@@ -34,6 +34,40 @@
 //! module and nowhere else in the crate.
 #![allow(clippy::excessive_precision)]
 
+/// An sRGB colour, 8 bits per channel — Pi's `RgbColor` (`terminal-colors.ts:1-5`), which every
+/// reported or generated terminal colour is. Plain data: any three bytes are a colour.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Rgb {
+    pub r: u8,
+    pub g: u8,
+    pub b: u8,
+}
+
+impl Rgb {
+    #[must_use]
+    pub const fn new(r: u8, g: u8, b: u8) -> Self {
+        Self { r, g, b }
+    }
+
+    /// `#rrggbb`, lower-case — Pi `hexOf` / `colorToHex` (`system-theme.ts:439`, `colors.ts:235`).
+    #[must_use]
+    pub fn hex(self) -> String {
+        format!("#{:02x}{:02x}{:02x}", self.r, self.g, self.b)
+    }
+
+    /// The `(r, g, b)` triple the conversion functions in this module speak.
+    #[must_use]
+    pub const fn channels(self) -> (u8, u8, u8) {
+        (self.r, self.g, self.b)
+    }
+}
+
+impl From<(u8, u8, u8)> for Rgb {
+    fn from((r, g, b): (u8, u8, u8)) -> Self {
+        Self { r, g, b }
+    }
+}
+
 /// One row of a 3×3 matrix, or a vector in any of the three linear spaces.
 ///
 /// A tuple rather than `[f64; 3]` so every access below is a field and not an index: the workspace
@@ -136,6 +170,14 @@ pub fn rgb_to_oklab((r, g, b): (u8, u8, u8)) -> Vec3 {
         srgb_to_linear(f64::from(g) / 255.0),
         srgb_to_linear(f64::from(b) / 255.0),
     ))
+}
+
+/// sRGB channels (0-255) to OKLCH `(L, C, h°)` — Pi `colorToOklch` for a non-OKLCH colour
+/// (`colors.ts:229-233`): chroma is the length of the Oklab `(a, b)` vector and the hue its angle
+/// in degrees, wrapped into `[0, 360)`.
+pub fn rgb_to_oklch(rgb: (u8, u8, u8)) -> Vec3 {
+    let (l, a, b) = rgb_to_oklab(rgb);
+    (l, a.hypot(b), (b.atan2(a).to_degrees() + 360.0) % 360.0)
 }
 
 /// Linear sRGB to sRGB channels (0-255, rounded), clipping out-of-gamut channels — Pi
@@ -470,7 +512,9 @@ fn split_function<'a>(value: &'a str, name: &str) -> Option<(&'a str, &'a str, &
 /// pi 1.0's built-in themes, which are written entirely in `okhsl(…)`, resolved to no colour at
 /// all and every role silently fell back to a compiled hex.
 pub fn parse_color(value: &str) -> Option<(u8, u8, u8)> {
-    let v = value.trim();
+    // Matched exactly as given: pi's three patterns are anchored `^…$` and `parseColor` trims
+    // nothing, so `" #abc"` and `"#abc "` THROW there and are not colours here.
+    let v = value;
 
     if let Some(rgb) = parse_hex(v) {
         return Some(rgb);
@@ -502,19 +546,15 @@ pub fn parse_color(value: &str) -> Option<(u8, u8, u8)> {
 /// `/^ok(lch|hsl)\(/i` (Pi `resolveVarRefs`, `theme/theme.ts:140`): a value that is a colour
 /// FUNCTION rather than a variable reference, so var resolution must not chase it.
 pub fn is_color_function(value: &str) -> bool {
-    let v = value.trim_start();
-    v.get(..6)
+    value
+        .get(..6)
         .is_some_and(|p| p.eq_ignore_ascii_case("oklch(") || p.eq_ignore_ascii_case("okhsl("))
 }
 
-/// `#RGB` / `#RRGGBB`, and (a cyrup tolerance that predates this module) the same without the `#`.
-///
-/// Pi's hex leg is `/^#([\da-f]{3}|[\da-f]{6})$/i` (`colors.ts:124`), which requires the `#`;
-/// cyrup's two theme resolvers have always also accepted a bare `rrggbb` as a last resort for a
-/// value that is not a known var, and that tolerance is preserved here rather than narrowed in a
-/// row about OKLCH.
+/// `/^#([\da-f]{3}|[\da-f]{6})$/i` (Pi `parseColor`'s hex leg, `colors.ts:124`): the `#` is
+/// required and the match is exact, so a bare `rrggbb` is not a colour.
 fn parse_hex(s: &str) -> Option<(u8, u8, u8)> {
-    let h = s.strip_prefix('#').unwrap_or(s);
+    let h = s.strip_prefix('#')?;
     let bytes = h.as_bytes();
     match bytes.len() {
         6 => Some((

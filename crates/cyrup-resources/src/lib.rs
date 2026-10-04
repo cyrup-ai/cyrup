@@ -65,8 +65,9 @@ pub use skill::{
     validate_description, validate_name,
 };
 pub use theme::{
-    BUILTIN_DARK_JSON, BUILTIN_LIGHT_JSON, ColorSpec, ExportColors, REQUIRED_COLOR_TOKENS,
-    ResolvedTheme, Theme, ThemeData, ThemeWatcher, builtin_themes,
+    Appearance, BUILTIN_DARK_JSON, BUILTIN_LIGHT_JSON, ColorError, ColorSpec, ColorValue,
+    ExportColors, REQUIRED_COLOR_TOKENS, ResolvedTheme, Theme, ThemeData, ThemeWatcher,
+    builtin_themes, resolve_color,
 };
 
 /// A lock-free, atomically-swappable holder of a [`ResourceRegistry`], offered to embedders.

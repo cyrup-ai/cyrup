@@ -294,6 +294,15 @@ impl ByteDecoder {
 
     fn decode_frames(&mut self, out: &mut Vec<Event>) {
         for frame in self.frames.drain(..) {
+            // A colour or DA1 reply that a query still waiting on the terminal owns — one that
+            // arrived after the boot probe's deadline — completes that query here (pi's
+            // `consumeTerminalColorResponse` runs ahead of every input listener, `tui.ts:1045`).
+            // Nothing else is touched: anything the queries do not own is decoded as before.
+            if let Frame::Seq(bytes) = &frame
+                && crate::terminal_query::offer_reply(bytes)
+            {
+                continue;
+            }
             if let Decoded::Event(ev) = decode(frame) {
                 out.push(ev);
             }

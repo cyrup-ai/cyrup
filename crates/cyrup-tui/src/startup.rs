@@ -4,8 +4,8 @@
 //!
 //! Pi prints two things at boot:
 //!
-//! * a **listing** of what loaded — `[Context]`, `[Skills]`, `[Prompts]`, `[Extensions]`,
-//!   `[Themes]` — gated on `force || options.verbose || !getQuietStartup()` (`:1488`);
+//! * a **listing** of what loaded — `[Context]`, `[Skills]`, `[Prompts]`, `[Extensions]` — gated on
+//!   `force || options.verbose || !getQuietStartup()` (`:1488`); custom themes are not listed;
 //! * **diagnostics** — `[Skill conflicts]`, `[Prompt conflicts]`, `[Extension issues]`,
 //!   `[Theme conflicts]` — gated on `showListing || showDiagnosticsWhenQuiet` (`:1489`), and the
 //!   boot call site passes `{force: false, showDiagnosticsWhenQuiet: true}` (`:1769`). So a
@@ -149,8 +149,6 @@ pub struct StartupReport {
     pub prompts: Vec<String>,
     /// Loaded (non-hidden) extension labels.
     pub extensions: Vec<String>,
-    /// Loaded CUSTOM themes only — Pi filters out the built-ins (`t.sourcePath`, `:1615`).
-    pub themes: Vec<String>,
     pub skill_diagnostics: Vec<StartupDiagnostic>,
     pub prompt_diagnostics: Vec<StartupDiagnostic>,
     pub extension_diagnostics: Vec<StartupDiagnostic>,
@@ -233,15 +231,6 @@ impl StartupReport {
                 .loaded_visible_ids()
                 .iter()
                 .map(|id| id.to_string())
-                .collect(),
-            // Built-ins are excluded — Pi lists only themes with a `sourcePath` (`:1615`).
-            themes: services
-                .resources
-                .themes
-                .all()
-                .iter()
-                .filter(|t| t.origin_path.is_some())
-                .map(|t| t.data.name.clone())
                 .collect(),
             skill_diagnostics: resource_diagnostics(
                 &services.startup_diagnostics.resources,
@@ -443,12 +432,11 @@ pub fn build_startup_lines(report: &StartupReport) -> Vec<StartupLine> {
     let mut out: Vec<StartupLine> = Vec::new();
 
     if report.show_listing() {
-        // Pi's order: Context, Skills, Prompts, Extensions, Themes (`:1550-1638`).
+        // Pi's order: Context, Skills, Prompts, Extensions. v1.0.0 has no themes listing.
         push_listing(&mut out, "Context", &report.context_files, false);
         push_listing(&mut out, "Skills", &report.skills, true);
         push_listing(&mut out, "Prompts", &report.prompts, true);
         push_listing(&mut out, "Extensions", &report.extensions, true);
-        push_listing(&mut out, "Themes", &report.themes, true);
     }
 
     // Diagnostics are shown even under `quietStartup` (`showDiagnosticsWhenQuiet: true`, `:1769`).

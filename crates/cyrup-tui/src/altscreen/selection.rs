@@ -70,6 +70,7 @@ use ratatui::text::Line;
 use unicode_segmentation::UnicodeSegmentation;
 
 use super::scroll::{self, ScrollState};
+use super::toggle::ToggleHit;
 use crate::text_width::str_width;
 use crate::transcript::is_ws_grapheme;
 
@@ -231,7 +232,16 @@ pub enum PointerOutcome {
     /// An unmodified secondary-button press with clipboard text behind it: the caller inserts the
     /// string into the editor — pi's `onRightClickPaste()` (`:711`).
     Paste(String),
+    /// A clean left click — no drag, released on the cell it was pressed on, with no link under it —
+    /// landed on a region pi makes toggle on click (a thinking run, a completed tool block, a
+    /// summary or a skill invocation). The caller flips that entry and re-anchors the viewport; the
+    /// selection has already been cleared, and nothing is copied (`tui-alt-screen.ts:1342-1353`).
+    Toggle(ToggleHit),
 }
+
+/// What the selection needs to ask the document: the toggle region under a document cell, if any.
+/// A function rather than the document's row map so this module still sees no application state.
+pub(super) type ToggleAt<'a> = &'a dyn Fn(usize, usize) -> Option<ToggleHit>;
 
 /// Offer one decoded mouse report to the selection — pi's `handleSelectionMouseEvent`
 /// (`tui-alt-screen.ts:981-1047`) with the right-click paste its dispatcher checks first
@@ -267,6 +277,7 @@ pub(super) fn route(
     viewport: Rect,
     ev: &MouseEvent,
     copy_on_select: bool,
+    toggle_at: ToggleAt<'_>,
 ) -> PointerOutcome {
     if right_click_paste_applies(ev) {
         // `try { this.onRightClickPaste(); } catch {}` then `return true` (`:709-715`): consumed
@@ -280,7 +291,7 @@ pub(super) fn route(
         MouseEventKind::Down(MouseButton::Left) => press(sel, scroll, doc, viewport, ev),
         MouseEventKind::Drag(MouseButton::Left) => drag(sel, scroll, doc, viewport, ev),
         MouseEventKind::Up(MouseButton::Left) => {
-            release(sel, scroll, doc, viewport, ev, copy_on_select)
+            release(sel, scroll, doc, viewport, ev, copy_on_select, toggle_at)
         }
         _ => PointerOutcome::Ignored,
     }
@@ -353,6 +364,20 @@ pub(super) fn cancel(sel: &mut SelectionState) {
     sel.granularity = Granularity::Character;
     sel.initial = None;
     sel.last_click = None;
+    sel.pressed_url = None;
+    sel.dragged = false;
+}
+
+/// Pi's `clearTextSelection` (`tui-alt-screen.ts:882-891`): everything [`cancel`] clears except the
+/// multi-click counter, which a handled click leaves running — so a quick second click on the same
+/// word still counts as the second of a double click.
+fn clear_text_selection(sel: &mut SelectionState) {
+    stop_auto_scroll(sel);
+    sel.press_active = false;
+    sel.anchor = None;
+    sel.focus = None;
+    sel.granularity = Granularity::Character;
+    sel.initial = None;
     sel.pressed_url = None;
     sel.dragged = false;
 }
@@ -591,6 +616,7 @@ fn release(
     viewport: Rect,
     ev: &MouseEvent,
     copy_on_select: bool,
+    toggle_at: ToggleAt<'_>,
 ) -> PointerOutcome {
     // `if (!this.selectionPressActive) return;` (`:987`) — a release belonging to no press of ours.
     if !sel.press_active {
@@ -605,10 +631,12 @@ fn release(
         return PointerOutcome::Handled;
     };
     update_focus(sel, doc, point);
-    let clicked_url = if sel.dragged || !same_cell(anchor, point) {
-        None
-    } else {
+    // `isClick` (`:1324-1328`): no drag, and the release is on the cell the gesture began on.
+    let is_click = !sel.dragged && same_cell(anchor, point);
+    let clicked_url = if is_click {
         sel.pressed_url.clone()
+    } else {
+        None
     };
     sel.pressed_url = None;
     if let Some(url) = clicked_url {
@@ -619,6 +647,12 @@ fn release(
         // launcher with its stdio nulled, reaps it off-thread and swallows every failure.
         crate::open_browser::open_browser(&url);
         return PointerOutcome::Handled;
+    }
+    // A click a component handles clears the selection and copies nothing (`:1342-1353`). Behind
+    // the link test above, which is upstream's order: a URL under the pointer wins.
+    if is_click && let Some(hit) = toggle_at(point.row, point.col) {
+        clear_text_selection(sel);
+        return PointerOutcome::Toggle(hit);
     }
     // `if (this.copyOnSelect) void this.copySelectionToClipboard();` (`:1035`) — the selection
     // itself is untouched either way, so the `Handled` arm below is upstream's bare

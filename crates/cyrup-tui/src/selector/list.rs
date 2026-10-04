@@ -1,4 +1,5 @@
 use super::*;
+use crate::system_theme::{SYSTEM_THEME_DESCRIPTION, SYSTEM_THEME_NAME};
 
 /// The shared list-selector engine (spec/tui/05 §3.2 `ListView<T>`): a [`SelectList`] body wrapped in
 /// the top/bottom `DynamicBorder` chrome, with a parallel `values` vector returned on confirm and an
@@ -231,16 +232,29 @@ impl ListSelector {
     /// Theme picker with live preview (`theme-selector.ts:27-56`): one row per available theme,
     /// `maxVisible = 10`, the current theme marked `(current)`, preselecting it. Navigation emits
     /// [`SelectorOutcome::Preview`] so the whole UI re-themes as the highlight moves.
+    ///
+    /// The system theme is listed FIRST — "it is the default and adapts to every terminal"
+    /// (`getAvailableThemesWithPaths`, `theme.ts:494-497` @v1.0.0) — and carries pi's description
+    /// "Theme created from your terminal's colors" (`settings-selector.ts:212`).
     pub fn theme(current: &str) -> Self {
         let mut rows = Vec::new();
         let mut selected = 0usize;
-        for (i, theme) in builtin_themes().iter().enumerate() {
-            let key = theme.key.as_str().to_string();
+        let names = std::iter::once(SYSTEM_THEME_NAME.to_string()).chain(
+            builtin_themes()
+                .into_iter()
+                .map(|theme| theme.key.as_str().to_string()),
+        );
+        for (i, key) in names.enumerate() {
             let is_current = key == current;
             if is_current {
                 selected = i;
             }
-            let desc = is_current.then(|| "(current)".to_string());
+            let desc = match (key == SYSTEM_THEME_NAME, is_current) {
+                (true, true) => Some(format!("{SYSTEM_THEME_DESCRIPTION} (current)")),
+                (true, false) => Some(SYSTEM_THEME_DESCRIPTION.to_string()),
+                (false, true) => Some("(current)".to_string()),
+                (false, false) => None,
+            };
             rows.push((key.clone(), key, desc));
         }
         ListSelector::new(rows, 10, selected, true)
@@ -266,45 +280,7 @@ impl Selector for ListSelector {
     }
 
     fn render(&mut self, frame: &mut Frame, area: Rect, theme: &UiTheme) {
-        let title_h = self
-            .title
-            .as_deref()
-            .map_or(0, |t| title_wrapped_height(t, area.width));
-        let hint_h = u16::from(self.hints);
-        // L4/SYS-3. The envelope row order is `ExtensionSelectorComponent`'s, counted from its
-        // constructor (`extension-selector.ts:44-75`): `DynamicBorder`(:44) · `Spacer`(:45) ·
-        // title(:47) · `Spacer`(:49) · list(:61) · `Spacer`(:62) · hint(:63-73) · `Spacer`(:74) ·
-        // `DynamicBorder`(:75). `OAuthSelectorComponent` (`oauth-selector.ts:68-96`) is the same
-        // order minus the hint row (it has none) — its `:87` spacer sits under a search `Input`
-        // cyrup has not ported, so `sp_after_hint` collapses to 0 there and the count is three.
-        // `spacers` is per-kind (`SelectorKind::envelope_spacers`); show-images and theme are
-        // border/list/border upstream and keep a zero-spacer envelope.
-        //
-        // Every height below is the NATURAL one — `sp` does not depend on `area.height`, and the
-        // body gets the list's own rendered height rather than "whatever is left". `stack_rows`
-        // then fills the regions from the TOP and starves the trailing ones, which is what pi's
-        // layout engine does; see its doc. The previous
-        // `area.height - fixed` body made `fixed` count the hint unconditionally, so a three-row
-        // slot spent its last row on the HINT and showed no options at all — the list starved
-        // before the trailing chrome did, the exact inversion of upstream's order.
-        let sp = u16::from(self.spacers);
-        let sp_after_hint = sp.min(hint_h);
-        let sp_before_hint = sp;
-        let body_h = self.list.rendered_height();
-        let [top, _, title_area, _, body, _, hint, _, bottom] = stack_rows(
-            area,
-            [
-                1,
-                sp,
-                title_h,
-                sp,
-                body_h,
-                sp_before_hint,
-                hint_h,
-                sp_after_hint,
-                1,
-            ],
-        );
+        let [top, _, title_area, _, body, _, hint, _, bottom] = self.regions(area);
         frame.render_widget(border_rule(top.width, theme), top);
         if let Some(title) = &self.title {
             let style = theme
@@ -350,6 +326,23 @@ impl Selector for ListSelector {
         frame.render_widget(border_rule(bottom.width, theme), bottom);
     }
 
+    fn pointer(&mut self, area: Rect, event: crate::app::Pointer) -> SelectorOutcome {
+        // The list's rows are the body region render paints them in; the rows of the envelope
+        // around it (rules, title, spacers, hint) are not the list's.
+        let [_, _, _, _, body, ..] = self.regions(Rect {
+            x: 0,
+            y: 0,
+            width: area.width,
+            height: area.height,
+        });
+        let answer = list_pointer(&mut self.list, body.y, body.height, event);
+        list_outcome(
+            answer,
+            || self.moved(),
+            || SelectorOutcome::Confirm(self.current_value()),
+        )
+    }
+
     fn handle(&mut self, key: &KeyEvent, keymap: &SelectKeymap) -> SelectorOutcome {
         // Keep the hint row honest even for a selector constructed without `with_keymap`: adopt
         // whatever table actually routed this key.
@@ -380,6 +373,52 @@ impl Selector for ListSelector {
 }
 
 impl ListSelector {
+    /// The nine regions of the envelope in `area`, top to bottom: top rule, spacer, title, spacer,
+    /// list body, spacer, hint, spacer, bottom rule. [`Selector::render`] paints into these and
+    /// [`Selector::pointer`] hit-tests against the body one, so the two cannot disagree about where
+    /// the first list row is.
+    fn regions(&self, area: Rect) -> [Rect; 9] {
+        let title_h = self
+            .title
+            .as_deref()
+            .map_or(0, |t| title_wrapped_height(t, area.width));
+        let hint_h = u16::from(self.hints);
+        // L4/SYS-3. The envelope row order is `ExtensionSelectorComponent`'s, counted from its
+        // constructor (`extension-selector.ts:44-75`): `DynamicBorder`(:44) · `Spacer`(:45) ·
+        // title(:47) · `Spacer`(:49) · list(:61) · `Spacer`(:62) · hint(:63-73) · `Spacer`(:74) ·
+        // `DynamicBorder`(:75). `OAuthSelectorComponent` (`oauth-selector.ts:68-96`) is the same
+        // order minus the hint row (it has none) — its `:87` spacer sits under a search `Input`
+        // cyrup has not ported, so `sp_after_hint` collapses to 0 there and the count is three.
+        // `spacers` is per-kind (`SelectorKind::envelope_spacers`); show-images and theme are
+        // border/list/border upstream and keep a zero-spacer envelope.
+        //
+        // Every height below is the NATURAL one — `sp` does not depend on `area.height`, and the
+        // body gets the list's own rendered height rather than "whatever is left". `stack_rows`
+        // then fills the regions from the TOP and starves the trailing ones, which is what pi's
+        // layout engine does; see its doc. The previous
+        // `area.height - fixed` body made `fixed` count the hint unconditionally, so a three-row
+        // slot spent its last row on the HINT and showed no options at all — the list starved
+        // before the trailing chrome did, the exact inversion of upstream's order.
+        let sp = u16::from(self.spacers);
+        let sp_after_hint = sp.min(hint_h);
+        let sp_before_hint = sp;
+        let body_h = self.list.rendered_height();
+        stack_rows(
+            area,
+            [
+                1,
+                sp,
+                title_h,
+                sp,
+                body_h,
+                sp_before_hint,
+                hint_h,
+                sp_after_hint,
+                1,
+            ],
+        )
+    }
+
     /// The outcome of a navigation move: a live-preview emit for previewing selectors, else a redraw
     /// (`select-list.ts:103-108` `notifySelectionChange` → `onSelectionChange`).
     fn moved(&self) -> SelectorOutcome {

@@ -265,9 +265,9 @@ fn assembled_live_tool_block_shows_spec_block_with_state_bg_tint() {
         live.contains("read src/auth.rs"),
         "tool call header missing:\n{live}"
     );
-    // Dark `toolPendingBg` = #282832 must reach real cells (the bg is the affordance, audit #6).
+    // Dark `toolPendingBg` = #34383a must reach real cells (the bg is the affordance, audit #6).
     assert!(
-        has_bg(&app, ratatui::style::Color::Rgb(0x28, 0x28, 0x32)),
+        has_bg(&app, ratatui::style::Color::Rgb(0x34, 0x38, 0x3a)),
         "tool-pending bg tint did not reach any cell:\n{live}"
     );
 }

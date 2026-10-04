@@ -52,6 +52,7 @@ mod bash_block;
 mod cache;
 mod content;
 mod entry;
+mod expansion;
 mod images;
 mod layout;
 mod message;
@@ -73,12 +74,14 @@ pub use entry::{
     CompactionCostKind, Entry, RenderSource, RenderSurface, Rendered, RenderedText, ToolRun,
 };
 pub(crate) use entry::{RenderSlot, StaleRender};
+pub use expansion::{Expansion, LiveBlock, ToggleTarget};
+pub(crate) use expansion::{LiveToggle, ToggleRegion, ToggleScope};
 pub use images::{DEFAULT_IMAGE_WIDTH_CELLS, ResultImage};
 pub use message::HIDDEN_THINKING_LABEL;
 
 pub(crate) use layout::{is_ws_grapheme, text_lines_of, wrap_all_owned, wrap_line, wrapped_height};
-pub(crate) use render::entry_lines;
-pub(crate) use tool_render::{ImageOpts, tool_lines};
+pub(crate) use render::{entry_block, entry_lines};
+pub(crate) use tool_render::{ImageOpts, tool_block, tool_lines};
 
 // The transcript-internal helpers the submodules share. Re-bound here so every submodule reaches
 // them through its own `use super::*;`, the same way `crate::app`'s split modules do.
@@ -87,7 +90,10 @@ use layout::{
     body_line, box_lines, finalize_block, normalize_line, normalize_terminal_output, pad_lines,
     replace_tabs, text_lines,
 };
-use message::{collapsed_summary_lines, group_thousands, labeled_message_lines, thinking_lines};
+use message::{
+    collapsed_skill_lines, collapsed_summary_lines, group_thousands, labeled_message_lines,
+    thinking_lines,
+};
 use tool_args::{
     StrArg, compact_read_call, compact_read_classification, js_arg, js_truthy, key_hint_spans,
     more_lines_hint, push_search_path, read_line_range, str_arg, tool_path_span,
@@ -192,6 +198,9 @@ pub struct TranscriptView {
     /// unrelated rows. Upstream has no counterpart because it never drops (see
     /// [`MAX_RETAINED_ENTRIES`]).
     retained_dropped: u64,
+    /// Per-entry expansion overrides for the retained document — the click-to-toggle state (see
+    /// the `expansion` module). Keyed by sequence number, so it survives the front trim.
+    expansion: expansion::ExpansionOverrides,
     /// The assistant turn currently streaming, if any (the only entry the viewport renders).
     streaming: Option<String>,
     /// The assistant **reasoning** currently streaming (`StreamEvent::ThinkingDelta`), if any. Held
@@ -343,4 +352,7 @@ struct RenderCache {
     /// marker bits index THIS table; a cache hit that reused stale hrefs would link the right text
     /// to the wrong file.
     links: crate::osc::LinkSink,
+    /// The click regions of the blocks in [`Self::rows`], in those wrapped rows. Built with the rows
+    /// and invalidated with them, so a toggle (which bumps the render generation) refreshes both.
+    toggles: std::sync::Arc<Vec<LiveToggle>>,
 }

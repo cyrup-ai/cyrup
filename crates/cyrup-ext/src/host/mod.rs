@@ -25,7 +25,7 @@ pub use limits::StoreLimits;
 pub use live::{GuestBashOperations, LiveExtension, WasmTool};
 pub use overlay::{
     CustomOption, CustomSpec, InteractiveOverlay, OverlayColor, OverlayKey, OverlayKeyCode,
-    OverlayLine, OverlayOptions, OverlayOutcome, OverlaySpan, SpecOverlay,
+    OverlayLine, OverlayMouse, OverlayOptions, OverlayOutcome, OverlaySpan, SpecOverlay, ThemeRole,
 };
 pub use overlay_keys::{KeySpec, key_ids, parse_user_bindings, read_user_bindings};
 pub use services::{

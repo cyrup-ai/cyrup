@@ -62,7 +62,13 @@ pub fn startup_theme(dirs: &ConfigDirs, use_theme: Option<&str>) -> UiTheme {
     let setting = use_theme
         .map(str::to_string)
         .or_else(|| mgr.effective().theme_setting());
-    ThemeController::boot_from_env(setting.as_deref()).theme()
+    let mut controller = ThemeController::boot_from_env(setting.as_deref());
+    // The pre-launch selectors paint before any terminal query can be answered (raw mode is not on
+    // yet), so the terminal has reported nothing: the system theme is generated for that case —
+    // ANSI indices and the terminal's own defaults, which fit whatever it looks like — rather than
+    // left in the grayscale a pending query implies.
+    let _ = controller.request_terminal_colors(&cyrup_tui::NoTerminalProbe, None);
+    controller.theme()
 }
 
 /// The user's `<agent_dir>/keybindings.json`, merged into the two keymaps the pre-launch selectors

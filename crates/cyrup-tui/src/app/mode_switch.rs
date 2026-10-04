@@ -261,6 +261,23 @@ impl<B: Backend> App<B> {
         }
     }
 
+    /// Apply the `fullscreenWheelScrollLines` setting (TUI-136) to this app AND to the live
+    /// alternate screen — pi's `onFullscreenWheelScrollLinesChange`, which persists and then, `if
+    /// (this.renderer instanceof TuiAltScreen)`, calls `setWheelScrollLines(lines)`
+    /// (`interactive-mode.ts:5050-5053` @v1.0.0).
+    ///
+    /// Both halves are needed for the reason [`Self::set_fullscreen_copy_on_select`] gives: the
+    /// field seeds the NEXT alternate screen, the push reaches the one already running.
+    pub fn set_fullscreen_wheel_scroll_lines(
+        &mut self,
+        lines: cyrup_config::settings::WheelScrollLines,
+    ) {
+        self.fullscreen_wheel_scroll_lines = lines;
+        if let Some(alt) = self.altscreen.as_mut() {
+            alt.set_wheel_scroll_lines(lines);
+        }
+    }
+
     /// What [`Self::stop_fullscreen`] must be passed on the SESSION-EXIT teardown for the configured
     /// `fullscreenExitOutput` (CFG-078) — `true` (preserve, i.e. repaint nothing) for
     /// `resume-hint`, `false` (repaint the excursion's transcript into scrollback) for `transcript`.
@@ -488,6 +505,9 @@ impl<B: RebuildBackend> App<B> {
         // the renderer's `?? true` default. This is that argument, moved to the one place both the
         // production and the captured entry paths pass through.
         alt.set_copy_on_select(self.fullscreen_copy_on_select);
+        // TUI-136 — `wheelScrollLines: options.fullscreenWheelScrollLines ?? "auto"`
+        // (`tui-renderer.ts:38` @v1.0.0), the same constructor-option seeding as `copyOnSelect`.
+        alt.set_wheel_scroll_lines(self.fullscreen_wheel_scroll_lines);
         // TUI-109 — the "Jump to latest message" label's shortcut, pi's `keyDisplayText(
         // "tui.altScreen.bottom")` (`tui-renderer.ts:30`); `load_keybindings_json` and
         // `reload_keybindings_from` push it again when the bindings change.

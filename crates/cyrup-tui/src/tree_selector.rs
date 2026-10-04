@@ -18,7 +18,9 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
 use crate::keymap::{SelectAction, SelectKeymap, TreeAction, TreeKeymap};
-use crate::selector::{Selector, SelectorOutcome, border_rule, centered_window};
+use crate::selector::{
+    RowAction, RowMap, RowPointer, Selector, SelectorOutcome, border_rule, centered_window,
+};
 use crate::theme::UiTheme;
 
 /// pi's floor on the `/tree` body window — the `5` in
@@ -456,6 +458,9 @@ pub struct TreeSelector {
     /// It filters [`TreeSelector::visible_indices`] as whitespace-split lowercase tokens, all of
     /// which must be substrings of the row's searchable text (`:337`, `:391-393`).
     search_query: String,
+    /// The row a left press went down on, so the click that completes the gesture navigates to it
+    /// even if the window slid under the pointer.
+    pointer: RowPointer,
 }
 
 impl TreeSelector {
@@ -470,6 +475,7 @@ impl TreeSelector {
             keymap: TreeKeymap::default(),
             label_edit: None,
             search_query: String::new(),
+            pointer: RowPointer::default(),
         }
     }
 
@@ -649,6 +655,30 @@ impl TreeSelector {
             return;
         }
         self.move_by(1);
+    }
+
+    /// Navigate to the highlighted entry — the one answer to `Enter` and to a click on its row.
+    fn confirm_current(&self) -> SelectorOutcome {
+        match self.selected_id() {
+            Some(id) => SelectorOutcome::Confirm(id),
+            None => SelectorOutcome::Redraw,
+        }
+    }
+
+    /// The six regions of the dialog in `area`, top to bottom: top rule, header, search line, body,
+    /// help line, bottom rule. [`Selector::render`] paints into these and [`Selector::pointer`]
+    /// hit-tests against the body one, so they cannot disagree about where the first row is — or
+    /// about how many of the windowed rows a short slot leaves room for.
+    fn regions(area: Rect) -> [Rect; 6] {
+        Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(0),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
+        .areas(area)
     }
 
     /// The `nodes` index of the highlighted visible row.
@@ -1140,15 +1170,7 @@ impl Selector for TreeSelector {
     }
 
     fn render(&mut self, frame: &mut Frame, area: Rect, theme: &UiTheme) {
-        let [top, header, search, body, hint, bottom] = Layout::vertical([
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Min(0),
-            Constraint::Length(1),
-            Constraint::Length(1),
-        ])
-        .areas(area);
+        let [top, header, search, body, hint, bottom] = Self::regions(area);
         frame.render_widget(border_rule(top.width, theme), top);
         frame.render_widget(Paragraph::new(self.header(theme)), header);
         // The standing `Type to search:` prompt plus the live query — pi's `SearchLine`
@@ -1180,6 +1202,46 @@ impl Selector for TreeSelector {
         };
         frame.render_widget(Paragraph::new(hint_line), hint);
         frame.render_widget(border_rule(bottom.width, theme), bottom);
+    }
+
+    /// A press highlights the entry under the pointer, a click navigates to it as `Enter` does, and
+    /// a wheel notch over the tree moves the highlight one entry, stopping at the ends as the arrow
+    /// keys do. The rules, header, search line and help line are not entries, and neither are rows
+    /// of the window a short slot has no room to paint. While the label editor is open it owns the
+    /// body, so the pointer is ignored.
+    fn pointer(&mut self, area: Rect, event: crate::app::Pointer) -> SelectorOutcome {
+        if self.label_edit.is_some() {
+            return SelectorOutcome::Ignored;
+        }
+        let [_, _, _, body, _, _] = Self::regions(Rect {
+            x: 0,
+            y: 0,
+            width: area.width,
+            height: area.height,
+        });
+        let len = self.visible_indices().len();
+        let (start, end) = centered_window(self.selected, len, self.max_visible);
+        let mut map = RowMap::starting_at(body.y);
+        for row in start..end {
+            map = map.item(row, 1, 1);
+        }
+        let map = map.clipped_to(body.bottom());
+        match self.pointer.act(event, &map, self.selected, len) {
+            RowAction::Ignored => SelectorOutcome::Ignored,
+            RowAction::Handled => SelectorOutcome::Redraw,
+            RowAction::Highlight(row) => {
+                self.selected = row;
+                SelectorOutcome::Redraw
+            }
+            RowAction::Activate(row) => {
+                self.selected = row;
+                self.confirm_current()
+            }
+            RowAction::Step(step) => {
+                self.move_by(step);
+                SelectorOutcome::Redraw
+            }
+        }
     }
 
     fn handle(&mut self, key: &KeyEvent, keymap: &SelectKeymap) -> SelectorOutcome {
@@ -1251,10 +1313,7 @@ impl Selector for TreeSelector {
                 self.page_by(false);
                 SelectorOutcome::Redraw
             }
-            Some(SelectAction::Confirm) => match self.selected_id() {
-                Some(id) => SelectorOutcome::Confirm(id),
-                None => SelectorOutcome::Redraw,
-            },
+            Some(SelectAction::Confirm) => self.confirm_current(),
             // `tui.select.cancel` clears a live search FIRST and only cancels the selector when the
             // query is already empty (`tree-selector.ts:1031-1037`).
             Some(SelectAction::Cancel) => {

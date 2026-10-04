@@ -349,8 +349,38 @@ pub(crate) fn settings_rows(
         .with_description(
             "Automatically copy selected text in fullscreen mode; disable to copy selections with Ctrl+X",
         ),
+        // TUI-136 / CFG-100 — pi's `fullscreen-wheel-scroll-lines` row, immediately after the copy
+        // row and before `theme` (`settings-selector.ts:733-745` @v1.0.0). The id IS the settings
+        // key, like its neighbours; `ApplySetting` re-types the cycled text through
+        // `WheelScrollLines::from_row_value` so the stored value is a clamped NUMBER (or `auto`).
+        SettingRow::choice(
+            "fullscreenWheelScrollLines",
+            "Fullscreen wheel scrolling",
+            eff.fullscreen_wheel_scroll_lines().to_string(),
+            wheel_scroll_choices(eff.fullscreen_wheel_scroll_lines()),
+        )
+        .with_description(
+            "Lines per mouse-wheel event in fullscreen mode; 'auto' speeds up fast wheel spins where the terminal does not",
+        ),
     ]);
     rows
+}
+
+/// The cycle values of the "Fullscreen wheel scrolling" row — `["auto", ...[...new Set([1, 2, 3, 5,
+/// 10, current])].filter((lines) => lines !== "auto").sort((a, b) => a - b).map(String)]`
+/// (`settings-selector.ts:739-745` @v1.0.0): `auto`, then the fixed offers in ascending order with
+/// the current value merged in, once, wherever it sorts — so a hand-edited `7` or `100` is still
+/// reachable and the row never starts on a value it cannot cycle through.
+fn wheel_scroll_choices(current: cyrup_config::settings::WheelScrollLines) -> Vec<String> {
+    let mut counts: Vec<u8> = vec![1, 2, 3, 5, 10];
+    if let cyrup_config::settings::WheelScrollLines::Lines(n) = current {
+        counts.push(n.get());
+    }
+    counts.sort_unstable();
+    counts.dedup();
+    std::iter::once("auto".to_string())
+        .chain(counts.into_iter().map(|n| n.to_string()))
+        .collect()
 }
 
 /// Build the `/settings` grid against default effective settings — the test seam for the two rows

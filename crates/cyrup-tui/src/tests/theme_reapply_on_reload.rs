@@ -111,17 +111,24 @@ fn apply_from_settings_resolves_an_auto_pair_against_the_boot_polarity() {
     assert_eq!(light_term.apply_from_settings(Some("light/dark")), "light");
 }
 
-/// Branch 3 (`:74-80`) minus the probe: an unset setting falls back to the polarity's own theme
-/// name, which is the value pi's `detectTerminalBackgroundTheme` would have re-answered.
+/// Branch 3: a cleared setting resolves to the SYSTEM theme — pi's `resolveThemeName` ends in
+/// `?? SYSTEM_THEME_NAME` (`theme-controller.ts:175`) — whatever the polarity, and the system theme
+/// arms auto-sync (`:106`).
 #[test]
-fn apply_from_settings_falls_back_to_the_terminal_polarity_when_the_setting_is_cleared() {
-    let mut controller = ThemeController::boot(
-        Some("solarized"),
-        ColorMode::TrueColor,
-        TerminalTheme::Light,
-    );
-    assert_eq!(controller.apply_from_settings(None), "light");
-    assert!(!controller.auto_sync(), "pi `setAutoSync(false)` (`:68`)");
+fn apply_from_settings_falls_back_to_the_system_theme_when_the_setting_is_cleared() {
+    for polarity in [TerminalTheme::Light, TerminalTheme::Dark] {
+        let mut controller =
+            ThemeController::boot(Some("solarized"), ColorMode::TrueColor, polarity);
+        assert!(
+            !controller.auto_sync(),
+            "an explicit name does not arm sync"
+        );
+        assert_eq!(controller.apply_from_settings(None), "system");
+        assert!(
+            controller.auto_sync(),
+            "`setAutoSync(... || themeName === SYSTEM_THEME_NAME)` (`:106`)"
+        );
+    }
 }
 
 /// Every apply bumps the generation, which is what invalidates the render caches — pi's
@@ -168,7 +175,7 @@ fn reload_repaints_when_settings_theme_changed_on_disk() {
 }
 
 /// The second half of the item's Impact: a **custom** theme file the reload discovered has to be
-/// loadable by name. `UiTheme::builtin` alone silently degrades an unknown name to dark, so the
+/// loadable by name. `UiTheme::builtin` alone degrades an unknown name to the system theme, so the
 /// resolution has to go through the swapped-in session's resource set.
 #[test]
 fn reload_repaints_from_a_custom_theme_the_reloaded_session_discovered() {
@@ -183,7 +190,7 @@ fn reload_repaints_from_a_custom_theme_the_reloaded_session_discovered() {
         app.state().theme.accent,
         Some(Color::Rgb(0x01, 0x02, 0x03)),
         "a file-backed custom theme must resolve out of the session's discovered set, not \
-         degrade to the built-in dark fallback"
+         degrade to the system fallback"
     );
 }
 
@@ -215,11 +222,11 @@ fn reload_repaints_when_the_theme_file_changed_under_an_unchanged_name() {
     );
 }
 
-/// A name that resolves to nothing degrades to dark, which is pi's `applyThemeName` failure path
-/// (`activeThemeName = "dark"`, `theme-controller.ts:126-135`) — never a panic, never a stale theme
-/// silently kept.
+/// A name that resolves to nothing degrades to the system theme, which is pi's `applyThemeName`
+/// failure path (`activeThemeName = SYSTEM_THEME_NAME`, `theme-controller.ts:180`) — never a panic,
+/// never a stale theme silently kept.
 #[test]
-fn reload_falls_back_to_dark_when_the_named_theme_no_longer_resolves() {
+fn reload_falls_back_to_the_system_theme_when_the_named_theme_no_longer_resolves() {
     let mut app = booted(Some("midnight"), TerminalTheme::Dark);
     app.reapply_theme_from_settings(
         Some("midnight"),
@@ -235,9 +242,9 @@ fn reload_falls_back_to_dark_when_the_named_theme_no_longer_resolves() {
     app.reapply_theme_from_settings(Some("midnight"), &registry(Vec::new()));
 
     assert_eq!(
-        app.state().theme.foreground,
-        UiTheme::builtin("dark").foreground,
-        "pi falls back to the dark theme when the named theme fails to load"
+        app.state().theme.name,
+        "system",
+        "pi falls back to the system theme when the named theme fails to load"
     );
 }
 
@@ -345,35 +352,34 @@ fn the_session_swap_arm_reapplies_the_theme_after_the_registry_and_before_the_re
 }
 
 // ---------------------------------------------------------------------------
-// TUI-096 — the failure half of pi's `applyThemeName` (`theme-controller.ts:126-135` @v0.84.4)
+// TUI-096 — the failure half of pi's `applyThemeName` (`theme-controller.ts:178-186` @v1.0.0)
 // ---------------------------------------------------------------------------
 //
-// `applyThemeName` does TWO things when `setTheme` fails: it seats `activeThemeName = "dark"`, and
-// — under `showError`, which is `true` on both `applyFromSettings` branches that name a theme
-// (`:64`, `:70`) — it surfaces
-// `Failed to load theme "<name>": <error>\nFell back to dark theme.`. The error text for a name
-// that resolves to nothing is `setTheme`'s caught `Theme not found: <name>`
-// (`theme/theme.ts:623` thrown by `loadThemeJson`, caught at `:903-911`). cyrup ported neither
-// half: it repainted dark and kept the broken name.
+// `applyThemeName` does TWO things when `setTheme` fails: it seats `activeThemeName =
+// SYSTEM_THEME_NAME`, and — under `showError`, which is `true` whenever the setting names a theme
+// (`:107`) — it surfaces
+// `Failed to load theme "<name>": <error>\nFell back to the system theme.`. The error text for a
+// name that resolves to nothing is `setTheme`'s caught `Theme not found: <name>`
+// (`theme/theme.ts:567` thrown by `loadThemeJson`, caught at `:783-792`).
 
-/// A `/reload` onto a theme the swapped-in session cannot resolve must seat `dark` as the ACTIVE
+/// A `/reload` onto a theme the swapped-in session cannot resolve must seat `system` as the ACTIVE
 /// name, not keep the name that failed — pi `this.activeThemeName = result.success ? themeName :
-/// "dark"` (`theme-controller.ts:127`).
+/// SYSTEM_THEME_NAME` (`theme-controller.ts:180`).
 #[test]
-fn a_theme_that_fails_to_load_seats_dark_as_the_active_name() {
+fn a_theme_that_fails_to_load_seats_the_system_theme_as_the_active_name() {
     let mut app = booted(Some("midnight"), TerminalTheme::Dark);
 
     let outcome = app.reapply_theme_from_settings(Some("midnight"), &registry(Vec::new()));
 
     assert_eq!(
         app.theme_controller().map(ThemeController::active_name),
-        Some("dark"),
+        Some("system"),
         "a theme that failed to load must not leave its own name reported as active — pi seats \
-         `\"dark\"` on the failure branch (`theme-controller.ts:127` @v0.84.4)"
+         the system theme on the failure branch (`theme-controller.ts:180` @v1.0.0)"
     );
     assert_eq!(
         outcome,
-        crate::ThemeApply::FellBackToDark {
+        crate::ThemeApply::FellBackToSystem {
             name: "midnight".to_string(),
             error: "Theme not found: midnight".to_string(),
         },
@@ -395,10 +401,10 @@ fn a_theme_that_fails_to_load_surfaces_pis_sentence() {
     assert!(
         out.contains("Error: Failed to load theme \"midnight\": Theme not found: midnight"),
         "pi surfaces `Failed to load theme \"${{themeName}}\": ${{result.error}}` \
-         (`theme-controller.ts:131-133` @v0.84.4):\n{out}"
+         (`theme-controller.ts:182-184` @v1.0.0):\n{out}"
     );
     assert!(
-        out.contains("Fell back to dark theme."),
+        out.contains("Fell back to the system theme."),
         "the second line of pi's message says WHICH theme is now painted:\n{out}"
     );
 }
@@ -419,7 +425,7 @@ fn a_theme_that_loads_is_reported_as_loaded_and_says_nothing() {
     assert_eq!(
         app.theme_controller().map(ThemeController::active_name),
         Some("midnight"),
-        "a theme that loaded keeps its own name active (`result.success ? themeName : \"dark\"`)"
+        "a theme that loaded keeps its own name active (`result.success ? themeName : SYSTEM_THEME_NAME`)"
     );
     assert!(
         !app.scrollback_text().contains("Failed to load theme"),
@@ -496,4 +502,91 @@ fn an_app_with_no_controller_reports_that_nothing_was_re_resolved() {
     assert_eq!(outcome, crate::ThemeApply::NoController);
     app.draw().unwrap();
     assert!(!app.scrollback_text().contains("Failed to load theme"));
+}
+
+// ---------------------------------------------------------------------------
+// Boot (`applyFromSettings` without the re-query) and the late colour reply
+// ---------------------------------------------------------------------------
+
+/// A custom theme file named by `settings.theme` is the theme the first frame paints. The boot used
+/// to build its theme from the compiled-in names only, so the file was ignored until a reload.
+///
+/// RED if `settle_boot_theme` stops resolving through the session's registry: the accent would be the
+/// system theme's, not `#010203`.
+#[test]
+fn the_boot_theme_is_the_custom_theme_file_the_setting_names() {
+    let mut app = booted(Some("midnight"), TerminalTheme::Dark);
+
+    let outcome = app.settle_boot_theme(
+        Some("midnight"),
+        &registry(vec![custom_theme("midnight", "#010203")]),
+    );
+
+    assert_eq!(outcome, crate::ThemeApply::Loaded("midnight".to_string()));
+    assert_eq!(app.state().theme.accent, Some(Color::Rgb(1, 2, 3)));
+}
+
+/// With no `theme` setting the boot theme is the generated `system` one, and a setting that names
+/// nothing falls back to it with pi's sentence rather than to `dark`.
+#[test]
+fn the_boot_theme_with_no_setting_is_system_and_an_unknown_name_falls_back_to_it() {
+    let mut app = booted(None, TerminalTheme::Light);
+    let outcome = app.settle_boot_theme(None, &registry(Vec::new()));
+    assert_eq!(outcome, crate::ThemeApply::Loaded("system".to_string()));
+    assert_eq!(app.state().theme.name, "system");
+
+    let mut app = booted(Some("ghost"), TerminalTheme::Light);
+    let outcome = app.settle_boot_theme(Some("ghost"), &registry(Vec::new()));
+    assert!(
+        matches!(outcome, crate::ThemeApply::FellBackToSystem { .. }),
+        "{outcome:?}"
+    );
+    assert_eq!(app.state().theme.name, "system");
+    app.draw().unwrap();
+    assert!(
+        app.scrollback_text()
+            .contains("Fell back to the system theme."),
+        "the user is told, in pi's words"
+    );
+}
+
+/// Pi's `onLateReply`: colours that arrive after the boot query gave up regenerate the system theme
+/// and repaint, and a repeat of the same colours changes nothing.
+///
+/// RED if `App::apply_terminal_colors` is not wired to the controller: the theme stays grayscale.
+#[test]
+fn colours_that_arrive_after_the_timeout_regenerate_the_system_theme() {
+    use crate::TerminalColors;
+    use cyrup_resources::color::Rgb;
+
+    let mut app = booted(None, TerminalTheme::Dark);
+    let nothing = registry(Vec::new());
+    app.settle_boot_theme(None, &nothing);
+    let before = app.state().theme.clone();
+    assert_eq!(before.name, "system");
+
+    let white = TerminalColors {
+        background: Some(Rgb::new(0xfa, 0xfa, 0xfa)),
+        ..TerminalColors::default()
+    };
+    app.apply_terminal_colors(white, &nothing);
+    let after = app.state().theme.clone();
+    assert_eq!(after.name, "system");
+    assert_ne!(
+        after.foreground, before.foreground,
+        "the late colours repainted"
+    );
+    assert_eq!(after.appearance(), cyrup_resources::Appearance::Light);
+    assert_eq!(
+        app.theme_controller().map(ThemeController::terminal_theme),
+        Some(TerminalTheme::Light)
+    );
+
+    // The same colours again are a no-op: the theme is untouched.
+    app.apply_terminal_colors(white, &nothing);
+    assert_eq!(
+        app.state().theme.generation,
+        after.generation,
+        "a repeat must not re-seat the theme"
+    );
 }

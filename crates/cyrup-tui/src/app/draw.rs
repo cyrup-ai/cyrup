@@ -1,5 +1,7 @@
 use super::*;
 
+use ratatui::layout::Rect;
+
 use crate::transcript::ImageOpts;
 
 /// The per-paint bag every entry render needs and no [`crate::Entry`] can carry on itself — Pi's
@@ -238,15 +240,13 @@ impl<B: Backend> App<B> {
     /// `Vec` is dropped rather than rendered: with retention on, the same entries are already in
     /// [`crate::TranscriptView::document`], which is what [`crate::AltScreen::sync_document`] walks.
     ///
-    /// # Known residual: no chrome
-    /// The frame is the scrolled document, the selection highlight, the scrollbar and the flash
-    /// overlay — [`crate::AltScreen::draw`]'s z-order, upstream's `:1290`. The editor, the status
-    /// band, the selector slot, the footer and the attachment strip are **not** painted: they are
-    /// upstream's layout root (`interactive-mode.ts:933-936`), reached through
-    /// [`crate::ViewportRenderer::set_layout_root`], and cyrup has no [`crate::Component`] that
-    /// paints them from [`crate::AppState`] without the renderer owning it (`altscreen/mod.rs`,
-    /// rule 2). Nothing calls `set_layout_root` today, so a fullscreen session shows the transcript
-    /// and nothing else.
+    /// # The frame
+    /// The scrolled document (committed entries, then the in-flight turn) over a dock, both laid out
+    /// from one [`Regions`] — the same rectangles the inline renderer paints into, so the editor, the
+    /// selectors, the band, the widgets and the footer are the very components inline mode draws, in
+    /// the same rows, with the document taking whatever the dock leaves. The renderer asks
+    /// [`FullscreenChrome`] for that layout and hands the frame back to it for the dock and the
+    /// overlays (`altscreen::Chrome`).
     fn draw_fullscreen(&mut self) -> Result<(), TuiError> {
         // Dropped, not rendered: with retention on the same entries are already in
         // `TranscriptView::document`, which is what `sync_document` walks below.
@@ -260,17 +260,25 @@ impl<B: Backend> App<B> {
         let Some(alt) = altscreen.as_mut() else {
             return Ok(());
         };
-        alt.sync_document(&state.transcript, &state.theme, image_opts(state, None));
-        // §B-12's strip, built from the same two `AppState` fields the inline path renders from, so
-        // an attachment cannot look different across a mode switch.
-        let strip = (!state.pending_images.is_empty()).then(|| crate::altscreen::Strip {
-            renderer: &state.image_renderer,
-            blocks: &state.pending_images,
-            theme: &state.theme,
-            show_images: state.transcript.show_images(),
-            width_cells: state.transcript.image_width_cells(),
-        });
-        alt.draw(strip)
+        // Publish the SCREEN geometry before anything measures, as the inline path does: the editor
+        // caps itself at `max(5, floor(terminalRows * 0.3))` and a windowed selector sizes against
+        // the terminal, not against the rows the dock happens to be given.
+        let screen = alt.area();
+        state.term_rows = screen.height;
+        state.term_cols = screen.width;
+        state.editor.set_terminal_height(screen.height);
+        if let Some(active) = state.selector.as_mut() {
+            active.inner.set_terminal_height(screen.height);
+        }
+        let width = usize::from(alt.content_width());
+        let live = state.transcript.live_rows(width, &state.theme);
+        alt.sync_document(
+            &state.transcript,
+            &state.theme,
+            image_opts(state, None),
+            &live,
+        );
+        alt.draw_with(&mut FullscreenChrome { state })
     }
 
     /// Rebuild the terminal with a new inline-viewport `height` over a fresh handle to the same
@@ -368,5 +376,50 @@ impl<B: Backend> App<B> {
             })
             .map_err(|e| TuiError::Backend(e.to_string()))?;
         Ok(height)
+    }
+}
+
+/// Everything the alternate screen paints that is not the scrolled document: it adapts
+/// [`AppState`] to the renderer's [`crate::altscreen::Chrome`] seam.
+struct FullscreenChrome<'a> {
+    state: &'a mut AppState,
+}
+
+impl crate::altscreen::Chrome for FullscreenChrome<'_> {
+    fn layout(&mut self, screen: Rect) -> Rect {
+        let regions = Regions::compute(self.state, screen);
+        self.state.regions = regions;
+        regions.msg
+    }
+
+    fn strip(&self) -> Option<(crate::altscreen::Strip<'_>, Rect)> {
+        let state = &*self.state;
+        // §B-12's strip, built from the same two `AppState` fields the inline path renders from, so
+        // an attachment cannot look different across a mode switch.
+        (!state.pending_images.is_empty()).then(|| {
+            (
+                crate::altscreen::Strip {
+                    renderer: &state.image_renderer,
+                    blocks: &state.pending_images,
+                    theme: &state.theme,
+                    show_images: state.transcript.show_images(),
+                    width_cells: state.transcript.image_width_cells(),
+                },
+                state.regions.images,
+            )
+        })
+    }
+
+    fn paint(&mut self, frame: &mut Frame) {
+        let regions = self.state.regions;
+        render_impl::paint_header(frame, self.state, &regions);
+        // The startup hints sit in the otherwise-empty message region; once the document has
+        // anything in it the document owns those rows.
+        if self.state.transcript.document().is_empty() {
+            render_impl::paint_startup_hints(frame, self.state, regions.msg);
+        }
+        render_impl::paint_dock_without_images(frame, self.state, &regions);
+        let screen = frame.area();
+        render_impl::paint_overlays(frame, self.state, screen);
     }
 }

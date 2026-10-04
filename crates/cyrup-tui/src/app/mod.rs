@@ -54,6 +54,9 @@ mod layout;
 pub(crate) mod login;
 mod mode_switch;
 mod outcome;
+mod overlay_pointer;
+mod pointer;
+mod regions;
 mod reload_trust;
 mod render_debug;
 #[path = "render.rs"]
@@ -128,6 +131,10 @@ pub use outcome::{
     CompactOutcome, CompactionQueued, ExtensionWidget, LifecycleEffects, LifecycleOutcome,
     LoginProviderSource, QueueDrain, QueueDrainReason, TreeNavMsg,
 };
+pub(crate) use overlay_pointer::OverlayPointerState;
+pub use pointer::Pointer;
+pub(crate) use pointer::PointerState;
+pub(crate) use regions::Regions;
 pub use render_debug::RenderDebug;
 pub(crate) use settings_rows::PROJECT_UNTRUSTED_WARNING;
 pub(crate) use settings_rows::{
@@ -192,7 +199,6 @@ use ratatui::crossterm::terminal::{
     BeginSynchronizedUpdate, Clear, ClearType, EndSynchronizedUpdate, enable_raw_mode,
 };
 use ratatui::crossterm::{ExecutableCommand, queue};
-use ratatui::layout::{Constraint, Layout};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Widget};
 use ratatui::{Frame, Terminal, TerminalOptions, Viewport};
@@ -291,6 +297,12 @@ pub struct App<B: Backend> {
     /// (`interactive-mode.ts:378`), and [`App::set_fullscreen_copy_on_select`] keeps both this and a
     /// live renderer in step, which is its `applyRuntimeSettings` write (`:1995`).
     fullscreen_copy_on_select: bool,
+    /// The `fullscreenWheelScrollLines` setting (TUI-136), held here for the same reason as
+    /// [`Self::fullscreen_copy_on_select`]: [`App::adopt_fullscreen_renderer`] pushes it into each
+    /// alternate screen as it is built (pi's `wheelScrollLines: options.fullscreenWheelScrollLines
+    /// ?? "auto"`, `tui-renderer.ts:38`), and [`App::set_fullscreen_wheel_scroll_lines`] keeps both
+    /// this and a live renderer in step (`interactive-mode.ts:2045`, `:5050-5053`).
+    fullscreen_wheel_scroll_lines: cyrup_config::settings::WheelScrollLines,
     /// The current inline-viewport height (the live region's content height). Recomputed each
     /// [`draw`](Self::draw); the viewport is rebuilt only when it changes (audit #1).
     viewport_height: u16,
@@ -338,6 +350,15 @@ pub struct App<B: Backend> {
     /// [`App::run`]; `None` (no channel wired, or the network policy declined) means the run loop
     /// grows no arm for it at all. The producer is `cyrup::update_check::spawn_package_update_check`.
     package_update_rx: Option<tokio::sync::mpsc::UnboundedReceiver<Vec<String>>>,
+    /// Where the terminal's colours arrive after the boot query gave up on them — Pi's
+    /// `onLateReply` (`theme-controller.ts:31-40`). The producer is the input reader thread, which
+    /// completes a timed-out query the moment the terminal finishes answering it; the run loop
+    /// applies the colours to the [`ThemeController`] and repaints. Installed by
+    /// [`App::set_terminal_colors_channel`]; `None` means no arm exists.
+    terminal_colors_rx: Option<tokio::sync::mpsc::UnboundedReceiver<crate::TerminalColors>>,
+    /// The sending half of [`Self::terminal_colors_rx`], kept so a later re-query (a `/reload`'s
+    /// `applyFromSettings`) answers on the same channel.
+    terminal_colors_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::TerminalColors>>,
     /// Where the spawned `/login` flow posts prompts, progress events and its final outcome —
     /// installed by [`App::install_login_channel`], which [`App::run`] calls once at startup (the
     /// same shape as [`Self::tree_nav_tx`]).

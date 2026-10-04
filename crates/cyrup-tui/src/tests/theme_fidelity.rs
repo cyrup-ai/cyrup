@@ -35,18 +35,17 @@ fn env_of(pairs: &[(&'static str, &'static str)]) -> impl Fn(&str) -> Option<Str
 
 /// Pi renders every hint through `theme.fg("dim", …)` (e.g. `theme.ts:1312`, `:1314`), and `fg()`
 /// (`theme.ts:372-376`) emits a bare foreground escape terminated by `\x1b[39m` — **no** SGR
-/// attribute. The token is `dimGray`: `#666666` in `dark.json:31`+`:12`, `#767676` in
-/// `light.json:30`+`:12`.
+/// attribute. The token is `dim`: `#7e888e` in v1.0.0's `dark.json`, `#879095` in its `light.json`.
 ///
-/// FAILS before the fix on both counts: the accessor resolved `text` (`#d4d4d4` dark / `#1f2328`
+/// FAILS before the fix on both counts: the accessor resolved `text` (`#dee0e1` dark / `#3b3f41`
 /// light) and added `Modifier::DIM`.
 #[test]
 fn t1_dim_style_resolves_the_dim_token_with_no_sgr_attribute() {
     let dark = UiTheme::dark().dim_style();
     assert_eq!(
         dark.fg,
-        Some(Color::Rgb(0x66, 0x66, 0x66)),
-        "dark `dim` is dimGray #666666"
+        Some(Color::Rgb(0x7e, 0x88, 0x8e)),
+        "dark `dim` is #7e888e"
     );
     assert!(
         !dark.add_modifier.contains(Modifier::DIM),
@@ -61,8 +60,8 @@ fn t1_dim_style_resolves_the_dim_token_with_no_sgr_attribute() {
     let light = UiTheme::light().dim_style();
     assert_eq!(
         light.fg,
-        Some(Color::Rgb(0x76, 0x76, 0x76)),
-        "light `dim` is dimGray #767676"
+        Some(Color::Rgb(0x87, 0x90, 0x95)),
+        "light `dim` is #879095"
     );
     assert_eq!(light.add_modifier, Modifier::empty());
 
@@ -75,17 +74,17 @@ fn t1_dim_style_resolves_the_dim_token_with_no_sgr_attribute() {
     assert_ne!(light.fg, UiTheme::light().base_style().fg);
 }
 
-/// MIRROR: `muted` is a *different* token and must not have moved. `dark.json:30 "muted": "gray"`
-/// = `#808080`, and `theme.ts:1291-1295` uses it for select-list descriptions/scroll info.
+/// MIRROR: `muted` is a *different* token and must not have moved. v1.0.0 `dark.json` `muted` =
+/// `#9da5a9`, and `theme.ts:1291-1295` uses it for select-list descriptions/scroll info.
 #[test]
 fn t1_mirror_muted_token_is_untouched_and_distinct_from_dim() {
     let t = UiTheme::dark();
-    assert_eq!(t.muted_style().fg, Some(Color::Rgb(0x80, 0x80, 0x80)));
+    assert_eq!(t.muted_style().fg, Some(Color::Rgb(0x9d, 0xa5, 0xa9)));
     assert_eq!(t.muted_style().add_modifier, Modifier::empty());
     assert_ne!(
         t.muted_style().fg,
         t.dim_style().fg,
-        "muted #808080 vs dim #666666"
+        "muted #9da5a9 vs dim #7e888e"
     );
 }
 
@@ -102,8 +101,8 @@ fn t4_error_style_is_colour_only() {
     let e = t.error_style();
     assert_eq!(
         e.fg,
-        Some(Color::Rgb(0xcc, 0x66, 0x66)),
-        "dark `error` is red #cc6666"
+        Some(Color::Rgb(0xea, 0x7f, 0x81)),
+        "dark `error` is #ea7f81"
     );
     assert!(
         !e.add_modifier.contains(Modifier::BOLD),
@@ -273,12 +272,14 @@ fn style_of(lines: &[ratatui::text::Line<'static>], needle: &str) -> Style {
 /// escape at all and sits at the terminal default.
 ///
 /// FAILS before the fix: `markdown.rs` used `md_code_block_style()` as the per-span default, so
-/// every unclassified run came out `mdCodeBlock` = `#b5bd68` green.
+/// every unclassified run came out `mdCodeBlock` green.
 #[test]
 fn t5_unclassified_code_tokens_carry_no_colour() {
     let t = UiTheme::dark();
-    let lines = render_markdown("```rust\nlet total = compute(1);\n```", 80, &t);
-    let green = Color::Rgb(0xb5, 0xbd, 0x68);
+    // No numeric literal: in v1.0.0's palettes `syntaxNumber` and `mdCodeBlock` are the same green,
+    // so a number would be indistinguishable from the whole-block fallback this test rules out.
+    let lines = render_markdown("```rust\nlet total = compute();\n```", 80, &t);
+    let green = Color::Rgb(0x68, 0xb7, 0x8d);
 
     // `total` is a bare identifier: syntect gives it no scope the table knows.
     let ident = style_of(&lines, "total");
@@ -306,7 +307,7 @@ fn t5_unclassified_code_tokens_carry_no_colour() {
 #[test]
 fn t5_mirror_unknown_language_still_falls_back_to_md_code_block() {
     let t = UiTheme::dark();
-    let green = Color::Rgb(0xb5, 0xbd, 0x68);
+    let green = Color::Rgb(0x68, 0xb7, 0x8d);
     for src in [
         "```\nplain text here\n```",
         "```nosuchlang-zzz\nplain text here\n```",
@@ -323,26 +324,26 @@ fn t5_mirror_unknown_language_still_falls_back_to_md_code_block() {
     let rs = render_markdown("```rust\nlet total = compute(1);\n```", 80, &t);
     assert_eq!(
         style_of(&rs, "let").fg,
-        Some(Color::Rgb(0x56, 0x9C, 0xD6)),
+        Some(Color::Rgb(0x69, 0xad, 0xd0)),
         "syntaxKeyword"
     );
     assert_eq!(
         style_of(&rs, "1").fg,
-        Some(Color::Rgb(0xB5, 0xCE, 0xA8)),
+        Some(Color::Rgb(0x68, 0xb7, 0x8d)),
         "syntaxNumber"
     );
 }
 
 /// Pi maps cli-highlight's `meta` class to `muted` — `meta: (s) => t.fg("muted", s)`,
 /// `theme.ts:1128` — and highlight.js puts that one class on the entire Rust attribute / Python
-/// decorator / C preprocessor line. `muted` is `gray` `#808080` (`dark.json:30`+`:11`).
+/// decorator / C preprocessor line. `muted` is `#9da5a9` in v1.0.0's `dark.json`.
 ///
 /// FAILS before the fix: only `meta.attribute` was mapped (to `syntaxVariable`), so `#` and `]`
-/// came out `syntaxPunctuation` and `derive` came out `#9CDCFE`, with the rest green.
+/// came out `syntaxPunctuation` and `derive` came out `syntaxVariable`, with the rest green.
 #[test]
 fn t6_annotation_and_preprocessor_lines_are_muted() {
     let t = UiTheme::dark();
-    let muted = Color::Rgb(0x80, 0x80, 0x80);
+    let muted = Color::Rgb(0x9d, 0xa5, 0xa9);
 
     let rs = render_markdown("```rust\n#[derive(Debug)]\nstruct S;\n```", 80, &t);
     for tok in ["#", "[", "derive", "]"] {
@@ -376,17 +377,17 @@ fn t6_annotation_and_preprocessor_lines_are_muted() {
 #[test]
 fn t6_mirror_structural_meta_scopes_do_not_grey_out_code() {
     let t = UiTheme::dark();
-    let muted = Color::Rgb(0x80, 0x80, 0x80);
+    let muted = Color::Rgb(0x9d, 0xa5, 0xa9);
     let rs = render_markdown("```rust\nfn main() {\n    let s = \"hi\";\n}\n```", 80, &t);
     // `fn main() { … }` lives under `meta.function.rust` / `meta.block.rust` throughout.
     assert_eq!(
         style_of(&rs, "fn").fg,
-        Some(Color::Rgb(0x56, 0x9C, 0xD6)),
+        Some(Color::Rgb(0x69, 0xad, 0xd0)),
         "storage → syntaxKeyword"
     );
     assert_eq!(
         style_of(&rs, "main").fg,
-        Some(Color::Rgb(0xDC, 0xDC, 0xAA)),
+        Some(Color::Rgb(0xcd, 0x9a, 0x22)),
         "syntaxFunction"
     );
     assert_ne!(style_of(&rs, "fn").fg, Some(muted));
@@ -406,14 +407,14 @@ fn t6_mirror_structural_meta_scopes_do_not_grey_out_code() {
 
 /// `linkUrl` is `(text) => theme.fg("mdLinkUrl", text)` (`theme.ts:1256`), emitted at
 /// `markdown.ts:705` with nothing wrapped around it. FAILS before the fix, which added
-/// `Modifier::DIM`. `mdLinkUrl` is `dimGray` `#666666` (`dark.json:50`).
+/// `Modifier::DIM`. `mdLinkUrl` is `muted` (`#9da5a9`) in v1.0.0's `dark.json`.
 #[test]
 fn t7_link_url_suffix_is_colour_only() {
     let s = UiTheme::dark().md_link_url_style();
     assert_eq!(
         s.fg,
-        Some(Color::Rgb(0x66, 0x66, 0x66)),
-        "mdLinkUrl = dimGray"
+        Some(Color::Rgb(0x9d, 0xa5, 0xa9)),
+        "mdLinkUrl = muted"
     );
     assert!(!s.add_modifier.contains(Modifier::DIM));
     assert_eq!(s.add_modifier, Modifier::empty());
@@ -425,11 +426,7 @@ fn t7_link_url_suffix_is_colour_only() {
 fn t7_mirror_link_text_keeps_its_underline() {
     let s = UiTheme::dark().md_link_style();
     assert!(s.add_modifier.contains(Modifier::UNDERLINED));
-    assert_eq!(
-        s.fg,
-        Some(Color::Rgb(0x81, 0xa2, 0xbe)),
-        "mdLink (dark.json:48)"
-    );
+    assert_eq!(s.fg, Some(Color::Rgb(0x69, 0xad, 0xd0)), "mdLink");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -535,21 +532,19 @@ fn t9_message_and_border_tokens_are_actually_read() {
     );
 }
 
-/// The built-in `customMessageLabel` is purple, distinctly not the teal accent cyrup used to draw
-/// (`dark.json:41` `#9575cd`, `light.json:40` `#7e57c2`).
+/// The built-in `customMessageLabel` is its own token, resolved from the theme: v1.0.0's palettes
+/// give it the violet `accent` value (`#a798d7` dark, `#7459b4` light), so the assertion is on the
+/// value; that the accessor reads the TOKEN rather than `accent` is pinned by
+/// `t9_render_labeled_block_bracket_uses_custom_message_label`, whose theme makes them differ.
 #[test]
-fn t9_builtin_custom_message_label_is_purple_not_accent() {
+fn t9_builtin_custom_message_label_matches_v1_0_0() {
     assert_eq!(
         UiTheme::dark().custom_message_label_style().fg,
-        Some(Color::Rgb(0x95, 0x75, 0xcd))
+        Some(Color::Rgb(0xa7, 0x98, 0xd7))
     );
     assert_eq!(
         UiTheme::light().custom_message_label_style().fg,
-        Some(Color::Rgb(0x7e, 0x57, 0xc2))
-    );
-    assert_ne!(
-        UiTheme::dark().custom_message_label_style().fg,
-        UiTheme::dark().accent
+        Some(Color::Rgb(0x74, 0x59, 0xb4))
     );
 }
 
@@ -592,7 +587,7 @@ fn thinking_border_unknown_level_falls_back_to_thinking_off() {
     );
     assert_eq!(
         t.thinking_border_style("ultra").fg,
-        Some(Color::Rgb(0x50, 0x50, 0x50))
+        Some(Color::Rgb(0x6c, 0x76, 0x7b))
     );
     assert_ne!(t.thinking_border_style("ultra"), t.border_style());
 }
@@ -611,8 +606,10 @@ fn t9_render_labeled_block_bracket_uses_custom_message_label() {
     use crate::App;
     use ratatui::backend::TestBackend;
 
-    let theme = UiTheme::dark();
+    // A sentinel label colour, so the bracket cannot pass by being the accent.
     let purple = Color::Rgb(0x95, 0x75, 0xcd);
+    let mut theme = UiTheme::dark();
+    theme.roles.insert("customMessageLabel".into(), purple);
     let mut app = App::new(TestBackend::new(80, 24), theme.clone()).unwrap();
     app.transcript_mut()
         .push_skill_invocation("commit-helper", "body");
@@ -648,7 +645,7 @@ fn t9_render_labeled_block_bracket_uses_custom_message_label() {
 /// chat editor is repainted per reasoning level (`interactive-mode.ts:3990-3993`).
 ///
 /// FAILS before the fix: the dialog inherited `InputEditor`'s `"medium"` thinking colour
-/// (`thinkingMedium` = `#81a2be`) instead of `borderMuted` (`darkGray` = `#505050`).
+/// (`thinkingMedium` = `#6185cc`) instead of `borderMuted` (`#768186`).
 #[test]
 fn t9_render_extension_editor_rule_is_border_muted() {
     use crate::InputEditor;
@@ -657,8 +654,8 @@ fn t9_render_extension_editor_rule_is_border_muted() {
     use ratatui::layout::Rect;
 
     let theme = UiTheme::dark();
-    let border_muted = Color::Rgb(0x50, 0x50, 0x50);
-    let thinking_medium = Color::Rgb(0x81, 0xa2, 0xbe);
+    let border_muted = Color::Rgb(0x76, 0x81, 0x86);
+    let thinking_medium = Color::Rgb(0x61, 0x85, 0xcc);
 
     let render = |muted: bool| -> Color {
         let mut editor = InputEditor::new();
@@ -690,15 +687,13 @@ fn t9_render_extension_editor_rule_is_border_muted() {
 
 /// The `role_style` hex fallbacks (used only by the synthetic no-resource theme) must agree with the
 /// real palette, so a degraded theme is a dimmer version of the same design rather than a different
-/// one. Five had drifted: `mdCodeBlockBorder`/`mdQuote`/`mdQuoteBorder`/`mdHr` are `gray` `#808080`
-/// (`dark.json:53,54,55,56` — `:57` is `mdListBullet`) and `mdLinkUrl` is `dimGray` `#666666`
-/// (`dark.json:50`). Found while fixing T7.
+/// one. The hexes are v1.0.0's resolved `dark.json` / `light.json` values (`muted` `#9da5a9` /
+/// `#677176` for the rule, quote and URL roles, and so on).
 ///
 /// Asserted for **both** built-ins. `builtin_or_static` synthesizes `UiTheme::dark()` and
 /// `UiTheme::light()` with an empty `roles` map, so both fall through to the same accessor;
-/// aligning the hexes to `dark.json` alone made a resource-less light theme draw dark-theme greys
-/// (`light.json:52-55` is `mediumGray` `#6c6c6c`, `:49` is `dimGray` `#767676`). The light half
-/// FAILS before the theme-aware fallback.
+/// aligning the hexes to the dark palette alone would make a resource-less light theme draw
+/// dark-theme greys. The light half FAILS without the theme-aware fallback.
 #[test]
 fn role_style_hex_fallbacks_match_the_real_palette() {
     for real in [UiTheme::dark(), UiTheme::light()] {
@@ -769,8 +764,8 @@ fn role_style_hex_fallbacks_match_the_real_palette() {
                 "{which}/{name}: fallback hex must equal the palette value"
             );
         }
-        // The syntax table's hexes are the other half of the same accessor (`dark.json:63-71` /
-        // `light.json:62-70`); syntect scope -> Pi class per `buildCliHighlightTheme`.
+        // The syntax table's hexes are the other half of the same accessor; syntect scope -> Pi
+        // class per `buildCliHighlightTheme`.
         for (scope, name) in [
             ("comment.line.rust", "syntaxComment"),
             ("string.quoted.double.rust", "syntaxString"),
@@ -788,8 +783,7 @@ fn role_style_hex_fallbacks_match_the_real_palette() {
                 "{which}/{name}: syntax fallback hex must equal the palette value"
             );
         }
-        // The thinking-border ladder, `dark.json:73-78` / `light.json:72-77`. `thinkingOff` used to
-        // default to `#666666` where the token is `darkGray` `#505050` / `lightGray` `#b0b0b0`.
+        // The thinking-border ladder: the six level tokens of `dark.json` / `light.json`.
         for level in ["off", "minimal", "low", "medium", "high", "xhigh"] {
             assert_eq!(
                 bare.thinking_border_style(level).fg,
@@ -800,7 +794,7 @@ fn role_style_hex_fallbacks_match_the_real_palette() {
         // `max` is deliberately NOT in that list. Pi makes `thinkingMax` the one OPTIONAL colour
         // token and resolves it as `colors.thinkingMax ?? colors.thinkingXhigh`
         // (`theme.ts:93,326-329,358`), so a palette that omits it reuses its OWN `xhigh` rather
-        // than any hardcoded default. `dark.json:79` and `light.json:78` do define it, which is
+        // than any hardcoded default. `dark.json` and `light.json` do define it, which is
         // why the bare and real values differ here — that difference is the ported `??`, not drift.
         assert_eq!(
             bare.thinking_border_style("max").fg,
@@ -826,7 +820,7 @@ fn role_style_hex_fallbacks_match_the_real_palette() {
 /// (`theme.ts:384-394`).
 ///
 /// FAILS before the fix: `markup.italic` and `markup.bold` returned an explicit `text` foreground
-/// (`#d4d4d4`) alongside the attribute, which overrides whatever colour the surrounding run had.
+/// (`#dee0e1`) alongside the attribute, which overrides whatever colour the surrounding run had.
 /// `markup.underline` returned `None` (Pi's `link` class was unmapped).
 #[test]
 fn attribute_only_syntax_classes_emit_no_foreground() {
@@ -869,15 +863,11 @@ fn mirror_markup_diff_classes_keep_their_colour() {
     let t = UiTheme::dark();
     let add = t.syntax_style_for_scope("markup.inserted.diff").unwrap();
     let del = t.syntax_style_for_scope("markup.deleted.diff").unwrap();
-    assert_eq!(
-        add.fg,
-        Some(Color::Rgb(0xb5, 0xbd, 0x68)),
-        "toolDiffAdded (dark.json:59)"
-    );
+    assert_eq!(add.fg, Some(Color::Rgb(0x68, 0xb7, 0x8d)), "toolDiffAdded");
     assert_eq!(
         del.fg,
-        Some(Color::Rgb(0xcc, 0x66, 0x66)),
-        "toolDiffRemoved (dark.json:60)"
+        Some(Color::Rgb(0xea, 0x7f, 0x81)),
+        "toolDiffRemoved"
     );
     assert_eq!(
         add.add_modifier,
@@ -1143,29 +1133,20 @@ fn t9_mirror_custom_message_bg_covers_the_sibling_blocks_and_is_optional() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// T9 — `scrollbarThumb`, Pi's seventh (and OPTIONAL) background token.
+// T9 / TUI-110 — `scrollbarTrack` and `scrollbarThumb`, Pi's two OPTIONAL fullscreen FOREGROUND
+// tokens.
 //
-// This is a direct mirror of `pi/packages/coding-agent/test/scrollbar-theme.test.ts`, which was RUN
-// against v0.84.1's source to read its expectations. That test constructs no `ScrollView`, enters no
-// alt-screen renderer and reads no `fullscreenScrollbar` setting: it loads a theme JSON and asserts
-// how the token RESOLVES. Resolution is the part cyrup can port today, and it is the part a user
-// notices first — a theme that omits the token must resolve to its own `selectedBg`, not to "no
-// colour", and a theme that sets it must win.
-//
-// ```ts
-// // :31-38
-// delete themeJson.colors.scrollbarThumb;
-// const loadedTheme = loadThemeFromPath(writeTheme(themeJson), "truecolor");
-// expect(loadedTheme.getBgAnsi("scrollbarThumb")).toBe(loadedTheme.getBgAnsi("selectedBg"));
-// // :40-47
-// themeJson.colors.scrollbarThumb = "#123456";
-// expect(loadedTheme.getBgAnsi("scrollbarThumb")).toBe("\x1b[48;2;18;52;86m");  // rgb(18,52,86)
-// ```
+// A direct mirror of `pi/packages/coding-agent/test/scrollbar-theme.test.ts` @v1.0.0, which loads a
+// theme JSON and asserts how each token RESOLVES: omitted, `scrollbarTrack` falls back to `muted`
+// and `scrollbarThumb` to `text` (`withThemeColorFallbacks`, `theme.ts:173-174`, and again in the
+// `Theme` constructor, `:281-282`); configured, the theme's own value wins. Both are read with
+// `getFgAnsi`, i.e. they are foregrounds — the earlier design resolved the thumb as a BACKGROUND
+// falling back to `selectedBg`.
 // ---------------------------------------------------------------------------------------------
 
-/// Load the built-in `dark` theme, optionally overriding `colors.scrollbarThumb`, and project it the
-/// way boot does. `None` = the token is absent, which is upstream's "legacy theme" case.
-fn dark_with_scrollbar_thumb(value: Option<&str>) -> UiTheme {
+/// Load the built-in `dark` theme, optionally overriding one `colors` entry, and project it the way
+/// boot does. `None` = the token is absent, which is upstream's "legacy theme" case.
+fn dark_with_color(token: &str, value: Option<&str>) -> UiTheme {
     let mut theme = cyrup_resources::theme::builtin_themes()
         .into_iter()
         .find(|t| t.data.name == "dark")
@@ -1175,69 +1156,71 @@ fn dark_with_scrollbar_thumb(value: Option<&str>) -> UiTheme {
             theme
                 .data
                 .colors
-                .insert("scrollbarThumb".to_string(), v.to_string());
+                .insert(token.to_string(), cyrup_resources::ColorValue::from(v));
         }
         None => {
-            theme.data.colors.remove("scrollbarThumb");
+            theme.data.colors.remove(token);
         }
     }
     UiTheme::from_resolved(theme.data.name.clone(), &theme.resolve(), 0)
 }
 
-/// `scrollbarThumb ?? selectedBg` — applied by `withThemeColorFallbacks` (`theme.ts:330`) and again
-/// by the `Theme` constructor (`theme.ts:365`). A theme that omits the token resolves to its OWN
-/// `selectedBg`, never to `None`.
+/// `falls back to %s when omitted` (`scrollbar-theme.test.ts:34-43`): `scrollbarTrack` takes the
+/// theme's own `muted`, `scrollbarThumb` its own `text`, never a hardcoded colour and never `None`.
 ///
-/// FAILS before the fix: `BackgroundTheme` had no `scrollbar_thumb` field at all, and the raw role
-/// lookup for a token the theme does not define answers `None` — i.e. "terminal default", which is
-/// a different colour from `selectedBg` on every theme.
+/// FAILS without the change: the thumb resolved as a BACKGROUND falling back to `selectedBg`, and
+/// there was no `scrollbarTrack` accessor at all.
 #[test]
-fn t9_an_omitted_scrollbar_thumb_falls_back_to_selected_bg() {
-    let theme = dark_with_scrollbar_thumb(None);
-    let bg = theme.backgrounds();
-
+fn t9_omitted_scrollbar_tokens_fall_back_to_muted_and_text() {
+    let theme = dark_with_color("scrollbarTrack", None);
     assert_eq!(
-        bg.scrollbar_thumb, bg.selected,
-        "`scrollbarThumb: bgColors.scrollbarThumb ?? bgColors.selectedBg` (theme.ts:365)"
+        theme.scrollbar_track(),
+        theme.muted,
+        "scrollbarTrack ?? muted"
     );
-    // …and pin the concrete value, so the assertion cannot be satisfied by both being `None`.
+    let theme = dark_with_color("scrollbarThumb", None);
     assert_eq!(
-        bg.scrollbar_thumb,
-        Some(Color::Rgb(0x3a, 0x3a, 0x4a)),
-        "dark `selectedBg` is `#3a3a4a` (dark.json vars `selectedBg`)"
+        theme.scrollbar_thumb(),
+        theme.foreground,
+        "scrollbarThumb ?? text"
     );
-}
-
-/// The other half: an explicitly configured `scrollbarThumb` WINS over the fallback
-/// (`scrollbar-theme.test.ts:40-47`, whose `#123456` is `rgb(18,52,86)`).
-#[test]
-fn t9_an_explicit_scrollbar_thumb_overrides_the_fallback() {
-    let theme = dark_with_scrollbar_thumb(Some("#123456"));
-    let bg = theme.backgrounds();
-
-    assert_eq!(
-        bg.scrollbar_thumb,
-        Some(Color::Rgb(18, 52, 86)),
-        "the theme's own value, not `selectedBg`"
-    );
+    // …and pin the concrete values, so the assertions cannot be satisfied by both being `None`.
+    assert!(theme.muted.is_some() && theme.foreground.is_some());
     assert_ne!(
-        bg.scrollbar_thumb, bg.selected,
-        "the fallback must not shadow an explicit token"
+        theme.scrollbar_thumb(),
+        theme.backgrounds().selected,
+        "the old background fallback (`selectedBg`) is gone"
     );
 }
 
-/// The token is OPTIONAL upstream (`Type.Optional(ColorValueSchema)`, `theme.ts:50`), so a theme
-/// that omits it must still LOAD — it is not one of the 51 required tokens. Guards against
-/// "porting" the token by adding it to the required set, which would reject every pre-existing user
-/// theme, the exact regression upstream's optionality exists to prevent.
+/// `uses explicitly configured scrollbar colors` (`scrollbar-theme.test.ts:45-54`): `#654321` is
+/// `rgb(101,67,33)` and `#123456` is `rgb(18,52,86)`.
 #[test]
-fn t9_scrollbar_thumb_is_optional_and_never_required() {
-    assert!(
-        !cyrup_resources::theme::REQUIRED_COLOR_TOKENS.contains(&"scrollbarThumb"),
-        "`theme.ts:50` declares it Type.Optional; docs/themes.md:144 lists it with `thinkingMax` \
-         as the two optional tokens among 51 required ones"
+fn t9_explicit_scrollbar_tokens_override_the_fallbacks() {
+    let theme = dark_with_color("scrollbarTrack", Some("#654321"));
+    assert_eq!(theme.scrollbar_track(), Some(Color::Rgb(101, 67, 33)));
+    let theme = dark_with_color("scrollbarThumb", Some("#123456"));
+    assert_eq!(
+        theme.scrollbar_thumb(),
+        Some(Color::Rgb(18, 52, 86)),
+        "parsed from the theme JSON"
     );
-    // A theme with no `scrollbarThumb` still resolves every other background.
-    let bg = dark_with_scrollbar_thumb(None).backgrounds();
+    assert_ne!(theme.scrollbar_thumb(), theme.foreground, "not `text`");
+}
+
+/// Both tokens are OPTIONAL upstream (`OptionalThemeColor`, `theme.ts:128`), so a theme that omits
+/// them must still LOAD — neither is one of the required tokens. Guards against "porting" a token
+/// by adding it to the required set, which would reject every pre-existing user theme.
+#[test]
+fn t9_scrollbar_tokens_are_optional_and_never_required() {
+    for token in ["scrollbarTrack", "scrollbarThumb"] {
+        assert!(
+            !cyrup_resources::theme::REQUIRED_COLOR_TOKENS.contains(&token),
+            "`theme.ts:128` lists {token} among the optional tokens"
+        );
+    }
+    // A theme with neither still resolves every background.
+    let theme = dark_with_color("scrollbarTrack", None);
+    let bg = theme.backgrounds();
     assert!(bg.selected.is_some() && bg.user_message.is_some() && bg.tool_error.is_some());
 }

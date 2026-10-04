@@ -80,25 +80,25 @@ fn x6_expanded_read_of_a_rust_file_is_highlighted() {
         .iter()
         .find(|s| s.content.contains("comment"))
         .expect("the comment text is on the row");
-    assert_ne!(
-        comment_span.style,
-        theme.tool_output_style(),
-        "a highlighted row is NOT painted `toolOutput`:\n{}",
-        joined(&lines)
-    );
     assert_eq!(
         comment_span.style,
         theme.syntax_style_for_scope("comment.line").unwrap(),
         "`// a comment` takes the syntaxComment role"
     );
     // The `fn` keyword on the next row proves the highlighter ran over the whole body, not just
-    // the first line.
+    // the first line. It is also what proves the row is NOT painted `toolOutput`: in v1.0.0's
+    // palettes `syntaxComment` and `toolOutput` are both `muted`, so the comment cannot tell.
     let decl = row(&lines, "fn main");
+    let keyword = theme.syntax_style_for_scope("keyword").unwrap();
     assert!(
-        decl.spans
-            .iter()
-            .any(|s| s.style == theme.syntax_style_for_scope("keyword").unwrap()),
+        decl.spans.iter().any(|s| s.style == keyword),
         "`fn` takes the syntaxKeyword role:\n{}",
+        joined(&lines)
+    );
+    assert_ne!(
+        keyword,
+        theme.tool_output_style(),
+        "a highlighted row is NOT painted `toolOutput`:\n{}",
         joined(&lines)
     );
 

@@ -556,8 +556,8 @@ mod tests {
         );
         assert_eq!(
             corner.fg,
-            Some(cyrup_ext::OverlayColor::DarkGray),
-            "the border keeps its colour crossing the overlay seam"
+            Some(cyrup_ext::OverlayColor::Theme(cyrup_ext::ThemeRole::Border)),
+            "the border crosses the overlay seam as the `border` theme role"
         );
         let title = tall[1]
             .spans

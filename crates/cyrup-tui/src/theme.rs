@@ -6,8 +6,16 @@
 //! the per-component `Style`s the widgets read. A `generation` counter is bumped on every
 //! hot-reload so render caches can be invalidated (R-10-026).
 
-use cyrup_resources::theme::{ColorSpec, ResolvedTheme, ThemeData, builtin_themes};
+use std::collections::{BTreeMap, BTreeSet};
+
+use cyrup_resources::theme::{Appearance, ColorSpec, ResolvedTheme, ThemeData, builtin_themes};
 use ratatui::style::{Color, Modifier, Style};
+
+use crate::system_theme::{
+    SYSTEM_THEME_NAME, Saturation, SystemColor, SystemThemeInput, generate_system_theme_colors,
+    terminal_appearance,
+};
+use crate::terminal_query::{COLOR_QUERY_TIMEOUT, LateColors, TerminalColors, TerminalProbe};
 
 /// The terminal color-depth the [`UiTheme`] projects its RGB roles into (Pi `ColorMode`, v0.84.1
 /// `coding-agent/src/modes/interactive/theme/theme.ts:167` + the capability gate at `:611`).
@@ -162,6 +170,16 @@ pub struct UiTheme {
     /// spec/tui/06 §11) can resolve the full ~51-token role set (`REQUIRED_COLOR_TOKENS`) without a
     /// field per role. Empty for the synthetic static fallback (the role helpers then use defaults).
     pub roles: std::collections::BTreeMap<String, Color>,
+    /// The background the theme itself is designed for: declared in its JSON, detected from its
+    /// colours, or — for the system theme — decided by the terminal's reported colours (Pi
+    /// `Theme.ownAppearance`, `theme.ts:256`, `:306`). `None` for a theme with no concrete colour.
+    own_appearance: Option<Appearance>,
+    /// Pi `getTerminalTheme()` (`theme.ts:713`), stamped on by the [`ThemeController`]: what
+    /// [`UiTheme::appearance`] answers for a theme that has no appearance of its own.
+    terminal_appearance: Appearance,
+    /// Foreground roles rendered faint (SGR 2) on top of their colour — the system theme's neutral
+    /// tokens when the terminal reported nothing (Pi `Theme.dimTokens`, `theme.ts:255`, `:361`).
+    dim_roles: BTreeSet<String>,
 }
 
 impl Default for UiTheme {
@@ -193,20 +211,19 @@ impl UiTheme {
         &DEFAULT
     }
 
-    /// Project a `ResolvedTheme` (color roles already resolved through `vars`) into a `UiTheme`.
-    pub fn from_resolved(
-        name: impl Into<String>,
-        resolved: &ResolvedTheme,
+    /// Build a theme from already-resolved role colours — the one place the eight direct fields
+    /// (`foreground`, `accent`, …) are read off the role map, so a built-in, a file theme and the
+    /// generated system theme cannot disagree about which role feeds which.
+    fn from_roles(
+        name: String,
+        roles: BTreeMap<String, Color>,
+        own_appearance: Option<Appearance>,
+        dim_roles: BTreeSet<String>,
         generation: u64,
     ) -> Self {
-        let role = |key: &str| resolved.roles.get(key).copied().and_then(color_of);
-        let roles = resolved
-            .roles
-            .iter()
-            .filter_map(|(k, spec)| color_of(*spec).map(|c| (k.clone(), c)))
-            .collect();
+        let role = |key: &str| roles.get(key).copied();
         UiTheme {
-            name: name.into(),
+            name,
             generation,
             color_mode: ColorMode::default(),
             foreground: role("text"),
@@ -219,30 +236,68 @@ impl UiTheme {
             success: role("success"),
             warning: role("warning"),
             bash_mode: role("bashMode"),
+            own_appearance,
+            terminal_appearance: Appearance::Dark,
+            dim_roles,
             roles,
         }
     }
 
-    /// A compiled-in built-in (`"dark"` / `"light"`); falls back to the dark palette if the name is
-    /// unknown so this is total and never panics (R-00-009, R-10-027).
+    /// Project a `ResolvedTheme` (color roles already resolved through `vars`) into a `UiTheme`.
+    ///
+    /// A role the theme sets to `""` is present in the map as [`Color::Reset`] — the terminal's
+    /// default foreground or background, which Pi draws with `\x1b[39m` / `\x1b[49m`
+    /// (`Theme.addToken`, `theme.ts:290-294`) — and NOT absent: an absent role falls back to a
+    /// compiled hex, which is a different colour.
+    pub fn from_resolved(
+        name: impl Into<String>,
+        resolved: &ResolvedTheme,
+        generation: u64,
+    ) -> Self {
+        let roles = resolved
+            .roles
+            .iter()
+            .map(|(k, spec)| (k.clone(), color_of(*spec)))
+            .collect();
+        UiTheme::from_roles(
+            name.into(),
+            roles,
+            resolved.appearance,
+            BTreeSet::new(),
+            generation,
+        )
+    }
+
+    /// A compiled-in theme by name — `"system"`, `"dark"` or `"light"`. An unknown name is the
+    /// system theme, as it is for pi's `applyThemeName` (`theme-controller.ts:180`) so this is total
+    /// and never panics (R-00-009, R-10-027).
     ///
     /// Callers that must DISTINGUISH "the name is unknown" from "the name is `dark`" — the theme
     /// load path, which owes the user pi's `Failed to load theme …` sentence (TUI-096) — ask
     /// [`UiTheme::builtin_named`] instead; this stays the total, silent projection every render
     /// site uses.
     pub fn builtin(name: &str) -> Self {
-        UiTheme::builtin_named(name).unwrap_or_else(UiTheme::dark)
+        UiTheme::builtin_named(name)
+            .unwrap_or_else(|| UiTheme::system(&SystemThemeInput::default()))
     }
 
     /// The compiled-in built-in with this exact name, or `None` when there is none.
     ///
     /// This is pi's `loadThemeJson` built-in lookup, `if (name in builtinThemes)`
-    /// (`modes/interactive/theme/theme.ts:607-610` @v0.84.4), split out from [`UiTheme::builtin`]
-    /// so a failed lookup is a value rather than a silent dark repaint: upstream's miss continues
+    /// (`modes/interactive/theme/theme.ts:551-554` @v1.0.0), split out from [`UiTheme::builtin`]
+    /// so a failed lookup is a value rather than a silent repaint: upstream's miss continues
     /// on to the registered themes and finally `throw new Error(\`Theme not found: ${name}\`)`
-    /// (`:623`), which `setTheme` catches into the `{success: false, error}` the controller reports
-    /// (`:900-911`).
+    /// (`:567`), which `setTheme` catches into the `{success: false, error}` the controller reports.
+    ///
+    /// `"system"` is a built-in too (`loadTheme`, `theme.ts:633`: "The system theme name is
+    /// reserved: it takes precedence over custom themes of the same name"). It is generated from the
+    /// terminal's colours, which this lookup does not know: the answer here is the theme for a
+    /// terminal that reported nothing. A caller that holds the reported colours — the
+    /// [`ThemeController`] — generates it with [`UiTheme::system`] instead.
     pub fn builtin_named(name: &str) -> Option<Self> {
+        if name == SYSTEM_THEME_NAME {
+            return Some(UiTheme::system(&SystemThemeInput::default()));
+        }
         builtin_themes().into_iter().find_map(|theme| {
             (theme.key.as_str() == name).then(|| {
                 let resolved = theme.resolve();
@@ -251,30 +306,81 @@ impl UiTheme {
         })
     }
 
-    /// The compiled-in `dark` theme (Pi `dark.json`: text `#d4d4d4`, accent `#8abeb7`, error `#cc6666`).
-    pub fn dark() -> Self {
-        UiTheme::builtin_or_static(
-            "dark",
-            Color::Rgb(0xd4, 0xd4, 0xd4),
-            Color::Rgb(0x8a, 0xbe, 0xb7),
-            Color::Rgb(0xcc, 0x66, 0x66),
+    /// The `system` theme generated from what the terminal reported — Pi `createSystemTheme`
+    /// (`theme.ts:611-623`): every token's colour is derived from the terminal's own colours, in one
+    /// of three tiers depending on what it reported (see [`crate::system_theme`]).
+    pub fn system(input: &SystemThemeInput) -> Self {
+        let generated = generate_system_theme_colors(input);
+        let roles = generated
+            .colors
+            .iter()
+            .map(|(token, color)| {
+                let color = match color {
+                    SystemColor::Rgb(rgb) => Color::Rgb(rgb.r, rgb.g, rgb.b),
+                    SystemColor::Indexed(index) => Color::Indexed(*index),
+                    SystemColor::Default => Color::Reset,
+                };
+                ((*token).to_string(), color)
+            })
+            .collect();
+        let dim = generated.dim.iter().map(|t| (*t).to_string()).collect();
+        UiTheme::from_roles(
+            SYSTEM_THEME_NAME.to_string(),
+            roles,
+            generated.appearance,
+            dim,
+            0,
         )
     }
 
-    /// The compiled-in `light` theme (Pi `light.json`: text `#1f2328`, accent `#5a8080`, error `#aa5555`).
+    /// The background this theme is designed for — Pi `Theme.appearance` (`theme.ts:313`): declared,
+    /// detected from its colours, or, for a theme with no concrete colour, the terminal's.
+    #[must_use]
+    pub fn appearance(&self) -> Appearance {
+        self.own_appearance.unwrap_or(self.terminal_appearance)
+    }
+
+    /// Record the terminal's appearance, the answer for a theme that has none of its own.
+    #[must_use]
+    pub fn with_terminal_appearance(mut self, terminal: Appearance) -> Self {
+        self.terminal_appearance = terminal;
+        self
+    }
+
+    /// The compiled-in `dark` theme (Pi `dark.json` @v1.0.0: text `okhsl(234 3% 89%)`, accent
+    /// `okhsl(295 50% 67%)`, error `okhsl(20 72% 67%)`).
+    pub fn dark() -> Self {
+        UiTheme::builtin_or_static(
+            "dark",
+            Appearance::Dark,
+            Color::Rgb(222, 224, 225),
+            Color::Rgb(167, 152, 215),
+            Color::Rgb(234, 127, 129),
+        )
+    }
+
+    /// The compiled-in `light` theme (Pi `light.json` @v1.0.0: text `okhsl(225 5% 27%)`, accent
+    /// `okhsl(295 60% 46%)`, error `okhsl(20 91% 47%)`).
     pub fn light() -> Self {
         UiTheme::builtin_or_static(
             "light",
-            Color::Rgb(0x1f, 0x23, 0x28),
-            Color::Rgb(0x5a, 0x80, 0x80),
-            Color::Rgb(0xaa, 0x55, 0x55),
+            Appearance::Light,
+            Color::Rgb(59, 63, 65),
+            Color::Rgb(116, 89, 180),
+            Color::Rgb(200, 37, 61),
         )
     }
 
     /// Look up a built-in by name, or synthesize a minimal palette from the given Pi `text`/`accent`/
     /// `error` colors if the resource layer somehow cannot supply it (keeps zero-disk-I/O
     /// availability, R-10-027). Background stays terminal-default (Pi has no global background token).
-    fn builtin_or_static(name: &str, text: Color, accent: Color, error: Color) -> Self {
+    fn builtin_or_static(
+        name: &str,
+        appearance: Appearance,
+        text: Color,
+        accent: Color,
+        error: Color,
+    ) -> Self {
         for theme in builtin_themes() {
             if theme.key.as_str() == name {
                 let resolved = theme.resolve();
@@ -294,41 +400,21 @@ impl UiTheme {
             success: None,
             warning: None,
             bash_mode: None,
-            roles: std::collections::BTreeMap::new(),
+            roles: BTreeMap::new(),
+            own_appearance: Some(appearance),
+            terminal_appearance: appearance,
+            dim_roles: BTreeSet::new(),
         }
     }
 
     /// Project freshly-watched [`ThemeData`] (e.g. from `cyrup_resources::theme::ThemeWatcher`)
-    /// into a `UiTheme` for hot-reload (R-10-026). Resolves the role through `vars` + hex parsing,
-    /// mirroring `Theme::resolve`, so the watcher's `Arc<ThemeData>` can be applied without first
-    /// reconstructing a `Theme`. Bad/empty values inherit the terminal default (no panic).
+    /// into a `UiTheme` for hot-reload (R-10-026). Resolves exactly as [`Theme::resolve`] does —
+    /// recursively through `vars`, with the same colour grammar — so the watcher's `Arc<ThemeData>`
+    /// can be applied without first reconstructing a `Theme`.
+    ///
+    /// [`Theme::resolve`]: cyrup_resources::Theme::resolve
     pub fn from_theme_data(data: &ThemeData, generation: u64) -> Self {
-        let role = |key: &str| {
-            data.colors
-                .get(key)
-                .and_then(|raw| resolve_value(raw, &data.vars))
-        };
-        let roles = data
-            .colors
-            .keys()
-            .filter_map(|k| role(k).map(|c| (k.clone(), c)))
-            .collect();
-        UiTheme {
-            name: data.name.clone(),
-            generation,
-            color_mode: ColorMode::default(),
-            foreground: role("text"),
-            // Pi has no global background token; per-component backgrounds are wired separately.
-            background: None,
-            accent: role("accent"),
-            error: role("error"),
-            muted: role("muted"),
-            border: role("border"),
-            success: role("success"),
-            warning: role("warning"),
-            bash_mode: role("bashMode"),
-            roles,
-        }
+        UiTheme::from_resolved(data.name.clone(), &data.resolve(), generation)
     }
 
     /// Bump the generation (caches keyed by generation re-render). Used by the hot-reload hook.
@@ -397,8 +483,8 @@ impl UiTheme {
         Style::default().fg(self.error.unwrap_or(Color::Red))
     }
 
-    /// Secondary/hint chrome — Pi's **`dim` token**, colour only (`dark.json:31 "dim": "dimGray"`
-    /// = `#666666`; `light.json:30` = `#767676`).
+    /// Secondary/hint chrome — Pi's **`dim` token**, colour only (v1.0.0 `dark.json` `dim` =
+    /// `okhsl(229 8% 56%)` = `#7e888e`; `light.json` `okhsl(229 7% 59%)` = `#879095`).
     ///
     /// T1 (TUI-FIDELITY §2): this used to resolve the `text` role and add `Modifier::DIM`, which is
     /// wrong twice over. Pi renders every hint through `theme.fg("dim", …)` (e.g.
@@ -408,7 +494,7 @@ impl UiTheme {
     /// render at full brightness, and which in the *light* theme came out near-black `#1f2328`
     /// where Pi draws grey.
     pub fn dim_style(&self) -> Style {
-        self.role_style("dim", "#666666", "#767676")
+        self.role_style("dim", "#7e888e", "#879095")
     }
 
     /// Style for the user's own messages (bold accent label).
@@ -425,13 +511,26 @@ impl UiTheme {
 
     /// Muted style (descriptions, scroll indicators, hints, footer body) — Pi `muted` (theme.ts:543).
     ///
-    /// The `muted` token is `gray` `#808080` (`dark.json:30`+`:11`) / `mediumGray` `#6c6c6c`
-    /// (`light.json:29`+`:11`); it is a *different* token from `dim`, so a theme that omits it falls
-    /// back to its own palette's grey rather than to [`Self::dim_style`]'s `dimGray`.
+    /// The `muted` token is `#9da5a9` in v1.0.0's `dark.json` and `#677176` in `light.json`; it is a
+    /// *different* token from `dim`, so a theme that omits it falls back to its own palette's value
+    /// rather than to [`Self::dim_style`]'s.
     pub fn muted_style(&self) -> Style {
         match self.muted {
-            Some(c) => Style::default().fg(c),
-            None => self.role_style("muted", "#808080", "#6c6c6c"),
+            Some(c) => Style::default()
+                .fg(c)
+                .add_modifier(self.faint_modifier("muted")),
+            None => self.role_style("muted", "#9da5a9", "#677176"),
+        }
+    }
+
+    /// `Modifier::DIM` (SGR 2) when the theme renders `key` faint, else nothing — Pi's `fg()` for a
+    /// `dimTokens` member emits `\x1b[2m` after the colour (`theme.ts:361-366`). Only the system
+    /// theme, generated for a terminal that reported no colours, has any.
+    fn faint_modifier(&self, key: &str) -> Modifier {
+        if self.dim_roles.contains(key) {
+            Modifier::DIM
+        } else {
+            Modifier::empty()
         }
     }
 
@@ -456,9 +555,9 @@ impl UiTheme {
     /// [`crate::TreeSelector`] coloured its rows per role (S24) the token had no read site at all
     /// even though a custom theme is *required* to define it (`theme-schema.json:41`).
     ///
-    /// It is a distinct colour from `accent` in both built-ins — `cyan` `#00d7ff` vs `accent`
-    /// `#8abeb7` (`dark.json:5,14,23,25`), `teal` vs `#5a8080` (`light.json:24`) — so the fallback
-    /// chain goes to `border` before `accent` rather than collapsing onto the accent role.
+    /// It is a distinct colour from `accent` in both built-ins (v1.0.0 `dark.json`: `borderAccent`
+    /// `#a08ed5` vs `accent` `#a798d7`; `light.json`: `#8a72cb` vs `#7459b4`), so the fallback chain
+    /// goes to `border` before `accent` rather than collapsing onto the accent role.
     pub fn border_accent_style(&self) -> Style {
         let fg = self
             .roles
@@ -505,7 +604,11 @@ impl UiTheme {
             // `"off"` and Pi's `default:` arm share `thinkingOff` (theme.ts:423-424, :437-438).
             _ => thinking.off,
         };
-        Style::default().fg(color)
+        let faint = match level {
+            "minimal" | "low" | "medium" | "high" | "xhigh" | "max" => Modifier::empty(),
+            _ => self.faint_modifier("thinkingOff"),
+        };
+        Style::default().fg(color).add_modifier(faint)
     }
 
     /// The **editor's own** top/bottom rule when no reasoning level owns it — Pi `borderMuted`.
@@ -526,7 +629,9 @@ impl UiTheme {
             .or(self.border)
             .or(self.muted)
             .unwrap_or(Color::DarkGray);
-        Style::default().fg(fg)
+        Style::default()
+            .fg(fg)
+            .add_modifier(self.faint_modifier("borderMuted"))
     }
 
     // --- structured sub-themes (feature #3) -----------------------------------------------------
@@ -550,30 +655,43 @@ impl UiTheme {
             tool_pending: g("toolPendingBg"),
             tool_success: g("toolSuccessBg"),
             tool_error: g("toolErrorBg"),
-            // `scrollbarThumb: bgColors.scrollbarThumb ?? bgColors.selectedBg` (`theme.ts:365`,
-            // and again at `:330`). The fallback is to this theme's OWN resolved `selectedBg`,
-            // never a hardcoded colour — exactly as `thinkingMax` falls back to `thinkingXhigh`.
-            scrollbar_thumb: g("scrollbarThumb").or(selected),
         }
+    }
+
+    /// The fullscreen scrollbar's TRACK foreground — pi's optional `scrollbarTrack` token, which
+    /// the loader and the `Theme` constructor both default with `scrollbarTrack ?? muted`
+    /// (`theme.ts:173`, `:281` @v1.0.0). The fallback is this theme's OWN resolved `muted`, never a
+    /// hardcoded colour — exactly as `thinkingMax` falls back to `thinkingXhigh`. `None` is the
+    /// terminal's default foreground. TUI-110.
+    pub fn scrollbar_track(&self) -> Option<Color> {
+        self.roles.get("scrollbarTrack").copied().or(self.muted)
+    }
+
+    /// The fullscreen scrollbar's THUMB foreground — `scrollbarThumb ?? text` (`theme.ts:174`,
+    /// `:282` @v1.0.0). Both scrollbar tokens are FOREGROUND colours painted with
+    /// `theme.fg(…)` (`interactive-mode.ts:966-967`), not backgrounds. TUI-110.
+    pub fn scrollbar_thumb(&self) -> Option<Color> {
+        self.roles
+            .get("scrollbarThumb")
+            .copied()
+            .or(self.foreground)
     }
 
     /// The structured **thinking-border** sub-theme (Pi `thinking{Off..Xhigh}`, interactive-mode.ts:
     /// 3533-3541): the escalating per-reasoning-level editor rule color, one typed field per level,
     /// each resolved from the live theme with the spec/tui/03 §3.3 dark-hex fallback so it is total.
     pub fn thinking(&self) -> ThinkingTheme {
-        // Fallback pairs, `dark.json:73-78` / `light.json:72-77`. `thinkingOff` used to default to
-        // `#666666` (`dimGray`); the token is `darkGray` `#505050` dark / `lightGray` `#b0b0b0`
-        // light — the same drifted-fallback defect as the markdown roles in [`Self::role_style`].
+        // Fallback pairs: the v1.0.0 `dark.json` / `light.json` values of the six level tokens.
         let level = |key: &str, dark_hex: &str, light_hex: &str| {
             self.role_color_themed(key, dark_hex, light_hex)
         };
-        let xhigh = level("thinkingXhigh", "#d183e8", "#8b008b");
+        let xhigh = level("thinkingXhigh", "#de54c1", "#e585cd");
         ThinkingTheme {
-            off: level("thinkingOff", "#505050", "#b0b0b0"),
-            minimal: level("thinkingMinimal", "#6e6e6e", "#767676"),
-            low: level("thinkingLow", "#5f87af", "#547da7"),
-            medium: level("thinkingMedium", "#81a2be", "#5a8080"),
-            high: level("thinkingHigh", "#b294bb", "#875f87"),
+            off: level("thinkingOff", "#6c767b", "#c2c8ca"),
+            minimal: level("thinkingMinimal", "#68808d", "#b5c4cb"),
+            low: level("thinkingLow", "#5489a4", "#9fc2d5"),
+            medium: level("thinkingMedium", "#6185cc", "#a2b7e0"),
+            high: level("thinkingHigh", "#9776e5", "#b5a5e8"),
             xhigh,
             // Pi made `thinkingMax` an OPTIONAL theme token with an explicit
             // `colors.thinkingMax ?? colors.thinkingXhigh` fallback (theme.ts:93,329,358) so
@@ -601,9 +719,6 @@ impl UiTheme {
             "toolPendingBg" => bg.tool_pending,
             "toolSuccessBg" => bg.tool_success,
             "toolErrorBg" => bg.tool_error,
-            // Routed through the struct so `theme.bg("scrollbarThumb", …)` (`interactive-mode.ts:
-            // 874`) gets the `?? selectedBg` fallback rather than the raw map miss.
-            "scrollbarThumb" => bg.scrollbar_thumb,
             _ => self.roles.get(key).copied(),
         }
     }
@@ -676,7 +791,9 @@ impl UiTheme {
     /// row.
     pub fn custom_message_text_style(&self) -> Style {
         match self.roles.get("customMessageText").copied() {
-            Some(c) => Style::default().fg(c),
+            Some(c) => Style::default()
+                .fg(c)
+                .add_modifier(self.faint_modifier("customMessageText")),
             None => self.dim_style(),
         }
     }
@@ -717,7 +834,9 @@ impl UiTheme {
     /// `toolOutput` role, else falls back to the muted (gray) role.
     pub fn tool_output_style(&self) -> Style {
         match self.roles.get("toolOutput").copied() {
-            Some(c) => Style::default().fg(c),
+            Some(c) => Style::default()
+                .fg(c)
+                .add_modifier(self.faint_modifier("toolOutput")),
             None => self.muted_style(),
         }
     }
@@ -793,28 +912,13 @@ impl UiTheme {
     /// Whether this palette is a **light** one, i.e. one that draws dark glyphs on a light ground.
     ///
     /// Only consulted to pick between the dark and light members of a hex fallback pair
-    /// ([`Self::palette_hex`]); a theme that actually defines the role never reaches it. The name is
-    /// authoritative for the two built-ins — `builtin_or_static` stamps `"dark"`/`"light"` and
-    /// `from_resolved` copies `dark.json`/`light.json`'s own `"name"` field — and a custom theme
-    /// falls back to the luma of its `text` role, because a light theme is exactly the one whose
-    /// body text is dark. After [`Self::with_color_mode`] has quantized `foreground` to a
-    /// `Color::Indexed` the luma test no longer applies and a non-built-in name resolves as dark;
-    /// that only affects roles a custom theme left undefined, which Pi forbids outright
-    /// (`REQUIRED_COLOR_TOKENS`).
+    /// ([`Self::palette_hex`]); a theme that actually defines the role never reaches it. The answer
+    /// is the theme's [`appearance`](Self::appearance) — the `appearance` its JSON declares, else
+    /// the lightness average of its own colours with palette indices 0-15 excluded (TUI-132). A
+    /// declared `"appearance": "light"` therefore wins over colours that average dark, and
+    /// quantizing a role to a `Color::Indexed` cannot change the answer.
     fn is_light_palette(&self) -> bool {
-        if self.name.eq_ignore_ascii_case("light") {
-            return true;
-        }
-        if self.name.eq_ignore_ascii_case("dark") {
-            return false;
-        }
-        match self.foreground {
-            // ITU-R BT.601 luma, in integer thousandths to keep the no-panic/no-float-cast profile.
-            Some(Color::Rgb(r, g, b)) => {
-                299 * u32::from(r) + 587 * u32::from(g) + 114 * u32::from(b) < 128_000
-            }
-            _ => false,
-        }
+        self.appearance() == Appearance::Light
     }
 
     /// Pick the member of a `(dark, light)` hex-fallback pair that matches this palette.
@@ -835,26 +939,19 @@ impl UiTheme {
     ///
     /// The hexes are a last-resort value for the synthetic fallback theme (the one
     /// `builtin_or_static` synthesizes when the resource layer cannot supply a palette at all); any
-    /// real theme resolves the role through [`Self::role_color`]. Five of these defaults had drifted
-    /// away from BOTH Pi's `dark.json` and cyrup's own built-in dark palette — `mdCodeBlockBorder`,
-    /// `mdQuote`, `mdQuoteBorder` and `mdHr` are `gray` `#808080` (`dark.json:53,54,55,56`;
-    /// `cyrup-resources/src/theme.rs:568,569,570,571`) and `mdLinkUrl` is `dimGray` `#666666`
-    /// (`dark.json:50`) — so the degraded theme drew a *different* palette from the normal one.
-    /// Found while fixing T7; same accessor, same class of defect.
-    ///
-    /// Aligning them to `dark.json` alone then broke the *light* half: `builtin_or_static`
-    /// synthesizes both [`Self::dark`] and [`Self::light`] with an empty `roles` map, so a
-    /// resource-less light theme fell through to the same hexes and drew dark-theme greys. Every
-    /// fallback is therefore a pair — `light.json`'s value is `mediumGray` `#6c6c6c` (`:11`, used by
-    /// `mdCodeBlockBorder` `:52` / `mdQuote` `:53` / `mdQuoteBorder` `:54` / `mdHr` `:55`) and
-    /// `dimGray` `#767676` (`:12`, used by `dim` `:30` / `mdLinkUrl` `:49`).
+    /// real theme resolves the role through [`Self::role_color`]. Every fallback is a pair — the
+    /// role's resolved value in v1.0.0's `dark.json` and in its `light.json` — so the degraded theme
+    /// draws the same palette as the normal one, and a resource-less light theme does not fall
+    /// through to dark greys. [`Self::palette_hex`] picks the member by the theme's appearance.
     fn role_style(&self, key: &str, dark_hex: &str, light_hex: &str) -> Style {
-        Style::default().fg(self.role_color_themed(key, dark_hex, light_hex))
+        Style::default()
+            .fg(self.role_color_themed(key, dark_hex, light_hex))
+            .add_modifier(self.faint_modifier(key))
     }
 
     /// Markdown heading — `mdHeading`, bold (`markdown.ts:336-362`).
     pub fn md_heading_style(&self) -> Style {
-        self.role_style("mdHeading", "#f0c674", "#9a7326")
+        self.role_style("mdHeading", "#cd9a22", "#8f6802")
             .add_modifier(Modifier::BOLD)
     }
     /// Inline code span — `mdCode` (= accent), no backticks (`markdown.ts:512-516`).
@@ -868,56 +965,51 @@ impl UiTheme {
     }
     /// Flat (unknown-language) fenced-code body — `mdCodeBlock` (`markdown.ts:378-398`).
     pub fn md_code_block_style(&self) -> Style {
-        self.role_style("mdCodeBlock", "#b5bd68", "#588458")
+        self.role_style("mdCodeBlock", "#68b78d", "#337e58")
     }
     /// Fence border lines (```` ``` ````) — `mdCodeBlockBorder` (`markdown.ts:380,393`).
     pub fn md_code_block_border_style(&self) -> Style {
-        self.role_style("mdCodeBlockBorder", "#808080", "#6c6c6c")
+        self.role_style("mdCodeBlockBorder", "#9da5a9", "#677176")
     }
     /// Assistant **reasoning** (thinking) body — `thinkingText`, italic (Pi
     /// `assistant-message.ts:145-165` renders each run of `thinking` blocks as one Markdown section
     /// with `{color: theme.fg("thinkingText", …), italic: true}`; the collapsed
     /// `hideThinkingBlock` label at `:139-143` uses the same role). `thinkingText` is `gray`
-    /// (`#808080`) in Pi's `dark.json:33` and `mediumGray` in `light.json:32`; the hex default here
-    /// is the dark one, used only when the live theme omits the role.
+    /// (`#96a0a4`) in Pi's v1.0.0 `dark.json` and `#7c868c` in `light.json`; the hex default here
+    /// is used only when the live theme omits the role.
     ///
     /// NOTE this is a different thing from [`ThinkingTheme`], which is the per-reasoning-**level**
     /// editor-border palette (`thinkingOff`…`thinkingXhigh`).
     pub fn thinking_text_style(&self) -> Style {
-        self.role_style("thinkingText", "#808080", "#6c6c6c")
+        self.role_style("thinkingText", "#96a0a4", "#7c868c")
             .add_modifier(Modifier::ITALIC)
     }
     /// Blockquote body — `mdQuote`, italic (`markdown.ts:414-461`).
     pub fn md_quote_style(&self) -> Style {
-        self.role_style("mdQuote", "#808080", "#6c6c6c")
+        self.role_style("mdQuote", "#9da5a9", "#677176")
             .add_modifier(Modifier::ITALIC)
     }
     /// Blockquote `│ ` border — `mdQuoteBorder` (`markdown.ts:414-461`).
     pub fn md_quote_border_style(&self) -> Style {
-        self.role_style("mdQuoteBorder", "#808080", "#6c6c6c")
+        self.role_style("mdQuoteBorder", "#9da5a9", "#677176")
     }
     /// Horizontal rule — `mdHr` (`markdown.ts:463-468`).
     pub fn md_hr_style(&self) -> Style {
-        self.role_style("mdHr", "#808080", "#6c6c6c")
+        self.role_style("mdHr", "#9da5a9", "#677176")
     }
     /// List bullet marker — `mdListBullet` (`markdown.ts:604-654`).
     ///
-    /// The `= accent` alias holds in the DARK palette only (`dark.json:57` `"mdListBullet":
-    /// "accent"`); `light.json:56` maps it to `green` `#588458`, which is *not* the light accent
-    /// (`teal` `#5a8080`). So the accent chain is the dark palette's rule and a resource-less light
-    /// theme takes the light hex instead.
+    /// `mdListBullet` is `accent` in both v1.0.0 palettes (`dark.json` / `light.json`
+    /// `"mdListBullet": "accent"`), so a theme that omits it takes its own accent.
     pub fn md_list_bullet_style(&self) -> Style {
         match self.roles.get("mdListBullet").copied() {
             Some(c) => Style::default().fg(c),
-            None if self.is_light_palette() => {
-                self.role_style("mdListBullet", "#588458", "#588458")
-            }
             None => Style::default().fg(self.accent.unwrap_or(Color::Cyan)),
         }
     }
     /// Link text — `mdLink`, underlined (`markdown.ts:537-556`).
     pub fn md_link_style(&self) -> Style {
-        self.role_style("mdLink", "#81a2be", "#547da7")
+        self.role_style("mdLink", "#69add0", "#2f7899")
             .add_modifier(Modifier::UNDERLINED)
     }
     /// Trailing ` (url)` after a markdown link — `mdLinkUrl`, **colour only**.
@@ -930,20 +1022,20 @@ impl UiTheme {
     /// `this.theme.link(this.theme.underline(linkText))`), which is why
     /// [`Self::md_link_style`] keeps `UNDERLINED`; the URL suffix is not.
     pub fn md_link_url_style(&self) -> Style {
-        self.role_style("mdLinkUrl", "#666666", "#767676")
+        self.role_style("mdLinkUrl", "#9da5a9", "#677176")
     }
 
     /// Diff added (`+`) line — `toolDiffAdded`, green (`diff.ts` `theme.fg("toolDiffAdded")`).
     pub fn tool_diff_added_style(&self) -> Style {
-        Style::default().fg(self.role_color_themed("toolDiffAdded", "#b5bd68", "#588458"))
+        self.role_style("toolDiffAdded", "#68b78d", "#337e58")
     }
     /// Diff removed (`-`) line — `toolDiffRemoved`, red.
     pub fn tool_diff_removed_style(&self) -> Style {
-        Style::default().fg(self.role_color_themed("toolDiffRemoved", "#cc6666", "#aa5555"))
+        self.role_style("toolDiffRemoved", "#ea7f81", "#c8253d")
     }
     /// Diff context (unchanged) line — `toolDiffContext`, gray.
     pub fn tool_diff_context_style(&self) -> Style {
-        Style::default().fg(self.role_color_themed("toolDiffContext", "#808080", "#6c6c6c"))
+        self.role_style("toolDiffContext", "#9da5a9", "#677176")
     }
     /// Intra-line changed-token emphasis — reversed video (`theme.inverse`, `diff.ts:renderIntraLineDiff`).
     pub fn inverse_style(&self) -> Style {
@@ -1025,33 +1117,33 @@ impl UiTheme {
         // Most-specific prefixes first; the first match wins. `role` is `None` for the classes Pi
         // styles with an SGR attribute and no colour.
         let (role, modifier) = if scope.starts_with("comment") {
-            (Some(("syntaxComment", "#6A9955", "#008000")), None)
+            (Some(("syntaxComment", "#9da5a9", "#677176")), None)
         } else if scope.starts_with("string") {
-            (Some(("syntaxString", "#CE9178", "#A31515")), None)
+            (Some(("syntaxString", "#de8d5a", "#a45417")), None)
         } else if scope.starts_with("constant.numeric") {
-            (Some(("syntaxNumber", "#B5CEA8", "#098658")), None)
+            (Some(("syntaxNumber", "#68b78d", "#337e58")), None)
         } else if scope.starts_with("entity.name.function") || scope.starts_with("support.function")
         {
-            (Some(("syntaxFunction", "#DCDCAA", "#795E26")), None)
+            (Some(("syntaxFunction", "#cd9a22", "#8f6802")), None)
         } else if scope.starts_with("entity.name.type")
             || scope.starts_with("support.type")
             || scope.starts_with("support.class")
             || scope.starts_with("entity.name.class")
         {
-            (Some(("syntaxType", "#4EC9B0", "#267F99")), None)
+            (Some(("syntaxType", "#a798d7", "#7459b4")), None)
         } else if scope.starts_with("keyword.operator") {
-            (Some(("syntaxOperator", "#D4D4D4", "#000000")), None)
+            (Some(("syntaxOperator", "#9da5a9", "#677176")), None)
         } else if scope.starts_with("keyword") || scope.starts_with("storage") {
-            (Some(("syntaxKeyword", "#569CD6", "#0000FF")), None)
+            (Some(("syntaxKeyword", "#69add0", "#2f7899")), None)
         } else if scope.starts_with("variable") || scope.starts_with("entity.other.attribute-name")
         {
-            (Some(("syntaxVariable", "#9CDCFE", "#001080")), None)
+            (Some(("syntaxVariable", "#5db3ba", "#287a81")), None)
         } else if scope.starts_with("punctuation") {
-            (Some(("syntaxPunctuation", "#D4D4D4", "#000000")), None)
+            (Some(("syntaxPunctuation", "#9da5a9", "#677176")), None)
         } else if scope.starts_with("markup.inserted") {
-            (Some(("toolDiffAdded", "#b5bd68", "#588458")), None)
+            (Some(("toolDiffAdded", "#68b78d", "#337e58")), None)
         } else if scope.starts_with("markup.deleted") {
-            (Some(("toolDiffRemoved", "#cc6666", "#aa5555")), None)
+            (Some(("toolDiffRemoved", "#ea7f81", "#c8253d")), None)
         } else if scope.starts_with("markup.italic") {
             // `emphasis: (s) => t.italic(s)` — `theme.ts:1140`. Attribute only, no `fg()`.
             (None, Some(Modifier::ITALIC))
@@ -1078,36 +1170,6 @@ impl UiTheme {
 /// The structured per-role **background** sub-theme (feature #3; Pi background tokens, theme.ts:48-55).
 /// Every message/tool/selected background is a named field, so the whole background surface is
 /// addressable at once instead of via ad-hoc flat-map string lookups. `None` ⇒ terminal default.
-///
-// T9 — `scrollbarThumb` is Pi's SEVENTH background token (`theme/theme.ts:50`), and unlike the
-// other six it is `Type.Optional`, with an explicit `?? selectedBg` fallback applied twice: in
-// `withThemeColorFallbacks` (`:330`) and again in the `Theme` constructor (`:365`).
-//
-// It was long recorded here as blocked on an unported DRAW surface. That reasoning confused the
-// token with its painter. Its only *painting* consumer is indeed
-// `scrollbarStyle: (text) => theme.bg("scrollbarThumb", text)` (`interactive-mode.ts:874`) on the
-// `ScrollView` that exists solely as `fullscreenLayoutRoot`'s first child — but the token has a
-// second, independent consumer in the THEME LOADER itself, and upstream tests exactly that with no
-// ScrollView, no alt-screen renderer and no settings in sight:
-//
-// ```ts
-// // test/scrollbar-theme.test.ts:31-38
-// delete themeJson.colors.scrollbarThumb;
-// const loadedTheme = loadThemeFromPath(writeTheme(themeJson), "truecolor");
-// expect(loadedTheme.getBgAnsi("scrollbarThumb")).toBe(loadedTheme.getBgAnsi("selectedBg"));
-// ```
-//
-// That resolution behaviour is portable today and is ported below — it is the exact idiom
-// [`UiTheme::thinking`] already uses for `thinkingMax ?? thinkingXhigh`, the OTHER optional token,
-// declared on the adjacent line of the same upstream function (`theme.ts:329`/`:330`).
-//
-// What remains unported is the PAINTER, and only the painter: a fullscreen/alt-screen renderer with
-// a `ScrollView` (`pi/packages/tui/src/components/scroll-view.ts`) and the `fullscreenScrollbar`
-// setting that gates it (`settings-manager.ts:136,1138-1146`). cyrup's interactive layout is one
-// ratatui `Viewport::Inline` committing history to native scrollback, so nothing draws a thumb yet.
-// When that lands it reads this field; until then the field still has to RESOLVE correctly, because
-// a user theme that sets `scrollbarThumb` and one that omits it must agree, and a theme that omits
-// it must not resolve to "no colour".
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct BackgroundTheme {
     /// Selected-row fill in selectors (`selectedBg`).
@@ -1122,11 +1184,6 @@ pub struct BackgroundTheme {
     pub tool_success: Option<Color>,
     /// Tool block fill on error (`toolErrorBg`).
     pub tool_error: Option<Color>,
-    /// Fullscreen scrollbar thumb fill (`scrollbarThumb`, `theme.ts:50`). OPTIONAL upstream, with
-    /// `scrollbarThumb ?? selectedBg` applied by the loader (`:330`) and again by the `Theme`
-    /// constructor (`:365`), so a theme that omits it resolves to its own `selectedBg` — NEVER to
-    /// `None`. Same shape as `thinkingMax ?? thinkingXhigh` in [`ThinkingTheme`].
-    pub scrollbar_thumb: Option<Color>,
 }
 
 /// The structured **thinking-border** sub-theme (feature #3; Pi `thinking{Off..Xhigh}`,
@@ -1152,33 +1209,17 @@ pub struct ThinkingTheme {
     pub max: Color,
 }
 
-/// Map a resolved color role onto a `ratatui::Color`. `Inherit` ⇒ `None` (terminal default).
-pub fn color_of(spec: ColorSpec) -> Option<Color> {
-    match spec {
-        ColorSpec::Inherit => None,
-        ColorSpec::Rgb { r, g, b } => Some(Color::Rgb(r, g, b)),
-    }
-}
-
-/// Resolve a raw `colors` value through `vars` then parse it (a mirror of
-/// `cyrup_resources::theme`'s private resolver, for the [`UiTheme::from_theme_data`] hot-reload
-/// hook).
+/// Map a resolved color role onto a `ratatui::Color`.
 ///
-/// TUI-131 — an `oklch(…)` / `okhsl(…)` value is a colour FUNCTION, not a variable name, so it
-/// short-circuits the `vars` lookup exactly as upstream's `resolveVarRefs` does
-/// (`/^ok(lch|hsl)\(/i`, `theme/theme.ts:140` @v1.0.0). Without that, a theme with a var literally
-/// named `okhsl(234 3% 89%)` would be consulted first; with it, the value parses.
-fn resolve_value(raw: &str, vars: &std::collections::BTreeMap<String, String>) -> Option<Color> {
-    let v = raw.trim();
-    if v.is_empty() {
-        return None;
+/// `Inherit` — a theme's `""` — is [`Color::Reset`], the terminal's own default foreground or
+/// background. A palette index stays [`Color::Indexed`], so indices 0-15 keep following the user's
+/// terminal palette instead of becoming the standard xterm RGB for them.
+pub fn color_of(spec: ColorSpec) -> Color {
+    match spec {
+        ColorSpec::Inherit => Color::Reset,
+        ColorSpec::Rgb { r, g, b } => Color::Rgb(r, g, b),
+        ColorSpec::Indexed(index) => Color::Indexed(index),
     }
-    if cyrup_resources::color::is_color_function(v) {
-        return parse_color(v);
-    }
-    let var_name = v.strip_prefix('$').unwrap_or(v);
-    let value = vars.get(var_name).map(String::as_str).unwrap_or(v);
-    parse_color(value)
 }
 
 /// The xterm 6×6×6 color-cube channel values (indices 0–5) — Pi `CUBE_VALUES` (`theme.ts:183`).
@@ -1296,23 +1337,22 @@ fn parse_color(s: &str) -> Option<Color> {
 }
 
 // ============================================================================
-// ThemeController (Pi theme-controller.ts + theme.ts theme-resolution) — feature #4
+// ThemeController (Pi theme-controller.ts + theme.ts theme-resolution)
 // ============================================================================
 
-/// The detected/assumed terminal background polarity (Pi `TerminalTheme`, `theme.ts`), used to resolve
-/// an `auto` theme setting and as the fallback theme when `settings.theme` is unset.
+/// Whether the terminal is dark or light (Pi `TerminalTheme`, `theme.ts:650`), used to resolve an
+/// automatic `light/dark` theme setting and as the appearance of a theme that has none of its own.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum TerminalTheme {
-    /// A light terminal background — the boot fallback resolves to the `light` theme.
+    /// A light terminal background.
     Light,
-    /// A dark terminal background — the boot fallback resolves to the `dark` theme (Pi's default).
+    /// A dark terminal background — what pi assumes when nothing says otherwise.
     #[default]
     Dark,
 }
 
 impl TerminalTheme {
-    /// The built-in theme name for this polarity (Pi resolves an unset setting to the terminal theme
-    /// name, `theme-controller.ts:53-55`).
+    /// The built-in theme named for this polarity.
     pub fn theme_name(self) -> &'static str {
         match self {
             TerminalTheme::Light => "light",
@@ -1320,113 +1360,75 @@ impl TerminalTheme {
         }
     }
 
-    /// Detect the terminal background polarity from the environment the way Pi does
-    /// (`detectTerminalBackgroundFromEnv`, `theme.ts:724-743`): parse the last numeric field of
-    /// `COLORFGBG` as the background palette index and classify by its luminance; on no hint, fall back
-    /// to [`TerminalTheme::Dark`] (Pi's `"fallback"` / low-confidence default).
+    /// The polarity the environment alone suggests: `COLORFGBG`, else dark (Pi's
+    /// `detectColorFgBgTheme(env) ?? "dark"`, `theme.ts:709`). Before the terminal has answered its
+    /// colour query this is all there is to go on.
     pub fn detect() -> TerminalTheme {
-        detect_terminal_background_from_env(&std::env::var("COLORFGBG").unwrap_or_default()).theme
+        detect_color_fg_bg_theme(&std::env::var("COLORFGBG").unwrap_or_default())
+            .unwrap_or_default()
     }
 }
 
-/// Where a [`TerminalThemeDetection`] came from (Pi `TerminalThemeDetection.source`,
-/// `theme.ts:691-697`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TerminalThemeSource {
-    /// An OSC 11 reply from the terminal itself.
-    TerminalBackground,
-    /// The `COLORFGBG` environment hint.
-    ColorFgBg,
-    /// Nothing answered — Pi's low-confidence `dark` default.
-    Fallback,
+impl From<TerminalTheme> for Appearance {
+    fn from(theme: TerminalTheme) -> Self {
+        match theme {
+            TerminalTheme::Light => Appearance::Light,
+            TerminalTheme::Dark => Appearance::Dark,
+        }
+    }
 }
 
-/// How much a detection can be trusted (Pi `confidence`). Pi persists `settings.theme` only on
-/// `"high"` (`theme-controller.ts:57-61`); a `Fallback` guess must never be written to disk.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DetectionConfidence {
-    High,
-    Low,
+impl From<Appearance> for TerminalTheme {
+    fn from(appearance: Appearance) -> Self {
+        match appearance {
+            Appearance::Light => TerminalTheme::Light,
+            Appearance::Dark => TerminalTheme::Dark,
+        }
+    }
 }
 
-/// The result of a background-polarity detection (Pi `TerminalThemeDetection`, `theme.ts:691-697`).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TerminalThemeDetection {
-    pub theme: TerminalTheme,
-    pub source: TerminalThemeSource,
-    /// Human-readable provenance, shown by `/debug` and Pi's theme diagnostics.
-    pub detail: String,
-    pub confidence: DetectionConfidence,
-}
-
-/// Pi `getThemeForRgbColor` (`theme.ts:743-745`): an sRGB-linearized relative luminance at or above
-/// `0.5` is a light background.
-pub fn theme_for_rgb(r: u8, g: u8, b: u8) -> TerminalTheme {
-    if relative_luminance(r, g, b) >= 0.5 {
-        TerminalTheme::Light
-    } else {
+/// Pi `detectColorFgBgTheme` (`theme.ts:689-695`): dark or light from the `COLORFGBG` environment
+/// variable some terminals set, or `None` without a usable background index. The value is `fg;bg`
+/// or `fg;xpm;bg` (rxvt), where a field is an ANSI colour index or `default` when the colour is not
+/// in the palette. The index refers to the terminal's own palette, whose colours are unknown here,
+/// so it is classified by index like Vim does: 0-6 and 8 (bright black, e.g. Solarized Dark's
+/// background) are dark, 7 and 9-15 are light.
+pub fn detect_color_fg_bg_theme(colorfgbg: &str) -> Option<TerminalTheme> {
+    let background = colorfgbg.split(';').next_back()?.trim();
+    // `/^\d{1,2}$/`
+    if background.is_empty()
+        || background.len() > 2
+        || !background.bytes().all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    let index: u8 = background.parse().ok()?;
+    if index > 15 {
+        return None;
+    }
+    Some(if index <= 6 || index == 8 {
         TerminalTheme::Dark
-    }
+    } else {
+        TerminalTheme::Light
+    })
 }
 
-/// Pi `detectTerminalBackgroundFromEnv` (`theme.ts:747-765`) with `COLORFGBG` passed in rather than
-/// read from the process (env reads are global mutable state; the caller owns the read).
-pub fn detect_terminal_background_from_env(colorfgbg: &str) -> TerminalThemeDetection {
-    if let Some(bg) = colorfgbg_background_index(colorfgbg) {
-        let (r, g, b) = ansi256_to_rgb(bg);
-        return TerminalThemeDetection {
-            theme: theme_for_rgb(r, g, b),
-            source: TerminalThemeSource::ColorFgBg,
-            detail: format!("background color index {bg}"),
-            confidence: DetectionConfidence::High,
-        };
-    }
-    TerminalThemeDetection {
-        theme: TerminalTheme::Dark,
-        source: TerminalThemeSource::Fallback,
-        detail: "no terminal background hint found".to_string(),
-        confidence: DetectionConfidence::Low,
-    }
-}
-
-/// Pi `detectTerminalBackgroundTheme` (`theme.ts:768-788`): **ask the terminal first** with OSC 11
-/// and classify the reply, falling back to `COLORFGBG` when the query times out or is unparseable.
-///
-/// This is the half cyrup was missing (TUI-004): production only ever read `COLORFGBG`, which most
-/// terminals — including iTerm2, Ghostty, Alacritty, WezTerm and Terminal.app — do not set, so a
-/// light-background user was always handed the dark theme.
-pub fn detect_terminal_background_theme(
-    probe: &dyn crate::terminal_query::TerminalProbe,
-    timeout: std::time::Duration,
-    colorfgbg: &str,
-) -> TerminalThemeDetection {
-    if let Some((r, g, b)) = probe.query_background_color(timeout) {
-        return TerminalThemeDetection {
-            theme: theme_for_rgb(r, g, b),
-            source: TerminalThemeSource::TerminalBackground,
-            detail: format!("OSC 11 background rgb({r}, {g}, {b})"),
-            confidence: DetectionConfidence::High,
-        };
-    }
-    detect_terminal_background_from_env(colorfgbg)
-}
-
-/// Pi `detectTerminalThemeForAuto` (`theme.ts:790-801`): for an `auto` (`light/dark`) setting the
-/// terminal's *declared* color scheme (DSR `?996` → `CSI ? 997 ; N n`) wins over inferring polarity
-/// from the background color, because a terminal that implements the notification protocol knows its
-/// own preference. Unsupported ⇒ fall through to [`detect_terminal_background_theme`].
-pub fn detect_terminal_theme_for_auto(
-    probe: &dyn crate::terminal_query::TerminalProbe,
-    timeout: std::time::Duration,
-    colorfgbg: &str,
+/// Pi `detectTerminalTheme` (`theme.ts:702-710`): whether the terminal is dark or light. The
+/// background it renders decides, classified the same way the system theme does
+/// ([`terminal_appearance`]). Without a reported background: the terminal's light/dark report, then
+/// `COLORFGBG`, then dark.
+pub fn detect_terminal_theme(
+    colors: &TerminalColors,
+    reported_scheme: Option<TerminalTheme>,
+    colorfgbg: Option<TerminalTheme>,
 ) -> TerminalTheme {
-    if let Some(scheme) = probe.query_color_scheme(timeout) {
-        return scheme;
+    match colors.background {
+        Some(background) => terminal_appearance(background, colors.foreground).into(),
+        None => reported_scheme.or(colorfgbg).unwrap_or_default(),
     }
-    detect_terminal_background_theme(probe, timeout, colorfgbg).theme
 }
 
-/// Pi `parseAutoThemeSetting` (`theme.ts:638-653`): a `"<light>/<dark>"` setting with exactly one
+/// Pi `parseAutoThemeSetting` (`theme.ts:652-667`): a `"<light>/<dark>"` setting with exactly one
 /// slash parses into a `(light, dark)` pair; anything else is not an auto setting.
 pub fn parse_auto_theme_setting(setting: Option<&str>) -> Option<(String, String)> {
     let (light, dark) = setting?.split_once('/')?;
@@ -1441,10 +1443,10 @@ pub fn parse_auto_theme_setting(setting: Option<&str>) -> Option<(String, String
     Some((light.to_string(), dark.to_string()))
 }
 
-/// Pi `resolveThemeSetting` (`theme.ts:655-666`): resolve the raw `settings.theme` value against the
+/// Pi `resolveThemeSetting` (`theme.ts:669-680`): resolve the raw `settings.theme` value against the
 /// detected `terminal` polarity into a concrete theme name. An `auto` (`light/dark`) setting picks the
 /// arm matching `terminal`; a bare name passes through; any other slash-namespaced value ⇒ `None`
-/// (unresolvable → caller falls back to the terminal theme).
+/// (unresolvable → the caller falls back to the system theme).
 pub fn resolve_theme_setting(setting: Option<&str>, terminal: TerminalTheme) -> Option<String> {
     if let Some((light, dark)) = parse_auto_theme_setting(setting) {
         return Some(match terminal {
@@ -1459,31 +1461,27 @@ pub fn resolve_theme_setting(setting: Option<&str>, terminal: TerminalTheme) -> 
     }
 }
 
-/// The theme pi falls back to when a named theme fails to load (`theme-controller.ts:127`,
-/// `theme.ts:906` @v0.84.4 — both hardwire the string).
-pub(crate) const DARK_THEME_NAME: &str = "dark";
-
 /// The outcome of one theme (re-)application — pi's `ThemeResult`
-/// (`modes/interactive/theme/theme-controller.ts:16` @v0.84.4), widened by the one case upstream
+/// (`modes/interactive/theme/theme-controller.ts:18` @v1.0.0), widened by the one case upstream
 /// cannot have: an app that was never handed a controller.
 ///
 /// Returned by [`crate::App::reapply_theme_from_settings`] so the failure is a VALUE and not a
-/// silent dark repaint (TUI-096). Upstream's `applyThemeName` reacts to the same result twice
-/// (`:126-135`): it seats `"dark"` as the active name, and, under `showError`, surfaces
-/// ``Failed to load theme "<name>": <error>\nFell back to dark theme.``
+/// silent repaint (TUI-096). Upstream's `applyThemeName` reacts to the same result twice
+/// (`:178-186`): it seats `"system"` as the active name, and, under `showError`, surfaces
+/// ``Failed to load theme "<name>": <error>\nFell back to the system theme.``
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ThemeApply {
     /// No controller was booted — a harness `App`, which has no `settings.theme` to answer from and
     /// keeps the theme it was constructed with. Upstream has no counterpart: its controller is a
-    /// field of the interactive mode and always exists (`interactive-mode.ts:960`).
+    /// field of the interactive mode and always exists.
     NoController,
     /// The named theme resolved and is now painted; `active_name()` is that name
-    /// (`this.activeThemeName = result.success ? themeName : "dark"`, `:127`).
+    /// (`this.activeThemeName = result.success ? themeName : SYSTEM_THEME_NAME`, `:180`).
     Loaded(String),
-    /// The named theme did NOT resolve: `dark` is painted AND seated as the active name, and the
-    /// notice was pushed to the transcript. `error` is pi's `result.error` — for a name that
-    /// resolves to nothing, `loadThemeJson`'s `Theme not found: <name>` (`theme.ts:623`).
-    FellBackToDark {
+    /// The named theme did NOT resolve: the system theme is painted AND seated as the active name,
+    /// and the notice was pushed to the transcript. `error` is pi's `result.error` — for a name that
+    /// resolves to nothing, `loadThemeJson`'s `Theme not found: <name>`.
+    FellBackToSystem {
         /// The name `settings.theme` asked for, as asked for.
         name: String,
         /// pi's `result.error` for that failure.
@@ -1491,65 +1489,87 @@ pub enum ThemeApply {
     },
 }
 
+/// The sentence a failed theme load ends with — pi's `applyThemeName` (`theme-controller.ts:183`).
+pub const THEME_FALLBACK_SENTENCE: &str = "Fell back to the system theme.";
+
 /// The boot + live-switch owner of the render theme (Pi `InteractiveThemeController`,
-/// `theme-controller.ts`). It resolves the boot theme from `settings.theme` with a terminal-bg
-/// fallback, carries the [`ColorMode`] so every projected [`UiTheme`] is depth-correct, and drives
-/// `/theme` + hot-switch by name. This is the seam the audit calls for (#4): production booted
-/// dark-only, ignoring `settings.theme` + terminal background; the controller fixes that.
+/// `theme-controller.ts` @v1.0.0). It resolves the theme from `settings.theme` — `system` when the
+/// setting names nothing that resolves — carries the [`ColorMode`] so every projected [`UiTheme`] is
+/// depth-correct, and holds everything the terminal reported about its own colours, which is what
+/// the `system` theme is generated from.
+///
+/// The system theme renders in grayscale until the terminal's colours arrive (Pi
+/// `markTerminalColorsPending`, `theme.ts:211`): the controller starts in that state and
+/// [`Self::apply_terminal_colors`] ends it, whether the terminal answered or the query timed out.
+///
+/// [CYRUP-DELTA] vs `waitForTerminalColors` (`theme-controller.ts:116`, awaited at
+/// `interactive-mode.ts:993` before the header and the startup notices are built, because they bake
+/// theme colours into their text): cyrup's boot query is synchronous and bounded by the same 100 ms
+/// ([`Self::request_terminal_colors`]), and runs before anything that bakes a colour is built, so
+/// the gate is the order of the calls rather than a promise. A reply that misses the deadline
+/// arrives through the late-reply callback and re-applies exactly as pi's `onLateReply` does.
 #[derive(Clone, Debug)]
 pub struct ThemeController {
     color_mode: ColorMode,
-    terminal_theme: TerminalTheme,
+    /// What the environment says about the terminal (`COLORFGBG`), the polarity used until the
+    /// terminal reports a background.
+    env_theme: Option<TerminalTheme>,
+    /// Pi's module-level `terminalColors` (`theme.ts:190`): replaced, never mutated.
+    terminal_colors: TerminalColors,
+    /// Pi's `terminalColorsPending` (`theme.ts:192`).
+    colors_pending: bool,
+    /// Pi's controller field `terminalColors` (`theme-controller.ts:65`): the last REPORTED colours,
+    /// kept when a later query times out instead of being erased. `None` until the first apply.
+    reported: Option<TerminalColors>,
     active_name: String,
     generation: u64,
-    /// The raw `settings.theme` value the controller booted from, retained so
-    /// [`Self::sync_with_terminal`] can re-run Pi's `applyFromSettings` once the terminal is in raw
-    /// mode and can actually answer a query.
+    /// The raw `settings.theme` value, retained so [`Self::apply_from_settings`] can re-resolve it.
     theme_setting: Option<String>,
-    /// Whether the resolved setting is an `auto` (`light/dark`) pair, i.e. whether Pi would have
-    /// enabled color-scheme notifications (`setAutoSync(true)`, `theme-controller.ts:107-111`).
+    /// Whether the terminal's appearance changes are followed (Pi `autoSyncEnabled`,
+    /// `theme-controller.ts:67`): armed for an automatic `light/dark` pair and for the system
+    /// theme.
     auto_sync: bool,
-    /// The theme name a HIGH-confidence detection wants written back to `settings.theme` (Pi
-    /// `settingsManager.setTheme(detection.theme)` + `flush()`, `theme-controller.ts:57-61`). Only
-    /// ever set when the user has no explicit setting.
-    persist: Option<String>,
-    /// Pi `currentThemeSetting` (`theme-controller.ts:23` @v0.87.1): the in-memory theme setting
-    /// that shadows `settings.theme` in `applyFromSettings` (`:57`). Seeded from
-    /// `--use-theme` (`initialThemeSetting`, `:42`) and replaced by every user theme switch
-    /// (`setThemeName` `:88-94`, `setThemeSetting` `:96-99`), so a one-run override survives
-    /// `/reload` without ever being written to settings. SEAM-119.
+    /// Pi `currentThemeSetting` (`theme-controller.ts:63`): the in-memory theme setting that
+    /// shadows `settings.theme`. Seeded from `--use-theme` (`initialThemeSetting`) and replaced by
+    /// every user theme switch, so a one-run override survives `/reload` without ever being written
+    /// to settings. SEAM-119.
     current_setting: Option<String>,
 }
 
 impl ThemeController {
     /// Boot the controller from the raw `settings.theme` value (Pi `getThemeSetting()`), the terminal
-    /// [`ColorMode`], and the detected terminal background polarity (Pi
-    /// `theme-controller.ts` constructor + `applyFromSettings`, lines 32-59). The active theme is
-    /// `resolveThemeSetting(setting, terminal)` when it resolves, else the terminal theme name — never
-    /// hardwired dark. An unknown name degrades to `dark` at projection time (`UiTheme::builtin`).
+    /// [`ColorMode`], and the polarity the environment suggests (Pi's constructor +
+    /// `applyFromSettings`, `theme-controller.ts:72-109`). The active theme is
+    /// `resolveThemeSetting(setting, terminal)` when it resolves, else the `system` theme
+    /// (`resolveThemeName`, `:174-176`) — never a hardwired `dark`.
     pub fn boot(
         theme_setting: Option<&str>,
         color_mode: ColorMode,
         terminal_theme: TerminalTheme,
     ) -> Self {
-        let active_name = resolve_theme_setting(theme_setting, terminal_theme)
-            .unwrap_or_else(|| terminal_theme.theme_name().to_string());
-        ThemeController {
+        let mut controller = ThemeController {
             color_mode,
-            terminal_theme,
-            active_name,
+            env_theme: Some(terminal_theme),
+            terminal_colors: TerminalColors::default(),
+            // `markTerminalColorsPending()` — "The system theme starts in grayscale; color follows
+            // once the terminal reports its colors" (`theme-controller.ts:87-88`).
+            colors_pending: true,
+            reported: None,
+            active_name: String::new(),
             generation: 0,
             theme_setting: theme_setting.map(str::to_string),
-            auto_sync: parse_auto_theme_setting(theme_setting).is_some(),
-            persist: None,
+            auto_sync: false,
             current_setting: None,
-        }
+        };
+        controller.active_name = controller.resolve_theme_name();
+        controller.auto_sync = controller.wants_auto_sync();
+        controller
     }
 
-    /// Pi's constructor with an `initialThemeSetting` (`theme-controller.ts:40-47` @v0.87.1): the
-    /// boot theme resolves from `initialThemeSetting ?? settings.theme`, and the initial setting
-    /// is kept as the in-memory shadow later re-resolutions prefer. `--use-theme` is the only
-    /// source of one (`main.ts:944`). SEAM-119.
+    /// Pi's constructor with an `initialThemeSetting` (`theme-controller.ts:72-90`): the boot theme
+    /// resolves from `initialThemeSetting ?? settings.theme`, and the initial setting is kept as the
+    /// in-memory shadow later re-resolutions prefer. `--use-theme` is the only source of one
+    /// (`main.ts:944`). SEAM-119.
     pub fn boot_with_initial(
         initial_setting: Option<&str>,
         theme_setting: Option<&str>,
@@ -1565,16 +1585,16 @@ impl ThemeController {
         controller
     }
 
-    /// Boot with the color mode + terminal polarity detected from the environment (the binary path).
+    /// Boot with the colour mode and polarity detected from the environment (the binary path).
     ///
-    /// This is only the FIRST half of Pi's boot: it uses `COLORFGBG` alone, because at this point the
-    /// terminal is not yet in raw mode and cannot answer an escape query. Call
-    /// [`Self::sync_with_terminal`] once raw mode is on to complete it.
+    /// The terminal has not been asked anything yet — it is not in raw mode and cannot answer an
+    /// escape query — so the `system` theme is grayscale and the polarity is `COLORFGBG`'s. Call
+    /// [`Self::request_terminal_colors`] once raw mode is on to complete the boot.
     pub fn boot_from_env(theme_setting: Option<&str>) -> Self {
         ThemeController::boot(theme_setting, ColorMode::detect(), TerminalTheme::detect())
     }
 
-    /// [`Self::boot_with_initial`] with the color mode + terminal polarity detected from the
+    /// [`Self::boot_with_initial`] with the colour mode and polarity detected from the
     /// environment, as [`Self::boot_from_env`] detects them.
     pub fn boot_from_env_with_initial(
         initial_setting: Option<&str>,
@@ -1588,140 +1608,178 @@ impl ThemeController {
         )
     }
 
-    /// Re-run Pi's `applyFromSettings` (`theme-controller.ts:37-63`) now that the terminal can be
-    /// **asked** rather than merely guessed at from `COLORFGBG`. Returns the freshly projected
-    /// [`UiTheme`] when the active theme actually changed, so the caller repaints only then.
+    /// Pi `getThemeSetting()` (`theme-controller.ts:169-171`): the in-memory setting, else the one
+    /// settings carried.
+    fn effective_setting(&self) -> Option<&str> {
+        self.current_setting
+            .as_deref()
+            .or(self.theme_setting.as_deref())
+    }
+
+    /// Pi `resolveThemeName` (`theme-controller.ts:174-176`): the theme for the current setting and
+    /// terminal appearance. Without one that resolves, pi uses the system theme.
+    fn resolve_theme_name(&self) -> String {
+        resolve_theme_setting(self.effective_setting(), self.terminal_theme())
+            .unwrap_or_else(|| SYSTEM_THEME_NAME.to_string())
+    }
+
+    /// `parseAutoThemeSetting(themeSetting) !== undefined || themeName === SYSTEM_THEME_NAME`
+    /// (`theme-controller.ts:106`).
+    fn wants_auto_sync(&self) -> bool {
+        parse_auto_theme_setting(self.effective_setting()).is_some()
+            || self.resolve_theme_name() == SYSTEM_THEME_NAME
+    }
+
+    /// Whether the terminal is dark or light, from everything it reported so far (Pi
+    /// `getTerminalTheme`, `theme.ts:713-715`).
+    pub fn terminal_theme(&self) -> TerminalTheme {
+        detect_terminal_theme(&self.terminal_colors, None, self.env_theme)
+    }
+
+    /// The colours the terminal last reported (Pi `terminalColors`, `theme.ts:190`).
+    pub fn terminal_colors(&self) -> TerminalColors {
+        self.terminal_colors
+    }
+
+    /// Whether the system theme is still waiting for the terminal's colours, and so grayscale
+    /// (Pi `terminalColorsPending`, `theme.ts:192`).
+    pub fn terminal_colors_pending(&self) -> bool {
+        self.colors_pending
+    }
+
+    /// Ask the terminal for its colours and apply the answer — Pi `queryTerminalColors` +
+    /// `requestTerminalColors` (`theme-controller.ts:31-40`, `:189-191`) with the 100 ms
+    /// [`COLOR_QUERY_TIMEOUT`]. A terminal that does not answer reports nothing, which still ends
+    /// the grayscale state. `on_late_reply` receives the finished colours if the terminal completes
+    /// the query after the timeout; hand them to [`Self::apply_terminal_colors`] when they arrive.
     ///
-    /// The three branches are Pi's, in Pi's order:
-    ///
-    /// 1. an `auto` (`light/dark`) setting → [`detect_terminal_theme_for_auto`] (DSR `?996` first,
-    ///    then OSC 11, then `COLORFGBG`), auto-sync on, and the matching arm applied;
-    /// 2. an explicit `settings.theme` → auto-sync off, the name applied verbatim, no query at all
-    ///    (Pi never probes when the user has chosen; `:46-49`);
-    /// 3. no setting → [`detect_terminal_background_theme`], and on `confidence == High` the result
-    ///    is offered back for persistence via [`Self::theme_to_persist`].
-    ///
-    /// `colorfgbg` is the raw env value; pass `""` when unset. Timing/safety of the query itself is
-    /// the probe's contract — see [`crate::terminal_query`].
-    pub fn sync_with_terminal(
+    /// Returns the name of the theme to load when the colours changed anything (see
+    /// [`Self::apply_terminal_colors`]).
+    pub fn request_terminal_colors(
         &mut self,
-        probe: &dyn crate::terminal_query::TerminalProbe,
-        timeout: std::time::Duration,
-        colorfgbg: &str,
-    ) -> Option<UiTheme> {
-        let setting = self.theme_setting.clone();
-        let resolved = if let Some((light, dark)) = parse_auto_theme_setting(setting.as_deref()) {
-            self.terminal_theme = detect_terminal_theme_for_auto(probe, timeout, colorfgbg);
-            self.auto_sync = true;
-            match self.terminal_theme {
-                TerminalTheme::Light => light,
-                TerminalTheme::Dark => dark,
-            }
-        } else if let Some(name) = setting {
-            self.auto_sync = false;
-            name
-        } else {
-            self.auto_sync = false;
-            let detection = detect_terminal_background_theme(probe, timeout, colorfgbg);
-            self.terminal_theme = detection.theme;
-            let name = detection.theme.theme_name().to_string();
-            if detection.confidence == DetectionConfidence::High {
-                self.persist = Some(name.clone());
-            }
-            name
+        probe: &dyn TerminalProbe,
+        on_late_reply: Option<LateColors>,
+    ) -> Option<String> {
+        let colors = probe.query_terminal_colors(COLOR_QUERY_TIMEOUT, on_late_reply);
+        self.apply_terminal_colors(colors)
+    }
+
+    /// Record reported colours — Pi `applyTerminalColors` (`theme-controller.ts:197-211`): themes use
+    /// the default colours for tokens set to `""`, the system theme is generated from all of them,
+    /// and light/dark detection uses them. Ends the grayscale state.
+    ///
+    /// A colour the new report omits keeps its previous value, so a query that timed out does not
+    /// erase what an earlier one reported. Nothing changing (including a repeat timeout) is a
+    /// no-op: `None`. Otherwise the result is the name of the theme to (re)load — re-applying the
+    /// setting regenerates the system theme, or switches the theme of an automatic pair
+    /// (`reapplyForTerminal`, `:217-223`).
+    pub fn apply_terminal_colors(&mut self, reported: TerminalColors) -> Option<String> {
+        let previous = self.reported;
+        let next = TerminalColors {
+            foreground: reported.foreground.or(previous.and_then(|p| p.foreground)),
+            background: reported.background.or(previous.and_then(|p| p.background)),
+            palette: reported.palette.or(previous.and_then(|p| p.palette)),
         };
-        (resolved != self.active_name).then(|| self.set_theme_name(resolved))
+        // Re-rendering rebuilds every component, so skip it when nothing changed (including
+        // timeouts).
+        if previous == Some(next) {
+            return None;
+        }
+        self.reported = Some(next);
+        self.terminal_colors = next;
+        self.colors_pending = false;
+        let name = self.resolve_theme_name();
+        self.set_theme_name(name.clone());
+        self.auto_sync = self.wants_auto_sync();
+        Some(name)
     }
 
     /// Re-resolve the active theme from a freshly re-read `settings.theme` — Pi `applyFromSettings`
-    /// (`modes/interactive/theme/theme-controller.ts:57-81` @v0.84.4) — and return the theme NAME
-    /// the caller must now load.
+    /// (`theme-controller.ts:103-109`) — and return the theme NAME the caller must now load.
     ///
-    /// This is the `/reload` half of TUI-004. Pi runs `applyFromSettings` on every session
-    /// replacement (the `setRebindSession` hook, `interactive-mode.ts:576-579`) and again explicitly
-    /// from `handleReloadCommand` (`:5987`), so a `settings.theme` the user edited on disk, and a
-    /// custom theme file whose CONTENT changed under an unchanged name, both take effect without a
-    /// restart.
+    /// Pi runs it on every session replacement (the `setRebindSession` hook,
+    /// `interactive-mode.ts:608`) and again explicitly from `handleReloadCommand` (`:6411`), so a
+    /// `settings.theme` the user edited on disk, and a custom theme file whose CONTENT changed under
+    /// an unchanged name, both take effect without a restart. An automatic `light/dark` pair
+    /// resolves against the terminal's polarity; an explicit name is applied verbatim; with no
+    /// setting that resolves the name is `system`. The system theme and a pair keep following the
+    /// terminal ([`Self::auto_sync`]).
     ///
-    /// The three branches are Pi's, in Pi's order (`:60-72`): an `auto` (`light/dark`) pair resolves
-    /// against the terminal polarity with auto-sync on; an explicit name is applied verbatim with
-    /// auto-sync off; an unset setting falls back to the polarity's own theme name.
-    ///
-    /// **[CYRUP-DELTA] vs `:62` and `:74`** — the two probing branches do **not** re-probe. Upstream
-    /// asks the terminal again (DSR `?996` for an `auto` setting, OSC 11 for an unset one) because
-    /// its own TUI owns the stdin demultiplexer and can route the reply back to the awaiting caller.
-    /// By the time cyrup can reach this seam the input reader thread owns stdin
-    /// (`crates/cyrup/src/interactive.rs` starts it right after the boot probe, for exactly this
-    /// reason), so a second query's reply bytes would be raced for and mis-decoded as keystrokes
-    /// into the user's prompt — the same hazard [`Self::auto_sync`] records for mode `2031`. The
-    /// polarity detected at boot is therefore reused, which is correct for every terminal whose
-    /// background did not change mid-session, and a stale-polarity `auto` resolve is strictly better
-    /// than corrupting the editor buffer. For the same reason branch 3 offers nothing new to
-    /// [`Self::theme_to_persist`]: there is no fresh detection to persist.
-    ///
-    /// Returns the resolved name rather than an `Option<UiTheme>` the way
-    /// [`Self::sync_with_terminal`] does, and deliberately: "the name did not change" is NOT "there
-    /// is nothing to do" here, because the theme's own file may have been rewritten under the same
-    /// name — which is precisely the `/reload` case the item names. The caller re-loads the named
-    /// theme from the swapped-in session's freshly discovered resources every time
+    /// Returns the resolved name rather than a theme, and deliberately: "the name did not change" is
+    /// NOT "there is nothing to do" here, because the theme's own file may have been rewritten under
+    /// the same name — which is precisely the `/reload` case. The caller re-loads the named theme
+    /// from the swapped-in session's freshly discovered resources every time
     /// ([`crate::App::reapply_theme_from_settings`]), matching Pi's unconditional
-    /// `applyThemeName` → `setTheme(name)` re-read (`:126-135`).
+    /// `applyThemeName` → `setTheme(name)` re-read.
     pub fn apply_from_settings(&mut self, setting: Option<&str>) -> String {
         // `const themeSetting = this.currentThemeSetting ?? settingsManager.getThemeSetting()`
-        // (`theme-controller.ts:57` @v0.87.1) — a `--use-theme` or an in-app switch shadows the
+        // (`theme-controller.ts:169-171`) — a `--use-theme` or an in-app switch shadows the
         // re-read settings value (SEAM-119).
-        let shadowed = self.current_setting.clone();
-        let setting = shadowed.as_deref().or(setting);
         self.theme_setting = setting.map(str::to_string);
-        let resolved = if let Some((light, dark)) = parse_auto_theme_setting(setting) {
-            self.auto_sync = true;
-            match self.terminal_theme {
-                TerminalTheme::Light => light,
-                TerminalTheme::Dark => dark,
-            }
-        } else if let Some(name) = setting {
-            self.auto_sync = false;
-            name.to_string()
-        } else {
-            self.auto_sync = false;
-            self.terminal_theme.theme_name().to_string()
-        };
-        // `set_theme_name` is Pi's `applyThemeName` (`:126-135`): it re-seats the active name and
-        // bumps the generation so every render cache keyed by it re-materialises, which is what
-        // makes an unchanged NAME with changed CONTENT repaint.
-        self.set_theme_name(resolved.clone());
-        resolved
+        let name = self.resolve_theme_name();
+        self.auto_sync = self.wants_auto_sync();
+        // `set_theme_name` is Pi's `applyThemeName`: it re-seats the active name and bumps the
+        // generation so every render cache keyed by it re-materialises, which is what makes an
+        // unchanged NAME with changed CONTENT repaint.
+        self.set_theme_name(name.clone());
+        name
     }
 
-    /// Whether the active setting is an `auto` pair, i.e. whether Pi would keep terminal
-    /// color-scheme notifications (mode `2031`) enabled and re-theme on every change.
+    /// Whether the active setting is an `auto` pair or the system theme, i.e. whether Pi would keep
+    /// terminal colour-scheme notifications (mode `2031`) enabled and re-theme on every change
+    /// (`setAutoSync`, `theme-controller.ts:225-229`).
     ///
-    /// cyrup reports this but deliberately does **not** enable mode `2031`, and the reason is a
-    /// safety one rather than an oversight: crossterm surfaced no event for the unsolicited
-    /// `CSI ? 997 ; N n` notification, so every push the terminal sent reached `event::read()` and
-    /// was mis-decoded as stray keystrokes into the user's prompt. On unix the byte reader now
-    /// frames the push as one terminal reply and swallows it (`crate::input::decode`), so it no
-    /// longer corrupts input — but nothing consumes it either, and turning the notifications on
-    /// without a consumer still buys nothing. Independently, committed
-    /// transcript rows have already gone to `Terminal::insert_before` and live in the terminal's own
-    /// scrollback, so a mid-session polarity flip could never recolor what is already on screen
-    /// (ADR-0001). Detection therefore happens once, at boot.
+    /// cyrup arms the flag but does not enable mode `2031`, so nothing subscribes: crossterm
+    /// surfaced no event for the unsolicited `CSI ? 997 ; N n` notification, and every push the
+    /// terminal sent was mis-decoded as stray keystrokes into the user's prompt. The byte reader now
+    /// frames and swallows it (`crate::input::decode`), but nothing consumes it either, so turning
+    /// the notifications on would buy nothing yet. A live appearance change reaches the system
+    /// theme only through [`Self::apply_terminal_colors`].
     pub fn auto_sync(&self) -> bool {
         self.auto_sync
     }
 
-    /// The theme name a high-confidence detection wants persisted to `settings.theme`, if any (Pi
-    /// `theme-controller.ts:57-61`). Consumed once by the caller that owns the settings manager.
-    pub fn theme_to_persist(&self) -> Option<&str> {
-        self.persist.as_deref()
+    /// The `system` theme generated from what the terminal reported so far — grayscale while
+    /// [`Self::terminal_colors_pending`] (Pi `createSystemTheme`, `theme.ts:611-623`).
+    pub fn system_theme(&self) -> UiTheme {
+        let colors = self.terminal_colors;
+        UiTheme::system(&SystemThemeInput {
+            foreground: colors.foreground,
+            background: colors.background,
+            palette: colors.palette,
+            saturation: if self.colors_pending {
+                Saturation::GRAYSCALE
+            } else {
+                Saturation::FULL
+            },
+            appearance_hint: Some(self.terminal_theme().into()),
+        })
+        .with_terminal_appearance(self.terminal_theme().into())
+        .with_color_mode(self.color_mode)
+        .with_generation(self.generation)
     }
 
-    /// The projected render theme for the active name (built-in lookup, then depth projection). This is
-    /// what the app boots its `UiTheme` from and re-reads on a live `/theme` switch.
+    /// The projected render theme for the active name: `system` generated from the terminal's
+    /// colours, or a compiled-in built-in, through the depth projection. This is what the app boots
+    /// its `UiTheme` from and re-reads on a live switch. A name that is neither is the system theme,
+    /// as it is for pi's failed `setTheme`.
     pub fn theme(&self) -> UiTheme {
-        UiTheme::builtin(&self.active_name)
-            .with_color_mode(self.color_mode)
-            .with_generation(self.generation)
+        self.theme_named(&self.active_name)
+    }
+
+    /// The theme for `name` as this controller would paint it: `system` generated from the
+    /// terminal's colours, a compiled-in built-in, else — an unknown name — the system theme.
+    pub fn theme_named(&self, name: &str) -> UiTheme {
+        if name == SYSTEM_THEME_NAME {
+            return self.system_theme();
+        }
+        match UiTheme::builtin_named(name) {
+            Some(theme) => theme
+                .with_terminal_appearance(self.terminal_theme().into())
+                .with_color_mode(self.color_mode)
+                .with_generation(self.generation),
+            None => self.system_theme(),
+        }
     }
 
     /// The active theme name (test/inspection).
@@ -1735,34 +1793,29 @@ impl ThemeController {
         self.color_mode = color_mode;
     }
 
-    /// The color mode the controller projects into (test/inspection).
+    /// The colour mode the controller projects into (test/inspection).
     pub fn color_mode(&self) -> ColorMode {
         self.color_mode
     }
 
-    /// The terminal background polarity the boot theme was resolved against (Pi
-    /// `getTerminalTheme`, `theme-controller.ts:88-90`; drives auto-sync + the unset-setting fallback).
-    pub fn terminal_theme(&self) -> TerminalTheme {
-        self.terminal_theme
-    }
-
     /// pi's `applyThemeName` failure assignment — `this.activeThemeName = result.success ?
-    /// themeName : "dark"` (`theme-controller.ts:127` @v0.84.4).
+    /// themeName : SYSTEM_THEME_NAME` (`theme-controller.ts:180` @v1.0.0).
     ///
     /// Called by the loader ([`crate::App::reapply_theme_from_settings`]) when the name the
     /// controller just resolved could not be loaded, so `active_name()` and every reader of it
     /// (`/settings`, the theme-file watcher binding) name the theme that is actually painted rather
     /// than the one that failed. The generation bumps for the same reason every other apply does.
-    pub fn fall_back_to_dark(&mut self) -> UiTheme {
-        self.set_theme_name(DARK_THEME_NAME)
+    pub fn fall_back_to_system(&mut self) -> UiTheme {
+        self.set_theme_name(SYSTEM_THEME_NAME)
     }
 
     /// Record a user theme switch as the in-memory setting — pi's `this.currentThemeSetting =
     /// themeName` in `setThemeName` and `= themeSetting` in `setThemeSetting`
-    /// (`theme-controller.ts:88-99` @v0.87.1), which both of pi's switch paths (the `/settings`
-    /// theme confirm and an extension's `ctx.ui.setTheme`) run. SEAM-119.
+    /// (`theme-controller.ts:124-136`), which both of pi's switch paths (the `/settings` theme
+    /// confirm and an extension's `ctx.ui.setTheme`) run. SEAM-119.
     pub fn set_current_setting(&mut self, setting: impl Into<String>) {
         self.current_setting = Some(setting.into());
+        self.auto_sync = self.wants_auto_sync();
     }
 
     /// The in-memory setting that shadows `settings.theme`, if any (test/inspection).
@@ -1770,54 +1823,12 @@ impl ThemeController {
         self.current_setting.as_deref()
     }
 
-    /// Switch the active theme by name (Pi `setThemeName`, `theme-controller.ts:62-65`), bumping the
-    /// generation so render caches invalidate. Returns the freshly projected [`UiTheme`].
+    /// Switch the active theme by name (Pi `applyThemeName`), bumping the generation so render
+    /// caches invalidate. Returns the freshly projected [`UiTheme`].
     pub fn set_theme_name(&mut self, name: impl Into<String>) -> UiTheme {
         self.active_name = name.into();
         self.generation = self.generation.saturating_add(1);
         self.theme()
-    }
-}
-
-/// Pi `getColorFgBgBackgroundIndex` (`theme.ts:697-706`): the last valid `0..=255` field of a
-/// semicolon-separated `COLORFGBG`.
-fn colorfgbg_background_index(colorfgbg: &str) -> Option<u8> {
-    colorfgbg
-        .split(';')
-        .rev()
-        .filter_map(|p| p.trim().parse::<i32>().ok())
-        .find(|&n| (0..=255).contains(&n))
-        .map(|n| n as u8)
-}
-
-/// WCAG relative luminance of an sRGB color (Pi `getRgbColorLuminance`, `theme.ts:708-714`).
-fn relative_luminance(r: u8, g: u8, b: u8) -> f64 {
-    let lin = |c: u8| {
-        let v = c as f64 / 255.0;
-        if v <= 0.03928 {
-            v / 12.92
-        } else {
-            ((v + 0.055) / 1.055).powf(2.4)
-        }
-    };
-    0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b)
-}
-
-/// Map an xterm-256 palette index to its RGB (Pi `ansi256ToHex`, `theme.ts:968`): the 16 base colors,
-/// the 6×6×6 cube (16–231), and the 24-step grayscale ramp (232–255).
-fn ansi256_to_rgb(index: u8) -> (u8, u8, u8) {
-    // All indices are `.get`-guarded so the function stays panic-free (`clippy::indexing_slicing`).
-    let cube = |i: i32| CUBE_VALUES.get(i as usize).copied().unwrap_or(0) as u8;
-    match index {
-        0..=15 => ANSI16_RGB.get(index as usize).copied().unwrap_or((0, 0, 0)),
-        16..=231 => {
-            let i = (index - 16) as i32;
-            (cube(i / 36), cube((i / 6) % 6), cube(i % 6))
-        }
-        _ => {
-            let v = (8 + (index as i32 - 232) * 10) as u8;
-            (v, v, v)
-        }
     }
 }
 
@@ -2128,12 +2139,5 @@ mod tests {
             None
         );
         assert_eq!(resolve_theme_setting(None, TerminalTheme::Light), None);
-    }
-
-    #[test]
-    fn ansi256_to_rgb_known_points() {
-        assert_eq!(ansi256_to_rgb(16), (0, 0, 0));
-        assert_eq!(ansi256_to_rgb(231), (255, 255, 255));
-        assert_eq!(ansi256_to_rgb(244), (128, 128, 128));
     }
 }

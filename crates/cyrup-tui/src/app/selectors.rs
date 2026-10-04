@@ -491,7 +491,7 @@ impl<B: Backend> App<B> {
 
     /// Act on a [`SelectorOutcome`], whatever produced it — the key path and the paste path share
     /// this verbatim.
-    fn apply_selector_outcome(
+    pub(super) fn apply_selector_outcome(
         &mut self,
         kind: SelectorKind,
         outcome: SelectorOutcome,
@@ -503,7 +503,8 @@ impl<B: Backend> App<B> {
                 // Theme live preview: re-theme the whole UI as the highlight moves
                 // (`theme-selector.ts:54-56`). Other kinds never emit `Preview`.
                 if kind == SelectorKind::Theme {
-                    self.set_theme(UiTheme::builtin(&value));
+                    let theme = self.theme_for_picker(&value);
+                    self.set_theme(theme);
                 }
                 AppAction::Redraw
             }
@@ -755,7 +756,8 @@ impl<B: Backend> App<B> {
             // `set_theme` still runs for the immediate repaint; the persist arm (`C::ApplySetting`)
             // pushes the `theme → {value}` status, so this arm no longer pushes its own.
             SelectorKind::Theme => {
-                self.set_theme(UiTheme::builtin(value));
+                let theme = self.theme_for_picker(value);
+                self.set_theme(theme);
                 Some(AppCommand::ApplySetting {
                     id: "theme".to_string(),
                     value: value.to_string(),

@@ -32,7 +32,8 @@ use ratatui::widgets::Paragraph;
 use crate::auth_select::{StatusTone, format_auth_selector_provider_type, status_indicator_runs};
 use crate::keymap::{SelectAction, SelectKeymap};
 use crate::selector::{
-    Selector, SelectorOutcome, border_rule_line, centered_window, input_line_spans,
+    RowAction, RowMap, RowPointer, Selector, SelectorOutcome, border_rule_line, centered_window,
+    clamped_step, input_line_spans,
 };
 use crate::text_input::{Input, InputOutcome};
 use crate::text_width::truncate_line_to_width;
@@ -93,6 +94,8 @@ pub struct OAuthSelector {
     selected: usize,
     /// The search `Input` (`:76`) — the shared single-line editing surface.
     input: Input,
+    /// The row a left press went down on, so the click that completes the gesture confirms it.
+    pointer: RowPointer,
 }
 
 impl OAuthSelector {
@@ -136,6 +139,7 @@ impl OAuthSelector {
             filtered: Vec::new(),
             selected: 0,
             input: Input::with_value(initial_search.unwrap_or_default()),
+            pointer: RowPointer::default(),
         };
         // `this.filterProviders(initialSearchInput ?? "")` (`:99`).
         sel.apply_filter();
@@ -171,6 +175,15 @@ impl OAuthSelector {
     /// The highlighted row's index into the ORIGINAL `options` slice, if any.
     pub fn current_index(&self) -> Option<usize> {
         self.filtered.get(self.selected).copied()
+    }
+
+    /// Confirm the highlighted provider — the one answer to `Enter` and to a click on its row.
+    /// `:198-203`: confirming an empty list does nothing.
+    fn confirm_current(&self) -> SelectorOutcome {
+        match self.current_index() {
+            Some(i) => SelectorOutcome::Confirm(i.to_string()),
+            None => SelectorOutcome::Redraw,
+        }
     }
 
     /// The visible window `[start, end)` — `updateList`'s centred window (`:117-122`), `maxVisible`
@@ -247,6 +260,27 @@ impl OAuthSelector {
         lines
     }
 
+    /// Everything above the list (`oauth-selector.ts:68-87`): the rule, a blank, the title, a
+    /// blank, the search `Input` and the blank under it. The `Input` is a bare container child
+    /// (`:86`), so it renders at column 0 behind the shared unstyled `"> "` prompt (S31,
+    /// `input.ts:380`). Its length is the slot row the first provider is painted on, which is what
+    /// [`Selector::pointer`] hit-tests against.
+    fn head_lines(&self, width: u16, theme: &UiTheme) -> Vec<Line<'static>> {
+        vec![
+            border_rule_line(width, theme),
+            Line::from(""),
+            self.title_line(width, theme),
+            Line::from(""),
+            Line::from(input_line_spans(
+                self.input.value(),
+                self.input.cursor(),
+                width,
+                theme,
+            )),
+            Line::from(""),
+        ]
+    }
+
     /// The title row (`:73`): `new TruncatedText(theme.fg("accent", theme.bold(title)), 1, 0)`.
     fn title_line(&self, width: u16, theme: &UiTheme) -> Line<'static> {
         let avail = usize::from(width).saturating_sub(2);
@@ -273,22 +307,7 @@ impl Selector for OAuthSelector {
     }
 
     fn render(&mut self, frame: &mut Frame, area: Rect, theme: &UiTheme) {
-        // `DynamicBorder`(:68) · `Spacer`(:69) · title(:73) · `Spacer`(:74) · `Input`(:86) ·
-        // `Spacer`(:87). The `Input` is a bare container child (`:86`), so it renders at column 0
-        // behind the shared unstyled `"> "` prompt (S31, `input.ts:380`).
-        let mut lines: Vec<Line<'static>> = vec![
-            border_rule_line(area.width, theme),
-            Line::from(""),
-            self.title_line(area.width, theme),
-            Line::from(""),
-            Line::from(input_line_spans(
-                self.input.value(),
-                self.input.cursor(),
-                area.width,
-                theme,
-            )),
-            Line::from(""),
-        ];
+        let mut lines = self.head_lines(area.width, theme);
         lines.extend(self.body_lines(area.width, theme));
         lines.push(Line::from(""));
         lines.push(border_rule_line(area.width, theme));
@@ -299,6 +318,34 @@ impl Selector for OAuthSelector {
         // `tests/dialog_envelope_spacers.rs::a_paragraph_keeps_the_first_rows_and_drops_the_rest`
         // for the ratatui half).
         frame.render_widget(Paragraph::new(lines).style(theme.base_style()), area);
+    }
+
+    /// A press highlights the provider under the pointer, a click confirms it as `Enter` does, and
+    /// a wheel notch over the list moves the highlight one row; like the arrow keys here it stops
+    /// at the ends. The rules, title, search box, `(i/N)` readout and blanks are not providers.
+    fn pointer(&mut self, area: Rect, event: crate::app::Pointer) -> SelectorOutcome {
+        let top = self
+            .head_lines(area.width, UiTheme::default_ref())
+            .len()
+            .min(usize::from(u16::MAX)) as u16;
+        let len = self.filtered.len();
+        let map = RowMap::windowed(top, self.selected, len, MAX_VISIBLE).clipped_to(area.height);
+        match self.pointer.act(event, &map, self.selected, len) {
+            RowAction::Ignored => SelectorOutcome::Ignored,
+            RowAction::Handled => SelectorOutcome::Redraw,
+            RowAction::Highlight(item) => {
+                self.selected = item;
+                SelectorOutcome::Redraw
+            }
+            RowAction::Activate(item) => {
+                self.selected = item;
+                self.confirm_current()
+            }
+            RowAction::Step(step) => {
+                self.selected = clamped_step(self.selected, len, step);
+                SelectorOutcome::Redraw
+            }
+        }
     }
 
     fn handle(&mut self, key: &KeyEvent, keymap: &SelectKeymap) -> SelectorOutcome {
@@ -321,10 +368,7 @@ impl Selector for OAuthSelector {
                 SelectorOutcome::Redraw
             }
             // `:198-203` — confirming an empty list does nothing.
-            Some(SelectAction::Confirm) => match self.current_index() {
-                Some(i) => SelectorOutcome::Confirm(i.to_string()),
-                None => SelectorOutcome::Redraw,
-            },
+            Some(SelectAction::Confirm) => self.confirm_current(),
             Some(SelectAction::Cancel) => SelectorOutcome::Cancel,
             // "Pass everything else to search input" (`:208-212`) — the shared `Input`, so the
             // whole Emacs surface (word motion, kill ring, undo) reaches this box too.

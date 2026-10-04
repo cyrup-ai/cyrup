@@ -62,8 +62,8 @@ fn rcol_of(row: &str, needle: &str) -> u16 {
     row.get(..byte).map_or(0, |p| p.chars().count()) as u16
 }
 
-const DIM_DARK: Color = Color::Rgb(0x66, 0x66, 0x66);
-const MUTED_DARK: Color = Color::Rgb(0x80, 0x80, 0x80);
+const DIM_DARK: Color = Color::Rgb(0x7e, 0x88, 0x8e);
+const MUTED_DARK: Color = Color::Rgb(0x9d, 0xa5, 0xa9);
 
 // =============================================================== C1 — the context segment ====
 
@@ -394,8 +394,8 @@ async fn c1_auto_compact_has_its_own_refresh_independent_of_the_event_predicate(
 // ============================================================= C2 — footer base colour ======
 
 /// **C2.** `truncateToWidth(theme.fg("dim", pwd), width, theme.fg("dim", "..."))` (`footer.ts:229`)
-/// and `theme.fg("dim", statsLeft) + theme.fg("dim", remainder)` (`:225-227`). `dim` is `#666666`
-/// (`dark.json:31` `"dim": "dimGray"`), not `muted` `#808080` (`dark.json:30` `"muted": "gray"`).
+/// and `theme.fg("dim", statsLeft) + theme.fg("dim", remainder)` (`:225-227`). `dim` is `#7e888e`
+/// (v1.0.0 `dark.json`), not `muted` `#9da5a9`.
 ///
 /// FAILS before the fix: every character of both lines was `muted_style()`, one shade too bright.
 #[test]

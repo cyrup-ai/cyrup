@@ -399,3 +399,70 @@ that reasoning priced reachability, not severity, and is withdrawn. They are re-
 
 Closing `TUI-107` is what makes this default defensible on its own terms rather than on parity
 alone. Until it closes, cyrup ships pi's layout with less of pi's interaction.
+
+## Amendment, 2026-10-04 (b) — the alternate screen paints the whole interface, and the pointer reaches it
+
+The amendment above made `fullscreen` the default and named `TUI-107` as what makes that default
+defensible. Reading the frame to implement it showed the premise of `TUI-107` was wrong in a way that
+matters more than the row did: **the alternate screen painted the transcript and nothing else.** The
+editor, the selector slot, the completion popup, the status band, the extension widgets, the footer
+and the extension overlays were not drawn at all (`app/draw.rs` documented this as a "known residual:
+no chrome"), the turn still streaming was invisible until it committed, and an overlay that was not
+drawn still took every key. `TUI-107` described clicks that did nothing on chrome that was painted;
+there was no chrome to click. The default was shipped in that state.
+
+### Decision B, restated for the pointer
+
+ADR-0001's carve-out is for **drawing** only; a pointer protocol does not draw, so it is in scope and
+this ADR takes it. The protocol post-dates the unit list above (pi added `handleMouse` at v0.85.0 and
+click-to-toggle entries at v0.86.0), so this section is its record.
+
+**What is ported is the behaviour, not pi's mechanism.** Pi routes a report through its component
+tree: every component may implement `handleMouse`, containers forward to the child under the pointer
+with translated coordinates, and a result object says handled / capture / focus / render. cyrup has no
+component tree, and ratatui does not want one. The same behaviour is three steps over data the frame
+already has:
+
+1. **Rectangles, recorded.** `app::Regions` is the one answer to "where is the editor, the popup, the
+   selector, the footer, the document". `region_constraints` (which already encodes pi's dock shrink
+   priorities and floors) sizes the regions, a vertical ratatui `Layout` turns the sizes into
+   `Rect`s, and the painter stores them on `AppState` as it paints. A report is resolved against the
+   rectangles the **last frame was painted with**, so painter and hit test cannot disagree.
+2. **A closed event enum.** The crossterm report becomes `Pointer` — `Press`, `Click { count }`,
+   `Wheel` — with its position made local to the target rectangle. A click is synthesised from a press
+   and a release on the same cell, with a consecutive-click count (3 wraps to 1, 500 ms window), as
+   pi's renderer does; list rows are *selected* on press and *activated* on click.
+3. **Dispatch by `match`.** The target picks the one method that owns that component's geometry:
+   `InputEditor::pointer` / `pointer_popup`, `Selector::pointer`, the overlay's pointer method, and for
+   the scrolled document the selection layer's click outcome. Each answers as a key would have: a
+   redraw, a selection, a confirmation. This is a dispatch driven by arbitrary external events, so it
+   is an enum and a `match` — not typestate (`docs/RUST-DESIGN-REVIEW.md`), the same conclusion
+   `ADR-0028` reached for `cyrup-acp`.
+
+Modal precedence follows pi: an overlay that is hit takes the event; otherwise the dock (popup, then
+slot); otherwise the document (scrollbar, indicator, entry clicks, selection, wheel). A wheel notch
+no component acts on scrolls the document, as pi's `routeWheel` hands the remainder to the primary
+scroll view.
+
+### The renderer seam: `Chrome`
+
+The alternate-screen renderer owns the scrolled document, the scrollbar, the selection, the jump
+indicator and the flash; it does not know the editor or the footer, which are application state. The
+seam is a trait the renderer defines and the application implements (`altscreen::Chrome`): `layout`
+says how much of the screen the document gets, `strip` supplies the attachment strip whose kitty
+placements the renderer tracks, and `paint` draws the dock, the startup hints and the overlays. The
+document, its scrollbar and its indicator are addressed in the **document rectangle**
+(`AltScreen::doc_area`), never the whole screen, so a dock under the document does not move the scroll
+model's idea of "the bottom". The in-flight turn is appended to the document after the committed
+rows and replaced as its rendering changes; no row index refers to it.
+
+### Consequences
+
+- The inline and fullscreen frames paint the dock with the same functions (`paint_dock*`), so an
+  editor cannot look different across a mode switch.
+- `TUI-107` is closed by this section's work, with the finding above recorded against it.
+- Not pi behaviour, stated rather than discovered: after a click toggles a block the viewport is
+  re-anchored so the block stays under the pointer (`altscreen/toggle.rs`; pi leaves `scrollTop` where
+  it was, which lands the user on unrelated rows when the block started above the viewport).
+- Residual gaps are ledger rows, not prose: text selection cannot start on the dock (`TUI-147`), the
+  extension header is pinned instead of scrolling with the document (`TUI-148`).

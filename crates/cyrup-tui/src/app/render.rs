@@ -1,70 +1,46 @@
+use ratatui::layout::Rect;
+
 use super::*;
 
 /// Pure render: lay out conversation / editor / status and render each component (`state -> frame`).
 pub fn render(frame: &mut Frame, state: &mut AppState) {
     let area = frame.area();
-    let [
-        header_h,
-        msg_h,
-        pending_h,
-        band_h,
-        images_h,
-        wabove_h,
-        slot_h,
-        popup_h,
-        wbelow_h,
-        footer_h,
-    ] = region_constraints(state, area.width, area.height);
-    let _ = msg_h; // the message region absorbs the remainder via `Min(0)` below.
-    let [
-        header_area,
-        msg_area,
-        pending_area,
-        band_area,
-        images_area,
-        wabove_area,
-        slot_area,
-        popup_area,
-        wbelow_area,
-        status_area,
-    ] = Layout::vertical([
-        // TUI-033 — `headerContainer` is docked above `chatContainer` (`interactive-mode.ts:709`).
-        Constraint::Length(header_h),
-        // `Min(0)` (not the old `Min(1)`): the empty turn must not balloon the viewport (audit #1).
-        Constraint::Min(0),
-        Constraint::Length(pending_h),
-        Constraint::Length(band_h),
-        Constraint::Length(images_h),
-        // TUI-014 — `widgetContainerAbove`, immediately before `editorContainer` (`:715-716`).
-        Constraint::Length(wabove_h),
-        Constraint::Length(slot_h),
-        Constraint::Length(popup_h),
-        // TUI-014 — `widgetContainerBelow`, immediately after `editorContainer` (`:717`).
-        Constraint::Length(wbelow_h),
-        Constraint::Length(footer_h),
-    ])
-    .areas(area);
-    if header_h > 0
-        && let Some(content) = state.extension_header.as_deref()
-    {
+    let regions = Regions::compute(state, area);
+    // Recorded so a pointer report is resolved against the rectangles this frame was painted with.
+    state.regions = regions;
+    paint_header(frame, state, &regions);
+    state.transcript.render(frame, regions.msg, &state.theme);
+    paint_startup_hints(frame, state, regions.msg);
+    paint_dock(frame, state, &regions);
+    paint_overlays(frame, state, area);
+}
+
+/// The extension header (`setHeader`), pinned above the message region.
+pub(crate) fn paint_header(frame: &mut Frame, state: &AppState, regions: &Regions) {
+    if regions.header.height == 0 {
+        return;
+    }
+    if let Some(content) = state.extension_header.as_deref() {
         let lines: Vec<Line<'static>> = content
             .lines()
             .map(|l| Line::from(Span::styled(l.to_string(), state.theme.base_style())))
             .collect();
         frame.render_widget(
             Paragraph::new(lines).style(state.theme.base_style()),
-            header_area,
+            regions.header,
         );
     }
-    state.transcript.render(frame, msg_area, &state.theme);
-    // The compact startup-help block (`compactInstructions` + `compactOnboarding` + `onboarding`,
-    // the startup `ExpandableText`'s collapsed body at interactive-mode.ts:936-957, framed by
-    // `Spacer(1)` at `:960-962`) occupies the bottom rows of the otherwise-empty message area at
-    // startup — just above the editor — sourced from the live keymap so rebinds reflect. It is
-    // suppressed once a submission lands (`show_startup_hints` cleared) and while a selector owns
-    // the slot, so it never shifts the editor/footer geometry. `render_compact_hints` degrades the
-    // block from its edges inward when `rows` is short of the block's wrapped height, so the hint
-    // bar itself survives down to a single row.
+}
+
+/// The compact startup-help block (`compactInstructions` + `compactOnboarding` + `onboarding`, the
+/// startup `ExpandableText`'s collapsed body at interactive-mode.ts:936-957, framed by `Spacer(1)`
+/// at `:960-962`) occupies the bottom rows of the otherwise-empty message area at startup — just
+/// above the editor — sourced from the live keymap so rebinds reflect. It is suppressed once a
+/// submission lands (`show_startup_hints` cleared) and while a selector owns the slot, so it never
+/// shifts the editor/footer geometry. `render_compact_hints` degrades the block from its edges
+/// inward when `rows` is short of the block's wrapped height, so the hint bar itself survives down
+/// to a single row.
+pub(crate) fn paint_startup_hints(frame: &mut Frame, state: &AppState, msg_area: Rect) {
     if state.show_startup_hints
         && state.selector.is_none()
         && !state.transcript.has_active()
@@ -72,7 +48,7 @@ pub fn render(frame: &mut Frame, state: &mut AppState) {
     {
         let rows = crate::chrome::compact_hint_height(&state.theme, &state.keymap, msg_area.width)
             .min(msg_area.height);
-        let hint_row = ratatui::layout::Rect {
+        let hint_row = Rect {
             x: msg_area.x,
             y: msg_area.y.saturating_add(msg_area.height - rows),
             width: msg_area.width,
@@ -80,7 +56,41 @@ pub fn render(frame: &mut Frame, state: &mut AppState) {
         };
         crate::chrome::render_compact_hints(frame, hint_row, &state.theme, &state.keymap);
     }
-    if pending_h > 0 {
+}
+
+/// Everything docked below the message region: queued messages, the attachment strip, the working
+/// band, the editor slot (with its popup), the extension widgets and the footer. Shared by both
+/// renderers — the inline path paints it into the live region, the alternate screen into the dock
+/// under the scrolled document.
+///
+/// `images` is painted here only inline; the alternate screen places the strip itself because the
+/// kitty placements it draws are tracked across frames (`altscreen/images.rs`).
+pub(crate) fn paint_dock(frame: &mut Frame, state: &mut AppState, regions: &Regions) {
+    paint_dock_inner(frame, state, regions, true);
+}
+
+/// [`paint_dock`] without the attachment strip, for the renderer that owns its placement.
+pub(crate) fn paint_dock_without_images(
+    frame: &mut Frame,
+    state: &mut AppState,
+    regions: &Regions,
+) {
+    paint_dock_inner(frame, state, regions, false);
+}
+
+fn paint_dock_inner(frame: &mut Frame, state: &mut AppState, regions: &Regions, images: bool) {
+    let Regions {
+        pending: pending_area,
+        band: band_area,
+        images: images_area,
+        widgets_above: wabove_area,
+        slot: slot_area,
+        popup: popup_area,
+        widgets_below: wbelow_area,
+        footer: status_area,
+        ..
+    } = *regions;
+    if pending_area.height > 0 {
         // `getAppKeyDisplay("app.message.dequeue")` (`interactive-mode.ts:3987`) — `keyDisplayText`,
         // so ALL bound keys joined with `/` and title-cased (`keybinding-hints.ts:29-40`).
         let dequeue = state
@@ -91,10 +101,10 @@ pub fn render(frame: &mut Frame, state: &mut AppState) {
             .pending_messages
             .render(frame, pending_area, &state.theme, dequeue.as_deref());
     }
-    if images_h > 0 {
+    if images && images_area.height > 0 {
         render_images(frame, images_area, state);
     }
-    if band_h > 0 {
+    if band_area.height > 0 {
         // `(${keyText("app.interrupt")} to cancel)` (`status-indicator.ts:47,78,100`) — `keyText`,
         // so ALL bound keys joined with `/` (`keybinding-hints.ts:29-36`), not just the first.
         let cancel = state.keymap.keys_label(Action::Interrupt);
@@ -141,7 +151,7 @@ pub fn render(frame: &mut Frame, state: &mut AppState) {
             // them into `popup_area` at full frame width, flush at column 0. No effect at the
             // default padding of 0, which is why it went unnoticed.
             let pad = state.editor.effective_padding(popup_area.width);
-            let inner = ratatui::layout::Rect {
+            let inner = Rect {
                 x: popup_area.x.saturating_add(pad),
                 y: popup_area.y,
                 width: popup_area.width.saturating_sub(pad.saturating_mul(2)),
@@ -151,10 +161,10 @@ pub fn render(frame: &mut Frame, state: &mut AppState) {
             frame.render_widget(Paragraph::new(lines).style(state.theme.base_style()), inner);
         }
     }
-    if wabove_h > 0 {
+    if wabove_area.height > 0 {
         render_extension_widgets(frame, wabove_area, state, false);
     }
-    if wbelow_h > 0 {
+    if wbelow_area.height > 0 {
         render_extension_widgets(frame, wbelow_area, state, true);
     }
     // TUI-033 — `setExtensionFooter` CLEARS `footerContainer` and adds the extension component in
@@ -173,8 +183,11 @@ pub fn render(frame: &mut Frame, state: &mut AppState) {
         }
         None => state.status.render(frame, status_area, &state.theme),
     }
-    // Floating overlays draw last, on top of the live region, bottom→top (spec/tui/05 §2; arch-10
-    // §6.4): each clears its own `Rect` then renders its box.
+}
+
+/// Floating overlays draw last, on top of everything, bottom→top (spec/tui/05 §2; arch-10 §6.4):
+/// each clears its own `Rect` then renders its box.
+pub(crate) fn paint_overlays(frame: &mut Frame, state: &mut AppState, area: Rect) {
     for overlay in state.overlays.iter_mut() {
         overlay.render(frame, area, &state.theme);
     }

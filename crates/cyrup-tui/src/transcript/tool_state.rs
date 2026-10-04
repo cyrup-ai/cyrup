@@ -61,6 +61,7 @@ impl TranscriptView {
             definition,
             preview: None,
             images: Vec::new(),
+            live_expansion: None,
         });
     }
 
@@ -189,6 +190,7 @@ impl TranscriptView {
                 definition: None,
                 preview: None,
                 images,
+                live_expansion: None,
             });
         }
     }
@@ -234,9 +236,10 @@ impl TranscriptView {
     /// becomes an [`Entry::Tool`]; still-running tools are committed as-is (marked done).
     pub fn commit_tools(&mut self) {
         self.bump_render_generation();
-        for mut run in self.active_tools.drain(..) {
+        for mut run in std::mem::take(&mut self.active_tools) {
             run.done = true;
-            self.pending.push(Entry::Tool(run));
+            let live = run.live_expansion.take();
+            self.push_pending_with(Entry::Tool(run), live);
         }
     }
 
@@ -271,8 +274,10 @@ impl TranscriptView {
             .iter()
             .position(|run| !run.done)
             .unwrap_or(self.active_tools.len());
-        for run in self.active_tools.drain(..split) {
-            self.pending.push(Entry::Tool(run));
+        let committed: Vec<ToolRun> = self.active_tools.drain(..split).collect();
+        for mut run in committed {
+            let live = run.live_expansion.take();
+            self.push_pending_with(Entry::Tool(run), live);
         }
     }
 
@@ -285,6 +290,9 @@ impl TranscriptView {
     pub fn toggle_tool_expanded(&mut self) -> bool {
         self.bump_render_generation();
         self.tool_expanded = !self.tool_expanded;
+        // `setToolsExpanded` overwrites every component's local flag (`interactive-mode.ts:4474`),
+        // so a per-entry click override does not outlive the broadcast.
+        self.reset_expansion(ToggleScope::Block);
         self.tool_expanded
     }
 
@@ -297,6 +305,11 @@ impl TranscriptView {
         self.bump_render_generation();
         let changed = self.tool_expanded != expanded;
         self.tool_expanded = expanded;
+        // Only a real change broadcasts (`if (expanded === this.toolOutputExpanded) return`), so
+        // only a real change overwrites the per-entry click overrides.
+        if changed {
+            self.reset_expansion(ToggleScope::Block);
+        }
         changed
     }
 

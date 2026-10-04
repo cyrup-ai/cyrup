@@ -34,7 +34,19 @@ impl TranscriptView {
             // TUI-020 — the href table `tool_path_span` fills while `lines` runs. Built with the
             // lines and stored with them, because the marker ids the spans carry index THIS table.
             let links = crate::osc::LinkSink::new();
-            let lines = self.lines_with(width, theme, Some(&links)); // the current body, unchanged
+            let (lines, blocks) = self.live_lines(width, theme, Some(&links)); // the current body
+            // The blocks' starts are positions in `lines`; the cache holds the WRAPPED rows. Each
+            // block arrives already fitted to the width, so these agree — measured rather than
+            // assumed, because a start that drifted would aim a click at the wrong block.
+            let toggles: Vec<LiveToggle> = blocks
+                .into_iter()
+                .map(|t| LiveToggle {
+                    start: lines
+                        .get(..t.start)
+                        .map_or(t.start, |prefix| wrapped_height(prefix, width.max(1))),
+                    ..t
+                })
+                .collect();
             // Wrap HERE, on the miss path, where the markdown pass already is — so a frame pays for
             // wrapping only when the content changed, and `render` becomes a slice of the result
             // rather than a re-wrap of the whole turn (PERF-005 §3.0).
@@ -44,9 +56,28 @@ impl TranscriptView {
                 theme_generation: theme.generation,
                 rows: std::sync::Arc::new(wrap_all_owned(lines, width.max(1))),
                 links,
+                toggles: std::sync::Arc::new(toggles),
             };
         }
         &self.render_cache
+    }
+
+    /// The in-flight turn's wrapped rows at `width` — the very rows the inline renderer paints into
+    /// its live region, handed out by reference count so the alternate screen can append them to the
+    /// scrolled document without copying them. The same `Arc` comes back until something the turn
+    /// draws changes, which is how the caller tells a changed turn from an unchanged one.
+    pub(crate) fn live_rows(
+        &mut self,
+        width: usize,
+        theme: &UiTheme,
+    ) -> std::sync::Arc<Vec<Line<'static>>> {
+        std::sync::Arc::clone(&self.cached_render(width, theme).rows)
+    }
+
+    /// The click regions of the blocks in the rows [`Self::live_rows`] last handed out, in those
+    /// rows. Only meaningful right after that call — the cache they come from is the one it filled.
+    pub(crate) fn live_toggles(&self) -> std::sync::Arc<Vec<LiveToggle>> {
+        std::sync::Arc::clone(&self.render_cache.toggles)
     }
 
     /// The number of visual lines the active turn occupies at `width` — the message region's content
@@ -80,13 +111,27 @@ impl TranscriptView {
     /// the body [`Self::cached_render`] materialises. `None` renders the same lines with no link
     /// marked: the shape every caller that does not own the resulting `Buffer` wants, and the shape
     /// the test-only `lines()` wrapper above keeps for the tests that only read text back.
+    #[cfg(test)]
     pub(super) fn lines_with(
         &self,
         width: usize,
         theme: &UiTheme,
         links: Option<&crate::osc::LinkSink>,
     ) -> Vec<Line<'static>> {
+        self.live_lines(width, theme, links).0
+    }
+
+    /// [`Self::lines_with`] and the click regions of the blocks pi makes toggle on click while they
+    /// are still live — a streaming reasoning run, and a tool block that has a result — with their
+    /// starts as indices into the returned lines.
+    pub(super) fn live_lines(
+        &self,
+        width: usize,
+        theme: &UiTheme,
+        links: Option<&crate::osc::LinkSink>,
+    ) -> (Vec<Line<'static>>, Vec<LiveToggle>) {
         let mut lines: Vec<Line<'static>> = Vec::new();
+        let mut toggles: Vec<LiveToggle> = Vec::new();
         // The live reasoning block renders ABOVE the answer text, the order Pi's content walk
         // produces for a reasoning model (thinking blocks precede the text blocks of the turn) —
         // `assistant-message.ts:115-166`.
@@ -129,15 +174,27 @@ impl TranscriptView {
             .as_deref()
             .or(self.thinking.as_deref());
         if let Some(thinking) = thinking_body.filter(|_| thinking_visible) {
+            // A click on the streaming run replaces `hideThinkingBlock` for it alone
+            // (`thinkingVisibilityOverrides.get(runIndex) ?? this.hideThinkingBlock`).
+            let hidden = match self.expansion.live_thinking {
+                Some(e) => !e.is_open(),
+                None => self.hide_thinking,
+            };
             let mut td = thinking_lines(
                 thinking,
-                self.hide_thinking,
+                hidden,
                 width.saturating_sub(self.output_pad * 2),
                 theme,
                 self.hidden_thinking_label(),
             );
             if !td.is_empty() {
                 pad_lines(&mut td, self.output_pad);
+                // The region is the run itself, not the `Spacer(1)` above it.
+                toggles.push(LiveToggle {
+                    start: lines.len(),
+                    region: ToggleRegion::new(0..td.len(), 0..width),
+                    block: LiveBlock::Thinking,
+                });
                 lines.extend(td);
                 // Pi's `hasVisibleContentAfter` spacer (`:134-137`): a blank only when more visible
                 // assistant content follows — and "visible" is the same trimmed test (`:137`).
@@ -190,10 +247,14 @@ impl TranscriptView {
         }
         // Live tool executions render below the streaming partial, honoring the expand flag so
         // `Ctrl+O` toggles their result body in the viewport before the turn commits.
-        for run in &self.active_tools {
-            lines.extend(tool_lines(
+        for (index, run) in self.active_tools.iter().enumerate() {
+            // This block's own click override, else the global flag.
+            let expanded = run
+                .live_expansion
+                .map_or(self.tool_expanded, Expansion::is_open);
+            let block = tool_block(
                 run,
-                self.tool_expanded,
+                expanded,
                 width,
                 theme,
                 ImageOpts {
@@ -204,7 +265,7 @@ impl TranscriptView {
                     cwd: self.cwd.as_deref(),
                     hyperlinks: self.hyperlinks,
                     links,
-                    tools_expanded: self.tool_expanded,
+                    tools_expanded: expanded,
                     // A tool block draws no reasoning, so this is inert here — carried only so the
                     // bag has one construction shape.
                     hidden_thinking_label: None,
@@ -212,7 +273,18 @@ impl TranscriptView {
                     // bodies, so no mermaid transformer reaches it upstream.
                     mermaid: self.mermaid_mode,
                 },
-            ));
+            );
+            // Running without a result: nothing to toggle yet.
+            if run.result.is_some()
+                && let Some(region) = block.hit
+            {
+                toggles.push(LiveToggle {
+                    start: lines.len(),
+                    region,
+                    block: LiveBlock::Tool(index),
+                });
+            }
+            lines.extend(block.lines);
         }
         // The live `!`/`!!` bash block renders last (`bash-execution.ts` sits in the message region).
         if let Some(b) = &self.bash {
@@ -223,7 +295,7 @@ impl TranscriptView {
                 self.bash_expand_hint.as_deref(),
             ));
         }
-        lines
+        (lines, toggles)
     }
 }
 

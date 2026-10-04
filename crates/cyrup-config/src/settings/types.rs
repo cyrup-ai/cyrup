@@ -174,6 +174,93 @@ impl FullscreenExitOutput {
     }
 }
 
+/// A fixed `fullscreenWheelScrollLines` count — always within `1..=100`.
+///
+/// Pi clamps this range independently on READ (`getFullscreenWheelScrollLines`,
+/// `Math.max(1, Math.min(100, Math.floor(lines)))`, `settings-manager.ts:1389-1394` @v1.0.0) and on
+/// WRITE (`setFullscreenWheelScrollLines`, `:1396-1400`), so a hand-edited `500` reads back as `100`
+/// rather than being rejected. A newtype with one private field makes both clamps the same
+/// constructor: an out-of-range value cannot be built, so neither side can forget to apply it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct WheelLineCount(u8);
+
+impl WheelLineCount {
+    /// The smallest legal count (`Math.max(1, …)`).
+    pub const MIN: u8 = 1;
+    /// The largest legal count (`Math.min(100, …)`).
+    pub const MAX: u8 = 100;
+
+    /// Floor then clamp a number into `1..=100` — pi's `Math.max(1, Math.min(100,
+    /// Math.floor(lines)))`. `None` for a non-finite input, which pi's reader maps to `"auto"`
+    /// (`Number.isFinite`, `:1391`).
+    pub fn from_number(n: f64) -> Option<Self> {
+        if !n.is_finite() {
+            return None;
+        }
+        let clamped = n.floor().clamp(f64::from(Self::MIN), f64::from(Self::MAX));
+        // `clamped` is an integer-valued float in `1..=100`, so the conversion is exact.
+        Some(Self(clamped as u8))
+    }
+
+    /// The count as a plain integer, `1..=100`.
+    pub fn get(self) -> u8 {
+        self.0
+    }
+}
+
+/// `fullscreenWheelScrollLines` — lines per wheel event, or `"auto"` to accelerate fast spins (pi
+/// `WheelScrollLines = number | "auto"`, `packages/tui/src/wheel-scroll.ts:2` @v1.0.0; the settings
+/// key is declared at `settings-manager.ts:188` with `// default: "auto"; lines per wheel event,
+/// 1-100`). TUI-136 / CFG-100.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum WheelScrollLines {
+    /// Pi's default, and what every non-finite or non-numeric stored value reads back as — see
+    /// [`super::EffectiveSettings::fullscreen_wheel_scroll_lines`].
+    #[default]
+    Auto,
+    /// A fixed count per event.
+    Lines(WheelLineCount),
+}
+
+impl WheelScrollLines {
+    /// The settings-file value `setFullscreenWheelScrollLines` writes: the string `"auto"`, or the
+    /// clamped number (a JSON NUMBER — pi's reader answers `"auto"` for a numeric string).
+    pub fn to_json(self) -> serde_json::Value {
+        match self {
+            Self::Auto => serde_json::Value::from("auto"),
+            Self::Lines(n) => serde_json::Value::from(n.get()),
+        }
+    }
+
+    /// Build from an arbitrary number, clamping exactly as pi's setter does; a non-finite number
+    /// is `Auto`.
+    pub fn from_number(n: f64) -> Self {
+        WheelLineCount::from_number(n).map_or(Self::Auto, Self::Lines)
+    }
+
+    /// Build from a `/settings` row's cycle value (`newValue === "auto" ? "auto" :
+    /// parseInt(newValue, 10)`, `settings-selector.ts:975`), clamped like the setter. Text that is
+    /// neither `auto` nor a number is `Auto`.
+    pub fn from_row_value(value: &str) -> Self {
+        match value.trim().parse::<i64>() {
+            // `i64 -> f64` only loses precision above 2^53, far outside the `1..=100` clamp.
+            Ok(n) => Self::from_number(n as f64),
+            Err(_) => Self::Auto,
+        }
+    }
+}
+
+impl std::fmt::Display for WheelScrollLines {
+    /// `String(config.fullscreenWheelScrollLines)` (`settings-selector.ts:738`): `auto` or the
+    /// decimal count.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Auto => f.write_str("auto"),
+            Self::Lines(n) => write!(f, "{}", n.get()),
+        }
+    }
+}
+
 /// Custom per-level thinking token budgets (Pi `ThinkingBudgetsSettings`, settings-manager.ts:46-51).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]

@@ -2,8 +2,8 @@
 //!
 //! Pi's `showLoadedResources` (`interactive-mode.ts:1480-1690`) prints, at boot:
 //!
-//! * an inventory — `[Context]`, `[Skills]`, `[Prompts]`, `[Extensions]`, `[Themes]` — gated on
-//!   `force || options.verbose || !getQuietStartup()` (`:1488`);
+//! * an inventory — `[Context]`, `[Skills]`, `[Prompts]`, `[Extensions]` (v1.0.0 has no
+//!   `[Themes]` listing) — gated on `force || options.verbose || !getQuietStartup()` (`:1488`);
 //! * four `warning`-styled diagnostic blocks — `[Skill conflicts]`, `[Prompt conflicts]`,
 //!   `[Extension issues]`, `[Theme conflicts]` (`:1641-1690`) — which the boot call site asks for
 //!   even under `quietStartup` (`{showDiagnosticsWhenQuiet: true}`, `:1769`).
@@ -70,7 +70,6 @@ fn loud_report() -> StartupReport {
         skills: vec!["review".into(), "deploy".into()],
         prompts: vec!["/plan".into()],
         extensions: vec!["cyrup-subagents".into()],
-        themes: vec!["solarized".into()],
         context_files: vec!["~/proj/AGENTS.md".into()],
         ..Default::default()
     }
@@ -79,25 +78,14 @@ fn loud_report() -> StartupReport {
 #[test]
 fn the_loaded_inventory_reaches_the_scrollback() {
     let (_app, out) = commit(&loud_report());
-    for needle in [
-        "[Context]",
-        "[Skills]",
-        "[Prompts]",
-        "[Extensions]",
-        "[Themes]",
-    ] {
+    for needle in ["[Context]", "[Skills]", "[Prompts]", "[Extensions]"] {
         assert!(out.contains(needle), "`{needle}` section missing:\n{out}");
     }
-    for needle in [
-        "review",
-        "deploy",
-        "/plan",
-        "cyrup-subagents",
-        "solarized",
-        "AGENTS.md",
-    ] {
+    for needle in ["review", "deploy", "/plan", "cyrup-subagents", "AGENTS.md"] {
         assert!(out.contains(needle), "`{needle}` not listed:\n{out}");
     }
+    // v1.0.0 `showLoadedResources` prints no themes inventory (only `[Theme conflicts]`).
+    assert!(!out.contains("[Themes]"), "no themes listing:\n{out}");
 }
 
 #[test]

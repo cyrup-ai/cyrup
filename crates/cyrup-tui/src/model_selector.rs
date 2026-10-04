@@ -17,7 +17,10 @@ use ratatui::widgets::Paragraph;
 
 use crate::fuzzy;
 use crate::keymap::{EditorAction, EditorKeymap, SelectAction, SelectKeymap};
-use crate::selector::{Selector, SelectorOutcome, border_rule_line, centered_window};
+use crate::selector::{
+    RowAction, RowMap, RowPointer, Selector, SelectorOutcome, border_rule_line, centered_window,
+    clamped_step,
+};
 use crate::text_input::{Input, InputOutcome};
 use crate::theme::UiTheme;
 use crate::transcript::text_lines_of;
@@ -118,6 +121,9 @@ pub struct ModelSelector {
     /// The label of the key bound to `tui.input.tab` (cyrup's `editor.tab`), for the scope hint row
     /// — Pi `keyHint("tui.input.tab", "scope")` reads the LIVE keymap (`:228-230`), never a glyph.
     scope_key: String,
+    /// The row a left press went down on, so the click that completes the gesture confirms it even
+    /// if the window slid under the pointer.
+    pointer: RowPointer,
 }
 
 impl ModelSelector {
@@ -217,6 +223,7 @@ impl ModelSelector {
             scope_key: EditorKeymap::default()
                 .keys_label(EditorAction::Tab)
                 .unwrap_or_else(|| "tab".to_string()),
+            pointer: RowPointer::default(),
         };
         // Preselect the current model within the initial (scope-filtered) view.
         sel.selected = sel.filtered().iter().position(|m| m.current).unwrap_or(0);
@@ -263,6 +270,18 @@ impl ModelSelector {
             .collect();
         out.extend(fuzzed.into_iter().filter(|m| !self.is_default(m)));
         out
+    }
+
+    /// Confirm the highlighted model — the one answer to `Enter` and to a click on its row.
+    ///
+    /// Confirms the fully-qualified `provider/id` (Pi `handleSelect` →
+    /// `setDefaultModelAndProvider(model.provider, model.id)`, model-selector.ts:330) so a
+    /// cross-provider selection resolves against the right provider and swaps it.
+    fn confirm_current(&self) -> SelectorOutcome {
+        match self.current() {
+            Some(m) => SelectorOutcome::Confirm(format!("{}/{}", m.provider, m.id)),
+            None => SelectorOutcome::Redraw,
+        }
     }
 
     /// The highlighted model, if any (test/inspection).
@@ -413,6 +432,31 @@ impl ModelSelector {
             out.extend(text_lines_of(&self.scope_hint_line(theme), width, 0));
         }
         out
+    }
+
+    /// Everything above the list, through the blank under the search box
+    /// (`model-selector.ts:92-120`). Its length is the slot row the first model is painted on,
+    /// which is what [`Selector::pointer`] hit-tests against.
+    fn head_lines(&self, width: u16, theme: &UiTheme) -> Vec<Line<'static>> {
+        let mut lines: Vec<Line<'static>> = vec![border_rule_line(width, theme)];
+        lines.push(Line::from(""));
+        // The scope hint is its OWN `Text` child (`:99-100`) and exists only on the scoped branch.
+        lines.extend(self.scope_block_lines(usize::from(width), theme));
+        lines.push(Line::from(""));
+        // Search box with a visible block cursor (feature #9 "selector IME cursor").
+        //
+        // S31: the prompt is `Input.render`'s shared, unstyled `"> "` at column 0 (`input.ts:380`),
+        // because `model-selector.ts:118` adds `this.searchInput` to the container as a bare child.
+        // cyrup drew accent `" ▏"…"▏"` bars around the value — one column in, coloured, and U+258F
+        // occurs nowhere in pi's TUI sources.
+        lines.push(Line::from(crate::selector::input_line_spans(
+            self.input.value(),
+            self.input.cursor(),
+            width,
+            theme,
+        )));
+        lines.push(Line::from(""));
+        lines
     }
 
     /// The windowed list body (Pi `updateList`, `:257-318`): `→ ` cursor + `id` + `[provider]` badge +
@@ -633,24 +677,7 @@ impl Selector for ModelSelector {
         // Unconditional, because upstream's `Spacer` children are — a `Paragraph` draws
         // `lines[0..area.height]` and drops the TRAILING rows, so a short slot shows a strict
         // PREFIX of this vector, matching pi's layout engine (see `crate::selector::stack_rows`).
-        let mut lines: Vec<Line<'static>> = vec![border_rule_line(area.width, theme)];
-        lines.push(Line::from(""));
-        // The scope hint is its OWN `Text` child (`:99-100`) and exists only on the scoped branch.
-        lines.extend(self.scope_block_lines(usize::from(area.width), theme));
-        lines.push(Line::from(""));
-        // Search box with a visible block cursor (feature #9 "selector IME cursor").
-        //
-        // S31: the prompt is `Input.render`'s shared, unstyled `"> "` at column 0 (`input.ts:380`),
-        // because `model-selector.ts:118` adds `this.searchInput` to the container as a bare child.
-        // cyrup drew accent `" ▏"…"▏"` bars around the value — one column in, coloured, and U+258F
-        // occurs nowhere in pi's TUI sources.
-        lines.push(Line::from(crate::selector::input_line_spans(
-            self.input.value(),
-            self.input.cursor(),
-            area.width,
-            theme,
-        )));
-        lines.push(Line::from(""));
+        let mut lines = self.head_lines(area.width, theme);
         lines.extend(self.body_lines(&filtered, usize::from(area.width), theme));
         // `if (this.onSelectAsDefaultCallback) { addChild(new Text(theme.fg("dim", "  Enter to
         // select · Ctrl+S to set as default · Esc to cancel"))) }` (`model-selector.ts:138-142`).
@@ -666,6 +693,36 @@ impl Selector for ModelSelector {
         lines.push(Line::from(""));
         lines.push(border_rule_line(area.width, theme));
         frame.render_widget(Paragraph::new(lines).style(theme.base_style()), area);
+    }
+
+    /// A press highlights the model under the pointer, a click confirms it as `Enter` does, and a
+    /// wheel notch over the list moves the highlight one model without wrapping. The rules, the
+    /// scope block, the search box, the `(i/N)` readout and everything under the list are not
+    /// models.
+    fn pointer(&mut self, area: Rect, event: crate::app::Pointer) -> SelectorOutcome {
+        let top = self
+            .head_lines(area.width, UiTheme::default_ref())
+            .len()
+            .min(usize::from(u16::MAX)) as u16;
+        let len = self.visible_len();
+        let map =
+            RowMap::windowed(top, self.selected, len, self.max_visible).clipped_to(area.height);
+        match self.pointer.act(event, &map, self.selected, len) {
+            RowAction::Ignored => SelectorOutcome::Ignored,
+            RowAction::Handled => SelectorOutcome::Redraw,
+            RowAction::Highlight(item) => {
+                self.selected = item;
+                SelectorOutcome::Redraw
+            }
+            RowAction::Activate(item) => {
+                self.selected = item;
+                self.confirm_current()
+            }
+            RowAction::Step(step) => {
+                self.selected = clamped_step(self.selected, len, step);
+                SelectorOutcome::Redraw
+            }
+        }
     }
 
     fn handle(&mut self, key: &KeyEvent, keymap: &SelectKeymap) -> SelectorOutcome {
@@ -729,13 +786,7 @@ impl Selector for ModelSelector {
                 SelectorOutcome::Redraw
             }
             // Handled below, ahead of this match — see the `Ctrl+S` guard at the top of `handle`.
-            Some(SelectAction::Confirm) => match self.current() {
-                // Confirm the fully-qualified `provider/id` (Pi `handleSelect` →
-                // `setDefaultModelAndProvider(model.provider, model.id)`, model-selector.ts:330) so a
-                // cross-provider selection resolves against the right provider and swaps it.
-                Some(m) => SelectorOutcome::Confirm(format!("{}/{}", m.provider, m.id)),
-                None => SelectorOutcome::Redraw,
-            },
+            Some(SelectAction::Confirm) => self.confirm_current(),
             Some(SelectAction::Cancel) => SelectorOutcome::Cancel,
             None => {
                 // Everything else feeds the search input (Pi `:409-411`: `searchInput.handleInput`
@@ -1088,8 +1139,8 @@ mod tests {
             !rows[2].contains('⇥'),
             "the hardcoded glyph is gone: {rows:?}"
         );
-        // Two-tone: the key `dim`, the description `muted` (they are different tokens — `#666666`
-        // vs `#808080` — so this cannot pass by accident).
+        // Two-tone: the key `dim`, the description `muted` (they are different tokens — `#7e888e`
+        // vs `#9da5a9` — so this cannot pass by accident).
         assert_ne!(theme.dim_style().fg, theme.muted_style().fg);
         assert_eq!(fg_at(&buf, 0, 3), theme.dim_style().fg, "`tab` is dim");
         assert_eq!(

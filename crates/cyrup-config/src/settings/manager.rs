@@ -11,6 +11,7 @@ use super::merge::deep_merge_settings;
 use super::store::SettingsStore;
 use super::types::{
     FullscreenExitOutput, FullscreenScrollbar, MermaidRenderingMode, SettingsScope, TuiMode,
+    WheelScrollLines,
 };
 use crate::error::{ConfigError, ScopedError, SettingsLoadError};
 
@@ -437,6 +438,23 @@ impl SettingsManager {
     ) -> Result<(), ConfigError> {
         self.set(SettingsScope::Global, "fullscreenCopyOnSelect", enabled)
             .await
+    }
+
+    /// `setFullscreenWheelScrollLines` (Pi settings-manager.ts:1396-1400 @v1.0.0): GLOBAL scope.
+    /// The 1-100 clamp pi applies here (`lines === "auto" ? lines : Math.max(1, Math.min(100,
+    /// Math.floor(lines)))`) lives in [`WheelScrollLines`]'s constructors, so a value that reaches
+    /// this method is already in range; read back through
+    /// [`EffectiveSettings::fullscreen_wheel_scroll_lines`]. TUI-136 / CFG-100.
+    pub async fn set_fullscreen_wheel_scroll_lines(
+        &mut self,
+        lines: WheelScrollLines,
+    ) -> Result<(), ConfigError> {
+        self.set(
+            SettingsScope::Global,
+            "fullscreenWheelScrollLines",
+            lines.to_json(),
+        )
+        .await
     }
 
     /// `setCacheWarmingMode` (Pi `settings-manager.ts:960-963` @v0.87.1): GLOBAL scope —

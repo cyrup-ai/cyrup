@@ -786,6 +786,35 @@ fn list_selector_draws_no_hint_row_where_pi_draws_none() {
     }
 }
 
+/// The `/settings` theme picker lists the generated `system` theme FIRST and describes it as pi does
+/// (`getAvailableThemesWithPaths`, `theme.ts:494-497` @v1.0.0; `settings-selector.ts:212`).
+///
+/// FAILS under the revert that drops the leading `system` row (the picker then opens on `dark`).
+#[test]
+fn theme_picker_lists_system_first_with_pis_description() {
+    let mut sel = ListSelector::theme("dark");
+    let s = screen(&render_selector(&mut sel, 100, 16));
+    let system = s.find("system").expect("`system` row");
+    let dark = s.find("dark").expect("`dark` row");
+    assert!(
+        system < dark,
+        "`system` must precede the other themes:\n{s}"
+    );
+    assert!(
+        s.contains("Theme created from your terminal's colors"),
+        "pi's description is missing:\n{s}"
+    );
+    // The current marker follows the active theme, whichever row that is.
+    let line_of = |needle: &str| s.lines().find(|l| l.contains(needle)).unwrap_or_default();
+    assert!(line_of("dark").contains("(current)"), "{s}");
+    assert!(!line_of("system").contains("(current)"), "{s}");
+
+    let mut sel = ListSelector::theme("system");
+    let s = screen(&render_selector(&mut sel, 100, 16));
+    let line = s.lines().find(|l| l.contains("system")).unwrap_or_default();
+    assert!(line.contains("(current)"), "{s}");
+}
+
 /// The thinking picker's footer is pi's own sentence, not the generic hint row — and it is what
 /// advertises the persist key. Unconditional upstream, unlike the model picker's
 /// (`model-selector.ts:138`). Since pi #9149 (v0.85.1) its three keys are live
@@ -1398,9 +1427,8 @@ fn tree_rows_are_coloured_per_role_like_pi() {
 }
 
 /// **T9 — `borderAccent`.** `tree-selector.ts:824` is the token's only component render site in all
-/// of `packages/*/src`. In `dark.json` it resolves through `vars.cyan` `#00d7ff` (`:5`, `:25`),
-/// which is a different colour from `accent` (`vars.accent` `#8abeb7`, `:14`, `:23`) — so a theme
-/// author who sets it can actually see it.
+/// of `packages/*/src`. In v1.0.0's `dark.json` it is `#a08ed5`, a different colour from `accent`
+/// (`#a798d7`) — so a theme author who sets it can actually see it.
 ///
 /// FAILS before the fix: `grep -rn borderAccent crates/cyrup-tui/src` found nothing outside doc
 /// comments, and the compaction row rendered in `base_style()`.
@@ -1410,7 +1438,7 @@ fn tree_compaction_row_reads_the_border_accent_token() {
     let want = *theme
         .roles
         .get("borderAccent")
-        .expect("dark.json:25 defines borderAccent");
+        .expect("dark.json defines borderAccent");
     let mut sel = TreeSelector::new(roled_nodes());
     sel.handle(&key(KeyCode::Down), &SelectKeymap::default());
     let rows = sel.rows(&theme);
@@ -1423,7 +1451,7 @@ fn tree_compaction_row_reads_the_border_accent_token() {
     assert_ne!(
         got,
         theme.accent_style().fg,
-        "`borderAccent` is not `accent` (#00d7ff vs #8abeb7)"
+        "`borderAccent` is not `accent` (#a08ed5 vs #a798d7)"
     );
     assert_ne!(
         got,

@@ -11,7 +11,7 @@ use super::types::{
     BranchSummarySettings, CacheWarmingMode, CompactionSettings, DefaultProjectTrust,
     FullscreenExitOutput, FullscreenScrollbar, MermaidRenderingMode, PackageSource,
     ProviderRetrySettings, RetrySettings, TerminalCapabilityOverrides, TerminalImagesOverride,
-    ThinkingBudgets, TuiMode, Warnings,
+    ThinkingBudgets, TuiMode, Warnings, WheelScrollLines,
 };
 use crate::error::ConfigError;
 
@@ -681,6 +681,23 @@ impl EffectiveSettings {
         self.merged
             .get_bool("fullscreenCopyOnSelect")
             .unwrap_or(true)
+    }
+
+    /// `fullscreenWheelScrollLines` — lines per wheel event in fullscreen, default `"auto"` (Pi
+    /// `getFullscreenWheelScrollLines`, settings-manager.ts:1389-1394 @v1.0.0: a finite number
+    /// becomes `Math.max(1, Math.min(100, Math.floor(lines)))`, anything else `"auto"`).
+    /// TUI-136 / CFG-100.
+    ///
+    /// Clamps on READ, independently of the write-side clamp
+    /// ([`super::SettingsManager::set_fullscreen_wheel_scroll_lines`]): a hand-edited `500` reads
+    /// back as `100` and `0` or `-3` as `1` instead of being rejected. A numeric STRING (`"5"`) is
+    /// not `typeof "number"`, so it reads `"auto"`, as does `null` or a boolean. The value on disk
+    /// is left verbatim (R-07-004).
+    pub fn fullscreen_wheel_scroll_lines(&self) -> WheelScrollLines {
+        self.merged
+            .get("fullscreenWheelScrollLines")
+            .and_then(Value::as_f64)
+            .map_or(WheelScrollLines::Auto, WheelScrollLines::from_number)
     }
 
     /// `showHardwareCursor` — the setting takes precedence, then the

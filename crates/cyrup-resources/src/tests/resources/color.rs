@@ -49,9 +49,36 @@ fn okhsl_and_oklch_values_resolve_to_pis_own_channels() {
     // The hex legs still work, unchanged.
     assert_eq!(parse_color("#abc"), Some((170, 187, 204)));
     assert_eq!(parse_color("#ABCDEF"), Some((171, 205, 239)));
-    assert_eq!(parse_color("  #abc  "), Some((170, 187, 204)));
-    // cyrup's own pre-existing tolerance for a bare `rrggbb`, deliberately kept.
-    assert_eq!(parse_color("abcdef"), Some((171, 205, 239)));
+}
+
+/// `parseColor`'s three patterns are anchored `^…$` and nothing is trimmed or defaulted, so each of
+/// these THROWS in pi (`Invalid color value`, verified by running `colors.ts` @v1.0.0). cyrup used
+/// to accept the first three — a bare `rrggbb`, and hex or a function with surrounding whitespace —
+/// as a tolerance that predates the module; a theme that loaded here then failed in pi.
+#[test]
+fn colour_values_are_matched_exactly_as_pi_matches_them() {
+    for value in [
+        "abcdef",
+        "abc",
+        " #abc",
+        "#abc ",
+        "\t#aabbcc",
+        " okhsl(295 50% 67%)",
+        "okhsl(295 50% 67%) ",
+        // Four hex digits, five, seven: not `{3}` or `{6}`.
+        "#abcd",
+        "#12345",
+        "#1234567",
+        // Units belong inside the parentheses, attached to their number.
+        "oklch(0.7 0.1 230 deg)",
+        "oklch(70%0.1 230)",
+        "oklch(0.7,0.1,230)",
+    ] {
+        assert_eq!(parse_color(value), None, "{value:?} must not parse");
+    }
+    // The units are case-insensitive, and a leading dot / exponent are `NUMBER_PATTERN` forms.
+    assert_eq!(parse_color("oklch(0.5 0.1 230DEG)"), Some((0, 109, 145)));
+    assert_eq!(parse_color("oklch(.5 .1 1e2)"), Some((113, 100, 11)));
 }
 
 /// Every one of these THROWS in pi (`Invalid color value`, or a range/finiteness error from
@@ -91,7 +118,9 @@ fn malformed_color_functions_do_not_parse() {
 fn colour_functions_are_recognised_before_var_lookup() {
     assert!(is_color_function("okhsl(234 3% 89%)"));
     assert!(is_color_function("OKLCH(0.7 0.1 230)"));
-    assert!(is_color_function("  okhsl(0 0 0)"));
+    // `/^ok(lch|hsl)\(/i` is anchored at the first character: leading whitespace makes it a
+    // variable name, which then fails to resolve.
+    assert!(!is_color_function("  okhsl(0 0 0)"));
     assert!(!is_color_function("okhsl"));
     assert!(!is_color_function("text"));
     assert!(!is_color_function("#abc"));
@@ -205,16 +234,13 @@ fn a_var_named_like_a_colour_function_does_not_shadow_the_value() {
     );
 }
 
-/// TUI-131's third verify item: an unparseable colour FUNCTION makes the theme load report an
-/// error instead of repainting the role from the compiled fallback.
+/// TUI-131's third verify item: an unparseable colour makes the theme load report an error instead
+/// of repainting the role from a compiled fallback.
 ///
 /// Upstream reaches this through `parseColor`'s `throw new Error(\`Invalid color value: ${value}\`)`
-/// during `setTheme`, which the user sees as `Failed to load theme …`. cyrup's resolver is total
-/// (R-00-009), so the report happens in `bad_color`, the validator that already fails a theme with
-/// an out-of-range palette index — carrying upstream's own message text.
-///
-/// The narrowness is the contract: `okhsl(…)` cannot be a variable reference, so judging it here is
-/// safe. A bare non-hex string still resolves to `Inherit` silently, because it might be a var.
+/// during `setTheme`, which the user sees as `Failed to load theme …`; the message here is pi's
+/// own text. (An unknown NAME is the sibling `Variable reference not found`, pinned in
+/// `themes.rs`.)
 #[test]
 fn an_unparseable_colour_function_fails_the_theme_load() {
     use super::fixtures::full_theme_json;
@@ -228,15 +254,13 @@ fn an_unparseable_colour_function_fails_the_theme_load() {
         crate::ResourceOrigin::Builtin,
     )
     .expect_err("an unparseable okhsl() value must be rejected, not silently inherited");
-    let msg = err.to_string();
-    assert!(msg.contains("Other errors:"), "{msg}");
-    assert!(msg.contains("/colors/accent"), "{msg}");
     assert!(
-        msg.contains("Invalid color value: okhsl(234 3% 89)"),
-        "pi's own message text: {msg}"
+        err.to_string()
+            .contains("Invalid color value: okhsl(234 3% 89)"),
+        "pi's own message text: {err}"
     );
 
-    // A malformed value in `vars` is reported the same way.
+    // A malformed value reached through a variable is reported the same way.
     let err = Theme::parse(
         &full_theme_json("badvar", &[("v", "oklch(1.5 0.1 0)")], &[("accent", "$v")]),
         None,
@@ -244,15 +268,9 @@ fn an_unparseable_colour_function_fails_the_theme_load() {
         crate::ResourceOrigin::Builtin,
     )
     .expect_err("an unparseable oklch() var must be rejected");
-    assert!(err.to_string().contains("/vars/v"), "{err}");
-
-    // A bare non-hex string is NOT judged here — it may be a variable reference, and cyrup's
-    // existing contract resolves it to `Inherit`. This theme must still LOAD.
-    Theme::parse(
-        &full_theme_json("tolerant", &[], &[("accent", "nothex")]),
-        None,
-        ResourceScope::Builtin,
-        crate::ResourceOrigin::Builtin,
-    )
-    .expect("a non-function string stays a silent Inherit, not a load failure");
+    assert!(
+        err.to_string()
+            .contains("Invalid color value: oklch(1.5 0.1 0)"),
+        "{err}"
+    );
 }

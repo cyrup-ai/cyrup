@@ -452,7 +452,7 @@ fn highlight_uncached(
 /// and renders at the terminal's default foreground. `mdCodeBlock` is a *whole-block* fallback in
 /// Pi, reached only when the language is unknown or the highlighter throws (`theme.ts:1275`,
 /// `:1284`); that path is [`highlight_lines`]'s `flat()`, not this one. Defaulting each unclassified
-/// run to `mdCodeBlock` painted roughly half of every code block `#b5bd68` green.
+/// run to `mdCodeBlock` painted roughly half of every code block green.
 fn push_code_span(
     spans: &mut Vec<Span<'static>>,
     piece: &str,

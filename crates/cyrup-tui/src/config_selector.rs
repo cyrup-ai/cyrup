@@ -31,7 +31,10 @@ use ratatui::widgets::Paragraph;
 
 use crate::chrome::key_hint_spans;
 use crate::keymap::{SelectAction, SelectKeymap};
-use crate::selector::{Selector, SelectorOutcome, border_rule, centered_window, input_line_spans};
+use crate::selector::{
+    RowAction, RowMap, RowPointer, Selector, SelectorOutcome, border_rule, centered_window,
+    input_line_spans,
+};
 use crate::text_input::{Input, InputOutcome};
 use crate::text_width::{str_width, truncate_line_to_width, truncate_to_width};
 use crate::theme::UiTheme;
@@ -281,6 +284,9 @@ pub struct ConfigSelector {
     /// `inheritedEnabledByKey`'s key set (`config-selector.ts:233,262`) — see
     /// [`ConfigSelector::set_inherited_global_keys`].
     inherited_global_keys: std::collections::HashSet<String>,
+    /// The row a left press went down on, so the click that completes the gesture toggles it even
+    /// if the window slid under the pointer.
+    pointer: RowPointer,
 }
 
 /// The non-body rows of the `cyrup config` envelope: `Spacer`(`config-selector.ts:901`),
@@ -296,6 +302,11 @@ pub struct ConfigSelector {
 /// the terminal by two rows. Reproduced rather than "fixed": the window size has to match upstream's
 /// or the visible row set diverges.
 const CHROME_ROWS: u16 = 8;
+
+/// The rows `ResourceList` draws above its entries: the search `Input` and the blank under it
+/// (`config-selector.ts:396-397`). The first window entry is painted this many rows below the top
+/// of the body.
+const SEARCH_ROWS: u16 = 2;
 
 /// The window floor, straight from `Math.max(5, …)` (`config-selector.ts:266`).
 const MIN_MAX_VISIBLE: u16 = 5;
@@ -332,6 +343,7 @@ impl ConfigSelector {
             project_mode_available: false,
             override_states,
             inherited_global_keys: std::collections::HashSet::new(),
+            pointer: RowPointer::default(),
         };
         sel.flat = sel.build_flat();
         sel.selected = sel.first_item().unwrap_or(0);
@@ -566,6 +578,28 @@ impl ConfigSelector {
         ]
     }
 
+    /// The search `Input` and the blank under it (`config-selector.ts:396-397`) — [`SEARCH_ROWS`]
+    /// rows.
+    fn search_lines(&self, width: u16, theme: &UiTheme) -> [Line<'static>; SEARCH_ROWS as usize] {
+        [
+            Line::from(input_line_spans(
+                self.input.value(),
+                self.input.cursor(),
+                width,
+                theme,
+            )),
+            Line::from(""),
+        ]
+    }
+
+    /// The eight regions of the dialog in `area`, top to bottom: the leading blank, the top rule, a
+    /// blank, the header, a blank, the body, a blank and the bottom rule (`config-selector.ts:
+    /// 901-930`). [`Selector::render`] paints into these and [`Selector::pointer`] hit-tests
+    /// against the body one, so they cannot disagree about where the first entry is.
+    fn regions(area: Rect, header_h: u16, body_h: u16) -> [Rect; 8] {
+        crate::selector::stack_rows(area, [1, 1, 1, header_h, 1, body_h, 1, 1])
+    }
+
     /// `ResourceList.render` (`config-selector.ts:392-451`), line for line.
     fn body_lines(&self, width: u16, theme: &UiTheme) -> Vec<Line<'static>> {
         let w = usize::from(width);
@@ -574,13 +608,7 @@ impl ConfigSelector {
         // `:396-397` — the search `Input` and the blank under it, via the shared `Input.render`
         // port (S31): a bare, unstyled `"> "` at column 0. cyrup used to hang the query off the
         // header as `filter: …`, a row upstream does not have.
-        lines.push(Line::from(input_line_spans(
-            self.input.value(),
-            self.input.cursor(),
-            width,
-            theme,
-        )));
-        lines.push(Line::from(""));
+        lines.extend(self.search_lines(width, theme));
 
         // `:399-402` — `theme.fg("muted", …)`, not dim (S17 fix #43).
         if self.flat.is_empty() {
@@ -852,8 +880,7 @@ impl Selector for ConfigSelector {
         let header_h = header.len().min(u16::MAX as usize) as u16;
         let lines = self.body_lines(area.width, theme);
         let body_h = lines.len().min(u16::MAX as usize) as u16;
-        let [_, top, _, header_area, _, body, _, bottom] =
-            crate::selector::stack_rows(area, [1, 1, 1, header_h, 1, body_h, 1, 1]);
+        let [_, top, _, header_area, _, body, _, bottom] = Self::regions(area, header_h, body_h);
 
         frame.render_widget(border_rule(top.width, theme), top);
         frame.render_widget(
@@ -868,6 +895,59 @@ impl Selector for ConfigSelector {
         // layout does one level up.
         frame.render_widget(Paragraph::new(lines).style(theme.base_style()), body);
         frame.render_widget(border_rule(bottom.width, theme), bottom);
+    }
+
+    /// A press highlights the resource under the pointer, a click toggles it as `Enter` does, and a
+    /// wheel notch over the list moves the highlight to the next resource, skipping group headers
+    /// and stopping at the ends as the arrow keys do. The group and subgroup headers are rows of the
+    /// window but not resources, so a press on one is ignored; so are the rules, the header, the
+    /// search box and the `(i/N)` readout.
+    fn pointer(&mut self, area: Rect, event: crate::app::Pointer) -> SelectorOutcome {
+        let width = area.width;
+        let theme = UiTheme::default_ref();
+        let header_h = self.header_lines(width, theme).len().min(u16::MAX as usize) as u16;
+        let body_h = self.body_rows(width);
+        let [_, _, _, _, _, body, _, _] = Self::regions(
+            Rect {
+                x: 0,
+                y: 0,
+                width,
+                height: area.height,
+            },
+            header_h,
+            body_h,
+        );
+        let (start, end) = self.window();
+        let mut map = RowMap::starting_at(body.y.saturating_add(SEARCH_ROWS));
+        for (i, entry) in self.flat.iter().enumerate().take(end).skip(start) {
+            map = match entry {
+                Flat::Item(_) => map.item(i, 1, 1),
+                Flat::Group(_) | Flat::Subgroup(_) => map.filler(1),
+            };
+        }
+        if start > 0 || end < self.flat.len() {
+            map = map.filler(1);
+        }
+        let map = map.clipped_to(body.bottom());
+        match self
+            .pointer
+            .act(event, &map, self.selected, self.flat.len())
+        {
+            RowAction::Ignored => SelectorOutcome::Ignored,
+            RowAction::Handled => SelectorOutcome::Redraw,
+            RowAction::Highlight(entry) => {
+                self.selected = entry;
+                SelectorOutcome::Redraw
+            }
+            RowAction::Activate(entry) => {
+                self.selected = entry;
+                self.toggle_selected()
+            }
+            RowAction::Step(step) => {
+                self.selected = self.find_item(self.selected, step);
+                SelectorOutcome::Redraw
+            }
+        }
     }
 
     fn handle(&mut self, key: &KeyEvent, keymap: &SelectKeymap) -> SelectorOutcome {

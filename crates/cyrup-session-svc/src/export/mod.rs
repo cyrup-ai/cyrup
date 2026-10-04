@@ -65,14 +65,15 @@ const TEMPLATE_JS: &str = include_str!("assets/template.js");
 const MARKED_JS: &str = include_str!("assets/vendor/marked.min.js");
 const HIGHLIGHT_JS: &str = include_str!("assets/vendor/highlight.min.js");
 
-/// pi's four `withThemeColorFallbacks` aliases (`modes/interactive/theme/theme.ts:332-346`
-/// @v0.84.4): `(alias, source)` — the alias takes the source's value when the theme document does
+/// pi's five `withThemeColorFallbacks` aliases (`modes/interactive/theme/theme.ts:164-178`
+/// @v1.0.0): `(alias, source)` — the alias takes the source's value when the theme document does
 /// not define it. Applied before the colours become CSS custom properties, because
 /// `getResolvedThemeColors` runs `resolveThemeColors(withThemeColorFallbacks(colors), vars)`
 /// (`theme.ts:1068`).
-const COLOR_FALLBACKS: [(&str, &str); 4] = [
+const COLOR_FALLBACKS: [(&str, &str); 5] = [
+    ("scrollbarTrack", "muted"),
+    ("scrollbarThumb", "text"),
     ("thinkingMax", "thinkingXhigh"),
-    ("scrollbarThumb", "selectedBg"),
     ("searchMatchBg", "selectedBg"),
     ("searchMatchText", "text"),
 ];
@@ -136,21 +137,19 @@ impl ExportTheme {
     /// against one already-loaded theme document.
     #[must_use]
     pub fn from_theme(theme: &Theme) -> Self {
-        // `isLight` is upstream's NAME test, not a luminance test (`theme.ts:1067`, and
-        // `isLightTheme`, `:1090-1093`: "Currently just check the name").
-        let default_text = if theme.data.name == "light" || theme.key.as_str() == "light" {
+        // `isLightTheme` reads the theme's `appearance` — declared, else detected from its colours
+        // (`theme.ts:911-913` @v1.0.0).
+        let default_text = if theme.appearance() == Some(cyrup_resources::Appearance::Light) {
             DEFAULT_TEXT_LIGHT
         } else {
             DEFAULT_TEXT_DARK
         };
 
-        let spec_to_css = |spec: ColorSpec| match spec {
-            ColorSpec::Rgb { r, g, b } => CssColor::from_rgb(r, g, b),
-            // `value === "" → defaultText` (`theme.ts:1078-1080`). `cyrup-resources` also lands an
-            // unresolvable var reference here, where pi would throw out of `loadThemeJson` and
-            // `getThemeExportColors` would swallow it (`:1116`); degrading one role is strictly
-            // closer to upstream's rendering than losing the whole palette.
-            ColorSpec::Inherit => default_text,
+        // An index exports as the standard xterm palette's RGB for it (`colorToHex(indexedColor(n))`,
+        // `theme.ts:936`). `value === "" → defaultText` (`theme.ts:1078-1080`).
+        let spec_to_css = |spec: ColorSpec| match spec.to_rgb() {
+            Some((r, g, b)) => CssColor::from_rgb(r, g, b),
+            None => default_text,
         };
 
         let mut roles: BTreeMap<String, CssColor> = theme
@@ -176,9 +175,9 @@ impl ExportTheme {
         // `themeExport.pageBg ?? derivedColors.pageBg` (`export-html/index.ts:123-125`, `:155-157`).
         // `resolve_export` maps an absent OR empty key to `Inherit`, which is pi's `undefined`
         // (`theme.ts:1120-1122` returns `undefined` for `""` too).
-        let pick = |spec: ColorSpec, fallback: CssColor| match spec {
-            ColorSpec::Rgb { r, g, b } => CssColor::from_rgb(r, g, b),
-            ColorSpec::Inherit => fallback,
+        let pick = |spec: ColorSpec, fallback: CssColor| match spec.to_rgb() {
+            Some((r, g, b)) => CssColor::from_rgb(r, g, b),
+            None => fallback,
         };
         let backdrops = ExportBackdrops {
             page_bg: pick(explicit.page_bg, derived.page_bg),

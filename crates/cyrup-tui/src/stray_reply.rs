@@ -1,13 +1,16 @@
-//! Swallow a **late** terminal OSC 11 reply before it reaches the editor as keystrokes.
+//! Swallow a **late** terminal colour reply (OSC 10, OSC 11 or OSC 4) before it reaches the editor
+//! as keystrokes.
 //!
 //! **Windows only since 2026-09-30.** On unix the byte reader frames every OSC/DCS/APC reply whole
 //! and swallows it (`crate::input::decode`, `TUI-047`), and this module is compiled out there.
 //!
 //! This is the port of Pi's first line of defence in `handleTerminalInput`
 //! (`pi/packages/tui/src/tui.ts:788-794`), which begins every dispatch with
-//! `consumeOsc11BackgroundResponse(data)` / `consumeTerminalColorSchemeReport(data)` and returns
-//! early, so a background-colour answer arriving at *any* time — including long after the probe
-//! that asked for it gave up — is discarded instead of being handed to an input listener.
+//! `consumeTerminalColorResponse(data)` / `consumeTerminalColorSchemeReport(data)` and returns
+//! early, so a colour answer arriving at *any* time — including long after the probe that asked for
+//! it gave up — is discarded instead of being handed to an input listener. The colour batch asks for
+//! the foreground (OSC 10), the background (OSC 11) and all sixteen palette entries (OSC 4), so all
+//! three reply shapes are recognised here.
 //!
 //! [`crate::terminal_query`] already reads the reply under a hard deadline, and its own module doc
 //! names the residual risk: a terminal that answers *after* that deadline. When that happens the
@@ -37,14 +40,15 @@
 //! # The safety contract (this filter sits on the path every keystroke takes)
 //!
 //! Eating one real keystroke would be far worse than the leak being fixed, so the machine is built
-//! so that **the only thing it can ever remove is a complete, correctly terminated OSC 11 frame**:
+//! so that **the only thing it can ever remove is a complete, correctly terminated OSC 10, 11 or 4
+//! colour frame**:
 //!
 //! 1. The opener is *ambiguous* and never commits. A genuine `Alt+]` press produces a byte-identical
 //!    event — under the Kitty `DISAMBIGUATE_ESCAPE_CODES` flags cyrup pushes
 //!    (`app.rs`, `App::into_stdout`), `ESC [ 93 ; 3 u` also decodes to `Char(']') + ALT`. So the
 //!    opener only *holds*.
 //! 2. Held events are **replayed in order** the instant anything fails to match: a wrong tail, a
-//!    payload character outside the OSC 11 alphabet, a non-key event, the [`MAX_HELD`] cap, or the
+//!    payload character outside the colour-reply alphabet, a non-key event, the [`MAX_HELD`] cap, or the
 //!    input simply going idle ([`StrayReplyFilter::flush`], driven by the reader thread's poll
 //!    timeout). Nothing is dropped on a "give up" path — dropping happens only on the terminator.
 //! 3. The hold is bounded twice over: [`MAX_HELD`] events, and the caller's short idle flush.
@@ -55,42 +59,74 @@
 //!
 //! # What is deliberately *not* handled here
 //!
-//! The DSR colour-scheme report (`CSI ? 997 ; 1 n`, the answer to
-//! [`crate::terminal_query::COLOR_SCHEME_QUERY`]) produces **zero** crossterm events — `parse_csi`'s
-//! `?` arm (`parse.rs:179-183`) only terminates on a final `u` or `c`, so any other final byte
-//! leaves the sequence buffered rather than emitted. There is nothing in the key stream to filter.
-//! It is already neutralised in practice because `terminal_query` appends a Primary Device
-//! Attributes request to every probe, whose reply's final `c` flushes crossterm's buffer and is
-//! itself dropped by crossterm's own `EventFilter`.
+//! The DSR colour-scheme report (`CSI ? 997 ; 1 n`) produces **zero** crossterm events —
+//! `parse_csi`'s `?` arm (`parse.rs:179-183`) only terminates on a final `u` or `c`, so any other
+//! final byte leaves the sequence buffered rather than emitted. There is nothing in the key stream
+//! to filter. It is already neutralised in practice because `terminal_query` appends a Primary
+//! Device Attributes request to every colour batch, whose reply's final `c` flushes crossterm's
+//! buffer and is itself dropped by crossterm's own `EventFilter`.
 
 use ratatui::crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 /// Hard cap on how many events the machine may hold before it gives up and replays them.
 ///
-/// The longest real frame is the opener (1–2 events) + `1`,`1`,`;` + `rgb:RRRR/GGGG/BBBB`
-/// (18 events) + the terminator, i.e. 23–24. The cap is generous enough for a `#rrrrggggbbbb`
+/// The longest real frame is the opener (1–2 events) + `4`,`;`,`d`,`d`,`d`,`;` + `rgb:RRRR/GGGG/BBBB`
+/// (18 events) + the terminator, i.e. 26–27. The cap is generous enough for a `#rrrrggggbbbb`
 /// form with trailing space and still bounds the hold to a fraction of a screen line.
 pub const MAX_HELD: usize = 48;
 
-/// Where the machine is in the shredded `ESC ] 1 1 ; … terminator` frame.
+/// Where the machine is in the shredded `ESC ] <10;|11;|4;N;> … terminator` frame.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum State {
     /// Nothing held; every event passes straight through.
     Idle,
     /// A bare `Esc` is held — this may be the split-chunk form of the OSC introducer.
     Esc,
-    /// The introducer matched. `n` characters of the literal tail `1`,`1`,`;` have matched.
-    Tail(u8),
+    /// The introducer matched. The characters after it are accumulated in `tail` until they spell
+    /// `10;`, `11;` or `4;<1-3 digits>;`.
+    Tail,
     /// The tail matched. Discarding payload characters until the terminator.
     Payload,
     /// Inside the payload, a bare `Esc` arrived — a split `ST` terminator may be completing.
     PayloadEsc,
 }
 
-/// The literal that must follow the introducer for an OSC **11** reply: `1`, `1`, `;`.
-const TAIL: [char; 3] = ['1', '1', ';'];
+/// How far the characters after the introducer have got towards a colour-reply selector.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TailMatch {
+    /// A prefix of a selector; more characters are needed.
+    Partial,
+    /// A whole selector: `10;` (foreground), `11;` (background) or `4;<1-3 digits>;` (palette).
+    Complete,
+    /// Not the start of any colour reply.
+    Mismatch,
+}
 
-/// A state machine over the crossterm event stream that removes a late OSC 11 background-colour
+/// Classify the text after `ESC ]` against the three reply selectors the colour batch can elicit.
+fn classify_tail(tail: &str) -> TailMatch {
+    match tail {
+        "1" | "10" | "11" | "4" | "4;" => return TailMatch::Partial,
+        "10;" | "11;" => return TailMatch::Complete,
+        _ => {}
+    }
+    let Some(rest) = tail.strip_prefix("4;") else {
+        return TailMatch::Mismatch;
+    };
+    let (index, terminated) = match rest.strip_suffix(';') {
+        Some(index) => (index, true),
+        None => (rest, false),
+    };
+    if index.is_empty() || index.len() > 3 || !index.bytes().all(|b| b.is_ascii_digit()) {
+        return TailMatch::Mismatch;
+    }
+    if terminated {
+        TailMatch::Complete
+    } else {
+        TailMatch::Partial
+    }
+}
+
+/// A state machine over the crossterm event stream that removes a late OSC 10 / 11 / 4 colour
 /// reply and passes everything else through untouched.
 ///
 /// Feed it with [`push`](Self::push) and, when the input goes idle, [`flush`](Self::flush). Both
@@ -100,6 +136,8 @@ const TAIL: [char; 3] = ['1', '1', ';'];
 pub struct StrayReplyFilter {
     state: State,
     held: Vec<Event>,
+    /// Characters matched after the introducer; meaningful only while `state` is [`State::Tail`].
+    tail: String,
 }
 
 impl Default for StrayReplyFilter {
@@ -115,6 +153,7 @@ impl StrayReplyFilter {
         Self {
             state: State::Idle,
             held: Vec::new(),
+            tail: String::new(),
         }
     }
 
@@ -192,7 +231,7 @@ impl StrayReplyFilter {
         match self.state {
             State::Idle => self.step_idle(key),
             State::Esc => self.step_esc(key),
-            State::Tail(n) => self.step_tail(n, key),
+            State::Tail => self.step_tail(key),
             State::Payload => self.step_payload(key),
             State::PayloadEsc => self.step_payload_esc(key),
         }
@@ -201,7 +240,7 @@ impl StrayReplyFilter {
     fn step_idle(&mut self, key: KeyEvent) -> Step {
         // Form 1 (the common one): `ESC ]` collapsed by crossterm into a single `Alt+]`.
         if key.code == KeyCode::Char(']') && key.modifiers == KeyModifiers::ALT {
-            self.state = State::Tail(0);
+            self.open_tail();
             self.held.push(Event::Key(key));
             return Step::Hold;
         }
@@ -216,26 +255,38 @@ impl StrayReplyFilter {
 
     fn step_esc(&mut self, key: KeyEvent) -> Step {
         if key.code == KeyCode::Char(']') && key.modifiers == KeyModifiers::NONE {
-            self.state = State::Tail(0);
+            self.open_tail();
             self.held.push(Event::Key(key));
             return Step::Hold;
         }
         Step::ReplayThenRetry(Event::Key(key))
     }
 
-    fn step_tail(&mut self, matched: u8, key: KeyEvent) -> Step {
-        let expected = TAIL.get(usize::from(matched)).copied();
-        if key.modifiers != KeyModifiers::NONE || Some(key.code) != expected.map(KeyCode::Char) {
+    fn open_tail(&mut self) {
+        self.state = State::Tail;
+        self.tail.clear();
+    }
+
+    fn step_tail(&mut self, key: KeyEvent) -> Step {
+        let KeyCode::Char(c) = key.code else {
+            return Step::ReplayThenRetry(Event::Key(key));
+        };
+        if key.modifiers != KeyModifiers::NONE {
             return Step::ReplayThenRetry(Event::Key(key));
         }
-        self.held.push(Event::Key(key));
-        let next = matched.saturating_add(1);
-        self.state = if usize::from(next) == TAIL.len() {
-            State::Payload
-        } else {
-            State::Tail(next)
-        };
-        Step::Hold
+        self.tail.push(c);
+        match classify_tail(&self.tail) {
+            TailMatch::Mismatch => Step::ReplayThenRetry(Event::Key(key)),
+            TailMatch::Partial => {
+                self.held.push(Event::Key(key));
+                Step::Hold
+            }
+            TailMatch::Complete => {
+                self.held.push(Event::Key(key));
+                self.state = State::Payload;
+                Step::Hold
+            }
+        }
     }
 
     fn step_payload(&mut self, key: KeyEvent) -> Step {
@@ -255,11 +306,11 @@ impl StrayReplyFilter {
             self.held.push(Event::Key(key));
             return Step::Hold;
         }
-        // Anything that is not an OSC 11 payload character aborts and replays. Uppercase hex digits
+        // Anything that is not a colour-reply payload character aborts and replays. Uppercase hex digits
         // carry SHIFT (`char_code_to_event`, `parse.rs:127-133`), so SHIFT alone is tolerated.
         let modifiers_ok =
             key.modifiers == KeyModifiers::NONE || key.modifiers == KeyModifiers::SHIFT;
-        let payload_char = matches!(key.code, KeyCode::Char(c) if is_osc11_payload_char(c));
+        let payload_char = matches!(key.code, KeyCode::Char(c) if is_color_payload_char(c));
         if !modifiers_ok || !payload_char {
             return Step::ReplayThenRetry(Event::Key(key));
         }
@@ -276,10 +327,10 @@ impl StrayReplyFilter {
     }
 }
 
-/// The alphabet a real OSC 11 payload can use — `#rrggbb`, `#rrrrggggbbbb`, `rgb:R/G/B` and the
-/// `rgba:` variant (`terminal_query::parse_osc11_value`, Pi `terminal-colors.ts:35-65`), plus the
-/// surrounding whitespace Pi's `value.trim()` tolerates. Anything else is real typing.
-fn is_osc11_payload_char(c: char) -> bool {
+/// The alphabet a real OSC 10 / 11 / 4 payload can use — `#rrggbb`, `#rrrrggggbbbb`, `rgb:R/G/B` and
+/// the `rgba:` variant (`terminal_query::parse_osc_color_response`), plus surrounding whitespace.
+/// Anything else is real typing.
+fn is_color_payload_char(c: char) -> bool {
     c.is_ascii_hexdigit() || matches!(c, '#' | ':' | '/' | ' ' | 'r' | 'g' | 'b' | 'R' | 'G' | 'B')
 }
 
@@ -289,7 +340,7 @@ enum Step {
     Forward(Event),
     /// The event joined the held prefix.
     Hold,
-    /// The held prefix plus this event formed a complete OSC 11 frame — discard all of it.
+    /// The held prefix plus this event formed a complete colour-reply frame — discard all of it.
     Swallowed,
     /// The held prefix was not a reply: replay it, then this event.
     Replay(Event),
@@ -384,6 +435,64 @@ mod tests {
         v.push(esc());
         v.push(ch('\\'));
         assert!(run(v).is_empty(), "split ST terminator must end the frame");
+    }
+
+    /// The colour batch also elicits OSC 10 (foreground) and sixteen OSC 4 (palette) replies, any
+    /// of which can arrive late; each is shredded exactly like the OSC 11 one.
+    #[test]
+    fn late_osc10_and_osc4_replies_are_swallowed_too() {
+        for selector in ["10;", "4;0;", "4;7;", "4;15;", "4;255;"] {
+            let mut v = vec![alt(']')];
+            v.extend(selector.chars().map(ch));
+            v.extend("rgb:0c0c/0b0b/1313".chars().map(ch));
+            v.push(ctrl('g'));
+            let out = run(v);
+            assert!(
+                out.is_empty(),
+                "`{selector}` frame must be swallowed, got {:?}",
+                typed(&out)
+            );
+        }
+    }
+
+    #[test]
+    fn selectors_that_are_not_colour_replies_are_replayed() {
+        for selector in ["12;", "1;", "4;;", "4;1234;", "5;", "10", "4x"] {
+            let mut burst = vec![alt(']')];
+            burst.extend(selector.chars().map(ch));
+            burst.extend("rgb:0c0c/0b0b/1313".chars().map(ch));
+            burst.push(ctrl('g'));
+            assert_eq!(
+                run(burst.clone()),
+                burst,
+                "`{selector}` is not a colour reply"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_tail_accepts_exactly_the_three_selectors() {
+        for (tail, want) in [
+            ("1", TailMatch::Partial),
+            ("10", TailMatch::Partial),
+            ("11", TailMatch::Partial),
+            ("4", TailMatch::Partial),
+            ("4;", TailMatch::Partial),
+            ("4;1", TailMatch::Partial),
+            ("4;255", TailMatch::Partial),
+            ("10;", TailMatch::Complete),
+            ("11;", TailMatch::Complete),
+            ("4;3;", TailMatch::Complete),
+            ("4;15;", TailMatch::Complete),
+            ("4;255;", TailMatch::Complete),
+            ("4;;", TailMatch::Mismatch),
+            ("4;1234", TailMatch::Mismatch),
+            ("4x", TailMatch::Mismatch),
+            ("111", TailMatch::Mismatch),
+            ("12", TailMatch::Mismatch),
+        ] {
+            assert_eq!(classify_tail(tail), want, "tail {tail:?}");
+        }
     }
 
     #[test]
@@ -569,8 +678,8 @@ mod tests {
     fn a_replay_leaves_the_machine_idle_not_armed_and_empty() {
         for prefix in [
             vec![esc()],                                      // State::Esc
-            vec![alt(']')],                                   // State::Tail(0)
-            vec![esc(), ch(']'), ch('1')],                    // State::Tail(1)
+            vec![alt(']')],                                   // State::Tail
+            vec![esc(), ch(']'), ch('1')],                    // State::Tail
             vec![alt(']'), ch('1'), ch('1'), ch(';')],        // State::Payload
             vec![alt(']'), ch('1'), ch('1'), ch(';'), esc()], // State::PayloadEsc
         ] {

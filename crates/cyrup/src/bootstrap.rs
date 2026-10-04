@@ -18,7 +18,7 @@ use cyrup_config::{
     AuthStore, CliConfigOverrides, ConfigDirs, EnvVars, ModelFile, SettingsManager, SettingsStore,
 };
 use cyrup_session_svc::{AppMode, SessionConfig};
-use cyrup_tui::{StdinTerminalProbe, UiTheme};
+use cyrup_tui::{StdinTerminalProbe, TerminalProbe as _, UiTheme};
 
 use crate::cli::Cli;
 use crate::diagnostics::Diagnostic;
@@ -122,8 +122,8 @@ fn collect_settings_diagnostics(mgr: &mut cyrup_config::SettingsManager) -> Vec<
 /// SEAM-020), so without them the wizard would mount on a command pi answers with help text or a
 /// model list.
 ///
-/// `detected` is pi's own detection (`detectTerminalThemeForAuto({ ui, timeoutMs: 100 })`,
-/// startup-ui.ts:180) — the 100 ms bound is pi's. The theme is the detected polarity rather than
+/// `detected` is pi's own detection (`detectTerminalTheme`, `theme.ts:702-710` @v1.0.0) over the
+/// colours the terminal reports within pi's 100 ms. The theme is the detected polarity rather than
 /// `UiTheme::default()`: pi's `createStartupTui` resolves the theme *setting* first
 /// (startup-ui.ts:77-84), and on a first run there is no `settings.json` by definition (the gate's
 /// own fourth clause), so what it resolves to is exactly this.
@@ -146,10 +146,13 @@ pub async fn maybe_run_first_time_setup(
     {
         return Ok(false);
     }
-    let detected = cyrup_tui::detect_terminal_theme_for_auto(
-        &StdinTerminalProbe,
-        std::time::Duration::from_millis(100),
-        &std::env::var("COLORFGBG").unwrap_or_default(),
+    // Pi's `detectTerminalTheme(colors, reportedScheme, env)` (`theme.ts:702-710`): the colours
+    // the terminal reports decide, then `COLORFGBG`, then dark.
+    let colors = StdinTerminalProbe.query_terminal_colors(cyrup_tui::COLOR_QUERY_TIMEOUT, None);
+    let detected = cyrup_tui::detect_terminal_theme(
+        &colors,
+        None,
+        cyrup_tui::detect_color_fg_bg_theme(&std::env::var("COLORFGBG").unwrap_or_default()),
     );
     let theme = if detected == cyrup_tui::TerminalTheme::Light {
         UiTheme::light()

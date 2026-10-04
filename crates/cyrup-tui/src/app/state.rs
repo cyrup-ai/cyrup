@@ -157,6 +157,16 @@ pub struct AppState {
     /// Stale under the alternate-screen renderer for exactly as long as [`Self::term_rows`] is:
     /// `draw_fullscreen` forks before either is published (ADR-0005 §B-14).
     pub term_cols: u16,
+    /// Where each region sat in the last frame painted — the rectangles a pointer report is resolved
+    /// against. Written by [`render`](crate::app::render) (inline) and by the alternate screen's
+    /// layout step; all-zero until the first draw.
+    pub(crate) regions: super::Regions,
+    /// A press on the dock that has not been released, and the last click, for counting
+    /// consecutive ones. See [`super::pointer`].
+    pub(crate) pointer: super::PointerState,
+    /// A press that landed on a floating overlay and has not been released, and the last click on
+    /// one. See [`super::overlay_pointer`].
+    pub(crate) overlay_pointer: super::OverlayPointerState,
     /// Whether the compact startup keybinding-hints bar is shown (Pi `compactInstructions`,
     /// interactive-mode.ts:697-703): a one-line `interrupt · clear/exit · / commands · ! bash · more`
     /// affordance bar rendered just above the editor at startup, dismissed on the first submission.
@@ -546,6 +556,9 @@ impl AppState {
             reserve_status_rows: false,
             term_rows: 24,
             term_cols: 80,
+            regions: super::Regions::default(),
+            pointer: super::PointerState::default(),
+            overlay_pointer: super::OverlayPointerState::default(),
             show_startup_hints: true,
             loader: None,
             loader_tick: 0,

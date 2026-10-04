@@ -504,6 +504,7 @@ impl Drop for ImageLifecycle {
 /// Everything one [`place`] call needs about the frame it is painting into, grouped so the painter
 /// keeps the narrow read-only-refs shape ADR-0005 §Part 4 R4 requires of every alternate-screen
 /// painter (`altscreen/mod.rs`, structural rule 1).
+#[derive(Clone, Copy)]
 pub struct Strip<'a> {
     /// The negotiated renderer — `AppState::image_renderer` (`app/state.rs:59`).
     pub renderer: &'a ImageRenderer,

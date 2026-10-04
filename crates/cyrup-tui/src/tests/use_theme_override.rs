@@ -81,19 +81,20 @@ fn without_an_override_a_reapply_follows_settings() {
     );
 }
 
-/// An explicit setting never probes and never asks to persist a detection, so a run started with
-/// the override leaves `settings.theme` untouched even when the user has none.
+/// The override names the theme outright: asking the terminal for its colours afterwards (pi does,
+/// whatever the setting) does not change which theme is active. Nothing here — or anywhere in the
+/// controller — writes a theme back to settings, so a run started with the override leaves
+/// `settings.theme` exactly as the user left it.
 #[test]
-fn the_override_is_never_offered_for_persistence() {
+fn the_override_is_not_second_guessed_by_the_terminal() {
     let mut controller = ThemeController::boot_with_initial(
         Some("light"),
         None,
         ColorMode::TrueColor,
         TerminalTheme::Dark,
     );
-    let _ = controller.sync_with_terminal(&NoTerminalProbe, std::time::Duration::ZERO, "");
+    let _ = controller.request_terminal_colors(&NoTerminalProbe, None);
     assert_eq!(controller.active_name(), "light");
-    assert_eq!(controller.theme_to_persist(), None);
 }
 
 async fn session() -> (TempDir, Arc<AgentSession>) {

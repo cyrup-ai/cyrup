@@ -108,6 +108,24 @@ pub struct SelectList {
     layout: ColumnLayout,
     /// Text for the empty state (e.g. `No matching commands`).
     no_match: String,
+    /// The item a left press went down on, so the click that completes the gesture activates that
+    /// item even if the window slid under the pointer in between — pi's `mousePressedIndex`
+    /// (`select-list.ts:122-143`).
+    pressed: Option<usize>,
+}
+
+/// What a pointer event did to a [`SelectList`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ListPointer {
+    /// Not the list's event: a hover, a row outside the window, an empty list. The caller may offer
+    /// it to something else.
+    Ignored,
+    /// The list took the event and nothing visible changed (a wheel notch against an end).
+    Handled,
+    /// The highlight moved, so the frame is stale.
+    Moved,
+    /// A click activated this item.
+    Activated(usize),
 }
 
 impl SelectList {
@@ -119,6 +137,7 @@ impl SelectList {
             max_visible: DEFAULT_MAX_VISIBLE,
             layout,
             no_match: "No matches".to_string(),
+            pressed: None,
         }
     }
 
@@ -211,6 +230,68 @@ impl SelectList {
             self.items.len(),
             usize::from(self.max_visible),
         )
+    }
+
+    /// The item index shown on window row `row` (0 is the first item row of the list), or `None`
+    /// for a row past the window — the `(i/N)` indicator, or blank space below a short list.
+    pub fn item_at(&self, row: u16) -> Option<usize> {
+        let (start, end) = self.window();
+        let index = start.checked_add(usize::from(row))?;
+        (index < end).then_some(index)
+    }
+
+    /// Act on a pointer event, its position local to the list (row 0 is the first item row) — pi's
+    /// `SelectList.handleMouse` (`select-list.ts:109-143` @v1.0.0).
+    ///
+    /// * **Wheel** moves the highlight one item, clamped at the ends — it does not wrap, unlike the
+    ///   arrow keys.
+    /// * **Press** highlights the item under the pointer and remembers it.
+    /// * **Click** activates the item the press went down on, falling back to the one under the
+    ///   pointer, and forgets the press.
+    ///
+    /// Hover never moves the highlight: the window is centred on it, so moving it under a resting
+    /// pointer would slide the rows out from under the user.
+    pub fn pointer(&mut self, event: crate::Pointer) -> ListPointer {
+        use crate::Pointer;
+        if self.items.is_empty() {
+            return ListPointer::Ignored;
+        }
+        match event {
+            Pointer::Wheel { lines, .. } => {
+                let step = if lines < 0 { -1_isize } else { 1 };
+                let last = self.items.len() - 1;
+                let next = self.selected.saturating_add_signed(step).min(last);
+                if next == self.selected {
+                    return ListPointer::Handled;
+                }
+                self.selected = next;
+                ListPointer::Moved
+            }
+            Pointer::Press { at } => {
+                let Some(index) = self.item_at(at.y) else {
+                    return ListPointer::Ignored;
+                };
+                self.pressed = Some(index);
+                if index == self.selected {
+                    return ListPointer::Handled;
+                }
+                self.selected = index;
+                ListPointer::Moved
+            }
+            Pointer::Click { at, .. } => {
+                // The cell must be an item row before the press is consulted
+                // (`select-list.ts:127-129`): a press dragged away from its row and released
+                // elsewhere leaves `pressed` behind, and a later click on a blank or scroll row
+                // must not activate it.
+                let pressed = self.pressed.take();
+                let Some(under) = self.item_at(at.y) else {
+                    return ListPointer::Ignored;
+                };
+                let index = pressed.filter(|i| *i < self.items.len()).unwrap_or(under);
+                self.selected = index;
+                ListPointer::Activated(index)
+            }
+        }
     }
 
     /// The number of rendered rows (visible rows + optional indicator), for live-region height math.
@@ -403,5 +484,59 @@ impl Component for SelectList {
     fn render(&mut self, frame: &mut Frame, area: Rect, theme: &UiTheme) {
         let lines = self.lines(area.width, theme);
         frame.render_widget(Paragraph::new(lines).style(theme.base_style()), area);
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::panic)]
+mod pointer_tests {
+    use super::*;
+    use crate::Pointer;
+    use ratatui::layout::Position;
+
+    fn list(n: usize) -> SelectList {
+        let items = (0..n)
+            .map(|i| SelectItem::label(format!("item {i}")))
+            .collect();
+        let mut list = SelectList::new(items, ColumnLayout::DEFAULT);
+        list.set_max_visible(3);
+        list
+    }
+
+    fn press(row: u16) -> Pointer {
+        Pointer::Press {
+            at: Position::new(0, row),
+        }
+    }
+
+    fn click(row: u16) -> Pointer {
+        Pointer::Click {
+            at: Position::new(0, row),
+            count: 1,
+        }
+    }
+
+    /// A press that is dragged off its row and released elsewhere leaves its index behind. A later
+    /// click on the `(i/N)` readout (or a blank row) is not a click on an item and must not
+    /// activate it (`select-list.ts:127-129` bounds-checks the cell before it reads the press).
+    #[test]
+    fn a_click_off_the_item_rows_does_not_activate_a_dragged_off_press() {
+        let mut list = list(10);
+        assert_eq!(list.pointer(press(0)), ListPointer::Handled);
+        // The window is rows 0..3 with the readout on row 3.
+        assert_eq!(list.pointer(click(3)), ListPointer::Ignored);
+        // The next click on a real row activates that row, not the abandoned one.
+        assert_eq!(list.pointer(click(1)), ListPointer::Activated(1));
+    }
+
+    #[test]
+    fn a_click_activates_the_row_its_press_went_down_on() {
+        let mut list = list(10);
+        list.set_selected(6);
+        let at = list.item_at(0).unwrap();
+        assert_eq!(list.pointer(press(0)), ListPointer::Moved);
+        // The press recentred the window, so row 0 now shows another item.
+        assert_ne!(list.item_at(0), Some(at));
+        assert_eq!(list.pointer(click(0)), ListPointer::Activated(at));
     }
 }
