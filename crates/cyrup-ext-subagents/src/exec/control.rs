@@ -294,8 +294,8 @@ pub fn parse_control_overrides(raw: &serde_json::Value) -> ControlConfig {
 // ControlEvent (shared/types.ts:205-225)
 // =================================================================================================
 
-/// pi `ControlEvent["reason"]` (`shared/types.ts:216`) — the eight discriminants a raised control
-/// event may carry. Serializes in pi's own snake_case wire spelling.
+/// pi `ControlEvent["reason"]` (`shared/types.ts:387` @v0.75.0) — the eight discriminants a raised
+/// control event may carry. Serializes in pi's own snake_case wire spelling.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ControlEventReason {
@@ -313,6 +313,13 @@ pub enum ControlEventReason {
     TurnThreshold,
     /// `activeNoticeAfterTokens` tripped.
     TokenThreshold,
+    /// SUBA-164 — one tool call has been OPEN for at least `activeNoticeAfterMs` without
+    /// finishing, so the child is wedged inside the call rather than merely slow between turns
+    /// (pi `shouldEmitOpenToolAttention`, `subagent-control.ts:114-124` @v0.75.0). Raised at most
+    /// once per call: the event names the exact call through
+    /// [`ControlEvent::tool_call_id`], so a supervisor acts on THAT call without having to
+    /// re-derive which of the child's open calls is the stuck one.
+    ToolOpenThreshold,
 }
 
 /// pi `ControlEvent` (`shared/types.ts:205-225`). Field ORDER matches the source's object literal
@@ -356,6 +363,13 @@ pub struct ControlEvent {
     /// The tool in flight when the event fired, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_tool: Option<String>,
+    /// SUBA-164 — the id of the exact tool CALL this event is about (pi `toolCallId`,
+    /// `shared/types.ts:393` @v0.75.0, added by `478f871c`/#2613 so two long calls in one child
+    /// raise two distinct notices). Set on a [`ControlEventReason::ToolOpenThreshold`] raise
+    /// whenever the child named an id for the call; `None` for every other reason, exactly as
+    /// upstream omits the key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
     /// How long that tool had been running.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_tool_duration_ms: Option<i64>,
@@ -401,6 +415,9 @@ pub struct ControlEventInput {
     pub tool_count: Option<u32>,
     /// Tool in flight.
     pub current_tool: Option<String>,
+    /// The id of the exact call in flight (SUBA-164; pi `buildControlEvent`'s `toolCallId`,
+    /// `subagent-control.ts:141`).
+    pub tool_call_id: Option<String>,
     /// How long that tool has been in flight.
     pub current_tool_duration_ms: Option<i64>,
     /// Path that tool names.
@@ -454,6 +471,7 @@ pub fn build_control_event(to: ActivityState, input: ControlEventInput) -> Contr
         tokens: input.tokens,
         tool_count: input.tool_count,
         current_tool: input.current_tool.filter(|s| !s.is_empty()),
+        tool_call_id: input.tool_call_id.filter(|s| !s.is_empty()),
         current_tool_duration_ms: input.current_tool_duration_ms,
         current_path: input.current_path.filter(|s| !s.is_empty()),
         elapsed_ms,
@@ -480,15 +498,46 @@ pub fn derive_activity_state(
     (age_ms > config.needs_attention_after_ms).then_some(ActivityState::NeedsAttention)
 }
 
+/// SUBA-164 — pi `shouldEmitOpenToolAttention` (`subagent-control.ts:114-124` @v0.75.0): a tool
+/// call that is still OPEN is due an attention notice once it has been open for at least
+/// `activeNoticeAfterMs`, unless control is off, nothing is open, or the tool is one of the three
+/// whose normal job is to wait ([`crate::exec::tool_timeout::TOOL_TIMEOUT_EXEMPT_TOOLS`] —
+/// `contact_supervisor`, `intercom`, `bg_wait`, via pi's own `isToolTimeoutExempt`).
+///
+/// Deliberately a pure function of `(now, open-since, threshold)` with NO ambient clock: the
+/// caller supplies `now`, which is what lets the threshold be tested at exact boundaries without
+/// sleeping. Note the comparison is `>=` (upstream's), not the `>` that
+/// [`derive_activity_state`] uses for the idle window — the two thresholds genuinely differ by one
+/// millisecond upstream and that difference is ported, not smoothed.
+#[must_use]
+pub fn should_emit_open_tool_attention(
+    config: &ResolvedControlConfig,
+    current_tool: Option<&str>,
+    current_tool_started_at: Option<i64>,
+    now: i64,
+) -> bool {
+    let (Some(tool), Some(started_at)) = (
+        current_tool.filter(|tool| !tool.is_empty()),
+        current_tool_started_at,
+    ) else {
+        return false;
+    };
+    if !config.enabled || crate::exec::tool_timeout::is_tool_timeout_exempt(Some(tool)) {
+        return false;
+    }
+    (now - started_at).max(0) >= config.active_notice_after_ms
+}
+
 /// pi `shouldNotifyControlEvent` (`subagent-control.ts:137-139`).
 #[must_use]
 pub fn should_notify_control_event(config: &ResolvedControlConfig, event: &ControlEvent) -> bool {
     config.enabled && config.notify_on.contains(&event.event_type)
 }
 
-/// pi `controlNotificationKey` (`subagent-control.ts:142-145`): the dedup identity of one notice —
-/// `<child>:<type>:<reason>`, where `<child>` is the child's intercom target when one exists, else
-/// `runId:index` (or the bare `runId` for a single-child run).
+/// pi `controlNotificationKey` (`subagent-control.ts:190-195` @v0.75.0): the dedup identity of one
+/// notice — `<child>:<type>:<reason>[:<toolCallId>]`, where `<child>` is the child's intercom
+/// target when one exists, else `runId:index` (or the bare `runId` for a single-child run), and the
+/// trailing call id is present only for a `tool_open_threshold` raise.
 #[must_use]
 pub fn control_notification_key(
     event: &ControlEvent,
@@ -506,7 +555,16 @@ pub fn control_notification_key(
         None => "idle",
     };
     let event_type = control_event_type_wire(event.event_type);
-    format!("{child_key}:{event_type}:{reason}")
+    // SUBA-164 — pi `subagent-control.ts:193` @v0.75.0 (`478f871c`/#2613): a `tool_open_threshold`
+    // notice is deduped PER CALL, so two tool calls left open in one child give the supervisor two
+    // notices instead of collapsing into one. Every other reason keys exactly as before.
+    let call_key = match (event.reason, event.tool_call_id.as_deref()) {
+        (Some(ControlEventReason::ToolOpenThreshold), Some(id)) if !id.is_empty() => {
+            format!(":{id}")
+        }
+        _ => String::new(),
+    };
+    format!("{child_key}:{event_type}:{reason}{call_key}")
 }
 
 /// The wire spelling of a [`ControlEventType`] — the key builder above interpolates the string
@@ -531,6 +589,7 @@ pub fn control_event_reason_wire(reason: ControlEventReason) -> &'static str {
         ControlEventReason::TimeThreshold => "time_threshold",
         ControlEventReason::TurnThreshold => "turn_threshold",
         ControlEventReason::TokenThreshold => "token_threshold",
+        ControlEventReason::ToolOpenThreshold => "tool_open_threshold",
     }
 }
 
@@ -1638,6 +1697,38 @@ struct PendingToolResult {
     started_at: i64,
 }
 
+/// SUBA-164 — one tool call the child has STARTED and not yet finished (pi `ActiveToolCall`,
+/// `execution.ts:795`, `subagent-runner.ts:2646`, both @v0.75.0).
+///
+/// Upstream keeps these in a `Map` keyed by [`crate::exec::tool_timeout::tool_timeout_call_key`]
+/// and derives `progress.currentTool` from the newest entry (`refreshCurrentTool`,
+/// `execution.ts:800-813`); this `Vec` is that map, insertion-ordered for the same reason
+/// [`crate::exec::tool_timeout::ToolTimeoutTracker`] is — the by-NAME removal fallback takes the
+/// FIRST call still open under that name.
+#[derive(Clone, Debug)]
+struct ActiveToolCall {
+    /// pi `toolTimeoutCallKey` (`tool-timeout.ts:43-47`): `id:<toolCallId>` when the child named
+    /// the call, else `anon:<tool>:<sequence>`.
+    key: String,
+    tool: String,
+    path: Option<String>,
+    started_at: i64,
+    /// pi `attentionEmitted` (`subagent-runner.ts:2646,2710,2765`; `execution.ts:795,851,926`):
+    /// the open-tool notice is raised at most ONCE per call. The flag lives on the call, so it
+    /// dies with the call and a fresh call starts eligible again — there is no decay and no
+    /// repeat for the same call.
+    attention_emitted: bool,
+}
+
+impl ActiveToolCall {
+    /// pi `target.key.startsWith("id:") ? target.key.slice(3) : undefined`
+    /// (`execution.ts:931`, `subagent-runner.ts:2787`): an anonymous call contributes no
+    /// `toolCallId` to the event.
+    fn tool_call_id(&self) -> Option<&str> {
+        self.key.strip_prefix("id:")
+    }
+}
+
 /// The per-attempt live control state machine — the Rust home for the closure soup
 /// `runSingleAttempt` builds inline (`execution.ts:344-354` the emit gate, `:578-722` the
 /// raise/derive closures, `:775-890` the per-event fold, `:896-905` the 1s activity timer,
@@ -1668,6 +1759,12 @@ pub struct ControlMonitor {
     current_tool: Option<String>,
     current_tool_started_at: Option<i64>,
     current_path: Option<String>,
+    /// SUBA-164 — every call open right now (pi `activeToolCalls`, `execution.ts:797`). The three
+    /// `current_*` fields above are DERIVED from this set by
+    /// [`Self::refresh_current_tool`], exactly as upstream derives `progress.currentTool`.
+    active_tool_calls: Vec<ActiveToolCall>,
+    /// pi `activeToolSequence` (`execution.ts:796`), for the anonymous-call key.
+    active_tool_sequence: u64,
     pending_tool_result: Option<PendingToolResult>,
     mutating_failures: MutatingFailureState,
     /// SUBA-102 — the agent's own `mutationTools` (pi `isMutatingTool(…, agent.mutationTools)`,
@@ -1706,6 +1803,8 @@ impl ControlMonitor {
             current_tool: None,
             current_tool_started_at: None,
             current_path: None,
+            active_tool_calls: Vec::new(),
+            active_tool_sequence: 0,
             pending_tool_result: None,
             mutating_failures: MutatingFailureState::default(),
             mutation_tools: None,
@@ -1812,6 +1911,112 @@ impl ControlMonitor {
         true
     }
 
+    /// pi `refreshCurrentTool` (`execution.ts:800-813`, `refreshStepCurrentTool`
+    /// `subagent-runner.ts:2651-2667`): the reported in-flight tool is the NEWEST open call, and
+    /// the three fields clear together once nothing is open.
+    ///
+    /// `min_by_key(Reverse(..))` rather than `max_by_key` on purpose: upstream sorts descending
+    /// and takes index 0, and `Array.prototype.sort` is stable, so the FIRST call registered at
+    /// the newest timestamp wins a tie. `max_by_key` would return the last.
+    fn refresh_current_tool(&mut self) {
+        let newest = self
+            .active_tool_calls
+            .iter()
+            .min_by_key(|call| std::cmp::Reverse(call.started_at))
+            .cloned();
+        match newest {
+            Some(call) => {
+                self.current_tool = Some(call.tool);
+                self.current_tool_started_at = Some(call.started_at);
+                self.current_path = call.path;
+            }
+            None => {
+                self.current_tool = None;
+                self.current_tool_started_at = None;
+                self.current_path = None;
+            }
+        }
+    }
+
+    /// pi `recordActiveToolCall` (`execution.ts:814-827`).
+    fn record_active_tool_call(
+        &mut self,
+        tool_call_id: Option<&str>,
+        tool_name: &str,
+        path: Option<String>,
+        now: i64,
+    ) {
+        self.active_tool_sequence = self.active_tool_sequence.saturating_add(1);
+        let key = crate::exec::tool_timeout::tool_timeout_call_key(
+            tool_call_id,
+            Some(tool_name),
+            self.active_tool_sequence,
+        );
+        self.active_tool_calls.push(ActiveToolCall {
+            key,
+            tool: tool_name.to_string(),
+            path,
+            started_at: now,
+            attention_emitted: false,
+        });
+        self.refresh_current_tool();
+    }
+
+    /// pi `removeActiveToolCall` (`execution.ts:831-847`): the call's own id when it has one, else
+    /// the FIRST call still open under that tool name, else — only when the event names no tool at
+    /// all — the single open call if there is exactly one. Byte-for-byte the resolution
+    /// [`crate::exec::tool_timeout::ToolTimeoutTracker::clear`] already ports for the timeout set.
+    fn remove_active_tool_call(&mut self, tool_call_id: Option<&str>, tool_name: Option<&str>) {
+        let key = match tool_call_id {
+            Some(id) if !id.is_empty() => Some(format!("id:{id}")),
+            _ => match tool_name.filter(|name| !name.is_empty()) {
+                Some(name) => self
+                    .active_tool_calls
+                    .iter()
+                    .find(|call| call.tool == name)
+                    .map(|call| call.key.clone()),
+                None if self.active_tool_calls.len() == 1 => {
+                    self.active_tool_calls.first().map(|call| call.key.clone())
+                }
+                None => None,
+            },
+        };
+        if let Some(key) = key {
+            self.active_tool_calls.retain(|call| call.key != key);
+        }
+        self.refresh_current_tool();
+    }
+
+    /// pi `openToolAttentionTarget` (`execution.ts:850-852`, `subagent-runner.ts:2709-2711`): the
+    /// OLDEST open call that is past [`should_emit_open_tool_attention`] and has not already had
+    /// its one notice. Returns the index into [`Self::active_tool_calls`] so the caller can mark
+    /// the flag; `min_by_key` is first-of-equals, matching upstream's stable ascending sort.
+    fn open_tool_attention_target(&self, now: i64) -> Option<usize> {
+        self.active_tool_calls
+            .iter()
+            .enumerate()
+            .filter(|(_, call)| {
+                !call.attention_emitted
+                    && should_emit_open_tool_attention(
+                        &self.config,
+                        Some(call.tool.as_str()),
+                        Some(call.started_at),
+                        now,
+                    )
+            })
+            .min_by_key(|(_, call)| call.started_at)
+            .map(|(index, _)| index)
+    }
+
+    /// pi `activeToolCalls.clear()` on a terminal assistant stop (`execution.ts:1130`): the child
+    /// said it is done, so nothing is open any more and no open-tool notice may fire off a stale
+    /// entry. Driven from [`crate::exec::drive_attempt`] beside the matching
+    /// `tool_timeouts.clear_all()`.
+    pub fn clear_active_tool_calls(&mut self) {
+        self.active_tool_calls.clear();
+        self.refresh_current_tool();
+    }
+
     fn current_tool_duration_ms(&self, now: i64) -> Option<i64> {
         self.current_tool_started_at
             .map(|started| (now - started).max(0))
@@ -1841,6 +2046,7 @@ impl ControlMonitor {
                 tokens: Some(self.tokens),
                 tool_count: Some(self.tool_count),
                 current_tool: input.current_tool.or_else(|| self.current_tool.clone()),
+                tool_call_id: input.tool_call_id,
                 current_tool_duration_ms: input
                     .current_tool_duration_ms
                     .or_else(|| self.current_tool_duration_ms(now)),
@@ -1849,8 +2055,15 @@ impl ControlMonitor {
                 elapsed_ms: None,
             },
         );
+        let reason = event.reason;
         self.emit_control_event(event);
+        // SUBA-164 — pi `execution.ts:882` @v0.75.0: `previous !== "needs_attention" ||
+        // input.reason === "tool_open_threshold"`. An open-tool notice is per CALL, so a child
+        // ALREADY flagged `needs_attention` (by the idle rule, a failure streak, or an earlier
+        // wedged call) still reports a genuine change when a second call trips the threshold —
+        // otherwise the 1s tick would swallow the progress update that carries the new notice.
         previous != Some(ActivityState::NeedsAttention)
+            || reason == Some(ControlEventReason::ToolOpenThreshold)
     }
 
     /// pi `emitActiveLongRunning` (`execution.ts:708-732`): at most once per attempt, and never
@@ -1880,6 +2093,7 @@ impl ControlMonitor {
                 tokens: Some(self.tokens),
                 tool_count: Some(self.tool_count),
                 current_tool: self.current_tool.clone(),
+                tool_call_id: None,
                 current_tool_duration_ms: self.current_tool_duration_ms(now),
                 current_path: self.current_path.clone(),
                 elapsed_ms: Some(now - self.started_at),
@@ -1891,9 +2105,10 @@ impl ControlMonitor {
         true
     }
 
-    /// pi `updateActivityState` (`execution.ts:784-803`): the idle heuristic first, then the
-    /// long-running trigger. Returns `true` when a fresh notice was raised (which is what the
-    /// source's 1s timer uses to decide whether to also fire a progress update).
+    /// pi `updateActivityState` (`execution.ts:910-936` @v0.75.0): the idle heuristic first, then
+    /// the open-tool threshold (SUBA-164), then the long-running trigger. Returns `true` when a
+    /// fresh notice was raised (which is what the source's 1s timer uses to decide whether to also
+    /// fire a progress update).
     pub fn update_activity_state(&mut self, now: i64) -> bool {
         if !self.config.enabled {
             return false;
@@ -1910,6 +2125,37 @@ impl ControlMonitor {
                 return false;
             }
             return self.emit_needs_attention(now, NeedsAttentionInput::default());
+        }
+        // SUBA-164 — pi `execution.ts:924-936` @v0.75.0, and identically
+        // `maybeEmitOpenToolAttention` on the background path
+        // (`subagent-runner.ts:2760-2792`, driven from `:3204`): AFTER the idle check (which is
+        // inert while a tool is open, by `deriveActivityState`'s own `currentTool` guard) and
+        // BEFORE the elapsed/turn/token long-running trigger, so a child wedged inside one call
+        // is diagnosed as a stuck CALL rather than as a merely long-running run.
+        if let Some(index) = self.open_tool_attention_target(now) {
+            let Some(target) = self.active_tool_calls.get_mut(index) else {
+                return false;
+            };
+            target.attention_emitted = true;
+            let target = target.clone();
+            let duration_ms = (now - target.started_at).max(0);
+            let agent = self.agent.clone();
+            return self.emit_needs_attention(
+                now,
+                NeedsAttentionInput {
+                    message: Some(format!(
+                        "{agent} has had tool '{}' open for {}s",
+                        target.tool,
+                        duration_ms / 1000
+                    )),
+                    reason: Some(ControlEventReason::ToolOpenThreshold),
+                    current_tool: Some(target.tool.clone()),
+                    tool_call_id: target.tool_call_id().map(str::to_string),
+                    current_path: target.path.clone(),
+                    current_tool_duration_ms: Some(duration_ms),
+                    recent_failure_summary: None,
+                },
+            );
         }
         match next_long_running_trigger(&self.config, self.started_at, now, self.turns, self.tokens)
         {
@@ -1938,12 +2184,22 @@ impl ControlMonitor {
         self.note_activity(now);
         match event {
             SubagentEvent::ToolExecutionStart {
-                tool_name, args, ..
+                tool_call_id,
+                tool_name,
+                args,
             } => {
                 self.tool_count = self.tool_count.saturating_add(1);
-                self.current_tool = Some(tool_name.clone());
-                self.current_tool_started_at = Some(now);
-                self.current_path = resolve_current_path(tool_name, args);
+                // SUBA-164 — register the call, then let `refresh_current_tool` derive the three
+                // `current_*` fields from the open set (pi `recordActiveToolCall`,
+                // `execution.ts:814-827`). Assigning them directly, as this fold used to, is why
+                // there was nowhere to hang a per-call `attentionEmitted` flag.
+                let path = resolve_current_path(tool_name, args);
+                self.record_active_tool_call(
+                    Some(tool_call_id.as_str()),
+                    tool_name,
+                    path.clone(),
+                    now,
+                );
                 let mutates = is_mutating_tool(tool_name, args, self.mutation_tools.as_deref());
                 self.pending_tool_result = Some(PendingToolResult {
                     tool: if tool_name.is_empty() {
@@ -1951,18 +2207,26 @@ impl ControlMonitor {
                     } else {
                         tool_name.clone()
                     },
-                    path: self.current_path.clone(),
+                    // pi `path: activeTool?.path` (`execution.ts:1061`): THIS call's own path, not
+                    // the derived `currentPath` — with two calls open the newest-wins derivation
+                    // can name a different call.
+                    path,
                     mutates,
                     started_at: now,
                 });
             }
             SubagentEvent::ToolExecutionEnd {
-                result, is_error, ..
+                tool_call_id,
+                tool_name,
+                result,
+                is_error,
             } => {
-                // pi `tool_execution_end` half (`execution.ts:803-816`).
-                self.current_tool = None;
-                self.current_tool_started_at = None;
-                self.current_path = None;
+                // pi `tool_execution_end` half (`execution.ts:1021-1031` @v0.75.0, and
+                // `subagent-runner.ts:3052-3057`): the call leaves the open set, which is also
+                // what RETIRES its open-tool attention candidacy — a closed call can never raise
+                // another `tool_open_threshold` notice, and its `attention_emitted` flag goes with
+                // it.
+                self.remove_active_tool_call(Some(tool_call_id.as_str()), Some(tool_name.as_str()));
                 // pi `tool_result_end` half (`execution.ts:861-889`).
                 let Some(snapshot) = self.pending_tool_result.take() else {
                     return;
@@ -2007,6 +2271,7 @@ impl ControlMonitor {
                                 )),
                                 reason: Some(ControlEventReason::ToolFailures),
                                 current_tool: Some(snapshot.tool),
+                                tool_call_id: None,
                                 current_path: snapshot.path,
                                 current_tool_duration_ms: Some((now - snapshot.started_at).max(0)),
                                 recent_failure_summary: summary,
@@ -2046,6 +2311,9 @@ pub struct NeedsAttentionInput {
     pub recent_failure_summary: Option<String>,
     /// Explicit in-flight tool name.
     pub current_tool: Option<String>,
+    /// The id of the exact call this notice is about (SUBA-164; only a
+    /// [`ControlEventReason::ToolOpenThreshold`] raise sets it).
+    pub tool_call_id: Option<String>,
     /// Explicit in-flight tool path.
     pub current_path: Option<String>,
     /// Explicit in-flight tool duration.
@@ -2216,6 +2484,323 @@ mod tests {
         assert_eq!(
             control_notification_key(&event, Some("child-target")),
             "child-target:needs_attention:idle"
+        );
+    }
+
+    // ---- SUBA-164: tool_open_threshold ----
+
+    fn start(call_id: &str, tool: &str) -> SubagentEvent {
+        SubagentEvent::ToolExecutionStart {
+            tool_call_id: cyrup_core::ToolCallId::from(call_id),
+            tool_name: tool.to_string(),
+            args: serde_json::json!({ "command": "sleep 600" }),
+        }
+    }
+
+    fn finish(call_id: &str, tool: &str) -> SubagentEvent {
+        SubagentEvent::ToolExecutionEnd {
+            tool_call_id: cyrup_core::ToolCallId::from(call_id),
+            tool_name: tool.to_string(),
+            result: serde_json::json!("done"),
+            is_error: false,
+        }
+    }
+
+    /// A monitor whose ONLY armed threshold is the open-tool one: the idle window is pushed out of
+    /// reach so nothing else can produce a `needs_attention`, and `started_at` is 0 so a call
+    /// opened at 0 has run-elapsed and call-open duration equal — which is what lets these tests
+    /// prove the open-tool branch runs BEFORE the elapsed long-running trigger that shares
+    /// `active_notice_after_ms`.
+    fn open_tool_monitor(active_notice_after_ms: i64) -> ControlMonitor {
+        monitor(ResolvedControlConfig {
+            active_notice_after_ms,
+            needs_attention_after_ms: 10_000_000,
+            ..ResolvedControlConfig::default()
+        })
+    }
+
+    /// The row's own scenario. No sleeping: `now` is an explicit `i64` epoch-millis argument on
+    /// every call, so "four minutes later" costs nothing and lands on an exact millisecond.
+    #[test]
+    fn one_tool_call_open_past_the_threshold_raises_needs_attention_with_tool_open_threshold() {
+        let config = ResolvedControlConfig {
+            active_notice_after_ms: 240_000,
+            needs_attention_after_ms: 10_000_000,
+            ..ResolvedControlConfig::default()
+        };
+        // The hole SUBA-164 names: the idle rule is inert for the whole life of an open call, so
+        // before this branch existed a wedged child produced nothing at all here.
+        assert_eq!(
+            derive_activity_state(&config, 0, Some(0), Some("bash"), 600_000),
+            None,
+            "derive_activity_state is silent while a tool is open"
+        );
+
+        let mut m = open_tool_monitor(240_000);
+        m.observe_event(&start("call-1", "bash"), 0);
+        assert!(
+            m.update_activity_state(600_000),
+            "a call open for 10 minutes is a fresh notice"
+        );
+        assert_eq!(m.events().len(), 1);
+        let event = &m.events()[0];
+        assert_eq!(event.event_type, ControlEventType::NeedsAttention);
+        assert_eq!(event.to, ActivityState::NeedsAttention);
+        assert_eq!(event.reason, Some(ControlEventReason::ToolOpenThreshold));
+        assert_eq!(event.tool_call_id.as_deref(), Some("call-1"));
+        assert_eq!(event.current_tool.as_deref(), Some("bash"));
+        assert_eq!(event.current_tool_duration_ms, Some(600_000));
+        assert_eq!(event.message, "scout has had tool 'bash' open for 600s");
+        assert_eq!(m.activity_state(), Some(ActivityState::NeedsAttention));
+    }
+
+    /// The control that stops this degrading into "always needs attention": open, but not yet long
+    /// enough. The boundary is `>=` upstream (`subagent-control.ts:123`), so the exact millisecond
+    /// matters and is pinned here rather than approximated.
+    #[test]
+    fn a_call_open_within_the_threshold_raises_nothing_and_the_boundary_is_inclusive() {
+        let config = ResolvedControlConfig {
+            active_notice_after_ms: 1_000,
+            ..ResolvedControlConfig::default()
+        };
+        assert!(!should_emit_open_tool_attention(
+            &config,
+            Some("bash"),
+            Some(0),
+            999
+        ));
+        assert!(should_emit_open_tool_attention(
+            &config,
+            Some("bash"),
+            Some(0),
+            1_000
+        ));
+
+        let mut m = open_tool_monitor(1_000);
+        m.observe_event(&start("call-1", "bash"), 0);
+        assert!(
+            !m.update_activity_state(999),
+            "one millisecond short of the threshold is not a notice"
+        );
+        assert!(m.events().is_empty());
+        assert_eq!(m.activity_state(), None);
+    }
+
+    /// A child doing ordinary work — short calls, assistant turns — stays completely quiet.
+    #[test]
+    fn a_child_doing_ordinary_work_raises_nothing() {
+        let mut m = monitor(ResolvedControlConfig {
+            active_notice_after_ms: 10_000_000,
+            needs_attention_after_ms: 10_000_000,
+            ..ResolvedControlConfig::default()
+        });
+        for i in 0..5_i64 {
+            let id = format!("call-{i}");
+            m.observe_event(&start(&id, "read"), i * 1_000);
+            // Ticked WHILE the call is open, not only between calls: a threshold that stopped
+            // comparing durations would raise here, and that is the "always needs attention"
+            // degradation this test exists to catch.
+            assert!(!m.update_activity_state(i * 1_000 + 10));
+            m.observe_event(&finish(&id, "read"), i * 1_000 + 40);
+            m.observe_event(
+                &SubagentEvent::MessageEnd {
+                    message: serde_json::json!({ "role": "assistant", "content": [] }),
+                },
+                i * 1_000 + 50,
+            );
+            assert!(!m.update_activity_state(i * 1_000 + 60));
+        }
+        assert!(m.events().is_empty(), "ordinary work is not a notice");
+        assert_eq!(m.activity_state(), None);
+    }
+
+    /// Upstream's per-call `attentionEmitted` (`subagent-runner.ts:2710,2765`): one notice per
+    /// call, not a repeating alarm. Ten more ticks, nine more minutes, still one event.
+    #[test]
+    fn the_same_open_call_never_notifies_twice_however_long_it_stays_open() {
+        let mut m = open_tool_monitor(1_000);
+        m.observe_event(&start("call-1", "bash"), 0);
+        assert!(m.update_activity_state(1_000));
+        for tick in 1..=10_i64 {
+            assert!(
+                !m.update_activity_state(1_000 + tick * 60_000),
+                "the same call must not notify again"
+            );
+        }
+        assert_eq!(m.events().len(), 1);
+        assert_eq!(
+            m.events()[0].reason,
+            Some(ControlEventReason::ToolOpenThreshold)
+        );
+    }
+
+    /// The row's `Verify`: two calls open past the threshold in one child give two notices, one
+    /// per call, each naming its own call id — not one notice for the child.
+    #[test]
+    fn two_calls_open_past_the_threshold_raise_one_notice_each_with_their_own_call_id() {
+        let mut m = open_tool_monitor(1_000);
+        m.observe_event(&start("call-a", "bash"), 0);
+        m.observe_event(&start("call-b", "grep"), 100);
+        assert!(
+            m.update_activity_state(1_200),
+            "the older call notices first"
+        );
+        assert!(m.update_activity_state(1_200), "then the younger one");
+        assert!(!m.update_activity_state(1_200), "and no third");
+        let ids: Vec<Option<&str>> = m
+            .events()
+            .iter()
+            .map(|event| event.tool_call_id.as_deref())
+            .collect();
+        assert_eq!(ids, vec![Some("call-a"), Some("call-b")]);
+        assert!(
+            m.events()
+                .iter()
+                .all(|event| event.reason == Some(ControlEventReason::ToolOpenThreshold)),
+            "both are open-tool notices, not one plus a long-running notice"
+        );
+    }
+
+    /// Closing the call retires its attention: the entry leaves the open set, so the threshold can
+    /// never be re-evaluated for it and no further `tool_open_threshold` notice exists for it.
+    #[test]
+    fn closing_the_call_clears_its_open_tool_attention() {
+        let mut m = open_tool_monitor(1_000);
+        m.observe_event(&start("call-1", "bash"), 0);
+        assert!(m.update_activity_state(1_000));
+        assert_eq!(m.events().len(), 1);
+
+        m.observe_event(&finish("call-1", "bash"), 1_100);
+        for tick in 1..=5_i64 {
+            assert!(
+                !m.update_activity_state(1_100 + tick * 60_000),
+                "a closed call raises nothing"
+            );
+        }
+        assert_eq!(
+            m.events()
+                .iter()
+                .filter(|event| event.reason == Some(ControlEventReason::ToolOpenThreshold))
+                .count(),
+            1,
+            "the closed call keeps its one notice and earns no more"
+        );
+    }
+
+    /// A call that finishes BEFORE the threshold never notifies at all (the row's "a call that
+    /// finishes before the threshold gives none").
+    #[test]
+    fn a_call_that_closes_before_the_threshold_never_notifies() {
+        let mut m = open_tool_monitor(1_000);
+        m.observe_event(&start("call-1", "bash"), 0);
+        m.observe_event(&finish("call-1", "bash"), 500);
+        m.update_activity_state(600_000);
+        assert!(
+            m.events()
+                .iter()
+                .all(|event| event.reason != Some(ControlEventReason::ToolOpenThreshold)),
+            "a call that already closed is not a wedged call"
+        );
+    }
+
+    /// pi `isToolTimeoutExempt` (`tool-timeout.ts:24-26`) via `shouldEmitOpenToolAttention`: the
+    /// three tools whose normal job is to wait never trip the threshold.
+    #[test]
+    fn a_timeout_exempt_tool_never_trips_the_open_tool_threshold() {
+        for tool in crate::exec::tool_timeout::TOOL_TIMEOUT_EXEMPT_TOOLS {
+            let mut m = open_tool_monitor(1_000);
+            assert!(!should_emit_open_tool_attention(
+                m.config(),
+                Some(tool),
+                Some(0),
+                600_000
+            ));
+            m.observe_event(&start("call-1", tool), 0);
+            m.update_activity_state(600_000);
+            // The run is still eligible for the ordinary elapsed long-running notice — upstream
+            // shares `activeNoticeAfterMs` between the two — so the claim under test is
+            // specifically that NO open-tool notice exists for a tool whose job is to wait.
+            assert!(
+                m.events()
+                    .iter()
+                    .all(|event| event.reason != Some(ControlEventReason::ToolOpenThreshold)),
+                "{tool} waiting is not a wedged call"
+            );
+        }
+    }
+
+    /// A terminal assistant stop clears the open set (pi `execution.ts:1130`), so a call the child
+    /// never reported an end for cannot trip the threshold afterwards.
+    #[test]
+    fn a_terminal_stop_clears_the_open_set_so_no_stale_call_notifies() {
+        let mut m = open_tool_monitor(1_000);
+        m.observe_event(&start("call-1", "bash"), 0);
+        m.clear_active_tool_calls();
+        m.update_activity_state(600_000);
+        assert!(
+            m.events()
+                .iter()
+                .all(|event| event.reason != Some(ControlEventReason::ToolOpenThreshold)),
+            "a cleared open set has no wedged call"
+        );
+    }
+
+    /// pi `subagent-control.ts:193` @v0.75.0: the notice dedupe identity carries the call id for
+    /// `tool_open_threshold` and ONLY for it.
+    #[test]
+    fn the_open_tool_dedupe_key_is_per_call() {
+        let mut event = sample_event(ControlEventType::NeedsAttention);
+        event.reason = Some(ControlEventReason::ToolOpenThreshold);
+        event.tool_call_id = Some("call-a".to_string());
+        assert_eq!(
+            control_notification_key(&event, None),
+            "run1:needs_attention:tool_open_threshold:call-a"
+        );
+        let mut other = event.clone();
+        other.tool_call_id = Some("call-b".to_string());
+        assert_ne!(
+            control_notification_key(&event, None),
+            control_notification_key(&other, None),
+            "two wedged calls must not dedupe into one notice"
+        );
+        let mut idle = event.clone();
+        idle.reason = Some(ControlEventReason::Idle);
+        assert_eq!(
+            control_notification_key(&idle, None),
+            "run1:needs_attention:idle",
+            "every other reason keys exactly as before"
+        );
+
+        let config = ResolvedControlConfig::default();
+        let mut seen = HashSet::new();
+        assert!(claim_control_notification(&config, &event, &mut seen, None));
+        assert!(claim_control_notification(&config, &other, &mut seen, None));
+        assert!(!claim_control_notification(
+            &config, &event, &mut seen, None
+        ));
+    }
+
+    /// The wire spellings a consumer sees: pi's `tool_open_threshold` reason and `toolCallId` key.
+    #[test]
+    fn the_open_tool_reason_and_call_id_serialize_in_pis_wire_spelling() {
+        assert_eq!(
+            control_event_reason_wire(ControlEventReason::ToolOpenThreshold),
+            "tool_open_threshold"
+        );
+        let mut event = sample_event(ControlEventType::NeedsAttention);
+        event.reason = Some(ControlEventReason::ToolOpenThreshold);
+        event.tool_call_id = Some("call-a".to_string());
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(json["reason"], "tool_open_threshold");
+        assert_eq!(json["toolCallId"], "call-a");
+        let mut without = sample_event(ControlEventType::NeedsAttention);
+        without.tool_call_id = None;
+        assert!(
+            serde_json::to_value(&without)
+                .unwrap()
+                .get("toolCallId")
+                .is_none(),
+            "an event with no call id omits the key, as upstream does"
         );
     }
 

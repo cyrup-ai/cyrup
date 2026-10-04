@@ -735,6 +735,11 @@ async fn handle_child_line(
     }
     if terminal_stop {
         state.tool_timeouts.clear_all();
+        // SUBA-164 — pi clears `activeToolCalls` on the same terminal assistant stop
+        // (`execution.ts:1129-1132` @v0.75.0), one line after `clearAllToolTimeouts()`: the child
+        // declared itself done, so no stale open call may trip the open-tool attention threshold
+        // afterwards.
+        control.clear_active_tool_calls();
     }
     let terminal_structured_output_call =
         opts.structured_output_schema.is_some() && is_sole_structured_output_tool_call(&event);

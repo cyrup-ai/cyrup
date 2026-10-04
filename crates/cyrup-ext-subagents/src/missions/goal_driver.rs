@@ -569,6 +569,7 @@ pub fn collect_goal_continuation_notices(
                 tokens: None,
                 tool_count: None,
                 current_tool: None,
+                tool_call_id: None,
                 current_tool_duration_ms: None,
                 current_path: None,
                 elapsed_ms: None,
