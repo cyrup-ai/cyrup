@@ -510,15 +510,23 @@ async fn run() -> anyhow::Result<i32> {
     // EXT-027 — a provider no built-in and no `models.json` block names may be one a loaded
     // extension registers (`--model llama.cpp/<id>`): pi resolves after the extensions load, so the
     // launch selection defers that case to the session builder ([`cyrup::provider::select_launch_provider`]).
+    //
+    // The session's ONE `AuthStore`, built before the provider so the provider resolves request
+    // auth against it (Pi `ModelRuntime` hands every provider its `RuntimeCredentials`). A provider
+    // built without it saw an empty store, so a `/login` credential never streamed. The runtime
+    // `--api-key` is installed on it below; the overlay reads it at request time.
+    let auth_store = Arc::new(AuthStore::at(dirs.agent_dir.join("auth.json")));
     let (mut provider, provider_deferred) = match cyrup::provider::select_launch_provider(
         cli.provider.as_deref(),
         cli.model.as_deref(),
         cli.api_key.as_deref(),
         &models_json,
+        Some(cyrup_config::login::runtime_credentials(auth_store.clone())),
     ) {
-        Err(_) if cli.exits_after_runtime() => {
-            (select_provider(None, None, None, &models_json)?, false)
-        }
+        Err(_) if cli.exits_after_runtime() => (
+            select_provider(None, None, None, &models_json, None)?,
+            false,
+        ),
         selected => selected?,
     };
 
@@ -632,7 +640,13 @@ async fn run() -> anyhow::Result<i32> {
     if let Some((launch_provider, launch_pattern)) =
         bootstrap::resolve_default_launch_model(&cli, &dirs, &config, &models_json, &settings_store)
     {
-        provider = select_provider(Some(&launch_provider), None, None, &models_json)?;
+        provider = select_provider(
+            Some(&launch_provider),
+            None,
+            None,
+            &models_json,
+            Some(cyrup_config::login::runtime_credentials(auth_store.clone())),
+        )?;
         config.model_pattern = Some(launch_pattern);
     }
 
@@ -640,13 +654,12 @@ async fn run() -> anyhow::Result<i32> {
     // runtime reads (Pi `modelRuntime.setRuntimeApiKey(...)`, main.ts:764 → model-runtime.ts:400-418).
     // cyrup handed the key only to `select_provider`'s throwaway `InMemoryCredentialStore`, so the
     // session's `AuthStore` — the one behind `hasConfiguredAuth`, `getProviderAuthStatus` and
-    // `/logout`'s `listCredentials()` — never saw it. Building the store here (instead of letting
-    // `SessionBuilder` default it) is what lets the key be installed on it.
+    // `/logout`'s `listCredentials()` — never saw it. Building the store in `main` (above, instead of
+    // letting `SessionBuilder` default it) is what lets the key be installed on it.
     //
     // The default-launch block above cannot have swapped `provider` out from under this: `--api-key`
     // is rejected earlier unless one of `--model`/`--provider`/`--models` is present, and that block
     // runs only when all three are absent.
-    let auth_store = Arc::new(AuthStore::at(dirs.agent_dir.join("auth.json")));
     if let Some(api_key) = cli.api_key.as_deref() {
         // The provider a deferred launch names, not the placeholder standing in for it.
         let key_provider = match cyrup::provider::requested_provider_id(

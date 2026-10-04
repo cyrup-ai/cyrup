@@ -44,9 +44,14 @@ use crate::provider::{
 /// is a placeholder.
 #[test]
 fn an_unknown_provider_with_a_model_is_left_to_the_session() {
-    let (provider, deferred) =
-        select_launch_provider(None, Some("llama.cpp/qwen3"), None, &ModelFile::default())
-            .expect("the choice is deferred, not refused");
+    let (provider, deferred) = select_launch_provider(
+        None,
+        Some("llama.cpp/qwen3"),
+        None,
+        &ModelFile::default(),
+        None,
+    )
+    .expect("the choice is deferred, not refused");
 
     assert!(deferred);
     assert!(provider.models().is_empty(), "a placeholder with no models");
@@ -57,10 +62,16 @@ fn an_unknown_provider_with_a_model_is_left_to_the_session() {
 /// embedders) relies on.
 #[test]
 fn the_strict_selection_still_refuses_an_unknown_provider() {
-    let error = select_provider(None, Some("llama.cpp/qwen3"), None, &ModelFile::default())
-        .err()
-        .expect("llama.cpp is not a built-in provider")
-        .to_string();
+    let error = select_provider(
+        None,
+        Some("llama.cpp/qwen3"),
+        None,
+        &ModelFile::default(),
+        None,
+    )
+    .err()
+    .expect("llama.cpp is not a built-in provider")
+    .to_string();
 
     assert!(error.contains("not a known provider"), "{error}");
 }
@@ -70,9 +81,15 @@ fn the_strict_selection_still_refuses_an_unknown_provider() {
 /// selection returns it, and its text is the one the user sees when nothing registers the id.
 #[test]
 fn the_deferred_refusal_is_the_unknown_provider_error_alone() {
-    let error = select_provider(None, Some("llama.cpp/qwen3"), None, &ModelFile::default())
-        .err()
-        .expect("llama.cpp is not a built-in provider");
+    let error = select_provider(
+        None,
+        Some("llama.cpp/qwen3"),
+        None,
+        &ModelFile::default(),
+        None,
+    )
+    .err()
+    .expect("llama.cpp is not a built-in provider");
 
     let unknown = error
         .downcast_ref::<UnknownProvider>()
@@ -96,8 +113,14 @@ fn the_deferred_refusal_is_the_unknown_provider_error_alone() {
 /// A built-in provider is selected as ever and is not deferred.
 #[test]
 fn a_built_in_provider_is_selected_immediately() {
-    let (provider, deferred) =
-        select_launch_provider(None, Some("openai/gpt-4o"), None, &ModelFile::default()).unwrap();
+    let (provider, deferred) = select_launch_provider(
+        None,
+        Some("openai/gpt-4o"),
+        None,
+        &ModelFile::default(),
+        None,
+    )
+    .unwrap();
 
     assert!(!deferred);
     assert_eq!(provider.id().as_str(), "openai");
@@ -107,7 +130,7 @@ fn a_built_in_provider_is_selected_immediately() {
 /// diagnostic stands.
 #[test]
 fn an_unknown_provider_without_a_model_keeps_its_error() {
-    let error = select_launch_provider(Some("llama.cpp"), None, None, &ModelFile::default())
+    let error = select_launch_provider(Some("llama.cpp"), None, None, &ModelFile::default(), None)
         .err()
         .expect("nothing to defer")
         .to_string();

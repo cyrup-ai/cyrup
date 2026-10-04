@@ -356,17 +356,19 @@ fn composed_registry(
     models_json: &ModelFile,
     api_key: Option<&str>,
     provider_id: Option<&str>,
+    credentials: Option<Arc<dyn cyrup_provider::CredentialStore>>,
 ) -> (Models, Vec<String>) {
     // Install the runtime `--api-key` as a credential for the resolved provider so the provider
-    // streams with it (Pi threads `apiKey` into the auth context). Absent a key the env-backed
-    // default auth resolves the key at stream time.
+    // streams with it (Pi threads `apiKey` into the auth context). Absent a key the providers read
+    // `credentials` (the session's `auth.json`, so a `/login` credential streams), and the
+    // env-backed default auth resolves the key at stream time when nothing is stored.
     let credentials = match (api_key, provider_id) {
         (Some(key), Some(id)) => {
             let store = InMemoryCredentialStore::new()
                 .with_credential(ProviderId::from(id), Credential::api_key(key));
             Some(Arc::new(store) as Arc<dyn cyrup_provider::CredentialStore>)
         }
-        _ => None,
+        _ => credentials,
     };
     cyrup_config::compose_provider_registry(
         models_json,
@@ -412,7 +414,7 @@ pub fn registry_with_credentials(
 /// [`UnconfiguredProvider`] appears here: pi's `faux.ts` is absent from `providers/all.ts`, and the
 /// unconfigured stand-in is a cyrup run-time placeholder, not a catalog entry (PROV-052).
 pub fn all_available_models(models_json: &ModelFile) -> Vec<cyrup_provider::Model> {
-    let (models, _errors) = composed_registry(models_json, None, None);
+    let (models, _errors) = composed_registry(models_json, None, None, None);
     models.get_models(None)
 }
 
@@ -453,7 +455,7 @@ pub fn available_models(
 /// `getError()` at `:336-344` renders it). Empty when the
 /// file is absent or every provider block composes.
 pub fn models_json_composition_errors(models_json: &ModelFile) -> Vec<String> {
-    let (_models, errors) = composed_registry(models_json, None, None);
+    let (_models, errors) = composed_registry(models_json, None, None, None);
     errors
 }
 
@@ -514,23 +516,40 @@ pub fn default_launch_model(
 /// `packages/coding-agent/src/modes/interactive/components/model-selector.ts:354-359`, whose
 /// `handleSelect` calls `setDefaultModelAndProvider(model.provider, model.id)` then the session's
 /// select callback). The provider's
-/// key resolves at stream time from the environment (e.g. `TOGETHER_API_KEY`), matching Pi.
+/// key resolves at stream time from the session's credential store (a `/login` credential), else
+/// the environment (e.g. `TOGETHER_API_KEY`), matching Pi.
 pub struct BuiltinProviderResolver {
     models_json: Arc<ModelFile>,
+    credentials: Arc<dyn cyrup_provider::CredentialStore>,
 }
 
 impl BuiltinProviderResolver {
     /// Bind the resolver to the session's loaded `models.json` so an in-session `/model` selection
     /// of a user-declared provider swaps onto the COMPOSED provider, not a built-in that does not
-    /// exist (Pi resolves every `setModel` against the one composed registry).
-    pub fn new(models_json: Arc<ModelFile>) -> Self {
-        Self { models_json }
+    /// exist (Pi resolves every `setModel` against the one composed registry), and to the
+    /// session's `credentials` ([`cyrup_config::login::runtime_credentials`]) so the swapped-in
+    /// provider streams with what `/login` stored.
+    pub fn new(
+        models_json: Arc<ModelFile>,
+        credentials: Arc<dyn cyrup_provider::CredentialStore>,
+    ) -> Self {
+        Self {
+            models_json,
+            credentials,
+        }
     }
 }
 
 impl cyrup_session_svc::ProviderResolver for BuiltinProviderResolver {
     fn resolve(&self, provider_id: &str) -> Result<Arc<dyn Provider>, String> {
-        select_provider(Some(provider_id), None, None, &self.models_json).map_err(|e| e.to_string())
+        select_provider(
+            Some(provider_id),
+            None,
+            None,
+            &self.models_json,
+            Some(self.credentials.clone()),
+        )
+        .map_err(|e| e.to_string())
     }
 }
 
@@ -567,7 +586,10 @@ fn resolve_provider_id<'a>(
 ///   non-interactive modes only (`packages/coding-agent/src/main.ts:852-855`). PROV-052 — this arm
 ///   used to hand back the scripted `FauxProvider`.
 /// - Any explicit provider ⇒ looked up in the built-in registry (Pi `providers/all.ts`), with
-///   `api_key` installed as a runtime credential when present (Pi `options.apiKey`).
+///   `api_key` installed as a runtime credential when present (Pi `options.apiKey`), else reading
+///   `credentials` — pass the session's store ([`cyrup_config::login::runtime_credentials`]): with
+///   `None` the provider sees an empty store and only an env key can configure it, so a `/login`
+///   credential never streams.
 /// - A provider that is not a built-in ⇒ a clear error listing the available built-ins. `faux` is
 ///   deliberately NOT among them: Pi's own scripted provider is not in `providers/all.ts` either
 ///   and is unreachable from its CLI.
@@ -576,6 +598,7 @@ pub fn select_provider(
     model_pattern: Option<&str>,
     api_key: Option<&str>,
     models_json: &ModelFile,
+    credentials: Option<Arc<dyn cyrup_provider::CredentialStore>>,
 ) -> anyhow::Result<Arc<dyn Provider>> {
     match resolve_provider_id(provider_override, model_pattern) {
         None => Ok(Arc::new(UnconfiguredProvider::new())),
@@ -589,7 +612,7 @@ pub fn select_provider(
         #[cfg(feature = "faux")]
         Some("faux") => Ok(Arc::new(cyrup_provider::faux::FauxProvider::new())),
         Some(id) => {
-            let (models, _errors) = composed_registry(models_json, api_key, Some(id));
+            let (models, _errors) = composed_registry(models_json, api_key, Some(id), credentials);
             match models.get_provider(id) {
                 Some(provider) => Ok(provider),
                 None => {
@@ -674,8 +697,15 @@ pub fn select_launch_provider(
     model_pattern: Option<&str>,
     api_key: Option<&str>,
     models_json: &ModelFile,
+    credentials: Option<Arc<dyn cyrup_provider::CredentialStore>>,
 ) -> anyhow::Result<(Arc<dyn Provider>, bool)> {
-    match select_provider(provider_override, model_pattern, api_key, models_json) {
+    match select_provider(
+        provider_override,
+        model_pattern,
+        api_key,
+        models_json,
+        credentials,
+    ) {
         Ok(provider) => Ok((provider, false)),
         Err(error) if model_pattern.is_some() && error.is::<UnknownProvider>() => {
             Ok((Arc::new(UnconfiguredProvider::new()), true))
@@ -844,7 +874,7 @@ mod tests {
     /// `packages/ai/src/providers/all.ts`, it is not a member of `KnownProvider`, and
     /// `git grep faux v0.83.0 -- packages/coding-agent/src/` matches **zero** files. Neither a bare
     /// invocation nor any `--provider`/`--model` spelling can reach it in pi. This test was RED
-    /// before the fix (`select_provider(None, ..)` returned `FauxProvider`, id `"faux"`) and is
+    /// before the fix (`select_provider(None, .., None)` returned `FauxProvider`, id `"faux"`) and is
     /// GREEN after.
     #[test]
     fn no_flags_resolve_to_an_empty_catalog_never_to_a_test_double() {
@@ -852,7 +882,7 @@ mod tests {
         // `model: None` + pi's `modelFallbackMessage` ⇒ the mode-gated stop in `main.rs` prints
         // `packages/coding-agent/src/main.ts:852-855`'s message and exits 1 in the non-interactive
         // modes, while interactive still opens a TUI to type `/login` into.
-        let p = select_provider(None, None, None, &ModelFile::default()).unwrap();
+        let p = select_provider(None, None, None, &ModelFile::default(), None).unwrap();
         assert_eq!(p.id().as_str(), "unconfigured");
         assert!(
             p.models().is_empty(),
@@ -860,14 +890,20 @@ mod tests {
              silently launched the scripted double"
         );
         // A bare id with no `provider/` prefix is the same no-flag path.
-        let p = select_provider(None, Some("faux-1"), None, &ModelFile::default()).unwrap();
+        let p = select_provider(None, Some("faux-1"), None, &ModelFile::default(), None).unwrap();
         assert_eq!(p.id().as_str(), "unconfigured");
         assert!(p.models().is_empty());
         // An unrecognised prefix is the ordinary unknown-provider error, never a silent double.
         // (`Arc<dyn Provider>` is not `Debug`, so `expect_err` is unavailable — take the `Err` side.)
-        let err = select_provider(None, Some("not-a-provider/x"), None, &ModelFile::default())
-            .err()
-            .expect("an unknown prefix is an error");
+        let err = select_provider(
+            None,
+            Some("not-a-provider/x"),
+            None,
+            &ModelFile::default(),
+            None,
+        )
+        .err()
+        .expect("an unknown prefix is an error");
         assert!(err.to_string().contains("not a known provider"));
         // `faux` itself is selectable ONLY under this package's TEST-ONLY `faux` feature, which is
         // reached solely through the self-dev-dependency; the shipped binary has no such arm. That
@@ -878,8 +914,14 @@ mod tests {
     #[test]
     fn explicit_provider_override_wins_over_model_prefix() {
         // `--provider openai` with a bare model resolves to openai (Pi precedence).
-        let p = select_provider(Some("openai"), Some("gpt-4o"), None, &ModelFile::default())
-            .expect("openai built-in");
+        let p = select_provider(
+            Some("openai"),
+            Some("gpt-4o"),
+            None,
+            &ModelFile::default(),
+            None,
+        )
+        .expect("openai built-in");
         assert_eq!(p.id().as_str(), "openai");
     }
 
@@ -890,11 +932,18 @@ mod tests {
             Some("anthropic/claude-opus"),
             None,
             &ModelFile::default(),
+            None,
         )
         .expect("anthropic built-in");
         assert_eq!(anthropic.id().as_str(), "anthropic");
-        let openai = select_provider(None, Some("openai/gpt-4o"), None, &ModelFile::default())
-            .expect("openai built-in");
+        let openai = select_provider(
+            None,
+            Some("openai/gpt-4o"),
+            None,
+            &ModelFile::default(),
+            None,
+        )
+        .expect("openai built-in");
         assert_eq!(openai.id().as_str(), "openai");
     }
 
@@ -905,6 +954,7 @@ mod tests {
             Some("openai/gpt-4o"),
             Some("sk-runtime"),
             &ModelFile::default(),
+            None,
         )
         .expect("openai built-in with runtime key");
         assert_eq!(p.id().as_str(), "openai");
@@ -917,6 +967,7 @@ mod tests {
             Some("together/moonshotai/Kimi-K2.6"),
             None,
             &ModelFile::default(),
+            None,
         )
         .expect("together is built-in");
         assert_eq!(together.id().as_str(), "together");
@@ -1013,6 +1064,7 @@ mod tests {
             Some("definitely-not-a-provider/whatever"),
             None,
             &ModelFile::default(),
+            None,
         ) {
             Err(e) => e.to_string(),
             Ok(_) => panic!("expected an error for an unknown provider"),

@@ -179,6 +179,8 @@ pub fn build_factory(
     trust_prompt: Option<TrustPromptFn>,
 ) -> anyhow::Result<Arc<SessionFactory>> {
     let session_cwd = config.cwd.clone();
+    // The resolver's providers read the SAME store `/login` writes through (`.auth` below).
+    let credentials = cyrup_config::login::runtime_credentials(auth_store.clone());
     let mut builder = SessionFactory::new(provider, config)
         .settings_store(settings_store)
         .auth(auth_store)
@@ -188,6 +190,7 @@ pub fn build_factory(
     }
     builder = builder.provider_resolver(Arc::new(crate::provider::BuiltinProviderResolver::new(
         models_json,
+        credentials,
     )));
     Ok(Arc::new(attach_native_extensions(
         builder,

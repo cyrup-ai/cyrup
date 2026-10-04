@@ -828,6 +828,16 @@ impl cyrup_provider::AuthContext for StoreAuthContext {
 /// when one is set, else the stored credential; every other operation is the store's.
 struct RuntimeKeyCredentials(std::sync::Arc<AuthStore>);
 
+/// `store` as the [`cyrup_provider::CredentialStore`] a provider resolves request auth against:
+/// `auth.json` with the runtime `--api-key` overlaid (pi `RuntimeCredentials`, which is what
+/// `ModelRuntime` hands every provider). Pass the session's OWN store: [`AuthStore`] serves reads
+/// from an in-memory snapshot, so a second instance would not see a `/login` made in-session.
+pub fn runtime_credentials(
+    store: std::sync::Arc<AuthStore>,
+) -> std::sync::Arc<dyn cyrup_provider::CredentialStore> {
+    std::sync::Arc::new(RuntimeKeyCredentials(store))
+}
+
 #[async_trait::async_trait]
 impl cyrup_provider::CredentialStore for RuntimeKeyCredentials {
     async fn read(
