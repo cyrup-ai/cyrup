@@ -92,6 +92,9 @@ mod import_confirm;
 mod inline_stacking;
 mod input_pipeline;
 mod input_prompt;
+// The child is spawned through util-linux's `setsid -c`, which other platforms (macOS) do not ship,
+// and `forbid(unsafe_code)` rules out the `pre_exec` setsid + `TIOCSCTTY` alternative.
+#[cfg(target_os = "linux")]
 mod input_pty;
 mod keybindings;
 mod keymap;
@@ -131,6 +134,8 @@ mod share_url;
 mod show_warning_prefix;
 mod sigint_double_tap;
 mod startup_resources_panel;
+// Spawns through `input_pty`'s `setsid -c` harness: Linux only, as above.
+#[cfg(target_os = "linux")]
 mod startup_selector_pty;
 mod startup_session_selector;
 mod status_indicator;

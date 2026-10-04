@@ -61,8 +61,10 @@ async fn runtime(fx: &Fixture) -> Arc<AgentSessionRuntime> {
         .unwrap()
 }
 
+/// Wide enough that `Session imported from: {path}` stays on one row: macOS temp dirs
+/// (`/var/folders/…/T/.tmpXXXXXX`) are long enough to wrap it at 80 columns.
 fn app() -> App<TestBackend> {
-    App::new(TestBackend::new(80, 24), UiTheme::dark()).unwrap()
+    App::new(TestBackend::new(200, 24), UiTheme::dark()).unwrap()
 }
 
 /// Submit `/import <path>` through the real editor → dispatch path and execute the routed command
