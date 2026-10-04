@@ -302,7 +302,14 @@ impl SubagentExecutor {
     ) -> Result<(AgentDefinition, Option<ModelScopeConfig>, Option<String>), SubagentError> {
         let cfg = self.discovery_config(cwd, roots)?;
         let result = discover_agents(&cfg, Some(scope))?;
-        let model_scope = result.model_scope.clone();
+        // SUBA-155 — capture the parent session's scoped-model snapshot into the policy at LAUNCH
+        // (see [`Self::scoped_model_snapshot`]). The report surfaces deliberately keep reading
+        // `discovered.model_scope` raw, so `/subagents-models` still prints the `scoped` token the
+        // operator wrote rather than the ids it happens to stand for right now.
+        let model_scope = result
+            .model_scope
+            .as_ref()
+            .map(|policy| policy.with_scoped_snapshot(&self.scoped_model_snapshot()));
         let max_thinking = result.max_thinking.clone();
         // pi v0.43.0 routes EVERY execution-path agent lookup through `resolveAgentName`
         // (`subagent-executor.ts:1675-1680`'s `canonicalizeAgentName`, `preflight.ts:228`), so the
@@ -360,6 +367,44 @@ impl SubagentExecutor {
         Ok(Self::discovery_config_on_disk(cwd, roots)?
             .override_settings
             .model_scope())
+    }
+
+    /// SUBA-155 — this session's scoped-model snapshot as `provider/id` ids: pi's
+    /// `scopedModelIdsFromContext(ctx)` (`src/runs/shared/model-resolution.ts:66` @v0.75.0, read at
+    /// every launch — `subagent-executor.ts:1395,1827,2098,2227`), over
+    /// [`cyrup_ext::host::HostServices::scoped_models`] (pi's `ctx.scopedModels`, the set
+    /// `/scoped-models` shows).
+    ///
+    /// Empty with no host bound (headless / SDK-embedder) or with no scoping configured, which is
+    /// upstream's own "empty when no scoping is configured" and leaves a `scoped` allow token to
+    /// degrade to `inherit` semantics.
+    #[must_use]
+    pub fn scoped_model_snapshot(&self) -> Vec<String> {
+        crate::exec::model_scope::scoped_model_ids_from_host(
+            self.host_services().map(|s| s.scoped_models()).as_ref(),
+        )
+    }
+
+    /// SUBA-155 — [`Self::resolve_model_scope`] with this session's scoped-model snapshot captured
+    /// into it, for the launch paths that resolve a whole PLAN's policy up front (a foreground
+    /// `/chain`//`/parallel`, and a background run whose policy is serialized into
+    /// [`crate::background::runner_main::RunnerConfig`]).
+    ///
+    /// The capture is what makes a background run enforce the snapshot its parent held when the
+    /// run was LAUNCHED — upstream's rule for background runs ("background runs keep the set
+    /// captured at start") — in a process that has no host to ask.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::resolve_model_scope`].
+    pub fn resolve_model_scope_for_launch(
+        &self,
+        cwd: &Path,
+        roots: &crate::paths::Roots,
+    ) -> Result<Option<ModelScopeConfig>, SubagentError> {
+        Ok(Self::resolve_model_scope(cwd, roots)?
+            .as_ref()
+            .map(|policy| policy.with_scoped_snapshot(&self.scoped_model_snapshot())))
     }
 
     /// Plan-time persona map (T0.1's C13 root-cause seam): resolve every DISTINCT agent named across

@@ -1020,7 +1020,7 @@ impl SubagentExecutor {
             // SUBA-155 — the canonical agent name selects any `modelScope.agents.<name>` rule.
             &agent_config.name,
         )
-        .map_err(|violation| SubagentError::ModelOutOfScope(violation.message))?;
+        .map_err(|refusal| SubagentError::ModelOutOfScope(refusal.message()))?;
         // SUBA-119 — the same three inputs the resolution above just consumed, read for pi's
         // `modelOverrideFromParent` (`execution.ts:1836`). It must be computed HERE: once
         // `resolve_model_inheritance` has returned `Explicit(model)`, a parent-inherited model and a

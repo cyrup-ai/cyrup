@@ -1038,15 +1038,15 @@ fn resolve_model_candidates(
                 .as_ref()
                 .or(opts.preferred_provider.as_ref()),
             // SUBA-155 — the policy plus the two `resolveModelScopesForAgent` inputs
-            // (`model-scope.ts:160` @v0.74.0): this persona's canonical name, which selects any
-            // `modelScope.agents.<name>` rule, and the parent session's model, which the reserved
-            // `inherit`/`scoped` allow tokens expand to. `scoped_model_ids` is unset here — see
-            // `RunOptions::parent_model`.
+            // (`model-scope.ts:161` @v0.75.0): this persona's canonical name, which selects any
+            // `modelScope.agents.<name>` rule, and the parent session's model, which a reserved
+            // `inherit`/`scoped` allow token expands to. The parent's scoped-model snapshot is
+            // already substituted into `opts.model_scope` at launch
+            // (`ModelScopeConfig::with_scoped_snapshot`), so this process needs no host.
             crate::exec::model_scope::ModelScopeContext {
                 config: opts.model_scope.as_ref(),
                 agent_name: &agent.name,
                 parent_model: opts.parent_model.as_ref().map(ModelId::as_str),
-                scoped_model_ids: None,
             },
             opts.model_exclusions.as_deref(),
         );
