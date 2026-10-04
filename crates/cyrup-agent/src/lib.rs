@@ -20,7 +20,10 @@ pub mod state;
 pub mod stream_fn;
 pub mod subscriber;
 
-pub use agent::{Agent, AgentBuilder, HeaderFn, PromptInput, RunHandle, Subscription};
+pub use agent::{
+    Agent, AgentBuilder, HeaderFn, PromptInput, RunHandle, RunToolCallOptions, Subscription,
+    ToolCallOutcome, run_tool_call,
+};
 pub use error::{AgentError, BusyEntry, ContinueSurface, HookError};
 pub use event::{AgentEvent, AgentMessage, AppRole, ToolResultMessage};
 pub use hooks::{

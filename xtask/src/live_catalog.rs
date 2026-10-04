@@ -226,8 +226,33 @@ pub fn http_date_to_iso8601(value: &str) -> Option<String> {
 pub fn refresh(
     specs: &'static [LiveCatalogSpec],
     fetch: &dyn Fn(&str) -> Result<Fetched, String>,
+    only: Option<&[String]>,
 ) -> Result<Vec<(&'static LiveCatalogSpec, LiveOutcome)>, String> {
-    refresh_with(specs, fetch, skip_live_requested())
+    let skip_all = skip_live_requested();
+    refresh_with(specs, fetch, &|spec| skip_reason(spec, skip_all, only))
+}
+
+/// Why this spec is not fetched on this run, or `None` to fetch it.
+///
+/// The two reasons are the same shape on purpose: both leave `<file>.json` byte-for-byte as it is
+/// and both carry the manifest entry forward (D6), and both are PRINTED as a notice naming the
+/// file. A skip nobody is told about is the silent-skip failure `main.rs`'s module docs forbid;
+/// a skip named on stdout, per file, is the `CYRUP_XTASK_SKIP_LIVE` contract that has always
+/// existed here, which is what `--only` reuses rather than inventing a second mechanism.
+pub fn skip_reason(
+    spec: &LiveCatalogSpec,
+    skip_all: bool,
+    only: Option<&[String]>,
+) -> Option<String> {
+    if skip_all {
+        return Some(format!("{SKIP_LIVE_ENV} is set"));
+    }
+    match only {
+        Some(selected) if !selected.iter().any(|s| s == spec.file) => {
+            Some("not named by --only".to_string())
+        }
+        _ => None,
+    }
 }
 
 /// The variable a maintainer with no network sets. Named once, because `main.rs`'s usage block and
@@ -241,20 +266,18 @@ pub fn skip_live_requested() -> bool {
 }
 
 /// [`refresh`] with the skip decision passed in rather than read from the environment.
+///
+/// `skip` answers per spec, so one seam carries both the no-network escape hatch and `--only`'s
+/// named selection; a second branch here would be a second place a fetch could be lost.
 pub fn refresh_with(
     specs: &'static [LiveCatalogSpec],
     fetch: &dyn Fn(&str) -> Result<Fetched, String>,
-    skip_all: bool,
+    skip: &dyn Fn(&LiveCatalogSpec) -> Option<String>,
 ) -> Result<Vec<(&'static LiveCatalogSpec, LiveOutcome)>, String> {
     let mut out = Vec::new();
     for spec in specs {
-        if skip_all {
-            out.push((
-                spec,
-                LiveOutcome::Skipped {
-                    why: format!("{SKIP_LIVE_ENV} is set"),
-                },
-            ));
+        if let Some(why) = skip(spec) {
+            out.push((spec, LiveOutcome::Skipped { why }));
             continue;
         }
         match fetch(&spec.url()) {

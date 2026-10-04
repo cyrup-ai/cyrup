@@ -975,7 +975,10 @@ fn every_model_the_regeneration_added_now_resolves() {
         ("anthropic", "claude-opus-5-5"),
         ("azure-openai-responses", "gpt-6-sol"),
         ("cerebras", "qwen-3.8-27b"),
-        ("cloudflare-ai-gateway", "claude-opus-5.5"),
+        // Dashed since PROV-131: pi's generator applies `nativeId.replaceAll(".", "-")` to this
+        // gateway's `/anthropic` passthrough, which forwards the id to Anthropic unchanged.
+        // `github-copilot` below keeps its dot — the rename is scoped to this one upstream.
+        ("cloudflare-ai-gateway", "claude-opus-5-5"),
         ("cloudflare-workers-ai", "@cf/zai-org/glm-5.3"),
         ("deepseek", "deepseek-flash"),
         ("fireworks", "accounts/fireworks/models/glm-5p3"),

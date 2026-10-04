@@ -1,21 +1,25 @@
 //! Tool preflight: locate the tool, normalize its arguments, validate/coerce them against the
 //! schema, run `before_tool_call` — yielding either a prepared executor or an immediate error
 //! result the model can retry from.
+//!
+//! AGENT-047 — these are free functions over [`ToolCallEnv`], not methods on `RunCtx`. pi made the
+//! same move at v1.0.0: `prepareToolCall` takes `config: ToolCallHooks` and an explicit `tools`
+//! slice instead of the whole `AgentLoopConfig` (`agent-loop.ts:707-714` @v1.0.1), which is what
+//! lets `runToolCall` reuse it without a loop. `RunCtx::prepare` below is the loop's thin adapter.
 
-use super::{Finalized, Prep, PreparedCall};
+use super::{Finalized, Prep, PreparedCall, ToolCallEnv};
 use crate::agent::message::empty_details;
 use crate::agent::run::RunCtx;
 use crate::agent::util::now_millis;
 use crate::event::{AgentMessage, ToolResultMessage};
-use crate::hooks::{AgentContextView, BeforeOutcome, BeforeToolCall};
+use crate::hooks::{BeforeOutcome, BeforeToolCall};
 use cyrup_core::{AssistantMessage, Content, SharedStr, TerminateHint, ToolCall};
 use cyrup_provider::validate_tool_call;
 use serde_json::Value;
 use std::sync::Arc;
 
 impl RunCtx {
-    /// Preflight: locate tool → normalize args (`prepare_arguments`) → validate/coerce → `before_tool_call`.
-    /// Returns an immediate (finalized) error result or a prepared executor (func-02 R-02-019/020/021/022).
+    /// The loop's adapter onto [`prepare_tool_call`]: narrow the run, then run the shared stage.
     pub(super) async fn prepare(
         &self,
         assistant: &AssistantMessage,
@@ -23,162 +27,167 @@ impl RunCtx {
         call: &ToolCall,
         source_index: usize,
     ) -> Prep {
-        let tool = match self.find_tool(&call.name) {
-            Some(t) => t,
-            None => {
-                // AGENT-010 — byte-for-byte pi: `` createErrorToolResult(`Tool ${toolCall.name} not
-                // found`) `` (`packages/agent/src/agent-loop.ts:611` @v0.83.0, identical offset at
-                // v0.84.1). NO quotes around the name; this string reaches the model.
-                return Prep::Immediate(Box::new(self.immediate_error(
-                    call,
-                    source_index,
-                    format!("Tool {} not found", call.name),
-                    TerminateHint::Unspecified,
-                )));
-            }
-        };
-        // Normalize the raw model-emitted arguments via the tool's `prepare_arguments` compat shim
-        // BEFORE schema validation (Pi `prepareToolCallArguments` → `validateToolArguments`,
-        // agent-loop.ts:548-560,578-579). Default impl is identity.
-        let prepared = tool
-            .prepare_arguments(Value::Object((*call.arguments).clone()))
-            .await;
-        // Validate AND coerce against the tool's JSON-Schema `parameters` (R-02-020 / func-01
-        // R-01-034). On failure surface an immediate isError tool-result so the model can retry on
-        // the next turn; the tool is NOT executed.
-        let mut args = match validate_tool_call(tool.parameters(), prepared) {
-            Ok(coerced) => coerced,
-            Err(e) => {
-                return Prep::Immediate(Box::new(self.immediate_error(
-                    call,
-                    source_index,
-                    e.to_string(),
-                    TerminateHint::Unspecified,
-                )));
-            }
-        };
-        // AGENT-012 — pi's `prepareToolCall` has NO pre-hook abort check
-        // (`packages/agent/src/agent-loop.ts:616-656` @v0.83.0): the only two checks are `if
-        // (signal?.aborted)` at `:629`, immediately AFTER `beforeToolCall` returns and BEFORE the
-        // block branch at `:636`, and a second at `:644`. So pi always invokes `beforeToolCall` —
-        // audit logs, permission bookkeeping and ref-counted resources in an extension see every
-        // call even on an aborted run. The check that used to sit here skipped the hook entirely.
-        let before = {
-            let ctx = BeforeToolCall {
-                tool_name: &call.name,
-                tool_call_id: &call.id,
-                args: &mut args,
-                messages: &self.new_messages,
-                assistant_message: assistant,
-                tool_call: call,
-                context: AgentContextView {
-                    system_prompt: &self.system_prompt,
-                    messages: ctx_messages,
-                    tools: &self.tools,
-                },
-            };
-            self.hooks.before_tool_call(ctx, self.cancel.child()).await
-        };
-        match before {
-            // Pi's `prepareToolCall` wraps the `beforeToolCall` await in the same try that guards
-            // argument preparation/validation, and its catch returns
-            // `createErrorToolResult(error instanceof Error ? error.message : String(error))`
-            // (agent-loop.ts:657-662) — the hook's OWN text reaches the model, exactly as the
-            // validation failure two arms up already does. No abort check first: the catch
-            // returns before `if (signal?.aborted)` is reached.
-            BeforeOutcome::Failed(e) => Prep::Immediate(Box::new(self.immediate_error(
+        prepare_tool_call(&self.tool_env(assistant, ctx_messages), call, source_index).await
+    }
+}
+
+/// Preflight: locate tool → normalize args (`prepare_arguments`) → validate/coerce → `before_tool_call`.
+/// Returns an immediate (finalized) error result or a prepared executor (func-02 R-02-019/020/021/022).
+pub(crate) async fn prepare_tool_call(
+    env: &ToolCallEnv<'_>,
+    call: &ToolCall,
+    source_index: usize,
+) -> Prep {
+    let tool = match env.resolve_tool(&call.name) {
+        Some(t) => t,
+        None => {
+            // AGENT-010 — byte-for-byte pi: `` createErrorToolResult(`Tool ${toolCall.name} not
+            // found`) `` (`packages/agent/src/agent-loop.ts:611` @v0.83.0, `:719` @v1.0.1). NO
+            // quotes around the name; this string reaches the model.
+            return Prep::Immediate(Box::new(immediate_error(
+                call,
+                source_index,
+                format!("Tool {} not found", call.name),
+                TerminateHint::Unspecified,
+            )));
+        }
+    };
+    // Normalize the raw model-emitted arguments via the tool's `prepare_arguments` compat shim
+    // BEFORE schema validation (Pi `prepareToolCallArguments` → `validateToolArguments`,
+    // agent-loop.ts:725-726 @v1.0.1). Default impl is identity.
+    let prepared = tool
+        .prepare_arguments(Value::Object((*call.arguments).clone()))
+        .await;
+    // Validate AND coerce against the tool's JSON-Schema `parameters` (R-02-020 / func-01
+    // R-01-034). On failure surface an immediate isError tool-result so the model can retry on
+    // the next turn; the tool is NOT executed.
+    let mut args = match validate_tool_call(tool.parameters(), prepared) {
+        Ok(coerced) => coerced,
+        Err(e) => {
+            return Prep::Immediate(Box::new(immediate_error(
                 call,
                 source_index,
                 e.to_string(),
                 TerminateHint::Unspecified,
-            ))),
-            // AGENT-012 — pi checks the signal the instant the hook returns and BEFORE it looks
-            // at `beforeResult.block` (`agent-loop.ts:629-635` @v0.83.0), so an abort landing
-            // during the hook OUT-VOTES a block and the transcript attributes the stop to the
-            // user rather than to policy.
-            BeforeOutcome::Block { .. } | BeforeOutcome::Proceed if self.cancel.is_cancelled() => {
-                Prep::Immediate(Box::new(self.immediate_error(
+            )));
+        }
+    };
+    // AGENT-012 — pi's `prepareToolCall` has NO pre-hook abort check
+    // (`packages/agent/src/agent-loop.ts:616-656` @v0.83.0): the only two checks are `if
+    // (signal?.aborted)` at `:737` @v1.0.1, immediately AFTER `beforeToolCall` returns and BEFORE
+    // the block branch at `:744`, and a second at `:756`. So pi always invokes `beforeToolCall` —
+    // audit logs, permission bookkeeping and ref-counted resources in an extension see every
+    // call even on an aborted run. The check that used to sit here skipped the hook entirely.
+    let before = {
+        let ctx = BeforeToolCall {
+            tool_name: &call.name,
+            tool_call_id: &call.id,
+            args: &mut args,
+            messages: env.new_messages,
+            assistant_message: env.assistant,
+            tool_call: call,
+            context: env.context,
+        };
+        env.hooks.before_tool_call(ctx, env.hook_cancel()).await
+    };
+    match before {
+        // Pi's `prepareToolCall` wraps the `beforeToolCall` await in the same try that guards
+        // argument preparation/validation, and its catch returns
+        // `createErrorToolResult(error instanceof Error ? error.message : String(error))`
+        // (agent-loop.ts:769-775 @v1.0.1) — the hook's OWN text reaches the model, exactly as the
+        // validation failure two arms up already does. No abort check first: the catch
+        // returns before `if (signal?.aborted)` is reached.
+        BeforeOutcome::Failed(e) => Prep::Immediate(Box::new(immediate_error(
+            call,
+            source_index,
+            e.to_string(),
+            TerminateHint::Unspecified,
+        ))),
+        // AGENT-012 — pi checks the signal the instant the hook returns and BEFORE it looks
+        // at `beforeResult.block` (`agent-loop.ts:737-743` @v1.0.1), so an abort landing
+        // during the hook OUT-VOTES a block and the transcript attributes the stop to the
+        // user rather than to policy.
+        BeforeOutcome::Block { .. } | BeforeOutcome::Proceed if env.is_cancelled() => {
+            Prep::Immediate(Box::new(immediate_error(
+                call,
+                source_index,
+                "Operation aborted",
+                TerminateHint::Unspecified,
+            )))
+        }
+        BeforeOutcome::Block { reason, terminate } => Prep::Immediate(Box::new(immediate_error(
+            call,
+            source_index,
+            // AGENT-010 + AGENT-032(a) — pi is
+            // `createErrorToolResult(beforeResult.reason || "Tool execution was
+            // blocked")` (`agent-loop.ts:639` @v0.83.0, `:745` @v1.0.1). `||` is
+            // JS-FALSY, so an empty-string reason yields the DEFAULT text; an
+            // `Option`-only fallback let `Some("")` through as an empty text content
+            // block, which Anthropic's Messages API rejects with a 400. The
+            // extension seam can produce exactly that (`block(some(""))`).
+            reason
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "Tool execution was blocked".to_string()),
+            // AGENT-022 — `if (beforeResult.terminate === true) { result.terminate =
+            // true; }` (`agent-loop.ts:746-748` @v1.0.1).
+            terminate,
+        ))),
+        // Args mutated in place are executed as-is, WITHOUT re-validation (R-02-022).
+        BeforeOutcome::Proceed => {
+            // pi's SECOND abort check, outside the `if (config.beforeToolCall)` block
+            // (`agent-loop.ts:644-650` @v0.83.0, `:756-762` @v1.0.1).
+            if env.is_cancelled() {
+                Prep::Immediate(Box::new(immediate_error(
                     call,
                     source_index,
                     "Operation aborted",
                     TerminateHint::Unspecified,
                 )))
-            }
-            BeforeOutcome::Block { reason, terminate } => Prep::Immediate(Box::new(
-                self.immediate_error(
-                    call,
+            } else {
+                Prep::Ready(PreparedCall {
                     source_index,
-                    // AGENT-010 + AGENT-032(a) — pi is
-                    // `createErrorToolResult(beforeResult.reason || "Tool execution was
-                    // blocked")` (`agent-loop.ts:639` @v0.83.0, `:637` @v0.84.1). `||` is
-                    // JS-FALSY, so an empty-string reason yields the DEFAULT text; an
-                    // `Option`-only fallback let `Some("")` through as an empty text content
-                    // block, which Anthropic's Messages API rejects with a 400. The
-                    // extension seam can produce exactly that (`block(some(""))`).
-                    reason
-                        .filter(|s| !s.is_empty())
-                        .unwrap_or_else(|| "Tool execution was blocked".to_string()),
-                    // AGENT-022 — `if (beforeResult.terminate === true) { result.terminate =
-                    // true; }` (`agent-loop.ts:637-645` @v0.84.1).
-                    terminate,
-                ),
-            )),
-            // Args mutated in place are executed as-is, WITHOUT re-validation (R-02-022).
-            BeforeOutcome::Proceed => {
-                // pi's SECOND abort check, outside the `if (config.beforeToolCall)` block
-                // (`agent-loop.ts:644-650` @v0.83.0, `:648` @v0.84.1).
-                if self.cancel.is_cancelled() {
-                    Prep::Immediate(Box::new(self.immediate_error(
-                        call,
-                        source_index,
-                        "Operation aborted",
-                        TerminateHint::Unspecified,
-                    )))
-                } else {
-                    Prep::Ready(PreparedCall {
-                        source_index,
-                        tool,
-                        args,
-                        call_id: call.id.clone(),
-                        tool_name: call.name.clone(),
-                    })
-                }
+                    tool,
+                    args,
+                    call_id: call.id.clone(),
+                    tool_name: call.name.clone(),
+                })
             }
         }
     }
+}
 
-    /// Pi `createErrorToolResult(message)` (`packages/agent/src/agent-loop.ts:756-761` @v0.83.0):
-    /// `{ content: [{type:"text", text: message}], details: {} }` — an object literal for `details`
-    /// and NO `terminate` key. `terminate` is stamped onto it only by the v0.84.1 blocked-call arm
-    /// (`agent-loop.ts:637-645`, AGENT-022), which is what the `terminate` parameter carries.
-    pub(super) fn immediate_error(
-        &self,
-        call: &ToolCall,
-        source_index: usize,
-        msg: impl Into<SharedStr>,
-        terminate: TerminateHint,
-    ) -> Finalized {
-        // AGENT-009 — `details: {}`, not absent: pi writes the empty object literal, so the JSONL
-        // transcript records `"details":{}` and `tool_execution_end.result` carries the key.
-        let message = ToolResultMessage {
-            tool_call_id: call.id.clone(),
-            tool_name: call.name.clone(),
-            content: vec![Content::text(msg)],
-            details: Some(empty_details()),
-            // Pi's `createErrorToolResult` builds `{content, details:{}}` and nothing else
-            // (agent-loop.ts:756-761): a call that did not run reports no usage and cannot have
-            // introduced a tool, so an error result never anchors deferred tool loading.
-            usage: None,
-            added_tool_names: Vec::new(),
-            is_error: true,
-            // Pi `createToolResultMessage` stamps every tool result with `Date.now()`
-            // (agent-loop.ts:741); this reaches the wire payload via `convert_to_llm`.
-            timestamp: now_millis(),
-        };
-        // pi's blocked-with-terminate arm assigns `result.terminate = true` only when the hook asked
-        // for it; every other error result leaves the key absent. `createErrorToolResult` builds
-        // `{content, details:{}}` and nothing else, so there is no structured half either
-        // (AGENT-045) — an unknown tool, a validation failure, a block and an abort all report none.
-        Finalized::new(source_index, message, terminate, None)
-    }
+/// Pi `createErrorToolResult(message)` (`packages/agent/src/agent-loop.ts:756-761` @v0.83.0):
+/// `{ content: [{type:"text", text: message}], details: {} }` — an object literal for `details`
+/// and NO `terminate` key. `terminate` is stamped onto it only by the v0.84.1 blocked-call arm
+/// (`agent-loop.ts:746-748` @v1.0.1, AGENT-022), which is what the `terminate` parameter carries.
+pub(crate) fn immediate_error(
+    call: &ToolCall,
+    source_index: usize,
+    msg: impl Into<SharedStr>,
+    terminate: TerminateHint,
+) -> Finalized {
+    // AGENT-009 — `details: {}`, not absent: pi writes the empty object literal, so the JSONL
+    // transcript records `"details":{}` and `tool_execution_end.result` carries the key.
+    let message = ToolResultMessage {
+        tool_call_id: call.id.clone(),
+        tool_name: call.name.clone(),
+        content: vec![Content::text(msg)],
+        details: Some(empty_details()),
+        // Pi's `createErrorToolResult` builds `{content, details:{}}` and nothing else
+        // (agent-loop.ts:756-761): a call that did not run reports no usage and cannot have
+        // introduced a tool, so an error result never anchors deferred tool loading.
+        usage: None,
+        added_tool_names: Vec::new(),
+        is_error: true,
+        // Pi `createToolResultMessage` stamps every tool result with `Date.now()`
+        // (agent-loop.ts:741); this reaches the wire payload via `convert_to_llm`.
+        timestamp: now_millis(),
+    };
+    // pi's blocked-with-terminate arm assigns `result.terminate = true` only when the hook asked
+    // for it; every other error result leaves the key absent. `createErrorToolResult` builds
+    // `{content, details:{}}` and nothing else, so there is no structured half either
+    // (AGENT-045) — an unknown tool, a validation failure, a block and an abort all report none.
+    // `createErrorToolResult` builds `{content, details:{}}` — no `isError` key either, so the
+    // RESULT object reports none even though the OUTCOME is an error (AGENT-046).
+    Finalized::new(source_index, message, terminate, None, false)
 }

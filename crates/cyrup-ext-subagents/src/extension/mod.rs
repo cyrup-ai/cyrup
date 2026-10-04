@@ -92,9 +92,9 @@ pub use executor::foreground_control::ForegroundChildSteerHandle;
 pub(crate) use executor::foreground_control::ForegroundChildEntry;
 pub use host::SubagentsExtension;
 pub use host::registration::{
-    INSTALL_ENV_VAR, RegistrationMode, is_installed, is_installed_with, registration_mode_from_env,
-    resolve_registration_mode, subagent_extension_for, subagent_extension_for_env,
-    subagent_extension_for_env_with_channels,
+    INSTALL_ENV_VAR, RegistrationMode, is_installed, is_installed_with, registration_mode_for_env,
+    registration_mode_from_env, resolve_registration_mode, subagent_extension_for,
+    subagent_extension_for_env, subagent_extension_for_env_with_channels,
 };
 pub use tool::SubagentTool;
 pub use wait_tool::WaitTool;
@@ -119,7 +119,11 @@ pub(crate) use tool::schema::sj_acceptance_override;
 pub(crate) use tool::text::subagent_actions;
 
 /// The literal, stable extension id every registration/log/doctor surface refers to.
-pub(crate) const EXTENSION_ID: &str = "subagents";
+///
+/// `pub` because `crates/cyrup/src/session_launch.rs` must name the extension it is QUARANTINING
+/// when this one declines to be built (SUBA-166): the placeholder carries the refused built-in's
+/// own id, and a second literal there would be free to drift from this one.
+pub const EXTENSION_ID: &str = "subagents";
 
 /// The single LLM-visible tool name (R-SA-128). Also the name a persona lists in its own `tools:`
 /// to be granted nested delegation — pi's `fanoutAuthorized = declaredBuiltinTools.includes(

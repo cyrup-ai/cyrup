@@ -36,6 +36,8 @@ pub use builder::AgentBuilder;
 pub use facade::Subscription;
 pub use lifecycle::RunHandle;
 pub use prompt::PromptInput;
+/// AGENT-047 — the programmatic single-call entry point (pi's exported `runToolCall`).
+pub use run::tools::single::{RunToolCallOptions, ToolCallOutcome, run_tool_call};
 
 // `crate::agent::{RunEntry, RunCtx, …}` — the paths `crate::loop_fn` imports; keep them resolving.
 pub(crate) use run::{PromptSource, ResumePoint, RunBaseline, RunCtx, RunEntry, RunShared};

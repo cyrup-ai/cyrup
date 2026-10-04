@@ -20,10 +20,68 @@
 //! that EXISTS but fails to parse as valid JSON IS surfaced as a warning on stderr (never silently
 //! swallowed, so a hand-edited typo is discoverable) and this function still falls back to the
 //! default rather than aborting startup over one malformed optional file.
+//!
+//! # SUBA-166 — except when the file declares a policy
+//!
+//! Warn-and-default is the wrong answer for a file that sets a POLICY key. A typo in `artifactDir`
+//! in a `config.json` that also carries `{"authorityPolicy": {"stopRun": "forbid"}}` or
+//! `permissions` rules used to discard both and run the session with no restrictions at all, with a
+//! single stderr line as the only trace. pi fixed the same fail-open in `9f1c2552` (#2624): its
+//! `loadConfig` (`pi-subagents/src/extension/config.ts:226-240` @v0.75.0) catches the validation
+//! failure, re-reads the file and RETHROWS when it holds any
+//! [`cyrup_ext_subagents::registration::FAIL_CLOSED_CONFIG_KEYS`] key, so only a file declaring
+//! none of them falls back to `{}`. This loader refuses the same files, through
+//! [`SubagentExtensionConfig::invalid_config_disposition`].
 
 use cyrup_config::ConfigDirs;
 use cyrup_ext_subagents::paths::Roots;
-use cyrup_ext_subagents::registration::SubagentExtensionConfig;
+use cyrup_ext_subagents::registration::{InvalidConfigDisposition, SubagentExtensionConfig};
+use std::path::{Path, PathBuf};
+
+/// SUBA-166 — a `config.json` that exists, failed validation, and declares at least one
+/// [`cyrup_ext_subagents::registration::FAIL_CLOSED_CONFIG_KEYS`] key.
+///
+/// Returned instead of the all-defaults config so the extension is never built with the operator's
+/// declared `authorityPolicy`, `permissions` or route identity replaced by the built-in defaults.
+///
+/// The blast radius is pi's: `crate::session_launch::attach_native_extensions` QUARANTINES the one
+/// extension (`crate::session_launch`'s `quarantine`), exactly as pi's loader `load.discard()`s the
+/// factory that threw and records `Failed to load extension: <message>`
+/// (`pi/packages/coding-agent/src/core/extensions/loader.ts:613-630`, `:655` @v1.0.1). The
+/// session is built with the subagents extension absent, the refusal is reported as a fatal
+/// extension-load diagnostic, and the other native built-ins still attach. It used to leave the
+/// launch path instead, which aborted the whole launch over a hand-edited typo.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefusedSubagentConfig {
+    /// The `config.json` that was refused.
+    path: PathBuf,
+    /// The validator's (or serde's) own message — upstream rethrows this very error.
+    message: String,
+    /// The fail-closed keys the file declares, in upstream's list order.
+    keys: Vec<&'static str>,
+}
+
+impl std::fmt::Display for RefusedSubagentConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} is invalid ({}) and sets {}: a declared policy must not be silently discarded and replaced by the built-in defaults",
+            self.path.display(),
+            self.message,
+            self.keys.join(", "),
+        )
+    }
+}
+
+impl std::error::Error for RefusedSubagentConfig {}
+
+impl RefusedSubagentConfig {
+    /// The fail-closed keys that forced the refusal, in upstream's list order.
+    #[must_use]
+    pub fn keys(&self) -> &[&'static str] {
+        &self.keys
+    }
+}
 
 /// Load the SubAgents extension's `config.json` (R-SA-133 tier 3) from
 /// `<dirs.agent_dir>/subagents/config.json`, or fall back to
@@ -36,24 +94,40 @@ use cyrup_ext_subagents::registration::SubagentExtensionConfig;
 /// already resolved. That is the point of the field: one resolution, in the startup phase that
 /// owns layout, instead of four resolvers re-deriving it from the environment deep inside the
 /// crate — where they could, and did, answer differently from each other.
-#[must_use]
-pub fn load_subagent_extension_config(dirs: &ConfigDirs) -> SubagentExtensionConfig {
-    // Every `return` below goes through this, so a config file that is absent, unparseable or
-    // missions-invalid still gets the SAME roots a good one would.
+///
+/// # Errors
+///
+/// SUBA-166 — [`RefusedSubagentConfig`] when the file exists, fails validation or the typed parse,
+/// and declares a [`cyrup_ext_subagents::registration::FAIL_CLOSED_CONFIG_KEYS`] key. Every other
+/// bad-but-present file still warns on stderr and yields the defaults.
+///
+/// The caller ACTS on this error rather than aborting over it — it quarantines the one extension —
+/// which is why the refusal is a `Result` here and not a third variant of the returned config
+/// (`docs/RUST-DESIGN-REVIEW.md`: expected domain outcomes are enum variants, technical failures
+/// that abort the operation are `Result`; this one aborts building THIS extension and nothing
+/// else). `crate::session_launch`'s `SubagentAttachment` is where the three outcomes the launch
+/// path distinguishes are named.
+pub fn load_subagent_extension_config(
+    dirs: &ConfigDirs,
+) -> Result<SubagentExtensionConfig, RefusedSubagentConfig> {
+    // Every defaulting `return` below goes through this, so a config file that is absent,
+    // unparseable or missions-invalid still gets the SAME roots a good one would.
     let rooted = || SubagentExtensionConfig {
         roots: Roots::from_config_dirs(dirs),
         ..SubagentExtensionConfig::default()
     };
     let path = dirs.agent_dir.join("subagents").join("config.json");
     let Ok(bytes) = std::fs::read(&path) else {
-        return rooted();
+        return Ok(rooted());
     };
     // pi `readConfigForUpdate` (`pi-subagents/src/extension/config.ts:15-28`) runs
     // `validateMissionStoreConfig(config.missions)` on the RAW parsed JSON before the typed view
     // is taken, because serde/`ExtensionConfig` field matching alone would silently DROP an
     // unknown key inside the `missions` block rather than refuse it. Upstream throws; this
     // loader's own established convention for a bad-but-present config file is warn-and-default
-    // (see the module docs), so that is what a refused `missions` block gets too.
+    // (see the module docs), so that is what a refused `missions` block gets too — unless the file
+    // declares a fail-closed key, in which case upstream's throw is the only safe answer and
+    // `refuse` produces it (SUBA-166).
     //
     // The same holds for every other raw validator pi's `validateConfig` runs
     // (`extension/config.ts:131-181` @v0.68.0): `artifactDir`, `authorityPolicy` and
@@ -63,39 +137,62 @@ pub fn load_subagent_extension_config(dirs: &ConfigDirs) -> SubagentExtensionCon
     //
     // Keys this port does not read at all get a non-fatal warning each (`config_warnings`): the
     // rest of the file still loads, but nothing the user set disappears silently.
-    match serde_json::from_slice::<serde_json::Value>(&bytes) {
-        Ok(raw) => {
-            if let Err(message) = SubagentExtensionConfig::validate_raw_config(&raw) {
-                eprintln!(
-                    "cyrup: warning: {} is invalid ({message}); using defaults",
-                    path.display()
-                );
-                return rooted();
-            }
-            for warning in SubagentExtensionConfig::config_warnings(&raw) {
-                eprintln!("cyrup: warning: {}: {warning}", path.display());
-            }
+    let raw = serde_json::from_slice::<serde_json::Value>(&bytes).ok();
+    if let Some(raw) = raw.as_ref() {
+        if let Err(message) = SubagentExtensionConfig::validate_raw_config(raw) {
+            return match SubagentExtensionConfig::invalid_config_disposition(raw) {
+                InvalidConfigDisposition::Refuse(keys) => Err(RefusedSubagentConfig {
+                    path,
+                    message,
+                    keys,
+                }),
+                InvalidConfigDisposition::DefaultWithWarning => {
+                    warn_and_default(&path, &format!("is invalid ({message})"), rooted)
+                }
+            };
         }
-        Err(_) => {
-            // Not valid JSON at all — the typed parse below reports it with the existing message.
+        for warning in SubagentExtensionConfig::config_warnings(raw) {
+            eprintln!("cyrup: warning: {}: {warning}", path.display());
         }
     }
+    // A `raw` of `None` is a file that is not valid JSON at all — the typed parse below reports it
+    // with the existing message, and declares no key to fail closed on (upstream's re-read parse
+    // fails the same way and its `readError === error` arm falls through to the log, `:235-237`).
     match serde_json::from_slice::<SubagentExtensionConfig>(&bytes) {
         // `roots` is `#[serde(skip)]`, so a parsed config carries `Default`'s env-derived value.
         // Overwrite it with the binary's own layout: a `config.json` must not be able to decide
         // where a run writes, and the two must not be able to disagree.
-        Ok(cfg) => SubagentExtensionConfig {
+        Ok(cfg) => Ok(SubagentExtensionConfig {
             roots: Roots::from_config_dirs(dirs),
             ..cfg
+        }),
+        Err(err) => match raw
+            .as_ref()
+            .map(SubagentExtensionConfig::invalid_config_disposition)
+        {
+            Some(InvalidConfigDisposition::Refuse(keys)) => Err(RefusedSubagentConfig {
+                path,
+                message: err.to_string(),
+                keys,
+            }),
+            _ => warn_and_default(
+                &path,
+                &format!("is not valid subagents config JSON ({err})"),
+                rooted,
+            ),
         },
-        Err(err) => {
-            eprintln!(
-                "cyrup: warning: {} is not valid subagents config JSON ({err}); using defaults",
-                path.display()
-            );
-            rooted()
-        }
     }
+}
+
+/// The non-policy half of SUBA-166: report the bad file on stderr and use the defaults, which is
+/// pi's `console.error(...)` + `return {}` (`extension/config.ts:238`).
+fn warn_and_default(
+    path: &Path,
+    what: &str,
+    rooted: impl Fn() -> SubagentExtensionConfig,
+) -> Result<SubagentExtensionConfig, RefusedSubagentConfig> {
+    eprintln!("cyrup: warning: {} {what}; using defaults", path.display());
+    Ok(rooted())
 }
 
 #[cfg(test)]
@@ -136,7 +233,7 @@ mod tests {
     fn absent_config_json_yields_defaults() {
         let dir = tempfile::tempdir().expect("tempdir");
         let dirs = dirs_at(dir.path());
-        let cfg = load_subagent_extension_config(&dirs);
+        let cfg = load_subagent_extension_config(&dirs).expect("absent is not an error");
         assert_eq!(cfg, defaults_for(&dirs));
     }
 
@@ -147,7 +244,8 @@ mod tests {
         std::fs::create_dir_all(&subagents_dir).expect("mkdir");
         std::fs::write(subagents_dir.join("config.json"), "not json at all").expect("write");
         let dirs = dirs_at(dir.path());
-        let cfg = load_subagent_extension_config(&dirs);
+        let cfg =
+            load_subagent_extension_config(&dirs).expect("a file that is not JSON declares no key");
         assert_eq!(cfg, defaults_for(&dirs));
     }
 
@@ -164,7 +262,10 @@ mod tests {
         // pi `validateMissionStoreConfig` refuses the whole block; this loader's warn-and-default
         // convention then discards the file rather than honoring a half-understood config.
         let dirs = dirs_at(dir.path());
-        assert_eq!(load_subagent_extension_config(&dirs), defaults_for(&dirs));
+        assert_eq!(
+            load_subagent_extension_config(&dirs).expect("no fail-closed key is declared"),
+            defaults_for(&dirs)
+        );
     }
 
     /// Before this, the loader called only `validate_missions`, so an unknown `authorityPolicy`
@@ -188,7 +289,26 @@ mod tests {
         )
         .expect("write");
         let dirs = dirs_at(dir.path());
-        assert_eq!(load_subagent_extension_config(&dirs), defaults_for(&dirs));
+        // SUBA-166: `authorityPolicy` is a fail-closed key, so the file is REFUSED rather than
+        // replaced by the defaults. Until SUBA-166 this assertion read
+        // `assert_eq!(load_subagent_extension_config(&dirs), defaults_for(&dirs))` — i.e. the
+        // typo'd action silently lifted the whole policy and the session ran anyway.
+        let refused = load_subagent_extension_config(&dirs)
+            .expect_err("a file declaring authorityPolicy must not be replaced by the defaults");
+        assert_eq!(refused.keys(), ["authorityPolicy"]);
+        let shown = refused.to_string();
+        assert!(shown.contains("stopRuns"), "names the bad value: {shown}");
+        assert!(
+            shown.contains(
+                &dirs
+                    .agent_dir
+                    .join("subagents")
+                    .join("config.json")
+                    .display()
+                    .to_string()
+            ),
+            "names the path: {shown}"
+        );
     }
 
     /// The two other formerly-uncalled validators are reached through the same entry point, and
@@ -220,7 +340,11 @@ mod tests {
         )
         .expect("write");
         let dirs = dirs_at(dir.path());
-        assert_eq!(load_subagent_extension_config(&dirs), defaults_for(&dirs));
+        // SUBA-166: no fail-closed key is declared, so warn-and-default is still the answer.
+        assert_eq!(
+            load_subagent_extension_config(&dirs).expect("no fail-closed key is declared"),
+            defaults_for(&dirs)
+        );
     }
 
     /// An upstream key this port never implemented, and a plain typo, are each reported — and
@@ -252,7 +376,9 @@ mod tests {
         std::fs::create_dir_all(&subagents_dir).expect("mkdir");
         std::fs::write(subagents_dir.join("config.json"), raw.to_string()).expect("write");
         assert_eq!(
-            load_subagent_extension_config(&dirs_at(dir.path())).max_subagent_depth,
+            load_subagent_extension_config(&dirs_at(dir.path()))
+                .expect("the file is valid; the keys only warn")
+                .max_subagent_depth,
             5
         );
     }
@@ -267,7 +393,7 @@ mod tests {
             r#"{"missions": {"enabled": false, "retainTerminal": 12}}"#,
         )
         .expect("write");
-        let cfg = load_subagent_extension_config(&dirs_at(dir.path()));
+        let cfg = load_subagent_extension_config(&dirs_at(dir.path())).expect("a valid file");
         let missions = cfg.missions.expect("missions block");
         assert_eq!(missions.enabled, Some(false));
         assert_eq!(missions.retain_terminal, Some(12));
@@ -283,11 +409,123 @@ mod tests {
             r#"{"maxSubagentDepth": 5}"#,
         )
         .expect("write");
-        let cfg = load_subagent_extension_config(&dirs_at(dir.path()));
+        let cfg = load_subagent_extension_config(&dirs_at(dir.path())).expect("a valid file");
         assert_eq!(cfg.max_subagent_depth, 5);
         assert_eq!(
             cfg.global_concurrency_limit,
             SubagentExtensionConfig::default().global_concurrency_limit
+        );
+    }
+
+    /// SUBA-166 — the exact failure pi's `9f1c2552` (#2624) changelog names: an invalid value for
+    /// ANY key used to silently drop `authorityPolicy`, `permissions` and `toolBudget`. A typo in
+    /// `artifactDir` sits beside a real `authorityPolicy`, and the whole file — restriction
+    /// included — was replaced by the all-permissive defaults with one stderr line to show for it.
+    ///
+    /// Mutation killed: making the `validate_raw_config` failure arm warn-and-default again. The
+    /// load then succeeds with `authority_policy: None`, i.e. `stopRun` is no longer forbidden.
+    #[test]
+    fn a_typo_beside_an_authority_policy_refuses_the_file_instead_of_lifting_the_policy() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let subagents_dir = dir.path().join("subagents");
+        std::fs::create_dir_all(&subagents_dir).expect("mkdir");
+        std::fs::write(
+            subagents_dir.join("config.json"),
+            r#"{"artifactDir": "nowhere", "authorityPolicy": {"stopRun": "forbid"}}"#,
+        )
+        .expect("write");
+        let dirs = dirs_at(dir.path());
+
+        let refused = load_subagent_extension_config(&dirs)
+            .expect_err("a declared authorityPolicy must not be replaced by the defaults");
+
+        assert_eq!(refused.keys(), ["authorityPolicy"]);
+        let shown = refused.to_string();
+        assert!(
+            shown.contains(&subagents_dir.join("config.json").display().to_string()),
+            "names the path: {shown}"
+        );
+        assert!(
+            shown.contains(r#"config.artifactDir must be "project", "session", or "temp""#),
+            "carries the validator's own message, as upstream's rethrow does: {shown}"
+        );
+        assert!(
+            shown.contains("must not be silently discarded"),
+            "says why the file was refused: {shown}"
+        );
+    }
+
+    /// SUBA-166 — the other two keys `9f1c2552` added, one of which (`toolBudget`) this port does
+    /// not even read: an unported policy key still means the operator was declaring a policy, so
+    /// it fails closed too rather than waiting for the key to be ported.
+    ///
+    /// Mutation killed: dropping `permissions` or `toolBudget` from `FAIL_CLOSED_CONFIG_KEYS`.
+    #[test]
+    fn permissions_and_an_unported_tool_budget_fail_closed_too() {
+        for (key, body) in [
+            ("permissions", r#""permissions": {"mode": "allow"}"#),
+            ("toolBudget", r#""toolBudget": {"hard": 5}"#),
+        ] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let subagents_dir = dir.path().join("subagents");
+            std::fs::create_dir_all(&subagents_dir).expect("mkdir");
+            std::fs::write(
+                subagents_dir.join("config.json"),
+                format!(r#"{{"artifactDir": "nowhere", {body}}}"#),
+            )
+            .expect("write");
+
+            let Err(refused) = load_subagent_extension_config(&dirs_at(dir.path())) else {
+                panic!("a file declaring {key} must not be replaced by the defaults");
+            };
+            assert_eq!(refused.keys(), [key]);
+        }
+    }
+
+    /// SUBA-166 — the typed-parse arm fails closed on the same list. `maxSubagentDepth: "five"`
+    /// passes every RAW validator (none of them looks at it) and dies in serde, which is the other
+    /// `return rooted()` the row names (`subagent_config.rs:91-97` before this change).
+    ///
+    /// Mutation killed: leaving the typed-parse arm on `warn_and_default`. The load then succeeds
+    /// with `scheduled_runs: None`, i.e. the operator's scheduled-runs policy is gone.
+    #[test]
+    fn a_typed_parse_failure_beside_a_policy_key_refuses_the_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let subagents_dir = dir.path().join("subagents");
+        std::fs::create_dir_all(&subagents_dir).expect("mkdir");
+        std::fs::write(
+            subagents_dir.join("config.json"),
+            r#"{"maxSubagentDepth": "five", "scheduledRuns": {"enabled": true}}"#,
+        )
+        .expect("write");
+
+        let refused = load_subagent_extension_config(&dirs_at(dir.path()))
+            .expect_err("a declared scheduledRuns policy must not be replaced by the defaults");
+
+        assert_eq!(refused.keys(), ["scheduledRuns"]);
+    }
+
+    /// SUBA-166's other half, and the reason the list exists at all: a bad-but-present file that
+    /// declares NO policy key keeps this loader's warn-and-default convention, which is upstream's
+    /// `console.error` + `return {}` (`extension/config.ts:238`).
+    ///
+    /// Mutation killed: failing closed unconditionally — every malformed optional file would then
+    /// abort startup, which is neither this loader's convention nor pi's.
+    #[test]
+    fn a_bad_file_that_declares_no_policy_key_still_defaults() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let subagents_dir = dir.path().join("subagents");
+        std::fs::create_dir_all(&subagents_dir).expect("mkdir");
+        std::fs::write(
+            subagents_dir.join("config.json"),
+            r#"{"artifactDir": "nowhere", "maxSubagentDepth": 5}"#,
+        )
+        .expect("write");
+        let dirs = dirs_at(dir.path());
+
+        assert_eq!(
+            load_subagent_extension_config(&dirs).expect("no policy key is declared"),
+            defaults_for(&dirs)
         );
     }
 
@@ -312,7 +550,7 @@ mod tests {
         )
         .expect("write");
 
-        let cfg = load_subagent_extension_config(&dirs_at(dir.path()));
+        let cfg = load_subagent_extension_config(&dirs_at(dir.path())).expect("a valid file");
 
         // The unrelated settings survive — this is the whole point.
         assert_eq!(

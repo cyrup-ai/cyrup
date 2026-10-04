@@ -264,6 +264,28 @@ recorded as a lead against that row's id and the row is left exactly as it stand
   inventories — and this area's event/host-surface counts (`06:1917`, 31 vs 33) are exactly the
   figures such an addition invalidates. Cyrup-only read.
 
+### cyrup-side changes at `a3786e3e` with no ledger row
+
+- **`cyrup_ext::QuarantinedNative` + `QuarantinedTier`** — S. `crates/cyrup-ext/src/native.rs:1127-1215`,
+  re-exported from `lib.rs`. A placeholder for a native built-in that refuses to be built: it carries the
+  refused id, registers nothing, mirrors the real built-in's `is_ambient` tier so `--no-extensions` drops
+  both together (`SEAM-071`/`SEAM-074`), and returns the refusal from `init` as `ExtError::Registration`,
+  the variant that `Display`s its message verbatim — so the host renders pi's own
+  `Failed to load extension "<id>": <message>` with no wrapper.
+  **Why it exists:** upstream runs every extension factory inside a `try`, so a factory that throws is
+  caught, has its registrations discarded and is recorded as a load failure while the session still
+  *builds* (pi v1.0.1 `packages/coding-agent/src/core/extensions/loader.ts:613-630,655`). A cyrup native
+  is constructed by the embedder *before* the loader sees it, so a built-in that declines to exist has no
+  factory to throw out of, and a refusal had nowhere to go but out of the launch path. This is the general
+  seam for that case, available to any future attach-point refusal — it is not specific to the three
+  built-ins that use it today (`SUBA-166`'s config refusal, `CFG-080`'s tool-budget refusal and
+  `ICOM-082`'s intercom-config refusal, all routed through `cyrup::session_launch::quarantine`). Its first
+  reuse was `ICOM-082`, found by checking the one residual `SUBA-166`'s fix left at the same attach point. `EXT-082`'s open residual — *"a refusal after `init` is only
+  logged"* — is a different seam and is **not** addressed by this.
+  **Cyrup-original surface with no upstream counterpart**, by construction: it exists because pi's
+  mechanism (a throwing factory) is unavailable to a pre-constructed native. New public API in this area
+  with no row of its own; recorded here rather than opened as a gap, since nothing about it is missing.
+
 ---
 
 ## Audit history — everything from here down predates 2026-09-14

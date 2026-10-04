@@ -1694,6 +1694,8 @@ impl Tool for StructuredOutputTool {
             // path, so there is no in-band machine-readable half to carry. Declaring one here
             // would also require an `output_schema`, which this tool does not have.
             structured_content: None,
+            // AGENT-046 — this is the SUCCESS path; a failure here returns `Err(ToolError)`.
+            is_error: false,
             terminate: TerminateHint::Terminate,
         })
     }
@@ -3029,19 +3031,23 @@ pub fn prompt_runtime_from_env(
     // an UNAUTHORISED `{"hard":0}` was exactly such a decode error, and it disabled the budget
     // entirely instead of enforcing it.
     //
-    // **[CYRUP-DELTA] on blast radius, in the safe direction.** pi loses only this extension and
-    // the child keeps running; cyrup has no per-extension quarantine at its native-extension
-    // attach point, so the error travels out of the launch path and the child exits before its
-    // first turn (`crates/cyrup/src/session_launch.rs`). Both refuse to run a budgeted child with
-    // its budget silently removed; cyrup additionally refuses to run it with the rest of the
-    // subagent runtime missing, which for this crate's children is not a survivable state anyway.
+    // The blast radius is upstream's. `crates/cyrup/src/session_launch.rs`'s `quarantine` turns
+    // this `Err` into a `cyrup_ext::QuarantinedNative` standing in for this extension: it
+    // registers nothing (pi's `load.discard()` is therefore exact) and fails `init`, which the
+    // session builder's EXT-S01 containment records as a fatal
+    // `Failed to load extension "subagent-prompt-runtime": …` and then keeps attaching the other
+    // built-ins. Session built without this extension, error reported, exit 1 — pi's
+    // `main.ts:914-922`, statement for statement. This used to travel out of the launch path
+    // instead, so the typo-class failure took the whole launch with it.
     //
-    // The radius is wider than a subagent child, and deliberately so: this decode runs before the
-    // inertness check below, so `attach_native_extensions` is unconditional and a stray or stale
-    // `CYRUP_SUBAGENT_TOOL_BUDGET` refuses a TOP-LEVEL interactive launch too, where pi would
-    // merely have lost one extension. Only the parent writes that variable, so a value present in
-    // a top-level environment is already evidence the environment is not the one this process was
-    // handed — which is the case this arm exists to refuse, not one to make an exception for.
+    // **[CYRUP-DELTA] on the TRIGGER, in the safe direction.** This decode runs before the
+    // inertness check below, so `attach_native_extensions` consults it unconditionally and a stray
+    // or stale `CYRUP_SUBAGENT_TOOL_BUDGET` quarantines this extension in a TOP-LEVEL launch too,
+    // where pi has no `subagent-prompt-runtime` extension loaded at all and therefore nothing to
+    // fail. Only a parent process writes that variable, so its presence in a top-level environment
+    // is already evidence the environment is not the one this process was handed — which is the
+    // case this arm exists to refuse, not one to make an exception for. The radius of the refusal
+    // itself no longer differs, only the set of environments that trips it.
     let tool_budget = crate::exec::tool_budget::decode_tool_budget_env(
         get(crate::exec::tool_budget::TOOL_BUDGET_ENV).as_deref(),
         crate::exec::tool_budget::HardMinimum::from_env(get),

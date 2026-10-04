@@ -1,8 +1,22 @@
 //! The runtime-facing `Tool` trait (arch-00 §3.4; conformance: func-02 §4.3 / func-03 §11).
 //!
 //! Defined here in `cyrup-core`; built-in tools implement it in `cyrup-tools` (arch-03), and
-//! extension tools implement it in `cyrup-ext` (arch-08). Tools signal failure by returning
-//! `Err(ToolError)` (never error text — func-02 R-02-024).
+//! extension tools implement it in `cyrup-ext` (arch-08).
+//!
+//! **A tool reports failure one of two ways, and never as bare text.** The primary path is
+//! `Err(ToolError)` (func-02 R-02-024). The second is an `Ok` result carrying
+//! [`ToolResult::is_error`], for a failure that has structured data worth keeping — see that
+//! field. What both forbid, and what R-02-024 is actually about, is describing a failure ONLY in
+//! `content`: the model must be told it was a failure by the shape of the result, not by reading
+//! the prose.
+//!
+//! AGENT-046 — the single-path wording this module carried was a faithful port of pi's own
+//! `execute` doc at v0.87.1 (`packages/agent/src/types.ts:451`: *"Throw on failure instead of
+//! encoding errors in `content`."*). Upstream REWROTE that line at v1.0.0; at the pin it reads
+//! *"Execute the tool call. Throw on failure, **or return a result with `isError: true`**; do not
+//! only describe the failure in `content`."* (`types.ts:477-480` @v1.0.1). So the two-path wording
+//! above is the port, not a loosening of a cyrup-originated rule, and the "never error text"
+//! half is unchanged on both sides.
 
 use crate::ToolCallId;
 use crate::cancel::CancelToken;
@@ -49,6 +63,30 @@ pub struct ToolResult {
     ///
     /// `None` = absent, which is what every tool that returns only text produces. AGENT-045.
     pub structured_content: Option<serde_json::Value>,
+    /// Report a failure WITHOUT returning `Err` (Pi `AgentToolResult.isError?`,
+    /// `agent/src/types.ts:436-440` @v1.0.1): *"The model sees `content` as an error result, like a
+    /// thrown error, but `details` and `structuredContent` are kept for the UI and programmatic
+    /// callers."*
+    ///
+    /// That sentence is the whole reason the field exists, and the asymmetry is deliberate on both
+    /// sides. An `Err(ToolError)` goes through cyrup's port of `createErrorToolResult`, which
+    /// replaces the result wholesale: [`Self::usage`] is nulled, [`Self::terminate`] is cleared and
+    /// there is no [`Self::structured_content`]. An `Ok` with `is_error: true` keeps all three. A
+    /// tool whose failure carries a machine-readable payload — an MCP tool reporting a tool-level
+    /// error, a command that failed with an exit code and captured output — therefore has a way to
+    /// report it that does not throw the payload away.
+    ///
+    /// `false` = the key is absent upstream, which is what every tool that does not opt in
+    /// produces, so the two-valued Rust field and pi's `boolean | undefined` agree on the wire
+    /// (`result_value_of` emits `isError` only when `true`).
+    ///
+    /// This is the TOOL's own flag and nothing rewrites it: pi's `finalizeExecutedToolCall` spreads
+    /// `{...result}` and never assigns `isError` into the spread (`agent-loop.ts:881-890` @v1.0.1),
+    /// exactly as it never assigns [`Self::added_tool_names`]. The NORMALISED verdict the loop acts
+    /// on — which an `after_tool_call` hook CAN flip, and which a thrown tool or a failing hook
+    /// forces to `true` — is a separate value: `ToolResultMessage::is_error` on the transcript, and
+    /// `isError` on the `tool_execution_end` event and on `cyrup_agent::ToolCallOutcome`. AGENT-046.
+    pub is_error: bool,
     /// Hint to stop the loop after this batch (func-02 §7.7); runtime-only, never persisted.
     /// Three-valued — see [`TerminateHint`] for what each value puts on the wire.
     pub terminate: TerminateHint,
@@ -364,6 +402,10 @@ pub trait Tool: Send + Sync {
         None
     }
 
+    /// Execute the tool call. Return `Err(ToolError)` on failure, or an `Ok` result with
+    /// [`ToolResult::is_error`] set; do not only describe the failure in
+    /// [`ToolResult::content`] (Pi `AgentTool.execute`, `agent/src/types.ts:477-480` @v1.0.1).
+    /// AGENT-046.
     async fn execute(
         &self,
         call_id: ToolCallId,

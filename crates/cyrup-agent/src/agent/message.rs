@@ -89,6 +89,7 @@ pub(super) fn result_value_of(
     added_tool_names: &[String],
     terminate: TerminateHint,
     structured_content: Option<&Value>,
+    tool_is_error: bool,
 ) -> Value {
     let mut obj = serde_json::Map::new();
     obj.insert(
@@ -115,6 +116,14 @@ pub(super) fn result_value_of(
     // key in the event when the call settled on one and omits it when it did not. AGENT-045.
     if let Some(sc) = structured_content {
         obj.insert("structuredContent".to_string(), sc.clone());
+    }
+    // AGENT-046 — the TOOL's own `isError`, which pi's `{...result}` spread carries into
+    // `finalized.result` untouched (`agent-loop.ts:881-890` @v1.0.1) and `JSON.stringify` then
+    // emits. `false` is pi's absent key, so it is omitted — the same rule `addedToolNames` and
+    // `structuredContent` follow. The event's own top-level `isError` is the NORMALISED verdict and
+    // is a different value (see `ToolResult::is_error`).
+    if tool_is_error {
+        obj.insert("isError".to_string(), Value::Bool(true));
     }
     if let Some(t) = terminate.wire() {
         obj.insert("terminate".to_string(), Value::Bool(t));

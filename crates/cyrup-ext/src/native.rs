@@ -1125,6 +1125,97 @@ pub trait NativeExtension: Send + Sync {
     fn set_late_registrar(&self, _registrar: Arc<dyn LateRegistrar>) {}
 }
 
+/// Which of pi's two extension tiers a [`QuarantinedNative`] stands in for, so `--no-extensions`
+/// treats the placeholder exactly as it would have treated the real built-in (SEAM-071/SEAM-074).
+///
+/// Getting this wrong is observable in one direction only, and it is the bad one: a placeholder
+/// that claims the inline tier while the extension it replaces is ambient survives a flag that
+/// drops the real thing, so `cyrup --no-extensions` would report a load failure for an extension
+/// that was never going to load.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QuarantinedTier {
+    /// The quarantined built-in declares [`NativeExtension::is_ambient`] — it stands in for an
+    /// upstream INSTALLED package, the tier `noExtensions` collapses.
+    Ambient,
+    /// The quarantined built-in stands in for pi's inline-factory tier, which no flag about
+    /// discovery touches.
+    Inline,
+}
+
+/// A native built-in whose registration was REFUSED before the extension object could be built —
+/// pi's `load.discard()` + `Failed to load extension: <message>`, available to an embedder that
+/// has no factory to throw out of.
+///
+/// # Why this type exists
+///
+/// Upstream runs every extension factory inside a `try`. A factory that throws is
+/// `load.discard()`ed — every registration it had already made is rolled back — the loader records
+/// `Failed to load extension: <message>`, and the loop goes on to the next extension
+/// (`initializeExtension`, `pi/packages/coding-agent/src/core/extensions/loader.ts:613-630` and
+/// `loadExtension`'s catch at `:655` @v1.0.1; the inline tier has the same catch of its own at
+/// `core/resource-loader.ts:1130-1141`). The session still builds, with that one extension absent.
+///
+/// `cyrup-session-svc`'s build loop already contains a native's `init` failure the same way
+/// (EXT-S01): it records the per-extension diagnostic, keeps loading the rest, and marks it fatal
+/// so the bin reports it and exits 1 in every mode, which is pi's `main.ts:914-922`.
+///
+/// What had no equivalent is a refusal that happens EARLIER than `init`. A native built-in is
+/// constructed by the embedder and handed to the builder, so a built-in that declines to exist at
+/// all — a `config.json` it will not accept, an env payload that does not decode — has no factory
+/// for the loader to catch. The embedder's only options were to drop the extension silently (a
+/// fail-open) or to carry the error out of the attach point (which aborts the whole launch, where
+/// upstream loses one extension). This type is the third option, and it is upstream's: it carries
+/// the refused built-in's own id, registers nothing at all — so `discard()` is trivially exact —
+/// and returns the refusal from [`NativeExtension::init`], which is the one path the EXT-S01
+/// containment loop already treats as pi's per-extension load failure.
+pub struct QuarantinedNative {
+    id: ExtensionId,
+    /// The refusal's own message. Surfaced verbatim, inside the host's
+    /// `Failed to load extension "<id>": …` frame — upstream's message is the thrown `Error`'s.
+    reason: String,
+    tier: QuarantinedTier,
+}
+
+impl QuarantinedNative {
+    /// Quarantine the built-in `id` with `reason` as its load-failure message.
+    ///
+    /// `tier` must be the tier the REAL built-in declares — see [`QuarantinedTier`].
+    pub fn new(id: ExtensionId, reason: impl Into<String>, tier: QuarantinedTier) -> Self {
+        Self {
+            id,
+            reason: reason.into(),
+            tier,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl NativeExtension for QuarantinedNative {
+    fn id(&self) -> ExtensionId {
+        self.id.clone()
+    }
+
+    /// Mirrors the refused built-in's own tier, so the placeholder lives and dies with it under
+    /// `--no-extensions`.
+    fn is_ambient(&self) -> bool {
+        matches!(self.tier, QuarantinedTier::Ambient)
+    }
+
+    /// The throw. [`ExtError::Registration`] is the variant for a registration pi's
+    /// `ExtensionAPI` refuses by throwing inside the factory, and it `Display`s its message
+    /// verbatim, so the host renders exactly upstream's
+    /// `Failed to load extension "<id>": <message>`.
+    async fn init(&self, _api: &mut InitApi) -> Result<(), ExtError> {
+        Err(ExtError::Registration(self.reason.clone()))
+    }
+
+    /// Unreachable in practice: a built-in whose `init` failed is not in the dispatch set. Declared
+    /// because the trait requires it, and inert so that it stays harmless if it ever is reached.
+    async fn on_event(&self, _ev: &HostEvent, _ctx: &HostCtx) -> HookOutcome {
+        HookOutcome::Noop
+    }
+}
+
 /// Wraps a `NativeExtension` into the unified [`Extension`] handle, applying panic containment
 /// (R-08-036): a panicking handler is caught and surfaced as `ExtError::Panicked`, never crashing
 /// the host. The chain then skips it (arch-08 §6.1).

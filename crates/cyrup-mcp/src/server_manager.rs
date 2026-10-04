@@ -1473,14 +1473,17 @@ struct Tables {
     connect_attempts: HashMap<String, Arc<AbortHandle>>,
     /// `acceptedUrlElicitations`.
     ///
-    /// **Permanently empty in production today.** Its only writer is
-    /// [`McpServerManager::remember_url_elicitation`], whose caller is section 05's
-    /// `handleUrlElicitation` dialog (MCP-122, unported); its reader
-    /// [`McpServerManager::has_accepted_url_elicitation`] *is* live, so
-    /// `handle_url_elicitation_required` (`live.rs:1467-1488`) answers `Cancel` on every URL
-    /// elicitation. That is the fail-closed answer and is deliberate — an id that has not been
-    /// through a human must not claim it has — but it is not the *ported* behaviour, which is the
-    /// dialog.
+    /// Written by [`McpServerManager::remember_url_elicitation`] from
+    /// [`McpServerManager::handle_url_elicitation_required`]'s accept arm — upstream's
+    /// `onUrlAccepted` (MCP-606) — and emptied by `close(name)` per server and by `closeAll`
+    /// wholesale. [`McpServerManager::forget_url_elicitation`] is what the server's
+    /// `notifications/elicitation/complete` consults, and its `false` is why a completion for an
+    /// id no human accepted is silent.
+    ///
+    /// It is empty for any generation that installs no elicitation config, because
+    /// `handle_url_elicitation_required` returns `Cancel` before the loop. The slot is filled in
+    /// production by [`crate::runtime::initialize_mcp`] (`runtime.rs:447`), which is
+    /// [`McpServerManager::set_elicitation_config`]'s first production caller.
     accepted_url_elicitations: HashMap<String, HashSet<String>>,
     /// `pendingMetadataPublications`.
     pending_metadata_publications: HashMap<String, PendingPublication>,
@@ -1643,17 +1646,17 @@ impl McpServerManager {
 
     /// `setElicitationConfig(config)`.
     ///
-    /// **Still no production caller.** The slot it writes is now *read* — [`manager_handler_factory`]
-    /// carries whatever is here onto every connection — but nothing writes it: the
-    /// [`crate::runtime::ElicitationHook`] it takes is §5's `registerElicitationHandler` body
-    /// (MCP-121 / MCP-122), and `elicitation.rs` does not exist yet. Step 6 of
-    /// [`crate::runtime::initialize_mcp`] is where it lands, beside step 5's sampling install.
+    /// The slot it writes is *read* by [`manager_handler_factory`], which carries whatever is here
+    /// onto every connection, and it is written in production by
+    /// [`crate::runtime::initialize_mcp`] (`runtime.rs:447`), beside the sampling install. The
+    /// [`crate::runtime::ElicitationHook`] it takes is `crate::elicitation`'s handler.
     ///
-    /// Two consequences remain visible in shipping code until then. No elicitation config can be
-    /// installed, so the `allowUrl` half of upstream's URL gate (`server-manager.ts:801`) is
-    /// unrepresented in `handle_url_elicitation_required`, which tests only the runtime signal. And
-    /// the tuple is still a tuple: §5 replaces it with `ElicitationConfig` so the completion notice
-    /// ([`url_elicitation_complete_notice`]) gets the `notify` route MCP-469 needs.
+    /// The consequence visible in shipping code until then: with the slot empty,
+    /// [`Self::handle_url_elicitation_required`] answers `Cancel` at its first gate, so no URL
+    /// elicitation is ever presented, nothing is recorded as accepted, and the server's
+    /// `notifications/elicitation/complete` is silently dropped. Everything downstream of the slot
+    /// — the `allowUrl` test, the accept arm's `onUrlAccepted` (MCP-606), the completion notice's
+    /// `notify` route — is wired and exercised; the writer is the only missing link.
     pub fn set_elicitation_config(&self, elicitation: Option<crate::runtime::ElicitationConfig>) {
         *self
             .elicitation
@@ -3039,12 +3042,16 @@ impl McpServerManager {
     /// `rememberUrlElicitation(serverName, elicitationId)` (`server-manager.ts:816-824`) — a **no-op
     /// once the runtime signal has fired**, so a stale generation cannot accumulate state.
     ///
-    /// **No production caller.** Upstream calls it from `handleUrlElicitation`'s accept arm — the
-    /// dialog that belongs to section 05 (MCP-122) and is not ported. The registry it fills is
-    /// therefore empty for the whole generation, and its live reader
-    /// [`Self::has_accepted_url_elicitation`] always answers `false`: see
-    /// `Tables::accepted_url_elicitations` for what that costs and why the resulting `Cancel` is the
-    /// correct fail-closed answer rather than a bug.
+    /// Called from [`Self::handle_url_elicitation_required`]'s accept arm, which is upstream's
+    /// `onUrlAccepted: elicitationId => this.rememberUrlElicitation(serverName, elicitationId)`
+    /// (`server-manager.ts:1545`) — MCP-606. Until that wiring landed the registry was empty for
+    /// the whole generation and [`Self::has_accepted_url_elicitation`] could never answer `true`;
+    /// see `Tables::accepted_url_elicitations`.
+    ///
+    /// It is reached only while an elicitation config is installed, which
+    /// [`crate::runtime::initialize_mcp`] does in production (`runtime.rs:447`). With no config
+    /// `handle_url_elicitation_required` returns `Cancel` before the loop, which is the fail-closed
+    /// answer and not this function's concern.
     pub fn remember_url_elicitation(&self, name: &str, elicitation_id: &str) {
         let aborted = self
             .runtime_signal
@@ -3055,6 +3062,15 @@ impl McpServerManager {
         if aborted {
             return;
         }
+        // `this.touch(serverName)` (`server-manager.ts:1555`), ABOVE the set insert and with
+        // upstream's reason: "The browser flow can outlast the call that started it; give the user
+        // one idle timeout to finish and retry." Without it the server the user is being asked to
+        // authorise can idle out mid-browser-flow, so the retry the completion notice invites finds
+        // no connection. MCP-606 — `43768d3`'s third leg, an accepted URL elicitation counting as
+        // server *use*. It is not interchangeable with the call deadline's `pause`
+        // ([`crate::call_deadline`]): that keeps THIS call alive, this keeps the SERVER alive for
+        // the next one.
+        self.touch(name);
         self.tables()
             .accepted_url_elicitations
             .entry(name.to_string())
@@ -3065,11 +3081,12 @@ impl McpServerManager {
     /// `accepted?.delete(notification.params.elicitationId)` — the user is told the interaction
     /// completed **only if this returns `true`** (§3.10).
     ///
-    /// **No production caller.** Its caller is the completion sink
-    /// [`crate::runtime::ElicitationCompleteHook`] (MCP-122), installed through
-    /// [`crate::runtime::ConnectionBuilder::with_handler_factory`] — which has no caller either.
-    /// The `true`/`false` return is the whole point of the pair and is why the delete lives on the
-    /// manager: a duplicate completion notification must be silent.
+    /// Its caller is the completion sink [`crate::runtime::ElicitationCompleteHook`], minted by
+    /// [`manager_handler_factory`] and installed through
+    /// [`crate::runtime::ConnectionBuilder::with_handler_factory`] at `runtime.rs:330` — a
+    /// production path. The `true`/`false` return is the whole point of the pair and is why the
+    /// delete lives on the manager: a duplicate completion notification must be silent, and since
+    /// MCP-606 it must also not `touch` the server.
     pub fn forget_url_elicitation(&self, name: &str, elicitation_id: &str) -> bool {
         self.tables()
             .accepted_url_elicitations
@@ -3077,8 +3094,6 @@ impl McpServerManager {
             .is_some_and(|accepted| accepted.remove(elicitation_id))
     }
 
-    /// Whether an elicitation id is still recorded as accepted for this server.
-    #[must_use]
     /// `handleUrlElicitationRequired(serverName, error)` (`server-manager.ts:800-814`).
     ///
     /// Sequential and short-circuiting: the FIRST non-accept answer ends the loop and is returned,
@@ -3109,9 +3124,38 @@ impl McpServerManager {
             return UrlElicitationAction::Cancel;
         }
         for params in decode_url_elicitations(error) {
+            // `onUrlAccepted` needs the id of the elicitation being handled, and the hook's result
+            // does not carry it, so take it off the params before they are moved into the call.
+            // `decode_url_elicitations` keeps only `UrlElicitationParams`, so this is always `Some`.
+            let elicitation_id = match &params {
+                rmcp::model::ElicitRequestParams::UrlElicitationParams {
+                    elicitation_id, ..
+                } => Some(elicitation_id.clone()),
+                // `ElicitRequestParams` is `#[non_exhaustive]`, and a variant rmcp adds later is
+                // not a URL elicitation with an id this code can name.
+                _ => None,
+            };
             match (config.handler)(server.to_string(), params).await {
                 Ok(result) => match result.action {
-                    rmcp::model::ElicitationAction::Accept => {}
+                    // `onUrlAccepted: elicitationId => this.rememberUrlElicitation(serverName,
+                    // elicitationId)` (`server-manager.ts:1545`). Upstream passes the callback INTO
+                    // `handleUrlElicitation`, which fires it at `elicitation-handler.ts:440` —
+                    // after the browser actually opened and immediately before it returns
+                    // `{ action: "accept" }`. Those are the same condition, so cyrup fires it here
+                    // instead, where the id is in hand: the hook IS `handleUrlElicitation`, and
+                    // threading an extra callback through [`crate::runtime::ElicitationHook`] only
+                    // to have it fire one statement earlier would widen a public seam for nothing.
+                    //
+                    // Without this the accept arm remembered nothing, so
+                    // [`Self::has_accepted_url_elicitation`] could never answer `true`, the
+                    // server's `notifications/elicitation/complete` was dropped by
+                    // [`Self::forget_url_elicitation`]'s `false`, and MCP-606's two `touch` calls
+                    // were unreachable.
+                    rmcp::model::ElicitationAction::Accept => {
+                        if let Some(elicitation_id) = elicitation_id {
+                            self.remember_url_elicitation(server, &elicitation_id);
+                        }
+                    }
                     rmcp::model::ElicitationAction::Decline => {
                         return UrlElicitationAction::Decline;
                     }
@@ -3123,6 +3167,13 @@ impl McpServerManager {
         UrlElicitationAction::Accept
     }
 
+    /// Whether an elicitation id is still recorded as accepted for this server.
+    ///
+    /// **A test accessor with no upstream counterpart.** Upstream reads `acceptedUrlElicitations`
+    /// only through the completion handler's `accepted?.delete(id)`, which is
+    /// [`Self::forget_url_elicitation`]; there is no `has`. It exists so a test can assert that
+    /// the accept arm's `onUrlAccepted` recorded the id without consuming it.
+    #[must_use]
     pub fn has_accepted_url_elicitation(&self, name: &str, elicitation_id: &str) -> bool {
         self.tables()
             .accepted_url_elicitations
@@ -3392,6 +3443,12 @@ pub fn manager_handler_factory(manager: Weak<McpServerManager>) -> crate::runtim
                 if !live.forget_url_elicitation(&event.server, &event.elicitation_id) {
                     return;
                 }
+                // `this.touch(serverName)` (`server-manager.ts:1471`) — BETWEEN the delete and the
+                // notice, and the second half of MCP-606's idle-sweep leg. The notice says "You can
+                // retry the tool now", so the idle clock must restart here or the sentence can be
+                // false by the time it is read. Ordered after the delete deliberately: a duplicate
+                // completion notification must touch nothing, exactly as it notifies nothing.
+                live.touch(&event.server);
                 notify(
                     &url_elicitation_complete_notice(&event.server),
                     cyrup_ext::NotifyKind::Info,
@@ -4787,6 +4844,113 @@ mod tests {
         runtime.cancel();
         manager.remember_url_elicitation("s", "e1");
         assert!(!manager.has_accepted_url_elicitation("s", "e1"));
+    }
+
+    // ── MCP-606 · an accepted URL elicitation counts as server USE ───────────────────────────
+
+    /// `43768d3`'s third leg, the half of MCP-606 that is not the call deadline. Upstream touches
+    /// the server in **both** halves of the browser flow:
+    ///
+    /// * `rememberUrlElicitation` opens with `this.touch(serverName)` (`server-manager.ts:1555`) —
+    ///   "The browser flow can outlast the call that started it; give the user one idle timeout to
+    ///   finish and retry."
+    /// * the `notifications/elicitation/complete` handler touches between the delete and the notice
+    ///   (`:1471`), because the notice it then emits says "You can retry the tool now".
+    ///
+    /// The deadline pause ([`crate::call_deadline`]) cannot stand in for either: it keeps THIS call
+    /// alive, while these keep the SERVER alive for the retry. A server that idles out mid-flow
+    /// makes the completion notice false by the time it is read.
+    #[tokio::test]
+    async fn an_accepted_url_elicitation_and_its_completion_both_count_as_server_use() {
+        let factory = ScriptedFactory::new(Script::Connect, None);
+        let manager = manager(factory as Arc<dyn ConnectionFactory>);
+        let connection = manager.connect("s", &entry(), None).await.unwrap();
+
+        // Age the connection past any idle window, so a missing touch shows up as an idle server
+        // rather than as a sub-millisecond difference between two `now_ms()` reads.
+        connection.last_used_at.store(0, Ordering::SeqCst);
+        assert!(
+            manager.is_idle("s", Duration::from_secs(60)),
+            "precondition: the aged connection really is idle"
+        );
+
+        // An elicitation config whose dialog always accepts — section 05's unported
+        // `handleUrlElicitation`, stood in for.
+        let notices: Arc<std::sync::Mutex<Vec<String>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = Arc::clone(&notices);
+        manager.set_elicitation_config(Some(crate::runtime::ElicitationConfig {
+            mode: crate::runtime::ElicitationMode { allow_url: true },
+            handler: Arc::new(|_server: String, _params| {
+                Box::pin(async {
+                    Ok(rmcp::model::ElicitResult::new(
+                        rmcp::model::ElicitationAction::Accept,
+                    ))
+                })
+                    as BoxFuture<'static, Result<rmcp::model::ElicitResult, rmcp::ErrorData>>
+            }),
+            notify: Arc::new(move |message: &str, _kind| {
+                sink.lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push(message.to_string());
+            }),
+        }));
+        // Half one — accepting the URL, through the PRODUCTION entry point
+        // (`proxy/call.rs:1103`'s callee), so upstream's `onUrlAccepted` is what is exercised and
+        // not `remember_url_elicitation` called by hand.
+        let error = rmcp::model::ErrorData::new(
+            rmcp::model::ErrorCode(URL_ELICITATION_REQUIRED_CODE),
+            "url elicitation required",
+            Some(serde_json::json!({
+                "elicitations": [{
+                    "mode": "url",
+                    "message": "sign in",
+                    "url": "https://example.test/authorize",
+                    "elicitationId": "e1",
+                }],
+            })),
+        );
+        assert_eq!(
+            manager.handle_url_elicitation_required("s", &error).await,
+            crate::proxy::env::UrlElicitationAction::Accept
+        );
+        assert!(
+            manager.has_accepted_url_elicitation("s", "e1"),
+            "the accept arm IS upstream's `onUrlAccepted`, so the id is remembered"
+        );
+        assert!(
+            !manager.is_idle("s", Duration::from_secs(60)),
+            "accepting a URL elicitation must give the browser flow one idle timeout to finish"
+        );
+
+        // Half two — the server's completion notification, through the hook the factory mints.
+        let handler_factory = manager_handler_factory(Arc::downgrade(&manager));
+        let handler = handler_factory("s", &CancelToken::new());
+
+        connection.last_used_at.store(0, Ordering::SeqCst);
+        handler.elicitation_complete("e1");
+        assert_eq!(
+            notices.lock().unwrap_or_else(PoisonError::into_inner).len(),
+            1,
+            "the delete removed one, so the notice fired"
+        );
+        assert!(
+            !manager.is_idle("s", Duration::from_secs(60)),
+            "and the completion restarts the idle clock, so \"You can retry the tool now\" is true"
+        );
+
+        // A duplicate completion must touch nothing, exactly as it notifies nothing.
+        connection.last_used_at.store(0, Ordering::SeqCst);
+        handler.elicitation_complete("e1");
+        assert_eq!(
+            notices.lock().unwrap_or_else(PoisonError::into_inner).len(),
+            1,
+            "a duplicate completion is silent"
+        );
+        assert!(
+            manager.is_idle("s", Duration::from_secs(60)),
+            "and leaves the idle clock alone — the touch is ordered AFTER the delete"
+        );
     }
 
     // ── MCP-116: needs-auth and one-shot credential invalidation ────────────────────────────

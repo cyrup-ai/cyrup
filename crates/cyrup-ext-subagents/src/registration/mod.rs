@@ -585,6 +585,55 @@ pub const UNPORTED_CONFIG_KEYS: [(&str, &str); 10] = [
     ("resultScanLogging", "result-index scan logging"),
 ];
 
+/// SUBA-166 — pi `FAIL_CLOSED_CONFIG_KEYS` (`extension/config.ts:17` @v0.75.0): the `config.json`
+/// keys whose mere PRESENCE turns a validation failure from "warn and use the built-in defaults"
+/// into a refusal of the whole file. Upstream's own comment: explicit route identity, worktree,
+/// checkpoint and tool-surface policies "must not be silently discarded and replaced by the
+/// built-in defaults after validation fails".
+///
+/// `9f1c2552` (#2624) widened the list from eight keys to these eleven by adding `authorityPolicy`,
+/// `permissions` and `toolBudget`, for the failure its changelog names: an invalid value for ANY
+/// key "silently drops `authorityPolicy`, `permissions`, or `toolBudget`".
+///
+/// A closed set that lives with the schema, not with the loader — the keys are a property of what
+/// `config.json` may declare, and three of them
+/// ([`UNPORTED_CONFIG_KEYS`]'s `toolBudget`, plus `disabledFeatures` and `toolActivation`, which
+/// this port has no field for at all) are listed anyway: a key nothing reads yet still means the
+/// operator was declaring a policy, so the list is complete BEFORE those keys are ported and does
+/// not have to be revisited when they are.
+///
+/// Order is upstream's, so [`SubagentExtensionConfig::invalid_config_disposition`] reports the keys
+/// in the order pi declares them.
+pub const FAIL_CLOSED_CONFIG_KEYS: [&str; 11] = [
+    "worktreeProvider",
+    "worktreeBranchPrefix",
+    "modelResponseAliases",
+    "modelExclusions",
+    "checkpointBeforeDeadlineMs",
+    "disabledFeatures",
+    "scheduledRuns",
+    "toolActivation",
+    "authorityPolicy",
+    "permissions",
+    "toolBudget",
+];
+
+/// SUBA-166 — what a `config.json` that EXISTS but failed validation must do, as a named outcome
+/// rather than an empty-vector convention: pi's `loadConfig` (`extension/config.ts:226-240`
+/// @v0.75.0) catches the validation failure, re-reads the file, and rethrows when the object holds
+/// any [`FAIL_CLOSED_CONFIG_KEYS`] key — only a file with none of them falls back to `{}` with a
+/// logged error.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum InvalidConfigDisposition {
+    /// No fail-closed key is set: report the failure and fall back to the built-in defaults, as
+    /// this port's loader has always done (pi's `console.error` + `return {}`).
+    DefaultWithWarning,
+    /// At least one fail-closed key is set, so the file must be refused outright rather than
+    /// replaced by the defaults. Carries the keys that forced it, in [`FAIL_CLOSED_CONFIG_KEYS`]
+    /// order, so the refusal can name what the operator would otherwise have lost.
+    Refuse(Vec<&'static str>),
+}
+
 /// SUBA-128 — the largest `checkpointBeforeDeadlineMs` upstream accepts, as a config value
 /// (`extension/config.ts:149`) and as a tool parameter (`extension/schemas.ts:363`).
 pub const MAX_CHECKPOINT_BEFORE_DEADLINE_MS: u64 = 2_147_483_647;
@@ -862,6 +911,34 @@ impl SubagentExtensionConfig {
         // so a file with both problems reports the one pi would.
         Self::validate_model_response_aliases(raw)?;
         Ok(())
+    }
+
+    /// SUBA-166 — what to do with a `config.json` that exists but failed
+    /// [`Self::validate_raw_config`] (or the typed parse): pi's `loadConfig`
+    /// (`extension/config.ts:226-240` @v0.75.0) rethrows the validation error when the raw object
+    /// holds any [`FAIL_CLOSED_CONFIG_KEYS`] key, and only otherwise logs it and returns `{}`.
+    ///
+    /// Presence is what counts, exactly as upstream's `Object.hasOwn` does — the value is already
+    /// known to be part of a file that failed validation, and an explicit `null` is still a
+    /// declaration the operator made.
+    ///
+    /// A non-object `raw` is [`InvalidConfigDisposition::DefaultWithWarning`]: upstream's
+    /// fail-closed test runs only after the re-read parses to a non-array object
+    /// (`extension/config.ts:234`), and a file that is not a JSON object declares no key at all.
+    #[must_use]
+    pub fn invalid_config_disposition(raw: &serde_json::Value) -> InvalidConfigDisposition {
+        let Some(object) = raw.as_object() else {
+            return InvalidConfigDisposition::DefaultWithWarning;
+        };
+        let present: Vec<&'static str> = FAIL_CLOSED_CONFIG_KEYS
+            .into_iter()
+            .filter(|key| object.contains_key(*key))
+            .collect();
+        if present.is_empty() {
+            InvalidConfigDisposition::DefaultWithWarning
+        } else {
+            InvalidConfigDisposition::Refuse(present)
+        }
     }
 
     /// SUBA-119 — pi `validateModelResponseAliases(config.modelResponseAliases)`
@@ -2355,6 +2432,79 @@ mod tests {
             ConfigTier::ExtensionConfig
         );
     }
+
+    // ---- SUBA-166: `FAIL_CLOSED_CONFIG_KEYS` ----
+
+    /// SUBA-166 — the fail-closed list is upstream's eleven keys, in upstream's order
+    /// (`extension/config.ts:17` @v0.75.0), and the disposition reports every one a bad file
+    /// declares.
+    ///
+    /// Mutation killed: dropping any key from [`FAIL_CLOSED_CONFIG_KEYS`] — the per-key loop then
+    /// reports `DefaultWithWarning` for it, which is the fail-open this row exists to close.
+    #[test]
+    fn every_fail_closed_config_key_forces_a_refusal() {
+        assert_eq!(
+            FAIL_CLOSED_CONFIG_KEYS,
+            [
+                "worktreeProvider",
+                "worktreeBranchPrefix",
+                "modelResponseAliases",
+                "modelExclusions",
+                "checkpointBeforeDeadlineMs",
+                "disabledFeatures",
+                "scheduledRuns",
+                "toolActivation",
+                "authorityPolicy",
+                "permissions",
+                "toolBudget",
+            ],
+            "pi FAIL_CLOSED_CONFIG_KEYS, in pi's own order"
+        );
+
+        for key in FAIL_CLOSED_CONFIG_KEYS {
+            let mut object = serde_json::Map::new();
+            // An explicit `null` — upstream's `Object.hasOwn` sees a declared key whatever the
+            // value is, and the value is already part of a file that failed validation.
+            object.insert(key.to_string(), serde_json::Value::Null);
+            let raw = serde_json::Value::Object(object);
+            assert_eq!(
+                SubagentExtensionConfig::invalid_config_disposition(&raw),
+                InvalidConfigDisposition::Refuse(vec![key]),
+                "'{key}' must force a refusal; an explicit null is still a declaration"
+            );
+        }
+
+        // Several at once, reported in the list's order rather than the file's.
+        assert_eq!(
+            SubagentExtensionConfig::invalid_config_disposition(&serde_json::json!({
+                "permissions": {}, "authorityPolicy": {}, "artifactDir": "nowhere"
+            })),
+            InvalidConfigDisposition::Refuse(vec!["authorityPolicy", "permissions"])
+        );
+    }
+
+    /// SUBA-166 — a file that declares none of the eleven keys, and a file that is not a JSON
+    /// object at all, keep the loader's warn-and-default convention: upstream's fail-closed test
+    /// runs only after the re-read parses to a non-array object (`extension/config.ts:234`).
+    ///
+    /// Mutation killed: returning `Refuse` unconditionally, or treating a non-object as a refusal.
+    #[test]
+    fn a_config_declaring_no_policy_key_defaults_with_a_warning() {
+        for raw in [
+            serde_json::json!({"artifactDir": "nowhere", "maxSubagentDepth": 5}),
+            serde_json::json!({}),
+            serde_json::json!(["worktreeProvider"]),
+            serde_json::json!("worktreeProvider"),
+            serde_json::Value::Null,
+        ] {
+            assert_eq!(
+                SubagentExtensionConfig::invalid_config_disposition(&raw),
+                InvalidConfigDisposition::DefaultWithWarning,
+                "no fail-closed key is declared by {raw}"
+            );
+        }
+    }
+
     // ---- SUBA-119: `config.modelResponseAliases` ----
 
     /// SUBA-119 — the operator surface. `modelResponseAliases` is the ONLY escape from

@@ -664,9 +664,9 @@ pub async fn initialize_mcp(
             needs_discovery.insert(name.clone());
         }
     }
-    // `failedDiscovery` is read only by the arm above; the set exists because upstream's does, and
-    // because the two counts are what a future diagnostic would report.
-    let _ = &failed_discovery;
+    // `failedDiscovery` keeps §11 from spawning the server (it is not `needs_discovery`, and a
+    // `lazy` server is not prewarmed) and is read again by §14's bootstrap filter, which is the
+    // only place the once-per-config property can actually be lost.
 
     // ── §11 — the bounded startup connect pass (MCP-022 / MCP-087 / MCP-130) ───────────────
     // `mode === "keep-alive" || mode === "eager" || needsDiscovery.has(name)` (`init.ts:345-349`).
@@ -728,6 +728,7 @@ pub async fn initialize_mcp(
                         StartupResult {
                             name,
                             definition,
+                            resident,
                             connection: None,
                             error: Some(message),
                             transient: false,
@@ -759,6 +760,7 @@ pub async fn initialize_mcp(
                         StartupResult {
                             name,
                             definition,
+                            resident,
                             connection: Some(connection),
                             error: None,
                             transient: false,
@@ -769,6 +771,7 @@ pub async fn initialize_mcp(
                         StartupResult {
                             name,
                             definition,
+                            resident,
                             connection: None,
                             error: None,
                             transient: false,
@@ -780,6 +783,7 @@ pub async fn initialize_mcp(
                         StartupResult {
                             name,
                             definition,
+                            resident,
                             connection: None,
                             error: Some(error.to_string()),
                             transient,
@@ -1002,12 +1006,17 @@ pub async fn initialize_mcp(
                 }
             }
         }
-        crate::live::update_metadata_cache(
-            &state,
-            &dirs,
-            name,
-            crate::live::MetadataCacheOptions::preserving(),
-        );
+        // `149fdf1` (#788, v5.0.0) DELETES `updateMetadataCache(state, name)` from this loop
+        // (`init.ts:259` of that diff), leaving only `notifyToolMetadataUpdated` and
+        // `markKeepAliveAfterConnect` — MCP-598's third stated failure: "Each discovered server
+        // rereads and rewrites the whole cache file, which upstream measures in seconds with many
+        // large catalogues." §12's merged write already carries every connected server's entry,
+        // captured while its connection was still open, so this was a second whole-file rewrite
+        // per resident server for an entry that was already on disk.
+        //
+        // It also wrote with **no** `startupSnapshot`, i.e. plain last-write-wins, so it could
+        // undo the very three-way merge §12 had just applied and clobber an entry another process
+        // wrote during the pass. The pass now writes the cache exactly once.
         state.notify_tool_metadata_updated(name, "startup");
         state.lifecycle.mark_keep_alive_after_connect(name);
 
@@ -1022,12 +1031,20 @@ pub async fn initialize_mcp(
         }
     }
 
-    // ── §13 — the startup summary (`init.ts:364-372`) ──────────────────────────────────────
-    let connected_count = results
+    // ── §13 — the startup summary (`init.ts:464-472`) ──────────────────────────────────────
+    // `const residentResults = results.filter(r => r.resident)` (`init.ts:464`) — the third half
+    // of `149fdf1` (#788, v5.0.0), and the one with a user-visible shape. Once a non-resident
+    // server is closed the moment its catalogue is captured, counting it as "connected" states
+    // something that is no longer true by the time the line is read: a first run with one
+    // `keep-alive` server beside three `lazy` ones discovered for their direct tools would claim
+    // four servers are connected when one is.
+    let resident_results: Vec<&StartupResult> =
+        results.iter().filter(|result| result.resident).collect();
+    let connected_count = resident_results
         .iter()
         .filter(|result| result.connection.is_some())
         .count();
-    let failed_count = results
+    let failed_count = resident_results
         .iter()
         .filter(|result| result.error.is_some())
         .count();
@@ -1039,12 +1056,13 @@ pub async fn initialize_mcp(
             .notify_on_startup_connect()
     {
         let total_tools = total_tool_count(&state);
-        // `{total}` is `startupServers.length`, NOT the config count: a lazy server that was never
-        // in this pass is not a server that failed to connect.
+        // `{total}` is `residentResults.length` (`init.ts:470`), NOT the config count and no longer
+        // `startupServers.length`: a lazy server that was never in this pass is not a server that
+        // failed to connect, and one this pass closed on purpose is not either.
         let message = if failed_count > 0 {
             format!(
                 "MCP: {connected_count}/{} servers connected ({total_tools} tools)",
-                startup.len()
+                resident_results.len()
             )
         } else {
             format!("MCP: {connected_count} servers connected ({total_tools} tools)")
@@ -1069,14 +1087,25 @@ pub async fn initialize_mcp(
             env_override.as_deref(),
         );
         if !missing.is_empty() {
-            // `filter(name => !results.some(r => r.name === name && r.connection))`
-            // (`init.ts:382`) — a server §11 already connected is cached and not missing.
+            // `missingCacheServers.filter(name => !failedDiscovery.has(name) &&
+            // !results.some(r => r.name === name))` (`init.ts:484`), whose comment reads "startup
+            // already attempted these servers, in this session or in an earlier one that failed."
+            // BOTH conjuncts changed in `149fdf1` (#788, v5.0.0) and both state that one rule:
+            //
+            // * `!failed_discovery` is the EARLIER session. A config whose discovery already failed
+            //   is retried on first USE, not a second time at startup — and §11 cannot enforce that
+            //   alone, because a `lazy` `directTools` server is absent from §11's set entirely and
+            //   reaches the pass only here. Without this conjunct the marker §11 honours is spent
+            //   by §14 on the very same startup, every startup, and the once-per-config property
+            //   the marker exists for never holds at all.
+            // * dropping the old `&& r.connection` is THIS session: a server §11 tried and could
+            //   not connect is not tried again three lines later. The old form retried it, so a
+            //   server that is down was connected to twice per startup.
             let pending: Vec<String> = missing
                 .into_iter()
                 .filter(|name| {
-                    !results
-                        .iter()
-                        .any(|result| &result.name == name && result.connection.is_some())
+                    !failed_discovery.contains(name.as_str())
+                        && !results.iter().any(|result| &result.name == name)
                 })
                 .collect();
             let bootstrap = crate::live::parallel_limit(
@@ -1293,6 +1322,11 @@ pub async fn initialize_mcp(
 struct StartupResult {
     name: String,
     definition: ServerEntry,
+    /// `(definition.lifecycle ?? "lazy") !== "lazy" || getEffectiveIdleTimeoutMinutes(state, name)
+    /// === 0` (`init.ts:361`) — whether this connection outlives the pass. §13 counts only the
+    /// resident results (`init.ts:464`): a server connected purely to read its catalogue and then
+    /// closed is not a server the status line should claim is connected.
+    resident: bool,
     /// `None` for a real failure, for needs-auth (which carries the byte-exact `/mcp-auth` line)
     /// **and** for an abort on a live signal — the last of which carries no `error` either, and is
     /// what pass two skips silently.
@@ -3320,6 +3354,34 @@ impl McpClientHandler {
         self.shared.identity.clone()
     }
 
+    /// Whether `notifications/elicitation/complete` is dispatched at all:
+    /// `if (this.runtimeSignal?.aborted) return;` plus the `if (this.elicitationConfig.allowUrl)`
+    /// registration gate (`server-manager.ts:1466-1468`), collapsed into one dispatch-time test
+    /// because cyrup registers the handler unconditionally and decides here instead.
+    fn elicitation_complete_enabled(&self) -> bool {
+        !self.shared.runtime_signal.is_cancelled() && self.shared.allow_url
+    }
+
+    /// `notifications/elicitation/complete`'s body (`server-manager.ts:1467-1476`), with the
+    /// [`CustomNotification`] envelope left out so it is reachable from a test — the sibling of
+    /// [`Self::elicit`].
+    ///
+    /// The hook is where MCP-606's second `touch` lives: it is minted by
+    /// [`crate::server_manager::manager_handler_factory`], which deletes the accepted id, touches
+    /// the server and only then tells the user the tool can be retried.
+    pub fn elicitation_complete(&self, elicitation_id: &str) {
+        if !self.elicitation_complete_enabled() {
+            return;
+        }
+        let Some(hook) = self.shared.elicitation_complete.as_ref() else {
+            return;
+        };
+        hook(ElicitationCompleteEvent {
+            server: self.shared.server.clone(),
+            elicitation_id: elicitation_id.to_string(),
+        });
+    }
+
     /// `elicitation/create`'s body, with [`RequestContext`] left out so it is reachable from a test.
     ///
     /// `registerElicitationHandler` wires `whilePromptOpen(state, () => handleElicitationRequest(…))`
@@ -3472,15 +3534,14 @@ impl ClientHandler for McpClientHandler {
         _context: NotificationContext<RoleClient>,
     ) -> impl std::future::Future<Output = ()> + MaybeSendFuture + '_ {
         let server = self.shared.server.clone();
-        let allow_url = self.shared.allow_url;
-        let aborted = self.shared.runtime_signal.is_cancelled();
-        let hook = self.shared.elicitation_complete.clone();
+        let this = self.clone();
         async move {
             match notification.method.as_str() {
                 ELICITATION_COMPLETE_METHOD => {
-                    // `if (this.runtimeSignal?.aborted) return;` plus the `allowUrl` registration
-                    // gate, collapsed into one dispatch-time test.
-                    if aborted || !allow_url {
+                    // The gate runs before the parse, so a notification this client never
+                    // registered for logs nothing; [`Self::elicitation_complete`] re-tests it
+                    // because it is also the test-reachable entry point.
+                    if !this.elicitation_complete_enabled() {
                         return;
                     }
                     let Some(elicitation_id) = notification
@@ -3495,11 +3556,7 @@ impl ClientHandler for McpClientHandler {
                         );
                         return;
                     };
-                    let Some(hook) = hook else { return };
-                    hook(ElicitationCompleteEvent {
-                        server,
-                        elicitation_id: elicitation_id.to_string(),
-                    });
+                    this.elicitation_complete(elicitation_id);
                 }
                 STREAM_RESULT_PATCH_METHOD => {
                     // Cut 2. The UI extension is gone; the notification is not an error.

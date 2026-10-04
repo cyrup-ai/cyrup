@@ -2,13 +2,15 @@
 //! while events stay in source order, and the sequential runtime that fully processes each call
 //! before starting the next.
 
+use super::preflight::immediate_error;
 use super::{Batch, Finalized, Prep, PreparedCall, ToolRuntimeMsg};
 use crate::agent::message::update_value;
 use crate::agent::run::{RunCtx, RunFailure};
 use crate::agent::util::panic_message;
 use crate::event::{AgentEvent, AgentMessage};
 use cyrup_core::{
-    AssistantMessage, TerminateHint, ToolCall, ToolError, ToolUpdate, ToolUpdateSink,
+    AssistantMessage, CancelToken, TerminateHint, Tool, ToolCall, ToolCallId, ToolError,
+    ToolResult, ToolUpdate, ToolUpdateSink,
 };
 use futures::future::FutureExt;
 use serde_json::Value;
@@ -19,6 +21,57 @@ use std::task::Poll;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio::task::JoinSet;
+
+/// Pi `executePreparedToolCall` (`packages/agent/src/agent-loop.ts:820-851` @v1.0.1): run the tool
+/// body, convert a throw into an error result, and stop accepting streamed updates the instant it
+/// settles.
+///
+/// AGENT-047 step 2 — the one home of the execute step, shared by both batch runtimes and by
+/// [`super::single::run_tool_call`]. pi reached the same shape by replacing this function's
+/// `AgentEventSink` parameter with a plain `ToolUpdateSink` (`:685`, `:823`) and moving event
+/// construction out into `emitToolExecutionUpdate` (`:778`), which the batch runtimes wrap their
+/// `emit` in. cyrup's [`cyrup_core::ToolUpdateSink`] was ALREADY that plain callback — the tool
+/// trait has never seen an event sink — so the only thing missing was this extraction. The
+/// callers' update closures are the `emitToolExecutionUpdate` equivalents: each pushes onto the
+/// batch's unbounded channel, which the runtime drains into `tool_execution_update` events.
+///
+/// AGENT-003 — the `accepting` gate is pi's `acceptingUpdates` (`:826`, `:838`, `:842`, `:849`) and
+/// is the ONLY drop rule: an update offered after the body settles is ignored, and nothing else is.
+/// It lives here rather than in each caller so the three call sites cannot drift apart on it.
+///
+/// AGENT-016 — pi wraps EVERY execute in try/catch and converts a throw into
+/// `{ result: createErrorToolResult(...), isError: true }` (`:841-847`), identically on every path.
+/// Without `catch_unwind` here a panicking tool kills the spawned task before the batch's
+/// `Finished` send, `remaining` never reaches zero, the slot stays `None`, and the batch emits NO
+/// tool-result message for the call — so the next request carries an assistant `tool_use` with no
+/// matching `tool_result`. `AssertUnwindSafe` is sound for the same reason as in `emit`: the tool
+/// owns no managed-state lock across this await (keeps the crate `#![forbid(unsafe_code)]`).
+pub(crate) async fn execute_prepared(
+    tool: Arc<dyn Tool>,
+    call_id: ToolCallId,
+    args: Value,
+    cancel: CancelToken,
+    mut on_update: ToolUpdateSink,
+) -> Result<ToolResult, ToolError> {
+    let accepting = Arc::new(AtomicBool::new(true));
+    let gate = accepting.clone();
+    let gated: ToolUpdateSink = Box::new(move |u: ToolUpdate| {
+        if gate.load(Ordering::Acquire) {
+            on_update(u);
+        }
+    });
+    let outcome = match std::panic::AssertUnwindSafe(tool.execute(call_id, args, cancel, gated))
+        .catch_unwind()
+        .await
+    {
+        Ok(r) => r,
+        Err(payload) => Err(ToolError::new(panic_message(payload.as_ref()))),
+    };
+    // pi's `finally { acceptingUpdates = false; }` (`:848-850`) — closed on the success and the
+    // throw path alike, BEFORE the caller observes the outcome.
+    accepting.store(false, Ordering::Release);
+    outcome
+}
 
 impl RunCtx {
     /// Parallel batch: `tool_execution_start` in source order, `tool_execution_end` in completion
@@ -98,8 +151,6 @@ impl RunCtx {
             tool_name,
         } in deferred
         {
-            let accepting = Arc::new(AtomicBool::new(true));
-            let acc2 = accepting.clone();
             let utx = tx.clone();
             let ftx = tx.clone();
             let cid = call_id;
@@ -134,40 +185,17 @@ impl RunCtx {
 
                 let mut body = std::pin::pin!(async move {
                     let sink_cid = cid.clone();
+                    // pi `emitToolExecutionUpdate(toolCall, emit)` (`agent-loop.ts:778-787`
+                    // @v1.0.1): the sink the batch hands `executePreparedToolCall`. AGENT-003 —
+                    // never drops: the send only fails once the receiver is gone, and the
+                    // accepting gate lives in `execute_prepared`.
                     let on_update: ToolUpdateSink = Box::new(move |u: ToolUpdate| {
-                        if acc2.load(Ordering::Acquire) {
-                            // AGENT-003 — never drops: the send only fails once the receiver is
-                            // gone.
-                            let _ = utx.send(ToolRuntimeMsg::Update {
-                                call_id: sink_cid.clone(),
-                                partial: u,
-                            });
-                        }
+                        let _ = utx.send(ToolRuntimeMsg::Update {
+                            call_id: sink_cid.clone(),
+                            partial: u,
+                        });
                     });
-                    // AGENT-016 — pi wraps EVERY execute in try/catch/finally and converts a throw
-                    // into `{ result: createErrorToolResult(...), isError: true }`
-                    // (`packages/agent/src/agent-loop.ts:700-703` @v0.83.0, inside
-                    // `executePreparedToolCall` at `:666-707`), identically in the parallel and the
-                    // sequential batch. Without `catch_unwind` here the spawned task dies before the
-                    // `ftx.send` below, `remaining` never reaches zero, the slot stays `None`, and
-                    // the batch emits NO tool-result message for this call — so the next request
-                    // carries an assistant `tool_use` with no matching `tool_result`.
-                    // `AssertUnwindSafe` is sound for the same reason as in `emit`: the tool owns no
-                    // managed-state lock across this await (keeps the crate
-                    // `#![forbid(unsafe_code)]`).
-                    let outcome = match std::panic::AssertUnwindSafe(tool.execute(
-                        cid.clone(),
-                        args,
-                        child,
-                        on_update,
-                    ))
-                    .catch_unwind()
-                    .await
-                    {
-                        Ok(r) => r,
-                        Err(payload) => Err(ToolError::new(panic_message(payload.as_ref()))),
-                    };
-                    accepting.store(false, Ordering::Release);
+                    let outcome = execute_prepared(tool, cid.clone(), args, child, on_update).await;
                     let _ = ftx.send(ToolRuntimeMsg::Finished {
                         call_id: cid,
                         source_index,
@@ -241,7 +269,7 @@ impl RunCtx {
                     // `emitToolExecutionEnd` — no `finalizeExecutedToolCall`, so no
                     // `after_tool_call` (`agent-loop.ts:617-625` @v0.87.1).
                     if let Some(call) = calls.get(source_index) {
-                        let fin = self.immediate_error(
+                        let fin = immediate_error(
                             call,
                             source_index,
                             "Operation aborted",
@@ -316,27 +344,15 @@ impl RunCtx {
                     // AGENT-003 — UNBOUNDED, same reasoning as the parallel path: pi's only drop
                     // rule is `acceptingUpdates` (`agent-loop.ts:672`/`:680` @v0.83.0).
                     let (utx, mut urx) = mpsc::unbounded_channel::<ToolUpdate>();
-                    let accepting = Arc::new(AtomicBool::new(true));
-                    let acc2 = accepting.clone();
                     let on_update: ToolUpdateSink = Box::new(move |u| {
-                        if acc2.load(Ordering::Acquire) {
-                            let _ = utx.send(u);
-                        }
+                        let _ = utx.send(u);
                     });
                     let child = self.cancel.child();
-                    // AGENT-016 — the same `catch_unwind` the parallel batch takes, so the two
-                    // modes match pi's SINGLE try/catch in `executePreparedToolCall`
-                    // (`agent-loop.ts:666-707` @v0.83.0, the throw→error-result conversion at
-                    // `:700-703`). Sequential already unwound to the run task's own `catch_unwind`
-                    // and closed cleanly, but "closed cleanly" is not pi's behaviour either: pi
-                    // finishes the batch with an error tool-result and keeps going.
-                    let exec = std::panic::AssertUnwindSafe(tool.execute(
-                        call.id.clone(),
-                        args.clone(),
-                        child,
-                        on_update,
-                    ))
-                    .catch_unwind();
+                    // AGENT-016/AGENT-003 — the SAME `execute_prepared` the parallel batch runs, so
+                    // the two modes cannot drift from pi's single `executePreparedToolCall`
+                    // (`agent-loop.ts:820-851` @v1.0.1): one try/catch, one accepting gate.
+                    let exec =
+                        execute_prepared(tool, call.id.clone(), args.clone(), child, on_update);
                     tokio::pin!(exec);
                     let outcome = loop {
                         tokio::select! {
@@ -352,23 +368,17 @@ impl RunCtx {
                                     .await?;
                                 }
                             }
-                            r = &mut exec => break match r {
-                                Ok(o) => o,
-                                Err(payload) => {
-                                    Err(ToolError::new(panic_message(payload.as_ref())))
-                                }
-                            },
+                            r = &mut exec => break r,
                         }
                     };
-                    accepting.store(false, Ordering::Release);
                     // AGENT-003 — pi awaits `Promise.all(updateEvents)` AFTER the execute settles,
-                    // on BOTH the success and the throw path (`agent-loop.ts:694-695` / `:698-699`
-                    // @v0.83.0), so an update emitted immediately before the tool returned is still
+                    // on BOTH the success and the throw path (`agent-loop.ts:839` / `:843`
+                    // @v1.0.1), so an update emitted immediately before the tool returned is still
                     // delivered. The `select!` above breaks the instant `exec` completes, which for
                     // a tool that emits synchronously and returns without ever awaiting means the
                     // whole burst is still sitting in the channel — drain it here rather than
-                    // dropping it on the floor. `accepting` is already false, so nothing new can
-                    // arrive; this terminates.
+                    // dropping it on the floor. `execute_prepared` already closed its accepting
+                    // gate, so nothing new can arrive; this terminates.
                     while let Ok(u) = urx.try_recv() {
                         self.emit(AgentEvent::ToolExecutionUpdate {
                             tool_call_id: call.id.clone(),

@@ -450,7 +450,7 @@ Numbering resumes from **`MCP-609`** *(as of the 2026-10-02 pass; now `MCP-612`,
 | `MCP-595` | medium | 13c | `upstream-drift` | **implemented** *(CLOSED 2026-10-04)* | S | the seven-day metadata expiry is gone upstream | [`13c`](13c-mcp-servers.md) |
 | `MCP-596` | medium | 13c | `not-ported` | **implemented** *(CLOSED 2026-10-04)* | M | private metadata scope and `discoveryFailed` are unported | [`13c`](13c-mcp-servers.md) |
 | `MCP-597` | low | 13c | `upstream-drift` | **partial** | S | HTTP header validation scope, and the superseded error message | [`13c`](13c-mcp-servers.md) |
-| `MCP-598` | medium | 13a | `upstream-drift` | **partial** | M | startup discovery should be per server, and should close what it opened | [`13a`](13a-mcp-activation.md) |
+| `MCP-598` | medium | 13a | `upstream-drift` | **implemented** *(CLOSED 2026-10-04)* | M | startup discovery should be per server, and should close what it opened | [`13a`](13a-mcp-activation.md) |
 | `MCP-599` | low | 13a | `not-ported` | **missing** | S | `MCP_RUNTIME_TOOL_CALL_EVENT` | [`13a`](13a-mcp-activation.md) |
 | `MCP-600` | medium | 13e | `parity-bug` | **implemented** *(CLOSED 2026-10-04)* | S | in-flight must be raised before the approval gate, not after it | [`13e`](13e-mcp-tools.md) |
 | `MCP-601` | medium | 13e | `not-ported` | **implemented** *(CLOSED 2026-10-04)* | M | MCP tool annotations are dropped | [`13e`](13e-mcp-tools.md) |
@@ -458,7 +458,7 @@ Numbering resumes from **`MCP-609`** *(as of the 2026-10-02 pass; now `MCP-612`,
 | `MCP-603` | low | 13e | `not-ported` | **missing** | M | observed output shapes | [`13e`](13e-mcp-tools.md) |
 | `MCP-604` | low | 13e | `not-ported` | **missing** | S | register search-mode direct tools at the `deferred` exposure | [`13e`](13e-mcp-tools.md) |
 | `MCP-605` | low | 13d | `upstream-drift` | **partial** | S | the failure reason belongs in the agent-facing backoff messages | [`13d`](13d-mcp-proxy-modes.md) |
-| `MCP-606` | medium | 13i | `not-ported` | **missing** | M | the call deadline must pause while an elicitation prompt is open | [`13i`](13i-mcp-protocol-and-verification.md) |
+| `MCP-606` | medium | 13i | `not-ported` | **implemented** *(CLOSED 2026-10-04)* | M | the call deadline must pause while an elicitation prompt is open | [`13i`](13i-mcp-protocol-and-verification.md) |
 | `MCP-607` | medium | 13i | `stale-port` | **implemented** *(CLOSED 2026-10-04)* | S | `resetTimeoutOnProgress` now has an upstream analogue, and the doc says it does not | [`13i`](13i-mcp-protocol-and-verification.md) |
 | `MCP-608` | low | 13h | `not-ported` | **partial** | S | completions for MCP prompt argument names | [`13h`](13h-mcp-tui.md) |
 
@@ -502,6 +502,16 @@ Numbering resumes from **`MCP-612`**.
 none of which existed before, so the counted set is **548**: `implemented` 347, `partial` 67 + 2 = **69**,
 `missing` 97 + 1 = **98**, `not-applicable` 34. Severity of the three new rows: 3 low. Table F's own
 census above is left as filed.
+
+### Closures — 2026-10-04
+
+Two rows moved to `implemented` in the tables above; the pass censuses themselves are left as filed,
+per the convention this file already follows.
+
+| id | § | what closed it |
+|---|---|---|
+| `MCP-598` | 13a | startup discovery is per server and `failed_discovery` is now read — it was written and discarded (`runtime.rs:669` was `let _ = &failed_discovery;`), and the §14 filter lacked upstream's `!failedDiscovery.has(name)` conjunct |
+| `MCP-606` | 13i | the elicitation `touch` is ported at both of upstream's call sites, so a prompt no longer burns the tool call's own deadline. This row's stated evidence was wrong and is corrected in `13i`: `onUrlAccepted` was already ported, and only the `handleUrlElicitationRequired` error path was missing |
 
 **Corrections appended 2026-10-03 (text only; each note is in the row's own file):**
 

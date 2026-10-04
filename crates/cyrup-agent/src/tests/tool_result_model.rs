@@ -161,6 +161,9 @@ impl Tool for ReportingTool {
             usage: self.usage.clone(),
             added_tool_names: self.added.clone(),
             structured_content: self.structured.clone(),
+            // AGENT-046 — this fixture exercises the SUCCESS shape; the tool-reported-failure
+            // shape has its own file (`agent046_tool_reported_failure.rs`).
+            is_error: false,
             terminate: TerminateHint::Unspecified,
         })
     }
