@@ -56,16 +56,24 @@ pub const DEFAULT_WORKTREE_SETUP_HOOK_TIMEOUT_MS: u64 = 30_000;
 /// cyrup equivalent). When unset, the base directory defaults to [`std::env::temp_dir`].
 pub const WORKTREE_DIR_ENV: &str = "CYRUP_SUBAGENTS_WORKTREE_DIR";
 
-/// pi `MACHINE_DIFF_OPTIONS` (`runs/shared/worktree.ts:23` @v0.68.0) — the flags that make
+/// pi `MACHINE_DIFF_OPTIONS` (`runs/shared/worktree.ts:23` @v0.74.0) — the flags that make
 /// `git diff` output a function of the REPOSITORY rather than of whoever's config it ran under.
 ///
 /// Every one of them closes a way a captured patch can stop describing the worktree it came from:
 /// `--no-color` (a `color.diff = always` config injects ANSI escapes into the patch body),
 /// `--no-ext-diff` / `--no-textconv` (a `.gitattributes` `diff=` driver renders the file instead
 /// of diffing it, so the patch holds a DESCRIPTION of a change rather than the change),
-/// `--default-prefix` and `--no-relative` (`diff.mnemonicPrefix`, `diff.noPrefix` and
-/// `diff.relative` move the `a/`…`b/` prefixes `git apply -p1` expects), `--line-prefix=` (clears
-/// any configured prefix that would be prepended to every output line).
+/// `--src-prefix=a/` / `--dst-prefix=b/` and `--no-relative` (`diff.mnemonicPrefix`,
+/// `diff.noPrefix`, `diff.srcPrefix`/`diff.dstPrefix` and `diff.relative` move the `a/`…`b/`
+/// prefixes `git apply -p1` expects), `--line-prefix=` (clears any configured prefix that would
+/// be prepended to every output line).
+///
+/// The prefix pair is spelled EXPLICITLY rather than as `--default-prefix`, which upstream used
+/// until `1cf63c18` (#2527, v0.73.1) and which this port copied: `git diff --default-prefix` was
+/// only added in git **2.43** (Nov 2023), and an older git exits non-zero with
+/// `error: unknown option 'default-prefix'` having written no diff — which on this code path is
+/// not a degraded patch but a LOST one (see the paragraph below). `--src-prefix=`/`--dst-prefix=`
+/// have been accepted for well over a decade and override the same four config variables.
 ///
 /// This matters here and not merely upstream because a harvested worktree is REMOVED right after
 /// capture ([`crate::spawn::chain_graph`]'s `publish_worktree_handoff`), so the patch is all that
@@ -76,12 +84,16 @@ const MACHINE_DIFF_OPTIONS: &[&str] = &[
     "--no-color",
     "--no-ext-diff",
     "--no-textconv",
-    "--default-prefix",
+    "--src-prefix=a/",
+    "--dst-prefix=b/",
     "--line-prefix=",
     "--no-relative",
 ];
 
-/// pi `MACHINE_PATCH_OPTIONS` (`worktree.ts:24`) — [`MACHINE_DIFF_OPTIONS`] plus `--binary`.
+/// pi `MACHINE_PATCH_OPTIONS` (`worktree.ts:24` @v0.74.0) — [`MACHINE_DIFF_OPTIONS`] plus
+/// `--binary`. Upstream writes it as `[...MACHINE_DIFF_OPTIONS, "--binary"]`, so the two lists
+/// MOVE TOGETHER; here they are spelled out separately and the test
+/// `the_two_machine_option_lists_move_together` holds them to that relationship.
 ///
 /// `--binary` is the difference between a patch and a note saying a patch was not taken: without
 /// it git emits `Binary files a/x.png and b/x.png differ`, which `git apply` cannot apply, so a
@@ -92,7 +104,8 @@ const MACHINE_PATCH_OPTIONS: &[&str] = &[
     "--no-color",
     "--no-ext-diff",
     "--no-textconv",
-    "--default-prefix",
+    "--src-prefix=a/",
+    "--dst-prefix=b/",
     "--line-prefix=",
     "--no-relative",
     "--binary",
@@ -3647,6 +3660,142 @@ mod tests {
         assert!(
             git(repo.path(), &["branch", "--list", &branch]).contains(&branch),
             "a failed removal must leave the branch reaching the child's commits"
+        );
+    }
+
+    /// SUBA-154 — the machine diff/patch argv must carry the EXPLICIT `a/`/`b/` prefix pair, not
+    /// `--default-prefix`.
+    ///
+    /// THE USER ACTION: a fan-out child does its work in a managed worktree on a host whose `git`
+    /// predates 2.43 (Nov 2023) — Debian bookworm, Ubuntu 22.04, RHEL 9, any pinned CI image.
+    /// `git diff --default-prefix` is an `unknown option` there: the capture exits non-zero having
+    /// written NO diff, and since the harvest removes the worktree the moment capture reports, the
+    /// child's work is only recoverable through the preserve gate — i.e. it is not delivered at
+    /// all. Upstream made exactly this change for exactly this reason in `1cf63c18` (#2527,
+    /// v0.73.1): explicit prefixes "work on older Git releases while still overriding
+    /// `diff.noprefix`".
+    ///
+    /// This asserts the argv against upstream's `MACHINE_DIFF_OPTIONS`
+    /// (`src/runs/shared/worktree.ts:23` @v0.74.0) verbatim and in order, because the list IS the
+    /// contract: the order is what makes a re-capture byte-comparable to the stored patch.
+    #[test]
+    fn machine_diff_argv_matches_upstream_and_carries_no_default_prefix() {
+        // `git -C tmp/pi-subagents show v0.74.0:src/runs/shared/worktree.ts`, line 23.
+        const UPSTREAM_MACHINE_DIFF_OPTIONS: &[&str] = &[
+            "--no-color",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--src-prefix=a/",
+            "--dst-prefix=b/",
+            "--line-prefix=",
+            "--no-relative",
+        ];
+        assert_eq!(
+            MACHINE_DIFF_OPTIONS, UPSTREAM_MACHINE_DIFF_OPTIONS,
+            "the machine diff argv must match pi `MACHINE_DIFF_OPTIONS` @v0.74.0 exactly"
+        );
+        assert!(
+            !MACHINE_DIFF_OPTIONS.contains(&"--default-prefix"),
+            "`--default-prefix` needs git >= 2.43; an older git writes no diff at all"
+        );
+        assert!(
+            !MACHINE_PATCH_OPTIONS.contains(&"--default-prefix"),
+            "`--default-prefix` needs git >= 2.43; an older git writes no patch at all"
+        );
+    }
+
+    /// SUBA-154 — upstream spells `MACHINE_PATCH_OPTIONS` as `[...MACHINE_DIFF_OPTIONS,
+    /// "--binary"]` (`worktree.ts:24`), so the two lists cannot drift apart. cyrup spells them out
+    /// separately for readability; this holds them to the same relationship, because
+    /// [`current_worktree_patch`]'s byte-for-byte comparison against the stored patch turns any
+    /// drift between the two into a permanent refusal to preserve a worktree.
+    #[test]
+    fn the_two_machine_option_lists_move_together() {
+        let expected: Vec<&str> = MACHINE_DIFF_OPTIONS
+            .iter()
+            .copied()
+            .chain(std::iter::once("--binary"))
+            .collect();
+        assert_eq!(
+            MACHINE_PATCH_OPTIONS,
+            expected.as_slice(),
+            "MACHINE_PATCH_OPTIONS must be MACHINE_DIFF_OPTIONS plus `--binary`"
+        );
+    }
+
+    /// SUBA-154 — the replacement flags must still beat a hostile prefix configuration.
+    ///
+    /// THE USER ACTION: the repository (or the user's `~/.gitconfig`) sets `diff.noprefix`,
+    /// `diff.mnemonicPrefix` or an explicit `diff.srcPrefix`/`diff.dstPrefix`. Every one of those
+    /// moves or removes the `a/`…`b/` prefixes, and the stored patch then does not apply with
+    /// `git apply -p1` — the form [`validate_worktree_patch`] and every recovery path use. This is
+    /// the behaviour `--default-prefix` was in the list for, so the swap has to preserve it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_hostile_prefix_configuration_still_yields_a_p1_applicable_patch() {
+        let repo = make_real_git_repo();
+        // All four knobs upstream's prefix flags override, set against us at once.
+        git(repo.path(), &["config", "diff.noprefix", "true"]);
+        git(repo.path(), &["config", "diff.mnemonicPrefix", "true"]);
+        git(repo.path(), &["config", "diff.srcPrefix", "SRC/"]);
+        git(repo.path(), &["config", "diff.dstPrefix", "DST/"]);
+
+        let base = tempfile::tempdir().unwrap();
+        let options = CreateWorktreesOptions {
+            base_dir: Some(base.path().to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        let setup = create_worktrees(repo.path(), "prefixwork", 1, Some(&options))
+            .await
+            .expect("create");
+        std::fs::write(setup.worktrees[0].path.join("tracked.txt"), "changed\n").unwrap();
+
+        let diffs_dir = repo.path().join("diffs");
+        let diffs = diff_worktrees(
+            &setup,
+            &["agent-a".to_string()],
+            &diffs_dir,
+            &GitBounds::unbounded(),
+        )
+        .await;
+        assert!(diffs[0].error.is_none(), "{:?}", diffs[0].error);
+
+        let patch = std::fs::read_to_string(&diffs[0].patch_path).unwrap();
+        assert!(
+            patch.contains("--- a/tracked.txt") && patch.contains("+++ b/tracked.txt"),
+            "the capture must force the default prefixes past the config: {patch}"
+        );
+
+        // And the patch really is the `-p1` form every recovery path assumes.
+        let replay = tempfile::tempdir().unwrap();
+        let replay_path = replay.path().join("replay");
+        git(
+            repo.path(),
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                "-f",
+                &replay_path.to_string_lossy(),
+                &setup.base_commit,
+            ],
+        );
+        git(
+            &replay_path,
+            &["apply", "-p1", &diffs[0].patch_path.to_string_lossy()],
+        );
+        assert_eq!(
+            std::fs::read_to_string(replay_path.join("tracked.txt")).unwrap(),
+            "changed\n",
+            "the recovered file must carry the child's work"
+        );
+        git(
+            repo.path(),
+            &[
+                "worktree",
+                "remove",
+                "--force",
+                &replay_path.to_string_lossy(),
+            ],
         );
     }
 }

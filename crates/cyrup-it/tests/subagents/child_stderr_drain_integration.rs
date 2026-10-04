@@ -149,6 +149,9 @@ fn base_run_options(cwd: &Path, model: &str) -> RunOptions {
         structured_output_schema: None,
         model_override: ModelOverride::Inherit,
         preferred_provider: None,
+        // SUBA-155 — a fixture launch has no parent session model, so the reserved
+        // `modelScope` allow tokens stay unexpanded (upstream's fail-closed rule).
+        parent_model: None,
         available_models: vec![ModelId::from(model)],
         cancel: CancelToken::new(),
         interrupt: CancelToken::new(),
@@ -165,6 +168,9 @@ fn base_run_options(cwd: &Path, model: &str) -> RunOptions {
         fork_context: ForkContext::fresh(),
         live_events: None,
         parent_session_id: None,
+        // SUBA-158 — a fixture launch carries no host trust information, which is pi's
+        // `undefined` arm: the child decides for itself, exactly as before the field existed.
+        parent_project_trusted: None,
         clarify: None,
         orchestrator_intercom_target: None,
         run_id: None,

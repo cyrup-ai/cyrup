@@ -159,12 +159,14 @@ fn spread(map: &mut JsonMap<String, Value>, identity: &[(String, Value)]) {
 /// resource tool reports `{server, resourceUri}`, a normal tool `{server, tool: originalName}`, and
 /// an unresolved name falls back to `{server, requestedTool}`.
 fn disabled_call_result(
+    blocked: &indexmap::IndexMap<String, crate::project_server_trust::ProjectServerBlock>,
     disabled_server: &str,
     tool_name: &str,
     metadata: Option<&ToolMetadata>,
 ) -> ToolResult {
     let message = format!(
-        "Server \"{disabled_server}\" is disabled. Run /mcp enable {disabled_server} and /reload to enable it."
+        "Server \"{disabled_server}\" is {}",
+        crate::project_server_trust::disabled_server_reason(Some(blocked), disabled_server)
     );
     let mut map = details_err("call", McpErrorCode::ServerDisabled);
     match metadata {
@@ -239,12 +241,17 @@ pub async fn execute_call(
             ctx.with_metadata(|metadata| get_single_tool_match(metadata.get(&hint), tool_name));
         match matched {
             SingleMatch::Ambiguous => return Ok(ambiguous_tool_result("call", tool_name)),
-            SingleMatch::One(found) => tool_meta = Some(found),
+            SingleMatch::One(found) => tool_meta = Some(*found),
             SingleMatch::None => {}
         }
         // The disabled check runs AFTER resolution so the error can name the resolved tool.
         if ctx.is_disabled(&hint) {
-            return Ok(disabled_call_result(&hint, tool_name, tool_meta.as_ref()));
+            return Ok(disabled_call_result(
+                ctx.blocked_project_servers(),
+                &hint,
+                tool_name,
+                tool_meta.as_ref(),
+            ));
         }
     } else {
         // ---- Phase 2 — no hint: the ambiguity gate, then two ordered scans -----------------------
@@ -317,7 +324,12 @@ pub async fn execute_call(
                 tool_meta = Some(found);
             }
             (None, Some((disabled, found))) => {
-                return Ok(disabled_call_result(&disabled, tool_name, Some(&found)));
+                return Ok(disabled_call_result(
+                    ctx.blocked_project_servers(),
+                    &disabled,
+                    tool_name,
+                    Some(&found),
+                ));
             }
             (None, None) => {}
         }
@@ -331,7 +343,7 @@ pub async fn execute_call(
                 .with_metadata(|metadata| get_single_tool_match(metadata.get(&hint), tool_name))
             {
                 SingleMatch::Ambiguous => return Ok(ambiguous_tool_result("call", tool_name)),
-                SingleMatch::One(found) => tool_meta = Some(found),
+                SingleMatch::One(found) => tool_meta = Some(*found),
                 SingleMatch::None => {}
             }
         } else {
@@ -358,7 +370,7 @@ pub async fn execute_call(
                                     SingleMatch::Ambiguous => {
                                         return Ok(ambiguous_tool_result("call", tool_name));
                                     }
-                                    SingleMatch::One(found) => tool_meta = Some(found),
+                                    SingleMatch::One(found) => tool_meta = Some(*found),
                                     SingleMatch::None => {
                                         let suggestions = ctx.suggestions(tool_name, 5);
                                         let mut map = details_err(
@@ -400,7 +412,7 @@ pub async fn execute_call(
                 if tool_meta.is_none()
                     && ctx.env.get_connection(&hint) == Some(ConnectionStatus::NeedsAuth)
                 {
-                    let message = get_auth_required_message(ctx.settings(), &hint);
+                    let message = get_auth_required_message(ctx.config(), &hint);
                     let mut map = details_err("call", McpErrorCode::AuthRequired);
                     map.insert("server".to_string(), Value::String(hint.clone()));
                     map.insert(
@@ -629,7 +641,7 @@ pub async fn execute_call(
             }
         }
         if connection == Some(ConnectionStatus::NeedsAuth) {
-            let message = get_auth_required_message(ctx.settings(), &server_name);
+            let message = get_auth_required_message(ctx.config(), &server_name);
             let mut map = details_err("call", McpErrorCode::AuthRequired);
             spread(&mut map, &identity);
             map.insert("message".to_string(), Value::String(message.clone()));
@@ -675,7 +687,7 @@ pub async fn execute_call(
                     }
                 }
                 if outcome.needs_auth() {
-                    let message = get_auth_required_message(ctx.settings(), &server_name);
+                    let message = get_auth_required_message(ctx.config(), &server_name);
                     let mut map = details_err("call", McpErrorCode::AuthRequired);
                     spread(&mut map, &identity);
                     map.insert("message".to_string(), Value::String(message.clone()));
@@ -725,7 +737,7 @@ pub async fn execute_call(
             .with_metadata(|metadata| get_single_tool_match(metadata.get(&server_name), tool_name))
         {
             SingleMatch::Ambiguous => return Ok(ambiguous_tool_result("call", tool_name)),
-            SingleMatch::One(found) => tool_meta = found,
+            SingleMatch::One(found) => tool_meta = *found,
             SingleMatch::None => {
                 let available = ctx.tool_names(&server_name);
                 let hint = if available.is_empty() {
@@ -767,6 +779,7 @@ pub async fn execute_call(
     // The definition may have been swapped under a live connection.
     if ctx.is_disabled(&server_name) {
         return Ok(disabled_call_result(
+            ctx.blocked_project_servers(),
             &server_name,
             tool_name,
             Some(&tool_meta),
@@ -782,6 +795,12 @@ pub async fn execute_call(
         .unwrap_or_else(|| Value::Object(JsonMap::new()));
     let resolved_origin =
         origin.unwrap_or_else(|| ApprovalOrigin::for_proxy_call(tool_meta.resource_uri.as_ref()));
+
+    // MCP-600 / `43768d3` — in flight from HERE, not after the gate, so an idle check cannot close
+    // the server while the approval dialog is open. [`InFlightScope`]'s `Drop` is upstream's
+    // `finally`, so the two early returns below still release the slot and restamp `last_used_at`.
+    let _in_flight = InFlightScope::enter(ctx, &server_name);
+
     match ctx
         .env
         .ensure_tool_call_approved(
@@ -841,10 +860,7 @@ pub async fn execute_call(
         cancel: owned.clone(),
     };
 
-    // try { touch; incrementInFlight; … } finally { decrementInFlight; touch }
-    ctx.env.touch(&server_name);
-    ctx.env.increment_in_flight(&server_name);
-    let outcome = invoke(
+    invoke(
         ctx,
         &server_name,
         &tool_meta,
@@ -855,10 +871,47 @@ pub async fn execute_call(
         &latch,
         &owned,
     )
-    .await;
-    ctx.env.decrement_in_flight(&server_name);
-    ctx.env.touch(&server_name);
-    outcome
+    .await
+}
+
+/// `try { touch; incrementInFlight; … } finally { decrementInFlight; touch }` over a
+/// [`ProxyCtx`] — the accounting pair that wraps the approval gate **and** the invocation.
+///
+/// Upstream raises in flight immediately after the final connected check and **before**
+/// `ensureToolCallApproved`, inside the `try` whose `finally` decrements
+/// (`43768d3`, #786, v5.0.0: `proxy-modes.ts:1587-1590`, `direct-tools.ts:252-255`). The commit
+/// body names the bug the move fixes: "Tool calls marked the server in flight only after approval,
+/// so an approval dialog left open past the idle timeout let the check close the server and the
+/// approved call failed."
+///
+/// `Drop` is that `finally`. It covers the denied / `approval_required` early returns, every `?`
+/// inside [`invoke`], and a dropped future — none of which a statement pair after the call could.
+///
+/// [`crate::server_manager::InFlightGuard`] is the same shape one layer down, over an
+/// [`crate::server_manager::McpServerManager`]; this one exists because the proxy reaches the
+/// manager only through [`crate::proxy::env::ProxyEnv`], which a mode test scripts.
+struct InFlightScope<'ctx> {
+    ctx: &'ctx ProxyCtx,
+    server: String,
+}
+
+impl<'ctx> InFlightScope<'ctx> {
+    /// `state.manager.touch(server); state.manager.incrementInFlight(server);`
+    fn enter(ctx: &'ctx ProxyCtx, server: &str) -> Self {
+        ctx.env.touch(server);
+        ctx.env.increment_in_flight(server);
+        Self {
+            ctx,
+            server: server.to_string(),
+        }
+    }
+}
+
+impl Drop for InFlightScope<'_> {
+    fn drop(&mut self) {
+        self.ctx.env.decrement_in_flight(&self.server);
+        self.ctx.env.touch(&self.server);
+    }
 }
 
 /// The body of [`execute_call`]'s `try` — the three result paths and the three catch arms.
@@ -1034,7 +1087,7 @@ async fn catch_arm(
     match error {
         ProxyCallError::SessionRecoveryAuthRequired { auth_message, .. } => {
             let message = auth_message
-                .unwrap_or_else(|| get_auth_required_message(ctx.settings(), server_name));
+                .unwrap_or_else(|| get_auth_required_message(ctx.config(), server_name));
             let mut map = details_err("call", McpErrorCode::AuthRequired);
             spread(&mut map, identity);
             map.insert("message".to_string(), Value::String(message.clone()));
@@ -1291,6 +1344,94 @@ mod tests {
             text_of(&result),
             "MCP tool \"run\" on server \"srv\" is approval-gated and requires an interactive session."
         );
+    }
+
+    // ---- MCP-600 · in flight before the approval gate ------------------------------------------------------
+
+    /// `43768d3` (#786, v5.0.0) — "Tool calls marked the server in flight only after approval, so
+    /// an approval dialog left open past the idle timeout let the check close the server and the
+    /// approved call failed."
+    ///
+    /// [`crate::state::McpServerManager::is_idle`] is `false` exactly while an in-flight count is
+    /// positive, so sampling that count **inside** the gate is sampling what an idle sweep racing
+    /// the dialog would see. Before the fix it was `0`: the sweep was free to close the connection
+    /// the user was about to approve a call on.
+    #[tokio::test]
+    async fn the_server_is_in_flight_while_the_approval_gate_is_open() {
+        let config = config_with(&[("srv", stdio("a"))]);
+        let env = FakeEnv::default().with_connection("srv", ConnectionStatus::Connected);
+        let (ctx, env) = ctx_with(
+            config,
+            &[("srv", vec![ToolMetadata::new("srv_run", "run", "")])],
+            &[],
+            env,
+        );
+        let result = execute_call(&ctx, "srv_run", None, None, &CancelToken::new(), None)
+            .await
+            .unwrap();
+        assert!(
+            result.details.as_ref().unwrap().get("error").is_none(),
+            "the call itself succeeds: {result:?}"
+        );
+        assert_eq!(
+            *env.in_flight_at_approval.lock().unwrap(),
+            Some(1),
+            "the approval gate must run with the server already marked in flight"
+        );
+        assert_eq!(
+            *env.touches_at_approval.lock().unwrap(),
+            Some(1),
+            "`touch` moves with the increment, or `last_used_at` still predates the dialog"
+        );
+        assert_eq!(
+            env.in_flight_of("srv"),
+            0,
+            "the slot is released once the call returns"
+        );
+    }
+
+    /// The other half of upstream's `finally`: the denied and `approval_required` early returns sit
+    /// **inside** the accounting pair, so they must release the slot. A leaked slot pins
+    /// `is_idle` at `false` and the idle sweep never reaps that server again.
+    #[tokio::test]
+    async fn a_denied_call_releases_the_in_flight_slot() {
+        for outcome in [
+            ApprovalOutcome::Denied,
+            ApprovalOutcome::NoInteractiveSession,
+        ] {
+            let config = config_with(&[("srv", stdio("a"))]);
+            let env = FakeEnv::default()
+                .with_connection("srv", ConnectionStatus::Connected)
+                .with_approval(outcome);
+            let (ctx, env) = ctx_with(
+                config,
+                &[("srv", vec![ToolMetadata::new("srv_run", "run", "")])],
+                &[],
+                env,
+            );
+            let result = execute_call(&ctx, "srv_run", None, None, &CancelToken::new(), None)
+                .await
+                .unwrap();
+            assert!(
+                result.details.as_ref().unwrap().get("error").is_some(),
+                "{outcome:?} returns through the approval arm: {result:?}"
+            );
+            assert_eq!(
+                *env.in_flight_at_approval.lock().unwrap(),
+                Some(1),
+                "{outcome:?}: the gate still runs in flight"
+            );
+            assert_eq!(
+                env.in_flight_of("srv"),
+                0,
+                "{outcome:?}: the early return must not leak the slot"
+            );
+            assert_eq!(
+                env.touches.load(std::sync::atomic::Ordering::SeqCst),
+                2,
+                "{outcome:?}: `touch` runs on the way in and again in the `finally`"
+            );
+        }
     }
 
     // ---- MCP-164 · result shaping --------------------------------------------------------------------------

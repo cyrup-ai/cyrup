@@ -212,8 +212,9 @@ impl Models {
     }
 
     // ---- multi-type reads (Pi `getAllModels` `models.ts:446-463`, `getModelsOfType` `:468-470`,
-    // `getModelOfType` `:476-478` @v0.99.2-17). `ModelType::Image` is not ported; see
-    // [`crate::classifier`]. ----
+    // `getModelOfType` `:476-478` @v0.99.2-17). [`ModelType::Image`] is representable as of
+    // PROV-128 step (1); no provider lists image rows through [`Provider::get_all_models`] yet,
+    // which is that row's step (2). ----
 
     /// Last-known models of every type from one provider, or all providers (Pi `getAllModels`).
     /// Each provider contributes [`Provider::get_all_models`], whose default is its chat catalog
@@ -831,6 +832,29 @@ impl Models {
         auth_type: AuthType,
         interaction: &dyn crate::auth::oauth::AuthInteraction,
     ) -> Result<crate::auth::Credential, ProviderError> {
+        self.login_with_options(
+            provider,
+            auth_type,
+            interaction,
+            &crate::auth::LoginOptions::default(),
+        )
+        .await
+    }
+
+    /// The same login with pi's optional `LoginOptions` supplied
+    /// (`Models.login(providerId, type, interaction, options?)`, `models.ts:756-770`).
+    ///
+    /// PROV-118 — this is where an app hands a flow its stable installation id. The two entry
+    /// points are upstream's one call with and without the trailing argument: [`Models::login`]
+    /// delegates here with [`crate::auth::LoginOptions::default`], which is the `options ===
+    /// undefined` case, so there is one implementation and no behavioural fork.
+    pub async fn login_with_options(
+        &self,
+        provider: &str,
+        auth_type: AuthType,
+        interaction: &dyn crate::auth::oauth::AuthInteraction,
+        options: &crate::auth::LoginOptions,
+    ) -> Result<crate::auth::Credential, ProviderError> {
         let id: cyrup_core::ProviderId = provider.into();
         let entry = self
             .providers
@@ -845,7 +869,7 @@ impl Models {
                     .oauth
                     .as_ref()
                     .ok_or_else(|| auth_err(&id, "provider has no OAuth flow"))?;
-                flow.login(interaction)
+                flow.login(interaction, options)
                     .await
                     .map_err(|e| auth_err(&id, &format!("login failed: {e}")))?
             }
@@ -2426,5 +2450,80 @@ mod tests {
         );
         assert_eq!(probe.checks(), 0);
         assert_eq!(probe.resolves(), 0);
+    }
+
+    /// PROV-118 (a) — `Models.login(providerId, type, interaction, options?)` is where the app
+    /// hands a flow its installation id (`models.ts:756-770`, `method.login({…}, options)` at
+    /// `:770`). [`Models::login_with_options`] is the call WITH the trailing argument and
+    /// [`Models::login`] the one without; this pins that both reach the same flow and that only
+    /// the former carries a device id.
+    #[tokio::test]
+    async fn login_with_options_threads_the_device_id_to_the_oauth_flow() {
+        use crate::auth::oauth::{AuthInteraction, OAuthError, ScriptedInteraction};
+        use crate::auth::{LoginOptions, ModelAuth, OAuthAuth, ProviderAuth};
+        use crate::error::AuthError;
+
+        /// Mints a credential whose access token is the device id it was given, so the value is
+        /// read back out of the stored credential rather than a side channel.
+        struct DeviceIdFlow;
+
+        #[async_trait::async_trait]
+        impl OAuthAuth for DeviceIdFlow {
+            fn name(&self) -> &str {
+                "Device Id Flow"
+            }
+            async fn login(
+                &self,
+                _interaction: &dyn AuthInteraction,
+                options: &LoginOptions,
+            ) -> Result<Credential, OAuthError> {
+                Ok(crate::auth::oauth_credential(
+                    options.device_id().unwrap_or_else(|| "none".to_string()),
+                    "r",
+                    0,
+                ))
+            }
+            async fn refresh(&self, cred: &Credential) -> Result<Credential, AuthError> {
+                Ok(cred.clone())
+            }
+            async fn to_auth(&self, _cred: &Credential) -> Result<ModelAuth, AuthError> {
+                Ok(ModelAuth::default())
+            }
+        }
+
+        let mut models = create_models(CreateModelsOptions::default());
+        models.set_provider(Arc::new(crate::wire::WireProvider::new(
+            "deviced",
+            "Deviced",
+            vec![model("deviced", "m", false, None)],
+            ProviderAuth::with_oauth(Arc::new(DeviceIdFlow)),
+            Arc::new(crate::auth::InMemoryCredentialStore::new()),
+            Arc::new(crate::api::builtin_registry()),
+        )));
+
+        let interaction = ScriptedInteraction::new(Vec::new());
+        let cred = models
+            .login_with_options(
+                "deviced",
+                AuthType::Oauth,
+                &interaction,
+                &LoginOptions::with_device_id(|| "install-7f3a".to_string()),
+            )
+            .await
+            .unwrap();
+        match &cred {
+            Credential::Oauth { access, .. } => assert_eq!(access, "install-7f3a"),
+            other => panic!("expected an oauth credential, got {other:?}"),
+        }
+
+        // The no-options entry point is `options === undefined`, not a second code path.
+        let cred = models
+            .login("deviced", AuthType::Oauth, &interaction)
+            .await
+            .unwrap();
+        match &cred {
+            Credential::Oauth { access, .. } => assert_eq!(access, "none"),
+            other => panic!("expected an oauth credential, got {other:?}"),
+        }
     }
 }

@@ -121,6 +121,70 @@ const MCP_DIRECT_TOOLS_ENV: &str = "MCP_DIRECT_TOOLS";
 /// anchor rather than overwriting it) → empty (omitted).
 pub const PARENT_SESSION_ENV_VAR: &str = "CYRUP_SUBAGENT_PARENT_SESSION";
 
+/// SUBA-158 — the launching session's PROJECT TRUST, carried to every child (pi
+/// `ChildSessionLaunch.projectTrusted`, `src/runs/shared/child-session.ts:59` @v0.74.0, reaching
+/// `pi.SettingsManager.create(launch.cwd, agentDir, { projectTrusted: launch.projectTrusted })` at
+/// `:373`; `b2718fb8`/#2570).
+///
+/// # CYRUP-DELTA
+///
+/// **The channel differs; the result does not.** Upstream's children are in-process, so
+/// `child-session.ts:373` hands the flag straight to the child's `SettingsManager.create`. cyrup's
+/// child is a real `cyrup` process with its own settings load, so the SAME decision is delivered
+/// as the two things that process already understands: the `--approve` / `--no-approve` argv pair
+/// (`cyrup_config::trust::decide_trust`'s step-1 per-run override — the highest-precedence rung,
+/// so nothing downstream can overturn the parent's answer) and this env var for the next hop. The
+/// three states map one to one — trusted, untrusted, no information — so a child resolves exactly
+/// the settings and project-resource set upstream's child resolves. There is no cost and no lost
+/// guarantee: cyrup additionally reaches a case upstream does not, since an argv override outranks
+/// a SAVED trust decision the child would otherwise read from its own trust store and that its
+/// parent is not running under.
+///
+/// cyrup's child is a real `cyrup` process, so the value travels on the child's ARGV as
+/// the `--approve` / `--no-approve` pair the binary already parses
+/// (`crates/cyrup/src/subcommands.rs:57-67`, `cli::Cli::trust_override`), which
+/// `cyrup_config::trust::decide_trust` consumes as its step-1 per-run override. This env var is
+/// the second half of the same channel: it is written into every child's overlay so a `DEPTH>1`
+/// grandchild — and the detached hop-2 `__subagent-runner`, which is spawned with no `RunOptions`
+/// of its own — keeps threading the ROOT session's trust instead of re-deciding it from a config
+/// file the parent is not reading.
+///
+/// Values are exactly `"1"` and `"0"`. **ABSENT means "no trust information"**, which is pi's
+/// `undefined` (`sessionProjectTrust`, `src/runs/foreground/subagent-executor.ts:645`:
+/// `typeof ctx.isProjectTrusted === "function" ? ctx.isProjectTrusted() : undefined`) — the child
+/// then decides for itself exactly as it did before this existed, so a host with no trust concept
+/// is unchanged. Precedence at the spawn site: EXPLICIT
+/// ([`crate::exec::RunOptions::parent_project_trusted`]) → INHERITED (this process's own
+/// `CYRUP_SUBAGENT_PARENT_PROJECT_TRUSTED`) → absent.
+pub const PARENT_PROJECT_TRUSTED_ENV: &str = "CYRUP_SUBAGENT_PARENT_PROJECT_TRUSTED";
+
+/// SUBA-158 — the [`PARENT_PROJECT_TRUSTED_ENV`] ladder, parameterized over the INHERITED env
+/// value so it is directly testable: this crate is `#![forbid(unsafe_code)]` and
+/// `std::env::set_var` is `unsafe` as of the 2024 edition, so a test cannot install an inherited
+/// value to assert against. Same injectable-core convention as
+/// [`crate::background::parent_anchor::resolve_parent_session_anchor_from`].
+///
+/// Only `"1"` and `"0"` (after trimming) are recognized. Anything else — including an empty
+/// overlay entry — reads as NO information rather than as `false`, so a malformed value can never
+/// silently narrow a child's configuration.
+#[must_use]
+pub fn resolve_parent_project_trust_from(
+    explicit: Option<bool>,
+    inherited: Option<&str>,
+) -> Option<bool> {
+    explicit.or_else(|| match inherited.map(str::trim) {
+        Some("1") => Some(true),
+        Some("0") => Some(false),
+        _ => None,
+    })
+}
+
+/// [`resolve_parent_project_trust_from`] against this process's real environment.
+fn resolve_parent_project_trust(explicit: Option<bool>) -> Option<bool> {
+    let inherited = std::env::var(PARENT_PROJECT_TRUSTED_ENV).ok();
+    resolve_parent_project_trust_from(explicit, inherited.as_deref())
+}
+
 /// The resolved persona/agent NAME the child runs as (port doc §4, permission input (1) — pi
 /// `resolveAgentName`, `pi-permission-system/src/index.ts:2033-2047` @v0.7.1). cyrup spawns a subagent as a SEPARATE process that IS
 /// its persona for the whole lifetime, so — unlike pi's in-process `active_agent` session entry /
@@ -571,6 +635,25 @@ pub fn build_attempt_spawn_plan_with_read_requirement(
             args.push("--session-dir".to_string());
             args.push(session_dir.display().to_string());
         }
+    }
+
+    // SUBA-158 — the launching session's project trust, as the `--approve`/`--no-approve` pair
+    // the child binary already parses (pi hands `projectTrusted` to the child's settings manager
+    // in-process, `child-session.ts:373` @v0.74.0; cyrup's child is a process, so the same
+    // decision travels on argv). ABSENT when the parent has no trust information, which is pi's
+    // `undefined`: the child then decides for itself, exactly as before this existed.
+    //
+    // This is not cosmetic. A parent whose trust was granted IN SESSION (the ordinary interactive
+    // path — the grant is not persisted, which is why `interactive.rs` carries
+    // `auto_trust_on_reload_cwd` at all) spawned children that ran `decide_trust` from scratch:
+    // step 1 had no override, step 2 saw trust-requiring `.cyrup/` resources, step 3 found no
+    // saved decision, and step 5's non-prompting `--print` host resolved UNTRUSTED. The child
+    // therefore dropped the project settings and project extensions its parent was running under,
+    // invisibly.
+    match resolve_parent_project_trust(opts.parent_project_trusted) {
+        Some(true) => args.push("--approve".to_string()),
+        Some(false) => args.push("--no-approve".to_string()),
+        None => {}
     }
 
     let (task_arg, temp_file) = ChildSpawnSpec::resolve_task_arg(task_text, temp_dir)?;
@@ -1186,6 +1269,20 @@ fn env_orchestration(
         })
     {
         env_overlay.insert(PARENT_SESSION_ENV_VAR.to_string(), anchor);
+    }
+
+    // SUBA-158 — the same resolved trust the argv above carries, written into the overlay so the
+    // NEXT hop inherits it: a depth-2 grandchild is spawned by a child process that has no
+    // `RunOptions` naming the root's trust, and the detached hop-2 `__subagent-runner` is spawned
+    // with no `RunOptions` at all. Upstream gets this for free (its anchor and its trust both live
+    // in one process); cyrup has to write the entry. Absent stays absent — writing `"0"` for "no
+    // information" would MASK a value the next hop would otherwise have inherited, and would
+    // narrow its configuration on no evidence.
+    if let Some(trusted) = resolve_parent_project_trust(opts.parent_project_trusted) {
+        env_overlay.insert(
+            PARENT_PROJECT_TRUSTED_ENV.to_string(),
+            if trusted { "1" } else { "0" }.to_string(),
+        );
     }
 
     // Child watchdog activation (pi `execution.ts:298-302` / `subagent-runner.ts:1309-1312`): the
@@ -4493,6 +4590,170 @@ mod tests {
         assert_eq!(argv[tools_idx + 1], "read,edit");
     }
 
+    /// SUBA-158 — a child must follow the LAUNCHING session's project trust.
+    ///
+    /// THE USER ACTION: the user opens cyrup in a project holding `.cyrup/settings.json` and
+    /// answers the trust prompt with yes — a SESSION-ONLY grant, not persisted (which is exactly
+    /// why `crates/cyrup/src/interactive.rs` carries `auto_trust_on_reload_cwd`). They then ask
+    /// for a subagent. Before this row the child's argv carried nothing trust-shaped, so the child
+    /// ran `cyrup_config::trust::decide_trust` from scratch: no `--approve` override (step 1), a
+    /// project with trust-requiring resources (step 2), no saved decision (step 3),
+    /// `defaultProjectTrust: ask` (step 4) and a non-prompting `--print` host (step 5) — the child
+    /// resolved UNTRUSTED and silently dropped the project settings and project extensions its
+    /// parent was running under.
+    ///
+    /// Upstream threads the same decision as `ChildSessionLaunch.projectTrusted` into
+    /// `pi.SettingsManager.create(launch.cwd, agentDir, { projectTrusted })`
+    /// (`src/runs/shared/child-session.ts:59,373` @v0.74.0, `b2718fb8`/#2570), filled from
+    /// `sessionProjectTrust(ctx)` at every launch site (`subagent-executor.ts:645`).
+    #[test]
+    fn a_trusted_parent_hands_its_child_the_approve_flag() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let agent = sample_agent_config("m1", &[]);
+        let mut opts = base_opts(dir.path(), &["m1"]);
+        opts.parent_project_trusted = Some(true);
+        let depth = DepthEnvelope {
+            current_depth: 0,
+            max_depth: 5,
+        };
+        let plan = build_attempt_spawn_plan(
+            &agent,
+            &ModelId::from("m1"),
+            "task",
+            &opts,
+            depth,
+            dir.path(),
+            None,
+        )
+        .expect("plan builds");
+        let argv = plan.spec.build_argv();
+        assert!(
+            argv.contains(&"--approve".to_string()),
+            "a child of a TRUSTED session must load the project its parent loaded: {argv:?}"
+        );
+        assert!(
+            !argv.contains(&"--no-approve".to_string()),
+            "only one of the pair may be emitted: {argv:?}"
+        );
+        // And the next hop inherits it: a depth-2 grandchild, and the detached hop-2 runner, are
+        // spawned without any `RunOptions` naming the root's trust.
+        assert_eq!(
+            plan.spec
+                .env_overlay
+                .get(PARENT_PROJECT_TRUSTED_ENV)
+                .map(String::as_str),
+            Some("1")
+        );
+    }
+
+    /// SUBA-158 — the other direction, which is the one that must not be lost: an UNTRUSTED parent
+    /// must not spawn a child that trusts the project. Without the flag the child re-decides, and
+    /// a saved trust decision for the folder (or an ancestor, R-07-013) would grant it trust its
+    /// parent does not have — `decide_trust` step 3 outranks everything below it.
+    #[test]
+    fn an_untrusted_parent_hands_its_child_the_no_approve_flag() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let agent = sample_agent_config("m1", &[]);
+        let mut opts = base_opts(dir.path(), &["m1"]);
+        opts.parent_project_trusted = Some(false);
+        let depth = DepthEnvelope {
+            current_depth: 0,
+            max_depth: 5,
+        };
+        let plan = build_attempt_spawn_plan(
+            &agent,
+            &ModelId::from("m1"),
+            "task",
+            &opts,
+            depth,
+            dir.path(),
+            None,
+        )
+        .expect("plan builds");
+        let argv = plan.spec.build_argv();
+        assert!(
+            argv.contains(&"--no-approve".to_string()),
+            "a child of an UNTRUSTED session must not trust the project: {argv:?}"
+        );
+        assert!(!argv.contains(&"--approve".to_string()), "{argv:?}");
+        assert_eq!(
+            plan.spec
+                .env_overlay
+                .get(PARENT_PROJECT_TRUSTED_ENV)
+                .map(String::as_str),
+            Some("0")
+        );
+    }
+
+    /// SUBA-158 — upstream's `undefined` arm: a host with no trust concept
+    /// (`typeof ctx.isProjectTrusted === "function" ? … : undefined`) changes nothing. Here that
+    /// is an unbound P-1 host slot, so `RunOptions::parent_project_trusted` is `None` and the
+    /// child decides for itself exactly as it did before this row — and NOTHING is written into
+    /// the overlay, because a `"0"` there would MASK a value the next hop would otherwise have
+    /// inherited.
+    #[test]
+    fn a_host_with_no_trust_information_changes_nothing_about_the_child() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let agent = sample_agent_config("m1", &[]);
+        let opts = base_opts(dir.path(), &["m1"]);
+        assert_eq!(opts.parent_project_trusted, None, "the default is no info");
+        let depth = DepthEnvelope {
+            current_depth: 0,
+            max_depth: 5,
+        };
+        let plan = build_attempt_spawn_plan(
+            &agent,
+            &ModelId::from("m1"),
+            "task",
+            &opts,
+            depth,
+            dir.path(),
+            None,
+        )
+        .expect("plan builds");
+        let argv = plan.spec.build_argv();
+        assert!(!argv.contains(&"--approve".to_string()), "{argv:?}");
+        assert!(!argv.contains(&"--no-approve".to_string()), "{argv:?}");
+        assert!(
+            !plan
+                .spec
+                .env_overlay
+                .contains_key(PARENT_PROJECT_TRUSTED_ENV),
+            "an absent value must stay absent, never be written as `0`"
+        );
+    }
+
+    /// SUBA-158 — the EXPLICIT → INHERITED → absent ladder, which is how the detached hop-2
+    /// `__subagent-runner` (spawned with no `RunOptions` of its own) and a depth-2 grandchild keep
+    /// threading the ROOT session's trust. Only `1`/`0` are recognized; anything else is NO
+    /// information rather than `false`, so a malformed value can never silently narrow a child.
+    #[test]
+    fn the_parent_trust_ladder_prefers_explicit_then_inherited_then_nothing() {
+        // Explicit wins outright, in both directions.
+        assert_eq!(
+            resolve_parent_project_trust_from(Some(true), Some("0")),
+            Some(true)
+        );
+        assert_eq!(
+            resolve_parent_project_trust_from(Some(false), Some("1")),
+            Some(false)
+        );
+        // No explicit value: the inherited env rung answers.
+        assert_eq!(
+            resolve_parent_project_trust_from(None, Some("1")),
+            Some(true)
+        );
+        assert_eq!(
+            resolve_parent_project_trust_from(None, Some(" 0 ")),
+            Some(false)
+        );
+        // Neither, or a value that is not one of the two tokens.
+        assert_eq!(resolve_parent_project_trust_from(None, None), None);
+        assert_eq!(resolve_parent_project_trust_from(None, Some("")), None);
+        assert_eq!(resolve_parent_project_trust_from(None, Some("true")), None);
+        assert_eq!(resolve_parent_project_trust_from(None, Some("yes")), None);
+    }
+
     #[test]
     fn build_attempt_spawn_plan_writes_the_child_intercom_bridge_env_when_orchestrator_target_is_set()
      {
@@ -5664,6 +5925,7 @@ mod tests {
             Some(&inherited),
             &mut available_models,
             None, // no modelScope policy configured
+            "worker",
         )
         .expect("with no scope configured, resolution can never be refused");
         assert!(

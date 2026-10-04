@@ -24,6 +24,9 @@
 //! (`unwrap_used`, `expect_used`, `panic`, `indexing_slicing`), test code included.
 #![forbid(unsafe_code)]
 
+/// TUI-131 — theme colour values: `#RGB`/`#RRGGBB`, `oklch(…)` and `okhsl(…)`, the port of pi's
+/// `packages/tui/src/oklab.ts` and the colour-value half of `packages/tui/src/colors.ts`.
+pub mod color;
 pub mod discovery;
 pub mod error;
 pub mod key;

@@ -132,7 +132,7 @@ impl Hooks for ExtHooks {
                     changed = true;
                 }
                 if changed {
-                    AfterOutcome::Override(over)
+                    AfterOutcome::Override(Box::new(over))
                 } else {
                     AfterOutcome::Keep
                 }

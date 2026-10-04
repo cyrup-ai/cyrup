@@ -55,8 +55,8 @@ use super::interaction::{AuthEvent, AuthInteraction, AuthPrompt};
 use super::pkce::generate_pkce;
 use super::query::{encode_query, parse_query};
 use super::{OAuthError, now_ms, oauth_credential};
-use crate::auth::OAuthAuth;
 use crate::auth::types::{Credential, EnvAuthContext, ModelAuth, ProviderEnv};
+use crate::auth::{LoginOptions, OAuthAuth};
 use crate::error::AuthError;
 use cyrup_core::CancelToken;
 use std::fmt::Write as _;
@@ -88,6 +88,13 @@ pub const CALLBACK_PATH: &str = "/callback";
 /// `anthropic.ts:35` — the redirect URI is advertised on `localhost` even though the listener
 /// binds `CALLBACK_HOST` (`127.0.0.1` unless `*_OAUTH_CALLBACK_HOST` says otherwise).
 pub const ADVERTISE_HOST: &str = "localhost";
+
+/// `REDIRECT_URI` (`anthropic.ts:20` @v1.0.0) — upstream composes it from the port and path,
+/// ``http://localhost:${CALLBACK_PORT}${CALLBACK_PATH}``, and then reads this one constant
+/// everywhere: the authorize URL (`:155`), the paste prompt's placeholder (`:170`) and the token
+/// exchange (`:185`). It never asks the listener what it bound, which is what lets the login still
+/// work when the listener never came up at all (PROV-117).
+pub const REDIRECT_URI: &str = "http://localhost:53692/callback";
 /// `anthropic.ts:36-37`. Space-separated; the urlencoded serializer turns the spaces into `+`.
 pub const SCOPES: &str = "org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload";
 
@@ -547,6 +554,17 @@ impl AnthropicOAuth {
         }
     }
 
+    /// The redirect URI this flow advertises: upstream's module-level `REDIRECT_URI`
+    /// (`anthropic.ts:20` @v1.0.0). Composed the same way — advertise host, port, path — but from
+    /// the *configured* callback port, so [`AnthropicOAuth::with_endpoints`]' test bind is
+    /// described honestly; for the production port it is [`REDIRECT_URI`] verbatim.
+    fn redirect_uri(&self) -> String {
+        format!(
+            "http://{ADVERTISE_HOST}:{}{CALLBACK_PATH}",
+            self.callback_port
+        )
+    }
+
     /// The listener's bind host: upstream's `CALLBACK_HOST` (`anthropic.ts:32`).
     async fn bind_host(&self) -> String {
         match &self.callback_host {
@@ -560,9 +578,17 @@ impl AnthropicOAuth {
         // `:230`
         let pkce = generate_pkce()?;
 
-        // `:231` — the verifier doubles as the OAuth state. The port is fixed and pre-registered,
-        // so a second concurrent login surfaces as `OAuthError::Listen`, which is upstream's
-        // `server.on("error", reject)` (`:150-152`); there is no manual-paste fallback for it.
+        // `:231` — the verifier doubles as the OAuth state.
+        //
+        // PROV-117 — `4df157433` ("share OAuth callback server and sign-in page") ends this call
+        // with `.catch(() => undefined)` (`anthropic.ts:148`), and
+        // `waitForCallbackOrManualInput(interaction, callback, …)` takes
+        // `OAuthCallbackServer<T> | undefined` and documents the degraded path: "Without a callback
+        // server only the manual prompt is used" (`callback-server.ts:150-184`). So a listener that
+        // cannot bind — port 53692 already taken by a concurrent login, or a sandbox that refuses
+        // the loopback listen — leaves the authorize URL and the paste prompt, and the login still
+        // completes. `openrouter.ts:116` and `radius.ts:153` keep the hard failure deliberately;
+        // only this flow and the Codex one degrade.
         let config = CallbackServerConfig::fixed(self.callback_port, CALLBACK_PATH)
             .with_host(self.bind_host().await)
             .advertising(ADVERTISE_HOST)
@@ -573,9 +599,19 @@ impl AnthropicOAuth {
                 expected_state: pkce.verifier.clone(),
             },
         )
-        .await?;
-        // `:35`/`:160` — `http://localhost:{port}/callback`.
-        let redirect_uri = server.redirect_uri().to_string();
+        .await
+        .ok();
+
+        // `:20` — `http://localhost:{port}/callback`. Upstream reads the module constant and
+        // never asks the listener (`:155`, `:170`, `:185`), which is exactly what makes the
+        // unbound case workable. cyrup prefers the listener's own URI when there is one solely
+        // because [`AnthropicOAuth::with_endpoints`] allows a test-only ephemeral bind, where the
+        // port is not known until `listen` returns; for the production fixed port the two agree
+        // byte for byte, which `redirect_uri_matches_the_bound_listener` pins.
+        let redirect_uri = match &server {
+            Some(server) => server.redirect_uri().to_string(),
+            None => self.redirect_uri(),
+        };
 
         // `:249-254`
         interaction.notify(AuthEvent::AuthUrl {
@@ -592,33 +628,42 @@ impl AnthropicOAuth {
                     .with_cancel(manual_abort.clone()),
             ),
         );
-        let mut waiter = Box::pin(server.wait());
-
         enum Winner {
             Redirect(Result<Option<AuthorizationCallback>, OAuthError>),
             Manual(Result<String, OAuthError>),
         }
-        // `:272` raced against `:256-270`.
-        let winner = tokio::select! {
-            settled = &mut waiter => Winner::Redirect(settled),
-            prompted = &mut manual => Winner::Manual(prompted),
-        };
 
         let mut manual_input: Option<String> = None;
-        let redirect_result = match winner {
-            Winner::Redirect(settled) => {
-                // `:300` — the redirect won, so abort the pending prompt.
-                manual_abort.cancel();
-                settled?
+        let redirect_result = match &server {
+            Some(server) => {
+                let mut waiter = Box::pin(server.wait());
+                // `:272` raced against `:256-270`.
+                let winner = tokio::select! {
+                    settled = &mut waiter => Winner::Redirect(settled),
+                    prompted = &mut manual => Winner::Manual(prompted),
+                };
+                match winner {
+                    Winner::Redirect(settled) => {
+                        // `:300` — the redirect won, so abort the pending prompt.
+                        manual_abort.cancel();
+                        settled?
+                    }
+                    Winner::Manual(prompted) => {
+                        // `:273` rethrows a prompt rejection before the redirect result is
+                        // consulted.
+                        let input = prompted?;
+                        manual_input = Some(input);
+                        // `:265`/`:269`
+                        server.cancel_wait();
+                        waiter.await?
+                    }
+                }
             }
-            Winner::Manual(prompted) => {
-                // `:273` rethrows a prompt rejection before the redirect result is consulted.
-                let input = prompted?;
-                manual_input = Some(input);
-                // `:265`/`:269`
-                server.cancel_wait();
-                waiter.await?
-            }
+            // PROV-117 — `await callback?.wait()` on an absent callback is `undefined`
+            // (`callback-server.ts:174`), so there is no race: the prompt is the only channel and
+            // the code below reads it through the `manual_input.is_none()` second chance at
+            // `:284-293`, which upstream reaches by the same `value !== undefined` test.
+            None => None,
         };
 
         // `:274-282`
@@ -645,8 +690,9 @@ impl AnthropicOAuth {
             }
         }
 
-        // `:284-293` — the second chance. The wait only settles early via `cancel_wait`, so this
-        // fires only when the listener stopped on its own.
+        // `:284-293` — the second chance (`const input = await manual`,
+        // `callback-server.ts:177`). Reached when the listener resolved without a code — which is
+        // `cancel_wait`, a listener that stopped on its own, or (PROV-117) no listener at all.
         if !truthy(code.as_deref()) && manual_input.is_none() {
             let input = manual.await?;
             let parsed = parse_authorization_input(&input);
@@ -700,9 +746,19 @@ impl OAuthAuth for AnthropicOAuth {
     /// cancels the other. When the paste wins we still consult the listener, because upstream
     /// gives a redirect that landed concurrently precedence over the pasted value (`:272-282`).
     ///
+    /// PROV-117 — a listener that cannot bind is **not** fatal: upstream's
+    /// `startOAuthCallbackServer({…}).catch(() => undefined)` (`:148`) hands
+    /// `waitForCallbackOrManualInput` an absent callback and the paste prompt runs alone
+    /// (`callback-server.ts:150-184`). So `/login anthropic` still completes on a host where port
+    /// 53692 is already taken or the loopback listen is refused.
+    ///
     /// This overrides the trait's `LoginUnsupported` default, so the `dyn OAuthAuth` the provider
     /// carries ([`crate::providers::builtin_oauth::builtin_provider_oauth`]) runs the real flow.
-    async fn login(&self, interaction: &dyn AuthInteraction) -> Result<Credential, OAuthError> {
+    async fn login(
+        &self,
+        interaction: &dyn AuthInteraction,
+        _options: &LoginOptions,
+    ) -> Result<Credential, OAuthError> {
         self.run_login(interaction).await
     }
 
@@ -1190,7 +1246,10 @@ mod tests {
         );
         let flow: Arc<dyn OAuthAuth> = Arc::new(strategy_for(&token.url));
         let interaction = ScriptedInteraction::new(vec![Ok("DYNCODE".to_string())]);
-        let cred = flow.login(&interaction).await.unwrap();
+        let cred = flow
+            .login(&interaction, &LoginOptions::default())
+            .await
+            .unwrap();
         match cred {
             Credential::Oauth { access, .. } => assert_eq!(access, "dyn-access"),
             other => panic!("expected oauth credential, got {other:?}"),
@@ -1271,7 +1330,10 @@ mod tests {
             })
         };
 
-        let cred = oauth.login(interaction.as_ref()).await.unwrap();
+        let cred = oauth
+            .login(interaction.as_ref(), &LoginOptions::default())
+            .await
+            .unwrap();
         let (status, page) = driver.await.unwrap();
         assert!(status.starts_with("HTTP/1.1 200"), "{status}");
         // anthropic.ts:145-146
@@ -1337,7 +1399,10 @@ mod tests {
         // A bare code with no state: upstream falls back to the verifier (`:281`).
         let interaction = ScriptedInteraction::new(vec![Ok("PASTED_CODE".to_string())]);
 
-        let cred = oauth.login(&interaction).await.unwrap();
+        let cred = oauth
+            .login(&interaction, &LoginOptions::default())
+            .await
+            .unwrap();
         match cred {
             Credential::Oauth { access, .. } => assert_eq!(access, "pasted-access"),
             other => panic!("expected oauth credential, got {other:?}"),
@@ -1389,7 +1454,10 @@ mod tests {
         );
         let oauth = strategy_for(&token.url);
         let interaction = PasteRedirectUrl::default();
-        let cred = oauth.login(&interaction).await.unwrap();
+        let cred = oauth
+            .login(&interaction, &LoginOptions::default())
+            .await
+            .unwrap();
         match cred {
             Credential::Oauth { access, .. } => assert_eq!(access, "url-access"),
             other => panic!("expected oauth credential, got {other:?}"),
@@ -1404,7 +1472,10 @@ mod tests {
         let interaction = ScriptedInteraction::new(vec![Ok(
             "http://localhost:53692/callback?code=C&state=not-the-verifier".to_string(),
         )]);
-        let err = oauth.login(&interaction).await.unwrap_err();
+        let err = oauth
+            .login(&interaction, &LoginOptions::default())
+            .await
+            .unwrap_err();
         // anthropic.ts:279
         assert_eq!(err.to_string(), "OAuth state mismatch");
     }
@@ -1413,7 +1484,10 @@ mod tests {
     async fn login_rejects_empty_paste_as_missing_code() {
         let oauth = strategy_for("http://127.0.0.1:1/never-called");
         let interaction = ScriptedInteraction::new(vec![Ok("   ".to_string())]);
-        let err = oauth.login(&interaction).await.unwrap_err();
+        let err = oauth
+            .login(&interaction, &LoginOptions::default())
+            .await
+            .unwrap_err();
         // anthropic.ts:295
         assert_eq!(err.to_string(), "Missing authorization code");
     }
@@ -1426,7 +1500,10 @@ mod tests {
         let interaction = ScriptedInteraction::new(vec![Ok(
             "http://localhost:53692/callback?code=C&state=".to_string(),
         )]);
-        let err = oauth.login(&interaction).await.unwrap_err();
+        let err = oauth
+            .login(&interaction, &LoginOptions::default())
+            .await
+            .unwrap_err();
         assert_eq!(err.to_string(), "Missing OAuth state");
     }
 
@@ -1435,7 +1512,10 @@ mod tests {
         // anthropic.ts:267-270 + :273 — a rejected prompt aborts the whole login.
         let oauth = strategy_for("http://127.0.0.1:1/never-called");
         let interaction = ScriptedInteraction::new(vec![Err(OAuthError::Cancelled)]);
-        let err = oauth.login(&interaction).await.unwrap_err();
+        let err = oauth
+            .login(&interaction, &LoginOptions::default())
+            .await
+            .unwrap_err();
         assert_eq!(err.to_string(), "Login cancelled");
     }
 
@@ -1470,7 +1550,10 @@ mod tests {
             })
         };
 
-        let cred = oauth.login(interaction.as_ref()).await.unwrap();
+        let cred = oauth
+            .login(interaction.as_ref(), &LoginOptions::default())
+            .await
+            .unwrap();
         let (denied, missing, mismatch, ok) = driver.await.unwrap();
 
         assert!(denied.0.starts_with("HTTP/1.1 400"), "{denied:?}");
@@ -1498,5 +1581,120 @@ mod tests {
         }
         let (_, body) = token.recorded();
         assert_eq!(body.get("code").and_then(|v| v.as_str()), Some("GOOD"));
+    }
+
+    /// PROV-117 — `4df157433`. A loopback listener that cannot bind must NOT abort the login:
+    /// upstream ends the start call with `.catch(() => undefined)` (`anthropic.ts:148`) and
+    /// `waitForCallbackOrManualInput` runs the paste prompt alone, documented as "Without a
+    /// callback server only the manual prompt is used" (`callback-server.ts:150-184`).
+    ///
+    /// The port is genuinely occupied here rather than mocked — asserted by the control below —
+    /// which is upstream's own stated trigger ("when it is taken, fall back to the pasted redirect
+    /// URL", `openai-codex.ts:361`) and equally a sandbox that refuses the listen.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn login_degrades_to_manual_paste_when_the_callback_port_cannot_bind() {
+        // Hold the port for the whole test. Binding `:0` first and reusing the number avoids
+        // racing another test for a hardcoded port.
+        let squatter = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = squatter.local_addr().unwrap().port();
+
+        // Control: this really is unbindable, so the degraded path below is reached because the
+        // listen failed and not for some other reason.
+        let blocked = CallbackServer::start(
+            CallbackServerConfig::fixed(port, CALLBACK_PATH).with_host("127.0.0.1"),
+            AnthropicCallbackHandler {
+                expected_state: "s".to_string(),
+            },
+        )
+        .await;
+        assert!(
+            matches!(blocked, Err(OAuthError::Listen { .. })),
+            "an occupied port must fail to bind; got {}",
+            if blocked.is_ok() {
+                "a listener"
+            } else {
+                "another error"
+            }
+        );
+
+        let mut token = FakeTokenServer::start(
+            200,
+            r#"{"access_token":"degraded-access","refresh_token":"degraded-refresh","expires_in":3600}"#,
+        );
+        let oauth = AnthropicOAuth::with_endpoints(AUTHORIZE_URL, &token.url, "127.0.0.1", port);
+        let interaction = ScriptedInteraction::new(vec![Ok("PASTED_CODE".to_string())]);
+
+        // At HEAD this is `Err(OAuthError::Listen)`; upstream completes the login.
+        let cred = oauth
+            .login(&interaction, &LoginOptions::default())
+            .await
+            .unwrap();
+        match cred {
+            Credential::Oauth {
+                access, refresh, ..
+            } => {
+                assert_eq!(access, "degraded-access");
+                assert_eq!(refresh, "degraded-refresh");
+            }
+            other => panic!("expected oauth credential, got {other:?}"),
+        }
+
+        // The authorize URL still advertises the pre-registered redirect, read from the constant
+        // rather than from a listener that does not exist (`:143` uses `REDIRECT_URI`), and the
+        // exchange reuses the same value (`:298`).
+        let url = auth_url_of(&interaction);
+        let expected = format!("http://{ADVERTISE_HOST}:{port}{CALLBACK_PATH}");
+        assert_eq!(param_of(&url, "redirect_uri"), expected);
+        let (_, body) = token.recorded();
+        assert_eq!(
+            body.get("redirect_uri").and_then(|v| v.as_str()),
+            Some(expected.as_str())
+        );
+        assert_eq!(
+            body.get("code").and_then(|v| v.as_str()),
+            Some("PASTED_CODE")
+        );
+
+        // The paste prompt was still offered, with that same redirect as its placeholder
+        // (`:256-261`).
+        let prompts = interaction.prompts();
+        let prompt = prompts.first().unwrap();
+        assert_eq!(prompt.message, MANUAL_PROMPT_MESSAGE);
+        assert_eq!(prompt.placeholder.as_deref(), Some(expected.as_str()));
+
+        drop(squatter);
+    }
+
+    /// PROV-117's companion invariant: when the listener DOES bind, the URI it reports and the one
+    /// [`AnthropicOAuth::redirect_uri`] composes are the same string — so reading the constant on
+    /// the degraded path is not a second, divergent spelling of the redirect. Upstream has only the
+    /// constant (`anthropic.ts:35`); cyrup keeps the listener's value for the test-only ephemeral
+    /// bind, and this pins that the two agree for any fixed port, the production 53692 included.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn redirect_uri_matches_the_bound_listener() {
+        assert_eq!(
+            AnthropicOAuth::new().redirect_uri(),
+            REDIRECT_URI,
+            "the production composition is upstream's constant verbatim"
+        );
+
+        // A free fixed port: take one, learn its number, release it, then let the flow bind it.
+        let port = {
+            let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            probe.local_addr().unwrap().port()
+        };
+        let oauth = AnthropicOAuth::with_endpoints(AUTHORIZE_URL, TOKEN_URL, "127.0.0.1", port);
+        let server = CallbackServer::start(
+            CallbackServerConfig::fixed(port, CALLBACK_PATH)
+                .with_host("127.0.0.1")
+                .advertising(ADVERTISE_HOST),
+            AnthropicCallbackHandler {
+                expected_state: "s".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(server.redirect_uri(), oauth.redirect_uri());
+        server.close();
     }
 }

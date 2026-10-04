@@ -2326,6 +2326,7 @@ mod tests {
             enforce: Some(true),
             strict: None,
             allow: Some(vec!["anthropic/*".to_string()]),
+            agents: None,
         }));
         assert_eq!(armed.status, CheckStatus::Ok);
         assert!(armed.detail.contains("anthropic/*"), "{}", armed.detail);
@@ -2336,6 +2337,7 @@ mod tests {
             enforce: Some(true),
             strict: Some(true),
             allow: Some(vec!["anthropic/*".to_string()]),
+            agents: None,
         }));
         assert!(strict.detail.contains("strict"), "{}", strict.detail);
         assert!(
@@ -2349,6 +2351,7 @@ mod tests {
             enforce: None,
             strict: None,
             allow: Some(vec!["anthropic/*".to_string()]),
+            agents: None,
         }));
         assert_eq!(inert.status, CheckStatus::Ok);
         assert!(inert.detail.contains("not enforcing"), "{}", inert.detail);
@@ -2358,6 +2361,7 @@ mod tests {
             enforce: Some(true),
             strict: None,
             allow: None,
+            agents: None,
         }));
         assert_eq!(broken.status, CheckStatus::Warn);
         assert!(

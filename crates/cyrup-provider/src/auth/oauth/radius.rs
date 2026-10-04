@@ -79,8 +79,8 @@ use super::pkce::generate_pkce;
 use super::query::encode_query;
 use super::random::random_uuid_v4;
 use super::{OAuthError, now_ms};
-use crate::auth::OAuthAuth;
 use crate::auth::types::{Credential, ModelAuth};
+use crate::auth::{LoginOptions, OAuthAuth};
 use crate::error::AuthError;
 use cyrup_core::CancelToken;
 
@@ -870,7 +870,11 @@ impl OAuthAuth for RadiusOAuth {
 
     /// `radius.ts:364-386`: pick a method, then run it. Only the browser method loads discovery
     /// (`:383`) — the device method talks to fixed gateway paths.
-    async fn login(&self, interaction: &dyn AuthInteraction) -> Result<Credential, OAuthError> {
+    async fn login(
+        &self,
+        interaction: &dyn AuthInteraction,
+        _options: &LoginOptions,
+    ) -> Result<Credential, OAuthError> {
         // `:365-376`
         let method = interaction
             .prompt(AuthPrompt::select(
@@ -1482,7 +1486,10 @@ mod tests {
         ]);
         let flow = flow_for(&gateway.base);
         let interaction = ScriptedInteraction::new(vec![Ok(LOGIN_METHOD_DEVICE_CODE.to_string())]);
-        let credential = flow.login(&interaction).await.unwrap();
+        let credential = flow
+            .login(&interaction, &LoginOptions::default())
+            .await
+            .unwrap();
 
         // `:300-306` — every hint comes from the server's response.
         assert_eq!(
@@ -1847,7 +1854,7 @@ mod tests {
     async fn unknown_login_method_names_the_gateway() {
         let interaction = ScriptedInteraction::new(vec![Ok("smoke-signal".to_string())]);
         let err = flow_for("https://gw.example")
-            .login(&interaction)
+            .login(&interaction, &LoginOptions::default())
             .await
             .unwrap_err();
         assert_eq!(

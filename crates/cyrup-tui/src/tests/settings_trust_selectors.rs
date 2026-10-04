@@ -532,3 +532,40 @@ fn the_image_rows_are_gated_on_an_image_protocol() {
         "`Auto-resize images` is NOT gated upstream"
     );
 }
+
+/// CFG-096 / TUI-135 — the `/settings` `TUI mode` row shows pi v1.0.0's default and pi v1.0.0's
+/// description.
+///
+/// Upstream `88ff80b98` made fullscreen the default (`core/settings-manager.ts:1349`), and the row's
+/// description changed with it — from "Interface layout; fullscreen mode is experimental" to
+/// "Interface layout; regular mode uses the terminal's normal scrollback"
+/// (`modes/interactive/components/settings-selector.ts:706-711` @v1.0.0). The row's `currentValue`
+/// is `config.tuiMode`, which is `getTuiMode()`, so with no `tuiMode` key the grid must display
+/// `fullscreen`.
+///
+/// This is the renderer-side half of the flip: the grid reads
+/// `EffectiveSettings::tui_mode`, so a getter that still degraded to `regular` would show `regular`
+/// here while pi shows `fullscreen`.
+#[test]
+fn the_tui_mode_row_defaults_to_fullscreen_with_pis_v1_description() {
+    let rows = crate::app::settings_rows_for_test();
+    let row = rows
+        .iter()
+        .find(|r| r.id == "tuiMode")
+        .expect("pi's `tui-mode` row is missing");
+    assert_eq!(row.label, "TUI mode");
+    assert_eq!(
+        row.value, "fullscreen",
+        "pi's documented default since v1.0.0 (settings-manager.ts:1349)"
+    );
+    assert_eq!(
+        row.description.as_deref(),
+        Some("Interface layout; regular mode uses the terminal's normal scrollback"),
+        "pi's v1.0.0 wording (settings-selector.ts:709)"
+    );
+    assert_eq!(
+        row.cycle,
+        vec!["regular".to_string(), "fullscreen".to_string()],
+        "pi's `values` array, in pi's order"
+    );
+}

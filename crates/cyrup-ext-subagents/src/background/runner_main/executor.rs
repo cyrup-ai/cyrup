@@ -643,6 +643,9 @@ impl ExecSingleStepExecutor {
             self.inherited_session_model.as_ref(),
             &mut available_models,
             self.model_scope.as_ref(),
+            // SUBA-155 — the canonical agent name selects any `modelScope.agents.<name>` rule;
+            // the hop-2 runner enforces the same policy the foreground path does.
+            &agent.name,
         ) {
             Ok(resolved) => resolved,
             Err(violation) => return Err(Box::new(StepResult::failure(violation.message))),
@@ -953,6 +956,11 @@ impl ExecSingleStepExecutor {
                 .inherited_session_model
                 .as_ref()
                 .and_then(crate::exec::fallback::provider_of),
+            // SUBA-155 — pi `parentModel` for `resolveModelScopesForAgent`
+            // (`model-scope.ts:160` @v0.74.0): the SAME `inherited_session_model` the provider
+            // above is split from, so the reserved `inherit`/`scoped` allow tokens expand against
+            // the session that actually launched this run.
+            parent_model: self.inherited_session_model.clone(),
             available_models,
             cancel: ctx.cancel.clone(),
             interrupt: interrupt_token,
@@ -1000,6 +1008,11 @@ impl ExecSingleStepExecutor {
             // shown to the operator. Hop 1 now really does inject it, so the claim is finally true
             // — and this call site states the dependency instead of assuming it.
             parent_session_id: crate::background::parent_anchor::resolve_parent_session_anchor(),
+            // SUBA-158 — the hop-2 runner has no host session of its own to ask, so it
+            // supplies NO explicit value: `build_attempt_spawn_plan`'s INHERITED rung reads the
+            // `CYRUP_SUBAGENT_PARENT_PROJECT_TRUSTED` the orchestrator wrote into this process's
+            // environment at the hop-1 spawn, exactly as the parent-session anchor travels.
+            parent_project_trusted: None,
             // The detached hop-2 runner has no live orchestrator human session to surface a clarify
             // ask to; a child's blocking `contact_supervisor` ask routes over the broker to whichever
             // supervisor its intercom metadata names, not through this headless runner's exec loop.

@@ -406,8 +406,8 @@ pub fn find_stored(root: &SessionsRoot, id: &AcpSessionId) -> Option<StoredSessi
 ///
 /// `reported` is `AgentSession::session_file()`, which for a `DiskStore` is `store.path()` and is
 /// therefore `Some` **whether or not the file has been created**: `persist_last` only calls
-/// `store.create_exclusive(..)` once `has_assistant_message()` is true, so a session that has not
-/// yet produced an assistant reply names a path that does not exist. That is deliberate here — the
+/// `store.create_exclusive(..)` once `has_conversation()` is true, so a session that has not yet
+/// seen a user or assistant message names a path that does not exist. That is deliberate here — the
 /// path is the resume target, and `SessionTarget::Resume` on a missing file is the manager's
 /// `flushed = false` open, not an error. A disk scan cannot produce this answer at all, which is
 /// exactly the finding.
@@ -1750,10 +1750,10 @@ impl SessionManager {
     ///
     /// The slot read [`SessionManager::locate`] cannot do: `locate` is
     /// [`AcpSessionId::parse`] + [`find_stored`], a pure scan of the sessions root, and a live
-    /// session's JSONL does not exist on disk until its first assistant message
+    /// session's JSONL does not exist on disk until its first user or assistant message
     /// (`cyrup_session`'s `persist_last` reaches `store.create_exclusive` only once
-    /// `has_assistant_message()` is true). So a client that sends `session/new`, gets an id back
-    /// and — before any reply exists — sends `session/load` for that id got
+    /// `has_conversation()` is true). So a client that sends `session/new`, gets an id back
+    /// and — before any message exists — sends `session/load` for that id got
     /// `Unknown sessionId: <id>` for the session that was live in the slot at that moment. Zed does
     /// exactly this on window/history restore, and `ACP-Q7`'s decision that a modelless session is
     /// not refused at `session/new` makes it the *normal* case on a credential-less first run:

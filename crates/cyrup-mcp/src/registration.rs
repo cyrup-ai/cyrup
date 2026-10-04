@@ -151,8 +151,29 @@ const DIRECT_TOOL_PROMPT_SNIPPET_LENGTH: usize = 100;
 /// `cyrup_ext_subagents::exec::mcp_direct_tools`.
 pub const METADATA_CACHE_VERSION: u32 = 1;
 
-/// `metadata-cache.ts`'s `CACHE_MAX_AGE_MS` — seven days.
-pub const METADATA_CACHE_MAX_AGE_MS: f64 = 7.0 * 24.0 * 60.0 * 60.0 * 1000.0;
+// `metadata-cache.ts`'s `CACHE_MAX_AGE_MS` is **gone upstream** (MCP-595, `2632013` #787, v5.0.0):
+// `isServerCacheValid`'s `maxAgeMs` parameter now defaults to `0`, "0 means no age limit: without a
+// server-declared TTL, an entry stays valid until the next connect refreshes it."
+//
+// The symptom the deletion fixes is a blanket one: the first session stamps every server's entry
+// with the same `cachedAt`, only the servers actually used get restamped, so a week later every
+// unused server's entry expires at once and nothing rediscovers a plain `lazy` server. The bound
+// that replaces it is the config hash, the server-declared `ttlMs`, and the private scope.
+//
+// The parameter is kept, so a *caller* may still impose an explicit cap; no production caller does.
+// Nothing in the crate holds a seven-day constant any more.
+
+/// `isServerCacheValid`'s `maxAgeMs` default (MCP-595) — "0 means no age limit", which is what
+/// every production caller now passes. See the note above for what replaced the seven-day cap.
+pub const NO_AGE_LIMIT_MS: f64 = 0.0;
+
+/// `ListToolsResult.cacheScope`'s one meaningful value (MCP-596). Upstream compares against this
+/// literal and nothing else, so an unknown scope is **not** private.
+pub const CACHE_SCOPE_PRIVATE: &str = "private";
+
+/// `Number.MAX_SAFE_INTEGER` — the upper bound of `Number.isSafeInteger`, which gates a
+/// server-declared `ttlMs` ([`ServerCacheEntry::ttl_ms`]).
+const SAFE_INTEGER_MAX: f64 = 9_007_199_254_740_991.0;
 
 /// The env override subagents and CI use to pin a minimal MCP tool surface (MCP-219).
 pub const DIRECT_TOOLS_ENV_VAR: &str = "MCP_DIRECT_TOOLS";
@@ -850,6 +871,53 @@ pub struct ServerCacheEntry {
     /// fails on.
     #[serde(default, deserialize_with = "lenient_epoch_ms")]
     pub cached_at: Option<f64>,
+    /// The server-declared `ListToolsResult.ttlMs` for this listing (MCP-505), carried from the
+    /// `tools/list` hints by the writer. Lenient for the same reason [`Self::cached_at`] is: a
+    /// foreign writer's `"ttlMs": "5000"` must cost this entry's TTL hint and not the whole file.
+    /// A hint that is not a non-negative safe integer is ignored by [`is_server_cache_valid`].
+    #[serde(default, deserialize_with = "lenient_f64")]
+    pub ttl_ms: Option<f64>,
+    /// The server-declared `ListToolsResult.cacheScope` (MCP-596). [`CACHE_SCOPE_PRIVATE`] makes
+    /// the entry invalid on read: the persistent cache is not partitioned by authorization
+    /// context, so one session's private listing must not be served to another.
+    ///
+    /// A `String` rather than an enum because an unknown scope from a newer server must round-trip
+    /// unchanged and must **not** be read as private — upstream compares against the one literal.
+    #[serde(default, deserialize_with = "lenient_string")]
+    pub cache_scope: Option<String>,
+    /// `discoveryFailed?: true` (`types.ts:834`, MCP-596) — written in place of a catalogue when
+    /// startup discovery of this config failed, so a later session skips it rather than serving a
+    /// half-empty catalogue as authoritative.
+    #[serde(default, deserialize_with = "lenient_bool")]
+    pub discovery_failed: Option<bool>,
+}
+
+/// `Option<f64>` that answers `None` for any non-number — see [`ServerCacheEntry::ttl_ms`].
+fn lenient_f64<'de, D>(deserializer: D) -> Result<Option<f64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<Value>::deserialize(deserializer)?.and_then(|value| value.as_f64()))
+}
+
+/// `Option<String>` that answers `None` for any non-string — see
+/// [`ServerCacheEntry::cache_scope`].
+fn lenient_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<Value>::deserialize(deserializer)?
+        .and_then(|value| value.as_str().map(ToString::to_string)))
+}
+
+/// `Option<bool>` that answers `None` for any non-boolean — see
+/// [`ServerCacheEntry::discovery_failed`]. Upstream's type is `true | undefined` and the read is
+/// the truthiness test `if (entry.discoveryFailed)`, so a JSON `"true"` is **not** a flag.
+fn lenient_bool<'de, D>(deserializer: D) -> Result<Option<bool>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<Value>::deserialize(deserializer)?.and_then(|value| value.as_bool()))
 }
 
 /// `Option<f64>` that answers `None` for **any** non-number instead of failing the parse — see
@@ -900,6 +968,13 @@ pub struct CachedTool {
     /// lenient derive flattens (MCP-208).
     #[serde(default)]
     pub ui_visibility: Option<Value>,
+    /// The server's tool annotations, as a raw [`Value`] for the same reason
+    /// [`Self::ui_visibility`] is: upstream reads this member with
+    /// [`crate::proxy::extract_tool_annotations`], which keeps each well-typed field and drops the
+    /// rest, and deserialising into the typed shape here would instead fail the whole file on one
+    /// malformed hint from a co-installed writer (MCP-601).
+    #[serde(default)]
+    pub annotations: Option<Value>,
 }
 
 /// `types.ts` `CachedResource`.
@@ -1039,13 +1114,21 @@ pub fn load_metadata_cache(dirs: &McpDirs) -> Option<MetadataCache> {
     Some(cache)
 }
 
-/// `isServerCacheValid(entry, definition, maxAgeMs)` (`metadata-cache.ts:114`) — MCP-145, all four
-/// rejections, in upstream's order.
+/// `isServerCacheValid(entry, definition, maxAgeMs = 0)` (`metadata-cache.ts:187-213`, v5.0.0) —
+/// MCP-145's four rejections plus MCP-596's two and MCP-505's TTL leg, in upstream's order.
 ///
 /// ```text
 /// let configHash; try { configHash = computeServerHash(definition) } catch { return false }
 /// if (!entry || entry.configHash !== configHash) return false;
 /// if (!entry.cachedAt || typeof entry.cachedAt !== "number") return false;
+/// if (entry.cacheScope === "private") return false;   // the cache is not partitioned by auth context
+/// if (entry.discoveryFailed) return false;
+/// const declaredTtlMs = entry.ttlMs;
+/// if (typeof declaredTtlMs === "number" && Number.isSafeInteger(declaredTtlMs) && declaredTtlMs >= 0) {
+///   if (declaredTtlMs === 0) return false;
+///   const effectiveMaxAge = maxAgeMs > 0 ? Math.min(maxAgeMs, declaredTtlMs) : declaredTtlMs;
+///   return Date.now() - entry.cachedAt < effectiveMaxAge;
+/// }
 /// if (maxAgeMs > 0 && Date.now() - entry.cachedAt > maxAgeMs) return false;
 /// return true;
 /// ```
@@ -1057,8 +1140,19 @@ pub fn load_metadata_cache(dirs: &McpDirs) -> Option<MetadataCache> {
 /// 2. A `configHash` that does not match. Absent counts as not matching.
 /// 3. A **falsy or non-numeric** `cachedAt` — `!entry.cachedAt` rejects `0` as well as absent, and
 ///    the `typeof` test rejects a JSON string, which [`lenient_epoch_ms`] turns into `None`.
-/// 4. An age over `max_age_ms`, checked **only when that limit is positive** — so `0` disables the
-///    age check entirely and a year-old entry is accepted.
+/// 4. **`cacheScope: "private"`** (MCP-596). `mcp-cache.json` is one shared file with no
+///    authorization partition, so a listing a server declared private may not be read back by a
+///    session that may be signed in as someone else.
+/// 5. **`discoveryFailed`** (MCP-596). An entry written to record that a config failed discovery is
+///    a marker, not a catalogue; serving its empty tool list as authoritative is the bug.
+/// 6. **A server-declared `ttlMs`** (MCP-505, `types.ts:705` `ListToolsResult["ttlMs"]`), honoured
+///    only when it is a non-negative safe integer. `0` means "never cache": invalid immediately.
+///    Otherwise the TTL wins unless an explicit positive `max_age_ms` is stricter. A
+///    non-integer, negative or non-finite hint is **ignored**, falling through to gate 7 — a
+///    server cannot lengthen its own validity by sending nonsense.
+/// 7. An age over `max_age_ms`, checked **only when that limit is positive** — so `0` disables the
+///    age check entirely and a year-old entry is accepted. Since MCP-595 every production caller
+///    passes `0`.
 #[must_use]
 pub fn is_server_cache_valid(
     entry: &ServerCacheEntry,
@@ -1080,6 +1174,28 @@ pub fn is_server_cache_valid(
     else {
         return false;
     };
+    if entry.cache_scope.as_deref() == Some(CACHE_SCOPE_PRIVATE) {
+        return false;
+    }
+    if entry.discovery_failed == Some(true) {
+        return false;
+    }
+    // `Number.isSafeInteger(declaredTtlMs) && declaredTtlMs >= 0`. An `f64` that is not an integer
+    // within the safe range is not a hint upstream would act on, so it falls through.
+    if let Some(ttl_ms) = entry.ttl_ms.filter(|ttl| {
+        ttl.is_finite() && ttl.fract() == 0.0 && *ttl >= 0.0 && *ttl <= SAFE_INTEGER_MAX
+    }) {
+        if ttl_ms == 0.0 {
+            return false;
+        }
+        let effective = if max_age_ms > 0.0 {
+            max_age_ms.min(ttl_ms)
+        } else {
+            ttl_ms
+        };
+        // `<`, not `<=` — upstream's TTL branch is strict where the age branch below is not.
+        return now_ms() - cached_at < effective;
+    }
     if max_age_ms > 0.0 && now_ms() - cached_at > max_age_ms {
         return false;
     }
@@ -1099,7 +1215,9 @@ pub(crate) fn valid_entry<'a>(
     definition: &ServerEntry,
 ) -> Option<&'a ServerCacheEntry> {
     let entry = cache?.servers.get(server_name)?;
-    is_server_cache_valid(entry, definition, METADATA_CACHE_MAX_AGE_MS).then_some(entry)
+    // MCP-595 — `isServerCacheValid`'s own default. No age limit: the config hash, the
+    // server-declared `ttlMs` and the private scope are the bounds now.
+    is_server_cache_valid(entry, definition, NO_AGE_LIMIT_MS).then_some(entry)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1752,6 +1870,11 @@ pub fn build_tool_metadata(
             // `rmcp` makes `inputSchema` required where the wire type has it optional, so the
             // `...(tool.inputSchema !== undefined ? … : {})` spread is always taken.
             input_schema: Some(Value::Object((*tool.input_schema).clone())),
+            // MCP-601 — the live `tools/list` hints. rmcp has already type-checked them.
+            annotations: tool
+                .annotations
+                .as_ref()
+                .and_then(crate::proxy::McpToolAnnotations::from_wire),
         });
     }
 
@@ -1783,6 +1906,9 @@ pub fn build_tool_metadata(
                 resource_uri: Some(resource.uri.clone()),
                 ui_visibility: None,
                 input_schema: None,
+                // A resource tool is the adapter's own, not the server's: it has no annotations
+                // upstream either (`direct-tools.ts:218` reads `spec.resourceUri ? undefined : …`).
+                annotations: None,
             });
         }
     }
@@ -1902,6 +2028,10 @@ pub fn reconstruct_tool_metadata(
             resource_uri: None,
             ui_visibility: cached_ui_visibility(tool.ui_visibility.as_ref()),
             input_schema: tool.input_schema.clone(),
+            // `extractToolAnnotations(tool.annotations)` (`metadata-cache.ts:300`) — the cache is a
+            // cross-product file, so the hints are type-filtered rather than deserialised, and a
+            // hint a hot start showed survives this cold one (MCP-601).
+            annotations: crate::proxy::extract_tool_annotations(tool.annotations.as_ref()),
         });
     }
 
@@ -1938,6 +2068,9 @@ pub fn reconstruct_tool_metadata(
                 resource_uri: Some(resource.uri.clone()),
                 ui_visibility: None,
                 input_schema: None,
+                // A resource tool is the adapter's own, not the server's: it has no annotations
+                // upstream either (`direct-tools.ts:218` reads `spec.resourceUri ? undefined : …`).
+                annotations: None,
             });
         }
     }
@@ -2650,7 +2783,7 @@ pub fn resolve_cached_prompts(
         if definition.is_disabled() || entry.prompts().is_empty() {
             continue;
         }
-        if !is_server_cache_valid(entry, definition, METADATA_CACHE_MAX_AGE_MS) {
+        if !is_server_cache_valid(entry, definition, NO_AGE_LIMIT_MS) {
             continue;
         }
         specs.extend(reconstruct_prompt_metadata(
@@ -3440,13 +3573,35 @@ mod tests {
         assert_eq!(names, vec!["s_kept"]);
     }
 
+    /// Seven days — the `CACHE_MAX_AGE_MS` upstream **deleted** (MCP-595). It survives here only
+    /// as the explicit cap the `maxAgeMs` parameter still honours when a caller supplies one.
+    const SEVEN_DAYS_MS: f64 = 7.0 * 24.0 * 60.0 * 60.0 * 1000.0;
+
+    /// MCP-595 — the production read path has **no age limit**: a week-old entry whose config hash
+    /// still matches keeps its direct tools. Before `2632013` this entry expired and, because
+    /// `bootstrap_all` is only set when the cache file is absent, nothing ever rediscovered a plain
+    /// `lazy` server — its tools left the surface permanently.
     #[test]
-    fn an_expired_cache_entry_is_invalid() {
-        let mut stale = cache_entry(vec![cached_tool("t")]);
-        stale.cached_at = Some(now_ms() - METADATA_CACHE_MAX_AGE_MS - 1000.0);
-        let config = config_of(&[("s", entry(true))]);
-        let cache = cache_of(&config, &[("s", stale)]);
-        assert!(resolve_direct_tools(&config, Some(&cache), ToolPrefix::Server, None).is_empty());
+    fn an_old_cache_entry_is_still_valid_on_the_production_read_path() {
+        let definition = entry(true);
+        let mut old = cache_entry(vec![cached_tool("t")]);
+        old.cached_at = Some(now_ms() - SEVEN_DAYS_MS * 52.0);
+        old.config_hash = default_server_hasher(&definition);
+        let config = config_of(&[("s", definition.clone())]);
+        let cache = cache_of(&config, &[("s", old.clone())]);
+        let specs = resolve_direct_tools(&config, Some(&cache), ToolPrefix::Server, None);
+        let names: Vec<&str> = specs.iter().map(|s| s.prefixed_name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["s_t"],
+            "a year-old entry with a matching hash stays valid"
+        );
+        assert!(
+            is_server_cache_valid(&old, &definition, NO_AGE_LIMIT_MS),
+            "the predicate's own default imposes no age limit"
+        );
+        // The parameter still works for a caller that wants a cap.
+        assert!(!is_server_cache_valid(&old, &definition, SEVEN_DAYS_MS));
     }
 
     // --- MCP-145: the hash comparison, the throw arm, and the two `cachedAt` rules -------------
@@ -3461,34 +3616,22 @@ mod tests {
         let mut stale = cache_entry(vec![cached_tool("t")]);
         stale.config_hash = Some("0".repeat(64));
         assert!(
-            !is_server_cache_valid(&stale, &definition, METADATA_CACHE_MAX_AGE_MS),
+            !is_server_cache_valid(&stale, &definition, SEVEN_DAYS_MS),
             "a mismatched digest must invalidate even with no installed hasher"
         );
 
         let mut fresh = cache_entry(vec![cached_tool("t")]);
         fresh.config_hash = default_server_hasher(&definition);
-        assert!(is_server_cache_valid(
-            &fresh,
-            &definition,
-            METADATA_CACHE_MAX_AGE_MS
-        ));
+        assert!(is_server_cache_valid(&fresh, &definition, SEVEN_DAYS_MS));
 
         // …and it tracks the definition: adding an identity field evicts the entry.
         let mut edited = definition.clone();
         edited.include_tools = Some(vec!["a".to_string()]);
-        assert!(!is_server_cache_valid(
-            &fresh,
-            &edited,
-            METADATA_CACHE_MAX_AGE_MS
-        ));
+        assert!(!is_server_cache_valid(&fresh, &edited, SEVEN_DAYS_MS));
         // …while a runtime-only field does not.
         let mut noisy = definition.clone();
         noisy.debug = Some(true);
-        assert!(is_server_cache_valid(
-            &fresh,
-            &noisy,
-            METADATA_CACHE_MAX_AGE_MS
-        ));
+        assert!(is_server_cache_valid(&fresh, &noisy, SEVEN_DAYS_MS));
     }
 
     /// The throw arm — upstream's `try { computeServerHash } catch { return false }`, and the sole
@@ -3515,7 +3658,7 @@ mod tests {
         assert!(!is_server_cache_valid(
             &anything,
             &definition,
-            METADATA_CACHE_MAX_AGE_MS
+            SEVEN_DAYS_MS
         ));
         // Even `maxAgeMs = 0`, which disables the age check, cannot rescue it: the throw is first.
         assert!(!is_server_cache_valid(&anything, &definition, 0.0));
@@ -3546,7 +3689,7 @@ mod tests {
         zero.config_hash = hash.clone();
         zero.cached_at = Some(0.0);
         assert!(
-            !is_server_cache_valid(&zero, &definition, METADATA_CACHE_MAX_AGE_MS),
+            !is_server_cache_valid(&zero, &definition, SEVEN_DAYS_MS),
             "`cachedAt: 0` is falsy upstream, so it is absent"
         );
         // …and it is rejected by the FALSY test, not by the age check: with `maxAgeMs = 0` there is
@@ -3555,16 +3698,173 @@ mod tests {
 
         let mut ancient = cache_entry(vec![cached_tool("t")]);
         ancient.config_hash = hash;
-        ancient.cached_at = Some(now_ms() - METADATA_CACHE_MAX_AGE_MS * 52.0);
-        assert!(!is_server_cache_valid(
-            &ancient,
-            &definition,
-            METADATA_CACHE_MAX_AGE_MS
-        ));
+        ancient.cached_at = Some(now_ms() - SEVEN_DAYS_MS * 52.0);
+        assert!(!is_server_cache_valid(&ancient, &definition, SEVEN_DAYS_MS));
         assert!(
             is_server_cache_valid(&ancient, &definition, 0.0),
             "`maxAgeMs = 0` disables the age check entirely"
         );
+    }
+
+    /// MCP-601 — a hint survives a **cold** start: `tools/list` → [`crate::dirs::serialize_tools`]
+    /// → `mcp-cache.json` → the lenient reader → `extractToolAnnotations` → [`ToolMetadata`].
+    ///
+    /// The cold path is the one that matters: a direct tool's spec is fixed at registration, often
+    /// from this cache, so a hint lost here is a hint the approval prompt never shows.
+    #[test]
+    fn a_tool_annotation_survives_the_cache_round_trip() {
+        let mut wire = rmcp::model::Tool::new(
+            "wipe",
+            "Delete everything",
+            std::sync::Arc::new(serde_json::Map::new()),
+        );
+        wire.annotations = Some(rmcp::model::ToolAnnotations::from_raw(
+            Some("Wipe".to_string()),
+            Some(false),
+            Some(true),
+            None,
+            None,
+        ));
+        let written = crate::dirs::serialize_tools(&[wire]);
+        let json = serde_json::to_string(&written).expect("the writer serialises");
+        assert!(
+            json.contains("\"destructiveHint\":true"),
+            "the hint must reach the file: {json}"
+        );
+
+        // …and back in through the lenient reader, which is a DIFFERENT type.
+        let read: Vec<CachedTool> = serde_json::from_str(&json).expect("the reader parses");
+        let definition = entry(true);
+        let mut cached = cache_entry(read);
+        cached.config_hash = default_server_hasher(&definition);
+        let metadata =
+            reconstruct_tool_metadata("s", &cached, ToolPrefix::Server, &definition, None, None);
+        let hints = metadata[0]
+            .annotations
+            .as_ref()
+            .expect("the hint survives the round trip");
+        assert_eq!(hints.destructive_hint, Some(true));
+        assert_eq!(hints.read_only_hint, Some(false));
+        assert_eq!(hints.title.as_deref(), Some("Wipe"));
+    }
+
+    /// MCP-596 — `cacheScope: "private"` and `discoveryFailed` (`metadata-cache.ts:202-204`).
+    ///
+    /// `mcp-cache.json` is one shared file with no authorization partition, so a listing the server
+    /// declared private must not be read back by a session that may be signed in as someone else;
+    /// and a `discoveryFailed` marker is not a catalogue.
+    #[test]
+    fn a_private_scope_and_a_failed_discovery_both_invalidate_the_entry() {
+        let definition = entry(true);
+        let hash = default_server_hasher(&definition);
+
+        let mut private = cache_entry(vec![cached_tool("t")]);
+        private.config_hash = hash.clone();
+        private.cache_scope = Some(CACHE_SCOPE_PRIVATE.to_string());
+        assert!(!is_server_cache_valid(
+            &private,
+            &definition,
+            NO_AGE_LIMIT_MS
+        ));
+
+        // Upstream compares against the one literal, so an unknown scope is NOT private.
+        let mut other_scope = cache_entry(vec![cached_tool("t")]);
+        other_scope.config_hash = hash.clone();
+        other_scope.cache_scope = Some("session".to_string());
+        assert!(is_server_cache_valid(
+            &other_scope,
+            &definition,
+            NO_AGE_LIMIT_MS
+        ));
+
+        let mut failed = cache_entry(vec![cached_tool("t")]);
+        failed.config_hash = hash.clone();
+        failed.discovery_failed = Some(true);
+        assert!(!is_server_cache_valid(
+            &failed,
+            &definition,
+            NO_AGE_LIMIT_MS
+        ));
+
+        // `discoveryFailed: false` is not a marker; upstream's type is `true | undefined`.
+        let mut not_failed = cache_entry(vec![cached_tool("t")]);
+        not_failed.config_hash = hash;
+        not_failed.discovery_failed = Some(false);
+        assert!(is_server_cache_valid(
+            &not_failed,
+            &definition,
+            NO_AGE_LIMIT_MS
+        ));
+
+        // …and a private entry is excluded from the cold-start direct-tool surface.
+        let config = config_of(&[("s", entry(true))]);
+        let cache = cache_of(&config, &[("s", private)]);
+        assert!(resolve_direct_tools(&config, Some(&cache), ToolPrefix::Server, None).is_empty());
+    }
+
+    /// MCP-505 — the server-declared `ttlMs` leg, which is the bound that **replaces** the deleted
+    /// seven-day age limit (`metadata-cache.ts:205-212`).
+    #[test]
+    fn a_declared_ttl_bounds_the_entry_and_zero_means_never_cache() {
+        let definition = entry(true);
+        let hash = default_server_hasher(&definition);
+        let fixture = |ttl: Option<f64>, age_ms: f64| {
+            let mut e = cache_entry(vec![cached_tool("t")]);
+            e.config_hash = hash.clone();
+            e.cached_at = Some(now_ms() - age_ms);
+            e.ttl_ms = ttl;
+            e
+        };
+
+        // `declaredTtlMs === 0` ⇒ invalid immediately, however fresh.
+        assert!(!is_server_cache_valid(
+            &fixture(Some(0.0), 0.0),
+            &definition,
+            NO_AGE_LIMIT_MS
+        ));
+        // Inside the TTL, valid; past it, invalid — with no age limit in play at all.
+        assert!(is_server_cache_valid(
+            &fixture(Some(60_000.0), 1_000.0),
+            &definition,
+            NO_AGE_LIMIT_MS
+        ));
+        assert!(!is_server_cache_valid(
+            &fixture(Some(1_000.0), 60_000.0),
+            &definition,
+            NO_AGE_LIMIT_MS
+        ));
+        // `effectiveMaxAge = maxAgeMs > 0 ? min(maxAgeMs, ttlMs) : ttlMs` — the stricter wins.
+        assert!(!is_server_cache_valid(
+            &fixture(Some(SEVEN_DAYS_MS * 52.0), 60_000.0),
+            &definition,
+            1_000.0
+        ));
+        // A hint that is not a non-negative safe integer is IGNORED, not honoured: a server cannot
+        // extend its own validity by sending nonsense, and cannot shorten it either.
+        for nonsense in [-1.0, 0.5, SAFE_INTEGER_MAX * 2.0] {
+            assert!(
+                is_server_cache_valid(
+                    &fixture(Some(nonsense), SEVEN_DAYS_MS * 52.0),
+                    &definition,
+                    NO_AGE_LIMIT_MS
+                ),
+                "ttlMs {nonsense} must fall through to the age check"
+            );
+        }
+    }
+
+    /// A foreign writer's malformed hint must cost the hint, never the file — the same rule
+    /// [`lenient_epoch_ms`] exists for, applied to the three MCP-505/MCP-596 fields.
+    #[test]
+    fn malformed_ttl_scope_and_failure_hints_load_as_absent() {
+        let raw = r#"{"version":1,"servers":{"s":{"configHash":"a","tools":[],
+            "cachedAt":1760000000000,"ttlMs":"5000","cacheScope":7,"discoveryFailed":"true"}}}"#;
+        let cache: MetadataCache = serde_json::from_str(raw).expect("a lenient reader must parse");
+        let entry = &cache.servers["s"];
+        assert_eq!(entry.ttl_ms, None);
+        assert_eq!(entry.cache_scope, None);
+        assert_eq!(entry.discovery_failed, None);
+        assert_eq!(entry.cached_at, Some(1_760_000_000_000.0));
     }
 
     /// A malformed `cachedAt` from a foreign writer must cost that entry and nothing else.

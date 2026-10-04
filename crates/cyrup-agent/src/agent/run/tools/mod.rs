@@ -31,7 +31,11 @@ enum ToolRuntimeMsg {
         call_id: ToolCallId,
         source_index: usize,
         tool_name: String,
-        outcome: Result<ToolResult, ToolError>,
+        /// Boxed for the same reason as [`Prep::Immediate`]: a `ToolResult` dwarfs the `Update`
+        /// and `Aborted` arms, so an unboxed outcome makes every message on this channel —
+        /// including each of a tool's streamed updates — pay for the largest one. AGENT-045 grew
+        /// `ToolResult` by its `structured_content`, which is what tipped the balance.
+        outcome: Box<Result<ToolResult, ToolError>>,
     },
     /// A prepared call whose turn to start came after the run was aborted: it was never executed
     /// and settles as `Operation aborted` without `after_tool_call` (AGENT-042, pi v0.85.0).

@@ -13,7 +13,7 @@ use crate::ids::{gen_session_id, gen_short_id, now_ts};
 use crate::layout::SessionLayout;
 use crate::store::{DiskStore, MemStore, SessionStore};
 
-use super::{SessionManager, entries_have_assistant};
+use super::{SessionManager, entries_have_conversation};
 
 impl SessionManager {
     /// Re-root this session onto the path from root through an EXPLICIT `leaf_id` and switch this
@@ -166,11 +166,12 @@ impl SessionManager {
 
         let path = layout.new_file_path(&ts, id.as_str());
         let mut store: Box<dyn SessionStore> = Box::new(DiskStore::new(path.clone()));
-        // Pi `createBranchedSession` defers the file write until an assistant message exists
-        // (`session-manager.ts:1362-1368`, explicitly to avoid the duplicate-header bug): write
-        // eagerly only when the retained path already contains an assistant, otherwise leave the
-        // file uncreated and let the first assistant append flush it (`flushed = false`).
-        let flushed = if entries_have_assistant(&retained) {
+        // Pi `createBranchedSession` uses the same rule as `_persist()` — "write now if the
+        // branched path already has a conversation, otherwise let `_persist()` create the file
+        // later" (`session-manager.ts:1717-1724` @v1.0.0), which avoids both an empty branched file
+        // and the duplicate-header bug. A retained path with a user message but no assistant reply
+        // therefore flushes eagerly at v1.0.0, where it used to stay deferred.
+        let flushed = if entries_have_conversation(&retained) {
             store.rewrite(&header, &retained)?;
             true
         } else {

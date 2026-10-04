@@ -785,7 +785,7 @@ impl UiTheme {
             Some(c) => c,
             None => self
                 .color_mode
-                .project_opt(parse_hex(default_hex))
+                .project_opt(parse_color(default_hex))
                 .unwrap_or(Color::Reset),
         }
     }
@@ -1160,16 +1160,25 @@ pub fn color_of(spec: ColorSpec) -> Option<Color> {
     }
 }
 
-/// Resolve a raw `colors` value through `vars` then hex-parse it (dependency-free mirror of
-/// `cyrup_resources::theme`'s private resolver, for the [`UiTheme::from_theme_data`] hot-reload hook).
+/// Resolve a raw `colors` value through `vars` then parse it (a mirror of
+/// `cyrup_resources::theme`'s private resolver, for the [`UiTheme::from_theme_data`] hot-reload
+/// hook).
+///
+/// TUI-131 — an `oklch(…)` / `okhsl(…)` value is a colour FUNCTION, not a variable name, so it
+/// short-circuits the `vars` lookup exactly as upstream's `resolveVarRefs` does
+/// (`/^ok(lch|hsl)\(/i`, `theme/theme.ts:140` @v1.0.0). Without that, a theme with a var literally
+/// named `okhsl(234 3% 89%)` would be consulted first; with it, the value parses.
 fn resolve_value(raw: &str, vars: &std::collections::BTreeMap<String, String>) -> Option<Color> {
     let v = raw.trim();
     if v.is_empty() {
         return None;
     }
+    if cyrup_resources::color::is_color_function(v) {
+        return parse_color(v);
+    }
     let var_name = v.strip_prefix('$').unwrap_or(v);
-    let hex = vars.get(var_name).map(String::as_str).unwrap_or(v);
-    parse_hex(hex)
+    let value = vars.get(var_name).map(String::as_str).unwrap_or(v);
+    parse_color(value)
 }
 
 /// The xterm 6×6×6 color-cube channel values (indices 0–5) — Pi `CUBE_VALUES` (`theme.ts:183`).
@@ -1272,40 +1281,18 @@ fn rgb_to_16(r: u8, g: u8, b: u8) -> u8 {
     best
 }
 
-/// Parse `#rrggbb` / `rrggbb` / `#rgb` into a `Color`; anything malformed ⇒ `None`.
-fn parse_hex(s: &str) -> Option<Color> {
-    let h = s.trim().strip_prefix('#').unwrap_or(s.trim());
-    let bytes = h.as_bytes();
-    match bytes.len() {
-        6 => {
-            let r = hex_pair(bytes.first(), bytes.get(1))?;
-            let g = hex_pair(bytes.get(2), bytes.get(3))?;
-            let b = hex_pair(bytes.get(4), bytes.get(5))?;
-            Some(Color::Rgb(r, g, b))
-        }
-        3 => {
-            let r = hex_digit(bytes.first()).map(|n| n * 17)?;
-            let g = hex_digit(bytes.get(1)).map(|n| n * 17)?;
-            let b = hex_digit(bytes.get(2)).map(|n| n * 17)?;
-            Some(Color::Rgb(r, g, b))
-        }
-        _ => None,
-    }
-}
-
-fn hex_digit(b: Option<&u8>) -> Option<u8> {
-    match *b? {
-        c @ b'0'..=b'9' => Some(c - b'0'),
-        c @ b'a'..=b'f' => Some(c - b'a' + 10),
-        c @ b'A'..=b'F' => Some(c - b'A' + 10),
-        _ => None,
-    }
-}
-
-fn hex_pair(hi: Option<&u8>, lo: Option<&u8>) -> Option<u8> {
-    let h = hex_digit(hi)?;
-    let l = hex_digit(lo)?;
-    h.checked_mul(16)?.checked_add(l)
+/// Parse a theme colour VALUE into a `ratatui::Color`; anything malformed ⇒ `None`.
+///
+/// TUI-131 — this was `parse_hex` and took `#rrggbb` / `rrggbb` / `#rgb` only. It now delegates to
+/// [`cyrup_resources::color::parse_color`], the port of pi's `parseColor`
+/// (`packages/tui/src/colors.ts:121` @v1.0.0), so `oklch(…)` and `okhsl(…)` resolve. pi 1.0's own
+/// `dark.json` and `light.json` are written entirely in OKHSL, so before this every token of a
+/// pi 1.0 theme fell back to a compiled hex with no error and no unresolved-role report.
+///
+/// One function for both resolvers: `cyrup-resources` owns the maths (it is the lower crate) and
+/// this crate wraps it in `ratatui`'s colour type at the boundary.
+fn parse_color(s: &str) -> Option<Color> {
+    cyrup_resources::color::parse_color(s).map(|(r, g, b)| Color::Rgb(r, g, b))
 }
 
 // ============================================================================

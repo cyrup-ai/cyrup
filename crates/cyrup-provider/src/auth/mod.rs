@@ -25,6 +25,55 @@ pub use types::{
     ProviderEnv,
 };
 
+/// App-supplied context for a login flow (pi `LoginOptions`, `ai/src/auth/types.ts:206-214`).
+///
+/// PROV-118 — `02eed88fd` ("add alternative sign in for the openai provider") added this as the
+/// optional second parameter of `OAuthAuth.login`. Upstream's doc comment on the one member:
+///
+/// > Returns the stable ID of this app installation, e.g. sent to OpenAI as its agent host ID.
+/// > Called only by login flows that need it, so apps can create the ID on first use and must
+/// > return the same ID on every later call.
+///
+/// Upstream passes the same bag to the api-key `login` as well, but `ApiKeyAuth.login?` is typed
+/// with one parameter (`auth/types.ts:175`) so it is unreachable there; only [`OAuthAuth::login`]
+/// takes it here.
+#[derive(Clone, Default)]
+pub struct LoginOptions {
+    /// `getDeviceId?: () => string`. A flow that needs an installation id calls it; a flow that
+    /// does not never does, which is why the app may create the id lazily.
+    pub get_device_id: Option<GetDeviceIdFn>,
+}
+
+/// `getDeviceId: () => string` (pi `LoginOptions.getDeviceId`, `ai/src/auth/types.ts:211-213`).
+/// Aliased for the same reason [`ModifyFn`] and [`crate::stream::TransformHeadersFn`] are: the
+/// inline type trips clippy's `type_complexity` budget wherever it appears.
+pub type GetDeviceIdFn = Arc<dyn Fn() -> String + Send + Sync>;
+
+impl LoginOptions {
+    /// Options carrying a device-id provider.
+    pub fn with_device_id<F>(get_device_id: F) -> Self
+    where
+        F: Fn() -> String + Send + Sync + 'static,
+    {
+        Self {
+            get_device_id: Some(Arc::new(get_device_id)),
+        }
+    }
+
+    /// `options?.getDeviceId?.()` — the installation id, if the app supplied a way to get one.
+    pub fn device_id(&self) -> Option<String> {
+        self.get_device_id.as_ref().map(|f| f())
+    }
+}
+
+impl std::fmt::Debug for LoginOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LoginOptions")
+            .field("get_device_id", &self.get_device_id.is_some())
+            .finish()
+    }
+}
+
 /// How a provider authenticates (func-01 §4.1: at least one of `api_key | oauth`).
 #[derive(Clone, Default)]
 pub struct ProviderAuth {
@@ -196,9 +245,16 @@ pub trait OAuthAuth: Send + Sync {
     /// The substrate to implement it lives in [`oauth`]: [`oauth::generate_pkce`],
     /// [`oauth::CallbackServer`], [`oauth::poll_oauth_device_code_flow`] and
     /// [`oauth::oauth_credential`].
+    ///
+    /// `options` is pi's optional second parameter (`login(interaction, options?)`,
+    /// `ai/src/auth/types.ts:226`), added by PROV-118's `02eed88fd` so a flow can ask the app for
+    /// a stable installation id. It is a required parameter here rather than an `Option` so a flow
+    /// that needs one cannot silently fail to receive it; [`LoginOptions::default`] is the
+    /// "called without options" case, and [`LoginOptions::device_id`] is `options?.getDeviceId?.()`.
     async fn login(
         &self,
         _interaction: &dyn oauth::AuthInteraction,
+        _options: &LoginOptions,
     ) -> Result<Credential, oauth::OAuthError> {
         Err(oauth::OAuthError::LoginUnsupported {
             name: self.name().to_string(),

@@ -132,7 +132,7 @@ pub(crate) const MAX_RETAINED_ENTRIES: usize = 5_000;
 /// drains them via [`drain_committed`](TranscriptView::drain_committed). What becomes of a drained
 /// entry is the **renderer's** strategy, not a property of this type:
 ///
-/// - **Inline (`regular`, the default renderer).** Per ADR-0001 / R-ARCH-TUI-003 the inline viewport
+/// - **Inline (`regular`).** Per ADR-0001 / R-ARCH-TUI-003 the inline viewport
 ///   holds only the **active** region (the in-flight streaming turn), so drained entries are emitted
 ///   to the terminal's native scrollback with `Terminal::insert_before` and are not re-rendered
 ///   inside the viewport. That describes how the inline renderer spends its entries; it is not a
@@ -156,7 +156,7 @@ pub struct TranscriptView {
     /// flush, so a session with a full screen of history would look like a fresh one.
     chat_flushed: bool,
     /// ADR-0005 §B-1 — whether a drain RETAINS its entries in [`TranscriptView::document()`] instead
-    /// of letting them go. `false` (the default, and every regular-mode session) is the inline
+    /// of letting them go. `false` (this type's own default, and every regular-mode session) is the inline
     /// mode's R-ARCH-TUI-003 strategy, byte-identical to the behaviour before this ADR; `true` is
     /// what gives the alternate-screen renderer a document to scroll. Upstream needs no such flag:
     /// it keeps every message component alive in `chatContainer` in BOTH modes, which is why
@@ -169,7 +169,9 @@ pub struct TranscriptView {
     /// [`TranscriptView::retained_dropped()`] movement — every row index a renderer holds would then
     /// be silently wrong. ADR-0005 §B-14's live mode switch therefore does NOT touch this flag; it
     /// is enabled whenever `tuiMode` is switchable at all, and the cost of retaining in a session
-    /// that never enters fullscreen is bounded by [`MAX_RETAINED_ENTRIES`].
+    /// that never enters fullscreen is bounded by [`MAX_RETAINED_ENTRIES`]. CFG-096/TUI-135 made
+    /// `fullscreen` the default, so that bounded cost is now paid by the opt-out sessions rather
+    /// than by the common ones.
     retain_document: bool,
     /// ADR-0005 §B-1 — the retained document: every committed [`Entry`] this view has drained while
     /// [`TranscriptView::retain_document()`] was on, in commit order, trimmed at the front to

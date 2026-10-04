@@ -29,6 +29,7 @@ use crate::config::{
 };
 use crate::credentials::OAuthCredentialStatus;
 use crate::dirs::{McpDirs, ServerCacheEntry};
+use crate::errors::McpResult;
 use crate::extension::McpExtension;
 use crate::onboarding::OnboardingState;
 use crate::state::McpState;
@@ -349,24 +350,26 @@ impl SetupCallbacks {
 }
 
 impl SetupPanelCallbacks for SetupCallbacks {
-    fn preview_imports(&self, imports: &[ImportKind]) -> ConfigWritePreview {
+    fn preview_imports(&self, imports: &[ImportKind]) -> McpResult<ConfigWritePreview> {
         self.context().preview_compatibility_imports(imports)
     }
 
-    fn preview_starter_project(&self) -> ConfigWritePreview {
+    fn preview_starter_project(&self) -> McpResult<ConfigWritePreview> {
         self.context().preview_starter_project_config()
     }
 
-    fn preview_repo_prompt(&self) -> Option<ConfigWritePreview> {
-        let (path, name, entry) = self.repo_prompt()?;
-        Some(crate::config::preview_shared_server_entry(
-            &path, &name, &entry,
-        ))
+    fn preview_repo_prompt(&self) -> McpResult<Option<ConfigWritePreview>> {
+        // `None` is upstream's `null` — RepoPrompt is not offerable — and stays distinct from the
+        // `Err` an unparseable target file produces (MCP-589).
+        let Some((path, name, entry)) = self.repo_prompt() else {
+            return Ok(None);
+        };
+        crate::config::preview_shared_server_entry(&path, &name, &entry).map(Some)
     }
 
     /// `previewKnownServer(preset)` — always against the PROJECT file, never the discovered path a
     /// RepoPrompt add would use, and keyed by `preset.id` rather than its display name.
-    fn preview_known_server(&self, preset: &KnownServerPreset) -> ConfigWritePreview {
+    fn preview_known_server(&self, preset: &KnownServerPreset) -> McpResult<ConfigWritePreview> {
         crate::config::preview_shared_server_entry(
             &self.context().project_path(),
             preset.id,

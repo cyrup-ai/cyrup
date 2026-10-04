@@ -163,10 +163,10 @@ struct TerminateAndCount {
 #[async_trait::async_trait]
 impl Hooks for TerminateAndCount {
     async fn after_tool_call(&self, _ctx: AfterToolCall<'_>, _cancel: CancelToken) -> AfterOutcome {
-        AfterOutcome::Override(AfterOverride {
+        AfterOutcome::Override(Box::new(AfterOverride {
             terminate: Some(TerminateHint::Terminate),
             ..Default::default()
-        })
+        }))
     }
     async fn prepare_next_turn(
         &self,

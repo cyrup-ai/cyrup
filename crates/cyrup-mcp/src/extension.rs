@@ -244,7 +244,7 @@ impl McpExtension {
         let config = self
             .programmatic_config
             .clone()
-            .unwrap_or_else(|| self.config_context().load().config);
+            .unwrap_or_else(|| self.load_time_config());
 
         // Seed the sink with what the model is CURRENTLY shown, so the pass registers only
         // differences. These three slots are the extension's memory of the last pass.
@@ -551,6 +551,22 @@ impl McpExtension {
     /// the next read without invalidating a cache.
     ///
     /// Returns the **context**, not the loaded config, because the two existing callers want
+    /// `excludeProjectServersAtLoadTime(loadMcpConfig(earlyConfigPath))` (`index.ts:370`,
+    /// `init.ts:149`) — the config for a pass that runs **before any session exists** (MCP-591).
+    ///
+    /// `4ed656e` (#714). Registration and surface-sync both happen outside `session_start`, so
+    /// there is no `cwd`-scoped approval to consult and no UI to prompt with; a project server's
+    /// tools must not be put in front of the model there. They reappear at `session_start`, where
+    /// [`crate::project_server_trust::apply_project_server_trust`] either admits them or blocks
+    /// them with a reason.
+    fn load_time_config(&self) -> crate::config::McpConfig {
+        let loaded = self.config_context().load();
+        crate::project_server_trust::exclude_project_servers_at_load_time(
+            &loaded.config,
+            &loaded.project_servers,
+        )
+    }
+
     /// `.load().config` while `/mcp disable` and `cyrup mcp init` want the context's own writers.
     #[must_use]
     pub(crate) fn config_context(&self) -> crate::config::ConfigContext {
@@ -2133,7 +2149,7 @@ impl NativeExtension for McpExtension {
         let config = self
             .programmatic_config
             .clone()
-            .unwrap_or_else(|| self.config_context().load().config);
+            .unwrap_or_else(|| self.load_time_config());
 
         // A NEW generation gets a NEW executor: this pass mints fresh tool objects, and the
         // dispatch they read is installed once this generation's `McpState` exists.
@@ -3133,19 +3149,19 @@ done
         // The whole of the production trigger: one `SessionStart`.
         let _ = ext.on_event(&session_start_event(), &event_ctx()).await;
 
-        // `mcp-cache.json` does not exist in this tempdir, so `initialize_mcp` sets
-        // `bootstrap_all` and the startup pass connects every enabled server once. The connection
-        // map is written by that pass, which runs inside the SPAWNED build — so the wait is real
-        // and not a formality.
+        // `mcp-cache.json` does not exist in this tempdir, so the server has no valid entry and
+        // §10 puts it in `needs_discovery` — which is what makes this an unconditional startup
+        // connect rather than a lazy one (MCP-598). The wait is on the **published catalogue**
+        // rather than on a live connection, because the server is `lazy` with a non-zero idle
+        // timeout and the pass therefore closes it again once its catalogue is captured. That
+        // publication is written inside the SPAWNED build, so the wait is real.
         let state = tokio::time::timeout(std::time::Duration::from_secs(30), async {
             loop {
                 if let Some(state) = ext.state()
                     && state
-                        .manager
-                        .get_connection("fixture")
-                        .is_some_and(|connection| {
-                            connection.status() == crate::lifecycle::ConnectionStatus::Connected
-                        })
+                        .tool_metadata
+                        .lock()
+                        .is_ok_and(|map| map.contains_key("fixture"))
                 {
                     return state;
                 }
@@ -3153,19 +3169,35 @@ done
             }
         })
         .await
-        .expect("a configured server must connect when a session starts");
+        .expect("a configured server must be discovered when a session starts");
 
-        // Three independent facts, because each catches a different break.
+        // Four independent facts, because each catches a different break.
         assert!(marker.exists(), "a real child process ran");
         assert!(
             state.server_instructions.lock().is_ok(),
             "the generation's state is the one the connect ran against"
         );
-        // §9's cold-cache bootstrap ran, which is what set `bootstrap_all` and made this an
-        // unconditional startup connect rather than a lazy one.
+        // MCP-598 — the pass writes the cache ONCE, at the end, with what it discovered. There is
+        // no longer an empty-file bootstrap before it, so this file existing means a catalogue
+        // reached it.
+        let cache = crate::dirs::load_metadata_cache(&dir.path().join("mcp-cache.json"))
+            .expect("the startup pass flushed a cache");
         assert!(
-            dir.path().join("mcp-cache.json").exists(),
-            "the cold-cache bootstrap writes an empty cache before the startup pass"
+            cache
+                .servers
+                .get("fixture")
+                .is_some_and(|entry| entry.tools.iter().any(|tool| tool.name == "echo")),
+            "the discovered catalogue is what got written: {cache:?}"
+        );
+        // …and the connection it was read from is CLOSED again: a `lazy` server discovered only to
+        // read its catalogue must not stay running until the idle sweep starts (MCP-598).
+        assert!(
+            state
+                .manager
+                .get_connection("fixture")
+                .is_none_or(|connection| connection.status()
+                    != crate::lifecycle::ConnectionStatus::Connected),
+            "a non-resident server is closed once its catalogue is captured"
         );
         // The commit tail ran on the state that owns this connection.
         assert!(ext.proxy_ctx().is_some());
@@ -3178,6 +3210,225 @@ done
             state.manager.get_connection("fixture").is_none(),
             "`shutdown_previous_generation` really drains the generation's children — the \
              graceful shutdown closes the connection and removes it from the map"
+        );
+    }
+
+    // --- MCP-598 · per-server startup discovery ------------------------------------------------
+
+    /// One `LIVE_MCP` server definition that touches `marker` when its child starts.
+    fn fixture_server(marker: &std::path::Path) -> serde_json::Value {
+        serde_json::json!({
+            "command": "sh",
+            "args": [
+                "-c",
+                LIVE_MCP,
+                "sh",
+                rmcp::model::ProtocolVersion::LATEST.as_str(),
+                marker.to_string_lossy(),
+            ],
+        })
+    }
+
+    /// Start one generation over `servers` in `dir` and wait until the startup pass has published
+    /// `settled`'s catalogue — the signal that the whole pass, including its single cache flush,
+    /// has run.
+    async fn start_and_settle(
+        dir: &std::path::Path,
+        servers: serde_json::Value,
+        settled: &str,
+    ) -> (Arc<McpExtension>, Arc<McpState>) {
+        let config: McpConfig =
+            serde_json::from_value(serde_json::json!({ "mcpServers": servers })).unwrap();
+        let ext = McpExtension::with_config(
+            McpDirs::new(dir.to_path_buf(), dir.to_path_buf()),
+            Some(config),
+        )
+        .with_home(dir.to_path_buf())
+        .into_arc();
+        let mut api = InitApi::new();
+        ext.init(&mut api).await.unwrap();
+        let _ = ext.on_event(&session_start_event(), &event_ctx()).await;
+        let state = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            loop {
+                if let Some(state) = ext.state()
+                    && state
+                        .tool_metadata
+                        .lock()
+                        .is_ok_and(|map| map.contains_key(settled))
+                {
+                    return state;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .ok()
+        .unwrap_or_else(|| unreachable!("the startup pass must discover {settled}"));
+        (ext, state)
+    }
+
+    /// MCP-598's first and most-likely-hit failure: **a server added after the first session was
+    /// never discovered.** `bootstrapAll` was set only when the cache *file* was absent, so with a
+    /// file present a plain `lazy` server was absent from search and from the direct-tool surface
+    /// until the model happened to call it by name — and with MCP-595's age limit gone, for ever.
+    ///
+    /// The already-cached server is the control: it must **not** be reconnected, which is what
+    /// makes this a per-server decision rather than a blanket bootstrap.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_server_added_after_a_cache_file_exists_is_discovered() {
+        let dir = tempfile::tempdir().unwrap();
+        let cached_marker = dir.path().join("cached-started");
+        let added_marker = dir.path().join("added-started");
+        let servers = serde_json::json!({
+            "cached": fixture_server(&cached_marker),
+            "added": fixture_server(&added_marker),
+        });
+
+        // Seed a VALID entry for `cached` only, under the digest the reader will recompute.
+        let config: McpConfig =
+            serde_json::from_value(serde_json::json!({ "mcpServers": servers.clone() })).unwrap();
+        let cached_definition = config
+            .mcp_servers
+            .get("cached")
+            .expect("the config names it")
+            .clone();
+        let mut seed = crate::dirs::MetadataCache::default();
+        seed.servers.insert(
+            "cached".to_string(),
+            crate::dirs::ServerCacheEntry {
+                config_hash: crate::registration::default_server_hasher(&cached_definition)
+                    .expect("no url, so the hash cannot throw"),
+                tools: vec![crate::dirs::CachedTool {
+                    name: "echo".to_string(),
+                    ..crate::dirs::CachedTool::default()
+                }],
+                cached_at: crate::dirs::now_ms(),
+                ..crate::dirs::ServerCacheEntry::default()
+            },
+        );
+        let cache_path = dir.path().join("mcp-cache.json");
+        crate::dirs::save_metadata_cache(&cache_path, &seed).unwrap();
+
+        let (_ext, _state) = start_and_settle(dir.path(), servers, "added").await;
+
+        assert!(
+            added_marker.exists(),
+            "the newly configured server must be connected and discovered"
+        );
+        assert!(
+            !cached_marker.exists(),
+            "a server with a valid cache entry must NOT be reconnected at startup"
+        );
+        let cache = crate::dirs::load_metadata_cache(&cache_path).expect("the pass flushed");
+        assert!(
+            cache
+                .servers
+                .get("added")
+                .is_some_and(|entry| entry.tools.iter().any(|tool| tool.name == "echo")),
+            "and its catalogue reached the ONE merged write: {cache:?}"
+        );
+        assert!(
+            cache.servers.contains_key("cached"),
+            "the merged write must not erase the entry it did not touch"
+        );
+    }
+
+    /// MCP-598's second failure: **a first run connected every enabled server and left them all
+    /// running** until the idle sweep started, which is after initialization.
+    ///
+    /// `resident = lifecycle !== "lazy" || effectiveIdleTimeout === 0`: the `keep-alive` server
+    /// stays, the `lazy` one is closed the moment its catalogue is captured.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_non_resident_server_is_closed_after_startup_discovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let keeper_marker = dir.path().join("keeper-started");
+        let lazy_marker = dir.path().join("lazy-started");
+        let mut keeper = fixture_server(&keeper_marker);
+        if let Some(object) = keeper.as_object_mut() {
+            object.insert("lifecycle".to_string(), serde_json::json!("keep-alive"));
+        }
+        let servers = serde_json::json!({
+            "keeper": keeper,
+            "transient": fixture_server(&lazy_marker),
+        });
+
+        let (_ext, state) = start_and_settle(dir.path(), servers, "transient").await;
+        // Both were connected — both children ran.
+        assert!(keeper_marker.exists() && lazy_marker.exists());
+
+        assert!(
+            state
+                .manager
+                .get_connection("keeper")
+                .is_some_and(|connection| connection.status()
+                    == crate::lifecycle::ConnectionStatus::Connected),
+            "a keep-alive server is resident and stays connected"
+        );
+        assert!(
+            state
+                .manager
+                .get_connection("transient")
+                .is_none_or(|connection| connection.status()
+                    != crate::lifecycle::ConnectionStatus::Connected),
+            "a lazy server with a non-zero idle timeout is closed once captured"
+        );
+        // …and both catalogues were published and written regardless.
+        let cache = crate::dirs::load_metadata_cache(&dir.path().join("mcp-cache.json"))
+            .expect("the pass flushed");
+        assert!(
+            cache.servers.contains_key("keeper") && cache.servers.contains_key("transient"),
+            "one merged write carries every server the pass discovered: {cache:?}"
+        );
+    }
+
+    /// MCP-596/MCP-598 — "Startup tries a config once; a server that failed is tried again on first
+    /// use." A `discoveryFailed` marker whose `configHash` still matches puts the server in
+    /// `failedDiscovery`, not in `needsDiscovery`, so the startup pass does not spawn it at all.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_discovery_failed_marker_is_not_retried_at_startup() {
+        let dir = tempfile::tempdir().unwrap();
+        let flaky_marker = dir.path().join("flaky-started");
+        let other_marker = dir.path().join("other-started");
+        let servers = serde_json::json!({
+            "flaky": fixture_server(&flaky_marker),
+            "other": fixture_server(&other_marker),
+        });
+        let config: McpConfig =
+            serde_json::from_value(serde_json::json!({ "mcpServers": servers.clone() })).unwrap();
+        let mut seed = crate::dirs::MetadataCache::default();
+        seed.servers.insert(
+            "flaky".to_string(),
+            crate::dirs::ServerCacheEntry {
+                config_hash: crate::registration::default_server_hasher(
+                    config
+                        .mcp_servers
+                        .get("flaky")
+                        .expect("the config names it"),
+                )
+                .expect("no url, so the hash cannot throw"),
+                discovery_failed: Some(true),
+                cached_at: crate::dirs::now_ms(),
+                ..crate::dirs::ServerCacheEntry::default()
+            },
+        );
+        let cache_path = dir.path().join("mcp-cache.json");
+        crate::dirs::save_metadata_cache(&cache_path, &seed).unwrap();
+
+        // `other` carries the pass: once its catalogue is published the pass has run.
+        let (_ext, _state) = start_and_settle(dir.path(), servers, "other").await;
+        assert!(other_marker.exists());
+        assert!(
+            !flaky_marker.exists(),
+            "a config that already failed discovery is not retried at startup"
+        );
+        let cache = crate::dirs::load_metadata_cache(&cache_path).expect("the pass flushed");
+        assert_eq!(
+            cache
+                .servers
+                .get("flaky")
+                .and_then(|entry| entry.discovery_failed),
+            Some(true),
+            "and its marker survives the merged write untouched"
         );
     }
 
@@ -3375,6 +3626,7 @@ done
             ui: services,
             open_browser: Arc::new(|_| async { Ok(()) }.boxed()),
             send_message: Arc::new(|_| {}),
+            blocked_project_servers: IndexMap::new(),
         }))
     }
 
@@ -3752,6 +4004,7 @@ done
             ui: None,
             open_browser: Arc::new(|_| async { Ok(()) }.boxed()),
             send_message: Arc::new(|_| {}),
+            blocked_project_servers: IndexMap::new(),
         }))
     }
 

@@ -47,8 +47,8 @@ use support::{
 ///
 /// # The prompt first is not scene-setting
 ///
-/// A session's `*.jsonl` does not exist until its first assistant message (`persist_last` reaches
-/// `store.create_exclusive` only once `has_assistant_message()` is true), so without it the load
+/// A session's `*.jsonl` does not exist until its first user or assistant message (`persist_last`
+/// reaches `store.create_exclusive` only once `has_conversation()` is true), so without it the load
 /// hands `SessionTarget::Resume(<a path that is not there>)` to the factory.
 #[test]
 fn session_load_on_the_live_id_rebuilds_once_and_evicts_the_outgoing_runtime() {

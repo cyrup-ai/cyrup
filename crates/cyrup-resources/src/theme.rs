@@ -64,17 +64,33 @@ where
 }
 
 /// Validate a single color value against Pi's `ColorValueSchema`
-/// (`Type.Union([Type.String(), Type.Integer({minimum:0,maximum:255})])`, theme.ts:23-26).
+/// (`Type.Union([Type.String(), Type.Integer({minimum:0,maximum:255})])`, theme.ts:23-26), plus
+/// TUI-131's one extra rejection.
 ///
-/// A string is always valid (hex / var-ref / empty). A number is valid only if it is a non-negative
-/// integer `<= 255`; a float, a negative, or an out-of-range integer fails the union, as does any
-/// non-string/non-number value (bool/object/array/null). Returns the typebox-style error message
-/// for the "Other errors" section when invalid.
-fn bad_color(val: &serde_json::Value) -> Option<&'static str> {
+/// A string is valid (hex / var-ref / empty) UNLESS it is an `oklch(…)` / `okhsl(…)` colour
+/// FUNCTION that does not parse. A number is valid only if it is a non-negative integer `<= 255`; a
+/// float, a negative, or an out-of-range integer fails the union, as does any non-string/non-number
+/// value (bool/object/array/null). Returns the error message for the "Other errors" section when
+/// invalid.
+///
+/// TUI-131 — upstream reaches a malformed colour value through `parseColor`'s
+/// `throw new Error(\`Invalid color value: ${value}\`)` during `setTheme`, which the user sees as
+/// `Failed to load theme …`. cyrup's resolver is total by R-00-009, so the report has to happen
+/// where cyrup already reports a bad theme: this validator, carrying upstream's own message text.
+/// The check is deliberately narrow — only a value whose `/^ok(lch|hsl)\(/i` prefix says it CANNOT
+/// be a variable reference is judged here. A bare string that is neither hex nor a known var stays
+/// a silent `Inherit`, which is cyrup's pre-existing contract and is pinned by
+/// `theme_resolve_var_indirection_and_bad_hex`.
+fn bad_color(val: &serde_json::Value) -> Option<String> {
     match val {
+        serde_json::Value::String(s)
+            if crate::color::is_color_function(s) && crate::color::parse_color(s).is_none() =>
+        {
+            Some(format!("Invalid color value: {s}"))
+        }
         serde_json::Value::String(_) => None,
         serde_json::Value::Number(n) if n.as_u64().is_some_and(|u| u <= 255) => None,
-        _ => Some("Expected union value"),
+        _ => Some("Expected union value".to_string()),
     }
 }
 
@@ -405,10 +421,13 @@ impl Named for Theme {
 
 /// Resolve a `colors` value **recursively** through `vars` (theme.ts:290-306).
 ///
-/// Empty → inherit. A value starting with `#` is a terminal hex color. Otherwise it is treated as a
-/// var reference (an optional leading `$` is accepted for cyrup compatibility; Pi uses the bare
-/// name) and resolved recursively. Circular references and unknown vars degrade to `Inherit` (Pi
-/// throws; cyrup's `resolve()` is total and never panics, R-00-009).
+/// Empty → inherit. A value starting with `#` is a terminal hex color, and — TUI-131 — so is an
+/// `oklch(…)` / `okhsl(…)` colour FUNCTION: upstream's `resolveVarRefs` short-circuits on
+/// `/^ok(lch|hsl)\(/i` alongside `#` (`theme/theme.ts:140` @v1.0.0), because a function call is a
+/// value and not a variable name. Otherwise it is treated as a var reference (an optional leading
+/// `$` is accepted for cyrup compatibility; Pi uses the bare name) and resolved recursively.
+/// Circular references and unknown vars degrade to `Inherit` (Pi throws; cyrup's `resolve()` is
+/// total and never panics, R-00-009).
 fn resolve_value(raw: &str, vars: &std::collections::BTreeMap<String, String>) -> ColorSpec {
     resolve_value_inner(raw, vars, &mut std::collections::BTreeSet::new())
 }
@@ -422,8 +441,8 @@ fn resolve_value_inner(
     if v.is_empty() {
         return ColorSpec::Inherit;
     }
-    if v.starts_with('#') {
-        return parse_hex(v);
+    if v.starts_with('#') || crate::color::is_color_function(v) {
+        return parse_color(v);
     }
     // Var reference (with or without a leading `$`).
     let var_name = v.strip_prefix('$').unwrap_or(v);
@@ -434,8 +453,8 @@ fn resolve_value_inner(
         seen.insert(var_name.to_string());
         return resolve_value_inner(next, vars, seen);
     }
-    // Not a known var: last-resort hex parse (e.g. `rrggbb` without `#`).
-    parse_hex(v)
+    // Not a known var: last-resort value parse (e.g. `rrggbb` without `#`).
+    parse_color(v)
 }
 
 /// Map a 256-color palette index to truecolor RGB (standard xterm-256 palette).
@@ -475,47 +494,22 @@ fn index_to_rgb(idx: u8) -> (u8, u8, u8) {
     }
 }
 
-/// Parse `#rrggbb` / `rrggbb` / `#rgb`. Anything malformed -> `Inherit`.
-fn parse_hex(s: &str) -> ColorSpec {
-    let h = s.trim().strip_prefix('#').unwrap_or(s.trim());
-    let bytes = h.as_bytes();
-    match bytes.len() {
-        6 => {
-            let r = hex_pair(bytes.first(), bytes.get(1));
-            let g = hex_pair(bytes.get(2), bytes.get(3));
-            let b = hex_pair(bytes.get(4), bytes.get(5));
-            match (r, g, b) {
-                (Some(r), Some(g), Some(b)) => ColorSpec::Rgb { r, g, b },
-                _ => ColorSpec::Inherit,
-            }
-        }
-        3 => {
-            let r = hex_digit(bytes.first()).map(|n| n * 17);
-            let g = hex_digit(bytes.get(1)).map(|n| n * 17);
-            let b = hex_digit(bytes.get(2)).map(|n| n * 17);
-            match (r, g, b) {
-                (Some(r), Some(g), Some(b)) => ColorSpec::Rgb { r, g, b },
-                _ => ColorSpec::Inherit,
-            }
-        }
-        _ => ColorSpec::Inherit,
+/// Parse a theme colour VALUE into a [`ColorSpec`]; anything malformed ⇒ `Inherit`.
+///
+/// TUI-131 — this was `parse_hex` and took `#rrggbb` / `rrggbb` / `#rgb` only. It now delegates to
+/// [`crate::color::parse_color`], the port of pi's `parseColor` (`packages/tui/src/colors.ts:121`
+/// @v1.0.0), so `oklch(…)` and `okhsl(…)` resolve instead of silently becoming `Inherit` — which
+/// is what every token of a pi 1.0 theme did, both built-ins included, since pi rewrote
+/// `dark.json` and `light.json` entirely in OKHSL.
+///
+/// Upstream THROWS on an unparseable value and the throw reaches the user as `Failed to load
+/// theme …`; cyrup's resolver is total by R-00-009, so an unparseable value still degrades to
+/// `Inherit` here.
+fn parse_color(s: &str) -> ColorSpec {
+    match crate::color::parse_color(s) {
+        Some((r, g, b)) => ColorSpec::Rgb { r, g, b },
+        None => ColorSpec::Inherit,
     }
-}
-
-fn hex_digit(b: Option<&u8>) -> Option<u8> {
-    let c = *b?;
-    match c {
-        b'0'..=b'9' => Some(c - b'0'),
-        b'a'..=b'f' => Some(c - b'a' + 10),
-        b'A'..=b'F' => Some(c - b'A' + 10),
-        _ => None,
-    }
-}
-
-fn hex_pair(hi: Option<&u8>, lo: Option<&u8>) -> Option<u8> {
-    let h = hex_digit(hi)?;
-    let l = hex_digit(lo)?;
-    h.checked_mul(16)?.checked_add(l)
 }
 
 /// The compiled-in `dark` theme (R-09-011), ported verbatim from Pi's `dark.json` (all 51 tokens).

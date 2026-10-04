@@ -21,6 +21,7 @@
 
 mod ask;
 mod cancel;
+mod cross_machine;
 mod list;
 mod list_cwd;
 mod pending;
@@ -318,6 +319,48 @@ impl IntercomTool {
     }
 }
 
+/// `explicitCrossMachineSendRestriction(options)` (`v0.16.0 index.ts:143-159`) — the features a
+/// `name@machine` send does NOT support, as ONE refusal computed before anything is resolved.
+///
+/// `None` for a local target, because the `@` test is the whole gate (`if (!options.to?.includes("@"))
+/// return undefined`). For a remote one there are exactly two sentences, and which one you get is
+/// upstream's split: `cwd`/`openProjectPaneIfMissing` are about OPENING something on a machine the
+/// sender cannot see, while `replyTo`/`supersedes`/`retryOf`/attachments are about a routing edge or
+/// a payload the relay envelope has no field for — its five keys are `version`, `target`, `text`,
+/// `origin`, `trust` ([`crate::cross_machine::CrossMachineEnvelope`]), so an attachment or a reply
+/// relationship could not survive the hop even if the relay wanted it to.
+///
+/// An EMPTY attachment list is not a restriction (`options.attachments?.length`), matching the
+/// local arm, which also treats `[]` as "no attachments".
+#[must_use]
+pub fn explicit_cross_machine_send_restriction(
+    to: Option<&str>,
+    cwd: Option<&str>,
+    open_project_pane_if_missing: bool,
+    attachments: Option<&[Attachment]>,
+    reply_to: Option<&str>,
+    supersedes: Option<&str>,
+    retry_of: Option<&str>,
+) -> Option<&'static str> {
+    if !to.is_some_and(|to| to.contains('@')) {
+        return None;
+    }
+    if cwd.is_some() || open_project_pane_if_missing {
+        return Some("Cross-machine send does not support cwd or opening project panes.");
+    }
+    if reply_to.is_some()
+        || supersedes.is_some()
+        || retry_of.is_some()
+        || attachments.is_some_and(|a| !a.is_empty())
+    {
+        return Some(
+            "Cross-machine send only supports a new text message; attachments, reply \
+             relationships, supersede, and retry are not supported.",
+        );
+    }
+    None
+}
+
 pub(super) fn require(value: Option<String>, msg: &str) -> Result<String, ToolError> {
     match value {
         Some(v) if !v.trim().is_empty() => Ok(v),
@@ -584,6 +627,151 @@ mod tests {
     use crate::transport::protocol::{Message, MessageContent, now_ms};
 
     use super::*;
+
+    /// ICOM-074 — `explicitCrossMachineSendRestriction` (`v0.16.0 index.ts:143-159`). The `@` test
+    /// is the whole gate, and the two sentences are upstream's split.
+    #[test]
+    fn a_cross_machine_target_refuses_panes_reply_edges_and_attachments() {
+        let attachment = || {
+            vec![
+                serde_json::from_value::<Attachment>(serde_json::json!({
+                    "type": "snippet", "name": "n", "content": "c",
+                }))
+                .expect("a well-formed attachment"),
+            ]
+        };
+        let call = |to: Option<&str>,
+                    cwd: Option<&str>,
+                    pane: bool,
+                    attachments: Option<Vec<Attachment>>,
+                    reply_to: Option<&str>,
+                    supersedes: Option<&str>,
+                    retry_of: Option<&str>| {
+            explicit_cross_machine_send_restriction(
+                to,
+                cwd,
+                pane,
+                attachments.as_deref(),
+                reply_to,
+                supersedes,
+                retry_of,
+            )
+        };
+
+        // A LOCAL target is never restricted, whatever else is set.
+        assert_eq!(
+            call(
+                Some("reviewer"),
+                Some("/repo"),
+                true,
+                Some(attachment()),
+                Some("m1"),
+                Some("m2"),
+                Some("m3")
+            ),
+            None
+        );
+        assert_eq!(
+            call(None, Some("/repo"), true, None, None, None, None),
+            None
+        );
+        // A clean remote send is not restricted either.
+        assert_eq!(
+            call(
+                Some("reviewer@ws"),
+                None,
+                false,
+                Some(Vec::new()),
+                None,
+                None,
+                None
+            ),
+            None,
+            "an EMPTY attachment list is not a restriction"
+        );
+
+        let panes = "Cross-machine send does not support cwd or opening project panes.";
+        assert_eq!(
+            call(
+                Some("reviewer@ws"),
+                Some("/repo"),
+                false,
+                None,
+                None,
+                None,
+                None
+            ),
+            Some(panes)
+        );
+        assert_eq!(
+            call(Some("reviewer@ws"), None, true, None, None, None, None),
+            Some(panes)
+        );
+
+        let payload = "Cross-machine send only supports a new text message; attachments, reply \
+                       relationships, supersede, and retry are not supported.";
+        assert_eq!(
+            call(
+                Some("reviewer@ws"),
+                None,
+                false,
+                None,
+                Some("m1"),
+                None,
+                None
+            ),
+            Some(payload)
+        );
+        assert_eq!(
+            call(
+                Some("reviewer@ws"),
+                None,
+                false,
+                None,
+                None,
+                Some("m2"),
+                None
+            ),
+            Some(payload)
+        );
+        assert_eq!(
+            call(
+                Some("reviewer@ws"),
+                None,
+                false,
+                None,
+                None,
+                None,
+                Some("m3")
+            ),
+            Some(payload)
+        );
+        assert_eq!(
+            call(
+                Some("reviewer@ws"),
+                None,
+                false,
+                Some(attachment()),
+                None,
+                None,
+                None
+            ),
+            Some(payload)
+        );
+        // The pane refusal OUTRANKS the payload one when both apply, as upstream orders them.
+        assert_eq!(
+            call(
+                Some("reviewer@ws"),
+                Some("/repo"),
+                false,
+                Some(attachment()),
+                Some("m1"),
+                None,
+                None
+            ),
+            Some(panes)
+        );
+    }
 
     /// The `intercom` tool's PROMPT SURFACE — the three `Tool` accessors that default to
     /// `None`/`None`/`Vec::new()` (`cyrup-core/src/tool.rs`) and therefore compile, run and look
@@ -963,6 +1151,150 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("")
+    }
+
+    /// ICOM-074 — the ROUTING decision: a `to` containing `@` leaves `action_send` through the
+    /// cross-machine relay (`v0.16.0 index.ts:1704-1733`) and never through the local broker.
+    ///
+    /// The fake broker below answers `register` and `list` and NOTHING else, so a `send` frame
+    /// reaching it is answered by no one. That is the point: before ICOM-074,
+    /// `reviewer@workstation` was just a session name that did not exist, so `resolve_target` fell
+    /// back to the raw string and `client.send` was dispatched into that silence. A result that
+    /// arrives promptly, naming SSH, is only reachable through the new arm.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_at_target_leaves_through_the_ssh_relay_and_never_the_local_broker() {
+        use std::sync::Mutex;
+        use std::time::Duration;
+
+        use crate::cross_machine::{CommandResult, CommandRunner};
+
+        struct Relay {
+            seen: Mutex<Vec<String>>,
+        }
+
+        #[async_trait]
+        impl CommandRunner for Relay {
+            async fn run(
+                &self,
+                command: &str,
+                args: &[&str],
+                _stdin: Option<&str>,
+                _timeout: Option<Duration>,
+            ) -> std::io::Result<CommandResult> {
+                self.seen
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(command.to_string());
+                Ok(CommandResult {
+                    stdout: match (command, args.first().copied()) {
+                        ("ssh", _) => r#"{"ok":true,"delivered":true,"id":"m-9"}"#.to_string(),
+                        (_, Some("machine")) => {
+                            r#"[{"label":"workstation","target":"user@ws","enabled":true}]"#
+                                .to_string()
+                        }
+                        _ => r#"{"agents":[{"agent":"cyrup","name":"reviewer"}]}"#.to_string(),
+                    },
+                    stderr: String::new(),
+                    code: 0,
+                    timed_out: false,
+                })
+            }
+        }
+
+        let (client, _dir) = fake_broker("self-1", Vec::new()).await;
+        let state = Arc::new(SharedIntercomState::new(
+            crate::config::IntercomConfig::default(),
+            600_000,
+            std::path::PathBuf::from("/w/proj"),
+        ));
+        let relay = Arc::new(Relay {
+            seen: Mutex::new(Vec::new()),
+        });
+        state.set_cross_machine_runner(relay.clone());
+        let tool = IntercomTool::new(state);
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            tool.action_send(
+                &action(serde_json::json!({
+                    "action": "send",
+                    "to": "reviewer@workstation",
+                    "message": "ship it",
+                })),
+                &client,
+                &CancelToken::new(),
+            ),
+        )
+        .await
+        .expect("the cross-machine arm answers without waiting on a broker that never replies")
+        .expect("delivered over SSH");
+
+        assert_eq!(
+            result_text(&result),
+            "Message sent to reviewer@workstation over SSH (origin identity is SSH-asserted)"
+        );
+        assert_eq!(
+            result.details.as_ref().map(|d| d["crossMachine"].clone()),
+            Some(serde_json::json!(true))
+        );
+        assert_eq!(
+            relay
+                .seen
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_slice(),
+            ["herdr".to_string(), "herdr".to_string(), "ssh".to_string()],
+            "discovery then ssh — the relay really ran"
+        );
+    }
+
+    /// ICOM-074 — the restriction and the target-shape refusal are WIRED into `action_send`
+    /// (`v0.16.0 index.ts:1656-1673`), and both fire before anything is resolved or spawned.
+    ///
+    /// `cwd` + `@` is the case that matters: before ICOM-074 it resolved the `cwd` locally and
+    /// delivered to whoever lived there, so `reviewer@workstation` reached a LOCAL peer.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_remote_target_with_a_pane_or_a_malformed_shape_is_refused_up_front() {
+        let (client, _dir) = fake_broker("self-1", Vec::new()).await;
+        let tool = tool();
+        let cancel = CancelToken::new();
+
+        let refused = tool
+            .action_send(
+                &action(serde_json::json!({
+                    "action": "send",
+                    "to": "reviewer@workstation",
+                    "cwd": "/w/proj",
+                    "message": "ship it",
+                })),
+                &client,
+                &cancel,
+            )
+            .await
+            .expect_err("a remote target with a cwd is refused");
+        assert_eq!(
+            refused.message,
+            "Cross-machine send does not support cwd or opening project panes."
+        );
+
+        let malformed = tool
+            .action_send(
+                &action(serde_json::json!({
+                    "action": "send",
+                    "to": "a@b@c",
+                    "message": "ship it",
+                })),
+                &client,
+                &cancel,
+            )
+            .await
+            .expect_err("a relay-of-a-relay has no legal spelling");
+        assert_eq!(
+            malformed.message,
+            "Invalid remote target \"a@b@c\"; expected name@machine or full-session-uuid@machine."
+        );
     }
 
     /// `v0.10.1 index.ts:1895-1941` — `list-cwd` end to end, the arm no test in the repo reached

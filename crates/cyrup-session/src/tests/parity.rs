@@ -740,37 +740,142 @@ fn gap23_create_exclusive_refuses_to_clobber() {
 
 #[test]
 fn gap23_first_flush_uses_exclusive_create() {
-    // The deferred first flush goes through create_exclusive: no file until an assistant exists,
-    // then the whole buffer lands (session-manager.ts:926-935).
+    // The deferred first flush goes through create_exclusive: no file until the session holds a
+    // user or assistant message, then the whole buffer lands (`_persist`'s `openSync(file,"wx")`
+    // arm gated on `_hasConversation()`, session-manager.ts:1172-1188 @v1.0.0).
+    //
+    // SESS-064: before v1.0.0 the gate was the first ASSISTANT message, and this test asserted
+    // `!exists` after `user("hi")`. The gate is now the first user OR assistant message, so the
+    // setup entries alone are what defer the file.
     let dir = tempfile::tempdir().unwrap();
     let cwd = PathBuf::from("/proj/gap23");
     let lay = SessionLayout::new(dir.path().to_path_buf(), cwd.clone());
     let mut m = SessionManager::create(&cwd, &lay, NewSessionOpts::default()).unwrap();
-    m.append_message(user("hi")).unwrap();
+    m.append_model_change("anthropic".into(), "claude-x".into())
+        .unwrap();
+    m.append_thinking_level_change("medium").unwrap();
     assert!(
         !m.session_file().unwrap().exists(),
-        "no file before the first assistant message"
+        "setup entries alone leave no file behind"
     );
-    m.append_message(asst()).unwrap();
+    m.append_message(user("hi")).unwrap();
     assert!(
         m.session_file().unwrap().exists(),
-        "file created on first assistant message"
+        "file created on the first user message"
+    );
+}
+
+// --------------------------------------------------------------- SESS-064 ----------------------
+
+/// SESS-064 — the session file is created at the first USER message, not the first assistant one.
+///
+/// pi v1.0.0 renamed the first-flush gate to `_hasConversation()` and widened it to
+/// `e.type === "message" && (e.message.role === "user" || e.message.role === "assistant")`
+/// (`core/session-manager.ts:1166-1170`), documented as: *"Starting at the user message (not the
+/// first assistant reply) keeps the prompt on disk if the first turn never completes (#10000)."*
+///
+/// This is the #10000 window itself: the user's prompt is appended, the turn then dies before any
+/// assistant message exists, and the manager is dropped. The prompt must already be on disk.
+///
+/// RED before the fix: `persist_last` gated on `has_assistant_message()`, so `create_exclusive`
+/// was never reached and `file.exists()` was `false` — the prompt was unrecoverable.
+#[test]
+fn sess064_first_user_message_creates_the_session_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = PathBuf::from("/proj/sess064");
+    let lay = SessionLayout::new(dir.path().to_path_buf(), cwd.clone());
+    let mut m = SessionManager::create(&cwd, &lay, NewSessionOpts::default()).unwrap();
+
+    // Setup entries first: these alone must still leave nothing behind.
+    m.append_model_change("anthropic".into(), "claude-x".into())
+        .unwrap();
+    let file = m.session_file().unwrap().to_path_buf();
+    assert!(!file.exists(), "a model_change alone writes no file");
+
+    // The prompt lands, and then the turn never completes — the manager just goes away.
+    m.append_message(user("SESS-064-PROMPT")).unwrap();
+    drop(m);
+
+    assert!(
+        file.exists(),
+        "the session file must exist after the first user message, so a turn that never \
+         completes does not lose the prompt (pi #10000, _hasConversation)"
+    );
+    let text = std::fs::read_to_string(&file).unwrap();
+    assert!(
+        text.contains("SESS-064-PROMPT"),
+        "the flushed buffer must hold the user line, got:\n{text}"
+    );
+    // The whole buffer flushed, header and setup entry included — not just the triggering entry.
+    let mut lines = text.lines();
+    let header: Value = serde_json::from_str(lines.next().unwrap()).unwrap();
+    assert_eq!(header["type"], "session");
+    let e1: Value = serde_json::from_str(lines.next().unwrap()).unwrap();
+    assert_eq!(e1["type"], "model_change");
+
+    // Reopening sees the user message: this is a resumable session.
+    let reopened = SessionManager::open(&file).unwrap();
+    assert!(reopened.entries().iter().any(|e| matches!(
+        e,
+        Entry::Known(KnownEntry::Message {
+            message: AgentMessage::Core(Message::User { .. }),
+            ..
+        })
+    )));
+}
+
+/// SESS-064's companion negative — the half pi kept. Setup entries alone (`session`,
+/// `model_change`, `thinking_level_change`) stay in memory, so "opening and closing pi without
+/// chatting leaves no file behind" (`session-manager.ts:1162-1165`). A `custom` message is NOT a
+/// user message either: `_hasConversation` compares `e.message.role` against the two literals, and
+/// a `CustomMessage` carries `role: "custom"`.
+#[test]
+fn sess064_setup_entries_and_a_custom_message_still_leave_no_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = PathBuf::from("/proj/sess064neg");
+    let lay = SessionLayout::new(dir.path().to_path_buf(), cwd.clone());
+    let mut m = SessionManager::create(&cwd, &lay, NewSessionOpts::default()).unwrap();
+    let file = m.session_file().unwrap().to_path_buf();
+
+    m.append_model_change("anthropic".into(), "claude-x".into())
+        .unwrap();
+    m.append_thinking_level_change("medium").unwrap();
+    m.append_agent_message(AgentMessage::Custom(CustomRoleMessage {
+        custom_type: "note".into(),
+        content: json!("an extension note"),
+        display: true,
+        details: None,
+        timestamp: 0,
+    }))
+    .unwrap();
+    drop(m);
+
+    assert!(
+        !file.exists(),
+        "setup entries and a custom message are not a conversation, so no file is created"
     );
 }
 
 // ---------------------------------------------------------------- gap 24 -----------------------
 
 #[test]
-fn gap24_clone_defers_write_until_assistant_exists() {
-    // Pi createBranchedSession defers the file write until an assistant message exists
-    // (session-manager.ts:1362-1368), avoiding an empty branched file + the duplicate-header bug.
+fn gap24_clone_defers_write_until_the_path_has_a_conversation() {
+    // Pi createBranchedSession "uses the same rule as `_persist()`: write now if the branched path
+    // already has a conversation, otherwise let `_persist()` create the file later"
+    // (session-manager.ts:1717-1724 @v1.0.0), avoiding an empty branched file + the
+    // duplicate-header bug.
+    //
+    // SESS-064: the rule used to be "until an ASSISTANT message exists", so this test branched a
+    // path holding one user message and asserted `!exists`. That path now HAS a conversation and
+    // flushes eagerly (see `sess064_*` below); a setup-only path is what still defers.
     let dir = tempfile::tempdir().unwrap();
     let cwd = PathBuf::from("/proj/gap24");
     let lay = SessionLayout::new(dir.path().to_path_buf(), cwd.clone());
     let mut m = SessionManager::create(&cwd, &lay, NewSessionOpts::default()).unwrap();
-    m.append_message(user("just a question")).unwrap(); // no assistant yet
+    m.append_model_change("anthropic".into(), "claude-x".into())
+        .unwrap(); // setup only: no conversation yet
 
-    // Branch the assistant-less path in place: the new session must NOT have written a file.
+    // Branch the conversation-less path in place: the new session must NOT have written a file.
     let leaf = m.leaf_id().cloned().unwrap();
     let cloned_path = m
         .create_branched_session(&leaf, &lay)
@@ -778,16 +883,16 @@ fn gap24_clone_defers_write_until_assistant_exists() {
         .expect("persisted branch returns a path");
     assert!(
         !cloned_path.exists(),
-        "branched session with no assistant defers its file"
+        "branched session with no conversation defers its file"
     );
 
-    // Once an assistant message arrives, the deferred buffer is flushed via create_exclusive.
-    m.append_message(asst()).unwrap();
+    // Once a user message arrives, the deferred buffer is flushed via create_exclusive.
+    m.append_message(user("just a question")).unwrap();
     assert!(
         cloned_path.exists(),
-        "deferred branched file is created on the first assistant message"
+        "deferred branched file is created on the first user message"
     );
-    // The retained user message survived into the new file.
+    // The retained setup entry survived into the new file alongside it.
     let reopened = SessionManager::open(&cloned_path).unwrap();
     assert!(reopened.entries().iter().any(|e| matches!(
         e,
@@ -796,6 +901,13 @@ fn gap24_clone_defers_write_until_assistant_exists() {
             ..
         })
     )));
+    assert!(
+        reopened
+            .entries()
+            .iter()
+            .any(|e| matches!(e, Entry::Known(KnownEntry::ModelChange { .. }))),
+        "the retained setup entry is in the flushed buffer too"
+    );
 }
 
 #[test]
@@ -1338,10 +1450,10 @@ fn f2_open_nonexistent_path_creates_a_fresh_session() {
         "the explicit path is preserved verbatim"
     );
     assert!(m.entries().is_empty(), "a fresh session starts empty");
-    // Fresh + no assistant yet ⇒ deferred flush, exactly like `newSession` (no file written yet).
+    // Fresh + no conversation yet ⇒ deferred flush, exactly like `newSession` (no file written).
     assert!(
         !path.exists(),
-        "the file is deferred until the first assistant message (Pi parity)"
+        "the file is deferred until the first user or assistant message (Pi parity)"
     );
 }
 

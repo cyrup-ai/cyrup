@@ -27,10 +27,17 @@ impl Finalized {
     /// message's tool-call list; `result_value` is derived here so it can never disagree with
     /// `message` (Pi emits `result: finalized.result` verbatim, `emitToolExecutionEnd`,
     /// `agent-loop.ts:763-771`).
+    ///
+    /// `structured_content` (`AgentToolResult.structuredContent?`, `agent/src/types.ts:429-433`
+    /// @v1.0.0, AGENT-045) is consumed HERE rather than stored: it belongs in the emitted
+    /// `result` payload but NOT in `message`, because pi's persisted `ToolResultMessage` has no
+    /// such field. A programmatic caller that needs the value back — `run_tool_call`, AGENT-047 —
+    /// is what would add a field and an accessor; until then there would be no reader.
     pub(super) fn new(
         source_index: usize,
         message: ToolResultMessage,
         terminate: TerminateHint,
+        structured_content: Option<Value>,
     ) -> Self {
         let result_value = result_value_of(
             &message.content,
@@ -38,6 +45,7 @@ impl Finalized {
             message.usage.as_ref(),
             &message.added_tool_names,
             terminate,
+            structured_content.as_ref(),
         );
         Self {
             source_index,

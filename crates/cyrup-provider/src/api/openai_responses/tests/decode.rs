@@ -268,3 +268,99 @@ async fn an_ordinary_function_call_has_no_namespace() {
     assert_eq!(tc.namespace, None);
     assert_eq!(ended.namespace, None);
 }
+
+/// PROV-116 / `1b2aa0ca0` ("reject unfinished Responses tool calls instead of running them",
+/// #9974) — a stream that reaches `response.completed` with a tool call whose
+/// `response.output_item.done` never arrived is an **error**, not a `toolUse` terminal the agent
+/// would execute (`openai-responses-shared.ts:764-775`). The message is pi's verbatim.
+#[tokio::test]
+async fn prov116_a_completed_stream_with_an_unfinished_tool_call_is_an_error() {
+    let raw = concat!(
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\"}}\n\n",
+        "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_1\",\"name\":\"bash\",\"arguments\":\"\"}}\n\n",
+        "data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":0,\"delta\":\"{\\\"command\\\":\\\"rm -r\"}\n\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\":\"completed\"}}\n\n",
+    );
+    let msg = run_decode(raw).await;
+    assert_eq!(msg.stop_reason, StopReason::Error);
+    assert_eq!(
+        msg.error_message.as_deref(),
+        Some("OpenAI Responses stream completed with an unfinished tool call: bash (call_1|fc_1)")
+    );
+}
+
+/// PROV-116 — the concrete failure `1b2aa0ca0`'s commit message describes: a non-compliant server
+/// that **omits `output_index`**, so two parallel calls collide on one slot key. `create_slot`
+/// overwrites `slots[0]`, orphaning the first block, and the second call's `output_item.done`
+/// then clears the slot — so at end-of-stream the slot table is empty while an unfinished call
+/// sits in the content. That is why the marker has to be per-block (upstream's deleted
+/// `partialJson` scratch field, ported here as `RBlock::Tool::finished`) and not per-slot.
+///
+/// Note that the orphaned call's argument buffer is also **empty** here: it never received a
+/// delta. A "non-empty `partial_json`" marker would miss it entirely.
+#[tokio::test]
+async fn prov116_a_server_omitting_output_index_cannot_smuggle_an_orphaned_call_through() {
+    let raw = concat!(
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\"}}\n\n",
+        // Two parallel calls, both with no `output_index` at all.
+        "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_1\",\"name\":\"echo\",\"arguments\":\"\"}}\n\n",
+        "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"function_call\",\"id\":\"fc_2\",\"call_id\":\"call_2\",\"name\":\"echo\",\"arguments\":\"\"}}\n\n",
+        "data: {\"type\":\"response.function_call_arguments.delta\",\"delta\":\"{\\\"x\\\":\\\"b\\\"}\"}\n\n",
+        // Only the SECOND call is finished.
+        "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"id\":\"fc_2\",\"call_id\":\"call_2\",\"name\":\"echo\",\"arguments\":\"{\\\"x\\\":\\\"b\\\"}\"}}\n\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\":\"completed\"}}\n\n",
+    );
+    let msg = run_decode(raw).await;
+    assert_eq!(msg.stop_reason, StopReason::Error);
+    // The FIRST offender in content order is named, as upstream's `for (const block of
+    // output.content)` throw does.
+    assert_eq!(
+        msg.error_message.as_deref(),
+        Some("OpenAI Responses stream completed with an unfinished tool call: echo (call_1|fc_1)")
+    );
+}
+
+/// PROV-116 ordering — upstream raises the unfinished-call error **after** the terminal-event
+/// check (`openai-responses-shared.ts:760-775`), so a stream that was cut before
+/// `response.completed` still reports the truncation. The unfinished call is present here, which
+/// is what makes the ordering observable.
+#[tokio::test]
+async fn prov116_a_truncated_stream_reports_truncation_not_the_unfinished_call() {
+    let raw = concat!(
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\"}}\n\n",
+        "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_1\",\"name\":\"bash\",\"arguments\":\"\"}}\n\n",
+        "data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":0,\"delta\":\"{\\\"command\\\":\\\"ls\"}\n\n",
+    );
+    let msg = run_decode(raw).await;
+    assert_eq!(msg.stop_reason, StopReason::Error);
+    let err = msg.error_message.unwrap();
+    assert!(err.contains("terminal response event"), "{err}");
+    assert!(!err.contains("unfinished tool call"), "{err}");
+}
+
+/// PROV-116 negative control — a stream whose terminal stop reason is **not** `toolUse` is left
+/// alone (`if (output.stopReason === "toolUse")`, `openai-responses-shared.ts:764`). A reasoning
+/// item never carries the marker, and an `incomplete`/`length` terminal with a *finished* call is
+/// not rewritten either.
+#[tokio::test]
+async fn prov116_the_guard_only_applies_to_a_tool_use_terminal() {
+    // A finished call plus a `max_output_tokens` incomplete: `length`, not `toolUse`, and the
+    // call is finished anyway — nothing to report.
+    let raw = concat!(
+        "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_1\",\"name\":\"echo\",\"arguments\":\"\"}}\n\n",
+        "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_1\",\"name\":\"echo\",\"arguments\":\"{}\"}}\n\n",
+        "data: {\"type\":\"response.incomplete\",\"response\":{\"id\":\"r\",\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"}}}\n\n",
+    );
+    let msg = run_decode(raw).await;
+    assert_eq!(msg.stop_reason, StopReason::Length);
+    assert!(msg.error_message.is_none());
+
+    // Plain text, no tool blocks at all: a clean `stop`.
+    let raw = concat!(
+        "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_a\"}}\n\n",
+        "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"hi\"}\n\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r\",\"status\":\"completed\"}}\n\n",
+    );
+    let msg = run_decode(raw).await;
+    assert_eq!(msg.stop_reason, StopReason::Stop);
+}

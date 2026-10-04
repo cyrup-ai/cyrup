@@ -554,6 +554,17 @@ pub struct RunOptions {
     /// model with [`crate::exec::fallback::provider_of`]; `None` (headless / no live session)
     /// leaves a bare id for the child to resolve, exactly as before this field was consumed.
     pub preferred_provider: Option<ProviderId>,
+    /// SUBA-155 — the PARENT session's model as `provider/id` (pi `parentModel`, the third
+    /// argument of `resolveModelScopesForAgent`, `src/runs/shared/model-scope.ts:160` @v0.74.0).
+    ///
+    /// The reserved `modelScope` allow tokens expand against it: `inherit` becomes this exact
+    /// `provider/id`, and `scoped` degrades to it when the parent has no scoped-model snapshot.
+    /// Carried beside [`Self::preferred_provider`] and derived from the SAME
+    /// `inherited_session_model` that field is split off, so the two can never disagree about
+    /// which session is the parent. `None` (headless / no live session) leaves a reserved token
+    /// UNEXPANDED, which is upstream's fail-closed rule: an enforced scope made of reserved
+    /// tokens then matches nothing and refuses the run rather than admitting everything.
+    pub parent_model: Option<ModelId>,
     pub available_models: Vec<ModelId>,
     /// Hard-abort cancellation, raced independently of `interrupt` (arch-SA §5.1).
     pub cancel: CancelToken,
@@ -650,6 +661,22 @@ pub struct RunOptions {
     /// permission companion reads it (`forwarding/mod.rs`) to address the parent's ask-forwarding
     /// inbox; this crate only ever WRITES it.
     pub parent_session_id: Option<String>,
+    /// SUBA-158 — the LAUNCHING session's project trust, handed to this child (pi
+    /// `ChildSessionLaunch.projectTrusted`, `src/runs/shared/child-session.ts:59` @v0.74.0, filled
+    /// at every launch site from `sessionProjectTrust(ctx)`,
+    /// `src/runs/foreground/subagent-executor.ts:645`).
+    ///
+    /// `Some(true)`/`Some(false)` reach the child as `--approve`/`--no-approve` and as
+    /// [`crate::exec::PARENT_PROJECT_TRUSTED_ENV`] for the next hop. `None` is pi's `undefined` —
+    /// "this host has no trust concept" — and emits neither, so the child decides for itself
+    /// exactly as it did before this field existed. It is therefore the correct value for the
+    /// detached hop-2 runner (which resolves the INHERITED env rung instead) and for every test.
+    ///
+    /// Filled at the foreground launch sites from
+    /// [`cyrup_ext::host::HostServices::is_project_trusted`] — the direct analog of upstream's
+    /// `ctx.isProjectTrusted()` — and `None` whenever the P-1 host slot is unbound, which is the
+    /// one place cyrup can tell "no host" from "host says untrusted".
+    pub parent_project_trusted: Option<bool>,
     /// Optional clarify/ask dispatch context (R-SA-037/119/120). When `Some`, [`crate::exec::drive_attempt::drive_attempt`]'s
     /// NDJSON loop fires [`crate::tui::intercom::spawn_clarify`] against the executor's single-slot
     /// [`crate::tui::intercom::AskLock`] the moment the child emits a BLOCKING `contact_supervisor`

@@ -71,8 +71,8 @@ use super::device_code::{
 };
 use super::interaction::{AuthEvent, AuthInteraction, AuthPrompt};
 use super::query::encode_query;
-use crate::auth::OAuthAuth;
 use crate::auth::types::{AuthContext, Credential, EnvAuthContext, ModelAuth};
+use crate::auth::{LoginOptions, OAuthAuth};
 use crate::error::AuthError;
 use crate::providers::github_copilot::{
     COPILOT_API_VERSION, COPILOT_HEADERS, CopilotModelCatalog, DEFAULT_GITHUB_DOMAIN,
@@ -1101,7 +1101,11 @@ impl OAuthAuth for GitHubCopilotLogin {
     /// an optional GitHub Enterprise domain, run the RFC 8628 device grant against that domain,
     /// exchange the resulting GitHub token for a Copilot token, accept every model policy, then
     /// record the account's selectable model ids on the credential.
-    async fn login(&self, interaction: &dyn AuthInteraction) -> Result<Credential, OAuthError> {
+    async fn login(
+        &self,
+        interaction: &dyn AuthInteraction,
+        _options: &LoginOptions,
+    ) -> Result<Credential, OAuthError> {
         self.run_login(interaction).await
     }
 
@@ -1773,7 +1777,10 @@ mod tests {
         .await;
 
         let interaction = ScriptedInteraction::new(vec![Ok(String::new())]);
-        let credential = flow(&origin).login(&interaction).await.unwrap();
+        let credential = flow(&origin)
+            .login(&interaction, &LoginOptions::default())
+            .await
+            .unwrap();
 
         // The credential (`:270-276` + `:355-358`).
         let (refresh, access, expires, ext) = match credential {
@@ -1935,7 +1942,10 @@ mod tests {
             .await;
 
             let interaction = ScriptedInteraction::new(vec![Ok(String::new())]);
-            let credential = flow(&origin).login(&interaction).await.unwrap();
+            let credential = flow(&origin)
+                .login(&interaction, &LoginOptions::default())
+                .await
+                .unwrap();
 
             assert_eq!(policy_paths(&log), vec!["/models/gpt-5.5/policy"]);
             // (d) the union, deduplicated, in first-seen order: the picker ids then the newly
@@ -1984,7 +1994,10 @@ mod tests {
             .await;
 
             let interaction = ScriptedInteraction::new(vec![Ok(String::new())]);
-            let credential = flow(&origin).login(&interaction).await.unwrap();
+            let credential = flow(&origin)
+                .login(&interaction, &LoginOptions::default())
+                .await
+                .unwrap();
             assert_eq!(policy_paths(&log), vec!["/models/gpt-5.5/policy"]);
             assert_eq!(available_ids(&credential), vec!["gpt-5.5".to_string()]);
         }
@@ -2015,7 +2028,10 @@ mod tests {
             .await;
 
             let interaction = ScriptedInteraction::new(vec![Ok(String::new())]);
-            let credential = flow(&origin).login(&interaction).await.unwrap();
+            let credential = flow(&origin)
+                .login(&interaction, &LoginOptions::default())
+                .await
+                .unwrap();
             assert_eq!(
                 policy_paths(&log),
                 vec!["/models/gpt-5.5/policy", "/models/gpt-5.5/policy"],
@@ -2056,7 +2072,10 @@ mod tests {
             .await;
 
             let interaction = ScriptedInteraction::new(vec![Ok(String::new())]);
-            let credential = flow(&origin).login(&interaction).await.unwrap();
+            let credential = flow(&origin)
+                .login(&interaction, &LoginOptions::default())
+                .await
+                .unwrap();
 
             // `maxRetries: 2` ⇒ the first attempt plus two retries, all for the FIRST id only.
             assert_eq!(
@@ -2109,7 +2128,10 @@ mod tests {
 
                 let answer = if enterprise { "company.ghe.com" } else { "" };
                 let interaction = ScriptedInteraction::new(vec![Ok(answer.to_string())]);
-                let credential = flow(&origin).login(&interaction).await.unwrap();
+                let credential = flow(&origin)
+                    .login(&interaction, &LoginOptions::default())
+                    .await
+                    .unwrap();
                 assert_eq!(
                     available_ids(&credential),
                     expected,
@@ -2179,10 +2201,13 @@ mod tests {
             // 4s is far above the ~2.2s the scripted device flow itself costs and far below the
             // five MINUTES an unbounded stall would take (`stream/sse.rs:66`), so what this wrapper
             // measures is the budget and nothing else.
-            let credential = tokio::time::timeout(Duration::from_secs(4), flow.login(&interaction))
-                .await
-                .expect("the retry budget must end the stalled attempt")
-                .expect("an abort inside the batch must not fail the login");
+            let credential = tokio::time::timeout(
+                Duration::from_secs(4),
+                flow.login(&interaction, &LoginOptions::default()),
+            )
+            .await
+            .expect("the retry budget must end the stalled attempt")
+            .expect("an abort inside the batch must not fail the login");
 
             // Two attempts: the 429 and the stalled retry. `max_retries: 2` would allow a third, but
             // the budget is gone before it can be issued.
@@ -2233,10 +2258,13 @@ mod tests {
             });
             // Same margin as the budget test: well above the scripted device flow's own ~2.2s,
             // far below an unbounded stall's five minutes.
-            let credential = tokio::time::timeout(Duration::from_secs(4), flow.login(&interaction))
-                .await
-                .expect("the per-attempt cap must end the stalled POST")
-                .expect("an abort inside the batch must not fail the login");
+            let credential = tokio::time::timeout(
+                Duration::from_secs(4),
+                flow.login(&interaction, &LoginOptions::default()),
+            )
+            .await
+            .expect("the per-attempt cap must end the stalled POST")
+            .expect("an abort inside the batch must not fail the login");
 
             // `max_retries: 0` means `retry == policy.max_retries` on the first pass, so there is
             // exactly one attempt — and it was capped.
@@ -2258,7 +2286,10 @@ mod tests {
     async fn unparseable_enterprise_domain_is_rejected_before_any_request() {
         let (origin, log) = spawn(Arc::new(|_, _| (200, "{}".to_string()))).await;
         let interaction = ScriptedInteraction::new(vec![Ok("://".to_string())]);
-        let err = flow(&origin).login(&interaction).await.unwrap_err();
+        let err = flow(&origin)
+            .login(&interaction, &LoginOptions::default())
+            .await
+            .unwrap_err();
         assert_eq!(err.to_string(), "Invalid GitHub Enterprise URL/domain");
         assert!(log.lock().unwrap().is_empty(), "no network call was made");
 
@@ -2287,7 +2318,10 @@ mod tests {
 
         let interaction =
             ScriptedInteraction::new(vec![Ok("  https://Company.GHE.com/x  ".into())]);
-        let credential = flow(&origin).login(&interaction).await.unwrap();
+        let credential = flow(&origin)
+            .login(&interaction, &LoginOptions::default())
+            .await
+            .unwrap();
         let Credential::Oauth { ext, .. } = credential else {
             panic!("expected an OAuth credential");
         };
@@ -2307,7 +2341,10 @@ mod tests {
         cancel.cancel();
         let interaction =
             ScriptedInteraction::new(vec![Ok(String::new())]).with_cancel(cancel.clone());
-        let err = flow(&origin).login(&interaction).await.unwrap_err();
+        let err = flow(&origin)
+            .login(&interaction, &LoginOptions::default())
+            .await
+            .unwrap_err();
         assert_eq!(err.to_string(), "Login cancelled");
         assert!(log.lock().unwrap().is_empty());
     }

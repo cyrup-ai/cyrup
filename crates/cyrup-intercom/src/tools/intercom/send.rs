@@ -11,9 +11,10 @@ use crate::tools::{detailed_result, text_result};
 use crate::transport::client::{IntercomClient, SendOptions};
 use crate::transport::protocol::now_ms;
 
+use super::cross_machine::deliver_cross_machine;
 use super::{
-    CwdDeliveryOptions, DeliveryTarget, IntercomParams, IntercomTool, resolve_cwd_delivery_target,
-    to_tool_err,
+    CwdDeliveryOptions, DeliveryTarget, IntercomParams, IntercomTool,
+    explicit_cross_machine_send_restriction, resolve_cwd_delivery_target, to_tool_err,
 };
 
 impl IntercomTool {
@@ -38,6 +39,32 @@ impl IntercomTool {
             }
         };
         let open_pane = params.open_project_pane_if_missing.unwrap_or(false);
+        // ICOM-074 — `v0.16.0 index.ts:1655-1673`, the FIRST thing `deliverMessage` does. A `to`
+        // containing `@` is a cross-machine target, and the two refusals below are checked before
+        // anything is resolved, confirmed or spawned: the restriction, then the target's shape.
+        //
+        // The shape check is not redundant with `discover_remote_agent`'s identical call. Upstream
+        // runs it here too (`:1666`) because `parseCrossMachineTarget` refuses `a@b@c` and
+        // `rev iewer@ws`, and those must fail with the TARGET error rather than reaching the relay
+        // — which is the only reason `reviewer@` is not simply a session name that does not exist.
+        let cross_machine_target = to.as_deref().is_some_and(|to| to.contains('@'));
+        if let Some(restriction) = explicit_cross_machine_send_restriction(
+            to.as_deref(),
+            cwd.as_deref(),
+            open_pane,
+            params.attachments.as_deref(),
+            params.reply_to.as_deref(),
+            params.supersedes.as_deref(),
+            params.retry_of.as_deref(),
+        ) {
+            return Err(ToolError::new(restriction));
+        }
+        if cross_machine_target
+            && let Some(to) = to.as_deref()
+            && let Err(error) = crate::cross_machine::parse_cross_machine_target(to)
+        {
+            return Err(ToolError::new(error.to_string()));
+        }
         // `v0.12.0 index.ts:2322-2326` — verbatim, and BEFORE the confirm, so a flag typo never
         // costs a dialog.
         if open_pane && cwd.is_none() {
@@ -58,6 +85,35 @@ impl IntercomTool {
             .map(format_attachments)
             .unwrap_or_default();
         let launch_possible = cwd.is_some() && open_pane;
+
+        // ICOM-074 — `v0.16.0 index.ts:1704-1733`. Sits after `confirmSend` is computed (the
+        // remote confirm uses it) and before any local resolution, because `name@machine` names no
+        // local session and `resolve_target` would hand the raw string to the broker as a target
+        // that does not exist.
+        if cross_machine_target && let Some(to) = to.as_deref() {
+            // `{ name: identity.name, sessionId: connectedClient.sessionId ?? ctx.sessionManager
+            // .getSessionId(), machine: config.crossMachine.machineName }` (`:1705-1710`): WHO this
+            // session claims to be, in the remote host's terms. The name is
+            // `buildPresenceIdentity`'s, so the origin matches the address local peers already hold.
+            let origin = crate::cross_machine::CrossMachineOrigin {
+                name: crate::connect::presence_identity_name(&self.state, None).unwrap_or_default(),
+                session_id: client
+                    .session_id()
+                    .or_else(|| crate::connect::resolved_intercom_session_id(&self.state))
+                    .unwrap_or_default(),
+                machine: self.state.config.cross_machine.machine_name.clone(),
+            };
+            let runner = self.state.cross_machine_runner();
+            return deliver_cross_machine(
+                &self.state,
+                runner.as_ref(),
+                to,
+                &message,
+                origin,
+                confirm_send,
+            )
+            .await;
+        }
 
         // `v0.12.0 index.ts:2330-2341`: the label is `to ?? cwd` — there is no resolved peer name
         // yet, and if the launch fails there never will be one. Asking here is what makes the

@@ -193,6 +193,15 @@ impl AgentMessage {
         matches!(self, AgentMessage::Core(Message::Assistant(_)))
     }
 
+    /// `true` for the core `user` role. Pi's `_hasConversation` tests
+    /// `e.message.role === "user" || e.message.role === "assistant"`
+    /// (`session-manager.ts:1166-1170` @v1.0.0); a `bashExecution`, `custom`, `branchSummary` or
+    /// `compactionSummary` message carries its own role and is therefore NOT a user message, even
+    /// though [`MessageRole::is_turn_start`] groups several of them with `user`.
+    pub fn is_core_user(&self) -> bool {
+        matches!(self, AgentMessage::Core(Message::User { .. }))
+    }
+
     /// `true` for the core `toolResult` role (never a valid cut point — Pi `compaction.ts:320-321`).
     pub fn is_tool_result(&self) -> bool {
         matches!(self, AgentMessage::Core(Message::ToolResult { .. }))

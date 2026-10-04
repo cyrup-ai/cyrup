@@ -1690,6 +1690,10 @@ impl Tool for StructuredOutputTool {
             details: Some(serde_json::json!({ "path": self.output_path.display().to_string() })),
             usage: None,
             added_tool_names: Vec::new(),
+            // AGENT-045 — this tool writes the structured payload to `output_path` and reports the
+            // path, so there is no in-band machine-readable half to carry. Declaring one here
+            // would also require an `output_schema`, which this tool does not have.
+            structured_content: None,
             terminate: TerminateHint::Terminate,
         })
     }

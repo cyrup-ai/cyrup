@@ -205,9 +205,15 @@ pub(super) async fn process_event(
                     if let Some(RBlock::Tool {
                         partial_json,
                         namespace,
+                        finished,
                         ..
                     }) = dec.block_mut(ci)
                     {
+                        // `delete slot.block.partialJson` — "Finalize in-place and strip the
+                        // scratch buffer" (`openai-responses-shared.ts:718-720`). cyrup keeps the
+                        // buffer as the argument state and flips the marker instead; PROV-116's
+                        // end-of-stream guard reads it.
+                        *finished = true;
                         // `if (item.namespace !== undefined) slot.block.namespace = item.namespace`
                         // (`openai-responses-shared.ts:715`): the done item can carry a namespace
                         // the `added` item did not, and it overrides one that did.

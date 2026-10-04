@@ -113,6 +113,14 @@ pub struct AfterToolCall<'a> {
 pub struct AfterOverride {
     pub content: Option<Vec<Content>>,
     pub details: Option<Value>,
+    /// Replaces [`cyrup_core::ToolResult::structured_content`] when `Some` (Pi
+    /// `AfterToolCallResult.structuredContent`, `agent/src/types.ts:85-88,95` @v1.0.0).
+    ///
+    /// `None` does NOT simply mean "keep": upstream's rule is *"if `content` is provided without
+    /// it, the structured content is dropped, because it may no longer match the content. Return
+    /// it along with `content` to keep it."* So the three cases are decided jointly with
+    /// [`Self::content`], and the fold implements that — see `fold_tool_outcome`. AGENT-045.
+    pub structured_content: Option<Value>,
     /// Replaces the tool result's usage in full when `Some` (Pi `AfterToolCallResult.usage`,
     /// types.ts:83-84: "if provided, replaces the tool result usage … There is no deep merge for
     /// `content`, `details`, or `usage`").
@@ -132,7 +140,13 @@ pub enum AfterOutcome {
     /// `undefined` upstream: the tool's own result stands.
     Keep,
     /// Replace-not-merge per field (`afterResult.x ?? result.x`, `agent-loop.ts:738-745`).
-    Override(AfterOverride),
+    ///
+    /// Boxed for the same reason as `Prep::Immediate`: [`AfterOverride`] carries six optional
+    /// replacement fields and dwarfs both `Keep` (empty) and `Failed` (one error), so an unboxed
+    /// variant makes the COMMON `Keep` answer — what every hook-less call and every hook with no
+    /// opinion returns — pay for the largest one. AGENT-045's `structured_content` is what tipped
+    /// it past the lint.
+    Override(Box<AfterOverride>),
     /// The hook itself failed: the WHOLE result becomes an error result carrying the error's own
     /// text, with `usage` and `added_tool_names` dropped and `terminate` cleared
     /// (`createErrorToolResult(error.message)`, `agent-loop.ts:747-750`; R-02-050).

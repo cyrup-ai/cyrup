@@ -108,8 +108,9 @@ the command palette.
 - **A session tree on disk** as JSONL, with compaction, forking, import and export.
 - **Five run modes.** The terminal interface, plus `--mode print`, `--mode json` and `--mode rpc`
   for scripting and embedding, and `--mode acp` to run as an
-  [editor's agent](docs/guide/guides/zed-acp.md). `--tui-mode fullscreen` switches to an
-  alternate-screen renderer with mouse capture, a scrollbar, text selection and image support.
+  [editor's agent](docs/guide/guides/zed-acp.md). The terminal interface runs in the
+  alternate-screen renderer by default — mouse capture, a scrollbar, text selection and image
+  support; `--tui-mode regular` (or `"tuiMode": "regular"`) keeps the terminal's normal scrollback.
 - **Subagent delegation** in the foreground or background, as single runs, chains, parallel fans
   or `workflowScript` plans, where the agent writes its orchestration once as JavaScript and the plan
   runs without further inference. Background runs survive a restart via a session index and durable

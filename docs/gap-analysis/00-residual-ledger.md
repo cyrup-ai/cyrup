@@ -5,6 +5,73 @@ next work item**.
 
 ---
 
+# UPDATE 2026-10-04 — eighteen rows closed (seven counted here, ten in area 13), three re-rated, none filed
+
+> **This block sits above the 2026-10-03 (ledger corrections) block and moves its counts.** The count
+> is whatever `python3 docs/gap-analysis/scripts/count_open_items.py` prints: on 2026-10-04, after
+> this pass, it prints **176 open: 0 critical, 1 high, 25 medium, 150 low; 17 trackers; 850 closed;
+> 2 duplicates not counted** (ledger corrections: 183 open, 1 high, 29 medium, 153 low, 842 closed,
+> 3 duplicates). By area: `01` 30, `02` 4, `03` 9, `04` 5, `05` 8, `06` 18, `07` 32, `08` 7, `09` 2, `09b` 30, `10` 1, `11` 11, `12` 2, `14` 0, `16` 2, `17` 1, `18` 13, `09a` 1.
+>
+> Arithmetic: open 183 − 7 counted closures (`PROV-114`, `PROV-115`, `PROV-116`, `PROV-117`,
+> `SUBA-154`, `SUBA-156`, `CFG-096`) = 176, with nothing filed. Closed 842 + 8 = 850 — eight strikes,
+> because `TUI-135` is `duplicate-of: CFG-096` and was never counted open, which is also why the
+> duplicate tally falls 3 → 2. High 1 − 1 (`PROV-115`) + 1 (`TUI-107`, re-rated) = 1. Medium 29 − 6
+> + 2 (`TUI-110`, `TUI-136`, re-rated) = 25. Low 153 − 3 (the three re-rated rows leaving `low`) = 150.
+> Area 13 is counted in its own file: ten rows closed there.
+>
+> **`PROV-115`, the one high the pi 1.0 survey left, is closed — and a different high replaces it.**
+> `TUI-107` was filed `low` on the reasoning that fullscreen was opt-in. `CFG-096` makes fullscreen
+> the default, and that reasoning priced reachability rather than severity, so it is withdrawn:
+> pointer input reaching only the scrollbar, selection and wheel is a `high` in a renderer cyrup
+> ships. `TUI-110` and `TUI-136` move to `medium` for the same reason. The count went up by being
+> honest, and `ADR-0005` carries the amendment that says so.
+>
+> **Area 13 is counted in [`13-cyrup-mcp-STATUS.md`](13-cyrup-mcp-STATUS.md), not here.** Ten of its
+> rows closed in the same pass — `MCP-589` `591` `593` `594` `595` `596` `600` `601` `602` `607` —
+> and that file's own census moves accordingly: the counted set stays **545** units while
+> `implemented` goes 347 → **357**, `partial` 67 → **62** and `missing` 97 → **92**. `MCP-602`, the
+> second high the pi 1.0 survey filed, is among them, so the `v2.38.0..v5.0.0` window has no open
+> high left either.
+>
+> ## Closed (each row carries its own evidence and the tests that pin it)
+>
+> * **`PROV-114`**, **`PROV-115`**, **`PROV-116`**, **`PROV-117`** (`01`) — Mistral reasoning lowering
+>   keys off `thinkingLevelMap` presence instead of a deleted model-id list, and the effort override
+>   spans all five upstream values; an empty Mistral text delta no longer opens a text block, so a GLM
+>   turn survives a transcript replay; a completed OpenAI Responses stream with an unfinished tool call
+>   is an error rather than truncated arguments, including when the server omits `output_index`; and a
+>   loopback callback that cannot bind degrades to the manual-paste prompt instead of aborting
+>   `/login`.
+> * **`SUBA-154`**, **`SUBA-156`** (`09b`) — the worktree diff and patch option lists carry upstream's
+>   explicit `--src-prefix` / `--dst-prefix` pair, so a capture no longer needs git ≥ 2.43 and a failed
+>   capture no longer costs the child's patch; and the MCP direct-tool reader models `inheritEnv` and
+>   `literalEnv`, so an agent-plugin server's identity digest agrees with the writer's and its `mcp:`
+>   selectors resolve. `SUBA-156` landed in one commit with `MCP-594`, as both rows require.
+> * **`MCP-589`**, **`MCP-591`**, **`MCP-593`**, **`MCP-594`**, **`MCP-595`**, **`MCP-596`**,
+>   **`MCP-600`**, **`MCP-601`**, **`MCP-602`**, **`MCP-607`** (`13b`, `13c`, `13e`, `13i`) — an
+>   unparseable MCP config is reported and left byte-identical rather than clobbered; project-scoped
+>   servers are gated on trust *and* per-definition approval; `auth: { provider: "<name>" }` reaches a
+>   reader and sends the provider's token per request, same-origin only; the metadata-cache digest
+>   pre-image carries the two stdio keys and the literal `env` arm; the seven-day metadata expiry is
+>   gone and a server-declared TTL bounds the entry instead; a private cache scope and a
+>   `discoveryFailed` marker invalidate an entry on both the read and the write side; a tool call is
+>   marked in flight before the approval gate; MCP tool annotations reach `describe` and the approval
+>   dialog; `approveTools` fails **closed** on a value it cannot read; and a progress notification
+>   restarts a call's deadline.
+>
+> **Three closures correct the row they close**, and the correction is on the row rather than left to
+> be re-derived: `MCP-596`'s `cacheScope` is a server-declared `tools/list` field captured from the
+> first page, not something inferred from a connection's authorization context; `MCP-607`'s premise
+> that cyrup requests no progress token was false, because rmcp sets one on every request's `_meta`
+> unconditionally and only the listener was missing; and `PROV-117`'s claim that the Codex flow shares
+> the defect was wrong — that flow already degraded. `MCP-595` additionally records that it must
+> **not** be mirrored into `cyrup-ext-subagents`, whose own seven-day limit matches `pi-subagents`
+> v0.74.0: the two readers disagree upstream, and mirroring would have been the defect.
+>
+> **Nothing was filed and no open row was annotated.** Ids are unmoved, so every *Next free ids* line
+> in the blocks below still holds.
+
 # UPDATE 2026-10-03 (ledger corrections) — pi-1.0 rows reviewed and corrected, 21 rows filed, one closed row, no code moved (`claude/ledger-corrections-pi-1.0.1`)
 
 > **This block sits above the batch-6 block and moves its counts; it is a docs-only change.** The count is

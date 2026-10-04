@@ -168,25 +168,36 @@ impl SessionManager {
                 let line = e.to_line()?;
                 self.store.append_line(&line)?;
             }
-        } else if self.has_assistant_message() {
-            // First assistant message → exclusive-create the file and write everything buffered so
-            // far (Pi `_persist` first flush via `openSync(file,"wx")`, `session-manager.ts:926-935`).
+        } else if self.has_conversation() {
+            // First user OR assistant message → exclusive-create the file and write everything
+            // buffered so far (Pi `_persist`'s first flush via `openSync(file,"wx")`,
+            // `session-manager.ts:1172-1188` @v1.0.0, gated on `_hasConversation()` at `:1176`).
             self.store.create_exclusive(&self.header, &self.entries)?;
             self.flushed = true;
         }
         Ok(())
     }
 
-    fn has_assistant_message(&self) -> bool {
-        entries_have_assistant(&self.entries)
+    fn has_conversation(&self) -> bool {
+        entries_have_conversation(&self.entries)
     }
 }
 
-/// Whether any entry is a core `assistant` message (Pi's `hasAssistant` guard,
-/// `session-manager.ts:915,1362`). Drives the deferred first-flush.
-fn entries_have_assistant(entries: &[Entry]) -> bool {
+/// Whether any entry is a core `user` **or** `assistant` message — Pi `_hasConversation`
+/// (`session-manager.ts:1166-1170` @v1.0.0). Drives the deferred first-flush.
+///
+/// A new session file is created only once the session contains a user or assistant message. Setup
+/// entries alone (model, thinking level, system prompt) stay in memory so opening and closing
+/// without chatting leaves no file behind. Starting at the **user** message (not the first
+/// assistant reply) keeps the prompt on disk if the first turn never completes (pi #10000);
+/// before v1.0.0 the gate was the first assistant message, so a prompt whose turn died was lost.
+fn entries_have_conversation(entries: &[Entry]) -> bool {
     entries.iter().any(|e| {
-        matches!(e, Entry::Known(KnownEntry::Message { message, .. }) if message.is_core_assistant())
+        matches!(
+            e,
+            Entry::Known(KnownEntry::Message { message, .. })
+                if message.is_core_user() || message.is_core_assistant()
+        )
     })
 }
 

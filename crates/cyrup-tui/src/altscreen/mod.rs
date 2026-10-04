@@ -242,13 +242,17 @@ use crate::component::Component;
 /// `keybindings.ts:159` (§B-9).
 ///
 /// Deliberately **not** `cyrup-config`'s `tuiMode` settings type (ADR-0005 §Decision A-3): that key
-/// records what the user *asked for* and degrades any unknown value to `regular`
-/// (`settings-manager.ts:1201-1203`); this records which renderer is actually *running*. The composition
-/// root maps one onto the other, so this crate's seam does not wait on A-3 to be defined.
+/// records what the user *asked for* and degrades any unknown value to `fullscreen`
+/// (`settings-manager.ts:1349` @v1.0.0 — CFG-096/TUI-135 inverted that degrade); this records which
+/// renderer is actually *running*. The composition root maps one onto the other, so this crate's
+/// seam does not wait on A-3 to be defined.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum TuiRenderMode {
-    /// The inline (`Viewport::Inline`) renderer — pi's `"regular"`. cyrup's default in every build
-    /// under every setting, exactly as upstream (`settings-manager.ts:1201-1203`).
+    /// The inline (`Viewport::Inline`) renderer — pi's `"regular"`. The `Default` here is a
+    /// RENDERER default, not the settings default: an `App` starts inline and the composition root
+    /// switches it (`crates/cyrup/src/interactive.rs`), which since CFG-096/TUI-135 it does on
+    /// every boot that does not opt out — pi's `tuiMode` now degrades to `fullscreen`
+    /// (`settings-manager.ts:1349` @v1.0.0).
     #[default]
     Regular,
     /// The alternate-screen renderer — pi's `"fullscreen"` (`tui-alt-screen.ts:168`).

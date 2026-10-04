@@ -30,7 +30,7 @@ use cyrup_core::EventStream;
 use cyrup_core::{ProviderId, StopReason};
 use cyrup_provider::AuthError as ProviderAuthError;
 use cyrup_provider::auth::oauth::{AuthEvent, AuthInteraction, AuthPrompt, OAuthError};
-use cyrup_provider::auth::{ApiKeyAuth, ModelAuth, OAuthAuth, ProviderAuth};
+use cyrup_provider::auth::{ApiKeyAuth, LoginOptions, ModelAuth, OAuthAuth, ProviderAuth};
 use cyrup_provider::faux::{FauxProvider, faux_assistant_message, faux_text};
 use cyrup_provider::{Context, Credential, Model, Provider, StreamEvent, StreamOptions};
 use cyrup_session_svc::{AgentSession, SessionBuilder, SessionConfig};
@@ -52,7 +52,11 @@ impl OAuthAuth for ScriptedOauth {
     fn login_label(&self) -> Option<&str> {
         Some("Sign in with Stub")
     }
-    async fn login(&self, interaction: &dyn AuthInteraction) -> Result<Credential, OAuthError> {
+    async fn login(
+        &self,
+        interaction: &dyn AuthInteraction,
+        _options: &LoginOptions,
+    ) -> Result<Credential, OAuthError> {
         interaction.notify(AuthEvent::AuthUrl {
             url: "https://stub.invalid/authorize".to_string(),
             instructions: Some("Approve, then paste the code".to_string()),
@@ -83,7 +87,11 @@ impl OAuthAuth for FailingOauth {
     fn name(&self) -> &str {
         "Stub (Pro/Max)"
     }
-    async fn login(&self, _interaction: &dyn AuthInteraction) -> Result<Credential, OAuthError> {
+    async fn login(
+        &self,
+        _interaction: &dyn AuthInteraction,
+        _options: &LoginOptions,
+    ) -> Result<Credential, OAuthError> {
         Err(OAuthError::Failed("token endpoint said no".to_string()))
     }
     async fn refresh(&self, cred: &Credential) -> Result<Credential, ProviderAuthError> {

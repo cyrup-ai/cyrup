@@ -99,7 +99,11 @@ pub async fn execute_auth_start(
         return Ok(not_found_result("auth-start", server_name));
     };
     if definition.is_disabled() {
-        return Ok(disabled_result("auth-start", server_name));
+        return Ok(disabled_result(
+            ctx.blocked_project_servers(),
+            "auth-start",
+            server_name,
+        ));
     }
 
     let started = async {
@@ -181,7 +185,11 @@ pub async fn execute_auth_complete(
         return Ok(not_found_result("auth-complete", server_name));
     };
     if definition.is_disabled() {
-        return Ok(disabled_result("auth-complete", server_name));
+        return Ok(disabled_result(
+            ctx.blocked_project_servers(),
+            "auth-complete",
+            server_name,
+        ));
     }
 
     match ctx
@@ -274,7 +282,7 @@ pub async fn attempt_auto_auth(
     let server_url = match ctx.env.resolve_server_url(&definition) {
         Err(error) => {
             return Ok(AutoAuthResult::Failed(get_auth_failed_message(
-                ctx.settings(),
+                ctx.config(),
                 server_name,
                 &error.to_string(),
             )));
@@ -293,7 +301,7 @@ pub async fn attempt_auto_auth(
     };
     if !ctx.has_ui() && grant_type != OAuthGrantType::ClientCredentials {
         return Ok(AutoAuthResult::Failed(get_auth_required_message(
-            ctx.settings(),
+            ctx.config(),
             server_name,
         )));
     }
@@ -309,7 +317,7 @@ pub async fn attempt_auto_auth(
                 return Err(error);
             }
             Ok(AutoAuthResult::Failed(get_auth_failed_message(
-                ctx.settings(),
+                ctx.config(),
                 server_name,
                 &error.to_string(),
             )))
@@ -348,7 +356,11 @@ pub async fn execute_connect(
         ));
     }
     if ctx.is_disabled(server_name) {
-        return Ok(disabled_result("connect", server_name));
+        return Ok(disabled_result(
+            ctx.blocked_project_servers(),
+            "connect",
+            server_name,
+        ));
     }
 
     let outcome: McpResult<ConnectOutcome> = async {
@@ -375,7 +387,7 @@ pub async fn execute_connect(
                 AutoAuthResult::Skipped => {}
             }
             if connection.needs_auth() {
-                let message = get_auth_required_message(ctx.settings(), server_name);
+                let message = get_auth_required_message(ctx.config(), server_name);
                 return Err(McpError::Other(format!("\u{0}auth_required\u{0}{message}")));
             }
         }

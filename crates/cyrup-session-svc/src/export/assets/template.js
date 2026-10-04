@@ -1386,8 +1386,8 @@
             <div class="help-bar">
               <span class="help-hint">T toggle thinking · O toggle tools</span>
               <div class="help-actions">
-                <button type="button" class="header-toggle-btn" data-action="toggle-thinking" title="Toggle thinking (T)">Toggle thinking</button>
-                <button type="button" class="header-toggle-btn" data-action="toggle-tools" title="Toggle tools (O)">Toggle tools</button>
+                <button type="button" class="header-toggle-btn" data-action="toggle-thinking" aria-pressed="${thinkingExpanded}" title="Toggle thinking (T)">Toggle thinking</button>
+                <button type="button" class="header-toggle-btn" data-action="toggle-tools" aria-pressed="${toolOutputsExpanded}" title="Toggle tools (O)">Toggle tools</button>
                 <button type="button" class="download-json-btn" onclick="downloadSessionJson()" title="Download session as JSONL">↓ JSONL</button>
               </div>
             </div>
@@ -1515,6 +1515,10 @@
 
         messagesEl.innerHTML = '';
         messagesEl.appendChild(fragment);
+
+        // Cached nodes contain their initial presentation; reapply the viewer's toggle states.
+        setThinkingExpanded(thinkingExpanded);
+        setToolOutputsExpanded(toolOutputsExpanded);
 
         // Attach click handlers for copy-link buttons
         messagesEl.querySelectorAll('.copy-link-btn').forEach(btn => {
@@ -1789,18 +1793,20 @@
       let thinkingExpanded = true;
       let toolOutputsExpanded = false;
 
-      const toggleThinking = () => {
-        thinkingExpanded = !thinkingExpanded;
+      function setThinkingExpanded(expanded) {
+        thinkingExpanded = expanded;
+        document.querySelector('[data-action="toggle-thinking"]')?.setAttribute('aria-pressed', String(expanded));
         document.querySelectorAll('.thinking-text').forEach(el => {
           el.style.display = thinkingExpanded ? '' : 'none';
         });
         document.querySelectorAll('.thinking-collapsed').forEach(el => {
           el.style.display = thinkingExpanded ? 'none' : 'block';
         });
-      };
+      }
 
-      const toggleToolOutputs = () => {
-        toolOutputsExpanded = !toolOutputsExpanded;
+      function setToolOutputsExpanded(expanded) {
+        toolOutputsExpanded = expanded;
+        document.querySelector('[data-action="toggle-tools"]')?.setAttribute('aria-pressed', String(expanded));
         document.querySelectorAll('.tool-output.expandable').forEach(el => {
           el.classList.toggle('expanded', toolOutputsExpanded);
         });
@@ -1810,11 +1816,15 @@
         document.querySelectorAll('.skill-invocation').forEach(el => {
           el.classList.toggle('expanded', toolOutputsExpanded);
         });
-      };
+      }
 
       const attachHeaderHandlers = () => {
-        document.querySelector('[data-action="toggle-thinking"]')?.addEventListener('click', toggleThinking);
-        document.querySelector('[data-action="toggle-tools"]')?.addEventListener('click', toggleToolOutputs);
+        document.querySelector('[data-action="toggle-thinking"]')?.addEventListener('click', () => {
+          setThinkingExpanded(!thinkingExpanded);
+        });
+        document.querySelector('[data-action="toggle-tools"]')?.addEventListener('click', () => {
+          setToolOutputsExpanded(!toolOutputsExpanded);
+        });
       };
 
       const isEditableTarget = (element) => {
@@ -1841,10 +1851,10 @@
         const key = e.key.toLowerCase();
         if (key === 't') {
           e.preventDefault();
-          toggleThinking();
+          setThinkingExpanded(!thinkingExpanded);
         } else if (key === 'o') {
           e.preventDefault();
-          toggleToolOutputs();
+          setToolOutputsExpanded(!toolOutputsExpanded);
         }
       });
 

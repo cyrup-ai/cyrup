@@ -147,10 +147,20 @@ pub async fn initialize_mcp(
     options: InitializeOptions,
 ) -> McpResult<Arc<McpState>> {
     // Step 1 — the config this generation runs. `loadMcpConfig` cannot fail (MCP-003).
-    let config = options
-        .programmatic_config
-        .clone()
-        .unwrap_or_else(|| crate::config::load_mcp_config(&dirs, snapshot.config_path.as_deref()));
+    //
+    // `loadMcpConfigWithSources` rather than `loadMcpConfig`, because the project-server trust gate
+    // below needs to know which servers came from the checkout (MCP-591). A **programmatic** config
+    // has no project source at all — the embedder supplied it — so it runs no gate, exactly as
+    // upstream's `options.config !== undefined` arm does.
+    let loaded = options.programmatic_config.clone().map_or_else(
+        || crate::config::load_mcp_config_with_sources(&dirs, snapshot.config_path.as_deref()),
+        |config| crate::config::LoadedConfig {
+            config,
+            diagnostics: Vec::new(),
+            project_servers: indexmap::IndexMap::new(),
+            project_server_policy: crate::config::ProjectServerPolicy::default(),
+        },
+    );
 
     // MCP-015's two derivations. The fenced handle is built BEFORE anything asynchronous can hold
     // it, which is the whole point: what crosses the await is already inert-on-stop.
@@ -166,6 +176,57 @@ pub async fn initialize_mcp(
         .flatten()
         .map(|services| Arc::new(OwnedServices::new(services, Arc::clone(&owner))));
     let runtime_signal = crate::abort::combine(&owner.token(), snapshot.initial_signal.as_ref());
+
+    // `const trustResult = … await applyProjectServerTrustToConfig(loadMcpConfig(configPath, cwd),
+    // ctx)` (`init.ts:146-151`) — MCP-591, and it runs HERE: after `ui` exists, because the prompt
+    // needs it, and before anything reads `config`, because a blocked server must never be
+    // connected, registered or offered to the model.
+    //
+    // `a6cfeea` (#701) is the reason the placement is not negotiable: the approval has to happen
+    // *inside* `session_start`. Earlier there is no session to ask in; later the server has already
+    // started.
+    let dialog = ui.as_ref().map(crate::owner::McpDialog::fenced);
+    let trust = crate::project_server_trust::apply_project_server_trust(
+        &loaded.config,
+        &loaded.project_servers,
+        &crate::project_server_trust::ProjectTrustContext {
+            cwd: &snapshot.cwd,
+            dirs: &dirs,
+            // `try { ctx.isProjectTrusted() } catch { false }` — a host that cannot answer is
+            // untrusted. `HostServices::is_project_trusted` defaults to `false`, so the `catch`
+            // arm and the no-host arm are the same value here.
+            project_trusted: snapshot
+                .services
+                .as_ref()
+                .is_some_and(|services| services.is_project_trusted()),
+            has_ui: snapshot.has_ui,
+            policy: loaded.config.settings_or_default().project_servers_policy(),
+            ui: dialog.as_ref(),
+        },
+    )
+    .await;
+    let blocked_project_servers = trust.blocked_servers;
+    let config = trust.config;
+
+    // `if (trustResult.blockedServers.size > 0)` (`init.ts:287-291`) — one line, either as a
+    // warning toast or on stderr, so a blocked server is never silently absent.
+    if !blocked_project_servers.is_empty() {
+        let summary = blocked_project_servers
+            .iter()
+            .map(|(name, block)| {
+                format!(
+                    "{name} ({})",
+                    crate::project_server_trust::describe_project_server_block(block.reason)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let message = format!("MCP: Project servers blocked: {summary}");
+        match ui.as_ref() {
+            Some(ui) if snapshot.has_ui => ui.notify(&message, cyrup_ext::NotifyKind::Warning),
+            _ => tracing::warn!("{message}"),
+        }
+    }
 
     // Steps 2-4. `getAuthStorageOptions(settings.oauthDir, cwd)` — and **only** `settings.oauthDir`:
     // `$MCP_OAUTH_DIR` and the `<agent_dir>/mcp-oauth` default are the store's own precedence ladder
@@ -438,6 +499,7 @@ pub async fn initialize_mcp(
         ui,
         open_browser,
         send_message,
+        blocked_project_servers,
     }));
 
     // The hooks minted above can now resolve the generation's dialog. Bound AFTER the state exists
@@ -512,32 +574,39 @@ pub async fn initialize_mcp(
         return Ok(state);
     }
 
-    // ── §9 — cache bootstrap (MCP-019) ─────────────────────────────────────────────────────
-    // The two-way split IS the unit (`init.ts:228-239`). Collapsing "no usable cache" into one arm
-    // turns the corrupt-cache path from cheap into a connect storm.
+    // ── §9 — the cache read (MCP-019, rewritten by MCP-598) ────────────────────────────────
+    // `const cache = serverEntries.length > 0 ? loadMetadataCache() : null;` (`init.ts:295`) —
+    // and that is the whole of it at v5.0.0.
     //
-    // The PROBE is [`crate::dirs`]', the READ is [`crate::registration`]'s lenient reader, and the
-    // WRITE is [`crate::dirs`]'. That asymmetry is deliberate: the strict reader answers `None` for
-    // a file the lenient one parses fine, and rewriting on THAT would destroy the very cache
+    // **What `149fdf1` (#788) deleted, and why this no longer looks like MCP-019.** The
+    // `existsSync(cachePath)` probe, the `bootstrapAll` flag it set, and the whole-file
+    // `saveMetadataCache({version: 1, servers: {}})` bootstrap are gone. The decision is now
+    // per server, in §10 below, against each entry's own validity — so "the file exists" no longer
+    // means "nothing needs discovering", which was the bug: a server added after the first session
+    // was never discovered at all (MCP-598).
+    //
+    // The corrupt-file arm goes with them. It used to truncate the file and deliberately NOT set
+    // `bootstrapAll`, so a cache that would not parse stayed cheap. Upstream's per-server decision
+    // reads an absent entry as `needsDiscovery`, so a corrupt cache now discovers every enabled
+    // server once — once, because the pass writes a good file at the end. That is upstream's
+    // behaviour and it is a deliberate change of this port's, not an oversight.
+    //
+    // The READ is [`crate::registration`]'s lenient reader and the WRITE is [`crate::dirs`]'; that
+    // asymmetry is unchanged and still deliberate — the strict reader answers `None` for a file the
+    // lenient one parses fine, and rewriting on THAT would destroy the very cache
     // `resolve_direct_tools` and `resolve_cached_prompts` registered this session's surface from.
     let cache_path = dirs.metadata_cache();
-    let cache_file_exists = cache_path.exists();
-    let mut cache = crate::registration::load_metadata_cache(&dirs);
-    let mut bootstrap_all = false;
-    if !cache_file_exists {
-        // No file at all — a first run. Every enabled server is a startup connect this once, so
-        // the next launch has a cache to register a direct-tool surface from.
-        bootstrap_all = true;
-        save_empty_metadata_cache(&cache_path);
-    } else if cache.is_none() {
-        // A file that exists and does not parse. Truncate it, but do NOT set `bootstrap_all`: a
-        // corrupt cache must stay cheap rather than becoming a connect storm.
-        save_empty_metadata_cache(&cache_path);
-        cache = Some(crate::registration::MetadataCache {
-            version: crate::registration::METADATA_CACHE_VERSION,
-            servers: indexmap::IndexMap::new(),
-        });
-    }
+    let cache = crate::registration::load_metadata_cache(&dirs);
+    // `const startupSnapshot = cache?.servers ?? {}` — what the merged write at the end compares a
+    // failure marker against, so a marker never destroys a catalogue another process wrote while
+    // this pass was running. Read through the WRITER's parser, because that is the type the write
+    // path compares.
+    let startup_snapshot = crate::dirs::load_metadata_cache(&cache_path)
+        .map(|cache| cache.servers)
+        .unwrap_or_default();
+    // `needsDiscovery` / `failedDiscovery` (`init.ts:336-341`), filled by §10's loop.
+    let mut needs_discovery: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut failed_discovery: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     // ── §10 — per-server lifecycle registration (MCP-020) + rehydration (MCP-021) ──────────
     for (name, definition) in state.config.enabled_servers() {
@@ -564,23 +633,62 @@ pub async fn initialize_mcp(
         if marks_keep_alive_at_registration(mode) {
             state.lifecycle.mark_keep_alive(name);
         }
-        // Step 6 — rehydrate from a hash-valid entry (`init.ts:256-269`).
+        // Step 6 — rehydrate from a hash-valid entry, or record which of the other two things
+        // this server is (`init.ts:316-342`). The three arms are an `if`/`else if`/`else if`
+        // upstream and must stay one here: a server that rehydrated needs no discovery, and a
+        // server whose config already failed discovery is not retried at startup.
+        //
         // [`crate::registration::valid_entry`] IS `cachedEntry && isServerCacheValid(entry, def)`;
         // it is not re-derived here, because a second hash path is the reader/writer drift the
         // cache seam exists to prevent.
+        let cached_entry = cache
+            .as_ref()
+            .and_then(|cache| cache.servers.get(name.as_str()));
         if let Some(cache) = cache.as_ref()
             && let Some(entry) = crate::registration::valid_entry(Some(cache), name, definition)
         {
             crate::live::rehydrate_from_cache(&state, name, definition, entry, cache);
+        } else if cached_entry.is_some_and(|entry| {
+            entry.discovery_failed == Some(true)
+                && entry.config_hash.as_deref()
+                    == crate::registration::default_server_hasher(definition).as_deref()
+        }) {
+            // "Startup tries a config once; a server that failed is tried again on first use."
+            failed_discovery.insert(name.clone());
+        } else if cached_entry.is_none_or(|entry| {
+            entry.cache_scope.as_deref() != Some(crate::registration::CACHE_SCOPE_PRIVATE)
+        }) {
+            // Missing, changed hash, corrupt, or past its server-declared TTL. A `private` entry is
+            // never discovered at startup at all: its listing belongs to an authorization context
+            // this pass has no business reconstructing.
+            needs_discovery.insert(name.clone());
         }
     }
+    // `failedDiscovery` is read only by the arm above; the set exists because upstream's does, and
+    // because the two counts are what a future diagnostic would report.
+    let _ = &failed_discovery;
 
     // ── §11 — the bounded startup connect pass (MCP-022 / MCP-087 / MCP-130) ───────────────
-    let startup: Vec<(String, ServerEntry)> = state
+    // `mode === "keep-alive" || mode === "eager" || needsDiscovery.has(name)` (`init.ts:345-349`).
+    // `is_prewarmed()` is the first two; `needs_discovery` is MCP-598's addition and is what makes
+    // a `lazy` server added after the first session get discovered at all.
+    //
+    // `resident` decides whether this connection outlives the pass:
+    // `(definition.lifecycle ?? "lazy") !== "lazy" || getEffectiveIdleTimeoutMinutes(state, name) === 0`
+    // (`init.ts:361`). A non-resident server is connected only to read its catalogue and is closed
+    // again once that catalogue is captured — before MCP-598 every first-run connection stayed open
+    // until the idle sweep began, which is after initialization.
+    let startup: Vec<(String, ServerEntry, bool)> = state
         .config
         .enabled_servers()
-        .filter(|(_, definition)| bootstrap_all || definition.lifecycle_mode().is_prewarmed())
-        .map(|(name, definition)| (name.clone(), definition.clone()))
+        .filter(|(name, definition)| {
+            definition.lifecycle_mode().is_prewarmed() || needs_discovery.contains(name.as_str())
+        })
+        .map(|(name, definition)| {
+            let resident = definition.lifecycle_mode() != ServerLifecycle::Lazy
+                || state.lifecycle.effective_idle_timeout_minutes(name) == 0.0;
+            (name.clone(), definition.clone(), resident)
+        })
         .collect();
 
     if let Some(ui) = state.ui.as_ref()
@@ -605,28 +713,128 @@ pub async fn initialize_mcp(
     let results = crate::live::parallel_limit(
         startup.clone(),
         crate::live::STARTUP_CONNECT_CONCURRENCY,
-        |(name, definition)| {
-            let manager = Arc::clone(&state.manager);
+        |(name, definition, resident)| {
+            let state = Arc::clone(&state);
+            let dirs = dirs.clone();
             let signal = runtime_signal.clone();
             async move {
+                let manager = Arc::clone(&state.manager);
                 match manager.connect(&name, &definition, Some(&signal)).await {
                     Ok(connection) if connection.status() == ConnectionStatus::NeedsAuth => {
-                        // BYTE-EXACT (`init.ts:288`). The `/mcp-auth {name}` form is what the user
+                        // BYTE-EXACT (`init.ts:354`). The `/mcp-auth {name}` form is what the user
                         // copies; a reworded line is a support burden, not a style choice.
                         let message =
                             format!("OAuth authentication required. Run /mcp-auth {name}.");
-                        (name, definition, None, Some(message))
+                        StartupResult {
+                            name,
+                            definition,
+                            connection: None,
+                            error: Some(message),
+                            transient: false,
+                            entry: None,
+                        }
                     }
-                    Ok(connection) => (name, definition, Some(connection), None),
+                    Ok(connection) => {
+                        // `captureMetadata(state, name, connection, () => cache); if (!resident)
+                        // await manager.close(name);` (`init.ts:365-367`) — in this order, because
+                        // `capture_metadata` reads the connection out of the manager's table and a
+                        // closed server is no longer in it. The `Arc` in `connection` keeps its
+                        // catalogue for §12's publication either way.
+                        let entry = crate::live::capture_metadata(
+                            &state,
+                            &dirs,
+                            &name,
+                            crate::live::MetadataCacheOptions::preserving(),
+                        );
+                        if !resident {
+                            // `await manager.close(name)` — a close that fails has nothing
+                            // left to do about it, and upstream does not await a rejection
+                            // either; the server is out of the connection table regardless.
+                            if let Err(error) = manager.close(&name).await {
+                                tracing::debug!(
+                                    "MCP: closing {name} after startup discovery failed: {error}"
+                                );
+                            }
+                        }
+                        StartupResult {
+                            name,
+                            definition,
+                            connection: Some(connection),
+                            error: None,
+                            transient: false,
+                            entry,
+                        }
+                    }
                     Err(error) if crate::abort::is_abort_error(&error, Some(&signal)) => {
-                        (name, definition, None, None)
+                        StartupResult {
+                            name,
+                            definition,
+                            connection: None,
+                            error: None,
+                            transient: false,
+                            entry: None,
+                        }
                     }
-                    Err(error) => (name, definition, None, Some(error.to_string())),
+                    Err(error) => {
+                        let transient = is_transient_http_connect_error(&error);
+                        StartupResult {
+                            name,
+                            definition,
+                            connection: None,
+                            error: Some(error.to_string()),
+                            transient,
+                            entry: None,
+                        }
+                    }
                 }
             }
         },
     )
     .await;
+
+    // `const captured = results.flatMap(...)` then ONE `saveMetadataCache(..., {startupSnapshot})`
+    // (`init.ts:387-396`). Rewriting the whole file once per discovered server is what upstream
+    // measures in seconds with many large catalogues; this is the single flush.
+    //
+    // A failure marker is written only for a server that was in `needs_discovery` and failed
+    // **non-transiently**: a 503 is an outage, not a config that cannot be discovered, and marking
+    // it would hide the server until its definition changed.
+    {
+        let mut batch = crate::dirs::MetadataCache::default();
+        for result in &results {
+            if result.connection.is_some() {
+                if let Some(entry) = result.entry.clone() {
+                    batch.servers.insert(result.name.clone(), entry);
+                }
+                continue;
+            }
+            if result.error.is_none()
+                || result.transient
+                || !needs_discovery.contains(result.name.as_str())
+            {
+                continue;
+            }
+            if let Some(config_hash) =
+                crate::registration::default_server_hasher(&result.definition)
+            {
+                batch.servers.insert(
+                    result.name.clone(),
+                    crate::dirs::ServerCacheEntry {
+                        config_hash,
+                        discovery_failed: Some(true),
+                        cached_at: crate::live::now_epoch_ms(),
+                        ..crate::dirs::ServerCacheEntry::default()
+                    },
+                );
+            }
+        }
+        if !batch.servers.is_empty()
+            && let Err(error) =
+                crate::dirs::save_metadata_cache_with(&cache_path, &batch, Some(&startup_snapshot))
+        {
+            tracing::debug!("MCP: failed to write the startup metadata cache: {error}");
+        }
+    }
 
     // `if (initialSignal?.aborted) return state;` (`init.ts:301`) — BEFORE the owner check, and it
     // returns `Ok`, not `Err`. This is the FIFTH exit from this function: a caller-cancelled init
@@ -651,8 +859,9 @@ pub async fn initialize_mcp(
     // one server depends on this map's entry for every other.
     let mut startup_known: indexmap::IndexMap<String, Vec<crate::proxy::ToolMetadata>> =
         indexmap::IndexMap::new();
-    for (name, definition, connection, _) in &results {
-        let Some(connection) = connection.as_ref() else {
+    for result in &results {
+        let (name, definition) = (&result.name, &result.definition);
+        let Some(connection) = result.connection.as_ref() else {
             continue;
         };
         let effective_prefix = crate::registration::resolve_tool_prefix(Some(definition), prefix);
@@ -690,6 +899,7 @@ pub async fn initialize_mcp(
                     resource_uri: Some(resource.uri.clone()),
                     ui_visibility: None,
                     input_schema: None,
+                    annotations: None,
                 });
             }
         }
@@ -697,7 +907,13 @@ pub async fn initialize_mcp(
     }
 
     // Pass two, per server (`init.ts:327-362`).
-    for (name, definition, connection, error) in &results {
+    for result in &results {
+        let (name, definition, connection, error) = (
+            &result.name,
+            &result.definition,
+            &result.connection,
+            &result.error,
+        );
         // MCP-046 checkpoint 2 (`init.ts:328`) — at the TOP of each iteration, so a stop observed
         // mid-pass leaves the remaining servers untouched instead of half-committed.
         owner.throw_if_inactive()?;
@@ -809,11 +1025,11 @@ pub async fn initialize_mcp(
     // ── §13 — the startup summary (`init.ts:364-372`) ──────────────────────────────────────
     let connected_count = results
         .iter()
-        .filter(|(_, _, connection, _)| connection.is_some())
+        .filter(|result| result.connection.is_some())
         .count();
     let failed_count = results
         .iter()
-        .filter(|(_, _, _, error)| error.is_some())
+        .filter(|result| result.error.is_some())
         .count();
     if let Some(ui) = state.ui.as_ref()
         && connected_count > 0
@@ -860,7 +1076,7 @@ pub async fn initialize_mcp(
                 .filter(|name| {
                     !results
                         .iter()
-                        .any(|(other, _, connection, _)| other == name && connection.is_some())
+                        .any(|result| &result.name == name && result.connection.is_some())
                 })
                 .collect();
             let bootstrap = crate::live::parallel_limit(
@@ -1069,12 +1285,54 @@ pub async fn initialize_mcp(
 ///
 /// The failure is swallowed with a debug line, as `metadata-cache.ts`'s own try/catch is: a cache
 /// that cannot be written is a slower next start, never a failed init.
-fn save_empty_metadata_cache(path: &std::path::Path) {
-    if let Err(error) =
-        crate::dirs::save_metadata_cache(path, &crate::dirs::MetadataCache::default())
-    {
-        tracing::debug!("MCP: failed to bootstrap the metadata cache: {error}");
+/// `{ name, definition, resident, connection, error, transient }` (`init.ts:350-382`) — one
+/// startup connect's outcome.
+///
+/// A struct rather than the tuple this used to be: `149fdf1` grew it from four members to six, and
+/// a six-tuple whose third and fifth members are both `Option`s is a shape nobody can read.
+struct StartupResult {
+    name: String,
+    definition: ServerEntry,
+    /// `None` for a real failure, for needs-auth (which carries the byte-exact `/mcp-auth` line)
+    /// **and** for an abort on a live signal — the last of which carries no `error` either, and is
+    /// what pass two skips silently.
+    connection: Option<Arc<crate::server_manager::ServerConnection>>,
+    error: Option<String>,
+    /// `isTransientHttpConnectError(error)` — an outage, so no failure marker is written.
+    transient: bool,
+    /// The cache entry captured while the connection was still open, for the one merged write.
+    entry: Option<crate::dirs::ServerCacheEntry>,
+}
+
+/// `isTransientHttpConnectError(error)` (`server-manager.ts:249-256`) — an HTTP **503** anywhere in
+/// the error's cause chain.
+///
+/// ```text
+/// while (current instanceof Error) {
+///   if (current instanceof SdkHttpError && current.status === 503) return true;
+///   current = current.cause;
+/// }
+/// ```
+///
+/// **Partial port, deliberately.** Upstream's helper is shared by three call sites: this one
+/// (MCP-598's failure marker), `lifecycle.ts:371`'s backoff exemption, and
+/// `server-manager.ts:1368`'s listen retry. Only this one is ported, because only this one is this
+/// row's; the other two are their own units and are not silently approximated here. The walk is
+/// [`bare_unauthorized`]'s, over the same rmcp transport error.
+fn is_transient_http_connect_error(error: &(dyn std::error::Error + 'static)) -> bool {
+    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    while let Some(error) = current {
+        if let Some(rmcp::transport::streamable_http_client::StreamableHttpError::Client(client)) =
+            error.downcast_ref::<rmcp::transport::streamable_http_client::StreamableHttpError<
+                reqwest::Error,
+            >>()
+            && client.status() == Some(reqwest::StatusCode::SERVICE_UNAVAILABLE)
+        {
+            return true;
+        }
+        current = error.source();
     }
+    false
 }
 
 /// `tool-metadata.ts:146` `totalToolCount(state)` — every server's tool count, summed.
@@ -1397,7 +1655,7 @@ use rmcp::transport::{
 use rmcp::{ClientHandler, ErrorData};
 use tokio::process::ChildStderr;
 
-use crate::config::{HttpTransport, ProtocolVersionSetting, ServerEntry};
+use crate::config::{AuthMode, HttpTransport, ProtocolVersionSetting, ServerEntry};
 use crate::errors::McpError;
 use crate::lifecycle::ConnectionStatus;
 use crate::server_manager::{
@@ -1922,6 +2180,215 @@ impl<C> SessionIdProbe<C> {
             // awaited to completion, and that await is the happens-before edge.
             self.seen.store(true, std::sync::atomic::Ordering::Relaxed);
         }
+    }
+}
+
+/// `createProviderTokenFetch(serverUrl, provider, providerToken, delegate)`
+/// (`server-manager.ts:284`) — MCP-593.
+///
+/// Wraps a [`StreamableHttpClient`] so each request to the server's own origin carries the named
+/// cyrup provider's **current** token. Three properties, each load-bearing and each upstream's:
+///
+/// * **Per request, not per connection.** The token is read on every call rather than resolved once
+///   into rmcp's `auth_header`, because a provider token expires or is revoked mid-session and the
+///   next request has to see that. It is also what makes the needs-sign-in classification work: a
+///   revoked token becomes `None`, becomes a 401, becomes `needs-auth` — never a transport failure.
+/// * **Same origin only.** `if (new URL(request.url).origin !== origin) return innerFetch(request)`
+///   — another origin gets no token at all. Combined with `redirect: "error"` (rmcp's client is
+///   already built with redirects off, `build_http_client`) the user's provider credential cannot be
+///   walked off the configured host.
+/// * **No token ⇒ no request.** Upstream synthesises `new Response(null, { status: 401 })` rather
+///   than sending an unauthenticated request, and its comment says why: *"Without a token the
+///   request is not sent; the 401 marks the server as needing sign-in."* The rmcp equivalent is
+///   [`StreamableHttpError::AuthRequired`] with an empty challenge, which is exactly what
+///   [`UnauthorizedProbe`] produces for a bare 401 and what [`unauthorized_challenge`] already
+///   reads.
+///
+/// # Position in the client stack
+///
+/// Upstream's chain is `providerTokenFetch(…, commandFetch)` — the provider **outside**, the
+/// request-headers command **inside** — under the comment *"requestHeadersCommand stays last in the
+/// header chain."* In a `StreamableHttpClient` stack the outermost wrapper writes its headers
+/// first, so the same precedence means this type wraps
+/// [`crate::request_headers_command::RequestHeadersCommandClient`] and not the other way round: a
+/// signing command that derives its own `Authorization` still wins.
+#[derive(Debug, Clone)]
+pub struct ProviderTokenClient<C> {
+    inner: C,
+    /// `new URL(serverUrl).origin` — scheme + host + port, compared verbatim.
+    origin: String,
+    provider: Arc<str>,
+    source: Arc<dyn ProviderTokenSource>,
+}
+
+impl<C> ProviderTokenClient<C> {
+    /// Build the wrapper for one connection.
+    ///
+    /// # Errors
+    ///
+    /// [`McpError::Config`] when `server_url` does not parse — `new URL(serverUrl).origin` throws
+    /// there, and the connect has already proven it parses, so this is the unreachable arm made
+    /// explicit rather than an `unwrap`.
+    pub fn new(
+        inner: C,
+        server_url: &str,
+        provider: &str,
+        source: Arc<dyn ProviderTokenSource>,
+    ) -> McpResult<Self> {
+        let parsed = url::Url::parse(server_url)
+            .map_err(|error| McpError::Config(format!("Invalid MCP server URL: {error}")))?;
+        Ok(Self {
+            inner,
+            origin: parsed.origin().ascii_serialization(),
+            provider: Arc::from(provider),
+            source,
+        })
+    }
+
+    /// Whether this request goes to the server's own origin, and therefore may carry the token.
+    fn same_origin(&self, uri: &str) -> bool {
+        url::Url::parse(uri)
+            .is_ok_and(|parsed| parsed.origin().ascii_serialization() == self.origin)
+    }
+
+    /// The token for one request, or the 401 that stands in for *not signed in*.
+    ///
+    /// `Ok(None)` is the other-origin case: no token, and the request still goes out.
+    async fn authorization<E>(&self, uri: &str) -> Result<Option<String>, StreamableHttpError<E>>
+    where
+        E: std::error::Error + Send + Sync + 'static,
+    {
+        if !self.same_origin(uri) {
+            return Ok(None);
+        }
+        let Some(token) = self.source.token(&self.provider).await else {
+            return Err(StreamableHttpError::AuthRequired(AuthRequiredError::new(
+                String::new(),
+            )));
+        };
+        // `headers.set("Authorization", \`Bearer ${token}\`)`'s throw, with upstream's own sentence
+        // — and upstream's reason for catching it at all: *"The Headers error quotes the value, so
+        // it must not surface."* A token with a newline in it must not be echoed into a log.
+        if HeaderValue::try_from(format!("Bearer {token}")).is_err() {
+            return Err(StreamableHttpError::Io(std::io::Error::other(format!(
+                "cyrup provider \"{}\" returned a token that is not a valid header value",
+                self.provider
+            ))));
+        }
+        Ok(Some(token))
+    }
+}
+
+/// Install the provider's bearer on one request, clearing any `Authorization` already in the map.
+///
+/// The same two-channel hazard `request_headers_command::apply_derived` documents: rmcp carries the
+/// bearer in `auth_header` and custom headers in a map, and **both append**, so a producer of one
+/// has to clear the other or the server sees two `Authorization` values.
+fn apply_provider_token(
+    custom_headers: &mut HashMap<HeaderName, HeaderValue>,
+    auth_header: &mut Option<String>,
+    token: Option<String>,
+) {
+    if let Some(token) = token {
+        let _ = custom_headers.remove(&http::header::AUTHORIZATION);
+        *auth_header = Some(token);
+    }
+}
+
+impl<C> StreamableHttpClient for ProviderTokenClient<C>
+where
+    C: StreamableHttpClient + Sync,
+{
+    type Error = C::Error;
+
+    async fn post_message(
+        &self,
+        uri: Arc<str>,
+        message: ClientJsonRpcMessage,
+        session_id: Option<Arc<str>>,
+        mut auth_header: Option<String>,
+        mut custom_headers: HashMap<HeaderName, HeaderValue>,
+    ) -> Result<StreamableHttpPostResponse, StreamableHttpError<Self::Error>> {
+        let token = self.authorization(&uri).await?;
+        apply_provider_token(&mut custom_headers, &mut auth_header, token);
+        self.inner
+            .post_message(uri, message, session_id, auth_header, custom_headers)
+            .await
+    }
+
+    async fn post_message_with_max_sse_event_size(
+        &self,
+        uri: Arc<str>,
+        message: ClientJsonRpcMessage,
+        session_id: Option<Arc<str>>,
+        mut auth_header: Option<String>,
+        mut custom_headers: HashMap<HeaderName, HeaderValue>,
+        max_sse_event_size: usize,
+    ) -> Result<StreamableHttpPostResponse, StreamableHttpError<Self::Error>> {
+        let token = self.authorization(&uri).await?;
+        apply_provider_token(&mut custom_headers, &mut auth_header, token);
+        self.inner
+            .post_message_with_max_sse_event_size(
+                uri,
+                message,
+                session_id,
+                auth_header,
+                custom_headers,
+                max_sse_event_size,
+            )
+            .await
+    }
+
+    async fn get_stream(
+        &self,
+        uri: Arc<str>,
+        session_id: Option<Arc<str>>,
+        last_event_id: Option<String>,
+        mut auth_header: Option<String>,
+        mut custom_headers: HashMap<HeaderName, HeaderValue>,
+    ) -> Result<BoxStream<'static, Result<Sse, SseError>>, StreamableHttpError<Self::Error>> {
+        let token = self.authorization(&uri).await?;
+        apply_provider_token(&mut custom_headers, &mut auth_header, token);
+        self.inner
+            .get_stream(uri, session_id, last_event_id, auth_header, custom_headers)
+            .await
+    }
+
+    async fn get_stream_with_max_sse_event_size(
+        &self,
+        uri: Arc<str>,
+        session_id: Option<Arc<str>>,
+        last_event_id: Option<String>,
+        mut auth_header: Option<String>,
+        mut custom_headers: HashMap<HeaderName, HeaderValue>,
+        max_sse_event_size: usize,
+    ) -> Result<BoxStream<'static, Result<Sse, SseError>>, StreamableHttpError<Self::Error>> {
+        let token = self.authorization(&uri).await?;
+        apply_provider_token(&mut custom_headers, &mut auth_header, token);
+        self.inner
+            .get_stream_with_max_sse_event_size(
+                uri,
+                session_id,
+                last_event_id,
+                auth_header,
+                custom_headers,
+                max_sse_event_size,
+            )
+            .await
+    }
+
+    async fn delete_session(
+        &self,
+        uri: Arc<str>,
+        session_id: Arc<str>,
+        mut auth_header: Option<String>,
+        mut custom_headers: HashMap<HeaderName, HeaderValue>,
+    ) -> Result<(), StreamableHttpError<Self::Error>> {
+        let token = self.authorization(&uri).await?;
+        apply_provider_token(&mut custom_headers, &mut auth_header, token);
+        self.inner
+            .delete_session(uri, session_id, auth_header, custom_headers)
+            .await
     }
 }
 
@@ -2772,6 +3239,10 @@ pub struct McpClientHandlerParts {
     /// handler **only when `allowUrl`**; the same gate is applied here at dispatch, so wiring the
     /// hook without `allow_url` is inert rather than wrong.
     pub elicitation_complete: Option<ElicitationCompleteHook>,
+    /// `promptPauses` (MCP-606/MCP-607) — the registry this client's `elicitation/create` pauses
+    /// and whose deadlines its `notifications/progress` restarts. `None` for a handler with no
+    /// manager behind it, which is the test and bootstrap case.
+    pub call_deadlines: Option<Arc<crate::call_deadline::CallDeadlines>>,
 }
 
 /// `createClient(serverName, definition)`'s client object, as an rmcp [`ClientHandler`].
@@ -2799,6 +3270,7 @@ struct HandlerShared {
     elicitation: Option<ElicitationHook>,
     list_changed: Option<ListChangedHook>,
     elicitation_complete: Option<ElicitationCompleteHook>,
+    call_deadlines: Option<Arc<crate::call_deadline::CallDeadlines>>,
 }
 
 impl McpClientHandler {
@@ -2830,6 +3302,7 @@ impl McpClientHandler {
                 elicitation: parts.elicitation,
                 list_changed: parts.list_changed,
                 elicitation_complete: parts.elicitation_complete,
+                call_deadlines: parts.call_deadlines,
             }),
         }
     }
@@ -2845,6 +3318,27 @@ impl McpClientHandler {
     #[must_use]
     pub fn identity(&self) -> ClientIdentity {
         self.shared.identity.clone()
+    }
+
+    /// `elicitation/create`'s body, with [`RequestContext`] left out so it is reachable from a test.
+    ///
+    /// `registerElicitationHandler` wires `whilePromptOpen(state, () => handleElicitationRequest(…))`
+    /// (`elicitation-handler.ts:48-50`, MCP-606): the prompt being on screen pauses the deadline of
+    /// every call in flight on this client, because a server's `elicitation/create` is its own
+    /// request and the transport does not tie it to the `tools/call` that caused it.
+    pub async fn elicit(&self, params: ElicitRequestParams) -> Result<ElicitResult, ErrorData> {
+        let Some(hook) = self.shared.elicitation.clone() else {
+            return Ok(ElicitResult::new(ElicitationAction::Decline));
+        };
+        let server = self.shared.server.clone();
+        // [`PromptOpen`]'s `Drop` is upstream's `finally`, so a prompt the user abandons — or one
+        // whose future is dropped when the generation stops — still resumes what it paused.
+        let _pause = self
+            .shared
+            .call_deadlines
+            .clone()
+            .map(|deadlines| PromptOpen::enter(deadlines, &server));
+        hook(server, params).await
     }
 
     /// The `initialize` frame's client half, as it will be sent.
@@ -2920,14 +3414,25 @@ impl ClientHandler for McpClientHandler {
         _context: RequestContext<RoleClient>,
     ) -> impl std::future::Future<Output = Result<ElicitResult, ErrorData>> + MaybeSendFuture + '_
     {
-        let hook = self.shared.elicitation.clone();
-        let server = self.shared.server.clone();
-        async move {
-            let Some(hook) = hook else {
-                return Ok(ElicitResult::new(ElicitationAction::Decline));
-            };
-            hook(server, params).await
+        self.elicit(params)
+    }
+
+    /// `notifications/progress` — the listener MCP-607 was missing.
+    ///
+    /// `b61c6ef` (#763, v5.0.0): "Every call requests progress, and each progress notification
+    /// restarts the timeout." rmcp puts a progress token on every request's `_meta` already, so
+    /// cyrup needs no `onprogress` shim; what it needed was something listening. Keyed by token, so
+    /// one chatty call cannot hold a quiet sibling's deadline open
+    /// ([`crate::call_deadline::CallDeadlines::progress`]).
+    fn on_progress(
+        &self,
+        params: rmcp::model::ProgressNotificationParam,
+        _context: NotificationContext<RoleClient>,
+    ) -> impl std::future::Future<Output = ()> + MaybeSendFuture + '_ {
+        if let Some(deadlines) = self.shared.call_deadlines.as_ref() {
+            deadlines.progress(&params.progress_token);
         }
+        std::future::ready(())
     }
 
     fn on_tool_list_changed(
@@ -3088,8 +3593,14 @@ where
 ///    `serve_client_with_lifecycle_and_ct`, which is `initialize` plus the
 ///    `notifications/initialized` send. The extra span is one buffered write on a transport that
 ///    has already answered, so the budget is very slightly stricter than upstream's, never looser.
-/// 2. **`maxTotalTimeout` / `resetTimeoutOnProgress`** have no upstream analogue in
-///    `buildRequestOptions` and are not applied.
+/// 2. **`maxTotalTimeout`** has no upstream analogue anywhere and is not applied.
+///    **`resetTimeoutOnProgress`** has one as of v5.0.0 — but not in `buildRequestOptions`, which
+///    is what this function mirrors. `b61c6ef` (#763) sets it on `callTool` and only on `callTool`
+///    (`elicitation-handler.ts:83`), so the connect and the three discovery lists this function
+///    serves are exactly the calls upstream leaves without it. The `tools/call` half is MCP-607,
+///    and it is implemented one layer out, in [`crate::call_deadline`]: rmcp's flag is honoured
+///    only by `RequestHandle::await_response`, which consumes the handle [`crate::live`] keeps in
+///    order to cancel.
 ///
 /// `None` means no timeout, which is `normalizeRequestTimeoutMs`'s answer for an absent, zero,
 /// negative, `NaN` or infinite value — see [`resolve_request_timeout`] for why that does **not**
@@ -3273,8 +3784,11 @@ pub fn resolve_request_timeout(
 /// dropping its future — the `ownedSignal` half therefore lives in the `abortable(..)` wrapper
 /// around each call rather than inside the options object.
 ///
-/// `reset_timeout_on_progress` and `max_total_timeout` have no upstream analogue and stay at their
-/// defaults.
+/// `max_total_timeout` has no upstream analogue and stays at its default.
+/// `reset_timeout_on_progress` also stays at its default **here**, and that is parity, not a gap:
+/// upstream sets its equivalent on `callTool` alone (`elicitation-handler.ts:83`, MCP-607), never
+/// in `buildRequestOptions`. The `tools/call` deadline — restarted on progress and paused for an
+/// elicitation prompt — is [`crate::call_deadline`]'s.
 #[must_use]
 pub fn build_request_options(
     entry: Option<&ServerEntry>,
@@ -3342,6 +3856,23 @@ pub trait HttpAuthProvider: Send + Sync + std::fmt::Debug + 'static {
     /// implementation's: see [`ConnectionBuilder::connect_http_client`]'s `invalidated` flag
     /// (MCP-116).
     fn invalidate_auth_entry_cache(&self, server: &str);
+}
+
+/// `setProviderToken(provider => Promise<string | undefined>)` (`server-manager.ts:401`) — the
+/// token lookup an `auth: { provider }` server's requests go through (MCP-593).
+///
+/// Upstream's comment on the setter is the whole contract: *"only a Pi session's model registry
+/// provides one."* The adapter does not reach into the provider's credential store itself; the host
+/// installs a lookup, and a build with no host — a load-time run, a bare library embedding — has
+/// none, which is what makes [`ConnectionBuilder::validate_provider_auth`]'s second sentence
+/// reachable rather than defensive.
+///
+/// `None` means *not signed in*, and it is not an error: the request is not sent at all and the
+/// server is marked as needing sign-in. An error would be a transport failure, which is exactly the
+/// misclassification `c524196` set out to avoid.
+pub trait ProviderTokenSource: Send + Sync + std::fmt::Debug + 'static {
+    /// The named provider's current access token, or `None` when there is no usable one.
+    fn token<'a>(&'a self, provider: &'a str) -> BoxFuture<'a, Option<String>>;
 }
 
 /// The default [`HttpAuthProvider`]: no credential is available, ever.
@@ -3577,8 +4108,35 @@ pub fn bare_handler_factory() -> HandlerFactory {
             elicitation: None,
             list_changed: None,
             elicitation_complete: None,
+            call_deadlines: None,
         })
     })
+}
+
+/// `whilePromptOpen`'s try/finally (`elicitation-handler.ts:52-59`) as an RAII guard.
+///
+/// Upstream's two counters are a `try`/`finally` around the handler call, so a prompt that throws
+/// still decrements. `Drop` is that `finally`, and it additionally covers the case TypeScript has
+/// no equivalent of: the handler future being dropped when the generation stops mid-prompt.
+struct PromptOpen {
+    deadlines: Arc<crate::call_deadline::CallDeadlines>,
+    server: String,
+}
+
+impl PromptOpen {
+    fn enter(deadlines: Arc<crate::call_deadline::CallDeadlines>, server: &str) -> Self {
+        deadlines.prompt_opened(server);
+        Self {
+            deadlines,
+            server: server.to_string(),
+        }
+    }
+}
+
+impl Drop for PromptOpen {
+    fn drop(&mut self) {
+        self.deadlines.prompt_closed(&self.server);
+    }
 }
 
 /// `isUnauthorizedHttpError(error)` (`server-manager.ts:73-75`) **and** the challenge it carries.
@@ -3936,6 +4494,8 @@ pub struct ConnectionBuilder {
     home: PathBuf,
     handler: HandlerFactory,
     auth: Arc<dyn HttpAuthProvider>,
+    /// `this.providerToken` — `None` until a host installs one (MCP-593).
+    provider_token: Option<Arc<dyn ProviderTokenSource>>,
 }
 
 impl std::fmt::Debug for ConnectionBuilder {
@@ -3962,7 +4522,60 @@ impl ConnectionBuilder {
             home: crate::dirs::home_dir(),
             handler: bare_handler_factory(),
             auth: Arc::new(NoStoredCredentials),
+            provider_token: None,
         }
+    }
+
+    /// `setProviderToken(providerToken)` (`server-manager.ts:401`) — install the lookup an
+    /// `auth: { provider }` server's requests read their bearer credential from (MCP-593).
+    ///
+    /// Without it such a server does not connect: [`Self::validate_provider_auth`] refuses it by
+    /// name rather than letting it reach the endpoint unauthenticated, which is what cyrup did
+    /// before the variant existed.
+    #[must_use]
+    pub fn with_provider_token(mut self, source: Arc<dyn ProviderTokenSource>) -> Self {
+        self.provider_token = Some(source);
+        self
+    }
+
+    /// `validateProviderAuth(name, definition)` (`server-manager.ts:406`) — MCP-593.
+    ///
+    /// Upstream's own comment says what it is for: *"Covers config that bypassed file validation
+    /// (runtime registrations, env-resolved URLs)."* [`crate::config::to_server_entries`] already
+    /// refuses a provider server whose URL is unsafe, but it **exempts** a URL still carrying
+    /// `${VAR}` — so this is the check that sees `https://${MCP_HOST}/mcp` after `MCP_HOST` has
+    /// resolved to `evil.example` over plain HTTP, and it is the only one that does.
+    ///
+    /// Note the order: the URL is judged **before** the token source is looked for, so a server
+    /// that is both unsafe and unsupported reports the unsafe URL. That is upstream's order and the
+    /// more useful one — the URL is the user's mistake, the missing lookup is the embedding's.
+    ///
+    /// # Errors
+    ///
+    /// `` MCP server "<name>": auth.provider requires an https URL, … `` or
+    /// `` MCP server "<name>": auth.provider isn't available here; … ``.
+    pub fn validate_provider_auth(&self, name: &str, entry: &ServerEntry) -> McpResult<()> {
+        if entry.auth.as_ref().and_then(AuthMode::provider).is_none() {
+            return Ok(());
+        }
+        // `providerAuthUrlError(resolveServerUrl(definition) ?? "")` — the `?? ""` matters: a
+        // definition whose URL cannot resolve is judged as the empty string, which is unparseable
+        // and therefore refused, rather than skipping the check.
+        let resolved = crate::credentials::resolve_server_url(entry.url.as_deref(), &self.env)
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        if let Some(url_error) = crate::config::provider_auth_url_error(&resolved) {
+            return Err(McpError::Config(format!(
+                "MCP server \"{name}\": {url_error}"
+            )));
+        }
+        if self.provider_token.is_none() {
+            return Err(McpError::Config(format!(
+                "MCP server \"{name}\": auth.provider isn't available here; it needs a cyrup session whose provider registry provides provider tokens"
+            )));
+        }
+        Ok(())
     }
 
     /// Install the manager's `createClient` — the hooks of §3.5, §3.10 and §3.16.
@@ -4305,6 +4918,34 @@ impl ConnectionBuilder {
             None => None,
         };
 
+        // `provider !== undefined ? createProviderTokenFetch(serverUrl, provider, …, commandFetch)`
+        // (`server-manager.ts:1690`) — built once per connect beside the signing client, for the
+        // same reason: what has to be fresh per attempt is the MCP client, not the HTTP one.
+        //
+        // `validate_definition` has already refused a provider server with no token source, so the
+        // `and_then` below cannot drop one silently; it is written this way rather than with an
+        // `expect` because the builder can be used without the manager.
+        let provider_client = match (
+            entry.auth.as_ref().and_then(AuthMode::provider),
+            self.provider_token.as_ref(),
+        ) {
+            (Some(provider), Some(source)) => Some(match signing_client.clone() {
+                Some(signing) => ProviderHttpClient::Signing(ProviderTokenClient::new(
+                    signing,
+                    &server_url,
+                    provider,
+                    Arc::clone(source),
+                )?),
+                None => ProviderHttpClient::Plain(ProviderTokenClient::new(
+                    http_client.clone(),
+                    &server_url,
+                    provider,
+                    Arc::clone(source),
+                )?),
+            }),
+            _ => None,
+        };
+
         // `let authState: HttpAuthProviderState = supportsOAuth(definition) ? … : { disabled }`.
         let mut auth_state = crate::oauth::initial_http_auth_state(entry);
         let mut invalidated = request.credentials_invalidated;
@@ -4332,8 +4973,11 @@ impl ConnectionBuilder {
                     request,
                     &spec,
                     entry,
-                    &http_client,
-                    signing_client.as_ref(),
+                    &HttpClientStack {
+                        http_client: &http_client,
+                        signing_client: signing_client.as_ref(),
+                        provider_client: provider_client.as_ref(),
+                    },
                     oauth_token,
                 )
                 .await?;
@@ -4372,7 +5016,14 @@ impl ConnectionBuilder {
                 // Arm 6 is Cut 1; arm 7 — `throw result.error`.
                 return Err(initialize_error(name, &error, None));
             };
-            match crate::oauth::on_unauthorized(&auth_state, Some(challenge)) {
+            // `supportsOAuth(definition) || provider !== undefined` — the second half is MCP-593's
+            // and `provider_client.is_some()` is exactly it: it exists only when the definition
+            // named a provider and a lookup was installed.
+            match crate::oauth::on_unauthorized(
+                &auth_state,
+                Some(challenge),
+                provider_client.is_some(),
+            ) {
                 crate::oauth::UnauthorizedAction::RetryOnce(next) => {
                     auth_state = next;
                     continue;
@@ -4415,12 +5066,14 @@ impl ConnectionBuilder {
         request: &CreateConnection,
         spec: &HttpTransportSpec,
         entry: &ServerEntry,
-        http_client: &UnauthorizedProbe,
-        signing_client: Option<
-            &crate::request_headers_command::RequestHeadersCommandClient<UnauthorizedProbe>,
-        >,
+        clients: &HttpClientStack<'_>,
         oauth_token: Option<String>,
     ) -> McpResult<HttpAttempt> {
+        let HttpClientStack {
+            http_client,
+            signing_client,
+            provider_client,
+        } = *clients;
         let name = request.name.as_str();
         let mut config = build_http_transport_config(spec)?;
 
@@ -4500,46 +5153,35 @@ impl ConnectionBuilder {
         // [`SessionIdProbe`] wraps whichever client this attempt uses, so `has_session_id` below is
         // a read of what the server actually sent rather than a constant. The flag is cloned out
         // BEFORE the probe is handed to the transport, which takes its client by value.
-        let (outcome, session_id) = match signing_client {
-            Some(signing) => {
-                let probe = SessionIdProbe::new(signing.clone());
-                let session_id = probe.flag();
-                (
-                    connect_client_bounded(
-                        handler,
-                        crate::trace::maybe_traced(
-                            http_transport_with_client(probe, config),
-                            &request.name,
-                            crate::trace::TraceTransportKind::StreamableHttp,
-                            request.trace.clone(),
-                        ),
-                        lifecycle,
-                        request.attempt.clone(),
-                        budget,
-                    )
-                    .await,
-                    session_id,
+        // Four shapes, one driver. The provider wrapper is OUTSIDE the signing client because
+        // upstream's chain is `providerTokenFetch(…, commandFetch)` — see [`ProviderTokenClient`]
+        // for why that order is the one that keeps a signing command's `Authorization` winning.
+        let (outcome, session_id) = match (provider_client, signing_client) {
+            (Some(provider), _) => {
+                drive_http_attempt(
+                    provider.clone(),
+                    config,
+                    handler,
+                    request,
+                    lifecycle,
+                    budget,
                 )
+                .await
             }
-            None => {
-                let probe = SessionIdProbe::new(http_client.clone());
-                let session_id = probe.flag();
-                (
-                    connect_client_bounded(
-                        handler,
-                        crate::trace::maybe_traced(
-                            http_transport_with_client(probe, config),
-                            &request.name,
-                            crate::trace::TraceTransportKind::StreamableHttp,
-                            request.trace.clone(),
-                        ),
-                        lifecycle,
-                        request.attempt.clone(),
-                        budget,
-                    )
-                    .await,
-                    session_id,
+            (None, Some(signing)) => {
+                drive_http_attempt(signing.clone(), config, handler, request, lifecycle, budget)
+                    .await
+            }
+            (None, None) => {
+                drive_http_attempt(
+                    http_client.clone(),
+                    config,
+                    handler,
+                    request,
+                    lifecycle,
+                    budget,
                 )
+                .await
             }
         };
 
@@ -4564,6 +5206,227 @@ impl ConnectionBuilder {
             Err(error) => HttpAttempt::Failed(error),
         })
     }
+}
+
+/// Whichever client stack an `auth: { provider }` connection uses: the provider wrapper over the
+/// signing client when both are configured, over the bare client otherwise (MCP-593).
+///
+/// An enum rather than a boxed `dyn StreamableHttpClient` because the trait's methods are
+/// `async fn`, so it is not object-safe; and two concrete arms rather than a generic parameter on
+/// `connect_http_client` because the shape is decided per definition, not per call site.
+#[derive(Debug, Clone)]
+pub enum ProviderHttpClient {
+    /// No `requestHeadersCommand`: the provider wrapper sits directly on the HTTP client.
+    Plain(ProviderTokenClient<UnauthorizedProbe>),
+    /// With one: the provider wrapper is outside the signing client, so the command's headers are
+    /// applied last and win.
+    Signing(
+        ProviderTokenClient<
+            crate::request_headers_command::RequestHeadersCommandClient<UnauthorizedProbe>,
+        >,
+    ),
+}
+
+impl StreamableHttpClient for ProviderHttpClient {
+    type Error = reqwest::Error;
+
+    async fn post_message(
+        &self,
+        uri: Arc<str>,
+        message: ClientJsonRpcMessage,
+        session_id: Option<Arc<str>>,
+        auth_header: Option<String>,
+        custom_headers: HashMap<HeaderName, HeaderValue>,
+    ) -> Result<StreamableHttpPostResponse, StreamableHttpError<Self::Error>> {
+        match self {
+            ProviderHttpClient::Plain(client) => {
+                client
+                    .post_message(uri, message, session_id, auth_header, custom_headers)
+                    .await
+            }
+            ProviderHttpClient::Signing(client) => {
+                client
+                    .post_message(uri, message, session_id, auth_header, custom_headers)
+                    .await
+            }
+        }
+    }
+
+    async fn post_message_with_max_sse_event_size(
+        &self,
+        uri: Arc<str>,
+        message: ClientJsonRpcMessage,
+        session_id: Option<Arc<str>>,
+        auth_header: Option<String>,
+        custom_headers: HashMap<HeaderName, HeaderValue>,
+        max_sse_event_size: usize,
+    ) -> Result<StreamableHttpPostResponse, StreamableHttpError<Self::Error>> {
+        match self {
+            ProviderHttpClient::Plain(client) => {
+                client
+                    .post_message_with_max_sse_event_size(
+                        uri,
+                        message,
+                        session_id,
+                        auth_header,
+                        custom_headers,
+                        max_sse_event_size,
+                    )
+                    .await
+            }
+            ProviderHttpClient::Signing(client) => {
+                client
+                    .post_message_with_max_sse_event_size(
+                        uri,
+                        message,
+                        session_id,
+                        auth_header,
+                        custom_headers,
+                        max_sse_event_size,
+                    )
+                    .await
+            }
+        }
+    }
+
+    async fn get_stream(
+        &self,
+        uri: Arc<str>,
+        session_id: Option<Arc<str>>,
+        last_event_id: Option<String>,
+        auth_header: Option<String>,
+        custom_headers: HashMap<HeaderName, HeaderValue>,
+    ) -> Result<BoxStream<'static, Result<Sse, SseError>>, StreamableHttpError<Self::Error>> {
+        match self {
+            ProviderHttpClient::Plain(client) => {
+                client
+                    .get_stream(uri, session_id, last_event_id, auth_header, custom_headers)
+                    .await
+            }
+            ProviderHttpClient::Signing(client) => {
+                client
+                    .get_stream(uri, session_id, last_event_id, auth_header, custom_headers)
+                    .await
+            }
+        }
+    }
+
+    async fn get_stream_with_max_sse_event_size(
+        &self,
+        uri: Arc<str>,
+        session_id: Option<Arc<str>>,
+        last_event_id: Option<String>,
+        auth_header: Option<String>,
+        custom_headers: HashMap<HeaderName, HeaderValue>,
+        max_sse_event_size: usize,
+    ) -> Result<BoxStream<'static, Result<Sse, SseError>>, StreamableHttpError<Self::Error>> {
+        match self {
+            ProviderHttpClient::Plain(client) => {
+                client
+                    .get_stream_with_max_sse_event_size(
+                        uri,
+                        session_id,
+                        last_event_id,
+                        auth_header,
+                        custom_headers,
+                        max_sse_event_size,
+                    )
+                    .await
+            }
+            ProviderHttpClient::Signing(client) => {
+                client
+                    .get_stream_with_max_sse_event_size(
+                        uri,
+                        session_id,
+                        last_event_id,
+                        auth_header,
+                        custom_headers,
+                        max_sse_event_size,
+                    )
+                    .await
+            }
+        }
+    }
+
+    async fn delete_session(
+        &self,
+        uri: Arc<str>,
+        session_id: Arc<str>,
+        auth_header: Option<String>,
+        custom_headers: HashMap<HeaderName, HeaderValue>,
+    ) -> Result<(), StreamableHttpError<Self::Error>> {
+        match self {
+            ProviderHttpClient::Plain(client) => {
+                client
+                    .delete_session(uri, session_id, auth_header, custom_headers)
+                    .await
+            }
+            ProviderHttpClient::Signing(client) => {
+                client
+                    .delete_session(uri, session_id, auth_header, custom_headers)
+                    .await
+            }
+        }
+    }
+}
+
+/// The three HTTP client shapes one connect may have built, passed as one value.
+///
+/// Grouped rather than listed: `attempt(kind)` is a closure upstream and closes over all of them,
+/// and a Rust method taking them positionally crossed the argument-count lint the moment MCP-593
+/// added the third. Which one is used is [`ConnectionBuilder::http_attempt`]'s decision, not the
+/// caller's.
+#[derive(Debug, Clone, Copy)]
+struct HttpClientStack<'a> {
+    /// Always present: the tuned `reqwest` client under its 401 probe.
+    http_client: &'a UnauthorizedProbe,
+    /// `createRequestHeadersCommandFetch(definition.requestHeadersCommand, …)`.
+    signing_client:
+        Option<&'a crate::request_headers_command::RequestHeadersCommandClient<UnauthorizedProbe>>,
+    /// `createProviderTokenFetch(serverUrl, provider, …)` — MCP-593, and outermost when present.
+    provider_client: Option<&'a ProviderHttpClient>,
+}
+
+/// One turn of the ladder's transport half, over whichever client stack the definition selected.
+///
+/// Extracted when MCP-593 added a third stack: the body was duplicated per arm of a two-arm match,
+/// and a fourth copy is how a transport option quietly stops applying to one shape of server.
+/// [`SessionIdProbe`] wraps the client here, so `has_session_id` is a read of what the server
+/// actually sent; the flag is cloned out BEFORE the probe is handed to the transport, which takes
+/// its client by value.
+async fn drive_http_attempt<C>(
+    client: C,
+    config: StreamableHttpClientTransportConfig,
+    handler: McpClientHandler,
+    request: &CreateConnection,
+    lifecycle: ClientLifecycleMode,
+    budget: Option<Duration>,
+) -> (
+    Result<
+        Result<RunningService<RoleClient, McpClientHandler>, Box<ClientInitializeError>>,
+        Duration,
+    >,
+    Arc<std::sync::atomic::AtomicBool>,
+)
+where
+    C: StreamableHttpClient + Clone + Send + Sync + 'static,
+{
+    let probe = SessionIdProbe::new(client);
+    let session_id = probe.flag();
+    let outcome = connect_client_bounded(
+        handler,
+        crate::trace::maybe_traced(
+            http_transport_with_client(probe, config),
+            &request.name,
+            crate::trace::TraceTransportKind::StreamableHttp,
+            request.trace.clone(),
+        ),
+        lifecycle,
+        request.attempt.clone(),
+        budget,
+    )
+    .await;
+    (outcome, session_id)
 }
 
 /// `definition.oauth !== false && definition.oauth?.skipIssuerMetadataValidation === true` —
@@ -4792,7 +5655,7 @@ async fn discover(
         .as_ref()
         .and_then(|options| options.timeout);
     let (tools, resources_result, prompts_result) = tokio::join!(
-        bounded_list(budget, peer.list_all_tools()),
+        bounded_list(budget, list_all_tools_with_hints(peer)),
         async {
             if !has_resources {
                 return None;
@@ -4815,7 +5678,7 @@ async fn discover(
     let aborted = request.request.is_cancelled();
 
     // `fetchAllTools` — no catch. Errors propagate.
-    let tools = tools.map_err(|failure| {
+    let (tools, tool_list_hints) = tools.map_err(|failure| {
         if aborted {
             return McpError::Aborted(crate::abort::ABORTED_FALLBACK_REASON.to_string());
         }
@@ -4866,7 +5729,65 @@ async fn discover(
         prompts,
         prompt_discovery_failed,
         instructions,
+        tool_list_hints,
     })
+}
+
+/// `fetchAllTools(client, requestOptions)` (`server-manager.ts:1822-1850`) — `Peer::list_all_tools`
+/// plus the **first page's** cache hints, which that helper discards.
+///
+/// ```text
+/// if (firstPage) {
+///   const ttlMs = typeof result.ttlMs === "number" && Number.isSafeInteger(result.ttlMs) && result.ttlMs >= 0
+///     ? result.ttlMs : undefined;
+///   const cacheScope = result.cacheScope === "public" || result.cacheScope === "private"
+///     ? result.cacheScope : undefined;
+///   if (ttlMs !== undefined || cacheScope !== undefined) hints = { ttlMs, cacheScope };
+///   firstPage = false;
+/// }
+/// ```
+///
+/// The type filtering upstream does here is rmcp's: `ttl_ms` is an `Option<u64>` normalised by
+/// `deserialize_ttl_ms` (a negative value becomes `0`, which is SEP-2549's own rule and upstream's
+/// `>= 0` test read the other way round — upstream *drops* a negative hint where rmcp clamps it to
+/// "never cache"; a server sending a negative TTL gets the stricter of the two readings here), and
+/// `cache_scope` is a `CacheScope` enum, so an unknown scope never reaches this code.
+///
+/// The cursor loop is `Peer::list_all_tools`' (`rmcp-3.1.4/src/service/client.rs:1727-1740`),
+/// reproduced because that helper returns only the tools.
+async fn list_all_tools_with_hints(
+    peer: &Peer<RoleClient>,
+) -> Result<
+    (
+        Vec<rmcp::model::Tool>,
+        Option<crate::server_manager::ToolListHints>,
+    ),
+    ServiceError,
+> {
+    let mut tools = Vec::new();
+    let mut cursor = None;
+    let mut hints = None;
+    let mut first_page = true;
+    loop {
+        let result = peer
+            .list_tools(Some(
+                rmcp::model::PaginatedRequestParams::default().with_cursor(cursor),
+            ))
+            .await?;
+        if first_page {
+            hints = crate::server_manager::ToolListHints {
+                ttl_ms: result.ttl_ms,
+                cache_scope: result.cache_scope,
+            }
+            .non_empty();
+            first_page = false;
+        }
+        tools.extend(result.tools);
+        cursor = result.next_cursor;
+        if cursor.is_none() {
+            return Ok((tools, hints));
+        }
+    }
 }
 
 /// [`initialize_error`]'s counterpart for a failure raised after the handshake, where the stderr
@@ -4897,8 +5818,18 @@ impl ConnectionFactory for ConnectionBuilder {
             home: self.home.clone(),
             handler: Arc::clone(&self.handler),
             auth: Arc::clone(&self.auth),
+            provider_token: self.provider_token.clone(),
         };
         Box::pin(async move { builder.create_connection(request).await })
+    }
+
+    /// `validateProviderAuth(name, definition)` — see
+    /// [`ConnectionBuilder::validate_provider_auth`]. The manager calls this in upstream's exact
+    /// position: before the disabled guard in both `connect` and `reconnect`
+    /// (`server-manager.ts:480`, `:579`), so a reconnect on a misconfigured provider server fails
+    /// **before any teardown happens**.
+    fn validate_definition(&self, name: &str, definition: &ServerEntry) -> McpResult<()> {
+        self.validate_provider_auth(name, definition)
     }
 }
 
@@ -5314,6 +6245,7 @@ mod wire_tests {
             elicitation: None,
             list_changed: None,
             elicitation_complete: hook,
+            call_deadlines: None,
         })
     }
 
@@ -5323,6 +6255,70 @@ mod wire_tests {
         let b = handler(false, None);
         assert!(a.identity().ptr_eq(&a.clone().identity()));
         assert!(!a.identity().ptr_eq(&b.identity()));
+    }
+
+    /// MCP-606 — `whilePromptOpen(state, () => handleElicitationRequest(...))`
+    /// (`elicitation-handler.ts:48-59`). The handler must raise the pause **around** the hook: one
+    /// prompt open while it runs, none once it returns.
+    #[tokio::test]
+    async fn the_elicitation_handler_opens_a_pause_around_the_prompt() {
+        let deadlines = Arc::new(crate::call_deadline::CallDeadlines::default());
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<usize>::new()));
+        let hook = {
+            let deadlines = Arc::clone(&deadlines);
+            let seen = Arc::clone(&seen);
+            Arc::new(move |server: String, _params| {
+                let deadlines = Arc::clone(&deadlines);
+                let seen = Arc::clone(&seen);
+                Box::pin(async move {
+                    // Observed from INSIDE the prompt, which is the whole assertion.
+                    seen.lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push(deadlines.open_prompts(&server));
+                    Ok(ElicitResult::new(ElicitationAction::Decline))
+                }) as BoxFuture<'static, Result<ElicitResult, ErrorData>>
+            }) as ElicitationHook
+        };
+        let handler = McpClientHandler::new(McpClientHandlerParts {
+            server: "s".to_string(),
+            runtime_signal: CancelToken::new(),
+            elicitation_mode: Some(ElicitationMode { allow_url: false }),
+            sampling: None,
+            elicitation: Some(hook),
+            list_changed: None,
+            elicitation_complete: None,
+            call_deadlines: Some(Arc::clone(&deadlines)),
+        });
+
+        // A deadline registered first, so the pause has something to act on.
+        let deadline = deadlines
+            .register("s", std::time::Duration::from_millis(100))
+            .deadline;
+        let before = deadline.subscribe().borrow().to_owned();
+
+        let request = ElicitRequestParams::FormElicitationParams {
+            meta: None,
+            message: "pick one".to_string(),
+            requested_schema: rmcp::model::ElicitationSchema::new(std::collections::BTreeMap::new()),
+        };
+        let result = handler.elicit(request).await.expect("the hook answers");
+        assert_eq!(result.action, ElicitationAction::Decline);
+        assert_eq!(
+            *seen
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            vec![1],
+            "the prompt must be counted open while the handler runs"
+        );
+        assert_eq!(
+            deadlines.open_prompts("s"),
+            0,
+            "and closed again when it returns — the `finally`"
+        );
+        assert!(
+            deadline.subscribe().borrow().to_owned() > before,
+            "the registered deadline was paused and resumed, which bumps its generation"
+        );
     }
 
     #[test]
@@ -7189,6 +8185,253 @@ done
             )),
             ..http_entry(url)
         }
+    }
+
+    // ── MCP-593 · `auth: { provider: "<name>" }` ──────────────────────────────────────────────
+
+    /// A [`ProviderTokenSource`] that answers one provider and counts the lookups.
+    #[derive(Debug)]
+    struct ScriptedProviderToken {
+        provider: &'static str,
+        token: std::sync::Mutex<Option<String>>,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl ScriptedProviderToken {
+        fn new(provider: &'static str, token: Option<&str>) -> Arc<Self> {
+            Arc::new(Self {
+                provider,
+                token: std::sync::Mutex::new(token.map(str::to_string)),
+                calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            })
+        }
+    }
+
+    impl ProviderTokenSource for ScriptedProviderToken {
+        fn token<'a>(&'a self, provider: &'a str) -> BoxFuture<'a, Option<String>> {
+            self.calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            // Another provider's token is never handed out: the lookup is keyed, not global.
+            let answer = (provider == self.provider)
+                .then(|| {
+                    self.token
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .clone()
+                })
+                .flatten();
+            Box::pin(async move { answer })
+        }
+    }
+
+    fn provider_entry(url: &str, provider: &str) -> ServerEntry {
+        let entry: ServerEntry = serde_json::from_str(&format!(
+            "{{\"url\":\"{url}\",\"auth\":{{\"provider\":\"{provider}\"}}}}"
+        ))
+        .expect("the entry parses");
+        assert_eq!(
+            entry.auth.as_ref().and_then(AuthMode::provider),
+            Some(provider),
+            "`auth: {{ provider }}` must reach `AuthMode::Provider`, not `Other`"
+        );
+        entry
+    }
+
+    /// The row's headline: a provider server's requests carry that provider's token as their
+    /// bearer credential, and the lookup happens **per request** rather than once per connection.
+    ///
+    /// The fixture's only gate is the bearer, so this cannot pass without the token actually being
+    /// sent — which is what cyrup did before the variant existed, `{ provider }` having landed in
+    /// `AuthMode::Other` and reached no reader at all.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_provider_auth_server_sends_the_providers_token() {
+        let fixture = HttpFixture::start_with(FixtureOptions {
+            require_bearer: Some("provider-token"),
+            ..FixtureOptions::default()
+        })
+        .await;
+        let source = ScriptedProviderToken::new("anthropic", Some("provider-token"));
+        let calls = Arc::clone(&source.calls);
+
+        let connection = builder()
+            .with_provider_token(Arc::clone(&source) as Arc<dyn ProviderTokenSource>)
+            .create_connection(request("api", provider_entry(&fixture.url, "anthropic")))
+            .await
+            .expect("the provider's token authorizes the connect");
+
+        assert_eq!(connection.status, ConnectionStatus::Connected);
+        let requests = fixture.requests();
+        assert!(
+            requests
+                .iter()
+                .any(|recorded| recorded.body.contains("\"method\":\"tools/list\"")),
+            "discovery ran, so the token authorized more than the handshake"
+        );
+        for recorded in &requests {
+            assert_eq!(
+                recorded.all("authorization"),
+                vec!["Bearer provider-token"],
+                "exactly one Authorization value, carrying the provider token: {}",
+                recorded.method
+            );
+        }
+        assert!(
+            calls.load(std::sync::atomic::Ordering::Relaxed) >= requests.len(),
+            "the lookup is per REQUEST, not once per connection: {} lookups for {} requests",
+            calls.load(std::sync::atomic::Ordering::Relaxed),
+            requests.len()
+        );
+
+        // Neither the source nor the builder may print a token.
+        let rendered = format!("{:?}", builder().with_provider_token(source));
+        assert!(!rendered.contains("provider-token"), "{rendered}");
+    }
+
+    /// Not signed in: upstream does **not** send the request, it synthesises a 401 — *"the 401 marks
+    /// the server as needing sign-in"* — so the outcome is `needs-auth`, never a transport failure.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_provider_with_no_token_is_needs_auth_and_sends_nothing() {
+        let fixture = HttpFixture::start_with(FixtureOptions::default()).await;
+        let source = ScriptedProviderToken::new("anthropic", None);
+
+        let connection = builder()
+            .with_provider_token(Arc::clone(&source) as Arc<dyn ProviderTokenSource>)
+            .create_connection(request("api", provider_entry(&fixture.url, "anthropic")))
+            .await
+            .expect("a missing token is not an error, it is needs-auth");
+
+        assert_eq!(connection.status, ConnectionStatus::NeedsAuth);
+        assert!(
+            fixture.requests().is_empty(),
+            "without a token the request is not sent at all: {:?}",
+            fixture.requests()
+        );
+    }
+
+    /// A token that stops working mid-session: the next request's lookup answers `None`, so the
+    /// request is refused locally and the server reads as needing sign-in rather than as a broken
+    /// transport. The fixture would have accepted the first token forever.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_token_revoked_mid_session_becomes_needs_auth_not_a_transport_failure() {
+        let fixture = HttpFixture::start_with(FixtureOptions {
+            require_bearer: Some("provider-token"),
+            ..FixtureOptions::default()
+        })
+        .await;
+        let source = ScriptedProviderToken::new("anthropic", Some("provider-token"));
+        let entry = provider_entry(&fixture.url, "anthropic");
+
+        let first = builder()
+            .with_provider_token(Arc::clone(&source) as Arc<dyn ProviderTokenSource>)
+            .create_connection(request("api", entry.clone()))
+            .await
+            .expect("the first connect is authorized");
+        assert_eq!(first.status, ConnectionStatus::Connected);
+
+        // `/login` expired, or the provider revoked it.
+        *source
+            .token
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        let before = fixture.requests().len();
+
+        let second = builder()
+            .with_provider_token(Arc::clone(&source) as Arc<dyn ProviderTokenSource>)
+            .create_connection(request("api", entry))
+            .await
+            .expect("a revoked token is needs-auth");
+        assert_eq!(second.status, ConnectionStatus::NeedsAuth);
+        assert_eq!(
+            fixture.requests().len(),
+            before,
+            "and nothing was put on the wire with a dead credential"
+        );
+    }
+
+    /// The provider's token goes to the server's own origin and nowhere else, and a different
+    /// provider's name gets no token at all — the lookup is keyed, not a global credential.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_token_is_scoped_to_one_origin_and_one_provider() {
+        let fixture = HttpFixture::start_with(FixtureOptions::default()).await;
+        let source = ScriptedProviderToken::new("anthropic", Some("provider-token"));
+        let client = ProviderTokenClient::new(
+            UnauthorizedProbe::new(build_http_client().expect("client")),
+            &fixture.url,
+            "anthropic",
+            Arc::clone(&source) as Arc<dyn ProviderTokenSource>,
+        )
+        .expect("the fixture URL parses");
+
+        assert!(client.same_origin(&fixture.url));
+        assert!(
+            !client.same_origin("https://evil.example/mcp"),
+            "another origin is not this server's"
+        );
+        // Same host, different port: a distinct origin, so still no token.
+        let other_port = fixture.url.replace("127.0.0.1:", "127.0.0.1:1");
+        assert!(!client.same_origin(&other_port), "{other_port}");
+
+        // A connection configured for a provider the source does not hold gets `None`, which is
+        // needs-auth — not somebody else's token.
+        let mismatched = builder()
+            .with_provider_token(Arc::clone(&source) as Arc<dyn ProviderTokenSource>)
+            .create_connection(request("api", provider_entry(&fixture.url, "openai")))
+            .await
+            .expect("needs-auth, not an error");
+        assert_eq!(mismatched.status, ConnectionStatus::NeedsAuth);
+    }
+
+    /// `validateProviderAuth` (`server-manager.ts:406`), both sentences, and the order between them.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn validate_provider_auth_refuses_before_the_endpoint_is_touched() {
+        let source = ScriptedProviderToken::new("anthropic", Some("t"));
+        let with_source =
+            builder().with_provider_token(Arc::clone(&source) as Arc<dyn ProviderTokenSource>);
+
+        // Leg 1 — the URL. This is the case `to_server_entries` deliberately EXEMPTS, because the
+        // URL still held `${VAR}` when the file was read; the check only exists here.
+        let interpolated = ServerEntry {
+            url: Some("http://${PROVIDER_HOST}/mcp".to_string()),
+            ..provider_entry("http://placeholder.example/mcp", "anthropic")
+        };
+        let env: crate::credentials::EnvFn =
+            Arc::new(|name: &str| (name == "PROVIDER_HOST").then(|| "evil.example".to_string()));
+        let error = ConnectionBuilder::new(None)
+            .with_environment(env, base_env(), PathBuf::from("/home/fixture"))
+            .with_provider_token(Arc::clone(&source) as Arc<dyn ProviderTokenSource>)
+            .validate_provider_auth("api", &interpolated)
+            .expect_err("plain http to a remote host must be refused");
+        assert_eq!(
+            error.to_string(),
+            "MCP server \"api\": auth.provider requires an https URL, or http on localhost, 127.0.0.1, or [::1]"
+        );
+
+        // …and the same definition resolving to loopback is allowed.
+        let loopback: crate::credentials::EnvFn =
+            Arc::new(|name: &str| (name == "PROVIDER_HOST").then(|| "127.0.0.1:9".to_string()));
+        ConnectionBuilder::new(None)
+            .with_environment(loopback, base_env(), PathBuf::from("/home/fixture"))
+            .with_provider_token(Arc::clone(&source) as Arc<dyn ProviderTokenSource>)
+            .validate_provider_auth("api", &interpolated)
+            .expect("http on 127.0.0.1 is the allowed cleartext case");
+
+        // Leg 2 — no lookup installed. Reported only once the URL is cleared, which is upstream's
+        // order: the URL is the user's mistake, a missing lookup is the embedding's.
+        let error = builder()
+            .validate_provider_auth(
+                "api",
+                &provider_entry("https://api.example/mcp", "anthropic"),
+            )
+            .expect_err("no provider-token source means no provider auth");
+        assert_eq!(
+            error.to_string(),
+            "MCP server \"api\": auth.provider isn't available here; it needs a cyrup session whose provider registry provides provider tokens"
+        );
+
+        // A server that does not use provider auth is untouched by either leg.
+        with_source
+            .validate_provider_auth("api", &http_entry("http://plain.example/mcp"))
+            .expect("no `auth.provider`, nothing to validate");
     }
 
     /// **Journey A.** A credential is already in the vault; the server connects on attempt one,

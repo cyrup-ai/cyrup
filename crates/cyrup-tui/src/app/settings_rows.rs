@@ -311,12 +311,14 @@ pub(crate) fn settings_rows(
             eff.tui_mode().as_str(),
             choices(&["regular", "fullscreen"]),
         )
-        .with_description("Interface layout; fullscreen mode is experimental"),
+        .with_description("Interface layout; regular mode uses the terminal's normal scrollback"),
         // The "no effect in regular mode" half of the description is upstream's own wording and is
-        // load-bearing: the key is read by the alternate screen's scrollbar only, so in the default
-        // renderer this row is a stored preference and nothing more (the same conditionality
-        // `EffectiveSettings::fullscreen_scrollbar` documents on the getter — it answers the
-        // configured policy in either mode, and the renderer decides whether that matters).
+        // load-bearing: the key is read by the alternate screen's scrollbar only (the same
+        // conditionality `EffectiveSettings::fullscreen_scrollbar` documents on the getter — it
+        // answers the configured policy in either mode, and the renderer decides whether that
+        // matters). CFG-096/TUI-135 flipped WHICH renderer is the default, so this row — and the
+        // other three `fullscreen*` rows below — now take effect out of the box and are a stored
+        // preference only for a user who opted into `tuiMode: "regular"`.
         SettingRow::choice(
             "fullscreenScrollbar",
             "Fullscreen scrollbar",

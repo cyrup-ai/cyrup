@@ -57,9 +57,9 @@ pub use api::{
 };
 pub use auth::{
     ApiKeyAuth, AuthContext, AuthOverrides, AuthResult, Credential, CredentialInfo,
-    CredentialStore, CredentialType, EnvAuthContext, InMemoryCredentialStore, ModelAuth, ModifyFn,
-    OAuthAuth, ProviderAuth, ProviderEnv, auth_credential, env_key, keyless_local,
-    resolve_provider_auth,
+    CredentialStore, CredentialType, EnvAuthContext, GetDeviceIdFn, InMemoryCredentialStore,
+    LoginOptions, ModelAuth, ModifyFn, OAuthAuth, ProviderAuth, ProviderEnv, auth_credential,
+    env_key, keyless_local, resolve_provider_auth,
 };
 pub use cache_stats::{
     CACHE_TTL_MS, CacheMiss, CacheScan, CacheScanEntry, CacheWasteTotals, ModelPriceSource,
@@ -74,7 +74,7 @@ pub use classifier::{
     AnyModel, BoolCriteria, ClassifierAnswer, ClassifierApiRegistry, ClassifierContext,
     ClassifierModel, ClassifierOnPayload, ClassifierOnResponse, ClassifierOptions,
     ClassifierQuestion, ClassifierResult, ClassifierStopReason, DEFAULT_MAX_RETRIES,
-    DEFAULT_TEMPERATURE, KnownClassifierApi, ModelType, OrderedMap, ProviderClassifier,
+    DEFAULT_TEMPERATURE, ImageModel, KnownClassifierApi, ModelType, OrderedMap, ProviderClassifier,
 };
 pub use collection::{
     CreateModelsOptions, EXTENDED_THINKING_LEVELS, Models, ModelsRefreshOptions,

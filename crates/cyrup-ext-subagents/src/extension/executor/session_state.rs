@@ -451,6 +451,7 @@ mod tests {
             enforce: Some(true),
             strict: None,
             allow: Some(vec!["anthropic/*".to_string()]),
+            agents: None,
         };
         let config = crate::background::runner_main::RunnerConfig {
             tool_timeout: Default::default(),

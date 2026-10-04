@@ -179,13 +179,23 @@ impl EffectiveSettings {
         })
     }
 
-    /// `getDefaultTools(): string[] | undefined` (Pi v0.84.4 settings-manager.ts:1273-1276, key
-    /// declared at `:128` as `defaultTools?: string[]; // Initial built-in tool selection`).
+    /// `getDefaultTools(): string[] | undefined` (Pi `core/settings-manager.ts:1434-1438`
+    /// @v1.0.0, key declared at `:168` as `defaultTools?: string[]` with the comment "Initial tool
+    /// selection; `+name`/`-name` entries add to or remove from the inherited selection").
     ///
-    /// A v0.84.4 addition (absent at v0.84.1): the INITIAL BUILT-IN tool selection a session starts
-    /// with, in place of pi's `defaultActiveToolNames` (`read`/`bash`/`edit`/`write`, sdk.ts:256).
-    /// Ported as a plain passthrough — upstream's getter only makes a defensive copy and validates
-    /// nothing, so an unknown name is carried through and simply matches no tool.
+    /// The INITIAL BUILT-IN tool selection a session starts with, in place of pi's
+    /// [`DEFAULT_TOOL_NAMES`](super::DEFAULT_TOOL_NAMES).
+    ///
+    /// CFG-097 — the value is a small language, not a list of names, and the getter RESOLVES it:
+    /// `return resolveDefaultTools(Array.isArray(tools) ? tools.filter(t => typeof t === "string")
+    /// : [])`. Plain names replace the baseline, then `+name`/`-name` add and remove in list order
+    /// — see [`super::resolve_default_tools`] for the exact rules and the `:238` edge condition.
+    /// Before this port the array came back verbatim, so pi's own documented example
+    /// `"defaultTools": ["+codemode"]` (`docs/settings.md:50`) selected a tool literally named
+    /// `+codemode`, matched nothing, and started the session with NO built-in tools.
+    ///
+    /// A non-array is resolved as `[]`, not as the baseline: upstream's ternary substitutes the
+    /// empty list before resolving, and `resolveDefaultTools([])` is `[]` by the `:238` condition.
     ///
     /// `None` (unset) and `Some(vec![])` (an explicit empty list) are DIFFERENT, exactly as for
     /// [`Self::enabled_models`]: unset means "pi's own four built-ins", empty means "no built-ins at
@@ -195,18 +205,20 @@ impl EffectiveSettings {
     /// Tag-to-tag (ADR-0006): the key landed at `4d9aa837c` ("add configurable default tools") as an
     /// `allowedToolNames` allowlist, which also SUPPRESSED extension and SDK custom tools;
     /// `541045ae0` ("preserve extension tools with defaults") narrowed it to the initial built-in
-    /// selection before v0.84.4 shipped. v0.84.4's behaviour — selection, not allowlist — is what is
-    /// ported here.
+    /// selection; `30a1d1849` ("support +name/-name in defaultTools") and `db6cc71dc` added the
+    /// modifiers, the exported baseline and the layer merge this getter now honours.
     pub fn default_tools(&self) -> Option<Vec<String>> {
         self.merged.get("defaultTools").map(|v| {
-            v.as_array()
+            let entries: Vec<String> = v
+                .as_array()
                 .map(|a| {
                     a.iter()
                         .filter_map(Value::as_str)
                         .map(str::to_string)
                         .collect()
                 })
-                .unwrap_or_default()
+                .unwrap_or_default();
+            super::resolve_default_tools(&entries)
         })
     }
 
@@ -596,13 +608,20 @@ impl EffectiveSettings {
     }
 
     /// `tuiMode` — which renderer the interactive TUI starts in (Pi `getTuiMode`,
-    /// settings-manager.ts:1128-1130 @v0.84.1). ADR-0005 §Decision A-3.
+    /// settings-manager.ts:1348-1350 @v1.0.0). ADR-0005 §Decision A-3.
     ///
-    /// Pi DEGRADES rather than validates: `this.settings.tuiMode === "fullscreen" ? "fullscreen" :
-    /// "regular"` (`:1129`), so an unknown value and an absent key both answer
-    /// [`TuiMode::Regular`] instead of erroring — the sole reason this reads the raw string rather
-    /// than `serde_json::from_value::<TuiMode>`, which would reject `"Fullscreen"`, `true`, or a
-    /// typo and force a `Result` on a getter upstream cannot fail.
+    /// CFG-096 / TUI-135 — the DEFAULT is `fullscreen`, not `regular`. Upstream `88ff80b98` ("make
+    /// fullscreen the default TUI mode") inverted the predicate to
+    /// `this.settings.tuiMode === "regular" ? "regular" : "fullscreen"` (`:1349`), and the field
+    /// comment at `:184` is now `// default: "fullscreen"`. The CHANGELOG entry is the user-facing
+    /// contract: *"Changed the default TUI mode to fullscreen. Set `tuiMode` to `"regular"` or pass
+    /// `--tui-mode regular` to keep the terminal's normal scrollback."*
+    ///
+    /// Pi DEGRADES rather than validates, and the inversion moved which way it degrades: an unknown
+    /// value, a non-string and an absent key all now answer [`TuiMode::Fullscreen`] — the sole
+    /// reason this reads the raw string rather than `serde_json::from_value::<TuiMode>`, which
+    /// would reject `"Fullscreen"`, `true`, or a typo and force a `Result` on a getter upstream
+    /// cannot fail.
     ///
     /// Degrading is a READ-side rule only. The unrecognized value stays in the document verbatim:
     /// [`Settings`] is a JSON map and every writer is a read-modify-write of the re-parsed file
@@ -610,8 +629,8 @@ impl EffectiveSettings {
     /// edit of some other key byte-for-byte (R-07-004).
     pub fn tui_mode(&self) -> TuiMode {
         match self.merged.get_str("tuiMode").as_deref() {
-            Some("fullscreen") => TuiMode::Fullscreen,
-            _ => TuiMode::Regular,
+            Some("regular") => TuiMode::Regular,
+            _ => TuiMode::Fullscreen,
         }
     }
 

@@ -67,7 +67,7 @@
 /// `Deserialize` (`entry.rs:262-285`) falls back to `Entry::Unknown(Value)` when a known-tag line
 /// does not fit the strict schema, so the line survives verbatim and `manager::load`'s `recovered`
 /// flag is never raised for it. Nothing is destroyed — but the entry stops being interpretable
-/// (`entries_have_assistant` answers `false` for it, `manager.rs:826-831`), so a genuinely new
+/// (`entries_have_conversation` answers `false` for it, `manager/mod.rs:188-199`), so a genuinely new
 /// upstream stop reason must still be added HERE to be understood. Widening the enum with a
 /// tolerant catch-all would not fix that; it would only make the misunderstanding silent.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
