@@ -28,3 +28,4 @@ mod image_bytecap;
 mod install_package_dir;
 mod list_models_session;
 mod models_json_resolution;
+mod stored_credentials;

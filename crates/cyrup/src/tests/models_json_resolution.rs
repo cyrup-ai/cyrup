@@ -47,7 +47,7 @@ const MYCORP: &str = r#"{
 #[test]
 fn a_models_json_provider_can_be_launched_by_model_prefix() {
     let file = model_file(MYCORP);
-    let provider = select_provider(None, Some("mycorp/mycorp-large"), None, &file)
+    let provider = select_provider(None, Some("mycorp/mycorp-large"), None, &file, None)
         .expect("a models.json-declared provider must be launchable, not a hard bail");
     assert_eq!(provider.id().as_str(), "mycorp");
     let model = provider
@@ -68,6 +68,7 @@ fn an_undeclared_provider_still_errors_clearly() {
         Some("mycorp/mycorp-large"),
         None,
         &ModelFile::default(),
+        None,
     ) {
         Err(e) => e.to_string(),
         Ok(_) => panic!("an undeclared provider must still be an error"),
@@ -192,7 +193,10 @@ fn a_models_json_provider_without_an_api_key_is_not_configured() {
 /// `AgentSession::set_model_resolved` calls for a cross-provider switch).
 #[test]
 fn an_in_session_model_swap_resolves_a_models_json_provider() {
-    let resolver = BuiltinProviderResolver::new(Arc::new(model_file(MYCORP)));
+    let resolver = BuiltinProviderResolver::new(
+        Arc::new(model_file(MYCORP)),
+        Arc::new(cyrup_provider::InMemoryCredentialStore::new()),
+    );
     let provider = resolver
         .resolve("mycorp")
         .expect("a /model selection targeting a declared provider must resolve");
@@ -204,7 +208,7 @@ fn an_in_session_model_swap_resolves_a_models_json_provider() {
 #[test]
 fn a_base_url_block_rewrites_the_launched_builtin_provider() {
     let file = model_file(r#"{"providers":{"anthropic":{"baseUrl":"https://proxy.internal/v1"}}}"#);
-    let provider = select_provider(Some("anthropic"), None, None, &file).expect("anthropic");
+    let provider = select_provider(Some("anthropic"), None, None, &file, None).expect("anthropic");
     assert!(!provider.models().is_empty());
     assert!(
         provider
@@ -236,7 +240,7 @@ fn a_bad_provider_block_is_reported_and_does_not_break_resolution() {
     assert_eq!(errors.len(), 1, "{errors:?}");
     assert!(errors[0].contains("broken"), "{}", errors[0]);
     // The rest of the world is untouched.
-    assert!(select_provider(Some("anthropic"), None, None, &file).is_ok());
-    assert!(select_provider(None, Some("mycorp/mycorp-large"), None, &file).is_ok());
-    assert!(select_provider(None, Some("broken/nope"), None, &file).is_err());
+    assert!(select_provider(Some("anthropic"), None, None, &file, None).is_ok());
+    assert!(select_provider(None, Some("mycorp/mycorp-large"), None, &file, None).is_ok());
+    assert!(select_provider(None, Some("broken/nope"), None, &file, None).is_err());
 }
