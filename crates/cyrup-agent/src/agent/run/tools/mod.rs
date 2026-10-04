@@ -5,18 +5,103 @@ mod exec;
 mod finalize;
 mod finalized;
 mod preflight;
+pub(crate) mod single;
 
 use finalized::Finalized;
 
 use super::{RunCtx, RunFailure};
 use crate::event::{AgentEvent, AgentMessage, ToolResultMessage};
+use crate::hooks::{AgentContextView, Hooks};
 use crate::queue::ToolExecution;
 use cyrup_core::{
-    AssistantMessage, ExecMode, TerminateHint, Tool, ToolCall, ToolCallId, ToolError, ToolResult,
-    ToolUpdate,
+    AssistantMessage, CancelToken, ExecMode, TerminateHint, Tool, ToolCall, ToolCallId, ToolError,
+    ToolResult, ToolUpdate,
 };
 use serde_json::Value;
 use std::sync::Arc;
+
+// ---------------------------------------------------------------------------
+// The narrowed per-call environment (AGENT-047 step 1)
+// ---------------------------------------------------------------------------
+
+/// Everything the preflight and finalization stages read — and nothing else.
+///
+/// This is cyrup's spelling of upstream's two narrowings in one type. pi moved `prepareToolCall`
+/// (`agent-loop.ts:707-714` @v1.0.1) and `finalizeExecutedToolCall` (`:853-859`) off the whole
+/// `AgentLoopConfig` and onto `ToolCallHooks = Pick<AgentLoopConfig, "beforeToolCall" |
+/// "afterToolCall">` (`:683`), and gave `prepareToolCall` an explicit `tools` parameter (`:713`,
+/// defaulting to `currentContext.tools ?? []`) so a nested call can resolve against a different
+/// tool set than the turn's. Here the equivalent move is off `&RunCtx` — which owns the provider
+/// transport, the subscriber list, the queues and the state lock — and onto this bundle of
+/// borrows, so neither stage needs a live run. That is the whole precondition for
+/// [`single::run_tool_call`].
+///
+/// [`Self::resolve_tools`] and `context.tools` are deliberately separate, exactly as upstream's
+/// `tools` parameter and `currentContext.tools` are: the first decides WHICH tool runs, the second
+/// is what the hooks are shown.
+pub(crate) struct ToolCallEnv<'a> {
+    /// pi `ToolCallHooks` (`agent-loop.ts:683`). cyrup bundles its hooks behind one trait object,
+    /// so the narrowing is to the bundle rather than to two function fields.
+    pub(crate) hooks: &'a dyn Hooks,
+    /// The run's root abort signal (pi's `signal` parameter, threaded into both stages). A clone
+    /// of the root rather than a borrow of [`cyrup_core::RunCancel`]: `is_cancelled` is the same
+    /// read and `child_token` is exactly what `RunCancel::child` returns.
+    pub(crate) cancel: CancelToken,
+    /// The tool set the call RESOLVES against (pi `tools`, `agent-loop.ts:713`).
+    pub(crate) resolve_tools: &'a [Arc<dyn Tool>],
+    /// What the hooks are shown (pi `currentContext`).
+    pub(crate) context: AgentContextView<'a>,
+    /// `BeforeToolCall::messages` — the run's new messages so far. Empty for a programmatic call,
+    /// which has no run and therefore no new messages (pi's `beforeToolCall` context has no such
+    /// field at all; it is a cyrup backward-compat field, documented on [`crate::hooks::BeforeToolCall`]).
+    pub(crate) new_messages: &'a [Arc<AgentMessage>],
+    /// The assistant message the hooks are told issued the call (pi `assistantMessage`).
+    pub(crate) assistant: &'a AssistantMessage,
+}
+
+impl ToolCallEnv<'_> {
+    /// pi `tools.find((t) => t.name === toolCall.name)` (`agent-loop.ts:715` @v1.0.1) — against the
+    /// explicit slice, never the context's.
+    fn resolve_tool(&self, name: &str) -> Option<Arc<dyn Tool>> {
+        self.resolve_tools
+            .iter()
+            .find(|t| t.name() == name)
+            .cloned()
+    }
+
+    /// pi's `signal?.aborted` reads inside both stages.
+    fn is_cancelled(&self) -> bool {
+        self.cancel.is_cancelled()
+    }
+
+    /// The per-hook child token the loop has always passed (`RunCancel::child`).
+    fn hook_cancel(&self) -> CancelToken {
+        self.cancel.child_token()
+    }
+}
+
+impl RunCtx {
+    /// The run's narrowing: the loop resolves against — and shows the hooks — its own tool list,
+    /// which is pi's `tools = currentContext.tools ?? []` default (`agent-loop.ts:713`).
+    pub(super) fn tool_env<'a>(
+        &'a self,
+        assistant: &'a AssistantMessage,
+        ctx_messages: &'a [Arc<AgentMessage>],
+    ) -> ToolCallEnv<'a> {
+        ToolCallEnv {
+            hooks: self.hooks.as_ref(),
+            cancel: self.cancel.token(),
+            resolve_tools: &self.tools,
+            context: AgentContextView {
+                system_prompt: &self.system_prompt,
+                messages: ctx_messages,
+                tools: &self.tools,
+            },
+            new_messages: &self.new_messages,
+            assistant,
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Internal run-loop types
@@ -113,7 +198,7 @@ impl RunCtx {
                 args: Value::Object((*call.arguments).clone()),
             })
             .await?;
-            let fin = self.immediate_error(
+            let fin = preflight::immediate_error(
                 call,
                 idx,
                 format!(

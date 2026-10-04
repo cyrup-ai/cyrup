@@ -55,6 +55,10 @@ pub mod ui;
 mod tests;
 
 pub use error::{IntercomError, Result};
+// `EXTENSION_ID` is re-exported so a caller that must NAME this extension without having built it
+// — the binary's attach point, quarantining a refusal (ICOM-082) — uses the id the extension itself
+// declares instead of re-spelling the literal.
 pub use extension::{
-    IntercomExtension, intercom_extension_for_env, intercom_extension_for_env_concrete,
+    EXTENSION_ID, IntercomExtension, intercom_extension_for_env,
+    intercom_extension_for_env_concrete,
 };

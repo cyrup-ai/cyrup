@@ -5,6 +5,135 @@ next work item**.
 
 ---
 
+# UPDATE 2026-10-04 (second hygiene pass) — seven implemented rows struck (five counted here, two in area 13), and one defect found, fixed and closed in the same pass
+
+> **This block sits above the 2026-10-04 (ledger hygiene) block and corrects its counts.** It records
+> a recording correction for five of the seven: those rows had already landed with the tests that pin
+> them, and each was re-verified before being struck rather than on the strength of a report —
+> upstream read only through git objects at the pins (pi v1.0.1, pi-mcp-adapter v5.0.0), cyrup read at
+> HEAD, and the fix reverted so the named tests were watched to fail and then restored.
+>
+> **Three rows needed code, and that code is in this branch.** `SUBA-166` and `MCP-606` were filed by
+> this pass's verification as *partial* — each had a real residual — and were closed by fixes, not by
+> recording. `CFG-080`, already closed, had the blast-radius half of its `[CYRUP-DELTA]` struck, because
+> `a3786e3e` makes that half's premise false. `ICOM-082` is new: `SUBA-166`'s fix left one residual at the
+> same attach point, and checking it rather than filing it as a note turned up the identical defect in the
+> intercom arm. It is filed and closed together, so it adds to the closed count and not to the open one.
+>
+> The count is whatever `python3 docs/gap-analysis/scripts/count_open_items.py` prints. **Rebased onto
+> `main` at `425559b0`, which brought the fullscreen-default work (#179) in underneath this pass**, it
+> prints **158 open: 0 critical, 0 high, 11 medium, 147 low; 17 trackers; 873 closed; 1 duplicate not
+> counted**. By area: `01` 28, `02` 1, `03` 7, `04` 5, `05` 7, `06` 18, `07` 25, `08` 7, `09` 2, `09b` 28, `10` 1, `11` 10, `12` 2, `14` 0, `16` 2, `17` 1, `18` 13, `09a` 1.
+>
+> Arithmetic, in two parts, because two passes landed:
+>
+> * **This pass**, measured before the rebase: open 169 − 5 counted closures (`PROV-130`, `PROV-131`,
+>   `AGENT-046`, `AGENT-047`, `SUBA-166`) = 164, nothing filed; medium 18 − 4 = 14; low 150 − 1
+>   (`AGENT-046`) = 149; closed 857 + 5 + 1 (`ICOM-082`, filed and closed here) = 863. Area 13 counts in
+>   its own file: two rows closed there (`MCP-598`, `MCP-606`).
+> * **The fullscreen default**, which its own block below records as ten rows closed and three filed.
+>   Measured against *this* branch the counted effect is −9 open, because `TUI-131` is the tenth and this
+>   pass had already struck it: `TUI-107` `110` `124` `125` `130` `132` `133` `134` `136` close, and
+>   `TUI-147` `148` `149` are filed. So open 164 − 9 + 3 = 158. Closed goes 863 + 9 + 1 = 873, the extra
+>   one being `CFG-100`, which was carried as a DUPLICATE of `TUI-136` and so never counted as open —
+>   which is also why the duplicate count drops 2 → 1.
+>
+> **There is no longer an open row above `medium`.** `TUI-107` was the one, and the fullscreen work
+> closed it, which discharges the "`TUI-107` remains the only open row above medium" line in the ledger
+> hygiene block below and the "a different high replaces it" line in the block below that — both were
+> true when written and are superseded here rather than edited in place, since each is that pass's own
+> snapshot.
+>
+> ## Closed (each row carries its own evidence and the tests that pin it)
+>
+> * **`PROV-130`**, **`PROV-131`** (`01`) — a Bedrock Claude adaptive-thinking request now carries
+>   `thinking.block_binding` and its beta, off GovCloud and only on the five model families that
+>   accept the field, so a replay whose system prompt or tool list changed drops the stale block
+>   instead of being rejected; and the Cloudflare AI Gateway and Bedrock catalogs are regenerated at
+>   pi 1.0.1, so the gateway's nine Claude ids are dashed for the `/anthropic` passthrough that
+>   rejects dotted ones, and 23 Bedrock rows carry their models.dev long-context pricing tiers. The
+>   dash rewrite is scoped to that one upstream, so dotted ids survive wherever they are legal.
+> * **`AGENT-046`**, **`AGENT-047`** (`02`) — a tool can report failure without returning `Err` and
+>   keep its `details`, `usage`, `structured_content` and `terminate`, with the `isError` key written
+>   on the wire only when the tool set one and no hook able to rewrite the tool's own flag; and
+>   `run_tool_call` makes one call programmatically through the same preflight, validation, hooks and
+>   finalisation the model-issued batch uses, resolving against the caller's tool slice while the
+>   hooks still see the context's, with "never rejects" and "emits no events" carried by the signature
+>   rather than by prose.
+> * **`MCP-598`** (`13a`) — startup discovery decides per server and closes what it opened: a server
+>   added after the first session is discovered instead of being skipped on the cache file's
+>   existence, a first-run lazy server is closed once its catalogue is captured rather than left
+>   running until the idle sweep, a config that already failed discovery is not re-dialled by the
+>   direct-tools bootstrap, and the pass writes the metadata cache once, respecting the snapshot, so
+>   a captured entry cannot be put over a newer one on disk.
+> * **`SUBA-166`** (`09b`) — an invalid `agent/subagents/config.json` that *declares* `authorityPolicy` or
+>   `permissions` no longer has its declaration silently discarded and replaced by the all-defaults
+>   config; the eleven keys whose misspelling is indistinguishable from a weaker policy refuse the
+>   extension instead. The refusal costs exactly the one extension upstream loses, through the channel
+>   every other extension-load failure already uses and with pi's own
+>   `Failed to load extension "<id>": <message>`: `f194471b` made it fail closed but aborted the whole
+>   launch, and `a3786e3e` closed that residual with the new `cyrup_ext::QuarantinedNative` placeholder
+>   at `session_launch::attach_native_extensions`. A config that is merely imperfect and declares no
+>   policy key still attaches and warns, which is the control the closure rests on.
+> * **`MCP-606`** (`13i`) — an elicitation prompt no longer burns the tool call's own deadline: the
+>   `touch` is ported at both of upstream's call sites. **This row's stated evidence was false** and the
+>   row says so now: `onUrlAccepted` was already ported and firing on the production
+>   `elicitation/create` URL path, so only upstream's second call site — the
+>   `handleUrlElicitationRequired` error path — was missing, and the row's claim that both `touch` calls
+>   would be dead code was wrong. Three doc-comment passages in `cyrup-mcp/src/server_manager.rs`
+>   asserting that `set_elicitation_config` had no production caller — one of them also that
+>   `elicitation.rs` did not exist — are corrected against `runtime.rs:406,447`; one was written by the
+>   commit this row had credited.
+>
+> * **`ICOM-082`** (`11`) — **filed and closed in this pass.** A malformed `intercom/config.json`, or an
+>   unusable ask-timeout env var, aborted the ENTIRE launch: the error left
+>   `session_launch::attach_native_extensions` as an `anyhow::Error`, so there was no session at all and
+>   not one of the other six native built-ins was even attempted. Upstream throws for the same two inputs
+>   — `loadConfig()` and `getAskTimeoutMs()` on the first two lines of the default-exported factory
+>   (`pi-intercom/index.ts:648-649` @v0.16.0) — but from inside the body pi's loader wraps in `try`, so it
+>   loses intercom and keeps going. Both of pi's two extension tiers have that catch, so the radius is the
+>   same whichever tier intercom sits in. Now routed through the `cyrup_ext::QuarantinedNative` seam
+>   `SUBA-166` built, at `QuarantinedTier::Ambient` to match `IntercomExtension::is_ambient`.
+>   `ICOM-044`'s guarantee is kept rather than traded: the diagnostic still names the config's path, now
+>   inside pi's `Failed to load extension "cyrup-intercom": …` frame. Proven red — with the fix reverted
+>   both tests fail on `AgentSessionRuntime::create` returning
+>   `Err(building intercom extension: Failed to load intercom config at …/config.json: …)`, which is the
+>   aborted launch itself.
+> **Two closures correct the row they close**, and the correction is on the row rather than left to be
+> re-derived: `AGENT-047` widens no `cyrup-core` type — it touches no file outside `crates/cyrup-agent/`
+> and `ToolResult` is untouched, which is `AGENT-046`'s business, not its own — and `MCP-598`'s
+> `http_oauth` re-pin from 2 to 1 is upstream's own filter narrowing rather than a lost connection.
+> `PROV-130` additionally records that its new doc comments cite an earlier pi version's line numbers
+> for `buildAdditionalModelRequestFields`, `supportsAdaptiveThinking` and `useBlockBinding`.
+>
+> **Area 13 is counted in [`13-cyrup-mcp-STATUS.md`](13-cyrup-mcp-STATUS.md), not here.** `MCP-598`
+> closed in this pass, so that file's own census moves accordingly: the counted set stays **545**
+> units while `implemented` goes 357 → **358** and `partial` 62 → **61**; `missing` is unchanged at 92.
+>
+> **Nothing was filed and no open row was annotated.** Ids are unmoved, so every *Next free ids* line
+> in the blocks below still holds, and **`TUI-107` remains the only open row above medium**.
+
+# UPDATE 2026-10-04 (ledger hygiene) — seven implemented rows struck, none filed, no code moved
+
+> **This block sits above the 2026-10-04 defect-batch block and corrects its counts.** It records a
+> recording correction, not new work: every row struck here had already landed and was verified, and
+> was left open only because a verdict hand-off was truncated before the recording pass received it.
+> No code moved in this change.
+>
+> The count is whatever `python3 docs/gap-analysis/scripts/count_open_items.py` prints: on 2026-10-04
+> it prints **169 open: 0 critical, 1 high, 18 medium, 150 low; 17 trackers; 857 closed; 2 duplicates
+> not counted** (the defect batch: 176 open, 25 medium, 850 closed). By area: `01` 30, `02` 3, `03` 7, `04` 5, `05` 7, `06` 18, `07` 31, `08` 7, `09` 2, `09b` 29, `10` 1, `11` 10, `12` 2, `14` 0, `16` 2, `17` 1, `18` 13, `09a` 1.
+> Arithmetic: open 176 − 7 = 169; medium 25 − 7 = 18; closed 850 + 7 = 857; nothing filed.
+>
+> Struck, each with the test that pins it named on its row: `AGENT-045`, `SESS-064`, `SESS-068`,
+> `CFG-097`, `TUI-131`, `SUBA-158`, `ICOM-072`. Each was re-verified against the tree before being
+> struck rather than on the strength of the lost verdict — the code and its tests are present in
+> `crates/` at this commit.
+>
+> **`TUI-107` remains the only open row above medium**, and `ADR-0005`'s amendment states why closing
+> it matters: it is what makes the fullscreen default defensible on its own terms rather than on
+> parity alone.
+
 # UPDATE 2026-10-04 — eighteen rows closed (seven counted here, ten in area 13), three re-rated, none filed
 
 > **This block sits above the 2026-10-03 (ledger corrections) block and moves its counts.** The count

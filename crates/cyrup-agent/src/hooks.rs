@@ -20,6 +20,12 @@ use std::sync::Arc;
 /// `finishTurn`/`prepareNextTurn`/`prepareRequest` (`types.ts` `AgentTurnContext.context`,
 /// `PrepareRequestContext.context` @v0.87.1). Borrowed (no clone) so a hook can inspect the system
 /// prompt / tools / messages without the runtime copying the transcript.
+///
+/// `Copy`: every field is a shared reference, so the view is a fat-pointer bundle. AGENT-047 needs
+/// to hand the SAME context to `before_tool_call` and then to `after_tool_call` out of one stored
+/// narrowing, which is what upstream's `currentContext` parameter is (`agent-loop.ts:708`, `:853`
+/// @v1.0.1).
+#[derive(Clone, Copy)]
 pub struct AgentContextView<'a> {
     pub system_prompt: &'a str,
     pub messages: &'a [Arc<AgentMessage>],

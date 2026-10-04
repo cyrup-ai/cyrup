@@ -2,7 +2,7 @@
 
 use super::capabilities::{
     is_anthropic_claude_model, is_gov_cloud_bedrock_target, map_thinking_level_to_effort,
-    supports_adaptive_thinking,
+    supports_adaptive_thinking, supports_thinking_block_binding,
 };
 use super::convert::{build_system_prompt, convert_messages, convert_tool_config};
 use super::options::{BedrockOptions, BedrockThinkingDisplay};
@@ -16,6 +16,10 @@ use serde_json::{Map, Value, json};
 
 /// pi's interleaved-thinking beta token (`bedrock-converse-stream.ts:1080`).
 pub(super) const INTERLEAVED_THINKING_BETA: &str = "interleaved-thinking-2025-05-14";
+
+/// pi `THINKING_BINDING_CONTROLS_BETA` (`bedrock-converse-stream.ts:122` @v1.0.1) — rides the
+/// adaptive branch beside `thinking.block_binding` (PROV-130).
+pub(super) const THINKING_BINDING_CONTROLS_BETA: &str = "thinking-binding-controls-2026-08-01";
 
 /// Build the `ConverseStreamCommand` input (pi `commandInput`,
 /// `bedrock-converse-stream.ts:230-241`), including the `modelId` URI label so `onPayload` sees the
@@ -136,8 +140,9 @@ fn build_additional_model_request_fields(
     }
     let level = opts.reasoning.level().unwrap_or(ThinkingLevel::High);
 
+    let is_gov_cloud = is_gov_cloud_bedrock_target(model, bedrock, env);
     // pi `:1048-1050`: GovCloud's Converse schema rejects `thinking.display`.
-    let display = if is_gov_cloud_bedrock_target(model, bedrock, env) {
+    let display = if is_gov_cloud {
         None
     } else {
         Some(
@@ -149,6 +154,11 @@ fn build_additional_model_request_fields(
     };
 
     let adaptive = supports_adaptive_thinking(model);
+    // pi `:1266` @v1.0.1: replayed signed thinking blocks are bound to the system prompt and tools
+    // they were created with, and Bedrock 400s on replay once either changes unless the stale
+    // blocks are dropped. Skipped on GovCloud like `display`, and only on models that accept the
+    // field (PROV-130).
+    let use_block_binding = !is_gov_cloud && supports_thinking_block_binding(model);
     let mut result = Map::new();
     if adaptive {
         let mut thinking = Map::new();
@@ -156,11 +166,25 @@ fn build_additional_model_request_fields(
         if let Some(display) = display {
             thinking.insert("display".to_string(), json!(display));
         }
+        if use_block_binding {
+            thinking.insert(
+                "block_binding".to_string(),
+                json!({ "prefix_mismatch_behavior": "drop_block" }),
+            );
+        }
         result.insert("thinking".to_string(), Value::Object(thinking));
         result.insert(
             "output_config".to_string(),
             json!({ "effort": map_thinking_level_to_effort(model, level) }),
         );
+        // pi `:1279`: the binding beta rides the adaptive branch only, where the interleaved beta
+        // never appears.
+        if use_block_binding {
+            result.insert(
+                "anthropic_beta".to_string(),
+                json!([THINKING_BINDING_CONTROLS_BETA]),
+            );
+        }
     } else {
         let budget = budget_override.unwrap_or_else(|| default_thinking_budget(level, opts));
         let mut thinking = Map::new();

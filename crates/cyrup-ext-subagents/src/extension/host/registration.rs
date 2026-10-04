@@ -138,6 +138,24 @@ fn gate_on_install(mode: RegistrationMode, installed: bool) -> Option<Registrati
     }
 }
 
+/// The WHOLE attach gate for the current process: the child-mode [`RegistrationMode`]
+/// ([`registration_mode_from_env`]) narrowed by the opt-in install signal ([`is_installed`]).
+/// `None` means this process attaches NO subagents extension at all — a plain subagent child, or a
+/// top-level session that never opted in.
+///
+/// Public because the binary's attach point has to know the answer BEFORE it loads the tier-3
+/// `config.json`. Upstream's `registerSubagentExtension` returns on the child flag
+/// (`pi-subagents/src/extension/index.ts:315-317` @v0.75.0) and only then calls `loadConfig()`
+/// (`:325`), so a process that registers nothing never reads that file and can never fail over it.
+/// `crates/cyrup/src/session_launch.rs` consults this first for exactly that reason: SUBA-166's
+/// refusal of a policy-declaring invalid `config.json` must not reach a process which, upstream,
+/// would not have opened the file.
+#[must_use]
+pub fn registration_mode_for_env(agent_dir: &Path, cwd: &Path) -> Option<RegistrationMode> {
+    registration_mode_from_env()
+        .and_then(|mode| gate_on_install(mode, is_installed(agent_dir, cwd)))
+}
+
 /// Build the subagent [`NativeExtension`] the `cyrup` binary should attach for the current process,
 /// or `None` when it must attach nothing — the crate-side half of the T6 child-mode gate composed
 /// with the opt-in install gate ([`is_installed`]), which `crates/cyrup/src/main.rs` calls at each of
@@ -151,12 +169,9 @@ pub fn subagent_extension_for_env(
     config: SubagentExtensionConfig,
     cwd: PathBuf,
 ) -> Option<Arc<dyn NativeExtension>> {
-    let installed = is_installed(agent_dir, &cwd);
-    registration_mode_from_env()
-        .and_then(|mode| gate_on_install(mode, installed))
-        .map(|mode| {
-            Arc::new(SubagentsExtension::with_mode(config, cwd, mode)) as Arc<dyn NativeExtension>
-        })
+    registration_mode_for_env(agent_dir, &cwd).map(|mode| {
+        Arc::new(SubagentsExtension::with_mode(config, cwd, mode)) as Arc<dyn NativeExtension>
+    })
 }
 
 /// As [`subagent_extension_for_env`], but threads the intercom companion's real broker-backed
@@ -178,19 +193,16 @@ pub fn subagent_extension_for_env_with_channels(
     clarify: Arc<dyn crate::tui::intercom::ClarifyChannel>,
     steer: Arc<dyn crate::tui::intercom::SteerChannel>,
 ) -> Option<Arc<dyn NativeExtension>> {
-    let installed = is_installed(agent_dir, &cwd);
-    registration_mode_from_env()
-        .and_then(|mode| gate_on_install(mode, installed))
-        .map(|mode| match mode {
-            RegistrationMode::Full => Arc::new(SubagentsExtension::with_channels(
-                config, cwd, delivery, clarify, steer,
-            )) as Arc<dyn NativeExtension>,
-            RegistrationMode::ChildSafe => Arc::new(SubagentsExtension::with_mode(
-                config,
-                cwd,
-                RegistrationMode::ChildSafe,
-            )) as Arc<dyn NativeExtension>,
-        })
+    registration_mode_for_env(agent_dir, &cwd).map(|mode| match mode {
+        RegistrationMode::Full => Arc::new(SubagentsExtension::with_channels(
+            config, cwd, delivery, clarify, steer,
+        )) as Arc<dyn NativeExtension>,
+        RegistrationMode::ChildSafe => Arc::new(SubagentsExtension::with_mode(
+            config,
+            cwd,
+            RegistrationMode::ChildSafe,
+        )) as Arc<dyn NativeExtension>,
+    })
 }
 
 /// The pure, env-free form of [`subagent_extension_for_env`]: resolve the [`RegistrationMode`] from

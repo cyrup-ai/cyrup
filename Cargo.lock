@@ -1435,6 +1435,7 @@ dependencies = [
  "cyrup",
  "cyrup-acp",
  "cyrup-config",
+ "cyrup-core",
  "cyrup-ext",
  "cyrup-ext-subagents",
  "cyrup-flux",

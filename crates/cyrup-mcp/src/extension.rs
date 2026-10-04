@@ -3237,6 +3237,17 @@ done
         servers: serde_json::Value,
         settled: &str,
     ) -> (Arc<McpExtension>, Arc<McpState>) {
+        start_and_settle_with_ui(dir, servers, settled, None).await
+    }
+
+    /// [`start_and_settle`], with a `HostServices` bound so the pass's own notices
+    /// (§13's startup summary, §14's direct-tools line) are observable.
+    async fn start_and_settle_with_ui(
+        dir: &std::path::Path,
+        servers: serde_json::Value,
+        settled: &str,
+        ui: Option<&Arc<ToolSetServices>>,
+    ) -> (Arc<McpExtension>, Arc<McpState>) {
         let config: McpConfig =
             serde_json::from_value(serde_json::json!({ "mcpServers": servers })).unwrap();
         let ext = McpExtension::with_config(
@@ -3245,6 +3256,9 @@ done
         )
         .with_home(dir.to_path_buf())
         .into_arc();
+        if let Some(ui) = ui {
+            bind_services(&ext, ui);
+        }
         let mut api = InitApi::new();
         ext.init(&mut api).await.unwrap();
         let _ = ext.on_event(&session_start_event(), &event_ctx()).await;
@@ -3381,6 +3395,130 @@ done
         );
     }
 
+    /// MCP-598's third stated failure: **each discovered server rereads and rewrites the whole
+    /// cache file.** `149fdf1` deletes `updateMetadataCache(state, name)` from the publication loop
+    /// (`init.ts:259` of that diff), leaving §12's merged write as the pass's ONLY write.
+    ///
+    /// Asserted without counting writes, because a write is a rename and leaves nothing to count.
+    /// Instead it is asserted through the one thing the two writes disagree about: §12's write
+    /// honours `startupSnapshot`'s "disk is newer for the same config" rule and skips the entry,
+    /// while the publication loop's write passed no snapshot and was plain last-write-wins. So a
+    /// disk entry whose `cachedAt` is in the future, under a matching `configHash`, must SURVIVE
+    /// the pass untouched — and did not, because the second write put the fresh entry over it.
+    ///
+    /// `ttlMs: 0` is what makes the entry invalid (a server saying "never cache this") so the
+    /// server is still discovered, while leaving `configHash` matching and `discoveryFailed`
+    /// absent, which is exactly the shape the skip rule tests.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_startup_pass_writes_the_cache_once_and_the_write_respects_the_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let keeper_marker = dir.path().join("keeper-started");
+        let mut keeper = fixture_server(&keeper_marker);
+        if let Some(object) = keeper.as_object_mut() {
+            // Resident, so the connection is still live when the publication loop runs — which is
+            // the only case in which the deleted write did anything at all.
+            object.insert("lifecycle".to_string(), serde_json::json!("keep-alive"));
+        }
+        let servers = serde_json::json!({ "keeper": keeper });
+        let config: McpConfig =
+            serde_json::from_value(serde_json::json!({ "mcpServers": servers.clone() })).unwrap();
+
+        // An hour into the future: "another process discovered the same config more recently".
+        let future = crate::dirs::now_ms() + 3_600_000;
+        let mut seed = crate::dirs::MetadataCache::default();
+        seed.servers.insert(
+            "keeper".to_string(),
+            crate::dirs::ServerCacheEntry {
+                config_hash: crate::registration::default_server_hasher(
+                    config
+                        .mcp_servers
+                        .get("keeper")
+                        .expect("the config names it"),
+                )
+                .expect("no url, so the hash cannot throw"),
+                ttl_ms: Some(0),
+                cached_at: future,
+                ..crate::dirs::ServerCacheEntry::default()
+            },
+        );
+        let cache_path = dir.path().join("mcp-cache.json");
+        crate::dirs::save_metadata_cache(&cache_path, &seed).unwrap();
+
+        let (_ext, _state) = start_and_settle(dir.path(), servers, "keeper").await;
+        assert!(
+            keeper_marker.exists(),
+            "a `ttlMs: 0` entry is not a valid one, so the server is still discovered"
+        );
+        // The publication `start_and_settle` waits on happens EARLIER in the loop body than the
+        // write this test is about, so settle before reading the file — otherwise the red proof
+        // could win the race and read the cache before the second write lands.
+        tokio::time::sleep(std::time::Duration::from_millis(750)).await;
+
+        let cache = crate::dirs::load_metadata_cache(&cache_path).expect("the pass flushed");
+        let entry = cache
+            .servers
+            .get("keeper")
+            .expect("the entry is still there");
+        assert_eq!(
+            (entry.cached_at, entry.ttl_ms),
+            (future, Some(0)),
+            "the pass's ONE write is the snapshot-aware merged one, which leaves a newer disk \
+             entry for the same config alone; a second last-write-wins write would have put the \
+             freshly captured entry over it: {entry:?}"
+        );
+    }
+
+    /// MCP-598's third half, from the same commit as the other two and the one with a user-visible
+    /// shape: `const residentResults = results.filter(r => r.resident)` (`init.ts:464`), and the
+    /// summary's counts and total are taken over **that** set (`:465-470`).
+    ///
+    /// Once a non-resident server is closed the moment its catalogue is captured — which is the
+    /// change `a_non_resident_server_is_closed_after_startup_discovery` proves — counting it as
+    /// "connected" says something that is false by the time the line is read. A first run with one
+    /// `keep-alive` server beside one plain `lazy` one connects two and keeps one, and the status
+    /// line has to say one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_startup_summary_counts_only_the_servers_that_outlive_the_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let keeper_marker = dir.path().join("keeper-started");
+        let lazy_marker = dir.path().join("lazy-started");
+        let mut keeper = fixture_server(&keeper_marker);
+        if let Some(object) = keeper.as_object_mut() {
+            object.insert("lifecycle".to_string(), serde_json::json!("keep-alive"));
+        }
+        let servers = serde_json::json!({
+            "keeper": keeper,
+            "transient": fixture_server(&lazy_marker),
+        });
+
+        let ui = Arc::new(ToolSetServices::default());
+        let (_ext, _state) =
+            start_and_settle_with_ui(dir.path(), servers, "transient", Some(&ui)).await;
+        // Both children ran — the lazy one WAS connected, which is what makes the count a choice.
+        assert!(keeper_marker.exists() && lazy_marker.exists());
+
+        // §13 runs just after the publication `start_and_settle` waits on, so poll for its notice.
+        let summary = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if let Some(line) = ui
+                    .notices()
+                    .into_iter()
+                    .find(|notice| notice.contains("servers connected"))
+                {
+                    return line;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("the startup summary must be emitted");
+
+        assert!(
+            summary.starts_with("MCP: 1 servers connected ("),
+            "only the resident server outlives the pass, so only it is counted: {summary:?}"
+        );
+    }
+
     /// MCP-596/MCP-598 — "Startup tries a config once; a server that failed is tried again on first
     /// use." A `discoveryFailed` marker whose `configHash` still matches puts the server in
     /// `failedDiscovery`, not in `needsDiscovery`, so the startup pass does not spawn it at all.
@@ -3429,6 +3567,77 @@ done
                 .and_then(|entry| entry.discovery_failed),
             Some(true),
             "and its marker survives the merged write untouched"
+        );
+    }
+
+    /// MCP-598 — the same "startup tries a config once" property, held where it can actually be
+    /// LOST. §11 skips a `failed_discovery` server for free, because such a server is not in
+    /// `needs_discovery` and a `lazy` server is not prewarmed. §14's direct-tools bootstrap is the
+    /// path that reaches it anyway: a `discoveryFailed` entry is not a *valid* entry
+    /// ([`crate::registration::is_server_cache_valid`] rejects `discoveryFailed == Some(true)`), so
+    /// the server is "missing" from the direct-tool surface and the bootstrap connects it — on
+    /// every startup, for ever, which is the opposite of once per config.
+    ///
+    /// `missingCacheServers.filter(name => !failedDiscovery.has(name) && !results.some(r => r.name
+    /// === name))` (`init.ts:484`, `149fdf1` #788 v5.0.0). `other` is the control: it is `missing`
+    /// too, and it must stay out of the bootstrap for the OTHER conjunct's reason — §11 already
+    /// attempted it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_discovery_failed_marker_is_not_retried_by_the_direct_tools_bootstrap() {
+        let dir = tempfile::tempdir().unwrap();
+        let flaky_marker = dir.path().join("flaky-started");
+        let other_marker = dir.path().join("other-started");
+        // `directTools` is what puts both servers into `missingConfiguredDirectToolServers`, and
+        // so into §14's reach. Without it §14's whole block is skipped and the marker is never
+        // tested against the bootstrap at all.
+        let mut flaky = fixture_server(&flaky_marker);
+        let mut other = fixture_server(&other_marker);
+        for server in [&mut flaky, &mut other] {
+            if let Some(object) = server.as_object_mut() {
+                object.insert("directTools".to_string(), serde_json::json!(true));
+            }
+        }
+        let servers = serde_json::json!({ "flaky": flaky, "other": other });
+        let config: McpConfig =
+            serde_json::from_value(serde_json::json!({ "mcpServers": servers.clone() })).unwrap();
+        let mut seed = crate::dirs::MetadataCache::default();
+        seed.servers.insert(
+            "flaky".to_string(),
+            crate::dirs::ServerCacheEntry {
+                config_hash: crate::registration::default_server_hasher(
+                    config
+                        .mcp_servers
+                        .get("flaky")
+                        .expect("the config names it"),
+                )
+                .expect("no url, so the hash cannot throw"),
+                discovery_failed: Some(true),
+                cached_at: crate::dirs::now_ms(),
+                ..crate::dirs::ServerCacheEntry::default()
+            },
+        );
+        let cache_path = dir.path().join("mcp-cache.json");
+        crate::dirs::save_metadata_cache(&cache_path, &seed).unwrap();
+
+        // `other` carries the pass through §11; §14 runs after §12's flush, so by the time
+        // `other`'s catalogue is published the bootstrap filter has been evaluated.
+        let (_ext, _state) = start_and_settle(dir.path(), servers, "other").await;
+        assert!(other_marker.exists());
+        // Give §14 room to have spawned it, so this is an absence and not a race.
+        tokio::time::sleep(std::time::Duration::from_millis(750)).await;
+        assert!(
+            !flaky_marker.exists(),
+            "a config that already failed discovery must not be retried by the direct-tools \
+             bootstrap either — `!failedDiscovery.has(name)`"
+        );
+        let cache = crate::dirs::load_metadata_cache(&cache_path).expect("the pass flushed");
+        assert_eq!(
+            cache
+                .servers
+                .get("flaky")
+                .and_then(|entry| entry.discovery_failed),
+            Some(true),
+            "and the marker survives, so the next startup skips it once again"
         );
     }
 

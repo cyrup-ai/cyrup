@@ -13,6 +13,8 @@
 
 mod support;
 
+mod agent046_tool_reported_failure;
+mod agent047_run_tool_call;
 mod agent_loop;
 mod agent_message_role_key;
 mod area02_backlog;

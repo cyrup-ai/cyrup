@@ -39,6 +39,7 @@ mod project_trust_shortcircuit;
 mod provider;
 #[cfg(feature = "wasm-host")]
 mod provider_refresh;
+mod quarantined_native;
 mod registration_validation;
 mod seam_liveness;
 mod startup_timings;

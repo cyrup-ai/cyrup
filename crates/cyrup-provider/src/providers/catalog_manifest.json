@@ -10,8 +10,8 @@
 		"amazon-bedrock": {
 			"source": "https://pi.dev/api/models/providers/amazon-bedrock",
 			"module": "packages/ai/src/providers/amazon-bedrock.models.ts",
-			"fetchedAt": "2026-09-28T18:47:47Z",
-			"revision": "sha256-6ffe40ba88d306a8412c9cc415b71210b5bf34573fc2e6544564eed74c029dfc"
+			"fetchedAt": "2026-10-03T16:16:34Z",
+			"revision": "sha256-88878e8f90eaebcdfe53f7d219e69bd7bf1748e88190ae19498530362aa1aa53"
 		},
 		"ant-ling": {
 			"source": "https://pi.dev/api/models/providers/ant-ling",
@@ -40,8 +40,8 @@
 		"cloudflare-ai-gateway": {
 			"source": "https://pi.dev/api/models/providers/cloudflare-ai-gateway",
 			"module": "packages/ai/src/providers/cloudflare-ai-gateway.models.ts",
-			"fetchedAt": "2026-09-28T18:48:02Z",
-			"revision": "sha256-6ffe40ba88d306a8412c9cc415b71210b5bf34573fc2e6544564eed74c029dfc"
+			"fetchedAt": "2026-10-03T16:16:49Z",
+			"revision": "sha256-88878e8f90eaebcdfe53f7d219e69bd7bf1748e88190ae19498530362aa1aa53"
 		},
 		"cloudflare-workers-ai": {
 			"source": "https://pi.dev/api/models/providers/cloudflare-workers-ai",

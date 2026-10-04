@@ -3,7 +3,7 @@
 
 mod assistant_stream;
 mod stream;
-mod tools;
+pub(crate) mod tools;
 mod turn;
 
 use super::HeaderFn;

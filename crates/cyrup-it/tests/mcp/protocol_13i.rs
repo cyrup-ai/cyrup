@@ -127,6 +127,14 @@ fn build(
                     extra_params,
                 ],
                 "directTools": true,
+                // MCP-598 — `149fdf1` closes a server that is not RESIDENT the moment its
+                // catalogue is captured (`resident` is
+                // `lifecycle !== "lazy" || effectiveIdleTimeout === 0`, `init.ts:361`). Every test
+                // here inspects the LIVE connection and the real handshake it performed, so the
+                // fixture declares the lifecycle that keeps one; a plain `lazy` server is
+                // discovered and then closed, which is correct and is not something a
+                // live-connection assertion can observe.
+                "lifecycle": "keep-alive",
             }
         },
         "settings": settings,

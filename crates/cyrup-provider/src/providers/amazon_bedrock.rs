@@ -517,17 +517,20 @@ mod tests {
 
     // ------------------------------------------------------------------ catalog
 
-    /// pi `AMAZON_BEDROCK_MODELS`: 174 rows, every one on the `bedrock-converse-stream` wire api
+    /// pi `AMAZON_BEDROCK_MODELS`: 183 rows, every one on the `bedrock-converse-stream` wire api
     /// and owned by `amazon-bedrock`.
     ///
     /// 109 until PROV-071, which is the same statement with a different date on it: the catalog was
     /// frozen at `b0c2a90e` (2026-07-17) because no later revision could be read, and the 65 rows
     /// AWS added in the two months after it were invisible. The count moved with the source, not
-    /// with a decision here.
+    /// with a decision here. 174 until PROV-131's refresh added nine rows AWS has since published:
+    /// `anthropic.claude-sonnet-5-5`, the `in.` (Mumbai) profiles for Haiku 4.5, Opus 5 and
+    /// Sonnet 5, `grok-4.7` on `global.`/`us.`, and `gpt-6.1-sol` on `openai.`/`us.`/`global.`.
+    /// Nothing was retired.
     #[test]
     fn catalog_parses_verbatim_with_expected_count() {
         let models = amazon_bedrock_models();
-        assert_eq!(models.len(), 174);
+        assert_eq!(models.len(), 183);
         assert!(
             models
                 .iter()
@@ -546,7 +549,7 @@ mod tests {
             u.dedup();
             u.len()
         };
-        assert_eq!(unique, 174, "duplicate model id in the Bedrock catalog");
+        assert_eq!(unique, 183, "duplicate model id in the Bedrock catalog");
         assert!(models.iter().all(|m| m.context_window > 0));
         assert!(models.iter().all(|m| m.max_tokens > 0));
         assert!(models.iter().all(|m| !m.base_url.is_empty()));
@@ -602,7 +605,7 @@ mod tests {
                 .iter()
                 .filter(|m| m.base_url == BEDROCK_US_EAST_1_BASE_URL)
                 .count(),
-            157
+            166
         );
     }
 
@@ -667,8 +670,10 @@ mod tests {
         assert_eq!(m.context_window, 163_840);
         assert_eq!(m.max_tokens, 81_920);
 
-        // 42 of the 174 rows are non-reasoning and 43 are text-only — the catalog is genuinely
+        // 42 of the 183 rows are non-reasoning and 43 are text-only — the catalog is genuinely
         // heterogeneous, which is what makes the single-row assertions above worth making.
+        // PROV-131's nine new rows are all reasoning-capable and all accept images, so only the
+        // image-input total moved.
         assert_eq!(models.iter().filter(|m| !m.reasoning).count(), 42);
         assert_eq!(
             models
@@ -679,16 +684,57 @@ mod tests {
         );
         assert_eq!(
             models.iter().filter(|m| m.supports_image_input()).count(),
-            131
+            140
         );
+    }
+
+    /// PROV-131 — pi `4665fafb4` (`scripts/generate-models.ts:1794-1795` @v1.0.1) routes Bedrock
+    /// cost through `getModelsDevCost` with the comment "Includes models.dev pricing tiers, e.g.
+    /// the long-context tier for OpenAI models (#10326)", replacing a four-field literal that
+    /// dropped `tiers`. Before the refresh this catalog had NO `tiers` object anywhere, so every
+    /// request above a tier threshold was costed at the base rate.
+    #[test]
+    fn bedrock_openai_rows_keep_their_long_context_pricing_tier() {
+        let models = amazon_bedrock_models();
+        let tiered: Vec<&Model> = models.iter().filter(|m| m.cost.tiers.is_some()).collect();
+        assert_eq!(
+            tiered.len(),
+            23,
+            "models.dev tiers the GPT-5.6/6/6.1 families across the bare, us., in. and global. \
+             inference profiles; zero of these survived before PROV-131"
+        );
+        for m in &tiered {
+            // Every tier on this catalog is OpenAI's one long-context rung.
+            assert!(
+                m.id.as_str().contains("openai."),
+                "{}: an unexpected provider gained a tier",
+                m.id.as_str()
+            );
+            let tiers = m.cost.tiers.as_ref().expect("filtered above");
+            assert_eq!(tiers.len(), 1, "{}", m.id.as_str());
+            assert_eq!(tiers[0].input_tokens_above, 272_000, "{}", m.id.as_str());
+            // The tier is strictly dearer than the base rate, which is the whole point of it.
+            assert!(
+                tiers[0].input > m.cost.input,
+                "{}: the long-context rung must cost more than the base rate",
+                m.id.as_str()
+            );
+        }
+        // MIRROR: an Anthropic row has no tier, so the assertion above pins the OpenAI families
+        // rather than "some rows have tiers".
+        let opus = models
+            .iter()
+            .find(|m| m.id.as_str() == "us.anthropic.claude-opus-4-6-v1")
+            .expect("row");
+        assert!(opus.cost.tiers.is_none());
     }
 
     /// No Bedrock row may enable a wire-payload compat flag, which is what kept it out of the
     /// blast radius pinned by
     /// `api/anthropic_messages.rs::tool_search_is_confined_to_the_openai_responses_catalog`.
     ///
-    /// It used to say "no `compat` block anywhere" and that is no longer true — 88 of the 174 rows
-    /// carry one. The block is `{"supportsStrictMode": true}` on every single one of them, which is
+    /// It used to say "no `compat` block anywhere" and that is no longer true — 93 of the 183 rows
+    /// carry one (88 of 174 before PROV-131's refresh added five structured-output rows). The block is `{"supportsStrictMode": true}` on every single one of them, which is
     /// PROV-078's change: upstream stopped INFERRING strict-tool support from the provider and
     /// started writing it into the catalog. That is metadata about the tool schema, not a flag that
     /// adds anything to a request, so the invariant this test exists for is intact — and it is now
@@ -713,7 +759,7 @@ mod tests {
         }
         assert_eq!(
             models.iter().filter(|m| m.compat.is_some()).count(),
-            88,
+            93,
             "every Bedrock compat block is PROV-078's `supportsStrictMode`; a different count \
              means a different flag arrived and has to be read"
         );
@@ -736,7 +782,7 @@ mod tests {
             .iter()
             .filter(|m| m.thinking_level_map.is_some())
             .collect();
-        assert_eq!(with_map.len(), 70);
+        assert_eq!(with_map.len(), 76);
         for m in &with_map {
             let map = m.thinking_level_map.as_ref().expect("checked above");
             assert_ne!(
@@ -777,7 +823,7 @@ mod tests {
         let provider = amazon_bedrock_provider();
         assert_eq!(provider.id().as_str(), "amazon-bedrock");
         assert_eq!(provider.name(), "Amazon Bedrock");
-        assert_eq!(provider.models().len(), 174);
+        assert_eq!(provider.models().len(), 183);
 
         let auth = provider.provider_auth().expect("bedrock declares auth");
         assert!(auth.api_key.is_some());

@@ -53,6 +53,18 @@ pub(super) fn supports_adaptive_thinking(model: &Model) -> bool {
         .any(|s| NEEDLES.iter().any(|n| s.contains(n)))
 }
 
+/// pi `supportsThinkingBlockBinding` (`bedrock-converse-stream.ts:792-806` @v1.0.1): the models
+/// that accept `thinking.block_binding`. Opus 4.6 and Sonnet 4.6 support adaptive thinking but
+/// REJECT the field with "thinking.adaptive.block_binding: Extra inputs are not permitted", which
+/// is why this needle list is narrower than [`supports_adaptive_thinking`]'s (PROV-130).
+pub(super) fn supports_thinking_block_binding(model: &Model) -> bool {
+    const NEEDLES: [&str; 5] = ["opus-4-7", "opus-4-8", "opus-5", "sonnet-5", "fable-5"];
+    let candidates = model_match_candidates(model);
+    candidates
+        .iter()
+        .any(|s| NEEDLES.iter().any(|n| s.contains(n)))
+}
+
 /// pi `supportsNativeXhighEffort` (`bedrock-converse-stream.ts:602-612`).
 fn supports_native_xhigh_effort(model: &Model) -> bool {
     const NEEDLES: [&str; 5] = ["opus-4-7", "opus-4-8", "opus-5", "sonnet-5", "fable-5"];

@@ -54,10 +54,17 @@
 //! missing without a diff — and a generalization that routed the live path around [`DELTAS`] is how
 //! twelve signed-off decisions would go missing the same way.
 //!
+//! `--only` narrows WHICH catalogs a run touches; it does not narrow what a touched catalog gets.
+//! A selected catalog is still rewritten whole from one source, still runs [`DELTAS`] and
+//! [`CONVERGED`], and still cannot have a row cherry-picked into it. An unselected one is named on
+//! stdout and left alone, the path a failed fetch has always taken. The forbidden thing is a skip
+//! nobody is told about, not a run a maintainer deliberately scoped.
+//!
 //! # Usage
 //!
 //! ```text
 //! cargo run -p xtask -- gen-catalogs [--pi <path>] [--rev <rev>] [--out <dir>] [--check] [--diff]
+//!                                     [--only <stem>[,<stem>...]]
 //! cargo run -p xtask -- gen-catalogs --roster <rev> [--pi <path>]
 //! cargo run -p xtask -- feature-matrix [--fast]
 //! ```
@@ -67,6 +74,15 @@
 //!   point: the committed floor is then behind upstream and somebody has to look. Offline, set
 //!   `CYRUP_XTASK_SKIP_LIVE` and it checks the pinned file alone rather than reporting 38 fake
 //!   differences.
+//! * `--only <stems>` — narrow the run to those catalogs. Every other one is SKIPPED BY NAME on
+//!   stdout, its file left byte-for-byte as it is and its manifest provenance carried forward,
+//!   which is the same path a failed fetch and `CYRUP_XTASK_SKIP_LIVE` already take (D6). An
+//!   unknown stem is a hard error, because a narrowed run that selected nothing would print a
+//!   plausible summary. It exists because pi.dev republishes all 38 catalogs independently, so a
+//!   total refresh is a 14-catalog data review that cannot be attached to one ledger row: PROV-131
+//!   needed `cloudflare-ai-gateway` and `amazon-bedrock`, and refreshing twelve unrelated
+//!   providers alongside them would have put a dozen undiagnosed data movements in one commit.
+//!   **A narrowed run is not a refresh of the floor** — it leaves the others as stale as they were.
 //! * `--diff` — print a **structural** (model-level and field-level) diff of on-disk vs generated
 //!   instead of writing anything. Whitespace-insensitive, so it reports only real data movement.
 //!   Its comparison is a port of pi's own `scripts/diff-model-catalog.mjs` (see [`canonicalize`]),
@@ -660,6 +676,11 @@ struct Args {
     diff: bool,
     /// `Some(rev)` selects the provider-set audit at `rev` instead of generating anything.
     roster: Option<String>,
+    /// `Some(stems)` narrows the run to those catalogs; every other one is SKIPPED by name
+    /// ([`live_catalog::skip_reason`]) — its file left byte-for-byte as it is and its manifest
+    /// provenance carried forward (D6), exactly as a failed or `CYRUP_XTASK_SKIP_LIVE` fetch
+    /// already behaves. `None` is the whole roster. See [`parse_only`] for why a typo is fatal.
+    only: Option<Vec<String>>,
 }
 
 fn workspace_root() -> PathBuf {
@@ -678,6 +699,7 @@ fn parse_args() -> Result<Args, String> {
         check: false,
         diff: false,
         roster: None,
+        only: None,
     };
     let mut it = std::env::args().skip(1);
     let cmd = it.next().unwrap_or_default();
@@ -696,10 +718,42 @@ fn parse_args() -> Result<Args, String> {
             "--check" => args.check = true,
             "--diff" => args.diff = true,
             "--roster" => args.roster = Some(value()?),
+            "--only" => args.only = Some(parse_only(&value()?)?),
             other => return Err(format!("unknown flag {other:?}")),
         }
     }
     Ok(args)
+}
+
+/// Parse `--only a,b` into catalog stems, refusing any name no catalog has.
+///
+/// A typo MUST be fatal. The whole hazard of a narrowed run is that it writes less than the
+/// maintainer thinks it did, and `--only amazon-bedrok` that silently selected nothing would
+/// print "wrote 1 of 2 files" and look like a successful refresh. Validating against the two
+/// rosters is what keeps a narrowed run as accounted-for as a total one.
+fn parse_only(value: &str) -> Result<Vec<String>, String> {
+    let known: Vec<&str> = CATALOGS
+        .iter()
+        .map(|c| c.file)
+        .chain(LIVE_CATALOGS.iter().map(|c| c.file))
+        .collect();
+    let mut out = Vec::new();
+    for stem in value.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        if !known.contains(&stem) {
+            return Err(format!(
+                "--only names {stem:?}, which is not a catalog — the {} catalogs are: {}",
+                known.len(),
+                known.join(", ")
+            ));
+        }
+        if !out.iter().any(|s: &String| s == stem) {
+            out.push(stem.to_string());
+        }
+    }
+    if out.is_empty() {
+        return Err("--only needs at least one catalog stem".to_string());
+    }
+    Ok(out)
 }
 
 /// Command dispatch. `xtask` takes no dependencies (see `xtask/Cargo.toml`), so this is a `match`
@@ -834,7 +888,11 @@ fn run_gen_catalogs() -> Result<(), String> {
     }
 
     // Live catalogs FIRST: the manifest carries their provenance, so it has to be built after them.
-    let live = live_catalog::refresh(LIVE_CATALOGS, &live_catalog::fetch_with_curl)?;
+    let live = live_catalog::refresh(
+        LIVE_CATALOGS,
+        &live_catalog::fetch_with_curl,
+        args.only.as_deref(),
+    )?;
     for (spec, outcome) in &live {
         if let live_catalog::LiveOutcome::Skipped { why } = outcome {
             // Non-fatal, exactly like the UNPORTED table's "declare and skip cleanly" precedent:
@@ -866,17 +924,26 @@ fn run_gen_catalogs() -> Result<(), String> {
         }
     }
 
+    // Derived from THIS run rather than from the static rosters: under `--only` (or a skipped
+    // fetch) the rosters' lengths describe a run that did not happen, and a summary that overstates
+    // what it wrote is the silent-skip failure wearing a count.
+    let live_fetched = live
+        .iter()
+        .filter(|(_, o)| matches!(o, live_catalog::LiveOutcome::Fetched { .. }))
+        .count();
+    let pinned_generated = generated.len().saturating_sub(live_fetched + 1);
+
     if args.check {
         if differing.is_empty() {
             // `generated` holds only what this run could produce, so a skipped live fetch is
             // reported as a smaller comparison rather than as a silent pass over 39 files.
-            let fetched = generated.len().saturating_sub(CATALOGS.len() + 1);
+            let fetched = live_fetched;
             println!(
                 "gen-catalogs --check: all {} file(s) compared reproduce — {fetched} live from \
                  {}<id>, {} from pi@{}{}{}",
                 generated.len(),
                 live_catalog::LIVE_CATALOG_ENDPOINT,
-                CATALOGS.len(),
+                pinned_generated,
                 args.rev,
                 own_rev_summary(&args.rev),
                 if fetched == LIVE_CATALOGS.len() {
@@ -904,10 +971,10 @@ fn run_gen_catalogs() -> Result<(), String> {
         "gen-catalogs: wrote {} of {} files — {} from pi@{}{}, {} live from {}<id>",
         differing.len(),
         generated.len(),
-        CATALOGS.len(),
+        pinned_generated,
         args.rev,
         own_rev_summary(&args.rev),
-        LIVE_CATALOGS.len(),
+        live_fetched,
         live_catalog::LIVE_CATALOG_ENDPOINT
     );
     for name in &differing {
@@ -1105,6 +1172,20 @@ fn generate_all(
 ) -> Result<Vec<(String, String)>, String> {
     let mut out = Vec::new();
     for spec in CATALOGS {
+        // A narrowed run leaves an unselected pinned catalog alone the same way it leaves an
+        // unselected live one alone: not generated, so not written and not compared. Its manifest
+        // entry is static (`pi@<rev>`), so there is nothing to carry forward.
+        if args
+            .only
+            .as_ref()
+            .is_some_and(|only| !only.iter().any(|s| s == spec.file))
+        {
+            println!(
+                "gen-catalogs: {}.json left unchanged — not named by --only",
+                spec.file
+            );
+            continue;
+        }
         let src = git_show(
             &args.pi,
             spec.rev(&args.rev),
@@ -2089,7 +2170,7 @@ mod tests {
                     live_catalog::SKIP_LIVE_ENV
                 )
             },
-            true,
+            &|spec| live_catalog::skip_reason(spec, true, None),
         )
         .expect("skipping is never an error");
         assert_eq!(outcomes.len(), LIVE_CATALOGS.len());
@@ -2114,6 +2195,92 @@ mod tests {
         assert_eq!(
             live_catalog::skip_live_requested(),
             std::env::var_os("CYRUP_XTASK_SKIP_LIVE").is_some()
+        );
+    }
+
+    /// PROV-131 — `--only` fetches exactly the named catalogs and SKIPS the rest BY NAME. The
+    /// skip has to land on the same `LiveOutcome::Skipped` a failed fetch produces, because that
+    /// is the variant `manifest_json` carries provenance forward for (D6); a narrowed run that
+    /// invented a third state would rewrite 36 manifest entries to describe data it never read.
+    #[test]
+    fn only_fetches_the_named_catalogs_and_skips_the_rest_by_name() {
+        let only = vec![
+            "amazon-bedrock".to_string(),
+            "cloudflare-ai-gateway".to_string(),
+        ];
+        let hit = std::cell::RefCell::new(Vec::<String>::new());
+        let outcomes = live_catalog::refresh_with(
+            LIVE_CATALOGS,
+            &|url| {
+                hit.borrow_mut().push(url.to_string());
+                // `rows_from_body` refuses a row tagged with another provider, so the fixture is
+                // built from the stem the URL asked for.
+                let stem = url.rsplit('/').next().unwrap_or_default();
+                Ok(live_catalog::Fetched {
+                    body: format!(
+                        r#"{{"x":{{"id":"x","provider":"{stem}","api":"a","name":"X"}}}}"#
+                    ),
+                    last_modified: None,
+                    revision: None,
+                    etag: None,
+                })
+            },
+            &|spec| live_catalog::skip_reason(spec, false, Some(&only)),
+        )
+        .expect("a fixture body parses");
+
+        assert_eq!(
+            outcomes.len(),
+            LIVE_CATALOGS.len(),
+            "every spec is reported"
+        );
+        let fetched: Vec<&str> = outcomes
+            .iter()
+            .filter(|(_, o)| matches!(o, live_catalog::LiveOutcome::Fetched { .. }))
+            .map(|(spec, _)| spec.file)
+            .collect();
+        assert_eq!(fetched, ["amazon-bedrock", "cloudflare-ai-gateway"]);
+
+        // Nothing else was even reached over the network.
+        assert_eq!(hit.borrow().len(), 2, "fetched {:?}", hit.borrow());
+
+        for (spec, outcome) in &outcomes {
+            if only.iter().any(|s| s == spec.file) {
+                continue;
+            }
+            match outcome {
+                live_catalog::LiveOutcome::Skipped { why } => assert!(
+                    why.contains("--only"),
+                    "{}: the notice must name why it was skipped, got {why}",
+                    spec.file
+                ),
+                live_catalog::LiveOutcome::Fetched { .. } => {
+                    panic!("{} was fetched despite --only", spec.file)
+                }
+            }
+        }
+    }
+
+    /// PROV-131 — a `--only` typo must be FATAL. A narrowed run that selected nothing would print
+    /// "wrote 0 of 1 files" and read as a clean no-op refresh, which is exactly the silent skip
+    /// this generator's module docs forbid.
+    #[test]
+    fn an_unknown_only_stem_is_a_hard_error() {
+        let err = parse_only("amazon-bedrok").expect_err("a typo cannot select nothing");
+        assert!(err.contains("amazon-bedrok"), "{err}");
+        assert!(err.contains("is not a catalog"), "{err}");
+        // ...and the error lists the real names, so the typo is self-correcting.
+        assert!(err.contains("amazon-bedrock"), "{err}");
+
+        assert!(parse_only("").is_err(), "an empty selection is not a run");
+        assert_eq!(
+            parse_only(" amazon-bedrock , cloudflare-ai-gateway ").expect("trims"),
+            ["amazon-bedrock", "cloudflare-ai-gateway"]
+        );
+        // De-duplicated, so `--only a,a` cannot make a summary count the same file twice.
+        assert_eq!(
+            parse_only("openrouter-images,openrouter-images").expect("pinned stems count too"),
+            ["openrouter-images"]
         );
     }
 

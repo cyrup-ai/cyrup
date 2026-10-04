@@ -1,12 +1,12 @@
 //! Tool result finalization: normalise the executed outcome, run `after_tool_call`, and fold the
 //! replace-not-merge table into a `Finalized`.
 
-use super::Finalized;
+use super::{Finalized, ToolCallEnv};
 use crate::agent::message::empty_details;
 use crate::agent::run::RunCtx;
 use crate::agent::util::now_millis;
 use crate::event::{AgentMessage, ToolResultMessage};
-use crate::hooks::{AfterOutcome, AfterToolCall, AgentContextView};
+use crate::hooks::{AfterOutcome, AfterToolCall};
 use cyrup_core::{AssistantMessage, Content, TerminateHint, ToolCall, ToolError, ToolResult};
 use serde_json::Value;
 use std::sync::Arc;
@@ -24,9 +24,12 @@ impl From<Result<ToolResult, ToolError>> for Executed {
             // AGENT-009 — `terminate` is optional upstream (`AgentToolResult.terminate?`,
             // types.ts:354-368) and `TerminateHint` carries all three of its values through
             // unchanged: `Unspecified` puts no key on the wire, `Continue` puts an explicit `false`.
+            // AGENT-046 — pi `:840` @v1.0.1 changed from `{ result, isError: false }` to
+            // `{ result, isError: result.isError === true }`: an `Ok` that declares failure IS a
+            // failure to the loop, and `details`/`usage`/`structured_content` survive with it.
             Ok(result) => Self {
+                is_error: result.is_error,
                 result,
-                is_error: false,
             },
             // A throwing TOOL yields `createErrorToolResult(...)` (`agent-loop.ts:700-703`
             // @v0.83.0), i.e. `details: {}` and no `terminate`. `ToolError::details` overrides the
@@ -43,6 +46,9 @@ impl From<Result<ToolResult, ToolError>> for Executed {
                     // a THROWN failure carries no structured half (AGENT-045). An `Ok` result that
                     // reports failure keeps one — that asymmetry is `AGENT-046`'s subject.
                     structured_content: None,
+                    // `createErrorToolResult` writes no `isError` key, so the RESULT object
+                    // reports none — the error-ness lives on the outcome. AGENT-046.
+                    is_error: false,
                     terminate: TerminateHint::Unspecified,
                 },
                 is_error: true,
@@ -52,9 +58,7 @@ impl From<Result<ToolResult, ToolError>> for Executed {
 }
 
 impl RunCtx {
-    /// Finalize one executed call: normalise → `after_tool_call` → fold. The two runtimes call
-    /// this; it composes the three steps and does nothing else.
-    #[allow(clippy::too_many_arguments)]
+    /// The loop's adapter onto [`finalize_tool_call`]: narrow the run, then run the shared stage.
     pub(super) async fn finalize(
         &self,
         assistant: &AssistantMessage,
@@ -64,44 +68,58 @@ impl RunCtx {
         args: Value,
         outcome: Result<ToolResult, ToolError>,
     ) -> Finalized {
-        let executed = Executed::from(outcome);
-        let hook = self
-            .after_hook(assistant, ctx_messages, call, &args, &executed)
-            .await;
-        fold_tool_outcome(call, source_index, executed, hook)
-    }
-
-    /// The shell: the one await in finalization. Builds the read-side view of the executed
-    /// result (Pi `AfterToolCallContext`, types.ts:100-113) and returns the hook's verdict
-    /// UNINTERPRETED — [`AfterOutcome::Failed`] is a third outcome of the fold, not an absence
-    /// (see [`fold_tool_outcome`]).
-    pub(super) async fn after_hook(
-        &self,
-        assistant: &AssistantMessage,
-        ctx_messages: &[Arc<AgentMessage>],
-        call: &ToolCall,
-        args: &Value,
-        executed: &Executed,
-    ) -> AfterOutcome {
-        let ctx = AfterToolCall {
-            tool_name: &call.name,
-            tool_call_id: &call.id,
+        finalize_tool_call(
+            &self.tool_env(assistant, ctx_messages),
+            call,
+            source_index,
             args,
-            content: &executed.result.content,
-            details: executed.result.details.as_ref(),
-            usage: executed.result.usage.as_ref(),
-            is_error: executed.is_error,
-            terminate: executed.result.terminate,
-            assistant_message: assistant,
-            tool_call: call,
-            context: AgentContextView {
-                system_prompt: &self.system_prompt,
-                messages: ctx_messages,
-                tools: &self.tools,
-            },
-        };
-        self.hooks.after_tool_call(ctx, self.cancel.child()).await
+            outcome,
+        )
+        .await
     }
+}
+
+/// Finalize one executed call: normalise → `after_tool_call` → fold. Both runtimes and
+/// [`super::single::run_tool_call`] call this; it composes the three steps and does nothing else.
+///
+/// AGENT-047 — a free function over [`ToolCallEnv`], mirroring pi's narrowing of
+/// `finalizeExecutedToolCall` onto `config: ToolCallHooks` (`agent-loop.ts:853-859` @v1.0.1).
+pub(crate) async fn finalize_tool_call(
+    env: &ToolCallEnv<'_>,
+    call: &ToolCall,
+    source_index: usize,
+    args: Value,
+    outcome: Result<ToolResult, ToolError>,
+) -> Finalized {
+    let executed = Executed::from(outcome);
+    let hook = after_hook(env, call, &args, &executed).await;
+    fold_tool_outcome(call, source_index, executed, hook)
+}
+
+/// The shell: the one await in finalization. Builds the read-side view of the executed
+/// result (Pi `AfterToolCallContext`, types.ts:100-113) and returns the hook's verdict
+/// UNINTERPRETED — [`AfterOutcome::Failed`] is a third outcome of the fold, not an absence
+/// (see [`fold_tool_outcome`]).
+pub(crate) async fn after_hook(
+    env: &ToolCallEnv<'_>,
+    call: &ToolCall,
+    args: &Value,
+    executed: &Executed,
+) -> AfterOutcome {
+    let ctx = AfterToolCall {
+        tool_name: &call.name,
+        tool_call_id: &call.id,
+        args,
+        content: &executed.result.content,
+        details: executed.result.details.as_ref(),
+        usage: executed.result.usage.as_ref(),
+        is_error: executed.is_error,
+        terminate: executed.result.terminate,
+        assistant_message: env.assistant,
+        tool_call: call,
+        context: env.context,
+    };
+    env.hooks.after_tool_call(ctx, env.hook_cancel()).await
 }
 
 /// The pure fold: pi `finalizeExecutedToolCall`'s three-way table (`agent-loop.ts:724-750`) as a
@@ -126,6 +144,12 @@ pub(super) fn fold_tool_outcome(
         mut usage,
         mut added_tool_names,
         mut structured_content,
+        // AGENT-046 — the TOOL's own flag. It rides through the override arm UNTOUCHED, for the
+        // same reason `added_tool_names` does: pi spreads `{...result}` and assigns only
+        // `content`/`details`/`usage`/`terminate` over it (`agent-loop.ts:881-887` @v1.0.1), so no
+        // hook can set or clear it. `is_error` below is the separate NORMALISED verdict, which a
+        // hook CAN flip (`isError = afterResult.isError ?? isError`, `:890`).
+        is_error: mut tool_is_error,
         mut terminate,
     } = result;
     match hook {
@@ -186,8 +210,11 @@ pub(super) fn fold_tool_outcome(
             usage = None;
             added_tool_names = Vec::new();
             // `createErrorToolResult` replaces the WHOLE result, so the structured half goes with
-            // `usage` and `added_tool_names` (AGENT-045).
+            // `usage` and `added_tool_names` (AGENT-045) — and so does the tool's own flag, since
+            // the replacement object has no `isError` key (AGENT-046). The OUTCOME is still an
+            // error; only the result object stops claiming to be one.
             structured_content = None;
+            tool_is_error = false;
             is_error = true;
             terminate = TerminateHint::Unspecified;
         }
@@ -205,7 +232,13 @@ pub(super) fn fold_tool_outcome(
         // (agent-loop.ts:741); this reaches the wire payload via `convert_to_llm`.
         timestamp: now_millis(),
     };
-    Finalized::new(source_index, message, terminate, structured_content)
+    Finalized::new(
+        source_index,
+        message,
+        terminate,
+        structured_content,
+        tool_is_error,
+    )
 }
 
 #[cfg(test)]
@@ -242,6 +275,7 @@ mod tests {
             usage: Some(usage(11)),
             added_tool_names: vec!["late".to_string()],
             structured_content: None,
+            is_error: false,
             terminate: TerminateHint::Terminate,
         }
     }
@@ -424,7 +458,7 @@ mod tests {
             is_error: true,
             timestamp: now_millis(),
         };
-        let fin = Finalized::new(7, message, TerminateHint::Continue, None);
+        let fin = Finalized::new(7, message, TerminateHint::Continue, None, false);
         assert_eq!(fin.source_index(), 7);
         let AgentEvent::ToolExecutionEnd {
             tool_call_id,

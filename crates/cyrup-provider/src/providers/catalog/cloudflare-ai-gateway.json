@@ -40,7 +40,7 @@
 		"type": "chat"
 	},
 	{
-		"id": "claude-fable-5.1",
+		"id": "claude-fable-5-1",
 		"name": "Claude Fable 5.1",
 		"api": "anthropic-messages",
 		"provider": "cloudflare-ai-gateway",
@@ -80,7 +80,7 @@
 		"type": "chat"
 	},
 	{
-		"id": "claude-haiku-4.5",
+		"id": "claude-haiku-4-5",
 		"name": "Claude Haiku 4.5 (latest)",
 		"api": "anthropic-messages",
 		"provider": "cloudflare-ai-gateway",
@@ -114,7 +114,7 @@
 		"type": "chat"
 	},
 	{
-		"id": "claude-opus-4.5",
+		"id": "claude-opus-4-5",
 		"name": "Claude Opus 4.5 (latest)",
 		"api": "anthropic-messages",
 		"provider": "cloudflare-ai-gateway",
@@ -148,7 +148,7 @@
 		"type": "chat"
 	},
 	{
-		"id": "claude-opus-4.6",
+		"id": "claude-opus-4-6",
 		"name": "Claude Opus 4.6",
 		"api": "anthropic-messages",
 		"provider": "cloudflare-ai-gateway",
@@ -186,7 +186,7 @@
 		"type": "chat"
 	},
 	{
-		"id": "claude-opus-4.7",
+		"id": "claude-opus-4-7",
 		"name": "Claude Opus 4.7",
 		"api": "anthropic-messages",
 		"provider": "cloudflare-ai-gateway",
@@ -226,7 +226,7 @@
 		"type": "chat"
 	},
 	{
-		"id": "claude-opus-4.8",
+		"id": "claude-opus-4-8",
 		"name": "Claude Opus 4.8",
 		"api": "anthropic-messages",
 		"provider": "cloudflare-ai-gateway",
@@ -306,7 +306,7 @@
 		"type": "chat"
 	},
 	{
-		"id": "claude-opus-5.5",
+		"id": "claude-opus-5-5",
 		"name": "Claude Opus 5.5",
 		"api": "anthropic-messages",
 		"provider": "cloudflare-ai-gateway",
@@ -346,7 +346,7 @@
 		"type": "chat"
 	},
 	{
-		"id": "claude-sonnet-4.5",
+		"id": "claude-sonnet-4-5",
 		"name": "Claude Sonnet 4.5 (latest)",
 		"api": "anthropic-messages",
 		"provider": "cloudflare-ai-gateway",
@@ -362,7 +362,7 @@
 			"cacheRead": 0.3,
 			"cacheWrite": 3.75
 		},
-		"contextWindow": 1000000,
+		"contextWindow": 200000,
 		"maxTokens": 64000,
 		"compat": {
 			"sendSessionAffinityHeaders": true
@@ -380,7 +380,7 @@
 		"type": "chat"
 	},
 	{
-		"id": "claude-sonnet-4.6",
+		"id": "claude-sonnet-4-6",
 		"name": "Claude Sonnet 4.6",
 		"api": "anthropic-messages",
 		"provider": "cloudflare-ai-gateway",
@@ -1518,7 +1518,7 @@
 			"cacheRead": 0.014,
 			"cacheWrite": 0
 		},
-		"contextWindow": 1310720,
+		"contextWindow": 1048576,
 		"maxTokens": 1048576,
 		"compat": {
 			"supportsStore": false,
@@ -1590,7 +1590,7 @@
 		"cost": {
 			"input": 0.1,
 			"output": 0.3,
-			"cacheRead": 0,
+			"cacheRead": 0.05,
 			"cacheWrite": 0
 		},
 		"contextWindow": 256000,
@@ -2039,7 +2039,7 @@
 			"cacheRead": 0.26,
 			"cacheWrite": 0
 		},
-		"contextWindow": 1310720,
+		"contextWindow": 1048576,
 		"maxTokens": 1048576,
 		"compat": {
 			"supportsStore": false,
@@ -2068,7 +2068,7 @@
 			"cacheRead": 0.03,
 			"cacheWrite": 0
 		},
-		"contextWindow": 1310720,
+		"contextWindow": 1048576,
 		"maxTokens": 1048576,
 		"compat": {
 			"supportsStore": false,

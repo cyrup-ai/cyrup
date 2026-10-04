@@ -68,6 +68,17 @@ cyrup-tui = { workspace = true }
 # through a direct edge — it is already in the graph transitively (`cyrup-session-svc` depends on it),
 # so this names the existing rlib rather than adding a build.
 cyrup-tools = { workspace = true }
+# The extension host's own vocabulary, for ONE thing: `session_launch::quarantine` constructs a
+# `cyrup_ext::QuarantinedNative` — pi's `load.discard()` plus the recorded
+# `Failed to load extension: <message>`, for a native built-in that refuses to be built before a
+# factory exists to throw out of — and names the built-in it stands in for with a
+# `cyrup_core::ExtensionId` rather than re-spelling the id as a literal here. Both rlibs are already
+# in this graph (`cyrup-session-svc` depends on both), so these name existing builds rather than
+# adding one, exactly as the `cyrup-tools` edge above does. `wasm-host` is deliberately NOT named:
+# nothing this bin reaches on `cyrup-ext` is behind it, and `cyrup-session-svc`'s own edge already
+# turns it on for the shipped binary (see that crate's Cargo.toml:40-53).
+cyrup-ext = { workspace = true }
+cyrup-core = { workspace = true }
 # The SubAgents extension (arch-SA): registered as a native built-in at all three session
 # construction sites below, plus this bin owns the internal `__subagent-runner --config <path>`
 # hop-2 subcommand (`subagent_runner_cmd.rs`) that calls straight into its `background::runner_main`.

@@ -215,8 +215,8 @@ pub use manifest::{Capabilities, ExtensionManifest, FsGrant, HOST_WORLD, MANIFES
 pub use native::ServicesCtxSource;
 pub use native::{
     CtxTier, ExtMode, HostCtx, HostCtxRich, HostCtxSource, HumanWaitGate, HumanWaitGuard, InitApi,
-    LateRegistrar, NativeExtension, NativeHandle, RenderCtx, RenderTheme, RenderedComponent,
-    SanctionedWaitGate, SanctionedWaitGuard, SanctionedWaitKind,
+    LateRegistrar, NativeExtension, NativeHandle, QuarantinedNative, QuarantinedTier, RenderCtx,
+    RenderTheme, RenderedComponent, SanctionedWaitGate, SanctionedWaitGuard, SanctionedWaitKind,
 };
 pub use provider::{
     ModelCost, ModelCostTier, ModelRegistrySink, ProviderConfig, ProviderHub, ProviderModelConfig,

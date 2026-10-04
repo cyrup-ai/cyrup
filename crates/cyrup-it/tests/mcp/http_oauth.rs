@@ -496,7 +496,31 @@ struct Harness {
 /// * `"directTools": true` for the reason `live_tool_call.rs` sets it — direct tools are opt-in, and
 ///   without it the model reaches the server only through `mcp({tool: …})`.
 fn harness(fixture: &HttpMcpFixture, explicit_oauth: bool) -> Harness {
-    harness_sharing(fixture, explicit_oauth, None)
+    harness_sharing(fixture, explicit_oauth, None, Lifecycle::KeepAlive)
+}
+
+/// Which lifecycle the fixture entry declares, because since MCP-598 the two answer different
+/// questions and no single value serves both.
+///
+/// `149fdf1` closes a server that is not RESIDENT the moment its catalogue is captured — `resident`
+/// is `lifecycle !== "lazy" || effectiveIdleTimeout === 0` (`init.ts:361`) — and a `keep-alive` or
+/// `eager` server is in the startup set whether or not its cache entry is valid.
+///
+/// * [`Lifecycle::KeepAlive`] is what a test that WITNESSES A CREDENTIAL needs: it asserts the
+///   server reached `Connected` and stayed there, which a plain `lazy` server no longer does.
+/// * [`Lifecycle::Lazy`] is what a test about the CACHE needs:
+///   [`a_first_login_stores_a_token_and_the_next_session_connects_silently`]'s phase 7a asserts
+///   that a warm metadata cache means no startup connect at all, which is a `lazy`-only property —
+///   a prewarmed server is dialled on every launch by design.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Lifecycle {
+    KeepAlive,
+    Lazy,
+}
+
+/// [`harness`] with a plain `lazy` fixture — see [`Lifecycle`].
+fn harness_lazy(fixture: &HttpMcpFixture, explicit_oauth: bool) -> Harness {
+    harness_sharing(fixture, explicit_oauth, None, Lifecycle::Lazy)
 }
 
 /// [`harness`], optionally over a vault that already exists.
@@ -529,6 +553,7 @@ fn harness_sharing(
     fixture: &HttpMcpFixture,
     explicit_oauth: bool,
     existing: Option<McpAuthStore>,
+    lifecycle: Lifecycle,
 ) -> Harness {
     let tmp = TempDir::new().unwrap();
     let cwd = tmp.path().join("project");
@@ -542,6 +567,14 @@ fn harness_sharing(
         entry.insert("auth".to_string(), Value::String("oauth".to_string()));
     }
     entry.insert("directTools".to_string(), Value::Bool(true));
+    // See [`Lifecycle`]. `keep-alive` is written as an explicit key; `lazy` is written as the
+    // ABSENCE of one, which is also how a real config expresses it (`definition.lifecycle ?? "lazy"`).
+    if lifecycle == Lifecycle::KeepAlive {
+        entry.insert(
+            "lifecycle".to_string(),
+            Value::String("keep-alive".to_string()),
+        );
+    }
     let config = serde_json::json!({ "mcpServers": { SERVER: Value::Object(entry) } });
     std::fs::write(
         agent_dir.join("mcp.json"),
@@ -1075,28 +1108,37 @@ async fn an_unauthenticated_http_server_ends_at_needs_auth() {
         Some(cyrup_mcp::lifecycle::ConnectionStatus::NeedsAuth),
         "an empty vault ends at needs-auth, not at connected and not at a hard error"
     );
-    // TWO handshakes, and neither is the ladder retrying: `on_unauthorized(Explicit)` answers
-    // `NeedsAuth` with no retry at all. The second connect is `initialize_mcp`'s **direct-tools
-    // bootstrap** (`init.ts:382`), which re-connects every server that is configured for direct
-    // tools and still has no cache entry — and §11's needs-auth arm records no connection, so this
-    // server is still "missing" when that pass runs. Pinned at 2 rather than waved at: a 3 would
-    // mean a real retry appeared, and a 1 would mean the direct-tools bootstrap stopped running.
+    // ONE handshake, and it is not the ladder retrying: `on_unauthorized(Explicit)` answers
+    // `NeedsAuth` with no retry at all.
+    //
+    // It was TWO until MCP-598. The direct-tools bootstrap re-connected every server configured
+    // for direct tools that still had no cache entry, and §11's needs-auth arm records no
+    // connection, so this server was still "missing" three lines later and was dialled a second
+    // time. `149fdf1` (#788, v5.0.0) narrowed that filter from
+    // `!results.some(r => r.name === name && r.connection)` to
+    // `!results.some(r => r.name === name)` (`init.ts:484`): a server the startup pass already
+    // attempted is not attempted again in the same pass, whether or not the attempt produced a
+    // connection. A needs-auth server is exactly that case, and dialling it twice only earned a
+    // second 401 — the vault is no fuller than it was a moment ago.
+    //
+    // Pinned at 1 rather than waved at: a 2 would mean that filter regressed, and a 0 would mean
+    // the startup pass stopped attempting the server at all.
     assert_eq!(
         fixture.initializes().len(),
-        2,
-        "the startup pass and the direct-tools bootstrap, each once, neither retrying: {:#?}",
+        1,
+        "the startup pass, once, with no bootstrap retry and no ladder retry: {:#?}",
         request_summary(&fixture)
     );
     assert_eq!(
         fixture.unauthorized().len(),
-        2,
-        "every attempt was challenged"
+        1,
+        "the one attempt was challenged"
     );
     for recorded in fixture.initializes() {
         assert_eq!(
             recorded.header("authorization"),
             None,
-            "an empty vault attaches nothing, on either attempt"
+            "an empty vault attaches nothing"
         );
     }
     // The MCP endpoint is all that was touched: `needs-auth` must not open a browser or walk the
@@ -1159,12 +1201,19 @@ async fn a_wrong_stored_token_fails_loudly_rather_than_connecting_empty() {
     let (mut model, ext) = driver(&hx).await;
     let state = await_settled(&ext).await;
 
-    // The token WAS presented — this is not the empty-vault case. Two attempts, for the reason
-    // [`an_unauthenticated_http_server_ends_at_needs_auth`] spells out, and BOTH carried the stored
-    // value: MCP-116's cache eviction fires once and the re-read finds the same wrong credential.
+    // The token WAS presented — this is not the empty-vault case.
+    //
+    // ONE attempt, for the reason [`an_unauthenticated_http_server_ends_at_needs_auth`] spells out:
+    // MCP-598 stopped the direct-tools bootstrap re-dialling a server the startup pass had already
+    // attempted. It was two before that, and the second attempt is where this test used to watch
+    // MCP-116's cache eviction fire once and the re-read find the same wrong credential — a
+    // property now covered where it belongs, by `server_manager.rs`'s
+    // `credentials_are_invalidated_at_most_once_per_needs_auth_episode`, which drives three
+    // connects against a permanent-401 fixture and asserts the `[false, true, true]` flag sequence
+    // directly.
     assert_eq!(
         fixture.initializes().len(),
-        2,
+        1,
         "{:#?}",
         request_summary(&fixture)
     );
@@ -1175,8 +1224,8 @@ async fn a_wrong_stored_token_fails_loudly_rather_than_connecting_empty() {
             "the provider read the vault and presented what it found"
         );
     }
-    // …and the server rejected it, every time.
-    assert_eq!(fixture.unauthorized().len(), 2);
+    // …and the server rejected it.
+    assert_eq!(fixture.unauthorized().len(), 1);
 
     // NOT connected. The whole point.
     assert_eq!(
@@ -1434,7 +1483,10 @@ fn browser_redirect(authorization_url: &str) -> String {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_first_login_stores_a_token_and_the_next_session_connects_silently() {
     let fixture = HttpMcpFixture::start().await;
-    let hx = harness(&fixture, true);
+    // `harness_lazy`, not `harness`: phase 7a below asserts that a WARM metadata cache means
+    // no startup connect at all, which is a `lazy`-only property — see [`Lifecycle`]. Phase 7b's
+    // `cold` harness is `keep-alive`, because there the assertion is the opposite one.
+    let hx = harness_lazy(&fixture, true);
 
     // ── phase 1 — no credential, so `needs-auth` ──────────────────────────────────────────────
     let (mut model, ext) = driver(&hx).await;
@@ -1659,7 +1711,7 @@ async fn a_first_login_stores_a_token_and_the_next_session_connects_silently() {
     // deliverable's sentence in its strictest form — "the session starts, the server connects
     // without any prompt" — against a credential no test seeded.
     let baseline_401 = fixture.unauthorized().len();
-    let cold = harness_sharing(&fixture, true, Some(hx.store.clone()));
+    let cold = harness_sharing(&fixture, true, Some(hx.store.clone()), Lifecycle::KeepAlive);
     let (mut cold_model, cold_ext) = driver(&cold).await;
     let cold_state = await_settled(&cold_ext).await;
     assert_eq!(
@@ -2270,7 +2322,7 @@ async fn the_mcp_auth_command_logs_in_against_a_real_server_and_stores_a_usable_
     // Nothing here was seeded: the only credential in play is the one the slash command's own flow
     // stored, and this is the sentence the feature exists for.
     let baseline_401 = fixture.unauthorized().len();
-    let cold = harness_sharing(&fixture, true, Some(hx.store.clone()));
+    let cold = harness_sharing(&fixture, true, Some(hx.store.clone()), Lifecycle::KeepAlive);
     let (mut cold_model, cold_ext) = driver(&cold).await;
     let cold_state = await_settled(&cold_ext).await;
     assert_eq!(

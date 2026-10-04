@@ -2392,6 +2392,93 @@ done
         );
     }
 
+    /// MCP-606's third `verify` item: **a cancel while the form is open aborts cleanly.**
+    ///
+    /// This is the hazard the pausable path creates and the two tests above cannot see. On the
+    /// unpausable paths a `tokio::time::timeout` always fires, so even a lost cancel ends the
+    /// call; on the pausable path a paused deadline never expires —
+    /// [`crate::call_deadline::CallDeadline::expired`] re-reads how long is left after every
+    /// generation bump, and a paused deadline has no running clock — so `cancel.cancelled()` is
+    /// the ONLY arm that can settle a call whose prompt is open.
+    /// If it were not in the `select!`, or not `biased;` first, the call would hang for as long as
+    /// the user left the form on screen, holding its in-flight slot and the whole shutdown behind
+    /// it.
+    ///
+    /// Upstream's own commit covers cancellation while a form is open; `Settled::Cancelled` is the
+    /// arm under test, and "cleanly" is all three of: the aborted error class rather than a
+    /// timeout, the wire-level `notifications/cancelled`, and promptly — well before either the
+    /// server's own answer or the budget.
+    #[tokio::test]
+    async fn a_cancel_while_an_elicitation_prompt_is_open_aborts_cleanly() {
+        let deadlines = Arc::new(crate::call_deadline::CallDeadlines::default());
+        let (_attempt, _resource, peer) = live_peer().await;
+        // A budget far longer than this test runs, so a timeout cannot be mistaken for the abort.
+        let budget = Duration::from_secs(30);
+
+        // The prompt is open before the call starts, so the call is handed its deadline PAUSED and
+        // the deadline arm of the `select!` can never fire.
+        deadlines.prompt_opened("fixture");
+        let cancel = CancelToken::new();
+        let call = {
+            let deadlines = Arc::clone(&deadlines);
+            let cancel = cancel.clone();
+            tokio::spawn(async move {
+                let pause = PausableDeadline {
+                    deadlines: &deadlines,
+                    server: "fixture",
+                    budget,
+                };
+                // `slow` answers after a second; the abort must land before that, so the result
+                // cannot be the server's.
+                let params = CallToolRequestParams::new("slow").with_arguments(JsonMap::new());
+                request_on_peer(
+                    &peer,
+                    CallToolRequest::new(params).into(),
+                    PeerRequestOptions::with_timeout(budget),
+                    &cancel,
+                    Some(&pause),
+                )
+                .await
+            })
+        };
+
+        // The user is still looking at the form when the session is cancelled.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            deadlines.open_prompts("fixture"),
+            1,
+            "precondition: the prompt really is open, so the deadline really is paused"
+        );
+        cancel.cancel();
+
+        // Half a second against a 30 s budget and a 1 s server: whatever settles the call in
+        // that window is the cancel and nothing with a clock.
+        let failure = tokio::time::timeout(Duration::from_millis(500), call)
+            .await
+            .expect(
+                "a cancel must settle the call at once, not leave it waiting on a paused deadline",
+            )
+            .expect("the call task joins")
+            .expect_err("a cancelled call reports the abort");
+        assert!(
+            matches!(failure.error, McpError::Aborted(_)),
+            "the abort class, not a timeout: {failure:?}"
+        );
+        assert_eq!(
+            failure.message,
+            crate::abort::ABORTED_FALLBACK_REASON,
+            "and the fallback reason, which is what goes on the wire as the cancel's reason"
+        );
+
+        // The prompt is still open — nothing about the abort unwound the user's form.
+        assert_eq!(deadlines.open_prompts("fixture"), 1);
+        // And the pause still balances afterwards: the abort consumed nothing the user's close
+        // was going to need, so `prompt_closed` brings the count back to zero as it would have
+        // without the cancel.
+        deadlines.prompt_closed("fixture");
+        assert_eq!(deadlines.open_prompts("fixture"), 0);
+    }
+
     /// MCP-607 end to end: a 1.5 s budget against a server that reports progress every second for
     /// three seconds before answering. Each notification arrives with ~0.5 s left and refills the
     /// budget, so the call completes at ~3 s — twice the budget it was given.

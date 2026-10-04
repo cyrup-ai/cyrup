@@ -598,6 +598,62 @@ mod tests {
         }));
     }
 
+    /// PROV-131 — pi `c10bfb0d7` (`scripts/generate-models.ts:1966-1969` @v1.0.1): "The
+    /// /anthropic passthrough forwards the model ID to Anthropic unchanged. models.dev lists
+    /// dotted versions (claude-opus-5.5), but Anthropic only accepts dashed IDs
+    /// (claude-opus-5-5)", hence `id = nativeId.replaceAll(".", "-")`.
+    ///
+    /// The gate is the WIRE API, not the provider: this gateway's `openai-completions` rows are
+    /// Workers-AI passthroughs whose ids legitimately keep their dots
+    /// (`workers-ai/@cf/zai-org/glm-5.3`), and `github-copilot` keeps dotted `claude-*` ids
+    /// because its own endpoint accepts them. A blanket dot-stripping would corrupt both, which
+    /// is why this asserts the condition upstream states rather than "no dots anywhere".
+    #[test]
+    fn ai_gateway_claude_ids_are_dashed_for_the_anthropic_passthrough() {
+        let models = cloudflare_ai_gateway_models();
+        let anthropic: Vec<&Model> = models
+            .iter()
+            .filter(|m| m.api.as_str() == crate::known_api::ANTHROPIC_MESSAGES)
+            .collect();
+        assert_eq!(anthropic.len(), 12, "the passthrough's row count");
+        for m in &anthropic {
+            assert!(
+                !m.id.as_str().contains('.'),
+                "{}: a dotted id on the /anthropic passthrough is rejected by Anthropic",
+                m.id.as_str()
+            );
+        }
+        // The nine that carried a dot before the refresh, by their dashed spellings.
+        let mut ids: Vec<&str> = anthropic.iter().map(|m| m.id.as_str()).collect();
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            [
+                "claude-fable-5",
+                "claude-fable-5-1",
+                "claude-haiku-4-5",
+                "claude-opus-4-5",
+                "claude-opus-4-6",
+                "claude-opus-4-7",
+                "claude-opus-4-8",
+                "claude-opus-5",
+                "claude-opus-5-5",
+                "claude-sonnet-4-5",
+                "claude-sonnet-4-6",
+                "claude-sonnet-5",
+            ]
+        );
+
+        // MIRROR: the Workers-AI passthrough rows KEEP their dots — the rename is upstream-scoped
+        // and over-applying it would break these.
+        assert!(
+            models
+                .iter()
+                .any(|m| m.api.as_str() == OPENAI_COMPLETIONS && m.id.as_str().contains('.')),
+            "a dot-bearing workers-ai id must survive"
+        );
+    }
+
     #[test]
     fn ai_gateway_env_mapping_present() {
         let vars = crate::env_api_keys::api_key_env_vars("cloudflare-ai-gateway").expect("mapping");
@@ -613,8 +669,10 @@ mod tests {
         let model = cloudflare_ai_gateway_models()
             .into_iter()
             // `claude-3-5-haiku` and `gpt-4` were the anthropic-messages / openai-responses
-            // samples here; the gateway retired both. `claude-haiku-4.5` is the same shape.
-            .find(|m| m.id.as_str() == "claude-haiku-4.5")
+            // samples here; the gateway retired both. `claude-haiku-4-5` is the same shape — and
+            // it is spelled DASHED since PROV-131: the `/anthropic` passthrough forwards the id to
+            // Anthropic unchanged, and Anthropic rejects the dotted `claude-haiku-4.5`.
+            .find(|m| m.id.as_str() == "claude-haiku-4-5")
             .expect("model");
         let ctx = MapEnv(BTreeMap::from([
             (CLOUDFLARE_API_KEY.to_string(), "cf-key".to_string()),
@@ -726,7 +784,7 @@ mod tests {
         )
         .with_auth_context(Arc::new(MapEnv(BTreeMap::new())));
         let model = provider
-            .get_model("claude-haiku-4.5")
+            .get_model("claude-haiku-4-5")
             .expect("model")
             .clone();
         let msg = collect_message(provider.stream(
@@ -745,7 +803,8 @@ mod tests {
         // a fully-configured gateway resolves auth and reaches transport (proving each api accepts
         // header-only auth with no api key). Point at an unroutable host so it fails fast at connect.
         for id in [
-            "claude-haiku-4.5",
+            // Dashed since PROV-131 — see `ai_gateway_claude_ids_are_dashed_for_the_passthrough`.
+            "claude-haiku-4-5",
             "workers-ai/@cf/moonshotai/kimi-k2.6",
             "gpt-4.1",
         ] {

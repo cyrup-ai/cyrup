@@ -68,7 +68,12 @@ use crate::timings;
 ///    registers nothing; a fanout-authorized child (`CYRUP_SUBAGENT_FANOUT_CHILD=1`) gets a
 ///    restricted, mutation-blocked tool REGARDLESS of `is_installed`. When intercom attached this
 ///    session its real channels are threaded in, else the NoTransport/NoOp degrade defaults stand
-///    (R-SA-020).
+///    (R-SA-020). That gate is resolved BEFORE the tier-3 `config.json` is read, matching the
+///    order upstream's `registerSubagentExtension` has (the child return at
+///    `pi-subagents/src/extension/index.ts:315-317`, then `loadConfig()` at `:325` @v0.75.0): a
+///    process that registers nothing never opens the file, so a refusal of it
+///    ([`SubagentAttachment::Refused`]) can only reach a process that WOULD have read it, where it
+///    quarantines this one extension ([`quarantine`]).
 /// 3. **The subagent prompt runtime** (SUBA-S01, pi `pi-args.ts:13`, which loads
 ///    `subagent-prompt-runtime.ts` into the child as its OWN extension): a plain subagent child
 ///    attaches NO subagents extension — `subagent_extension_for_env` returns `None` for it by
@@ -110,25 +115,71 @@ fn attach_native_extensions(
     if let Some(ext) = cyrup_llama::llama_extension_for_env(agent_dir) {
         builder = builder.with_native_extension(ext);
     }
-    let intercom_ext = cyrup_intercom::intercom_extension_for_env_concrete(
+    // A malformed `intercom/config.json`, or an unusable `PI_INTERCOM_ASK_TIMEOUT_MS`, REFUSES
+    // this extension. Both of upstream's equivalents throw from the first two lines of the
+    // extension factory itself — `loadConfig()` (`pi-intercom/index.ts:648` @v0.16.0, throwing from
+    // `config.ts:98-159`) and `getAskTimeoutMs()` (`:649`, throwing from `config.ts:18`) — so pi's
+    // loader catches them, discards this one extension and builds the session without it. The
+    // refusal therefore QUARANTINES the one extension, exactly as the two below do; carrying it out
+    // of this function aborted the whole launch instead, and not one of the other six built-ins was
+    // attempted.
+    //
+    // Ordering: this must precede `subagent_attachment`, because the `Configured` arm reads
+    // `intercom_ext` to wire the subagent extension's delivery/clarify/steer channels. A
+    // quarantined intercom leaves it `None`, so the subagent extension attaches channel-less —
+    // which is what it does whenever intercom is absent, and is what upstream's subagent extension
+    // finds when intercom failed to load.
+    let intercom_ext = match cyrup_intercom::intercom_extension_for_env_concrete(
         agent_dir.to_path_buf(),
         session_cwd.clone(),
-    )
-    .map_err(|e| anyhow::anyhow!("building intercom extension: {e}"))?;
-    let subagent_ext = match &intercom_ext {
-        Some(ic) => cyrup_ext_subagents::extension::subagent_extension_for_env_with_channels(
-            agent_dir,
-            crate::subagent_config::load_subagent_extension_config(dirs),
-            session_cwd.clone(),
-            ic.delivery_channel(),
-            ic.clarify_channel(),
-            ic.steer_channel(),
-        ),
-        None => cyrup_ext_subagents::extension::subagent_extension_for_env(
-            agent_dir,
-            crate::subagent_config::load_subagent_extension_config(dirs),
-            session_cwd.clone(),
-        ),
+    ) {
+        Ok(ext) => ext,
+        Err(refusal) => {
+            builder = quarantine(
+                builder,
+                cyrup_intercom::EXTENSION_ID,
+                // `IntercomExtension::is_ambient` is `true` (`cyrup-intercom/src/extension.rs:655`):
+                // it stands in for an installed package in the tier `--no-extensions` collapses, so
+                // the placeholder must be dropped by that flag too.
+                cyrup_ext::QuarantinedTier::Ambient,
+                &refusal,
+            );
+            None
+        }
+    };
+    // SUBA-166: a `config.json` that failed validation while declaring a policy key
+    // (`authorityPolicy`, `permissions`, the route-identity and worktree keys) is REFUSED rather
+    // than replaced by the all-defaults config — pi's `loadConfig` rethrows exactly those files
+    // (`pi-subagents/src/extension/config.ts:226-240` @v0.75.0). The refusal QUARANTINES the one
+    // extension: see [`quarantine`].
+    let subagent_gate =
+        cyrup_ext_subagents::extension::registration_mode_for_env(agent_dir, &session_cwd);
+    let subagent_ext = match subagent_attachment(dirs, subagent_gate) {
+        SubagentAttachment::Unregistered => None,
+        SubagentAttachment::Refused(refusal) => {
+            builder = quarantine(
+                builder,
+                cyrup_ext_subagents::extension::EXTENSION_ID,
+                cyrup_ext::QuarantinedTier::Ambient,
+                &refusal,
+            );
+            None
+        }
+        SubagentAttachment::Configured(config) => match &intercom_ext {
+            Some(ic) => cyrup_ext_subagents::extension::subagent_extension_for_env_with_channels(
+                agent_dir,
+                *config,
+                session_cwd.clone(),
+                ic.delivery_channel(),
+                ic.clarify_channel(),
+                ic.steer_channel(),
+            ),
+            None => cyrup_ext_subagents::extension::subagent_extension_for_env(
+                agent_dir,
+                *config,
+                session_cwd.clone(),
+            ),
+        },
     };
     if let Some(ext) = subagent_ext {
         builder = builder.with_native_extension(ext);
@@ -137,10 +188,21 @@ fn attach_native_extensions(
     // `CYRUP_SUBAGENT_TOOL_BUDGET` does not decode — pi's `decodeToolBudgetEnv` throws out of
     // `registerSubagentPromptRuntime` (`pi-subagents` v0.64.0
     // `src/runs/shared/subagent-prompt-runtime.ts:693`, `tool-budget.ts:74-80`) and its loader
-    // discards the extension. Carrying the error out of the launch path is how this process
-    // declines to run a child whose budget was silently removed; the message is pi's own.
-    let prompt_runtime = cyrup_ext_subagents::prompt_runtime::prompt_runtime_extension_for_env()
-        .map_err(|e| anyhow::anyhow!("building the subagent prompt runtime: {e}"))?;
+    // discards the extension. The refusal QUARANTINES the one extension here too, which is that
+    // discard; the message is pi's own.
+    let prompt_runtime =
+        match cyrup_ext_subagents::prompt_runtime::prompt_runtime_extension_for_env() {
+            Ok(runtime) => runtime,
+            Err(refusal) => {
+                builder = quarantine(
+                    builder,
+                    cyrup_ext_subagents::prompt_runtime::PROMPT_RUNTIME_EXTENSION_ID,
+                    cyrup_ext::QuarantinedTier::Ambient,
+                    &refusal,
+                );
+                None
+            }
+        };
     if let Some(runtime) = prompt_runtime {
         builder = builder.with_native_extension(runtime);
     }
@@ -159,6 +221,97 @@ fn attach_native_extensions(
         builder = builder.with_native_extension(ext);
     }
     Ok(builder)
+}
+
+/// Replace the native built-in `id` with [`cyrup_ext::QuarantinedNative`] carrying `reason`, so a
+/// built-in that REFUSED to be built costs this launch that one extension and nothing else.
+///
+/// # Upstream's blast radius, which this restores
+///
+/// pi runs every extension factory inside a `try`. A factory that throws is `load.discard()`ed,
+/// the loader records `Failed to load extension: <message>` and the loop CONTINUES to the next
+/// extension (`initializeExtension` + `loadExtension`'s catch,
+/// `pi/packages/coding-agent/src/core/extensions/loader.ts:613-630`, `:655` @v1.0.1; the
+/// inline tier has the same catch at `core/resource-loader.ts:1130-1141`). The session is built,
+/// without that extension; `main.ts:914-922` then reports the recorded error and exits 1.
+///
+/// Both of cyrup's refusing built-ins — the subagents extension whose `config.json` declared a
+/// policy it will not run without (SUBA-166) and the subagent prompt runtime whose tool-budget
+/// payload does not decode (CFG-080) — decline BEFORE the extension object exists, so there is no
+/// factory for the loader to catch. Carrying the error out of this function instead (which is what
+/// both arms did) aborted the entire launch: no session, and not one of the other six built-ins
+/// attempted. That traded a fail-open for a strictly worse failure, since an ordinary typo in a
+/// hand-edited `config.json` is not evidence of a tampered environment.
+///
+/// The placeholder is that missing throw. It registers nothing — `discard()` is therefore exact —
+/// and fails `init`, which is the ONE path `cyrup-session-svc`'s build loop already treats as pi's
+/// per-extension load failure (EXT-S01): the diagnostic lands on `StartupDiagnostics::extensions`
+/// for the interactive `[Extension issues]` panel AND on `AgentSessionRuntime::diagnostics()` as a
+/// fatal `Failed to load extension "<id>": <reason>`, which the bin reports and exits 1 on in
+/// every mode. So the refusal still refuses — SUBA-166's config is still not loaded and CFG-080's
+/// child still does not run — and it now refuses the way upstream does, through the same channel
+/// every other extension-load failure already uses, with the other built-ins still attached.
+fn quarantine(
+    builder: SessionFactory,
+    id: &str,
+    tier: cyrup_ext::QuarantinedTier,
+    reason: &dyn std::fmt::Display,
+) -> SessionFactory {
+    let reason = reason.to_string();
+    tracing::error!(
+        extension = %id,
+        reason = %reason,
+        "native built-in quarantined: it refused to be built"
+    );
+    builder.with_native_extension(Arc::new(cyrup_ext::QuarantinedNative::new(
+        cyrup_core::ExtensionId::from(id),
+        reason,
+        tier,
+    )) as Arc<dyn cyrup_ext::NativeExtension>)
+}
+
+/// What this process attaches for the SubAgents built-in — the three outcomes upstream's
+/// registration distinguishes, named rather than folded into one `Option` whose `None` would mean
+/// two unrelated things (`docs/RUST-DESIGN-REVIEW.md`, "Explicit domain enums").
+enum SubagentAttachment {
+    /// The gate declined: a plain subagent child, or a top-level session that never opted in.
+    /// Upstream's `registerSubagentExtension` returns on the child flag
+    /// (`pi-subagents/src/extension/index.ts:315-317` @v0.75.0) BEFORE it calls `loadConfig()`
+    /// (`:325`), so such a process never opens `config.json` and can never be refused over it.
+    /// That ordering is why this variant exists at all rather than being `Configured`'s absence.
+    Unregistered,
+    /// The gate passed and the tier-3 `config.json` loaded (or was absent, which is the
+    /// all-defaults case). Build the extension with it.
+    ///
+    /// `Box`ed because the config is ~1.6 KiB and the other two variants are tiny — every
+    /// `SubagentAttachment` the launch path moves would otherwise carry that much stack
+    /// (`clippy::large_enum_variant`).
+    Configured(Box<cyrup_ext_subagents::registration::SubagentExtensionConfig>),
+    /// SUBA-166: the gate passed, and the `config.json` was REFUSED — it failed validation while
+    /// declaring a policy key, so the built-in declines to run with the defaults in its place.
+    Refused(crate::subagent_config::RefusedSubagentConfig),
+}
+
+/// Resolve [`SubagentAttachment`]: the attach `gate` is consulted FIRST and the tier-3
+/// `config.json` is read only when it passed — upstream's order
+/// (`pi-subagents/src/extension/index.ts:315-317` then `:325` @v0.75.0), and the reason
+/// [`SubagentAttachment::Unregistered`] is a variant of its own rather than `Configured`'s absence.
+///
+/// `gate` is passed in rather than read from the environment here so the ordering is provable
+/// without a process-global `std::env::set_var` (which is `unsafe`, and forbidden in this
+/// workspace): the one caller supplies
+/// [`cyrup_ext_subagents::extension::registration_mode_for_env`].
+fn subagent_attachment(
+    dirs: &ConfigDirs,
+    gate: Option<cyrup_ext_subagents::extension::RegistrationMode>,
+) -> SubagentAttachment {
+    if gate.is_none() {
+        return SubagentAttachment::Unregistered;
+    }
+    match crate::subagent_config::load_subagent_extension_config(dirs) {
+        Ok(config) => SubagentAttachment::Configured(Box::new(config)),
+        Err(refusal) => SubagentAttachment::Refused(refusal),
+    }
 }
 
 /// Build the [`SessionFactory`] every mode launches from: the shared prefix plus
@@ -737,11 +890,15 @@ mod tests {
     // `with_native_extension` line in `attach_native_extensions` fails every one of them.
     // ============================================================================================
 
+    use std::path::Path;
     use std::sync::Arc;
 
     use cyrup_provider::Provider;
     use cyrup_provider::faux::FauxProvider;
-    use cyrup_session_svc::{AgentSession, SessionConfig, TrustPromptFn};
+    use cyrup_session_svc::{
+        AgentSession, AgentSessionRuntime, RuntimeDiagnostic, SessionConfig, SessionFactory,
+        TrustPromptFn,
+    };
 
     use super::build_factory;
 
@@ -774,27 +931,28 @@ mod tests {
         listed: Vec<String>,
     }
 
-    /// Build a session exactly as a mode arm does — through `build_factory` — over the faux
-    /// provider in a hermetic temp home. `interactive` selects the one thing the three arms differ
-    /// by in this function: whether a `trust_prompt` is supplied.
-    async fn session_through_build_factory(interactive: bool, no_extensions: bool) -> Loaded {
-        let tmp = tempfile::tempdir().unwrap();
-        let cwd = tmp.path().join("project");
-        let agent_dir = tmp.path().join("agent");
-        std::fs::create_dir_all(&cwd).unwrap();
-        std::fs::create_dir_all(&agent_dir).unwrap();
+    /// The factory a mode arm would build over `agent_dir` + `cwd`, and the target to build it at.
+    /// Shared by [`session_through_build_factory`] (which is handed a throwaway home) and by the
+    /// quarantine tests, which have to PREPARE that home — write a `subagents/config.json` into it
+    /// — before the factory is built.
+    fn factory_at(
+        agent_dir: &Path,
+        cwd: &Path,
+        interactive: bool,
+        no_extensions: bool,
+    ) -> (Arc<SessionFactory>, cyrup_session_svc::SessionTarget) {
         let env = cyrup_config::EnvVars {
-            home: Some(agent_dir.clone()),
+            home: Some(agent_dir.to_path_buf()),
             ..cyrup_config::EnvVars::default()
         };
         let overrides = cyrup_config::CliConfigOverrides {
-            agent_dir: Some(agent_dir.clone()),
-            cwd: Some(cwd.clone()),
+            agent_dir: Some(agent_dir.to_path_buf()),
+            cwd: Some(cwd.to_path_buf()),
             ..Default::default()
         };
         let dirs = cyrup_config::ConfigDirs::resolve(&overrides, &env).unwrap();
 
-        let mut config = SessionConfig::new(cwd, agent_dir.clone());
+        let mut config = SessionConfig::new(cwd.to_path_buf(), agent_dir.to_path_buf());
         config.persist = false;
         config.trust_override = Some(true);
         config.no_extensions = no_extensions;
@@ -811,6 +969,19 @@ mod tests {
             interactive.then(never_asked_trust_prompt),
         )
         .unwrap();
+        (factory, target)
+    }
+
+    /// Build a session exactly as a mode arm does — through `build_factory` — over the faux
+    /// provider in a hermetic temp home. `interactive` selects the one thing the three arms differ
+    /// by in this function: whether a `trust_prompt` is supplied.
+    async fn session_through_build_factory(interactive: bool, no_extensions: bool) -> Loaded {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path().join("project");
+        let agent_dir = tmp.path().join("agent");
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        let (factory, target) = factory_at(&agent_dir, &cwd, interactive, no_extensions);
         let session: AgentSession = factory.build(target, None).await.unwrap();
 
         let loaded = session
@@ -904,60 +1075,78 @@ mod tests {
     /// this test binary with the variable in its environment, running [`llama_child_probe`] as the
     /// body. The child runs under a deadline and is killed when it passes it, so a wedged child
     /// fails this test instead of hanging the suite.
-    #[test]
-    fn a_subagent_child_treats_llama_like_the_other_ambient_natives() {
+    /// Re-execute THIS test binary to run the `#[ignore]`d test `probe` with `env` set, and insist
+    /// that it both succeeded and printed `marker`.
+    ///
+    /// The environment is process-global and `std::env::set_var` is `unsafe` (forbidden in this
+    /// workspace), so every launch decision that reads a variable is proven the way a real process
+    /// gets it: in a child with that variable in its environment. The child runs under a deadline
+    /// and is killed when it passes it, so a wedged child fails its test instead of hanging the
+    /// suite; the marker is insisted on so a filter that matched NOTHING cannot pass for a probe
+    /// that ran.
+    fn run_env_probe(probe: &str, env: &[(&str, &str)], marker: &str) {
         use std::io::Read as _;
         use std::process::Stdio;
 
         const DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
+        let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+        cmd.args([
+            "--exact",
+            "--ignored",
+            probe,
+            "--nocapture",
+            "--test-threads=1",
+        ]);
+        for (key, value) in env {
+            cmd.env(key, value);
+        }
+        let mut child = cmd
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        // Drained on their own threads, so a chatty child cannot fill a pipe and stall.
+        let drain = |mut pipe: Box<dyn std::io::Read + Send>| {
+            std::thread::spawn(move || {
+                let mut text = String::new();
+                let _ = pipe.read_to_string(&mut text);
+                text
+            })
+        };
+        let stdout = drain(Box::new(child.stdout.take().unwrap()));
+        let stderr = drain(Box::new(child.stderr.take().unwrap()));
+        let started = std::time::Instant::now();
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break Some(status);
+            }
+            if started.elapsed() > DEADLINE {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        let stdout = stdout.join().unwrap();
+        let stderr = stderr.join().unwrap();
+        assert!(
+            status.is_some(),
+            "probe `{probe}` {env:?} did not finish within {DEADLINE:?} and was killed\n\
+             --- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+        );
+        assert!(
+            status.is_some_and(|s| s.success()) && stdout.contains(marker),
+            "probe `{probe}` {env:?} failed\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+        );
+    }
+
+    #[test]
+    fn a_subagent_child_treats_llama_like_the_other_ambient_natives() {
         for probe in ["keep", "no-extensions"] {
-            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "--ignored",
-                    "session_launch::tests::llama_child_probe",
-                    "--nocapture",
-                    "--test-threads=1",
-                ])
-                .env(CHILD_ENV, "1")
-                .env(PROBE_ENV, probe)
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .unwrap();
-            // Drained on their own threads, so a chatty child cannot fill a pipe and stall.
-            let drain = |mut pipe: Box<dyn std::io::Read + Send>| {
-                std::thread::spawn(move || {
-                    let mut text = String::new();
-                    let _ = pipe.read_to_string(&mut text);
-                    text
-                })
-            };
-            let stdout = drain(Box::new(child.stdout.take().unwrap()));
-            let stderr = drain(Box::new(child.stderr.take().unwrap()));
-            let started = std::time::Instant::now();
-            let status = loop {
-                if let Some(status) = child.try_wait().unwrap() {
-                    break Some(status);
-                }
-                if started.elapsed() > DEADLINE {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    break None;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(20));
-            };
-            let stdout = stdout.join().unwrap();
-            let stderr = stderr.join().unwrap();
-            assert!(
-                status.is_some(),
-                "child probe `{probe}` did not finish within {DEADLINE:?} and was killed\n\
-                 --- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
-            );
-            assert!(
-                status.is_some_and(|s| s.success())
-                    && stdout.contains(&format!("llama-probe-ok:{probe}")),
-                "child probe `{probe}` failed\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+            run_env_probe(
+                "session_launch::tests::llama_child_probe",
+                &[(CHILD_ENV, "1"), (PROBE_ENV, probe)],
+                &format!("llama-probe-ok:{probe}"),
             );
         }
     }
@@ -1021,5 +1210,409 @@ mod tests {
 
         // An empty scope yields nothing to pick.
         assert!(pick_scoped_active_model(&[], Some("openai"), Some("gpt-4o")).is_none());
+    }
+
+    // ============================================================================================
+    // SUBA-166's blast radius — a native built-in that REFUSES to be built is quarantined, not
+    // carried out of the launch path.
+    //
+    // `load_subagent_extension_config` refuses a `config.json` that failed validation while
+    // declaring a policy key, and that refusal used to leave `attach_native_extensions` as an
+    // `anyhow::Error`: no session at all, and not one of the other six built-ins attempted. pi
+    // loses the one extension — the factory's throw is caught, `load.discard()`ed and recorded as
+    // `Failed to load extension: <message>`
+    // (`pi/packages/coding-agent/src/core/extensions/loader.ts:613-630`, `:655` @v1.0.1) —
+    // and the session is built without it.
+    //
+    // Every test here drives the production seam, `build_factory`, and reads what the extension
+    // host actually loaded plus the diagnostics the bin's checkpoint consumes.
+    // ============================================================================================
+
+    /// The subagents built-in's own id (`cyrup_ext_subagents::extension::EXTENSION_ID`) — the key
+    /// the quarantine placeholder carries, and therefore the one the diagnostic names.
+    const SUBAGENTS_ID: &str = cyrup_ext_subagents::extension::EXTENSION_ID;
+
+    /// Write `<agent_dir>/subagents/config.json`. Its mere PRESENCE is the extension's install
+    /// signal (`cyrup_ext_subagents::extension::is_installed`), so every case below actually
+    /// reaches the subagents arm of the attach point instead of the opt-out.
+    fn write_subagents_config(agent_dir: &Path, json: &str) {
+        let dir = agent_dir.join("subagents");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("config.json"), json).unwrap();
+    }
+
+    /// A hermetic agent dir + project, prepared with `config.json`, built through `build_factory`
+    /// and then through `AgentSessionRuntime::create` — the real launch sequence — returning the
+    /// ids the host loaded and the diagnostics `report_runtime_diagnostics` reads in every mode.
+    async fn launch_with_subagents_config(json: &str) -> (Vec<String>, Vec<RuntimeDiagnostic>) {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path().join("project");
+        let agent_dir = tmp.path().join("agent");
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        write_subagents_config(&agent_dir, json);
+        let (factory, target) = factory_at(&agent_dir, &cwd, false, false);
+        let runtime = AgentSessionRuntime::create(factory, target)
+            .await
+            .expect("a refused subagents config must not abort the launch");
+        let diagnostics = runtime.diagnostics().await;
+        let loaded = runtime
+            .session()
+            .await
+            .services()
+            .ext_host
+            .loaded_ids()
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        (loaded, diagnostics)
+    }
+
+    /// A `config.json` that fails validation AND declares `authorityPolicy` — pi's #2624 scenario,
+    /// the one SUBA-166 ported. The typo'd `stopRuns` action means the file cannot be honoured, and
+    /// `authorityPolicy` means the all-defaults config must not stand in for it.
+    const REFUSED_CONFIG: &str =
+        r#"{"maxSubagentDepth": 5, "authorityPolicy": {"stopRuns": "allow"}}"#;
+    /// The same file with the typo fixed: valid, policy-declaring, loads.
+    const ACCEPTED_CONFIG: &str =
+        r#"{"maxSubagentDepth": 5, "authorityPolicy": {"stopRun": "forbid"}}"#;
+
+    /// THE headline. The refusal still refuses — the subagents extension is ABSENT, so the
+    /// built-in defaults never stand in for the operator's `authorityPolicy` (SUBA-166 intact) —
+    /// and it costs this launch that one extension and nothing else: the session is built, and the
+    /// loaded set is EXACTLY the clean launch's set minus `subagents`.
+    ///
+    /// Asserting against the clean launch rather than a hardcoded id list is what makes "the other
+    /// native extensions still attach" provable without a literal that can drift: llama.cpp, the
+    /// MCP adapter and flux are all in there because the clean run loaded them.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_refused_subagents_config_costs_the_launch_only_that_extension() {
+        let (clean, clean_diags) = launch_with_subagents_config(ACCEPTED_CONFIG).await;
+        assert!(
+            clean.iter().any(|i| i == SUBAGENTS_ID),
+            "the control launch must actually attach subagents, or this test proves nothing; got {clean:?}"
+        );
+        assert!(
+            clean_diags.is_empty(),
+            "a valid policy-declaring config is not a diagnostic: {clean_diags:?}"
+        );
+
+        let (refused, _) = launch_with_subagents_config(REFUSED_CONFIG).await;
+        let expected: Vec<String> = clean
+            .iter()
+            .filter(|i| i.as_str() != SUBAGENTS_ID)
+            .cloned()
+            .collect();
+        assert_eq!(
+            refused, expected,
+            "a refused config must quarantine subagents and NOTHING else (clean: {clean:?})"
+        );
+    }
+
+    /// The other half: the refusal is REPORTED, through the same channel every other
+    /// extension-load failure uses, in pi's own message shape and marked fatal so the bin reports
+    /// it and exits 1 in every mode (`main.ts:914-922`). A silent quarantine would pass the test
+    /// above and be strictly worse than the launch abort it replaces.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_refusal_is_reported_as_pis_own_fatal_extension_load_failure() {
+        let (_, diags) = launch_with_subagents_config(REFUSED_CONFIG).await;
+        let errors: Vec<&RuntimeDiagnostic> =
+            diags.iter().filter(|d| d.severity == "error").collect();
+        assert_eq!(
+            errors.len(),
+            1,
+            "expected exactly one fatal diagnostic, got {diags:?}"
+        );
+        let only = errors.first().expect("one error");
+        assert_eq!(only.source.as_deref(), Some("extension"));
+        assert!(
+            only.message
+                .starts_with("Failed to load extension \"subagents\": "),
+            "pi's shape is `Failed to load extension \"<path>\": <err>` (main.ts:736-737); got {}",
+            only.message
+        );
+        // The refusal's own sentence survives the frame, naming the file, the bad value and the
+        // policy key — a diagnostic that only said "subagents failed" would not let an operator
+        // fix the typo.
+        for needle in [
+            "config.json",
+            "stopRuns",
+            "authorityPolicy",
+            "must not be silently discarded",
+        ] {
+            assert!(
+                only.message.contains(needle),
+                "the refusal's message is carried verbatim; `{needle}` is missing from {}",
+                only.message
+            );
+        }
+    }
+
+    // ============================================================================================
+    // The same quarantine at the SAME attach point, for the intercom built-in.
+    //
+    // Upstream's intercom factory opens with `loadConfig()` and `getAskTimeoutMs()`
+    // (`pi-intercom/index.ts:647-649` @v0.16.0), both of which THROW on bad input
+    // (`config.ts:98-159` and `:18`). They throw from inside the default-exported factory, which is
+    // the body pi's loader wraps in `try` — so a malformed intercom config costs upstream that one
+    // extension and nothing else. cyrup carried the error out of `attach_native_extensions`
+    // instead, aborting the entire launch.
+    // ============================================================================================
+
+    /// The intercom built-in's own id, as the placeholder carries it.
+    const INTERCOM_ID: &str = cyrup_intercom::EXTENSION_ID;
+
+    /// Write `<agent_dir>/intercom/config.json`. As with subagents, its mere PRESENCE is the
+    /// install signal (`cyrup_intercom::extension::is_installed` is
+    /// `env_truthy(INSTALL_ENV_VAR) || config_path(..).exists()`), so one file both opts the
+    /// extension in and supplies the bad input — the control and the refusal differ only in the
+    /// file's CONTENTS, never in whether intercom was reachable at all.
+    async fn launch_with_intercom_config(json: &str) -> (Vec<String>, Vec<RuntimeDiagnostic>) {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path().join("project");
+        let agent_dir = tmp.path().join("agent");
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        let dir = agent_dir.join("intercom");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("config.json"), json).unwrap();
+        let (factory, target) = factory_at(&agent_dir, &cwd, false, false);
+        let runtime = AgentSessionRuntime::create(factory, target)
+            .await
+            .expect("a malformed intercom config must not abort the launch");
+        let diagnostics = runtime.diagnostics().await;
+        let loaded = runtime
+            .session()
+            .await
+            .services()
+            .ext_host
+            .loaded_ids()
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        (loaded, diagnostics)
+    }
+
+    /// Unparseable JSON — `load_config`'s `parse_config` arm, which carries pi's path-prefixed
+    /// message (`config.ts:94-96`'s catch).
+    const REFUSED_INTERCOM_CONFIG: &str = "{ this is not valid json";
+    /// The same file, valid. `enabled` defaults to `true` (`config.rs:118`), so this both installs
+    /// and enables intercom and the control actually attaches it.
+    const ACCEPTED_INTERCOM_CONFIG: &str = r#"{"confirmSend": true}"#;
+
+    /// The intercom headline, built the same way as the subagents one: the loaded set after the
+    /// refusal is EXACTLY the control launch's set minus `cyrup-intercom`.
+    ///
+    /// Before the fix this test could not even reach its assertions — `AgentSessionRuntime::create`
+    /// returned `Err`, because the refusal propagated out of `attach_native_extensions` and there
+    /// was no session at all.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_malformed_intercom_config_costs_the_launch_only_that_extension() {
+        let (clean, clean_diags) = launch_with_intercom_config(ACCEPTED_INTERCOM_CONFIG).await;
+        assert!(
+            clean.iter().any(|i| i == INTERCOM_ID),
+            "the control launch must actually attach intercom, or this test proves nothing; got {clean:?}"
+        );
+        assert!(
+            clean_diags.is_empty(),
+            "a valid intercom config is not a diagnostic: {clean_diags:?}"
+        );
+
+        let (refused, _) = launch_with_intercom_config(REFUSED_INTERCOM_CONFIG).await;
+        let expected: Vec<String> = clean
+            .iter()
+            .filter(|i| i.as_str() != INTERCOM_ID)
+            .cloned()
+            .collect();
+        assert_eq!(
+            refused, expected,
+            "a malformed intercom config must quarantine intercom and NOTHING else (clean: {clean:?})"
+        );
+    }
+
+    /// The reporting half. A silent quarantine would pass the test above while losing the operator's
+    /// only clue, and would be strictly worse than the launch abort it replaces.
+    ///
+    /// The message must still name the config's PATH, because that is the whole point of `ICOM-044`
+    /// (a malformed config errors with the path rather than failing closed silently) and the
+    /// quarantine must not undo it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_intercom_refusal_is_reported_as_pis_own_fatal_extension_load_failure() {
+        let (_, diags) = launch_with_intercom_config(REFUSED_INTERCOM_CONFIG).await;
+        let errors: Vec<&RuntimeDiagnostic> =
+            diags.iter().filter(|d| d.severity == "error").collect();
+        assert_eq!(
+            errors.len(),
+            1,
+            "expected exactly one fatal diagnostic, got {diags:?}"
+        );
+        let only = errors.first().expect("one error");
+        assert_eq!(only.source.as_deref(), Some("extension"));
+        assert!(
+            only.message
+                .starts_with(&format!("Failed to load extension \"{INTERCOM_ID}\": ")),
+            "pi's shape is `Failed to load extension \"<id>\": <err>`; got {}",
+            only.message
+        );
+        for needle in ["Failed to load intercom config at", "config.json"] {
+            assert!(
+                only.message.contains(needle),
+                "ICOM-044's path-naming message is carried verbatim; `{needle}` is missing from {}",
+                only.message
+            );
+        }
+    }
+
+    /// SUBA-166's OTHER arm, unweakened: a bad-but-present `config.json` that declares NO
+    /// fail-closed key still warns and defaults (pi's `console.error` + `return {}`,
+    /// `extension/config.ts:238` @v0.75.0), so the extension attaches and nothing is quarantined.
+    /// This is the control that keeps "quarantine the refusal" from degrading into "quarantine
+    /// every imperfect config".
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_invalid_config_declaring_no_policy_key_still_attaches_the_extension() {
+        let (loaded, diags) =
+            launch_with_subagents_config(r#"{"maxSubagentDepth": 5, "artifactDir": "nowhere"}"#)
+                .await;
+        assert!(
+            loaded.iter().any(|i| i == SUBAGENTS_ID),
+            "no fail-closed key is declared, so warn-and-default still applies; got {loaded:?}"
+        );
+        assert!(
+            !diags.iter().any(|d| d.severity == "error"),
+            "warn-and-default is not an extension-load failure: {diags:?}"
+        );
+    }
+
+    /// The gate runs BEFORE the config is read, which is upstream's order:
+    /// `registerSubagentExtension` returns on the child flag
+    /// (`pi-subagents/src/extension/index.ts:315-317` @v0.75.0) and only then calls `loadConfig()`
+    /// (`:325`). A process that registers nothing never opens the file, so it can never be
+    /// quarantined over it — otherwise a plain subagent child would be killed by a typo in its
+    /// PARENT's config, a file it was never going to read.
+    ///
+    /// Driven through `subagent_attachment` with the gate supplied explicitly, because the real
+    /// gate reads `CYRUP_SUBAGENT_CHILD` from the process environment and `std::env::set_var` is
+    /// `unsafe` (forbidden in this workspace).
+    #[test]
+    fn the_attach_gate_is_consulted_before_the_config_is_read() {
+        use cyrup_ext_subagents::extension::RegistrationMode;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let agent_dir = tmp.path().join("agent");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        write_subagents_config(&agent_dir, REFUSED_CONFIG);
+        let env = cyrup_config::EnvVars {
+            home: Some(agent_dir.clone()),
+            ..cyrup_config::EnvVars::default()
+        };
+        let overrides = cyrup_config::CliConfigOverrides {
+            agent_dir: Some(agent_dir.clone()),
+            cwd: Some(tmp.path().join("project")),
+            ..Default::default()
+        };
+        let dirs = cyrup_config::ConfigDirs::resolve(&overrides, &env).unwrap();
+
+        // The gate declined (a plain subagent child): the file is not read and nothing is
+        // quarantined, even though that very file WOULD be refused.
+        assert!(
+            matches!(
+                super::subagent_attachment(&dirs, None),
+                super::SubagentAttachment::Unregistered
+            ),
+            "a process that registers nothing must not be refused over a config it never reads"
+        );
+        // The same file, with the gate passing: refused.
+        assert!(
+            matches!(
+                super::subagent_attachment(&dirs, Some(RegistrationMode::Full)),
+                super::SubagentAttachment::Refused(_)
+            ),
+            "the same config IS refused once the gate passes, so the case above is the gate's \
+             doing and not a file that loads"
+        );
+    }
+
+    /// CFG-080's refusal, through the same quarantine. `decode_tool_budget_env` rejects an
+    /// unauthorised `{"hard":0}` payload (`tool_budget.rs`, pi `tool-budget.ts:74-80` @v0.64.0),
+    /// which used to leave `attach_native_extensions` as an `anyhow::Error` and take the launch
+    /// with it. pi's `decodeToolBudgetEnv` throws out of `registerSubagentPromptRuntime`
+    /// (`subagent-prompt-runtime.ts:693`) and its loader loses that ONE extension.
+    ///
+    /// The refusal is not weakened: the budgeted child still cannot run with its budget silently
+    /// removed, because the prompt runtime is absent and the diagnostic is fatal.
+    ///
+    /// Env-driven, so it runs in a re-executed child — see [`run_env_probe`].
+    #[test]
+    fn an_undecodable_tool_budget_quarantines_only_the_prompt_runtime() {
+        run_env_probe(
+            "session_launch::tests::tool_budget_quarantine_probe",
+            &[(
+                cyrup_ext_subagents::exec::tool_budget::TOOL_BUDGET_ENV,
+                r#"{"hard":0}"#,
+            )],
+            "tool-budget-quarantine-ok",
+        );
+    }
+
+    /// The body of the probe above. `#[ignore]`d so an ordinary run cannot count a vacuous pass,
+    /// and inert unless the variable it is about is actually set.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "re-executed by an_undecodable_tool_budget_quarantines_only_the_prompt_runtime"]
+    async fn tool_budget_quarantine_probe() {
+        let budget = cyrup_ext_subagents::exec::tool_budget::TOOL_BUDGET_ENV;
+        let Ok(payload) = std::env::var(budget) else {
+            return;
+        };
+        assert_eq!(payload, r#"{"hard":0}"#, "the probe's own payload");
+
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path().join("project");
+        let agent_dir = tmp.path().join("agent");
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        // No `subagents/config.json`: the subagents extension is not installed here, so the only
+        // refusing built-in in this launch is the prompt runtime.
+        let (factory, target) = factory_at(&agent_dir, &cwd, false, false);
+        // Before the quarantine this `build_factory` returned `Err` and the line above panicked.
+        let runtime = AgentSessionRuntime::create(factory, target)
+            .await
+            .expect("an undecodable tool budget must not abort the launch");
+
+        let loaded: Vec<String> = runtime
+            .session()
+            .await
+            .services()
+            .ext_host
+            .loaded_ids()
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        let runtime_id = cyrup_ext_subagents::prompt_runtime::PROMPT_RUNTIME_EXTENSION_ID;
+        assert!(
+            !loaded.iter().any(|i| i == runtime_id),
+            "the prompt runtime must be absent, not built with the budget dropped; got {loaded:?}"
+        );
+        // The other built-ins are untouched — the whole point of the quarantine.
+        for id in [LLAMA_ID, MCP_ID] {
+            assert!(
+                loaded.iter().any(|i| i == id),
+                "{id} must still attach past the quarantine; got {loaded:?}"
+            );
+        }
+
+        let diags = runtime.diagnostics().await;
+        let errors: Vec<&RuntimeDiagnostic> =
+            diags.iter().filter(|d| d.severity == "error").collect();
+        assert_eq!(errors.len(), 1, "one fatal diagnostic, got {diags:?}");
+        let only = errors.first().expect("one error");
+        assert_eq!(
+            only.message,
+            format!(
+                "Failed to load extension \"{runtime_id}\": {budget}.hard must be an integer >= 1."
+            ),
+            "pi's frame around pi's own message"
+        );
+        assert_eq!(only.source.as_deref(), Some("extension"));
+        println!("tool-budget-quarantine-ok");
     }
 }

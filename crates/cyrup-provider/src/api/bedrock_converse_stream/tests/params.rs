@@ -24,12 +24,131 @@ fn adaptive_models_send_adaptive_thinking_and_an_effort() {
         let fields = &body["additionalModelRequestFields"];
         assert_eq!(
             fields["thinking"],
-            json!({ "type": "adaptive", "display": "summarized" }),
+            json!({
+                "type": "adaptive",
+                "display": "summarized",
+                "block_binding": { "prefix_mismatch_behavior": "drop_block" },
+            }),
             "{id}"
         );
         assert_eq!(fields["output_config"], json!({ "effort": "high" }), "{id}");
-        assert!(fields.get("anthropic_beta").is_none(), "{id}");
+        assert_eq!(
+            fields["anthropic_beta"],
+            json!([THINKING_BINDING_CONTROLS_BETA]),
+            "{id}"
+        );
+        assert!(
+            !fields["anthropic_beta"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|b| b == INTERLEAVED_THINKING_BETA),
+            "the interleaved beta must stay off the adaptive branch: {id}"
+        );
     }
+}
+
+/// PROV-130 — pi `supportsThinkingBlockBinding` (`bedrock-converse-stream.ts:792-806` @v1.0.1)
+/// and `useBlockBinding` (`:1266`). The GATE matters as much as the field: Opus 4.6 and Sonnet 4.6
+/// support adaptive thinking but reject `thinking.block_binding` outright, and GovCloud is skipped
+/// like `display`.
+#[test]
+fn thinking_block_binding_rides_only_the_adaptive_models_that_accept_it() {
+    let opts = opts_with_reasoning(ModelThinkingLevel::High);
+    let binding = json!({ "prefix_mismatch_behavior": "drop_block" });
+
+    // Accepts the field: the five needles upstream matches.
+    for (id, name) in [
+        ("global.anthropic.claude-opus-4-7-v1", "Claude Opus 4.7"),
+        ("global.anthropic.claude-opus-4-8-v1", "Claude Opus 4.8"),
+        ("global.anthropic.claude-opus-5", "Claude Opus 5"),
+        ("global.anthropic.claude-sonnet-5", "Claude Sonnet 5"),
+        ("global.anthropic.claude-fable-5", "Claude Fable 5"),
+    ] {
+        let fields = payload(
+            &model_with(id, name),
+            &user_ctx("Hello"),
+            &opts,
+            &BedrockOptions::default(),
+        )["additionalModelRequestFields"]
+            .clone();
+        assert_eq!(fields["thinking"]["block_binding"], binding, "{id}");
+        assert_eq!(
+            fields["anthropic_beta"],
+            json!([THINKING_BINDING_CONTROLS_BETA]),
+            "{id}"
+        );
+    }
+
+    // MIRROR: adaptive but REJECTS the field — Opus 4.6 and Sonnet 4.6 400 on it.
+    for (id, name) in [
+        ("global.anthropic.claude-opus-4-6-v1", "Claude Opus 4.6"),
+        ("global.anthropic.claude-sonnet-4-6-v1", "Claude Sonnet 4.6"),
+    ] {
+        let fields = payload(
+            &model_with(id, name),
+            &user_ctx("Hello"),
+            &opts,
+            &BedrockOptions::default(),
+        )["additionalModelRequestFields"]
+            .clone();
+        assert_eq!(
+            fields["thinking"],
+            json!({ "type": "adaptive", "display": "summarized" }),
+            "{id} must carry no block_binding"
+        );
+        assert!(
+            fields.get("anthropic_beta").is_none(),
+            "{id} must carry no binding beta"
+        );
+    }
+
+    // MIRROR: GovCloud skips the field even on a model that accepts it — by region...
+    let gov_region = BedrockOptions {
+        region: Some("us-gov-west-1".to_string()),
+        ..Default::default()
+    };
+    let fields =
+        payload(&opus_48(), &user_ctx("Hello"), &opts, &gov_region)["additionalModelRequestFields"]
+            .clone();
+    assert_eq!(fields["thinking"], json!({ "type": "adaptive" }));
+    assert!(fields.get("anthropic_beta").is_none());
+
+    // ...and by `us-gov.` model-id prefix.
+    let fields = payload(
+        &model_with("us-gov.anthropic.claude-opus-4-8-v1", "Claude Opus 4.8"),
+        &user_ctx("Hello"),
+        &opts,
+        &BedrockOptions::default(),
+    )["additionalModelRequestFields"]
+        .clone();
+    assert_eq!(fields["thinking"], json!({ "type": "adaptive" }));
+    assert!(fields.get("anthropic_beta").is_none());
+}
+
+/// PROV-130 mirror: the budget-based branch never gets `block_binding`, even on a model whose id
+/// matches the needle list — upstream adds it to the adaptive branch only.
+#[test]
+fn the_budget_based_branch_never_carries_block_binding() {
+    let opts = opts_with_reasoning(ModelThinkingLevel::High);
+    // Sonnet 4.5 is budget-based: not in `supports_adaptive_thinking`'s needle list.
+    let fields = payload(
+        &sonnet_45(),
+        &user_ctx("Hello"),
+        &opts,
+        &BedrockOptions::default(),
+    )["additionalModelRequestFields"]
+        .clone();
+    assert!(
+        fields["thinking"].get("block_binding").is_none(),
+        "budget branch must not bind: {}",
+        fields["thinking"]
+    );
+    assert_eq!(
+        fields["anthropic_beta"],
+        json!([INTERLEAVED_THINKING_BETA]),
+        "the budget branch keeps the interleaved beta alone"
+    );
 }
 
 #[test]
@@ -97,7 +216,8 @@ fn govcloud_omits_the_thinking_display_field() {
         json!({ "type": "adaptive" })
     );
 
-    // MIRROR: the same adaptive model outside GovCloud keeps `display`.
+    // MIRROR: the same adaptive model outside GovCloud keeps `display` (and, per PROV-130,
+    // `block_binding`, which GovCloud drops alongside it).
     let body = payload(
         &opus_48(),
         &user_ctx("Hello"),
@@ -106,7 +226,11 @@ fn govcloud_omits_the_thinking_display_field() {
     );
     assert_eq!(
         body["additionalModelRequestFields"]["thinking"],
-        json!({ "type": "adaptive", "display": "summarized" })
+        json!({
+            "type": "adaptive",
+            "display": "summarized",
+            "block_binding": { "prefix_mismatch_behavior": "drop_block" },
+        })
     );
 }
 

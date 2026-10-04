@@ -212,6 +212,14 @@ fn fixture_with(direct_tools: bool) -> Fixture {
                     handshook.to_string_lossy(),
                 ],
                 "directTools": direct_tools,
+                // MCP-598 — `149fdf1` closes a server that is not RESIDENT the moment its
+                // catalogue is captured, and `resident` is
+                // `lifecycle !== "lazy" || effectiveIdleTimeout === 0` (`init.ts:361`). Every test
+                // in this file inspects the LIVE connection (`await_live_connection`), so the
+                // fixture has to declare the lifecycle that keeps one: a plain `lazy` server is
+                // discovered and then closed, which is correct upstream behaviour and not
+                // something a live-connection assertion can observe.
+                "lifecycle": "keep-alive",
             }
         }
     });
