@@ -277,6 +277,15 @@ fn persist_of(entry: CatalogEntry) -> ModelsPersist {
         match model {
             AnyModel::Chat(chat) => models.push(chat),
             AnyModel::Classifier(classifier) => classifiers.push(classifier),
+            // PROV-128 step (1) made `AnyModel::Image` representable. It is unreachable here:
+            // this entry is llama.cpp's own catalog refresh, which lists chat and classifier rows
+            // only (`CatalogEntry` is built by `refresh`, below). The store has no image channel
+            // either — cyrup splits pi's one `models: AnyModel[]` into a chat
+            // `ModelsStoreEntry.models` plus `read/write_classifier_models`
+            // (`models_store.rs:122-136`), and folding that split is PROV-128 step (2)/(3) and the
+            // open EXT-027 follow-up. Dropping an image row here is therefore the honest answer
+            // until that channel exists, not a silent loss on a live path.
+            AnyModel::Image(_) => {}
         }
     }
     ModelsPersist::Write {

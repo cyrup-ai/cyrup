@@ -19,6 +19,7 @@
 )]
 
 use crate::all_providers;
+use crate::auth::LoginOptions;
 use std::sync::Arc;
 
 fn oauth_by_id(id: &str) -> Option<Arc<dyn crate::auth::OAuthAuth>> {
@@ -182,7 +183,7 @@ async fn copilot_and_codex_logins_are_reachable_from_all_providers() {
         let interaction = crate::auth::oauth::ScriptedInteraction::new(vec![Err(
             crate::auth::oauth::OAuthError::Cancelled,
         )]);
-        let error = match oauth.login(&interaction).await {
+        let error = match oauth.login(&interaction, &LoginOptions::default()).await {
             Ok(_) => panic!("{id}: the cancelled probe must not produce a credential"),
             Err(error) => error,
         };

@@ -13,7 +13,7 @@ use crate::auth::types::ModelAuth;
 use crate::auth::{ApiKeyAuth, AuthContext, ProviderAuth};
 use crate::classifier::{
     AnyModel, ClassifierAnswer, ClassifierApiRegistry, ClassifierContext, ClassifierModel,
-    ClassifierOptions, ClassifierResult, OrderedMap, ProviderClassifier,
+    ClassifierOptions, ClassifierResult, ImageModel, OrderedMap, ProviderClassifier,
 };
 use crate::context::Context;
 use crate::error::AuthError;
@@ -55,6 +55,23 @@ pub(super) fn classifier_model(provider: &str, id: &str, api: &str) -> Classifie
         cost: ModelCost::default(),
         headers: None,
         context_window: 4096,
+    }
+}
+
+/// PROV-128 — an image row in v1.0.0's unified shape (`ImageModel`, types.ts:1144-1149):
+/// `BaseModel` plus `type: "image"` and a required `output` list. `output` includes `text` here so
+/// [`ImageModel::outputs_text`] has something to report.
+pub(super) fn image_model(provider: &str, id: &str, api: &str) -> ImageModel {
+    ImageModel {
+        id: id.into(),
+        name: format!("{id} (image)"),
+        api: api.into(),
+        provider: provider.into(),
+        base_url: "http://image.test/api/v1".into(),
+        input: vec![Modality::Text, Modality::Image],
+        output: vec![Modality::Text, Modality::Image],
+        cost: ModelCost::default(),
+        headers: None,
     }
 }
 

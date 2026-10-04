@@ -225,6 +225,9 @@ fn context_windows(entry: &Option<CatalogEntry>) -> Vec<u64> {
         .map(|model| match model {
             AnyModel::Chat(model) => model.context_window,
             AnyModel::Classifier(model) => model.context_window,
+            // PROV-128 added `AnyModel::Image`; an image row has no `contextWindow`
+            // (`BaseModel` has none, types.ts:1097-1108) and llama.cpp lists none.
+            AnyModel::Image(_) => 0,
         })
         .collect()
 }
@@ -304,6 +307,8 @@ fn get_all_models_lists_chat_models_then_classifier_twins_on_the_server_root() {
             let base_url = match model {
                 AnyModel::Chat(model) => model.base_url.as_str(),
                 AnyModel::Classifier(model) => model.base_url.as_str(),
+                // PROV-128 added `AnyModel::Image`; llama.cpp lists no image rows.
+                AnyModel::Image(model) => model.base_url.as_str(),
             };
             (model.id(), model.api().as_str(), base_url)
         })
@@ -844,7 +849,8 @@ async fn restore_keeps_only_llama_models_of_the_matching_api() {
     let mut entry = host.entry().unwrap();
     let kept_chat = match &entry.models[0] {
         AnyModel::Chat(model) => model.clone(),
-        AnyModel::Classifier(_) => panic!("chat first"),
+        // PROV-128 added `AnyModel::Image`; neither non-chat variant may appear first here.
+        AnyModel::Classifier(_) | AnyModel::Image(_) => panic!("chat first"),
     };
     let kept_classifier = entry.models[1].as_classifier().unwrap().clone();
 

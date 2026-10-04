@@ -28,6 +28,19 @@ pub(super) enum RBlock {
         /// Pi `item.namespace` (`openai-responses-shared.ts:491`, `:715`): read when the item
         /// opens and again on `output_item.done`, where a namespace can arrive alone.
         namespace: Option<String>,
+        /// PROV-116 — `slot.block.partialJson !== undefined`
+        /// (`openai-responses-shared.ts:714`, `:720`, `:769-773`).
+        ///
+        /// Upstream's `partialJson` is a *scratch* field that `output_item.done` **deletes** once
+        /// it has parsed the arguments out of it, so "the scratch buffer is still there" is
+        /// upstream's per-block "this call never finished" marker. cyrup's `partial_json` is the
+        /// block's only argument state (see above) and therefore survives finalization, so the
+        /// marker has to be carried explicitly instead of inferred from the buffer.
+        ///
+        /// It must be per-block and not per-slot: the failure this guards (`1b2aa0ca0`, #9974) is
+        /// a server that omits `output_index`, where two parallel calls share one slot key, so
+        /// removing the slot finishes at most one of them.
+        finished: bool,
     },
 }
 
@@ -54,6 +67,7 @@ pub(super) fn project_block(b: &RBlock) -> Content {
                 name,
                 partial_json,
                 namespace,
+                finished: _,
             } => Content::ToolCall(ToolCall {
                 id: ToolCallId::from(format!("{call_id}|{item_id}").as_str()),
                 name: name.clone(),

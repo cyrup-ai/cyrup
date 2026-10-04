@@ -10,13 +10,13 @@
 use std::sync::{Arc, Mutex};
 
 use super::classifier_support::{
-    LLAMA_API, RecordingClassifier, chat_model, classifier_model, empty_context,
+    LLAMA_API, RecordingClassifier, chat_model, classifier_model, empty_context, image_model,
 };
 use crate::classifier::{
     AnyModel, ClassifierAnswer, ClassifierApiRegistry, ClassifierContext, ClassifierModel,
     ClassifierOptions, ClassifierQuestion, ClassifierResult, ClassifierStopReason,
-    DEFAULT_MAX_RETRIES, DEFAULT_TEMPERATURE, KnownClassifierApi, ModelType, OrderedMap,
-    ProviderClassifier,
+    DEFAULT_MAX_RETRIES, DEFAULT_TEMPERATURE, ImageModel, KnownClassifierApi, ModelType,
+    OrderedMap, ProviderClassifier,
 };
 use crate::stream::ProviderResponse;
 use cyrup_core::{ApiId, CancelToken};
@@ -114,8 +114,12 @@ fn the_auth_shim_carries_what_auth_strategies_read() {
     assert_eq!(shim.max_tokens, 0);
 }
 
-/// `getModelType` (`model-operations.ts:17-19`): no `type` means chat; `classifier` routes to the
-/// classifier shape; a type this build does not know is an error, not a chat model.
+/// `getModelType` (`model-operations.ts:17-19`): no `type` means chat; `image` and `classifier`
+/// route to their own shapes; a type this build does not know is an error, not a chat model.
+///
+/// PROV-128 re-expressed the `image` leg of this test. It previously asserted that
+/// `"type":"image"` was an **error**, which was right for the two-valued union cyrup shipped and
+/// is wrong at v1.0.0, where `ModelTypeMap` has three members (`types.ts:1156-1161`).
 #[test]
 fn any_model_routes_by_type_tag() {
     let chat = chat_model("p", "m");
@@ -124,33 +128,156 @@ fn any_model_routes_by_type_tag() {
         chat_json.get("type").is_none(),
         "a chat model carries no `type`"
     );
+    let image = image_model("p", "i", "openrouter-images");
     let classifier = classifier_model("p", "c", LLAMA_API);
 
     let parsed_chat: AnyModel = serde_json::from_value(chat_json).unwrap();
+    let parsed_image: AnyModel =
+        serde_json::from_value(serde_json::to_value(&image).unwrap()).unwrap();
     let parsed_classifier: AnyModel =
         serde_json::from_value(serde_json::to_value(&classifier).unwrap()).unwrap();
 
     assert_eq!(parsed_chat, AnyModel::Chat(chat));
+    assert_eq!(parsed_image, AnyModel::Image(image));
     assert_eq!(parsed_classifier, AnyModel::Classifier(classifier));
     assert_eq!(parsed_chat.model_type(), ModelType::Chat);
+    assert_eq!(parsed_image.model_type(), ModelType::Image);
     assert_eq!(parsed_classifier.model_type(), ModelType::Classifier);
     assert_eq!(parsed_classifier.as_chat(), None);
     assert!(parsed_classifier.as_classifier().is_some());
 
-    let mut image = serde_json::to_value(chat_model("p", "i")).unwrap();
-    image["type"] = json!("image");
-    assert!(serde_json::from_value::<AnyModel>(image).is_err());
+    // The three narrowings are mutually exclusive (pi `isModelType`).
+    assert!(parsed_image.as_image().is_some());
+    assert_eq!(parsed_image.as_chat(), None);
+    assert_eq!(parsed_image.as_classifier(), None);
+    assert_eq!(parsed_chat.as_image(), None);
+    assert_eq!(parsed_classifier.as_image(), None);
+    assert!(parsed_image.clone().into_image().is_some());
+    assert!(parsed_chat.clone().into_image().is_none());
+
+    // A type NO build knows is still an error here; `withKnownModelTypes` drops such entries at
+    // the store layer instead (`models.ts:121-127`).
+    let mut unknown = serde_json::to_value(chat_model("p", "v")).unwrap();
+    unknown["type"] = json!("video");
+    let err = serde_json::from_value::<AnyModel>(unknown).unwrap_err();
+    assert!(
+        err.to_string().contains("unknown model type: video"),
+        "{err}"
+    );
 }
 
+/// PROV-128 — one mixed array carrying all three types, which is the shape the pi.dev overlay now
+/// serves for `openrouter` (`PROV-099`: cyrup's `cyrup/<version>` User-Agent gets it the newest
+/// catalog revision, where image rows sit beside chat rows in one `models` array).
+///
+/// Red at HEAD: the `image` entry failed with `unknown model type: image`, and because the error
+/// is raised per element the WHOLE array failed to deserialize, not just that row.
+#[test]
+fn a_mixed_array_of_all_three_types_deserializes() {
+    let wire = json!([
+        serde_json::to_value(chat_model("openrouter", "m")).unwrap(),
+        serde_json::to_value(image_model("openrouter", "i", "openrouter-images")).unwrap(),
+        serde_json::to_value(classifier_model("openrouter", "c", LLAMA_API)).unwrap(),
+    ]);
+
+    let models: Vec<AnyModel> = serde_json::from_value(wire).unwrap();
+
+    assert_eq!(
+        models.iter().map(AnyModel::model_type).collect::<Vec<_>>(),
+        vec![ModelType::Chat, ModelType::Image, ModelType::Classifier]
+    );
+    assert_eq!(
+        models.iter().map(AnyModel::id).collect::<Vec<_>>(),
+        vec!["m", "i", "c"]
+    );
+    // Every row keeps the one provider it came from.
+    for model in &models {
+        assert_eq!(model.provider().as_str(), "openrouter");
+    }
+}
+
+/// `ImageModel.type` is the literal `"image"` (types.ts:1146); the rest is `BaseModel` in
+/// camelCase (types.ts:1097-1108) plus the required `output` list (:1148). Note what is NOT here:
+/// `thinkingLevelMap`, which the pre-v1.0.0 `ImagesModel` inherited from `Model` and which
+/// `BaseModel` does not have.
+#[test]
+fn image_model_wire_shape() {
+    let mut model = image_model("openrouter", "gemini-image", "openrouter-images");
+    model.headers = Some([("x-a".to_string(), Some("1".to_string()))].into());
+
+    let value = serde_json::to_value(&model).unwrap();
+
+    assert_eq!(value["type"], "image");
+    assert_eq!(value["id"], "gemini-image");
+    assert_eq!(value["api"], "openrouter-images");
+    assert_eq!(value["provider"], "openrouter");
+    assert_eq!(value["baseUrl"], "http://image.test/api/v1");
+    assert_eq!(value["input"], json!(["text", "image"]));
+    assert_eq!(value["output"], json!(["text", "image"]));
+    assert_eq!(value["headers"], json!({"x-a": "1"}));
+    assert!(value.get("thinkingLevelMap").is_none(), "{value}");
+    assert!(value.get("contextWindow").is_none(), "{value}");
+
+    let back: ImageModel = serde_json::from_value(value).unwrap();
+    assert_eq!(back, model);
+    assert!(back.outputs_text());
+}
+
+/// The `type` member is required on read, so a chat model's JSON (which carries no `type`) and a
+/// classifier model's JSON are both refused as image models — the property that lets one mixed
+/// array be split by tag.
+#[test]
+fn image_model_requires_its_own_type_tag() {
+    let mut value = serde_json::to_value(image_model("p", "i", "openrouter-images")).unwrap();
+    value.as_object_mut().unwrap().remove("type");
+    assert!(serde_json::from_value::<ImageModel>(value).is_err());
+
+    let chat_json = serde_json::to_value(chat_model("p", "m")).unwrap();
+    assert!(serde_json::from_value::<ImageModel>(chat_json).is_err());
+
+    let classifier_json = serde_json::to_value(classifier_model("p", "c", LLAMA_API)).unwrap();
+    assert!(serde_json::from_value::<ImageModel>(classifier_json).is_err());
+
+    // `output` is required too (`output: ("text" | "image")[]`, types.ts:1148).
+    let mut no_output = serde_json::to_value(image_model("p", "i", "openrouter-images")).unwrap();
+    no_output.as_object_mut().unwrap().remove("output");
+    assert!(serde_json::from_value::<ImageModel>(no_output).is_err());
+}
+
+/// An image-only model reports no text output (pi `model.output.includes("text")`,
+/// `api/openrouter-images.ts:149`).
+#[test]
+fn an_image_only_model_reports_no_text_output() {
+    let mut model = image_model("p", "i", "openrouter-images");
+    model.output = vec![crate::Modality::Image];
+    assert!(!model.outputs_text());
+}
+
+/// PROV-128 — `KNOWN_MODEL_TYPES` is `{ chat: true, image: true, classifier: true }` at v1.0.0
+/// (`models.ts:116`). This previously asserted `ALL.len() == 2`.
 #[test]
 fn model_type_spelling() {
     assert_eq!(ModelType::Chat.to_string(), "chat");
+    assert_eq!(ModelType::Image.to_string(), "image");
     assert_eq!(ModelType::Classifier.to_string(), "classifier");
     assert_eq!(
         serde_json::to_value(ModelType::Classifier).unwrap(),
         json!("classifier")
     );
-    assert_eq!(ModelType::ALL.len(), 2);
+    assert_eq!(
+        serde_json::to_value(ModelType::Image).unwrap(),
+        json!("image")
+    );
+    assert_eq!(
+        serde_json::from_value::<ModelType>(json!("image")).unwrap(),
+        ModelType::Image
+    );
+    assert_eq!(ModelType::ALL.len(), 3);
+    assert_eq!(
+        ModelType::ALL.map(ModelType::as_str),
+        ["chat", "image", "classifier"],
+        "declaration order is upstream's KNOWN_MODEL_TYPES order"
+    );
 }
 
 // ----------------------------------------------------------------------------- ordered objects --

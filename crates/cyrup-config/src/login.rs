@@ -736,7 +736,11 @@ pub async fn login(
                     auth_type,
                 });
             };
-            credential_from_provider(oauth.login(interaction).await?)
+            credential_from_provider(
+                oauth
+                    .login(interaction, &cyrup_provider::LoginOptions::default())
+                    .await?,
+            )
         }
         AuthType::ApiKey => {
             // `if (!method?.login) throw new ModelsError("auth", …)` (`ai/src/models.ts:433-435`
@@ -1022,6 +1026,7 @@ mod tests {
         async fn login(
             &self,
             interaction: &dyn AuthInteraction,
+            _options: &cyrup_provider::LoginOptions,
         ) -> Result<cyrup_provider::Credential, OAuthError> {
             // Consume one scripted answer so a test can drive a cancel through the flow.
             interaction

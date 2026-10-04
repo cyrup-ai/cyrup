@@ -6,8 +6,9 @@
 //! next-token label probabilities instead of generating text. This module holds everything that
 //! operation is made of:
 //!
-//! - [`ModelType`] / [`AnyModel`] / [`ClassifierModel`] — what a catalog entry is for
-//!   (`ModelTypeMap`, types.ts:1158-1168; `ClassifierModel`, :1151-1155).
+//! - [`ModelType`] / [`AnyModel`] / [`ImageModel`] / [`ClassifierModel`] — what a catalog entry is
+//!   for (`ModelTypeMap`, types.ts:1156-1176; `ImageModel`, :1144-1149; `ClassifierModel`,
+//!   :1151-1155). PROV-128 made the union three-valued at v1.0.0 (`a328aa89a`).
 //! - [`KnownClassifierApi`] — the classifier wire-protocol ids (types.ts:35).
 //! - [`ClassifierContext`] / [`ClassifierQuestion`] — the request (types.ts:633-656).
 //! - [`ClassifierResult`] / [`ClassifierAnswer`] — the response (types.ts:658-688).
@@ -20,10 +21,17 @@
 //! Dispatch itself lives where pi keeps it: [`crate::provider::Provider::classify`] and
 //! [`crate::collection::Models::classify`].
 //!
-//! Not ported from the 0.99 multi-type surface (see the EXT-027 ledger rows): `ImageModel`
-//! unification (cyrup keeps [`crate::images`] as its own stack), the `typesafe-system-one` and
-//! `cloudflare-workers-ai-system-one` classifier apis, `Provider.filterAllModels` and
-//! `Models.getAllAvailable`, and the array-based `models.all.json` shape.
+//! Not ported from the 0.99 multi-type surface (see the EXT-027 ledger rows): the
+//! `typesafe-system-one` and `cloudflare-workers-ai-system-one` classifier apis,
+//! `Provider.filterAllModels` and `Models.getAllAvailable`, and the array-based
+//! `models.all.json` shape.
+//!
+//! PROV-128 is landing in the three steps its ledger row names. Step (1) — the one here — makes an
+//! image row *representable*: [`ModelType::Image`], [`AnyModel::Image`] and [`ImageModel`] in
+//! upstream's v1.0.0 shape. Steps (2) and (3) — hanging an `images` dispatch map on
+//! [`crate::provider::Provider`], adding `generate_images` to [`crate::collection::Models`], and
+//! retiring [`crate::images`]'s parallel `ImagesProvider`/`ImagesModels` tree — are still open, so
+//! image generation continues to run through [`crate::images`] for now.
 
 use crate::HeaderMap;
 use crate::auth::ProviderEnv;
@@ -36,23 +44,31 @@ use std::sync::Arc;
 // ---------------------------------------------------------------------------------- model types --
 
 /// What a catalog entry is for; decides which `Models` operation accepts it (pi `ModelType =
-/// keyof ModelTypeMap`, types.ts:1165). pi also has `image`; cyrup keeps image models in
-/// [`crate::images`] and does not unify them here.
+/// keyof ModelTypeMap`, types.ts:1163).
+///
+/// PROV-128 — `a328aa89a` ("unify image and classifier models") made this three-valued at
+/// v1.0.0: `ModelTypeMap` is `{ chat: Model<Api>; image: ImageModel<ImageApi>; classifier:
+/// ClassifierModel<ClassifierApi> }` (`types.ts:1156-1161`), and the parallel images registry
+/// (`images-models.ts`, `providers/openrouter-images.ts`, `builtinImagesProviders`,
+/// `builtinImagesModels`) was deleted in the same commit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ModelType {
     Chat,
+    Image,
     Classifier,
 }
 
 impl ModelType {
-    /// Every type this build knows (pi `KNOWN_MODEL_TYPES`, models.ts:118).
-    pub const ALL: [ModelType; 2] = [ModelType::Chat, ModelType::Classifier];
+    /// Every type this build knows (pi `KNOWN_MODEL_TYPES`, models.ts:116). Declaration order is
+    /// upstream's `["chat", "image", "classifier"]`.
+    pub const ALL: [ModelType; 3] = [ModelType::Chat, ModelType::Image, ModelType::Classifier];
 
     /// The wire spelling (pi `model.type`, with `chat` being the omitted default).
     pub const fn as_str(self) -> &'static str {
         match self {
             ModelType::Chat => "chat",
+            ModelType::Image => "image",
             ModelType::Classifier => "classifier",
         }
     }
@@ -191,6 +207,94 @@ impl ClassifierModel {
     }
 }
 
+/// Image-generation model: usable with `generateImages()` only (pi `ImageModel`,
+/// types.ts:1144-1149 over `BaseModel`, :1097-1108).
+///
+/// PROV-128 — `a328aa89a` folded image models onto the one provider surface, so an image row is a
+/// [`BaseModel`](Model) plus a required `type: "image"` discriminant and a required `output`
+/// modality list. Two shape notes against the v0.87.1-era [`crate::images::ImagesModel`] this
+/// replaces on the unified surface:
+///
+/// * `thinkingLevelMap` is **gone**. At v0.87.1 `ImagesModel` extended `Model` and inherited it;
+///   v1.0.0's `ImageModel` extends `BaseModel`, which has no such member (`types.ts:1097-1108`),
+///   and the field was never read on an image path.
+/// * `type` is required on read, the same way [`ClassifierModel`]'s is, so a chat model's JSON is
+///   not accepted as an image model inside one mixed array.
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+#[serde(tag = "type", rename = "image", rename_all = "camelCase")]
+pub struct ImageModel {
+    pub id: ModelId,
+    pub name: String,
+    pub api: ApiId,
+    pub provider: ProviderId,
+    pub base_url: String,
+    pub input: Vec<Modality>,
+    /// Output modalities. Always includes `image`; `text` means the model can also return text
+    /// blocks (pi `ImageModel.output`, types.ts:1148).
+    pub output: Vec<Modality>,
+    pub cost: ModelCost,
+    /// Top-level per-provider request headers (pi `BaseModel.headers`, types.ts:1107).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub headers: Option<HeaderMap>,
+}
+
+/// The `type` member of an [`ImageModel`]; its only value is `image`.
+#[derive(serde::Deserialize)]
+enum ImageTag {
+    #[serde(rename = "image")]
+    Image,
+}
+
+/// [`ImageModel`] as read: serde's struct-level `tag` only writes the member, so reading goes
+/// through this mirror to make the tag mandatory (same reason as `ClassifierModelWire`).
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ImageModelWire {
+    #[serde(rename = "type")]
+    _kind: ImageTag,
+    id: ModelId,
+    name: String,
+    api: ApiId,
+    provider: ProviderId,
+    base_url: String,
+    input: Vec<Modality>,
+    output: Vec<Modality>,
+    cost: ModelCost,
+    #[serde(default)]
+    headers: Option<HeaderMap>,
+}
+
+impl<'de> serde::Deserialize<'de> for ImageModel {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let wire = ImageModelWire::deserialize(deserializer)?;
+        Ok(Self {
+            id: wire.id,
+            name: wire.name,
+            api: wire.api,
+            provider: wire.provider,
+            base_url: wire.base_url,
+            input: wire.input,
+            output: wire.output,
+            cost: wire.cost,
+            headers: wire.headers,
+        })
+    }
+}
+
+impl ImageModel {
+    /// `true` if this model emits text alongside images (pi `model.output.includes("text")`,
+    /// `api/openrouter-images.ts:149`).
+    pub fn outputs_text(&self) -> bool {
+        self.output.contains(&Modality::Text)
+    }
+
+    // NOTE (PROV-128 step 2): the `to_auth_model` shim [`ClassifierModel`] carries is deliberately
+    // absent here. It exists so `resolve_provider_auth` — which takes a [`Model`] where pi types
+    // `resolveProviderAuth` for every model shape — can be reached from a non-chat row, and the
+    // unified surface has no image leg to reach it from yet. Adding it now would be an item with
+    // no caller outside tests, so it lands with the dispatch that needs it.
+}
+
 /// Anything a provider can list (pi `AnyModel = ModelTypeMap[ModelType]`, types.ts:1168). Narrow
 /// with [`AnyModel::as_chat`] / [`AnyModel::as_classifier`] or match on the variant (pi's
 /// `isModelType()`).
@@ -203,6 +307,7 @@ impl ClassifierModel {
 #[serde(untagged)]
 pub enum AnyModel {
     Chat(Model),
+    Image(ImageModel),
     Classifier(ClassifierModel),
 }
 
@@ -211,6 +316,7 @@ impl AnyModel {
     pub fn model_type(&self) -> ModelType {
         match self {
             AnyModel::Chat(_) => ModelType::Chat,
+            AnyModel::Image(_) => ModelType::Image,
             AnyModel::Classifier(_) => ModelType::Classifier,
         }
     }
@@ -218,6 +324,7 @@ impl AnyModel {
     pub fn id(&self) -> &str {
         match self {
             AnyModel::Chat(m) => m.id.as_str(),
+            AnyModel::Image(m) => m.id.as_str(),
             AnyModel::Classifier(m) => m.id.as_str(),
         }
     }
@@ -225,6 +332,7 @@ impl AnyModel {
     pub fn provider(&self) -> &ProviderId {
         match self {
             AnyModel::Chat(m) => &m.provider,
+            AnyModel::Image(m) => &m.provider,
             AnyModel::Classifier(m) => &m.provider,
         }
     }
@@ -232,6 +340,7 @@ impl AnyModel {
     pub fn api(&self) -> &ApiId {
         match self {
             AnyModel::Chat(m) => &m.api,
+            AnyModel::Image(m) => &m.api,
             AnyModel::Classifier(m) => &m.api,
         }
     }
@@ -240,7 +349,15 @@ impl AnyModel {
     pub fn as_chat(&self) -> Option<&Model> {
         match self {
             AnyModel::Chat(m) => Some(m),
-            AnyModel::Classifier(_) => None,
+            AnyModel::Image(_) | AnyModel::Classifier(_) => None,
+        }
+    }
+
+    /// pi `isModelType(model, "image")`.
+    pub fn as_image(&self) -> Option<&ImageModel> {
+        match self {
+            AnyModel::Image(m) => Some(m),
+            AnyModel::Chat(_) | AnyModel::Classifier(_) => None,
         }
     }
 
@@ -248,21 +365,28 @@ impl AnyModel {
     pub fn as_classifier(&self) -> Option<&ClassifierModel> {
         match self {
             AnyModel::Classifier(m) => Some(m),
-            AnyModel::Chat(_) => None,
+            AnyModel::Chat(_) | AnyModel::Image(_) => None,
         }
     }
 
     pub fn into_chat(self) -> Option<Model> {
         match self {
             AnyModel::Chat(m) => Some(m),
-            AnyModel::Classifier(_) => None,
+            AnyModel::Image(_) | AnyModel::Classifier(_) => None,
+        }
+    }
+
+    pub fn into_image(self) -> Option<ImageModel> {
+        match self {
+            AnyModel::Image(m) => Some(m),
+            AnyModel::Chat(_) | AnyModel::Classifier(_) => None,
         }
     }
 
     pub fn into_classifier(self) -> Option<ClassifierModel> {
         match self {
             AnyModel::Classifier(m) => Some(m),
-            AnyModel::Chat(_) => None,
+            AnyModel::Chat(_) | AnyModel::Image(_) => None,
         }
     }
 }
@@ -270,6 +394,12 @@ impl AnyModel {
 impl From<Model> for AnyModel {
     fn from(model: Model) -> Self {
         AnyModel::Chat(model)
+    }
+}
+
+impl From<ImageModel> for AnyModel {
+    fn from(model: ImageModel) -> Self {
+        AnyModel::Image(model)
     }
 }
 
@@ -289,6 +419,9 @@ impl<'de> serde::Deserialize<'de> for AnyModel {
         match value.get("type").and_then(serde_json::Value::as_str) {
             None | Some("chat") => serde_json::from_value(value)
                 .map(AnyModel::Chat)
+                .map_err(D::Error::custom),
+            Some("image") => serde_json::from_value(value)
+                .map(AnyModel::Image)
                 .map_err(D::Error::custom),
             Some("classifier") => serde_json::from_value(value)
                 .map(AnyModel::Classifier)
