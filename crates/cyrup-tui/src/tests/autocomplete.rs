@@ -184,6 +184,29 @@ fn enter_on_slash_popup_submits_immediately() {
 }
 
 #[test]
+fn enter_on_argument_popup_accepts_then_next_enter_submits() {
+    // pi accepts an argument item with Enter, cancels the popup and returns without a recompute
+    // (`components/editor.ts:803-809` @v0.86.0), so the NEXT Enter submits. Recomputing here
+    // reopened the same popup for a fully typed argument, and every Enter accepted it again: the
+    // line could never be submitted.
+    let mut ed = InputEditor::new();
+    ed.set_argument_sources(crate::ArgumentSources {
+        thinking_levels: vec!["low".to_string(), "high".to_string()].into(),
+        ..Default::default()
+    });
+    type_str(&mut ed, "/thinking high");
+    assert!(ed.autocomplete_open());
+
+    let out = ed.handle_key(&key(KeyCode::Enter));
+    assert_eq!(out, EditorOutcome::Edited);
+    assert!(!ed.autocomplete_open(), "accepting closes the popup");
+
+    let out = ed.handle_key(&key(KeyCode::Enter));
+    assert_eq!(out, EditorOutcome::Submit("/thinking high".to_string()));
+    assert!(ed.is_empty());
+}
+
+#[test]
 fn esc_cancels_popup_keeps_text() {
     let mut ed = InputEditor::new();
     type_str(&mut ed, "/mod");

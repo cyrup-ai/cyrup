@@ -18,7 +18,26 @@ use crate::input::frame::DEFAULT_ESCAPE_TIMEOUT;
 /// A raw-mode pty: the reader gets the slave, the test keeps the master.
 fn pty() -> (std::fs::File, std::os::fd::OwnedFd) {
     use rustix::pty::{OpenptFlags, grantpt, openpt, ptsname, unlockpt};
+    // rustix offers `OpenptFlags::CLOEXEC` only where `posix_openpt` accepts `O_CLOEXEC` (Linux,
+    // FreeBSD, NetBSD); elsewhere (macOS) the flag is set right after opening.
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "netbsd"
+    ))]
     let master = openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY | OpenptFlags::CLOEXEC).unwrap();
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "netbsd"
+    )))]
+    let master = {
+        let master = openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY).unwrap();
+        rustix::io::fcntl_setfd(&master, rustix::io::FdFlags::CLOEXEC).unwrap();
+        master
+    };
     grantpt(&master).unwrap();
     unlockpt(&master).unwrap();
     let path = ptsname(&master, Vec::new()).unwrap();
