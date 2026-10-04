@@ -5,6 +5,27 @@ next work item**.
 
 ---
 
+# UPDATE 2026-10-04 (ledger hygiene) — seven implemented rows struck, none filed, no code moved
+
+> **This block sits above the 2026-10-04 defect-batch block and corrects its counts.** It records a
+> recording correction, not new work: every row struck here had already landed and was verified, and
+> was left open only because a verdict hand-off was truncated before the recording pass received it.
+> No code moved in this change.
+>
+> The count is whatever `python3 docs/gap-analysis/scripts/count_open_items.py` prints: on 2026-10-04
+> it prints **169 open: 0 critical, 1 high, 18 medium, 150 low; 17 trackers; 857 closed; 2 duplicates
+> not counted** (the defect batch: 176 open, 25 medium, 850 closed). By area: `01` 30, `02` 3, `03` 7, `04` 5, `05` 7, `06` 18, `07` 31, `08` 7, `09` 2, `09b` 29, `10` 1, `11` 10, `12` 2, `14` 0, `16` 2, `17` 1, `18` 13, `09a` 1.
+> Arithmetic: open 176 − 7 = 169; medium 25 − 7 = 18; closed 850 + 7 = 857; nothing filed.
+>
+> Struck, each with the test that pins it named on its row: `AGENT-045`, `SESS-064`, `SESS-068`,
+> `CFG-097`, `TUI-131`, `SUBA-158`, `ICOM-072`. Each was re-verified against the tree before being
+> struck rather than on the strength of the lost verdict — the code and its tests are present in
+> `crates/` at this commit.
+>
+> **`TUI-107` remains the only open row above medium**, and `ADR-0005`'s amendment states why closing
+> it matters: it is what makes the fullscreen default defensible on its own terms rather than on
+> parity alone.
+
 # UPDATE 2026-10-04 — eighteen rows closed (seven counted here, ten in area 13), three re-rated, none filed
 
 > **This block sits above the 2026-10-03 (ledger corrections) block and moves its counts.** The count
