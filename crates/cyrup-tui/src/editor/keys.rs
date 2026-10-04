@@ -137,7 +137,10 @@ impl InputEditor {
                     self.undo.clear(); // `this.undoStack.clear()` (`editor.ts:1268`)
                     Some(EditorOutcome::Submit(text))
                 } else {
-                    self.update_autocomplete();
+                    // No recompute, unlike Tab's `Accept`: pi cancels and returns
+                    // (`components/editor.ts:806-809` @v0.86.0), so the next Enter submits.
+                    // Recomputing reopened the popup for a fully typed argument
+                    // (`/login anthropic`), and every Enter re-accepted it without submitting.
                     Some(EditorOutcome::Edited)
                 }
             }
