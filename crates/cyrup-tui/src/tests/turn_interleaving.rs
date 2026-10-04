@@ -23,7 +23,7 @@
 //!    block is three rows — top pad, header, bottom pad. Forcing `true` dumped the entire file
 //!    inside the full-width state-tinted `Box`, so one `read` painted hundreds of rows of solid
 //!    tool background over the conversation. On a 256-colour terminal that background is
-//!    `Indexed(22)` — a vivid `#005f00` — which is the "hideous solid green" in the report.
+//!    an indexed cube green — the "hideous solid green" in the report.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -39,10 +39,10 @@ use cyrup_session_svc::AgentSessionEvent;
 use ratatui::backend::TestBackend;
 use ratatui::style::Color;
 
-/// `dark.json:18` `"toolSuccessBg": "#283228"`, resolved through `dark.json:43`.
-const DARK_TOOL_SUCCESS_BG: Color = Color::Rgb(0x28, 0x32, 0x28);
-/// `dark.json:17` `"toolPendingBg": "#282832"`.
-const DARK_TOOL_PENDING_BG: Color = Color::Rgb(0x28, 0x28, 0x32);
+/// v1.0.0 `dark.json` `toolSuccessBg` = `#254131`.
+const DARK_TOOL_SUCCESS_BG: Color = Color::Rgb(0x25, 0x41, 0x31);
+/// v1.0.0 `dark.json` `toolPendingBg` = `#34383a`.
+const DARK_TOOL_PENDING_BG: Color = Color::Rgb(0x34, 0x38, 0x3a);
 
 fn assistant(text: &str, tool: Option<(&str, &str, serde_json::Value)>) -> AssistantMessage {
     let mut m = AssistantMessage::errored(
@@ -403,12 +403,11 @@ fn live_viewport_cells_tint_only_the_running_tool_rows() {
     );
 }
 
-/// The 256-colour projection is Pi's, exactly. `#283228` has channel spread `10`, so `rgbTo256`'s
+/// The 256-colour projection is Pi's, exactly. `#254131` has channel spread `28`, so `rgbTo256`'s
 /// `spread < 10` grayscale escape does NOT apply (`theme.ts:243-251`) and the 6×6×6 cube wins:
-/// `40→0`, `50→95`, `40→0` ⇒ `16 + 36*0 + 6*1 + 0 = 22`. Index 22 is `#005f00`, a vivid green —
-/// which is what a 256-colour terminal shows for the tool background in cyrup **and in Pi**. This
-/// test pins the parity so the tint is never "fixed" away from upstream; the defect the report
-/// describes was the SIZE of the painted region, not its colour.
+/// `37→0`, `65→95`, `49→95` ⇒ `16 + 36*0 + 6*1 + 1 = 23`. This test pins the parity so the tint is
+/// never "fixed" away from upstream; the defect the report describes was the SIZE of the painted
+/// region, not its colour.
 #[test]
 fn ansi256_tool_tints_quantise_exactly_as_pi_does() {
     let theme = UiTheme::dark().with_color_mode(ColorMode::Ansi256);
@@ -442,8 +441,8 @@ fn ansi256_tool_tints_quantise_exactly_as_pi_does() {
     for bg in &tinted {
         assert_eq!(
             *bg,
-            Color::Indexed(22),
-            "toolSuccessBg must quantise to Pi's cube index 22"
+            Color::Indexed(23),
+            "toolSuccessBg must quantise to Pi's cube index 23"
         );
     }
     // And the block is still three rows, not the file.

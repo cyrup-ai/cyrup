@@ -40,5 +40,5 @@ pub use types::{
     BranchSummarySettings, CacheWarmingMode, CompactionSettings, DefaultProjectTrust,
     FullscreenExitOutput, FullscreenScrollbar, MermaidRenderingMode, PackageSource,
     ProviderRetrySettings, RetrySettings, SettingsScope, TerminalCapabilityOverrides,
-    TerminalImagesOverride, ThinkingBudgets, TuiMode, Warnings,
+    TerminalImagesOverride, ThinkingBudgets, TuiMode, Warnings, WheelLineCount, WheelScrollLines,
 };

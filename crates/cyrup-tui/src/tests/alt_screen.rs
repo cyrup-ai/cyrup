@@ -95,6 +95,7 @@
 
 use std::time::Duration;
 
+use cyrup_config::settings::WheelScrollLines;
 use ratatui::backend::{Backend, TestBackend};
 use ratatui::crossterm::event::{
     KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -111,6 +112,9 @@ use crate::{AltScreen, PointerOutcome, ScrollbarMode, TuiRenderMode, ViewportRen
 // ---------------------------------------------------------------------------------------------
 // Fixtures — the `VirtualTerminal` + `Text` pair every upstream case opens with (`:58-61`).
 // ---------------------------------------------------------------------------------------------
+
+/// The glyphs the scrollbar writes into its column: track `│`, thumb `┃`, hovered thumb `█`.
+const BAR_GLYPHS: [char; 3] = ['│', '┃', '█'];
 
 /// `Array.from({length: n}, (_, i) => 'line ' + (i+1))` (`:60`).
 fn doc(n: usize) -> Vec<Line<'static>> {
@@ -132,8 +136,27 @@ fn screen(w: u16, h: u16, n: usize) -> (AltScreen<TestBackend>, crate::altscreen
     (alt, captured, area)
 }
 
-/// `terminal.getViewport().map(l => l.trimEnd())` (`:66-69`).
+/// `terminal.getViewport().map(l => l.trimEnd())` (`:66-69`) — the DOCUMENT text of each row.
+///
+/// pi's cases run a `TuiAltScreen` whose implicit scroll view has its scrollbar `hidden`, so its
+/// viewport never carries a bar. cyrup's renderer defaults to `auto` (the `fullscreenScrollbar`
+/// default), and a visible bar paints a glyph into the last column, so one trailing bar glyph is
+/// dropped here; [`raw_rows`] is the scrape that keeps it, for the cases about the bar itself.
 fn viewport(alt: &mut AltScreen<TestBackend>) -> Vec<String> {
+    raw_rows(alt)
+        .into_iter()
+        .map(|row| {
+            row.trim_end()
+                .strip_suffix(BAR_GLYPHS)
+                .unwrap_or(row.trim_end())
+                .trim_end()
+                .to_owned()
+        })
+        .collect()
+}
+
+/// Every row as painted, last column included, with trailing blanks trimmed.
+fn raw_rows(alt: &mut AltScreen<TestBackend>) -> Vec<String> {
     let backend = alt.backend_for_test();
     let width = usize::from(backend.size().map(|s| s.width).unwrap_or(0));
     backend
@@ -297,18 +320,49 @@ fn renders_the_tail_and_a_wheel_notch_breaks_follow() {
     assert_eq!(viewport(&mut alt), ["line 6", "line 7", "line 8", "line 9"]);
 }
 
-/// pi `tui-alt-screen.test.ts:321` @v0.87.1 — "scrolls faster while Alt is held during wheel
+/// pi `tui-alt-screen.test.ts:321` @v1.0.0 — "scrolls faster while Alt is held during wheel
 /// input": a 12-line document in a 4-row viewport sits at `viewportTop === 8`, and one Alt+wheel-up
 /// notch (`\x1b[<72;1;1M`, 72 = 64 + the Alt bit 8) lands at 3 — five lines, not one.
+///
+/// That is the renderer's own default, a fixed one row (`options.wheelScrollLines ?? 1`,
+/// `tui-alt-screen.ts:270`), times the Alt multiplier. The multiplier applies to whatever the
+/// `fullscreenWheelScrollLines` setting resolves to rather than to a constant one, so the same
+/// notch moves 3 x 5 = 15 rows once the setting is 3 (`:698-701`).
 #[test]
 fn alt_wheel_scrolls_five_lines_per_notch() {
-    let (mut alt, _captured, area) = screen(20, 4, 12);
+    let (mut alt, _captured, area) = screen(20, 4, 40);
     alt.draw(None).unwrap();
-    assert_eq!(alt.viewport_top(), 8);
+    assert_eq!(alt.viewport_top(), 36);
     let mut up = wheel(MouseEventKind::ScrollUp, 0, 0);
     up.modifiers = KeyModifiers::ALT;
     alt.handle_mouse(&up, area);
-    assert_eq!(alt.viewport_top(), 3);
+    assert_eq!(alt.viewport_top(), 31, "default one row x Alt 5");
+
+    alt.set_wheel_scroll_lines(WheelScrollLines::from_number(3.0));
+    alt.handle_mouse(&up, area);
+    assert_eq!(alt.viewport_top(), 16, "setting 3 x Alt 5 = 15 rows");
+
+    // And without Alt the setting alone is the count.
+    alt.handle_mouse(&wheel(MouseEventKind::ScrollDown, 0, 0), area);
+    assert_eq!(alt.viewport_top(), 19);
+}
+
+/// The `fullscreenWheelScrollLines` setting reaches the renderer's notch count, and a document
+/// rect SHORTER than the terminal (an input dock below it) changes nothing about the arithmetic.
+#[test]
+fn the_wheel_count_setting_moves_the_document_rect_by_that_many_rows() {
+    let (mut alt, _captured, full) = screen(20, 10, 60);
+    alt.draw(None).unwrap();
+    // A dock under the document leaves the renderer a shorter document rect; the wheel router only
+    // asks the rect whether the pointer is over the view, never the terminal's size.
+    let rect = Rect::new(full.x, full.y, full.width, 6);
+    alt.set_wheel_scroll_lines(WheelScrollLines::from_number(7.0));
+    let before = alt.viewport_top();
+    alt.handle_mouse(&wheel(MouseEventKind::ScrollUp, 2, 2), rect);
+    assert_eq!(alt.viewport_top(), before - 7);
+    // Over the dock (outside the rect) the primary view still takes the notch.
+    alt.handle_mouse(&wheel(MouseEventKind::ScrollUp, 2, 8), rect);
+    assert_eq!(alt.viewport_top(), before - 14);
 }
 
 /// pi `:1317` — "ignores horizontal trackpad wheel events".
@@ -375,9 +429,8 @@ fn a_short_document_cannot_scroll() {
 /// `components/scroll-view.ts:86-88`) where `"auto"` overlays the content's last column, and
 /// `"hidden"` neither draws nor reserves.
 ///
-/// Asserted on the reserved width AND on the painted cell's style rather than its symbol: the
-/// thumb is a space carrying `scrollbarThumb` as a BACKGROUND (`theme.rs:507`), so a symbol-only
-/// comparison sees nothing.
+/// Asserted on the reserved width AND on the painted column's cells: `always` paints the bar's
+/// glyphs there and `hidden` leaves the document's own cells.
 #[test]
 fn scrollbar_mode_selects_the_reserved_column() {
     let (mut alt, _captured, area) = screen(20, 4, 40);
@@ -405,6 +458,168 @@ fn scrollbar_mode_selects_the_reserved_column() {
     assert_ne!(
         painted, bare,
         "an `always` bar paints the reserved column where `hidden` does not"
+    );
+}
+
+/// The last column of every painted row, top to bottom.
+fn bar_column(alt: &mut AltScreen<TestBackend>) -> Vec<String> {
+    let backend = alt.backend_for_test();
+    let width = usize::from(backend.size().map(|s| s.width).unwrap_or(0));
+    backend
+        .buffer()
+        .content
+        .chunks(width)
+        .filter_map(|row| row.last().map(|cell| cell.symbol().to_owned()))
+        .collect()
+}
+
+/// TUI-110, the row's own Verify: an overflowing transcript in `always` mode paints EVERY row of
+/// the last column as track `│` or thumb `┃` (pi's `paintScrollbar`, `layout.ts:309-330`), with the
+/// thumb in the theme's `scrollbarThumb` foreground and the track in `scrollbarTrack`'s.
+///
+/// Red before the change: the bar was a bare background fill on a space, so no row carried a glyph.
+#[test]
+fn an_always_bar_paints_a_glyph_on_every_row() {
+    let (mut alt, _captured, _) = screen(20, 10, 100);
+    alt.set_scrollbar_mode(ScrollbarMode::Always);
+    alt.draw(None).unwrap();
+    let glyphs = bar_column(&mut alt);
+    assert!(
+        glyphs.iter().all(|g| g == "│" || g == "┃"),
+        "every row is track or thumb: {glyphs:?}"
+    );
+    assert!(
+        glyphs.iter().filter(|g| *g == "┃").count() >= 2,
+        "a thumb of at least two rows"
+    );
+
+    let theme = UiTheme::dark();
+    let styles = last_column_styles(&mut alt);
+    for (glyph, style) in glyphs.iter().zip(&styles) {
+        let want = if glyph == "┃" {
+            theme.scrollbar_thumb()
+        } else {
+            theme.scrollbar_track()
+        };
+        assert_eq!(style.fg, want, "{glyph} is painted as a foreground token");
+        assert_eq!(
+            style.bg,
+            Some(ratatui::style::Color::Reset),
+            "no background fill"
+        );
+    }
+}
+
+/// TUI-110, the Verify's second half: a press mid-track (off the thumb) jumps so the thumb is
+/// centred on the pointer — it does not page — and a following drag moves it (pi
+/// `test/tui-alt-screen.test.ts:481-506`). The thumb paints `█` while held.
+#[test]
+fn a_mid_track_press_jumps_the_thumb_to_the_pointer_and_a_drag_moves_it() {
+    let (mut alt, _captured, area) = screen(20, 10, 50);
+    alt.set_scrollbar_mode(ScrollbarMode::Always);
+    alt.scroll_to_top();
+    alt.draw(None).unwrap();
+    let bar = area.width - 1;
+    assert_eq!(alt.viewport_top(), 0);
+
+    alt.handle_mouse(
+        &wheel(MouseEventKind::Down(MouseButton::Left), bar, 5),
+        area,
+    );
+    assert_eq!(
+        alt.viewport_top(),
+        20,
+        "jumped to the pointer, not paged by a screenful"
+    );
+    alt.draw(None).unwrap();
+    let glyphs = bar_column(&mut alt);
+    assert_eq!(
+        glyphs.iter().filter(|g| *g == "█").count(),
+        2,
+        "the held thumb paints as `█`: {glyphs:?}"
+    );
+    assert_eq!(glyphs[5], "█", "and the pointer's row is on it");
+
+    alt.handle_mouse(
+        &wheel(MouseEventKind::Drag(MouseButton::Left), bar, 9),
+        area,
+    );
+    assert_eq!(alt.viewport_top(), 40, "the drag carries the thumb on");
+    alt.handle_mouse(&wheel(MouseEventKind::Up(MouseButton::Left), bar, 9), area);
+    // The release ended the drag: a further motion report no longer moves the document.
+    alt.handle_mouse(
+        &wheel(MouseEventKind::Drag(MouseButton::Left), bar, 0),
+        area,
+    );
+    assert_eq!(alt.viewport_top(), 40);
+}
+
+/// TUI-110: hover covers the whole track column, including a hidden `auto` bar — a pointer
+/// arriving over the column reveals it with no scroll at all, thumb or not (pi
+/// `test/tui-alt-screen.test.ts:456-479`).
+///
+/// Red before the change: hover needed the pointer ON the thumb of an already-visible bar, so a
+/// faded bar could not be found by pointing.
+#[test]
+fn pointing_at_the_track_reveals_a_hidden_auto_bar() {
+    let (mut alt, _captured, area) = screen(20, 10, 50);
+    // A fresh overflowing document follows its tail and has not moved: the `auto` bar is faded.
+    alt.draw(None).unwrap();
+    let is_bar = |g: &String| matches!(g.as_str(), "│" | "┃" | "█");
+    assert!(
+        !bar_column(&mut alt).iter().any(is_bar),
+        "fixture: nothing painted yet"
+    );
+
+    // Reach the column at a row nowhere near the thumb (which is at the bottom, rows 8-9).
+    let bar = area.width - 1;
+    alt.handle_mouse(&wheel(MouseEventKind::Moved, bar, 2), area);
+    alt.draw(None).unwrap();
+    let after = bar_column(&mut alt);
+    assert!(
+        after.iter().all(is_bar),
+        "the whole track is painted: {after:?}"
+    );
+    assert_eq!(
+        after.iter().filter(|g| *g == "█").count(),
+        2,
+        "hovered: the thumb is expanded"
+    );
+    assert_eq!(alt.viewport_top(), 40, "revealing it scrolled nothing");
+
+    // Leaving the column lets go of the hover (the bar then fades on its own deadline).
+    alt.handle_mouse(&wheel(MouseEventKind::Moved, 3, 2), area);
+    alt.draw(None).unwrap();
+    assert_eq!(bar_column(&mut alt).iter().filter(|g| *g == "█").count(), 0);
+}
+
+/// pi orders the two halves of a pointer report as "offer it to the scrollbar, THEN refresh hover"
+/// (`tui-alt-screen.ts:932-934`), and a press looks the bar up WITHOUT `includeHiddenAuto`. So the
+/// first press on a faded bar's column is content — a text selection starts, no thumb is grabbed,
+/// nothing scrolls — and only the hover refresh that follows reveals the bar.
+///
+/// Red if the hover refresh runs first: the press would find the freshly revealed bar and jump the
+/// view to the pointer.
+#[test]
+fn the_first_press_on_a_faded_bar_is_content_and_only_reveals_it() {
+    let (mut alt, _captured, area) = screen(20, 10, 50);
+    alt.draw(None).unwrap();
+    assert_eq!(alt.viewport_top(), 40);
+
+    let bar = area.width - 1;
+    alt.handle_mouse(
+        &wheel(MouseEventKind::Down(MouseButton::Left), bar, 3),
+        area,
+    );
+    assert_eq!(
+        alt.viewport_top(),
+        40,
+        "the press did not grab or jump the bar"
+    );
+    alt.draw(None).unwrap();
+    assert!(
+        bar_column(&mut alt).iter().any(|g| g == "█"),
+        "but the hover refresh revealed it"
     );
 }
 
@@ -839,7 +1054,12 @@ fn syncing_a_populated_transcript_renders_its_entries() {
     );
     assert!(!transcript.document().is_empty(), "and retention kept it");
 
-    alt.sync_document(&transcript, &theme, ImageOpts::default());
+    alt.sync_document(
+        &transcript,
+        &theme,
+        ImageOpts::default(),
+        &std::sync::Arc::new(Vec::new()),
+    );
     alt.draw(None).unwrap();
 
     let rows = viewport(&mut alt);
@@ -866,7 +1086,12 @@ fn syncing_an_empty_transcript_renders_an_empty_document() {
         AltScreen::for_test(TestBackend::new(20, 4), UiTheme::dark()).unwrap();
     let transcript = TranscriptView::new();
     let theme = UiTheme::dark();
-    alt.sync_document(&transcript, &theme, ImageOpts::default());
+    alt.sync_document(
+        &transcript,
+        &theme,
+        ImageOpts::default(),
+        &std::sync::Arc::new(Vec::new()),
+    );
     alt.draw(None).unwrap();
     assert!(
         viewport(&mut alt).iter().all(|row| row.is_empty()),
@@ -961,9 +1186,12 @@ fn press(column: u16, row: u16) -> MouseEvent {
     wheel(MouseEventKind::Down(MouseButton::Left), column, row)
 }
 
-/// The last painted row of the viewport.
+/// The last painted row of the document's viewport — the bottom of the rectangle the scrolled
+/// document was painted in, which is the whole screen unless a dock is painted under it.
 fn last_row(alt: &mut AltScreen<TestBackend>) -> String {
-    viewport(alt).pop().unwrap_or_default()
+    let area = alt.doc_area();
+    let bottom = usize::from(area.y.saturating_add(area.height)).saturating_sub(1);
+    viewport(alt).get(bottom).cloned().unwrap_or_default()
 }
 
 /// The label on the last row, without the document text to its left: from the arrow to the end.
@@ -1120,10 +1348,9 @@ fn the_jump_label_does_not_overpaint_the_scrollbar_column() {
         .buffer()
         .cell((area.width - 1, area.height - 1))
         .map(|cell| cell.symbol().to_owned());
-    assert_ne!(
-        bar_cell.as_deref(),
-        Some("n"),
-        "the bar column stays the bar's"
+    assert!(
+        matches!(bar_cell.as_deref(), Some("│" | "┃" | "█")),
+        "the bar column stays the bar's, got {bar_cell:?}"
     );
 }
 
@@ -1141,10 +1368,17 @@ fn the_clipped_column_is_not_part_of_the_jump_label() {
         last_row(&mut alt).contains("Jump"),
         "fixture: label painted"
     );
+    // The press lands on the bar's track, so it STARTS A DRAG — which a click on the label never
+    // does. A pointer dragged to the top then moves the document there.
     alt.handle_mouse(&press(area.width - 1, area.height - 1), area);
-    assert!(
-        !alt.is_following_output(),
-        "the scrollbar column belongs to the bar (here: a track press), not to the label"
+    alt.handle_mouse(
+        &wheel(MouseEventKind::Drag(MouseButton::Left), area.width - 1, 0),
+        area,
+    );
+    assert_eq!(
+        alt.viewport_top(),
+        0,
+        "the scrollbar column belongs to the bar (a track press and a drag), not to the label"
     );
 }
 

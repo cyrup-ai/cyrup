@@ -99,6 +99,7 @@ mod status_indicator;
 #[cfg(not(unix))]
 mod stray_reply;
 mod submenu_selector;
+mod system_theme;
 mod terminal_progress;
 mod terminal_query;
 mod terminal_title;
@@ -124,10 +125,11 @@ pub use altscreen::{
 pub use app::{
     App, AppAction, AppCommand, AppState, CompactionQueued, ExtensionWidget, ImplicitTrustReload,
     InlineBackend, LifecycleEffects, LifecycleOutcome, LoginProviderSource, MainScreenRenderState,
-    ModeSwitch, ModeSwitchOptions, QueueDrain, QueueDrainReason, RebuildBackend, RenderDebug,
-    SessionListMsg, SessionListUpdate, TreeNavMsg, crossterm_input_stream, extension_render,
-    gist_id_from_url, implicit_trust_after_reload, reanchor_inline_region, render,
-    share_viewer_url, share_viewer_url_from, should_honor_extension_shutdown, tree_node_from_dag,
+    ModeSwitch, ModeSwitchOptions, Pointer, QueueDrain, QueueDrainReason, RebuildBackend,
+    RenderDebug, SessionListMsg, SessionListUpdate, TreeNavMsg, crossterm_input_stream,
+    extension_render, gist_id_from_url, implicit_trust_after_reload, reanchor_inline_region,
+    render, share_viewer_url, share_viewer_url_from, should_honor_extension_shutdown,
+    tree_node_from_dag,
 };
 pub use auth_select::{
     AuthState, StatusTone, format_auth_selector_provider_type, format_status_indicator,
@@ -241,23 +243,23 @@ pub use status_indicator::{
     IndicatorKind, SPINNER_FRAMES, SPINNER_INTERVAL, StatusIndicator, WorkingIndicator,
 };
 pub use submenu_selector::SubmenuSelector;
+pub use system_theme::SYSTEM_THEME_NAME;
 pub use terminal_progress::{
     TERMINAL_PROGRESS_ACTIVE_SEQUENCE, TERMINAL_PROGRESS_CLEAR_SEQUENCE,
     TERMINAL_PROGRESS_KEEPALIVE, TerminalProgress, progress_is_armed, write_terminal_progress,
 };
 pub use terminal_query::{
-    CELL_SIZE_QUERY, CELL_SIZE_TIMEOUT, COLOR_SCHEME_QUERY, NoTerminalProbe,
-    OSC11_BACKGROUND_QUERY, StdinTerminalProbe, TerminalProbe, find_cell_size_report,
-    find_color_scheme_report, find_osc11_background_color, parse_cell_size_report,
-    parse_color_scheme_report, parse_osc11_background_color, saw_device_attributes,
+    CELL_SIZE_QUERY, CELL_SIZE_TIMEOUT, COLOR_QUERY_TIMEOUT, LateColors, NoTerminalProbe,
+    OscColorResponse, OscColorTarget, StdinTerminalProbe, TERMINAL_COLOR_QUERY, TerminalColors,
+    TerminalProbe, find_cell_size_report, parse_cell_size_report, parse_color_scheme_report,
+    parse_osc_color_response, saw_device_attributes,
 };
 pub use terminal_title::{APP_TITLE, session_terminal_title};
 pub use text_input::{Input, InputOutcome, TextInputSelector};
 pub use theme::{
-    BackgroundTheme, ColorMode, DetectionConfidence, TerminalTheme, TerminalThemeDetection,
-    TerminalThemeSource, ThemeApply, ThemeController, ThinkingTheme, UiTheme, color_of,
-    detect_terminal_background_from_env, detect_terminal_background_theme,
-    detect_terminal_theme_for_auto, rgb_to_256, theme_for_rgb,
+    BackgroundTheme, ColorMode, THEME_FALLBACK_SENTENCE, TerminalTheme, ThemeApply,
+    ThemeController, ThinkingTheme, UiTheme, color_of, detect_color_fg_bg_theme,
+    detect_terminal_theme, rgb_to_256,
 };
 pub use thinking_selector::{ThinkingSelector, ThinkingSelectorKeys};
 pub use tmux::{
@@ -266,8 +268,8 @@ pub use tmux::{
     keyboard_warning as tmux_keyboard_warning,
 };
 pub use transcript::{
-    DEFAULT_IMAGE_WIDTH_CELLS, Entry, HIDDEN_THINKING_LABEL, ParsedSkillBlock, ResultImage,
-    TranscriptView, content_text, parse_skill_block, thinking_text,
+    DEFAULT_IMAGE_WIDTH_CELLS, Entry, Expansion, HIDDEN_THINKING_LABEL, ParsedSkillBlock,
+    ResultImage, TranscriptView, content_text, parse_skill_block, thinking_text,
 };
 pub use tree_selector::{
     FilterMode, TreeEntryRole, TreeKind, TreeNode, TreeSelector, format_label_timestamp,

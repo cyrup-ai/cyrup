@@ -801,7 +801,18 @@ impl<B: Backend> App<B> {
             C::ApplySetting { id, value } => {
                 // Persist a `/settings` toggle/choice live (Global scope; Pi's settings selector
                 // writes the global layer). The `/reload` re-reads the effective view.
-                let json = parse_setting_value(&value);
+                let mut json = parse_setting_value(&value);
+                // TUI-136 — `onFullscreenWheelScrollLinesChange` persists the clamped setting and
+                // then, `if (this.renderer instanceof TuiAltScreen)`, pushes it into the running
+                // renderer (`interactive-mode.ts:5050-5053` @v1.0.0). The typed value is both:
+                // `to_json` is what `setFullscreenWheelScrollLines` stores (`settings-manager.ts:
+                // 1396-1400` — `auto`, or a NUMBER clamped to 1-100), and the push is
+                // `App::set_fullscreen_wheel_scroll_lines`, which also seeds the next renderer.
+                if id == "fullscreenWheelScrollLines" {
+                    let lines = cyrup_config::settings::WheelScrollLines::from_row_value(&value);
+                    self.set_fullscreen_wheel_scroll_lines(lines);
+                    json = lines.to_json();
+                }
                 // Both theme-switch arms land here (the `/settings` confirm and an extension's
                 // `setTheme`), and both of pi's set `currentThemeSetting` as well as persisting
                 // (`setThemeSetting` / `setThemeName`, `theme-controller.ts:88-99` @v0.87.1), which

@@ -129,6 +129,42 @@ pub(super) fn collapsed_summary_lines(
     out
 }
 
+/// The COLLAPSED skill invocation — the `else` branch of `skill-invocation-message.ts`'s
+/// `updateDisplay`: one `Text(line, 0, 0)` of a bold `customMessageLabel` `[skill] `, the skill name
+/// in `customMessageText`, and a `dim` ` (<key> to expand)`.
+///
+/// Unlike the summaries there is no `Spacer(1)` after the label — label, name and hint share one
+/// row. The `Box(1, 1, customMessageBg)` shell and the gated leading `Spacer(1)`
+/// (`interactive-mode.ts:3500`) are the expanded form's, so `lead_spacer` means what it means there.
+pub(super) fn collapsed_skill_lines(
+    name: &str,
+    expand_key: &str,
+    lead_spacer: bool,
+    theme: &UiTheme,
+    width: usize,
+) -> Vec<Line<'static>> {
+    let block = theme.custom_message_bg_style();
+    let content_width = width.saturating_sub(2).max(1);
+    let row = Line::from(vec![
+        // One bold `customMessageLabel` run in pi (`[skill] `, the space inside the SGR pair); two
+        // spans of one style here, so the bracket is a span of its own as in the expanded form.
+        Span::styled("[skill]".to_string(), theme.custom_message_label_style()),
+        Span::styled(" ".to_string(), theme.custom_message_label_style()),
+        Span::styled(name.to_string(), theme.custom_message_text_style()),
+        Span::styled(format!(" ({expand_key} to expand)"), theme.dim_style()),
+    ]);
+    let children = text_lines_of(&row, content_width, 0);
+    let fill = match block.bg {
+        Some(bg) => Style::default().bg(bg),
+        None => Style::default(),
+    };
+    let mut out = box_lines(children, width, 1, 1, fill);
+    if lead_spacer && !out.is_empty() {
+        out.insert(0, Line::default());
+    }
+    out
+}
+
 pub(super) fn labeled_message_lines(
     label: &str,
     header: &str,

@@ -22,8 +22,8 @@ use ratatui::widgets::Paragraph;
 
 use crate::keymap::{SelectAction, SelectKeymap};
 use crate::selector::{
-    Selector, SelectorOutcome, border_rule, border_rule_line, centered_window, input_line_spans,
-    stack_rows,
+    RowAction, RowMap, RowPointer, Selector, SelectorOutcome, border_rule, border_rule_line,
+    centered_window, clamped_step, input_line_spans, stack_rows,
 };
 use crate::text_width::{str_width, truncate_line_to_width, truncate_to_width};
 use crate::theme::UiTheme;
@@ -134,6 +134,10 @@ impl SettingRow {
 /// `terminalHeight` and never recomputes it.
 const SETTINGS_MAX_VISIBLE: usize = 10;
 
+/// The rows `SettingsList` draws above its items: the search `Input` and the blank under it
+/// (`settings-list.ts:93-96`). The first item is painted this many rows below the list's top.
+const SEARCH_ROWS: u16 = 2;
+
 /// `Math.min(30, …)` — the label column's upper bound (`settings-list.ts:121`). There is **no**
 /// lower bound upstream: a list of short labels hugs them (S33). cyrup previously routed the rows
 /// through `ColumnLayout::SLASH` (`{primary_min: 12, primary_max: 32}`), which is
@@ -178,6 +182,9 @@ pub struct SettingsSelector {
     /// The search box (`this.searchInput`, `settings-list.ts:65`) — the shared single-line editing
     /// surface, caret and all.
     input: crate::text_input::Input,
+    /// The row a left press went down on, so the click that completes the gesture activates it even
+    /// if the window slid under the pointer — pi's `mousePressedIndex` (`settings-list.ts:208-215`).
+    pointer: RowPointer,
 }
 
 impl SettingsSelector {
@@ -189,6 +196,7 @@ impl SettingsSelector {
             filtered: Vec::new(),
             selected: 0,
             input: crate::text_input::Input::new(),
+            pointer: RowPointer::default(),
         };
         sel.apply_filter();
         sel
@@ -268,6 +276,19 @@ impl SettingsSelector {
             .min(LABEL_COLUMN_MAX)
     }
 
+    /// The search `Input` and the blank under it (`settings-list.ts:93-96`) — [`SEARCH_ROWS`] rows.
+    fn search_lines(&self, width: u16, theme: &UiTheme) -> [Line<'static>; SEARCH_ROWS as usize] {
+        [
+            Line::from(input_line_spans(
+                self.input.value(),
+                self.input.cursor(),
+                width,
+                theme,
+            )),
+            Line::from(""),
+        ]
+    }
+
     /// `renderMainList` (`settings-list.ts:90-166`), line for line.
     pub fn lines(&self, width: u16, theme: &UiTheme) -> Vec<Line<'static>> {
         let width_u16 = width;
@@ -278,13 +299,7 @@ impl SettingsSelector {
         // which is constructed `{ enableSearch: true }` (`settings-selector.ts:872`).
         // [`crate::selector::input_line_spans`] is the shared `Input.render` port (S31), so the
         // prompt here is upstream's bare unstyled `"> "` at column 0, same as every other dialog's.
-        lines.push(Line::from(input_line_spans(
-            self.input.value(),
-            self.input.cursor(),
-            width_u16,
-            theme,
-        )));
-        lines.push(Line::from(""));
+        lines.extend(self.search_lines(width_u16, theme));
 
         // `:98-104` — no rows at all. NOT truncated upstream (only the "no matching" arm is), and
         // the hint follows because search is enabled.
@@ -422,6 +437,26 @@ impl SettingsSelector {
         Some(format!("{}{}{}", row.id, FIELD_SEP, row.value))
     }
 
+    /// `activateItem` (`settings-list.ts:198-220`): open the highlighted row's submenu if it has
+    /// one, else cycle its value in place and apply it live. The one answer to `Enter`, `Space`
+    /// (while the search box is empty) and a click.
+    fn activate(&mut self) -> SelectorOutcome {
+        if let Some(id) = self.current().and_then(|r| r.submenu.clone()) {
+            return SelectorOutcome::OpenSubmenu(id);
+        }
+        match self.cycle_current() {
+            Some(payload) => SelectorOutcome::Apply(payload),
+            None => SelectorOutcome::Redraw,
+        }
+    }
+
+    /// The three regions of the dialog in `area`: top rule, the `SettingsList` body, bottom rule.
+    /// [`Selector::render`] paints into these and [`Selector::pointer`] hit-tests against the body
+    /// one, so they cannot disagree about where the first item is.
+    fn carve(area: Rect, body_h: u16) -> [Rect; 3] {
+        stack_rows(area, [1, body_h, 1])
+    }
+
     /// `tui.select.up`/`down` (`settings-list.ts:179-184`) — both **wrap**, and both no-op on an
     /// empty display list.
     fn select_up(&mut self) {
@@ -478,10 +513,56 @@ impl Selector for SettingsSelector {
         // slot is the top `DynamicBorder` — upstream's own first child.
         let lines = self.lines(area.width, theme);
         let body_h = lines.len().min(usize::from(u16::MAX)) as u16;
-        let [top, body, bottom] = stack_rows(area, [1, body_h, 1]);
+        let [top, body, bottom] = Self::carve(area, body_h);
         frame.render_widget(border_rule(top.width, theme), top);
         frame.render_widget(Paragraph::new(lines).style(theme.base_style()), body);
         frame.render_widget(border_rule(bottom.width, theme), bottom);
+    }
+
+    /// `SettingsList.handleMouse` (`settings-list.ts:179-220`): the search row and the blank under
+    /// it are not items (a press there is ignored), a wheel notch over the list moves the highlight
+    /// one row without wrapping, a press highlights the row under the pointer and a click activates
+    /// the row the press went down on exactly as `Enter` would — opening its submenu or cycling its
+    /// value. Hover never reaches here, and so never moves the highlight.
+    fn pointer(&mut self, area: Rect, event: crate::app::Pointer) -> SelectorOutcome {
+        let local = Rect {
+            x: 0,
+            y: 0,
+            width: area.width,
+            height: area.height,
+        };
+        let body_h = self
+            .lines(area.width, UiTheme::default_ref())
+            .len()
+            .min(usize::from(u16::MAX)) as u16;
+        let [_, body, _] = Self::carve(local, body_h);
+        let len = self.filtered.len();
+        // The wheel is the `SettingsList`'s from its first item down to its hint row; the rows the
+        // slot was too short to paint are nobody's.
+        let map = RowMap::windowed(
+            body.y.saturating_add(SEARCH_ROWS),
+            self.selected,
+            len,
+            SETTINGS_MAX_VISIBLE,
+        )
+        .wheel_to(body.bottom())
+        .clipped_to(body.bottom());
+        match self.pointer.act(event, &map, self.selected, len) {
+            RowAction::Ignored => SelectorOutcome::Ignored,
+            RowAction::Handled => SelectorOutcome::Redraw,
+            RowAction::Highlight(item) => {
+                self.selected = item;
+                SelectorOutcome::Redraw
+            }
+            RowAction::Activate(item) => {
+                self.selected = item;
+                self.activate()
+            }
+            RowAction::Step(step) => {
+                self.selected = clamped_step(self.selected, len, step);
+                SelectorOutcome::Redraw
+            }
+        }
     }
 
     fn handle(&mut self, key: &KeyEvent, keymap: &SelectKeymap) -> SelectorOutcome {
@@ -499,15 +580,7 @@ impl Selector for SettingsSelector {
             // Enter on a submenu row opens the nested picker (Pi `SettingItem.submenu`); otherwise it
             // cycles the value in place and applies it live (Pi `activateItem` → `onChange`), the
             // slot staying open.
-            Some(SelectAction::Confirm) => {
-                if let Some(id) = self.current().and_then(|r| r.submenu.clone()) {
-                    return SelectorOutcome::OpenSubmenu(id);
-                }
-                return match self.cycle_current() {
-                    Some(payload) => SelectorOutcome::Apply(payload),
-                    None => SelectorOutcome::Redraw,
-                };
-            }
+            Some(SelectAction::Confirm) => return self.activate(),
             Some(SelectAction::Cancel) => return SelectorOutcome::Cancel,
             None => {}
         }
@@ -528,13 +601,7 @@ impl Selector for SettingsSelector {
                         .modifiers
                         .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
             {
-                if let Some(id) = self.current().and_then(|r| r.submenu.clone()) {
-                    return SelectorOutcome::OpenSubmenu(id);
-                }
-                match self.cycle_current() {
-                    Some(payload) => SelectorOutcome::Apply(payload),
-                    None => SelectorOutcome::Redraw,
-                }
+                self.activate()
             }
             _ => match self.input.handle_key(key) {
                 crate::text_input::InputOutcome::Edited => {
@@ -583,6 +650,8 @@ pub struct TrustSelector {
     /// Defaults to the stock table and is refreshed from whatever keymap actually routed a key, the
     /// same way [`crate::selector::ListSelector`] does it.
     keymap: SelectKeymap,
+    /// The option a left press went down on, so the click that completes the gesture confirms it.
+    pointer: RowPointer,
 }
 
 impl TrustSelector {
@@ -604,6 +673,7 @@ impl TrustSelector {
             selected,
             saved_index: None,
             keymap: SelectKeymap::default(),
+            pointer: RowPointer::default(),
         }
     }
 
@@ -663,6 +733,16 @@ impl TrustSelector {
             ),
             theme.muted_style(),
         )));
+        lines
+    }
+
+    /// Everything above the options (`trust-selector.ts:52-70`): the rule, a blank, the header and
+    /// the blank before the list. Its length is the slot row the first option is painted on, which
+    /// is what [`Selector::pointer`] hit-tests against.
+    fn head_lines(&self, width: u16, theme: &UiTheme) -> Vec<Line<'static>> {
+        let mut lines = vec![border_rule_line(width, theme), Line::from("")];
+        lines.extend(self.header_lines(theme));
+        lines.push(Line::from(""));
         lines
     }
 
@@ -768,17 +848,45 @@ impl Selector for TrustSelector {
         // `lines[0..area.height]` and drops the TRAILING rows, so a short slot shows a strict
         // PREFIX of this vector, matching pi's layout engine (see `crate::selector::stack_rows`).
         let blank = || Line::from("");
-        let mut lines: Vec<Line<'static>> = Vec::new();
-        lines.push(border_rule_line(area.width, theme));
-        lines.push(blank());
-        lines.extend(self.header_lines(theme));
-        lines.push(blank());
+        let mut lines = self.head_lines(area.width, theme);
         lines.extend(self.option_lines(theme));
         lines.push(blank());
         lines.push(self.hint_line(theme));
         lines.push(blank());
         lines.push(border_rule_line(area.width, theme));
         frame.render_widget(Paragraph::new(lines).style(theme.base_style()), area);
+    }
+
+    /// A press highlights the option under the pointer, a click confirms it as `Enter` would, and a
+    /// wheel notch moves the highlight one option, stopping at the ends as the arrow keys do. The
+    /// header, the rules, the blanks and the hint are not options.
+    fn pointer(&mut self, area: Rect, event: crate::app::Pointer) -> SelectorOutcome {
+        let top = self
+            .head_lines(area.width, UiTheme::default_ref())
+            .len()
+            .min(usize::from(u16::MAX)) as u16;
+        let len = self.labels.len();
+        let mut map = RowMap::starting_at(top);
+        for option in 0..len {
+            map = map.item(option, 1, 1);
+        }
+        let map = map.clipped_to(area.height);
+        match self.pointer.act(event, &map, self.selected, len) {
+            RowAction::Ignored => SelectorOutcome::Ignored,
+            RowAction::Handled => SelectorOutcome::Redraw,
+            RowAction::Highlight(option) => {
+                self.selected = option;
+                SelectorOutcome::Redraw
+            }
+            RowAction::Activate(option) => {
+                self.selected = option;
+                SelectorOutcome::Confirm(self.selected.to_string())
+            }
+            RowAction::Step(step) => {
+                self.selected = clamped_step(self.selected, len, step);
+                SelectorOutcome::Redraw
+            }
+        }
     }
 
     fn handle(&mut self, key: &KeyEvent, keymap: &SelectKeymap) -> SelectorOutcome {

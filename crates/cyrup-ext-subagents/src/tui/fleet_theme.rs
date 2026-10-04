@@ -28,12 +28,16 @@
 //! # Colour roles
 //!
 //! [`Role`] enumerates exactly the theme roles `fleet.ts`/`fleet-status.ts`/`fleet-transcript.ts`
-//! pass to `theme.fg(...)` — nothing more. The concrete [`Color`] each maps to is this crate's
-//! choice (pi resolves them against the user's active `MarkdownTheme`/`Theme`, a `cyrup-tui`-owned
-//! surface out of reach here), chosen to match the palette `tui/render.rs` already established for
-//! this crate's other renderable output.
+//! pass to `theme.fg(...)` — nothing more. The concrete [`Color`] each maps to ([`style`]) is this
+//! crate's choice, chosen to match the palette `tui/render.rs` already established for this
+//! crate's other renderable output; it is the fallback for a surface with no theme.
+//!
+//! On the overlay seam the role is handed to the host instead of that colour:
+//! [`to_overlay_span`] emits [`OverlayColor::Theme`], which `cyrup-tui` resolves against the
+//! user's ACTIVE theme at paint time (pi resolves `theme.fg(role, …)` against the same theme), so
+//! the fleet inspector follows `--use-theme` and a live theme switch.
 
-use cyrup_ext::{OverlayColor, OverlayLine, OverlaySpan};
+use cyrup_ext::{OverlayColor, OverlayLine, OverlaySpan, ThemeRole};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
@@ -66,9 +70,74 @@ pub enum Role {
     ToolOutput,
 }
 
-/// The [`Style`] one [`Role`] renders with.
+impl Role {
+    /// Every role, in declaration order.
+    pub const ALL: [Role; 10] = [
+        Role::Accent,
+        Role::Muted,
+        Role::Dim,
+        Role::Success,
+        Role::Warning,
+        Role::Error,
+        Role::Border,
+        Role::BorderMuted,
+        Role::ToolTitle,
+        Role::ToolOutput,
+    ];
+
+    /// The host theme role this role is painted with on the overlay seam
+    /// ([`OverlayColor::Theme`]): the same token pi's `theme.fg(...)` names, resolved by the host
+    /// against the ACTIVE theme at paint time. The mapping is total and one-to-one.
+    #[must_use]
+    pub fn theme_role(self) -> ThemeRole {
+        match self {
+            Role::Accent => ThemeRole::Accent,
+            Role::Muted => ThemeRole::Muted,
+            Role::Dim => ThemeRole::Dim,
+            Role::Success => ThemeRole::Success,
+            Role::Warning => ThemeRole::Warning,
+            Role::Error => ThemeRole::Error,
+            Role::Border => ThemeRole::Border,
+            Role::BorderMuted => ThemeRole::BorderMuted,
+            Role::ToolTitle => ThemeRole::ToolTitle,
+            Role::ToolOutput => ThemeRole::ToolOutput,
+        }
+    }
+
+    /// The marker [`style`] stamps on every span so [`to_overlay_span`] can tell which ROLE
+    /// produced it. A ratatui `Style` has no field for a role, and the literal colour alone does
+    /// not name one (`Muted` and `ToolOutput` are both gray), so the role rides in the one style
+    /// slot nothing here paints with: the underline colour of a span that is not underlined.
+    fn tag(self) -> Color {
+        let index = Self::ALL.iter().position(|r| *r == self).unwrap_or(0);
+        Color::Indexed(u8::try_from(index).unwrap_or(0))
+    }
+
+    /// The role a [`Self::tag`] names, or `None` for a colour that is not one.
+    fn from_tag(color: Color) -> Option<Role> {
+        match color {
+            Color::Indexed(index) => Self::ALL.get(usize::from(index)).copied(),
+            _ => None,
+        }
+    }
+
+    /// Whether the literal [`Style`] spells this role's dimness with the DIM modifier. Pi's `dim`
+    /// and `borderMuted` tokens are COLOURS; the host's theme supplies that colour, so the
+    /// stand-in modifier must not be painted on top of it.
+    fn dims_via_modifier(self) -> bool {
+        matches!(self, Role::Dim | Role::BorderMuted)
+    }
+}
+
+/// The [`Style`] one [`Role`] renders with: the literal fallback colour and modifiers, plus the
+/// role marker ([`Role::tag`]) the overlay projection reads to hand the host the ROLE instead.
 #[must_use]
 pub fn style(role: Role) -> Style {
+    literal_style(role).underline_color(role.tag())
+}
+
+/// The fixed colour and modifiers a role falls back to when no theme is in play.
+fn literal_style(role: Role) -> Style {
     match role {
         Role::Accent => Style::default()
             .fg(Color::Cyan)
@@ -436,12 +505,18 @@ pub fn to_overlay_lines(lines: &[Line<'_>]) -> Vec<OverlayLine> {
 #[must_use]
 pub fn to_overlay_span(span: &Span<'_>) -> OverlaySpan {
     let m = span.style.add_modifier;
+    // A span a [`Role`] produced is handed over AS that role, so the host paints it in the user's
+    // theme; only a span with no role keeps its literal colour.
+    let role = span.style.underline_color.and_then(Role::from_tag);
     OverlaySpan {
         text: span.content.to_string(),
-        fg: span.style.fg.and_then(to_overlay_color),
+        fg: match role {
+            Some(role) => Some(OverlayColor::Theme(role.theme_role())),
+            None => span.style.fg.and_then(to_overlay_color),
+        },
         bg: span.style.bg.and_then(to_overlay_color),
         bold: m.contains(Modifier::BOLD),
-        dim: m.contains(Modifier::DIM),
+        dim: m.contains(Modifier::DIM) && !role.is_some_and(Role::dims_via_modifier),
         italic: m.contains(Modifier::ITALIC),
         underlined: m.contains(Modifier::UNDERLINED),
         reversed: m.contains(Modifier::REVERSED),
@@ -646,63 +721,60 @@ mod tests {
 
     #[test]
     fn every_role_survives_the_overlay_projection_round_trip() {
-        for role in [
-            Role::Accent,
-            Role::Muted,
-            Role::Dim,
-            Role::Success,
-            Role::Warning,
-            Role::Error,
-            Role::Border,
-            Role::BorderMuted,
-            Role::ToolTitle,
-            Role::ToolOutput,
-        ] {
+        for role in Role::ALL {
             let line = Line::from(vec![fg(role, "x")]);
             let projected = to_overlay_line(&line);
             let span = &projected.spans[0];
-            let expected = style(role);
+            let expected = literal_style(role);
             assert_eq!(
-                span.fg.map(to_ratatui_color_for_test),
-                expected.fg,
-                "{role:?} lost its colour crossing the overlay seam"
+                span.fg,
+                Some(OverlayColor::Theme(role.theme_role())),
+                "{role:?} crosses the overlay seam as its THEME ROLE, not as a fixed colour"
             );
             assert_eq!(
                 span.bold,
                 expected.add_modifier.contains(Modifier::BOLD),
                 "{role:?} lost bold"
             );
+            // `dim` and `borderMuted` are colours in pi; the host's theme supplies them, so the
+            // stand-in modifier is not painted over the themed colour.
             assert_eq!(
                 span.dim,
-                expected.add_modifier.contains(Modifier::DIM),
-                "{role:?} lost dim"
+                expected.add_modifier.contains(Modifier::DIM) && !role.dims_via_modifier(),
+                "{role:?} dim"
             );
         }
     }
 
-    /// The inverse of [`to_overlay_color`], as `cyrup-tui`'s `to_ratatui_color` implements it — kept
-    /// here so this crate can assert the round trip without depending on `cyrup-tui`.
-    fn to_ratatui_color_for_test(color: OverlayColor) -> Color {
-        match color {
-            OverlayColor::Black => Color::Black,
-            OverlayColor::Red => Color::Red,
-            OverlayColor::Green => Color::Green,
-            OverlayColor::Yellow => Color::Yellow,
-            OverlayColor::Blue => Color::Blue,
-            OverlayColor::Magenta => Color::Magenta,
-            OverlayColor::Cyan => Color::Cyan,
-            OverlayColor::Gray => Color::Gray,
-            OverlayColor::DarkGray => Color::DarkGray,
-            OverlayColor::LightRed => Color::LightRed,
-            OverlayColor::LightGreen => Color::LightGreen,
-            OverlayColor::LightYellow => Color::LightYellow,
-            OverlayColor::LightBlue => Color::LightBlue,
-            OverlayColor::LightMagenta => Color::LightMagenta,
-            OverlayColor::LightCyan => Color::LightCyan,
-            OverlayColor::White => Color::White,
-            OverlayColor::Indexed(i) => Color::Indexed(i),
-            OverlayColor::Rgb(r, g, b) => Color::Rgb(r, g, b),
+    /// The role marker is how the projection knows which role made a span; it must name every
+    /// role exactly once and never be mistaken for one on a span that has none.
+    #[test]
+    fn the_role_marker_names_every_role_exactly_once() {
+        let mut seen = std::collections::HashSet::new();
+        for role in Role::ALL {
+            assert_eq!(Role::from_tag(role.tag()), Some(role));
+            assert!(seen.insert(role.tag()), "{role:?} shares a marker");
+            assert_eq!(style(role).underline_color, Some(role.tag()));
+            // The theme-role mapping is one to one.
+            assert!(seen.len() <= Role::ALL.len());
         }
+        let themes: std::collections::HashSet<_> =
+            Role::ALL.iter().map(|r| r.theme_role()).collect();
+        assert_eq!(themes.len(), Role::ALL.len());
+        assert_eq!(Role::from_tag(Color::Indexed(200)), None);
+        assert_eq!(Role::from_tag(Color::Red), None);
+    }
+
+    /// A span with no role keeps whatever literal colour it carries: extensions' literal colours
+    /// still work.
+    #[test]
+    fn a_span_without_a_role_keeps_its_literal_colour() {
+        let span = Span::styled("x", Style::default().fg(Color::Magenta));
+        assert_eq!(
+            to_overlay_span(&span).fg,
+            Some(OverlayColor::Magenta),
+            "no role marker, no theme role"
+        );
     }
 
     #[test]

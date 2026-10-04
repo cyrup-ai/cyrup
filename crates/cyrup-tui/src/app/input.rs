@@ -238,18 +238,25 @@ impl<B: Backend> App<B> {
             // why a renderer that captures it owes them a replacement — the outcomes below ARE
             // that replacement.
             InputEvent::Mouse(m) => {
-                let area = match self.terminal.size() {
-                    Ok(s) => ratatui::layout::Rect {
-                        x: 0,
-                        y: 0,
-                        width: s.width,
-                        height: s.height,
-                    },
-                    Err(_) => return AppAction::None,
-                };
+                if self.altscreen.is_none() {
+                    return AppAction::None;
+                }
+                // A floating overlay under the pointer takes the report and nothing beneath it sees
+                // it (`app/overlay_pointer.rs`); a miss falls through to the dock and the document.
+                if let Some(action) = self.handle_overlay_pointer(m) {
+                    return action;
+                }
+                // The dock (editor, completion popup, selector) is offered the report next: it is
+                // painted in rectangles of its own, outside the scrolled document.
+                if let Some(action) = self.handle_dock_pointer(m) {
+                    return action;
+                }
                 let Some(alt) = self.altscreen.as_mut() else {
                     return AppAction::None;
                 };
+                // The rectangle the scrolled document was painted in, not the whole screen: the
+                // dock under it is not part of the scroll view.
+                let area = alt.doc_area();
                 match alt.handle_mouse(m, area) {
                     crate::altscreen::PointerOutcome::Ignored => AppAction::None,
                     crate::altscreen::PointerOutcome::Handled => AppAction::Redraw,
@@ -260,6 +267,13 @@ impl<B: Backend> App<B> {
                     // right-click paste collapses to the `[paste #N …]` marker identically.
                     crate::altscreen::PointerOutcome::Paste(text) => {
                         self.state.editor.handle_paste(&text);
+                        AppAction::Redraw
+                    }
+                    // A click on a thinking run, completed tool block, summary or skill block:
+                    // flip that entry, and have the next frame keep the clicked row where it was.
+                    crate::altscreen::PointerOutcome::Toggle(hit) => {
+                        alt.anchor_toggle(hit, &self.state.transcript);
+                        self.state.transcript.toggle(hit.target());
                         AppAction::Redraw
                     }
                 }
@@ -280,6 +294,8 @@ impl<B: Backend> App<B> {
                 if let Some(alt) = self.altscreen.as_mut() {
                     alt.handle_focus_lost();
                 }
+                // …and a press on the dock whose release will now go elsewhere.
+                self.state.pointer.cancel();
                 self.state.editor.set_focused(false);
                 AppAction::Redraw
             }

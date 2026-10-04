@@ -52,9 +52,14 @@
 //!   outcome of a cancelled run is discarded (`ui.ts:535-536`). Ledger: EXT-027.
 //!
 //! Colours: pi resolves `theme.fg("accent" | "muted" | "dim" | "warning" | "text", ...)` against the
-//! user's theme, which lives in `cyrup-tui` and is out of reach of an extension. The roles map to
-//! the fixed palette `cyrup-ext-subagents`' `fleet_theme` uses for the same roles
-//! (accent = cyan, muted = grey, dim = the dim modifier, warning = yellow).
+//! user's active theme. The theme lives in `cyrup-tui`, out of reach of an extension, so each run
+//! names the ROLE ([`OverlayColor::Theme`]) and the host resolves it at paint time: a `--use-theme`
+//! choice, or a theme switched while the view is open, recolours it.
+//!
+//! Pointer: the model list, the select dialogs and the Hugging Face results answer the wheel (one
+//! row, clamped), a press (selects the row) and a click (activates it); the search box places its
+//! caret where it is clicked. [`LlamaView`] records, while it renders, what each painted row is
+//! ([`RowHit`]), so the pointer is resolved against the rows that were actually drawn.
 
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
@@ -67,7 +72,8 @@ use std::time::Instant;
 use async_trait::async_trait;
 use cyrup_ext::host::{
     HostServices, InteractiveOverlay, KeySpec, NotifyKind, OverlayColor, OverlayKey,
-    OverlayKeyCode, OverlayLine, OverlayOutcome, OverlaySpan, key_ids, read_user_bindings,
+    OverlayKeyCode, OverlayLine, OverlayMouse, OverlayOutcome, OverlaySpan, ThemeRole, key_ids,
+    read_user_bindings,
 };
 use futures::future::BoxFuture;
 use tokio::runtime::Handle;
@@ -651,18 +657,22 @@ enum Role {
     Warning,
 }
 
+/// `theme.fg(<role>, …)` as a span: the run names the theme role and the host resolves it against
+/// the ACTIVE theme at paint time, so a user's theme (and a live theme switch) recolours the view.
 fn span(role: Role, text: impl Into<String>) -> OverlaySpan {
     let mut span = OverlaySpan::raw(text);
+    let themed = |role| Some(OverlayColor::Theme(role));
     match role {
-        Role::Plain | Role::Text => {}
-        Role::Accent => span.fg = Some(OverlayColor::Cyan),
+        Role::Plain => {}
+        Role::Text => span.fg = themed(ThemeRole::Text),
+        Role::Accent => span.fg = themed(ThemeRole::Accent),
         Role::AccentBold => {
-            span.fg = Some(OverlayColor::Cyan);
+            span.fg = themed(ThemeRole::Accent);
             span.bold = true;
         }
-        Role::Muted => span.fg = Some(OverlayColor::Gray),
-        Role::Dim => span.dim = true,
-        Role::Warning => span.fg = Some(OverlayColor::Yellow),
+        Role::Muted => span.fg = themed(ThemeRole::Muted),
+        Role::Dim => span.fg = themed(ThemeRole::Dim),
+        Role::Warning => span.fg = themed(ThemeRole::Warning),
     }
     span
 }
@@ -1122,6 +1132,63 @@ pub(crate) fn fuzzy_filter<T>(items: &[T], query: &str, text: impl Fn(&T) -> &st
 }
 
 // =================================================================================================
+// What each painted row is, for the pointer
+// =================================================================================================
+
+/// What a painted row is, as far as the pointer is concerned. Recorded while the view renders, so
+/// a pointer event is resolved against the rows that were actually drawn (a wrapped row, a scroll
+/// window and a title that wraps all shift them) rather than against a second computation of the
+/// layout.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum RowHit {
+    /// Chrome: a border, the title, a hint, a spacer.
+    #[default]
+    None,
+    /// A list row; the index is into the list of the current mode.
+    Item(usize),
+    /// A row that belongs to the list but is not one of its items (the `(i/N)` indicator): the
+    /// wheel over it scrolls the list, a click selects nothing.
+    ListChrome,
+    /// The search box. `first_col` is the text column shown at its left edge once the text has
+    /// scrolled horizontally.
+    Input { first_col: usize },
+}
+
+/// Painted rows together with what each one is.
+#[derive(Clone, Debug, Default)]
+struct Body {
+    lines: Vec<OverlayLine>,
+    hits: Vec<RowHit>,
+}
+
+impl Body {
+    fn push(&mut self, line: OverlayLine, hit: RowHit) {
+        self.lines.push(line);
+        self.hits.push(hit);
+    }
+
+    fn extend(&mut self, lines: Vec<OverlayLine>, hit: RowHit) {
+        for line in lines {
+            self.push(line, hit);
+        }
+    }
+
+    fn append(&mut self, other: Body) {
+        self.lines.extend(other.lines);
+        self.hits.extend(other.hits);
+    }
+}
+
+impl From<Vec<OverlayLine>> for Body {
+    /// Rows that are all chrome.
+    fn from(lines: Vec<OverlayLine>) -> Self {
+        let mut body = Self::default();
+        body.extend(lines, RowHit::None);
+        body
+    }
+}
+
+// =================================================================================================
 // `SelectList` (`select-list.ts`)
 // =================================================================================================
 
@@ -1151,11 +1218,23 @@ enum SelectEvent {
     Cancel,
 }
 
+/// What a pointer event did to a list.
+enum ListPointer {
+    /// Not the list's: the event is not on a row it acts on.
+    Ignored,
+    /// The list took it (the highlight may have moved) and the frame must be repainted.
+    Handled,
+    /// A click activated this row.
+    Select(SelectItem),
+}
+
 /// `SelectList` (`select-list.ts:44-259`): the windowed two-column list with a `(i/N)` indicator.
 #[derive(Clone, Debug)]
 struct SelectList {
     items: Vec<SelectItem>,
     selected: usize,
+    /// The row a press selected and whose release has not arrived: the click activates THAT row.
+    pressed: Option<usize>,
     max_visible: usize,
     /// `layout.minPrimaryColumnWidth` / `maxPrimaryColumnWidth`.
     min_primary: Option<usize>,
@@ -1167,6 +1246,7 @@ impl SelectList {
         Self {
             items,
             selected: 0,
+            pressed: None,
             max_visible,
             min_primary: None,
             max_primary: None,
@@ -1207,6 +1287,44 @@ impl SelectList {
         SelectEvent::None
     }
 
+    /// The pointer over the list (`select-list.ts` `handleMouse`), `hit` being what the row under
+    /// it was painted as.
+    ///
+    /// * **Wheel** over the list moves the highlight one row, clamped (the keys wrap, the wheel
+    ///   does not).
+    /// * **Press** on a row selects it and remembers it.
+    /// * **Click** activates the row the press went down on, falling back to the one under the
+    ///   pointer, and forgets the press.
+    ///
+    /// Hover never moves the highlight: the window is centred on it, so moving it under a resting
+    /// pointer would slide the rows out from under the user.
+    fn pointer(&mut self, hit: RowHit, event: OverlayMouse) -> ListPointer {
+        if self.items.is_empty() {
+            return ListPointer::Ignored;
+        }
+        let last = self.items.len() - 1;
+        match (event, hit) {
+            (OverlayMouse::Wheel { lines, .. }, RowHit::Item(_) | RowHit::ListChrome) => {
+                let step = if lines < 0 { -1_isize } else { 1 };
+                self.selected = self.selected.saturating_add_signed(step).min(last);
+                ListPointer::Handled
+            }
+            (OverlayMouse::Press { .. }, RowHit::Item(index)) if index <= last => {
+                self.selected = index;
+                self.pressed = Some(index);
+                ListPointer::Handled
+            }
+            (OverlayMouse::Click { .. }, RowHit::Item(index)) => {
+                let index = self.pressed.take().unwrap_or(index).min(last);
+                self.selected = index;
+                self.items.get(index).map_or(ListPointer::Ignored, |item| {
+                    ListPointer::Select(item.clone())
+                })
+            }
+            _ => ListPointer::Ignored,
+        }
+    }
+
     /// `getVisibleRange` (`select-list.ts:183`): the window centred on the selection.
     fn visible_range(&self, max_visible: usize) -> (usize, usize) {
         let len = i64::try_from(self.items.len()).unwrap_or(i64::MAX);
@@ -1237,16 +1355,16 @@ impl SelectList {
 
     /// `render` (`select-list.ts:119-149`) with the window narrowed to `max_visible` rows (never
     /// wider than the list's own), for a host frame too short for the natural one.
-    fn render_with(&self, width: usize, max_visible: usize) -> Vec<OverlayLine> {
+    fn render_with(&self, width: usize, max_visible: usize) -> Body {
         if self.items.is_empty() {
-            return vec![OverlayLine::new(vec![span(
+            return Body::from(vec![OverlayLine::new(vec![span(
                 Role::Warning,
                 "  No matching commands",
-            )])];
+            )])]);
         }
         let primary = self.primary_column_width();
         let (start, end) = self.visible_range(max_visible.min(self.max_visible));
-        let mut lines = Vec::new();
+        let mut body = Body::default();
         for index in start..end {
             let Some(item) = self.items.get(index) else {
                 continue;
@@ -1256,22 +1374,28 @@ impl SelectList {
                 .as_deref()
                 .map(normalize_to_single_line)
                 .filter(|d| !d.is_empty());
-            lines.push(Self::render_item(
-                item,
-                index == self.selected,
-                width,
-                description.as_deref(),
-                primary,
-            ));
+            body.push(
+                Self::render_item(
+                    item,
+                    index == self.selected,
+                    width,
+                    description.as_deref(),
+                    primary,
+                ),
+                RowHit::Item(index),
+            );
         }
         if start > 0 || end < self.items.len() {
             let text = format!("  ({}/{})", self.selected + 1, self.items.len());
-            lines.push(OverlayLine::new(vec![span(
-                Role::Dim,
-                truncate_to_width(&text, width.saturating_sub(2)),
-            )]));
+            body.push(
+                OverlayLine::new(vec![span(
+                    Role::Dim,
+                    truncate_to_width(&text, width.saturating_sub(2)),
+                )]),
+                RowHit::ListChrome,
+            );
         }
-        lines
+        body
     }
 
     /// `renderItem` (`select-list.ts:216-258`).
@@ -1758,15 +1882,26 @@ impl TextInput {
 
     /// `render(width)` (`input.ts:266-376`) with a fake (reverse-video) cursor; the hardware-cursor
     /// marker has no counterpart on the overlay seam.
+    #[cfg(test)]
     pub(crate) fn render(&self, width: usize) -> OverlayLine {
+        self.render_at(width).0
+    }
+
+    /// [`Self::render`] plus the text column shown at the left edge of the field, which a click
+    /// needs to turn its screen column back into a position in the text.
+    pub(crate) fn render_at(&self, width: usize) -> (OverlayLine, usize) {
         let available = width.saturating_sub(visible_width(Self::PROMPT));
         if width <= visible_width(Self::PROMPT) {
-            return OverlayLine::new(vec![OverlaySpan::raw(truncate_to_width(
-                Self::PROMPT,
-                width,
-            ))]);
+            return (
+                OverlayLine::new(vec![OverlaySpan::raw(truncate_to_width(
+                    Self::PROMPT,
+                    width,
+                ))]),
+                0,
+            );
         }
         let total = visible_width(&self.value);
+        let mut first_col = 0;
         let (visible_text, cursor_display) = if total < available {
             (self.value.clone(), self.cursor)
         } else {
@@ -1785,6 +1920,7 @@ impl TextInput {
                 } else {
                     cursor_col.saturating_sub(half)
                 };
+                first_col = start;
                 let visible = slice_by_column(&self.value, start, scroll_width);
                 let before = slice_by_column(&self.value, start, cursor_col.saturating_sub(start));
                 let cursor_display = before.len().min(visible.len());
@@ -1814,7 +1950,30 @@ impl TextInput {
         if padding > 0 {
             spans.push(OverlaySpan::raw(" ".repeat(padding)));
         }
-        OverlayLine::new(spans)
+        (OverlayLine::new(spans), first_col)
+    }
+
+    /// A press on the field's row (`input.ts` `handleMouse`, which acts on `press`, not on the
+    /// click that follows it): the caret goes to the START of the grapheme whose cells contain the
+    /// pointer, or to the end of the text when the pointer is past it.
+    ///
+    /// `column` is the cell inside the row, `first_col` the text column the field's left edge
+    /// showed when it was painted ([`Self::render_at`], the same window `render` draws); the
+    /// two-cell prompt is skipped, so a press on the prompt lands on that first visible column.
+    /// Always a cursor movement, so it ends an undo-coalescing run.
+    pub(crate) fn press_at(&mut self, column: usize, first_col: usize) {
+        self.last_action = LastAction::None;
+        let target = first_col + column.saturating_sub(visible_width(Self::PROMPT));
+        let mut passed = 0;
+        for (offset, grapheme) in self.value.grapheme_indices(true) {
+            let next = passed + grapheme_width(grapheme);
+            if target < next {
+                self.cursor = offset;
+                return;
+            }
+            passed = next;
+        }
+        self.cursor = self.value.len();
     }
 }
 
@@ -2038,21 +2197,20 @@ fn border(width: usize) -> OverlayLine {
 }
 
 /// `frame(theme, title, body, footer)` (`ui.ts:64-75`).
-fn frame(
-    title: &str,
-    body: Vec<OverlayLine>,
-    footer: Option<Vec<Seg>>,
-    width: usize,
-) -> Vec<OverlayLine> {
-    let mut lines = vec![border(width)];
-    lines.extend(text_lines(&[seg(Role::AccentBold, title)], 1, 0, width));
-    lines.extend(body);
+fn frame(title: &str, body: impl Into<Body>, footer: Option<Vec<Seg>>, width: usize) -> Body {
+    let mut out = Body::default();
+    out.push(border(width), RowHit::None);
+    out.extend(
+        text_lines(&[seg(Role::AccentBold, title)], 1, 0, width),
+        RowHit::None,
+    );
+    out.append(body.into());
     if let Some(footer) = footer {
-        lines.push(OverlayLine::default());
-        lines.extend(text_lines(&footer, 1, 0, width));
+        out.push(OverlayLine::default(), RowHit::None);
+        out.extend(text_lines(&footer, 1, 0, width), RowHit::None);
     }
-    lines.push(border(width));
-    lines
+    out.push(border(width), RowHit::None);
+    out
 }
 
 fn spacer() -> OverlayLine {
@@ -2098,6 +2256,8 @@ struct HuggingFaceSearch {
     results: Vec<HuggingFaceModel>,
     filtered: Vec<HuggingFaceModel>,
     selected: usize,
+    /// The result a press selected and whose release has not arrived: the click confirms THAT row.
+    pressed: Option<usize>,
     query: String,
     status: String,
     /// `this.debounce`: the deadline of the pending `setTimeout`.
@@ -2129,6 +2289,7 @@ impl HuggingFaceSearch {
             results: Vec::new(),
             filtered: Vec::new(),
             selected: 0,
+            pressed: None,
             query: String::new(),
             status: STATUS_TOO_SHORT.to_string(),
             debounce_at: None,
@@ -2144,16 +2305,21 @@ impl HuggingFaceSearch {
     /// `updateResults` (`ui.ts:146-180`), as lines, with the result window narrowed to
     /// `max_visible` rows (never wider than [`SEARCH_MAX_VISIBLE`]) for a host frame too short for
     /// the natural one.
-    fn render_with(&self, width: usize, max_visible: i64) -> Vec<OverlayLine> {
+    fn render_with(&self, width: usize, max_visible: i64) -> Body {
         let max_visible = max_visible.clamp(1, SEARCH_MAX_VISIBLE);
-        let mut lines = text_lines(
-            &[seg(Role::Dim, "Model name or owner/repository[:quant]")],
-            1,
-            0,
-            width,
+        let mut body = Body::default();
+        body.extend(
+            text_lines(
+                &[seg(Role::Dim, "Model name or owner/repository[:quant]")],
+                1,
+                0,
+                width,
+            ),
+            RowHit::None,
         );
-        lines.push(self.input.render(width));
-        lines.push(spacer());
+        let (input_line, first_col) = self.input.render_at(width);
+        body.push(input_line, RowHit::Input { first_col });
+        body.push(spacer(), RowHit::None);
 
         let len = i64::try_from(self.filtered.len()).unwrap_or(i64::MAX);
         let selected = i64::try_from(self.selected).unwrap_or(i64::MAX);
@@ -2180,21 +2346,22 @@ impl HuggingFaceSearch {
                     seg(Role::Muted, format!("  {details}")),
                 ]
             };
-            lines.extend(text_lines(&segs, 0, 0, width));
+            body.extend(text_lines(&segs, 0, 0, width), RowHit::Item(index));
         }
         if start > 0 || end < len {
             let indicator = format!("  ({}/{})", self.selected + 1, self.filtered.len());
-            lines.extend(text_lines(&[seg(Role::Dim, indicator)], 0, 0, width));
+            body.extend(
+                text_lines(&[seg(Role::Dim, indicator)], 0, 0, width),
+                RowHit::ListChrome,
+            );
         }
         if self.filtered.is_empty() || self.status == STATUS_SEARCHING {
-            lines.extend(text_lines(
-                &[seg(Role::Dim, format!("  {}", self.status))],
-                0,
-                0,
-                width,
-            ));
+            body.extend(
+                text_lines(&[seg(Role::Dim, format!("  {}", self.status))], 0, 0, width),
+                RowHit::None,
+            );
         }
-        lines
+        body
     }
 
     /// `filterResults` (`ui.ts:182-191`). The narrowed list keeps the API's order, not the fuzzy
@@ -2362,6 +2529,48 @@ impl HuggingFaceSearch {
         self.query_changed();
     }
 
+    /// The pointer over the search view, `hit` being what the row under it was painted as. The
+    /// results answer as a [`SelectList`] does (wheel one row clamped, press selects, click
+    /// confirms the row); a press in the box places the caret. `true` when the event was the
+    /// view's and the frame must be repainted.
+    fn pointer(&mut self, hit: RowHit, event: OverlayMouse) -> bool {
+        if self.closed {
+            return false;
+        }
+        let last = self.filtered.len().saturating_sub(1);
+        match (event, hit) {
+            (OverlayMouse::Wheel { lines, .. }, RowHit::Item(_) | RowHit::ListChrome)
+                if !self.filtered.is_empty() =>
+            {
+                let step = if lines < 0 { -1_isize } else { 1 };
+                self.selected = self.selected.saturating_add_signed(step).min(last);
+                true
+            }
+            (OverlayMouse::Press { .. }, RowHit::Item(index)) if index < self.filtered.len() => {
+                self.selected = index;
+                self.pressed = Some(index);
+                true
+            }
+            (OverlayMouse::Click { .. }, RowHit::Item(index)) => {
+                let index = self.pressed.take().unwrap_or(index);
+                self.selected = index.min(last);
+                if let Some(model) = self.filtered.get(index) {
+                    let id = model.id.clone();
+                    self.close(Some(id));
+                    return true;
+                }
+                false
+            }
+            // The caret is placed on the PRESS; the click that completes the gesture must not move
+            // it again (pi's `Input.handleMouse` answers `press` only).
+            (OverlayMouse::Press { column, .. }, RowHit::Input { first_col }) => {
+                self.input.press_at(usize::from(column), first_col);
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// A bracketed paste into the search box: forwarded to the input as upstream's
     /// `this.input.handleInput(data)` does (`ui.ts:271`), then the query change is picked up as
     /// for a typed key.
@@ -2424,10 +2633,56 @@ struct ModelsMode {
     answer: Option<oneshot::Sender<LlamaManagerAction>>,
 }
 
+impl ModelsMode {
+    /// Answer the pending `showModels` with what the list decided (`onSelect` / `onCancel`),
+    /// whether a key or a click decided it.
+    fn settle(&mut self, event: SelectEvent) {
+        match event {
+            SelectEvent::Select(item) => {
+                let action = if item.value == DOWNLOAD_VALUE {
+                    Some(LlamaManagerAction::Download)
+                } else {
+                    self.by_id
+                        .get(&item.value)
+                        .map(|model| LlamaManagerAction::Model(Box::new(model.clone())))
+                };
+                if let (Some(action), Some(answer)) = (action, self.answer.take()) {
+                    let _ = answer.send(action);
+                }
+            }
+            SelectEvent::Cancel => {
+                if let Some(answer) = self.answer.take() {
+                    let _ = answer.send(LlamaManagerAction::Close);
+                }
+            }
+            SelectEvent::None => {}
+        }
+    }
+}
+
 struct SelectMode {
     title: String,
     list: SelectList,
     answer: Option<oneshot::Sender<Option<String>>>,
+}
+
+impl SelectMode {
+    /// Answer the pending `select` with what the list decided.
+    fn settle(&mut self, event: SelectEvent) {
+        match event {
+            SelectEvent::Select(item) => {
+                if let Some(answer) = self.answer.take() {
+                    let _ = answer.send(Some(item.value));
+                }
+            }
+            SelectEvent::Cancel => {
+                if let Some(answer) = self.answer.take() {
+                    let _ = answer.send(None);
+                }
+            }
+            SelectEvent::None => {}
+        }
+    }
 }
 
 /// `this.content` and its input handler (`ui.ts:281-282`).
@@ -2461,6 +2716,8 @@ pub struct LlamaView {
     closed: bool,
     dirty: bool,
     attached: Option<oneshot::Sender<()>>,
+    /// What each row of the last render was, for the pointer.
+    hits: Vec<RowHit>,
 }
 
 impl LlamaView {
@@ -2477,6 +2734,7 @@ impl LlamaView {
             closed: false,
             dirty: true,
             attached: None,
+            hits: Vec::new(),
         }
     }
 
@@ -2620,43 +2878,56 @@ impl LlamaView {
             return;
         }
         match &mut self.mode {
-            Mode::Models(models) => match models.list.handle_key(&keys, key) {
-                SelectEvent::Select(item) => {
-                    let action = if item.value == DOWNLOAD_VALUE {
-                        Some(LlamaManagerAction::Download)
-                    } else {
-                        models
-                            .by_id
-                            .get(&item.value)
-                            .map(|model| LlamaManagerAction::Model(Box::new(model.clone())))
-                    };
-                    if let (Some(action), Some(answer)) = (action, models.answer.take()) {
-                        let _ = answer.send(action);
-                    }
-                }
-                SelectEvent::Cancel => {
-                    if let Some(answer) = models.answer.take() {
-                        let _ = answer.send(LlamaManagerAction::Close);
-                    }
-                }
-                SelectEvent::None => {}
-            },
-            Mode::Select(select) => match select.list.handle_key(&keys, key) {
-                SelectEvent::Select(item) => {
-                    if let Some(answer) = select.answer.take() {
-                        let _ = answer.send(Some(item.value));
-                    }
-                }
-                SelectEvent::Cancel => {
-                    if let Some(answer) = select.answer.take() {
-                        let _ = answer.send(None);
-                    }
-                }
-                SelectEvent::None => {}
-            },
+            Mode::Models(models) => {
+                let event = models.list.handle_key(&keys, key);
+                models.settle(event);
+            }
+            Mode::Select(select) => {
+                let event = select.list.handle_key(&keys, key);
+                select.settle(event);
+            }
             Mode::Search(search) => search.handle_key(&keys, key),
             Mode::Loading | Mode::Status { .. } | Mode::Progress(_) => {}
         }
+    }
+
+    /// A pointer event inside the box the overlay painted, `event` local to it. Resolved against
+    /// what the last render drew on that row ([`RowHit`]), then handled exactly as the key that
+    /// does the same thing: a click on a row is the Enter on it. `true` when the view took the
+    /// event and the frame must be repainted.
+    pub fn handle_mouse(&mut self, event: OverlayMouse) -> bool {
+        self.mark_attached();
+        if self.closed {
+            return false;
+        }
+        let (_, row) = event.cell();
+        let hit = self
+            .hits
+            .get(usize::from(row))
+            .copied()
+            .unwrap_or(RowHit::None);
+        let handled = match &mut self.mode {
+            Mode::Models(models) => match models.list.pointer(hit, event) {
+                ListPointer::Ignored => false,
+                ListPointer::Handled => true,
+                ListPointer::Select(item) => {
+                    models.settle(SelectEvent::Select(item));
+                    true
+                }
+            },
+            Mode::Select(select) => match select.list.pointer(hit, event) {
+                ListPointer::Ignored => false,
+                ListPointer::Handled => true,
+                ListPointer::Select(item) => {
+                    select.settle(SelectEvent::Select(item));
+                    true
+                }
+            },
+            Mode::Search(search) => search.pointer(hit, event),
+            Mode::Loading | Mode::Status { .. } | Mode::Progress(_) => false,
+        };
+        self.dirty |= handled;
+        handled
     }
 
     /// A bracketed paste (`handleInput` receiving `\x1b[200~ ... \x1b[201~`, `input.ts:62-98`).
@@ -2698,8 +2969,9 @@ impl LlamaView {
     #[must_use]
     pub fn render_within(&mut self, width: usize, rows: Option<usize>) -> Vec<OverlayLine> {
         self.mark_attached();
-        let lines = self.render_content(width, rows);
-        lines
+        let body = self.render_content(width, rows);
+        self.hits = body.hits;
+        body.lines
             .into_iter()
             .map(|line| clip_line(line, width))
             .collect()
@@ -2711,7 +2983,7 @@ impl LlamaView {
         }
     }
 
-    fn render_content(&self, width: usize, rows: Option<usize>) -> Vec<OverlayLine> {
+    fn render_content(&self, width: usize, rows: Option<usize>) -> Body {
         let keys = &self.keys;
         match &self.mode {
             Mode::Loading => frame(
@@ -2721,10 +2993,14 @@ impl LlamaView {
                 width,
             ),
             Mode::Models(models) => fit_rows(rows, models.list.max_visible, |visible| {
-                let mut body =
-                    text_lines(&[seg(Role::Dim, models.server_url.as_str())], 1, 0, width);
-                body.push(spacer());
-                body.extend(models.list.render_with(width, visible));
+                let mut body = Body::from(text_lines(
+                    &[seg(Role::Dim, models.server_url.as_str())],
+                    1,
+                    0,
+                    width,
+                ));
+                body.push(spacer(), RowHit::None);
+                body.append(models.list.render_with(width, visible));
                 let footer = join_hints(vec![
                     key_hint(keys, Binding::SelectConfirm, "load/unload/download"),
                     key_hint(keys, Binding::SelectCancel, "close"),
@@ -2732,8 +3008,8 @@ impl LlamaView {
                 frame("llama.cpp models", body, Some(footer), width)
             }),
             Mode::Select(select) => fit_rows(rows, select.list.max_visible, |visible| {
-                let mut body = vec![spacer()];
-                body.extend(select.list.render_with(width, visible));
+                let mut body = Body::from(vec![spacer()]);
+                body.append(select.list.render_with(width, visible));
                 let footer = join_hints(vec![
                     key_hint(keys, Binding::SelectConfirm, "select"),
                     key_hint(keys, Binding::SelectCancel, "cancel"),
@@ -2741,8 +3017,8 @@ impl LlamaView {
                 frame(&select.title, body, Some(footer), width)
             }),
             Mode::Search(search) => fit_rows(rows, SEARCH_VISIBLE_ROWS, |visible| {
-                let mut body = vec![spacer()];
-                body.extend(
+                let mut body = Body::from(vec![spacer()]);
+                body.append(
                     search.render_with(width, i64::try_from(visible).unwrap_or(SEARCH_MAX_VISIBLE)),
                 );
                 let footer = join_hints(vec![
@@ -2776,19 +3052,15 @@ impl LlamaView {
 
 /// The frame `render` builds for a list window of `visible` rows, narrowed one row at a time until
 /// it fits `rows` (or the window is a single row). `None` is "no clip": the natural window.
-fn fit_rows(
-    rows: Option<usize>,
-    natural: usize,
-    render: impl Fn(usize) -> Vec<OverlayLine>,
-) -> Vec<OverlayLine> {
+fn fit_rows(rows: Option<usize>, natural: usize, render: impl Fn(usize) -> Body) -> Body {
     let mut visible = natural.max(1);
     let Some(rows) = rows else {
         return render(visible);
     };
     loop {
-        let lines = render(visible);
-        if lines.len() <= rows || visible <= 1 {
-            return lines;
+        let body = render(visible);
+        if body.lines.len() <= rows || visible <= 1 {
+            return body;
         }
         visible -= 1;
     }
@@ -2865,6 +3137,18 @@ impl InteractiveOverlay for LlamaOverlay {
             OverlayOutcome::Close
         } else {
             OverlayOutcome::Redraw
+        }
+    }
+
+    fn handle_mouse(&mut self, event: OverlayMouse) -> OverlayOutcome {
+        let mut view = lock(&self.view);
+        let handled = view.handle_mouse(event);
+        if view.is_closed() {
+            OverlayOutcome::Close
+        } else if handled {
+            OverlayOutcome::Redraw
+        } else {
+            OverlayOutcome::Ignored
         }
     }
 

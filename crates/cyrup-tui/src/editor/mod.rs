@@ -52,6 +52,7 @@ mod keys;
 pub(crate) mod kill_ring;
 mod motion;
 mod paste;
+mod pointer;
 mod render;
 pub(crate) mod undo;
 pub(crate) mod word_nav;

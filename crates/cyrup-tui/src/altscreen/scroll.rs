@@ -1,7 +1,7 @@
 //! The **scroll model** over the retained document and the **scrollbar** that reports it — cyrup's
 //! port of pi's `ScrollView` (`packages/tui/src/components/scroll-view.ts` @v0.84.3) together with
-//! the thumb geometry the layout pass derives from one (`layout.ts:266-290`). ADR-0005 §Decision
-//! B-5.
+//! the thumb geometry and painter the layout pass derives from one (`layout.ts:278-330` @v1.0.0).
+//! ADR-0005 §Decision B-5.
 //!
 //! # Why the offset and the bar share a file
 //! Upstream they share an *object*: `ScrollView` holds `currentScrollTop`, `contentHeight` and
@@ -29,8 +29,9 @@
 //!
 //! # What the alternate screen builds
 //! One primary scroll view over the whole retained document, `follow: "end"`,
-//! `overscroll: "chain"`, its scrollbar taken from the `fullscreenScrollbar` setting and its thumb
-//! styled with `theme.bg("scrollbarThumb", …)` (`interactive-mode.ts:918-923`). Because there is
+//! `overscroll: "chain"`, its scrollbar taken from the `fullscreenScrollbar` setting and its track
+//! and thumb styled with `theme.fg("scrollbarTrack", …)` / `theme.fg("scrollbarThumb", …)`
+//! (`interactive-mode.ts:962-967` @v1.0.0). Because there is
 //! exactly one and it is always built that way, `followEnd` and `overscroll` are constants here
 //! rather than fields: this module always follows the tail (`scroll-view.ts:46-47`) and always
 //! reports its unconsumed remainder for a caller to chain (`tui-alt-screen.ts:675-686`).
@@ -49,17 +50,18 @@
 //!
 //! # No application state
 //! Nothing here holds a transcript, a theme or a keymap (`altscreen/mod.rs`, rule 2): the heights
-//! arrive through [`update_layout`], the thumb colour arrives as a `&UiTheme` argument at paint
-//! time, and the document itself is never touched — which is what lets
+//! arrive through [`update_layout`], the track and thumb colours arrive as a `&UiTheme` argument at
+//! paint time, and the document itself is never touched — which is what lets
 //! [`crate::ViewportRenderer::scroll_by`] and its siblings work from `&mut self` alone.
 
 use std::time::{Duration, Instant};
 
 use ratatui::Frame;
-use ratatui::layout::Rect;
-use ratatui::style::Style;
-use ratatui::widgets::{Scrollbar, ScrollbarOrientation, ScrollbarState};
+use ratatui::buffer::{Buffer, Cell};
+use ratatui::layout::{Position, Rect};
+use ratatui::style::Color;
 
+use crate::text_width::str_width;
 use crate::theme::UiTheme;
 
 /// How long an `auto` bar stays up after the last movement — pi's `scrollbarHideDelayMs`, whose
@@ -133,8 +135,8 @@ impl Default for ScrollState {
     }
 }
 
-/// The scrollbar policy and the ratatui widget state that paints it — pi's `ScrollView` scrollbar
-/// half (`components/scroll-view.ts:27-37`).
+/// The scrollbar policy and the pointer state that shapes how it paints — pi's `ScrollView`
+/// scrollbar half (`components/scroll-view.ts:27-37`).
 ///
 /// Held beside a [`ScrollState`] in the renderer's UI bag. Every mutator below takes both, because
 /// upstream's answers are joint: whether the bar shows depends on the heights, and every movement
@@ -143,26 +145,23 @@ impl Default for ScrollState {
 pub(super) struct ScrollbarView {
     /// Which policy is in force — `currentScrollbar` (`:27`).
     mode: ScrollbarMode,
-    /// Whether the pointer is over the thumb, or a drag holds it — `scrollbarActive` (`:36`),
-    /// written by `setScrollbarActive` (`:113-117`) from the alternate screen's hover tracking
-    /// (`tui-alt-screen.ts:735-743`). While it holds, an `auto` bar does not fade: upstream arms no
-    /// hide timer at all in that case (`components/scroll-view.ts:97`). ADR-0005 §B-7 is its only
-    /// writer, through [`set_hover`].
+    /// Whether the pointer is over the bar's track column, or a drag holds it — `scrollbarActive`
+    /// (`:36`), written by `setScrollbarActive` (`:113-117`) from the alternate screen's hover
+    /// tracking (`tui-alt-screen.ts:1053-1062`). While it holds, an `auto` bar does not fade:
+    /// upstream arms no hide timer at all in that case (`components/scroll-view.ts:97`), and the
+    /// thumb paints as `█` instead of `┃`. ADR-0005 §B-7 is its only writer, through
+    /// [`set_hover`].
     hover: bool,
-    /// The ratatui widget's own view of content length, position and viewport length, refreshed
-    /// from [`ScrollState`] on every [`draw`]. Carried across frames only because
-    /// [`ratatui::widgets::Scrollbar`] renders statefully; it is never the source of truth.
-    state: ScrollbarState,
 }
 
 /// Where the thumb is — pi's `ScrollbarGeometry` (`layout.ts:38-45`), in absolute frame
 /// coordinates.
 ///
-/// This is ADR-0005 §B-7's only window into the thumb: the drag hit-tests
-/// `x == column && thumb_top <= y < thumb_top + thumb_height` (`tui-alt-screen.ts:725-730`) and
-/// converts a pointer row into an offset with
-/// `round(thumb_offset / (track_height - thumb_height) * max_scroll_top)` (`:760-768`). Deriving it
-/// anywhere else would let the hit test and the paint disagree.
+/// This is ADR-0005 §B-7's only window into the bar: the hit test is
+/// `x == column && track_top <= y < track_top + track_height` (`tui-alt-screen.ts:1036-1051`), the
+/// thumb is `thumb_top <= y < thumb_top + thumb_height`, and a pointer row converts into an offset
+/// with `round(thumb_offset / (track_height - thumb_height) * max_scroll_top)` (`:1068-1078`).
+/// Deriving it anywhere else would let the hit test and the paint disagree.
 pub(super) struct ScrollbarGeom {
     /// The column the thumb occupies — `column` (`layout.ts:39`), upstream's
     /// `box.rect.x + box.rect.width - 1` (`:280`).
@@ -426,9 +425,9 @@ pub(super) fn set_mode(bar: &mut ScrollbarView, scroll: &mut ScrollState, mode: 
     }
 }
 
-/// Report the pointer entering or leaving the thumb — pi's `setScrollbarActive`
+/// Report the pointer entering or leaving the bar's track column — pi's `setScrollbarActive`
 /// (`components/scroll-view.ts:113-117`), driven by the alternate screen's hover tracking
-/// (`tui-alt-screen.ts:735-743`). ADR-0005 §B-7 is its only caller.
+/// (`tui-alt-screen.ts:1053-1062`). ADR-0005 §B-7 is its only caller.
 ///
 /// Both edges mark activity, as upstream does: entering pins an `auto` bar up for as long as the
 /// pointer stays (`:97`), and leaving starts the fade from that moment rather than from the last
@@ -501,132 +500,561 @@ pub(super) fn content_width(bar: &ScrollbarView, width: u16) -> u16 {
 }
 
 /// Where the thumb sits inside `area`, or `None` when none is painted — pi's
-/// `getScrollbarGeometry(box)` (`layout.ts:266-290`).
+/// `getScrollbarGeometry(box)` (`layout.ts:278-306` @v1.0.0) with `includeHiddenAuto` false: the
+/// geometry the PAINTER and a PRESS see, which exists only while the bar is visible.
 ///
-/// The thumb *arithmetic* is ratatui's, not upstream's: [`draw`] paints with
-/// [`ratatui::widgets::Scrollbar`], so the hit test must agree with that widget's own idea of the
-/// thumb rather than with pi's `round(trackHeight² / contentHeight)` (`layout.ts:273-276`). The two
-/// place the thumb within a row of each other and differ only in rounding; a hit test that
-/// disagreed with the paint by even one row would be a bug the user feels. The reproduction below
-/// mirrors `Scrollbar::part_lengths` and is fed the identical `ScrollbarState` inputs [`draw`]
-/// uses, so the agreement holds by construction.
+/// `area` is the scroll document's rectangle and the only thing consulted for placement — the track
+/// is its rightmost column over its full height — so a document laid out above an input dock is
+/// measured by its own rect, never by the terminal's.
 pub(super) fn geometry(
     bar: &ScrollbarView,
     scroll: &ScrollState,
     area: Rect,
 ) -> Option<ScrollbarGeom> {
-    // `if (!box.scrollView?.isScrollbarVisible || …) return undefined;` (`layout.ts:267`).
-    if !is_visible(bar, scroll) || area.width == 0 || area.height == 0 {
+    geometry_with(bar, scroll, area, false)
+}
+
+/// [`geometry`] with pi's `includeHiddenAuto` switch (`layout.ts:278`): when set, an `auto` bar that
+/// is currently faded still answers with its geometry while the content overflows
+/// (`canRevealHiddenAuto`, `:285`). Hover uses it (`updateScrollbarHover`,
+/// `tui-alt-screen.ts:1060-1062`), because that is how a pointer arriving over the faded bar's
+/// column reveals it; a press and the painter do not (`getScrollbarTargetAt(x, y)` defaults it to
+/// false), so a bar nobody can see cannot be grabbed.
+///
+/// The arithmetic is pi's own, not ratatui's `Scrollbar` widget's: [`draw`] is a per-row painter
+/// over this geometry, so the hit test and the paint share one derivation by construction and the
+/// two-row minimum thumb (`Math.min(2, trackHeight)`, `:293`) lives in exactly one place.
+pub(super) fn geometry_with(
+    bar: &ScrollbarView,
+    scroll: &ScrollState,
+    area: Rect,
+    include_hidden_auto: bool,
+) -> Option<ScrollbarGeom> {
+    // `if (!box.scrollView || box.rect.width <= 0 || box.rect.height <= 0) return undefined;`
+    if area.width == 0 || area.height == 0 {
         return None;
     }
-    let (thumb_offset, thumb_height) = thumb_span(
-        area.height,
-        scroll.content_height,
-        scroll.viewport_height,
-        scroll.scroll_top,
-    )?;
+    // `canRevealHiddenAuto = includeHiddenAuto && scrollbar === "auto" && contentHeight >
+    // trackHeight; if (!isScrollbarVisible && !canRevealHiddenAuto) return undefined;`
+    let can_reveal_hidden_auto = include_hidden_auto
+        && bar.mode == ScrollbarMode::Auto
+        && scroll.content_height > usize::from(area.height);
+    if !is_visible(bar, scroll) && !can_reveal_hidden_auto {
+        return None;
+    }
+    let (thumb_offset, thumb_height) =
+        thumb_span(area.height, scroll.content_height, scroll.scroll_top);
     Some(ScrollbarGeom {
-        // `box.rect.x + box.rect.width - 1` (`layout.ts:280`) — the rightmost column, which is also
-        // the one `Scrollbar` takes for `ScrollbarOrientation::VerticalRight`.
+        // `box.rect.x + box.rect.width - 1` (`layout.ts:303`) — the rightmost column.
         column: area.x.saturating_add(area.width.saturating_sub(1)),
         track_top: area.y,
         track_height: area.height,
         thumb_top: area.y.saturating_add(thumb_offset),
         thumb_height,
-        max_scroll_top: max_scroll_top_of(scroll),
+        // `Math.max(0, contentHeight - trackHeight)` (`:297`).
+        max_scroll_top: scroll
+            .content_height
+            .saturating_sub(usize::from(area.height)),
     })
 }
 
-/// The thumb's `(offset from the track top, height)` in rows, reproducing
-/// `ratatui_widgets::scrollbar::Scrollbar::part_lengths` for the arrow-less vertical bar [`draw`]
-/// configures. See [`geometry`] for why this is ratatui's arithmetic rather than pi's.
-fn thumb_span(
-    track_height: u16,
-    content_length: usize,
-    viewport_length: usize,
-    position: usize,
-) -> Option<(u16, u16)> {
-    // `Scrollbar::render` draws nothing at all in either of these cases.
-    if track_height == 0 || content_length == 0 {
-        return None;
-    }
-    let track = usize::from(track_height);
-    // `Scrollbar::viewport_length` falls back to the track when the state carries no viewport
-    // length, which is the shape of a frame drawn before the first `update_layout`. Mirrored here
-    // so the two never disagree about the thumb in that window.
-    let viewport = if viewport_length == 0 {
-        track
+/// The thumb's `(offset from the track top, height)` in rows — the body of pi's
+/// `getScrollbarGeometry` (`layout.ts:292-300` @v1.0.0):
+///
+/// ```text
+/// minThumbHeight = min(2, trackHeight)
+/// thumbHeight    = max(minThumbHeight, min(trackHeight, round(trackHeight² / contentHeight)))
+/// maxScrollTop   = max(0, contentHeight - trackHeight)
+/// thumbOffset    = maxScrollTop === 0 ? 0 : round(scrollTop / maxScrollTop * (trackHeight - thumbHeight))
+/// ```
+///
+/// Computed in `f64` in pi's own operation order, so a quotient that lands on a half rounds the way
+/// `Math.round` does (up) rather than the way an integer rounding division happens to. An empty
+/// document divides by zero in JavaScript to `Infinity`, which `Math.min(trackHeight, …)` turns
+/// into a full-track thumb — the `content == 0` arm.
+fn thumb_span(track_height: u16, content_length: usize, scroll_top: usize) -> (u16, u16) {
+    let track = f64::from(track_height);
+    let min_thumb_height = track_height.min(2);
+    let sized = if content_length == 0 {
+        track_height
     } else {
-        viewport_length
+        // `as u16` saturates, and the `min` below bounds it by the track either way.
+        ((track * track) / content_length as f64).round() as u16
     };
-    let max_position = content_length.saturating_sub(1);
-    let start_position = position.min(max_position);
-    let max_viewport_position = max_position.saturating_add(viewport);
-    if max_viewport_position == 0 {
-        // ratatui's own division-by-zero guard, which yields a full-track thumb.
-        return Some((0, track_height));
-    }
-    let height = rounding_divide(viewport.saturating_mul(track), max_viewport_position)
-        .max(1)
-        .min(track);
-    let offset = rounding_divide(start_position.saturating_mul(track), max_viewport_position)
-        .min(track.saturating_sub(height));
-    // Both values are already clamped into `0..=track`, so the conversions cannot narrow.
-    let height = u16::try_from(height)
-        .unwrap_or(track_height)
-        .min(track_height);
-    let offset = u16::try_from(offset)
-        .unwrap_or(0)
-        .min(track_height.saturating_sub(height));
-    Some((offset, height))
+    let thumb_height = sized.min(track_height).max(min_thumb_height);
+    let max_scroll_top = content_length.saturating_sub(usize::from(track_height));
+    let max_thumb_top = track_height - thumb_height;
+    let thumb_offset = if max_scroll_top == 0 {
+        0
+    } else {
+        let fraction = scroll_top as f64 / max_scroll_top as f64;
+        ((fraction * f64::from(max_thumb_top)).round() as u16).min(max_thumb_top)
+    };
+    (thumb_offset, thumb_height)
 }
 
-/// Integer division rounding to nearest instead of down, as ratatui's private `rounding_divide`
-/// does, with the zero denominator its caller rules out made explicit.
-fn rounding_divide(numerator: usize, denominator: usize) -> usize {
-    if denominator == 0 {
-        return 0;
-    }
-    numerator.saturating_add(denominator / 2) / denominator
+/// `#[cfg(test)]`: pi's `get isScrollbarActive()` (`components/scroll-view.ts:63`), whose only
+/// production reader is [`draw`] inside this module.
+#[cfg(test)]
+pub(super) fn is_hovered(bar: &ScrollbarView) -> bool {
+    bar.hover
 }
 
-/// Paint the thumb over the rightmost column of `area` — pi's `paintScrollbar`
-/// (`layout.ts:292-302`), which styles only the thumb rows and leaves the track alone.
+/// `#[cfg(test)]`: let the `auto` bar's fade deadline pass — a test of a faded bar cannot wait out
+/// [`SCROLLBAR_HIDE_DELAY`], and the instant it compares against is private to this module.
+#[cfg(test)]
+pub(super) fn fade(scroll: &mut ScrollState) {
+    scroll.last_activity = None;
+}
+
+/// The track glyph — `scrollbarTrackStyle("│")` (`layout.ts:314`).
+const TRACK_GLYPH: &str = "│";
+/// The resting thumb glyph — `scrollbarThumbStyle("┃")` (`:313`).
+const THUMB_GLYPH: &str = "┃";
+/// The thumb glyph while the pointer hovers or drags the bar — `isScrollbarActive ? "█" : "┃"`
+/// (`:313`).
+const THUMB_ACTIVE_GLYPH: &str = "█";
+
+/// Paint the bar over the rightmost column of `area`, one row at a time — pi's `paintScrollbar`
+/// (`layout.ts:309-330` @v1.0.0) over [`geometry`].
 ///
-/// The colour is [`UiTheme`]'s already-resolved `scrollbarThumb`, which upstream applies as
-/// `scrollbarStyle: (text) => theme.bg("scrollbarThumb", text)` (`interactive-mode.ts:923`). It is
-/// a *background* token that falls back to the theme's own `selectedBg` in the loader
-/// (`theme.rs:507`, `theme.rs:1056-1060`), so no new theme key is introduced and a theme that omits
-/// it still paints. A theme that resolves it to nothing paints nothing, which is upstream's
-/// behaviour when `theme.bg` has no colour to emit.
+/// Every row of the track is written: `│` in the theme's `scrollbarTrack` foreground, and on the
+/// thumb's rows `┃` — `█` while the pointer hovers or drags it ([`set_hover`]) — in
+/// `scrollbarThumb` (both [`UiTheme`] foregrounds, falling back to `muted` / `text`). The cell's own
+/// background is kept for every mode except `always` (`replaceScrollbarCell(…, scrollbar !==
+/// "always")`, `:327`), where the column is reserved and the bar stands on the terminal default.
+/// Everything else about the cell is replaced: pi opens the replacement with a full SGR reset, so
+/// bold, underline and the old foreground do not leak onto the glyph.
 ///
-/// The track, the arrow heads and the pi-style glyph restyle are all suppressed: `begin_symbol`,
-/// `end_symbol` and `track_symbol` are `None` so only the thumb rows are written, and the thumb is
-/// a space carrying the background colour. That covers the cell underneath, where upstream restyles
-/// the character in place (`layout.ts:300`) — visible only for `auto`, which by design does not
-/// reserve a column of its own.
+/// `[CYRUP-DELTA]` (mechanism only): pi splices the glyph into a rendered ANSI line and pads the
+/// grapheme it displaced (`replaceScrollbarCell`, `:255-277`); cyrup writes the [`Buffer`] cell and,
+/// where the target is the trailing half of a double-width glyph, blanks the leading half so the
+/// terminal does not draw the wide character over the bar.
 pub(super) fn draw(
-    bar: &mut ScrollbarView,
+    bar: &ScrollbarView,
     scroll: &ScrollState,
     theme: &UiTheme,
     frame: &mut Frame,
     area: Rect,
 ) {
-    if !is_visible(bar, scroll) || area.width == 0 || area.height == 0 {
-        return;
-    }
-    let Some(thumb) = theme.backgrounds().scrollbar_thumb else {
+    let Some(geom) = geometry(bar, scroll, area) else {
         return;
     };
-    // The same three inputs `thumb_span` reads, so the painted thumb and `geometry` agree.
-    bar.state = ScrollbarState::new(scroll.content_height)
-        .viewport_content_length(scroll.viewport_height)
-        .position(scroll.scroll_top);
-    let widget = Scrollbar::new(ScrollbarOrientation::VerticalRight)
-        .begin_symbol(None)
-        .end_symbol(None)
-        .track_symbol(None)
-        .thumb_symbol(" ")
-        .thumb_style(Style::default().bg(thumb));
-    frame.render_stateful_widget(widget, area, &mut bar.state);
+    // `theme.fg(token, …)` on a token that resolves to the terminal default emits the default-
+    // foreground code, i.e. `Color::Reset`.
+    let track_fg = theme.scrollbar_track().unwrap_or(Color::Reset);
+    let thumb_fg = theme.scrollbar_thumb().unwrap_or(Color::Reset);
+    let keep_background = bar.mode != ScrollbarMode::Always;
+    let thumb_rows = geom.thumb_top..geom.thumb_top.saturating_add(geom.thumb_height);
+    let buffer = frame.buffer_mut();
+    for offset in 0..geom.track_height {
+        let row = geom.track_top.saturating_add(offset);
+        let (glyph, fg) = if thumb_rows.contains(&row) {
+            let glyph = if bar.hover {
+                THUMB_ACTIVE_GLYPH
+            } else {
+                THUMB_GLYPH
+            };
+            (glyph, thumb_fg)
+        } else {
+            (TRACK_GLYPH, track_fg)
+        };
+        replace_cell(
+            buffer,
+            Position::new(geom.column, row),
+            glyph,
+            fg,
+            keep_background,
+        );
+    }
+}
+
+/// Overwrite one cell with `glyph` in foreground `fg` — pi's `replaceScrollbarCell`
+/// (`layout.ts:255-277`). A position outside the buffer is skipped, which is the clip check in
+/// `paintScrollbar` (`row < 0 || row >= screen.length`).
+fn replace_cell(buffer: &mut Buffer, at: Position, glyph: &str, fg: Color, keep_background: bool) {
+    // The cell to the left may be the leading half of a double-width glyph whose trailing half is
+    // `at`: ratatui would skip our cell when it emits the wide one, so blank that half first.
+    if let Some(left_x) = at.x.checked_sub(1)
+        && let Some(left) = buffer.cell_mut(Position::new(left_x, at.y))
+        && str_width(left.symbol()) > 1
+    {
+        restyle(left, " ", Color::Reset, keep_background);
+    }
+    if let Some(cell) = buffer.cell_mut(at) {
+        restyle(cell, glyph, fg, keep_background);
+    }
+}
+
+/// A full style reset, then (when preserved) the old background, then `fg` and `glyph`.
+fn restyle(cell: &mut Cell, glyph: &str, fg: Color, keep_background: bool) {
+    let background = cell.bg;
+    cell.reset();
+    cell.set_symbol(glyph).set_fg(fg);
+    if keep_background {
+        cell.set_bg(background);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::panic
+    )]
+
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use ratatui::style::Modifier;
+    use ratatui::text::Text;
+    use ratatui::widgets::Paragraph;
+
+    use super::*;
+
+    /// Terminal width. The document rect is narrower than the terminal and SHORTER than it: the
+    /// rows below it are where an input dock would be painted, and nothing here may touch them.
+    const TERM_W: u16 = 30;
+    const TERM_H: u16 = 20;
+
+    fn view(mode: ScrollbarMode, content: usize, viewport: usize) -> (ScrollbarView, ScrollState) {
+        let mut bar = ScrollbarView::default();
+        let mut state = ScrollState::default();
+        set_mode(&mut bar, &mut state, mode);
+        update_layout(&mut state, content, viewport);
+        // A scroll view that follows its tail starts at the bottom; pi's fixtures start at the top
+        // with no movement yet, so an `auto` bar is faded until a test scrolls.
+        scroll_to_row(&mut state, 0);
+        fade(&mut state);
+        (bar, state)
+    }
+
+    /// A theme whose track and thumb are distinguishable from each other and from `muted`/`text`.
+    fn themed() -> UiTheme {
+        let mut theme = UiTheme::dark();
+        theme
+            .roles
+            .insert("scrollbarTrack".to_owned(), Color::Rgb(1, 2, 3));
+        theme
+            .roles
+            .insert("scrollbarThumb".to_owned(), Color::Rgb(4, 5, 6));
+        theme
+    }
+
+    /// Paint `texts` (one per row, from `(rect.x, rect.y)`) over a `fill` style, then the bar, and
+    /// return the buffer.
+    fn paint(
+        bar: &ScrollbarView,
+        state: &ScrollState,
+        theme: &UiTheme,
+        rect: Rect,
+        texts: &[&str],
+        fill: ratatui::style::Style,
+    ) -> Buffer {
+        let mut terminal = Terminal::new(TestBackend::new(TERM_W, TERM_H)).unwrap();
+        terminal
+            .draw(|frame| {
+                let lines: Vec<ratatui::text::Line<'_>> = texts
+                    .iter()
+                    .map(|t| ratatui::text::Line::styled((*t).to_owned(), fill))
+                    .collect();
+                frame.render_widget(Paragraph::new(Text::from(lines)).style(fill), rect);
+                draw(bar, state, theme, frame, rect);
+            })
+            .unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    fn symbol(buffer: &Buffer, x: u16, y: u16) -> String {
+        buffer.cell((x, y)).unwrap().symbol().to_owned()
+    }
+
+    /// The glyphs down column `x` over rows `top..top + rows`.
+    fn column(buffer: &Buffer, x: u16, top: u16, rows: u16) -> Vec<String> {
+        (top..top + rows).map(|y| symbol(buffer, x, y)).collect()
+    }
+
+    /// `renders a proportional glyph scrollbar with an expanded active thumb`
+    /// (`test/layout.test.ts:193-241` @v1.0.0): 8 rows in a 4-row viewport, scrolled by 2 — track
+    /// `│` on the first and last row, `┃` on the two thumb rows, `█` while the pointer holds it —
+    /// in the track and thumb FOREGROUND colours, over a document rect shorter than the terminal.
+    #[test]
+    fn the_bar_is_a_per_row_glyph_painter() {
+        let rect = Rect::new(3, 2, 6, 4);
+        let (mut bar, mut state) = view(ScrollbarMode::Auto, 8, 4);
+        scroll_by(&mut state, 2);
+        let theme = themed();
+        let rows = ["abcd界", "abcde2", "abcde3", "abcde4"];
+        let buffer = paint(
+            &bar,
+            &state,
+            &theme,
+            rect,
+            &rows,
+            ratatui::style::Style::default(),
+        );
+
+        assert_eq!(column(&buffer, 8, 2, 4), ["│", "┃", "┃", "│"]);
+        assert_eq!(
+            buffer.cell((8, 2)).unwrap().fg,
+            Color::Rgb(1, 2, 3),
+            "track fg"
+        );
+        assert_eq!(
+            buffer.cell((8, 3)).unwrap().fg,
+            Color::Rgb(4, 5, 6),
+            "thumb fg"
+        );
+        assert_eq!(buffer.cell((8, 4)).unwrap().fg, Color::Rgb(4, 5, 6));
+        assert_eq!(buffer.cell((8, 5)).unwrap().fg, Color::Rgb(1, 2, 3));
+        // The document text beside the bar is untouched, and nothing below the rect is.
+        assert_eq!(symbol(&buffer, 3, 3), "a");
+        assert!(
+            column(&buffer, 8, 6, 8).iter().all(|s| s == " "),
+            "the dock rows stay empty"
+        );
+
+        set_hover(&mut bar, &mut state, true);
+        let buffer = paint(
+            &bar,
+            &state,
+            &theme,
+            rect,
+            &rows,
+            ratatui::style::Style::default(),
+        );
+        assert_eq!(
+            column(&buffer, 8, 2, 4),
+            ["│", "█", "█", "│"],
+            "active thumb"
+        );
+    }
+
+    /// The track is painted on EVERY row of the document rect, not just beside the thumb.
+    #[test]
+    fn every_row_of_the_last_column_is_track_or_thumb() {
+        let rect = Rect::new(0, 3, 12, 10);
+        let (bar, state) = view(ScrollbarMode::Always, 100, 10);
+        let buffer = paint(
+            &bar,
+            &state,
+            &themed(),
+            rect,
+            &[],
+            ratatui::style::Style::default(),
+        );
+        let glyphs = column(&buffer, 11, 3, 10);
+        assert!(
+            glyphs.iter().all(|g| g == "│" || g == "┃"),
+            "no gap in the track: {glyphs:?}"
+        );
+        assert_eq!(
+            glyphs.iter().filter(|g| *g == "┃").count(),
+            2,
+            "min thumb is two rows"
+        );
+        assert_eq!(
+            symbol(&buffer, 11, 2),
+            " ",
+            "the row above the rect is not the bar's"
+        );
+        assert_eq!(symbol(&buffer, 11, 13), " ", "nor the row below it");
+    }
+
+    /// pi's thumb sizing, `round(track² / content)` clamped to `[min(2, track), track]` — the
+    /// four sizes in `layout.test.ts:225-237` (21 -> 19, 40 -> 10, 100 -> 4, 400 -> 2) on a 20-row
+    /// track, and the one-row-track corner `min(2, 1)`.
+    #[test]
+    fn thumb_height_is_proportional_with_a_two_row_minimum() {
+        let area = Rect::new(2, 4, 10, 20);
+        for (content, expected) in [(21, 19), (40, 10), (100, 4), (400, 2), (100_000, 2)] {
+            let (bar, state) = view(ScrollbarMode::Always, content, 20);
+            let geom = geometry(&bar, &state, area).unwrap();
+            assert_eq!(geom.thumb_height, expected, "content {content}");
+            assert_eq!(geom.track_height, 20);
+            assert_eq!(geom.track_top, 4, "placement comes from the rect");
+            assert_eq!(geom.column, 11);
+        }
+        let one_row = Rect::new(0, 0, 4, 1);
+        let (bar, state) = view(ScrollbarMode::Always, 500, 1);
+        assert_eq!(geometry(&bar, &state, one_row).unwrap().thumb_height, 1);
+        let three_rows = Rect::new(0, 0, 4, 3);
+        let (bar, state) = view(ScrollbarMode::Always, 9_000, 3);
+        assert_eq!(geometry(&bar, &state, three_rows).unwrap().thumb_height, 2);
+    }
+
+    /// The thumb offset is `round(scrollTop / maxScrollTop * (track - thumb))` (`layout.ts:299`):
+    /// top at the start, bottom at the end, and exactly half way at a half-way scrollTop.
+    #[test]
+    fn thumb_offset_follows_the_scroll_position() {
+        let area = Rect::new(0, 1, 8, 10);
+        let (bar, mut state) = view(ScrollbarMode::Always, 50, 10);
+        assert_eq!(geometry(&bar, &state, area).unwrap().thumb_top, 1);
+        scroll_to_row(&mut state, 20);
+        // thumb 2 rows, 8 free: round(20/40 * 8) = 4 -> top at 1 + 4.
+        assert_eq!(geometry(&bar, &state, area).unwrap().thumb_top, 5);
+        scroll_to_bottom(&mut state);
+        let geom = geometry(&bar, &state, area).unwrap();
+        assert_eq!(geom.thumb_top + geom.thumb_height, area.y + area.height);
+        assert_eq!(geom.max_scroll_top, 40);
+    }
+
+    /// `always` with content that FITS: pi still shows the bar and the thumb fills the track
+    /// (`layout.test.ts:268-272`), and the column is reserved.
+    #[test]
+    fn an_always_bar_over_fitting_content_is_one_full_thumb() {
+        let rect = Rect::new(0, 0, 6, 4);
+        let (bar, state) = view(ScrollbarMode::Always, 2, 4);
+        let buffer = paint(
+            &bar,
+            &state,
+            &themed(),
+            rect,
+            &[],
+            ratatui::style::Style::default(),
+        );
+        assert_eq!(column(&buffer, 5, 0, 4), ["┃", "┃", "┃", "┃"]);
+    }
+
+    /// `preserves only the underlying background beneath overlay scrollbar glyphs`
+    /// (`layout.test.ts:306-332`): in `auto` the cell keeps its background and loses its other
+    /// styling — the old foreground and bold do not leak onto the glyph — while `always` stands on
+    /// the terminal default.
+    #[test]
+    fn auto_keeps_the_cell_background_and_always_does_not() {
+        let rect = Rect::new(0, 0, 6, 4);
+        let fill = ratatui::style::Style::default()
+            .bg(Color::Green)
+            .fg(Color::Red)
+            .add_modifier(Modifier::BOLD);
+        let rows = ["xxxxxx", "xxxxxx", "xxxxxx", "xxxxxx"];
+
+        let (mut bar, mut state) = view(ScrollbarMode::Auto, 8, 4);
+        scroll_by(&mut state, 1);
+        let buffer = paint(&bar, &state, &themed(), rect, &rows, fill);
+        for y in 0..4 {
+            let cell = buffer.cell((5, y)).unwrap();
+            assert!(matches!(cell.symbol(), "│" | "┃"), "row {y}");
+            assert_eq!(
+                cell.bg,
+                Color::Green,
+                "row {y}: the document's background is kept"
+            );
+            assert_ne!(
+                cell.fg,
+                Color::Red,
+                "row {y}: the old foreground is replaced"
+            );
+            assert!(
+                !cell.modifier.contains(Modifier::BOLD),
+                "row {y}: bold does not leak"
+            );
+            assert_eq!(
+                buffer.cell((4, y)).unwrap().bg,
+                Color::Green,
+                "neighbours untouched"
+            );
+        }
+
+        set_mode(&mut bar, &mut state, ScrollbarMode::Always);
+        let buffer = paint(&bar, &state, &themed(), rect, &rows, fill);
+        for y in 0..4 {
+            assert_eq!(
+                buffer.cell((5, y)).unwrap().bg,
+                Color::Reset,
+                "row {y}: `always` resets"
+            );
+        }
+    }
+
+    /// `renders a proportional glyph scrollbar …` at the start (`layout.test.ts:244-246`): the
+    /// bar column is the trailing half of a double-width glyph, so the glyph is replaced by a
+    /// space and the bar takes the cell — `"abcd ┃"`.
+    #[test]
+    fn a_double_width_glyph_under_the_bar_is_blanked() {
+        let rect = Rect::new(0, 0, 6, 4);
+        let (bar, mut state) = view(ScrollbarMode::Auto, 8, 4);
+        scroll_to_row(&mut state, 2);
+        scroll_to_top(&mut state);
+        let rows = ["abcd界", "abcde2", "abcde3", "abcde4"];
+        let buffer = paint(
+            &bar,
+            &state,
+            &themed(),
+            rect,
+            &rows,
+            ratatui::style::Style::default(),
+        );
+        let first_row: String = (0..6).map(|x| symbol(&buffer, x, 0)).collect();
+        assert_eq!(first_row, "abcd ┃");
+    }
+
+    /// Nothing is painted when the bar is not showing: `hidden`, and a faded `auto` bar — whose
+    /// geometry exists only for a hover lookup, never for the painter.
+    #[test]
+    fn a_hidden_or_faded_bar_paints_nothing() {
+        let rect = Rect::new(0, 0, 6, 4);
+        let rows = ["abcde1", "abcde2", "abcde3", "abcde4"];
+        let (bar, mut state) = view(ScrollbarMode::Hidden, 100, 4);
+        scroll_by(&mut state, 3);
+        let buffer = paint(
+            &bar,
+            &state,
+            &themed(),
+            rect,
+            &rows,
+            ratatui::style::Style::default(),
+        );
+        assert_eq!(column(&buffer, 5, 0, 4), ["1", "2", "3", "4"]);
+
+        // `auto` that has never moved is faded.
+        let (bar, state) = view(ScrollbarMode::Auto, 100, 4);
+        assert!(!is_visible(&bar, &state));
+        assert!(geometry(&bar, &state, rect).is_none());
+        let buffer = paint(
+            &bar,
+            &state,
+            &themed(),
+            rect,
+            &rows,
+            ratatui::style::Style::default(),
+        );
+        assert_eq!(column(&buffer, 5, 0, 4), ["1", "2", "3", "4"]);
+        // …but a hover lookup finds it while the content overflows (`includeHiddenAuto`).
+        assert!(geometry_with(&bar, &state, rect, true).is_some());
+        let (bar_fit, state_fit) = view(ScrollbarMode::Auto, 4, 4);
+        assert!(
+            geometry_with(&bar_fit, &state_fit, rect, true).is_none(),
+            "nothing to scroll"
+        );
+    }
+
+    /// With no `scrollbarTrack`/`scrollbarThumb` in the theme the painter uses the theme's own
+    /// `muted` and `text` (`theme.ts:173-174`) — never a background, never a hardcoded colour.
+    #[test]
+    fn omitted_theme_tokens_paint_muted_and_text() {
+        let rect = Rect::new(0, 0, 6, 4);
+        // pi's own `dark.json` configures both tokens; the fallback is for a theme that omits them.
+        let mut theme = UiTheme::dark();
+        theme.roles.remove("scrollbarTrack");
+        theme.roles.remove("scrollbarThumb");
+        let (bar, mut state) = view(ScrollbarMode::Auto, 8, 4);
+        scroll_by(&mut state, 2);
+        let buffer = paint(
+            &bar,
+            &state,
+            &theme,
+            rect,
+            &[],
+            ratatui::style::Style::default(),
+        );
+        assert_eq!(Some(buffer.cell((5, 0)).unwrap().fg), theme.muted);
+        assert_eq!(Some(buffer.cell((5, 1)).unwrap().fg), theme.foreground);
+        assert_eq!(
+            buffer.cell((5, 1)).unwrap().bg,
+            Color::Reset,
+            "the thumb is not a background fill"
+        );
+    }
 }

@@ -29,3 +29,4 @@ mod install_package_dir;
 mod list_models_session;
 mod models_json_resolution;
 mod stored_credentials;
+mod theme_boot_no_persist;

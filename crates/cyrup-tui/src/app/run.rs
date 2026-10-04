@@ -16,6 +16,9 @@ pub(crate) struct RunCtx {
     pub(crate) overlay_tick: Option<tokio::time::Interval>,
     pub(crate) bash_rx: Option<tokio::sync::mpsc::UnboundedReceiver<BashMsg>>,
     pub(crate) package_update_rx: Option<tokio::sync::mpsc::UnboundedReceiver<Vec<String>>>,
+    /// The terminal's colours, delivered after the boot query gave up (Pi's `onLateReply`).
+    pub(crate) terminal_colors_rx:
+        Option<tokio::sync::mpsc::UnboundedReceiver<crate::TerminalColors>>,
     pub(crate) ui_tx: tokio::sync::mpsc::UnboundedSender<UiRequest>,
     pub(crate) ui_effect_tx: tokio::sync::mpsc::UnboundedSender<UiEffect>,
     pub(crate) ext_error_tx: tokio::sync::mpsc::UnboundedSender<cyrup_ext::ExtensionError>,
@@ -207,6 +210,7 @@ impl App<InlineBackend<TuiStdout>> {
         // run-loop-local shape as `bash_rx` / `tree_nav_rx`. `None` when the binary wired no channel
         // (offline / `--offline` / `CYRUP_SKIP_VERSION_CHECK`), in which case the arm never resolves.
         let package_update_rx = self.package_update_rx.take();
+        let terminal_colors_rx = self.terminal_colors_rx.take();
         let mut ctx = RunCtx {
             session,
             runtime,
@@ -216,6 +220,7 @@ impl App<InlineBackend<TuiStdout>> {
             overlay_tick,
             bash_rx,
             package_update_rx,
+            terminal_colors_rx,
             ui_tx,
             ui_effect_tx,
             ext_error_tx,
@@ -267,6 +272,14 @@ impl App<InlineBackend<TuiStdout>> {
             // runtime is threaded in, never resolves (single fixed session).
             let package_updates = async {
                 match ctx.package_update_rx.as_mut() {
+                    Some(rx) => rx.recv().await,
+                    None => std::future::pending().await,
+                }
+            };
+            // The terminal's colours arriving after the boot query's deadline. Never resolves when
+            // no channel was installed.
+            let terminal_colors = async {
+                match ctx.terminal_colors_rx.as_mut() {
                     Some(rx) => rx.recv().await,
                     None => std::future::pending().await,
                 }
@@ -439,6 +452,7 @@ impl App<InlineBackend<TuiStdout>> {
                 maybe_updates = package_updates => self.on_package_updates(&mut ctx, maybe_updates)?,
                 Some(warning) = tmux_warning_rx.recv() => self.on_tmux_warning(warning)?,
                 Some(theme) = theme_switch_rx.recv() => self.on_theme_switch(&mut ctx, theme).await?,
+                Some(colors) = terminal_colors => self.on_terminal_colors(&ctx, colors)?,
                 Some(msg) = login_rx.recv() => self.on_login_msg(&mut ctx, msg).await?,
                 Some(msg) = login_refresh_rx.recv() => self.on_login_refresh_msg(&mut ctx, msg).await?,
                 Some(msg) = model_refresh_rx.recv() => self.on_model_refresh_msg(&mut ctx, msg)?,
@@ -516,7 +530,7 @@ impl App<InlineBackend<TuiStdout>> {
                 // The WHOLE frame, as `handle_mouse` takes it — `timers::tick` derives the
                 // document viewport from it with `scroll::content_width` itself, so the rows the
                 // auto-scroll re-resolves the pointer over are the rows the user can see.
-                let area = alt.area();
+                let area = alt.doc_area();
                 alt.tick(area)
             }
             None => false,

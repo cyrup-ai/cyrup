@@ -62,8 +62,8 @@ fn structured_sub_themes_make_every_bg_and_thinking_field_addressable() {
     assert_eq!(think.xhigh, Color::Rgb(0xd1, 0x83, 0xe8));
     assert_eq!(
         think.low,
-        Color::Rgb(0x5f, 0x87, 0xaf),
-        "omitted level uses the spec dark fallback"
+        Color::Rgb(0x54, 0x89, 0xa4),
+        "omitted level uses the v1.0.0 dark.json value"
     );
     // PROV-002: this assembled theme predates the `max` rung and omits `thinkingMax`, so it must
     // reuse its OWN resolved `xhigh` color (Pi's `thinkingMax ?? thinkingXhigh`, theme.ts:329) —
@@ -160,18 +160,19 @@ fn theme_controller_resolves_auto_and_unset_against_terminal_background() {
         "auto setting on a dark terminal → dark"
     );
 
-    // An unset setting falls back to the terminal polarity's theme name (never hardwired dark).
+    // An unset setting is the generated `system` theme whatever the polarity (pi
+    // `resolveThemeName` ends in `?? SYSTEM_THEME_NAME`); the polarity only feeds its generation.
     let unset_light = ThemeController::boot(None, ColorMode::TrueColor, TerminalTheme::Light);
     assert_eq!(
         unset_light.active_name(),
-        "light",
-        "unset setting on a light terminal → light"
+        "system",
+        "unset setting on a light terminal → system"
     );
     let unset_dark = ThemeController::boot(None, ColorMode::TrueColor, TerminalTheme::Dark);
     assert_eq!(
         unset_dark.active_name(),
-        "dark",
-        "unset setting on a dark terminal → dark"
+        "system",
+        "unset setting on a dark terminal → system"
     );
 }
 
@@ -289,5 +290,68 @@ fn from_theme_data_resolves_okhsl_and_oklch_values() {
         theme.backgrounds().selected,
         Some(Color::Rgb(46, 60, 68)),
         "okhsl(231.49 20% 25%) as pi computes it"
+    );
+}
+
+/// pi's `resolveVarRefs` follows a variable through any number of hops, and a palette index or the
+/// empty string is a value in its own right: the index stays an index (so a 256-colour terminal
+/// shows the user's own palette entry), and `""` is the terminal default.
+///
+/// RED if the resolver stops after one hop (the chained role would answer the sentinel) or if an
+/// index is turned into a fixed RGB value.
+#[test]
+fn from_theme_data_follows_chained_vars_and_keeps_indices_and_the_terminal_default() {
+    let data: ThemeData = serde_json::from_str(
+        r##"{
+            "name": "chained",
+            "vars": { "a": "b", "b": "c", "c": "#112233", "slot": 5 },
+            "colors": { "text": "a", "accent": "slot", "border": "", "error": 9 }
+        }"##,
+    )
+    .unwrap();
+    let theme = UiTheme::from_theme_data(&data, 0);
+    assert_eq!(
+        theme.role_color("text", "#000000"),
+        Color::Rgb(0x11, 0x22, 0x33)
+    );
+    assert_eq!(theme.accent, Some(Color::Indexed(5)));
+    assert_eq!(theme.error, Some(Color::Indexed(9)));
+    assert_eq!(theme.border, Some(Color::Reset));
+
+    // The depth projection leaves an index alone and never invents an RGB value for it.
+    for mode in [ColorMode::TrueColor, ColorMode::Ansi256] {
+        let projected = theme.clone().with_color_mode(mode);
+        assert_eq!(projected.accent, Some(Color::Indexed(5)), "{mode:?}");
+        assert_eq!(projected.border, Some(Color::Reset), "{mode:?}");
+    }
+}
+
+/// A role the theme leaves undefined falls back to the hex of the theme's OWN polarity, and the
+/// polarity is the theme's `appearance`: a declared one beats what its colours average to.
+///
+/// RED if the fallback pair is chosen from the colours alone: this theme declares `light` over
+/// colours that average dark, so it would draw the dark pair's `#9da5a9` rule.
+#[test]
+fn an_undefined_role_falls_back_to_the_pair_member_of_the_declared_appearance() {
+    let declared = |appearance: &str| -> UiTheme {
+        let data: ThemeData = serde_json::from_str(&format!(
+            r##"{{
+                "name": "declared",
+                "appearance": "{appearance}",
+                "colors": {{ "text": "#101010", "selectedBg": "#202020" }}
+            }}"##
+        ))
+        .unwrap();
+        UiTheme::from_theme_data(&data, 0)
+    };
+    assert_eq!(
+        declared("light").md_hr_style().fg,
+        Some(Color::Rgb(0x67, 0x71, 0x76)),
+        "light.json's `muted`"
+    );
+    assert_eq!(
+        declared("dark").md_hr_style().fg,
+        Some(Color::Rgb(0x9d, 0xa5, 0xa9)),
+        "dark.json's `muted`"
     );
 }

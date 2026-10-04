@@ -55,8 +55,8 @@ fn the_active_theme_changes_the_exported_palette() {
         &state,
     );
 
-    assert!(dark.contains("--body-bg: #18181e;"));
-    assert!(light.contains("--body-bg: #f8f8f8;"));
+    assert!(dark.contains("--body-bg: #21252c;"));
+    assert!(light.contains("--body-bg: #efeeee;"));
     assert_ne!(dark, light);
     // The constant palette the pre-DRIFT-041 renderer hardcoded.
     assert!(!dark.contains("#1e1e2e"));

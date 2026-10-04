@@ -266,6 +266,13 @@ pub(crate) enum RenderSlot {
     ActiveToolCall(usize),
     /// `active_tools[i]`'s RESULT side.
     ActiveToolResult(usize),
+    /// `document[i]`, an [`Entry::Custom`]'s `rendered` — a retained entry, which the alternate
+    /// screen repaints from and so can show a fresh render (an inline-flushed row cannot).
+    DocumentCustom(usize),
+    /// `document[i]`, an [`Entry::Tool`]'s CALL side.
+    DocumentToolCall(usize),
+    /// `document[i]`, an [`Entry::Tool`]'s RESULT side.
+    DocumentToolResult(usize),
 }
 
 /// One row whose extension render was produced under display inputs that no longer hold.
@@ -424,4 +431,8 @@ pub struct ToolRun {
     /// (`tool-execution.ts:331-350` filters `content` for `type === "image"` on every display
     /// update). Decoding here rather than per frame keeps a screenshot-sized PNG off the redraw path.
     pub images: Vec<ResultImage>,
+    /// A click override set while the run was still live (`createResultRegion`, which answers as
+    /// soon as a result exists). It is carried onto the sequence-keyed override the committed entry
+    /// renders with the moment the run commits, then cleared — see `transcript/expansion.rs`.
+    pub(super) live_expansion: Option<Expansion>,
 }

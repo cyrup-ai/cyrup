@@ -25,7 +25,9 @@ use ratatui::widgets::Paragraph;
 use crate::fuzzy;
 use crate::keymap::{EditorKeymap, SelectAction, SelectKeymap};
 use crate::select_list::{ColumnLayout, SelectItem, SelectList};
-use crate::selector::{Selector, SelectorOutcome, border_rule_line, input_line_spans};
+use crate::selector::{
+    Selector, SelectorOutcome, border_rule_line, input_line_spans, list_outcome, list_pointer,
+};
 use crate::text_input::{Input, InputOutcome};
 use crate::theme::UiTheme;
 
@@ -139,7 +141,26 @@ impl SubmenuSelector {
 
     /// The rendered envelope, in pi's child order (`settings-submenu.ts:56-91`).
     fn lines(&self, width: u16, theme: &UiTheme) -> Vec<Line<'static>> {
-        let mut lines = Vec::with_capacity(self.values.len().saturating_add(9));
+        let mut lines = self.head_lines(width, theme);
+        lines.extend(self.list.lines(width, theme)); // :80-83
+        lines.push(Line::from("")); // :86
+        lines.push(Line::from(Span::styled(
+            if self.input.is_some() {
+                "  Type to filter \u{b7} Enter to select \u{b7} Esc to go back"
+            } else {
+                "  Enter to select \u{b7} Esc to go back"
+            },
+            theme.dim_style(),
+        ))); // :87-91
+        lines.push(border_rule_line(width, theme));
+        lines
+    }
+
+    /// Everything above the list (`settings-submenu.ts:56-77`), up to and including the blank
+    /// before it. Its length is the slot row the list's first item is painted on, which is what
+    /// [`Selector::pointer`] hit-tests against.
+    fn head_lines(&self, width: u16, theme: &UiTheme) -> Vec<Line<'static>> {
+        let mut lines = Vec::with_capacity(8);
         lines.push(border_rule_line(width, theme));
         lines.push(Line::from(Span::styled(
             self.title.clone(),
@@ -165,18 +186,14 @@ impl SubmenuSelector {
             ))); // :70-74
         }
         lines.push(Line::from("")); // :77
-        lines.extend(self.list.lines(width, theme)); // :80-83
-        lines.push(Line::from("")); // :86
-        lines.push(Line::from(Span::styled(
-            if self.input.is_some() {
-                "  Type to filter \u{b7} Enter to select \u{b7} Esc to go back"
-            } else {
-                "  Enter to select \u{b7} Esc to go back"
-            },
-            theme.dim_style(),
-        ))); // :87-91
-        lines.push(border_rule_line(width, theme));
         lines
+    }
+
+    /// The slot row the list's first item is painted on: the number of rows above it.
+    fn first_list_row(&self, width: u16) -> u16 {
+        self.head_lines(width, UiTheme::default_ref())
+            .len()
+            .min(usize::from(u16::MAX)) as u16
     }
 }
 
@@ -190,6 +207,20 @@ impl Selector for SubmenuSelector {
     fn render(&mut self, frame: &mut Frame, area: Rect, theme: &UiTheme) {
         let lines = self.lines(area.width, theme);
         frame.render_widget(Paragraph::new(lines).style(theme.base_style()), area);
+    }
+
+    fn pointer(&mut self, area: Rect, event: crate::app::Pointer) -> SelectorOutcome {
+        let top = self.first_list_row(area.width);
+        let available = area.height.saturating_sub(top);
+        let answer = list_pointer(&mut self.list, top, available, event);
+        list_outcome(
+            answer,
+            || SelectorOutcome::Redraw,
+            || match self.current_value() {
+                Some(value) => SelectorOutcome::Confirm(value),
+                None => SelectorOutcome::Redraw,
+            },
+        )
     }
 
     fn handle(&mut self, key: &KeyEvent, keymap: &SelectKeymap) -> SelectorOutcome {

@@ -72,6 +72,35 @@ next work item**.
 > **Nothing was filed and no open row was annotated.** Ids are unmoved, so every *Next free ids* line
 > in the blocks below still holds.
 
+# UPDATE 2026-10-04 (fullscreen default) — the alternate screen made whole: ten rows closed, three filed (`claude/fullscreen-tui-default`)
+
+> **This block sits above the ledger-corrections block and moves its counts.** The count is whatever
+> `python3 docs/gap-analysis/scripts/count_open_items.py` prints: **169 open: 0 critical, 0 high, 21 medium,
+> 148 low; 17 trackers; 861 closed; 1 duplicate not counted** (before: 176 open, 1 high, 25 medium, 150 low,
+> 850 closed). Arithmetic: open 176 − 10 closed + 3 filed = 169; high 1 − 1 (`TUI-107`) = 0; medium 25 − 4
+> (`TUI-110`, `TUI-130`, `TUI-131`, `TUI-136`) = 21; low 150 − 5 (`TUI-124`, `TUI-125`, `TUI-132`, `TUI-133`,
+> `TUI-134`) + 3 filed = 148; closed 850 + 10 + `CFG-100` (the closed duplicate of `TUI-136`) = 861.
+>
+> * **A false premise, found by reading the frame.** `TUI-107` said the editor, selectors and footer were painted
+>   in fullscreen and ignored clicks. They were not painted at all: the alternate-screen frame was the transcript
+>   and nothing else (`app/draw.rs` had a "known residual: no chrome" note), the turn still streaming was
+>   invisible until it committed, and an overlay that was not drawn still took every key. The default had been
+>   flipped to fullscreen on a renderer in that state. The work was therefore the dock, the in-flight turn and the
+>   overlays first (`app/regions.rs`, `altscreen::Chrome`), then the pointer on top of them (ADR-0005 amendment
+>   (b)). `TUI-107`'s ledger text said the chrome was painted; that sentence in the coverage table is corrected.
+> * **Closed (each row carries its evidence).** `07`: `TUI-107` (dock, in-flight turn, overlays, pointer for the
+>   editor, popup, all 15 selectors, transcript entries and overlays), `TUI-110` (scrollbar), `TUI-136` (wheel
+>   accelerator and `fullscreenWheelScrollLines`, with `CFG-100`), `TUI-124` and `TUI-125` (extension overlays:
+>   pointer and theme roles), `TUI-130` (the `system` theme and the default), `TUI-131` (verified, four residuals
+>   fixed), `TUI-132` (v1.0.0 palettes and `appearance`), `TUI-133` (the colour query), `TUI-134` (no persisted
+>   theme).
+> * **Filed.** `TUI-147` (text selection cannot reach the dock), `TUI-148` (the extension header does not scroll
+>   with the document), `TUI-149` (surfaces that do not know the `system` theme). Next free id `TUI-150`.
+> * **Not pi behaviour, stated.** After a click toggle the viewport is re-anchored so the toggled block stays under
+>   the pointer (`altscreen/toggle.rs`, one call to remove); pi leaves `scrollTop`.
+
+---
+
 # UPDATE 2026-10-03 (ledger corrections) — pi-1.0 rows reviewed and corrected, 21 rows filed, one closed row, no code moved (`claude/ledger-corrections-pi-1.0.1`)
 
 > **This block sits above the batch-6 block and moves its counts; it is a docs-only change.** The count is

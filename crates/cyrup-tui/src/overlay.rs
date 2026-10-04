@@ -30,10 +30,11 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, Paragraph};
 
 use cyrup_ext::{
-    InteractiveOverlay, OverlayColor, OverlayKey, OverlayKeyCode, OverlayLine, OverlayOptions,
-    OverlayOutcome as ExtOverlayOutcome, OverlaySpan,
+    InteractiveOverlay, OverlayColor, OverlayKey, OverlayKeyCode, OverlayLine, OverlayMouse,
+    OverlayOptions, OverlayOutcome as ExtOverlayOutcome, OverlaySpan, ThemeRole,
 };
 
+use crate::app::Pointer;
 use crate::theme::UiTheme;
 
 /// The result of routing one key to an overlay (spec/tui/05 §2 step 2).
@@ -55,6 +56,19 @@ pub trait Overlay: Send {
     fn render(&mut self, frame: &mut Frame, area: Rect, theme: &UiTheme);
     /// Route one key, returning the outcome.
     fn handle(&mut self, key: &KeyEvent) -> OverlayOutcome;
+    /// The rectangle this overlay was last painted into, or `None` before its first paint (and for
+    /// an overlay that does not take the pointer, the default).
+    ///
+    /// The pointer layer hit-tests against THIS, the rectangle the painter computed, so the two
+    /// cannot disagree about where the overlay is.
+    fn painted_rect(&self) -> Option<Rect> {
+        None
+    }
+    /// Route one pointer event that landed inside [`Self::painted_rect`], `event` local to it. A hit
+    /// overlay is modal for the event whatever it answers; the default ignores it.
+    fn pointer(&mut self, _event: Pointer) -> OverlayOutcome {
+        OverlayOutcome::Ignored
+    }
     /// Route one bracketed paste, returning the outcome. The default ignores it: an overlay with no
     /// text field has nothing to paste into, and the host swallows the paste either way so it never
     /// reaches the editor beneath the modal.
@@ -104,6 +118,9 @@ pub trait Overlay: Send {
 pub struct ExtensionOverlay {
     inner: Box<dyn InteractiveOverlay>,
     done: Option<tokio::sync::oneshot::Sender<()>>,
+    /// The box the last [`Overlay::render`] painted, which is what a pointer event is hit-tested
+    /// against.
+    painted: Option<Rect>,
 }
 
 impl ExtensionOverlay {
@@ -113,6 +130,7 @@ impl ExtensionOverlay {
         Self {
             inner,
             done: Some(done),
+            painted: None,
         }
     }
 
@@ -166,8 +184,9 @@ impl Drop for ExtensionOverlay {
 }
 
 impl Overlay for ExtensionOverlay {
-    fn render(&mut self, frame: &mut Frame, area: Rect, _theme: &UiTheme) {
+    fn render(&mut self, frame: &mut Frame, area: Rect, theme: &UiTheme) {
         if area.width == 0 || area.height == 0 {
+            self.painted = None;
             return;
         }
         // Size the box first so the component is told the EXACT width it will be painted at (pi
@@ -192,8 +211,9 @@ impl Overlay for ExtensionOverlay {
         let painted: Vec<Line<'static>> = lines
             .into_iter()
             .take(rect.height as usize)
-            .map(to_ratatui_line)
+            .map(|line| to_ratatui_line(line, theme))
             .collect();
+        self.painted = Some(rect);
         frame.render_widget(Clear, rect);
         frame.render_widget(Paragraph::new(painted), rect);
     }
@@ -205,6 +225,18 @@ impl Overlay for ExtensionOverlay {
             return OverlayOutcome::Ignored;
         };
         match self.inner.handle_key(mapped) {
+            ExtOverlayOutcome::Ignored => OverlayOutcome::Ignored,
+            ExtOverlayOutcome::Redraw => OverlayOutcome::Redraw,
+            ExtOverlayOutcome::Close => OverlayOutcome::Close,
+        }
+    }
+
+    fn painted_rect(&self) -> Option<Rect> {
+        self.painted
+    }
+
+    fn pointer(&mut self, event: Pointer) -> OverlayOutcome {
+        match self.inner.handle_mouse(to_overlay_mouse(event)) {
             ExtOverlayOutcome::Ignored => OverlayOutcome::Ignored,
             ExtOverlayOutcome::Redraw => OverlayOutcome::Redraw,
             ExtOverlayOutcome::Close => OverlayOutcome::Close,
@@ -233,26 +265,50 @@ impl Overlay for ExtensionOverlay {
     }
 }
 
-/// One backend-free [`OverlayLine`] as painted ratatui spans.
+/// A pointer event as the backend-free [`OverlayMouse`] the extension sees. Both are the same three
+/// things (press, click with its consecutive count, wheel notch) at a position local to the box.
 #[must_use]
-pub fn to_ratatui_line(line: OverlayLine) -> Line<'static> {
+pub fn to_overlay_mouse(event: Pointer) -> OverlayMouse {
+    match event {
+        Pointer::Press { at } => OverlayMouse::Press {
+            column: at.x,
+            row: at.y,
+        },
+        Pointer::Click { at, count } => OverlayMouse::Click {
+            column: at.x,
+            row: at.y,
+            count,
+        },
+        Pointer::Wheel { at, lines } => OverlayMouse::Wheel {
+            column: at.x,
+            row: at.y,
+            lines,
+        },
+    }
+}
+
+/// One backend-free [`OverlayLine`] as painted ratatui spans, theme roles resolved against `theme`.
+#[must_use]
+pub fn to_ratatui_line(line: OverlayLine, theme: &UiTheme) -> Line<'static> {
     Line::from(
         line.spans
             .into_iter()
-            .map(to_ratatui_span)
+            .map(|span| to_ratatui_span(span, theme))
             .collect::<Vec<_>>(),
     )
 }
 
-/// One backend-free [`OverlaySpan`] as a painted ratatui span, colour and modifiers intact.
+/// One backend-free [`OverlaySpan`] as a painted ratatui span, colour and modifiers intact. A
+/// [`OverlayColor::Theme`] colour is resolved against `theme` HERE, at paint time, so the same
+/// overlay repainted under another theme is recoloured.
 #[must_use]
-pub fn to_ratatui_span(span: OverlaySpan) -> Span<'static> {
+pub fn to_ratatui_span(span: OverlaySpan, theme: &UiTheme) -> Span<'static> {
     let mut style = Style::default();
     if let Some(fg) = span.fg {
-        style = style.fg(to_ratatui_color(fg));
+        style = style.fg(to_ratatui_color(fg, theme));
     }
     if let Some(bg) = span.bg {
-        style = style.bg(to_ratatui_color(bg));
+        style = style.bg(to_ratatui_color(bg, theme));
     }
     if span.bold {
         style = style.add_modifier(Modifier::BOLD);
@@ -272,10 +328,34 @@ pub fn to_ratatui_span(span: OverlaySpan) -> Span<'static> {
     Span::styled(span.text, style)
 }
 
-/// [`OverlayColor`] → `ratatui::style::Color`, variant for variant.
+/// The colour `theme` gives `role` — the foreground of the style the rest of the interface paints
+/// that role with (`UiTheme::accent_style`, `muted_style`, …), so an extension overlay and a
+/// built-in component agree on what "accent" is. A role the theme leaves to the terminal default
+/// (`text` on a theme without a foreground) is `Color::Reset`.
 #[must_use]
-pub fn to_ratatui_color(color: OverlayColor) -> Color {
+pub fn theme_role_color(role: ThemeRole, theme: &UiTheme) -> Color {
+    let style = match role {
+        ThemeRole::Text => return theme.foreground.unwrap_or(Color::Reset),
+        ThemeRole::Accent => theme.accent_style(),
+        ThemeRole::Muted => theme.muted_style(),
+        ThemeRole::Dim => theme.dim_style(),
+        ThemeRole::Success => theme.success_style(),
+        ThemeRole::Warning => theme.warning_style(),
+        ThemeRole::Error => theme.error_style(),
+        ThemeRole::Border => theme.border_style(),
+        ThemeRole::BorderMuted => theme.border_muted_style(),
+        ThemeRole::ToolTitle => theme.tool_title_style(),
+        ThemeRole::ToolOutput => theme.tool_output_style(),
+    };
+    style.fg.unwrap_or(Color::Reset)
+}
+
+/// [`OverlayColor`] → `ratatui::style::Color`, variant for variant; a theme role is resolved
+/// against `theme` ([`theme_role_color`]).
+#[must_use]
+pub fn to_ratatui_color(color: OverlayColor, theme: &UiTheme) -> Color {
     match color {
+        OverlayColor::Theme(role) => theme_role_color(role, theme),
         OverlayColor::Black => Color::Black,
         OverlayColor::Red => Color::Red,
         OverlayColor::Green => Color::Green,
@@ -574,33 +654,40 @@ mod tests {
 
     #[test]
     fn every_colour_variant_maps_to_its_ratatui_twin() {
+        let theme = UiTheme::default();
         assert_eq!(
-            to_ratatui_color(OverlayColor::Rgb(9, 8, 7)),
+            to_ratatui_color(OverlayColor::Rgb(9, 8, 7), &theme),
             Color::Rgb(9, 8, 7)
         );
         assert_eq!(
-            to_ratatui_color(OverlayColor::Indexed(42)),
+            to_ratatui_color(OverlayColor::Indexed(42), &theme),
             Color::Indexed(42)
         );
         assert_eq!(
-            to_ratatui_color(OverlayColor::LightMagenta),
+            to_ratatui_color(OverlayColor::LightMagenta, &theme),
             Color::LightMagenta
         );
-        assert_eq!(to_ratatui_color(OverlayColor::DarkGray), Color::DarkGray);
+        assert_eq!(
+            to_ratatui_color(OverlayColor::DarkGray, &theme),
+            Color::DarkGray
+        );
     }
 
     #[test]
     fn every_modifier_survives_span_conversion() {
-        let span = to_ratatui_span(OverlaySpan {
-            text: "x".into(),
-            fg: Some(OverlayColor::Red),
-            bg: Some(OverlayColor::Blue),
-            bold: true,
-            dim: true,
-            italic: true,
-            underlined: true,
-            reversed: true,
-        });
+        let span = to_ratatui_span(
+            OverlaySpan {
+                text: "x".into(),
+                fg: Some(OverlayColor::Red),
+                bg: Some(OverlayColor::Blue),
+                bold: true,
+                dim: true,
+                italic: true,
+                underlined: true,
+                reversed: true,
+            },
+            &UiTheme::default(),
+        );
         assert_eq!(span.style.fg, Some(Color::Red));
         assert_eq!(span.style.bg, Some(Color::Blue));
         for m in [

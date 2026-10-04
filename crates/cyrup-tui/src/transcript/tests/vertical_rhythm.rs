@@ -242,7 +242,12 @@ fn label_blocks_space_after_the_label_except_skill() {
         &theme,
         40,
         1,
-        ImageOpts::default(),
+        // The skill block opens only when tools are expanded (`skill-invocation-message.ts`
+        // starts collapsed); this is about the expanded body's label/body adjacency.
+        ImageOpts {
+            tools_expanded: true,
+            ..ImageOpts::default()
+        },
     );
     let s = texts(&skill);
     assert_eq!(s[2].trim_end(), " [skill]", "label, inset 1");

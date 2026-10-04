@@ -467,23 +467,23 @@ fn palette_comes_from_the_active_theme_not_a_constant() {
     let dark_html = session_jsonl_to_html_with_theme(FIXTURE, &dark, &ExportState::from_file());
     let light_html = session_jsonl_to_html_with_theme(FIXTURE, &light, &ExportState::from_file());
 
-    // The explicit `export` blocks of the two built-ins (`cyrup-resources/src/theme.rs:602-606`,
-    // `:689-693`), which pi prefers over the derived triple (`index.ts:155-157`).
-    assert!(dark_html.contains("--body-bg: #18181e;"), "dark page bg");
-    assert!(dark_html.contains("--container-bg: #1e1e24;"));
-    assert!(dark_html.contains("--info-bg: #3c3728;"));
-    assert!(light_html.contains("--body-bg: #f8f8f8;"), "light page bg");
-    assert!(light_html.contains("--container-bg: #ffffff;"));
-    assert!(light_html.contains("--info-bg: #fffae6;"));
+    // The explicit `export` blocks of the two v1.0.0 built-ins, which pi prefers over the derived
+    // triple (`index.ts:155-157`).
+    assert!(dark_html.contains("--body-bg: #21252c;"), "dark page bg");
+    assert!(dark_html.contains("--container-bg: #282c34;"));
+    assert!(dark_html.contains("--info-bg: #4e2f1b;"));
+    assert!(light_html.contains("--body-bg: #efeeee;"), "light page bg");
+    assert!(light_html.contains("--container-bg: #f7f6f6;"));
+    assert!(light_html.contains("--info-bg: #ede3dd;"));
 
     // `generateThemeVars` emits every role as a CSS custom property (`index.ts:113-116`).
-    assert!(dark_html.contains("--exportPageBg: #18181e;"));
+    assert!(dark_html.contains("--exportPageBg: #21252c;"));
     assert!(
         dark_html.contains("--accent: "),
         "roles reach the stylesheet"
     );
     assert!(
-        dark_html.contains("--userMessageBg: #343541;"),
+        dark_html.contains("--userMessageBg: #213b49;"),
         "a var reference is resolved through `vars`"
     );
 
@@ -492,13 +492,30 @@ fn palette_comes_from_the_active_theme_not_a_constant() {
     assert!(!light_html.contains("#1e1e2e"));
 }
 
-/// `withThemeColorFallbacks` (`theme.ts:332-346`): four aliases the schema leaves optional but the
-/// stylesheet still references.
+/// `withThemeColorFallbacks` (`theme.ts:164-178` @v1.0.0): five aliases the schema leaves optional
+/// but the stylesheet still references. The two scrollbar tokens are FOREGROUNDS that fall back to
+/// `muted` / `text`.
 #[test]
 fn optional_role_aliases_fall_back_the_way_pi_does() {
-    let dark = ExportTheme::from_theme(&builtin(cyrup_resources::BUILTIN_DARK_JSON));
+    // v1.0.0's built-ins declare the optional tokens themselves, so strip them to reach the
+    // fallback arm.
+    let mut json: Value = serde_json::from_str(cyrup_resources::BUILTIN_DARK_JSON).unwrap();
+    let colors = json
+        .get_mut("colors")
+        .and_then(Value::as_object_mut)
+        .expect("colors object");
+    for alias in [
+        "scrollbarTrack",
+        "scrollbarThumb",
+        "searchMatchBg",
+        "searchMatchText",
+    ] {
+        assert!(colors.remove(alias).is_some(), "{alias} is declared");
+    }
+    let dark = ExportTheme::from_theme(&builtin(&json.to_string()));
     for (alias, source) in [
-        ("scrollbarThumb", "selectedBg"),
+        ("scrollbarTrack", "muted"),
+        ("scrollbarThumb", "text"),
         ("searchMatchBg", "selectedBg"),
         ("searchMatchText", "text"),
     ] {
@@ -510,7 +527,12 @@ fn optional_role_aliases_fall_back_the_way_pi_does() {
         assert!(dark.role(alias).is_some(), "{alias} is emitted at all");
     }
     // `thinkingMax` IS declared by both built-ins, so the alias must NOT overwrite it.
-    assert_eq!(dark.role("thinkingMax"), "#ff5fff".parse::<CssColor>().ok());
+    let declared = ExportTheme::from_theme(&builtin(cyrup_resources::BUILTIN_DARK_JSON));
+    assert_eq!(
+        declared.role("thinkingMax"),
+        "#fe5462".parse::<CssColor>().ok()
+    );
+    assert_ne!(declared.role("thinkingMax"), declared.role("thinkingXhigh"));
 }
 
 /// `deriveExportColors` (`index.ts:81-106`) — the arm a theme with no `export` block takes.

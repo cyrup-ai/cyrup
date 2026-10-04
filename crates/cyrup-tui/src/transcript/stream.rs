@@ -94,6 +94,7 @@ impl TranscriptView {
         self.bump_render_generation();
         self.streaming = None;
         self.thinking = None;
+        self.expansion.live_thinking = None;
         self.streaming_display = None;
         self.thinking_display = None;
     }
@@ -132,13 +133,14 @@ impl TranscriptView {
         // As in [`Self::commit_assistant`]: the live reasoning partial's transformed form dies with
         // the partial, and the committed entry is transformed on its own terms.
         self.thinking_display = None;
+        // A click made while the run streamed rides onto the committed entry, or is dropped with a
+        // run that commits nothing.
+        let live = self.expansion.live_thinking.take();
         if let Some(t) = final_text
             && !t.trim().is_empty()
         {
-            self.pending.push(Entry::Thinking {
-                text: t,
-                hidden: self.hide_thinking,
-            });
+            let hidden = self.hide_thinking;
+            self.push_pending_with(Entry::Thinking { text: t, hidden }, live);
         }
     }
 
@@ -148,6 +150,9 @@ impl TranscriptView {
     pub fn set_hide_thinking_block(&mut self, hide: bool) {
         self.bump_render_generation();
         self.hide_thinking = hide;
+        // `thinkingVisibilityOverrides.clear()` (`assistant-message.ts:57-62`): every per-run click
+        // override is dropped, whether or not the value changed.
+        self.reset_expansion(ToggleScope::Thinking);
     }
 
     /// Whether the reasoning body is collapsed to the `Thinking...` label (test/inspection access).

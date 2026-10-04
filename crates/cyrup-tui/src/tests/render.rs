@@ -372,7 +372,7 @@ fn theme_colors_reach_rendered_cells() {
     // only) and the assertion has been surviving since on the editor's `› ` prompt glyph — a cyrup
     // invention pi's `editor.ts:482-601` never emits, removed here as E1. An assertion whose only
     // live subject is the thing under removal proves nothing about themes.
-    let accent = Color::Rgb(0x8a, 0xbe, 0xb7);
+    let accent = Color::Rgb(0xa7, 0x98, 0xd7);
     let mut app = App::new(TestBackend::new(40, 12), UiTheme::dark()).unwrap();
     app.state_mut().indicator.working();
     app.transcript_mut().push_assistant_delta("colored");
@@ -382,8 +382,8 @@ fn theme_colors_reach_rendered_cells() {
         "dark accent color did not reach any cell"
     );
 
-    // A different theme yields a different accent on the cells (Pi light `accent` = teal #5a8080).
-    let light_accent = Color::Rgb(0x5a, 0x80, 0x80);
+    // A different theme yields a different accent on the cells (Pi v1.0.0 light `accent` = violet #7459b4).
+    let light_accent = Color::Rgb(0x74, 0x59, 0xb4);
     let mut light = App::new(TestBackend::new(40, 12), UiTheme::light()).unwrap();
     light.state_mut().indicator.working();
     light.transcript_mut().push_assistant_delta("colored");
@@ -673,14 +673,15 @@ fn visible_len(s: &str) -> usize {
 fn builtin_themes_resolve_known_colors() {
     let dark = UiTheme::builtin("dark");
     assert_eq!(dark.name, "dark");
-    // Pi dark `accent` token resolves through `vars.accent` to #8abeb7; `text` to #d4d4d4.
-    assert_eq!(dark.accent, Some(Color::Rgb(0x8a, 0xbe, 0xb7)));
-    assert_eq!(dark.foreground, Some(Color::Rgb(0xd4, 0xd4, 0xd4)));
+    // Pi v1.0.0 `dark.json`: `accent` is `violet` = `okhsl(295 50% 67%)`, `text` is
+    // `okhsl(234 3% 89%)`. The triples are `colorToRgb(parseColor(..))` from pi's own `colors.ts`.
+    assert_eq!(dark.accent, Some(Color::Rgb(167, 152, 215)));
+    assert_eq!(dark.foreground, Some(Color::Rgb(222, 224, 225)));
     let light = UiTheme::builtin("light");
     assert_eq!(light.name, "light");
-    // Pi light `accent` token resolves through `vars.teal` to #5a8080.
-    assert_eq!(light.accent, Some(Color::Rgb(0x5a, 0x80, 0x80)));
-    // Unknown names fall back to the dark palette (never panics).
+    // Pi v1.0.0 `light.json`: `accent` is `violet` = `okhsl(295 60% 46%)`.
+    assert_eq!(light.accent, Some(Color::Rgb(116, 89, 180)));
+    // Unknown names fall back to the system theme (never panics) — `applyThemeName`'s fallback.
     let fallback = UiTheme::builtin("does-not-exist");
-    assert_eq!(fallback.accent, dark.accent);
+    assert_eq!(fallback.name, "system");
 }

@@ -7,6 +7,86 @@ pub(crate) fn entry_lines(
     output_pad: usize,
     images: ImageOpts<'_>,
 ) -> Vec<Line<'static>> {
+    render_entry(entry, None, theme, width, output_pad, images)
+}
+
+/// One entry's rows and the cells a left click toggles it from.
+pub(crate) struct EntryBlock {
+    pub lines: Vec<Line<'static>>,
+    /// `None` for an entry pi does not make clickable (see [`Entry::toggle_scope`]).
+    pub toggle: Option<ToggleRegion>,
+}
+
+/// [`entry_lines`] for an entry that may carry a per-entry [`Expansion`] override, with the click
+/// region of what it drew. The retained document is the only caller that has overrides; the inline
+/// flush has nothing to click and uses [`entry_lines`].
+pub(crate) fn entry_block(
+    entry: &Entry,
+    expansion: Option<Expansion>,
+    theme: &UiTheme,
+    width: usize,
+    output_pad: usize,
+    images: ImageOpts<'_>,
+) -> EntryBlock {
+    if entry.toggle_scope().is_none() {
+        return EntryBlock {
+            lines: render_entry(entry, expansion, theme, width, output_pad, images),
+            toggle: None,
+        };
+    }
+    if let Entry::Tool(run) = entry {
+        let images = effective_opts(entry, expansion, images);
+        let block = tool_block(run, images.tools_expanded, width, theme, images);
+        return EntryBlock {
+            lines: block.lines,
+            toggle: block.hit,
+        };
+    }
+    let lines = render_entry(entry, expansion, theme, width, output_pad, images);
+    let rows = lines.len();
+    let inner_cols = 1..width.saturating_sub(1);
+    let toggle = match entry {
+        // `MouseRegion(thinkingComponent)` sits in a bare container: the whole row, but not the
+        // leading `Spacer(1)` that precedes it.
+        Entry::Thinking { .. } => (rows >= 2).then(|| ToggleRegion::new(1..rows, 0..width)),
+        // Spacer, then a `Box(1, 1)` whose content (label, spacer, body) is the region.
+        Entry::BranchSummary { .. } | Entry::CompactionSummary { .. } => {
+            (rows >= 4).then(|| ToggleRegion::new(2..rows - 1, inner_cols))
+        }
+        Entry::SkillInvocation { lead_spacer, .. } => {
+            let lead = usize::from(*lead_spacer);
+            (rows >= lead + 3).then(|| ToggleRegion::new(lead + 1..rows - 1, inner_cols))
+        }
+        _ => None,
+    };
+    EntryBlock { lines, toggle }
+}
+
+/// The paint inputs the entry renders at once its own override is applied: a block entry reads the
+/// tools-expanded flag, so a click override replaces it for this entry alone.
+fn effective_opts<'a>(
+    entry: &Entry,
+    expansion: Option<Expansion>,
+    images: ImageOpts<'a>,
+) -> ImageOpts<'a> {
+    match (entry.toggle_scope(), expansion) {
+        (Some(ToggleScope::Block), Some(e)) => ImageOpts {
+            tools_expanded: e.is_open(),
+            ..images
+        },
+        _ => images,
+    }
+}
+
+fn render_entry(
+    entry: &Entry,
+    expansion: Option<Expansion>,
+    theme: &UiTheme,
+    width: usize,
+    output_pad: usize,
+    images: ImageOpts<'_>,
+) -> Vec<Line<'static>> {
+    let images = effective_opts(entry, expansion, images);
     match entry {
         Entry::User { text, lead_spacer } => {
             // `UserMessageComponent` (`user-message.ts:38-58`) is exactly one child: a
@@ -99,10 +179,16 @@ pub(crate) fn entry_lines(
         }
         Entry::Thinking { text, hidden } => {
             // The reasoning section (`assistant-message.ts:139-165`), padded like every other
-            // assistant-side block. `hidden` was frozen at commit time (see [`Entry::Thinking`]).
+            // assistant-side block. `hidden` was frozen at commit time (see [`Entry::Thinking`]);
+            // a click on the run replaces it for this run alone
+            // (`thinkingVisibilityOverrides.get(runIndex) ?? this.hideThinkingBlock`, `:131`).
+            let hidden = match expansion {
+                Some(e) => !e.is_open(),
+                None => *hidden,
+            };
             let mut out = thinking_lines(
                 text,
-                *hidden,
+                hidden,
                 width.saturating_sub(output_pad * 2),
                 theme,
                 images
@@ -152,9 +238,15 @@ pub(crate) fn entry_lines(
             content,
             lead_spacer,
         } => {
-            // `[skill]` label + bold name header, full content as markdown (the committed/expanded
-            // form — `skill-invocation-message.ts` expanded branch). The leading spacer is the gated
-            // `interactive-mode.ts:3500` one (see [`Entry::SkillInvocation`]).
+            // `skill-invocation-message.ts` starts collapsed (`private expanded = false`) and
+            // `interactive-mode.ts:3864` seeds it from the live `toolOutputExpanded`, so — like the
+            // two summaries — it reads that flag here and `Ctrl+O` opens it.
+            if !images.tools_expanded {
+                return collapsed_skill_lines(name, images.expand_key, *lead_spacer, theme, width);
+            }
+            // `[skill]` label + bold name header, full content as markdown (the expanded branch).
+            // The leading spacer is the gated `interactive-mode.ts:3500` one (see
+            // [`Entry::SkillInvocation`]).
             labeled_message_lines(
                 "skill",
                 &format!("**{name}**"),

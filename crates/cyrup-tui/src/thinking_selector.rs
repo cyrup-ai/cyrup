@@ -38,7 +38,9 @@ use crate::keymap::{
     Action, EditorKeymap, Keymap, SelectAction, SelectKeymap, ThinkingAction, ThinkingKeymap,
 };
 use crate::select_list::{ColumnLayout, SelectItem, SelectList};
-use crate::selector::{Selector, SelectorOutcome, border_rule_line, input_line_spans};
+use crate::selector::{
+    Selector, SelectorOutcome, border_rule_line, input_line_spans, list_outcome, list_pointer,
+};
 use crate::text_input::{Input, InputOutcome};
 use crate::theme::UiTheme;
 
@@ -219,6 +221,13 @@ impl ThinkingSelector {
         &self.list
     }
 
+    /// The slot row the list's first item is painted on: the number of rows above it.
+    fn first_list_row(&self, width: u16) -> u16 {
+        self.head_lines(width, UiTheme::default_ref())
+            .len()
+            .min(usize::from(u16::MAX)) as u16
+    }
+
     /// The rendered envelope, in pi's child order (`thinking-selector.ts:77-97`).
     ///
     /// The two header `Text` children are **unstyled** upstream — `new Text("Thinking Level", 0, 0)`
@@ -227,7 +236,37 @@ impl ThinkingSelector {
     /// (`settings-submenu.ts:59`) — so they render in the base style here too. Only the footer is
     /// coloured (`theme.fg("dim", …)`, `:94`).
     fn lines(&self, width: u16, theme: &UiTheme) -> Vec<Line<'static>> {
-        let mut lines = Vec::with_capacity(self.values.len().saturating_add(10));
+        let mut lines = self.head_lines(width, theme);
+        // `:92` adds the `SelectList` straight to the container, so it is laid out at the FULL
+        // container width and its rows start at column 0 — no `paddingX` wrapper, no inset.
+        lines.extend(self.list.lines(width, theme)); // :92
+        lines.push(Line::from("")); // :93
+        // `${keyDisplayText("tui.select.confirm")} to select · ${keyDisplayText("app.thinking.save")}
+        // to set as default · ${keyDisplayText("tui.select.cancel")} to cancel`
+        // (`thinking-selector.ts:93-100` @v0.87.1) — live labels since pi #9149, where 0.84.3 had
+        // the literal "Enter to select · Ctrl+S to set as default · Esc to cancel".
+        let save = self
+            .keys
+            .save
+            .keys_label(ThinkingAction::Save)
+            .map(|k| crate::chrome::format_key_text(&k, true))
+            .unwrap_or_default();
+        lines.push(Line::from(Span::styled(
+            format!(
+                "  {} to select \u{b7} {save} to set as default \u{b7} {} to cancel",
+                self.keys.confirm, self.keys.cancel
+            ),
+            theme.dim_style(),
+        ))); // :94
+        lines.push(border_rule_line(width, theme)); // :97
+        lines
+    }
+
+    /// Everything above the list (`thinking-selector.ts:77-87`), up to and including the blank
+    /// under the search box. Its length is the slot row the list's first item is painted on, which
+    /// is what [`Selector::pointer`] hit-tests against.
+    fn head_lines(&self, width: u16, theme: &UiTheme) -> Vec<Line<'static>> {
+        let mut lines = Vec::with_capacity(10);
         lines.push(border_rule_line(width, theme)); // :77
         lines.push(Line::from("")); // :78
         lines.push(Line::from(Span::styled(
@@ -265,28 +304,6 @@ impl ThinkingSelector {
             theme,
         ))); // :84-86
         lines.push(Line::from("")); // :87
-        // `:92` adds the `SelectList` straight to the container, so it is laid out at the FULL
-        // container width and its rows start at column 0 — no `paddingX` wrapper, no inset.
-        lines.extend(self.list.lines(width, theme)); // :92
-        lines.push(Line::from("")); // :93
-        // `${keyDisplayText("tui.select.confirm")} to select · ${keyDisplayText("app.thinking.save")}
-        // to set as default · ${keyDisplayText("tui.select.cancel")} to cancel`
-        // (`thinking-selector.ts:93-100` @v0.87.1) — live labels since pi #9149, where 0.84.3 had
-        // the literal "Enter to select · Ctrl+S to set as default · Esc to cancel".
-        let save = self
-            .keys
-            .save
-            .keys_label(ThinkingAction::Save)
-            .map(|k| crate::chrome::format_key_text(&k, true))
-            .unwrap_or_default();
-        lines.push(Line::from(Span::styled(
-            format!(
-                "  {} to select \u{b7} {save} to set as default \u{b7} {} to cancel",
-                self.keys.confirm, self.keys.cancel
-            ),
-            theme.dim_style(),
-        ))); // :94
-        lines.push(border_rule_line(width, theme)); // :97
         lines
     }
 }
@@ -301,6 +318,20 @@ impl Selector for ThinkingSelector {
     fn render(&mut self, frame: &mut Frame, area: Rect, theme: &UiTheme) {
         let lines = self.lines(area.width, theme);
         frame.render_widget(Paragraph::new(lines).style(theme.base_style()), area);
+    }
+
+    fn pointer(&mut self, area: Rect, event: crate::app::Pointer) -> SelectorOutcome {
+        let top = self.first_list_row(area.width);
+        let available = area.height.saturating_sub(top);
+        let answer = list_pointer(&mut self.list, top, available, event);
+        list_outcome(
+            answer,
+            || SelectorOutcome::Redraw,
+            || match self.current_value() {
+                Some(level) => SelectorOutcome::Confirm(level),
+                None => SelectorOutcome::Redraw,
+            },
+        )
     }
 
     fn handle(&mut self, key: &KeyEvent, keymap: &SelectKeymap) -> SelectorOutcome {

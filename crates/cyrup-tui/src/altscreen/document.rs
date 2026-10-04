@@ -71,7 +71,9 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use ratatui::text::Line;
 
 use crate::theme::UiTheme;
-use crate::transcript::{Entry, ImageOpts, TranscriptView, entry_lines, wrap_line, wrapped_height};
+use crate::transcript::{
+    ImageOpts, ToggleRegion, TranscriptView, entry_block, wrap_line, wrapped_height,
+};
 
 /// Render the whole retained document at `width` — pi's `TuiBase.render(width)` (`tui.ts:235-245`),
 /// with `child.render(width)` spelled [`crate::transcript::entry_lines`].
@@ -107,30 +109,55 @@ use crate::transcript::{Entry, ImageOpts, TranscriptView, entry_lines, wrap_line
 /// internal render generation, whose tick bumps would rebuild the whole document once a frame for
 /// the duration of every turn.
 pub(super) fn render_document(
-    entries: &[Entry],
+    transcript: &TranscriptView,
     theme: &UiTheme,
     width: usize,
-    output_pad: usize,
     images: ImageOpts<'_>,
-) -> (Vec<Line<'static>>, Vec<usize>) {
+) -> RenderedDocument {
+    let output_pad = transcript.output_pad();
+    let entries = transcript.document();
     let mut rows: Vec<Line<'static>> = Vec::new();
     let mut row_starts: Vec<usize> = Vec::with_capacity(entries.len());
-    for entry in entries {
+    let mut toggles: Vec<Option<ToggleRegion>> = Vec::with_capacity(entries.len());
+    for (index, entry) in entries.iter().enumerate() {
         // Pushed BEFORE the entry renders, so the map records where the entry begins even when it
         // contributes nothing — see the module doc on zero-row entries.
         row_starts.push(rows.len());
-        let lines = entry_lines(entry, theme, width, output_pad, images);
+        let block = entry_block(
+            entry,
+            transcript.entry_expansion(index),
+            theme,
+            width,
+            output_pad,
+            images,
+        );
+        let lines = block.lines;
         // The common case by a wide margin: `entry_lines` wrapped every row it produced, so its
         // display height already equals its line count and the rows move across untouched.
         if wrapped_height(&lines, width) == lines.len() {
+            toggles.push(block.toggle);
             rows.extend(lines);
             continue;
         }
+        // A reflowed entry no longer has the row layout its click region was measured against.
+        toggles.push(None);
         for line in &lines {
             rows.extend(wrap_line(line, width));
         }
     }
-    (rows, row_starts)
+    RenderedDocument {
+        rows,
+        row_starts,
+        toggles,
+    }
+}
+
+/// What [`render_document`] builds: the rows, where each entry starts, and where each entry's
+/// click-to-toggle region lies (relative to that start) — the last two parallel to the entries.
+pub(super) struct RenderedDocument {
+    pub(super) rows: Vec<Line<'static>>,
+    pub(super) row_starts: Vec<usize>,
+    pub(super) toggles: Vec<Option<ToggleRegion>>,
 }
 
 /// Everything [`render_document`]'s output depends on, as one comparable value — the caller's test
@@ -164,6 +191,9 @@ pub(super) struct DocumentKey {
     /// [`crate::TranscriptView::tool_expanded`] — X14's live `toolOutputExpanded`, which every
     /// committed tool, branch summary and compaction summary renders at.
     tools_expanded: bool,
+    /// [`crate::TranscriptView::expansion_generation`] — the per-entry click overrides, which move
+    /// neither the entry window nor any flag above yet change the rows an entry renders.
+    expansion: u64,
     /// [`crate::TranscriptView::mermaid_mode`] — the live `markdown.mermaid` mode. Without it,
     /// cycling the `/settings` row would leave the whole retained document stale: every committed
     /// user/assistant body is re-rendered through the mermaid gate.
@@ -199,6 +229,7 @@ pub(super) fn document_key(
         show_images: transcript.show_images(),
         graphical_images: transcript.graphical_images(),
         tools_expanded: transcript.tool_expanded(),
+        expansion: transcript.expansion_generation(),
         mermaid: transcript.mermaid_mode(),
         labels: hasher.finish(),
     }

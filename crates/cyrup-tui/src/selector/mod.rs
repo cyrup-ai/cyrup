@@ -635,6 +635,13 @@ pub trait Selector: Send {
     fn render(&mut self, frame: &mut Frame, area: Rect, theme: &UiTheme);
     /// Route one key through the [`SelectKeymap`], returning the outcome.
     fn handle(&mut self, key: &KeyEvent, keymap: &SelectKeymap) -> SelectorOutcome;
+    /// Route one pointer event, its position local to `area` — the rectangle this selector was last
+    /// rendered into (the editor slot). Answers what a key would have answered: a redraw for a
+    /// moved highlight, a confirmation for an activated row. The default ignores the pointer, which
+    /// is what a selector without a list of rows (a dialog, an input) wants.
+    fn pointer(&mut self, _area: Rect, _event: crate::app::Pointer) -> SelectorOutcome {
+        SelectorOutcome::Ignored
+    }
     // NOTE: there is deliberately no `fn cursor(&self) -> Option<(u16, u16)>` here. It existed as a
     // defaulted accessor returning `None` that all 13 implementors took and no caller ever read, so
     // while a selector owned the input slot the terminal's hardware cursor sat wherever the last
@@ -748,4 +755,361 @@ pub(crate) fn border_rule_line(width: u16, theme: &UiTheme) -> Line<'static> {
 /// it spans the whole inline width with no corners (spec/tui/05 §11).
 pub(crate) fn border_rule(width: u16, theme: &UiTheme) -> Paragraph<'static> {
     Paragraph::new(border_rule_line(width, theme))
+}
+
+/// The slot row (local to the selector's rectangle, row 0 at the top) a pointer event landed on.
+fn event_row(event: crate::app::Pointer) -> u16 {
+    use crate::app::Pointer;
+    match event {
+        Pointer::Press { at } | Pointer::Click { at, .. } | Pointer::Wheel { at, .. } => at.y,
+    }
+}
+
+/// `event` with its row replaced by `row`; the column is left alone because no selector acts on it
+/// (a list row answers over its whole width).
+fn event_at_row(event: crate::app::Pointer, row: u16) -> crate::app::Pointer {
+    use crate::app::Pointer;
+    match event {
+        Pointer::Press { at } => Pointer::Press {
+            at: ratatui::layout::Position::new(at.x, row),
+        },
+        Pointer::Click { at, count } => Pointer::Click {
+            at: ratatui::layout::Position::new(at.x, row),
+            count,
+        },
+        Pointer::Wheel { at, lines } => Pointer::Wheel {
+            at: ratatui::layout::Position::new(at.x, row),
+            lines,
+        },
+    }
+}
+
+/// Offer `event` to a [`crate::select_list::SelectList`] embedded in a selector whose first list
+/// row sits at slot row `top`, with `available` rows from there before the slot (or the carved body
+/// region) ends.
+///
+/// The list answers in its own coordinates (row 0 = its first item row). Anything outside the rows
+/// it painted — the rules, title, search box and blanks above it, the hint below it, and any row the
+/// slot was too short to show — is not the list's, so it never reaches it: a press there must not
+/// select, and a click there must not activate whatever a stale press left behind. The list's own
+/// rows include its `(i/N)` scroll row, so a wheel notch over it still scrolls the list, as a
+/// container hit test in pi lands on the `SelectList` component for every row it renders.
+pub(crate) fn list_pointer(
+    list: &mut crate::select_list::SelectList,
+    top: u16,
+    available: u16,
+    event: crate::app::Pointer,
+) -> crate::select_list::ListPointer {
+    let Some(local) = event_row(event).checked_sub(top) else {
+        return crate::select_list::ListPointer::Ignored;
+    };
+    if local >= list.rendered_height().min(available) {
+        return crate::select_list::ListPointer::Ignored;
+    }
+    list.pointer(event_at_row(event, local))
+}
+
+/// What a list selector does with the answer of [`list_pointer`], given how it reports a moved
+/// highlight (a plain redraw, or a preview) and what activating the highlighted row means.
+pub(crate) fn list_outcome(
+    answer: crate::select_list::ListPointer,
+    moved: impl FnOnce() -> SelectorOutcome,
+    activate: impl FnOnce() -> SelectorOutcome,
+) -> SelectorOutcome {
+    use crate::select_list::ListPointer;
+    match answer {
+        ListPointer::Ignored => SelectorOutcome::Ignored,
+        // The list took a notch or a press that changed nothing. The event is still claimed, so it
+        // must not fall through to the document behind the dock; a redraw is the cheapest claim.
+        ListPointer::Handled => SelectorOutcome::Redraw,
+        ListPointer::Moved => moved(),
+        ListPointer::Activated(_) => activate(),
+    }
+}
+
+/// Where the items of a windowed list sit in a selector's slot — built from the same window and
+/// row heights the selector's render uses, so a hit test cannot drift from the paint.
+///
+/// A selector that draws its items through a `Vec<Line>` it cannot hand to a
+/// [`crate::select_list::SelectList`] (`/model`, `/resume`, `/login`, `/tree`, the scoped-models
+/// and `/config` pickers, `/fork`, the trust options) describes its rows here: the slot row each
+/// item starts on, how many rows answer a press, and which rows around them belong to the list for
+/// a wheel notch. [`RowPointer`] turns an event and this map into a [`RowAction`].
+#[derive(Debug)]
+pub(crate) struct RowMap {
+    /// The next slot row a call to [`Self::item`] / [`Self::filler`] describes.
+    cursor: u16,
+    /// `(item index, slot rows that answer a press on it)`.
+    hits: Vec<(usize, std::ops::Range<u16>)>,
+    /// The slot rows a wheel notch scrolls the list from.
+    wheel: std::ops::Range<u16>,
+}
+
+impl RowMap {
+    /// A map whose first described row is slot row `top`.
+    pub(crate) fn starting_at(top: u16) -> Self {
+        RowMap {
+            cursor: top,
+            hits: Vec::new(),
+            wheel: top..top,
+        }
+    }
+
+    /// The next `rows` slot rows draw item `item`; a press lands on it in the first `hit` of them
+    /// (the rest, such as the blank an item draws after itself, are list rows but not the item's).
+    #[must_use]
+    pub(crate) fn item(mut self, item: usize, rows: u16, hit: u16) -> Self {
+        let end = self.cursor.saturating_add(rows);
+        let hit_end = self.cursor.saturating_add(hit.min(rows));
+        self.hits.push((item, self.cursor..hit_end));
+        self.cursor = end;
+        self.wheel.end = end;
+        self
+    }
+
+    /// The next `rows` slot rows belong to the list but are not an item: a group header, a scroll
+    /// readout, a description under the list.
+    #[must_use]
+    pub(crate) fn filler(mut self, rows: u16) -> Self {
+        self.cursor = self.cursor.saturating_add(rows);
+        self.wheel.end = self.cursor;
+        self
+    }
+
+    /// The map of a window of single-row items with the `(i/N)` readout under it — the shape every
+    /// body built on [`centered_window`] has. `max` is the window size the render passes to it.
+    pub(crate) fn windowed(top: u16, selected: usize, len: usize, max: usize) -> Self {
+        let (start, end) = centered_window(selected, len, max);
+        let mut map = RowMap::starting_at(top);
+        for item in start..end {
+            map = map.item(item, 1, 1);
+        }
+        if end.saturating_sub(start) < len {
+            map = map.filler(1);
+        }
+        map
+    }
+
+    /// Let a wheel notch scroll the list down to (excluding) slot row `end` — pi's `SettingsList`
+    /// takes the wheel over everything under its search box, its description and hint rows
+    /// included.
+    #[must_use]
+    pub(crate) fn wheel_to(mut self, end: u16) -> Self {
+        self.wheel.end = end;
+        self
+    }
+
+    /// Drop everything at or below slot row `bottom`: the slot (or the region carved out of it) was
+    /// too short to paint those rows, and a row that was never painted cannot be pressed.
+    #[must_use]
+    pub(crate) fn clipped_to(mut self, bottom: u16) -> Self {
+        self.hits.retain(|(_, rows)| rows.start < bottom);
+        for (_, rows) in &mut self.hits {
+            rows.end = rows.end.min(bottom);
+        }
+        self.wheel.end = self.wheel.end.min(bottom);
+        self.wheel.start = self.wheel.start.min(self.wheel.end);
+        self
+    }
+
+    /// The item drawn on slot row `row`, if it answers a press there.
+    fn item_at(&self, row: u16) -> Option<usize> {
+        self.hits
+            .iter()
+            .find(|(_, rows)| rows.contains(&row))
+            .map(|(item, _)| *item)
+    }
+}
+
+/// What a pointer event asks of a list whose rows are described by a [`RowMap`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RowAction {
+    /// Not the list's event: a row that is not an item, an empty list.
+    Ignored,
+    /// The list took the event and nothing changed.
+    Handled,
+    /// Highlight this item.
+    Highlight(usize),
+    /// Highlight this item and activate it, as the confirm key would.
+    Activate(usize),
+    /// One wheel notch: move the highlight one item in this direction (`-1` up, `1` down).
+    Step(isize),
+}
+
+/// The press bookkeeping a [`RowMap`]-driven list keeps between events — pi's `mousePressedIndex`
+/// (`select-list.ts:122-143`): a press highlights an item, which re-centres the window and slides
+/// the rows under the pointer, so the click that completes the gesture activates the item the
+/// press went down on rather than whatever now sits under the cell.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct RowPointer {
+    pressed: Option<usize>,
+}
+
+impl RowPointer {
+    /// Decide what `event` asks of a list of `len` items with `selected` highlighted, whose rows
+    /// `map` describes. Hover never reaches here (the dock turns only presses, clicks and wheel
+    /// notches into events), and nothing here moves the highlight: the caller applies the answer.
+    pub(crate) fn act(
+        &mut self,
+        event: crate::app::Pointer,
+        map: &RowMap,
+        selected: usize,
+        len: usize,
+    ) -> RowAction {
+        use crate::app::Pointer;
+        if len == 0 {
+            return RowAction::Ignored;
+        }
+        let row = event_row(event);
+        match event {
+            Pointer::Wheel { lines, .. } => {
+                if !map.wheel.contains(&row) {
+                    return RowAction::Ignored;
+                }
+                RowAction::Step(if lines < 0 { -1 } else { 1 })
+            }
+            Pointer::Press { .. } => {
+                let Some(item) = map.item_at(row).filter(|item| *item < len) else {
+                    return RowAction::Ignored;
+                };
+                self.pressed = Some(item);
+                if item == selected {
+                    RowAction::Handled
+                } else {
+                    RowAction::Highlight(item)
+                }
+            }
+            Pointer::Click { .. } => {
+                let pressed = self.pressed.take();
+                let Some(under) = map.item_at(row).filter(|item| *item < len) else {
+                    return RowAction::Ignored;
+                };
+                RowAction::Activate(pressed.filter(|item| *item < len).unwrap_or(under))
+            }
+        }
+    }
+}
+
+/// `selected` moved one item by `step`, clamped to `[0, len)` — a wheel notch does not wrap, unlike
+/// the arrow keys.
+pub(crate) fn clamped_step(selected: usize, len: usize, step: isize) -> usize {
+    selected
+        .saturating_add_signed(step)
+        .min(len.saturating_sub(1))
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::panic)]
+mod pointer_tests {
+    use super::*;
+    use crate::app::Pointer;
+    use ratatui::layout::Position;
+
+    fn press(row: u16) -> Pointer {
+        Pointer::Press {
+            at: Position::new(3, row),
+        }
+    }
+
+    fn click(row: u16) -> Pointer {
+        Pointer::Click {
+            at: Position::new(3, row),
+            count: 1,
+        }
+    }
+
+    fn wheel(row: u16, lines: i32) -> Pointer {
+        Pointer::Wheel {
+            at: Position::new(3, row),
+            lines,
+        }
+    }
+
+    /// Ten items, window of three, first row at slot row 4.
+    fn map_at(selected: usize) -> RowMap {
+        RowMap::windowed(4, selected, 10, 3)
+    }
+
+    #[test]
+    fn rows_outside_the_window_and_its_readout_are_not_items() {
+        let mut p = RowPointer::default();
+        let map = map_at(0);
+        assert_eq!(p.act(press(3), &map, 0, 10), RowAction::Ignored, "above");
+        assert_eq!(p.act(press(7), &map, 0, 10), RowAction::Ignored, "readout");
+        assert_eq!(p.act(press(8), &map, 0, 10), RowAction::Ignored, "below");
+        assert_eq!(p.act(press(5), &map, 0, 10), RowAction::Highlight(1));
+    }
+
+    #[test]
+    fn a_press_on_the_highlighted_row_changes_nothing() {
+        let mut p = RowPointer::default();
+        assert_eq!(p.act(press(4), &map_at(0), 0, 10), RowAction::Handled);
+    }
+
+    #[test]
+    fn a_click_activates_the_pressed_item_not_the_one_now_under_the_cell() {
+        let mut p = RowPointer::default();
+        // Press the middle row of the window around item 7 (items 6..9)…
+        assert_eq!(p.act(press(5), &map_at(7), 7, 10), RowAction::Handled);
+        // …the highlight moved elsewhere, the window slid (items 1..4), the cell shows item 3.
+        assert_eq!(p.act(click(6), &map_at(2), 2, 10), RowAction::Activate(7));
+        // The press is spent: a bare click activates what is under it.
+        assert_eq!(p.act(click(4), &map_at(2), 2, 10), RowAction::Activate(1));
+    }
+
+    #[test]
+    fn a_click_off_the_item_rows_leaves_an_abandoned_press_alone() {
+        let mut p = RowPointer::default();
+        assert_eq!(p.act(press(4), &map_at(0), 0, 10), RowAction::Handled);
+        assert_eq!(p.act(click(7), &map_at(0), 0, 10), RowAction::Ignored);
+    }
+
+    #[test]
+    fn the_wheel_is_the_lists_only_over_its_own_rows() {
+        let mut p = RowPointer::default();
+        let map = map_at(0);
+        assert_eq!(p.act(wheel(4, 1), &map, 0, 10), RowAction::Step(1));
+        assert_eq!(p.act(wheel(4, -3), &map, 0, 10), RowAction::Step(-1));
+        assert_eq!(
+            p.act(wheel(7, 1), &map, 0, 10),
+            RowAction::Step(1),
+            "readout"
+        );
+        assert_eq!(p.act(wheel(2, 1), &map, 0, 10), RowAction::Ignored, "title");
+        assert_eq!(p.act(wheel(9, 1), &map, 0, 10), RowAction::Ignored, "hint");
+    }
+
+    #[test]
+    fn an_empty_list_takes_nothing() {
+        let mut p = RowPointer::default();
+        let map = RowMap::windowed(4, 0, 0, 3);
+        assert_eq!(p.act(press(4), &map, 0, 0), RowAction::Ignored);
+        assert_eq!(p.act(wheel(4, 1), &map, 0, 0), RowAction::Ignored);
+    }
+
+    #[test]
+    fn rows_the_slot_was_too_short_to_paint_are_not_items() {
+        let mut p = RowPointer::default();
+        let map = map_at(0).clipped_to(6);
+        assert_eq!(p.act(press(5), &map, 0, 10), RowAction::Highlight(1));
+        assert_eq!(p.act(press(6), &map, 0, 10), RowAction::Ignored);
+        assert_eq!(p.act(wheel(6, 1), &map, 0, 10), RowAction::Ignored);
+    }
+
+    #[test]
+    fn an_item_answers_only_on_its_hit_rows() {
+        let mut p = RowPointer::default();
+        let map = RowMap::starting_at(2).item(0, 3, 2).item(1, 3, 2);
+        assert_eq!(p.act(press(3), &map, 1, 2), RowAction::Highlight(0));
+        assert_eq!(p.act(press(4), &map, 0, 2), RowAction::Ignored, "the gap");
+        assert_eq!(p.act(press(5), &map, 0, 2), RowAction::Highlight(1));
+    }
+
+    #[test]
+    fn a_wheel_step_is_clamped_not_wrapped() {
+        assert_eq!(clamped_step(0, 5, -1), 0);
+        assert_eq!(clamped_step(4, 5, 1), 4);
+        assert_eq!(clamped_step(2, 5, 1), 3);
+        assert_eq!(clamped_step(0, 0, 1), 0);
+    }
 }

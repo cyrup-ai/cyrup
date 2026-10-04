@@ -284,39 +284,20 @@ pub async fn run_interactive(
             }
         });
         app.set_fullscreen_copy_on_select(eff.fullscreen_copy_on_select());
+        // TUI-136 — `fullscreenWheelScrollLines`, seeded the same way as `copyOnSelect`
+        // (`tui-renderer.ts:38` @v1.0.0): `options.fullscreenWheelScrollLines ?? "auto"`.
+        app.set_fullscreen_wheel_scroll_lines(eff.fullscreen_wheel_scroll_lines());
     }
-    // TUI-004: now that `into_stdout` has raw mode on — and BEFORE `crossterm_input_stream` spawns
-    // the reader thread that would race us for the reply bytes — complete Pi's boot detection by
-    // actually ASKING the terminal (OSC 11, and DSR `?996` for an `auto` setting) instead of
-    // trusting `COLORFGBG`, which most terminals never set. The probe is hard-bounded at Pi's
-    // 100 ms (`theme-controller.ts:41,53`) and consumes nothing when the terminal stays silent; see
-    // `cyrup_tui::terminal_query` for the timeout / input-safety contract.
-    let colorfgbg = std::env::var("COLORFGBG").unwrap_or_default();
-    if let Some(theme) = controller.sync_with_terminal(
+    // Now that `into_stdout` has raw mode on — and BEFORE `crossterm_input_stream` spawns the
+    // reader thread that would race us for the reply bytes — settle the theme against what the
+    // terminal says its colours are.
+    settle_terminal_theme(
+        &mut app,
+        &mut controller,
         &StdinTerminalProbe,
-        std::time::Duration::from_millis(100),
-        &colorfgbg,
-    ) {
-        app.set_theme(theme);
-    }
-    // Pi persists a HIGH-confidence detection back to `settings.theme` so the next boot skips the
-    // query entirely (`theme-controller.ts:57-61`). A low-confidence fallback is never written.
-    if let Some(name) = controller.theme_to_persist() {
-        let _ = session
-            .persist_setting(
-                cyrup_session_svc::SettingsScope::Global,
-                "theme",
-                serde_json::Value::String(name.to_string()),
-            )
-            .await;
-    }
-    // TUI-004 — hand the settled controller to the app so the run loop's `session_swapped` arm can
-    // re-run pi's `applyFromSettings` on every session replacement. Upstream's controller is a field
-    // of the interactive mode (`interactive-mode.ts:960` @v0.84.4) and its `setRebindSession` hook
-    // calls straight into it (`:576-579`); cyrup's lived only in this stack frame, which is why
-    // `/reload` re-read five other settings rows and never the theme. Cloned rather than moved: the
-    // theme file watcher below still binds against `controller.active_name()`.
-    app.set_theme_controller(controller.clone());
+        &session,
+        theme_setting.as_deref(),
+    );
     app.detect_image_support();
     seed_footer(&mut app, &runtime, &session).await;
     // Pi shows the package-update notification whenever the detached check settles, which is why the
@@ -476,6 +457,57 @@ pub async fn run_interactive(
     let _ = app.restore();
     result.map_err(|e| anyhow::anyhow!("tui: {e}"))?;
     Ok(())
+}
+
+/// Settle the render theme against the terminal's own colours: ask for them, hand the controller to
+/// the app, and apply the theme the setting names.
+///
+/// Pi starts the colour query in `applyFromSettings` and awaits it with `waitForTerminalColors()`
+/// before building the header and the startup notices, because they bake theme colours into their
+/// text (`interactive-mode.ts:990-993`). The probe here is synchronous, hard-bounded at the same
+/// 100 ms (`theme-controller.ts:25`), consumes nothing when the terminal stays silent, and runs
+/// before anything the caller builds afterwards, so the ordering is the gate. A terminal that
+/// answers after the deadline completes the query on the input reader thread and the colours
+/// arrive on the channel installed here (Pi's `onLateReply`). See `cyrup_tui::terminal_query` for
+/// the timeout / input-safety contract.
+///
+/// Nothing is written back to `settings.json`: with no `theme` setting at all the theme is the
+/// generated `system` one, resolved afresh from the terminal at every start, and the file is left
+/// exactly as it was. pi v1.0.0 deleted its persist-the-detection path (`applyFromSettings` no
+/// longer calls `settingsManager.setTheme(detection.theme)`), and a persisted `theme` would pin the
+/// user to `dark` or `light` for good.
+///
+/// TUI-004 — the controller is handed to the app so the run loop's `session_swapped` arm can re-run
+/// pi's `applyFromSettings` on every session replacement. Upstream's controller is a field of the
+/// interactive mode (`interactive-mode.ts:960`) and its `setRebindSession` hook calls straight into
+/// it (`:608`); cyrup's lived only in the caller's stack frame, which is why `/reload` re-read five
+/// other settings rows and never the theme. `controller` is left holding the settled state because
+/// the theme file watcher still binds against `controller.active_name()`.
+pub(crate) fn settle_terminal_theme<B: cyrup_tui::RebuildBackend>(
+    app: &mut App<B>,
+    controller: &mut ThemeController,
+    probe: &dyn cyrup_tui::TerminalProbe,
+    session: &AgentSession,
+    theme_setting: Option<&str>,
+) {
+    let (colors_tx, colors_rx) = tokio::sync::mpsc::unbounded_channel();
+    let on_late_colors: cyrup_tui::LateColors = {
+        let colors_tx = colors_tx.clone();
+        Arc::new(move |colors| {
+            let _ = colors_tx.send(colors);
+        })
+    };
+    let _ = controller.request_terminal_colors(probe, Some(on_late_colors));
+    app.set_terminal_colors_channel(colors_tx, colors_rx);
+    app.set_theme_controller(controller.clone());
+    // …and apply the theme the setting names, now that the colours are in: a file-backed custom
+    // theme, the system theme generated from what the terminal reported, or — when the name
+    // resolves to nothing — the system theme with pi's `Failed to load theme …` sentence
+    // (`applyFromSettings`, `interactive-mode.ts:990`).
+    app.settle_boot_theme(theme_setting, &session.services().resources);
+    if let Some(settled) = app.theme_controller() {
+        *controller = settled.clone();
+    }
 }
 
 /// Build a [`ThemeWatcher`] for the active theme when it resolves to an on-disk file (feature #1).

@@ -169,6 +169,7 @@ impl TranscriptView {
         self.retained_dropped = self
             .retained_dropped
             .saturating_add(u64::try_from(excess).unwrap_or(u64::MAX));
+        self.prune_expansion();
     }
 
     /// The retained document: every committed [`Entry`] drained while retention was on, in commit
@@ -229,6 +230,7 @@ impl TranscriptView {
         self.retained_dropped = self
             .retained_dropped
             .saturating_add(u64::try_from(dropped).unwrap_or(u64::MAX));
+        self.prune_expansion();
     }
 
     /// `this.chatContainer.children.length > 0` (`interactive-mode.ts:3500`).
@@ -333,63 +335,98 @@ impl TranscriptView {
         live: &cyrup_ext::RenderOptions,
     ) -> Vec<StaleRender> {
         let mut out = Vec::new();
+        // The display inputs one row wants: the live ones, with `expanded` replaced by the row's own
+        // click override when it has one (`setExpanded` on a single component), and `isPartial`
+        // taken from the run for a tool RESULT. Built only for a row that carries an extension
+        // render, so a long retained document costs one match per entry, not one clone.
+        let want = |expansion: Option<Expansion>, partial: Option<bool>| {
+            let mut options = live.clone();
+            if let Some(e) = expansion {
+                options.expanded = e.is_open();
+            }
+            match partial {
+                Some(p) => options.partial(p),
+                None => options,
+            }
+        };
         let consider = |slot: RenderSlot,
                         rendered: Option<&RenderedText>,
-                        want: &cyrup_ext::RenderOptions,
+                        expansion: Option<Expansion>,
+                        partial: Option<bool>,
                         out: &mut Vec<StaleRender>| {
             let Some(source) = rendered.and_then(RenderedText::source) else {
                 return;
             };
-            if &source.under == want {
+            let want = want(expansion, partial);
+            if source.under == want {
                 return;
             }
             out.push(StaleRender {
                 slot,
                 next: RenderSource {
-                    under: want.clone(),
+                    under: want,
                     ..source.clone()
                 },
             });
         };
-        for (i, entry) in self.pending.iter().enumerate() {
-            match entry {
-                Entry::Custom { rendered, .. } => {
-                    let text = match rendered {
-                        Rendered::Text(t) => Some(t),
-                        _ => None,
-                    };
-                    consider(RenderSlot::PendingCustom(i), text, live, &mut out);
+        // The committed-but-undrained entries, then the retained document: the same two shapes of
+        // row, addressed by different slots. A tool carries its own click override; a custom
+        // message is not clickable and follows the live inputs.
+        for (retained, entries) in [(false, &self.pending), (true, &self.document)] {
+            for (i, entry) in entries.iter().enumerate() {
+                match entry {
+                    Entry::Custom { rendered, .. } => {
+                        let text = match rendered {
+                            Rendered::Text(t) => Some(t),
+                            _ => None,
+                        };
+                        let slot = if retained {
+                            RenderSlot::DocumentCustom(i)
+                        } else {
+                            RenderSlot::PendingCustom(i)
+                        };
+                        consider(slot, text, None, None, &mut out);
+                    }
+                    Entry::Tool(run) => {
+                        let (call, result, expansion) = if retained {
+                            (
+                                RenderSlot::DocumentToolCall(i),
+                                RenderSlot::DocumentToolResult(i),
+                                self.entry_expansion(i),
+                            )
+                        } else {
+                            (
+                                RenderSlot::PendingToolCall(i),
+                                RenderSlot::PendingToolResult(i),
+                                self.pending_expansion(i),
+                            )
+                        };
+                        consider(call, run.rendered_call.as_ref(), expansion, None, &mut out);
+                        consider(
+                            result,
+                            run.rendered_result.as_ref(),
+                            expansion,
+                            Some(!run.done),
+                            &mut out,
+                        );
+                    }
+                    _ => {}
                 }
-                Entry::Tool(run) => {
-                    consider(
-                        RenderSlot::PendingToolCall(i),
-                        run.rendered_call.as_ref(),
-                        live,
-                        &mut out,
-                    );
-                    let want = live.clone().partial(!run.done);
-                    consider(
-                        RenderSlot::PendingToolResult(i),
-                        run.rendered_result.as_ref(),
-                        &want,
-                        &mut out,
-                    );
-                }
-                _ => {}
             }
         }
         for (i, run) in self.active_tools.iter().enumerate() {
             consider(
                 RenderSlot::ActiveToolCall(i),
                 run.rendered_call.as_ref(),
-                live,
+                run.live_expansion,
+                None,
                 &mut out,
             );
-            let want = live.clone().partial(!run.done);
             consider(
                 RenderSlot::ActiveToolResult(i),
                 run.rendered_result.as_ref(),
-                &want,
+                run.live_expansion,
+                Some(!run.done),
                 &mut out,
             );
         }
@@ -419,6 +456,27 @@ impl TranscriptView {
             }
             RenderSlot::PendingToolResult(i) => {
                 if let Some(Entry::Tool(run)) = self.pending.get_mut(i) {
+                    run.rendered_result = Some(text);
+                } else {
+                    return;
+                }
+            }
+            RenderSlot::DocumentCustom(i) => {
+                if let Some(Entry::Custom { rendered, .. }) = self.document.get_mut(i) {
+                    *rendered = Rendered::Text(text);
+                } else {
+                    return;
+                }
+            }
+            RenderSlot::DocumentToolCall(i) => {
+                if let Some(Entry::Tool(run)) = self.document.get_mut(i) {
+                    run.rendered_call = Some(text);
+                } else {
+                    return;
+                }
+            }
+            RenderSlot::DocumentToolResult(i) => {
+                if let Some(Entry::Tool(run)) = self.document.get_mut(i) {
                     run.rendered_result = Some(text);
                 } else {
                     return;

@@ -13,81 +13,108 @@ use crate::error::ResourceError;
 use crate::key::ResourceKey;
 use crate::scope::{ResourceOrigin, ResourceScope};
 
-/// Parsed theme JSON (shape per Pi's `theme-schema.json`: name/vars/colors/export).
+/// Parsed theme JSON (shape per Pi's `theme-schema.json`: name/appearance/vars/colors/export).
 ///
-/// Color values may be hex strings, var references, **or 256-color integer indices** (0-255,
-/// theme.ts:23-28). Integer values are mapped to their truecolor RGB via the standard xterm-256
-/// palette at parse time and stored as `#rrggbb`, so downstream consumers see a uniform string map.
+/// Color values may be hex strings, `oklch(…)` / `okhsl(…)` functions, var references, the empty
+/// string (terminal default), **or 256-color integer indices** (0-255, theme.ts:23-28). The two
+/// kinds stay distinct in [`ColorValue`], as they do in pi's `ColorValue = string | number`: an
+/// index is NOT converted to RGB, because indices 0-15 name the user's own terminal palette.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ThemeData {
     pub name: String,
-    #[serde(default, deserialize_with = "de_color_map")]
-    pub vars: std::collections::BTreeMap<String, String>,
-    #[serde(default, deserialize_with = "de_color_map")]
-    pub colors: std::collections::BTreeMap<String, String>,
-    #[serde(default, deserialize_with = "de_color_map")]
-    pub export: std::collections::BTreeMap<String, String>,
+    /// The background the theme is designed for (`theme-schema.json:17-21`). `None` ⇒ detected from
+    /// the theme's own colours ([`Theme::appearance`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub appearance: Option<Appearance>,
+    #[serde(default)]
+    pub vars: std::collections::BTreeMap<String, ColorValue>,
+    #[serde(default)]
+    pub colors: std::collections::BTreeMap<String, ColorValue>,
+    #[serde(default)]
+    pub export: std::collections::BTreeMap<String, ColorValue>,
 }
 
-/// A raw theme color value: a string (hex / var-ref / "") or a 256-color integer index.
-#[derive(serde::Deserialize)]
+impl ThemeData {
+    /// Resolve every `colors` role through `vars` and settle the theme's [`Appearance`] — the shared
+    /// path for a discovered [`Theme`], a built-in, and a document the file watcher just re-read.
+    /// A role that does not resolve degrades to `Inherit` rather than panicking (R-00-009); a
+    /// document that came through [`Theme::parse`] has none.
+    #[must_use]
+    pub fn resolve(&self) -> ResolvedTheme {
+        let mut roles = std::collections::BTreeMap::new();
+        for (role, raw) in &self.colors {
+            let resolved = resolve_color(raw, &self.vars).unwrap_or(ColorSpec::Inherit);
+            roles.insert(role.clone(), resolved);
+        }
+        let appearance = self.appearance.or_else(|| detect_appearance(&roles));
+        ResolvedTheme { roles, appearance }
+    }
+}
+
+/// The background a theme is designed for — Pi `ThemeAppearance` (`theme.ts:186`), the schema's
+/// `"enum": ["dark", "light"]`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Appearance {
+    Dark,
+    Light,
+}
+
+/// A theme colour value as written — Pi `ColorValue` (`theme-json.ts`): a string (hex, `oklch(…)`,
+/// `okhsl(…)`, variable name, or `""` for the terminal default) or a 256-colour palette index.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(untagged)]
-enum ColorValueRaw {
-    Int(i64),
-    Str(String),
+pub enum ColorValue {
+    /// A palette index, 0-255.
+    Index(u8),
+    /// Any string form.
+    Text(String),
 }
 
-/// Deserialize a color map accepting string or integer values (theme.ts ColorValueSchema). Integer
-/// indices 0-255 are converted to `#rrggbb` via the xterm-256 palette; out-of-range integers become
-/// the empty (inherit) value.
-fn de_color_map<'de, D>(de: D) -> Result<std::collections::BTreeMap<String, String>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let raw: std::collections::BTreeMap<String, ColorValueRaw> =
-        serde::Deserialize::deserialize(de)?;
-    Ok(raw
-        .into_iter()
-        .map(|(k, v)| {
-            let s = match v {
-                ColorValueRaw::Str(s) => s,
-                ColorValueRaw::Int(n) if (0..=255).contains(&n) => {
-                    let (r, g, b) = index_to_rgb(n as u8);
-                    format!("#{r:02x}{g:02x}{b:02x}")
-                }
-                ColorValueRaw::Int(_) => String::new(),
-            };
-            (k, s)
-        })
-        .collect())
+impl From<&str> for ColorValue {
+    fn from(s: &str) -> Self {
+        ColorValue::Text(s.to_string())
+    }
 }
+
+/// Why a [`ColorValue`] did not resolve — the three `throw`s on pi's colour path, carrying pi's own
+/// message text (`resolveVarRefs` `theme.ts:143-147`, `parseColor` `colors.ts:147`). Pi's `setTheme`
+/// catches the throw and the controller prints it as `Failed to load theme "<name>": <message>`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ColorError {
+    /// `Circular variable reference detected: <value>`.
+    Circular(String),
+    /// `Variable reference not found: <value>`.
+    UnknownVariable(String),
+    /// `Invalid color value: <value>`.
+    Invalid(String),
+}
+
+impl std::fmt::Display for ColorError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ColorError::Circular(v) => write!(f, "Circular variable reference detected: {v}"),
+            ColorError::UnknownVariable(v) => write!(f, "Variable reference not found: {v}"),
+            ColorError::Invalid(v) => write!(f, "Invalid color value: {v}"),
+        }
+    }
+}
+
+impl std::error::Error for ColorError {}
 
 /// Validate a single color value against Pi's `ColorValueSchema`
-/// (`Type.Union([Type.String(), Type.Integer({minimum:0,maximum:255})])`, theme.ts:23-26), plus
-/// TUI-131's one extra rejection.
+/// (`Type.Union([Type.String(), Type.Integer({minimum:0,maximum:255})])`, theme.ts:23-26).
 ///
-/// A string is valid (hex / var-ref / empty) UNLESS it is an `oklch(…)` / `okhsl(…)` colour
-/// FUNCTION that does not parse. A number is valid only if it is a non-negative integer `<= 255`; a
-/// float, a negative, or an out-of-range integer fails the union, as does any non-string/non-number
-/// value (bool/object/array/null). Returns the error message for the "Other errors" section when
-/// invalid.
+/// A string is valid; a number is valid only if it is a non-negative integer `<= 255`; a float, a
+/// negative, or an out-of-range integer fails the union, as does any non-string/non-number value
+/// (bool/object/array/null). Returns the error message for the "Other errors" section when invalid.
 ///
-/// TUI-131 — upstream reaches a malformed colour value through `parseColor`'s
-/// `throw new Error(\`Invalid color value: ${value}\`)` during `setTheme`, which the user sees as
-/// `Failed to load theme …`. cyrup's resolver is total by R-00-009, so the report has to happen
-/// where cyrup already reports a bad theme: this validator, carrying upstream's own message text.
-/// The check is deliberately narrow — only a value whose `/^ok(lch|hsl)\(/i` prefix says it CANNOT
-/// be a variable reference is judged here. A bare string that is neither hex nor a known var stays
-/// a silent `Inherit`, which is cyrup's pre-existing contract and is pinned by
-/// `theme_resolve_var_indirection_and_bad_hex`.
+/// Whether a string actually RESOLVES — a known variable, a parseable colour — is not a schema
+/// question and is decided after validation by [`resolve_color`], exactly where pi decides it
+/// (`createTheme`, not the typebox schema).
 fn bad_color(val: &serde_json::Value) -> Option<String> {
     match val {
-        serde_json::Value::String(s)
-            if crate::color::is_color_function(s) && crate::color::parse_color(s).is_none() =>
-        {
-            Some(format!("Invalid color value: {s}"))
-        }
         serde_json::Value::String(_) => None,
         serde_json::Value::Number(n) if n.as_u64().is_some_and(|u| u <= 255) => None,
         _ => Some("Expected union value".to_string()),
@@ -117,6 +144,14 @@ fn collect_theme_errors(
     other: &mut Vec<String>,
 ) {
     let Some(obj) = value.as_object() else { return };
+
+    // `appearance: Type.Optional(Type.Union([Type.Literal("dark"), Type.Literal("light")]))`
+    // (`theme-schema.json:17-21`).
+    if let Some(appearance) = obj.get("appearance")
+        && !matches!(appearance.as_str(), Some("dark" | "light"))
+    {
+        other.push("  - /appearance: Expected union value".to_string());
+    }
 
     if let Some(vars) = obj.get("vars") {
         validate_color_record("/vars", vars, other);
@@ -194,9 +229,11 @@ pub struct Theme {
     pub origin: ResourceOrigin,
 }
 
-/// A color role resolved through `vars`. `""` / unknown means inherit (terminal default).
+/// A color role resolved through `vars` — Pi's concrete `Color` (`colors.ts:24`) plus the empty
+/// string. `""` means the terminal default (`Theme.addToken`'s `\x1b[39m` / `\x1b[49m`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum ColorSpec {
+    /// `""` — the terminal's default foreground or background.
     #[default]
     Inherit,
     Rgb {
@@ -204,12 +241,32 @@ pub enum ColorSpec {
         g: u8,
         b: u8,
     },
+    /// A 256-colour palette index, emitted as `38;5;N` / `48;5;N` so indices 0-15 follow the user's
+    /// terminal palette (Pi `IndexedColor`, `colors.ts:4`).
+    Indexed(u8),
+}
+
+impl ColorSpec {
+    /// The sRGB triple this colour is documented to have (`colorToRgb`, `colors.ts:218`), or `None`
+    /// for the terminal default, which has no colour of its own. An index maps through the standard
+    /// xterm palette — the *nominal* value; the terminal may draw 0-15 differently.
+    #[must_use]
+    pub fn to_rgb(self) -> Option<(u8, u8, u8)> {
+        match self {
+            ColorSpec::Inherit => None,
+            ColorSpec::Rgb { r, g, b } => Some((r, g, b)),
+            ColorSpec::Indexed(i) => Some(index_to_rgb(i)),
+        }
+    }
 }
 
 /// Roles resolved to concrete colors; cyrup-tui maps these to `ratatui::Color` (arch-10).
 #[derive(Clone, Debug, Default)]
 pub struct ResolvedTheme {
     pub roles: std::collections::BTreeMap<String, ColorSpec>,
+    /// The theme's [`Theme::appearance`]: declared, else detected from its colours. `None` for a
+    /// theme with no concrete colour at all (Pi then asks the terminal).
+    pub appearance: Option<Appearance>,
 }
 
 /// The fixed set of required `colors` tokens every theme must define (theme.ts:34-93).
@@ -333,6 +390,20 @@ impl Theme {
             path: path.clone().unwrap_or_default(),
             reason: e.to_string(),
         })?;
+        // Pi's `createTheme` resolves every `colors` entry — `resolveVarRefs`, then `parseColor` —
+        // and THROWS on the first that does not (`theme.ts:135-151`, `colors.ts:147`), which
+        // `setTheme` reports as `Failed to load theme …`. A value that cannot resolve is therefore
+        // a load error here too, with pi's own message, not a role that silently repaints from a
+        // compiled fallback. Only `colors` is judged: an unreferenced `vars` entry is never
+        // resolved upstream, and a bad `export` colour is swallowed by `getThemeExportColors`.
+        for raw in data.colors.values() {
+            if let Err(error) = resolve_color(raw, &data.vars) {
+                return Err(ResourceError::Theme {
+                    path: path.unwrap_or_default(),
+                    reason: error.to_string(),
+                });
+            }
+        }
         // Theme name must not contain `/` — reserved for the `light/dark` auto-theme setting
         // (theme.ts:506-512,551).
         if data.name.contains('/') {
@@ -377,15 +448,19 @@ impl Theme {
         Theme::parse(&text, Some(path.to_path_buf()), scope, origin)
     }
 
-    /// Resolve `colors` roles through `vars` + hex parsing. Bad/empty values become `Inherit`
-    /// (no panic).
+    /// Resolve `colors` roles through `vars` + colour parsing. A theme that came through
+    /// [`Theme::parse`] cannot fail to resolve; a hand-built [`ThemeData`] that does fail degrades
+    /// that role to `Inherit` rather than panicking (R-00-009).
     pub fn resolve(&self) -> ResolvedTheme {
-        let mut roles = std::collections::BTreeMap::new();
-        for (role, raw) in &self.data.colors {
-            let resolved = resolve_value(raw, &self.data.vars);
-            roles.insert(role.clone(), resolved);
-        }
-        ResolvedTheme { roles }
+        self.data.resolve()
+    }
+
+    /// The background this theme is designed for: the `appearance` its document declares, else
+    /// detected from the lightness of its own colours (Pi `Theme.ownAppearance`, `theme.ts:306`).
+    /// `None` when it has no concrete colour to judge by — Pi then asks the terminal.
+    #[must_use]
+    pub fn appearance(&self) -> Option<Appearance> {
+        self.resolve().appearance
     }
 
     /// Resolve the typed `export` section (`pageBg`/`cardBg`/`infoBg`) through `vars` for HTML
@@ -399,7 +474,7 @@ impl Theme {
             self.data
                 .export
                 .get(k)
-                .map(|raw| resolve_value(raw, &self.data.vars))
+                .and_then(|raw| resolve_color(raw, &self.data.vars).ok())
                 .unwrap_or(ColorSpec::Inherit)
         };
         ExportColors {
@@ -419,42 +494,133 @@ impl Named for Theme {
     }
 }
 
-/// Resolve a `colors` value **recursively** through `vars` (theme.ts:290-306).
+/// Resolve a theme colour value **recursively** through `vars` and parse it — Pi `resolveVarRefs`
+/// (`theme/theme.ts:135-151` @v1.0.0) followed by `parseColor` (`colors.ts:121-148`).
 ///
-/// Empty → inherit. A value starting with `#` is a terminal hex color, and — TUI-131 — so is an
-/// `oklch(…)` / `okhsl(…)` colour FUNCTION: upstream's `resolveVarRefs` short-circuits on
-/// `/^ok(lch|hsl)\(/i` alongside `#` (`theme/theme.ts:140` @v1.0.0), because a function call is a
-/// value and not a variable name. Otherwise it is treated as a var reference (an optional leading
-/// `$` is accepted for cyrup compatibility; Pi uses the bare name) and resolved recursively.
-/// Circular references and unknown vars degrade to `Inherit` (Pi throws; cyrup's `resolve()` is
-/// total and never panics, R-00-009).
-fn resolve_value(raw: &str, vars: &std::collections::BTreeMap<String, String>) -> ColorSpec {
-    resolve_value_inner(raw, vars, &mut std::collections::BTreeSet::new())
+/// A number is a palette index. The empty string is the terminal default. A string starting with
+/// `#`, or an `oklch(…)` / `okhsl(…)` function, is a VALUE and is parsed as written — upstream's
+/// `resolveVarRefs` short-circuits on exactly `value.startsWith("#") || /^ok(lch|hsl)\(/i` and
+/// leaves the rest to `parseColor`. Any other string is a variable name, looked up in `vars` and
+/// resolved the same way (an optional leading `$` is accepted for cyrup-authored themes; pi uses the
+/// bare name).
+///
+/// Every failure is an `Err` carrying pi's message; pi throws at each of these points. Nothing is
+/// trimmed, case-folded or defaulted on the way: `" #abc"`, `"abcdef"` and an unknown name are all
+/// errors, as they are upstream.
+///
+/// # Errors
+///
+/// [`ColorError::Circular`], [`ColorError::UnknownVariable`] or [`ColorError::Invalid`].
+pub fn resolve_color<'a>(
+    value: &'a ColorValue,
+    vars: &'a std::collections::BTreeMap<String, ColorValue>,
+) -> Result<ColorSpec, ColorError> {
+    let mut visited = std::collections::BTreeSet::new();
+    let mut current = value;
+    loop {
+        let text = match current {
+            ColorValue::Index(i) => return Ok(ColorSpec::Indexed(*i)),
+            ColorValue::Text(text) => text,
+        };
+        if text.is_empty() {
+            return Ok(ColorSpec::Inherit);
+        }
+        if text.starts_with('#') || crate::color::is_color_function(text) {
+            return crate::color::parse_color(text)
+                .map(|(r, g, b)| ColorSpec::Rgb { r, g, b })
+                .ok_or_else(|| ColorError::Invalid(text.clone()));
+        }
+        let name = text.strip_prefix('$').unwrap_or(text);
+        if !visited.insert(name) {
+            return Err(ColorError::Circular(text.clone()));
+        }
+        current = vars
+            .get(name)
+            .ok_or_else(|| ColorError::UnknownVariable(text.clone()))?;
+    }
 }
 
-fn resolve_value_inner(
-    raw: &str,
-    vars: &std::collections::BTreeMap<String, String>,
-    seen: &mut std::collections::BTreeSet<String>,
-) -> ColorSpec {
-    let v = raw.trim();
-    if v.is_empty() {
-        return ColorSpec::Inherit;
+/// `averageLightness` (`theme.ts:221-226`): the mean OKLab lightness of the concrete colours,
+/// ignoring palette indices 0-15 — those follow the user's terminal palette, so they say nothing
+/// about the theme.
+fn average_lightness(colors: &[ColorSpec]) -> Option<f64> {
+    let lightness: Vec<f64> = colors
+        .iter()
+        .filter_map(|spec| match spec {
+            ColorSpec::Inherit => None,
+            ColorSpec::Indexed(i) if *i < 16 => None,
+            other => other.to_rgb(),
+        })
+        .map(|rgb| crate::color::rgb_to_oklch(rgb).0)
+        .collect();
+    if lightness.is_empty() {
+        return None;
     }
-    if v.starts_with('#') || crate::color::is_color_function(v) {
-        return parse_color(v);
+    Some(lightness.iter().sum::<f64>() / lightness.len() as f64)
+}
+
+/// The tokens pi draws as backgrounds (`BACKGROUND_TOKENS`, `theme.ts:573-581`); every other token
+/// is a foreground.
+const BACKGROUND_TOKENS: [&str; 7] = [
+    "selectedBg",
+    "searchMatchBg",
+    "userMessageBg",
+    "customMessageBg",
+    "toolPendingBg",
+    "toolSuccessBg",
+    "toolErrorBg",
+];
+
+/// Pi's `withThemeColorFallbacks` (`theme.ts:164-179`): `(optional token, token it falls back to)`.
+const OPTIONAL_TOKEN_FALLBACKS: [(&str, &str); 5] = [
+    ("scrollbarTrack", "muted"),
+    ("scrollbarThumb", "text"),
+    ("thinkingMax", "thinkingXhigh"),
+    ("searchMatchBg", "selectedBg"),
+    ("searchMatchText", "text"),
+];
+
+/// Pi `detectAppearance(foregrounds, backgrounds)` (`theme.ts:228-236`) over a resolved role map:
+/// background tokens against foreground tokens, with the optional tokens' fallbacks applied first
+/// (they are part of the colour set pi averages, `theme.ts:164-179`, `:306`).
+///
+/// Both present: dark when the backgrounds are darker than the foregrounds. Backgrounds alone: dark
+/// below 0.5. Foregrounds alone: dark above 0.5. Neither: undecided.
+fn detect_appearance(roles: &std::collections::BTreeMap<String, ColorSpec>) -> Option<Appearance> {
+    let mut all = roles.clone();
+    for (optional, base) in OPTIONAL_TOKEN_FALLBACKS {
+        if !all.contains_key(optional)
+            && let Some(spec) = all.get(base).copied()
+        {
+            all.insert(optional.to_string(), spec);
+        }
     }
-    // Var reference (with or without a leading `$`).
-    let var_name = v.strip_prefix('$').unwrap_or(v);
-    if seen.contains(var_name) {
-        return ColorSpec::Inherit; // circular reference
+    let (backgrounds, foregrounds): (Vec<_>, Vec<_>) = all
+        .into_iter()
+        .partition(|(token, _)| BACKGROUND_TOKENS.contains(&token.as_str()));
+    let backgrounds: Vec<ColorSpec> = backgrounds.into_iter().map(|(_, spec)| spec).collect();
+    let foregrounds: Vec<ColorSpec> = foregrounds.into_iter().map(|(_, spec)| spec).collect();
+    match (
+        average_lightness(&foregrounds),
+        average_lightness(&backgrounds),
+    ) {
+        (Some(fg), Some(bg)) => Some(if bg < fg {
+            Appearance::Dark
+        } else {
+            Appearance::Light
+        }),
+        (None, Some(bg)) => Some(if bg < 0.5 {
+            Appearance::Dark
+        } else {
+            Appearance::Light
+        }),
+        (Some(fg), None) => Some(if fg > 0.5 {
+            Appearance::Dark
+        } else {
+            Appearance::Light
+        }),
+        (None, None) => None,
     }
-    if let Some(next) = vars.get(var_name) {
-        seen.insert(var_name.to_string());
-        return resolve_value_inner(next, vars, seen);
-    }
-    // Not a known var: last-resort value parse (e.g. `rrggbb` without `#`).
-    parse_color(v)
 }
 
 /// Map a 256-color palette index to truecolor RGB (standard xterm-256 palette).
@@ -494,198 +660,11 @@ fn index_to_rgb(idx: u8) -> (u8, u8, u8) {
     }
 }
 
-/// Parse a theme colour VALUE into a [`ColorSpec`]; anything malformed ⇒ `Inherit`.
-///
-/// TUI-131 — this was `parse_hex` and took `#rrggbb` / `rrggbb` / `#rgb` only. It now delegates to
-/// [`crate::color::parse_color`], the port of pi's `parseColor` (`packages/tui/src/colors.ts:121`
-/// @v1.0.0), so `oklch(…)` and `okhsl(…)` resolve instead of silently becoming `Inherit` — which
-/// is what every token of a pi 1.0 theme did, both built-ins included, since pi rewrote
-/// `dark.json` and `light.json` entirely in OKHSL.
-///
-/// Upstream THROWS on an unparseable value and the throw reaches the user as `Failed to load
-/// theme …`; cyrup's resolver is total by R-00-009, so an unparseable value still degrades to
-/// `Inherit` here.
-fn parse_color(s: &str) -> ColorSpec {
-    match crate::color::parse_color(s) {
-        Some((r, g, b)) => ColorSpec::Rgb { r, g, b },
-        None => ColorSpec::Inherit,
-    }
-}
+/// The compiled-in `dark` theme (R-09-011): pi's `theme/dark.json` @v1.0.0, byte for byte.
+pub const BUILTIN_DARK_JSON: &str = include_str!("builtin_themes/dark.json");
 
-/// The compiled-in `dark` theme (R-09-011), ported verbatim from Pi's `dark.json` (all 51 tokens).
-pub const BUILTIN_DARK_JSON: &str = r##"{
-  "name": "dark",
-  "vars": {
-    "cyan": "#00d7ff",
-    "blue": "#5f87ff",
-    "green": "#b5bd68",
-    "red": "#cc6666",
-    "yellow": "#ffff00",
-    "text": "#d4d4d4",
-    "gray": "#808080",
-    "dimGray": "#666666",
-    "darkGray": "#505050",
-    "accent": "#8abeb7",
-    "selectedBg": "#3a3a4a",
-    "userMsgBg": "#343541",
-    "toolPendingBg": "#282832",
-    "toolSuccessBg": "#283228",
-    "toolErrorBg": "#3c2828",
-    "customMsgBg": "#2d2838"
-  },
-  "colors": {
-    "accent": "accent",
-    "border": "blue",
-    "borderAccent": "cyan",
-    "borderMuted": "darkGray",
-    "success": "green",
-    "error": "red",
-    "warning": "yellow",
-    "muted": "gray",
-    "dim": "dimGray",
-    "text": "text",
-    "thinkingText": "gray",
-
-    "selectedBg": "selectedBg",
-    "userMessageBg": "userMsgBg",
-    "userMessageText": "text",
-    "customMessageBg": "customMsgBg",
-    "customMessageText": "text",
-    "customMessageLabel": "#9575cd",
-    "toolPendingBg": "toolPendingBg",
-    "toolSuccessBg": "toolSuccessBg",
-    "toolErrorBg": "toolErrorBg",
-    "toolTitle": "text",
-    "toolOutput": "gray",
-
-    "mdHeading": "#f0c674",
-    "mdLink": "#81a2be",
-    "mdLinkUrl": "dimGray",
-    "mdCode": "accent",
-    "mdCodeBlock": "green",
-    "mdCodeBlockBorder": "gray",
-    "mdQuote": "gray",
-    "mdQuoteBorder": "gray",
-    "mdHr": "gray",
-    "mdListBullet": "accent",
-
-    "toolDiffAdded": "green",
-    "toolDiffRemoved": "red",
-    "toolDiffContext": "gray",
-
-    "syntaxComment": "#6A9955",
-    "syntaxKeyword": "#569CD6",
-    "syntaxFunction": "#DCDCAA",
-    "syntaxVariable": "#9CDCFE",
-    "syntaxString": "#CE9178",
-    "syntaxNumber": "#B5CEA8",
-    "syntaxType": "#4EC9B0",
-    "syntaxOperator": "#D4D4D4",
-    "syntaxPunctuation": "#D4D4D4",
-
-    "thinkingOff": "darkGray",
-    "thinkingMinimal": "#6e6e6e",
-    "thinkingLow": "#5f87af",
-    "thinkingMedium": "#81a2be",
-    "thinkingHigh": "#b294bb",
-    "thinkingXhigh": "#d183e8",
-    "thinkingMax": "#ff5fff",
-
-    "bashMode": "green"
-  },
-  "export": {
-    "pageBg": "#18181e",
-    "cardBg": "#1e1e24",
-    "infoBg": "#3c3728"
-  }
-}"##;
-
-/// The compiled-in `light` theme (R-09-011), ported verbatim from Pi's `light.json` (all 51 tokens).
-pub const BUILTIN_LIGHT_JSON: &str = r##"{
-  "name": "light",
-  "vars": {
-    "teal": "#5a8080",
-    "blue": "#547da7",
-    "green": "#588458",
-    "red": "#aa5555",
-    "yellow": "#9a7326",
-    "text": "#1f2328",
-    "mediumGray": "#6c6c6c",
-    "dimGray": "#767676",
-    "lightGray": "#b0b0b0",
-    "selectedBg": "#d0d0e0",
-    "userMsgBg": "#e8e8e8",
-    "toolPendingBg": "#e8e8f0",
-    "toolSuccessBg": "#e8f0e8",
-    "toolErrorBg": "#f0e8e8",
-    "customMsgBg": "#ede7f6"
-  },
-  "colors": {
-    "accent": "teal",
-    "border": "blue",
-    "borderAccent": "teal",
-    "borderMuted": "lightGray",
-    "success": "green",
-    "error": "red",
-    "warning": "yellow",
-    "muted": "mediumGray",
-    "dim": "dimGray",
-    "text": "text",
-    "thinkingText": "mediumGray",
-
-    "selectedBg": "selectedBg",
-    "userMessageBg": "userMsgBg",
-    "userMessageText": "text",
-    "customMessageBg": "customMsgBg",
-    "customMessageText": "text",
-    "customMessageLabel": "#7e57c2",
-    "toolPendingBg": "toolPendingBg",
-    "toolSuccessBg": "toolSuccessBg",
-    "toolErrorBg": "toolErrorBg",
-    "toolTitle": "text",
-    "toolOutput": "mediumGray",
-
-    "mdHeading": "yellow",
-    "mdLink": "blue",
-    "mdLinkUrl": "dimGray",
-    "mdCode": "teal",
-    "mdCodeBlock": "green",
-    "mdCodeBlockBorder": "mediumGray",
-    "mdQuote": "mediumGray",
-    "mdQuoteBorder": "mediumGray",
-    "mdHr": "mediumGray",
-    "mdListBullet": "green",
-
-    "toolDiffAdded": "green",
-    "toolDiffRemoved": "red",
-    "toolDiffContext": "mediumGray",
-
-    "syntaxComment": "#008000",
-    "syntaxKeyword": "#0000FF",
-    "syntaxFunction": "#795E26",
-    "syntaxVariable": "#001080",
-    "syntaxString": "#A31515",
-    "syntaxNumber": "#098658",
-    "syntaxType": "#267F99",
-    "syntaxOperator": "#000000",
-    "syntaxPunctuation": "#000000",
-
-    "thinkingOff": "lightGray",
-    "thinkingMinimal": "#767676",
-    "thinkingLow": "blue",
-    "thinkingMedium": "teal",
-    "thinkingHigh": "#875f87",
-    "thinkingXhigh": "#8b008b",
-    "thinkingMax": "#af005f",
-
-    "bashMode": "green"
-  },
-  "export": {
-    "pageBg": "#f8f8f8",
-    "cardBg": "#ffffff",
-    "infoBg": "#fffae6"
-  }
-}"##;
+/// The compiled-in `light` theme (R-09-011): pi's `theme/light.json` @v1.0.0, byte for byte.
+pub const BUILTIN_LIGHT_JSON: &str = include_str!("builtin_themes/light.json");
 
 /// The two compiled-in built-ins (`dark`, `light`) at [`ResourceScope::Builtin`].
 pub fn builtin_themes() -> Vec<Theme> {

@@ -31,6 +31,16 @@
 //! uses, and records the outcome in a process-global ([`current`]) so the rest of the TUI — and the
 //! user-facing diagnostics — can tell whether modified keys are actually disambiguated.
 //!
+//! The negotiation is not the only query that ends in a DA1 request: the terminal-colour query's
+//! trailing sentinel is a second consumer (TUI-133). Pi therefore COUNTS the DA1 replies the
+//! negotiation is owed (`pendingKeyboardProtocolDeviceAttributes`, `terminal.ts:144`, `:262`) and
+//! forwards any further one instead of swallowing it (`:271-273`) — without that, the negotiator
+//! eats the colour query's sentinel and every boot pays the colour query's full 100 ms. Here the
+//! count is the DA1 ledger in [`crate::terminal_query`]: the exchange [`negotiate_with`] runs queues
+//! its claim before it writes, the first DA1 the terminal sends settles it, and the next belongs to
+//! whoever queued behind. An exchange that gave up keeps its place, so its late DA1 is absorbed
+//! rather than mistaken for the next query's.
+//!
 //! `[CYRUP-DELTA]` **`REPORT_EVENT_TYPES` (bit 2) and `REPORT_ALTERNATE_KEYS` (bit 4) are both
 //! withheld: cyrup pushes `CSI > 1 u` where Pi pushes `CSI > 7 u`** (`TUI-046`). Only bit 1
 //! (`DISAMBIGUATE_ESCAPE_CODES`) is asked for. Both omissions have one root cause: Pi owns its key
@@ -249,7 +259,7 @@ pub fn is_negotiation_prefix(sequence: &str) -> bool {
 ///
 /// Pi anchors its regex because its `StdinBuffer` has already split the stream per sequence; here the
 /// bytes arrive unsplit, so we scan — the same shape as
-/// [`crate::terminal_query::find_osc11_background_color`].
+/// [`crate::terminal_query::find_cell_size_report`].
 pub fn find_kitty_flags(buffer: &str) -> Option<u32> {
     let mut rest = buffer;
     while let Some(start) = rest.find("\x1b[?") {
@@ -324,14 +334,39 @@ pub fn set_current(protocol: KeyboardProtocol) {
 /// reader thread exists; see the module docs. Returns the decision and stores it in [`current`].
 /// Costs at most [`NEGOTIATION_TIMEOUT`] and consumes no byte the terminal did not send in reply.
 pub fn negotiate() -> KeyboardProtocol {
-    let reply = crate::terminal_query::exchange(
+    let decision = negotiate_with(
         crate::dead_terminal::terminal_stdout(),
-        KITTY_FLAGS_QUERY,
-        NEGOTIATION_TIMEOUT,
+        &mut crate::terminal_query::StdinSource,
+        crate::terminal_query::stdin_is_queryable,
+        &crate::terminal_query::GlobalHub,
     );
-    let decision = decide(reply.as_deref().unwrap_or_default());
     set_current(decision);
     decision
+}
+
+/// [`negotiate`] over any terminal and any [`Hub`](crate::terminal_query::Hub), without recording
+/// the outcome — the whole negotiation, driveable from a scripted terminal.
+///
+/// The DA1 request that closes the query is this negotiation's claim on one DA1 reply, queued on
+/// the hub in write order (Pi's `pendingKeyboardProtocolDeviceAttributes += 1`,
+/// `terminal.ts:262`). The reply that settles it is the first DA1 the terminal sends; a LATER one
+/// belongs to whoever queued behind — the colour query's sentinel — and is not this negotiation's
+/// to swallow (`terminal.ts:271-273`: with none owed the DA1 is forwarded, not consumed).
+pub(crate) fn negotiate_with(
+    out: impl std::io::Write,
+    source: &mut dyn crate::terminal_query::ReplySource,
+    queryable: impl FnOnce() -> bool,
+    hub: &impl crate::terminal_query::HubAccess,
+) -> KeyboardProtocol {
+    let reply = crate::terminal_query::exchange_with(
+        out,
+        KITTY_FLAGS_QUERY,
+        source,
+        NEGOTIATION_TIMEOUT,
+        queryable,
+        hub,
+    );
+    decide(reply.as_deref().unwrap_or_default())
 }
 
 #[cfg(test)]
@@ -581,6 +616,113 @@ mod tests {
         // Bytes that merely contain `u`/`c` must not be read as a negotiation reply.
         assert_eq!(decide("cursor"), KeyboardProtocol::Unknown);
         assert_eq!(find_kitty_flags("\x1b[?abcu"), None);
+    }
+
+    // ------------------------------- TUI-133: the DA1 replies the negotiation is owed ----
+
+    use crate::terminal_query::{Dispatch, Hub, Read, ReplySource};
+    use std::collections::VecDeque;
+    use std::sync::{Arc, Mutex};
+
+    /// A terminal that answers from a script, one chunk per read, then falls silent.
+    struct Terminal {
+        chunks: VecDeque<Vec<u8>>,
+        on_first_read: Option<Box<dyn FnOnce()>>,
+    }
+
+    impl Terminal {
+        fn new(chunks: &[&str]) -> Self {
+            Self {
+                chunks: chunks.iter().map(|c| c.as_bytes().to_vec()).collect(),
+                on_first_read: None,
+            }
+        }
+    }
+
+    impl ReplySource for Terminal {
+        fn read(&mut self, _timeout: Duration) -> Read {
+            if let Some(hook) = self.on_first_read.take() {
+                hook();
+            }
+            self.chunks.pop_front().map_or(Read::TimedOut, Read::Bytes)
+        }
+    }
+
+    const DA1: &str = "\x1b[?62;1;2;6;9;15;22c";
+
+    /// The row's verify line: "With the keyboard-protocol query in flight, the first DA1 reply ends
+    /// negotiation and the second reaches the colour query."
+    ///
+    /// The colour query is written right behind the negotiation's request (the hook), so both are
+    /// in flight when the terminal answers: Kitty flags, DA1, the OSC 11 colour, DA1. Pi's
+    /// negotiator counts the DA1 it is owed (`pendingKeyboardProtocolDeviceAttributes`) and
+    /// forwards the next, which is the colour query's sentinel.
+    #[test]
+    fn the_first_da1_ends_the_negotiation_and_the_second_reaches_the_colour_query() {
+        let hub = Arc::new(Mutex::new(Hub::default()));
+        let colours = Arc::new(Mutex::new(None));
+        let mut terminal = Terminal::new(&["\x1b[?1u", DA1, "\x1b]11;rgb:1010/1010/1010\x07", DA1]);
+        terminal.on_first_read = Some(Box::new({
+            let (hub, colours) = (Arc::clone(&hub), Arc::clone(&colours));
+            move || *colours.lock().unwrap() = Some(hub.lock().unwrap().begin_colors())
+        }));
+
+        let decision = negotiate_with(std::io::sink(), &mut terminal, || true, &*hub);
+
+        assert_eq!(
+            decision,
+            KeyboardProtocol::Kitty,
+            "the flags reply decided it"
+        );
+        assert_eq!(
+            terminal.chunks.len(),
+            2,
+            "the negotiation stopped at ITS DA1 and did not read the colour query's replies"
+        );
+
+        // What the input reader does with the rest of the terminal's answer.
+        let id = colours
+            .lock()
+            .unwrap()
+            .expect("the colour query was written");
+        let mut hub = hub.lock().unwrap();
+        assert_eq!(
+            hub.dispatch("\x1b]11;rgb:1010/1010/1010\x07").0,
+            Dispatch::Consumed
+        );
+        assert!(
+            hub.take_colors(id).is_none(),
+            "the colour query is not done before its DA1"
+        );
+        assert_eq!(
+            hub.dispatch(DA1).0,
+            Dispatch::Consumed,
+            "the SECOND DA1 belongs to the colour query"
+        );
+        let done = hub.take_colors(id).expect("and completes it");
+        assert_eq!(
+            done.background,
+            Some(cyrup_resources::color::Rgb::new(0x10, 0x10, 0x10))
+        );
+    }
+
+    /// A negotiation whose terminal is slow keeps its claim: when its DA1 finally lands it is the
+    /// negotiation's, not the next query's.
+    #[test]
+    fn a_slow_negotiations_late_da1_is_not_taken_by_the_next_query() {
+        let hub = Mutex::new(Hub::default());
+        let decision = negotiate_with(std::io::sink(), &mut Terminal::new(&[]), || true, &hub);
+        assert_eq!(
+            decision,
+            KeyboardProtocol::Unknown,
+            "nothing answered in time"
+        );
+
+        let mut hub = hub.lock().unwrap();
+        let next = hub.begin_exchange();
+        // The negotiation's late DA1 arrives first, then the next query's own.
+        assert_eq!(hub.dispatch(DA1).0, Dispatch::Consumed);
+        assert_eq!(hub.dispatch(DA1).0, Dispatch::Sentinel(next));
     }
 
     #[test]

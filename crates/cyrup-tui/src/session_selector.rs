@@ -24,7 +24,10 @@ use ratatui::widgets::Paragraph;
 use crate::keymap::{
     EditorAction, EditorKeymap, Key, SelectAction, SelectKeymap, SessionAction, SessionKeymap,
 };
-use crate::selector::{Selector, SelectorOutcome, centered_window, rule_line};
+use crate::selector::{
+    RowAction, RowMap, RowPointer, Selector, SelectorOutcome, centered_window, clamped_step,
+    rule_line,
+};
 use crate::session_search::{NameFilter, SearchRow, SortMode, filter_and_sort};
 use crate::settings_selector::FIELD_SEP;
 use crate::text_input::{Input, InputOutcome};
@@ -252,6 +255,9 @@ pub struct SessionSelector {
     /// `rename` pair is appended to hint row 2 (`:177-179`). Upstream hides it when the host wired
     /// no rename callback.
     show_rename_hint: bool,
+    /// The row a left press went down on, so the click that completes the gesture resumes it even
+    /// if the window slid under the pointer.
+    pointer: RowPointer,
 }
 
 impl SessionSelector {
@@ -291,6 +297,7 @@ impl SessionSelector {
             // `options?.showRenameHint ?? this.canRename` (`:772`), and cyrup's `/resume` always
             // wires the rename path (`SessionSelectorOutcome::Rename` → `rename_session`).
             show_rename_hint: true,
+            pointer: RowPointer::default(),
         }
     }
 
@@ -626,6 +633,14 @@ impl SessionSelector {
             .map(|n| n.row)
     }
 
+    /// Resume the highlighted session — the one answer to `Enter` and to a click on its row.
+    fn confirm_current(&self) -> SelectorOutcome {
+        match self.current() {
+            Some(row) => SelectorOutcome::Confirm(row.path),
+            None => SelectorOutcome::Redraw,
+        }
+    }
+
     /// `startDeleteConfirmationForSelectedSession` (`session-selector.ts:394-403` @v0.84.4): arm
     /// the delete confirmation for the highlighted row, or do nothing when the list is empty.
     /// Shared by `app.session.delete` and `app.session.deleteNoninvasive`.
@@ -916,6 +931,53 @@ impl SessionSelector {
         lines
     }
 
+    /// Everything above the list (`buildBaseLayout`, then `SessionList.render`'s search box): the
+    /// blank above the top rule, the rule, a blank, the three-line header, a blank, the search or
+    /// rename `Input` and the blank under it. Its length is the slot row the first session is
+    /// painted on, which is what [`Selector::pointer`] hit-tests against.
+    fn head_lines(&self, theme: &UiTheme, width: u16) -> Vec<Line<'static>> {
+        let mut lines: Vec<Line<'static>> = vec![
+            Line::from(""),                         // `Spacer`(:737)
+            rule_line(width, theme.accent_style()), // `DynamicBorder`(:738), accent (S13)
+            Line::from(""),                         // `Spacer`(:739)
+            self.header_line(theme, width),         // header line 1 of 3 (:185)
+        ];
+        // Header lines 2 and 3 (`hintLine1`/`hintLine2`, `:156-183`).
+        lines.extend(self.hint_lines(theme, width));
+        // `Spacer`(:742) — `buildBaseLayout` puts one between the header child and the content
+        // child, and the content child is the `SessionList` whose first line is the search input.
+        lines.push(Line::from(""));
+        // Search / rename input (`SessionList.render`, `session-selector.ts:418`).
+        if let Some((_, edit)) = &self.renaming {
+            // The accent ` rename ` label, then the `Input`'s own value + caret; the label eats
+            // eight columns, so the value gets the rest.
+            let mut spans = vec![Span::styled(" rename ", theme.accent_style())];
+            spans.extend(crate::selector::search_input_spans(
+                edit.value(),
+                edit.cursor(),
+                usize::from(width).saturating_sub(8),
+                theme,
+            ));
+            lines.push(Line::from(spans));
+        } else {
+            // Search box with a visible block cursor (feature #9 "selector IME cursor").
+            //
+            // S31: `SessionList.render` splices the `Input`'s own lines in unmodified —
+            // `lines.push(...this.searchInput.render(width))` (`session-selector.ts:418`) — so the
+            // row is `Input.render`'s shared, unstyled `"> "` at column 0 (`input.ts:380`). cyrup
+            // drew an accent `" > "`: one column in, and coloured.
+            lines.push(Line::from(crate::selector::input_line_spans(
+                self.input.value(),
+                self.input.cursor(),
+                width,
+                theme,
+            )));
+        }
+        // The blank `SessionList.render` itself pushes after the search input (`:419`).
+        lines.push(Line::from(""));
+        lines
+    }
+
     /// S12 — the header's first line (`SessionSelectorHeader.render`, `session-selector.ts:130-153`
     /// and `:185`).
     ///
@@ -1151,51 +1213,53 @@ impl Selector for SessionSelector {
         // the rest pass the `border` token. cyrup framed it with `theme.border_style()`. Hence
         // `rule_line(.., accent)` below rather than the shared `border_rule_line` every other
         // envelope uses.
-        let mut lines: Vec<Line<'static>> = vec![
-            Line::from(""),                              // `Spacer`(:737)
-            rule_line(area.width, theme.accent_style()), // `DynamicBorder`(:738), accent (S13)
-            Line::from(""),                              // `Spacer`(:739)
-            self.header_line(theme, area.width),         // header line 1 of 3 (:185)
-        ];
-        // Header lines 2 and 3 (`hintLine1`/`hintLine2`, `:156-183`).
-        lines.extend(self.hint_lines(theme, area.width));
-        // `Spacer`(:742) — `buildBaseLayout` puts one between the header child and the content
-        // child, and the content child is the `SessionList` whose first line is the search input.
-        lines.push(Line::from(""));
-        // Search / rename input (`SessionList.render`, `session-selector.ts:418`).
-        if let Some((_, edit)) = &self.renaming {
-            // The accent ` rename ` label, then the `Input`'s own value + caret; the label eats
-            // eight columns, so the value gets the rest.
-            let mut spans = vec![Span::styled(" rename ", theme.accent_style())];
-            spans.extend(crate::selector::search_input_spans(
-                edit.value(),
-                edit.cursor(),
-                usize::from(area.width).saturating_sub(8),
-                theme,
-            ));
-            lines.push(Line::from(spans));
-        } else {
-            // Search box with a visible block cursor (feature #9 "selector IME cursor").
-            //
-            // S31: `SessionList.render` splices the `Input`'s own lines in unmodified —
-            // `lines.push(...this.searchInput.render(width))` (`session-selector.ts:418`) — so the
-            // row is `Input.render`'s shared, unstyled `"> "` at column 0 (`input.ts:380`). cyrup
-            // drew an accent `" > "`: one column in, and coloured.
-            lines.push(Line::from(crate::selector::input_line_spans(
-                self.input.value(),
-                self.input.cursor(),
-                area.width,
-                theme,
-            )));
-        }
-        // The blank `SessionList.render` itself pushes after the search input (`:419`).
-        lines.push(Line::from(""));
+        let mut lines = self.head_lines(theme, area.width);
         lines.extend(self.body_lines(theme, &filtered, area.width));
         // `Spacer`(:745).
         lines.push(Line::from(""));
         // `DynamicBorder`(:746) — accent, like `:738` above (S13).
         lines.push(rule_line(area.width, theme.accent_style()));
         frame.render_widget(Paragraph::new(lines).style(theme.base_style()), area);
+    }
+
+    /// A press highlights the session under the pointer, a click resumes it as `Enter` does, and a
+    /// wheel notch over the list moves the highlight one session; like the arrow keys here it stops
+    /// at the ends. The rules, header, hint rows, search box, `(i/N)` readout and blanks are not
+    /// sessions. While a delete confirmation or a rename is pending the keyboard owns the dialog
+    /// (`Enter` there means "delete" / "save", not "resume"), so the pointer is ignored.
+    fn pointer(&mut self, area: Rect, event: crate::app::Pointer) -> SelectorOutcome {
+        if self.confirming_delete.is_some() || self.renaming.is_some() {
+            return SelectorOutcome::Ignored;
+        }
+        let top = self
+            .head_lines(UiTheme::default_ref(), area.width)
+            .len()
+            .min(usize::from(u16::MAX)) as u16;
+        let len = self.filtered().len();
+        let map =
+            RowMap::windowed(top, self.selected, len, self.max_visible).clipped_to(area.height);
+        let action = self.pointer.act(event, &map, self.selected, len);
+        if action != RowAction::Ignored {
+            // `this.selectionTouched = true` (`session-selector.ts:611`) — a pointer move is a
+            // navigation key as far as the batch-landing snap is concerned.
+            self.selection_touched = true;
+        }
+        match action {
+            RowAction::Ignored => SelectorOutcome::Ignored,
+            RowAction::Handled => SelectorOutcome::Redraw,
+            RowAction::Highlight(item) => {
+                self.selected = item;
+                SelectorOutcome::Redraw
+            }
+            RowAction::Activate(item) => {
+                self.selected = item;
+                self.confirm_current()
+            }
+            RowAction::Step(step) => {
+                self.selected = clamped_step(self.selected, len, step);
+                SelectorOutcome::Redraw
+            }
+        }
     }
 
     fn handle(&mut self, key: &KeyEvent, keymap: &SelectKeymap) -> SelectorOutcome {
@@ -1327,10 +1391,7 @@ impl Selector for SessionSelector {
                 }
                 SelectorOutcome::Redraw
             }
-            Some(SelectAction::Confirm) => match self.current() {
-                Some(row) => SelectorOutcome::Confirm(row.path),
-                None => SelectorOutcome::Redraw,
-            },
+            Some(SelectAction::Confirm) => self.confirm_current(),
             Some(SelectAction::Cancel) => SelectorOutcome::Cancel,
             // 6) Everything else → the search `Input` (`session-selector.ts:565-567`).
             None => match self.input.handle_key(key) {
@@ -2461,7 +2522,7 @@ mod tests {
         let mut term = Terminal::new(backend).unwrap();
         term.draw(|f| sel.render(f, f.area(), &theme)).unwrap();
         let buf = term.backend().buffer().clone();
-        // `dim` and `muted` are different tokens (`#666666` vs `#808080`), so this cannot pass by
+        // `dim` and `muted` are different tokens (`#7e888e` vs `#9da5a9`), so this cannot pass by
         // accident.
         assert_ne!(theme.dim_style().fg, theme.muted_style().fg);
         let y1 = find_row(&buf, "tab scope");

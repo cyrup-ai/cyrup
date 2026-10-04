@@ -21,7 +21,7 @@ use std::time::Duration;
 
 use cyrup_ext::host::{
     HostServices, InteractiveOverlay, NotifyKind, OverlayColor, OverlayKey, OverlayKeyCode,
-    OverlayLine,
+    OverlayLine, OverlayMouse, OverlayOutcome, ThemeRole,
 };
 use serde_json::json;
 use tokio::sync::oneshot;
@@ -440,7 +440,10 @@ async fn models_view_styles() {
     let _rx = view.show_models("http://h", &three_models());
     let lines = view.render(100);
     let border = lines.first().unwrap();
-    assert_eq!(border.spans[0].fg, Some(OverlayColor::Cyan));
+    assert_eq!(
+        border.spans[0].fg,
+        Some(OverlayColor::Theme(ThemeRole::Accent))
+    );
     let title = &lines[1];
     let title_span = title
         .spans
@@ -448,10 +451,13 @@ async fn models_view_styles() {
         .find(|s| s.text == "llama.cpp models")
         .unwrap();
     assert!(title_span.bold);
-    assert_eq!(title_span.fg, Some(OverlayColor::Cyan));
+    assert_eq!(title_span.fg, Some(OverlayColor::Theme(ThemeRole::Accent)));
     let selected = &lines[4];
     assert_eq!(selected.spans.len(), 1);
-    assert_eq!(selected.spans[0].fg, Some(OverlayColor::Cyan));
+    assert_eq!(
+        selected.spans[0].fg,
+        Some(OverlayColor::Theme(ThemeRole::Accent))
+    );
     let download = &lines[7];
     assert_eq!(
         download.spans[0].fg, None,
@@ -459,18 +465,18 @@ async fn models_view_styles() {
     );
     assert_eq!(
         download.spans[1].fg,
-        Some(OverlayColor::Gray),
+        Some(OverlayColor::Theme(ThemeRole::Muted)),
         "its description is muted"
     );
     let footer = &lines[9];
     let key = footer.spans.iter().find(|s| s.text == "enter").unwrap();
-    assert!(key.dim);
+    assert_eq!(key.fg, Some(OverlayColor::Theme(ThemeRole::Dim)));
     let described = footer
         .spans
         .iter()
         .find(|s| s.text == " load/unload/download")
         .unwrap();
-    assert_eq!(described.fg, Some(OverlayColor::Gray));
+    assert_eq!(described.fg, Some(OverlayColor::Theme(ThemeRole::Muted)));
 }
 
 /// Loaded models first (only `loaded`, not `sleeping`), then alphabetical regardless of case
@@ -2897,7 +2903,10 @@ async fn search_rows_are_styled() {
         .iter()
         .find(|l| l.plain_text().starts_with("→ owner/model-00"))
         .unwrap();
-    assert_eq!(selected.spans[0].fg, Some(OverlayColor::Cyan));
+    assert_eq!(
+        selected.spans[0].fg,
+        Some(OverlayColor::Theme(ThemeRole::Accent))
+    );
     assert_eq!(
         selected.spans[0].text, "→ owner/model-00  1.0k downloads",
         "the whole row, details included, is one accent run (the rest is padding)"
@@ -2907,13 +2916,19 @@ async fn search_rows_are_styled() {
         .find(|l| l.plain_text().starts_with("  owner/model-01"))
         .unwrap();
     assert_eq!(other.spans[0].fg, None);
-    assert_eq!(other.spans[1].fg, Some(OverlayColor::Gray));
+    assert_eq!(
+        other.spans[1].fg,
+        Some(OverlayColor::Theme(ThemeRole::Muted))
+    );
     assert_eq!(other.spans[1].text.trim(), "1.0k downloads");
     let indicator = lines
         .iter()
         .find(|l| l.plain_text().trim() == "(1/12)")
         .unwrap();
-    assert!(indicator.spans[0].dim);
+    assert_eq!(
+        indicator.spans[0].fg,
+        Some(OverlayColor::Theme(ThemeRole::Dim))
+    );
 
     // The status line ("Searching…") is dim too.
     type_text(&mut view, "x");
@@ -2922,7 +2937,10 @@ async fn search_rows_are_styled() {
         .iter()
         .find(|l| l.plain_text().contains("Searching Hugging Face…"))
         .unwrap();
-    assert!(status.spans[0].dim);
+    assert_eq!(
+        status.spans[0].fg,
+        Some(OverlayColor::Theme(ThemeRole::Dim))
+    );
 }
 
 /// The whole bridge future can be driven from a spawned task (a command handler is one), i.e. it
@@ -3310,4 +3328,324 @@ fn a_download_progress_update_replaces_everything() {
 
     assert_eq!(shown.ratio, Some(0.75));
     assert_eq!(shown.detail.as_deref(), Some("3 B / 4 B"));
+}
+
+// =================================================================================================
+// The pointer (`select-list.ts` / `input.ts` `handleMouse`)
+// =================================================================================================
+
+fn wheel(row: u16, lines: i32) -> OverlayMouse {
+    OverlayMouse::Wheel {
+        column: 4,
+        row,
+        lines,
+    }
+}
+fn mouse_press(row: u16) -> OverlayMouse {
+    OverlayMouse::Press { column: 4, row }
+}
+fn mouse_click(row: u16) -> OverlayMouse {
+    OverlayMouse::Click {
+        column: 4,
+        row,
+        count: 1,
+    }
+}
+
+/// The row a text was painted on, as a pointer coordinate.
+fn row_of(view: &mut LlamaView, width: usize, text: &str) -> u16 {
+    let lines = snapshot(view, width);
+    let row = lines
+        .iter()
+        .position(|l| l.contains(text))
+        .unwrap_or_else(|| panic!("{text:?} is not on screen: {lines:#?}"));
+    u16::try_from(row).unwrap()
+}
+
+/// The text of the highlighted (`→`) row.
+fn highlighted(view: &mut LlamaView, width: usize) -> String {
+    snapshot(view, width)
+        .into_iter()
+        .find(|l| l.starts_with('→'))
+        .unwrap_or_default()
+}
+
+/// The wheel moves the model list one row per notch and CLAMPS: the keys wrap from the first row
+/// to the last, the wheel stops at the ends.
+#[tokio::test]
+async fn pointer_wheel_moves_the_model_list_one_row_and_clamps() {
+    let (mut view, _clock) = new_view();
+    let _rx = view.show_models("http://h", &three_models());
+    let first = row_of(&mut view, 100, "mid");
+    assert!(highlighted(&mut view, 100).contains("mid"));
+
+    assert!(view.handle_mouse(wheel(first, -1)), "the list takes it");
+    assert!(
+        highlighted(&mut view, 100).contains("mid"),
+        "the wheel never wraps from the first row to the last"
+    );
+    view.handle_mouse(wheel(first, 1));
+    assert!(highlighted(&mut view, 100).contains("alpha"));
+    for _ in 0..9 {
+        view.handle_mouse(wheel(first, 1));
+    }
+    assert!(
+        highlighted(&mut view, 100).contains("Download model"),
+        "the wheel stops at the last row: {:?}",
+        highlighted(&mut view, 100)
+    );
+}
+
+/// A press selects the row under the pointer without activating it; the click activates it
+/// (`SelectList.handleMouse`: select on press, `onSelect` on click).
+#[tokio::test]
+async fn pointer_press_selects_and_click_activates_a_model_row() {
+    let (mut view, _clock) = new_view();
+    let mut rx = view.show_models("http://h", &three_models());
+    let zeta = row_of(&mut view, 100, "zeta");
+
+    assert!(view.handle_mouse(mouse_press(zeta)));
+    assert!(highlighted(&mut view, 100).contains("zeta"));
+    assert!(
+        rx.try_recv().is_err(),
+        "a press only selects: nothing is answered yet"
+    );
+
+    assert!(view.handle_mouse(mouse_click(zeta)));
+    match rx.try_recv().unwrap() {
+        LlamaManagerAction::Model(model) => assert_eq!(model.id, "zeta"),
+        other => panic!("expected the zeta model, got {other:?}"),
+    }
+}
+
+/// The click activates the row the PRESS went down on, not whatever the pointer is over by the time
+/// the release is reported.
+#[tokio::test]
+async fn pointer_click_activates_the_pressed_row() {
+    let (mut view, _clock) = new_view();
+    let mut rx = view.show_models("http://h", &three_models());
+    let alpha = row_of(&mut view, 100, "alpha");
+    let zeta = row_of(&mut view, 100, "zeta");
+    view.handle_mouse(mouse_press(alpha));
+    view.handle_mouse(mouse_click(zeta));
+    match rx.try_recv().unwrap() {
+        LlamaManagerAction::Model(model) => assert_eq!(model.id, "alpha"),
+        other => panic!("expected the pressed row, got {other:?}"),
+    }
+}
+
+/// "Download model…" is a row like any other: clicking it is Enter on it.
+#[tokio::test]
+async fn pointer_click_on_the_download_row_asks_to_download() {
+    let (mut view, _clock) = new_view();
+    let mut rx = view.show_models("http://h", &three_models());
+    let download = row_of(&mut view, 100, "Download model");
+    view.handle_mouse(mouse_click(download));
+    assert_eq!(rx.try_recv().unwrap(), LlamaManagerAction::Download);
+}
+
+/// Chrome is not a row: a click on the border, the title, the server url or the footer answers
+/// nothing and reports the event unhandled.
+#[tokio::test]
+async fn pointer_over_chrome_answers_nothing() {
+    let (mut view, _clock) = new_view();
+    let mut rx = view.show_models("http://h", &three_models());
+    let footer = row_of(&mut view, 100, "enter");
+    for row in [0, 1, 2, 3, footer] {
+        assert!(!view.handle_mouse(mouse_press(row)), "row {row} is chrome");
+        assert!(!view.handle_mouse(mouse_click(row)), "row {row} is chrome");
+        assert!(!view.handle_mouse(wheel(row, 1)), "row {row} is chrome");
+    }
+    assert!(rx.try_recv().is_err());
+    assert!(highlighted(&mut view, 100).contains("mid"));
+}
+
+/// A list longer than its window scrolls with the highlight; the click lands on the row that is
+/// DRAWN under the pointer, not on the row at the same offset from the top of the list.
+#[tokio::test]
+async fn pointer_hits_the_row_drawn_in_a_scrolled_window() {
+    let (mut view, _clock) = new_view();
+    let options: Vec<String> = (0..30).map(|i| format!("option-{i:02}")).collect();
+    let mut rx = view.show_select("Pick", &options);
+    // Render once so the view knows where its rows are, then scroll the window.
+    let first = row_of(&mut view, 60, "option-00");
+    for _ in 0..20 {
+        view.handle_mouse(wheel(first, 1));
+        let _ = view.render(60);
+    }
+    let row = row_of(&mut view, 60, "option-22");
+    view.handle_mouse(mouse_click(row));
+    assert_eq!(rx.try_recv().unwrap().as_deref(), Some("option-22"));
+}
+
+/// A title that wraps pushes every row down; the pointer follows what was painted.
+#[tokio::test]
+async fn pointer_follows_rows_pushed_down_by_a_wrapped_title() {
+    let (mut view, _clock) = new_view();
+    let title = "a very long title that has to wrap onto several rows at this narrow width";
+    let mut rx = view.show_select(title, &["first".to_string(), "second".to_string()]);
+    let narrow = 30;
+    let second = row_of(&mut view, narrow, "second");
+    assert!(second > 5, "the title wrapped: row {second}");
+    view.handle_mouse(mouse_click(second));
+    assert_eq!(rx.try_recv().unwrap().as_deref(), Some("second"));
+}
+
+/// Through the bridge the host drives: a click inside a confirm dialog answers it, and the outcome
+/// the host gets is a redraw (a miss on chrome is `Ignored`).
+#[tokio::test]
+async fn pointer_through_the_overlay_answers_a_confirm_dialog() {
+    let (mut overlay, ui, _attached) = llama_overlay(
+        Arc::new(LlamaKeys::default()),
+        ManualClock::new(),
+        tokio::runtime::Handle::current(),
+    );
+    let mut confirm = Box::pin(ui.confirm("Unload model?", "qwen"));
+    assert!(futures::poll!(confirm.as_mut()).is_pending());
+    let frame = plain(&overlay.render(60, 24));
+    assert_eq!(frame[5], "  No");
+
+    assert_eq!(
+        overlay.handle_mouse(mouse_click(1)),
+        OverlayOutcome::Ignored,
+        "the title is not a row"
+    );
+    assert_eq!(
+        overlay.handle_mouse(mouse_click(5)),
+        OverlayOutcome::Redraw,
+        "the No row took the click"
+    );
+    assert!(!confirm.await, "clicking No answers the confirm with false");
+}
+
+/// A press in the search box puts the caret at the start of the grapheme under the pointer
+/// (`Input.handleMouse`).
+#[test]
+fn pointer_press_places_the_caret_by_grapheme() {
+    let keys = LlamaKeys::default();
+    let place = |text: &str, column: usize, first_col: usize| {
+        let mut input = input_with(text);
+        input.press_at(column, first_col);
+        input.handle_key(&keys, &chr('|'));
+        input.value().to_string()
+    };
+    // The prompt is two cells; the text starts at column 2.
+    assert_eq!(place("abcd", 2, 0), "|abcd", "on the first cell");
+    assert_eq!(place("abcd", 4, 0), "ab|cd", "on `c`");
+    assert_eq!(
+        place("abcd", 0, 0),
+        "|abcd",
+        "a press on the prompt is the start"
+    );
+    assert_eq!(place("abcd", 40, 0), "abcd|", "past the text is the end");
+    // A double-width grapheme is one target, whichever of its two cells is hit.
+    assert_eq!(place("ab👍cd", 4, 0), "ab|👍cd");
+    assert_eq!(place("ab👍cd", 5, 0), "ab|👍cd");
+    assert_eq!(place("ab👍cd", 6, 0), "ab👍|cd");
+    // A combining sequence is never split.
+    assert_eq!(place("e\u{301}x", 3, 0), "e\u{301}|x");
+    // A scrolled field: its left edge shows text column 10.
+    assert_eq!(place("0123456789abcdef", 2, 10), "0123456789|abcdef");
+}
+
+/// The press reads the column the field was PAINTED at: a long query scrolls horizontally, and the
+/// same screen column then means a different character.
+#[test]
+fn pointer_press_uses_the_columns_the_field_was_painted_with() {
+    let keys = LlamaKeys::default();
+    let mut input = input_with("0123456789abcdefghijklmnopqrstuvwxyz");
+    let (line, first_col) = input.render_at(14);
+    assert!(first_col > 0, "the field scrolled: {first_col}");
+    let shown: String = line.plain_text().chars().skip(2).collect();
+    let expected_char = shown.chars().next().unwrap();
+    input.press_at(2, first_col);
+    input.handle_key(&keys, &chr('|'));
+    assert!(
+        input.value().contains(&format!("|{expected_char}")),
+        "the caret went in front of the first visible character {expected_char:?}: {:?}",
+        input.value()
+    );
+}
+
+/// In the search view a press on the box moves the caret, and what is typed next lands there. The
+/// click that completes the gesture does not move it again, and only the box's own row takes it.
+#[tokio::test]
+async fn pointer_press_in_the_search_box_moves_the_caret() {
+    let (mut view, _clock) = new_view();
+    let search = FakeSearch::new();
+    let _rx = view.show_search(search.as_fn());
+    type_text(&mut view, "own");
+    let input_row = row_of(&mut view, 70, "> own");
+
+    // Not the box's row: the hint above it and the spacer below it place nothing.
+    for row in [input_row - 1, input_row + 1] {
+        assert!(!view.handle_mouse(OverlayMouse::Press { column: 3, row }));
+    }
+
+    assert!(view.handle_mouse(OverlayMouse::Press {
+        column: 3,
+        row: input_row,
+    }));
+    // The release lands somewhere else in the row's text: a click after a handled press is inert.
+    view.handle_mouse(OverlayMouse::Click {
+        column: 5,
+        row: input_row,
+        count: 1,
+    });
+    view.handle_key(&chr('X'));
+    assert_eq!(snapshot(&mut view, 70)[usize::from(input_row)], "> oXwn");
+}
+
+/// The search results answer the pointer as a list does: the wheel moves the highlight (clamped),
+/// a press selects a result, a click confirms the result it landed on.
+#[tokio::test]
+async fn pointer_drives_the_search_results() {
+    let (mut view, clock) = new_view();
+    let search = FakeSearch::new();
+    search.reply_ok(vec![
+        hf("owner/one", 10.0),
+        hf("owner/two", 20.0),
+        hf("owner/three", 30.0),
+    ]);
+    let mut rx = view.show_search(search.as_fn());
+    type_text(&mut view, "own");
+    clock.advance(500);
+    settle(&mut view).await;
+
+    let one = row_of(&mut view, 70, "owner/one");
+    assert!(highlighted(&mut view, 70).contains("owner/one"));
+    view.handle_mouse(wheel(one, 1));
+    assert!(highlighted(&mut view, 70).contains("owner/two"));
+    view.handle_mouse(wheel(one, -1));
+    view.handle_mouse(wheel(one, -1));
+    assert!(
+        highlighted(&mut view, 70).contains("owner/one"),
+        "clamped at the first result"
+    );
+
+    let three = row_of(&mut view, 70, "owner/three");
+    view.handle_mouse(mouse_press(three));
+    assert!(highlighted(&mut view, 70).contains("owner/three"));
+    assert!(rx.try_recv().is_err(), "a press only selects");
+    view.handle_mouse(mouse_click(three));
+    assert_eq!(rx.try_recv().unwrap().as_deref(), Some("owner/three"));
+}
+
+/// Every style run names a theme ROLE, not a fixed colour: this is what lets the host paint the
+/// view in the user's theme.
+#[tokio::test]
+async fn the_view_colours_its_runs_by_theme_role_not_by_fixed_colour() {
+    let (mut view, _clock) = new_view();
+    let _rx = view.show_models("http://h", &three_models());
+    for line in view.render(100) {
+        for span in &line.spans {
+            assert!(
+                matches!(span.fg, None | Some(OverlayColor::Theme(_))),
+                "{:?} carries a literal colour: {:?}",
+                span.text,
+                span.fg
+            );
+            assert!(!span.dim, "dimness is the `dim` role, not the SGR modifier");
+        }
+    }
 }

@@ -716,6 +716,20 @@ impl App<InlineBackend<TuiStdout>> {
         Ok(())
     }
 
+    /// The terminal finished answering a colour query after its deadline — Pi's `onLateReply`
+    /// handed to `applyTerminalColors` (`theme-controller.ts:31-40`, `:197-211`). Records the
+    /// colours, regenerates the system theme (or switches an automatic pair) and repaints.
+    pub(crate) fn on_terminal_colors(
+        &mut self,
+        ctx: &RunCtx,
+        colors: crate::TerminalColors,
+    ) -> Result<(), TuiError> {
+        let _arm = ArmGuard::enter("terminal_colors");
+        self.apply_terminal_colors(colors, &ctx.session.services().resources);
+        self.frames.request();
+        Ok(())
+    }
+
     pub(crate) fn on_tmux_warning(&mut self, warning: &'static str) -> Result<(), TuiError> {
         // Pi `this.showWarning(warning)` (`interactive-mode.ts:1114-1118` @v0.87.1).
         self.state.transcript.show_warning(warning);

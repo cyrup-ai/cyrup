@@ -1,7 +1,7 @@
 //! Making the scrollbar **interactive** — hit test, hover and thumb drag, cyrup's port of pi's
 //! `getScrollbarTargetAt` / `setScrollbarHover` / `handleScrollbarMouseEvent`
-//! (`packages/tui/src/tui-alt-screen.ts` @v0.84.3: `:718-733`, `:735-748`, `:750-795`). ADR-0005
-//! §Decision B-7.
+//! (`packages/tui/src/tui-alt-screen.ts` @v1.0.0: `:1036-1051`, `:1053-1066`, `:1080-1127`).
+//! ADR-0005 §Decision B-7.
 //!
 //! # Why any of this is application work
 //! [`ratatui::widgets::Scrollbar`] *draws* a thumb and answers no question about it: it has no
@@ -10,8 +10,7 @@
 //! upstream writes it too. This module is that code, and nothing else: it never paints (the thumb
 //! is [`super::scroll::draw`]'s), never derives thumb geometry of its own (it asks
 //! [`super::scroll::geometry`], the single derivation both the paint and the hit test share) and
-//! never moves the offset by hand (it calls [`super::scroll::scroll_to_row`] and
-//! [`super::scroll::scroll_by`]).
+//! never moves the offset by hand (it calls [`super::scroll::scroll_to_row`]).
 //!
 //! # Named for what it drags
 //! `scrollbar_drag`, not `drag`: ADR-0005 §B-8 owns a second, unrelated pointer drag — the text
@@ -48,8 +47,7 @@ use ratatui::crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
 
 use super::scroll::{
-    ScrollState, ScrollbarGeom, ScrollbarView, geometry, scroll_by, scroll_to_row, set_hover,
-    viewport_height,
+    ScrollState, ScrollbarGeom, ScrollbarView, geometry, geometry_with, scroll_to_row, set_hover,
 };
 
 /// A live thumb drag — pi's `ScrollbarDrag` (`tui-alt-screen.ts:117-120`), held in the renderer's
@@ -96,15 +94,15 @@ pub(super) fn is_dragging(drag: &DragState) -> bool {
 ///    (`:752-755`).
 /// 2. **A drag is live and the pointer moved** — the offset follows the pointer through
 ///    [`offset_for_pointer`], preserving the grab (`:756-770`).
-/// 3. **No drag, and a left press landed on the thumb** — the grab offset is recorded, hover is
-///    pinned, and the report is consumed (`:773-790`).
-/// 4. **Anything else** — declined, so §B-8's selection sees it (`:773`, `:775`). A press outside
-///    the bar's own column, a release with no drag, a non-left button and every motion report with
-///    no drag all land here, which is upstream's `(event.button & 32) !== 0` motion test and its
-///    `(event.button & 3) !== 0` button test expressed as [`MouseEventKind`] arms.
-///
-/// The one cyrup addition is inside case 3 — see [`page_toward`] for the trough press upstream
-/// does not have.
+/// 3. **No drag, and a left press landed on the track** — hover is pinned and a drag starts
+///    (`:1102-1123`). On the thumb the grab offset is the row pressed within it; OFF the thumb the
+///    view first jumps so the thumb is centred on the pointer — `grabOffset = floor(thumbHeight /
+///    2)` through [`offset_for_pointer`] (`:1115-1117`) — and the drag continues from there.
+/// 4. **Anything else** — declined, so §B-8's selection sees it (`:1102-1104`). A press outside
+///    the bar's own column or rows, a press while the bar is faded, a release with no drag, a
+///    non-left button and every motion report with no drag all land here, which is upstream's
+///    `(event.button & 32) !== 0` motion test and its `(event.button & 3) !== 0` button test
+///    expressed as [`MouseEventKind`] arms.
 pub(super) fn route(
     drag: &mut DragState,
     bar: &mut ScrollbarView,
@@ -122,23 +120,23 @@ pub(super) fn route(
     consumed
 }
 
-/// Re-derive hover from a pointer position — pi's `updateScrollbarHover(x, y)` (`:742-744`) over
-/// `getScrollbarTargetAt` (`:718-733`) and `setScrollbarHover` (`:735-740`).
+/// Re-derive hover from a pointer position — pi's `updateScrollbarHover(x, y)` (`:1060-1062`) over
+/// `getScrollbarTargetAt(x, y, true)` (`:1036-1051`) and `setScrollbarHover` (`:1053-1058`).
 ///
-/// Exposed because [`route`] is not the only caller upstream has: `routeWheel` refreshes hover
-/// after every notch (`:685`), since scrolling moves the thumb out from under a stationary pointer.
-/// ADR-0005 §B-6 is that call site.
+/// Upstream also refreshes hover after every wheel notch (`routeWheel`, `:995`), because scrolling
+/// moved the thumb out from under a stationary pointer. Hover here is the TRACK, whose position
+/// does not depend on the offset, and [`route`] already refreshes it for the wheel report itself,
+/// so that second call site has nothing left to do.
 ///
-/// Hover is the pointer being **on the thumb**, not merely in the bar's column: upstream's target
-/// test is `y >= thumbTop && y < thumbTop + thumbHeight` (`:727-729`). It is also only ever true
-/// while the bar is visible at all, because [`super::scroll::geometry`] returns `None` otherwise
-/// (`layout.ts:267`) — so a faded `auto` bar is not revealed by a pointer passing over where it
-/// would have been, which is upstream's behaviour and not an omission.
+/// Hover is the pointer being **anywhere on the track** — the bar's column over its full height,
+/// thumb or not — and the lookup passes `includeHiddenAuto`, so a pointer arriving over the column
+/// of a faded `auto` bar whose content overflows reveals it (and, being hovered, it then stays up
+/// and paints its thumb as `█`). A faded bar is therefore found by pointing at where it would be;
+/// it is only a *press* that needs the bar already showing ([`handle`]).
 ///
 /// What hover *does* is upstream's `setScrollbarActive` (`components/scroll-view.ts:113-117`): an
 /// `auto` bar under the pointer stops fading (`:97`) and stays up for as long as the pointer holds
-/// it. The thumb's colour is not part of it — upstream paints every thumb with the one
-/// `scrollbarStyle` (`layout.ts:300`, `components/scroll-view.ts:51`) whether it is hovered or not.
+/// it, and [`super::scroll::draw`] paints the thumb as `█` rather than `┃` while it holds.
 pub(super) fn update_hover(
     bar: &mut ScrollbarView,
     scroll: &mut ScrollState,
@@ -146,8 +144,9 @@ pub(super) fn update_hover(
     row: u16,
     area: Rect,
 ) {
-    let on_thumb = geometry(bar, scroll, area).is_some_and(|geom| hits_thumb(&geom, column, row));
-    set_hover(bar, scroll, on_thumb);
+    let on_track =
+        geometry_with(bar, scroll, area, true).is_some_and(|geom| hits_track(&geom, column, row));
+    set_hover(bar, scroll, on_track);
 }
 
 /// Drop a live drag and the hover with it — pi's `stopScrollbarDrag` (`:793-795`) and
@@ -187,29 +186,33 @@ fn handle(
     if !matches!(ev.kind, MouseEventKind::Down(MouseButton::Left)) {
         return false;
     }
+    // `getScrollbarTargetAt(event.x, event.y)` (`:1102`) — `includeHiddenAuto` defaults to false,
+    // so a faded bar has no geometry and cannot be pressed.
     let Some(geom) = geometry(bar, scroll, area) else {
         return false;
     };
-    // `x === geometry.column` (`:726`). A press anywhere else in the viewport is content, and in
-    // `auto` — where the bar reserves no column of its own (`components/scroll-view.ts:86-88`) —
-    // this single column is the whole of what the scrollbar takes from selection.
-    if ev.column != geom.column {
+    // `x === geometry.column && y >= trackTop && y < trackTop + trackHeight` (`:1042-1046`). A
+    // press anywhere else in the viewport is content, and in `auto` — where the bar reserves no
+    // column of its own (`components/scroll-view.ts:86-88`) — this single column is the whole of
+    // what the scrollbar takes from selection.
+    if !hits_track(&geom, ev.column, ev.row) {
         return false;
     }
-    if hits_thumb(&geom, ev.column, ev.row) {
-        // `this.setScrollbarHover(target.scrollView)` (`:785`) before the grab is recorded, so an
-        // `auto` bar is pinned up for the life of the drag rather than fading out from under the
-        // pointer holding it.
-        set_hover(bar, scroll, true);
-        // `grabOffset: event.y - target.geometry.thumbTop` (`:788`). The hit test above puts the
-        // row inside the thumb, so the subtraction cannot go negative.
-        drag.grab_offset = Some(ev.row.saturating_sub(geom.thumb_top));
-        return true;
-    }
-    if !hits_track(&geom, ev.row) {
-        return false;
-    }
-    page_toward(scroll, &geom, ev.row);
+    // `this.setScrollbarHover(target.scrollView)` (`:1113`) before the grab is recorded, so an
+    // `auto` bar is pinned up for the life of the drag rather than fading out from under the
+    // pointer holding it.
+    set_hover(bar, scroll, true);
+    // `onThumb ? event.y - thumbTop : Math.floor(thumbHeight / 2)` (`:1115-1116`). Off the thumb the
+    // view first scrolls so the thumb's middle is under the pointer, and the drag that follows
+    // holds that middle row (`:1117`).
+    let grab = if hits_thumb(&geom, ev.row) {
+        ev.row.saturating_sub(geom.thumb_top)
+    } else {
+        let grab = geom.thumb_height / 2;
+        scroll_to_row(scroll, offset_for_pointer(&geom, ev.row, grab));
+        grab
+    };
+    drag.grab_offset = Some(grab);
     true
 }
 
@@ -252,7 +255,7 @@ fn drive(
 }
 
 /// The offset a pointer row maps to under a drag that grabbed `grab` rows into the thumb — pi's
-/// `:761-767`.
+/// `scrollScrollbarToPointer` (`tui-alt-screen.ts:1068-1078`).
 ///
 /// ```text
 /// maxThumbOffset = trackHeight - thumbHeight
@@ -262,19 +265,16 @@ fn drive(
 ///
 /// Subtracting `grabOffset` is what stops the thumb snapping its top — or, under a hit test that
 /// centred instead, its middle — to the pointer: the row the user pressed on stays under the
-/// pointer for the whole gesture.
+/// pointer for the whole gesture. A press OFF the thumb passes `thumbHeight / 2` so it is the
+/// thumb's middle that lands there.
 ///
-/// The arithmetic runs in `i64` so the intermediate product cannot wrap a `u16` track against a
-/// document of any length, and every step is saturating; the two `try_from` fallbacks are
-/// unreachable, since `thumb_offset` is bounded by a `u16` track and the quotient is bounded by
-/// `max_scroll_top`. `Math.round` on a non-negative quotient is the `+ denominator / 2` before an
-/// integer division, which is also how [`super::scroll`] reproduces ratatui's own rounding.
+/// Computed in `f64` in pi's operation order so a quotient on a half rounds as `Math.round` does.
+/// The pointer arithmetic runs in `i64` so a `u16` row against any track cannot wrap.
 fn offset_for_pointer(geom: &ScrollbarGeom, row: u16, grab: u16) -> usize {
     let max_thumb_offset =
         i64::from(geom.track_height).saturating_sub(i64::from(geom.thumb_height));
     if max_thumb_offset <= 0 {
-        // `maxThumbOffset === 0 ? 0` (`:767`) — a thumb that fills its track has one position, and
-        // it is the top.
+        // `maxThumbOffset === 0 ? 0` — a thumb that fills its track has one position, the top.
         return 0;
     }
     let thumb_offset = i64::from(row)
@@ -282,65 +282,279 @@ fn offset_for_pointer(geom: &ScrollbarGeom, row: u16, grab: u16) -> usize {
         .saturating_sub(i64::from(grab))
         .max(0)
         .min(max_thumb_offset);
-    let max_scroll_top = i64::try_from(geom.max_scroll_top).unwrap_or(i64::MAX);
-    let scaled = thumb_offset
-        .saturating_mul(max_scroll_top)
-        .saturating_add(max_thumb_offset / 2);
-    usize::try_from(scaled / max_thumb_offset).unwrap_or(geom.max_scroll_top)
+    let fraction = thumb_offset as f64 / max_thumb_offset as f64;
+    // `as usize` saturates; the product is bounded by `max_scroll_top`.
+    ((fraction * geom.max_scroll_top as f64).round() as usize).min(geom.max_scroll_top)
 }
 
-/// Page the view toward a press that landed in the **trough** — the part of the bar's column the
-/// thumb is not on.
-///
-/// `[CYRUP-DELTA]`: upstream has no trough behaviour. `getScrollbarTargetAt` matches the thumb rows
-/// only (`tui-alt-screen.ts:727-729`), so a press beside the thumb returns no target, is declined
-/// by `handleScrollbarMouseEvent` (`:775`) and reaches `handleSelectionMouseEvent` — which, in the
-/// `auto` mode both cyrup and pi default to, begins a text selection in the content column the bar
-/// is overlaying. ADR-0005 §B-7 asks for the conventional scrollbar instead: a trough press pages
-/// toward the click. The cost is one column of selection while the bar is actually on screen; the
-/// gain is that the bar behaves the way every other scrollbar the user owns does.
-///
-/// Paging, not jumping, is the point: a trough press moves by a viewport and stops, so a user who
-/// wants the position under their finger drags the thumb there and a user who wants the next
-/// screenful clicks once. Absolute positioning on a trough click would make the two gestures
-/// indistinguishable and lose the first.
-///
-/// A page here is the **whole** viewport, deliberately unlike the keyboard page, which is
-/// `max(1, viewportHeight - PAGE_SCROLL_OVERLAP)` (`:64`, `:603`) and belongs to ADR-0005 §B-9's
-/// file so that constant keeps one definition. The overlap exists to carry context across a blind
-/// jump; a trough press is not blind — the pointer marks where the reader is looking — and an
-/// overlap would leave the thumb visibly short of it.
-///
-/// Movement goes through [`super::scroll::scroll_by`], so the clamp, the release of `follow: end`
-/// and the activity mark that keeps an `auto` bar up are the ones every other mover uses.
-fn page_toward(scroll: &mut ScrollState, geom: &ScrollbarGeom, row: u16) {
-    // `Math.max(1, …)` on the page size (`:603`): a viewport of zero or one row still moves.
-    let page = i32::try_from(viewport_height(scroll))
-        .unwrap_or(i32::MAX)
-        .max(1);
-    if row < geom.thumb_top {
-        scroll_by(scroll, page.saturating_neg());
-    } else {
-        scroll_by(scroll, page);
-    }
+/// Whether `row` is on the thumb — `y >= geometry.thumbTop && y < geometry.thumbTop +
+/// geometry.thumbHeight` (`tui-alt-screen.ts:1109-1110`). The caller has already matched the
+/// column.
+fn hits_thumb(geom: &ScrollbarGeom, row: u16) -> bool {
+    row >= geom.thumb_top && row < thumb_bottom(geom)
 }
 
-/// Whether `(column, row)` is on the thumb — pi's target test
-/// (`tui-alt-screen.ts:726-729`): `x === geometry.column && y >= geometry.thumbTop &&
-/// y < geometry.thumbTop + geometry.thumbHeight`.
-fn hits_thumb(geom: &ScrollbarGeom, column: u16, row: u16) -> bool {
-    column == geom.column && row >= geom.thumb_top && row < thumb_bottom(geom)
-}
-
-/// Whether `row` is inside the track, thumb included — the half of the trough test the column
-/// check at the call site does not cover. Upstream needs no equivalent, because it has no trough
-/// behaviour to bound; see [`page_toward`].
-fn hits_track(geom: &ScrollbarGeom, row: u16) -> bool {
-    row >= geom.track_top && row < geom.track_top.saturating_add(geom.track_height)
+/// Whether `(column, row)` is on the track, thumb included — `getScrollbarTargetAt`'s test
+/// (`tui-alt-screen.ts:1042-1046`): `x === geometry.column && y >= geometry.trackTop && y <
+/// geometry.trackTop + geometry.trackHeight`.
+fn hits_track(geom: &ScrollbarGeom, column: u16, row: u16) -> bool {
+    column == geom.column
+        && row >= geom.track_top
+        && row < geom.track_top.saturating_add(geom.track_height)
 }
 
 /// The first row **below** the thumb — `geometry.thumbTop + geometry.thumbHeight`
-/// (`tui-alt-screen.ts:729`), saturating rather than wrapping at the bottom of a `u16` screen.
+/// (`tui-alt-screen.ts:1110`), saturating rather than wrapping at the bottom of a `u16` screen.
 fn thumb_bottom(geom: &ScrollbarGeom) -> u16 {
     geom.thumb_top.saturating_add(geom.thumb_height)
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::panic
+    )]
+
+    use ratatui::crossterm::event::KeyModifiers;
+
+    use super::super::scroll::{
+        ScrollbarMode, fade, is_following_end, is_hovered, is_visible, scroll_to_row, scroll_top,
+        set_mode, update_layout,
+    };
+    use super::*;
+
+    /// The document rect: offset from the origin (a header above it) and SHORTER than the terminal
+    /// it sits in (an input dock below). Every coordinate below is relative to it, and nothing in
+    /// this module may consult a terminal size. The bar's column is `4 + 20 - 1 = 23`.
+    const AREA: Rect = Rect::new(4, 2, 20, 10);
+    const COLUMN: u16 = 23;
+
+    struct Fixture {
+        drag: DragState,
+        bar: ScrollbarView,
+        scroll: ScrollState,
+    }
+
+    /// `content` rows in a [`AREA`]-high viewport under `mode`.
+    fn fixture(mode: ScrollbarMode, content: usize) -> Fixture {
+        let mut f = Fixture {
+            drag: DragState::default(),
+            bar: ScrollbarView::default(),
+            scroll: ScrollState::default(),
+        };
+        set_mode(&mut f.bar, &mut f.scroll, mode);
+        update_layout(&mut f.scroll, content, usize::from(AREA.height));
+        // Park at the top with the movement mark cleared: an `auto` bar starts out faded.
+        scroll_to_row(&mut f.scroll, 0);
+        fade(&mut f.scroll);
+        f
+    }
+
+    fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    fn send(f: &mut Fixture, kind: MouseEventKind, column: u16, row: u16) -> bool {
+        route(
+            &mut f.drag,
+            &mut f.bar,
+            &mut f.scroll,
+            &mouse(kind, column, row),
+            AREA,
+        )
+    }
+
+    fn press() -> MouseEventKind {
+        MouseEventKind::Down(MouseButton::Left)
+    }
+
+    /// `jumps to a scrollbar track position and continues dragging from there`
+    /// (`test/tui-alt-screen.test.ts:481-506` @v1.0.0): 50 rows in a 10-row viewport with a 2-row
+    /// thumb. A press on track row 5 — off the thumb — scrolls to 20 (the thumb centred on the
+    /// pointer, `grabOffset = floor(2 / 2)`), and a drag to the last row carries on from there to 40.
+    ///
+    /// Paging by a whole viewport would land on 10 and start no drag.
+    #[test]
+    fn a_press_off_the_thumb_jumps_to_the_pointer_and_then_drags() {
+        let mut f = fixture(ScrollbarMode::Always, 50);
+        assert_eq!(scroll_top(&f.scroll), 0);
+
+        assert!(send(&mut f, press(), COLUMN, AREA.y + 5));
+        assert_eq!(scroll_top(&f.scroll), 20, "jumped, not paged");
+        assert!(is_dragging(&f.drag), "and the press began a drag");
+
+        assert!(send(
+            &mut f,
+            MouseEventKind::Drag(MouseButton::Left),
+            COLUMN,
+            AREA.y + 9
+        ));
+        assert_eq!(
+            scroll_top(&f.scroll),
+            40,
+            "the drag continues from the jump"
+        );
+        assert!(is_following_end(&f.scroll));
+
+        assert!(send(
+            &mut f,
+            MouseEventKind::Up(MouseButton::Left),
+            COLUMN,
+            AREA.y + 9
+        ));
+        assert!(!is_dragging(&f.drag));
+    }
+
+    /// A press ON the thumb grabs it where it was pressed and does not move the document; the
+    /// drag keeps that row under the pointer (`scrollbarDrag.grabOffset`, `:1115-1123`).
+    #[test]
+    fn a_press_on_the_thumb_keeps_its_grab_offset() {
+        let mut f = fixture(ScrollbarMode::Always, 50);
+        // The thumb is track rows 0-1; press its second row.
+        assert!(send(&mut f, press(), COLUMN, AREA.y + 1));
+        assert_eq!(scroll_top(&f.scroll), 0, "a thumb grab moves nothing");
+        assert!(is_dragging(&f.drag));
+        // Pointer at track row 3, grab 1 -> thumb offset 2 of 8 -> round(2 / 8 * 40) = 10.
+        send(
+            &mut f,
+            MouseEventKind::Drag(MouseButton::Left),
+            COLUMN,
+            AREA.y + 3,
+        );
+        assert_eq!(scroll_top(&f.scroll), 10);
+    }
+
+    /// A press beside the bar, above it or below it is content: declined, so selection sees it.
+    #[test]
+    fn a_press_outside_the_track_is_declined() {
+        let mut f = fixture(ScrollbarMode::Always, 50);
+        assert!(
+            !send(&mut f, press(), COLUMN - 1, AREA.y + 5),
+            "one column left"
+        );
+        assert!(
+            !send(&mut f, press(), COLUMN, AREA.y - 1),
+            "the row above the rect"
+        );
+        assert!(
+            !send(&mut f, press(), COLUMN, AREA.y + AREA.height),
+            "the row below the rect"
+        );
+        assert!(!is_dragging(&f.drag));
+        assert_eq!(scroll_top(&f.scroll), 0);
+    }
+
+    /// `reveals an auto scrollbar when the pointer enters its hidden track`
+    /// (`test/tui-alt-screen.test.ts:456-479`): a faded `auto` bar over overflowing content shows,
+    /// hovered, as soon as the pointer reaches its column — anywhere on the track, thumb or not —
+    /// and a pointer one column over, or past the rect, does not.
+    #[test]
+    fn hover_reveals_a_hidden_auto_bar_from_anywhere_on_the_track() {
+        let mut f = fixture(ScrollbarMode::Auto, 50);
+        assert!(!is_visible(&f.bar, &f.scroll), "fixture: the bar is faded");
+
+        update_hover(&mut f.bar, &mut f.scroll, COLUMN - 1, AREA.y + 5, AREA);
+        assert!(
+            !is_hovered(&f.bar) && !is_visible(&f.bar, &f.scroll),
+            "one column left of the track"
+        );
+        update_hover(
+            &mut f.bar,
+            &mut f.scroll,
+            COLUMN,
+            AREA.y + AREA.height,
+            AREA,
+        );
+        assert!(!is_hovered(&f.bar), "below the rect");
+
+        // Row 7 is nowhere near the thumb (rows 0-1), which is what the old thumb-only hover needed.
+        update_hover(&mut f.bar, &mut f.scroll, COLUMN, AREA.y + 7, AREA);
+        assert!(is_hovered(&f.bar), "the track is hovered");
+        assert!(
+            is_visible(&f.bar, &f.scroll),
+            "and a hovered auto bar is revealed"
+        );
+
+        update_hover(&mut f.bar, &mut f.scroll, COLUMN - 1, AREA.y + 7, AREA);
+        assert!(!is_hovered(&f.bar), "leaving the column un-hovers it");
+    }
+
+    /// Nothing to scroll, nothing to reveal: `includeHiddenAuto` needs `contentHeight >
+    /// trackHeight`, and a hidden-mode bar is never revealed.
+    #[test]
+    fn hover_does_not_reveal_a_bar_with_nothing_to_scroll() {
+        let mut fits = fixture(ScrollbarMode::Auto, 10);
+        update_hover(&mut fits.bar, &mut fits.scroll, COLUMN, AREA.y + 3, AREA);
+        assert!(!is_hovered(&fits.bar) && !is_visible(&fits.bar, &fits.scroll));
+
+        let mut hidden = fixture(ScrollbarMode::Hidden, 50);
+        update_hover(
+            &mut hidden.bar,
+            &mut hidden.scroll,
+            COLUMN,
+            AREA.y + 3,
+            AREA,
+        );
+        assert!(!is_hovered(&hidden.bar) && !is_visible(&hidden.bar, &hidden.scroll));
+    }
+
+    /// pi checks `getScrollbarTargetAt(x, y)` WITHOUT `includeHiddenAuto` for a press, so the very
+    /// first press on a faded bar's column is the content's (declined) — and the hover refresh that
+    /// follows it reveals the bar, so the next press is the bar's.
+    #[test]
+    fn a_press_on_a_faded_bar_is_declined_but_reveals_it() {
+        let mut f = fixture(ScrollbarMode::Auto, 50);
+        assert!(
+            !send(&mut f, press(), COLUMN, AREA.y + 5),
+            "faded: not the bar's"
+        );
+        assert!(!is_dragging(&f.drag));
+        assert!(
+            is_hovered(&f.bar) && is_visible(&f.bar, &f.scroll),
+            "but the press revealed it"
+        );
+        assert!(!send(
+            &mut f,
+            MouseEventKind::Up(MouseButton::Left),
+            COLUMN,
+            AREA.y + 5
+        ));
+        assert!(
+            send(&mut f, press(), COLUMN, AREA.y + 5),
+            "now it is the bar's"
+        );
+        assert!(is_dragging(&f.drag));
+    }
+
+    /// A press that starts a drag pins hover for its life, even with the pointer dragged off the
+    /// column, and the release re-derives it from where the pointer actually is.
+    #[test]
+    fn a_drag_pins_hover_until_the_release() {
+        let mut f = fixture(ScrollbarMode::Auto, 50);
+        send(&mut f, MouseEventKind::Moved, COLUMN, AREA.y + 5);
+        assert!(is_hovered(&f.bar));
+        assert!(send(&mut f, press(), COLUMN, AREA.y + 5));
+        send(
+            &mut f,
+            MouseEventKind::Drag(MouseButton::Left),
+            0,
+            AREA.y + 6,
+        );
+        assert!(is_hovered(&f.bar), "dragged off the column: still held");
+        assert!(is_dragging(&f.drag));
+        send(&mut f, MouseEventKind::Up(MouseButton::Left), 0, AREA.y + 6);
+        assert!(!is_dragging(&f.drag));
+        assert!(
+            !is_hovered(&f.bar),
+            "released over content: no longer hovered"
+        );
+    }
 }

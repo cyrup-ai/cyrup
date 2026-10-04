@@ -53,6 +53,9 @@ pub struct CheckboxSelector {
     /// shared single-line editing surface, so this box has the same word motion / kill ring / undo
     /// / paste as every other one.
     input: Input,
+    /// The row a left press went down on, so the click that completes the gesture toggles it even
+    /// if the window slid under the pointer.
+    pointer: RowPointer,
 }
 
 /// One built row — upstream's `ModelItem` (`scoped-models-selector.ts:68-72`). `model` is `None` for
@@ -94,6 +97,7 @@ impl CheckboxSelector {
             dirty: false,
             refresh_status: None,
             input: Input::new(),
+            pointer: RowPointer::default(),
         }
     }
 
@@ -453,6 +457,44 @@ impl CheckboxSelector {
         }
     }
 
+    /// The rows one item draws — a `Text` child, so a long id wraps at `width` onto further rows
+    /// (`text.ts:60-87`). The one definition [`Self::body_lines`] paints from and
+    /// [`Selector::pointer`] measures with, so the hit test sees the same row heights the paint has.
+    fn item_lines(
+        &self,
+        item: &ModelItem,
+        is_sel: bool,
+        all_enabled: bool,
+        width: usize,
+        theme: &UiTheme,
+    ) -> Vec<Line<'static>> {
+        let row = item.model.and_then(|idx| self.rows.get(idx));
+        let id = row.map_or(item.full_id.as_str(), |r| r.id.as_str());
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        // `prefix` (`:248`): the `→ ` is accent, the unselected `  ` is a plain two-space pad.
+        if is_sel {
+            spans.push(Span::styled("→ ", theme.accent_style()));
+            spans.push(Span::styled(id.to_string(), theme.accent_style()));
+        } else {
+            spans.push(Span::styled("  ", theme.base_style()));
+            spans.push(Span::styled(id.to_string(), theme.base_style()));
+        }
+        spans.push(Span::styled(
+            row.map_or_else(
+                || " [unavailable]".to_string(),
+                |r| format!(" [{}]", r.provider),
+            ),
+            theme.muted_style(),
+        ));
+        match (row, all_enabled, item.enabled) {
+            (None, _, _) => spans.push(Span::styled(" ✗", theme.dim_style())),
+            (Some(_), true, _) => {}
+            (Some(_), false, true) => spans.push(Span::styled(" ✓", theme.success_style())),
+            (Some(_), false, false) => spans.push(Span::styled(" ✗", theme.dim_style())),
+        }
+        crate::transcript::text_lines_of(&Line::from(spans), width, 0)
+    }
+
     /// `updateList` (`:230-280`) — the whole `listContainer`, in upstream's order.
     ///
     /// **S6.** The enable marker is *appended after* the id **and** the provider badge, and it is
@@ -478,36 +520,7 @@ impl CheckboxSelector {
         let (start, end) = centered_window(self.selected, len, self.max_visible);
         let all_enabled = self.enabled.is_none();
         for (i, item) in items.iter().enumerate().take(end).skip(start) {
-            let is_sel = i == self.selected;
-            let row = item.model.and_then(|idx| self.rows.get(idx));
-            let id = row.map_or(item.full_id.as_str(), |r| r.id.as_str());
-            let mut spans: Vec<Span<'static>> = Vec::new();
-            // `prefix` (`:248`): the `→ ` is accent, the unselected `  ` is a plain two-space pad.
-            if is_sel {
-                spans.push(Span::styled("→ ", theme.accent_style()));
-                spans.push(Span::styled(id.to_string(), theme.accent_style()));
-            } else {
-                spans.push(Span::styled("  ", theme.base_style()));
-                spans.push(Span::styled(id.to_string(), theme.base_style()));
-            }
-            spans.push(Span::styled(
-                row.map_or_else(
-                    || " [unavailable]".to_string(),
-                    |r| format!(" [{}]", r.provider),
-                ),
-                theme.muted_style(),
-            ));
-            match (row, all_enabled, item.enabled) {
-                (None, _, _) => spans.push(Span::styled(" ✗", theme.dim_style())),
-                (Some(_), true, _) => {}
-                (Some(_), false, true) => spans.push(Span::styled(" ✓", theme.success_style())),
-                (Some(_), false, false) => spans.push(Span::styled(" ✗", theme.dim_style())),
-            }
-            lines.extend(crate::transcript::text_lines_of(
-                &Line::from(spans),
-                width,
-                0,
-            ));
+            lines.extend(self.item_lines(item, i == self.selected, all_enabled, width, theme));
         }
         // Scroll indicator (`:263-267`).
         if start > 0 || end < len {
@@ -532,17 +545,11 @@ impl CheckboxSelector {
         lines
     }
 
-    /// The complete natural render, top to bottom — the single source both
-    /// [`Selector::desired_height`] and [`Selector::render`] read, so the measured height can never
-    /// disagree with what is drawn.
-    ///
-    /// `ScopedModelsSelectorComponent`'s children (`scoped-models-selector.ts:130-156`):
-    /// `DynamicBorder`(:130) · `Spacer`(:131) · title(:132) · subtitle(:133-135) · `Spacer`(:136) ·
-    /// search `Input`(:140) · `Spacer`(:141) · listContainer(:145) · `Spacer`(:148) ·
-    /// [refreshStatus(:150-151)] · footer(:154) · `DynamicBorder`(:156). **Four** spacers, and note
-    /// this component — unlike `extension-selector.ts:74` — has NO spacer between its footer row and
-    /// the bottom border.
-    fn all_lines(&self, width: u16, theme: &UiTheme) -> Vec<Line<'static>> {
+    /// Everything above the list (`scoped-models-selector.ts:130-142`): the rule, a blank, the
+    /// title, the subtitle, a blank, the search `Input` and the blank under it. Its length is the
+    /// slot row the first model is painted on, which is what [`Selector::pointer`] hit-tests
+    /// against.
+    fn head_lines(&self, width: u16, theme: &UiTheme) -> Vec<Line<'static>> {
         let w = usize::from(width);
         let mut lines: Vec<Line<'static>> = Vec::new();
         lines.push(border_rule_line(width, theme));
@@ -563,6 +570,33 @@ impl CheckboxSelector {
             theme,
         )));
         lines.push(Line::from(""));
+        lines
+    }
+
+    /// Toggle the highlighted model — the one answer to `Enter` and to a click on its row
+    /// (`:322-331`): it does not confirm.
+    fn toggle_current(&mut self) -> SelectorOutcome {
+        if let Some(id) = self.current_id() {
+            self.toggle(&id);
+            self.dirty = true;
+            self.clamp_selection();
+        }
+        SelectorOutcome::Redraw
+    }
+
+    /// The complete natural render, top to bottom — the single source both
+    /// [`Selector::desired_height`] and [`Selector::render`] read, so the measured height can never
+    /// disagree with what is drawn.
+    ///
+    /// `ScopedModelsSelectorComponent`'s children (`scoped-models-selector.ts:130-156`):
+    /// `DynamicBorder`(:130) · `Spacer`(:131) · title(:132) · subtitle(:133-135) · `Spacer`(:136) ·
+    /// search `Input`(:140) · `Spacer`(:141) · listContainer(:145) · `Spacer`(:148) ·
+    /// [refreshStatus(:150-151)] · footer(:154) · `DynamicBorder`(:156). **Four** spacers, and note
+    /// this component — unlike `extension-selector.ts:74` — has NO spacer between its footer row and
+    /// the bottom border.
+    fn all_lines(&self, width: u16, theme: &UiTheme) -> Vec<Line<'static>> {
+        let w = usize::from(width);
+        let mut lines = self.head_lines(width, theme);
         lines.extend(self.body_lines(w, theme));
         lines.push(Line::from(""));
         if let Some(status) = &self.refresh_status {
@@ -596,6 +630,57 @@ impl Selector for CheckboxSelector {
         // `stack_rows`' doc for the full argument.
         let lines = self.all_lines(area.width, theme);
         frame.render_widget(Paragraph::new(lines).style(theme.base_style()), area);
+    }
+
+    /// A press highlights the model under the pointer, a click toggles it as `Enter` does (it does
+    /// not close the dialog), and a wheel notch over the list moves the highlight one model without
+    /// wrapping. A model whose id wraps is one item over all of its rows. The rules, title,
+    /// subtitle, search box, `(i/N)` readout, `Model Name:` row, status row and footer are not
+    /// models.
+    fn pointer(&mut self, area: Rect, event: crate::app::Pointer) -> SelectorOutcome {
+        let width = area.width;
+        let top = self
+            .head_lines(width, UiTheme::default_ref())
+            .len()
+            .min(usize::from(u16::MAX)) as u16;
+        let items = self.items();
+        let len = items.len();
+        let (start, end) = centered_window(self.selected, len, self.max_visible);
+        let all_enabled = self.enabled.is_none();
+        let mut map = RowMap::starting_at(top);
+        for (i, item) in items.iter().enumerate().take(end).skip(start) {
+            let rows = self
+                .item_lines(
+                    item,
+                    i == self.selected,
+                    all_enabled,
+                    usize::from(width),
+                    UiTheme::default_ref(),
+                )
+                .len()
+                .min(usize::from(u16::MAX)) as u16;
+            map = map.item(i, rows, rows);
+        }
+        if end.saturating_sub(start) < len {
+            map = map.filler(1);
+        }
+        let map = map.clipped_to(area.height);
+        match self.pointer.act(event, &map, self.selected, len) {
+            RowAction::Ignored => SelectorOutcome::Ignored,
+            RowAction::Handled => SelectorOutcome::Redraw,
+            RowAction::Highlight(item) => {
+                self.selected = item;
+                SelectorOutcome::Redraw
+            }
+            RowAction::Activate(item) => {
+                self.selected = item;
+                self.toggle_current()
+            }
+            RowAction::Step(step) => {
+                self.selected = clamped_step(self.selected, len, step);
+                SelectorOutcome::Redraw
+            }
+        }
     }
 
     fn handle(&mut self, key: &KeyEvent, keymap: &SelectKeymap) -> SelectorOutcome {
@@ -694,14 +779,7 @@ impl Selector for CheckboxSelector {
                 SelectorOutcome::Redraw
             }
             // Enter TOGGLES membership (it does NOT confirm) — `:322-331`.
-            Some(SelectAction::Confirm) => {
-                if let Some(id) = self.current_id() {
-                    self.toggle(&id);
-                    self.dirty = true;
-                    self.clamp_selection();
-                }
-                SelectorOutcome::Redraw
-            }
+            Some(SelectAction::Confirm) => self.toggle_current(),
             Some(SelectAction::Cancel) => SelectorOutcome::Cancel,
             // Everything else feeds the search `Input` (`:396-397`). The bespoke
             // [`ModelsKeymap`] block above deliberately stays AHEAD of this: `ctrl+w` is

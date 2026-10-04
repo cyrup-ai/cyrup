@@ -27,7 +27,10 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
 use crate::keymap::{SelectAction, SelectKeymap};
-use crate::selector::{Selector, SelectorOutcome, border_rule_line, centered_window};
+use crate::selector::{
+    RowAction, RowMap, RowPointer, Selector, SelectorOutcome, border_rule_line, centered_window,
+    clamped_step,
+};
 use crate::text_width::truncate_line_to_width;
 use crate::theme::UiTheme;
 
@@ -51,6 +54,9 @@ pub struct UserMessageRow {
 pub struct UserMessageSelector {
     messages: Vec<UserMessageRow>,
     selected: usize,
+    /// The message a left press went down on, so the click that completes the gesture forks from it
+    /// even if the window slid under the pointer.
+    pointer: RowPointer,
 }
 
 impl UserMessageSelector {
@@ -59,7 +65,11 @@ impl UserMessageSelector {
     pub fn new(messages: Vec<UserMessageRow>, initial_id: Option<&str>) -> Self {
         let initial = initial_id.and_then(|id| messages.iter().position(|m| m.id == id));
         let selected = initial.unwrap_or_else(|| messages.len().saturating_sub(1));
-        UserMessageSelector { messages, selected }
+        UserMessageSelector {
+            messages,
+            selected,
+            pointer: RowPointer::default(),
+        }
     }
 
     /// The highlighted entry id, if any (test/inspection).
@@ -154,6 +164,26 @@ impl UserMessageSelector {
     }
 }
 
+impl UserMessageSelector {
+    /// Everything above the list: the header block, the top rule and the blank under it. Its length
+    /// is the slot row the first message is painted on, which is what [`Selector::pointer`]
+    /// hit-tests against.
+    fn head_lines(&self, width: u16, theme: &UiTheme) -> Vec<Line<'static>> {
+        let mut lines = self.header_lines(width, theme);
+        lines.push(border_rule_line(width, theme));
+        lines.push(Line::from(""));
+        lines
+    }
+
+    /// Fork from the highlighted message — the one answer to `Enter` and to a click on it.
+    fn confirm_current(&self) -> SelectorOutcome {
+        match self.current_id() {
+            Some(id) => SelectorOutcome::Confirm(id.to_string()),
+            None => SelectorOutcome::Redraw,
+        }
+    }
+}
+
 impl Selector for UserMessageSelector {
     fn desired_height(&self, width: u16) -> u16 {
         let theme = UiTheme::default_ref();
@@ -168,13 +198,49 @@ impl Selector for UserMessageSelector {
     }
 
     fn render(&mut self, frame: &mut Frame, area: Rect, theme: &UiTheme) {
-        let mut lines = self.header_lines(area.width, theme);
-        lines.push(border_rule_line(area.width, theme));
-        lines.push(Line::from(""));
+        let mut lines = self.head_lines(area.width, theme);
         lines.extend(self.body_lines(area.width, theme));
         lines.push(Line::from(""));
         lines.push(border_rule_line(area.width, theme));
         frame.render_widget(Paragraph::new(lines).style(theme.base_style()), area);
+    }
+
+    /// A press highlights the message under the pointer, a click forks from it as `Enter` does, and a
+    /// wheel notch over the list moves the highlight one message without wrapping. Each message is
+    /// three rows tall (the text, `Message i of N`, and a blank); a press answers on the first two,
+    /// the blank between messages is not a message. The header, rules and `(i/N)` readout are not
+    /// messages either.
+    fn pointer(&mut self, area: Rect, event: crate::app::Pointer) -> SelectorOutcome {
+        let top = self
+            .head_lines(area.width, UiTheme::default_ref())
+            .len()
+            .min(usize::from(u16::MAX)) as u16;
+        let len = self.messages.len();
+        let (start, end) = centered_window(self.selected, len, MAX_VISIBLE);
+        let mut map = RowMap::starting_at(top);
+        for message in start..end {
+            map = map.item(message, 3, 2);
+        }
+        if end.saturating_sub(start) < len {
+            map = map.filler(1);
+        }
+        let map = map.clipped_to(area.height);
+        match self.pointer.act(event, &map, self.selected, len) {
+            RowAction::Ignored => SelectorOutcome::Ignored,
+            RowAction::Handled => SelectorOutcome::Redraw,
+            RowAction::Highlight(message) => {
+                self.selected = message;
+                SelectorOutcome::Redraw
+            }
+            RowAction::Activate(message) => {
+                self.selected = message;
+                self.confirm_current()
+            }
+            RowAction::Step(step) => {
+                self.selected = clamped_step(self.selected, len, step);
+                SelectorOutcome::Redraw
+            }
+        }
     }
 
     fn handle(&mut self, key: &KeyEvent, keymap: &SelectKeymap) -> SelectorOutcome {
@@ -201,10 +267,7 @@ impl Selector for UserMessageSelector {
                 }
                 SelectorOutcome::Redraw
             }
-            Some(SelectAction::Confirm) => match self.current_id() {
-                Some(id) => SelectorOutcome::Confirm(id.to_string()),
-                None => SelectorOutcome::Redraw,
-            },
+            Some(SelectAction::Confirm) => self.confirm_current(),
             Some(SelectAction::Cancel) => SelectorOutcome::Cancel,
             None => SelectorOutcome::Ignored,
         }

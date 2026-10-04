@@ -99,6 +99,43 @@ pub enum OverlayColor {
     Indexed(u8),
     /// A 24-bit truecolor triple.
     Rgb(u8, u8, u8),
+    /// A role of the user's ACTIVE theme (pi `theme.fg(role, …)`), resolved by the host at paint
+    /// time — so a `--use-theme` choice or a live theme switch recolours the overlay, which no
+    /// literal variant above can do.
+    Theme(ThemeRole),
+}
+
+/// The theme roles an overlay can ask the host to colour a run with — pi's `theme.fg(<role>, …)`
+/// vocabulary, restricted to the tokens extension UIs actually use (`/llama` in `ui.ts`, the fleet
+/// inspector in `fleet*.ts`).
+///
+/// The set is closed on purpose: the host resolves each role against its own theme with an
+/// exhaustive `match`, so a role added here is a compile error there until it is given a colour.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ThemeRole {
+    /// pi `"text"` — the default foreground.
+    Text,
+    /// pi `"accent"` — focus, selection, headings.
+    Accent,
+    /// pi `"muted"` — secondary text.
+    Muted,
+    /// pi `"dim"` — tertiary text, hints.
+    Dim,
+    /// pi `"success"`.
+    Success,
+    /// pi `"warning"`.
+    Warning,
+    /// pi `"error"`.
+    Error,
+    /// pi `"border"`.
+    Border,
+    /// pi `"borderMuted"`.
+    BorderMuted,
+    /// pi `"toolTitle"`.
+    ToolTitle,
+    /// pi `"toolOutput"`.
+    ToolOutput,
 }
 
 /// One styled run of text inside an [`OverlayLine`].
@@ -264,6 +301,60 @@ pub enum OverlayOutcome {
     /// The overlay asked to close (pi `this.done(...)`); the host tears it down.
     Close,
 }
+
+/// One pointer event the host routed to an overlay, as the small closed set an overlay can act on.
+///
+/// Positions are **local to the box the overlay painted**: `(0, 0)` is the top-left cell of the
+/// rectangle the host reserved for [`InteractiveOverlay::render`]'s lines, so `row` indexes
+/// straight into the `Vec<OverlayLine>` the overlay returned and `column` into a line's cells.
+/// The host decides whether an event is the overlay's at all — by the rectangle it painted — and
+/// only forwards the ones that landed inside it.
+///
+/// Like [`OverlayKey`] this is deliberately not the terminal backend's type (`cyrup-ext` stays free
+/// of crossterm): a terminal's press/release pair has already been folded into a
+/// [`Self::Click`] by the host.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum OverlayMouse {
+    /// The primary button went down. A list row is *selected* on press.
+    Press {
+        /// Column inside the box.
+        column: u16,
+        /// Row inside the box.
+        row: u16,
+    },
+    /// A press and its release landed on the same cell with nothing in between. `count` is the
+    /// number of consecutive clicks on that cell: 1, 2 or 3. A list row is *activated* on click.
+    Click {
+        /// Column inside the box.
+        column: u16,
+        /// Row inside the box.
+        row: u16,
+        /// Consecutive clicks on this cell (1 to 3).
+        count: u8,
+    },
+    /// One wheel notch. `lines` is signed: negative scrolls up.
+    Wheel {
+        /// Column inside the box.
+        column: u16,
+        /// Row inside the box.
+        row: u16,
+        /// Notch direction and size; negative is up.
+        lines: i32,
+    },
+}
+
+impl OverlayMouse {
+    /// The cell the event landed on, as `(column, row)` inside the box.
+    #[must_use]
+    pub fn cell(self) -> (u16, u16) {
+        match self {
+            Self::Press { column, row }
+            | Self::Click { column, row, .. }
+            | Self::Wheel { column, row, .. } => (column, row),
+        }
+    }
+}
 /// pi's `overlayOptions` (`interactive-mode.ts:2719`), carried **with the factory** rather than
 /// through `open_overlay`.
 ///
@@ -348,6 +439,17 @@ pub trait InteractiveOverlay: Send {
     /// [`OverlayOutcome::Ignored`] — a component with no text field has nothing to paste into —
     /// and the host still keeps the paste away from the editor beneath the modal.
     fn handle_paste(&mut self, _text: &str) -> OverlayOutcome {
+        OverlayOutcome::Ignored
+    }
+
+    /// Route one pointer event that landed inside the box this overlay painted.
+    ///
+    /// The host hit-tests by the rectangle [`Self::render`]'s lines were painted into, so every
+    /// event arrives already local to it ([`OverlayMouse`]). A hit overlay is modal for the event:
+    /// whatever it answers, the event is not also offered to the editor, the dock or the document
+    /// beneath. Defaulted to [`OverlayOutcome::Ignored`] — an overlay with nothing to point at is
+    /// unchanged by this seam.
+    fn handle_mouse(&mut self, _event: OverlayMouse) -> OverlayOutcome {
         OverlayOutcome::Ignored
     }
 
@@ -588,6 +690,55 @@ impl InteractiveOverlay for SpecOverlay {
             _ => OverlayOutcome::Ignored,
         }
     }
+
+    /// A chooser's rows answer the pointer the way a list does: the wheel moves the highlight one
+    /// row (clamped, never wrapping), a press selects the row under the pointer, a click resolves
+    /// `ui.custom` to it. A read-only panel has no rows, so it ignores the pointer.
+    fn handle_mouse(&mut self, event: OverlayMouse) -> OverlayOutcome {
+        let Some(last) = self.spec.options.len().checked_sub(1) else {
+            return OverlayOutcome::Ignored;
+        };
+        let first_option =
+            usize::from(self.spec.title.is_some()).saturating_add(self.spec.lines.len());
+        let option_at = |row: u16| {
+            usize::from(row)
+                .checked_sub(first_option)
+                .filter(|index| *index <= last)
+        };
+        match event {
+            OverlayMouse::Wheel { lines, .. } => {
+                let next = if lines < 0 {
+                    self.selected.saturating_sub(1)
+                } else {
+                    self.selected.saturating_add(1).min(last)
+                };
+                if next == self.selected {
+                    return OverlayOutcome::Ignored;
+                }
+                self.selected = next;
+                OverlayOutcome::Redraw
+            }
+            OverlayMouse::Press { row, .. } => match option_at(row) {
+                Some(index) if index != self.selected => {
+                    self.selected = index;
+                    OverlayOutcome::Redraw
+                }
+                _ => OverlayOutcome::Ignored,
+            },
+            OverlayMouse::Click { row, .. } => {
+                let Some(index) = option_at(row) else {
+                    return OverlayOutcome::Ignored;
+                };
+                self.selected = index;
+                if let Some(opt) = self.spec.options.get(index)
+                    && let Ok(mut slot) = self.result.lock()
+                {
+                    *slot = Some(opt.id.clone());
+                }
+                OverlayOutcome::Close
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -728,6 +879,130 @@ mod tests {
                 .map(OverlayLine::plain_text)
                 .collect::<Vec<_>>(),
             vec!["read me".to_string()]
+        );
+    }
+
+    fn chooser() -> (SpecOverlay, Arc<Mutex<Option<String>>>) {
+        CustomSpec::from_json(&serde_json::json!({
+            "title": "pick",
+            "lines": ["one line of body"],
+            "options": ["a", "b", "c"],
+        }))
+        .into_overlay()
+    }
+
+    /// Rows: 0 title, 1 body line, 2..=4 the options.
+    #[test]
+    fn a_chooser_wheel_moves_the_highlight_one_row_and_clamps() {
+        let (mut ov, _result) = chooser();
+        let wheel = |lines| OverlayMouse::Wheel {
+            column: 3,
+            row: 0,
+            lines,
+        };
+        assert_eq!(ov.handle_mouse(wheel(1)), OverlayOutcome::Redraw);
+        assert_eq!(ov.handle_mouse(wheel(1)), OverlayOutcome::Redraw);
+        assert_eq!(
+            ov.handle_mouse(wheel(1)),
+            OverlayOutcome::Ignored,
+            "the wheel clamps at the last row rather than wrapping"
+        );
+        assert_eq!(ov.handle_mouse(wheel(-1)), OverlayOutcome::Redraw);
+        assert_eq!(ov.handle_mouse(wheel(-1)), OverlayOutcome::Redraw);
+        assert_eq!(ov.handle_mouse(wheel(-1)), OverlayOutcome::Ignored);
+    }
+
+    #[test]
+    fn a_chooser_press_selects_and_a_click_resolves_the_row_under_the_pointer() {
+        let (mut ov, result) = chooser();
+        // Row 4 is the third option ("c"); a press only moves the highlight.
+        assert_eq!(
+            ov.handle_mouse(OverlayMouse::Press { column: 2, row: 4 }),
+            OverlayOutcome::Redraw
+        );
+        assert_eq!(result.lock().unwrap().as_deref(), None);
+        assert_eq!(
+            ov.handle_mouse(OverlayMouse::Click {
+                column: 2,
+                row: 3,
+                count: 1
+            }),
+            OverlayOutcome::Close,
+            "a click activates the row it landed on"
+        );
+        assert_eq!(result.lock().unwrap().as_deref(), Some("b"));
+    }
+
+    #[test]
+    fn a_chooser_ignores_the_pointer_over_its_title_and_body() {
+        let (mut ov, result) = chooser();
+        for row in [0, 1, 5, 99] {
+            assert_eq!(
+                ov.handle_mouse(OverlayMouse::Press { column: 0, row }),
+                OverlayOutcome::Ignored,
+                "row {row} is not an option"
+            );
+            assert_eq!(
+                ov.handle_mouse(OverlayMouse::Click {
+                    column: 0,
+                    row,
+                    count: 1
+                }),
+                OverlayOutcome::Ignored
+            );
+        }
+        assert_eq!(result.lock().unwrap().as_deref(), None);
+    }
+
+    #[test]
+    fn a_read_only_panel_and_a_plain_overlay_ignore_the_pointer() {
+        let (mut panel, _r) =
+            CustomSpec::from_json(&serde_json::json!({"lines": ["read me"]})).into_overlay();
+        assert_eq!(
+            panel.handle_mouse(OverlayMouse::Click {
+                column: 0,
+                row: 0,
+                count: 1
+            }),
+            OverlayOutcome::Ignored
+        );
+
+        struct Inert;
+        impl InteractiveOverlay for Inert {
+            fn render(&mut self, _w: usize, _h: usize) -> Vec<OverlayLine> {
+                Vec::new()
+            }
+            fn handle_key(&mut self, _key: OverlayKey) -> OverlayOutcome {
+                OverlayOutcome::Ignored
+            }
+        }
+        assert_eq!(
+            Inert.handle_mouse(OverlayMouse::Wheel {
+                column: 0,
+                row: 0,
+                lines: 1
+            }),
+            OverlayOutcome::Ignored,
+            "the default body leaves every existing overlay unchanged"
+        );
+    }
+
+    #[test]
+    fn a_mouse_event_reports_its_cell_and_a_theme_colour_survives_the_wire() {
+        assert_eq!(
+            OverlayMouse::Click {
+                column: 7,
+                row: 2,
+                count: 2
+            }
+            .cell(),
+            (7, 2)
+        );
+        let json = serde_json::to_string(&OverlayColor::Theme(ThemeRole::Accent)).unwrap();
+        assert_eq!(json, r#"{"theme":"accent"}"#);
+        assert_eq!(
+            serde_json::from_str::<OverlayColor>(&json).unwrap(),
+            OverlayColor::Theme(ThemeRole::Accent)
         );
     }
 

@@ -25,6 +25,31 @@ pub(crate) fn tool_lines(
     theme: &UiTheme,
     images: ImageOpts,
 ) -> Vec<Line<'static>> {
+    tool_block(run, expanded, width, theme, images).lines
+}
+
+/// One tool block's rows, and where a left click on it toggles it.
+pub(crate) struct ToolBlock {
+    pub lines: Vec<Line<'static>>,
+    /// The cells `createResultRegion` (`tool-execution.ts:175-181`) covers, relative to the first
+    /// row. Not gated on the run having a result — [`Entry::toggle_scope`] owns that rule.
+    pub hit: Option<ToggleRegion>,
+}
+
+/// [`tool_lines`] plus the click region of the block it drew.
+///
+/// Pi wraps every renderer component of the block in a `MouseRegion`, but the regions live in
+/// different containers depending on the shell: inside the default shell's `Box(1, 1)` the tinted
+/// padding rows and columns are outside every region (`box.ts:75-99` hit-tests the content box),
+/// whereas the `renderShell: "self"` container and the no-definition `Text` are plain containers
+/// that test the row alone.
+pub(crate) fn tool_block(
+    run: &ToolRun,
+    expanded: bool,
+    width: usize,
+    theme: &UiTheme,
+    images: ImageOpts,
+) -> ToolBlock {
     let mut block: Vec<Line<'static>> = Vec::new();
     // Pi's `builtInToolDefinition` lookup, asked ONCE so both resolutions below read the same
     // answer (`tool-execution.ts:84-101`).
@@ -35,7 +60,8 @@ pub(crate) fn tool_lines(
     // `getToolDefinition(name)` answered when the run started ([`ToolRun::has_definition`]).
     let has_definition =
         run.definition.is_some() || run.rendered_call.is_some() || run.rendered_result.is_some();
-    if builtin.is_none() && !has_definition {
+    let generic = builtin.is_none() && !has_definition;
+    if generic {
         // The `else` of `hasRendererDefinition()`: the unbounded `formatToolExecution()`
         // (`tool-execution.ts:330-333`). Nothing at all is known about this tool name.
         render_generic(run, theme, &mut block);
@@ -119,18 +145,29 @@ pub(crate) fn tool_lines(
     // `hasRendererDefinition()` half is implied: `shell` can only be `SelfRendered` through a
     // definition or the built-in table, each of which satisfies it.
     if shell == ToolRenderKind::SelfRendered {
-        return self_rendered_lines(run, builtin, block, inline, width, theme, images);
+        return self_rendered_block(run, builtin, block, inline, width, theme, images);
     }
     // The DEFAULT shell: `this.contentBox = new Box(1, 1, bgFn)` (`:71`), tinted by execution
     // state (`updateDisplay`, `:265-269` — `toolPendingBg` while partial, else `toolErrorBg` /
     // `toolSuccessBg`), preceded by the untinted `Spacer(1)` the constructor adds (`:66`).
     let bg = theme.tool_bg_style(Style::default(), run.done, run.is_error);
     let mut out = vec![Line::default()];
-    out.extend(finalize_block(block, width, bg));
+    let boxed = finalize_block(block, width, bg);
+    let boxed_len = boxed.len();
+    out.extend(boxed);
     if inline {
         out.extend(image_raster_lines(run, width, images.width_cells));
     }
-    out
+    // Rows: the `Spacer(1)`, then the `Box(1, 1)` — a padding row, the content, a padding row.
+    let hit = if generic {
+        // No definition: the `Text` itself is the region child of a bare container, padding and all.
+        (boxed_len > 0).then(|| ToggleRegion::new(1..1 + boxed_len, 0..width))
+    } else if boxed_len >= 3 {
+        Some(ToggleRegion::new(2..boxed_len, 1..width.saturating_sub(1)))
+    } else {
+        None
+    };
+    ToolBlock { lines: out, hit }
 }
 
 /// The `renderShell: "self"` block — `ToolExecutionComponent.render()`'s first branch
@@ -160,7 +197,7 @@ pub(crate) fn tool_lines(
 /// special case, now attributed to the renderer that owns them. An extension renderer that takes
 /// `edit` over (`rendered_call`/`rendered_result`) replaces the component, box and all, exactly as
 /// `toolDefinition.renderCall ?? builtInToolDefinition.renderCall` (`:84-92`) would.
-fn self_rendered_lines(
+fn self_rendered_block(
     run: &ToolRun,
     builtin: Option<Builtin>,
     block: Vec<Line<'static>>,
@@ -168,7 +205,7 @@ fn self_rendered_lines(
     width: usize,
     theme: &UiTheme,
     images: ImageOpts,
-) -> Vec<Line<'static>> {
+) -> ToolBlock {
     let own_edit_component = builtin == Some(Builtin::Edit)
         && run.rendered_call.is_none()
         && run.rendered_result.is_none();
@@ -181,8 +218,12 @@ fn self_rendered_lines(
         block.iter().flat_map(|l| wrap_line(l, width)).collect()
     };
     if content.is_empty() && !inline {
-        return Vec::new();
+        return ToolBlock {
+            lines: Vec::new(),
+            hit: None,
+        };
     }
+    let content_len = content.len();
     let mut out = Vec::with_capacity(content.len() + 1);
     if !content.is_empty() {
         out.push(Line::default());
@@ -192,7 +233,10 @@ fn self_rendered_lines(
         // `image_raster_lines` emits the per-image `Spacer(1)` + raster pair (`:248-257`).
         out.extend(image_raster_lines(run, width, images.width_cells));
     }
-    out
+    // The container is bare, so every content row is in a region whatever its column; the image
+    // rows are siblings of the container, not children.
+    let hit = (content_len > 0).then(|| ToggleRegion::new(1..1 + content_len, 0..width));
+    ToolBlock { lines: out, hit }
 }
 
 /// The per-frame render inputs a tool block needs that are not on the [`ToolRun`] itself — Pi's

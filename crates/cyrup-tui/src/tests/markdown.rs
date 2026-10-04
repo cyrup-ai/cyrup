@@ -17,13 +17,13 @@ use ratatui::backend::TestBackend;
 use ratatui::style::{Color, Modifier};
 use ratatui::text::Line;
 
-/// The dark theme's body/prose foreground (`text` = `#d4d4d4`) — the colour Pi's *unstyled* table
+/// The dark theme's body/prose foreground (`text` = `#dee0e1`) — the colour Pi's *unstyled* table
 /// chrome inherits, since `markdown.ts:956/971/976/1003` pass no theme function at all.
-const BODY_FG: Color = Color::Rgb(0xd4, 0xd4, 0xd4);
-/// `mdHr` = `gray` `#808080` (`dark.json:56`) — what the table frame must NOT be.
-const MD_HR: Color = Color::Rgb(0x80, 0x80, 0x80);
-/// `mdHeading` = `#f0c674` (`dark.json:52`) — what a table header cell must NOT be.
-const MD_HEADING: Color = Color::Rgb(0xf0, 0xc6, 0x74);
+const BODY_FG: Color = Color::Rgb(0xde, 0xe0, 0xe1);
+/// `mdHr` = `muted` `#9da5a9` (v1.0.0 `dark.json`) — what the table frame must NOT be.
+const MD_HR: Color = Color::Rgb(0x9d, 0xa5, 0xa9);
+/// `mdHeading` = `#cd9a22` (v1.0.0 `dark.json`) — what a table header cell must NOT be.
+const MD_HEADING: Color = Color::Rgb(0xcd, 0x9a, 0x22);
 
 /// The effective foreground of a line: its own line style, else the first span that sets one.
 fn line_fg(line: &Line<'_>) -> Option<Color> {
@@ -76,14 +76,14 @@ fn headings_drop_hash_for_h1_h2_and_keep_it_for_h3_plus() {
     let theme = UiTheme::dark();
     let lines = render_markdown("## Plan\n\nbody\n", 80, &theme);
     let text = rows(&lines).join("\n");
-    // H2: no `#` prefix, bold mdHeading (#f0c674 in the dark theme).
+    // H2: no `#` prefix, bold mdHeading (#cd9a22 in the dark theme).
     assert!(text.contains("Plan"), "heading text missing:\n{text}");
     assert!(
         !text.contains("## Plan"),
         "H2 kept its hash prefix:\n{text}"
     );
     assert!(
-        has_span_colored(&lines, "Plan", Color::Rgb(0xf0, 0xc6, 0x74)),
+        has_span_colored(&lines, "Plan", Color::Rgb(0xcd, 0x9a, 0x22)),
         "heading not in mdHeading color:\n{text}"
     );
     assert!(
@@ -159,10 +159,10 @@ fn blockquote_prefixes_border_and_hr_is_a_rule() {
 #[test]
 fn inline_code_bold_and_links() {
     let theme = UiTheme::dark();
-    // inline code → mdCode (= accent #8abeb7), no surrounding backticks.
+    // inline code → mdCode (= accent #a798d7), no surrounding backticks.
     let code = render_markdown("write `out.json` now\n", 80, &theme);
     assert!(
-        has_span_colored(&code, "out.json", Color::Rgb(0x8a, 0xbe, 0xb7)),
+        has_span_colored(&code, "out.json", Color::Rgb(0xa7, 0x98, 0xd7)),
         "inline code not in mdCode/accent color:\n{:?}",
         rows(&code)
     );
@@ -279,9 +279,9 @@ fn fenced_code_block_highlights_known_language() {
         text.contains("```rust"),
         "opening fence line missing:\n{text}"
     );
-    // The `fn` keyword is highlighted with syntaxKeyword (#569CD6 in the dark theme).
+    // The `fn` keyword is highlighted with syntaxKeyword (#69add0 in the dark theme).
     assert!(
-        has_span_colored(&lines, "fn", Color::Rgb(0x56, 0x9C, 0xD6)),
+        has_span_colored(&lines, "fn", Color::Rgb(0x69, 0xad, 0xd0)),
         "rust keyword not syntax-highlighted:\n{text}"
     );
 }
@@ -301,7 +301,7 @@ fn unknown_language_code_renders_flat() {
     );
     // mdCodeBlock = "green" var in the dark theme; assert the body span is not the keyword blue.
     assert!(
-        !has_span_colored(&lines, "some", Color::Rgb(0x56, 0x9C, 0xD6)),
+        !has_span_colored(&lines, "some", Color::Rgb(0x69, 0xad, 0xd0)),
         "flat code wrongly highlighted as a keyword"
     );
 }
@@ -1204,7 +1204,7 @@ fn m17_code_fence_keeps_the_whole_info_string() {
     // `supportsLanguage('js title="server.ts"')` returning false (`theme.ts:1268-1274`) — the body
     // falls back to a flat block rather than being highlighted as JavaScript.
     assert!(
-        !has_span_colored(&lines, "const", Color::Rgb(0x56, 0x9C, 0xD6)),
+        !has_span_colored(&lines, "const", Color::Rgb(0x69, 0xad, 0xd0)),
         "a multi-word info string must not highlight:\n{r:?}"
     );
 
@@ -1216,7 +1216,7 @@ fn m17_code_fence_keeps_the_whole_info_string() {
         rows(&bare)
     );
     assert!(
-        has_span_colored(&bare, "fn", Color::Rgb(0x56, 0x9C, 0xD6)),
+        has_span_colored(&bare, "fn", Color::Rgb(0x69, 0xad, 0xd0)),
         "bare `rust` lost its highlighting:\n{:?}",
         rows(&bare)
     );

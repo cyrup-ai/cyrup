@@ -41,11 +41,15 @@ impl<B: Backend> App<B> {
             // empty `settings.json`.
             fullscreen_exit_output: crate::altscreen::FullscreenExitOutput::default(),
             fullscreen_copy_on_select: true,
+            // `options.fullscreenWheelScrollLines ?? "auto"` (`tui-renderer.ts:38`).
+            fullscreen_wheel_scroll_lines: cyrup_config::settings::WheelScrollLines::Auto,
             viewport_height: 0,
             live_floor: 0,
             tree_nav_tx: None,
             share_tx: None,
             package_update_rx: None,
+            terminal_colors_rx: None,
+            terminal_colors_tx: None,
             login_tx: None,
             login_refresh_tx: None,
             model_refresh_tx: None,
@@ -366,6 +370,42 @@ impl<B: Backend> App<B> {
         self.package_update_rx = rx;
     }
 
+    /// Install the channel the terminal's colours arrive on once the boot query has given up on
+    /// them — the receiving half for [`App::run`], the sending half for the callback handed to
+    /// [`ThemeController::request_terminal_colors`] and for a later re-query.
+    ///
+    /// Must be called before [`App::run`]. Without it a colour reply that misses the boot deadline
+    /// is swallowed by the input reader and the system theme stays as the timeout left it.
+    pub fn set_terminal_colors_channel(
+        &mut self,
+        tx: tokio::sync::mpsc::UnboundedSender<crate::TerminalColors>,
+        rx: tokio::sync::mpsc::UnboundedReceiver<crate::TerminalColors>,
+    ) {
+        self.terminal_colors_tx = Some(tx);
+        self.terminal_colors_rx = Some(rx);
+    }
+
+    /// Ask the terminal for its colours again without waiting — the `queryTerminalColors()` pi's
+    /// `applyFromSettings` ends with (`theme-controller.ts:108`). The input reader thread owns
+    /// stdin by now, so the answer is routed to the pending query by the reader and delivered on
+    /// the channel [`Self::set_terminal_colors_channel`] installed. A no-op off a real terminal
+    /// and when no channel was installed.
+    #[cfg(unix)]
+    fn requery_terminal_colors(&self) {
+        if let Some(tx) = self.terminal_colors_tx.clone() {
+            crate::terminal_query::request_terminal_colors_async(
+                crate::write_log::tui_stdout(),
+                std::sync::Arc::new(move |colors| {
+                    let _ = tx.send(colors);
+                }),
+            );
+        }
+    }
+
+    /// Windows has no byte reader to route a reply through, so there is nothing to ask.
+    #[cfg(not(unix))]
+    fn requery_terminal_colors(&self) {}
+
     /// Re-check the git refs and republish the branch when it moved — Pi's watch-driven
     /// `refreshGitBranchAsync` → `notifyBranchChange` (`footer-data-provider.ts`), driven here by
     /// [`App::run`]'s poll tick. Returns `true` when the footer needs a repaint.
@@ -598,6 +638,18 @@ impl<B: Backend> App<B> {
         self.state.theme = theme;
     }
 
+    /// The theme a picker preview or confirm paints for `name` — the controller's, when there is
+    /// one, because `system` is generated from the colours the terminal reported and only the
+    /// controller holds them (Pi's `themeController.preview(name)` → `setTheme(name)` reads the
+    /// same module state). Without a controller (a harness app) there are no reported colours, and
+    /// the compiled-in answer stands.
+    pub(crate) fn theme_for_picker(&self, name: &str) -> UiTheme {
+        match self.state.theme_controller.as_ref() {
+            Some(controller) => controller.theme_named(name),
+            None => UiTheme::builtin(name),
+        }
+    }
+
     /// TUI-004 — hand the app the boot [`ThemeController`] so a session swap can re-run Pi's
     /// `applyFromSettings` (`modes/interactive/theme/theme-controller.ts:57-81` @v0.84.4).
     ///
@@ -626,19 +678,18 @@ impl<B: Backend> App<B> {
     /// answers from the same [`cyrup_resources::ResourceSet`]).
     ///
     /// TUI-096 — a name that resolves to NOTHING is pi's `setTheme` failure, and upstream does two
-    /// things with it (`applyThemeName`, `theme-controller.ts:126-135` @v0.84.4), not one:
+    /// things with it (`applyThemeName`, `theme-controller.ts:178-186` @v1.0.0), not one:
     ///
-    /// 1. `this.activeThemeName = result.success ? themeName : "dark"` — the ACTIVE name becomes
-    ///    the theme that is actually painted ([`ThemeController::fall_back_to_dark`]); and
-    /// 2. under `showError` — which is `true` on both `applyFromSettings` branches that name a
-    ///    theme (`:64`, `:70`), i.e. on every path that reaches here — it surfaces
-    ///    ``Failed to load theme "<name>": <error>\nFell back to dark theme.``
+    /// 1. `this.activeThemeName = result.success ? themeName : SYSTEM_THEME_NAME` — the ACTIVE name
+    ///    becomes the theme that is actually painted ([`ThemeController::fall_back_to_system`]);
+    ///    and
+    /// 2. under `showError` — which is `true` whenever the setting names a theme (`:107`), i.e. on
+    ///    every path that reaches here — it surfaces
+    ///    ``Failed to load theme "<name>": <error>\nFell back to the system theme.``
     ///
-    /// cyrup projected [`UiTheme::builtin`]'s silent dark fallback and kept the broken name, so a
-    /// `/reload` onto a deleted, renamed or malformed theme turned the UI dark with no way to tell
-    /// that apart from a theme that simply looks dark. `<error>` is pi's `result.error`: for a name
-    /// nothing resolves, `loadThemeJson`'s `Theme not found: <name>` (`theme/theme.ts:623`, caught
-    /// by `setTheme` at `:903-911`). The sentence goes to
+    /// `<error>` is pi's `result.error`: for a name nothing resolves, `loadThemeJson`'s
+    /// `Theme not found: <name>` (`theme/theme.ts:567`, caught by `setTheme` at `:783-792`). The
+    /// sentence goes to
     /// [`crate::transcript::TranscriptView::push_error`], which is `showError`'s
     /// `Spacer(1)` + `Text(theme.fg("error", …), outputPad, 0)`
     /// (`interactive-mode.ts:4258-4262`) — with the `Error: ` prefix supplied here, since that
@@ -660,54 +711,115 @@ impl<B: Backend> App<B> {
         setting: Option<&str>,
         resources: &cyrup_resources::ResourceRegistry,
     ) -> ThemeApply {
+        self.apply_theme_setting(setting, resources, true)
+    }
+
+    /// The boot-time `applyFromSettings` (`interactive-mode.ts:990`): [`Self::reapply_theme_from_settings`]
+    /// without the colour re-query, because the composition root has just asked the terminal for
+    /// them synchronously (`ThemeController::request_terminal_colors`) and asking again would
+    /// only repeat the question.
+    pub fn settle_boot_theme(
+        &mut self,
+        setting: Option<&str>,
+        resources: &cyrup_resources::ResourceRegistry,
+    ) -> ThemeApply {
+        self.apply_theme_setting(setting, resources, false)
+    }
+
+    fn apply_theme_setting(
+        &mut self,
+        setting: Option<&str>,
+        resources: &cyrup_resources::ResourceRegistry,
+        requery_colors: bool,
+    ) -> ThemeApply {
         let Some(controller) = self.state.theme_controller.as_mut() else {
             return ThemeApply::NoController;
         };
         let name = controller.apply_from_settings(setting);
-        // The load: the swapped-in session's discovered themes, then the compiled-in built-ins.
-        // `None` from both is pi's `setTheme` throw — the failure this seam owes the user a sentence
-        // for.
-        //
-        // [CYRUP-DELTA] vs `loadThemeJson`, which checks `if (name in builtinThemes)` FIRST
-        // (`theme/theme.ts:607-610` @v0.84.4) and so shadows a user theme that reuses a built-in
-        // name. Discovery already seeds the registry with the built-ins, so the two orders differ
-        // only for that shadowing case, and cyrup resolves it the other way everywhere else it
-        // resolves a theme by name — `TuiThemeAccess::get`/`set` (`theme_access.rs:144`, `:164`) and
-        // the boot theme-file watcher (`crates/cyrup/src/interactive.rs`'s `build_theme_watcher`)
-        // both go through `ResourceSet::get_name`. Re-ordering HERE alone would repaint one theme
-        // while the watcher watched another's file. `builtin_named` is therefore the fallback, which
-        // is what a registry that discovered nothing (a harness `ResourceRegistry::default()`) needs
-        // to keep `dark`/`light` loadable. Pinned by
-        // `tests::theme_reapply_on_reload::a_discovered_theme_that_shadows_a_builtin_name_beats_the_builtin`,
-        // which is red under the upstream order and is the ONLY test that can tell the two apart.
-        let loaded = resources
-            .themes
-            .get_name(&name)
-            .map(|theme| UiTheme::from_theme_data(&theme.data, 0))
-            .or_else(|| UiTheme::builtin_named(&name));
+        let loaded = Self::load_theme_named(controller, resources, &name);
         let (projected, outcome) = match loaded {
             Some(theme) => (theme, ThemeApply::Loaded(name)),
             None => (
-                UiTheme::builtin(crate::theme::DARK_THEME_NAME),
-                ThemeApply::FellBackToDark {
+                controller.fall_back_to_system(),
+                ThemeApply::FellBackToSystem {
                     error: format!("Theme not found: {name}"),
                     name,
                 },
             ),
         };
-        if matches!(outcome, ThemeApply::FellBackToDark { .. }) {
-            controller.fall_back_to_dark();
-        }
         // `set_theme`, not a bare assignment: it re-projects through the app's live `ColorMode` and
         // bumps the generation, which is what invalidates the render caches (`notifyChanged` →
-        // `ui.invalidate()`, `theme-controller.ts:136-139`).
+        // `ui.invalidate()`, `theme-controller.ts:249-252`).
         self.set_theme(projected);
-        if let ThemeApply::FellBackToDark { name, error } = &outcome {
+        if let ThemeApply::FellBackToSystem { name, error } = &outcome {
             self.state.transcript.push_error(format!(
-                "Error: Failed to load theme \"{name}\": {error}\nFell back to dark theme."
+                "Error: Failed to load theme \"{name}\": {error}\n{}",
+                crate::theme::THEME_FALLBACK_SENTENCE
             ));
         }
+        // `applyFromSettings` ends by asking the terminal for its colours again
+        // (`theme-controller.ts:108`), so a terminal theme the user switched since boot reaches the
+        // system theme and the `""` tokens.
+        if requery_colors {
+            self.requery_terminal_colors();
+        }
         outcome
+    }
+
+    /// pi's `loadTheme(name)` (`theme.ts:631-640`) for the controller's owner: `system` first — it
+    /// "is reserved: it takes precedence over custom themes of the same name" and is generated from
+    /// the colours the terminal reported, which only the controller holds — then the session's
+    /// discovered themes, then the compiled-in built-ins. `None` from all three is pi's `setTheme`
+    /// throw, the failure the caller owes the user a sentence for.
+    ///
+    /// [CYRUP-DELTA] vs `loadThemeJson`, which checks `if (name in builtinThemes)` FIRST
+    /// (`theme/theme.ts:552-554` @v1.0.0) and so shadows a user theme that reuses a built-in name.
+    /// Discovery already seeds the registry with the built-ins, so the two orders differ only for
+    /// that shadowing case, and cyrup resolves it the other way everywhere else it resolves a theme
+    /// by name — `TuiThemeAccess::get`/`set` (`theme_access.rs`) and the boot theme-file watcher
+    /// (`crates/cyrup/src/interactive.rs`'s `build_theme_watcher`) both go through
+    /// `ResourceSet::get_name`. Re-ordering HERE alone would repaint one theme while the watcher
+    /// watched another's file. `builtin_named` is therefore the fallback, which is what a registry
+    /// that discovered nothing (a harness `ResourceRegistry::default()`) needs to keep `dark`/`light`
+    /// loadable. Pinned by
+    /// `tests::theme_reapply_on_reload::a_discovered_theme_that_shadows_a_builtin_name_beats_the_builtin`,
+    /// which is red under the upstream order and is the ONLY test that can tell the two apart.
+    fn load_theme_named(
+        controller: &ThemeController,
+        resources: &cyrup_resources::ResourceRegistry,
+        name: &str,
+    ) -> Option<UiTheme> {
+        if name == crate::system_theme::SYSTEM_THEME_NAME {
+            return Some(controller.system_theme());
+        }
+        resources
+            .themes
+            .get_name(name)
+            .map(|theme| UiTheme::from_theme_data(&theme.data, 0))
+            .or_else(|| UiTheme::builtin_named(name))
+            .map(|theme| theme.with_terminal_appearance(controller.terminal_theme().into()))
+    }
+
+    /// The terminal reported its colours after the boot query gave up — Pi's `onLateReply`
+    /// (`theme-controller.ts:34`, `applyTerminalColors` `:197-211`): record them, regenerate the
+    /// system theme (or switch the theme of an automatic pair) and repaint. A repeat of what the
+    /// controller already holds changes nothing.
+    pub fn apply_terminal_colors(
+        &mut self,
+        colors: crate::terminal_query::TerminalColors,
+        resources: &cyrup_resources::ResourceRegistry,
+    ) {
+        let Some(controller) = self.state.theme_controller.as_mut() else {
+            return;
+        };
+        let Some(name) = controller.apply_terminal_colors(colors) else {
+            return;
+        };
+        let loaded = Self::load_theme_named(controller, resources, &name);
+        // A name that no longer loads is pi's silent `applyThemeName(themeName)` failure
+        // (`showError` is false on this path): the system theme is painted and seated.
+        let theme = loaded.unwrap_or_else(|| controller.fall_back_to_system());
+        self.set_theme(theme);
     }
 
     /// The boot [`ThemeController`] the composition root handed over, if any (test/inspection).
