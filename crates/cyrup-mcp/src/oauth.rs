@@ -4010,12 +4010,21 @@ pub enum UnauthorizedAction {
 }
 
 /// Advance the four-state union on a 401.
+///
+/// `provider_auth` is the `|| provider !== undefined` half of upstream's needs-auth gate
+/// (`server-manager.ts:1795`, widened by `c524196` / #767 — MCP-593). A server with
+/// `auth: { provider }` is **not** an OAuth server — `supports_oauth` answers false for it, so its
+/// state is [`Disabled`](HttpAuthProviderState::Disabled) — but its 401 still means *not signed in*
+/// rather than *broken*, and the whole point of the row is that it surfaces as `needs-auth` with
+/// the `/login` sentence instead of as a transport failure.
 #[must_use]
 pub fn on_unauthorized(
     state: &HttpAuthProviderState,
     challenge: Option<&str>,
+    provider_auth: bool,
 ) -> UnauthorizedAction {
     match state {
+        HttpAuthProviderState::Disabled if provider_auth => UnauthorizedAction::NeedsAuth,
         HttpAuthProviderState::Disabled => UnauthorizedAction::HardError,
         HttpAuthProviderState::ImplicitDeferred => {
             UnauthorizedAction::RetryOnce(HttpAuthProviderState::ImplicitChallenged {
@@ -4570,7 +4579,7 @@ mod tests {
         };
         let state = initial_http_auth_state(&implicit);
         assert_eq!(state, HttpAuthProviderState::ImplicitDeferred);
-        let promoted = match on_unauthorized(&state, Some("Bearer realm=\"x\"")) {
+        let promoted = match on_unauthorized(&state, Some("Bearer realm=\"x\""), false) {
             UnauthorizedAction::RetryOnce(next) => next,
             other => panic!("{other:?}"),
         };
@@ -4581,7 +4590,7 @@ mod tests {
             }
         );
         assert_eq!(
-            on_unauthorized(&promoted, None),
+            on_unauthorized(&promoted, None, false),
             UnauthorizedAction::NeedsAuth
         );
 
@@ -4594,7 +4603,7 @@ mod tests {
             HttpAuthProviderState::Explicit
         );
         assert_eq!(
-            on_unauthorized(&HttpAuthProviderState::Explicit, None),
+            on_unauthorized(&HttpAuthProviderState::Explicit, None, false),
             UnauthorizedAction::NeedsAuth
         );
 
@@ -4607,7 +4616,7 @@ mod tests {
             HttpAuthProviderState::Disabled
         );
         assert_eq!(
-            on_unauthorized(&HttpAuthProviderState::Disabled, None),
+            on_unauthorized(&HttpAuthProviderState::Disabled, None, false),
             UnauthorizedAction::HardError
         );
     }

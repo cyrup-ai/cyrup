@@ -157,7 +157,7 @@ fn help_lists_tui_mode_at_pis_position() {
     assert_eq!(r.code, 0, "stderr was: {}", r.stderr);
     assert!(
         r.stdout.contains(
-            "  --tui-mode <mode>              TUI mode: regular (default) or fullscreen\n"
+            "  --tui-mode <mode>              TUI mode: fullscreen (default) or regular\n"
         ),
         "stdout was: {}",
         r.stdout

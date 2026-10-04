@@ -248,7 +248,14 @@ pub struct App<B: Backend> {
     /// the top of `App::run`'s body consumes the request.
     frames: frames::FrameScheduler,
     /// The ADR-0005 §B-3 alternate-screen renderer while fullscreen mode is live — `None` for
-    /// regular mode, which is every session that never calls [`App::switch_tui_mode`].
+    /// regular mode, i.e. any session that has not called [`App::switch_tui_mode`].
+    ///
+    /// CFG-096 / TUI-135 — that is no longer the common case. `tuiMode` defaults to `fullscreen`
+    /// upstream (`settings-manager.ts:1349` @v1.0.0) and now in
+    /// [`cyrup_config::settings::EffectiveSettings::tui_mode`], so the composition root
+    /// (`crates/cyrup/src/interactive.rs`) calls `switch_tui_mode(Fullscreen, …)` on every boot
+    /// that does not opt out with `tuiMode: "regular"` or `--tui-mode regular`. A `None` here means
+    /// the user opted out, or the renderer refused (`ModeSwitch::RendererUnavailable`).
     ///
     /// An `Option` field rather than a `Box<dyn ViewportRenderer>` swap, for the reason
     /// [`crate::ViewportRenderer`]'s own scope note gives: `ratatui::Terminal` exposes no consuming

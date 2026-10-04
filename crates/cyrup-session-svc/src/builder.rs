@@ -348,8 +348,14 @@ fn http_proxy_overlay(proxy: Option<&str>) -> Option<cyrup_provider::ProviderEnv
     Some(overlay)
 }
 
-/// Pi's default active built-in tool names (sdk.ts:244).
-const DEFAULT_BUILTIN_TOOLS: [&str; 4] = ["read", "bash", "edit", "write"];
+/// Pi's default active built-in tool names.
+///
+/// CFG-097 — an ALIAS, not a copy. Upstream exported the baseline from the settings module as
+/// `DEFAULT_TOOL_NAMES` (`core/settings-manager.ts:215` @v1.0.0) and deleted `core/sdk.ts`'s local
+/// `defaultActiveToolNames` in favour of importing it (`sdk.ts:267`), precisely so the list the
+/// `defaultTools` resolver starts from and the list this selector falls back to cannot drift. The
+/// `use … as` keeps that single source while leaving every reader below spelled as before.
+use cyrup_config::DEFAULT_TOOL_NAMES as DEFAULT_BUILTIN_TOOLS;
 
 /// Every tool `ToolRegistry::with_builtins` installs (`cyrup-tools/src/registry.rs:53-100`).
 ///
@@ -1173,6 +1179,10 @@ impl SessionBuilder {
         // denylist. Absent all three, the initial built-in selection is the `defaultTools` setting
         // when configured (CFG-079, `settingsManager.getDefaultTools()` at sdk.ts:257) and pi's four
         // `defaultActiveToolNames` otherwise.
+        // CFG-097 — already RESOLVED by the getter: plain names have replaced the baseline and
+        // every `+name`/`-name` has been applied (`EffectiveSettings::default_tools`, pi
+        // `getDefaultTools` → `resolveDefaultTools`). `select_active_tools` therefore still sees a
+        // literal list of tool names, which is what upstream's `sdk.ts:261-263` sees too.
         let configured_default_tools = settings.effective().default_tools();
         let base_tools = select_active_tools(&visible, &cfg, configured_default_tools.as_deref());
         // pi `AgentSession._allowedToolNames` / `_excludedToolNames` (`sdk.ts:258-259` →
@@ -3213,6 +3223,42 @@ mod tests {
         assert_eq!(
             selected(&cfg, Some(&names(&["read", "no-such-tool"]))),
             names(&["read", "static_tool"])
+        );
+    }
+
+    /// CFG-097 — the reachable break, end to end: pi's own documented `"defaultTools":
+    /// ["+codemode"]` (`docs/settings.md:50`) must ADD to the baseline, not wipe it.
+    ///
+    /// This is the observed-at side of the resolution that `EffectiveSettings::default_tools` now
+    /// performs. Before it, the setting reached `select_active_tools` verbatim, no visible tool was
+    /// named `+grep`, and the session started with the extension tool and NOTHING else — a silent,
+    /// total loss of the default loadout from a documented config line.
+    #[test]
+    fn a_modifier_default_tools_setting_adds_to_the_baseline_at_the_selector() {
+        let cfg = super::SessionConfig::new("/tmp", "/tmp/agent");
+        let eff = |json: &str| {
+            cyrup_config::EffectiveSettings::from_settings(
+                cyrup_config::Settings::parse(json).unwrap(),
+            )
+        };
+
+        let added = eff(r#"{"defaultTools":["+grep"]}"#).default_tools();
+        assert_eq!(
+            selected(&cfg, added.as_deref()),
+            names(&["read", "write", "edit", "bash", "grep", "static_tool"])
+        );
+
+        let removed = eff(r#"{"defaultTools":["-bash"]}"#).default_tools();
+        assert_eq!(
+            selected(&cfg, removed.as_deref()),
+            names(&["read", "write", "edit", "static_tool"])
+        );
+
+        // Plain names still replace, so the pre-modifier contract is untouched.
+        let replaced = eff(r#"{"defaultTools":["grep","find"]}"#).default_tools();
+        assert_eq!(
+            selected(&cfg, replaced.as_deref()),
+            names(&["grep", "find", "static_tool"])
         );
     }
 

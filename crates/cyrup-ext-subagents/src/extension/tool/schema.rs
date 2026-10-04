@@ -98,6 +98,14 @@ fn sj_usage_budget_override() -> serde_json::Value {
     serde_json::json!({
         "type": "object",
         "additionalProperties": false,
+        // SUBA-151 — pi added `minProperties: 1` to this object in `71d042f0` (#2596, v0.74.0,
+        // `extension/schemas.ts`). The BEHAVIOUR was already here — dispatch refuses an empty
+        // block with `usageBudget must include tokens or costUsd.`
+        // ([`crate::exec::usage_budget::validate_usage_budget_config`], pi's own
+        // `validateUsageBudgetConfig`) — but the ADVERTISED schema admitted `{}`, and this crate's
+        // rule is that the schema and the dispatch agree. Without it a model is told `{}` is a
+        // legal argument and then refused for sending it.
+        "minProperties": 1,
         "properties": { "tokens": metric("token"), "costUsd": metric("cost (USD)") },
         "description": "Optional usage budget for this run, enforced against reported totals. Provide tokens and/or costUsd; reaching a hard limit ends the run."
     })
@@ -899,6 +907,25 @@ mod tests {
         assert!(props.contains_key("usageBudget"));
         let usage = &props["usageBudget"];
         assert_eq!(usage["additionalProperties"], serde_json::json!(false));
+        // SUBA-151 — pi `minProperties: 1` (`71d042f0`, #2596, v0.74.0). THE USER ACTION: a model
+        // sends `usageBudget: {}` because the schema said an all-optional object was legal, and
+        // dispatch then refuses the whole call with `usageBudget must include tokens or costUsd.`
+        // The advertised schema and the dispatch have to agree, and the dispatch is the one that
+        // is already right — so the schema stops advertising the shape it will refuse.
+        assert_eq!(
+            usage["minProperties"],
+            serde_json::json!(1),
+            "an empty usageBudget is refused at dispatch, so it must not be advertised as legal"
+        );
+        assert_eq!(
+            crate::exec::usage_budget::validate_usage_budget_config(
+                Some(&serde_json::json!({})),
+                "usageBudget"
+            )
+            .expect_err("an empty block is refused"),
+            "usageBudget must include tokens or costUsd.",
+            "the behaviour the schema now advertises"
+        );
         for metric in ["tokens", "costUsd"] {
             let shape = &usage["properties"][metric];
             assert_eq!(shape["additionalProperties"], serde_json::json!(false));

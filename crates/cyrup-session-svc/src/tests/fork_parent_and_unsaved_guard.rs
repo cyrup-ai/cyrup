@@ -15,12 +15,12 @@
 //!
 //! * **SEAM-056**, the persisted has-leaf branch. pi guards the reopen with an ACTIONABLE sentence:
 //!   `if (!existsSync(currentSessionFile)) { throw new Error("This session has not been saved yet.
-//!   Wait for the first assistant response before cloning or forking it."); }` (`:312-316`),
-//!   immediately above `SessionManager.open` at `:317`. cyrup went straight to
-//!   `SessionManager::open(&file)?`, so `/fork` or `/clone` before the first assistant response —
-//!   an ordinary user mistake, because cyrup defers the first file write until then — surfaced a
-//!   filesystem error naming an internal path, with no remedy. Over RPC that string is what a
-//!   client renders (`rpc.rs`'s `fork`/`clone` arms relay it verbatim).
+//!   Send a message before cloning or forking it."); }` (`:312`), immediately above
+//!   `SessionManager.open` at `:313`. cyrup went straight to `SessionManager::open(&file)?`, so
+//!   `/fork` or `/clone` before the session was ever written — an ordinary user mistake, because
+//!   cyrup defers the first file write — surfaced a filesystem error naming an internal path, with
+//!   no remedy. Over RPC that string is what a client renders (`rpc.rs`'s `fork`/`clone` arms relay
+//!   it verbatim). The sentence's wording moved with the save rule at v1.0.0 (`SESS-064`).
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -137,8 +137,8 @@ async fn forking_before_the_first_message_records_the_parent_session() {
 /// SEAM-056 — `/clone` (and `/fork` at a real leaf) on a persisted session whose file has not been
 /// written yet must produce pi's sentence, verbatim, not an IO error naming an internal path.
 ///
-/// The precondition is the one pi's own message describes: a session that has been prompted but has
-/// no assistant response yet, so cyrup's deferred first write has not happened.
+/// The precondition is the one pi's own message describes: a persisted session whose file is not on
+/// disk, so the reopen has nothing to open.
 ///
 /// RED before the fix: `SessionManager::open(&file)` was reached unguarded and the error was
 /// whatever the filesystem said. The assertion is on the exact text because that text is
@@ -173,8 +173,7 @@ async fn cloning_an_unwritten_persisted_session_gives_pis_actionable_sentence() 
     );
     assert_eq!(
         err.to_string(),
-        "This session has not been saved yet. Wait for the first assistant response before \
-         cloning or forking it.",
-        "the Display must be pi's sentence verbatim (agent-session-runtime.ts:313-315)"
+        "This session has not been saved yet. Send a message before cloning or forking it.",
+        "the Display must be pi's sentence verbatim (agent-session-runtime.ts:312 @v1.0.0)"
     );
 }

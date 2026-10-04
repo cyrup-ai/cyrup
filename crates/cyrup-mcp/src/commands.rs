@@ -99,6 +99,17 @@ pub fn show_status(state: &McpState, has_ui: bool) -> String {
     }
     let mut lines = vec!["MCP Server Status:".to_string(), String::new()];
     for (name, definition) in &state.config.mcp_servers {
+        // The block arm comes FIRST and is tested on the map, not on `disabled`
+        // (`commands.ts:161-165`) — a blocked project server IS disabled, and reporting the
+        // ordinary sentence for it would tell the user to run `/mcp enable`, which cannot help
+        // (MCP-591).
+        if let Some(block) = state.blocked_project_servers.get(name) {
+            lines.push(format!(
+                "\u{2298} {name}: {}",
+                crate::project_server_trust::describe_project_server_block(block.reason)
+            ));
+            continue;
+        }
         if definition.is_disabled() {
             lines.push(format!(
                 "\u{2298} {name}: disabled (run /mcp enable {name}, then /reload)"
@@ -951,6 +962,7 @@ mod tests {
             ui: None,
             open_browser: Arc::new(|_| async { Ok(()) }.boxed()),
             send_message: Arc::new(|_| {}),
+            blocked_project_servers: indexmap::IndexMap::new(),
         }))
     }
 
@@ -972,6 +984,7 @@ mod tests {
             resource_uri: None,
             ui_visibility: None,
             input_schema: None,
+            annotations: None,
         }
     }
 

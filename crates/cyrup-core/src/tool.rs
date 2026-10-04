@@ -38,6 +38,17 @@ pub struct ToolResult {
     /// loading WHERE in the transcript a tool definition first becomes available; adapters without
     /// that capability ignore it and use the normal tool list. Empty = absent on the wire.
     pub added_tool_names: Vec<String>,
+    /// Machine-readable result matching the tool's [`Tool::output_schema`], for programmatic
+    /// callers (Pi `AgentToolResult.structuredContent`, `agent/src/types.ts:429-433` @v1.0.0).
+    ///
+    /// **Not sent to the model**; [`Self::content`] remains the model-facing result. It is
+    /// runtime-only and is NOT persisted: pi's transcript `ToolResultMessage`
+    /// (`packages/ai/src/types.ts`) has no such field at v1.0.0, so a session file never carries
+    /// it. It reaches the `tool_execution_end.result` payload (pi emits `finalized.result`
+    /// verbatim, `agent-loop.ts`'s `emitToolExecutionEnd`) and a programmatic caller.
+    ///
+    /// `None` = absent, which is what every tool that returns only text produces. AGENT-045.
+    pub structured_content: Option<serde_json::Value>,
     /// Hint to stop the loop after this batch (func-02 §7.7); runtime-only, never persisted.
     /// Three-valued — see [`TerminateHint`] for what each value puts on the wire.
     pub terminate: TerminateHint,
@@ -198,6 +209,17 @@ pub trait Tool: Send + Sync {
     /// Human-readable label for the UI (Pi `ToolDefinition.label`, extensions/types.ts:438-439).
     /// Default `None` = the runtime falls back to the tool `name` (today's behavior).
     fn label(&self) -> Option<&str> {
+        None
+    }
+
+    /// JSON Schema of [`ToolResult::structured_content`] in successful results (Pi
+    /// `AgentTool.outputSchema`, `agent/src/types.ts:472-476` @v1.0.0, and the extension-side
+    /// `ToolDefinition.outputSchema`, `core/extensions/types.ts:586-589`).
+    ///
+    /// Upstream's own rule: *"Tools that declare it should always set `structuredContent`."* It is
+    /// a declaration ABOUT the structured half, so a tool that returns only text leaves it `None`
+    /// — the default, which is why every existing impl compiles unchanged. AGENT-045.
+    fn output_schema(&self) -> Option<&serde_json::Value> {
         None
     }
 

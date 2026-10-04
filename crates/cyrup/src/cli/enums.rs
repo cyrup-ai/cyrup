@@ -56,11 +56,14 @@ impl ThinkingArg {
     }
 }
 
-/// `--tui-mode <regular|fullscreen>` (pi `args.ts:180-192` @v0.84.1; the `TuiMode` type is
-/// `settings-manager.ts:36` @v0.84.1, re-exported from `pi-tui`). Upstream drift: the flag does not
-/// exist at v0.83.0, the tag cyrup ported — see ADR-0005, which decided cyrup DOES build the
-/// alternate-screen renderer, so the value is modelled in full here rather than being collapsed to a
-/// bool. `regular` is pi's documented default and is a working no-op.
+/// `--tui-mode <fullscreen|regular>` (pi `args.ts:326` @v1.0.0 — "TUI mode: fullscreen (default)
+/// or regular"; the `TuiMode` type is `settings-manager.ts:36`, re-exported from `pi-tui`).
+/// Upstream drift: the flag does not exist at v0.83.0, the tag cyrup ported — see ADR-0005, which
+/// decided cyrup DOES build the alternate-screen renderer, so the value is modelled in full here
+/// rather than being collapsed to a bool.
+///
+/// CFG-096 / TUI-135 — `fullscreen` is pi's documented DEFAULT as of v1.0.0 (`88ff80b98`), so
+/// `--tui-mode regular` is now the opt-out and `--tui-mode fullscreen` is the no-op.
 ///
 /// The ADR-0005 §A-2 interim that declined `fullscreen` at startup is GONE — deleted by work unit
 /// B-13, which is what the grep for its wording was planted to catch. Both values are now accepted
@@ -77,7 +80,8 @@ impl ThinkingArg {
 /// 1. this flag, when given, wins; otherwise
 /// 2. the persisted `tuiMode` key — `EffectiveSettings::tui_mode()`, ADR-0005 §A-3, already live in
 ///    `cyrup-config` and already offered by the `/settings` `TUI mode` row; otherwise
-/// 3. `regular`, which is pi's default and a working no-op.
+/// 3. `fullscreen`, which is pi's default since v1.0.0 (`settings-manager.ts:1349`); `regular` is
+///    reached only by an explicit `tuiMode: "regular"` or `--tui-mode regular`.
 ///
 /// The two `TuiMode` enums that step 1-vs-2 has to reconcile — this clap `ValueEnum` and
 /// `cyrup_config::settings::TuiMode` — carry the same two variants with the same lowercase
@@ -86,10 +90,11 @@ impl ThinkingArg {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 #[value(rename_all = "lower")]
 pub enum TuiMode {
-    /// The inline (main-screen) renderer — pi's default (`settings-manager.ts:1129` @v0.84.1).
+    /// The inline (main-screen) renderer. pi's default up to v0.87.x; since v1.0.0 it is the
+    /// opt-out (`settings-manager.ts:1349`).
     Regular,
-    /// The alternate-screen renderer (`tui-alt-screen.ts` @v0.84.1), built by ADR-0005 §Decision B
-    /// in `crates/cyrup-tui/src/altscreen/`.
+    /// The alternate-screen renderer (`tui-alt-screen.ts`), built by ADR-0005 §Decision B in
+    /// `crates/cyrup-tui/src/altscreen/`. pi's default since v1.0.0.
     Fullscreen,
 }
 

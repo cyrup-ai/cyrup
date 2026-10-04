@@ -1516,6 +1516,7 @@ mod tests {
                     enforce: Some(false),
                     strict: None,
                     allow: Some(vec!["profile/*".to_string()]),
+                    agents: None,
                 }),
                 ..Default::default()
             },

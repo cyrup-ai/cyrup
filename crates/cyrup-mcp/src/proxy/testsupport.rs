@@ -58,6 +58,18 @@ pub(crate) struct FakeEnv {
     pub(crate) approval: Mutex<Option<ApprovalOutcome>>,
     pub(crate) all_tools: Mutex<Option<Vec<String>>>,
     pub(crate) approval_required: Mutex<BTreeSet<String>>,
+    /// `state.manager`'s in-flight count per server, as the two accounting calls move it.
+    ///
+    /// MCP-600: this is the quantity [`crate::state::McpServerManager::is_idle`] reads, so its
+    /// value **while the approval gate is awaiting** decides whether an idle sweep may close the
+    /// server out from under an open approval dialog.
+    pub(crate) in_flight: Mutex<BTreeMap<String, i64>>,
+    /// The value of [`Self::in_flight`] for the gated server, sampled inside
+    /// `ensure_tool_call_approved` — i.e. what an idle check racing the dialog would see.
+    pub(crate) in_flight_at_approval: Mutex<Option<i64>>,
+    /// How many times `touch` ran before the approval gate was entered.
+    pub(crate) touches_at_approval: Mutex<Option<usize>>,
+    pub(crate) touches: AtomicUsize,
 }
 
 impl FakeEnv {
@@ -95,6 +107,19 @@ impl FakeEnv {
             Some(names.iter().map(|name| (*name).to_string()).collect());
         self
     }
+    /// The in-flight count recorded for `server`, after every accounting call has run.
+    pub(crate) fn in_flight_of(&self, server: &str) -> i64 {
+        self.in_flight
+            .lock()
+            .unwrap()
+            .get(server)
+            .copied()
+            .unwrap_or(0)
+    }
+    pub(crate) fn with_approval(self, outcome: ApprovalOutcome) -> Self {
+        *self.approval.lock().unwrap() = Some(outcome);
+        self
+    }
     pub(crate) fn with_approval_required(self, tool: &str) -> Self {
         self.approval_required
             .lock()
@@ -127,9 +152,25 @@ impl ProxyEnv for FakeEnv {
     async fn close(&self, server: &str) {
         self.connections.lock().unwrap().remove(server);
     }
-    fn touch(&self, _server: &str) {}
-    fn increment_in_flight(&self, _server: &str) {}
-    fn decrement_in_flight(&self, _server: &str) {}
+    fn touch(&self, _server: &str) {
+        self.touches.fetch_add(1, Ordering::SeqCst);
+    }
+    fn increment_in_flight(&self, server: &str) {
+        *self
+            .in_flight
+            .lock()
+            .unwrap()
+            .entry(server.to_string())
+            .or_default() += 1;
+    }
+    fn decrement_in_flight(&self, server: &str) {
+        *self
+            .in_flight
+            .lock()
+            .unwrap()
+            .entry(server.to_string())
+            .or_default() -= 1;
+    }
     async fn call_tool(
         &self,
         _server: &str,
@@ -224,12 +265,23 @@ impl ProxyEnv for FakeEnv {
     }
     async fn ensure_tool_call_approved(
         &self,
-        _server: &str,
+        server: &str,
         _tool: &ToolMetadata,
         _arguments: &Value,
         _origin: ApprovalOrigin,
         _cancel: &CancelToken,
     ) -> ApprovalOutcome {
+        // MCP-600 — stand in for the idle sweep racing an open approval dialog: whatever the
+        // in-flight count is *here* is what `is_idle` would read while the user is deciding.
+        *self.in_flight_at_approval.lock().unwrap() = Some(
+            self.in_flight
+                .lock()
+                .unwrap()
+                .get(server)
+                .copied()
+                .unwrap_or(0),
+        );
+        *self.touches_at_approval.lock().unwrap() = Some(self.touches.load(Ordering::SeqCst));
         self.approval
             .lock()
             .unwrap()
@@ -273,6 +325,7 @@ pub(crate) fn ctx_with(
         ui: None,
         open_browser: Arc::new(|_| Box::pin(async { Ok(()) })),
         send_message: Arc::new(|_| {}),
+        blocked_project_servers: IndexMap::new(),
     }));
     {
         let mut slot = state.server_instructions.lock().unwrap();

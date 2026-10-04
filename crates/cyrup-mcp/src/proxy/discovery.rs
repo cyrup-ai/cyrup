@@ -178,7 +178,7 @@ pub fn execute_list(ctx: &ProxyCtx, server: &str) -> ToolResult {
         );
     }
     if ctx.is_disabled(server) {
-        return disabled_result("list", server);
+        return disabled_result(ctx.blocked_project_servers(), "list", server);
     }
 
     let metadata: Option<Vec<ToolMetadata>> = ctx.with_metadata(|map| map.get(server).cloned());
@@ -301,7 +301,7 @@ pub fn execute_instructions(ctx: &ProxyCtx, server: &str) -> ToolResult {
         return not_found_result("instructions", server);
     }
     if ctx.is_disabled(server) {
-        return disabled_result("instructions", server);
+        return disabled_result(ctx.blocked_project_servers(), "instructions", server);
     }
 
     if let Some(instructions) = ctx
@@ -397,7 +397,7 @@ pub fn execute_describe(ctx: &ProxyCtx, tool_name: &str) -> ToolResult {
 
     let (Some(server_name), Some(tool_meta)) = (server_name, tool_meta) else {
         if let Some(disabled) = disabled_match {
-            return disabled_result("describe", &disabled);
+            return disabled_result(ctx.blocked_project_servers(), "describe", &disabled);
         }
         let suggestions = ctx.suggestions(tool_name, 5);
         let suggestion_text = if suggestions.is_empty() {
@@ -439,6 +439,14 @@ pub fn execute_describe(ctx: &ProxyCtx, tool_name: &str) -> ToolResult {
     text.push_str(&format!("Server: {server_name}\n"));
     if let Some(uri) = tool_meta.resource_uri.as_ref() {
         text.push_str(&format!("Type: Resource (reads from {uri})\n"));
+    }
+    // `const hints = formatToolHints(toolMeta); if (hints) text += ...` (`proxy-modes.ts:797-798`,
+    // MCP-601). `describe` is one of the two places upstream shows the hints at all — the other is
+    // the approval prompt — because they are the two places a decision is made. Search results and
+    // direct-tool descriptions stay unchanged.
+    let hints = crate::proxy::format_tool_hints(&tool_meta);
+    if !hints.is_empty() {
+        text.push_str(&format!("Hints: {hints}\n"));
     }
     let description = if tool_meta.description.is_empty() {
         "(no description)"
@@ -508,7 +516,7 @@ pub fn execute_search(
     if let Some(server) = server
         && ctx.is_disabled(server)
     {
-        return disabled_result("search", server);
+        return disabled_result(ctx.blocked_project_servers(), "search", server);
     }
 
     let global_prefix = ctx.config().tool_prefix();
@@ -1088,6 +1096,35 @@ mod tests {
         assert!(text_of(&miss).starts_with(
             "Tool \"totally_absent\" not found. Use mcp({ search: \"...\" }) to search."
         ));
+    }
+
+    /// MCP-601 — `describe` is one of the two places upstream shows the hints
+    /// (`proxy-modes.ts:797-798`), and the line sits between `Server:` and the description.
+    #[test]
+    fn describe_shows_the_servers_tool_hints() {
+        let config = config_with(&[("srv", stdio("a"))]);
+        let mut annotated = ToolMetadata::new("srv_wipe", "wipe", "Delete everything");
+        annotated.annotations = Some(crate::proxy::McpToolAnnotations {
+            destructive_hint: Some(true),
+            idempotent_hint: Some(false),
+            ..crate::proxy::McpToolAnnotations::default()
+        });
+        let plain = ToolMetadata::new("srv_ping", "ping", "Ping");
+        let (ctx, _) = ctx_with(
+            config,
+            &[("srv", vec![annotated, plain])],
+            &[],
+            FakeEnv::default(),
+        );
+        assert_eq!(
+            text_of(&execute_describe(&ctx, "srv_wipe")),
+            "srv_wipe\nServer: srv\nHints: destructive, not idempotent\n\nDelete everything\n\nNo parameters defined."
+        );
+        // An unannotated tool renders no `Hints:` line at all.
+        assert_eq!(
+            text_of(&execute_describe(&ctx, "srv_ping")),
+            "srv_ping\nServer: srv\n\nPing\n\nNo parameters defined."
+        );
     }
 
     #[test]

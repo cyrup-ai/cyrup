@@ -75,6 +75,9 @@ pub(super) fn create_slot(
                     name,
                     partial_json,
                     namespace,
+                    // Upstream opens the block WITH `partialJson` set
+                    // (`openai-responses-shared.ts:493`), i.e. unfinished.
+                    finished: false,
                 },
                 SlotKind::Tool,
             )

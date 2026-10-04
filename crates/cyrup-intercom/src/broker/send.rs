@@ -1156,6 +1156,92 @@ mod tests {
         );
     }
 
+    /// ICOM-072 — `provenance` is part of the AUTHORED field set
+    /// (`v0.13.0 broker/broker.ts:1043-1053`, `v0.16.0 broker/protocol.ts:164-176`), so a resend
+    /// that keeps the text but changes WHICH EXTENSION claims it is a reuse refusal, not a replay.
+    ///
+    /// Red before ICOM-072: [`DeliveryFingerprint`] omitted the field, so the second frame matched
+    /// the first's fingerprint, the first send's ack was replayed, and the new attribution was
+    /// silently dropped with the receiver never told.
+    #[test]
+    fn a_resend_that_changes_only_provenance_is_refused_not_replayed() {
+        let mut state = make_state();
+        let (a_tx, mut a_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (b_tx, mut b_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut a_sid = None;
+        let mut b_sid = None;
+        register_named(&mut state, 1, &mut a_sid, &a_tx, "a", "alice", "/w", 1_000);
+        register_named(&mut state, 2, &mut b_sid, &b_tx, "b", "bob", "/w", 1_000);
+        let _ = payloads(&mut a_rx);
+        let _ = payloads(&mut b_rx);
+
+        let authored = |extension: &str| {
+            json!({
+                "id": "m1",
+                "timestamp": 1,
+                "content": { "text": "ship it" },
+                "provenance": {
+                    "type": "extension_outbox",
+                    "extensionId": extension,
+                    "extensionName": extension,
+                    "requestId": "r1",
+                },
+            })
+        };
+
+        send_frame(
+            &mut state,
+            1,
+            &a_tx,
+            &mut a_sid,
+            "b",
+            authored("first-ext"),
+            1_100,
+        );
+        let first = payloads(&mut a_rx);
+        assert!(
+            first
+                .iter()
+                .any(|p| p["type"] == "delivered" && p["delivery"] == "socket_delivered"),
+            "the first send is delivered: {first:?}"
+        );
+        let delivered = payloads(&mut b_rx);
+        assert_eq!(
+            delivered
+                .iter()
+                .filter(|p| p["type"] == "message" && p["message"]["id"] == "m1")
+                .count(),
+            1,
+            "the receiver sees the first attribution once: {delivered:?}"
+        );
+
+        send_frame(
+            &mut state,
+            1,
+            &a_tx,
+            &mut a_sid,
+            "b",
+            authored("second-ext"),
+            1_200,
+        );
+        let reuse = payloads(&mut a_rx);
+        let failed = reuse
+            .iter()
+            .find(|p| p["type"] == "delivery_failed")
+            .unwrap_or_else(|| {
+                panic!("a changed provenance under a re-used id must be refused, got {reuse:?}")
+            });
+        assert_eq!(
+            failed["reason"],
+            "Message id was reused with different authored content"
+        );
+        assert_eq!(failed["code"], "E_MESSAGE_ID_REUSE");
+        assert!(
+            !payloads(&mut b_rx).iter().any(|p| p["type"] == "message"),
+            "and the second attribution is not delivered under the first send's id"
+        );
+    }
+
     /// ICOM-054 — two senders whose keys and ids both contain `:` must not collide, which is what
     /// upstream's `JSON.stringify([fromKey, messageId])` buys and a naive `from + ":" + id` would
     /// lose (`v0.13.0 broker/broker.ts:1055-1057`).

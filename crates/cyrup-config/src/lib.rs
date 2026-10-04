@@ -73,10 +73,11 @@ pub use paths::{
 pub use policy::NetworkPolicy;
 pub use provider_compose::{ConfiguredApiKeyAuth, compose_provider_registry};
 pub use settings::{
-    CompactionSettings, DEFAULT_HTTP_IDLE_TIMEOUT_MS, DefaultProjectTrust, EffectiveSettings,
-    FileSettingsStore, InMemorySettingsStore, MermaidRenderingMode, PackageSource, RetrySettings,
-    Settings, SettingsManager, SettingsScope, SettingsStore, deep_merge, migrate_settings,
-    parse_http_idle_timeout_ms,
+    CompactionSettings, DEFAULT_HTTP_IDLE_TIMEOUT_MS, DEFAULT_TOOL_NAMES, DefaultProjectTrust,
+    EffectiveSettings, FileSettingsStore, InMemorySettingsStore, MermaidRenderingMode,
+    PackageSource, RetrySettings, Settings, SettingsManager, SettingsScope, SettingsStore,
+    deep_merge, deep_merge_settings, migrate_settings, parse_http_idle_timeout_ms,
+    resolve_default_tools,
 };
 pub use text::strip_bom;
 pub use trust::{

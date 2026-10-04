@@ -64,8 +64,8 @@ use super::pkce::generate_pkce;
 use super::query::{encode_query, parse_query};
 use super::random::random_uuid_v4;
 use super::{OAuthError, oauth_credential};
-use crate::auth::OAuthAuth;
 use crate::auth::types::{Credential, EnvAuthContext, ModelAuth};
+use crate::auth::{LoginOptions, OAuthAuth};
 use crate::error::AuthError;
 use cyrup_core::CancelToken;
 use std::time::Duration;
@@ -657,7 +657,11 @@ impl OAuthAuth for OpenRouterOAuth {
     }
 
     /// 1:1 port of `loginOpenRouter` (`openrouter.ts:242-299`, wired at `:304`).
-    async fn login(&self, interaction: &dyn AuthInteraction) -> Result<Credential, OAuthError> {
+    async fn login(
+        &self,
+        interaction: &dyn AuthInteraction,
+        _options: &LoginOptions,
+    ) -> Result<Credential, OAuthError> {
         self.run_login(interaction).await
     }
 
@@ -1099,7 +1103,10 @@ mod tests {
         let login = {
             let flow = flow.clone();
             let interaction = Arc::clone(&interaction);
-            tokio::spawn(async move { flow.login(interaction.as_ref()).await })
+            tokio::spawn(async move {
+                flow.login(interaction.as_ref(), &LoginOptions::default())
+                    .await
+            })
         };
 
         let authorize = await_auth_url(&interaction).await;
@@ -1169,7 +1176,7 @@ mod tests {
         )]));
 
         let cred = flow
-            .login(interaction.as_ref())
+            .login(interaction.as_ref(), &LoginOptions::default())
             .await
             .expect("login succeeds");
         match &cred {
@@ -1210,7 +1217,10 @@ mod tests {
         let server = FakeTokenServer::start(200, r#"{"key":"never-used"}"#);
         let flow = strategy_for(&server.url);
         let interaction = Arc::new(ScriptedInteraction::new(vec![Ok("   ".to_string())]));
-        let err = flow.login(interaction.as_ref()).await.unwrap_err();
+        let err = flow
+            .login(interaction.as_ref(), &LoginOptions::default())
+            .await
+            .unwrap_err();
         assert_eq!(err.to_string(), "Missing authorization code");
     }
 
@@ -1223,7 +1233,10 @@ mod tests {
         let login = {
             let flow = flow.clone();
             let interaction = Arc::clone(&interaction);
-            tokio::spawn(async move { flow.login(interaction.as_ref()).await })
+            tokio::spawn(async move {
+                flow.login(interaction.as_ref(), &LoginOptions::default())
+                    .await
+            })
         };
         let callback_url = callback_url_of(&await_auth_url(&interaction).await);
 
@@ -1258,7 +1271,10 @@ mod tests {
         let login = {
             let flow = flow.clone();
             let interaction = Arc::clone(&interaction);
-            tokio::spawn(async move { flow.login(interaction.as_ref()).await })
+            tokio::spawn(async move {
+                flow.login(interaction.as_ref(), &LoginOptions::default())
+                    .await
+            })
         };
         let callback_url = callback_url_of(&await_auth_url(&interaction).await);
         let _ = tokio::task::spawn_blocking(move || {
@@ -1281,7 +1297,10 @@ mod tests {
         let login = {
             let flow = flow.clone();
             let interaction = Arc::clone(&interaction);
-            tokio::spawn(async move { flow.login(interaction.as_ref()).await })
+            tokio::spawn(async move {
+                flow.login(interaction.as_ref(), &LoginOptions::default())
+                    .await
+            })
         };
         let callback_url = callback_url_of(&await_auth_url(&interaction).await);
 
@@ -1315,7 +1334,10 @@ mod tests {
         let login = {
             let flow = flow.clone();
             let interaction = Arc::clone(&interaction);
-            tokio::spawn(async move { flow.login(interaction.as_ref()).await })
+            tokio::spawn(async move {
+                flow.login(interaction.as_ref(), &LoginOptions::default())
+                    .await
+            })
         };
         let callback_url = callback_url_of(&await_auth_url(&interaction).await);
 
@@ -1352,7 +1374,10 @@ mod tests {
         );
         let login = {
             let interaction = Arc::clone(&interaction);
-            tokio::spawn(async move { flow.login(interaction.as_ref()).await })
+            tokio::spawn(async move {
+                flow.login(interaction.as_ref(), &LoginOptions::default())
+                    .await
+            })
         };
         let _ = await_auth_url(&interaction).await;
         token.cancel();

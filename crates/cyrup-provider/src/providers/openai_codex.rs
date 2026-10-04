@@ -153,7 +153,11 @@ pub fn openai_codex_provider_with(
 ) -> WireProvider {
     WireProvider::new(
         OPENAI_CODEX_PROVIDER_ID,
-        "OpenAI Codex",
+        // PROV-118 (e) — `02eed88fd` renamed this provider to `"OpenAI Codex (legacy)"`
+        // (`providers/openai-codex.ts:10`), which is how `/login` tells it apart from the new
+        // "Sign in with ChatGPT" option on the plain `openai` provider. The OAuth strategy's own
+        // name is unchanged: still `"OpenAI (ChatGPT Plus/Pro)"` (`:14`).
+        "OpenAI Codex (legacy)",
         openai_codex_models(),
         openai_codex_auth(),
         store,
@@ -844,7 +848,9 @@ mod tests {
     fn provider_matches_the_upstream_factory() {
         let provider = openai_codex_provider();
         assert_eq!(provider.id().as_str(), "openai-codex");
-        assert_eq!(provider.name(), "OpenAI Codex");
+        // PROV-118 (e) — `"OpenAI Codex (legacy)"` as of v1.0.0 (`openai-codex.ts:10`); this
+        // asserted `"OpenAI Codex"`, the v0.87.1 name.
+        assert_eq!(provider.name(), "OpenAI Codex (legacy)");
         assert_eq!(provider.models().len(), 8);
 
         let auth = provider.provider_auth().expect("codex declares auth");

@@ -568,6 +568,18 @@ impl StringRecord {
     pub fn unhashable(&self) -> Option<&str> {
         self.unhashable.as_deref()
     }
+
+    /// Every member exactly as written, non-string ones included — `definition.env` itself.
+    ///
+    /// The one consumer is the metadata-cache identity's literal arm
+    /// (`env: literalEnv ? definition.env : interpolateEnvRecord(definition.env, environment)`,
+    /// `metadata-cache.ts:118`, `MCP-594`). That arm does not call `interpolateEnvRecord`, so it
+    /// does not throw on a member [`Self::values`] could not take: upstream hashes `{"A":1}` as
+    /// `{"A":1}`. Every other reader wants [`Self::values`].
+    #[must_use]
+    pub fn raw(&self) -> &BTreeMap<String, RawJson> {
+        &self.raw
+    }
 }
 
 impl std::ops::Deref for StringRecord {
@@ -642,6 +654,7 @@ pub struct McpConfig {
 /// The all-`None` settings block every accessor falls back to, so
 /// [`McpConfig::settings_or_default`] can hand out a reference without allocating.
 static EMPTY_SETTINGS: McpSettings = McpSettings {
+    project_servers: None,
     tool_prefix: None,
     show_status_icon: None,
     mcp_footer_status: None,
@@ -796,6 +809,22 @@ pub struct ServerEntry {
         skip_serializing_if = "Option::is_none"
     )]
     pub env: Option<StringRecord>,
+    /// `inheritEnv?: boolean` (`types.ts:447` @ v5.0.0, upstream `7a7b01b` / #514) — whether a
+    /// **stdio** child inherits the adapter process environment. Absent and `true` are the same
+    /// thing; only an explicit `false` turns inheritance off.
+    ///
+    /// **Read here by the digest only.** `inheritEnv: false` is not yet honoured at spawn —
+    /// `MCP-553` owns that half, and until it lands a server fenced off from the parent environment
+    /// still receives it. The field is present because the metadata-cache identity hashes
+    /// `definition.inheritEnv !== false` for every stdio server (`metadata-cache.ts:120`,
+    /// `MCP-594`), so without it flipping the key would not evict the server's cached tools and the
+    /// stale list would be served forever (`MCP-595` having removed the age limit).
+    #[serde(
+        default,
+        deserialize_with = "lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub inherit_env: Option<bool>,
     /// Working directory, `resolveConfigPath`'d (interpolation + `~`); falls back to the session
     /// cwd.
     #[serde(
@@ -942,13 +971,15 @@ pub struct ServerEntry {
         skip_serializing_if = "Option::is_none"
     )]
     pub search_keywords: Option<IndexMap<String, Vec<String>>>,
-    /// Which of this server's tools skip the approval prompt. Present beats the global.
+    /// Which of this server's tools prompt before they run. Present beats the global — including
+    /// a present `false`. See [`ApproveTools`]; an unparseable value lands in
+    /// [`ApproveTools::Other`] and makes the gate answer `true` (MCP-602).
     #[serde(
         default,
         deserialize_with = "lenient",
         skip_serializing_if = "Option::is_none"
     )]
-    pub approve_tools: Option<BoolOrList>,
+    pub approve_tools: Option<ApproveTools>,
     /// `true` ⇒ the child's stderr is **inherited** (visible in the terminal); `false`/absent ⇒
     /// piped. rmcp's `TokioChildProcessBuilder` defaults to `Stdio::inherit()`, so the port sets
     /// `.stderr(Stdio::piped())` on the `false` arm rather than the other way round.
@@ -1066,6 +1097,18 @@ impl ServerEntry {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct McpSettings {
+    /// `settings.projectServers` (`types.ts:605` @ v5.0.0, `5d645df` / #681) — the admission policy
+    /// for project-local MCP servers that have not been approved (MCP-591).
+    ///
+    /// Default `"ask"`. **User-global config only:** [`ConfigContext::load`] strips the key from a
+    /// project-scoped source with upstream's own warning, because a policy a project file could set
+    /// would let the project approve itself.
+    #[serde(
+        default,
+        deserialize_with = "lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub project_servers: Option<ProjectServerPolicy>,
     /// Default `"server"`. How every direct tool is named.
     #[serde(
         default,
@@ -1157,13 +1200,13 @@ pub struct McpSettings {
         skip_serializing_if = "Option::is_none"
     )]
     pub collapsed_result_lines: Option<u8>,
-    /// Global approval policy; a present per-server value wins.
+    /// Global approval policy; a present per-server value wins. See [`ApproveTools`] (MCP-602).
     #[serde(
         default,
         deserialize_with = "lenient",
         skip_serializing_if = "Option::is_none"
     )]
-    pub approve_tools: Option<BoolOrList>,
+    pub approve_tools: Option<ApproveTools>,
     /// Default `false`, tested `!== true` — the proxy tool survives unless this is literally
     /// `true`. **If HA-1 (late tool registration) is not built, this must be treated as
     /// unsupported**: on a cold cache the proxy tool is the *only* model-facing surface.
@@ -1409,7 +1452,7 @@ impl McpSettings {
     /// `definition.approveTools !== undefined ? definition.approveTools : settings.approveTools`
     /// and *presence* is what wins.
     #[must_use]
-    pub fn approve_tools(&self) -> Option<&BoolOrList> {
+    pub fn approve_tools(&self) -> Option<&ApproveTools> {
         self.approve_tools.as_ref()
     }
 
@@ -1500,6 +1543,14 @@ impl McpSettings {
             self.trace.as_ref().and_then(|t| t.max_events),
             DEFAULT_MCP_TRACE_MAX_EVENTS,
         )
+    }
+
+    /// `settings?.projectServers ?? "ask"` — the admission policy for unapproved project servers
+    /// (MCP-591). `"ask"` is the default and is also what an unrecognised value degrades to,
+    /// because [`lenient`] drops it: a typo must not widen the gate.
+    #[must_use]
+    pub fn project_servers_policy(&self) -> ProjectServerPolicy {
+        self.project_servers.unwrap_or_default()
     }
 
     /// `settings?.authRequiredMessage` — the template, not the formatted text. Formatting is
@@ -1683,8 +1734,9 @@ impl<'de> Deserialize<'de> for ProtocolVersionSetting {
     }
 }
 
-/// `auth: "oauth" | "bearer" | false`. Untagged with a `bool` arm because only the literal `false`
-/// is legal — `true` is not a variant, it is a value the entry simply never satisfies.
+/// `auth: "oauth" | "bearer" | false | { provider: string }` (`types.ts:464` @ v5.0.0). Untagged
+/// with a `bool` arm because only the literal `false` is legal — `true` is not a variant, it is a
+/// value the entry simply never satisfies.
 ///
 /// # The third arm exists for the digest, and for nothing else
 ///
@@ -1708,8 +1760,98 @@ pub enum AuthMode {
     /// The literal `false` — and `true`, which is tolerated exactly as TypeScript's structural cast
     /// tolerates it and satisfies no read site.
     Disabled(bool),
+    /// `{ provider: "<name>" }` — send the named cyrup provider's OAuth token as this HTTP server's
+    /// bearer credential on every request (`c524196`, #767, v5.0.0; MCP-593).
+    ///
+    /// Listed **before** [`Other`](Self::Other) so an object carrying a non-empty string `provider`
+    /// lands here; every other object-shaped `auth` still falls through, and
+    /// [`to_server_entries`] is what turns such a value into the dropped-server warning upstream
+    /// produces for it.
+    Provider(ProviderAuth),
     /// Anything else the file contained, held **verbatim** for the digest and matched by nothing.
     Other(RawJson),
+}
+
+impl AuthMode {
+    /// `typeof auth === "object"` — **including `null` and an array**, as JS does.
+    ///
+    /// This is the gate `toServerEntries` (`config.ts:1341`) opens its provider ladder with, and the
+    /// `null` case is the one that makes the distinction load-bearing: `auth: null` is `typeof
+    /// "object"`, so upstream drops that server with `auth.provider must be a provider name`, while
+    /// `auth: "basic"` and `auth: 5` are kept and simply match nothing.
+    #[must_use]
+    pub fn is_object_like(&self) -> bool {
+        match self {
+            AuthMode::Provider(_) => true,
+            AuthMode::Other(raw) => {
+                matches!(raw, RawJson::Object(_) | RawJson::Array(_) | RawJson::Null)
+            }
+            AuthMode::Named(_) | AuthMode::Disabled(_) => false,
+        }
+    }
+
+    /// `typeof definition.auth === "object" ? definition.auth.provider : undefined`
+    /// (`server-manager.ts:1577`).
+    #[must_use]
+    pub fn provider(&self) -> Option<&str> {
+        match self {
+            AuthMode::Provider(auth) => Some(auth.provider()),
+            _ => None,
+        }
+    }
+}
+
+/// `{ provider: string }` — the object arm of [`AuthMode`], keeping the **whole** block beside the
+/// extracted name.
+///
+/// # Why the raw object is retained
+///
+/// `computeServerHash` folds `definition.auth` into the identity object verbatim
+/// (`metadata-cache.ts:132`), and `toServerEntries` stores the entry as it was written — so an
+/// `auth` object carrying a key this build does not read still reaches the digest. A variant holding
+/// only `provider` would re-serialise as `{"provider":"x"}` and move the digest of every such
+/// server off upstream's. This is [`StringRecord`]'s arrangement, for the same reason.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProviderAuth {
+    /// The non-empty provider name — `auth.provider`.
+    provider: String,
+    /// The block exactly as written, so [`Serialize`] is lossless and the digest is upstream's.
+    raw: RawObject,
+}
+
+impl ProviderAuth {
+    /// The provider name `/login <provider>` signs into.
+    #[must_use]
+    pub fn provider(&self) -> &str {
+        &self.provider
+    }
+}
+
+impl Serialize for ProviderAuth {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.raw.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for ProviderAuth {
+    /// An object whose `provider` is a **non-empty string**; everything else is an error, which in
+    /// an untagged position means the next variant gets its turn.
+    ///
+    /// `typeof auth.provider !== "string" || !auth.provider` (`config.ts:1207`, `:1343`) — the
+    /// emptiness test is upstream's own, and it is why `{ "provider": "" }` is not a provider
+    /// server but a dropped one.
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = RawObject::deserialize(deserializer)?;
+        let provider = raw
+            .get("provider")
+            .and_then(RawJson::as_str)
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| {
+                serde::de::Error::custom("auth.provider must be a non-empty provider name")
+            })?
+            .to_string();
+        Ok(Self { provider, raw })
+    }
 }
 
 /// The two named `auth` values.
@@ -1832,8 +1974,11 @@ pub enum OAuthGrantType {
     ClientCredentials,
 }
 
-/// `boolean | string[]` — `directTools` and `approveTools`. The distinction that matters is
-/// *presence*, not truthiness: a per-server value that exists at all overrides the global.
+/// `boolean | string[]` — `directTools`. The distinction that matters is *presence*, not
+/// truthiness: a per-server value that exists at all overrides the global.
+///
+/// `approveTools` shared this type until MCP-602 and now has its own, [`ApproveTools`]; that type's
+/// documentation says why the two cannot be one.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum BoolOrList {
@@ -1841,6 +1986,103 @@ pub enum BoolOrList {
     All(bool),
     /// An explicit name list.
     Named(Vec<String>),
+}
+
+/// `approveTools: boolean | "destructive" | string[]`, plus a catch-all that fails **closed**
+/// (MCP-602).
+///
+/// `types.ts:495` (per server) and `types.ts:670` (global) `@v5.0.0`, read as
+/// `isToolCallApprovalRequired` (`tool-approval.ts:25-44 @v5.0.0`) consumes them.
+///
+/// # Why this is not [`BoolOrList`]
+///
+/// Upstream's two types are not the same type — `directTools` is `boolean | string[] | "search"`
+/// and `approveTools` is `boolean | "destructive" | string[]` — and, the half that matters, the two
+/// consumers answer an unparseable value in **opposite directions**. `approveTools` feeds a security
+/// gate whose unparseable arm is upstream's `if (!Array.isArray(approval)) return true;`, while
+/// `directTools` feeds `resolve_direct_tool_filter`, where the same value is an ordinary
+/// `ToolFilter::Off`. Folding a `Destructive` and a catch-all into [`BoolOrList`] would hand both
+/// variants to `directTools`, where neither has a meaning, and would make that filter's exhaustive
+/// match pick one by accident.
+///
+/// # The catch-all is the fix, and keeping [`lenient`] is the constraint
+///
+/// Every field in this module is read through [`lenient`], which degrades a type mismatch to `None`
+/// because upstream's `validateConfig` *cannot* fail a file on a wrong-typed field — see that
+/// function's own documentation. For `approveTools` that degradation was a fail-**open**: `None` is
+/// indistinguishable from absent, and absent means "never ask". So `"approveTools": "destructive"`,
+/// the value v5.0.0's README documents for precisely the user who wants to be asked, matched neither
+/// the bool nor the list variant and switched approval **off** for every tool on that server. A typo
+/// such as `"approveTools": "all"` did the same thing, silently.
+///
+/// [`ApproveTools::Other`] keeps [`lenient`]'s guarantee — the file still loads and every other
+/// server survives — while making the mismatch *visible* to the gate, which is what lets the gate
+/// answer `true`. [`validate_config`] additionally names the key in a [`ConfigDiagnostic`], which is
+/// the port's form of upstream's compile-time rejection of such a value in an adapter config file.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ApproveTools {
+    /// `true` — ask before every tool on this scope. `false` — never ask, and a per-server `false`
+    /// beats a global `true` because presence is what wins.
+    All(bool),
+    /// `"destructive"` — ask unless the tool is a resource read or the server marked it harmless.
+    Destructive,
+    /// A glob-or-exact name list. A non-string member is dropped rather than poisoning the whole
+    /// value, which is `matchesToolPattern`'s own
+    /// `if (typeof pattern !== "string") continue;` (`types.ts:1049 @v5.0.0`) — upstream still
+    /// treats such an array as an array, so it must not reach [`Self::Other`].
+    Named(Vec<String>),
+    /// Anything else: a typo'd string, a number, an object, an explicit `null`. Upstream's
+    /// `if (!Array.isArray(approval)) return true;` requires approval for every one of these, and
+    /// the raw value is kept so a config rewrite gives the user's bytes back unchanged.
+    Other(RawJson),
+}
+
+impl ApproveTools {
+    /// The one string literal the type admits.
+    pub const DESTRUCTIVE: &'static str = "destructive";
+
+    /// Classify a parsed JSON value. Total by construction: every shape upstream's type does not
+    /// admit lands in [`Self::Other`].
+    #[must_use]
+    pub fn from_raw(raw: RawJson) -> Self {
+        match raw {
+            RawJson::Bool(value) => Self::All(value),
+            RawJson::String(text) if text == Self::DESTRUCTIVE => Self::Destructive,
+            RawJson::Array(items) => Self::Named(
+                items
+                    .iter()
+                    .filter_map(|item| item.as_str().map(str::to_string))
+                    .collect(),
+            ),
+            other => Self::Other(other),
+        }
+    }
+
+    /// `false` only for [`Self::Other`] — the values that earn a load-time diagnostic and require
+    /// approval.
+    #[must_use]
+    pub fn is_recognized(&self) -> bool {
+        !matches!(self, Self::Other(_))
+    }
+}
+
+impl Serialize for ApproveTools {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::All(value) => serializer.serialize_bool(*value),
+            Self::Destructive => serializer.serialize_str(Self::DESTRUCTIVE),
+            Self::Named(list) => list.serialize(serializer),
+            Self::Other(raw) => raw.serialize(serializer),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ApproveTools {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // Through [`RawJson`] rather than an `untagged` derive: the derive has no way to pin the
+        // `"destructive"` literal, and its failure mode is an error, not a catch-all.
+        Ok(Self::from_raw(RawJson::deserialize(deserializer)?))
+    }
 }
 
 /// `outputGuard: boolean | {maxBytes, maxLines, detailsMaxBytes}`.
@@ -2035,6 +2277,94 @@ pub struct LoadedConfig {
     pub config: McpConfig,
     /// Named diagnostics, in discovery order.
     pub diagnostics: Vec<ConfigDiagnostic>,
+    /// `LoadedMcpConfig.projectServers` (`config.ts:426`) — every server whose definition came from
+    /// a **project** source, with the file it came from (MCP-591).
+    ///
+    /// This is the input to [`crate::project_server_trust::apply_project_server_trust`], and the
+    /// only thing that distinguishes a server the user put in their own config from one a cloned
+    /// repository put in the checkout. Five routes populate it: a project-scoped host config under
+    /// `hostConfigDiscovery`, a project-scoped ladder rung's own servers, that rung's **imports**
+    /// (project-scoped even when they read home-level files), a user rung's import that resolved to
+    /// a cwd-relative candidate, and the Agent Plugins a project source's `agentPluginPaths` named.
+    ///
+    /// `[CYRUP-DELTA]` — upstream smuggles this past `loadMcpConfig`'s `McpConfig` return type on a
+    /// non-enumerable `Symbol.for("pi-mcp-adapter/config-source-metadata")` property and reads it
+    /// back with `asLoadedConfig`, so a caller holding only an `McpConfig` can still recover it.
+    /// Rust has no such back channel and needs none: this is a typed field on the load's own
+    /// return, [`load_mcp_config_with_sources`] is the accessor, and `asLoadedConfig`'s
+    /// `?? new Map()` fallback — the case where the metadata was lost — is unrepresentable rather
+    /// than merely unused. Full parity: every upstream read of the symbol is a read of this field.
+    pub project_servers: IndexMap<String, ProjectServerSource>,
+    /// `LoadedMcpConfig.projectServerPolicy` — the merged `settings.projectServers`, which only a
+    /// user-global source may set.
+    pub project_server_policy: ProjectServerPolicy,
+}
+
+/// `stripProjectProviderAuth(config, projectServers)` (`config.ts:538`) — a cyrup provider's OAuth
+/// token goes **only** to servers from user-global config (MCP-593, unblocked by MCP-591).
+///
+/// A project file that defines or overrides a server with `auth: { provider }` would otherwise be
+/// able to point a repository-supplied endpoint at the user's provider credential — which the
+/// `https`-or-loopback URL check narrows but does not prevent, because `https://attacker.example`
+/// passes it. So the server is **dropped entirely**, not merely unauthenticated, and it leaves the
+/// project set with it: there is nothing left for the trust gate to ask about.
+///
+/// The gate is `typeof auth === "object"`, so it catches a malformed object too — those are already
+/// dropped by [`to_server_entries`]'s own ladder, which is why only a *valid* provider server can
+/// reach here, and why the test for it uses one.
+fn strip_project_provider_auth(
+    config: &mut McpConfig,
+    project_servers: &mut IndexMap<String, ProjectServerSource>,
+    diagnostics: &mut Vec<ConfigDiagnostic>,
+    cwd: &Path,
+) {
+    let stripped: Vec<String> = project_servers
+        .keys()
+        .filter(|name| {
+            config
+                .mcp_servers
+                .get(*name)
+                .and_then(|entry| entry.auth.as_ref())
+                .is_some_and(AuthMode::is_object_like)
+        })
+        .cloned()
+        .collect();
+    if stripped.is_empty() {
+        return;
+    }
+    for name in &stripped {
+        let _ = config.mcp_servers.shift_remove(name);
+        let _ = project_servers.shift_remove(name);
+    }
+    let names = stripped
+        .iter()
+        .map(|name| format!("\"{name}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let message = format!(
+        "Ignoring MCP servers {names}: auth.provider is only allowed in user-global config, and \
+         project config defines or overrides them"
+    );
+    tracing::warn!("{message}");
+    diagnostics.push(ConfigDiagnostic {
+        // Upstream's warning names no path — the offending source is whichever project file
+        // defined or overrode the server, and there may be several. The diagnostic needs one, so it
+        // carries the cwd the project layer was read from.
+        path: cwd.to_path_buf(),
+        server: None,
+        message,
+    });
+}
+
+/// `ProjectServerSource` (`config.ts:420`) — which project file a server came from.
+///
+/// Carried into the approval prompt (`Project config: ${source.path}`) and into every
+/// [`crate::project_server_trust::ProjectServerBlock`], so a blocked server can say *which* file
+/// asked for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectServerSource {
+    /// The file the definition was read from.
+    pub path: PathBuf,
 }
 
 /// `getConfigPathFromArgv(argv)` — `utils.ts`.
@@ -2129,7 +2459,11 @@ pub fn validate_config(
                 .collect()
         })
         .unwrap_or_default();
-    let settings = root.get("settings").and_then(raw_to::<McpSettings>);
+    let raw_settings = root.get("settings");
+    let settings = raw_settings.and_then(raw_to::<McpSettings>);
+    if let Some(raw_settings) = raw_settings {
+        warn_unrecognized_approve_tools(raw_settings, "`settings`", path, None, diagnostics);
+    }
     McpConfig {
         mcp_servers: servers,
         settings,
@@ -2210,12 +2544,155 @@ pub fn to_server_entries(
             });
             continue;
         }
+        warn_unrecognized_approve_tools(
+            raw_entry,
+            &format!("MCP server \"{name}\""),
+            path,
+            Some(name),
+            diagnostics,
+        );
         // Cannot fail: the root is an object and every field is `lenient`.
         if let Some(entry) = raw_to::<ServerEntry>(raw_entry) {
+            if let Some(error) = provider_auth_entry_error(&entry) {
+                // `console.warn(\`Ignoring MCP server "${name}": ${error}\`)` (`config.ts:1348`) —
+                // and `continue`, so the server is gone rather than silently unauthenticated.
+                let message = format!(
+                    "Ignoring MCP server \"{name}\" in {}: {error}",
+                    path.display()
+                );
+                tracing::warn!("{message}");
+                diagnostics.push(ConfigDiagnostic {
+                    path: path.to_path_buf(),
+                    server: Some(name.clone()),
+                    message,
+                });
+                continue;
+            }
             out.insert(name.clone(), entry);
         }
     }
     out
+}
+
+/// `toServerEntries`' `auth.provider` ladder (`config.ts:1341-1350`) — `Some(reason)` when the
+/// entry must be **dropped**, in upstream's order (MCP-593).
+///
+/// 1. `typeof provider !== "string" || !provider` ⇒ `auth.provider must be a provider name`. The
+///    gate above it is `typeof auth === "object"`, which is true of `null` and of an array too, so
+///    those reach this first rung rather than being ignored.
+/// 2. `typeof entry.url !== "string"` ⇒ `auth.provider requires a url`. A provider token is an HTTP
+///    credential; there is nowhere to put it on a stdio server.
+/// 3. A URL still carrying an unresolved `${VAR}` is **exempt** — upstream's comment: *"A URL with
+///    env references is checked once resolved, when it connects."* The connect-time re-check is
+///    [`crate::runtime::validate_provider_auth`], and it is not optional: without it an
+///    `http://evil.example` hidden behind `${MCP_HOST}` would never be checked at all.
+/// 4. Otherwise [`provider_auth_url_error`].
+fn provider_auth_entry_error(entry: &ServerEntry) -> Option<String> {
+    if !entry.auth.as_ref().is_some_and(AuthMode::is_object_like) {
+        return None;
+    }
+    if entry.auth.as_ref().and_then(AuthMode::provider).is_none() {
+        return Some("auth.provider must be a provider name".to_string());
+    }
+    let Some(url) = entry.url.as_deref() else {
+        return Some("auth.provider requires a url".to_string());
+    };
+    if !crate::credentials::missing_env_vars(url, &crate::credentials::process_env()).is_empty() {
+        return None;
+    }
+    provider_auth_url_error(url).map(str::to_string)
+}
+
+/// `providerAuthUrlError(url)` (`utils.ts:455`) — why a server must **not** receive its
+/// `auth.provider` token at `url`, or `None` when it may (MCP-593).
+///
+/// `https` anywhere, or `http` on exactly `localhost`, `127.0.0.1` or `[::1]`. Everything else —
+/// plain `http` to a remote host, a non-HTTP scheme, an unparseable URL — is refused, because the
+/// token being sent is the user's *provider* credential and a cleartext hop would disclose it.
+///
+/// The host comparison is against upstream's three literals and nothing else: `::1` unbracketed is
+/// not in the list, and neither is `127.0.0.2`, even though both are loopback. Widening it would be
+/// a security decision upstream has not made.
+#[must_use]
+pub fn provider_auth_url_error(url: &str) -> Option<&'static str> {
+    const REFUSED: &str =
+        "auth.provider requires an https URL, or http on localhost, 127.0.0.1, or [::1]";
+    let Ok(parsed) = url::Url::parse(url) else {
+        return Some(REFUSED);
+    };
+    if parsed.scheme() == "https" {
+        return None;
+    }
+    // `new URL(...).hostname` leaves an IPv6 literal BRACKETED, which is why `[::1]` and not
+    // `::1` is the spelling upstream compares against — and `url::Url::host_str` brackets it the
+    // same way, so the three literals transfer verbatim with no normalisation in between.
+    if parsed.scheme() == "http"
+        && parsed
+            .host_str()
+            .is_some_and(|host| matches!(host, "localhost" | "127.0.0.1" | "[::1]"))
+    {
+        return None;
+    }
+    Some(REFUSED)
+}
+
+/// `providerSignInMessage(serverName, provider)` (`utils.ts:450`) — the needs-sign-in text a
+/// provider-auth server gets **instead** of the MCP-OAuth one (MCP-593).
+///
+/// A provider server never signs in through MCP OAuth, so neither `/mcp-auth` nor
+/// `mcp({ action: "auth-start" })` can help it; the only route is `/login <provider>` followed by a
+/// reconnect. That is why this bypasses `settings.authRequiredMessage` entirely
+/// (`utils.ts:444` returns before the template is read): a template written for the OAuth flow would
+/// send the user somewhere that cannot work.
+#[must_use]
+pub fn provider_sign_in_message(server_name: &str, provider: &str) -> String {
+    format!(
+        "MCP server \"{server_name}\" needs sign-in. Run /login {provider}, then /mcp-adapter reconnect {server_name}."
+    )
+}
+
+/// `approveTools` carries a value this build cannot read — name the key (MCP-602).
+///
+/// Upstream rejects such a value in an adapter config file at the type level: `approveTools` is
+/// `boolean | "destructive" | string[]`, so a config file carrying anything else fails to compile
+/// with an error naming the key, and the commit that widened the type
+/// (`a4b3e90`, #731, `pi-mcp-adapter` v3.3.0; still the shape at the v5.0.0 pin) records exactly
+/// that — "Adapter config files with one
+/// are now rejected with a warning naming the key, and such values from other sources require
+/// approval." A JSONC file has no compiler, so the port says the same thing at load.
+///
+/// The entry is **not** dropped, which is the difference from the `socket` and `oauth` arms above.
+/// Upstream keeps the value and lets `isToolCallApprovalRequired` fail closed on it; dropping the
+/// entry here would instead let a lower-precedence definition of that server win, and that
+/// definition may carry no `approveTools` at all — turning a loud mistake back into a silent
+/// fail-open.
+fn warn_unrecognized_approve_tools(
+    raw: &RawJson,
+    scope: &str,
+    path: &Path,
+    server: Option<&str>,
+    diagnostics: &mut Vec<ConfigDiagnostic>,
+) {
+    let Some(value) = raw.get("approveTools") else {
+        return;
+    };
+    if ApproveTools::from_raw(value.clone()).is_recognized() {
+        return;
+    }
+    let rendered =
+        serde_json::to_string(value).unwrap_or_else(|_| "an unprintable value".to_string());
+    let message = format!(
+        "{scope} in {} sets `approveTools` to {rendered}, which is not `true`, `false`, \
+         \"destructive\", or a list of tool-name patterns; every tool in that scope now requires \
+         approval until it is corrected.",
+        path.display()
+    );
+    tracing::warn!("{message}");
+    diagnostics.push(ConfigDiagnostic {
+        path: path.to_path_buf(),
+        server: server.map(str::to_string),
+        message,
+    });
 }
 
 /// `readValidatedConfig(path, label)` — non-existent ⇒ `None`; a parse throw ⇒
@@ -2332,6 +2809,7 @@ pub fn merge_entry(base: Option<&ServerEntry>, over: &ServerEntry) -> ServerEntr
         command,
         args,
         env,
+        inherit_env,
         cwd,
         url,
         headers,
@@ -2363,6 +2841,9 @@ pub fn merge_entry(base: Option<&ServerEntry>, over: &ServerEntry) -> ServerEntr
         command: command.clone().or(base_entry.command),
         args: args.clone().or(base_entry.args),
         env: env.clone().or(base_entry.env),
+        // Not in the url-switch strip set above: upstream's url arm drops `inheritEnv` with the
+        // rest of the stdio block, and that whole strip set is `MCP-540`'s, not this field's.
+        inherit_env: inherit_env.or(base_entry.inherit_env),
         cwd: cwd.clone().or(base_entry.cwd),
         url: url.clone().or(base_entry.url),
         headers: headers.clone().or(base_entry.headers),
@@ -2441,6 +2922,7 @@ pub fn merge_settings(
     };
     let base = base.cloned().unwrap_or_default();
     Some(McpSettings {
+        project_servers: next.project_servers.or(base.project_servers),
         tool_prefix: next.tool_prefix.or(base.tool_prefix),
         show_status_icon: next.show_status_icon.or(base.show_status_icon),
         mcp_footer_status: next.mcp_footer_status.or(base.mcp_footer_status),
@@ -2496,6 +2978,14 @@ pub struct ImportedDocument {
     pub path: PathBuf,
     /// The parsed document.
     pub value: RawJson,
+    /// Whether the winning candidate is a **project** path (MCP-591).
+    ///
+    /// `const scope = candidate.startsWith(".") ? "project" : "user"`
+    /// (`config.ts:1002`) — a cwd-relative candidate is project-scoped, a home-relative one is
+    /// not. It decides whether the servers this document contributes need project-server approval,
+    /// and it is why the `opencode` family can be either: its two candidates differ in scope and
+    /// the one that won is the one that counts.
+    pub scope: SourceScope,
 }
 
 /// `IMPORT_PATHS[kind]`, resolved against a home directory and a cwd (`resolveImportCandidates`).
@@ -2505,31 +2995,66 @@ pub struct ImportedDocument {
 /// [`resolve_opencode_project_candidate`].
 #[must_use]
 pub fn resolve_import_candidates(kind: ImportKind, home: &Path, cwd: &Path) -> Vec<PathBuf> {
+    resolve_import_candidates_scoped(kind, home, cwd)
+        .into_iter()
+        .map(|candidate| candidate.path)
+        .collect()
+}
+
+/// One candidate path and whether it is project-scoped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportCandidate {
+    /// The resolved path.
+    pub path: PathBuf,
+    /// `candidate.startsWith(".") ? "project" : "user"` (`config.ts:1002`).
+    pub scope: SourceScope,
+}
+
+/// [`resolve_import_candidates`] with each candidate's scope (MCP-591).
+///
+/// The scope is a property of the **template**, not of the resolved path: upstream tests the raw
+/// `IMPORT_PATHS` entry for a leading `.`, so exactly the cwd-relative candidates — `vscode`'s
+/// `.vscode/mcp.json` and `opencode`'s `./opencode.json` — are project-scoped, and a home that
+/// happens to equal the cwd does not change that.
+#[must_use]
+pub fn resolve_import_candidates_scoped(
+    kind: ImportKind,
+    home: &Path,
+    cwd: &Path,
+) -> Vec<ImportCandidate> {
+    let user = |path: PathBuf| ImportCandidate {
+        path,
+        scope: SourceScope::Global,
+    };
+    let project = |path: PathBuf| ImportCandidate {
+        path,
+        scope: SourceScope::Project,
+    };
     match kind {
-        ImportKind::Cursor => vec![home.join(".cursor").join("mcp.json")],
+        ImportKind::Cursor => vec![user(home.join(".cursor").join("mcp.json"))],
         ImportKind::ClaudeCode => vec![
-            home.join(".claude").join("mcp.json"),
-            home.join(".claude.json"),
-            home.join(".claude").join("claude_desktop_config.json"),
+            user(home.join(".claude").join("mcp.json")),
+            user(home.join(".claude.json")),
+            user(home.join(".claude").join("claude_desktop_config.json")),
         ],
-        ImportKind::ClaudeDesktop => vec![
+        ImportKind::ClaudeDesktop => vec![user(
             home.join("Library")
                 .join("Application Support")
                 .join("Claude")
                 .join("claude_desktop_config.json"),
-        ],
+        )],
         ImportKind::Codex => {
             vec![
-                home.join(".codex").join("config.toml"),
-                home.join(".codex").join("config.json"),
+                user(home.join(".codex").join("config.toml")),
+                user(home.join(".codex").join("config.json")),
             ]
         }
         ImportKind::Opencode => vec![
-            home.join(".config").join("opencode").join("opencode.json"),
-            resolve_opencode_project_candidate(cwd),
+            user(home.join(".config").join("opencode").join("opencode.json")),
+            project(resolve_opencode_project_candidate(cwd)),
         ],
-        ImportKind::Windsurf => vec![home.join(".windsurf").join("mcp.json")],
-        ImportKind::Vscode => vec![resolve_from(cwd, ".vscode/mcp.json")],
+        ImportKind::Windsurf => vec![user(home.join(".windsurf").join("mcp.json"))],
+        ImportKind::Vscode => vec![project(resolve_from(cwd, ".vscode/mcp.json"))],
     }
 }
 
@@ -2601,38 +3126,50 @@ pub fn load_imported_config(
     warning_prefix: &str,
     diagnostics: &mut Vec<ConfigDiagnostic>,
 ) -> Option<ImportedDocument> {
-    let candidates = resolve_import_candidates(kind, home, cwd);
+    let candidates = resolve_import_candidates_scoped(kind, home, cwd);
 
     if kind == ImportKind::Opencode {
         let mut merged = IndexMap::new();
-        let mut highest: Option<PathBuf> = None;
-        for path in candidates {
-            if !path.exists() {
+        let mut highest: Option<ImportCandidate> = None;
+        for candidate in candidates {
+            if !candidate.path.exists() {
                 continue;
             }
-            match read_imported_config(&path) {
+            match read_imported_config(&candidate.path) {
                 Ok(value) => {
                     if let Some(entries) = value.as_object() {
                         merged = merge_opencode_configs(&merged, entries);
-                        highest = Some(path);
+                        highest = Some(candidate);
                     }
                 }
-                Err(error) => push_import_warning(&path, warning_prefix, &error, diagnostics),
+                Err(error) => {
+                    push_import_warning(&candidate.path, warning_prefix, &error, diagnostics);
+                }
             }
         }
-        return highest.map(|path| ImportedDocument {
-            path,
+        // The scope is the WINNING candidate's, which for `opencode` is the last existing one — so
+        // a project `./opencode.json` beside a home one makes the merged document project-scoped,
+        // and a home-only one does not (MCP-591).
+        return highest.map(|candidate| ImportedDocument {
+            path: candidate.path,
             value: RawJson::Object(merged),
+            scope: candidate.scope,
         });
     }
 
-    for path in candidates {
-        if !path.exists() {
+    for candidate in candidates {
+        if !candidate.path.exists() {
             continue;
         }
-        match read_imported_config(&path) {
-            Ok(value) => return Some(ImportedDocument { path, value }),
-            Err(error) => push_import_warning(&path, warning_prefix, &error, diagnostics),
+        match read_imported_config(&candidate.path) {
+            Ok(value) => {
+                return Some(ImportedDocument {
+                    path: candidate.path,
+                    value,
+                    scope: candidate.scope,
+                });
+            }
+            Err(error) => push_import_warning(&candidate.path, warning_prefix, &error, diagnostics),
         }
     }
     None
@@ -2951,10 +3488,48 @@ pub fn expand_imports(
     cwd: &Path,
     diagnostics: &mut Vec<ConfigDiagnostic>,
 ) -> McpConfig {
+    expand_imports_with_sources(config, home, cwd, diagnostics).config
+}
+
+/// `expandImports(config, cwd)`'s **whole** return — the config and where each imported server
+/// came from (`config.ts:971`, MCP-591).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExpandedImports {
+    /// What [`expand_imports`] returns on its own.
+    pub config: McpConfig,
+    /// One entry per server this expansion contributed, keyed by server name.
+    pub server_sources: IndexMap<String, ImportedServerSource>,
+}
+
+/// `ImportedServerSource` (`config.ts:430`) — the file one server was read from, and its scope.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportedServerSource {
+    /// The document the entry was read from.
+    pub path: PathBuf,
+    /// [`SourceScope::Project`] when the winning candidate was cwd-relative.
+    pub scope: SourceScope,
+}
+
+/// [`expand_imports`] with the per-server provenance (MCP-591).
+///
+/// The map records **first writer wins**, exactly as `importedServers[name]` does: a server named
+/// by two import families is attributed to the first family that supplied it, which is the one
+/// whose definition survives.
+#[must_use]
+pub fn expand_imports_with_sources(
+    config: &McpConfig,
+    home: &Path,
+    cwd: &Path,
+    diagnostics: &mut Vec<ConfigDiagnostic>,
+) -> ExpandedImports {
     if config.imports.is_empty() {
-        return config.clone();
+        return ExpandedImports {
+            config: config.clone(),
+            server_sources: IndexMap::new(),
+        };
     }
     let mut imported: IndexMap<String, ServerEntry> = IndexMap::new();
+    let mut server_sources: IndexMap<String, ImportedServerSource> = IndexMap::new();
     for raw_kind in &config.imports {
         let Some(kind) = ImportKind::parse(raw_kind) else {
             continue;
@@ -2969,13 +3544,26 @@ pub fn expand_imports(
             continue;
         };
         for (name, entry) in extract_servers(&document.value, kind, &document.path, diagnostics) {
-            imported.entry(name).or_insert(entry);
+            if imported.contains_key(&name) {
+                continue;
+            }
+            let _ = server_sources.insert(
+                name.clone(),
+                ImportedServerSource {
+                    path: document.path.clone(),
+                    scope: document.scope,
+                },
+            );
+            let _ = imported.insert(name, entry);
         }
     }
-    McpConfig {
-        mcp_servers: merge_server_maps(&imported, &config.mcp_servers),
-        settings: config.settings.clone(),
-        imports: config.imports.clone(),
+    ExpandedImports {
+        config: McpConfig {
+            mcp_servers: merge_server_maps(&imported, &config.mcp_servers),
+            settings: config.settings.clone(),
+            imports: config.imports.clone(),
+        },
+        server_sources,
     }
 }
 
@@ -2992,7 +3580,26 @@ pub fn load_discovered_host_configs(
     cwd: &Path,
     diagnostics: &mut Vec<ConfigDiagnostic>,
 ) -> McpConfig {
+    load_discovered_host_configs_with_sources(home, cwd, diagnostics).config
+}
+
+/// [`load_discovered_host_configs`] with the per-server provenance (MCP-591).
+///
+/// `loadDiscoveredHostConfigs` returns `{ config, serverSources }` and `loadMcpConfigWithSources`
+/// walks the map keeping the **project**-scoped entries, which is the first of the five routes a
+/// server can take into the project-server set.
+///
+/// LAST writer wins here, not first: the fold is `mergeConfigs(config, discovered)` in
+/// [`ImportKind::ALL`] order, so a later family's definition replaces an earlier one and the
+/// provenance has to follow it.
+#[must_use]
+pub fn load_discovered_host_configs_with_sources(
+    home: &Path,
+    cwd: &Path,
+    diagnostics: &mut Vec<ConfigDiagnostic>,
+) -> ExpandedImports {
     let mut config = McpConfig::default();
+    let mut server_sources: IndexMap<String, ImportedServerSource> = IndexMap::new();
     for kind in ImportKind::ALL {
         let Some(document) = load_imported_config(
             kind,
@@ -3004,6 +3611,15 @@ pub fn load_discovered_host_configs(
             continue;
         };
         let servers = extract_servers(&document.value, kind, &document.path, diagnostics);
+        for name in servers.keys() {
+            let _ = server_sources.insert(
+                name.clone(),
+                ImportedServerSource {
+                    path: document.path.clone(),
+                    scope: document.scope,
+                },
+            );
+        }
         config = merge_configs(
             &config,
             &McpConfig {
@@ -3012,7 +3628,10 @@ pub fn load_discovered_host_configs(
             },
         );
     }
-    config
+    ExpandedImports {
+        config,
+        server_sources,
+    }
 }
 
 // ===================================================================================================
@@ -3064,6 +3683,20 @@ pub enum SourceKind {
     Project,
     /// A shared file the adapter reads but never writes — its writes are redirected to `userPath`.
     Import,
+}
+
+/// `settings.projectServers: "ask" | "allow"` (`types.ts:605`) — MCP-591.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProjectServerPolicy {
+    /// The default: an unapproved project server is admitted only after the user approves it in a
+    /// trusted interactive session.
+    #[default]
+    Ask,
+    /// A **non-interactive** trusted session admits project servers without a prompt. Note the
+    /// `!ctx.hasUI` in upstream's gate (`project-server-trust.ts:204`): an interactive session
+    /// still asks, because there a human is there to be asked.
+    Allow,
 }
 
 /// `ConfigSourceSpec["scope"]`.
@@ -3376,15 +4009,44 @@ impl ConfigContext {
     /// Every read is defensive: a missing file is skipped, a malformed file warns and is skipped, a
     /// malformed entry is dropped while the file survives. That is what lets
     /// [`crate::extension::McpExtension`]'s `init` be infallible (MCP-003).
+    /// 4. **Project-server provenance** is recorded as the ladder runs (MCP-591) — see
+    ///    [`LoadedConfig::project_servers`] for the five routes. It is collected here and nowhere
+    ///    else, because only the loader knows which file a surviving definition came from; by the
+    ///    time the merge is done that information is gone.
     #[must_use]
     pub fn load(&self) -> LoadedConfig {
         let mut diagnostics = Vec::new();
+        let mut project_servers: IndexMap<String, ProjectServerSource> = IndexMap::new();
+        let mut project_server_policy = ProjectServerPolicy::Ask;
         let discovery = self.host_config_discovery(&mut diagnostics);
         let mut config = if discovery == HostConfigDiscovery::On {
-            load_discovered_host_configs(&self.home, self.dirs.cwd(), &mut diagnostics)
+            let discovered = load_discovered_host_configs_with_sources(
+                &self.home,
+                self.dirs.cwd(),
+                &mut diagnostics,
+            );
+            // Route 1. `for (const [name, source] of discoveredHost.serverSources) if (source.scope
+            // === "project") projectServers.set(name, { path: source.path })`.
+            for (name, source) in &discovered.server_sources {
+                if source.scope == SourceScope::Project {
+                    let _ = project_servers.insert(
+                        name.clone(),
+                        ProjectServerSource {
+                            path: source.path.clone(),
+                        },
+                    );
+                }
+            }
+            discovered.config
         } else {
             McpConfig::default()
         };
+
+        // `projectAgentPluginSource` — the project file that named `agentPluginPaths`, if any. Only
+        // the LAST such source counts, and a user-scoped source that names the key clears it:
+        // upstream's assignment is unconditional (`source.scope === "project" ? sourceRef :
+        // undefined`), so a user-global override of the paths makes the plugins user-scoped again.
+        let mut project_plugin_source: Option<ProjectServerSource> = None;
 
         for source in self.sources() {
             if !self.source_contributes(&source) {
@@ -3393,16 +4055,99 @@ impl ConfigContext {
             let Some(loaded) = read_validated_config(&source.read_path, &mut diagnostics) else {
                 continue;
             };
-            let expanded = expand_imports(&loaded, &self.home, self.dirs.cwd(), &mut diagnostics);
-            config = merge_configs(&config, &expanded);
+            let mut expanded =
+                expand_imports_with_sources(&loaded, &self.home, self.dirs.cwd(), &mut diagnostics);
+            let source_ref = ProjectServerSource {
+                path: source.read_path.clone(),
+            };
+            if expanded
+                .config
+                .settings
+                .as_ref()
+                .is_some_and(|settings| settings.agent_plugin_paths.is_some())
+            {
+                project_plugin_source =
+                    (source.scope == SourceScope::Project).then(|| source_ref.clone());
+            }
+            if source.scope == SourceScope::Project {
+                // Route 2 and route 3 at once: `for (const name of Object.keys(expanded.mcpServers))
+                // projectServers.set(name, sourceRef)` runs over the EXPANDED table, so a project
+                // file's imports are project-scoped even when they read home-level files.
+                for name in expanded.config.mcp_servers.keys() {
+                    let _ = project_servers.insert(name.clone(), source_ref.clone());
+                }
+                // `settings.projectServers` in a project config is ignored, with upstream's own
+                // warning: a policy the project could set would let the project approve itself.
+                if let Some(settings) = expanded.config.settings.as_mut()
+                    && settings.project_servers.take().is_some()
+                {
+                    let message = format!(
+                        "Ignoring settings.projectServers in project config {}; set it in the \
+                         user-global MCP config instead",
+                        source.read_path.display()
+                    );
+                    tracing::warn!("{message}");
+                    diagnostics.push(ConfigDiagnostic {
+                        path: source.read_path.clone(),
+                        server: None,
+                        message,
+                    });
+                }
+            } else if let Some(policy) = expanded
+                .config
+                .settings
+                .as_ref()
+                .and_then(|settings| settings.project_servers)
+            {
+                project_server_policy = policy;
+            }
+            // Route 4. A **user**-scoped rung whose import resolved to a cwd-relative candidate
+            // still contributed a project server, and this is the only loop that sees it. It runs
+            // for a project rung too, where it is a no-op: route 2 already named every one of them.
+            for (name, imported) in &expanded.server_sources {
+                if imported.scope == SourceScope::Project {
+                    let _ = project_servers.insert(
+                        name.clone(),
+                        ProjectServerSource {
+                            path: imported.path.clone(),
+                        },
+                    );
+                }
+            }
+            config = merge_configs(&config, &expanded.config);
         }
 
         let plugin_config = self.load_plugin_config(&config, &mut diagnostics);
+        // Route 5. `if (projectAgentPluginSource) for (const name of
+        // Object.keys(pluginConfig.mcpServers)) projectServers.set(name, projectAgentPluginSource)`
+        // — an Agent Plugin the *project* pointed at is a project server, however the plugin
+        // directory itself is laid out.
+        if let Some(plugin_source) = project_plugin_source {
+            for name in plugin_config.mcp_servers.keys() {
+                let _ = project_servers.insert(name.clone(), plugin_source.clone());
+            }
+        }
         config = merge_configs(&plugin_config, &config);
+
+        // A name that is in the project set but not in the merged table was outranked by a
+        // higher-precedence definition and is no longer a project server. Upstream has the same
+        // property by construction — `applyProjectServerTrust` skips a name with no definition
+        // (`project-server-trust.ts:200`) — and pruning here makes `project_servers` an accurate
+        // answer to "which of these servers came from the project" for every other reader too.
+        project_servers.retain(|name, _| config.mcp_servers.contains_key(name));
+
+        strip_project_provider_auth(
+            &mut config,
+            &mut project_servers,
+            &mut diagnostics,
+            self.dirs.cwd(),
+        );
 
         LoadedConfig {
             config,
             diagnostics,
+            project_servers,
+            project_server_policy,
         }
     }
 
@@ -3467,9 +4212,20 @@ impl ConfigContext {
 /// **This function cannot fail** — see [`ConfigContext::load`] and MCP-003.
 #[must_use]
 pub fn load_mcp_config(dirs: &McpDirs, explicit_path: Option<&Path>) -> McpConfig {
-    ConfigContext::new(dirs.clone(), explicit_path)
-        .load()
-        .config
+    load_mcp_config_with_sources(dirs, explicit_path).config
+}
+
+/// `loadMcpConfigWithSources(overridePath, cwd)` (`config.ts:450`) — the load **with** its
+/// project-server provenance (MCP-591).
+///
+/// Upstream's two entry points exist for a language reason: `loadMcpConfig` returns an `McpConfig`
+/// because every old caller expects one, and smuggles the provenance past the type on a
+/// non-enumerable `Symbol` property. In Rust the metadata is a field on [`LoadedConfig`], so this
+/// is the whole function and [`load_mcp_config`] is the projection — see
+/// [`LoadedConfig::project_servers`] for the `[CYRUP-DELTA]` that records it.
+#[must_use]
+pub fn load_mcp_config_with_sources(dirs: &McpDirs, explicit_path: Option<&Path>) -> LoadedConfig {
+    ConfigContext::new(dirs.clone(), explicit_path).load()
 }
 
 // ===================================================================================================
@@ -3515,27 +4271,94 @@ fn compact_json<T: Serialize>(value: &T) -> String {
     serde_json::to_string(value).unwrap_or_default()
 }
 
-/// `readRawConfigObject(filePath)` — missing ⇒ `{}`, unparseable ⇒ `{}`, non-object root ⇒ `{}`.
+/// `readRawConfigObject(filePath)` — absent ⇒ `{}`, empty ⇒ `{}`, **anything else that will not
+/// parse into an object is an error** (MCP-589).
 ///
-/// **Silently.** This is a *writer* helper, and upstream's bare `catch {}` here is deliberate:
-/// clobbering an unparseable file is the accepted cost of being able to write one at all. The user
-/// still sees what is about to happen, because [`build_config_write_preview`] renders the diff from
-/// `{}` — it announces the clobber rather than hiding it (MCP-099).
+/// **This reader fails closed, and it did not always.** Upstream's original was a bare
+/// `catch { return {} }`, on the reasoning that clobbering an unparseable file is the accepted cost
+/// of being able to write one at all; `319b161` (#693) reversed that decision, because the writer
+/// merges one change into the `{}` it was handed and then *renames the result over the original* —
+/// a hand-edited `mcp.json` with one bad escape loses every server, setting, import and comment in
+/// it, atomically, with nothing left to recover from. The mitigation the old doc comment cited —
+/// [`build_config_write_preview`] rendering the diff from `{}` (MCP-099) — is a preview the user has
+/// to read and recognise, and the non-interactive writers do not render it at all.
+///
+/// The existence gate is `lstat`, not `stat`: a **dangling symlink** must reach the read and fail
+/// there rather than be reported absent and then silently replaced by a regular file.
 ///
 /// Note this is *not* [`read_validated_config`]: no typing, no diagnostics, no `mcp-servers`
-/// normalisation. The two exist side by side on purpose.
-#[must_use]
-pub fn read_raw_config_object(path: &Path) -> RawObject {
-    if !path.exists() {
-        return RawObject::new();
+/// normalisation. The two exist side by side on purpose, and only this one may fail — module rule 4
+/// (`init` must never `Err`) is a constraint on the *read* ladder, not on the writers.
+///
+/// # Errors
+///
+/// [`McpError::Config`] carrying `Failed to read MCP config at <path>: <reason>`, where the reason
+/// is the I/O failure, the JSONC parse failure, or `top-level value must be an object`.
+pub fn read_raw_config_object(path: &Path) -> McpResult<RawObject> {
+    // `lstatSync(filePath, { throwIfNoEntry: false })` — `symlink_metadata` is the `lstat` of the
+    // pair, so it does not follow and a broken link reports present.
+    if std::fs::symlink_metadata(path).is_err() {
+        return Ok(RawObject::new());
     }
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return RawObject::new();
-    };
-    match parse_json_config(&text, &path.to_string_lossy()) {
-        Ok(RawJson::Object(entries)) => entries,
-        _ => RawObject::new(),
+    let text = std::fs::read_to_string(path).map_err(|error| config_read_error(path, &error))?;
+    if text.trim().is_empty() {
+        return Ok(RawObject::new());
     }
+    let parsed = parse_json_config(&text, &path.to_string_lossy())
+        .map_err(|error| config_read_error(path, &error))?;
+    match parsed {
+        RawJson::Object(entries) => Ok(entries),
+        _ => Err(config_read_error(
+            path,
+            &"top-level value must be an object",
+        )),
+    }
+}
+
+/// `` `Failed to read MCP config at ${filePath}: ${message}` `` — the wrapper
+/// [`read_raw_config_object`] puts around every one of its failures.
+///
+/// Upstream attaches the original as `cause`; [`McpError::Config`] has no source slot, so the inner
+/// text is interpolated instead. Nothing upstream reads `cause` off this error — it is rendered
+/// through `formatTerminalError`, which walks to the same text.
+fn config_read_error(path: &Path, message: &dyn std::fmt::Display) -> McpError {
+    McpError::Config(format!(
+        "Failed to read MCP config at {}: {message}",
+        path.display()
+    ))
+}
+
+/// `` `Failed to update MCP config at ${filePath}: ${detail}` `` — [`get_servers_object`] and
+/// [`get_config_imports`]'s shared head.
+///
+/// Note the verb: a malformed *document* is a read failure, a malformed `mcpServers` or `imports`
+/// **inside** a well-formed document is an update failure. Upstream splits them the same way, and
+/// the split is what tells the user whether the file parses at all.
+fn config_update_error(path: &Path, detail: &str) -> McpError {
+    McpError::Config(format!(
+        "Failed to update MCP config at {}: {detail}",
+        path.display()
+    ))
+}
+
+/// `assertScaffoldTargetAbsent(filePath)` — `319b161` (#693).
+///
+/// The scaffold writers do not read the file they are about to write, so [`read_raw_config_object`]
+/// cannot protect them: `{ "mcpServers": {} }` is written from a literal. This is the guard that
+/// stops a scaffold from being the one write that still clobbers. `lstat` again, so a symlink —
+/// dangling or not — counts as present.
+///
+/// # Errors
+///
+/// [`McpError::Config`] carrying `Cannot scaffold MCP config at <path>: file already exists`.
+fn assert_scaffold_target_absent(path: &Path) -> McpResult<()> {
+    if std::fs::symlink_metadata(path).is_ok() {
+        return Err(McpError::Config(format!(
+            "Cannot scaffold MCP config at {}: file already exists",
+            path.display()
+        )));
+    }
+    Ok(())
 }
 
 /// `writeRawConfigObject(filePath, raw)` — `mkdirSync(recursive)`, write `<path>.<pid>.tmp`, then
@@ -3578,18 +4401,79 @@ pub fn write_raw_config_object(path: &Path, raw: &RawObject) -> McpResult<()> {
     Ok(())
 }
 
-/// `getServersObject(raw)` — `raw.mcpServers ?? raw["mcp-servers"] ?? {}`, and `{}` again for any
-/// non-object value.
+/// `getServersObject(raw, filePath)` — `raw.mcpServers ?? raw["mcp-servers"] ?? {}`, and an **error**
+/// for a present-but-non-object value under either spelling (MCP-589).
+///
+/// It used to answer `{}` there, which meant a file whose `"mcpServers"` was a string, a list or an
+/// explicit `null` had its whole server table silently replaced by the one entry the writer was
+/// adding. `319b161` (#693) made it throw.
+///
+/// The test is presence, not truthiness — upstream's `Object.hasOwn(raw, key) && !isRecord(raw[key])`
+/// — so an explicit `"mcpServers": null` is reported rather than treated as absent. **Both** keys
+/// are checked, even though only the first present one is read, because `set_servers_object` deletes
+/// the hyphenated key on write: a bad `mcp-servers` beside a good `mcpServers` would otherwise be
+/// dropped without a word.
 ///
 /// Returns an owned map where upstream returns the live reference. Every caller's next move is
 /// `setServersObject(raw, servers)`, so the end state is identical; the clone is what makes the
 /// mutation explicit instead of spooky.
-#[must_use]
-pub fn get_servers_object(raw: &RawObject) -> RawObject {
-    match raw.get(SERVERS_KEY).or_else(|| raw.get(LEGACY_SERVERS_KEY)) {
-        Some(RawJson::Object(servers)) => servers.clone(),
-        _ => RawObject::new(),
+///
+/// # Errors
+///
+/// [`McpError::Config`] carrying `Failed to update MCP config at <path>: <key> must be an object`.
+pub fn get_servers_object(raw: &RawObject, path: &Path) -> McpResult<RawObject> {
+    for key in [SERVERS_KEY, LEGACY_SERVERS_KEY] {
+        match raw.get(key) {
+            None | Some(RawJson::Object(_)) => {}
+            Some(_) => {
+                return Err(config_update_error(
+                    path,
+                    &format!("{key} must be an object"),
+                ));
+            }
+        }
     }
+    Ok(
+        match raw.get(SERVERS_KEY).or_else(|| raw.get(LEGACY_SERVERS_KEY)) {
+            Some(RawJson::Object(servers)) => servers.clone(),
+            _ => RawObject::new(),
+        },
+    )
+}
+
+/// `getConfigImports(raw, filePath)` — `[]` for an absent `imports`, an **error** for anything that
+/// is not an array of strings (MCP-589).
+///
+/// The predecessor filtered non-strings out and carried on, so `"imports": "cursor"` and
+/// `"imports": [1]` both read as "no imports" and were then overwritten by the merged list — the
+/// user's own value destroyed without a message. `319b161` (#693) made it throw.
+///
+/// An *unknown* kind is still preserved, not rejected: the type test is `typeof value === "string"`
+/// and nothing more, so a config naming a host this build does not know round-trips through the
+/// writer untouched.
+///
+/// # Errors
+///
+/// [`McpError::Config`] carrying
+/// `Failed to update MCP config at <path>: imports must be an array of strings`.
+fn get_config_imports(raw: &RawObject, path: &Path) -> McpResult<Vec<String>> {
+    let Some(value) = raw.get("imports") else {
+        return Ok(Vec::new());
+    };
+    let RawJson::Array(items) = value else {
+        return Err(config_update_error(
+            path,
+            "imports must be an array of strings",
+        ));
+    };
+    items
+        .iter()
+        .map(|item| {
+            item.as_str()
+                .map(str::to_string)
+                .ok_or_else(|| config_update_error(path, "imports must be an array of strings"))
+        })
+        .collect()
 }
 
 /// `setServersObject(raw, servers)` — `delete raw["mcp-servers"]; raw.mcpServers = servers;`.
@@ -3741,24 +4625,34 @@ pub fn build_unified_diff(before_text: &str, after_text: &str) -> String {
 ///
 /// That is not a bug to fix in the port: the writer really does normalise the file, and a
 /// byte-accurate "before" would under-report what the write is about to do.
-#[must_use]
-pub fn build_config_write_preview(path: &Path, next_raw: &RawObject) -> ConfigWritePreview {
+///
+/// Since MCP-589 it can fail, because [`read_raw_config_object`] can: an unparseable file has no
+/// "before" side to render, and the panel says so through
+/// [`crate::ui::SetupPanel`]'s `Preview unavailable:` arm rather than previewing a diff from `{}`.
+///
+/// # Errors
+///
+/// Whatever [`read_raw_config_object`] returns for the existing file.
+pub fn build_config_write_preview(
+    path: &Path,
+    next_raw: &RawObject,
+) -> McpResult<ConfigWritePreview> {
     let existed = path.exists();
-    let before_raw = read_raw_config_object(path);
+    let before_raw = read_raw_config_object(path)?;
     let before_text = if existed {
         serialize_raw_object(&before_raw)
     } else {
         String::new()
     };
     let after_text = serialize_raw_object(next_raw);
-    ConfigWritePreview {
+    Ok(ConfigWritePreview {
         path: path.to_path_buf(),
         existed,
         changed: before_text != after_text,
         diff_text: build_unified_diff(&before_text, &after_text),
         before_text,
         after_text,
-    }
+    })
 }
 
 // ===================================================================================================
@@ -3823,14 +4717,17 @@ fn starter_raw() -> RawObject {
 /// server to an arbitrary shared file (a preset, or the RepoPrompt proposal).
 ///
 /// Called by [`crate::panel_host::SetupCallbacks`] for the RepoPrompt and known-server rows.
-#[must_use]
+///
+/// # Errors
+///
+/// Whatever [`read_raw_config_object`] or [`get_servers_object`] return for the target file.
 pub fn preview_shared_server_entry(
     path: &Path,
     server_name: &str,
     entry: &ServerEntry,
-) -> ConfigWritePreview {
-    let mut next_raw = read_raw_config_object(path);
-    let mut servers = get_servers_object(&next_raw);
+) -> McpResult<ConfigWritePreview> {
+    let mut next_raw = read_raw_config_object(path)?;
+    let mut servers = get_servers_object(&next_raw, path)?;
     servers.insert(server_name.to_string(), raw_from(entry));
     set_servers_object(&mut next_raw, servers);
     build_config_write_preview(path, &next_raw)
@@ -3848,8 +4745,8 @@ pub fn write_shared_server_entry(
     server_name: &str,
     entry: &ServerEntry,
 ) -> McpResult<PathBuf> {
-    let mut raw = read_raw_config_object(path);
-    let mut servers = get_servers_object(&raw);
+    let mut raw = read_raw_config_object(path)?;
+    let mut servers = get_servers_object(&raw, path)?;
     servers.insert(server_name.to_string(), raw_from(entry));
     set_servers_object(&mut raw, servers);
     write_raw_config_object(path, &raw)?;
@@ -3888,9 +4785,18 @@ pub fn write_direct_tools_config(
         ));
     }
 
+    // `for (const filePath of byPath.keys()) getServersObject(readRawConfigObject(filePath), filePath)`
+    // — `d3389d9` (#707). Every target is validated before **any** of them is written, so a second
+    // unparseable file cannot leave the first one already rewritten. The per-file read then happens
+    // again inside the write loop rather than being cached from this pass: two provenance paths can
+    // alias one file, and a stale copy would undo the earlier change.
+    for path in by_path.keys() {
+        get_servers_object(&read_raw_config_object(path)?, path)?;
+    }
+
     for (path, entries) in by_path {
-        let mut raw = read_raw_config_object(&path);
-        let mut servers = get_servers_object(&raw);
+        let mut raw = read_raw_config_object(&path)?;
+        let mut servers = get_servers_object(&raw, &path)?;
 
         for (name, value, prov) in entries {
             if prov.kind == SourceKind::Import {
@@ -3940,26 +4846,12 @@ impl ConfigContext {
     ) -> McpResult<ServerDisabledOverrideResult> {
         let file_path = self.project_override_path();
         let shown = file_path.display().to_string();
-        let mut raw = RawObject::new();
-
-        if file_path.exists() {
-            let text = std::fs::read_to_string(&file_path).map_err(|error| {
-                McpError::Config(format!(
-                    "Failed to read project MCP override at {shown}: {error}"
-                ))
-            })?;
-            let parsed = parse_json_config(&text, &shown).map_err(|error| {
-                McpError::Config(format!(
-                    "Failed to read project MCP override at {shown}: {error}"
-                ))
-            })?;
-            let Some(entries) = parsed.as_object() else {
-                return Err(McpError::Config(format!(
-                    "Failed to read project MCP override at {shown}: root value must be an object"
-                )));
-            };
-            raw = entries.clone();
-        }
+        // `d3389d9` (#707) deleted this writer's own `parseWritableConfigObject` try/catch and
+        // routed it through the shared reader, so an unparseable override now reports
+        // `Failed to read MCP config at …` and no longer has its own
+        // `Failed to read project MCP override at …` head. The two `Failed to UPDATE project MCP
+        // override at …` strings below are this writer's and stayed.
+        let mut raw = read_raw_config_object(&file_path)?;
 
         // `raw.mcpServers !== undefined ? "mcpServers" : raw["mcp-servers"] !== undefined ? … `.
         // Presence, not truthiness: an explicit `"mcpServers": null` selects that key and then fails
@@ -4203,16 +5095,23 @@ impl ConfigContext {
     ///
     /// Called by [`crate::ui::SetupPanelCallbacks::preview_imports`], from inside the setup
     /// panel's `render` on every frame.
-    #[must_use]
-    pub fn preview_compatibility_imports(&self, import_kinds: &[ImportKind]) -> ConfigWritePreview {
+    /// # Errors
+    ///
+    /// Whatever [`read_raw_config_object`], [`get_config_imports`] or [`get_servers_object`] return
+    /// for the adapter-owned global file.
+    pub fn preview_compatibility_imports(
+        &self,
+        import_kinds: &[ImportKind],
+    ) -> McpResult<ConfigWritePreview> {
         let target = self.user_path();
-        let mut next_raw = read_raw_config_object(&target);
-        let merged = merged_import_list(&next_raw, import_kinds);
+        let mut next_raw = read_raw_config_object(&target)?;
+        let current = get_config_imports(&next_raw, &target)?;
+        let merged = merged_import_list(&current, import_kinds);
         next_raw.insert(
             "imports".to_string(),
             RawJson::Array(merged.into_iter().map(RawJson::String).collect()),
         );
-        let servers = get_servers_object(&next_raw);
+        let servers = get_servers_object(&next_raw, &target)?;
         set_servers_object(&mut next_raw, servers);
         build_config_write_preview(&target, &next_raw)
     }
@@ -4230,9 +5129,9 @@ impl ConfigContext {
         import_kinds: &[ImportKind],
     ) -> McpResult<CompatibilityImportsResult> {
         let target = self.user_path();
-        let mut raw = read_raw_config_object(&target);
-        let current = current_import_list(&raw);
-        let merged = merged_import_list(&raw, import_kinds);
+        let mut raw = read_raw_config_object(&target)?;
+        let current = get_config_imports(&raw, &target)?;
+        let merged = merged_import_list(&current, import_kinds);
         // `merged.filter(kind => !currentImports.includes(kind))` — computed off the **deduped**
         // merged list, so a caller passing the same kind twice gets one entry back, not two.
         let mut added: Vec<ImportKind> = Vec::new();
@@ -4253,7 +5152,7 @@ impl ConfigContext {
             "imports".to_string(),
             RawJson::Array(merged.into_iter().map(RawJson::String).collect()),
         );
-        let servers = get_servers_object(&raw);
+        let servers = get_servers_object(&raw, &target)?;
         set_servers_object(&mut raw, servers);
         write_raw_config_object(&target, &raw)?;
         Ok(CompatibilityImportsResult {
@@ -4279,10 +5178,11 @@ impl ConfigContext {
     ///
     /// # Errors
     ///
-    /// Whatever [`write_raw_config_object`] returns for an unwritable target.
+    /// Whatever [`read_raw_config_object`] returns for an unparseable target, and whatever
+    /// [`write_raw_config_object`] returns for an unwritable one.
     pub fn enable_host_config_discovery(&self) -> McpResult<bool> {
         let target = self.user_path();
-        let mut raw = read_raw_config_object(&target);
+        let mut raw = read_raw_config_object(&target)?;
         let mut settings = match raw.get("settings") {
             Some(RawJson::Object(existing)) => existing.clone(),
             // A non-object `settings` is REPLACED, matching upstream's spread of a non-object into
@@ -4305,44 +5205,47 @@ impl ConfigContext {
         Ok(true)
     }
 
-    #[must_use]
-    pub fn preview_starter_project_config(&self) -> ConfigWritePreview {
-        build_config_write_preview(&self.project_path(), &starter_raw())
+    /// # Errors
+    ///
+    /// [`assert_scaffold_target_absent`]'s `Cannot scaffold MCP config at <path>: file already
+    /// exists`.
+    pub fn preview_starter_project_config(&self) -> McpResult<ConfigWritePreview> {
+        let target = self.project_path();
+        assert_scaffold_target_absent(&target)?;
+        build_config_write_preview(&target, &starter_raw())
     }
 
-    /// `writeStarterProjectConfig(cwd)` — writes `<cwd>/.mcp.json`, **clobbering** whatever was
-    /// there. Upstream does not merge here and neither does this: the caller is the setup panel,
-    /// which only offers the action when the file does not exist.
+    /// `writeStarterProjectConfig(cwd)` — writes `<cwd>/.mcp.json` from a literal, never a merge.
+    ///
+    /// Because it does not read the file, [`read_raw_config_object`] cannot protect it; since
+    /// `319b161` (#693) the protection is [`assert_scaffold_target_absent`] instead. The setup panel
+    /// only offers the action when the file does not exist, but that is the panel's judgement taken
+    /// a frame earlier, and this is the writer's own.
     ///
     /// Called by [`crate::ui::SetupPanelCallbacks::scaffold_project_config`].
+    ///
+    /// # Errors
+    ///
+    /// [`assert_scaffold_target_absent`]'s message, or whatever [`write_raw_config_object`] returns.
     pub fn write_starter_project_config(&self) -> McpResult<PathBuf> {
         let target = self.project_path();
+        assert_scaffold_target_absent(&target)?;
         write_raw_config_object(&target, &starter_raw())?;
         Ok(target)
     }
 }
 
-/// `Array.isArray(raw.imports) ? raw.imports.filter(isString) : []` — the file's current list,
-/// unvalidated (an unknown kind is preserved, exactly as upstream preserves it).
-fn current_import_list(raw: &RawObject) -> Vec<String> {
-    raw.get("imports")
-        .and_then(RawJson::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(|item| item.as_str().map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
 /// `[...new Set([...currentImports, ...importKinds])]` — first-seen order, deduplicated.
-fn merged_import_list(raw: &RawObject, import_kinds: &[ImportKind]) -> Vec<String> {
+///
+/// Takes the current list rather than the raw object since MCP-589: reading `imports` out of the
+/// document is [`get_config_imports`]'s job now, and it can fail, so the two callers do it once and
+/// pass the result in.
+fn merged_import_list(current: &[String], import_kinds: &[ImportKind]) -> Vec<String> {
     let requested: Vec<String> = import_kinds
         .iter()
         .map(|kind| kind.as_str().to_string())
         .collect();
-    merge_imports(&current_import_list(raw), &requested)
+    merge_imports(current, &requested)
 }
 
 // ===================================================================================================
@@ -5280,6 +6183,11 @@ mod tests {
                 .join(PROJECT_OVERRIDE_DIR)
                 .join(crate::dirs::MCP_CONFIG_FILE)
         }
+
+        /// `<cwd>/.mcp.json` — the project standard rung (MCP-591's fixtures).
+        fn project_path(&self) -> PathBuf {
+            self.context().project_path()
+        }
     }
 
     fn config_message(error: &McpError) -> String {
@@ -5300,8 +6208,8 @@ mod tests {
             "{\n  \"$schema\": \"https://example/schema.json\",\n  \"mcp-servers\": {\"a\": {\"command\": \"x\"}}\n}\n",
         );
 
-        let mut raw = read_raw_config_object(&path);
-        let servers = get_servers_object(&raw);
+        let mut raw = read_raw_config_object(&path).unwrap();
+        let servers = get_servers_object(&raw, &path).unwrap();
         assert!(servers.contains_key("a"), "the legacy key is still READ");
         set_servers_object(&mut raw, servers);
         write_raw_config_object(&path, &raw).unwrap();
@@ -5335,20 +6243,718 @@ mod tests {
         );
     }
 
+    // -- MCP-591 -----------------------------------------------------------------------------
+
     #[test]
-    fn unparseable_and_missing_files_read_as_empty_objects() {
+    fn the_loader_records_which_servers_came_from_the_project() {
+        let fixture = Fixture::new();
+        // A user-global rung and a project rung, each naming one server.
+        fixture.write(
+            &fixture.user_path(),
+            r#"{"mcpServers":{"mine":{"command":"a"}}}"#,
+        );
+        fixture.write(
+            &fixture.project_path(),
+            r#"{"mcpServers":{"theirs":{"command":"b"}}}"#,
+        );
+        let loaded = fixture.context().load();
+
+        assert_eq!(loaded.config.mcp_servers.len(), 2);
+        assert_eq!(
+            loaded.project_servers.keys().collect::<Vec<_>>(),
+            vec!["theirs"],
+            "only the project rung's server is a project server"
+        );
+        assert_eq!(
+            loaded.project_servers.get("theirs").expect("tracked").path,
+            fixture.project_path(),
+            "and it names the file that asked for it"
+        );
+        assert_eq!(loaded.project_server_policy, ProjectServerPolicy::Ask);
+    }
+
+    #[test]
+    fn a_project_rungs_imports_are_project_scoped_even_from_home() {
+        let fixture = Fixture::new();
+        // `cursor` resolves under HOME, so the file itself is not project-scoped…
+        fixture.write(
+            &fixture.home.join(".cursor").join("mcp.json"),
+            r#"{"mcpServers":{"imported":{"command":"c"}}}"#,
+        );
+        // …but a PROJECT config importing it makes the servers it contributes project-scoped,
+        // because the project decided to pull them in.
+        fixture.write(
+            &fixture.project_path(),
+            r#"{"mcpServers":{},"imports":["cursor"]}"#,
+        );
+        let loaded = fixture.context().load();
+        assert!(loaded.config.mcp_servers.contains_key("imported"));
+        assert_eq!(
+            loaded
+                .project_servers
+                .get("imported")
+                .expect("tracked")
+                .path,
+            fixture.project_path(),
+            "attributed to the project file, which is what upstream's `sourceRef` is"
+        );
+    }
+
+    #[test]
+    fn a_user_rungs_cwd_relative_import_is_still_a_project_server() {
+        let fixture = Fixture::new();
+        // `vscode` is `.vscode/mcp.json` under the CWD — a project path by the template test.
+        fixture.write(
+            &fixture.cwd.join(".vscode").join("mcp.json"),
+            r#"{"mcpServers":{"vs":{"command":"d"}}}"#,
+        );
+        fixture.write(
+            &fixture.user_path(),
+            r#"{"mcpServers":{},"imports":["vscode"]}"#,
+        );
+        let loaded = fixture.context().load();
+        assert!(loaded.config.mcp_servers.contains_key("vs"));
+        assert_eq!(
+            loaded.project_servers.get("vs").expect("tracked").path,
+            fixture.cwd.join(".vscode").join("mcp.json"),
+            "a user config importing a cwd-relative file still read it out of the checkout"
+        );
+    }
+
+    #[test]
+    fn host_discovery_records_only_its_project_scoped_families() {
+        let fixture = Fixture::new();
+        fixture.write(
+            &fixture.cwd.join(".vscode").join("mcp.json"),
+            r#"{"mcpServers":{"vs":{"command":"d"}}}"#,
+        );
+        fixture.write(
+            &fixture.home.join(".cursor").join("mcp.json"),
+            r#"{"mcpServers":{"cur":{"command":"e"}}}"#,
+        );
+        fixture.write(
+            &fixture.user_path(),
+            r#"{"settings":{"hostConfigDiscovery":"on"},"mcpServers":{}}"#,
+        );
+        let loaded = fixture.context().load();
+        assert!(loaded.config.mcp_servers.contains_key("vs"));
+        assert!(loaded.config.mcp_servers.contains_key("cur"));
+        assert_eq!(
+            loaded.project_servers.keys().collect::<Vec<_>>(),
+            vec!["vs"],
+            "`.vscode/mcp.json` is in the checkout; `~/.cursor/mcp.json` is not"
+        );
+    }
+
+    #[test]
+    fn project_servers_settings_is_user_global_only() {
+        let fixture = Fixture::new();
+        fixture.write(
+            &fixture.user_path(),
+            r#"{"settings":{"projectServers":"allow"},"mcpServers":{}}"#,
+        );
+        assert_eq!(
+            fixture.context().load().project_server_policy,
+            ProjectServerPolicy::Allow,
+            "a user-global source may set it"
+        );
+
+        // A PROJECT source may not: the key is ignored with upstream's own warning, and the merged
+        // settings must not carry it either — a policy the project could set would let the project
+        // approve itself.
+        fixture.write(
+            &fixture.project_path(),
+            r#"{"settings":{"projectServers":"allow"},"mcpServers":{}}"#,
+        );
+        fixture.write(&fixture.user_path(), r#"{"mcpServers":{}}"#);
+        let loaded = fixture.context().load();
+        assert_eq!(loaded.project_server_policy, ProjectServerPolicy::Ask);
+        assert_eq!(
+            loaded.config.settings_or_default().project_servers_policy(),
+            ProjectServerPolicy::Ask
+        );
+        let shown = fixture.project_path().display().to_string();
+        assert!(
+            loaded
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message
+                    == format!(
+                        "Ignoring settings.projectServers in project config {shown}; set it in the \
+                     user-global MCP config instead"
+                    )),
+            "{:?}",
+            loaded.diagnostics
+        );
+    }
+
+    #[test]
+    fn a_project_server_outranked_by_a_user_definition_is_no_longer_one() {
+        let fixture = Fixture::new();
+        fixture.write(
+            &fixture.project_path(),
+            r#"{"mcpServers":{"both":{"command":"project"}}}"#,
+        );
+        // `<agent_dir>/mcp.json` is the adapter-owned rung and outranks the project standard file.
+        fixture.write(
+            &fixture.user_path(),
+            r#"{"mcpServers":{"both":{"command":"user"}}}"#,
+        );
+        let loaded = fixture.context().load();
+        // The merge is per-field, so the project rung's definition can still be the one that wins
+        // its `command`; what the assertion pins is that the provenance follows the table.
+        assert!(loaded.config.mcp_servers.contains_key("both"));
+        assert!(
+            loaded.project_servers.contains_key("both"),
+            "still present in the table, so still a project server"
+        );
+
+        // A name the project asked for and that nothing kept is pruned.
+        let mut loaded = fixture.context().load();
+        let _ = loaded.config.mcp_servers.shift_remove("both");
+        loaded
+            .project_servers
+            .retain(|name, _| loaded.config.mcp_servers.contains_key(name));
+        assert!(loaded.project_servers.is_empty());
+    }
+
+    #[test]
+    fn a_project_config_cannot_point_provider_auth_at_its_own_endpoint() {
+        let fixture = Fixture::new();
+        fixture.write(
+            &fixture.project_path(),
+            r#"{"mcpServers":{"theirs":{"url":"https://attacker.example/mcp","auth":{"provider":"anthropic"}},"plain":{"url":"https://ok.example/mcp"}}}"#,
+        );
+        let loaded = fixture.context().load();
+
+        assert!(
+            !loaded.config.mcp_servers.contains_key("theirs"),
+            "the server is DROPPED, not merely unauthenticated: the URL check passes for              `https://attacker.example`"
+        );
+        assert!(
+            !loaded.project_servers.contains_key("theirs"),
+            "and it leaves the project set, so the trust gate has nothing to ask about"
+        );
+        assert!(
+            loaded.config.mcp_servers.contains_key("plain"),
+            "its neighbours are untouched"
+        );
+        assert!(
+            loaded
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message
+                    == "Ignoring MCP servers \"theirs\": auth.provider is only allowed in \
+                    user-global config, and project config defines or overrides them"),
+            "{:?}",
+            loaded.diagnostics
+        );
+
+        // The SAME entry in a user-global config is kept.
+        fixture.write(&fixture.project_path(), r#"{"mcpServers":{}}"#);
+        fixture.write(
+            &fixture.user_path(),
+            r#"{"mcpServers":{"mine":{"url":"https://ok.example/mcp","auth":{"provider":"anthropic"}}}}"#,
+        );
+        let loaded = fixture.context().load();
+        assert_eq!(
+            loaded
+                .config
+                .mcp_servers
+                .get("mine")
+                .and_then(|entry| entry.auth.as_ref())
+                .and_then(AuthMode::provider),
+            Some("anthropic")
+        );
+    }
+
+    #[test]
+    fn an_import_candidates_scope_follows_the_template_not_the_resolved_path() {
+        let home = Path::new("/h");
+        let cwd = Path::new("/c");
+        for (kind, expected) in [
+            (ImportKind::Cursor, SourceScope::Global),
+            (ImportKind::ClaudeCode, SourceScope::Global),
+            (ImportKind::ClaudeDesktop, SourceScope::Global),
+            (ImportKind::Codex, SourceScope::Global),
+            (ImportKind::Windsurf, SourceScope::Global),
+            (ImportKind::Vscode, SourceScope::Project),
+        ] {
+            for candidate in resolve_import_candidates_scoped(kind, home, cwd) {
+                assert_eq!(candidate.scope, expected, "{kind}");
+            }
+        }
+        // `opencode` is the one family with BOTH: the home file and the `./opencode.json`.
+        let opencode = resolve_import_candidates_scoped(ImportKind::Opencode, home, cwd);
+        assert_eq!(
+            opencode
+                .iter()
+                .map(|candidate| candidate.scope)
+                .collect::<Vec<_>>(),
+            vec![SourceScope::Global, SourceScope::Project]
+        );
+        // The path-only accessor still answers exactly what it did before.
+        assert_eq!(
+            resolve_import_candidates(ImportKind::Opencode, home, cwd),
+            opencode
+                .iter()
+                .map(|candidate| candidate.path.clone())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    // -- MCP-593 -----------------------------------------------------------------------------
+
+    #[test]
+    fn provider_auth_parses_into_its_own_variant_and_keeps_the_block_whole() {
+        let entry: ServerEntry = serde_json::from_str(
+            r#"{"url":"https://api.example/mcp","auth":{"provider":"anthropic","future":1}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            entry.auth.as_ref().and_then(AuthMode::provider),
+            Some("anthropic")
+        );
+        // The digest folds `definition.auth` in VERBATIM, so an unread key has to survive the
+        // round trip or every such server's hash moves off upstream's.
+        assert_eq!(
+            serde_json::to_string(&entry.auth).unwrap(),
+            r#"{"provider":"anthropic","future":1}"#
+        );
+
+        // `auth: { provider }` is NOT OAuth: `supportsOAuth` ends at `auth === undefined`.
+        assert!(!crate::oauth::supports_oauth(&entry));
+
+        // Everything that is not an object with a non-empty string `provider` still lands on
+        // `Other`, where it matches nothing.
+        for json in [
+            r#"{"auth":{"provider":""}}"#,
+            r#"{"auth":{"provider":5}}"#,
+            r#"{"auth":{}}"#,
+            r#"{"auth":null}"#,
+            r#"{"auth":[]}"#,
+            r#"{"auth":"basic"}"#,
+        ] {
+            let entry: ServerEntry = serde_json::from_str(json).unwrap();
+            assert!(
+                entry.auth.as_ref().and_then(AuthMode::provider).is_none(),
+                "{json}"
+            );
+        }
+
+        // `typeof auth === "object"` is JS's test, so `null` and an array ARE object-like and a
+        // string is not — which is what decides whether the server is dropped below.
+        for (json, object_like) in [
+            (r#"{"auth":{"provider":"x"}}"#, true),
+            (r#"{"auth":null}"#, true),
+            (r#"{"auth":[]}"#, true),
+            (r#"{"auth":{}}"#, true),
+            (r#"{"auth":"basic"}"#, false),
+            (r#"{"auth":"oauth"}"#, false),
+            (r#"{"auth":false}"#, false),
+            (r#"{"auth":5}"#, false),
+        ] {
+            let entry: ServerEntry = serde_json::from_str(json).unwrap();
+            assert_eq!(
+                entry.auth.as_ref().is_some_and(AuthMode::is_object_like),
+                object_like,
+                "{json}"
+            );
+        }
+    }
+
+    #[test]
+    fn provider_auth_url_error_is_https_or_loopback_http() {
+        for url in [
+            "https://api.example/mcp",
+            "https://127.0.0.1:8443/mcp",
+            "http://localhost:3000/mcp",
+            "http://127.0.0.1:3000/mcp",
+            "http://[::1]:3000/mcp",
+        ] {
+            assert_eq!(provider_auth_url_error(url), None, "{url}");
+        }
+        for url in [
+            "http://api.example/mcp",
+            "http://127.0.0.2:3000/mcp",
+            "http://sub.localhost/mcp",
+            "ws://localhost/mcp",
+            "not a url",
+            "",
+        ] {
+            assert_eq!(
+                provider_auth_url_error(url),
+                Some(
+                    "auth.provider requires an https URL, or http on localhost, 127.0.0.1, or [::1]"
+                ),
+                "{url}"
+            );
+        }
+    }
+
+    #[test]
+    fn to_server_entries_drops_a_misconfigured_provider_server() {
+        for (json, reason) in [
+            (
+                r#"{"url":"https://api.example/mcp","auth":{}}"#,
+                "auth.provider must be a provider name",
+            ),
+            (
+                r#"{"url":"https://api.example/mcp","auth":null}"#,
+                "auth.provider must be a provider name",
+            ),
+            (
+                r#"{"url":"https://api.example/mcp","auth":{"provider":""}}"#,
+                "auth.provider must be a provider name",
+            ),
+            (
+                r#"{"command":"x","auth":{"provider":"anthropic"}}"#,
+                "auth.provider requires a url",
+            ),
+            (
+                r#"{"url":"http://api.example/mcp","auth":{"provider":"anthropic"}}"#,
+                "auth.provider requires an https URL, or http on localhost, 127.0.0.1, or [::1]",
+            ),
+        ] {
+            let servers = parse_json_config(&format!("{{\"a\": {json}}}"), "mcp.json").unwrap();
+            let mut diagnostics = Vec::new();
+            let entries = to_server_entries(&servers, Path::new("/x/mcp.json"), &mut diagnostics);
+            assert!(entries.is_empty(), "the server must be dropped: {json}");
+            let diagnostic = diagnostics.first().expect("one diagnostic");
+            assert_eq!(diagnostics.len(), 1, "{json}");
+            assert_eq!(
+                diagnostic.message,
+                format!("Ignoring MCP server \"a\" in /x/mcp.json: {reason}"),
+                "{json}"
+            );
+        }
+
+        // Kept: a valid provider server, and one whose URL still holds `${VAR}` — upstream defers
+        // that one to connect time ("A URL with env references is checked once resolved").
+        for json in [
+            r#"{"url":"https://api.example/mcp","auth":{"provider":"anthropic"}}"#,
+            r#"{"url":"http://${MCP_HOST}/mcp","auth":{"provider":"anthropic"}}"#,
+            // Not object-like, so the ladder does not open at all.
+            r#"{"url":"http://api.example/mcp","auth":"basic"}"#,
+            r#"{"command":"x","auth":"bearer"}"#,
+        ] {
+            let servers = parse_json_config(&format!("{{\"a\": {json}}}"), "mcp.json").unwrap();
+            let mut diagnostics = Vec::new();
+            let entries = to_server_entries(&servers, Path::new("/x/mcp.json"), &mut diagnostics);
+            assert_eq!(entries.len(), 1, "the server must be kept: {json}");
+            assert!(
+                diagnostics.is_empty(),
+                "and reported clean: {json} -> {diagnostics:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_provider_server_is_told_to_login_not_to_run_mcp_auth() {
+        assert_eq!(
+            provider_sign_in_message("linear", "anthropic"),
+            "MCP server \"linear\" needs sign-in. Run /login anthropic, then /mcp-adapter reconnect linear."
+        );
+
+        let mut servers = IndexMap::new();
+        let _ = servers.insert(
+            "linear".to_string(),
+            serde_json::from_str::<ServerEntry>(
+                r#"{"url":"https://api.example/mcp","auth":{"provider":"anthropic"}}"#,
+            )
+            .unwrap(),
+        );
+        let _ = servers.insert(
+            "other".to_string(),
+            serde_json::from_str::<ServerEntry>(r#"{"url":"https://b.example/mcp"}"#).unwrap(),
+        );
+        // A configured template must NOT win for a provider server: it would point at a flow that
+        // cannot sign one in. `formatAuthRequiredMessage` returns before the template is read.
+        let config = McpConfig {
+            mcp_servers: servers,
+            settings: Some(McpSettings {
+                auth_required_message: Some("custom for ${server}".to_string()),
+                ..McpSettings::default()
+            }),
+            ..McpConfig::default()
+        };
+        assert_eq!(
+            crate::proxy::env::format_auth_required_message(&config, "linear", "the default"),
+            "MCP server \"linear\" needs sign-in. Run /login anthropic, then /mcp-adapter reconnect linear."
+        );
+        assert_eq!(
+            crate::proxy::env::format_auth_required_message(&config, "other", "the default"),
+            "custom for other",
+            "and every other server still reads the template"
+        );
+    }
+
+    // -- MCP-589 -----------------------------------------------------------------------------
+    //
+    // `319b161` (#693) and `d3389d9` (#707). The predecessor of this block asserted
+    // `"unparseable ⇒ {}, silently"`; upstream reversed that decision and these pin the reversal.
+
+    #[test]
+    fn absent_and_empty_files_read_as_empty_objects_but_nothing_else_does() {
         let fixture = Fixture::new();
         let path = fixture.user_path();
-        assert!(read_raw_config_object(&path).is_empty(), "missing ⇒ {{}}");
-        fixture.write(&path, "{{{");
         assert!(
-            read_raw_config_object(&path).is_empty(),
-            "unparseable ⇒ {{}}, silently"
+            read_raw_config_object(&path).unwrap().is_empty(),
+            "absent ⇒ {{}}"
         );
-        fixture.write(&path, "[1, 2]");
+        fixture.write(&path, "   \n\t\n");
         assert!(
-            read_raw_config_object(&path).is_empty(),
-            "a non-object root ⇒ {{}}"
+            read_raw_config_object(&path).unwrap().is_empty(),
+            "`text.trim() === \"\"` ⇒ {{}}, and whitespace counts as empty"
+        );
+    }
+
+    #[test]
+    fn an_unparseable_config_is_reported_and_left_byte_identical() {
+        let fixture = Fixture::new();
+        let path = fixture.user_path();
+        let original = "{\n  \"mcpServers\": {\"keep\": {\"command\": \"x\"}},\n  // a comment\n  \"trailing\": {{{\n";
+        fixture.write(&path, original);
+
+        let error = config_message(&read_raw_config_object(&path).unwrap_err());
+        assert!(
+            error.starts_with(&format!(
+                "Failed to read MCP config at {}: ",
+                path.display()
+            )),
+            "upstream's head, verbatim: {error}"
+        );
+
+        // The point of the row: every writer refuses rather than merging its one change into `{}`
+        // and renaming the result over the user's file.
+        let entry = ServerEntry {
+            command: Some("new".to_string()),
+            ..ServerEntry::default()
+        };
+        assert!(write_shared_server_entry(&path, "added", &entry).is_err());
+        assert!(fixture.context().enable_host_config_discovery().is_err());
+        assert!(
+            fixture
+                .context()
+                .ensure_compatibility_imports(&[ImportKind::Cursor])
+                .is_err()
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            original,
+            "the file on disk is byte-identical after every refused write"
+        );
+    }
+
+    #[test]
+    fn a_non_object_root_names_the_top_level_value() {
+        let fixture = Fixture::new();
+        let path = fixture.user_path();
+        fixture.write(&path, "[1, 2]");
+        assert_eq!(
+            config_message(&read_raw_config_object(&path).unwrap_err()),
+            format!(
+                "Failed to read MCP config at {}: top-level value must be an object",
+                path.display()
+            )
+        );
+    }
+
+    #[test]
+    fn a_non_object_server_table_is_an_update_failure_under_either_spelling() {
+        let fixture = Fixture::new();
+        let path = fixture.user_path();
+        let entry = ServerEntry {
+            command: Some("x".to_string()),
+            ..ServerEntry::default()
+        };
+
+        for (text, key) in [
+            ("{\"mcpServers\": \"nope\"}", SERVERS_KEY),
+            ("{\"mcpServers\": null}", SERVERS_KEY),
+            ("{\"mcpServers\": [1]}", SERVERS_KEY),
+            ("{\"mcp-servers\": 7}", LEGACY_SERVERS_KEY),
+        ] {
+            fixture.write(&path, text);
+            assert_eq!(
+                config_message(&write_shared_server_entry(&path, "added", &entry).unwrap_err()),
+                format!(
+                    "Failed to update MCP config at {}: {key} must be an object",
+                    path.display()
+                ),
+                "for {text}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                text,
+                "the server table is not silently replaced: {text}"
+            );
+        }
+
+        // A bad `mcp-servers` BESIDE a good `mcpServers` is still reported, because the write
+        // deletes the hyphenated key and would otherwise drop it without a word.
+        fixture.write(&path, "{\"mcpServers\": {}, \"mcp-servers\": 7}");
+        assert_eq!(
+            config_message(&write_shared_server_entry(&path, "added", &entry).unwrap_err()),
+            format!(
+                "Failed to update MCP config at {}: mcp-servers must be an object",
+                path.display()
+            )
+        );
+    }
+
+    #[test]
+    fn a_non_string_imports_list_is_an_update_failure() {
+        let fixture = Fixture::new();
+        let path = fixture.user_path();
+        let expected = format!(
+            "Failed to update MCP config at {}: imports must be an array of strings",
+            path.display()
+        );
+
+        for text in [
+            "{\"imports\": \"cursor\"}",
+            "{\"imports\": [1]}",
+            "{\"imports\": null}",
+            "{\"imports\": {}}",
+        ] {
+            fixture.write(&path, text);
+            let error = fixture
+                .context()
+                .ensure_compatibility_imports(&[ImportKind::Cursor])
+                .unwrap_err();
+            assert_eq!(config_message(&error), expected, "for {text}");
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                text,
+                "the user's own imports value is not overwritten: {text}"
+            );
+            assert!(
+                fixture
+                    .context()
+                    .preview_compatibility_imports(&[ImportKind::Cursor])
+                    .is_err(),
+                "the preview refuses on the same ground: {text}"
+            );
+        }
+
+        // An UNKNOWN kind is a string and stays legal, preserved through the write.
+        fixture.write(&path, "{\"imports\": [\"some-future-host\"]}");
+        fixture
+            .context()
+            .ensure_compatibility_imports(&[ImportKind::Cursor])
+            .unwrap();
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("some-future-host"),
+            "an unknown kind is preserved, not rejected"
+        );
+    }
+
+    #[test]
+    fn the_project_override_writer_reports_the_shared_read_failure() {
+        let fixture = Fixture::new();
+        let path = fixture.project_override();
+        fixture.write(&path, "{{{");
+        // `d3389d9` (#707) deleted this writer's own `Failed to read project MCP override at …`
+        // head and routed it through the shared reader.
+        let error = config_message(
+            &fixture
+                .context()
+                .write_project_server_disabled_override("a", true)
+                .unwrap_err(),
+        );
+        assert!(
+            error.starts_with(&format!(
+                "Failed to read MCP config at {}: ",
+                path.display()
+            )),
+            "got {error}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{{{");
+    }
+
+    #[test]
+    fn a_dangling_symlink_reaches_the_read_instead_of_reporting_absent() {
+        let fixture = Fixture::new();
+        let path = fixture.user_path();
+        // `existsSync` → `lstatSync(filePath, { throwIfNoEntry: false })`: `stat` follows and would
+        // call this absent, which is how a dotfiles symlink whose target is gone used to be
+        // replaced by a regular file without a word.
+        std::os::unix::fs::symlink(fixture.agent_dir.join("gone.json"), &path).unwrap();
+        assert!(!path.exists(), "`stat` says absent");
+        let error = config_message(&read_raw_config_object(&path).unwrap_err());
+        assert!(
+            error.starts_with(&format!(
+                "Failed to read MCP config at {}: ",
+                path.display()
+            )),
+            "but `lstat` says present and the read reports the failure: {error}"
+        );
+    }
+
+    #[test]
+    fn a_scaffold_refuses_a_target_that_already_exists() {
+        let fixture = Fixture::new();
+        let context = fixture.context();
+        let target = context.project_path();
+
+        // Absent: the preview and the write both work, and the write is what creates the file.
+        assert!(context.preview_starter_project_config().is_ok());
+        assert_eq!(context.write_starter_project_config().unwrap(), target);
+
+        let expected = format!(
+            "Cannot scaffold MCP config at {}: file already exists",
+            target.display()
+        );
+        assert_eq!(
+            config_message(&context.write_starter_project_config().unwrap_err()),
+            expected,
+            "the scaffold writes from a literal, so the reader cannot protect it"
+        );
+        assert_eq!(
+            config_message(&context.preview_starter_project_config().unwrap_err()),
+            expected
+        );
+    }
+
+    #[test]
+    fn a_direct_tools_write_validates_every_target_before_writing_any() {
+        let fixture = Fixture::new();
+        let good = fixture.user_path();
+        let bad = fixture.shared_global();
+        fixture.write(&good, "{\"mcpServers\": {\"a\": {\"command\": \"x\"}}}");
+        fixture.write(&bad, "{{{");
+
+        let mut changes: IndexMap<String, BoolOrList> = IndexMap::new();
+        changes.insert("a".to_string(), BoolOrList::All(true));
+        changes.insert("b".to_string(), BoolOrList::All(true));
+        let mut provenance: IndexMap<String, ServerProvenance> = IndexMap::new();
+        provenance.insert(
+            "a".to_string(),
+            ServerProvenance {
+                path: good.clone(),
+                kind: SourceKind::User,
+                import_kind: None,
+            },
+        );
+        provenance.insert(
+            "b".to_string(),
+            ServerProvenance {
+                path: bad.clone(),
+                kind: SourceKind::User,
+                import_kind: None,
+            },
+        );
+
+        assert!(
+            write_direct_tools_config(&changes, &provenance, &McpConfig::default()).is_err(),
+            "the unparseable second target refuses the whole write"
+        );
+        assert!(
+            !std::fs::read_to_string(&good).unwrap().contains("direct"),
+            "and the FIRST target is untouched, because every target is validated up front"
         );
     }
 
@@ -5389,7 +6995,7 @@ mod tests {
 
         let mut next = RawObject::new();
         next.insert(SERVERS_KEY.to_string(), RawJson::Object(RawObject::new()));
-        let preview = build_config_write_preview(&path, &next);
+        let preview = build_config_write_preview(&path, &next).unwrap();
 
         assert!(preview.existed);
         assert!(
@@ -5407,7 +7013,7 @@ mod tests {
 
         // A hyphenated key IS a change, because `setServersObject` normalises it.
         fixture.write(&path, "{\n  \"mcp-servers\": {}\n}\n");
-        let preview = build_config_write_preview(&path, &next);
+        let preview = build_config_write_preview(&path, &next).unwrap();
         assert!(preview.changed);
         assert!(preview.diff_text.contains("- ") && preview.diff_text.contains("+ "));
     }
@@ -5441,8 +7047,9 @@ mod tests {
             .write_project_server_disabled_override("foo", false)
             .unwrap();
         assert!(enabled.changed);
-        let raw = read_raw_config_object(&fixture.project_override());
-        let servers = get_servers_object(&raw);
+        let override_path = fixture.project_override();
+        let raw = read_raw_config_object(&override_path).unwrap();
+        let servers = get_servers_object(&raw, &override_path).unwrap();
         assert!(
             !servers.contains_key("foo"),
             "an empty entry is removed, not left as a husk"
@@ -5482,6 +7089,10 @@ mod tests {
         let path = fixture.project_override();
         let shown = path.display().to_string();
 
+        // The READ failure is no longer this writer's own: `d3389d9` (#707) routed it through
+        // `readRawConfigObject`, so the head is the shared one and the detail is
+        // `top-level value must be an object`, not `root value must be an object` (MCP-589). The
+        // three `… update project MCP override …` strings below are still this writer's.
         fixture.write(&path, "[]");
         assert_eq!(
             config_message(
@@ -5489,7 +7100,7 @@ mod tests {
                     .write_project_server_disabled_override("foo", true)
                     .unwrap_err()
             ),
-            format!("Failed to read project MCP override at {shown}: root value must be an object")
+            format!("Failed to read MCP config at {shown}: top-level value must be an object")
         );
 
         fixture.write(&path, "{\"mcpServers\": 5}");
@@ -5643,7 +7254,7 @@ mod tests {
             url: Some("https://x.example/mcp".to_string()),
             ..ServerEntry::default()
         };
-        let preview = preview_shared_server_entry(&starter, "x", &entry);
+        let preview = preview_shared_server_entry(&starter, "x", &entry).unwrap();
         assert!(preview.changed);
         write_shared_server_entry(&starter, "x", &entry).unwrap();
         let text = std::fs::read_to_string(&starter).unwrap();
@@ -6098,6 +7709,142 @@ mod tests {
             typed.idle_timeout.is_none(),
             "a wrong-typed FIELD degrades to None, not to an error"
         );
+    }
+
+    // -- MCP-602 -------------------------------------------------------------------------------
+
+    /// `approveTools` must pin every value `types.ts:495`/`:670 @v5.0.0` documents — `true`,
+    /// `false`, `"destructive"`, a pattern list — and must **remember** anything else instead of
+    /// degrading it to `None`. `None` is indistinguishable from absent, and absent means "never
+    /// ask", so the old `lenient`-over-`BoolOrList` reading turned `"destructive"` into the exact
+    /// opposite of what the user asked for.
+    #[test]
+    fn approve_tools_pins_every_documented_value_and_remembers_an_unreadable_one() {
+        let mut diagnostics = Vec::new();
+        let document = parse_json_config(
+            "{\"settings\":{\"approveTools\":\"destructive\"},\
+             \"mcpServers\":{\
+             \"asks\":{\"command\":\"a\",\"approveTools\":true},\
+             \"never\":{\"command\":\"n\",\"approveTools\":false},\
+             \"listed\":{\"command\":\"l\",\"approveTools\":[\"delete_*\",7]},\
+             \"typo\":{\"command\":\"t\",\"approveTools\":\"all\"}}}",
+            "test",
+        )
+        .unwrap();
+        let config = validate_config(&document, Path::new("test"), &mut diagnostics);
+
+        assert_eq!(
+            config.settings.as_ref().unwrap().approve_tools,
+            Some(ApproveTools::Destructive),
+            "`\"destructive\"` is a documented value; reading it as `None` disabled approval"
+        );
+        let value = |name: &str| {
+            config
+                .mcp_servers
+                .get(name)
+                .unwrap()
+                .approve_tools
+                .clone()
+                .unwrap()
+        };
+        assert_eq!(value("asks"), ApproveTools::All(true));
+        assert_eq!(value("never"), ApproveTools::All(false));
+        assert_eq!(
+            value("listed"),
+            ApproveTools::Named(vec!["delete_*".to_string()]),
+            "an array stays an array with its non-string members dropped, because \
+             `matchesToolPattern` skips a non-string pattern and still treats the value as a list"
+        );
+        assert_eq!(
+            value("typo"),
+            ApproveTools::Other(RawJson::String("all".to_string())),
+            "an unreadable value is remembered so the gate can fail CLOSED on it"
+        );
+        assert!(
+            config.mcp_servers.contains_key("typo"),
+            "the entry survives: dropping it would let a lower-precedence definition carrying no \
+             `approveTools` win, which is the fail-open all over again"
+        );
+    }
+
+    /// The load-time diagnostic names the key, names the value, and names the server (MCP-602) —
+    /// the port's stand-in for upstream rejecting such a value in an adapter config file at the
+    /// type level.
+    #[test]
+    fn an_unreadable_approve_tools_value_is_named_at_load() {
+        let mut diagnostics = Vec::new();
+        let document = parse_json_config(
+            "{\"settings\":{\"approveTools\":{\"ask\":true}},\
+             \"mcpServers\":{\
+             \"typo\":{\"command\":\"t\",\"approveTools\":\"all\"},\
+             \"fine\":{\"command\":\"f\",\"approveTools\":\"destructive\"}}}",
+            "test",
+        )
+        .unwrap();
+        let config = validate_config(&document, Path::new("test"), &mut diagnostics);
+        assert_eq!(
+            config
+                .mcp_servers
+                .get("fine")
+                .unwrap()
+                .approve_tools
+                .clone()
+                .unwrap(),
+            ApproveTools::Destructive,
+            "a readable value on a sibling server is untouched by the complaint"
+        );
+
+        let named: Vec<&ConfigDiagnostic> = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.message.contains("approveTools"))
+            .collect();
+        assert_eq!(
+            named.len(),
+            2,
+            "one per unreadable scope, and `\"destructive\"` is not one of them: {diagnostics:?}"
+        );
+        let per_server = named
+            .iter()
+            .find(|diagnostic| diagnostic.server.as_deref() == Some("typo"))
+            .unwrap();
+        assert!(
+            per_server.message.contains("\"all\""),
+            "the offending value is quoted back: {}",
+            per_server.message
+        );
+        let global = named
+            .iter()
+            .find(|diagnostic| diagnostic.server.is_none())
+            .unwrap();
+        assert!(
+            global.message.contains("`settings`"),
+            "the global scope is named too: {}",
+            global.message
+        );
+    }
+
+    /// Every shape round-trips, [`ApproveTools::Other`] included — a `/mcp` config rewrite must
+    /// hand the user's own bytes back rather than silently normalising a value it could not read.
+    #[test]
+    fn approve_tools_round_trips_including_the_unreadable_value() {
+        for (value, json) in [
+            (ApproveTools::All(true), "true"),
+            (ApproveTools::All(false), "false"),
+            (ApproveTools::Destructive, "\"destructive\""),
+            (ApproveTools::Named(Vec::new()), "[]"),
+            (
+                ApproveTools::Named(vec!["delete_*".to_string()]),
+                "[\"delete_*\"]",
+            ),
+            (
+                ApproveTools::Other(RawJson::String("all".to_string())),
+                "\"all\"",
+            ),
+            (ApproveTools::Other(RawJson::Null), "null"),
+        ] {
+            assert_eq!(serde_json::to_string(&value).unwrap(), json);
+            assert_eq!(serde_json::from_str::<ApproveTools>(json).unwrap(), value);
+        }
     }
 
     #[test]

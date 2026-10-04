@@ -586,10 +586,10 @@ struct DetailsHook;
 #[async_trait::async_trait]
 impl Hooks for DetailsHook {
     async fn after_tool_call(&self, _ctx: AfterToolCall<'_>, _cancel: CancelToken) -> AfterOutcome {
-        AfterOutcome::Override(AfterOverride {
+        AfterOutcome::Override(Box::new(AfterOverride {
             details: Some(json!({ "k": "v" })),
             ..Default::default()
-        })
+        }))
     }
 }
 
@@ -643,10 +643,10 @@ impl Hooks for TerminateHook {
             None => true,
             Some(name) => ctx.tool_name == name,
         };
-        AfterOutcome::Override(AfterOverride {
+        AfterOutcome::Override(Box::new(AfterOverride {
             terminate: Some(TerminateHint::from_wire(Some(terminate))),
             ..Default::default()
-        })
+        }))
     }
 }
 

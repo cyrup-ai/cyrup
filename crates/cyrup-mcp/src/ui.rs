@@ -70,6 +70,7 @@ use crate::config::{
     ServerProvenance, SourceId, SourceKind, ToolPrefix,
 };
 use crate::dirs::{CACHE_MAX_AGE_MS, CachedTool, MetadataCache, ServerCacheEntry};
+use crate::errors::McpResult;
 use crate::onboarding::OnboardingState;
 use crate::registration::{
     matches_tool_pattern, resolve_tool_prefix, resource_base_tool_name, tool_name_candidates,
@@ -3505,13 +3506,32 @@ pub struct AddServerOutcome {
 /// other one in the tree is `#[cfg(test)]`.
 pub trait SetupPanelCallbacks: Send + Sync + 'static {
     /// `previewImports(imports)`.
-    fn preview_imports(&self, imports: &[ImportKind]) -> ConfigWritePreview;
+    ///
+    /// # Errors
+    ///
+    /// Fallible since MCP-589: the config read under every preview fails closed on an unparseable
+    /// file, and the panel renders the message through
+    /// [`SetupPanel::format_write_preview_result`] instead of a diff from `{}`.
+    fn preview_imports(&self, imports: &[ImportKind]) -> McpResult<ConfigWritePreview>;
     /// `previewStarterProject()`.
-    fn preview_starter_project(&self) -> ConfigWritePreview;
-    /// `previewRepoPrompt()` — `None` when RepoPrompt cannot be offered.
-    fn preview_repo_prompt(&self) -> Option<ConfigWritePreview>;
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::preview_imports`], plus the scaffold guard's `file already exists`.
+    fn preview_starter_project(&self) -> McpResult<ConfigWritePreview>;
+    /// `previewRepoPrompt()` — `Ok(None)` when RepoPrompt cannot be offered, which is upstream's
+    /// `null` and is **not** an error.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::preview_imports`].
+    fn preview_repo_prompt(&self) -> McpResult<Option<ConfigWritePreview>>;
     /// `previewKnownServer(preset)`.
-    fn preview_known_server(&self, preset: &KnownServerPreset) -> ConfigWritePreview;
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::preview_imports`].
+    fn preview_known_server(&self, preset: &KnownServerPreset) -> McpResult<ConfigWritePreview>;
     /// `adoptImports(imports)`.
     fn adopt_imports(
         &self,
@@ -4337,7 +4357,7 @@ impl McpSetupPanelModel {
             .filter(|entry| self.selected_imports.contains(&entry.kind))
             .map(|entry| entry.kind)
             .collect();
-        let preview = Self::format_write_preview(
+        let preview = Self::format_write_preview_result(
             "Compatibility import write preview",
             &self.callbacks.preview_imports(&selected),
             &[],
@@ -4537,6 +4557,33 @@ impl McpSetupPanelModel {
             .collect()
     }
 
+    /// `previewOrError(getPreview, width, errors)` (`mcp-setup-panel.ts:659`) — MCP-589.
+    ///
+    /// Every `preview_*` callback can now fail, because [`crate::config::read_raw_config_object`]
+    /// fails closed on an unparseable file instead of answering `{}`. Upstream pushes
+    /// `Preview unavailable:` plus the message into the pane's `errors` list, toned `needsAuth`, and
+    /// renders the preview as empty. cyrup's pane body is untoned `Vec<String>`, so the two lines go
+    /// in the preview's own place; the head string and the message are upstream's.
+    ///
+    /// The action stays selectable: refusing to preview an unparseable file is not refusing to let
+    /// the user try, and the write reports the same message if they do.
+    #[must_use]
+    pub fn format_write_preview_result(
+        title: &str,
+        preview: &McpResult<ConfigWritePreview>,
+        intro: &[String],
+        width: usize,
+    ) -> Vec<String> {
+        match preview {
+            Ok(preview) => Self::format_write_preview(title, preview, intro, width),
+            Err(error) => {
+                let mut lines = vec!["Preview unavailable:".to_string()];
+                lines.push(error.to_string());
+                Self::format_preview(&lines, width)
+            }
+        }
+    }
+
     /// `formatWritePreview(title, preview, intro, width)` (MCP-376).
     ///
     /// The diff is capped at 18 lines and the overflow line is singular only at exactly one. The
@@ -4615,7 +4662,7 @@ impl McpSetupPanelModel {
                     .iter()
                     .map(|entry| format!("{} ({} servers)", entry.kind.as_str(), entry.server_count))
                     .collect();
-                Self::format_write_preview(
+                Self::format_write_preview_result(
                     "Compatibility import write preview",
                     &self.callbacks.preview_imports(&selected),
                     &[
@@ -4690,13 +4737,20 @@ impl McpSetupPanelModel {
             }
             SetupActionId::AddRepoPrompt => {
                 let repo = &self.discovery.repo_prompt;
-                let Some(preview) = self.callbacks.preview_repo_prompt() else {
-                    return Self::format_preview(
-                        &["RepoPrompt is not available to add from this setup screen.".to_string()],
-                        width,
-                    );
+                let preview = match self.callbacks.preview_repo_prompt() {
+                    Ok(Some(preview)) => Ok(preview),
+                    Ok(None) => {
+                        return Self::format_preview(
+                            &[
+                                "RepoPrompt is not available to add from this setup screen."
+                                    .to_string(),
+                            ],
+                            width,
+                        );
+                    }
+                    Err(error) => Err(error),
                 };
-                Self::format_write_preview(
+                Self::format_write_preview_result(
                     "RepoPrompt write preview",
                     &preview,
                     &[
@@ -4727,14 +4781,14 @@ impl McpSetupPanelModel {
                         width,
                     );
                 };
-                Self::format_write_preview(
+                Self::format_write_preview_result(
                     &format!("{} write preview", preset.name),
                     &self.callbacks.preview_known_server(preset),
                     &[preset.summary.to_string()],
                     width,
                 )
             }
-            SetupActionId::ScaffoldProject => Self::format_write_preview(
+            SetupActionId::ScaffoldProject => Self::format_write_preview_result(
                 "Starter project `.mcp.json` write preview",
                 &self.callbacks.preview_starter_project(),
                 &[
@@ -5465,6 +5519,7 @@ mod tests {
             prompts: None,
             instructions: None,
             cached_at: crate::dirs::now_ms(),
+            ..ServerCacheEntry::default()
         }
     }
 
@@ -6262,17 +6317,20 @@ mod tests {
     }
 
     impl SetupPanelCallbacks for StubSetup {
-        fn preview_imports(&self, _imports: &[ImportKind]) -> ConfigWritePreview {
-            empty_preview()
+        fn preview_imports(&self, _imports: &[ImportKind]) -> McpResult<ConfigWritePreview> {
+            Ok(empty_preview())
         }
-        fn preview_starter_project(&self) -> ConfigWritePreview {
-            empty_preview()
+        fn preview_starter_project(&self) -> McpResult<ConfigWritePreview> {
+            Ok(empty_preview())
         }
-        fn preview_repo_prompt(&self) -> Option<ConfigWritePreview> {
-            None
+        fn preview_repo_prompt(&self) -> McpResult<Option<ConfigWritePreview>> {
+            Ok(None)
         }
-        fn preview_known_server(&self, _preset: &KnownServerPreset) -> ConfigWritePreview {
-            empty_preview()
+        fn preview_known_server(
+            &self,
+            _preset: &KnownServerPreset,
+        ) -> McpResult<ConfigWritePreview> {
+            Ok(empty_preview())
         }
         fn adopt_imports(
             &self,

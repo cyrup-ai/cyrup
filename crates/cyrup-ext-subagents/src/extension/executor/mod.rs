@@ -458,6 +458,25 @@ impl SubagentExecutor {
         self.host_services.get().cloned()
     }
 
+    /// SUBA-158 — this launching session's project trust, as every child launch must carry it:
+    /// pi `sessionProjectTrust(ctx)` (`src/runs/foreground/subagent-executor.ts:645` @v0.74.0),
+    ///
+    /// ```ts
+    /// typeof ctx.isProjectTrusted === "function" ? ctx.isProjectTrusted() : undefined
+    /// ```
+    ///
+    /// Upstream's `undefined` arm is "this host predates Pi's trust concept"; here the P-1 host
+    /// slot being UNBOUND is that same condition, and it is the one place cyrup can tell "no host"
+    /// apart from "host says untrusted" (the [`cyrup_ext::host::HostServices`] trait method itself
+    /// always answers, defaulting to `false`). `None` therefore reaches
+    /// [`crate::exec::RunOptions::parent_project_trusted`] as "no information", and the child
+    /// decides for itself exactly as it did before this existed.
+    #[must_use]
+    pub fn session_project_trust(&self) -> Option<bool> {
+        self.host_services()
+            .map(|services| services.is_project_trusted())
+    }
+
     /// SUBA-034 — a handle on this orchestrator's completion bus (pi's
     /// `SUBAGENT_ASYNC_COMPLETE_EVENT`), for a caller that needs to WAKE on completions rather than
     /// consume them: the `wait` tool subscribes through this.

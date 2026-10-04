@@ -77,6 +77,11 @@ struct ResolvedRunAgent {
     /// [`RunOptions::preferred_provider`] (pi's `preferredModelProvider: currentProvider`,
     /// `:3825`) — the second rung under the agent's own `model_provider`.
     preferred_provider: Option<ProviderId>,
+    /// SUBA-155 — the REMEMBERED parent model itself (pi `parentModel`, the third argument of
+    /// `resolveModelScopesForAgent`, `model-scope.ts:160` @v0.74.0), carried beside
+    /// `preferred_provider` and split from the same value, so the reserved `modelScope` allow
+    /// tokens expand against the same session the provider came from.
+    parent_model: Option<ModelId>,
 }
 
 /// The run-scoped identity, sinks and directories [`SubagentExecutor::resolve_run_channels`]
@@ -145,6 +150,11 @@ struct ForegroundRunOptionsInput<'a> {
     /// `subagent-executor.ts:4029`).
     model_response_aliases: Option<crate::exec::model_verification::ModelResponseAliases>,
     preferred_provider: Option<ProviderId>,
+    /// SUBA-155 — the REMEMBERED parent model itself (pi `parentModel`, the third argument of
+    /// `resolveModelScopesForAgent`, `model-scope.ts:160` @v0.74.0), carried beside
+    /// `preferred_provider` and split from the same value, so the reserved `modelScope` allow
+    /// tokens expand against the same session the provider came from.
+    parent_model: Option<ModelId>,
     fork_context: ForkContext,
     deadline_at: Option<std::time::Instant>,
     /// Borrowed: the same id the caller registers, tears down and returns.
@@ -340,6 +350,7 @@ impl SubagentExecutor {
             effective_override,
             model_override_from_parent,
             preferred_provider,
+            parent_model,
         } = self.resolve_run_agent(&req, &cfg, depth).await?;
         // SUBA-100 — pi `runSinglePath` (`subagent-executor.ts:3823-3827` @v0.68.0):
         // `params.machine ?? agentConfig.machine`, refused for a runner pane-native placement cannot
@@ -413,6 +424,7 @@ impl SubagentExecutor {
             model_override_from_parent,
             model_response_aliases: cfg.model_response_aliases.clone(),
             preferred_provider,
+            parent_model,
             fork_context,
             deadline_at,
             run_id: &run_id,
@@ -1005,6 +1017,8 @@ impl SubagentExecutor {
             parent_model.as_ref(),
             &mut available_models,
             model_scope.as_ref(),
+            // SUBA-155 — the canonical agent name selects any `modelScope.agents.<name>` rule.
+            &agent_config.name,
         )
         .map_err(|violation| SubagentError::ModelOutOfScope(violation.message))?;
         // SUBA-119 — the same three inputs the resolution above just consumed, read for pi's
@@ -1033,6 +1047,7 @@ impl SubagentExecutor {
             effective_override,
             model_override_from_parent,
             preferred_provider,
+            parent_model,
         })
     }
 
@@ -1189,6 +1204,7 @@ impl SubagentExecutor {
             model_override_from_parent,
             model_response_aliases,
             preferred_provider,
+            parent_model,
             fork_context,
             deadline_at,
             run_id,
@@ -1281,6 +1297,9 @@ impl SubagentExecutor {
             // currentProvider`, `subagent-executor.ts:3825` @v0.64.0). `run_sync` consults it only
             // when the agent carries no `model_provider` of its own.
             preferred_provider,
+            // SUBA-155 — pi `parentModel` for `resolveModelScopesForAgent`: the reserved
+            // `inherit`/`scoped` allow tokens expand against this exact `provider/id`.
+            parent_model,
             available_models,
             // pi `execute(id, params, signal, ...)` threads the host's own `AbortSignal` into the
             // executor for every mode (`extension/index.ts:498-500` ->
@@ -1315,6 +1334,9 @@ impl SubagentExecutor {
             // SessionStart via P-2. `None` when no live session id is available (headless / SDK
             // embedder), at which point the child spawn falls through to the inherited env value.
             parent_session_id: self.root_parent_session(),
+            // SUBA-158 — pi `projectTrusted: sessionProjectTrust(input.ctx)` at every
+            // foreground launch site (`subagent-executor.ts:1818,3498,4242` @v0.74.0).
+            parent_project_trusted: self.session_project_trust(),
             // R-SA-037/119/120: hand the executor's single-slot ask lock (backed by the intercom
             // companion's real broker `ClarifyChannel` when `with_channels` wired one, else the
             // no-live-channel degrade default) to the drive loop, so a child's blocking
@@ -2167,7 +2189,7 @@ mod tests {
         );
         assert_eq!(
             err.to_string(),
-            "Model 'openai/gpt-5-nano' is outside the configured subagent model scope. Allowed \
+            "Model 'openai/gpt-5-nano' is outside the configured subagent model scope (modelScope). Allowed \
              patterns: anthropic/*, together/*.",
             "the caller must see pi's verbatim violation text, naming the model AND the patterns"
         );
@@ -2846,6 +2868,7 @@ mod detach_producer_tests {
                     model_override_from_parent: false,
                     model_response_aliases: map,
                     preferred_provider: None,
+                    parent_model: None,
                     fork_context: ForkContext::fresh(),
                     deadline_at: None,
                     run_id: &run_id,

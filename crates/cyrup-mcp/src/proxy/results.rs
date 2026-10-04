@@ -7,7 +7,7 @@ use serde_json::{Map as JsonMap, Value};
 
 use cyrup_core::{Content, ToolResult};
 
-use crate::config::{McpConfig, McpSettings, ServerEntry};
+use crate::config::{McpConfig, ServerEntry};
 use crate::proxy::env::format_auth_required_message;
 use crate::proxy::error_vocab::McpErrorCode;
 use crate::proxy::tool_metadata::ToolMetadata;
@@ -66,11 +66,22 @@ pub fn ambiguous_tool_result(mode: &str, tool_name: &str) -> ToolResult {
     text_result(message, map)
 }
 
-/// `proxy-modes.ts:69` `disabledResult(mode, serverName)` — shared by every mode.
+/// `proxy-modes.ts:214` `disabledResult(state, mode, serverName)` — shared by every mode.
+///
+/// The tail is [`crate::project_server_trust::disabled_server_reason`]'s since MCP-591: for an
+/// ordinary disabled server it is still *"disabled. Run /mcp enable … and /reload to enable it."*,
+/// and for one the project-server trust gate refused it is the block reason instead — because
+/// `/mcp enable` would not help, the entry being disabled by the gate rather than by any file the
+/// user can edit.
 #[must_use]
-pub fn disabled_result(mode: &str, server_name: &str) -> ToolResult {
+pub fn disabled_result(
+    blocked: &indexmap::IndexMap<String, crate::project_server_trust::ProjectServerBlock>,
+    mode: &str,
+    server_name: &str,
+) -> ToolResult {
     let message = format!(
-        "Server \"{server_name}\" is disabled. Run /mcp enable {server_name} and /reload to enable it."
+        "Server \"{server_name}\" is {}",
+        crate::project_server_trust::disabled_server_reason(Some(blocked), server_name)
     );
     let mut map = details_err(mode, McpErrorCode::ServerDisabled);
     map.insert("server".to_string(), Value::String(server_name.to_string()));
@@ -95,9 +106,9 @@ pub(crate) fn not_found_result(mode: &str, server_name: &str) -> ToolResult {
 /// which is why the caller-supplied default in [`crate::proxy::attempt_auto_auth`] step 4 also routes through
 /// here rather than being returned directly.
 #[must_use]
-pub fn get_auth_required_message(settings: &McpSettings, server_name: &str) -> String {
+pub fn get_auth_required_message(config: &McpConfig, server_name: &str) -> String {
     format_auth_required_message(
-        settings,
+        config,
         server_name,
         &default_auth_required_message(server_name),
     )
@@ -116,11 +127,15 @@ pub(crate) fn default_auth_required_message(server_name: &str) -> String {
 /// [`get_auth_required_message`]; without one the default guidance is inlined literally. Both spell
 /// the same sentence, but the template arm renders the user's text.
 #[must_use]
-pub fn get_auth_failed_message(settings: &McpSettings, server_name: &str, message: &str) -> String {
-    if settings.auth_required_message().is_some() {
+pub fn get_auth_failed_message(config: &McpConfig, server_name: &str, message: &str) -> String {
+    if config
+        .settings_or_default()
+        .auth_required_message()
+        .is_some()
+    {
         format!(
             "OAuth authentication failed for \"{server_name}\": {message}. {}",
-            get_auth_required_message(settings, server_name)
+            get_auth_required_message(config, server_name)
         )
     } else {
         format!(
@@ -179,7 +194,11 @@ pub(crate) fn get_enabled_tool_matches(
 #[derive(Debug, Clone, PartialEq)]
 pub enum SingleMatch {
     /// Exactly one match — exact if any exact matches existed, else the single fuzzy one.
-    One(ToolMetadata),
+    ///
+    /// **Boxed** (`clippy::large_enum_variant`): the other two variants are unit, so an inline
+    /// [`ToolMetadata`] makes every `SingleMatch` as wide as the metadata — and MCP-601 widened
+    /// that type by an `McpToolAnnotations`. The box keeps the three-valued return cheap to move.
+    One(Box<ToolMetadata>),
     /// **More than one.** The sentinel that fails the call closed rather than routing it to
     /// whichever server happened to be first in the map.
     Ambiguous,
@@ -205,9 +224,9 @@ pub fn get_single_tool_match(metadata: Option<&Vec<ToolMetadata>>, tool_name: &s
     if matches.len() > 1 {
         return SingleMatch::Ambiguous;
     }
-    matches
-        .first()
-        .map_or(SingleMatch::None, |tool| SingleMatch::One((*tool).clone()))
+    matches.first().map_or(SingleMatch::None, |tool| {
+        SingleMatch::One(Box::new((*tool).clone()))
+    })
 }
 
 #[cfg(test)]
@@ -304,7 +323,7 @@ mod tests {
             json!("Tool \"create_issue\" matches multiple servers. Specify a server.")
         );
 
-        let disabled = disabled_result("list", "gh");
+        let disabled = disabled_result(&indexmap::IndexMap::new(), "list", "gh");
         let details = disabled.details.expect("details");
         assert_eq!(details["error"], json!("server_disabled"));
         assert_eq!(

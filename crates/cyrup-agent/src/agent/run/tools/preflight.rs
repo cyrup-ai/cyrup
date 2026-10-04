@@ -176,7 +176,9 @@ impl RunCtx {
             timestamp: now_millis(),
         };
         // pi's blocked-with-terminate arm assigns `result.terminate = true` only when the hook asked
-        // for it; every other error result leaves the key absent.
-        Finalized::new(source_index, message, terminate)
+        // for it; every other error result leaves the key absent. `createErrorToolResult` builds
+        // `{content, details:{}}` and nothing else, so there is no structured half either
+        // (AGENT-045) — an unknown tool, a validation failure, a block and an abort all report none.
+        Finalized::new(source_index, message, terminate, None)
     }
 }

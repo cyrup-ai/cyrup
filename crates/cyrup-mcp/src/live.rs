@@ -493,7 +493,7 @@ impl MetadataCacheOptions {
 ///
 /// `0` is the crate's "invalid entry" sentinel (`is_server_cache_valid` rejects it with the falsy
 /// `!entry.cachedAt` test), which is exactly the right answer for a clock that cannot be read.
-fn now_epoch_ms() -> i64 {
+pub(crate) fn now_epoch_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .ok()
@@ -523,35 +523,72 @@ pub fn update_metadata_cache(
     server: &str,
     options: MetadataCacheOptions,
 ) {
-    let Some(connection) = state.manager.get_connection(server) else {
+    let Some(entry) = capture_metadata(state, dirs, server, options) else {
         return;
     };
-    if connection.status() != LinkStatus::Connected {
-        return;
+    let mut one = crate::dirs::MetadataCache::default();
+    one.servers.insert(server.to_string(), entry);
+    if let Err(error) = crate::dirs::save_metadata_cache(&dirs.metadata_cache(), &one) {
+        // Upstream's `saveMetadataCache` swallows its own write failure (`metadata-cache.ts:57`'s
+        // try/catch); a cache that cannot be written is a slower next start, never a failed connect.
+        tracing::debug!("MCP: failed to write metadata cache for {server}: {error}");
     }
-    let Some(definition) = state.config.mcp_servers.get(server) else {
-        return;
-    };
+}
+
+/// `captureMetadata(state, serverName, connection, loadCache)` (`init.ts:619`) — the entry
+/// [`update_metadata_cache`] writes, **built but not written**.
+///
+/// Split out for MCP-598: the startup pass captures each server's catalogue while its connection is
+/// still open, closes the non-resident ones, and then writes the whole batch once. Upstream's split
+/// is the same, and its comment at the call site is the reason — "Capture before closing; the closed
+/// connection keeps its catalog for publication below."
+///
+/// `None` where upstream returns `undefined`: no connection, not connected, no definition, a
+/// disabled definition, or a `computeServerHash` that throws.
+///
+/// **Not ported, and said so here rather than left to be noticed:** upstream's `sessionMetadata`
+/// fallback (`init.ts:636-640`) and `keepOutputShapes` (`:658`). `state.sessionMetadata` has no
+/// counterpart in this port, so the only fallback source is the entry on disk — which is the v2.x
+/// shape this function already had; and observed output shapes are `MCP-603`, unported, so there is
+/// nothing for `keepOutputShapes` to carry.
+pub fn capture_metadata(
+    state: &McpState,
+    dirs: &McpDirs,
+    server: &str,
+    options: MetadataCacheOptions,
+) -> Option<crate::dirs::ServerCacheEntry> {
+    let connection = state.manager.get_connection(server)?;
+    if connection.status() != LinkStatus::Connected {
+        return None;
+    }
+    let definition = state.config.mcp_servers.get(server)?;
     if definition.is_disabled() {
-        return;
+        return None;
     }
 
     // `const configHash = computeServerHash(definition)` — which THROWS on a `url` naming an unset
     // variable. `None` is that throw, and a cache entry that cannot be keyed by identity must not
     // be written at all: the reader would reject it on the next run anyway.
-    let Some(config_hash) = crate::registration::default_server_hasher(definition) else {
-        return;
-    };
+    let config_hash = crate::registration::default_server_hasher(definition)?;
 
     let path = dirs.metadata_cache();
     let existing = crate::dirs::load_metadata_cache(&path);
     let existing_entry = existing
         .as_ref()
         .and_then(|cache| cache.servers.get(server));
-    let hash_matches =
-        existing_entry.is_some_and(|entry| entry.config_hash.as_str() == config_hash.as_str());
+    let now = now_epoch_ms();
+    // `existingEntry?.configHash === configHash && isServerCacheValid(existingEntry, definition)`
+    // (`init.ts:644-646`, `:650-653`) — the **fallback** test, which is strictly more than a hash
+    // match. MCP-596's two new rejections bite here: a `cacheScope: "private"` entry, or one
+    // written as a `discoveryFailed` marker, must not hand its prompts or resources to the entry
+    // being written, because a private listing belongs to the authorization context that fetched
+    // it and a marker has no catalogue to give.
+    let hash_matches = existing_entry.is_some_and(|entry| {
+        entry.config_hash.as_str() == config_hash.as_str() && entry.is_readable_now(now)
+    });
 
     let tools = crate::dirs::serialize_tools(&connection.tools());
+    let hints = connection.tool_list_hints();
     // `definition.exposeResources === false ? [] : serializeResources(connection.resources)`.
     let mut resources = if definition.expose_resources() {
         crate::dirs::serialize_resources(&connection.resources())
@@ -592,16 +629,18 @@ pub fn update_metadata_cache(
         // `...(connection.instructions !== undefined ? {instructions} : {})` — presence, not
         // truthiness. An empty string round-trips as an empty string.
         instructions: connection.instructions().map(str::to_string),
-        cached_at: now_epoch_ms(),
+        cached_at: now,
+        // `...(connection.toolListHints?.ttlMs !== undefined ? { ttlMs } : {})` and the
+        // `cacheScope` spread beside it (`init.ts:665-666`) — MCP-505/MCP-596. Presence, not
+        // truthiness: `ttlMs: 0` is a server saying "never cache this" and must reach the file.
+        ttl_ms: hints.and_then(|hints| hints.ttl_ms),
+        cache_scope: hints.and_then(|hints| hints.cache_scope),
+        // Only `init`'s startup pass writes a marker (MCP-598); a connection that discovered its
+        // catalogue is by definition not a failed discovery, so the key stays absent.
+        discovery_failed: None,
     };
 
-    let mut one = crate::dirs::MetadataCache::default();
-    one.servers.insert(server.to_string(), entry);
-    if let Err(error) = crate::dirs::save_metadata_cache(&path, &one) {
-        // Upstream's `saveMetadataCache` swallows its own write failure (`metadata-cache.ts:57`'s
-        // try/catch); a cache that cannot be written is a slower next start, never a failed connect.
-        tracing::debug!("MCP: failed to write metadata cache for {server}: {error}");
-    }
+    Some(entry)
 }
 
 /// `init.ts:560-566` `flushMetadataCache(state)` — the [`crate::lifecycle::MetadataFlush`]
@@ -1069,21 +1108,76 @@ fn session_expired_status(error: &ServiceError) -> Option<u16> {
     None
 }
 
-/// One MCP request on a live peer, with upstream's `requestOptions.signal` cancellation.
+/// `callToolPausingForElicitation`'s registration, as the two objects [`request_on_peer`] needs:
+/// the registry to register in, and the server whose prompts pause it.
+///
+/// Built only for `tools/call` — upstream wraps `client.callTool` and nothing else, so
+/// `resources/read`, `prompts/get` and the three discovery lists keep the plain rmcp timeout.
+struct PausableDeadline<'a> {
+    deadlines: &'a Arc<crate::call_deadline::CallDeadlines>,
+    server: &'a str,
+    budget: Duration,
+}
+
+impl PausableDeadline<'_> {
+    /// `state.deadlines.add(deadline); if (state.open === 0) deadline.resume();`, plus the
+    /// progress-token index. The returned guard is upstream's `finally`.
+    fn index(&self, token: &rmcp::model::ProgressToken) -> Option<RegisteredDeadline<'_>> {
+        let registration = self.deadlines.register(self.server, self.budget);
+        self.deadlines
+            .index_token(token.clone(), &registration.deadline);
+        Some(RegisteredDeadline {
+            deadlines: self.deadlines,
+            server: self.server,
+            token: token.clone(),
+            deadline: registration.deadline,
+        })
+    }
+}
+
+/// The live registration — dropped at the end of the request, which is
+/// `finally { state.deadlines.delete(deadline); deadline.pause(); }`
+/// (`elicitation-handler.ts:119-121`).
+struct RegisteredDeadline<'a> {
+    deadlines: &'a Arc<crate::call_deadline::CallDeadlines>,
+    server: &'a str,
+    token: rmcp::model::ProgressToken,
+    deadline: Arc<crate::call_deadline::CallDeadline>,
+}
+
+impl Drop for RegisteredDeadline<'_> {
+    fn drop(&mut self) {
+        self.deadlines
+            .release(self.server, Some(&self.token), &self.deadline);
+    }
+}
+
+/// One MCP request on a live peer, with upstream's `requestOptions.signal` cancellation and, for a
+/// `tools/call`, upstream's **pausable** deadline.
 ///
 /// `abortable(..)`'s `biased` cancel arm is the `is_cancelled` check ahead of the send: an
 /// already-stopped generation must not start a request it would immediately cancel. After the send
 /// the race is against `handle.rx` directly rather than `RequestHandle::await_response`, which
 /// consumes the handle and would leave nothing to call `cancel` on — the borrow-then-take shape rmcp
-/// itself uses for a pending subscription (`service/client.rs:391-432`). The timeout arm is
-/// `await_response`'s own `(Some(timeout), None, false)` branch, reproduced because
-/// [`crate::runtime::build_request_options`] only ever sets `timeout`: `reset_timeout_on_progress`
-/// and `max_total_timeout` have no upstream analogue and stay at their defaults.
+/// itself uses for a pending subscription (`service/client.rs:391-432`).
+///
+/// # The two timeout arms
+///
+/// Without a `pause`, the timeout arm is `await_response`'s own `(Some(timeout), None, false)`
+/// branch, reproduced: `max_total_timeout` has no upstream analogue and stays at its default.
+///
+/// With one — `callToolPausingForElicitation` (`elicitation-handler.ts:89-121`, MCP-606/MCP-607) —
+/// the budget is driven by a [`crate::call_deadline::CallDeadline`] instead, which an open
+/// elicitation prompt pauses and a progress notification restarts. rmcp's own
+/// `reset_timeout_on_progress` is left at its default on purpose; [`crate::call_deadline`]'s module
+/// doc says why, and the expiry lands on the same [`Settled::TimedOut`] arm either way, so the
+/// error the user sees is unchanged.
 async fn request_on_peer(
     peer: &Peer<RoleClient>,
     request: ClientRequest,
     options: PeerRequestOptions,
     cancel: &CancelToken,
+    pause: Option<&PausableDeadline<'_>>,
 ) -> Result<ServerResult, Box<RequestFailure>> {
     if cancel.is_cancelled() {
         return Err(Box::new(RequestFailure::aborted()));
@@ -1109,8 +1203,30 @@ async fn request_on_peer(
         Cancelled,
     }
 
-    let settled = match timeout {
-        Some(limit) => tokio::select! {
+    // `state.deadlines.add(deadline)` indexed by the progress token rmcp just assigned, which is
+    // the earliest moment the token exists. `_registered`'s `Drop` is upstream's
+    // `finally { state.deadlines.delete(deadline); deadline.pause(); }`.
+    let registered = pause.and_then(|pause| pause.index(&handle.progress_token));
+    let settled = match (registered.as_ref(), timeout) {
+        // The pausable path. The loop re-polls `handle.rx` after every pause, resume and restart,
+        // which is the point: how long is left changes under it.
+        (Some(registered), _) => {
+            // `CallDeadline::expired` is the loop: it re-reads how long is left after every pause,
+            // resume and restart and only resolves on a real expiry, so this `select!` settles
+            // exactly once, like the two below it.
+            let deadline = Arc::clone(&registered.deadline);
+            let mut generation = deadline.subscribe();
+            tokio::select! {
+                biased;
+                () = cancel.cancelled() => Settled::Cancelled,
+                settled = &mut handle.rx => match settled {
+                    Ok(response) => Settled::Response(Box::new(response)),
+                    Err(_closed) => Settled::Closed,
+                },
+                () = deadline.expired(&mut generation) => Settled::TimedOut(deadline.budget()),
+            }
+        }
+        (None, Some(limit)) => tokio::select! {
             biased;
             () = cancel.cancelled() => Settled::Cancelled,
             settled = tokio::time::timeout(limit, &mut handle.rx) => match settled {
@@ -1119,7 +1235,7 @@ async fn request_on_peer(
                 Err(_elapsed) => Settled::TimedOut(limit),
             },
         },
-        None => tokio::select! {
+        (None, None) => tokio::select! {
             biased;
             () = cancel.cancelled() => Settled::Cancelled,
             settled = &mut handle.rx => match settled {
@@ -1477,12 +1593,20 @@ impl ProxyEnv for RuntimeEnv {
                 let params =
                     CallToolRequestParams::new(tool.to_string()).with_arguments(arguments.clone());
                 let options = self.request_options(server);
+                // MCP-606 — the ONE call upstream makes pausable. A `None` budget is upstream's
+                // "no timeout", which has no deadline to pause.
+                let pause = options.timeout.map(|budget| PausableDeadline {
+                    deadlines: self.state.manager.call_deadlines(),
+                    server,
+                    budget,
+                });
                 async move {
                     let response = request_on_peer(
                         &peer,
                         CallToolRequest::new(params).into(),
                         options,
                         cancel,
+                        pause.as_ref(),
                     )
                     .await
                     .map_err(|failure| *failure)?;
@@ -1538,6 +1662,10 @@ impl ProxyEnv for RuntimeEnv {
                         ReadResourceRequest::new(params).into(),
                         options,
                         cancel,
+                        // Upstream wraps `callTool` only, so a `resources/read` keeps the plain
+                        // rmcp timeout and an elicitation during one still burns it (MCP-606's
+                        // body records the same scope).
+                        None,
                     )
                     .await
                     .map_err(|failure| *failure)?;
@@ -1916,7 +2044,7 @@ while IFS= read -r line; do
       ;;
     *'"method":"notifications/'*) : ;;
     *'"method":"tools/list"'*)
-      printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"echo","description":"echo back","inputSchema":{"type":"object"}}]}}\n' "$id"
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"echo","description":"echo back","inputSchema":{"type":"object"}},{"name":"slow","description":"answers after a second","inputSchema":{"type":"object"}},{"name":"progressive","description":"reports progress, then answers","inputSchema":{"type":"object"}}]}}\n' "$id"
       ;;
     *'"method":"resources/list"'*)
       printf '{"jsonrpc":"2.0","id":%s,"result":{"resources":[]}}\n' "$id"
@@ -1926,6 +2054,20 @@ while IFS= read -r line; do
       ;;
     *'"method":"tools/call"'*)
       case "$line" in
+        *'"name":"slow"'*)
+          sleep 1
+          printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"slow:done"}],"isError":false}}\n' "$id"
+          ;;
+        *'"name":"progressive"'*)
+          tok=$(printf '%s' "$line" | sed -n 's/.*"progressToken":\([0-9]*\).*/\1/p')
+          i=0
+          while [ "$i" -lt 3 ]; do
+            sleep 1
+            printf '{"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":%s,"progress":%s,"total":3}}\n' "$tok" "$i"
+            i=$((i+1))
+          done
+          printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"progressive:done"}],"isError":false}}\n' "$id"
+          ;;
         *'"name":"boom"'*)
           printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"it went wrong"}],"isError":true}}\n' "$id"
           ;;
@@ -1948,6 +2090,182 @@ while IFS= read -r line; do
   esac
 done
 "#;
+
+    /// A fixture whose `tools/list` declares the two SEP-2549 cache hints and whose `prompts/list`
+    /// fails — the two inputs MCP-505/MCP-596 need on one server.
+    const LIVE_PRIVATE: &str = r#"
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*)
+      pv=$(printf '%s' "$line" | sed -n 's/.*"protocolVersion":"\([^"]*\)".*/\1/p')
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"%s","capabilities":{"tools":{},"resources":{},"prompts":{}},"serverInfo":{"name":"fixture","version":"1"}}}\n' "$id" "$pv"
+      ;;
+    *'"method":"notifications/'*) : ;;
+    *'"method":"tools/list"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"ttlMs":5000,"cacheScope":"private","tools":[{"name":"whoami","description":"who","inputSchema":{"type":"object"}}]}}\n' "$id"
+      ;;
+    *'"method":"resources/list"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"resources":[]}}\n' "$id"
+      ;;
+    *'"method":"prompts/list"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32603,"message":"prompts are unavailable"}}\n' "$id"
+      ;;
+    *)
+      if [ -n "$id" ]; then printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id"; fi
+      ;;
+  esac
+done
+"#;
+
+    fn private_entry() -> ServerEntry {
+        ServerEntry {
+            command: Some("sh".to_string()),
+            args: Some(vec![
+                "-c".to_string(),
+                LIVE_PRIVATE.to_string(),
+                "sh".to_string(),
+            ]),
+            ..ServerEntry::default()
+        }
+    }
+
+    /// A real [`McpState`] over a real connection to `definition`, and the dirs the cache goes in.
+    async fn connected_state(
+        temp: &std::path::Path,
+        definition: &ServerEntry,
+    ) -> (Arc<McpState>, McpDirs) {
+        let manager = Arc::new(crate::server_manager::McpServerManager::with_factory(
+            None,
+            Arc::new(crate::runtime::ConnectionBuilder::new(None)),
+        ));
+        let lifecycle = Arc::new(crate::lifecycle::McpLifecycleManager::new(
+            Arc::clone(&manager),
+            Arc::new(|_: &str| false),
+        ));
+        let state = Arc::new(McpState::new(crate::state::McpStateParts {
+            owner: Arc::new(crate::owner::McpRuntimeOwner::new()),
+            manager,
+            lifecycle,
+            config: crate::proxy::testsupport::config_with(&[("fixture", definition.clone())]),
+            programmatic_config: None,
+            oauth_runtime: crate::oauth::create_oauth_runtime(None),
+            auth_storage_options: crate::state::AuthStorageOptions::default(),
+            ui: None,
+            open_browser: Arc::new(|_| Box::pin(async { Ok(()) })),
+            send_message: Arc::new(|_| {}),
+            blocked_project_servers: indexmap::IndexMap::new(),
+        }));
+        state
+            .manager
+            .connect("fixture", definition, None)
+            .await
+            .expect("the fixture connects");
+        (state, McpDirs::new(temp.to_path_buf(), temp.to_path_buf()))
+    }
+
+    /// MCP-505/MCP-596 end to end: a server declares `ttlMs` and `cacheScope: "private"` on its
+    /// `tools/list`, and both reach `mcp-cache.json` — where the entry is then **unreadable**,
+    /// which is the whole point. `mcp-cache.json` has no authorization partition, so a listing that
+    /// depended on who was signed in must not be served to the next session.
+    #[tokio::test]
+    async fn the_tools_list_cache_hints_are_written_and_make_the_entry_unreadable() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let definition = private_entry();
+        let (state, dirs) = connected_state(temp.path(), &definition).await;
+
+        let connection = state.manager.get_connection("fixture").expect("connected");
+        let hints = connection
+            .tool_list_hints()
+            .expect("the first page's hints reached the connection");
+        assert_eq!(hints.ttl_ms, Some(5_000));
+        assert!(hints.is_private());
+
+        update_metadata_cache(&state, &dirs, "fixture", MetadataCacheOptions::preserving());
+        let body = std::fs::read_to_string(dirs.metadata_cache()).expect("the cache was written");
+        // `save_metadata_cache` still pretty-prints (upstream dropped the indent at `MCP-506`,
+        // which is not this row), so the keys carry a space after the colon.
+        assert!(body.contains("\"ttlMs\": 5000"), "{body}");
+        assert!(body.contains("\"cacheScope\": \"private\""), "{body}");
+
+        // The next session's reader — a different type over the same bytes — rejects it.
+        let reloaded: crate::registration::MetadataCache =
+            serde_json::from_str(&body).expect("the lenient reader parses");
+        let entry = reloaded.servers.get("fixture").expect("the entry is there");
+        assert_eq!(
+            entry.config_hash,
+            crate::registration::default_server_hasher(&definition),
+            "the hash matches, so only the scope can be what rejects it"
+        );
+        assert!(
+            !crate::registration::is_server_cache_valid(
+                entry,
+                &definition,
+                crate::registration::NO_AGE_LIMIT_MS
+            ),
+            "a private listing must not be served to another session"
+        );
+    }
+
+    /// MCP-596's write-side half: a failed `prompts/list` falls back to the previous entry's
+    /// prompts, but **only** from an entry `isServerCacheValid` would accept. A private entry, or a
+    /// `discoveryFailed` marker, is not a source.
+    #[tokio::test]
+    async fn an_unreadable_previous_entry_does_not_hand_over_its_prompts() {
+        let definition = private_entry();
+        let config_hash = crate::registration::default_server_hasher(&definition)
+            .expect("no url, so the hash cannot throw");
+        let seeded = |scope: Option<rmcp::model::CacheScope>, failed: Option<bool>| {
+            let mut cache = crate::dirs::MetadataCache::default();
+            cache.servers.insert(
+                "fixture".to_string(),
+                crate::dirs::ServerCacheEntry {
+                    config_hash: config_hash.clone(),
+                    prompts: Some(vec![crate::dirs::CachedPrompt {
+                        name: "yesterdays_prompt".to_string(),
+                        ..crate::dirs::CachedPrompt::default()
+                    }]),
+                    cached_at: now_epoch_ms(),
+                    cache_scope: scope,
+                    discovery_failed: failed,
+                    ..crate::dirs::ServerCacheEntry::default()
+                },
+            );
+            cache
+        };
+
+        // Control: a readable previous entry DOES hand its prompts over, which is the v2.x rule
+        // this test must not have broken.
+        for (scope, failed, expected) in [
+            (None, None, Some("yesterdays_prompt")),
+            (Some(rmcp::model::CacheScope::Private), None, None),
+            (None, Some(true), None),
+        ] {
+            let temp = tempfile::TempDir::new().unwrap();
+            let (state, dirs) = connected_state(temp.path(), &definition).await;
+            crate::dirs::save_metadata_cache(&dirs.metadata_cache(), &seeded(scope, failed))
+                .expect("the seed writes");
+
+            let connection = state.manager.get_connection("fixture").expect("connected");
+            assert!(
+                connection.prompt_discovery_failed(),
+                "the fixture's `prompts/list` fails, which is what arms the fallback"
+            );
+            update_metadata_cache(&state, &dirs, "fixture", MetadataCacheOptions::preserving());
+
+            let written = crate::dirs::load_metadata_cache(&dirs.metadata_cache())
+                .expect("the cache reloads");
+            let prompts = written.servers["fixture"].prompts.clone();
+            assert_eq!(
+                prompts
+                    .as_ref()
+                    .and_then(|list| list.first())
+                    .map(|p| p.name.as_str()),
+                expected,
+                "scope {scope:?} / discoveryFailed {failed:?}"
+            );
+        }
+    }
 
     fn live_entry() -> ServerEntry {
         ServerEntry {
@@ -1972,6 +2290,172 @@ done
     /// The attempt token and the resource are both returned rather than dropped: the token is
     /// rmcp's service-loop cancellation token, and the resource owns the `RunningService` — dropping
     /// either takes the child with it.
+    /// [`live_peer`], but with a handler factory that carries `deadlines` — so
+    /// `notifications/progress` reaches [`crate::call_deadline::CallDeadlines::progress`] instead of
+    /// `bare_handler_factory`'s no-op `on_progress`.
+    async fn live_peer_watching(
+        deadlines: &Arc<crate::call_deadline::CallDeadlines>,
+    ) -> (
+        CancelToken,
+        Arc<dyn crate::server_manager::ConnectionResource>,
+        Peer<RoleClient>,
+    ) {
+        use crate::server_manager::ConnectionFactory as _;
+        let attempt = CancelToken::new();
+        let watching = {
+            let deadlines = Arc::clone(deadlines);
+            Arc::new(move |server: &str, runtime_signal: &CancelToken| {
+                crate::runtime::McpClientHandler::new(crate::runtime::McpClientHandlerParts {
+                    server: server.to_string(),
+                    runtime_signal: runtime_signal.clone(),
+                    elicitation_mode: None,
+                    sampling: None,
+                    elicitation: None,
+                    list_changed: None,
+                    elicitation_complete: None,
+                    call_deadlines: Some(Arc::clone(&deadlines)),
+                })
+            }) as crate::runtime::HandlerFactory
+        };
+        let made = crate::runtime::ConnectionBuilder::new(None)
+            .with_handler_factory(watching)
+            .create(crate::server_manager::CreateConnection {
+                trace: None,
+                name: "fixture".to_string(),
+                definition: Arc::new(live_entry()),
+                attempt: attempt.clone(),
+                request: CancelToken::new(),
+                credentials_invalidated: false,
+                request_options: None,
+            })
+            .await
+            .expect("the fixture connects");
+        let peer = made
+            .resource
+            .peer()
+            .cloned()
+            .expect("a connected resource hands its caller the live peer");
+        (attempt, made.resource, peer)
+    }
+
+    /// MCP-606 end to end, through the production [`request_on_peer`]: a `tools/call` whose budget
+    /// is 300 ms against a server that answers after a second, with an elicitation prompt held open
+    /// the whole time. Without the pause the call is abandoned at 300 ms; with it the budget is
+    /// still unspent when the prompt closes, and the already-buffered answer arrives.
+    #[tokio::test]
+    async fn a_tool_call_survives_an_elicitation_prompt_held_past_its_timeout() {
+        let deadlines = Arc::new(crate::call_deadline::CallDeadlines::default());
+        let (_attempt, _resource, peer) = live_peer().await;
+        let budget = Duration::from_millis(300);
+
+        // The prompt opens before the call starts, which is the `state.open !== 0` arm of
+        // `register`: the call is handed its deadline paused.
+        deadlines.prompt_opened("fixture");
+        let call = {
+            let deadlines = Arc::clone(&deadlines);
+            tokio::spawn(async move {
+                let pause = PausableDeadline {
+                    deadlines: &deadlines,
+                    server: "fixture",
+                    budget,
+                };
+                let params = CallToolRequestParams::new("slow").with_arguments(JsonMap::new());
+                request_on_peer(
+                    &peer,
+                    CallToolRequest::new(params).into(),
+                    PeerRequestOptions::with_timeout(budget),
+                    &CancelToken::new(),
+                    Some(&pause),
+                )
+                .await
+            })
+        };
+
+        // Four budgets' worth of the user filling in the form.
+        tokio::time::sleep(Duration::from_millis(1_200)).await;
+        deadlines.prompt_closed("fixture");
+
+        let response = call
+            .await
+            .expect("the call task joins")
+            .expect("the call must survive a prompt held past its own timeout");
+        let ServerResult::CallToolResult(result) = response else {
+            panic!("expected a CallToolResult, got {response:?}");
+        };
+        assert_eq!(
+            result
+                .content
+                .first()
+                .and_then(|c| c.as_text())
+                .map(|t| t.text.as_str()),
+            Some("slow:done")
+        );
+    }
+
+    /// MCP-607 end to end: a 1.5 s budget against a server that reports progress every second for
+    /// three seconds before answering. Each notification arrives with ~0.5 s left and refills the
+    /// budget, so the call completes at ~3 s — twice the budget it was given.
+    ///
+    /// rmcp already puts a progress token on every request's `_meta`, so nothing here asks for one;
+    /// what this proves is that [`crate::runtime::McpClientHandler::on_progress`] now restarts the
+    /// deadline the token names.
+    #[tokio::test]
+    async fn a_tool_call_reporting_progress_outlives_its_own_timeout() {
+        let deadlines = Arc::new(crate::call_deadline::CallDeadlines::default());
+        let (_attempt, _resource, peer) = live_peer_watching(&deadlines).await;
+        let budget = Duration::from_millis(1_500);
+        let pause = PausableDeadline {
+            deadlines: &deadlines,
+            server: "fixture",
+            budget,
+        };
+        let params = CallToolRequestParams::new("progressive").with_arguments(JsonMap::new());
+        let response = request_on_peer(
+            &peer,
+            CallToolRequest::new(params).into(),
+            PeerRequestOptions::with_timeout(budget),
+            &CancelToken::new(),
+            Some(&pause),
+        )
+        .await
+        .expect("progress must keep the call alive");
+        let ServerResult::CallToolResult(result) = response else {
+            panic!("expected a CallToolResult, got {response:?}");
+        };
+        assert_eq!(
+            result
+                .content
+                .first()
+                .and_then(|c| c.as_text())
+                .map(|t| t.text.as_str()),
+            Some("progressive:done")
+        );
+    }
+
+    /// The same call with no pause registered is the control: 1.5 s is 1.5 s, and the server's
+    /// progress is not listened to, so the call is cancelled on the wire and reported as a timeout.
+    #[tokio::test]
+    async fn the_same_call_without_the_pausable_deadline_times_out() {
+        let deadlines = Arc::new(crate::call_deadline::CallDeadlines::default());
+        let (_attempt, _resource, peer) = live_peer_watching(&deadlines).await;
+        let params = CallToolRequestParams::new("progressive").with_arguments(JsonMap::new());
+        let failure = request_on_peer(
+            &peer,
+            CallToolRequest::new(params).into(),
+            PeerRequestOptions::with_timeout(Duration::from_millis(1_500)),
+            &CancelToken::new(),
+            None,
+        )
+        .await
+        .expect_err("without the deadline nothing restarts the timeout");
+        assert!(
+            failure
+                .message
+                .contains("MCP request timed out after 1500 ms"),
+            "{failure:?}"
+        );
+    }
+
     async fn live_peer() -> (
         CancelToken,
         Arc<dyn crate::server_manager::ConnectionResource>,
@@ -2007,6 +2491,7 @@ done
             CallToolRequest::new(params).into(),
             PeerRequestOptions::no_options(),
             &CancelToken::new(),
+            None,
         )
         .await
         .expect("the server answered");
@@ -2127,6 +2612,7 @@ done
             ReadResourceRequest::new(ReadResourceRequestParams::new("file:///fixture.txt")).into(),
             PeerRequestOptions::no_options(),
             &CancelToken::new(),
+            None,
         )
         .await
         .expect("the server answered");
@@ -2156,6 +2642,7 @@ done
             CallToolRequest::new(params).into(),
             PeerRequestOptions::no_options(),
             &cancel,
+            None,
         )
         .await
         .expect_err("a cancelled token never returns a result");
@@ -2279,6 +2766,7 @@ done
             ui: None,
             open_browser: Arc::new(|_| Box::pin(async { Ok(()) })),
             send_message: Arc::new(|_| {}),
+            blocked_project_servers: indexmap::IndexMap::new(),
         }));
         let connection = state
             .manager

@@ -7,7 +7,7 @@ use serde_json::{Map, Value};
 
 use super::effective::EffectiveSettings;
 use super::layer::{Settings, strip_global_only};
-use super::merge::deep_merge;
+use super::merge::deep_merge_settings;
 use super::store::SettingsStore;
 use super::types::{
     FullscreenExitOutput, FullscreenScrollbar, MermaidRenderingMode, SettingsScope, TuiMode,
@@ -115,7 +115,9 @@ impl SettingsManager {
         let mut project = self.project.clone();
         strip_global_only(&mut project);
 
-        let merged = deep_merge(&self.global.to_value(), &project.to_value());
+        // CFG-097 — `deepMergeSettings`, not the generic deep merge: `defaultTools` has a
+        // special layer rule (`settings-manager.ts:250-253` @v1.0.0).
+        let merged = deep_merge_settings(&self.global.to_value(), &project.to_value());
         let merged = match merged {
             Value::Object(obj) => Settings::from_map(obj),
             _ => Settings::default(),
@@ -166,7 +168,9 @@ impl SettingsManager {
     pub fn apply_overrides(&mut self, overrides: &Settings) {
         let mut overrides = overrides.clone();
         strip_global_only(&mut overrides);
-        let merged = deep_merge(&self.effective.raw().to_value(), &overrides.to_value());
+        // CFG-097 — upstream's `applyOverrides` is `deepMergeSettings(this.settings, overrides)`
+        // (`settings-manager.ts:637`), so it carries the `defaultTools` rule too.
+        let merged = deep_merge_settings(&self.effective.raw().to_value(), &overrides.to_value());
         let merged = match merged {
             Value::Object(obj) => Settings::from_map(obj),
             _ => Settings::default(),

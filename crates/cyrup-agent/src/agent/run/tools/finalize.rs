@@ -39,6 +39,10 @@ impl From<Result<ToolResult, ToolError>> for Executed {
                     content: vec![Content::text(e.to_string())],
                     usage: None,
                     added_tool_names: Vec::new(),
+                    // `createErrorToolResult` builds `{content, details: {}}` and nothing else, so
+                    // a THROWN failure carries no structured half (AGENT-045). An `Ok` result that
+                    // reports failure keeps one — that asymmetry is `AGENT-046`'s subject.
+                    structured_content: None,
                     terminate: TerminateHint::Unspecified,
                 },
                 is_error: true,
@@ -121,10 +125,33 @@ pub(super) fn fold_tool_outcome(
         mut details,
         mut usage,
         mut added_tool_names,
+        mut structured_content,
         mut terminate,
     } = result;
     match hook {
         AfterOutcome::Override(ov) => {
+            // Pi `finalizeExecutedToolCall` (`agent-loop.ts:877-889` @v1.0.0), ported literally:
+            //
+            //   const structuredContent =
+            //       afterResult.structuredContent ?? (afterResult.content ? undefined : result.structuredContent);
+            //   …
+            //   if (structuredContent === undefined) delete result.structuredContent;
+            //   else result.structuredContent = structuredContent;
+            //
+            // Three cases, under the comment "Structured content not replaced along with the
+            // content may no longer match it": the hook returns it → replace; the hook returns
+            // `content` WITHOUT it → DROP, because the structured half may no longer describe the
+            // text; the hook returns neither → keep the tool's own value. Note upstream's
+            // `delete`: the key is REMOVED, never set to null — `None` is that removal.
+            //
+            // `ov.content.is_some()` is the faithful test. Upstream gates on the truthiness of
+            // `afterResult.content`, and an array is truthy in JS even when empty, so a hook that
+            // blanks the content with `Some(vec![])` drops the structured half here too.
+            structured_content = match (&ov.structured_content, ov.content.is_some()) {
+                (Some(sc), _) => Some(sc.clone()),
+                (None, true) => None,
+                (None, false) => structured_content,
+            };
             if let Some(c) = ov.content {
                 content = c;
             }
@@ -158,6 +185,9 @@ pub(super) fn fold_tool_outcome(
             details = Some(empty_details());
             usage = None;
             added_tool_names = Vec::new();
+            // `createErrorToolResult` replaces the WHOLE result, so the structured half goes with
+            // `usage` and `added_tool_names` (AGENT-045).
+            structured_content = None;
             is_error = true;
             terminate = TerminateHint::Unspecified;
         }
@@ -175,7 +205,7 @@ pub(super) fn fold_tool_outcome(
         // (agent-loop.ts:741); this reaches the wire payload via `convert_to_llm`.
         timestamp: now_millis(),
     };
-    Finalized::new(source_index, message, terminate)
+    Finalized::new(source_index, message, terminate, structured_content)
 }
 
 #[cfg(test)]
@@ -211,8 +241,37 @@ mod tests {
             details: Some(json!({ "k": "v" })),
             usage: Some(usage(11)),
             added_tool_names: vec!["late".to_string()],
+            structured_content: None,
             terminate: TerminateHint::Terminate,
         }
+    }
+
+    /// AGENT-045 — the same result, plus the machine-readable half a tool with an `output_schema`
+    /// is expected to set.
+    fn ok_result_with_structured() -> ToolResult {
+        ToolResult {
+            structured_content: Some(json!({ "exitCode": 0, "output": "hi" })),
+            ..ok_result()
+        }
+    }
+
+    /// The structured half `fold_tool_outcome` settled on, read back off the OBSERVABLE surface:
+    /// the `tool_execution_end.result` payload, which is where pi's `finalized.result` lands.
+    /// `None` means the key is absent from that payload, which is pi's `delete`, never a `null`.
+    fn folded_structured(hook: AfterOutcome, result: ToolResult) -> Option<Value> {
+        let executed = Executed {
+            result,
+            is_error: false,
+        };
+        let fin = fold_tool_outcome(&call(), 0, executed, hook);
+        let AgentEvent::ToolExecutionEnd { result, .. } = fin.end_event() else {
+            panic!("end_event is ToolExecutionEnd");
+        };
+        assert!(
+            result.get("structuredContent").is_none_or(|v| !v.is_null()),
+            "absent, never `null` (pi `delete result.structuredContent`): {result}"
+        );
+        result.get("structuredContent").cloned()
     }
 
     fn text_of(c: &[Content]) -> Vec<String> {
@@ -288,7 +347,7 @@ mod tests {
             &call(),
             0,
             Executed::from(Ok(ok_result())),
-            AfterOutcome::Override(over),
+            AfterOutcome::Override(Box::new(over)),
         );
         assert_eq!(
             fin.terminate(),
@@ -324,7 +383,7 @@ mod tests {
             &call(),
             0,
             Executed::from(Ok(ok_result())),
-            AfterOutcome::Override(flip),
+            AfterOutcome::Override(Box::new(flip)),
         );
         assert!(fin.into_message().is_error);
     }
@@ -365,7 +424,7 @@ mod tests {
             is_error: true,
             timestamp: now_millis(),
         };
-        let fin = Finalized::new(7, message, TerminateHint::Continue);
+        let fin = Finalized::new(7, message, TerminateHint::Continue, None);
         assert_eq!(fin.source_index(), 7);
         let AgentEvent::ToolExecutionEnd {
             tool_call_id,
@@ -387,5 +446,174 @@ mod tests {
         assert!(result.get("details").is_none());
         assert!(result.get("usage").is_none());
         assert!(result.get("addedToolNames").is_none());
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // AGENT-045 — `outputSchema` / `structuredContent`
+    // -----------------------------------------------------------------------------------------
+
+    /// AGENT-045 — the structured half is carried through finalization and reaches the
+    /// `tool_execution_end.result` payload, while the MODEL-facing transcript message never gains
+    /// the key.
+    ///
+    /// pi `AgentToolResult.structuredContent` (`agent/src/types.ts:429-433` @v1.0.0): *"Machine-
+    /// readable result matching the tool's `outputSchema`, for programmatic callers. Not sent to
+    /// the model; `content` remains the model-facing result."* `emitToolExecutionEnd` emits
+    /// `result: finalized.result` verbatim, so the key IS in that event; `packages/ai/src/types.ts`'s
+    /// `ToolResultMessage` has no such field, so the transcript keeps none.
+    ///
+    /// RED before the fix: `ToolResult` had no `structured_content`, so there was nothing to carry.
+    #[test]
+    fn agent045_structured_content_reaches_the_end_event_but_never_the_model_message() {
+        let executed = Executed {
+            result: ok_result_with_structured(),
+            is_error: false,
+        };
+        let fin = fold_tool_outcome(&call(), 0, executed, AfterOutcome::Keep);
+
+        let AgentEvent::ToolExecutionEnd { result, .. } = fin.end_event() else {
+            panic!("end_event is ToolExecutionEnd");
+        };
+        assert_eq!(
+            result.get("structuredContent"),
+            Some(&json!({ "exitCode": 0, "output": "hi" })),
+            "the structured half must reach `tool_execution_end.result` (pi emits `finalized.result` verbatim)"
+        );
+        // `content` is still the model-facing result, unchanged by the structured half.
+        assert_eq!(
+            result.get("content"),
+            Some(
+                &serde_json::to_value(vec![Content::text("tool said")])
+                    .expect("content serializes")
+            )
+        );
+
+        // The persisted message is the model-facing one: no structured key anywhere in it.
+        let msg = fin.into_message();
+        let as_json = serde_json::to_value(&msg).expect("the message serializes");
+        assert!(
+            as_json.get("structuredContent").is_none(),
+            "pi's transcript `ToolResultMessage` has no `structuredContent` at v1.0.0, so the \
+             persisted message must not carry one: {as_json}"
+        );
+    }
+
+    /// A tool that sets nothing leaves the key ABSENT — not null. pi's `delete result.structuredContent`
+    /// removes it (`agent-loop.ts:888`), and `JSON.stringify` then omits it entirely.
+    #[test]
+    fn agent045_a_tool_that_returns_none_puts_no_key_on_the_wire() {
+        let executed = Executed {
+            result: ok_result(),
+            is_error: false,
+        };
+        let fin = fold_tool_outcome(&call(), 0, executed, AfterOutcome::Keep);
+        let AgentEvent::ToolExecutionEnd { result, .. } = fin.end_event() else {
+            panic!("end_event is ToolExecutionEnd");
+        };
+        assert!(
+            !result
+                .as_object()
+                .expect("an object")
+                .contains_key("structuredContent"),
+            "absent, never `null`: {result}"
+        );
+    }
+
+    /// AGENT-045's three hook cases, which are the whole point of the field's contract
+    /// (`AfterToolCallResult.structuredContent`, `agent/src/types.ts:85-88`): *"if provided,
+    /// replaces the structured content. If `content` is provided without it, the structured content
+    /// is dropped, because it may no longer match the content. Return it along with `content` to
+    /// keep it."* Implemented at `agent-loop.ts:877-889`.
+    #[test]
+    fn agent045_the_after_hook_drop_rule_is_ported_literally() {
+        // (1) returns `structured_content` → REPLACED.
+        assert_eq!(
+            folded_structured(
+                AfterOutcome::Override(Box::new(AfterOverride {
+                    structured_content: Some(json!({ "replaced": true })),
+                    ..AfterOverride::default()
+                })),
+                ok_result_with_structured(),
+            ),
+            Some(json!({ "replaced": true })),
+        );
+
+        // (2) returns `content` ALONE → DROPPED, because the structured half may no longer match
+        // the text the hook just rewrote. This is the non-obvious arm.
+        assert_eq!(
+            folded_structured(
+                AfterOutcome::Override(Box::new(AfterOverride {
+                    content: Some(vec![Content::text("redacted")]),
+                    ..AfterOverride::default()
+                })),
+                ok_result_with_structured(),
+            ),
+            None,
+            "content without structured content drops it (agent-loop.ts:879-880)",
+        );
+
+        // (3) returns NEITHER → the tool's own value is preserved.
+        assert_eq!(
+            folded_structured(
+                AfterOutcome::Override(Box::new(AfterOverride {
+                    details: Some(json!({ "ui": "only" })),
+                    ..AfterOverride::default()
+                })),
+                ok_result_with_structured(),
+            ),
+            Some(json!({ "exitCode": 0, "output": "hi" })),
+            "a hook with no opinion on either field keeps the tool's structured half",
+        );
+
+        // (4) returns BOTH → kept, which is upstream's "Return it along with `content` to keep it."
+        assert_eq!(
+            folded_structured(
+                AfterOutcome::Override(Box::new(AfterOverride {
+                    content: Some(vec![Content::text("redacted")]),
+                    structured_content: Some(json!({ "both": true })),
+                    ..AfterOverride::default()
+                })),
+                ok_result_with_structured(),
+            ),
+            Some(json!({ "both": true })),
+        );
+
+        // (5) An EMPTY content array still drops it. pi gates on `afterResult.content`'s
+        // truthiness and `[]` is truthy in JS, so a hook that blanks the content drops the
+        // structured half too — `ov.content.is_some()` is that test.
+        assert_eq!(
+            folded_structured(
+                AfterOutcome::Override(Box::new(AfterOverride {
+                    content: Some(Vec::new()),
+                    ..AfterOverride::default()
+                })),
+                ok_result_with_structured(),
+            ),
+            None,
+            "an empty content array is truthy upstream, so it drops the structured half too",
+        );
+    }
+
+    /// A THROWING tool and a THROWING hook both go through `createErrorToolResult`, which builds
+    /// `{content, details:{}}` and nothing else — so neither can carry a structured half.
+    #[test]
+    fn agent045_an_error_tool_result_carries_no_structured_half() {
+        // The tool threw: `Executed::from(Err)`.
+        let executed = Executed::from(Err(ToolError::new("boom")));
+        assert!(
+            executed.result.structured_content.is_none(),
+            "`createErrorToolResult` has no structured half"
+        );
+
+        // The HOOK threw: the whole result is replaced, so a structured half the tool DID set goes
+        // with `usage` and `added_tool_names`.
+        assert_eq!(
+            folded_structured(
+                AfterOutcome::Failed(HookError::new("hook exploded")),
+                ok_result_with_structured(),
+            ),
+            None,
+            "a throwing hook discards the whole result, structured half included",
+        );
     }
 }

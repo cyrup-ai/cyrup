@@ -236,6 +236,9 @@ fn production_child_env(cwd: &Path, parent_id: &str) -> std::collections::HashMa
         structured_output_schema: None,
         model_override: RunModelOverride::Inherit,
         preferred_provider: None,
+        // SUBA-155 — a fixture launch has no parent session model, so the reserved
+        // `modelScope` allow tokens stay unexpanded (upstream's fail-closed rule).
+        parent_model: None,
         available_models: vec![ModelId::from("m1")],
         cancel: CancelToken::new(),
         interrupt: CancelToken::new(),
@@ -250,6 +253,9 @@ fn production_child_env(cwd: &Path, parent_id: &str) -> std::collections::HashMa
         live_events: None,
         // The launching session's own id — the anchor a child addresses its forwarded asks at.
         parent_session_id: Some(parent_id.to_string()),
+        // SUBA-158 — a fixture launch carries no host trust information, which is pi's
+        // `undefined` arm: the child decides for itself, exactly as before the field existed.
+        parent_project_trusted: None,
         clarify: None,
         orchestrator_intercom_target: None,
         run_id: None,

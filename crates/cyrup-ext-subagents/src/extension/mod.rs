@@ -71,6 +71,10 @@ pub(crate) mod models;
 // ready payload, and `background/watch/observer.rs` advertises the completion topic it names; the
 // four WIRE constants a client integrates against are `pub` on the module itself.
 pub(crate) mod rpc;
+// SUBA-150 — the reply-fenced workflow-script grammar (pi `src/extension/reply-workflow-script.ts`
+// @v0.74.0). `pub` because it is a pure function of data with no session dependency: the caller
+// that owns the branch supplies the joined reply text and the `workflow: true` call count.
+pub mod reply_workflow_script;
 mod tool;
 pub(crate) mod wait_tool;
 

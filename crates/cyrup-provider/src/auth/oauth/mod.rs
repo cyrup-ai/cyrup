@@ -168,7 +168,7 @@ mod tests {
 
     use super::*;
     use crate::auth::types::{Credential, ModelAuth};
-    use crate::auth::{OAuthAuth, ProviderAuth};
+    use crate::auth::{LoginOptions, OAuthAuth, ProviderAuth};
     use std::sync::Arc;
 
     #[test]
@@ -240,7 +240,7 @@ mod tests {
 
         use super::super::*;
         use crate::auth::types::{Credential, ModelAuth};
-        use crate::auth::{AuthError, OAuthAuth};
+        use crate::auth::{AuthError, LoginOptions, OAuthAuth};
         use std::sync::Arc;
         use std::time::Duration;
 
@@ -289,6 +289,7 @@ mod tests {
             async fn login(
                 &self,
                 interaction: &dyn AuthInteraction,
+                _options: &LoginOptions,
             ) -> Result<Credential, OAuthError> {
                 let pkce = generate_pkce()?;
                 let state = random_token(16)?;
@@ -384,7 +385,10 @@ mod tests {
             let login = {
                 let flow = Arc::clone(&flow);
                 let interaction = Arc::clone(&interaction);
-                tokio::spawn(async move { flow.login(interaction.as_ref()).await })
+                tokio::spawn(async move {
+                    flow.login(interaction.as_ref(), &LoginOptions::default())
+                        .await
+                })
             };
 
             // Wait for the flow to publish its authorize URL, exactly as a TUI would.
@@ -452,7 +456,11 @@ mod tests {
                 Arc::new(ScriptedInteraction::new(Vec::new()).with_cancel(token.clone()));
             let login = {
                 let interaction = Arc::clone(&interaction);
-                tokio::spawn(async move { DemoFlow.login(interaction.as_ref()).await })
+                tokio::spawn(async move {
+                    DemoFlow
+                        .login(interaction.as_ref(), &LoginOptions::default())
+                        .await
+                })
             };
             tokio::time::sleep(Duration::from_millis(30)).await;
             token.cancel();
@@ -469,7 +477,10 @@ mod tests {
         let flow = NoLoginFlow;
         assert!(flow.login_label().is_none());
         let interaction = ScriptedInteraction::new(Vec::new());
-        let err = flow.login(&interaction).await.unwrap_err();
+        let err = flow
+            .login(&interaction, &LoginOptions::default())
+            .await
+            .unwrap_err();
         assert_eq!(
             err.to_string(),
             "Test OAuth does not support interactive OAuth login"
@@ -477,5 +488,84 @@ mod tests {
         // And it is still usable as the provider-level strategy object.
         let auth = ProviderAuth::with_oauth(Arc::new(NoLoginFlow));
         assert!(auth.is_configured());
+    }
+
+    /// PROV-118 (a) — `02eed88fd` added `LoginOptions { getDeviceId?: () => string }` as the
+    /// optional second parameter of `OAuthAuth.login` (`auth/types.ts:206-226`), for "the stable
+    /// ID of this app installation, e.g. sent to OpenAI as its agent host ID", and
+    /// `Models.login(providerId, type, interaction, options?)` is where the app supplies it
+    /// (`models.ts:756-770`).
+    ///
+    /// This drives it through `dyn OAuthAuth` — the shape the provider actually carries — and
+    /// asserts three things: the closure reaches a flow that asks for one, it is **not** called by
+    /// a flow that does not ask, and the "called without options" path still works.
+    #[tokio::test]
+    async fn the_device_id_closure_reaches_a_flow_that_asks_for_one() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        /// A flow whose credential's access token IS whatever device id it was handed, so the
+        /// value is observed through the flow's own result rather than through a side channel.
+        struct DeviceIdFlow;
+
+        #[async_trait::async_trait]
+        impl OAuthAuth for DeviceIdFlow {
+            fn name(&self) -> &str {
+                "Device Id Flow"
+            }
+            async fn login(
+                &self,
+                _interaction: &dyn AuthInteraction,
+                options: &LoginOptions,
+            ) -> Result<Credential, OAuthError> {
+                // `options?.getDeviceId?.()`
+                let device = options.device_id().unwrap_or_else(|| "none".to_string());
+                Ok(oauth_credential(device, "r", 0))
+            }
+            async fn refresh(&self, cred: &Credential) -> Result<Credential, AuthError> {
+                Ok(cred.clone())
+            }
+            async fn to_auth(&self, _cred: &Credential) -> Result<ModelAuth, AuthError> {
+                Ok(ModelAuth::default())
+            }
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let options = {
+            let calls = Arc::clone(&calls);
+            LoginOptions::with_device_id(move || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                "install-7f3a".to_string()
+            })
+        };
+
+        let flow: Arc<dyn OAuthAuth> = Arc::new(DeviceIdFlow);
+        let interaction = ScriptedInteraction::new(Vec::new());
+        let cred = flow.login(&interaction, &options).await.unwrap();
+        match &cred {
+            Credential::Oauth { access, .. } => assert_eq!(access, "install-7f3a"),
+            other => panic!("expected an oauth credential, got {other:?}"),
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "a flow that asks calls the closure exactly once"
+        );
+
+        // "Called only by login flows that need it": `NoLoginFlow` never asks, so the app's
+        // closure is not invoked — which is what lets an app create the id lazily on first use.
+        let silent: Arc<dyn OAuthAuth> = Arc::new(NoLoginFlow);
+        let _ = silent.login(&interaction, &options).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // `options === undefined`: the flow sees no device id and says so.
+        let cred = flow
+            .login(&interaction, &LoginOptions::default())
+            .await
+            .unwrap();
+        match &cred {
+            Credential::Oauth { access, .. } => assert_eq!(access, "none"),
+            other => panic!("expected an oauth credential, got {other:?}"),
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 }

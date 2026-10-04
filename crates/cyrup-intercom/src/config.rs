@@ -46,6 +46,33 @@ pub enum BusyDelivery {
     HumanFirst,
 }
 
+/// `CrossMachineConfig` (`v0.16.0 config.ts:31-36`, narrowed to exactly these two keys by
+/// `dd0580b`) — "Cross-machine discovery and SSH relay settings."
+///
+/// Both keys are REQUIRED in the type and defaulted in [`IntercomConfig::default`], never
+/// `Option`: upstream's `defaults.crossMachine` is a concrete object and every read site
+/// (`sendCrossMachine`'s `remoteCommand`, `resolveOrigin`'s `machineName`) dereferences it
+/// unconditionally.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CrossMachineConfig {
+    /// "Name peers use for this host in their Herdr saved-machine lists" (`:33`). Defaults to
+    /// [`crate::cross_machine::default_machine_name`] of this host's name.
+    pub machine_name: String,
+    /// "Command invoked through SSH on remote machines" (`:35`). Upstream defaults to the
+    /// `pi-intercom` binary; cyrup defaults to the binary cyrup actually installs,
+    /// [`DEFAULT_REMOTE_COMMAND`].
+    pub remote_command: String,
+}
+
+/// The default `crossMachine.remoteCommand`.
+///
+/// Upstream's is the literal `"pi-intercom"` (`v0.16.0 config.ts:84`), the bin its package
+/// exposes. cyrup's counterpart bin is `cyrup-intercom-cli` — the same substitution ICOM-067
+/// settled for the CLI's usage line, default name and model — so the default here names the
+/// command that actually exists on a cyrup host. A `config.json` written for pi still works: the
+/// key is read verbatim when present.
+pub const DEFAULT_REMOTE_COMMAND: &str = "cyrup-intercom-cli";
+
 /// `IntercomConfig` (`v0.14.0 config.ts:29-53`). `broker_command`/`broker_args` are parsed for wire-parity
 /// with pi's `config.json`, but cyrup's broker spawn re-execs `current_exe __intercom-broker`
 /// (`transport::spawn`) rather than shelling out to `npx tsx`, so they are informational on cyrup.
@@ -74,6 +101,8 @@ pub struct IntercomConfig {
     pub enabled: bool,
     /// Show the reply hint in incoming messages (`config.ts:55`, true).
     pub reply_hint: bool,
+    /// "Cross-machine discovery and SSH relay settings" (`v0.16.0 config.ts:66-67`).
+    pub cross_machine: CrossMachineConfig,
 }
 
 impl Default for IntercomConfig {
@@ -88,6 +117,14 @@ impl Default for IntercomConfig {
             stable_id: None,
             enabled: true,
             reply_hint: true,
+            // `v0.16.0 config.ts:82-85`. Upstream notes at `:91`/`:104` that the nested object is
+            // CLONED rather than shared with `defaults`; owned `String`s make that structural here.
+            cross_machine: CrossMachineConfig {
+                machine_name: crate::cross_machine::default_machine_name(
+                    &cyrup_ext_subagents::background::async_retention::machine_hostname(),
+                ),
+                remote_command: DEFAULT_REMOTE_COMMAND.to_string(),
+            },
         }
     }
 }
@@ -219,6 +256,27 @@ fn parse_config(raw: &str) -> Result<IntercomConfig, String> {
         }
         config.stable_id = Some(trimmed.to_string());
     }
+    // `v0.16.0 config.ts:189-207`. Three distinct refusals, byte-identical to upstream's: a
+    // non-object `crossMachine`, and a blank-or-non-string value for either key. Each present key
+    // is `.trim()`ed; an absent one keeps the default, so `{"crossMachine": {}}` is legal.
+    if let Some(v) = obj.get("crossMachine") {
+        let map = v
+            .as_object()
+            .ok_or_else(|| "\"crossMachine\" must be an object".to_string())?;
+        for (key, slot) in [
+            ("machineName", &mut config.cross_machine.machine_name),
+            ("remoteCommand", &mut config.cross_machine.remote_command),
+        ] {
+            if let Some(raw) = map.get(key) {
+                let trimmed = raw
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| format!("\"crossMachine.{key}\" must be a non-empty string"))?;
+                *slot = trimmed.to_string();
+            }
+        }
+    }
     Ok(config)
 }
 
@@ -325,6 +383,82 @@ mod tests {
         assert_eq!(cfg.inbound_trigger, InboundTrigger::Replies);
         assert!(!cfg.enabled);
         assert_eq!(cfg.status.as_deref(), Some("busy"));
+    }
+
+    /// ICOM-073 (ICOM-074's prerequisite) — `crossMachine` (`v0.16.0 config.ts:189-207`). Three
+    /// distinct refusals, each key `.trim()`ed, each absent key keeping the default, and an unknown
+    /// top-level `crossMachine` no longer silently ignored.
+    #[test]
+    fn cross_machine_keys_are_trimmed_validated_and_default_per_key() {
+        let defaults = IntercomConfig::default();
+        assert_eq!(
+            defaults.cross_machine.remote_command,
+            DEFAULT_REMOTE_COMMAND
+        );
+        assert!(
+            !defaults.cross_machine.machine_name.is_empty()
+                && defaults.cross_machine.machine_name
+                    == defaults.cross_machine.machine_name.to_lowercase(),
+            "`defaultMachineName(hostname())` is a lower-cased first dot-segment: {:?}",
+            defaults.cross_machine.machine_name
+        );
+
+        let both = parse_config(
+            r#"{"crossMachine":{"machineName":"  Laptop  ","remoteCommand":"  pi-intercom  "}}"#,
+        )
+        .expect("valid");
+        assert_eq!(both.cross_machine.machine_name, "Laptop");
+        assert_eq!(
+            both.cross_machine.remote_command, "pi-intercom",
+            "a config written for a pi peer is read verbatim, not rewritten"
+        );
+
+        // Each key defaults INDEPENDENTLY — `{}` is legal and changes nothing.
+        let empty = parse_config(r#"{"crossMachine":{}}"#).expect("valid");
+        assert_eq!(empty.cross_machine, defaults.cross_machine);
+        let one = parse_config(r#"{"crossMachine":{"machineName":"ws"}}"#).expect("valid");
+        assert_eq!(one.cross_machine.machine_name, "ws");
+        assert_eq!(
+            one.cross_machine.remote_command,
+            defaults.cross_machine.remote_command
+        );
+
+        for (raw, expected) in [
+            (
+                r#"{"crossMachine":"ws"}"#,
+                "\"crossMachine\" must be an object",
+            ),
+            (
+                r#"{"crossMachine":[]}"#,
+                "\"crossMachine\" must be an object",
+            ),
+            (
+                r#"{"crossMachine":null}"#,
+                "\"crossMachine\" must be an object",
+            ),
+            (
+                r#"{"crossMachine":{"machineName":""}}"#,
+                "\"crossMachine.machineName\" must be a non-empty string",
+            ),
+            (
+                r#"{"crossMachine":{"machineName":"   "}}"#,
+                "\"crossMachine.machineName\" must be a non-empty string",
+            ),
+            (
+                r#"{"crossMachine":{"machineName":7}}"#,
+                "\"crossMachine.machineName\" must be a non-empty string",
+            ),
+            (
+                r#"{"crossMachine":{"remoteCommand":""}}"#,
+                "\"crossMachine.remoteCommand\" must be a non-empty string",
+            ),
+            (
+                r#"{"crossMachine":{"remoteCommand":false}}"#,
+                "\"crossMachine.remoteCommand\" must be a non-empty string",
+            ),
+        ] {
+            assert_eq!(parse_config(raw).expect_err(raw), expected, "{raw}");
+        }
     }
 
     #[test]

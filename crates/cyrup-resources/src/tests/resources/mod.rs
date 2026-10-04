@@ -18,6 +18,7 @@
 )]
 
 mod autoload_delta;
+mod color;
 mod discovery;
 mod fixtures;
 mod git_clone;

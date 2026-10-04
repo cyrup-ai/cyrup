@@ -866,6 +866,11 @@ pub struct ServerConnection {
     /// `connection.promptDiscoveryFailed` — the `prompts` capability was advertised but
     /// `prompts/list` threw. See [`Discovery`] for why this is not the same as empty prompts.
     prompt_discovery_failed: AtomicBool,
+    /// `connection.toolListHints` — the hints this connection's latest `tools/list` declared
+    /// (MCP-505/MCP-596). Rewritten with the tools by [`Self::set_tools_with_hints`], because
+    /// upstream assigns the two together and compares both when deciding whether a refresh
+    /// changed anything (`server-manager.ts:705-717`).
+    tool_list_hints: Mutex<Option<ToolListHints>>,
     /// `disposeConnection` **completed** for this record — or is running and will complete; see
     /// [`Self::dispose`] and [`DisposeGuard`], which puts the flag back when it does not. Distinct
     /// from `status == closed`: `close` sets the status *before* awaiting cleanup so a replacement
@@ -918,6 +923,7 @@ impl ServerConnection {
             prompts,
             prompt_discovery_failed,
             instructions,
+            tool_list_hints,
         } = discovery;
         let connection = Arc::new(Self {
             definition,
@@ -931,6 +937,7 @@ impl ServerConnection {
             resources: Mutex::new(Vec::new()),
             prompts: Mutex::new(Vec::new()),
             prompt_discovery_failed: AtomicBool::new(false),
+            tool_list_hints: Mutex::new(None),
             disposed: AtomicBool::new(false),
         });
         // The three assignments upstream performs on the record it has just built
@@ -941,7 +948,7 @@ impl ServerConnection {
         //
         // Nothing can observe the gap: this `Arc` is the only one in existence until the manager
         // publishes it into `connections`, which happens strictly after this function returns.
-        connection.set_tools(tools);
+        connection.set_tools_with_hints(tools, tool_list_hints);
         connection.set_resources(resources);
         connection.set_prompts(prompts, prompt_discovery_failed);
         connection
@@ -1058,6 +1065,29 @@ impl ServerConnection {
     /// (MCP-119) and again by every `tools/list_changed` refresh (MCP-120).
     pub fn set_tools(&self, tools: Vec<Tool>) {
         *self.tools.lock().unwrap_or_else(PoisonError::into_inner) = tools;
+    }
+
+    /// `connection.tools = toolResult.tools; connection.toolListHints = toolResult.hints;`
+    /// (`server-manager.ts:715-716`) — the pair, written together.
+    ///
+    /// Separate from [`Self::set_tools`] rather than replacing it: `list_changed` refreshes that
+    /// re-list the tools carry hints, while the callers that only rewrite the vector (a filtered
+    /// surface, a test) must not silently clear a hint the server did declare.
+    pub fn set_tools_with_hints(&self, tools: Vec<Tool>, hints: Option<ToolListHints>) {
+        *self.tools.lock().unwrap_or_else(PoisonError::into_inner) = tools;
+        *self
+            .tool_list_hints
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = hints;
+    }
+
+    /// `connection.toolListHints`.
+    #[must_use]
+    pub fn tool_list_hints(&self) -> Option<ToolListHints> {
+        *self
+            .tool_list_hints
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     /// `connection.resources`.
@@ -1268,8 +1298,46 @@ pub struct CreateConnection {
 /// **live** set at all. Collapsing the two would make a transient list failure look like a server
 /// that deliberately publishes nothing, and cache the emptiness.
 ///
-/// [`Default`] is `{ [], [], [], false, None }` — what a `needs-auth` early return carries, and
-/// what every test factory that is not exercising discovery wants.
+/// `toolListHints?: Partial<Pick<ListToolsResult, "ttlMs" | "cacheScope">>`
+/// (`server-manager.ts:199`) — the server-level cache hints its `tools/list` answer carried.
+///
+/// From the **first page only** (`fetchAllTools`, `server-manager.ts:1830-1844`): a paginated
+/// listing declares its freshness once, and a later page is part of the same listing.
+///
+/// `None` for the whole struct where upstream writes `undefined`, which is what
+/// `...(hints !== undefined ? { hints } : {})` omits — a server that declared neither hint leaves
+/// both cache keys absent rather than writing nulls into `mcp-cache.json`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ToolListHints {
+    /// `ListToolsResult["ttlMs"]` (SEP-2549) — how long this listing may be treated as fresh.
+    /// `Some(0)` is a real value and means "never cache", which
+    /// [`crate::registration::is_server_cache_valid`] honours (MCP-505).
+    pub ttl_ms: Option<u64>,
+    /// `ListToolsResult["cacheScope"]` — [`rmcp::model::CacheScope::Private`] means this listing is
+    /// tied to the authorization context that fetched it, so it must not reach the shared
+    /// `mcp-cache.json` as a readable entry (MCP-596).
+    pub cache_scope: Option<rmcp::model::CacheScope>,
+}
+
+impl ToolListHints {
+    /// `if (ttlMs !== undefined || cacheScope !== undefined) hints = {…}` — upstream builds the
+    /// object only when at least one member survived, and the distinction is observable: an absent
+    /// `hints` leaves `cacheScope` out of the cache entry, where a present-but-empty one would
+    /// still have to be reasoned about.
+    #[must_use]
+    pub fn non_empty(self) -> Option<Self> {
+        (self != Self::default()).then_some(self)
+    }
+
+    /// `cacheScope === "private"`.
+    #[must_use]
+    pub fn is_private(self) -> bool {
+        self.cache_scope == Some(rmcp::model::CacheScope::Private)
+    }
+}
+
+/// [`Default`] is `{ [], [], [], false, None, None }` — what a `needs-auth` early return carries,
+/// and what every test factory that is not exercising discovery wants.
 #[derive(Debug, Default)]
 pub struct Discovery {
     /// `connection.tools` — `fetchAllTools`, unconditional, errors propagate.
@@ -1284,6 +1352,9 @@ pub struct Discovery {
     /// `client.getInstructions?.()`, read before the lists (§3.9). `None` is upstream's
     /// `undefined`, which is the case its `...(instructions !== undefined ? …)` spread omits.
     pub instructions: Option<String>,
+    /// `connection.toolListHints = toolResult.hints` (`server-manager.ts:716`, `:941`, `:1252`) —
+    /// MCP-505/MCP-596.
+    pub tool_list_hints: Option<ToolListHints>,
 }
 
 /// What `createConnection` returns.
@@ -1312,6 +1383,23 @@ pub struct NewConnection {
 pub trait ConnectionFactory: Send + Sync + 'static {
     /// Build one connection, or fail.
     fn create(&self, request: CreateConnection) -> BoxFuture<'static, McpResult<NewConnection>>;
+
+    /// `validateCaFile(definition); this.validateProviderAuth(name, definition)` — the synchronous
+    /// pre-flight both `connect` (`server-manager.ts:479-480`) and `reconnect` (`:578-579`) run
+    /// **before** the disabled guard, and therefore before any teardown.
+    ///
+    /// It lives on the factory rather than the manager because the facts it judges — the resolved
+    /// environment, and whether a provider-token lookup was installed — belong to the thing that
+    /// builds connections. The default answers `Ok(())`, which is what every definition that does
+    /// not use `auth: { provider }` gets.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the implementation refuses the definition with, reported to the caller of
+    /// `connect`/`reconnect` unchanged.
+    fn validate_definition(&self, _name: &str, _definition: &ServerEntry) -> McpResult<()> {
+        Ok(())
+    }
 }
 
 /// The default factory: fail loudly, naming the units that would build a connection.
@@ -1460,6 +1548,15 @@ pub struct McpServerManager {
     /// `invalidateAuthEntryCache` evicts a cache nobody reads. This slot is what makes that eviction
     /// mean something.
     auth_store: Mutex<Option<crate::credentials::McpAuthStore>>,
+    /// `promptPauses` (`elicitation-handler.ts:44`) — the pausable call deadlines, MCP-606/MCP-607.
+    ///
+    /// Upstream hangs this off the `Client` through a `WeakMap`; here it is the manager's, because
+    /// the manager is the one object both ends can reach: [`crate::live`]'s `request_on_peer`
+    /// registers a deadline per `tools/call`, and the [`crate::runtime::McpClientHandler`] the
+    /// factory builds pauses and restarts them from `elicitation/create` and
+    /// `notifications/progress`. It is **not** nulled by `close_all`: a deadline outliving its
+    /// generation is a timer, not a callback into a dead runtime, and its registration is `Weak`.
+    call_deadlines: Arc<crate::call_deadline::CallDeadlines>,
 }
 
 impl std::fmt::Debug for McpServerManager {
@@ -1512,6 +1609,7 @@ impl McpServerManager {
             auth_storage_options: Mutex::new(crate::credentials::AuthStorageOptions::default()),
             oauth_runtime: Mutex::new(None),
             auth_store: Mutex::new(None),
+            call_deadlines: Arc::new(crate::call_deadline::CallDeadlines::default()),
         }
     }
 
@@ -1779,6 +1877,13 @@ impl McpServerManager {
     }
 
     /// `incrementInFlight(name)`.
+    /// `promptPauses.get(client)` — the pausable deadlines of every call in flight on this
+    /// manager (MCP-606/MCP-607). See [`crate::call_deadline`].
+    #[must_use]
+    pub fn call_deadlines(&self) -> &Arc<crate::call_deadline::CallDeadlines> {
+        &self.call_deadlines
+    }
+
     pub fn increment_in_flight(&self, name: &str) {
         if let Some(connection) = self.tables().connections.get(name) {
             connection.increment_in_flight();
@@ -1997,6 +2102,11 @@ impl McpServerManager {
     ) -> ManagerResult<Arc<ServerConnection>> {
         // MEASURED: both guards fire before anything else, including before the single-flight map is
         // consulted, and `connect` and `reconnect` carry the identical two strings.
+        // `validateCaFile` / `validateProviderAuth` run FIRST, ahead of the disabled guard
+        // (`server-manager.ts:479-480`, `:578-579`).
+        self.factory
+            .validate_definition(name, definition)
+            .map_err(ManagerError::mcp)?;
         if definition.is_disabled() {
             return Err(ManagerError::other(server_disabled_message(name)));
         }
@@ -2292,6 +2402,11 @@ impl McpServerManager {
     ) -> ManagerResult<Arc<ServerConnection>> {
         // Both guards are load-bearing and are *not* inherited from `connect`: a reconnect on a
         // just-disabled server must fail **before any teardown happens** (§3.11).
+        // `validateCaFile` / `validateProviderAuth` run FIRST, ahead of the disabled guard
+        // (`server-manager.ts:479-480`, `:578-579`).
+        self.factory
+            .validate_definition(name, definition)
+            .map_err(ManagerError::mcp)?;
         if definition.is_disabled() {
             return Err(ManagerError::other(server_disabled_message(name)));
         }
@@ -3029,9 +3144,9 @@ impl McpServerManager {
     ///
     /// **No production caller yet — and that is not a live in-flight-accounting bug.** The one
     /// shipping request path, the proxy's `tools/call`, performs the same four accounting calls
-    /// inline: `touch` + `increment_in_flight` at `proxy/call.rs:710-711` and
-    /// `decrement_in_flight` + `touch` at `:724-725`. So no slot leaks today; what MCP-121 buys is
-    /// [`InFlightGuard`]'s `Drop` in place of a statement pair that an early `?` could skip.
+    /// through its own RAII equivalent, `proxy::call::InFlightScope`, which raises the count before
+    /// the approval gate and decrements in `Drop` (MCP-600). So no slot leaks today; what MCP-121
+    /// buys is reaching that same shape from [`begin_request`](Self::begin_request).
     ///
     /// # Errors
     ///
@@ -3095,9 +3210,9 @@ impl McpServerManager {
 ///
 /// **No production caller yet.** The only thing that hands one out is
 /// [`McpServerManager::begin_request`], which MCP-121 has still to call; the shipping proxy path
-/// keeps its own inline `decrement_in_flight` + `touch` pair (`proxy/call.rs:724-725`) instead. So
-/// the leak this guard exists to prevent is not one the crate is currently exposed to — the guard
-/// is the *safe* shape waiting for its caller, not a fix for a live defect.
+/// uses its own `Drop`-based equivalent, `proxy::call::InFlightScope` (MCP-600), instead. So the
+/// leak this guard exists to prevent is not one the crate is currently exposed to — the guard is
+/// the *safe* shape waiting for its caller, not a fix for a live defect.
 #[derive(Debug)]
 pub struct InFlightGuard {
     manager: Option<Arc<McpServerManager>>,
@@ -3294,6 +3409,12 @@ pub fn manager_handler_factory(manager: Weak<McpServerManager>) -> crate::runtim
                 .map(|config| Arc::clone(&config.handler)),
             list_changed: None,
             elicitation_complete: complete,
+            // MCP-606/MCP-607 — the manager's registry, so this client's `elicitation/create`
+            // pauses, and its `notifications/progress` restarts, the deadlines of the calls in
+            // flight on it.
+            call_deadlines: manager
+                .upgrade()
+                .map(|live| Arc::clone(live.call_deadlines())),
         })
     })
 }
@@ -5078,8 +5199,14 @@ mod tests {
         let _ = running.await;
         gate.open();
 
+        // Both conditions, not just the first: the orphaned reconnect publishes the replacement
+        // and *then* runs its identity-matched `finally`, so polling only for the connection
+        // leaves the slot assertion below racing the clear under load. The loop is still bounded,
+        // so a slot that never clears fails the assertion rather than hanging.
         for _ in 0..400 {
-            if manager.get_connection("s").is_some() {
+            if manager.get_connection("s").is_some()
+                && manager.tables().reconnect_promises.is_empty()
+            {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(5)).await;

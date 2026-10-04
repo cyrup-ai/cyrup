@@ -239,3 +239,55 @@ fn hot_reload_theme_data_repaints_the_assembled_app() {
         "hot-reloaded accent color did not reach the rendered buffer"
     );
 }
+
+/// TUI-131 — the hot-reload resolver in THIS crate parses `okhsl(…)` / `oklch(…)` too.
+///
+/// `cyrup-tui`'s `resolve_value` is a second resolver, independent of `cyrup-resources`'s
+/// (`UiTheme::from_theme_data` is the `/theme` and watcher path, `app/run_arms.rs:746`, `:858`,
+/// `app/shell.rs:686`), and it had its own hex-only `parse_hex`. pi 1.0 writes its built-in themes
+/// entirely in OKHSL, so before this every role of a pi 1.0 theme reaching this path fell back to a
+/// compiled hex.
+///
+/// The expected channels are pi's own, from `parseColor` → `colorToRgb` at v1.0.0.
+#[test]
+fn from_theme_data_resolves_okhsl_and_oklch_values() {
+    let data: ThemeData = serde_json::from_str(
+        r##"{
+            "name": "pi-one-point-oh",
+            "vars": { "text": "okhsl(234 3% 89%)", "violet": "okhsl(295 50% 67%)" },
+            "colors": {
+                "text": "text",
+                "accent": "$violet",
+                "border": "oklch(0.7 0.1 230)",
+                "selectedBg": "okhsl(231.49 20% 25%)"
+            }
+        }"##,
+    )
+    .unwrap();
+    let theme = UiTheme::from_theme_data(&data, 0);
+
+    // `role_color`'s second argument is the fallback a role that did NOT resolve falls back to,
+    // so a sentinel there makes the failure mode unambiguous: before this row every one of these
+    // answered `#000000`.
+    //
+    // Through `vars`, in pi's bare-name form and cyrup's `$name` form.
+    assert_eq!(
+        theme.role_color("text", "#000000"),
+        Color::Rgb(222, 224, 225)
+    );
+    assert_eq!(
+        theme.role_color("accent", "#000000"),
+        Color::Rgb(167, 152, 215)
+    );
+    // A direct colour function, which must not be looked up as a variable name.
+    assert_eq!(
+        theme.role_color("border", "#000000"),
+        Color::Rgb(84, 170, 209)
+    );
+    // And through the structured background projection, so the value survives the whole path.
+    assert_eq!(
+        theme.backgrounds().selected,
+        Some(Color::Rgb(46, 60, 68)),
+        "okhsl(231.49 20% 25%) as pi computes it"
+    );
+}

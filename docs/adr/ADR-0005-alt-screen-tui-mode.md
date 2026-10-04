@@ -178,7 +178,8 @@ works. Concretely, and in this order:
 - **B-2 A renderer seam.** Introduce cyrup's analogue of pi's `ViewportTUI`
   (`packages/tui/src/tui.ts:322-330`): a trait the inline `App` and the new alt-screen renderer both
   satisfy, with `set_layout_root`-equivalent, `scroll_by`, `scroll_to_top`, `scroll_to_bottom`,
-  `flash`. Keep the inline renderer the default.
+  `flash`. Keep the inline renderer the default. **AMENDED 2026-10-04 — see the amendment at the
+  foot of this ADR: the default is now `fullscreen`, following pi v1.0.0.**
 - **B-3 Terminal setup.** `EnterAlternateScreen` / `LeaveAlternateScreen` around a
   `Viewport::Fullscreen` terminal, autowrap `?7l`/`?7h`, cursor hide, and `?2026h`/`?2026l` around
   teardown, mirroring `tui-alt-screen.ts:236-288`.
@@ -322,10 +323,11 @@ the plan that it contends with batch 16 and 30a in `transcript.rs`/`app.rs`. B-4
 crossterm-vs-pi mouse-sequence deltas likewise have no id and are the kind of detail that gets lost
 inside an L+ item.
 
-**What does not change.** Batches 1-29 are untouched. The inline renderer stays the default in every
-build, under every setting, exactly as upstream (`settings-manager.ts:1129` defaults to `regular`,
-and `settings-selector.ts:635` calls fullscreen "experimental"). Nothing in this decision authorises
-degrading the inline path to make the alt-screen path easier.
+**What does not change.** Batches 1-29 are untouched. ~~The inline renderer stays the default in
+every build, under every setting, exactly as upstream (`settings-manager.ts:1129` defaults to
+`regular`, and `settings-selector.ts:635` calls fullscreen "experimental").~~ **SUPERSEDED
+2026-10-04 by the amendment below — upstream inverted this at v1.0.0.** Nothing in this decision
+authorises degrading the inline path to make the alt-screen path easier.
 
 ## Rejected alternatives
 
@@ -366,3 +368,34 @@ recorded verbatim (not silently closed — `PARITY-PLAN.md:1212-1214`), `CFG-021
 requirement survives anyway so no user setting is lost, batch 30b is deleted and batch 30a reverts to
 being batch 30, and the batch-14 interim message becomes permanent and is reworded from "not built
 yet" to name the reversing decision.
+
+---
+
+## Amendment, 2026-10-04 — `fullscreen` is the default
+
+This ADR's holding is unchanged: cyrup **builds** the alternate screen. What changes is the default,
+and the reason is that this decision's own justification inverted upstream.
+
+The original text kept the inline renderer the default "exactly as upstream
+(`settings-manager.ts:1129` defaults to `regular`)". At pi v1.0.0 that line reads
+`settings-manager.ts:1349`: `return this.settings.tuiMode === "regular" ? "regular" : "fullscreen";`
+— an unknown value, a wrong case, a non-string, a null and an absent key all answer `fullscreen`.
+`args.ts:326` documents `fullscreen (default)`, and `settings-selector.ts:709` no longer calls it
+experimental. The parity rule this ADR was decided under therefore now points the other way, which is
+what its `overridable` status is for.
+
+cyrup's default is `fullscreen` as of `CFG-096` / `TUI-135`.
+
+**What this costs, stated rather than discovered.** Three defects live only in the alternate screen
+and are now on the default path. They were filed `low` on the reasoning that the mode was opt-in;
+that reasoning priced reachability, not severity, and is withdrawn. They are re-rated in area 07:
+
+- **`TUI-107` (high, L)** — pointer input reaches only the scrollbar, text selection and the wheel.
+  The editor, autocomplete, selectors and settings lists are painted but a click on them does
+  nothing. This is the one that makes the default experience worse than the inline path today.
+- **`TUI-110` (medium, M)** — the scrollbar is the pre-v0.84.4 design.
+- **`TUI-136` (medium, M)** — wheel scrolling is a hardcoded one line per notch;
+  `fullscreenWheelScrollLines` and the accelerator are unported.
+
+Closing `TUI-107` is what makes this default defensible on its own terms rather than on parity
+alone. Until it closes, cyrup ships pi's layout with less of pi's interaction.

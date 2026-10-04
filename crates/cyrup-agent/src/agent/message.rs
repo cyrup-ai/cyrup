@@ -88,6 +88,7 @@ pub(super) fn result_value_of(
     usage: Option<&Usage>,
     added_tool_names: &[String],
     terminate: TerminateHint,
+    structured_content: Option<&Value>,
 ) -> Value {
     let mut obj = serde_json::Map::new();
     obj.insert(
@@ -108,6 +109,12 @@ pub(super) fn result_value_of(
             "addedToolNames".to_string(),
             serde_json::to_value(added_tool_names).unwrap_or(Value::Null),
         );
+    }
+    // Pi emits `result: finalized.result` verbatim (`emitToolExecutionEnd`), and
+    // `AgentToolResult.structuredContent` is a field of that object, so `JSON.stringify` puts the
+    // key in the event when the call settled on one and omits it when it did not. AGENT-045.
+    if let Some(sc) = structured_content {
+        obj.insert("structuredContent".to_string(), sc.clone());
     }
     if let Some(t) = terminate.wire() {
         obj.insert("terminate".to_string(), Value::Bool(t));

@@ -159,15 +159,16 @@ pub enum SessionServiceError {
     Io(String),
 
     /// `/fork` or `/clone` on a persisted session whose file has not been written yet. The `Display`
-    /// is pi's sentence **verbatim** — `throw new Error("This session has not been saved yet. Wait
-    /// for the first assistant response before cloning or forking it.")`
-    /// (`core/agent-session-runtime.ts:312-316` @v0.83.0, identical at v0.84.1) — because it is
-    /// user-facing text, relayed straight through the RPC `fork`/`clone` `error` field
-    /// (`cyrup-modes/src/rpc.rs`) and into whatever a client renders. SEAM-056.
-    #[error(
-        "This session has not been saved yet. Wait for the first assistant response before cloning \
-         or forking it."
-    )]
+    /// is pi's sentence **verbatim** — `throw new Error("This session has not been saved yet. Send
+    /// a message before cloning or forking it.")` (`core/agent-session-runtime.ts:312` @v1.0.0) —
+    /// because it is user-facing text, relayed straight through the RPC `fork`/`clone` `error`
+    /// field (`cyrup-modes/src/rpc.rs`) and into whatever a client renders. SEAM-056.
+    ///
+    /// The sentence moved with the save rule it describes (`SESS-064`): through v0.87.1 it said
+    /// "Wait for the first assistant response", because the file appeared at the first assistant
+    /// message; at v1.0.0 `_hasConversation()` creates it at the first **user** message, so the
+    /// remedy is to send a message, not to wait for a reply.
+    #[error("This session has not been saved yet. Send a message before cloning or forking it.")]
     SessionNotSaved,
 
     /// A genuine immediate-bash backend failure (spawn error, missing cwd, …) — Pi's

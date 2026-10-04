@@ -794,3 +794,308 @@ fn terminal_capability_overrides_follow_pis_mapping() {
     // `images: true` is not in pi's type and is not an override.
     assert_eq!(of(r#"{ "terminal": { "images": true } }"#).images, None);
 }
+
+/// CFG-096 / TUI-135 — `getTuiMode` degrades to `fullscreen`, not `regular`.
+///
+/// Upstream `88ff80b98` ("make fullscreen the default TUI mode") inverted the predicate at
+/// `core/settings-manager.ts:1348-1350` @v1.0.0 to
+/// `return this.settings.tuiMode === "regular" ? "regular" : "fullscreen";`, and the four cases in
+/// `test/settings-manager.test.ts` were inverted with it — including the unknown-value leg, where
+/// `{ tuiMode: "other" }` now answers `fullscreen`. The field comment at `:184` reads
+/// `// default: "fullscreen"` and `cli/args.ts:326` reads
+/// `TUI mode: fullscreen (default) or regular`.
+///
+/// The degrade legs are the point: a mutant that only special-cases the absent key still answers
+/// `Regular` for `"other"`, `true` and a numeric value.
+#[test]
+fn tui_mode_degrades_to_fullscreen_and_only_regular_opts_out() {
+    let eff = |json: &str| EffectiveSettings::from_settings(Settings::parse(json).unwrap());
+
+    // The one value that selects the inline renderer.
+    assert_eq!(eff(r#"{"tuiMode":"regular"}"#).tui_mode(), TuiMode::Regular);
+
+    // Everything else is fullscreen: the explicit value, the absent key, an unknown spelling,
+    // a wrong-cased spelling, a non-string and a null.
+    assert_eq!(
+        eff(r#"{"tuiMode":"fullscreen"}"#).tui_mode(),
+        TuiMode::Fullscreen
+    );
+    assert_eq!(eff("{}").tui_mode(), TuiMode::Fullscreen);
+    assert_eq!(
+        eff(r#"{"tuiMode":"other"}"#).tui_mode(),
+        TuiMode::Fullscreen
+    );
+    assert_eq!(
+        eff(r#"{"tuiMode":"Regular"}"#).tui_mode(),
+        TuiMode::Fullscreen
+    );
+    assert_eq!(eff(r#"{"tuiMode":true}"#).tui_mode(), TuiMode::Fullscreen);
+    assert_eq!(eff(r#"{"tuiMode":null}"#).tui_mode(), TuiMode::Fullscreen);
+    assert_eq!(
+        EffectiveSettings::from_settings(Settings::default()).tui_mode(),
+        TuiMode::Fullscreen
+    );
+
+    // The settings-file spelling is unchanged, so a value cyrup writes is still one pi reads.
+    assert_eq!(TuiMode::default().as_str(), "fullscreen");
+}
+
+/// CFG-097 — `defaultTools` is a language, and `getDefaultTools` resolves it.
+///
+/// `resolveDefaultTools` (Pi `core/settings-manager.ts:236-249` @v1.0.0): plain names replace
+/// `DEFAULT_TOOL_NAMES`, then each `+name`/`-name` applies in list order. `docs/settings.md:50`'s
+/// own worked example is `"defaultTools": ["+codemode"]`, which before this port selected a tool
+/// literally named `+codemode`, matched nothing, and left the session with no built-ins at all.
+///
+/// The `:238` condition — `plain.length > 0 || entries.length === 0 ? plain : [...DEFAULT_TOOL_NAMES]`
+/// — is the subtle one: `[]` stays empty (all built-ins off, a configured value), while a
+/// modifier-only list starts from the four defaults.
+#[test]
+fn default_tools_resolves_the_baseline_and_the_plus_minus_modifiers() {
+    let eff = |json: &str| EffectiveSettings::from_settings(Settings::parse(json).unwrap());
+    let tools = |json: &str| eff(json).default_tools();
+    let names = |list: &[&str]| Some(list.iter().map(|s| (*s).to_string()).collect::<Vec<_>>());
+
+    // Unset stays unset — `None` and `Some(vec![])` are different values downstream.
+    assert_eq!(tools("{}"), None);
+
+    // pi's own documented example: one tool ADDED to the four defaults.
+    assert_eq!(
+        tools(r#"{"defaultTools":["+codemode"]}"#),
+        names(&["read", "bash", "edit", "write", "codemode"])
+    );
+
+    // Plain names still replace the baseline outright.
+    assert_eq!(
+        tools(r#"{"defaultTools":["grep","find"]}"#),
+        names(&["grep", "find"])
+    );
+
+    // Order matters: the plain name replaces, then `+grep` appends, then `-read` removes.
+    assert_eq!(
+        tools(r#"{"defaultTools":["read","+grep","-read"]}"#),
+        names(&["grep"])
+    );
+
+    // Upstream's own two cases from `test/settings-manager.test.ts`'s "applies +name and -name to
+    // the default selection".
+    assert_eq!(
+        tools(r#"{"defaultTools":["+codemode","-write"]}"#),
+        names(&["read", "bash", "edit", "codemode"])
+    );
+    assert_eq!(
+        tools(r#"{"defaultTools":["read","+grep","+read"]}"#),
+        names(&["read", "grep"])
+    );
+
+    // `docs/settings.md:54`'s second worked example, verbatim: "This replaces `bash` with
+    // `powershell` and enables `grep`".
+    assert_eq!(
+        tools(r#"{"defaultTools":["-bash","+powershell","+grep"]}"#),
+        names(&["read", "edit", "write", "powershell", "grep"])
+    );
+
+    // `:238`'s edge: an explicit `[]` resolves to `[]`, NOT to the baseline.
+    assert_eq!(tools(r#"{"defaultTools":[]}"#), names(&[]));
+
+    // The empty-name guard (`&& name`): a bare `+` appends nothing, a bare `-` removes nothing.
+    assert_eq!(
+        tools(r#"{"defaultTools":["+"]}"#),
+        names(&["read", "bash", "edit", "write"])
+    );
+    assert_eq!(
+        tools(r#"{"defaultTools":["-"]}"#),
+        names(&["read", "bash", "edit", "write"])
+    );
+
+    // `+` on a name already present is a no-op, and `-` on an absent name is too.
+    assert_eq!(
+        tools(r#"{"defaultTools":["+read","-no-such-tool"]}"#),
+        names(&["read", "bash", "edit", "write"])
+    );
+
+    // Removing everything is reachable, and is not the same as "unset".
+    assert_eq!(
+        tools(r#"{"defaultTools":["-read","-bash","-edit","-write"]}"#),
+        names(&[])
+    );
+
+    // Non-string entries are dropped before resolving (`tools.filter(t => typeof t === "string")`),
+    // so a list of only non-strings behaves like `[]`.
+    assert_eq!(
+        tools(r#"{"defaultTools":["+grep",7,null]}"#),
+        names(&["read", "bash", "edit", "write", "grep"])
+    );
+    assert_eq!(tools(r#"{"defaultTools":[7]}"#), names(&[]));
+
+    // A non-array is `[]` before resolving (upstream's ternary), not the baseline.
+    assert_eq!(tools(r#"{"defaultTools":"read"}"#), names(&[]));
+    assert_eq!(tools(r#"{"defaultTools":{}}"#), names(&[]));
+
+    // The exported baseline is pi's, and it is the one `cyrup-session-svc` falls back to.
+    assert_eq!(DEFAULT_TOOL_NAMES, ["read", "bash", "edit", "write"]);
+    assert!(is_tool_modifier("+x") && is_tool_modifier("-x") && !is_tool_modifier("x"));
+}
+
+/// CFG-097 — the layer merge: `mergeDefaultTools` (Pi `core/settings-manager.ts:225-230`), applied
+/// from `deepMergeSettings` (`:250-253`) as a special case OVER the generic deep merge.
+///
+/// A project list containing any plain name replaces the global one; a project list of ONLY
+/// modifiers is appended, so a project file adjusts the global selection instead of discarding it.
+/// A malformed value on either side replaces — upstream's own comment says so.
+#[test]
+fn default_tools_merges_modifier_only_project_layers_onto_the_global_list() {
+    let v = |json: &str| serde_json::from_str::<serde_json::Value>(json).unwrap();
+    let merged = |global: &str, project: &str| deep_merge_settings(&v(global), &v(project));
+    let resolved = |global: &str, project: &str| {
+        EffectiveSettings::from_settings(
+            Settings::parse(&merged(global, project).to_string()).unwrap(),
+        )
+        .default_tools()
+    };
+    let names = |list: &[&str]| Some(list.iter().map(|s| (*s).to_string()).collect::<Vec<_>>());
+
+    // Modifier-only project list: APPENDED pre-resolution, then resolved in order.
+    assert_eq!(
+        merged(
+            r#"{"defaultTools":["read","bash"]}"#,
+            r#"{"defaultTools":["+grep"]}"#
+        )["defaultTools"],
+        v(r#"["read","bash","+grep"]"#)
+    );
+    assert_eq!(
+        resolved(
+            r#"{"defaultTools":["read","bash"]}"#,
+            r#"{"defaultTools":["+grep"]}"#
+        ),
+        names(&["read", "bash", "grep"])
+    );
+
+    // A plain name anywhere in the project list REPLACES.
+    assert_eq!(
+        resolved(
+            r#"{"defaultTools":["read","bash"]}"#,
+            r#"{"defaultTools":["grep"]}"#
+        ),
+        names(&["grep"])
+    );
+    assert_eq!(
+        resolved(
+            r#"{"defaultTools":["read","bash"]}"#,
+            r#"{"defaultTools":["grep","+find"]}"#
+        ),
+        names(&["grep", "find"])
+    );
+
+    // `every` is true for an empty list, so a project `[]` appends nothing rather than clearing.
+    assert_eq!(
+        merged(r#"{"defaultTools":["read"]}"#, r#"{"defaultTools":[]}"#)["defaultTools"],
+        v(r#"["read"]"#)
+    );
+
+    // No project value: the global one survives (`overrides === undefined` ⇒ base).
+    assert_eq!(
+        merged(r#"{"defaultTools":["read"]}"#, r#"{"theme":"dark"}"#)["defaultTools"],
+        v(r#"["read"]"#)
+    );
+
+    // No global value: the project one stands on its own, modifiers and all.
+    assert_eq!(
+        resolved(r#"{"theme":"dark"}"#, r#"{"defaultTools":["+grep"]}"#),
+        names(&["read", "bash", "edit", "write", "grep"])
+    );
+
+    // A malformed value on either side replaces instead of throwing (upstream's own comment).
+    assert_eq!(
+        merged(
+            r#"{"defaultTools":"read"}"#,
+            r#"{"defaultTools":["+grep"]}"#
+        )["defaultTools"],
+        v(r#"["+grep"]"#)
+    );
+    assert_eq!(
+        merged(r#"{"defaultTools":["read"]}"#, r#"{"defaultTools":"grep"}"#)["defaultTools"],
+        v(r#""grep""#)
+    );
+
+    // Neither layer sets it: the key must not be invented by the merge.
+    assert!(
+        merged(r#"{"theme":"dark"}"#, r#"{"model":"x"}"#)
+            .get("defaultTools")
+            .is_none()
+    );
+
+    // The special case is TOP-LEVEL only: a nested `defaultTools` merges by the generic rule
+    // (upstream reads `base.defaultTools`/`overrides.defaultTools` and never recurses with it).
+    assert_eq!(
+        merged(
+            r#"{"nested":{"defaultTools":["read"]}}"#,
+            r#"{"nested":{"defaultTools":["+grep"]}}"#
+        )["nested"]["defaultTools"],
+        v(r#"["+grep"]"#)
+    );
+}
+
+/// CFG-097 — upstream's own "layers project modifiers on top of the global selection" case
+/// (`test/settings-manager.test.ts`), through the real [`SettingsManager`]: global, project and
+/// `applyOverrides` in turn.
+///
+/// This is the end-to-end that pins `SettingsManager::recompute` and `apply_overrides` onto
+/// [`deep_merge_settings`] rather than the generic deep merge. With the generic merge the project
+/// layer REPLACES, so `getDefaultTools()` answers `["tool_search"]` where pi answers
+/// `["read", "bash", "tool_search"]`.
+#[test]
+fn project_modifiers_layer_onto_the_global_default_tools_through_the_manager() {
+    let names = |list: &[&str]| Some(list.iter().map(|s| (*s).to_string()).collect::<Vec<_>>());
+
+    let store = Arc::new(InMemorySettingsStore::new());
+    store.seed(
+        SettingsScope::Global,
+        r#"{ "defaultTools": ["read", "bash", "+codemode"] }"#,
+    );
+    store.seed(
+        SettingsScope::Project,
+        r#"{ "defaultTools": ["-codemode", "+tool_search"] }"#,
+    );
+    let mut mgr = SettingsManager::load(store.clone(), true);
+    assert_eq!(
+        mgr.effective().default_tools(),
+        names(&["read", "bash", "tool_search"])
+    );
+
+    // `applyOverrides` is `deepMergeSettings(this.settings, overrides)` (`:637`), so a
+    // modifier-only override layers again rather than replacing.
+    mgr.apply_overrides(&Settings::parse(r#"{ "defaultTools": ["+codemode"] }"#).unwrap());
+    assert_eq!(
+        mgr.effective().default_tools(),
+        names(&["read", "bash", "tool_search", "codemode"])
+    );
+
+    // "applies project modifiers to the built-in defaults without a global setting".
+    let bare = Arc::new(InMemorySettingsStore::new());
+    bare.seed(
+        SettingsScope::Project,
+        r#"{ "defaultTools": ["+codemode"] }"#,
+    );
+    assert_eq!(
+        SettingsManager::load(bare, true)
+            .effective()
+            .default_tools(),
+        names(&["read", "bash", "edit", "write", "codemode"])
+    );
+
+    // Upstream's "loads global defaults and lets project settings replace them": a plain project
+    // name still replaces the global list outright.
+    let replacing = Arc::new(InMemorySettingsStore::new());
+    replacing.seed(
+        SettingsScope::Global,
+        r#"{ "defaultTools": ["read", "bash"] }"#,
+    );
+    replacing.seed(SettingsScope::Project, r#"{ "defaultTools": ["grep"] }"#);
+    assert_eq!(
+        SettingsManager::load(replacing, true)
+            .effective()
+            .default_tools(),
+        names(&["grep"])
+    );
+}

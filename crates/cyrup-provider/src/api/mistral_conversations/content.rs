@@ -79,7 +79,18 @@ pub(super) async fn process_chunk(
     true
 }
 
-/// Handle a `delta.content` value (Pi mistral-conversations.ts:355-416).
+/// Handle a `delta.content` value (Pi mistral-conversations.ts:629-693).
+///
+/// PROV-115 — every text site drops an EMPTY delta before it can open a block. Upstream guards both
+/// of its text branches (`mistral-conversations.ts:636` and `:678` @v1.0.0, commit `8930b9ec0`
+/// "ignore empty Mistral content deltas") with the reason in the comment: *"GLM models on Mistral
+/// send empty content deltas around thinking and tool calls. Opening a block for them splits
+/// thinking into multiple blocks, which Mistral rejects on replay."* cyrup ships `zai-glm-5-2` and
+/// `zai-glm-5-3` in `providers/catalog/mistral.json`, so without the guard a turn on either model
+/// lands `thinking / text:"" / thinking`; `messages.rs` then replays each thinking block as its own
+/// assistant `"thinking"` entry and Mistral rejects the body, breaking every later turn while that
+/// message stays in context. The guard is at the three CALL SITES, not inside [`push_text`]: a
+/// caller that legitimately wants an empty text block must not be silenced invisibly.
 async fn process_content(
     content: &Value,
     dec: &mut Decoder,
@@ -87,16 +98,27 @@ async fn process_content(
     api: &ApiId,
     sink: &EventSink,
 ) -> bool {
-    // `string` content collapses to a single text item.
+    // `string` content collapses to a single text item. Upstream reaches this through
+    // `typeof delta.content === "string" ? [delta.content] : delta.content`
+    // (`mistral-conversations.ts:630`), so the string case runs the SAME guarded string-item branch
+    // as an array element — hence the same emptiness test here (PROV-115).
     if let Some(s) = content.as_str() {
-        return push_text(dec, model, api, sink, &sanitize_surrogates(s)).await;
+        let delta = sanitize_surrogates(s);
+        if delta.is_empty() {
+            return true;
+        }
+        return push_text(dec, model, api, sink, &delta).await;
     }
     let Some(items) = content.as_array() else {
         return true;
     };
     for item in items {
         if let Some(s) = item.as_str() {
-            if !push_text(dec, model, api, sink, &sanitize_surrogates(s)).await {
+            let delta = sanitize_surrogates(s);
+            if delta.is_empty() {
+                continue;
+            }
+            if !push_text(dec, model, api, sink, &delta).await {
                 return false;
             }
             continue;
@@ -123,7 +145,11 @@ async fn process_content(
             }
             Some("text") => {
                 let text = item.get("text").and_then(Value::as_str).unwrap_or("");
-                if !push_text(dec, model, api, sink, &sanitize_surrogates(text)).await {
+                let delta = sanitize_surrogates(text);
+                if delta.is_empty() {
+                    continue;
+                }
+                if !push_text(dec, model, api, sink, &delta).await {
                     return false;
                 }
             }

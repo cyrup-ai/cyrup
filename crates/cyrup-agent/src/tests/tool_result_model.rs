@@ -99,6 +99,10 @@ struct ReportingTool {
     params: Value,
     usage: Option<Usage>,
     added: Vec<String>,
+    /// AGENT-045 — the machine-readable half, set only by the structured-output cases.
+    structured: Option<Value>,
+    /// AGENT-045 — what [`Tool::output_schema`] answers for this tool.
+    schema: Option<Value>,
     calls: Arc<AtomicUsize>,
 }
 
@@ -110,9 +114,25 @@ impl ReportingTool {
             params: obj_schema(),
             usage,
             added: added.iter().map(|s| (*s).to_string()).collect(),
+            structured: None,
+            schema: None,
             calls: calls.clone(),
         });
         (t, calls)
+    }
+
+    /// AGENT-045 — a tool that declares an `output_schema` and returns a matching
+    /// `structured_content`, which is what pi's `bash` does (`core/tools/bash.ts:259`, `:391`).
+    fn structured(name: &str, schema: Value, structured: Value) -> Arc<Self> {
+        Arc::new(Self {
+            name: name.into(),
+            params: obj_schema(),
+            usage: None,
+            added: Vec::new(),
+            structured: Some(structured),
+            schema: Some(schema),
+            calls: Arc::new(AtomicUsize::new(0)),
+        })
     }
 }
 
@@ -123,6 +143,9 @@ impl Tool for ReportingTool {
     }
     fn parameters(&self) -> &Value {
         &self.params
+    }
+    fn output_schema(&self) -> Option<&Value> {
+        self.schema.as_ref()
     }
     async fn execute(
         &self,
@@ -137,6 +160,7 @@ impl Tool for ReportingTool {
             details: None,
             usage: self.usage.clone(),
             added_tool_names: self.added.clone(),
+            structured_content: self.structured.clone(),
             terminate: TerminateHint::Unspecified,
         })
     }
@@ -258,10 +282,10 @@ struct UsagePatchHook {
 impl Hooks for UsagePatchHook {
     async fn after_tool_call(&self, ctx: AfterToolCall<'_>, _cancel: CancelToken) -> AfterOutcome {
         self.observed.lock().unwrap().push(ctx.usage.cloned());
-        AfterOutcome::Override(AfterOverride {
+        AfterOutcome::Override(Box::new(AfterOverride {
             usage: Some(self.replacement.clone()),
             ..AfterOverride::default()
-        })
+        }))
     }
 }
 
@@ -317,10 +341,10 @@ struct ContentOnlyHook;
 #[async_trait::async_trait]
 impl Hooks for ContentOnlyHook {
     async fn after_tool_call(&self, _ctx: AfterToolCall<'_>, _cancel: CancelToken) -> AfterOutcome {
-        AfterOutcome::Override(AfterOverride {
+        AfterOutcome::Override(Box::new(AfterOverride {
             content: Some(vec![Content::text("patched")]),
             ..AfterOverride::default()
-        })
+        }))
     }
 }
 
@@ -741,4 +765,119 @@ async fn an_announced_tool_is_still_subject_to_the_permission_gate() {
     // A blocked call cannot smuggle an anchor or usage through the gate.
     assert!(blocked.added_tool_names.is_empty());
     assert_eq!(blocked.usage, None);
+}
+
+// ===========================================================================
+// AGENT-045 — `outputSchema` / `structuredContent`
+// ===========================================================================
+
+/// AGENT-045 — a tool's `structured_content` reaches the `tool_execution_end.result` payload and
+/// is **never sent to the model**.
+///
+/// pi `AgentToolResult.structuredContent` (`packages/agent/src/types.ts:429-433` @v1.0.0):
+/// *"Machine-readable result matching the tool's `outputSchema`, for programmatic callers. Not
+/// sent to the model; `content` remains the model-facing result."* `emitToolExecutionEnd` emits
+/// `result: finalized.result` verbatim so the event carries it, while the transcript
+/// `ToolResultMessage` (`packages/ai/src/types.ts`) has no such field at v1.0.0 — so neither the
+/// persisted message nor the next turn's provider payload can carry it.
+///
+/// This is the assertion that makes the field safe to add: a tool can hand a programmatic caller
+/// a typed object without widening what the model sees, and without growing the transcript.
+///
+/// RED before the fix: `ToolResult` had no `structured_content` field, so `ReportingTool` did not
+/// compile; with the field but without threading it to `result_value_of`, the
+/// `tool_execution_end` assertion fails.
+#[tokio::test]
+async fn agent045_structured_content_reaches_the_event_but_not_the_model() {
+    let schema = json!({ "type": "object", "properties": { "exitCode": { "type": "number" } } });
+    let structured = json!({ "exitCode": 0, "output": "AGENT-045-STRUCTURED" });
+    let tool = ReportingTool::structured("probe", schema, structured.clone());
+    let (sf, payloads) = payload_recording(vec![
+        faux_assistant_message(
+            vec![faux_tool_call("probe", json!({}))],
+            StopReason::ToolUse,
+        ),
+        faux_assistant_message(vec![faux_text("done")], StopReason::Stop),
+    ]);
+    let rec = Arc::new(EventRecorder::default());
+    let agent = Agent::builder(model_ref(), sf).tools(vec![tool]).build();
+    agent.subscribe(rec.clone());
+    agent.prompt("go").await.unwrap().finished().await;
+    agent.wait_for_idle().await;
+
+    let events = rec.snapshot();
+
+    // 1. The event payload carries the structured half, under pi's camelCase key.
+    let ends = execution_end_results(&events);
+    assert_eq!(ends.len(), 1);
+    assert_eq!(
+        ends[0].get("structuredContent"),
+        Some(&structured),
+        "`tool_execution_end.result` must carry it (pi emits `finalized.result` verbatim): {}",
+        ends[0]
+    );
+    // …and `content` is still the model-facing result, untouched.
+    assert_eq!(
+        ends[0]["content"][0]["text"],
+        json!("ran:probe"),
+        "`content` remains the model-facing result"
+    );
+
+    // 2. The transcript message does NOT gain the key — pi's `ToolResultMessage` has no such
+    //    field, so a session file never records one.
+    let me = message_end_results(&events);
+    assert_eq!(me.len(), 1);
+    let as_json = serde_json::to_value(&me[0]).expect("the message serializes");
+    assert!(
+        as_json.get("structuredContent").is_none(),
+        "the persisted tool-result message must not carry the structured half: {as_json}"
+    );
+
+    // 3. The decisive one: it never reaches the provider. Scan the WHOLE next-turn request, not
+    //    just its tool-result blocks, so the value cannot slip in through any other field.
+    let p = payloads.lock().unwrap().clone();
+    assert_eq!(p.len(), 2, "two provider requests");
+    let wire = serde_json::to_string(&p[1]).expect("the payload serializes");
+    assert!(
+        wire.contains("ran:probe"),
+        "sanity: the model DOES see the text content"
+    );
+    assert!(
+        !wire.contains("AGENT-045-STRUCTURED"),
+        "the structured half must never be sent to the model (types.ts:429-432): {wire}"
+    );
+    assert!(
+        !wire.contains("structuredContent"),
+        "not even the key reaches the provider payload: {wire}"
+    );
+}
+
+/// A tool that declares no `output_schema` and returns no structured half puts NO key on the wire
+/// — absent, not `null` (pi's `delete result.structuredContent`, `agent-loop.ts:888`).
+#[tokio::test]
+async fn agent045_a_tool_without_an_output_schema_emits_no_structured_key() {
+    let (tool, _calls) = ReportingTool::new("plain", None, &[]);
+    assert!(
+        cyrup_core::Tool::output_schema(tool.as_ref()).is_none(),
+        "a text-only tool declares no output schema"
+    );
+    let (sf, _payloads) = payload_recording(vec![
+        faux_assistant_message(
+            vec![faux_tool_call("plain", json!({}))],
+            StopReason::ToolUse,
+        ),
+        faux_assistant_message(vec![faux_text("done")], StopReason::Stop),
+    ]);
+    let rec = Arc::new(EventRecorder::default());
+    let agent = Agent::builder(model_ref(), sf).tools(vec![tool]).build();
+    agent.subscribe(rec.clone());
+    agent.prompt("go").await.unwrap().finished().await;
+    agent.wait_for_idle().await;
+
+    let ends = execution_end_results(&rec.snapshot());
+    assert!(
+        ends[0].get("structuredContent").is_none(),
+        "no `structuredContent` key at all: {}",
+        ends[0]
+    );
 }

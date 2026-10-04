@@ -172,7 +172,7 @@ impl RunCtx {
                         call_id: cid,
                         source_index,
                         tool_name,
-                        outcome,
+                        outcome: Box::new(outcome),
                     });
                 });
 
@@ -228,7 +228,7 @@ impl RunCtx {
                             )
                         });
                     let fin = self
-                        .finalize(assistant, ctx_messages, &call, source_index, args, outcome)
+                        .finalize(assistant, ctx_messages, &call, source_index, args, *outcome)
                         .await;
                     self.emit(fin.end_event()).await?;
                     if let Some(slot) = finalized.get_mut(fin.source_index()) {

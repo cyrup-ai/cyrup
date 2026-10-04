@@ -123,6 +123,28 @@ impl RDecoder {
         }
     }
 
+    /// PROV-116 — the first tool block whose `output_item.done` never arrived, as
+    /// `(name, wire call id)` (Pi `openai-responses-shared.ts:765-774`).
+    ///
+    /// Upstream iterates `output.content` in order and throws on the first offender, so the first
+    /// such block is the one named in the message. The id is the one the projected [`ToolCall`]
+    /// carries, which is `"{call_id}|{item_id}"` — the same `toolCall.id` upstream interpolates,
+    /// since pi's block id is likewise the composed wire id (`openai-responses-shared.ts:488`).
+    ///
+    /// [`ToolCall`]: cyrup_core::ToolCall
+    pub(super) fn first_unfinished_tool_call(&self) -> Option<(String, String)> {
+        self.blocks.iter().find_map(|b| match b {
+            RBlock::Tool {
+                call_id,
+                item_id,
+                name,
+                finished: false,
+                ..
+            } => Some((name.clone(), format!("{call_id}|{item_id}"))),
+            _ => None,
+        })
+    }
+
     pub(super) fn slot(&self, output_index: i64, kind: SlotKind) -> Option<usize> {
         self.slots
             .get(&output_index)
@@ -215,6 +237,38 @@ pub(crate) async fn decode_stream_with_end_turn<S>(
     // the fallback is applied here, the same guard `bedrock_converse_stream.rs:454-457` carries.
     // The `|| "An unknown error occurred"` fallback dates to `v0.83.0 openai-responses.ts:174`
     // (unconditional there), so this is a PORT BUG at the ported baseline, not version lag.
+
+    // PROV-116 — `1b2aa0ca0` ("reject unfinished Responses tool calls instead of running them",
+    // #9974). The agent runs every tool call in the final message, so a call whose
+    // `output_item.done` never arrived must not be handed over: its arguments may be cut off, or
+    // merged with another call's when a non-compliant server omits `output_index`
+    // (`openai-responses-shared.ts:764-775`):
+    //
+    //     if (output.stopReason === "toolUse") {
+    //         for (const block of output.content) { … if (toolCall.partialJson !== undefined …)
+    //             throw new Error(`OpenAI Responses stream completed with an unfinished tool call: …`);
+    //
+    // Ordering matches upstream: this sits AFTER the terminal-event check, so a stream that was
+    // truncated before `response.completed` still reports the truncation (`:760-762`) rather than
+    // the unfinished call. `dec.stop_reason` is only `ToolUse` once `finalize_response` has run,
+    // which is exactly upstream's `sawTerminalResponseEvent` precondition.
+    if dec.saw_terminal
+        && dec.stop_reason == StopReason::ToolUse
+        && let Some((name, id)) = dec.first_unfinished_tool_call()
+    {
+        emit_error(
+            &mut dec,
+            model,
+            api,
+            sink,
+            format!(
+                "OpenAI Responses stream completed with an unfinished tool call: {name} ({id})"
+            ),
+        )
+        .await;
+        return;
+    }
+
     let mut message = dec.snapshot_owned(model, api);
     if dec.saw_terminal && dec.stop_reason == StopReason::Error && message.error_message.is_none() {
         message.error_message = Some("An unknown error occurred".to_string());

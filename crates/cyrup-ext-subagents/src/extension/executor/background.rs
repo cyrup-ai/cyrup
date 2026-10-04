@@ -948,6 +948,20 @@ impl SubagentExecutor {
         // computed above the capacity claim — never wider than what THIS process is bound by.
         let mut env_overlay =
             crate::background::parent_anchor::detached_runner_env_overlay_in(&cfg.roots);
+        // SUBA-158 — the launching session's project trust, written onto the hop-1 runner's
+        // environment so the hop-3 children it spawns inherit it (pi
+        // `projectTrusted: sessionProjectTrust(input.ctx)` on the async launch,
+        // `subagent-executor.ts:2089` @v0.74.0). The runner itself supplies no explicit value,
+        // so `exec::build_attempt_spawn_plan`'s INHERITED rung reads exactly this entry —
+        // the same two-cell emulation the R-SA-P1 parent-session anchor uses, and for the same
+        // reason: cyrup cannot write its own `process.env`. Absent when this process has no live
+        // host session, which leaves the runner's environment byte-for-byte as before.
+        if let Some(trusted) = self.session_project_trust() {
+            env_overlay.insert(
+                crate::exec::PARENT_PROJECT_TRUSTED_ENV.to_string(),
+                if trusted { "1" } else { "0" }.to_string(),
+            );
+        }
         // SUBA-100 — the detached runner reaches a placed step's machine through ITS environment,
         // so the placement keys this extension pins in `env_overrides` (the ssh binary and agent
         // socket, the herdr binary) are forwarded to it; unpinned keys are inherited as ever.

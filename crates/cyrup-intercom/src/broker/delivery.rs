@@ -10,23 +10,30 @@
 //! `E_TARGET_REBOUND`-and-retryable record, which is what lets the client retry a rebound target
 //! under the same message id (`v0.13.0 broker/broker.ts:1068-1070`).
 
-use crate::transport::protocol::{Attachment, DeliveredState, Message};
+use crate::transport::protocol::{Attachment, DeliveredState, Message, MessageProvenance};
 
 use super::limits::{DELIVERY_RECORD_RETENTION_MS, MAX_DELIVERY_RECORDS};
 use super::routing::SessionKey;
 use super::state::BrokerState;
 
-/// `deliveryFingerprint` (`v0.13.0 broker/broker.ts:1043-1053`) — the AUTHORED content of a send,
-/// the part a resend must not change.
+/// `deliveryFingerprint` (`v0.13.0 broker/broker.ts:1043-1053`, lifted to the exported
+/// `messageDeliveryFingerprint` at `v0.16.0 broker/protocol.ts:164-176`) — the AUTHORED content of
+/// a send, the part a resend must not change.
 ///
 /// Upstream `JSON.stringify`s a fixed-key object; this is a struct compared with `==`, because the
 /// fingerprint never crosses the wire — byte-identity with JS's serialisation is not a requirement,
 /// and structural equality is stronger (no separator ambiguity, no key-order hazard).
 ///
-/// The FIELD SET is upstream's exactly. Note it takes `content.text` and `content.attachments`
-/// individually rather than the whole `MessageContent`, so a differing `#[serde(flatten)] extra` on
-/// the content object is NOT a fingerprint change — matching pi, and deliberately: the broker-owned
-/// timestamps and the receipt bookkeeping are not authored content.
+/// The FIELD SET is upstream's: `targetId`, `text`, `attachments`, `replyTo`, `expectsReply`,
+/// `supersedes`, `retryOf`, `provenance`. `provenance` has been in it since it landed at v0.12.0
+/// (ICOM-072 — it was missed here, so a resend that changed only the claiming extension replayed
+/// the first send's ack and discarded the new attribution). `crossMachine`, the ninth key added at
+/// v0.16.0, follows [`Message::cross_machine`] and is tracked by ICOM-071.
+///
+/// Note it takes `content.text` and `content.attachments` individually rather than the whole
+/// `MessageContent`, so a differing `#[serde(flatten)] extra` on the content object is NOT a
+/// fingerprint change — matching pi, and deliberately: the broker-owned timestamps and the receipt
+/// bookkeeping are not authored content.
 #[derive(Clone, Debug, PartialEq)]
 pub(super) struct DeliveryFingerprint {
     target_id: String,
@@ -36,6 +43,7 @@ pub(super) struct DeliveryFingerprint {
     expects_reply: Option<bool>,
     supersedes: Option<String>,
     retry_of: Option<String>,
+    provenance: Option<MessageProvenance>,
 }
 
 impl DeliveryFingerprint {
@@ -49,6 +57,7 @@ impl DeliveryFingerprint {
             expects_reply: message.expects_reply,
             supersedes: message.supersedes.clone(),
             retry_of: message.retry_of.clone(),
+            provenance: message.provenance.clone(),
         }
     }
 }
@@ -162,6 +171,8 @@ impl BrokerState {
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
+    use crate::transport::protocol::{ProvenanceKind, UnknownFields};
+
     use super::super::test_support::make_state;
     use super::*;
 
@@ -284,6 +295,42 @@ mod tests {
             DeliveryFingerprint::of(&base, "b"),
             DeliveryFingerprint::of(&base, "c"),
             "the target id is part of the fingerprint"
+        );
+    }
+
+    /// ICOM-072 — `provenance` is the eighth AUTHORED key
+    /// (`v0.16.0 broker/protocol.ts:164-176`; present in `private deliveryFingerprint` since
+    /// v0.12.0). Two sends whose only difference is the claiming extension are DIFFERENT authored
+    /// content, so the replay guard must refuse the second rather than replay the first's ack.
+    #[test]
+    fn provenance_is_part_of_the_fingerprint() {
+        let bare = message("m1", "hi");
+        let claim = |extension: &str| {
+            let mut msg = bare.clone();
+            msg.provenance = Some(MessageProvenance {
+                kind: ProvenanceKind::ExtensionOutbox,
+                extension_id: extension.to_string(),
+                extension_name: extension.to_string(),
+                request_id: "r1".to_string(),
+                extra: UnknownFields::default(),
+            });
+            msg
+        };
+
+        assert_ne!(
+            DeliveryFingerprint::of(&bare, "b"),
+            DeliveryFingerprint::of(&claim("ext-a"), "b"),
+            "gaining a provenance changes the authored content"
+        );
+        assert_ne!(
+            DeliveryFingerprint::of(&claim("ext-a"), "b"),
+            DeliveryFingerprint::of(&claim("ext-b"), "b"),
+            "a different extension claiming the same text is a different authored message"
+        );
+        assert_eq!(
+            DeliveryFingerprint::of(&claim("ext-a"), "b"),
+            DeliveryFingerprint::of(&claim("ext-a"), "b"),
+            "and the same claim still fingerprints identically, so an honest resend replays"
         );
     }
 }

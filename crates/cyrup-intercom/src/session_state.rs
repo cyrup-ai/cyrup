@@ -135,6 +135,15 @@ pub struct SharedIntercomState {
     /// `openProjectPaneIfMissing` with [`crate::project_pane::UnavailableLauncher`] — a true
     /// `HERDR_UNAVAILABLE` — rather than ignoring the flag.
     project_pane_launcher: Mutex<Option<Arc<dyn crate::project_pane::ProjectPaneLauncher>>>,
+    /// The process runner the cross-machine relay spawns `herdr` and `ssh` through (ICOM-074) —
+    /// upstream's `deps.run ?? runCommand` (`v0.16.0 cross-machine-transport.ts:78`), as a seam on
+    /// the same late-bind template as [`Self::project_pane_launcher`].
+    ///
+    /// Unlike that one, `None` is NOT a degraded mode: the default is the real
+    /// [`crate::cross_machine::SpawnRunner`] ([`Self::cross_machine_runner`]), because a cross-machine
+    /// send has no headless fallback to offer — it either runs two processes or it refuses. The slot
+    /// exists so the delivery arm can be driven against a scripted runner without an `ssh` on PATH.
+    cross_machine_runner: Mutex<Option<Arc<dyn crate::cross_machine::CommandRunner>>>,
     /// Whether this session has an interactive UI (pi `hasUI`, `index.ts:739-758`). Captured ONCE
     /// from the live `HostCtx::has_ui` at `SessionStart` (a static per-session property) and read by
     /// the inbound delivery policy ([`crate::inbound`]): an interactive session drives/steers a turn
@@ -232,6 +241,7 @@ impl SharedIntercomState {
             client: Mutex::new(None),
             host_services: Mutex::new(None),
             project_pane_launcher: Mutex::new(None),
+            cross_machine_runner: Mutex::new(None),
             has_ui: AtomicBool::new(false),
             active_tools: Mutex::new(Vec::new()),
             agent_running: AtomicBool::new(false),
@@ -428,6 +438,28 @@ impl SharedIntercomState {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
+    }
+
+    /// Override the cross-machine process runner (ICOM-074) — `deps.run` in upstream's terms.
+    /// Production never calls this; [`Self::cross_machine_runner`] already answers with the real
+    /// spawner.
+    pub fn set_cross_machine_runner(&self, runner: Arc<dyn crate::cross_machine::CommandRunner>) {
+        *self
+            .cross_machine_runner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(runner);
+    }
+
+    /// The bound cross-machine process runner, else the real
+    /// [`crate::cross_machine::SpawnRunner`] — `deps.run ?? runCommand`
+    /// (`v0.16.0 cross-machine-transport.ts:78`).
+    #[must_use]
+    pub fn cross_machine_runner(&self) -> Arc<dyn crate::cross_machine::CommandRunner> {
+        self.cross_machine_runner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .unwrap_or_else(|| Arc::new(crate::cross_machine::SpawnRunner))
     }
 
     /// Record whether this session has an interactive UI (pi `hasUI`). Called ONCE from the

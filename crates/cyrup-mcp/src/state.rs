@@ -151,6 +151,15 @@ pub struct McpState {
     /// Written by [`Self::set_human_wait_ctx`] from `McpExtension::on_event`; read by
     /// [`Self::dialog`].
     pub human_wait_ctx: Mutex<Option<cyrup_ext::HostCtx>>,
+    /// 22 · `blockedProjectServers` (`init.ts:225`) — the project-local servers the trust gate
+    /// refused, and why (MCP-591).
+    ///
+    /// Immutable for the generation: the gate runs once, inside `session_start`, before this state
+    /// exists. Every "that server is disabled" message routes through
+    /// [`crate::project_server_trust::disabled_server_reason`] against this map, so a blocked
+    /// server says *why* instead of telling the user to run `/mcp enable` — which would not help,
+    /// because the entry is not disabled in any file they can edit.
+    pub blocked_project_servers: IndexMap<String, crate::project_server_trust::ProjectServerBlock>,
 }
 
 /// The collaborators [`McpState::new`] cannot default — everything else it allocates itself, which
@@ -176,6 +185,10 @@ pub struct McpStateParts {
     pub open_browser: OpenBrowser,
     /// See [`McpState::send_message`].
     pub send_message: SendMessage,
+    /// See [`McpState::blocked_project_servers`]. Empty for a programmatic config and for the
+    /// load-time pass, both of which run no gate — see
+    /// [`crate::project_server_trust::apply_project_server_trust`].
+    pub blocked_project_servers: IndexMap<String, crate::project_server_trust::ProjectServerBlock>,
 }
 
 impl McpState {
@@ -205,6 +218,7 @@ impl McpState {
             on_tool_metadata_updated: Mutex::new(None),
             status_events,
             human_wait_ctx: Mutex::new(None),
+            blocked_project_servers: parts.blocked_project_servers,
         }
     }
 

@@ -85,20 +85,25 @@ pub struct TerminalCapabilityOverrides {
     pub hyperlinks: Option<bool>,
 }
 
-/// `tuiMode` — which renderer the interactive TUI starts in (Pi `TuiMode`, settings-manager.ts:36
-/// @v0.84.1, itself a re-export of `pi-tui`'s `TuiMode` = `"regular" | "fullscreen"`; the settings
-/// key is declared at `:135` with `// default: "regular"`). ADR-0005 §Decision A-3.
+/// `tuiMode` — which renderer the interactive TUI starts in (Pi `TuiMode`, settings-manager.ts:36,
+/// itself a re-export of `pi-tui`'s `TuiMode` = `"regular" | "fullscreen"`; the settings key is
+/// declared at `:184` @v1.0.0 with `// default: "fullscreen"`). ADR-0005 §Decision A-3.
 ///
-/// The key exists at v0.84.1 only — it is upstream drift relative to v0.83.0, the tag cyrup
-/// otherwise ports — and pairs with the `--tui-mode` flag (`args.ts:180-192`).
+/// The key is upstream drift relative to v0.83.0, the tag cyrup otherwise ports — and pairs with
+/// the `--tui-mode` flag (`args.ts:326` @v1.0.0).
+///
+/// CFG-096 / TUI-135 — the default moved from `regular` to `fullscreen` at v1.0.0 (`88ff80b98`),
+/// so [`Self::Fullscreen`] carries `#[default]` and is the value every unrecognized spelling
+/// degrades to.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TuiMode {
-    /// The inline (main-screen) renderer. Pi's documented default, and the value every
-    /// unrecognized spelling degrades to — see [`super::EffectiveSettings::tui_mode`].
-    #[default]
+    /// The inline (main-screen) renderer, reached only by an explicit `"regular"` — see
+    /// [`super::EffectiveSettings::tui_mode`].
     Regular,
-    /// The alternate-screen renderer (`crates/cyrup-tui/src/altscreen/`).
+    /// The alternate-screen renderer (`crates/cyrup-tui/src/altscreen/`). Pi's documented default
+    /// since v1.0.0, and the value every unrecognized spelling degrades to.
+    #[default]
     Fullscreen,
 }
 

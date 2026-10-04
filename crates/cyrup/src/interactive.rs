@@ -190,7 +190,8 @@ pub async fn run_interactive(
     // `--tui-mode` (pi `cli/args.ts:180-193`, threaded to the composition root at `main.ts:935`
     // and read at `interactive-mode.ts:345-352`). `None` when the flag was omitted, in which case
     // the `tuiMode` SETTING decides — the precedence ADR-0005 §B-14 fixes and `cli/enums.rs`
-    // documents: the flag wins when given, else the setting, else `regular`.
+    // documents: the flag wins when given, else the setting, else `fullscreen` (CFG-096/TUI-135:
+    // pi's default since v1.0.0).
     tui_mode: Option<cyrup_config::settings::TuiMode>,
     // TUI-037 — pi's `InteractiveModeOptions.autoTrustOnReloadCwd` (`interactive-mode.ts:344`
     // @v0.84.4), computed at the composition root (`main.ts:701-704`) and handed in here exactly
@@ -228,8 +229,9 @@ pub async fn run_interactive(
     let mut app = App::into_stdout(controller.theme()).context("initialising the terminal UI")?;
 
     // ADR-0005 §B-14 — select the renderer before anything paints. The flag wins when supplied,
-    // otherwise the `tuiMode` setting (§A-3), otherwise `regular`. `switch_tui_mode` is a no-op
-    // returning `Unchanged` for `Regular`, so the common path costs one comparison.
+    // otherwise the `tuiMode` setting (§A-3), which since v1.0.0 degrades to `fullscreen` rather
+    // than `regular` (CFG-096/TUI-135; `settings-manager.ts:1349`). `switch_tui_mode` is a no-op
+    // returning `Unchanged` for `Regular`, so the opt-out path costs one comparison.
     //
     // A refusal is NOT fatal: `ModeSwitch::RendererUnavailable` means the alternate screen could
     // not be entered (a terminal that rejected the escape, a backend rebuild that failed), and the

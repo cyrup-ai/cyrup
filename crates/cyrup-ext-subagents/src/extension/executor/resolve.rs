@@ -770,7 +770,7 @@ mod tests {
             .expect_err("a thinking suffix must not smuggle an out-of-scope model past the gate");
         assert_eq!(
             err.to_string(),
-            "Model 'openai/gpt-5-nano' is outside the configured subagent model scope. Allowed \
+            "Model 'openai/gpt-5-nano' is outside the configured subagent model scope (modelScope). Allowed \
              patterns: anthropic/claude-opus-4.",
             "the reported model must be the BASE id, with the thinking suffix stripped"
         );
@@ -790,6 +790,7 @@ mod tests {
                 None,
                 &mut available,
                 Some(&scope),
+                "worker",
             )
             .is_ok(),
             "an ALLOWED model carrying a known thinking suffix must pass the gate unchanged"
@@ -819,6 +820,7 @@ mod tests {
             None,
             &mut available,
             None,
+            "worker",
         )
         .expect("no policy configured, so nothing can be refused");
         assert_eq!(
@@ -831,6 +833,7 @@ mod tests {
             enforce: Some(true),
             strict: None,
             allow: Some(vec!["anthropic/*".to_string()]),
+            agents: None,
         };
         let refused = crate::exec::fallback::resolve_model_inheritance(
             Some(&requested),
@@ -838,6 +841,7 @@ mod tests {
             None,
             &mut available,
             Some(&scope),
+            "worker",
         );
         assert!(
             refused.is_err(),
