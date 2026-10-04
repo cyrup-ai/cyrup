@@ -984,6 +984,7 @@ mod tests {
             resource_uri: None,
             ui_visibility: None,
             input_schema: None,
+            annotations: None,
         }
     }
 

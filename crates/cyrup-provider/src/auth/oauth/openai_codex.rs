@@ -96,8 +96,8 @@ use super::pkce::generate_pkce;
 use super::query::encode_query;
 use super::random::random_bytes;
 use super::{OAuthError, now_ms};
-use crate::auth::OAuthAuth;
 use crate::auth::types::{Credential, EnvAuthContext, ModelAuth};
+use crate::auth::{LoginOptions, OAuthAuth};
 use crate::error::AuthError;
 use crate::providers::openai_codex::{
     EXT_ACCOUNT_ID, OPENAI_CODEX_OAUTH_NAME, OPENAI_CODEX_PROVIDER_ID, openai_codex_account_id,
@@ -1045,7 +1045,11 @@ impl OAuthAuth for OpenAiCodexOAuthFlow {
     ///
     /// The `select` answer is an option **id**, and anything other than the two known ids is
     /// upstream's `Unknown OpenAI Codex login method: {method}` (`:509`).
-    async fn login(&self, interaction: &dyn AuthInteraction) -> Result<Credential, OAuthError> {
+    async fn login(
+        &self,
+        interaction: &dyn AuthInteraction,
+        _options: &LoginOptions,
+    ) -> Result<Credential, OAuthError> {
         // `:496-506`
         let method = interaction
             .prompt(AuthPrompt::select(
@@ -1729,7 +1733,10 @@ mod tests {
         });
 
         let interaction = ScriptedInteraction::new(vec![Ok(DEVICE_CODE_LOGIN_METHOD.to_string())]);
-        let credential = flow.login(&interaction).await.unwrap();
+        let credential = flow
+            .login(&interaction, &LoginOptions::default())
+            .await
+            .unwrap();
 
         // `:410-416` — the device-code event carries the *fixed* verification URI and timeout.
         assert_eq!(
@@ -2058,7 +2065,7 @@ mod tests {
     async fn unknown_login_method_is_reported_verbatim() {
         let interaction = ScriptedInteraction::new(vec![Ok("carrier-pigeon".to_string())]);
         let err = OpenAiCodexOAuthFlow::new()
-            .login(&interaction)
+            .login(&interaction, &LoginOptions::default())
             .await
             .unwrap_err();
         assert_eq!(

@@ -16,7 +16,7 @@ use crate::proxy::auth::{AutoAuthResult, attempt_auto_auth};
 use crate::proxy::constants::MCP_TOOL_NAME;
 use crate::proxy::env::{
     ApprovalOrigin, ApprovalOutcome, ConnectionStatus, OutputGuardOptions, ProxyCallError,
-    ProxyCtx, UrlElicitationAction,
+    ProxyCtx, ProxyEnv, UrlElicitationAction,
 };
 use crate::proxy::error_vocab::McpErrorCode;
 use crate::proxy::results::{
@@ -795,6 +795,11 @@ pub async fn execute_call(
         .unwrap_or_else(|| Value::Object(JsonMap::new()));
     let resolved_origin =
         origin.unwrap_or_else(|| ApprovalOrigin::for_proxy_call(tool_meta.resource_uri.as_ref()));
+    // In flight from here so an idle check cannot close the server while the approval dialog is
+    // open (MCP-600). `try { touch; incrementInFlight; … } finally { decrementInFlight; touch }`
+    // opens HERE, above the gate, and not at the invocation — the approval wait must be covered or
+    // a dialog outliving `idleTimeout` lets the sweep reap the very server the user just allowed.
+    let _in_flight = InFlightGuard::enter(ctx.env.as_ref(), &server_name);
     match ctx
         .env
         .ensure_tool_call_approved(
@@ -854,10 +859,9 @@ pub async fn execute_call(
         cancel: owned.clone(),
     };
 
-    // try { touch; incrementInFlight; … } finally { decrementInFlight; touch }
-    ctx.env.touch(&server_name);
-    ctx.env.increment_in_flight(&server_name);
-    let outcome = invoke(
+    // The `finally` half is `_in_flight`'s [`Drop`]; see the guard it was entered with, above the
+    // approval gate.
+    invoke(
         ctx,
         &server_name,
         &tool_meta,
@@ -868,10 +872,39 @@ pub async fn execute_call(
         &latch,
         &owned,
     )
-    .await;
-    ctx.env.decrement_in_flight(&server_name);
-    ctx.env.touch(&server_name);
-    outcome
+    .await
+}
+
+/// Upstream's `try { touch; incrementInFlight; … } finally { decrementInFlight; touch }` around
+/// the approval gate and the invocation — `proxy-modes.ts:1587-1590`/`:1785-1790` and
+/// `direct-tools.ts:252-255`/`:445-450` (`43768d3`, #786, v5.0.0).
+///
+/// A `finally` has no Rust keyword, and the two early returns the approval gate owns —
+/// `approval_denied` and `approval_required` — are exactly the paths a hand-written decrement
+/// forgets, so the pair lives in a [`Drop`] guard instead. The guard also covers the case upstream
+/// cannot have: this future being dropped mid-await, where no trailing statement would run at all.
+struct InFlightGuard<'a> {
+    env: &'a dyn ProxyEnv,
+    server: &'a str,
+}
+
+impl<'a> InFlightGuard<'a> {
+    /// The `try` half: `state.manager.touch(server); state.manager.incrementInFlight(server)`.
+    ///
+    /// The `touch` moves **with** the increment, or the server is in flight while its
+    /// `last_used_at` still predates the dialog.
+    fn enter(env: &'a dyn ProxyEnv, server: &'a str) -> Self {
+        env.touch(server);
+        env.increment_in_flight(server);
+        Self { env, server }
+    }
+}
+
+impl Drop for InFlightGuard<'_> {
+    fn drop(&mut self) {
+        self.env.decrement_in_flight(self.server);
+        self.env.touch(self.server);
+    }
 }
 
 /// The body of [`execute_call`]'s `try` — the three result paths and the three catch arms.
@@ -1304,6 +1337,71 @@ mod tests {
             text_of(&result),
             "MCP tool \"run\" on server \"srv\" is approval-gated and requires an interactive session."
         );
+    }
+
+    // ---- MCP-600 · in flight across the approval gate ----------------------------------------------------
+
+    #[tokio::test]
+    async fn the_server_is_in_flight_while_the_approval_dialog_is_open() {
+        // `43768d3` (#786): "Tool calls marked the server in flight only after approval, so an
+        // approval dialog left open past the idle timeout let the check close the server and the
+        // approved call failed." `McpServerManager::is_idle` is false iff in-flight work exists,
+        // so a zero here is the window in which the sweep reaps an approved call's server.
+        let config = config_with(&[("srv", stdio("a"))]);
+        let env = FakeEnv::default().with_connection("srv", ConnectionStatus::Connected);
+        let (ctx, env) = ctx_with(
+            config,
+            &[("srv", vec![ToolMetadata::new("srv_run", "run", "")])],
+            &[],
+            env,
+        );
+        execute_call(&ctx, "srv_run", None, None, &CancelToken::new(), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            *env.in_flight_at_approval.lock().unwrap(),
+            Some(1),
+            "the gate must run with the server already in flight"
+        );
+        // The `touch` moves with the increment, or `last_used_at` still predates the dialog.
+        assert_eq!(
+            env.in_flight_log.lock().unwrap().as_slice(),
+            ["touch", "increment", "gate", "decrement", "touch"]
+        );
+        assert_eq!(env.in_flight_of("srv"), 0, "the finally half still runs");
+    }
+
+    #[tokio::test]
+    async fn a_denied_call_still_leaves_the_server_idle() {
+        // The early return upstream's `finally` covers for free: denied and `approval_required`
+        // must decrement, or one refused dialog pins the server out of the idle sweep forever.
+        for outcome in [
+            ApprovalOutcome::Denied,
+            ApprovalOutcome::NoInteractiveSession,
+        ] {
+            let config = config_with(&[("srv", stdio("a"))]);
+            let env = FakeEnv::default().with_connection("srv", ConnectionStatus::Connected);
+            *env.approval.lock().unwrap() = Some(outcome);
+            let (ctx, env) = ctx_with(
+                config,
+                &[("srv", vec![ToolMetadata::new("srv_run", "run", "")])],
+                &[],
+                env,
+            );
+            execute_call(&ctx, "srv_run", None, None, &CancelToken::new(), None)
+                .await
+                .unwrap();
+            assert_eq!(
+                *env.in_flight_at_approval.lock().unwrap(),
+                Some(1),
+                "{outcome:?}: the gate must run with the server already in flight"
+            );
+            assert_eq!(
+                env.in_flight_of("srv"),
+                0,
+                "{outcome:?}: a refused call must not pin the server in flight"
+            );
+        }
     }
 
     // ---- MCP-164 · result shaping --------------------------------------------------------------------------

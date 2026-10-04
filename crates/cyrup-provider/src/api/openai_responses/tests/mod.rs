@@ -62,6 +62,18 @@ fn model() -> Model {
     }
 }
 
+/// Drive [`decode_stream`] over a scripted SSE transcript and collect its terminal message.
+async fn run_decode(raw: &str) -> AssistantMessage {
+    let frames = decode_sse_bytes(raw.as_bytes().to_vec());
+    let (sink, rx) = crate::api::channel(64);
+    let m = model();
+    let api = ApiId::from(API_ID);
+    decode_stream(frames, &m, &api, &sink).await;
+    drop(sink);
+    let stream = Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx));
+    collect_message(stream).await
+}
+
 fn user_ctx(text: &str) -> Context {
     Context {
         system_prompt: None,

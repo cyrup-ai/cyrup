@@ -23,8 +23,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rmcp::model::{
-    CallToolRequest, CallToolRequestParams, CallToolResult, ClientRequest, ReadResourceRequest,
-    ReadResourceRequestParams, ReadResourceResult, ServerResult,
+    CallToolRequest, CallToolRequestParams, CallToolResult, CancelledNotification,
+    CancelledNotificationParam, ClientRequest, ReadResourceRequest, ReadResourceRequestParams,
+    ReadResourceResult, RequestId, ServerResult,
 };
 use rmcp::service::{Peer, PeerRequestOptions, RequestHandle, RoleClient, ServiceError};
 use serde_json::{Map as JsonMap, Value};
@@ -1076,9 +1077,14 @@ fn session_expired_status(error: &ServiceError) -> Option<u16> {
 /// the race is against `handle.rx` directly rather than `RequestHandle::await_response`, which
 /// consumes the handle and would leave nothing to call `cancel` on — the borrow-then-take shape rmcp
 /// itself uses for a pending subscription (`service/client.rs:391-432`). The timeout arm is
-/// `await_response`'s own `(Some(timeout), None, false)` branch, reproduced because
-/// [`crate::runtime::build_request_options`] only ever sets `timeout`: `reset_timeout_on_progress`
-/// and `max_total_timeout` have no upstream analogue and stay at their defaults.
+/// `await_response`'s own `(Some(timeout), None, false)` branch, reproduced for the requests whose
+/// options carry a bare `timeout` — `max_total_timeout` has no upstream analogue and stays at its
+/// default.
+///
+/// `reset_timeout_on_progress` **does** have one (MCP-607), so a request that asks for it is handed
+/// to [`await_response_resetting_on_progress`] instead: rmcp's reset loop is inside
+/// `RequestHandle::await_response`, whose `progress_reset_rx` is private, so that path cannot
+/// borrow the receiver the way this one does.
 async fn request_on_peer(
     peer: &Peer<RoleClient>,
     request: ClientRequest,
@@ -1089,10 +1095,14 @@ async fn request_on_peer(
         return Err(Box::new(RequestFailure::aborted()));
     }
     let timeout = options.timeout;
+    let reset_on_progress = options.reset_timeout_on_progress;
     let mut handle = peer
         .send_request_with_option(request, options)
         .await
         .map_err(|error| Box::new(RequestFailure::from_service(error)))?;
+    if reset_on_progress && timeout.is_some() {
+        return await_response_resetting_on_progress(peer, handle, cancel).await;
+    }
 
     /// Which of the four ways the race can end happened, computed while `handle.rx` is borrowed so
     /// the arms below can move the handle into `cancel`.
@@ -1157,6 +1167,88 @@ async fn request_on_peer(
             }
             Err(Box::new(RequestFailure::aborted()))
         }
+    }
+}
+
+/// [`request_on_peer`]'s `resetTimeoutOnProgress` arm — MCP-607.
+///
+/// `elicitation-handler.ts:72-83`: "Every call requests progress, and each progress notification
+/// restarts the timeout, as in Pi's built-in MCP", implemented upstream as
+/// `client.callTool(params, { ...options, onprogress, resetTimeoutOnProgress: true })`. Without it a
+/// legitimately long-running tool that reports progress every few seconds is still killed at
+/// `requestTimeoutMs`, which is the whole reason progress exists in the protocol.
+///
+/// # Why this is a second shape rather than a fourth `select!` arm
+///
+/// rmcp owns the reset: `RequestHandle::await_response` resets its idle sleep from
+/// `progress_reset_rx` (`service.rs:644`), and that receiver is a **private** field — there is no
+/// public way to race it alongside `handle.rx` the way [`request_on_peer`] races its own timer. So
+/// rmcp drives the deadline here and this function races the *result*. `await_response` takes the
+/// handle by value, so cancellation cannot go through `RequestHandle::cancel`; it sends the same
+/// `notifications/cancelled` frame `cancel` would have sent, over the same peer, for the same
+/// request id.
+///
+/// Detaching the wait is upstream's own shape, not a liberty: `abortable(callToolPausingForElicitation(…), signal)`
+/// stops awaiting while the SDK's promise and its timer keep running. It also keeps rmcp's
+/// progress-watcher bookkeeping intact on *every* path — `await_response` is the only public entry
+/// that removes the watcher it registered, so abandoning the handle instead would leak one entry
+/// per cancelled call.
+///
+/// # Two upstream halves with nothing to port
+///
+/// * `const onprogress = options?.onprogress ?? (() => {})` (`:81`) exists because the TypeScript
+///   SDK emits `_meta.progressToken` only when a handler is set. rmcp sets it on **every** outgoing
+///   request (`service.rs:886-888`), so a cyrup request already asks for progress.
+/// * `maxTotalTimeout` still has no upstream analogue and stays at its default.
+async fn await_response_resetting_on_progress(
+    peer: &Peer<RoleClient>,
+    handle: RequestHandle<RoleClient>,
+    cancel: &CancelToken,
+) -> Result<ServerResult, Box<RequestFailure>> {
+    let request_id = handle.id.clone();
+    let (settled_tx, settled_rx) = tokio::sync::oneshot::channel();
+    let waiter = tokio::spawn(async move {
+        let _ = settled_tx.send(handle.await_response().await);
+    });
+    tokio::select! {
+        biased;
+        () = cancel.cancelled() => {
+            // `RequestHandle::cancel`'s wire effect, without the handle: same notification, same
+            // reason, same peer. The detached `await_response` finishes on the server's answer or
+            // on rmcp's own timeout and unregisters the watcher either way.
+            send_cancelled(peer, request_id, crate::abort::ABORTED_FALLBACK_REASON).await;
+            Err(Box::new(RequestFailure::aborted()))
+        }
+        settled = settled_rx => match settled {
+            Ok(Ok(response)) => Ok(response),
+            // rmcp has already sent `notifications/cancelled` with its own timeout reason, so this
+            // arm must NOT send a second one. The message is [`request_on_peer`]'s, unchanged.
+            Ok(Err(ServiceError::Timeout { timeout })) => Err(Box::new(RequestFailure::plain(
+                format!("MCP request timed out after {} ms", timeout.as_millis()),
+            ))),
+            Ok(Err(error)) => Err(Box::new(RequestFailure::from_service(error))),
+            // The waiter was dropped without sending, which only happens if the task was aborted.
+            Err(_dropped) => {
+                waiter.abort();
+                Err(Box::new(RequestFailure::plain(
+                    "MCP transport closed before the request was answered".to_string(),
+                )))
+            }
+        },
+    }
+}
+
+/// `notifications/cancelled` for one request id — `RequestHandle::cancel`'s only wire effect.
+///
+/// Failure is logged and swallowed: a peer that cannot take the notification is a peer whose
+/// request is already dead, and the caller's answer is the abort either way.
+async fn send_cancelled(peer: &Peer<RoleClient>, request_id: RequestId, reason: &str) {
+    let notification = CancelledNotification::new(CancelledNotificationParam::new(
+        Some(request_id),
+        Some(reason.to_string()),
+    ));
+    if let Err(error) = peer.send_notification(notification.into()).await {
+        tracing::debug!("MCP: cancelling an aborted request failed: {error}");
     }
 }
 
@@ -1380,6 +1472,19 @@ impl RuntimeEnv {
             .get_request_options(server)
             .unwrap_or_else(PeerRequestOptions::no_options)
     }
+
+    /// [`Self::request_options`] for a `tools/call`, with `resetTimeoutOnProgress` — MCP-607.
+    ///
+    /// `callToolPausingForElicitation` (`elicitation-handler.ts:76-83`) is the **only** wrapper
+    /// upstream routes a `tools/call` through — `direct-tools.ts:342`, `proxy-modes.ts:1679` — and
+    /// it sets the flag on every call. `resources/read` is **not** wrapped
+    /// (`proxy-modes.ts:1613` calls `conn.client.readResource` directly) and keeps the plain timer,
+    /// which is why this is a separate accessor rather than a change to
+    /// [`crate::runtime::build_request_options`]: that function is also the connect and
+    /// discovery-list options, and upstream's `buildRequestOptions` still sets neither flag.
+    fn call_request_options(&self, server: &str) -> PeerRequestOptions {
+        self.request_options(server).reset_timeout_on_progress()
+    }
 }
 
 #[async_trait::async_trait]
@@ -1476,7 +1581,7 @@ impl ProxyEnv for RuntimeEnv {
             .with_session_recovery(server, recovery, cancel, |peer| {
                 let params =
                     CallToolRequestParams::new(tool.to_string()).with_arguments(arguments.clone());
-                let options = self.request_options(server);
+                let options = self.call_request_options(server);
                 async move {
                     let response = request_on_peer(
                         &peer,
@@ -1926,6 +2031,18 @@ while IFS= read -r line; do
       ;;
     *'"method":"tools/call"'*)
       case "$line" in
+        *'"name":"slow"'*)
+          tok=$(printf '%s' "$line" | sed -n 's/.*"progressToken":\([0-9]*\).*/\1/p')
+          i=1
+          while [ "$i" -le 4 ]; do
+            sleep 0.2
+            if [ -n "$tok" ]; then
+              printf '{"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":%s,"progress":%s,"total":4}}\n' "$tok" "$i"
+            fi
+            i=$((i + 1))
+          done
+          printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"slow:done"}],"isError":false}}\n' "$id"
+          ;;
         *'"name":"boom"'*)
           printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"it went wrong"}],"isError":true}}\n' "$id"
           ;;
@@ -2342,6 +2459,94 @@ done
             details["mcpResult"]["content"][0]["text"],
             serde_json::json!("echoed:pong"),
             "`rawMcpResult` rode out with it: {details}"
+        );
+    }
+
+    // ---- MCP-607 · `resetTimeoutOnProgress` ----------------------------------------------------
+
+    /// The whole of MCP-607, end to end on a real child: a tool that reports progress outlives its
+    /// own `requestTimeoutMs`.
+    ///
+    /// `elicitation-handler.ts:72-83` — "Every call requests progress, and each progress
+    /// notification restarts the timeout, as in Pi's built-in MCP." The fixture's `slow` tool emits
+    /// four `notifications/progress` 200 ms apart and only then answers, so the call runs for
+    /// ~800 ms against a 400 ms budget. Without the flag it is killed at 400 ms — which is what
+    /// cyrup did, because `build_request_options`' doc said there was no upstream analogue to
+    /// mirror.
+    ///
+    /// This goes through `execute_call` rather than [`request_on_peer`] so it covers **both** halves
+    /// of the port: that `tools/call` asks for the reset at all
+    /// ([`RuntimeEnv::call_request_options`]) and that the request honours it
+    /// ([`await_response_resetting_on_progress`]).
+    #[tokio::test]
+    async fn progress_notifications_keep_a_slow_tool_call_alive() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let entry = ServerEntry {
+            // Four 200 ms steps against this: the call cannot finish unless progress resets it.
+            request_timeout_ms: Some(400.0),
+            ..live_entry()
+        };
+        let manager = Arc::new(crate::server_manager::McpServerManager::with_factory(
+            None,
+            Arc::new(crate::runtime::ConnectionBuilder::new(None)),
+        ));
+        let lifecycle = Arc::new(crate::lifecycle::McpLifecycleManager::new(
+            Arc::clone(&manager),
+            Arc::new(|_: &str| false),
+        ));
+        let state = Arc::new(McpState::new(crate::state::McpStateParts {
+            owner: Arc::new(crate::owner::McpRuntimeOwner::new()),
+            manager,
+            lifecycle,
+            config: crate::proxy::testsupport::config_with(&[("fixture", entry.clone())]),
+            programmatic_config: None,
+            oauth_runtime: crate::oauth::create_oauth_runtime(None),
+            auth_storage_options: crate::state::AuthStorageOptions::default(),
+            ui: None,
+            open_browser: Arc::new(|_| Box::pin(async { Ok(()) })),
+            send_message: Arc::new(|_| {}),
+            blocked_project_servers: indexmap::IndexMap::new(),
+        }));
+        state
+            .manager
+            .connect("fixture", &entry, None)
+            .await
+            .expect("the fixture connects");
+        state.tool_metadata.lock().unwrap().insert(
+            "fixture".to_string(),
+            vec![ToolMetadata::new("fixture_slow", "slow", "slow")],
+        );
+        let dirs = McpDirs::new(temp.path().to_path_buf(), temp.path().to_path_buf());
+        let ctx = crate::proxy::ProxyCtx::new(
+            Arc::clone(&state),
+            Arc::new(RuntimeEnv::new(
+                Arc::clone(&state),
+                dirs,
+                std::sync::Weak::new(),
+            )),
+        );
+
+        let result = crate::proxy::execute_call(
+            &ctx,
+            "fixture_slow",
+            None,
+            None,
+            &CancelToken::new(),
+            None,
+        )
+        .await
+        .expect("the call completes");
+
+        let details = result.details.clone().expect("details");
+        assert_eq!(
+            details.get("error"),
+            None,
+            "progress must reset the deadline, not merely be ignored: {details}"
+        );
+        assert_eq!(
+            text_of(&result.content),
+            "slow:done",
+            "the server's own answer, after four progress notifications"
         );
     }
 }

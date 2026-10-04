@@ -339,6 +339,47 @@ pub fn execute_instructions(ctx: &ProxyCtx, server: &str) -> ToolResult {
 // 7 · `executeDescribe` (MCP-157)
 // ==================================================================================================
 
+/// `formatToolHints(toolMeta)` (`proxy-modes.ts:709`) — the `Hints:` row of `mcp({ describe })`.
+///
+/// Four flags in a fixed order, each emitted only when the server **declared** it, with the
+/// negative wording when it declared `false`: an undeclared hint says nothing and must not be
+/// rendered as `not read-only`. `title` is appended last, JSON-quoted, and only when it differs
+/// from both of the tool's names — a server that sets `title` to the tool name is not telling the
+/// reader anything (MCP-601).
+#[must_use]
+fn format_tool_hints(tool: &ToolMetadata) -> String {
+    let Some(annotations) = tool.annotations.as_ref() else {
+        return String::new();
+    };
+    let mut hints: Vec<String> = Vec::new();
+    let mut flag = |value: Option<bool>, yes: &str, no: &str| {
+        if let Some(value) = value {
+            hints.push(if value { yes.to_string() } else { no.to_string() });
+        }
+    };
+    flag(annotations.read_only_hint, "read-only", "not read-only");
+    flag(
+        annotations.destructive_hint,
+        "destructive",
+        "non-destructive",
+    );
+    flag(annotations.idempotent_hint, "idempotent", "not idempotent");
+    flag(annotations.open_world_hint, "open-world", "closed-world");
+    if let Some(title) = annotations.title.as_ref().map(|title| title.trim())
+        && !title.is_empty()
+        && title != tool.original_name
+        && title != tool.name
+    {
+        // `JSON.stringify(title)` — the escaping is the point: a server tool title is untrusted
+        // text being spliced into a line the model reads.
+        hints.push(format!(
+            "title {}",
+            Value::String(title.to_string())
+        ));
+    }
+    hints.join(", ")
+}
+
 /// `proxy-modes.ts:434` `executeDescribe(state, toolName)`.
 ///
 /// 1. **Ambiguity first**, before any resolution: `>1` exact enabled match is ambiguous; otherwise
@@ -439,6 +480,12 @@ pub fn execute_describe(ctx: &ProxyCtx, tool_name: &str) -> ToolResult {
     text.push_str(&format!("Server: {server_name}\n"));
     if let Some(uri) = tool_meta.resource_uri.as_ref() {
         text.push_str(&format!("Type: Resource (reads from {uri})\n"));
+    }
+    // `const hints = formatToolHints(toolMeta); if (hints) text += ...` (`proxy-modes.ts:797`) —
+    // `describe` is the second of the two places a hint is shown, and both are decisions (MCP-601).
+    let hints = format_tool_hints(&tool_meta);
+    if !hints.is_empty() {
+        text.push_str(&format!("Hints: {hints}\n"));
     }
     let description = if tool_meta.description.is_empty() {
         "(no description)"

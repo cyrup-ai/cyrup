@@ -58,6 +58,14 @@ pub(crate) struct FakeEnv {
     pub(crate) approval: Mutex<Option<ApprovalOutcome>>,
     pub(crate) all_tools: Mutex<Option<Vec<String>>>,
     pub(crate) approval_required: Mutex<BTreeSet<String>>,
+    /// `state.manager`'s in-flight counter, per server — the quantity
+    /// `McpServerManager::is_idle` reads, and so the one MCP-600 is about.
+    pub(crate) in_flight: Mutex<BTreeMap<String, i64>>,
+    /// The counter sampled from inside the approval gate. `Some(0)` is the MCP-600 bug: the
+    /// dialog is open and the server looks idle.
+    pub(crate) in_flight_at_approval: Mutex<Option<i64>>,
+    /// `touch`/`incrementInFlight`/the gate/`decrementInFlight`, in the order they happened.
+    pub(crate) in_flight_log: Mutex<Vec<&'static str>>,
 }
 
 impl FakeEnv {
@@ -102,6 +110,15 @@ impl FakeEnv {
             .insert(tool.to_string());
         self
     }
+    /// The live in-flight count for `server`.
+    pub(crate) fn in_flight_of(&self, server: &str) -> i64 {
+        self.in_flight
+            .lock()
+            .unwrap()
+            .get(server)
+            .copied()
+            .unwrap_or(0)
+    }
 }
 
 #[async_trait::async_trait]
@@ -127,9 +144,27 @@ impl ProxyEnv for FakeEnv {
     async fn close(&self, server: &str) {
         self.connections.lock().unwrap().remove(server);
     }
-    fn touch(&self, _server: &str) {}
-    fn increment_in_flight(&self, _server: &str) {}
-    fn decrement_in_flight(&self, _server: &str) {}
+    fn touch(&self, _server: &str) {
+        self.in_flight_log.lock().unwrap().push("touch");
+    }
+    fn increment_in_flight(&self, server: &str) {
+        *self
+            .in_flight
+            .lock()
+            .unwrap()
+            .entry(server.to_string())
+            .or_insert(0) += 1;
+        self.in_flight_log.lock().unwrap().push("increment");
+    }
+    fn decrement_in_flight(&self, server: &str) {
+        *self
+            .in_flight
+            .lock()
+            .unwrap()
+            .entry(server.to_string())
+            .or_insert(0) -= 1;
+        self.in_flight_log.lock().unwrap().push("decrement");
+    }
     async fn call_tool(
         &self,
         _server: &str,
@@ -224,12 +259,16 @@ impl ProxyEnv for FakeEnv {
     }
     async fn ensure_tool_call_approved(
         &self,
-        _server: &str,
+        server: &str,
         _tool: &ToolMetadata,
         _arguments: &Value,
         _origin: ApprovalOrigin,
         _cancel: &CancelToken,
     ) -> ApprovalOutcome {
+        // Stand-in for "the approval dialog is open now": whatever the idle sweep would see while
+        // the user is deciding (MCP-600).
+        *self.in_flight_at_approval.lock().unwrap() = Some(self.in_flight_of(server));
+        self.in_flight_log.lock().unwrap().push("gate");
         self.approval
             .lock()
             .unwrap()

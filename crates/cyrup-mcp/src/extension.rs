@@ -3149,10 +3149,10 @@ done
         // The whole of the production trigger: one `SessionStart`.
         let _ = ext.on_event(&session_start_event(), &event_ctx()).await;
 
-        // `mcp-cache.json` does not exist in this tempdir, so `initialize_mcp` sets
-        // `bootstrap_all` and the startup pass connects every enabled server once. The connection
-        // map is written by that pass, which runs inside the SPAWNED build — so the wait is real
-        // and not a formality.
+        // `mcp-cache.json` does not exist in this tempdir, so no server has a valid cache entry,
+        // every one of them lands in `needs_discovery` (MCP-598) and the startup pass connects it.
+        // The connection map is written by that pass, which runs inside the SPAWNED build — so
+        // the wait is real and not a formality.
         let state = tokio::time::timeout(std::time::Duration::from_secs(30), async {
             loop {
                 if let Some(state) = ext.state()
@@ -3177,11 +3177,12 @@ done
             state.server_instructions.lock().is_ok(),
             "the generation's state is the one the connect ran against"
         );
-        // §9's cold-cache bootstrap ran, which is what set `bootstrap_all` and made this an
-        // unconditional startup connect rather than a lazy one.
+        // §12 wrote the discovered catalogue. Since MCP-598 there is no empty-file bootstrap, so
+        // the file exists only because the startup connect really happened and really captured
+        // something — a stronger assertion than the one it replaces.
         assert!(
             dir.path().join("mcp-cache.json").exists(),
-            "the cold-cache bootstrap writes an empty cache before the startup pass"
+            "the startup pass writes the catalogue it discovered"
         );
         // The commit tail ran on the state that owns this connection.
         assert!(ext.proxy_ctx().is_some());

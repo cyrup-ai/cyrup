@@ -54,8 +54,8 @@ use super::device_code::{
 };
 use super::interaction::{AuthEvent, AuthInteraction};
 use super::query::encode_query;
-use crate::auth::OAuthAuth;
 use crate::auth::types::{AuthContext, Credential, EnvAuthContext, ModelAuth};
+use crate::auth::{LoginOptions, OAuthAuth};
 use crate::error::AuthError;
 use cyrup_core::CancelToken;
 use serde_json::Value;
@@ -713,7 +713,11 @@ impl OAuthAuth for KimiCodingOAuth {
     /// 1:1 port of `loginKimiCoding` (`kimi-coding.ts:274-286`, wired at `:292`): start the device
     /// authorization, show the user code and the complete verification URI, then poll the token
     /// endpoint until the user approves.
-    async fn login(&self, interaction: &dyn AuthInteraction) -> Result<Credential, OAuthError> {
+    async fn login(
+        &self,
+        interaction: &dyn AuthInteraction,
+        _options: &LoginOptions,
+    ) -> Result<Credential, OAuthError> {
         self.run_login(interaction).await
     }
 
@@ -1407,7 +1411,10 @@ mod tests {
 
         let interaction = ScriptedInteraction::new(Vec::new());
         let before = super::super::now_ms();
-        let credential = flow_at(&origin).login(&interaction).await.unwrap();
+        let credential = flow_at(&origin)
+            .login(&interaction, &LoginOptions::default())
+            .await
+            .unwrap();
 
         match &credential {
             Credential::Oauth {
@@ -1447,7 +1454,10 @@ mod tests {
         let cancel = CancelToken::new();
         cancel.cancel();
         let interaction = ScriptedInteraction::new(Vec::new()).with_cancel(cancel);
-        let err = flow_at(&origin).login(&interaction).await.unwrap_err();
+        let err = flow_at(&origin)
+            .login(&interaction, &LoginOptions::default())
+            .await
+            .unwrap_err();
         assert_eq!(err.to_string(), "Login cancelled");
         assert!(log.lock().unwrap().is_empty());
     }

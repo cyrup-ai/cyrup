@@ -55,8 +55,8 @@ use super::device_code::{
 use super::interaction::{AuthEvent, AuthInteraction};
 use super::query::encode_query;
 use super::{OAuthError, now_ms, oauth_credential};
-use crate::auth::OAuthAuth;
 use crate::auth::types::{Credential, ModelAuth};
+use crate::auth::{LoginOptions, OAuthAuth};
 use crate::error::AuthError;
 use cyrup_core::CancelToken;
 
@@ -647,7 +647,11 @@ impl OAuthAuth for XaiOAuth {
 
     /// 1:1 port of `loginXai` (`xai.ts:201-211`, wired at `:232`): request a device code, show it,
     /// then poll until the user finishes in the browser.
-    async fn login(&self, interaction: &dyn AuthInteraction) -> Result<Credential, OAuthError> {
+    async fn login(
+        &self,
+        interaction: &dyn AuthInteraction,
+        _options: &LoginOptions,
+    ) -> Result<Credential, OAuthError> {
         self.run_login(interaction).await
     }
 
@@ -1400,7 +1404,10 @@ mod tests {
 
         let flow = XaiOAuth::with_endpoints(&device_server.url, &token_server.url);
         let interaction = ScriptedInteraction::new(Vec::new());
-        let cred = flow.login(&interaction).await.expect("login succeeds");
+        let cred = flow
+            .login(&interaction, &LoginOptions::default())
+            .await
+            .expect("login succeeds");
 
         // xai.ts:203-209 — the COMPLETE uri is what the user is shown when present.
         assert_eq!(
@@ -1433,7 +1440,10 @@ mod tests {
         let token_server = FakeEndpoint::one("/oauth2/token", 400, r#"{"error":"access_denied"}"#);
         let flow = XaiOAuth::with_endpoints(&device_server.url, &token_server.url);
         let interaction = ScriptedInteraction::new(Vec::new());
-        let err = flow.login(&interaction).await.unwrap_err();
+        let err = flow
+            .login(&interaction, &LoginOptions::default())
+            .await
+            .unwrap_err();
 
         // xai.ts:206 — `verificationUriComplete ?? verificationUri`.
         assert_eq!(
@@ -1464,7 +1474,10 @@ mod tests {
         token.cancel();
         let interaction = ScriptedInteraction::new(Vec::new()).with_cancel(token);
         assert_eq!(
-            flow.login(&interaction).await.unwrap_err().to_string(),
+            flow.login(&interaction, &LoginOptions::default())
+                .await
+                .unwrap_err()
+                .to_string(),
             "Login cancelled"
         );
     }

@@ -69,7 +69,7 @@ use crate::config::{
     ConfigWritePreview, ImportKind, KnownServerPreset, McpConfig, McpDiscoverySummary, ServerEntry,
     ServerProvenance, SourceId, SourceKind, ToolPrefix,
 };
-use crate::dirs::{CACHE_MAX_AGE_MS, CachedTool, MetadataCache, ServerCacheEntry};
+use crate::dirs::{CachedTool, DEFAULT_MAX_AGE_MS, MetadataCache, ServerCacheEntry};
 use crate::errors::McpResult;
 use crate::onboarding::OnboardingState;
 use crate::registration::{
@@ -1741,7 +1741,7 @@ impl McpPanelModel {
             Some(hasher) => hasher(definition)?,
             None => crate::registration::default_server_hasher(definition)?,
         };
-        crate::dirs::is_server_cache_valid(entry, &hash, CACHE_MAX_AGE_MS).then_some(entry)
+        crate::dirs::is_server_cache_valid(entry, &hash, DEFAULT_MAX_AGE_MS).then_some(entry)
     }
 
     /// `getOtherCurrentCandidates(serverName, definition, currentEntry, toolName)` (13h §1.2).

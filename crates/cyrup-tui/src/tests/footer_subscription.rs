@@ -48,7 +48,7 @@ use cyrup_core::EventStream;
 use cyrup_core::{ProviderId, StopReason};
 use cyrup_provider::AuthError as ProviderAuthError;
 use cyrup_provider::auth::oauth::{AuthInteraction, AuthPrompt, OAuthError};
-use cyrup_provider::auth::{ApiKeyAuth, ModelAuth, OAuthAuth, ProviderAuth};
+use cyrup_provider::auth::{ApiKeyAuth, LoginOptions, ModelAuth, OAuthAuth, ProviderAuth};
 use cyrup_provider::faux::{FauxProvider, faux_assistant_message, faux_text};
 use cyrup_provider::{Context, Credential, Model, Provider, StreamEvent, StreamOptions};
 use cyrup_session_svc::{AgentSession, AgentSessionEvent, SessionBuilder, SessionConfig};
@@ -71,7 +71,11 @@ impl<const SUB: bool> OAuthAuth for ScriptedOauth<SUB> {
     fn is_subscription(&self) -> bool {
         SUB
     }
-    async fn login(&self, interaction: &dyn AuthInteraction) -> Result<Credential, OAuthError> {
+    async fn login(
+        &self,
+        interaction: &dyn AuthInteraction,
+        _options: &LoginOptions,
+    ) -> Result<Credential, OAuthError> {
         let code = interaction.prompt(AuthPrompt::text("code?")).await?;
         Ok(Credential::Oauth {
             refresh: format!("rt-{code}"),

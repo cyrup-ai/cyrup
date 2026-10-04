@@ -151,8 +151,17 @@ const DIRECT_TOOL_PROMPT_SNIPPET_LENGTH: usize = 100;
 /// `cyrup_ext_subagents::exec::mcp_direct_tools`.
 pub const METADATA_CACHE_VERSION: u32 = 1;
 
-/// `metadata-cache.ts`'s `CACHE_MAX_AGE_MS` — seven days.
-pub const METADATA_CACHE_MAX_AGE_MS: f64 = 7.0 * 24.0 * 60.0 * 60.0 * 1000.0;
+/// [`is_server_cache_valid`]'s default `maxAgeMs` — **no age limit** (`metadata-cache.ts:190`).
+///
+/// `2632013` (#787, v5.0.0) deleted `CACHE_MAX_AGE_MS` and defaulted the parameter to `0`, with the
+/// comment "0 means no age limit: without a server-declared TTL, an entry stays valid until the
+/// next connect refreshes it." The seven-day limit was not a safety net but a scheduled outage: the
+/// first session stamps every server's entry with the same time, only the servers you actually use
+/// get restamped, so a week later every unused server's entry expired together and nothing
+/// rediscovered a plain `lazy` server — it dropped out of search for good. Validity is now bounded
+/// by the config hash and a server-declared TTL instead, and the parameter survives so an explicit
+/// cap still applies (MCP-595).
+pub const METADATA_CACHE_DEFAULT_MAX_AGE_MS: f64 = 0.0;
 
 /// The env override subagents and CI use to pin a minimal MCP tool surface (MCP-219).
 pub const DIRECT_TOOLS_ENV_VAR: &str = "MCP_DIRECT_TOOLS";
@@ -900,6 +909,12 @@ pub struct CachedTool {
     /// lenient derive flattens (MCP-208).
     #[serde(default)]
     pub ui_visibility: Option<Value>,
+    /// Kept as a raw [`Value`] for the same reason upstream types it `unknown` here: the lenient
+    /// reader must not fail on a cache written by something else, and
+    /// [`crate::proxy::extract_tool_annotations`] is what turns it into hints at reconstruction
+    /// time (MCP-601).
+    #[serde(default)]
+    pub annotations: Option<Value>,
 }
 
 /// `types.ts` `CachedResource`.
@@ -1058,7 +1073,9 @@ pub fn load_metadata_cache(dirs: &McpDirs) -> Option<MetadataCache> {
 /// 3. A **falsy or non-numeric** `cachedAt` — `!entry.cachedAt` rejects `0` as well as absent, and
 ///    the `typeof` test rejects a JSON string, which [`lenient_epoch_ms`] turns into `None`.
 /// 4. An age over `max_age_ms`, checked **only when that limit is positive** — so `0` disables the
-///    age check entirely and a year-old entry is accepted.
+///    age check entirely and a year-old entry is accepted. `0` is the **default** every production
+///    caller passes ([`METADATA_CACHE_DEFAULT_MAX_AGE_MS`], MCP-595); the branch is kept because the
+///    parameter is, for a caller that wants an explicit cap.
 #[must_use]
 pub fn is_server_cache_valid(
     entry: &ServerCacheEntry,
@@ -1099,7 +1116,7 @@ pub(crate) fn valid_entry<'a>(
     definition: &ServerEntry,
 ) -> Option<&'a ServerCacheEntry> {
     let entry = cache?.servers.get(server_name)?;
-    is_server_cache_valid(entry, definition, METADATA_CACHE_MAX_AGE_MS).then_some(entry)
+    is_server_cache_valid(entry, definition, METADATA_CACHE_DEFAULT_MAX_AGE_MS).then_some(entry)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1752,6 +1769,8 @@ pub fn build_tool_metadata(
             // `rmcp` makes `inputSchema` required where the wire type has it optional, so the
             // `...(tool.inputSchema !== undefined ? … : {})` spread is always taken.
             input_schema: Some(Value::Object((*tool.input_schema).clone())),
+            // `const annotations = extractToolAnnotations(tool.annotations)` (`tool-metadata.ts:99`).
+            annotations: crate::proxy::tool_annotations(tool),
         });
     }
 
@@ -1783,6 +1802,10 @@ pub fn build_tool_metadata(
                 resource_uri: Some(resource.uri.clone()),
                 ui_visibility: None,
                 input_schema: None,
+                // A resource tool is synthesised by the adapter, not declared by the server, so
+                // there are no server hints to carry — upstream's resource spread has no
+                // `annotations` member either.
+                annotations: None,
             });
         }
     }
@@ -1902,6 +1925,10 @@ pub fn reconstruct_tool_metadata(
             resource_uri: None,
             ui_visibility: cached_ui_visibility(tool.ui_visibility.as_ref()),
             input_schema: tool.input_schema.clone(),
+            // `extractToolAnnotations(tool.annotations)` (`metadata-cache.ts:300`) — a hint
+            // survives a cold start, which is what makes the `"destructive"` gate work on a
+            // direct-tool surface registered from the cache alone.
+            annotations: crate::proxy::extract_tool_annotations(tool.annotations.as_ref()),
         });
     }
 
@@ -1938,6 +1965,10 @@ pub fn reconstruct_tool_metadata(
                 resource_uri: Some(resource.uri.clone()),
                 ui_visibility: None,
                 input_schema: None,
+                // A resource tool is synthesised by the adapter, not declared by the server, so
+                // there are no server hints to carry — upstream's resource spread has no
+                // `annotations` member either.
+                annotations: None,
             });
         }
     }
@@ -2650,7 +2681,7 @@ pub fn resolve_cached_prompts(
         if definition.is_disabled() || entry.prompts().is_empty() {
             continue;
         }
-        if !is_server_cache_valid(entry, definition, METADATA_CACHE_MAX_AGE_MS) {
+        if !is_server_cache_valid(entry, definition, METADATA_CACHE_DEFAULT_MAX_AGE_MS) {
             continue;
         }
         specs.extend(reconstruct_prompt_metadata(
@@ -3440,13 +3471,48 @@ mod tests {
         assert_eq!(names, vec!["s_kept"]);
     }
 
+    /// The seven-day limit `2632013` (#787) deleted, kept only as the value an **explicit** cap
+    /// test passes — no production caller has one (MCP-595).
+    const SEVEN_DAYS_MS: f64 = 7.0 * 24.0 * 60.0 * 60.0 * 1000.0;
+
+    /// MCP-595. A week-old entry used to leave the direct-tool surface, and because cyrup's startup
+    /// discovery set is `bootstrap_all || is_prewarmed()` — and `bootstrap_all` is set only when the
+    /// cache file is absent entirely — nothing ever rediscovered a plain `lazy` server. The tools
+    /// came back only if the model happened to call one by name.
     #[test]
-    fn an_expired_cache_entry_is_invalid() {
-        let mut stale = cache_entry(vec![cached_tool("t")]);
-        stale.cached_at = Some(now_ms() - METADATA_CACHE_MAX_AGE_MS - 1000.0);
+    fn a_long_unused_cache_entry_is_still_valid() {
+        let mut old = cache_entry(vec![cached_tool("t")]);
+        old.cached_at = Some(now_ms() - SEVEN_DAYS_MS - 1000.0);
         let config = config_of(&[("s", entry(true))]);
-        let cache = cache_of(&config, &[("s", stale)]);
-        assert!(resolve_direct_tools(&config, Some(&cache), ToolPrefix::Server, None).is_empty());
+        let cache = cache_of(&config, &[("s", old)]);
+        let specs = resolve_direct_tools(&config, Some(&cache), ToolPrefix::Server, None);
+        let names: Vec<&str> = specs
+            .iter()
+            .map(|spec| spec.prefixed_name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["s_t"],
+            "an entry whose configHash still matches stays valid however old it is"
+        );
+    }
+
+    /// …and a full year old, straight at the predicate, is still valid — while an **explicit**
+    /// positive cap still rejects it, because the parameter survived the default change.
+    #[test]
+    fn an_explicit_positive_cap_still_expires_an_entry() {
+        let definition = entry(true);
+        let mut ancient = cache_entry(vec![cached_tool("t")]);
+        ancient.config_hash = default_server_hasher(&definition);
+        ancient.cached_at = Some(now_ms() - SEVEN_DAYS_MS * 52.0);
+        assert!(
+            is_server_cache_valid(&ancient, &definition, METADATA_CACHE_DEFAULT_MAX_AGE_MS),
+            "the default is `0` — no age limit"
+        );
+        assert!(
+            !is_server_cache_valid(&ancient, &definition, SEVEN_DAYS_MS),
+            "a caller that passes a positive cap still gets one"
+        );
     }
 
     // --- MCP-145: the hash comparison, the throw arm, and the two `cachedAt` rules -------------
@@ -3461,7 +3527,7 @@ mod tests {
         let mut stale = cache_entry(vec![cached_tool("t")]);
         stale.config_hash = Some("0".repeat(64));
         assert!(
-            !is_server_cache_valid(&stale, &definition, METADATA_CACHE_MAX_AGE_MS),
+            !is_server_cache_valid(&stale, &definition, SEVEN_DAYS_MS),
             "a mismatched digest must invalidate even with no installed hasher"
         );
 
@@ -3470,7 +3536,7 @@ mod tests {
         assert!(is_server_cache_valid(
             &fresh,
             &definition,
-            METADATA_CACHE_MAX_AGE_MS
+            SEVEN_DAYS_MS
         ));
 
         // …and it tracks the definition: adding an identity field evicts the entry.
@@ -3479,7 +3545,7 @@ mod tests {
         assert!(!is_server_cache_valid(
             &fresh,
             &edited,
-            METADATA_CACHE_MAX_AGE_MS
+            SEVEN_DAYS_MS
         ));
         // …while a runtime-only field does not.
         let mut noisy = definition.clone();
@@ -3487,7 +3553,7 @@ mod tests {
         assert!(is_server_cache_valid(
             &fresh,
             &noisy,
-            METADATA_CACHE_MAX_AGE_MS
+            SEVEN_DAYS_MS
         ));
     }
 
@@ -3515,7 +3581,7 @@ mod tests {
         assert!(!is_server_cache_valid(
             &anything,
             &definition,
-            METADATA_CACHE_MAX_AGE_MS
+            SEVEN_DAYS_MS
         ));
         // Even `maxAgeMs = 0`, which disables the age check, cannot rescue it: the throw is first.
         assert!(!is_server_cache_valid(&anything, &definition, 0.0));
@@ -3546,7 +3612,7 @@ mod tests {
         zero.config_hash = hash.clone();
         zero.cached_at = Some(0.0);
         assert!(
-            !is_server_cache_valid(&zero, &definition, METADATA_CACHE_MAX_AGE_MS),
+            !is_server_cache_valid(&zero, &definition, SEVEN_DAYS_MS),
             "`cachedAt: 0` is falsy upstream, so it is absent"
         );
         // …and it is rejected by the FALSY test, not by the age check: with `maxAgeMs = 0` there is
@@ -3555,11 +3621,11 @@ mod tests {
 
         let mut ancient = cache_entry(vec![cached_tool("t")]);
         ancient.config_hash = hash;
-        ancient.cached_at = Some(now_ms() - METADATA_CACHE_MAX_AGE_MS * 52.0);
+        ancient.cached_at = Some(now_ms() - SEVEN_DAYS_MS * 52.0);
         assert!(!is_server_cache_valid(
             &ancient,
             &definition,
-            METADATA_CACHE_MAX_AGE_MS
+            SEVEN_DAYS_MS
         ));
         assert!(
             is_server_cache_valid(&ancient, &definition, 0.0),

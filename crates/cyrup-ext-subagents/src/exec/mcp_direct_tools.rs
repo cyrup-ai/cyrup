@@ -118,9 +118,15 @@ use sha2::{Digest, Sha256};
 /// declaring any other version is treated as absent.
 const CACHE_VERSION: i64 = 1;
 
-/// Maximum age (milliseconds) a cached server-metadata entry may have before it is treated as
-/// stale and skipped — pi's `CACHE_MAX_AGE_MS` (7 days).
-const CACHE_MAX_AGE_MS: i64 = 7 * 24 * 60 * 60 * 1000;
+/// The default `maxAgeMs` for a cached server-metadata entry — **no age limit**
+/// (`metadata-cache.ts:190`).
+///
+/// `2632013` (#787, v5.0.0) deleted pi's `CACHE_MAX_AGE_MS` (7 days) and defaulted the parameter to
+/// `0`: "0 means no age limit: without a server-declared TTL, an entry stays valid until the next
+/// connect refreshes it." This side must move with the writer (`cyrup_mcp::dirs`), or a subagent's
+/// `mcp:` selector resolves to nothing for exactly the servers the host still serves from cache
+/// (MCP-595).
+const DEFAULT_MAX_AGE_MS: i64 = 0;
 
 /// Builtin tool names a resolved/prefixed MCP name may never shadow (pi `BUILTIN_TOOL_NAMES`): a
 /// formatted MCP name colliding with one of these is dropped rather than emitted.
@@ -925,10 +931,10 @@ fn parse_selections(selections: &[String]) -> (HashSet<String>, HashMap<String, 
     (servers, tools)
 }
 
-/// `isServerCacheValid(entry, definition, maxAgeMs)` (`metadata-cache.ts:114` @ v2.26.1) at the
-/// module's own [`CACHE_MAX_AGE_MS`] — the arity every call site here uses.
+/// `isServerCacheValid(entry, definition)` (`metadata-cache.ts:187`) at the parameter's default
+/// [`DEFAULT_MAX_AGE_MS`] — the arity every call site here uses.
 fn is_server_cache_valid(entry: &ServerCacheEntry, definition: &ServerEntry) -> bool {
-    is_server_cache_valid_with_age(entry, definition, CACHE_MAX_AGE_MS)
+    is_server_cache_valid_with_age(entry, definition, DEFAULT_MAX_AGE_MS)
 }
 
 /// `isServerCacheValid` with upstream's third parameter, and with its **throw-to-false** rule
@@ -956,8 +962,9 @@ fn is_server_cache_valid(entry: &ServerCacheEntry, definition: &ServerEntry) -> 
 ///    accepted `0`), and the `typeof` test rejects a JSON string, which
 ///    [`ServerCacheEntry::cached_at`]'s deserialiser turns into `None`.
 /// 4. An age over `max_age_ms`, checked **only when that limit is positive** — `0` disables the age
-///    check entirely, which is upstream's documented way to validate a definition without regard to
-///    freshness. This module had no parameter at all and treated the constant as a hard floor.
+///    check entirely, and since `2632013` (#787) `0` is the **default** every caller passes
+///    (MCP-595). This module had no parameter at all and treated the seven-day constant as a hard
+///    floor.
 fn is_server_cache_valid_with_age(
     entry: &ServerCacheEntry,
     definition: &ServerEntry,
@@ -4151,13 +4158,22 @@ mod tests {
             &definition
         ));
 
+        // MCP-595: the default is `0`, so a year-old entry whose digest still matches is valid —
+        // and it must be, or a `mcp:` selector resolves to nothing for a server the host is still
+        // serving from the same file.
         let year = 365 * 24 * 60 * 60 * 1000;
         let ancient = with_stamp(Some(crate::time::now_epoch_millis() - year));
-        assert!(!is_server_cache_valid(&ancient, &definition));
         assert!(
-            is_server_cache_valid_with_age(&ancient, &definition, 0),
-            "`maxAgeMs = 0` disables the age check entirely"
+            is_server_cache_valid(&ancient, &definition),
+            "`maxAgeMs = 0` is the default and disables the age check entirely"
         );
+        // The parameter survived the default change, so an explicit positive cap still bites.
+        let seven_days_ms = 7 * 24 * 60 * 60 * 1000;
+        assert!(!is_server_cache_valid_with_age(
+            &ancient,
+            &definition,
+            seven_days_ms
+        ));
 
         // A JSON string `cachedAt` must cost this entry and nothing else — a plain `Option<i64>`
         // would have failed the whole file's parse.

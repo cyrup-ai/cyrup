@@ -184,18 +184,24 @@ pub fn is_tool_call_approval_required(
 /// tests are `!== true` and `!== false`, not `=== false` and `=== true`, and both pass when
 /// `annotations` is absent. Resource reads are the one exemption.
 ///
-/// # The two hint terms are MCP-601's data, and both are vacuous here
+/// # The two hint terms read the LIVE metadata, which is the subtle half of `2bc904f`
 ///
-/// `ToolMetadata` carries no `annotations` yet — that field, `extractToolAnnotations`, and its
-/// cache round-trip are MCP-601 (`2bc904f`, #728, `pi-mcp-adapter` v3.3.0), which is not ported.
-/// Every tool this build knows is therefore unannotated, which is the case both hint terms are
-/// written to pass, so this function is upstream's expression with its two always-true conjuncts
-/// elided rather than an approximation of it. The residual is MCP-601's, not this gate's: a server
-/// that marks a tool `readOnlyHint: true` or `destructiveHint: false` is prompted for here and is
-/// not upstream, because the hint never reaches cyrup to be read. When MCP-601 lands, the two terms
-/// come back here verbatim and this doc comment goes away.
+/// A direct tool's spec is fixed at registration, often from the cache, and with `freezeDirectTools`
+/// it is never re-registered — so upstream **removed** `annotations` from `DirectToolSpec` and has
+/// approval read the hints off the live `state.toolMetadata` entry that lazy connect refreshes
+/// (`direct-tools.ts:218-220`). A server that newly marks a tool destructive must prompt with the
+/// warning on the next call, not on the next cold start.
+///
+/// cyrup has that property structurally and not by arrangement: every direct tool is dispatched
+/// through [`crate::proxy::execute_call`] (`dispatch.rs:340`), which resolves its [`ToolMetadata`]
+/// out of `state.tool_metadata` on every call, and [`crate::registration::DirectToolSpec`] has no
+/// `annotations` member to go stale. So the fingerprint that decides re-registration cannot move
+/// when a hint changes, and the gate still sees the new hint.
 fn destructive_gate(tool: &ToolMetadata) -> bool {
+    let annotations = tool.annotations.as_ref();
     tool.resource_uri.is_none()
+        && annotations.and_then(|hints| hints.read_only_hint) != Some(true)
+        && annotations.and_then(|hints| hints.destructive_hint) != Some(false)
 }
 
 /// The tail both scopes of [`is_tool_call_approval_required`] share (`tool-approval.ts:53-67 @v2.26.1`,
@@ -373,7 +379,22 @@ pub async fn ensure_tool_call_approved(
         crate::ui::sanitize_terminal_text(server_name),
         crate::ui::sanitize_terminal_text(&tool.original_name)
     );
-    let prompt = format!("{title}\n\nArguments:\n{}", approval_argument_preview(args));
+    // `tool-approval.ts:191-193` — the hints are shown HERE, where a decision is made, and
+    // nowhere else (MCP-601). `=== true` on both arms: an absent hint says nothing, and
+    // `destructiveHint: false` is not an invitation to call a tool read-only.
+    let hint = match tool.annotations.as_ref() {
+        Some(hints) if hints.destructive_hint == Some(true) => {
+            "\n\nThe server marks this tool as destructive: it may delete or overwrite data."
+        }
+        Some(hints) if hints.read_only_hint == Some(true) => {
+            "\n\nThe server marks this tool as read-only."
+        }
+        _ => "",
+    };
+    let prompt = format!(
+        "{title}{hint}\n\nArguments:\n{}",
+        approval_argument_preview(args)
+    );
     let decision = dialog.select(&prompt, &APPROVAL_OPTIONS).await;
     if cancelled() {
         // The answer arrived after the run was cancelled: discard it rather than caching a

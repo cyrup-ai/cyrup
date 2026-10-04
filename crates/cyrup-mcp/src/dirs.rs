@@ -46,7 +46,8 @@
 //!
 //! `cyrup-mcp` is the **writer** of a file that already has an in-tree **reader**:
 //! `cyrup_ext_subagents::exec::mcp_direct_tools` (`load_metadata_cache`, `is_server_cache_valid`,
-//! `compute_mcp_server_hash`, `CACHE_VERSION = 1`, `CACHE_MAX_AGE_MS = 7 days`). If the two disagree
+//! `compute_mcp_server_hash`, `CACHE_VERSION = 1`, and the same no-age-limit default). If the two
+//! disagree
 //! about one byte of the `configHash` pre-image, every cached entry is rejected and the symptom
 //! surfaces three subsystems away as "direct tools silently didn't appear" and as `mcp:` subagent
 //! selectors resolving to nothing.
@@ -491,10 +492,15 @@ pub fn resolve_auth_base_dir(
 /// every user's direct tools disappearing for one session. They stay absent and ignored (MCP-077).
 pub const CACHE_VERSION: u32 = 1;
 
-/// `CACHE_MAX_AGE_MS` (`metadata-cache.ts:35`) — 7 days. An entry older than this is stale even
-/// when its `configHash` still matches, because a server's tool list can change without its
-/// definition changing.
-pub const CACHE_MAX_AGE_MS: i64 = 7 * 24 * 60 * 60 * 1000;
+/// [`is_server_cache_valid`]'s default `max_age_ms` — **no age limit** (`metadata-cache.ts:190`).
+///
+/// `2632013` (#787, v5.0.0) deleted `CACHE_MAX_AGE_MS` (seven days) and defaulted the parameter to
+/// `0`: "0 means no age limit: without a server-declared TTL, an entry stays valid until the next
+/// connect refreshes it." An entry whose `configHash` still matches is now valid however old it is,
+/// because the alternative was every unused server's entry expiring on the same day a week after
+/// the first session and never being rediscovered (MCP-595). A caller that wants a cap still passes
+/// one; nothing in production does.
+pub const DEFAULT_MAX_AGE_MS: i64 = 0;
 
 /// One cached tool descriptor — `types.ts:617` `CachedTool`.
 ///
@@ -531,6 +537,14 @@ pub struct CachedTool {
     /// `mcp-cache.json` shape compatibility only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ui_stream_mode: Option<String>,
+    /// `types.ts:803` — the server's behaviour hints, carried through the cache so a hint survives
+    /// a cold start (MCP-601).
+    ///
+    /// Lenient member by member: see [`crate::proxy::extract_tool_annotations`]. It has to be, and
+    /// not only because a server is untrusted — this file is written by a co-installed
+    /// `pi-mcp-adapter` too, and one malformed hint must not cost the whole cache.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub annotations: Option<crate::proxy::McpToolAnnotations>,
 }
 
 /// One cached resource descriptor — `types.ts:626` `CachedResource`. Each becomes a `read_<name>`
@@ -816,6 +830,9 @@ pub fn serialize_tools(tools: &[rmcp::model::Tool]) -> Vec<CachedTool> {
                     .as_ref(),
             ),
             ui_stream_mode: None,
+            // `const annotations = extractToolAnnotations(t.annotations)` (`metadata-cache.ts:366`)
+            // — the write side of MCP-601, and the half that makes a hint survive a cold start.
+            annotations: crate::proxy::tool_annotations(tool),
         })
         .collect()
 }
@@ -883,7 +900,8 @@ pub fn serialize_prompts(prompts: &[rmcp::model::Prompt]) -> Vec<CachedPrompt> {
 ///
 /// Three rejections, in upstream's order: a hash mismatch; a falsy `cachedAt` (which is `0` as well
 /// as absent — `!entry.cachedAt`); and an age over `max_age_ms`, checked only when that limit is
-/// positive, so `0` disables the age check entirely.
+/// positive, so `0` disables the age check entirely — and `0` is the default every production
+/// caller passes ([`DEFAULT_MAX_AGE_MS`], MCP-595).
 #[must_use]
 pub fn is_server_cache_valid(entry: &ServerCacheEntry, config_hash: &str, max_age_ms: i64) -> bool {
     is_server_cache_valid_at(entry, config_hash, max_age_ms, now_ms())
@@ -2152,37 +2170,41 @@ mod tests {
         }
     }
 
+    /// The seven-day limit `2632013` (#787) deleted — kept here as the value an **explicit** cap
+    /// test passes, since the default is now `0` (MCP-595).
+    const SEVEN_DAYS_MS: i64 = 7 * 24 * 60 * 60 * 1000;
+
     #[test]
     fn cache_validity_rejects_mismatch_falsy_timestamp_and_age() {
         let now = 1_000_000_000_000;
         let fresh = entry_with("h", now - 1000);
-        assert!(is_server_cache_valid_at(&fresh, "h", CACHE_MAX_AGE_MS, now));
+        assert!(is_server_cache_valid_at(&fresh, "h", SEVEN_DAYS_MS, now));
         assert!(!is_server_cache_valid_at(
             &fresh,
             "other",
-            CACHE_MAX_AGE_MS,
+            SEVEN_DAYS_MS,
             now
         ));
         // `!entry.cachedAt` rejects 0 as well as absent.
         assert!(!is_server_cache_valid_at(
             &entry_with("h", 0),
             "h",
-            CACHE_MAX_AGE_MS,
+            SEVEN_DAYS_MS,
             now
         ));
         // Exactly at the boundary is still valid — upstream's test is `>`, not `>=`.
-        let boundary = entry_with("h", now - CACHE_MAX_AGE_MS);
+        let boundary = entry_with("h", now - SEVEN_DAYS_MS);
         assert!(is_server_cache_valid_at(
             &boundary,
             "h",
-            CACHE_MAX_AGE_MS,
+            SEVEN_DAYS_MS,
             now
         ));
-        let stale = entry_with("h", now - CACHE_MAX_AGE_MS - 1);
+        let stale = entry_with("h", now - SEVEN_DAYS_MS - 1);
         assert!(!is_server_cache_valid_at(
             &stale,
             "h",
-            CACHE_MAX_AGE_MS,
+            SEVEN_DAYS_MS,
             now
         ));
         // `maxAgeMs <= 0` disables the age check entirely.
@@ -2719,12 +2741,12 @@ mod tests {
         let year = 365 * 24 * 60 * 60 * 1000;
         let old = entry_with("h", now_ms() - year);
         assert!(
-            !is_server_cache_valid(&old, "h", CACHE_MAX_AGE_MS),
-            "a year is older than 7 days"
+            !is_server_cache_valid(&old, "h", SEVEN_DAYS_MS),
+            "a year is older than an explicit seven-day cap"
         );
         assert!(
-            is_server_cache_valid(&old, "h", 0),
-            "`maxAgeMs = 0` disables the age check"
+            is_server_cache_valid(&old, "h", DEFAULT_MAX_AGE_MS),
+            "`maxAgeMs = 0` is the default and disables the age check (MCP-595)"
         );
 
         // A JSON string `cachedAt` must invalidate THIS entry without costing the file its others.

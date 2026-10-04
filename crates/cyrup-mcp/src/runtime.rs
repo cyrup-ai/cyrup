@@ -574,34 +574,32 @@ pub async fn initialize_mcp(
         return Ok(state);
     }
 
-    // ── §9 — cache bootstrap (MCP-019) ─────────────────────────────────────────────────────
-    // The two-way split IS the unit (`init.ts:228-239`). Collapsing "no usable cache" into one arm
-    // turns the corrupt-cache path from cheap into a connect storm.
+    // ── §9 — the cache read (MCP-019, MCP-598) ─────────────────────────────────────────────
+    // `const cache = serverEntries.length > 0 ? loadMetadataCache() : null;` — one line, and all
+    // that is left of it. `149fdf1` (#788, v5.0.0) deleted the `existsSync` probe, the
+    // `bootstrapAll` flag and both `saveMetadataCache({version:1,servers:{}})` writes, and decides
+    // the startup set **per server** off each entry's own validity instead (§10 below).
     //
-    // The PROBE is [`crate::dirs`]', the READ is [`crate::registration`]'s lenient reader, and the
-    // WRITE is [`crate::dirs`]'. That asymmetry is deliberate: the strict reader answers `None` for
-    // a file the lenient one parses fine, and rewriting on THAT would destroy the very cache
-    // `resolve_direct_tools` and `resolve_cached_prompts` registered this session's surface from.
-    let cache_path = dirs.metadata_cache();
-    let cache_file_exists = cache_path.exists();
-    let mut cache = crate::registration::load_metadata_cache(&dirs);
-    let mut bootstrap_all = false;
-    if !cache_file_exists {
-        // No file at all — a first run. Every enabled server is a startup connect this once, so
-        // the next launch has a cache to register a direct-tool surface from.
-        bootstrap_all = true;
-        save_empty_metadata_cache(&cache_path);
-    } else if cache.is_none() {
-        // A file that exists and does not parse. Truncate it, but do NOT set `bootstrap_all`: a
-        // corrupt cache must stay cheap rather than becoming a connect storm.
-        save_empty_metadata_cache(&cache_path);
-        cache = Some(crate::registration::MetadataCache {
-            version: crate::registration::METADATA_CACHE_VERSION,
-            servers: indexmap::IndexMap::new(),
-        });
-    }
+    // Why the file-existence test had to go (MCP-598): it could not see a server **added after the
+    // first session**. The file exists, so `bootstrapAll` was false, and a `lazy` server is not
+    // prewarmed — it stayed absent from search and from the direct-tool surface until the model
+    // happened to call it by name. With MCP-595's age limit gone its entry never expires either, so
+    // there was no eventual self-correction.
+    //
+    // The corrupt-cache arm goes with it, and that is a deliberate loss. "A corrupt cache must stay
+    // cheap rather than becoming a connect storm" was v4's property, held by `bootstrapAll` staying
+    // `false`; at v5.0.0 a file that does not parse means nothing is known about any server and
+    // every one of them needs discovery. The empty-file write goes too: it truncated bytes a later
+    // reader with a fixed parser could still have used, and nothing reads the file's existence any
+    // more. Upstream is the specification here.
+    let cache = crate::registration::load_metadata_cache(&dirs);
 
     // ── §10 — per-server lifecycle registration (MCP-020) + rehydration (MCP-021) ──────────
+    //
+    // `needsDiscovery` (`init.ts:297`, MCP-598): the servers whose catalogue this process does not
+    // have and must connect to learn, decided one entry at a time. §11's startup set is
+    // `keep-alive | eager | needsDiscovery`.
+    let mut needs_discovery: std::collections::HashSet<String> = std::collections::HashSet::new();
     for (name, definition) in state.config.enabled_servers() {
         let mode = definition.lifecycle_mode();
         // `persistsAfterFirstSpawn` is `eager | lazy-keep-alive` (`init.ts:245`) — NOT
@@ -634,6 +632,30 @@ pub async fn initialize_mcp(
             && let Some(entry) = crate::registration::valid_entry(Some(cache), name, definition)
         {
             crate::live::rehydrate_from_cache(&state, name, definition, entry, cache);
+        } else {
+            // Upstream's remaining two arms (`init.ts:337-343`):
+            //
+            // ```text
+            // } else if (cachedEntry?.discoveryFailed && cachedEntry.configHash === tryComputeServerHash(definition)) {
+            //   failedDiscovery.add(name);   // startup tries a config once; retried on first use
+            // } else if (cachedEntry?.cacheScope !== "private") {
+            //   needsDiscovery.add(name);
+            // }
+            // ```
+            //
+            // Both read `ServerCacheEntry` fields **MCP-596 has not ported** — `discoveryFailed`
+            // and `cacheScope` — so this build has ONE arm, and the two differences from upstream
+            // are named rather than approximated:
+            //
+            // * a server whose discovery failed is retried at **every** startup instead of once
+            //   per config, and
+            // * an entry a private tool listing produced is discovered at startup, where upstream
+            //   never discovers one at all.
+            //
+            // Both err towards rediscovery — neither serves a stale or a cross-authorization
+            // catalogue — but neither is upstream. MCP-596 supplies the two fields and splits this
+            // arm back into three.
+            needs_discovery.insert(name.clone());
         }
     }
 
@@ -641,7 +663,13 @@ pub async fn initialize_mcp(
     let startup: Vec<(String, ServerEntry)> = state
         .config
         .enabled_servers()
-        .filter(|(_, definition)| bootstrap_all || definition.lifecycle_mode().is_prewarmed())
+        // `mode === "keep-alive" || mode === "eager" || needsDiscovery.has(name)`
+        // (`init.ts:346-350`). [`ServerLifecycle::is_prewarmed`] is exactly that first pair, which
+        // is why `lazy-keep-alive` is NOT here: it earns its keep-alive on the first successful
+        // connect, not at startup.
+        .filter(|(name, definition)| {
+            definition.lifecycle_mode().is_prewarmed() || needs_discovery.contains(name.as_str())
+        })
         .map(|(name, definition)| (name.clone(), definition.clone()))
         .collect();
 
@@ -752,6 +780,10 @@ pub async fn initialize_mcp(
                     resource_uri: Some(resource.uri.clone()),
                     ui_visibility: None,
                     input_schema: None,
+                    // Pass one is the collision universe, not a published surface: upstream's own
+                    // `startupKnownMetadata` entry carries only the names. A resource tool has no
+                    // server hints anyway (MCP-601).
+                    annotations: None,
                 });
             }
         }
@@ -1123,22 +1155,6 @@ pub async fn initialize_mcp(
     Ok(state)
 }
 
-/// `saveMetadataCache({version: 1, servers: {}})` (`init.ts:233`, `:236`) — §9's two write arms.
-///
-/// [`crate::dirs::save_metadata_cache`] merges rather than replaces, which is what makes upstream's
-/// one-entry writes non-destructive; an empty cache therefore truncates only because the strict
-/// reader inside it rejects the same bytes the lenient one just did.
-///
-/// The failure is swallowed with a debug line, as `metadata-cache.ts`'s own try/catch is: a cache
-/// that cannot be written is a slower next start, never a failed init.
-fn save_empty_metadata_cache(path: &std::path::Path) {
-    if let Err(error) =
-        crate::dirs::save_metadata_cache(path, &crate::dirs::MetadataCache::default())
-    {
-        tracing::debug!("MCP: failed to bootstrap the metadata cache: {error}");
-    }
-}
-
 /// `tool-metadata.ts:146` `totalToolCount(state)` — every server's tool count, summed.
 ///
 /// Deliberately **not** [`crate::state::McpStatusSnapshot::total_tools`]: that one excludes
@@ -1393,6 +1409,103 @@ mod tests {
         assert!(
             message.contains("OAuth credentials for gated"),
             "the vault was consulted before the socket; got {message}"
+        );
+    }
+
+    /// MCP-598. A server added to the config **after** a cache file exists is still discovered at
+    /// the next startup.
+    ///
+    /// `149fdf1` (#788, v5.0.0) replaced the `existsSync(cachePath)` bootstrap with a per-server
+    /// `needsDiscovery` decision for exactly this case. Before it: the file exists, so
+    /// `bootstrapAll` is `false`; a `lazy` server is not prewarmed; so it never connected, its
+    /// tools were absent from search and from the direct-tool surface, and the only way back was
+    /// for the model to call it by name or for the user to delete the cache file. With MCP-595's
+    /// age limit gone, nothing would ever have refreshed it either.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_server_added_after_the_cache_file_exists_is_still_discovered() {
+        /// Answers `initialize` and `tools/list` with one tool, and nothing else.
+        const LIST_ONE_TOOL: &str = r#"
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*)
+      pv=$(printf '%s' "$line" | sed -n 's/.*"protocolVersion":"\([^"]*\)".*/\1/p')
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"%s","capabilities":{"tools":{}},"serverInfo":{"name":"added","version":"1"}}}\n' "$id" "$pv"
+      ;;
+    *'"method":"notifications/'*) : ;;
+    *'"method":"tools/list"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"ping","description":"p","inputSchema":{"type":"object"}}]}}\n' "$id"
+      ;;
+    *)
+      if [ -n "$id" ]; then printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id"; fi
+      ;;
+  esac
+done
+"#;
+        let dir = tempfile::tempdir().unwrap();
+        // A cache file that EXISTS and knows nothing about this server — the exact state a user is
+        // in the moment they add one to `mcp.json`.
+        std::fs::write(
+            dir.path().join(crate::dirs::METADATA_CACHE_FILE),
+            br#"{"version":1,"servers":{}}"#,
+        )
+        .unwrap();
+
+        let mut config = McpConfig::default();
+        config.mcp_servers.insert(
+            "added".to_string(),
+            ServerEntry {
+                command: Some("sh".to_string()),
+                args: Some(vec![
+                    "-c".to_string(),
+                    LIST_ONE_TOOL.to_string(),
+                    "sh".to_string(),
+                ]),
+                // The default, spelled out: a `lazy` server is NOT prewarmed, so the startup set
+                // can only reach it through `needsDiscovery`.
+                lifecycle: Some(ServerLifecycle::Lazy),
+                ..ServerEntry::default()
+            },
+        );
+
+        let owner = Arc::new(McpRuntimeOwner::new());
+        let dirs = McpDirs::new(dir.path().to_path_buf(), dir.path().to_path_buf());
+        let snapshot = ContextSnapshot {
+            config_path: None,
+            cwd: dir.path().to_path_buf(),
+            has_ui: false,
+            mode: "print".to_string(),
+            initial_signal: None,
+            services: None,
+        };
+        let state = initialize_mcp(
+            owner,
+            dirs,
+            snapshot,
+            InitializeOptions {
+                programmatic_config: Some(config),
+                ..InitializeOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let discovered: Vec<String> = state
+            .tool_metadata
+            .lock()
+            .unwrap()
+            .get("added")
+            .map(|tools| {
+                tools
+                    .iter()
+                    .map(|tool| tool.original_name.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert_eq!(
+            discovered,
+            vec!["ping".to_string()],
+            "a config the cache file has never seen must be discovered at startup"
         );
     }
 }
@@ -3359,8 +3472,12 @@ where
 ///    `serve_client_with_lifecycle_and_ct`, which is `initialize` plus the
 ///    `notifications/initialized` send. The extra span is one buffered write on a transport that
 ///    has already answered, so the budget is very slightly stricter than upstream's, never looser.
-/// 2. **`maxTotalTimeout` / `resetTimeoutOnProgress`** have no upstream analogue in
-///    `buildRequestOptions` and are not applied.
+/// 2. **`maxTotalTimeout`** has no upstream analogue anywhere and is not applied.
+///    **`resetTimeoutOnProgress`** has none *in `buildRequestOptions`* either — upstream sets it on
+///    the `tools/call` wrapper instead (`elicitation-handler.ts:83`), which is a per-call option and
+///    not part of the connect budget. It is applied there, by
+///    [`crate::live::RuntimeEnv::call_request_options`] (MCP-607); this function, which is also the
+///    connect and discovery-list options, still leaves it at its default, as upstream does.
 ///
 /// `None` means no timeout, which is `normalizeRequestTimeoutMs`'s answer for an absent, zero,
 /// negative, `NaN` or infinite value — see [`resolve_request_timeout`] for why that does **not**
@@ -3544,8 +3661,11 @@ pub fn resolve_request_timeout(
 /// dropping its future — the `ownedSignal` half therefore lives in the `abortable(..)` wrapper
 /// around each call rather than inside the options object.
 ///
-/// `reset_timeout_on_progress` and `max_total_timeout` have no upstream analogue and stay at their
-/// defaults.
+/// `max_total_timeout` has no upstream analogue and stays at its default. `reset_timeout_on_progress`
+/// has one, but not here: upstream sets it per `tools/call`, inside
+/// `callToolPausingForElicitation` (`elicitation-handler.ts:83`), and `buildRequestOptions` — the
+/// connect and the three discovery-list calls — sets neither flag. See
+/// [`crate::live::RuntimeEnv::call_request_options`] (MCP-607).
 #[must_use]
 pub fn build_request_options(
     entry: Option<&ServerEntry>,
