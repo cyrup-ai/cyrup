@@ -575,6 +575,47 @@ mod guest {
         assert_eq!(registry.activated_tool_names().unwrap(), ["exposed_guest"]);
     }
 
+    /// The `ext-tools` imports a guest reads with no live session attached: `getActiveTools()`
+    /// answers the names registration activates (not the whole registry) and `getAllTools()`
+    /// answers every tool, each row carrying pi's `exposure` and, when set, `namespace`.
+    #[tokio::test]
+    async fn a_guest_reads_exposure_through_the_ext_tools_imports() {
+        use crate::host::live::bindings::cyrup::ext::ext_tools::Host as ExtToolsHost;
+
+        let (_registry, mut state) = guest_host("guest-ext");
+        let named = |name: &str, exposure: Option<&str>, default_active: Option<bool>| {
+            let mut t = wit_tool(exposure, None, default_active);
+            t.name = name.into();
+            t
+        };
+        for t in [
+            named("g_direct", None, None),
+            named("g_codemode", Some("codemode"), None),
+            named("g_inactive", Some("direct"), Some(false)),
+            named("g_model_only", Some("model-only"), None),
+        ] {
+            state.register_tool(t).await.unwrap();
+        }
+
+        let active: Vec<String> = serde_json::from_str(&state.get_active_tools().await).unwrap();
+        assert_eq!(active, ["g_direct", "g_model_only"]);
+
+        let all: Vec<Value> = serde_json::from_str(&state.get_all_tools().await).unwrap();
+        let exposures: Vec<(&str, &str)> = all
+            .iter()
+            .map(|r| (r["name"].as_str().unwrap(), r["exposure"].as_str().unwrap()))
+            .collect();
+        assert_eq!(
+            exposures,
+            [
+                ("g_direct", "direct"),
+                ("g_codemode", "codemode"),
+                ("g_inactive", "direct"),
+                ("g_model_only", "model-only"),
+            ]
+        );
+    }
+
     /// An unknown spelling is refused at registration with an error naming the tool, the
     /// extension and the spelling; nothing is registered.
     #[tokio::test]
