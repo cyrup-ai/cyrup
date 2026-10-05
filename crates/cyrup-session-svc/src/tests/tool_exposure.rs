@@ -252,7 +252,9 @@ fn strings(v: &[&str]) -> Vec<String> {
     v.iter().map(|s| s.to_string()).collect()
 }
 
-fn one_of_each() -> (Vec<Arc<dyn Tool>>, BTreeMap<&'static str, Arc<AtomicBool>>) {
+type RanFlags = BTreeMap<&'static str, Arc<AtomicBool>>;
+
+fn one_of_each() -> (Vec<Arc<dyn Tool>>, RanFlags) {
     let probes = vec![
         Probe::new("direct_t", ToolExposure::Direct),
         Probe::new("model_only_t", ToolExposure::ModelOnly),

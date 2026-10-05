@@ -79,6 +79,15 @@ impl Tool for Fixture {
     }
 }
 
+/// What a hook observed: declared, callable and registered names, one exposure, one namespace.
+type Observed = (
+    Vec<String>,
+    Vec<String>,
+    Vec<String>,
+    ToolExposure,
+    Option<ToolNamespace>,
+);
+
 fn names(v: &[&str]) -> Vec<String> {
     v.iter().map(|s| s.to_string()).collect()
 }
@@ -256,17 +265,7 @@ fn a_hook_description_replaces_the_description_everywhere_the_loop_looks() {
 
 #[test]
 fn a_hook_sees_the_three_views_and_both_accessors() {
-    let seen: Arc<
-        std::sync::Mutex<
-            Option<(
-                Vec<String>,
-                Vec<String>,
-                Vec<String>,
-                ToolExposure,
-                Option<ToolNamespace>,
-            )>,
-        >,
-    > = Arc::new(std::sync::Mutex::new(None));
+    let seen: Arc<std::sync::Mutex<Option<Observed>>> = Arc::new(std::sync::Mutex::new(None));
     let sink = Arc::clone(&seen);
     let mut with_ns = Fixture::new("ns_t", ToolExposure::Deferred);
     with_ns.namespace = Some(ToolNamespace {

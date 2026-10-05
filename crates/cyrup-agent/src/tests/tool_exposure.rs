@@ -105,9 +105,12 @@ impl Tool for Probe {
 }
 
 /// Records the tool declarations of every request that reaches the provider.
+/// The declarations of every request, in order.
+type Seen = Arc<Mutex<Vec<Vec<ToolDef>>>>;
+
 struct SchemaSpy {
     inner: Arc<dyn StreamFn>,
-    seen: Arc<Mutex<Vec<Vec<ToolDef>>>>,
+    seen: Seen,
 }
 
 impl StreamFn for SchemaSpy {
@@ -122,9 +125,7 @@ impl StreamFn for SchemaSpy {
     }
 }
 
-fn spy(
-    responses: Vec<cyrup_core::AssistantMessage>,
-) -> (Arc<dyn StreamFn>, Arc<Mutex<Vec<Vec<ToolDef>>>>) {
+fn spy(responses: Vec<cyrup_core::AssistantMessage>) -> (Arc<dyn StreamFn>, Seen) {
     let faux = Arc::new(FauxProvider::new());
     faux.set_responses(responses);
     let seen = Arc::new(Mutex::new(Vec::new()));

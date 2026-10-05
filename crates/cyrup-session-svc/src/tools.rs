@@ -202,11 +202,6 @@ impl DynamicToolState {
         }
     }
 
-    /// The current resolved loadout (Pi `agent.state.tools` after `_applyToolLoadout`).
-    pub(crate) fn loadout(&self) -> ToolLoadout {
-        self.loadout.clone()
-    }
-
     /// The rebuilt system prompt for the current loadout.
     pub(crate) fn prompt(&self) -> String {
         self.rebuilder
