@@ -118,6 +118,9 @@ fn build_run_ctx(
         messages,
         tools,
     } = context;
+    // The low-level loop has no session registry behind it, so its loadout is exactly the tools it
+    // was handed (see `ToolLoadout::from_tools`).
+    let tools = cyrup_core::ToolLoadout::from_tools(tools);
     // The loop's working copy (Pi `currentContext.messages`, a `.slice()` of the supplied snapshot)
     // is kept distinct from the throwaway reducer `state.messages` so a `prepare_next_turn` context
     // override updates only the working copy — matching the high-level agent (agent-loop.ts:104-107).

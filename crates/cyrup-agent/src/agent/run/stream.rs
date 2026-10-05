@@ -72,33 +72,16 @@ impl RunCtx {
         .filter(|k| !k.is_empty())
         .or_else(|| self.gen_config.api_key.clone());
 
-        // Forward each tool's `description` to the model (Pi `Context.tools`, agent-loop.ts:289-296;
-        // spec §4.3) — an empty description left the model unable to use the tool.
-        let tool_defs: Vec<cyrup_provider::ToolDef> = self
-            .tools
-            .iter()
-            .map(|t| cyrup_provider::ToolDef {
-                name: t.name().to_string(),
-                description: t.description().to_string(),
-                parameters: t.parameters().clone(),
-                // PROV-011: pi's `constrainedSampling` is a per-tool OPT-IN declared on the tool
-                // definition (`extensions/types.ts:463` @v0.83.0); `undefined` and `false` behave
-                // identically (`packages/ai/README.md:483`).
-                //
-                // Upstream the declaration is COPIED off the `ToolDefinition` onto the runtime
-                // `AgentTool` by `wrapToolDefinition`
-                // (`packages/coding-agent/src/core/tools/tool-definition-wrapper.ts:14` @v0.83.0),
-                // and the loop then hands those same `AgentTool`s to the stream verbatim —
-                // `tools: context.tools` (`packages/agent/src/agent-loop.ts:301` @v0.83.0) — so
-                // whatever the tool declared is what `convertTools` sees. This `.map` IS that
-                // hand-off, so it must read the declaration rather than erase it: hardcoding `None`
-                // here made `cyrup_provider::utils::constrained_sampling` unreachable from the
-                // agent loop, so no tool — extension-registered or WASM guest — could ever opt in,
-                // and a `strict: "require"` declaration that upstream FAILS the request silently
-                // degraded to an ordinary unconstrained tool call.
-                constrained_sampling: t.constrained_sampling().cloned(),
-            })
-            .collect();
+        // The request declares the ADVERTISED tools — the loadout's executable set minus the
+        // declarations a `prepare_loadout` hook left out (Pi `_hiddenDeclarations`,
+        // `agent-session.ts:1721-1738` @v1.0.1) — and nothing else: `AdvertisedTools` is the only
+        // thing that yields `ToolDef`s, so the executable set cannot be sent by mistake.
+        //
+        // Each declaration carries the tool's `description` (Pi `Context.tools`,
+        // agent-loop.ts:289-296; spec §4.3) and its PROV-011 `constrainedSampling` opt-in, copied
+        // off the tool as `wrapToolDefinition` does (`tool-definition-wrapper.ts:14` @v0.83.0); see
+        // [`cyrup_core::AdvertisedTools::declarations`].
+        let tool_defs: Vec<cyrup_provider::ToolDef> = self.tools.advertised().declarations();
 
         // Forward the generation params + telemetry + reasoning level (Pi `AgentLoopConfig` →
         // `streamSimple`, agent-loop.ts:298-308 / agent.ts:421-447).

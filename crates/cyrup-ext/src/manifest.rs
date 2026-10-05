@@ -272,7 +272,12 @@ impl Capabilities {
 ///   `registerTool` / `registerFlag` throw (`core/extensions/loader.ts:274-279`, `:312-316`
 ///   @v0.87.1), so a guest can stop its handler at the refusal. A 0.12 guest calls them at the old
 ///   `()`-returning signature and fails to link, so it takes the bump.
-pub const HOST_WORLD: &str = "cyrup:ext@0.13";
+/// - 0.13 -> 0.14: IMPORT RE-SIGNING — `types.tool-descriptor` gained `exposure`, `namespace`
+///   (a new `tool-namespace` record) and `default-active` (pi `ToolDefinition.exposure` /
+///   `namespace` / `defaultActive`, `core/extensions/types.ts:509`, `:527`, `:608` @v1.0.1), which
+///   re-signs `registration.register-tool`. A 0.13 guest calls it with the record without them and
+///   fails to link, so it takes the bump (the 0.6 -> 0.7 `constrained-sampling` precedent).
+pub const HOST_WORLD: &str = "cyrup:ext@0.14";
 
 impl ExtensionManifest {
     /// Parse from JSON bytes.

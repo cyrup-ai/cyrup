@@ -407,10 +407,17 @@ fn select_active_tools(
 ) -> Vec<Arc<dyn cyrup_core::Tool>> {
     let exclude: std::collections::HashSet<&str> =
         cfg.exclude_tools.iter().map(String::as_str).collect();
-    let keep = |name: &str| -> bool {
+    // Pi `_isActivatedOnRegistration` for the non-built-in tools (`agent-session.ts:3554` @v1.0.1):
+    // a `codemode`, `deferred` or `hidden` tool, or one registered `defaultActive: false`, is
+    // registered but not active at start.
+    let registration_activates =
+        |t: &Arc<dyn cyrup_core::Tool>| t.exposure().activated_on_registration(t.default_active());
+    let keep = |t: &Arc<dyn cyrup_core::Tool>| -> bool {
+        let name = t.name();
         match (&cfg.tools, cfg.no_tools) {
-            // Explicit allowlist wins (Pi `options.tools`).
-            (Some(allow), _) => allow.iter().any(|a| a == name),
+            // Explicit allowlist wins (Pi `options.tools`): naming a tool activates it iff it is
+            // declarable, even when it is not active by default (`agent-session.ts:3510-3516`).
+            (Some(allow), _) => allow.iter().any(|a| a == name) && t.exposure().declarable(),
             (None, Some(NoTools::All)) => false,
             // SEAM-118: `!ALL_BUILTIN_TOOLS`, not `!DEFAULT_BUILTIN_TOOLS`. Upstream's expression
             // branches on the PRESENCE of `noTools`, not on its value —
@@ -426,7 +433,9 @@ fn select_active_tools(
             // This arm read `!DEFAULT_BUILTIN_TOOLS`, so `--no-builtin-tools` dropped only pi's
             // four defaults and left `grep`, `find`, `ls` and `powershell` ACTIVE — the flag
             // advertised a smaller tool surface than it delivered, `powershell` included.
-            (None, Some(NoTools::Builtin)) => !ALL_BUILTIN_TOOLS.contains(&name),
+            (None, Some(NoTools::Builtin)) => {
+                !ALL_BUILTIN_TOOLS.contains(&name) && registration_activates(t)
+            }
             // pi `sdk.ts:244-250`: with no `tools`/`noTools` the active set is
             // `defaultActiveToolNames` — read/bash/edit/write — NOT every visible tool. Confirmed
             // at the same tag in `agent-session.ts:2592-2594`, and `_refreshToolRegistry`
@@ -454,13 +463,13 @@ fn select_active_tools(
                     Some(configured) => configured.iter().any(|t| t == name),
                     None => DEFAULT_BUILTIN_TOOLS.contains(&name),
                 };
-                selected || !ALL_BUILTIN_TOOLS.contains(&name)
+                selected || (!ALL_BUILTIN_TOOLS.contains(&name) && registration_activates(t))
             }
         }
     };
     visible
         .iter()
-        .filter(|t| keep(t.name()) && !exclude.contains(t.name()))
+        .filter(|t| keep(t) && !exclude.contains(t.name()))
         .cloned()
         .collect()
 }
@@ -1758,26 +1767,74 @@ impl SessionBuilder {
             &excluded_tool_names,
         )?;
 
-        // pi's `definitionRegistry`: base first, then each custom/extension tool `set` over it by
-        // NAME — so an override replaces the built-in's entry rather than adding a second one, and
-        // the base order is preserved for everything not overridden (`:2471-2487`).
-        let prompt_tools: Vec<Arc<dyn cyrup_core::Tool>> = {
-            let mut order: Vec<Arc<dyn cyrup_core::Tool>> = base_tools.clone();
-            for t in active_tools.iter() {
-                // `iter_mut().find()` rather than `position()` + `order[i]`: same `set`-by-name
-                // semantics, without the raw index the workspace denies (`indexing_slicing`).
-                if let Some(slot) = order.iter_mut().find(|b| b.name() == t.name()) {
-                    *slot = t.clone();
-                } else {
-                    order.push(t.clone());
-                }
-            }
-            order
+        // The REGISTRY (pi `_toolRegistry`): the base selection with extension overrides, plus every
+        // allowed extension tool whatever its exposure — a `codemode`, `deferred` or `hidden` tool
+        // is registered without being active (pi `_refreshToolRegistry`, `agent-session.ts:3445-3545`
+        // @v1.0.1). `active_tools` above is the subset registration activates.
+        let registered_tools = ext_host.registered_tools_filtered(
+            &base_tools,
+            allowed_tool_names.as_ref(),
+            &excluded_tool_names,
+        )?;
+        // The dynamic-tool registry (Pi `_toolRegistry`): every Availability-visible tool, the caller's
+        // custom tools, AND the extension-contributed/override tools are enable-able; the active set
+        // starts at the build-time selection. Including the extension tools is load-bearing: (a) the
+        // permission companion's registry / unknown-tool gate checks `all_tool_names` against this
+        // registry (an extension tool absent here would be falsely blocked as "unknown"), and (b) a
+        // `setActiveTools` rebuild (`DynamicToolState::set_active`) looks tools up BY NAME in this
+        // registry — an extension override (recording/test double or a real replacement of a built-in)
+        // must survive the rebuild rather than being replaced by the shadowed built-in. Extended LAST
+        // so an override wins the `BTreeMap`-by-name dedup in `DynamicToolState::new`.
+        let mut registry_tools = visible.clone();
+        // The SDK-supplied custom tools go through the same registered-tool wrapper (Pi folds them
+        // into `_baseToolDefinitions` and wraps that whole map, agent-session.ts:2507-2515), so a
+        // custom tool that widens the active set also derives `addedToolNames`. `active_tools`
+        // above already returned WRAPPED handles for the built-ins + extension tools.
+        // Each SDK custom tool is also the SDK half of upstream's renderer map: `allCustomTools`
+        // spreads `this._customTools` into the very map `getToolDefinition(name)` reads, so a
+        // custom tool's own `renderCall`/`renderResult` reaches the transcript
+        // (`core/agent-session.ts:2471-2495`, resolved at
+        // `modes/interactive/components/tool-execution.ts:83-101` @v0.83.0). Registering here is
+        // what gives `Tool::render_call`/`Tool::render_result` a reader at all — before this they
+        // were overridable methods nothing in the workspace ever called, so a custom tool that
+        // supplied its own rendering had it silently discarded and drew the generic shell.
+        // Registered UNWRAPPED: the renderer belongs to the tool the caller configured, and
+        // `wrap_tool`'s active-set diffing has nothing to add to a pure render call (the wrapper
+        // delegates both methods through anyway, `cyrup-ext/src/wrapper.rs`).
+        for tool in &cfg.custom_tools {
+            ext_host.register_native_tool_renderer(tool.clone());
+        }
+        registry_tools.extend(
+            cfg.custom_tools
+                .iter()
+                .map(|t| ext_host.wrap_tool(t.clone())),
+        );
+        registry_tools.extend(registered_tools.iter().cloned());
+        // The initial loadout: the active names resolved against the registry, which is what pi's
+        // `_buildRuntime` → `_refreshToolRegistry` → `_applyToolLoadout` computes before the first
+        // prompt is built. It decides the system prompt's tool list (a tool whose declaration a
+        // `prepare_loadout` hook hides is not listed, `agent-session.ts:1655-1658`) and is what the
+        // agent starts with.
+        let initial_loadout = {
+            let names: Vec<String> = active_tools.iter().map(|t| t.name().to_string()).collect();
+            cyrup_core::ToolLoadout::resolve(&names, &registry_tools)
         };
-        let selected_tools: Vec<Arc<str>> =
-            prompt_tools.iter().map(|t| Arc::from(t.name())).collect();
-        let tool_contributions: Vec<ToolPromptContribution> =
-            prompt_tools.iter().map(tool_contribution).collect();
+        let selected_tools: Vec<Arc<str>> = initial_loadout
+            .executable()
+            .iter()
+            .map(|t| Arc::from(t.name()))
+            .collect();
+        let tool_contributions: Vec<ToolPromptContribution> = initial_loadout
+            .executable()
+            .iter()
+            .map(|t| {
+                let mut c = tool_contribution(t);
+                if initial_loadout.hidden_declarations().contains(t.name()) {
+                    c.snippet = None;
+                }
+                c
+            })
+            .collect();
 
         // CFG-035 — `SYSTEM.md` / `APPEND_SYSTEM.md` discovery. Pi's `load()` resolves
         // `this.systemPromptSource ?? this.discoverSystemPromptFile()` and, for the append leg,
@@ -1834,40 +1891,6 @@ impl SessionBuilder {
         };
         let system_prompt = SystemPromptBuilder::new().build(&prompt_inputs);
 
-        // The dynamic-tool registry (Pi `_toolRegistry`): every Availability-visible tool, the caller's
-        // custom tools, AND the extension-contributed/override tools are enable-able; the active set
-        // starts at the build-time selection. Including the extension tools is load-bearing: (a) the
-        // permission companion's registry / unknown-tool gate checks `all_tool_names` against this
-        // registry (an extension tool absent here would be falsely blocked as "unknown"), and (b) a
-        // `setActiveTools` rebuild (`DynamicToolState::set_active`) looks tools up BY NAME in this
-        // registry — an extension override (recording/test double or a real replacement of a built-in)
-        // must survive the rebuild rather than being replaced by the shadowed built-in. Extended LAST
-        // so an override wins the `BTreeMap`-by-name dedup in `DynamicToolState::new`.
-        let mut registry_tools = visible.clone();
-        // The SDK-supplied custom tools go through the same registered-tool wrapper (Pi folds them
-        // into `_baseToolDefinitions` and wraps that whole map, agent-session.ts:2507-2515), so a
-        // custom tool that widens the active set also derives `addedToolNames`. `active_tools`
-        // above already returned WRAPPED handles for the built-ins + extension tools.
-        // Each SDK custom tool is also the SDK half of upstream's renderer map: `allCustomTools`
-        // spreads `this._customTools` into the very map `getToolDefinition(name)` reads, so a
-        // custom tool's own `renderCall`/`renderResult` reaches the transcript
-        // (`core/agent-session.ts:2471-2495`, resolved at
-        // `modes/interactive/components/tool-execution.ts:83-101` @v0.83.0). Registering here is
-        // what gives `Tool::render_call`/`Tool::render_result` a reader at all — before this they
-        // were overridable methods nothing in the workspace ever called, so a custom tool that
-        // supplied its own rendering had it silently discarded and drew the generic shell.
-        // Registered UNWRAPPED: the renderer belongs to the tool the caller configured, and
-        // `wrap_tool`'s active-set diffing has nothing to add to a pure render call (the wrapper
-        // delegates both methods through anyway, `cyrup-ext/src/wrapper.rs`).
-        for tool in &cfg.custom_tools {
-            ext_host.register_native_tool_renderer(tool.clone());
-        }
-        registry_tools.extend(
-            cfg.custom_tools
-                .iter()
-                .map(|t| ext_host.wrap_tool(t.clone())),
-        );
-        registry_tools.extend(active_tools.iter().cloned());
         let contributions: std::collections::BTreeMap<String, ToolPromptContribution> =
             registry_tools
                 .iter()
@@ -2004,7 +2027,7 @@ impl SessionBuilder {
         let mut agent_builder = cyrup_agent::AgentBuilder::new(agent_stream_fn)
             .system_prompt(system_prompt.clone())
             .thinking_level(thinking)
-            .tools(active_tools)
+            .loadout(initial_loadout)
             .messages(seed)
             .hooks(policy_hooks)
             .session_id(session_id.clone())
@@ -3188,6 +3211,87 @@ mod tests {
 
     fn names(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    /// A non-built-in tool with a settable exposure and `defaultActive`.
+    struct ExposedTool {
+        name: &'static str,
+        exposure: cyrup_core::ToolExposure,
+        default_active: bool,
+        params: serde_json::Value,
+    }
+
+    #[async_trait::async_trait]
+    impl cyrup_core::Tool for ExposedTool {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn parameters(&self) -> &serde_json::Value {
+            &self.params
+        }
+        fn exposure(&self) -> cyrup_core::ToolExposure {
+            self.exposure
+        }
+        fn default_active(&self) -> bool {
+            self.default_active
+        }
+        async fn execute(
+            &self,
+            _id: cyrup_core::ToolCallId,
+            _args: serde_json::Value,
+            _cancel: cyrup_core::CancelToken,
+            _on_update: Box<dyn FnMut(cyrup_core::ToolUpdate) + Send>,
+        ) -> Result<cyrup_core::ToolResult, cyrup_core::ToolError> {
+            Err(cyrup_core::ToolError::new("not executable"))
+        }
+    }
+
+    /// pi `_isActivatedOnRegistration` (`agent-session.ts:3554` @v1.0.1) decides which NON-built-in
+    /// visible tools start active: `direct`/`model-only` unless `defaultActive: false`. An explicit
+    /// `tools` allowlist activates a named tool iff it is declarable (`:3510-3516`).
+    #[test]
+    fn a_non_builtin_tool_starts_active_only_when_registration_activates_it() {
+        use cyrup_core::ToolExposure as E;
+        let tool = |name, exposure, default_active| {
+            std::sync::Arc::new(ExposedTool {
+                name,
+                exposure,
+                default_active,
+                params: serde_json::json!({}),
+            }) as std::sync::Arc<dyn cyrup_core::Tool>
+        };
+        let visible = vec![
+            tool("x_direct", E::Direct, true),
+            tool("x_model_only", E::ModelOnly, true),
+            tool("x_codemode", E::Codemode, true),
+            tool("x_deferred", E::Deferred, true),
+            tool("x_hidden", E::Hidden, true),
+            tool("x_inactive", E::Direct, false),
+        ];
+        let pick = |cfg: &super::SessionConfig| -> Vec<String> {
+            super::select_active_tools(&visible, cfg, None)
+                .iter()
+                .map(|t| t.name().to_string())
+                .collect()
+        };
+
+        let cfg = super::SessionConfig::new("/tmp", "/tmp/agent");
+        assert_eq!(pick(&cfg), names(&["x_direct", "x_model_only"]));
+
+        let mut builtin_off = super::SessionConfig::new("/tmp", "/tmp/agent");
+        builtin_off.no_tools = Some(super::NoTools::Builtin);
+        assert_eq!(pick(&builtin_off), names(&["x_direct", "x_model_only"]));
+
+        // Naming activates iff declarable, even when not active by default; a codemode or hidden
+        // tool named in the allowlist is still not activated.
+        let mut allow = super::SessionConfig::new("/tmp", "/tmp/agent");
+        allow.tools = Some(names(&[
+            "x_inactive",
+            "x_codemode",
+            "x_hidden",
+            "x_model_only",
+        ]));
+        assert_eq!(pick(&allow), names(&["x_model_only", "x_inactive"]));
     }
 
     #[test]

@@ -7,10 +7,10 @@
 //! and never re-derived. [`DynamicToolState`] keeps the full registry of enable-able tools and a
 //! [`PromptRebuilder`] capturing the stable prompt inputs so the active set can be retoggled.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use cyrup_core::Tool;
+use cyrup_core::{Tool, ToolExposure, ToolLoadout, ToolNamespace};
 use cyrup_session::prompt::{PromptInputs, SystemPromptBuilder, ToolPromptContribution};
 
 /// A serializable tool descriptor for `getAllTools`/`getToolDefinition` (Pi `ToolInfo`,
@@ -26,6 +26,12 @@ pub struct ToolInfo {
     pub prompt_snippet: Option<String>,
     /// Whether the tool is in the currently-active set (model-visible this turn).
     pub active: bool,
+    /// How the model reaches the tool (pi `ToolInfo.exposure`, `core/extensions/types.ts` @v1.0.1,
+    /// filled by `getAllTools` at `agent-session.ts:1469` from `_getToolExposure`).
+    pub exposure: ToolExposure,
+    /// The tool's namespace, when it has one (pi `ToolInfo.namespace`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<ToolNamespace>,
     /// The definition's `renderShell` (pi `ToolDefinition.renderShell?: "default" | "self"`,
     /// `extensions/types.ts:467` @v0.84.4), read off [`Tool::render_kind`] — what
     /// `ToolExecutionComponent.getRenderShell()` resolves from `session.getToolDefinition(name)`
@@ -93,12 +99,17 @@ impl PromptRebuilder {
     ///   free-floating [`PromptInputs::prompt_guidelines`], which upstream has no channel for.
     /// - `customPrompt` / `appendSystemPrompt` — omitted when unset, as pi omits `undefined`.
     /// - `cwd`, `contextFiles` (`{path, content}`), `skills`.
-    fn base_options(&self, active: &[String]) -> serde_json::Value {
+    fn base_options(&self, active: &[String], hidden: &BTreeSet<String>) -> serde_json::Value {
         let mut snippets = serde_json::Map::new();
         let mut guidelines: Vec<String> = Vec::new();
         for name in active {
             if let Some(c) = self.contributions.get(name) {
-                if let Some(s) = c.snippet.as_ref() {
+                // A hidden declaration is left out of the tool listing, as it is out of the
+                // request (pi `_rebuildSystemPrompt`, `agent-session.ts:1655-1658` @v1.0.1);
+                // its guidelines stay.
+                if !hidden.contains(name)
+                    && let Some(s) = c.snippet.as_ref()
+                {
                     snippets.insert(name.clone(), serde_json::Value::String(s.to_string()));
                 }
                 guidelines.extend(c.guidelines.iter().map(|g| g.to_string()));
@@ -142,12 +153,21 @@ impl PromptRebuilder {
 
     /// Rebuild the base system prompt for `active` tools, pulling each tool's contribution from the
     /// precomputed map (Pi `_rebuildSystemPrompt`, agent-session.ts:2304-2396).
-    fn rebuild(&self, active: &[String]) -> String {
+    fn rebuild(&self, active: &[String], hidden: &BTreeSet<String>) -> String {
         let mut inputs = self.base.clone();
         inputs.selected_tools = Some(active.iter().map(|n| Arc::from(n.as_str())).collect());
         inputs.tool_contributions = active
             .iter()
             .filter_map(|n| self.contributions.get(n).cloned())
+            .map(|mut c| {
+                // The listing must match the declarations the request carries, so a tool whose
+                // declaration is hidden is not listed (pi `_preparePromptAndToolLoadout`,
+                // `agent-session.ts:1693-1697` @v1.0.1). Its guidelines stay.
+                if hidden.contains(&*c.tool) {
+                    c.snippet = None;
+                }
+                c
+            })
             .collect();
         SystemPromptBuilder::new().build(&inputs)
     }
@@ -157,8 +177,9 @@ impl PromptRebuilder {
 pub(crate) struct DynamicToolState {
     /// All enable-able tools by name (built-ins after selection + extension/custom tools).
     registry: BTreeMap<String, Arc<dyn Tool>>,
-    /// The currently-active tool names, in order (Pi `agent.state.tools` names).
-    active: Vec<String>,
+    /// The resolved loadout of the currently-active names (Pi `agent.state.tools` plus
+    /// `_hiddenDeclarations`): what the loop runs, and what a request may declare.
+    loadout: ToolLoadout,
     rebuilder: PromptRebuilder,
 }
 
@@ -172,24 +193,49 @@ impl DynamicToolState {
             .into_iter()
             .map(|t| (t.name().to_string(), t))
             .collect();
-        let active = active.into_iter().map(|t| t.name().to_string()).collect();
+        let names: Vec<String> = active.iter().map(|t| t.name().to_string()).collect();
+        let loadout = ToolLoadout::resolve(&names, &registry.values().cloned().collect::<Vec<_>>());
         Self {
             registry,
-            active,
+            loadout,
             rebuilder,
         }
+    }
+
+    /// The rebuilt system prompt for the current loadout.
+    pub(crate) fn prompt(&self) -> String {
+        self.rebuilder
+            .rebuild(&self.active_names(), self.loadout.hidden_declarations())
+    }
+
+    /// The tools another tool can call through `ctx.executeTool()` — the active `direct` tools and
+    /// every registered `codemode` or `deferred` one (pi `getCallableToolNames` /
+    /// `_getCallableTools`, `agent-session.ts:1457-1520` @v1.0.1).
+    pub(crate) fn callable_names(&self) -> Vec<String> {
+        let active_names: BTreeSet<String> = self.active_names().into_iter().collect();
+        let active: BTreeSet<&str> = active_names.iter().map(String::as_str).collect();
+        let registry: Vec<Arc<dyn Tool>> = self.registry.values().cloned().collect();
+        cyrup_core::callable_tools(&registry, &active)
+            .iter()
+            .map(|t| t.name().to_string())
+            .collect()
     }
 
     /// The base system-prompt options bag for the CURRENT active set (EXT-061) — pi
     /// `_baseSystemPromptOptions` (`core/agent-session.ts:1044-1053` @v0.83.0), returned to a
     /// command handler by `ctx.getSystemPromptOptions()` (`:2436`).
     pub(crate) fn base_prompt_options(&self) -> serde_json::Value {
-        self.rebuilder.base_options(&self.active)
+        self.rebuilder
+            .base_options(&self.active_names(), self.loadout.hidden_declarations())
     }
 
     /// Names of the currently-active tools (Pi `getActiveToolNames`).
     pub(crate) fn active_names(&self) -> Vec<String> {
-        self.active.clone()
+        self.loadout
+            .executable()
+            .iter()
+            .map(|t| t.name().to_string())
+            .collect()
     }
 
     /// All enable-able tools as [`ToolInfo`] (Pi `getAllTools`).
@@ -219,25 +265,23 @@ impl DynamicToolState {
             description: t.description().to_string(),
             parameters: t.parameters().clone(),
             prompt_snippet: t.prompt_snippet().map(str::to_string),
-            active: self.active.iter().any(|n| n == t.name()),
+            active: self
+                .loadout
+                .executable()
+                .iter()
+                .any(|a| a.name() == t.name()),
+            exposure: t.exposure(),
+            namespace: t.namespace().cloned(),
             render_kind: t.render_kind(),
         }
     }
 
-    /// Set the active set by name (Pi `setActiveToolsByName`): unknown names are ignored, the active
-    /// list is replaced, and the new `(tools, system_prompt)` to push to the agent are returned.
-    pub(crate) fn set_active(&mut self, names: &[String]) -> (Vec<Arc<dyn Tool>>, String) {
-        let mut active: Vec<String> = Vec::new();
-        let mut tools: Vec<Arc<dyn Tool>> = Vec::new();
-        for name in names {
-            if let Some(t) = self.registry.get(name) {
-                active.push(name.clone());
-                tools.push(t.clone());
-            }
-        }
-        self.active = active;
-        let prompt = self.rebuilder.rebuild(&self.active);
-        (tools, prompt)
+    /// Set the active set by name (Pi `setActiveToolsByName`): unknown names and `hidden` tools are ignored, the
+    /// active list is replaced, and the new `(tools, system_prompt)` to push to the agent are returned.
+    pub(crate) fn set_active(&mut self, names: &[String]) -> (ToolLoadout, String) {
+        let registry: Vec<Arc<dyn Tool>> = self.registry.values().cloned().collect();
+        self.loadout = ToolLoadout::resolve(names, &registry);
+        (self.loadout.clone(), self.prompt())
     }
 
     /// Register additional custom tools into the enable-able registry (Pi `customTools`, sdk.ts:71).
@@ -292,32 +336,54 @@ impl DynamicToolState {
     pub(crate) fn merge_registered(
         &mut self,
         tools: Vec<Arc<dyn Tool>>,
-    ) -> Option<(Vec<Arc<dyn Tool>>, String)> {
-        let mut newly_registered: Vec<String> = Vec::new();
-        let mut redefined = false;
+    ) -> Option<(ToolLoadout, String)> {
+        // Pi `previousActivatedOnRegistration` (`agent-session.ts:3446-3449` @v1.0.1): a tool whose
+        // exposure changes to `direct` or `model-only` (from `hidden`, say) is activated like a new
+        // one, so the comparison is on "activated by registration", not on "was registered".
+        let previously_activated: BTreeSet<String> = self
+            .registry
+            .values()
+            .filter(|t| activated_on_registration(t))
+            .map(|t| t.name().to_string())
+            .collect();
+        let mut registry_moved = false;
         for t in tools {
             let name = t.name().to_string();
             self.rebuilder.upsert_contribution(&t);
             match self.registry.insert(name.clone(), t) {
-                None => newly_registered.push(name),
+                None => registry_moved = true,
                 Some(previous) => {
                     if let Some(current) = self.registry.get(&name)
                         && definition_changed(&previous, current)
                     {
-                        redefined = true;
+                        registry_moved = true;
                     }
                 }
             }
         }
-        // Pi filters the auto-activation through `new Set(...)`; a name already active stays once.
-        newly_registered.retain(|n| !self.active.contains(n));
-        if newly_registered.is_empty() && !redefined {
+        let mut names = self.active_names();
+        let newly_activated: Vec<String> = self
+            .registry
+            .values()
+            .filter(|t| activated_on_registration(t) && !previously_activated.contains(t.name()))
+            .map(|t| t.name().to_string())
+            .filter(|n| !names.contains(n))
+            .collect();
+        // A registration that activates nothing still moves the loadout: `callable` and
+        // `registered` are what `prepare_loadout` hooks read, and pi's `_refreshToolRegistry` ends
+        // with an unconditional `_setActiveTools` (`:3541-3543`).
+        if newly_activated.is_empty() && !registry_moved {
             return None;
         }
-        let mut names = self.active.clone();
-        names.extend(newly_registered);
+        names.extend(newly_activated);
         Some(self.set_active(&names))
     }
+}
+
+/// pi `_isActivatedOnRegistration` (`agent-session.ts:3554` @v1.0.1) for a registered tool.
+fn activated_on_registration(tool: &Arc<dyn Tool>) -> bool {
+    tool.exposure()
+        .activated_on_registration(tool.default_active())
 }
 
 /// Whether a re-registration actually replaced the tool the model would run — the model-visible
@@ -334,6 +400,9 @@ fn definition_changed(previous: &Arc<dyn Tool>, current: &Arc<dyn Tool>) -> bool
         return false;
     }
     previous.description() != current.description()
+        || previous.exposure() != current.exposure()
+        || previous.namespace() != current.namespace()
+        || previous.default_active() != current.default_active()
         || previous.parameters() != current.parameters()
         || previous.prompt_snippet() != current.prompt_snippet()
         || previous.prompt_guidelines() != current.prompt_guidelines()
@@ -439,7 +508,8 @@ mod tests {
                 Fake::new("deploy", "v2").with_snippet("deploy: v2").arc(),
             ])
             .expect("a CHANGED definition for an existing name must still push");
-        let (tools, prompt) = push;
+        let (loadout, prompt) = push;
+        let tools = loadout.executable();
 
         assert_eq!(
             tools.len(),
@@ -492,10 +562,10 @@ mod tests {
     #[test]
     fn merge_registered_still_auto_activates_a_new_name() {
         let mut st = state_with(vec![Fake::new("deploy", "v1").arc()]);
-        let (tools, _) = st
+        let (loadout, _) = st
             .merge_registered(vec![Fake::new("audit", "new").arc()])
             .expect("a new name pushes");
-        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+        let names: Vec<&str> = loadout.executable().iter().map(|t| t.name()).collect();
         assert!(
             names.contains(&"audit"),
             "the late tool is active: {names:?}"
@@ -535,8 +605,8 @@ mod tests {
             "custom tools register inert"
         );
 
-        let (tools, prompt) = st.set_active(&["read".to_string(), "deploy".to_string()]);
-        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+        let (loadout, prompt) = st.set_active(&["read".to_string(), "deploy".to_string()]);
+        let names: Vec<&str> = loadout.executable().iter().map(|t| t.name()).collect();
         assert_eq!(
             names,
             ["read", "deploy"],

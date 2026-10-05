@@ -9,7 +9,7 @@ use crate::queue::QueueMode;
 use crate::state::AgentStateSnapshot;
 use crate::stream_fn::StreamFn;
 use crate::subscriber::EventSubscriber;
-use cyrup_core::{AssistantMessage, CancelToken, ModelRef, ModelThinkingLevel, Tool};
+use cyrup_core::{AssistantMessage, CancelToken, ModelRef, ModelThinkingLevel, Tool, ToolLoadout};
 use std::sync::{Arc, Mutex};
 
 /// The detach handle [`Agent::subscribe`] returns — cyrup's analogue of the `() => void` closure pi
@@ -115,7 +115,14 @@ impl Agent {
 
     /// Copies the top-level Vec (the caller's array is decoupled, R-02-038).
     pub async fn set_tools(&self, tools: Vec<Arc<dyn Tool>>) {
-        lock(&self.state).tools = tools;
+        lock(&self.state).tools = ToolLoadout::from_tools(tools);
+    }
+
+    /// Replace the tool loadout (Pi `agent.state.tools = declared`, `_applyToolLoadout`,
+    /// `agent-session.ts:1569-1571` @v1.0.1). The loadout was resolved against the session's
+    /// registry, so hidden tools are already out and the `prepare_loadout` hooks have already run.
+    pub async fn set_loadout(&self, loadout: ToolLoadout) {
+        lock(&self.state).tools = loadout;
     }
 
     /// The agent's CURRENT tool set (Pi `agent.state.tools`, read by `_installAgentNextTurnRefresh`
@@ -123,6 +130,12 @@ impl Agent {
     /// `tool_count` because a tool is not serializable; a caller that must re-push the live array
     /// onto a running loop — via [`crate::TurnUpdate::tools`] — needs the handles themselves.
     pub async fn tools(&self) -> Vec<Arc<dyn Tool>> {
+        lock(&self.state).tools.executable().to_vec()
+    }
+
+    /// The agent's current [`ToolLoadout`] — what a caller that re-pushes the live set onto a
+    /// running loop via [`crate::TurnUpdate::tools`] hands back, keeping the hidden declarations.
+    pub async fn loadout(&self) -> ToolLoadout {
         lock(&self.state).tools.clone()
     }
 

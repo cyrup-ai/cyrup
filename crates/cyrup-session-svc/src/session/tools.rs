@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use cyrup_core::ModelRef;
+use cyrup_core::{ModelRef, ToolLoadout};
 
 use crate::tools::ToolInfo;
 
@@ -17,6 +17,15 @@ impl AgentSession {
     /// Names of the currently-active tools (Pi `getActiveToolNames`, agent-session.ts:786).
     pub fn active_tool_names(&self) -> Vec<String> {
         Self::lock(&self.dynamic_tools).active_names()
+    }
+
+    /// The names of the tools other tools can call through `ctx.executeTool()` — the active
+    /// `direct` tools and every registered `codemode` or `deferred` one (Pi
+    /// `getCallableToolNames`, `agent-session.ts:1457-1460` @v1.0.1). A tool that is callable is
+    /// not necessarily declared to the model: that is [`Self::active_tool_names`] minus the
+    /// declarations a `prepare_loadout` hook hid.
+    pub fn callable_tool_names(&self) -> Vec<String> {
+        Self::lock(&self.dynamic_tools).callable_names()
     }
 
     /// All enable-able tools with metadata (Pi `getAllTools`, agent-session.ts:794).
@@ -29,16 +38,12 @@ impl AgentSession {
         Self::lock(&self.dynamic_tools).get(name)
     }
 
-    /// Push a rebuilt `(tools, system_prompt)` onto the agent for the next turn (Pi
+    /// Push a rebuilt `(loadout, system_prompt)` onto the agent for the next turn (Pi
     /// `setActiveToolsByName` tail, agent-session.ts:850-854). Shared by the host/CLI
     /// [`Self::set_active_tools_by_name`] path and the guest-driven drain in
     /// [`Self::apply_pending_control`] so both reach the live agent identically.
-    pub(super) async fn push_active_tools(
-        &self,
-        tools: Vec<Arc<dyn cyrup_core::Tool>>,
-        prompt: String,
-    ) {
-        self.agent.set_tools(tools).await;
+    pub(super) async fn push_active_tools(&self, loadout: ToolLoadout, prompt: String) {
+        self.apply_loadout(loadout).await;
         // The rebuilt prompt is the new BASE, not just this turn's value (Pi
         // `this._baseSystemPrompt = this._rebuildSystemPrompt(validToolNames)`, agent-session.ts:939).
         // Without this write the next run's `before_agent_start` reset in
@@ -58,6 +63,18 @@ impl AgentSession {
         self.services
             .host_services
             .update_prompt_state(Some(prompt), self.services.settings.project_trusted());
+    }
+
+    /// Hand a resolved loadout to the agent, reporting the `prepare_loadout` hooks that failed while
+    /// it was resolved (pi `emitError({ event: "prepare_loadout" })`, `agent-session.ts:1556-1561`
+    /// @v1.0.1) — a failed hook changes nothing, but it is not silent.
+    pub(super) async fn apply_loadout(&self, loadout: ToolLoadout) {
+        for failure in loadout.hook_failures() {
+            self.services
+                .ext_host
+                .report_loadout_failure(&failure.tool, failure.message.clone());
+        }
+        self.agent.set_loadout(loadout).await;
     }
 
     /// Surface tools an extension registered AFTER its `init` to the LIVE agent (EXT-004; Pi
@@ -92,7 +109,11 @@ impl AgentSession {
         // `init`, which is precisely what the #2835 regression's `dynamic_tool` is, arrives here and
         // nowhere else: leaving this path unfiltered would keep the whole defect reachable while
         // every builder-level test passed.
-        let ext_tools = match self.services.ext_host.active_tools_filtered(
+        //
+        // The REGISTERED set, not the active one: a `codemode`/`deferred`/`hidden` tool is
+        // registered without being activated, and `merge_registered` is what decides activation
+        // (pi `_isActivatedOnRegistration`, `agent-session.ts:3554` @v1.0.1).
+        let ext_tools = match self.services.ext_host.registered_tools_filtered(
             &[],
             self.services.allowed_tool_names.as_ref(),
             &self.services.excluded_tool_names,
@@ -104,8 +125,8 @@ impl AgentSession {
             }
         };
         let push = { Self::lock(&self.dynamic_tools).merge_registered(ext_tools) };
-        if let Some((tools, prompt)) = push {
-            self.push_active_tools(tools, prompt).await;
+        if let Some((loadout, prompt)) = push {
+            self.push_active_tools(loadout, prompt).await;
         }
     }
 
@@ -134,7 +155,7 @@ impl AgentSession {
     /// drains below still discard their locally rebuilt prompt string for the same reason they always
     /// did — the authority is the base slot [`Self::push_active_tools`] writes, not a drain's
     /// by-product.
-    pub(crate) async fn next_turn_tools(&self) -> Vec<Arc<dyn cyrup_core::Tool>> {
+    pub(crate) async fn next_turn_tools(&self) -> ToolLoadout {
         // EXT-004: a tool an extension registered from a LIVE handler during this run.
         self.refresh_extension_tools().await;
         // A guest's `setActiveTools` queued from an event handler / mid-turn tool hook, re-resolved
@@ -142,10 +163,10 @@ impl AgentSession {
         // precisely so this resolution happens after it — see `PendingActiveTools`). Array only,
         // prompt discarded — see above, and the identical rule in `assemble_run_messages`.
         if let Some(names) = self.services.host_services.take_pending_active_tools() {
-            let (tools, _rebuilt_prompt) = { Self::lock(&self.dynamic_tools).set_active(&names) };
-            self.agent.set_tools(tools).await;
+            let (loadout, _rebuilt_prompt) = { Self::lock(&self.dynamic_tools).set_active(&names) };
+            self.apply_loadout(loadout).await;
         }
-        self.agent.tools().await
+        self.agent.loadout().await
     }
 
     /// The agent's live model + thinking level, for the per-turn refresh to stamp over whatever the
@@ -166,8 +187,8 @@ impl AgentSession {
     /// tool array and the prompt to the agent for the next turn (Pi `setActiveToolsByName`,
     /// agent-session.ts:812). Unknown names are ignored.
     pub async fn set_active_tools_by_name(&self, names: &[String]) {
-        let (tools, prompt) = { Self::lock(&self.dynamic_tools).set_active(names) };
-        self.push_active_tools(tools, prompt).await;
+        let (loadout, prompt) = { Self::lock(&self.dynamic_tools).set_active(names) };
+        self.push_active_tools(loadout, prompt).await;
     }
 
     /// Register additional custom tools into the enable-able registry (Pi `customTools`, sdk.ts:71,384).

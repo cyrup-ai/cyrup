@@ -95,3 +95,41 @@ fn a_mid_session_policy_edit_re_applies_the_shaped_tool_set() {
         );
     });
 }
+
+/// The shaping replaces the active set with the names it hands `set_active_tools`, so it must not
+/// name a tool that registration does not activate: a `codemode`/`deferred` tool would be declared
+/// to the model on the next request, a `hidden` one is unreachable by definition. A `deferred` tool
+/// that something already loaded (so it is active) stays, or shaping would unload it every turn.
+#[test]
+fn shaping_never_activates_codemode_deferred_or_hidden_tools() {
+    block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let agent_dir = dir.path().to_path_buf();
+        let ext = PermissionSystemExtension::new(agent_dir.clone(), agent_dir.clone());
+        init_ext(&ext).await;
+        let host = Arc::new(ExposureRegistry {
+            rows: vec![
+                ("read".to_string(), "direct"),
+                ("ask_user".to_string(), "model-only"),
+                ("docs_search".to_string(), "codemode"),
+                ("loaded_later".to_string(), "deferred"),
+                ("still_deferred".to_string(), "deferred"),
+                ("internal".to_string(), "hidden"),
+            ],
+            active: vec!["read".to_string(), "loaded_later".to_string()],
+            applied: std::sync::Mutex::new(Vec::new()),
+        });
+        ext.set_host_services(host.clone());
+        let _ = ext
+            .on_event(&before_agent_start("SYSTEM"), &event_ctx(agent_dir))
+            .await;
+
+        let applied = guard(&host.applied).clone();
+        assert_eq!(applied.len(), 1, "one shaping call: {applied:?}");
+        assert_eq!(
+            applied[0],
+            vec!["read", "ask_user", "loaded_later"],
+            "only declarable tools and tools already active may be named"
+        );
+    });
+}

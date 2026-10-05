@@ -16,7 +16,9 @@ use crate::queue::{PendingQueue, ToolExecution};
 use crate::state::{GenerationConfig, StateInner, reduce};
 use crate::stream_fn::{ApiKeyResolver, StreamFn};
 use crate::subscriber::EventSubscriber;
-use cyrup_core::{ModelRef, ModelThinkingLevel, RunCancel, SessionId, StopReason, Tool};
+use cyrup_core::{
+    ModelRef, ModelThinkingLevel, RunCancel, SessionId, StopReason, Tool, ToolLoadout,
+};
 use futures::future::FutureExt;
 use std::sync::{Arc, Mutex};
 
@@ -93,7 +95,7 @@ pub(crate) struct RunBaseline {
     pub model: ModelRef,
     pub thinking_level: ModelThinkingLevel,
     pub gen_config: GenerationConfig,
-    pub tools: Vec<Arc<dyn Tool>>,
+    pub tools: ToolLoadout,
     pub messages: Vec<AgentMessage>,
 }
 
@@ -132,7 +134,7 @@ pub(crate) struct RunCtx {
     thinking_level: ModelThinkingLevel,
     /// Generation params + telemetry forwarded into `StreamOptions` (Pi `AgentLoopConfig`).
     gen_config: GenerationConfig,
-    tools: Vec<Arc<dyn Tool>>,
+    tools: ToolLoadout,
     cancel: RunCancel,
     new_messages: Vec<Arc<AgentMessage>>,
     /// The loop's OWN working transcript — Pi `currentContext.messages`, a `.slice()` SNAPSHOT of the
@@ -333,7 +335,11 @@ impl RunCtx {
     }
 
     fn find_tool(&self, name: &str) -> Option<Arc<dyn Tool>> {
-        self.tools.iter().find(|t| t.name() == name).cloned()
+        self.tools
+            .executable()
+            .iter()
+            .find(|t| t.name() == name)
+            .cloned()
     }
 
     /// Pi `runWithLifecycle` (`packages/agent/src/agent.ts:480-494` @v0.83.0): drive the loop and,

@@ -272,11 +272,14 @@ fn all_registered_tool_names_is_first_registration_wins() {
     assert_eq!(info.len(), 3);
     assert_eq!(info[0]["name"], json!("alpha"));
 
-    // EXT-060 — pi's `ToolInfo` has FIVE keys and no `source`:
-    // `Pick<ToolDefinition, "name"|"description"|"parameters"|"promptGuidelines"> & {sourceInfo}`
-    // (`extensions/types.ts:1552-1554` @v0.83.0). cyrup used to add
-    // `source: "extension"|"guest"` — its native-vs-WASM tier — onto this guest-facing surface.
-    // Assert the ABSENCE against the presence of the rest, so this cannot pass vacuously.
+    // EXT-060 — pi's `ToolInfo` has no `source`. At v1.0.1 it is
+    // `Pick<ToolDefinition, "name"|"description"|"parameters"|"promptGuidelines"> & {exposure,
+    // namespace?, annotations?, sourceInfo}` (`core/extensions/types.ts:2081-2086`), emitted by
+    // `getAllTools()` (`core/agent-session.ts:1465-1475`): `exposure` is always present, and
+    // `namespace` and `annotations` only when the tool has them. These tools have neither, so the
+    // keys are those five plus `exposure`. cyrup used to add `source: "extension"|"guest"` — its
+    // native-vs-WASM tier — onto this guest-facing surface. Assert the ABSENCE against the
+    // presence of the rest, so this cannot pass vacuously.
     let obj = info[0].as_object().expect("ToolInfo is an object");
     let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
     keys.sort_unstable();
@@ -284,12 +287,13 @@ fn all_registered_tool_names_is_first_registration_wins() {
         keys,
         [
             "description",
+            "exposure",
             "name",
             "parameters",
             "promptGuidelines",
             "sourceInfo"
         ],
-        "ToolInfo must be pi's five keys exactly — no cyrup tier discriminator: {info:?}"
+        "ToolInfo must be pi's keys exactly — no cyrup tier discriminator: {info:?}"
     );
 
     // EXT-038 — pi's `ToolInfo` is

@@ -52,12 +52,26 @@ impl PermissionSystemExtension {
         // keyed on an empty tool list — which would be indistinguishable from a registry that
         // legitimately exposes nothing, and would replay the wrong prompt if the backend attached
         // between turns.
-        let allowed: Option<Vec<String>> = services.and_then(|s| s.all_tool_names()).map(|tools| {
-            tools
-                .into_iter()
-                .filter(|name| self.should_expose_tool(name, agent))
-                .collect()
-        });
+        //
+        // The candidates are the registry names the shaping may NAME in `set_active_tools`, and that
+        // call REPLACES the active set. A tool that registration does not activate (`codemode`,
+        // `deferred`, `hidden`) is registered without being declared to the model, so naming it
+        // here would declare it on the very next request — and replacing the active set with a list
+        // that omits a tool `tool_search` loaded would unload it. [`shapeable_tools`] therefore
+        // keeps a non-declarable tool only while it is already active, and never a `hidden` one.
+        // \[CYRUP-DELTA] pi v0.8.0 predates the exposure model (`ToolExposure`,
+        // `core/extensions/types.ts:509` @pi v1.0.1) and round-trips every `getAllTools()` name.
+        let allowed: Option<Vec<String>> = services
+            .and_then(|s| {
+                s.all_tool_names()
+                    .map(|names| shapeable_tools(names, s.all_tools(), s.active_tools()))
+            })
+            .map(|tools| {
+                tools
+                    .into_iter()
+                    .filter(|name| self.should_expose_tool(name, agent))
+                    .collect()
+            });
 
         let Some(allowed) = allowed else {
             return self.shape_agent_start_prompt(system_prompt, system_prompt, agent, &cwd, None);
@@ -220,4 +234,34 @@ impl PermissionSystemExtension {
         // pi `:1815`.
         false
     }
+}
+
+/// The registry names the permission shaping may hand to `set_active_tools`, in registry order.
+///
+/// A name is shapeable when its tool's exposure is declarable (`direct` or `model-only`, a tool that
+/// registration activates) or when it is already active; a `hidden` tool is never shapeable. A name
+/// with no `exposure` row (a host that cannot enumerate rows) is treated as declarable, which is
+/// what every tool was before the exposure model.
+fn shapeable_tools(
+    names: Vec<String>,
+    rows: Option<Vec<serde_json::Value>>,
+    active: Option<Vec<String>>,
+) -> Vec<String> {
+    let rows = rows.unwrap_or_default();
+    let active = active.unwrap_or_default();
+    let exposure_of = |name: &str| -> Option<cyrup_core::ToolExposure> {
+        rows.iter()
+            .find(|row| row.get("name").and_then(|n| n.as_str()) == Some(name))
+            .and_then(|row| row.get("exposure"))
+            .and_then(|e| e.as_str())
+            .and_then(|e| e.parse().ok())
+    };
+    names
+        .into_iter()
+        .filter(|name| match exposure_of(name) {
+            None => true,
+            Some(exposure) if !exposure.can_be_activated() => false,
+            Some(exposure) => exposure.declarable() || active.contains(name),
+        })
+        .collect()
 }

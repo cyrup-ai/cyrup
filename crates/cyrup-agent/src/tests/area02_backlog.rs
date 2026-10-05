@@ -495,7 +495,7 @@ fn empty_state() -> StateInner {
         system_prompt: String::new(),
         model: Some(model_ref()),
         thinking_level: ModelThinkingLevel::Off,
-        tools: Vec::new(),
+        tools: cyrup_core::ToolLoadout::empty(),
         messages: Vec::new(),
         streaming_message: None,
         pending_tool_calls: std::collections::HashSet::new(),

@@ -94,6 +94,16 @@ fn lower_tool_descriptor(d: &crate::descriptor::ToolDescriptor) -> types::ToolDe
             .constrained_sampling
             .as_ref()
             .map(|cs| serde_json::to_string(cs).unwrap_or_else(|_| "false".to_string())),
+        // Tool exposure (pi `ToolDefinition.exposure` / `namespace` / `defaultActive`,
+        // `extensions/types.ts:509`, `:527`, `:608` @v1.0.1). The omitted fields are upstream's
+        // `"direct"` and `true`, so those lower to `none`.
+        exposure: d.wire_exposure().map(str::to_string),
+        namespace: d.namespace.as_ref().map(|n| types::ToolNamespace {
+            name: n.name.clone(),
+            description: n.description.clone(),
+            instructions: n.instructions.clone(),
+        }),
+        default_active: d.wire_default_active(),
     }
 }
 
@@ -118,6 +128,9 @@ fn _lower_tool_descriptor_is_exhaustive(d: crate::descriptor::ToolDescriptor) {
         render_shell: _,
         prepare_arguments: _,
         constrained_sampling: _,
+        exposure: _,
+        namespace: _,
+        default_active: _,
     } = d;
 }
 

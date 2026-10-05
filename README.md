@@ -134,7 +134,7 @@ it is unavailable and does nothing else.
 ## Extensions are WebAssembly components
 
 Pi loads TypeScript at runtime. cyrup runs extensions as WASM components under Wasmtime, against a
-versioned WIT world (`cyrup:ext@0.13.0`). That buys three things a dynamic-import model cannot.
+versioned WIT world (`cyrup:ext@0.14.0`). That buys three things a dynamic-import model cannot.
 
 **A real sandbox.** An extension declares what it needs in its manifest: filesystem roots, process
 execution, network, UI. The host enforces it. A component that declares nothing gets nothing, and

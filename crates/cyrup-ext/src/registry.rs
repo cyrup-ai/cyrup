@@ -52,6 +52,54 @@ pub struct ToolDescriptor {
     /// which upstream is indistinguishable from `false`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub constrained_sampling: Option<cyrup_core::ConstrainedSampling>,
+    /// pi `ToolDefinition.exposure?: ToolExposure` (`extensions/types.ts:509` @v1.0.1): how the
+    /// model reaches the tool. Stored PARSED — the wire carries pi's string literal and an unknown
+    /// spelling is refused once, at registration, by [`parse_exposure`], so a [`ToolDescriptor`]
+    /// can only ever hold one of the five. The omitted field is upstream's `"direct"`
+    /// (`_getToolExposure`'s `?? "direct"`, `agent-session.ts:1507`), which is also the serde
+    /// default, so descriptors serialized before the field existed still deserialize.
+    #[serde(default, skip_serializing_if = "is_direct")]
+    pub exposure: cyrup_core::ToolExposure,
+    /// pi `ToolDefinition.namespace?: ToolNamespace` (`extensions/types.ts:527` @v1.0.1): the group
+    /// the tool belongs to, such as one MCP server. `None` = the omitted field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<cyrup_core::ToolNamespace>,
+    /// pi `ToolDefinition.defaultActive?: boolean` (`extensions/types.ts:608` @v1.0.1). The omitted
+    /// field is `true` — upstream tests `defaultActive !== false` (`_isActivatedOnRegistration`,
+    /// `agent-session.ts:3554`) — which is also the serde default.
+    #[serde(default = "default_active_true", skip_serializing_if = "is_true")]
+    pub default_active: bool,
+}
+
+fn is_direct(exposure: &cyrup_core::ToolExposure) -> bool {
+    *exposure == cyrup_core::ToolExposure::Direct
+}
+
+fn default_active_true() -> bool {
+    true
+}
+
+fn is_true(b: &bool) -> bool {
+    *b
+}
+
+/// Parse the exposure a guest declared (pi `ToolExposure`, `extensions/types.ts:509` @v1.0.1).
+/// `None` is the omitted field, i.e. `direct`. A spelling that is not one of the five is REFUSED
+/// with an error naming the tool, the extension and the spelling: coercing it to `direct` would
+/// advertise to the model a tool its author meant to keep out of requests.
+pub fn parse_exposure(
+    owner: &ExtensionId,
+    name: &str,
+    raw: Option<&str>,
+) -> Result<cyrup_core::ToolExposure, ExtError> {
+    let Some(raw) = raw else {
+        return Ok(cyrup_core::ToolExposure::Direct);
+    };
+    raw.parse::<cyrup_core::ToolExposure>().map_err(|e| {
+        ExtError::Registration(format!(
+            "Tool \"{name}\" registered by extension \"{owner}\" declares an invalid exposure: {e}."
+        ))
+    })
 }
 
 impl ToolDescriptor {
@@ -568,6 +616,13 @@ impl ExtensionRegistry {
             .cloned()
     }
 
+    /// The extension that owns tool `name`, in either tool table (see `tool_owner_in`); `None` for
+    /// a built-in or SDK tool the registry does not know. This is the same ownership
+    /// [`Self::tool_info`] reports as `sourceInfo.source`.
+    pub fn tool_owner(&self, name: &str) -> Result<Option<ExtensionId>, ExtError> {
+        Ok(Self::tool_owner_in(&*self.lock_read()?, name))
+    }
+
     /// Append a conflict record, de-duplicated. Pi emits one record per losing registration from a
     /// single post-load sweep; cyrup sees registrations streaming in and a retryable path (the guest
     /// descriptor re-materializer) can re-offer the same losing registration, so identical records
@@ -868,13 +923,41 @@ impl ExtensionRegistry {
         Ok(out)
     }
 
+    /// The names registration activates, in [`Self::all_registered_tool_names`] order: the
+    /// registered tools whose exposure is declarable and whose `defaultActive` is not `false`
+    /// (pi `_isActivatedOnRegistration`, `agent-session.ts:3554` @v1.0.1). What
+    /// `getActiveTools()` answers when no live session is attached; the rest of the registry
+    /// (`codemode`, `deferred`, `hidden`, `defaultActive: false`) is registered but not active.
+    pub fn activated_tool_names(&self) -> Result<Vec<String>, ExtError> {
+        let g = self.lock_read()?;
+        let mut out: Vec<String> = Vec::new();
+        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for n in g.tool_order.iter().chain(g.guest_tool_order.iter()) {
+            if !seen.insert(n.as_str()) {
+                continue;
+            }
+            let activated = match (g.tools.get(n), g.guest_tools.get(n)) {
+                (Some(t), _) => t.exposure().activated_on_registration(t.default_active()),
+                (None, Some((_, d))) => d.exposure.activated_on_registration(d.default_active),
+                (None, None) => false,
+            };
+            if activated {
+                out.push(n.clone());
+            }
+        }
+        Ok(out)
+    }
+
     /// `ToolInfo[]` for every registered tool (Pi `getAllTools`, `extensions/types.ts:1323`,
     /// implemented at `core/agent-session.ts:906-914` @v0.83.0). First-registration-wins order
     /// (matches [`Self::all_registered_tool_names`]).
     ///
-    /// EXT-060 — the emitted object is EXACTLY pi's five keys:
+    /// EXT-060 — the emitted object is EXACTLY pi's keys:
     /// `ToolInfo = Pick<ToolDefinition, "name"|"description"|"parameters"|"promptGuidelines"> &
-    /// {sourceInfo}` (`extensions/types.ts:1552-1554` @v0.83.0). It previously also carried a
+    /// {exposure, namespace?, annotations?, sourceInfo}` (`core/extensions/types.ts:2081-2086`
+    /// @v1.0.1, emitted by `getAllTools()` at `core/agent-session.ts:1465-1475`; the same type
+    /// had only `sourceInfo` beyond the `Pick` at v0.83.0, `types.ts:1552-1554`). `exposure` is
+    /// always present and `namespace` only when the tool has one. It previously also carried a
     /// cyrup-invented `source: "extension"|"guest"` discriminator, which leaked cyrup's
     /// native-vs-WASM TIER onto a guest-facing parity surface — a distinction pi's one-extension-kind
     /// model has no word for, and one a guest could read and branch on. Note that pi DOES have a
@@ -907,6 +990,9 @@ impl ExtensionRegistry {
                     "promptGuidelines": t.prompt_guidelines(),
                     "sourceInfo": tool_source_info(g.tool_owner.get(n)),
                 }));
+                if let Some(row) = out.last_mut() {
+                    insert_exposure_keys(row, t.exposure(), t.namespace());
+                }
             }
         }
         for n in &g.guest_tool_order {
@@ -921,6 +1007,9 @@ impl ExtensionRegistry {
                     "promptGuidelines": d.prompt_guidelines,
                     "sourceInfo": tool_source_info(Some(owner)),
                 }));
+                if let Some(row) = out.last_mut() {
+                    insert_exposure_keys(row, d.exposure, d.namespace.as_ref());
+                }
             }
         }
         Ok(out)
@@ -1705,11 +1794,14 @@ impl ExtensionRegistry {
         Ok(self.lock_read()?.provider_hub.ids())
     }
 
-    /// Merge a base tool set (built-ins) with extension tools; extension tools override by name
-    /// (R-08-012/014). Stable order: base order first, then new extension-only tools.
+    /// The merged ACTIVE tool set: built-ins overridden by extension tools (R-08-012/014), plus the
+    /// extension tools that registration activates (pi `_isActivatedOnRegistration`,
+    /// `agent-session.ts:3554` @v1.0.1). Stable order: base order first, then new extension-only
+    /// tools.
     ///
     /// The UNRESTRICTED form — [`Self::active_tools_filtered`] with no allowlist and no denylist.
-    /// Every non-production caller in the workspace keeps this arity.
+    /// Every non-production caller in the workspace keeps this arity. For every tool, whatever its
+    /// exposure, use [`Self::registered_tools_filtered`].
     pub fn active_tools(&self, base: &[Arc<dyn Tool>]) -> Result<Vec<Arc<dyn Tool>>, ExtError> {
         self.active_tools_filtered(base, None, &HashSet::new())
     }
@@ -1725,6 +1817,22 @@ impl ExtensionRegistry {
     /// selection while leaving `allowedToolNames` `undefined`, which is what keeps extension tools
     /// active (`sdk.ts:258`, `cyrup-session-svc/src/builder.rs`'s `NoTools` doc).
     ///
+    /// This is the REGISTRY ([`Self::registered_tools_filtered`]) minus the extension tools
+    /// registration does not activate. An extension tool that is not in `base` is active when
+    ///
+    /// * `allow` is `None`: its exposure activates it on registration
+    ///   ([`cyrup_core::ToolExposure::activated_on_registration`] over its `default_active`) — a
+    ///   `codemode`, `deferred` or `hidden` tool, or a `direct` one registered with
+    ///   `defaultActive: false`, stays registered but inactive
+    ///   (`_refreshToolRegistry`, `agent-session.ts:3510-3545` @v1.0.1);
+    /// * `allow` is `Some(set)`: it is named by the set and its exposure is declarable — naming a
+    ///   `direct` or `model-only` tool activates it even with `defaultActive: false`
+    ///   (`agent-session.ts:3510-3516` @v1.0.1), while naming a `codemode`, `deferred` or `hidden`
+    ///   tool does not make it a default-active one.
+    ///
+    /// Base tools keep the caller's build-time selection; an extension override of a base tool
+    /// replaces it by name and stays in the list.
+    ///
     /// Only the APPEND loop is filtered. The override loop over `base` is not: `base` has already
     /// been through `select_active_tools`, and an override shares its base tool's name, so it is
     /// allowed by construction — testing it again could only ever reject a name the caller just
@@ -1734,6 +1842,39 @@ impl ExtensionRegistry {
         base: &[Arc<dyn Tool>],
         allow: Option<&HashSet<String>>,
         exclude: &HashSet<String>,
+    ) -> Result<Vec<Arc<dyn Tool>>, ExtError> {
+        self.merge_tools(base, allow, exclude, |t| {
+            let exposure = t.exposure();
+            match allow {
+                None => exposure.activated_on_registration(t.default_active()),
+                Some(_) => exposure.declarable(),
+            }
+        })
+    }
+
+    /// The REGISTRY under the session's tool selection: `base` (with extension overrides by name)
+    /// plus every allowed extension tool, whatever its exposure (pi `_toolRegistry` after
+    /// `_refreshToolRegistry`, `agent-session.ts:3445-3545` @v1.0.1 — the registry holds every
+    /// allowed tool; only the active set is narrowed by exposure). The set a tool-search or
+    /// `executeTool` surface resolves names against. Not what a request declares: see
+    /// [`Self::active_tools_filtered`].
+    pub fn registered_tools_filtered(
+        &self,
+        base: &[Arc<dyn Tool>],
+        allow: Option<&HashSet<String>>,
+        exclude: &HashSet<String>,
+    ) -> Result<Vec<Arc<dyn Tool>>, ExtError> {
+        self.merge_tools(base, allow, exclude, |_| true)
+    }
+
+    /// `base` with extension overrides by name, then the allowed extension-only tools for which
+    /// `include` holds.
+    fn merge_tools(
+        &self,
+        base: &[Arc<dyn Tool>],
+        allow: Option<&HashSet<String>>,
+        exclude: &HashSet<String>,
+        include: impl Fn(&dyn Tool) -> bool,
     ) -> Result<Vec<Arc<dyn Tool>>, ExtError> {
         let is_allowed =
             |name: &str| allow.is_none_or(|a| a.contains(name)) && !exclude.contains(name);
@@ -1753,6 +1894,7 @@ impl ExtensionRegistry {
             if !seen.contains(n)
                 && is_allowed(n)
                 && let Some(t) = g.tools.get(n)
+                && include(t.as_ref())
             {
                 out.push(t.clone());
             }
@@ -1848,6 +1990,25 @@ pub fn build_builtin_keybindings(
 /// EXT-038: cyrup's registry knows the owning extension id and nothing else — a discovered
 /// extension's on-disk path is held by the loader, not here — so the id fills both `path` and
 /// `source`. That is still strictly more than the field being absent, which is what a guest saw.
+/// Add pi's `ToolInfo.exposure` and `ToolInfo.namespace` to a `tool_info` row
+/// (`core/extensions/types.ts` `ToolInfo` @v1.0.1): `exposure` is always present, spelled as pi
+/// spells it, and `namespace` only when the tool has one.
+fn insert_exposure_keys(
+    row: &mut Value,
+    exposure: cyrup_core::ToolExposure,
+    namespace: Option<&cyrup_core::ToolNamespace>,
+) {
+    let Some(obj) = row.as_object_mut() else {
+        return;
+    };
+    obj.insert("exposure".to_string(), Value::from(exposure.as_str()));
+    if let Some(ns) = namespace
+        && let Ok(v) = serde_json::to_value(ns)
+    {
+        obj.insert("namespace".to_string(), v);
+    }
+}
+
 fn tool_source_info(owner: Option<&ExtensionId>) -> Value {
     let name = owner.map(ToString::to_string).unwrap_or_default();
     serde_json::json!({

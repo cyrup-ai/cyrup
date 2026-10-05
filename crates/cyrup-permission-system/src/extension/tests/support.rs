@@ -157,3 +157,31 @@ pub(super) fn ui_ctx(cwd: &Path) -> HostCtx {
 pub(super) fn headless_ctx(cwd: &Path) -> HostCtx {
     HostCtx::event(cyrup_ext::ExtMode::Tui, false, cwd.to_path_buf())
 }
+
+/// A registry whose tools carry exposures, with a settable active set; records every
+/// `set_active_tools` the shaping makes.
+pub(super) struct ExposureRegistry {
+    pub(super) rows: Vec<(String, &'static str)>,
+    pub(super) active: Vec<String>,
+    pub(super) applied: Mutex<Vec<Vec<String>>>,
+}
+
+impl HostServices for ExposureRegistry {
+    fn all_tool_names(&self) -> Option<Vec<String>> {
+        Some(self.rows.iter().map(|(n, _)| n.clone()).collect())
+    }
+    fn all_tools(&self) -> Option<Vec<serde_json::Value>> {
+        Some(
+            self.rows
+                .iter()
+                .map(|(n, e)| json!({"name": n, "exposure": e}))
+                .collect(),
+        )
+    }
+    fn active_tools(&self) -> Option<Vec<String>> {
+        Some(self.active.clone())
+    }
+    fn set_active_tools(&self, tools: &[String]) {
+        guard(&self.applied).push(tools.to_vec());
+    }
+}

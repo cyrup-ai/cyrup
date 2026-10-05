@@ -9,7 +9,7 @@ use crate::error::HookError;
 use crate::event::{AgentMessage, ToolResultMessage};
 use cyrup_core::{
     AssistantMessage, CancelToken, Content, Message, ModelRef, ModelThinkingLevel, TerminateHint,
-    Tool, ToolCall, ToolCallId, Usage,
+    Tool, ToolCall, ToolCallId, ToolLoadout, Usage,
 };
 use serde_json::Value;
 use std::sync::Arc;
@@ -208,7 +208,7 @@ pub struct RequestUpdate {
     pub context: Option<Vec<Arc<AgentMessage>>>,
     pub model: Option<ModelRef>,
     pub thinking_level: Option<ModelThinkingLevel>,
-    pub tools: Option<Vec<Arc<dyn Tool>>>,
+    pub tools: Option<ToolLoadout>,
     pub system_prompt: Option<String>,
 }
 
@@ -239,7 +239,7 @@ pub struct TurnUpdate {
     /// until the next prompt, which would make a mid-run anchor point at a tool the model cannot
     /// use. cyrup models it as its own field rather than folding it into `context` because
     /// [`Self::context`] here is the message list only, not Pi's whole `AgentContext`.
-    pub tools: Option<Vec<Arc<dyn Tool>>>,
+    pub tools: Option<ToolLoadout>,
     /// Replacement system prompt for the rest of the run (Pi `context.systemPrompt`, same return).
     /// The tool-set rebuild rewrites the prompt (`_rebuildSystemPrompt`, agent-session.ts:2304), so
     /// refreshing tools without it would leave the run advertising a tool whose guidance is missing.
@@ -271,8 +271,13 @@ impl TurnUpdate {
     }
 }
 
-fn tool_names(tools: Option<&Vec<Arc<dyn Tool>>>) -> Option<Vec<String>> {
-    tools.map(|ts| ts.iter().map(|t| t.name().to_string()).collect())
+fn tool_names(tools: Option<&ToolLoadout>) -> Option<Vec<String>> {
+    tools.map(|ts| {
+        ts.executable()
+            .iter()
+            .map(|t| t.name().to_string())
+            .collect()
+    })
 }
 
 /// Hand-written because `Arc<dyn Tool>` is not `Debug` (`Tool: Send + Sync` only) — tools print as

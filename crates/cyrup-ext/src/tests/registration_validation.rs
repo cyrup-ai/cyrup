@@ -228,6 +228,9 @@ fn wit_tool(
         prepare_arguments: false,
         render_shell: None,
         constrained_sampling: None,
+        exposure: None,
+        namespace: None,
+        default_active: None,
     }
 }
 
@@ -408,18 +411,24 @@ async fn a_refused_register_flag_propagated_with_question_mark_stops_and_fails_t
 /// `registration` import declaring `register-tool` (its `tool-descriptor` aliased from the `types`
 /// import, as `use types.{tool-descriptor}` encodes it) and `register-flag`.
 #[cfg(feature = "wasm-host")]
-const REGISTRATION_TOOL_AND_FLAG: &str = r#"  (import "cyrup:ext/types@0.13.0" (instance $types
+const REGISTRATION_TOOL_AND_FLAG: &str = r#"  (import "cyrup:ext/types@0.14.0" (instance $types
     (type $em (enum "parallel" "sequential"))
     (export "exec-mode" (type $em-x (eq $em)))
+    (type $tn (record
+      (field "name" string) (field "description" (option string))
+      (field "instructions" (option string))))
+    (export "tool-namespace" (type $tn-x (eq $tn)))
     (type $td (record
       (field "name" string) (field "label" string) (field "description" string)
       (field "parameters-json" string) (field "exec-mode" (option $em-x))
       (field "prompt-snippet" (option string)) (field "prompt-guidelines" (list string))
       (field "has-renderer" bool) (field "prepare-arguments" bool)
-      (field "render-shell" (option string)) (field "constrained-sampling" (option string))))
+      (field "render-shell" (option string)) (field "constrained-sampling" (option string))
+      (field "exposure" (option string)) (field "namespace" (option $tn-x))
+      (field "default-active" (option bool))))
     (export "tool-descriptor" (type $td-x (eq $td)))))
   (alias export $types "tool-descriptor" (type $tool-descriptor))
-  (import "cyrup:ext/registration@0.13.0" (instance $reg
+  (import "cyrup:ext/registration@0.14.0" (instance $reg
     (alias outer 1 $tool-descriptor (type $td))
     (export "tool-descriptor" (type $td-x (eq $td)))
     (export "register-tool" (func (param "t" $td-x) (result (result (error string)))))
@@ -450,7 +459,7 @@ async fn a_guest_that_handles_a_refused_register_tool_carries_on_and_its_call_su
 
     const AFTER_SPEC: &str = r#"{"type":"boolean"}"#;
     // The flattened `tool-descriptor` exceeds 16 core params, so it is passed by pointer: the
-    // canonical-ABI record (84 bytes) at 17000 — `name` at 0, `label` 8, `description` 16,
+    // canonical-ABI record (136 bytes) at 17000 — `name` at 0, `label` 8, `description` 16,
     // `parameters-json` 24, then zeroed options/list/bools.
     let mut record = String::new();
     record.push_str(&le(17200));
@@ -458,7 +467,7 @@ async fn a_guest_that_handles_a_refused_register_tool_carries_on_and_its_call_su
     record.push_str(&le(0).repeat(4)); // label, description: ""
     record.push_str(&le(17220));
     record.push_str(&le(2)); // parameters-json → "[]"
-    record.push_str(&"\\00".repeat(84 - 32));
+    record.push_str(&"\\00".repeat(136 - 32));
 
     let component = |parameters: &str| {
         WatGuest {

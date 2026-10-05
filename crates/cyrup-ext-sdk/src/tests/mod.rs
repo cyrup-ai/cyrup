@@ -18,4 +18,5 @@ mod dialog_options_timeout;
 mod ergonomic;
 mod payload_fidelity;
 mod prelude_export_parity;
+mod tool_exposure;
 mod world_import_coverage;

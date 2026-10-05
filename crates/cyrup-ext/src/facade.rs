@@ -820,13 +820,38 @@ impl ExtensionHost {
     ) -> Result<Vec<Arc<dyn Tool>>, ExtError> {
         self.refresh_tools()?;
         let merged = self.registry.active_tools_filtered(base, allow, exclude)?;
+        Ok(self.wrap_tools(merged))
+    }
+
+    /// The REGISTRY under the session's tool selection, delegating to
+    /// [`crate::registry::ExtensionRegistry::registered_tools_filtered`]: `base` (with extension
+    /// overrides) plus every allowed extension tool, whatever its exposure — pi's `_toolRegistry`
+    /// (`agent-session.ts:3445-3545` @v1.0.1). [`Self::active_tools_filtered`] is this minus the
+    /// extension tools registration does not activate (`codemode`, `deferred`, `hidden`,
+    /// `defaultActive: false`). Same refresh and wrapping as that method.
+    pub fn registered_tools_filtered(
+        &self,
+        base: &[Arc<dyn Tool>],
+        allow: Option<&std::collections::HashSet<String>>,
+        exclude: &std::collections::HashSet<String>,
+    ) -> Result<Vec<Arc<dyn Tool>>, ExtError> {
+        self.refresh_tools()?;
+        let merged = self
+            .registry
+            .registered_tools_filtered(base, allow, exclude)?;
+        Ok(self.wrap_tools(merged))
+    }
+
+    /// Put each tool through the registered-tool wrapper when a live active-tool source is
+    /// attached ([`Self::set_active_tool_source`]); otherwise hand them back untouched.
+    fn wrap_tools(&self, tools: Vec<Arc<dyn Tool>>) -> Vec<Arc<dyn Tool>> {
         let Some(src) = self.active_tool_source.read().ok().and_then(|g| g.clone()) else {
-            return Ok(merged);
+            return tools;
         };
-        Ok(merged
+        tools
             .into_iter()
             .map(|t| crate::wrapper::wrap_registered_tool(t, src.clone()))
-            .collect())
+            .collect()
     }
 
     /// Re-materialize guest tool descriptors registered after their extension's `init` into
@@ -2166,6 +2191,30 @@ impl ExtensionHost {
     /// handler fault is contained and skipped.
     pub fn add_error_listener(&self, listener: crate::ErrorListener) {
         self.dispatcher.add_error_listener(listener);
+    }
+
+    /// Surface a failed `prepare_loadout` hook on the extension error channel — pi's
+    /// `emitError({ extensionPath, event: "prepare_loadout", error })`
+    /// (`core/agent-session.ts:1556-1561` @v1.0.1) — so an error listener ([`Self::add_error_listener`])
+    /// sees it as an [`crate::ExtensionError`] with `event == "prepare_loadout"`.
+    ///
+    /// `tool` is the tool whose hook failed and `message` is the error's own text
+    /// (`cyrup_core::LoadoutHookFailure`). The reported extension is the tool's owner when the
+    /// registry knows one ([`crate::registry::ExtensionRegistry::tool_owner`], the ownership
+    /// `tool_info` reports as `sourceInfo`); a built-in or SDK tool has none, and gets pi's
+    /// synthetic `<builtin:NAME>` path (`createSyntheticSourceInfo`, `agent-session.ts:2478`).
+    pub fn report_loadout_failure(&self, tool: &str, message: String) {
+        let extension = self
+            .registry
+            .tool_owner(tool)
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| ExtensionId::from(format!("<builtin:{tool}>")));
+        self.dispatcher.report_external(crate::ExtensionError {
+            extension,
+            event: "prepare_loadout",
+            error: message,
+        });
     }
 
     /// Ids of loaded extensions in load order.

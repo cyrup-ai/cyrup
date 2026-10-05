@@ -148,6 +148,26 @@ impl Tool for RegisteredTool {
     fn constrained_sampling(&self) -> Option<&cyrup_core::ConstrainedSampling> {
         self.inner.constrained_sampling()
     }
+    /// Tool exposure (pi `ToolDefinition.exposure`, `types.ts:509` @v1.0.1). Upstream's wrapper
+    /// is a spread of the wrapped tool, so `exposure`, `namespace`, `defaultActive` and
+    /// `prepareLoadout` survive it by construction; here each one is delegated by hand, because a
+    /// wrapper that kept the trait defaults would turn every wrapped `codemode`, `deferred`,
+    /// `model-only` or `hidden` tool into `direct`.
+    fn exposure(&self) -> cyrup_core::ToolExposure {
+        self.inner.exposure()
+    }
+    fn namespace(&self) -> Option<&cyrup_core::ToolNamespace> {
+        self.inner.namespace()
+    }
+    fn default_active(&self) -> bool {
+        self.inner.default_active()
+    }
+    fn prepare_loadout(
+        &self,
+        view: &cyrup_core::LoadoutView<'_>,
+    ) -> Result<cyrup_core::ToolLoadoutChanges, ToolError> {
+        self.inner.prepare_loadout(view)
+    }
     async fn prepare_arguments(&self, args: Value) -> Value {
         self.inner.prepare_arguments(args).await
     }
@@ -469,6 +489,104 @@ mod tests {
             serde_json::json!({"z": 1, "prepared": true})
         );
     }
+    /// A tool whose exposure surface is entirely non-default, with a `prepare_loadout` hook that
+    /// rewrites its own description, so a wrapper that kept the trait defaults is observable.
+    struct Exposed {
+        exposure: cyrup_core::ToolExposure,
+        namespace: cyrup_core::ToolNamespace,
+        default_active: bool,
+        params: Value,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for Exposed {
+        fn name(&self) -> &str {
+            "exposed"
+        }
+        fn parameters(&self) -> &Value {
+            &self.params
+        }
+        fn description(&self) -> &str {
+            "original description"
+        }
+        fn exposure(&self) -> cyrup_core::ToolExposure {
+            self.exposure
+        }
+        fn namespace(&self) -> Option<&cyrup_core::ToolNamespace> {
+            Some(&self.namespace)
+        }
+        fn default_active(&self) -> bool {
+            self.default_active
+        }
+        fn prepare_loadout(
+            &self,
+            _view: &cyrup_core::LoadoutView<'_>,
+        ) -> Result<cyrup_core::ToolLoadoutChanges, ToolError> {
+            let mut changes = cyrup_core::ToolLoadoutChanges::default();
+            changes
+                .descriptions
+                .insert("exposed".to_string(), "rewritten by the hook".to_string());
+            Ok(changes)
+        }
+        async fn execute(
+            &self,
+            _call_id: ToolCallId,
+            _params: Value,
+            _cancel: CancelToken,
+            _on_update: ToolUpdateSink,
+        ) -> Result<ToolResult, ToolError> {
+            Ok(ToolResult::default())
+        }
+    }
+
+    /// Pi's `wrapRegisteredTool` spreads the wrapped tool (`wrapper.ts:21-22`), so `exposure`,
+    /// `namespace`, `defaultActive` and `prepareLoadout` survive it. Each of the five exposures
+    /// must come out of the wrapper unchanged — a wrapper on the trait defaults would report
+    /// every one of them as `direct` — and the wrapped hook's result must pass through.
+    #[test]
+    fn the_wrapper_reports_the_wrapped_tools_exposure_surface() {
+        use cyrup_core::{ToolExposure, ToolLoadout, ToolNamespace};
+        for exposure in [
+            ToolExposure::Direct,
+            ToolExposure::ModelOnly,
+            ToolExposure::Codemode,
+            ToolExposure::Deferred,
+            ToolExposure::Hidden,
+        ] {
+            let namespace = ToolNamespace {
+                name: "mcp__docs".to_string(),
+                description: Some("docs server".to_string()),
+                instructions: Some("use it".to_string()),
+            };
+            let inner: Arc<dyn Tool> = Arc::new(Exposed {
+                exposure,
+                namespace: namespace.clone(),
+                default_active: false,
+                params: serde_json::json!({}),
+            });
+            let w = wrap_registered_tool(inner, ScriptedActive::new(vec![]));
+            assert_eq!(w.exposure(), exposure, "{exposure:?}");
+            assert_eq!(w.namespace(), Some(&namespace), "{exposure:?}");
+            assert!(!w.default_active(), "{exposure:?}");
+
+            // The hook's result passes through the wrapper: resolving a loadout over the WRAPPED
+            // tool applies the description the inner hook returned. (Hidden tools are never
+            // executable, so there is nothing to describe for them.)
+            let names = vec!["exposed".to_string()];
+            let loadout = ToolLoadout::resolve(&names, std::slice::from_ref(&w));
+            let described: Vec<&str> = loadout
+                .executable()
+                .iter()
+                .map(|t| t.description())
+                .collect();
+            if exposure == ToolExposure::Hidden {
+                assert!(described.is_empty());
+            } else {
+                assert_eq!(described, vec!["rewritten by the hook"], "{exposure:?}");
+            }
+        }
+    }
+
     /// TOOL-046 — the REAL built-ins' strict-`prefer` declaration, carried through THIS wrapper and
     /// on into the provider request.
     ///

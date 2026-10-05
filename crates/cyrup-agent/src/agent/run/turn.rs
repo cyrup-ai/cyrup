@@ -186,7 +186,7 @@ impl RunCtx {
         AgentContextView {
             system_prompt: &self.system_prompt,
             messages: &self.messages,
-            tools: &self.tools,
+            tools: self.tools.executable(),
         }
     }
 

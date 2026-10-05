@@ -13,6 +13,7 @@ pub mod constrained_sampling;
 pub mod diagnostics;
 pub mod error;
 pub mod event_stream;
+pub mod exposure;
 pub mod json;
 pub mod keyed_lock;
 pub mod lazy_args;
@@ -34,6 +35,10 @@ pub use diagnostics::{
 };
 pub use error::CoreError;
 pub use event_stream::{Finalizing, FinalizingSink, FinalizingStream, finalizing_channel};
+pub use exposure::{
+    AdvertisedTools, LoadoutHookFailure, LoadoutView, ToolExposure, ToolLoadout,
+    ToolLoadoutChanges, ToolNamespace, UnknownExposure, callable_tools,
+};
 pub use keyed_lock::{Cancelled, KeyedAcquire, KeyedGuard, KeyedLockMap, KeyedLocks};
 pub use lazy_args::LazyArgs;
 pub use message::{

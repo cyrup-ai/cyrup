@@ -6,7 +6,7 @@ use crate::hooks::{DefaultHooks, Hooks};
 use crate::queue::{PendingQueue, QueueMode, ToolExecution};
 use crate::state::{GenerationConfig, StateInner};
 use crate::stream_fn::{ApiKeyResolver, StreamFn};
-use cyrup_core::{ModelRef, ModelThinkingLevel, SessionId, Tool};
+use cyrup_core::{ModelRef, ModelThinkingLevel, SessionId, Tool, ToolLoadout};
 use serde_json::Value;
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
@@ -17,7 +17,7 @@ pub struct AgentBuilder {
     system_prompt: String,
     model: Option<ModelRef>,
     thinking_level: ModelThinkingLevel,
-    tools: Vec<Arc<dyn Tool>>,
+    tools: ToolLoadout,
     messages: Vec<AgentMessage>,
     hooks: Option<Arc<dyn Hooks>>,
     stream_fn: Arc<dyn StreamFn>,
@@ -36,7 +36,7 @@ impl AgentBuilder {
             system_prompt: String::new(),
             model: None,
             thinking_level: ModelThinkingLevel::Off,
-            tools: Vec::new(),
+            tools: ToolLoadout::empty(),
             messages: Vec::new(),
             hooks: None,
             stream_fn,
@@ -77,7 +77,14 @@ impl AgentBuilder {
 
     #[must_use]
     pub fn tools(mut self, tools: Vec<Arc<dyn Tool>>) -> Self {
-        self.tools = tools;
+        self.tools = ToolLoadout::from_tools(tools);
+        self
+    }
+
+    /// A tool loadout resolved against a session registry (see [`cyrup_core::exposure`]).
+    #[must_use]
+    pub fn loadout(mut self, loadout: ToolLoadout) -> Self {
+        self.tools = loadout;
         self
     }
 
