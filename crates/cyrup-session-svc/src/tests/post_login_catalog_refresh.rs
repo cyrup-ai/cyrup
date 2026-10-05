@@ -98,6 +98,11 @@ impl Origin {
                     let provider = head
                         .split_whitespace()
                         .nth(1)
+                        // PROV-128 put `?types=chat,image,classifier` on the catalog URL, so the
+                        // last path segment now carries a query string. Strip it: this records the
+                        // PROVIDER, which is what the assertions below compare against, and what
+                        // the `== stall` arm needs to match.
+                        .and_then(|p| p.split('?').next())
                         .and_then(|p| p.rsplit('/').next())
                         .unwrap_or_default()
                         .to_string();
