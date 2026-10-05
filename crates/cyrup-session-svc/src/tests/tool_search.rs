@@ -399,3 +399,38 @@ async fn invalid_arguments_come_back_as_tool_errors_and_load_nothing() {
     assert!(!rig.session.active_tool_names().iter().any(|n| n == LOOKUP));
     assert!(!declares(&rig.requests()[2], LOOKUP));
 }
+
+/// The load is recorded in the session file in the form the session persists today: the
+/// `tool_search` tool result carries `details.loaded` and the host-derived `addedToolNames` (the
+/// active-set diff around the call), and the file holds nothing else about the load. Restoring the
+/// loaded set on resume is the active-tool-set persistence design; this pins that the record exists
+/// for it to read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_load_is_recorded_on_the_persisted_tool_result() {
+    let rig = rig(vec![
+        Reply::Call("tool_search", json!({ "query": "widget" })),
+        Reply::Text("done"),
+    ])
+    .await;
+    rig.activate_tool_search().await;
+    rig.run("go").await;
+
+    let file = rig
+        .session
+        .session_file()
+        .await
+        .expect("a persisted session");
+    let entries: Vec<Value> = std::fs::read_to_string(file)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let result = entries
+        .iter()
+        .filter_map(|entry| entry.get("message"))
+        .find(|message| message["role"] == "toolResult" && message["toolName"] == "tool_search")
+        .expect("the tool result is persisted");
+    assert_eq!(result["details"], json!({ "loaded": [LOOKUP] }));
+    assert_eq!(result["addedToolNames"], json!([LOOKUP]));
+    assert_eq!(result["isError"], json!(false));
+}
