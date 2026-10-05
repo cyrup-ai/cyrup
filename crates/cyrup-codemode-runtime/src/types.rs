@@ -166,7 +166,11 @@ pub struct ExecuteOptions {
 pub trait ScriptSandbox: Send + Sync {
     /// `code` is an async function body: `return` and top-level `await` work. Never fails for a
     /// script's failure; those come back as [`CodemodeResult::Failed`]. `Err` is only "closed".
-    async fn execute(&self, code: &str, options: ExecuteOptions) -> Result<CodemodeResult, SandboxClosed>;
+    async fn execute(
+        &self,
+        code: &str,
+        options: ExecuteOptions,
+    ) -> Result<CodemodeResult, SandboxClosed>;
 
     /// Cancels in-flight executions (they settle as [`ErrorKind::Aborted`]) and refuses new ones.
     async fn close(&self);
