@@ -20,3 +20,6 @@ thiserror = { workspace = true }
 async-trait = { workspace = true }
 futures = { workspace = true }
 tokio = { workspace = true }
+# ADR-0031: the one JavaScript engine in this workspace. The sandbox embeds V8 through `deno_core`
+# alone (no `deno_runtime`): ECMAScript intrinsics and this crate's ops, nothing else.
+deno_core = { workspace = true }

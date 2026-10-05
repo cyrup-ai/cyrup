@@ -1517,6 +1517,7 @@ dependencies = [
  "async-trait",
  "cyrup-codemode",
  "cyrup-core",
+ "deno_core",
  "futures",
  "serde",
  "serde_json",

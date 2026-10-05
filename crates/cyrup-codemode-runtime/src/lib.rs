@@ -12,4 +12,5 @@
 
 #![forbid(unsafe_code)]
 
+pub mod sandbox;
 pub mod types;
