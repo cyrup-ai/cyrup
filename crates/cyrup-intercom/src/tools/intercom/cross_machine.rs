@@ -12,33 +12,12 @@ use std::sync::Arc;
 use cyrup_core::{ToolError, ToolResult};
 
 use crate::cross_machine::{
-    CommandRunner, CrossMachineDeps, CrossMachineOrigin, relay_sender_name, send_cross_machine,
+    CommandRunner, CrossMachineDeps, CrossMachineOrigin, herdr_bin_from, relay_sender_name,
+    send_cross_machine,
 };
 use crate::session_state::SharedIntercomState;
 use crate::tools::detailed_result;
 use crate::transport::protocol::now_ms;
-
-/// `process.env.HERDR_BIN_PATH ?? "herdr"` (`v0.16.0 cross-machine-transport.ts:79`,
-/// `index.ts:3052`).
-///
-/// **Not `HERDR_BIN`,** and not a typo here: upstream's cross-machine files read this *other*
-/// spelling, while `project-agent.ts:68` (cyrup: [`cyrup_herdr::cli::HERDR_BIN`]) reads
-/// `HERDR_BIN`, and neither falls back to the other. Adding a fallback would be inventing upstream
-/// behaviour, so the two variables stay as upstream has them; both belong to the herdr vendor, so
-/// neither takes a `CYRUP_` prefix.
-pub const HERDR_BIN_PATH: &str = "HERDR_BIN_PATH";
-
-/// The `herdr` binary cross-machine discovery runs, from [`HERDR_BIN_PATH`].
-///
-/// A blank value falls through to `"herdr"`, as every other binary ladder in this workspace does
-/// for a variable that was unset badly.
-#[must_use]
-pub(super) fn herdr_bin_from(env: impl Fn(&str) -> Option<String>) -> String {
-    env(HERDR_BIN_PATH)
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| cyrup_herdr::cli::HERDR_BIN_DEFAULT.to_string())
-}
 
 /// `v0.16.0 index.ts:1708-1733` — relay over SSH, append the audit entry, report.
 ///
@@ -314,23 +293,6 @@ mod tests {
                 .unwrap_or_else(|e| e.into_inner())
                 .is_empty(),
             "an undelivered send leaves no `intercom_sent` entry"
-        );
-    }
-
-    /// `process.env.HERDR_BIN_PATH ?? "herdr"` (`v0.16.0 cross-machine-transport.ts:79`) — and a
-    /// blank value is an env var that was unset badly, not a request to exec the empty string.
-    #[test]
-    fn the_herdr_binary_comes_from_herdr_bin_path_only() {
-        assert_eq!(herdr_bin_from(|_| None), "herdr");
-        assert_eq!(herdr_bin_from(|_| Some("  ".to_string())), "herdr");
-        assert_eq!(
-            herdr_bin_from(|key| (key == HERDR_BIN_PATH).then(|| "/opt/herdr".to_string())),
-            "/opt/herdr"
-        );
-        assert_eq!(
-            herdr_bin_from(|key| (key == "HERDR_BIN").then(|| "/opt/other".to_string())),
-            "herdr",
-            "upstream reads HERDR_BIN_PATH here and does NOT fall back to HERDR_BIN"
         );
     }
 }

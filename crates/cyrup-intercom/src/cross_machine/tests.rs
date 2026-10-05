@@ -1177,3 +1177,20 @@ async fn timeouts_and_command_failures_identify_the_machine_as_unreachable() {
         );
     }
 }
+
+/// `process.env.HERDR_BIN_PATH ?? "herdr"` (`v0.16.0 cross-machine-transport.ts:79`) — and a blank
+/// value is an env var that was unset badly, not a request to exec the empty string.
+#[test]
+fn the_herdr_binary_comes_from_herdr_bin_path_only() {
+    assert_eq!(herdr_bin_from(|_| None), "herdr");
+    assert_eq!(herdr_bin_from(|_| Some("  ".to_string())), "herdr");
+    assert_eq!(
+        herdr_bin_from(|key| (key == HERDR_BIN_PATH).then(|| "/opt/herdr".to_string())),
+        "/opt/herdr"
+    );
+    assert_eq!(
+        herdr_bin_from(|key| (key == "HERDR_BIN").then(|| "/opt/other".to_string())),
+        "herdr",
+        "upstream reads HERDR_BIN_PATH here and does NOT fall back to HERDR_BIN"
+    );
+}
