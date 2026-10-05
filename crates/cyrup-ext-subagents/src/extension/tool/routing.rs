@@ -31,6 +31,7 @@ use crate::extension::tool::task_items::{
     parse_tool_chain_items, parse_tool_task_items, render_parallel_tool_summary, tool_task_to_spec,
 };
 use crate::extension::tool::text::unknown_subagent_action_message;
+use crate::extension::tool::workflow_field::{self, ClassifiedWorkflowRequest, WorkflowSource};
 use crate::fork_context::{ContextMode, ContextRequest};
 use crate::spawn::chain_graph::{ParallelGroupSpec, RunnerStep, SingleStepSpec, StepResult};
 use crate::spawn::depth::resolve_effective_depth;
@@ -368,6 +369,157 @@ impl SubagentTool {
         }
     }
 
+    // ---------------------------------------------------------------------------------------
+    // SUBA-150 — the `workflow` field's resolution (the imperative shell)
+    // ---------------------------------------------------------------------------------------
+
+    /// Lower the request's `workflow` field onto the internal `workflowScript` carrier — pi's
+    /// resolution block (`subagent-executor.ts:7928-7958` @v0.75.0), run at the one public
+    /// boundary this crate has.
+    ///
+    /// The classification is [`WorkflowSource::parse`]'s (the functional core); this method is the
+    /// shell that performs the three reads it names — the reply block from the live session, a
+    /// script file from the request cwd, a named resource from the registry — and rewrites the
+    /// request map exactly as upstream rewrites `publicParams`: `workflow` is REMOVED and
+    /// `workflowScript` carries the resolved text, so every downstream surface (the mode gate in
+    /// `Tool::execute`, [`Self::route_workflow_mode`], the `validate` arm and `schedule.create`)
+    /// sees one carrier and needs no second classification.
+    ///
+    /// It runs BEFORE the typed parse, for the reason
+    /// [`SubagentToolParams`] cannot carry the field: `workflow` is a `true | string` union while
+    /// the typed struct's `workflow_script` is a `String`. Upstream has the same split for the
+    /// same reason, and keeps `workflowScript` as its internal carrier too.
+    ///
+    /// # Errors
+    ///
+    /// Upstream's verbatim refusals: the two parameters v0.74.0 removed
+    /// ([`workflow_field::removed_model_workflow_field_error`]), an invalid `workflow` value,
+    /// `workflow` combined with the internal carrier,
+    /// [`workflow_field::ARGS_REQUIRES_WORKFLOW`], and whichever of the three reads failed. The
+    /// two string forms carry upstream's [`workflow_field::SCRIPT_TEXT_HINT`]; the reply form does
+    /// not, because its own sentence already states the reply contract (`:7956`).
+    pub(crate) fn lower_workflow_field(
+        &self,
+        request: &mut serde_json::Value,
+        call_id: &ToolCallId,
+    ) -> Result<(), ToolError> {
+        let Some(map) = request.as_object_mut() else {
+            return Ok(());
+        };
+        // pi `:120-122` — `workflow` cannot be combined with the internal carrier. Checked ahead
+        // of the removed-parameter refusals so the more specific sentence wins for a caller that
+        // sent both.
+        if map.contains_key("workflow") && map.contains_key("workflowScript") {
+            return Err(ToolError::new(
+                workflow_field::WORKFLOW_WITH_INTERNAL_SCRIPT,
+            ));
+        }
+        if let Some(refusal) = workflow_field::removed_model_workflow_field_error(map) {
+            return Err(ToolError::new(refusal));
+        }
+        let classified = ClassifiedWorkflowRequest {
+            workflow: match map.remove("workflow") {
+                None => None,
+                Some(raw) => Some(WorkflowSource::parse(&raw).map_err(ToolError::new)?),
+            },
+        };
+        // pi `:117-119` — `args` is meaningless without a workflow, and saying so is the only way
+        // a caller learns the key it set was not simply ignored.
+        let Some(workflow) = classified.workflow else {
+            if map.contains_key("args") {
+                return Err(ToolError::new(workflow_field::ARGS_REQUIRES_WORKFLOW));
+            }
+            return Ok(());
+        };
+        let script = match workflow {
+            // pi `:7955` — `readReplyWorkflowScript(ctx.sessionManager, id)`, whose error is
+            // reported WITHOUT the script-text hint (`:7956`).
+            WorkflowSource::ReplyBlock => self
+                .read_reply_workflow_script(call_id)
+                .map_err(ToolError::new)?,
+            // pi `:7955` — `readWorkflowScriptFile(workflow, publicParams.cwd, ctx.cwd)`, hint
+            // appended.
+            WorkflowSource::ScriptFile(path) => {
+                let cwd =
+                    self.resolve_requested_cwd(map.get("cwd").and_then(serde_json::Value::as_str));
+                workflow_field::read_workflow_script_file(&path, &cwd).map_err(|error| {
+                    ToolError::new(format!("{error}{}", workflow_field::SCRIPT_TEXT_HINT))
+                })?
+            }
+            // pi `:7941-7945` — a named resource resolves through the registry, which CONSUMES
+            // `args`; upstream drops the key from the forwarded params (`:7943`) and so does this.
+            WorkflowSource::Resource(name) => {
+                let resolved = self.executor.workflow_resources().resolve(
+                    &serde_json::Value::String(name),
+                    map.get("args"),
+                    crate::identity::SessionId::parse_opt(
+                        self.executor.current_session_id().as_deref(),
+                    )
+                    .as_ref(),
+                );
+                match resolved {
+                    crate::workflows::WorkflowResourceResolution::Ok(resource) => {
+                        map.remove("args");
+                        resource.script
+                    }
+                    crate::workflows::WorkflowResourceResolution::Err(error) => {
+                        return Err(ToolError::new(format!(
+                            "{error}{}",
+                            workflow_field::SCRIPT_TEXT_HINT
+                        )));
+                    }
+                }
+            }
+        };
+        map.insert(
+            "workflowScript".to_string(),
+            serde_json::Value::String(script),
+        );
+        Ok(())
+    }
+
+    /// pi `readReplyWorkflowScript` (`extension/reply-workflow-script.ts:14-26` @v0.75.0) — the
+    /// session-reading half of `workflow: true`.
+    ///
+    /// The invariant that makes it work is upstream's own — *"Pi persists the whole assistant
+    /// message before running its tool calls"* — and it holds here for the same reason:
+    /// `cyrup-agent`'s turn loop emits `MessageEnd` for the streamed assistant message
+    /// (`agent/run/stream.rs:182`) before `execute_tool_calls` runs (`agent/run/turn.rs:82,110`),
+    /// and the session service's single subscriber persists a finalized message on `MessageEnd`
+    /// (`cyrup-session-svc/src/subscriber.rs:160-200`, *"User → assistant(toolCall) → toolResult →
+    /// assistant, in event order"*). By the time this tool call executes, the reply that issued it
+    /// is a durable entry on the branch.
+    ///
+    /// The branch is read through a THROWAWAY [`cyrup_session::SessionManager`] opened on the live
+    /// session's persisted path — the same way [`crate::fork_context`] reads it
+    /// ([`crate::extension::executor::SubagentExecutor`]'s `fork_resolver`), because this crate
+    /// never holds the orchestrator's live handle and a read-only reopen cannot mutate it.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::extension::reply_workflow_script::NOT_A_MODEL_TOOL_CALL_REFUSAL`] when there is no
+    /// session file or it cannot be opened — upstream's single fall-through for every caller that
+    /// is not a model tool call carrying the block (an RPC spawn, a CLI invocation, a headless
+    /// embedder). Otherwise [`workflow_field::script_from_branch`]'s refusal.
+    fn read_reply_workflow_script(&self, call_id: &ToolCallId) -> Result<String, String> {
+        let Some(path) = self
+            .executor
+            .host_services()
+            .and_then(|services| services.session_file())
+        else {
+            return Err(
+                crate::extension::reply_workflow_script::NOT_A_MODEL_TOOL_CALL_REFUSAL.to_string(),
+            );
+        };
+        let Ok(manager) = cyrup_session::SessionManager::open_with_cwd(&path, Some(&self.cwd))
+        else {
+            return Err(
+                crate::extension::reply_workflow_script::NOT_A_MODEL_TOOL_CALL_REFUSAL.to_string(),
+            );
+        };
+        workflow_field::script_from_branch(&manager.branch_path(None), call_id)
+    }
+
     /// SINGLE mode (`{agent, task?}`) — the fully-wired shape (func-SA §5.2). Resolves the persona
     /// through real discovery and drives [`crate::extension::SubagentExecutor::run_foreground`]/[`crate::extension::SubagentExecutor::spawn_background`]
     /// (`async: true`), each a genuine child OS process. `context` selects fork/fresh (an omitted
@@ -536,6 +688,11 @@ impl SubagentTool {
                     parent_workflow_run_id: None,
                     workflow_key: None,
                     workflow_steer: None,
+                    // SUBA-149 — the caller's `worktree` request, which this path used to read
+                    // nowhere at all: the flag was parsed, validated, and then silently dropped,
+                    // so an isolated single run ran in the SHARED cwd. `ForegroundRunRequest`
+                    // carries no default for this field, so this line is now mandatory.
+                    worktree: crate::spawn::worktree::WorktreeRequest::from_flag(p.worktree),
                 },
                 on_update,
             )
@@ -1868,11 +2025,39 @@ impl SubagentTool {
             // as the `guide` arm renders an unknown topic. Only an engine/instantiation failure is
             // a `ToolError`.
             "validate" => {
+                // SUBA-150 — pi's refusal names the `workflow` FORMS, not the carrier
+                // (`RAW_SCRIPT_FORMS`, `public-execution.ts:55`; `validate requires …`, `:216`).
+                // The boundary has already lowered `workflow` onto `workflow_script`, so this is
+                // the "no workflow input at all" case.
                 let Some(script) = p.workflow_script.as_deref() else {
-                    return Err(ToolError::new("action='validate' requires workflowScript."));
+                    return Err(ToolError::new(
+                        "validate requires workflow: true or a workflow script path.",
+                    ));
                 };
-                let report = crate::workflows::scripted::validate_workflow_script(script, false)
-                    .map_err(ToolError::new)?;
+                let mut report =
+                    crate::workflows::scripted::validate_workflow_script(script, false)
+                        .map_err(ToolError::new)?;
+                // SUBA-150 fold-in (b) / pi `cfb6f9a8` (#2611, v0.75.0) — `validateWorkflowRequest`
+                // (`subagent-executor.ts:5312-5317` @v0.75.0): `validate` runs the SAME args
+                // normalization a launch runs and reports its error BESIDE the script errors,
+                // rather than letting an oversized or overly wide `args` validate here and fail at
+                // launch, one limit at a time.
+                //
+                // `normalize_workflow_args` is that one normalizer — the same function the
+                // `schedule.create` target parse calls (`background/scheduled_runs/tool.rs`) and
+                // the same four `MAX_ARGS_*` constants the `args` schema description is formatted
+                // from. One implementation, so the advertised bound, the `validate` bound and the
+                // persisted-schedule bound are one value; a drift between them is unrepresentable.
+                if let Err(error) = crate::workflows::normalize_workflow_args(p.args.as_ref()) {
+                    report.ok = false;
+                    report
+                        .errors
+                        .push(crate::workflows::scripted::WorkflowScriptValidationError {
+                            message: error,
+                            line: None,
+                            column: None,
+                        });
+                }
                 Ok(ToolResult {
                     content: vec![cyrup_core::Content::text(render_validation_findings(
                         &report,
@@ -3126,3 +3311,11 @@ mod inspector_actions_dispatch_tests;
 #[cfg(test)]
 #[path = "children_list_tests.rs"]
 mod children_list_tests;
+
+/// SUBA-150/SUBA-151's end-to-end suite — the `workflow` field from the advertised schema through
+/// [`SubagentTool::lower_workflow_field`] to a run, plus what a `chain`/`tasks` caller gets. A
+/// `#[path]` sibling for the same reason as the suites above: every row drives `Tool::execute`
+/// against the boundary in this file, over a real on-disk session and the workflow engine.
+#[cfg(test)]
+#[path = "workflow_field_tests.rs"]
+mod workflow_field_tests;

@@ -24,7 +24,7 @@ use crate::extension::SubagentExecutor;
 use crate::extension::executor::paths::{default_async_root_in, default_results_dir_in};
 use crate::extension::testsupport::{
     FixedSessionHost, arm_scoped_missions, bare_single_step, dispatch_tool, tool_text,
-    write_completing_child_binary, write_failing_child_binary,
+    workflow_script_path, write_completing_child_binary, write_failing_child_binary,
 };
 use crate::spawn::chain_graph::RunnerStep;
 use std::path::Path;
@@ -165,9 +165,12 @@ async fn children_list_lists_a_settled_workflow_child_with_the_real_predicate() 
         "await runs.run(\"a\", {{ agent: \"worker\", task: \"T\", model: \"sonnet\", sessionDir: \
          {sessions_json}, share: true }});\nreturn \"done\";"
     );
-    let result = dispatch_tool(&tool, serde_json::json!({ "workflowScript": script_text }))
-        .await
-        .expect("a completing child must not fail the workflow");
+    let result = dispatch_tool(
+        &tool,
+        serde_json::json!({ "workflow": workflow_script_path(script_text)}),
+    )
+    .await
+    .expect("a completing child must not fail the workflow");
     let workflow_run_id = result.details.as_ref().expect("details")["workflowRunId"]
         .as_str()
         .expect("the settlement stamps the run id")
@@ -438,10 +441,8 @@ async fn children_list_prints_the_childs_own_state_under_a_completed_workflow() 
     let result = dispatch_tool(
         &tool,
         serde_json::json!({
-            "workflowScript":
-                "try { await runs.run(\"a\", { agent: \"worker\", task: \"T\", model: \
-                 \"sonnet\" }); } catch (e) {}\nreturn \"done\";"
-        }),
+            "workflow": workflow_script_path("try { await runs.run(\"a\", { agent: \"worker\", task: \"T\", model: \
+                 \"sonnet\" }); } catch (e) {}\nreturn \"done\";")}),
     )
     .await
     .expect("a caught child failure does not fail the workflow");

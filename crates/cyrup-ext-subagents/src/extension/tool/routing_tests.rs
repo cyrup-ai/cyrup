@@ -23,6 +23,7 @@ use crate::extension::testsupport::scoped_missions;
 use crate::extension::testsupport::scoped_tool;
 use crate::extension::testsupport::seed_running_run;
 use crate::extension::testsupport::tool_text;
+use crate::extension::testsupport::workflow_script_path;
 use crate::registration::SubagentExtensionConfig;
 use cyrup_core::Tool;
 use cyrup_core::ToolCallId;
@@ -1916,9 +1917,12 @@ async fn workflow_mode_registers_and_settles_its_controller_around_a_successful_
         "precondition: nothing registered before the call"
     );
 
-    let result = dispatch_tool(&tool, serde_json::json!({ "workflowScript": "return 42;" }))
-        .await
-        .expect("a trivial childless workflow script must succeed");
+    let result = dispatch_tool(
+        &tool,
+        serde_json::json!({ "workflow": workflow_script_path("return 42;")}),
+    )
+    .await
+    .expect("a trivial childless workflow script must succeed");
 
     assert!(
         tool_text(&result).contains("Workflow completed with 0 child run(s). Return: 42"),
@@ -1944,7 +1948,7 @@ async fn workflow_mode_settles_its_controller_even_when_the_script_fails() {
 
     let err = dispatch_tool(
         &tool,
-        serde_json::json!({ "workflowScript": "throw new Error('boom');" }),
+        serde_json::json!({ "workflow": workflow_script_path("throw new Error('boom');")}),
     )
     .await
     .expect_err("a script that throws must fail the call");
@@ -1998,9 +2002,12 @@ async fn workflow_host_commands_land_in_the_receipt_once_each_and_terminal() {
         return { state: gate.state, ok: gate.ok, exitCode: gate.exitCode, failure };
     "#;
 
-    let result = dispatch_tool(&tool, serde_json::json!({ "workflowScript": script }))
-        .await
-        .expect("the host commands are caught, so the workflow itself must succeed");
+    let result = dispatch_tool(
+        &tool,
+        serde_json::json!({ "workflow": workflow_script_path(script)}),
+    )
+    .await
+    .expect("the host commands are caught, so the workflow itself must succeed");
 
     let text = tool_text(&result);
     assert!(
@@ -2072,9 +2079,12 @@ async fn a_workflow_that_dies_on_a_host_command_still_records_the_step() {
         return "unreachable";
     "#;
 
-    let error = dispatch_tool(&tool, serde_json::json!({ "workflowScript": script }))
-        .await
-        .expect_err("an uncaught host-command rejection must fail the workflow");
+    let error = dispatch_tool(
+        &tool,
+        serde_json::json!({ "workflow": workflow_script_path(script)}),
+    )
+    .await
+    .expect_err("an uncaught host-command rejection must fail the workflow");
     assert!(
         error.to_string().contains("Host command 'gate' failed"),
         "{error}"
@@ -2118,9 +2128,12 @@ async fn a_workflow_child_that_never_launched_is_named_from_its_label() {
         } catch (error) {}
         return "done";
     "#;
-    let result = dispatch_tool(&tool, serde_json::json!({ "workflowScript": script }))
-        .await
-        .expect("a caught child failure does not fail the workflow");
+    let result = dispatch_tool(
+        &tool,
+        serde_json::json!({ "workflow": workflow_script_path(script)}),
+    )
+    .await
+    .expect("a caught child failure does not fail the workflow");
     let workflow_run_id = result.details.as_ref().expect("details")["workflowRunId"]
         .as_str()
         .expect("the settlement stamps the run id")
@@ -2182,9 +2195,12 @@ async fn a_workflow_host_step_reaches_the_async_status_snapshot() {
         const gate = await runs.host("gate", { kind: "command", command: "exit 0", timeoutMs: 30000, role: "gate" });
         return gate.state;
     "#;
-    let result = dispatch_tool(&tool, serde_json::json!({ "workflowScript": script }))
-        .await
-        .expect("a passing host command must not fail the workflow");
+    let result = dispatch_tool(
+        &tool,
+        serde_json::json!({ "workflow": workflow_script_path(script)}),
+    )
+    .await
+    .expect("a passing host command must not fail the workflow");
     let workflow_run_id = result.details.as_ref().expect("details")["workflowRunId"]
         .as_str()
         .expect("the settlement stamps the run id")
@@ -2290,7 +2306,7 @@ async fn a_mission_bound_workflow_script_carries_state_across_two_calls() {
         &tool,
         serde_json::json!({
             "missionId": record.id,
-            "workflowScript": "await state.set(\"seen\", { n: 1 }); return await state.get(\"seen\");",
+            "workflow": workflow_script_path("await state.set(\"seen\", { n: 1 }); return await state.get(\"seen\");"),
         }),
     )
     .await
@@ -2305,10 +2321,9 @@ async fn a_mission_bound_workflow_script_carries_state_across_two_calls() {
         &tool,
         serde_json::json!({
             "missionId": record.id,
-            "workflowScript":
-                "const prior = await state.get(\"seen\"); \
+            "workflow": workflow_script_path("const prior = await state.get(\"seen\"); \
                  await state.set(\"seen\", { n: (prior ? prior.n : 0) + 1 }); \
-                 return await state.get(\"seen\");",
+                 return await state.get(\"seen\");"),
         }),
     )
     .await
@@ -2363,7 +2378,7 @@ async fn a_mission_bound_workflow_script_still_hits_the_256_kib_ceiling() {
         &tool,
         serde_json::json!({
             "missionId": record.id,
-            "workflowScript": "await state.set(\"big\", \"x\".repeat(300000)); return \"unreachable\";",
+            "workflow": workflow_script_path("await state.set(\"big\", \"x\".repeat(300000)); return \"unreachable\";"),
         }),
     )
     .await
@@ -2405,7 +2420,7 @@ async fn an_unbound_workflow_script_is_refused_by_the_analyzer_not_the_guest() {
     // create one from. Unbound stays unbound.
     let bare = dispatch_tool(
         &tool,
-        serde_json::json!({ "workflowScript": "return await state.get(\"seen\");" }),
+        serde_json::json!({ "workflow": workflow_script_path("return await state.get(\"seen\");")}),
     )
     .await
     .expect_err("a workflow with no mission may not use state");
@@ -2422,7 +2437,7 @@ async fn an_unbound_workflow_script_is_refused_by_the_analyzer_not_the_guest() {
         &tool,
         serde_json::json!({
             "mission": false,
-            "workflowScript": "return await state.get(\"seen\");",
+            "workflow": workflow_script_path("return await state.get(\"seen\");"),
         }),
     )
     .await
@@ -2462,9 +2477,8 @@ async fn the_analyzer_admits_state_exactly_when_the_run_has_a_mission() {
         &tool,
         serde_json::json!({
             "missionId": record.id,
-            "workflowScript":
-                "const missing = await state.get(\"seen\"); \
-                 return { missing: missing === undefined };",
+            "workflow": workflow_script_path("const missing = await state.get(\"seen\"); \
+                 return { missing: missing === undefined };"),
         }),
     )
     .await
@@ -2633,10 +2647,8 @@ async fn a_detached_workflow_child_reconciles_the_paused_workflow() {
     let error = dispatch_tool(
         &tool,
         serde_json::json!({
-            "workflowScript":
-                "await runs.run(\"a\", { agent: \"worker\", task: \"T\", model: \"sonnet\" });\n\
-                 return \"unreachable\";"
-        }),
+            "workflow": workflow_script_path("await runs.run(\"a\", { agent: \"worker\", task: \"T\", model: \"sonnet\" });\n\
+                 return \"unreachable\";")}),
     )
     .await
     .expect_err("a detached-child rejection must fail the workflow");

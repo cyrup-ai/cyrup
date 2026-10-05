@@ -301,28 +301,37 @@ fn text_result(
     }
 }
 
-/// pi `targetLabel` (`scheduled-runs.ts:431-434`).
+/// pi `targetLabel` (`scheduled-runs.ts:443-447` @v0.75.0).
+///
+/// SUBA-150 — upstream renamed both labels off the removed parameter: a schedule's target is a
+/// WORKFLOW, however its script was supplied, and a status row that says `workflowScript` names a
+/// parameter the caller can no longer pass.
 fn target_label(target: &ScheduleTarget) -> String {
     match crate::workflows::scripted::preview_simple_workflow_run(Some(&target.workflow_script))
         .and_then(|preview| preview.agent)
     {
-        Some(agent) => format!("workflowScript -> agent {agent}"),
-        None => "workflowScript (dynamic)".to_string(),
+        Some(agent) => format!("workflow -> agent {agent}"),
+        None => "workflow (dynamic)".to_string(),
     }
 }
 
-/// pi `sanitizeTarget` (`scheduled-runs.ts:436-451`) — the schedule target is `workflowScript`,
-/// and ONLY `workflowScript`.
+/// pi `sanitizeTarget` (`scheduled-runs.ts:448-467` @v0.75.0) — the schedule target is a workflow
+/// script, and ONLY a workflow script.
+///
+/// SUBA-150 — all three refusals are upstream's v0.75.0 wording, which names the two `workflow`
+/// FORMS a caller can actually pass (`workflow: true` or a script path) instead of the
+/// `workflowScript` parameter v0.74.0 deleted. A re-prompt naming a removed parameter is worse
+/// than none: the model retries the exact call that was just refused.
 fn sanitize_target(params: &ScheduledRunActionParams) -> Result<ScheduleTarget, String> {
     if params.tasks.is_some() || params.chain.is_some() {
         return Err(
-            "Recurring schedules require workflowScript; legacy tasks and chain inputs are unsupported."
+            "Recurring schedules require a workflow script; legacy tasks and chain inputs are unsupported."
                 .to_string(),
         );
     }
     if params.agent.is_some() || params.task.is_some() {
         return Err(
-            "schedule.create requires workflowScript. Use workflowScript: \"return runs.run('main', { agent, task })\"."
+            "schedule.create requires workflow: true or a workflow script path, e.g. a ```js workflow block containing return runs.run('main', { agent, task })."
                 .to_string(),
         );
     }
@@ -332,7 +341,9 @@ fn sanitize_target(params: &ScheduledRunActionParams) -> Result<ScheduleTarget, 
         .map(str::trim)
         .filter(|script| !script.is_empty())
     else {
-        return Err("schedule.create requires a non-empty workflowScript.".to_string());
+        return Err(
+            "schedule.create requires workflow: true or a workflow script path.".to_string(),
+        );
     };
     if params.context.as_deref() == Some("fork") {
         return Err("Scheduled runs require fresh context.".to_string());
