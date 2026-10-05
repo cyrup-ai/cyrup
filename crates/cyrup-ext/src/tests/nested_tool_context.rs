@@ -167,11 +167,13 @@ impl Tool for CallerTool {
         _cancel: CancelToken,
         _on_update: ToolUpdateSink,
     ) -> Result<ToolResult, ToolError> {
-        let ctx = ExtensionToolContext::current()
-            .ok_or_else(|| ToolError::new("no tool context is bound"))?;
+        // Hold until both calls are inside `execute`, THEN read the context: a binding that outlived
+        // its call, or that one call could overwrite for another, is read here.
         if let Some(barrier) = &self.barrier {
             barrier.wait().await;
         }
+        let ctx = ExtensionToolContext::current()
+            .ok_or_else(|| ToolError::new("no tool context is bound"))?;
         let outcome = ctx
             .execute_tool(
                 "read",
@@ -917,7 +919,8 @@ mod wasm {
         /// the way the session's hooks do.
         struct DispatchingRunner {
             host: std::sync::OnceLock<Arc<ExtensionHost>>,
-            reached_other: Arc<Mutex<bool>>,
+            /// Whether the dispatch passed, and how long it took.
+            dispatched: Arc<Mutex<Option<(bool, Duration)>>>,
         }
         #[async_trait::async_trait]
         impl NestedToolRunner for DispatchingRunner {
@@ -929,14 +932,19 @@ mod wasm {
                 _options: NestedToolCallOptions,
             ) -> ToolCallOutcome {
                 let host = self.host.get().unwrap();
-                host.dispatcher()
+                let started = std::time::Instant::now();
+                let reduced = host
+                    .dispatcher()
                     .dispatch_block_mutate_nested(
                         tool_call_event(&format!("{caller}/1")),
                         caller,
                         &CancelToken::new(),
                     )
                     .await;
-                *self.reached_other.lock().unwrap() = true;
+                *self.dispatched.lock().unwrap() = Some((
+                    matches!(reduced, crate::Reduced::Pass(_)),
+                    started.elapsed(),
+                ));
                 StubRunner::outcome(caller, 1, name, "dispatched", false)
             }
             fn callable_tools(&self) -> Vec<Arc<dyn Tool>> {
@@ -1002,10 +1010,10 @@ mod wasm {
         }
         .build();
 
-        let reached = Arc::new(Mutex::new(false));
+        let dispatched = Arc::new(Mutex::new(None));
         let runner = Arc::new(DispatchingRunner {
             host: std::sync::OnceLock::new(),
-            reached_other: Arc::clone(&reached),
+            dispatched: Arc::clone(&dispatched),
         });
         let host = Arc::new(ExtensionHost::with_wasm(cfg()).unwrap());
         host.set_active_tool_source(Arc::new(NoAgent));
@@ -1044,9 +1052,17 @@ mod wasm {
         .expect("the nested dispatch does not wait on the instance its caller holds")
         .unwrap();
 
+        let (passed, took) = dispatched
+            .lock()
+            .unwrap()
+            .expect("the nested call ran to completion");
         assert!(
-            *reached.lock().unwrap(),
-            "the nested call ran to completion"
+            passed,
+            "the dispatch was blocked: the calling instance was waited on, not skipped"
+        );
+        assert!(
+            took < Duration::from_secs(2),
+            "the dispatch waited {took:?} on the instance its caller holds"
         );
         assert_eq!(
             *watched.lock().unwrap(),

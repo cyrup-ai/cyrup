@@ -333,5 +333,8 @@ async fn a_guest_tools_on_update_receives_the_nested_tools_partial_results() {
     loaded.session.wait_for_idle().await;
 
     let text = text_of(&probe_result(&loaded.session).await);
-    assert!(text.contains("error=false partials=1 :: streamed"), "{text}");
+    assert!(
+        text.contains("error=false partials=1 :: streamed"),
+        "{text}"
+    );
 }
