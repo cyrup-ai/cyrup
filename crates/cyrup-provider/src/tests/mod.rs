@@ -11,6 +11,7 @@
 //! that file's module doc comment for the full account.
 
 mod anthropic_sensitive_stop;
+mod available_of_type;
 mod api_key_login;
 mod builtin_oauth;
 mod catalog_data;

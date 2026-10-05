@@ -228,6 +228,21 @@ pub trait Provider: Send + Sync {
         models.to_vec()
     }
 
+    /// Optional credential-specific availability policy across every model type (Pi
+    /// `Provider.filterAllModels?`, `models.ts:196-199` @v1.0.1: "Without it,
+    /// `Models.getAllAvailable()` applies `filterModels` to chat models and keeps every other
+    /// model"). `None` is the member being absent; `Some` replaces the default policy outright, as
+    /// `if (provider.filterAllModels) return provider.filterAllModels(models, credential)` does
+    /// (`models.ts:724`). Applied by [`crate::collection::Models::get_all_available`] after auth is
+    /// confirmed.
+    fn filter_all_models(
+        &self,
+        _models: &[AnyModel],
+        _credential: Option<&Credential>,
+    ) -> Option<Vec<AnyModel>> {
+        None
+    }
+
     /// The provider's auth strategy (Pi `Provider.auth`). Exposed so a [`crate::collection::Models`]
     /// can resolve request auth against the collection's own credential store + auth context
     /// (Pi `models.ts:getAuth`/`applyAuth`). Default `None` for providers that fully encapsulate
