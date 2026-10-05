@@ -27,6 +27,7 @@ members = [
     "crates/cyrup-mcp",
     "crates/cyrup-acp",
     "crates/cyrup-llama",
+    "crates/cyrup-codemode",
     "crates/cyrup-it",
     # PICO5-PLAN S1: the durability kernel's identity and value newtypes, and (from S3) the
     # storage contract. A plain library -- no C, no build script -- so it is in default-members
@@ -120,6 +121,7 @@ default-members = [
     "crates/cyrup-mcp",
     "crates/cyrup-acp",
     "crates/cyrup-llama",
+    "crates/cyrup-codemode",
     "crates/cyrup-pico-store",
     "crates/cyrup-pico-doc",
     "crates/cyrup-pico-store-jsonl",
@@ -187,6 +189,9 @@ cyrup-flux         = { path = "crates/cyrup-flux",         version = "0.0.0" }
 cyrup-mcp          = { path = "crates/cyrup-mcp",          version = "0.0.0" }
 cyrup-acp          = { path = "crates/cyrup-acp",          version = "0.0.0" }
 cyrup-llama        = { path = "crates/cyrup-llama",        version = "0.0.0" }
+# pi 1.0 `codemode`, engine-independent half: the script source format, the TypeScript declaration
+# renderer, the BM25 tool ranker and the output budget (gap-analysis 18, CODE-003/004/010/012).
+cyrup-codemode     = { path = "crates/cyrup-codemode",     version = "0.0.0" }
 # The Pico5 durability kernel's storage layer (ADR-0030 §8). NOTE for every future consumer: this
 # crate exports `EntryId` as `Id<Entry>`, a minted number, while `cyrup_core::EntryId` is an
 # `Arc<str>` session token. Importing both unqualified is E0252; alias at the import rather than
@@ -250,7 +255,15 @@ serde        = { version = "1",   features = ["derive", "rc"] }
 #
 # `preserve_order_is_declared_workspace_wide` in `crates/cyrup-core/src/tests/` pins this so a
 # future dependency change cannot revert it silently. This is `ACP-Q1`, decided: accept, and own it.
-serde_json   = { version = "1", features = ["preserve_order"] }
+#
+# `float_roundtrip` is declared HERE for the same reason: without it `serde_json` parses a float with
+# a fast path that is allowed to land one ulp off the nearest double, where `JSON.parse` is always
+# correctly rounded. `cyrup-codemode` prints a schema's `const`/`enum` numbers with
+# `Number.prototype.toString` and must produce upstream's digits for the same JSON text
+# (`123456789012345680000` parses to a different double without it and prints as
+# `123456789012345670000`). It only makes parsing more exact, so no existing reader can observe a
+# regression; it costs parse speed on float-heavy input.
+serde_json   = { version = "1", features = ["preserve_order", "float_roundtrip"] }
 
 # Insertion-ordered map. arch-00 §7.1 listed it as "added when first used"; PICO5-PLAN S2 is the
 # first use. `DocMap = IndexMap<Arc<str>, DocValue>` is the persisted document object, and the

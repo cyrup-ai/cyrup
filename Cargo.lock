@@ -1499,6 +1499,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "cyrup-codemode"
+version = "0.0.0"
+dependencies = [
+ "cyrup-core",
+ "getrandom 0.3.4",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "cyrup-config"
 version = "0.0.0"
 dependencies = [

@@ -1,0 +1,33 @@
+[package]
+name = "cyrup-codemode"
+description = "pi codemode, engine-independent half: script source format, TypeScript declaration renderer, BM25 tool ranker, output budget (gap-analysis 18)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+# DELIBERATELY ABSENT: `deno_core` and every other JavaScript engine. Everything here is a total
+# function over explicit inputs (the one filesystem write sits behind `output::spill_output`), so the
+# sandbox crate can depend on this one without this one ever depending on an engine.
+[lints]
+workspace = true
+
+[dependencies]
+# `ToolNamespace`: the group a tool belongs to. The ranker folds a namespace's name, description and
+# instructions into a tool's search text (pi `createToolSearchDocument`), and `describe_namespace`
+# returns one -- reusing the exposure model's type rather than minting a parallel one.
+cyrup-core = { workspace = true }
+serde = { workspace = true }
+# Schemas are `serde_json::Value`. The workspace declares `preserve_order` (the declaration renderer
+# must reproduce V8's key order for `const`/`enum` objects) and `float_roundtrip` (a number must
+# parse to the double `JSON.parse` yields, or `Number.prototype.toString` prints other digits).
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+# 8 random bytes for the spill file name (`randomBytes(8)`, pi `execute.ts:263`). Same pin as
+# `cyrup-permission-system`; `std` makes its error a `std::error::Error`.
+getrandom = { version = "0.3", features = ["std"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }
