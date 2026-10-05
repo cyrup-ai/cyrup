@@ -338,6 +338,7 @@ pub fn default_convert_to_llm(msgs: &[Arc<AgentMessage>]) -> Vec<Message> {
                 usage: t.usage.clone(),
                 added_tool_names: t.added_tool_names.clone(),
                 timestamp: t.timestamp,
+                nested_calls: None,
             }),
             AgentMessage::Custom { .. } => None,
             // SESS-043 — a declaration-merged coding-agent role. pi's BASE `defaultConvertToLlm`
@@ -382,6 +383,40 @@ pub trait Hooks: Send + Sync {
     /// outcome, [`AfterOutcome::Failed`] included, is a per-call result (func-02 R-02-050).
     async fn after_tool_call(&self, _ctx: AfterToolCall<'_>, _cancel: CancelToken) -> AfterOutcome {
         AfterOutcome::Keep
+    }
+
+    /// [`Self::before_tool_call`] for a call another tool made while it ran (CODE-006), where
+    /// `parent` is the call that made it — pi's `parentToolCallId` on the `tool_call` event
+    /// (`core/extensions/types.ts:1155-1161` @v1.0.1), which the session threads through
+    /// `_beforeToolCall(context, parentToolCallId)` (`agent-session.ts:629-650`).
+    ///
+    /// Defaults to [`Self::before_tool_call`]: a hook that does not tell the two apart — a
+    /// permission gate — runs on the nested call exactly as it does on a model-issued one. That
+    /// default is what keeps "a permission hook cannot be routed around by a tool that calls a
+    /// tool" true of every `Hooks` implementation, including one written before nested calls
+    /// existed.
+    async fn before_nested_tool_call(
+        &self,
+        parent: &ToolCallId,
+        ctx: BeforeToolCall<'_>,
+        cancel: CancelToken,
+    ) -> BeforeOutcome {
+        let _ = parent;
+        self.before_tool_call(ctx, cancel).await
+    }
+
+    /// [`Self::after_tool_call`] for a call another tool made while it ran (CODE-006); see
+    /// [`Self::before_nested_tool_call`]. pi: `_afterToolCall(context, parentToolCallId)`,
+    /// `agent-session.ts:653-690`, and `parentToolCallId` on the `tool_result` event
+    /// (`core/extensions/types.ts:1231`).
+    async fn after_nested_tool_call(
+        &self,
+        parent: &ToolCallId,
+        ctx: AfterToolCall<'_>,
+        cancel: CancelToken,
+    ) -> AfterOutcome {
+        let _ = parent;
+        self.after_tool_call(ctx, cancel).await
     }
 
     /// After the tool batch and every tool-result `message_end`, immediately BEFORE `turn_end` (Pi

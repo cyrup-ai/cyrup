@@ -119,7 +119,15 @@ pub(crate) async fn after_hook(
         tool_call: call,
         context: env.context,
     };
-    env.hooks.after_tool_call(ctx, env.hook_cancel()).await
+    match env.parent {
+        // CODE-006 — see `prepare_tool_call`.
+        Some(parent) => {
+            env.hooks
+                .after_nested_tool_call(parent, ctx, env.hook_cancel())
+                .await
+        }
+        None => env.hooks.after_tool_call(ctx, env.hook_cancel()).await,
+    }
 }
 
 /// The pure fold: pi `finalizeExecutedToolCall`'s three-way table (`agent-loop.ts:724-750`) as a

@@ -339,6 +339,7 @@ fn gap14_15_listing_first_message_user_only_with_sentinel() {
         timestamp: 0,
         usage: None,
         added_tool_names: Vec::new(),
+        nested_calls: None,
     })
     .unwrap();
 

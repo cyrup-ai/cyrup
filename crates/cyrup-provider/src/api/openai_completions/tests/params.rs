@@ -96,6 +96,7 @@ fn request_body_matches_openai_shape() {
                 timestamp: 0,
                 usage: None,
                 added_tool_names: Vec::new(),
+                nested_calls: None,
             },
         ],
         tools: vec![ToolDef {

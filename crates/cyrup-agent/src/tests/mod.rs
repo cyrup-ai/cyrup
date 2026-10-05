@@ -20,6 +20,7 @@ mod agent_message_role_key;
 mod area02_backlog;
 mod hook_failure_text;
 mod model_boundary;
+mod nested_tool_calls;
 mod pending_containment;
 mod preflight_validation;
 mod prepared_call_abort;

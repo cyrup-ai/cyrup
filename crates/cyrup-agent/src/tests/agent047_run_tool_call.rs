@@ -233,6 +233,7 @@ async fn run(call: ToolCall, tools: &[Arc<dyn Tool>], hooks: &dyn Hooks) -> Tool
             hooks,
             cancel: None,
             on_update: None,
+            parent_tool_call_id: None,
         },
     )
     .await
@@ -337,6 +338,7 @@ async fn agent047_resolves_against_the_options_tools_not_the_contexts() {
             hooks: &hooks,
             cancel: None,
             on_update: None,
+            parent_tool_call_id: None,
         },
     )
     .await;
@@ -365,6 +367,7 @@ async fn agent047_resolves_against_the_options_tools_not_the_contexts() {
             hooks: &DefaultHooks,
             cancel: None,
             on_update: None,
+            parent_tool_call_id: None,
         },
     )
     .await;
@@ -428,6 +431,7 @@ async fn agent047_emits_no_event_and_appends_no_message() {
             hooks: hooks.as_ref(),
             cancel: None,
             on_update: None,
+            parent_tool_call_id: None,
         },
     )
     .await;
@@ -508,6 +512,7 @@ async fn agent047_the_callers_on_update_sink_receives_the_tools_partials() {
                     }
                 }
             })),
+            parent_tool_call_id: None,
         },
     )
     .await;

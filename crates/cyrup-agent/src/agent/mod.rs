@@ -28,6 +28,7 @@ mod builder;
 mod facade;
 mod lifecycle;
 mod message;
+mod nested;
 mod prompt;
 mod run;
 mod util;
@@ -35,6 +36,11 @@ mod util;
 pub use builder::AgentBuilder;
 pub use facade::Subscription;
 pub use lifecycle::RunHandle;
+/// CODE-006 — the calls a tool makes while it runs: the runner, its host seam and its events.
+pub use nested::{
+    NestedCallSummary, NestedToolCallHost, NestedToolCallOptions, NestedToolCallRunner,
+    NestedToolExecutionEvent,
+};
 pub use prompt::PromptInput;
 /// AGENT-047 — the programmatic single-call entry point (pi's exported `runToolCall`).
 pub use run::tools::single::{RunToolCallOptions, ToolCallOutcome, run_tool_call};

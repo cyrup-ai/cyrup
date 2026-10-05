@@ -11,7 +11,7 @@ use cyrup_agent::HookError;
 use cyrup_agent::{
     AfterOutcome, AfterOverride, AfterToolCall, AgentMessage, BeforeOutcome, BeforeToolCall, Hooks,
 };
-use cyrup_core::{CancelToken, TerminateHint};
+use cyrup_core::{CancelToken, TerminateHint, ToolCallId};
 use std::sync::Arc;
 
 /// The mutating hooks adapter handed to the agent (arch-08 §3.1). Shares the dispatcher with
@@ -35,12 +35,93 @@ impl Hooks for ExtHooks {
         ctx: BeforeToolCall<'_>,
         cancel: CancelToken,
     ) -> BeforeOutcome {
+        self.before(None, ctx, cancel).await
+    }
+
+    /// The same seam for a call another tool made (CODE-006): the `tool_call` event is the ordinary
+    /// one and is blocked, mutated and fail-closed exactly the same way; the parent id reaches a
+    /// native handler as [`crate::HostCtx::parent_tool_call_id`].
+    async fn before_nested_tool_call(
+        &self,
+        parent: &ToolCallId,
+        ctx: BeforeToolCall<'_>,
+        cancel: CancelToken,
+    ) -> BeforeOutcome {
+        self.before(Some(parent), ctx, cancel).await
+    }
+
+    /// Patch the tool result (R-08-011). Replace-not-merge: only fields a handler changed are
+    /// returned as `Some(_)` (func-02 R-02-025).
+    async fn after_tool_call(&self, ctx: AfterToolCall<'_>, cancel: CancelToken) -> AfterOutcome {
+        self.after(None, ctx, cancel).await
+    }
+
+    /// [`Self::after_tool_call`] for a call another tool made (CODE-006); see
+    /// [`Self::before_nested_tool_call`].
+    async fn after_nested_tool_call(
+        &self,
+        parent: &ToolCallId,
+        ctx: AfterToolCall<'_>,
+        cancel: CancelToken,
+    ) -> AfterOutcome {
+        self.after(Some(parent), ctx, cancel).await
+    }
+
+    /// Filter/replace the LLM context (R-08-028 subset). Runs before `convert_to_llm`.
+    ///
+    /// Two phases, as pi's `emitContext` (`core/extensions/runner.ts:1190-1253` @v0.87.1): every
+    /// `context` handler first, then every `context_with_system` handler over what that chain left,
+    /// its result used as returned (EXT-079). pi's `context` phase hides the system messages and
+    /// restores them after each handler; cyrup's transcript has no system messages (the prompt
+    /// travels beside it until AGENT-039), so that half holds by construction and both phases see
+    /// the same list.
+    async fn transform_context(
+        &self,
+        msgs: Vec<Arc<AgentMessage>>,
+        cancel: CancelToken,
+    ) -> Result<Vec<Arc<AgentMessage>>, HookError> {
+        // `msgs.clone()` is a POINTER clone now (PERF-002). It runs before the `no_subscribers`
+        // gate inside `dispatch_block_mutate`, so every turn paid a whole-transcript deep copy
+        // here even with no `context`-subscribing extension wired. Do not "fix" a type mismatch
+        // at this line by unwrapping the handles — that restores exactly that copy.
+        let ev = HostEvent::Context {
+            messages: msgs.clone(),
+        };
+        let msgs = match self.dispatcher.dispatch_block_mutate(ev, &cancel).await {
+            Reduced::Pass(ev) => match *ev {
+                HostEvent::Context { messages } => messages,
+                _ => msgs,
+            },
+            _ => msgs,
+        };
+        let ev = HostEvent::ContextWithSystem {
+            messages: msgs.clone(),
+        };
+        match self.dispatcher.dispatch_block_mutate(ev, &cancel).await {
+            Reduced::Pass(ev) => match *ev {
+                HostEvent::ContextWithSystem { messages } => Ok(messages),
+                _ => Ok(msgs),
+            },
+            _ => Ok(msgs),
+        }
+    }
+}
+
+impl ExtHooks {
+    /// `before_tool_call` / `before_nested_tool_call`: one body, so a nested call cannot drift from
+    /// a model-issued one. `parent` is the call that made this one, when a tool did.
+    async fn before(
+        &self,
+        parent: Option<&ToolCallId>,
+        ctx: BeforeToolCall<'_>,
+        cancel: CancelToken,
+    ) -> BeforeOutcome {
         let ev = HostEvent::ToolCall {
             call_id: ctx.tool_call_id.clone(),
             name: ctx.tool_name.to_string(),
             input: ctx.args.clone(),
         };
-        match self.dispatcher.dispatch_block_mutate(ev, &cancel).await {
+        match self.dispatch(ev, parent, &cancel).await {
             // EXT-029. `cancel` is a FRESH child of the run token, minted at the call site and
             // handed to nobody else (`self.cancel.child()`, cyrup-agent/src/agent.rs:1009), so it
             // can only be cancelled by the run root — a cancelled token here means the USER
@@ -67,9 +148,13 @@ impl Hooks for ExtHooks {
         }
     }
 
-    /// Patch the tool result (R-08-011). Replace-not-merge: only fields a handler changed are
-    /// returned as `Some(_)` (func-02 R-02-025).
-    async fn after_tool_call(&self, ctx: AfterToolCall<'_>, cancel: CancelToken) -> AfterOutcome {
+    /// `after_tool_call` / `after_nested_tool_call`; see [`Self::before`].
+    async fn after(
+        &self,
+        parent: Option<&ToolCallId>,
+        ctx: AfterToolCall<'_>,
+        cancel: CancelToken,
+    ) -> AfterOutcome {
         let orig_content = ctx.content.to_vec();
         let orig_is_error = ctx.is_error;
         let orig_details = ctx.details.cloned();
@@ -90,7 +175,7 @@ impl Hooks for ExtHooks {
             usage: orig_usage.clone(),
             terminate: orig_terminate,
         };
-        match self.dispatcher.dispatch_block_mutate(ev, &cancel).await {
+        match self.dispatch(ev, parent, &cancel).await {
             Reduced::Pass(ev) => {
                 let HostEvent::ToolResult {
                     content,
@@ -142,42 +227,20 @@ impl Hooks for ExtHooks {
         }
     }
 
-    /// Filter/replace the LLM context (R-08-028 subset). Runs before `convert_to_llm`.
-    ///
-    /// Two phases, as pi's `emitContext` (`core/extensions/runner.ts:1190-1253` @v0.87.1): every
-    /// `context` handler first, then every `context_with_system` handler over what that chain left,
-    /// its result used as returned (EXT-079). pi's `context` phase hides the system messages and
-    /// restores them after each handler; cyrup's transcript has no system messages (the prompt
-    /// travels beside it until AGENT-039), so that half holds by construction and both phases see
-    /// the same list.
-    async fn transform_context(
+    /// The block/mutate chain for a loop event or a nested call's.
+    async fn dispatch(
         &self,
-        msgs: Vec<Arc<AgentMessage>>,
-        cancel: CancelToken,
-    ) -> Result<Vec<Arc<AgentMessage>>, HookError> {
-        // `msgs.clone()` is a POINTER clone now (PERF-002). It runs before the `no_subscribers`
-        // gate inside `dispatch_block_mutate`, so every turn paid a whole-transcript deep copy
-        // here even with no `context`-subscribing extension wired. Do not "fix" a type mismatch
-        // at this line by unwrapping the handles — that restores exactly that copy.
-        let ev = HostEvent::Context {
-            messages: msgs.clone(),
-        };
-        let msgs = match self.dispatcher.dispatch_block_mutate(ev, &cancel).await {
-            Reduced::Pass(ev) => match *ev {
-                HostEvent::Context { messages } => messages,
-                _ => msgs,
-            },
-            _ => msgs,
-        };
-        let ev = HostEvent::ContextWithSystem {
-            messages: msgs.clone(),
-        };
-        match self.dispatcher.dispatch_block_mutate(ev, &cancel).await {
-            Reduced::Pass(ev) => match *ev {
-                HostEvent::ContextWithSystem { messages } => Ok(messages),
-                _ => Ok(msgs),
-            },
-            _ => Ok(msgs),
+        ev: HostEvent,
+        parent: Option<&ToolCallId>,
+        cancel: &CancelToken,
+    ) -> Reduced {
+        match parent {
+            Some(parent) => {
+                self.dispatcher
+                    .dispatch_block_mutate_nested(ev, parent, cancel)
+                    .await
+            }
+            None => self.dispatcher.dispatch_block_mutate(ev, cancel).await,
         }
     }
 }

@@ -28,6 +28,7 @@ fn tool_result(usage: Option<Usage>, added: &[&str]) -> Message {
         usage,
         added_tool_names: added.iter().map(|s| (*s).to_string()).collect(),
         timestamp: 7,
+        nested_calls: None,
     }
 }
 

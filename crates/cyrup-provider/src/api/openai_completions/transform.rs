@@ -119,6 +119,7 @@ fn downgrade_unsupported_images(messages: &[Message], model: &Model) -> Vec<Mess
                 usage,
                 added_tool_names,
                 timestamp,
+                nested_calls,
             } => Message::ToolResult {
                 tool_call_id: tool_call_id.clone(),
                 tool_name: tool_name.clone(),
@@ -135,6 +136,7 @@ fn downgrade_unsupported_images(messages: &[Message], model: &Model) -> Vec<Mess
                 usage: usage.clone(),
                 added_tool_names: added_tool_names.clone(),
                 timestamp: *timestamp,
+                nested_calls: nested_calls.clone(),
             },
             other => other.clone(),
         })
@@ -171,6 +173,7 @@ fn close_pending_tool_calls(
                 timestamp: now_millis(),
                 usage: None,
                 added_tool_names: Vec::new(),
+                nested_calls: None,
             });
         }
     }
@@ -226,6 +229,7 @@ pub(crate) fn transform_messages_with_source(
                 usage,
                 added_tool_names,
                 timestamp,
+                nested_calls,
             } => {
                 if let Some(norm) = tool_call_id_map.get(tool_call_id.as_str()).cloned()
                     && norm != tool_call_id.as_str()
@@ -241,6 +245,7 @@ pub(crate) fn transform_messages_with_source(
                         usage: usage.clone(),
                         added_tool_names: added_tool_names.clone(),
                         timestamp: *timestamp,
+                        nested_calls: nested_calls.clone(),
                     };
                 }
                 msg.clone()

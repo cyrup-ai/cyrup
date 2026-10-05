@@ -161,6 +161,12 @@ pub fn is_upstream_wire_event(event: &AgentSessionEvent) -> bool {
         | AgentSessionEvent::ToolExecutionStart { .. }
         | AgentSessionEvent::ToolExecutionUpdate { .. }
         | AgentSessionEvent::ToolExecutionEnd { .. }
+        // CODE-006 — the same three event types with `parentToolCallId`: pi types them as
+        // `WithParentToolCallId<ToolExecution…Event>` members of this union
+        // (`agent-session.ts:182-190` @v1.0.1) and writes them to the stream like any other.
+        | AgentSessionEvent::NestedToolExecutionStart { .. }
+        | AgentSessionEvent::NestedToolExecutionUpdate { .. }
+        | AgentSessionEvent::NestedToolExecutionEnd { .. }
         | AgentSessionEvent::TurnEnd { .. }
         | AgentSessionEvent::AgentEnd { .. }
         | AgentSessionEvent::AgentSettled

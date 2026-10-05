@@ -13,7 +13,7 @@ use super::preflight::prepare_tool_call;
 use super::{Prep, PreparedCall, ToolCallEnv};
 use crate::event::AgentMessage;
 use crate::hooks::{AgentContextView, Hooks};
-use cyrup_core::{AssistantMessage, CancelToken, Tool, ToolCall, ToolUpdateSink};
+use cyrup_core::{AssistantMessage, CancelToken, Tool, ToolCall, ToolCallId, ToolUpdateSink};
 use std::sync::Arc;
 
 pub use super::finalized::ToolCallOutcome;
@@ -41,6 +41,14 @@ pub struct RunToolCallOptions<'a> {
     /// {})` (`:816`) — the updates are dropped on the floor, because emitting them is the batch
     /// runtime's job and this path emits nothing.
     pub on_update: Option<ToolUpdateSink>,
+    /// The tool call that made this call, when a tool is calling a tool (CODE-006). Pi has no such
+    /// field on `RunToolCallOptions`: its session passes hooks that close over the parent id
+    /// (`beforeToolCall: (context) => this._beforeToolCall(context, parentId)`,
+    /// `agent-session.ts:719-733` @v1.0.1). cyrup bundles its hooks behind one trait object, so the
+    /// parent travels beside it and selects the hooks' nested entry points
+    /// ([`Hooks::before_nested_tool_call`], [`Hooks::after_nested_tool_call`]) instead.
+    /// `None` runs the ordinary entry points.
+    pub parent_tool_call_id: Option<&'a ToolCallId>,
 }
 
 /// Run one tool call through the same steps as a model-issued call: argument preparation, schema
@@ -73,6 +81,7 @@ pub async fn run_tool_call(call: ToolCall, options: RunToolCallOptions<'_>) -> T
         hooks,
         cancel,
         on_update,
+        parent_tool_call_id,
     } = options;
     // pi has no `newMessages` on the `beforeToolCall` context; cyrup's field is a backward-compat
     // extra documented on `BeforeToolCall::messages`, and a programmatic call produced none.
@@ -84,6 +93,7 @@ pub async fn run_tool_call(call: ToolCall, options: RunToolCallOptions<'_>) -> T
         context,
         new_messages: NO_NEW_MESSAGES,
         assistant: assistant_message,
+        parent: parent_tool_call_id,
     };
 
     // pi: `if (preparation.kind === "immediate") return { toolCall, result, isError }`

@@ -241,6 +241,7 @@ fn copilot_uses_bearer_and_dynamic_headers_not_x_api_key() {
         usage: None,
         added_tool_names: Vec::new(),
         timestamp: 0,
+        nested_calls: None,
     });
     let headers = build_headers(&m, &agent_ctx, &auth, &StreamOptions::default(), false);
     assert_eq!(

@@ -4,6 +4,7 @@
 mod area03_repairs;
 mod branch_provenance_and_export;
 mod compaction;
+mod compaction_nested_calls;
 mod deferred_context;
 mod durable_rewrite;
 mod estimator_prefix_timestamp_parity;

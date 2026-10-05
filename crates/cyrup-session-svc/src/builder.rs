@@ -1982,6 +1982,9 @@ impl SessionBuilder {
             block_images,
             handle.clone(),
         ));
+        // The same hooks the agent runs with, for the calls tools make while they run (CODE-006).
+        let nested_hooks: Arc<dyn cyrup_agent::Hooks> = policy_hooks.clone();
+        let nested_calls = Arc::new(cyrup_agent::NestedToolCallRunner::new());
         let eff = settings.effective();
         // Provider attribution + opencode session headers (Pi sdk.ts:323-330, #20). Telemetry is the
         // env override (`CYRUP_TELEMETRY`) else the `enableInstallTelemetry` setting.
@@ -2291,6 +2294,7 @@ impl SessionBuilder {
             handle.clone(),
             ext_host.clone(),
             session_cancel.clone(),
+            nested_calls.clone(),
         )));
         let agent = Arc::new(agent);
 
@@ -2326,6 +2330,8 @@ impl SessionBuilder {
             handle,
             bash_session_env,
             read_model_vision,
+            nested_calls,
+            hooks: nested_hooks,
         };
 
         let services = AgentSessionServices {

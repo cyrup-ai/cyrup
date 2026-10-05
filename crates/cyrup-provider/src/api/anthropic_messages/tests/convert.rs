@@ -18,6 +18,7 @@ fn tool_results_collapse_into_one_user_message() {
                 timestamp: 0,
                 usage: None,
                 added_tool_names: Vec::new(),
+                nested_calls: None,
             },
             Message::ToolResult {
                 tool_call_id: ToolCallId::from("toolu_2"),
@@ -28,6 +29,7 @@ fn tool_results_collapse_into_one_user_message() {
                 timestamp: 0,
                 usage: None,
                 added_tool_names: Vec::new(),
+                nested_calls: None,
             },
         ],
         tools: Vec::new(),

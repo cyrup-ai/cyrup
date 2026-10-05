@@ -120,6 +120,7 @@ fn blank_tool_result_content_becomes_the_empty_placeholder() {
                 usage: None,
                 added_tool_names: Vec::new(),
                 timestamp: 0,
+                nested_calls: None,
             },
         ],
         tools: Vec::new(),
@@ -186,6 +187,7 @@ fn consecutive_tool_results_collapse_into_one_user_message() {
             usage: None,
             added_tool_names: Vec::new(),
             timestamp: 0,
+            nested_calls: None,
         });
     }
     let ctx = Context {

@@ -212,13 +212,20 @@ impl DynamicToolState {
     /// every registered `codemode` or `deferred` one (pi `getCallableToolNames` /
     /// `_getCallableTools`, `agent-session.ts:1457-1520` @v1.0.1).
     pub(crate) fn callable_names(&self) -> Vec<String> {
+        self.callable_tools()
+            .iter()
+            .map(|t| t.name().to_string())
+            .collect()
+    }
+
+    /// The tools themselves — what a nested call resolves against (pi `_getCallableTools`,
+    /// `agent-session.ts:1515-1520` @v1.0.1, which [`Self::callable_names`] names). Never the
+    /// declared set: a tool that is hidden, `model-only`, or an inactive `direct` one is not here.
+    pub(crate) fn callable_tools(&self) -> Vec<Arc<dyn Tool>> {
         let active_names: BTreeSet<String> = self.active_names().into_iter().collect();
         let active: BTreeSet<&str> = active_names.iter().map(String::as_str).collect();
         let registry: Vec<Arc<dyn Tool>> = self.registry.values().cloned().collect();
         cyrup_core::callable_tools(&registry, &active)
-            .iter()
-            .map(|t| t.name().to_string())
-            .collect()
     }
 
     /// The base system-prompt options bag for the CURRENT active set (EXT-061) — pi

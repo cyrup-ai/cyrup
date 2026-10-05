@@ -88,7 +88,16 @@ pub(crate) async fn prepare_tool_call(
             tool_call: call,
             context: env.context,
         };
-        env.hooks.before_tool_call(ctx, env.hook_cancel()).await
+        match env.parent {
+            // CODE-006 — a call another tool made reaches the hooks through the entry point that
+            // names its parent; a model-issued one through the ordinary one.
+            Some(parent) => {
+                env.hooks
+                    .before_nested_tool_call(parent, ctx, env.hook_cancel())
+                    .await
+            }
+            None => env.hooks.before_tool_call(ctx, env.hook_cancel()).await,
+        }
     };
     match before {
         // Pi's `prepareToolCall` wraps the `beforeToolCall` await in the same try that guards

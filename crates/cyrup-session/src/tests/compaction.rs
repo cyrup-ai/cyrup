@@ -114,6 +114,7 @@ fn tool_result(name: &str, path: &str, body: &str) -> Message {
         timestamp: 0,
         usage: None,
         added_tool_names: Vec::new(),
+        nested_calls: None,
     }
 }
 

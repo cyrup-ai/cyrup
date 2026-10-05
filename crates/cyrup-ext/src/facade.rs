@@ -1142,6 +1142,22 @@ impl ExtensionHost {
         }
     }
 
+    /// Deliver a `tool_execution_*` event of a call another tool made to the extensions that
+    /// subscribe to it (CODE-006; pi `this._extensionRunner.emit(event)` with `parentToolCallId`
+    /// set, `agent-session.ts:719-733` @v1.0.1). Notify-only, subscription-gated and fault-contained
+    /// like every other `tool_execution_*` dispatch; a native handler reads the parent from
+    /// [`crate::HostCtx::parent_tool_call_id`].
+    pub async fn emit_nested_tool_execution(
+        &self,
+        event: &cyrup_agent::NestedToolExecutionEvent,
+        cancel: &CancelToken,
+    ) {
+        let (ev, parent) = HostEvent::from_nested_tool_execution(event);
+        self.dispatcher
+            .dispatch_notify_nested(&ev, &parent, cancel)
+            .await;
+    }
+
     /// Dispatch `message_end` (Pi `ExtensionRunner.emitMessageEnd`, runner.ts:770-810; gap-08 #3). A
     /// handler may return a same-role replacement message (a mismatched role is rejected — the
     /// original is kept — inside `apply_patch`, never a panic). Returns `Some(replacement)` iff a

@@ -630,7 +630,10 @@ fn adjust_brightness_saturates_at_both_ends() {
 /// `setToolOutputsExpanded` as idempotent setters that also write `aria-pressed`, the two
 /// `navigateTo` reapply calls, the two header buttons' `aria-pressed` attributes and the
 /// `.header-toggle-btn[aria-pressed="true"]` rule — and each of those regions IS byte-identical
-/// to v1.0.0 (verified by region diff when the row landed). What is still missing is `SESS-069`'s
+/// to v1.0.0 (verified by region diff when the row landed). CODE-006 added v1.0.1's
+/// `renderNestedCalls` helper and its call in `renderToolCall` to `template.js`, the one region of
+/// the v1.0.1 file that renders the `nestedCalls` record of a tool result; it too is byte-identical
+/// to v1.0.1 (the same region diff). What is still missing is `SESS-069`'s
 /// hidden-message half: `setHiddenMessagesVisible`, the third header button, the `H` key, the
 /// `hook-message-hidden` rendering and `navigateTo`'s auto-reveal. So these two files sit between
 /// v0.84.4 and v1.0.0 on purpose, and the pin below is a drift detector, not a claim of identity
@@ -651,10 +654,12 @@ fn embedded_assets_match_their_pinned_upstream_bytes() {
             "4ed5d504acc41d368a87133096c9c1a7475837e68f0d24ecf2fef9457331dfa2",
         ),
         (
-            // v0.84.4 + SESS-068's v1.0.0 toggle-setter refactor; awaiting SESS-069. See above.
+            // v0.84.4 + SESS-068's v1.0.0 toggle-setter refactor + CODE-006's v1.0.1
+            // `renderNestedCalls` (the `nestedCalls` rendering, `template.js:933-947` and its one
+            // call, `:1081`); awaiting SESS-069. See above.
             "template.js",
             include_str!("../export/assets/template.js"),
-            "8dd207c6d426031f52d0b2a4307a3ca752cc26cfe01e5f8f9e02921843d5200b",
+            "7cebf881657d93846ccc5613e5b1d682a78ff6149553cd26629ab2b325735df8",
         ),
         (
             "vendor/marked.min.js",
@@ -811,5 +816,68 @@ fn sess068_the_keyboard_shortcuts_route_through_the_setters() {
     assert!(
         !html.contains("toggleThinking()") && !html.contains("toggleToolOutputs()"),
         "no call site may still reach an argument-less toggler"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// CODE-006 — a tool result's `nestedCalls` record is rendered
+// ---------------------------------------------------------------------------------------------
+
+/// A transcript whose `codemode` result carries pi's persisted `nestedCalls` record: one call that
+/// succeeded, one that failed with a multi-line error, one whose arguments were omitted for size.
+const NESTED_FIXTURE: &str = concat!(
+    r#"{"type":"session","version":3,"id":"0199aaaa-bbbb-7ccc-8ddd-eeeeffff0001","timestamp":"2026-09-04T10:00:00.000Z","cwd":"/home/dev/proj"}"#,
+    "\n",
+    r#"{"type":"message","id":"aaaaaaaa","parentId":null,"timestamp":"2026-09-04T10:00:01.000Z","message":{"role":"user","content":"run the script"}}"#,
+    "\n",
+    r#"{"type":"message","id":"bbbbbbbb","parentId":"aaaaaaaa","timestamp":"2026-09-04T10:00:02.000Z","message":{"role":"assistant","model":"claude","content":[{"type":"toolCall","id":"call_1","name":"codemode","arguments":{"code":"..."}}]}}"#,
+    "\n",
+    r#"{"type":"message","id":"cccccccc","parentId":"bbbbbbbb","timestamp":"2026-09-04T10:00:03.000Z","message":{"role":"toolResult","toolCallId":"call_1","toolName":"codemode","content":[{"type":"text","text":"done"}],"isError":false,"timestamp":1,"nestedCalls":{"calls":[{"id":"call_1/1","name":"read","status":"ok","arguments":{"path":"a.ts"},"durationMs":4},{"id":"call_1/2","name":"edit","status":"error","arguments":{"path":"b.ts"},"durationMs":1,"error":"no match\nline two"},{"id":"call_1/3","name":"write","status":"ok","argumentsBytes":40000,"durationMs":0}],"complete":false}}}"#,
+    "\n",
+);
+
+/// The record reaches the browser untouched: the embedded session data holds the same
+/// `nestedCalls` object the file did, so `renderNestedCalls` reads exactly what pi's does.
+#[test]
+fn nested_calls_reach_the_document_with_the_record_intact() {
+    let html = session_jsonl_to_html(NESTED_FIXTURE);
+    let data = session_data(&html);
+    let nested = &data["entries"][2]["message"]["nestedCalls"];
+    assert_eq!(nested["complete"], false);
+    assert_eq!(nested["calls"].as_array().unwrap().len(), 3);
+    assert_eq!(nested["calls"][0]["id"], "call_1/1");
+    assert_eq!(nested["calls"][1]["error"], "no match\nline two");
+    assert_eq!(nested["calls"][2]["argumentsBytes"], 40000);
+}
+
+/// The shipped `template.js` renders that record under the tool call, the way pi's does
+/// (`template.js:933-947`, called at `:1081` @v1.0.1): a `Nested calls: N` title with an
+/// `(incomplete record)` suffix, one line per call with a status icon, the arguments as JSON or an
+/// `[arguments omitted, N bytes]` placeholder, the duration, and the error text indented.
+#[test]
+fn the_template_renders_the_nested_calls_of_a_tool_result() {
+    let html = session_jsonl_to_html(NESTED_FIXTURE);
+    let body = js_body(&html, "const renderNestedCalls = () =>");
+    for needle in [
+        "result?.nestedCalls",
+        "{ ok: '✓', error: '✗', unfinished: '…' }",
+        "[arguments omitted, ${c.argumentsBytes} bytes]",
+        "(incomplete record)",
+        "Nested calls: ${nested.calls.length}",
+        "formatExpandableOutput([title, ...lines].join(",
+    ] {
+        assert!(
+            body.contains(needle),
+            "renderNestedCalls lost `{needle}`:\n{body}"
+        );
+    }
+    // …and `renderToolCall` calls it once, after the per-tool body, before it closes the block.
+    let render = js_body(&html, "function renderToolCall(call)");
+    assert_eq!(render.matches("renderNestedCalls()").count(), 1);
+    let at = render.find("html += renderNestedCalls();").expect("called");
+    let close = render.rfind("html += '</div>';").expect("closes the block");
+    assert!(
+        at < close,
+        "the nested record is rendered inside the tool block"
     );
 }

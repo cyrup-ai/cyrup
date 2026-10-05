@@ -5,7 +5,7 @@
 //! rpc front-ends (func-11 Open-Question resolved: yes, one schema). Snake_case `type` tags match
 //! Pi's event-type names; payload fields are camelCase via the embedded agent types.
 
-use cyrup_agent::{AgentEvent, AgentMessage, AppRole, ToolResultMessage};
+use cyrup_agent::{AgentEvent, AgentMessage, AppRole, NestedToolExecutionEvent, ToolResultMessage};
 use cyrup_core::{Content, ToolCallId};
 use cyrup_provider::StreamEvent;
 use cyrup_session::compaction::CompactionReason;
@@ -158,6 +158,40 @@ pub enum AgentSessionEvent {
         tool_name: String,
         result: Value,
         is_error: bool,
+    },
+    /// `tool_execution_start` of a call a tool made while it ran (`ctx.executeTool`), carrying the
+    /// `parentToolCallId` of the call that made it (pi `AgentSessionEvent`'s
+    /// `WithParentToolCallId<ToolExecutionStartEvent>`, `agent-session.ts:182-190` @v1.0.1, CODE-006).
+    ///
+    /// A variant of its own rather than an optional field on [`Self::ToolExecutionStart`]: the
+    /// loop's `tool_execution_*` events keep exactly their shape (no consumer that matches them
+    /// changes, and none can mistake a nested call for a model-issued one), and a nested event
+    /// cannot exist without its parent. The wire is pi's: `type` is `tool_execution_start` for
+    /// both, and only the nested one has the `parentToolCallId` key, written last.
+    #[serde(rename = "tool_execution_start")]
+    NestedToolExecutionStart {
+        tool_call_id: ToolCallId,
+        tool_name: String,
+        args: Value,
+        parent_tool_call_id: ToolCallId,
+    },
+    /// `tool_execution_update` of a nested call; see [`Self::NestedToolExecutionStart`].
+    #[serde(rename = "tool_execution_update")]
+    NestedToolExecutionUpdate {
+        tool_call_id: ToolCallId,
+        tool_name: String,
+        args: Value,
+        partial_result: Value,
+        parent_tool_call_id: ToolCallId,
+    },
+    /// `tool_execution_end` of a nested call; see [`Self::NestedToolExecutionStart`].
+    #[serde(rename = "tool_execution_end")]
+    NestedToolExecutionEnd {
+        tool_call_id: ToolCallId,
+        tool_name: String,
+        result: Value,
+        is_error: bool,
+        parent_tool_call_id: ToolCallId,
     },
     TurnEnd {
         message: AgentMessage,
@@ -368,6 +402,11 @@ impl AgentSessionEvent {
             AgentSessionEvent::ToolExecutionStart { .. } => "tool_execution_start",
             AgentSessionEvent::ToolExecutionUpdate { .. } => "tool_execution_update",
             AgentSessionEvent::ToolExecutionEnd { .. } => "tool_execution_end",
+            // Nested calls have the same wire `type` as the loop's own (pi: one event type, an
+            // optional `parentToolCallId`); `parent_tool_call_id` tells them apart.
+            AgentSessionEvent::NestedToolExecutionStart { .. } => "tool_execution_start",
+            AgentSessionEvent::NestedToolExecutionUpdate { .. } => "tool_execution_update",
+            AgentSessionEvent::NestedToolExecutionEnd { .. } => "tool_execution_end",
             AgentSessionEvent::TurnEnd { .. } => "turn_end",
             AgentSessionEvent::AgentEnd { .. } => "agent_end",
             AgentSessionEvent::AgentSettled => "agent_settled",
@@ -391,6 +430,51 @@ impl AgentSessionEvent {
             AgentSessionEvent::SessionStart { .. } => "session_start",
             AgentSessionEvent::SessionShutdown { .. } => "session_shutdown",
             AgentSessionEvent::SessionReplaced { .. } => "session_replaced",
+        }
+    }
+}
+
+impl From<NestedToolExecutionEvent> for AgentSessionEvent {
+    /// A nested call's `tool_execution_*` event as the seam event (CODE-006).
+    fn from(ev: NestedToolExecutionEvent) -> Self {
+        match ev {
+            NestedToolExecutionEvent::ToolExecutionStart {
+                tool_call_id,
+                tool_name,
+                args,
+                parent_tool_call_id,
+            } => AgentSessionEvent::NestedToolExecutionStart {
+                tool_call_id,
+                tool_name,
+                args,
+                parent_tool_call_id,
+            },
+            NestedToolExecutionEvent::ToolExecutionUpdate {
+                tool_call_id,
+                tool_name,
+                args,
+                partial_result,
+                parent_tool_call_id,
+            } => AgentSessionEvent::NestedToolExecutionUpdate {
+                tool_call_id,
+                tool_name,
+                args,
+                partial_result,
+                parent_tool_call_id,
+            },
+            NestedToolExecutionEvent::ToolExecutionEnd {
+                tool_call_id,
+                tool_name,
+                result,
+                is_error,
+                parent_tool_call_id,
+            } => AgentSessionEvent::NestedToolExecutionEnd {
+                tool_call_id,
+                tool_name,
+                result,
+                is_error,
+                parent_tool_call_id,
+            },
         }
     }
 }
@@ -421,6 +505,9 @@ pub(crate) fn agent_message_to_core(m: &AgentMessage) -> Option<cyrup_core::Mess
             usage: t.usage.clone(),
             added_tool_names: t.added_tool_names.clone(),
             timestamp: t.timestamp,
+            // The agent loop's own result message has no record of nested calls: the session
+            // stamps it on at `message_end` (`SvcSubscriber`), where it holds the runner's record.
+            nested_calls: None,
         }),
         AgentMessage::Custom { .. } => None,
         // SESS-043 — an `App` message is a *projection* of an entry that is already on disk (the
@@ -545,6 +632,10 @@ pub(crate) fn core_message_to_agent(m: &cyrup_core::Message) -> AgentMessage {
             usage,
             added_tool_names,
             timestamp,
+            // Not carried: the agent's in-memory result has no such field, and the persisted row —
+            // which this resume direction reads from — keeps it. A transcript re-seeded from disk
+            // loses nothing the model could see, since `nestedCalls` is never sent to the model.
+            nested_calls: _,
         } => AgentMessage::ToolResult(ToolResultMessage {
             tool_call_id: tool_call_id.clone(),
             tool_name: tool_name.clone(),

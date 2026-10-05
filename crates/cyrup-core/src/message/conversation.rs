@@ -2,6 +2,7 @@
 
 use super::assistant::AssistantMessage;
 use super::content::{Content, de_tool_result_content, de_user_content};
+use super::nested::NestedToolCalls;
 use super::system::SystemMessage;
 use super::usage::Usage;
 use crate::ToolCallId;
@@ -60,6 +61,16 @@ pub enum Message {
         #[serde(skip_serializing_if = "Vec::is_empty", default)]
         added_tool_names: Vec<String>,
         timestamp: i64,
+        /// The calls this tool made to other tools while it ran (Pi `ToolResultMessage.nestedCalls`,
+        /// `ai/src/types.ts:604-605` @v1.0.1): *"Kept for the session record; not sent to the
+        /// model."* Absent when the tool made none.
+        ///
+        /// Written LAST, after `timestamp`: pi never builds it into the message — the session
+        /// assigns `message.nestedCalls = summary.calls` onto the already-built object when the
+        /// result starts (`agent-session.ts:1075-1082`), so the key is appended after the literal's
+        /// own keys (`agent-loop.ts:922-935`) and that is its position in every pi session file.
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        nested_calls: Option<NestedToolCalls>,
     },
 }
 
@@ -98,6 +109,7 @@ impl serde::Serialize for Message {
                 usage,
                 added_tool_names,
                 timestamp,
+                nested_calls,
             } => {
                 // The key ORDER is pi's `createToolResultMessage` object literal
                 // (`pi/packages/agent/src/agent-loop.ts:773-787` @v0.83.0; the literal is
@@ -118,7 +130,8 @@ impl serde::Serialize for Message {
                 let len = 6
                     + usize::from(details.is_some())
                     + usize::from(usage.is_some())
-                    + usize::from(!added_tool_names.is_empty());
+                    + usize::from(!added_tool_names.is_empty())
+                    + usize::from(nested_calls.is_some());
                 let mut st = serializer.serialize_struct("Message", len)?;
                 st.serialize_field("role", "toolResult")?;
                 st.serialize_field("toolCallId", tool_call_id)?;
@@ -139,6 +152,12 @@ impl serde::Serialize for Message {
                 }
                 st.serialize_field("isError", is_error)?;
                 st.serialize_field("timestamp", timestamp)?;
+                // After `timestamp`: pi assigns `nestedCalls` onto the finished message object
+                // (see the field), so JSON.stringify writes it last.
+                match nested_calls {
+                    Some(n) => st.serialize_field("nestedCalls", n)?,
+                    None => st.skip_field("nestedCalls")?,
+                }
                 st.end()
             }
         }
@@ -149,6 +168,7 @@ impl serde::Serialize for Message {
 #[allow(clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
 mod tests {
     use super::*;
+    use crate::NestedCallStatus;
 
     #[test]
     fn tool_result_message_uses_camelcase_fields() {
@@ -161,6 +181,7 @@ mod tests {
             timestamp: 0,
             usage: None,
             added_tool_names: Vec::new(),
+            nested_calls: None,
         };
         let v = serde_json::to_value(&m).expect("serialize");
         assert_eq!(v["role"], "toolResult");
@@ -188,6 +209,7 @@ mod tests {
             }),
             added_tool_names: vec!["late".to_string()],
             timestamp: 7,
+            nested_calls: None,
         };
         let first = serde_json::to_string(&m).expect("serialize");
         // Both keys present, and positioned after `details` (Pi keeps them adjacent, types.ts:419-428).
@@ -286,6 +308,7 @@ mod tests {
             }),
             added_tool_names: vec!["late".to_string()],
             timestamp: 7,
+            nested_calls: None,
         };
         let new_bytes = serde_json::to_string(&new_msg).expect("serialize");
 
@@ -311,6 +334,71 @@ mod tests {
             }
             other => panic!("expected a tool result, got {other:?}"),
         }
+    }
+
+    /// A pi-written session row with `nestedCalls` (`ai/src/types.ts:604` @v1.0.1) loads and
+    /// re-saves byte for byte. The literal is the shape pi's `JSON.stringify` produces for a result
+    /// whose script made three calls: the keys of the message literal, then `nestedCalls` appended
+    /// last; each record's keys in the order `NestedCallRecorder` assigns them (id, name, status,
+    /// arguments | argumentsBytes, durationMs, error); the summed nested usage folded into `usage`.
+    #[test]
+    fn pi_row_with_nested_calls_round_trips_byte_identically() {
+        let pi = concat!(
+            r#"{"role":"toolResult","toolCallId":"call_1","toolName":"codemode","#,
+            r#""content":[{"type":"text","text":"done"}],"details":{},"#,
+            r#""usage":{"input":10,"output":2,"cacheRead":3,"cacheWrite":4,"totalTokens":19,"#,
+            r#""cost":{"input":0.01,"output":0.02,"cacheRead":0.03,"cacheWrite":0.04,"total":0.1}},"#,
+            r#""isError":false,"timestamp":1760000000000,"#,
+            r#""nestedCalls":{"calls":["#,
+            r#"{"id":"call_1/1","name":"read","status":"ok","arguments":{"path":"a.ts","offset":2},"durationMs":4},"#,
+            r#"{"id":"call_1/2","name":"write","status":"ok","argumentsBytes":40000,"durationMs":0},"#,
+            r#"{"id":"call_1/3","name":"missing","status":"error","arguments":{},"durationMs":1,"error":"Tool missing not found"},"#,
+            r#"{"id":"call_1/4","name":"bash","status":"unfinished","arguments":{"command":"sleep 9"}}"#,
+            r#"],"complete":false}}"#
+        );
+        let m: Message = serde_json::from_str(pi).expect("pi row parses");
+        let Message::ToolResult { nested_calls, .. } = &m else {
+            panic!("expected a tool result, got {m:?}");
+        };
+        let nested = nested_calls
+            .as_ref()
+            .expect("nestedCalls survives the load");
+        assert!(!nested.complete);
+        assert_eq!(nested.calls.len(), 4);
+        assert_eq!(nested.calls[0].id, "call_1/1");
+        assert_eq!(nested.calls[0].status, NestedCallStatus::Ok);
+        assert_eq!(nested.calls[1].arguments, None);
+        assert_eq!(nested.calls[1].arguments_bytes, Some(40000));
+        assert_eq!(nested.calls[2].status, NestedCallStatus::Error);
+        assert_eq!(
+            nested.calls[2].error.as_deref(),
+            Some("Tool missing not found")
+        );
+        assert_eq!(nested.calls[3].status, NestedCallStatus::Unfinished);
+        assert_eq!(nested.calls[3].duration_ms, None);
+        assert_eq!(
+            serde_json::to_string(&m).expect("re-serialize"),
+            pi,
+            "a session row with nestedCalls re-saves identically"
+        );
+    }
+
+    /// A tool result with no nested calls has no `nestedCalls` key (pi never assigns it).
+    #[test]
+    fn tool_result_without_nested_calls_writes_no_key() {
+        let m = Message::ToolResult {
+            tool_call_id: "tc1".into(),
+            tool_name: "read".into(),
+            content: vec![Content::text("ok")],
+            is_error: false,
+            details: None,
+            usage: None,
+            added_tool_names: Vec::new(),
+            timestamp: 7,
+            nested_calls: None,
+        };
+        let json = serde_json::to_string(&m).expect("serialize");
+        assert!(!json.contains("nestedCalls"), "{json}");
     }
 
     #[test]

@@ -31,6 +31,7 @@ mod malformed_manifest;
 mod manifest_cache;
 mod native_ctx_state;
 mod native_dispatch;
+mod nested_tool_events;
 #[cfg(feature = "wasm-host")]
 mod overlay_keys;
 mod payload_and_seam_parity;

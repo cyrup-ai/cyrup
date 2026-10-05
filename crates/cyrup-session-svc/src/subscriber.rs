@@ -10,8 +10,8 @@
 
 use std::sync::{Arc, Mutex};
 
-use cyrup_agent::{AgentEvent, AgentMessage, EventSubscriber};
-use cyrup_core::{CancelToken, EventStream};
+use cyrup_agent::{AgentEvent, AgentMessage, EventSubscriber, NestedToolCallRunner};
+use cyrup_core::{CancelToken, EventStream, NestedToolCalls, combine_usage};
 use cyrup_ext::ExtensionHost;
 use cyrup_session::manager::SessionManager;
 use tokio::sync::{Mutex as AsyncMutex, mpsc};
@@ -132,6 +132,10 @@ pub(crate) struct SvcSubscriber {
     /// The session cancel token; `message_end` re-dispatch runs under a child of it so a session
     /// teardown cancels an in-flight guest call (never hangs).
     session_cancel: CancelToken,
+    /// The calls tools made while they ran (CODE-006): the record each model-issued call's tool
+    /// result is stamped with at `message_end`, and what `agent_end` clears. Shared with the
+    /// session, whose `execute_nested_tool` is the producer.
+    nested: Arc<NestedToolCallRunner>,
 }
 
 impl SvcSubscriber {
@@ -141,6 +145,7 @@ impl SvcSubscriber {
         handle: Arc<SessionHandle>,
         ext_host: Arc<ExtensionHost>,
         session_cancel: CancelToken,
+        nested: Arc<NestedToolCallRunner>,
     ) -> Self {
         Self {
             fanout,
@@ -148,7 +153,83 @@ impl SvcSubscriber {
             handle,
             ext_host,
             session_cancel,
+            nested,
         }
+    }
+
+    /// Stamp the calls a tool made, and what they spent, onto its result message — pi
+    /// `_handleAgentEvent`'s head (`agent-session.ts:1075-1082` @v1.0.1):
+    ///
+    /// ```text
+    /// const summary = this._nestedToolCalls.takeRecord(message.toolCallId);
+    /// if (summary?.calls) message.nestedCalls = summary.calls;
+    /// if (summary?.usage) message.usage = message.usage ? combineUsage(message.usage, summary.usage) : summary.usage;
+    /// ```
+    ///
+    /// Returns the result as the live transcript should show it (usage folded in) and the record
+    /// for the persisted row. `None` for every message that is not the result of a call that made
+    /// nested calls. Taken once: a second `message_end` for the same call finds nothing.
+    ///
+    /// The record lands on the persisted `cyrup_core::Message` only. The agent loop's own
+    /// [`cyrup_agent::ToolResultMessage`] — the type the live `message_end` event carries — has no
+    /// `nestedCalls` field, so a live subscriber sees the folded `usage` but not the record; both
+    /// reach a session file, which is where pi's consumers (compaction, HTML export, a resumed
+    /// session) read it.
+    fn stamp_nested_calls(
+        &self,
+        event: &AgentEvent,
+    ) -> Option<(AgentMessage, Option<NestedToolCalls>)> {
+        let AgentEvent::MessageEnd {
+            message: AgentMessage::ToolResult(result),
+        } = event
+        else {
+            return None;
+        };
+        let summary = self.nested.take_record(&result.tool_call_id)?;
+        let mut folded = result.clone();
+        if let Some(nested_usage) = &summary.usage {
+            folded.usage = Some(match &folded.usage {
+                Some(own) => combine_usage(own, nested_usage),
+                None => nested_usage.clone(),
+            });
+        }
+        Some((AgentMessage::ToolResult(folded), summary.calls))
+    }
+}
+
+/// `core` with the calls its tool made recorded on it, when it is a tool result and there are any
+/// (pi `message.nestedCalls = summary.calls`, `agent-session.ts:1078`). Applied before the message
+/// goes to the extension seam, so a `message_end` handler sees the record it will be persisted with.
+fn with_nested_calls(
+    core: cyrup_core::Message,
+    calls: Option<&NestedToolCalls>,
+) -> cyrup_core::Message {
+    match (core, calls) {
+        (
+            cyrup_core::Message::ToolResult {
+                tool_call_id,
+                tool_name,
+                content,
+                is_error,
+                details,
+                usage,
+                added_tool_names,
+                timestamp,
+                nested_calls: None,
+            },
+            Some(calls),
+        ) => cyrup_core::Message::ToolResult {
+            tool_call_id,
+            tool_name,
+            content,
+            is_error,
+            details,
+            usage,
+            added_tool_names,
+            timestamp,
+            nested_calls: Some(calls.clone()),
+        },
+        (core, _) => core,
     }
 }
 
@@ -156,6 +237,13 @@ impl SvcSubscriber {
 impl EventSubscriber for SvcSubscriber {
     async fn on_event(&self, event: &AgentEvent, _cancel: CancelToken) {
         let session = self.handle.get();
+
+        // `_handleAgentEvent`'s `agent_end` arm forgets every open nested-call scope
+        // (`this._nestedToolCalls.clear()`, `agent-session.ts:1083-1085` @v1.0.1) so a call that
+        // never reached its result message cannot leak into the next run.
+        if matches!(event, AgentEvent::AgentEnd { .. }) {
+            self.nested.clear();
+        }
 
         // 0. `_handleAgentEvent` head (Pi agent-session.ts:514-535): on a USER `message_start`, reset
         //    the overflow latch and drain the matching queue mirror entry + emit `queue_update`.
@@ -176,12 +264,19 @@ impl EventSubscriber for SvcSubscriber {
         //    session.rs:1041/…). NOTE (documented delta, risks §3): this replaces only the persisted
         //    + fanned-out copy, not the agent's already-emitted in-memory transcript.
         let mut replaced_end: Option<AgentMessage> = None;
+        // CODE-006 — the calls this result's tool made, taken BEFORE the extension seam so a
+        // `message_end` handler sees the stamped message, as it does upstream (the stamping is the
+        // head of `_handleAgentEvent`, ahead of every listener).
+        let stamped = self.stamp_nested_calls(event);
         if let AgentEvent::MessageEnd { message } = event {
+            let message = stamped.as_ref().map_or(message, |(folded, _)| folded);
+            let nested_calls = stamped.as_ref().and_then(|(_, calls)| calls.as_ref());
             let effective: Option<cyrup_core::Message> = if !self
                 .ext_host
                 .dispatcher()
                 .no_subscribers(cyrup_ext::EventKind::MessageEnd)
-                && let Some(core) = agent_message_to_core(message)
+                && let Some(core) =
+                    agent_message_to_core(message).map(|core| with_nested_calls(core, nested_calls))
             {
                 let cancel = self.session_cancel.child_token();
                 match self.ext_host.emit_message_end(core.clone(), &cancel).await {
@@ -194,8 +289,16 @@ impl EventSubscriber for SvcSubscriber {
                     None => Some(core),
                 }
             } else {
-                agent_message_to_core(message)
+                agent_message_to_core(message).map(|core| with_nested_calls(core, nested_calls))
             };
+            // The stamped usage must reach the live subscribers too (the TUI folds a tool result's
+            // usage into its footer totals from `message_end`) — unless a handler's replacement
+            // already stands in for it.
+            if replaced_end.is_none()
+                && let Some((folded, _)) = &stamped
+            {
+                replaced_end = Some(folded.clone());
+            }
 
             if let Some(core) = effective {
                 // Append the finalized (possibly guest-replaced) message to the session tree.

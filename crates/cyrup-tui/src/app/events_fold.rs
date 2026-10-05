@@ -251,6 +251,20 @@ impl<B: Backend> App<B> {
                 // components scrolling up into native history as the turn proceeds.
                 self.state.transcript.commit_finished_leading_tools();
             }
+            // CODE-006 — a tool-execution event of a call a TOOL made while it ran (`ctx.executeTool`):
+            // IGNORED. Pi's `case "tool_execution_start"` opens with
+            // `// Nested calls (from codemode scripts) are shown inside their parent's row.` /
+            // `if (event.parentToolCallId) break;` (`interactive-mode.ts:3558-3559` @v1.0.1), so no
+            // row is ever filed under the nested id, and the matching `update` / `end` — which look
+            // the row up by that id (`pendingTools.get(event.toolCallId)`, `:3593`) — find nothing.
+            // The nested calls are shown by their parent's own row, from the `nestedCalls` record on
+            // its result. cyrup's nested events are separate variants rather than an optional field
+            // (`AgentSessionEvent::NestedToolExecutionStart`), so the skip is an arm of its own; all
+            // three are named here, because a fold that drew a nested call as a top-level tool row
+            // would show it twice.
+            AgentSessionEvent::NestedToolExecutionStart { .. }
+            | AgentSessionEvent::NestedToolExecutionUpdate { .. }
+            | AgentSessionEvent::NestedToolExecutionEnd { .. } => {}
             // Pi `case "queue_update"` (`interactive-mode.ts:2888-2891`): rebuild the
             // pending-messages region and re-render. TUI-016 — cyrup used to keep only the COUNT
             // (`status.set_queued`) and, since the fidelity pass deleted the `{n} queued` footer

@@ -13,6 +13,8 @@
 //! - `tool_call` — the self-tagging [`ToolCall`].
 //! - `content` — the typed [`Content`] block and the per-role content deserializers.
 //! - `usage` — token + cost accounting ([`Usage`], [`Cost`]).
+//! - `nested` — the record of the calls a tool made to other tools ([`NestedToolCalls`]) and its
+//!   bounded [`NestedCallRecorder`].
 //! - `assistant` — [`AssistantMessage`], [`DeferredHandle`], [`UNRESOLVED_API`].
 //! - `conversation` — the role-tagged [`Message`] enum.
 //! - `sections` — the ordered named prompt sections of a system message ([`Sections`]).
@@ -21,6 +23,7 @@
 mod assistant;
 mod content;
 mod conversation;
+mod nested;
 mod sections;
 mod stop_reason;
 mod system;
@@ -32,10 +35,14 @@ mod usage;
 pub use assistant::{AssistantMessage, DeferredHandle, UNRESOLVED_API};
 pub use content::Content;
 pub use conversation::Message;
+pub use nested::{
+    NESTED_CALL_LIMITS, NestedCallHandle, NestedCallLimits, NestedCallRecorder, NestedCallResult,
+    NestedCallStatus, NestedToolCallRecord, NestedToolCalls,
+};
 pub use sections::Sections;
 pub use stop_reason::StopReason;
 pub use system::SystemMessage;
 pub use text_signature::{TextPhase, TextSignatureV1};
 pub use thinking::{ModelThinkingLevel, ThinkingLevel};
 pub use tool_call::ToolCall;
-pub use usage::{Cost, Usage};
+pub use usage::{Cost, Usage, combine_usage};

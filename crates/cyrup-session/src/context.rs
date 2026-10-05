@@ -316,6 +316,7 @@ fn project_context_entry(out: &mut Vec<AgentMessage>, e: &Entry, edit: Option<&K
                 usage,
                 added_tool_names,
                 timestamp,
+                nested_calls,
                 ..
             }) => AgentMessage::Core(Message::ToolResult {
                 tool_call_id,
@@ -326,6 +327,7 @@ fn project_context_entry(out: &mut Vec<AgentMessage>, e: &Entry, edit: Option<&K
                 usage,
                 added_tool_names,
                 timestamp,
+                nested_calls,
             }),
             AgentMessage::Custom(c) => AgentMessage::Custom(CustomRoleMessage {
                 content: match &r.content {

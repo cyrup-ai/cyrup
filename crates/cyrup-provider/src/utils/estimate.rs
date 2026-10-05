@@ -443,6 +443,7 @@ mod tests {
             usage: None,
             added_tool_names: added,
             timestamp: 0,
+            nested_calls: None,
         };
         let base = vec![
             user("hi"),

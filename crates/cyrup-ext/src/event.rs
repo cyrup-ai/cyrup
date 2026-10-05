@@ -703,6 +703,65 @@ impl HostEvent {
     }
 }
 
+impl HostEvent {
+    /// The notify event for a `tool_execution_*` event of a call another tool made (CODE-006): the
+    /// same `ToolExec{Start,Update,End}` a loop event becomes ([`Self::from_agent`]), with its
+    /// parent returned beside it — dispatch it with
+    /// [`crate::Dispatcher::dispatch_notify_nested`] so a native handler reads the parent from
+    /// [`crate::HostCtx::parent_tool_call_id`]. Pi hands the extension runner the same event object
+    /// with `parentToolCallId` set (`agent-session.ts:719-733` @v1.0.1).
+    pub fn from_nested_tool_execution(
+        ev: &cyrup_agent::NestedToolExecutionEvent,
+    ) -> (HostEvent, ToolCallId) {
+        use cyrup_agent::NestedToolExecutionEvent as N;
+        match ev {
+            N::ToolExecutionStart {
+                tool_call_id,
+                tool_name,
+                args,
+                parent_tool_call_id,
+            } => (
+                HostEvent::ToolExecStart {
+                    call_id: tool_call_id.clone(),
+                    name: tool_name.clone(),
+                    args: args.clone(),
+                },
+                parent_tool_call_id.clone(),
+            ),
+            N::ToolExecutionUpdate {
+                tool_call_id,
+                tool_name,
+                args,
+                partial_result,
+                parent_tool_call_id,
+            } => (
+                HostEvent::ToolExecUpdate {
+                    call_id: tool_call_id.clone(),
+                    name: tool_name.clone(),
+                    args: args.clone(),
+                    chunk: partial_result.clone(),
+                },
+                parent_tool_call_id.clone(),
+            ),
+            N::ToolExecutionEnd {
+                tool_call_id,
+                tool_name,
+                result,
+                is_error,
+                parent_tool_call_id,
+            } => (
+                HostEvent::ToolExecEnd {
+                    call_id: tool_call_id.clone(),
+                    name: tool_name.clone(),
+                    result: result.clone(),
+                    is_error: *is_error,
+                },
+                parent_tool_call_id.clone(),
+            ),
+        }
+    }
+}
+
 /// Wall-clock milliseconds since the Unix epoch (Pi `Date.now()`). A clock before the epoch
 /// degrades to `0` (never a panic).
 pub(crate) fn now_millis() -> u64 {

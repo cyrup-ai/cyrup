@@ -777,6 +777,7 @@ fn replay_tool_result(id: &str, name: &str, body: &str) -> SessionMessage {
         timestamp: 0,
         usage: None,
         added_tool_names: Vec::new(),
+        nested_calls: None,
     })
 }
 

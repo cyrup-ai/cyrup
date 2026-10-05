@@ -2790,6 +2790,7 @@ mod tests {
             usage: None,
             added_tool_names: Vec::new(),
             timestamp: 0,
+            nested_calls: None,
         })))
     }
 

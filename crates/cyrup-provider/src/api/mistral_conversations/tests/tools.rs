@@ -34,6 +34,7 @@ fn tool_result_message_shape() {
         timestamp: 0,
         usage: None,
         added_tool_names: Vec::new(),
+        nested_calls: None,
     }];
     let out = to_chat_messages(&messages, false);
     assert_eq!(out[0]["role"], "tool");
