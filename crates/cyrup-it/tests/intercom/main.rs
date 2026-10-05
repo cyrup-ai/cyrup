@@ -56,6 +56,9 @@ mod child_bridge_activation;
 // ICOM-067: the `cyrup-intercom-cli` scripting client (`cli.ts`), run as a subprocess against a
 // real broker and a real peer.
 mod cli_client;
+// ICOM-074 / ICOM-075 / ICOM-071: the explicit cross-machine SSH relay — the `relay` subcommand
+// and `send --to name@machine`, with both halves proved against each other.
+mod cli_relay;
 mod compose_send_leg;
 mod dismiss_incoming_ask;
 // ICOM-065: the broker-side Herdr location join, against a fake Herdr socket.

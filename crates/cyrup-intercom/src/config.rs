@@ -120,13 +120,26 @@ impl Default for IntercomConfig {
             // `v0.16.0 config.ts:82-85`. Upstream notes at `:91`/`:104` that the nested object is
             // CLONED rather than shared with `defaults`; owned `String`s make that structural here.
             cross_machine: CrossMachineConfig {
-                machine_name: crate::cross_machine::default_machine_name(
-                    &cyrup_ext_subagents::background::async_retention::machine_hostname(),
-                ),
+                machine_name: crate::cross_machine::default_machine_name(&host_name()),
                 remote_command: DEFAULT_REMOTE_COMMAND.to_string(),
             },
         }
     }
+}
+
+/// `os.hostname()` (`v0.16.0 config.ts:84`): the kernel's host name where the platform has the
+/// call (`gethostname(2)` — the only source on macOS, where neither `/proc` nor `/etc/hostname`
+/// exist and `$HOSTNAME` is a shell variable that is rarely exported), else the lock-owner
+/// ladder's `/proc` → `/etc/hostname` → `$HOSTNAME`/`$COMPUTERNAME` → `unknown-host`.
+fn host_name() -> String {
+    #[cfg(unix)]
+    if let Ok(name) = nix::unistd::gethostname() {
+        let name = name.to_string_lossy().trim().to_string();
+        if !name.is_empty() {
+            return name;
+        }
+    }
+    cyrup_ext_subagents::background::async_retention::machine_hostname()
 }
 
 /// `getConfigPath` (`config.ts:45-47`): `<intercomDir>/config.json`.

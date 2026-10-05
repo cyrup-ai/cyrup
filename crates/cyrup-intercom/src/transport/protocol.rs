@@ -514,6 +514,113 @@ pub struct MessageProvenance {
     pub extra: UnknownFields,
 }
 
+/// `CrossMachineProvenance.type` (`v0.16.0 types.ts:74`) — the single tag `"ssh-relay"`.
+///
+/// A CLOSED one-variant vocabulary, like [`ProvenanceKind`]: `isCrossMachineProvenance` compares it
+/// with `!==` (`v0.16.0 broker/protocol.ts:106`), so any other tag fails the whole message.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum CrossMachineKind {
+    /// Relayed over SSH by `cyrup-intercom-cli relay`.
+    #[serde(rename = "ssh-relay")]
+    SshRelay,
+}
+
+/// `CrossMachineProvenance.trust` and `CrossMachineEnvelope.trust` (`v0.16.0 types.ts:77`,
+/// `cross-machine-envelope.ts:10`) — the single value `"ssh-asserted"`, compared with `!==` at
+/// `broker/protocol.ts:108` and `cross-machine-envelope.ts:72`.
+///
+/// The honest name for how much the claim is worth: the origin is whatever the SSH caller wrote.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum RelayTrust {
+    /// The origin is whatever the SSH caller said it was.
+    #[serde(rename = "ssh-asserted")]
+    SshAsserted,
+}
+
+/// `CrossMachineProvenance.version` (`v0.16.0 types.ts:75`) — the discriminant `b92d945` added so a
+/// future provenance shape is REJECTED rather than silently misread. One variant, deserialised from
+/// the JSON number `1` only: `value.version !== 1` (`broker/protocol.ts:107`) is a number
+/// comparison, so `1.0` is as good as `1` and `"1"`, `2` and `null` all fail the message.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CrossMachineVersion;
+
+impl serde::Serialize for CrossMachineVersion {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_u8(1)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for CrossMachineVersion {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let number = serde_json::Number::deserialize(deserializer)?;
+        if number.as_f64() == Some(1.0) {
+            Ok(Self)
+        } else {
+            Err(serde::de::Error::custom(
+                "crossMachine.version must be the number 1",
+            ))
+        }
+    }
+}
+
+/// `CrossMachineOrigin` as it rides on a MESSAGE (`v0.16.0 types.ts:67-71`), guarded by
+/// `isCrossMachineProvenance` (`v0.16.0 broker/protocol.ts:111-113`): `name`, `sessionId` and
+/// `machine` must all be strings. Nothing else is checked, so unknown keys are tolerated and round
+/// trip (`[UNKNOWN-FIELDS]`) — unlike the relay ENVELOPE's origin
+/// ([`crate::cross_machine::CrossMachineOrigin`]), whose exact key set `parseRelayEnvelope`
+/// enforces.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProvenanceOrigin {
+    /// The origin session's intercom name, as asserted by the SSH caller.
+    pub name: String,
+    /// The origin session's intercom session id, as asserted by the SSH caller.
+    pub session_id: String,
+    /// The origin host's `crossMachine.machineName`, as asserted by the SSH caller.
+    pub machine: String,
+    /// `[UNKNOWN-FIELDS]` + `[MAP-ONLY]`.
+    #[serde(flatten)]
+    pub extra: UnknownFields,
+}
+
+/// `CrossMachineProvenance` (`v0.16.0 types.ts:73-78`) — "this message arrived over the explicit SSH
+/// relay, and the origin below is only what the relay's caller claimed".
+///
+/// Guarded by `isCrossMachineProvenance` (`v0.16.0 broker/protocol.ts:104-114`), enforced inside
+/// `isMessage` at `:151-153`: absent is legal, and a PRESENT but malformed value makes the whole
+/// message invalid, which the broker answers with its ordinary invalid-message refusal.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CrossMachineProvenance {
+    /// Always `"ssh-relay"` (`broker/protocol.ts:106`).
+    #[serde(rename = "type")]
+    pub kind: CrossMachineKind,
+    /// Always `1` (`broker/protocol.ts:107`).
+    pub version: CrossMachineVersion,
+    /// Who the relay's caller claimed to be (`broker/protocol.ts:109-113`).
+    pub origin: ProvenanceOrigin,
+    /// Always `"ssh-asserted"` (`broker/protocol.ts:108`).
+    pub trust: RelayTrust,
+    /// `[UNKNOWN-FIELDS]` + `[MAP-ONLY]`.
+    #[serde(flatten)]
+    pub extra: UnknownFields,
+}
+
+impl CrossMachineProvenance {
+    /// The provenance the relay CLI stamps on a delivered envelope (`cli.ts:219-224`):
+    /// `{ type: "ssh-relay", version: 1, origin, trust }`.
+    #[must_use]
+    pub fn ssh_relay(origin: ProvenanceOrigin, trust: RelayTrust) -> Self {
+        Self {
+            kind: CrossMachineKind::SshRelay,
+            version: CrossMachineVersion,
+            origin,
+            trust,
+            extra: UnknownFields::default(),
+        }
+    }
+}
+
 /// `Message` (`v0.9.2 types.ts:24-40`), guarded by `isMessage`
 /// (`v0.9.2 broker/client.ts:106-150`, mirrored at `v0.9.2 broker/broker.ts:140-184`).
 ///
@@ -611,6 +718,18 @@ pub struct Message {
         skip_serializing_if = "Option::is_none"
     )]
     pub provenance: Option<MessageProvenance>,
+    /// `crossMachine` (`v0.16.0 types.ts:93`, guarded at `v0.16.0 broker/protocol.ts:151-153`) —
+    /// set only on a message delivered by `cyrup-intercom-cli relay`; it says the sender is a
+    /// transient relay session and the real author is an SSH-asserted, UNVERIFIED claim.
+    ///
+    /// `[NON-NULL]`, as [`Self::provenance`]: absent is legal, and an explicit `null` is fatal
+    /// (`null !== undefined`, then `isCrossMachineProvenance(null)` is `false`).
+    #[serde(
+        default,
+        deserialize_with = "present_non_null",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub cross_machine: Option<CrossMachineProvenance>,
     /// The message body (`v0.9.2 broker/client.ts:139-141`).
     pub content: MessageContent,
     /// `[UNKNOWN-FIELDS]` + `[MAP-ONLY]`. This is the capture the relay claim rests on: pi
@@ -638,6 +757,7 @@ impl Default for Message {
             reply_to: None,
             expects_reply: None,
             provenance: None,
+            cross_machine: None,
             content: MessageContent::default(),
             extra: UnknownFields::default(),
         }
@@ -2037,6 +2157,159 @@ mod tests {
         assert_eq!(back["senderSequence"], 7);
         // An integer must relay AS an integer, not as `1700000000000.0`.
         assert!(back["timestamp"].is_u64());
+    }
+
+    /// `message_with(crossMachine)` from `broker/cross-machine-provenance.test.ts`.
+    fn message_with_cross_machine(cross_machine: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "id": "message-1",
+            "timestamp": 1,
+            "crossMachine": cross_machine,
+            "content": { "text": "hello" },
+        })
+    }
+
+    fn valid_cross_machine() -> serde_json::Value {
+        serde_json::json!({
+            "type": "ssh-relay",
+            "version": 1,
+            "trust": "ssh-asserted",
+            "origin": { "name": "worker", "sessionId": "origin-session", "machine": "laptop" },
+        })
+    }
+
+    /// `protocol validates the complete SSH relay provenance discriminator and origin`
+    /// (`broker/cross-machine-provenance.test.ts:22-52`): the complete value passes, every
+    /// malformed variant fails the WHOLE message (`isMessage` is `false`), and the value is
+    /// independent of the extension `provenance` beside it.
+    #[test]
+    fn a_message_validates_the_complete_ssh_relay_provenance() {
+        let accepted: Message =
+            serde_json::from_value(message_with_cross_machine(valid_cross_machine())).unwrap();
+        let provenance = accepted.cross_machine.unwrap();
+        assert_eq!(provenance.kind, CrossMachineKind::SshRelay);
+        assert_eq!(provenance.trust, RelayTrust::SshAsserted);
+        assert_eq!(provenance.origin.name, "worker");
+        assert_eq!(provenance.origin.session_id, "origin-session");
+        assert_eq!(provenance.origin.machine, "laptop");
+
+        let mutate = |edit: &dyn Fn(&mut serde_json::Value)| {
+            let mut value = valid_cross_machine();
+            edit(&mut value);
+            value
+        };
+        let invalid = [
+            ("type ssh", mutate(&|v| v["type"] = "ssh".into())),
+            (
+                "type missing",
+                mutate(&|v| {
+                    v.as_object_mut().unwrap().remove("type");
+                }),
+            ),
+            ("version 2", mutate(&|v| v["version"] = 2.into())),
+            ("version string", mutate(&|v| v["version"] = "1".into())),
+            (
+                "version missing",
+                mutate(&|v| {
+                    v.as_object_mut().unwrap().remove("version");
+                }),
+            ),
+            (
+                "trust verified",
+                mutate(&|v| v["trust"] = "verified".into()),
+            ),
+            (
+                "trust missing",
+                mutate(&|v| {
+                    v.as_object_mut().unwrap().remove("trust");
+                }),
+            ),
+            (
+                "origin missing",
+                mutate(&|v| {
+                    v.as_object_mut().unwrap().remove("origin");
+                }),
+            ),
+            (
+                "origin not an object",
+                mutate(&|v| v["origin"] = serde_json::json!([])),
+            ),
+            (
+                "origin.name number",
+                mutate(&|v| v["origin"]["name"] = 1.into()),
+            ),
+            (
+                "origin.sessionId number",
+                mutate(&|v| v["origin"]["sessionId"] = 1.into()),
+            ),
+            (
+                "origin.machine number",
+                mutate(&|v| v["origin"]["machine"] = 1.into()),
+            ),
+            (
+                "origin.machine missing",
+                mutate(&|v| {
+                    v["origin"].as_object_mut().unwrap().remove("machine");
+                }),
+            ),
+            // `value.crossMachine !== undefined`: an explicit `null` is PRESENT.
+            ("null", serde_json::Value::Null),
+            ("a string", "ssh-relay".into()),
+            ("an array", serde_json::json!([])),
+        ];
+        for (label, cross_machine) in invalid {
+            assert!(
+                serde_json::from_value::<Message>(message_with_cross_machine(cross_machine))
+                    .is_err(),
+                "{label} must fail the whole message"
+            );
+        }
+
+        // Absent is legal, and the extension provenance beside it is validated independently.
+        let mut with_extension = message_with_cross_machine(valid_cross_machine());
+        with_extension["provenance"] = serde_json::json!({
+            "type": "extension_outbox",
+            "extensionId": "extension-id",
+            "extensionName": "Extension",
+            "requestId": "request-id",
+        });
+        let both: Message = serde_json::from_value(with_extension).unwrap();
+        assert!(both.provenance.is_some() && both.cross_machine.is_some());
+        let absent: Message = serde_json::from_value(serde_json::json!({
+            "id": "m", "timestamp": 1, "content": { "text": "hi" }
+        }))
+        .unwrap();
+        assert!(absent.cross_machine.is_none());
+        assert!(
+            serde_json::to_value(&absent)
+                .unwrap()
+                .get("crossMachine")
+                .is_none(),
+            "an absent value serialises to no key at all"
+        );
+    }
+
+    /// `1.0 !== 1` is `false` in JS, so `version: 1.0` passes `isCrossMachineProvenance`; and keys
+    /// the guard does not check — on the provenance and on its origin — round-trip, like every
+    /// other envelope struct here.
+    #[test]
+    fn cross_machine_provenance_round_trips_and_keeps_unchecked_keys() {
+        let mut value = valid_cross_machine();
+        value["origin"]["futureOriginKey"] = serde_json::json!({ "n": [1, 2] });
+        value["futureKey"] = "kept".into();
+        let raw = message_with_cross_machine(value)
+            .to_string()
+            .replace("\"version\":1", "\"version\":1.0");
+        let message: Message = serde_json::from_str(&raw).unwrap();
+        let back = serde_json::to_value(&message).unwrap();
+        assert_eq!(back["crossMachine"]["origin"]["futureOriginKey"]["n"][1], 2);
+        assert_eq!(back["crossMachine"]["futureKey"], "kept");
+        assert_eq!(
+            back["crossMachine"]["version"], 1,
+            "it leaves as the integer 1, the only value the guard accepts"
+        );
+        assert_eq!(back["crossMachine"]["type"], "ssh-relay");
+        assert_eq!(back["crossMachine"]["trust"], "ssh-asserted");
     }
 
     /// `[MAP-ONLY]`, stated rather than inherited. serde derives `visit_seq` for a plain struct, so

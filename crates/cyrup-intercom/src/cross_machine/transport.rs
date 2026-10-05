@@ -7,6 +7,7 @@
 //! (`project-agent.ts`'s `run<T>` vs this file's `runCommand`).
 
 use std::process::Stdio;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use tokio::io::AsyncWriteExt;
@@ -15,6 +16,28 @@ use super::discovery::{
     DISCOVERY_TIMEOUT, DiscoveredRemoteAgent, DiscoveryDeps, DiscoveryError, discover_remote_agent,
 };
 use super::envelope::{CrossMachineEnvelope, CrossMachineOrigin};
+
+/// `process.env.HERDR_BIN_PATH` (`v0.16.0 cross-machine-transport.ts:79`, `index.ts:3052`).
+///
+/// **Not `HERDR_BIN`,** and not a typo here: upstream's cross-machine files read this *other*
+/// spelling, while `project-agent.ts:68` (cyrup: [`cyrup_herdr::cli::HERDR_BIN`]) reads
+/// `HERDR_BIN`, and neither falls back to the other. Adding a fallback would be inventing upstream
+/// behaviour, so the two variables stay as upstream has them; both belong to the herdr vendor, so
+/// neither takes a `CYRUP_` prefix.
+pub const HERDR_BIN_PATH: &str = "HERDR_BIN_PATH";
+
+/// The `herdr` binary cross-machine discovery runs: `deps.herdrBin ?? process.env.HERDR_BIN_PATH ??
+/// "herdr"` (`v0.16.0 cross-machine-transport.ts:79`), the environment half.
+///
+/// A blank value falls through to `"herdr"`, as every other binary ladder in this workspace does
+/// for a variable that was unset badly.
+#[must_use]
+pub fn herdr_bin_from(env: impl Fn(&str) -> Option<String>) -> String {
+    env(HERDR_BIN_PATH)
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| cyrup_herdr::cli::HERDR_BIN_DEFAULT.to_string())
+}
 
 /// `DELIVERY_TIMEOUT_MS = 15_000` (`v0.16.0 cross-machine-transport.ts:5`).
 pub const DELIVERY_TIMEOUT: Duration = Duration::from_millis(15_000);
@@ -61,11 +84,73 @@ pub trait CommandRunner: Send + Sync {
 ///
 /// The three properties that commit named: the promise settles exactly ONCE, the timeout
 /// `SIGKILL`s rather than `SIGTERM`s, and a timed-out run reports code 124 with the flag set.
-/// Single-settle is structural here — `tokio::select!` takes one arm — and `kill_on_drop` is the
-/// `SIGKILL`: dropping the child on the timeout arm kills it, where `wait_with_output` would
-/// otherwise wait for a child that is ignoring signals.
+/// Single-settle is structural here — one `timeout` decides — and the kill is explicit.
+///
+/// A timed-out run still hands back **what the child had written** (`stdout`/`stderr` are
+/// accumulated by `data` handlers upstream and returned from `onClose` whether or not the timer
+/// fired). That is observable: a relay that printed `{"ok":false,"error":…}` and then hung is
+/// reported as `Remote intercom delivery … failed: <error>` rather than as a missing relay.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SpawnRunner;
+
+/// How long a killed child, and the readers draining its pipes, get to finish after the deadline.
+///
+/// Upstream waits for the `close` event, which a grandchild holding the pipe open can postpone
+/// forever; here the wait is bounded so a timed-out run still returns promptly with what was read.
+const KILL_REAP_GRACE: Duration = Duration::from_secs(1);
+
+/// The two tasks copying a child's stdout and stderr into their sinks.
+struct Readers {
+    stdout: Option<tokio::task::JoinHandle<()>>,
+    stderr: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl Readers {
+    /// Wait for both pipes to reach EOF.
+    async fn finished(&mut self) {
+        if let Some(task) = self.stdout.as_mut() {
+            let _ = task.await;
+        }
+        if let Some(task) = self.stderr.as_mut() {
+            let _ = task.await;
+        }
+    }
+
+    fn abort(&self) {
+        for task in [&self.stdout, &self.stderr].into_iter().flatten() {
+            task.abort();
+        }
+    }
+}
+
+/// `child.on("close")`: the process has exited AND its stdio has closed.
+async fn wait_and_drain(
+    child: &mut tokio::process::Child,
+    readers: &mut Readers,
+) -> std::io::Result<std::process::ExitStatus> {
+    let status = child.wait().await?;
+    readers.finished().await;
+    Ok(status)
+}
+
+/// Copy `pipe` into `sink` as it arrives, so a reader that is abandoned at the deadline has
+/// already published everything read so far.
+async fn drain<R: tokio::io::AsyncRead + Unpin>(mut pipe: R, sink: Arc<Mutex<Vec<u8>>>) {
+    use tokio::io::AsyncReadExt;
+    let mut chunk = [0u8; 8192];
+    loop {
+        match pipe.read(&mut chunk).await {
+            Ok(0) | Err(_) => return,
+            Ok(read) => {
+                if let Some(bytes) = chunk.get(..read) {
+                    sink.lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .extend_from_slice(bytes);
+                }
+            }
+        }
+    }
+}
 
 #[async_trait::async_trait]
 impl CommandRunner for SpawnRunner {
@@ -83,38 +168,65 @@ impl CommandRunner for SpawnRunner {
             .stderr(Stdio::piped())
             .kill_on_drop(true)
             .spawn()?;
+        let stdout = Arc::new(Mutex::new(Vec::new()));
+        let stderr = Arc::new(Mutex::new(Vec::new()));
+        let mut readers = Readers {
+            stdout: child
+                .stdout
+                .take()
+                .map(|pipe| tokio::spawn(drain(pipe, Arc::clone(&stdout)))),
+            stderr: child
+                .stderr
+                .take()
+                .map(|pipe| tokio::spawn(drain(pipe, Arc::clone(&stderr)))),
+        };
         // `child.stdin.end(input)` (`:65`) — ALWAYS closed, input or not. A remote relay reading
         // `--envelope-stdin` blocks forever on a pipe that is merely empty.
-        if let Some(mut pipe) = child.stdin.take() {
-            if let Some(input) = stdin {
-                // A write failure is not fatal: the child may have exited already, which the
-                // exit code below reports better than an io error would.
-                let _ = pipe.write_all(input.as_bytes()).await;
-            }
-            let _ = pipe.shutdown().await;
-        }
-        let collected = match timeout {
-            None => child.wait_with_output().await?,
-            Some(limit) => {
-                tokio::select! {
-                    output = child.wait_with_output() => output?,
-                    () = tokio::time::sleep(limit) => {
-                        return Ok(CommandResult {
-                            stdout: String::new(),
-                            stderr: String::new(),
-                            code: 124,
-                            timed_out: true,
-                        });
-                    }
+        //
+        // The write runs INSIDE the deadline. Node's `end(input)` only queues the bytes, so a
+        // child that never reads stdin cannot stall the caller there; a blocking `write_all` of an
+        // envelope larger than the pipe buffer (64 KiB, against a 256 KiB text cap) would, and
+        // would sit outside the 15 s delivery timeout.
+        let mut stdin_pipe = child.stdin.take();
+        let run_to_close = async {
+            if let Some(mut pipe) = stdin_pipe.take() {
+                if let Some(input) = stdin {
+                    // A write failure is not fatal: the child may have exited already, which the
+                    // exit code below reports better than an io error would.
+                    let _ = pipe.write_all(input.as_bytes()).await;
                 }
+                let _ = pipe.shutdown().await;
             }
+            wait_and_drain(&mut child, &mut readers).await
         };
+        let finished = match timeout {
+            None => Some(run_to_close.await),
+            Some(limit) => tokio::time::timeout(limit, run_to_close).await.ok(),
+        };
+        let text = |sink: &Mutex<Vec<u8>>| {
+            String::from_utf8_lossy(&sink.lock().unwrap_or_else(PoisonError::into_inner))
+                .into_owned()
+        };
+        if let Some(status) = finished {
+            return Ok(CommandResult {
+                stdout: text(&stdout),
+                stderr: text(&stderr),
+                // `code ?? 1` — a signal-killed child has no code and reports 1.
+                code: status?.code().unwrap_or(1),
+                timed_out: false,
+            });
+        }
+        // `child.kill("SIGKILL")` (`:59`), then reap it and let the readers drain whatever the
+        // pipes still hold.
+        let _ = child.start_kill();
+        let _ =
+            tokio::time::timeout(KILL_REAP_GRACE, wait_and_drain(&mut child, &mut readers)).await;
+        readers.abort();
         Ok(CommandResult {
-            stdout: String::from_utf8_lossy(&collected.stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&collected.stderr).into_owned(),
-            // `code ?? 1` — a signal-killed child has no code and reports 1.
-            code: collected.status.code().unwrap_or(1),
-            timed_out: false,
+            stdout: text(&stdout),
+            stderr: text(&stderr),
+            code: 124,
+            timed_out: true,
         })
     }
 }
@@ -268,8 +380,9 @@ pub async fn send_cross_machine(
         .get("ok")
         .and_then(serde_json::Value::as_bool)
         .ok_or_else(no_support)?;
+    // A number comparison, so `1.0` is as good as `1`.
     if let Some(version) = object.get("version")
-        && version != &serde_json::json!(1)
+        && version.as_f64() != Some(1.0)
     {
         return Err(no_support());
     }

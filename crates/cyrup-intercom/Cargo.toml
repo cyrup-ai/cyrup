@@ -81,9 +81,11 @@ tracing = "0.1.44"
 # broker_wait_error}`), so the DEPENDENCY has to be gated too or the crate — and with it the `cyrup`
 # binary, which takes cyrup-intercom as a non-optional dependency — cannot be produced for Windows.
 # `signal` = the kill(pid,0) liveness probe; `process` = setsid (unused today — detach uses the
-# unsafe-free `process_group(0)`, mirroring cyrup-ext-subagents' spawn precedent).
+# unsafe-free `process_group(0)`, mirroring cyrup-ext-subagents' spawn precedent); `hostname` =
+# `gethostname`, the default `crossMachine.machineName` (`os.hostname()`, `config.ts:84`), which
+# `/proc` and `/etc/hostname` cannot supply on macOS.
 [target.'cfg(unix)'.dependencies]
-nix = { workspace = true, features = ["signal", "process"] }
+nix = { workspace = true, features = ["signal", "process", "hostname"] }
 
 [[bin]]
 # The real-broker-participant test-double `cyrup`-child stand-in (the claim-6 production-activation
