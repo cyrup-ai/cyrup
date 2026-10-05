@@ -87,7 +87,7 @@ impl SubagentExecutor {
             self.remembered_parent_model(),
             // SUBA-003: the cwd's `subagents.modelScope` policy, so a foreground chain/parallel
             // step's own `model:` is policed exactly as a single run's `model` is.
-            Self::resolve_model_scope(cwd, &cfg.roots)?,
+            self.resolve_model_scope_for_launch(cwd, &cfg.roots)?,
             // The extension config's in-process binary override, from the same snapshot this
             // function already took. `None` for every ordinary configuration, which leaves each
             // step resolving its command from the environment as before.

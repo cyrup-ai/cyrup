@@ -5,6 +5,67 @@ next work item**.
 
 ---
 
+# UPDATE 2026-10-04 (subagent mediums) — two mediums closed, both fail-open or unreachable rather than unwritten
+
+> Two `medium` rows in `cyrup-ext-subagents`, one lane each, read against the pin
+> (`pi-subagents v0.75.0`) through git objects only. **Neither row was what it said it was**, and in both
+> cases the correction matters more than the diff.
+>
+> The count is whatever `python3 docs/gap-analysis/scripts/count_open_items.py` prints: **156 open — 0
+> critical, 0 high, 9 medium, 147 low; 17 trackers; 875 closed; 1 duplicate not counted**. By area: `01` 28, `02` 1, `03` 7, `04` 5, `05` 7, `06` 18, `07` 25, `08` 7, `09` 2, `09b` 26, `10` 1, `11` 10, `12` 2, `14` 0, `16` 2, `17` 1, `18` 13, `09a` 1.
+> Arithmetic: open 158 − 2 = 156; medium 11 − 2 = 9; closed 873 + 2 = 875; nothing filed.
+>
+> ## Closed
+>
+> * **`SUBA-155`** (`09b`) — `modelScope` reaches full parity. **Most of this row was already implemented**
+>   by `81200403`, which is on `main`: it added `ModelScopeRule`, `ModelScopeConfig.agents`,
+>   `resolve_model_scopes_for_agent`, `expand_reserved_patterns`, the render cap and the `agents` parser arm
+>   (verified absent in `81200403^`). So the row's own `CORRECTED 2026-10-03` note — which says the config
+>   has three fields and no `agents` — **had itself gone stale**, and the row needed a second correction,
+>   not just a strike.
+>
+>   What `81200403` left were two upstream behaviours that no launch path could reach. `scoped` never
+>   resolved, because both production call sites passed `None` for the snapshot while citing a `RunOptions`
+>   field that does not exist — so `allow: ["scoped"]` could only ever degrade to `inherit`. And an armed
+>   `inherit`/`scoped` with no parent session model **failed OPEN**: the refusal was ported and tested at
+>   `model_scope.rs:347`, but `#[cfg(test)]` starts at `:693` and every one of its four callers sat after
+>   it. A green suite was proving a function that production never called, and the launch went ahead on the
+>   persona's model with a log line where pi refuses.
+>
+> * **`SUBA-164`** (`09b`) — `tool_open_threshold` attention is ported, so a child wedged in one long tool
+>   call now raises `needs_attention` naming the call, where `derive_activity_state` previously returned
+>   `None` and the supervisor never learned. The threshold decision is a pure function of
+>   `(now, open-since, threshold)`, so no test sleeps or reads a clock and the inclusive `>=` boundary is
+>   pinned at 999 vs 1000 ms. Three PRE-EXISTING tests also go red when the threshold is forced true, which
+>   is the evidence that the branch is wired into the real fold rather than sitting beside it.
+>
+>   Its cite corrections are worth keeping: the row's `shouldEmitOpenToolAttention` range stopped one line
+>   short of the `>=` comparison — the one line that fixes both the clock and the boundary — and the row
+>   never cited `subagent-runner.ts:3204`, the driver that establishes the idle → open-tool → long-running
+>   ordering and the only way to check that pi's two runners agree. **Upstream's v0.75.0 CHANGELOG
+>   miscredits this fix** to `#2598`; the row's `#2613` is right, so reconciling against pi's CHANGELOG
+>   would turn a correct row into a wrong one.
+>
+> Both lanes shared one working tree. The cargo lock serialises invocations but not source edits, so one
+> lane's revert-to-red windows were briefly visible to the other's test runs — which is why the gate
+> numbers below were re-measured by the coordinator on the finished tree rather than taken from either
+> lane's report.
+>
+> **Gates** (combined tree, both commits): `cargo fmt --all -- --check` clean; `cargo clippy --workspace
+> --all-targets -- -D warnings` exit 0 with 0 warnings, a real re-check at 2m54s after touching both
+> edited files; `cargo nextest run --workspace --no-fail-fast` **13482 passed, 0 failed, 11 skipped**.
+>
+> The test delta was measured by diffing the suite's own test-name sets against the `#180` tree rather
+> than taken from either lane's count, which is how the one removal in it was caught: **18 tests added**
+> (11 in `exec::control::tests`, 7 in `exec::model_scope::tests` — the lanes self-reported 10 and 4) and
+> **1 renamed**, `the_scoped_token_expands_to_the_snapshot_and_degrades_to_inherit` →
+> `…_resolves_to_…`, following the signature change that moved snapshot substitution out of
+> `expand_reserved_patterns`. The rename is not a weakening: the new body keeps all three original cases
+> and adds the control that the parent's OWN model is refused when it sits outside the snapshot, which is
+> what demonstrates `scoped` is not silently behaving as `inherit`. Net +17.
+>
+> ---
+>
 # UPDATE 2026-10-04 (second hygiene pass) — seven implemented rows struck (five counted here, two in area 13), and one defect found, fixed and closed in the same pass
 
 > **This block sits above the 2026-10-04 (ledger hygiene) block and corrects its counts.** It records

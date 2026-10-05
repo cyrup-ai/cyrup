@@ -34,6 +34,33 @@
 //! every other orchestrator decision does: baked into the serialized
 //! [`crate::background::runner_main::RunnerConfig`] handed over `--config`, so a background run
 //! enforces the same policy the foreground path does.
+//!
+//! # Reserved allow tokens resolve in TWO phases
+//!
+//! Upstream's `expandReservedPatterns` takes the parent model AND the parent session's scoped-model
+//! snapshot together, because `resolveModelScopesForAgent` runs in-process at every launch with
+//! `ctx.scopedModels` one property access away (`src/runs/shared/model-scope.ts:105-118`,
+//! `model-resolution.ts:66-76` @v0.75.0). cyrup's launches cross a process boundary — a background
+//! run resolves its models inside the detached hop-2 runner, which has no host at all — so the
+//! snapshot has to be CAPTURED at launch rather than read at resolution. It is captured by
+//! substituting it into the policy itself:
+//!
+//! 1. **shell**, once per launch, where the host is reachable:
+//!    [`ModelScopeConfig::with_scoped_snapshot`] replaces every `scoped` token — in the global
+//!    `allow` and in each `agents.<name>.allow` — with the ids
+//!    [`scoped_model_ids_from_host`] read off [`cyrup_ext::host::HostServices::scoped_models`].
+//!    A snapshot that is EMPTY substitutes nothing, which leaves the token for phase 2.
+//! 2. **core**, at resolution: [`expand_reserved_patterns`] turns a surviving `inherit` — or a
+//!    `scoped` that phase 1 found no snapshot for — into the parent session's `provider/id`, and
+//!    leaves it literal when there is no parent model at all (upstream's fail-closed rule).
+//!
+//! The composition is upstream's function, case for case: a non-empty snapshot yields the
+//! snapshot; an empty one degrades `scoped` to `inherit` semantics; neither leaves the token
+//! unexpanded. What it additionally buys is that a background run enforces the snapshot its parent
+//! held when the run was LAUNCHED, which is upstream's own rule for background runs, without a
+//! second field on [`crate::exec::RunOptions`] and
+//! [`crate::background::runner_main::RunnerConfig`] that could drift out of step with the parent
+//! model beside it.
 
 use crate::exec::split_known_thinking_suffix;
 
@@ -92,6 +119,59 @@ pub struct ModelScopeConfig {
 }
 
 impl ModelScopeConfig {
+    /// SUBA-155 — phase 1 of the reserved-token resolution (see the module header): substitute the
+    /// parent session's scoped-model snapshot for every `scoped` token, in the global `allow` and
+    /// in every `agents.<name>.allow`.
+    ///
+    /// An EMPTY snapshot substitutes nothing and returns the policy unchanged, so the token
+    /// survives into [`expand_reserved_patterns`] and degrades to `inherit` semantics there —
+    /// upstream's `if (scopedModelIds?.length) … return parentModel ? … : [pattern]`
+    /// (`model-scope.ts:113-116` @v0.75.0). That is also what keeps an unresolvable `scoped` naming
+    /// ITSELF in the refusal rather than naming `inherit`.
+    ///
+    /// Applied at each launch (so a mid-session re-scope is picked up) and before a background
+    /// run's policy is serialized (so that run enforces the snapshot its parent held at launch).
+    #[must_use]
+    pub fn with_scoped_snapshot(&self, scoped_model_ids: &[String]) -> Self {
+        if scoped_model_ids.is_empty() {
+            return self.clone();
+        }
+        let substitute = |allow: Option<&Vec<String>>| -> Option<Vec<String>> {
+            allow.map(|patterns| {
+                patterns
+                    .iter()
+                    .flat_map(|pattern| {
+                        if pattern == SCOPED_PATTERN {
+                            scoped_model_ids.to_vec()
+                        } else {
+                            vec![pattern.clone()]
+                        }
+                    })
+                    .collect()
+            })
+        };
+        Self {
+            enforce: self.enforce,
+            strict: self.strict,
+            allow: substitute(self.allow.as_ref()),
+            agents: self.agents.as_ref().map(|agents| {
+                agents
+                    .iter()
+                    .map(|(name, rule)| {
+                        (
+                            name.clone(),
+                            ModelScopeRule {
+                                enforce: rule.enforce,
+                                strict: rule.strict,
+                                allow: substitute(rule.allow.as_ref()),
+                            },
+                        )
+                    })
+                    .collect()
+            }),
+        }
+    }
+
     /// True iff enforcement is actually armed: `enforce: true` AND a non-empty `allow` list. A
     /// config that is enforcing with no patterns is a no-op (the settings parser rejects that
     /// combination, but this stays defensive for callers building configs programmatically — pi
@@ -183,6 +263,43 @@ pub const SCOPED_PATTERN: &str = "scoped";
 /// `provider/id`.
 pub const INHERIT_PATTERN: &str = "inherit";
 
+/// SUBA-155 — the two `allow` patterns that are NOT patterns: they name a model set the policy
+/// cannot know by itself and that has to be substituted before any matching happens.
+///
+/// An explicit enum rather than the `&'static str` the refusal used to carry, because the two
+/// differ in what they resolve AGAINST (the parent model vs. the parent's scoped snapshot) and in
+/// which phase resolves them, and a caller that has to compare strings to tell them apart cannot
+/// be made exhaustive by the compiler when a third token is added.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReservedScopeToken {
+    /// `inherit` — the parent session's `provider/id`.
+    Inherit,
+    /// `scoped` — the parent session's scoped-model snapshot (pi's `/scoped-models`), degrading to
+    /// [`Self::Inherit`] when the parent is unscoped.
+    Scoped,
+}
+
+impl ReservedScopeToken {
+    /// The literal spelling an operator writes in `allow`, and the one a refusal names.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Inherit => INHERIT_PATTERN,
+            Self::Scoped => SCOPED_PATTERN,
+        }
+    }
+
+    /// `Some` iff this `allow` entry is a reserved token rather than a glob.
+    #[must_use]
+    pub fn parse(pattern: &str) -> Option<Self> {
+        match pattern {
+            INHERIT_PATTERN => Some(Self::Inherit),
+            SCOPED_PATTERN => Some(Self::Scoped),
+            _ => None,
+        }
+    }
+}
+
 /// SUBA-155 — pi `MAX_RENDERED_PATTERNS` (`model-scope.ts:53`): a violation message renders at
 /// most this many patterns and then says how many there are in total, so a hundred-pattern
 /// allowlist does not become a hundred-pattern error string.
@@ -214,51 +331,71 @@ impl ResolvedModelScope {
 
     /// Whether this scope still holds an UNEXPANDED reserved token — i.e. the parent session had
     /// no model (and, for `scoped`, no snapshot) to expand it against.
+    ///
+    /// `inherit` wins when both are present, matching upstream's
+    /// `allow?.includes(INHERIT_MODEL) ? INHERIT_MODEL : SCOPED_PATTERN`
+    /// (`model-resolution.ts:302` @v0.75.0).
     #[must_use]
-    fn holds_unexpanded_reserved_token(&self) -> Option<&'static str> {
-        if self.allow.iter().any(|p| p == INHERIT_PATTERN) {
-            Some(INHERIT_PATTERN)
-        } else if self.allow.iter().any(|p| p == SCOPED_PATTERN) {
-            Some(SCOPED_PATTERN)
-        } else {
-            None
+    fn holds_unexpanded_reserved_token(&self) -> Option<ReservedScopeToken> {
+        let mut found = None;
+        for pattern in &self.allow {
+            match ReservedScopeToken::parse(pattern) {
+                Some(ReservedScopeToken::Inherit) => return Some(ReservedScopeToken::Inherit),
+                Some(token) => found = Some(token),
+                None => {}
+            }
         }
+        found
     }
 }
 
-/// SUBA-155 — pi `expandReservedPatterns` (`model-scope.ts:105-114` @v0.74.0).
+/// SUBA-155 — phase 2 of the reserved-token resolution: pi `expandReservedPatterns`
+/// (`model-scope.ts:108-119` @v0.75.0) with the snapshot arm already applied by
+/// [`ModelScopeConfig::with_scoped_snapshot`] (see the module header).
 ///
-/// `inherit` becomes the parent session's `provider/id`; `scoped` becomes the parent's
-/// scoped-model snapshot (pi's `/scoped-models`) and, when that snapshot is empty, degrades to
-/// `inherit` semantics. A token that cannot be expanded is returned UNEXPANDED, so an enforced
-/// scope made only of reserved tokens matches nothing and the run is refused rather than admitted
-/// — upstream's stated fail-closed rule. Every other pattern passes through untouched.
+/// Both surviving tokens become the parent session's `provider/id`: that is `inherit`'s whole
+/// meaning, and it is what `scoped` degrades to once phase 1 has established that the parent holds
+/// no snapshot (upstream's `return parentModel ? [...] : [pattern]`). A token that cannot be
+/// expanded is returned UNEXPANDED, so an enforced scope made only of reserved tokens matches
+/// nothing and the run is refused rather than admitted — upstream's stated fail-closed rule. Every
+/// other pattern passes through untouched.
 #[must_use]
-pub fn expand_reserved_patterns(
-    pattern: &str,
-    parent_model: Option<&str>,
-    scoped_model_ids: Option<&[String]>,
-) -> Vec<String> {
-    if pattern == SCOPED_PATTERN {
-        if let Some(ids) = scoped_model_ids.filter(|ids| !ids.is_empty()) {
-            return ids.to_vec();
-        }
-        return match parent_model {
-            Some(model) => vec![model.to_string()],
-            None => vec![pattern.to_string()],
-        };
+pub fn expand_reserved_patterns(pattern: &str, parent_model: Option<&str>) -> Vec<String> {
+    match (ReservedScopeToken::parse(pattern), parent_model) {
+        (Some(_), Some(model)) => vec![model.to_string()],
+        (Some(_) | None, _) => vec![pattern.to_string()],
     }
-    if pattern == INHERIT_PATTERN {
-        return match parent_model {
-            Some(model) => vec![model.to_string()],
-            None => vec![pattern.to_string()],
-        };
-    }
-    vec![pattern.to_string()]
+}
+
+/// SUBA-155 — pi `scopedModelIdsFromContext` (`model-resolution.ts:66-76` @v0.75.0) over the JSON
+/// [`cyrup_ext::host::HostServices::scoped_models`] reports (pi's `ctx.scopedModels`, the set
+/// `/scoped-models` shows — EXT-045 wired the live reader).
+///
+/// Each row's `model` must carry BOTH a non-empty `provider` and a non-empty `id` to become a
+/// `provider/id` entry — upstream's `normalizeParentModel` gate (`model-resolution.ts:55-58`),
+/// which rejects `""`, a bare provider and a bare id. Anything else in the array is skipped
+/// rather than poisoning the allowlist with a half-formed pattern. A missing or non-array value
+/// (no host bound, headless) is the empty snapshot, which is upstream's documented "empty when no
+/// scoping is configured" and the input `with_scoped_snapshot` treats as "nothing to substitute".
+#[must_use]
+pub fn scoped_model_ids_from_host(scoped_models: Option<&serde_json::Value>) -> Vec<String> {
+    let Some(rows) = scoped_models.and_then(serde_json::Value::as_array) else {
+        return Vec::new();
+    };
+    rows.iter()
+        .filter_map(|row| {
+            let model = row.get("model")?;
+            let provider = model.get("provider")?.as_str()?;
+            let id = model.get("id")?.as_str()?;
+            (!provider.is_empty() && !id.is_empty()).then(|| format!("{provider}/{id}"))
+        })
+        .collect()
 }
 
 /// SUBA-155 — the three inputs a launch-time scope resolution needs, as one value (pi passes them
-/// as `resolveModelScopesForAgent`'s four parameters, `model-scope.ts:160` @v0.74.0).
+/// as `resolveModelScopesForAgent`'s parameters, `model-scope.ts:161` @v0.75.0; its fourth, the
+/// scoped-model snapshot, is phase 1's and is already folded into `config` — see the module
+/// header).
 ///
 /// Bundled rather than spread because they travel TOGETHER through every launch path and are
 /// meaningless apart: a config without the agent name silently drops per-agent rules, and a config
@@ -266,32 +403,25 @@ pub fn expand_reserved_patterns(
 /// that has only some of them impossible to write.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ModelScopeContext<'a> {
-    /// The `subagents.modelScope` block in force, or `None` for no policy at all.
+    /// The `subagents.modelScope` block in force — with the parent's scoped-model snapshot already
+    /// substituted by [`ModelScopeConfig::with_scoped_snapshot`] — or `None` for no policy at all.
     pub config: Option<&'a ModelScopeConfig>,
     /// The canonical agent name, which selects a `modelScope.agents.<name>` rule.
     pub agent_name: &'a str,
-    /// The parent session's model as `provider/id`, which `inherit`/`scoped` expand to.
+    /// The parent session's model as `provider/id`, which a surviving `inherit`/`scoped` token
+    /// expands to.
     pub parent_model: Option<&'a str>,
-    /// The parent session's scoped-model snapshot (pi's `/scoped-models`), which `scoped` expands
-    /// to. `None` degrades `scoped` to `inherit` semantics, exactly as an EMPTY snapshot does
-    /// upstream (`model-scope.ts:106-108`).
-    pub scoped_model_ids: Option<&'a [String]>,
 }
 
 impl ModelScopeContext<'_> {
     /// [`resolve_model_scopes_for_agent`] over this context's own fields.
     #[must_use]
     pub fn resolve(&self) -> Vec<ResolvedModelScope> {
-        resolve_model_scopes_for_agent(
-            self.config,
-            self.agent_name,
-            self.parent_model,
-            self.scoped_model_ids,
-        )
+        resolve_model_scopes_for_agent(self.config, self.agent_name, self.parent_model)
     }
 }
 
-/// SUBA-155 — pi `resolveModelScopesForAgent` (`model-scope.ts:160-181` @v0.74.0): the global
+/// SUBA-155 — pi `resolveModelScopesForAgent` (`model-scope.ts:161-188` @v0.75.0): the global
 /// policy and, when one is configured for this agent, the per-agent policy, as INDEPENDENT checks.
 ///
 /// The agent scope inherits `enforce`/`strict` from the global block when it does not state them
@@ -302,7 +432,6 @@ pub fn resolve_model_scopes_for_agent(
     config: Option<&ModelScopeConfig>,
     agent_name: &str,
     parent_model: Option<&str>,
-    scoped_model_ids: Option<&[String]>,
 ) -> Vec<ResolvedModelScope> {
     let Some(config) = config else {
         return Vec::new();
@@ -310,7 +439,7 @@ pub fn resolve_model_scopes_for_agent(
     let expand = |patterns: &[String]| -> Vec<String> {
         patterns
             .iter()
-            .flat_map(|pattern| expand_reserved_patterns(pattern, parent_model, scoped_model_ids))
+            .flat_map(|pattern| expand_reserved_patterns(pattern, parent_model))
             .collect()
     };
     let mut scopes = Vec::new();
@@ -335,19 +464,80 @@ pub fn resolve_model_scopes_for_agent(
     scopes
 }
 
-/// SUBA-155 — pi `throwForUnresolvedEnforcedReservedScope` (`model-resolution.ts:287-296`
-/// @v0.74.0): the message for an ENFORCED scope whose reserved token could not be expanded,
+/// SUBA-155 — why a launch was refused by `subagents.modelScope`, as the two cases upstream
+/// genuinely has rather than one struct that has to pretend.
+///
+/// pi throws two different `Error`s on this path: `checkModelScope`'s violation message
+/// (`model-scope.ts:101-103` @v0.75.0) and `throwForUnresolvedEnforcedReservedScope`'s
+/// (`model-resolution.ts:303`). The second has no model and no allowlist to report — it fires
+/// BEFORE any model is resolved, precisely because the policy could not be made concrete — so
+/// expressing it as a [`ModelScopeViolation`] would mean inventing a model and an `allowedPatterns`
+/// list the refusal never had. Each variant carries exactly what its own case knows, and
+/// [`Self::message`] renders pi's verbatim sentence for either.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ModelScopeRefusal {
+    /// A resolved model fell outside an armed scope at error severity.
+    OutOfScope(ModelScopeViolation),
+    /// An armed scope's reserved token could not be made concrete: the host reports no current
+    /// parent session model, so there is nothing for `inherit`/`scoped` to name.
+    UnresolvableReservedToken {
+        /// `modelScope`, or `modelScope.agents.<name>` — which block cannot be enforced.
+        origin: String,
+        /// Which token is unresolvable.
+        token: ReservedScopeToken,
+    },
+}
+
+impl ModelScopeRefusal {
+    /// pi's verbatim refusal sentence, which is what reaches the caller as
+    /// [`crate::error::SubagentError::ModelOutOfScope`] / a step failure.
+    #[must_use]
+    pub fn message(&self) -> String {
+        match self {
+            Self::OutOfScope(violation) => violation.message.clone(),
+            Self::UnresolvableReservedToken { origin, token } => format!(
+                "Cannot enforce subagent model scope ({origin}): '{}' requires a current parent \
+                 session model.",
+                token.as_str()
+            ),
+        }
+    }
+
+    /// The out-of-scope decision, for a caller that wants the severity/patterns rather than the
+    /// sentence. `None` for the unresolvable-token case, which has neither.
+    #[must_use]
+    pub fn violation(&self) -> Option<&ModelScopeViolation> {
+        match self {
+            Self::OutOfScope(violation) => Some(violation),
+            Self::UnresolvableReservedToken { .. } => None,
+        }
+    }
+}
+
+impl From<ModelScopeViolation> for ModelScopeRefusal {
+    fn from(violation: ModelScopeViolation) -> Self {
+        Self::OutOfScope(violation)
+    }
+}
+
+/// SUBA-155 — pi `throwForUnresolvedEnforcedReservedScope` (`model-resolution.ts:295-304`
+/// @v0.75.0): the refusal for an ENFORCED scope whose reserved token could not be expanded,
 /// because the host has no current parent session model.
 ///
 /// `include_mixed` is upstream's own second mode: with it, ANY unexpanded reserved token in the
-/// list is reported (the no-requested-model path); without it, only a list that is nothing BUT one
-/// reserved token. Without this the refusal still happens — an unexpanded token matches no model —
-/// but it names a meaningless allowlist of one literal word instead of saying why.
+/// list is refused (the no-explicit-model and inherited-source paths); without it, only a list
+/// that is nothing BUT one reserved token — so an `allow: ["inherit", "openai/*"]` still admits an
+/// explicitly requested `openai/gpt-5` on a headless host instead of refusing it outright.
+///
+/// This must be consulted BEFORE resolution: without it the refusal still happens (an unexpanded
+/// token matches no model), but only for the model that happens to be resolved, at warn severity
+/// on an inherited source — so an enforced policy the host cannot make concrete would print a
+/// warning and run the model anyway. Upstream fails CLOSED and says why.
 #[must_use]
-pub fn unresolved_enforced_reserved_scope_message(
+pub fn unresolvable_enforced_reserved_scope(
     scopes: &[ResolvedModelScope],
     include_mixed: bool,
-) -> Option<String> {
+) -> Option<ModelScopeRefusal> {
     let found = scopes.iter().find(|scope| {
         scope.enforce == Some(true)
             && if include_mixed {
@@ -356,11 +546,10 @@ pub fn unresolved_enforced_reserved_scope_message(
                 scope.allow.len() == 1 && scope.holds_unexpanded_reserved_token().is_some()
             }
     })?;
-    let token = found.holds_unexpanded_reserved_token()?;
-    Some(format!(
-        "Cannot enforce subagent model scope ({}): '{token}' requires a current parent session model.",
-        found.origin
-    ))
+    Some(ModelScopeRefusal::UnresolvableReservedToken {
+        origin: found.origin.clone(),
+        token: found.holds_unexpanded_reserved_token()?,
+    })
 }
 
 /// Case-insensitive glob match where only `*` is special (pi `globToRegExp` + `matchesScopePattern`,
@@ -713,7 +902,7 @@ mod tests {
     /// so the rows below that are about `checkModelScope` alone keep reading as before. Rows about
     /// the resolution itself call [`resolve_model_scopes_for_agent`] directly.
     fn resolved(config: &ModelScopeConfig) -> ResolvedModelScope {
-        resolve_model_scopes_for_agent(Some(config), "worker", None, None)
+        resolve_model_scopes_for_agent(Some(config), "worker", None)
             .into_iter()
             .next()
             .unwrap_or_else(|| ResolvedModelScope {
@@ -736,8 +925,7 @@ mod tests {
     #[test]
     fn the_inherit_token_expands_to_the_parent_session_model() {
         let config = scope(&["inherit"]);
-        let scopes =
-            resolve_model_scopes_for_agent(Some(&config), "worker", Some("openai/gpt-5"), None);
+        let scopes = resolve_model_scopes_for_agent(Some(&config), "worker", Some("openai/gpt-5"));
         assert_eq!(scopes.len(), 1);
         assert_eq!(scopes[0].allow, vec!["openai/gpt-5".to_string()]);
         assert_eq!(scopes[0].origin, "modelScope");
@@ -760,7 +948,7 @@ mod tests {
     #[test]
     fn an_unexpandable_reserved_token_fails_closed_and_says_why() {
         let config = scope(&["inherit"]);
-        let scopes = resolve_model_scopes_for_agent(Some(&config), "worker", None, None);
+        let scopes = resolve_model_scopes_for_agent(Some(&config), "worker", None);
         assert_eq!(
             scopes[0].allow,
             vec!["inherit".to_string()],
@@ -771,53 +959,126 @@ mod tests {
             "with no parent model an enforced `inherit` admits nothing"
         );
         assert_eq!(
-            unresolved_enforced_reserved_scope_message(&scopes, false).as_deref(),
+            unresolvable_enforced_reserved_scope(&scopes, false)
+                .as_ref()
+                .map(ModelScopeRefusal::message),
             Some(
                 "Cannot enforce subagent model scope (modelScope): 'inherit' requires a current \
                  parent session model."
+                    .to_string()
             )
         );
         // A resolvable scope says nothing.
         let resolvable =
-            resolve_model_scopes_for_agent(Some(&config), "worker", Some("openai/gpt-5"), None);
+            resolve_model_scopes_for_agent(Some(&config), "worker", Some("openai/gpt-5"));
         assert_eq!(
-            unresolved_enforced_reserved_scope_message(&resolvable, true),
+            unresolvable_enforced_reserved_scope(&resolvable, true),
             None
         );
     }
 
-    /// SUBA-155 — `scoped` expands to the parent's scoped-model snapshot (pi's `/scoped-models`),
-    /// and degrades to `inherit` semantics when that snapshot is empty (`model-scope.ts:106-108`).
+    /// SUBA-155 — `scoped` resolves to the parent's scoped-model snapshot (pi's `/scoped-models`),
+    /// and degrades to `inherit` semantics when that snapshot is empty
+    /// (`model-scope.ts:113-116` @v0.75.0).
+    ///
+    /// Asserted over the COMPOSITION of the two phases cyrup splits upstream's one function into
+    /// (module header), case for case against upstream's own four: a non-empty snapshot yields the
+    /// snapshot; an empty snapshot plus a parent model yields that model; neither leaves the token
+    /// literal, which is fail-closed and names `scoped` — not `inherit` — in the refusal.
     #[test]
-    fn the_scoped_token_expands_to_the_snapshot_and_degrades_to_inherit() {
+    fn the_scoped_token_resolves_to_the_snapshot_and_degrades_to_inherit() {
         let config = scope(&[SCOPED_PATTERN]);
         let snapshot = vec!["openai/gpt-5".to_string(), "anthropic/opus".to_string()];
+
         let scopes = resolve_model_scopes_for_agent(
-            Some(&config),
+            Some(&config.with_scoped_snapshot(&snapshot)),
             "worker",
             Some("openai/gpt-4"),
-            Some(&snapshot),
         );
         assert_eq!(scopes[0].allow, snapshot, "the whole snapshot is admitted");
+        assert!(
+            check_model_scope(Some("anthropic/opus"), &scopes[0], ModelSource::Explicit).is_none(),
+            "a model in the snapshot is admitted even though it is not the parent's own model"
+        );
+        assert!(
+            check_model_scope(Some("openai/gpt-4"), &scopes[0], ModelSource::Explicit).is_some(),
+            "the control: the parent's OWN model is refused when it is outside the snapshot, so \
+             `scoped` is not silently behaving as `inherit`"
+        );
 
-        // Empty snapshot → the parent model alone.
+        // Empty snapshot → nothing substituted, so phase 2 degrades the token to the parent model.
         let degraded = resolve_model_scopes_for_agent(
-            Some(&config),
+            Some(&config.with_scoped_snapshot(&[])),
             "worker",
             Some("openai/gpt-4"),
-            Some(&[]),
         );
         assert_eq!(degraded[0].allow, vec!["openai/gpt-4".to_string()]);
 
-        // Neither → literal, i.e. fail closed.
-        let closed = resolve_model_scopes_for_agent(Some(&config), "worker", None, None);
+        // Neither → literal, i.e. fail closed, and the refusal names `scoped`.
+        let closed =
+            resolve_model_scopes_for_agent(Some(&config.with_scoped_snapshot(&[])), "worker", None);
         assert_eq!(closed[0].allow, vec![SCOPED_PATTERN.to_string()]);
         assert_eq!(
-            unresolved_enforced_reserved_scope_message(&closed, false).as_deref(),
+            unresolvable_enforced_reserved_scope(&closed, false)
+                .as_ref()
+                .map(ModelScopeRefusal::message),
             Some(
                 "Cannot enforce subagent model scope (modelScope): 'scoped' requires a current \
                  parent session model."
+                    .to_string()
             )
+        );
+    }
+
+    /// SUBA-155 — phase 1 substitutes the snapshot into the PER-AGENT lists too, which is the only
+    /// way `modelScope.agents.<name>: {allow: ["scoped"]}` can mean anything.
+    #[test]
+    fn the_snapshot_is_substituted_into_per_agent_allow_lists() {
+        let mut config = scope(&[SCOPED_PATTERN]);
+        config.agents = Some(std::collections::BTreeMap::from([(
+            "reviewer".to_string(),
+            ModelScopeRule {
+                enforce: None,
+                strict: None,
+                allow: Some(vec![SCOPED_PATTERN.to_string(), "anthropic/*".to_string()]),
+            },
+        )]));
+        let snapshot = vec!["openai/gpt-5".to_string()];
+        let substituted = config.with_scoped_snapshot(&snapshot);
+        let agent_allow = substituted
+            .agents
+            .as_ref()
+            .and_then(|map| map.get("reviewer"))
+            .and_then(|rule| rule.allow.as_deref())
+            .expect("the per-agent rule survived substitution");
+        assert_eq!(
+            agent_allow,
+            ["openai/gpt-5".to_string(), "anthropic/*".to_string()],
+            "`scoped` is replaced in place and every other pattern is left alone"
+        );
+    }
+
+    /// SUBA-155 — pi `scopedModelIdsFromContext` (`model-resolution.ts:66-76` @v0.75.0) over the
+    /// JSON shape `HostServices::scoped_models` reports (`{model: {provider, id}, thinkingLevel?}`).
+    ///
+    /// The `normalizeParentModel` gate is the load-bearing part: a half-formed row must be SKIPPED,
+    /// never turned into a pattern like `anthropic/` that would silently widen or narrow the
+    /// allowlist.
+    #[test]
+    fn the_host_snapshot_reader_keeps_only_well_formed_provider_id_rows() {
+        assert!(scoped_model_ids_from_host(None).is_empty());
+        assert!(scoped_model_ids_from_host(Some(&serde_json::json!({}))).is_empty());
+        assert_eq!(
+            scoped_model_ids_from_host(Some(&serde_json::json!([
+                {"model": {"provider": "openai", "id": "gpt-5"}, "thinkingLevel": "high"},
+                {"model": {"provider": "anthropic", "id": "opus"}},
+                {"model": {"provider": "", "id": "x"}},
+                {"model": {"provider": "y", "id": ""}},
+                {"model": {"provider": "z"}},
+                {"model": "openai/gpt-5"},
+                {}
+            ]))),
+            vec!["openai/gpt-5".to_string(), "anthropic/opus".to_string()]
         );
     }
 
@@ -840,12 +1101,12 @@ mod tests {
         )]));
 
         // An agent with no rule of its own sees only the global scope.
-        let worker = resolve_model_scopes_for_agent(Some(&config), "worker", None, None);
+        let worker = resolve_model_scopes_for_agent(Some(&config), "worker", None);
         assert_eq!(worker.len(), 1);
         assert_eq!(worker[0].origin, "modelScope");
 
         // The named agent gets BOTH checks, and the second one carries the global flags.
-        let reviewer = resolve_model_scopes_for_agent(Some(&config), "reviewer", None, None);
+        let reviewer = resolve_model_scopes_for_agent(Some(&config), "reviewer", None);
         assert_eq!(reviewer.len(), 2);
         assert_eq!(reviewer[1].origin, "modelScope.agents.reviewer");
         assert_eq!(reviewer[1].enforce, Some(true), "enforce ?? config.enforce");
@@ -1298,6 +1559,297 @@ mod tests {
         assert_eq!(
             parse_model_scope_config(Some(&serde_json::json!({}))),
             Ok(None)
+        );
+    }
+
+    // ===================================================================================
+    // SUBA-155 — the policy as an OPERATOR writes it, through the real launch resolver
+    // ===================================================================================
+
+    /// Pi's documented policy block, verbatim, for the tests below to parse rather than hand-build
+    /// — a hand-built `ModelScopeConfig` cannot catch a parser that drops a key.
+    fn parsed(json: serde_json::Value) -> ModelScopeConfig {
+        parse_model_scope_config(Some(&json))
+            .expect("the documented block is valid")
+            .expect("the block says something")
+    }
+
+    /// SUBA-155's headline scenario, end to end through the launch resolver rather than the pure
+    /// core: a policy written the way pi DOCUMENTS it must resolve the way pi resolves it.
+    ///
+    /// THE USER ACTION: an operator wants subagents pinned to whatever model the parent session is
+    /// on, copies `"modelScope": {"enforce": true, "allow": ["inherit"]}` out of pi's reference
+    /// into `settings.json`, and launches a subagent with an explicit `model`. Matched literally,
+    /// `inherit` matches no `provider/id` at all, so EVERY explicit model was refused with
+    /// `SubagentError::ModelOutOfScope` naming an allowlist of one meaningless word.
+    ///
+    /// The control is the second half: a genuinely out-of-scope model must STILL be refused, so
+    /// the fix cannot degrade into "accept everything".
+    #[test]
+    fn the_documented_inherit_policy_admits_the_parent_model_and_still_refuses_another() {
+        let config = parsed(serde_json::json!({"enforce": true, "allow": ["inherit"]}));
+        let parent = cyrup_core::ModelId::from("openai/gpt-5");
+
+        // The parent's own model, asked for EXPLICITLY, resolves.
+        let asked = parent.clone();
+        let mut available = vec![asked.clone()];
+        assert_eq!(
+            crate::exec::fallback::resolve_model_inheritance(
+                Some(&asked),
+                None,
+                Some(&parent),
+                &mut available,
+                Some(&config),
+                "worker",
+            )
+            .map_err(|refusal| refusal.message()),
+            Ok(crate::exec::fallback::ModelOverride::Explicit(asked)),
+            "`allow: [\"inherit\"]` must admit the model the parent session is actually on"
+        );
+
+        // CONTROL: another model is still refused, with pi's verbatim message.
+        let other = cyrup_core::ModelId::from("anthropic/opus");
+        let mut available = vec![other.clone()];
+        let refusal = crate::exec::fallback::resolve_model_inheritance(
+            Some(&other),
+            None,
+            Some(&parent),
+            &mut available,
+            Some(&config),
+            "worker",
+        )
+        .expect_err("an out-of-scope explicit model must still be refused");
+        assert_eq!(
+            refusal.message(),
+            "Model 'anthropic/opus' is outside the configured subagent model scope (modelScope). \
+             Allowed patterns: openai/gpt-5.",
+            "the refusal must name the EXPANDED allowlist, not the literal word `inherit`"
+        );
+    }
+
+    /// SUBA-155 — an armed reserved token with no parent session model to expand against must
+    /// REFUSE the launch and say why, which is pi's
+    /// `throwForUnresolvedEnforcedReservedScope(options?.scope, explicit === undefined ||
+    /// options?.source === "inherited")` at `model-resolution.ts:347` @v0.75.0.
+    ///
+    /// THE USER ACTION: the same operator's policy, on a host with no live session model
+    /// (headless, an SDK embedder, or a session whose model is momentarily unbound). The token
+    /// stays literal and matches nothing — but the only model that then gets checked is the
+    /// INHERITED one, at warn severity, so the launch printed a warning and ran the persona's own
+    /// model anyway. An armed policy that cannot be made concrete must fail CLOSED.
+    #[test]
+    fn an_armed_reserved_token_with_no_parent_session_refuses_the_launch_instead_of_warning() {
+        let config = parsed(serde_json::json!({"enforce": true, "allow": ["inherit"]}));
+        let persona = cyrup_core::ModelId::from("openai/gpt-5");
+        let mut available = vec![persona.clone()];
+
+        let refusal = crate::exec::fallback::resolve_model_inheritance(
+            None,
+            Some(&persona),
+            None, // no parent session model
+            &mut available,
+            Some(&config),
+            "worker",
+        )
+        .expect_err("an armed `inherit` with no parent session model must refuse the launch");
+        assert_eq!(
+            refusal.message(),
+            "Cannot enforce subagent model scope (modelScope): 'inherit' requires a current parent \
+             session model.",
+            "the refusal must say WHY the policy cannot be enforced, not name a one-word allowlist"
+        );
+        assert_eq!(
+            refusal.violation(),
+            None,
+            "there is no out-of-scope model here: the refusal fires before any model is resolved"
+        );
+        assert_eq!(
+            available,
+            vec![persona.clone()],
+            "the refusal happens before resolution, so the availability set is untouched"
+        );
+
+        // `scoped` is the same refusal, naming itself.
+        let scoped_only = parsed(serde_json::json!({"enforce": true, "allow": ["scoped"]}));
+        assert_eq!(
+            crate::exec::fallback::resolve_model_inheritance(
+                None,
+                Some(&persona),
+                None,
+                &mut available,
+                Some(&scoped_only),
+                "worker",
+            )
+            .err()
+            .map(|refusal| refusal.message()),
+            Some(
+                "Cannot enforce subagent model scope (modelScope): 'scoped' requires a current \
+                 parent session model."
+                    .to_string()
+            )
+        );
+
+        // CONTROL — upstream's `includeMixed` distinction: a list that is not ONLY a reserved
+        // token still admits an explicitly requested model that matches one of its real patterns,
+        // so a headless host does not become "refuse every launch".
+        let mixed = parsed(serde_json::json!({"enforce": true, "allow": ["inherit", "openai/*"]}));
+        let asked = cyrup_core::ModelId::from("openai/gpt-5");
+        let mut available = vec![asked.clone()];
+        assert_eq!(
+            crate::exec::fallback::resolve_model_inheritance(
+                Some(&asked),
+                None,
+                None,
+                &mut available,
+                Some(&mixed),
+                "worker",
+            )
+            .map_err(|refusal| refusal.message()),
+            Ok(crate::exec::fallback::ModelOverride::Explicit(asked)),
+            "a mixed allowlist must still admit a model one of its real patterns covers"
+        );
+    }
+
+    /// SUBA-155 — `modelScope.agents.<name>` must be HONOURED by the launch resolver, not accepted
+    /// and dropped. The failure direction that matters for a policy knob is the silent one: an
+    /// operator believes a named agent is restricted and it is not.
+    #[test]
+    fn a_per_agent_rule_refuses_at_launch_a_model_the_global_block_admits() {
+        let config = parsed(serde_json::json!({
+            "enforce": true,
+            "allow": ["anthropic/*", "openai/*"],
+            "agents": {"reviewer": {"allow": ["anthropic/*"]}}
+        }));
+        let asked = cyrup_core::ModelId::from("openai/gpt-5");
+
+        // The unnamed agent sees the global list only, so `openai/*` resolves.
+        let mut available = vec![asked.clone()];
+        assert!(
+            crate::exec::fallback::resolve_model_inheritance(
+                Some(&asked),
+                None,
+                None,
+                &mut available,
+                Some(&config),
+                "worker",
+            )
+            .is_ok(),
+            "the global block admits openai/*, so an agent with no rule of its own runs"
+        );
+
+        // The named agent is refused BY NAME, and the message says which block refused.
+        let mut available = vec![asked.clone()];
+        let refusal = crate::exec::fallback::resolve_model_inheritance(
+            Some(&asked),
+            None,
+            None,
+            &mut available,
+            Some(&config),
+            "reviewer",
+        )
+        .expect_err("the per-agent rule must refuse a model the global rule allows");
+        assert_eq!(
+            refusal.message(),
+            "Model 'openai/gpt-5' is outside the configured subagent model scope \
+             (modelScope.agents.reviewer). Allowed patterns: anthropic/*.",
+        );
+    }
+
+    /// A [`cyrup_ext::host::HostServices`] double reporting only a canned scoped-model snapshot,
+    /// in the `{model: {provider, id}, thinkingLevel?}` shape the live backend emits
+    /// (`cyrup-session-svc`'s `host_services.rs::scoped_models`, EXT-045).
+    struct FixedScopedModelsHost(serde_json::Value);
+
+    impl cyrup_ext::host::HostServices for FixedScopedModelsHost {
+        fn scoped_models(&self) -> serde_json::Value {
+            self.0.clone()
+        }
+    }
+
+    /// SUBA-155 — `allow: ["scoped"]` must admit the parent session's scoped-model set, which
+    /// means the snapshot has to be CAPTURED at launch: the resolver that enforces the policy runs
+    /// (for a background run) in a process with no host at all.
+    ///
+    /// THE USER ACTION: an operator has narrowed this session with `/scoped-models` and wants
+    /// subagents held to the same set, so writes `"allow": ["scoped"]`. With the snapshot never
+    /// read, `scoped` could only ever degrade to `inherit` — admitting the parent's ONE current
+    /// model and refusing every other model the operator deliberately kept in scope.
+    #[test]
+    fn the_launch_time_policy_captures_this_sessions_scoped_model_snapshot() {
+        let dir = tempfile::tempdir().expect("real tempdir");
+        crate::extension::testsupport::seed_scope_fixture(
+            dir.path(),
+            "worker",
+            Some(r#"{"subagents":{"modelScope":{"enforce":true,"allow":["scoped"]}}}"#),
+        );
+        let roots = crate::paths::Roots::from_env();
+        let executor = crate::extension::SubagentExecutor::new();
+
+        // No host bound: nothing to capture, so the token survives for phase 2 to degrade.
+        assert_eq!(
+            executor
+                .resolve_model_scope_for_launch(dir.path(), &roots)
+                .expect("settings parse")
+                .and_then(|policy| policy.allow),
+            Some(vec![SCOPED_PATTERN.to_string()]),
+            "with no host there is no snapshot, which must leave `scoped` to degrade to `inherit`"
+        );
+
+        // A scoped session: the whole set is captured into the policy.
+        executor.set_host_services(std::sync::Arc::new(FixedScopedModelsHost(
+            serde_json::json!([
+                {"model": {"provider": "anthropic", "id": "opus"}, "thinkingLevel": "high"},
+                {"model": {"provider": "openai", "id": "gpt-5"}}
+            ]),
+        )));
+        let captured = executor
+            .resolve_model_scope_for_launch(dir.path(), &roots)
+            .expect("settings parse")
+            .expect("a modelScope block is configured");
+        assert_eq!(
+            captured.allow.as_deref(),
+            Some(&["anthropic/opus".to_string(), "openai/gpt-5".to_string()][..]),
+            "`scoped` must resolve to the session's scoped-model set"
+        );
+
+        // And the captured policy polices: every scoped model resolves, an unscoped one does not,
+        // even though the parent session's model is a THIRD model entirely.
+        let parent = cyrup_core::ModelId::from("together/glm");
+        for admitted in ["anthropic/opus", "openai/gpt-5"] {
+            let asked = cyrup_core::ModelId::from(admitted);
+            let mut available = vec![asked.clone()];
+            assert!(
+                crate::exec::fallback::resolve_model_inheritance(
+                    Some(&asked),
+                    None,
+                    Some(&parent),
+                    &mut available,
+                    Some(&captured),
+                    "worker",
+                )
+                .is_ok(),
+                "{admitted} is in the scoped set and must resolve"
+            );
+        }
+        let unscoped = cyrup_core::ModelId::from("openai/gpt-4");
+        let mut available = vec![unscoped.clone()];
+        assert_eq!(
+            crate::exec::fallback::resolve_model_inheritance(
+                Some(&unscoped),
+                None,
+                Some(&parent),
+                &mut available,
+                Some(&captured),
+                "worker",
+            )
+            .err()
+            .map(|refusal| refusal.message()),
+            Some(
+                "Model 'openai/gpt-4' is outside the configured subagent model scope (modelScope). \
+                 Allowed patterns: anthropic/opus, openai/gpt-5."
+                    .to_string()
+            ),
+            "CONTROL: a model outside the scoped set is still refused"
         );
     }
 }

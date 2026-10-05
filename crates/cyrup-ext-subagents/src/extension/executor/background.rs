@@ -592,7 +592,7 @@ impl SubagentExecutor {
             .map_err(SubagentError::Spawn)?;
 
         // Hoisted out of the `RunnerConfig` literal below: see `model_scope` there.
-        let model_scope = Self::resolve_model_scope(cwd, &cfg.roots)?;
+        let model_scope = self.resolve_model_scope_for_launch(cwd, &cfg.roots)?;
 
         // The two ceilings this LAUNCHING process is bound by, resolved once, parent-side, and
         // BEFORE the capacity claim below for `model_scope`'s reason: every fallible step past the

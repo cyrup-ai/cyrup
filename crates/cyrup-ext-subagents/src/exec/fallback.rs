@@ -46,8 +46,8 @@
 use cyrup_core::{ModelId, ProviderId, Usage};
 
 use crate::exec::model_scope::{
-    ModelScopeConfig, ModelScopeViolation, ModelSource, ResolvedModelScope, check_model_scope,
-    warn_violation,
+    ModelScopeConfig, ModelScopeRefusal, ModelScopeViolation, ModelSource, ResolvedModelScope,
+    check_model_scope, warn_violation,
 };
 
 // -------------------------------------------------------------------------------------------
@@ -418,9 +418,11 @@ pub fn build_model_candidates_scoped(
 ///
 /// # Errors
 ///
-/// Returns the [`ModelScopeViolation`] when an EXPLICIT caller-supplied model falls outside an
-/// armed scope. `available_models` is left untouched on that path (nothing was pushed yet), so a
-/// caller that retries with a different model sees an unpolluted allowlist.
+/// Returns a [`ModelScopeRefusal`] when an EXPLICIT caller-supplied model falls outside an armed
+/// scope, or when an armed scope's reserved `inherit`/`scoped` token cannot be made concrete
+/// because there is no current parent session model. `available_models` is left untouched on both
+/// paths (nothing was pushed yet), so a caller that retries with a different model sees an
+/// unpolluted allowlist.
 pub fn resolve_model_inheritance(
     per_call_override: Option<&ModelId>,
     persona_model: Option<&ModelId>,
@@ -428,10 +430,10 @@ pub fn resolve_model_inheritance(
     available_models: &mut Vec<ModelId>,
     scope: Option<&ModelScopeConfig>,
     // SUBA-155 — selects a `modelScope.agents.<name>` rule (pi `resolveModelScopesForAgent`'s
-    // `agentName`, `model-scope.ts:160` @v0.74.0). The reserved `inherit`/`scoped` tokens expand
+    // `agentName`, `model-scope.ts:161` @v0.75.0). The reserved `inherit`/`scoped` tokens expand
     // against `inherited_session_model`, which this function already receives.
     agent_name: &str,
-) -> Result<ModelOverride, ModelScopeViolation> {
+) -> Result<ModelOverride, ModelScopeRefusal> {
     // SUBA-155 — resolve ONCE for this launch: the global `modelScope` plus any per-agent rule,
     // with `inherit` replaced by the parent session's `provider/id`. Before this, `allow:
     // ["inherit"]` — the shape pi's own documentation shows — was matched LITERALLY against
@@ -440,8 +442,34 @@ pub fn resolve_model_inheritance(
         scope,
         agent_name,
         inherited_session_model.map(ModelId::as_str),
-        None,
     );
+    // SUBA-155 — pi `resolveSubagentModelOverride`'s FIRST statement after it classifies the
+    // request: `if (!parentModel) throwForUnresolvedEnforcedReservedScope(options?.scope, explicit
+    // === undefined || options?.source === "inherited")` (`model-resolution.ts:347` @v0.75.0).
+    //
+    // With no parent session model an armed `inherit`/`scoped` scope cannot be made concrete, and
+    // upstream refuses the launch HERE — before any resolution, which is why `available_models` is
+    // still untouched. Without this the token stays literal, matches nothing, and the only thing
+    // that happens is a warn-severity violation against whatever model the ladder then resolves:
+    // the policy would print a warning and run the model anyway, which is the wrong direction for
+    // a policy knob.
+    //
+    // `include_mixed` is upstream's own second argument, transcribed term for term. `explicit ===
+    // undefined` is "the request reduced to no real model" (`real_requested_model` of
+    // `explicitModel ?? agentModel`), and `source === "inherited"` is `explicitModel ===
+    // undefined`, because `resolveEffectiveSubagentModel` derives the source as `explicitModel !==
+    // undefined ? "explicit" : "inherited"` (`:379`). So a mixed list like
+    // `["inherit", "openai/*"]` still admits an explicitly requested `openai/gpt-5` on a headless
+    // host, and only a list that is nothing BUT a reserved token refuses it.
+    if inherited_session_model.is_none() {
+        let include_mixed = real_requested_model(per_call_override.or(persona_model)).is_none()
+            || per_call_override.is_none();
+        if let Some(refusal) =
+            crate::exec::model_scope::unresolvable_enforced_reserved_scope(&scopes, include_mixed)
+        {
+            return Err(refusal);
+        }
+    }
     // A blank or `"inherit"` model id is a REQUEST, not a candidate. Purge it from the allowlist
     // before anything else: `build_model_candidates` re-derives the ladder from
     // `agent_primary_model`/`agent_fallback_models` independently of this function's return value,
@@ -2990,13 +3018,13 @@ mod tests {
         let mut avail = vec![out.clone()];
         let refused =
             resolve_model_inheritance(Some(&out), None, None, &mut avail, Some(&scope), "worker");
-        let violation = refused.expect_err("an explicit out-of-scope model must be refused");
+        let refusal = refused.expect_err("an explicit out-of-scope model must be refused");
         assert_eq!(
-            violation.severity,
-            crate::exec::model_scope::ModelScopeSeverity::Error
+            refusal.violation().map(|v| v.severity),
+            Some(crate::exec::model_scope::ModelScopeSeverity::Error)
         );
         assert_eq!(
-            violation.message,
+            refusal.message(),
             "Model 'openai/gpt-5-nano' is outside the configured subagent model scope (modelScope). Allowed \
              patterns: anthropic/*."
         );

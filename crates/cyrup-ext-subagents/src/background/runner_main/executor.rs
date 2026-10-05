@@ -648,7 +648,7 @@ impl ExecSingleStepExecutor {
             &agent.name,
         ) {
             Ok(resolved) => resolved,
-            Err(violation) => return Err(Box::new(StepResult::failure(violation.message))),
+            Err(refusal) => return Err(Box::new(StepResult::failure(refusal.message()))),
         };
         // SUBA-119 — pi's `modelOverrideFromParent` (`execution.ts:1836`), over the same three inputs
         // the resolution above just consumed. Model verification is OFF for a run whose model came
