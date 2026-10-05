@@ -3934,9 +3934,11 @@ mod tests {
                 "description",
                 "parameters",
                 "promptGuidelines",
+                "exposure",
                 "sourceInfo"
             ],
-            "pi's ToolInfo keys and no others"
+            "pi's ToolInfo keys and no others (v1.0.1 adds `exposure`, always present: \
+             `core/agent-session.ts:1465-1475`)"
         );
         assert_eq!(read["description"], json!("described"));
         assert_eq!(

@@ -509,7 +509,8 @@ mod tests {
                 Fake::new("deploy", "v2").with_snippet("deploy: v2").arc(),
             ])
             .expect("a CHANGED definition for an existing name must still push");
-        let (tools, prompt) = push;
+        let (loadout, prompt) = push;
+        let tools = loadout.executable();
 
         assert_eq!(
             tools.len(),
@@ -562,10 +563,10 @@ mod tests {
     #[test]
     fn merge_registered_still_auto_activates_a_new_name() {
         let mut st = state_with(vec![Fake::new("deploy", "v1").arc()]);
-        let (tools, _) = st
+        let (loadout, _) = st
             .merge_registered(vec![Fake::new("audit", "new").arc()])
             .expect("a new name pushes");
-        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+        let names: Vec<&str> = loadout.executable().iter().map(|t| t.name()).collect();
         assert!(
             names.contains(&"audit"),
             "the late tool is active: {names:?}"
@@ -605,8 +606,8 @@ mod tests {
             "custom tools register inert"
         );
 
-        let (tools, prompt) = st.set_active(&["read".to_string(), "deploy".to_string()]);
-        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+        let (loadout, prompt) = st.set_active(&["read".to_string(), "deploy".to_string()]);
+        let names: Vec<&str> = loadout.executable().iter().map(|t| t.name()).collect();
         assert_eq!(
             names,
             ["read", "deploy"],
