@@ -5,6 +5,23 @@ next work item**.
 
 ---
 
+# UPDATE 2026-10-05 (quietStartup closure) — `TUI-137` and `CFG-098` closed; the fix had shipped under three other ids
+
+> **This block sits above the fullscreen-shortfalls block and moves its counts.** The count is whatever
+> `python3 docs/gap-analysis/scripts/count_open_items.py` prints: **154 open: 0 critical, 0 high, 9 medium,
+> 145 low; 17 trackers; 893 closed; 0 duplicates not counted** (before: 155 open, 146 low, 891 closed, 1
+> duplicate). Arithmetic: open 155 − 1 (`TUI-137`) = 154; low 146 − 1 = 145; closed 891 + 2 (`TUI-137`, and
+> `CFG-098`, its duplicate, struck with it as `CFG-100` was with `TUI-136`) = 893; duplicates 1 − 1 = 0.
+>
+> * **What happened.** `TUI-137` (`quietStartup: "header"`, filed 2026-10-02) was already on file when the
+>   fullscreen-shortfalls pass fixed it, and the pass filed the work again as `TUI-152`, `TUI-154` and `TUI-162`
+>   instead of finding it. The code was right and the open row stayed open. Both are closed now; `TUI-152`,
+>   `TUI-154` and `TUI-162` say they are the same work as `TUI-137`.
+> * **Found by** reading every open `TUI-*` row against what the pass changed, after being asked whether any
+>   fullscreen row was still open.
+
+---
+
 # UPDATE 2026-10-05 (fullscreen shortfalls) — three rows closed, thirteen filed and closed on arrival, two filed open (`claude/fullscreen-shortfalls`)
 
 > **This block sits above the 2026-10-04 blocks and moves their counts.** The count is whatever
