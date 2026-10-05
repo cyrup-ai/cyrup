@@ -233,6 +233,43 @@ pub(crate) async fn scoped_tool(dir: &Path) -> SubagentTool {
     SubagentTool::new(executor, dir.to_path_buf())
 }
 
+/// SUBA-150 — a `workflow` value for a test that wants to run SCRIPT TEXT through the tool.
+///
+/// `workflowScript` is no longer a tool parameter: v0.74.0 removed it and
+/// [`crate::extension::tool::SubagentTool::lower_workflow_field`] refuses it by name. A test that
+/// means "run this script" now says so the way a caller must — `workflow: "<path>"` — and this
+/// writes the text to a stable per-script file under the process temp dir and returns its ABSOLUTE
+/// path, which always contains a separator and therefore always classifies as
+/// [`crate::extension::tool::workflow_field::WorkflowSource::ScriptFile`] whatever the test's cwd
+/// is. The file holds the script BYTE-FOR-BYTE, so a test asserting on the persisted
+/// `target.workflowScript` still sees its own text.
+///
+/// The other two `workflow` forms are not substitutable here: `true` needs a live session whose
+/// reply carries the fenced block (covered in `workflow_field_tests.rs`), and a resource name
+/// needs a registered resource.
+pub(crate) fn workflow_script_path(script: impl AsRef<str>) -> String {
+    let script = script.as_ref();
+    use std::hash::{Hash as _, Hasher as _};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    script.hash(&mut hasher);
+    let dir = std::env::temp_dir().join("cyrup-suba150-scripts");
+    std::fs::create_dir_all(&dir).expect("the script scratch dir must be creatable");
+    let path = dir.join(format!("{:016x}.js", hasher.finish()));
+    // Tests run in parallel and two of them asking for the same script land on the same path, so
+    // the write is staged and RENAMED into place: a concurrent reader sees either the previous
+    // complete file or this one, never a half-written script. A plain `fs::write` truncates first,
+    // which is exactly the window that made a schedule test fail only under the full run.
+    let staged = dir.join(format!(
+        "{:016x}.{}.{:?}.staging",
+        hasher.finish(),
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    std::fs::write(&staged, script).expect("the script file must be writable");
+    std::fs::rename(&staged, &path).expect("the script file must be renamable into place");
+    path.display().to_string()
+}
+
 pub(crate) async fn dispatch_tool(
     tool: &SubagentTool,
     params: serde_json::Value,

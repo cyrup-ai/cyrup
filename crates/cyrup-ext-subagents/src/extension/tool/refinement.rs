@@ -159,6 +159,10 @@ async fn launch_proposal_child(
         parent_workflow_run_id: None,
         workflow_key: None,
         workflow_steer: None,
+        // SUBA-149 — the refinement proposal child is a read-only reviewer with a hard tool
+        // budget blocking `write`/`edit`/`bash`; pi's own call (`:6371-6378`) sets no `worktree`,
+        // and isolating a child that cannot write would only cost a git allocation.
+        worktree: crate::spawn::worktree::WorktreeRequest::Shared,
     };
     // pi passes `onUpdate: undefined` (`:6378`) — the proposal child streams no progress — so
     // the sink is a no-op closure. `run_foreground_streaming` is the entry point that takes a

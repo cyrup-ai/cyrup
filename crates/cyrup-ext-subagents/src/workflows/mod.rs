@@ -150,6 +150,9 @@ pub use receipt::{
 /// (`runs/background/scheduled-runs.ts:293`), read by
 /// [`crate::background::scheduled_runs::parse_schedule_target`].
 pub(crate) use resources::normalize_args as normalize_workflow_args;
+/// SUBA-150 — the four `args` limits upstream exports for its schema description
+/// (`workflow-resources.ts:12-15` @v0.75.0, re-exported through `extension/schemas.ts:7`).
+pub(crate) use resources::{MAX_ARGS_BYTES, MAX_ARGS_DEPTH, MAX_ARGS_FIELDS, MAX_ARGS_ITEMS};
 pub use resources::{
     ResolvedWorkflowResource, WorkflowResourceDefinition, WorkflowResourceExpansion,
     WorkflowResourceRegistration, WorkflowResourceRegistry, WorkflowResourceResolution,

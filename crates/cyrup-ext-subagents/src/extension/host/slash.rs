@@ -909,6 +909,9 @@ impl SubagentsExtension {
                     parent_workflow_run_id: None,
                     workflow_key: None,
                     workflow_steer: None,
+                    // SUBA-149 — a recipe/`/run` dispatch exposes no `worktree` argument, so the
+                    // request is the shared cwd (pi's slash surfaces likewise never set it).
+                    worktree: crate::spawn::worktree::WorktreeRequest::Shared,
                 },
                 None,
             )

@@ -22,7 +22,7 @@ use crate::background::scheduled_runs::{
     SCHEDULED_RUN_ACTIONS, ScheduleRunState, ScheduledRunManager, schedule_timestamp,
 };
 use crate::extension::executor::SubagentExecutor;
-use crate::extension::testsupport::{arm_scoped_missions, tool_text};
+use crate::extension::testsupport::{arm_scoped_missions, tool_text, workflow_script_path};
 use crate::extension::tool::SubagentTool;
 
 /// A [`cyrup_ext::host::HostServices`] whose reported session id/file can be SWAPPED mid-test.
@@ -137,7 +137,8 @@ async fn schedule_create_refuses_a_non_workflow_script_target() {
     .expect_err("an agent/task target must be refused");
     assert_eq!(
         error.to_string(),
-        "schedule.create requires workflowScript. Use workflowScript: \"return runs.run('main', { agent, task })\".",
+        "schedule.create requires workflow: true or a workflow script path, e.g. a ```js workflow \
+         block containing return runs.run('main', { agent, task }).",
         "upstream's verbatim sentence, which NAMES the replacement"
     );
 
@@ -154,7 +155,7 @@ async fn schedule_create_refuses_a_non_workflow_script_target() {
     .expect_err("a tasks[] target must be refused");
     assert_eq!(
         error.to_string(),
-        "Recurring schedules require workflowScript; legacy tasks and chain inputs are unsupported."
+        "Recurring schedules require a workflow script; legacy tasks and chain inputs are unsupported."
     );
 }
 
@@ -168,10 +169,10 @@ async fn schedule_create_refuses_a_calendar_trigger_with_pis_own_sentence() {
     const SENTENCE: &str = "Calendar schedules are deferred from this first safe slice. Use a fixed interval such as every:'24h' or every:'7d'.";
 
     for params in [
-        serde_json::json!({ "action": "schedule.create", "every": "6h", "workflowScript": TRIVIAL_SCRIPT, "on": "monday" }),
-        serde_json::json!({ "action": "schedule.create", "every": "6h", "workflowScript": TRIVIAL_SCRIPT, "on": 1 }),
-        serde_json::json!({ "action": "schedule.create", "every": "6h", "workflowScript": TRIVIAL_SCRIPT, "timezone": "Europe/London" }),
-        serde_json::json!({ "action": "schedule.create", "every": "day", "workflowScript": TRIVIAL_SCRIPT }),
+        serde_json::json!({ "action": "schedule.create", "every": "6h", "workflow": workflow_script_path(TRIVIAL_SCRIPT), "on": "monday" }),
+        serde_json::json!({ "action": "schedule.create", "every": "6h", "workflow": workflow_script_path(TRIVIAL_SCRIPT), "on": 1 }),
+        serde_json::json!({ "action": "schedule.create", "every": "6h", "workflow": workflow_script_path(TRIVIAL_SCRIPT), "timezone": "Europe/London" }),
+        serde_json::json!({ "action": "schedule.create", "every": "day", "workflow": workflow_script_path(TRIVIAL_SCRIPT)}),
     ] {
         let error = dispatch(&tool, params.clone())
             .await
@@ -193,7 +194,7 @@ async fn schedule_create_refuses_a_base_ref_rather_than_running_against_the_wron
         serde_json::json!({
             "action": "schedule.create",
             "every": "6h",
-            "workflowScript": TRIVIAL_SCRIPT,
+            "workflow": workflow_script_path(TRIVIAL_SCRIPT),
             "baseRef": "refs/heads/main",
         }),
     )
@@ -211,7 +212,7 @@ async fn schedule_create_refuses_a_base_ref_rather_than_running_against_the_wron
         serde_json::json!({
             "action": "schedule.create",
             "every": "6h",
-            "workflowScript": TRIVIAL_SCRIPT,
+            "workflow": workflow_script_path(TRIVIAL_SCRIPT),
             "baseRef": "bad ref",
         }),
     )
@@ -237,7 +238,7 @@ async fn the_max_pending_limit_refuses_the_twenty_first_schedule() {
                 "action": "schedule.create",
                 "id": format!("s{index}"),
                 "every": "6h",
-                "workflowScript": TRIVIAL_SCRIPT,
+                "workflow": workflow_script_path(TRIVIAL_SCRIPT),
             }),
         )
         .await
@@ -250,7 +251,7 @@ async fn the_max_pending_limit_refuses_the_twenty_first_schedule() {
             "action": "schedule.create",
             "id": "s20",
             "every": "6h",
-            "workflowScript": TRIVIAL_SCRIPT,
+            "workflow": workflow_script_path(TRIVIAL_SCRIPT),
         }),
     )
     .await
@@ -288,7 +289,7 @@ async fn a_capability_ceiling_refuses_schedule_create_through_the_tool() {
         serde_json::json!({
             "action": "schedule.create",
             "every": "6h",
-            "workflowScript": TRIVIAL_SCRIPT,
+            "workflow": workflow_script_path(TRIVIAL_SCRIPT),
         }),
     )
     .await
@@ -314,7 +315,7 @@ async fn listing_reports_session_only_and_project_schedules_distinctly() {
         &tool,
         serde_json::json!({
             "action": "schedule.create", "id": "mine", "every": "1h",
-            "workflowScript": TRIVIAL_SCRIPT, "sessionOnly": true,
+            "workflow": workflow_script_path(TRIVIAL_SCRIPT), "sessionOnly": true,
         }),
     )
     .await
@@ -323,7 +324,7 @@ async fn listing_reports_session_only_and_project_schedules_distinctly() {
         &tool,
         serde_json::json!({
             "action": "schedule.create", "id": "ours", "every": "6h",
-            "workflowScript": TRIVIAL_SCRIPT,
+            "workflow": workflow_script_path(TRIVIAL_SCRIPT),
         }),
     )
     .await
@@ -382,7 +383,7 @@ async fn cancelling_a_schedule_removes_it_from_the_store() {
         &tool,
         serde_json::json!({
             "action": "schedule.create", "id": "nightly", "every": "6h",
-            "workflowScript": TRIVIAL_SCRIPT,
+            "workflow": workflow_script_path(TRIVIAL_SCRIPT),
         }),
     )
     .await
@@ -437,7 +438,7 @@ async fn deleting_a_schedule_with_a_live_run_is_refused() {
         &tool,
         serde_json::json!({
             "action": "schedule.create", "id": "nightly", "every": "6h",
-            "workflowScript": TRIVIAL_SCRIPT,
+            "workflow": workflow_script_path(TRIVIAL_SCRIPT),
         }),
     )
     .await
@@ -511,7 +512,7 @@ async fn a_fired_schedule_claims_a_spawn_slot_for_the_live_session() {
         &tool,
         serde_json::json!({
             "action": "schedule.create", "id": "nightly", "at": "+1h",
-            "workflowScript": TRIVIAL_SCRIPT,
+            "workflow": workflow_script_path(TRIVIAL_SCRIPT),
         }),
     )
     .await
@@ -570,7 +571,7 @@ async fn a_fired_schedule_is_refused_when_the_session_is_at_its_spawn_cap() {
         &tool,
         serde_json::json!({
             "action": "schedule.create", "id": "nightly", "every": "1h",
-            "workflowScript": TRIVIAL_SCRIPT,
+            "workflow": workflow_script_path(TRIVIAL_SCRIPT),
         }),
     )
     .await
@@ -631,7 +632,7 @@ async fn a_fired_runs_result_is_delivered_to_the_live_session_only() {
         &tool,
         serde_json::json!({
             "action": "schedule.create", "id": "nightly", "at": "+1h",
-            "workflowScript": TRIVIAL_SCRIPT,
+            "workflow": workflow_script_path(TRIVIAL_SCRIPT),
         }),
     )
     .await
@@ -697,7 +698,7 @@ async fn the_session_identity_is_pinned_for_the_duration_of_a_fire() {
         &tool,
         serde_json::json!({
             "action": "schedule.create", "id": "nightly", "at": "+1h",
-            "workflowScript": TRIVIAL_SCRIPT,
+            "workflow": workflow_script_path(TRIVIAL_SCRIPT),
         }),
     )
     .await
@@ -756,7 +757,7 @@ async fn the_session_file_is_pinned_too() {
         &tool,
         serde_json::json!({
             "action": "schedule.create", "id": "mine", "every": "1h",
-            "workflowScript": TRIVIAL_SCRIPT, "sessionOnly": true,
+            "workflow": workflow_script_path(TRIVIAL_SCRIPT), "sessionOnly": true,
         }),
     )
     .await
@@ -803,7 +804,7 @@ async fn a_non_session_only_schedule_created_in_one_session_fires_in_a_later_one
         &tool,
         serde_json::json!({
             "action": "schedule.create", "id": "nightly", "every": "1h",
-            "workflowScript": TRIVIAL_SCRIPT,
+            "workflow": workflow_script_path(TRIVIAL_SCRIPT),
         }),
     )
     .await
@@ -941,7 +942,7 @@ async fn a_quiet_schedules_successful_completion_does_not_wake_a_turn() {
             &tool,
             serde_json::json!({
                 "action": "schedule.create", "id": id, "every": "1h",
-                "workflowScript": TRIVIAL_SCRIPT, "quiet": quiet_flag,
+                "workflow": workflow_script_path(TRIVIAL_SCRIPT), "quiet": quiet_flag,
             }),
         )
         .await
@@ -1014,7 +1015,7 @@ async fn schedule_create_reports_its_flags_and_refuses_quiet_on_a_one_shot() {
         &tool,
         serde_json::json!({
             "action": "schedule.create", "id": "nightly", "every": "6h",
-            "workflowScript": TRIVIAL_SCRIPT, "sessionOnly": true, "quiet": true,
+            "workflow": workflow_script_path(TRIVIAL_SCRIPT), "sessionOnly": true, "quiet": true,
         }),
     )
     .await
@@ -1029,7 +1030,7 @@ async fn schedule_create_reports_its_flags_and_refuses_quiet_on_a_one_shot() {
         &tool,
         serde_json::json!({
             "action": "schedule.create", "id": "once", "at": "+10m",
-            "workflowScript": TRIVIAL_SCRIPT, "quiet": true,
+            "workflow": workflow_script_path(TRIVIAL_SCRIPT), "quiet": true,
         }),
     )
     .await
@@ -1043,7 +1044,7 @@ async fn schedule_create_reports_its_flags_and_refuses_quiet_on_a_one_shot() {
         &tool,
         serde_json::json!({
             "action": "schedule.create", "id": "bad", "every": "6h",
-            "workflowScript": TRIVIAL_SCRIPT, "quiet": "yes",
+            "workflow": workflow_script_path(TRIVIAL_SCRIPT), "quiet": "yes",
         }),
     )
     .await
@@ -1104,7 +1105,7 @@ async fn run_due_reports_what_it_processed() {
         &tool,
         serde_json::json!({
             "action": "schedule.create", "id": "nightly", "every": "1h",
-            "workflowScript": TRIVIAL_SCRIPT,
+            "workflow": workflow_script_path(TRIVIAL_SCRIPT),
         }),
     )
     .await
@@ -1143,7 +1144,7 @@ async fn show_and_history_render_a_schedule_and_its_runs() {
         &tool,
         serde_json::json!({
             "action": "schedule.create", "id": "nightly", "every": "6h",
-            "workflowScript": TRIVIAL_SCRIPT, "catchUp": "none",
+            "workflow": workflow_script_path(TRIVIAL_SCRIPT), "catchUp": "none",
         }),
     )
     .await
@@ -1213,7 +1214,7 @@ async fn an_armed_schedule_is_offered_as_a_stop_target() {
         &tool,
         serde_json::json!({
             "action": "schedule.create", "id": "nightly", "every": "6h",
-            "workflowScript": TRIVIAL_SCRIPT,
+            "workflow": workflow_script_path(TRIVIAL_SCRIPT),
         }),
     )
     .await
@@ -1247,7 +1248,7 @@ async fn installing_and_disposing_the_manager_never_touches_the_store() {
         &tool,
         serde_json::json!({
             "action": "schedule.create", "id": "nightly", "every": "6h",
-            "workflowScript": TRIVIAL_SCRIPT,
+            "workflow": workflow_script_path(TRIVIAL_SCRIPT),
         }),
     )
     .await
@@ -1370,7 +1371,7 @@ async fn the_armed_tick_fires_a_due_schedule_with_nobody_asking() {
         &tool,
         serde_json::json!({
             "action": "schedule.create", "id": "nightly", "every": "1h",
-            "workflowScript": TRIVIAL_SCRIPT,
+            "workflow": workflow_script_path(TRIVIAL_SCRIPT),
         }),
     )
     .await
@@ -1476,7 +1477,7 @@ async fn a_run_a_schedule_references_is_protected_from_retention() {
         &tool,
         serde_json::json!({
             "action": "schedule.create", "id": "nightly", "at": "+1h",
-            "workflowScript": TRIVIAL_SCRIPT,
+            "workflow": workflow_script_path(TRIVIAL_SCRIPT),
         }),
     )
     .await

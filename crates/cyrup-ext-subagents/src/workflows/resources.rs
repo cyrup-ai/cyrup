@@ -25,9 +25,24 @@ use super::permit::{
 };
 use super::stable_json::stable_json_digest;
 
-/// pi `MAX_ARGS_BYTES` (`workflow-resources.ts:11`).
-const MAX_ARGS_BYTES: usize = 16 * 1024;
-/// pi `MAX_STRING_BYTES` (`workflow-resources.ts:12`).
+/// pi `MAX_ARGS_BYTES` (`workflow-resources.ts:12` @v0.75.0).
+///
+/// SUBA-150 — the four `MAX_ARGS_*` limits are `pub(crate)` because upstream commit `cfb6f9a8`
+/// (#2611, v0.75.0) made them exported constants for exactly one reason: the `args` parameter's
+/// own schema description now STATES them
+/// (`extension/schemas.ts:7,227` @v0.75.0, ``${MAX_ARGS_FIELDS} fields/object, …``), and a
+/// literal in the description beside a literal in the validator is how a caller is told one bound
+/// and refused by another. [`crate::extension::tool::schema::subagent_tool_parameters`] formats
+/// the description from these four, and the `validate` action arm runs [`normalize_args`], so the
+/// advertised bound, the launch bound and the `validate` bound are one value in three places.
+pub(crate) const MAX_ARGS_BYTES: usize = 16 * 1024;
+/// pi `MAX_ARGS_FIELDS` (`workflow-resources.ts:13` @v0.75.0) — max fields per JSON object.
+pub(crate) const MAX_ARGS_FIELDS: usize = 16;
+/// pi `MAX_ARGS_ITEMS` (`workflow-resources.ts:14` @v0.75.0) — max items per JSON array.
+pub(crate) const MAX_ARGS_ITEMS: usize = 64;
+/// pi `MAX_ARGS_DEPTH` (`workflow-resources.ts:15` @v0.75.0) — max nesting depth.
+pub(crate) const MAX_ARGS_DEPTH: u32 = 8;
+/// pi `MAX_STRING_BYTES` (`workflow-resources.ts:16`).
 const MAX_STRING_BYTES: usize = 16 * 1024;
 
 /// What a resource's `resolve` returns on success — the expansion half of pi's
@@ -384,7 +399,7 @@ fn json_byte_length(value: &Value) -> Result<usize, String> {
 /// pi's non-finite-number rejection (`:115`) is structurally absent — a JSON [`Value`] cannot
 /// hold one — and its non-plain-object rejection (`:120`) likewise.
 fn validate_plain_json(value: &Value, path: &str, depth: u32) -> Result<(), String> {
-    if depth > 8 {
+    if depth > MAX_ARGS_DEPTH {
         return Err(format!("{path} is too deeply nested."));
     }
     match value {
@@ -399,7 +414,7 @@ fn validate_plain_json(value: &Value, path: &str, depth: u32) -> Result<(), Stri
             Ok(())
         }
         Value::Array(items) => {
-            if items.len() > 64 {
+            if items.len() > MAX_ARGS_ITEMS {
                 return Err(format!("{path} contains too many items."));
             }
             for (index, entry) in items.iter().enumerate() {
@@ -408,7 +423,7 @@ fn validate_plain_json(value: &Value, path: &str, depth: u32) -> Result<(), Stri
             Ok(())
         }
         Value::Object(map) => {
-            if map.len() > 16 {
+            if map.len() > MAX_ARGS_FIELDS {
                 return Err(format!("{path} contains too many fields."));
             }
             for (key, entry) in map {

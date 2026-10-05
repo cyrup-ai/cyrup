@@ -5,6 +5,63 @@ next work item**.
 
 ---
 
+# UPDATE 2026-10-05 (subagent tool surface) — one medium closed, two advanced with their premises corrected, one filed
+
+> Three `medium` rows in `cyrup-ext-subagents`, two lanes, upstream read only through git objects at the
+> pin (`pi-subagents v0.75.0`). **One closes. Two do not, and in both cases the row's own evidence was
+> wrong** — in one of them, following the row literally would have deleted a working capability.
+>
+> The count is whatever `python3 docs/gap-analysis/scripts/count_open_items.py` prints. Measured AFTER
+> rebasing onto `494fea86`, which brought #182, #183 and #184 in underneath this work: **154 open — 0
+> critical, 0 high, 9 medium, 145 low; 17 trackers; 894 closed; 0 duplicates**. By area: `01` 28, `02` 1, `03` 7, `04` 5, `05` 7, `06` 18, `07` 23, `08` 7, `09` 2, `09b` 26, `10` 1, `11` 10, `12` 2, `14` 0, `16` 2, `17` 1, `18` 13, `09a` 1.
+> This pass itself closed one medium (`SUBA-150`) and filed one (`SUBA-174`), so its own effect on the
+> medium count is **zero**. All of the movement from 156 → 154 open and 876 → 894 closed is the TUI work
+> rebased in under it — #182, #183 and #184 — not this pass. The duplicate count reaching 0 is #184's
+> `CFG-098` closure, also not this pass.
+>
+> ## Closed
+>
+> * **`SUBA-150`** (`09b`) — one `workflow` field taking `true` | a path | a resource name, with
+>   `workflowScript` retained as upstream's internal carrier. The classification is parsed once at the
+>   boundary into a domain enum, because upstream re-derives it four times and that duplication is how
+>   the string `"true"` became a resource lookup in pi's own #2600. Both v0.75.0 fold-ins are in, and
+>   the four arg limits are named constants feeding the advertised description, `maxProperties`, the
+>   `validate` arm and the schedule parse — one value, four consumers, pinned by a test that fails if
+>   they drift. The decision the row left open resolves with no `[CYRUP-DELTA]`: both removed parameters
+>   are gone from the schema AND refused at dispatch with upstream's own sentences.
+>
+> ## Not closed — and the reasons are the findings
+>
+> * **`SUBA-151`** (`09b`) — **the row's premise is false.** It claims v0.71.0 carried `chain`/`tasks`
+>   and v0.74.0 deleted them. That property set has ZERO top-level `chain`/`tasks` at v0.71.0, v0.73.0,
+>   v0.74.0 AND v0.75.0, and v0.71.0 already refused them by name. They left pi's default tool before
+>   v0.71.0, at the v0.43.0 cutover. **The row's prescribed fix would therefore have deleted a working
+>   capability** that pi still supports by another route and cyrup offers both routes for. A test now
+>   pins the non-regression. What remains is blocked on `SUBA-152` — a `low` row gating a `medium`.
+>
+> * **`SUBA-149`** (`09b`) — partial. The typing is the good part and it is real: `WorktreeRequest` has
+>   no `Default`, and `ManagedLaunch` has private fields with one fallible constructor, so no value can
+>   claim isolation while pointing at the shared cwd — the bug made unrepresentable rather than
+>   re-checked. Allocation and pi's preserve-and-publish hand-off landed for the foreground single run
+>   and every workflow child, plus the batch admission probe. **But `async_by_default` is `true` and
+>   `SingleStepSpec` has no `worktree` field at all, so the silent drop still happens on the DEFAULT
+>   shape** for a single call. The fix covers the minority path. Striking this row would have been a
+>   false closure; the remainder is a second L-sized piece, and no delta covers it because a dropped
+>   isolation request is a lost guarantee.
+>
+> ## Filed
+>
+> * **`SUBA-174`** (`09b`, `medium`) — not a residual of the above but an independent authority gap found
+>   while porting: `WorkflowRunHost::supports_host` returns `true` unconditionally and
+>   `workflow_launch.rs` passes `one_use_permit: None`, so every workflow script reaches `runs.host`
+>   where upstream links that op only for a resource-provenance run. Pre-existing, verified live.
+>
+> **Gates** (rebased tree, coordinator-measured): `cargo fmt --all -- --check` clean; `cargo clippy
+> --workspace --all-targets -- -D warnings` exit 0 with 0 warnings, 17 crates from source. 44 tests
+> added, 0 removed, measured by diffing the suite's own test-name sets rather than either lane's count.
+>
+> ---
+>
 # UPDATE 2026-10-05 (quietStartup closure) — `TUI-137` and `CFG-098` closed; the fix had shipped under three other ids
 
 > **This block sits above the fullscreen-shortfalls block and moves its counts.** The count is whatever

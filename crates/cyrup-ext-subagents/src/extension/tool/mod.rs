@@ -9,6 +9,8 @@ pub(crate) mod routing;
 pub(crate) mod schema;
 pub(crate) mod task_items;
 pub(crate) mod text;
+/// SUBA-150 — the `workflow` field's classification and the two parameters v0.74.0 removed.
+pub(crate) mod workflow_field;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -211,6 +213,13 @@ impl Tool for SubagentTool {
         {
             return Err(ToolError::new(refusal));
         }
+        // SUBA-150 — the `workflow` field, lowered onto the internal `workflowScript` carrier
+        // before the typed parse (pi `subagent-executor.ts:7928-7958` @v0.75.0). It must run
+        // AFTER `refuse_nested_workflow` above, whose `starts_a_script` test already names
+        // `workflow` as one of its three disjuncts, so a workflow child asking for a nested
+        // script is refused on the field it actually sent rather than on the carrier this
+        // rewrites it to. See [`SubagentTool::lower_workflow_field`].
+        self.lower_workflow_field(&mut request, &call_id)?;
         // PB-9 — captured BEFORE the typed parse, which consumes `request` and (the field being
         // gone) ignores the key: pi refuses ANY present `clarify` value, `null` and non-booleans
         // included, so presence on the raw map is the test.

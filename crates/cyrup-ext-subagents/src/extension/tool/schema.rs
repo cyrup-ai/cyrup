@@ -142,7 +142,12 @@ fn sj_tool_budget_override() -> serde_json::Value {
                 ]
             }
         },
-        "description": "Optional child tool-call budget. soft nudges the child; after hard, block tools (default read/grep/find/ls, or '*' for all tools) are blocked so the child can finalize."
+        // SUBA-151 — pi's v0.73.0 narrowing (`extension/schemas.ts:104` @v0.75.0): the description
+        // STATES `soft <= hard`, which `validate_tool_budget_config` already refuses by name
+        // (`exec/tool_budget.rs:171`, `toolBudget.soft must be <= toolBudget.hard.`). Same class
+        // of defect as the empty `usageBudget` below: a bound the dispatcher enforces and the
+        // schema does not state is a refusal the model could not have avoided.
+        "description": "Optional child tool-call budget; soft <= hard. soft nudges the child; after hard, block tools (default read/grep/find/ls, or '*' for all tools) are blocked so the child can finalize."
     })
 }
 
@@ -339,25 +344,48 @@ pub(crate) fn subagent_tool_parameters() -> serde_json::Value {
     let mut props = serde_json::Map::new();
     props.insert("agent".to_string(), serde_json::json!({ "type": "string", "description": "Agent name (SINGLE mode) or target for management get/update/delete" }));
     props.insert("task".to_string(), serde_json::json!({ "type": "string", "description": "Task (SINGLE mode, optional for self-contained agents)" }));
-    // WORKFLOW_2 — pi `extension/schemas.ts:348`, description TRIMMED to what this build actually
-    // offers. An advertised capability that refuses is worse than an unadvertised one.
+    // WORKFLOW_2 — pi `extension/schemas.ts:223-226` @v0.75.0, description TRIMMED to what this
+    // build actually offers. An advertised capability that refuses is worse than an unadvertised
+    // one.
     //
-    // [CYRUP-DELTA, narrower] upstream advertises "Normally async unless asyncByDefault:false",
-    // mission `state`, and `runs.host`. This build runs workflows in the FOREGROUND and grants
-    // neither state nor runs.host, and for those two the guest surface genuinely OMITS what it
-    // does not grant (`js/prelude.js:574,578` in `cyrup-workflow-runtime`), so advertising them
-    // would describe members the model cannot discover. `runs.steer` is deliberately NOT listed
-    // either — but note that one is present-and-refusing rather than absent (`prelude.js:288-309`
-    // installs it; `engine.rs:1105` refuses it), so omitting it is a choice about noise, not
-    // discoverability.
-    props.insert("workflowScript".to_string(), serde_json::json!({
-        "type": "string",
-        "minLength": 1,
-        "description": "Inline JavaScript statement body run as a workflow. Use explicit return, \
-            top-level await, plain helper functions, or explicit Promise chains. Nested async \
-            function, arrow, and method helpers are rejected. Globals: runs.run, runs.all, \
-            runs.lanes, runs.ref, runs.refs, runs.status, emit, console, and standard JavaScript \
-            only — no filesystem, shell, Pi tools, or host globals. Runs in the foreground: omit \
+    // SUBA-150 — pi `0538e14d` (#2588, `feat(workflows)!`, v0.74.0) DELETED `workflowScript` and
+    // `workflowScriptPath` from the tool and put one `workflow` field in their place
+    // (`extension/schemas.ts:223-226` @v0.75.0). The union is advertised as upstream advertises
+    // it — `anyOf: [boolean, string minLength 1]` — and the description names all three forms
+    // plus the `false invalid` rule, because a model that cannot tell a path from a resource name
+    // writes script text into the string (the defect upstream's `scriptTextHint` exists for).
+    //
+    // `workflowScript` is NOT advertised any more; it survives as the INTERNAL carrier, exactly as
+    // upstream keeps it (`disabled-features.ts:106-110` names it such). The boundary
+    // ([`SubagentTool::lower_workflow_field`]) rewrites `workflow` onto it and REFUSES either
+    // removed parameter by name, so the advertise-vs-dispatch invariant holds in both directions:
+    // nothing advertised is undispatched, and nothing unadvertised is quietly accepted.
+    //
+    // What the description does NOT carry, and why — carried over from the `workflowScript`
+    // description this replaces, with one correction.
+    //
+    // * Upstream's "Normally async unless asyncByDefault:false" is absent because this build runs
+    //   workflows in the FOREGROUND only; `route_workflow_mode` refuses `async: true` outright.
+    //   That is a CAPABILITY THIS BUILD LACKS, not a delta — it is named here so the omission is
+    //   not read as a style choice.
+    // * Mission `state` is absent because the guest surface genuinely OMITS it without a bound
+    //   mission (`js/prelude.js:578` in `cyrup-workflow-runtime`, from `options.state.is_some()`),
+    //   so advertising it unconditionally would describe a member the model cannot discover.
+    // * `runs.host` is absent from the globals list for NOISE, not because it is ungranted: the
+    //   previous revision of this comment claimed this build "grants neither state nor runs.host",
+    //   which is false — `extension/executor/workflow.rs`'s `supports_host` is unconditionally
+    //   `true`, so every workflow script here can call `runs.host`. Upstream registers that op
+    //   only for resource-provenance runs; see the SUBA-150 report for the gap that opens.
+    // * `runs.steer` is likewise omitted for noise, and that one is present-and-refusing rather
+    //   than absent (`prelude.js:288-309` installs it; the engine refuses it).
+    props.insert("workflow".to_string(), serde_json::json!({
+        "anyOf": [ { "type": "boolean" }, { "type": "string", "minLength": 1 } ],
+        "description": "true: run the one ```js workflow block written in this same reply (false \
+            invalid). String with '/': script file read from request cwd. Other string: named \
+            workflow resource. Script globals: runs.run, runs.all, runs.lanes, runs.ref, \
+            runs.refs, runs.status, emit, console, and standard JavaScript only — no filesystem, \
+            shell, Pi tools, or host globals. Use explicit return and top-level await; nested \
+            async function, arrow, and method helpers are rejected. Runs in the foreground: omit \
             async or pass async:false. Cannot combine with agent, tasks, chain, or action (except \
             action:'validate')."
     }));
@@ -373,7 +401,9 @@ pub(crate) fn subagent_tool_parameters() -> serde_json::Value {
             // SUBA-038: derived from [`SUBAGENT_ACTIONS`], not hand-written — a hand-written copy is
             // exactly what let the two unknown-action messages drift away from what dispatches.
             "enum": SUBAGENT_ACTIONS,
-            "description": "Management/control action. Omit for execution mode."
+            // SUBA-150 — pi `:184` @v0.75.0 names what `validate` accepts, and names it as the
+            // `workflow` field rather than the two deleted parameters.
+            "description": "Management/control action. Omit for execution mode. validate accepts workflow: true or a script path."
         }),
     );
     // SUBA-104 — pi `capabilities` (`extension/schemas.ts:287` @v0.68.0), right after `action`
@@ -554,8 +584,8 @@ pub(crate) fn subagent_tool_parameters() -> serde_json::Value {
     // SCOPE_19/B [CYRUP-DELTA] — `timeoutMs` is the advertised spelling and states its omitted
     // behaviour; `maxRuntimeMs` carries `deprecated: true` and defers. Dispatch still accepts both
     // and still cross-validates them (`resolve_foreground_timeout`).
-    props.insert("timeoutMs".to_string(), serde_json::json!({ "type": "integer", "minimum": 1, "description": "Optional run-level timeout in ms for foreground and async/background runs. Omitted: the agent's or configured default for foreground runs; async runs use the async default. Prefer this over maxRuntimeMs." }));
-    props.insert("maxRuntimeMs".to_string(), serde_json::json!({ "type": "integer", "minimum": 1, "deprecated": true, "description": "Deprecated alias of timeoutMs; still accepted." }));
+    props.insert("timeoutMs".to_string(), serde_json::json!({ "type": "integer", "minimum": 1, "description": "Optional run-level timeout in ms for foreground and async/background runs. Omitted: the agent's or configured default for foreground runs; async runs use the async default. Prefer this over maxRuntimeMs; the two are aliases and must agree." }));
+    props.insert("maxRuntimeMs".to_string(), serde_json::json!({ "type": "integer", "minimum": 1, "deprecated": true, "description": "Deprecated alias of timeoutMs; still accepted, and must agree with it." }));
     // SUBA-128 — pi `checkpointBeforeDeadlineMs` (`extension/schemas.ts:363` @v0.71.0), in
     // upstream's position and with its own bounds and description.
     props.insert("checkpointBeforeDeadlineMs".to_string(), serde_json::json!({ "type": "integer", "minimum": 1, "maximum": crate::registration::MAX_CHECKPOINT_BEFORE_DEADLINE_MS, "description": "Async single-agent runs only: the runner requests that the child checkpoint and stop this many ms before the run deadline (best-effort; the deadline kill still applies)." }));
@@ -737,7 +767,7 @@ pub(crate) fn subagent_tool_parameters() -> serde_json::Value {
     // `on` and `timezone` are DECLARED AND REFUSED, deliberately: upstream answers a calendar
     // schedule with an actionable sentence naming the fixed-interval form to use instead, and a
     // model can only receive that sentence if the schema let the call through in the first place.
-    props.insert("name".to_string(), serde_json::json!({ "type": "string", "description": "Display name for schedule.create. Omitted: derived from the workflowScript target." }));
+    props.insert("name".to_string(), serde_json::json!({ "type": "string", "description": "Display name for schedule.create. Omitted: derived from the workflow target." }));
     props.insert("at".to_string(), serde_json::json!({ "type": "string", "description": "schedule.create: delay (+10m) or zoned ISO timestamp." }));
     props.insert("every".to_string(), serde_json::json!({ "type": "string", "description": "schedule.create interval, e.g. 30m/6h/2d/2w." }));
     props.insert("sessionOnly".to_string(), serde_json::json!({ "type": "boolean", "description": "schedule.create: fire only while the creating session is live. Omitted: the schedule is project-wide and outlives this session." }));
@@ -747,7 +777,29 @@ pub(crate) fn subagent_tool_parameters() -> serde_json::Value {
     props.insert("overlap".to_string(), serde_json::json!({ "type": "string", "enum": ["skip"], "description": "schedule.create overlap policy. Only skip is supported: a fire while the previous run is still going is recorded as skipped." }));
     props.insert("catchUp".to_string(), serde_json::json!({ "type": "string", "enum": ["none", "latest"], "description": "Missed schedule occurrences; default latest." }));
     props.insert("baseRef".to_string(), serde_json::json!({ "type": "string", "description": "Git ref a scheduled run should execute against. Not honoured yet; schedule.create refuses it rather than running against the wrong tree." }));
-    props.insert("args".to_string(), serde_json::json!({ "type": "object", "additionalProperties": true, "description": "Arguments object a scheduled workflowScript runs with. Omitted: an empty object." }));
+    // SUBA-150 fold-in (b) — pi `cfb6f9a8` (#2611, v0.75.0) states the limits in the description
+    // and builds them from the ENFORCING constants (`extension/schemas.ts:7,227` @v0.75.0:
+    // `${MAX_ARGS_FIELDS} fields/object, ${MAX_ARGS_ITEMS} items/array, depth ${MAX_ARGS_DEPTH},
+    // ${MAX_ARGS_BYTES / 1024} KiB total`). Formatted here from
+    // [`crate::workflows::MAX_ARGS_FIELDS`] and its three siblings — the very constants
+    // `normalize_workflow_args` refuses with — so the advertised bound and the enforced bound
+    // cannot drift. `maxProperties` is upstream's too (`:227`), and is the same constant again.
+    props.insert(
+        "args".to_string(),
+        serde_json::json!({
+            "type": "object",
+            "maxProperties": crate::workflows::MAX_ARGS_FIELDS,
+            "additionalProperties": true,
+            "description": format!(
+                "Plain-JSON args a scheduled workflow runs with; {} fields/object, {} items/array, \
+                 depth {}, {} KiB total. Omitted: an empty object.",
+                crate::workflows::MAX_ARGS_FIELDS,
+                crate::workflows::MAX_ARGS_ITEMS,
+                crate::workflows::MAX_ARGS_DEPTH,
+                crate::workflows::MAX_ARGS_BYTES / 1024,
+            )
+        }),
+    );
 
     serde_json::json!({
         "type": "object",
@@ -776,6 +828,167 @@ mod tests {
     use cyrup_core::ToolCallId;
     use std::path::PathBuf;
     use std::sync::Arc;
+
+    /// SUBA-151 — the two schema narrowings that landed with pi's `chain`/`tasks` removal window,
+    /// ported for the same reason the `usageBudget` one was: each states a bound the DISPATCHER
+    /// already refuses by name, and a bound the dispatcher enforces while the schema calls it
+    /// legal is a refusal the model could not have avoided.
+    ///
+    /// Both halves are asserted — the sentence AND the refusal it describes — so neither can be
+    /// reworded into something the validator does not do.
+    #[test]
+    fn the_budget_and_timeout_alias_bounds_are_stated_where_the_dispatcher_enforces_them() {
+        let schema = subagent_tool_parameters();
+        let props = schema["properties"]
+            .as_object()
+            .expect("the tool schema must expose an object of properties");
+
+        // pi `extension/schemas.ts:104` @v0.75.0 — `soft <= hard`.
+        let tool_budget = props["toolBudget"]["description"]
+            .as_str()
+            .expect("toolBudget carries a description");
+        assert!(tool_budget.contains("soft <= hard"), "got {tool_budget}");
+        assert_eq!(
+            crate::exec::tool_budget::validate_tool_budget_config(
+                Some(&serde_json::json!({ "hard": 2, "soft": 5 })),
+                "toolBudget"
+            ),
+            Err("toolBudget.soft must be <= toolBudget.hard.".to_string()),
+            "the stated bound is the one the dispatcher enforces"
+        );
+
+        // pi `extension/schemas.ts:241` @v0.75.0 — *"Alias maxRuntimeMs; must agree."*
+        for name in ["timeoutMs", "maxRuntimeMs"] {
+            let description = props[name]["description"]
+                .as_str()
+                .expect("the alias carries a description");
+            assert!(
+                description.contains("must agree"),
+                "{name} must state that the aliases have to agree, because \
+                 `resolve_foreground_timeout` refuses two different values; got {description}"
+            );
+        }
+        let disagreeing: SubagentToolParams = serde_json::from_value(serde_json::json!({
+            "agent": "a", "timeoutMs": 10, "maxRuntimeMs": 20
+        }))
+        .expect("the params parse");
+        assert_eq!(
+            crate::extension::tool::params::resolve_foreground_timeout(&disagreeing, None),
+            Err(
+                "timeoutMs and maxRuntimeMs are aliases; provide only one value or use the same \
+                 value for both."
+                    .to_string()
+            ),
+            "the stated bound is the one the dispatcher enforces"
+        );
+    }
+
+    /// SUBA-150 — the two parameters pi `0538e14d` (#2588, v0.74.0) DELETED from the tool are
+    /// gone from the advertised schema, and the one `workflow` field that replaced them is there
+    /// in upstream's union shape.
+    ///
+    /// Asserted against the schema the model actually receives — `self.parameters`, the value
+    /// `Tool::parameters` hands the provider — rather than against a hand-maintained name list,
+    /// because a list is exactly what goes stale when a property is reintroduced elsewhere in the
+    /// builder. THE USER ACTION: a model reading this schema must be told `workflow`, and must not
+    /// be shown a parameter the boundary refuses by name.
+    #[tokio::test]
+    async fn the_removed_workflow_parameters_are_gone_and_workflow_replaces_them() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tool = scoped_tool(dir.path()).await;
+        let advertised = tool.parameters()["properties"]
+            .as_object()
+            .expect("the advertised schema has a properties object")
+            .clone();
+
+        for removed in ["workflowScript", "workflowScriptPath"] {
+            assert!(
+                !advertised.contains_key(removed),
+                "'{removed}' was deleted from the tool at v0.74.0 and the boundary refuses it by \
+                 name, so advertising it would promise a parameter that cannot be used; keys: {:?}",
+                advertised.keys().collect::<Vec<_>>()
+            );
+        }
+        let workflow = advertised
+            .get("workflow")
+            .expect("the one workflow field must be advertised");
+        assert_eq!(
+            workflow["anyOf"],
+            serde_json::json!([
+                { "type": "boolean" },
+                { "type": "string", "minLength": 1 }
+            ]),
+            "pi `extension/schemas.ts:223-226` @v0.75.0 advertises the union, not a bare string: a \
+             string-only schema makes a provider converter reject `workflow: true`"
+        );
+        let description = workflow["description"]
+            .as_str()
+            .expect("the workflow field carries a description");
+        for form in ["true", "'/'", "named workflow resource"] {
+            assert!(
+                description.contains(form),
+                "the description must name the {form} form, or a model cannot tell a path from a \
+                 resource name; got {description}"
+            );
+        }
+    }
+
+    /// SUBA-150 fold-in (b) / pi `cfb6f9a8` (#2611, v0.75.0) — the `args` description STATES its
+    /// limits, and states them from the constants that enforce them.
+    ///
+    /// The anti-drift assertion is the point: every number in the description is recomputed here
+    /// from [`crate::workflows::MAX_ARGS_FIELDS`] and its siblings, AND
+    /// [`crate::workflows::normalize_workflow_args`] is made to refuse at exactly those values. A
+    /// change to one bound that left the other behind — the literal-in-the-description problem
+    /// upstream exported the constants to end — fails here.
+    #[test]
+    fn the_args_description_states_the_same_limits_the_normaliser_enforces() {
+        let schema = subagent_tool_parameters();
+        let args = &schema["properties"]["args"];
+        assert_eq!(
+            args["maxProperties"],
+            serde_json::json!(crate::workflows::MAX_ARGS_FIELDS),
+            "pi advertises the field bound as `maxProperties` too (`schemas.ts:227`)"
+        );
+        let description = args["description"]
+            .as_str()
+            .expect("args carries a description");
+        for stated in [
+            format!("{} fields/object", crate::workflows::MAX_ARGS_FIELDS),
+            format!("{} items/array", crate::workflows::MAX_ARGS_ITEMS),
+            format!("depth {}", crate::workflows::MAX_ARGS_DEPTH),
+            format!("{} KiB", crate::workflows::MAX_ARGS_BYTES / 1024),
+        ] {
+            assert!(
+                description.contains(&stated),
+                "the advertised description must state {stated:?} — the value the normaliser \
+                 enforces; got {description}"
+            );
+        }
+
+        // …and the enforcing side really does refuse at those numbers, so the description is not
+        // merely self-consistent.
+        let over_fields: serde_json::Map<String, serde_json::Value> = (0
+            ..=crate::workflows::MAX_ARGS_FIELDS)
+            .map(|i| (format!("f{i}"), serde_json::json!(1)))
+            .collect();
+        assert!(
+            crate::workflows::normalize_workflow_args(Some(&serde_json::Value::Object(
+                over_fields
+            )))
+            .is_err(),
+            "one field past the advertised bound must be refused"
+        );
+        let at_fields: serde_json::Map<String, serde_json::Value> = (0
+            ..crate::workflows::MAX_ARGS_FIELDS)
+            .map(|i| (format!("f{i}"), serde_json::json!(1)))
+            .collect();
+        assert!(
+            crate::workflows::normalize_workflow_args(Some(&serde_json::Value::Object(at_fields)))
+                .is_ok(),
+            "exactly the advertised bound must be admitted"
+        );
+    }
 
     /// PB-9 — the schema does not advertise `clarify` (upstream dropped it at v0.43.0 and refuses
     /// it at every public entry). Mutation killed: re-inserting the property.

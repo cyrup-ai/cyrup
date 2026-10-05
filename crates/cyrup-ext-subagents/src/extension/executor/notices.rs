@@ -2147,9 +2147,10 @@ mod retained_children_goal_tests {
         let result = dispatch_tool(
             &tool,
             serde_json::json!({
-                "workflowScript":
+                "workflow": crate::extension::testsupport::workflow_script_path(
                     "await runs.run(\"a\", { agent: \"worker\", task: \"T\", model: \"sonnet\" });\n\
                      return \"done\";"
+                )
             }),
         )
         .await
