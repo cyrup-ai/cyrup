@@ -122,7 +122,9 @@ impl StreamFn for SchemaSpy {
     }
 }
 
-fn spy(responses: Vec<cyrup_core::AssistantMessage>) -> (Arc<dyn StreamFn>, Arc<Mutex<Vec<Vec<ToolDef>>>>) {
+fn spy(
+    responses: Vec<cyrup_core::AssistantMessage>,
+) -> (Arc<dyn StreamFn>, Arc<Mutex<Vec<Vec<ToolDef>>>>) {
     let faux = Arc::new(FauxProvider::new());
     faux.set_responses(responses);
     let seen = Arc::new(Mutex::new(Vec::new()));
@@ -204,7 +206,11 @@ async fn a_codemode_tool_is_not_in_the_schema_unless_explicitly_activated() {
         "codemode must not be declared by default: {:?}",
         declared_names(&schema)
     );
-    let schema = schema_for(ToolLoadout::resolve(&names(&["direct_t", "codemode_t"]), &registry)).await;
+    let schema = schema_for(ToolLoadout::resolve(
+        &names(&["direct_t", "codemode_t"]),
+        &registry,
+    ))
+    .await;
     assert_eq!(declared_names(&schema), ["direct_t", "codemode_t"]);
 }
 
@@ -229,11 +235,17 @@ async fn a_deferred_tool_is_not_in_the_schema_unless_explicitly_activated() {
 async fn a_hidden_tool_never_reaches_the_schema_and_is_not_dispatched() {
     let hidden = Probe::new("hidden_t", ToolExposure::Hidden);
     let ran = hidden.ran();
-    let registry: Vec<Arc<dyn Tool>> = vec![Probe::new("direct_t", ToolExposure::Direct).arc(), hidden.arc()];
+    let registry: Vec<Arc<dyn Tool>> = vec![
+        Probe::new("direct_t", ToolExposure::Direct).arc(),
+        hidden.arc(),
+    ];
     let loadout = ToolLoadout::resolve(&names(&["direct_t", "hidden_t"]), &registry);
 
     let (sf, seen) = spy(vec![
-        faux_assistant_message(vec![faux_tool_call("hidden_t", json!({}))], StopReason::ToolUse),
+        faux_assistant_message(
+            vec![faux_tool_call("hidden_t", json!({}))],
+            StopReason::ToolUse,
+        ),
         faux_assistant_message(vec![faux_text("done")], StopReason::Stop),
     ]);
     let agent = Agent::builder(model_ref(), sf).loadout(loadout).build();
@@ -294,7 +306,11 @@ async fn a_loadout_description_reaches_the_schema() {
             .arc(),
         Probe::new("read", ToolExposure::Direct).arc(),
     ];
-    let schema = schema_for(ToolLoadout::resolve(&names(&["codemode", "read"]), &registry)).await;
+    let schema = schema_for(ToolLoadout::resolve(
+        &names(&["codemode", "read"]),
+        &registry,
+    ))
+    .await;
     let read = schema.iter().find(|d| d.name == "read").unwrap();
     assert_eq!(read.description, "REWRITTEN by the loadout");
     assert_eq!(
@@ -338,7 +354,10 @@ async fn a_pushed_loadout_keeps_its_hidden_declarations_on_the_next_request() {
     let second = ToolLoadout::resolve(&names(&["codemode", "bash", "direct_t"]), &registry);
 
     let (sf, seen) = spy(vec![
-        faux_assistant_message(vec![faux_tool_call("direct_t", json!({}))], StopReason::ToolUse),
+        faux_assistant_message(
+            vec![faux_tool_call("direct_t", json!({}))],
+            StopReason::ToolUse,
+        ),
         faux_assistant_message(vec![faux_text("done")], StopReason::Stop),
     ]);
     let agent = Agent::builder(model_ref(), sf)

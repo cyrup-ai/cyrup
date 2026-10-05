@@ -61,16 +61,17 @@ impl PermissionSystemExtension {
         // keeps a non-declarable tool only while it is already active, and never a `hidden` one.
         // \[CYRUP-DELTA] pi v0.8.0 predates the exposure model (`ToolExposure`,
         // `core/extensions/types.ts:509` @pi v1.0.1) and round-trips every `getAllTools()` name.
-        let allowed: Option<Vec<String>> = services.and_then(|s| {
-            s.all_tool_names()
-                .map(|names| shapeable_tools(names, s.all_tools(), s.active_tools()))
-        })
-        .map(|tools| {
-            tools
-                .into_iter()
-                .filter(|name| self.should_expose_tool(name, agent))
-                .collect()
-        });
+        let allowed: Option<Vec<String>> = services
+            .and_then(|s| {
+                s.all_tool_names()
+                    .map(|names| shapeable_tools(names, s.all_tools(), s.active_tools()))
+            })
+            .map(|tools| {
+                tools
+                    .into_iter()
+                    .filter(|name| self.should_expose_tool(name, agent))
+                    .collect()
+            });
 
         let Some(allowed) = allowed else {
             return self.shape_agent_start_prompt(system_prompt, system_prompt, agent, &cwd, None);

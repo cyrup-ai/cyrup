@@ -9,9 +9,7 @@ use crate::queue::QueueMode;
 use crate::state::AgentStateSnapshot;
 use crate::stream_fn::StreamFn;
 use crate::subscriber::EventSubscriber;
-use cyrup_core::{
-    AssistantMessage, CancelToken, ModelRef, ModelThinkingLevel, Tool, ToolLoadout,
-};
+use cyrup_core::{AssistantMessage, CancelToken, ModelRef, ModelThinkingLevel, Tool, ToolLoadout};
 use std::sync::{Arc, Mutex};
 
 /// The detach handle [`Agent::subscribe`] returns — cyrup's analogue of the `() => void` closure pi

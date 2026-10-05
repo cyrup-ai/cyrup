@@ -127,8 +127,16 @@ fn registration_activation_is_declarable_and_default_active() {
         (ToolExposure::Deferred, false, false),
         (ToolExposure::Hidden, false, false),
     ] {
-        assert_eq!(e.activated_on_registration(true), on, "{e:?} default active");
-        assert_eq!(e.activated_on_registration(false), off, "{e:?} defaultActive false");
+        assert_eq!(
+            e.activated_on_registration(true),
+            on,
+            "{e:?} default active"
+        );
+        assert_eq!(
+            e.activated_on_registration(false),
+            off,
+            "{e:?} defaultActive false"
+        );
     }
 }
 
@@ -206,10 +214,7 @@ fn a_hidden_declaration_stays_executable_but_leaves_the_request() {
     let l = ToolLoadout::resolve(&names(&["codemode", "bash", "read"]), &registry);
     assert_eq!(exec_names(&l), ["codemode", "bash", "read"]);
     assert_eq!(l.advertised().names(), ["codemode", "read"]);
-    assert_eq!(
-        l.hidden_declarations().iter().collect::<Vec<_>>(),
-        ["bash"]
-    );
+    assert_eq!(l.hidden_declarations().iter().collect::<Vec<_>>(), ["bash"]);
     let decls = l.advertised().declarations();
     assert_eq!(
         decls.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(),
@@ -238,7 +243,11 @@ fn a_hook_description_replaces_the_description_everywhere_the_loop_looks() {
         .find(|d| d.name == "read")
         .unwrap();
     assert_eq!(decl.description, "rewritten");
-    assert_eq!(decl.parameters, registry[1].parameters().clone(), "schema untouched");
+    assert_eq!(
+        decl.parameters,
+        registry[1].parameters().clone(),
+        "schema untouched"
+    );
     let exec = l.executable().iter().find(|t| t.name() == "read").unwrap();
     assert_eq!(exec.description(), "rewritten");
     // The registry's own tool is not mutated.
@@ -247,8 +256,17 @@ fn a_hook_description_replaces_the_description_everywhere_the_loop_looks() {
 
 #[test]
 fn a_hook_sees_the_three_views_and_both_accessors() {
-    let seen: Arc<std::sync::Mutex<Option<(Vec<String>, Vec<String>, Vec<String>, ToolExposure, Option<ToolNamespace>)>>> =
-        Arc::new(std::sync::Mutex::new(None));
+    let seen: Arc<
+        std::sync::Mutex<
+            Option<(
+                Vec<String>,
+                Vec<String>,
+                Vec<String>,
+                ToolExposure,
+                Option<ToolNamespace>,
+            )>,
+        >,
+    > = Arc::new(std::sync::Mutex::new(None));
     let sink = Arc::clone(&seen);
     let mut with_ns = Fixture::new("ns_t", ToolExposure::Deferred);
     with_ns.namespace = Some(ToolNamespace {
@@ -274,10 +292,14 @@ fn a_hook_sees_the_three_views_and_both_accessors() {
             .arc(),
     );
     let _ = ToolLoadout::resolve(&names(&["direct_t", "model_only_t", "probe"]), &registry);
-    let (declared, callable, registered, hidden_exposure, ns) = seen.lock().unwrap().take().unwrap();
+    let (declared, callable, registered, hidden_exposure, ns) =
+        seen.lock().unwrap().take().unwrap();
     assert_eq!(declared, ["direct_t", "model_only_t", "probe"]);
     // active direct + every codemode/deferred; model-only and hidden never.
-    assert_eq!(callable, ["direct_t", "codemode_t", "deferred_t", "ns_t", "probe"]);
+    assert_eq!(
+        callable,
+        ["direct_t", "codemode_t", "deferred_t", "ns_t", "probe"]
+    );
     assert_eq!(registered.len(), 7);
     assert_eq!(hidden_exposure, ToolExposure::Hidden);
     assert_eq!(ns.unwrap().name, "mcp__docs");

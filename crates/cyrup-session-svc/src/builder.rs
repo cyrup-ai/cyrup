@@ -410,9 +410,8 @@ fn select_active_tools(
     // Pi `_isActivatedOnRegistration` for the non-built-in tools (`agent-session.ts:3554` @v1.0.1):
     // a `codemode`, `deferred` or `hidden` tool, or one registered `defaultActive: false`, is
     // registered but not active at start.
-    let registration_activates = |t: &Arc<dyn cyrup_core::Tool>| {
-        t.exposure().activated_on_registration(t.default_active())
-    };
+    let registration_activates =
+        |t: &Arc<dyn cyrup_core::Tool>| t.exposure().activated_on_registration(t.default_active());
     let keep = |t: &Arc<dyn cyrup_core::Tool>| -> bool {
         let name = t.name();
         match (&cfg.tools, cfg.no_tools) {
@@ -3212,6 +3211,87 @@ mod tests {
 
     fn names(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    /// A non-built-in tool with a settable exposure and `defaultActive`.
+    struct ExposedTool {
+        name: &'static str,
+        exposure: cyrup_core::ToolExposure,
+        default_active: bool,
+        params: serde_json::Value,
+    }
+
+    #[async_trait::async_trait]
+    impl cyrup_core::Tool for ExposedTool {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn parameters(&self) -> &serde_json::Value {
+            &self.params
+        }
+        fn exposure(&self) -> cyrup_core::ToolExposure {
+            self.exposure
+        }
+        fn default_active(&self) -> bool {
+            self.default_active
+        }
+        async fn execute(
+            &self,
+            _id: cyrup_core::ToolCallId,
+            _args: serde_json::Value,
+            _cancel: cyrup_core::CancelToken,
+            _on_update: Box<dyn FnMut(cyrup_core::ToolUpdate) + Send>,
+        ) -> Result<cyrup_core::ToolResult, cyrup_core::ToolError> {
+            Err(cyrup_core::ToolError::new("not executable"))
+        }
+    }
+
+    /// pi `_isActivatedOnRegistration` (`agent-session.ts:3554` @v1.0.1) decides which NON-built-in
+    /// visible tools start active: `direct`/`model-only` unless `defaultActive: false`. An explicit
+    /// `tools` allowlist activates a named tool iff it is declarable (`:3510-3516`).
+    #[test]
+    fn a_non_builtin_tool_starts_active_only_when_registration_activates_it() {
+        use cyrup_core::ToolExposure as E;
+        let tool = |name, exposure, default_active| {
+            std::sync::Arc::new(ExposedTool {
+                name,
+                exposure,
+                default_active,
+                params: serde_json::json!({}),
+            }) as std::sync::Arc<dyn cyrup_core::Tool>
+        };
+        let visible = vec![
+            tool("x_direct", E::Direct, true),
+            tool("x_model_only", E::ModelOnly, true),
+            tool("x_codemode", E::Codemode, true),
+            tool("x_deferred", E::Deferred, true),
+            tool("x_hidden", E::Hidden, true),
+            tool("x_inactive", E::Direct, false),
+        ];
+        let pick = |cfg: &super::SessionConfig| -> Vec<String> {
+            super::select_active_tools(&visible, cfg, None)
+                .iter()
+                .map(|t| t.name().to_string())
+                .collect()
+        };
+
+        let cfg = super::SessionConfig::new("/tmp", "/tmp/agent");
+        assert_eq!(pick(&cfg), names(&["x_direct", "x_model_only"]));
+
+        let mut builtin_off = super::SessionConfig::new("/tmp", "/tmp/agent");
+        builtin_off.no_tools = Some(super::NoTools::Builtin);
+        assert_eq!(pick(&builtin_off), names(&["x_direct", "x_model_only"]));
+
+        // Naming activates iff declarable, even when not active by default; a codemode or hidden
+        // tool named in the allowlist is still not activated.
+        let mut allow = super::SessionConfig::new("/tmp", "/tmp/agent");
+        allow.tools = Some(names(&[
+            "x_inactive",
+            "x_codemode",
+            "x_hidden",
+            "x_model_only",
+        ]));
+        assert_eq!(pick(&allow), names(&["x_model_only", "x_inactive"]));
     }
 
     #[test]

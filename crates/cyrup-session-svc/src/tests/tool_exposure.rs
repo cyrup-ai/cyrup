@@ -72,7 +72,11 @@ impl Probe {
         self
     }
 
-    fn hiding(mut self, hidden: &'static str, describing: Option<(&'static str, &'static str)>) -> Self {
+    fn hiding(
+        mut self,
+        hidden: &'static str,
+        describing: Option<(&'static str, &'static str)>,
+    ) -> Self {
         self.hook = Some(Arc::new(move |_| {
             let mut descriptions = BTreeMap::new();
             if let Some((tool, text)) = describing {
@@ -206,9 +210,10 @@ fn script(requests: &Requests, replies: Vec<Reply>) -> Arc<FauxProvider> {
         .map(|reply| {
             let seen = Arc::clone(requests);
             FauxResponseStep::factory(move |ctx, _opts, _state, _model| {
-                seen.lock()
-                    .unwrap()
-                    .push((ctx.tools.clone(), ctx.system_prompt.clone().unwrap_or_default()));
+                seen.lock().unwrap().push((
+                    ctx.tools.clone(),
+                    ctx.system_prompt.clone().unwrap_or_default(),
+                ));
                 match reply {
                     Reply::Call(name) => faux_assistant_message(
                         vec![faux_tool_call(name.to_string(), serde_json::json!({}))],
@@ -284,8 +289,14 @@ async fn the_schema_the_provider_receives_declares_only_what_registration_activa
     let reqs = requests.lock().unwrap().clone();
     assert_eq!(reqs.len(), 1);
     let declared = names(&reqs[0].0);
-    assert!(declared.contains(&"direct_t"), "direct is declared: {declared:?}");
-    assert!(declared.contains(&"model_only_t"), "model-only is declared: {declared:?}");
+    assert!(
+        declared.contains(&"direct_t"),
+        "direct is declared: {declared:?}"
+    );
+    assert!(
+        declared.contains(&"model_only_t"),
+        "model-only is declared: {declared:?}"
+    );
     for absent in ["codemode_t", "deferred_t", "hidden_t", "direct_inactive_t"] {
         assert!(
             !declared.contains(&absent),
@@ -321,7 +332,11 @@ async fn active_callable_and_registered_views_follow_pis_predicates() {
         ("hidden_t", false),
         ("direct_inactive_t", false),
     ] {
-        assert_eq!(active.iter().any(|n| n == name), want, "{name} active? {active:?}");
+        assert_eq!(
+            active.iter().any(|n| n == name),
+            want,
+            "{name} active? {active:?}"
+        );
     }
 
     // Callable: the active `direct` tools and every registered codemode/deferred tool; never
@@ -335,16 +350,27 @@ async fn active_callable_and_registered_views_follow_pis_predicates() {
         ("hidden_t", false),
         ("direct_inactive_t", false),
     ] {
-        assert_eq!(callable.iter().any(|n| n == name), want, "{name} callable? {callable:?}");
+        assert_eq!(
+            callable.iter().any(|n| n == name),
+            want,
+            "{name} callable? {callable:?}"
+        );
     }
 
     // Registered: every tool, with its exposure and namespace on the row.
     let rows = session.all_tools();
-    let row = |n: &str| rows.iter().find(|r| r.name == n).unwrap_or_else(|| panic!("{n} registered"));
+    let row = |n: &str| {
+        rows.iter()
+            .find(|r| r.name == n)
+            .unwrap_or_else(|| panic!("{n} registered"))
+    };
     assert_eq!(row("codemode_t").exposure, ToolExposure::Codemode);
     assert_eq!(row("hidden_t").exposure, ToolExposure::Hidden);
     assert_eq!(row("direct_t").exposure, ToolExposure::Direct);
-    assert_eq!(row("codemode_t").namespace.as_ref().unwrap().name, "mcp__docs");
+    assert_eq!(
+        row("codemode_t").namespace.as_ref().unwrap().name,
+        "mcp__docs"
+    );
     assert!(row("direct_t").namespace.is_none());
 }
 
@@ -368,7 +394,10 @@ async fn explicit_activation_declares_deferred_and_codemode_but_never_hidden() {
     let declared = names(&reqs[0].0);
     assert!(declared.contains(&"deferred_t"), "{declared:?}");
     assert!(declared.contains(&"codemode_t"), "{declared:?}");
-    assert!(!declared.contains(&"hidden_t"), "hidden is never declared: {declared:?}");
+    assert!(
+        !declared.contains(&"hidden_t"),
+        "hidden is never declared: {declared:?}"
+    );
     assert!(
         !session.active_tool_names().iter().any(|n| n == "hidden_t"),
         "activating a hidden tool has no effect"
@@ -402,8 +431,16 @@ async fn a_hidden_declaration_leaves_the_request_and_prompt_but_is_still_dispatc
     let reqs = requests.lock().unwrap().clone();
     assert_eq!(reqs.len(), 2, "call + final answer");
     for (i, (decls, prompt)) in reqs.iter().enumerate() {
-        assert!(names(decls).contains(&"hider_t"), "request {i}: {:?}", names(decls));
-        assert!(!names(decls).contains(&"echo_t"), "request {i}: {:?}", names(decls));
+        assert!(
+            names(decls).contains(&"hider_t"),
+            "request {i}: {:?}",
+            names(decls)
+        );
+        assert!(
+            !names(decls).contains(&"echo_t"),
+            "request {i}: {:?}",
+            names(decls)
+        );
         assert!(
             !prompt.contains("SNIPPET-echo_t"),
             "request {i}: the prompt must not list a tool the request does not declare: {prompt}"
@@ -451,7 +488,12 @@ async fn a_plain_direct_extension_tool_is_declared_unchanged() {
     let fx = fixture();
     let requests: Requests = Arc::new(Mutex::new(Vec::new()));
     let faux = script(&requests, vec![Reply::Text("done")]);
-    let session = session_with(&fx, faux, vec![Probe::new("plain_t", ToolExposure::Direct).arc()]).await;
+    let session = session_with(
+        &fx,
+        faux,
+        vec![Probe::new("plain_t", ToolExposure::Direct).arc()],
+    )
+    .await;
     let _ = session.prompt("go").await.unwrap();
     session.wait_for_idle().await;
     let reqs = requests.lock().unwrap().clone();
@@ -472,10 +514,16 @@ async fn a_late_registration_is_activated_only_when_its_exposure_says_so() {
 
     let owner = ExtensionId::from("late-ext");
     let host = session.services().ext_host.clone();
-    host.register_late_tool(owner.clone(), Probe::new("late_direct", ToolExposure::Direct).arc())
-        .unwrap();
-    host.register_late_tool(owner.clone(), Probe::new("late_deferred", ToolExposure::Deferred).arc())
-        .unwrap();
+    host.register_late_tool(
+        owner.clone(),
+        Probe::new("late_direct", ToolExposure::Direct).arc(),
+    )
+    .unwrap();
+    host.register_late_tool(
+        owner.clone(),
+        Probe::new("late_deferred", ToolExposure::Deferred).arc(),
+    )
+    .unwrap();
     host.register_late_tool(owner, Probe::new("late_hidden", ToolExposure::Hidden).arc())
         .unwrap();
     session.refresh_extension_tools().await;
@@ -485,7 +533,10 @@ async fn a_late_registration_is_activated_only_when_its_exposure_says_so() {
     assert!(!active.iter().any(|n| n == "late_deferred"), "{active:?}");
     assert!(!active.iter().any(|n| n == "late_hidden"), "{active:?}");
     let callable = session.callable_tool_names();
-    assert!(callable.iter().any(|n| n == "late_deferred"), "{callable:?}");
+    assert!(
+        callable.iter().any(|n| n == "late_deferred"),
+        "{callable:?}"
+    );
     assert!(!callable.iter().any(|n| n == "late_hidden"), "{callable:?}");
 
     let _ = session.prompt("go").await.unwrap();
@@ -505,13 +556,21 @@ async fn a_tool_whose_exposure_changes_to_direct_is_activated_like_a_new_tool() 
     let fx = fixture();
     let requests: Requests = Arc::new(Mutex::new(Vec::new()));
     let faux = script(&requests, vec![Reply::Text("done")]);
-    let session = session_with(&fx, faux, vec![Probe::new("flip_t", ToolExposure::Hidden).arc()]).await;
+    let session = session_with(
+        &fx,
+        faux,
+        vec![Probe::new("flip_t", ToolExposure::Hidden).arc()],
+    )
+    .await;
     assert!(!session.active_tool_names().iter().any(|n| n == "flip_t"));
 
     session
         .services()
         .ext_host
-        .register_late_tool(ExtensionId::from("exposure-ext"), Probe::new("flip_t", ToolExposure::Direct).arc())
+        .register_late_tool(
+            ExtensionId::from("exposure-ext"),
+            Probe::new("flip_t", ToolExposure::Direct).arc(),
+        )
         .unwrap();
     session.refresh_extension_tools().await;
     assert!(
@@ -532,7 +591,11 @@ async fn the_guest_get_all_tools_rows_carry_exposure_and_namespace() {
     let (tools, _) = one_of_each();
     let session = session_with(&fx, faux, tools).await;
 
-    let rows = session.services().host_services.all_tools().expect("a live session answers");
+    let rows = session
+        .services()
+        .host_services
+        .all_tools()
+        .expect("a live session answers");
     let row = |n: &str| rows.iter().find(|r| r["name"] == n).unwrap().clone();
     assert_eq!(row("codemode_t")["exposure"], "codemode");
     assert_eq!(row("codemode_t")["namespace"]["name"], "mcp__docs");
@@ -560,12 +623,13 @@ async fn a_failing_loadout_hook_is_reported_and_leaves_the_loadout_intact() {
     )
     .await;
     let sink = Arc::clone(&errors);
-    session
-        .services()
-        .ext_host
-        .add_error_listener(Arc::new(move |e: &cyrup_ext::ExtensionError| {
-            sink.lock().unwrap().push((e.event.to_string(), e.error.clone()));
-        }));
+    session.services().ext_host.add_error_listener(Arc::new(
+        move |e: &cyrup_ext::ExtensionError| {
+            sink.lock()
+                .unwrap()
+                .push((e.event.to_string(), e.error.clone()));
+        },
+    ));
 
     // Any re-application of the active set runs the hooks again.
     let names_now = session.active_tool_names();
@@ -573,12 +637,45 @@ async fn a_failing_loadout_hook_is_reported_and_leaves_the_loadout_intact() {
 
     let seen = errors.lock().unwrap().clone();
     assert!(
-        seen.iter().any(|(event, msg)| event == "prepare_loadout" && msg.contains("hook exploded")),
+        seen.iter()
+            .any(|(event, msg)| event == "prepare_loadout" && msg.contains("hook exploded")),
         "{seen:?}"
     );
     let _ = session.prompt("go").await.unwrap();
     session.wait_for_idle().await;
     let reqs = requests.lock().unwrap().clone();
     let declared = names(&reqs[0].0);
-    assert!(declared.contains(&"bad_t") && declared.contains(&"plain_t"), "{declared:?}");
+    assert!(
+        declared.contains(&"bad_t") && declared.contains(&"plain_t"),
+        "{declared:?}"
+    );
+}
+
+/// The prompt REBUILT after the session started (a `setActiveTools`) must also omit the snippet of a
+/// tool whose declaration a hook hides, exactly as the one built at start does (pi
+/// `_rebuildSystemPrompt`, `agent-session.ts:1651-1678`): the listing has to match the request.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_rebuilt_prompt_does_not_list_a_hidden_declaration() {
+    let fx = fixture();
+    let requests: Requests = Arc::new(Mutex::new(Vec::new()));
+    let faux = script(&requests, vec![Reply::Text("done")]);
+    let session = session_with(
+        &fx,
+        faux,
+        vec![
+            Probe::new("hider_t", ToolExposure::Direct)
+                .hiding("echo_t", None)
+                .arc(),
+            Probe::new("echo_t", ToolExposure::Direct).arc(),
+        ],
+    )
+    .await;
+    // Deactivate and reactivate so the base prompt is rebuilt from the dynamic-tool state.
+    session.set_active_tools_by_name(&strings(&["read"])).await;
+    session
+        .set_active_tools_by_name(&strings(&["read", "hider_t", "echo_t"]))
+        .await;
+    let prompt = session.base_system_prompt();
+    assert!(prompt.contains("SNIPPET-hider_t"), "{prompt}");
+    assert!(!prompt.contains("SNIPPET-echo_t"), "{prompt}");
 }

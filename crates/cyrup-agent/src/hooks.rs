@@ -272,7 +272,12 @@ impl TurnUpdate {
 }
 
 fn tool_names(tools: Option<&ToolLoadout>) -> Option<Vec<String>> {
-    tools.map(|ts| ts.executable().iter().map(|t| t.name().to_string()).collect())
+    tools.map(|ts| {
+        ts.executable()
+            .iter()
+            .map(|t| t.name().to_string())
+            .collect()
+    })
 }
 
 /// Hand-written because `Arc<dyn Tool>` is not `Debug` (`Tool: Send + Sync` only) — tools print as

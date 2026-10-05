@@ -270,7 +270,11 @@ impl DynamicToolState {
             description: t.description().to_string(),
             parameters: t.parameters().clone(),
             prompt_snippet: t.prompt_snippet().map(str::to_string),
-            active: self.loadout.executable().iter().any(|a| a.name() == t.name()),
+            active: self
+                .loadout
+                .executable()
+                .iter()
+                .any(|a| a.name() == t.name()),
             exposure: t.exposure(),
             namespace: t.namespace().cloned(),
             render_kind: t.render_kind(),

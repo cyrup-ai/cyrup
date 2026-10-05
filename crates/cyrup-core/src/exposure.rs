@@ -60,7 +60,9 @@ use crate::tool_def::ToolDef;
 /// declared, being activated on registration and being callable, and those rules live in the
 /// exhaustive `match`es below so that adding a sixth exposure is a compile error everywhere a
 /// decision is made.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
+)]
 #[serde(rename_all = "kebab-case")]
 pub enum ToolExposure {
     /// Declared to the model while active, and callable while active. The default.
