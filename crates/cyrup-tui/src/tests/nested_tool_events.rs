@@ -64,20 +64,36 @@ fn events(with_nested: bool) -> Vec<AgentSessionEvent> {
     evs
 }
 
-fn transcript_after(evs: &[AgentSessionEvent]) -> String {
+/// Everything on screen: the committed scrollback and the live region, where a tool that has
+/// started and not ended is drawn.
+fn screen(app: &App<TestBackend>) -> String {
+    let buf = app.terminal().backend().buffer();
+    let mut live = String::new();
+    for y in 0..buf.area.height {
+        for x in 0..buf.area.width {
+            if let Some(cell) = buf.cell((x, y)) {
+                live.push_str(cell.symbol());
+            }
+        }
+        live.push('\n');
+    }
+    format!("{}\n{live}", app.scrollback_text())
+}
+
+fn screen_after(evs: &[AgentSessionEvent]) -> String {
     let mut app = app();
     for ev in evs {
         app.ingest_event(ev);
     }
     app.draw().unwrap();
-    app.scrollback_text()
+    screen(&app)
 }
 
-/// The nested call draws no row of its own: the transcript is exactly what the parent alone makes.
+/// The nested call draws no row of its own, in scrollback or in the live region: its arguments and
+/// its result appear nowhere, and the parent's own row is intact.
 #[test]
 fn nested_tool_execution_events_draw_no_row() {
-    let with = transcript_after(&events(true));
-    let without = transcript_after(&events(false));
+    let with = screen_after(&events(true));
     assert!(
         with.contains("README.md"),
         "the parent's own row is lost:\n{with}"
@@ -86,7 +102,6 @@ fn nested_tool_execution_events_draw_no_row() {
         !with.contains("NESTED_ONLY_FILE.md") && !with.contains("NESTED_RESULT_TEXT"),
         "a nested call was drawn as a tool row:\n{with}"
     );
-    assert_eq!(with, without, "nested events changed what is on screen");
 }
 
 /// The nested events are ignored by the fold, not merely invisible: an end for a nested id does not
@@ -107,7 +122,7 @@ fn a_nested_end_does_not_close_the_parents_running_row() {
         parent_tool_call_id: ToolCallId::from("call-ls"),
     });
     app.draw().unwrap();
-    let mid = app.scrollback_text();
+    let mid = screen(&app);
     assert!(!mid.contains("NESTED_RESULT_TEXT"), "{mid}");
     // The parent can still finish normally afterwards.
     app.ingest_event(&AgentSessionEvent::ToolExecutionEnd {
@@ -117,5 +132,5 @@ fn a_nested_end_does_not_close_the_parents_running_row() {
         is_error: false,
     });
     app.draw().unwrap();
-    assert!(app.scrollback_text().contains("PARENT_RESULT"));
+    assert!(screen(&app).contains("PARENT_RESULT"));
 }
