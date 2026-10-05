@@ -11,9 +11,22 @@ authors.workspace = true
 [lints]
 workspace = true
 
+[features]
+# `testkit`: a scripted `ScriptSandbox` and a recording `CodemodeHost`, so a consumer's tests can
+# drive the `codemode` tool through its real seams without an engine. Never on in a release build.
+testkit = []
+
 [dependencies]
 cyrup-core = { workspace = true }
 cyrup-codemode = { workspace = true }
+# `CodemodeMode`, the `codemode.mode` / `codemode.inlineBudget` settings the host reports.
+cyrup-config = { workspace = true }
+# `NativeExtension`/`InitApi`: the built-in extension that registers the tool.
+cyrup-ext = { workspace = true }
+# `AnyModel`, `ClassifierContext`, `ImagesContext` and `Models`: what the `models` globals call.
+cyrup-provider = { workspace = true }
+# `localeCompare` for the order of namespace headings (`createCodemodeDescription`).
+feruca = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
@@ -23,3 +36,6 @@ tokio = { workspace = true }
 # ADR-0031: the one JavaScript engine in this workspace. The sandbox embeds V8 through `deno_core`
 # alone (no `deno_runtime`): ECMAScript intrinsics and this crate's ops, nothing else.
 deno_core = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

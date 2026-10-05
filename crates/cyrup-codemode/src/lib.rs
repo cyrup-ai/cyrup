@@ -29,7 +29,7 @@
 pub mod declarations;
 pub mod discovery;
 pub mod identifier;
-mod js;
+pub mod js;
 pub mod output;
 pub mod rank;
 pub mod source;
