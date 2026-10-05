@@ -302,6 +302,29 @@ pub enum OverlayOutcome {
     Close,
 }
 
+/// How an overlay answered one pointer event — pi's `handleMouse` result, where `undefined` means
+/// "not mine" and an object (with or without a repaint) means "handled".
+///
+/// [`OverlayOutcome::Ignored`] cannot say that: for a key it means "nothing changed", and an
+/// overlay that *handled* a press on an already-highlighted row also changed nothing. The host
+/// needs the difference, because a pointer event the overlay does not handle is not consumed — it
+/// falls through to the host's text selection, so the overlay's text can be selected and copied —
+/// while one it handled stays the overlay's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum OverlayMouseOutcome {
+    /// Not the overlay's event: a press on its title, its body text, a row that is not an item.
+    /// The host may use it to select the text under the pointer.
+    Unhandled,
+    /// The overlay took the event and nothing visible changed (a wheel notch against the end of a
+    /// list, a press on the row already highlighted).
+    Handled,
+    /// The overlay took the event and state changed; repaint.
+    Redraw,
+    /// The overlay took the event and asked to close; the host tears it down.
+    Close,
+}
+
 /// One pointer event the host routed to an overlay, as the small closed set an overlay can act on.
 ///
 /// Positions are **local to the box the overlay painted**: `(0, 0)` is the top-left cell of the
@@ -445,12 +468,13 @@ pub trait InteractiveOverlay: Send {
     /// Route one pointer event that landed inside the box this overlay painted.
     ///
     /// The host hit-tests by the rectangle [`Self::render`]'s lines were painted into, so every
-    /// event arrives already local to it ([`OverlayMouse`]). A hit overlay is modal for the event:
-    /// whatever it answers, the event is not also offered to the editor, the dock or the document
-    /// beneath. Defaulted to [`OverlayOutcome::Ignored`] — an overlay with nothing to point at is
-    /// unchanged by this seam.
-    fn handle_mouse(&mut self, _event: OverlayMouse) -> OverlayOutcome {
-        OverlayOutcome::Ignored
+    /// event arrives already local to it ([`OverlayMouse`]). The event is never also offered to the
+    /// editor, the dock or the scrolled document beneath. What the overlay answers decides the rest:
+    /// [`OverlayMouseOutcome::Unhandled`] lets the host use the event for text selection (so a
+    /// drag across the overlay's text copies it), while any handled answer keeps it the overlay's.
+    /// Defaulted to `Unhandled` — an overlay with nothing to point at has selectable text.
+    fn handle_mouse(&mut self, _event: OverlayMouse) -> OverlayMouseOutcome {
+        OverlayMouseOutcome::Unhandled
     }
 
     /// The self-refresh cadence in milliseconds, or `0` for "never tick me" (the default).
@@ -693,10 +717,11 @@ impl InteractiveOverlay for SpecOverlay {
 
     /// A chooser's rows answer the pointer the way a list does: the wheel moves the highlight one
     /// row (clamped, never wrapping), a press selects the row under the pointer, a click resolves
-    /// `ui.custom` to it. A read-only panel has no rows, so it ignores the pointer.
-    fn handle_mouse(&mut self, event: OverlayMouse) -> OverlayOutcome {
+    /// `ui.custom` to it. A read-only panel has no rows, so it leaves the pointer unhandled, as
+    /// does a press or click on the title or the body text.
+    fn handle_mouse(&mut self, event: OverlayMouse) -> OverlayMouseOutcome {
         let Some(last) = self.spec.options.len().checked_sub(1) else {
-            return OverlayOutcome::Ignored;
+            return OverlayMouseOutcome::Unhandled;
         };
         let first_option =
             usize::from(self.spec.title.is_some()).saturating_add(self.spec.lines.len());
@@ -706,6 +731,8 @@ impl InteractiveOverlay for SpecOverlay {
                 .filter(|index| *index <= last)
         };
         match event {
+            // A list handles a wheel notch against its end too (pi `select-list.ts:116`): the
+            // notch is consumed, it just moves nothing.
             OverlayMouse::Wheel { lines, .. } => {
                 let next = if lines < 0 {
                     self.selected.saturating_sub(1)
@@ -713,21 +740,22 @@ impl InteractiveOverlay for SpecOverlay {
                     self.selected.saturating_add(1).min(last)
                 };
                 if next == self.selected {
-                    return OverlayOutcome::Ignored;
+                    return OverlayMouseOutcome::Handled;
                 }
                 self.selected = next;
-                OverlayOutcome::Redraw
+                OverlayMouseOutcome::Redraw
             }
             OverlayMouse::Press { row, .. } => match option_at(row) {
                 Some(index) if index != self.selected => {
                     self.selected = index;
-                    OverlayOutcome::Redraw
+                    OverlayMouseOutcome::Redraw
                 }
-                _ => OverlayOutcome::Ignored,
+                Some(_) => OverlayMouseOutcome::Handled,
+                None => OverlayMouseOutcome::Unhandled,
             },
             OverlayMouse::Click { row, .. } => {
                 let Some(index) = option_at(row) else {
-                    return OverlayOutcome::Ignored;
+                    return OverlayMouseOutcome::Unhandled;
                 };
                 self.selected = index;
                 if let Some(opt) = self.spec.options.get(index)
@@ -735,7 +763,7 @@ impl InteractiveOverlay for SpecOverlay {
                 {
                     *slot = Some(opt.id.clone());
                 }
-                OverlayOutcome::Close
+                OverlayMouseOutcome::Close
             }
         }
     }
@@ -900,16 +928,16 @@ mod tests {
             row: 0,
             lines,
         };
-        assert_eq!(ov.handle_mouse(wheel(1)), OverlayOutcome::Redraw);
-        assert_eq!(ov.handle_mouse(wheel(1)), OverlayOutcome::Redraw);
+        assert_eq!(ov.handle_mouse(wheel(1)), OverlayMouseOutcome::Redraw);
+        assert_eq!(ov.handle_mouse(wheel(1)), OverlayMouseOutcome::Redraw);
         assert_eq!(
             ov.handle_mouse(wheel(1)),
-            OverlayOutcome::Ignored,
-            "the wheel clamps at the last row rather than wrapping"
+            OverlayMouseOutcome::Handled,
+            "the wheel clamps at the last row rather than wrapping, and the notch is still the list's"
         );
-        assert_eq!(ov.handle_mouse(wheel(-1)), OverlayOutcome::Redraw);
-        assert_eq!(ov.handle_mouse(wheel(-1)), OverlayOutcome::Redraw);
-        assert_eq!(ov.handle_mouse(wheel(-1)), OverlayOutcome::Ignored);
+        assert_eq!(ov.handle_mouse(wheel(-1)), OverlayMouseOutcome::Redraw);
+        assert_eq!(ov.handle_mouse(wheel(-1)), OverlayMouseOutcome::Redraw);
+        assert_eq!(ov.handle_mouse(wheel(-1)), OverlayMouseOutcome::Handled);
     }
 
     #[test]
@@ -918,7 +946,12 @@ mod tests {
         // Row 4 is the third option ("c"); a press only moves the highlight.
         assert_eq!(
             ov.handle_mouse(OverlayMouse::Press { column: 2, row: 4 }),
-            OverlayOutcome::Redraw
+            OverlayMouseOutcome::Redraw
+        );
+        assert_eq!(
+            ov.handle_mouse(OverlayMouse::Press { column: 2, row: 4 }),
+            OverlayMouseOutcome::Handled,
+            "a press on the row already highlighted is still the list's, with nothing to repaint"
         );
         assert_eq!(result.lock().unwrap().as_deref(), None);
         assert_eq!(
@@ -927,7 +960,7 @@ mod tests {
                 row: 3,
                 count: 1
             }),
-            OverlayOutcome::Close,
+            OverlayMouseOutcome::Close,
             "a click activates the row it landed on"
         );
         assert_eq!(result.lock().unwrap().as_deref(), Some("b"));
@@ -939,7 +972,7 @@ mod tests {
         for row in [0, 1, 5, 99] {
             assert_eq!(
                 ov.handle_mouse(OverlayMouse::Press { column: 0, row }),
-                OverlayOutcome::Ignored,
+                OverlayMouseOutcome::Unhandled,
                 "row {row} is not an option"
             );
             assert_eq!(
@@ -948,7 +981,7 @@ mod tests {
                     row,
                     count: 1
                 }),
-                OverlayOutcome::Ignored
+                OverlayMouseOutcome::Unhandled
             );
         }
         assert_eq!(result.lock().unwrap().as_deref(), None);
@@ -964,7 +997,7 @@ mod tests {
                 row: 0,
                 count: 1
             }),
-            OverlayOutcome::Ignored
+            OverlayMouseOutcome::Unhandled
         );
 
         struct Inert;
@@ -982,8 +1015,8 @@ mod tests {
                 row: 0,
                 lines: 1
             }),
-            OverlayOutcome::Ignored,
-            "the default body leaves every existing overlay unchanged"
+            OverlayMouseOutcome::Unhandled,
+            "the default body leaves the pointer unhandled, so the overlay's text is selectable"
         );
     }
 

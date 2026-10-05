@@ -139,7 +139,7 @@ pub struct StartupReport {
     /// `--verbose` (Pi `this.options.verbose`, `:1488`).
     pub verbose: bool,
     /// `settings.quietStartup` (Pi `getQuietStartup()`, `:1488`).
-    pub quiet_startup: bool,
+    pub quiet_startup: cyrup_config::settings::QuietStartup,
     /// System-prompt source + appended prompts + `AGENTS.md`/`CLAUDE.md` (`:1551-1555`). Order is
     /// meaningful, so this list is NOT sorted (`{sort: false}`, `:1563`).
     pub context_files: Vec<String>,
@@ -277,13 +277,14 @@ impl StartupReport {
         }
     }
 
-    /// Pi `showListing` (`:1702` @v0.84.4): `force || verbose || !quietStartup`. cyrup has no
-    /// `force` and does not need one — `force` is dead upstream at this tag, both of pi's call
+    /// Pi `showListing` (`:1767` @v1.0.0): `force || shouldShowStartupDetails()`, i.e. `verbose ||
+    /// quietStartup === false` — `quietStartup: "header"` hides the listing as `true` does. cyrup
+    /// has no `force` and does not need one — `force` is dead upstream at this tag, both of pi's call
     /// sites passing `{force: false, showDiagnosticsWhenQuiet: true}` (`:1982`, `:5991-5994`) — so
     /// `--verbose` is the only override, which is exactly what `cli.rs`'s help text has been
     /// promising all along.
     pub fn show_listing(&self) -> bool {
-        self.verbose || !self.quiet_startup
+        self.quiet_startup.shows_details(self.verbose)
     }
 
     /// Whether there is any diagnostic at all.
@@ -669,7 +670,7 @@ mod tests {
     #[test]
     fn quiet_startup_suppresses_the_listing_but_never_the_diagnostics() {
         let report = StartupReport {
-            quiet_startup: true,
+            quiet_startup: cyrup_config::settings::QuietStartup::On,
             skills: vec!["review".into()],
             skill_diagnostics: vec![StartupDiagnostic::plain(
                 DiagnosticSeverity::Warning,
@@ -698,7 +699,7 @@ mod tests {
     fn verbose_overrides_quiet_startup() {
         let report = StartupReport {
             verbose: true,
-            quiet_startup: true,
+            quiet_startup: cyrup_config::settings::QuietStartup::On,
             skills: vec!["review".into()],
             ..Default::default()
         };
@@ -712,7 +713,7 @@ mod tests {
     #[test]
     fn a_clean_quiet_startup_prints_nothing() {
         let report = StartupReport {
-            quiet_startup: true,
+            quiet_startup: cyrup_config::settings::QuietStartup::On,
             ..Default::default()
         };
         assert!(build_startup_lines(&report).is_empty());
@@ -751,7 +752,7 @@ mod tests {
             }),
         };
         let report = StartupReport {
-            quiet_startup: true,
+            quiet_startup: cyrup_config::settings::QuietStartup::On,
             skill_diagnostics: vec![collision("global/review"), collision("package/review")],
             ..Default::default()
         };

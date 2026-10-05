@@ -261,6 +261,91 @@ impl std::fmt::Display for WheelScrollLines {
     }
 }
 
+/// `quietStartup` — how much of the startup output is silenced (pi `QuietStartup = boolean |
+/// "header"`, `settings-manager.ts:112` @v1.0.0; the key is declared at `:150` with
+/// `// default: false`).
+///
+/// Two independent decisions hang off the one value (`interactive-mode.ts:1409-1417`):
+///
+/// * the startup HEADER (logo, version, key hints) is hidden only by [`Self::On`]
+///   (`shouldShowStartupHeader`: `verbose || getQuietStartup() !== true`);
+/// * the startup DETAILS (the model-scope line and the loaded-resources listing) are hidden by
+///   [`Self::On`] and [`Self::Header`] alike (`shouldShowStartupDetails`: `verbose ||
+///   getQuietStartup() === false`).
+///
+/// `--verbose` overrides both, so the two decisions take it as an argument.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum QuietStartup {
+    /// `false` — pi's default, and what every unrecognised stored value reads back as (see
+    /// [`Self::from_value`]).
+    #[default]
+    Off,
+    /// `true` — header and details are both hidden.
+    On,
+    /// `"header"` — the header stays, the details are hidden.
+    Header,
+}
+
+impl QuietStartup {
+    /// The three spellings the `/settings` row cycles through, in pi's order
+    /// (`settings-selector.ts:559`: `["true", "header", "false"]`).
+    pub const ROW_VALUES: [&'static str; 3] = ["true", "header", "false"];
+
+    /// `getQuietStartup` (`settings-manager.ts:1089-1092`): `value === true || value === "header" ?
+    /// value : false`. Only the boolean `true` and the exact string `"header"` are recognised;
+    /// absent, `false`, `null`, `"true"`, `"HEADER"`, a number or any other type is [`Self::Off`].
+    pub fn from_value(value: Option<&serde_json::Value>) -> Self {
+        match value {
+            Some(serde_json::Value::Bool(true)) => Self::On,
+            Some(serde_json::Value::String(s)) if s == "header" => Self::Header,
+            _ => Self::Off,
+        }
+    }
+
+    /// What `setQuietStartup` stores: the boolean, or the string `"header"`.
+    pub fn to_json(self) -> serde_json::Value {
+        match self {
+            Self::Off => serde_json::Value::Bool(false),
+            Self::On => serde_json::Value::Bool(true),
+            Self::Header => serde_json::Value::from("header"),
+        }
+    }
+
+    /// Build from a `/settings` row's cycle value (`onQuietStartupChange(newValue === "header" ?
+    /// "header" : newValue === "true")`, `settings-selector.ts:924`): `"header"` is the string,
+    /// `"true"` the boolean and every other text `false`.
+    pub fn from_row_value(value: &str) -> Self {
+        match value {
+            "header" => Self::Header,
+            "true" => Self::On,
+            _ => Self::Off,
+        }
+    }
+
+    /// `shouldShowStartupHeader` (`interactive-mode.ts:1410-1412`): hidden only by [`Self::On`],
+    /// and `--verbose` always shows it.
+    pub const fn shows_header(self, verbose: bool) -> bool {
+        verbose || !matches!(self, Self::On)
+    }
+
+    /// `shouldShowStartupDetails` (`interactive-mode.ts:1415-1417`): shown only by [`Self::Off`],
+    /// and `--verbose` always shows them.
+    pub const fn shows_details(self, verbose: bool) -> bool {
+        verbose || matches!(self, Self::Off)
+    }
+}
+
+impl std::fmt::Display for QuietStartup {
+    /// `String(config.quietStartup)` (`settings-selector.ts:558`): `false`, `true` or `header`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Off => "false",
+            Self::On => "true",
+            Self::Header => "header",
+        })
+    }
+}
+
 /// Custom per-level thinking token budgets (Pi `ThinkingBudgetsSettings`, settings-manager.ts:46-51).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]

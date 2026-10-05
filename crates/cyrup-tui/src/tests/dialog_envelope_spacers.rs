@@ -473,7 +473,7 @@ fn settings_selector_envelope_is_border_list_border_with_no_title_row() {
 }
 
 /// MIRROR for S16 + S33. Everything S16/S33 add — a search `Input`, a description block, the
-/// `Type to search …` hint, the `min(30, widest)` label column — belongs to **`SettingsList`**
+/// `Type to search …` hint, the `min(36, widest)` label column — belongs to **`SettingsList`**
 /// (`packages/tui/src/components/settings-list.ts`) and to nothing else. The components that host a
 /// `SelectList` instead get none of it: `show-images-selector.ts:25,41,44` and
 /// `theme-selector.ts:35,58,61` are border/list/border with no `Input` and no hint, and
@@ -666,11 +666,11 @@ fn settings_selector_search_filters_and_space_types_once_the_box_is_dirty() {
     );
 }
 
-/// S33 — the label column is `Math.min(30, Math.max(...labels))` (`settings-list.ts:121`), measured
+/// S33 — the label column is `Math.min(36, Math.max(...labels))` (`settings-list.ts:132` @v1.0.0), measured
 /// over ALL items with **no lower bound**. `ColumnLayout::SLASH`'s `{12, 32}` was a different
 /// upstream component's policy: it padded short labels out to 12 and capped long ones at 32.
 #[test]
-fn settings_selector_label_column_hugs_short_labels_and_caps_at_thirty() {
+fn settings_selector_label_column_hugs_short_labels_and_caps_at_thirty_six() {
     // Widest label is 3 columns. Upstream pads to 3, not to 12.
     let mut sel = SettingsSelector::new(
         "Settings",
@@ -689,7 +689,7 @@ fn settings_selector_label_column_hugs_short_labels_and_caps_at_thirty() {
         "`xy` padded to 3: {rows:?}"
     );
 
-    // A 40-column label clamps to 30, not 32.
+    // A 40-column label clamps to 36 (`Math.min(36, …)`), not 30 and not 32.
     let long = "l".repeat(40);
     let mut sel = SettingsSelector::new(
         "Settings",
@@ -703,11 +703,100 @@ fn settings_selector_label_column_hugs_short_labels_and_caps_at_thirty() {
         .iter()
         .find(|r| r.contains("short"))
         .unwrap_or_else(|| panic!("no short row: {rows:?}"));
-    // `  ` cursor + 30-wide column + `  ` separator ⇒ the value starts at column 34.
+    // `  ` cursor + 36-wide column + `  ` separator ⇒ the value starts at column 40.
     assert_eq!(
         short_row.find("false"),
-        Some(34),
-        "min(30, …), not 32: {short_row:?}"
+        Some(40),
+        "min(36, …), not 30 or 32: {short_row:?}"
+    );
+
+    // A label between the old bound and the new one is NOT clamped: 33 columns ⇒ the value starts
+    // at 2 + 33 + 2.
+    let mid = "m".repeat(33);
+    let mut sel = SettingsSelector::new(
+        "Settings",
+        vec![
+            SettingRow::toggle("a", mid, true),
+            SettingRow::toggle("b", "short", false),
+        ],
+    );
+    let rows = natural(sel.as_mut_selector(), 60);
+    let short_row = rows
+        .iter()
+        .find(|r| r.contains("short"))
+        .unwrap_or_else(|| panic!("no short row: {rows:?}"));
+    assert_eq!(short_row.find("false"), Some(37), "{short_row:?}");
+}
+
+/// The value column's room follows the label column (`settings-list.ts:149-152` @v1.0.0):
+/// `valueMaxWidth = width - (prefixWidth + maxLabelWidth + 2) - 2`, and the value is cut to it with
+/// an EMPTY ellipsis. At width 50 with a 36-wide column that is `50 - 40 - 2 = 8` (the row is
+/// `2 + 36 + 2 + 8 = 48` wide, so the row-level truncation leaves it alone); with the old 30-wide
+/// cap it would have been 14.
+#[test]
+fn settings_selector_value_room_is_what_the_thirty_six_column_leaves() {
+    let mut sel = SettingsSelector::new(
+        "Settings",
+        vec![SettingRow::choice(
+            "a",
+            "l".repeat(36),
+            "v".repeat(30),
+            vec!["v".repeat(30)],
+        )],
+    );
+    let rows = natural(sel.as_mut_selector(), 50);
+    let row = rows
+        .iter()
+        .find(|r| r.starts_with("→ "))
+        .unwrap_or_else(|| panic!("no row: {rows:?}"));
+    assert_eq!(
+        row,
+        &format!("→ {}  {}", "l".repeat(36), "v".repeat(8)),
+        "value cut to 8 with no ellipsis: {row:?}"
+    );
+
+    // A label wider than the column is NOT truncated (`Math.max(0, …)` pads by zero): the 40-wide
+    // label overflows the 36 column, the value gets the same 8 columns, and the ROW-level
+    // `truncateToWidth(…, width)` (default `"..."`) cuts the line at 50.
+    let mut sel = SettingsSelector::new(
+        "Settings",
+        vec![SettingRow::choice(
+            "a",
+            "l".repeat(40),
+            "v".repeat(30),
+            vec!["v".repeat(30)],
+        )],
+    );
+    let rows = natural(sel.as_mut_selector(), 50);
+    let row = rows
+        .iter()
+        .find(|r| r.starts_with("→ "))
+        .unwrap_or_else(|| panic!("no row: {rows:?}"));
+    assert_eq!(
+        row,
+        &format!("→ {}  {}...", "l".repeat(40), "v".repeat(3)),
+        "{row:?}"
+    );
+}
+
+/// The real `/settings` list: its widest label, "Default thinking level per model", is 32 columns
+/// — past the old 30 bound, inside the new 36 one — so every value column sits at `2 + 32 + 2`.
+#[test]
+fn the_real_settings_list_aligns_values_on_its_widest_label() {
+    let rows_in = crate::app::settings_rows_for_test();
+    let widest = rows_in
+        .iter()
+        .map(|r| crate::text_width::str_width(&r.label))
+        .max()
+        .unwrap_or(0);
+    assert_eq!(widest, 32, "the widest /settings label");
+    let first = rows_in.first().expect("rows");
+    let expected = format!("→ {:<32}  {}", first.label, first.value);
+    let mut sel = SettingsSelector::new("Settings", rows_in);
+    let rows = natural(sel.as_mut_selector(), 100);
+    assert!(
+        rows.contains(&expected),
+        "first row aligned on a 32-wide column: expected {expected:?} in {rows:?}"
     );
 }
 

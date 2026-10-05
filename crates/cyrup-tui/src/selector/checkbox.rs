@@ -634,8 +634,8 @@ impl Selector for CheckboxSelector {
 
     /// A press highlights the model under the pointer, a click toggles it as `Enter` does (it does
     /// not close the dialog), and a wheel notch over the list moves the highlight one model without
-    /// wrapping. A model whose id wraps is one item over all of its rows. The rules, title,
-    /// subtitle, search box, `(i/N)` readout, `Model Name:` row, status row and footer are not
+    /// wrapping. A model whose id wraps is one item over all of its rows. A press on the search box
+    /// places its caret. The rules, title, subtitle, `(i/N)` readout, `Model Name:` row, status row and footer are not
     /// models.
     fn pointer(&mut self, area: Rect, event: crate::app::Pointer) -> SelectorOutcome {
         let width = area.width;
@@ -643,6 +643,16 @@ impl Selector for CheckboxSelector {
             .head_lines(width, UiTheme::default_ref())
             .len()
             .min(usize::from(u16::MAX)) as u16;
+        // The search `Input` is the row above the blank that closes the head (`:140` adds it as a
+        // bare container child): a press there places its caret.
+        if self.input.pointer_in_row(
+            event,
+            top.saturating_sub(2),
+            crate::selector::INPUT_PROMPT_COLS,
+            width,
+        ) {
+            return SelectorOutcome::Redraw;
+        }
         let items = self.items();
         let len = items.len();
         let (start, end) = centered_window(self.selected, len, self.max_visible);

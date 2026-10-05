@@ -29,10 +29,11 @@ use std::sync::Arc;
 use cyrup_ext::host::HostServices;
 use cyrup_provider::Provider;
 use cyrup_provider::faux::FauxProvider;
-use cyrup_resources::{ResourceRegistry, ResourceSet, Theme, builtin_themes};
+use cyrup_resources::{ResourceRegistry, ResourceSet, builtin_themes};
 use cyrup_session_svc::LiveHostServices;
 use ratatui::backend::TestBackend;
 
+use crate::theme_access::ThemeSwitch;
 use crate::{App, UiTheme};
 
 fn services() -> Arc<LiveHostServices> {
@@ -59,11 +60,11 @@ fn registry() -> Arc<ResourceRegistry> {
 fn wired() -> (
     App<TestBackend>,
     Arc<LiveHostServices>,
-    tokio::sync::mpsc::UnboundedReceiver<Theme>,
+    tokio::sync::mpsc::UnboundedReceiver<ThemeSwitch>,
 ) {
     let mut app = App::new(TestBackend::new(80, 24), UiTheme::dark()).unwrap();
     let svc = services();
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Theme>();
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<ThemeSwitch>();
     app.install_extension_readbacks(&svc, registry(), tx);
     (app, svc, rx)
 }
@@ -278,15 +279,15 @@ fn a_guest_lists_every_available_theme_with_its_path() {
     let names: Vec<&str> = rows.iter().filter_map(|r| r["name"].as_str()).collect();
     assert_eq!(
         names,
-        vec!["dark", "light"],
-        "name-sorted, like `theme.ts:519`'s localeCompare"
+        vec!["system", "dark", "light"],
+        "the generated system theme first, then name-sorted (`theme.ts:494-497` @v1.0.0)"
     );
     // [CYRUP-DELTA] `theme.ts:506-508` synthesizes `<themesDir>/<name>.json` for a built-in; cyrup's
     // built-ins are compiled-in constants with no file, so `null` (the EXT-021 contract) is the only
     // honest answer — and it is what distinguishes them from a file-backed theme.
     assert!(
         rows.iter().all(|r| r["path"].is_null()),
-        "compiled-in built-ins carry no path"
+        "compiled-in built-ins and the generated system theme carry no path"
     );
 }
 
@@ -351,7 +352,10 @@ fn a_guest_switches_the_theme_and_a_bad_name_reports_pis_error() {
     let switched = rx
         .try_recv()
         .expect("the resolved theme reaches the run loop");
-    assert_eq!(switched.key.as_str(), "light");
+    assert!(
+        matches!(&switched, ThemeSwitch::Resource(t) if t.key.as_str() == "light"),
+        "{switched:?}"
+    );
 
     assert_eq!(
         HostServices::set_theme(svc.as_ref(), "no-such-theme"),

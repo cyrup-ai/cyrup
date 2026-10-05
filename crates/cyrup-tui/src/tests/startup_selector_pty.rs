@@ -31,7 +31,6 @@ use crate::keymap::SelectKeymap;
 use crate::selector::SelectorOutcome;
 use crate::session_selector::SessionSelector;
 use crate::startup_loop::StartupSessionLoads;
-use crate::theme::UiTheme;
 
 /// Names the directory the child lists, in its environment.
 const DIR_ENV: &str = "CYRUP_TUI_PTY_STARTUP_DIR";
@@ -120,7 +119,11 @@ fn child_picker() {
     let mut picker = SessionSelector::new(vec![]).with_async_loaders();
     report("ready");
     let result = rt.block_on(crate::run_startup_session_selector(
-        &UiTheme::dark(),
+        &crate::StartupTheme::from_controller(crate::ThemeController::boot(
+            Some("dark"),
+            crate::ColorMode::TrueColor,
+            crate::TerminalTheme::Dark,
+        )),
         &SelectKeymap::default(),
         &mut picker,
         loads,
@@ -140,6 +143,107 @@ fn child_picker() {
     report(format!("raw {raw}"));
     // A listing still parked on the FIFO must not hold the process open.
     rt.shutdown_background();
+}
+
+/// The child of the colour test: the production startup runner over a bare prompt, in the theme
+/// `createStartupTui` would resolve from a fresh `settings.json`.
+fn child_prompt() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let mut selector = crate::ListSelector::prompt(
+        "Pick one".to_string(),
+        vec![
+            ("a".to_string(), "Alpha".to_string(), None),
+            ("b".to_string(), "Beta".to_string(), None),
+        ],
+        0,
+    );
+    report("ready");
+    let result = rt.block_on(crate::run_startup_selector(
+        &crate::StartupTheme::resolve(None),
+        &SelectKeymap::default(),
+        &mut selector,
+        async |_: &str| {},
+    ));
+    let raw = ratatui::crossterm::terminal::is_raw_mode_enabled().unwrap_or(true);
+    match result {
+        Ok(SelectorOutcome::Confirm(value)) => report(format!("confirm {value}")),
+        Ok(SelectorOutcome::Cancel) => report("cancel"),
+        Ok(other) => report(format!("other {other:?}")),
+        Err(e) => report(format!("error {e}")),
+    }
+    report(format!("raw {raw}"));
+}
+
+/// A selector that mounts BEFORE the interface launches asks the terminal for its colours and
+/// repaints in the theme they generate — pi's `startStartupTui` → `queryStartupTerminalColors`
+/// (`cli/startup-ui.ts:92-127` @v1.0.0). The parent plays the terminal: it sees the colour query
+/// (OSC 10, OSC 11, OSC 4 ×16, DA1) leave the child, answers it on the master, and looks for the
+/// generated colour in what the child paints next.
+///
+/// FAILS without the change: the startup selector painted a theme resolved before any query, with
+/// no OSC query on the wire at all.
+#[test]
+fn a_prelaunch_selector_queries_the_terminal_and_repaints_in_the_generated_theme() {
+    if child_mode().as_deref() == Some("startup_theme") {
+        return child_prompt();
+    }
+    let dir = listing_dir(false);
+    let mut pty = PtyChild::spawn_capturing(
+        "tests::startup_selector_pty::a_prelaunch_selector_queries_the_terminal_and_repaints_in_the_generated_theme",
+        "startup_theme",
+        &[
+            (DIR_ENV, dir.path().to_str().unwrap()),
+            ("COLORTERM", "truecolor"),
+            ("CYRUP_TUI_ESC_TIMEOUT", "150"),
+        ],
+    );
+    let mut seen = Vec::new();
+    assert!(
+        pty.screen_until(&mut seen, ENTER_ALT_SCREEN, Duration::from_secs(20)),
+        "the selector never entered the alternate screen; stderr {:#?}",
+        pty.noise
+    );
+    assert!(
+        pty.screen_until(&mut seen, "\x1b]11;?", Duration::from_secs(20)),
+        "the selector never asked the terminal for its colours; saw {:?}",
+        String::from_utf8_lossy(&seen)
+    );
+    assert!(
+        String::from_utf8_lossy(&seen).contains("\x1b]4;15;?"),
+        "the whole palette is asked for"
+    );
+    let asked = seen.len();
+
+    // The terminal answers.
+    let colors = super::system_theme_surfaces::mocha();
+    let mut controller = crate::ThemeController::boot(
+        None,
+        crate::ColorMode::TrueColor,
+        crate::TerminalTheme::Dark,
+    );
+    controller.apply_terminal_colors(colors);
+    let Some(ratatui::style::Color::Rgb(r, g, b)) = controller.theme().accent else {
+        panic!("the generated accent is concrete");
+    };
+    let generated = format!("38;2;{r};{g};{b}");
+    assert!(
+        !String::from_utf8_lossy(&seen).contains(&generated),
+        "the generated colour was painted before the terminal answered"
+    );
+    pty.write(&super::system_theme_surfaces::terminal_reply(&colors));
+    assert!(
+        pty.screen_until(&mut seen, &generated, Duration::from_secs(20)),
+        "the selector never repainted in the generated theme ({generated}); saw {:?}",
+        String::from_utf8_lossy(seen.get(asked..).unwrap_or_default())
+    );
+
+    // The reply was the terminal's, not typing: the selector is still open, and Esc leaves it.
+    pty.write(b"\x1b");
+    pty.expect("cancel");
+    pty.expect("raw false");
 }
 
 fn spawn_child(test: &str, dir: &tempfile::TempDir) -> PtyChild {

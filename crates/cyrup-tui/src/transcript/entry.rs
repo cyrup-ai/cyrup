@@ -55,10 +55,16 @@ pub enum Entry {
     /// `\n\n` (`:116-127`) and renders it as italic `thinkingText` markdown (`:145-165`) — or, when
     /// `hideThinkingBlock` is set, as the single static `Thinking...` label (`:139-143`).
     ///
-    /// `hidden` freezes that choice **at commit time**: Pi's `setHideThinkingBlock` (`:57-62`)
-    /// re-renders every prior assistant message live, but cyrup's committed entries have already
-    /// left the render tree for native scrollback (`App::flush_committed` → `insert_before`), so a
-    /// runtime toggle can only affect entries committed after the flip (ADR-0001).
+    /// `hidden` records that choice **at commit time**. Pi's `setHideThinkingBlock` (`:57-62`)
+    /// re-renders every prior assistant message live, and what cyrup can do about it depends on the
+    /// renderer ([`crate::transcript::ThinkingHiding`]):
+    ///
+    /// * **Inline** — the committed entry has already left the render tree for native scrollback
+    ///   (`App::flush_committed` → `insert_before`), so it keeps the form it committed with and a
+    ///   runtime toggle affects only entries committed after the flip (ADR-0001). `hidden` is what
+    ///   that flush draws.
+    /// * **Fullscreen** — the retained document is repainted from its entries, so `hidden` is
+    ///   ignored there and every committed run follows the live setting, as upstream's does.
     Thinking { text: String, hidden: bool },
     /// A finished tool execution (`tool-execution.ts`): the tool name + the raw call args + the raw
     /// result value + error flag. Each built-in dispatches to its Pi-specific rich render

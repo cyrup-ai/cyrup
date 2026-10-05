@@ -730,6 +730,19 @@ impl App<InlineBackend<TuiStdout>> {
         Ok(())
     }
 
+    /// The terminal reported its appearance changed (mode `2031`) — see
+    /// [`App::apply_color_scheme_report`].
+    pub(crate) fn on_color_scheme(
+        &mut self,
+        ctx: &RunCtx,
+        scheme: crate::TerminalTheme,
+    ) -> Result<(), TuiError> {
+        let _arm = ArmGuard::enter("color_scheme");
+        self.apply_color_scheme_report(scheme, &ctx.session.services().resources);
+        self.frames.request();
+        Ok(())
+    }
+
     pub(crate) fn on_tmux_warning(&mut self, warning: &'static str) -> Result<(), TuiError> {
         // Pi `this.showWarning(warning)` (`interactive-mode.ts:1114-1118` @v0.87.1).
         self.state.transcript.show_warning(warning);
@@ -740,7 +753,7 @@ impl App<InlineBackend<TuiStdout>> {
     pub(crate) async fn on_theme_switch(
         &mut self,
         ctx: &mut RunCtx,
-        theme: cyrup_resources::Theme,
+        switch: crate::theme_access::ThemeSwitch,
     ) -> Result<(), TuiError> {
         let _arm = ArmGuard::enter("theme_switch");
         // SEAM-T01 — a guest called `ctx.ui().set_theme(name)` and the name RESOLVED
@@ -752,13 +765,7 @@ impl App<InlineBackend<TuiStdout>> {
         // are the SAME pair the `/settings → theme` confirm arm runs
         // (`SelectorKind::Theme` in `apply_selection`), so an extension switch and a
         // human switch cannot drift apart.
-        let name = theme.key.as_str().to_string();
-        // `from_theme_data`, not `UiTheme::builtin`: the listing this name came from is
-        // the session's whole discovered set, so a file-backed custom theme is
-        // switchable exactly as upstream's is, and would otherwise silently render as
-        // `dark` (`UiTheme::builtin`'s unknown-name fallback).
-        let projected = UiTheme::from_theme_data(&theme.data, 0);
-        self.set_theme(projected);
+        let name = self.apply_theme_switch(switch);
         // [CYRUP-DELTA] vs `interactive-mode.ts:2412`: upstream guards the persist with
         // `if (this.settingsManager.getTheme() !== themeOrName)`. That guard is a pure
         // write-avoidance — writing the same value yields the same file — and cyrup

@@ -66,7 +66,7 @@ reasoning off by default.
 | `doubleEscapeAction` | `fork`\|`tree`\|`none` | `"tree"` | What double-`Esc` on an empty editor opens. |
 | `treeFilterMode` | `default`\|`no-tools`\|`user-only`\|`labeled-only`\|`all` | `"default"` | Starting filter in `/tree`; an unrecognised value falls back. |
 | `collapseChangelog` | bool | `false` | Show a condensed changelog after updates. |
-| `quietStartup` | bool | `false` | Suppress verbose startup printing. |
+| `quietStartup` | bool \| `"header"` | `false` | `true` hides the startup header and the loaded-resource listing. `"header"` keeps the header (version and key hints) but hides the model scope line and the listing. Any other value reads as `false`. |
 | `terminal.showImages` | bool | `true` | Render images inline. |
 | `terminal.imageWidthCells` | number | `60` | Inline image width in terminal cells. |
 | `terminal.showTerminalProgress` | bool | `false` | Report progress to the terminal's tab bar. |

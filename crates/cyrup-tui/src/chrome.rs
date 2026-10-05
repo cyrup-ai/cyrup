@@ -99,17 +99,34 @@ pub fn compact_hints(keymap: &Keymap) -> Vec<(String, String)> {
     ]
 }
 
+/// Whether the startup details (model scope, loaded resources) are shown this session — pi's
+/// `shouldShowStartupDetails()` (`interactive-mode.ts:1415-1417` @v1.0.0). The header's onboarding
+/// line names them only when they are there to be revealed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum StartupDetails {
+    /// Shown: the onboarding line promises "full startup help and loaded resources".
+    #[default]
+    Shown,
+    /// Hidden (`quietStartup: "header"`): the line promises the startup help alone.
+    Hidden,
+}
+
 /// The onboarding line printed directly under the compact hint bar — verbatim
-/// `interactive-mode.ts:943-946`:
-/// `theme.fg("dim", \`Press ${keyText("app.tools.expand")} to show full startup help and loaded
-/// resources.\`)`. It is the only place a new user is told the expanded help exists, and cyrup
-/// had no counterpart at all (`grep -rn "to show full startup help" crates/` found nothing).
-pub fn compact_onboarding(keymap: &Keymap) -> String {
+/// `interactive-mode.ts:1044-1048` @v1.0.0:
+/// `theme.fg("dim", \`Press ${keyText("app.tools.expand")} to show full startup help${showDetails ?
+/// " and loaded resources" : ""}.\`)`. It is the only place a new user is told the expanded help
+/// exists, and cyrup had no counterpart at all (`grep -rn "to show full startup help" crates/`
+/// found nothing).
+pub fn compact_onboarding(keymap: &Keymap, details: StartupDetails) -> String {
     // `keyText("app.tools.expand")` — all bound keys joined with `/` (`keybinding-hints.ts:29-36`).
     let expand = keymap
         .keys_label(Action::ToolsExpand)
         .unwrap_or_else(|| "ctrl+o".into());
-    format!("Press {expand} to show full startup help and loaded resources.")
+    let resources = match details {
+        StartupDetails::Shown => " and loaded resources",
+        StartupDetails::Hidden => "",
+    };
+    format!("Press {expand} to show full startup help{resources}.")
 }
 
 /// The block's closing sentence — `onboarding`, `interactive-mode.ts:947-950`:
@@ -164,7 +181,12 @@ fn hint_content_width(width: u16) -> u16 {
 /// leading blank, closing onboarding, the body's inner blank, the compact onboarding line, and only
 /// then the bar itself. A previous revision put the framing blank FIRST in a fixed-height,
 /// top-aligned `Paragraph`, so a one-row budget drew the blank and the bar vanished entirely.
-fn compact_hint_entries(theme: &UiTheme, keymap: &Keymap, width: u16) -> Vec<HintEntry> {
+fn compact_hint_entries(
+    theme: &UiTheme,
+    keymap: &Keymap,
+    width: u16,
+    details: StartupDetails,
+) -> Vec<HintEntry> {
     let content = hint_content_width(width);
     let blank = |rank: u8| HintEntry {
         lines: vec![Line::default()],
@@ -191,7 +213,10 @@ fn compact_hint_entries(theme: &UiTheme, keymap: &Keymap, width: u16) -> Vec<Hin
         blank(4),
         text(vec![Line::from(bar)], 0),
         text(
-            vec![Line::styled(compact_onboarding(keymap), theme.dim_style())],
+            vec![Line::styled(
+                compact_onboarding(keymap, details),
+                theme.dim_style(),
+            )],
             1,
         ),
         blank(2),
@@ -211,11 +236,50 @@ fn compact_hint_entries(theme: &UiTheme, keymap: &Keymap, width: u16) -> Vec<Hin
 ///
 /// cyrup previously reserved a fixed row count and rendered a fixed-height `Paragraph` with no
 /// `.wrap()`, so on a narrow terminal the overflowing half of each line was simply lost.
-pub fn compact_hint_height(theme: &UiTheme, keymap: &Keymap, width: u16) -> u16 {
-    compact_hint_entries(theme, keymap, width)
+pub fn compact_hint_height(
+    theme: &UiTheme,
+    keymap: &Keymap,
+    width: u16,
+    details: StartupDetails,
+) -> u16 {
+    compact_hint_entries(theme, keymap, width, details)
         .iter()
         .map(|e| e.rows)
         .fold(0u16, u16::saturating_add)
+}
+
+/// The compact hint block as document rows — the built-in header pi puts at the top of its
+/// `documentContainer` (`headerContainer = [Spacer(1), builtInHeader, Spacer(1)]`,
+/// `interactive-mode.ts:1061-1065` @v1.0.0), for the renderer that scrolls it with the
+/// conversation.
+///
+/// The same six row groups [`render_compact_hints`] paints, each wrapped at the block's content
+/// width and inset by its `paddingX`, one [`Line`] per display row at `width`. Nothing is dropped
+/// from the edges inward here: that degradation exists to keep the bar visible in a fixed-height
+/// slot, and a scrolled document has no slot to overflow.
+pub fn compact_hint_lines(
+    theme: &UiTheme,
+    keymap: &Keymap,
+    width: u16,
+    details: StartupDetails,
+) -> Vec<Line<'static>> {
+    let content = usize::from(hint_content_width(width));
+    let pad = width >= 3;
+    let base = theme.base_style();
+    compact_hint_entries(theme, keymap, width, details)
+        .into_iter()
+        .flat_map(|entry| entry.lines)
+        .flat_map(|line| crate::transcript::wrap_line(&line, content))
+        .map(|mut row| {
+            if pad {
+                row.spans
+                    .insert(0, Span::raw(" ".repeat(usize::from(HINT_PADDING_X))));
+            }
+            // The block's own background, as `render_compact_hints` paints it under the groups.
+            row.style = base.patch(row.style);
+            row
+        })
+        .collect()
 }
 
 /// Render the compact hint block into `area`, wrapping each row group at
@@ -223,11 +287,17 @@ pub fn compact_hint_height(theme: &UiTheme, keymap: &Keymap, width: u16) -> u16 
 ///
 /// If `area` is shorter than [`compact_hint_height`] the block degrades from its edges inward (see
 /// [`compact_hint_entries`]) until it fits, so the hint bar survives down to a one-row budget.
-pub fn render_compact_hints(frame: &mut Frame, area: Rect, theme: &UiTheme, keymap: &Keymap) {
+pub fn render_compact_hints(
+    frame: &mut Frame,
+    area: Rect,
+    theme: &UiTheme,
+    keymap: &Keymap,
+    details: StartupDetails,
+) {
     if area.width == 0 || area.height == 0 {
         return;
     }
-    let mut entries = compact_hint_entries(theme, keymap, area.width);
+    let mut entries = compact_hint_entries(theme, keymap, area.width, details);
     let total = |es: &[HintEntry]| es.iter().map(|e| e.rows).fold(0u16, u16::saturating_add);
     while total(&entries) > area.height {
         // Give up the outermost droppable group; `drop_rank == 0` (the bar) is never a candidate.

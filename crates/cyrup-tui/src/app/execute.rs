@@ -246,7 +246,7 @@ impl<B: Backend> App<B> {
                     .collect();
                 let rows = settings_rows(
                     session.services().settings.effective(),
-                    &self.state.theme.name,
+                    &self.theme_selection(),
                     &self.state.keymap,
                     &self.state.thinking_level,
                     // TUI-036 — `supportsImages` gates the two image rows upstream.

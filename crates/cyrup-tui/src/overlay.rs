@@ -31,7 +31,8 @@ use ratatui::widgets::{Clear, Paragraph};
 
 use cyrup_ext::{
     InteractiveOverlay, OverlayColor, OverlayKey, OverlayKeyCode, OverlayLine, OverlayMouse,
-    OverlayOptions, OverlayOutcome as ExtOverlayOutcome, OverlaySpan, ThemeRole,
+    OverlayMouseOutcome, OverlayOptions, OverlayOutcome as ExtOverlayOutcome, OverlaySpan,
+    ThemeRole,
 };
 
 use crate::app::Pointer;
@@ -46,6 +47,24 @@ pub enum OverlayOutcome {
     Close,
     /// The key was not an overlay binding — the chrome may let it bubble.
     Ignored,
+}
+
+/// How an overlay answered one pointer event — pi's `handleMouse` result, where no result means the
+/// event is not the overlay's.
+///
+/// [`OverlayOutcome::Ignored`] cannot carry that: for a key it is "nothing changed", and an overlay
+/// that handled a press on a row that was already highlighted also changed nothing. The difference
+/// is what decides whether the text under the pointer can be selected.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OverlayPointerOutcome {
+    /// Not the overlay's event (its title, a line of body text). The host lets it select text.
+    Unhandled,
+    /// Taken, and nothing visible changed.
+    Handled,
+    /// Taken, and the frame is stale.
+    Redraw,
+    /// Taken, and the overlay asked to close.
+    Close,
 }
 
 /// A floating, focus-capturing modal drawn over the live region. Object-safe so the chrome holds a
@@ -64,10 +83,12 @@ pub trait Overlay: Send {
     fn painted_rect(&self) -> Option<Rect> {
         None
     }
-    /// Route one pointer event that landed inside [`Self::painted_rect`], `event` local to it. A hit
-    /// overlay is modal for the event whatever it answers; the default ignores it.
-    fn pointer(&mut self, _event: Pointer) -> OverlayOutcome {
-        OverlayOutcome::Ignored
+    /// Route one pointer event that landed inside [`Self::painted_rect`], `event` local to it. The
+    /// event never reaches anything beneath the overlay; an answer of
+    /// [`OverlayPointerOutcome::Unhandled`] (the default) leaves it to the text selection, so the
+    /// overlay's own text can be selected and copied.
+    fn pointer(&mut self, _event: Pointer) -> OverlayPointerOutcome {
+        OverlayPointerOutcome::Unhandled
     }
     /// Route one bracketed paste, returning the outcome. The default ignores it: an overlay with no
     /// text field has nothing to paste into, and the host swallows the paste either way so it never
@@ -235,11 +256,12 @@ impl Overlay for ExtensionOverlay {
         self.painted
     }
 
-    fn pointer(&mut self, event: Pointer) -> OverlayOutcome {
+    fn pointer(&mut self, event: Pointer) -> OverlayPointerOutcome {
         match self.inner.handle_mouse(to_overlay_mouse(event)) {
-            ExtOverlayOutcome::Ignored => OverlayOutcome::Ignored,
-            ExtOverlayOutcome::Redraw => OverlayOutcome::Redraw,
-            ExtOverlayOutcome::Close => OverlayOutcome::Close,
+            OverlayMouseOutcome::Unhandled => OverlayPointerOutcome::Unhandled,
+            OverlayMouseOutcome::Handled => OverlayPointerOutcome::Handled,
+            OverlayMouseOutcome::Redraw => OverlayPointerOutcome::Redraw,
+            OverlayMouseOutcome::Close => OverlayPointerOutcome::Close,
         }
     }
 

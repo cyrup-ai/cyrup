@@ -53,7 +53,12 @@ use ratatui::crossterm::terminal::{EndSynchronizedUpdate, disable_raw_mode};
 /// of everything else, because an exit taken mid-frame leaves the terminal buffering every write
 /// that follows, this function's own included. See the first statement below.
 pub fn restore_terminal_best_effort() {
-    let mut out = crate::dead_terminal::terminal_stdout();
+    restore_into(&mut crate::dead_terminal::terminal_stdout());
+}
+
+/// [`restore_terminal_best_effort`] over any sink — the escapes it writes, in the order it writes
+/// them.
+fn restore_into(out: &mut impl Write) {
     // Close the synchronized update FIRST, before this function writes anything else.
     // [`crate::App::draw_synchronized`] (`app/crossterm.rs:87-100`) brackets every frame in
     // `BeginSynchronizedUpdate` … `EndSynchronizedUpdate`, and both a hard exit through the TUI-092
@@ -66,6 +71,11 @@ pub fn restore_terminal_best_effort() {
     // because ending an update that never began is a no-op — and `panic = "abort"` means no unwind
     // will ever emit the closing marker on our behalf.
     let _ = out.execute(EndSynchronizedUpdate);
+    // Pi's `TUI.stop()` writes `CSI ? 2031 l` before anything else of its teardown
+    // (`tui.ts:972-975`): a terminal that keeps reporting appearance changes to a process that is
+    // gone would type `997;1n` into the user's shell. Idempotent, and a no-op for a session that
+    // never asked for the reports.
+    crate::color_scheme::terminal_stopped(out);
     // The OSC 9;4 taskbar indicator next — Pi's `ProcessTerminal.stop()` clears it ahead of every
     // other teardown step (`tui/src/terminal.ts:407-409`, `if (this.clearProgressInterval())`), and
     // it is the one piece of state here that OUTLIVES the process: raw mode and bracketed paste die
@@ -173,6 +183,34 @@ mod tests {
         );
 
         let _ = std::panic::take_hook();
+    }
+
+    /// pi's `TUI.stop()` takes mode 2031 down (`tui.ts:972-975`) and the panic hook runs the same
+    /// teardown, so a terminal left reporting appearance changes to a dead process is impossible:
+    /// the escape goes out after the synchronized update is closed and before any other mode is
+    /// touched.
+    ///
+    /// FAILS without the change: the teardown wrote no `2031` sequence at all.
+    #[test]
+    fn restoration_turns_the_colour_scheme_notifications_off() {
+        let _scheme = crate::color_scheme::lock_for_test();
+        let _armed = crate::terminal_progress::lock_progress_armed();
+        crate::color_scheme::reset_for_test();
+        crate::color_scheme::arm_for_test();
+
+        let mut out = Vec::new();
+        restore_into(&mut out);
+        let text = String::from_utf8_lossy(&out).into_owned();
+        let sync = text.find("\x1b[?2026l").expect("the update is closed");
+        let off = text.find("\x1b[?2031l").expect("the mode is switched off");
+        let bracketed = text.find("\x1b[?2004l").expect("bracketed paste is off");
+        assert!(sync < off && off < bracketed, "{text:?}");
+
+        // Idempotent: a second teardown has nothing left to switch off.
+        let mut again = Vec::new();
+        restore_into(&mut again);
+        assert!(!String::from_utf8_lossy(&again).contains("2031"));
+        crate::color_scheme::reset_for_test();
     }
 
     /// Restoration runs on a process with no TTY (CI, a piped run) without panicking itself — a

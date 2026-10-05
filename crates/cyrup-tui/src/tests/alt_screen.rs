@@ -103,7 +103,7 @@ use ratatui::crossterm::event::{
 use ratatui::layout::Rect;
 use ratatui::text::Line;
 
-use crate::altscreen::captured_text;
+use crate::altscreen::{Modal, captured_text};
 use crate::keymap::AltScreenKeymap;
 use crate::theme::UiTheme;
 use crate::transcript::{Entry, ImageOpts, TranscriptView};
@@ -779,17 +779,18 @@ fn click_count_widens_the_selection_granularity() {
     assert!(triple > double, "a triple click selects the whole line");
 }
 
-/// A press outside the document viewport is not ours — upstream's screen-coordinate fallback
-/// (`:822-826`), which cyrup declines so the editor and status chrome keep their own behaviour.
+/// A press outside the document viewport is no longer declined: pi anchors it on the screen
+/// (`getSelectionPoint` without a scroll view, `:1149-1158`), clamped into the frame, so a drag that
+/// starts on the dock selects what is painted there.
 #[test]
-fn a_press_below_the_document_is_not_a_selection() {
+fn a_press_below_the_document_anchors_on_the_screen() {
     let (mut alt, _captured, area) = screen(20, 4, 2);
     alt.draw(None).unwrap();
     let outcome = alt.handle_mouse(
         &wheel(MouseEventKind::Down(MouseButton::Left), 0, area.height + 5),
         area,
     );
-    assert!(matches!(outcome, PointerOutcome::Ignored));
+    assert!(matches!(outcome, PointerOutcome::Handled));
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1014,7 +1015,7 @@ fn the_real_document_hand_over_reconciles_against_the_transcript() {
     let transcript = TranscriptView::new();
     assert_eq!(transcript.retained_dropped(), 0, "nothing has been trimmed");
 
-    alt.set_document(&transcript, doc(10), row_starts(10));
+    alt.set_document(&transcript, doc(10), row_starts(10), 0);
     alt.draw(None).unwrap();
     assert_eq!(
         viewport(&mut alt),
@@ -1022,7 +1023,7 @@ fn the_real_document_hand_over_reconciles_against_the_transcript() {
     );
 
     alt.scroll_to_top();
-    alt.set_document(&transcript, doc(12), row_starts(12));
+    alt.set_document(&transcript, doc(12), row_starts(12), 0);
     assert_eq!(
         alt.viewport_top(),
         0,
@@ -1058,6 +1059,7 @@ fn syncing_a_populated_transcript_renders_its_entries() {
         &transcript,
         &theme,
         ImageOpts::default(),
+        &[],
         &std::sync::Arc::new(Vec::new()),
     );
     alt.draw(None).unwrap();
@@ -1090,6 +1092,7 @@ fn syncing_an_empty_transcript_renders_an_empty_document() {
         &transcript,
         &theme,
         ImageOpts::default(),
+        &[],
         &std::sync::Arc::new(Vec::new()),
     );
     alt.draw(None).unwrap();
@@ -1293,6 +1296,97 @@ fn clicking_the_jump_label_returns_to_the_tail() {
         Some("line 40"),
         "and the viewport is at the tail"
     );
+}
+
+/// Under a modal overlay the label is not the user's to press: the press goes to the selection
+/// (pi skips `handleScrollToEndIndicatorMouseEvent` when `overlay.hit`, `:915-918`). With a modal
+/// open elsewhere on the screen it is still the label's.
+#[test]
+fn the_jump_label_is_inert_under_a_modal() {
+    let (mut alt, area) = scrolled_up();
+    let outcome = alt.handle_mouse_under(&press(20, area.height - 1), area, Modal::Under);
+    assert_eq!(outcome, PointerOutcome::Handled, "a selection began");
+    assert!(
+        !alt.is_following_output(),
+        "the click did not re-arm the follow"
+    );
+    assert!(last_row(&mut alt).contains("Jump"));
+
+    let (mut alt, area) = scrolled_up();
+    alt.handle_mouse_under(&press(20, area.height - 1), area, Modal::Open);
+    assert!(alt.is_following_output(), "beside the modal it still works");
+}
+
+/// While a modal is open the scrollbar cannot be grabbed (pi's `getScrollbarTargetAt` returns
+/// nothing under `hasOverlay()`, `:1037`): the press anchors a selection and the thumb stays put.
+#[test]
+fn the_scrollbar_cannot_be_grabbed_while_a_modal_is_open() {
+    for modal in [Modal::Open, Modal::Under] {
+        let (mut alt, _captured, area) = screen(20, 10, 50);
+        alt.set_scrollbar_mode(ScrollbarMode::Always);
+        alt.scroll_to_top();
+        alt.draw(None).unwrap();
+        let bar = area.width - 1;
+        alt.handle_mouse_under(
+            &wheel(MouseEventKind::Down(MouseButton::Left), bar, 5),
+            area,
+            modal,
+        );
+        assert_eq!(alt.viewport_top(), 0, "{modal:?}: the thumb did not jump");
+        alt.handle_mouse_under(
+            &wheel(MouseEventKind::Drag(MouseButton::Left), bar, 9),
+            area,
+            modal,
+        );
+        assert_eq!(alt.viewport_top(), 0, "{modal:?}: and no drag follows");
+    }
+}
+
+/// A modal defers the wheel to itself: a notch the overlay did not take scrolls nothing (pi's
+/// `shouldDeferViewportInputToOverlay`, `:709`).
+#[test]
+fn the_wheel_does_not_scroll_the_document_while_a_modal_is_open() {
+    let (mut alt, _captured, area) = screen(20, 10, 50);
+    alt.scroll_to_top();
+    alt.draw(None).unwrap();
+    for modal in [Modal::Open, Modal::Under] {
+        let outcome = alt.handle_mouse_under(&wheel(MouseEventKind::ScrollDown, 3, 3), area, modal);
+        assert_eq!(outcome, PointerOutcome::Ignored, "{modal:?}");
+        assert_eq!(alt.viewport_top(), 0, "{modal:?}");
+    }
+    alt.handle_mouse_under(
+        &wheel(MouseEventKind::ScrollDown, 3, 3),
+        area,
+        Modal::Absent,
+    );
+    assert!(alt.viewport_top() > 0, "with no modal it scrolls");
+}
+
+/// pi's `clearTextSelection()` leaves `lastClick` alone (`:893-902`): a press a component handled
+/// clears the highlight, and the next click on the same word is still the second of a double click.
+#[test]
+fn clearing_the_selection_keeps_the_multi_click_ladder() {
+    let (mut alt, _captured, area) = screen(30, 6, 6);
+    alt.set_document_for_test(vec![Line::from("alpha beta gamma delta"); 6], row_starts(6));
+    alt.draw(None).unwrap();
+    let click = |alt: &mut AltScreen<TestBackend>| {
+        alt.handle_mouse(&wheel(MouseEventKind::Down(MouseButton::Left), 8, 1), area);
+        alt.handle_mouse(&wheel(MouseEventKind::Up(MouseButton::Left), 8, 1), area);
+    };
+
+    click(&mut alt);
+    alt.clear_selection();
+    click(&mut alt);
+    assert_eq!(
+        alt.selection_text().as_deref(),
+        Some("beta"),
+        "the second click counted as a double click"
+    );
+
+    // A full reset (a swapped session) is the other thing, and does forget the ladder.
+    alt.reset_selection();
+    click(&mut alt);
+    assert_eq!(alt.selection_text(), None, "a first click selects no word");
 }
 
 /// A press outside the label's rectangle does not: the row above, the same row left of the label,

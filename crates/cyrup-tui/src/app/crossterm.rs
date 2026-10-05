@@ -73,6 +73,10 @@ impl App<InlineBackend<TuiStdout>> {
         // `crate::terminal_query`'s for the read's timeout/input-safety contract). The recorded
         // outcome is what the re-entry paths below re-apply and what the startup diagnostics read.
         let _ = crate::keyboard_protocol::negotiate();
+        // Pi's `TUI.start()` (`tui.ts:917-929`): the terminal is running. No appearance-following
+        // theme is known yet, so nothing is written; `App::sync_color_scheme_notifications` asks
+        // for the mode once the theme setting is applied.
+        crate::color_scheme::terminal_started(&mut out);
         // TUI-093 — the ONE cursor-position query this process makes, in the SAME pre-reader-thread
         // window as the Kitty negotiation just above (see `crate::terminal_query`'s timeout /
         // input-safety contract). Hard-bounded at 100 ms, consumes nothing when the terminal is
@@ -156,6 +160,9 @@ impl App<InlineBackend<TuiStdout>> {
         let mut out = crate::dead_terminal::terminal_stdout();
         let _ = out.execute(ratatui::crossterm::event::EnableBracketedPaste);
         let _ = crate::keyboard_protocol::push_flags(&mut out);
+        // `ui.start()` after the resume (`interactive-mode.ts:4371`): the mode `restore` took down
+        // comes back if the theme still follows the terminal's appearance.
+        crate::color_scheme::terminal_started(&mut out);
         self.reset_render_state();
         self.draw_synchronized()
     }
@@ -252,6 +259,8 @@ impl App<InlineBackend<TuiStdout>> {
         let mut out = crate::dead_terminal::terminal_stdout();
         let _ = out.execute(ratatui::crossterm::event::EnableBracketedPaste);
         let _ = crate::keyboard_protocol::push_flags(&mut out);
+        // `ui.start()` after the editor (`interactive-mode.ts:4522`), as in `suspend`.
+        crate::color_scheme::terminal_started(&mut out);
         self.reset_render_state();
         Ok(result)
     }

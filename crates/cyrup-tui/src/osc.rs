@@ -49,9 +49,10 @@
 //! across the intervening `MoveTo`.
 
 use ratatui::buffer::{Buffer, Cell, CellDiffOption, CellWidth};
+use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
-use std::cell::RefCell;
 use std::num::NonZeroU16;
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 /// Bits 9..=15 of `Modifier`, the seven the enum leaves unallocated.
 const LINK_MASK: u16 = 0b1111_1110_0000_0000;
@@ -83,23 +84,45 @@ fn forced_width(cell: &Cell) -> CellDiffOption {
     CellDiffOption::ForcedWidth(NonZeroU16::new(cell.cell_width()).unwrap_or(NonZeroU16::MIN))
 }
 
-/// The hrefs registered during one render pass, in assignment order. Held behind a `RefCell` so it
+/// The hrefs registered during one render pass, in assignment order. Held behind a lock so it
 /// can ride on the `Copy` per-paint bag ([`crate::transcript::ImageOpts`]) instead of threading an
-/// `&mut` through every tool renderer.
-#[derive(Debug, Default, PartialEq, Eq)]
+/// `&mut` through every tool renderer, and so a finished table can be shared by reference count
+/// between the transcript's render cache and the renderer that paints its rows.
+///
+/// A `Mutex` rather than a `RefCell` only for that sharing: one thread uses a table at a time, so
+/// the lock is never contended; it exists to make the table `Send + Sync` and thereby `Arc`-able.
+#[derive(Debug, Default)]
 pub(crate) struct LinkSink {
-    urls: RefCell<Vec<String>>,
+    urls: Mutex<Vec<String>>,
 }
+
+impl PartialEq for LinkSink {
+    fn eq(&self, other: &Self) -> bool {
+        // The same table compared with itself must not take its own lock twice.
+        std::ptr::eq(self, other) || {
+            let mine = self.urls().clone();
+            mine == *other.urls()
+        }
+    }
+}
+
+impl Eq for LinkSink {}
 
 impl LinkSink {
     pub(crate) fn new() -> Self {
         Self::default()
     }
 
+    /// The table, whatever happened to a previous holder: a poisoned lock only means a panic
+    /// elsewhere, and the list of hrefs is as valid as it was.
+    fn urls(&self) -> MutexGuard<'_, Vec<String>> {
+        self.urls.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     /// Register `url` and return the [`Style`] marker that tags its cells, or a neutral `Style` once
     /// this pass has spent all [`MAX_ID`] ids (the span then renders unlinked — today's behaviour).
     pub(crate) fn mark(&self, url: String) -> Style {
-        let mut urls = self.urls.borrow_mut();
+        let mut urls = self.urls();
         if urls.len() >= MAX_ID as usize {
             return Style::default();
         }
@@ -110,29 +133,35 @@ impl LinkSink {
     }
 
     pub(crate) fn is_empty(&self) -> bool {
-        self.urls.borrow().is_empty()
+        self.urls().is_empty()
     }
 
     /// The href an id stands for — the inverse of [`Self::mark`]'s one-based assignment.
     fn url_for(&self, id: u16) -> Option<String> {
         let idx = usize::from(id).checked_sub(1)?;
-        self.urls.borrow().get(idx).cloned()
+        self.urls().get(idx).cloned()
     }
 }
 
 /// `\x1b]8;;<url>\x07` — OSC-8 open, BEL-terminated (the form pi emits and the form
 /// [`crate::ansi::strip_ansi`] recognises).
-fn open(url: &str) -> String {
+pub(crate) fn open(url: &str) -> String {
     format!("\u{1b}]8;;{url}\u{7}")
 }
 
 /// `\x1b]8;;\x07` — OSC-8 close.
-const CLOSE: &str = "\u{1b}]8;;\u{7}";
+pub(crate) const CLOSE: &str = "\u{1b}]8;;\u{7}";
 
 /// Read the link id a cell carries, or `None`.
 fn id_of(modifier: Modifier) -> Option<u16> {
     let id = (modifier.bits() & LINK_MASK) >> LINK_SHIFT;
     (id != 0).then_some(id)
+}
+
+/// The href a span's style stands for, if it carries a link marker issued by `sink` — for a
+/// writer that emits styled text itself instead of painting a `Buffer` (the exit repaint).
+pub(crate) fn url_of(style: Style, sink: &LinkSink) -> Option<String> {
+    sink.url_for(id_of(style.add_modifier)?)
 }
 
 /// Wrap every marked run of cells in `buf` in its OSC-8 escape, and strip the marker bits.
@@ -146,18 +175,52 @@ pub(crate) fn inject(buf: &mut Buffer, sink: &LinkSink) {
     if sink.is_empty() {
         return;
     }
-    let mut i = 0usize;
-    while i < buf.content.len() {
+    inject_cells(buf, 0, buf.content.len(), sink);
+}
+
+/// [`inject`] restricted to the cells of `area`, for a frame in which different parts of the
+/// buffer were painted from different link tables — the alternate screen's document, whose
+/// committed entries each carry their own table and whose in-flight turn carries another.
+///
+/// Runs are resolved one buffer row at a time and never continue across a row boundary, so two
+/// regions' ids cannot meet in one run. Marked cells outside `area` are left exactly as found.
+pub(crate) fn inject_in(buf: &mut Buffer, area: Rect, sink: &LinkSink) {
+    if sink.is_empty() {
+        return;
+    }
+    let area = area.intersection(buf.area);
+    if area.is_empty() {
+        return;
+    }
+    let width = usize::from(buf.area.width);
+    for y in area.top()..area.bottom() {
+        let row = usize::from(y.saturating_sub(buf.area.y)).saturating_mul(width);
+        let from = row.saturating_add(usize::from(area.x.saturating_sub(buf.area.x)));
+        inject_cells(
+            buf,
+            from,
+            from.saturating_add(usize::from(area.width)),
+            sink,
+        );
+    }
+}
+
+/// The run scan behind [`inject`] and [`inject_in`], over the cell indices `from..to`.
+fn inject_cells(buf: &mut Buffer, from: usize, to: usize, sink: &LinkSink) {
+    let to = to.min(buf.content.len());
+    let mut i = from;
+    while i < to {
         let Some(id) = buf.content.get(i).and_then(|c| id_of(c.modifier)) else {
             i += 1;
             continue;
         };
         let start = i;
-        while buf
-            .content
-            .get(i)
-            .and_then(|c| id_of(c.modifier))
-            .is_some_and(|next| next == id)
+        while i < to
+            && buf
+                .content
+                .get(i)
+                .and_then(|c| id_of(c.modifier))
+                .is_some_and(|next| next == id)
         {
             i += 1;
         }

@@ -111,8 +111,16 @@ impl AgentSession {
     ///
     /// Unattached — headless `print`/`json`/`rpc` — falls through to
     /// [`crate::ExportTheme::default`], which is pi's `getDefaultTheme()` arm.
+    ///
+    /// Interactively the TUI answers first ([`crate::ThemeAccess::export_theme`]): it holds the
+    /// terminal's colours, which pi's `Theme.colors` getter folds into every `""` token, and the
+    /// generated `system` theme, which is not a document in the resources at all. Without that
+    /// answer the active theme's document is resolved against a terminal that reported nothing.
     pub fn export_theme(&self) -> crate::export::ExportTheme {
         use cyrup_ext::host::HostServices as _;
+        if let Some(live) = self.services.host_services.export_theme() {
+            return live;
+        }
         self.services
             .host_services
             .theme()

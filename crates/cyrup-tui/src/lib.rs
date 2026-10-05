@@ -57,6 +57,7 @@ mod autocomplete;
 mod bash;
 mod chrome;
 mod clipboard;
+mod color_scheme;
 mod commands;
 mod component;
 mod config_selector;
@@ -77,6 +78,7 @@ mod keyboard_protocol;
 mod keymap;
 mod login_dialog;
 mod markdown;
+mod model_scope;
 mod model_selector;
 mod native_modifiers;
 mod oauth_selector;
@@ -94,6 +96,7 @@ mod settings_selector;
 mod startup;
 mod startup_loop;
 mod startup_selector;
+mod startup_theme;
 mod status;
 mod status_indicator;
 #[cfg(not(unix))]
@@ -107,6 +110,7 @@ mod text_input;
 mod text_width;
 mod theme;
 mod theme_access;
+mod theme_selector;
 mod thinking_selector;
 mod tmux;
 mod transcript;
@@ -126,10 +130,10 @@ pub use app::{
     App, AppAction, AppCommand, AppState, CompactionQueued, ExtensionWidget, ImplicitTrustReload,
     InlineBackend, LifecycleEffects, LifecycleOutcome, LoginProviderSource, MainScreenRenderState,
     ModeSwitch, ModeSwitchOptions, Pointer, QueueDrain, QueueDrainReason, RebuildBackend,
-    RenderDebug, SessionListMsg, SessionListUpdate, TreeNavMsg, crossterm_input_stream,
-    extension_render, gist_id_from_url, implicit_trust_after_reload, reanchor_inline_region,
-    render, share_viewer_url, share_viewer_url_from, should_honor_extension_shutdown,
-    tree_node_from_dag,
+    RenderDebug, SessionListMsg, SessionListUpdate, StartupHeader, TreeNavMsg,
+    crossterm_input_stream, extension_render, gist_id_from_url, implicit_trust_after_reload,
+    reanchor_inline_region, render, share_viewer_url, share_viewer_url_from,
+    should_honor_extension_shutdown, tree_node_from_dag,
 };
 pub use auth_select::{
     AuthState, StatusTone, format_auth_selector_provider_type, format_status_indicator,
@@ -142,9 +146,9 @@ pub use autocomplete::{
 };
 pub use bash::{BashExecution, BashStatus, PREVIEW_LINES};
 pub use chrome::{
-    BorderedLoader, COMPACT_HINT_ROWS, STARTUP_ONBOARDING, VisualTruncate, compact_hint_height,
-    compact_hints, compact_onboarding, format_key_text, key_hint_line, key_hint_spans,
-    render_compact_hints, truncate_to_visual_lines,
+    BorderedLoader, COMPACT_HINT_ROWS, STARTUP_ONBOARDING, StartupDetails, VisualTruncate,
+    compact_hint_height, compact_hints, compact_onboarding, format_key_text, key_hint_line,
+    key_hint_spans, render_compact_hints, truncate_to_visual_lines,
 };
 pub use commands::{
     ArgumentCompleter, BUILTIN_SLASH_COMMANDS, CommandRegistry, CommandSource, Dispatch,
@@ -201,6 +205,7 @@ pub use markdown::{
     render as render_markdown, render_with_hyperlink_support as render_markdown_with_hyperlinks,
     render_with_text_color as render_markdown_with_text_color, trim_partial_closing_fence,
 };
+pub use model_scope::{ModelScopeBanner, cycle_forward_keys};
 pub use model_selector::{
     MODEL_REFRESH_TIMEOUT, ModelEntry, ModelRefreshMsg, ModelSelector, refresh_outcome_rows,
 };
@@ -236,6 +241,7 @@ pub use startup::{
 };
 pub use startup_loop::StartupSessionLoads;
 pub use startup_selector::{run_startup_selector, run_startup_session_selector};
+pub use startup_theme::StartupTheme;
 pub use status::{
     StatusLine, experimental_features_enabled, experimental_features_enabled_from, format_tokens,
 };
@@ -261,6 +267,7 @@ pub use theme::{
     ThemeController, ThinkingTheme, UiTheme, color_of, detect_color_fg_bg_theme,
     detect_terminal_theme, rgb_to_256,
 };
+pub use theme_selector::ThemeSelector;
 pub use thinking_selector::{ThinkingSelector, ThinkingSelectorKeys};
 pub use tmux::{
     EXTENDED_KEYS_FORMAT_WARNING, EXTENDED_KEYS_OFF_WARNING, TMUX_QUERY_TIMEOUT,

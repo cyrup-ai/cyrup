@@ -322,12 +322,22 @@ impl Selector for OAuthSelector {
 
     /// A press highlights the provider under the pointer, a click confirms it as `Enter` does, and
     /// a wheel notch over the list moves the highlight one row; like the arrow keys here it stops
-    /// at the ends. The rules, title, search box, `(i/N)` readout and blanks are not providers.
+    /// at the ends. A press on the search box places its caret. The rules, title, `(i/N)` readout and blanks are not providers.
     fn pointer(&mut self, area: Rect, event: crate::app::Pointer) -> SelectorOutcome {
         let top = self
             .head_lines(area.width, UiTheme::default_ref())
             .len()
             .min(usize::from(u16::MAX)) as u16;
+        // The search `Input` (`oauth-selector.ts:105-115`, a bare container child) is the row above
+        // the blank that closes the head: a press there places its caret.
+        if self.input.pointer_in_row(
+            event,
+            top.saturating_sub(2),
+            crate::selector::INPUT_PROMPT_COLS,
+            area.width,
+        ) {
+            return SelectorOutcome::Redraw;
+        }
         let len = self.filtered.len();
         let map = RowMap::windowed(top, self.selected, len, MAX_VISIBLE).clipped_to(area.height);
         match self.pointer.act(event, &map, self.selected, len) {

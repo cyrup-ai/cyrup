@@ -25,6 +25,7 @@ pub(super) fn thinking_lines(
     width: usize,
     theme: &UiTheme,
     label: &str,
+    links: crate::markdown::MdLinks<'_>,
 ) -> Vec<Line<'static>> {
     let style = theme.thinking_text_style();
     if hidden {
@@ -34,7 +35,7 @@ pub(super) fn thinking_lines(
     if body.is_empty() {
         return Vec::new();
     }
-    crate::markdown::render_with_default_style(body, width.max(1), theme, style.fg, true)
+    crate::markdown::render_with_links(body, width.max(1), theme, style.fg, true, links)
 }
 
 /// Render a labeled extension/system message (`skill`/`custom`/`branch`/`compaction` variants),
@@ -165,6 +166,9 @@ pub(super) fn collapsed_skill_lines(
     out
 }
 
+// Eight because the markdown link context rides beside the block's six presentation inputs; they
+// are all per-call and none of them groups with another.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn labeled_message_lines(
     label: &str,
     header: &str,
@@ -173,6 +177,7 @@ pub(super) fn labeled_message_lines(
     lead_spacer: bool,
     theme: &UiTheme,
     width: usize,
+    links: crate::markdown::MdLinks<'_>,
 ) -> Vec<Line<'static>> {
     let block = theme.custom_message_bg_style();
     // `Box(1, 1)` renders its children at `contentWidth = width - 2` (`box.ts:79`).
@@ -192,11 +197,13 @@ pub(super) fn labeled_message_lines(
         format!("{header}\n\n{body}")
     };
     if !md_src.is_empty() {
-        children.extend(crate::markdown::render_with_text_color(
+        children.extend(crate::markdown::render_with_links(
             &md_src,
             content_width,
             theme,
             block.fg,
+            false,
+            links,
         ));
     }
     // The `customMessageBg` fill covers the whole box — padding rows and label row included.

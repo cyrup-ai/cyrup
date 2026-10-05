@@ -167,6 +167,13 @@ impl SessionSelectorOutcome {
     }
 }
 
+/// The accent label the rename field is drawn behind, in place of the search box's `"> "` prompt.
+const RENAME_LABEL: &str = " rename ";
+
+/// The columns [`RENAME_LABEL`] takes: the cells before the value, and the amount the field's
+/// width is reduced by.
+const RENAME_LABEL_COLS: u16 = RENAME_LABEL.len() as u16;
+
 /// The interactive `/resume` selector.
 pub struct SessionSelector {
     /// The set currently on screen — pi's `SessionList.allSessions` (`session-selector.ts:288`),
@@ -951,11 +958,11 @@ impl SessionSelector {
         if let Some((_, edit)) = &self.renaming {
             // The accent ` rename ` label, then the `Input`'s own value + caret; the label eats
             // eight columns, so the value gets the rest.
-            let mut spans = vec![Span::styled(" rename ", theme.accent_style())];
+            let mut spans = vec![Span::styled(RENAME_LABEL, theme.accent_style())];
             spans.extend(crate::selector::search_input_spans(
                 edit.value(),
                 edit.cursor(),
-                usize::from(width).saturating_sub(8),
+                usize::from(width).saturating_sub(usize::from(RENAME_LABEL_COLS)),
                 theme,
             ));
             lines.push(Line::from(spans));
@@ -1225,16 +1232,33 @@ impl Selector for SessionSelector {
     /// A press highlights the session under the pointer, a click resumes it as `Enter` does, and a
     /// wheel notch over the list moves the highlight one session; like the arrow keys here it stops
     /// at the ends. The rules, header, hint rows, search box, `(i/N)` readout and blanks are not
-    /// sessions. While a delete confirmation or a rename is pending the keyboard owns the dialog
-    /// (`Enter` there means "delete" / "save", not "resume"), so the pointer is ignored.
+    /// sessions. While a delete confirmation is pending the keyboard owns the dialog (`Enter` there
+    /// means "delete", not "resume"), so the pointer is ignored; while a rename is open the only
+    /// thing the pointer acts on is a press on its field, which places the caret.
     fn pointer(&mut self, area: Rect, event: crate::app::Pointer) -> SelectorOutcome {
-        if self.confirming_delete.is_some() || self.renaming.is_some() {
+        if self.confirming_delete.is_some() {
             return SelectorOutcome::Ignored;
         }
         let top = self
             .head_lines(UiTheme::default_ref(), area.width)
             .len()
             .min(usize::from(u16::MAX)) as u16;
+        // The rename panel adds its `Input` to a `Container` as a bare child
+        // (`session-selector.ts:894`), which forwards a press to it (`input.ts:229-243`); that is
+        // the only thing in the rename view the pointer acts on. The ordinary search box is drawn
+        // by `SessionList.render` (`:418`) and `SessionList` has no `handleMouse`, so it is not.
+        if let Some((_, edit)) = self.renaming.as_mut() {
+            return if edit.pointer_in_row(
+                event,
+                top.saturating_sub(2),
+                RENAME_LABEL_COLS,
+                area.width,
+            ) {
+                SelectorOutcome::Redraw
+            } else {
+                SelectorOutcome::Ignored
+            };
+        }
         let len = self.filtered().len();
         let map =
             RowMap::windowed(top, self.selected, len, self.max_visible).clipped_to(area.height);

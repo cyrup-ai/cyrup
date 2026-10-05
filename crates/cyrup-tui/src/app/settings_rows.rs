@@ -180,8 +180,19 @@ pub(crate) fn settings_rows(
         ),
         SettingRow::toggle("collapseChangelog", "Collapse changelog", eff.collapse_changelog())
             .with_description("Show condensed changelog after updates"),
-        SettingRow::toggle("quietStartup", "Quiet startup", eff.quiet_startup())
-            .with_description("Disable verbose printing at startup"),
+        // `quiet-startup` (`settings-selector.ts:554-560` @v1.0.0): a three-way row — `currentValue:
+        // String(config.quietStartup)`, `values: ["true", "header", "false"]` — whose description
+        // names the middle value. `ApplySetting` re-types the cycled text through
+        // `QuietStartup::from_row_value`, so `header` is persisted as the STRING.
+        SettingRow::choice(
+            "quietStartup",
+            "Quiet startup",
+            eff.quiet_startup().to_string(),
+            choices(&cyrup_config::settings::QuietStartup::ROW_VALUES),
+        )
+        .with_description(
+            "Disable verbose printing at startup (header: keep only the startup header)",
+        ),
         SettingRow::toggle(
             "enableInstallTelemetry",
             "Install telemetry",

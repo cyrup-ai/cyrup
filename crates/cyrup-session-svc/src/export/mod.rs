@@ -54,6 +54,10 @@ use std::collections::BTreeMap;
 use std::sync::LazyLock;
 
 use base64::Engine as _;
+use cyrup_resources::color::Rgb;
+use cyrup_resources::system_theme::{
+    SystemThemeColors, SystemThemeInput, concrete_colors, generate_system_theme_colors,
+};
 use cyrup_resources::{ColorSpec, Theme};
 use serde_json::{Map, Value};
 
@@ -78,10 +82,69 @@ const COLOR_FALLBACKS: [(&str, &str); 5] = [
     ("searchMatchText", "text"),
 ];
 
-/// pi's substitute for a role the theme leaves empty — "" means "the terminal's default
-/// foreground", which has no meaning in a browser (`theme.ts:1071-1072` @v0.84.4).
-const DEFAULT_TEXT_DARK: CssColor = CssColor::from_rgb(0xe5, 0xe5, 0xe7);
-const DEFAULT_TEXT_LIGHT: CssColor = CssColor::from_rgb(0x00, 0x00, 0x00);
+/// pi's `GUESSED_DEFAULT_COLORS` (`theme.ts:215-218` @v1.0.0): the terminal's default colours
+/// when it reported none, by the appearance the theme is designed for. A token a theme sets to
+/// `""` has no colour of its own — it is drawn in the terminal's default foreground (or, for a
+/// background token, its default background) — and a browser needs a concrete value.
+const GUESSED_DARK: (CssColor, CssColor) = (
+    CssColor::from_rgb(0xe5, 0xe5, 0xe7),
+    CssColor::from_rgb(0x00, 0x00, 0x00),
+);
+const GUESSED_LIGHT: (CssColor, CssColor) = (
+    CssColor::from_rgb(0x00, 0x00, 0x00),
+    CssColor::from_rgb(0xff, 0xff, 0xff),
+);
+
+/// pi's `BACKGROUND_TOKENS` (`theme.ts:573-581` @v1.0.0): the tokens a theme paints as a
+/// background. A `""` among them is the terminal's default BACKGROUND; everywhere else it is the
+/// default foreground.
+const BACKGROUND_TOKENS: [&str; 7] = [
+    "selectedBg",
+    "searchMatchBg",
+    "userMessageBg",
+    "customMessageBg",
+    "toolPendingBg",
+    "toolSuccessBg",
+    "toolErrorBg",
+];
+
+/// What the terminal said its default colours are, and whether it is light or dark — the inputs to
+/// pi's `Theme.colors` getter (`theme.ts:321-338` @v1.0.0). An unreported colour is guessed from
+/// the theme's appearance ([`GUESSED_DARK`], [`GUESSED_LIGHT`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TerminalDefaults {
+    /// OSC 10, if the terminal answered.
+    pub foreground: Option<CssColor>,
+    /// OSC 11, if the terminal answered.
+    pub background: Option<CssColor>,
+    /// Pi `getTerminalTheme()`: the appearance of a theme that declares none of its own.
+    pub appearance: cyrup_resources::Appearance,
+}
+
+impl Default for TerminalDefaults {
+    /// A terminal that reported nothing and is assumed dark, which is what a headless export has.
+    fn default() -> Self {
+        Self {
+            foreground: None,
+            background: None,
+            appearance: cyrup_resources::Appearance::Dark,
+        }
+    }
+}
+
+impl TerminalDefaults {
+    /// `(foreground, background)` for a theme of `appearance`: the reported colours, else the guess.
+    fn resolve(&self, appearance: cyrup_resources::Appearance) -> (CssColor, CssColor) {
+        let (guess_fg, guess_bg) = match appearance {
+            cyrup_resources::Appearance::Dark => GUESSED_DARK,
+            cyrup_resources::Appearance::Light => GUESSED_LIGHT,
+        };
+        (
+            self.foreground.unwrap_or(guess_fg),
+            self.background.unwrap_or(guess_bg),
+        )
+    }
+}
 /// `colors.userMessageBg || "#343541"` (`export-html/index.ts:120`, `:154` @v0.84.4).
 const FALLBACK_USER_MESSAGE_BG: CssColor = CssColor::from_rgb(0x34, 0x35, 0x41);
 
@@ -100,30 +163,18 @@ pub struct ExportTheme {
     backdrops: ExportBackdrops,
 }
 
-/// The compiled-in `dark` theme's palette — pi's `themeName ?? currentThemeName ?? getDefaultTheme()`
-/// chain (`theme.ts:1065`) bottoming out when no live theme is attached (headless `print`/`json`/`rpc`
-/// modes and `cyrup --export`, which runs before any session exists).
+/// The palette of an export with no TUI attached (headless `print`/`json`/`rpc` modes and
+/// `cyrup --export`, which runs before any session exists): pi's `themeName ?? currentThemeName ??
+/// SYSTEM_THEME_NAME` chain (`theme.ts:903-906` @v1.0.0) bottoming out in the generated `system`
+/// theme. With no terminal behind it nothing was reported, so the generator runs at its third tier
+/// (ANSI palette indices and the terminal's default colours) and `Theme.colors` resolves those
+/// against the colours it guesses for the theme's appearance ([`ExportTheme::headless`]).
 ///
-/// [CYRUP-DELTA] pi's `getDefaultTheme()` (`theme.ts:833-835`) probes the TERMINAL background and
-/// can answer `light`; this seam has no terminal to probe (RPC mode and `--export` are not attached
-/// to one), so the default is the `dark` built-in. An interactive export goes through
-/// [`crate::AgentSession::export_theme`] and carries the user's real theme either way.
-static DEFAULT_EXPORT_THEME: LazyLock<ExportTheme> = LazyLock::new(|| {
-    match Theme::parse(
-        cyrup_resources::BUILTIN_DARK_JSON,
-        None,
-        cyrup_resources::ResourceScope::Builtin,
-        cyrup_resources::ResourceOrigin::Builtin,
-    ) {
-        Ok(theme) => ExportTheme::from_theme(&theme),
-        // Unreachable — the built-in is validated by `cyrup-resources`' own tests — but the
-        // no-panic policy (R-00-009) forbids resolving it with `expect`.
-        Err(_) => ExportTheme {
-            roles: BTreeMap::new(),
-            backdrops: derive_export_colors(None),
-        },
-    }
-});
+/// The appearance is the one pi's `getTerminalTheme()` falls back to without a terminal report:
+/// `COLORFGBG`, then dark (`detectTerminalTheme`, `theme.ts:702-710`), read once at first use as pi
+/// reads `process.env`.
+static DEFAULT_EXPORT_THEME: LazyLock<ExportTheme> =
+    LazyLock::new(|| ExportTheme::headless(ExportTheme::environment_appearance()));
 
 impl Default for ExportTheme {
     fn default() -> Self {
@@ -132,31 +183,87 @@ impl Default for ExportTheme {
 }
 
 impl ExportTheme {
+    /// The appearance pi assumes for a process with no terminal report: `COLORFGBG`'s background
+    /// index, else dark (`detectColorFgBgTheme(env) ?? "dark"`, `theme.ts:689-710`).
+    #[must_use]
+    pub fn environment_appearance() -> cyrup_resources::Appearance {
+        std::env::var("COLORFGBG")
+            .ok()
+            .as_deref()
+            .and_then(cyrup_resources::Appearance::from_colorfgbg)
+            .unwrap_or(cyrup_resources::Appearance::Dark)
+    }
+
+    /// The `system` theme of a terminal that reported nothing, which is an export with no TUI
+    /// attached: pi's `generateSystemThemeColors({ saturation: 1, appearanceHint })` at its third
+    /// tier, folded through `Theme.colors` (`theme.ts:321-338` @v1.0.0). `appearance_hint` is what
+    /// `getTerminalTheme()` answers without a report ([`Self::environment_appearance`]).
+    #[must_use]
+    pub fn headless(appearance_hint: cyrup_resources::Appearance) -> Self {
+        let generated = generate_system_theme_colors(&SystemThemeInput {
+            appearance_hint: Some(appearance_hint),
+            ..SystemThemeInput::default()
+        });
+        Self::from_system(&generated, None, None, appearance_hint)
+    }
+
+    /// A generated `system` theme as an export palette: every token resolved to the concrete colour
+    /// pi's `Theme.colors` getter gives it ([`concrete_colors`]) against the terminal's reported
+    /// default colours, else the guess for the theme's appearance. `terminal_appearance` is what a
+    /// theme with no appearance of its own takes. The backdrops derive from `userMessageBg`
+    /// ([`Self::from_resolved_roles`]).
+    ///
+    /// The one resolution both an interactive export of `system` and a headless export go through,
+    /// so the two cannot disagree about what a token means.
+    #[must_use]
+    pub fn from_system(
+        generated: &SystemThemeColors,
+        foreground: Option<Rgb>,
+        background: Option<Rgb>,
+        terminal_appearance: cyrup_resources::Appearance,
+    ) -> Self {
+        let roles = concrete_colors(generated, foreground, background, terminal_appearance)
+            .into_iter()
+            .map(|(token, rgb)| (token.to_string(), CssColor::from_rgb(rgb.r, rgb.g, rgb.b)))
+            .collect();
+        Self::from_resolved_roles(roles)
+    }
+
     /// pi `getResolvedThemeColors` + `getThemeExportColors` + `deriveExportColors`
     /// (`theme.ts:1064-1085`, `:1099-1125`; `export-html/index.ts:111-128`, `:151-157` @v0.84.4),
     /// against one already-loaded theme document.
     #[must_use]
     pub fn from_theme(theme: &Theme) -> Self {
-        // `isLightTheme` reads the theme's `appearance` — declared, else detected from its colours
-        // (`theme.ts:911-913` @v1.0.0).
-        let default_text = if theme.appearance() == Some(cyrup_resources::Appearance::Light) {
-            DEFAULT_TEXT_LIGHT
-        } else {
-            DEFAULT_TEXT_DARK
-        };
+        Self::from_theme_with(theme, &TerminalDefaults::default())
+    }
+
+    /// [`Self::from_theme`] for a terminal whose default colours are known: pi's `Theme.colors`
+    /// getter fills every token set to `""` from them (`theme.ts:321-338` @v1.0.0), and
+    /// `getResolvedThemeColors` exports that getter's output (`theme.ts:903-906`).
+    #[must_use]
+    pub fn from_theme_with(theme: &Theme, terminal: &TerminalDefaults) -> Self {
+        // The theme's own appearance — declared, else detected from its colours — and only if it has
+        // neither the terminal's (`Theme.appearance`, `theme.ts:313-315`).
+        let appearance = theme.appearance().unwrap_or(terminal.appearance);
+        let (default_fg, default_bg) = terminal.resolve(appearance);
 
         // An index exports as the standard xterm palette's RGB for it (`colorToHex(indexedColor(n))`,
-        // `theme.ts:936`). `value === "" → defaultText` (`theme.ts:1078-1080`).
-        let spec_to_css = |spec: ColorSpec| match spec.to_rgb() {
+        // `theme.ts:936`). `""` is the terminal's default foreground, or its default background for
+        // a background token (`Theme.colors`, `theme.ts:326-332`).
+        let to_css = |token: &str, spec: ColorSpec| match spec.to_rgb() {
             Some((r, g, b)) => CssColor::from_rgb(r, g, b),
-            None => default_text,
+            None if BACKGROUND_TOKENS.contains(&token) => default_bg,
+            None => default_fg,
         };
 
         let mut roles: BTreeMap<String, CssColor> = theme
             .resolve()
             .roles // pi `resolveThemeColors(…, vars)` (`theme.ts:321-331`)
             .into_iter()
-            .map(|(k, v)| (k, spec_to_css(v)))
+            .map(|(k, v)| {
+                let css = to_css(&k, v);
+                (k, css)
+            })
             .collect();
         for (alias, source) in COLOR_FALLBACKS {
             if !roles.contains_key(alias)
@@ -186,6 +293,23 @@ impl ExportTheme {
         };
 
         Self { roles, backdrops }
+    }
+
+    /// A palette whose roles were already resolved to concrete colours by the caller — the generated
+    /// `system` theme, which exists only in the interactive TUI (`getResolvedThemeColors("system")`
+    /// reads `createSystemTheme().colors`, `theme.ts:903-906`). The backdrops are derived from
+    /// `userMessageBg`, because a generated theme has no `export` block
+    /// (`getThemeExportColors`, `theme.ts:924-925`: `if (name === SYSTEM_THEME_NAME) return {}`).
+    #[must_use]
+    pub fn from_resolved_roles(roles: BTreeMap<String, CssColor>) -> Self {
+        let base = roles
+            .get("userMessageBg")
+            .copied()
+            .unwrap_or(FALLBACK_USER_MESSAGE_BG);
+        Self {
+            roles,
+            backdrops: derive_export_colors(Some(base)),
+        }
     }
 
     /// The three backdrop colours this palette resolved to.

@@ -293,6 +293,48 @@ pub(crate) struct ImageOpts<'a> {
     /// [`cyrup_config::MermaidRenderingMode::Streaming`], Pi's documented default
     /// (`settings-manager.ts:61`).
     pub mermaid: cyrup_config::MermaidRenderingMode,
+    /// Whose `hideThinkingBlock` a committed [`Entry::Thinking`] renders under — see
+    /// [`ThinkingHiding`].
+    pub thinking: ThinkingHiding,
+}
+
+/// Which `hideThinkingBlock` a committed reasoning entry is drawn with.
+///
+/// Pi's `setHideThinkingBlock` re-renders every assistant message already in `chatContainer`
+/// (`assistant-message.ts:57-62`, broadcast by `updateThinkingBlockVisibility`,
+/// `interactive-mode.ts:4494-4500` @v1.0.0), so a run committed visible turns into the `Thinking...`
+/// label the moment the setting is flipped, and back. Which renderer can honour that depends on
+/// whether it still owns the committed rows:
+///
+/// * [`Self::AsCommitted`] — the **inline** renderer. A committed entry is rendered exactly once,
+///   into the terminal's native scrollback (`insert_before`, ADR-0001), and those cells are the
+///   terminal's from then on; the entry therefore keeps the choice `Entry::Thinking::hidden` froze
+///   at commit, and a later flip affects only the live block and what commits afterwards.
+/// * [`Self::Live`] — the **fullscreen** renderer. The retained document is repainted from its
+///   entries, so every committed run is drawn under the setting in force at paint time, which is
+///   upstream's behaviour. A per-run click override still wins over it
+///   (`thinkingVisibilityOverrides.get(runIndex) ?? this.hideThinkingBlock`,
+///   `assistant-message.ts:131`) until the next flip clears it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum ThinkingHiding {
+    /// The value frozen into the entry at commit.
+    #[default]
+    AsCommitted,
+    /// The live setting.
+    Live {
+        /// The `hideThinkingBlock` in force now.
+        hide: bool,
+    },
+}
+
+impl ThinkingHiding {
+    /// Whether a run committed with `committed` is drawn collapsed.
+    pub(crate) const fn hidden(self, committed: bool) -> bool {
+        match self {
+            Self::AsCommitted => committed,
+            Self::Live { hide } => hide,
+        }
+    }
 }
 
 impl Default for ImageOpts<'_> {
@@ -310,6 +352,7 @@ impl Default for ImageOpts<'_> {
             tools_expanded: false,
             hidden_thinking_label: None,
             mermaid: cyrup_config::MermaidRenderingMode::default(),
+            thinking: ThinkingHiding::AsCommitted,
         }
     }
 }

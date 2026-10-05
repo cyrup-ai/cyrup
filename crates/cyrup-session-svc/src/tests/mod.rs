@@ -25,6 +25,7 @@ mod custom_tool_render;
 mod delete_session_file_trash;
 mod dispose_invalidates;
 mod export_branch_jsonl;
+mod export_headless_theme;
 mod export_html;
 mod ext_077_user_bash_fails_closed;
 mod ext_083_send_user_message_options;

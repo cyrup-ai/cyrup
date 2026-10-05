@@ -19,13 +19,16 @@ pub(crate) struct RunCtx {
     /// The terminal's colours, delivered after the boot query gave up (Pi's `onLateReply`).
     pub(crate) terminal_colors_rx:
         Option<tokio::sync::mpsc::UnboundedReceiver<crate::TerminalColors>>,
+    /// The terminal's light/dark reports (mode `2031`), from the input reader.
+    pub(crate) color_scheme_rx: tokio::sync::mpsc::UnboundedReceiver<crate::TerminalTheme>,
     pub(crate) ui_tx: tokio::sync::mpsc::UnboundedSender<UiRequest>,
     pub(crate) ui_effect_tx: tokio::sync::mpsc::UnboundedSender<UiEffect>,
     pub(crate) ext_error_tx: tokio::sync::mpsc::UnboundedSender<cyrup_ext::ExtensionError>,
     /// HA-1's re-install handle, kept beside `ext_error_tx` for the same reason.
     pub(crate) commands_changed_tx: tokio::sync::mpsc::UnboundedSender<()>,
     pub(crate) overlay_tx: tokio::sync::mpsc::UnboundedSender<cyrup_session_svc::OverlayRequest>,
-    pub(crate) theme_switch_tx: tokio::sync::mpsc::UnboundedSender<cyrup_resources::Theme>,
+    pub(crate) theme_switch_tx:
+        tokio::sync::mpsc::UnboundedSender<crate::theme_access::ThemeSwitch>,
     pub(crate) shortcut_status_tx: tokio::sync::mpsc::UnboundedSender<String>,
 }
 
@@ -98,7 +101,7 @@ impl App<InlineBackend<TuiStdout>> {
         // `theme/theme.ts:622`) and only a RESOLVED theme reaches this channel. Re-installed on
         // session swap below, for the same reason `ui_tx` is.
         let (theme_switch_tx, mut theme_switch_rx) =
-            tokio::sync::mpsc::unbounded_channel::<cyrup_resources::Theme>();
+            tokio::sync::mpsc::unbounded_channel::<crate::theme_access::ThemeSwitch>();
         Self::install_ui_sinks(
             &session.services().host_services,
             ui_tx.clone(),
@@ -211,6 +214,13 @@ impl App<InlineBackend<TuiStdout>> {
         // (offline / `--offline` / `CYRUP_SKIP_VERSION_CHECK`), in which case the arm never resolves.
         let package_update_rx = self.package_update_rx.take();
         let terminal_colors_rx = self.terminal_colors_rx.take();
+        // The reader thread frames `CSI ? 997 ; N n` and hands the scheme to this listener
+        // (pi's `onTerminalColorSchemeChange` subscription, `theme-controller.ts:236-238`). Removed
+        // when the loop ends, so a report after it is swallowed like any other reply.
+        let (color_scheme_tx, color_scheme_rx) = tokio::sync::mpsc::unbounded_channel();
+        crate::color_scheme::set_listener(Some(std::sync::Arc::new(move |scheme| {
+            let _ = color_scheme_tx.send(scheme);
+        })));
         let mut ctx = RunCtx {
             session,
             runtime,
@@ -221,6 +231,7 @@ impl App<InlineBackend<TuiStdout>> {
             bash_rx,
             package_update_rx,
             terminal_colors_rx,
+            color_scheme_rx,
             ui_tx,
             ui_effect_tx,
             ext_error_tx,
@@ -284,6 +295,8 @@ impl App<InlineBackend<TuiStdout>> {
                     None => std::future::pending().await,
                 }
             };
+            // The terminal's light/dark reports (mode 2031).
+            let color_scheme = ctx.color_scheme_rx.recv();
             let session_swapped = async {
                 match ctx.gen_rx.as_mut() {
                     Some(rx) => rx.changed().await.is_ok(),
@@ -453,6 +466,7 @@ impl App<InlineBackend<TuiStdout>> {
                 Some(warning) = tmux_warning_rx.recv() => self.on_tmux_warning(warning)?,
                 Some(theme) = theme_switch_rx.recv() => self.on_theme_switch(&mut ctx, theme).await?,
                 Some(colors) = terminal_colors => self.on_terminal_colors(&ctx, colors)?,
+                Some(scheme) = color_scheme => self.on_color_scheme(&ctx, scheme)?,
                 Some(msg) = login_rx.recv() => self.on_login_msg(&mut ctx, msg).await?,
                 Some(msg) = login_refresh_rx.recv() => self.on_login_refresh_msg(&mut ctx, msg).await?,
                 Some(msg) = model_refresh_rx.recv() => self.on_model_refresh_msg(&mut ctx, msg)?,
@@ -479,6 +493,7 @@ impl App<InlineBackend<TuiStdout>> {
                 break;
             }
         }
+        crate::color_scheme::set_listener(None);
         // A state change made just before the quit would otherwise never be drawn: `break` leaves
         // the loop without passing the top-of-body frame site again (PERF-005 §3.1).
         if self.frames.pending() {

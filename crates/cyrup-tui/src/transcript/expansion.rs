@@ -82,11 +82,12 @@ impl Entry {
         }
     }
 
-    /// Whether the entry renders expanded when it has no override of its own.
-    fn open_by_default(&self, tools_expanded: bool) -> bool {
+    /// Whether the entry renders expanded when it has no override of its own, in the retained
+    /// document (the only place an entry can be toggled): a reasoning body is shown unless the
+    /// live `hideThinkingBlock` hides it ([`ThinkingHiding::Live`]).
+    fn open_by_default(&self, tools_expanded: bool, hide_thinking: bool) -> bool {
         match self {
-            // The reasoning body is shown unless the run committed under `hideThinkingBlock`.
-            Entry::Thinking { hidden, .. } => !hidden,
+            Entry::Thinking { .. } => !hide_thinking,
             _ => tools_expanded,
         }
     }
@@ -185,14 +186,14 @@ impl TranscriptView {
     /// the state it now has, or `None` when the entry is not one a click toggles.
     ///
     /// The flip is relative to what the entry shows now: its override if it has one, otherwise the
-    /// global flag (a thinking run: whether it committed hidden).
+    /// global flag (a thinking run: whether `hideThinkingBlock` is on now).
     pub fn toggle_entry(&mut self, index: usize) -> Option<Expansion> {
         let entry = self.document.get(index)?;
         let scope = entry.toggle_scope()?;
         let seq = self.entry_seq(index);
         let open = match self.expansion.by_seq.get(&seq) {
             Some(o) => o.state.is_open(),
-            None => entry.open_by_default(self.tool_expanded),
+            None => entry.open_by_default(self.tool_expanded, self.hide_thinking),
         };
         let state = Expansion::from_open(!open);
         self.expansion.by_seq.insert(seq, Override { scope, state });

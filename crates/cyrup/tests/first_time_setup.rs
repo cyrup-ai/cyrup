@@ -1,10 +1,10 @@
-//! First-run setup wizard — parity with Pi v0.83.0.
+//! First-run setup wizard — parity with Pi v1.0.0.
 //!
 //! Fixtures are upstream-derived: the four gate cases are 1:1 with
 //! `pi/packages/coding-agent/test/first-time-setup.test.ts:36-55`, the fork case with
 //! `first-time-setup-fork.test.ts:34-36`, the persisted analytics/tracking-id behaviour with
 //! `first-time-setup.test.ts:58-88`, and every wizard string is quoted from
-//! `pi/packages/coding-agent/src/modes/interactive/components/first-time-setup.ts` (v0.83.0) with
+//! `pi/packages/coding-agent/src/modes/interactive/components/first-time-setup.ts` (v1.0.0) with
 //! only the product name rebranded, exactly as Pi itself interpolates `APP_NAME` at :60.
 //!
 //! `run_first_time_setup` itself drives a real `CrosstermBackend` terminal (like `run_trust_prompt`)
@@ -33,14 +33,13 @@ use std::path::Path;
 use cyrup::startup::{
     APP_NAME, CONFIG_DIR_NAME, DistributionMetadata, FirstTimeSetupResult, PACKAGE_NAME,
     apply_first_time_setup, are_experimental_features_enabled_from, distribution,
-    first_time_setup_analytics_step, first_time_setup_theme_step, is_official_distribution,
-    is_official_distribution_of, parse_analytics_choice, parse_theme_choice,
-    should_run_first_time_setup_with,
+    first_time_setup_analytics_step, first_time_setup_theme_selector, first_time_setup_theme_step,
+    is_official_distribution, is_official_distribution_of, parse_analytics_choice,
+    parse_theme_choice, should_run_first_time_setup_with,
 };
 use cyrup::{Cli, resolve_app_mode};
 use cyrup_config::{ConfigDirs, SettingsManager};
 use cyrup_session_svc::AppMode;
-use cyrup_tui::TerminalTheme;
 
 // ---------------------------------------------------------------------------------------------
 // The gate — `shouldRunFirstTimeSetup` (startup-ui.ts:115-133).
@@ -217,11 +216,15 @@ fn config_dir_name_is_the_directory_the_layout_uses() {
 // The wizard steps — `FirstTimeSetupComponent` (first-time-setup.ts:19-140).
 // ---------------------------------------------------------------------------------------------
 
-/// Theme step copy + rows (first-time-setup.ts:19-22, :48-70). Labels and order are Pi's; the
+/// Theme step copy + rows (first-time-setup.ts:19-23, :48-70 @v1.0.0). Labels and order are Pi's:
+/// the system theme first — "System (matches your terminal colors)" — then Dark and Light; the
 /// welcome line is Pi's `Welcome to ${APP_NAME}, the minimal coding agent.` (:60).
+///
+/// FAILS on the v0.83 wizard, which offered only Dark and Light and printed a "Detected system
+/// appearance" line pi v1.0.0 no longer has.
 #[test]
 fn theme_step_matches_upstream_copy_and_options() {
-    let step = first_time_setup_theme_step(TerminalTheme::Dark);
+    let step = first_time_setup_theme_step();
 
     assert!(
         step.title
@@ -230,7 +233,11 @@ fn theme_step_matches_upstream_copy_and_options() {
         step.title
     );
     assert!(step.title.contains("Pick a theme."));
-    assert!(step.title.contains("Detected system appearance: dark"));
+    assert!(
+        !step.title.contains("Detected system appearance"),
+        "v1.0.0 does not detect the appearance for the wizard: {}",
+        step.title
+    );
     // SETUP_LOGO_LINES (:29).
     assert!(step.title.contains("██████\n██  ██\n████  ██\n██    ██"));
 
@@ -239,29 +246,22 @@ fn theme_step_matches_upstream_copy_and_options() {
         .iter()
         .map(|(_, label, _)| label.as_str())
         .collect();
-    assert_eq!(labels, vec!["Dark", "Light"]);
+    assert_eq!(
+        labels,
+        vec!["System (matches your terminal colors)", "Dark", "Light"]
+    );
     let values: Vec<&str> = step
         .rows
         .iter()
         .map(|(value, _, _)| value.as_str())
         .collect();
-    assert_eq!(values, vec!["dark", "light"]);
+    assert_eq!(values, vec!["system", "dark", "light"]);
 }
 
-/// `themeIndex = Math.max(0, THEME_OPTIONS.findIndex(o => o.value === detectedTheme))` (:40-43):
-/// the detected appearance is preselected, and an unmatched detection falls back to row 0 (Dark).
+/// `this.themeIndex = 0` (:38): the system theme is preselected, whatever the terminal looks like.
 #[test]
-fn theme_step_preselects_the_detected_appearance() {
-    assert_eq!(first_time_setup_theme_step(TerminalTheme::Dark).selected, 0);
-    assert_eq!(
-        first_time_setup_theme_step(TerminalTheme::Light).selected,
-        1
-    );
-    assert!(
-        first_time_setup_theme_step(TerminalTheme::Light)
-            .title
-            .contains("Detected system appearance: light")
-    );
+fn theme_step_preselects_the_system_theme() {
+    assert_eq!(first_time_setup_theme_step().selected, 0);
 }
 
 /// Analytics step copy + rows (first-time-setup.ts:24-27, :71-83). The blurb is upstream's verbatim,
@@ -294,15 +294,10 @@ fn analytics_step_matches_upstream_copy_and_options() {
 /// Confirming a row yields that row's option value (first-time-setup.ts:133-137).
 #[test]
 fn confirm_values_map_back_to_the_upstream_options() {
-    let theme_step = first_time_setup_theme_step(TerminalTheme::Dark);
-    assert_eq!(
-        parse_theme_choice(&theme_step.rows[0].0),
-        Some(TerminalTheme::Dark)
-    );
-    assert_eq!(
-        parse_theme_choice(&theme_step.rows[1].0),
-        Some(TerminalTheme::Light)
-    );
+    let theme_step = first_time_setup_theme_step();
+    assert_eq!(parse_theme_choice(&theme_step.rows[0].0), Some("system"));
+    assert_eq!(parse_theme_choice(&theme_step.rows[1].0), Some("dark"));
+    assert_eq!(parse_theme_choice(&theme_step.rows[2].0), Some("light"));
     assert_eq!(parse_theme_choice("mauve"), None);
 
     let analytics_step = first_time_setup_analytics_step();
@@ -334,7 +329,7 @@ async fn submitting_the_wizard_persists_theme_and_analytics_opt_in() {
     apply_first_time_setup(
         &mut settings,
         &FirstTimeSetupResult {
-            theme: TerminalTheme::Light,
+            theme: "light",
             share_analytics: true,
         },
     )
@@ -373,7 +368,7 @@ async fn opting_out_persists_the_flag_without_a_tracking_id() {
     apply_first_time_setup(
         &mut settings,
         &FirstTimeSetupResult {
-            theme: TerminalTheme::Dark,
+            theme: "dark",
             share_analytics: false,
         },
     )
@@ -450,4 +445,78 @@ fn a_list_models_run_is_still_interactive_so_the_gate_needs_the_list_models_conj
     let plain = Cli::default();
     assert_eq!(resolve_app_mode(&plain, true, true), AppMode::Interactive);
     assert!(plain.list_models.is_none());
+}
+
+/// Choosing the first row persists the NAME `system` (`settingsManager.setTheme(result.theme)`,
+/// startup-ui.ts:192): the next launch reads it back as the system theme.
+#[tokio::test]
+async fn choosing_the_system_theme_persists_its_name() {
+    let root = tempfile::tempdir().unwrap();
+    let dirs = dirs_under(root.path());
+    std::fs::create_dir_all(&dirs.agent_dir).unwrap();
+    let mut settings = manager_for(&dirs);
+
+    apply_first_time_setup(
+        &mut settings,
+        &FirstTimeSetupResult {
+            theme: parse_theme_choice("system").unwrap(),
+            share_analytics: false,
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(read_settings(&dirs)["theme"], serde_json::json!("system"));
+}
+
+/// `onThemePreview` (first-time-setup.ts:127-130): moving the highlight previews the theme under it,
+/// so the dialog recolours before anything is chosen. The selector `run_first_time_setup` mounts is
+/// the one built here.
+///
+/// FAILS without the change: the wizard's selector was a bare prompt that emitted no preview, so the
+/// choice only took effect on the next render.
+#[test]
+fn moving_the_highlight_previews_the_theme_under_it() {
+    use cyrup_tui::{SelectKeymap, Selector as _, SelectorOutcome};
+    use ratatui::crossterm::event::{KeyCode, KeyEvent};
+
+    let mut selector = first_time_setup_theme_selector();
+    let keymap = SelectKeymap::default();
+    assert_eq!(
+        selector.handle(&KeyEvent::from(KeyCode::Down), &keymap),
+        SelectorOutcome::Preview("dark".to_string())
+    );
+    assert_eq!(
+        selector.handle(&KeyEvent::from(KeyCode::Down), &keymap),
+        SelectorOutcome::Preview("light".to_string())
+    );
+    assert_eq!(
+        selector.handle(&KeyEvent::from(KeyCode::Enter), &keymap),
+        SelectorOutcome::Confirm("light".to_string())
+    );
+}
+
+/// `createStartupTui` resolves `settings.theme` (`initTheme(resolveThemeSetting(…) ?? system)`,
+/// startup-ui.ts:79-80) and starts the system theme in grayscale until the terminal answers
+/// (`markTerminalColorsPending`, :78).
+#[test]
+fn the_prelaunch_theme_is_the_setting_or_the_pending_system_theme() {
+    let root = tempfile::tempdir().unwrap();
+    let dirs = dirs_under(root.path());
+    std::fs::create_dir_all(&dirs.agent_dir).unwrap();
+
+    let fresh = cyrup::startup_theme(&dirs, None);
+    assert_eq!(fresh.theme().name, "system");
+    assert!(
+        fresh.colors_pending(),
+        "grayscale until the terminal answers"
+    );
+
+    std::fs::write(dirs.settings_path(), r#"{"theme":"light"}"#).unwrap();
+    assert_eq!(cyrup::startup_theme(&dirs, None).theme().name, "light");
+    // `--use-theme` outranks the file for the run.
+    assert_eq!(
+        cyrup::startup_theme(&dirs, Some("dark")).theme().name,
+        "dark"
+    );
 }

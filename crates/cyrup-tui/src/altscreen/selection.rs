@@ -12,11 +12,33 @@
 //! Everything below is that replacement, and nothing else. Without it, turning fullscreen on is a
 //! net regression for anyone who copies text out of their terminal.
 //!
+//! # Two row sources
+//! A selection indexes rows of one of two [`Source`]s, chosen by where the press landed and fixed
+//! for the whole gesture, as pi's `SelectionPoint.scrollView` is (`tui-alt-screen.ts:93-99`,
+//! `getSelectionPoint` `:1149-1158`):
+//!
+//! * **Document** — a press inside the scrolled document's viewport. The rows are the rendered
+//!   document, the pointer is clamped into the viewport, and a drag held against its edge
+//!   auto-scrolls. A drag that starts here and ends over the dock keeps selecting document rows.
+//! * **Screen** — a press anywhere else, which by the time it arrives here no component has acted
+//!   on: the editor body and its rules, the footer, the working band, extension widgets, queued
+//!   messages, blank rows. The rows are the frame as the renderer last painted it
+//!   ([`super::screen::ScreenRows`], pi's `previousScreen`), the pointer is clamped into the frame,
+//!   and there is no auto-scroll because the screen is not a scroll view. A drag that starts here
+//!   selects screen rows wherever it goes — it may run up over the document's viewport, reading
+//!   what is painted there — and never document rows.
+//!
+//! The selection holds coordinates, not text, so it is not invalidated when the rows it indexes are
+//! repainted with something else: the highlight stays on the same cells and a copy reads what is
+//! painted in them now. What clears it is what clears a document selection — a press a component
+//! handles, a new press, a scrollbar grab, an overlay press, the end of a click a component took,
+//! and, for an in-flight gesture, losing focus.
+//!
 //! # Selection is view state
 //! Nothing here mutates a [`crate::Entry`]. The anchor and focus are *rendered document* rows and
-//! visible columns over the same `&[Line]` the frame painted, which is what makes a selection
-//! survive a re-render of the entries beneath it and what makes [`highlight`] a pure post-pass over
-//! cells that are already on the screen. It is also why the copied string matches the visible text
+//! visible columns over the same `&[Line]` the frame painted (or screen rows and columns over the
+//! same cells), which is what makes a selection survive a re-render of the entries beneath it and
+//! what makes [`highlight`] a pure post-pass over cells that are already on the screen. It is also why the copied string matches the visible text
 //! across wrapped rows for free: a wrapped row IS a document row here, exactly as it is upstream,
 //! where the selection runs over `box.scrollContentLines` (`:1094-1097`).
 //!
@@ -60,6 +82,7 @@
 //! [`tick_auto_scroll`] is the callback body (`:954-970`). Without it a drag held motionless
 //! against the edge would stop extending, which is the acceptance criterion the timer exists for.
 
+use std::borrow::Cow;
 use std::time::{Duration, Instant};
 
 use ratatui::Frame;
@@ -69,6 +92,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::Line;
 use unicode_segmentation::UnicodeSegmentation;
 
+use super::screen::ScreenRows;
 use super::scroll::{self, ScrollState};
 use super::toggle::ToggleHit;
 use crate::text_width::str_width;
@@ -115,6 +139,77 @@ struct Point {
     boundary: bool,
 }
 
+/// Which rows a selection's points index — what pi's `SelectionPoint.scrollView` says (`:95`):
+/// present when the press landed in a scroll view, absent when it landed anywhere else.
+///
+/// The source belongs to the **gesture**, not to a point: every later point of a gesture is
+/// resolved against the source its anchor was (`getSelectionPoint(event, anchorScrollView)`,
+/// `:1316-1317`), which is what keeps a drag that began in the document in the document — clamped
+/// into its viewport, however far the pointer goes — and a drag that began outside it on the
+/// screen, clamped into the frame. A selection never straddles the two (`getSelectionBounds`
+/// answers nothing when the ends name different views, `:1395`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) enum Source {
+    /// Rows of the rendered document, addressed in the scrolled viewport — pi's `scrollView` set.
+    #[default]
+    Document,
+    /// Rows of the frame as painted ([`ScreenRows`]) — the editor, a selector, the footer, the
+    /// working band, extension widgets, queued messages, a floating overlay. Pi's `scrollView`
+    /// absent: screen coordinates over `previousScreen`.
+    Screen,
+}
+
+/// The rows a source reads — the document the frame painted into the viewport, or the frame.
+#[derive(Clone, Copy)]
+pub(super) enum Rows<'a> {
+    /// `scrollContentLines`.
+    Document(&'a [Line<'a>]),
+    /// `previousScreen`.
+    Screen(&'a ScreenRows),
+}
+
+impl<'a> Rows<'a> {
+    /// The plain text of row `row`, empty past the end — pi's `getSelectionSourceLine`
+    /// (`tui-alt-screen.ts:1160-1166`), whose `lines[point.row] ?? ""` this is.
+    ///
+    /// A document [`Line`] is its spans' concatenation ([`std::fmt::Display`], ratatui-core
+    /// `text/line.rs:839-845`) and carries no styling, so there is nothing to strip.
+    fn text(self, row: usize) -> Cow<'a, str> {
+        match self {
+            Self::Document(doc) => {
+                Cow::Owned(doc.get(row).map(ToString::to_string).unwrap_or_default())
+            }
+            Self::Screen(screen) => Cow::Borrowed(screen.text(row)),
+        }
+    }
+}
+
+/// Both row sources and the document's viewport — what a pointer report is resolved against.
+#[derive(Clone, Copy)]
+pub(super) struct Surface<'a> {
+    /// The rendered document.
+    pub(super) doc: &'a [Line<'a>],
+    /// The rectangle the document was painted into. A press inside it anchors in the document; a
+    /// press anywhere else anchors on the screen.
+    pub(super) viewport: Rect,
+    /// The last frame, cell by cell.
+    pub(super) screen: &'a ScreenRows,
+    /// Whether every press anchors on the screen, whatever the viewport holds. True while a modal
+    /// overlay is open: pi finds no scroll view under the pointer then
+    /// (`!this.hasOverlay() && this.currentLayout`, `tui-alt-screen.ts:1372`), because the document
+    /// is not what the user sees under a modal and the modal's own text is not in it.
+    pub(super) screen_only: bool,
+}
+
+impl<'a> Surface<'a> {
+    fn rows(self, source: Source) -> Rows<'a> {
+        match source {
+            Source::Document => Rows::Document(self.doc),
+            Source::Screen => Rows::Screen(self.screen),
+        }
+    }
+}
+
 /// An ordered pair of points — pi's `SelectionRange` (`tui-alt-screen.ts:88-91`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Range {
@@ -152,6 +247,8 @@ struct LastClick {
     /// presses — upstream's `wordStart`/`wordEnd` (`:100-101`).
     word_start: usize,
     word_end: usize,
+    /// Which rows `row` indexes — upstream's `scrollView` (`:99`), compared at `:1245`.
+    source: Source,
 }
 
 /// A drag holding the pointer at or past a viewport edge — pi's
@@ -178,6 +275,9 @@ struct AutoScroll {
 /// entry point, which is what lets a selection outlive any single frame without borrowing one.
 #[derive(Default)]
 pub(super) struct SelectionState {
+    /// The rows `anchor` and `focus` index, fixed by the press that began the gesture — see
+    /// [`Source`]. Meaningful only while `anchor` is set.
+    source: Source,
     /// Where the gesture began — upstream's `selectionAnchor` (`:185`). Not necessarily the
     /// earlier end: a backwards drag leaves the anchor after the focus, which is what
     /// [`bounds`] orders.
@@ -216,9 +316,11 @@ pub(super) struct SelectionState {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PointerOutcome {
     /// Not a selection gesture: the caller offers the report onward. A wheel notch, a middle
-    /// press, a motion report with no press behind it and a press outside the document viewport
-    /// all land here — the last being upstream's screen-coordinate fallback (`:822-826`), which
-    /// cyrup declines instead so the editor and status chrome keep their own behaviour.
+    /// press and a motion report with no press behind it land here. A left press outside the
+    /// document viewport does not: it anchors on the screen ([`Source::Screen`]), which is
+    /// upstream's no-scroll-view fallback (`getSelectionPoint`, `:1149-1158`). The application
+    /// has already offered it to the docked components that act on a press, so what arrives is
+    /// one nobody took.
     Ignored,
     /// The report was ours and is fully dealt with.
     Handled,
@@ -237,6 +339,25 @@ pub enum PointerOutcome {
     /// summary or a skill invocation). The caller flips that entry and re-anchors the viewport; the
     /// selection has already been cleared, and nothing is copied (`tui-alt-screen.ts:1342-1353`).
     Toggle(ToggleHit),
+    /// A clean left click — no drag, released on the cell it was pressed on — that began on the
+    /// **screen** rather than in the document, with no link under it. Pi hands it to the component
+    /// under the pointer as a `click` event with the selection ladder's count
+    /// (`tui-alt-screen.ts:1337-1348`): if one handles it (the editor places its caret, a list
+    /// row activates) the selection is cleared and nothing is copied, otherwise the release goes on
+    /// to copy as any other.
+    ///
+    /// The selection is left exactly as the release found it. The caller answers with
+    /// [`super::AltScreen::clear_selection`] when a component handled the click and with
+    /// [`super::AltScreen::finish_release`] when none did. It is a report rather than a closure
+    /// like [`ToggleAt`] because the components that may take the click are the application's, and
+    /// this module sees no application state.
+    Click {
+        /// The screen cell, which is the cell the press began on.
+        at: Position,
+        /// The consecutive-click count of the selection ladder (`this.lastClick?.count ?? 1`,
+        /// `:1339`).
+        count: u8,
+    },
 }
 
 /// What the selection needs to ask the document: the toggle region under a document cell, if any.
@@ -273,8 +394,7 @@ pub(super) type ToggleAt<'a> = &'a dyn Fn(usize, usize) -> Option<ToggleHit>;
 pub(super) fn route(
     sel: &mut SelectionState,
     scroll: &ScrollState,
-    doc: &[Line<'_>],
-    viewport: Rect,
+    surface: Surface<'_>,
     ev: &MouseEvent,
     copy_on_select: bool,
     toggle_at: ToggleAt<'_>,
@@ -288,10 +408,10 @@ pub(super) fn route(
         };
     }
     match ev.kind {
-        MouseEventKind::Down(MouseButton::Left) => press(sel, scroll, doc, viewport, ev),
-        MouseEventKind::Drag(MouseButton::Left) => drag(sel, scroll, doc, viewport, ev),
+        MouseEventKind::Down(MouseButton::Left) => press(sel, scroll, surface, ev),
+        MouseEventKind::Drag(MouseButton::Left) => drag(sel, scroll, surface, ev),
         MouseEventKind::Up(MouseButton::Left) => {
-            release(sel, scroll, doc, viewport, ev, copy_on_select, toggle_at)
+            release(sel, scroll, surface, ev, copy_on_select, toggle_at)
         }
         _ => PointerOutcome::Ignored,
     }
@@ -324,7 +444,9 @@ pub(super) fn tick_auto_scroll(
     doc: &[Line<'_>],
     viewport: Rect,
 ) -> bool {
-    let Some(auto) = sel.auto else {
+    // Only a selection anchored in the document auto-scrolls: the screen has no scroll view to move
+    // (`updateSelectionAutoScroll`, `:1259-1262`), and `drag` never arms one for it.
+    let Some(auto) = sel.auto.filter(|_| sel.source == Source::Document) else {
         return false;
     };
     if Instant::now() < auto.due {
@@ -336,7 +458,7 @@ pub(super) fn tick_auto_scroll(
         return false;
     }
     if let Some(point) = point_at(scroll, doc, viewport, auto.pointer.x, auto.pointer.y) {
-        update_focus(sel, doc, point);
+        update_focus(sel, Rows::Document(doc), point);
     }
     let now = Instant::now();
     if let Some(next) = sel.auto.as_mut() {
@@ -359,6 +481,7 @@ pub(super) fn tick_auto_scroll(
 pub(super) fn cancel(sel: &mut SelectionState) {
     stop_auto_scroll(sel);
     sel.press_active = false;
+    sel.source = Source::Document;
     sel.anchor = None;
     sel.focus = None;
     sel.granularity = Granularity::Character;
@@ -371,7 +494,7 @@ pub(super) fn cancel(sel: &mut SelectionState) {
 /// Pi's `clearTextSelection` (`tui-alt-screen.ts:882-891`): everything [`cancel`] clears except the
 /// multi-click counter, which a handled click leaves running — so a quick second click on the same
 /// word still counts as the second of a double click.
-fn clear_text_selection(sel: &mut SelectionState) {
+pub(super) fn clear_text_selection(sel: &mut SelectionState) {
     stop_auto_scroll(sel);
     sel.press_active = false;
     sel.anchor = None;
@@ -437,11 +560,19 @@ pub(super) fn has_selection(sel: &SelectionState) -> bool {
 /// rows are ANSI-bearing strings. cyrup's are [`Line`]s, whose styling travels out of band in each
 /// [`ratatui::text::Span`], so the concatenated content is already the plain text and there is
 /// nothing to strip — the reason [`crate::ansi::strip_ansi`] is not called here.
-pub(super) fn selected_text(sel: &SelectionState, doc: &[Line<'_>]) -> Option<String> {
+pub(super) fn selected_text(
+    sel: &SelectionState,
+    doc: &[Line<'_>],
+    screen: &ScreenRows,
+) -> Option<String> {
     let (start, end) = bounds(sel)?;
+    let source = match sel.source {
+        Source::Document => Rows::Document(doc),
+        Source::Screen => Rows::Screen(screen),
+    };
     let mut rows: Vec<String> = Vec::new();
     for row in start.row..=end.row {
-        let text = line_text(doc, row);
+        let text = source.text(row);
         let width = str_width(&text);
         let (from, to) = selection_columns(&text, row, start, end, 0, width);
         rows.push(slice_by_column(&text, from, to).trim_end().to_string());
@@ -479,6 +610,9 @@ pub(super) fn highlight(
     frame: &mut Frame,
     viewport: Rect,
 ) {
+    if sel.source != Source::Document {
+        return;
+    }
     let Some((start, end)) = bounds(sel) else {
         return;
     };
@@ -496,7 +630,7 @@ pub(super) fn highlight(
     let style = Style::default().add_modifier(Modifier::REVERSED);
     let max_col = usize::from(viewport.width);
     for row in first..=last {
-        let text = line_text(doc, row);
+        let text = Rows::Document(doc).text(row);
         let (from, to) = selection_columns(&text, row, start, end, 0, max_col);
         // `if (columns.end <= columns.start) return line;` (`:1249`).
         if to <= from {
@@ -508,6 +642,50 @@ pub(super) fn highlight(
     }
 }
 
+/// Paint a selection anchored on the screen over the cells already drawn — the `applySelection`
+/// branch with no scroll view (`tui-alt-screen.ts:1580-1616`, where `screenSelection` is the
+/// selection itself and the row and column bounds are the terminal's).
+///
+/// Called after the dock and the overlays are painted and before the flash, which is upstream's
+/// order (`:1685-1686`): the highlight covers whatever the application drew, wherever it drew it,
+/// and a flash notice is composited over it. The rows are read from the buffer **as it is now**
+/// ([`ScreenRows::capture`]), because the highlight must land on the text painted in this frame;
+/// the selection's own coordinates are the only thing carried between frames.
+pub(super) fn highlight_screen(sel: &SelectionState, frame: &mut Frame) {
+    if sel.source != Source::Screen {
+        return;
+    }
+    let Some((start, end)) = bounds(sel) else {
+        return;
+    };
+    let screen = ScreenRows::capture(frame.buffer_mut());
+    let area = frame.area();
+    let style = Style::default().add_modifier(Modifier::REVERSED);
+    let last = end.row.min(screen.len().saturating_sub(1));
+    for row in start.row..=last {
+        let text = screen.text(row);
+        let (from, to) = selection_columns(text, row, start, end, 0, screen.width());
+        // `if (columns.end <= columns.start) return line;` (`:1249`).
+        if to <= from {
+            continue;
+        }
+        let (Ok(x), Ok(y), Ok(width)) = (
+            u16::try_from(from),
+            u16::try_from(row),
+            u16::try_from(to.saturating_sub(from)),
+        ) else {
+            continue;
+        };
+        let rect = Rect {
+            x: area.x.saturating_add(x),
+            y: area.y.saturating_add(y),
+            width,
+            height: 1,
+        };
+        frame.buffer_mut().set_style(area.intersection(rect), style);
+    }
+}
+
 /// Begin a gesture — the press tail of pi's `handleSelectionMouseEvent` (`:1024-1046`).
 ///
 /// The click count picks the granularity: one press selects characters, two the word under the
@@ -515,30 +693,41 @@ pub(super) fn highlight(
 /// resolved range, so the selection is already visible before any drag, and records that range as
 /// the pivot every later extension turns around ([`SelectionState::initial`]).
 ///
-/// A press outside the document viewport is declined. Upstream instead falls back to whole-screen
-/// coordinates (`:822-826`) and lets a selection run over its chrome; cyrup's chrome is the shared
-/// [`crate::AppState`] editor, status band and selector slot that both renderers paint, and each
-/// already owns its pointer behaviour — so the report is passed on rather than claimed.
+/// # Where the press lands decides the rows
+/// A press inside the document viewport anchors on a document row; a press anywhere else anchors
+/// on a row of the frame as painted ([`Source::Screen`]) — upstream's `scrollView` set or absent
+/// (`getScrollViewsAt(…)[0]`, `:1029`, then `getSelectionPoint`, `:1149-1158`). The caller offers a
+/// press to the components that act on one first (the dock, the overlays), so what arrives here is
+/// a press no component took, and that is what makes the editor, the rules, the footer, the
+/// working band and the blank rows selectable.
+///
+/// A screen gesture carries no link: upstream finds one by looking for an OSC 8 escape in the row
+/// (`:1042`), and the dock paints none — the editor's text is typed text — so there is nothing
+/// under the pointer to activate.
 fn press(
     sel: &mut SelectionState,
     scroll: &ScrollState,
-    doc: &[Line<'_>],
-    viewport: Rect,
+    surface: Surface<'_>,
     ev: &MouseEvent,
 ) -> PointerOutcome {
     // `getScrollViewsAt(this.currentLayout, event.x, event.y)[0]` (`:1029`) reduced to cyrup's one
     // view — the containment test `layout.ts:384-386` performs, as [`super::wheel::route`] does it.
-    if !viewport.contains(Position::new(ev.column, ev.row)) {
-        return PointerOutcome::Ignored;
-    }
-    let Some(anchor) = point_at(scroll, doc, viewport, ev.column, ev.row) else {
+    let source =
+        if !surface.screen_only && surface.viewport.contains(Position::new(ev.column, ev.row)) {
+            Source::Document
+        } else {
+            Source::Screen
+        };
+    let Some(anchor) = locate(source, scroll, surface, ev.column, ev.row) else {
         return PointerOutcome::Ignored;
     };
     stop_auto_scroll(sel);
     sel.press_active = true;
-    let text = line_text(doc, anchor.row);
+    sel.source = source;
+    let rows = surface.rows(source);
+    let text = rows.text(anchor.row);
     let word = word_selection(&text, anchor);
-    let count = click_count(sel, anchor, word, Instant::now());
+    let count = click_count(sel, anchor, word, source, Instant::now());
     // `clickCount === 2 ? word : clickCount === 3 ? this.getLineSelection(anchor) : undefined`
     // (`:1034`). A double click on a column with no word under it resolves nothing and stays
     // character-granular, which is upstream's `range ? … : "character"` (`:1035`).
@@ -558,7 +747,7 @@ fn press(
     sel.dragged = false;
     // `this.pressedUrl = range ? undefined : getOsc8LinkAtColumn(…)` (`:1040-1046`): a word or line
     // press is a selection gesture and never a link click.
-    sel.pressed_url = if range.is_some() {
+    sel.pressed_url = if range.is_some() || source == Source::Screen {
         None
     } else {
         link_at(&text, anchor.col)
@@ -574,8 +763,7 @@ fn press(
 fn drag(
     sel: &mut SelectionState,
     scroll: &ScrollState,
-    doc: &[Line<'_>],
-    viewport: Rect,
+    surface: Surface<'_>,
     ev: &MouseEvent,
 ) -> PointerOutcome {
     // `if (!this.selectionPressActive || !this.selectionAnchor) return;` (`:1017`).
@@ -585,12 +773,19 @@ fn drag(
     sel.dragged = true;
     sel.last_click = None;
     sel.pressed_url = None;
-    // The point is CLAMPED into the viewport rather than rejected (`:806-811`), which is what lets
-    // a drag past the edge keep extending while [`update_auto_scroll`] brings more document to it.
-    if let Some(point) = point_at(scroll, doc, viewport, ev.column, ev.row) {
-        update_focus(sel, doc, point);
+    // The point is CLAMPED into the anchor's own rows rather than rejected (`:806-811`, `:1149-1158`):
+    // into the viewport for a document gesture, which is what lets a drag past the edge keep
+    // extending while [`update_auto_scroll`] brings more document to it, and into the frame for a
+    // screen gesture. So a drag that began in the document and ends over the dock keeps selecting
+    // document rows, and one that began in the dock selects screen rows wherever it goes.
+    if let Some(point) = locate(sel.source, scroll, surface, ev.column, ev.row) {
+        update_focus(sel, surface.rows(sel.source), point);
     }
-    update_auto_scroll(sel, viewport, ev);
+    match sel.source {
+        Source::Document => update_auto_scroll(sel, surface.viewport, ev),
+        // The screen is not a scroll view: nothing to bring under the pointer (`:1259-1262`).
+        Source::Screen => stop_auto_scroll(sel),
+    }
     PointerOutcome::Handled
 }
 
@@ -612,8 +807,7 @@ fn drag(
 fn release(
     sel: &mut SelectionState,
     scroll: &ScrollState,
-    doc: &[Line<'_>],
-    viewport: Rect,
+    surface: Surface<'_>,
     ev: &MouseEvent,
     copy_on_select: bool,
     toggle_at: ToggleAt<'_>,
@@ -626,11 +820,11 @@ fn release(
     stop_auto_scroll(sel);
     let (Some(anchor), Some(point)) = (
         sel.anchor,
-        point_at(scroll, doc, viewport, ev.column, ev.row),
+        locate(sel.source, scroll, surface, ev.column, ev.row),
     ) else {
         return PointerOutcome::Handled;
     };
-    update_focus(sel, doc, point);
+    update_focus(sel, surface.rows(sel.source), point);
     // `isClick` (`:1324-1328`): no drag, and the release is on the cell the gesture began on.
     let is_click = !sel.dragged && same_cell(anchor, point);
     let clicked_url = if is_click {
@@ -650,17 +844,41 @@ fn release(
     }
     // A click a component handles clears the selection and copies nothing (`:1342-1353`). Behind
     // the link test above, which is upstream's order: a URL under the pointer wins.
-    if is_click && let Some(hit) = toggle_at(point.row, point.col) {
+    if is_click
+        && sel.source == Source::Document
+        && let Some(hit) = toggle_at(point.row, point.col)
+    {
         clear_text_selection(sel);
         return PointerOutcome::Toggle(hit);
     }
-    // `if (this.copyOnSelect) void this.copySelectionToClipboard();` (`:1035`) — the selection
-    // itself is untouched either way, so the `Handled` arm below is upstream's bare
-    // `requestRender()` with nothing copied.
+    // The same click on a screen gesture is the application's to offer to its docked components
+    // (`dispatchMouseToLayout(clickEvent)`, `:1338-1341`); the selection waits for the answer.
+    if is_click && sel.source == Source::Screen {
+        let count = sel.last_click.map_or(1, |previous| previous.count);
+        return PointerOutcome::Click {
+            at: Position::new(ev.column, ev.row),
+            count,
+        };
+    }
+    finish_release(sel, surface.doc, surface.screen, copy_on_select)
+}
+
+/// The tail of a release no component took — pi's `if (this.copyOnSelect) void
+/// this.copySelectionToClipboard(); this.requestRender();` (`tui-alt-screen.ts:1355-1356`).
+///
+/// `copy_on_select` is the `fullscreenCopyOnSelect` setting (CFG-078), and it gates ONLY the copy:
+/// the selection itself is untouched either way, so the `Handled` arm is upstream's bare
+/// `requestRender()` with nothing copied.
+pub(super) fn finish_release(
+    sel: &SelectionState,
+    doc: &[Line<'_>],
+    screen: &ScreenRows,
+    copy_on_select: bool,
+) -> PointerOutcome {
     if !copy_on_select {
         return PointerOutcome::Handled;
     }
-    match selected_text(sel, doc) {
+    match selected_text(sel, doc, screen) {
         Some(text) => PointerOutcome::Copy(text),
         None => PointerOutcome::Handled,
     }
@@ -698,7 +916,7 @@ fn right_click_paste_applies(ev: &MouseEvent) -> bool {
 /// under the pointer and then choose which end of the *initial* range to anchor to, so dragging
 /// backwards past the word the gesture started on keeps whole words selected on that side rather
 /// than cutting the origin word in half (`:886-897`).
-fn update_focus(sel: &mut SelectionState, doc: &[Line<'_>], point: Point) {
+fn update_focus(sel: &mut SelectionState, rows: Rows<'_>, point: Point) {
     // `if (this.selectionGranularity === "character" || !this.selectionInitialRange)` (`:881`).
     if sel.granularity == Granularity::Character {
         sel.focus = Some(point);
@@ -708,7 +926,7 @@ fn update_focus(sel: &mut SelectionState, doc: &[Line<'_>], point: Point) {
         sel.focus = Some(point);
         return;
     };
-    let text = line_text(doc, point.row);
+    let text = rows.text(point.row);
     let range = if sel.granularity == Granularity::Word {
         word_selection(&text, point)
     } else {
@@ -738,10 +956,17 @@ fn update_focus(sel: &mut SelectionState, doc: &[Line<'_>], point: Point) {
 ///
 /// A press with no word under it records nothing (`:913-923`), which is upstream's way of saying an
 /// empty column cannot be the first half of a double click.
-fn click_count(sel: &mut SelectionState, point: Point, word: Option<Range>, now: Instant) -> u8 {
+fn click_count(
+    sel: &mut SelectionState,
+    point: Point,
+    word: Option<Range>,
+    source: Source,
+    now: Instant,
+) -> u8 {
     let count = match (word, sel.last_click) {
         (Some(range), Some(previous))
             if now.saturating_duration_since(previous.at) <= DOUBLE_CLICK_INTERVAL
+                && previous.source == source
                 && previous.row == point.row
                 && previous.word_start == range.start.col
                 && previous.word_end == range.end.col =>
@@ -756,6 +981,7 @@ fn click_count(sel: &mut SelectionState, point: Point, word: Option<Range>, now:
         row: point.row,
         word_start: range.start.col,
         word_end: range.end.col,
+        source,
     });
     count
 }
@@ -806,6 +1032,33 @@ fn stop_auto_scroll(sel: &mut SelectionState) {
     sel.auto = None;
 }
 
+/// The point a pointer position names in `source`'s rows — pi's `getSelectionPoint`
+/// (`tui-alt-screen.ts:1149-1158`): a document point clamped into the viewport, or a screen point
+/// clamped into the frame (`Math.max(0, Math.min(this.terminal.rows - 1, event.y))`, and the same
+/// for the column). `None` when the source has nothing to point at.
+fn locate(
+    source: Source,
+    scroll: &ScrollState,
+    surface: Surface<'_>,
+    column: u16,
+    row: u16,
+) -> Option<Point> {
+    match source {
+        Source::Document => point_at(scroll, surface.doc, surface.viewport, column, row),
+        Source::Screen => {
+            let (rows, width) = (surface.screen.len(), surface.screen.width());
+            if rows == 0 || width == 0 {
+                return None;
+            }
+            Some(Point {
+                row: usize::from(row).min(rows.saturating_sub(1)),
+                col: usize::from(column).min(width.saturating_sub(1)),
+                boundary: false,
+            })
+        }
+    }
+}
+
 /// The document point a pointer position names, clamped into the viewport — pi's
 /// `getScrollSelectionPoint` (`tui-alt-screen.ts:797-815`).
 ///
@@ -842,15 +1095,6 @@ fn point_at(
         ),
         boundary: false,
     })
-}
-
-/// The plain text of one document row — pi's `getSelectionSourceLine`
-/// (`tui-alt-screen.ts:828-834`), whose `lines[point.row] ?? ""` is this `unwrap_or_default`.
-///
-/// Concatenating a [`Line`]'s spans is [`std::fmt::Display`] for it (ratatui-core
-/// `text/line.rs:839-845`), and the result carries no styling — see [`selected_text`].
-fn line_text(doc: &[Line<'_>], row: usize) -> String {
-    doc.get(row).map(ToString::to_string).unwrap_or_default()
 }
 
 /// One segment of a row's word segmentation — the shape pi builds inside `getWordSelection`

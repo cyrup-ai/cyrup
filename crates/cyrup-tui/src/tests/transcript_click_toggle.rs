@@ -30,6 +30,7 @@ const ROWS: u16 = 24;
 fn fullscreen_app() -> App<TestBackend> {
     let mut app = App::new(TestBackend::new(COLS, ROWS), UiTheme::dark()).unwrap();
     app.state_mut().show_startup_hints = false;
+    app.state_mut().startup_header = crate::StartupHeader::Hidden;
     let _captured = app.enter_fullscreen_captured().expect("renderer builds");
     app
 }

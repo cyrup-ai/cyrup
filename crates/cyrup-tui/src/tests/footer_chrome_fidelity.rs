@@ -26,8 +26,8 @@ use std::time::Duration;
 use super::harness::*;
 use crate::{
     Action, App, BorderedLoader, COMPACT_HINT_ROWS, IndicatorKind, Key, Keymap, LoginDialog,
-    STARTUP_ONBOARDING, SelectAction, SelectKeymap, StatusIndicator, StatusLine, UiTheme,
-    compact_onboarding, format_tokens,
+    STARTUP_ONBOARDING, SelectAction, SelectKeymap, StartupDetails, StatusIndicator, StatusLine,
+    UiTheme, compact_onboarding, format_tokens,
 };
 use cyrup_provider::Provider;
 use cyrup_provider::faux::{FauxProvider, faux_assistant_message, faux_text};
@@ -990,7 +990,15 @@ fn c13_short_terminal_gives_up_the_edges_and_keeps_the_hint_bar() {
     let render = |rows: u16| -> Vec<String> {
         let mut terminal = Terminal::new(TestBackend::new(100, rows)).unwrap();
         terminal
-            .draw(|f| crate::render_compact_hints(f, Rect::new(0, 0, 100, rows), &theme, &keymap))
+            .draw(|f| {
+                crate::render_compact_hints(
+                    f,
+                    Rect::new(0, 0, 100, rows),
+                    &theme,
+                    &keymap,
+                    StartupDetails::Shown,
+                )
+            })
             .unwrap();
         let buf = terminal.backend().buffer().clone();
         (0..rows)
@@ -1060,17 +1068,17 @@ fn c13_narrow_terminal_wraps_the_block_instead_of_clipping_it() {
     let keymap = Keymap::default();
     // `compactInstructions` is 79 columns, `compactOnboarding` 60, `onboarding` 91.
     assert_eq!(
-        crate::compact_hint_height(&theme, &keymap, 100),
+        crate::compact_hint_height(&theme, &keymap, 100, StartupDetails::Shown),
         6,
         "content 98 ≥ 91: nothing wraps"
     );
     assert_eq!(
-        crate::compact_hint_height(&theme, &keymap, 80),
+        crate::compact_hint_height(&theme, &keymap, 80, StartupDetails::Shown),
         8,
         "content 78: the 79-column bar and the 91-column onboarding each take 2 rows"
     );
     assert_eq!(
-        crate::compact_hint_height(&theme, &keymap, 60),
+        crate::compact_hint_height(&theme, &keymap, 60, StartupDetails::Shown),
         9,
         "content 58: all three text rows take 2"
     );
@@ -1130,7 +1138,7 @@ fn c11_app_keymap_keys_label_joins_every_bound_key() {
         "the `more` hint"
     );
     assert_eq!(
-        compact_onboarding(&expand),
+        compact_onboarding(&expand, StartupDetails::Shown),
         "Press ctrl+o/ctrl+e to show full startup help and loaded resources."
     );
 
@@ -1171,12 +1179,12 @@ fn c13_mirror_onboarding_copy_follows_a_rebind() {
     let mut km = Keymap::default();
     km.set_action(Action::ToolsExpand, vec![Key::ctrl('t')]);
     assert_eq!(
-        compact_onboarding(&km),
+        compact_onboarding(&km, StartupDetails::Shown),
         "Press ctrl+t to show full startup help and loaded resources.",
         "the sentence is not frozen at compile time"
     );
     assert_eq!(
-        compact_onboarding(&Keymap::default()),
+        compact_onboarding(&Keymap::default(), StartupDetails::Shown),
         "Press ctrl+o to show full startup help and loaded resources."
     );
 }

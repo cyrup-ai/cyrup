@@ -508,6 +508,33 @@ impl Selector for LoginDialog {
         frame.render_widget(border_rule(bottom.width, theme), bottom);
     }
 
+    /// The armed prompt's `Input` sits in `contentContainer` as a bare child
+    /// (`login-dialog.ts:140`, `:160`), which forwards a press to it (`input.ts:229-243`); every
+    /// other row of the dialog is a `Text` and takes nothing. The field's row is the rule, the
+    /// title and the wrapped lines above it — the rows [`Self::render`] lays out.
+    fn pointer(&mut self, area: Rect, event: crate::app::Pointer) -> SelectorOutcome {
+        if self.input.is_none() {
+            return SelectorOutcome::Ignored;
+        }
+        let body = self.body_lines(area.width, None);
+        let above = body.get(..self.lines.len()).unwrap_or_default();
+        let above_h = crate::transcript::wrapped_height(above, usize::from(area.width));
+        let row = title_wrapped_height(&self.title, area.width)
+            .saturating_add(1)
+            .saturating_add(above_h.min(usize::from(u16::MAX)) as u16);
+        let Some(field) = self.input.as_mut() else {
+            return SelectorOutcome::Ignored;
+        };
+        if field
+            .input
+            .pointer_in_row(event, row, crate::selector::INPUT_PROMPT_COLS, area.width)
+        {
+            SelectorOutcome::Redraw
+        } else {
+            SelectorOutcome::Ignored
+        }
+    }
+
     fn handle(&mut self, key: &KeyEvent, keymap: &SelectKeymap) -> SelectorOutcome {
         // `handleInput` (`login-dialog.ts:222-232`): the cancel binding aborts the WHOLE login
         // (`cancel()` → `abortController.abort()` + reject "Login cancelled"); everything else goes

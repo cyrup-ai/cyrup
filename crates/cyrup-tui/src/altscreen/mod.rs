@@ -61,6 +61,11 @@
 //! `:301-302`). Both are wired
 //! ([`AltScreen::handle_mouse`] and [`AltScreen::handle_focus_lost`]).
 //!
+//! A press the application's own docked components did not act on reaches [`selection::route`]
+//! even when it is outside the document: it anchors a selection on [`screen::ScreenRows`], the
+//! cells the last [`AltScreen::draw_with`] painted, which is how the editor, the footer and the
+//! rest of the dock become selectable. `app/pointer.rs` explains which presses get there.
+//!
 //! [`selection`] sits behind that dispatcher in five positions — three of them the same arms
 //! [`scrollbar_drag`] names, immediately behind it. [`selection::route`] takes the press, drag
 //! and release [`scrollbar_drag::route`] declined, which is upstream's `if (!handled)
@@ -178,6 +183,7 @@ pub(crate) use out::{Captured, captured_text};
 /// stays `pub(super)` and reachable only from here.
 pub(crate) mod mouse;
 mod prompt_nav;
+mod screen;
 mod scroll;
 mod scrollbar_drag;
 mod selection;
@@ -190,6 +196,24 @@ mod wheel_scroll;
 /// The outcome of one pointer report, re-exported because `App::handle_input` matches on it —
 /// ADR-0005 §B-8's `Copy`/`Paste` arms are performed by the app, not by the renderer.
 pub use selection::PointerOutcome;
+
+/// Whether a modal overlay is up while a mouse report is routed — pi's `hasOverlay()` and the
+/// overlay hit test its mouse dispatcher runs first (`tui-alt-screen.ts:916-960`).
+///
+/// A modal owns the screen: the scrollbar cannot be grabbed (`getScrollbarTargetAt`, `:1037`), the
+/// wheel does not scroll the document (`shouldDeferViewportInputToOverlay`, `:660-662`, `:709`)
+/// and a text selection is made of the rows as painted, not of the document.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum Modal {
+    /// No overlay is open: the document and the scrollbar take the pointer.
+    #[default]
+    Absent,
+    /// An overlay is open and the pointer is somewhere else on the screen.
+    Open,
+    /// An overlay is open and the pointer is over its painted box, which did not take the report.
+    /// The "jump to latest" indicator is not offered the press either (`:915-918`).
+    Under,
+}
 /// The entry a click landed on, carried by [`PointerOutcome::Toggle`].
 pub use toggle::ToggleHit;
 
@@ -412,10 +436,17 @@ pub struct AltScreen<B: Backend> {
     flashes: flash::FlashStack,
     /// Inline-image placements and their eviction (§B-12).
     images: images::ImageLifecycle,
-    /// The rendered document — one entry per row, `set_document`'s first argument.
+    /// The rendered document — one entry per row, `set_document`'s first argument. It opens with
+    /// the header ([`prefix_rows`](Self::prefix_rows)), pi's `headerContainer`, which is the first
+    /// child of its `documentContainer` (`interactive-mode.ts:622-628` @v1.0.0).
     doc: Vec<Line<'static>>,
-    /// Entry index → first rendered row, for §B-10's prompt walk.
+    /// Entry index → first rendered row, for §B-10's prompt walk. **Absolute** rows: entry 0 starts
+    /// at [`prefix_rows`](Self::prefix_rows), not at 0.
     row_starts: Vec<usize>,
+    /// How many rows at the very top of [`doc`](Self::doc) belong to no entry — the header. A row
+    /// below this answers no click and starts no prompt; a front trim never removes them
+    /// ([`document::rows_dropped`]).
+    prefix_rows: usize,
     /// Per entry, the cells a left click toggles it from, relative to its first row — parallel to
     /// [`row_starts`](Self::row_starts). Empty for a fixture document.
     toggles: Vec<Option<ToggleRegion>>,
@@ -425,6 +456,12 @@ pub struct AltScreen<B: Backend> {
     /// The click regions of the in-flight turn's blocks, in the rows after
     /// [`committed_rows`](Self::committed_rows) — replaced together with [`live`](Self::live).
     live_toggles: std::sync::Arc<Vec<LiveToggle>>,
+    /// The OSC-8 link tables of the committed rows, one per run of rows that registered any
+    /// (TUI-020). The rows carry only an id in their spans' marker bits; the escape is written into
+    /// the cells once they exist, per table, in [`Self::draw_with`].
+    doc_links: Vec<document::LinkRun>,
+    /// The table of the in-flight turn's rows — [`Self::live`]'s, replaced together with it.
+    live_links: Option<std::sync::Arc<crate::osc::LinkSink>>,
     /// What [`doc`](Self::doc) and [`row_starts`](Self::row_starts) were built from, as one
     /// comparable value — [`document::DocumentKey`]. `None` is "never built", which is why that
     /// type is deliberately not `Default`: an empty document at width 0 must not be mistaken for a
@@ -461,6 +498,9 @@ pub struct AltScreen<B: Backend> {
     /// the wheel and the selection are addressed in. The whole screen until the first frame, and
     /// smaller than it whenever a dock is painted under the document.
     doc_area: Option<Rect>,
+    /// The cells the last frame painted, one string per row — the second row source of the text
+    /// selection ([`screen`]). Replaced at the end of every [`Self::draw_with`].
+    painted: screen::ScreenRows,
 }
 
 /// What the application paints around the alternate screen's scrolled document.
@@ -524,14 +564,18 @@ impl<B: Backend> AltScreen<B> {
             images,
             doc: Vec::new(),
             row_starts: Vec::new(),
+            prefix_rows: 0,
             toggles: Vec::new(),
             toggle_anchor: None,
             live_toggles: std::sync::Arc::default(),
+            doc_links: Vec::new(),
+            live_links: None,
             doc_key: None,
             doc_dropped: 0,
             committed_rows: 0,
             live: None,
             doc_area: None,
+            painted: screen::ScreenRows::default(),
         })
     }
 
@@ -571,7 +615,10 @@ impl<B: Backend> AltScreen<B> {
         self.live = None;
         self.doc = lines;
         self.row_starts = row_starts;
+        self.prefix_rows = 0;
         self.toggles.clear();
+        self.doc_links.clear();
+        self.live_links = None;
         // `draw` runs this every frame; doing it here too lets a test assert on `viewport_top` and
         // `max_scroll_top` before the first paint, as upstream does off `getViewport()`.
         let height = self
@@ -670,21 +717,26 @@ impl<B: Backend> AltScreen<B> {
     /// row count this renderer still holds at the moment of the call, plus how far
     /// `retained_dropped` has moved since that build ([`Self::doc_dropped`]). Deriving the number
     /// from the INCOMING map cannot work and is the silent mis-scroll R6 exists to prevent:
-    /// `row_starts.first()` of a freshly built document is `0` by construction, so
-    /// [`scroll::rebuild_rows`]'s `saturating_sub` would always be a no-op and a reader parked in
-    /// history would jump forward on every [`crate::transcript::MAX_RETAINED_ENTRIES`] trim and on
-    /// every [`crate::TranscriptView::clear_document`].
+    /// `row_starts.first()` of a freshly built document is its header height by construction, so
+    /// [`scroll::rebuild_rows`]'s `saturating_sub` would never see the dropped rows and a reader
+    /// parked in history would jump forward on every [`crate::transcript::MAX_RETAINED_ENTRIES`]
+    /// trim and on every [`crate::TranscriptView::clear_document`].
+    ///
+    /// `prefix_rows` is how many leading rows of `lines` are the header, before entry 0. The rows a
+    /// trim removes never include them ([`document::rows_dropped`]).
     pub(crate) fn set_document(
         &mut self,
         transcript: &TranscriptView,
         lines: Vec<Line<'static>>,
         row_starts: Vec<usize>,
+        prefix_rows: usize,
     ) {
         let dropped = transcript.retained_dropped();
         let rows_dropped = document::rows_dropped(
             &self.row_starts,
             dropped.saturating_sub(self.doc_dropped),
             self.committed_rows,
+            self.prefix_rows,
         );
         self.doc_dropped = dropped;
         scroll::rebuild_rows(&mut self.scroll, dropped, rows_dropped);
@@ -692,7 +744,9 @@ impl<B: Backend> AltScreen<B> {
         self.doc = lines;
         // A fresh build carries no in-flight rows; the next `sync_document` appends them.
         self.live = None;
+        self.live_links = None;
         self.row_starts = row_starts;
+        self.prefix_rows = prefix_rows;
     }
 
     /// The whole frame, in the fullscreen terminal's current geometry — the [`Rect`]
@@ -732,23 +786,31 @@ impl<B: Backend> AltScreen<B> {
     /// else, so a `/theme` switch or a hot reload during a fullscreen session would otherwise paint
     /// the scrollbar and the layout root in the theme that was live when the screen was entered.
     /// Keyed on [`UiTheme::generation`], which is what that setter bumps.
+    ///
+    /// `header` is the rows pi's `headerContainer` contributes — the extension header, else the
+    /// built-in startup block — already fitted to the content width. They are the **first rows of
+    /// the document** (`documentContainer = [headerContainer, loadedResourcesContainer,
+    /// chatContainer]`, `interactive-mode.ts:622-628` @v1.0.0), so they scroll away with the
+    /// conversation instead of being pinned above it.
     pub(crate) fn sync_document(
         &mut self,
         transcript: &TranscriptView,
         theme: &UiTheme,
         images: ImageOpts<'_>,
+        header: &[Line<'static>],
         live: &std::sync::Arc<Vec<Line<'static>>>,
     ) {
         if self.theme.generation != theme.generation {
             self.theme = theme.clone();
         }
         let width = usize::from(self.content_width());
-        let key = document::document_key(transcript, theme, width);
+        let key = document::document_key(transcript, theme, width, header);
         let rebuilt = self.doc_key != Some(key);
         if rebuilt {
-            let built = document::render_document(transcript, theme, width, images);
-            self.set_document(transcript, built.rows, built.row_starts);
+            let built = document::render_document(transcript, theme, width, images, header);
+            self.set_document(transcript, built.rows, built.row_starts, built.prefix_rows);
             self.toggles = built.toggles;
+            self.doc_links = built.links;
             self.doc_key = Some(key);
         }
         // The in-flight turn: the streaming reply, the running tools and the live bash block. They
@@ -765,6 +827,7 @@ impl<B: Backend> AltScreen<B> {
             self.live = Some(std::sync::Arc::clone(live));
             // Read right after `live_rows` filled the same cache the rows came from.
             self.live_toggles = transcript.live_toggles();
+            self.live_links = Some(transcript.live_links());
         }
         // An entry toggled since the last frame has just been rebuilt at its new height: put the
         // row the user clicked back where it was. Taken either way, so an anchor whose toggle
@@ -875,6 +938,10 @@ impl<B: Backend> AltScreen<B> {
             doc,
             images,
             doc_area,
+            painted,
+            doc_links,
+            live_links,
+            committed_rows,
             ..
         } = self;
         term.terminal_mut()
@@ -897,6 +964,17 @@ impl<B: Backend> AltScreen<B> {
                     .cloned()
                     .collect();
                 frame.render_widget(Paragraph::new(Text::from(visible)), viewport);
+                // TUI-020 — only now do the cells exist for the OSC-8 escapes to go into, and they
+                // go in before the selection highlight, the scrollbar or the dock touch them.
+                document::inject_links(
+                    frame.buffer_mut(),
+                    viewport,
+                    top,
+                    doc_links,
+                    live_links
+                        .as_deref()
+                        .map(|sink| (sink, *committed_rows..doc.len())),
+                );
 
                 if let Some(root) = layout_root.as_mut() {
                     root.render(frame, viewport, theme);
@@ -931,7 +1009,14 @@ impl<B: Backend> AltScreen<B> {
                 indicator::paint(indicator, bar, scroll, theme, frame, area, image_rows);
                 scroll::draw(bar, scroll, theme, frame, area);
                 chrome.paint(frame);
+                // A selection that began outside the document is painted over whatever the dock
+                // and the overlays put on the screen, then the flash is composited over it
+                // (`applySelection` before `compositeFlashes`, `tui-alt-screen.ts:1685-1686`).
+                selection::highlight_screen(selection, frame);
                 flash::overlay(flashes, frame, screen);
+                // `this.previousScreen = screen` (`:1750`): the frame as written, flash included,
+                // is what a press anchors on and a copy reads.
+                *painted = screen::ScreenRows::capture(frame.buffer_mut());
             })
             .map_err(|e| TuiError::Backend(e.to_string()))?;
         Ok(())
@@ -1023,11 +1108,25 @@ impl<B: Backend> AltScreen<B> {
     }
 
     /// Route a mouse report in pi's fixed precedence — the scrollbar first (`:526-604`), then
-    /// selection (`:605-963`), then the wheel. Returns the selection outcome the caller acts on.
+    /// selection (`:605-963`), then the wheel — with no modal up. Returns the selection outcome the
+    /// caller acts on. The application routes through [`Self::handle_mouse_under`].
+    #[cfg(test)]
     pub(crate) fn handle_mouse(
         &mut self,
         ev: &MouseEvent,
         area: Rect,
+    ) -> selection::PointerOutcome {
+        self.handle_mouse_under(ev, area, Modal::Absent)
+    }
+
+    /// [`Self::handle_mouse`] while an overlay may be open: with [`Modal::Open`] or
+    /// [`Modal::Under`] the report can only reach the text selection. The scrollbar, the wheel and
+    /// (under the overlay) the indicator belong to the screen beneath the modal, not to the user.
+    pub(crate) fn handle_mouse_under(
+        &mut self,
+        ev: &MouseEvent,
+        area: Rect,
+        modal: Modal,
     ) -> selection::PointerOutcome {
         let content_width = scroll::content_width(&self.bar, area.width);
         let viewport = Rect {
@@ -1037,14 +1136,21 @@ impl<B: Backend> AltScreen<B> {
         // `handleScrollToEndIndicatorMouseEvent` (`tui-alt-screen.ts:1018-1024`), tried ahead of the
         // scrollbar and its hover (`:916`). Only an unreleased, undragged left press counts; its
         // modifier bits are not tested upstream (`(button & 3) !== 0` masks just the button).
-        if matches!(ev.kind, MouseEventKind::Down(MouseButton::Left))
+        if modal != Modal::Under
+            && matches!(ev.kind, MouseEventKind::Down(MouseButton::Left))
             && indicator::contains(&self.indicator, Position::new(ev.column, ev.row))
         {
             scroll::scroll_to_bottom(&mut self.scroll);
             indicator::consume(&mut self.indicator);
             return selection::PointerOutcome::Handled;
         }
-        if scrollbar_drag::route(&mut self.drag, &mut self.bar, &mut self.scroll, ev, area) {
+        if modal == Modal::Under {
+            // `else { this.stopScrollbarHover(); }` (`:922`): the pointer is on the modal.
+            scroll::set_hover(&mut self.bar, &mut self.scroll, false);
+        }
+        if modal == Modal::Absent
+            && scrollbar_drag::route(&mut self.drag, &mut self.bar, &mut self.scroll, ev, area)
+        {
             // A report the scrollbar CLAIMED clears every selection field, which is upstream
             // clearing them when a thumb grab begins (`tui-alt-screen.ts:776-784`) — the pointer
             // now belongs to the thumb, so an in-flight selection must end rather than be extended
@@ -1057,8 +1163,12 @@ impl<B: Backend> AltScreen<B> {
         match selection::route(
             &mut self.selection,
             &self.scroll,
-            &self.doc,
-            viewport,
+            selection::Surface {
+                doc: &self.doc,
+                viewport,
+                screen: &self.painted,
+                screen_only: modal != Modal::Absent,
+            },
             ev,
             self.copy_on_select,
             &|row, col| {
@@ -1073,13 +1183,17 @@ impl<B: Backend> AltScreen<B> {
             },
         ) {
             selection::PointerOutcome::Ignored => {
-                if wheel::route(
-                    &mut self.scroll,
-                    &mut self.wheel,
-                    viewport,
-                    ev,
-                    Instant::now(),
-                ) {
+                // A focused overlay defers the viewport's wheel to itself (`:709`): nothing
+                // beneath the modal scrolls.
+                if modal == Modal::Absent
+                    && wheel::route(
+                        &mut self.scroll,
+                        &mut self.wheel,
+                        viewport,
+                        ev,
+                        Instant::now(),
+                    )
+                {
                     selection::PointerOutcome::Handled
                 } else {
                     selection::PointerOutcome::Ignored
@@ -1108,11 +1222,32 @@ impl<B: Backend> AltScreen<B> {
         let _ = selection::focus_lost(&mut self.selection);
     }
 
-    /// Drop any selection, finished or in flight — pi's `clearTextSelection()` (`tui-alt-screen.ts:
-    /// 893-902`), which a press that a component handled runs so the highlight does not linger under
-    /// a click the user meant for the editor.
+    /// Drop the selection, finished or in flight, keeping the multi-click counter running — pi's
+    /// `clearTextSelection()` (`tui-alt-screen.ts:893-902`), which a press or a click that a
+    /// component handled runs so the highlight does not linger under a gesture the user meant for
+    /// that component. It does not touch `lastClick` (`:893-902`), so a quick second click on the
+    /// same word still counts as the second of a double click.
     pub(crate) fn clear_selection(&mut self) {
+        selection::clear_text_selection(&mut self.selection);
+    }
+
+    /// Forget the selection AND the click ladder — pi's `cancel`-shaped reset (`:260-261`,
+    /// `:301-302`) for the rows a selection indexes having been replaced wholesale, as a session
+    /// swap does: a click on the new document must not continue a ladder built on the old one.
+    pub(crate) fn reset_selection(&mut self) {
         selection::cancel(&mut self.selection);
+    }
+
+    /// The end of a release whose click no component took: copy what is selected, if the setting
+    /// says to — the tail of `handleSelectionMouseEvent`'s release branch (`:1355-1356`) that
+    /// [`PointerOutcome::Click`] defers to the application.
+    pub(crate) fn finish_release(&self) -> selection::PointerOutcome {
+        selection::finish_release(
+            &self.selection,
+            &self.doc,
+            &self.painted,
+            self.copy_on_select,
+        )
     }
 
     /// Tear down in pi's order — `TuiBase.stop` (`tui.ts:752-762`): delete placements, repaint the
@@ -1123,7 +1258,27 @@ impl<B: Backend> AltScreen<B> {
     /// (`tui-alt-screen.ts:303`, via `components/alt-screen-flash.ts:38-41`). Nothing repaints
     /// after this point, so it is bookkeeping rather than a visible step, but it keeps the
     /// teardown a faithful pair for [`ViewportRenderer::flash`]'s queue.
+    ///
+    /// The whole document is repainted; production reaches the teardown through
+    /// [`Self::stop_skipping`], which this is `0` rows of.
+    #[cfg(test)]
     pub(crate) fn stop(&mut self, preserve_screen: bool) {
+        self.stop_skipping(preserve_screen, 0);
+    }
+
+    /// How many rows at the top of the document are the header — the rows a leave that hands the
+    /// header to the inline renderer must not write ([`Self::stop_skipping`]).
+    pub(crate) fn header_rows(&self) -> usize {
+        self.prefix_rows
+    }
+
+    /// [`Self::stop`], leaving the first `skip_rows` rows of the document out of the repaint.
+    ///
+    /// Pi's `switchTuiMode` re-renders the shared containers on the incoming renderer, so the
+    /// header is on screen once whichever renderer is live. cyrup's inline renderer keeps an
+    /// extension's header in a band of its own above the live region; the rows that band will
+    /// show must not also be written into scrollback.
+    pub(crate) fn stop_skipping(&mut self, preserve_screen: bool, skip_rows: usize) {
         flash::clear(&mut self.flashes);
         self.images.delete_all(preserve_screen);
         let width = self
@@ -1152,7 +1307,20 @@ impl<B: Backend> AltScreen<B> {
         // `LeaveAlternateScreen` or the rows are painted onto the alternate screen and torn down
         // with it — pi writes them inside `afterTerminalStop` (`tui-alt-screen.ts:322-327`) for
         // exactly that reason.
-        self.term.leave(preserve_screen, &self.doc, width);
+        // OSC-8 survives the leave: the rows carry only link markers, and the tables that resolve
+        // them go along (`exit::repaint`).
+        let repaint = exit::Repaint {
+            document: &self.doc,
+            skip: skip_rows,
+            links: document::DocLinks {
+                runs: &self.doc_links,
+                live: self
+                    .live_links
+                    .as_deref()
+                    .map(|sink| (sink, self.committed_rows..self.doc.len())),
+            },
+        };
+        self.term.leave(preserve_screen, &repaint, width);
     }
 
     /// The current selection's text, for ADR-0005 §B-11's `/copy` — upstream asks
@@ -1162,7 +1330,7 @@ impl<B: Backend> AltScreen<B> {
     /// assistant message.
     pub(crate) fn selection_text(&self) -> Option<String> {
         selection::has_selection(&self.selection)
-            .then(|| selection::selected_text(&self.selection, &self.doc))
+            .then(|| selection::selected_text(&self.selection, &self.doc, &self.painted))
             .flatten()
     }
 }

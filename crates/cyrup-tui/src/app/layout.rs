@@ -194,7 +194,12 @@ pub(crate) fn region_constraints(state: &mut AppState, width: u16, avail: u16) -
     // grows into instead of clipping them off.
     let hint =
         if state.show_startup_hints && state.selector.is_none() && !state.transcript.has_active() {
-            crate::chrome::compact_hint_height(&state.theme, &state.keymap, width)
+            crate::chrome::compact_hint_height(
+                &state.theme,
+                &state.keymap,
+                width,
+                state.startup_header.details(),
+            )
         } else {
             0
         };

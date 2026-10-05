@@ -27,6 +27,7 @@ mod image_auto_resize_file_args;
 mod image_bytecap;
 mod install_package_dir;
 mod list_models_session;
+mod model_scope_announce;
 mod models_json_resolution;
 mod stored_credentials;
 mod theme_boot_no_persist;

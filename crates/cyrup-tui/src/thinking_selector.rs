@@ -322,6 +322,16 @@ impl Selector for ThinkingSelector {
 
     fn pointer(&mut self, area: Rect, event: crate::app::Pointer) -> SelectorOutcome {
         let top = self.first_list_row(area.width);
+        // The search `Input` (`thinking-selector.ts:83-85`, a bare container child) is the row above
+        // the blank that closes the head: a press there places its caret.
+        if self.input.pointer_in_row(
+            event,
+            top.saturating_sub(2),
+            crate::selector::INPUT_PROMPT_COLS,
+            area.width,
+        ) {
+            return SelectorOutcome::Redraw;
+        }
         let available = area.height.saturating_sub(top);
         let answer = list_pointer(&mut self.list, top, available, event);
         list_outcome(

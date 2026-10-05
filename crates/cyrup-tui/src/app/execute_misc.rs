@@ -813,6 +813,13 @@ impl<B: Backend> App<B> {
                     self.set_fullscreen_wheel_scroll_lines(lines);
                     json = lines.to_json();
                 }
+                // `onQuietStartupChange(newValue === "header" ? "header" : newValue === "true")`
+                // (`settings-selector.ts:924` @v1.0.0): the boolean for `true`/`false`, the string
+                // for `header`, and `false` for anything else. The header decision itself is made
+                // once, at boot, so there is nothing live to push.
+                if id == "quietStartup" {
+                    json = cyrup_config::settings::QuietStartup::from_row_value(&value).to_json();
+                }
                 // Both theme-switch arms land here (the `/settings` confirm and an extension's
                 // `setTheme`), and both of pi's set `currentThemeSetting` as well as persisting
                 // (`setThemeSetting` / `setThemeName`, `theme-controller.ts:88-99` @v0.87.1), which
@@ -821,6 +828,9 @@ impl<B: Backend> App<B> {
                     && let Some(controller) = self.state.theme_controller.as_mut()
                 {
                     controller.set_current_setting(value.clone());
+                    // …and `setAutoSync(…)` (`theme-controller.ts:104-106`, `:119`): the mode is on
+                    // exactly while the new setting follows the terminal's appearance.
+                    self.sync_color_scheme_notifications();
                 }
                 // `outputPad` also takes effect ON SCREEN immediately (Pi `onOutputPadChange` →
                 // `this.outputPad = padding` + re-render, interactive-mode.ts:4127-4136), unlike the

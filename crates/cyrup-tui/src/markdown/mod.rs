@@ -52,6 +52,7 @@ use crate::text_width::spans_width;
 use crate::theme::UiTheme;
 use crate::transcript::is_ws_grapheme;
 
+mod autolink;
 mod highlight;
 
 mod latex;
@@ -145,9 +146,54 @@ pub fn render_with_default_style(
         theme,
         color,
         italic,
-        crate::image::hyperlinks_supported(),
+        MdLinks::process(),
         MermaidContext::OFF,
     )
+}
+
+/// [`render_with_default_style`] with the link context supplied by the caller: whether the
+/// terminal forwards OSC-8, and the table the link markers are issued from ([`MdLinks`]). What the
+/// transcript's own renderers use, so that a link in a reasoning block, a summary or a changelog is
+/// as clickable as one in an assistant reply.
+pub(crate) fn render_with_links(
+    text: &str,
+    width: usize,
+    theme: &UiTheme,
+    color: Option<ratatui::style::Color>,
+    italic: bool,
+    links: MdLinks<'_>,
+) -> Vec<Line<'static>> {
+    render_inner(
+        text,
+        width,
+        theme,
+        color,
+        italic,
+        links,
+        MermaidContext::OFF,
+    )
+}
+
+/// How a markdown render treats links: whether the terminal forwards OSC-8 (Pi's
+/// `getCapabilities().hyperlinks`, `markdown.ts:702`), and the table that issues the markers the
+/// link text is tagged with so [`crate::osc::inject`] can turn them into escapes once the cells
+/// exist (TUI-020). Without a table a link on a capable terminal still prints no ` (url)` suffix —
+/// pi's rule — but is not clickable.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct MdLinks<'a> {
+    pub(crate) enabled: bool,
+    pub(crate) sink: Option<&'a crate::osc::LinkSink>,
+}
+
+impl MdLinks<'static> {
+    /// The process-wide capability, no table: every caller that does not own the `Buffer` its rows
+    /// are painted into.
+    pub(crate) fn process() -> Self {
+        MdLinks {
+            enabled: crate::image::hyperlinks_supported(),
+            sink: None,
+        }
+    }
 }
 
 /// [`render`] with the terminal's OSC-8 hyperlink capability supplied explicitly instead of read
@@ -175,7 +221,10 @@ pub fn render_with_hyperlink_support(
         theme,
         None,
         false,
-        hyperlinks,
+        MdLinks {
+            enabled: hyperlinks,
+            sink: None,
+        },
         MermaidContext::OFF,
     )
 }
@@ -220,16 +269,9 @@ pub(crate) fn render_message(
     theme: &UiTheme,
     color: Option<ratatui::style::Color>,
     mermaid: MermaidContext,
+    links: MdLinks<'_>,
 ) -> Vec<Line<'static>> {
-    render_inner(
-        text,
-        width,
-        theme,
-        color,
-        false,
-        crate::image::hyperlinks_supported(),
-        mermaid,
-    )
+    render_inner(text, width, theme, color, false, links, mermaid)
 }
 
 fn render_inner(
@@ -238,7 +280,7 @@ fn render_inner(
     theme: &UiTheme,
     color: Option<ratatui::style::Color>,
     italic: bool,
-    hyperlinks: bool,
+    links: MdLinks<'_>,
     mermaid: MermaidContext,
 ) -> Vec<Line<'static>> {
     // Tabs → 3 spaces before parse (`markdown.ts:171`).
@@ -249,7 +291,8 @@ fn render_inner(
     r.math = math;
     r.default_text = color;
     r.default_italic = italic;
-    r.hyperlinks = hyperlinks;
+    r.hyperlinks = links.enabled;
+    r.sink = links.sink;
     r.mermaid = mermaid;
     // `user-message.ts:50-53` is the ONLY place in pi that sets `preserveOrderedListMarkers` /
     // `preserveBackslashEscapes`, and it sets them in the same options object as
@@ -265,7 +308,10 @@ fn render_inner(
     // `into_offset_iter` (rather than the plain event iterator) because two upstream behaviours are
     // defined on the *source* text, not on the event: the strict `~~`-only strikethrough tokenizer
     // (`markdown.ts:7-24`) and the too-narrow table fallback to `token.raw` (`markdown.ts:854-861`).
-    for (ev, range) in Parser::new_ext(&prepared, opts).into_offset_iter() {
+    let mut events = Parser::new_ext(&prepared, opts)
+        .into_offset_iter()
+        .peekable();
+    while let Some((ev, range)) = events.next() {
         // `case "escape": result += applyTextWithNewlines(preserveBackslashEscapes ? token.raw :
         // token.text)` (`markdown.ts:656`) reconstructed. pulldown-cmark has no escape event and —
         // unlike the `~~` case above — the run's OWN `raw` does not carry the backslash either:
@@ -277,6 +323,31 @@ fn render_inner(
             && matches!(ev, Event::Text(_))
             && start > 0
             && prepared.as_bytes().get(start - 1) == Some(&b'\\');
+        // GFM autolink literals (`https://...`, `www.`, `me@x.io`), which marked's `url` tokenizer
+        // makes links and pulldown-cmark leaves as text. A URL can span several `Text` events
+        // (pulldown-cmark splits at every `_`, `*`, `&`...), so the run is gathered first.
+        if let Event::Text(first) = &ev
+            && !escaped
+            && r.autolinks_apply()
+        {
+            let mut joined = first.to_string();
+            loop {
+                let more = match events.peek() {
+                    Some((Event::Text(next), next_range)) => {
+                        let backslash = r.preserve_escapes
+                            && next_range.start > 0
+                            && prepared.as_bytes().get(next_range.start - 1) == Some(&b'\\');
+                        (!backslash).then(|| next.to_string())
+                    }
+                    _ => None,
+                };
+                let Some(more) = more else { break };
+                joined.push_str(&more);
+                events.next();
+            }
+            r.text_with_autolinks(&joined);
+            continue;
+        }
         let raw = prepared.get(range).unwrap_or("");
         r.event(ev, raw, escaped);
     }
@@ -346,6 +417,15 @@ struct MdRenderer<'t> {
     /// `getCapabilities().hyperlinks` (`markdown.ts:692`): when the terminal forwards OSC-8, Pi
     /// prints the link text ONLY and never the ` (url)` suffix.
     hyperlinks: bool,
+    /// The table link markers are issued from (TUI-020), when the caller owns the `Buffer` the rows
+    /// are painted into; `None` renders a link with no marker.
+    sink: Option<&'t crate::osc::LinkSink>,
+    /// The marker of the link being rendered: its text spans carry it so [`crate::osc::inject`]
+    /// can wrap their cells in the OSC-8 escape.
+    link_mark: Option<Style>,
+    /// Open `Tag::Image` depth: an image's alt text is plain text, not somewhere to look for URLs
+    /// (marked's `image` token holds it raw).
+    image: u32,
     /// The mermaid transformer's gate (`mermaid.ts:62-70`): the live `markdown.mermaid` mode plus
     /// the `messageType` / `isStreaming` half of pi's `MarkdownTransformContext`. Default
     /// [`MermaidContext::OFF`] — every entry point but [`render_message`] leaves fences alone,

@@ -93,7 +93,7 @@ fn quiet_startup_hides_the_inventory_but_still_shows_load_failures() {
     // Pi's boot call passes `showDiagnosticsWhenQuiet: true` (`:1769`), so `quietStartup` silences
     // the listing ONLY. This is the whole point of the item: a broken extension must not be silent.
     let report = StartupReport {
-        quiet_startup: true,
+        quiet_startup: cyrup_config::settings::QuietStartup::On,
         extension_diagnostics: vec![StartupDiagnostic::plain(
             DiagnosticSeverity::Error,
             Some("~/.cyrup/extensions/todo".into()),
@@ -130,7 +130,7 @@ fn quiet_startup_hides_the_inventory_but_still_shows_load_failures() {
 fn verbose_overrides_quiet_startup_exactly_as_the_help_text_claims() {
     // `cli.rs:818` — "Force verbose startup (overrides quietStartup setting)".
     let report = StartupReport {
-        quiet_startup: true,
+        quiet_startup: cyrup_config::settings::QuietStartup::On,
         verbose: true,
         ..loud_report()
     };
@@ -144,7 +144,7 @@ fn verbose_overrides_quiet_startup_exactly_as_the_help_text_claims() {
 #[test]
 fn a_clean_quiet_startup_commits_nothing_at_all() {
     let report = StartupReport {
-        quiet_startup: true,
+        quiet_startup: cyrup_config::settings::QuietStartup::On,
         ..Default::default()
     };
     let (_app, out) = commit(&report);
@@ -164,7 +164,7 @@ fn each_diagnostic_family_gets_pis_own_header() {
         )
     };
     let report = StartupReport {
-        quiet_startup: true,
+        quiet_startup: cyrup_config::settings::QuietStartup::On,
         skill_diagnostics: vec![warn("bad skill")],
         prompt_diagnostics: vec![warn("bad prompt")],
         extension_diagnostics: vec![warn("bad extension")],
@@ -208,7 +208,7 @@ fn a_shadowed_skill_shows_the_winner_and_every_loser() {
     ];
     let home = PathBuf::from("/home/u");
     let report = StartupReport {
-        quiet_startup: true,
+        quiet_startup: cyrup_config::settings::QuietStartup::On,
         skill_diagnostics: resource_diagnostics(&diagnostics, ResourceKind::Skill, Some(&home)),
         prompt_diagnostics: resource_diagnostics(&diagnostics, ResourceKind::Prompt, Some(&home)),
         ..Default::default()
@@ -260,7 +260,7 @@ fn extension_load_errors_map_from_the_session_services_shape() {
     }];
     let home = PathBuf::from("/home/u");
     let report = StartupReport {
-        quiet_startup: true,
+        quiet_startup: cyrup_config::settings::QuietStartup::On,
         extension_diagnostics: extension_diagnostics(&errors, Some(&home)),
         ..Default::default()
     };
@@ -285,7 +285,7 @@ fn a_contained_native_init_failure_renders_under_extension_issues() {
         // Under `quietStartup` the LISTING is suppressed but the diagnostics are not
         // (`showDiagnosticsWhenQuiet: true`, interactive-mode.ts:1769) — the case that matters,
         // since a user who never sees the inventory must still see the failure.
-        quiet_startup: true,
+        quiet_startup: cyrup_config::settings::QuietStartup::On,
         extension_diagnostics: extension_diagnostics(&errors, Some(&PathBuf::from("/home/u"))),
         ..Default::default()
     };
@@ -318,7 +318,7 @@ fn startup_panel_rows_wrap_inside_the_frame() {
     let long_msg = "failed to instantiate: the module exported no `activate` entry point and the \
                     manifest declared an unknown capability";
     let report = StartupReport {
-        quiet_startup: true,
+        quiet_startup: cyrup_config::settings::QuietStartup::On,
         extension_diagnostics: vec![StartupDiagnostic::plain(
             DiagnosticSeverity::Error,
             Some(long_path.into()),
@@ -415,7 +415,7 @@ fn shortcut_conflict_warnings_join_the_extension_issues_block() {
     }]));
 
     let report = StartupReport {
-        quiet_startup: true,
+        quiet_startup: cyrup_config::settings::QuietStartup::On,
         extension_diagnostics: extension,
         ..Default::default()
     };
@@ -496,11 +496,11 @@ impl cyrup_ext::NativeExtension for FailingExt {
     }
 }
 
-/// A session whose effective settings carry `quietStartup: <quiet>` and whose build recorded one
-/// contained extension load failure.
+/// A session whose effective settings carry `quietStartup: <quiet>` (the JSON text of the value:
+/// `true`, `false` or `"header"`) and whose build recorded one contained extension load failure.
 async fn broken_extension_session(
     dir: &std::path::Path,
-    quiet: bool,
+    quiet: &str,
 ) -> std::sync::Arc<cyrup_session_svc::AgentSession> {
     let cwd = dir.join("project");
     let agent_dir = dir.join("agent");
@@ -543,7 +543,7 @@ async fn broken_extension_session(
 #[tokio::test]
 async fn the_panel_is_derivable_from_a_session_and_survives_quiet_startup() {
     let dir = tempfile::tempdir().unwrap();
-    let session = broken_extension_session(dir.path(), true).await;
+    let session = broken_extension_session(dir.path(), "true").await;
     assert_eq!(
         session.services().startup_diagnostics.extensions.len(),
         1,
@@ -570,12 +570,49 @@ async fn the_panel_is_derivable_from_a_session_and_survives_quiet_startup() {
     );
 }
 
+/// `quietStartup: "header"` keeps the header but, like `true`, hides the details: the listing is
+/// gated by `shouldShowStartupDetails` (`verbose || quietStartup === false`,
+/// `interactive-mode.ts:1415-1417`, `:1767` @v1.0.0), not by `quietStartup !== true`. The
+/// diagnostics survive either way, and `false` shows the listing.
+#[tokio::test]
+async fn the_header_value_hides_the_listing_like_true_but_not_the_diagnostics() {
+    let dir = tempfile::tempdir().unwrap();
+    for (stored, listing) in [("\"header\"", false), ("true", false), ("false", true)] {
+        let session = broken_extension_session(dir.path(), stored).await;
+        let mut app = new_app();
+        app.push_session_loaded_resources(&session);
+        app.draw().unwrap();
+        let out = app.scrollback_text();
+        assert_eq!(
+            out.contains("[Context]"),
+            listing,
+            "quietStartup {stored}: the listing:\n{out}"
+        );
+        assert!(
+            out.contains("[Extension issues]"),
+            "quietStartup {stored}: diagnostics are never suppressed:\n{out}"
+        );
+    }
+}
+
+/// `--verbose` forces the listing through `"header"` as it does through `true`.
+#[tokio::test]
+async fn verbose_overrides_the_header_value_for_the_listing() {
+    let dir = tempfile::tempdir().unwrap();
+    let session = broken_extension_session(dir.path(), "\"header\"").await;
+    let mut app = new_app();
+    app.set_verbose_startup(true);
+    app.push_session_loaded_resources(&session);
+    app.draw().unwrap();
+    assert!(app.scrollback_text().contains("[Context]"));
+}
+
 /// `--verbose` is pi's `options.verbose`, read inside `showListing` (`:1702`) — so it has to be
 /// held on the App, not passed at the single boot call site, or the re-emit could never honour it.
 #[tokio::test]
 async fn set_verbose_startup_overrides_quiet_startup_at_the_session_seam() {
     let dir = tempfile::tempdir().unwrap();
-    let session = broken_extension_session(dir.path(), true).await;
+    let session = broken_extension_session(dir.path(), "true").await;
 
     let mut app = new_app();
     app.set_verbose_startup(true);

@@ -124,7 +124,8 @@ async fn the_first_frame_is_loading_and_rows_arrive_as_progress() {
     let mut lp = StartupLoop {
         terminal: &mut terminal,
         events: &mut events,
-        theme: &theme,
+        theme: theme.clone(),
+        retheme: None,
         keymap: &keymap,
         inner: &mut picker,
         loads: Some(LoadDriver::new(loads(&fx))),
@@ -183,7 +184,8 @@ async fn a_streamed_row_can_be_picked_while_the_scan_is_stuck() {
     let lp = StartupLoop {
         terminal: &mut terminal,
         events: &mut events,
-        theme: &theme,
+        theme: theme.clone(),
+        retheme: None,
         keymap: &keymap,
         inner: &mut picker,
         loads: Some(LoadDriver::new(loads(&fx))),

@@ -10,8 +10,8 @@ use super::layer::{Settings, strip_global_only};
 use super::merge::deep_merge_settings;
 use super::store::SettingsStore;
 use super::types::{
-    FullscreenExitOutput, FullscreenScrollbar, MermaidRenderingMode, SettingsScope, TuiMode,
-    WheelScrollLines,
+    FullscreenExitOutput, FullscreenScrollbar, MermaidRenderingMode, QuietStartup, SettingsScope,
+    TuiMode, WheelScrollLines,
 };
 use crate::error::{ConfigError, ScopedError, SettingsLoadError};
 
@@ -426,6 +426,14 @@ impl SettingsManager {
             output.as_str(),
         )
         .await
+    }
+
+    /// `setQuietStartup` (Pi settings-manager.ts:1094-1098 @v1.0.0): GLOBAL scope — the boolean
+    /// `true`/`false`, or the string `"header"`. Read back through
+    /// [`EffectiveSettings::quiet_startup`].
+    pub async fn set_quiet_startup(&mut self, quiet: QuietStartup) -> Result<(), ConfigError> {
+        self.set(SettingsScope::Global, "quietStartup", quiet.to_json())
+            .await
     }
 
     /// `setFullscreenCopyOnSelect` (Pi settings-manager.ts:1237-1241 @v0.84.4): GLOBAL scope, and a

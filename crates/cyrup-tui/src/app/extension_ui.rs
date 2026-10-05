@@ -242,6 +242,9 @@ impl<B: Backend> App<B> {
         self.state.editor_focus_mirror.publish(has_focus);
         if let Some(access) = self.state.theme_access.as_ref() {
             access.publish_active(&self.state.theme.name);
+            if let Some(controller) = self.state.theme_controller.as_ref() {
+                access.publish_theme(controller);
+            }
         }
         // EXT-064 — the two frame-driven members of pi's `FooterDataProvider`. The third,
         // `extensionStatuses`, is NOT published here: `LiveHostServices::set_status` writes it

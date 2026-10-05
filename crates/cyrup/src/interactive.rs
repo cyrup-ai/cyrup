@@ -226,6 +226,28 @@ pub async fn run_interactive(
         initial_theme_setting.as_deref(),
         theme_setting.as_deref(),
     );
+    // Configurable keybindings (feature #2; Pi `KeybindingsManager.create`, keybindings.ts:348-352):
+    // the user's `~/.cyrup/keybindings.json`, read once here so the `Model scope:` line below can
+    // name the user's own cycle key, and merged into every live keymap further down.
+    let keybindings_path = session.services().agent_dir.join("keybindings.json");
+    let keybindings_json = std::fs::read_to_string(&keybindings_path).ok();
+
+    // Pi `init()` prints `Model scope: …` with `console.log` BEFORE its TUI mounts
+    // (`interactive-mode.ts:940-953` @v1.0.0). Doing the same here — a plain write ahead of
+    // `App::into_stdout` — is what puts the line in the terminal's scrollback above the inline
+    // region (the cursor probe inside `into_stdout` anchors the region BELOW it) and on the main
+    // screen, ahead of the alternate screen, in fullscreen, where it is out of sight until the
+    // alternate screen is left. Routing it through the interface instead would draw it inside the
+    // alternate screen, which is not what pi does.
+    announce_model_scope(
+        &mut std::io::stdout(),
+        &session,
+        verbose,
+        keybindings_json.as_deref(),
+        &controller.theme(),
+    )
+    .context("writing the model scope line")?;
+
     let mut app = App::into_stdout(controller.theme()).context("initialising the terminal UI")?;
 
     // ADR-0005 §B-14 — select the renderer before anything paints. The flag wins when supplied,
@@ -304,11 +326,9 @@ pub async fn run_interactive(
     // channel — not the answer — is what reaches the loop (`interactive-mode.ts:850-856`).
     app.set_package_update_channel(package_updates);
 
-    // Configurable keybindings (feature #2; Pi `KeybindingsManager.create`, keybindings.ts:348-352):
-    // load the user's `~/.cyrup/keybindings.json` and merge it into every live keymap (global/editor/
-    // selector/tree). Absent file ⇒ defaults; a malformed file logs to stderr and keeps the defaults.
-    let keybindings_path = session.services().agent_dir.join("keybindings.json");
-    if let Ok(json) = std::fs::read_to_string(&keybindings_path) {
+    // Merge the keybindings read above into every live keymap (global/editor/selector/tree).
+    // Absent file ⇒ defaults; a malformed file logs to stderr and keeps the defaults.
+    if let Some(json) = keybindings_json.as_deref() {
         // CFG-038 — `load_keybindings_json` no longer aborts on the first bad entry, so the two
         // outcomes are now genuinely different and are reported differently. `Err` really does mean
         // the whole document was ignored (unparseable JSON or a non-object top level, Pi's
@@ -319,7 +339,7 @@ pub async fn run_interactive(
         // Printed through the TUI's guarded stderr: the terminal is live, and pi's dead-terminal
         // handler covers `process.stderr` too (TUI-S02).
         let mut stderr = cyrup_tui::terminal_stderr();
-        match app.load_keybindings_json(&json) {
+        match app.load_keybindings_json(json) {
             Err(e) => {
                 let _ = writeln!(
                     stderr,
@@ -457,6 +477,31 @@ pub async fn run_interactive(
     let _ = app.restore();
     result.map_err(|e| anyhow::anyhow!("tui: {e}"))?;
     Ok(())
+}
+
+/// Pi's `Model scope: <ids> (<key> to cycle)` startup line (`interactive-mode.ts:940-953`
+/// @v1.0.0): written to `out` when the session has a scoped-model set and the startup details are
+/// shown (`--verbose`, or `quietStartup: false`). Returns whether a line was written.
+///
+/// Must run before `App::into_stdout`; see the call site in [`run_interactive`] for why.
+pub(crate) fn announce_model_scope<W: std::io::Write>(
+    out: &mut W,
+    session: &AgentSession,
+    verbose: bool,
+    keybindings_json: Option<&str>,
+    theme: &UiTheme,
+) -> std::io::Result<bool> {
+    let banner = cyrup_tui::ModelScopeBanner::for_startup(
+        &session.scoped_models(),
+        session.services().settings.effective().quiet_startup(),
+        verbose,
+        cyrup_tui::cycle_forward_keys(keybindings_json).as_deref(),
+        theme,
+    );
+    match banner {
+        Some(banner) => banner.write_to(out).map(|()| true),
+        None => Ok(false),
+    }
 }
 
 /// Settle the render theme against the terminal's own colours: ask for them, hand the controller to

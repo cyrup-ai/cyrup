@@ -47,6 +47,10 @@ pub use list::ListSelector;
 /// `login_dialog.rs`, all one column further right than upstream and all coloured.
 pub const INPUT_PROMPT: &str = "> ";
 
+/// The columns [`INPUT_PROMPT`] takes — the `2` of `Input.handleMouse`'s `Math.max(0, event.x - 2)`
+/// (`input.ts:231`), derived from the prompt rather than restated.
+pub(crate) const INPUT_PROMPT_COLS: u16 = INPUT_PROMPT.len() as u16;
+
 /// The complete rendered `Input` line: [`INPUT_PROMPT`] followed by the value + block caret
 /// ([`search_input_spans`]). The single composition point for every search box, so a dialog cannot
 /// drift into a prompt of its own again (S31).
@@ -83,11 +87,15 @@ pub fn input_line_spans(
 ///   end (`:397`), and `startCol` is one of three branches (`:404-413`): 0 when the caret is in the
 ///   first half-window, `totalWidth - scrollWidth` when it is in the last, else `cursorCol -
 ///   halfWidth` (caret centred).
-fn input_window(value: &str, cursor: usize, available: usize) -> (String, usize) {
+fn input_window(value: &str, cursor: usize, available: usize) -> InputWindow {
     let total = crate::text_width::str_width(value);
     // `if (totalWidth < availableWidth) { visibleText = this.value; }` (`:391-393`).
     if total < available {
-        return (value.to_string(), cursor);
+        return InputWindow {
+            text: value.to_string(),
+            caret: cursor,
+            start_col: 0,
+        };
     }
     // `const scrollWidth = this.cursor === this.value.length ? availableWidth - 1 : availableWidth`
     // (`:397`).
@@ -98,7 +106,11 @@ fn input_window(value: &str, cursor: usize, available: usize) -> (String, usize)
     };
     // The `else` of `if (scrollWidth > 0)` (`:418-421`): nothing fits, no caret.
     if scroll == 0 {
-        return (String::new(), 0);
+        return InputWindow {
+            text: String::new(),
+            caret: 0,
+            start_col: 0,
+        };
     }
     let cursor_col = crate::text_width::str_width(value.get(..cursor).unwrap_or(""));
     let half = scroll / 2;
@@ -118,7 +130,30 @@ fn input_window(value: &str, cursor: usize, available: usize) -> (String, usize)
         true,
     );
     let caret = before.len();
-    (visible, caret)
+    InputWindow {
+        text: visible,
+        caret,
+        start_col,
+    }
+}
+
+/// What [`input_window`] decided to show of an `Input` value.
+struct InputWindow {
+    /// The visible slice of the value.
+    text: String,
+    /// The caret's byte offset inside [`Self::text`].
+    caret: usize,
+    /// The value column [`Self::text`] starts at — pi's `renderedStartColumn` (`input.ts:445,
+    /// 459`), the number a press turns a pointer column back into a value column with.
+    start_col: usize,
+}
+
+/// The value column an `Input` of `value` with its caret at byte `cursor` shows at its left edge
+/// when it is `available` columns wide (the row width less the prompt) — `renderedStartColumn`,
+/// computed by the same [`input_window`] the paint uses, so a press cannot land against a window
+/// the paint did not draw.
+pub(crate) fn input_first_column(value: &str, cursor: usize, available: usize) -> usize {
+    input_window(value, cursor, available).start_col
 }
 
 /// Render an embedded selector **search `Input`** with a visible block cursor at the byte offset
@@ -144,8 +179,9 @@ pub fn search_input_spans(
         .find(|i| query.is_char_boundary(*i))
         .unwrap_or(0);
     // Everything below draws the WINDOW, with the caret at its window-local offset.
-    let (window, cursor) = input_window(query, cursor, available);
-    let query = window.as_str();
+    let window = input_window(query, cursor, available);
+    let cursor = window.caret;
+    let query = window.text.as_str();
     let cursor = cursor.min(query.len());
     let cursor = (0..=cursor)
         .rev()

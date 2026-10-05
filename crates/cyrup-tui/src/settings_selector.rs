@@ -5,7 +5,7 @@
 //! a windowed list of `SettingItem`s, each rendering a **label** on the left and the **current value**
 //! on the right, where `Enter`/`Space` **cycles** the value through a fixed set and applies it *live*
 //! (`onChange`) while the slot stays open — plus, all of it `SettingsList`'s own and none of it the
-//! shared `SelectList`'s, a search `Input`, a `min(30, widest)` label column, a `(i/n)` scroll
+//! shared `SelectList`'s, a search `Input`, a `min(36, widest)` label column, a `(i/n)` scroll
 //! readout, the highlighted row's wrapped description and a `Type to search …` hint (S16/S33).
 //! `/config` is a **different** upstream component ([`crate::config_selector`]) that only looks
 //! similar. The `/trust` picker (`trust-selector.ts`) is a small list
@@ -138,12 +138,12 @@ const SETTINGS_MAX_VISIBLE: usize = 10;
 /// (`settings-list.ts:93-96`). The first item is painted this many rows below the list's top.
 const SEARCH_ROWS: u16 = 2;
 
-/// `Math.min(30, …)` — the label column's upper bound (`settings-list.ts:121`). There is **no**
+/// `Math.min(36, …)` — the label column's upper bound (`settings-list.ts:132` @v1.0.0). There is **no**
 /// lower bound upstream: a list of short labels hugs them (S33). cyrup previously routed the rows
 /// through `ColumnLayout::SLASH` (`{primary_min: 12, primary_max: 32}`), which is
 /// `SLASH_COMMAND_SELECT_LIST_LAYOUT`'s policy on a *different* upstream component
 /// (`select-list.ts`), so short labels were padded out to 12 and long ones capped at 32.
-const LABEL_COLUMN_MAX: usize = 30;
+const LABEL_COLUMN_MAX: usize = 36;
 
 /// The two-space label↔value separator (`settings-list.ts:137`).
 const LABEL_VALUE_SEPARATOR: &str = "  ";
@@ -153,11 +153,27 @@ const LABEL_VALUE_SEPARATOR: &str = "  ";
 /// arm, never the `"  Enter/Space to change · Esc to cancel"` one.
 const SETTINGS_HINT: &str = "  Type to search · Enter/Space to change · Esc to cancel";
 
+/// `addHintLine`'s text for a list built without search (`settings-list.ts:243-245`).
+const SETTINGS_HINT_NO_SEARCH: &str = "  Enter/Space to change · Esc to cancel";
+
+/// A line of text above a [`SettingsSelector`]'s list, in the container that mounts the list
+/// (pi's `ThemeSubmenu.showAutomaticMenu` stacks a bold accent title, muted explanations and
+/// spacers over its `SettingsList`, `settings-selector.ts:332-338`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HeaderLine {
+    /// `theme.bold(theme.fg("accent", text))`.
+    Title(String),
+    /// `theme.fg("muted", text)`.
+    Muted(String),
+    /// `new Spacer(1)`.
+    Blank,
+}
+
 /// The `/settings` picker — a port of pi's `SettingsList` (`packages/tui/src/components/settings-list.ts`)
 /// as mounted by `SettingsSelectorComponent` (`settings-selector.ts:765,873,874`).
 ///
 /// **Not** a [`crate::select_list::SelectList`]. `SettingsList` is a separate upstream component
-/// with its own geometry (a `min(30, widest)` label column, a `"  "` separator, a `"→ "` accent
+/// with its own geometry (a `min(36, widest)` label column, a `"  "` separator, a `"→ "` accent
 /// cursor), its own search box, its own scroll readout, its own description block and its own hint
 /// row. Borrowing `SelectList`'s column policy for it was the root of S16/S33 — see the
 /// per-property citations on [`SettingsSelector::lines`].
@@ -185,6 +201,12 @@ pub struct SettingsSelector {
     /// The row a left press went down on, so the click that completes the gesture activates it even
     /// if the window slid under the pointer — pi's `mousePressedIndex` (`settings-list.ts:208-215`).
     pointer: RowPointer,
+    /// `options.enableSearch` (`settings-list.ts:70`). `/settings` enables it
+    /// (`settings-selector.ts:872`); the automatic-theme menu does not, so it has no search row, a
+    /// shorter hint, and Space always activates.
+    search: bool,
+    /// What the mounting container draws above the list.
+    header: Vec<HeaderLine>,
 }
 
 impl SettingsSelector {
@@ -197,9 +219,46 @@ impl SettingsSelector {
             selected: 0,
             input: crate::text_input::Input::new(),
             pointer: RowPointer::default(),
+            search: true,
+            header: Vec::new(),
         };
         sel.apply_filter();
         sel
+    }
+
+    /// A list built without `enableSearch` (`new SettingsList(items, n, theme, onChange, onCancel)`,
+    /// the default of `options.enableSearch ?? false`, `settings-list.ts:70`).
+    #[must_use]
+    pub fn without_search(mut self) -> Self {
+        self.search = false;
+        self.apply_filter();
+        self
+    }
+
+    /// Lines the container draws above the list.
+    #[must_use]
+    pub fn with_header(mut self, header: Vec<HeaderLine>) -> Self {
+        self.header = header;
+        self
+    }
+
+    /// Move the highlight to the row with `id` (`selectItem`, `settings-list.ts:84-89`); a no-op
+    /// when there is none.
+    pub fn select_id(&mut self, id: &str) {
+        if let Some(position) = self
+            .filtered
+            .iter()
+            .position(|&i| self.rows.get(i).is_some_and(|r| r.id == id))
+        {
+            self.selected = position;
+        }
+    }
+
+    /// The rows above the first item: the container's header, then the search row and its blank
+    /// when search is enabled.
+    fn rows_above_items(&self) -> u16 {
+        let header = u16::try_from(self.header.len()).unwrap_or(u16::MAX);
+        header.saturating_add(if self.search { SEARCH_ROWS } else { 0 })
     }
 
     /// The title the chrome opened this selector with. Never rendered — `SettingsSelectorComponent`
@@ -213,7 +272,8 @@ impl SettingsSelector {
     /// highlight to 0. `fuzzy::filter` is the port of `fuzzyFilter`, so an empty query keeps every
     /// row in its original order.
     fn apply_filter(&mut self) {
-        self.filtered = crate::fuzzy::filter(&self.rows, self.input.value(), |r| r.label.as_str())
+        let query = if self.search { self.input.value() } else { "" };
+        self.filtered = crate::fuzzy::filter(&self.rows, query, |r| r.label.as_str())
             .into_iter()
             .map(|m| m.index)
             .collect();
@@ -260,8 +320,8 @@ impl SettingsSelector {
         }
     }
 
-    /// `maxLabelWidth = Math.min(30, Math.max(...this.items.map((i) => visibleWidth(i.label))))`
-    /// — `settings-list.ts:121`. **S33.** Two things this spelling pins down:
+    /// `maxLabelWidth = Math.min(36, Math.max(...this.items.map((i) => visibleWidth(i.label))))`
+    /// — `settings-list.ts:132 @v1.0.0`. **S33.** Two things this spelling pins down:
     ///
     /// * the reduce is over **`this.items`**, the full row set, not `displayItems` — so the value
     ///   column does not jump sideways as the search narrows the list;
@@ -295,11 +355,30 @@ impl SettingsSelector {
         let width = usize::from(width);
         let mut lines: Vec<Line<'static>> = Vec::new();
 
+        // The container's own lines (the automatic-theme menu's title and explanations).
+        for line in &self.header {
+            lines.push(match line {
+                HeaderLine::Title(text) => Line::from(Span::styled(
+                    text.clone(),
+                    theme
+                        .accent_style()
+                        .add_modifier(ratatui::style::Modifier::BOLD),
+                )),
+                HeaderLine::Muted(text) => {
+                    Line::from(Span::styled(text.clone(), theme.muted_style()))
+                }
+                HeaderLine::Blank => Line::from(""),
+            });
+        }
+
         // `:93-96` — the search `Input` and the blank under it. Unconditional for `/settings`,
-        // which is constructed `{ enableSearch: true }` (`settings-selector.ts:872`).
+        // which is constructed `{ enableSearch: true }` (`settings-selector.ts:872`), absent for a
+        // list built without it.
         // [`crate::selector::input_line_spans`] is the shared `Input.render` port (S31), so the
         // prompt here is upstream's bare unstyled `"> "` at column 0, same as every other dialog's.
-        lines.extend(self.search_lines(width_u16, theme));
+        if self.search {
+            lines.extend(self.search_lines(width_u16, theme));
+        }
 
         // `:98-104` — no rows at all. NOT truncated upstream (only the "no matching" arm is), and
         // the hint follows because search is enabled.
@@ -308,7 +387,10 @@ impl SettingsSelector {
                 "  No settings available",
                 theme.dim_style(),
             )));
-            self.push_hint_line(&mut lines, width, theme);
+            // `:100-102` — the hint follows only when search is enabled.
+            if self.search {
+                self.push_hint_line(&mut lines, width, theme);
+            }
             return lines;
         }
 
@@ -331,7 +413,7 @@ impl SettingsSelector {
         let (start, end) = centered_window(self.selected, total, SETTINGS_MAX_VISIBLE);
 
         let label_w = self.label_column_width();
-        // `:138-139` — `usedWidth = prefixWidth + maxLabelWidth + visibleWidth(separator)`, then
+        // `:149-150` @v1.0.0 — `usedWidth = prefixWidth + maxLabelWidth + visibleWidth(separator)`, then
         // `valueMaxWidth = width - usedWidth - 2`. The trailing `- 2` is upstream's right gutter.
         let used = 2usize
             .saturating_add(label_w)
@@ -417,7 +499,15 @@ impl SettingsSelector {
     fn push_hint_line(&self, lines: &mut Vec<Line<'static>>, width: usize, theme: &UiTheme) {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
-            truncate_to_width(SETTINGS_HINT, width, "..."),
+            truncate_to_width(
+                if self.search {
+                    SETTINGS_HINT
+                } else {
+                    SETTINGS_HINT_NO_SEARCH
+                },
+                width,
+                "...",
+            ),
             theme.dim_style(),
         )));
     }
@@ -519,8 +609,8 @@ impl Selector for SettingsSelector {
         frame.render_widget(border_rule(bottom.width, theme), bottom);
     }
 
-    /// `SettingsList.handleMouse` (`settings-list.ts:179-220`): the search row and the blank under
-    /// it are not items (a press there is ignored), a wheel notch over the list moves the highlight
+    /// `SettingsList.handleMouse` (`settings-list.ts:179-220`): a press on the search row places
+    /// its caret, the blank under it is not an item, a wheel notch over the list moves the highlight
     /// one row without wrapping, a press highlights the row under the pointer and a click activates
     /// the row the press went down on exactly as `Enter` would — opening its submenu or cycling its
     /// value. Hover never reaches here, and so never moves the highlight.
@@ -536,11 +626,22 @@ impl Selector for SettingsSelector {
             .len()
             .min(usize::from(u16::MAX)) as u16;
         let [_, body, _] = Self::carve(local, body_h);
+        // `if (this.searchEnabled && this.searchInput) { if (event.y === 0) { … searchInput.
+        // handleMouse … } }` (`settings-list.ts:185-189`): the search `Input` is the first row of
+        // the body, and a press on it places its caret. The blank under it is nobody's (`:190`).
+        if self.input.pointer_in_row(
+            event,
+            body.y,
+            crate::selector::INPUT_PROMPT_COLS,
+            area.width,
+        ) {
+            return SelectorOutcome::Redraw;
+        }
         let len = self.filtered.len();
         // The wheel is the `SettingsList`'s from its first item down to its hint row; the rows the
         // slot was too short to paint are nobody's.
         let map = RowMap::windowed(
-            body.y.saturating_add(SEARCH_ROWS),
+            body.y.saturating_add(self.rows_above_items()),
             self.selected,
             len,
             SETTINGS_MAX_VISIBLE,
@@ -592,6 +693,20 @@ impl Selector for SettingsSelector {
         // (`settings-list.ts:192-195`), and the `Input` rejects control characters itself
         // (`input.ts:202-210`) — which is where that rejection now lives in cyrup too. The guard
         // made Ctrl+W / Ctrl+U / Ctrl+K / Alt+B / Alt+F / Alt+D unreachable in this dialog.
+        if !self.search {
+            // No search `Input`: `data === " "` activates unconditionally and nothing else is typed
+            // (`settings-list.ts:186-188`, `:192`).
+            return match key.code {
+                KeyCode::Char(' ')
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
+                    self.activate()
+                }
+                _ => SelectorOutcome::Ignored,
+            };
+        }
         match key.code {
             // `:187` — Space activates the row ONLY while the search box is empty; otherwise it is
             // a literal space typed into the query.
@@ -619,6 +734,9 @@ impl Selector for SettingsSelector {
     }
 
     fn handle_paste(&mut self, text: &str) -> SelectorOutcome {
+        if !self.search {
+            return SelectorOutcome::Ignored;
+        }
         self.input.paste(text);
         self.apply_filter();
         SelectorOutcome::Redraw

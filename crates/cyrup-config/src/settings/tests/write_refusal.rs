@@ -23,7 +23,7 @@ fn apply_overrides_deep_merges_onto_effective() {
         mgr.effective().compaction_reserve_tokens(None).unwrap(),
         4096
     );
-    assert!(mgr.effective().quiet_startup());
+    assert_eq!(mgr.effective().quiet_startup(), QuietStartup::On);
 
     // transient: a reload recomputes from the layers and drops the overrides.
     mgr.reload().unwrap();
@@ -31,7 +31,7 @@ fn apply_overrides_deep_merges_onto_effective() {
         mgr.effective().compaction_reserve_tokens(None).unwrap(),
         16384
     );
-    assert!(!mgr.effective().quiet_startup());
+    assert_eq!(mgr.effective().quiet_startup(), QuietStartup::Off);
 }
 
 #[tokio::test]
@@ -241,7 +241,7 @@ async fn cfg001_project_scope_is_latched_independently() {
     mgr.set(SettingsScope::Global, "quietStartup", true)
         .await
         .unwrap();
-    assert!(mgr.effective().quiet_startup());
+    assert_eq!(mgr.effective().quiet_startup(), QuietStartup::On);
 }
 
 #[tokio::test]
