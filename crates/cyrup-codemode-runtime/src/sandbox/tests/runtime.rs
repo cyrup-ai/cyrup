@@ -198,6 +198,7 @@ async fn an_unawaited_failing_call_does_not_fail_the_script() {
         r#"
         tools.fail();
         Promise.reject(new Error("nobody listens"));
+        for (let i = 0; i < 50000; i++) Promise.reject(i);
         await null;
         return "fine";
     "#,
@@ -669,7 +670,7 @@ async fn a_runaway_array_buffer_allocation_is_bounded_by_the_same_limit_and_is_c
         ("buffer slice", "a.push(seed.buffer.slice(0));"),
         (
             "buffer transfer",
-            "a.push(seed.buffer.slice(0).transfer());",
+            "a.push(new ArrayBuffer(8).transfer(1 << 22));",
         ),
         (
             "resize",

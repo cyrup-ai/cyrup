@@ -817,7 +817,7 @@ mod limits_and_lifetime {
     async fn runs_without_a_deadline_when_the_deadline_is_never() {
         let wait = tool_with(ToolDeclaration::new("wait"), |_, _| {
             Box::pin(async {
-                tokio::time::sleep(Duration::from_millis(50)).await;
+                tokio::time::sleep(Duration::from_millis(400)).await;
                 Ok(Some(json!("late")))
             })
         });
