@@ -110,6 +110,15 @@ impl Tool for RegisteredTool {
     fn label(&self) -> Option<&str> {
         self.inner.label()
     }
+    /// `outputSchema` (pi `AgentTool.outputSchema`, `agent/src/types.ts:472-476` @v1.0.1) survives
+    /// `wrapRegisteredTool` as every other field does — it is `{ ...tool, execute }`. It is what
+    /// tells a `codemode` script a nested call resolves to the tool's `structuredContent` rather
+    /// than its text, and what the script's declaration renders as, so a wrapper that kept the
+    /// trait default (`None`) turned every extension-registered tool with a structured output —
+    /// MCP tools among them — into one that resolves to a string.
+    fn output_schema(&self) -> Option<&Value> {
+        self.inner.output_schema()
+    }
     fn prompt_snippet(&self) -> Option<&str> {
         self.inner.prompt_snippet()
     }
@@ -257,6 +266,7 @@ mod tests {
         result: Result<Vec<String>, ()>,
         guidelines: Vec<String>,
         constrained: cyrup_core::ConstrainedSampling,
+        output_schema: Value,
     }
 
     #[async_trait::async_trait]
@@ -272,6 +282,9 @@ mod tests {
         }
         fn label(&self) -> Option<&str> {
             Some("Fixed Label")
+        }
+        fn output_schema(&self) -> Option<&Value> {
+            Some(&self.output_schema)
         }
         fn prompt_snippet(&self) -> Option<&str> {
             Some("fixed prompt snippet")
@@ -333,6 +346,7 @@ mod tests {
     fn tool(added: Vec<&str>) -> Arc<dyn Tool> {
         Arc::new(Fixed {
             params: serde_json::json!({}),
+            output_schema: serde_json::json!({"type": "object", "properties": {"n": {"type": "number"}}}),
             result: Ok(added.into_iter().map(str::to_string).collect()),
             guidelines: vec![
                 "use fixed sparingly".to_string(),
@@ -404,6 +418,7 @@ mod tests {
         let active = ScriptedActive::new(vec![Some(vec!["a"]), Some(vec!["a", "late"])]);
         let inner: Arc<dyn Tool> = Arc::new(Fixed {
             params: serde_json::json!({}),
+            output_schema: serde_json::json!({}),
             result: Err(()),
             guidelines: Vec::new(),
             // pi's explicit opt-OUT literal (`constrainedSampling: false`,
@@ -434,6 +449,12 @@ mod tests {
         assert_eq!(w.description(), "the fixed tool's description");
         assert_eq!(w.label(), inner.label());
         assert_eq!(w.label(), Some("Fixed Label"));
+        // `outputSchema` is what makes a `codemode` nested call resolve to `structuredContent`.
+        assert_eq!(w.output_schema(), inner.output_schema());
+        assert_eq!(
+            w.output_schema(),
+            Some(&serde_json::json!({"type": "object", "properties": {"n": {"type": "number"}}}))
+        );
         assert_eq!(w.prompt_snippet(), inner.prompt_snippet());
         assert_eq!(w.prompt_snippet(), Some("fixed prompt snippet"));
         // TOOL-021: the inner tool's guidelines are OWNED `String`s, so this delegation is only
