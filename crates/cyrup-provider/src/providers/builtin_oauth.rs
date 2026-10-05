@@ -1,11 +1,12 @@
 //! The `auth: { oauth: … }` clause of pi's built-in provider definitions.
 //!
-//! Ports the `lazyOAuth({ … })` expressions that pi v0.83.0/v0.84.4 puts on six built-in
-//! providers:
+//! Ports the `lazyOAuth({ … })` expressions that pi puts on seven built-in providers
+//! (v0.83.0/v0.84.4, plus `openai` at v1.0.0 — PROV-118):
 //!
 //! | provider | pi v0.84.4 source | `isSubscription` |
 //! |---|---|---|
 //! | `anthropic` | `ai/src/providers/anthropic.ts:50-54` | **true** (`:52`) |
+//! | `openai` | `ai/src/providers/openai.ts:14-19` @v1.0.1 | **true** (`:16`) |
 //! | `kimi-coding` | `ai/src/providers/kimi-coding.ts:14-19` | **true** (`:16`) |
 //! | `xai` | `ai/src/providers/xai.ts:15-20` | **true** (`:17`) |
 //! | `openrouter` | `ai/src/providers/openrouter.ts:14-18` | absent — metered, not a plan |
@@ -39,6 +40,7 @@
 use crate::auth::OAuthAuth;
 use crate::auth::oauth::anthropic::AnthropicOAuth;
 use crate::auth::oauth::kimi_coding::KimiCodingOAuth;
+use crate::auth::oauth::openai_chatgpt::OpenAiChatGptOAuth;
 use crate::auth::oauth::openrouter::OpenRouterOAuth;
 use crate::auth::oauth::radius::{RadiusOAuth, RadiusOptions};
 use crate::auth::oauth::xai::XaiOAuth;
@@ -54,6 +56,12 @@ pub fn builtin_provider_oauth(provider_id: &str) -> Option<Arc<dyn OAuthAuth>> {
         // `lazyOAuth({ name: "Kimi Code (subscription)", isSubscription: true, loginLabel: … })`
         // (`providers/kimi-coding.ts:14-19`).
         "kimi-coding" => Some(Arc::new(KimiCodingOAuth::new())),
+        // PROV-118 — `lazyOAuth({ name: "OpenAI (ChatGPT subscription)", isSubscription: true,
+        // loginLabel: "Sign in with ChatGPT", load: loadOpenAIChatGPTOAuth })`
+        // (`providers/openai.ts:14-19` @v1.0.1). This sits BESIDE openai's api key, so the
+        // provider offers both; `providers/openai-codex.ts:10`'s "OpenAI Codex (legacy)" rename
+        // is how `/login` tells the two ChatGPT-backed options apart.
+        "openai" => Some(Arc::new(OpenAiChatGptOAuth::new())),
         // `lazyOAuth({ name: "xAI (Grok/X subscription)", isSubscription: true, loginLabel: … })`
         // (`providers/xai.ts:15-20`).
         "xai" => Some(Arc::new(XaiOAuth::new())),
@@ -84,15 +92,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_the_five_built_ins_carry_oauth() {
-        for id in ["anthropic", "kimi-coding", "xai", "openrouter", "radius"] {
+    fn only_the_six_built_ins_carry_oauth() {
+        for id in [
+            "anthropic",
+            "kimi-coding",
+            "openai",
+            "xai",
+            "openrouter",
+            "radius",
+        ] {
             assert!(
                 builtin_provider_oauth(id).is_some(),
                 "{id} wires lazyOAuth upstream"
             );
         }
         for id in [
-            "openai",
             "google",
             "groq",
             "deepseek",
@@ -113,7 +127,7 @@ mod tests {
     /// subscriptions", asserted through the provider clause that actually reaches a user.
     #[test]
     fn subscription_split_matches_upstream() {
-        for id in ["anthropic", "kimi-coding", "xai"] {
+        for id in ["anthropic", "kimi-coding", "openai", "xai"] {
             let oauth = builtin_provider_oauth(id).expect("oauth");
             assert!(oauth.is_subscription(), "{id} is subscription-backed");
         }

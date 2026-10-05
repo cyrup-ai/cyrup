@@ -14,7 +14,13 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 /// Provider/account-limit errors that are NOT transient and must never be retried (Pi
-/// `NON_RETRYABLE_PROVIDER_LIMIT_ERROR_PATTERN`, retry.ts:7-24).
+/// `NON_RETRYABLE_PROVIDER_LIMIT_ERROR_PATTERN`, retry.ts:7-28 @v1.0.1).
+///
+/// PROV-118: `"subscription_sharing_usage_limit_exceeded"` (`retry.ts:27`) joined this set with
+/// "Sign in with ChatGPT". It belongs on the NON-retryable side — upstream's comment: "Sign in
+/// with ChatGPT: the subscription's shared usage limit, which resets after hours rather than
+/// seconds." Backing off on it burns the whole retry budget against a limit that will not lift.
+/// It is the same literal `crate::api::openai_responses`'s catch keys the ChatGPT-usage hint on.
 const NON_RETRYABLE_PROVIDER_LIMIT_PATTERNS: &[&str] = &[
     // OpenCode Go/free-tier subscription limits returned as 429 JSON error types.
     "GoUsageLimitError",
@@ -27,6 +33,9 @@ const NON_RETRYABLE_PROVIDER_LIMIT_PATTERNS: &[&str] = &[
     "out of budget",
     "quota exceeded",
     "billing",
+    // PROV-118 — Sign in with ChatGPT: the subscription's shared usage limit, which resets after
+    // hours rather than seconds (`retry.ts:25-27`).
+    "subscription_sharing_usage_limit_exceeded",
 ];
 
 /// Transient provider/transport errors that ARE retryable (Pi `RETRYABLE_PROVIDER_ERROR_PATTERN`,
@@ -113,6 +122,11 @@ const RETRYABLE_PROVIDER_PATTERNS: &[&str] = &[
     "please retry your request",
     // gRPC based providers (e.g. NVIDIA NIM).
     "ResourceExhausted",
+    // PROV-118 — Sign in with ChatGPT: usage or user data temporarily unavailable. Upstream's
+    // comment adds why these are not merely 503s: "Usage failures can arrive mid-stream without
+    // an HTTP 503 in the message." (`retry.ts:98-101`).
+    "subscription_sharing_usage_unavailable",
+    "subscription_sharing_user_unavailable",
 ];
 
 fn non_retryable_regex() -> &'static Regex {
@@ -460,6 +474,35 @@ mod tests {
             assert!(
                 !is_retryable_assistant_error(&err(StopReason::Error, Some(msg))),
                 "should NOT be retryable: {msg}"
+            );
+        }
+    }
+
+    /// PROV-118 — the three `subscription_sharing_*` literals `02eed88fd` added, each on the side
+    /// upstream puts it on (`retry.ts:25-27`, `:98-101`). The split is the behaviour: the usage
+    /// LIMIT resets in hours, so retrying it burns the budget for nothing, while the two
+    /// "temporarily unavailable" codes are exactly what a retry is for.
+    #[test]
+    fn subscription_sharing_literals_are_classified_on_upstreams_sides() {
+        // `retry.ts:27` — non-retryable.
+        let limit = "429 Too Many Requests: subscription_sharing_usage_limit_exceeded";
+        assert!(
+            !is_retryable_assistant_error(&err(StopReason::Error, Some(limit))),
+            "the shared-subscription usage limit must NOT be retried: {limit}"
+        );
+        // ...and it wins over the retryable `429` in the same string, which is the only reason the
+        // literal has to be in the non-retryable set at all.
+        assert!(limit.contains("429"));
+
+        // `retry.ts:100-101` — retryable. Upstream's comment notes these can arrive mid-stream
+        // with no HTTP status in the text, so neither string carries one here.
+        for msg in [
+            "subscription_sharing_usage_unavailable",
+            "subscription_sharing_user_unavailable",
+        ] {
+            assert!(
+                is_retryable_assistant_error(&err(StopReason::Error, Some(msg))),
+                "must be retried: {msg}"
             );
         }
     }

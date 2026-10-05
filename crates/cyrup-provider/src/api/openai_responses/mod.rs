@@ -47,7 +47,7 @@ use crate::model::Model;
 use crate::stream::StreamOptions;
 use crate::stream::sse::SseRequest;
 use crate::utils::provider_plumbing::connect_sse;
-use auth::resolve_api_key;
+use auth::ResponsesCredential;
 use cyrup_core::{ApiId, CancelToken};
 use headers::build_headers;
 use params::try_build_params;
@@ -109,10 +109,12 @@ impl ApiImpl for OpenAiResponsesApi {
             }
         };
 
-        // getClientApiKey (openai-responses.ts:37-41): an explicit key wins; otherwise an
+        // getClientApiKey (openai-responses.ts:58-63): an explicit key wins; otherwise an
         // authorization / cf-aig-authorization header lets the key be the literal "unused".
-        let api_key = match resolve_api_key(auth, opts) {
-            Some(k) => k,
+        // PROV-118: the resolved credential arrives WITH its `isChatGPTSignIn` classification, so
+        // the body builder below cannot be reached without one — see `auth::ResponsesTokenKind`.
+        let credential = match ResponsesCredential::resolve(model, auth, opts) {
+            Some(c) => c,
             None => {
                 let e = ProviderError::Transport(
                     format!("No API key for provider: {}", model.provider).into(),
@@ -125,7 +127,8 @@ impl ApiImpl for OpenAiResponsesApi {
 
         // PROV-011: an unsatisfiable `constrainedSampling` fails the turn before any HTTP, with
         // pi's own message.
-        let params = match try_build_params(model, ctx, opts, auth.env.as_ref()) {
+        let params = match try_build_params(model, ctx, opts, auth.env.as_ref(), credential.kind())
+        {
             Ok(p) => p,
             Err(e) => {
                 let e = ProviderError::from(e);
@@ -140,7 +143,7 @@ impl ApiImpl for OpenAiResponsesApi {
         // `models.ts:657` @v0.84.4); its return value is what goes on the wire.
         let headers = crate::stream::apply_transform_headers(
             opts,
-            build_headers(model, ctx, auth, opts, &api_key),
+            build_headers(model, ctx, auth, opts, credential.api_key()),
         )
         .await;
         let req = SseRequest {
@@ -152,7 +155,18 @@ impl ApiImpl for OpenAiResponsesApi {
             flush_at_eof: false,
         };
 
-        let Some(frames) = connect_sse(req, model, auth, opts, cancel, &sink).await else {
+        // PROV-118 — upstream's hint sits in the catch around the WHOLE of `stream`
+        // (`openai-responses.ts:215-232`), which includes the HTTP failure. `connect_sse` emits
+        // its own terminal event, so it is given a local sink and anything it pushed is forwarded
+        // through `hint_terminal_error`. It sends at most one event and only on failure, so the
+        // buffer cannot fill.
+        let (probe, mut probe_rx) = crate::api::channel(4);
+        let frames = connect_sse(req, model, auth, opts, cancel, &probe).await;
+        drop(probe);
+        let Some(frames) = frames else {
+            while let Some(event) = probe_rx.recv().await {
+                sink.send(errors::hint_terminal_error(event)).await;
+            }
             return;
         };
 

@@ -2,7 +2,7 @@
 //! the decoder state and the SSE frame loop.
 
 use super::blocks::{RBlock, project_block};
-use super::errors::emit_error;
+use super::errors::{emit_error, hint_terminal_error};
 use super::events::{ProcessResult, process_event};
 use super::slots::SlotKind;
 use crate::api::EventSink;
@@ -193,8 +193,14 @@ pub(crate) async fn decode_stream_with_end_turn<S>(
         let frame = match frame {
             Ok(f) => f,
             Err(e) => {
-                sink.send(e.into_error_event(provider, &model_id, Some(model.api.clone())))
-                    .await;
+                // PROV-118 — a mid-stream transport failure lands in the same catch upstream
+                // (`openai-responses.ts:215-232`), so it gets the same ChatGPT-usage hint.
+                sink.send(hint_terminal_error(e.into_error_event(
+                    provider,
+                    &model_id,
+                    Some(model.api.clone()),
+                )))
+                .await;
                 return;
             }
         };

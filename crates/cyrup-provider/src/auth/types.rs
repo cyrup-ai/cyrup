@@ -8,7 +8,14 @@ pub type ProviderEnv = BTreeMap<String, String>;
 
 /// A persisted credential (func-01 §7.2). serde tag `type = api_key | oauth`; the OAuth `ext` map
 /// flattens provider-specific fields (Copilot endpoint, etc.) for Pi `auth.json` interop (R-00-013).
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+///
+/// **`Debug` is hand-written and redacting** ([`Credential`]'s impl below). It used to be derived,
+/// which printed `key`, `access` and `refresh` in the clear into any `{:?}` — a leak
+/// `cyrup-mcp/src/credentials.rs:96-97` already named as "the pattern **not** to copy". Every
+/// field that can hold token material renders as `<redacted>`; the non-secret shape (which variant,
+/// whether a key is present, the expiry, the `ext` keys) is kept, because that is what a
+/// `Debug` render is read for. Do not re-derive it.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Credential {
     ApiKey {
@@ -52,6 +59,41 @@ impl Credential {
         match self {
             Credential::ApiKey { .. } => CredentialType::ApiKey,
             Credential::Oauth { .. } => CredentialType::Oauth,
+        }
+    }
+}
+
+/// The placeholder every secret-bearing field renders as.
+pub(crate) const REDACTED: &str = "<redacted>";
+
+impl std::fmt::Debug for Credential {
+    /// Redacting. `key`, `access` and `refresh` are token material and never render; `ext` renders
+    /// its **keys only**, because its values are provider-specific and a provider is free to put a
+    /// second secret there (an endpoint today, a token tomorrow). What survives is what a reader
+    /// actually needs: which variant this is, whether a key is set, when it expires, and which
+    /// extension fields it carries.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Credential::ApiKey { key, env } => f
+                .debug_struct("Credential::ApiKey")
+                .field("key", &key.as_ref().map(|_| REDACTED))
+                .field(
+                    "env_keys",
+                    &env.as_ref().map(|e| e.keys().collect::<Vec<_>>()),
+                )
+                .finish(),
+            Credential::Oauth {
+                refresh: _,
+                access: _,
+                expires,
+                ext,
+            } => f
+                .debug_struct("Credential::Oauth")
+                .field("access", &REDACTED)
+                .field("refresh", &REDACTED)
+                .field("expires", expires)
+                .field("ext_keys", &ext.keys().collect::<Vec<_>>())
+                .finish(),
         }
     }
 }

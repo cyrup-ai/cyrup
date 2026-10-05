@@ -1,6 +1,7 @@
 //! Request encoding: the Responses request body (Pi `buildParams`,
 //! openai-responses.ts:231-279).
 
+use super::auth::ResponsesTokenKind;
 use super::convert::convert_responses_messages;
 use super::options::{reasoning_summary_or_auto, reasoning_summary_wire};
 use super::tools::{ConvertResponsesToolsOptions, convert_responses_tools};
@@ -84,7 +85,22 @@ pub(crate) fn build_params(
     opts: &StreamOptions,
     env: Option<&ProviderEnv>,
 ) -> Value {
-    try_build_params(model, ctx, opts, env)
+    build_params_for(model, ctx, opts, env, ResponsesTokenKind::ApiKey)
+}
+
+/// [`build_params`] for a chosen credential kind. `#[cfg(test)]` only — production reaches
+/// [`try_build_params`], whose `token` parameter has no default, so the PROV-118 classification
+/// cannot be skipped on a real request.
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+pub(crate) fn build_params_for(
+    model: &Model,
+    ctx: &Context,
+    opts: &StreamOptions,
+    env: Option<&ProviderEnv>,
+    token: ResponsesTokenKind,
+) -> Value {
+    try_build_params(model, ctx, opts, env, token)
         .expect("fixture declares no unsatisfiable constrained sampling")
 }
 
@@ -98,8 +114,17 @@ pub(super) fn try_build_params(
     ctx: &Context,
     opts: &StreamOptions,
     env: Option<&ProviderEnv>,
+    token: ResponsesTokenKind,
 ) -> Result<Value, ConstrainedSamplingError> {
     let compat = get_responses_compat(model);
+    // PROV-118. `const omitUnsupportedFields = isChatGPTSignIn(model, options?.apiKey)`
+    // (`openai-responses.ts:329-330` @v1.0.1), with upstream's comment at `:328`: "Sign in with
+    // ChatGPT rejects these request fields." `token` is a REQUIRED parameter rather than an
+    // `Option` or a `bool` default, and its only source is
+    // [`super::auth::ResponsesCredential::resolve`], so a caller cannot reach this builder without
+    // having classified the credential it is about to send. The four omissions are marked
+    // `PROV-118` below; nothing else on the body changes.
+    let omit_unsupported_fields = token.omit_unsupported_fields();
 
     // --- DRIFT-001 deferred-tool placement (Pi openai-responses.ts:267-274) ---
     //
@@ -154,10 +179,16 @@ pub(super) fn try_build_params(
             json!(clamp_openai_prompt_cache_key(sid.as_str())),
         );
     }
-    if let Some(retention) = prompt_cache_retention(&compat, cache) {
+    // PROV-118 (1/4) — `prompt_cache_retention: omitUnsupportedFields ? undefined : …` (`:335`).
+    if let Some(retention) =
+        prompt_cache_retention(&compat, cache).filter(|_| !omit_unsupported_fields)
+    {
         obj.insert("prompt_cache_retention".to_string(), json!(retention));
     }
-    if let Some(options) = prompt_cache_options(&compat, cache) {
+    // PROV-118 (2/4) — `prompt_cache_options: omitUnsupportedFields ? undefined : …` (`:336`).
+    // Note `prompt_cache_key` above is NOT omitted (`:334`); the set is exactly these four.
+    if let Some(options) = prompt_cache_options(&compat, cache).filter(|_| !omit_unsupported_fields)
+    {
         obj.insert("prompt_cache_options".to_string(), options);
     }
     obj.insert("store".to_string(), json!(false));
@@ -166,9 +197,11 @@ pub(super) fn try_build_params(
     // = Math.max(options.maxTokens, OPENAI_RESPONSES_MIN_OUTPUT_TOKENS)` (openai-responses.ts:321-322
     // @v0.87.1; the compat gate is PROV-093). The `.filter` reproduces pi's JS truthiness gate, so
     // `Some(0)` omits the key rather than sending `0`.
+    //
+    // PROV-118 (3/4) — `&& !omitUnsupportedFields` (`:340`, assigned `:341`).
     if let Some(max) = opts
         .max_tokens
-        .filter(|m| *m > 0 && compat.supports_max_output_tokens)
+        .filter(|m| *m > 0 && compat.supports_max_output_tokens && !omit_unsupported_fields)
     {
         obj.insert(
             "max_output_tokens".to_string(),
@@ -180,9 +213,10 @@ pub(super) fn try_build_params(
     // model-option-compatibility.ts:74-80` @v0.8.0), applied through a provider wrapper because a
     // JS extension cannot reach this builder. cyrup can, so the key simply is not written; see
     // [`crate::api::compat::unsupported_temperature_reason`] for the CYRUP-DELTA on the seam.
+    // PROV-118 (4/4) — `&& !omitUnsupportedFields` (`:344`, assigned `:345`).
     if let Some(temp) = opts
         .temperature
-        .filter(|_| crate::api::compat::temperature_is_supported(model))
+        .filter(|_| crate::api::compat::temperature_is_supported(model) && !omit_unsupported_fields)
     {
         obj.insert("temperature".to_string(), json!(temp));
     }
