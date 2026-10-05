@@ -1237,3 +1237,75 @@ mod tests {
         assert_eq!(obj.get("msg").and_then(Value::as_str), Some("x  y"));
     }
 }
+
+/// `Number.prototype.toString()` for a double (ECMA-262 `Number::toString`).
+#[must_use]
+pub fn js_number_string(value: f64) -> String {
+    if value == 0.0 {
+        return "0".to_owned();
+    }
+    if value.is_nan() {
+        return "NaN".to_owned();
+    }
+    if value.is_infinite() {
+        return if value > 0.0 { "Infinity" } else { "-Infinity" }.to_owned();
+    }
+    let sign = if value < 0.0 { "-" } else { "" };
+    // `{:e}` prints the shortest digit string that round-trips, as `d.ddde<exp>`; the spec's `s`
+    // (digits) and `n` (decimal point position) come straight from it.
+    let scientific = format!("{:e}", value.abs());
+    let (mantissa, exponent) = scientific.split_once('e').unwrap_or((&scientific, "0"));
+    let digits: String = mantissa.chars().filter(char::is_ascii_digit).collect();
+    let exponent: i32 = exponent.parse().unwrap_or(0);
+    let k = i32::try_from(digits.len()).unwrap_or(i32::MAX);
+    let n = exponent + 1;
+    let body = if k <= n && n <= 21 {
+        format!(
+            "{digits}{}",
+            "0".repeat(usize::try_from(n - k).unwrap_or(0))
+        )
+    } else if 0 < n && n <= 21 {
+        let split = usize::try_from(n).unwrap_or(0);
+        let (whole, fraction) = digits.split_at(split);
+        format!("{whole}.{fraction}")
+    } else if -6 < n && n <= 0 {
+        format!("0.{}{digits}", "0".repeat(usize::try_from(-n).unwrap_or(0)))
+    } else {
+        let exp = n - 1;
+        let exp_sign = if exp < 0 { '-' } else { '+' };
+        let mut chars = digits.chars();
+        let first = chars.next().unwrap_or('0');
+        let rest: String = chars.collect();
+        if rest.is_empty() {
+            format!("{first}e{exp_sign}{}", exp.abs())
+        } else {
+            format!("{first}.{rest}e{exp_sign}{}", exp.abs())
+        }
+    };
+    format!("{sign}{body}")
+}
+
+#[cfg(test)]
+mod js_number_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+    use super::js_number_string;
+
+    #[test]
+    fn formats_as_javascript_does() {
+        for (value, text) in [
+            (0.0, "0"),
+            (-0.0, "0"),
+            (1.0, "1"),
+            (0.000_001, "0.000001"),
+            (0.000_000_1, "1e-7"),
+            (0.000_012, "0.000012"),
+            (1e21, "1e+21"),
+            (123_456_789_012_345_680_000.0, "123456789012345680000"),
+            (0.1 + 0.2, "0.30000000000000004"),
+            (-2.5, "-2.5"),
+            (f64::NAN, "NaN"),
+        ] {
+            assert_eq!(js_number_string(value), text, "{value:?}");
+        }
+    }
+}

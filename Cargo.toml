@@ -266,7 +266,7 @@ serde        = { version = "1",   features = ["derive", "rc"] }
 # (`123456789012345680000` parses to a different double without it and prints as
 # `123456789012345670000`). It only makes parsing more exact, so no existing reader can observe a
 # regression; it costs parse speed on float-heavy input.
-serde_json   = { version = "1", features = ["preserve_order", "float_roundtrip"] }
+serde_json   = { version = "1", features = ["preserve_order", "float_roundtrip", "raw_value"] }
 
 # Insertion-ordered map. arch-00 §7.1 listed it as "added when first used"; PICO5-PLAN S2 is the
 # first use. `DocMap = IndexMap<Arc<str>, DocValue>` is the persisted document object, and the
