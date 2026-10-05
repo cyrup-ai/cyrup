@@ -1,12 +1,22 @@
-//! The `openrouter-images` wire protocol (1:1 port of Pi `api/openrouter-images.ts`).
+//! The `openrouter-images` wire protocol (1:1 port of pi `packages/ai/src/api/openrouter-images.ts`
+//! @v1.0.1, which `providers/openrouter.ts:33` installs as `images: { "openrouter-images":
+//! openrouterImagesApi() }`).
 //!
 //! OpenRouter exposes image generation through the OpenAI `chat/completions` shape with
 //! `modalities: ["image"]` (plus `"text"` when the model also emits text). cyrup speaks it directly
 //! over `reqwest` (no OpenAI SDK): a single non-streaming POST to `{baseUrl}/chat/completions`,
 //! Bearer-keyed, whose response carries assistant `images[]` as `data:` URLs that are decoded into
-//! [`Content::Image`] blocks (Pi `openrouter-images.ts:86-97`).
+//! [`Content::Image`] blocks (`openrouter-images.ts:86-97`).
+//!
+//! PROV-128 moved this module from `crate::images::openrouter` to where upstream keeps it, under
+//! `api`, when the parallel images registry it used to be reached through was deleted. The wire
+//! behaviour is unchanged; only the model type it takes is ([`ImageModel`] rather than the
+//! v0.87.1-era `ImageModel`).
 
-use super::{AssistantImages, ImagesApiImpl, ImagesContext, ImagesModel, ImagesOptions};
+use crate::classifier::ImageModel;
+use crate::images::{
+    AssistantImages, ImagesApiImpl, ImagesContext, ImagesOptions, OPENROUTER_IMAGES, ProviderImages,
+};
 use crate::stream::ProviderResponse;
 use crate::stream::sse::build_client_for_target;
 use cyrup_core::{ApiId, Content, Usage};
@@ -14,15 +24,45 @@ use serde_json::json;
 use std::sync::Arc;
 use std::time::Duration;
 
-/// Build the `openrouter-images` [`ImagesApiImpl`] (Pi `openrouterImagesApi()`).
+/// Build the `openrouter-images` [`ProviderImages`] for a provider's `images` map (pi
+/// `openrouterImagesApi()`, `providers/openrouter.ts:33`).
+pub fn openrouter_images_api() -> Arc<dyn ProviderImages> {
+    Arc::new(OpenRouterImages::new())
+}
+
+/// Build the `openrouter-images` [`ImagesApiImpl`] for the GLOBAL images api registry (pi
+/// `registerBuiltInImagesApiProviders()`, `providers/images/register-builtins.ts`). The same wire
+/// impl, reached through the other of upstream's two registries — see [`crate::images`].
 pub fn factory() -> Arc<dyn ImagesApiImpl> {
-    Arc::new(OpenRouterImages {
-        api: ApiId::from(super::OPENROUTER_IMAGES),
-    })
+    Arc::new(OpenRouterImages::new())
 }
 
 struct OpenRouterImages {
     api: ApiId,
+}
+
+impl OpenRouterImages {
+    fn new() -> Self {
+        Self {
+            api: ApiId::from(OPENROUTER_IMAGES),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl ProviderImages for OpenRouterImages {
+    async fn generate_images(
+        &self,
+        model: &ImageModel,
+        context: &ImagesContext,
+        options: &ImagesOptions,
+    ) -> AssistantImages {
+        match run(model, context, options).await {
+            Ok(out) => out,
+            Err(GenError::Aborted) => AssistantImages::errored(model, "aborted", true),
+            Err(GenError::Message(m)) => AssistantImages::errored(model, m, false),
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -33,15 +73,11 @@ impl ImagesApiImpl for OpenRouterImages {
 
     async fn generate_images(
         &self,
-        model: &ImagesModel,
+        model: &ImageModel,
         context: &ImagesContext,
         options: &ImagesOptions,
     ) -> AssistantImages {
-        match run(model, context, options).await {
-            Ok(out) => out,
-            Err(GenError::Aborted) => AssistantImages::errored(model, "aborted", true),
-            Err(GenError::Message(m)) => AssistantImages::errored(model, m, false),
-        }
+        ProviderImages::generate_images(self, model, context, options).await
     }
 }
 
@@ -54,7 +90,7 @@ enum GenError {
 }
 
 async fn run(
-    model: &ImagesModel,
+    model: &ImageModel,
     context: &ImagesContext,
     options: &ImagesOptions,
 ) -> Result<AssistantImages, GenError> {
@@ -159,7 +195,7 @@ async fn run(
 
 /// `buildParams` (openrouter-images.ts:124-151): a single user turn whose content mirrors the input,
 /// `stream:false`, and `modalities` driven by the model's output modalities.
-fn build_params(model: &ImagesModel, context: &ImagesContext) -> serde_json::Value {
+fn build_params(model: &ImageModel, context: &ImagesContext) -> serde_json::Value {
     let content: Vec<serde_json::Value> = context
         .input
         .iter()
@@ -182,7 +218,7 @@ fn build_params(model: &ImagesModel, context: &ImagesContext) -> serde_json::Val
     };
 
     json!({
-        "model": model.id,
+        "model": model.id.as_str(),
         "messages": [{ "role": "user", "content": content }],
         "stream": false,
         "modalities": modalities,
@@ -190,7 +226,7 @@ fn build_params(model: &ImagesModel, context: &ImagesContext) -> serde_json::Val
 }
 
 /// Parse the OpenRouter chat-completion response into [`AssistantImages`] (openrouter-images.ts:73-99).
-fn parse_response(model: &ImagesModel, body: &serde_json::Value) -> AssistantImages {
+fn parse_response(model: &ImageModel, body: &serde_json::Value) -> AssistantImages {
     let mut output = AssistantImages::new(model);
     output.response_id = body.get("id").and_then(|v| v.as_str()).map(String::from);
     if let Some(usage) = body.get("usage").filter(|u| u.is_object()) {
@@ -249,7 +285,7 @@ fn parse_data_url(url: &str) -> Option<(String, String)> {
 
 /// `parseUsage` (openrouter-images.ts:153-184): split reported cached tokens into read/write, derive
 /// input, and price each component against the model's per-1e6-token rates.
-fn parse_usage(model: &ImagesModel, raw: &serde_json::Value) -> Usage {
+fn parse_usage(model: &ImageModel, raw: &serde_json::Value) -> Usage {
     let num = |v: &serde_json::Value, path: &[&str]| -> u64 {
         let mut cur = v;
         for key in path {
@@ -292,7 +328,7 @@ fn parse_usage(model: &ImagesModel, raw: &serde_json::Value) -> Usage {
 
 /// `{ ...model.headers, ...options.headers }` (openrouter-images.ts:116): the model's default headers
 /// overlaid by the per-request headers (request wins per key).
-fn merged_headers(model: &ImagesModel, options: &ImagesOptions) -> crate::HeaderMap {
+fn merged_headers(model: &ImageModel, options: &ImagesOptions) -> crate::HeaderMap {
     let mut merged = crate::HeaderMap::new();
     if let Some(h) = &model.headers {
         merged.extend(h.iter().map(|(k, v)| (k.clone(), v.clone())));
@@ -326,14 +362,15 @@ fn header_record(
 )]
 mod tests {
     use super::*;
-    use crate::images::{ImagesStopReason, get_image_model, openrouter_image_models};
+    use crate::images::ImagesStopReason;
     use crate::model::Modality;
+    use crate::providers::openrouter::{openrouter_image_model, openrouter_image_models};
 
-    fn nano_banana() -> ImagesModel {
-        get_image_model("openrouter", "google/gemini-2.5-flash-image").expect("nano banana")
+    fn nano_banana() -> ImageModel {
+        openrouter_image_model("google/gemini-2.5-flash-image").expect("nano banana")
     }
-    fn flux() -> ImagesModel {
-        get_image_model("openrouter", "black-forest-labs/flux.2-flex").expect("flux")
+    fn flux() -> ImageModel {
+        openrouter_image_model("black-forest-labs/flux.2-flex").expect("flux")
     }
 
     #[test]
@@ -349,7 +386,7 @@ mod tests {
             ],
         };
         let params = build_params(&model, &ctx);
-        assert_eq!(params["model"], model.id);
+        assert_eq!(params["model"], model.id.as_str());
         assert_eq!(params["stream"], false);
         assert_eq!(params["modalities"], json!(["image", "text"]));
         let content = &params["messages"][0]["content"];
@@ -501,7 +538,9 @@ mod tests {
             api_key: Some(key),
             ..Default::default()
         };
-        let out = factory().generate_images(&model, &ctx, &opts).await;
+        let out = openrouter_images_api()
+            .generate_images(&model, &ctx, &opts)
+            .await;
         assert_eq!(
             out.stop_reason,
             ImagesStopReason::Stop,

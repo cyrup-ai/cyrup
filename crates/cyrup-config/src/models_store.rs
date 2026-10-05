@@ -11,7 +11,7 @@
 //! `auth-storage.ts:45+`) — a cross-process lock plus an atomic replace at 0600. So does this, via
 //! the sidecar-lock + temp-and-rename pair `crate::auth` already uses.
 //!
-//! # Classifier models (EXT-027)
+//! # Non-chat models (EXT-027, PROV-128)
 //!
 //! Pi persists a provider's chat models AND its classifier models in the entry's ONE `models` array
 //! (`ModelsStoreEntry.models: readonly AnyModel[]`, `models-store.ts:3-5` @v0.99.2-17; the llama.cpp
@@ -22,6 +22,13 @@
 //! replaces the chat members and leaves the classifier members where they are,
 //! `write_classifier_models` does the converse, and `read` hands back the chat members alone. A file
 //! written before classifier models existed has no such member and reads as it always did.
+//!
+//! PROV-128 adds the **image** half on the same seam: an image member is one whose `type` is
+//! `"image"`, `read_image_models`/`write_image_models` are its pair, and `write_all_types` writes
+//! chat + image + classifier as the ONE operation the pi.dev `?types=chat,image,classifier` body
+//! is. The chat/non-chat split is now keyed on `type` generally rather than on `"classifier"`
+//! specifically, because an image member in the chat half fails the whole entry's typed conversion
+//! and would have cost the provider its entire persisted overlay.
 //!
 //! # Failure posture
 //!
@@ -41,9 +48,9 @@
 
 use std::path::{Path, PathBuf};
 
-use cyrup_provider::ClassifierModel;
 use cyrup_provider::error::ProviderError;
 use cyrup_provider::models_store::{ModelsStore, ModelsStoreEntry, ModelsStoreOperationOptions};
+use cyrup_provider::{ClassifierModel, ImageModel};
 
 /// A JSON object in **file order** — Pi's `StoredModels` is a plain JS object, and both
 /// `JSON.parse` and `JSON.stringify` preserve its insertion order (models-store.ts:120-145
@@ -131,10 +138,26 @@ impl<'de> serde::Deserialize<'de> for OrderedObject {
     }
 }
 
+/// The `type` tag of a `models` array member, or `None` for a chat member. A chat row written by
+/// cyrup carries no `type` (its [`cyrup_provider::Model`] has no such field); a row that came from
+/// pi.dev may carry `"chat"` explicitly, and both read as chat.
+fn member_type(model: &serde_json::Value) -> Option<&str> {
+    match model.get("type").and_then(serde_json::Value::as_str) {
+        None | Some("chat") => None,
+        Some(other) => Some(other),
+    }
+}
+
 /// Whether a `models` array member is a classifier model (`type: "classifier"`, `ClassifierModel`'s
-/// wire tag); a chat model carries no `type`.
+/// wire tag).
 fn is_classifier_member(model: &serde_json::Value) -> bool {
-    model.get("type").and_then(serde_json::Value::as_str) == Some("classifier")
+    member_type(model) == Some("classifier")
+}
+
+/// Whether a `models` array member is an image model (`type: "image"`, `ImageModel`'s wire tag).
+/// PROV-128.
+fn is_image_member(model: &serde_json::Value) -> bool {
+    member_type(model) == Some("image")
 }
 
 /// The file name Pi uses, resolved beside `models.json` (`model-runtime.ts:141-144`,
@@ -345,12 +368,60 @@ impl FileModelsStore {
             .get("models")
             .and_then(serde_json::Value::as_array)
             .map(|models| {
+                // PROV-128 — the split is "chat vs EVERY other type", not "chat vs classifier".
+                // With the narrower test an `type: "image"` member landed in the chat half, and the
+                // whole entry's typed conversion in `read` then failed (an image row has no
+                // `reasoning`/`contextWindow`/`maxTokens`) — costing the provider its ENTIRE
+                // persisted overlay, chat rows included, the first time the pi.dev refresh wrote
+                // one. The non-chat half is filtered per type by its own reader below.
                 models
                     .iter()
                     .cloned()
-                    .partition(|model| !is_classifier_member(model))
+                    .partition(|model| member_type(model).is_none())
             })
             .unwrap_or_default()
+    }
+
+    /// The non-chat members of `entry` that are of type `kind`, deserialized best-effort — a member
+    /// that is not a well-formed model of that type is skipped, like a malformed provider entry in
+    /// [`Self::read`]: the cache degrades, it does not fail a start.
+    fn typed_members<T: serde::de::DeserializeOwned>(
+        entry: Option<&serde_json::Value>,
+        keep: fn(&serde_json::Value) -> bool,
+    ) -> Vec<T> {
+        entry
+            .map(|stored| Self::members(stored).1)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(keep)
+            .filter_map(|member| serde_json::from_value::<T>(member).ok())
+            .collect()
+    }
+
+    /// Replace the members of `entry`'s `models` array that satisfy `replacing` with `members`,
+    /// keeping every other member where it is. The one primitive behind
+    /// [`ModelsStore::write_image_models`] and [`ModelsStore::write_classifier_models`], which
+    /// differ only in which half they own.
+    fn replace_members(
+        entry: &mut serde_json::Value,
+        replacing: fn(&serde_json::Value) -> bool,
+        members: Vec<serde_json::Value>,
+    ) {
+        let mut kept: Vec<serde_json::Value> = entry
+            .get("models")
+            .and_then(serde_json::Value::as_array)
+            .map(|models| {
+                models
+                    .iter()
+                    .filter(|model| !replacing(model))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+        kept.extend(members);
+        if let Some(object) = entry.as_object_mut() {
+            object.insert("models".to_string(), serde_json::Value::Array(kept));
+        }
     }
 
     fn write_all(&self, entries: &OrderedObject) -> Result<(), crate::error::ConfigError> {
@@ -420,8 +491,9 @@ impl ModelsStore for FileModelsStore {
         // `ConfigError::Serde` (error.rs:52) rather than dropped.
         let mut value = serde_json::to_value(&entry)
             .map_err(|e| store_err(crate::error::ConfigError::Serde(e)))?;
-        // The classifier models already stored stay: `write` replaces the chat half only
-        // (`write_classifier_models` owns the other).
+        // The non-chat models already stored stay: `write` replaces the CHAT half only
+        // (`write_image_models` / `write_classifier_models` own the others). PROV-128 widened this
+        // from "classifier models" to "every non-chat member" with `members()`.
         let kept = all
             .get(provider_id)
             .map_or_else(Vec::new, |stored| Self::members(stored).1);
@@ -462,6 +534,10 @@ impl ModelsStore for FileModelsStore {
     /// locked read-modify-write of the file (pi's single `write({ models: [...] })`,
     /// `extensions/llama/provider.ts:251-253`): the file holds either the old pair or the new one,
     /// never new chat models beside old classifier models.
+    ///
+    /// The provider's IMAGE members are left where they are, the same way [`Self::write`] leaves
+    /// every non-chat member alone — this method owns the chat and classifier halves only, and
+    /// [`ModelsStore::write_all_types`] is the one that replaces all three.
     async fn write_with_classifiers(
         &self,
         provider_id: &str,
@@ -475,6 +551,15 @@ impl ModelsStore for FileModelsStore {
                 .await
                 .map_err(store_err)?;
         let mut all = self.read_all();
+        // PROV-128 — the image members already stored stay, so a `write_with_classifiers` from the
+        // llama refresh path cannot wipe an image overlay the pi.dev refresh persisted.
+        let kept_images: Vec<serde_json::Value> = all
+            .get(provider_id)
+            .map(|stored| Self::members(stored).1)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(is_image_member)
+            .collect();
         let mut value = serde_json::to_value(&entry)
             .map_err(|e| store_err(crate::error::ConfigError::Serde(e)))?;
         let classifier_members = classifiers
@@ -486,9 +571,103 @@ impl ModelsStore for FileModelsStore {
             .get_mut("models")
             .and_then(serde_json::Value::as_array_mut)
         {
+            models.extend(kept_images);
             models.extend(classifier_members);
         }
         all.insert(provider_id.to_string(), value);
+        self.write_all(&all).map_err(store_err)?;
+        self.update_read_state(&all, None);
+        Ok(())
+    }
+
+    /// Replace the chat, image AND classifier members of the provider's `models` array in ONE
+    /// locked read-modify-write — pi's single `write({ models: AnyModel[] })` over its one array.
+    /// This is what the pi.dev refresh calls once a `?types=chat,image,classifier` body arrives
+    /// (PROV-128): that body is one catalog, and a reader (this process after a crash, another
+    /// process, the next restore) must never see one refresh's chat rows beside another's image
+    /// rows.
+    async fn write_all_types(
+        &self,
+        provider_id: &str,
+        entry: ModelsStoreEntry,
+        images: Vec<ImageModel>,
+        classifiers: Vec<ClassifierModel>,
+        options: Option<&ModelsStoreOperationOptions>,
+    ) -> Result<(), ProviderError> {
+        ModelsStoreOperationOptions::throw_if_aborted(options)?;
+        let _guard =
+            crate::lock::FileLock::acquire(&self.path, options.and_then(|o| o.signal.as_ref()))
+                .await
+                .map_err(store_err)?;
+        let mut all = self.read_all();
+        let mut value = serde_json::to_value(&entry)
+            .map_err(|e| store_err(crate::error::ConfigError::Serde(e)))?;
+        let mut non_chat = images
+            .iter()
+            .map(serde_json::to_value)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| store_err(crate::error::ConfigError::Serde(e)))?;
+        non_chat.extend(
+            classifiers
+                .iter()
+                .map(serde_json::to_value)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| store_err(crate::error::ConfigError::Serde(e)))?,
+        );
+        if let Some(models) = value
+            .get_mut("models")
+            .and_then(serde_json::Value::as_array_mut)
+        {
+            models.extend(non_chat);
+        }
+        all.insert(provider_id.to_string(), value);
+        self.write_all(&all).map_err(store_err)?;
+        self.update_read_state(&all, None);
+        Ok(())
+    }
+
+    /// The `type: "image"` members of the provider's `models` array (PROV-128).
+    async fn read_image_models(
+        &self,
+        provider_id: &str,
+        options: Option<&ModelsStoreOperationOptions>,
+    ) -> Result<Vec<ImageModel>, ProviderError> {
+        ModelsStoreOperationOptions::throw_if_aborted(options)?;
+        let latest = self.read_latest(options).await.map_err(store_err)?;
+        ModelsStoreOperationOptions::throw_if_aborted(options)?;
+        Ok(Self::typed_members(
+            latest.get(provider_id),
+            is_image_member,
+        ))
+    }
+
+    /// Replace the image members of the provider's `models` array, leaving its chat and classifier
+    /// members and the entry's other fields as they are; an empty list removes them. Nothing is
+    /// created for an empty list when the provider has no entry. PROV-128.
+    async fn write_image_models(
+        &self,
+        provider_id: &str,
+        models: Vec<ImageModel>,
+        options: Option<&ModelsStoreOperationOptions>,
+    ) -> Result<(), ProviderError> {
+        ModelsStoreOperationOptions::throw_if_aborted(options)?;
+        let _guard =
+            crate::lock::FileLock::acquire(&self.path, options.and_then(|o| o.signal.as_ref()))
+                .await
+                .map_err(store_err)?;
+        let mut all = self.read_all();
+        let members = models
+            .iter()
+            .map(serde_json::to_value)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| store_err(crate::error::ConfigError::Serde(e)))?;
+        let mut entry = match all.get(provider_id) {
+            Some(stored) if stored.is_object() => stored.clone(),
+            _ if members.is_empty() => return Ok(()),
+            _ => serde_json::json!({}),
+        };
+        Self::replace_members(&mut entry, is_image_member, members);
+        all.insert(provider_id.to_string(), entry);
         self.write_all(&all).map_err(store_err)?;
         self.update_read_state(&all, None);
         Ok(())
@@ -505,13 +684,10 @@ impl ModelsStore for FileModelsStore {
         ModelsStoreOperationOptions::throw_if_aborted(options)?;
         let latest = self.read_latest(options).await.map_err(store_err)?;
         ModelsStoreOperationOptions::throw_if_aborted(options)?;
-        Ok(latest
-            .get(provider_id)
-            .map(|stored| Self::members(stored).1)
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|member| serde_json::from_value::<ClassifierModel>(member).ok())
-            .collect())
+        Ok(Self::typed_members(
+            latest.get(provider_id),
+            is_classifier_member,
+        ))
     }
 
     /// Replace the classifier members of the provider's `models` array, leaving its chat members
@@ -540,11 +716,10 @@ impl ModelsStore for FileModelsStore {
             _ if classifiers.is_empty() => return Ok(()),
             _ => serde_json::json!({}),
         };
-        let (mut members, _) = Self::members(&entry);
-        members.extend(classifiers);
-        if let Some(object) = entry.as_object_mut() {
-            object.insert("models".to_string(), serde_json::Value::Array(members));
-        }
+        // PROV-128 — replace the classifier members only. This used to rebuild the array as
+        // `chat ++ classifiers`, which DROPPED every other non-chat member: once the pi.dev refresh
+        // persisted image rows, a later classifier write would have deleted them.
+        Self::replace_members(&mut entry, is_classifier_member, classifiers);
         all.insert(provider_id.to_string(), entry);
         self.write_all(&all).map_err(store_err)?;
         self.update_read_state(&all, None);

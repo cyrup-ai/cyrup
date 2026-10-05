@@ -16,7 +16,7 @@
 //! returns a `ProviderStreams` **immediately** and defers the `import()` — the actual module load —
 //! to the first `stream`/`streamSimple` call on it, relying on the JS host's import cache to
 //! deduplicate. cyrup registers the same 10 ids ([`crate::known_api`], registered in
-//! [`register_builtins`]) plus `openrouter-images` in [`crate::images`], and defers with
+//! [`register_builtins`]) plus `openrouter-images` in [`openrouter_images`], and defers with
 //! [`ApiFactory`] + [`ApiRegistry::get`]'s get-or-init.
 //!
 //! **Why the substitution.** Rust has no dynamic `import()`: a wire impl is a statically linked
@@ -58,6 +58,7 @@ pub mod mistral_conversations;
 pub mod openai_codex_responses;
 pub mod openai_completions;
 pub mod openai_responses;
+pub mod openrouter_images;
 pub mod pi_messages;
 
 /// Cross-converter regression suite: a truncated stream must never be reported as a completed turn
@@ -285,7 +286,10 @@ mod tests {
         let reg = builtin_registry();
 
         // pi `KnownApi` (`packages/ai/src/types.ts:16-26` @v0.83.0) — all ten, no more, no fewer.
-        // `openrouter-images` is `KnownImagesApi` (`:30`) and lives in `crate::images`, not here.
+        // `openrouter-images` is `KnownImageApi` (`types.ts:31-35` @v1.0.1): it is an IMAGE api,
+        // dispatched through a provider's `images` map (`crate::images::ImageApiRegistry`) rather
+        // than this streaming registry, exactly as upstream keeps `images` and `api` apart on
+        // `createProvider` — so it is absent from this list by construction, not by omission.
         let mut registered: Vec<String> = reg.factories.keys().map(|a| a.to_string()).collect();
         registered.sort();
         let mut expected = vec![

@@ -105,7 +105,6 @@
 use crate::api::{ApiRegistry, builtin_registry};
 use crate::auth::{CredentialStore, InMemoryCredentialStore};
 use crate::collection::{CreateModelsOptions, Models, create_models};
-use crate::images::{ImagesModels, ImagesProvider, create_images_models};
 use crate::provider::Provider;
 use crate::providers::anthropic::anthropic_fleet_providers_with;
 use crate::providers::fleet::fleet_providers_with;
@@ -116,7 +115,7 @@ use crate::providers::{
     fireworks_provider_with, github_copilot_provider_with, google_provider_with,
     google_vertex_provider_with, mistral_provider_with, openai_codex_provider_with,
     openai_provider_with, opencode_go_provider_with, opencode_provider_with,
-    openrouter_images_provider, together_provider_with,
+    together_provider_with,
 };
 use crate::remote_catalog::CatalogOverlay;
 use crate::utils::http_date::parse_iso8601_utc_ms;
@@ -372,21 +371,15 @@ pub fn default_models(options: CreateModelsOptions) -> Models {
     models
 }
 
-/// Every built-in image-generation provider, freshly constructed (Pi `builtinImagesProviders`,
-/// `all.ts:120-122`). Currently just `openrouter-images` (Pi's only built-in image provider).
-pub fn all_images_providers() -> Vec<Arc<dyn ImagesProvider>> {
-    vec![Arc::new(openrouter_images_provider())]
-}
-
-/// An [`ImagesModels`] collection with every built-in image-generation provider registered (Pi
-/// `builtinImagesModels`, `all.ts:125-131`).
-pub fn default_images_models(options: CreateModelsOptions) -> ImagesModels {
-    let mut models = create_images_models(options);
-    for provider in all_images_providers() {
-        models.set_provider(provider);
-    }
-    models
-}
+// PROV-128 — `all_images_providers()` and `default_images_models()` are GONE, because
+// `builtinImagesProviders()` and `builtinImagesModels()` are: `a328aa89a` deleted both (they were
+// `providers/all.ts:146-150` and `:151-157` at v0.87.1 — the last 12 lines of a 157-line file,
+// NOT `:188` as the ledger row cites). An image
+// model now reaches a caller through the ordinary provider that lists it —
+// `default_models(..).get_image_models(Some("openrouter"))` and `Models::generate_images` — which
+// is upstream's `getBuiltinImageModels(provider)` / `Models.generateImages`
+// (`providers/all.ts:111-118`, `models.ts:948-963`). `builtinProviders()` returns one list, and
+// `openrouter` is in it carrying its image rows (`crate::providers::openrouter`).
 
 #[cfg(test)]
 #[allow(
@@ -584,26 +577,26 @@ mod tests {
         );
     }
 
-    /// The built-in images collection registers `openrouter-images` (Pi `builtinImagesModels`,
-    /// `all.ts:125-131`) so an image model resolves out of the box.
+    /// PROV-128 — the built-in `openrouter` provider is where image models live now, reached
+    /// through the ONE [`Models`] collection (pi `getBuiltinImageModels("openrouter")` /
+    /// `Models.getModelsOfType("image")`), not through a second collection of its own.
     #[test]
-    fn default_images_models_registers_openrouter() {
-        let models = default_images_models(CreateModelsOptions::default());
-        let ids: Vec<String> = models
-            .get_providers()
-            .iter()
-            .map(|p| p.id().to_string())
-            .collect();
-        assert!(
-            ids.iter().any(|id| id == "openrouter"),
-            "missing built-in image provider 'openrouter'"
+    fn the_builtin_models_collection_lists_openrouter_image_models() {
+        let models = default_models(CreateModelsOptions::default());
+        let images = models.get_image_models(Some("openrouter"));
+        assert_eq!(
+            images.len(),
+            55,
+            "openrouter must contribute its image rows"
         );
         assert!(
             models
-                .get_model("openrouter", "google/gemini-2.5-flash-image")
+                .get_image_model("openrouter", "google/gemini-2.5-flash-image")
                 .is_some(),
             "expected openrouter image model resolvable"
         );
+        // No other built-in contributes one.
+        assert_eq!(models.get_image_models(None).len(), 55);
     }
 
     /// PROV-014 — the registered `radius` is the real provider kind, not a fleet row: `pi-messages`

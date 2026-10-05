@@ -73,6 +73,7 @@
     clippy::indexing_slicing
 )]
 
+use crate::classifier::ImageModel;
 use crate::collection::{CreateModelsOptions, Models, create_models};
 use crate::{Model, all_providers};
 
@@ -127,30 +128,36 @@ const IMAGES_CATALOGS: &[&str] = &["openrouter-images"];
 ///
 /// Each file is parsed with **the type its own production loader uses**. That distinction is not a
 /// nicety: pi types the image catalogs as
-/// `ImagesModel<TApi> extends Omit<Model<Api>, "api" | "provider" | "reasoning" | "contextWindow" |
-/// "maxTokens" | "compat">` (`packages/ai/src/types.ts:825-829` @v0.83.0), so an image row has no
-/// `reasoning`, no `contextWindow` and no `maxTokens` **by design**. Parsing
+/// `ImageModel<TApi> extends BaseModel<TApi>` (`packages/ai/src/types.ts:1145-1149` @v1.0.1, over
+/// `BaseModel` at `:1097-1108`; at v0.83.0 the same shape was spelled `ImagesModel<TApi> extends
+/// Omit<Model<Api>, "api" | "provider" | "reasoning" | "contextWindow" | "maxTokens" | "compat">`,
+/// `types.ts:825-829`), so an image row has no `reasoning`, no `contextWindow` and no `maxTokens`
+/// **by design**. Parsing
 /// `openrouter-images.json` as a text [`Model`] therefore fails on `missing field reasoning` while
 /// the shipped data is exactly right — the file is loaded by
-/// [`crate::images::openrouter_image_models`] (`images/mod.rs:634`) as
-/// [`crate::images::ImagesModel`], never as [`Model`].
+/// [`crate::providers::openrouter::openrouter_image_models`] as [`ImageModel`], never as [`Model`].
+/// PROV-128 moved that loader out of the deleted `crate::images` tree and renamed the type to
+/// v1.0.0's `ImageModel`; the loader also STAMPS `type: "image"`, which the v0.87.1-era file
+/// predates (see [`the_images_catalog_needs_its_type_stamped`]).
 #[test]
 fn every_embedded_catalog_parses_non_empty() {
     for (name, blob) in catalogs() {
         if IMAGES_CATALOGS.contains(&name.as_str()) {
-            // The images half of the same guard: `openrouter_image_models()` also swallows a parse
-            // error into `Vec::default()`, so it needs the identical treatment against its own type.
-            let models: Vec<crate::images::ImagesModel> = serde_json::from_str(&blob)
-                .unwrap_or_else(|e| panic!("images catalog {name}.json failed to parse: {e}"));
+            // The images half of the same guard, read through the production loader — which also
+            // stamps the `type: "image"` discriminant the v0.87.1 extract predates. The loader
+            // swallows a parse error into `Vec::default()`, so emptiness is the signal here, as it
+            // is for the text catalogs.
+            let models: Vec<ImageModel> = crate::providers::openrouter::openrouter_image_models();
+            let _ = &blob;
             assert!(
                 !models.is_empty(),
                 "images catalog {name}.json parsed to ZERO models"
             );
             for m in &models {
-                assert!(!m.id.is_empty(), "{name}: empty model id");
+                assert!(!m.id.as_str().is_empty(), "{name}: empty model id");
                 assert!(!m.base_url.is_empty(), "{name}: {} has empty baseUrl", m.id);
                 // The field that replaces the text catalog's `contextWindow` as the row's reason to
-                // exist: pi makes `output` REQUIRED on `ImagesModel` (`types.ts:828`), and a row
+                // exist: pi makes `output` REQUIRED on `ImageModel` (`types.ts:1148`), and a row
                 // that emits nothing is unusable.
                 assert!(!m.output.is_empty(), "{name}: {} declares no output", m.id);
             }
@@ -182,39 +189,55 @@ fn every_embedded_catalog_parses_non_empty() {
 
 /// The parse-type split above is only load-bearing if the images catalog really is a shape the text
 /// [`Model`] rejects — otherwise the `continue` is silently covering nothing. This pins the split
-/// itself: `openrouter-images.json` MUST fail as `Vec<Model>` (pi omits `reasoning` from
-/// `ImagesModel`, `types.ts:825-829`) and MUST succeed as `Vec<ImagesModel>` with the same row count
-/// the production loader hands the provider.
+/// itself: `openrouter-images.json` MUST fail as `Vec<Model>` (pi omits `reasoning` from an image
+/// row, `types.ts:1144-1149` @v1.0.1), and the loader MUST hand the provider every row.
+///
+/// **PROV-128 — and it must ALSO fail as a raw `Vec<ImageModel>`.** v1.0.0 made `type: "image"`
+/// required on an image row so that a chat row's JSON cannot be read as one inside a mixed array
+/// ([`crate::AnyModel`]'s deserializer dispatches on `type`). The embedded file was extracted at
+/// v0.87.1, where the FILE was the discriminant and no row carried `type`. Both failures together
+/// are what make the loader's per-row stamp a necessary step rather than decoration: if either
+/// stopped failing, the stamp could be deleted without a test noticing.
 #[test]
-fn the_images_catalog_is_an_images_shape_not_a_model_shape() {
+fn the_images_catalog_needs_its_type_stamped() {
     let (_, blob) = catalogs()
         .into_iter()
         .find(|(name, _)| name == "openrouter-images")
         .expect("openrouter-images.json is shipped");
 
     let as_text = serde_json::from_str::<Vec<Model>>(&blob)
-        .expect_err("an images row has no `reasoning`/`contextWindow`/`maxTokens` — pi omits them");
+        .expect_err("an image row has no `reasoning`/`contextWindow`/`maxTokens` — pi omits them");
     assert!(
         as_text.to_string().contains("reasoning"),
         "expected the missing text-only field to be named, got {as_text}"
     );
 
-    let as_images: Vec<crate::images::ImagesModel> =
-        serde_json::from_str(&blob).expect("parses as the type its loader uses");
+    let unstamped = serde_json::from_str::<Vec<ImageModel>>(&blob)
+        .expect_err("the v0.87.1 extract carries no `type`, which v1.0.0 requires");
+    assert!(
+        unstamped.to_string().contains("type"),
+        "expected the missing discriminant to be named, got {unstamped}"
+    );
+
+    let loaded = crate::providers::openrouter::openrouter_image_models();
+    let row_count = serde_json::from_str::<Vec<serde_json::Value>>(&blob)
+        .expect("the file is a JSON array")
+        .len();
     assert_eq!(
-        as_images.len(),
-        crate::images::openrouter_image_models().len(),
-        "the loader must not be silently defaulting to an empty catalog"
+        loaded.len(),
+        row_count,
+        "the loader must stamp and keep EVERY row, not silently drop some into an empty catalog"
     );
 }
 
 /// **PROV-089.** The images catalog the production loader hands the `openrouter-images` provider is
 /// `IMAGE_MODELS.openrouter` at pi `v0.87.1`: 55 rows, where the `b0c2a90e` extraction had 35. The
 /// twenty rows that tag added and the two display names it changed are asserted through
-/// [`crate::images::openrouter_image_models`], the loader the images registry resolves.
+/// [`crate::providers::openrouter::openrouter_image_models`], the loader the `openrouter`
+/// provider's image leg resolves (PROV-128).
 #[test]
 fn the_images_catalog_is_image_models_at_v0_87_1() {
-    let models = crate::images::openrouter_image_models();
+    let models = crate::providers::openrouter::openrouter_image_models();
     assert_eq!(
         models.len(),
         55,
@@ -243,14 +266,14 @@ fn the_images_catalog_is_image_models_at_v0_87_1() {
         "x-ai/grok-imagine-image-2.0",
     ] {
         assert!(
-            models.iter().any(|m| m.id == id),
+            models.iter().any(|m| m.id.as_str() == id),
             "{id} is in image-models.generated.ts @v0.87.1"
         );
     }
     let name = |id: &str| {
         models
             .iter()
-            .find(|m| m.id == id)
+            .find(|m| m.id.as_str() == id)
             .map(|m| m.name.clone())
             .unwrap_or_else(|| panic!("missing {id}"))
     };

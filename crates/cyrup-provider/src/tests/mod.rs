@@ -14,6 +14,7 @@ mod anthropic_sensitive_stop;
 mod api_key_login;
 mod builtin_oauth;
 mod catalog_data;
+mod catalog_model_types;
 mod catalog_refresh;
 mod classifier_dispatch;
 mod classifier_store;

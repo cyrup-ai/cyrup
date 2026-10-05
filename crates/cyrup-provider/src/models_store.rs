@@ -15,7 +15,7 @@
 //! vendor-neutral `packages/ai` layer (here), while the locked, on-disk `FileModelsStore` lives in
 //! the agent layer (here: `cyrup-config`, which owns `FileLock`/`write_atomic`).
 
-use crate::classifier::ClassifierModel;
+use crate::classifier::{ClassifierModel, ImageModel};
 use crate::error::ProviderError;
 use crate::model::Model;
 use cyrup_core::CancelToken;
@@ -166,6 +166,72 @@ pub trait ModelsStore: Send + Sync {
         self.write(provider_id, entry, options).await
     }
 
+    /// The image models persisted for `provider_id` (the `type: "image"` members of pi's one
+    /// `models` array, `ModelsStoreEntry.models: readonly AnyModel[]`, `models-store.ts:3-5`).
+    /// Empty when none were written, which is also every store file written before PROV-128 made
+    /// the catalog ask pi.dev for image rows.
+    ///
+    /// The exact twin of [`ModelsStore::read_classifier_models`], for the reason that method's docs
+    /// give: cyrup's typed [`ModelsStoreEntry`] carries CHAT rows only, so each additional model
+    /// type persists through a sibling pair rather than a new member on a struct literal that four
+    /// other crates build. **PROV-128 makes images the third channel on that seam**, which the
+    /// ledger row predicted; folding all of them into one `Vec<AnyModel>` entry — pi's actual
+    /// shape — remains the open EXT-027 follow-up, and is now worth more than it was.
+    async fn read_image_models(
+        &self,
+        _provider_id: &str,
+        options: Option<&ModelsStoreOperationOptions>,
+    ) -> Result<Vec<ImageModel>, ProviderError> {
+        ModelsStoreOperationOptions::throw_if_aborted(options)?;
+        Ok(Vec::new())
+    }
+
+    /// Replace the image models persisted for `provider_id`; an empty list clears them. Independent
+    /// of [`ModelsStore::write`] and of the classifier half.
+    ///
+    /// The default reports [`ProviderError::ModelSource`] for a non-empty list, because a store
+    /// without image support has nowhere to put it — it says so rather than dropping the rows
+    /// silently, exactly as [`ModelsStore::write_classifier_models`] does.
+    async fn write_image_models(
+        &self,
+        _provider_id: &str,
+        models: Vec<ImageModel>,
+        options: Option<&ModelsStoreOperationOptions>,
+    ) -> Result<(), ProviderError> {
+        ModelsStoreOperationOptions::throw_if_aborted(options)?;
+        if models.is_empty() {
+            return Ok(());
+        }
+        Err(ProviderError::ModelSource(
+            "this models store does not persist image models".into(),
+        ))
+    }
+
+    /// Replace the chat entry AND the image models AND the classifier models of `provider_id` as
+    /// ONE operation — pi's single `write({ models: [...chat, ...images, ...classifiers] })` over
+    /// its one array. This is what the pi.dev catalog refresh calls, because a body fetched with
+    /// `?types=chat,image,classifier` is one catalog and must land as one
+    /// ([`crate::remote_catalog`]).
+    ///
+    /// The default composes the non-chat halves FIRST, for the reason
+    /// [`ModelsStore::write_with_classifiers`] gives: a store that cannot persist a half refuses
+    /// before the chat half is replaced, rather than after. It is NOT atomic across the writes; a
+    /// store whose medium can do better must override it ([`crate::models_store`]'s in-memory store
+    /// and `cyrup-config`'s `FileModelsStore` both do).
+    async fn write_all_types(
+        &self,
+        provider_id: &str,
+        entry: ModelsStoreEntry,
+        images: Vec<ImageModel>,
+        classifiers: Vec<ClassifierModel>,
+        options: Option<&ModelsStoreOperationOptions>,
+    ) -> Result<(), ProviderError> {
+        self.write_image_models(provider_id, images, options)
+            .await?;
+        self.write_with_classifiers(provider_id, entry, classifiers, options)
+            .await
+    }
+
     /// Replace the classifier models persisted for `provider_id`; an empty list clears them.
     /// Independent of [`ModelsStore::write`]: neither call touches what the other wrote (pi's one
     /// `write` replaces the whole array, so a caller persisting both writes both, ideally through
@@ -273,6 +339,40 @@ impl ProviderModelsStore {
             .write_classifier_models(&self.provider_id, models, options)
             .await
     }
+
+    /// [`ModelsStore::read_image_models`] for this provider (PROV-128).
+    pub async fn read_image_models(
+        &self,
+        options: Option<&ModelsStoreOperationOptions>,
+    ) -> Result<Vec<ImageModel>, ProviderError> {
+        self.store
+            .read_image_models(&self.provider_id, options)
+            .await
+    }
+
+    /// [`ModelsStore::write_image_models`] for this provider (PROV-128).
+    pub async fn write_image_models(
+        &self,
+        models: Vec<ImageModel>,
+        options: Option<&ModelsStoreOperationOptions>,
+    ) -> Result<(), ProviderError> {
+        self.store
+            .write_image_models(&self.provider_id, models, options)
+            .await
+    }
+
+    /// [`ModelsStore::write_all_types`] for this provider (PROV-128).
+    pub async fn write_all_types(
+        &self,
+        entry: ModelsStoreEntry,
+        images: Vec<ImageModel>,
+        classifiers: Vec<ClassifierModel>,
+        options: Option<&ModelsStoreOperationOptions>,
+    ) -> Result<(), ProviderError> {
+        self.store
+            .write_all_types(&self.provider_id, entry, images, classifiers, options)
+            .await
+    }
 }
 
 /// Process-local store (Pi `InMemoryModelsStore`, `models-store.ts:30-45`). Used by tests and by
@@ -281,6 +381,7 @@ impl ProviderModelsStore {
 #[derive(Default)]
 pub struct InMemoryModelsStore {
     entries: Mutex<BTreeMap<String, ModelsStoreEntry>>,
+    images: Mutex<BTreeMap<String, Vec<ImageModel>>>,
     classifiers: Mutex<BTreeMap<String, Vec<ClassifierModel>>>,
 }
 
@@ -339,7 +440,10 @@ impl ModelsStore for InMemoryModelsStore {
         if let Ok(mut g) = self.entries.lock() {
             g.remove(provider_id);
         }
-        // Pi's `entries.delete` removes the whole entry, classifier models included.
+        // Pi's `entries.delete` removes the whole entry — image and classifier models included.
+        if let Ok(mut g) = self.images.lock() {
+            g.remove(provider_id);
+        }
         if let Ok(mut g) = self.classifiers.lock() {
             g.remove(provider_id);
         }
@@ -394,6 +498,68 @@ impl ModelsStore for InMemoryModelsStore {
                 g.remove(provider_id);
             } else {
                 g.insert(provider_id.to_string(), models);
+            }
+        }
+        Ok(())
+    }
+
+    async fn read_image_models(
+        &self,
+        provider_id: &str,
+        options: Option<&ModelsStoreOperationOptions>,
+    ) -> Result<Vec<ImageModel>, ProviderError> {
+        ModelsStoreOperationOptions::throw_if_aborted(options)?;
+        Ok(self
+            .images
+            .lock()
+            .ok()
+            .and_then(|g| g.get(provider_id).cloned())
+            .unwrap_or_default())
+    }
+
+    async fn write_image_models(
+        &self,
+        provider_id: &str,
+        models: Vec<ImageModel>,
+        options: Option<&ModelsStoreOperationOptions>,
+    ) -> Result<(), ProviderError> {
+        ModelsStoreOperationOptions::throw_if_aborted(options)?;
+        if let Ok(mut g) = self.images.lock() {
+            if models.is_empty() {
+                g.remove(provider_id);
+            } else {
+                g.insert(provider_id.to_string(), models);
+            }
+        }
+        Ok(())
+    }
+
+    /// All three maps are replaced while all three locks are held, so a reader never sees one
+    /// refresh's chat rows beside another's image or classifier rows (PROV-128).
+    async fn write_all_types(
+        &self,
+        provider_id: &str,
+        entry: ModelsStoreEntry,
+        images: Vec<ImageModel>,
+        classifiers: Vec<ClassifierModel>,
+        options: Option<&ModelsStoreOperationOptions>,
+    ) -> Result<(), ProviderError> {
+        ModelsStoreOperationOptions::throw_if_aborted(options)?;
+        if let (Ok(mut entries), Ok(mut stored_images), Ok(mut stored_classifiers)) = (
+            self.entries.lock(),
+            self.images.lock(),
+            self.classifiers.lock(),
+        ) {
+            entries.insert(provider_id.to_string(), entry);
+            if images.is_empty() {
+                stored_images.remove(provider_id);
+            } else {
+                stored_images.insert(provider_id.to_string(), images);
+            }
+            if classifiers.is_empty() {
+                stored_classifiers.remove(provider_id);
+            } else {
+                stored_classifiers.insert(provider_id.to_string(), classifiers);
             }
         }
         Ok(())

@@ -70,13 +70,13 @@ impl ForkingOrigin {
                     let mut buf = vec![0u8; 8192];
                     let n = sock.read(&mut buf).await.unwrap_or(0);
                     let head = String::from_utf8_lossy(&buf[..n]).to_string();
-                    // `GET /api/models/providers/<id> HTTP/1.1`
-                    let provider = head
-                        .split_whitespace()
-                        .nth(1)
-                        .and_then(|p| p.rsplit('/').next())
-                        .unwrap_or_default()
-                        .to_string();
+                    // `GET /api/models/providers/<id>?types=chat,image,classifier HTTP/1.1` —
+                    // PROV-128 added the query string, so the id is the last path segment with
+                    // the query stripped. Keeping the query in would have made every provider id
+                    // read as `<id>?types=...` and silently broken the narrowing assertions.
+                    let target = head.split_whitespace().nth(1).unwrap_or_default();
+                    let path = target.split('?').next().unwrap_or_default();
+                    let provider = path.rsplit('/').next().unwrap_or_default().to_string();
                     seen.lock().unwrap().push(provider.clone());
                     if stall == Some(provider.as_str()) {
                         // Never answer. The caller's deadline is the only thing that ends this.

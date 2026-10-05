@@ -2,11 +2,12 @@
 
 use crate::auth::{Credential, ProviderAuth};
 use crate::classifier::{
-    AnyModel, ClassifierContext, ClassifierModel, ClassifierOptions, ClassifierResult,
+    AnyModel, ClassifierContext, ClassifierModel, ClassifierOptions, ClassifierResult, ImageModel,
 };
 use crate::collection::clamp_thinking_level;
 use crate::context::Context;
 use crate::error::ProviderError;
+use crate::images::{AssistantImages, ImagesContext, ImagesOptions};
 use crate::model::Model;
 use crate::stream::{StreamEvent, StreamOptions};
 use crate::utils::simple_options::{SimpleStreamOptions, build_base_options};
@@ -276,6 +277,54 @@ pub trait Provider: Send + Sync {
     /// construction (an optional store) answers for that state.
     fn has_refresh_models(&self) -> bool {
         false
+    }
+
+    /// Generate images with one of this provider's image models (pi `Provider.generateImages?`,
+    /// `models.ts:220-225`: "Present when the provider supports dedicated image models. Never
+    /// rejects.").
+    ///
+    /// PROV-128 — pi's member is optional and [`crate::collection::Models::generate_images`] turns
+    /// its absence into `Provider ${model.provider} does not support image generation`
+    /// (`models.ts:956-959`). A Rust trait method cannot be absent, so the default IS that absent
+    /// case: an error envelope with that message. A provider with image models overrides this,
+    /// typically by delegating to a [`crate::images::ImageApiRegistry`] (pi's
+    /// `createProvider({ images })` dispatch on `model.api`, `models.ts:1146-1160`) — which is
+    /// what [`crate::wire::WireProvider::with_images`] installs.
+    ///
+    /// Like [`Provider::classify`], this never fails as a call: every failure is an error
+    /// [`AssistantImages`]. The default is `models.ts:955-962` end to end: the `throw` sits inside
+    /// pi's `try`, whose `catch` is `imageErrorResult(model, error, options?.signal?.aborted)`, so
+    /// the envelope is `aborted` (not `error`) when the request was already cancelled.
+    async fn generate_images(
+        &self,
+        model: &ImageModel,
+        _context: &ImagesContext,
+        options: &ImagesOptions,
+    ) -> AssistantImages {
+        AssistantImages::errored(
+            model,
+            format!(
+                "Provider {} does not support image generation",
+                model.provider
+            ),
+            options.is_aborted(),
+        )
+    }
+
+    /// Whether [`Provider::generate_images`] is more than the absent-member default (pi's
+    /// `if (!provider.generateImages)` presence test, `models.ts:956`).
+    ///
+    /// [`crate::collection::Models::generate_images`] asks this BEFORE it applies request auth,
+    /// because pi throws `does not support image generation` ahead of `applyAuth`
+    /// (`models.ts:954-959`): a provider that cannot generate images must neither need a credential
+    /// nor trigger an OAuth refresh. The default is "this provider lists an image model" (pi
+    /// attaches `generateImages` exactly when the provider was created with image
+    /// implementations, `models.ts:1146`). A provider that overrides [`Provider::generate_images`]
+    /// without listing image models overrides this too.
+    fn supports_image_generation(&self) -> bool {
+        self.get_all_models()
+            .iter()
+            .any(|m| matches!(m, AnyModel::Image(_)))
     }
 
     /// Classify structured state with one of this provider's classifier models (Pi

@@ -47,8 +47,10 @@
 //!   is [`RemoteCatalog::with_request_timeout`]'s default.
 
 use crate::auth::{EnvAuthContext, ProviderAuth};
+use crate::classifier::{AnyModel, ClassifierModel, ImageModel, ModelType};
 use crate::context::Context;
 use crate::error::ProviderError;
+use crate::images::{AssistantImages, ImagesContext, ImagesOptions};
 use crate::model::Model;
 use crate::models_store::{ModelsStore, ModelsStoreEntry};
 use crate::provider::Provider;
@@ -69,6 +71,31 @@ pub const DEFAULT_CATALOG_BASE_URL: &str = "https://pi.dev";
 
 /// Pi `REMOTE_CATALOG_REFRESH_INTERVAL_MS` (`remote-catalog-provider.ts:6`) — four hours.
 pub const REMOTE_CATALOG_REFRESH_INTERVAL_MS: i64 = 4 * 60 * 60 * 1000;
+
+/// The model types this client can consume, sent as `?types=` (1:1 port of pi
+/// `REMOTE_CATALOG_MODEL_TYPES`, `remote-catalog-provider.ts:22`, new at v1.0.0 — PROV-128).
+///
+/// Upstream's own comment states the contract: "Sent as `?types=` so the catalog server returns the
+/// full-type shard instead of the chat-only one served to clients that predate model types. A
+/// server that ignores the parameter still returns the chat-only shard, which this client handles
+/// unchanged." (`:17-21`.)
+///
+/// **The two shards are different JSON shapes, and that is the trap.** Measured against the live
+/// endpoint on 2026-10-05: `/api/models/providers/openrouter` answers a JSON OBJECT keyed by model
+/// id with 400 rows, all `chat`; the same path with `?types=chat,image,classifier` answers a JSON
+/// ARRAY of 469 (400 chat, 59 image, 10 classifier). [`parse_catalog`] accepts both, because pi's
+/// `parseCatalog` does (`:37-51`) and cyrup's port always has — see its own docs. Sending the
+/// parameter without that is what breaks the parse on day one.
+pub const REMOTE_CATALOG_MODEL_TYPES: [ModelType; 3] = ModelType::ALL;
+
+/// `REMOTE_CATALOG_MODEL_TYPES.join(",")` (pi `:102`) — `chat,image,classifier`.
+fn remote_catalog_types_param() -> String {
+    REMOTE_CATALOG_MODEL_TYPES
+        .iter()
+        .map(|t| t.as_str())
+        .collect::<Vec<_>>()
+        .join(",")
+}
 
 /// Default per-request timeout. Pi has no timeout on the background refresh itself and instead
 /// aborts at the caller (15s in `package-manager-cli.ts:397-420` and `model-selector.ts:162-185`);
@@ -142,24 +169,35 @@ pub fn merge_models(baseline: &[Model], dynamic: &[Model]) -> Vec<Model> {
     merged
 }
 
-/// Parse a remote catalog body (1:1 port of Pi `parseCatalog`, `remote-catalog-provider.ts:18-30`).
+/// Parse a remote catalog body (1:1 port of Pi `parseCatalog`, `remote-catalog-provider.ts:37-51`
+/// @v1.0.1).
 ///
 /// Three shapes are accepted, exactly as upstream: a JSON array, `{"models": [...]}`, or a plain
-/// object whose VALUES are models (pi.dev serves model-ID-keyed responses). Anything else is an
-/// error carrying Pi's message verbatim.
+/// object whose VALUES are models. All three are live: pi.dev serves the **model-id-keyed object**
+/// to a client that sends no `?types=`, and a **JSON array** to one that does
+/// ([`REMOTE_CATALOG_MODEL_TYPES`]). Anything else is an error carrying Pi's message verbatim.
 ///
 /// `provider` is forced onto every entry so a mislabelled body can never inject models into another
 /// provider's catalog.
 ///
+/// Rows of every type come back (pi returns `AnyModel[]`, `:40`). PROV-128 — before the `?types=`
+/// parameter this returned `Vec<Model>` and an image or classifier row was silently discarded as a
+/// failed chat parse; the distinction only became observable once the rows started arriving.
+///
+/// A row whose `type` this build does not know is DROPPED, not an error — pi's
+/// `.filter(isSupportedModelType)` (`:49`, defined `:24-30`), which also keeps a row with no
+/// `type` at all (a legacy chat row). The drop has to happen before deserialization because
+/// [`AnyModel`]'s own deserializer rejects an unknown `type` outright; upstream's filter sits in
+/// the same position for the same reason.
+///
 /// **[CYRUP-DELTA]** Pi filters to `"id" in entry` and spreads whatever else is there, because its
-/// `Model` is structural. cyrup's [`Model`] has required fields (`name`/`api`/`baseUrl`/`cost`/…),
-/// so an entry that carries an `id` but does not deserialize is DROPPED rather than fabricated with
-/// invented defaults. Dropping is the floor-preserving choice: the baseline entry for that id simply
-/// survives unmerged.
+/// models are structural. cyrup's are nominal, so an entry that carries an `id` but does not
+/// deserialize is DROPPED rather than fabricated with invented defaults. Dropping is the
+/// floor-preserving choice: the baseline entry for that id simply survives unmerged.
 pub fn parse_catalog(
     provider_id: &str,
     value: &serde_json::Value,
-) -> Result<Vec<Model>, ProviderError> {
+) -> Result<Vec<AnyModel>, ProviderError> {
     let entries: Vec<&serde_json::Value> = match value {
         serde_json::Value::Array(items) => items.iter().collect(),
         serde_json::Value::Object(map) => match map.get("models") {
@@ -178,14 +216,91 @@ pub fn parse_catalog(
         .filter_map(|entry| {
             let object = entry.as_object()?;
             object.get("id")?;
+            if !is_supported_model_type(object) {
+                return None;
+            }
             let mut owned = object.clone();
             owned.insert(
                 "provider".to_string(),
                 serde_json::Value::String(provider_id.to_string()),
             );
-            serde_json::from_value::<Model>(serde_json::Value::Object(owned)).ok()
+            serde_json::from_value::<AnyModel>(serde_json::Value::Object(owned)).ok()
         })
         .collect())
+}
+
+/// pi `isSupportedModelType` (`remote-catalog-provider.ts:24-30`): an absent `type` is a chat row
+/// and is kept; a string `type` is kept only when [`REMOTE_CATALOG_MODEL_TYPES`] names it. A
+/// `type` that is present but not a string is a malformed row and is dropped.
+fn is_supported_model_type(entry: &serde_json::Map<String, serde_json::Value>) -> bool {
+    match entry.get("type") {
+        None => true,
+        Some(serde_json::Value::String(kind)) => REMOTE_CATALOG_MODEL_TYPES
+            .iter()
+            .any(|known| known.as_str() == kind),
+        Some(_) => false,
+    }
+}
+
+/// Split a parsed catalog into its three typed lists, preserving each type's relative order.
+///
+/// This is where the port stops carrying `AnyModel` and starts carrying the three concrete types,
+/// and it is deliberate rather than incidental: downstream of here a chat caller holds `&[Model]`
+/// and CANNOT be handed an image row, so "chat only" is a fact the compiler keeps instead of a
+/// `filter(isModelType(m, "chat"))` that a later edit can forget. pi needs that filter at
+/// `models.ts:1084` and `remote-catalog-provider.ts:73` precisely because its one array is
+/// structurally typed; see `docs/RUST-DESIGN-REVIEW.md` on explicit domain enums and on stating the
+/// exact guarantee (what remains possible: a row can still be the WRONG chat model — splitting by
+/// type says nothing about a row's contents).
+pub fn split_by_type(models: Vec<AnyModel>) -> (Vec<Model>, Vec<ImageModel>, Vec<ClassifierModel>) {
+    let mut chat = Vec::new();
+    let mut images = Vec::new();
+    let mut classifiers = Vec::new();
+    for model in models {
+        match model {
+            AnyModel::Chat(m) => chat.push(m),
+            AnyModel::Image(m) => images.push(m),
+            AnyModel::Classifier(m) => classifiers.push(m),
+        }
+    }
+    (chat, images, classifiers)
+}
+
+/// [`merge_models`] for image rows: pi keys its merge map by `${getModelType(model)}\0${model.id}`
+/// (`remote-catalog-provider.ts:33-35`), so ids are matched WITHIN a type. Order-preserving and
+/// never-shrinking, exactly like the chat merge.
+pub fn merge_image_models(baseline: &[ImageModel], dynamic: &[ImageModel]) -> Vec<ImageModel> {
+    let mut merged = baseline.to_vec();
+    for model in dynamic {
+        match merged.iter().position(|entry| entry.id == model.id) {
+            Some(index) => {
+                if let Some(slot) = merged.get_mut(index) {
+                    *slot = model.clone();
+                }
+            }
+            None => merged.push(model.clone()),
+        }
+    }
+    merged
+}
+
+/// [`merge_models`] for classifier rows; see [`merge_image_models`].
+pub fn merge_classifier_models(
+    baseline: &[ClassifierModel],
+    dynamic: &[ClassifierModel],
+) -> Vec<ClassifierModel> {
+    let mut merged = baseline.to_vec();
+    for model in dynamic {
+        match merged.iter().position(|entry| entry.id == model.id) {
+            Some(index) => {
+                if let Some(slot) = merged.get_mut(index) {
+                    *slot = model.clone();
+                }
+            }
+            None => merged.push(model.clone()),
+        }
+    }
+    merged
 }
 
 /// The overlay a stored entry contributes, after the staleness guard (1:1 port of Pi `remoteModels`,
@@ -199,33 +314,124 @@ pub fn remote_models(
     entry: Option<&ModelsStoreEntry>,
     local_generated_at: Option<i64>,
 ) -> &[Model] {
-    let Some(entry) = entry else { return &[] };
-    if let Some(local) = local_generated_at
-        && entry.last_modified.is_none_or(|remote| remote <= local)
-    {
-        return &[];
+    match entry.filter(|entry| stored_entry_is_newer(entry, local_generated_at)) {
+        Some(entry) => &entry.models,
+        None => &[],
     }
-    &entry.models
+}
+
+/// The staleness guard of [`remote_models`] as a predicate, so the image and classifier channels
+/// of the same persisted entry are gated on the SAME decision rather than a second copy of it
+/// (pi has one `remoteModels`, over one array).
+pub fn stored_entry_is_newer(entry: &ModelsStoreEntry, local_generated_at: Option<i64>) -> bool {
+    match local_generated_at {
+        Some(local) => entry.last_modified.is_some_and(|remote| remote > local),
+        None => true,
+    }
 }
 
 // ------------------------------------------------------------------------------- the overlay ----
 
+/// One provider's overlay rows, split by model type (PROV-128).
+///
+/// The split is the point: the chat accessor returns `&[Model]`, so no caller on a chat path can be
+/// handed an image row even by mistake. pi keeps one `AnyModel[]` and re-filters it at every read
+/// (`remote-catalog-provider.ts:73`, `models.ts:1084`); the filter is what this type makes
+/// unnecessary.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ProviderOverlay {
+    chat: Vec<Model>,
+    images: Vec<ImageModel>,
+    classifiers: Vec<ClassifierModel>,
+}
+
+impl ProviderOverlay {
+    /// Split a parsed catalog (pi's `AnyModel[]`) into the three typed lists.
+    pub fn from_any(models: Vec<AnyModel>) -> Self {
+        let (chat, images, classifiers) = split_by_type(models);
+        Self {
+            chat,
+            images,
+            classifiers,
+        }
+    }
+
+    pub fn from_chat(chat: Vec<Model>) -> Self {
+        Self {
+            chat,
+            images: Vec::new(),
+            classifiers: Vec::new(),
+        }
+    }
+
+    pub fn from_parts(
+        chat: Vec<Model>,
+        images: Vec<ImageModel>,
+        classifiers: Vec<ClassifierModel>,
+    ) -> Self {
+        Self {
+            chat,
+            images,
+            classifiers,
+        }
+    }
+
+    pub fn chat(&self) -> &[Model] {
+        &self.chat
+    }
+
+    pub fn images(&self) -> &[ImageModel] {
+        &self.images
+    }
+
+    pub fn classifiers(&self) -> &[ClassifierModel] {
+        &self.classifiers
+    }
+
+    /// `true` when this provider's overlay contributes nothing of ANY type. An overlay that
+    /// contributes nothing must be indistinguishable from no overlay.
+    pub fn is_empty(&self) -> bool {
+        self.chat.is_empty() && self.images.is_empty() && self.classifiers.is_empty()
+    }
+
+    /// Keep only the rows that label themselves as belonging to `provider_id` — pi's
+    /// `.filter(model => model.provider === provider.id)` (`:59`): a body that mislabels its
+    /// provider must not leak into another provider's catalog.
+    #[must_use]
+    pub fn retain_provider(mut self, provider_id: &str) -> Self {
+        self.chat.retain(|m| m.provider.as_str() == provider_id);
+        self.images.retain(|m| m.provider.as_str() == provider_id);
+        self.classifiers
+            .retain(|m| m.provider.as_str() == provider_id);
+        self
+    }
+}
+
 /// A loaded, already-staleness-checked overlay: provider id → the models that provider's remote
-/// catalog contributes. Cheap to clone behind an `Arc` and immutable once built, so the sync, hot
-/// registry reads never touch the disk or take a lock.
+/// catalog contributes, split by type. Cheap to clone behind an `Arc` and immutable once built, so
+/// the sync, hot registry reads never touch the disk or take a lock.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct CatalogOverlay {
-    by_provider: BTreeMap<String, Vec<Model>>,
+    by_provider: BTreeMap<String, ProviderOverlay>,
 }
 
 impl CatalogOverlay {
-    /// Build from already-parsed per-provider model lists. Entries whose models are empty are
+    /// Build from already-parsed per-provider CHAT model lists. Entries whose models are empty are
     /// dropped — an empty overlay and no overlay must be indistinguishable.
     pub fn from_entries(entries: impl IntoIterator<Item = (String, Vec<Model>)>) -> Self {
+        Self::from_overlays(
+            entries
+                .into_iter()
+                .map(|(id, models)| (id, ProviderOverlay::from_chat(models))),
+        )
+    }
+
+    /// Build from per-provider lists of every type (PROV-128).
+    pub fn from_overlays(entries: impl IntoIterator<Item = (String, ProviderOverlay)>) -> Self {
         Self {
             by_provider: entries
                 .into_iter()
-                .filter(|(_, models)| !models.is_empty())
+                .filter(|(_, overlay)| !overlay.is_empty())
                 .collect(),
         }
     }
@@ -239,11 +445,30 @@ impl CatalogOverlay {
         self.by_provider.keys().map(String::as_str)
     }
 
-    /// The remote models for one provider (empty when this provider has no overlay).
+    /// Everything this overlay contributes for one provider.
+    pub fn overlay_for(&self, provider_id: &str) -> Option<&ProviderOverlay> {
+        self.by_provider.get(provider_id)
+    }
+
+    /// The remote CHAT models for one provider (empty when this provider has no overlay).
     pub fn models_for(&self, provider_id: &str) -> &[Model] {
         self.by_provider
             .get(provider_id)
-            .map_or(&[][..], Vec::as_slice)
+            .map_or(&[][..], ProviderOverlay::chat)
+    }
+
+    /// The remote image models for one provider (PROV-128).
+    pub fn image_models_for(&self, provider_id: &str) -> &[ImageModel] {
+        self.by_provider
+            .get(provider_id)
+            .map_or(&[][..], ProviderOverlay::images)
+    }
+
+    /// The remote classifier models for one provider (PROV-128).
+    pub fn classifier_models_for(&self, provider_id: &str) -> &[ClassifierModel] {
+        self.by_provider
+            .get(provider_id)
+            .map_or(&[][..], ProviderOverlay::classifiers)
     }
 
     /// `baseline` with this provider's overlay merged over it (see [`merge_models`] — never shrinks).
@@ -252,14 +477,15 @@ impl CatalogOverlay {
     }
 
     /// Wrap `provider` so its catalog reads come back merged (Pi `withRemoteCatalog`,
-    /// `remote-catalog-provider.ts:44-119`). Returns `provider` UNCHANGED when this overlay has
+    /// `remote-catalog-provider.ts:61-158`). Returns `provider` UNCHANGED when this overlay has
     /// nothing for it, so the no-overlay path allocates nothing and behaves bit-identically to today.
     pub fn apply(&self, provider: Arc<dyn Provider>) -> Arc<dyn Provider> {
-        let dynamic = self.models_for(provider.id().as_str());
-        if dynamic.is_empty() {
-            return provider;
+        match self.by_provider.get(provider.id().as_str()) {
+            Some(overlay) if !overlay.is_empty() => {
+                Arc::new(RemoteCatalogProvider::new(provider, overlay))
+            }
+            _ => provider,
         }
-        Arc::new(RemoteCatalogProvider::new(provider, dynamic))
     }
 }
 
@@ -295,12 +521,38 @@ impl CatalogOverlay {
 pub struct RemoteCatalogProvider {
     inner: Arc<dyn Provider>,
     models: Vec<Model>,
+    /// The inner provider's non-chat rows with this overlay merged over them, computed once at
+    /// construction for the same reason `models` is (see the module doc). PROV-128.
+    image_models: Vec<ImageModel>,
+    classifier_models: Vec<ClassifierModel>,
 }
 
 impl RemoteCatalogProvider {
-    pub fn new(inner: Arc<dyn Provider>, dynamic: &[Model]) -> Self {
-        let models = merge_models(inner.models(), dynamic);
-        Self { inner, models }
+    pub fn new(inner: Arc<dyn Provider>, overlay: &ProviderOverlay) -> Self {
+        let models = merge_models(inner.models(), overlay.chat());
+        // The baseline for the non-chat types is the inner provider's own `get_all_models()`, the
+        // same way the chat baseline is its `models()` (pi merges over
+        // `provider.getAllModels?.() ?? provider.getModels()`, `remote-catalog-provider.ts:75`).
+        let inner_all = inner.get_all_models();
+        let baseline_images: Vec<ImageModel> = inner_all
+            .iter()
+            .filter_map(AnyModel::as_image)
+            .cloned()
+            .collect();
+        let baseline_classifiers: Vec<ClassifierModel> = inner_all
+            .iter()
+            .filter_map(AnyModel::as_classifier)
+            .cloned()
+            .collect();
+        Self {
+            inner,
+            models,
+            image_models: merge_image_models(&baseline_images, overlay.images()),
+            classifier_models: merge_classifier_models(
+                &baseline_classifiers,
+                overlay.classifiers(),
+            ),
+        }
     }
 
     /// The undecorated provider (its catalog is the built-in floor).
@@ -333,6 +585,68 @@ impl Provider for RemoteCatalogProvider {
 
     fn models(&self) -> &[Model] {
         &self.models
+    }
+
+    /// PROV-M01 + PROV-128 — carried by `...provider` upstream, and the ONE member whose omission
+    /// was a live capability loss rather than a latent one once a built-in gained image rows: the
+    /// trait default rebuilds the list from `models()`, which is chat-only, so an overlaid
+    /// `openrouter` would have reported its 55 image rows as absent for as long as an overlay
+    /// existed — and `supports_image_generation`'s default, which reads this, would have gone with
+    /// them. Upstream's own `getAllModels` merges over
+    /// `provider.getAllModels?.() ?? provider.getModels()` (`remote-catalog-provider.ts:75`).
+    fn get_all_models(&self) -> Vec<AnyModel> {
+        let mut all: Vec<AnyModel> = Vec::with_capacity(
+            self.models.len() + self.image_models.len() + self.classifier_models.len(),
+        );
+        all.extend(self.models.iter().cloned().map(AnyModel::Chat));
+        all.extend(self.image_models.iter().cloned().map(AnyModel::Image));
+        all.extend(
+            self.classifier_models
+                .iter()
+                .cloned()
+                .map(AnyModel::Classifier),
+        );
+        all
+    }
+
+    /// PROV-M01 — carried by `...provider`. The trait default is the ABSENT-member error envelope,
+    /// so omitting this would make an overlaid provider report "does not support image generation"
+    /// for a model its inner provider can generate. PROV-128.
+    async fn generate_images(
+        &self,
+        model: &ImageModel,
+        context: &ImagesContext,
+        options: &ImagesOptions,
+    ) -> AssistantImages {
+        self.inner.generate_images(model, context, options).await
+    }
+
+    /// PROV-M01 — forwarded with [`Provider::generate_images`]: the default answers from
+    /// `get_all_models()`, which for this decorator includes OVERLAY image rows the inner provider
+    /// may have no implementation for. The inner provider's own answer is the truthful one (pi's
+    /// `generateImages` presence travels through the spread with its implementation). PROV-128.
+    fn supports_image_generation(&self) -> bool {
+        self.inner.supports_image_generation()
+    }
+
+    /// PROV-M01 — carried by `...provider`. Same shape as [`Provider::generate_images`]: the trait
+    /// default is the absent-member error result, so an overlaid provider with classifier models
+    /// would have reported "does not support classification". Latent before PROV-128 (no built-in
+    /// ships classifier rows and extension providers are not overlaid) and fixed here with the
+    /// image leg, because both legs are lost by the same omission.
+    async fn classify(
+        &self,
+        model: &crate::classifier::ClassifierModel,
+        context: &crate::classifier::ClassifierContext,
+        options: &crate::classifier::ClassifierOptions,
+    ) -> crate::classifier::ClassifierResult {
+        self.inner.classify(model, context, options).await
+    }
+
+    /// PROV-M01 — forwarded with [`Provider::classify`], for the reason
+    /// [`Provider::supports_image_generation`]'s forward gives.
+    fn supports_classification(&self) -> bool {
+        self.inner.supports_classification()
     }
 
     /// PROV-M01 — carried by `...provider`. The trait default returns the catalog UNCHANGED, which
@@ -522,7 +836,7 @@ impl RemoteCatalog {
     /// all contribute nothing. This is the call that belongs on the startup path — it is a bounded
     /// number of small reads from one already-open JSON file, never a request.
     pub async fn load_overlay(&self, provider_ids: &[&str]) -> CatalogOverlay {
-        let mut entries: Vec<(String, Vec<Model>)> = Vec::new();
+        let mut entries: Vec<(String, ProviderOverlay)> = Vec::new();
         for id in provider_ids {
             let stored = self.store.read(id, None).await.ok().flatten();
             // Per-provider floor when one exists (XAI_1), else the global stamp — never the other
@@ -532,18 +846,37 @@ impl RemoteCatalog {
                 .get(*id)
                 .copied()
                 .or(self.local_generated_at);
+            let chat: Vec<Model> = remote_models(stored.as_ref(), floor).to_vec();
+            // PROV-128 — the image and classifier halves of the same persisted entry, gated on the
+            // SAME staleness decision (`stored_entry_is_newer`) so a stale entry cannot contribute
+            // non-chat rows after its chat rows were discarded. Both reads degrade to empty: a
+            // store that does not persist them is pi's pre-v1.0.0 file, not an error.
+            let fresh = stored
+                .as_ref()
+                .is_some_and(|entry| stored_entry_is_newer(entry, floor));
+            let (images, classifiers) = if fresh {
+                (
+                    self.store
+                        .read_image_models(id, None)
+                        .await
+                        .unwrap_or_default(),
+                    self.store
+                        .read_classifier_models(id, None)
+                        .await
+                        .unwrap_or_default(),
+                )
+            } else {
+                (Vec::new(), Vec::new())
+            };
             // Pi filters the overlay to `model.provider === provider.id` (`:59`): a body that
             // mislabels its provider must not leak into another provider's catalog.
-            let models: Vec<Model> = remote_models(stored.as_ref(), floor)
-                .iter()
-                .filter(|m| m.provider.as_str() == *id)
-                .cloned()
-                .collect();
-            if !models.is_empty() {
-                entries.push(((*id).to_string(), models));
+            let overlay =
+                ProviderOverlay::from_parts(chat, images, classifiers).retain_provider(id);
+            if !overlay.is_empty() {
+                entries.push(((*id).to_string(), overlay));
             }
         }
-        CatalogOverlay::from_entries(entries)
+        CatalogOverlay::from_overlays(entries)
     }
 
     /// Refresh one provider's catalog, deduplicated against any concurrent call for the same id.
@@ -633,10 +966,17 @@ impl RemoteCatalog {
             .filter(|entry| !entry.models.is_empty())
             .and_then(|entry| entry.etag.clone());
 
+        // `url.searchParams.set("types", REMOTE_CATALOG_MODEL_TYPES.join(","))`
+        // (`remote-catalog-provider.ts:101-102`) — PROV-128. Without it pi.dev serves the
+        // chat-only shard and no image or classifier row ever arrives; with it the response is a
+        // different top-level JSON shape, which [`parse_catalog`] handles. The value is
+        // `chat,image,classifier`; `,` is a legal sub-delim in a query value, and upstream's
+        // `URLSearchParams` does not escape it either.
         let url = format!(
-            "{}/api/models/providers/{}",
+            "{}/api/models/providers/{}?types={}",
             self.base_url.trim_end_matches('/'),
-            encode_path_segment(provider_id)
+            encode_path_segment(provider_id),
+            remote_catalog_types_param()
         );
 
         // Reuse the provider-traffic client builder so the catalog fetch honours the same
@@ -744,17 +1084,24 @@ impl RemoteCatalog {
             ))
         })?;
         let refreshed = parse_catalog(provider_id, &value)?;
-
+        // PROV-128 — the body now carries every type, so all three halves are persisted, as ONE
+        // store operation: pi writes one `models: AnyModel[]` array (`:143`), and a reader must
+        // never see new chat rows beside the previous refresh's image rows. cyrup's entry carries
+        // chat rows only (the EXT-027 seam), so `write_all_types` is what makes the three halves
+        // one write.
+        let (chat, images, classifiers) = split_by_type(refreshed);
         let _ = self
             .store
-            .write(
+            .write_all_types(
                 provider_id,
                 ModelsStoreEntry {
-                    models: refreshed,
+                    models: chat,
                     checked_at: Some(checked_at),
                     last_modified: Some(last_modified),
                     etag,
                 },
+                images,
+                classifiers,
                 None,
             )
             .await;
@@ -872,7 +1219,7 @@ mod tests {
         );
         assert!(inner.headers().is_some(), "fixture must declare headers");
 
-        let overlay = vec![model("decorated", "keep-c", 3)];
+        let overlay = ProviderOverlay::from_chat(vec![model("decorated", "keep-c", 3)]);
         let w = RemoteCatalogProvider::new(inner.clone(), &overlay);
 
         assert_eq!(w.id(), inner.id());
@@ -989,7 +1336,8 @@ mod tests {
         for value in [array, wrapped, keyed] {
             let parsed = parse_catalog("groq", &value).unwrap();
             assert_eq!(parsed.len(), 1);
-            assert_eq!(parsed[0].provider.as_str(), "groq");
+            assert_eq!(parsed[0].provider().as_str(), "groq");
+            assert_eq!(parsed[0].model_type(), ModelType::Chat);
         }
         // Non-object/array bodies carry Pi's message verbatim.
         let err = parse_catalog("groq", &serde_json::json!(42)).unwrap_err();

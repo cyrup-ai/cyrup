@@ -13,10 +13,12 @@ use crate::auth::{
     InMemoryCredentialStore, ProviderEnv, resolve_provider_auth,
 };
 use crate::classifier::{
-    AnyModel, ClassifierContext, ClassifierModel, ClassifierOptions, ClassifierResult, ModelType,
+    AnyModel, ClassifierContext, ClassifierModel, ClassifierOptions, ClassifierResult, ImageModel,
+    ModelType,
 };
 use crate::context::Context;
 use crate::error::ProviderError;
+use crate::images::{AssistantImages, ImagesContext, ImagesOptions};
 use crate::model::Model;
 use crate::provider::Provider;
 use crate::stream::{StreamEvent, StreamOptions, collect_message};
@@ -212,9 +214,11 @@ impl Models {
     }
 
     // ---- multi-type reads (Pi `getAllModels` `models.ts:446-463`, `getModelsOfType` `:468-470`,
-    // `getModelOfType` `:476-478` @v0.99.2-17). [`ModelType::Image`] is representable as of
-    // PROV-128 step (1); no provider lists image rows through [`Provider::get_all_models`] yet,
-    // which is that row's step (2). ----
+    // `getModelOfType` `:476-478` @v0.99.2-17). All three types are reachable here as of PROV-128:
+    // `openrouter` lists its image rows through [`Provider::get_all_models`]
+    // ([`crate::providers::openrouter`]), and the pi.dev overlay contributes image and classifier
+    // rows for any provider the live catalog serves them for
+    // ([`crate::remote_catalog::RemoteCatalogProvider`]). ----
 
     /// Last-known models of every type from one provider, or all providers (Pi `getAllModels`).
     /// Each provider contributes [`Provider::get_all_models`], whose default is its chat catalog
@@ -257,6 +261,22 @@ impl Models {
         self.get_models_of_type(model_type, Some(provider))
             .into_iter()
             .find(|m| m.id() == id)
+    }
+
+    /// The image models of one provider, or all providers (Pi `getModelsOfType("image")`).
+    /// PROV-128.
+    pub fn get_image_models(&self, provider: Option<&str>) -> Vec<ImageModel> {
+        self.get_all_models(provider)
+            .into_iter()
+            .filter_map(AnyModel::into_image)
+            .collect()
+    }
+
+    /// One image model by provider and id (Pi `getModelOfType("image", ...)`). PROV-128.
+    pub fn get_image_model(&self, provider: &str, id: &str) -> Option<ImageModel> {
+        self.get_image_models(Some(provider))
+            .into_iter()
+            .find(|m| m.id.as_str() == id)
     }
 
     /// The classifier models of one provider, or all providers (Pi `getModelsOfType("classifier")`).
@@ -310,6 +330,43 @@ impl Models {
             overrides,
         )
         .await?)
+    }
+
+    /// Resolve request auth for a model of ANY type — pi's `getAuth(model: AnyModel, overrides?)`
+    /// overload (`models.ts:734-753` @v1.0.1), which is typed for every model shape.
+    ///
+    /// PROV-128 — [`Models::get_auth`] takes a chat [`Model`], and the deleted parallel images tree
+    /// carried its own `ImagesModels::get_auth(&ImagesModel)`. Retiring that tree without this
+    /// would have been a lost ability: there would be no way to ask the collection for an image
+    /// model's credential at all. Routing every type through one method is upstream's shape, and it
+    /// closes the same hole for [`ClassifierModel`], which never had a public accessor either.
+    ///
+    /// `Ok(None)` when the provider is unknown or unconfigured, exactly as [`Models::get_auth`].
+    pub async fn get_any_auth(
+        &self,
+        model: &AnyModel,
+    ) -> Result<Option<AuthResult>, ProviderError> {
+        self.get_any_auth_with(model, AuthOverrides::default())
+            .await
+    }
+
+    /// [`Models::get_any_auth`] with per-request overrides.
+    ///
+    /// Non-chat models resolve through their `to_auth_model()` shim, which is what
+    /// [`Models::generate_images`] and [`Models::classify`] already pass to `resolve_provider_auth`
+    /// — pi types `resolveProviderAuth` for every model shape and cyrup's takes a [`Model`], so the
+    /// shim is the port of that typing, not an approximation of it (strategies read only identity,
+    /// `base_url` and `headers`).
+    pub async fn get_any_auth_with(
+        &self,
+        model: &AnyModel,
+        overrides: AuthOverrides<'_>,
+    ) -> Result<Option<AuthResult>, ProviderError> {
+        match model {
+            AnyModel::Chat(m) => self.get_auth_with(m, overrides).await,
+            AnyModel::Image(m) => self.get_auth_with(&m.to_auth_model(), overrides).await,
+            AnyModel::Classifier(m) => self.get_auth_with(&m.to_auth_model(), overrides).await,
+        }
     }
 
     // ---- stream / complete (Pi `stream` declared `models.ts:173-177` / implemented `:489-502`,
@@ -461,6 +518,119 @@ impl Models {
         options: &SimpleStreamOptions,
     ) -> AssistantMessage {
         collect_message(self.stream_simple(model, context, options)).await
+    }
+
+    /// Generate images through the owning provider, applying request auth first (pi
+    /// `Models.generateImages`, `models.ts:948-963` @v1.0.1). PROV-128.
+    ///
+    /// **Never fails as a call**: an unknown provider (`Unknown provider: ${model.provider}`), a
+    /// provider that is not configured (`Provider is not configured: ...`), a failed auth
+    /// resolution, and a provider without image generation
+    /// ([`Provider::generate_images`]'s default) all come back as an error [`AssistantImages`],
+    /// marked `aborted` when the request was cancelled (`imageErrorResult(model, error,
+    /// options?.signal?.aborted)`, `:962`).
+    ///
+    /// Support is checked BEFORE auth, as pi does (`:956-959`): a provider that cannot generate
+    /// images ([`Provider::supports_image_generation`]) is answered without a credential read.
+    ///
+    /// Auth is applied exactly as [`Models::classify`] applies it — pi's one `applyAuth` serves
+    /// every operation (`:837-869`).
+    pub async fn generate_images(
+        &self,
+        model: &ImageModel,
+        context: &ImagesContext,
+        options: &ImagesOptions,
+    ) -> AssistantImages {
+        let Some(provider) = self.providers.get(model.provider.as_str()) else {
+            return AssistantImages::errored(
+                model,
+                format!("Unknown provider: {}", model.provider),
+                options.is_aborted(),
+            );
+        };
+        // `if (!provider.generateImages) throw ...` precedes `applyAuth` (`models.ts:956-959`).
+        if !provider.supports_image_generation() {
+            return AssistantImages::errored(
+                model,
+                format!(
+                    "Provider {} does not support image generation",
+                    model.provider
+                ),
+                options.is_aborted(),
+            );
+        }
+        let (request_model, request_options) = match self
+            .apply_images_auth(provider.as_ref(), model, options)
+            .await
+        {
+            Ok(request) => request,
+            Err(message) => {
+                return AssistantImages::errored(model, message, options.is_aborted());
+            }
+        };
+        provider
+            .generate_images(&request_model, context, &request_options)
+            .await
+    }
+
+    /// Pi `applyAuth` (`models.ts:837-869`) for an image request; the `Err` string is the error
+    /// envelope's message. Identical in every clause to [`Models::apply_classifier_auth`] —
+    /// upstream has ONE `applyAuth` for every operation, so the two must not drift.
+    async fn apply_images_auth(
+        &self,
+        provider: &dyn Provider,
+        model: &ImageModel,
+        options: &ImagesOptions,
+    ) -> Result<(ImageModel, ImagesOptions), String> {
+        let resolution = match provider.provider_auth() {
+            Some(auth_strategy) => {
+                let resolved = resolve_provider_auth(
+                    &model.provider,
+                    auth_strategy,
+                    &model.to_auth_model(),
+                    self.credentials.as_ref(),
+                    self.auth_context.as_ref(),
+                    AuthOverrides {
+                        api_key: options.api_key.as_deref(),
+                        env: options.env.as_ref(),
+                        min_oauth_validity_ms: None,
+                    },
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+                Some(
+                    resolved
+                        .ok_or_else(|| format!("Provider is not configured: {}", model.provider))?,
+                )
+            }
+            None => None,
+        };
+        let (auth, resolution_env) = match &resolution {
+            Some(r) => (Some(&r.auth), r.env.as_ref()),
+            None => (None, None),
+        };
+
+        let mut request_model = model.clone();
+        if let Some(base_url) = auth.and_then(|a| a.base_url.as_ref()) {
+            request_model.base_url = base_url.clone();
+        }
+        let mut request_options = options.clone();
+        request_options.api_key = options
+            .api_key
+            .clone()
+            .or_else(|| auth.and_then(|a| a.api_key.clone()));
+        let auth_headers = merge_headers(
+            auth.and_then(|a| a.headers.as_ref()),
+            model.headers.as_ref(),
+        );
+        let mut headers = merge_headers(auth_headers.as_ref(), options.headers.as_ref());
+        if let Some(transform) = &options.transform_headers {
+            headers = Some(transform(headers.unwrap_or_default()).await);
+        }
+        request_options.headers = headers;
+        request_options.transform_headers = None;
+        request_options.env = merge_env(resolution_env, options.env.as_ref());
+        Ok((request_model, request_options))
     }
 
     /// Classify structured state through the owning provider, applying request auth first (Pi
@@ -1244,6 +1414,72 @@ mod tests {
         // Unknown provider → Ok(None).
         let unknown = model("nope", "x", false, None);
         assert!(models.get_auth(&unknown).await.expect("ok").is_none());
+    }
+
+    /// PROV-128 — pi folds auth resolution for every model type into ONE `getAuth(model: AnyModel)`
+    /// (`models.ts:734-753` @v1.0.1). The deleted parallel images tree had its own
+    /// `ImagesModels::get_auth(&ImagesModel)`; without [`Models::get_any_auth`] retiring that tree
+    /// would have left no way to resolve an image model's credential from the collection at all.
+    ///
+    /// `openrouter` is the one built-in that lists chat AND image rows, so one provider covers two
+    /// of the three arms; the classifier arm is built by hand because cyrup ships no built-in
+    /// classifier catalog.
+    #[tokio::test]
+    async fn the_collection_resolves_auth_for_a_model_of_every_type() {
+        let mut models = create_models(CreateModelsOptions {
+            credentials: None,
+            auth_context: Some(Arc::new(MapCtx(BTreeMap::from([(
+                "OPENROUTER_API_KEY".to_string(),
+                "sk-or".to_string(),
+            )])))),
+            catalog_overlay: None,
+        });
+        models.set_provider(Arc::new(crate::providers::fleet::OPENROUTER.provider()));
+
+        let key = |auth: Option<crate::auth::AuthResult>| {
+            auth.expect("configured").auth.api_key.expect("an api key")
+        };
+
+        let chat = models
+            .get_all_models(Some("openrouter"))
+            .into_iter()
+            .find(|m| m.model_type() == ModelType::Chat)
+            .expect("openrouter lists chat rows");
+        assert_eq!(key(models.get_any_auth(&chat).await.expect("ok")), "sk-or");
+
+        let image = models
+            .get_all_models(Some("openrouter"))
+            .into_iter()
+            .find(|m| m.model_type() == ModelType::Image)
+            .expect("openrouter lists image rows");
+        assert_eq!(key(models.get_any_auth(&image).await.expect("ok")), "sk-or");
+
+        let classifier = AnyModel::Classifier(ClassifierModel {
+            id: "~typesafe/jev-latest".into(),
+            name: "TypeSafe: Jev Latest".into(),
+            api: "typesafe-system-one".into(),
+            provider: "openrouter".into(),
+            base_url: "https://openrouter.ai/api/v1".to_string(),
+            input: vec![crate::model::Modality::Text],
+            cost: crate::model::ModelCost::default(),
+            headers: None,
+            context_window: 32_000,
+        });
+        assert_eq!(
+            key(models.get_any_auth(&classifier).await.expect("ok")),
+            "sk-or"
+        );
+
+        // An unknown provider is `Ok(None)` for every type, exactly as `get_auth` is.
+        let mut orphan = image.clone().into_image().expect("an image model");
+        orphan.provider = "nope".into();
+        assert!(
+            models
+                .get_any_auth(&AnyModel::Image(orphan))
+                .await
+                .expect("ok")
+                .is_none()
+        );
     }
 
     #[tokio::test]

@@ -15,8 +15,12 @@ use crate::auth::{
     AuthContext, AuthOverrides, CredentialStore, EnvAuthContext, ProviderAuth,
     resolve_provider_auth,
 };
+use crate::classifier::{AnyModel, ImageModel};
 use crate::context::Context;
 use crate::error::ProviderError;
+use crate::images::{
+    AssistantImages, ImageApiRegistry, ImagesContext, ImagesOptions, ProviderImages,
+};
 use crate::model::Model;
 use crate::provider::Provider;
 use crate::stream::{StreamEvent, StreamOptions};
@@ -45,6 +49,18 @@ pub struct WireProvider {
     /// Pi `createProvider({ filterModels })` — the option `models.ts:545`/`:618` transports onto
     /// the constructed provider, applied by `Models.getAvailable()` at `:407`. PROV-032.
     filter_models: Option<FilterModelsFn>,
+    /// The provider's `type: "image"` catalog rows (pi's ONE `models` array holds every type;
+    /// `CreateProviderOptions.models: readonly ProviderModel<TApi>[]`, `models.ts:997`). Held
+    /// apart from [`WireProvider::models`] rather than in one `Vec<AnyModel>` so that
+    /// [`Provider::models`] — whose every caller streams what it is handed — CANNOT return an
+    /// image row: that is a type-level fact here, not a filter a caller has to remember. pi needs
+    /// the runtime `isModelType` filter at `models.ts:1084` precisely because its one array is
+    /// structurally typed. PROV-128.
+    image_models: Vec<ImageModel>,
+    /// Pi `createProvider({ images })` (`CreateProviderOptions.images`, `models.ts:1021`) — the
+    /// per-api image-generation map, dispatched on `model.api` at `:1146-1160`. `None` is pi's
+    /// absent option, which is what makes `provider.generateImages` absent. PROV-128.
+    images: Option<Arc<ImageApiRegistry>>,
 }
 
 /// A provider's credential-scoped availability policy (Pi `Provider.filterModels?`,
@@ -74,6 +90,8 @@ impl WireProvider {
             base_url: None,
             headers: None,
             filter_models: None,
+            image_models: Vec::new(),
+            images: None,
         }
     }
 
@@ -99,6 +117,26 @@ impl WireProvider {
         self
     }
 
+    /// Add the provider's image catalog rows (pi's `...Object.values(OPENROUTER_IMAGE_MODELS)`
+    /// inside the one `models` array, `providers/openrouter.ts:25`). They appear in
+    /// [`Provider::get_all_models`] and NOT in [`Provider::models`]. PROV-128.
+    #[must_use]
+    pub fn with_image_models(mut self, models: Vec<ImageModel>) -> Self {
+        self.image_models = models;
+        self
+    }
+
+    /// Install the per-api image-generation map (pi `createProvider({ images })`,
+    /// `providers/openrouter.ts:33`). Installing it is what makes
+    /// [`Provider::supports_image_generation`] true, exactly as pi attaches `generateImages` only
+    /// when `images` carries at least one implementation (`models.ts:1146`); an EMPTY registry is
+    /// therefore ignored, which is pi's `imageImplementations.length === 0`. PROV-128.
+    #[must_use]
+    pub fn with_images(mut self, images: Arc<ImageApiRegistry>) -> Self {
+        self.images = (!images.is_empty()).then_some(images);
+        self
+    }
+
     /// Override the ambient auth context (for tests / custom env sources).
     #[must_use]
     pub fn with_auth_context(mut self, ctx: Arc<dyn AuthContext>) -> Self {
@@ -111,6 +149,7 @@ impl WireProvider {
     }
 }
 
+#[async_trait::async_trait]
 impl Provider for WireProvider {
     fn id(&self) -> &ProviderId {
         &self.id
@@ -130,6 +169,48 @@ impl Provider for WireProvider {
 
     fn models(&self) -> &[Model] {
         &self.models
+    }
+
+    /// Pi `getAllModels: currentModels` (`models.ts:1085`): the ONE catalog, every type. Chat rows
+    /// first, then image rows, in the order `createProvider({ models })` was given them
+    /// (`providers/openrouter.ts:23-27`). PROV-128.
+    fn get_all_models(&self) -> Vec<AnyModel> {
+        let mut all: Vec<AnyModel> =
+            Vec::with_capacity(self.models.len() + self.image_models.len());
+        all.extend(self.models.iter().cloned().map(AnyModel::Chat));
+        all.extend(self.image_models.iter().cloned().map(AnyModel::Image));
+        all
+    }
+
+    /// Pi dispatches `images[model.api]` and answers `imageErrorResult` when there is no entry
+    /// (`models.ts:1146-1160`); [`ImageApiRegistry`] is that map and that message. With no `images`
+    /// option at all the trait default runs, which is pi's absent member. PROV-128.
+    async fn generate_images(
+        &self,
+        model: &ImageModel,
+        context: &ImagesContext,
+        options: &ImagesOptions,
+    ) -> AssistantImages {
+        match &self.images {
+            Some(images) => images.generate_images(model, context, options).await,
+            None => AssistantImages::errored(
+                model,
+                format!(
+                    "Provider {} does not support image generation",
+                    model.provider
+                ),
+                options.is_aborted(),
+            ),
+        }
+    }
+
+    /// Pi attaches `generateImages` exactly when `createProvider` was given a non-empty `images`
+    /// map (`models.ts:1146`) — NOT when the catalog happens to hold an image row. So this answers
+    /// for the map, not the catalog: a provider given image rows but no implementation reports
+    /// "does not support image generation" before any credential is read, rather than resolving
+    /// auth and then failing on dispatch. PROV-128.
+    fn supports_image_generation(&self) -> bool {
+        self.images.is_some()
     }
 
     fn filter_models(
