@@ -86,6 +86,11 @@ impl Probe {
         self
     }
 
+    fn failing(mut self) -> Self {
+        self.hook = Some(Arc::new(|_| Err(ToolError::new("hook exploded"))));
+        self
+    }
+
     fn ran(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.ran)
     }
@@ -534,4 +539,46 @@ async fn the_guest_get_all_tools_rows_carry_exposure_and_namespace() {
     assert_eq!(row("hidden_t")["exposure"], "hidden");
     assert_eq!(row("direct_t")["exposure"], "direct");
     assert!(row("direct_t").get("namespace").is_none());
+}
+
+/// A `prepare_loadout` hook that fails is reported on the extension error channel with event
+/// `prepare_loadout` (pi `emitError`, `agent-session.ts:1556-1561` @v1.0.1) and changes nothing:
+/// the failing tool and its neighbours stay declared.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failing_loadout_hook_is_reported_and_leaves_the_loadout_intact() {
+    let fx = fixture();
+    let requests: Requests = Arc::new(Mutex::new(Vec::new()));
+    let faux = script(&requests, vec![Reply::Text("done")]);
+    let errors: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+    let session = session_with(
+        &fx,
+        faux,
+        vec![
+            Probe::new("bad_t", ToolExposure::Direct).failing().arc(),
+            Probe::new("plain_t", ToolExposure::Direct).arc(),
+        ],
+    )
+    .await;
+    let sink = Arc::clone(&errors);
+    session
+        .services()
+        .ext_host
+        .add_error_listener(Arc::new(move |e: &cyrup_ext::ExtensionError| {
+            sink.lock().unwrap().push((e.event.to_string(), e.error.clone()));
+        }));
+
+    // Any re-application of the active set runs the hooks again.
+    let names_now = session.active_tool_names();
+    session.set_active_tools_by_name(&names_now).await;
+
+    let seen = errors.lock().unwrap().clone();
+    assert!(
+        seen.iter().any(|(event, msg)| event == "prepare_loadout" && msg.contains("hook exploded")),
+        "{seen:?}"
+    );
+    let _ = session.prompt("go").await.unwrap();
+    session.wait_for_idle().await;
+    let reqs = requests.lock().unwrap().clone();
+    let declared = names(&reqs[0].0);
+    assert!(declared.contains(&"bad_t") && declared.contains(&"plain_t"), "{declared:?}");
 }
