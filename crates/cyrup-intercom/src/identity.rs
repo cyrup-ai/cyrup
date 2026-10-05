@@ -18,6 +18,12 @@ pub const DEFAULT_UNNAMED_SESSION_ALIAS_PREFIX: &str = "subagent-chat";
 /// `crate::connect::connect_once`). Reading it for self-registration would make a child
 /// re-register under its parent's id and take the parent's broker slot over.
 pub const ENV_INTERCOM_SESSION_ID: &str = "CYRUP_INTERCOM_SESSION_ID";
+/// `CYRUP_SESSION_ID` (pi `PI_SESSION_ID`) — the session id the bash tool publishes into every
+/// command it runs (`cyrup-tools` `resolveSpawnContext`). `cyrup-intercom-cli send --to
+/// name@machine` reads it as the second rung of its origin ladder (`resolveOrigin`,
+/// `v0.16.0 cross-machine-envelope.ts:45`), after [`ENV_INTERCOM_SESSION_ID`]: a model that shells
+/// out to the CLI is speaking FOR the session whose bash tool ran it.
+pub const ENV_SESSION_ID: &str = "CYRUP_SESSION_ID";
 /// `CYRUP_INTERCOM_ASK_TIMEOUT_MS` (`config.ts:8`, pi `PI_INTERCOM_ASK_TIMEOUT_MS`).
 pub const ENV_INTERCOM_ASK_TIMEOUT_MS: &str = "CYRUP_INTERCOM_ASK_TIMEOUT_MS";
 /// `CYRUP_INTERCOM_NAME_POLL_MS` (`index.ts:420-429`, pi `PI_INTERCOM_NAME_POLL_MS`).

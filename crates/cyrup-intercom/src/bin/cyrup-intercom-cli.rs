@@ -4,8 +4,19 @@
 //! ```text
 //! cyrup-intercom-cli list [--json]
 //! cyrup-intercom-cli send --to worker --text "build failed" [--name <bridge-name>] [--json]
+//! cyrup-intercom-cli send --to reviewer@workstation --text "ship it" [--name <bridge-name>] [--json]
 //! cyrup-intercom-cli ask --to worker --text "status?" [--timeout-ms N] [--name <bridge-name>] [--json]
+//! cyrup-intercom-cli relay --envelope-stdin [--json]
 //! ```
+//!
+//! `send --to name@machine` is the explicit cross-machine SSH relay's sending half
+//! (`v0.16.0 cli.ts:232-244`): the target is resolved through Herdr's saved machines and the
+//! message is carried over `ssh` to the remote host's `relay` subcommand. `relay` is that
+//! subcommand — the RECEIVING half (`cli.ts:181-230`): it reads one envelope from stdin, refuses
+//! anything [`parse_relay_envelope`] refuses, and delivers `[Unverified cross-machine origin]` plus
+//! the body to a LOCAL session with the SSH-asserted origin attached as `crossMachine` provenance.
+//! `relay` is deliberately absent from [`CLI_USAGE`] (`cli.test.ts`: `doesNotMatch(CLI_USAGE,
+//! /relay/)`): it is the protocol the sender's `ssh` speaks, not a command for people.
 //!
 //! The CLI registers as a regular session (`cli.ts:10-11`), so it shows up in the roster and replies
 //! can be routed back to it while it stays connected (`ask`). It never starts a broker: it dials the
@@ -46,7 +57,13 @@ use std::io::Write;
 use std::process::ExitCode;
 use std::time::Duration;
 
-use cyrup_intercom::paths::agent_dir_path;
+use cyrup_intercom::config::{CrossMachineConfig, load_config};
+use cyrup_intercom::cross_machine::{
+    CrossMachineDeps, SpawnRunner, ValidatedRelayEnvelope, herdr_bin_from,
+    parse_cross_machine_target, read_relay_envelope, relay_message, relay_sender_name,
+    resolve_origin, send_cross_machine,
+};
+use cyrup_intercom::paths::{agent_dir_path, intercom_dir_path};
 use cyrup_intercom::transport::client::{InboundEvent, IntercomClient, SendOptions};
 use cyrup_intercom::transport::protocol::{SessionInfo, SessionRegistration, now_ms};
 use cyrup_intercom::transport::target::broker_connect_target;
@@ -79,6 +96,7 @@ enum Command {
     List,
     Send,
     Ask,
+    Relay,
 }
 
 impl Command {
@@ -87,22 +105,29 @@ impl Command {
             Command::List => "list",
             Command::Send => "send",
             Command::Ask => "ask",
+            Command::Relay => "relay",
         }
     }
 }
 
-/// `CliOptions` (`cli.ts:31-38`).
+/// `CliOptions` (`cli.ts:41-49`).
 #[derive(Debug, PartialEq, Eq)]
 struct CliOptions {
     command: Command,
     to: Option<String>,
     text: Option<String>,
+    envelope_stdin: bool,
     timeout_ms: u64,
     name: String,
     json: bool,
 }
 
-/// `parseCliArgs` (`cli.ts:42-96`). The `Err` is the `CliUsageError` message.
+/// The `relay` usage refusal, raised both before and after the option loop (`cli.ts:74,111`).
+fn relay_usage() -> String {
+    format!("relay requires only --envelope-stdin (and optional --json)\n{CLI_USAGE}")
+}
+
+/// `parseCliArgs` (`cli.ts:53-122`). The `Err` is the `CliUsageError` message.
 fn parse_cli_args(argv: &[String]) -> Result<CliOptions, String> {
     let (command, rest) = match argv.split_first() {
         Some((first, rest)) => (first.as_str(), rest),
@@ -113,21 +138,40 @@ fn parse_cli_args(argv: &[String]) -> Result<CliOptions, String> {
         "list" => Command::List,
         "send" => Command::Send,
         "ask" => Command::Ask,
+        "relay" => Command::Relay,
         other => return Err(format!("unknown command: {other}\n{CLI_USAGE}")),
     };
     let mut opts = CliOptions {
         command,
         to: None,
         text: None,
+        envelope_stdin: false,
         timeout_ms: DEFAULT_ASK_TIMEOUT_MS,
         name: CLI_SESSION_NAME.to_string(),
         json: false,
     };
 
+    // `relay` takes `--envelope-stdin` exactly once, `--json` at most once, and nothing else at
+    // all (`cli.ts:70-75`) — judged BEFORE the option loop, so `--text ""` is a usage error and not
+    // a missing value.
+    if command == Command::Relay
+        && (rest.iter().filter(|a| *a == "--envelope-stdin").count() != 1
+            || rest.iter().filter(|a| *a == "--json").count() > 1
+            || rest
+                .iter()
+                .any(|a| a != "--envelope-stdin" && a != "--json"))
+    {
+        return Err(relay_usage());
+    }
+
     let mut args = rest.iter();
     while let Some(arg) = args.next() {
         if arg == "--json" {
             opts.json = true;
+            continue;
+        }
+        if arg == "--envelope-stdin" {
+            opts.envelope_stdin = true;
             continue;
         }
         let Some(value) = args.next() else {
@@ -142,19 +186,36 @@ fn parse_cli_args(argv: &[String]) -> Result<CliOptions, String> {
         }
     }
 
-    if opts.command != Command::List {
-        // `!opts.to` / `!opts.text`: an empty string is as missing as an absent one.
-        if opts.to.as_deref().is_none_or(str::is_empty) {
+    if opts.command == Command::Relay {
+        // `!opts.envelopeStdin || opts.to || opts.text || opts.name !== "pi-intercom-cli"`
+        // (`cli.ts:110`): unreachable after the pre-check above, kept as upstream keeps it.
+        if !opts.envelope_stdin
+            || opts.to.as_deref().is_some_and(|to| !to.is_empty())
+            || opts.text.as_deref().is_some_and(|text| !text.is_empty())
+            || opts.name != CLI_SESSION_NAME
+        {
+            return Err(relay_usage());
+        }
+    } else {
+        if opts.envelope_stdin {
             return Err(format!(
-                "--to is required for {}\n{CLI_USAGE}",
-                opts.command.as_str()
+                "--envelope-stdin is only valid for relay\n{CLI_USAGE}"
             ));
         }
-        if opts.text.as_deref().is_none_or(str::is_empty) {
-            return Err(format!(
-                "--text is required for {}\n{CLI_USAGE}",
-                opts.command.as_str()
-            ));
+        if opts.command != Command::List {
+            // `!opts.to` / `!opts.text`: an empty string is as missing as an absent one.
+            if opts.to.as_deref().is_none_or(str::is_empty) {
+                return Err(format!(
+                    "--to is required for {}\n{CLI_USAGE}",
+                    opts.command.as_str()
+                ));
+            }
+            if opts.text.as_deref().is_none_or(str::is_empty) {
+                return Err(format!(
+                    "--text is required for {}\n{CLI_USAGE}",
+                    opts.command.as_str()
+                ));
+            }
         }
     }
 
@@ -175,13 +236,17 @@ fn parse_timeout_ms(value: &str) -> Result<u64, String> {
     }
 }
 
-/// `buildCliRegistration` (`cli.ts:113-123`): the process's own cwd and pid, `model` fixed to the
+/// `buildCliRegistration` (`cli.ts:143-154`): the process's own cwd and pid, `model` fixed to the
 /// CLI's name, `status: "idle"`.
-fn build_cli_registration(name: &str) -> SessionRegistration {
+///
+/// `runtime_fallback_alias` is set for the relay's transient `name@machine` session (`cli.ts:195`,
+/// `Boolean(relayEnvelope)`), so it never wins a name lookup: `worker@laptop` is a label for an
+/// asserted origin, not a peer anyone should be able to address or reply to.
+fn build_cli_registration(name: &str, runtime_fallback_alias: bool) -> SessionRegistration {
     let now = now_ms();
     SessionRegistration {
         name: Some(name.to_string()),
-        runtime_fallback_alias: None,
+        runtime_fallback_alias: runtime_fallback_alias.then_some(true),
         cwd: std::env::current_dir()
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_default(),
@@ -241,7 +306,66 @@ impl Streams {
     }
 }
 
-/// `runCli` (`cli.ts:135-248`), returning the process exit code.
+/// What the pre-connect checks of `runCli` decided to do (`cli.ts:177-191`).
+///
+/// Everything that can be refused WITHOUT the broker is refused here, so a bad relay envelope or a
+/// malformed `name@machine` never registers a session; and the variants carry exactly what their
+/// command needs, so a `Relay` without a validated envelope, or a cross-machine `Send` without the
+/// `crossMachine` config, cannot be built.
+enum Plan {
+    List,
+    /// A local `send`.
+    Send,
+    /// `send --to name@machine`: carried over SSH, never to the local broker (`cli.ts:233-244`).
+    SendCrossMachine(CrossMachineConfig),
+    Ask,
+    /// `relay --envelope-stdin`: an envelope that already passed [`read_relay_envelope`].
+    Relay(ValidatedRelayEnvelope),
+}
+
+/// `await readProcessStdin()` then `parseRelayEnvelope` (`cli.ts:182`), on a blocking thread
+/// because a pipe read is.
+async fn read_relay_stdin() -> Result<ValidatedRelayEnvelope, String> {
+    tokio::task::spawn_blocking(|| read_relay_envelope(std::io::stdin().lock()))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())
+}
+
+/// The pre-connect half of `runCli` (`cli.ts:179-191`). The `Err` is the message `reportFailure`
+/// prints.
+async fn plan(opts: &CliOptions) -> Result<Plan, String> {
+    let to = opts.to.as_deref().unwrap_or_default();
+    match opts.command {
+        Command::List => Ok(Plan::List),
+        Command::Relay => {
+            let envelope = read_relay_stdin().await?;
+            // No relay-of-a-relay (`cli.ts:183`): the remote half of a target is the sender's
+            // business, never the relay's.
+            if envelope.target().as_str().contains('@') {
+                return Err("relay target must be a local name or session id".to_string());
+            }
+            Ok(Plan::Relay(envelope))
+        }
+        Command::Ask if to.contains('@') => {
+            Err("ask only supports local names or session ids".to_string())
+        }
+        Command::Ask => Ok(Plan::Ask),
+        Command::Send if to.contains('@') => {
+            // `parseCrossMachineTarget(opts.to)` (`cli.ts:187`) — the same corpus discovery uses,
+            // judged before any registration.
+            parse_cross_machine_target(to).map_err(|e| e.to_string())?;
+            // `runMain`'s `loadConfig()` (`cli.ts:328`), but only where the config is read: the
+            // origin's machine name and the remote command. A malformed file is refused with its
+            // path, as everywhere else this crate loads it.
+            let config = load_config(&intercom_dir_path(&agent_dir_path()))?;
+            Ok(Plan::SendCrossMachine(config.cross_machine))
+        }
+        Command::Send => Ok(Plan::Send),
+    }
+}
+
+/// `runCli` (`cli.ts:166-318`), returning the process exit code.
 async fn run_cli(argv: &[String], io: &Streams) -> u8 {
     // Keyed on the RAW argv, not the parsed options, so a usage error still answers in JSON
     // (`argv.includes("--json")`, `cli.ts:139`).
@@ -264,9 +388,25 @@ async fn run_cli(argv: &[String], io: &Streams) -> u8 {
         Err(message) => return report_failure(&message, 1, None),
     };
 
+    let plan = match plan(&opts).await {
+        Ok(plan) => plan,
+        Err(message) => return report_failure(&message, 1, None),
+    };
+
+    // A relay registers under the ASSERTED origin, `name@machine`, as a runtime fallback alias
+    // (`cli.ts:193-195`); everything else under `--name`.
+    let (registration_name, is_relay) = match &plan {
+        Plan::Relay(envelope) => (envelope.sender_name(), true),
+        _ => (opts.name.clone(), false),
+    };
     let connected = match broker_connect_target(&agent_dir_path()) {
         Ok(target) => {
-            IntercomClient::connect_target(&target, build_cli_registration(&opts.name), None).await
+            IntercomClient::connect_target(
+                &target,
+                build_cli_registration(&registration_name, is_relay),
+                None,
+            )
+            .await
         }
         Err(e) => Err(e),
     };
@@ -284,7 +424,7 @@ async fn run_cli(argv: &[String], io: &Streams) -> u8 {
         }
     };
 
-    let code = match run_command(&client, &opts, io).await {
+    let code = match run_command(&client, &opts, plan, io).await {
         Ok(()) => 0,
         Err((message, code, reason)) => report_failure(&message, code, reason),
     };
@@ -313,10 +453,11 @@ async fn disconnect(client: &IntercomClient) {
 /// A failure `runCli` reports: its message, exit code and optional JSON `reason`.
 type Failure = (String, u8, Option<&'static str>);
 
-/// The connected half of `runCli` (`cli.ts:160-244`).
+/// The connected half of `runCli` (`cli.ts:200-316`).
 async fn run_command(
     client: &IntercomClient,
     opts: &CliOptions,
+    plan: Plan,
     io: &Streams,
 ) -> Result<(), Failure> {
     let to = opts.to.as_deref().unwrap_or_default();
@@ -325,8 +466,8 @@ async fn run_command(
         (format!("intercom request failed: {e}"), 1, None)
     };
 
-    match opts.command {
-        Command::List => {
+    match plan {
+        Plan::List => {
             let sessions = client.list_sessions().await.map_err(request_failed)?;
             if opts.json {
                 let rows: Vec<_> = sessions.iter().map(session_row).collect();
@@ -346,7 +487,104 @@ async fn run_command(
             }
             Ok(())
         }
-        Command::Send => {
+        Plan::Relay(envelope) => {
+            // `cli.ts:215-230` — the validated body, the validated target, and the asserted origin
+            // as provenance. The recipient gets `[Unverified cross-machine origin]\n` first.
+            let result = client
+                .send_relayed(
+                    envelope.target().as_str(),
+                    SendOptions {
+                        text: relay_message(&envelope),
+                        ..Default::default()
+                    },
+                    envelope.provenance(),
+                )
+                .await
+                .map_err(request_failed)?;
+            if !result.outcome_known {
+                let reason = result.reason.unwrap_or_default();
+                return Err((format!("intercom request failed: {reason}"), 1, None));
+            }
+            if !result.delivered {
+                return Err((
+                    format!(
+                        "relay delivery failed: {}",
+                        result
+                            .reason
+                            .unwrap_or_else(|| "unknown reason".to_string())
+                    ),
+                    1,
+                    None,
+                ));
+            }
+            if opts.json {
+                // The exact object `sendCrossMachine` parses on the other end of the SSH
+                // connection (`cross-machine-transport.ts:96-108`); one compact line.
+                let body = serde_json::json!({
+                    "ok": true,
+                    "delivered": true,
+                    "id": result.id,
+                    "origin": envelope.sender_name(),
+                    "trust": "ssh-asserted",
+                });
+                io.out(&format!("{body}\n"));
+            } else {
+                io.out(&format!(
+                    "relayed from {} to {} ({})\n",
+                    envelope.sender_name(),
+                    envelope.target().as_str(),
+                    result.id
+                ));
+            }
+            Ok(())
+        }
+        Plan::SendCrossMachine(config) => {
+            // `cli.ts:233-244`. No fallback to a local send on any failure: a `@` target that
+            // cannot be relayed is an error, never a silently-local delivery.
+            let failed = |e: String| -> Failure {
+                (
+                    format!("explicit cross-machine delivery failed: {e}"),
+                    1,
+                    None,
+                )
+            };
+            let sessions = client
+                .list_sessions()
+                .await
+                .map_err(|e| failed(e.to_string()))?;
+            let origin = resolve_origin(
+                &sessions,
+                &opts.name,
+                &config.machine_name,
+                client.session_id().as_deref(),
+                |key| std::env::var(key).ok(),
+            );
+            let herdr_bin = herdr_bin_from(|key| std::env::var(key).ok());
+            let deps = CrossMachineDeps::new(&SpawnRunner, &herdr_bin, &config.remote_command);
+            let remote = send_cross_machine(to, &text, origin, &deps)
+                .await
+                .map_err(|e| failed(e.to_string()))?;
+            if opts.json {
+                let body = serde_json::json!({
+                    "ok": true,
+                    "delivered": true,
+                    "crossMachine": true,
+                    "machine": remote.discovered.machine.label,
+                    "target": remote.discovered.agent.name,
+                });
+                io.out(&format!("{body}\n"));
+            } else {
+                io.out(&format!(
+                    "delivered to {} over SSH\n",
+                    relay_sender_name(
+                        &remote.discovered.agent.name,
+                        &remote.discovered.machine.label
+                    )
+                ));
+            }
+            Ok(())
+        }
+        Plan::Send => {
             let result = client
                 .send(
                     to,
@@ -375,7 +613,7 @@ async fn run_command(
             }
             Ok(())
         }
-        Command::Ask => match ask(client, to, text, opts.timeout_ms).await {
+        Plan::Ask => match ask(client, to, text, opts.timeout_ms).await {
             AskOutcome::Timeout => Err((
                 format!(
                     "ask timed out after {} ms waiting for a reply from {to}",
@@ -574,12 +812,70 @@ mod tests {
         assert!(err(&["ask", "--to", "w"]).starts_with("--text is required for ask\n"));
         assert!(err(&["ask", "--to", "", "--text", "?"]).starts_with("--to is required for ask\n"));
         assert!(parse_cli_args(&args(&["list", "--to", "w"])).is_ok());
+        // The unknown option is judged before the missing `--to`, as upstream's loop precedes it.
+        assert!(
+            parse_cli_args(&args(&["send", "--to", "w", "--text-stdin", "ignored"]))
+                .unwrap_err()
+                .starts_with("unknown option: --text-stdin\n")
+        );
     }
 
-    /// `buildCliRegistration fills required session fields`.
+    /// `parseCliArgs keeps relay hidden and restricted to an stdin envelope` (`cli.test.ts`).
+    #[test]
+    fn relay_is_hidden_from_usage_and_restricted_to_an_stdin_envelope() {
+        assert!(!CLI_USAGE.contains("relay"));
+        let opts = parse_cli_args(&args(&["relay", "--envelope-stdin", "--json"])).unwrap();
+        assert_eq!(opts.command, Command::Relay);
+        assert!(opts.envelope_stdin && opts.json);
+        assert!(
+            parse_cli_args(&args(&["relay", "--envelope-stdin"]))
+                .unwrap()
+                .envelope_stdin
+        );
+        let expected =
+            format!("relay requires only --envelope-stdin (and optional --json)\n{CLI_USAGE}");
+        for argv in [
+            &["relay"][..],
+            &["relay", "--json"],
+            &["relay", "--envelope-stdin", "--text", "hello"],
+            &["relay", "--envelope-stdin", "--text", ""],
+            &["relay", "--envelope-stdin", "--name", "cyrup-intercom-cli"],
+            &["relay", "--envelope-stdin", "--to", "reviewer"],
+            &["relay", "--envelope-stdin", "--timeout-ms", "5"],
+            &["relay", "--envelope-stdin", "--envelope-stdin"],
+            &["relay", "--envelope-stdin", "--json", "--json"],
+            &["relay", "--envelope-stdin", "extra"],
+        ] {
+            assert_eq!(
+                parse_cli_args(&args(argv)).unwrap_err(),
+                expected,
+                "{argv:?}"
+            );
+        }
+    }
+
+    /// `--envelope-stdin` belongs to `relay` alone (`cli.ts:114`), and is judged before the
+    /// missing-`--to` rule.
+    #[test]
+    fn the_stdin_envelope_flag_is_refused_outside_relay() {
+        for argv in [
+            &["list", "--envelope-stdin"][..],
+            &["send", "--envelope-stdin"],
+            &["ask", "--to", "w", "--text", "?", "--envelope-stdin"],
+        ] {
+            assert_eq!(
+                parse_cli_args(&args(argv)).unwrap_err(),
+                format!("--envelope-stdin is only valid for relay\n{CLI_USAGE}"),
+                "{argv:?}"
+            );
+        }
+    }
+
+    /// `buildCliRegistration fills required session fields`, and the relay's alias flag
+    /// (`cli.ts:151`: `...(runtimeFallbackAlias ? { runtimeFallbackAlias: true } : {})`).
     #[test]
     fn registration_fills_required_session_fields() {
-        let registration = build_cli_registration("bridge");
+        let registration = build_cli_registration("bridge", false);
         assert_eq!(registration.name.as_deref(), Some("bridge"));
         assert_eq!(registration.model, "cyrup-intercom-cli");
         assert_eq!(registration.status.as_deref(), Some("idle"));
@@ -587,6 +883,11 @@ mod tests {
         assert_eq!(
             registration.pid,
             serde_json::Number::from(std::process::id())
+        );
+        assert_eq!(registration.runtime_fallback_alias, None);
+        assert_eq!(
+            build_cli_registration("worker@laptop", true).runtime_fallback_alias,
+            Some(true)
         );
     }
 }

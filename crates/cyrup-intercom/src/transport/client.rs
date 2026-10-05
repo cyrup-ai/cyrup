@@ -548,6 +548,36 @@ impl IntercomClient {
     /// # Errors
     /// [`IntercomError::Client`] on a send timeout or if the client disconnected mid-send.
     pub async fn send(&self, to: &str, options: SendOptions) -> Result<SendResult> {
+        self.send_with_cross_machine(to, options, None).await
+    }
+
+    /// [`Self::send`] for a message whose real author is an SSH-asserted claim: the same send,
+    /// with `crossMachine` (`SendOptions.crossMachine`, `v0.16.0 broker/client.ts:31,:641`) on the
+    /// envelope.
+    ///
+    /// A separate entry point rather than a [`SendOptions`] field, so that ONLY the relay
+    /// subcommand (`v0.16.0 cli.ts:217-225`) can attach it: every other send path is built from a
+    /// [`SendOptions`] and has no way to claim a cross-machine origin, which is exactly the
+    /// property the `[Unverified cross-machine origin]` marking relies on.
+    ///
+    /// # Errors
+    /// As [`Self::send`].
+    pub async fn send_relayed(
+        &self,
+        to: &str,
+        options: SendOptions,
+        cross_machine: crate::transport::protocol::CrossMachineProvenance,
+    ) -> Result<SendResult> {
+        self.send_with_cross_machine(to, options, Some(cross_machine))
+            .await
+    }
+
+    async fn send_with_cross_machine(
+        &self,
+        to: &str,
+        options: SendOptions,
+        cross_machine: Option<crate::transport::protocol::CrossMachineProvenance>,
+    ) -> Result<SendResult> {
         if !self.is_connected() {
             return Err(IntercomError::Client("not connected".to_string()));
         }
@@ -563,6 +593,7 @@ impl IntercomClient {
             supersedes: options.supersedes,
             retry_of: options.retry_of,
             provenance: options.provenance,
+            cross_machine,
             content: MessageContent {
                 text: options.text,
                 attachments: options.attachments,

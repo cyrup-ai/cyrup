@@ -1242,6 +1242,192 @@ mod tests {
         );
     }
 
+    /// A `message` frame whose `crossMachine` is `provenance` (`None`: no such key).
+    fn cross_machine_message(id: &str, provenance: Option<serde_json::Value>) -> serde_json::Value {
+        let mut message = json!({
+            "id": id,
+            "timestamp": 1,
+            "content": { "text": "[Unverified cross-machine origin]\nship it" },
+        });
+        if let Some(provenance) = provenance {
+            message["crossMachine"] = provenance;
+        }
+        message
+    }
+
+    fn ssh_relay(origin_name: &str) -> serde_json::Value {
+        json!({
+            "type": "ssh-relay",
+            "version": 1,
+            "trust": "ssh-asserted",
+            "origin": { "name": origin_name, "sessionId": "origin-session", "machine": "laptop" },
+        })
+    }
+
+    /// ICOM-071 — `isMessage` rejects a present-but-malformed `crossMachine`
+    /// (`v0.16.0 broker/protocol.ts:151-153`), and the broker answers with its ordinary
+    /// invalid-message refusal (`broker.ts:418-428`): `messageId` is `"unknown"` because
+    /// `isMessage(message)` was false, and nothing reaches the target.
+    #[test]
+    fn a_malformed_cross_machine_provenance_is_refused_as_an_invalid_message() {
+        let mut state = make_state();
+        let (a_tx, mut a_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (b_tx, mut b_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut a_sid = None;
+        let mut b_sid = None;
+        register_named(&mut state, 1, &mut a_sid, &a_tx, "a", "alice", "/w", 1_000);
+        register_named(&mut state, 2, &mut b_sid, &b_tx, "b", "bob", "/w", 1_000);
+        let _ = payloads(&mut a_rx);
+        let _ = payloads(&mut b_rx);
+
+        for (label, bad) in [
+            (
+                "wrong type",
+                json!({ "type": "ssh", "version": 1, "trust": "ssh-asserted",
+                "origin": { "name": "w", "sessionId": "s", "machine": "m" } }),
+            ),
+            (
+                "version 2",
+                json!({ "type": "ssh-relay", "version": 2, "trust": "ssh-asserted",
+                "origin": { "name": "w", "sessionId": "s", "machine": "m" } }),
+            ),
+            (
+                "trust verified",
+                json!({ "type": "ssh-relay", "version": 1, "trust": "verified",
+                "origin": { "name": "w", "sessionId": "s", "machine": "m" } }),
+            ),
+            (
+                "origin.machine missing",
+                json!({ "type": "ssh-relay", "version": 1,
+                "trust": "ssh-asserted", "origin": { "name": "w", "sessionId": "s" } }),
+            ),
+            ("null", serde_json::Value::Null),
+        ] {
+            send_frame(
+                &mut state,
+                1,
+                &a_tx,
+                &mut a_sid,
+                "b",
+                cross_machine_message("m-bad", Some(bad)),
+                1_100,
+            );
+            let reply = payloads(&mut a_rx);
+            let failed = reply
+                .iter()
+                .find(|p| p["type"] == "delivery_failed")
+                .unwrap_or_else(|| panic!("{label}: expected a refusal, got {reply:?}"));
+            assert_eq!(failed["messageId"], "unknown", "{label}");
+            assert_eq!(failed["reason"], "Invalid message format", "{label}");
+            assert_eq!(failed["code"], "E_INVALID_MESSAGE", "{label}");
+            assert!(
+                !payloads(&mut b_rx).iter().any(|p| p["type"] == "message"),
+                "{label}: and nothing is delivered"
+            );
+        }
+    }
+
+    /// ICOM-071 — a VALID `crossMachine` is delivered to the target unchanged, which is what the
+    /// receiving session reads its attribution from.
+    #[test]
+    fn a_valid_cross_machine_provenance_reaches_the_target_intact() {
+        let mut state = make_state();
+        let (a_tx, mut a_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (b_tx, mut b_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut a_sid = None;
+        let mut b_sid = None;
+        register_named(
+            &mut state,
+            1,
+            &mut a_sid,
+            &a_tx,
+            "a",
+            "worker@laptop",
+            "/w",
+            1_000,
+        );
+        register_named(&mut state, 2, &mut b_sid, &b_tx, "b", "bob", "/w", 1_000);
+        let _ = payloads(&mut a_rx);
+        let _ = payloads(&mut b_rx);
+
+        send_frame(
+            &mut state,
+            1,
+            &a_tx,
+            &mut a_sid,
+            "b",
+            cross_machine_message("m1", Some(ssh_relay("worker"))),
+            1_100,
+        );
+        let delivered = payloads(&mut b_rx);
+        let message = delivered
+            .iter()
+            .find(|p| p["type"] == "message")
+            .unwrap_or_else(|| panic!("the message should be delivered: {delivered:?}"));
+        assert_eq!(message["message"]["crossMachine"], ssh_relay("worker"));
+    }
+
+    /// ICOM-071 / `broker replay fingerprints distinguish every asserted origin field`
+    /// (`broker/cross-machine-provenance.test.ts:54-63`) at the broker: a resend that keeps the
+    /// text and changes only who the relay CLAIMS wrote it is a reuse refusal, not a replay —
+    /// otherwise the first claim's ack would be replayed and the second claim silently dropped.
+    #[test]
+    fn a_resend_that_changes_only_the_asserted_origin_is_refused_not_replayed() {
+        let mut state = make_state();
+        let (a_tx, mut a_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (b_tx, mut b_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut a_sid = None;
+        let mut b_sid = None;
+        register_named(
+            &mut state,
+            1,
+            &mut a_sid,
+            &a_tx,
+            "a",
+            "worker@laptop",
+            "/w",
+            1_000,
+        );
+        register_named(&mut state, 2, &mut b_sid, &b_tx, "b", "bob", "/w", 1_000);
+        let _ = payloads(&mut a_rx);
+        let _ = payloads(&mut b_rx);
+
+        send_frame(
+            &mut state,
+            1,
+            &a_tx,
+            &mut a_sid,
+            "b",
+            cross_machine_message("m1", Some(ssh_relay("worker"))),
+            1_100,
+        );
+        assert!(
+            payloads(&mut a_rx)
+                .iter()
+                .any(|p| p["type"] == "delivered" && p["delivery"] == "socket_delivered")
+        );
+        let _ = payloads(&mut b_rx);
+
+        send_frame(
+            &mut state,
+            1,
+            &a_tx,
+            &mut a_sid,
+            "b",
+            cross_machine_message("m1", Some(ssh_relay("someone-else"))),
+            1_200,
+        );
+        let reuse = payloads(&mut a_rx);
+        let failed = reuse
+            .iter()
+            .find(|p| p["type"] == "delivery_failed")
+            .unwrap_or_else(|| {
+                panic!("a changed origin under a re-used id must be refused: {reuse:?}")
+            });
+        assert_eq!(failed["code"], "E_MESSAGE_ID_REUSE");
+        assert!(!payloads(&mut b_rx).iter().any(|p| p["type"] == "message"));
+    }
+
     /// ICOM-054 — two senders whose keys and ids both contain `:` must not collide, which is what
     /// upstream's `JSON.stringify([fromKey, messageId])` buys and a naive `from + ":" + id` would
     /// lose (`v0.13.0 broker/broker.ts:1055-1057`).

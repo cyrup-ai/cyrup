@@ -23,7 +23,7 @@ use cyrup_ext::host::{
     HttpStreamResponse, HumanInteractionLock, InjectOutcome, InteractiveOverlay, NotifyKind,
     ProcSpawnSpec,
 };
-use cyrup_provider::Provider;
+use cyrup_provider::{Model, Provider};
 use cyrup_session::manager::SessionManager;
 use cyrup_tools::{ArgvSpec, ExitStatus, ProcOps};
 use serde_json::{Value, json};
@@ -250,6 +250,12 @@ pub type UiEffectSink = UnboundedSender<UiEffect>;
 #[derive(Clone, Debug, Default)]
 struct LiveSnapshot {
     model: Option<ModelRef>,
+    /// The full catalog entry behind [`Self::model`], pushed together with it by
+    /// [`LiveHostServices::update_model`]. [`HostServices::complete_standalone`] streams against
+    /// this, the same `Model` the session's own compaction summarizer is handed
+    /// (`AgentSession::compaction_model`), so a standalone completion runs on exactly the model
+    /// the session is on rather than one re-resolved from the ref string.
+    resolved_model: Option<Model>,
     context_window: u64,
     used_tokens: u64,
     session_name: Option<String>,
@@ -1203,15 +1209,14 @@ impl LiveHostServices {
     }
 
     /// Push the active model + its context window (the session calls this on build + `set_model`).
-    pub fn update_model(
-        &self,
-        model: ModelRef,
-        context_window: u64,
-        thinking_level: Option<String>,
-    ) {
+    ///
+    /// `resolved` is the catalog entry `model` names; the context window is read off it, so the
+    /// two cannot be pushed apart.
+    pub fn update_model(&self, model: ModelRef, resolved: Model, thinking_level: Option<String>) {
         let mut g = Self::lock(&self.snapshot);
         g.model = Some(model);
-        g.context_window = context_window;
+        g.context_window = resolved.context_window;
+        g.resolved_model = Some(resolved);
         g.thinking_level = thinking_level;
     }
 
@@ -2049,6 +2054,74 @@ impl HostServices for LiveHostServices {
             inner: source.auth,
             provider: cyrup_core::ProviderId::from(provider_id),
         }))
+    }
+
+    /// pi `buildSessionContext(sessionManager.getBranch()).messages` (see the trait method): the
+    /// live tree's compaction-aware, context-edit-aware projection, raw and before `convertToLlm`.
+    /// Waits on the manager's lock rather than `try_lock`ing it like [`Self::branch`], so a
+    /// momentarily busy session answers late, never with an empty list that would read as "no
+    /// conversation".
+    fn session_context_messages(
+        &self,
+    ) -> futures::future::BoxFuture<'_, Vec<cyrup_session::AgentMessage>> {
+        let manager = Self::lock(&self.manager).clone();
+        Box::pin(async move {
+            match manager {
+                Some(manager) => manager.lock().await.build_context_raw(),
+                None => Vec::new(),
+            }
+        })
+    }
+
+    /// pi `ctx.modelRegistry.complete(ctx.model, …)` (see the trait method).
+    ///
+    /// Runs through the SAME choke point every compaction and branch summary uses,
+    /// [`cyrup_session::compaction::complete_summarization`], against the provider the session
+    /// currently streams through ([`Self::registered_provider`]'s source) and the full `Model` the
+    /// session is on ([`LiveSnapshot::resolved_model`]). That single function is what applies
+    /// `cache_retention: None`, a fresh session id and the cancel race, so a standalone completion
+    /// cannot drift from them; the provider resolves its own credential per request, exactly as it
+    /// does for a compaction. No reasoning level and no retry: pi's `complete` passes neither.
+    fn complete_standalone<'a>(
+        &'a self,
+        request: cyrup_ext::host::StandaloneCompletion,
+        cancel: CancelToken,
+    ) -> futures::future::BoxFuture<
+        'a,
+        Result<cyrup_core::AssistantMessage, cyrup_ext::host::StandaloneCompletionRefusal>,
+    > {
+        use cyrup_ext::host::StandaloneCompletionRefusal as Refusal;
+        let (model_ref, model) = {
+            let snapshot = Self::lock(&self.snapshot);
+            (snapshot.model.clone(), snapshot.resolved_model.clone())
+        };
+        let provider = Self::lock(&self.provider_swap)
+            .as_ref()
+            .map_or_else(|| Arc::clone(&self.provider), |swap| swap.current());
+        Box::pin(async move {
+            let (Some(model_ref), Some(model)) = (model_ref, model) else {
+                return Err(Refusal::NoModel);
+            };
+            let summarization = cyrup_session::compaction::SummarizationRequest {
+                system_prompt: &request.system_prompt,
+                prompt_text: request.user_text,
+                max_tokens: request.max_tokens,
+                model: model_ref,
+                thinking: cyrup_core::ModelThinkingLevel::Off,
+            };
+            // `complete_summarization` resolves `Err` only for `Aborted` (the cancel race); a
+            // provider or transport failure arrives as an `Ok` message with `StopReason::Error`.
+            cyrup_session::compaction::complete_summarization(
+                provider.as_ref(),
+                &model,
+                summarization,
+                cyrup_provider::RetryPolicy::DISABLED,
+                None,
+                cancel,
+            )
+            .await
+            .map_err(|_| Refusal::Cancelled)
+        })
     }
 
     fn context_usage(&self) -> Value {
@@ -2989,7 +3062,9 @@ mod tests {
             api: None,
             model: "faux-1".into(),
         };
-        svc.update_model(m, 128_000, Some("medium".into()));
+        let mut resolved = provider.models()[0].clone();
+        resolved.context_window = 128_000;
+        svc.update_model(m, resolved, Some("medium".into()));
         svc.update_state(Some("my session".into()), 42);
         assert_eq!(svc.current_model().as_deref(), Some("faux/faux-1"));
         assert_eq!(svc.thinking_level().as_deref(), Some("medium"));
@@ -4384,5 +4459,306 @@ mod tests {
         svc.set_overlay_sink(tx);
         assert_eq!(svc.custom(&json!({})), None);
         assert_eq!(svc.custom(&Value::Null), None);
+    }
+
+    // =============================================================================================
+    // `session_context_messages` / `complete_standalone` — the two verbs a handover runs on
+    // (`handover.ts:48-72` @v0.16.0)
+    // =============================================================================================
+
+    fn user(text: &str) -> cyrup_core::Message {
+        cyrup_core::Message::User {
+            content: vec![cyrup_core::Content::text(text)],
+            timestamp: 0,
+        }
+    }
+
+    fn assistant(text: &str) -> cyrup_core::Message {
+        cyrup_core::Message::Assistant(cyrup_provider::faux::faux_assistant_message(
+            vec![cyrup_provider::faux::faux_text(text)],
+            cyrup_core::StopReason::Stop,
+        ))
+    }
+
+    /// A tree that has been compacted once:
+    ///
+    /// ```text
+    /// U(old-question) A(old-answer) U(kept-question) A(kept-answer) [compaction: kept from the
+    /// second user turn] U(later-question)
+    /// ```
+    ///
+    /// Returns the backend with that tree attached.
+    fn compacted_session(provider: Arc<dyn Provider>) -> LiveHostServices {
+        use cyrup_session::manager::NewSessionOpts;
+        let svc = svc_with(provider);
+        let mut mgr = SessionManager::in_memory(&std::env::temp_dir(), NewSessionOpts::default())
+            .expect("an in-memory session tree");
+        mgr.append_message(user("old-question-ALPHA")).unwrap();
+        mgr.append_message(assistant("old-answer-BRAVO")).unwrap();
+        let first_kept = mgr.append_message(user("kept-question-CHARLIE")).unwrap();
+        mgr.append_message(assistant("kept-answer-DELTA")).unwrap();
+        mgr.append_compaction(
+            "SUMMARY-ECHO of the old exchange".to_string(),
+            first_kept,
+            1234,
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        mgr.append_message(user("later-question-FOXTROT")).unwrap();
+        svc.attach_session(Arc::new(AsyncMutex::new(mgr)));
+        svc
+    }
+
+    fn rendered(messages: &[cyrup_session::AgentMessage]) -> String {
+        cyrup_session::serialize_conversation(&cyrup_session::convert_to_llm(messages))
+    }
+
+    /// `buildSessionContext(getBranch()).messages` — the conversation AS THE MODEL SEES IT. The
+    /// compaction summary stands in for the history it replaced, so the compacted-away turns are
+    /// ABSENT from what a handover summarizes even though they are still in the raw tree
+    /// (`branch()` / `entries()`), which is the whole reason a handover must not be built from them.
+    #[tokio::test]
+    async fn session_context_messages_are_the_post_compaction_view_not_the_raw_tree() {
+        let svc = compacted_session(Arc::new(FauxProvider::new()));
+
+        let context = rendered(&svc.session_context_messages().await);
+        assert!(
+            context.contains("SUMMARY-ECHO of the old exchange"),
+            "the compaction summary is in the model's view: {context}"
+        );
+        assert!(
+            context.contains("kept-question-CHARLIE") && context.contains("kept-answer-DELTA"),
+            "the entries the compaction kept are in the model's view: {context}"
+        );
+        assert!(
+            context.contains("later-question-FOXTROT"),
+            "everything after the compaction is in the model's view: {context}"
+        );
+        assert!(
+            !context.contains("old-question-ALPHA") && !context.contains("old-answer-BRAVO"),
+            "the compacted-away turns are NOT in the model's view: {context}"
+        );
+
+        // The control: the raw tree DOES still hold them, so building the body from `branch()` /
+        // `entries()` would have handed the receiver history the model no longer has.
+        let raw = svc.branch().to_string();
+        assert!(
+            raw.contains("old-question-ALPHA") && raw.contains("old-answer-BRAVO"),
+            "the raw branch still carries the compacted-away turns: {raw}"
+        );
+    }
+
+    /// No attached session is an empty conversation, which a handover reports as "No conversation to
+    /// hand over." rather than as a failure.
+    #[tokio::test]
+    async fn an_unattached_backend_has_no_session_context() {
+        let svc = svc_with(Arc::new(FauxProvider::new()));
+        assert!(svc.session_context_messages().await.is_empty());
+    }
+
+    /// What `complete_standalone` sends the provider, recorded by a faux step.
+    #[derive(Clone, Debug)]
+    struct SeenRequest {
+        system_prompt: Option<String>,
+        message_texts: Vec<String>,
+        tool_count: usize,
+        max_tokens: Option<u64>,
+        cache_retention: Option<cyrup_provider::CacheRetention>,
+        session_id: Option<String>,
+        reasoning: cyrup_core::ModelThinkingLevel,
+        model_id: String,
+    }
+
+    fn recording_provider(
+        reply: &'static str,
+        calls: usize,
+    ) -> (Arc<FauxProvider>, Arc<Mutex<Vec<SeenRequest>>>) {
+        use cyrup_provider::faux::{FauxResponseStep, faux_assistant_message, faux_text};
+        let seen: Arc<Mutex<Vec<SeenRequest>>> = Arc::new(Mutex::new(Vec::new()));
+        let provider = Arc::new(FauxProvider::new());
+        let sink = Arc::clone(&seen);
+        let step = FauxResponseStep::factory(move |context, options, _state, model| {
+            let texts = context
+                .messages
+                .iter()
+                .map(|message| match message {
+                    cyrup_core::Message::User { content, .. } => content
+                        .iter()
+                        .filter_map(|part| match part {
+                            cyrup_core::Content::Text { text, .. } => Some(text.to_string()),
+                            _ => None,
+                        })
+                        .collect::<String>(),
+                    other => format!("{other:?}"),
+                })
+                .collect();
+            sink.lock().unwrap().push(SeenRequest {
+                system_prompt: context.system_prompt.clone(),
+                message_texts: texts,
+                tool_count: context.tools.len(),
+                max_tokens: options.max_tokens,
+                cache_retention: options.cache_retention,
+                session_id: options.session_id.as_ref().map(ToString::to_string),
+                reasoning: options.reasoning,
+                model_id: model.id.as_str().to_string(),
+            });
+            faux_assistant_message(vec![faux_text(reply)], cyrup_core::StopReason::Stop)
+        });
+        provider.set_response_steps(vec![step; calls]);
+        (provider, seen)
+    }
+
+    fn selected(svc: &LiveHostServices, provider: &FauxProvider) {
+        let model = provider.model().clone();
+        let model_ref = ModelRef {
+            provider: model.provider.clone(),
+            api: Some(model.api.clone()),
+            model: model.id.clone(),
+        };
+        svc.update_model(model_ref, model, Some("high".into()));
+    }
+
+    fn request(text: &str) -> cyrup_ext::host::StandaloneCompletion {
+        cyrup_ext::host::StandaloneCompletion {
+            system_prompt: "SYSTEM PROMPT".to_string(),
+            user_text: text.to_string(),
+            max_tokens: 4096,
+        }
+    }
+
+    /// `ctx.modelRegistry.complete(ctx.model, { systemPrompt, messages: [user] }, { signal,
+    /// cacheRetention: "none", sessionId: randomUUID(), maxTokens })` (`handover.ts:66-72`): the
+    /// provider is asked exactly that — the caller's system prompt, ONE user message, no tools, the
+    /// token cap, no prompt cache, a fresh session id each time, and none of the session's
+    /// reasoning level (`pi` passes no `reasoning`; this session is on `high`).
+    #[tokio::test]
+    async fn complete_standalone_asks_the_provider_for_one_uncached_isolated_completion() {
+        let (provider, seen) = recording_provider("the handover body", 1);
+        let svc = svc_with(provider.clone());
+        selected(&svc, &provider);
+
+        let reply = svc
+            .complete_standalone(request("the one user message"), CancelToken::new())
+            .await
+            .expect("a model is selected, so a completion runs");
+        assert_eq!(
+            reply
+                .content
+                .iter()
+                .filter_map(|part| match part {
+                    cyrup_core::Content::Text { text, .. } => Some(text.to_string()),
+                    _ => None,
+                })
+                .collect::<String>(),
+            "the handover body",
+            "the provider's turn is returned as it settled"
+        );
+
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 1, "exactly one provider call: {seen:?}");
+        let call = &seen[0];
+        assert_eq!(call.system_prompt.as_deref(), Some("SYSTEM PROMPT"));
+        assert_eq!(call.message_texts, vec!["the one user message".to_string()]);
+        assert_eq!(
+            call.tool_count, 0,
+            "a standalone completion offers no tools"
+        );
+        assert_eq!(call.max_tokens, Some(4096));
+        assert_eq!(
+            call.cache_retention,
+            Some(cyrup_provider::CacheRetention::None),
+            "`cacheRetention: \"none\"`"
+        );
+        assert_eq!(
+            call.reasoning,
+            cyrup_core::ModelThinkingLevel::Off,
+            "the session's `high` thinking level is not carried into a handover"
+        );
+        assert_eq!(call.model_id, provider.model().id.as_str());
+        assert!(
+            call.session_id.as_deref().is_some_and(|id| !id.is_empty()),
+            "`sessionId: randomUUID()`: {call:?}"
+        );
+    }
+
+    /// `sessionId: randomUUID()` is per CALL, not per session: two completions must not share a
+    /// provider-side session (and with it a prompt cache) with each other or the conversation.
+    #[tokio::test]
+    async fn complete_standalone_mints_a_fresh_session_id_per_call() {
+        let (provider, seen) = recording_provider("body", 2);
+        let svc = svc_with(provider.clone());
+        selected(&svc, &provider);
+        svc.complete_standalone(request("a"), CancelToken::new())
+            .await
+            .expect("first");
+        svc.complete_standalone(request("b"), CancelToken::new())
+            .await
+            .expect("second");
+        let ids: Vec<Option<String>> = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|call| call.session_id.clone())
+            .collect();
+        assert_eq!(ids.len(), 2);
+        assert!(ids[0].is_some() && ids[1].is_some(), "{ids:?}");
+        assert_ne!(ids[0], ids[1], "each completion gets its own session id");
+    }
+
+    /// `if (!ctx.model) throw new Error("No model selected; …")`: with no model pushed there is
+    /// nothing to complete with, and the provider is never called.
+    #[tokio::test]
+    async fn complete_standalone_without_a_selected_model_runs_nothing() {
+        let (provider, seen) = recording_provider("never sent", 1);
+        let svc = svc_with(provider);
+        assert_eq!(
+            svc.complete_standalone(request("x"), CancelToken::new())
+                .await
+                .map(|_| ()),
+            Err(cyrup_ext::host::StandaloneCompletionRefusal::NoModel)
+        );
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "the provider was not asked"
+        );
+    }
+
+    /// The caller's signal ends the call: a fired token resolves `Cancelled` rather than waiting on
+    /// (or fabricating) a reply.
+    #[tokio::test]
+    async fn complete_standalone_honours_the_callers_cancel_token() {
+        let (provider, _seen) = recording_provider("late", 1);
+        let svc = svc_with(provider.clone());
+        selected(&svc, &provider);
+        let cancel = CancelToken::new();
+        cancel.cancel();
+        assert_eq!(
+            svc.complete_standalone(request("x"), cancel)
+                .await
+                .map(|_| ()),
+            Err(cyrup_ext::host::StandaloneCompletionRefusal::Cancelled)
+        );
+    }
+
+    /// A provider failure is a settled turn, not a refusal: `complete_standalone` hands the
+    /// `StopReason::Error` message back so the caller can say WHY (`Handover generation failed:
+    /// <errorMessage>`).
+    #[tokio::test]
+    async fn complete_standalone_returns_a_provider_failure_as_a_settled_error_turn() {
+        use cyrup_provider::faux::{FauxResponseStep, faux_assistant_message};
+        let provider = Arc::new(FauxProvider::new());
+        let mut failed = faux_assistant_message(vec![], cyrup_core::StopReason::Error);
+        failed.error_message = Some("429 slow down".to_string());
+        provider.set_response_steps(vec![FauxResponseStep::from(failed)]);
+        let svc = svc_with(provider.clone());
+        selected(&svc, &provider);
+        let reply = svc
+            .complete_standalone(request("x"), CancelToken::new())
+            .await
+            .expect("an errored turn is still a turn");
+        assert_eq!(reply.stop_reason, cyrup_core::StopReason::Error);
+        assert_eq!(reply.error_message.as_deref(), Some("429 slow down"));
     }
 }

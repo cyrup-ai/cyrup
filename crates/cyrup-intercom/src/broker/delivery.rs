@@ -10,7 +10,9 @@
 //! `E_TARGET_REBOUND`-and-retryable record, which is what lets the client retry a rebound target
 //! under the same message id (`v0.13.0 broker/broker.ts:1068-1070`).
 
-use crate::transport::protocol::{Attachment, DeliveredState, Message, MessageProvenance};
+use crate::transport::protocol::{
+    Attachment, CrossMachineProvenance, DeliveredState, Message, MessageProvenance,
+};
 
 use super::limits::{DELIVERY_RECORD_RETENTION_MS, MAX_DELIVERY_RECORDS};
 use super::routing::SessionKey;
@@ -25,10 +27,11 @@ use super::state::BrokerState;
 /// and structural equality is stronger (no separator ambiguity, no key-order hazard).
 ///
 /// The FIELD SET is upstream's: `targetId`, `text`, `attachments`, `replyTo`, `expectsReply`,
-/// `supersedes`, `retryOf`, `provenance`. `provenance` has been in it since it landed at v0.12.0
-/// (ICOM-072 — it was missed here, so a resend that changed only the claiming extension replayed
-/// the first send's ack and discarded the new attribution). `crossMachine`, the ninth key added at
-/// v0.16.0, follows [`Message::cross_machine`] and is tracked by ICOM-071.
+/// `supersedes`, `retryOf`, `provenance`, `crossMachine`. `provenance` has been in it since it
+/// landed at v0.12.0 (ICOM-072 — it was missed here, so a resend that changed only the claiming
+/// extension replayed the first send's ack and discarded the new attribution). `crossMachine` is
+/// the ninth key, added at v0.16.0 (`v0.16.0 broker/protocol.ts:164-176`): a resend that changes
+/// only the asserted origin is a different authored message, not a replay.
 ///
 /// Note it takes `content.text` and `content.attachments` individually rather than the whole
 /// `MessageContent`, so a differing `#[serde(flatten)] extra` on the content object is NOT a
@@ -44,6 +47,7 @@ pub(super) struct DeliveryFingerprint {
     supersedes: Option<String>,
     retry_of: Option<String>,
     provenance: Option<MessageProvenance>,
+    cross_machine: Option<CrossMachineProvenance>,
 }
 
 impl DeliveryFingerprint {
@@ -58,6 +62,7 @@ impl DeliveryFingerprint {
             supersedes: message.supersedes.clone(),
             retry_of: message.retry_of.clone(),
             provenance: message.provenance.clone(),
+            cross_machine: message.cross_machine.clone(),
         }
     }
 }
@@ -171,7 +176,7 @@ impl BrokerState {
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
-    use crate::transport::protocol::{ProvenanceKind, UnknownFields};
+    use crate::transport::protocol::{ProvenanceKind, ProvenanceOrigin, RelayTrust, UnknownFields};
 
     use super::super::test_support::make_state;
     use super::*;
@@ -331,6 +336,50 @@ mod tests {
             DeliveryFingerprint::of(&claim("ext-a"), "b"),
             DeliveryFingerprint::of(&claim("ext-a"), "b"),
             "and the same claim still fingerprints identically, so an honest resend replays"
+        );
+    }
+
+    /// ICOM-071 — `crossMachine` is the ninth AUTHORED key (`v0.16.0 broker/protocol.ts:164-176`),
+    /// and `broker replay fingerprints distinguish every asserted origin field`
+    /// (`broker/cross-machine-provenance.test.ts:54-63`): `name`, `sessionId` and `machine` each
+    /// change the fingerprint, and so does gaining the key at all.
+    #[test]
+    fn cross_machine_is_part_of_the_fingerprint() {
+        let bare = message("m1", "hi");
+        let claim = |name: &str, session_id: &str, machine: &str| {
+            let mut msg = bare.clone();
+            msg.cross_machine = Some(CrossMachineProvenance::ssh_relay(
+                ProvenanceOrigin {
+                    name: name.to_string(),
+                    session_id: session_id.to_string(),
+                    machine: machine.to_string(),
+                    extra: UnknownFields::default(),
+                },
+                RelayTrust::SshAsserted,
+            ));
+            msg
+        };
+        let original = DeliveryFingerprint::of(&claim("worker", "origin-session", "laptop"), "b");
+        assert_ne!(
+            DeliveryFingerprint::of(&bare, "b"),
+            original,
+            "gaining the key"
+        );
+        for (field, changed) in [
+            ("name", claim("other", "origin-session", "laptop")),
+            ("sessionId", claim("worker", "other", "laptop")),
+            ("machine", claim("worker", "origin-session", "other")),
+        ] {
+            assert_ne!(
+                DeliveryFingerprint::of(&changed, "b"),
+                original,
+                "a different asserted origin {field}"
+            );
+        }
+        assert_eq!(
+            DeliveryFingerprint::of(&claim("worker", "origin-session", "laptop"), "b"),
+            original,
+            "the same claim still fingerprints identically, so an honest resend replays"
         );
     }
 }

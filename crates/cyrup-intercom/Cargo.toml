@@ -59,6 +59,10 @@ cyrup-ext-subagents = { workspace = true }
 # skill/prompts/agents (`registration/resources.rs`), rather than a second, private walk. Nothing in
 # `cyrup-resources` depends on this crate, so there is no cycle.
 cyrup-resources = { workspace = true }
+# ICOM-077 — `convert_to_llm` + `serialize_conversation` render the conversation a handover
+# summarizes (`handover.ts:48-49`). `cyrup-ext` already depends on this crate, so the edge adds no
+# new node to the graph and cannot cycle.
+cyrup-session = { workspace = true }
 tokio = { workspace = true, features = ["net", "io-util", "sync", "time", "macros", "rt-multi-thread", "signal", "process"] }
 bytes = { workspace = true }
 serde = { workspace = true }
@@ -81,9 +85,11 @@ tracing = "0.1.44"
 # broker_wait_error}`), so the DEPENDENCY has to be gated too or the crate — and with it the `cyrup`
 # binary, which takes cyrup-intercom as a non-optional dependency — cannot be produced for Windows.
 # `signal` = the kill(pid,0) liveness probe; `process` = setsid (unused today — detach uses the
-# unsafe-free `process_group(0)`, mirroring cyrup-ext-subagents' spawn precedent).
+# unsafe-free `process_group(0)`, mirroring cyrup-ext-subagents' spawn precedent); `hostname` =
+# `gethostname`, the default `crossMachine.machineName` (`os.hostname()`, `config.ts:84`), which
+# `/proc` and `/etc/hostname` cannot supply on macOS.
 [target.'cfg(unix)'.dependencies]
-nix = { workspace = true, features = ["signal", "process"] }
+nix = { workspace = true, features = ["signal", "process", "hostname"] }
 
 [[bin]]
 # The real-broker-participant test-double `cyrup`-child stand-in (the claim-6 production-activation

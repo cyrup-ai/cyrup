@@ -56,8 +56,13 @@ mod child_bridge_activation;
 // ICOM-067: the `cyrup-intercom-cli` scripting client (`cli.ts`), run as a subprocess against a
 // real broker and a real peer.
 mod cli_client;
+// ICOM-074 / ICOM-075 / ICOM-071: the explicit cross-machine SSH relay — the `relay` subcommand
+// and `send --to name@machine`, with both halves proved against each other.
+mod cli_relay;
 mod compose_send_leg;
 mod dismiss_incoming_ask;
+// ICOM-077: `intercom({ action: "handover" })` through the tool, over a real broker and peer.
+mod handover_action;
 // ICOM-065: the broker-side Herdr location join, against a fake Herdr socket.
 mod herdr_location;
 mod human_surface;
@@ -69,6 +74,8 @@ mod intercom_command_transcript;
 mod intercom_id_command;
 // ICOM-066: `details.roster` and the collapsed one-line render.
 mod list_roster;
+// ICOM-077: the outbox's confirm dialog — title `Send extension message`, body names the extension.
+mod outbox_dialog;
 // ICOM-057: the broker's `pending-asks/*.json` records — write, remove, prune.
 mod pending_ask_records;
 mod presence_context_usage;

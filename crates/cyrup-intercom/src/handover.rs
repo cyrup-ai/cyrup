@@ -7,32 +7,28 @@
 //! the receiving agent reads them as instructions — the trust disclaimer at
 //! [`format_handover_message`] most of all.
 //!
-//! ## ICOM-077 scope — what is here and what is not
+//! ## ICOM-077 — what is here and how it is reached
 //!
-//! This is the half of `handover.ts` that needs nothing from the host: `generateHandoverBody`'s
-//! system prompt and request assembly (`:14-36,:52-57`), its response triage (`:58-76`),
-//! `readGitState` (`:84-91`) and `formatHandoverMessage` (`:93-115`).
+//! `generateHandoverBody` is split along its seam. The decisions — the system prompt, the request
+//! text, the response triage, the git line and the delivered message's framing — are pure functions
+//! of their inputs. The two things only the live session can do are `cyrup_ext::HostServices`
+//! verbs: [`HostServices::session_context_messages`] (the conversation as the model would see it)
+//! and [`HostServices::complete_standalone`] (one completion on the session's current model,
+//! `ctx.modelRegistry.complete(ctx.model, …)`, `:66-72`). [`generate_handover_body`] is the one
+//! function that sequences them in upstream's order; the `intercom({ action: "handover" })` arm
+//! (`index.ts:2627-2654`) calls it, then frames the result with [`format_handover_message`] and
+//! hands it to the shared delivery.
 //!
-//! The half that is NOT here is the completion call itself —
-//! `ctx.modelRegistry.complete(ctx.model, …, { cacheRetention: "none", sessionId: randomUUID(),
-//! maxTokens: 4096 })` (`:68-72`) — and with it the `intercom({ action: "handover" })` action arm
-//! (`index.ts:2627-2654`). cyrup's tool layer cannot reach a completion at all today:
-//! [`cyrup_ext::HostServices`] exposes `current_model()` (a ref STRING), `models()` and
-//! `registered_provider()`, but no verb that runs one turn, and [`LiveHostServices`] holds no
-//! [`cyrup_provider::Models`] to resolve that ref against. Shipping the action without it would put
-//! `"handover"` in the tool's action enum and then always answer "No model selected", which is a
-//! behavioural difference from pi rather than a port. So the action is deliberately still
-//! `unknown intercom action "handover"`, exactly as before, and the remainder of the row — the host
-//! completion verb, the action arm, the schema enum and usage block, the `deliverMessage`
-//! extraction, and ICOM-079's `SKILL.md` Pattern 6b — lands as ONE later slice on top of this one.
-//!
-//! [`LiveHostServices`]: https://docs.rs/cyrup-session-svc
+//! [`HostServices::session_context_messages`]: cyrup_ext::HostServices::session_context_messages
+//! [`HostServices::complete_standalone`]: cyrup_ext::HostServices::complete_standalone
 
 use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
 
-use cyrup_core::{AssistantMessage, Content, StopReason};
+use cyrup_core::{AssistantMessage, CancelToken, Content, StopReason};
+use cyrup_ext::HostServices;
+use cyrup_ext::host::{StandaloneCompletion, StandaloneCompletionRefusal};
 
 /// `HANDOVER_MAX_OUTPUT_TOKENS = 4096` (`v0.16.0 handover.ts:11`) — the `maxTokens` the handover
 /// completion is capped at.
@@ -80,8 +76,7 @@ pub const NO_GOAL_GIVEN: &str =
 /// (`v0.16.0 handover.ts:46,:50,:74,:77,:80`).
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum HandoverError {
-    /// `:46` — `ctx.model` is unset. The one arm this slice cannot yet produce, since the model is
-    /// chosen by the completion caller.
+    /// `:46` — `ctx.model` is unset: the session has no model selected, or has no live host.
     #[error("No model selected; select a model to generate a handover.")]
     NoModel,
     /// `:50` — `buildSessionContext(getBranch()).messages` is empty. There is nothing to summarize,
@@ -173,6 +168,75 @@ pub fn handover_body(response: &AssistantMessage, aborted: bool) -> Result<Strin
         });
     }
     Ok(body)
+}
+
+/// `generateHandoverBody(ctx, goal, signal)` (`v0.16.0 handover.ts:38-82`) — the model-generated
+/// body, in upstream's order: the model check (`:45`), the conversation check (`:48`), one
+/// completion on the session's current model (`:66-72`), then [`handover_body`]'s triage.
+///
+/// `services` is `ctx`: `None` is a session with no live host, which has no model either. The
+/// conversation is read through [`HostServices::session_context_messages`] — what
+/// `buildSessionContext(getBranch()).messages` yields, so a message compaction folded into a summary
+/// is NOT in it — and rendered with `serialize_conversation(convert_to_llm(…))`, never from the raw
+/// entry log.
+///
+/// # Errors
+/// [`HandoverError`], one arm per upstream sentence.
+pub async fn generate_handover_body(
+    services: Option<&dyn HostServices>,
+    goal: Option<&str>,
+    cancel: &CancelToken,
+) -> Result<String, HandoverError> {
+    let Some(services) = services.filter(|services| services.current_model().is_some()) else {
+        return Err(HandoverError::NoModel);
+    };
+    let messages = services.session_context_messages().await;
+    if messages.is_empty() {
+        return Err(HandoverError::NoConversation);
+    }
+    let conversation =
+        cyrup_session::serialize_conversation(&cyrup_session::convert_to_llm(&messages));
+    let request = StandaloneCompletion {
+        system_prompt: HANDOVER_SYSTEM_PROMPT.to_string(),
+        user_text: handover_request_text(&conversation, goal),
+        max_tokens: HANDOVER_MAX_OUTPUT_TOKENS,
+    };
+    let response = match services.complete_standalone(request, cancel.clone()).await {
+        Ok(response) => response,
+        Err(StandaloneCompletionRefusal::NoModel) => return Err(HandoverError::NoModel),
+        Err(StandaloneCompletionRefusal::Cancelled) => return Err(HandoverError::Aborted),
+    };
+    handover_body(&response, cancel.is_cancelled())
+}
+
+/// Every way `intercom({ action: "handover" })` answers without delivering a handover. `Display` is
+/// upstream's sentence for each arm (`v0.16.0 index.ts:2628-2649`, `:1705-1707`, `:1768-1770`).
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum HandoverRefusal {
+    /// `index.ts:2629-2632` — neither `to` nor `cwd` names a target.
+    #[error("Missing 'to' or 'cwd' parameter")]
+    MissingTarget,
+    /// `index.ts:2634-2638` — a handover is always a NEW message, so the fields that relate it to
+    /// another message, and attachments (which the generated body replaces), are refused.
+    #[error(
+        "Handover always sends a new message; replyTo, supersedes, retryOf, and attachments are not supported."
+    )]
+    UnsupportedFields,
+    /// `index.ts:2643-2647` — the body could not be generated; the inner sentence is
+    /// [`HandoverError`]'s.
+    #[error("Handover failed: {0}")]
+    GenerationFailed(#[from] HandoverError),
+    /// `index.ts:1705-1707,:1768-1770` — the caller's signal fired while the confirm dialog was
+    /// open or while the target was being resolved, after the body was generated and before the
+    /// message left.
+    #[error("Handover was cancelled before delivery.")]
+    CancelledBeforeDelivery,
+}
+
+impl From<HandoverRefusal> for cyrup_core::ToolError {
+    fn from(refusal: HandoverRefusal) -> Self {
+        Self::new(refusal.to_string())
+    }
 }
 
 /// `GitState` (`v0.16.0 handover.ts:82-85`) — the sender's HEAD, for the receiving agent to compare
@@ -546,5 +610,186 @@ mod tests {
         // A directory that is not a checkout at all.
         let plain = tempfile::tempdir().expect("tempdir");
         assert_eq!(read_git_state(plain.path()).await, None);
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // `generate_handover_body` — the sequencing of the two host verbs
+    // -----------------------------------------------------------------------------------------
+
+    use std::sync::Mutex;
+
+    use cyrup_core::Message;
+
+    /// `futures::future::BoxFuture`, spelled out: this crate takes no `futures` dependency.
+    type BoxFuture<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
+
+    /// A host whose conversation and completion are scripted, recording the request it was given.
+    struct Host {
+        model: Option<String>,
+        messages: Vec<cyrup_session::AgentMessage>,
+        completion: Mutex<Option<Result<AssistantMessage, StandaloneCompletionRefusal>>>,
+        request: Mutex<Option<StandaloneCompletion>>,
+    }
+
+    impl Host {
+        fn new(completion: Result<AssistantMessage, StandaloneCompletionRefusal>) -> Self {
+            Self {
+                model: Some("faux/faux-1".to_string()),
+                messages: vec![
+                    cyrup_session::AgentMessage::core(Message::User {
+                        content: vec![Content::text("hi")],
+                        timestamp: 0,
+                    }),
+                    cyrup_session::AgentMessage::core(Message::Assistant(response(
+                        StopReason::Stop,
+                        &["yo"],
+                    ))),
+                ],
+                completion: Mutex::new(Some(completion)),
+                request: Mutex::new(None),
+            }
+        }
+    }
+
+    impl HostServices for Host {
+        fn current_model(&self) -> Option<String> {
+            self.model.clone()
+        }
+
+        fn session_context_messages(&self) -> BoxFuture<'_, Vec<cyrup_session::AgentMessage>> {
+            Box::pin(async move { self.messages.clone() })
+        }
+
+        fn complete_standalone<'a>(
+            &'a self,
+            request: StandaloneCompletion,
+            _cancel: CancelToken,
+        ) -> BoxFuture<'a, Result<AssistantMessage, StandaloneCompletionRefusal>> {
+            *self.request.lock().unwrap() = Some(request);
+            let next = self
+                .completion
+                .lock()
+                .unwrap()
+                .take()
+                .unwrap_or(Err(StandaloneCompletionRefusal::NoModel));
+            Box::pin(async move { next })
+        }
+    }
+
+    /// `:45` precedes `:48`: with neither a model nor a conversation the answer is the MODEL
+    /// refusal, and no host at all is the same as no model.
+    #[tokio::test]
+    async fn the_model_is_checked_before_the_conversation() {
+        let cancel = CancelToken::new();
+        assert_eq!(
+            generate_handover_body(None, None, &cancel).await,
+            Err(HandoverError::NoModel)
+        );
+        let mut host = Host::new(Ok(response(StopReason::Stop, &["x"])));
+        host.model = None;
+        host.messages = Vec::new();
+        assert_eq!(
+            generate_handover_body(Some(&host), None, &cancel).await,
+            Err(HandoverError::NoModel),
+            "no model, no conversation: the model is what is reported"
+        );
+        assert!(host.request.lock().unwrap().is_none(), "no completion ran");
+
+        host.model = Some("faux/faux-1".to_string());
+        assert_eq!(
+            generate_handover_body(Some(&host), None, &cancel).await,
+            Err(HandoverError::NoConversation)
+        );
+        assert!(
+            host.request.lock().unwrap().is_none(),
+            "an empty conversation costs no completion"
+        );
+    }
+
+    /// `:56-72` — the completion is asked for upstream's system prompt, 4096 tokens, and ONE
+    /// user message of `## Conversation … ## Goal for the receiving agent …`, where the conversation
+    /// is the serialized `convertToLlm` view; its text parts come back trimmed.
+    #[tokio::test]
+    async fn the_completion_is_asked_for_upstreams_request_and_its_text_is_returned() {
+        let host = Host::new(Ok(response(
+            StopReason::Stop,
+            &["  ## Next task\n- ship it \n"],
+        )));
+        let body = generate_handover_body(Some(&host), Some(" port it "), &CancelToken::new())
+            .await
+            .expect("a body");
+        assert_eq!(body, "## Next task\n- ship it");
+        let request = host.request.lock().unwrap().clone().expect("one request");
+        assert_eq!(request.system_prompt, HANDOVER_SYSTEM_PROMPT);
+        assert_eq!(request.max_tokens, 4096);
+        assert_eq!(
+            request.user_text,
+            "## Conversation\n\n[User]: hi\n\n[Assistant]: yo\n\n## Goal for the receiving agent\n\nport it"
+        );
+    }
+
+    /// The host's refusals and a signal that fired under a normal reply all map to the sentences
+    /// the action reports (`:73-82`).
+    #[tokio::test]
+    async fn refusals_and_a_fired_signal_map_to_upstreams_arms() {
+        assert_eq!(
+            generate_handover_body(
+                Some(&Host::new(Err(StandaloneCompletionRefusal::NoModel))),
+                None,
+                &CancelToken::new()
+            )
+            .await,
+            Err(HandoverError::NoModel)
+        );
+        assert_eq!(
+            generate_handover_body(
+                Some(&Host::new(Err(StandaloneCompletionRefusal::Cancelled))),
+                None,
+                &CancelToken::new()
+            )
+            .await,
+            Err(HandoverError::Aborted)
+        );
+        let fired = CancelToken::new();
+        fired.cancel();
+        assert_eq!(
+            generate_handover_body(
+                Some(&Host::new(Ok(response(StopReason::Stop, &["done"])))),
+                None,
+                &fired
+            )
+            .await,
+            Err(HandoverError::Aborted),
+            "a reply that arrived under a fired signal is an abort"
+        );
+    }
+
+    /// The action's refusal sentences, each upstream's (`index.ts:2629,2636,2645,1706`).
+    #[test]
+    fn each_refusal_displays_upstreams_sentence() {
+        assert_eq!(
+            HandoverRefusal::MissingTarget.to_string(),
+            "Missing 'to' or 'cwd' parameter"
+        );
+        assert_eq!(
+            HandoverRefusal::UnsupportedFields.to_string(),
+            "Handover always sends a new message; replyTo, supersedes, retryOf, and attachments are not supported."
+        );
+        assert_eq!(
+            HandoverRefusal::from(HandoverError::NoModel).to_string(),
+            "Handover failed: No model selected; select a model to generate a handover."
+        );
+        assert_eq!(
+            HandoverRefusal::from(HandoverError::NoConversation).to_string(),
+            "Handover failed: No conversation to hand over."
+        );
+        assert_eq!(
+            HandoverRefusal::from(HandoverError::Aborted).to_string(),
+            "Handover failed: Handover generation was aborted."
+        );
+        assert_eq!(
+            HandoverRefusal::CancelledBeforeDelivery.to_string(),
+            "Handover was cancelled before delivery."
+        );
     }
 }

@@ -1,45 +1,25 @@
-//! The `name@machine` arm of `intercom{action:"send"}` (`v0.16.0 index.ts:1704-1733`, inside the
-//! shared `deliverMessage`) — ICOM-074's sending half.
+//! The `name@machine` arm of the shared delivery (`v0.16.0 index.ts:1708-1733`, inside
+//! `deliverMessage`) — ICOM-074's sending half.
 //!
-//! Split from [`super::send`] rather than inlined because this arm shares nothing with the local
+//! Split from [`super::deliver`] rather than inlined because this arm shares nothing with the local
 //! one after the confirm: no target resolution, no reply-tracker interaction, no `SendOptions`, no
 //! broker round trip. It takes the delivery through SSH, and the only state it touches is the
-//! confirm dialog and the audit entry.
+//! audit entry. The confirm dialog and the handover cancel check precede it in `deliver`, because
+//! upstream orders both before the origin identity is built.
 
 use std::sync::Arc;
 
 use cyrup_core::{ToolError, ToolResult};
 
 use crate::cross_machine::{
-    CommandRunner, CrossMachineDeps, CrossMachineOrigin, relay_sender_name, send_cross_machine,
+    CommandRunner, CrossMachineDeps, CrossMachineOrigin, herdr_bin_from, relay_sender_name,
+    send_cross_machine,
 };
 use crate::session_state::SharedIntercomState;
-use crate::tools::{detailed_result, text_result};
+use crate::tools::detailed_result;
 use crate::transport::protocol::now_ms;
 
-/// `process.env.HERDR_BIN_PATH ?? "herdr"` (`v0.16.0 cross-machine-transport.ts:79`,
-/// `index.ts:3052`).
-///
-/// **Not `HERDR_BIN`,** and not a typo here: upstream's cross-machine files read this *other*
-/// spelling, while `project-agent.ts:68` (cyrup: [`cyrup_herdr::cli::HERDR_BIN`]) reads
-/// `HERDR_BIN`, and neither falls back to the other. Adding a fallback would be inventing upstream
-/// behaviour, so the two variables stay as upstream has them; both belong to the herdr vendor, so
-/// neither takes a `CYRUP_` prefix.
-pub const HERDR_BIN_PATH: &str = "HERDR_BIN_PATH";
-
-/// The `herdr` binary cross-machine discovery runs, from [`HERDR_BIN_PATH`].
-///
-/// A blank value falls through to `"herdr"`, as every other binary ladder in this workspace does
-/// for a variable that was unset badly.
-#[must_use]
-pub(super) fn herdr_bin_from(env: impl Fn(&str) -> Option<String>) -> String {
-    env(HERDR_BIN_PATH)
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| cyrup_herdr::cli::HERDR_BIN_DEFAULT.to_string())
-}
-
-/// `v0.16.0 index.ts:1704-1733` — confirm, relay over SSH, append the audit entry, report.
+/// `v0.16.0 index.ts:1708-1733` — relay over SSH, append the audit entry, report.
 ///
 /// `to` is the caller's `name@machine` verbatim; it has already passed
 /// [`super::explicit_cross_machine_send_restriction`] and
@@ -48,30 +28,16 @@ pub(super) fn herdr_bin_from(env: impl Fn(&str) -> Option<String>) -> String {
 /// silently-local delivery.
 ///
 /// # Errors
-/// The user cancelled is NOT an error (`Message cancelled by user`, as the local arm). Everything
-/// else is `Explicit cross-machine message to "{to}" was not delivered: {reason}` — ONE sentence
-/// for discovery, SSH and relay refusals alike, because from the model's side they are all "the
-/// peer did not get it".
+/// `Explicit cross-machine message to "{to}" was not delivered: {reason}` — ONE sentence for
+/// discovery, SSH and relay refusals alike, because from the model's side they are all "the peer
+/// did not get it".
 pub(super) async fn deliver_cross_machine(
     state: &Arc<SharedIntercomState>,
     runner: &dyn CommandRunner,
     to: &str,
     message: &str,
     origin: CrossMachineOrigin,
-    confirm_send: bool,
 ) -> Result<ToolResult, ToolError> {
-    // `v0.16.0 index.ts:1693-1701`: `Send to "${to}":\n\n${message}` — the CALLER's target, since
-    // nothing is resolved yet, and no attachment text, since attachments are already refused.
-    if confirm_send
-        && let Some(services) = state.host_services()
-        && !services.confirm(
-            "Send Message",
-            &format!("Send to \"{to}\":\n\n{message}"),
-            &cyrup_ext::DialogOptions::default(),
-        )
-    {
-        return Ok(text_result("Message cancelled by user"));
-    }
     let herdr_bin = herdr_bin_from(|key| std::env::var(key).ok());
     let remote_command = state.config.cross_machine.remote_command.clone();
     let deps = CrossMachineDeps::new(runner, &herdr_bin, &remote_command);
@@ -170,10 +136,8 @@ mod tests {
         }
     }
 
-    /// Records the audit entries and the confirm prompts, and answers the confirm as told.
+    /// Records the audit entries.
     struct Host {
-        confirm: bool,
-        prompts: Mutex<Vec<String>>,
         entries: Mutex<Vec<(String, serde_json::Value)>>,
     }
 
@@ -183,13 +147,6 @@ mod tests {
         }
         fn session_name(&self) -> Option<String> {
             Some("alice".to_string())
-        }
-        fn confirm(&self, _prompt: &str, message: &str, _opts: &cyrup_ext::DialogOptions) -> bool {
-            self.prompts
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .push(message.to_string());
-            self.confirm
         }
         fn append_entry(
             &self,
@@ -204,10 +161,7 @@ mod tests {
         }
     }
 
-    fn fixture(
-        ssh: CommandResult,
-        confirm: bool,
-    ) -> (Arc<SharedIntercomState>, Arc<Host>, Arc<Relay>) {
+    fn fixture(ssh: CommandResult) -> (Arc<SharedIntercomState>, Arc<Host>, Arc<Relay>) {
         let state = Arc::new(SharedIntercomState::new(
             IntercomConfig {
                 cross_machine: crate::config::CrossMachineConfig {
@@ -220,8 +174,6 @@ mod tests {
             std::path::PathBuf::from("/w"),
         ));
         let host = Arc::new(Host {
-            confirm,
-            prompts: Mutex::new(Vec::new()),
             entries: Mutex::new(Vec::new()),
         });
         state.set_host_services(host.clone());
@@ -255,22 +207,18 @@ mod tests {
     /// entry's `crossMachine: true`.
     #[tokio::test]
     async fn a_relayed_send_reports_ssh_asserted_trust_and_audits_the_remote_target() {
-        let (state, host, relay) = fixture(
-            CommandResult {
-                stdout: r#"{"ok":true,"delivered":true,"id":"m-9"}"#.to_string(),
-                stderr: String::new(),
-                code: 0,
-                timed_out: false,
-            },
-            true,
-        );
+        let (state, host, relay) = fixture(CommandResult {
+            stdout: r#"{"ok":true,"delivered":true,"id":"m-9"}"#.to_string(),
+            stderr: String::new(),
+            code: 0,
+            timed_out: false,
+        });
         let result = deliver_cross_machine(
             &state,
             relay.as_ref(),
             "reviewer@workstation",
             "ship it",
             origin(),
-            true,
         )
         .await
         .expect("delivered");
@@ -288,14 +236,6 @@ mod tests {
                 "target": "reviewer",
                 "trust": "ssh-asserted",
             }))
-        );
-        assert_eq!(
-            host.prompts
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .as_slice(),
-            ["Send to \"reviewer@workstation\":\n\nship it".to_string()],
-            "the confirm names the CALLER's target and carries no attachment text"
         );
         let entries = host.entries.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(entries.len(), 1);
@@ -323,60 +263,22 @@ mod tests {
         );
     }
 
-    /// A declined confirm cancels WITHOUT running `ssh` — the dialog is a veto on the side effect.
-    #[tokio::test]
-    async fn a_declined_confirm_sends_nothing() {
-        let (state, _host, relay) = fixture(
-            CommandResult {
-                stdout: r#"{"ok":true}"#.to_string(),
-                stderr: String::new(),
-                code: 0,
-                timed_out: false,
-            },
-            false,
-        );
-        let result = deliver_cross_machine(
-            &state,
-            relay.as_ref(),
-            "reviewer@workstation",
-            "ship it",
-            origin(),
-            true,
-        )
-        .await
-        .expect("cancelled is not an error");
-        assert_eq!(text(&result), "Message cancelled by user");
-        assert!(
-            relay
-                .ssh_argv
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .is_empty(),
-            "nothing is relayed after a declined confirm"
-        );
-    }
-
     /// `v0.16.0 index.ts:1728-1733` — ONE failure sentence, naming the caller's target, whatever
     /// went wrong underneath. The audit entry must NOT be appended for an undelivered send.
     #[tokio::test]
     async fn a_refused_relay_names_the_target_and_audits_nothing() {
-        let (state, host, relay) = fixture(
-            CommandResult {
-                stdout: r#"{"ok":false,"error":"Session \"reviewer\" is not connected."}"#
-                    .to_string(),
-                stderr: String::new(),
-                code: 1,
-                timed_out: false,
-            },
-            false,
-        );
+        let (state, host, relay) = fixture(CommandResult {
+            stdout: r#"{"ok":false,"error":"Session \"reviewer\" is not connected."}"#.to_string(),
+            stderr: String::new(),
+            code: 1,
+            timed_out: false,
+        });
         let error = deliver_cross_machine(
             &state,
             relay.as_ref(),
             "reviewer@workstation",
             "ship it",
             origin(),
-            false,
         )
         .await
         .expect_err("refused");
@@ -391,23 +293,6 @@ mod tests {
                 .unwrap_or_else(|e| e.into_inner())
                 .is_empty(),
             "an undelivered send leaves no `intercom_sent` entry"
-        );
-    }
-
-    /// `process.env.HERDR_BIN_PATH ?? "herdr"` (`v0.16.0 cross-machine-transport.ts:79`) — and a
-    /// blank value is an env var that was unset badly, not a request to exec the empty string.
-    #[test]
-    fn the_herdr_binary_comes_from_herdr_bin_path_only() {
-        assert_eq!(herdr_bin_from(|_| None), "herdr");
-        assert_eq!(herdr_bin_from(|_| Some("  ".to_string())), "herdr");
-        assert_eq!(
-            herdr_bin_from(|key| (key == HERDR_BIN_PATH).then(|| "/opt/herdr".to_string())),
-            "/opt/herdr"
-        );
-        assert_eq!(
-            herdr_bin_from(|key| (key == "HERDR_BIN").then(|| "/opt/other".to_string())),
-            "herdr",
-            "upstream reads HERDR_BIN_PATH here and does NOT fall back to HERDR_BIN"
         );
     }
 }

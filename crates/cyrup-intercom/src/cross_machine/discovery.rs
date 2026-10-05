@@ -40,8 +40,16 @@ fn is_full_session_uuid(value: &str) -> bool {
 
 /// `SESSION_ID_IN_PATH` (`:2`, added by `93c5a01`) — the `_<uuid>.jsonl` suffix of a session file,
 /// which is how a session id is recovered from the path Herdr reports.
+///
+/// The regex carries the `i` flag, so the extension is matched case-insensitively too
+/// (`session_<uuid>.JSONL` counts). The id is returned as written: `FULL_SESSION_UUID` is
+/// case-insensitive as well, but the later comparison against a caller's target is `===`.
 fn session_id_in_path(path: &str) -> Option<String> {
-    let stem = path.strip_suffix(".jsonl")?;
+    let stem_len = path.len().checked_sub(".jsonl".len())?;
+    let (stem, extension) = (path.get(..stem_len)?, path.get(stem_len..)?);
+    if !extension.eq_ignore_ascii_case(".jsonl") {
+        return None;
+    }
     let (_, candidate) = stem.rsplit_once('_')?;
     is_full_session_uuid(candidate).then(|| candidate.to_string())
 }
@@ -261,7 +269,8 @@ pub fn parse_remote_agents(raw: &str) -> Result<Vec<RemoteAgent>, DiscoveryError
 /// `parseCrossMachineTarget(target)` (`v0.16.0 cross-machine-discovery.ts:80-86`) — the
 /// `(agent_target, machine_label)` split.
 ///
-/// Exactly two halves, neither blank and neither containing whitespace. Two `@`s is a refusal, not
+/// Exactly two halves, neither blank and neither containing whitespace (JS `/\s/`, see
+/// [`super::is_js_whitespace`]). Two `@`s is a refusal, not
 /// a last-`@` split: the receiving relay also refuses a `target` containing `@` (`cli.ts:184`), so
 /// a relay-of-a-relay has no legal spelling on either side.
 ///
@@ -277,7 +286,7 @@ pub fn parse_cross_machine_target(target: &str) -> Result<(String, String), Disc
     };
     if [agent_target, machine_label]
         .iter()
-        .any(|part| part.is_empty() || part.chars().any(char::is_whitespace))
+        .any(|part| part.is_empty() || part.chars().any(super::is_js_whitespace))
     {
         return Err(invalid());
     }
@@ -355,29 +364,25 @@ fn failure_detail(result: &CommandResult) -> String {
 /// .replace(/^machine '[^']*': /, "")`.
 ///
 /// Hand-written rather than regex-driven — this crate has no `regex` dependency — and the scan is
-/// the regex's semantics exactly: the FIRST `error: "` in stderr, then characters up to the first
+/// the regex's semantics: the FIRST `error: "` whose quote actually closes (an unterminated one
+/// moves the search on to the next occurrence, as a regex search does), characters up to the first
 /// unescaped `"`, with every `\x` collapsing to `x`, then one leading `machine '…': ` stripped.
+/// `.` does not match a line terminator, so a backslash before one cannot be consumed and that
+/// candidate fails.
 fn unwrap_herdr_error(stderr: &str) -> Option<String> {
-    let after = stderr.find("error: \"").map(|at| &stderr[at + 8..])?;
-    let mut unescaped = String::new();
-    let mut chars = after.chars();
-    let mut closed = false;
-    while let Some(ch) = chars.next() {
-        match ch {
-            '\\' => match chars.next() {
-                Some(escaped) => unescaped.push(escaped),
-                None => break,
-            },
-            '"' => {
-                closed = true;
-                break;
-            }
-            other => unescaped.push(other),
+    const NEEDLE: &str = "error: \"";
+    let mut search_from = 0;
+    let unescaped = loop {
+        let found = search_from + stderr.get(search_from..)?.find(NEEDLE)?;
+        if let Some(reason) = stderr
+            .get(found + NEEDLE.len()..)
+            .and_then(unescape_until_closing_quote)
+        {
+            break reason;
         }
-    }
-    if !closed {
-        return None;
-    }
+        // `e` is ASCII, so `found + 1` is a character boundary.
+        search_from = found + 1;
+    };
     // `/^machine '[^']*': /` — the prefix is stripped only when the quote actually closes before
     // the `: `, so a reason that merely starts with the word `machine` survives intact.
     let stripped = unescaped
@@ -386,6 +391,24 @@ fn unwrap_herdr_error(stderr: &str) -> Option<String> {
         .filter(|(label, _)| !label.contains('\''))
         .map(|(_, reason)| reason.to_string());
     Some(stripped.unwrap_or(unescaped))
+}
+
+/// `((?:[^"\\]|\\.)*)"` followed by `.replace(/\\(.)/g, "$1")`: the text up to the first unescaped
+/// `"` with escapes collapsed, or `None` when there is no closing quote or an escape cannot be
+/// consumed.
+fn unescape_until_closing_quote(rest: &str) -> Option<String> {
+    let mut unescaped = String::new();
+    let mut chars = rest.chars();
+    loop {
+        match chars.next()? {
+            '\\' => match chars.next()? {
+                '\n' | '\r' | '\u{2028}' | '\u{2029}' => return None,
+                escaped => unescaped.push(escaped),
+            },
+            '"' => return Some(unescaped),
+            other => unescaped.push(other),
+        }
+    }
 }
 
 /// `listMachineAgents(machine, deps)` (`v0.16.0 cross-machine-discovery.ts:94-117`).
