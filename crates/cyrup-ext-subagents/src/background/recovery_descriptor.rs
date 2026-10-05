@@ -1218,6 +1218,7 @@ mod tests {
 
     fn distinctive_step() -> SingleStepSpec {
         SingleStepSpec {
+            worktree: crate::spawn::worktree::WorktreeRequest::Shared,
             machine: None,
             agent: "worker".to_string(),
             task: "do the thing".to_string(),

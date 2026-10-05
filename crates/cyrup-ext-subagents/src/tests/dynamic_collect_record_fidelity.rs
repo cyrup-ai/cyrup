@@ -63,6 +63,7 @@ impl SingleStepExecutor for Scripted {
 
 fn template(agent: &str, task: &str) -> SingleStepSpec {
     SingleStepSpec {
+        worktree: crate::spawn::worktree::WorktreeRequest::Shared,
         machine: None,
         agent: agent.to_string(),
         task: task.to_string(),

@@ -77,6 +77,7 @@ impl SubagentExecutor {
             usage_budget,
             checkpoint_before_deadline_ms,
             tool_timeout_ms,
+            worktree,
         } = request;
         // R-SA-055 (SAFETY-CRITICAL): the depth guard runs FIRST — before agent discovery or
         // fork-context resolution below, and therefore also before `spawn_background_steps`' own
@@ -294,6 +295,14 @@ impl SubagentExecutor {
             agent_scope: None,
             label: None,
             session_name: None,
+            // SUBA-149 — pi `...(params.worktree === true ? { worktree: true } : {})` on the one
+            // step `executeAsyncSingle` spawns (`async-execution.ts:2163` @v0.75.0). The hop-2
+            // runner's walk answers it through `ManagedLaunch`; the child's cwd is whatever that
+            // answer produced, which is why `cwd: None` above stays `None` — the step's cwd is the
+            // shared cwd unless and until an allocation replaces it, exactly as upstream leaves
+            // its step's `cwd: machine?.cwd ?? runnerCwd` for the runner to override (`:2118`,
+            // `subagent-runner.ts:4536-4537`).
+            worktree,
         };
 
         self.spawn_background_steps(
@@ -1679,6 +1688,7 @@ runner: {\"type\": \"external-cli\", \"command\": \"true\"}\n---\n\nbody\n";
     /// assertions below are about the SLOT and not about step configuration.
     fn bare_background_request<'a>(cwd: &'a Path) -> BackgroundSingleRequest<'a> {
         BackgroundSingleRequest {
+            worktree: crate::spawn::worktree::WorktreeRequest::Shared,
             tool_timeout_ms: None,
             machine_cwd: None,
             machine: None,
@@ -2057,6 +2067,7 @@ runner: {\"type\": \"external-cli\", \"command\": \"true\"}\n---\n\nbody\n";
 
         let run_id = executor
             .spawn_background(BackgroundSingleRequest {
+                worktree: crate::spawn::worktree::WorktreeRequest::Shared,
                 tool_timeout_ms: None,
                 machine_cwd: None,
                 machine: None,
@@ -2195,6 +2206,7 @@ runner: {\"type\": \"external-cli\", \"command\": \"true\"}\n---\n\nbody\n";
 
         let run_id = executor
             .spawn_background(BackgroundSingleRequest {
+                worktree: crate::spawn::worktree::WorktreeRequest::Shared,
                 tool_timeout_ms: None,
                 machine_cwd: None,
                 machine: None,
@@ -2277,6 +2289,7 @@ runner: {\"type\": \"external-cli\", \"command\": \"true\"}\n---\n\nbody\n";
         for artifacts in [None, Some(true), Some(false)] {
             let run_id = executor
                 .spawn_background(BackgroundSingleRequest {
+                    worktree: crate::spawn::worktree::WorktreeRequest::Shared,
                     tool_timeout_ms: None,
                     machine_cwd: None,
                     machine: None,
@@ -2372,6 +2385,7 @@ runner: {\"type\": \"external-cli\", \"command\": \"true\"}\n---\n\nbody\n";
         let before = u64::try_from(crate::time::now_epoch_millis()).unwrap_or(0);
         let run_id = executor
             .spawn_background(BackgroundSingleRequest {
+                worktree: crate::spawn::worktree::WorktreeRequest::Shared,
                 tool_timeout_ms: None,
                 machine_cwd: None,
                 machine: None,
@@ -2438,6 +2452,7 @@ runner: {\"type\": \"external-cli\", \"command\": \"true\"}\n---\n\nbody\n";
         // and CPU until a human noticed and issued `interrupt`.
         let untimed = executor
             .spawn_background(BackgroundSingleRequest {
+                worktree: crate::spawn::worktree::WorktreeRequest::Shared,
                 tool_timeout_ms: None,
                 machine_cwd: None,
                 machine: None,
@@ -2503,6 +2518,7 @@ runner: {\"type\": \"external-cli\", \"command\": \"true\"}\n---\n\nbody\n";
 
         let request = |exec: Arc<SubagentExecutor>, root: std::path::PathBuf| async move {
             exec.spawn_background(BackgroundSingleRequest {
+                worktree: crate::spawn::worktree::WorktreeRequest::Shared,
                 tool_timeout_ms: None,
                 machine_cwd: None,
                 machine: None,
@@ -2629,6 +2645,7 @@ runner: {\"type\": \"external-cli\", \"command\": \"true\"}\n---\n\nbody\n";
 
             let run_id = executor
                 .spawn_background(BackgroundSingleRequest {
+                    worktree: crate::spawn::worktree::WorktreeRequest::Shared,
                     tool_timeout_ms: None,
                     machine_cwd: None,
                     machine: None,
@@ -2728,6 +2745,7 @@ runner: {\"type\": \"external-cli\", \"command\": \"true\"}\n---\n\nbody\n";
         let dir = tempfile::tempdir().expect("tempdir");
         let run_id = executor
             .spawn_background(BackgroundSingleRequest {
+                worktree: crate::spawn::worktree::WorktreeRequest::Shared,
                 tool_timeout_ms: None,
                 machine_cwd: None,
                 machine: None,
@@ -2803,6 +2821,7 @@ runner: {\"type\": \"external-cli\", \"command\": \"true\"}\n---\n\nbody\n";
         });
         let run_id = executor
             .spawn_background(BackgroundSingleRequest {
+                worktree: crate::spawn::worktree::WorktreeRequest::Shared,
                 tool_timeout_ms: None,
                 machine_cwd: None,
                 machine: None,
@@ -2887,6 +2906,7 @@ runner: {\"type\": \"external-cli\", \"command\": \"true\"}\n---\n\nbody\n";
         let dir = tempfile::tempdir().expect("tempdir");
         let run_id = executor
             .spawn_background(BackgroundSingleRequest {
+                worktree: crate::spawn::worktree::WorktreeRequest::Shared,
                 tool_timeout_ms: None,
                 machine_cwd: None,
                 machine: None,
@@ -3280,6 +3300,7 @@ memory: {scope: user, path: other.md}\n---\nRewritten body.\n";
             });
             let run_id = executor
                 .spawn_background(BackgroundSingleRequest {
+                    worktree: crate::spawn::worktree::WorktreeRequest::Shared,
                     tool_timeout_ms: None,
                     machine_cwd: None,
                     machine: None,
@@ -4019,6 +4040,7 @@ mutationTools: apply_patch, notebook_edit\n",
                 .expect("the persona resolves");
             let persona = crate::exec::resolve_step_agent_config(&agent);
             let step = SingleStepSpec {
+                worktree: crate::spawn::worktree::WorktreeRequest::Shared,
                 machine: None,
                 agent: "worker".to_string(),
                 task: "do the thing".to_string(),
@@ -4275,6 +4297,7 @@ mutationTools: apply_patch, notebook_edit\n",
                 capability_ceiling: None,
                 model_origin: None,
                 steps: vec![RunnerStep::SingleStep(SingleStepSpec {
+                    worktree: crate::spawn::worktree::WorktreeRequest::Shared,
                     machine: None,
                     agent: "worker".to_string(),
                     task: "do the thing".to_string(),

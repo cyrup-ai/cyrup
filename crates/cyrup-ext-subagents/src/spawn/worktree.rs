@@ -2263,7 +2263,22 @@ pub async fn setup_worktree_group(
 /// not. What remains possible, and is therefore tested: a launch shape that never asks
 /// [`ManagedLaunch::resolve`] at all — see `SUBA-149`'s residual note for the shapes that do not
 /// yet.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+///
+/// # Why it serializes as a bare `bool`, and why that is not a `Default`
+///
+/// This type crosses the hop-1/hop-2 process boundary on
+/// [`crate::spawn::chain_graph::SingleStepSpec::worktree`], whose wire shape is pi's own
+/// `worktree?: boolean` (`shared/settings.ts:50` `SequentialStep.worktree`, written as
+/// `...(s.worktree ? { worktree: true } : {})`, `async-execution.ts:1247`/`:2163` @v0.75.0). So it
+/// serializes `true`/`false` and an ABSENT key reads as [`Self::Shared`] — pi's `params.worktree
+/// === true`.
+///
+/// That absent-key rule is deliberately NOT `impl Default`. The wire has a third state (the key is
+/// missing) that a Rust struct literal does not have, and the whole of `SUBA-149` is that a
+/// construction site which can stay silent about isolation eventually does. [`Self::absent`] is
+/// reachable only from `serde(default = …)`; no field literal can call on it implicitly.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(from = "bool", into = "bool")]
 pub enum WorktreeRequest {
     /// The child runs in the caller's own working directory, sharing it with everything else.
     Shared,
@@ -2282,10 +2297,37 @@ impl WorktreeRequest {
         }
     }
 
+    /// What an ABSENT wire `worktree` key means — pi's `params.worktree === true` read against
+    /// `undefined`. The `serde(default = …)` hook, and nothing else: see this type's own note on
+    /// why it is not an `impl Default`.
+    #[must_use]
+    pub const fn absent() -> Self {
+        Self::Shared
+    }
+
     /// Whether this request asks for a managed worktree.
     #[must_use]
     pub const fn is_isolated(self) -> bool {
         matches!(self, Self::Isolated)
+    }
+
+    /// Whether this request asks for nothing — the `skip_serializing_if` hook, so an un-isolated
+    /// step serializes with no `worktree` key at all, exactly as upstream writes it.
+    #[must_use]
+    pub const fn is_shared(&self) -> bool {
+        matches!(self, Self::Shared)
+    }
+}
+
+impl From<bool> for WorktreeRequest {
+    fn from(value: bool) -> Self {
+        Self::from_flag(Some(value))
+    }
+}
+
+impl From<WorktreeRequest> for bool {
+    fn from(value: WorktreeRequest) -> Self {
+        value.is_isolated()
     }
 }
 
@@ -2347,15 +2389,36 @@ pub enum ManagedHandoff {
     Retained(crate::handoff::HandoffError),
 }
 
-/// Where one managed single run publishes its hand-off manifest, and under what identity.
+/// Where ONE managed single-child launch publishes its hand-off manifest, and under what
+/// identity.
+///
+/// "Single" here means one allocated worktree for one child, not "SINGLE mode": upstream's
+/// background runner reaches the identical preserve-and-publish for an async SINGLE run's only
+/// step AND for every `worktree: true` SEQUENTIAL step of a chain, through one code path
+/// (`subagent-runner.ts:4440-4441` allocates, `:4732-4779` settles). The three fields below are
+/// exactly what differs between those callers, which is why they are carried rather than assumed.
 #[derive(Debug, Clone, Copy)]
 pub struct SingleHandoffBinding<'a> {
-    /// `<artifacts>/handoffs/<run_id>.json` — [`crate::handoff::handoff_manifest_path`].
+    /// `<artifacts>/handoffs/<run_id>.json` — [`crate::handoff::handoff_manifest_path`] — or, for
+    /// the async runner, `<run_dir>/handoff.json` (pi `parallelHandoffPath(asyncDir)`).
     pub manifest_path: &'a Path,
     /// This run's own id (pi's manifest `runId`).
     pub run_id: &'a crate::handoff::LaneId,
-    /// Which process is writing. pi's single path writes `source: "foreground"` (`:3934`).
+    /// The manifest's `mode`, which is manifest IDENTITY — a rewrite whose mode disagrees with the
+    /// file on disk is refused (pi `parallel-handoff.ts:514-516`). A foreground/async SINGLE run
+    /// writes `single`; a chain step writes `chain`, pi's own
+    /// `(config.resultMode ?? statusPayload.mode)` fold (`subagent-runner.ts:4417`).
+    pub mode: crate::handoff::HandoffMode,
+    /// Which process is writing. pi's foreground single path writes `source: "foreground"`
+    /// (`:3934`); the runner writes `source: "async"` (`:4745`).
     pub source: crate::handoff::HandoffSource,
+    /// The manifest group this allocation merges under — pi `stepIndex` (`:4747`). `0` for a
+    /// single-step run; the step's own position for a chain step, so two isolated steps of one
+    /// chain are two groups rather than one overwriting the other.
+    pub step_index: u32,
+    /// pi `flatStartIndex` (`:4748`): where this group's children start in the run's flat
+    /// `RunStatus::steps`.
+    pub flat_start_index: u32,
 }
 
 impl ManagedLaunch {
@@ -2462,11 +2525,16 @@ impl ManagedLaunch {
         // writes and the removal so a concurrent `worktree.discard` cannot remove a tree this
         // manifest is about to claim. `create_worktrees` takes the SAME turn.
         let _turn = worktree_turn().await;
+        // pi `path.join(asyncDir, "worktree-diffs", `step-${stepIndex}`)`
+        // (`subagent-runner.ts:4735`) — per STEP, not per run. The flat name is the one
+        // `chain_graph::publish_worktree_handoff` already writes for a fan-out group, so a chain
+        // that isolates several steps lands each step's patches in its own directory instead of
+        // overwriting the previous step's.
         let diffs_dir = binding
             .manifest_path
             .parent()
             .unwrap_or_else(|| Path::new("."))
-            .join("worktree-diffs-single");
+            .join(format!("worktree-diffs-step-{}", binding.step_index));
         let run_cancel = self.bounds.cancel.clone().unwrap_or_default();
         let harvest = GitBounds::for_harvest(&run_cancel, self.bounds.deadline_at);
         let agents: Vec<String> = results.iter().map(|result| result.agent.clone()).collect();
@@ -2476,11 +2544,11 @@ impl ManagedLaunch {
         if let Err(error) = crate::handoff::write_group(crate::handoff::WriteGroup {
             manifest_path: binding.manifest_path,
             run_id: binding.run_id,
-            mode: crate::handoff::HandoffMode::Single,
+            mode: binding.mode,
             source: binding.source,
             cwd: &self.source_cwd,
-            step_index: 0,
-            flat_start_index: 0,
+            step_index: binding.step_index,
+            flat_start_index: binding.flat_start_index,
             setup,
             diffs: &diffs,
             cleanup: None,
@@ -2508,11 +2576,11 @@ impl ManagedLaunch {
         match crate::handoff::write_group(crate::handoff::WriteGroup {
             manifest_path: binding.manifest_path,
             run_id: binding.run_id,
-            mode: crate::handoff::HandoffMode::Single,
+            mode: binding.mode,
             source: binding.source,
             cwd: &self.source_cwd,
-            step_index: 0,
-            flat_start_index: 0,
+            step_index: binding.step_index,
+            flat_start_index: binding.flat_start_index,
             setup,
             diffs: &diffs,
             cleanup: Some(&report),

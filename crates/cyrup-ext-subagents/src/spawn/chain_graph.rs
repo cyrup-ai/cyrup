@@ -39,6 +39,14 @@
 //! [`crate::spawn::worktree::setup_worktree_group`] first (R-SA-060-064) to assign each fanned-out
 //! task its own dedicated worktree `cwd` before `run_bounded` dispatches it.
 //!
+//! SUBA-149 — a [`RunnerStep::SingleStep`] carries its OWN
+//! [`crate::spawn::worktree::WorktreeRequest`] ([`SingleStepSpec::worktree`], pi
+//! `SequentialStep.worktree`), and [`run_single_step`] answers it through
+//! [`crate::spawn::worktree::ManagedLaunch`] before dispatch and hands the worktree back after.
+//! That is the SAME single branch upstream's runner reaches for an async SINGLE run's only step
+//! and for every `worktree: true` sequential chain step (`subagent-runner.ts:4440-4443`,
+//! `:4732-4779`), so this module has one allocation site per shape and no third path.
+//!
 //! `SingleStepExecutor` (the actual "spawn a real child OS process for this one agent
 //! invocation" primitive) is a narrow seam this module depends on rather than a concrete
 //! `exec::run_sync` call, because `exec/mod.rs` (func-SA §5.2's foreground executor, a later
@@ -211,6 +219,37 @@ pub struct SingleStepSpec {
     /// derivation in [`Self::child_session_name`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_name: Option<String>,
+    /// SUBA-149 — pi `SequentialStep.worktree` (`shared/settings.ts:50` @v0.75.0): whether THIS
+    /// step's child must run in its own managed git worktree rather than the walk's shared cwd.
+    ///
+    /// # Why this field had to exist, and why it is mandatory
+    ///
+    /// `worktree` was consumed on [`ParallelGroupSpec`] alone. Every launch that reaches a child
+    /// through a `SingleStep` — which is **every async SINGLE run**, because
+    /// `subagents.asyncByDefault` is `true`, so a bare `subagent({agent, task, worktree: true})`
+    /// takes the background path — had nowhere for the request to land, and dropped it silently.
+    /// Upstream has no such hole: `executeAsyncSingle` puts `worktree: true` on its one step
+    /// (`async-execution.ts:2163`), a chain's sequential step carries its own
+    /// (`async-execution.ts:1336-1340`), and the runner allocates for either from the SAME branch
+    /// (`subagent-runner.ts:4440-4441`).
+    ///
+    /// It is a mandatory [`crate::spawn::worktree::WorktreeRequest`] with no `Default`, so the
+    /// compiler names every construction site rather than letting a new one inherit "no
+    /// isolation" by omission — the mechanism by which the drop happened in the first place.
+    /// [`walk_chain`] answers it through [`crate::spawn::worktree::ManagedLaunch`], the one type
+    /// that can; the serialized form is pi's own `worktree?: boolean`, absent when shared.
+    ///
+    /// A member of a [`ParallelGroupSpec`] always reads [`crate::spawn::worktree::
+    /// WorktreeRequest::Shared`] here even inside a `worktree: true` group: the GROUP allocated,
+    /// and the member's `cwd` is already its worktree. That is upstream's own shape — it
+    /// overwrites each member's value with the group's (`async-execution.ts:1289`
+    /// `buildSeqStep({ ...t, worktree: s.worktree })`) and allocates once for the group
+    /// (`subagent-runner.ts:3979`), never per member.
+    #[serde(
+        default = "crate::spawn::worktree::WorktreeRequest::absent",
+        skip_serializing_if = "crate::spawn::worktree::WorktreeRequest::is_shared"
+    )]
+    pub worktree: crate::spawn::worktree::WorktreeRequest,
 }
 
 impl SingleStepSpec {
@@ -1214,6 +1253,25 @@ pub struct StepResult {
     /// `Paused`, never `Complete`. `false` for every non-interrupted step.
     #[doc(alias = "paused")]
     pub interrupted: bool,
+    /// SUBA-149 — [`crate::exec::SingleResult::detached`] carried across the dispatch waist, which
+    /// dropped it (it sat in `build_step_result`'s trailing `..`).
+    ///
+    /// It is load-bearing for exactly one decision, and getting that decision wrong destroys a
+    /// caller's work: a detached child is STILL EXECUTING, so its managed worktree must not be
+    /// diffed, preserved and removed underneath it. Upstream gates both of its settle sites on
+    /// precisely this flag — `if (singleWorktreeSetup && !singleResult.detached)`
+    /// (`subagent-runner.ts:4732`) in the background runner, and `r.detached ? pendingHandoff :
+    /// await finalizeSingleWorktreeHandoff(…)` (`subagent-executor.ts:4387-4389`) in the
+    /// foreground. The foreground path reads it off its own `SingleResult`; a chain/async step has
+    /// only a [`StepResult`], so without this field the gate could not be asked at all.
+    ///
+    /// `false` for every ordinary step, which is what a child that ran to a real exit reports.
+    /// Only the FLAG is carried, not [`crate::exec::SingleResult::detached_reason`]: its one
+    /// consumer is the hand-off gate, which asks whether to settle and never renders a reason, and
+    /// nothing projects the pair back onto a `SingleResult` — upstream's own terminal results
+    /// array carries neither (`subagent-runner.ts:4588-4620` enumerates its fields and `detached`
+    /// is not among them).
+    pub detached: bool,
     /// SUBA-N05 — the live-control events this step's child raised
     /// ([`crate::exec::SingleResult::control_events`], pi `result.controlEvents`,
     /// `runs/foreground/execution.ts:1314` @v0.43.0).
@@ -1372,6 +1430,7 @@ impl StepResult {
             final_output,
             error: None,
             interrupted: false,
+            detached: false,
             control_events: Vec::new(),
             exit_code: None,
             timed_out: false,
@@ -1408,6 +1467,7 @@ impl StepResult {
             final_output: None,
             error: Some(error.into()),
             interrupted: false,
+            detached: false,
             control_events: Vec::new(),
             exit_code: None,
             timed_out: false,
@@ -1740,10 +1800,10 @@ pub async fn walk_chain(
                 // C10: resolve {outputs.name}/{task}/{previous}/{chain_dir} + the chain-instruction
                 // prefix/suffix before dispatch (fails the whole walk on an unknown {outputs.x}).
                 let resolved_task = resolve_step_task(&spec.task, registry, ctx, spec)?;
-                let result = single
-                    .run_single(spec, &resolved_task, ctx)
-                    .await
-                    .unwrap_or_else(|err| StepResult::failure(err.to_string()));
+                // SUBA-149 — the step's isolation request is ANSWERED here, between task
+                // resolution and dispatch, exactly where upstream's runner answers it
+                // (`subagent-runner.ts:4440-4441`).
+                let result = run_single_step(spec, &resolved_task, single, ctx, step_index).await?;
                 if result.success {
                     // C11: register this step's named output — structured OR plain text — so a later
                     // step's {outputs.name} can resolve it, then advance `previous` for {previous}
@@ -1820,6 +1880,13 @@ async fn run_parallel_group(
             skills: None,
             session_dir: None,
             task,
+            // SUBA-149 — the GROUP owns the allocation: `assign_worktree_cwds` below rewrites each
+            // member's `cwd` to its own worktree, so the member spec carries no request of its own
+            // left to answer and must not make `run_single_step` allocate a second one. Upstream
+            // overwrites each member's value with the group's for the same reason
+            // (`async-execution.ts:1289` `buildSeqStep({ ...t, worktree: s.worktree })`) and
+            // allocates once per group (`subagent-runner.ts:3979`), never per member.
+            worktree: crate::spawn::worktree::WorktreeRequest::Shared,
             ..s.clone()
         });
     }
@@ -1889,6 +1956,168 @@ async fn run_parallel_group(
 
     group_results.push(group_result);
     Ok(collapsed)
+}
+
+/// SUBA-149 — dispatch ONE [`RunnerStep::SingleStep`], answering its
+/// [`crate::spawn::worktree::WorktreeRequest`] first and handing the worktree back afterwards.
+///
+/// # What this closes
+///
+/// `subagents.asyncByDefault` is `true` (`registration/mod.rs:684`), so a bare
+/// `subagent({agent, task, worktree: true})` is a BACKGROUND launch whose runner config is one
+/// `SingleStep`. Before this function the request had nowhere to be read on that path and the
+/// child ran in the shared cwd — the caller got no isolation and no diagnostic. The same hole
+/// covered every `worktree: true` SEQUENTIAL chain step (pi `sequential.worktree`,
+/// `async-execution.ts:1336-1340`).
+///
+/// Upstream reaches both from ONE branch of its runner, and so does this: allocate
+/// (`subagent-runner.ts:4441-4443`), run the step with the allocation's `agentCwd` as its cwd
+/// (`:4511`, `:4536-4537`), then preserve-and-publish (`:4732-4779`).
+///
+/// # Shape notes
+///
+/// * The allocation is cut from `ctx.cwd` and OVERRIDES the step's own `cwd`, which is upstream's
+///   own shape — `bindWorktreeCwd({ ...seqStep, cwd: singleCwd }, singleCwd)` (`:4536-4537`)
+///   replaces it. (A `worktree: true` fan-out GROUP instead refuses an explicit per-task `cwd`
+///   outright, `find_worktree_task_cwd_conflict`; upstream draws the same distinction.)
+/// * An unallocatable requested worktree ABORTS the walk rather than degrading to the shared cwd.
+///   That is the `?` on `ManagedLaunch::resolve` and it matches what the `worktree: true` GROUP
+///   arm beside it already does; upstream fails the step and `break`s the chain (`:4477-4496`).
+///   What must never happen is a child that silently runs un-isolated.
+/// * A DETACHED result skips the hand-off entirely (`!singleResult.detached`, `:4732`): that child
+///   is still executing inside the tree, so diffing and removing it would destroy live work.
+async fn run_single_step(
+    spec: &SingleStepSpec,
+    resolved_task: &str,
+    single: &Arc<dyn SingleStepExecutor>,
+    ctx: &ChainRunContext,
+    step_index: usize,
+) -> Result<StepResult, SubagentError> {
+    let position = step_position(ctx, step_index);
+    let managed = crate::spawn::worktree::ManagedLaunch::resolve(
+        spec.worktree,
+        &ctx.cwd,
+        &worktree_allocation_id(ctx, position),
+        &crate::spawn::worktree::ManagedLaunchConfig {
+            agent: Some(spec.agent.as_str()),
+            base_dir: ctx.worktree_base_dir.as_deref(),
+            // `ChainRunContext` carries no hook: the one-shot `RunnerConfig` does not transmit
+            // `worktreeSetupHook`/`worktreeSetupHookTimeoutMs` to hop 2 at all, which is why the
+            // fan-out group beside this one passes `None` too (`assign_worktree_cwds`). A
+            // recorded residual, not a decision taken here.
+            setup_hook: None,
+            setup_hook_timeout_ms: None,
+            // pi `SetupTransaction`: every allocation git command obeys the run's stop and
+            // deadline (`worktree.ts:239-252`).
+            bounds: crate::spawn::worktree::GitBounds::new(
+                Some(ctx.cancel.clone()),
+                ctx.deadline_at,
+            ),
+        },
+    )
+    .await?;
+
+    // One borrow of the allocation's answer. `child_cwd()` is the worktree's `agent_cwd` when
+    // isolated and `ctx.cwd` otherwise (pi's `singleCwd`, `:4511`), and by construction of
+    // `ManagedLaunch` it cannot say "isolated" while pointing at the shared cwd.
+    let dispatched = managed.allocated().map(|_| SingleStepSpec {
+        cwd: Some(managed.child_cwd().to_path_buf()),
+        ..spec.clone()
+    });
+    let result = single
+        .run_single(dispatched.as_ref().unwrap_or(spec), resolved_task, ctx)
+        .await
+        .unwrap_or_else(|err| StepResult::failure(err.to_string()));
+
+    let Some(binding) = ctx.handoff.as_ref() else {
+        return Ok(result);
+    };
+    // pi `:4732`'s own gate, in pi's own order: nothing allocated, or a child still live in the
+    // tree, and there is nothing to hand back.
+    if managed.allocated().is_none() || result.detached {
+        return Ok(result);
+    }
+    let handoff_result = crate::handoff::HandoffResult {
+        agent: spec.agent.clone(),
+        status: Some(handoff_child_status(Some(&result))),
+        summary: result
+            .final_output
+            .clone()
+            .filter(|text| !text.is_empty())
+            .or_else(|| result.error.clone())
+            .unwrap_or_else(|| "(no output)".to_string()),
+        output_path: result.saved_output_path.clone().map(PathBuf::from),
+        structured_output: result.structured_output.clone(),
+        structured_output_path: result.structured_output_path.clone(),
+        session_path: result.session_file.clone(),
+        workflow_key: None,
+        run_id: None,
+        lane: None,
+    };
+    let published = managed
+        .finalize(
+            &crate::spawn::worktree::SingleHandoffBinding {
+                manifest_path: &binding.manifest_path,
+                run_id: &binding.run_id,
+                mode: binding.mode,
+                source: binding.source,
+                step_index: u32::try_from(position).unwrap_or(u32::MAX),
+                flat_start_index: u32::try_from(position).unwrap_or(u32::MAX),
+            },
+            std::slice::from_ref(&handoff_result),
+        )
+        .await;
+    // pi appends the reference (or the error) to `previousOutput` and keeps going (`:4772-4776`):
+    // the child has already run and its patch is already on disk, so a bookkeeping failure is
+    // reported, never escalated into a lost result.
+    let note = match &published {
+        crate::spawn::worktree::ManagedHandoff::Published(reference) => {
+            Some(crate::handoff::format_reference(reference))
+        }
+        crate::spawn::worktree::ManagedHandoff::Retained(error) => {
+            Some(crate::handoff::format_error(error))
+        }
+        // Unreachable behind the `allocated().is_none()` guard above, and deliberately not
+        // `unreachable!()`: this crate denies `panic!`, and "nothing to say" is the right note.
+        crate::spawn::worktree::ManagedHandoff::NothingToHandOff => None,
+    };
+    let mut result = result;
+    if let Some(note) = note {
+        result.final_output = Some(match result.final_output.take() {
+            Some(existing) if !existing.is_empty() => format!("{existing}\n\n{note}"),
+            _ => note,
+        });
+    }
+    Ok(result)
+}
+
+/// This step's position in the RUN, which is not the same as its index in the slice
+/// [`walk_chain`] was handed.
+///
+/// Two callers walk with two different conventions and both have to come out right:
+/// the detached runner calls [`walk_chain`] once per cursor position with a ONE-element graph and
+/// stamps the real flat index on [`ChainRunContext::step_slot`] first
+/// (`background/runner_main/turn_loop.rs`), so its `step_index` is always `0`; a foreground
+/// `/chain` walk hands over the whole graph with `step_slot` fixed at `0`, so its `step_index` is
+/// the real position. The SUM is the run position under both, which is what pi's
+/// `${id}-s${stepIndex}` allocation id and its per-step diff directory need to stay unique across
+/// a chain that isolates more than one step.
+fn step_position(ctx: &ChainRunContext, step_index: usize) -> usize {
+    ctx.step_slot.index().saturating_add(step_index)
+}
+
+/// pi `${id}-s${stepIndex}` (`subagent-runner.ts:4443`) — what this step's managed worktree
+/// directory and temporary branch are named after.
+///
+/// The run id comes from the hand-off binding, so the allocation and the manifest it will be
+/// published under are provably named from one source. A walk with no binding publishes no
+/// manifest and therefore has no run id to agree with; it gets a fresh token, which still keeps
+/// two such walks from colliding on a worktree path.
+fn worktree_allocation_id(ctx: &ChainRunContext, position: usize) -> String {
+    match ctx.handoff.as_ref() {
+        Some(binding) => format!("{}-s{position}", binding.run_id.as_str()),
+        None => format!("{}-s{position}", uuid::Uuid::now_v7().as_simple()),
+    }
 }
 
 /// Capture this group's diffs, publish the manifest, clean the worktrees up, and publish AGAIN
@@ -2210,6 +2439,12 @@ async fn run_dynamic_group(
                 task: resolved,
                 label,
                 session_name,
+                // SUBA-149 — a [`DynamicGroupSpec`] has no `worktree` field, by design
+                // (func-SA §4.2; upstream's dynamic lowering passes none either —
+                // `async-execution.ts:1307` builds its template step with no `worktree`), so a
+                // materialized item cannot inherit one from the group and must not carry a
+                // stale request forward from the template literal.
+                worktree: crate::spawn::worktree::WorktreeRequest::Shared,
                 ..(*spec.template).clone()
             });
         }
@@ -2678,6 +2913,10 @@ fn collapse_fan_out(fan_out: FanOutResult<StepResult, SubagentError>) -> GroupSt
             final_output: aggregate_final_output,
             error,
             interrupted: false,
+            // SUBA-149 — a GROUP aggregate is not a child, so it never detaches; each member's own
+            // flag (if any) lives on `children` below, and the group's worktree hand-off is
+            // `publish_worktree_handoff`'s, not `run_single_step`'s.
+            detached: false,
             control_events: aggregate_control_events,
             // A GROUP aggregate has no single child of its own; the per-child exit codes /
             // deadline flags / paths / usage / models / session files live on `children` below
@@ -2725,6 +2964,7 @@ mod tests {
 
     fn single_step(agent: &str, task: &str) -> SingleStepSpec {
         SingleStepSpec {
+            worktree: crate::spawn::worktree::WorktreeRequest::Shared,
             machine: None,
             skills: None,
             session_dir: None,

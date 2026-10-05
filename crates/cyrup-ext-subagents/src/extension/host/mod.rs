@@ -1272,6 +1272,7 @@ mod tests {
 
         let graph = vec![RunnerStep::SingleStep(
             crate::spawn::chain_graph::SingleStepSpec {
+                worktree: crate::spawn::worktree::WorktreeRequest::Shared,
                 machine: None,
                 skills: None,
                 session_dir: None,

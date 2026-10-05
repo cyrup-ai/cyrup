@@ -149,6 +149,7 @@ pub(crate) mod tests {
 
     pub(super) fn single_step(agent: &str, task: &str) -> SingleStepSpec {
         SingleStepSpec {
+            worktree: crate::spawn::worktree::WorktreeRequest::Shared,
             machine: None,
             skills: None,
             session_dir: None,

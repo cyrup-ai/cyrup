@@ -218,13 +218,17 @@ async fn copilot_and_codex_logins_are_reachable_from_all_providers() {
 /// the device-id message and NOT `LoginUnsupported` is the proof that the trait default was
 /// overridden.
 ///
-/// It also records the one thing still missing end to end: nothing in the app supplies a device id
-/// yet. Upstream's `coding-agent` passes
-/// `{ getDeviceId: () => this.settingsManager.getOrCreateDeviceId() }`
+/// The app half — upstream's `{ getDeviceId: () => this.settingsManager.getOrCreateDeviceId() }`
 /// (`modes/interactive/interactive-mode.ts:6262` → `core/settings-manager.ts:1175-1182`, a
-/// persisted `deviceId` created with `randomUUID()` on first use), and `cyrup-config`'s
-/// `login::login` still calls `LoginOptions::default()`. When that lands, this assertion changes
-/// from "fails for want of a device id" to a real login.
+/// persisted `deviceId` created with `randomUUID()` on first use) — has LANDED: `cyrup-config`'s
+/// `login::login` now takes a `SettingsManager` and builds `LoginOptions::with_device_id` from the
+/// global layer (`cyrup_config::settings::installation`), so `/login openai` reaches the flow. That
+/// is asserted where it belongs, against the login path, in
+/// `cyrup-config/src/tests/installation_id.rs`.
+///
+/// These assertions deliberately did NOT change: this probe calls the strategy directly and
+/// supplies no device id, so refusing before any authorization starts is still the correct
+/// behaviour and still the proof that the trait default was overridden.
 #[tokio::test]
 async fn the_openai_chatgpt_login_is_reachable_from_all_providers() {
     let oauth = oauth_by_id("openai").expect("openai must expose an oauth strategy");

@@ -58,6 +58,7 @@ fn child(dir: &Path) -> std::path::PathBuf {
 
 fn single_step() -> SingleStepSpec {
     SingleStepSpec {
+        worktree: crate::spawn::worktree::WorktreeRequest::Shared,
         machine: None,
         skills: None,
         session_dir: None,

@@ -7,7 +7,8 @@
 //!
 //! Split by concern: `types` holds the scope + value enums/structs, `layer` is the raw one-scope
 //! `Settings` document, `migrate` ports `migrateSettings`, `merge` is `deep_merge` and
-//! `deep_merge_settings`, `default_tools` is the `defaultTools` language (CFG-097), `effective` is
+//! `deep_merge_settings`, `default_tools` is the `defaultTools` language (CFG-097),
+//! `installation` is the per-install `deviceId` (PROV-118), `effective` is
 //! the merged read-only view and its typed getters, `store` is the read/lock seam plus its two
 //! implementations, and `manager` is the two-layer facade and its writers.
 //!
@@ -16,6 +17,7 @@
 
 mod default_tools;
 mod effective;
+mod installation;
 mod layer;
 mod manager;
 mod merge;
@@ -31,6 +33,10 @@ pub use default_tools::{
     DEFAULT_TOOL_NAMES, is_tool_modifier, merge_default_tools, resolve_default_tools,
 };
 pub use effective::{DEFAULT_HTTP_IDLE_TIMEOUT_MS, EffectiveSettings, parse_http_idle_timeout_ms};
+pub use installation::{
+    DEVICE_ID_KEY, DeviceIdDecision, InstallationId, InstallationIdParseError,
+    InstallationIdSupplier,
+};
 pub use layer::Settings;
 pub use manager::SettingsManager;
 pub use merge::{deep_merge, deep_merge_settings};

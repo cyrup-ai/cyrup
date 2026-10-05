@@ -92,6 +92,18 @@ pub(crate) struct ToolTaskItem {
     phase: Option<String>,
     #[serde(default)]
     label: Option<String>,
+    /// SUBA-149 — pi `SequentialStep.worktree` (`shared/settings.ts:50` @v0.75.0). This type
+    /// serves BOTH shapes: a `chain[]` sequential element, where upstream's `SequentialStep`
+    /// carries `worktree` and the runner honours it (`async-execution.ts:1336`), and a
+    /// `tasks[]`/`chain[].parallel[]` member, where upstream's `ParallelTaskItem` has none and the
+    /// GROUP's flag is pushed down onto every member instead (`async-execution.ts:1289`).
+    ///
+    /// Lifting it here therefore only takes effect on the sequential shape: `chain_graph`'s group
+    /// arms overwrite each member's request with `Shared` because the group already allocated.
+    /// Before this field existed the key was not even parsed, so `chain: [{agent, task,
+    /// worktree: true}]` was accepted and silently un-isolated.
+    #[serde(default)]
+    worktree: Option<bool>,
 }
 
 impl ToolTaskItem {
@@ -149,6 +161,9 @@ impl ToolTaskItem {
         }
         if self.label.is_some() {
             keys.push("label");
+        }
+        if self.worktree.is_some() {
+            keys.push("worktree");
         }
         keys
     }
@@ -278,6 +293,14 @@ fn validate_step_machine(machine: Option<&str>) -> Result<(), ToolError> {
 /// `ExecSingleStepExecutor::run_single`'s `model_override`), exactly as the slash `[model=…]` path.
 pub(crate) fn tool_task_to_spec(item: &ToolTaskItem) -> SingleStepSpec {
     SingleStepSpec {
+        // SUBA-149 — pi `SequentialStep.worktree` (`shared/settings.ts:50` @v0.75.0), honoured by
+        // the runner's sequential arm (`async-execution.ts:1336` -> `subagent-runner.ts:4441`). A
+        // `chain[]` element gets its own request; a `tasks[]`/`chain[].parallel[]` member's value
+        // is overwritten with the group's answer at dispatch (`chain_graph::run_parallel_group`),
+        // which is upstream's own push-down (`async-execution.ts:1289`). Before this the key was
+        // not parsed at all, so `chain: [{agent, task, worktree: true}]` was accepted and ran
+        // un-isolated.
+        worktree: crate::spawn::worktree::WorktreeRequest::from_flag(item.worktree),
         // SUBA-100 — the step rung; the call and agent rungs are folded in at launch
         // (`crate::placement::resolve_graph_placements`), where the resolution happens.
         machine: item

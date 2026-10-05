@@ -365,6 +365,9 @@ pub(super) fn child_stopped_step_result() -> StepResult {
         final_output: Some(control::STOP_MESSAGE.to_string()),
         error: Some(control::STOP_MESSAGE.to_string()),
         interrupted: false,
+        // No child ever ran, so nothing detached: any worktree this slot was allocated is free
+        // to be handed back (SUBA-149).
+        detached: false,
         control_events: Vec::new(),
         exit_code: Some(1),
         timed_out: false,
@@ -408,6 +411,8 @@ pub(super) fn stopped_single_result(step: &RunnerStep) -> SingleResult {
             final_output: Some(message.clone()),
             error: Some(message),
             interrupted: false,
+            // A STOPPED step's child is gone, not detached (SUBA-149).
+            detached: false,
             control_events: Vec::new(),
             exit_code: Some(1),
             timed_out: false,
@@ -684,6 +689,13 @@ pub(super) fn step_result_to_single_result_with(
         transcript_path: result.transcript_path.clone(),
         transcript_error: result.transcript_error.clone(),
         acceptance: None,
+        // SUBA-149 — NOT carried, and that is upstream's own shape rather than a drop. pi's
+        // sequential `results.push` enumerates its fields explicitly
+        // (`subagent-runner.ts:4588-4620` @v0.75.0) and `detached` is not among them, so a
+        // terminal async `ResultFile` carries no detach marker upstream either. The flag's ONE
+        // consumer is the worktree hand-off gate at `:4732`, which reads it off the live
+        // `singleResult` — in cyrup, off [`crate::spawn::chain_graph::StepResult::detached`]. A
+        // reader that needs it has `status`'s live view; inventing it here would diverge.
         detached: false,
         detached_reason: None,
         // R-SA-084: carry the mid-flight interrupt flag through to the terminal per-step

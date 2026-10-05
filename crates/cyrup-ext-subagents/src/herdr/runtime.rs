@@ -651,6 +651,7 @@ mod tests {
         // prompt, and it is in here precisely so that a builder or a label that started reading it
         // would be caught.
         let steps = vec![RunnerStep::SingleStep(SingleStepSpec {
+            worktree: crate::spawn::worktree::WorktreeRequest::Shared,
             machine: None,
             skills: None,
             session_dir: None,

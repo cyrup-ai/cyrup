@@ -482,6 +482,7 @@ mod tests {
 
     fn fork_test_step(agent: &str) -> SingleStepSpec {
         SingleStepSpec {
+            worktree: crate::spawn::worktree::WorktreeRequest::Shared,
             machine: None,
             skills: None,
             session_dir: None,

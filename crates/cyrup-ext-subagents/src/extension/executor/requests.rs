@@ -389,6 +389,23 @@ pub struct BackgroundSingleRequest<'a> {
     /// (`subagent-executor.ts:4146`): the CALL rung, raw, for the same reason
     /// [`BackgroundStepsSpec::tool_timeout_ms`] is.
     pub tool_timeout_ms: Option<serde_json::Value>,
+    /// SUBA-149 — pi `...(params.worktree === true ? { worktree: true } : {})` on the async SINGLE
+    /// launch (`subagent-executor.ts:3595` → `async-execution.ts:2163` @v0.75.0): whether this
+    /// child must run in its own managed git worktree.
+    ///
+    /// **This is the field whose absence kept `SUBA-149` open.** `subagents.asyncByDefault` is
+    /// `true`, so a bare `subagent({agent, task, worktree: true})` takes THIS path, not the
+    /// foreground one — and with nowhere for the request to land, `route_single_background` read
+    /// `p.worktree` nowhere and the child ran in the caller's own working directory. The
+    /// foreground twin on [`ForegroundRunRequest::worktree`] was fixed first, and foreground is
+    /// the minority shape for a bare call.
+    ///
+    /// A [`crate::spawn::worktree::WorktreeRequest`] with **no `Default`**, for the reason that
+    /// field's own doc gives: `spawn_background` lands it on
+    /// [`crate::spawn::chain_graph::SingleStepSpec::worktree`], where
+    /// [`crate::spawn::worktree::ManagedLaunch`] answers it, and a field that cannot be omitted
+    /// cannot be forgotten by the next launch shape either.
+    pub worktree: crate::spawn::worktree::WorktreeRequest,
 }
 
 /// The already-resolved, plan-shaped inputs [`crate::extension::SubagentExecutor::spawn_background_steps`] takes from

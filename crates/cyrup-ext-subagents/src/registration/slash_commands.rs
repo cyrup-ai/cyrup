@@ -1255,6 +1255,11 @@ pub fn step_token_to_spec(
 
     Ok(SingleStepSpec {
         machine: None,
+        // SUBA-149 — a slash `/chain` step TOKEN has no `worktree` modifier in its grammar (pi's
+        // own token surface has none either), so every token-authored step runs in the shared cwd.
+        // An authored `.chain.md`/`.chain.json` step DOES carry one and lifts it in
+        // `discovery::chains::chain_step_to_single_step_spec`.
+        worktree: crate::spawn::worktree::WorktreeRequest::Shared,
         skills: None,
         session_dir: None,
         agent: step.name.clone(),
