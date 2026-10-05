@@ -2,16 +2,12 @@
 	"use strict";
 	// The only host entry points. They are captured here and `Deno` is deleted before the script
 	// runs, so the script cannot reach them (see the end of this function).
-	const core = Deno.core;
-	const hostOps = core.ops;
+	const hostOps = Deno.core.ops;
 	const opCall = hostOps.op_codemode_call;
 	const opOutput = hostOps.op_codemode_output;
 	const opDoneOk = hostOps.op_codemode_done_ok;
 	const opDoneErr = hostOps.op_codemode_done_err;
 	const opMemoryExceeded = hostOps.op_codemode_memory_exceeded;
-	// A rejected promise nobody awaits (an unawaited tool call that fails) is not an error of the
-	// script: report it as handled, so the engine's event loop does not turn it into one.
-	core.setUnhandledPromiseRejectionHandler(() => true);
 
 	function bridge(kind, a, b, c) {
 		switch (kind) {
