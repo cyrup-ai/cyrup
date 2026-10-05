@@ -20,6 +20,7 @@
 
 use crate::ToolCallId;
 use crate::cancel::CancelToken;
+use crate::exposure::{LoadoutView, ToolExposure, ToolLoadoutChanges, ToolNamespace};
 use crate::message::Content;
 
 /// Per-tool execution mode (func-02 R-02-014).
@@ -400,6 +401,36 @@ pub trait Tool: Send + Sync {
     /// (`ExtensionHost::render_tool_result`) has always had the same shape.
     fn render_result(&self, _result: &serde_json::Value) -> Option<String> {
         None
+    }
+
+    /// How the model reaches this tool (pi `ToolDefinition.exposure`, `extensions/types.ts:593-630`
+    /// @v1.0.1; the type is [`ToolExposure`]). Default [`ToolExposure::Direct`], which is what pi
+    /// reads for a definition that sets none (`_getToolExposure`'s `?? "direct"`,
+    /// `agent-session.ts:1507`), so a tool that says nothing behaves as it always did.
+    fn exposure(&self) -> ToolExposure {
+        ToolExposure::Direct
+    }
+
+    /// The group this tool belongs to, such as an MCP server (pi `ToolDefinition.namespace`).
+    /// Default `None`.
+    fn namespace(&self) -> Option<&ToolNamespace> {
+        None
+    }
+
+    /// Whether registering the tool activates it (pi `ToolDefinition.defaultActive`,
+    /// `types.ts:608` @v1.0.1; `false` is pi's `defaultActive: false`). Only meaningful for
+    /// [`ToolExposure::Direct`] and [`ToolExposure::ModelOnly`] tools — the other three are never
+    /// activated on registration. Default `true`.
+    fn default_active(&self) -> bool {
+        true
+    }
+
+    /// Adjust what the model sees of the session's tools (pi `ToolDefinition.prepareLoadout`,
+    /// `types.ts:625-630` @v1.0.1). Called with the loadout whenever the active set is applied,
+    /// for each *active* tool that has a hook. Default: no changes. An `Err` is reported and
+    /// discarded; see [`crate::exposure`].
+    fn prepare_loadout(&self, _view: &LoadoutView<'_>) -> Result<ToolLoadoutChanges, ToolError> {
+        Ok(ToolLoadoutChanges::default())
     }
 
     /// Execute the tool call. Return `Err(ToolError)` on failure, or an `Ok` result with

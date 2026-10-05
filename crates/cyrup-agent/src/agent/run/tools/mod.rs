@@ -91,11 +91,11 @@ impl RunCtx {
         ToolCallEnv {
             hooks: self.hooks.as_ref(),
             cancel: self.cancel.token(),
-            resolve_tools: &self.tools,
+            resolve_tools: self.tools.executable(),
             context: AgentContextView {
                 system_prompt: &self.system_prompt,
                 messages: ctx_messages,
-                tools: &self.tools,
+                tools: self.tools.executable(),
             },
             new_messages: &self.new_messages,
             assistant,

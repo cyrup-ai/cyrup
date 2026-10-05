@@ -1,12 +1,11 @@
 //! In-memory agent state + the event reducer (arch-02 §4.1 / func-02 §10).
 
 use crate::event::{AgentEvent, AgentMessage};
-use cyrup_core::{ModelRef, ModelThinkingLevel, Tool, ToolCallId};
+use cyrup_core::{ModelRef, ModelThinkingLevel, ToolCallId, ToolLoadout};
 use cyrup_provider::{
     CacheRetention, OnPayload, OnResponseHook, ThinkingBudgets, TransformHeadersFn, Transport,
 };
 use std::collections::HashSet;
-use std::sync::Arc;
 
 /// The per-run model-call configuration the agent forwards into `cyrup_provider::StreamOptions`
 /// (Pi `AgentOptions`/`AgentLoopConfig` generation params, agent.ts:96-116). All fields are
@@ -103,7 +102,10 @@ pub(crate) struct StateInner {
     /// `AgentError::NoModelSelected` at run start; never a sentinel address.
     pub model: Option<ModelRef>,
     pub thinking_level: ModelThinkingLevel,
-    pub tools: Vec<Arc<dyn Tool>>,
+    /// The resolved tool loadout: what the loop runs ([`ToolLoadout::executable`]) and what a
+    /// request declares ([`ToolLoadout::advertised`]). Pi `agent.state.tools` plus the
+    /// `_hiddenDeclarations` projection of it.
+    pub tools: ToolLoadout,
     pub messages: Vec<AgentMessage>,
     pub streaming_message: Option<AgentMessage>,
     pub pending_tool_calls: HashSet<ToolCallId>,
@@ -136,7 +138,7 @@ impl StateInner {
             model: self.model.clone(),
             thinking_level: self.thinking_level,
             messages: self.messages.clone(),
-            tool_count: self.tools.len(),
+            tool_count: self.tools.executable().len(),
             is_streaming,
             streaming_message: self.streaming_message.clone(),
             pending_tool_calls: self.pending_tool_calls.iter().cloned().collect(),

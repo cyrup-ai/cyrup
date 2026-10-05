@@ -121,7 +121,7 @@ impl Hooks for RefreshOnce {
     ) -> Result<Option<TurnUpdate>, HookError> {
         if self.turns.fetch_add(1, Ordering::SeqCst) == 0 {
             Ok(Some(TurnUpdate {
-                tools: Some(self.tools.clone()),
+                tools: Some(self.tools.clone().into()),
                 system_prompt: Some("REFRESHED".to_string()),
                 ..TurnUpdate::default()
             }))
