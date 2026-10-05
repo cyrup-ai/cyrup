@@ -2,6 +2,7 @@
 //! into ONE binary instead of one process per file. Assertions are unchanged.
 
 mod bash_session_env;
+mod builtin_exposure;
 mod builtin_tool_order;
 mod cross_registry_mutation_lock;
 mod edit_preview_diff;

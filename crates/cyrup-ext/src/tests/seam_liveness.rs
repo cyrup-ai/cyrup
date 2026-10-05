@@ -270,6 +270,9 @@ fn descriptor(name: &str, description: &str) -> ToolDescriptor {
         prepare_arguments: false,
         render_shell: None,
         constrained_sampling: None,
+        exposure: cyrup_core::ToolExposure::Direct,
+        namespace: None,
+        default_active: true,
     }
 }
 

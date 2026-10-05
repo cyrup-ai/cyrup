@@ -1,4 +1,4 @@
-// cyrup:ext@0.13.0 — the versioned WIT world (arch-08 §4.1).
+// cyrup:ext@0.14.0 — the versioned WIT world (arch-08 §4.1).
 //
 // Single source of truth, shared verbatim by the host (`wasmtime::component::bindgen!`)
 // and the guest (`wit-bindgen` in cyrup-ext-sdk). Open-shaped values (tool params, message
@@ -107,7 +107,13 @@
 // throw as a value, so an SDK guest hands it to the author as a Rust `Result` to `?` out of the
 // handler. They are the only two registration imports pi validates. A 0.12 guest calls both at
 // the old `()`-returning signature and would fail to LINK against this host, so it takes the bump.
-package cyrup:ext@0.13.0;
+//
+// 0.13 -> 0.14 is the tool-exposure batch, an IMPORT RE-SIGNING: `types.tool-descriptor` gained
+// `exposure`, `namespace` and `default-active` (pi `ToolDefinition.exposure` / `namespace` /
+// `defaultActive`, `extensions/types.ts:509`, `:527`, `:608` @v1.0.1), which re-signs
+// `registration.register-tool`. A 0.13 guest calls it with the record without them and would fail
+// to LINK against this host, so it takes the bump.
+package cyrup:ext@0.14.0;
 
 // ---------------------------------------------------------------------------
 // Serializable mirrors of cyrup-core. JSON-as-string at the seam (arch-08 §4.1).
@@ -167,6 +173,28 @@ interface types {
     // open-shaped value per the header's rule. `none` = the omitted field, which upstream is
     // indistinguishable from `false` (PROV-011 / EXT-024).
     constrained-sampling: option<string>,
+    // pi `ToolDefinition.exposure?: ToolExposure` (extensions/types.ts:509 @v1.0.1), carried as
+    // pi's string literal: "direct" | "model-only" | "codemode" | "deferred" | "hidden". `none` =
+    // the omitted field = "direct". Any other spelling is REFUSED by `register-tool` with an
+    // `err` naming it, never coerced.
+    exposure: option<string>,
+    // pi `ToolDefinition.namespace?: ToolNamespace` (extensions/types.ts:527 @v1.0.1). `none` =
+    // the tool belongs to no group.
+    namespace: option<tool-namespace>,
+    // pi `ToolDefinition.defaultActive?: boolean` (extensions/types.ts:608 @v1.0.1): `false`
+    // keeps a direct / model-only tool registered but inactive until something names it. `none`
+    // = the omitted field = `true`.
+    default-active: option<bool>,
+  }
+
+  // pi `ToolNamespace` (extensions/types.ts:527 @v1.0.1): a group of related tools, such as the
+  // tools of one MCP server. `name` is for example `mcp__docs`; `description` is the short summary
+  // shown once with the group in model-facing listings; `instructions` is the longer usage
+  // guidance that is not part of the listing.
+  record tool-namespace {
+    name: string,
+    description: option<string>,
+    instructions: option<string>,
   }
 
   // Pi `TerminalInputHandler`'s return, `extensions/types.ts:113` @v0.83.0:

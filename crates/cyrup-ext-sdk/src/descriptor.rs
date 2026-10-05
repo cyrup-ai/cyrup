@@ -97,6 +97,85 @@ pub enum ConstrainedSampling {
     Disabled(bool),
 }
 
+/// How the model reaches a tool (pi `ToolExposure`, `extensions/types.ts:509` @v1.0.1). Set with
+/// [`ToolDescriptor::exposure`].
+///
+/// The wire spelling is pi's string literal ([`Self::as_str`]); the host parses it back and
+/// refuses a spelling that is not one of these five.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ToolExposure {
+    /// Declared to the model while active, and callable while active. The default, and what an
+    /// omitted field means.
+    #[default]
+    Direct,
+    /// Declared to the model while active, never callable by other tools. For orchestrating or
+    /// interactive tools.
+    ModelOnly,
+    /// Callable whenever registered. Not declared to the model unless something activates it by
+    /// name; codemode tools list it in their description.
+    Codemode,
+    /// Like [`Self::Codemode`], but codemode tools do not list it; tool search can find it.
+    Deferred,
+    /// Registered but unreachable. Activating it has no effect.
+    Hidden,
+}
+
+impl ToolExposure {
+    /// The wire spelling, which is pi's string literal: `"direct"`, `"model-only"`, `"codemode"`,
+    /// `"deferred"` or `"hidden"`.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Direct => "direct",
+            Self::ModelOnly => "model-only",
+            Self::Codemode => "codemode",
+            Self::Deferred => "deferred",
+            Self::Hidden => "hidden",
+        }
+    }
+}
+
+/// A group of related tools, such as the tools of one MCP server (pi `ToolNamespace`,
+/// `extensions/types.ts:527` @v1.0.1). Set with [`ToolDescriptor::namespace`].
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolNamespace {
+    /// The group's name, for example `mcp__docs`.
+    pub name: String,
+    /// Short summary shown once with the group in model-facing tool listings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Longer usage guidance, such as MCP server instructions. Not part of tool listings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<String>,
+}
+
+impl ToolNamespace {
+    /// A namespace with only a name; add the rest with [`Self::description`] and
+    /// [`Self::instructions`].
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            description: None,
+            instructions: None,
+        }
+    }
+
+    /// Set the short summary shown with the group (builder-style).
+    #[must_use]
+    pub fn description(mut self, d: impl Into<String>) -> Self {
+        self.description = Some(d.into());
+        self
+    }
+
+    /// Set the longer usage guidance (builder-style).
+    #[must_use]
+    pub fn instructions(mut self, i: impl Into<String>) -> Self {
+        self.instructions = Some(i.into());
+        self
+    }
+}
+
 /// What a guest sends to register a tool (R-08-012/013; Pi `ToolDefinition`, types.ts:435-482).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -143,6 +222,26 @@ pub struct ToolDescriptor {
     /// [`ToolDescriptor::constrained_sampling`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub constrained_sampling: Option<ConstrainedSampling>,
+    /// How the model reaches the tool (pi `ToolDefinition.exposure`, `extensions/types.ts:509`
+    /// @v1.0.1). Defaults to [`ToolExposure::Direct`], pi's omitted field. Set with
+    /// [`Self::exposure`].
+    #[serde(default)]
+    pub exposure: ToolExposure,
+    /// The group the tool belongs to (pi `ToolDefinition.namespace`, `extensions/types.ts:527`
+    /// @v1.0.1); `None` = no group. Set with [`Self::namespace`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<ToolNamespace>,
+    /// Whether registering the tool activates it (pi `ToolDefinition.defaultActive`,
+    /// `extensions/types.ts:608` @v1.0.1). `false` keeps a [`ToolExposure::Direct`] or
+    /// [`ToolExposure::ModelOnly`] tool registered but inactive until something names it; it means
+    /// nothing for the other three exposures, which are never activated on registration. Defaults
+    /// to `true`. Set with [`Self::default_active`].
+    #[serde(default = "default_active_true")]
+    pub default_active: bool,
+}
+
+fn default_active_true() -> bool {
+    true
 }
 
 impl ToolDescriptor {
@@ -161,7 +260,26 @@ impl ToolDescriptor {
             render_shell: RenderShell::Default,
             prepare_arguments: false,
             constrained_sampling: None,
+            exposure: ToolExposure::Direct,
+            namespace: None,
+            default_active: true,
         }
+    }
+
+    /// The `exposure` the guest hands the host: pi's string literal, or `None` for
+    /// [`ToolExposure::Direct`], which is pi's OMITTED field (`_getToolExposure`'s `?? "direct"`,
+    /// `core/agent-session.ts:1507` @v1.0.1), the same convention `render_shell` follows.
+    pub fn wire_exposure(&self) -> Option<&'static str> {
+        match self.exposure {
+            ToolExposure::Direct => None,
+            other => Some(other.as_str()),
+        }
+    }
+
+    /// The `default-active` the guest hands the host: `None` for `true`, pi's omitted field
+    /// (`defaultActive !== false`, `core/agent-session.ts:3554` @v1.0.1).
+    pub fn wire_default_active(&self) -> Option<bool> {
+        (!self.default_active).then_some(false)
     }
 
     /// Set the model-facing description (builder-style).
@@ -201,6 +319,31 @@ impl ToolDescriptor {
     #[must_use]
     pub fn has_renderer(mut self, yes: bool) -> Self {
         self.has_renderer = yes;
+        self
+    }
+
+    /// Set how the model reaches this tool (builder-style); see [`ToolExposure`]. A
+    /// [`ToolExposure::Codemode`] or [`ToolExposure::Deferred`] tool is registered and callable but
+    /// is not in model requests until something activates it by name.
+    #[must_use]
+    pub fn exposure(mut self, e: ToolExposure) -> Self {
+        self.exposure = e;
+        self
+    }
+
+    /// Put this tool in a [`ToolNamespace`] (builder-style).
+    #[must_use]
+    pub fn namespace(mut self, n: ToolNamespace) -> Self {
+        self.namespace = Some(n);
+        self
+    }
+
+    /// Set whether registering this tool activates it (builder-style); see
+    /// [`Self::default_active`]. `false` registers a [`ToolExposure::Direct`] tool without
+    /// activating it.
+    #[must_use]
+    pub fn default_active(mut self, active: bool) -> Self {
+        self.default_active = active;
         self
     }
 

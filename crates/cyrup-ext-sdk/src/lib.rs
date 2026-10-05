@@ -85,7 +85,7 @@ pub use descriptor::{
     DialogOptions, ExecMode, ExecOptions, FlagSpec, ForkOptions, ForkPosition, GrammarVariants,
     ModelCost, ModelCostTier, NavigateOptions, NewSessionOptions, ProviderConfig,
     ProviderModelConfig, RenderShell, SendUserMessageOptions, StrictSampling, SwitchSessionOptions,
-    ToolDescriptor,
+    ToolDescriptor, ToolExposure, ToolNamespace,
 };
 pub use events::*;
 pub use provider::{
@@ -122,7 +122,7 @@ pub mod prelude {
         DeliverAs, DialogOptions, ExecMode, ExecOptions, FlagSpec, ForkOptions, ForkPosition,
         GrammarVariants, ModelCost, ModelCostTier, NavigateOptions, NewSessionOptions,
         ProviderConfig, ProviderModelConfig, RenderShell, SendUserMessageOptions, StrictSampling,
-        SwitchSessionOptions, ToolDescriptor,
+        SwitchSessionOptions, ToolDescriptor, ToolExposure, ToolNamespace,
     };
     pub use crate::events::*;
     pub use crate::provider::{

@@ -991,6 +991,9 @@ fn the_tool_descriptor_carries_prepare_arguments_and_render_shell() {
         prepare_arguments: true,
         render_shell: Some("self".into()),
         constrained_sampling: None,
+        exposure: cyrup_core::ToolExposure::Direct,
+        namespace: None,
+        default_active: true,
     };
     d.validate().unwrap();
 
@@ -1029,6 +1032,9 @@ fn the_tool_descriptor_carries_constrained_sampling_in_pis_wire_shape() {
         prepare_arguments: false,
         render_shell: None,
         constrained_sampling: None,
+        exposure: cyrup_core::ToolExposure::Direct,
+        namespace: None,
+        default_active: true,
     };
     assert!(
         serde_json::to_value(&absent)

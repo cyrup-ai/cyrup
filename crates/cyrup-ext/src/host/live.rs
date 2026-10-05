@@ -110,6 +110,11 @@ impl bindings::cyrup::ext::registration::Host for HostState {
         let guest = guest_of(self)?;
         let parameters: Value = serde_json::from_str(&t.parameters_json).unwrap_or(Value::Null);
         let desc_name_for_log = t.name.clone();
+        // An unknown `exposure` spelling is refused HERE, before anything is registered, and
+        // handed back as the import's `err` arm like pi's other `registerTool` guards.
+        let exposure =
+            crate::registry::parse_exposure(&guest.owner, &t.name, t.exposure.as_deref())
+                .map_err(|e| e.to_string())?;
         let desc = ToolDescriptor {
             name: t.name,
             label: t.label,
@@ -145,6 +150,16 @@ impl bindings::cyrup::ext::registration::Host for HostState {
                     }
                 }
             }),
+            // pi `ToolDefinition.exposure` / `namespace` / `defaultActive`
+            // (`extensions/types.ts:509`, `:527`, `:608` @v1.0.1). The omitted `default-active`
+            // is upstream's `true` (`defaultActive !== false`).
+            exposure,
+            namespace: t.namespace.map(|n| cyrup_core::ToolNamespace {
+                name: n.name,
+                description: n.description,
+                instructions: n.instructions,
+            }),
+            default_active: t.default_active.unwrap_or(true),
         };
         // A guest tool is dispatched back across the boundary; register it via the registry's
         // descriptor table so the active-tool set can surface it (R-08-012/014). A refusal (pi's
@@ -1201,10 +1216,9 @@ impl bindings::cyrup::ext::ext_tools::Host for HostState {
             Some(live) => live,
             None => match guest.active_tools_restriction() {
                 Some(r) => r,
-                None => guest
-                    .registry
-                    .all_registered_tool_names()
-                    .unwrap_or_default(),
+                // No live session: the active set is what registration activates, not the whole
+                // registry (pi `_isActivatedOnRegistration`, `agent-session.ts:3554` @v1.0.1).
+                None => guest.registry.activated_tool_names().unwrap_or_default(),
             },
         };
         serde_json::to_string(&names).unwrap_or_else(|_| "[]".into())
@@ -2446,6 +2460,22 @@ impl Tool for WasmTool {
     fn constrained_sampling(&self) -> Option<&cyrup_core::ConstrainedSampling> {
         self.descriptor.constrained_sampling.as_ref()
     }
+    /// The guest's declared `exposure` (pi `ToolDefinition.exposure`, `extensions/types.ts:509`
+    /// @v1.0.1). Without this override the trait default, `direct`, would answer for every guest
+    /// tool, advertising each `codemode`, `deferred` or `hidden` one to the model.
+    fn exposure(&self) -> cyrup_core::ToolExposure {
+        self.descriptor.exposure
+    }
+    /// The guest's declared `namespace` (pi `ToolDefinition.namespace`, `extensions/types.ts:527`
+    /// @v1.0.1).
+    fn namespace(&self) -> Option<&cyrup_core::ToolNamespace> {
+        self.descriptor.namespace.as_ref()
+    }
+    /// The guest's declared `defaultActive` (pi `ToolDefinition.defaultActive`,
+    /// `extensions/types.ts:608` @v1.0.1); `true` when omitted.
+    fn default_active(&self) -> bool {
+        self.descriptor.default_active
+    }
     /// pi `ToolDefinition.prepareArguments?: (args: unknown) => Static<TParams>`
     /// (`extensions/types.ts:468` @v0.83.0), run BEFORE `validateToolArguments` in
     /// `packages/agent/src/agent-loop.ts`. EXT-023 — the whole shim was unreachable across the WASM
@@ -3112,6 +3142,9 @@ mod tests {
             prepare_arguments: false,
             render_shell: None,
             constrained_sampling: None,
+            exposure: cyrup_core::ToolExposure::Direct,
+            namespace: None,
+            default_active: true,
         };
         assert_eq!(
             descriptor_label(&described),

@@ -44,6 +44,7 @@ mod registration_validation;
 mod seam_liveness;
 mod startup_timings;
 mod terminal_keys;
+mod tool_exposure;
 mod trust_gate_order;
 mod wasm_host;
 #[cfg(feature = "wasm-host")]
