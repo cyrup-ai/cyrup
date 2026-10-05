@@ -29,6 +29,7 @@ members = [
     "crates/cyrup-llama",
     "crates/cyrup-codemode",
     "crates/cyrup-codemode-runtime",
+    "crates/cyrup-tool-search",
     "crates/cyrup-it",
     # PICO5-PLAN S1: the durability kernel's identity and value newtypes, and (from S3) the
     # storage contract. A plain library -- no C, no build script -- so it is in default-members
@@ -124,6 +125,7 @@ default-members = [
     "crates/cyrup-llama",
     "crates/cyrup-codemode",
     "crates/cyrup-codemode-runtime",
+    "crates/cyrup-tool-search",
     "crates/cyrup-pico-store",
     "crates/cyrup-pico-doc",
     "crates/cyrup-pico-store-jsonl",
@@ -195,6 +197,8 @@ cyrup-llama        = { path = "crates/cyrup-llama",        version = "0.0.0" }
 # renderer, the BM25 tool ranker and the output budget (gap-analysis 18, CODE-003/004/010/012).
 cyrup-codemode     = { path = "crates/cyrup-codemode",     version = "0.0.0" }
 cyrup-codemode-runtime = { path = "crates/cyrup-codemode-runtime", version = "0.0.0" }
+# pi `extensions/tool-search`: the `tool_search` tool and its built-in extension (TOOL-052).
+cyrup-tool-search  = { path = "crates/cyrup-tool-search",  version = "0.0.0" }
 # The Pico5 durability kernel's storage layer (ADR-0030 §8). NOTE for every future consumer: this
 # crate exports `EntryId` as `Id<Entry>`, a minted number, while `cyrup_core::EntryId` is an
 # `Arc<str>` session token. Importing both unqualified is E0252; alias at the import rather than

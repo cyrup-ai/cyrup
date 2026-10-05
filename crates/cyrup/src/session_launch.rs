@@ -122,6 +122,9 @@ fn attach_native_extensions(
         cyrup_codemode_runtime::tool::CodemodeHostSlot::new(),
         Arc::new(cyrup_codemode_runtime::tool::EngineSandboxFactory),
     ));
+    // `tool_search` follows it (`extensions/index.ts:12` @v1.0.1): registered inactive and
+    // replaceable, it loads `codemode` and `deferred` tools into the active set on request.
+    builder = builder.with_native_extension(Arc::new(cyrup_tool_search::ToolSearchExtension::new()));
     // A malformed `intercom/config.json`, or an unusable `PI_INTERCOM_ASK_TIMEOUT_MS`, REFUSES
     // this extension. Both of upstream's equivalents throw from the first two lines of the
     // extension factory itself — `loadConfig()` (`pi-intercom/index.ts:648` @v0.16.0, throwing from

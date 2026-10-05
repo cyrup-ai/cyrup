@@ -1449,6 +1449,7 @@ dependencies = [
  "cyrup-resources",
  "cyrup-sdk",
  "cyrup-session-svc",
+ "cyrup-tool-search",
  "cyrup-tools",
  "cyrup-tui",
  "futures",
@@ -1993,6 +1994,7 @@ dependencies = [
  "cyrup-provider",
  "cyrup-resources",
  "cyrup-session",
+ "cyrup-tool-search",
  "cyrup-tools",
  "futures",
  "image",
@@ -2027,6 +2029,19 @@ dependencies = [
  "serde_json",
  "similar",
  "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
+name = "cyrup-tool-search"
+version = "0.0.0"
+dependencies = [
+ "async-trait",
+ "cyrup-codemode",
+ "cyrup-core",
+ "cyrup-ext",
+ "serde_json",
  "thiserror 2.0.18",
  "tokio",
 ]
