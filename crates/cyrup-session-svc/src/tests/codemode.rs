@@ -1270,6 +1270,51 @@ async fn a_session_built_by_the_factory_runs_scripts_against_itself() {
     assert_eq!(result_text(&result), "echo: via factory");
 }
 
+/// The production path end to end: real JavaScript in the V8 sandbox calls a tool through the
+/// session's pipeline, writes the store, and the next script on the branch reads it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn real_javascript_runs_against_the_session() {
+    let fx = fixture();
+    let mut cfg = SessionConfig::new(fx.cwd.clone(), fx.agent_dir.clone());
+    cfg.trust_override = Some(true);
+    cfg.no_extensions = false;
+    let faux = Arc::new(FauxProvider::new());
+    let session = SessionBuilder::new(faux.clone() as Arc<dyn Provider>, cfg)
+        .with_codemode(CodemodeExtension::new(
+            Default::default(),
+            Arc::new(cyrup_codemode_runtime::tool::EngineSandboxFactory),
+        ))
+        .with_native_extension(Arc::new(ToolsExt::new(vec![echo(), stats()])))
+        .build()
+        .await
+        .unwrap()
+        .into_shared();
+    session
+        .set_active_tools_by_name(&["codemode".to_owned(), "echo".to_owned(), "stats".to_owned()])
+        .await;
+    let requests: Requests = Arc::new(Mutex::new(Vec::new()));
+    let mut results = Vec::new();
+    for code in [
+        "const s = await tools.stats({});\nstore('seen', s.files);\nreturn [await tools.echo({ text: 'hi' }), s.names];",
+        "return load('seen');",
+    ] {
+        faux.set_response_steps(steps(&requests, vec![Some(json!({ "code": code })), None]));
+        let _ = session.prompt("go").await.unwrap();
+        session.wait_for_idle().await;
+        results.push(
+            session
+                .messages()
+                .await
+                .into_iter()
+                .rev()
+                .find(|m| matches!(m, Message::ToolResult { tool_name, .. } if tool_name == "codemode"))
+                .unwrap(),
+        );
+    }
+    assert_eq!(result_text(&results[0]), "[\"echo: hi\",[\"a\",\"b\"]]");
+    assert_eq!(result_text(&results[1]), "2");
+}
+
 // ------------------------------------------------------------------------------------- models --
 
 /// A provider that lists a classifier and an image model, serves them with fixed credentials, and

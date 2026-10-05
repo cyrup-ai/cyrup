@@ -147,6 +147,12 @@ impl Default for SandboxOptions {
 #[derive(Clone, Debug, Default)]
 pub struct ExecuteOptions {
     pub cancel: Option<CancelToken>,
+    /// The message of the [`ErrorKind::Aborted`] failure a `cancel` produces. A [`CancelToken`]
+    /// carries no reason, so the caller supplies what upstream reads off `signal.reason`: the
+    /// reason's message when it is an `Error` (an ordinary `AbortController.abort()` is a
+    /// `DOMException` "This operation was aborted"), and `host.ts`'s constant `Execution aborted`
+    /// otherwise. `None` is that non-`Error` branch.
+    pub cancel_reason: Option<String>,
     /// Overrides the sandbox default for this execution.
     pub deadline: Option<Deadline>,
     /// Values the script reads with `load(key)`; the script's own `store()` calls come back as the

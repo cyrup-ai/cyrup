@@ -58,7 +58,9 @@ pub use description::{
     DescriptionOptions, callable_tools, create_codemode_description, describe_script_call,
     to_codemode_declaration,
 };
-pub use factory::{SandboxFactory, SandboxUnavailable, UnavailableSandboxFactory};
+pub use factory::{
+    EngineSandboxFactory, SandboxFactory, SandboxUnavailable, UnavailableSandboxFactory,
+};
 pub use host::{CodemodeHost, CodemodeHostSlot, NestedOutcome, StoreAppendFailed};
 pub use models::CodemodeModels;
 pub use store::{
@@ -315,5 +317,7 @@ impl Tool for CodemodeTool {
     }
 }
 
+#[cfg(test)]
+mod engine_tests;
 #[cfg(test)]
 mod tests;

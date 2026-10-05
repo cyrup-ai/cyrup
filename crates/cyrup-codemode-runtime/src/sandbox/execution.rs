@@ -54,6 +54,8 @@ pub(super) struct Plan {
     pub memory_limit: Option<u64>,
     pub store: Map<String, Value>,
     pub cancel: Option<CancelToken>,
+    /// The message of an abort by `cancel`; [`ABORTED_BY_CALLER`] when unset.
+    pub cancel_reason: Option<String>,
 }
 
 /// Stops the isolate and fires every tool token when the execution ends, however it ends,
@@ -84,7 +86,11 @@ pub(super) async fn execute(hub: &Hub, plan: Plan) -> CodemodeResult {
     let cancel = plan.cancel.clone().unwrap_or_default();
     if cancel.is_cancelled() {
         // Upstream aborts in the constructor, before any worker starts (`host.ts:114-116`).
-        return failed(aborted(ABORTED_BY_CALLER), Vec::new(), Vec::new());
+        return failed(
+            aborted(plan.cancel_reason.as_deref().unwrap_or(ABORTED_BY_CALLER)),
+            Vec::new(),
+            Vec::new(),
+        );
     }
 
     let (to_host, mut from_worker) = mpsc::unbounded_channel::<WorkerMessage>();
@@ -145,7 +151,9 @@ pub(super) async fn execute(hub: &Hub, plan: Plan) -> CodemodeResult {
         tokio::select! {
             biased;
             () = hub.close.cancelled() => break Err(aborted(ABORTED_BY_CLOSE)),
-            () = cancel.cancelled() => break Err(aborted(ABORTED_BY_CALLER)),
+            () = cancel.cancelled() => break Err(aborted(
+                plan.cancel_reason.as_deref().unwrap_or(ABORTED_BY_CALLER),
+            )),
             () = &mut deadline => break Err(timed_out(plan.deadline)),
             message = from_worker.recv() => match message {
                 None => break Err(sandbox_error(String::from(

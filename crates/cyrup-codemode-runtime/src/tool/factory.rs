@@ -8,8 +8,9 @@
 //! # Production call path
 //!
 //! [`super::execute::execute_codemode`] calls [`SandboxFactory::create`] once per script.
-//! [`UnavailableSandboxFactory`] is what a build without an engine uses: every script fails with
-//! the named [`SandboxUnavailable::NotLinked`], never silently.
+//! [`EngineSandboxFactory`] is the production factory. [`UnavailableSandboxFactory`] is what a
+//! build without an engine uses: every script fails with the named
+//! [`SandboxUnavailable::NotLinked`], never silently.
 
 use std::sync::Arc;
 
@@ -48,5 +49,21 @@ impl SandboxFactory for UnavailableSandboxFactory {
         _options: SandboxOptions,
     ) -> Result<Arc<dyn ScriptSandbox>, SandboxUnavailable> {
         Err(SandboxUnavailable::NotLinked)
+    }
+}
+
+/// The production factory: each script runs in a [`CodemodeSandbox`](crate::sandbox::CodemodeSandbox)
+/// (a V8 isolate, ADR-0031), configured by what the tool registered.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct EngineSandboxFactory;
+
+impl SandboxFactory for EngineSandboxFactory {
+    fn create(
+        &self,
+        options: SandboxOptions,
+    ) -> Result<Arc<dyn ScriptSandbox>, SandboxUnavailable> {
+        crate::sandbox::CodemodeSandbox::new(options)
+            .map(|sandbox| Arc::new(sandbox) as Arc<dyn ScriptSandbox>)
+            .map_err(|error| SandboxUnavailable::Failed(error.to_string()))
     }
 }

@@ -436,12 +436,9 @@ async fn cancelling_the_tool_call_yields_an_aborted_result() {
         Vec::new(),
         script(|_code, env| async move {
             env.cancel.cancelled().await;
-            failed(
-                ErrorKind::Aborted,
-                "The operation was aborted",
-                None,
-                vec![text("so far")],
-            )
+            // What a sandbox does with the reason the tool passed.
+            let reason = env.cancel_reason.clone().unwrap_or_default();
+            failed(ErrorKind::Aborted, &reason, None, vec![text("so far")])
         }),
     );
     let cancel = CancelToken::new();
@@ -454,7 +451,7 @@ async fn cancelling_the_tool_call_yields_an_aborted_result() {
     assert!(result.is_error);
     assert_eq!(
         result_text(&result),
-        "so far\nScript error:\nScript aborted: The operation was aborted\n\nNo tool calls were made."
+        "so far\nScript error:\nScript aborted: This operation was aborted\n\nNo tool calls were made."
     );
 }
 

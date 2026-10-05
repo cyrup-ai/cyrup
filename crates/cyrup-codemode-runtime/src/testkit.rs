@@ -42,6 +42,8 @@ pub struct ScriptEnv {
     pub store: Map<String, Value>,
     /// The token the caller passed to `execute`.
     pub cancel: CancelToken,
+    /// The message the caller asked an abort by [`Self::cancel`] to carry.
+    pub cancel_reason: Option<String>,
     calls: CancelToken,
 }
 
@@ -244,6 +246,7 @@ impl ScriptSandbox for ScriptedSandbox {
             ),
             store: options.store,
             cancel: options.cancel.unwrap_or_default(),
+            cancel_reason: options.cancel_reason,
             calls: calls.clone(),
         };
         let result = (self.script)(code.to_owned(), env).await;

@@ -396,6 +396,50 @@ async fn cancelling_stops_a_spinning_script() {
     wait_until_idle(&sandbox).await;
 }
 
+/// `host.ts:114-116,230-235`: the abort's message is the signal's reason when it is an `Error`. A
+/// `CancelToken` has no reason, so the caller passes it as `cancel_reason`; it applies to an abort
+/// before the start and to one while the script runs.
+#[tokio::test]
+async fn a_cancel_reason_is_the_message_of_the_abort() {
+    let sandbox = sandbox(vec![]);
+    let before = CancelToken::new();
+    before.cancel();
+    let result = run_with(
+        &sandbox,
+        "while (true) {}",
+        ExecuteOptions {
+            cancel: Some(before),
+            cancel_reason: Some("user cancelled".to_owned()),
+            ..never()
+        },
+    )
+    .await;
+    assert_eq!(error(&result).message, "user cancelled");
+
+    let token = CancelToken::new();
+    let canceller = {
+        let token = token.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            token.cancel();
+        })
+    };
+    let result = run_with(
+        &sandbox,
+        "while (true) {}",
+        ExecuteOptions {
+            cancel: Some(token),
+            cancel_reason: Some("user cancelled".to_owned()),
+            ..never()
+        },
+    )
+    .await;
+    canceller.await.unwrap();
+    assert_eq!(error(&result).kind, ErrorKind::Aborted);
+    assert_eq!(error(&result).message, "user cancelled");
+    wait_until_idle(&sandbox).await;
+}
+
 #[tokio::test]
 async fn a_deadline_that_expires_while_the_isolate_is_still_being_built_stops_it_before_the_script()
 {

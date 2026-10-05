@@ -202,6 +202,7 @@ impl CodemodeSandbox {
             memory_limit: self.memory_limit_bytes,
             store: options.store,
             cancel: options.cancel,
+            cancel_reason: options.cancel_reason,
         };
         Ok(execution::execute(&self.hub, plan).await)
     }

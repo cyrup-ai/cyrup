@@ -42,6 +42,12 @@ use crate::types::{
 /// down (`CODEMODE_MEMORY_LIMIT_BYTES`, `execute.ts:55`). An overrun fails inside the script.
 pub const CODEMODE_MEMORY_LIMIT_BYTES: u64 = 256 * 1024 * 1024;
 
+/// The message of the `DOMException` an ordinary `AbortController.abort()` carries as its reason
+/// (`signal.reason.message`), which upstream renders as `Script aborted: <reason>`
+/// (`execute.ts:255-256`). A [`CancelToken`] carries no reason, and a tool call is cancelled by the
+/// user or the run, never with a more specific one.
+pub const ABORT_REASON: &str = "This operation was aborted";
+
 /// The text items of a tool result joined with `\n` (`textOf`, `execute.ts:58-63`).
 fn text_of(result: &ToolResult) -> String {
     result
@@ -299,6 +305,7 @@ pub async fn execute_codemode(
             &parsed.code,
             ExecuteOptions {
                 cancel: Some(cancel),
+                cancel_reason: Some(ABORT_REASON.to_owned()),
                 deadline: None,
                 store,
             },

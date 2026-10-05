@@ -116,13 +116,11 @@ fn attach_native_extensions(
         builder = builder.with_native_extension(ext);
     }
     // `codemode` is the next entry of pi's `builtInExtensions` (`extensions/index.ts:9-14`
-    // @v1.0.1), registered inactive and replaceable. Its scripts run in the sandbox
-    // [`cyrup_codemode_runtime::tool::UnavailableSandboxFactory`] stands in for until the
-    // `deno_core` sandbox is linked: with it, activating the tool is a NAMED failure of each script
-    // ("codemode sandbox unavailable"), never a silent no-op.
+    // @v1.0.1), registered inactive and replaceable. Its scripts run in V8 isolates
+    // ([`cyrup_codemode_runtime::tool::EngineSandboxFactory`], ADR-0031).
     builder = builder.with_codemode(cyrup_codemode_runtime::CodemodeExtension::new(
         cyrup_codemode_runtime::tool::CodemodeHostSlot::new(),
-        Arc::new(cyrup_codemode_runtime::tool::UnavailableSandboxFactory),
+        Arc::new(cyrup_codemode_runtime::tool::EngineSandboxFactory),
     ));
     // A malformed `intercom/config.json`, or an unusable `PI_INTERCOM_ASK_TIMEOUT_MS`, REFUSES
     // this extension. Both of upstream's equivalents throw from the first two lines of the
