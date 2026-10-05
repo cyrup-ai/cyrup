@@ -1511,6 +1511,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "cyrup-codemode-runtime"
+version = "0.0.0"
+dependencies = [
+ "async-trait",
+ "cyrup-codemode",
+ "cyrup-core",
+ "futures",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
 name = "cyrup-config"
 version = "0.0.0"
 dependencies = [

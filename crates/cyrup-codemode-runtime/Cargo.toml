@@ -1,0 +1,22 @@
+[package]
+name = "cyrup-codemode-runtime"
+description = "pi codemode, engine-bound half: the deno_core sandbox, the codemode tool and its script globals (gap-analysis 18)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+cyrup-core = { workspace = true }
+cyrup-codemode = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+tokio = { workspace = true }
