@@ -4,3 +4,4 @@
 mod live_provider_auth;
 mod models_json_provider;
 mod models_store_classifiers;
+mod models_store_images;

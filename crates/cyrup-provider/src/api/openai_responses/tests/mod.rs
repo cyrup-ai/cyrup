@@ -6,6 +6,7 @@
     clippy::indexing_slicing
 )]
 
+mod chatgpt_sign_in;
 mod convert;
 mod decode;
 mod errors;
@@ -13,6 +14,7 @@ mod headers;
 mod params;
 mod tools;
 
+use super::auth::ResponsesTokenKind;
 use super::decoder::*;
 use super::headers::*;
 use super::ids::*;
@@ -21,6 +23,7 @@ use super::params::*;
 use super::tools::*;
 use super::url::*;
 use super::*;
+use crate::api::ApiImpl;
 use crate::api::compat::ModelCompat;
 use crate::api::compat::{SessionAffinityFormat, get_responses_compat};
 use crate::auth::AuthResult;

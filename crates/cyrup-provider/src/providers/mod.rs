@@ -17,15 +17,14 @@ pub mod openai;
 pub mod openai_codex;
 pub mod opencode;
 pub mod opencode_go;
-pub mod openrouter_images;
+pub mod openrouter;
 pub mod radius;
 pub mod radius_share;
 pub mod together;
 
 pub use all::{
-    BUILTIN_CATALOG_MANIFEST_JSON, all_images_providers, all_providers, all_providers_with,
-    all_providers_with_overlay, builtin_model_data_generated_at,
-    builtin_model_data_generated_at_by_provider, default_images_models, default_models,
+    BUILTIN_CATALOG_MANIFEST_JSON, all_providers, all_providers_with, all_providers_with_overlay,
+    builtin_model_data_generated_at, builtin_model_data_generated_at_by_provider, default_models,
 };
 pub use amazon_bedrock::*;
 pub use anthropic::{
@@ -74,7 +73,7 @@ pub use opencode_go::{
     OPENCODE_GO_PROVIDER_ID, opencode_go_auth, opencode_go_models, opencode_go_provider,
     opencode_go_provider_with,
 };
-pub use openrouter_images::{openrouter_images_auth, openrouter_images_provider};
+pub use openrouter::{openrouter_image_model, openrouter_image_models, openrouter_images_registry};
 pub use radius::{
     DEFAULT_RADIUS_GATEWAY, RADIUS_API_KEY_ENV, RADIUS_PROVIDER_ID, RADIUS_PROVIDER_NAME,
     RadiusGatewayConfig, RadiusGatewayModel, RadiusProvider, RadiusProviderOptions,

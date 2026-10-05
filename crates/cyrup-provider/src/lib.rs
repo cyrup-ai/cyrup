@@ -93,11 +93,10 @@ pub use env_api_keys::{
 };
 pub use error::{AuthError, BoxErr, ProviderError};
 pub use images::{
-    AssistantImages, CreateImagesProviderOptions, ImagesApiImpl, ImagesApiRegistry, ImagesContext,
-    ImagesModel, ImagesModels, ImagesOptions, ImagesProvider, ImagesStopReason, OPENROUTER_IMAGES,
-    create_images_models, create_images_provider, generate_images, get_image_model,
-    get_image_models, get_image_providers, image_models, images_builtin_registry,
-    openrouter_image_models, register_images_builtins,
+    AssistantImages, ImageApiRegistry, ImagesApiFactory, ImagesApiImpl, ImagesApiProviderRegistry,
+    ImagesContext, ImagesOnPayload, ImagesOnResponse, ImagesOptions, ImagesStopReason,
+    KnownImageApi, OPENROUTER_IMAGES, ProviderImages, generate_images, images_builtin_registry,
+    register_images_builtins,
 };
 pub use model::{Modality, Model, ModelCost, ModelCostTier};
 pub use models_store::{
@@ -108,9 +107,8 @@ pub use provider::{
     ModelsPersist, ModelsPublication, ModelsPublisher, Provider, RefreshModelsContext,
 };
 pub use providers::all::{
-    BUILTIN_CATALOG_MANIFEST_JSON, all_images_providers, all_providers, all_providers_with,
-    all_providers_with_overlay, builtin_model_data_generated_at,
-    builtin_model_data_generated_at_by_provider, default_images_models, default_models,
+    BUILTIN_CATALOG_MANIFEST_JSON, all_providers, all_providers_with, all_providers_with_overlay,
+    builtin_model_data_generated_at, builtin_model_data_generated_at_by_provider, default_models,
 };
 pub use providers::builtin_provider_oauth;
 pub use providers::fleet::{
@@ -164,10 +162,12 @@ pub use providers::{
 pub use providers::{
     TOGETHER_BASE_URL, together_models, together_provider, together_provider_with,
 };
-pub use providers::{openrouter_images_auth, openrouter_images_provider};
+pub use providers::{openrouter_image_model, openrouter_image_models, openrouter_images_registry};
 pub use remote_catalog::{
-    CatalogOverlay, DEFAULT_CATALOG_BASE_URL, REMOTE_CATALOG_REFRESH_INTERVAL_MS, RefreshOptions,
-    RemoteCatalog, RemoteCatalogProvider, merge_models, parse_catalog, remote_models,
+    CatalogOverlay, DEFAULT_CATALOG_BASE_URL, ProviderOverlay, REMOTE_CATALOG_MODEL_TYPES,
+    REMOTE_CATALOG_REFRESH_INTERVAL_MS, RefreshOptions, RemoteCatalog, RemoteCatalogProvider,
+    merge_classifier_models, merge_image_models, merge_models, parse_catalog, remote_models,
+    split_by_type, stored_entry_is_newer,
 };
 pub use stream::sse::{
     DEFAULT_HTTP_IDLE_TIMEOUT_MS, OnRequest, OnResponse, SseFrame, SseRequest, build_client,

@@ -205,10 +205,13 @@ async fn first_refresh_fetches_and_persists_body_etag_and_timestamps() {
         .await
         .expect("a 200 refresh succeeds");
 
-    // The route matches pi's `/api/models/providers/<encodeURIComponent(id)>`.
+    // The route matches pi's `/api/models/providers/<encodeURIComponent(id)>` plus PROV-128's
+    // `?types=` parameter (`remote-catalog-provider.ts:101-102`). Asserted in full, so neither the
+    // path nor the parameter can drift unnoticed; `tests::catalog_model_types` owns the parameter's
+    // own coverage.
     let head = &origin.request_heads()[0];
     assert!(
-        head.starts_with("GET /api/models/providers/groq "),
+        head.starts_with("GET /api/models/providers/groq?types=chat,image,classifier HTTP/1.1"),
         "unexpected request line: {head}"
     );
     assert!(head.to_lowercase().contains("accept: application/json"));
@@ -851,6 +854,12 @@ fn a_live_row_keeps_pis_full_caps_grammar_tools_key() {
     });
     let parsed = crate::remote_catalog::parse_catalog("openai", &body).unwrap();
     assert_eq!(parsed.len(), 1);
+    // PROV-128 widened `parse_catalog` to pi's `AnyModel[]`; this row is a chat row.
+    let parsed: Vec<crate::Model> = parsed
+        .into_iter()
+        .filter_map(crate::AnyModel::into_chat)
+        .collect();
+    assert_eq!(parsed.len(), 1, "the row must still parse as a CHAT model");
     let compat = parsed[0]
         .compat
         .as_ref()

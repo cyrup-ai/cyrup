@@ -7,8 +7,8 @@
 //! operation is made of:
 //!
 //! - [`ModelType`] / [`AnyModel`] / [`ImageModel`] / [`ClassifierModel`] — what a catalog entry is
-//!   for (`ModelTypeMap`, types.ts:1156-1176; `ImageModel`, :1144-1149; `ClassifierModel`,
-//!   :1151-1155). PROV-128 made the union three-valued at v1.0.0 (`a328aa89a`).
+//!   for (`ModelTypeMap`, types.ts:1158-1162; `ImageModel`, :1145-1149; `ClassifierModel`,
+//!   :1152-1155). PROV-128 made the union three-valued at v1.0.0 (`a328aa89a`).
 //! - [`KnownClassifierApi`] — the classifier wire-protocol ids (types.ts:35).
 //! - [`ClassifierContext`] / [`ClassifierQuestion`] — the request (types.ts:633-656).
 //! - [`ClassifierResult`] / [`ClassifierAnswer`] — the response (types.ts:658-688).
@@ -26,12 +26,14 @@
 //! `Provider.filterAllModels` and `Models.getAllAvailable`, and the array-based
 //! `models.all.json` shape.
 //!
-//! PROV-128 is landing in the three steps its ledger row names. Step (1) — the one here — makes an
-//! image row *representable*: [`ModelType::Image`], [`AnyModel::Image`] and [`ImageModel`] in
-//! upstream's v1.0.0 shape. Steps (2) and (3) — hanging an `images` dispatch map on
-//! [`crate::provider::Provider`], adding `generate_images` to [`crate::collection::Models`], and
-//! retiring [`crate::images`]'s parallel `ImagesProvider`/`ImagesModels` tree — are still open, so
-//! image generation continues to run through [`crate::images`] for now.
+//! PROV-128 is CLOSED. Step (1) is the type work here: [`ModelType::Image`], [`AnyModel::Image`]
+//! and [`ImageModel`] in upstream's v1.0.0 shape. Step (2) hung an `images` dispatch map on
+//! [`crate::provider::Provider`] ([`crate::images::ImageApiRegistry`],
+//! [`crate::wire::WireProvider::with_images`]) and added `generate_images` to
+//! [`crate::collection::Models`]; the catalog path constructs [`AnyModel::Image`] for real
+//! ([`crate::remote_catalog`] asks pi.dev for `?types=chat,image,classifier`). Step (3) retired
+//! the parallel `ImagesProvider`/`ImagesModels` tree the way upstream did — [`crate::images`] now
+//! holds only what `types.ts` still holds.
 
 use crate::HeaderMap;
 use crate::auth::ProviderEnv;
@@ -44,11 +46,11 @@ use std::sync::Arc;
 // ---------------------------------------------------------------------------------- model types --
 
 /// What a catalog entry is for; decides which `Models` operation accepts it (pi `ModelType =
-/// keyof ModelTypeMap`, types.ts:1163).
+/// keyof ModelTypeMap`, types.ts:1165).
 ///
 /// PROV-128 — `a328aa89a` ("unify image and classifier models") made this three-valued at
 /// v1.0.0: `ModelTypeMap` is `{ chat: Model<Api>; image: ImageModel<ImageApi>; classifier:
-/// ClassifierModel<ClassifierApi> }` (`types.ts:1156-1161`), and the parallel images registry
+/// ClassifierModel<ClassifierApi> }` (`types.ts:1158-1162`), and the parallel images registry
 /// (`images-models.ts`, `providers/openrouter-images.ts`, `builtinImagesProviders`,
 /// `builtinImagesModels`) was deleted in the same commit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -120,7 +122,7 @@ impl From<KnownClassifierApi> for ApiId {
 }
 
 /// Structured classifier model: usable with `classify()` only (pi `ClassifierModel`,
-/// types.ts:1151-1155 over `BaseModel`, :1097-1108). The `type` member is always `"classifier"` on
+/// types.ts:1152-1155 over `BaseModel`, :1097-1108). The `type` member is always `"classifier"` on
 /// the wire, which is what tells it apart from a chat [`Model`] inside one array; it is required
 /// on read, so a chat model's JSON is not accepted as a classifier model.
 #[derive(Clone, Debug, PartialEq, serde::Serialize)]
@@ -185,7 +187,7 @@ impl<'de> serde::Deserialize<'de> for ClassifierModel {
 impl ClassifierModel {
     /// The chat-[`Model`] shim auth resolution operates on: pi types `resolveProviderAuth` for
     /// every model shape, cyrup's takes a [`Model`], and strategies read only identity, `base_url`
-    /// and `headers` from it (the same adapter [`crate::images::ImagesModel`] uses). The
+    /// and `headers` from it (the same adapter [`ImageModel::to_auth_model`] uses). The
     /// chat-only members default to non-reasoning / zero output.
     pub(crate) fn to_auth_model(&self) -> Model {
         Model {
@@ -208,12 +210,12 @@ impl ClassifierModel {
 }
 
 /// Image-generation model: usable with `generateImages()` only (pi `ImageModel`,
-/// types.ts:1144-1149 over `BaseModel`, :1097-1108).
+/// types.ts:1145-1149 over `BaseModel`, :1097-1108).
 ///
 /// PROV-128 — `a328aa89a` folded image models onto the one provider surface, so an image row is a
 /// [`BaseModel`](Model) plus a required `type: "image"` discriminant and a required `output`
-/// modality list. Two shape notes against the v0.87.1-era [`crate::images::ImagesModel`] this
-/// replaces on the unified surface:
+/// modality list. Two shape notes against the v0.87.1-era `ImagesModel` this replaced (PROV-128
+/// step (3) deleted it, as `a328aa89a` deleted upstream's):
 ///
 /// * `thinkingLevelMap` is **gone**. At v0.87.1 `ImagesModel` extended `Model` and inherited it;
 ///   v1.0.0's `ImageModel` extends `BaseModel`, which has no such member (`types.ts:1097-1108`),
@@ -288,11 +290,31 @@ impl ImageModel {
         self.output.contains(&Modality::Text)
     }
 
-    // NOTE (PROV-128 step 2): the `to_auth_model` shim [`ClassifierModel`] carries is deliberately
-    // absent here. It exists so `resolve_provider_auth` — which takes a [`Model`] where pi types
-    // `resolveProviderAuth` for every model shape — can be reached from a non-chat row, and the
-    // unified surface has no image leg to reach it from yet. Adding it now would be an item with
-    // no caller outside tests, so it lands with the dispatch that needs it.
+    /// The chat-[`Model`] shim auth resolution operates on, the twin of
+    /// [`ClassifierModel::to_auth_model`]: pi types `resolveProviderAuth` for every model shape,
+    /// cyrup's takes a [`Model`], and strategies read only identity, `base_url` and `headers` from
+    /// it. The chat-only members default to non-reasoning / zero window / zero output — an image
+    /// row genuinely has none of them (pi's `ImageModel` extends `BaseModel`, which declares
+    /// neither `contextWindow` nor `maxTokens`, `types.ts:1097-1108`), which is why this is a
+    /// private shim for one caller rather than a `From` impl.
+    pub(crate) fn to_auth_model(&self) -> Model {
+        Model {
+            id: self.id.clone(),
+            name: self.name.clone(),
+            api: self.api.clone(),
+            provider: self.provider.clone(),
+            base_url: self.base_url.clone(),
+            reasoning: false,
+            input: self.input.clone(),
+            cost: self.cost.clone(),
+            context_window: 0,
+            max_tokens: 0,
+            sampling_params: None,
+            thinking_level_map: None,
+            compat: None,
+            headers: self.headers.clone(),
+        }
+    }
 }
 
 /// Anything a provider can list (pi `AnyModel = ModelTypeMap[ModelType]`, types.ts:1168). Narrow

@@ -8,7 +8,7 @@
 //! | [`pkce`] | `pkce.ts` (PKCE verifier/challenge) |
 //! | [`device_code`] | `device-code.ts` (RFC 8628 device-code poll loop) |
 //! | [`page`] | `oauth-page.ts` (the browser-facing callback pages) |
-//! | [`callback`] | the loopback callback listener shared verbatim by `openrouter.ts:135-243`, `anthropic.ts:97-170`, `openai-codex.ts:334-375` and `radius.ts:170-212` |
+//! | [`callback`] | the loopback callback listener shared verbatim by `openrouter.ts:135-243`, `anthropic.ts:97-170`, `openai-codex.ts:334-375`, `openai-chatgpt.ts:85-132` and `radius.ts:170-212` |
 //! | [`interaction`] | `../types.ts:119-187` (`AuthPrompt`/`AuthEvent`/`AuthInteraction`) |
 //! | [`query`] | `URLSearchParams` parse/serialize, which pi gets from the platform |
 //! | [`sha256`], [`random`] | `crypto.subtle.digest` / `crypto.getRandomValues`, which pi gets from Web Crypto |
@@ -31,6 +31,7 @@ pub mod device_code;
 pub mod github_copilot;
 pub mod interaction;
 pub mod kimi_coding;
+pub mod openai_chatgpt;
 pub mod openai_codex;
 pub mod openrouter;
 pub mod page;

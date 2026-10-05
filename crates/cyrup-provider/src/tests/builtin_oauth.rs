@@ -43,6 +43,8 @@ fn builtin_providers_expose_their_oauth_clause() {
         ("xai", "xAI (Grok/X subscription)"),
         // `providers/openrouter.ts:14-18`
         ("openrouter", "OpenRouter OAuth"),
+        // PROV-118 — `providers/openai.ts:14-19` @v1.0.0 ("Sign in with ChatGPT").
+        ("openai", "OpenAI (ChatGPT subscription)"),
     ] {
         let oauth = oauth_by_id(id).unwrap_or_else(|| panic!("{id} must expose an oauth strategy"));
         assert_eq!(oauth.name(), name, "{id} oauth display name");
@@ -55,7 +57,7 @@ fn builtin_providers_expose_their_oauth_clause() {
 /// OAuth/OpenID sign-ins without a known subscription"* (`coding-agent/CHANGELOG.md:155`).
 #[test]
 fn only_subscription_backed_oauth_reports_is_subscription() {
-    for id in ["anthropic", "kimi-coding", "xai"] {
+    for id in ["anthropic", "kimi-coding", "openai", "xai"] {
         let oauth = oauth_by_id(id).unwrap_or_else(|| panic!("{id} oauth"));
         assert!(
             oauth.is_subscription(),
@@ -71,12 +73,17 @@ fn only_subscription_backed_oauth_reports_is_subscription() {
     );
 }
 
-/// The full subscription set reachable from `all_providers()`. Five upstream OAuth flows carry
-/// `isSubscription: true` and `providers/all.rs` registers all five providers:
+/// The full subscription set reachable from `all_providers()`. SIX upstream OAuth flows carry
+/// `isSubscription: true` and `providers/all.rs` registers all six providers:
 /// `anthropic` (`providers/anthropic.ts:52`), `kimi-coding` (`providers/kimi-coding.ts:16`),
-/// `xai` (`providers/xai.ts:17`), `openai-codex` (`providers/openai-codex.ts:15`) and
-/// `github-copilot` (`providers/github-copilot.ts:16`). Every other built-in is api-key only
-/// or metered OAuth, so nothing else may claim a subscription.
+/// `xai` (`providers/xai.ts:17`), `openai-codex` (`providers/openai-codex.ts:15`),
+/// `github-copilot` (`providers/github-copilot.ts:16`) and — PROV-118 — `openai`
+/// (`providers/openai.ts:16` @v1.0.0). Every other built-in is api-key only or metered OAuth, so
+/// nothing else may claim a subscription.
+///
+/// `openai` and `openai-codex` are now BOTH subscription-backed and both reach a ChatGPT plan;
+/// that is upstream's state, and `"OpenAI Codex (legacy)"` (`providers/openai-codex.ts:10`) is how
+/// `/login` tells them apart.
 #[test]
 fn no_other_builtin_provider_claims_a_subscription() {
     let subscription_ids: Vec<String> = all_providers()
@@ -97,6 +104,7 @@ fn no_other_builtin_provider_claims_a_subscription() {
             "anthropic".to_string(),
             "github-copilot".to_string(),
             "kimi-coding".to_string(),
+            "openai".to_string(),
             "openai-codex".to_string(),
             "xai".to_string()
         ],
@@ -108,7 +116,7 @@ fn no_other_builtin_provider_claims_a_subscription() {
 /// key row `/login` offers, nor the ambient resolution path.
 #[test]
 fn wiring_oauth_keeps_the_api_key_strategy() {
-    for id in ["anthropic", "kimi-coding", "xai", "openrouter"] {
+    for id in ["anthropic", "kimi-coding", "openai", "xai", "openrouter"] {
         let provider = all_providers()
             .into_iter()
             .find(|p| p.id().as_str() == id)
@@ -199,4 +207,49 @@ async fn copilot_and_codex_logins_are_reachable_from_all_providers() {
             "{id}: the ported flow must have asked the user something before failing"
         );
     }
+}
+
+/// PROV-118 — `/login` must REACH the new ChatGPT flow on the plain `openai` provider, and must
+/// offer it under upstream's selector label (`loginLabel: "Sign in with ChatGPT"`,
+/// `providers/openai.ts:17`), which is the only thing distinguishing it from the legacy Codex row.
+///
+/// The probe supplies no device id, so the flow fails at its first statement
+/// (`oauth/openai-chatgpt.ts:237`) before binding a port or opening a browser. That the failure is
+/// the device-id message and NOT `LoginUnsupported` is the proof that the trait default was
+/// overridden.
+///
+/// It also records the one thing still missing end to end: nothing in the app supplies a device id
+/// yet. Upstream's `coding-agent` passes
+/// `{ getDeviceId: () => this.settingsManager.getOrCreateDeviceId() }`
+/// (`modes/interactive/interactive-mode.ts:6262` → `core/settings-manager.ts:1175-1182`, a
+/// persisted `deviceId` created with `randomUUID()` on first use), and `cyrup-config`'s
+/// `login::login` still calls `LoginOptions::default()`. When that lands, this assertion changes
+/// from "fails for want of a device id" to a real login.
+#[tokio::test]
+async fn the_openai_chatgpt_login_is_reachable_from_all_providers() {
+    let oauth = oauth_by_id("openai").expect("openai must expose an oauth strategy");
+    assert_eq!(oauth.name(), "OpenAI (ChatGPT subscription)");
+    assert_eq!(oauth.login_label(), Some("Sign in with ChatGPT"));
+    assert!(oauth.is_subscription());
+
+    let interaction = crate::auth::oauth::ScriptedInteraction::new(Vec::new());
+    let error = match oauth.login(&interaction, &LoginOptions::default()).await {
+        Ok(_) => panic!("the probe must not produce a credential"),
+        Err(error) => error,
+    };
+    assert!(
+        !matches!(
+            error,
+            crate::auth::oauth::OAuthError::LoginUnsupported { .. }
+        ),
+        "/login reached the trait default instead of the ported flow ({error})"
+    );
+    assert_eq!(
+        error.to_string(),
+        "Sign in with ChatGPT requires a device ID (UUID) for this installation"
+    );
+    assert!(
+        interaction.prompts().is_empty() && interaction.events().is_empty(),
+        "the device-id check runs before any authorization starts"
+    );
 }

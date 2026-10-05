@@ -27,9 +27,23 @@ pub fn openai_models() -> Vec<Model> {
     crate::catalog::load_catalog(OPENAI_CATALOG_JSON).unwrap_or_default()
 }
 
-/// The OpenAI [`ProviderAuth`]: an API key from `$OPENAI_API_KEY` (Pi `envApiKeyAuth`).
+/// The OpenAI [`ProviderAuth`]: an API key from `$OPENAI_API_KEY` (Pi `envApiKeyAuth`,
+/// `openai.ts:13`) **and** "Sign in with ChatGPT" (`lazyOAuth`, `openai.ts:14-19` @v1.0.0).
+///
+/// PROV-118 — the two sit side by side upstream, which is the whole point: a ChatGPT Plus/Pro
+/// subscriber reaches `api.openai.com` through their plan while a metered caller keeps using a key.
+/// The OAuth half is [`crate::auth::oauth::openai_chatgpt::OpenAiChatGptOAuth`], routed through
+/// [`super::builtin_oauth::builtin_provider_oauth`] because upstream wires it with `lazyOAuth`.
+///
+/// The request shaping these two credentials need is **different**, not merely differently
+/// authenticated: a ChatGPT sign-in token sent to [`OPENAI_BASE_URL`] makes the Responses request
+/// omit four fields the token-sharing endpoint rejects. That decision lives in
+/// [`crate::api::openai_responses`]; see its `ResponsesTokenKind`.
 pub fn openai_auth() -> ProviderAuth {
-    ProviderAuth::with_api_key(env_key("OpenAI API key", [OPENAI_API_KEY_ENV]))
+    ProviderAuth {
+        api_key: Some(env_key("OpenAI API key", [OPENAI_API_KEY_ENV])),
+        oauth: super::builtin_oauth::builtin_provider_oauth(OPENAI_PROVIDER_ID),
+    }
 }
 
 /// Construct the OpenAI provider over the given credential store + shared api registry. The

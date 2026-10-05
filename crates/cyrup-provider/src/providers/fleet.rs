@@ -288,10 +288,14 @@ impl FleetSpec {
             store,
             registry,
         );
-        match self.base_url {
+        let provider = match self.base_url {
             Some(base_url) => provider.with_base_url(base_url),
             None => provider,
-        }
+        };
+        // PROV-128 — the per-id image leg, shaped exactly like `auth()`'s `builtin_provider_oauth`
+        // clause: `openrouter` is the only fleet member upstream gives an `images` map
+        // (`providers/openrouter.ts:33`), and every other id comes back untouched.
+        super::openrouter::with_builtin_images(self.id, provider)
     }
 
     /// Build this provider with an in-memory store + the built-in api registry.
