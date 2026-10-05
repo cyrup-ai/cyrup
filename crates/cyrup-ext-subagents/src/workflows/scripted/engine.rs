@@ -121,7 +121,12 @@ pub enum WorkflowResolvedResume {
 #[async_trait::async_trait]
 pub trait WorkflowScriptHost: Send + Sync {
     /// pi `options.admit` (`:1112`) — runs once per launch/batch BEFORE any child spawns.
-    async fn admit(&self, _calls: &[WorkflowRunCall]) -> Result<(), String> {
+    ///
+    /// `cancel` is pi's `admissionSignal` (`scripted-workflow.ts:2622` hands `options.admit` the
+    /// workflow's own `childController.signal`): a host that does I/O here must obey it. cyrup
+    /// passes the run's `child_cancel`, which the whole-run timeout also fires, so a bounded
+    /// admission cannot outlive the workflow that asked for it.
+    async fn admit(&self, _calls: &[WorkflowRunCall], _cancel: &CancelToken) -> Result<(), String> {
         Ok(())
     }
 
@@ -1914,8 +1919,11 @@ async fn run_child(
             }
             let host = shared.host.clone();
             let calls = admission_calls.clone();
+            // pi `:2622` — the workflow's child controller signal, so an admission that does I/O
+            // (SUBA-149's worktree probe) is stopped by the same token that stops the children.
+            let admission_cancel = shared.child_cancel.clone();
             shared
-                .on_main(async move { host.admit(&calls).await })
+                .on_main(async move { host.admit(&calls, &admission_cancel).await })
                 .await
                 .unwrap_or_else(Err)
         })
@@ -3630,6 +3638,131 @@ return { shipped: false };
                 .filter(|entry| entry.state == WorkflowScriptTraceState::Completed)
                 .count()
                 >= 13
+        );
+    }
+
+    /// SUBA-149 — THE ORDERING the row asks to be asserted rather than inferred: a refused
+    /// admission fails the whole `runs.all` batch and **no child is launched at all**.
+    ///
+    /// The engine's per-child pipeline (`run_child`) awaits the batch-shared admission `OnceCell`
+    /// before its stop check, its resume resolution and its launch, so one `Err` from `admit`
+    /// reaches every member of the batch and `launch` is never called. The recording host below
+    /// makes that observable: the launch counter must still read zero when the batch fails, which
+    /// is a stronger claim than "the error text was right".
+    ///
+    /// **Gutting mutation this fails on:** move the `admission.await` below the `host.launch`
+    /// call in `run_child` (or drop the `admitted?` propagation). Children then start and the
+    /// `launches` assertion fires while the error text still looks correct — which is exactly the
+    /// failure mode the row warned the admission could introduce.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_refused_admission_launches_no_child_in_the_batch() {
+        struct RefusingHost {
+            launches: AtomicUsize,
+            admissions: AtomicUsize,
+        }
+
+        #[async_trait::async_trait]
+        impl WorkflowScriptHost for RefusingHost {
+            async fn admit(
+                &self,
+                _calls: &[WorkflowRunCall],
+                _cancel: &CancelToken,
+            ) -> Result<(), String> {
+                self.admissions.fetch_add(1, Ordering::SeqCst);
+                Err(
+                    "Worktree admission failed for 'a', 'b' at /repo: worktree isolation requires \
+                     a clean git working tree. Commit or stash changes first. Select the correct \
+                     cwd or arrange an operator-approved commit/stash."
+                        .to_string(),
+                )
+            }
+
+            async fn launch(
+                &self,
+                key: &str,
+                _params: Map<String, Value>,
+                _cancel: CancelToken,
+                _admission: WorkflowLaunchAdmission,
+            ) -> Result<WorkflowScriptChildResult, String> {
+                self.launches.fetch_add(1, Ordering::SeqCst);
+                Ok(WorkflowScriptChildResult {
+                    key: key.to_string(),
+                    ok: true,
+                    output: "should never run".into(),
+                    ..Default::default()
+                })
+            }
+
+            async fn status(
+                &self,
+                key_or_run_id: &str,
+                _cancel: CancelToken,
+            ) -> Result<WorkflowScriptChildResult, String> {
+                Err(format!(
+                    "'{key_or_run_id}' names no launched child in this workflow."
+                ))
+            }
+        }
+
+        let host = Arc::new(RefusingHost {
+            launches: AtomicUsize::new(0),
+            admissions: AtomicUsize::new(0),
+        });
+        let script = r#"
+return await runs.all([
+  { key: "a", agent: "worker", task: "T", worktree: true },
+  { key: "b", agent: "worker", task: "T", worktree: true },
+]);
+"#;
+        let result = run_workflow_script(RunWorkflowScriptOptions {
+            script: script.to_string(),
+            one_use_permit: None,
+            timeout_ms: Some(120_000),
+            cancel: None,
+            continue_after_abort_when_children_settled: None,
+            global_concurrency_limit: None,
+            host: host.clone(),
+            state: None,
+            register_stop_child: None,
+            on_trace: None,
+            on_lane_plan: None,
+            on_emit: None,
+            on_host_step: None,
+        })
+        .await
+        .expect("runs.all COLLECTS its children's failures rather than throwing");
+
+        // Every member of the batch carries the admission sentence verbatim — the refusal reached
+        // all of them, not only the one whose launch happened to run the probe.
+        assert_eq!(result.children.len(), 2);
+        for child in &result.children {
+            assert!(!child.ok, "{child:?}");
+            assert_eq!(
+                child.error.as_deref(),
+                Some(
+                    "Worktree admission failed for 'a', 'b' at /repo: worktree isolation requires \
+                     a clean git working tree. Commit or stash changes first. Select the correct \
+                     cwd or arrange an operator-approved commit/stash."
+                )
+            );
+        }
+        // THE ORDERING ASSERTION, and the reason this test exists: not one child was launched.
+        assert_eq!(
+            host.launches.load(Ordering::SeqCst),
+            0,
+            "a refused admission must launch NO child"
+        );
+        assert_eq!(
+            host.admissions.load(Ordering::SeqCst),
+            1,
+            "the batch is admitted ONCE, not once per child"
+        );
+        // And nothing even reached a `run_id`: the trace's `started` rows are the launch
+        // REGISTRATIONS the engine writes before admission, and both keys end `failed` with no id.
+        assert!(
+            result.trace.iter().all(|entry| entry.run_id.is_none()),
+            "{:?}",
+            result.trace
         );
     }
 

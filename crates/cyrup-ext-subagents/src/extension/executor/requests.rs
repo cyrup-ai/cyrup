@@ -218,6 +218,16 @@ pub struct ForegroundRunRequest<'a> {
     /// disagreeing about the index.
     pub workflow_steer:
         Option<crate::extension::executor::foreground_control::ForegroundChildSteerHandle>,
+    /// SUBA-149 — pi `params.worktree` on the single path (`subagent-executor.ts:4099` @v0.75.0):
+    /// whether this child must run in its own managed git worktree instead of the caller's cwd.
+    ///
+    /// Deliberately a [`crate::spawn::worktree::WorktreeRequest`] with **no `Default`**, so every
+    /// construction of this struct has to state which of the two it is. That is the whole fix for
+    /// `SUBA-149`: the flag existed on the wire and on the params struct and was simply never read
+    /// on this path, so a caller who asked for isolation silently got a child writing into the
+    /// shared working directory. A field that cannot be omitted cannot be forgotten, and
+    /// [`crate::spawn::worktree::ManagedLaunch`] is the only thing that can answer it.
+    pub worktree: crate::spawn::worktree::WorktreeRequest,
 }
 
 /// The inputs one BACKGROUND single run needs, bundled into one borrowed request so

@@ -284,6 +284,10 @@ impl SubagentExecutor {
                 parent_workflow_run_id: None,
                 workflow_key: None,
                 workflow_steer: None,
+                // SUBA-149 — `/run` and this crate's own tests expose no `worktree` argument, so
+                // the request is the shared cwd. Spelled rather than defaulted: the field has no
+                // `Default` precisely so this answer is visible here.
+                worktree: crate::spawn::worktree::WorktreeRequest::Shared,
             },
             None,
         )
@@ -378,6 +382,7 @@ impl SubagentExecutor {
             parent_workflow_run_id,
             workflow_key,
             workflow_steer,
+            worktree,
             ..
         } = req;
 
@@ -407,9 +412,39 @@ impl SubagentExecutor {
         )
         .map_err(SubagentError::Management)?;
 
+        // SUBA-149 — pi `runSinglePath` (`subagent-executor.ts:4099`, `:4134` @v0.75.0): the
+        // caller's isolation REQUEST is answered here, and the child's cwd is whatever the answer
+        // produced. A requested-but-unallocatable worktree FAILS the launch (`?`); it never
+        // degrades to the shared cwd, which is the silent drop `SUBA-149` names.
+        //
+        // Placed as late as possible, and deliberately AFTER the last fallible step above: every
+        // statement between this allocation and the drive loop is infallible, so there is no
+        // early return that could leave an allocated worktree with no owner. The error path below
+        // rolls it back explicitly.
+        //
+        // `cwd` — the SOURCE cwd — has already done its two other jobs: persona discovery
+        // (`resolve_run_agent`, upstream resolves agents against the source cwd before any
+        // worktree exists) and artifact/output resolution (`resolve_run_channels`). Both must stay
+        // on the source: the handoff manifest and the caller's `output:` file live outside the
+        // worktree, so a preserved-then-removed worktree can never take them with it.
+        let managed = crate::spawn::worktree::ManagedLaunch::resolve(
+            worktree,
+            cwd,
+            run_id.as_str(),
+            &crate::spawn::worktree::ManagedLaunchConfig {
+                agent: Some(agent.name.as_str()),
+                base_dir: cfg.worktree_base_dir.as_deref(),
+                setup_hook: cfg.worktree_setup_hook.as_deref(),
+                setup_hook_timeout_ms: cfg.worktree_setup_hook_timeout_ms,
+                bounds: crate::spawn::worktree::GitBounds::new(Some(cancel.clone()), deadline_at),
+            },
+        )
+        .await?;
+        let child_cwd = managed.child_cwd();
+
         let run_options = self.build_foreground_run_options(ForegroundRunOptionsInput {
             overrides,
-            cwd,
+            cwd: child_cwd,
             timeout_ms,
             tool_timeout_ms,
             cancel,
@@ -459,7 +494,10 @@ impl SubagentExecutor {
             &agent,
             task,
             ForegroundControlIdentity {
-                cwd,
+                // SUBA-149 — where the child ACTUALLY runs, so `/subagents` and the control
+                // surface name the worktree a managed run is isolated in rather than the source
+                // it was cut from. Identical to `cwd` for every non-isolated run.
+                cwd: child_cwd,
                 parent_workflow_run_id: parent_workflow_run_id.as_ref(),
                 workflow_key: workflow_key.as_ref(),
                 // The SAME handle the run options above were derived from — one value, both sides.
@@ -529,13 +567,15 @@ impl SubagentExecutor {
                     stamp_intercom_detach_reason(&mut settled);
                     self.settle_attached_foreground_run(
                         &run_id,
-                        cwd,
+                        child_cwd,
                         &control_notifier,
                         &art_paths,
                         &art_cfg,
                         &settled,
                     )
                     .await;
+                    hand_back_managed_worktree(&managed, &art_dir, &run_id, &agent.name, &settled)
+                        .await;
                     return Ok((settled, run_id));
                 }
                 reason = detach_gate.requested() => {
@@ -567,7 +607,8 @@ impl SubagentExecutor {
         self.remember_foreground_run(
             &run_id,
             crate::background::RunMode::Single,
-            cwd,
+            // pi `updateRememberedForegroundChild({ … cwd: singleCwd … })` (`:4331`).
+            child_cwd,
             &[&receipt.result],
         );
         if !self.stamp_detached_receipt(&run_id, receipt.output_save_error.as_deref()) {
@@ -586,13 +627,14 @@ impl SubagentExecutor {
             stamp_intercom_detach_reason(&mut settled);
             self.settle_attached_foreground_run(
                 &run_id,
-                cwd,
+                child_cwd,
                 &control_notifier,
                 &art_paths,
                 &art_cfg,
                 &settled,
             )
             .await;
+            hand_back_managed_worktree(&managed, &art_dir, &run_id, &agent.name, &settled).await;
             return Ok((settled, run_id));
         }
         detach_gate.accept();
@@ -601,7 +643,7 @@ impl SubagentExecutor {
             .hand_off_detached_foreground_run(
                 DetachedRunHandoff {
                     run_id: &run_id,
-                    cwd,
+                    cwd: child_cwd,
                     control_notifier: &control_notifier,
                     art_paths,
                     art_cfg,
@@ -612,6 +654,7 @@ impl SubagentExecutor {
                 receipt.result,
             )
             .await;
+        hand_back_managed_worktree(&managed, &art_dir, &run_id, &agent.name, &settled).await;
 
         Ok((settled, run_id))
     }
@@ -1962,6 +2005,85 @@ fn write_foreground_input_artifact(
     art_paths
 }
 
+/// SUBA-149 — hand the managed worktree one single run was isolated in back to its caller: capture
+/// the diff, publish the manifest, preserve-or-remove, publish the ledger.
+///
+/// pi `:4385-4389`. The gate is `!result.detached`, and it is upstream's own: a run that returned a
+/// DETACH RECEIPT is still executing inside that worktree, so capturing and removing it would
+/// destroy live work. Upstream reports the pending setup reference for that case and finalizes
+/// later from `onDetachedExit` (`:4327-4328`); cyrup's detached fork keeps driving the child in
+/// this task and returns its REAL terminal result, so the one gate covers both shapes — a receipt
+/// is skipped, a real exit is finalized.
+///
+/// A hand-off failure is reported, never escalated: [`ManagedHandoff::Retained`] means the
+/// worktree and its branch are still on disk with the child's work in them. Losing a run's result
+/// because its bookkeeping failed would be strictly worse than a worktree that needs an operator.
+async fn hand_back_managed_worktree(
+    managed: &crate::spawn::worktree::ManagedLaunch,
+    art_dir: &Path,
+    run_id: &RunId,
+    agent: &str,
+    result: &SingleResult,
+) {
+    if managed.allocated().is_none() || result.detached {
+        return;
+    }
+    let manifest_path = crate::handoff::handoff_manifest_path(art_dir, run_id);
+    let binding = crate::spawn::worktree::SingleHandoffBinding {
+        manifest_path: &manifest_path,
+        run_id: &crate::handoff::LaneId::from(run_id),
+        source: crate::handoff::HandoffSource::Foreground,
+    };
+    let handoff_result = crate::handoff::HandoffResult {
+        agent: agent.to_string(),
+        status: Some(managed_child_status(result)),
+        summary: result
+            .final_output
+            .clone()
+            .filter(|text| !text.is_empty())
+            .or_else(|| result.error.clone())
+            .unwrap_or_else(|| "(no output)".to_string()),
+        output_path: result.saved_output_path.clone().map(PathBuf::from),
+        structured_output: result.structured_output.clone(),
+        structured_output_path: result.structured_output_path.clone(),
+        session_path: result.session_file.clone(),
+        workflow_key: None,
+        run_id: None,
+        lane: None,
+    };
+    match managed
+        .finalize(&binding, std::slice::from_ref(&handoff_result))
+        .await
+    {
+        crate::spawn::worktree::ManagedHandoff::NothingToHandOff
+        | crate::spawn::worktree::ManagedHandoff::Published(_) => {}
+        crate::spawn::worktree::ManagedHandoff::Retained(error) => {
+            tracing::warn!(
+                run_id = %run_id,
+                %error,
+                "managed worktree retained for manual reconciliation: the hand-off manifest could \
+                 not be published, so the worktree and its branch were left on disk"
+            );
+        }
+    }
+}
+
+/// pi's child-status mapping (`subagent-runner.ts:4411-4416`) read off a settled
+/// [`SingleResult`]: `stopped -> "stopped"`, `interrupted -> "paused"`, `exitCode === 0 ->
+/// "completed"`, else `"failed"`. Unlike `chain_graph`'s `StepResult` twin, a `SingleResult` DOES
+/// carry `stopped`, so all four arms are reachable here.
+fn managed_child_status(result: &SingleResult) -> crate::handoff::ChildStatus {
+    if result.stopped {
+        crate::handoff::ChildStatus::Stopped
+    } else if result.interrupted {
+        crate::handoff::ChildStatus::Paused
+    } else if result.exit_code == 0 {
+        crate::handoff::ChildStatus::Completed
+    } else {
+        crate::handoff::ChildStatus::Failed
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(
@@ -2894,6 +3016,221 @@ mod detach_producer_tests {
             built(None),
             None,
             "and an installation that declared nothing gets nothing invented for it"
+        );
+    }
+}
+
+/// SUBA-149 — a SINGLE run's `worktree: true` reaches the child's real working directory.
+///
+/// These drive the REAL tool dispatch and a REAL child process: the scripted child records its own
+/// `pwd`, so the assertion is on where the child actually ran rather than on an intermediate value.
+#[cfg(test)]
+mod managed_single_worktree_tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )]
+
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    use crate::extension::SubagentExecutor;
+    use crate::extension::testsupport::{FixedSessionIdHost, dispatch_tool};
+    use crate::extension::tool::SubagentTool;
+
+    /// A real, throwaway git repository with one commit — the shape a managed worktree can be cut
+    /// from. Mirrors `spawn::worktree`'s own fixture.
+    fn make_repo() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let run = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .current_dir(dir.path())
+                .args(args)
+                .status()
+                .expect("git spawns");
+            assert!(status.success(), "git {args:?} must succeed");
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.email", "test@example.com"]);
+        run(&["config", "user.name", "SUBA-149"]);
+        std::fs::write(dir.path().join("tracked.txt"), "initial\n").expect("tracked");
+        run(&["add", "-A"]);
+        run(&["commit", "-q", "-m", "initial"]);
+        dir
+    }
+
+    /// A scripted child that APPENDS its own working directory to `record` and then settles
+    /// cleanly with the NDJSON success shape. `record` is absolute and outside any worktree, so it
+    /// survives the hand-off's removal of the tree the child ran in.
+    fn write_cwd_recording_child(dir: &std::path::Path, record: &std::path::Path) -> PathBuf {
+        let script = dir.join("cwd-recording-child.sh");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\n\
+pwd >> '{}'\n\
+printf '%s\\n' '{{\"type\":\"agent_start\"}}'\n\
+printf '%s\\n' '{{\"type\":\"message_end\",\"message\":{{\"role\":\"assistant\",\
+\"content\":[{{\"type\":\"text\",\"text\":\"done\"}}]}}}}'\n\
+printf '%s\\n' '{{\"type\":\"agent_settled\"}}'\n\
+exit 0\n",
+                record.display()
+            ),
+        )
+        .expect("write the scripted child");
+        std::fs::set_permissions(
+            &script,
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+        )
+        .expect("make the scripted child executable");
+        script
+    }
+
+    /// Everything one dispatch needs: a git repo cwd, a worktree base dir outside it, a scripted
+    /// child that records its cwd, and a tool wired to all three.
+    struct Fixture {
+        repo: tempfile::TempDir,
+        base: tempfile::TempDir,
+        _home: tempfile::TempDir,
+        record: PathBuf,
+        tool: SubagentTool,
+    }
+
+    impl Fixture {
+        async fn new() -> Self {
+            let repo = make_repo();
+            let base = tempfile::tempdir().expect("worktree base");
+            let home = tempfile::tempdir().expect("script home");
+            let record = home.path().join("child-cwds.txt");
+            let script = write_cwd_recording_child(home.path(), &record);
+            let executor = Arc::new(SubagentExecutor::new());
+            executor.set_host_services(Arc::new(FixedSessionIdHost {
+                id: Some("session-suba149".to_string()),
+                file: None,
+            }));
+            {
+                let mut cfg = executor.config_cell().lock().await;
+                cfg.spawn_command = Some(crate::spawn::SpawnCommand {
+                    binary: script,
+                    base_args: Vec::new(),
+                });
+                // Kept off the system temp root so a failed hand-off cannot leak a worktree
+                // outside this test's own tempdirs.
+                cfg.worktree_base_dir = Some(base.path().to_path_buf());
+            }
+            let tool = SubagentTool::new(executor, repo.path().to_path_buf());
+            Self {
+                repo,
+                base,
+                _home: home,
+                record,
+                tool,
+            }
+        }
+
+        /// Every directory a child of this run actually executed in.
+        fn child_cwds(&self) -> Vec<PathBuf> {
+            std::fs::read_to_string(&self.record)
+                .unwrap_or_default()
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .map(PathBuf::from)
+                .collect()
+        }
+    }
+
+    /// THE ROW'S FIRST `Verify`: a single run with `worktree: true` runs in a managed worktree.
+    ///
+    /// **Gutting mutation this fails on:** pass `cwd` instead of `child_cwd` to
+    /// `build_foreground_run_options` (the pre-fix behaviour, where the flag was parsed and then
+    /// read nowhere). The child's recorded `pwd` is then the repository itself and both asserts
+    /// below fire — which is exactly the silent drop `SUBA-149` reports.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_single_run_with_worktree_true_runs_in_a_managed_worktree() {
+        let fixture = Fixture::new().await;
+        let result = dispatch_tool(
+            &fixture.tool,
+            serde_json::json!({
+                "agent": "worker",
+                "task": "T",
+                "model": "sonnet",
+                // `async: false` pins this to the FOREGROUND single path. A top-level single run
+                // is async by default (`asyncByDefault`), and the async single is a separate,
+                // still-unisolated shape — see `SUBA-149`'s residual note.
+                "async": false,
+                "worktree": true,
+            }),
+        )
+        .await
+        .expect("an isolated single run must not fail");
+        assert!(!result.is_error, "{:?}", result.content);
+
+        let cwds = fixture.child_cwds();
+        assert_eq!(cwds.len(), 1, "exactly one child ran: {cwds:?}");
+        let child_cwd = &cwds[0];
+        assert!(
+            child_cwd.starts_with(fixture.base.path())
+                || child_cwd
+                    .canonicalize()
+                    .is_ok_and(|real| real
+                        .starts_with(fixture.base.path().canonicalize().unwrap_or_default())),
+            "the child must run under the managed worktree base dir {}, not {}",
+            fixture.base.path().display(),
+            child_cwd.display()
+        );
+        assert_ne!(
+            child_cwd
+                .canonicalize()
+                .unwrap_or_else(|_| child_cwd.clone()),
+            fixture
+                .repo
+                .path()
+                .canonicalize()
+                .unwrap_or_else(|_| fixture.repo.path().to_path_buf()),
+            "the child must NOT share the caller's working directory"
+        );
+    }
+
+    /// THE CONTROL: a run WITHOUT `worktree: true` still executes in the shared cwd, and no
+    /// worktree is allocated for it at all.
+    ///
+    /// **Gutting mutation this fails on:** resolving `WorktreeRequest::Isolated` unconditionally
+    /// (or giving the field a `Default` that is wrong). The child's `pwd` moves out of the repo
+    /// and the base dir fills with worktrees.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_single_run_without_worktree_stays_in_the_shared_cwd() {
+        let fixture = Fixture::new().await;
+        let result = dispatch_tool(
+            &fixture.tool,
+            serde_json::json!({
+                "agent": "worker", "task": "T", "model": "sonnet", "async": false,
+            }),
+        )
+        .await
+        .expect("a shared single run must not fail");
+        assert!(!result.is_error, "{:?}", result.content);
+
+        let cwds = fixture.child_cwds();
+        assert_eq!(cwds.len(), 1, "exactly one child ran: {cwds:?}");
+        assert_eq!(
+            cwds[0].canonicalize().unwrap_or_else(|_| cwds[0].clone()),
+            fixture
+                .repo
+                .path()
+                .canonicalize()
+                .unwrap_or_else(|_| fixture.repo.path().to_path_buf()),
+            "a child that did not ask for isolation runs where the caller does"
+        );
+        let allocated: Vec<_> = std::fs::read_dir(fixture.base.path())
+            .expect("base dir is readable")
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name())
+            .collect();
+        assert!(
+            allocated.is_empty(),
+            "nothing may be allocated for a run that never asked: {allocated:?}"
         );
     }
 }

@@ -35,8 +35,9 @@ use crate::extension::tool::text::{CHILD_SESSION_NOT_RUNNING_YET, STEER_ACK_TIME
 use crate::fork_context::ContextRequest;
 use crate::workflows::scripted::{
     WORKFLOW_CHILD_MARKER, WorkflowLaunchAdmission, WorkflowResolvedResume,
-    WorkflowResolvedResumeReference, WorkflowResumeInput, WorkflowScriptHost, WorkflowSteerMode,
-    WorkflowSteerOptions, WorkflowSteerResult, WorkflowSteerState, WorkflowSteerTarget,
+    WorkflowResolvedResumeReference, WorkflowResumeInput, WorkflowRunCall, WorkflowScriptHost,
+    WorkflowSteerMode, WorkflowSteerOptions, WorkflowSteerResult, WorkflowSteerState,
+    WorkflowSteerTarget,
 };
 use crate::workflows::{
     WorkflowContinuation, WorkflowHostCommandParams, WorkflowHostCommandResult, WorkflowKey,
@@ -748,6 +749,75 @@ fn workflow_steer_receipt(
 
 #[async_trait::async_trait]
 impl WorkflowScriptHost for WorkflowRunHost {
+    /// SUBA-149 — pi `preflightWorkflowWorktrees` (`subagent-executor.ts:4941-4968` @v0.75.0),
+    /// invoked from the engine's `admit:` callback (`:6130` async, `:6442` foreground) ONCE per
+    /// `runs.run` / `runs.all` batch.
+    ///
+    /// A read-only probe of every distinct source cwd a child in this batch would cut a worktree
+    /// from. It fails the WHOLE batch before any child launches, which is the point: discovering a
+    /// dirty or non-git source inside the first child's allocation leaves the batch half-run.
+    ///
+    /// # Where this sits in the engine's existing claim order, and why it must not move
+    ///
+    /// `engine.rs`'s `launch_child` claims in this order, which is pi's own
+    /// (`scripted-workflow.ts:2569-2623`): reuse-or-conflict decision, then the **one-use permit
+    /// claim**, then the shape rejections, then the batch-admission dedup, then the launch
+    /// registration, and only THEN the admission promise this method is the body of. Three
+    /// consequences, all of them upstream's:
+    ///
+    /// * the one-use permit is **already spent** when this probe runs, and a failed admission does
+    ///   not give it back. That is not a defect to fix here: pi spends it in the same place
+    ///   (`:2569`, before `:2622`), and a permit-bearing launch is always a single non-`resume`
+    ///   child (`engine.rs` refuses a permit with `runs.all` and with `resume`), so it is always a
+    ///   child this probe actually examines — never one skipped below.
+    /// * the **recovery barrier** is checked inside the same `OnceCell` initializer and BEFORE
+    ///   this call (`engine.rs`'s admission cell, pi `:2621` before `:2622`). A barred workflow
+    ///   must report the barrier, not a worktree complaint, so the probe deliberately stays on
+    ///   this side of it rather than being hoisted into `launch_child`.
+    /// * the admission is **memoised per batch id** in that `OnceCell`, so the probe runs once for
+    ///   a `runs.all` and its `Err` is cloned to every child in the batch. Moving it into `launch`
+    ///   would run it once per child and let an earlier child start before a later child's source
+    ///   was ever checked.
+    ///
+    /// The engine filters `admission_calls` by the keys already in `launches`, so a key re-launched
+    /// later (auto-resume) is not re-probed — also upstream's (`:2614`).
+    async fn admit(&self, calls: &[WorkflowRunCall], cancel: &CancelToken) -> Result<(), String> {
+        let admission = crate::spawn::worktree::WorktreeAdmissionPlan::of(
+            &calls
+                .iter()
+                .map(|call| crate::spawn::worktree::AdmissionCall {
+                    key: call.key.clone(),
+                    // Every child of this workflow is launched against the ONE request cwd —
+                    // `launch` below passes `&self.cwd` to `ForegroundRunRequest::cwd`, and a
+                    // child's own `cwd` param is a PLACEMENT path (`overrides.machine_cwd`,
+                    // SUBA-100), not a local one. Probing `self.cwd` therefore probes exactly the
+                    // tree the child's worktree would be cut from; probing a per-child `cwd` that
+                    // the launch does not honour would invent a failure.
+                    source_cwd: self.cwd.clone(),
+                    request: crate::spawn::worktree::WorktreeRequest::from_flag(
+                        call.params.get("worktree").and_then(Value::as_bool),
+                    ),
+                    // pi `:4951`. The retained id or receipt a `resume` child names is validated
+                    // by the workflow BEFORE admission and RESOLVED after it, so at this point the
+                    // tree it would continue in is unknown. Upstream skips it; so does this.
+                    carries_resume: call.params.contains_key("resume"),
+                })
+                .collect::<Vec<_>>(),
+        );
+        if admission.is_empty() {
+            return Ok(());
+        }
+        admission
+            // No deadline: `WorkflowRunHost` holds none, and the engine's whole-run timeout fires
+            // this very token (`engine.rs`'s `GuestOutcome` arms), so the stop covers both.
+            .probe(&crate::spawn::worktree::GitBounds::new(
+                Some(cancel.clone()),
+                None,
+            ))
+            .await
+            .map_err(|error| error.to_string())
+    }
+
     async fn launch(
         &self,
         key: &str,
@@ -909,6 +979,15 @@ impl WorkflowScriptHost for WorkflowRunHost {
                     // `parent_workflow_run_id` so the "`Some` iff workflow-owned" invariant is
                     // visible at a glance rather than asserted elsewhere.
                     workflow_steer: Some(self.child_steer_handle(index)),
+                    // SUBA-149 — pi's effective-`worktree` resolution for a workflow child
+                    // (`prepareWorkflowLaunchParams`, `subagent-executor.ts:5040`/`:5001`): the
+                    // child's own value, else the workflow defaults', else `config.worktree`.
+                    // cyrup has neither a workflow-defaults spread nor `subagents.worktree` (the
+                    // latter is a self-declared unported config key, carried by `SUBA-113`), so
+                    // the child's own value IS the effective one here. The same flag drives the
+                    // admission probe above, which is what makes the probe and the allocation
+                    // agree about which children isolate.
+                    worktree: crate::spawn::worktree::WorktreeRequest::from_flag(child.worktree),
                 },
                 // A FRESH forwarding sink per child, because the real sink is `Box<dyn FnMut>` and
                 // `run_foreground_streaming` consumes one.
@@ -2206,5 +2285,470 @@ mod tests {
             crate::workflows::WorkflowHostCommandState::Stopped
         );
         assert!(!result.ok);
+    }
+}
+
+/// SUBA-149 — the workflow host's two halves: the admission probe (`admit`) and the per-child
+/// worktree allocation (`launch`).
+#[cfg(test)]
+mod managed_workflow_worktree_tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )]
+
+    use super::*;
+    use crate::workflows::scripted::WorkflowRunCall;
+
+    /// A real, throwaway git repository with one commit.
+    fn make_repo() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let run = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .current_dir(dir.path())
+                .args(args)
+                .status()
+                .expect("git spawns");
+            assert!(status.success(), "git {args:?} must succeed");
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.email", "test@example.com"]);
+        run(&["config", "user.name", "SUBA-149"]);
+        std::fs::write(dir.path().join("tracked.txt"), "initial\n").expect("tracked");
+        run(&["add", "-A"]);
+        run(&["commit", "-q", "-m", "initial"]);
+        dir
+    }
+
+    fn dirty(repo: &tempfile::TempDir) {
+        std::fs::write(repo.path().join("tracked.txt"), "uncommitted\n").expect("dirty it");
+    }
+
+    fn call(key: &str, params: serde_json::Value) -> WorkflowRunCall {
+        WorkflowRunCall {
+            key: key.to_string(),
+            params: params.as_object().expect("an object").clone(),
+        }
+    }
+
+    /// A host rooted at `cwd`, with an executor configured to spawn `script` as every child and to
+    /// allocate managed worktrees under `base`.
+    async fn host_at(
+        cwd: &std::path::Path,
+        base: Option<&std::path::Path>,
+        script: Option<PathBuf>,
+    ) -> WorkflowRunHost {
+        let executor = Arc::new(SubagentExecutor::new());
+        {
+            let mut cfg = executor.config_cell().lock().await;
+            if let Some(script) = script {
+                cfg.spawn_command = Some(crate::spawn::SpawnCommand {
+                    binary: script,
+                    base_args: Vec::new(),
+                });
+            }
+            cfg.worktree_base_dir = base.map(std::path::Path::to_path_buf);
+        }
+        let workflow_run_id = crate::background::RunId::new();
+        let status = Arc::new(Mutex::new(crate::background::RunStatus::queued(
+            workflow_run_id.clone(),
+            crate::background::RunMode::Workflow,
+            None,
+        )));
+        let run_dir = cwd.join(".runs");
+        std::fs::create_dir_all(&run_dir).expect("run dir");
+        WorkflowRunHost::new(
+            executor,
+            cwd.to_path_buf(),
+            Box::new(|_| {}),
+            workflow_run_id,
+            status,
+            run_dir.clone(),
+            run_dir,
+        )
+    }
+
+    /// A scripted child that appends its own working directory to `record` and settles cleanly.
+    fn write_cwd_recording_child(dir: &std::path::Path, record: &std::path::Path) -> PathBuf {
+        let script = dir.join("cwd-recording-child.sh");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\n\
+pwd >> '{}'\n\
+printf '%s\\n' '{{\"type\":\"agent_start\"}}'\n\
+printf '%s\\n' '{{\"type\":\"message_end\",\"message\":{{\"role\":\"assistant\",\
+\"content\":[{{\"type\":\"text\",\"text\":\"done\"}}]}}}}'\n\
+printf '%s\\n' '{{\"type\":\"agent_settled\"}}'\n\
+exit 0\n",
+                record.display()
+            ),
+        )
+        .expect("write the scripted child");
+        std::fs::set_permissions(
+            &script,
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+        )
+        .expect("make the scripted child executable");
+        script
+    }
+
+    /// The admission's refusal, verbatim — pi `preflightWorkflowWorktrees`
+    /// (`subagent-executor.ts:4962` @v0.75.0), with every key that shares the cwd named in ONE
+    /// sentence.
+    ///
+    /// **Gutting mutation this fails on:** delete the `admit` override (restore the trait's
+    /// default `Ok(())`), which is where `SUBA-149` found it. `admit` then returns `Ok` and the
+    /// `expect_err` fires.
+    #[tokio::test]
+    async fn the_admission_refuses_a_dirty_source_and_names_every_key_sharing_it() {
+        let repo = make_repo();
+        dirty(&repo);
+        let host = host_at(repo.path(), None, None).await;
+        let error = host
+            .admit(
+                &[
+                    call(
+                        "a",
+                        serde_json::json!({ "agent": "worker", "task": "T", "worktree": true }),
+                    ),
+                    call(
+                        "b",
+                        serde_json::json!({ "agent": "worker", "task": "T", "worktree": true }),
+                    ),
+                ],
+                &CancelToken::new(),
+            )
+            .await
+            .expect_err("a dirty source is not admissible");
+        assert_eq!(
+            error,
+            format!(
+                "Worktree admission failed for 'a', 'b' at {}: worktree isolation requires a \
+                 clean git working tree. Commit or stash changes first. Select the correct cwd or \
+                 arrange an operator-approved commit/stash.",
+                repo.path().display()
+            )
+        );
+    }
+
+    /// THE ROW'S OWN SKIP RULE: a child carrying `resume` is not probed, so a dirty source cannot
+    /// refuse it. pi `:4951`.
+    ///
+    /// **Gutting mutation this fails on:** drop the `carries_resume` skip in
+    /// `WorktreeAdmissionPlan::of`. The dirty repo then refuses the resumed child and `expect`
+    /// fires — an invented failure for a child whose tree the probe cannot even identify.
+    #[tokio::test]
+    async fn the_admission_skips_a_child_carrying_resume() {
+        let repo = make_repo();
+        dirty(&repo);
+        let host = host_at(repo.path(), None, None).await;
+        host.admit(
+            &[call(
+                "resumed",
+                serde_json::json!({ "resume": "abc123", "task": "go on", "worktree": true }),
+            )],
+            &CancelToken::new(),
+        )
+        .await
+        .expect("a resumed child is skipped by the probe, however dirty the source");
+    }
+
+    /// The other skip: a child that never asked for isolation is not probed, so a dirty working
+    /// tree cannot invent a failure for it — the defect `SUBA-147` was closed as.
+    #[tokio::test]
+    async fn the_admission_skips_a_child_that_did_not_ask_for_isolation() {
+        let repo = make_repo();
+        dirty(&repo);
+        let host = host_at(repo.path(), None, None).await;
+        host.admit(
+            &[
+                call(
+                    "plain",
+                    serde_json::json!({ "agent": "worker", "task": "T" }),
+                ),
+                call(
+                    "explicit",
+                    serde_json::json!({ "agent": "worker", "task": "T", "worktree": false }),
+                ),
+            ],
+            &CancelToken::new(),
+        )
+        .await
+        .expect("no child asked for isolation, so nothing is probed");
+    }
+
+    /// A clean source is admitted.
+    #[tokio::test]
+    async fn the_admission_passes_a_clean_source() {
+        let repo = make_repo();
+        let host = host_at(repo.path(), None, None).await;
+        host.admit(
+            &[call(
+                "a",
+                serde_json::json!({ "agent": "worker", "task": "T", "worktree": true }),
+            )],
+            &CancelToken::new(),
+        )
+        .await
+        .expect("a clean source is admissible");
+    }
+
+    /// THE ROW'S THIRD `Verify`, END TO END and with the ORDERING asserted: a dirty source fails
+    /// the whole `runs.all` batch and **no child process is ever spawned**.
+    ///
+    /// This drives the REAL engine over the REAL [`WorkflowRunHost`], so the admission under test
+    /// is the production one and the ordering under test is the engine's own. The ordering claim
+    /// is not inferred from the error text: the scripted child would APPEND its `pwd` to a file,
+    /// so that file's absence is positive evidence that `launch` was never reached.
+    ///
+    /// **Gutting mutation this fails on:** delete the `admit` override. Both children then launch
+    /// against the dirty repository, the record file appears, and the `recorded` assertion fires —
+    /// which is `SUBA-149`'s own failure mode with the loud half removed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_dirty_source_fails_the_whole_batch_before_any_child_launches() {
+        let repo = make_repo();
+        let base = tempfile::tempdir().expect("worktree base");
+        let home = tempfile::tempdir().expect("script home");
+        let record = home.path().join("child-cwds.txt");
+        let script = write_cwd_recording_child(home.path(), &record);
+        let host = Arc::new(host_at(repo.path(), Some(base.path()), Some(script)).await);
+        dirty(&repo);
+
+        let result = crate::workflows::scripted::run_workflow_script(
+            crate::workflows::scripted::RunWorkflowScriptOptions {
+                script: r#"
+return await runs.all([
+  { key: "a", agent: "worker", task: "T", model: "sonnet", async: false, worktree: true },
+  { key: "b", agent: "worker", task: "T", model: "sonnet", async: false, worktree: true },
+]);
+"#
+                .to_string(),
+                one_use_permit: None,
+                timeout_ms: Some(120_000),
+                cancel: None,
+                continue_after_abort_when_children_settled: None,
+                global_concurrency_limit: None,
+                host,
+                state: None,
+                register_stop_child: None,
+                on_trace: None,
+                on_lane_plan: None,
+                on_emit: None,
+                on_host_step: None,
+            },
+        )
+        .await
+        .expect("runs.all collects its children's failures rather than throwing");
+
+        let expected = format!(
+            "Worktree admission failed for 'a', 'b' at {}: worktree isolation requires a clean \
+             git working tree. Commit or stash changes first. Select the correct cwd or arrange \
+             an operator-approved commit/stash.",
+            repo.path().display()
+        );
+        assert_eq!(result.children.len(), 2);
+        for child in &result.children {
+            assert!(!child.ok, "{child:?}");
+            assert_eq!(child.error.as_deref(), Some(expected.as_str()));
+        }
+        // THE ORDERING: the child binary never ran, so it never recorded a cwd.
+        assert!(
+            !record.exists(),
+            "no child may launch once admission has failed; the child recorded: {:?}",
+            std::fs::read_to_string(&record)
+        );
+        let allocated: Vec<_> = std::fs::read_dir(base.path())
+            .expect("base dir is readable")
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name())
+            .collect();
+        assert!(
+            allocated.is_empty(),
+            "a refused admission allocates nothing: {allocated:?}"
+        );
+    }
+
+    /// THE ORDERING, isolated from the error text: a batch whose FIRST child wants isolation from
+    /// a dirty source and whose SECOND child wants none at all. The admission's scope is the
+    /// BATCH, so the second child — which would have been perfectly launchable — never runs.
+    ///
+    /// This is the assertion the row asks for and the one the error text cannot make. Without the
+    /// `admit` override the dirty source is still discovered, but only INSIDE the isolated child's
+    /// own allocation: the shared-cwd sibling launches, records its `pwd`, and does whatever work
+    /// it was given against a tree the operator was never told about. The record file's contents
+    /// are therefore positive evidence of the ordering, not of the message.
+    ///
+    /// **Gutting mutation this fails on:** delete the `admit` override. `plain` then launches and
+    /// the `record.exists()` assertion fires.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn one_childs_dirty_source_stops_a_sibling_that_wanted_no_isolation() {
+        let repo = make_repo();
+        let base = tempfile::tempdir().expect("worktree base");
+        let home = tempfile::tempdir().expect("script home");
+        let record = home.path().join("child-cwds.txt");
+        let script = write_cwd_recording_child(home.path(), &record);
+        let host = Arc::new(host_at(repo.path(), Some(base.path()), Some(script)).await);
+        dirty(&repo);
+
+        let result = crate::workflows::scripted::run_workflow_script(
+            crate::workflows::scripted::RunWorkflowScriptOptions {
+                script: r#"
+return await runs.all([
+  { key: "isolated", agent: "worker", task: "T", model: "sonnet", async: false, worktree: true },
+  { key: "plain", agent: "worker", task: "T", model: "sonnet", async: false },
+]);
+"#
+                .to_string(),
+                one_use_permit: None,
+                timeout_ms: Some(120_000),
+                cancel: None,
+                continue_after_abort_when_children_settled: None,
+                global_concurrency_limit: None,
+                host,
+                state: None,
+                register_stop_child: None,
+                on_trace: None,
+                on_lane_plan: None,
+                on_emit: None,
+                on_host_step: None,
+            },
+        )
+        .await
+        .expect("runs.all collects its children's failures rather than throwing");
+
+        let expected = format!(
+            "Worktree admission failed for 'isolated' at {}: worktree isolation requires a clean \
+             git working tree. Commit or stash changes first. Select the correct cwd or arrange \
+             an operator-approved commit/stash.",
+            repo.path().display()
+        );
+        // THE ORDERING, asserted FIRST and on its own: whatever the messages say, the
+        // shared-cwd sibling must not have run. Without the admission it does.
+        assert!(
+            !record.exists(),
+            "the shared-cwd sibling must NOT have launched; it recorded: {:?}",
+            std::fs::read_to_string(&record)
+        );
+        assert_eq!(result.children.len(), 2);
+        for child in &result.children {
+            assert!(!child.ok, "{child:?}");
+            assert_eq!(
+                child.error.as_deref(),
+                Some(expected.as_str()),
+                "the whole batch carries the ONE admission failure, '{}' included",
+                child.key
+            );
+        }
+    }
+
+    /// THE ROW'S SECOND `Verify`: a workflow child with `worktree: true` runs in a managed
+    /// worktree. Driven through the host's REAL `launch` and a REAL child process, which records
+    /// its own `pwd`.
+    ///
+    /// **Gutting mutation this fails on:** remove the `worktree:` line from `launch`'s
+    /// `ForegroundRunRequest` (replace it with `WorktreeRequest::Shared`), which is the pre-fix
+    /// behaviour. The child's recorded `pwd` becomes the workflow's shared cwd and both asserts
+    /// fire.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_workflow_child_with_worktree_true_runs_in_a_managed_worktree() {
+        let repo = make_repo();
+        let base = tempfile::tempdir().expect("worktree base");
+        let home = tempfile::tempdir().expect("script home");
+        let record = home.path().join("child-cwds.txt");
+        let script = write_cwd_recording_child(home.path(), &record);
+        let host = host_at(repo.path(), Some(base.path()), Some(script)).await;
+
+        let result = host
+            .launch(
+                "a",
+                serde_json::json!({
+                    "agent": "worker", "task": "T", "model": "sonnet", "worktree": true,
+                })
+                .as_object()
+                .unwrap()
+                .clone(),
+                CancelToken::new(),
+                WorkflowLaunchAdmission {
+                    admitted: true,
+                    batch: false,
+                },
+            )
+            .await
+            .expect("an isolated workflow child must launch");
+        assert!(result.ok, "{result:?}");
+
+        let recorded = std::fs::read_to_string(&record).expect("the child recorded its cwd");
+        let child_cwd = PathBuf::from(recorded.trim());
+        assert!(
+            child_cwd.starts_with(base.path())
+                || child_cwd.canonicalize().is_ok_and(
+                    |real| real.starts_with(base.path().canonicalize().unwrap_or_default())
+                ),
+            "the child must run under the managed worktree base dir {}, not {}",
+            base.path().display(),
+            child_cwd.display()
+        );
+        assert_ne!(
+            child_cwd
+                .canonicalize()
+                .unwrap_or_else(|_| child_cwd.clone()),
+            repo.path()
+                .canonicalize()
+                .unwrap_or_else(|_| repo.path().to_path_buf()),
+            "the child must NOT share the workflow's working directory"
+        );
+    }
+
+    /// THE CONTROL: a workflow child WITHOUT `worktree: true` still runs in the workflow's shared
+    /// cwd and allocates nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_workflow_child_without_worktree_stays_in_the_shared_cwd() {
+        let repo = make_repo();
+        let base = tempfile::tempdir().expect("worktree base");
+        let home = tempfile::tempdir().expect("script home");
+        let record = home.path().join("child-cwds.txt");
+        let script = write_cwd_recording_child(home.path(), &record);
+        let host = host_at(repo.path(), Some(base.path()), Some(script)).await;
+
+        let result = host
+            .launch(
+                "a",
+                serde_json::json!({ "agent": "worker", "task": "T", "model": "sonnet" })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+                CancelToken::new(),
+                WorkflowLaunchAdmission {
+                    admitted: true,
+                    batch: false,
+                },
+            )
+            .await
+            .expect("a shared workflow child must launch");
+        assert!(result.ok, "{result:?}");
+
+        let recorded = std::fs::read_to_string(&record).expect("the child recorded its cwd");
+        let child_cwd = PathBuf::from(recorded.trim());
+        assert_eq!(
+            child_cwd
+                .canonicalize()
+                .unwrap_or_else(|_| child_cwd.clone()),
+            repo.path()
+                .canonicalize()
+                .unwrap_or_else(|_| repo.path().to_path_buf()),
+            "a child that did not ask for isolation runs where the workflow does"
+        );
+        let allocated: Vec<_> = std::fs::read_dir(base.path())
+            .expect("base dir is readable")
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name())
+            .collect();
+        assert!(
+            allocated.is_empty(),
+            "nothing may be allocated for a child that never asked: {allocated:?}"
+        );
     }
 }

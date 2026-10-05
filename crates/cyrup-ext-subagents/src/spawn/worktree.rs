@@ -654,18 +654,42 @@ pub async fn resolve_expected_worktree_agent_cwd(
     })
 }
 
-/// pi `resolveRepoState`.
-async fn resolve_repo_state(cwd: &Path, bounds: &GitBounds) -> Result<RepoState, SubagentError> {
-    let cwd_relative = resolve_repo_cwd_relative(cwd, bounds).await?;
+/// pi `probeWorktreeSource` (`runs/shared/worktree.ts:344-357` @v0.75.0) — the repo test and the
+/// clean-tree test, returning the repository toplevel. **No HEAD resolve**, which is exactly what
+/// separates it from [`resolve_repo_state`]: a probe must not need a commit to exist, and it must
+/// not pretend to have produced the base commit a real allocation is cut from.
+///
+/// Upstream exposes the same split and for the same reason: `probeWorktreeSource` is shared by
+/// `preflightWorktreeSource` (the read-only admission check, `:359-369`) and by `resolveRepoState`
+/// (`:371-372`), so an admission that passes and an allocation that then fails cannot disagree
+/// about what "usable source" means. [`resolve_repo_state`] calls this function rather than
+/// repeating the two tests, so the two can never drift.
+///
+/// # Errors
+///
+/// [`WorktreeSourceRefusal`], whose `Display` is upstream's own sentence with no wrapper.
+pub async fn preflight_worktree_source(
+    cwd: &Path,
+    bounds: &GitBounds,
+) -> Result<PathBuf, WorktreeSourceRefusal> {
+    // pi `:345-346`: `rev-parse --is-inside-work-tree` is accepted on [0, 128] and the STDOUT is
+    // what decides, so a non-repo cwd reports the repository sentence rather than git's own.
+    let inside = run_git_bounded(cwd, &["rev-parse", "--is-inside-work-tree"], bounds)
+        .await
+        .map_err(WorktreeSourceRefusal::ProbeFailed)?;
+    if inside.status != Some(0) || inside.stdout.trim() != "true" {
+        return Err(WorktreeSourceRefusal::NotARepository);
+    }
     let toplevel = PathBuf::from(
         run_git_checked(cwd, &["rev-parse", "--show-toplevel"], bounds)
-            .await?
+            .await
+            .map_err(WorktreeSourceRefusal::ProbeFailed)?
             .trim(),
     );
 
     // pi-subagents writes durable runtime state under its project artifact root by default;
     // that state must not make managed isolation unusable for later runs
-    // (`runs/shared/worktree.ts:351` @v0.71.0, `["status", "--porcelain", "--",
+    // (`runs/shared/worktree.ts:351` @v0.75.0, `["status", "--porcelain", "--",
     // `:!${PROJECT_SUBAGENTS_RELATIVE_DIR}`]`). The pathspec is resolved against the TOPLEVEL
     // while [`crate::artifacts::PROJECT_ARTIFACT_ROOT`] is `<cwd>`-relative; that is upstream's
     // own shape (its pathspec is likewise toplevel-relative), so it is ported as-is.
@@ -675,13 +699,66 @@ async fn resolve_repo_state(cwd: &Path, bounds: &GitBounds) -> Result<RepoState,
         &["status", "--porcelain", "--", &artifact_root_exclude],
         bounds,
     )
-    .await?;
+    .await
+    .map_err(WorktreeSourceRefusal::ProbeFailed)?;
     if !status.trim().is_empty() {
-        return Err(SubagentError::WorktreeSetup(
-            "worktree isolation requires a clean git working tree. Commit or stash changes first."
-                .to_string(),
-        ));
+        return Err(WorktreeSourceRefusal::DirtyWorkingTree);
     }
+    Ok(toplevel)
+}
+
+/// Why a cwd cannot be a managed-worktree source — pi `probeWorktreeSource`'s two throws
+/// (`runs/shared/worktree.ts:346`, `:353` @v0.75.0) plus the bounded-`git` failures.
+///
+/// A named enum rather than a formatted string because these are expected domain outcomes with
+/// fixed, upstream-owned sentences, and because both consumers need the sentence RAW:
+/// [`resolve_repo_state`] lifts it into [`SubagentError::WorktreeSetup`] (whose own `Display`
+/// adds cyrup's `worktree group aborted: ` prefix), while
+/// [`format_worktree_admission_failure`] embeds it where upstream writes `${error.message}` —
+/// a prefix there would be a divergence in a sentence an operator is told to act on.
+#[derive(Debug)]
+pub enum WorktreeSourceRefusal {
+    /// `cwd` is not inside a git work tree.
+    NotARepository,
+    /// The source tree has uncommitted changes outside the project artifact root.
+    DirtyWorkingTree,
+    /// The probe's own `git` never reached a verdict: stopped, past its deadline, or over the
+    /// output budget.
+    ProbeFailed(SubagentError),
+}
+
+impl std::fmt::Display for WorktreeSourceRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotARepository => f.write_str("worktree isolation requires a git repository"),
+            Self::DirtyWorkingTree => f.write_str(
+                "worktree isolation requires a clean git working tree. Commit or stash changes \
+                 first.",
+            ),
+            Self::ProbeFailed(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+impl From<WorktreeSourceRefusal> for SubagentError {
+    fn from(value: WorktreeSourceRefusal) -> Self {
+        match value {
+            // Already a `SubagentError`; re-wrapping it would double cyrup's prefix.
+            WorktreeSourceRefusal::ProbeFailed(error) => error,
+            refusal => Self::WorktreeSetup(refusal.to_string()),
+        }
+    }
+}
+
+/// pi `resolveRepoState`.
+async fn resolve_repo_state(cwd: &Path, bounds: &GitBounds) -> Result<RepoState, SubagentError> {
+    // The repo + clean-tree half, SHARED with the admission probe — pi `:372`, which calls
+    // `probeWorktreeSource` BEFORE `--show-prefix`. Keeping that order matters: a non-repo cwd
+    // must report the probe's sentence, not git's own `--show-prefix` stderr.
+    let toplevel = preflight_worktree_source(cwd, bounds)
+        .await
+        .map_err(SubagentError::from)?;
+    let cwd_relative = resolve_repo_cwd_relative(cwd, bounds).await?;
 
     let base_commit = run_git_checked(&toplevel, &["rev-parse", "HEAD"], bounds)
         .await?
@@ -2165,6 +2242,422 @@ pub async fn setup_worktree_group(
     })
 }
 
+// =================================================================================================
+// Managed isolation: the REQUEST, its FULFILMENT, and batch admission
+// (pi `worktreeSetup`/`finalizeSingleWorktreeHandoff`/`retainSingleWorktreeHandoff`,
+//  `runs/foreground/subagent-executor.ts:3928-4010`, `:4099-4150`; `preflightWorkflowWorktrees`,
+//  `:4941-4968`; `preflightWorktreeSource`, `runs/shared/worktree.ts:359-369` — all @v0.75.0)
+// =================================================================================================
+
+/// What a caller asked for when it set, or omitted, `worktree` — **the request, which is not yet a
+/// fulfilment**.
+///
+/// This distinction is the whole of `SUBA-149`. `worktree: true` was parsed into an
+/// `Option<bool>` and then consumed by only two of the tool's launch shapes; on every other shape
+/// the `bool` was simply never read, and a caller who asked for isolation silently got a child
+/// writing into the shared working directory. A `bool` cannot carry the obligation to answer it.
+/// This enum, deliberately WITHOUT a `Default`, makes every launch-request literal spell out which
+/// of the two states it is in, and [`ManagedLaunch`] is the only thing that can answer it.
+///
+/// What becomes impossible: constructing a launch request that neither isolates nor says it does
+/// not. What remains possible, and is therefore tested: a launch shape that never asks
+/// [`ManagedLaunch::resolve`] at all — see `SUBA-149`'s residual note for the shapes that do not
+/// yet.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum WorktreeRequest {
+    /// The child runs in the caller's own working directory, sharing it with everything else.
+    Shared,
+    /// The child must run in its own managed git worktree, cut from the source cwd's repository.
+    Isolated,
+}
+
+impl WorktreeRequest {
+    /// Lift the wire `worktree` flag. pi reads `params.worktree === true`
+    /// (`subagent-executor.ts:4099`), so `false` and omitted are the same request.
+    #[must_use]
+    pub const fn from_flag(flag: Option<bool>) -> Self {
+        match flag {
+            Some(true) => Self::Isolated,
+            Some(false) | None => Self::Shared,
+        }
+    }
+
+    /// Whether this request asks for a managed worktree.
+    #[must_use]
+    pub const fn is_isolated(self) -> bool {
+        matches!(self, Self::Isolated)
+    }
+}
+
+/// What an allocation for ONE child needs beyond the source cwd (pi's `createSingleWorktreeSetup`
+/// argument list, `subagent-executor.ts:3631-3645`).
+#[derive(Debug, Clone, Default)]
+pub struct ManagedLaunchConfig<'a> {
+    /// The agent name, used to make the branch and the hook payload readable.
+    pub agent: Option<&'a str>,
+    /// `subagents.worktreeBaseDir`; `None` takes [`resolve_worktree_base_dir`]'s own
+    /// `$CYRUP_SUBAGENTS_WORKTREE_DIR` -> [`std::env::temp_dir`] ladder.
+    pub base_dir: Option<&'a Path>,
+    /// `subagents.worktreeSetupHook`.
+    pub setup_hook: Option<&'a Path>,
+    /// `subagents.worktreeSetupHookTimeoutMs`.
+    pub setup_hook_timeout_ms: Option<u64>,
+    /// The run's stop token and deadline, obeyed by every allocation `git` and by the hook.
+    pub bounds: GitBounds,
+}
+
+/// Where one child will actually run, **together with the allocation that justifies it**.
+///
+/// The only constructor is [`ManagedLaunch::resolve`], which either allocates a worktree or
+/// returns the allocation's error. There is therefore no value of this type that says "isolation
+/// was requested" while [`Self::child_cwd`] still points at the shared cwd — the state the bug
+/// consisted of. The fields are private for the same reason: a forged `Isolated` with a
+/// hand-built [`WorktreeSetup`] would re-open it.
+///
+/// Not typestate: the real lifecycle of a managed worktree outlives this process (the manifest on
+/// disk is what a later `worktree.cleanup` or `lane.*` verb reads), which is the one case
+/// `docs/RUST-DESIGN-REVIEW.md` names as the wrong place for compiler-visible transitions. A
+/// private-field struct with one fallible constructor gives the guarantee that is actually needed.
+#[derive(Debug)]
+#[must_use]
+pub struct ManagedLaunch {
+    /// The caller's own cwd — where artifacts, output files and the handoff manifest stay, so a
+    /// preserved-then-removed worktree can never take the caller's output with it.
+    source_cwd: PathBuf,
+    /// `Some` exactly for [`WorktreeRequest::Isolated`], by construction.
+    allocated: Option<WorktreeSetup>,
+    /// The bounds the allocation ran under, reused by the harvest so the two agree.
+    bounds: GitBounds,
+}
+
+/// What [`ManagedLaunch::finalize`] achieved.
+///
+/// Three named outcomes rather than `Option<Result<…>>`: "there was nothing to hand off" and "the
+/// hand-off failed and the worktree is still on disk" are different facts, and the second must
+/// never read as a loss of the child's work.
+#[derive(Debug)]
+pub enum ManagedHandoff {
+    /// The run was never isolated, so there is nothing to capture.
+    NothingToHandOff,
+    /// The diff was captured, the manifest published, and cleanup's ledger recorded.
+    Published(crate::handoff::HandoffReference),
+    /// The manifest write failed. pi `retainSingleWorktreeHandoff` (`:3998-4010`): the worktree is
+    /// NOT removed and the branch is NOT deleted, so the child's work survives for manual
+    /// reconciliation. The error is the reason to report, never a reason to discard.
+    Retained(crate::handoff::HandoffError),
+}
+
+/// Where one managed single run publishes its hand-off manifest, and under what identity.
+#[derive(Debug, Clone, Copy)]
+pub struct SingleHandoffBinding<'a> {
+    /// `<artifacts>/handoffs/<run_id>.json` — [`crate::handoff::handoff_manifest_path`].
+    pub manifest_path: &'a Path,
+    /// This run's own id (pi's manifest `runId`).
+    pub run_id: &'a crate::handoff::LaneId,
+    /// Which process is writing. pi's single path writes `source: "foreground"` (`:3934`).
+    pub source: crate::handoff::HandoffSource,
+}
+
+impl ManagedLaunch {
+    /// Answer a [`WorktreeRequest`] for one child: allocate a managed worktree, or record that the
+    /// shared cwd is what was asked for.
+    ///
+    /// pi `runSinglePath`'s `params.worktree ? await createSingleWorktreeSetup(…) : undefined`
+    /// followed by `const singleCwd = worktreeSetup?.worktrees[0]?.agentCwd ?? sourceCwd`
+    /// (`subagent-executor.ts:4099`, `:4134`).
+    ///
+    /// # Errors
+    ///
+    /// [`create_worktrees`]' errors — a non-git or dirty source, a failed `git worktree add`, or a
+    /// failed/timed-out setup hook. A requested isolation that cannot be allocated FAILS the
+    /// launch; it never degrades to the shared cwd.
+    pub async fn resolve(
+        request: WorktreeRequest,
+        source_cwd: &Path,
+        run_id: &str,
+        config: &ManagedLaunchConfig<'_>,
+    ) -> Result<Self, SubagentError> {
+        let bounds = config.bounds.clone();
+        match request {
+            WorktreeRequest::Shared => Ok(Self {
+                source_cwd: source_cwd.to_path_buf(),
+                allocated: None,
+                bounds,
+            }),
+            WorktreeRequest::Isolated => {
+                let options = CreateWorktreesOptions {
+                    agents: config.agent.map(|agent| vec![agent.to_string()]),
+                    setup_hook: config.setup_hook.map(|hook| WorktreeSetupHookConfig {
+                        hook_path: hook.to_string_lossy().into_owned(),
+                        timeout_ms: config.setup_hook_timeout_ms,
+                    }),
+                    base_dir: config
+                        .base_dir
+                        .map(|dir| dir.to_string_lossy().into_owned()),
+                    bounds: bounds.clone(),
+                };
+                let setup = create_worktrees(source_cwd, run_id, 1, Some(&options)).await?;
+                // `count = 1` always yields one worktree or an `Err`, but the vector's length is
+                // not a type-level fact: refuse rather than silently fall back to the shared cwd,
+                // which is the exact behaviour this type exists to make impossible.
+                if setup.worktrees.is_empty() {
+                    return Err(SubagentError::WorktreeSetup(
+                        "worktree isolation was requested but no worktree was allocated"
+                            .to_string(),
+                    ));
+                }
+                Ok(Self {
+                    source_cwd: source_cwd.to_path_buf(),
+                    allocated: Some(setup),
+                    bounds,
+                })
+            }
+        }
+    }
+
+    /// The directory the child MUST run in: the allocated worktree's `agent_cwd` when isolated,
+    /// the caller's own cwd otherwise (pi's `singleCwd`, `:4134`).
+    #[must_use]
+    pub fn child_cwd(&self) -> &Path {
+        self.allocated
+            .as_ref()
+            .and_then(|setup| setup.worktrees.first())
+            .map_or(self.source_cwd.as_path(), |worktree| {
+                worktree.agent_cwd.as_path()
+            })
+    }
+
+    /// The caller's own cwd — the discovery root, and where artifacts and output stay.
+    #[must_use]
+    pub fn source_cwd(&self) -> &Path {
+        &self.source_cwd
+    }
+
+    /// The allocation, for a caller that needs the branch or the base commit. `None` iff the
+    /// request was [`WorktreeRequest::Shared`].
+    #[must_use]
+    pub fn allocated(&self) -> Option<&WorktreeSetup> {
+        self.allocated.as_ref()
+    }
+
+    /// pi `finalizeSingleWorktreeHandoff` (`:3928-3996`): capture the worktree's diff, publish the
+    /// manifest with every task `preserved`, run cleanup's preserve intent, then publish the same
+    /// group again carrying the removal ledger.
+    ///
+    /// **The two writes must never be collapsed into one.** The first makes the capture durable
+    /// BEFORE any removal is attempted; a crash between them leaves a manifest a later
+    /// `worktree.cleanup` can act on. Collapsing them orphans the worktree with no record.
+    ///
+    /// A failure here is [`ManagedHandoff::Retained`], never a lost worktree: upstream's own
+    /// retention path preserves the tree and the branch and asks for manual reconciliation.
+    pub async fn finalize(
+        &self,
+        binding: &SingleHandoffBinding<'_>,
+        results: &[crate::handoff::HandoffResult],
+    ) -> ManagedHandoff {
+        let Some(setup) = self.allocated.as_ref() else {
+            return ManagedHandoff::NothingToHandOff;
+        };
+        // The finalization turn — pi `withWorktreeTransaction` (`:3940`). Held across diff, both
+        // writes and the removal so a concurrent `worktree.discard` cannot remove a tree this
+        // manifest is about to claim. `create_worktrees` takes the SAME turn.
+        let _turn = worktree_turn().await;
+        let diffs_dir = binding
+            .manifest_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("worktree-diffs-single");
+        let run_cancel = self.bounds.cancel.clone().unwrap_or_default();
+        let harvest = GitBounds::for_harvest(&run_cancel, self.bounds.deadline_at);
+        let agents: Vec<String> = results.iter().map(|result| result.agent.clone()).collect();
+        let diffs = diff_worktrees(setup, &agents, &diffs_dir, &harvest).await;
+
+        // Phase 1 — durable capture BEFORE removal; every task lands `preserved: true`.
+        if let Err(error) = crate::handoff::write_group(crate::handoff::WriteGroup {
+            manifest_path: binding.manifest_path,
+            run_id: binding.run_id,
+            mode: crate::handoff::HandoffMode::Single,
+            source: binding.source,
+            cwd: &self.source_cwd,
+            step_index: 0,
+            flat_start_index: 0,
+            setup,
+            diffs: &diffs,
+            cleanup: None,
+            results,
+            lane_bindings: None,
+            now: crate::time::now_epoch_millis(),
+        })
+        .await
+        {
+            // Nothing was removed, so the child's work is intact — pi's `retain` arm exactly.
+            return ManagedHandoff::Retained(error);
+        }
+
+        let report = cleanup_worktrees(
+            setup,
+            &crate::handoff::WorktreeCleanupIntent::Preserve(crate::handoff::PreserveEvidence {
+                captured_diffs: diffs.clone(),
+                handoff_manifest_path: Some(binding.manifest_path.to_path_buf()),
+            }),
+            &harvest,
+        )
+        .await;
+
+        // Phase 2 — the same group, now carrying the removal ledger.
+        match crate::handoff::write_group(crate::handoff::WriteGroup {
+            manifest_path: binding.manifest_path,
+            run_id: binding.run_id,
+            mode: crate::handoff::HandoffMode::Single,
+            source: binding.source,
+            cwd: &self.source_cwd,
+            step_index: 0,
+            flat_start_index: 0,
+            setup,
+            diffs: &diffs,
+            cleanup: Some(&report),
+            results,
+            lane_bindings: None,
+            now: crate::time::now_epoch_millis(),
+        })
+        .await
+        {
+            Ok(reference) => ManagedHandoff::Published(reference),
+            Err(error) => ManagedHandoff::Retained(error),
+        }
+    }
+}
+
+/// One launch the admission probe must consider, reduced to the four facts it reads — pi
+/// `preflightWorkflowWorktrees`' loop body (`subagent-executor.ts:4949-4959`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AdmissionCall {
+    /// The workflow key this launch is registered under; what the failure sentence names.
+    pub key: String,
+    /// The cwd this child would run its worktree out of.
+    pub source_cwd: PathBuf,
+    /// This child's EFFECTIVE request, already resolved against whatever defaults apply.
+    pub request: WorktreeRequest,
+    /// pi `:4951` — `if (params.resume !== undefined) continue;`. A resumed child's retained id or
+    /// receipt is validated by the workflow BEFORE admission and RESOLVED after it, so the probe
+    /// cannot know which tree it would continue in and does not guess.
+    pub carries_resume: bool,
+}
+
+/// The distinct sources one admission must prove usable, each with the keys that share it — pi's
+/// `sources` map (`:4947-4960`), in first-seen order.
+///
+/// Built by [`WorktreeAdmissionPlan::of`], which is **pure**: the skipping rules (resume, shared
+/// cwd) and the grouping are decided from the calls alone, with no `git` and no repository, so
+/// they are tested directly rather than through a fixture. [`Self::probe`] is the only part that
+/// touches the filesystem.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct WorktreeAdmissionPlan {
+    sources: Vec<(PathBuf, Vec<String>)>,
+}
+
+impl WorktreeAdmissionPlan {
+    /// Project a batch of launches onto the sources that must be probed.
+    ///
+    /// Skips, in pi's own order: a child carrying `resume`, then a child whose effective request
+    /// is [`WorktreeRequest::Shared`]. Everything left is grouped by cwd so one dirty repository
+    /// reports every key that would have used it, in one sentence.
+    #[must_use]
+    pub fn of(calls: &[AdmissionCall]) -> Self {
+        let mut sources: Vec<(PathBuf, Vec<String>)> = Vec::new();
+        for call in calls {
+            if call.carries_resume || !call.request.is_isolated() {
+                continue;
+            }
+            let normalized = normalize_comparable_cwd(&call.source_cwd);
+            match sources
+                .iter_mut()
+                .find(|(cwd, _)| normalize_comparable_cwd(cwd) == normalized)
+            {
+                Some((_, keys)) => keys.push(call.key.clone()),
+                None => sources.push((call.source_cwd.clone(), vec![call.key.clone()])),
+            }
+        }
+        Self { sources }
+    }
+
+    /// Whether this admission has nothing to probe — no child in the batch asked for isolation.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.sources.is_empty()
+    }
+
+    /// The sources to probe, each with the keys that share it, in first-seen order.
+    #[must_use]
+    pub fn sources(&self) -> &[(PathBuf, Vec<String>)] {
+        &self.sources
+    }
+
+    /// Probe every source, read-only, and fail the whole admission on the first unusable one.
+    ///
+    /// pi `:4960-4966`. The probe is deliberately repeated by allocation
+    /// ([`preflight_worktree_source`]'s own doc, pi `:358`): source state can change between
+    /// admission and launch, so this is an admission check and not a substitute for the
+    /// allocation's own.
+    ///
+    /// # Errors
+    ///
+    /// [`WorktreeAdmissionFailure`] carrying [`format_worktree_admission_failure`]'s sentence,
+    /// which is reported VERBATIM and therefore wraps nothing of cyrup's own around it.
+    pub async fn probe(&self, bounds: &GitBounds) -> Result<(), WorktreeAdmissionFailure> {
+        for (cwd, keys) in &self.sources {
+            if let Err(refusal) = preflight_worktree_source(cwd, bounds).await {
+                return Err(WorktreeAdmissionFailure(format_worktree_admission_failure(
+                    keys,
+                    cwd,
+                    &refusal.to_string(),
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A refused admission, holding upstream's whole sentence ready to report with nothing added.
+///
+/// A newtype rather than a bare `String` so the sentence can only come from
+/// [`WorktreeAdmissionPlan::probe`]: the inner field is private, and the only other way to build
+/// the text — [`format_worktree_admission_failure`] — is the function `probe` itself calls. The
+/// point is that an operator-facing instruction ("select the correct cwd or arrange an
+/// operator-approved commit/stash") cannot be half-quoted somewhere else.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorktreeAdmissionFailure(String);
+
+impl WorktreeAdmissionFailure {
+    /// The sentence, for a caller that reports it on a `String`-typed channel.
+    #[must_use]
+    pub fn message(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for WorktreeAdmissionFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// pi's admission wrapper (`subagent-executor.ts:4962`), verbatim: every key that shares the cwd,
+/// quoted and comma-joined, the cwd, the probe's own reason, and the operator instruction.
+#[must_use]
+pub fn format_worktree_admission_failure(keys: &[String], cwd: &Path, reason: &str) -> String {
+    let keys = keys
+        .iter()
+        .map(|key| format!("'{key}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "Worktree admission failed for {keys} at {}: {reason} Select the correct cwd or arrange \
+         an operator-approved commit/stash.",
+        cwd.display()
+    )
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(
@@ -2193,7 +2686,7 @@ mod tests {
 
     /// A real, throwaway git repo with one committed file, a `.gitignore` ignoring `node_modules/`,
     /// and a tracked `tracked.txt` — mirrors pi's worktree.test.ts `createRepo`.
-    fn make_real_git_repo() -> tempfile::TempDir {
+    pub(super) fn make_real_git_repo() -> tempfile::TempDir {
         let dir = tempfile::tempdir().expect("real tempdir");
         let run = |args: &[&str]| {
             let status = StdCommand::new("git")
@@ -2213,7 +2706,7 @@ mod tests {
         dir
     }
 
-    fn git(cwd: &Path, args: &[&str]) -> String {
+    pub(super) fn git(cwd: &Path, args: &[&str]) -> String {
         let out = StdCommand::new("git")
             .current_dir(cwd)
             .args(args)
@@ -3796,6 +4289,282 @@ mod tests {
                 "--force",
                 &replay_path.to_string_lossy(),
             ],
+        );
+    }
+}
+
+/// SUBA-149 — the admission probe, the request/fulfilment split, and the pure admission plan.
+#[cfg(test)]
+mod managed_isolation_tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::panic
+    )]
+
+    use super::tests::make_real_git_repo;
+    use super::*;
+
+    /// A git repository with NO commits at all. `git init` and nothing else.
+    fn make_empty_git_repo() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("real tempdir");
+        for args in [
+            &["init", "-q"][..],
+            &["config", "user.email", "test@example.com"][..],
+            &["config", "user.name", "Worktree Tests"][..],
+        ] {
+            let status = std::process::Command::new("git")
+                .current_dir(dir.path())
+                .args(args)
+                .status()
+                .expect("git spawns");
+            assert!(status.success(), "git {args:?} must succeed");
+        }
+        dir
+    }
+
+    fn call(
+        key: &str,
+        cwd: &Path,
+        request: WorktreeRequest,
+        carries_resume: bool,
+    ) -> AdmissionCall {
+        AdmissionCall {
+            key: key.to_string(),
+            source_cwd: cwd.to_path_buf(),
+            request,
+            carries_resume,
+        }
+    }
+
+    /// The probe's happy path: a clean repository is admitted and its toplevel is what comes back.
+    #[tokio::test]
+    async fn the_probe_admits_a_clean_repository_and_returns_its_toplevel() {
+        let repo = make_real_git_repo();
+        let toplevel = preflight_worktree_source(repo.path(), &GitBounds::unbounded())
+            .await
+            .expect("a clean repo is admissible");
+        assert_eq!(
+            normalize_comparable_cwd(&toplevel),
+            normalize_comparable_cwd(repo.path())
+        );
+    }
+
+    /// pi's clean-tree sentence, verbatim (`runs/shared/worktree.ts:353` @v0.75.0).
+    #[tokio::test]
+    async fn the_probe_refuses_a_dirty_tree_with_upstreams_own_sentence() {
+        let repo = make_real_git_repo();
+        std::fs::write(repo.path().join("tracked.txt"), "uncommitted\n").unwrap();
+        let error = preflight_worktree_source(repo.path(), &GitBounds::unbounded())
+            .await
+            .expect_err("a dirty repo is not admissible");
+        assert_eq!(
+            error.to_string(),
+            "worktree isolation requires a clean git working tree. Commit or stash changes first."
+        );
+    }
+
+    /// pi's non-repository sentence, verbatim (`:346`).
+    #[tokio::test]
+    async fn the_probe_refuses_a_directory_that_is_not_a_repository() {
+        let plain = tempfile::tempdir().unwrap();
+        let error = preflight_worktree_source(plain.path(), &GitBounds::unbounded())
+            .await
+            .expect_err("a non-repo is not admissible");
+        assert_eq!(
+            error.to_string(),
+            "worktree isolation requires a git repository"
+        );
+    }
+
+    /// **The HEAD resolve is genuinely absent**, which is what makes this a probe and not half of
+    /// an allocation. An empty repository has no `HEAD` commit: the probe admits it (the source IS
+    /// usable — a first commit would make allocation work) while `resolve_repo_state`, which adds
+    /// `rev-parse HEAD`, cannot produce a base commit and fails. Collapsing the two would reject
+    /// an admissible source.
+    #[tokio::test]
+    async fn the_probe_needs_no_commit_while_the_full_repo_state_does() {
+        let repo = make_empty_git_repo();
+        preflight_worktree_source(repo.path(), &GitBounds::unbounded())
+            .await
+            .expect("a commitless repo is still an admissible SOURCE");
+        assert!(
+            resolve_repo_state(repo.path(), &GitBounds::unbounded())
+                .await
+                .is_err(),
+            "the full repo state needs a base commit the probe does not"
+        );
+    }
+
+    /// pi `:4951` — `if (params.resume !== undefined) continue;`. A resumed child is skipped
+    /// BEFORE its request is even looked at, so a dirty source cannot fail a batch on its account.
+    #[test]
+    fn the_admission_plan_skips_a_child_carrying_resume() {
+        let cwd = Path::new("/repo");
+        let plan = WorktreeAdmissionPlan::of(&[
+            call("resumed", cwd, WorktreeRequest::Isolated, true),
+            call("fresh", cwd, WorktreeRequest::Isolated, false),
+        ]);
+        assert_eq!(plan.sources().len(), 1);
+        assert_eq!(plan.sources()[0].1, vec!["fresh".to_string()]);
+    }
+
+    /// A child that never asked for isolation is not probed, so a dirty working tree cannot
+    /// invent a failure for it — the exact defect `SUBA-147` was closed for.
+    #[test]
+    fn the_admission_plan_skips_a_child_that_did_not_ask_for_isolation() {
+        let cwd = Path::new("/repo");
+        let plan = WorktreeAdmissionPlan::of(&[
+            call("shared", cwd, WorktreeRequest::Shared, false),
+            call(
+                "also-shared",
+                cwd,
+                WorktreeRequest::from_flag(Some(false)),
+                false,
+            ),
+            call("omitted", cwd, WorktreeRequest::from_flag(None), false),
+        ]);
+        assert!(plan.is_empty(), "{:?}", plan.sources());
+    }
+
+    /// pi `:4956-4959` groups by cwd, and `:4962` names every key that shares it in ONE sentence.
+    #[test]
+    fn the_admission_plan_lists_keys_sharing_a_cwd_together() {
+        let plan = WorktreeAdmissionPlan::of(&[
+            call("a", Path::new("/repo"), WorktreeRequest::Isolated, false),
+            call("b", Path::new("/other"), WorktreeRequest::Isolated, false),
+            call("c", Path::new("/repo"), WorktreeRequest::Isolated, false),
+        ]);
+        assert_eq!(plan.sources().len(), 2);
+        assert_eq!(
+            plan.sources()[0].1,
+            vec!["a".to_string(), "c".to_string()],
+            "first-seen cwd order, with both of its keys"
+        );
+        assert_eq!(
+            format_worktree_admission_failure(
+                &plan.sources()[0].1,
+                Path::new("/repo"),
+                "worktree isolation requires a clean git working tree. Commit or stash changes \
+                 first."
+            ),
+            "Worktree admission failed for 'a', 'c' at /repo: worktree isolation requires a clean \
+             git working tree. Commit or stash changes first. Select the correct cwd or arrange \
+             an operator-approved commit/stash."
+        );
+    }
+
+    /// The probe wrapped in its admission sentence, against a real dirty repository.
+    #[tokio::test]
+    async fn probing_a_dirty_source_reports_the_admission_sentence() {
+        let repo = make_real_git_repo();
+        std::fs::write(repo.path().join("tracked.txt"), "uncommitted\n").unwrap();
+        let plan = WorktreeAdmissionPlan::of(&[call(
+            "step1",
+            repo.path(),
+            WorktreeRequest::Isolated,
+            false,
+        )]);
+        let error = plan
+            .probe(&GitBounds::unbounded())
+            .await
+            .expect_err("a dirty source fails admission");
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "Worktree admission failed for 'step1' at {}: worktree isolation requires a clean \
+                 git working tree. Commit or stash changes first. Select the correct cwd or \
+                 arrange an operator-approved commit/stash.",
+                repo.path().display()
+            )
+        );
+    }
+
+    /// A `Shared` request resolves to the caller's own cwd and allocates nothing.
+    #[tokio::test]
+    async fn a_shared_request_leaves_the_child_in_the_callers_cwd() {
+        let repo = make_real_git_repo();
+        let managed = ManagedLaunch::resolve(
+            WorktreeRequest::Shared,
+            repo.path(),
+            "run-shared",
+            &ManagedLaunchConfig::default(),
+        )
+        .await
+        .expect("a shared launch cannot fail");
+        assert_eq!(managed.child_cwd(), repo.path());
+        assert!(managed.allocated().is_none());
+    }
+
+    /// An `Isolated` request puts the child in a REAL managed worktree of the source repository —
+    /// a different directory, on its own branch, registered with git.
+    #[tokio::test]
+    async fn an_isolated_request_puts_the_child_in_a_managed_worktree() {
+        let repo = make_real_git_repo();
+        let base = tempfile::tempdir().unwrap();
+        let managed = ManagedLaunch::resolve(
+            WorktreeRequest::Isolated,
+            repo.path(),
+            "run-isolated",
+            &ManagedLaunchConfig {
+                base_dir: Some(base.path()),
+                ..ManagedLaunchConfig::default()
+            },
+        )
+        .await
+        .expect("a clean repo allocates");
+        let setup = managed.allocated().expect("the request was fulfilled");
+        assert_eq!(setup.worktrees.len(), 1);
+        assert_ne!(
+            normalize_comparable_cwd(managed.child_cwd()),
+            normalize_comparable_cwd(repo.path()),
+            "the child must NOT run in the shared cwd"
+        );
+        assert!(
+            managed.child_cwd().starts_with(base.path()),
+            "the worktree lands under the configured base dir: {}",
+            managed.child_cwd().display()
+        );
+        assert!(managed.child_cwd().join("tracked.txt").is_file());
+        let listed = super::tests::git(repo.path(), &["worktree", "list", "--porcelain"]);
+        assert!(
+            listed.contains(&setup.worktrees[0].path.to_string_lossy().into_owned()),
+            "git must know about the worktree:\n{listed}"
+        );
+
+        let report = cleanup_worktrees(
+            setup,
+            &crate::handoff::WorktreeCleanupIntent::SetupRollback,
+            &GitBounds::unbounded(),
+        )
+        .await;
+        assert!(
+            report.tasks.iter().all(|task| task.worktree_removed),
+            "{report:?}"
+        );
+    }
+
+    /// A requested isolation that cannot be allocated FAILS the launch. It never degrades to the
+    /// shared cwd, which is the whole of `SUBA-149`'s silent drop.
+    #[tokio::test]
+    async fn a_requested_worktree_that_cannot_be_allocated_fails_the_launch() {
+        let repo = make_real_git_repo();
+        std::fs::write(repo.path().join("tracked.txt"), "uncommitted\n").unwrap();
+        let error = ManagedLaunch::resolve(
+            WorktreeRequest::Isolated,
+            repo.path(),
+            "run-dirty",
+            &ManagedLaunchConfig::default(),
+        )
+        .await
+        .expect_err("a dirty repo cannot fulfil an isolation request");
+        // `SubagentError::WorktreeSetup`'s own `Display` prefix is cyrup's, pre-existing, and
+        // applies to every allocation refusal; the probe's sentence rides inside it unchanged.
+        assert_eq!(
+            error.to_string(),
+            "worktree group aborted: worktree isolation requires a clean git working tree. \
+             Commit or stash changes first."
         );
     }
 }
