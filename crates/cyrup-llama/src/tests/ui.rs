@@ -21,7 +21,7 @@ use std::time::Duration;
 
 use cyrup_ext::host::{
     HostServices, InteractiveOverlay, NotifyKind, OverlayColor, OverlayKey, OverlayKeyCode,
-    OverlayLine, OverlayMouse, OverlayOutcome, ThemeRole,
+    OverlayLine, OverlayMouse, OverlayMouseOutcome, ThemeRole,
 };
 use serde_json::json;
 use tokio::sync::oneshot;
@@ -3507,12 +3507,12 @@ async fn pointer_through_the_overlay_answers_a_confirm_dialog() {
 
     assert_eq!(
         overlay.handle_mouse(mouse_click(1)),
-        OverlayOutcome::Ignored,
+        OverlayMouseOutcome::Unhandled,
         "the title is not a row"
     );
     assert_eq!(
         overlay.handle_mouse(mouse_click(5)),
-        OverlayOutcome::Redraw,
+        OverlayMouseOutcome::Redraw,
         "the No row took the click"
     );
     assert!(!confirm.await, "clicking No answers the confirm with false");

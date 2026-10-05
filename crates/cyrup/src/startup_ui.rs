@@ -28,30 +28,32 @@ use cyrup_session_svc::{
 };
 use cyrup_tui::{
     ListSelector, SelectKeymap, SelectorOutcome, SessionKeymap, SessionRow, SessionSelector,
-    SessionSelectorOutcome, StartupSessionLoads, ThemeController, TrustSelector, UiTheme,
-    run_startup_selector, run_startup_session_selector,
+    SessionSelectorOutcome, StartupSessionLoads, StartupTheme, TrustSelector, run_startup_selector,
+    run_startup_session_selector,
 };
 
 // ---------------------------------------------------------------------------------------------
 // Pre-launch settings-derived inputs — Pi `createStartupTui` (startup-ui.ts:77-85).
 // ---------------------------------------------------------------------------------------------
 
-/// The palette every pre-launch selector renders in — Pi `createStartupTui`'s
-/// `initTheme(resolveThemeSetting(settingsManager.getThemeSetting(), detectTerminalBackgroundFromEnv().theme) ?? terminalTheme)`
-/// (`packages/coding-agent/src/cli/startup-ui.ts:79-80` @v0.83.0, identical at v0.84.1).
+/// The theme every pre-launch selector paints in — Pi `createStartupTui`'s
+/// `initTheme(resolveThemeSetting(settingsManager.getThemeSetting(), getTerminalTheme()) ??
+/// SYSTEM_THEME_NAME)` after `markTerminalColorsPending()` (`cli/startup-ui.ts:77-85` @v1.0.0).
 ///
 /// The settings manager is Pi's own startup one: the file store with the **project scope
 /// untrusted** (`startup-ui.ts:65-67` — trust has not been resolved yet at this point), so a
 /// project `settings.json` cannot re-theme a folder before the user has trusted it.
 ///
-/// SEAM-066. This is the boot half only; the live OSC-11 re-theme
-/// (`applyDetectedStartupTheme`, `startup-ui.ts:92-100`) belongs to whichever selector owns the
-/// terminal, and `ThemeController::boot_from_env` already folds in `COLORFGBG`.
+/// The value is the theme as it stands BEFORE the terminal has been asked anything: the system
+/// theme is grayscale until the colours arrive. Each selector asks the terminal for them as it
+/// mounts (`startStartupTui`'s `queryStartupTerminalColors`, `startup-ui.ts:92-100`) and repaints
+/// when they land, which is why this is a [`StartupTheme`] and not a painted palette — the
+/// selector re-applies it, and the wizard's live theme preview rides the same value.
 ///
 /// SEAM-119 — `use_theme` is `--use-theme`, which pi applies to this very settings manager
 /// (`startupSettingsManager.applyOverrides({ theme })`, `main.ts:666-668` @v0.87.1) before any
 /// startup selector mounts, so the pickers already paint in the one-run theme.
-pub fn startup_theme(dirs: &ConfigDirs, use_theme: Option<&str>) -> UiTheme {
+pub fn startup_theme(dirs: &ConfigDirs, use_theme: Option<&str>) -> StartupTheme {
     let mgr = SettingsManager::load(crate::startup::file_settings_store(dirs), false);
     // CFG-090 — `createStartupTui`'s first line is
     // `setCapabilityOverrides(settingsManager.getTerminalCapabilityOverrides())`
@@ -62,13 +64,7 @@ pub fn startup_theme(dirs: &ConfigDirs, use_theme: Option<&str>) -> UiTheme {
     let setting = use_theme
         .map(str::to_string)
         .or_else(|| mgr.effective().theme_setting());
-    let mut controller = ThemeController::boot_from_env(setting.as_deref());
-    // The pre-launch selectors paint before any terminal query can be answered (raw mode is not on
-    // yet), so the terminal has reported nothing: the system theme is generated for that case —
-    // ANSI indices and the terminal's own defaults, which fit whatever it looks like — rather than
-    // left in the grayscale a pending query implies.
-    let _ = controller.request_terminal_colors(&cyrup_tui::NoTerminalProbe, None);
-    controller.theme()
+    StartupTheme::resolve(setting.as_deref())
 }
 
 /// The user's `<agent_dir>/keybindings.json`, merged into the two keymaps the pre-launch selectors
@@ -240,7 +236,7 @@ pub fn interpret_resume(outcome: &SelectorOutcome) -> ResumeChoice {
 /// `cyrup_tui::SessionSelector` has no status channel, so they are returned here and printed by the
 /// caller after the alternate screen is torn down. The channel itself is area 07's file.
 pub async fn run_resume_picker(
-    theme: &UiTheme,
+    theme: &StartupTheme,
     keymaps: &(SelectKeymap, SessionKeymap),
     current: SessionListing,
     all: SessionListing,
@@ -440,7 +436,7 @@ async fn persist_trust_choice(
 /// (`Some(true/false)` ⇒ feed as the run's `trust_override`; `None` ⇒ cancelled, proceed untrusted).
 /// TTY-only; the persistence branch it runs is unit-tested through [`persist_trust_choice`].
 pub async fn run_trust_prompt(
-    theme: &UiTheme,
+    theme: &StartupTheme,
     keymap: &SelectKeymap,
     cwd: &std::path::Path,
     options: &[TrustOption],
@@ -512,7 +508,7 @@ pub fn interpret_missing_cwd(outcome: &SelectorOutcome) -> MissingCwdChoice {
 /// [`ListSelector`] titled with `prompt_body`, drive it to a confirm/cancel, and return the choice.
 /// TTY-only; not unit-tested (the pure mapper [`interpret_missing_cwd`] is).
 pub async fn run_missing_cwd_prompt(
-    theme: &UiTheme,
+    theme: &StartupTheme,
     keymap: &SelectKeymap,
     prompt_body: &str,
     fallback_cwd: &std::path::Path,

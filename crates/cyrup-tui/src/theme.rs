@@ -8,6 +8,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use cyrup_resources::ColorValue;
 use cyrup_resources::theme::{Appearance, ColorSpec, ResolvedTheme, ThemeData, builtin_themes};
 use ratatui::style::{Color, Modifier, Style};
 
@@ -1392,25 +1393,10 @@ impl From<Appearance> for TerminalTheme {
 /// or `fg;xpm;bg` (rxvt), where a field is an ANSI colour index or `default` when the colour is not
 /// in the palette. The index refers to the terminal's own palette, whose colours are unknown here,
 /// so it is classified by index like Vim does: 0-6 and 8 (bright black, e.g. Solarized Dark's
-/// background) are dark, 7 and 9-15 are light.
+/// background) are dark, 7 and 9-15 are light. The classification itself is
+/// [`Appearance::from_colorfgbg`], which a headless HTML export shares.
 pub fn detect_color_fg_bg_theme(colorfgbg: &str) -> Option<TerminalTheme> {
-    let background = colorfgbg.split(';').next_back()?.trim();
-    // `/^\d{1,2}$/`
-    if background.is_empty()
-        || background.len() > 2
-        || !background.bytes().all(|b| b.is_ascii_digit())
-    {
-        return None;
-    }
-    let index: u8 = background.parse().ok()?;
-    if index > 15 {
-        return None;
-    }
-    Some(if index <= 6 || index == 8 {
-        TerminalTheme::Dark
-    } else {
-        TerminalTheme::Light
-    })
+    Appearance::from_colorfgbg(colorfgbg).map(TerminalTheme::from)
 }
 
 /// Pi `detectTerminalTheme` (`theme.ts:702-710`): whether the terminal is dark or light. The
@@ -1492,6 +1478,22 @@ pub enum ThemeApply {
 /// The sentence a failed theme load ends with — pi's `applyThemeName` (`theme-controller.ts:183`).
 pub const THEME_FALLBACK_SENTENCE: &str = "Fell back to the system theme.";
 
+/// The theme state other threads read: an extension asking for the `system` theme, and an export
+/// of the session. Computed from the controller when its [`ThemeController::generation`] moves and
+/// published to [`crate::theme_access::TuiThemeAccess`], which is read off the run loop.
+#[derive(Clone, Debug)]
+pub(crate) struct ThemePublication {
+    /// The controller generation this was computed for.
+    pub(crate) generation: u64,
+    /// The generated `system` theme as a theme document: hex colours, palette indices and `""`, the
+    /// shape a file theme has.
+    pub(crate) system_document: ThemeData,
+    /// The `system` theme as an HTML export renders it: every token concrete.
+    pub(crate) system_export: cyrup_session_svc::ExportTheme,
+    /// The terminal's reported defaults, for exporting a theme that sets tokens to `""`.
+    pub(crate) terminal_defaults: cyrup_session_svc::TerminalDefaults,
+}
+
 /// The boot + live-switch owner of the render theme (Pi `InteractiveThemeController`,
 /// `theme-controller.ts` @v1.0.0). It resolves the theme from `settings.theme` — `system` when the
 /// setting names nothing that resolves — carries the [`ColorMode`] so every projected [`UiTheme`] is
@@ -1521,6 +1523,9 @@ pub struct ThemeController {
     /// Pi's controller field `terminalColors` (`theme-controller.ts:65`): the last REPORTED colours,
     /// kept when a later query times out instead of being erased. `None` until the first apply.
     reported: Option<TerminalColors>,
+    /// Pi's `terminalColorScheme` (`theme.ts:194`): the terminal's last light/dark report (mode
+    /// `2031`), consulted only while it has not reported a background.
+    reported_scheme: Option<TerminalTheme>,
     active_name: String,
     generation: u64,
     /// The raw `settings.theme` value, retained so [`Self::apply_from_settings`] can re-resolve it.
@@ -1555,6 +1560,7 @@ impl ThemeController {
             // once the terminal reports its colors" (`theme-controller.ts:87-88`).
             colors_pending: true,
             reported: None,
+            reported_scheme: None,
             active_name: String::new(),
             generation: 0,
             theme_setting: theme_setting.map(str::to_string),
@@ -1633,7 +1639,7 @@ impl ThemeController {
     /// Whether the terminal is dark or light, from everything it reported so far (Pi
     /// `getTerminalTheme`, `theme.ts:713-715`).
     pub fn terminal_theme(&self) -> TerminalTheme {
-        detect_terminal_theme(&self.terminal_colors, None, self.env_theme)
+        detect_terminal_theme(&self.terminal_colors, self.reported_scheme, self.env_theme)
     }
 
     /// The colours the terminal last reported (Pi `terminalColors`, `theme.ts:190`).
@@ -1729,21 +1735,49 @@ impl ThemeController {
     /// terminal colour-scheme notifications (mode `2031`) enabled and re-theme on every change
     /// (`setAutoSync`, `theme-controller.ts:225-229`).
     ///
-    /// cyrup arms the flag but does not enable mode `2031`, so nothing subscribes: crossterm
-    /// surfaced no event for the unsolicited `CSI ? 997 ; N n` notification, and every push the
-    /// terminal sent was mis-decoded as stray keystrokes into the user's prompt. The byte reader now
-    /// frames and swallows it (`crate::input::decode`), but nothing consumes it either, so turning
-    /// the notifications on would buy nothing yet. A live appearance change reaches the system
-    /// theme only through [`Self::apply_terminal_colors`].
+    /// The app mirrors the flag onto the terminal ([`crate::color_scheme`]) whenever it can have
+    /// changed, and a report that arrives while it is set re-themes through
+    /// [`Self::apply_color_scheme`].
     pub fn auto_sync(&self) -> bool {
         self.auto_sync
     }
 
-    /// The `system` theme generated from what the terminal reported so far — grayscale while
-    /// [`Self::terminal_colors_pending`] (Pi `createSystemTheme`, `theme.ts:611-623`).
-    pub fn system_theme(&self) -> UiTheme {
+    /// Pi `applyTerminalColorSchemeChange` (`theme-controller.ts:240-248`): the terminal reported a
+    /// light/dark switch. Ignored unless the theme follows the terminal ([`Self::auto_sync`]).
+    /// Otherwise the report is recorded, and when it moved the terminal's appearance the setting is
+    /// re-applied — the result is the name of the theme to (re)load, as for
+    /// [`Self::apply_terminal_colors`]. The caller then queries the terminal's colours again, which
+    /// decide the appearance when it reports a background; the scheme only matters for terminals
+    /// that do not.
+    pub fn apply_color_scheme(&mut self, scheme: TerminalTheme) -> Option<String> {
+        if !self.auto_sync {
+            return None;
+        }
+        let previous = self.terminal_theme();
+        self.reported_scheme = Some(scheme);
+        if self.terminal_theme() == previous {
+            return None;
+        }
+        // `reapplyForTerminal` (`:217-223`): the system theme regenerates, a pair switches.
+        let name = self.resolve_theme_name();
+        if name != SYSTEM_THEME_NAME && name == self.active_name {
+            return None;
+        }
+        self.set_theme_name(name.clone());
+        Some(name)
+    }
+
+    /// The terminal's last light/dark report (test/inspection).
+    pub fn reported_scheme(&self) -> Option<TerminalTheme> {
+        self.reported_scheme
+    }
+
+    /// What the system theme is generated from: the terminal's reported colours, full colour once
+    /// they have arrived (grayscale until then), and the appearance to assume when it reported no
+    /// background (Pi `createSystemTheme`, `theme.ts:611-623`).
+    fn system_input(&self) -> SystemThemeInput {
         let colors = self.terminal_colors;
-        UiTheme::system(&SystemThemeInput {
+        SystemThemeInput {
             foreground: colors.foreground,
             background: colors.background,
             palette: colors.palette,
@@ -1753,10 +1787,66 @@ impl ThemeController {
                 Saturation::FULL
             },
             appearance_hint: Some(self.terminal_theme().into()),
-        })
-        .with_terminal_appearance(self.terminal_theme().into())
-        .with_color_mode(self.color_mode)
-        .with_generation(self.generation)
+        }
+    }
+
+    /// The `system` theme generated from what the terminal reported so far — grayscale while
+    /// [`Self::terminal_colors_pending`] (Pi `createSystemTheme`, `theme.ts:611-623`).
+    pub fn system_theme(&self) -> UiTheme {
+        UiTheme::system(&self.system_input())
+            .with_terminal_appearance(self.terminal_theme().into())
+            .with_color_mode(self.color_mode)
+            .with_generation(self.generation)
+    }
+
+    /// The generation the render caches key on; it moves whenever the active theme is re-applied or
+    /// the terminal's colours change.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// What an extension and an HTML export are told about the theme right now — see
+    /// [`ThemePublication`]. Built from the same inputs as [`Self::system_theme`].
+    pub(crate) fn publication(&self) -> ThemePublication {
+        let generated = generate_system_theme_colors(&self.system_input());
+        let terminal: Appearance = self.terminal_theme().into();
+        let colors = self.terminal_colors;
+        let css = |rgb: cyrup_resources::color::Rgb| {
+            cyrup_session_svc::CssColor::from_rgb(rgb.r, rgb.g, rgb.b)
+        };
+        let document = ThemeData {
+            name: SYSTEM_THEME_NAME.to_string(),
+            appearance: generated.appearance,
+            vars: BTreeMap::new(),
+            colors: generated
+                .colors
+                .iter()
+                .map(|(token, color)| {
+                    let value = match color {
+                        SystemColor::Rgb(rgb) => ColorValue::Text(rgb.hex()),
+                        SystemColor::Indexed(index) => ColorValue::Index(*index),
+                        SystemColor::Default => ColorValue::Text(String::new()),
+                    };
+                    ((*token).to_string(), value)
+                })
+                .collect(),
+            export: BTreeMap::new(),
+        };
+        ThemePublication {
+            generation: self.generation,
+            system_document: document,
+            system_export: cyrup_session_svc::ExportTheme::from_system(
+                &generated,
+                colors.foreground,
+                colors.background,
+                terminal,
+            ),
+            terminal_defaults: cyrup_session_svc::TerminalDefaults {
+                foreground: colors.foreground.map(css),
+                background: colors.background.map(css),
+                appearance: terminal,
+            },
+        }
     }
 
     /// The projected render theme for the active name: `system` generated from the terminal's
@@ -1780,6 +1870,13 @@ impl ThemeController {
                 .with_generation(self.generation),
             None => self.system_theme(),
         }
+    }
+
+    /// Pi `getThemeSelection()` (`theme-controller.ts:117-119`): the setting in force — the in-memory
+    /// one, else the one settings carried, else the theme that is painted. What `/settings` shows
+    /// for the Theme row and opens the theme submenu on.
+    pub fn theme_selection(&self) -> &str {
+        self.effective_setting().unwrap_or(&self.active_name)
     }
 
     /// The active theme name (test/inspection).
@@ -1925,13 +2022,21 @@ impl<'a> UiThemeRoles<'a> {
         if style.add_modifier.contains(Modifier::DIM) {
             open.push_str("\u{1B}[2m");
         }
-        if let Some(Color::Rgb(r, g, b)) = style.fg {
-            open.push_str(&format!("\u{1B}[38;2;{r};{g};{b}m"));
-        } else if let Some(c) = style.fg {
-            // A named/indexed colour is resolved to its RGB so the single `38;2` form is the only
-            // one `sgr_line` has to understand.
-            let (r, g, b) = named_color_rgb(c);
-            open.push_str(&format!("\u{1B}[38;2;{r};{g};{b}m"));
+        match style.fg {
+            None => {}
+            Some(Color::Rgb(r, g, b)) => open.push_str(&format!("\u{1B}[38;2;{r};{g};{b}m")),
+            // A role the theme sets to `""` is the terminal's own default foreground, which pi
+            // draws with `\x1b[39m` (`Theme.addToken`, `theme.ts:290-294` @v1.0.0). Resolving it to
+            // a colour here painted it black.
+            Some(Color::Reset) => open.push_str("\u{1B}[39m"),
+            // A palette index stays an index, so 0-15 keep following the user's terminal palette
+            // (`foregroundAnsi` for an indexed colour is `38;5;N`).
+            Some(Color::Indexed(index)) => open.push_str(&format!("\u{1B}[38;5;{index}m")),
+            // The sixteen ANSI names are resolved to RGB: `sgr_line` has no name form to read back.
+            Some(named) => {
+                let (r, g, b) = named_color_rgb(named);
+                open.push_str(&format!("\u{1B}[38;2;{r};{g};{b}m"));
+            }
         }
         if open.is_empty() {
             return text.to_string();

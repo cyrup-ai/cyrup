@@ -251,6 +251,55 @@ impl Input {
         }
     }
 
+    /// A pointer event on the row this field is painted in (`Input.handleMouse`, `input.ts:229-
+    /// 243`): only a **press** acts, so the click that completes the gesture leaves the caret where
+    /// the press put it. The caret goes to the START of the grapheme whose cells contain the
+    /// pointer, or to the end of the value when the pointer is past it. Answers whether the event
+    /// was the field's.
+    ///
+    /// `row` is the slot row the field is painted on, `prompt_cols` the columns painted before the
+    /// value (pi's two-column `"> "`; [`crate::selector::INPUT_PROMPT`]) and `row_width` the full
+    /// width the row was painted at. The scrolled window is recomputed from those with the shared
+    /// [`crate::selector::input_first_column`], the function the paint calls, so the column a
+    /// press resolves against is the column that was drawn there.
+    pub(crate) fn pointer_in_row(
+        &mut self,
+        event: crate::app::Pointer,
+        row: u16,
+        prompt_cols: u16,
+        row_width: u16,
+    ) -> bool {
+        let crate::app::Pointer::Press { at } = event else {
+            return false;
+        };
+        if at.y != row {
+            return false;
+        }
+        let available = usize::from(row_width.saturating_sub(prompt_cols));
+        let first_col = crate::selector::input_first_column(&self.value, self.cursor, available);
+        self.press_at(usize::from(at.x), usize::from(prompt_cols), first_col);
+        true
+    }
+
+    /// The caret placement of [`Self::pointer_in_row`]: `column` is the cell inside the row,
+    /// `prompt_cols` the cells the prompt takes, `first_col` the value column the field's left
+    /// edge showed when it was painted. A press on the prompt lands on that first visible column
+    /// (`max(0, x - 2)`). Always a cursor movement, so it ends an undo-coalescing run.
+    fn press_at(&mut self, column: usize, prompt_cols: usize, first_col: usize) {
+        self.last_action = LastAction::None;
+        let target = first_col + column.saturating_sub(prompt_cols);
+        let mut passed = 0;
+        for (offset, grapheme) in self.value.grapheme_indices(true) {
+            let next = passed + crate::text_width::str_width(grapheme);
+            if target < next {
+                self.cursor = offset;
+                return;
+            }
+            passed = next;
+        }
+        self.cursor = self.value.len();
+    }
+
     /// `handlePaste` (`input.ts:362-372`): one undo snapshot, then the text with `\r`/`\n` stripped
     /// and every tab expanded to four spaces, inserted at the caret.
     pub fn paste(&mut self, text: &str) {
@@ -686,6 +735,27 @@ impl Selector for TextInputSelector {
             hint,
         );
         frame.render_widget(border_rule(bottom.width, theme), bottom);
+    }
+
+    /// `ExtensionInputComponent` adds its `Input` as a bare container child
+    /// (`extension-input.ts:63-64`), so a press on the field's row places the caret
+    /// (`input.ts:229-243`) and nothing else in the dialog takes the pointer. The row is the fifth
+    /// of the stack [`Self::render`] carves, from the same heights.
+    fn pointer(&mut self, area: Rect, event: crate::app::Pointer) -> SelectorOutcome {
+        let title_h = title_wrapped_height(&self.title, area.width);
+        let local = Rect::new(0, 0, area.width, area.height);
+        let [_, _, _, _, body, _, _, _, _] = stack_rows(local, [1, 1, title_h, 1, 1, 1, 1, 1, 1]);
+        if body.height > 0
+            && self.input.pointer_in_row(
+                event,
+                body.y,
+                crate::selector::INPUT_PROMPT_COLS,
+                body.width,
+            )
+        {
+            return SelectorOutcome::Redraw;
+        }
+        SelectorOutcome::Ignored
     }
 
     fn handle(&mut self, key: &KeyEvent, keymap: &SelectKeymap) -> SelectorOutcome {

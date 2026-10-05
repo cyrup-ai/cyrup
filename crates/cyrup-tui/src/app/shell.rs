@@ -1,5 +1,16 @@
 use super::*;
 
+/// How many times a colour re-query was asked for in this process — the seam a test reads to see
+/// that a colour-scheme report made the app query the terminal (no real terminal answers there).
+#[cfg(test)]
+static REQUERIES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// [`REQUERIES`], for the tests.
+#[cfg(test)]
+pub(crate) fn requery_count_for_test() -> usize {
+    REQUERIES.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 impl<B: Backend> App<B> {
     /// Build an app over `backend` using a **content-sized inline viewport** (R-ARCH-TUI-003,
     /// ADR-0001 #1): the live region holds only the active turn + status band + editor/selector +
@@ -391,7 +402,9 @@ impl<B: Backend> App<B> {
     /// the channel [`Self::set_terminal_colors_channel`] installed. A no-op off a real terminal
     /// and when no channel was installed.
     #[cfg(unix)]
-    fn requery_terminal_colors(&self) {
+    pub(crate) fn requery_terminal_colors(&self) {
+        #[cfg(test)]
+        REQUERIES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if let Some(tx) = self.terminal_colors_tx.clone() {
             crate::terminal_query::request_terminal_colors_async(
                 crate::write_log::tui_stdout(),
@@ -404,7 +417,7 @@ impl<B: Backend> App<B> {
 
     /// Windows has no byte reader to route a reply through, so there is nothing to ask.
     #[cfg(not(unix))]
-    fn requery_terminal_colors(&self) {}
+    pub(crate) fn requery_terminal_colors(&self) {}
 
     /// Re-check the git refs and republish the branch when it moved — Pi's watch-driven
     /// `refreshGitBranchAsync` → `notifyBranchChange` (`footer-data-provider.ts`), driven here by
@@ -638,15 +651,56 @@ impl<B: Backend> App<B> {
         self.state.theme = theme;
     }
 
-    /// The theme a picker preview or confirm paints for `name` — the controller's, when there is
-    /// one, because `system` is generated from the colours the terminal reported and only the
-    /// controller holds them (Pi's `themeController.preview(name)` → `setTheme(name)` reads the
-    /// same module state). Without a controller (a harness app) there are no reported colours, and
-    /// the compiled-in answer stands.
-    pub(crate) fn theme_for_picker(&self, name: &str) -> UiTheme {
+    /// The theme a picker preview or confirm paints for `setting` — pi's `themeController.preview`
+    /// (`theme-controller.ts:134-141`): `resolveThemeSetting(setting, getTerminalTheme()) ??
+    /// activeThemeName`, so a `light/dark` pair previews the half the terminal's appearance picks.
+    /// The name then loads as the controller loads it — `system` generated from the colours the
+    /// terminal reported, which only the controller holds; a discovered theme from its document;
+    /// else a compiled-in one. Without a controller (a harness app) there are no reported colours,
+    /// and the compiled-in answer stands.
+    pub(crate) fn theme_for_picker(&self, setting: &str) -> UiTheme {
+        let controller = self.state.theme_controller.as_ref();
+        let terminal = controller.map_or(crate::TerminalTheme::Dark, |c| c.terminal_theme());
+        let name =
+            crate::theme::resolve_theme_setting(Some(setting), terminal).unwrap_or_else(|| {
+                controller.map_or_else(
+                    || self.state.theme.name.clone(),
+                    |c| c.active_name().to_string(),
+                )
+            });
+        if name != crate::system_theme::SYSTEM_THEME_NAME
+            && let Some(data) = self
+                .state
+                .theme_access
+                .as_ref()
+                .and_then(|access| access.document(&name))
+        {
+            return UiTheme::from_theme_data(&data, 0).with_terminal_appearance(terminal.into());
+        }
+        match controller {
+            Some(controller) => controller.theme_named(&name),
+            None => UiTheme::builtin(&name),
+        }
+    }
+
+    /// Pi `getThemeSelection() || SYSTEM_THEME_NAME` (`interactive-mode.ts:4847`): the theme setting
+    /// in force, which the Theme row shows and the theme submenu opens on.
+    pub(crate) fn theme_selection(&self) -> String {
         match self.state.theme_controller.as_ref() {
-            Some(controller) => controller.theme_named(name),
-            None => UiTheme::builtin(name),
+            Some(controller) => controller.theme_selection().to_string(),
+            None => self.state.theme.name.clone(),
+        }
+    }
+
+    /// Pi `getAvailableThemes()` (`interactive-mode.ts:4849`): the names the theme picker offers.
+    pub(crate) fn available_theme_names(&self) -> Vec<String> {
+        match self.state.theme_access.as_ref() {
+            Some(access) => access.available_names(),
+            None => vec![
+                crate::system_theme::SYSTEM_THEME_NAME.to_string(),
+                "dark".to_string(),
+                "light".to_string(),
+            ],
         }
     }
 
@@ -757,7 +811,9 @@ impl<B: Backend> App<B> {
                 crate::theme::THEME_FALLBACK_SENTENCE
             ));
         }
-        // `applyFromSettings` ends by asking the terminal for its colours again
+        // `applyFromSettings` opens with `setAutoSync(…)` (`theme-controller.ts:104-106`).
+        self.sync_color_scheme_notifications();
+        // …and ends by asking the terminal for its colours again
         // (`theme-controller.ts:108`), so a terminal theme the user switched since boot reaches the
         // system theme and the `""` tokens.
         if requery_colors {
@@ -820,6 +876,70 @@ impl<B: Backend> App<B> {
         // (`showError` is false on this path): the system theme is painted and seated.
         let theme = loaded.unwrap_or_else(|| controller.fall_back_to_system());
         self.set_theme(theme);
+    }
+
+    /// Paint the theme an extension's `setTheme` resolved to and say which name to persist.
+    ///
+    /// The generated `system` theme is not in the resources: it is built from the colours the
+    /// controller holds (`setThemeName("system")`, `theme-controller.ts:124-131`), which also seats
+    /// it as the active name. A discovered theme is projected from its document.
+    pub(crate) fn apply_theme_switch(
+        &mut self,
+        switch: crate::theme_access::ThemeSwitch,
+    ) -> String {
+        let (name, projected) = match switch {
+            crate::theme_access::ThemeSwitch::System => {
+                let name = crate::system_theme::SYSTEM_THEME_NAME.to_string();
+                let projected = match self.state.theme_controller.as_mut() {
+                    Some(controller) => controller.set_theme_name(name.clone()),
+                    None => UiTheme::builtin(&name),
+                };
+                (name, projected)
+            }
+            crate::theme_access::ThemeSwitch::Resource(theme) => {
+                // `from_theme_data`, not `UiTheme::builtin`: the listing this name came from is
+                // the session's whole discovered set, so a file-backed custom theme is
+                // switchable exactly as upstream's is, and would otherwise silently render as
+                // `dark` (`UiTheme::builtin`'s unknown-name fallback).
+                let projected = UiTheme::from_theme_data(&theme.data, 0);
+                (theme.key.as_str().to_string(), projected)
+            }
+        };
+        self.set_theme(projected);
+        name
+    }
+
+    /// Pi `setAutoSync` (`theme-controller.ts:225-229`): ask the terminal for appearance-change
+    /// notifications (mode `2031`) exactly while the theme follows the terminal — an automatic
+    /// `light/dark` pair or the system theme. A no-op without a controller (a harness `App`).
+    pub(crate) fn sync_color_scheme_notifications(&self) {
+        if let Some(controller) = self.state.theme_controller.as_ref() {
+            crate::color_scheme::set_notifications(controller.auto_sync());
+        }
+    }
+
+    /// The terminal reported a light/dark switch (`CSI ? 997 ; N n`) — pi's
+    /// `applyTerminalColorSchemeChange` (`theme-controller.ts:240-248`): record the scheme, re-theme
+    /// when it moved the terminal's appearance, then query the terminal's colours again; they
+    /// decide the appearance for a terminal that reports its background, and regenerate the system
+    /// theme from the new palette when they arrive.
+    pub fn apply_color_scheme_report(
+        &mut self,
+        scheme: crate::TerminalTheme,
+        resources: &cyrup_resources::ResourceRegistry,
+    ) {
+        let Some(controller) = self.state.theme_controller.as_mut() else {
+            return;
+        };
+        if !controller.auto_sync() {
+            return;
+        }
+        if let Some(name) = controller.apply_color_scheme(scheme) {
+            let loaded = Self::load_theme_named(controller, resources, &name);
+            let theme = loaded.unwrap_or_else(|| controller.fall_back_to_system());
+            self.set_theme(theme);
+        }
+        self.requery_terminal_colors();
     }
 
     /// The boot [`ThemeController`] the composition root handed over, if any (test/inspection).

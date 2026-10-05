@@ -233,6 +233,16 @@ impl TranscriptView {
         self.prune_expansion();
     }
 
+    /// Start this view's document where a view it replaces left off: `previous_dropped` is that
+    /// view's [`Self::retained_dropped`] after [`Self::clear_document`] had emptied it.
+    ///
+    /// A new session gets a new [`TranscriptView`], but a renderer holding the old one's rows keeps
+    /// reconciling against the counter, which is documented as monotonic. Restarting it at zero
+    /// would let a document of the same length as the one it replaced pass for it unchanged.
+    pub(crate) fn continue_document_epoch(&mut self, previous_dropped: u64) {
+        self.retained_dropped = previous_dropped;
+    }
+
     /// `this.chatContainer.children.length > 0` (`interactive-mode.ts:3500`).
     ///
     /// cyrup's analogue of the chat container is the whole entry stream: everything ever committed —

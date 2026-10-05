@@ -16,6 +16,20 @@ impl<B: Backend> App<B> {
         });
     }
 
+    /// Pi's `ThemeSubmenu` (`settings-selector.ts:752-754`) as the `/settings` Theme row opens it:
+    /// `currentTheme` is the theme SETTING in force (`getThemeSelection()`), `terminalTheme`
+    /// decides which half of a pair is active, `availableThemes` is `getAvailableThemes()`.
+    fn theme_submenu(&self) -> Box<dyn Selector> {
+        Box::new(crate::theme_selector::ThemeSelector::new(
+            &self.theme_selection(),
+            self.state
+                .theme_controller
+                .as_ref()
+                .map_or(crate::TerminalTheme::Dark, |c| c.terminal_theme()),
+            self.available_theme_names(),
+        ))
+    }
+
     /// Build (but do not mount) the dependency-free list selector for `kind`, plus the theme to
     /// restore if it is cancelled. Split out of [`Self::open_selector`] so the same construction
     /// serves both the top-level open and the `/settings` submenu open
@@ -55,10 +69,17 @@ impl<B: Backend> App<B> {
                 ),
                 None,
             ),
+            // The standalone theme list (`ThemeSelectorComponent`, `theme-selector.ts:13-62`): every
+            // available theme, the current one marked. pi v1.0.0 mounts it nowhere —
+            // `/settings` reaches theme switching through `ThemeSubmenu`, which
+            // [`Self::theme_submenu`] builds — but the component is still part of its API.
             SelectorKind::Theme => (
                 Box::new(
-                    ListSelector::theme(&self.state.theme.name)
-                        .with_upstream_chrome(kind, &self.state.select_keymap),
+                    ListSelector::theme_among(
+                        &self.state.theme.name,
+                        &self.available_theme_names(),
+                    )
+                    .with_upstream_chrome(kind, &self.state.select_keymap),
                 ),
                 Some(self.state.theme.clone()),
             ),
@@ -648,8 +669,12 @@ impl<B: Backend> App<B> {
                         // live preview and lands back on the settings list — pi's
                         // `ThemeSubmenu.cancel()`, which restores `originalThemeSetting` and then
                         // calls `onDone()` with no value (`settings-selector.ts:283-330`).
-                        let (inner, restore_theme) = self.build_list_selector(SelectorKind::Theme);
-                        self.open_child_selector(SelectorKind::Theme, inner, restore_theme);
+                        let inner = self.theme_submenu();
+                        self.open_child_selector(
+                            SelectorKind::Theme,
+                            inner,
+                            Some(self.state.theme.clone()),
+                        );
                     }
                     // TUI-032 — `thinking` opens the picker cyrup already had and could not reach:
                     // Pi's `SelectSubmenu("Thinking Level", …, config.availableThinkingLevels, …,
@@ -758,6 +783,12 @@ impl<B: Backend> App<B> {
             SelectorKind::Theme => {
                 let theme = self.theme_for_picker(value);
                 self.set_theme(theme);
+                // Pi's `onThemeChange` ends in `themeController.applyFromSettings()`
+                // (`interactive-mode.ts:4943-4946`), which asks the terminal for its colours again
+                // (`theme-controller.ts:108`) — so a terminal theme the user switched since boot
+                // reaches the system theme. The persist arm records the setting and re-arms the
+                // appearance notifications.
+                self.requery_terminal_colors();
                 Some(AppCommand::ApplySetting {
                     id: "theme".to_string(),
                     value: value.to_string(),

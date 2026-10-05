@@ -31,8 +31,8 @@ use crate::error::TuiError;
 use crate::keymap::SelectKeymap;
 use crate::selector::{Selector, SelectorOutcome};
 use crate::session_selector::SessionSelector;
-use crate::startup_loop::{LoadDriver, StartupEvents, StartupLoop, StartupSessionLoads};
-use crate::theme::UiTheme;
+use crate::startup_loop::{LoadDriver, Retheme, StartupEvents, StartupLoop, StartupSessionLoads};
+use crate::startup_theme::StartupTheme;
 use crate::write_log::tui_stdout;
 
 /// Restore the terminal on EVERY exit from [`run_startup_selector`] — the two setup errors, the
@@ -74,7 +74,7 @@ impl Drop for StartupTerminalRestore {
 /// selector frames and decodes keys exactly as the app will a moment later; elsewhere it is
 /// crossterm's `event::poll` + `event::read()`.
 pub async fn run_startup_selector(
-    theme: &UiTheme,
+    theme: &StartupTheme,
     keymap: &SelectKeymap,
     inner: &mut dyn Selector,
     on_apply: impl AsyncFnMut(&str),
@@ -96,7 +96,7 @@ pub async fn run_startup_selector(
 /// to cwd): the caller has no finished scan to look the picked session's missing-cwd issue up in
 /// (`main.ts:321-332`).
 pub async fn run_startup_session_selector(
-    theme: &UiTheme,
+    theme: &StartupTheme,
     keymap: &SelectKeymap,
     picker: &mut SessionSelector,
     loads: StartupSessionLoads,
@@ -113,7 +113,7 @@ pub async fn run_startup_session_selector(
 }
 
 async fn run_on_terminal(
-    theme: &UiTheme,
+    theme: &StartupTheme,
     keymap: &SelectKeymap,
     inner: &mut dyn Selector,
     loads: Option<LoadDriver>,
@@ -132,10 +132,20 @@ async fn run_on_terminal(
         .map_err(|e| TuiError::Backend(e.to_string()))?;
 
     let mut input = Input::open()?;
+    // pi `startStartupTui`: `ui.start()`, then at once `queryStartupTerminalColors` — asked, not
+    // waited for. The reader just opened routes the terminal's reply to the query; the loop
+    // re-applies the theme when it lands.
+    let (colors_tx, colors_rx) = tokio::sync::mpsc::unbounded_channel();
+    ask_for_colors(colors_tx);
     StartupLoop {
         terminal: &mut terminal,
         events: &mut input,
-        theme,
+        theme: theme.theme(),
+        retheme: Some(Retheme::new(
+            theme.clone(),
+            colors_rx,
+            std::time::Instant::now(),
+        )),
         keymap,
         inner,
         loads,
@@ -143,6 +153,23 @@ async fn run_on_terminal(
     .run(on_apply)
     .await
 }
+
+/// Ask the terminal for its colours and return at once; the answer — whenever it comes — is sent on
+/// `tx`. Asked of the terminal in raw mode with the reader running, which is what routes the reply.
+#[cfg(unix)]
+fn ask_for_colors(tx: tokio::sync::mpsc::UnboundedSender<crate::terminal_query::TerminalColors>) {
+    crate::terminal_query::request_terminal_colors_async(
+        tui_stdout(),
+        std::sync::Arc::new(move |colors| {
+            let _ = tx.send(colors);
+        }),
+    );
+}
+
+/// Windows has no byte reader to route a reply through, so there is nothing to ask: the wait for
+/// colours times out and the system theme settles on what the environment says.
+#[cfg(not(unix))]
+fn ask_for_colors(_tx: tokio::sync::mpsc::UnboundedSender<crate::terminal_query::TerminalColors>) {}
 
 /// The selector's key source.
 #[cfg(unix)]

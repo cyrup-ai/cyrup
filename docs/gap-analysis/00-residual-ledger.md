@@ -5,6 +5,31 @@ next work item**.
 
 ---
 
+# UPDATE 2026-10-05 (fullscreen shortfalls) — three rows closed, thirteen filed and closed on arrival, two filed open (`claude/fullscreen-shortfalls`)
+
+> **This block sits above the 2026-10-04 blocks and moves their counts.** The count is whatever
+> `python3 docs/gap-analysis/scripts/count_open_items.py` prints: **155 open: 0 critical, 0 high, 9 medium,
+> 146 low; 17 trackers; 891 closed; 1 duplicate not counted** (before: 156 open, 147 low, 875 closed).
+> Arithmetic: open 156 − 3 closed (`TUI-147`, `TUI-148`, `TUI-149`) + 2 filed open (`TUI-163`, `TUI-164`) = 155;
+> low 147 − 3 + 2 = 146; medium unchanged at 9; closed 875 + 3 + 13 filed-and-closed (`TUI-150`…`TUI-162`) = 891.
+>
+> * **Closed.** `TUI-147` (text selection reaches the dock and overlays), `TUI-148` (the header scrolls with the
+>   document), `TUI-149` (the `system` theme on every surface that names a theme: extension API, first-run wizard,
+>   pre-launch selectors, HTML export, colour-scheme reports, the `/settings` sub-menu).
+> * **Defects found while doing it, each a row, each fixed in the same change.** `TUI-150` a markdown link lost its
+>   URL on a hyperlink-capable terminal (and bare URLs were prose); `TUI-151` a fullscreen session went blank at its
+>   first `/new` or `/resume`; `TUI-152` `quietStartup` was a boolean (pi's is `true | false | "header"`);
+>   `TUI-153` the `/settings` label column was 30, pi's is 36; `TUI-154` the `Model scope:` startup line was never
+>   printed; `TUI-155` an overlay swallowed pointer input its component did not handle; `TUI-156` clearing a
+>   selection reset the click ladder; `TUI-157` a headless HTML export used a fixed dark palette instead of pi's tier-3
+>   system theme; `TUI-158` a selector search box ignored a click; `TUI-159` accepting a completion left no undo
+>   snapshot; `TUI-160` committed thinking ignored the hide toggle in fullscreen; `TUI-161` an extension's theme roles
+>   painted the terminal default as black; `TUI-162` the inline renderer ignored `quietStartup: true`.
+> * **Filed open.** `TUI-163` (Windows never requests colour-scheme reports; crossterm has no event for them),
+>   `TUI-164` (the startup logo click animation, which needs `TUI-018`'s logo). Next free id `TUI-165`.
+
+---
+
 # UPDATE 2026-10-04 (subagent mediums) — two mediums closed, both fail-open or unreachable rather than unwritten
 
 > Two `medium` rows in `cyrup-ext-subagents`, one lane each, read against the pin
@@ -194,6 +219,8 @@ next work item**.
 > **`TUI-107` remains the only open row above medium**, and `ADR-0005`'s amendment states why closing
 > it matters: it is what makes the fullscreen default defensible on its own terms rather than on
 > parity alone.
+
+---
 
 # UPDATE 2026-10-04 — eighteen rows closed (seven counted here, ten in area 13), three re-rated, none filed
 

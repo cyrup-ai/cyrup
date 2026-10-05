@@ -105,6 +105,14 @@ impl ListSelector {
         selector
     }
 
+    /// Emit [`SelectorOutcome::Preview`] as the highlight moves — pi's first-run wizard calls
+    /// `onThemePreview` whenever the theme index changes (`first-time-setup.ts:127-130`).
+    #[must_use]
+    pub fn with_preview(mut self) -> Self {
+        self.preview = true;
+        self
+    }
+
     /// **Opt in** to the keyboard-hint row, binding it to the app's live `tui.select.*` table so it
     /// names the keys the user has actually bound rather than the stock defaults (`keyHint`
     /// resolves through `keyText` on every render upstream, `keybinding-hints.ts:34-44`).
@@ -237,14 +245,22 @@ impl ListSelector {
     /// (`getAvailableThemesWithPaths`, `theme.ts:494-497` @v1.0.0) — and carries pi's description
     /// "Theme created from your terminal's colors" (`settings-selector.ts:212`).
     pub fn theme(current: &str) -> Self {
+        let names: Vec<String> = std::iter::once(SYSTEM_THEME_NAME.to_string())
+            .chain(
+                builtin_themes()
+                    .into_iter()
+                    .map(|theme| theme.key.as_str().to_string()),
+            )
+            .collect();
+        ListSelector::theme_among(current, &names)
+    }
+
+    /// [`Self::theme`] over the names the session offers (`getAvailableThemes()`), which include
+    /// the user's own and extension-registered themes.
+    pub fn theme_among(current: &str, names: &[String]) -> Self {
         let mut rows = Vec::new();
         let mut selected = 0usize;
-        let names = std::iter::once(SYSTEM_THEME_NAME.to_string()).chain(
-            builtin_themes()
-                .into_iter()
-                .map(|theme| theme.key.as_str().to_string()),
-        );
-        for (i, key) in names.enumerate() {
+        for (i, key) in names.iter().cloned().enumerate() {
             let is_current = key == current;
             if is_current {
                 selected = i;

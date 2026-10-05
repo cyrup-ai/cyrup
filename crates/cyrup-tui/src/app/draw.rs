@@ -49,7 +49,52 @@ fn image_opts<'a>(
         // cycled mid-session must reach both the inline flush and the alternate screen through the
         // one shared builder.
         mermaid: state.transcript.mermaid_mode(),
+        // The inline flush draws a committed reasoning run as it committed: the rows go into the
+        // terminal's scrollback and are the terminal's from then on. The retained document the
+        // alternate screen repaints sets the live flag itself (`altscreen::document`).
+        thinking: crate::transcript::ThinkingHiding::AsCommitted,
     }
+}
+
+/// The rows pi's `headerContainer` contributes to the document (`interactive-mode.ts:622-628`
+/// @v1.0.0), fitted to the content `width`. They are the first rows of the fullscreen document, so
+/// they scroll away with the conversation; the inline renderer, which has no scrolled document,
+/// paints the same two things in bands of its own ([`render_impl::paint_header`],
+/// [`render_impl::paint_startup_hints`]).
+///
+/// Pi builds the header once and keeps it for the session. With the built-in header enabled
+/// ([`StartupHeader`], pi's `shouldShowStartupHeader`) it is `[Spacer(1), builtInHeader,
+/// Spacer(1)]` (`:1061-1065`), and `setExtensionHeader` swaps a custom header in for the
+/// `builtInHeader` child only (`:2515-2531`), so an extension's header keeps the spacers around it.
+/// With the built-in header disabled (`quietStartup`) the container holds just an empty `Text`
+/// (`:1067-1068`), which a custom header replaces: no spacers.
+///
+/// The startup block's own framing blanks are part of the block ([`chrome::compact_hint_lines`]).
+fn document_header(state: &AppState, width: usize) -> Vec<Line<'static>> {
+    let builtin = state.startup_header.is_shown();
+    let lines: Vec<Line<'static>> = match state.extension_header.as_deref() {
+        Some(content) => {
+            let mut lines: Vec<Line<'static>> = content
+                .lines()
+                .map(|l| Line::from(Span::styled(l.to_string(), state.theme.base_style())))
+                .collect();
+            if builtin {
+                lines.insert(0, Line::default());
+                lines.push(Line::default());
+            }
+            lines
+        }
+        None if builtin => crate::chrome::compact_hint_lines(
+            &state.theme,
+            &state.keymap,
+            u16::try_from(width).unwrap_or(u16::MAX),
+            state.startup_header.details(),
+        ),
+        None => Vec::new(),
+    };
+    // One `Line` is one display row in the document, so a row wider than the viewport is reflowed
+    // here rather than truncated by the painter.
+    crate::transcript::wrap_all_owned(lines, width.max(1))
 }
 
 impl<B: Backend> App<B> {
@@ -251,34 +296,62 @@ impl<B: Backend> App<B> {
         // Dropped, not rendered: with retention on the same entries are already in
         // `TranscriptView::document`, which is what `sync_document` walks below.
         drop(self.state.transcript.drain_committed());
-        // Destructured for the disjoint borrows: `sync_document` reads the transcript and the theme
-        // while the renderer it hands them to is mutably borrowed out of the same `self` — the
-        // shape `app/draw.rs:89` and `altscreen/mod.rs`'s rule 1 both already use.
+        {
+            // Destructured for the disjoint borrows, as everywhere the renderer and the state are
+            // used together (`altscreen/mod.rs`'s rule 1).
+            let App {
+                altscreen, state, ..
+            } = self;
+            let Some(alt) = altscreen.as_mut() else {
+                return Ok(());
+            };
+            // Publish the SCREEN geometry before anything measures, as the inline path does: the
+            // editor caps itself at `max(5, floor(terminalRows * 0.3))` and a windowed selector
+            // sizes against the terminal, not against the rows the dock happens to be given.
+            let screen = alt.area();
+            state.term_rows = screen.height;
+            state.term_cols = screen.width;
+            state.editor.set_terminal_height(screen.height);
+            if let Some(active) = state.selector.as_mut() {
+                active.inner.set_terminal_height(screen.height);
+            }
+        }
+        self.sync_fullscreen_document();
         let App {
             altscreen, state, ..
         } = self;
         let Some(alt) = altscreen.as_mut() else {
             return Ok(());
         };
-        // Publish the SCREEN geometry before anything measures, as the inline path does: the editor
-        // caps itself at `max(5, floor(terminalRows * 0.3))` and a windowed selector sizes against
-        // the terminal, not against the rows the dock happens to be given.
-        let screen = alt.area();
-        state.term_rows = screen.height;
-        state.term_cols = screen.width;
-        state.editor.set_terminal_height(screen.height);
-        if let Some(active) = state.selector.as_mut() {
-            active.inner.set_terminal_height(screen.height);
-        }
+        alt.draw_with(&mut FullscreenChrome { state })
+    }
+
+    /// Bring the alternate screen's retained document up to date with the transcript, the header
+    /// and the in-flight turn — [`crate::AltScreen::sync_document`] with everything it takes read
+    /// off [`AppState`].
+    ///
+    /// Called by every frame, and by the input path right after it changes what the document is
+    /// made of (a click that toggles an entry), so that the very next hit test is made against the
+    /// document the user is about to see rather than the one they just changed. It costs a rebuild
+    /// only when [`crate::AltScreen::sync_document`]'s key moved, so the frame that follows finds
+    /// nothing left to do.
+    pub(crate) fn sync_fullscreen_document(&mut self) {
+        let App {
+            altscreen, state, ..
+        } = self;
+        let Some(alt) = altscreen.as_mut() else {
+            return;
+        };
         let width = usize::from(alt.content_width());
+        let header = document_header(state, width);
         let live = state.transcript.live_rows(width, &state.theme);
         alt.sync_document(
             &state.transcript,
             &state.theme,
             image_opts(state, None),
+            &header,
             &live,
         );
-        alt.draw_with(&mut FullscreenChrome { state })
     }
 
     /// Rebuild the terminal with a new inline-viewport `height` over a fresh handle to the same
@@ -387,7 +460,8 @@ struct FullscreenChrome<'a> {
 
 impl crate::altscreen::Chrome for FullscreenChrome<'_> {
     fn layout(&mut self, screen: Rect) -> Rect {
-        let regions = Regions::compute(self.state, screen);
+        // The header is the first rows of the scrolled document here, not a band above it.
+        let regions = Regions::compute_with(self.state, screen, HeaderPlacement::InDocument);
         self.state.regions = regions;
         regions.msg
     }
@@ -412,12 +486,8 @@ impl crate::altscreen::Chrome for FullscreenChrome<'_> {
 
     fn paint(&mut self, frame: &mut Frame) {
         let regions = self.state.regions;
-        render_impl::paint_header(frame, self.state, &regions);
-        // The startup hints sit in the otherwise-empty message region; once the document has
-        // anything in it the document owns those rows.
-        if self.state.transcript.document().is_empty() {
-            render_impl::paint_startup_hints(frame, self.state, regions.msg);
-        }
+        // Neither the extension header nor the startup hints are painted here: both are rows of
+        // the scrolled document ([`document_header`]), drawn by the renderer with the rest of it.
         render_impl::paint_dock_without_images(frame, self.state, &regions);
         let screen = frame.area();
         render_impl::paint_overlays(frame, self.state, screen);

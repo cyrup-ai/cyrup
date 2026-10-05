@@ -57,6 +57,9 @@ pub struct SubmenuSelector {
     input: Option<Input>,
     /// The `maxVisible` cap, `Math.min(options.length, 10)` (`:93`).
     max_visible: usize,
+    /// `onSelectionChange` (`settings-submenu.ts:44`, `:100-102`): a move emits
+    /// [`SelectorOutcome::Preview`] with the value now highlighted.
+    preview: bool,
 }
 
 impl SubmenuSelector {
@@ -79,6 +82,7 @@ impl SubmenuSelector {
             description,
             input: if searchable { Some(Input::new()) } else { None },
             max_visible: 10,
+            preview: false,
         };
         sel.rebuild();
         sel.list.set_selected(selected);
@@ -132,6 +136,21 @@ impl SubmenuSelector {
     /// The highlighted value, or `None` when the query matched nothing.
     fn current_value(&self) -> Option<String> {
         self.values.get(self.list.selected()).cloned()
+    }
+
+    /// Emit [`SelectorOutcome::Preview`] as the highlight moves — pi's `onSelectionChange` argument.
+    #[must_use]
+    pub fn with_preview(mut self) -> Self {
+        self.preview = true;
+        self
+    }
+
+    /// The answer to a move: the preview of the value now under the highlight, or a plain redraw.
+    fn moved(&self) -> SelectorOutcome {
+        match (self.preview, self.current_value()) {
+            (true, Some(value)) => SelectorOutcome::Preview(value),
+            _ => SelectorOutcome::Redraw,
+        }
     }
 
     /// Read-only access to the inner list (tests / chrome inspection).
@@ -211,11 +230,23 @@ impl Selector for SubmenuSelector {
 
     fn pointer(&mut self, area: Rect, event: crate::app::Pointer) -> SelectorOutcome {
         let top = self.first_list_row(area.width);
+        // The search `Input` (`settings-submenu.ts:70-74`, a bare container child) is the row above
+        // the blank that closes the head: a press there places its caret.
+        if let Some(input) = self.input.as_mut()
+            && input.pointer_in_row(
+                event,
+                top.saturating_sub(2),
+                crate::selector::INPUT_PROMPT_COLS,
+                area.width,
+            )
+        {
+            return SelectorOutcome::Redraw;
+        }
         let available = area.height.saturating_sub(top);
         let answer = list_pointer(&mut self.list, top, available, event);
         list_outcome(
             answer,
-            || SelectorOutcome::Redraw,
+            || self.moved(),
             || match self.current_value() {
                 Some(value) => SelectorOutcome::Confirm(value),
                 None => SelectorOutcome::Redraw,
@@ -229,11 +260,11 @@ impl Selector for SubmenuSelector {
         match keymap.action_for(key) {
             Some(SelectAction::Up) | Some(SelectAction::PageUp) => {
                 self.list.select_up();
-                SelectorOutcome::Redraw
+                self.moved()
             }
             Some(SelectAction::Down) | Some(SelectAction::PageDown) => {
                 self.list.select_down();
-                SelectorOutcome::Redraw
+                self.moved()
             }
             Some(SelectAction::Confirm) => match self.current_value() {
                 Some(value) => SelectorOutcome::Confirm(value),

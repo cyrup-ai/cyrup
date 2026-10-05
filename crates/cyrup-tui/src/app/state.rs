@@ -12,6 +12,64 @@ pub enum SwapCaption {
     Receipt(String),
 }
 
+/// Whether the built-in startup header is part of the conversation view — pi's
+/// `shouldShowStartupHeader()` (`interactive-mode.ts:1410-1412` @v1.0.0): `verbose ||
+/// quietStartup !== true`, decided once when the interface starts — together with whether the
+/// startup details travel with it (`shouldShowStartupDetails()`, `:1415-1417`: `verbose ||
+/// quietStartup === false`), which `quietStartup: "header"` splits from the header.
+///
+/// This is the fullscreen document's header: pi puts it at the top of `documentContainer` for the
+/// whole session, where it scrolls away with the conversation, and a first submission does not
+/// dismiss it. [`AppState::show_startup_hints`] is the inline renderer's separate, dismissable
+/// band and is not this.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum StartupHeader {
+    /// Not yet decided (before the session's settings are read): shown, pi's default.
+    #[default]
+    Pending,
+    /// Decided: shown, with the startup details.
+    Shown,
+    /// Decided: shown, without the details — `quietStartup` is `"header"` and `--verbose` is not.
+    HeaderOnly,
+    /// Decided: `quietStartup` is `true` and `--verbose` is not.
+    Hidden,
+}
+
+impl StartupHeader {
+    /// The two decisions `shouldShowStartupHeader` and `shouldShowStartupDetails` make.
+    pub const fn decide(
+        verbose: bool,
+        quiet_startup: cyrup_config::settings::QuietStartup,
+    ) -> Self {
+        if !quiet_startup.shows_header(verbose) {
+            Self::Hidden
+        } else if quiet_startup.shows_details(verbose) {
+            Self::Shown
+        } else {
+            Self::HeaderOnly
+        }
+    }
+
+    /// Whether the header is part of the view.
+    pub const fn is_shown(self) -> bool {
+        !matches!(self, Self::Hidden)
+    }
+
+    /// What the header's onboarding line says about the startup details. Pending is pi's default
+    /// (`quietStartup: false`): the details are there.
+    pub const fn details(self) -> crate::chrome::StartupDetails {
+        match self {
+            Self::HeaderOnly => crate::chrome::StartupDetails::Hidden,
+            _ => crate::chrome::StartupDetails::Shown,
+        }
+    }
+
+    /// Whether the decision has been made.
+    pub const fn is_decided(self) -> bool {
+        !matches!(self, Self::Pending)
+    }
+}
+
 /// All retained UI state (the data half of the `state -> frame` split).
 pub struct AppState {
     pub transcript: TranscriptView,
@@ -171,6 +229,10 @@ pub struct AppState {
     /// interactive-mode.ts:697-703): a one-line `interrupt · clear/exit · / commands · ! bash · more`
     /// affordance bar rendered just above the editor at startup, dismissed on the first submission.
     pub show_startup_hints: bool,
+    /// Whether the fullscreen document opens with the built-in startup header, for the whole
+    /// session ([`StartupHeader`]). Decided from the settings once, by
+    /// [`App::push_session_loaded_resources`], the way pi decides it once in `init()`.
+    pub startup_header: StartupHeader,
     /// A `DynamicBorder` loader occupying the editor slot during a long inline op (Pi
     /// `BorderedLoader`, bordered-loader.ts): `/share`'s gist creation and any extension-UI long op.
     /// When `Some`, it replaces the editor in the live region (the selector still wins if both are set,
@@ -560,6 +622,7 @@ impl AppState {
             pointer: super::PointerState::default(),
             overlay_pointer: super::OverlayPointerState::default(),
             show_startup_hints: true,
+            startup_header: StartupHeader::Pending,
             loader: None,
             loader_tick: 0,
             share_in_flight: None,

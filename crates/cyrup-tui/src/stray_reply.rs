@@ -65,6 +65,10 @@
 //! to filter. It is already neutralised in practice because `terminal_query` appends a Primary
 //! Device Attributes request to every colour batch, whose reply's final `c` flushes crossterm's
 //! buffer and is itself dropped by crossterm's own `EventFilter`.
+//!
+//! That is also why the appearance notifications (mode `2031`, [`crate::color_scheme`]) are never
+//! requested on a platform that reads the console through crossterm: an UNSOLICITED report has no
+//! such flush to ride, and would sit in crossterm's buffer in front of the next key.
 
 use ratatui::crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 

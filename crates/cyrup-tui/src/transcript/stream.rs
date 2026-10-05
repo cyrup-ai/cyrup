@@ -125,7 +125,8 @@ impl TranscriptView {
     /// the accumulated buffer commits. Whitespace-only reasoning commits nothing, exactly as Pi
     /// skips a run whose trimmed blocks are all empty (`assistant-message.ts:128-130`).
     ///
-    /// The `hideThinkingBlock` choice is frozen into the entry here — see [`Entry::Thinking`].
+    /// The `hideThinkingBlock` choice is recorded in the entry here — see [`Entry::Thinking`] for
+    /// which renderer honours it.
     pub fn commit_thinking(&mut self, text: Option<String>) {
         self.bump_render_generation();
         let final_text = text.or_else(|| self.thinking.take());
@@ -144,9 +145,12 @@ impl TranscriptView {
         }
     }
 
-    /// Set `hideThinkingBlock` live (Pi `setHideThinkingBlock`, assistant-message.ts:57-62). Affects
-    /// the live reasoning block and every entry committed afterwards; already-flushed scrollback is
-    /// immutable (see [`Entry::Thinking`]).
+    /// Set `hideThinkingBlock` live (Pi `setHideThinkingBlock`, assistant-message.ts:57-62).
+    ///
+    /// Affects the live reasoning block and every entry committed afterwards, and — under the
+    /// fullscreen renderer, whose retained document is repainted from its entries — every committed
+    /// run too. Inline scrollback already flushed is the terminal's and immutable (see
+    /// [`Entry::Thinking`]).
     pub fn set_hide_thinking_block(&mut self, hide: bool) {
         self.bump_render_generation();
         self.hide_thinking = hide;

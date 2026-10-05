@@ -430,7 +430,11 @@ impl<B: RebuildBackend> App<B> {
                 // (`interactive-mode.ts:857`) because its regular renderer re-renders the shared chat
                 // container; cyrup's committed entries have already left the app for the terminal, so
                 // the repaint is the only thing that carries them across.
-                self.stop_fullscreen(false);
+                self.stop_fullscreen_to_inline();
+                // The regular TUI starts (`nextUi.start()`, `interactive-mode.ts:919`) and the
+                // controller re-binds it (`rebindTui()`, `:920`): the mode the alternate screen's
+                // teardown took down goes back up.
+                crate::color_scheme::terminal_started(&mut crate::write_log::tui_stdout());
                 self.restore_main_screen_render_state(saved);
                 true
             }
@@ -552,10 +556,44 @@ impl<B: RebuildBackend> App<B> {
     /// `fullscreenExitOutput` setting (CFG-078) — pi's own split between printing the transcript and
     /// printing only the resume hint (`interactive-mode.ts:836-842` @v0.84.4).
     pub(crate) fn stop_fullscreen(&mut self, preserve_screen: bool) -> bool {
+        self.stop_fullscreen_keeping(preserve_screen, false)
+    }
+
+    /// [`Self::stop_fullscreen`] for the live switch back to the inline renderer — pi's
+    /// `switchTuiMode` re-renders the shared containers, header included, on the incoming
+    /// renderer, so the header is on screen once.
+    ///
+    /// Here that means: an extension's header stays the inline renderer's band, so its rows are
+    /// left out of the repaint; the built-in startup block is written into scrollback with the rest
+    /// of the document and the inline renderer's own copy of it (the hint band) is retired, as it
+    /// is by a first submission.
+    pub(crate) fn stop_fullscreen_to_inline(&mut self) -> bool {
+        let custom_header = self.state.extension_header.is_some();
+        let startup_block = !custom_header && self.state.startup_header.is_shown();
+        if !self.stop_fullscreen_keeping(false, custom_header) {
+            return false;
+        }
+        if startup_block {
+            self.state.show_startup_hints = false;
+        }
+        true
+    }
+
+    /// The shared body: `header_stays_inline` leaves the header rows out of the repaint.
+    fn stop_fullscreen_keeping(
+        &mut self,
+        preserve_screen: bool,
+        header_stays_inline: bool,
+    ) -> bool {
         let Some(mut alt) = self.altscreen.take() else {
             return false;
         };
-        alt.stop(preserve_screen);
+        let skip = if header_stays_inline {
+            alt.header_rows()
+        } else {
+            0
+        };
+        alt.stop_skipping(preserve_screen, skip);
         alt.restore_images(&mut self.state.transcript, &self.state.image_renderer);
         drop(alt);
         // The pair that keeps the §B-1 flag's "set once" rule honest across a second excursion —

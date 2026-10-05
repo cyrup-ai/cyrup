@@ -78,6 +78,8 @@ mod session_list;
 mod settings_rows;
 mod share;
 mod shell;
+#[cfg(test)]
+pub(crate) use shell::requery_count_for_test;
 mod state;
 mod submit;
 /// UW-7 — the raw-terminal-input seam's host side: pi's `TUI.handleInput` listener fold.
@@ -131,10 +133,10 @@ pub use outcome::{
     CompactOutcome, CompactionQueued, ExtensionWidget, LifecycleEffects, LifecycleOutcome,
     LoginProviderSource, QueueDrain, QueueDrainReason, TreeNavMsg,
 };
-pub(crate) use overlay_pointer::OverlayPointerState;
+pub(crate) use overlay_pointer::{OverlayClick, OverlayPointerState, OverlayRoute};
 pub use pointer::Pointer;
-pub(crate) use pointer::PointerState;
-pub(crate) use regions::Regions;
+pub(crate) use pointer::{PointerReply, PointerState};
+pub(crate) use regions::{HeaderPlacement, Regions};
 pub use render_debug::RenderDebug;
 pub(crate) use settings_rows::PROJECT_UNTRUSTED_WARNING;
 pub(crate) use settings_rows::{
@@ -157,7 +159,7 @@ pub use render_impl::render;
 pub(crate) use render_impl::{env_rows, fallback_columns, is_extension_command};
 pub(crate) use session_list::spawn_session_load;
 pub use session_list::{SessionListMsg, SessionListUpdate};
-pub use state::{ActiveSelector, AppState, ShortcutSpec, SwapCaption};
+pub use state::{ActiveSelector, AppState, ShortcutSpec, StartupHeader, SwapCaption};
 pub(crate) use state::{
     BRANCH_SUMMARY_CUSTOM, BRANCH_SUMMARY_NONE, BRANCH_SUMMARY_YES, CONFIRM_YES, PendingImport,
     PendingTreeNav, PendingUiReply, countdown_title, default_ui_reply,

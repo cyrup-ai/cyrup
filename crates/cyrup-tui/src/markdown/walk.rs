@@ -26,6 +26,9 @@ impl<'t> MdRenderer<'t> {
             default_text: None,
             default_italic: false,
             hyperlinks: false,
+            sink: None,
+            link_mark: None,
+            image: 0,
             mermaid: MermaidContext::OFF,
             math: Vec::new(),
             strike_literal: Vec::new(),
@@ -62,6 +65,11 @@ impl<'t> MdRenderer<'t> {
         } else {
             self.theme.assistant_style()
         };
+        // The link's own marker goes on last, so it survives whichever branch chose the base: a
+        // link inside a heading takes the heading's colours but is still a link.
+        if let Some(mark) = self.link_mark.filter(|_| self.link.is_some()) {
+            s = s.patch(mark);
+        }
         if self.bold > 0 {
             s = s.add_modifier(Modifier::BOLD);
         }
@@ -302,6 +310,44 @@ impl<'t> MdRenderer<'t> {
         } else {
             let style = self.inline_style();
             self.push_text(text, style);
+        }
+    }
+
+    /// Whether bare URLs in a text run are links here: marked tries its `url` tokenizer everywhere
+    /// except inside a link (`!this.state.inLink`), a code span or fence, and an image's alt text.
+    pub(super) fn autolinks_apply(&self) -> bool {
+        self.code_lang.is_none() && self.link.is_none() && self.image == 0
+    }
+
+    /// A text run with GFM autolinks in it ([`autolink::find`]): each one is rendered through the
+    /// same `Tag::Link` arms an explicit `[text](url)` goes through, so it is underlined in
+    /// `mdLink`, tagged for OSC-8 on a capable terminal and given its ` (url)` suffix on an
+    /// incapable one exactly as pi's `link` token is (`markdown.ts:699-713`).
+    pub(super) fn text_with_autolinks(&mut self, text: &str) {
+        let mut at = 0usize;
+        for link in autolink::find(text) {
+            if let Some(plain) = text.get(at..link.start).filter(|t| !t.is_empty()) {
+                let style = self.inline_style();
+                self.emit_with_math(plain, style);
+            }
+            self.start(
+                Tag::Link {
+                    link_type: pulldown_cmark::LinkType::Autolink,
+                    dest_url: link.href.into(),
+                    title: "".into(),
+                    id: "".into(),
+                },
+                "",
+            );
+            let shown = text.get(link.start..link.end).unwrap_or("");
+            let style = self.inline_style();
+            self.emit_with_math(shown, style);
+            self.end(TagEnd::Link);
+            at = link.end;
+        }
+        if let Some(tail) = text.get(at..).filter(|t| !t.is_empty()) {
+            let style = self.inline_style();
+            self.emit_with_math(tail, style);
         }
     }
 
@@ -547,9 +593,16 @@ impl<'t> MdRenderer<'t> {
                 }
             }
             Tag::Link { dest_url, .. } => {
+                // `hyperlink(styledLink, token.href)` (`markdown.ts:705`): on a capable terminal the
+                // link text is the clickable part, so its spans are tagged for `osc::inject`.
+                self.link_mark = match self.sink {
+                    Some(sink) if self.hyperlinks => Some(sink.mark(dest_url.to_string())),
+                    _ => None,
+                };
                 self.link = Some(dest_url.to_string());
                 self.link_text.clear();
             }
+            Tag::Image { .. } => self.image += 1,
             Tag::Table(_) => {
                 self.flush_line();
                 // `token.raw` — the fallback body when the pane is too narrow for the grid
@@ -655,6 +708,7 @@ impl<'t> MdRenderer<'t> {
                 Some(true) => self.emit_literal("~"),
                 _ => self.strike = self.strike.saturating_sub(1),
             },
+            TagEnd::Image => self.image = self.image.saturating_sub(1),
             TagEnd::Link => {
                 if let Some(href) = self.link.take() {
                     let text = std::mem::take(&mut self.link_text);
@@ -672,6 +726,8 @@ impl<'t> MdRenderer<'t> {
                     // misses a link whose text is the FULL `mailto:` href — `[mailto:a@b](mailto:a@b)`
                     // — which upstream treats as self-describing and cyrup would have followed with
                     // a redundant ` (mailto:a@b)`.
+                    // Cleared before the suffix is pushed, which is not part of the link.
+                    self.link_mark = None;
                     if !self.hyperlinks && text != href && text != stripped {
                         let style = self.theme.md_link_url_style();
                         self.push_text(&format!(" ({href})"), style);

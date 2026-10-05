@@ -10,8 +10,8 @@ use super::layer::Settings;
 use super::types::{
     BranchSummarySettings, CacheWarmingMode, CompactionSettings, DefaultProjectTrust,
     FullscreenExitOutput, FullscreenScrollbar, MermaidRenderingMode, PackageSource,
-    ProviderRetrySettings, RetrySettings, TerminalCapabilityOverrides, TerminalImagesOverride,
-    ThinkingBudgets, TuiMode, Warnings, WheelScrollLines,
+    ProviderRetrySettings, QuietStartup, RetrySettings, TerminalCapabilityOverrides,
+    TerminalImagesOverride, ThinkingBudgets, TuiMode, Warnings, WheelScrollLines,
 };
 use crate::error::ConfigError;
 
@@ -467,9 +467,11 @@ impl EffectiveSettings {
             })
     }
 
-    /// `quietStartup` (default false; :873-875).
-    pub fn quiet_startup(&self) -> bool {
-        self.merged.get_bool("quietStartup").unwrap_or(false)
+    /// `quietStartup` (Pi `getQuietStartup`, settings-manager.ts:1089-1092 @v1.0.0): `true`,
+    /// `"header"` or — for an absent key, `false` and every other value or type — `false`. The
+    /// value on disk is left verbatim; only this read normalises it.
+    pub fn quiet_startup(&self) -> QuietStartup {
+        QuietStartup::from_value(self.merged.get("quietStartup"))
     }
 
     /// `enableSkillCommands` (default true; :1033-1035).

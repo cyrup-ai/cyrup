@@ -38,10 +38,23 @@ use cyrup_resources::{ResourceRegistry, Theme};
 use serde_json::{Value, json};
 use tokio::sync::mpsc::UnboundedSender;
 
+use crate::system_theme::SYSTEM_THEME_NAME;
+use crate::theme::{ColorMode, TerminalTheme, ThemeController, ThemePublication};
+
+/// What a validated `TuiThemeAccess::set` asks the run loop to switch to: a theme from the
+/// session's discovered resources, or the generated `system` theme, which is not one of them.
+#[derive(Clone, Debug)]
+pub enum ThemeSwitch {
+    /// The `system` theme (`SYSTEM_THEME_NAME`), generated from the terminal's own colours.
+    System,
+    /// A discovered theme document.
+    Resource(Theme),
+}
+
 /// The channel a validated `TuiThemeAccess::set` hands the resolved theme to `App::run` on. The
 /// run loop applies it live and persists it, mirroring the `/settings → theme` confirm path — pi's
 /// `setThemeName` + `settingsManager.setTheme` pair (`interactive-mode.ts:2406-2417`).
-pub type ThemeSwitchSink = UnboundedSender<Theme>;
+pub type ThemeSwitchSink = UnboundedSender<ThemeSwitch>;
 
 /// [`cyrup_session_svc::ThemeAccess`] over the live TUI: the session's discovered themes, the
 /// app's active theme name, and a switch channel back into the run loop. See the module docs.
@@ -57,6 +70,9 @@ pub struct TuiThemeAccess {
     /// of `AppState` because this is read from an extension's own task while the run loop owns
     /// `&mut self`.
     active: Mutex<String>,
+    /// What the controller last published about the generated `system` theme and the terminal's
+    /// default colours, republished by the app when the controller's generation moves.
+    published: Mutex<ThemePublication>,
     switch: ThemeSwitchSink,
 }
 
@@ -66,8 +82,53 @@ impl TuiThemeAccess {
         Self {
             resources,
             active: Mutex::new(active.to_string()),
+            // Until the app publishes its controller's state (a harness app has none), the system
+            // theme is the one a terminal that reported nothing gets.
+            published: Mutex::new(
+                ThemeController::boot(None, ColorMode::TrueColor, TerminalTheme::Dark)
+                    .publication(),
+            ),
             switch,
         }
+    }
+
+    /// Republish the generated `system` theme and the terminal's defaults when `controller` has
+    /// moved on since the last call (the app, once per frame; a generation compare when idle).
+    pub(crate) fn publish_theme(&self, controller: &ThemeController) {
+        let mut held = self.published.lock().unwrap_or_else(|e| e.into_inner());
+        if held.generation != controller.generation() {
+            *held = controller.publication();
+        }
+    }
+
+    /// Pi `getAvailableThemes()` (`theme.ts:458-460`): the names the theme picker offers — the
+    /// generated system theme first, then every discovered theme by name.
+    pub(crate) fn available_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .resources
+            .themes
+            .winners()
+            .map(|t| t.key.as_str().to_string())
+            .filter(|name| name != SYSTEM_THEME_NAME)
+            .collect();
+        names.sort();
+        names.insert(0, SYSTEM_THEME_NAME.to_string());
+        names
+    }
+
+    /// The discovered theme document called `name`, if any — what a custom theme previews from.
+    pub(crate) fn document(&self, name: &str) -> Option<cyrup_resources::theme::ThemeData> {
+        self.resources
+            .themes
+            .get_name(name)
+            .map(|theme| theme.data.clone())
+    }
+
+    fn publication(&self) -> ThemePublication {
+        self.published
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// Republish the active theme name (the app, once per frame).
@@ -115,10 +176,13 @@ impl cyrup_session_svc::ThemeAccess for TuiThemeAccess {
     /// and it is the contract `HostServices::theme_list` and the SDK's `Ctx::theme_list` already
     /// document (EXT-021): `path` null ⇒ built-in.
     fn list(&self) -> Value {
+        // pi lists the generated system theme first, with no file (`theme.ts:479-480`), and a
+        // custom theme of the same name is dropped as a duplicate (`seen`).
         let mut rows: Vec<(String, Option<String>)> = self
             .resources
             .themes
             .winners()
+            .filter(|t| t.key.as_str() != SYSTEM_THEME_NAME)
             .map(|t| {
                 (
                     t.key.as_str().to_string(),
@@ -129,6 +193,7 @@ impl cyrup_session_svc::ThemeAccess for TuiThemeAccess {
             })
             .collect();
         rows.sort_by(|a, b| a.0.cmp(&b.0));
+        rows.insert(0, (SYSTEM_THEME_NAME.to_string(), None));
         Value::Array(
             rows.into_iter()
                 .map(|(name, path)| json!({"name": name, "path": path}))
@@ -141,6 +206,12 @@ impl cyrup_session_svc::ThemeAccess for TuiThemeAccess {
     /// (`{name, vars, colors, export}`, `cyrup_resources::ThemeData`), which is the shape both
     /// `Ctx::theme_by_name` and `Ctx::theme_json` hand the guest.
     fn by_name(&self, name: &str) -> Option<Value> {
+        // `loadTheme` checks the system name first: it "takes precedence over custom themes of the
+        // same name" (`theme.ts:633`). Its document is generated from the terminal's colours as
+        // the app last published them.
+        if name == SYSTEM_THEME_NAME {
+            return serde_json::to_value(&self.publication().system_document).ok();
+        }
         let theme = self.resources.themes.get_name(name)?;
         serde_json::to_value(&theme.data).ok()
     }
@@ -158,18 +229,43 @@ impl cyrup_session_svc::ThemeAccess for TuiThemeAccess {
     /// guarded by `if (this.settingsManager.getTheme() !== themeOrName)` writes it back
     /// (`:2411-2414`).
     fn set(&self, name: &str) -> Result<(), String> {
-        let theme = self
-            .resources
-            .themes
-            .get_name(name)
-            .ok_or_else(|| format!("Theme not found: {name}"))?;
+        let request = if name == SYSTEM_THEME_NAME {
+            ThemeSwitch::System
+        } else {
+            let theme = self
+                .resources
+                .themes
+                .get_name(name)
+                .ok_or_else(|| format!("Theme not found: {name}"))?;
+            ThemeSwitch::Resource(theme.clone())
+        };
         // The receiver is the run loop; it is gone only while the app is tearing down. Pi's
         // `setThemeName` cannot fail that way, and reporting a torn-down UI as a theme error would
         // be misleading, so a closed channel reports the no-UI state instead — the same string
         // `LiveHostServices::set_theme` uses when no handle is attached at all
         // (`core/extensions/runner.ts:263`).
         self.switch
-            .send(theme.clone())
+            .send(request)
             .map_err(|_| "UI not available".to_string())
+    }
+
+    /// Pi `getResolvedThemeColors()` over the active theme (`theme.ts:903-906`): the generated
+    /// `system` theme's tokens, or the active document with every `""` filled from the terminal's
+    /// reported defaults. `None` when the active theme is neither (it was removed by a reload).
+    fn export_theme(&self) -> Option<cyrup_session_svc::ExportTheme> {
+        let active = self
+            .active
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let published = self.publication();
+        if active == SYSTEM_THEME_NAME {
+            return Some(published.system_export);
+        }
+        let theme = self.resources.themes.get_name(&active)?;
+        Some(cyrup_session_svc::ExportTheme::from_theme_with(
+            theme,
+            &published.terminal_defaults,
+        ))
     }
 }

@@ -75,7 +75,8 @@ pub use event::{
 };
 pub use export::{
     CssColor, ExportBackdrops, ExportState, ExportTheme, ExportTool, ParseColorError,
-    derive_export_colors, session_jsonl_to_html, session_jsonl_to_html_with_theme,
+    TerminalDefaults, derive_export_colors, session_jsonl_to_html,
+    session_jsonl_to_html_with_theme,
 };
 pub use factory::SessionFactory;
 pub use guest_providers::GuestProviderRegistry;

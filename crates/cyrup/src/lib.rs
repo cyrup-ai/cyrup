@@ -76,7 +76,8 @@ pub use session_resolve::{
 pub use signals::spawn_abort_on_signal;
 pub use startup::{
     apply_settings_session_dir, are_experimental_features_enabled, file_settings_store,
-    is_official_distribution, run_first_time_setup, should_run_first_time_setup,
+    first_time_setup_theme_selector, is_official_distribution, run_first_time_setup,
+    should_run_first_time_setup,
 };
 pub use startup_ui::{
     MissingCwdChoice, ResumeChoice, TrustChoice, has_trust_requiring_project_resources,

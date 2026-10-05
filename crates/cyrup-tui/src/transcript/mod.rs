@@ -81,7 +81,7 @@ pub use message::HIDDEN_THINKING_LABEL;
 
 pub(crate) use layout::{is_ws_grapheme, text_lines_of, wrap_all_owned, wrap_line, wrapped_height};
 pub(crate) use render::{entry_block, entry_lines};
-pub(crate) use tool_render::{ImageOpts, tool_block, tool_lines};
+pub(crate) use tool_render::{ImageOpts, ThinkingHiding, tool_block, tool_lines};
 
 // The transcript-internal helpers the submodules share. Re-bound here so every submodule reaches
 // them through its own `use super::*;`, the same way `crate::app`'s split modules do.
@@ -228,8 +228,9 @@ pub struct TranscriptView {
     thinking_display: Option<String>,
     /// `hideThinkingBlock` (settings-manager.ts; Pi `AssistantMessageComponent.hideThinkingBlock`,
     /// assistant-message.ts:126): render one static `Thinking...` label instead of the reasoning
-    /// body. Read when a thinking run is rendered live and frozen into [`Entry::Thinking::hidden`]
-    /// when it commits.
+    /// body. Read when a thinking run is rendered live and recorded in `Entry::Thinking::hidden`
+    /// when it commits; the fullscreen retained document reads it again at every paint
+    /// ([`ThinkingHiding::Live`]).
     hide_thinking: bool,
     /// `markdown.mermaid` (Pi `getMermaidRenderingMode`, settings-manager.ts:1251-1254), the mode
     /// the mermaid markdown transformer's `getMode()` closure returns (`mermaid.ts:62`,
@@ -351,7 +352,7 @@ struct RenderCache {
     /// The hrefs `lines` was built with (TUI-020). Cached alongside because the ids in the spans'
     /// marker bits index THIS table; a cache hit that reused stale hrefs would link the right text
     /// to the wrong file.
-    links: crate::osc::LinkSink,
+    links: std::sync::Arc<crate::osc::LinkSink>,
     /// The click regions of the blocks in [`Self::rows`], in those wrapped rows. Built with the rows
     /// and invalidated with them, so a toggle (which bumps the render generation) refreshes both.
     toggles: std::sync::Arc<Vec<LiveToggle>>,

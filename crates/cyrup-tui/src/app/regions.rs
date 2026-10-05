@@ -21,7 +21,9 @@ use super::{AppState, region_constraints};
 /// in and the order the inline renderer has always painted them.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Regions {
-    /// The extension header (`setHeader`), docked above the message region.
+    /// The extension header (`setHeader`), docked above the message region — inline only. The
+    /// alternate screen lays the header out as the first rows of the scrolled document, so this
+    /// has no rows there ([`HeaderPlacement::InDocument`]).
     pub(crate) header: Rect,
     /// The message region. Inline, the active turn's rows (committed rows live in native
     /// scrollback); fullscreen, the scrolled document's viewport.
@@ -44,10 +46,33 @@ pub(crate) struct Regions {
     pub(crate) footer: Rect,
 }
 
+/// Where the header (`headerContainer`) sits on screen.
+///
+/// Pi mounts it as the first child of `documentContainer` (`interactive-mode.ts:622-628` @v1.0.0).
+/// The inline renderer has no scrolled document — the viewport holds only the live region — so
+/// there the header is a band of its own above the message region; the alternate screen scrolls the
+/// document, and the header is its first rows (`AltScreen::sync_document`), leaving no band.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HeaderPlacement {
+    /// A [`Regions::header`] band above the message region.
+    Band,
+    /// Part of the scrolled document: [`Regions::header`] has no rows.
+    InDocument,
+}
+
 impl Regions {
+    /// Lay `area` out for the inline renderer: the header is a band above the message region.
+    pub(crate) fn compute(state: &mut AppState, area: Rect) -> Self {
+        Self::compute_with(state, area, HeaderPlacement::Band)
+    }
+
     /// Lay `area` out for the state as it stands. Takes `&mut AppState` because sizing the slot asks
     /// the editor to measure its wrapped line count ([`region_constraints`]).
-    pub(crate) fn compute(state: &mut AppState, area: Rect) -> Self {
+    pub(crate) fn compute_with(
+        state: &mut AppState,
+        area: Rect,
+        header_placement: HeaderPlacement,
+    ) -> Self {
         let [
             header_h,
             _msg_h,
@@ -60,6 +85,12 @@ impl Regions {
             wbelow_h,
             footer_h,
         ] = region_constraints(state, area.width, area.height);
+        // The rows a header would take come out of the message region's share only, so dropping
+        // them changes no dock height.
+        let header_h = match header_placement {
+            HeaderPlacement::Band => header_h,
+            HeaderPlacement::InDocument => 0,
+        };
         let [
             header,
             msg,

@@ -25,6 +25,37 @@
 //! *selected* on press). [`Gesture`] is that bookkeeping: it remembers where a press began and
 //! whether the pointer has moved since.
 //!
+//! # A press either belongs to a component or starts a text selection
+//! Whether the dock claims a press depends on whether a component **acted on it**
+//! ([`PointerReply`]), which is pi's `handleMouseEvent` ordering (`tui-alt-screen.ts:938-962`):
+//!
+//! * A component that acts on a press (a selector row or a completion row highlights) *handles*
+//!   it. The press is the component's: an existing text selection is cleared, no new one starts,
+//!   and the rest of the gesture (drag, release, the click) goes to that component and not to the
+//!   selection. That is [`Gesture`].
+//! * A press no component acts on is **not** claimed. That is the editor body (it leaves press,
+//!   drag and release alone on purpose, `components/editor.ts:656-658`), its rules, the footer,
+//!   the working band, extension widgets, queued messages, blank rows, and a selector row that is
+//!   not an item. [`App::handle_dock_pointer`] answers `None`, the report falls through to
+//!   [`crate::altscreen::AltScreen::handle_mouse`], and the selection starts there, on the cells
+//!   the last frame painted (`altscreen/selection.rs`). No [`Gesture`] is recorded, so the drag
+//!   and the release belong to the selection as well.
+//!
+//! The click that places the editor caret is then synthesised from the *selection's* release: a
+//! press and release on one cell with no drag in between ends the selection as
+//! [`crate::altscreen::PointerOutcome::Click`], and [`App::complete_selection_click`] offers that
+//! click to the component under the cell. If one takes it (the editor, which places the caret and
+//! claims every click inside its rectangle) the selection is cleared and nothing is copied;
+//! otherwise the release copies as any other does. A drag across the prompt is not a click, so it
+//! selects the text and never moves the caret.
+//!
+//! # Where a selection started decides what it can reach
+//! A selection that began in the scrolled document stays in the document: a drag that ends over the
+//! dock keeps selecting document rows, clamped to the viewport. A selection that began anywhere
+//! else (the dock, the header, the margins) selects rows of the screen as painted, clamped to the
+//! frame, so it may run over any cell of it, document viewport included. Pi's `getSelectionPoint`
+//! resolves every later point against the anchor's own rows (`:1149-1158`).
+//!
 //! Everything here is inert in regular mode, where the terminal is never asked for mouse reports.
 
 use std::time::{Duration, Instant};
@@ -32,7 +63,7 @@ use std::time::{Duration, Instant};
 use ratatui::crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::{Position, Rect};
 
-use super::{App, AppAction, AppState, Regions};
+use super::{App, AppAction, AppState, OverlayClick, Regions};
 
 /// Consecutive clicks on the same cell count as a double or triple click only if each follows the
 /// last within this window — pi's `DOUBLE_CLICK_INTERVAL_MS = 500` (`tui-alt-screen.ts:68`).
@@ -70,6 +101,19 @@ impl Pointer {
             },
         }
     }
+}
+
+/// How a docked component answered a pointer event: whether it *acted on* it, which decides if a
+/// press belongs to the component or to the text selection under it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PointerReply {
+    /// Not the component's event: a press on the editor body, a row that is not an item. The caller
+    /// may offer it to something else, and a press starts a text selection.
+    Ignored,
+    /// The component took the event and nothing visible changed.
+    Handled,
+    /// The component took the event and the frame is stale.
+    Redraw,
 }
 
 /// Which docked component a position falls in.
@@ -189,22 +233,24 @@ impl<B: ratatui::backend::Backend> App<B> {
                 self.dispatch_pointer(target, Pointer::Wheel { at, lines })
             }
             MouseEventKind::Down(MouseButton::Left) => {
+                // A press ends whatever gesture an earlier press began.
+                self.state.pointer.gesture = None;
                 let target = DockTarget::at(&regions, at)?;
+                // Claimed only if a component acted on it. A press nothing acted on is the text
+                // selection's: it starts one over the cells painted here.
+                let action = self.dispatch_pointer(target, Pointer::Press { at })?;
                 self.state.pointer.gesture = Some(Gesture {
                     target,
                     press: at,
                     moved: false,
                 });
-                // The press is claimed whether or not the component acts on it: the document's
-                // selection must not start under the editor, and one already made is dropped, as
-                // pi's `clearTextSelection()` does on a handled press.
+                // A handled press drops the selection already made, so the highlight does not
+                // linger under a click the user meant for the component: pi's
+                // `clearTextSelection()` on a handled press.
                 if let Some(alt) = self.altscreen.as_mut() {
                     alt.clear_selection();
                 }
-                Some(
-                    self.dispatch_pointer(target, Pointer::Press { at })
-                        .unwrap_or(AppAction::None),
-                )
+                Some(action)
             }
             MouseEventKind::Drag(MouseButton::Left) => {
                 let gesture = self.state.pointer.gesture.as_mut()?;
@@ -231,6 +277,48 @@ impl<B: ratatui::backend::Backend> App<B> {
         }
     }
 
+    /// A clean click that began a text selection on the screen, released: offer it to the
+    /// component under the cell, as pi's release does (`dispatchMouseToLayout(clickEvent)`,
+    /// `tui-alt-screen.ts:1338-1341`). `count` is the selection ladder's, not [`PointerState`]'s.
+    ///
+    /// A component that takes the click clears the selection and nothing is copied; otherwise the
+    /// release finishes as any other, copying what is selected under the `copyOnSelect` rule.
+    pub(crate) fn complete_selection_click(&mut self, at: Position, count: u8) -> AppAction {
+        // An overlay under the cell is offered the click first, and when it leaves it alone the
+        // components beneath it are not (`overlay.result ?? (overlay.hit ? undefined : layout)`,
+        // `tui-alt-screen.ts:1346-1347`).
+        let taken = match self.offer_overlay_click(at, count) {
+            OverlayClick::Taken(action) => Some(action),
+            OverlayClick::Unhandled => None,
+            OverlayClick::Miss => DockTarget::at(&self.state.regions, at)
+                .and_then(|target| self.dispatch_pointer(target, Pointer::Click { at, count })),
+        };
+        let Some(alt) = self.altscreen.as_mut() else {
+            return taken.unwrap_or(AppAction::None);
+        };
+        match taken {
+            Some(action) => {
+                // A selection that was visible (a word the click landed on the first cell of) is
+                // gone, so the frame is stale even if the component repainted nothing.
+                let visible = alt.selection_text().is_some();
+                alt.clear_selection();
+                match action {
+                    AppAction::None if visible => AppAction::Redraw,
+                    other => other,
+                }
+            }
+            None => match alt.finish_release() {
+                crate::altscreen::PointerOutcome::Copy(text) => AppAction::CopySelection(text),
+                // Nothing was selected (a click on a rule or a title): there is no highlight to
+                // paint or to keep, so the frame is not stale.
+                crate::altscreen::PointerOutcome::Handled if alt.selection_text().is_some() => {
+                    AppAction::Redraw
+                }
+                _ => AppAction::None,
+            },
+        }
+    }
+
     /// Hand `event` to the component `target` names, positions made local to its rectangle.
     /// `None` when the component did not act on it.
     fn dispatch_pointer(&mut self, target: DockTarget, event: Pointer) -> Option<AppAction> {
@@ -239,14 +327,14 @@ impl<B: ratatui::backend::Backend> App<B> {
         match target {
             DockTarget::Popup => {
                 let AppState { editor, .. } = &mut self.state;
-                // Everything over the popup is the popup's, repaint or not: a wheel notch against
-                // the end of the list is handled (pi `select-list.ts:116`), and must not scroll
-                // the document under it.
-                Some(if editor.pointer_popup(area, event) {
-                    AppAction::Redraw
-                } else {
-                    AppAction::None
-                })
+                // What the list acts on is the popup's, repaint or not: a wheel notch against the
+                // end of the list is handled (pi `select-list.ts:116`), and must not scroll the
+                // document under it. A row it does not act on (the `(i/N)` readout) is not.
+                match editor.pointer_popup(area, event) {
+                    PointerReply::Ignored => None,
+                    PointerReply::Handled => Some(AppAction::None),
+                    PointerReply::Redraw => Some(AppAction::Redraw),
+                }
             }
             DockTarget::Slot => {
                 if let Some(active) = self.state.selector.as_mut() {
@@ -260,10 +348,11 @@ impl<B: ratatui::backend::Backend> App<B> {
                 if self.state.loader.is_some() {
                     return None;
                 }
-                self.state
-                    .editor
-                    .pointer(area, event)
-                    .then_some(AppAction::Redraw)
+                match self.state.editor.pointer(area, event) {
+                    PointerReply::Ignored => None,
+                    PointerReply::Handled => Some(AppAction::None),
+                    PointerReply::Redraw => Some(AppAction::Redraw),
+                }
             }
         }
     }

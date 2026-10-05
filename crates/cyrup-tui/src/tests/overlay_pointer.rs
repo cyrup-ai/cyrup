@@ -18,13 +18,14 @@ use std::sync::{Arc, Mutex};
 
 use cyrup_ext::host::{
     CustomSpec, InteractiveOverlay, OverlayColor, OverlayKey, OverlayLine, OverlayMouse,
-    OverlayOutcome as ExtOverlayOutcome, OverlaySpan, ThemeRole,
+    OverlayMouseOutcome, OverlayOutcome as ExtOverlayOutcome, OverlaySpan, ThemeRole,
 };
 use ratatui::backend::TestBackend;
 use ratatui::crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::{Position, Rect};
 use ratatui::style::Color;
 
+use crate::app::OverlayRoute;
 use crate::overlay::ExtensionOverlay;
 use crate::{App, AppAction, InputEvent, UiTheme};
 
@@ -34,6 +35,7 @@ const ROWS: u16 = 24;
 fn fullscreen_app() -> App<TestBackend> {
     let mut app = App::new(TestBackend::new(COLS, ROWS), UiTheme::dark()).unwrap();
     app.state_mut().show_startup_hints = false;
+    app.state_mut().startup_header = crate::StartupHeader::Hidden;
     let _captured = app.enter_fullscreen_captured().expect("renderer builds");
     app
 }
@@ -143,7 +145,7 @@ fn chooser() -> (Box<dyn InteractiveOverlay>, Arc<Mutex<Option<String>>>) {
 /// An overlay that records the pointer events it is given and answers a fixed outcome.
 struct Probe {
     events: Arc<Mutex<Vec<OverlayMouse>>>,
-    outcome: ExtOverlayOutcome,
+    outcome: OverlayMouseOutcome,
     rows: usize,
 }
 
@@ -170,13 +172,13 @@ impl InteractiveOverlay for Probe {
     fn handle_key(&mut self, _key: OverlayKey) -> ExtOverlayOutcome {
         ExtOverlayOutcome::Ignored
     }
-    fn handle_mouse(&mut self, event: OverlayMouse) -> ExtOverlayOutcome {
+    fn handle_mouse(&mut self, event: OverlayMouse) -> OverlayMouseOutcome {
         self.events.lock().unwrap().push(event);
         self.outcome
     }
 }
 
-fn probe(rows: usize, outcome: ExtOverlayOutcome) -> (Box<Probe>, Arc<Mutex<Vec<OverlayMouse>>>) {
+fn probe(rows: usize, outcome: OverlayMouseOutcome) -> (Box<Probe>, Arc<Mutex<Vec<OverlayMouse>>>) {
     let events = Arc::new(Mutex::new(Vec::new()));
     (
         Box::new(Probe {
@@ -270,74 +272,121 @@ fn the_wheel_scrolls_the_list_and_clamps() {
     assert!(app.overlay_open());
 }
 
-/// A report outside the box the overlay painted is a miss: the overlay does not see it and it
-/// carries on to the document, which a wheel notch scrolls.
+/// A report outside the box the overlay painted is a miss for the overlay: it does not see it and
+/// the dock does. The document does not take the wheel from under a modal (pi's
+/// `shouldDeferViewportInputToOverlay`, `tui-alt-screen.ts:709`).
 #[test]
-fn a_report_outside_the_overlay_falls_through_to_the_document() {
+fn a_report_outside_the_overlay_is_a_miss_and_the_wheel_waits_for_the_modal() {
     let mut app = fullscreen_app();
     fill_transcript(&mut app);
-    let (overlay, _result) = chooser();
-    let _released = open(&mut app, overlay);
     let before = screen(&mut app)[0].clone();
-    let rect = painted(&mut app);
-    assert!(rect.y > 0, "the overlay does not cover the top row");
 
-    // The overlay answers "miss" for a wheel notch and for a press at the top-left corner.
-    let ev = MouseEvent {
-        kind: MouseEventKind::ScrollUp,
-        column: 0,
-        row: 0,
-        modifiers: KeyModifiers::NONE,
-    };
-    assert_eq!(app.handle_overlay_pointer(&ev), None);
-    let ev = MouseEvent {
-        kind: MouseEventKind::Down(MouseButton::Left),
-        column: 0,
-        row: 0,
-        modifiers: KeyModifiers::NONE,
-    };
-    assert_eq!(app.handle_overlay_pointer(&ev), None);
-
-    // …and the whole chain: the notch scrolled the document under the overlay, the list kept its
-    // highlight.
+    // Control: with no overlay the notch scrolls the document.
     app.handle_input(&notch_up(0, 0));
     app.draw().unwrap();
     assert_ne!(
         screen(&mut app)[0],
         before,
-        "the document scrolled: {:?}",
-        screen(&mut app)[0]
+        "without a modal the document scrolls"
+    );
+
+    let (overlay, _result) = chooser();
+    let _released = open(&mut app, overlay);
+    let rect = painted(&mut app);
+    assert!(rect.y > 0, "the overlay does not cover the top row");
+
+    let ev = |kind| MouseEvent {
+        kind,
+        column: 0,
+        row: 0,
+        modifiers: KeyModifiers::NONE,
+    };
+    assert_eq!(
+        app.handle_overlay_pointer(&ev(MouseEventKind::ScrollUp)),
+        OverlayRoute::Miss
+    );
+    assert_eq!(
+        app.handle_overlay_pointer(&ev(MouseEventKind::Down(MouseButton::Left))),
+        OverlayRoute::Miss
+    );
+
+    // The whole chain: a notch beside the modal scrolls nothing, the list keeps its highlight.
+    let held = screen(&mut app)[0].clone();
+    app.handle_input(&notch_up(0, 0));
+    app.handle_input(&notch_down(0, 0));
+    app.draw().unwrap();
+    assert_eq!(
+        screen(&mut app)[0],
+        held,
+        "the document did not scroll under the modal"
     );
     assert_eq!(highlighted(&mut app), "option-alpha");
 }
 
-/// Offered to the dock, a press on the editor slot is a gesture in flight; under an overlay that
-/// covers the slot the press goes to the overlay and the dock never sees it — nor does the wheel
+/// The dock is still reachable beside a modal: a press on a completion row outside the overlay's
+/// box is the dock's.
+#[test]
+fn a_press_beside_the_overlay_still_reaches_the_dock() {
+    let mut app = fullscreen_app();
+    for c in "/m".chars() {
+        app.handle_input(&crate::tests::harness::key(
+            ratatui::crossterm::event::KeyCode::Char(c),
+        ));
+    }
+    app.draw().unwrap();
+    let popup = app.state_mut().regions.popup;
+    assert!(popup.height > 0, "`/m` opens a popup");
+    let (overlay, _events) = probe(4, OverlayMouseOutcome::Unhandled);
+    let _released = open(&mut app, overlay);
+    let at = Position::new(popup.x + 3, popup.y);
+    assert!(
+        !painted(&mut app).contains(at),
+        "the box does not cover the popup"
+    );
+    app.handle_input(&down(at.x, at.y));
+    assert!(
+        app.state().pointer.press_in_flight(),
+        "the dock took the press"
+    );
+}
+
+/// Offered to the dock, a press on a completion row is a gesture in flight; under an overlay that
+/// covers the popup the press goes to the overlay and the dock never sees it — nor does the wheel
 /// reach the document, whatever the overlay answers.
 #[test]
 fn a_report_inside_the_overlay_never_reaches_the_dock_or_the_document() {
     let mut app = fullscreen_app();
     fill_transcript(&mut app);
+    // A completion popup under the editor: a press on its rows is a component's, so it leaves a
+    // gesture behind (a press on the editor body would start a text selection instead).
+    for c in "/m".chars() {
+        app.handle_input(&crate::tests::harness::key(
+            ratatui::crossterm::event::KeyCode::Char(c),
+        ));
+    }
 
-    // Control: with no overlay a press on the editor slot is the dock's.
+    // Control: with no overlay a press on a completion row is the dock's.
     app.draw().unwrap();
     let slot = app.state_mut().regions.slot;
-    let at = Position::new(slot.x + 2, slot.y);
+    let popup = app.state_mut().regions.popup;
+    assert!(popup.height > 0, "`/m` opens a popup");
+    let at = Position::new(popup.x + 3, popup.y);
     app.handle_input(&down(at.x, at.y));
     assert!(
         app.state().pointer.press_in_flight(),
         "without an overlay the dock takes the press (the detector works)"
     );
-    app.handle_input(&up(at.x, at.y));
+    // Released on another cell, so it is not a click and activates nothing.
+    app.handle_input(&up(at.x + 1, at.y));
     assert!(!app.state().pointer.press_in_flight());
 
     // An overlay tall enough to cover the editor slot, and one that ignores the pointer.
-    let (overlay, events) = probe(60, ExtOverlayOutcome::Ignored);
+    let (overlay, events) = probe(60, OverlayMouseOutcome::Unhandled);
     let _released = open(&mut app, overlay);
     let rect = painted(&mut app);
     assert!(
-        rect.contains(at) && rect.contains(Position::new(at.x, at.y + slot.height - 1)),
-        "the box {rect:?} covers the editor slot {slot:?}"
+        rect.contains(at) && rect.contains(Position::new(at.x, slot.y)),
+        "the box {rect:?} covers the editor slot {slot:?} and the popup {popup:?}"
     );
     let before = screen(&mut app)[0].clone();
 
@@ -391,7 +440,7 @@ fn a_report_inside_the_overlay_never_reaches_the_dock_or_the_document() {
 #[test]
 fn the_hit_test_is_exactly_the_rectangle_the_overlay_painted() {
     let mut app = fullscreen_app();
-    let (overlay, events) = probe(8, ExtOverlayOutcome::Redraw);
+    let (overlay, events) = probe(8, OverlayMouseOutcome::Redraw);
     let _released = open(&mut app, overlay);
     // The box the painter lays out for 8 rows on this screen, computed independently of what the
     // overlay reports, and checked against the cells actually painted.
@@ -428,7 +477,7 @@ fn the_hit_test_is_exactly_the_rectangle_the_overlay_painted() {
         (last_x, rect.y),
     ] {
         assert!(
-            app.handle_overlay_pointer(&notch(x, y)).is_some(),
+            app.handle_overlay_pointer(&notch(x, y)) != OverlayRoute::Miss,
             "({x}, {y}) is inside {rect:?}"
         );
     }
@@ -439,7 +488,7 @@ fn the_hit_test_is_exactly_the_rectangle_the_overlay_painted() {
         (rect.x, last_y + 1),
     ] {
         assert!(
-            app.handle_overlay_pointer(&notch(x, y)).is_none(),
+            app.handle_overlay_pointer(&notch(x, y)) == OverlayRoute::Miss,
             "({x}, {y}) is outside {rect:?}"
         );
     }
@@ -458,8 +507,8 @@ fn the_hit_test_is_exactly_the_rectangle_the_overlay_painted() {
 #[test]
 fn the_topmost_overlay_under_the_pointer_takes_the_event() {
     let mut app = fullscreen_app();
-    let (below, below_events) = probe(8, ExtOverlayOutcome::Redraw);
-    let (above, above_events) = probe(8, ExtOverlayOutcome::Redraw);
+    let (below, below_events) = probe(8, OverlayMouseOutcome::Redraw);
+    let (above, above_events) = probe(8, OverlayMouseOutcome::Redraw);
     let _a = open(&mut app, below);
     let _b = open(&mut app, above);
     let rect = painted(&mut app);
@@ -477,7 +526,7 @@ fn the_topmost_overlay_under_the_pointer_takes_the_event() {
 #[test]
 fn consecutive_clicks_are_counted_and_a_drag_is_not_a_click() {
     let mut app = fullscreen_app();
-    let (overlay, events) = probe(8, ExtOverlayOutcome::Redraw);
+    let (overlay, events) = probe(8, OverlayMouseOutcome::Redraw);
     let _released = open(&mut app, overlay);
     let rect = painted(&mut app);
     let (x, y) = (rect.x + 3, rect.y + 2);
@@ -501,12 +550,13 @@ fn consecutive_clicks_are_counted_and_a_drag_is_not_a_click() {
     assert_eq!(clicks, vec![1, 2], "the drag produced no click");
 }
 
-/// Any other report over the modal (a right-click paste, hover) is still the modal's: it is not
-/// offered to the editor or the document under it, and outside the box it is a miss.
+/// Any other report over the modal (a right press, hover) is not the overlay's to handle: it goes
+/// no further than the text selection, which ignores it, and outside the box it is a miss. The
+/// overlay is never offered it.
 #[test]
-fn a_right_click_inside_the_overlay_is_swallowed() {
+fn a_right_click_inside_the_overlay_goes_no_further_than_the_selection() {
     let mut app = fullscreen_app();
-    let (overlay, events) = probe(8, ExtOverlayOutcome::Redraw);
+    let (overlay, events) = probe(8, OverlayMouseOutcome::Redraw);
     let _released = open(&mut app, overlay);
     let rect = painted(&mut app);
 
@@ -516,32 +566,297 @@ fn a_right_click_inside_the_overlay_is_swallowed() {
         row: rect.y + 1,
         modifiers: KeyModifiers::NONE,
     };
+    assert_eq!(app.handle_overlay_pointer(&inside), OverlayRoute::Over);
     assert_eq!(
-        app.handle_overlay_pointer(&inside),
-        Some(AppAction::None),
-        "consumed"
+        app.handle_input(&InputEvent::Mouse(inside)),
+        AppAction::None,
+        "nothing beneath the modal answers it"
     );
     let outside = MouseEvent {
         column: 0,
         row: 0,
         ..inside
     };
-    assert_eq!(app.handle_overlay_pointer(&outside), None, "a miss");
+    assert_eq!(app.handle_overlay_pointer(&outside), OverlayRoute::Miss);
     assert!(events.lock().unwrap().is_empty());
 }
 
-/// An overlay with nothing to point at (the trait default) still shields what is beneath it.
+/// An overlay that leaves the pointer alone (the trait default) still shields what is beneath it:
+/// its press is not consumed, but it starts a text selection on the painted rows rather than
+/// reaching the dock or the document.
 #[test]
-fn an_overlay_that_ignores_the_pointer_still_takes_the_event() {
+fn an_overlay_that_leaves_the_pointer_alone_hands_the_press_to_the_selection() {
     let mut app = fullscreen_app();
-    let (overlay, _events) = probe(8, ExtOverlayOutcome::Ignored);
+    let (overlay, _events) = probe(8, OverlayMouseOutcome::Unhandled);
     let _released = open(&mut app, overlay);
     let rect = painted(&mut app);
     let ev = down(rect.x + 1, rect.y + 1);
     assert_eq!(
+        app.handle_overlay_pointer(&MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: rect.x + 1,
+            row: rect.y + 1,
+            modifiers: KeyModifiers::NONE,
+        }),
+        OverlayRoute::Over
+    );
+    assert_eq!(
         app.handle_input(&ev),
-        AppAction::None,
-        "taken, nothing to repaint"
+        AppAction::Redraw,
+        "the selection began"
+    );
+    assert!(!app.state().pointer.press_in_flight(), "not the dock's");
+}
+
+// =============================================================================================
+// A press the overlay does not handle selects the text under it
+// =============================================================================================
+
+/// The text of the highlighted selection, or `None`.
+fn selected(app: &mut App<TestBackend>) -> Option<String> {
+    app.altscreen_for_test()
+        .expect("fullscreen is live")
+        .selection_text()
+}
+
+fn reversed_cells(app: &mut App<TestBackend>, y: u16) -> Vec<u16> {
+    use ratatui::style::Modifier;
+    let alt = app.altscreen_for_test().expect("fullscreen is live");
+    let buf = alt.backend_for_test().buffer().clone();
+    (0..COLS)
+        .filter(|&x| buf[(x, y)].modifier.contains(Modifier::REVERSED))
+        .collect()
+}
+
+fn column_of(app: &mut App<TestBackend>, needle: &str) -> u16 {
+    let row = usize::from(row_of(app, needle));
+    let text = screen(app)[row].clone();
+    let (before, _) = text.split_once(needle).unwrap();
+    u16::try_from(before.chars().count()).unwrap()
+}
+
+fn copied(action: AppAction) -> String {
+    match action {
+        AppAction::CopySelection(text) => text,
+        other => panic!("expected a copy, got {other:?}"),
+    }
+}
+
+/// pi's `overlay.result ?? (overlay.hit ? undefined : layout)` leaves a hit the component did not
+/// handle to `handleSelectionMouseEvent`: a drag across the text of a modal selects it and the
+/// release copies it. The rows are the overlay's, painted over the transcript, so the copy is not
+/// the document's text beneath.
+#[test]
+fn a_drag_across_unhandled_overlay_text_copies_it() {
+    let mut app = fullscreen_app();
+    fill_transcript(&mut app);
+    let (overlay, events) = probe(8, OverlayMouseOutcome::Unhandled);
+    let _released = open(&mut app, overlay);
+    let y = row_of(&mut app, "ACCENT-ROW");
+    let x = column_of(&mut app, "ACCENT-ROW");
+
+    app.handle_input(&down(x, y));
+    app.handle_input(&mouse(MouseEventKind::Drag(MouseButton::Left), x + 9, y));
+    let action = app.handle_input(&up(x + 9, y));
+    app.draw().unwrap();
+
+    assert_eq!(copied(action), "ACCENT-ROW");
+    assert_eq!(selected(&mut app).as_deref(), Some("ACCENT-ROW"));
+    assert_eq!(
+        reversed_cells(&mut app, y),
+        (x..=x + 9).collect::<Vec<_>>(),
+        "the highlight covers exactly the selected cells of the overlay"
+    );
+    assert!(app.overlay_open(), "selecting does not dismiss the modal");
+    let seen = events.lock().unwrap().clone();
+    assert!(
+        matches!(seen.as_slice(), [OverlayMouse::Press { .. }]),
+        "the overlay was offered the press, and a drag is no click: {seen:?}"
+    );
+}
+
+/// The same on a real chooser: its title is selectable, its option rows are not.
+#[test]
+fn a_chooser_title_is_selectable_text() {
+    let mut app = fullscreen_app();
+    let (overlay, result) = chooser();
+    let _released = open(&mut app, overlay);
+    let y = row_of(&mut app, "Pick one");
+    let x = column_of(&mut app, "Pick one");
+
+    app.handle_input(&down(x, y));
+    app.handle_input(&mouse(MouseEventKind::Drag(MouseButton::Left), x + 7, y));
+    let action = app.handle_input(&up(x + 7, y));
+    assert_eq!(copied(action), "Pick one");
+    assert!(app.overlay_open());
+    assert_eq!(result.lock().unwrap().as_deref(), None);
+}
+
+/// A press the overlay handles stays the overlay's: the row is selected, no text selection starts,
+/// one already made is dropped, and the drag and release do not copy anything.
+#[test]
+fn a_press_the_overlay_handles_does_not_start_a_selection() {
+    let mut app = fullscreen_app();
+    let (overlay, result) = chooser();
+    let _released = open(&mut app, overlay);
+
+    // A selection on the title, made first.
+    let title_y = row_of(&mut app, "Pick one");
+    let title_x = column_of(&mut app, "Pick one");
+    app.handle_input(&down(title_x, title_y));
+    app.handle_input(&mouse(
+        MouseEventKind::Drag(MouseButton::Left),
+        title_x + 3,
+        title_y,
+    ));
+    app.handle_input(&up(title_x + 3, title_y));
+    assert_eq!(selected(&mut app).as_deref(), Some("Pick"));
+
+    let y = row_of(&mut app, "option-charlie");
+    let x = painted(&mut app).x + 4;
+    let action = app.handle_input(&down(x, y));
+    assert_eq!(action, AppAction::Redraw, "the row took the press");
+    assert_eq!(selected(&mut app), None, "the handled press dropped it");
+    app.draw().unwrap();
+    assert_eq!(highlighted(&mut app), "option-charlie");
+
+    // Dragged off the row and released: no copy, no click, no selection.
+    let action = app.handle_input(&mouse(MouseEventKind::Drag(MouseButton::Left), x + 5, y));
+    assert_eq!(action, AppAction::None);
+    let action = app.handle_input(&up(x + 5, y));
+    assert_eq!(action, AppAction::None);
+    assert_eq!(selected(&mut app), None);
+    assert!(app.overlay_open());
+    assert_eq!(result.lock().unwrap().as_deref(), None);
+}
+
+/// A press the overlay left alone whose release is a clean click is offered to the overlay as a
+/// click (pi `dispatchMouseToOverlay(clickEvent)` on release), and when the overlay takes it the
+/// selection is cleared and nothing is copied.
+#[test]
+fn an_unhandled_press_released_in_place_is_offered_to_the_overlay_as_a_click() {
+    /// Leaves the press to the selection, takes the click.
+    struct ClickOnly {
+        clicks: Arc<Mutex<Vec<u8>>>,
+    }
+    impl InteractiveOverlay for ClickOnly {
+        fn render(&mut self, _width: usize, _height: usize) -> Vec<OverlayLine> {
+            vec![OverlayLine::new(vec![OverlaySpan {
+                text: "CLICK-ME".to_string(),
+                ..OverlaySpan::default()
+            }])]
+        }
+        fn handle_key(&mut self, _key: OverlayKey) -> ExtOverlayOutcome {
+            ExtOverlayOutcome::Ignored
+        }
+        fn handle_mouse(&mut self, event: OverlayMouse) -> OverlayMouseOutcome {
+            match event {
+                OverlayMouse::Click { count, .. } => {
+                    self.clicks.lock().unwrap().push(count);
+                    OverlayMouseOutcome::Close
+                }
+                _ => OverlayMouseOutcome::Unhandled,
+            }
+        }
+    }
+    let mut app = fullscreen_app();
+    let clicks = Arc::new(Mutex::new(Vec::new()));
+    let mut released = open(
+        &mut app,
+        Box::new(ClickOnly {
+            clicks: Arc::clone(&clicks),
+        }),
+    );
+    let y = row_of(&mut app, "CLICK-ME");
+    let x = column_of(&mut app, "CLICK-ME");
+
+    let action = app.handle_input(&down(x + 2, y));
+    assert_eq!(action, AppAction::Redraw, "the press began a selection");
+    let action = app.handle_input(&up(x + 2, y));
+    assert_eq!(action, AppAction::Redraw, "the click closed the overlay");
+    assert_eq!(*clicks.lock().unwrap(), vec![1]);
+    assert!(!app.overlay_open());
+    assert!(released.try_recv().is_ok());
+    assert_eq!(selected(&mut app), None, "the click cleared the selection");
+}
+
+/// A click the overlay does not take copies nothing, and does not fall through to what is under
+/// the modal either (pi: `overlay.hit` suppresses `dispatchMouseToLayout`).
+#[test]
+fn a_click_the_overlay_leaves_alone_does_not_reach_the_dock() {
+    let mut app = fullscreen_app();
+    for c in "/m".chars() {
+        app.handle_input(&crate::tests::harness::key(
+            ratatui::crossterm::event::KeyCode::Char(c),
+        ));
+    }
+    app.draw().unwrap();
+    let popup = app.state_mut().regions.popup;
+    assert!(popup.height > 0);
+    let (overlay, events) = probe(60, OverlayMouseOutcome::Unhandled);
+    let _released = open(&mut app, overlay);
+    let at = Position::new(popup.x + 3, popup.y);
+    assert!(painted(&mut app).contains(at), "the box covers the popup");
+    let before = app.state().editor.text();
+
+    let action = app.handle_input(&down(at.x, at.y));
+    assert_eq!(action, AppAction::Redraw);
+    let action = app.handle_input(&up(at.x, at.y));
+    assert!(!matches!(action, AppAction::CopySelection(_)), "{action:?}");
+    assert_eq!(
+        app.state().editor.text(),
+        before,
+        "the completion row under the modal was not activated"
+    );
+    let seen = events.lock().unwrap().clone();
+    assert!(
+        matches!(
+            seen.as_slice(),
+            [
+                OverlayMouse::Press { .. },
+                OverlayMouse::Click { count: 1, .. }
+            ]
+        ),
+        "{seen:?}"
+    );
+}
+
+/// pi's `clearTextSelection()` on a press a component handled leaves the multi-click ladder
+/// running (`tui-alt-screen.ts:893-902`): a click on a word, a press the overlay handles, and a
+/// second click on the word inside the window are still a double click, which selects the word.
+#[test]
+fn a_press_the_overlay_handled_does_not_reset_the_double_click_ladder() {
+    let mut app = fullscreen_app();
+    for c in "alpha beta gamma".chars() {
+        app.handle_input(&crate::tests::harness::key(
+            ratatui::crossterm::event::KeyCode::Char(c),
+        ));
+    }
+    app.draw().unwrap();
+    let beta = (
+        column_of(&mut app, "alpha beta gamma") + 7,
+        row_of(&mut app, "alpha beta gamma"),
+    );
+    let (overlay, _events) = probe(4, OverlayMouseOutcome::Handled);
+    let _released = open(&mut app, overlay);
+    let rect = painted(&mut app);
+    assert!(!rect.contains(Position::new(beta.0, beta.1)));
+
+    // The first click of the ladder, then a handled press elsewhere, then the second click.
+    click(&mut app, beta.0, beta.1);
+    app.handle_input(&down(rect.x + 2, rect.y + 1));
+    assert_eq!(
+        selected(&mut app),
+        None,
+        "the handled press cleared the selection"
+    );
+    app.handle_input(&up(rect.x + 2, rect.y + 1));
+    app.handle_input(&down(beta.0, beta.1));
+    let action = app.handle_input(&up(beta.0, beta.1));
+    assert_eq!(
+        copied(action),
+        "beta",
+        "the second click was a double click"
     );
 }
 
@@ -555,7 +870,7 @@ fn an_overlay_that_ignores_the_pointer_still_takes_the_event() {
 #[test]
 fn the_overlay_is_painted_in_the_active_theme_and_follows_a_switch() {
     let mut app = fullscreen_app();
-    let (overlay, _events) = probe(6, ExtOverlayOutcome::Ignored);
+    let (overlay, _events) = probe(6, OverlayMouseOutcome::Unhandled);
     let _released = open(&mut app, overlay);
     let rect = painted(&mut app);
     let accent_row = rect.y + u16::try_from(row_in_box(&mut app, "ACCENT-ROW")).unwrap();

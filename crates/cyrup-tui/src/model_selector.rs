@@ -696,14 +696,24 @@ impl Selector for ModelSelector {
     }
 
     /// A press highlights the model under the pointer, a click confirms it as `Enter` does, and a
-    /// wheel notch over the list moves the highlight one model without wrapping. The rules, the
-    /// scope block, the search box, the `(i/N)` readout and everything under the list are not
-    /// models.
+    /// wheel notch over the list moves the highlight one model without wrapping. A press on the
+    /// search box places its caret. The rules, the scope block, the `(i/N)` readout and everything
+    /// under the list are not models.
     fn pointer(&mut self, area: Rect, event: crate::app::Pointer) -> SelectorOutcome {
         let top = self
             .head_lines(area.width, UiTheme::default_ref())
             .len()
             .min(usize::from(u16::MAX)) as u16;
+        // The search `Input` is the row above the blank that closes the head
+        // (`model-selector.ts:116-126`, a bare container child): a press there places its caret.
+        if self.input.pointer_in_row(
+            event,
+            top.saturating_sub(2),
+            crate::selector::INPUT_PROMPT_COLS,
+            area.width,
+        ) {
+            return SelectorOutcome::Redraw;
+        }
         let len = self.visible_len();
         let map =
             RowMap::windowed(top, self.selected, len, self.max_visible).clipped_to(area.height);

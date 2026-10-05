@@ -13,7 +13,28 @@ impl<B: Backend> App<B> {
         // `AgentSessionRuntime::set_before_session_invalidate`, which exists as a library surface
         // for embedders that need the earlier position.
         self.reset_extension_ui();
+        // pi's `chatContainer.clear()` empties the CONVERSATION, not the renderer: what the fresh
+        // view must keep is what describes the terminal and the renderer rather than the session.
+        // Retention is the alternate screen's — without it a fullscreen session goes blank for good
+        // at its first `/new` or `/resume`, because nothing drained afterwards reaches the
+        // document. The two capability gates are published once, at startup.
+        let retain_document = self.state.transcript.retain_document();
+        let hyperlinks = self.state.transcript.hyperlinks();
+        let graphical_images = self.state.transcript.graphical_images();
+        // The outgoing document is emptied through the one door that tells a renderer rows moved.
+        self.state.transcript.clear_document();
+        let dropped = self.state.transcript.retained_dropped();
         self.state.transcript = TranscriptView::new();
+        self.state.transcript.continue_document_epoch(dropped);
+        self.state.transcript.set_retain_document(retain_document);
+        self.state.transcript.set_hyperlinks(hyperlinks);
+        self.state.transcript.set_graphical_images(graphical_images);
+        // The rows the outgoing view's document held — and any selection or scroll position
+        // addressed in them — are gone; the new conversation is read from its tail.
+        if let Some(alt) = self.altscreen.as_mut() {
+            alt.reset_selection();
+            crate::altscreen::ViewportRenderer::scroll_to_bottom(alt);
+        }
         self.state.selector = None;
         self.state.overlays.clear();
         self.state.status.set_streaming(false);
@@ -597,13 +618,30 @@ impl<B: Backend> App<B> {
     /// `/resume`, `/fork`, `/import` and `/reload` alike.
     ///
     /// pi re-renders into a dedicated `loadedResourcesContainer` that it `clear()`s first
-    /// (`:1699`), a region pinned ABOVE `chatContainer` (`:594-596`); cyrup's committed entries live
-    /// in the terminal's own scrollback and cannot be re-rendered, so the caller pushes this
-    /// BEFORE the swap's replay to reproduce that stacking, and a second swap appends a second
-    /// panel rather than replacing the first.
+    /// (`:1699`), a region pinned ABOVE `chatContainer` (`:594-596`), so the document never holds
+    /// two panels. The caller pushes this BEFORE the swap's replay to reproduce that stacking, and
+    /// what happens to the previous panel depends on the renderer: under **fullscreen** the swap
+    /// replaced the whole view ([`Self::rebind_session`]) and the retained document with it, so the
+    /// new panel is the only one; **inline**, the earlier panel is already in the terminal's native
+    /// scrollback, which cannot be edited (ADR-0001), and a second swap appends a second panel.
     pub fn push_session_loaded_resources(&mut self, session: &cyrup_session_svc::AgentSession) {
         let report =
             crate::startup::StartupReport::from_session(session, self.state.verbose_startup);
+        // `shouldShowStartupHeader` / `shouldShowStartupDetails` (`interactive-mode.ts:1410-1417`)
+        // are read once, when pi's `init()` builds the header, and the header stays for the
+        // session: the first call — the boot path — decides it, a swap or `/reload` does not
+        // revisit it. (The listing below re-reads the setting on every call, as pi's
+        // `showLoadedResources` does.)
+        if !self.state.startup_header.is_decided() {
+            self.state.startup_header =
+                crate::StartupHeader::decide(report.verbose, report.quiet_startup);
+            // The inline renderer paints the same built-in header in a band of its own
+            // ([`AppState::show_startup_hints`]); a header pi would not build is not painted there
+            // either.
+            if !self.state.startup_header.is_shown() {
+                self.state.show_startup_hints = false;
+            }
+        }
         self.push_loaded_resources(&report);
     }
 

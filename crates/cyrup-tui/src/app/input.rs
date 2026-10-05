@@ -241,23 +241,34 @@ impl<B: Backend> App<B> {
                 if self.altscreen.is_none() {
                     return AppAction::None;
                 }
-                // A floating overlay under the pointer takes the report and nothing beneath it sees
-                // it (`app/overlay_pointer.rs`); a miss falls through to the dock and the document.
-                if let Some(action) = self.handle_overlay_pointer(m) {
-                    return action;
-                }
-                // The dock (editor, completion popup, selector) is offered the report next: it is
-                // painted in rectangles of its own, outside the scrolled document.
-                if let Some(action) = self.handle_dock_pointer(m) {
-                    return action;
-                }
+                // A floating overlay under the pointer is offered the report and nothing beneath
+                // it sees it (`app/overlay_pointer.rs`). One it handles is its own; one it leaves
+                // alone goes on to the text selection only; a miss falls through to the dock and
+                // the document.
+                let modal = match self.handle_overlay_pointer(m) {
+                    OverlayRoute::Taken(action) => return action,
+                    OverlayRoute::Over => crate::altscreen::Modal::Under,
+                    OverlayRoute::Miss => {
+                        // The dock (editor, completion popup, selector) is offered the report
+                        // next: it is painted in rectangles of its own, outside the scrolled
+                        // document.
+                        if let Some(action) = self.handle_dock_pointer(m) {
+                            return action;
+                        }
+                        if self.state.overlays.is_empty() {
+                            crate::altscreen::Modal::Absent
+                        } else {
+                            crate::altscreen::Modal::Open
+                        }
+                    }
+                };
                 let Some(alt) = self.altscreen.as_mut() else {
                     return AppAction::None;
                 };
                 // The rectangle the scrolled document was painted in, not the whole screen: the
                 // dock under it is not part of the scroll view.
                 let area = alt.doc_area();
-                match alt.handle_mouse(m, area) {
+                match alt.handle_mouse_under(m, area, modal) {
                     crate::altscreen::PointerOutcome::Ignored => AppAction::None,
                     crate::altscreen::PointerOutcome::Handled => AppAction::Redraw,
                     // The write is async, so it rides the action out to the run loop.
@@ -271,9 +282,18 @@ impl<B: Backend> App<B> {
                     }
                     // A click on a thinking run, completed tool block, summary or skill block:
                     // flip that entry, and have the next frame keep the clicked row where it was.
+                    // A click that began a selection on the screen: the component under the cell
+                    // may take it (the editor places its caret), else the release copies.
+                    crate::altscreen::PointerOutcome::Click { at, count } => {
+                        self.complete_selection_click(at, count)
+                    }
                     crate::altscreen::PointerOutcome::Toggle(hit) => {
                         alt.anchor_toggle(hit, &self.state.transcript);
                         self.state.transcript.toggle(hit.target());
+                        // Rebuilt NOW, not by the next frame: a second click that arrives before
+                        // that frame is hit-tested against the document the renderer holds, and
+                        // against the pre-toggle one it would land on rows that have since moved.
+                        self.sync_fullscreen_document();
                         AppAction::Redraw
                     }
                 }
@@ -509,9 +529,12 @@ impl<B: Backend> App<B> {
             // `ApplySetting` — the same command the `/settings` row uses, whose handler also applies
             // the flip live to the transcript (one write path, not two).
             //
-            // **[CYRUP-DELTA]** — pi additionally rebuilds the whole chat container from the session
-            // messages (`:3838-3840`), so ALREADY-SHOWN assistant messages change form. cyrup's
-            // committed rows have left the render tree for the terminal's native scrollback
+            // Pi additionally rebuilds the whole chat container from the session messages
+            // (`:3838-3840`), so ALREADY-SHOWN assistant messages change form. Under the
+            // **fullscreen** renderer so do cyrup's: the retained document is repainted from its
+            // entries and every committed reasoning run follows the flag
+            // ([`crate::transcript::ThinkingHiding::Live`]). **[CYRUP-DELTA], inline only:** there
+            // the committed rows have left the render tree for the terminal's native scrollback
             // (`flush_committed` → `insert_before`, ADR-0001), so they keep the form they committed
             // with; only the in-flight block and everything after the flip change. That residual is
             // `TUI-N06`, which owns it — it is not introduced here.

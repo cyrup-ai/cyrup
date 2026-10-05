@@ -200,6 +200,19 @@ impl ExtensionEditorSelector {
     }
 }
 
+impl ExtensionEditorSelector {
+    /// The dialog's nine stacked regions in `area` (`extension-editor.ts:62-95`): rule, blank,
+    /// title, blank, the embedded editor (its own two rules included), blank, hint, blank, rule.
+    /// [`Selector::render`] paints into them and [`Selector::pointer`] hit-tests against them, so
+    /// the rows a click resolves against are the rows that were drawn.
+    fn stack(&self, area: Rect) -> [Rect; 9] {
+        let title_h = title_wrapped_height(&self.title, area.width);
+        let body_h = self.body_rows(area.width).saturating_add(2);
+        let hint_h = self.hint_rows(area.width);
+        stack_rows(area, [1, 1, title_h, 1, body_h, 1, hint_h, 1, 1])
+    }
+}
+
 impl Selector for ExtensionEditorSelector {
     fn desired_height(&self, width: u16) -> u16 {
         title_wrapped_height(&self.title, width)
@@ -211,9 +224,6 @@ impl Selector for ExtensionEditorSelector {
     }
 
     fn render(&mut self, frame: &mut Frame, area: Rect, theme: &UiTheme) {
-        let title_h = title_wrapped_height(&self.title, area.width);
-        let body_h = self.body_rows(area.width).saturating_add(2);
-        let hint_h = self.hint_rows(area.width);
         // E5 + E7. `ExtensionEditorComponent`'s full child list (`extension-editor.ts:62-95`):
         //   `DynamicBorder`(:62) · `Spacer`(:63) · title(:66) · `Spacer`(:67) · `Editor`(:78) ·
         //   `Spacer`(:80) · hint(:83-90) · `Spacer`(:92) · `DynamicBorder`(:95).
@@ -222,8 +232,7 @@ impl Selector for ExtensionEditorSelector {
         // spacers. All heights are natural and the blanks unconditional; `stack_rows` fills the
         // regions from the TOP and starves the trailing ones, so the visible rows are a prefix of
         // the natural render, exactly as pi's layout engine does (see its doc).
-        let [top, _, title_area, _, body, _, hint, _, bottom] =
-            stack_rows(area, [1, 1, title_h, 1, body_h, 1, hint_h, 1, 1]);
+        let [top, _, title_area, _, body, _, hint, _, bottom] = self.stack(area);
         frame.render_widget(border_rule(top.width, theme), top);
         frame.render_widget(
             // E11: `new Text(theme.fg("accent", title), 1, 0)` (`extension-editor.ts:66`).
@@ -242,6 +251,35 @@ impl Selector for ExtensionEditorSelector {
         );
         // E5: the closing `DynamicBorder` (`extension-editor.ts:95`).
         frame.render_widget(border_rule(bottom.width, theme), bottom);
+    }
+
+    /// The embedded `Editor` is a bare container child (`extension-editor.ts:78-79`), so the
+    /// container hands it the events that land on its rows (`editor.ts:632-686`): a click puts the
+    /// caret there. The editor answers in its own coordinates, rule row 0, so the event is made
+    /// local to the rectangle [`Self::stack`] gave it. Pi wires no autocomplete provider into this
+    /// dialog's editor, so there is no completion popup to click.
+    fn pointer(&mut self, area: Rect, event: crate::app::Pointer) -> SelectorOutcome {
+        let local = Rect::new(0, 0, area.width, area.height);
+        let [_, _, _, _, body, _, _, _, _] = self.stack(local);
+        // The editor claims every click inside its rectangle (`editor.ts:632-686`), rule rows
+        // included, so the dialog's own title, hint and spacer rows — which localise onto the
+        // editor's rule rows — are filtered out here by position.
+        let at = match event {
+            crate::app::Pointer::Press { at }
+            | crate::app::Pointer::Click { at, .. }
+            | crate::app::Pointer::Wheel { at, .. } => at,
+        };
+        if !body.contains(at) {
+            return SelectorOutcome::Ignored;
+        }
+        match self.editor.pointer(body, event.localized(body)) {
+            crate::app::PointerReply::Ignored => SelectorOutcome::Ignored,
+            // A claimed event whose only effect is the claim still repaints: it is cheap and the
+            // selector outcome has no "handled, nothing changed" value.
+            crate::app::PointerReply::Handled | crate::app::PointerReply::Redraw => {
+                SelectorOutcome::Redraw
+            }
+        }
     }
 
     fn set_terminal_height(&mut self, rows: u16) {

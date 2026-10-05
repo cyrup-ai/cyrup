@@ -29,6 +29,7 @@ fn fullscreen_app() -> App<TestBackend> {
     let mut app = App::new(TestBackend::new(COLS, ROWS), UiTheme::dark()).unwrap();
     // The startup hint bar would be a second thing on screen to tell the tests apart from.
     app.state_mut().show_startup_hints = false;
+    app.state_mut().startup_header = crate::StartupHeader::Hidden;
     let _captured = app.enter_fullscreen_captured().expect("renderer builds");
     app
 }
@@ -201,6 +202,7 @@ fn a_terminal_shorter_than_the_dock_still_draws() {
     for rows in [1_u16, 2, 3, 4, 5, 6] {
         let mut app = App::new(TestBackend::new(COLS, rows), UiTheme::dark()).unwrap();
         app.state_mut().show_startup_hints = false;
+        app.state_mut().startup_header = crate::StartupHeader::Hidden;
         let _captured = app.enter_fullscreen_captured().expect("renderer builds");
         app.editor_mut().handle_paste("x");
         app.draw().unwrap();
@@ -216,10 +218,11 @@ fn a_terminal_shorter_than_the_dock_still_draws() {
     }
 }
 
-/// At startup, with nothing in the transcript, the hint bar sits in the otherwise-empty document
-/// region just above the editor, as it does inline.
+/// At startup the hint block is the first rows of the document (pi's `headerContainer`), inside the
+/// document region, and it stays there as the conversation starts: the first line lands under it
+/// instead of replacing it.
 #[test]
-fn the_startup_hints_fill_the_empty_document_region() {
+fn the_startup_hints_are_the_first_rows_of_the_document() {
     let mut app = App::new(TestBackend::new(COLS, ROWS), UiTheme::dark()).unwrap();
     assert!(
         app.state_mut().show_startup_hints,
@@ -239,14 +242,21 @@ fn the_startup_hints_fill_the_empty_document_region() {
         hint_row < usize::from(doc.y + doc.height),
         "the hints are inside the document region {doc:?}, row {hint_row}"
     );
+    assert!(hint_row <= 2, "and at the top of it: {rows:#?}");
 
-    // …and the first committed line takes the region over.
     app.transcript_mut().push_status("first line");
     app.transcript_mut().drain_committed();
     app.draw().unwrap();
     let rows = screen(&mut app);
+    assert_eq!(
+        rows.iter().position(|r| r.contains("commands")),
+        Some(hint_row),
+        "the block stays put: {rows:#?}"
+    );
     assert!(
-        rows.iter().all(|r| !r.contains("commands")),
-        "the hint bar is gone once the document has content: {rows:#?}"
+        rows.iter()
+            .position(|r| r.contains("first line"))
+            .is_some_and(|y| y > hint_row),
+        "the first line lands under it: {rows:#?}"
     );
 }

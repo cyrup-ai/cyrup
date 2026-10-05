@@ -72,8 +72,8 @@ use std::time::Instant;
 use async_trait::async_trait;
 use cyrup_ext::host::{
     HostServices, InteractiveOverlay, KeySpec, NotifyKind, OverlayColor, OverlayKey,
-    OverlayKeyCode, OverlayLine, OverlayMouse, OverlayOutcome, OverlaySpan, ThemeRole, key_ids,
-    read_user_bindings,
+    OverlayKeyCode, OverlayLine, OverlayMouse, OverlayMouseOutcome, OverlayOutcome, OverlaySpan,
+    ThemeRole, key_ids, read_user_bindings,
 };
 use futures::future::BoxFuture;
 use tokio::runtime::Handle;
@@ -3140,15 +3140,16 @@ impl InteractiveOverlay for LlamaOverlay {
         }
     }
 
-    fn handle_mouse(&mut self, event: OverlayMouse) -> OverlayOutcome {
+    fn handle_mouse(&mut self, event: OverlayMouse) -> OverlayMouseOutcome {
         let mut view = lock(&self.view);
         let handled = view.handle_mouse(event);
         if view.is_closed() {
-            OverlayOutcome::Close
+            OverlayMouseOutcome::Close
         } else if handled {
-            OverlayOutcome::Redraw
+            OverlayMouseOutcome::Redraw
         } else {
-            OverlayOutcome::Ignored
+            // A row of chrome (title, hint, blank) is not the view's: the host may select it.
+            OverlayMouseOutcome::Unhandled
         }
     }
 

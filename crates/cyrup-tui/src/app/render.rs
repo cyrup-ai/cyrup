@@ -46,15 +46,26 @@ pub(crate) fn paint_startup_hints(frame: &mut Frame, state: &AppState, msg_area:
         && !state.transcript.has_active()
         && msg_area.height >= 1
     {
-        let rows = crate::chrome::compact_hint_height(&state.theme, &state.keymap, msg_area.width)
-            .min(msg_area.height);
+        let rows = crate::chrome::compact_hint_height(
+            &state.theme,
+            &state.keymap,
+            msg_area.width,
+            state.startup_header.details(),
+        )
+        .min(msg_area.height);
         let hint_row = Rect {
             x: msg_area.x,
             y: msg_area.y.saturating_add(msg_area.height - rows),
             width: msg_area.width,
             height: rows,
         };
-        crate::chrome::render_compact_hints(frame, hint_row, &state.theme, &state.keymap);
+        crate::chrome::render_compact_hints(
+            frame,
+            hint_row,
+            &state.theme,
+            &state.keymap,
+            state.startup_header.details(),
+        );
     }
 }
 

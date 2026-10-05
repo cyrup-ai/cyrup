@@ -24,7 +24,8 @@ use cyrup_config::{
     ConfigDirs, ConfigError, FileSettingsStore, SettingsManager, SettingsScope, SettingsStore,
 };
 use cyrup_tui::{
-    ListSelector, SelectKeymap, SelectorOutcome, TerminalTheme, UiTheme, run_startup_selector,
+    ListSelector, SYSTEM_THEME_NAME, SelectKeymap, SelectorOutcome, StartupTheme,
+    run_startup_selector,
 };
 
 /// The official **cyrup** distribution identity — the rebrand's counterpart to Pi's `OFFICIAL_*`
@@ -131,7 +132,9 @@ pub fn should_run_first_time_setup_with(
 /// Port of `FirstTimeSetupResult` (first-time-setup.ts:7-10).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FirstTimeSetupResult {
-    pub theme: TerminalTheme,
+    /// The theme NAME the user picked (`FirstTimeSetupResult.theme: string`): `system`, `dark` or
+    /// `light`.
+    pub theme: &'static str,
     pub share_analytics: bool,
 }
 
@@ -139,10 +142,12 @@ pub struct FirstTimeSetupResult {
 /// rebuilds the whole dialog (first-time-setup.ts:48-55).
 const SETUP_LOGO_LINES: [&str; 4] = ["██████", "██  ██", "████  ██", "██    ██"];
 
-/// `THEME_OPTIONS` (first-time-setup.ts:19-22), in Pi's order — Dark first.
-const THEME_OPTIONS: [(TerminalTheme, &str); 2] = [
-    (TerminalTheme::Dark, "Dark"),
-    (TerminalTheme::Light, "Light"),
+/// `THEME_OPTIONS` (first-time-setup.ts:19-23 @v1.0.0), in Pi's order — the system theme first, then
+/// the two fixed ones.
+const THEME_OPTIONS: [(&str, &str); 3] = [
+    (SYSTEM_THEME_NAME, "System (matches your terminal colors)"),
+    ("dark", "Dark"),
+    ("light", "Light"),
 ];
 
 /// `ANALYTICS_OPTIONS` (first-time-setup.ts:24-27), in Pi's order — opt-in first.
@@ -171,31 +176,24 @@ fn setup_header() -> String {
     )
 }
 
-/// Step 1 — theme choice (first-time-setup.ts:62-70). The preselected row is the detected terminal
-/// appearance (`Math.max(0, findIndex(...))`, :40-43), i.e. Dark when detection finds nothing.
-pub fn first_time_setup_theme_step(detected: TerminalTheme) -> FirstTimeSetupStep {
-    let selected = THEME_OPTIONS
-        .iter()
-        .position(|(value, _)| *value == detected)
-        .unwrap_or(0);
+/// Step 1 — theme choice (first-time-setup.ts:62-70 @v1.0.0). The first row (the system theme) is
+/// preselected: `themeIndex = 0` (:38), with no detection of the terminal's appearance.
+pub fn first_time_setup_theme_step() -> FirstTimeSetupStep {
     FirstTimeSetupStep {
-        title: format!(
-            "{}\nPick a theme.\nDetected system appearance: {}",
-            setup_header(),
-            detected.theme_name()
-        ),
+        title: format!("{}\nPick a theme.", setup_header()),
         rows: THEME_OPTIONS
             .iter()
-            .map(|(value, label)| {
-                (
-                    (*value).theme_name().to_string(),
-                    (*label).to_string(),
-                    None,
-                )
-            })
+            .map(|(value, label)| ((*value).to_string(), (*label).to_string(), None))
             .collect(),
-        selected,
+        selected: 0,
     }
+}
+
+/// The theme step as the selector `run_first_time_setup` mounts: the rows above, previewing the
+/// theme under the highlight as it moves (`onThemePreview`, first-time-setup.ts:127-130).
+pub fn first_time_setup_theme_selector() -> ListSelector {
+    let step = first_time_setup_theme_step();
+    ListSelector::prompt(step.title, step.rows, step.selected).with_preview()
 }
 
 /// Step 2 — analytics opt-in (first-time-setup.ts:71-83). Pi starts this step on
@@ -221,10 +219,10 @@ pub fn first_time_setup_analytics_step() -> FirstTimeSetupStep {
 }
 
 /// Map a confirmed theme row back to its option value (first-time-setup.ts:134).
-pub fn parse_theme_choice(value: &str) -> Option<TerminalTheme> {
+pub fn parse_theme_choice(value: &str) -> Option<&'static str> {
     THEME_OPTIONS
         .iter()
-        .find(|(option, _)| option.theme_name() == value)
+        .find(|(option, _)| *option == value)
         .map(|(option, _)| *option)
 }
 
@@ -250,7 +248,7 @@ pub async fn apply_first_time_setup(
     result: &FirstTimeSetupResult,
 ) -> Result<(), ConfigError> {
     settings
-        .set(SettingsScope::Global, "theme", result.theme.theme_name())
+        .set(SettingsScope::Global, "theme", result.theme)
         .await?;
     settings
         .set_enable_analytics(result.share_analytics)
@@ -266,19 +264,19 @@ pub async fn apply_first_time_setup(
 /// (first-time-setup.ts:126-140); cyrup's pre-launch surface is [`run_startup_selector`], which mounts
 /// exactly one [`cyrup_tui::Selector`] per call, so the two steps are two sequential mounts. The
 /// observable flow is the same — theme, then analytics, confirm advances, cancel at either step
-/// abandons setup without writing settings. The one behaviour this layer cannot carry is Pi's
-/// `onThemePreview` live recolour (:184-187): `run_startup_selector` treats
-/// [`SelectorOutcome::Preview`] as a no-op, so the chosen theme applies on the next render rather
-/// than while navigating.
+/// abandons setup without writing settings. The theme step previews live (`onThemePreview`,
+/// :184-187): the selector emits [`SelectorOutcome::Preview`] as the highlight moves and the startup
+/// loop repaints the dialog in that theme.
+///
+/// The analytics step opens in the theme the user left highlighted, as pi's dialog does: `ui` is
+/// handed on with the preview applied.
 pub async fn run_first_time_setup(
-    ui: &UiTheme,
+    ui: &StartupTheme,
     settings: &mut SettingsManager,
-    detected: TerminalTheme,
 ) -> anyhow::Result<Option<FirstTimeSetupResult>> {
     let keymap = SelectKeymap::default();
 
-    let step = first_time_setup_theme_step(detected);
-    let mut selector = ListSelector::prompt(step.title, step.rows, step.selected);
+    let mut selector = first_time_setup_theme_selector();
     let theme = match run_startup_selector(ui, &keymap, &mut selector, async |_| {}).await? {
         SelectorOutcome::Confirm(value) => match parse_theme_choice(&value) {
             Some(theme) => theme,
@@ -287,10 +285,14 @@ pub async fn run_first_time_setup(
         _ => return Ok(None),
     };
 
+    // The second dialog paints in the theme just chosen: pi keeps the previewed theme for the
+    // whole component (`previewTheme`, startup-ui.ts:202-209).
+    let mut ui = ui.clone();
+    ui.preview(theme);
     let step = first_time_setup_analytics_step();
     let mut selector = ListSelector::prompt(step.title, step.rows, step.selected);
     let share_analytics =
-        match run_startup_selector(ui, &keymap, &mut selector, async |_| {}).await? {
+        match run_startup_selector(&ui, &keymap, &mut selector, async |_| {}).await? {
             SelectorOutcome::Confirm(value) => match parse_analytics_choice(&value) {
                 Some(share) => share,
                 None => return Ok(None),

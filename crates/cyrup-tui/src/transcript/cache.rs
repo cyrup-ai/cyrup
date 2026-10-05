@@ -55,7 +55,7 @@ impl TranscriptView {
                 width,
                 theme_generation: theme.generation,
                 rows: std::sync::Arc::new(wrap_all_owned(lines, width.max(1))),
-                links,
+                links: std::sync::Arc::new(links),
                 toggles: std::sync::Arc::new(toggles),
             };
         }
@@ -78,6 +78,14 @@ impl TranscriptView {
     /// rows. Only meaningful right after that call — the cache they come from is the one it filled.
     pub(crate) fn live_toggles(&self) -> std::sync::Arc<Vec<LiveToggle>> {
         std::sync::Arc::clone(&self.render_cache.toggles)
+    }
+
+    /// The hrefs behind the link markers in the rows [`Self::live_rows`] last handed out (TUI-020).
+    /// The marker ids those rows carry index THIS table, so a renderer that paints the rows into a
+    /// buffer of its own passes it to [`crate::osc::inject_in`] once the cells exist. Only
+    /// meaningful right after that call, for the reason [`Self::live_toggles`] gives.
+    pub(crate) fn live_links(&self) -> std::sync::Arc<crate::osc::LinkSink> {
+        std::sync::Arc::clone(&self.render_cache.links)
     }
 
     /// The number of visual lines the active turn occupies at `width` — the message region's content
@@ -186,6 +194,10 @@ impl TranscriptView {
                 width.saturating_sub(self.output_pad * 2),
                 theme,
                 self.hidden_thinking_label(),
+                crate::markdown::MdLinks {
+                    enabled: self.hyperlinks,
+                    sink: links,
+                },
             );
             if !td.is_empty() {
                 pad_lines(&mut td, self.output_pad);
@@ -238,6 +250,10 @@ impl TranscriptView {
                     crate::markdown::MessageType::Assistant,
                     true,
                 ),
+                crate::markdown::MdLinks {
+                    enabled: self.hyperlinks,
+                    sink: links,
+                },
             );
             if md.is_empty() {
                 md.push(Line::default());
@@ -272,6 +288,8 @@ impl TranscriptView {
                     // Likewise inert: a tool block is not one of pi's three markdown message
                     // bodies, so no mermaid transformer reaches it upstream.
                     mermaid: self.mermaid_mode,
+                    // Likewise inert: no reasoning entry is drawn here.
+                    thinking: ThinkingHiding::AsCommitted,
                 },
             );
             // Running without a result: nothing to toggle yet.

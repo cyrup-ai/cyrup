@@ -29,6 +29,7 @@ const ROWS: u16 = 24;
 fn fullscreen_app() -> App<TestBackend> {
     let mut app = App::new(TestBackend::new(COLS, ROWS), UiTheme::dark()).unwrap();
     app.state_mut().show_startup_hints = false;
+    app.state_mut().startup_header = crate::StartupHeader::Hidden;
     let _captured = app.enter_fullscreen_captured().expect("renderer builds");
     app
 }
@@ -152,10 +153,14 @@ fn a_click_below_the_last_visible_line_moves_nothing() {
         ..slot
     };
     let at = ratatui::layout::Position::new(0, 4);
-    let moved = app
+    let reply = app
         .editor_mut()
         .pointer(taller, crate::Pointer::Click { at, count: 1 });
-    assert!(!moved, "nothing to repaint");
+    assert_eq!(
+        reply,
+        crate::app::PointerReply::Handled,
+        "the editor takes the click and has nothing to repaint"
+    );
     assert_eq!(cursor(&app), (1, 3));
 }
 

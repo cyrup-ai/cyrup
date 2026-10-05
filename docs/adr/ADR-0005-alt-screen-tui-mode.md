@@ -439,10 +439,19 @@ already has:
    is an enum and a `match` — not typestate (`docs/RUST-DESIGN-REVIEW.md`), the same conclusion
    `ADR-0028` reached for `cyrup-acp`.
 
-Modal precedence follows pi: an overlay that is hit takes the event; otherwise the dock (popup, then
-slot); otherwise the document (scrollbar, indicator, entry clicks, selection, wheel). A wheel notch
-no component acts on scrolls the document, as pi's `routeWheel` hands the remainder to the primary
-scroll view.
+Modal precedence follows pi: an overlay that is hit and acts on the event takes it; otherwise the dock
+(popup, then slot); otherwise the document (scrollbar, indicator, entry clicks, selection, wheel). A
+wheel notch no component acts on scrolls the document, as pi's `routeWheel` hands the remainder to the
+primary scroll view — except under an open modal, where it scrolls nothing
+(`shouldDeferViewportInputToOverlay`).
+
+A press that no component acted on is the selection's, wherever it lands. The selection has two row
+sources: the retained document, and the cells the last frame painted (`altscreen/screen.rs`). A press
+that starts in the dock or on an overlay selects screen rows, clamped to the terminal, so the text of
+the prompt, a selector or a modal can be copied; a press that starts in the document selects document
+rows. A component reports "handled" or "not handled" (`PointerReply`, `OverlayMouseOutcome`), so a
+click on a selector row stays the selector's and a drag across its title is the selection's. Clearing
+a selection keeps the multi-click ladder (`clearTextSelection` in pi).
 
 ### The renderer seam: `Chrome`
 
@@ -464,5 +473,7 @@ rows and replaced as its rendering changes; no row index refers to it.
 - Not pi behaviour, stated rather than discovered: after a click toggles a block the viewport is
   re-anchored so the block stays under the pointer (`altscreen/toggle.rs`; pi leaves `scrollTop` where
   it was, which lands the user on unrelated rows when the block started above the viewport).
-- Residual gaps are ledger rows, not prose: text selection cannot start on the dock (`TUI-147`), the
-  extension header is pinned instead of scrolling with the document (`TUI-148`).
+- The extension header is the first rows of the scrolled document, as in pi
+  (`HeaderPlacement::InDocument`, `AltScreen::sync_document`), so `Regions::header` has no rows there
+  (`TUI-148`); text selection reaches the dock and overlays (`TUI-147`).
+- Residual gaps are ledger rows, not prose.

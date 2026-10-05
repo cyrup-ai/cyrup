@@ -87,6 +87,12 @@ fn render_entry(
     images: ImageOpts<'_>,
 ) -> Vec<Line<'static>> {
     let images = effective_opts(entry, expansion, images);
+    // Links in a markdown body: clickable on a terminal that forwards OSC-8, issued from the table
+    // the caller owns (`markdown.ts:699-713`).
+    let md_links = crate::markdown::MdLinks {
+        enabled: images.hyperlinks,
+        sink: images.links,
+    };
     match entry {
         Entry::User { text, lead_spacer } => {
             // `UserMessageComponent` (`user-message.ts:38-58`) is exactly one child: a
@@ -115,6 +121,7 @@ fn render_entry(
                     crate::markdown::MessageType::User,
                     false,
                 ),
+                md_links,
             );
             // `applyBackgroundToLine` paints the BACKGROUND only (`box.ts:132-134`).
             let fill = match role.bg {
@@ -162,6 +169,7 @@ fn render_entry(
                     crate::markdown::MessageType::Assistant,
                     false,
                 ),
+                md_links,
             );
             if md.is_empty() {
                 md.push(Line::default());
@@ -179,12 +187,13 @@ fn render_entry(
         }
         Entry::Thinking { text, hidden } => {
             // The reasoning section (`assistant-message.ts:139-165`), padded like every other
-            // assistant-side block. `hidden` was frozen at commit time (see [`Entry::Thinking`]);
-            // a click on the run replaces it for this run alone
+            // assistant-side block. Which `hideThinkingBlock` applies is the renderer's to say
+            // ([`ThinkingHiding`]): the inline flush draws the value frozen at commit, the retained
+            // document the live one. A click on the run replaces either for this run alone
             // (`thinkingVisibilityOverrides.get(runIndex) ?? this.hideThinkingBlock`, `:131`).
             let hidden = match expansion {
                 Some(e) => !e.is_open(),
-                None => *hidden,
+                None => images.thinking.hidden(*hidden),
             };
             let mut out = thinking_lines(
                 text,
@@ -194,6 +203,7 @@ fn render_entry(
                 images
                     .hidden_thinking_label
                     .unwrap_or(HIDDEN_THINKING_LABEL),
+                md_links,
             );
             if out.is_empty() {
                 return out;
@@ -255,6 +265,7 @@ fn render_entry(
                 *lead_spacer,
                 theme,
                 width,
+                md_links,
             )
         }
         Entry::Custom {
@@ -335,7 +346,9 @@ fn render_entry(
             }
             // A bracketed extension-type label + the markdown body (`custom-message.ts`).
             // `custom-message.ts:33`'s constructor `Spacer(1)` — unconditional.
-            Rendered::None => labeled_message_lines(label, "", body, true, true, theme, width),
+            Rendered::None => {
+                labeled_message_lines(label, "", body, true, true, theme, width, md_links)
+            }
         },
         Entry::BranchSummary { summary } => {
             // X14 — `BranchSummaryMessageComponent` is a `Box(1, 1, customMessageBg)` whose body
@@ -362,6 +375,7 @@ fn render_entry(
                     true,
                     theme,
                     width,
+                    md_links,
                 )
             } else {
                 collapsed_summary_lines(
@@ -398,7 +412,16 @@ fn render_entry(
                 group_thousands(*tokens_before)
             );
             // `interactive-mode.ts:3484` is UNgated too.
-            labeled_message_lines("compaction", &header, summary, true, true, theme, width)
+            labeled_message_lines(
+                "compaction",
+                &header,
+                summary,
+                true,
+                true,
+                theme,
+                width,
+                md_links,
+            )
         }
         Entry::Status(text) => {
             // X18 — `showStatus` (`interactive-mode.ts:3411-3429`) is two chat children and nothing
@@ -493,7 +516,14 @@ fn render_entry(
             // `markdown.ts:288-296` returns EARLY on blank text, before the paddingY block, so an
             // empty body contributes no rows at all — not two blanks.
             if !markdown.trim().is_empty() {
-                let mut md = crate::markdown::render(markdown, w.saturating_sub(2).max(1), theme);
+                let mut md = crate::markdown::render_with_links(
+                    markdown,
+                    w.saturating_sub(2).max(1),
+                    theme,
+                    None,
+                    false,
+                    md_links,
+                );
                 pad_lines(&mut md, 1);
                 out.push(Line::default());
                 out.extend(md);

@@ -207,7 +207,23 @@ impl InputEditor {
     /// `autocompleteState`, `components/editor.ts` @v0.86.0), so whatever is asked next is
     /// unforced. Without this, the recompute after accepting a file from a Tab-opened list would
     /// re-ask the empty trailing token with force and reopen a listing of the whole cwd.
+    ///
+    /// Every route that applies a completion takes the undo snapshot first and ends the typing run
+    /// — Tab (`components/editor.ts:770-772`), Enter (`:791-793`), a list `onSelect` (`:2243-2244`)
+    /// and the forced single-match auto-apply (`:2394-2395`) each open with
+    /// `this.pushUndoSnapshot(); this.lastAction = null;` — so it lives here, in the one place the
+    /// buffer is rewritten, and a key, a click or an auto-apply cannot disagree about it. Like
+    /// upstream's `if (selected && …)` guard, nothing is snapshotted when no item is highlighted.
     pub(super) fn accept_completion(&mut self) {
+        if self
+            .autocomplete
+            .as_ref()
+            .and_then(|ac| ac.selected())
+            .is_some()
+        {
+            self.push_undo_for(LastAction::None);
+            self.last_action = LastAction::None;
+        }
         let lines = self.lines_as_strings();
         let Some(ac) = self.autocomplete.as_mut() else {
             return;

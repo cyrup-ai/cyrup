@@ -61,6 +61,35 @@ pub enum Appearance {
     Light,
 }
 
+impl Appearance {
+    /// Pi `detectColorFgBgTheme` (`theme.ts:689-695`): dark or light from the value of the
+    /// `COLORFGBG` environment variable some terminals set, or `None` without a usable background
+    /// index. The value is `fg;bg` or `fg;xpm;bg` (rxvt), where a field is an ANSI colour index or
+    /// `default` when the colour is not in the palette. The index refers to the terminal's own
+    /// palette, whose colours are unknown here, so it is classified by index like Vim does: 0-6 and
+    /// 8 (bright black, e.g. Solarized Dark's background) are dark, 7 and 9-15 are light.
+    #[must_use]
+    pub fn from_colorfgbg(value: &str) -> Option<Self> {
+        let background = value.split(';').next_back()?.trim();
+        // `/^\d{1,2}$/`
+        if background.is_empty()
+            || background.len() > 2
+            || !background.bytes().all(|b| b.is_ascii_digit())
+        {
+            return None;
+        }
+        let index: u8 = background.parse().ok()?;
+        if index > 15 {
+            return None;
+        }
+        Some(if index <= 6 || index == 8 {
+            Self::Dark
+        } else {
+            Self::Light
+        })
+    }
+}
+
 /// A theme colour value as written — Pi `ColorValue` (`theme-json.ts`): a string (hex, `oklch(…)`,
 /// `okhsl(…)`, variable name, or `""` for the terminal default) or a 256-colour palette index.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

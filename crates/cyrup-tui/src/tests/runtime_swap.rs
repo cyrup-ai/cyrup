@@ -327,6 +327,7 @@ fn run_ctx(
         bash_rx: None,
         package_update_rx: None,
         terminal_colors_rx: None,
+        color_scheme_rx: tokio::sync::mpsc::unbounded_channel().1,
         ui_tx: tokio::sync::mpsc::unbounded_channel().0,
         ui_effect_tx: tokio::sync::mpsc::unbounded_channel().0,
         ext_error_tx: tokio::sync::mpsc::unbounded_channel().0,

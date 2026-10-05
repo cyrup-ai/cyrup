@@ -293,7 +293,19 @@ impl ByteDecoder {
     }
 
     fn decode_frames(&mut self, out: &mut Vec<Event>) {
+        // The last colour-scheme report of this read. Pi hands a back-to-back burst of them to the
+        // listener as one report whose scheme is the final frame's (`parseTerminalColorScheme
+        // Report`, `terminal-colors.ts:85-91`), so the listener hears it once.
+        let mut reported_scheme = None;
         for frame in self.frames.drain(..) {
+            // `CSI ? 997 ; N n`, the mode-2031 notification: consumed ahead of every input listener
+            // and every query, exactly like a colour reply (`tui.ts:1048`), and never typing.
+            if let Frame::Seq(bytes) = &frame
+                && let Some(scheme) = crate::color_scheme::offer_report(bytes)
+            {
+                reported_scheme = Some(scheme);
+                continue;
+            }
             // A colour or DA1 reply that a query still waiting on the terminal owns — one that
             // arrived after the boot probe's deadline — completes that query here (pi's
             // `consumeTerminalColorResponse` runs ahead of every input listener, `tui.ts:1045`).
@@ -306,6 +318,9 @@ impl ByteDecoder {
             if let Decoded::Event(ev) = decode(frame) {
                 out.push(ev);
             }
+        }
+        if let Some(scheme) = reported_scheme {
+            crate::color_scheme::deliver(scheme);
         }
     }
 }

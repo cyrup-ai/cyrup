@@ -11,7 +11,7 @@
 //! for a key.
 
 use std::collections::HashMap;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use cyrup_core::CancelToken;
 use cyrup_session_svc::SessionListing;
@@ -26,6 +26,8 @@ use crate::error::TuiError;
 use crate::keymap::SelectKeymap;
 use crate::selector::{Selector, SelectorOutcome};
 use crate::session_selector::{SessionScope, SessionSelector};
+use crate::startup_theme::StartupTheme;
+use crate::terminal_query::{COLOR_QUERY_TIMEOUT, TerminalColors};
 use crate::theme::UiTheme;
 
 /// How long one turn waits for a key while a listing is still running. The listing reports over a
@@ -163,11 +165,71 @@ impl Drop for LoadDriver {
     }
 }
 
+/// The live theme of a startup selector: pi's `queryStartupTerminalColors` and `onThemePreview`
+/// (`cli/startup-ui.ts:117-127`, `:204-209` @v1.0.0) as a loop component.
+///
+/// The selector is on screen before the terminal has said what its colours are, in the grayscale the
+/// pending system theme paints. The colours arrive on [`Self::colors`] — from the input reader, which
+/// routes the terminal's reply to the query the run asked — and each batch re-applies the theme. A
+/// terminal that answers nothing is given the query's own timeout ([`COLOR_QUERY_TIMEOUT`], pi's
+/// `requestTerminalColors` `.then(apply, () => apply({}))`): then the grayscale ends with nothing
+/// reported, and a reply that comes later still applies.
+pub(crate) struct Retheme {
+    theme: StartupTheme,
+    colors: UnboundedReceiver<TerminalColors>,
+    /// When the wait for the first answer ends; `None` once any colours have been applied.
+    deadline: Option<Instant>,
+}
+
+impl Retheme {
+    /// Start waiting for the terminal's colours at `now`.
+    pub(crate) fn new(
+        theme: StartupTheme,
+        colors: UnboundedReceiver<TerminalColors>,
+        now: Instant,
+    ) -> Self {
+        Self {
+            theme,
+            colors,
+            deadline: now.checked_add(COLOR_QUERY_TIMEOUT),
+        }
+    }
+
+    /// How long until the first answer is given up on, if it is still awaited.
+    fn until_deadline(&self, now: Instant) -> Option<Duration> {
+        self.deadline.map(|due| due.saturating_duration_since(now))
+    }
+
+    /// Apply whatever the terminal has said by `now`. `Some` with the theme to paint when it moved.
+    fn settle(&mut self, now: Instant) -> Option<UiTheme> {
+        let mut changed = false;
+        while let Ok(colors) = self.colors.try_recv() {
+            self.deadline = None;
+            changed |= self.theme.apply_colors(colors);
+        }
+        if self.deadline.is_some_and(|due| due <= now) {
+            self.deadline = None;
+            changed |= self.theme.apply_colors(TerminalColors::default());
+        }
+        changed.then(|| self.theme.theme())
+    }
+
+    /// `onThemePreview`: the highlight names a theme.
+    fn preview(&mut self, name: &str) -> UiTheme {
+        self.theme.preview(name);
+        self.theme.theme()
+    }
+}
+
 /// One selector, one terminal, one key source: [`Self::step`] is a turn of the loop.
 pub(crate) struct StartupLoop<'a, B: Backend, E: StartupEvents> {
     pub(crate) terminal: &'a mut Terminal<B>,
     pub(crate) events: &'a mut E,
-    pub(crate) theme: &'a UiTheme,
+    /// The theme painted now. Replaced when [`Self::retheme`] says the terminal's colours changed
+    /// it.
+    pub(crate) theme: UiTheme,
+    /// Where the theme comes from, if it can change under the selector.
+    pub(crate) retheme: Option<Retheme>,
     pub(crate) keymap: &'a SelectKeymap,
     pub(crate) inner: &'a mut dyn Selector,
     pub(crate) loads: Option<LoadDriver>,
@@ -187,6 +249,7 @@ impl<B: Backend, E: StartupEvents> StartupLoop<'_, B, E> {
             inner,
             ..
         } = self;
+        let theme = &*theme;
         terminal
             .draw(|frame| {
                 let area = frame.area();
@@ -214,6 +277,9 @@ impl<B: Backend, E: StartupEvents> StartupLoop<'_, B, E> {
         &mut self,
         on_apply: &mut impl AsyncFnMut(&str),
     ) -> Result<Option<SelectorOutcome>, TuiError> {
+        if let Some(theme) = self.retheme.as_mut().and_then(|r| r.settle(Instant::now())) {
+            self.theme = theme;
+        }
         let mut loading = false;
         if let Some((picker, loads)) = self.picker_and_loads() {
             loads.serve(picker);
@@ -222,7 +288,15 @@ impl<B: Backend, E: StartupEvents> StartupLoop<'_, B, E> {
                 picker.is_loading(SessionScope::Current) || picker.is_loading(SessionScope::All);
         }
         self.draw()?;
-        let wait = if loading { LOADING_POLL } else { IDLE_POLL };
+        let mut wait = if loading { LOADING_POLL } else { IDLE_POLL };
+        // The first colour answer is not waited on past its timeout (`requestTerminalColors`).
+        if let Some(due) = self
+            .retheme
+            .as_ref()
+            .and_then(|r| r.until_deadline(Instant::now()))
+        {
+            wait = wait.min(due);
+        }
         // Ignore key-release events (Kitty protocol) so a single press is not double-counted.
         let Some(Event::Key(key)) = self.events.next(wait)? else {
             return Ok(None);
@@ -250,8 +324,15 @@ impl<B: Backend, E: StartupEvents> StartupLoop<'_, B, E> {
             // `ConfirmDefault` is only the model/thinking pickers', neither of which runs
             // pre-launch — and there is no session here to persist through anyway) —
             // treated as a no-op like `Redraw`'s siblings.
-            SelectorOutcome::Preview(_)
-            | SelectorOutcome::Redraw
+            // The first-run wizard's theme step (`onThemePreview`, `startup-ui.ts:204-209`): the
+            // dialog repaints in the theme under the highlight.
+            SelectorOutcome::Preview(name) => {
+                if let Some(retheme) = self.retheme.as_mut() {
+                    self.theme = retheme.preview(&name);
+                }
+                Ok(None)
+            }
+            SelectorOutcome::Redraw
             | SelectorOutcome::Ignored
             | SelectorOutcome::OpenExternalEditor
             | SelectorOutcome::ConfirmDefault(_)

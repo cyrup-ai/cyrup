@@ -34,6 +34,10 @@ pub mod package;
 pub mod prompt;
 pub mod scope;
 pub mod skill;
+/// TUI-130 — the `system` theme: pi's `system-theme.ts` recipe and generator, and the concrete
+/// colours pi's `Theme.colors` getter derives from them. Pure arithmetic over [`color`], so the
+/// interactive renderer and a headless HTML export evaluate the same code.
+pub mod system_theme;
 pub mod theme;
 
 use std::sync::Arc;

@@ -66,7 +66,28 @@ use ratatui::crossterm::style::{ContentStyle, Print, PrintStyledContent};
 use ratatui::crossterm::terminal::{Clear, ClearType};
 use ratatui::text::Line;
 
+use super::document::DocLinks;
 use crate::text_width::truncate_line_to_width;
+
+/// What [`repaint`] writes: the retained document, how many of its leading rows to leave out, and
+/// the link tables that turn the markers in its spans back into OSC-8 hyperlinks.
+pub(super) struct Repaint<'a> {
+    pub(super) document: &'a [Line<'static>],
+    /// Leading rows not written. The header rows when the incoming inline renderer keeps showing
+    /// the header itself (an extension's `setHeader`): written here too they would be on screen
+    /// twice.
+    pub(super) skip: usize,
+    pub(super) links: DocLinks<'a>,
+}
+
+impl Repaint<'_> {
+    /// Nothing to write — the un-taken exit, which has no document to trust.
+    pub(super) const NONE: Repaint<'static> = Repaint {
+        document: &[],
+        skip: 0,
+        links: DocLinks::NONE,
+    };
+}
 
 /// Repaint `document` onto the main screen — pi's `afterTerminalStop` row loop
 /// (`tui-alt-screen.ts:322-327`), minus the framing its caller owns (see the module doc).
@@ -87,7 +108,7 @@ use crate::text_width::truncate_line_to_width;
 /// looking at a blank screen.
 pub(super) fn repaint<W: Write>(
     out: &mut W,
-    document: &[Line<'static>],
+    what: &Repaint<'_>,
     width: u16,
     preserve_screen: bool,
 ) {
@@ -96,7 +117,9 @@ pub(super) fn repaint<W: Write>(
     }
     // `Math.max(1, this.terminal.columns)` (`:317`).
     let max = usize::from(width.max(1));
-    for (row, line) in document.iter().enumerate() {
+    for (written, (doc_row, line)) in what.document.iter().enumerate().skip(what.skip).enumerate() {
+        let row = written;
+        let sink = what.links.sink_for(doc_row);
         // `if (row > 0) buffer += "\r\n"` (`:324`) — the separator goes BETWEEN rows, never after
         // the last one. The trailing newline that ends the repaint is the caller's (`:327`), so
         // emitting one here too would leave a blank line under every fullscreen session.
@@ -112,9 +135,9 @@ pub(super) fn repaint<W: Write>(
         // paid only by a row that a resize between the last frame and this exit left too wide; the
         // empty ellipsis is what makes it a hard cut rather than an elision.
         if line.width() <= max {
-            write_row(out, line);
+            write_row(out, line, sink);
         } else {
-            write_row(out, &truncate_line_to_width(line.clone(), max, ""));
+            write_row(out, &truncate_line_to_width(line.clone(), max, ""), sink);
         }
     }
 }
@@ -130,9 +153,21 @@ pub(super) fn repaint<W: Write>(
 /// The row's own [`Line::style`] is patched under each span's, which is ratatui's own composition
 /// order for a styled line — a line-level colour is the base and a span's overrides it, not the
 /// other way round.
-fn write_row<W: Write>(out: &mut W, line: &Line<'static>) {
+///
+/// A span tagged with a link marker (TUI-020) is wrapped in its OSC-8 pair, resolved against `sink`
+/// — the table of this row's run of the document. The escape goes around the styled text, outside
+/// the SGR, which is how pi's rows carry it (`markdown.ts:705` wraps the already-styled link).
+fn write_row<W: Write>(out: &mut W, line: &Line<'static>, sink: Option<&crate::osc::LinkSink>) {
     for span in &line.spans {
-        let style: ContentStyle = line.style.patch(span.style).into_crossterm();
+        let merged = line.style.patch(span.style);
+        let url = sink.and_then(|sink| crate::osc::url_of(merged, sink));
+        let style: ContentStyle = merged.into_crossterm();
+        if let Some(url) = &url {
+            let _ = queue!(out, Print(crate::osc::open(url)));
+        }
         let _ = queue!(out, PrintStyledContent(style.apply(&*span.content)));
+        if url.is_some() {
+            let _ = queue!(out, Print(crate::osc::CLOSE));
+        }
     }
 }

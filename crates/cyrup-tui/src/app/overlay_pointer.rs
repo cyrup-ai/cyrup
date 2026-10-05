@@ -9,15 +9,27 @@
 //!
 //! The rules, all of them a consequence of the overlay being a modal:
 //!
-//! * the topmost overlay whose painted rectangle contains the pointer takes the event, and
-//!   **nothing beneath it is also offered the event** — not the dock, not the editor, not the
-//!   scrolled document. Whatever the overlay answers, a hit is consumed;
-//! * a pointer outside every overlay is a miss, and the caller falls through to the dock and the
-//!   document exactly as it did before overlays could take the pointer;
+//! * the topmost overlay whose painted rectangle contains the pointer is offered the event, and
+//!   **nothing beneath it is also offered it** — not the dock, not the editor, not the scrolled
+//!   document, not the scrollbar. That is pi's `overlay.hit` (`tui-alt-screen.ts:929-960`);
+//! * what the overlay *answers* decides the rest ([`OverlayPointerOutcome`]). A component that
+//!   handles a press (a row, an input) keeps the gesture: a text selection already made is
+//!   cleared, no new one starts, and the release comes back as a click. A press it does not handle
+//!   (pi's `overlay.result` undefined) is [`OverlayRoute::Over`]: it falls through to the screen
+//!   text selection, so the text of a modal can be selected and copied, as pi's
+//!   `result ?? (hit ? undefined : layout)` leaves it to `handleSelectionMouseEvent`;
+//! * a wheel notch the overlay does not handle is deferred to the overlay, as pi's
+//!   `shouldDeferViewportInputToOverlay` does (`:709`): it is consumed here and scrolls nothing;
+//! * a pointer outside every overlay is a miss ([`OverlayRoute::Miss`]) and the caller falls
+//!   through to the dock and the document, which no longer takes the wheel while a modal is open
+//!   (see [`crate::altscreen::Modal`]);
 //! * positions are made local to the overlay's rectangle ([`Pointer::localized`]), so the overlay
 //!   indexes straight into the lines it painted;
-//! * a press and its release on the same cell are folded into a [`Pointer::Click`] carrying the
-//!   consecutive-click count, as for the dock ([`super::pointer`]).
+//! * a press the overlay handled and its release on the same cell are folded into a
+//!   [`Pointer::Click`] carrying the consecutive-click count, as for the dock ([`super::pointer`]).
+//!   A press it left to the selection becomes a click through the selection's release
+//!   ([`App::offer_overlay_click`]), so a drag across text copies it and a click on text selects
+//!   nothing.
 //!
 //! Everything here is inert in regular mode, where the terminal is never asked for mouse reports.
 
@@ -28,7 +40,30 @@ use ratatui::layout::Position;
 
 use super::pointer::DOUBLE_CLICK_INTERVAL;
 use super::{App, AppAction, Pointer};
-use crate::overlay::OverlayOutcome;
+use crate::overlay::OverlayPointerOutcome;
+
+/// Where a mouse report goes after the floating overlays have seen it.
+#[derive(Debug, PartialEq)]
+pub(crate) enum OverlayRoute {
+    /// The pointer is outside every overlay: the dock and the document are offered the report.
+    Miss,
+    /// The pointer is over an overlay that did not handle the report. Nothing beneath the overlay
+    /// is offered it, but the text selection is: the overlay's painted rows are in the frame.
+    Over,
+    /// An overlay took the report; this is the answer, and nothing else sees it.
+    Taken(AppAction),
+}
+
+/// What an overlay made of a click offered after a selection's release.
+#[derive(Debug, PartialEq)]
+pub(crate) enum OverlayClick {
+    /// No overlay is under the cell: the dock may take the click.
+    Miss,
+    /// An overlay is under the cell and left the click alone; nothing beneath it is offered it.
+    Unhandled,
+    /// An overlay took the click.
+    Taken(AppAction),
+}
 
 /// A press that landed on an overlay and has not been released yet.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -82,59 +117,99 @@ impl OverlayPointerState {
 }
 
 impl<B: ratatui::backend::Backend> App<B> {
-    /// Offer a mouse report to the floating overlays. `Some` means an overlay took the event and
-    /// the caller must offer it to nothing else; `None` is a miss and the report is the dock's.
-    pub(crate) fn handle_overlay_pointer(&mut self, ev: &MouseEvent) -> Option<AppAction> {
+    /// Offer a mouse report to the floating overlays. See [`OverlayRoute`] for what each answer
+    /// obliges the caller to do next.
+    pub(crate) fn handle_overlay_pointer(&mut self, ev: &MouseEvent) -> OverlayRoute {
         let at = Position::new(ev.column, ev.row);
         match ev.kind {
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
-                let index = self.overlay_at(at)?;
+                let Some(index) = self.overlay_at(at) else {
+                    return OverlayRoute::Miss;
+                };
                 let lines = if matches!(ev.kind, MouseEventKind::ScrollUp) {
                     -1
                 } else {
                     1
                 };
-                Some(self.dispatch_overlay_pointer(index, Pointer::Wheel { at, lines }))
+                // A notch the overlay does not handle is deferred to it, not given to the
+                // document: consumed, and it scrolls nothing.
+                OverlayRoute::Taken(
+                    self.dispatch_overlay_pointer(index, Pointer::Wheel { at, lines })
+                        .unwrap_or(AppAction::None),
+                )
             }
             MouseEventKind::Down(MouseButton::Left) => {
+                // A press ends whatever an earlier press began.
+                self.state.overlay_pointer.gesture = None;
                 let Some(index) = self.overlay_at(at) else {
-                    // A press elsewhere ends whatever an earlier press began.
-                    self.state.overlay_pointer.gesture = None;
-                    return None;
+                    return OverlayRoute::Miss;
+                };
+                let Some(action) = self.dispatch_overlay_pointer(index, Pointer::Press { at })
+                else {
+                    // Not the overlay's press: it starts a text selection on the painted rows.
+                    return OverlayRoute::Over;
                 };
                 self.state.overlay_pointer.gesture = Some(Gesture {
                     overlay: index,
                     press: at,
                     moved: false,
                 });
-                // The document's selection must not start under the modal, and one already made
-                // is dropped, as for a press the dock takes.
+                // The press is the overlay's, so a selection already made is dropped and none
+                // starts: pi's `clearTextSelection()` on a handled press.
                 if let Some(alt) = self.altscreen.as_mut() {
                     alt.clear_selection();
                 }
-                Some(self.dispatch_overlay_pointer(index, Pointer::Press { at }))
+                OverlayRoute::Taken(action)
             }
             MouseEventKind::Drag(MouseButton::Left) => {
-                let gesture = self.state.overlay_pointer.gesture.as_mut()?;
+                // Without a press of the overlay's, a drag is the selection's (or the dock's).
+                let Some(gesture) = self.state.overlay_pointer.gesture.as_mut() else {
+                    return OverlayRoute::Miss;
+                };
                 if at != gesture.press {
                     gesture.moved = true;
                 }
-                Some(AppAction::None)
+                OverlayRoute::Taken(AppAction::None)
             }
             MouseEventKind::Up(MouseButton::Left) => {
-                let gesture = self.state.overlay_pointer.gesture.take()?;
+                let Some(gesture) = self.state.overlay_pointer.gesture.take() else {
+                    return OverlayRoute::Miss;
+                };
                 if gesture.moved || at != gesture.press {
-                    return Some(AppAction::None);
+                    return OverlayRoute::Taken(AppAction::None);
                 }
                 let count =
                     self.state
                         .overlay_pointer
                         .register_click(Instant::now(), at, gesture.overlay);
-                Some(self.dispatch_overlay_pointer(gesture.overlay, Pointer::Click { at, count }))
+                OverlayRoute::Taken(
+                    self.dispatch_overlay_pointer(gesture.overlay, Pointer::Click { at, count })
+                        .unwrap_or(AppAction::None),
+                )
             }
-            // Any other report over an overlay (a right-click paste, a middle click, hover) is
-            // still a report over the modal: it must not reach the editor or the document under it.
-            _ => self.overlay_at(at).map(|_| AppAction::None),
+            // Any other report over an overlay (a right press, a middle click, hover) is not
+            // handled by a component: pi tries the right-click paste and the selection, which
+            // ignore the rest. It must not reach the editor or the document under the modal.
+            _ => {
+                if self.overlay_at(at).is_some() {
+                    OverlayRoute::Over
+                } else {
+                    OverlayRoute::Miss
+                }
+            }
+        }
+    }
+
+    /// A clean click that began a text selection on the screen, released on `at`: offer it to the
+    /// overlay under the cell, as pi's release does (`dispatchMouseToOverlay(clickEvent)`,
+    /// `tui-alt-screen.ts:1346-1347`). `count` is the selection ladder's.
+    pub(crate) fn offer_overlay_click(&mut self, at: Position, count: u8) -> OverlayClick {
+        let Some(index) = self.overlay_at(at) else {
+            return OverlayClick::Miss;
+        };
+        match self.dispatch_overlay_pointer(index, Pointer::Click { at, count }) {
+            Some(action) => OverlayClick::Taken(action),
+            None => OverlayClick::Unhandled,
         }
     }
 
@@ -150,21 +225,19 @@ impl<B: ratatui::backend::Backend> App<B> {
     }
 
     /// Hand `event` to the overlay at `index`, its position made local to the rectangle it was
-    /// painted in. A `Close` tears the overlay down like a key that closes it does.
-    fn dispatch_overlay_pointer(&mut self, index: usize, event: Pointer) -> AppAction {
-        let Some(overlay) = self.state.overlays.get_mut(index) else {
-            return AppAction::None;
-        };
-        let Some(rect) = overlay.painted_rect() else {
-            return AppAction::None;
-        };
+    /// painted in. `None` when the overlay did not handle it. A `Close` tears the overlay down like
+    /// a key that closes it does.
+    fn dispatch_overlay_pointer(&mut self, index: usize, event: Pointer) -> Option<AppAction> {
+        let overlay = self.state.overlays.get_mut(index)?;
+        let rect = overlay.painted_rect()?;
         match overlay.pointer(event.localized(rect)) {
-            OverlayOutcome::Close => {
+            OverlayPointerOutcome::Unhandled => None,
+            OverlayPointerOutcome::Close => {
                 self.state.overlays.remove(index);
-                AppAction::Redraw
+                Some(AppAction::Redraw)
             }
-            OverlayOutcome::Redraw => AppAction::Redraw,
-            OverlayOutcome::Ignored => AppAction::None,
+            OverlayPointerOutcome::Redraw => Some(AppAction::Redraw),
+            OverlayPointerOutcome::Handled => Some(AppAction::None),
         }
     }
 }

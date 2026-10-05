@@ -67,6 +67,10 @@ async fn session(tmp: &TempDir) -> Arc<AgentSession> {
 
 fn app_with_a_document() -> App<TestBackend> {
     let mut app = App::new(TestBackend::new(40, 10), UiTheme::dark()).unwrap();
+    // The startup block is the document's first rows, and its text is selectable too: leave it out
+    // so the drag below has exactly one piece of text to find.
+    app.state_mut().show_startup_hints = false;
+    app.state_mut().startup_header = crate::StartupHeader::Hidden;
     app.transcript_mut()
         .push_status("selectable text for the drag");
     app

@@ -393,6 +393,18 @@ pub trait ThemeAccess: Send + Sync {
     /// `Theme not found: {name}` (`theme.ts:622`, thrown by `loadThemeJson` and caught into the
     /// result by `setTheme`, `:891-913`).
     fn set(&self, name: &str) -> Result<(), String>;
+
+    /// The palette an HTML export of the ACTIVE theme renders with — pi's `getResolvedThemeColors()`
+    /// over `currentThemeName` (`modes/interactive/theme/theme.ts:903-906` @v1.0.0), which reads the
+    /// theme's `colors` getter: every token set to `""` takes the terminal's reported default colour
+    /// and the generated `system` theme carries its generated tokens.
+    ///
+    /// Only the TUI can answer — it holds the terminal's colours and the generated `system` theme,
+    /// neither of which is a document in the session's resources — so the default is `None`, and the
+    /// export then falls back to the active theme's document.
+    fn export_theme(&self) -> Option<crate::export::ExportTheme> {
+        None
+    }
 }
 
 /// The extension-visible mirror of the interactive editor's buffer, backing
@@ -1251,6 +1263,14 @@ impl LiveHostServices {
     /// like the ui sinks: a replacement session brings a fresh `LiveHostServices`.
     pub fn attach_theme_access(&self, theme: Arc<dyn ThemeAccess>) {
         *Self::lock(&self.theme_access) = Some(theme);
+    }
+
+    /// The active theme's export palette, if the interactive TUI's theme seam is attached and has
+    /// one to give (see [`ThemeAccess::export_theme`]). `None` headless.
+    #[must_use]
+    pub fn export_theme(&self) -> Option<crate::export::ExportTheme> {
+        let access = Self::lock(&self.theme_access).clone()?;
+        access.export_theme()
     }
 
     /// EXT-064 — attach the interactive footer's data mirror (SEAM-T03), the source behind

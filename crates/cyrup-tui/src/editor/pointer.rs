@@ -8,7 +8,7 @@
 use ratatui::layout::Rect;
 
 use super::{InputEditor, LastAction, VisualLine, display_width};
-use crate::app::Pointer;
+use crate::app::{Pointer, PointerReply};
 use crate::select_list::ListPointer;
 
 /// Where on a visual line a click at display column `target` puts the caret, as a char offset into
@@ -42,13 +42,17 @@ fn caret_for_column(
 
 impl InputEditor {
     /// Act on a pointer event over the editor, `event` local to `area` (the rectangle the editor
-    /// was rendered into). `true` when the editor changed and the frame must be repainted.
+    /// was rendered into).
     ///
-    /// Only a click places the caret. A click on a rule row, or below the last visible line, is the
-    /// editor's (the caller claims it) but moves nothing.
-    pub(crate) fn pointer(&mut self, area: Rect, event: Pointer) -> bool {
+    /// Only a click is the editor's, and every click is: it places the caret, or — on a rule row
+    /// or below the last visible line — moves nothing and still takes the click (pi answers
+    /// `{ handled: true }` for those, `components/editor.ts:659-660`). A press, a drag and a release
+    /// are left unanswered on purpose (`:656-658`): they are what the renderer's text selection
+    /// runs on, so a drag across the prompt selects it instead of moving the caret, and the click
+    /// that places the caret is synthesised only from a press and release on one cell.
+    pub(crate) fn pointer(&mut self, area: Rect, event: Pointer) -> PointerReply {
         let Pointer::Click { at, .. } = event else {
-            return false;
+            return PointerReply::Ignored;
         };
         let map = self.visual_line_map();
         // Row 0 is the top rule; the visible lines follow, at most as many as the render window
@@ -59,11 +63,11 @@ impl InputEditor {
         let shown = map.len().saturating_sub(self.scroll_offset).min(window);
         let row = usize::from(at.y);
         if row == 0 || row > shown {
-            return false;
+            return PointerReply::Handled;
         }
         let index = self.scroll_offset.saturating_add(row - 1);
         let (Some(&vl), next) = (map.get(index), map.get(index + 1)) else {
-            return false;
+            return PointerReply::Handled;
         };
         let mid_line = next.is_some_and(|n| n.logical == vl.logical);
         let target = usize::from(at.x.saturating_sub(self.effective_padding(area.width)));
@@ -80,7 +84,11 @@ impl InputEditor {
         if popup {
             self.update_autocomplete();
         }
-        popup || before != (self.row, self.col)
+        if popup || before != (self.row, self.col) {
+            PointerReply::Redraw
+        } else {
+            PointerReply::Handled
+        }
     }
 
     /// The caret column a click at display column `target` of visual line `vl` gives.
@@ -109,7 +117,9 @@ impl InputEditor {
     }
 
     /// Act on a pointer event over the completion popup, `event` local to `area` (the popup's
-    /// rectangle). `true` when the popup or the buffer changed.
+    /// rectangle). [`PointerReply::Ignored`] for a row the list does not act on — pi's
+    /// `SelectList.handleMouse` answers `undefined` there (`select-list.ts:116-124`), so the press
+    /// is free to start a text selection.
     ///
     /// The list answers like a key would: a wheel notch or a press moves the highlight, a click
     /// activates an item. Activation is pi's `SelectList.onSelect` for the editor's popup
@@ -121,19 +131,18 @@ impl InputEditor {
     /// The list is painted inset by the editor's horizontal padding, but a row is chosen by its
     /// vertical position alone: pi shifts `x` by the padding and the list never reads it, so a
     /// click in the padding columns still hits the row it is level with.
-    pub(crate) fn pointer_popup(&mut self, _area: Rect, event: Pointer) -> bool {
+    pub(crate) fn pointer_popup(&mut self, _area: Rect, event: Pointer) -> PointerReply {
         let Some(ac) = self.autocomplete.as_mut() else {
-            return false;
+            return PointerReply::Ignored;
         };
         match ac.list.pointer(event) {
-            ListPointer::Ignored | ListPointer::Handled => false,
-            ListPointer::Moved => true,
+            ListPointer::Ignored => PointerReply::Ignored,
+            ListPointer::Handled => PointerReply::Handled,
+            ListPointer::Moved => PointerReply::Redraw,
             ListPointer::Activated(_) => {
-                self.push_undo_for(LastAction::None);
-                self.last_action = LastAction::None;
                 self.accept_completion();
                 self.autocomplete = None;
-                true
+                PointerReply::Redraw
             }
         }
     }

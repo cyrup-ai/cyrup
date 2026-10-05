@@ -95,7 +95,7 @@ impl StartupBlock {
 /// branch without building a session.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct StartupInventory {
-    /// `!quiet_startup`. When false the inventory blocks are suppressed and the diagnostics are
+    /// `quietStartup` is unset. When false the inventory blocks are suppressed and the diagnostics are
     /// not — pi's `showDiagnosticsWhenQuiet: true`. See [`StartupInventory::of`] for why the
     /// `verbose ||` half of `StartupReport::show_listing()` is not read here.
     pub show_listing: bool,
@@ -208,13 +208,19 @@ impl StartupInventory {
         ];
 
         Self {
-            // `StartupReport::show_listing()` is `verbose || !quiet_startup`. **[CYRUP-DELTA]**
+            // `StartupReport::show_listing()` is `verbose || quietStartup === false`
+            // (`shouldShowStartupDetails`), so BOTH `true` and `"header"` suppress the inventory:
+            // there is no header in an editor's prelude for `"header"` to keep. **[CYRUP-DELTA]**
             // the `verbose` half is dropped: `--verbose` is a CLI flag the TUI's own front-end
             // holds, not a setting, and nothing plumbs it to the ACP host. *What it costs*: a
             // user who sets `quietStartup` and then launches their editor cannot re-enable the
             // inventory for one session the way `cyrup --verbose` does in the terminal. The
             // diagnostics are unaffected — they are never suppressed.
-            show_listing: !services.settings.effective().quiet_startup(),
+            show_listing: services
+                .settings
+                .effective()
+                .quiet_startup()
+                .shows_details(false),
             listing,
             diagnostics,
         }

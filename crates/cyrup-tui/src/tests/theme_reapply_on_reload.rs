@@ -9,10 +9,10 @@
 //! `imageWidthCells` and `editorPaddingX` and never touched the theme, which was resolved once at
 //! boot in the composition root's stack frame and then unreachable.
 //!
-//! The MODE-`2031` half of TUI-004 is deliberately not ported and is not tested here: crossterm
-//! surfaces no event for the unsolicited `CSI ? 997 ; N n` notification, so enabling it would feed
-//! the push into `event::read()` as stray keystrokes. That reasoning lives on
-//! [`crate::ThemeController::auto_sync`].
+//! The MODE-`2031` half of TUI-004 — the terminal's light/dark notifications — is not tested here:
+//! the byte reader frames `CSI ? 997 ; N n` itself, so enabling the mode no longer feeds stray
+//! keystrokes to the prompt. Its lifecycle and its effect on the theme are in `crate::color_scheme`
+//! and `tests::system_theme_surfaces`.
 
 #![allow(
     clippy::unwrap_used,

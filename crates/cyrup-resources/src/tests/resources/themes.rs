@@ -587,3 +587,30 @@ fn an_appearance_outside_the_enum_is_a_schema_error() {
     assert!(msg.contains("/appearance"), "{msg}");
     assert!(msg.contains("Expected union value"), "{msg}");
 }
+
+/// `Appearance::from_colorfgbg` is pi's `detectColorFgBgTheme` (`theme.ts:689-695` @v1.0.0): the
+/// last `;`-separated field, one or two digits, an index of at most 15; 0-6 and 8 are dark.
+#[test]
+fn colorfgbg_is_classified_by_the_background_index_as_pi_classifies_it() {
+    use crate::Appearance::{Dark, Light};
+    for (value, expected) in [
+        ("0;15", Some(Light)),
+        ("15;0", Some(Dark)),
+        ("0;8", Some(Dark)),
+        ("0;9", Some(Light)),
+        ("0;default;15", Some(Light)),
+        ("0; 7 ", Some(Light)),
+        ("0;15;", None),
+        ("default;default", None),
+        ("", None),
+        ("0;16", None),
+        ("0;007", None),
+        ("0;1x", None),
+    ] {
+        assert_eq!(
+            crate::Appearance::from_colorfgbg(value),
+            expected,
+            "{value:?}"
+        );
+    }
+}
