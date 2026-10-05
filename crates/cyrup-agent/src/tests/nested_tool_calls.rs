@@ -672,7 +672,17 @@ async fn a_dropped_call_releases_the_exclusive_queue() {
 /// is still recorded.
 #[tokio::test]
 async fn non_object_arguments_settle_as_an_error_outcome() {
-    let host = TestHost::new(vec![], false);
+    // The tool exists and would succeed: only the arguments make the call fail.
+    let ran = Arc::new(AtomicUsize::new(0));
+    let r = ran.clone();
+    let echo = arc(FnTool::new("echo", move |_, _| {
+        let r = r.clone();
+        Box::pin(async move {
+            r.fetch_add(1, Ordering::SeqCst);
+            Ok(ToolResult::default())
+        })
+    }));
+    let host = TestHost::new(vec![echo], false);
     let runner = NestedToolCallRunner::new();
     let outcome = runner
         .execute(
@@ -684,6 +694,11 @@ async fn non_object_arguments_settle_as_an_error_outcome() {
         )
         .await;
     assert!(outcome.is_error);
+    assert_eq!(
+        text_of(&outcome.result.content),
+        "Invalid arguments for tool echo: expected an object, got array"
+    );
+    assert_eq!(ran.load(Ordering::SeqCst), 0, "the tool ran");
     let record = runner.take_record(&id("call")).unwrap().calls.unwrap();
     assert_eq!(record.calls[0].status, NestedCallStatus::Error);
 }
