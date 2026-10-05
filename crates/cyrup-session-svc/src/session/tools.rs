@@ -66,7 +66,7 @@ impl AgentSession {
     }
 
     /// Hand a resolved loadout to the agent, reporting the `prepare_loadout` hooks that failed while
-    /// it was resolved (pi `emitError({ event: "prepare_loadout" })`, `agent-session.ts:1560-1566`
+    /// it was resolved (pi `emitError({ event: "prepare_loadout" })`, `agent-session.ts:1556-1561`
     /// @v1.0.1) — a failed hook changes nothing, but it is not silent.
     pub(super) async fn apply_loadout(&self, loadout: ToolLoadout) {
         for failure in loadout.hook_failures() {

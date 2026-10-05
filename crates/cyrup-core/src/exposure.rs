@@ -221,7 +221,7 @@ impl<'a> LoadoutView<'a> {
 
 /// A `prepare_loadout` hook that failed. The hook's tool is named; the message is the error's own
 /// text. Upstream reports the same pair through `emitError({ event: "prepare_loadout", … })`
-/// (`agent-session.ts:1560-1566` @v1.0.1).
+/// (`agent-session.ts:1556-1561` @v1.0.1).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LoadoutHookFailure {
     pub tool: String,
