@@ -115,6 +115,15 @@ fn attach_native_extensions(
     if let Some(ext) = cyrup_llama::llama_extension_for_env(agent_dir) {
         builder = builder.with_native_extension(ext);
     }
+    // `codemode` is the next entry of pi's `builtInExtensions` (`extensions/index.ts:9-14`
+    // @v1.0.1), registered inactive and replaceable. Its scripts run in the sandbox
+    // [`cyrup_codemode_runtime::tool::UnavailableSandboxFactory`] stands in for until the
+    // `deno_core` sandbox is linked: with it, activating the tool is a NAMED failure of each script
+    // ("codemode sandbox unavailable"), never a silent no-op.
+    builder = builder.with_codemode(cyrup_codemode_runtime::CodemodeExtension::new(
+        cyrup_codemode_runtime::tool::CodemodeHostSlot::new(),
+        Arc::new(cyrup_codemode_runtime::tool::UnavailableSandboxFactory),
+    ));
     // A malformed `intercom/config.json`, or an unusable `PI_INTERCOM_ASK_TIMEOUT_MS`, REFUSES
     // this extension. Both of upstream's equivalents throw from the first two lines of the
     // extension factory itself — `loadConfig()` (`pi-intercom/index.ts:648` @v0.16.0, throwing from

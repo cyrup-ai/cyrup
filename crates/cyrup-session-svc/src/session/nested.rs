@@ -78,7 +78,7 @@ impl AgentSession {
     /// The tools a nested call resolves against — pi `_getCallableTools()`
     /// (`agent-session.ts:1515-1520`): the active `direct` tools and every registered `codemode`
     /// or `deferred` one.
-    fn callable_tools(&self) -> Vec<Arc<dyn Tool>> {
+    pub(super) fn callable_tools(&self) -> Vec<Arc<dyn Tool>> {
         Self::lock(&self.dynamic_tools).callable_tools()
     }
 }

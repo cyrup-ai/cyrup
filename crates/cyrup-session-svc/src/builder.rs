@@ -509,6 +509,9 @@ pub struct SessionBuilder {
     settings_store: Arc<dyn SettingsStore>,
     auth: Option<Arc<AuthStore>>,
     native_extensions: Vec<Arc<dyn NativeExtension>>,
+    /// Where the `codemode` extension finds the session it runs in. Set by [`Self::with_codemode`]
+    /// or [`Self::codemode_host_slot`]; each built session binds its own host into it.
+    codemode_host_slot: Option<cyrup_codemode_runtime::tool::CodemodeHostSlot>,
     cli_settings: Settings,
     /// A pre-built session manager to adopt instead of opening/creating one from `config.target`
     /// (Pi `createAgentSessionFromServices` with a caller-supplied `sessionManager`,
@@ -618,6 +621,7 @@ impl SessionBuilder {
             settings_store: Arc::new(InMemorySettingsStore::new()),
             auth: None,
             native_extensions: Vec::new(),
+            codemode_host_slot: None,
             cli_settings: Settings::new(),
             prebuilt_manager: None,
             provider_resolver: None,
@@ -760,6 +764,28 @@ impl SessionBuilder {
     #[must_use]
     pub fn with_native_extension(mut self, ext: Arc<dyn NativeExtension>) -> Self {
         self.native_extensions.push(ext);
+        self
+    }
+
+    /// Register the built-in `codemode` extension (pi's `builtin:codemode`, `extensions/index.ts:9-14`
+    /// @v1.0.1): the extension is loaded like any native built-in, and each session built from this
+    /// builder is bound into the extension's host slot, so the tool it registers can call tools,
+    /// replay the branch's `store()` entries and reach the model registry as pi's `ctx` lets it.
+    #[must_use]
+    pub fn with_codemode(self, ext: cyrup_codemode_runtime::CodemodeExtension) -> Self {
+        let slot = ext.host().clone();
+        self.with_native_extension(Arc::new(ext))
+            .codemode_host_slot(slot)
+    }
+
+    /// Bind each built session into `slot`, for a codemode extension that is already registered
+    /// through [`Self::with_native_extension`] (what [`crate::SessionFactory`] does per build).
+    #[must_use]
+    pub fn codemode_host_slot(
+        mut self,
+        slot: cyrup_codemode_runtime::tool::CodemodeHostSlot,
+    ) -> Self {
+        self.codemode_host_slot = Some(slot);
         self
     }
 
@@ -1282,6 +1308,23 @@ impl SessionBuilder {
         // built-ins (permission-system, intercom), so anything short of a non-zero exit would turn
         // a failed permission gate into a fail-OPEN session.
         let mut native_load_errors: Vec<crate::services::ExtensionLoadDiagnostic> = Vec::new();
+        // The `codemode` tool's `prepare_loadout` hook reads `codemode.mode` / `codemode.inlineBudget`
+        // while the loadout is resolved (below), long before the session is shared, so its host
+        // exists from here with the settings this session was built with. `into_shared` attaches the
+        // session itself. Pi reads the same two settings from `pi.getSettings()` at hook time
+        // (`extensions/codemode/index.ts:22-29` @v1.0.1); a session's settings are fixed until
+        // `/reload` rebuilds it, so reading them once is the same value.
+        let codemode_host = self.codemode_host_slot.as_ref().map(|slot| {
+            let eff = settings.effective();
+            let host = Arc::new(crate::session::SessionCodemodeHost::new(
+                crate::session::CodemodeSettings {
+                    mode: eff.codemode_mode(),
+                    inline_budget: eff.codemode_inline_budget(),
+                },
+            ));
+            slot.bind(host.clone());
+            host
+        });
         // SEAM-071: `--no-extensions` gates the AMBIENT natives too. It used to gate only the
         // WASM/disk discovery roots (`extension_discovery_roots`), while this loop loaded every
         // native unconditionally — so `cyrup --no-extensions` still started an intercom broker,
@@ -2332,6 +2375,7 @@ impl SessionBuilder {
             read_model_vision,
             nested_calls,
             hooks: nested_hooks,
+            codemode_host,
         };
 
         let services = AgentSessionServices {

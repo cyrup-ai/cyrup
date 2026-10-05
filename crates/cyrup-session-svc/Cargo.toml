@@ -34,6 +34,9 @@ cyrup-provider = { workspace = true }
 cyrup-tools = { workspace = true }
 cyrup-session = { workspace = true }
 cyrup-config = { workspace = true }
+# `CodemodeHost`, the seam the `codemode` tool acts through; the session implements it
+# (`session/codemode.rs`) and `SessionBuilder::with_codemode` binds it.
+cyrup-codemode-runtime = { workspace = true }
 cyrup-resources = { workspace = true }
 # `src/host_services.rs:17-19` opens with `cyrup_ext::caps::http::HttpCaps`,
 # `cyrup_ext::caps::proc::ProcCaps` and `cyrup_ext::host::{...}` — all three modules exist only under
@@ -79,6 +82,9 @@ cyrup-agent = { workspace = true }
 cyrup-ext = { workspace = true }
 cyrup-session = { workspace = true }
 cyrup-config = { workspace = true }
+# A scripted sandbox and a recording host, so the session tests drive the real `codemode` tool.
+cyrup-codemode-runtime = { workspace = true, features = ["testkit"] }
+cyrup-codemode = { workspace = true }
 cyrup-tools = { workspace = true }
 # Lock-neutral: cyrup-provider is already a dependency; `faux` pulls no new crate.
 cyrup-provider = { workspace = true, features = ["faux"] }
