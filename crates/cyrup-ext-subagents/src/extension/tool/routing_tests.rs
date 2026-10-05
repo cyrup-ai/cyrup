@@ -3495,3 +3495,305 @@ async fn a_blank_machine_is_refused_at_the_tool_boundary() {
         );
     }
 }
+
+// ===========================================================================================
+// SUBA-149 (residual half) — the DEFAULT single-run path: `asyncByDefault` is `true`, so a bare
+// `subagent({agent, task, worktree: true})` is a BACKGROUND launch. These are the tool-surface
+// halves of that case; the walker/settle halves live in
+// `crate::tests::async_single_worktree_isolation`.
+// ===========================================================================================
+
+/// A real, CLEAN git repository — the only source a managed allocation accepts.
+fn suba149_clean_repo() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let run = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .current_dir(dir.path())
+            .args(args)
+            .output()
+            .expect("git runs");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    run(&["init", "-q"]);
+    run(&["config", "user.email", "t@example.com"]);
+    run(&["config", "user.name", "SUBA-149 Tests"]);
+    std::fs::write(dir.path().join("tracked.txt"), "initial\n").expect("tracked");
+    run(&["add", "-A"]);
+    run(&["commit", "-q", "-m", "initial"]);
+    dir
+}
+
+/// A minimal persona on disk, discoverable from `cwd`, and COMMITTED.
+///
+/// The commit is load-bearing, not tidiness: `preflight_worktree_source` excludes only the project
+/// artifact root, so an uncommitted persona file is an uncommitted change and Fix 2(b) would
+/// (correctly) refuse the very launch these tests are about.
+fn suba149_write_persona(cwd: &std::path::Path, name: &str) {
+    let dir = cwd.join(".cyrup").join("agents");
+    std::fs::create_dir_all(&dir).expect("agents dir");
+    std::fs::write(
+        dir.join(format!("{name}.md")),
+        format!("---\nname: {name}\ndescription: SUBA-149 fixture\n---\n\nYou isolate.\n"),
+    )
+    .expect("persona");
+    let run = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .current_dir(cwd)
+            .args(args)
+            .output()
+            .expect("git runs");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    run(&["add", "-A"]);
+    run(&["commit", "-q", "-m", "persona"]);
+}
+
+/// A `worktree: true` element of the TOOL's `chain[]` array must reach the walker as a request —
+/// pi's `SequentialStep.worktree` is a legal key on exactly that shape.
+///
+/// **Gutting mutation this fails on:** removing `ToolTaskItem::worktree` (the key is then not
+/// parsed at all and `tool_task_to_spec` lands `Shared`).
+#[test]
+fn a_tool_authored_sequential_chain_step_lowers_its_worktree_flag() {
+    let graph = crate::extension::tool::task_items::parse_tool_chain_items(
+        &[
+            serde_json::json!({ "agent": "a", "task": "plain" }),
+            serde_json::json!({ "agent": "b", "task": "isolated", "worktree": true }),
+        ],
+        2,
+    )
+    .expect("the chain lowers");
+    let requests: Vec<crate::spawn::worktree::WorktreeRequest> = graph
+        .iter()
+        .map(|s| match s {
+            RunnerStep::SingleStep(spec) => spec.worktree,
+            other => panic!("expected SingleSteps, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        requests,
+        vec![
+            crate::spawn::worktree::WorktreeRequest::Shared,
+            crate::spawn::worktree::WorktreeRequest::Isolated
+        ],
+        "a tool-authored chain step's `worktree` must survive the lowering"
+    );
+}
+
+// -------------------------------------------------------------------------------------------
+// The headline: a bare call, no `async: false`, reaching hop 2
+// -------------------------------------------------------------------------------------------
+
+/// **THE HEADLINE.** `subagent({agent, task, worktree: true})` — no `async` key anywhere — is a
+/// BACKGROUND launch under the shipped `asyncByDefault: true`, and the isolation request must
+/// reach the detached runner's step.
+///
+/// The test asserts the async path was the one taken (the reply is pi's `Async: {agent} [{id}]`
+/// headline, `async-execution.ts:1515`) BEFORE it asserts anything about the request, because a
+/// test that quietly took the foreground path would be re-proving what commit `b9e35f5d` already
+/// fixed. It then reads the one-shot `runner-config.json` that hop 1 writes for hop 2 and checks
+/// the step's serialized `worktree` — pi's own wire shape,
+/// `...(params.worktree === true ? { worktree: true } : {})` (`async-execution.ts:2163`).
+///
+/// `spawn_command` is `true(1)`, so both hops are genuinely spawned and confirmed while nothing
+/// consumes the config file.
+///
+/// **Gutting mutation this fails on:** reverting `route_single_background`'s
+/// `worktree: crate::spawn::worktree::WorktreeRequest::from_flag(p.worktree)` to `crate::spawn::worktree::WorktreeRequest::Shared` — the launch
+/// still succeeds and the step reaches hop 2 with no `worktree` key, exactly as it did before.
+#[tokio::test]
+async fn a_bare_worktree_true_single_call_reaches_hop_two_as_an_isolation_request() {
+    let repo = suba149_clean_repo();
+    let home = tempfile::tempdir().expect("sandbox home");
+    let executor = Arc::new(SubagentExecutor::new());
+    arm_scoped_missions(&executor, home.path()).await;
+    {
+        let mut cfg = executor.config_cell().lock().await;
+        // Sandboxed OUTSIDE the repository: the run directory, the mission index and the async
+        // root must not themselves dirty the source tree Fix 2(b)'s probe reads.
+        cfg.roots = crate::paths::Roots::sandboxed(home.path());
+        cfg.max_subagent_depth = 4;
+        // `true(1)` execs and exits immediately: hop 1 is really spawned and confirmed, and
+        // nothing reads (or deletes) the one-shot config this test inspects.
+        cfg.spawn_command = Some(crate::spawn::SpawnCommand {
+            binary: std::path::PathBuf::from("true"),
+            base_args: Vec::new(),
+        });
+        assert!(
+            cfg.async_by_default,
+            "the shipped default is what makes this the DEFAULT path; if this flips, the headline \
+             case moves and this test must follow it"
+        );
+    }
+    suba149_write_persona(repo.path(), "isolator");
+    let tool = SubagentTool::new(Arc::clone(&executor), repo.path().into());
+
+    let result = dispatch_tool(
+        &tool,
+        // NO `async` key. This is the exact call the row names.
+        serde_json::json!({ "agent": "isolator", "task": "do it", "worktree": true }),
+    )
+    .await
+    .expect("the launch succeeds");
+    let text = tool_text(&result);
+    let run_id = text
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("Async: isolator [")
+                .and_then(|rest| rest.strip_suffix(']'))
+        })
+        .unwrap_or_else(|| {
+            panic!("this must take the ASYNC path, not the foreground one; got: {text}")
+        })
+        .to_string();
+
+    let roots = crate::paths::Roots::sandboxed(home.path());
+    let run_dir =
+        crate::extension::executor::paths::default_async_root_in(&roots, repo.path()).join(&run_id);
+    let raw = std::fs::read_to_string(run_dir.join("runner-config.json"))
+        .expect("hop 1 writes runner-config.json before spawning hop 2");
+    let config: serde_json::Value = serde_json::from_str(&raw).expect("the config is JSON");
+    assert_eq!(
+        config["steps"][0]["worktree"],
+        serde_json::json!(true),
+        "the async SINGLE step must carry pi's own `worktree: true` to hop 2; it carried nothing \
+         at all before SUBA-149's residual half: {config:#}"
+    );
+}
+
+/// The control for the headline, and the reason Fix 2(b) could not land first: a bare call that
+/// did NOT ask for isolation must reach hop 2 with no `worktree` key — pi omits it rather than
+/// writing `false` — and must not be probed for repository state on the way.
+///
+/// **Gutting mutation this fails on:** hard-coding `crate::spawn::worktree::WorktreeRequest::Isolated` in
+/// `route_single_background`.
+#[tokio::test]
+async fn a_bare_call_that_asked_for_nothing_reaches_hop_two_with_no_worktree_key() {
+    let repo = suba149_clean_repo();
+    // Deliberately DIRTY: a child that never asked for isolation must not be refused for the
+    // source's state, which is the invented failure `SUBA-147` was closed for.
+    std::fs::write(repo.path().join("tracked.txt"), "uncommitted\n").expect("dirty the tree");
+
+    let home = tempfile::tempdir().expect("sandbox home");
+    let executor = Arc::new(SubagentExecutor::new());
+    arm_scoped_missions(&executor, home.path()).await;
+    {
+        let mut cfg = executor.config_cell().lock().await;
+        // Sandboxed OUTSIDE the repository: the run directory, the mission index and the async
+        // root must not themselves dirty the source tree Fix 2(b)'s probe reads.
+        cfg.roots = crate::paths::Roots::sandboxed(home.path());
+        cfg.max_subagent_depth = 4;
+        cfg.spawn_command = Some(crate::spawn::SpawnCommand {
+            binary: std::path::PathBuf::from("true"),
+            base_args: Vec::new(),
+        });
+    }
+    suba149_write_persona(repo.path(), "plain");
+    let tool = SubagentTool::new(Arc::clone(&executor), repo.path().into());
+
+    let result = dispatch_tool(
+        &tool,
+        serde_json::json!({ "agent": "plain", "task": "do it" }),
+    )
+    .await
+    .expect("a dirty tree must not refuse a launch that asked for no isolation");
+    let text = tool_text(&result);
+    let run_id = text
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("Async: plain [")
+                .and_then(|rest| rest.strip_suffix(']'))
+        })
+        .unwrap_or_else(|| panic!("expected the async headline; got: {text}"))
+        .to_string();
+
+    let roots = crate::paths::Roots::sandboxed(home.path());
+    let run_dir =
+        crate::extension::executor::paths::default_async_root_in(&roots, repo.path()).join(&run_id);
+    let raw = std::fs::read_to_string(run_dir.join("runner-config.json")).expect("the config");
+    let config: serde_json::Value = serde_json::from_str(&raw).expect("the config is JSON");
+    assert!(
+        config["steps"][0].get("worktree").is_none(),
+        "pi omits the key when the request is `Shared`: {config:#}"
+    );
+}
+
+// -------------------------------------------------------------------------------------------
+// Fix 2(b): the async-single admission probe
+// -------------------------------------------------------------------------------------------
+
+/// SUBA-149 Fix 2(b) — pi `subagent-executor.ts:7454-7459` @v0.75.0:
+///
+/// ```text
+/// if (effectiveAsync && hasSingle && effectiveParams.resume === undefined
+///     && effectiveParams.worktree === true) {
+///     try { await preflightWorktreeSource(effectiveCwd, { signal }); }
+///     catch (error) { return toExecutionErrorResult(…, error, …); }
+/// }
+/// ```
+///
+/// The refusal text is `probeWorktreeSource`'s own (`runs/shared/worktree.ts:344-356`), carried
+/// VERBATIM — no cyrup wrapper, because an operator searching for upstream's sentence must find it.
+///
+/// **Gutting mutation this fails on:** deleting the probe block from `route_single` — the launch
+/// then succeeds and the operator discovers the dirty source as a hop-2 step failure inside a run
+/// they must go and read.
+#[tokio::test]
+async fn a_bare_async_worktree_call_is_probed_with_upstreams_own_sentences() {
+    // Dirty source.
+    let dirty = suba149_clean_repo();
+    std::fs::write(dirty.path().join("tracked.txt"), "uncommitted\n").expect("dirty");
+    let tool = scoped_tool(dirty.path()).await;
+    let message = dispatch_tool(
+        &tool,
+        serde_json::json!({ "agent": "ghost", "task": "do it", "worktree": true }),
+    )
+    .await
+    .expect_err("a dirty source is refused before the runner exists")
+    .to_string();
+    assert!(
+        message.contains(
+            "worktree isolation requires a clean git working tree. Commit or stash changes first."
+        ),
+        "upstream's own sentence, verbatim; got {message}"
+    );
+
+    // Not a repository at all.
+    let plain = tempfile::tempdir().expect("tempdir");
+    let tool = scoped_tool(plain.path()).await;
+    let message = dispatch_tool(
+        &tool,
+        serde_json::json!({ "agent": "ghost", "task": "do it", "worktree": true }),
+    )
+    .await
+    .expect_err("a non-repository source is refused")
+    .to_string();
+    assert!(
+        message.contains("worktree isolation requires a git repository"),
+        "upstream's own sentence, verbatim; got {message}"
+    );
+
+    // The control: the SAME dirty source, with no isolation asked for, is not probed — it falls
+    // through to ordinary agent resolution. (`ghost` is unresolvable in these fixtures, which is
+    // what proves the call got past the probe rather than being turned away by it.)
+    let tool = scoped_tool(dirty.path()).await;
+    let message = dispatch_tool(
+        &tool,
+        serde_json::json!({ "agent": "ghost", "task": "do it" }),
+    )
+    .await
+    .expect_err("the agent is unresolvable in this fixture")
+    .to_string();
+    assert!(
+        !message.contains("worktree isolation requires"),
+        "a child that asked for nothing must not be probed (SUBA-147's premise); got {message}"
+    );
+}

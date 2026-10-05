@@ -651,6 +651,40 @@ impl SubagentTool {
         )
         .map_err(ToolError::new)?;
 
+        // SUBA-149 Fix 2(b) — pi `subagent-executor.ts:7454-7459` @v0.75.0:
+        //
+        //     if (effectiveAsync && hasSingle && effectiveParams.resume === undefined
+        //         && effectiveParams.worktree === true) {
+        //         try { await preflightWorktreeSource(effectiveCwd, { signal }); }
+        //         catch (error) { return toExecutionErrorResult(…, error, …); }
+        //     }
+        //
+        // The admission check for an async SINGLE launch: refuse a non-repo or dirty source
+        // BEFORE the detached runner exists, rather than letting the operator discover it as a
+        // hop-2 step failure in a run they must then go and read. `preflight_worktree_source`
+        // re-runs inside the allocation anyway (source state can change in between), so this is
+        // strictly an earlier, cheaper refusal and never the only one.
+        //
+        // **It is placed here, and only here, because this path can now actually isolate.** A
+        // probe on a path whose children can never use a worktree would reject dirty-tree launches
+        // for nothing — the invented failure `SUBA-147` was closed as a wrong premise for exactly
+        // that reason. The allocation landed first; the probe follows it.
+        //
+        // `hasSingle` is structural: this is `route_single`. `resume === undefined` is structural
+        // too — cyrup spells resume as `action: "resume"`, which `route_management`/`control_resume`
+        // serve and which never reaches this function, so the guard upstream needs cannot be
+        // violated here.
+        if background
+            && crate::spawn::worktree::WorktreeRequest::from_flag(p.worktree).is_isolated()
+        {
+            crate::spawn::worktree::preflight_worktree_source(
+                cwd,
+                &crate::spawn::worktree::GitBounds::new(Some(cancel.clone()), None),
+            )
+            .await
+            .map_err(|refusal| ToolError::new(refusal.to_string()))?;
+        }
+
         if background {
             return self
                 .route_single_background(SingleBackgroundDispatch {
@@ -1079,6 +1113,14 @@ impl SubagentTool {
                 // @v0.71.0); the config default is folded in by `spawn_background`.
                 checkpoint_before_deadline_ms: p.checkpoint_before_deadline_ms,
                 include_progress: overrides.include_progress,
+                // SUBA-149 — the caller's `worktree` request, which this branch read NOWHERE: the
+                // flag was parsed and validated at the tool boundary and then dropped, so a bare
+                // `subagent({agent, task, worktree: true})` — background, because
+                // `asyncByDefault` is `true` — ran in the SHARED cwd. pi
+                // `...(params.worktree === true ? { worktree: true } : {})` on the async single
+                // launch (`subagent-executor.ts:3595`). `BackgroundSingleRequest` carries no
+                // default for this field, so this line is now mandatory.
+                worktree: crate::spawn::worktree::WorktreeRequest::from_flag(p.worktree),
             })
             .await
             .map_err(|e| ToolError::new(e.to_string()))?;

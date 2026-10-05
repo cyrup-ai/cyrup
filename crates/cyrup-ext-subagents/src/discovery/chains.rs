@@ -1247,6 +1247,20 @@ fn chain_step_to_single_step_spec(step: &ChainStepConfig) -> SingleStepSpec {
         // SUBA-134 — the step label a child session name prefers over the task excerpt.
         label: step.label.clone(),
         session_name: None,
+        // SUBA-149 — pi `SequentialStep.worktree` (`shared/settings.ts:50` @v0.75.0), read by the
+        // runner's sequential arm as `sequential.worktree` (`async-execution.ts:1336`,
+        // `subagent-runner.ts:4441`). This converter had no home for it, so an authored
+        // `.chain.md`/`.chain.json` step declaring `worktree: true` was parsed, kept on
+        // `ChainStepConfig`, read for the PARALLEL group shape only, and silently dropped for the
+        // sequential one.
+        //
+        // A parallel ITEM or a dynamic TEMPLATE also arrives here (via
+        // `value_to_single_step_spec`), and upstream's `ParallelTaskItem` has no `worktree` of its
+        // own: the group's flag is pushed down onto every member instead
+        // (`async-execution.ts:1289`). `chain_graph`'s group arms overwrite this field with
+        // `Shared` for exactly that reason, so a value lifted here can only ever take effect on
+        // the sequential shape it belongs to.
+        worktree: crate::spawn::worktree::WorktreeRequest::from_flag(step.worktree),
     }
 }
 

@@ -67,6 +67,31 @@ impl Settings {
         Value::Object(self.obj.clone())
     }
 
+    /// The raw `deviceId` value in THIS layer (`settings-manager.ts:158`).
+    ///
+    /// Deliberately on [`Settings`], the one-scope document, and not on
+    /// [`EffectiveSettings`](super::effective::EffectiveSettings): upstream's reader is
+    /// `this.globalSettings.deviceId` (`getOrCreateDeviceId`, `:1176`), never the merged
+    /// `this.settings`, so a project `.cyrup/settings.json` cannot supply a per-installation id.
+    /// Having no merged getter at all is what makes that unforgeable here — see
+    /// [`super::installation`] for why the layer matters and
+    /// [`crate::settings::SettingsManager::installation_id`] for the only caller, which passes
+    /// [`SettingsManager::global`](super::manager::SettingsManager::global).
+    ///
+    /// This is why `deviceId` is NOT in `GLOBAL_ONLY_KEYS`. That list strips a key from the
+    /// project layer *before the merge*, for keys whose getters read the merged view; upstream's
+    /// `deviceId` is never read that way, so stripping it would make `effective()` diverge from
+    /// upstream's `this.settings` for no gain. The restriction is enforced at the reader instead,
+    /// exactly as upstream enforces it.
+    ///
+    /// Returns the raw [`Value`], not a `&str`: settings are user-edited JSON, so the value may be
+    /// any type, and [`DeviceIdDecision::for_stored`](super::installation::DeviceIdDecision::for_stored)
+    /// needs to tell a truthy non-string (upstream returns it, and the login then fails) from an
+    /// absent one (upstream mints a new id).
+    pub fn device_id(&self) -> Option<&Value> {
+        self.obj.get(super::installation::DEVICE_ID_KEY)
+    }
+
     /// Pretty JSON (2-space) with a trailing newline (Pi byte-interop).
     pub fn to_pretty(&self) -> String {
         let mut s = serde_json::to_string_pretty(&self.obj).unwrap_or_else(|_| "{}".to_string());

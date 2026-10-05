@@ -42,6 +42,7 @@ pub(crate) fn bare_single_step(
     task: &str,
 ) -> crate::spawn::chain_graph::SingleStepSpec {
     crate::spawn::chain_graph::SingleStepSpec {
+        worktree: crate::spawn::worktree::WorktreeRequest::Shared,
         machine: None,
         skills: None,
         session_dir: None,

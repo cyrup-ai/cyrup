@@ -56,6 +56,7 @@ use cyrup_provider::auth::ProviderAuth;
 use cyrup_provider::auth::oauth::{AuthInteraction, OAuthError};
 
 use crate::auth::{AuthSource, AuthStatus, AuthStore, Credential};
+use crate::settings::SettingsManager;
 
 /// `"Sign in with an account"` — the default subscription label (`interactive-mode.ts:4951`).
 pub const DEFAULT_SUBSCRIPTION_LABEL: &str = "Sign in with an account";
@@ -712,12 +713,35 @@ pub fn provider_selector_empty_message(auth_type: Option<AuthType>) -> &'static 
 /// The flow runs **before** the store is touched, so a cancelled or failed login leaves whatever
 /// was on disk untouched. `ModelRuntime.login` (`model-runtime.ts:505-509`) additionally refreshes
 /// the model registry afterwards; that is the caller's step.
+///
+/// # The installation id (PROV-118)
+///
+/// `settings` is here for one reason: the fourth argument upstream passes to
+/// `modelRuntime.login`, `{ getDeviceId: () => this.settingsManager.getOrCreateDeviceId() }`
+/// (`modes/interactive/interactive-mode.ts:6250-6263`). It is the stable id of this installation,
+/// which the `openai` "Sign in with ChatGPT" flow sends as `ext_agent_host_id` and **refuses to
+/// start authorization without** (`cyrup_provider::auth::oauth`'s `agent_host_id`). Until this
+/// parameter existed, [`login`] built a `LoginOptions::default()` and `/login openai` failed at
+/// its first statement with "Sign in with ChatGPT requires a device ID (UUID) for this
+/// installation".
+///
+/// It is a **required** parameter rather than an `Option`, for the same reason
+/// `cyrup_provider::LoginOptions` is a required parameter of `OAuthAuth::login` rather than an
+/// `Option` (documented at `cyrup-provider/src/auth/mod.rs`): a flow that needs an installation id
+/// must not be able to silently not receive one. A front-end cannot forget to wire it.
+///
+/// Matching upstream, the id is supplied for **every** provider, not just `openai`: it is a
+/// callback, so a flow that does not need one never invokes it and nothing is minted or written
+/// (see [`crate::settings::InstallationIdSupplier::newly_created`]). `settings` is otherwise untouched — the only
+/// write this function can make to it is the one `getOrCreateDeviceId` makes, a single `deviceId`
+/// key in the GLOBAL scope on first use.
 pub async fn login(
     store: &dyn LoginStore,
     providers: &[ProviderLoginInput],
     provider_id: &ProviderId,
     auth_type: AuthType,
     interaction: &dyn AuthInteraction,
+    settings: &SettingsManager,
 ) -> Result<Credential, LoginError> {
     let Some(provider) = providers
         .iter()
@@ -736,11 +760,34 @@ pub async fn login(
                     auth_type,
                 });
             };
-            credential_from_provider(
-                oauth
-                    .login(interaction, &cyrup_provider::LoginOptions::default())
-                    .await?,
-            )
+            // `{ getDeviceId: () => this.settingsManager.getOrCreateDeviceId() }`
+            // (`interactive-mode.ts:6262`). Built from the GLOBAL layer only, and lazy: a flow
+            // that never calls the callback leaves the settings file untouched.
+            let installation = settings.installation_id();
+            let outcome = oauth
+                .login(
+                    interaction,
+                    &cyrup_provider::LoginOptions::with_device_id(installation.callback()),
+                )
+                .await;
+            // Upstream persists inside `getOrCreateDeviceId`, before the flow continues; cyrup's
+            // settings write is async and a sync callback cannot await, so it lands here instead —
+            // see `crate::settings::InstallationIdSupplier` for why that ordering difference is
+            // unobservable.
+            //
+            // Unconditionally, BEFORE `outcome?`: upstream mints and saves the id the moment a flow
+            // asks, so a login the user then cancels still leaves the id on disk and the NEXT login
+            // reuses it. Returning early on failure would mint a new id per attempt and make every
+            // retry look like a fresh install to OpenAI.
+            if let Some(fresh) = installation.newly_created() {
+                // A settings-write failure must NOT fail the login. Upstream's `save()` swallows it
+                // into `recordError` (`settings-manager.ts:683-696`) and `getOrCreateDeviceId`
+                // returns the id regardless, so the flow proceeds with an id that is valid for this
+                // process and simply not durable. Failing here would turn an unwritable
+                // `settings.json` into an unusable `/login`, which upstream never does.
+                let _ = settings.persist_installation_id(fresh).await;
+            }
+            credential_from_provider(outcome?)
         }
         AuthType::ApiKey => {
             // `if (!method?.login) throw new ModelsError("auth", …)` (`ai/src/models.ts:433-435`
@@ -1067,6 +1114,17 @@ mod tests {
             expires: 1_700_000_000_000,
             ext: serde_json::Map::new(),
         }
+    }
+
+    /// An empty settings tree for the tests that are not about the installation id. A real
+    /// [`SettingsManager`] over [`crate::settings::InMemorySettingsStore`], so `login`'s
+    /// `getOrCreateDeviceId` half runs for real — it simply has nothing to read and, for a flow
+    /// that never asks for a device id, nothing to write.
+    fn fresh_settings() -> SettingsManager {
+        SettingsManager::load(
+            Arc::new(crate::settings::InMemorySettingsStore::new()),
+            true,
+        )
     }
 
     fn unconfigured() -> AuthStatus {
@@ -1479,6 +1537,7 @@ mod tests {
             &ProviderId::from("anthropic"),
             AuthType::Oauth,
             &interaction,
+            &fresh_settings(),
         )
         .await
         .unwrap();
@@ -1505,6 +1564,7 @@ mod tests {
             &ProviderId::from("openrouter"),
             AuthType::ApiKey,
             &interaction,
+            &fresh_settings(),
         )
         .await
         .unwrap();
@@ -1543,6 +1603,7 @@ mod tests {
             &ProviderId::from("openrouter"),
             AuthType::ApiKey,
             &interaction,
+            &fresh_settings(),
         )
         .await
         .unwrap();
@@ -1571,6 +1632,7 @@ mod tests {
             &ProviderId::from("nope"),
             AuthType::Oauth,
             &interaction,
+            &fresh_settings(),
         )
         .await
         .unwrap_err();
@@ -1592,6 +1654,7 @@ mod tests {
             &ProviderId::from("openrouter"),
             AuthType::Oauth,
             &interaction,
+            &fresh_settings(),
         )
         .await
         .unwrap_err();
@@ -1610,6 +1673,7 @@ mod tests {
             &ProviderId::from("ollama"),
             AuthType::ApiKey,
             &interaction,
+            &fresh_settings(),
         )
         .await
         .unwrap_err();
@@ -1630,6 +1694,7 @@ mod tests {
             &ProviderId::from("openrouter"),
             AuthType::ApiKey,
             &interaction,
+            &fresh_settings(),
         )
         .await
         .unwrap_err();
@@ -1649,9 +1714,16 @@ mod tests {
         let interaction = ScriptedInteraction::new(vec![Ok("sk".to_string())]);
         let id = ProviderId::from("openrouter");
 
-        login(&store, &providers, &id, AuthType::ApiKey, &interaction)
-            .await
-            .unwrap();
+        login(
+            &store,
+            &providers,
+            &id,
+            AuthType::ApiKey,
+            &interaction,
+            &fresh_settings(),
+        )
+        .await
+        .unwrap();
         assert!(store.read(&id).await.unwrap().is_some());
 
         logout(&store, &id).await.unwrap();
@@ -1687,6 +1759,7 @@ mod tests {
             &id,
             AuthType::ApiKey,
             &interaction,
+            &fresh_settings(),
         )
         .await
         .unwrap_err();
@@ -1722,6 +1795,7 @@ mod tests {
             &ProviderId::from("openrouter"),
             AuthType::ApiKey,
             &interaction,
+            &fresh_settings(),
         )
         .await
         .unwrap();
@@ -1731,6 +1805,7 @@ mod tests {
             &ProviderId::from("anthropic"),
             AuthType::Oauth,
             &interaction,
+            &fresh_settings(),
         )
         .await
         .unwrap();

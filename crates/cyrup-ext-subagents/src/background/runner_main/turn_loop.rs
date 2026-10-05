@@ -811,6 +811,10 @@ pub(super) async fn run_import_async_root(
         final_output: Some(imported.output.clone()),
         error: imported.error.clone(),
         interrupted: false,
+        // An IMPORTED async root is a POLL of another run's settled result, not a child this walk
+        // spawned: there is no process here to detach and no worktree of this run's to hand back
+        // (SUBA-149).
+        detached: false,
         // An IMPORTED async root's control events belong to the run that was attached, and
         // are already recorded on ITS own terminal `ResultFile` — `ImportedAsyncRootResult`
         // deliberately carries only the identity/output fields

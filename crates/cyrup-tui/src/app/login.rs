@@ -419,9 +419,22 @@ impl<B: Backend> App<B> {
                     // `await this.session.modelRuntime.login(providerId, method, {…})`
                     // (`interactive-mode.ts:5368`) — `Models.login` persists into the credential
                     // store itself, so there is no separate write here.
-                    let result =
-                        cyrup_config::login::login(&*store, &inputs, &id, auth_type, &interaction)
-                            .await;
+                    //
+                    // The session's `SettingsManager` is the fourth argument upstream passes,
+                    // `{ getDeviceId: () => this.settingsManager.getOrCreateDeviceId() }`
+                    // (`interactive-mode.ts:6262`): the stable installation id the `openai`
+                    // "Sign in with ChatGPT" flow requires (PROV-118). `cyrup_config::login::login`
+                    // owns the create-on-first-use half, so this is the same single settings
+                    // manager the rest of the session reads — not a second one with its own id.
+                    let result = cyrup_config::login::login(
+                        &*store,
+                        &inputs,
+                        &id,
+                        auth_type,
+                        &interaction,
+                        &session.services().settings,
+                    )
+                    .await;
                     let finished = match result {
                         Ok(_) => LoginFinished {
                             provider_id: id.as_str().to_string(),

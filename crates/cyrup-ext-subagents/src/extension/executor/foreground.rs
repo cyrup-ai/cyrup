@@ -2032,7 +2032,13 @@ async fn hand_back_managed_worktree(
     let binding = crate::spawn::worktree::SingleHandoffBinding {
         manifest_path: &manifest_path,
         run_id: &crate::handoff::LaneId::from(run_id),
+        // pi's foreground single path writes `mode: "single"` with `stepIndex: 0` /
+        // `flatStartIndex: 0` (`subagent-executor.ts:3945-3952` @v0.75.0): a SINGLE run is one
+        // child in one group, and there is no earlier group for it to merge against.
+        mode: crate::handoff::HandoffMode::Single,
         source: crate::handoff::HandoffSource::Foreground,
+        step_index: 0,
+        flat_start_index: 0,
     };
     let handoff_result = crate::handoff::HandoffResult {
         agent: agent.to_string(),

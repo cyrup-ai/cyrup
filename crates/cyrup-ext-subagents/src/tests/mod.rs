@@ -23,6 +23,7 @@
 mod abort_recovery_integration;
 mod acceptance_policy_parity;
 mod acceptance_role_inference;
+mod async_single_worktree_isolation;
 mod bundled_resources_registration_integration;
 mod child_prompt_runtime_integration;
 mod deadline_checkpoint_runner_integration;

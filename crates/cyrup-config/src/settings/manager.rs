@@ -6,6 +6,9 @@ use std::sync::Arc;
 use serde_json::{Map, Value};
 
 use super::effective::EffectiveSettings;
+use super::installation::{
+    DEVICE_ID_KEY, DeviceIdDecision, InstallationId, InstallationIdSupplier,
+};
 use super::layer::{Settings, strip_global_only};
 use super::merge::deep_merge_settings;
 use super::store::SettingsStore;
@@ -572,6 +575,41 @@ impl SettingsManager {
         Ok(())
     }
 
+    /// `getOrCreateDeviceId` read half (Pi settings-manager.ts:1175-1182 @v1.0.1) — the stable id
+    /// of this installation, which `/login` hands to a flow that needs one (PROV-118).
+    ///
+    /// Pure: it looks at the loaded GLOBAL layer and nothing else. **`self.global()`, not
+    /// `self.effective()`** — upstream reads `this.globalSettings.deviceId`, so a project settings
+    /// file cannot give a machine a second identity, nor leak one project's id into another. See
+    /// [`Settings::device_id`](super::layer::Settings::device_id).
+    ///
+    /// Takes `&self` (not `&mut self`): the mint is pure and the write is the separate, awaited
+    /// [`Self::persist_installation_id`], so the supplier can be built from a manager held behind
+    /// a shared reference — which is how the spawned `/login` task reaches it.
+    pub fn installation_id(&self) -> InstallationIdSupplier {
+        InstallationIdSupplier::new(DeviceIdDecision::for_stored(self.global.device_id()))
+    }
+
+    /// `getOrCreateDeviceId` write half — `markModified("deviceId"); this.save()`
+    /// (`settings-manager.ts:1178-1179`). GLOBAL scope, one key.
+    ///
+    /// Routes through [`Self::persist_nested`], so it inherits that seam's three properties
+    /// verbatim: the write is a scoped read-modify-write under the file lock, so **every unrelated
+    /// setting survives** (R-07-004 — upstream's `persistScopedSettings` likewise re-reads and
+    /// spreads); a scope whose last load failed is REFUSED rather than rewritten from the degraded
+    /// in-memory view (CFG-001); and `&self` suffices because it does not reload.
+    ///
+    /// Only ever called for [`InstallationIdSupplier::newly_created`], so an id that was already
+    /// present does not cause a write at all.
+    pub async fn persist_installation_id(&self, id: &InstallationId) -> Result<(), ConfigError> {
+        self.persist_nested(
+            SettingsScope::Global,
+            &[DEVICE_ID_KEY],
+            Value::String(id.as_str().to_string()),
+        )
+        .await
+    }
+
     pub fn drain_load_errors(&mut self) -> Vec<ScopedError> {
         std::mem::take(&mut self.load_errors)
     }
@@ -608,8 +646,11 @@ fn set_value_at_path(map: &mut Map<String, Value>, path: &[String], value: Value
 
 /// Generate a random v4 UUID string (Pi `randomUUID()` for `trackingId`). Dependency-free: derives
 /// 16 entropy bytes from the OS-seeded `RandomState` hasher plus monotonic/PID inputs, then sets the
-/// RFC 4122 version (4) and variant bits. Used only for a non-secret analytics tracking id.
-fn random_uuid_v4() -> String {
+/// RFC 4122 version (4) and variant bits. Used for the two non-secret ids upstream mints with
+/// `randomUUID()` into the GLOBAL layer on first use: the analytics `trackingId`
+/// (`setEnableAnalytics`, settings-manager.ts:943-951) and the installation `deviceId`
+/// ([`InstallationId::generate`](super::installation::InstallationId::generate)).
+pub(crate) fn random_uuid_v4() -> String {
     use std::collections::hash_map::RandomState;
     use std::hash::{BuildHasher, Hasher};
 

@@ -436,6 +436,16 @@ impl SubagentExecutor {
                 .get(&agent)
                 .and_then(|persona| persona.machine.as_deref())
                 .map(crate::placement::StepPlacement::requested),
+            // SUBA-149 — a REVIVE never allocates. pi `worktree: input.params.worktree === true
+            // && !("managedWorktree" in target && target.managedWorktree === true)`
+            // (`subagent-executor.ts:2271` @v0.75.0) under its own comment at `:2269-2270`: *"A
+            // retained async child already owns the recorded worktree. Resume it in place rather
+            // than allocating a second provider worktree around it."* cyrup's revive path takes no
+            // `worktree` param at all and the recovery descriptor records none, so the second term
+            // is the only one that can apply and it is always `Shared` here. Allocating would cut
+            // a fresh tree from HEAD and run the revived child somewhere its own prior work is
+            // not.
+            worktree: crate::spawn::worktree::WorktreeRequest::Shared,
             skills: (!descriptor.skills.is_empty()).then(|| descriptor.skills.clone()),
             session_dir: descriptor.session_dir.clone(),
             agent: agent.clone(),
@@ -739,6 +749,10 @@ impl SubagentExecutor {
         let placed = step_machine.is_some() || agent_def.machine.is_some();
         let mut step = SingleStepSpec {
             machine: step_machine.map(crate::placement::StepPlacement::requested),
+            // SUBA-149 — an APPENDED step declares no isolation: upstream's `chain-append.ts` does
+            // not mention `worktree` at any point at v0.75.0, and the appended step shape it
+            // validates has no such key, so there is nothing to lift.
+            worktree: crate::spawn::worktree::WorktreeRequest::Shared,
             skills: None,
             session_dir: None,
             agent: agent.to_string(),

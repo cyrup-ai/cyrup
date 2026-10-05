@@ -615,6 +615,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let executor = SubagentExecutor::new();
         let graph = vec![RunnerStep::SingleStep(SingleStepSpec {
+            worktree: crate::spawn::worktree::WorktreeRequest::Shared,
             machine: None,
             skills: None,
             session_dir: None,
@@ -679,6 +680,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let graph = vec![RunnerStep::SingleStep(
             crate::spawn::chain_graph::SingleStepSpec {
+                worktree: crate::spawn::worktree::WorktreeRequest::Shared,
                 machine: None,
                 skills: None,
                 session_dir: None,

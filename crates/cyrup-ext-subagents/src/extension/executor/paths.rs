@@ -625,6 +625,7 @@ mod tests {
 
         let err = executor
             .spawn_background(BackgroundSingleRequest {
+                worktree: crate::spawn::worktree::WorktreeRequest::Shared,
                 tool_timeout_ms: None,
                 machine_cwd: None,
                 machine: None,
@@ -689,6 +690,7 @@ mod tests {
 
         let err = executor
             .spawn_background(BackgroundSingleRequest {
+                worktree: crate::spawn::worktree::WorktreeRequest::Shared,
                 tool_timeout_ms: None,
                 machine_cwd: None,
                 machine: None,
@@ -742,6 +744,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let err = executor
             .spawn_background(BackgroundSingleRequest {
+                worktree: crate::spawn::worktree::WorktreeRequest::Shared,
                 tool_timeout_ms: None,
                 machine_cwd: None,
                 machine: None,
@@ -938,6 +941,7 @@ mod tests {
         }
         let dir = tempfile::tempdir().expect("tempdir");
         let step = RunnerStep::SingleStep(crate::spawn::chain_graph::SingleStepSpec {
+            worktree: crate::spawn::worktree::WorktreeRequest::Shared,
             machine: None,
             skills: None,
             session_dir: None,

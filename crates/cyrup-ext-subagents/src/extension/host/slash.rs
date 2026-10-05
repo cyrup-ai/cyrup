@@ -487,6 +487,12 @@ impl SubagentsExtension {
                     tool_timeout_ms: None,
                     machine_cwd: None,
                     machine: None,
+                    // SUBA-149 — `/run`'s own flag set has no `worktree`
+                    // ([`crate::registration::slash_commands::ExecutionFlags`] carries
+                    // `background`/`fork`/`fresh` only, and its usage string advertises no more),
+                    // so there is no request on this surface to answer. Contrast
+                    // `/prompt-workflow` below, which DOES take `--worktree`.
+                    worktree: crate::spawn::worktree::WorktreeRequest::Shared,
                     // SUBA-021: the slash surfaces advertise no `usageBudget` param upstream either.
                     usage_budget: None,
                     fast: None,
@@ -851,6 +857,24 @@ impl SubagentsExtension {
                     tool_timeout_ms: None,
                     machine_cwd: None,
                     machine: None,
+                    // SUBA-149 — `/prompt-workflow --worktree`, and a recipe's own
+                    // `worktree: true` frontmatter, folded into one effective request by
+                    // [`crate::registration::prompt_workflows::workflow_params`]
+                    // (`runtime.worktree || workflow.worktree`). It was computed there and read
+                    // NOWHERE: this surface advertises the flag in its own usage string
+                    // (`slash_commands.rs:279`) and then ran the child in the shared cwd — the same
+                    // advertised-and-silently-dropped defect on a third surface.
+                    //
+                    // [CYRUP-DELTA] the SURFACE is cyrup's, not upstream's: v0.75.0's
+                    // `slash/prompt-workflows.ts` has no `worktree` anywhere, and
+                    // `slash/prompt-template-bridge.ts:232-238` REFUSES a legacy `worktree` by name
+                    // ("Legacy prompt-template tasks/worktree orchestration was removed; use a
+                    // workflow script."). There is therefore no upstream behaviour to match either
+                    // way, and the two readings available are "honour the flag cyrup advertises" and
+                    // "keep dropping it". Honouring it is what the frontmatter's own doc promises.
+                    worktree: crate::spawn::worktree::WorktreeRequest::from_flag(Some(
+                        run.worktree,
+                    )),
                     // SUBA-021: the slash surfaces advertise no `usageBudget` param upstream either.
                     usage_budget: None,
                     fast: None,
@@ -909,9 +933,13 @@ impl SubagentsExtension {
                     parent_workflow_run_id: None,
                     workflow_key: None,
                     workflow_steer: None,
-                    // SUBA-149 — a recipe/`/run` dispatch exposes no `worktree` argument, so the
-                    // request is the shared cwd (pi's slash surfaces likewise never set it).
-                    worktree: crate::spawn::worktree::WorktreeRequest::Shared,
+                    // SUBA-149 — the foreground twin of the background arm above: the SAME
+                    // effective `runtime.worktree || workflow.worktree`, so `--worktree` means the
+                    // same thing whether or not `--bg` was passed. See that arm for why cyrup
+                    // honours a flag v0.75.0 does not have.
+                    worktree: crate::spawn::worktree::WorktreeRequest::from_flag(Some(
+                        run.worktree,
+                    )),
                 },
                 None,
             )
@@ -945,6 +973,9 @@ impl SubagentsExtension {
             .map(|step| {
                 RunnerStep::SingleStep(SingleStepSpec {
                     machine: None,
+                    // SUBA-149 — a prompt-workflow `ChainStep` has no `worktree` key upstream
+                    // (`prompt-workflows.ts`), so every step of one runs in the shared cwd.
+                    worktree: crate::spawn::worktree::WorktreeRequest::Shared,
                     agent: step.agent.clone(),
                     task: step.task.clone(),
                     cwd: step.cwd.as_deref().map(PathBuf::from),

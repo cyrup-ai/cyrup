@@ -3692,6 +3692,7 @@ mod tests {
 
     fn single_step(agent: &str, output: Option<&str>) -> SingleStepSpec {
         SingleStepSpec {
+            worktree: crate::spawn::worktree::WorktreeRequest::Shared,
             machine: None,
             skills: None,
             session_dir: None,

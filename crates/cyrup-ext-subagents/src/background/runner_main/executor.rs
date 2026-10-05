@@ -1311,6 +1311,7 @@ fn build_step_result(
         structured_output_path,
         error,
         interrupted,
+        detached,
         timed_out,
         timeout_recovery,
         context_overflow,
@@ -1334,6 +1335,12 @@ fn build_step_result(
         }))
     };
     step_result.interrupted = interrupted;
+    // SUBA-149 — pi reads `singleResult.detached` to decide whether a step's managed worktree may
+    // be diffed and removed (`subagent-runner.ts:4732`). It sat in the trailing `..` of the
+    // destructure above, so the walker could not ask the question at all and would have harvested
+    // a tree a live child was still writing into. Same trailing-`..` caveat as the fields below:
+    // dropping this line builds clean and silently reports `false`.
+    step_result.detached = detached;
     // Carry the per-child detail pi's `collectDynamicResults` copies verbatim onto a dynamic
     // fan-out's collect records (`runs/shared/dynamic-fanout.ts:278-284` @v0.34.0). All four
     // are known HERE and nowhere upstream of here: the walker sees only `StepResult`, so
