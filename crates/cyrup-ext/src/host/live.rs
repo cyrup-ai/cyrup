@@ -15,10 +15,13 @@ use crate::extension::{ExtKind, Extension};
 use crate::host::engine::map_wasm_error;
 use crate::host::limits::StoreLimits;
 use crate::host::services::{
-    ControlOp, DialogOptions, ExecOutput, GuestState, NotifyKind, OAuthEvent,
+    ControlOp, DialogOptions, ExecOutput, GuestState, NestedImportRefusal, NotifyKind, OAuthEvent,
 };
 use crate::host::store_state::HostState;
 use crate::native::{CtxTier, ExtMode};
+use crate::nested::{
+    ExecuteToolOptions, ExtensionToolContext, callable_tools_json, tool_update_json,
+};
 use crate::registry::{CommandDescriptor, ExecModeWire, ToolDescriptor};
 use crate::ui_prompt::UiPromptKind;
 use cyrup_core::{
@@ -1066,6 +1069,60 @@ impl bindings::cyrup::ext::host_tool::Host for HostState {
             .map(|g| g.tool_is_cancelled(&call_id))
             .unwrap_or(false)
     }
+
+    /// pi `ctx.executeTool(name, args, options?)` for the guest tool call `call_id`
+    /// (`extensions/types.ts:394` @v1.0.1): the call goes through the session
+    /// ([`crate::NestedToolRunner`]) bound to that call, with the calling tool's own cancellation.
+    async fn execute_tool(
+        &mut self,
+        call_id: String,
+        name: String,
+        args_json: String,
+        collect_updates: bool,
+    ) -> Result<(String, Vec<String>), String> {
+        let guest = Arc::clone(guest_of(self)?);
+        let context = guest
+            .nested_context_for(&call_id)
+            .map_err(|e| e.to_string())?;
+        let args: Value = serde_json::from_str(&args_json)
+            .map_err(|e| NestedImportRefusal::BadArguments(e.to_string()).to_string())?;
+        // pi's `onUpdate` closure inverts into the partial results returned once the call settles
+        // (`world.wit`, `host-tool.execute-tool`); the same results already reached the
+        // `tool_execution_update` events as they happened.
+        let partials: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+        let on_update: Option<ToolUpdateSink> = collect_updates.then(|| {
+            let partials = Arc::clone(&partials);
+            Box::new(move |u: ToolUpdate| {
+                if let Ok(mut g) = partials.lock() {
+                    g.push(tool_update_json(&u).to_string());
+                }
+            }) as ToolUpdateSink
+        });
+        // The nested call can run for as long as the tools it calls: the wait is host time, not
+        // guest CPU, so it is forgiven against the epoch budget exactly like a dialog.
+        let started = std::time::Instant::now();
+        let outcome = context
+            .execute_tool(
+                &name,
+                args,
+                ExecuteToolOptions {
+                    cancel: None,
+                    on_update,
+                },
+            )
+            .await;
+        guest.note_dialog_wait(started);
+        let partial_results = partials.lock().map(|g| g.clone()).unwrap_or_default();
+        Ok((outcome.to_wire().to_string(), partial_results))
+    }
+
+    /// pi `ctx.tools` (`extensions/types.ts:385`): what `execute-tool` can call.
+    async fn callable_tools(&mut self, call_id: String) -> Result<String, String> {
+        let context = guest_of(self)?
+            .nested_context_for(&call_id)
+            .map_err(|e| e.to_string())?;
+        Ok(callable_tools_json(&context.tools()).to_string())
+    }
 }
 
 /// DRIFT-004 — the two closure-shaped options of pi's `BashOperations.exec`
@@ -1542,6 +1599,25 @@ impl bindings::cyrup::ext::ctx_state::Host for HostState {
 // LiveExtension: a loaded `.wasm` component as a unified Extension.
 // ---------------------------------------------------------------------------
 
+/// Why a tool call was refused before it reached a guest instance.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum GuestReentry {
+    /// `call` was made, at some depth, by `holder`, which is executing in the instance `call`
+    /// targets. A WASM instance runs one call at a time and `holder` is suspended inside the nested
+    /// call, so queueing `call` behind it would wait forever.
+    #[error(
+        "tool call `{call}` was made by `{holder}`, which is executing in the same extension \
+         instance; an instance runs one call at a time, so a tool cannot call a tool of its own \
+         extension"
+    )]
+    ToolOfSameExtension {
+        /// The refused call.
+        call: ToolCallId,
+        /// The call that holds the instance.
+        holder: ToolCallId,
+    },
+}
+
 /// Unwinds the two pieces of INSTANCE-scoped state `execute_tool` binds for the duration of ONE
 /// call — the bound tool `CancelToken` and the queued `host-tool.emit-update` chunks — when the call
 /// ends, **including when the `execute_tool` future is DROPPED mid-await**, which is the case a JS
@@ -1581,6 +1657,7 @@ pub(crate) struct ToolCallBinding<'a>(pub(crate) &'a Arc<GuestState>);
 impl Drop for ToolCallBinding<'_> {
     fn drop(&mut self) {
         self.0.set_tool_cancel(None);
+        self.0.unbind_tool_call();
         let dropped = self.0.clear_tool_updates();
         if dropped > 0 {
             tracing::debug!(
@@ -1731,6 +1808,11 @@ impl LiveExtension {
     /// Execute a guest-registered tool (R-08-015). Mirrors Pi's `ToolDefinition.execute`: passes the
     /// `call_id`/`params`, races against `cancel` (the `signal`), and replays the streamed `onUpdate`
     /// chunks into `on_update` once the call settles. A guest fault is contained as a `ToolError`.
+    ///
+    /// `nested` is the context the guest's `host-tool.execute-tool` / `callable-tools` imports act
+    /// through for this call (pi's `ctx.executeTool` / `ctx.tools`); `None` when the call runs
+    /// outside a session. A call that a tool of THIS instance made, at any depth, is refused with
+    /// [`GuestReentry`] instead of being queued behind the call that is waiting for it.
     pub async fn execute_tool(
         &self,
         name: &str,
@@ -1738,7 +1820,17 @@ impl LiveExtension {
         params: &Value,
         cancel: &CancelToken,
         on_update: &mut ToolUpdateSink,
+        nested: Option<ExtensionToolContext>,
     ) -> Result<ToolResult, ToolError> {
+        if let Some(holder) = self.guest.in_flight_ancestor_of(call_id) {
+            return Err(ToolError::new(
+                GuestReentry::ToolOfSameExtension {
+                    call: call_id.clone(),
+                    holder,
+                }
+                .to_string(),
+            ));
+        }
         let mut guard = self.inner.lock().await;
         let inner = &mut *guard;
         inner.store.set_epoch_deadline(self.epoch_ticks);
@@ -1751,6 +1843,7 @@ impl LiveExtension {
         // guard's own doc for what the leaked token then does to `is-cancelled`, and what the
         // leaked `emit-update` chunks then do to the NEXT tool call (EXT-M06).
         self.guest.set_tool_cancel(Some(cancel.clone()));
+        self.guest.bind_tool_call(call_id.clone(), nested);
         let _tool_call = ToolCallBinding(&self.guest);
         let params_s = params.to_string();
         let api = inner.instance.cyrup_ext_events();
@@ -2521,6 +2614,9 @@ impl Tool for WasmTool {
                 &params,
                 &cancel,
                 &mut on_update,
+                // pi hands `execute` a context whose `executeTool` is bound to THIS call; the
+                // wrapper that ran us put it in scope for exactly this future.
+                ExtensionToolContext::current(),
             )
             .await
     }
@@ -2593,6 +2689,47 @@ impl Extension for LiveExtension {
         ev: &HostEvent,
         cancel: &CancelToken,
     ) -> Result<HookOutcome, ExtError> {
+        self.invoke_with_parent(ev, None, cancel).await
+    }
+
+    /// The `tool_call`, `tool_result` and `tool_execution_*` events of a call a tool made reach the
+    /// guest with `parent-tool-call-id` set (pi `parentToolCallId`, `extensions/types.ts:1061-1083`
+    /// @v1.0.1) — except when the tool that made the call is executing in THIS instance.
+    ///
+    /// CYRUP-DELTA, the one the `ProviderReduction` skip already is: pi runs every subscribed
+    /// handler, the calling extension's own included, because it is one JS process. Here the
+    /// calling tool is suspended inside its own single-instance `Store`, and the lock that would
+    /// deliver the event is the one it holds, so waiting for it would never end. The event is not
+    /// delivered to that one instance; every other extension receives it.
+    async fn invoke_nested_event(
+        &self,
+        parent: &ToolCallId,
+        ev: &HostEvent,
+        cancel: &CancelToken,
+    ) -> Result<HookOutcome, ExtError> {
+        if let Some(holder) = self.guest.in_flight_ancestor_of(parent) {
+            tracing::debug!(
+                extension = %self.id,
+                kind = ?ev.kind(),
+                parent = %parent,
+                holder = %holder,
+                "nested-call event not delivered to the instance whose tool is making the call"
+            );
+            return Ok(HookOutcome::Noop);
+        }
+        self.invoke_with_parent(ev, Some(parent), cancel).await
+    }
+}
+
+impl LiveExtension {
+    /// Deliver `ev` to the guest, with the call that made the call it is about (see
+    /// [`Extension::invoke_nested_event`]) when there is one.
+    async fn invoke_with_parent(
+        &self,
+        ev: &HostEvent,
+        parent: Option<&ToolCallId>,
+        cancel: &CancelToken,
+    ) -> Result<HookOutcome, ExtError> {
         let mut guard = self.inner.lock().await;
         // Re-arm the epoch deadline for this call and run at event tier (control ops illegal).
         guard.store.set_epoch_deadline(self.epoch_ticks);
@@ -2600,7 +2737,7 @@ impl Extension for LiveExtension {
         self.guest.set_tier(CtxTier::Event);
 
         let kind = ev.kind();
-        let call = invoke(&mut guard, ev);
+        let call = invoke(&mut guard, ev, parent.map(ToolCallId::as_str));
         let outcome = tokio::select! {
             biased;
             _ = cancel.cancelled() => return Err(ExtError::Cancelled),
@@ -2617,6 +2754,7 @@ impl Extension for LiveExtension {
 async fn invoke(
     inner: &mut LiveInner,
     ev: &HostEvent,
+    parent: Option<&str>,
 ) -> Result<wit_types::HookOutcome, wasmtime::Error> {
     let store = &mut inner.store;
     let api = inner.instance.cyrup_ext_events();
@@ -2627,7 +2765,7 @@ async fn invoke(
             name,
             input,
         } => {
-            api.call_on_tool_call(store, call_id.as_str(), name, &input.to_string())
+            api.call_on_tool_call(store, call_id.as_str(), name, &input.to_string(), parent)
                 .await
         }
         // `terminate` is host-side only: the WIT `on-tool-result` signature is fixed (no ABI
@@ -2656,6 +2794,7 @@ async fn invoke(
                 *is_error,
                 details_json.as_deref(),
                 usage_json.as_deref(),
+                parent,
             )
             .await
         }
@@ -2802,7 +2941,7 @@ async fn invoke(
             name,
             args,
         } => api
-            .call_on_tool_execution_start(store, call_id.as_str(), name, &args.to_string())
+            .call_on_tool_execution_start(store, call_id.as_str(), name, &args.to_string(), parent)
             .await
             .and_then(|()| noop()),
         HostEvent::ToolExecUpdate {
@@ -2817,6 +2956,7 @@ async fn invoke(
                 name,
                 &args.to_string(),
                 &chunk.to_string(),
+                parent,
             )
             .await
             .and_then(|()| noop()),
@@ -2832,6 +2972,7 @@ async fn invoke(
                 name,
                 &result.to_string(),
                 *is_error,
+                parent,
             )
             .await
             .and_then(|()| noop()),

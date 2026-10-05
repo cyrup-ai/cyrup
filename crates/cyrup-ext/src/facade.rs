@@ -315,6 +315,10 @@ pub struct ExtensionHost {
     /// via [`Self::set_active_tool_source`], in which case [`Self::active_tools`] hands tools back
     /// UNWRAPPED — there is no live agent whose tool set could change, so the diff has no meaning.
     active_tool_source: RwLock<Option<Arc<dyn crate::wrapper::ActiveToolNames>>>,
+    /// Where the session's [`crate::NestedToolRunner`] is attached ([`Self::set_nested_tool_runner`]).
+    /// Shared with every tool [`Self::wrap_tool`] / [`Self::active_tools`] wraps, which read it at
+    /// execute time — the runner exists only once the session does, long after the tools were built.
+    nested_runner: Arc<crate::nested::NestedRunnerSlot>,
     /// The bus fan-out (EXT-034). Owned here (strong) and handed to the dispatcher as a `Weak`, so
     /// every dispatch entry point drains after its subscriber loop — not just the two command-tier
     /// call sites that used to be the only drain.
@@ -420,6 +424,7 @@ impl ExtensionHost {
             ctx_source: RwLock::new(None),
             commands_listeners: Arc::new(RwLock::new(Vec::new())),
             active_tool_source: RwLock::new(None),
+            nested_runner: Arc::new(crate::nested::NestedRunnerSlot::default()),
             fanout,
         }
     }
@@ -440,9 +445,25 @@ impl ExtensionHost {
     /// (agent-session.ts:2507-2515) without reaching into the registry.
     pub fn wrap_tool(&self, tool: Arc<dyn Tool>) -> Arc<dyn Tool> {
         match self.active_tool_source.read().ok().and_then(|g| g.clone()) {
-            Some(src) => crate::wrapper::wrap_registered_tool(tool, src),
+            Some(src) => crate::wrapper::wrap_registered_tool_with_nested(
+                tool,
+                src,
+                Arc::clone(&self.nested_runner),
+            ),
             None => tool,
         }
+    }
+
+    /// Attach the session's [`crate::NestedToolRunner`] — the half of pi's `ctx.executeTool`
+    /// (`agent-session.ts:3420-3421`) that only the session can supply. From then on every tool
+    /// this host wrapped ([`Self::wrap_tool`], [`Self::active_tools`],
+    /// [`Self::registered_tools_filtered`]) runs with a [`crate::ExtensionToolContext`] bound to its
+    /// call, and a guest tool's `host-tool.execute-tool` import reaches the same runner.
+    ///
+    /// The host keeps a `Weak`: the session owns the runner, and the session reaches this host.
+    /// Idempotent; the last runner wins.
+    pub fn set_nested_tool_runner(&self, runner: &Arc<dyn crate::NestedToolRunner>) {
+        self.nested_runner.set(runner);
     }
 
     /// Load a compiled-in native extension (R-ARCH-EXT-003). Awaits `init` (R-08-001), registers its
@@ -850,7 +871,13 @@ impl ExtensionHost {
         };
         tools
             .into_iter()
-            .map(|t| crate::wrapper::wrap_registered_tool(t, src.clone()))
+            .map(|t| {
+                crate::wrapper::wrap_registered_tool_with_nested(
+                    t,
+                    src.clone(),
+                    Arc::clone(&self.nested_runner),
+                )
+            })
             .collect()
     }
 

@@ -128,7 +128,7 @@ impl WatGuest {
 }
 
 /// `registration` import declaring the given functions.
-pub(super) const REGISTRATION_FLAG_AND_UNSUBSCRIBE: &str = r#"  (import "cyrup:ext/registration@0.14.0" (instance $reg
+pub(super) const REGISTRATION_FLAG_AND_UNSUBSCRIBE: &str = r#"  (import "cyrup:ext/registration@0.15.0" (instance $reg
     (export "register-flag" (func (param "name" string) (param "spec-json" string) (result (result (error string)))))
     (export "subscribe" (func (param "event-kinds" (list u8))))
     (export "unsubscribe" (func (param "event-kinds" (list u8))))))
@@ -138,7 +138,7 @@ pub(super) const REGISTRATION_FLAG_AND_UNSUBSCRIBE: &str = r#"  (import "cyrup:e
 "#;
 
 /// `ui` import declaring `set-status` and `select`.
-pub(super) const UI_STATUS_AND_SELECT: &str = r#"  (import "cyrup:ext/ui@0.14.0" (instance $ui
+pub(super) const UI_STATUS_AND_SELECT: &str = r#"  (import "cyrup:ext/ui@0.15.0" (instance $ui
     (export "set-status" (func (param "key" string) (param "text" (option string))))
     (export "select" (func (param "prompt" string) (param "options-json" string) (param "opts-json" string) (result (option string))))))
   (alias export $ui "set-status" (func $set-status))

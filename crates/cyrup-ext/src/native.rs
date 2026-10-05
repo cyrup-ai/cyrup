@@ -515,6 +515,10 @@ impl InitApi {
     }
 
     /// Register a tool. Overrides a built-in of the same name at the registry (R-08-012).
+    ///
+    /// While the tool's `execute` runs inside a session, [`crate::ExtensionToolContext::current`]
+    /// answers pi's `ctx.executeTool` / `ctx.tools` bound to that call (`extensions/types.ts:367-395`
+    /// @v1.0.1) — see [`crate::nested`].
     pub fn register_tool(&mut self, tool: Arc<dyn Tool>) {
         self.tools.push(tool);
     }

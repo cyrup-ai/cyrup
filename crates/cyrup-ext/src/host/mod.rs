@@ -22,7 +22,7 @@ pub mod testkit;
 pub use engine::{build_engine, build_engine_on_demand, map_wasm_error};
 pub use epoch::EpochDriver;
 pub use limits::StoreLimits;
-pub use live::{GuestBashOperations, LiveExtension, WasmTool};
+pub use live::{GuestBashOperations, GuestReentry, LiveExtension, WasmTool};
 pub use overlay::{
     CustomOption, CustomSpec, InteractiveOverlay, OverlayColor, OverlayKey, OverlayKeyCode,
     OverlayLine, OverlayMouse, OverlayMouseOutcome, OverlayOptions, OverlayOutcome, OverlaySpan,
@@ -32,8 +32,8 @@ pub use overlay_keys::{KeySpec, key_ids, parse_user_bindings, read_user_bindings
 pub use services::{
     CannedResponses, ControlOp, DENIED_EXEC, DENIED_NET, DENIED_UI, DenyServices, DialogOptions,
     ExecOutput, FsCaps, GuestState, HostServices, HttpRequest, HttpResponse, HttpStreamResponse,
-    HumanInteractionGuard, HumanInteractionLock, InjectOutcome, NotifyKind, OAuthEvent,
-    ProcSpawnSpec, ProviderReduction, RecordingServices, SharedBus, StandaloneCompletion,
-    StandaloneCompletionRefusal, UiChrome, WidgetEffect, WidgetPlacement,
+    HumanInteractionGuard, HumanInteractionLock, InjectOutcome, NestedImportRefusal, NotifyKind,
+    OAuthEvent, ProcSpawnSpec, ProviderReduction, RecordingServices, SharedBus,
+    StandaloneCompletion, StandaloneCompletionRefusal, UiChrome, WidgetEffect, WidgetPlacement,
 };
 pub use store_state::HostState;

@@ -771,8 +771,8 @@ mod guest {
 /// The component-level `registration` import declaring only `register-tool`, with the
 /// `tool-descriptor` record at its current shape.
 #[cfg(feature = "wasm-host")]
-fn guest_registration_tool_import() -> String {
-    r#"  (import "cyrup:ext/types@0.14.0" (instance $types
+pub(super) fn guest_registration_tool_import() -> String {
+    r#"  (import "cyrup:ext/types@0.15.0" (instance $types
     (type $em (enum "parallel" "sequential"))
     (export "exec-mode" (type $em-x (eq $em)))
     (type $tn (record
@@ -789,7 +789,7 @@ fn guest_registration_tool_import() -> String {
       (field "default-active" (option bool))))
     (export "tool-descriptor" (type $td-x (eq $td)))))
   (alias export $types "tool-descriptor" (type $tool-descriptor))
-  (import "cyrup:ext/registration@0.14.0" (instance $reg
+  (import "cyrup:ext/registration@0.15.0" (instance $reg
     (alias outer 1 $tool-descriptor (type $td))
     (export "tool-descriptor" (type $td-x (eq $td)))
     (export "register-tool" (func (param "t" $td-x) (result (result (error string)))))))

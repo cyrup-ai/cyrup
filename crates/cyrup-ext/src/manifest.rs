@@ -277,7 +277,16 @@ impl Capabilities {
 ///   `namespace` / `defaultActive`, `core/extensions/types.ts:509`, `:527`, `:608` @v1.0.1), which
 ///   re-signs `registration.register-tool`. A 0.13 guest calls it with the record without them and
 ///   fails to link, so it takes the bump (the 0.6 -> 0.7 `constrained-sampling` precedent).
-pub const HOST_WORLD: &str = "cyrup:ext@0.14";
+/// - 0.14 -> 0.15: EXPORT RE-SIGNING — `events.on-tool-call`, `on-tool-result` and
+///   `on-tool-execution-{start,update,end}` each gained a trailing `parent-tool-call-id:
+///   option<string>` (pi `parentToolCallId` on `tool_call`, `tool_result` and `tool_execution_*`,
+///   `core/extensions/types.ts:1061-1083`, `:1155-1161`, `:1231` @v1.0.1), so a guest observer can
+///   tell a call a tool made (`ctx.executeTool`) from one the model issued. A 0.14 guest exports
+///   the shorter signatures and fails to link, so it takes the bump (the 0.8 -> 0.9 `render-call`
+///   precedent). The `host-tool.execute-tool` / `callable-tools` imports of the same batch (pi
+///   `ExtensionToolContext.executeTool` / `.tools`, `:383-395`) are ADDITIVE and would not have
+///   required one on their own.
+pub const HOST_WORLD: &str = "cyrup:ext@0.15";
 
 impl ExtensionManifest {
     /// Parse from JSON bytes.

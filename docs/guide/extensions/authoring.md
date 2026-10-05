@@ -84,6 +84,46 @@ cross a component boundary, so here it is an export.)
 The macro compiles to nothing on non-wasm targets, so your crate still builds and tests on the host.
 That is the point of keeping `rlib` in `crate-type`.
 
+## Tools that call tools
+
+A tool's `execute` can run other tools through the same validation, hooks and permission checks as a
+call the model made. In a guest, the `ToolCall` your executor receives carries it:
+
+```rust
+define_tool(descriptor, |call: ToolCall| {
+    let outcome = call
+        .execute_tool("read", json!({ "path": "notes.md" }), ExecuteToolOptions::default())
+        .map_err(|e| e.to_string())?;
+    Ok(ToolOutput::text(outcome.result.text()))
+})
+```
+
+`call.tools()` lists what `execute_tool` can reach: the active `direct` tools and every registered
+`codemode` or `deferred` one. The call gets the id `<your call id>/<n>`, never enters the transcript,
+and is recorded, with its usage, as `nestedCalls` on your tool's result. A tool that fails comes
+back as an outcome with `is_error` set; `Err` means the call could not be made at all (the host's
+text says why).
+
+Three things differ from pi's `ctx.executeTool`. The call is always cancelled with your own call
+(there is no `signal` option, because a guest suspended inside the call has no handle to fire).
+`ExecuteToolOptions::on_update` is invoked with the nested tool's partial results after the call
+settles, not as they stream; the same results reach `tool_execution_update` events live. And an
+instance runs one call at a time, so a call to a tool of your own extension is refused instead of
+waiting for itself; the same holds for the nested call's events: your own handlers are not given
+the `tool_call`, `tool_result` and `tool_execution_*` events of a call your tool is making, while
+every other extension is.
+
+A native extension reads the same context inside its tool's `execute`:
+`cyrup_ext::ExtensionToolContext::current()` gives `execute_tool(name, args, options)` bound to the
+running call, and `tools()`. Read it at the top of `execute` and move the clone into anything you
+spawn; the binding is scoped to the call's own future, so two calls running at once never see each
+other's id.
+
+Your handlers tell a nested call from a model-issued one by `parent_tool_call_id` on the event
+(`ToolCallEvent`, `ToolResultEvent` and the three tool-execution events in a guest;
+`HostCtx::parent_tool_call_id()` in a native). A `tool_call` gate needs no change to cover nested
+calls: they reach it as the same event.
+
 ## Building
 
 ```sh
@@ -101,7 +141,7 @@ post-processes it.
 {
   "id": "my-ext",
   "version": "1.0.0",
-  "world": "cyrup:ext@0.14",
+  "world": "cyrup:ext@0.15",
   "entry": "crates/my-ext",
   "capabilities": {
     "fs": ["read:.", "write:.cyrup/todo"],
@@ -122,9 +162,9 @@ post-processes it.
 
 ### World compatibility
 
-The host world is `cyrup:ext@0.14` (`HOST_WORLD` in `crates/cyrup-ext/src/manifest.rs`, which also
+The host world is `cyrup:ext@0.15` (`HOST_WORLD` in `crates/cyrup-ext/src/manifest.rs`, which also
 carries the bump history). A manifest's `world` must declare the **same major version** as the host
-and a **minor version at least** the host's. Against today's host, `cyrup:ext@0.14` is the value to
+and a **minor version at least** the host's. Against today's host, `cyrup:ext@0.15` is the value to
 write; an older minor is a mismatch, and so is a different major.
 
 The minor moves whenever an export is added, removed or re-signed, and whenever an import is removed

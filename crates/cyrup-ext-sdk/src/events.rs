@@ -19,6 +19,11 @@ pub struct ToolCallEvent {
     pub name: String,
     /// The arguments the call is about to run with (Pi `input`).
     pub input: Value,
+    /// The tool call that made this call, when a tool is calling a tool (`ctx.executeTool`) — pi
+    /// `parentToolCallId` (`extensions/types.ts:1061-1083` @v1.0.1). It is itself `<id>/<n>` when
+    /// that tool was a nested call. `None` for a call the model issued; absent on the wire then.
+    #[serde(rename = "parentToolCallId", skip_serializing_if = "Option::is_none")]
+    pub parent_tool_call_id: Option<String>,
 }
 
 /// `tool_result` (Pi `ToolResultEventBase` + per-tool subtype, types.ts:883-929) — mutate the
@@ -49,6 +54,11 @@ pub struct ToolResultEvent {
     /// dependency on the host's `Usage` type.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub usage: Option<Value>,
+    /// The tool call that made this call, when a tool is calling a tool (`ctx.executeTool`) — pi
+    /// `parentToolCallId` (`extensions/types.ts:1061-1083` @v1.0.1). It is itself `<id>/<n>` when
+    /// that tool was a nested call. `None` for a call the model issued; absent on the wire then.
+    #[serde(rename = "parentToolCallId", skip_serializing_if = "Option::is_none")]
+    pub parent_tool_call_id: Option<String>,
 }
 
 /// `context` (Pi types.ts:1207) — filter/replace the LLM message list.
@@ -223,6 +233,10 @@ pub struct ToolExecStartEvent {
     pub name: String,
     /// The arguments it is executing with.
     pub args: Value,
+    /// The tool call that made this call, when a tool is calling a tool (`ctx.executeTool`) — pi
+    /// `parentToolCallId` (`extensions/types.ts:1155-1161`, `:1231` @v1.0.1), itself `<id>/<n>`
+    /// when that tool was a nested call. `None` for a call the model issued.
+    pub parent_tool_call_id: Option<String>,
 }
 
 /// `tool_execution_update` (Pi types.ts) — HIGH-FREQ.
@@ -237,6 +251,10 @@ pub struct ToolExecUpdateEvent {
     /// One partial-output chunk from the running tool; for a guest tool, what it pushed through
     /// [`crate::ToolCall::emit_update`].
     pub chunk: Value,
+    /// The tool call that made this call, when a tool is calling a tool (`ctx.executeTool`) — pi
+    /// `parentToolCallId` (`extensions/types.ts:1155-1161`, `:1231` @v1.0.1), itself `<id>/<n>`
+    /// when that tool was a nested call. `None` for a call the model issued.
+    pub parent_tool_call_id: Option<String>,
 }
 
 /// `tool_execution_end` (Pi types.ts).
@@ -252,6 +270,10 @@ pub struct ToolExecEndEvent {
     pub result: Value,
     /// Whether that result is a failure.
     pub is_error: bool,
+    /// The tool call that made this call, when a tool is calling a tool (`ctx.executeTool`) — pi
+    /// `parentToolCallId` (`extensions/types.ts:1155-1161`, `:1231` @v1.0.1), itself `<id>/<n>`
+    /// when that tool was a nested call. `None` for a call the model issued.
+    pub parent_tool_call_id: Option<String>,
 }
 
 /// `session_start` / `session_shutdown` — `reason` includes `"reload"`.

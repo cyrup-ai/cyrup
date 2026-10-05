@@ -190,8 +190,17 @@ macro_rules! export_extension {
                     call_id: ::std::string::String,
                     name: ::std::string::String,
                     input_json: ::std::string::String,
+                    parent_tool_call_id: ::core::option::Option<::std::string::String>,
                 ) -> bindings::cyrup::ext::types::HookOutcome {
-                    $crate::guest::hook(0, &[&call_id, &name, &input_json])
+                    $crate::guest::hook(
+                        0,
+                        &[
+                            &call_id,
+                            &name,
+                            &input_json,
+                            parent_tool_call_id.as_deref().unwrap_or(""),
+                        ],
+                    )
                 }
                 fn on_tool_result(
                     call_id: ::std::string::String,
@@ -201,6 +210,7 @@ macro_rules! export_extension {
                     is_error: bool,
                     details_json: ::core::option::Option<::std::string::String>,
                     usage_json: ::core::option::Option<::std::string::String>,
+                    parent_tool_call_id: ::core::option::Option<::std::string::String>,
                 ) -> bindings::cyrup::ext::types::HookOutcome {
                     $crate::guest::hook(
                         1,
@@ -212,6 +222,7 @@ macro_rules! export_extension {
                             $crate::guest::b(is_error),
                             details_json.as_deref().unwrap_or(""),
                             usage_json.as_deref().unwrap_or(""),
+                            parent_tool_call_id.as_deref().unwrap_or(""),
                         ],
                     )
                 }
@@ -366,26 +377,52 @@ macro_rules! export_extension {
                     call_id: ::std::string::String,
                     name: ::std::string::String,
                     args_json: ::std::string::String,
+                    parent_tool_call_id: ::core::option::Option<::std::string::String>,
                 ) {
-                    $crate::guest::notify(13, &[&call_id, &name, &args_json]);
+                    $crate::guest::notify(
+                        13,
+                        &[
+                            &call_id,
+                            &name,
+                            &args_json,
+                            parent_tool_call_id.as_deref().unwrap_or(""),
+                        ],
+                    );
                 }
                 fn on_tool_execution_update(
                     call_id: ::std::string::String,
                     name: ::std::string::String,
                     args_json: ::std::string::String,
                     chunk_json: ::std::string::String,
+                    parent_tool_call_id: ::core::option::Option<::std::string::String>,
                 ) {
-                    $crate::guest::notify(14, &[&call_id, &name, &args_json, &chunk_json]);
+                    $crate::guest::notify(
+                        14,
+                        &[
+                            &call_id,
+                            &name,
+                            &args_json,
+                            &chunk_json,
+                            parent_tool_call_id.as_deref().unwrap_or(""),
+                        ],
+                    );
                 }
                 fn on_tool_execution_end(
                     call_id: ::std::string::String,
                     name: ::std::string::String,
                     result_json: ::std::string::String,
                     is_error: bool,
+                    parent_tool_call_id: ::core::option::Option<::std::string::String>,
                 ) {
                     $crate::guest::notify(
                         15,
-                        &[&call_id, &name, &result_json, $crate::guest::b(is_error)],
+                        &[
+                            &call_id,
+                            &name,
+                            &result_json,
+                            $crate::guest::b(is_error),
+                            parent_tool_call_id.as_deref().unwrap_or(""),
+                        ],
                     );
                 }
                 fn on_session_start(

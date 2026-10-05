@@ -34,6 +34,15 @@ pub(super) fn install(api: &mut ExtensionApi) {
             }
             return Outcome::block("shutting down");
         }
+        // CODE-006: pi's `parentToolCallId` on `tool_call` (`extensions/types.ts:1155-1161`
+        // @v1.0.1) — a call a tool made through `ctx.executeTool` reaches this gate as the same
+        // event, so a gate needs no change to cover it; this handler also says which it was.
+        if let Some(parent) = &ev.parent_tool_call_id {
+            ctx.ui().notify(&format!(
+                "demo: tool_call {} parent={parent} id={}",
+                ev.name, ev.call_id
+            ));
+        }
         if ev.name == "bash" {
             // An `error`-severity notification (Pi `notify(msg, "error")`, types.ts:142 @v0.83.0).
             ctx.ui()
@@ -61,8 +70,14 @@ pub(super) fn install(api: &mut ExtensionApi) {
             .as_ref()
             .map(|u| u.to_string())
             .unwrap_or_else(|| "none".to_string());
-        ctx.ui()
-            .notify(&format!("demo: tool_result {} usage={received}", ev.name));
+        ctx.ui().notify(&format!(
+            "demo: tool_result {} usage={received}{}",
+            ev.name,
+            ev.parent_tool_call_id
+                .as_ref()
+                .map(|p| format!(" parent={p}"))
+                .unwrap_or_default()
+        ));
         match ev.usage.clone() {
             Some(mut usage) if ev.name == "usage_probe" => {
                 let doubled = usage.get("output").and_then(|v| v.as_u64()).unwrap_or(0) * 2;
@@ -72,6 +87,34 @@ pub(super) fn install(api: &mut ExtensionApi) {
                 Outcome::mutate(json!({ "usage": usage }))
             }
             _ => Outcome::noop(),
+        }
+    });
+
+    // CODE-006: the three `tool_execution_*` events of a call a tool made carry `parentToolCallId`
+    // (`extensions/types.ts:1223-1225`, `:1061-1083` @v1.0.1). Each handler speaks ONLY for a nested
+    // call, so no other test in the shared `cyrup-it` suite sees an extra notification.
+    api.on_tool_exec_start(|ev, ctx| {
+        if let Some(parent) = &ev.parent_tool_call_id {
+            ctx.ui().notify(&format!(
+                "demo: tool_execution_start {} parent={parent}",
+                ev.call_id
+            ));
+        }
+    });
+    api.on_tool_exec_update(|ev, ctx| {
+        if let Some(parent) = &ev.parent_tool_call_id {
+            ctx.ui().notify(&format!(
+                "demo: tool_execution_update {} parent={parent}",
+                ev.call_id
+            ));
+        }
+    });
+    api.on_tool_exec_end(|ev, ctx| {
+        if let Some(parent) = &ev.parent_tool_call_id {
+            ctx.ui().notify(&format!(
+                "demo: tool_execution_end {} parent={parent}",
+                ev.call_id
+            ));
         }
     });
 

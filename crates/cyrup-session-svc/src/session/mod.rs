@@ -317,11 +317,11 @@ pub struct AgentSession {
     /// `setActiveTools`/`getActiveTools` and the host/CLI tool-toggle read+mutate the SAME state.
     dynamic_tools: Arc<Mutex<DynamicToolState>>,
     // ---- nested tool calls (Pi `_nestedToolCalls`, agent-session.ts:699-740; CODE-006) ----
-    /// The calls tools make while they run: scopes, the exclusive queue, the per-call records.
-    nested_calls: Arc<cyrup_agent::NestedToolCallRunner>,
-    /// The hooks the agent runs with, kept so [`Self::execute_nested_tool`] can run a nested call
-    /// through them.
-    nested_hooks: Arc<dyn cyrup_agent::Hooks>,
+    /// What a call a tool makes while it runs needs: the runner (scopes, the exclusive queue, the
+    /// per-call records), the hooks the agent runs with, the callable tools and the event sinks.
+    /// Also the [`cyrup_ext::NestedToolRunner`] the extension host holds (weakly), which is how an
+    /// extension tool's `ctx.executeTool` reaches [`Self::execute_nested_tool`].
+    nested: Arc<nested::SessionNested>,
     /// The host the `codemode` tool acts through, if the builder was given a codemode extension.
     codemode_host: Option<Arc<SessionCodemodeHost>>,
     // ---- post-run execution loop (Pi `_runAgentPrompt`/`_handlePostAgentRun`,
@@ -424,6 +424,20 @@ impl AgentSession {
         let (driver_tx_init, driver_keepalive) = tokio::sync::watch::channel(false);
         // EXT-087 — see `settled_drain_tx`.
         let (settled_drain_init, settled_drain_keepalive) = tokio::sync::watch::channel(false);
+        let nested = Arc::new(nested::SessionNested::new(
+            Arc::clone(&agent),
+            extras.nested_calls,
+            extras.hooks,
+            Arc::clone(&extras.dynamic_tools),
+            Arc::clone(&services.ext_host),
+            Arc::clone(&fanout),
+            session_cancel.clone(),
+        ));
+        // pi binds `executeTool` / `getCallableTools` into the extension runner
+        // (`agent-session.ts:3420-3421`); the host keeps a `Weak`, so it never outlives the session.
+        services
+            .ext_host
+            .set_nested_tool_runner(&(Arc::clone(&nested) as Arc<dyn cyrup_ext::NestedToolRunner>));
         Self {
             agent,
             manager,
@@ -472,8 +486,7 @@ impl AgentSession {
             bash_session_env: extras.bash_session_env,
             read_model_vision: extras.read_model_vision,
             dynamic_tools: extras.dynamic_tools,
-            nested_calls: extras.nested_calls,
-            nested_hooks: extras.hooks,
+            nested,
             codemode_host: extras.codemode_host,
             handle: extras.handle,
             last_assistant: Mutex::new(None),

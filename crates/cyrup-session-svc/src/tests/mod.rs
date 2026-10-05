@@ -51,6 +51,7 @@ mod native_host_services;
 mod native_slash_command_output;
 mod nested_tool_calls;
 mod codemode;
+mod nested_tool_context;
 mod post_login_catalog_refresh;
 mod production_provider_wiring;
 mod project_trust_extension;

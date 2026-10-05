@@ -42,11 +42,27 @@ pub trait ActiveToolNames: Send + Sync {
 pub struct RegisteredTool {
     inner: Arc<dyn Tool>,
     active: Arc<dyn ActiveToolNames>,
+    /// Where the session's [`crate::NestedToolRunner`] is attached, when the host has one; read at
+    /// execute time, so a tool wrapped before the session existed still reaches it.
+    nested: Option<Arc<crate::nested::NestedRunnerSlot>>,
 }
 
 impl RegisteredTool {
     pub fn new(inner: Arc<dyn Tool>, active: Arc<dyn ActiveToolNames>) -> Self {
-        Self { inner, active }
+        Self {
+            inner,
+            active,
+            nested: None,
+        }
+    }
+
+    /// Bind the host's runner slot: while this tool executes, [`crate::ExtensionToolContext::current`]
+    /// answers a context bound to the call's id and cancel token — pi's `ctx.executeTool` and
+    /// `ctx.tools` for `execute` (`extensions/types.ts:383-395` @v1.0.1).
+    #[must_use]
+    pub fn with_nested_runner(mut self, slot: Arc<crate::nested::NestedRunnerSlot>) -> Self {
+        self.nested = Some(slot);
+        self
     }
 
     /// The wrapped tool, for callers that need the raw handle back.
@@ -61,6 +77,16 @@ pub fn wrap_registered_tool(
     active: Arc<dyn ActiveToolNames>,
 ) -> Arc<dyn Tool> {
     Arc::new(RegisteredTool::new(tool, active))
+}
+
+/// [`wrap_registered_tool`] that also binds the host's [`crate::NestedRunnerSlot`], which is what
+/// gives the wrapped tool a [`crate::ExtensionToolContext`] while it runs.
+pub fn wrap_registered_tool_with_nested(
+    tool: Arc<dyn Tool>,
+    active: Arc<dyn ActiveToolNames>,
+    slot: Arc<crate::nested::NestedRunnerSlot>,
+) -> Arc<dyn Tool> {
+    Arc::new(RegisteredTool::new(tool, active).with_nested_runner(slot))
 }
 
 /// The names present in `after` but not in `before`, in `after` order — or `None` when the change
@@ -196,11 +222,21 @@ impl Tool for RegisteredTool {
         on_update: ToolUpdateSink,
     ) -> Result<ToolResult, ToolError> {
         let before = self.active.active_tool_names();
+        // The context `ctx.executeTool` binds is THIS call's: scoped to the one future below, so a
+        // parallel call never reads it (see `crate::nested`).
+        let context = self
+            .nested
+            .as_ref()
+            .and_then(|slot| slot.get())
+            .map(|runner| {
+                crate::nested::ExtensionToolContext::new(runner, call_id.clone(), cancel.clone())
+            });
+        let work = self.inner.execute(call_id, params, cancel, on_update);
         // A failing tool propagates unchanged — upstream the `await` throws past the diff entirely.
-        let mut result = self
-            .inner
-            .execute(call_id, params, cancel, on_update)
-            .await?;
+        let mut result = match context {
+            Some(context) => context.scope(work).await?,
+            None => work.await?,
+        };
         let (Some(before), Some(after)) = (before, self.active.active_tool_names()) else {
             return Ok(result);
         };

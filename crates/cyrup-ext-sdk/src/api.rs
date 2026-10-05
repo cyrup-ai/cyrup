@@ -1243,6 +1243,7 @@ impl ExtensionApi {
                     call_id: arg(a, 0).into(),
                     name: arg(a, 1).into(),
                     input: json(arg(a, 2)),
+                    parent_tool_call_id: opt_str(arg(a, 3)),
                 };
                 f(ev, c).into_raw()
             }),
@@ -1267,6 +1268,7 @@ impl ExtensionApi {
                     // pi `ToolResultEventBase.usage` (types.ts:920-921 @v0.83.0; `:919` is `isError`);
                     // empty arg = pi `undefined`.
                     usage: opt_json(arg(a, 6)),
+                    parent_tool_call_id: opt_str(arg(a, 7)),
                 };
                 f(ev, c).into_raw()
             }),
@@ -1701,6 +1703,7 @@ impl ExtensionApi {
                         call_id: arg(a, 0).into(),
                         name: arg(a, 1).into(),
                         args: json(arg(a, 2)),
+                        parent_tool_call_id: opt_str(arg(a, 3)),
                     },
                     c,
                 )
@@ -1722,6 +1725,7 @@ impl ExtensionApi {
                         name: arg(a, 1).into(),
                         args: json(arg(a, 2)),
                         chunk: json(arg(a, 3)),
+                        parent_tool_call_id: opt_str(arg(a, 4)),
                     },
                     c,
                 )
@@ -1743,6 +1747,7 @@ impl ExtensionApi {
                         name: arg(a, 1).into(),
                         result: json(arg(a, 2)),
                         is_error: arg(a, 3) == "true",
+                        parent_tool_call_id: opt_str(arg(a, 4)),
                     },
                     c,
                 )
