@@ -508,6 +508,84 @@ mod wasm {
         .build()
     }
 
+    /// `execute-tool` calls `host-tool.callable-tools` for its own call and returns the JSON array
+    /// as its `content-json` (`ok` and `err` share a layout, as in [`execute_tool_calling_import`]).
+    fn lister_component() -> Vec<u8> {
+        WatGuest {
+            component: format!(
+                "{}{HOST_TOOL_IMPORT}",
+                crate::tests::tool_exposure::guest_registration_tool_import()
+            ),
+            lowered: vec![REGISTER_TOOL, EXECUTE_TOOL, CALLABLE_TOOLS],
+            overrides: vec![
+                ("init", init_registering()),
+                (
+                    "execute-tool",
+                    "    (func (export \"execute-tool\") (param i32 i32 i32 i32 i32 i32) (result i32) \
+                     (call $callable_tools (local.get 2) (local.get 3) (i32.const 18000)) \
+                     (i32.store (i32.const 18100) (i32.load (i32.const 18000))) \
+                     (i32.store (i32.const 18104) (i32.load (i32.const 18004))) \
+                     (i32.store (i32.const 18108) (i32.load (i32.const 18008))) \
+                     (i32.const 18100))"
+                        .to_string(),
+                ),
+            ],
+            data: vec![
+                (17000, descriptor(6)),
+                (17200, "nester".into()),
+                (17220, "{}".into()),
+            ],
+        }
+        .build()
+    }
+
+    /// pi `ctx.tools`: the guest reads the runner's callable tools through
+    /// `host-tool.callable-tools`, with the fields a sandbox describes a tool by.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_guest_tool_reads_the_callable_tools_through_the_import() {
+        let runner = Arc::new(StubRunner {
+            tools: vec![Arc::new(CallerTool {
+                name: "listed",
+                barrier: None,
+                params: json!({ "type": "object" }),
+            })],
+            ..StubRunner::default()
+        });
+        let host = ExtensionHost::with_wasm(cfg()).unwrap();
+        host.set_active_tool_source(Arc::new(NoAgent));
+        host.set_nested_tool_runner(&as_runner(&runner));
+        host.load_wasm_with_caps(
+            "lister-guest".into(),
+            &lister_component(),
+            Arc::new(crate::DenyServices),
+            &Capabilities::host_granted(),
+        )
+        .await
+        .unwrap();
+        let tool = host
+            .active_tools(&[])
+            .unwrap()
+            .into_iter()
+            .find(|t| t.name() == "nester")
+            .unwrap();
+
+        let result = tool
+            .execute(
+                ToolCallId::from("guest-1"),
+                json!({}),
+                CancelToken::new(),
+                no_updates(),
+            )
+            .await
+            .unwrap();
+
+        let listed: Value = serde_json::from_str(&text_of(&result.content)).unwrap();
+        assert_eq!(listed.as_array().unwrap().len(), 1);
+        assert_eq!(listed[0]["name"], "listed");
+        assert_eq!(listed[0]["exposure"], "direct");
+        assert_eq!(listed[0]["parameters"], json!({ "type": "object" }));
+    }
+
     async fn guest_host(
         runner: &Arc<impl NestedToolRunner + 'static>,
         own_call_id: bool,

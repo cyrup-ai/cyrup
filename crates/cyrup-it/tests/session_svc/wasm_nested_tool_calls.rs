@@ -20,7 +20,11 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use cyrup_core::{ExtensionId, Message, NestedCallStatus, StopReason};
+use cyrup_core::{
+    CancelToken, Content, ExtensionId, Message, NestedCallStatus, StopReason, Tool, ToolCallId,
+    ToolError, ToolResult, ToolUpdate, ToolUpdateSink,
+};
+use cyrup_ext::{ExtError, HookOutcome, HostCtx, HostEvent, InitApi, NativeExtension};
 use cyrup_provider::Provider;
 use cyrup_provider::faux::{
     FauxProvider, FauxResponseStep, faux_assistant_message, faux_text, faux_tool_call,
@@ -68,6 +72,56 @@ fn faux_calling_probe(args: Value) -> Arc<FauxProvider> {
     faux
 }
 
+/// A native tool that streams one partial result before it answers — what a guest's
+/// `ExecuteToolOptions::on_update` is for.
+struct Streamer {
+    params: Value,
+}
+
+#[async_trait::async_trait]
+impl Tool for Streamer {
+    fn name(&self) -> &str {
+        "streamer"
+    }
+    fn parameters(&self) -> &Value {
+        &self.params
+    }
+    async fn execute(
+        &self,
+        _call_id: ToolCallId,
+        _params: Value,
+        _cancel: CancelToken,
+        mut on_update: ToolUpdateSink,
+    ) -> Result<ToolResult, ToolError> {
+        on_update(ToolUpdate {
+            content: vec![Content::text("tick")],
+            ..ToolUpdate::default()
+        });
+        Ok(ToolResult {
+            content: vec![Content::text("streamed")],
+            ..ToolResult::default()
+        })
+    }
+}
+
+struct StreamerExt;
+
+#[async_trait::async_trait]
+impl NativeExtension for StreamerExt {
+    fn id(&self) -> ExtensionId {
+        ExtensionId::from("streamer-ext")
+    }
+    async fn init(&self, api: &mut InitApi) -> Result<(), ExtError> {
+        api.register_tool(Arc::new(Streamer {
+            params: json!({ "type": "object", "properties": {}, "additionalProperties": true }),
+        }));
+        Ok(())
+    }
+    async fn on_event(&self, _ev: &HostEvent, _ctx: &HostCtx) -> HookOutcome {
+        HookOutcome::Noop
+    }
+}
+
 struct Loaded {
     session: Arc<cyrup_session_svc::AgentSession>,
     demo: Arc<cyrup_ext::host::LiveExtension>,
@@ -79,6 +133,7 @@ async fn session_with_two_guests(fx: &Fixture, provider: Arc<FauxProvider>) -> L
     cfg.trust_override = Some(true);
     cfg.no_extensions = true;
     let session = SessionBuilder::new(provider as Arc<dyn Provider>, cfg)
+        .with_native_extension(Arc::new(StreamerExt))
         .build()
         .await
         .unwrap()
@@ -261,4 +316,22 @@ async fn a_guest_tool_calling_its_own_extensions_tool_is_refused_not_deadlocked(
         text.contains("a tool cannot call a tool of its own extension"),
         "{text}"
     );
+}
+
+/// pi's `options.onUpdate` of `ctx.executeTool`: the partial results the nested tool streamed reach
+/// the guest's `on_update` — batched, once the call has settled — and the guest gets the result.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_guest_tools_on_update_receives_the_nested_tools_partial_results() {
+    let fx = fixture();
+    let loaded = session_with_two_guests(
+        &fx,
+        faux_calling_probe(json!({ "tool": "streamer", "args": {}, "collect": true })),
+    )
+    .await;
+
+    let _ = loaded.session.prompt("go").await.unwrap();
+    loaded.session.wait_for_idle().await;
+
+    let text = text_of(&probe_result(&loaded.session).await);
+    assert!(text.contains("error=false partials=1 :: streamed"), "{text}");
 }

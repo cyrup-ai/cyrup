@@ -51,6 +51,7 @@ const SDK_SOURCES: &str = concat!(
     include_str!("../ctx/http.rs"),
     include_str!("../ctx/mod.rs"),
     include_str!("../ctx/models.rs"),
+    include_str!("../ctx/nested_call.rs"),
     include_str!("../ctx/proc.rs"),
     include_str!("../ctx/session.rs"),
     include_str!("../ctx/tool_call.rs"),

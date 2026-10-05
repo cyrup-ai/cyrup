@@ -1,4 +1,4 @@
-// cyrup:ext@0.14.0 — the versioned WIT world (arch-08 §4.1).
+// cyrup:ext@0.15.0 — the versioned WIT world (arch-08 §4.1).
 //
 // Single source of truth, shared verbatim by the host (`wasmtime::component::bindgen!`)
 // and the guest (`wit-bindgen` in cyrup-ext-sdk). Open-shaped values (tool params, message
