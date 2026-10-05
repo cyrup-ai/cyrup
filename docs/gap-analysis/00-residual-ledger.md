@@ -12,11 +12,12 @@ next work item**.
 > wrong** — in one of them, following the row literally would have deleted a working capability.
 >
 > The count is whatever `python3 docs/gap-analysis/scripts/count_open_items.py` prints. Measured AFTER
-> rebasing onto `3189e73a`, which brought #182 and #183 in underneath this work: **155 open — 0
-> critical, 0 high, 9 medium, 146 low; 17 trackers; 892 closed; 1 duplicate not counted**. By area: `01` 28, `02` 1, `03` 7, `04` 5, `05` 7, `06` 18, `07` 24, `08` 7, `09` 2, `09b` 26, `10` 1, `11` 10, `12` 2, `14` 0, `16` 2, `17` 1, `18` 13, `09a` 1.
+> rebasing onto `494fea86`, which brought #182, #183 and #184 in underneath this work: **154 open — 0
+> critical, 0 high, 9 medium, 145 low; 17 trackers; 894 closed; 0 duplicates**. By area: `01` 28, `02` 1, `03` 7, `04` 5, `05` 7, `06` 18, `07` 23, `08` 7, `09` 2, `09b` 26, `10` 1, `11` 10, `12` 2, `14` 0, `16` 2, `17` 1, `18` 13, `09a` 1.
 > This pass itself closed one medium (`SUBA-150`) and filed one (`SUBA-174`), so its own effect on the
-> medium count is **zero**; the movement from 156 → 155 open and 876 → 892 closed is the TUI work
-> rebased in under it, not this pass.
+> medium count is **zero**. All of the movement from 156 → 154 open and 876 → 894 closed is the TUI work
+> rebased in under it — #182, #183 and #184 — not this pass. The duplicate count reaching 0 is #184's
+> `CFG-098` closure, also not this pass.
 >
 > ## Closed
 >
