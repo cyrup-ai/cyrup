@@ -134,12 +134,19 @@ async fn a_panicking_tool_is_an_error_in_the_script_not_a_crash() {
         Box::pin(async { panic!("tool bug") })
     });
     let eager = tool_with(ToolDeclaration::new("eager"), |_, _| panic!("sync bug"));
-    let sandbox = sandbox(vec![boom, eager, echo()]);
+    // Panics after its first suspension, in the task the supervisor spawned for it.
+    let late = tool_with(ToolDeclaration::new("late"), |_, _| {
+        Box::pin(async {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            panic!("late bug")
+        })
+    });
+    let sandbox = sandbox(vec![boom, eager, late, echo()]);
     let result = run(
         &sandbox,
         r#"
         const messages = [];
-        for (const name of ["boom", "eager"]) {
+        for (const name of ["boom", "eager", "late"]) {
             try { await tools[name](); } catch (error) { messages.push(error.message); }
         }
         return [messages, await tools.echo("alive")];
@@ -149,7 +156,11 @@ async fn a_panicking_tool_is_an_error_in_the_script_not_a_crash() {
     assert_eq!(
         value(&result),
         Some(json!([
-            ["The tool callback panicked", "The tool callback panicked"],
+            [
+                "The tool callback panicked",
+                "The tool callback panicked",
+                "The tool callback panicked"
+            ],
             "alive"
         ]))
     );
@@ -158,6 +169,7 @@ async fn a_panicking_tool_is_an_error_in_the_script_not_a_crash() {
         [
             ("boom".to_owned(), CallStatus::Error),
             ("eager".to_owned(), CallStatus::Error),
+            ("late".to_owned(), CallStatus::Error),
             ("echo".to_owned(), CallStatus::Ok),
         ]
     );
