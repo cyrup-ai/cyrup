@@ -124,7 +124,8 @@ fn attach_native_extensions(
     ));
     // `tool_search` follows it (`extensions/index.ts:12` @v1.0.1): registered inactive and
     // replaceable, it loads `codemode` and `deferred` tools into the active set on request.
-    builder = builder.with_native_extension(Arc::new(cyrup_tool_search::ToolSearchExtension::new()));
+    builder =
+        builder.with_native_extension(Arc::new(cyrup_tool_search::ToolSearchExtension::new()));
     // A malformed `intercom/config.json`, or an unusable `PI_INTERCOM_ASK_TIMEOUT_MS`, REFUSES
     // this extension. Both of upstream's equivalents throw from the first two lines of the
     // extension factory itself — `loadConfig()` (`pi-intercom/index.ts:648` @v0.16.0, throwing from
@@ -1071,6 +1072,50 @@ mod tests {
                 !dropped.iter().any(|i| i == LLAMA_ID),
                 "{mode}: --no-extensions drops the ambient llama.cpp built-in; got {dropped:?}"
             );
+        }
+    }
+
+    /// TOOL-052 — `tool_search` is attached by `attach_native_extensions` (`extensions/index.ts:12`
+    /// @v1.0.1) in every mode, registered inactive and `model-only`; `--no-extensions` drops it as
+    /// it drops the other ambient built-ins. Read off a session built through `build_factory`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tool_search_is_attached_inactive_and_model_only_in_every_mode() {
+        for (mode, interactive) in [("interactive", true), ("rpc/print/json", false)] {
+            for no_extensions in [false, true] {
+                let tmp = tempfile::tempdir().unwrap();
+                let cwd = tmp.path().join("project");
+                let agent_dir = tmp.path().join("agent");
+                std::fs::create_dir_all(&cwd).unwrap();
+                std::fs::create_dir_all(&agent_dir).unwrap();
+                let (factory, target) = factory_at(&agent_dir, &cwd, interactive, no_extensions);
+                let session: AgentSession = factory.build(target, None).await.unwrap();
+                let row = session
+                    .all_tools()
+                    .into_iter()
+                    .find(|row| row.name == "tool_search");
+                if no_extensions {
+                    assert!(row.is_none(), "{mode}: --no-extensions drops tool_search");
+                    continue;
+                }
+                let row = row.unwrap_or_else(|| panic!("{mode}: tool_search is registered"));
+                assert_eq!(row.exposure, cyrup_core::ToolExposure::ModelOnly, "{mode}");
+                assert!(
+                    !session
+                        .active_tool_names()
+                        .iter()
+                        .any(|n| n == "tool_search"),
+                    "{mode}: registered `defaultActive: false`"
+                );
+                assert!(
+                    session
+                        .services()
+                        .ext_host
+                        .loaded_ids()
+                        .iter()
+                        .any(|id| id.to_string() == cyrup_tool_search::EXTENSION_ID),
+                    "{mode}: the extension is loaded"
+                );
+            }
         }
     }
 
