@@ -73,7 +73,8 @@ pub use paths::{
 pub use policy::NetworkPolicy;
 pub use provider_compose::{ConfiguredApiKeyAuth, compose_provider_registry};
 pub use settings::{
-    CompactionSettings, DEFAULT_HTTP_IDLE_TIMEOUT_MS, DEFAULT_TOOL_NAMES, DEVICE_ID_KEY,
+    CodemodeMode, CodemodeSettings, CompactionSettings, DEFAULT_CODEMODE_INLINE_BUDGET,
+    DEFAULT_HTTP_IDLE_TIMEOUT_MS, DEFAULT_TOOL_NAMES, DEVICE_ID_KEY,
     DefaultProjectTrust, DeviceIdDecision, EffectiveSettings, FileSettingsStore,
     InMemorySettingsStore, InstallationId, InstallationIdParseError, InstallationIdSupplier,
     MermaidRenderingMode, PackageSource, RetrySettings, Settings, SettingsManager, SettingsScope,

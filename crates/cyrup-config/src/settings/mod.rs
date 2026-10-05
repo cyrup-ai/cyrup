@@ -43,8 +43,9 @@ pub use merge::{deep_merge, deep_merge_settings};
 pub use migrate::migrate_settings;
 pub use store::{FileSettingsStore, InMemorySettingsStore, SettingsStore};
 pub use types::{
-    BranchSummarySettings, CacheWarmingMode, CompactionSettings, DefaultProjectTrust,
-    FullscreenExitOutput, FullscreenScrollbar, MermaidRenderingMode, PackageSource,
-    ProviderRetrySettings, QuietStartup, RetrySettings, SettingsScope, TerminalCapabilityOverrides,
-    TerminalImagesOverride, ThinkingBudgets, TuiMode, Warnings, WheelLineCount, WheelScrollLines,
+    BranchSummarySettings, CacheWarmingMode, CodemodeMode, CodemodeSettings, CompactionSettings,
+    DEFAULT_CODEMODE_INLINE_BUDGET, DefaultProjectTrust, FullscreenExitOutput, FullscreenScrollbar,
+    MermaidRenderingMode, PackageSource, ProviderRetrySettings, QuietStartup, RetrySettings,
+    SettingsScope, TerminalCapabilityOverrides, TerminalImagesOverride, ThinkingBudgets, TuiMode,
+    Warnings, WheelLineCount, WheelScrollLines,
 };

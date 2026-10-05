@@ -1099,3 +1099,65 @@ fn project_modifiers_layer_onto_the_global_default_tools_through_the_manager() {
         names(&["grep"])
     );
 }
+
+/// `codemode.mode` / `codemode.inlineBudget` (pi `readMode`/`readInlineBudget`,
+/// `extensions/codemode/index.ts:22-29` @v1.0.1): `mode === "only" ? "only" : "on"`, and a budget is
+/// used only when it is a finite number `>= 0`, otherwise the tool's 3000-token default applies.
+#[test]
+fn codemode_settings_validate_like_the_extension_reads_them() {
+    let eff = |json: &str| EffectiveSettings::from_settings(Settings::parse(json).unwrap());
+
+    let unset = eff("{}");
+    assert_eq!(unset.codemode_mode(), CodemodeMode::On);
+    assert_eq!(unset.codemode_inline_budget(), 3000.0);
+    assert_eq!(unset.codemode(), CodemodeSettings::default());
+
+    assert_eq!(
+        eff(r#"{"codemode":{"mode":"only"}}"#).codemode_mode(),
+        CodemodeMode::Only
+    );
+    // Anything but the exact string "only" is `on`: an unknown spelling, a non-string.
+    for bad in [r#""ONLY""#, r#""off""#, "true", "1", "null"] {
+        assert_eq!(
+            eff(&format!(r#"{{"codemode":{{"mode":{bad}}}}}"#)).codemode_mode(),
+            CodemodeMode::On,
+            "mode {bad}"
+        );
+    }
+
+    // `0` is a valid budget (lists only namespaces); a fraction is kept as written.
+    assert_eq!(
+        eff(r#"{"codemode":{"inlineBudget":0}}"#).codemode_inline_budget(),
+        0.0
+    );
+    assert_eq!(
+        eff(r#"{"codemode":{"inlineBudget":1500.5}}"#).codemode_inline_budget(),
+        1500.5
+    );
+    // Negative and non-numeric budgets fall back to the default.
+    for bad in ["-1", r#""500""#, "true", "null"] {
+        assert_eq!(
+            eff(&format!(r#"{{"codemode":{{"inlineBudget":{bad}}}}}"#)).codemode_inline_budget(),
+            3000.0,
+            "budget {bad}"
+        );
+    }
+
+    // The raw object is parsed field-wise: a bad budget does not discard a good mode.
+    assert_eq!(
+        eff(r#"{"codemode":{"mode":"only","inlineBudget":"x"}}"#).codemode(),
+        CodemodeSettings {
+            mode: Some(CodemodeMode::Only),
+            inline_budget: None
+        }
+    );
+    // camelCase on the wire.
+    assert_eq!(
+        serde_json::to_value(CodemodeSettings {
+            mode: Some(CodemodeMode::On),
+            inline_budget: Some(10.0)
+        })
+        .unwrap(),
+        serde_json::json!({"mode": "on", "inlineBudget": 10.0})
+    );
+}
