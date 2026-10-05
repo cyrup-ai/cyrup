@@ -238,8 +238,8 @@ pub use host::{
     HttpRequest, HttpResponse, HttpStreamResponse, HumanInteractionGuard, HumanInteractionLock,
     InteractiveOverlay, LiveExtension, NotifyKind, OAuthEvent, OverlayColor, OverlayKey,
     OverlayKeyCode, OverlayLine, OverlayMouse, OverlayMouseOutcome, OverlayOptions, OverlayOutcome,
-    OverlaySpan, ProcSpawnSpec, RecordingServices, SpecOverlay, StoreLimits, ThemeRole, UiChrome,
-    WasmTool,
+    OverlaySpan, ProcSpawnSpec, RecordingServices, SpecOverlay, StandaloneCompletion,
+    StandaloneCompletionRefusal, StoreLimits, ThemeRole, UiChrome, WasmTool,
 };
 #[cfg(feature = "wasm-host")]
 pub use host_runtime::WasmRuntime;

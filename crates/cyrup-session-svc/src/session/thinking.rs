@@ -78,7 +78,7 @@ impl AgentSession {
         if let (Some(mr), Some(m)) = (Self::lock(&self.model).clone(), model.as_ref()) {
             self.services
                 .host_services
-                .update_model(mr, m.context_window, Some(level_str.clone()));
+                .update_model(mr, m.clone(), Some(level_str.clone()));
         }
         self.fanout_emit(AgentSessionEvent::ThinkingLevelChanged {
             level: level_str.clone(),

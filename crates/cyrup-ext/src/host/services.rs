@@ -345,6 +345,38 @@ pub fn no_refresh_backend(
     result
 }
 
+/// One standalone model completion, as [`HostServices::complete_standalone`] runs it: a system
+/// prompt, ONE user message, no tools, and a token cap.
+///
+/// pi's `ctx.modelRegistry.complete(ctx.model, { systemPrompt, messages: [user] }, { signal,
+/// cacheRetention: "none", sessionId: randomUUID(), maxTokens })` (`handover.ts:66-72` @v0.16.0).
+/// The cache policy and the fresh session id are not fields because they are not the caller's to
+/// choose: a standalone completion is by definition one that must not share a prompt cache or a
+/// provider-side session with the conversation it summarizes, so the backend always applies both.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StandaloneCompletion {
+    /// The system prompt.
+    pub system_prompt: String,
+    /// The text of the single user message.
+    pub user_text: String,
+    /// `maxTokens` — the cap on the completion's output.
+    pub max_tokens: u32,
+}
+
+/// Why [`HostServices::complete_standalone`] ran no completion at all. A completion that ran and
+/// failed is NOT one of these: provider and transport failures settle as an
+/// [`cyrup_core::AssistantMessage`] with `StopReason::Error`, exactly as pi's `complete` resolves
+/// them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum StandaloneCompletionRefusal {
+    /// `ctx.model` is unset: the session has no model selected, or this host has no live session.
+    #[error("no model is selected")]
+    NoModel,
+    /// The caller's [`CancelToken`] fired before the completion settled.
+    #[error("the completion was cancelled")]
+    Cancelled,
+}
+
 /// What [`HostServices::provider_auth`] hands a native: pi's `AuthResult`
 /// (`packages/ai/src/auth/types.ts`, `{ auth: { apiKey?, baseUrl?, headers? }, env?, source? }`)
 /// flattened to the three members an extension reads — `result.auth.apiKey`,
@@ -930,6 +962,48 @@ pub trait HostServices: Send + Sync {
         _provider_id: &str,
     ) -> Option<Arc<dyn cyrup_provider::CredentialStore>> {
         None
+    }
+
+    /// pi `buildSessionContext(ctx.sessionManager.getBranch()).messages` (`session-manager.ts`
+    /// @v0.84.4, read by `handover.ts:48` @v0.16.0): the active branch as the MODEL would see it —
+    /// the governing compaction summary first, then the entries it kept, then everything after it,
+    /// with context edits applied — as raw [`cyrup_session::AgentMessage`]s, before `convertToLlm`.
+    ///
+    /// Distinct from [`Self::entries`]/[`Self::branch`] on purpose: those are the raw tree, so a
+    /// compacted-away message is still in them, and a summary built from them would hand the
+    /// receiver history the model itself no longer has. Also unlike them it never answers from a
+    /// momentarily contended lock with an empty list: an empty result here means the context really
+    /// is empty, which is what "No conversation to hand over." reports.
+    ///
+    /// Returns a boxed future because reading the live tree waits on its lock. Empty by default:
+    /// a host with no live session has no conversation.
+    fn session_context_messages(
+        &self,
+    ) -> futures::future::BoxFuture<'_, Vec<cyrup_session::AgentMessage>> {
+        Box::pin(async { Vec::new() })
+    }
+
+    /// pi `ctx.modelRegistry.complete(ctx.model, …)` (`handover.ts:66-72` @v0.16.0): run ONE
+    /// [`StandaloneCompletion`] against the session's CURRENT model, through the provider the
+    /// session itself streams with, and settle it as an [`cyrup_core::AssistantMessage`].
+    ///
+    /// The request is standalone: no tools, no prompt cache (`cacheRetention: "none"`), a fresh
+    /// provider session id, no reasoning level and no retry — what the call asked for and nothing
+    /// the conversation's own turns carry. `cancel` is pi's `signal`: when it fires the call
+    /// resolves [`StandaloneCompletionRefusal::Cancelled`].
+    ///
+    /// Defaults to [`StandaloneCompletionRefusal::NoModel`], never to a fabricated reply: a host
+    /// with no live session has no model to complete with, and upstream answers that case with
+    /// "No model selected; select a model to generate a handover.".
+    fn complete_standalone<'a>(
+        &'a self,
+        _request: StandaloneCompletion,
+        _cancel: CancelToken,
+    ) -> futures::future::BoxFuture<
+        'a,
+        Result<cyrup_core::AssistantMessage, StandaloneCompletionRefusal>,
+    > {
+        Box::pin(async { Err(StandaloneCompletionRefusal::NoModel) })
     }
 
     // --- exec capability (R-08-030); denied by default ---

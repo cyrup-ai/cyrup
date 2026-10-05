@@ -1652,6 +1652,7 @@ dependencies = [
  "cyrup-ext-subagents",
  "cyrup-herdr",
  "cyrup-resources",
+ "cyrup-session",
  "nix 0.31.3",
  "serde",
  "serde_json",

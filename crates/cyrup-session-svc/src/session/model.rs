@@ -927,7 +927,7 @@ impl AgentSession {
         *Self::lock(&self.compaction_model) = Some(next.clone());
         self.services
             .host_services
-            .update_model(model_ref, next.context_window, None);
+            .update_model(model_ref, next.clone(), None);
         // Republish `CYRUP_PROVIDER`/`CYRUP_MODEL` for the NEXT `bash` child (Pi re-reads `ctx.model`
         // on every `resolveSpawnContext`, bash.ts:175-178; docs/environment-variables.md:27).
         self.bash_session_env

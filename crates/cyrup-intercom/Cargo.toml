@@ -59,6 +59,10 @@ cyrup-ext-subagents = { workspace = true }
 # skill/prompts/agents (`registration/resources.rs`), rather than a second, private walk. Nothing in
 # `cyrup-resources` depends on this crate, so there is no cycle.
 cyrup-resources = { workspace = true }
+# ICOM-077 — `convert_to_llm` + `serialize_conversation` render the conversation a handover
+# summarizes (`handover.ts:48-49`). `cyrup-ext` already depends on this crate, so the edge adds no
+# new node to the graph and cannot cycle.
+cyrup-session = { workspace = true }
 tokio = { workspace = true, features = ["net", "io-util", "sync", "time", "macros", "rt-multi-thread", "signal", "process"] }
 bytes = { workspace = true }
 serde = { workspace = true }

@@ -1,5 +1,6 @@
-//! The `intercom` tool (`v0.10.1 index.ts:1826+`): `list`/`list-cwd`/`send`/`ask`/`reply`/`pending`/
-//! `status` over the shared broker client. `ask` is the one blocking action (single-slot outbound waiter).
+//! The `intercom` tool (`v0.16.0 index.ts:2425+`): `list`/`list-cwd`/`send`/`ask`/`handover`/`reply`/
+//! `pending`/`status`/`cancel` over the shared broker client. `ask` is the one blocking action
+//! (single-slot outbound waiter).
 //!
 //! ## Layout
 //!
@@ -7,11 +8,12 @@
 //! `switch (action)` and so did this file, until its `dispatch` reached 592 lines — eight
 //! independent handlers sharing one scope, because match arms cannot see each other's bindings.
 //! The modules below are the seams it was carrying: one per action, in upstream's own `switch`
-//! order — `list`, `list_cwd`, `cancel`, `send`, `ask`, `reply`, `pending`, `status` — each a
+//! order — `list`, `list_cwd`, `cancel`, `send`, `handover`, `ask`, `reply`, `pending`, `status` — each a
 //! `pub(super) async fn action_*` in its own `impl IntercomTool` block, carrying that arm's
 //! `index.ts` citations with the code they annotate. `IntercomTool::dispatch` keeps the shared
 //! prelude (`ensureConnected("tool")` + `syncPresenceIdentity`) and is now the action switch and
-//! nothing else.
+//! nothing else. `send` and `handover` do not each carry a delivery: both hand a typed request to
+//! [`deliver`], upstream's one `deliverMessage`.
 //!
 //! This file keeps what the handlers share: the tool itself, `IntercomParams`,
 //! `DeliveryTarget`, the target/cwd resolvers, the row and error formatters, the schema and the
@@ -22,6 +24,8 @@
 mod ask;
 mod cancel;
 mod cross_machine;
+mod deliver;
+mod handover;
 mod list;
 mod list_cwd;
 mod pending;
@@ -308,6 +312,10 @@ impl IntercomTool {
             "list-cwd" => self.action_list_cwd(&params, &client).await,
             "cancel" => self.action_cancel(&params, &client).await,
             "send" => self.action_send(&params, &client, cancel).await,
+            // `handover` sits between `send` and `ask` in upstream's `switch` (`v0.16.0
+            // index.ts:2627`), and like `send` it reads the cancel token: its delivery re-checks it
+            // immediately before the message leaves.
+            "handover" => self.action_handover(&params, &client, cancel).await,
             "ask" => self.action_ask(&params, &client, cancel).await,
             "reply" => self.action_reply(&params, &client).await,
             "pending" => self.action_pending(&params, &client).await,
@@ -472,7 +480,7 @@ pub(super) fn format_session_list_row(
     )
 }
 
-/// The `intercom` tool's `description` — `v0.14.0 index.ts:2182-2199`, a template literal whose
+/// The `intercom` tool's `description` — `v0.16.0 index.ts:2425-2442`, a template literal whose
 /// line breaks and column-aligned `→` are part of the text the model reads.
 const INTERCOM_DESCRIPTION: &str = r#"Send a message to another cyrup session running on this machine.
 Use this to communicate findings, request help, or coordinate work with other sessions.
@@ -488,6 +496,8 @@ Usage:
   intercom({ action: "send", to: "name-or-id", message: "..." })  → Send message
   intercom({ action: "send", cwd: "/path", openProjectPaneIfMissing: true, message: "..." }) → Open a visible Herdr project pane when needed, then send
   intercom({ action: "ask", to: "name-or-id", message: "..." })   → Ask and wait for reply
+  intercom({ action: "handover", to: "name-or-id", message: "next task" }) → Summarize this session and hand it over; the receiver acts on it
+  intercom({ action: "handover", cwd: "/path", openProjectPaneIfMissing: true }) → Hand over to the session in that project, opening a Herdr pane when needed
   intercom({ action: "cancel", messageId: "..." })                 → Request cancellation of a sent message
   intercom({ action: "reply", message: "..." })                      → Reply to the active/single pending ask
   intercom({ action: "pending" })                                      → List unresolved inbound asks
@@ -500,29 +510,28 @@ pub(crate) fn parameters_schema() -> serde_json::Value {
     serde_json::json!({
         "type": "object",
         "properties": {
-            // `v0.14.0 index.ts:2204-2215` + `:2219-2221` — `action`, `to`, `message` and `replyTo`
-            // descriptions verbatim (ICOM-070).
+            // `v0.16.0 index.ts:2446-2455` + `:2474-2476` — `action`, `to`, `message` and `cwd`
+            // descriptions verbatim (ICOM-070, ICOM-077).
             "action": {
                 "type": "string",
-                "enum": ["list", "list-cwd", "send", "ask", "reply", "pending", "status", "cancel"],
-                "description": "Action: 'list', 'list-cwd', 'send', 'ask', 'reply', 'pending', 'status', or 'cancel'"
+                "enum": ["list", "list-cwd", "send", "ask", "handover", "reply", "pending", "status", "cancel"],
+                "description": "Action: 'list', 'list-cwd', 'send', 'ask', 'handover', 'reply', 'pending', 'status', or 'cancel'. 'handover' summarizes this session with the current model and sends it to the target, which acts on it; 'message' is the optional next task."
             },
-            // `v0.12.0 index.ts:1831-1833`.
             "cwd": {
                 "type": "string",
-                "description": "Working directory filter for 'list-cwd'. For send/ask, scopes target lookup to that directory; omit 'to' to target the sole live peer there. Absolute, or relative to the current session's cwd; '.' means the current cwd."
+                "description": "Working directory filter for 'list-cwd'. For send/ask/handover, scopes target lookup to that directory; omit 'to' to target the sole live peer there. Absolute, or relative to the current session's cwd; '.' means the current cwd."
             },
-            // `v0.12.0 index.ts:2175-2180`, verbatim apart from `Pi` -> `cyrup`.
+            // `v0.16.0 index.ts:2477-2479`, verbatim apart from `Pi` -> `cyrup`.
             "openProjectPaneIfMissing": {
                 "type": "boolean",
-                "description": "For send/ask with cwd, open a visible Herdr project pane and launch cyrup there when no matching live session is connected."
+                "description": "For send/ask/handover with cwd, open a visible Herdr project pane and launch cyrup there when no matching live session is connected."
             },
             "focus": {
                 "type": "boolean",
                 "description": "For openProjectPaneIfMissing, focus the new Herdr pane. Defaults to true."
             },
-            "to": { "type": "string", "description": "Target session: name, full session ID, or the short id shown in parentheses by 'list' (a leading ID prefix resolves). For send/ask with cwd, omit to target the sole live session in that cwd or the newly opened project-pane session. For 'reply', disambiguates the pending ask." },
-            "message": { "type": "string", "description": "Message to send (for 'send', 'ask', or 'reply' action)" },
+            "to": { "type": "string", "description": "Target session: name, full session ID, or the short id shown in parentheses by 'list' (a leading ID prefix resolves). For send/ask/handover with cwd, omit to target the sole live session in that cwd or the newly opened project-pane session. For 'reply', disambiguates the pending ask." },
+            "message": { "type": "string", "description": "Message to send (for 'send', 'ask', or 'reply' action). For 'handover', the optional next task for the receiver." },
             "attachments": {
                 "type": "array",
                 "items": {
@@ -556,7 +565,7 @@ impl Tool for IntercomTool {
         &self.parameters
     }
 
-    /// `description` (`v0.14.0 index.ts:2182-2199`), verbatim except for the product name.
+    /// `description` (`v0.16.0 index.ts:2425-2442`), verbatim except for the product name.
     ///
     /// ICOM-070. The targeting paragraph and the `Usage:` block are what tell the model that a
     /// leading id prefix resolves, to prefer the short id when two peers share a name, and — v0.11.0
@@ -811,10 +820,12 @@ mod tests {
         );
     }
 
-    /// ICOM-070 — the tool `description` and the four parameter descriptions that were cyrup
-    /// paraphrases, pinned against `v0.14.0 index.ts:2182-2221` with the port's one product-name
-    /// substitution (`another pi session` → `another cyrup session`). The paraphrase dropped the
-    /// prefix-targeting rule, the stale-id warning and the per-action call shapes.
+    /// ICOM-070 / ICOM-077 — the tool `description` and the parameter descriptions, pinned against
+    /// `v0.16.0 index.ts:2425-2480` with the port's product-name substitutions (`another pi
+    /// session` → `another cyrup session`, `launch Pi there` → `launch cyrup there`). The ICOM-070
+    /// paraphrase dropped the prefix-targeting rule, the stale-id warning and the per-action call
+    /// shapes; v0.16.0 adds the two `handover` call shapes and names `handover` in the `action`,
+    /// `to`, `message`, `cwd` and `openProjectPaneIfMissing` descriptions.
     #[test]
     fn the_intercom_tool_description_and_parameter_descriptions_are_upstreams() {
         let tool = IntercomTool::new(Arc::new(SharedIntercomState::new(
@@ -837,27 +848,37 @@ mod tests {
             "  intercom({ action: \"send\", to: \"name-or-id\", message: \"...\" })  → Send message",
             "  intercom({ action: \"send\", cwd: \"/path\", openProjectPaneIfMissing: true, message: \"...\" }) → Open a visible Herdr project pane when needed, then send",
             "  intercom({ action: \"ask\", to: \"name-or-id\", message: \"...\" })   → Ask and wait for reply",
+            "  intercom({ action: \"handover\", to: \"name-or-id\", message: \"next task\" }) → Summarize this session and hand it over; the receiver acts on it",
+            "  intercom({ action: \"handover\", cwd: \"/path\", openProjectPaneIfMissing: true }) → Hand over to the session in that project, opening a Herdr pane when needed",
             "  intercom({ action: \"cancel\", messageId: \"...\" })                 → Request cancellation of a sent message",
             "  intercom({ action: \"reply\", message: \"...\" })                      → Reply to the active/single pending ask",
             "  intercom({ action: \"pending\" })                                      → List unresolved inbound asks",
             "  intercom({ action: \"status\" })                  → Show connection status",
         ]
         .join("\n");
-        assert_eq!(tool.description(), expected, "`v0.14.0 index.ts:2182-2199`");
+        assert_eq!(tool.description(), expected, "`v0.16.0 index.ts:2425-2442`");
 
         let schema = tool.parameters();
         for (key, text) in [
             (
                 "action",
-                "Action: 'list', 'list-cwd', 'send', 'ask', 'reply', 'pending', 'status', or 'cancel'",
+                "Action: 'list', 'list-cwd', 'send', 'ask', 'handover', 'reply', 'pending', 'status', or 'cancel'. 'handover' summarizes this session with the current model and sends it to the target, which acts on it; 'message' is the optional next task.",
             ),
             (
                 "to",
-                "Target session: name, full session ID, or the short id shown in parentheses by 'list' (a leading ID prefix resolves). For send/ask with cwd, omit to target the sole live session in that cwd or the newly opened project-pane session. For 'reply', disambiguates the pending ask.",
+                "Target session: name, full session ID, or the short id shown in parentheses by 'list' (a leading ID prefix resolves). For send/ask/handover with cwd, omit to target the sole live session in that cwd or the newly opened project-pane session. For 'reply', disambiguates the pending ask.",
             ),
             (
                 "message",
-                "Message to send (for 'send', 'ask', or 'reply' action)",
+                "Message to send (for 'send', 'ask', or 'reply' action). For 'handover', the optional next task for the receiver.",
+            ),
+            (
+                "cwd",
+                "Working directory filter for 'list-cwd'. For send/ask/handover, scopes target lookup to that directory; omit 'to' to target the sole live peer there. Absolute, or relative to the current session's cwd; '.' means the current cwd.",
+            ),
+            (
+                "openProjectPaneIfMissing",
+                "For send/ask/handover with cwd, open a visible Herdr project pane and launch cyrup there when no matching live session is connected.",
             ),
             (
                 "replyTo",
@@ -867,7 +888,7 @@ mod tests {
             assert_eq!(
                 schema["properties"][key]["description"].as_str(),
                 Some(text),
-                "`{key}`'s description is upstream's (`v0.14.0 index.ts:2204-2221`)"
+                "`{key}`'s description is upstream's (`v0.16.0 index.ts:2446-2480`)"
             );
         }
     }
@@ -894,9 +915,11 @@ mod tests {
         assert_eq!(
             actions,
             vec![
-                "list", "list-cwd", "send", "ask", "reply", "pending", "status", "cancel"
+                "list", "list-cwd", "send", "ask", "handover", "reply", "pending", "status",
+                "cancel"
             ],
-            "`v0.10.1 index.ts:1810-1812` — pi's enum, in pi's order, with `cancel` last"
+            "`v0.16.0 index.ts:2447` — pi's enum, in pi's order, with `handover` after `ask` and \
+             `cancel` last"
         );
         for (key, needle) in [
             ("messageId", "such as 'cancel'"),
@@ -1294,6 +1317,50 @@ mod tests {
         assert_eq!(
             malformed.message,
             "Invalid remote target \"a@b@c\"; expected name@machine or full-session-uuid@machine."
+        );
+    }
+
+    /// `deliverMessage` never throws: a failure its `try` catches is reported as
+    /// `Failed to send: <reason>` (`v0.16.0 index.ts:1805-1810`), for `send` and `handover` alike,
+    /// while a failure it RETURNS keeps its own sentence. A roster that does not contain this very
+    /// session is a throw (`resolveCwdDeliveryTarget`, `:1509-1515`); a send to this session is a
+    /// return.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_thrown_delivery_failure_is_reported_as_failed_to_send() {
+        let (client, _dir) = fake_broker("self-1", Vec::new()).await;
+        let tool = tool();
+        let cancel = CancelToken::new();
+
+        let thrown = tool
+            .action_send(
+                &action(serde_json::json!({
+                    "action": "send", "cwd": "/w/proj", "message": "hi",
+                })),
+                &client,
+                &cancel,
+            )
+            .await
+            .expect_err("the roster does not list this session");
+        assert_eq!(
+            thrown.message,
+            "Failed to send: Current session is missing from intercom session list."
+        );
+
+        let (client, _dir) = fake_broker("self-1", vec![session("self-1", "/w/proj")]).await;
+        let returned = tool
+            .action_send(
+                &action(serde_json::json!({
+                    "action": "send", "to": "self-1", "message": "hi",
+                })),
+                &client,
+                &cancel,
+            )
+            .await
+            .expect_err("a send to this session is refused");
+        assert_eq!(
+            returned.message, "Cannot message the current session",
+            "a RETURNED refusal is not wrapped"
         );
     }
 

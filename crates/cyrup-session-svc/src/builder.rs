@@ -1214,7 +1214,7 @@ impl SessionBuilder {
         if let (Some(mr), Some(m)) = (model_ref.as_ref(), resolved_model.as_ref()) {
             host_services.update_model(
                 mr.clone(),
-                m.context_window,
+                m.clone(),
                 Some(thinking_level_to_str(thinking)),
             );
         }
@@ -1637,7 +1637,7 @@ impl SessionBuilder {
             if let (Some(reference), Some(model)) = (reference.as_ref(), model.as_ref()) {
                 host_services.update_model(
                     reference.clone(),
-                    model.context_window,
+                    model.clone(),
                     Some(thinking_level_to_str(level)),
                 );
             }

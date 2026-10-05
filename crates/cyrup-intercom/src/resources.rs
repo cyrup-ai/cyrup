@@ -210,7 +210,7 @@ mod tests {
             .filter_map(|v| v.as_str().map(str::to_string))
             .collect();
         for action in [
-            "send", "ask", "reply", "pending", "list", "status", "list-cwd",
+            "send", "ask", "handover", "reply", "pending", "list", "status", "list-cwd",
         ] {
             assert!(
                 body.contains(&format!("\"{action}\"")),
@@ -221,5 +221,48 @@ mod tests {
                 "the skill documents {action:?}, which the tool does not advertise: {advertised:?}"
             );
         }
+    }
+
+    /// ICOM-079 — `skills/pi-intercom/SKILL.md:163-181` at `v0.16.0`: "Pattern 6b: Hand Over Your
+    /// Session", byte for byte, between Pattern 6 and Pattern 7. This is the text the agent reads to
+    /// learn that `handover` exists and that its `message` is the NEXT TASK, not a message body, so
+    /// a paraphrase here changes what the model sends.
+    #[test]
+    fn the_skill_teaches_handover_with_upstreams_pattern_6b() {
+        const PATTERN_6B: &str = "### Pattern 6b: Hand Over Your Session
+
+When the user moves work to another session, `handover` summarizes this
+session (next task, decisions, files, current state, open questions) with the
+current model and sends it. The receiver acts on it like any inbound message.
+Pass the next task as `message`; targeting works exactly like `send`.
+
+```typescript
+intercom({
+  action: \"handover\",
+  cwd: \"/path/to/other-repo\",
+  openProjectPaneIfMissing: true,
+  message: \"Port the schema fix here and run the adapter tests\"
+})
+```
+
+Humans can run `/handover <target> [next task]` to review the summary in an
+editor before it is sent. `/handover` alone opens a picker for the target.
+
+";
+        let files = bundled_skill_files();
+        let text = std::fs::read_to_string(&files[0]).expect("the bundled skill is readable");
+        let at = text
+            .find(PATTERN_6B)
+            .expect("Pattern 6b is in the bundled skill, verbatim");
+        let pattern_6 = text
+            .find("### Pattern 6: Cross-Codebase Peer Messages")
+            .expect("Pattern 6 is in the bundled skill");
+        let pattern_7 = text
+            .find("### Pattern 7:")
+            .expect("Pattern 7 is in the bundled skill");
+        assert!(
+            pattern_6 < at && at + PATTERN_6B.len() == pattern_7,
+            "6b sits after Pattern 6 and immediately before Pattern 7"
+        );
     }
 }

@@ -555,9 +555,16 @@ async fn deliver_outbox_request(
     if state.config.confirm_send
         && let Some(services) = services.as_ref()
     {
-        let prompt = format!("Send message to {}?", target.label);
+        // `ctx.ui.confirm("Send extension message", `Allow ${request.extensionName}
+        // (${request.extensionId}) to send to "${target.label}":\n\n${request.message}`)`
+        // (`v0.16.0 index.ts:1198-1201`): the human is told WHICH extension is asking, because the
+        // message is the extension's, not the model's.
+        let prompt = format!(
+            "Allow {} ({}) to send to \"{}\":\n\n{}",
+            request.extension_name, request.extension_id, target.label, request.message
+        );
         if !services.confirm(
-            "Send Message",
+            "Send extension message",
             &prompt,
             &cyrup_ext::DialogOptions::default(),
         ) {

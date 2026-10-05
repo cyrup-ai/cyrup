@@ -16,6 +16,10 @@
 # session is joined by its registered pane id and a moved pane reads `pane_missing` — the text says
 # that instead of naming a session identity cyrup does not register.)
 #
+# (ICOM-079 carries in v0.16.0 `31e73d2`'s "Pattern 6b: Hand Over Your Session"
+# (`skills/pi-intercom/SKILL.md:163-181`) byte for byte, placed after Pattern 6's `list-cwd` example
+# so that pattern stays whole.)
+#
 # YAML comments are ignored by the front-matter parser, exactly as in
 # `cyrup-ext-subagents/resources/agents/researcher.md`.
 name: pi-intercom
@@ -183,6 +187,25 @@ session ID. To see who is live in a directory first:
 ```typescript
 intercom({ action: "list-cwd", cwd: "/path/to/other-repo" })
 ```
+
+### Pattern 6b: Hand Over Your Session
+
+When the user moves work to another session, `handover` summarizes this
+session (next task, decisions, files, current state, open questions) with the
+current model and sends it. The receiver acts on it like any inbound message.
+Pass the next task as `message`; targeting works exactly like `send`.
+
+```typescript
+intercom({
+  action: "handover",
+  cwd: "/path/to/other-repo",
+  openProjectPaneIfMissing: true,
+  message: "Port the schema fix here and run the adapter tests"
+})
+```
+
+Humans can run `/handover <target> [next task]` to review the summary in an
+editor before it is sent. `/handover` alone opens a picker for the target.
 
 ### Pattern 7: Handle Subagent Escalations (Orchestrator Side)
 
