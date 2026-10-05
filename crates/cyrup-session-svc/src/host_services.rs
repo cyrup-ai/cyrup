@@ -2815,18 +2815,26 @@ impl HostServices for LiveHostServices {
                 .iter()
                 .map(|t| {
                     let name = t.name();
-                    json!({
+                    let mut row = json!({
                         "name": name,
                         "description": t.description(),
                         "parameters": t.parameters(),
                         // EXT-007/TOOL-021 widened `Tool::prompt_guidelines` to an OWNED `Vec<&str>`
                         // precisely so a WASM guest tool's decoded guidelines are readable here.
                         "promptGuidelines": t.prompt_guidelines(),
+                        // pi v1.0.1 `getAllTools` adds `exposure` (always) and `namespace` (when the
+                        // definition has one) to `ToolInfo` (`agent-session.ts:1462-1475`): the row a
+                        // `tool_search`-style extension reads to tell what it may load.
+                        "exposure": t.exposure().as_str(),
                         "sourceInfo": ext_source_info
                             .get(name)
                             .cloned()
                             .unwrap_or_else(|| builtin_tool_source_info(name)),
-                    })
+                    });
+                    if let (Some(ns), Some(obj)) = (t.namespace(), row.as_object_mut()) {
+                        obj.insert("namespace".to_string(), json!(ns));
+                    }
+                    row
                 })
                 .collect(),
         )

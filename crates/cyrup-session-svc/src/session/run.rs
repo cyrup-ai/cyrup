@@ -1074,8 +1074,8 @@ impl AgentSession {
         // `pending_active_tools` empty for the later `apply_pending_agent_control` drains, so the
         // restriction is applied exactly once.
         if let Some(names) = self.services.host_services.take_pending_active_tools() {
-            let (tools, _rebuilt_prompt) = { Self::lock(&self.dynamic_tools).set_active(&names) };
-            self.agent.set_tools(tools).await;
+            let (loadout, _rebuilt_prompt) = { Self::lock(&self.dynamic_tools).set_active(&names) };
+            self.apply_loadout(loadout).await;
         }
         if let Some(cyrup_ext::BeforeAgentStartReduction {
             system_prompt,
