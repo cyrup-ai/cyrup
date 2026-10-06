@@ -1254,6 +1254,12 @@ async fn download_finished_ends_the_wait_without_a_catalog_entry() {
 
 /// `client.ts:334-338`: with no SSE at all, a `downloading` entry reports bytes and the wait
 /// continues, then finishes when the entry stops downloading after having been seen downloading.
+///
+/// **This is a pi-fidelity test, not a server-conformance one** (EXT-100): no llama.cpp release
+/// puts per-file progress in a catalog entry's `status`, so the `status.progress` fed below is a
+/// shape only pi's TypeScript type claims. See
+/// [`crate::client::LlamaModelStatusInfo::progress`] for the citations, and
+/// [`super::llama_cpp_wire::download_progress_event`] for how a real router reports it.
 #[tokio::test]
 async fn download_polling_reports_entry_progress_and_finishes_after_it_was_seen_downloading() {
     let server = FakeLlamaServer::start().await;

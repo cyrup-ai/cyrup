@@ -598,6 +598,28 @@ impl RefreshInner {
                 format!("refresh task for {id} ended abnormally: {joined}").into(),
             ),
         };
+        // **EXT-099d — the `false` branch of this guard cannot be observed by a test, and here
+        // is why.** Suppressing the error needs a cancel that is INVISIBLE at the `tokio::select!`
+        // above (`:585-589`) and visible here. That select is `biased` with `signal.cancelled()`
+        // first and yields `None` on that arm, which `settled?` turns into an early return — so
+        // any cancellation already visible there never reaches this line. Between the select
+        // resolving `Some(joined)` and this `then_some` there is no await point (`settle.settled()`
+        // is synchronous), so no other task can be scheduled in the gap: on a current-thread
+        // runtime the window is empty, and on a multi-threaded one it is a few instructions wide
+        // and cannot be forced.
+        //
+        // The TRUE branch — an uncancelled refresh reporting its failure — is covered end to end
+        // by `an_abort_during_the_network_phase_is_reported_and_is_not_a_provider_error`
+        // (`tests/provider_refresh.rs:1240`), which drives a provider that answers an abort with
+        // `ProviderError::Aborted` and asserts `result.errors.is_empty()`. That test passes through
+        // the select's `None` arm, not through this guard, which is precisely why the guard itself
+        // survives mutation.
+        //
+        // The guard stays because upstream has it (pi's `if (!signal.aborted)`, `models.ts:583`)
+        // and because that instruction-wide window is real: a cancel landing in it must not be
+        // reported as a provider failure. Unreachable by construction in a test, NOT untested
+        // behaviour nobody looked at. Same disposition, same reasoning, as `EXT-099c`
+        // (`cyrup-llama/src/provider.rs`'s post-fan-out abort guard).
         (!signal.is_cancelled()).then_some((id, failure))
     }
 }

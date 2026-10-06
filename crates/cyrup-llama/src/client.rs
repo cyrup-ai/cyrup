@@ -263,6 +263,19 @@ pub struct LlamaModelStatusInfo {
     )]
     pub exit_code: Option<Value>,
     /// `status.progress`: per-file download progress while `downloading`.
+    ///
+    /// **No llama.cpp release puts it here** (EXT-100). `get_router_models` builds `status` from
+    /// `value` and `args`, plus `preset` for a preset entry and `exit_code`/`failed` for a failed
+    /// one (`llama.cpp@b11436 tools/server/server-models.cpp:2095-2111`); the per-file progress the
+    /// router does keep (`server-models.h:83-84`) reaches `GET /models` only through the
+    /// `loaded_info` merge at `:2128-2135`, which is gated on `is_running()` — `loaded`, `loading`
+    /// or `sleeping`, never `downloading` (`server-models.h:94-96`) — and lands at the entry's TOP
+    /// level, not inside `status`. Unchanged at `b9000`, `b10000`, `b10700`, `b11000`, `b11436`.
+    ///
+    /// The field stays because pi declares it (`client.ts:11` @v0.99.2-17) and this crate ports pi; a
+    /// real server reports download progress over SSE instead
+    /// (`crate::tests::llama_cpp_wire::download_progress_event`). What a test feeding
+    /// `status.progress` proves is that the port is faithful to pi, NOT that any server does this.
     #[serde(
         default,
         deserialize_with = "lenient_progress",
@@ -1343,6 +1356,9 @@ impl LlamaClient {
                     entry.filter(|entry| entry.status.value == LlamaModelStatus::Downloading)
                 {
                     saw_downloading.store(true, Ordering::SeqCst);
+                    // `entry.status.progress` is never set by a real router — see
+                    // `LlamaModelStatusInfo::progress`. This branch is pi's (`client.ts:334-338`)
+                    // and is kept for fidelity; the live progress path is the SSE one above.
                     if let Some(files) = &entry.status.progress
                         && let Some(progress) = download_progress_from(
                             files.values().map(|file| (file.done, file.total)),

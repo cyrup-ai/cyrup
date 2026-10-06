@@ -78,9 +78,13 @@ use crate::timings;
 ///    `subagent-prompt-runtime.ts` into the child as its OWN extension): a plain subagent child
 ///    attaches NO subagents extension — `subagent_extension_for_env` returns `None` for it by
 ///    design — so the child-side `structured_output` tool cannot come from that gate. This one is
-///    independent: it builds only when the parent passed both structured-output env vars, i.e.
-///    only for a step that actually declared an `outputSchema`. Every other process attaches
-///    nothing.
+///    independent: it builds for a step that actually declared an `outputSchema`, i.e. when the
+///    parent passed both structured-output env vars — `CYRUP_SUBAGENT_STRUCTURED_OUTPUT_SCHEMA`
+///    naming a schema DOCUMENT on disk, not carrying one inline — and it also builds for a
+///    fan-out-authorized child that passed neither. Both observed by
+///    [`tests::llama_child_probe`], whose `plain` arm loads exactly `[llama.cpp, mcp]`, whose
+///    `fanout` arm adds `subagents` AND `subagent-prompt-runtime`, and whose `structured` arm adds
+///    `subagent-prompt-runtime` alone (EXT-101). Every other process attaches nothing.
 /// 4. **Intercom itself**, now that its channels have been handed out.
 /// 5. **The MCP adapter** (gap-analysis 13a, MCP-001, the `pi-mcp-adapter` port). Attached
 ///    UNCONDITIONALLY — upstream is an installed npm package present in every session of every
@@ -928,6 +932,16 @@ mod tests {
     /// The subagent-child marker `SessionBuilder` reads (`cyrup_ext_subagents::spawn::nested_events::CHILD_ENV`).
     const CHILD_ENV: &str = "CYRUP_SUBAGENT_CHILD";
 
+    /// The fan-out authorization a parent puts in a fan-out child's environment (documented at
+    /// this module's item 2: `CYRUP_SUBAGENT_FANOUT_CHILD=1` gets the restricted, mutation-blocked
+    /// subagent tool REGARDLESS of `is_installed`). EXT-101.
+    const FANOUT_ENV: &str = "CYRUP_SUBAGENT_FANOUT_CHILD";
+
+    /// The two variables a parent sets ONLY for a step that declared an `outputSchema`, and which
+    /// the subagent prompt runtime needs BOTH of before it builds (this module's item 3). EXT-101.
+    const STRUCTURED_SCHEMA_ENV: &str = "CYRUP_SUBAGENT_STRUCTURED_OUTPUT_SCHEMA";
+    const STRUCTURED_CAPTURE_ENV: &str = "CYRUP_SUBAGENT_STRUCTURED_OUTPUT_CAPTURE";
+
     /// A trust prompt that is never consulted (`trust_override` answers first) — it exists so the
     /// interactive arm's `Some(prompt)` shape is the one under test (pi's `hasUI` gate,
     /// project-trust.ts:86-88).
@@ -1522,12 +1536,48 @@ mod tests {
 
     #[test]
     fn a_subagent_child_treats_llama_like_the_other_ambient_natives() {
-        for probe in ["keep", "no-extensions"] {
-            run_env_probe(
-                "session_launch::tests::llama_child_probe",
-                &[(CHILD_ENV, "1"), (PROBE_ENV, probe)],
-                &format!("llama-probe-ok:{probe}"),
-            );
+        // EXT-101: three child environments, not one. A child carrying ORCHESTRATOR METADATA is a
+        // different launch — the fan-out authorization and the structured-output pair each turn on
+        // another extension in `attach_native_extensions`, ahead of and after the llama.cpp line —
+        // so "the marker alone" was one third of what a real child looks like. The probe asserts
+        // that the extra extension really attached, so a renamed or misspelled variable fails this
+        // test instead of quietly making the extra arms copies of the first.
+        //
+        // Held for the whole test: the structured-output pair names real files, and
+        // `STRUCTURED_SCHEMA_ENV` is a PATH to a schema document, not an inline schema — an
+        // inline one leaves the prompt runtime unbuilt, which the companion assertion in the probe
+        // catches.
+        let tmp = tempfile::tempdir().expect("a temp dir");
+        let schema = tmp.path().join("output-schema.json");
+        std::fs::write(&schema, r#"{"type":"object"}"#).expect("the schema document");
+        let schema = schema.to_string_lossy().into_owned();
+        let capture = tmp.path().join("structured-output.json");
+        let capture = capture.to_string_lossy().into_owned();
+        let flavours: [(&str, Vec<(&str, &str)>); 3] = [
+            // The no-orchestrator-metadata case: the child marker alone.
+            ("plain", vec![]),
+            // A fan-out child: authorized for the restricted subagent tool.
+            ("fanout", vec![(FANOUT_ENV, "1")]),
+            // A child running a step that declared an `outputSchema`: both variables, or the
+            // prompt runtime does not build.
+            (
+                "structured",
+                vec![
+                    (STRUCTURED_SCHEMA_ENV, schema.as_str()),
+                    (STRUCTURED_CAPTURE_ENV, capture.as_str()),
+                ],
+            ),
+        ];
+        for (flavour, extra) in &flavours {
+            for probe in ["keep", "no-extensions"] {
+                let mut env = vec![(CHILD_ENV, "1"), (PROBE_ENV, probe)];
+                env.extend(extra.iter().copied());
+                run_env_probe(
+                    "session_launch::tests::llama_child_probe",
+                    &env,
+                    &format!("llama-probe-ok:{flavour}:{probe}"),
+                );
+            }
         }
     }
 
@@ -1546,20 +1596,62 @@ mod tests {
             std::env::var_os(CHILD_ENV).is_some(),
             "the probe must run as a subagent child"
         );
+        // The flavour is read from the environment the parent handed this process, not passed as a
+        // label: a variable the parent misspells is then absent here, and the companion assertion
+        // below fails instead of the arm silently degenerating into the `plain` one.
+        let fanout = std::env::var_os(FANOUT_ENV).is_some();
+        let structured = std::env::var_os(STRUCTURED_SCHEMA_ENV).is_some()
+            && std::env::var_os(STRUCTURED_CAPTURE_ENV).is_some();
+        let flavour = match (fanout, structured) {
+            (true, false) => "fanout",
+            (false, true) => "structured",
+            (false, false) => "plain",
+            (true, true) => panic!("one orchestrator environment per probe run"),
+        };
         let no_extensions = probe == "no-extensions";
         let Loaded { loaded, .. } = session_through_build_factory(false, no_extensions).await;
         let llama = loaded.iter().any(|i| i == LLAMA_ID);
         let mcp = loaded.iter().any(|i| i == MCP_ID);
         assert_eq!(
             llama, !no_extensions,
-            "child, no_extensions={no_extensions}: llama.cpp is attached unless the flag drops it; \
-             got {loaded:?}"
+            "child {flavour}, no_extensions={no_extensions}: llama.cpp is attached unless the flag \
+             drops it; got {loaded:?}"
         );
         assert_eq!(
             llama, mcp,
-            "child: llama.cpp follows the MCP adapter's ambient treatment; got {loaded:?}"
+            "child {flavour}: llama.cpp follows the MCP adapter's ambient treatment; got {loaded:?}"
         );
-        println!("llama-probe-ok:{probe}");
+        // The orchestrator environment DID reach this launch, so neither extra arm is a silent
+        // copy of `plain`: a fan-out child attaches the subagents extension off its authorization
+        // alone, and a child carrying the structured-output pair attaches the prompt runtime —
+        // neither of which a `plain` child has (`plain` loads exactly `[llama.cpp, mcp]`). A
+        // misspelled or renamed variable therefore fails HERE instead of quietly re-running the
+        // `plain` case three times.
+        //
+        // Both companions are install-gated, not ambient, so `--no-extensions` does NOT drop them:
+        // that is the contrast this test is about. llama.cpp goes with the flag, these stay.
+        let companion = match flavour {
+            "fanout" => Some(cyrup_ext_subagents::extension::EXTENSION_ID),
+            "structured" => Some(cyrup_ext_subagents::prompt_runtime::PROMPT_RUNTIME_EXTENSION_ID),
+            _ => None,
+        };
+        if let Some(companion) = companion {
+            assert!(
+                loaded.iter().any(|i| i == companion),
+                "child {flavour}, no_extensions={no_extensions}: `{companion}` proves the \
+                 orchestrator environment reached this launch; got {loaded:?}"
+            );
+        } else {
+            assert!(
+                !loaded
+                    .iter()
+                    .any(|i| i == cyrup_ext_subagents::extension::EXTENSION_ID
+                        || i == cyrup_ext_subagents::prompt_runtime::PROMPT_RUNTIME_EXTENSION_ID),
+                "child plain: neither orchestrator extension may be present, or the two arms \
+                 above prove nothing; got {loaded:?}"
+            );
+        }
+        println!("llama-probe-ok:{flavour}:{probe}");
     }
 
     #[test]

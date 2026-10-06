@@ -6,13 +6,18 @@
 //!
 //! | request                | answer                                                              |
 //! |------------------------|---------------------------------------------------------------------|
-//! | `GET /models`          | `{"object":"list","data":[<models>]}` (also `?reload=1`)            |
-//! | `GET /props`           | the configured props object (default `{"models_autoload":true}`)    |
-//! | `POST /models/load`    | `{"success":true}`, then runs the model's [`on_load`] script        |
-//! | `POST /models/unload`  | `{"success":true}`, then runs the model's [`on_unload`] script      |
-//! | `POST /models`         | `{"success":true}`, then runs the model's [`on_download`] script    |
+//! | `GET /models`          | [`wire::models_envelope`] over the catalog (also `?reload=1`)       |
+//! | `GET /props`           | the configured props (default [`wire::router_props`] with autoload) |
+//! | `POST /models/load`    | [`wire::success`], then runs the model's [`on_load`] script         |
+//! | `POST /models/unload`  | [`wire::success`], then runs the model's [`on_unload`] script       |
+//! | `POST /models`         | [`wire::success`], then runs the model's [`on_download`] script     |
 //! | `GET /models/sse`      | an open `text/event-stream` fed by [`Step`]s and [`broadcast`]      |
-//! | anything else          | `404 {"error":{"message":"not found"}}`                             |
+//! | anything else          | [`wire::file_not_found`], llama.cpp's own unknown-route 404         |
+//!
+//! Every one of those answers, and the SSE framing, comes from [`wire`] — ONE definition of the
+//! llama.cpp router wire, each shape carrying a `file:line` citation into llama.cpp's own server
+//! source at a recorded pin (EXT-100). This file holds no transcription of its own, so it cannot
+//! drift from the real server without that module changing.
 //!
 //! State is whatever the test makes it: the catalog is a list of JSON objects ([`model`] builds
 //! one), and the lifecycle transitions are *scripted*, not simulated. A script is a list of
@@ -31,6 +36,11 @@
 //!
 //! Every connection is `connection: close`; the SSE stream is delimited by the close.
 //!
+//! [`wire`]: super::llama_cpp_wire
+//! [`wire::models_envelope`]: super::llama_cpp_wire::models_envelope
+//! [`wire::router_props`]: super::llama_cpp_wire::router_props
+//! [`wire::success`]: super::llama_cpp_wire::success
+//! [`wire::file_not_found`]: super::llama_cpp_wire::file_not_found
 //! [`on_load`]: FakeLlamaServer::on_load
 //! [`on_unload`]: FakeLlamaServer::on_unload
 //! [`on_download`]: FakeLlamaServer::on_download
@@ -58,6 +68,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Notify, mpsc};
 use tokio::task::JoinHandle;
+
+use super::llama_cpp_wire as wire;
 
 // ------------------------------------------------------------------------------------- builders --
 
@@ -250,7 +262,7 @@ impl Inner {
                     .state()
                     .models
                     .retain(|existing| existing.get("id").and_then(Value::as_str) != Some(&id)),
-                Step::Sse(value) => self.broadcast(format!("data: {value}\n\n").into_bytes()),
+                Step::Sse(value) => self.broadcast(wire::sse_frame(&value).into_bytes()),
                 Step::SseRaw(raw) => self.broadcast(raw.into_bytes()),
                 Step::SseBytes(bytes) => self.broadcast(bytes),
                 Step::WaitForSse(count) => self.wait_for_sse(count).await,
@@ -337,7 +349,7 @@ impl FakeLlamaServer {
         let inner = Arc::new(Inner {
             state: Mutex::new(State {
                 models: Vec::new(),
-                props: json!({ "models_autoload": true }),
+                props: wire::router_props(true),
                 bearer: None,
                 requests: Vec::new(),
                 subscribers: Vec::new(),
@@ -435,10 +447,12 @@ impl FakeLlamaServer {
         self.inner.state().tasks.push(handle);
     }
 
-    /// Send one SSE event to every open stream.
+    /// Send one SSE event to every open stream, framed as llama.cpp frames it
+    /// ([`wire::sse_frame`]).
+    ///
+    /// [`wire::sse_frame`]: super::llama_cpp_wire::sse_frame
     pub fn broadcast(&self, event: Value) {
-        self.inner
-            .broadcast(format!("data: {event}\n\n").into_bytes());
+        self.inner.broadcast(wire::sse_frame(&event).into_bytes());
     }
 
     /// Close every open SSE stream.
@@ -610,8 +624,8 @@ async fn handle_connection(inner: Arc<Inner>, mut socket: TcpStream) {
     if let Some(key) = bearer
         && request.header("authorization") != Some(format!("Bearer {key}").as_str())
     {
-        let body = json!({ "error": { "message": "Invalid API Key" } }).to_string();
-        write_response(&mut socket, 401, &body).await;
+        let (status, body) = wire::invalid_api_key();
+        write_response(&mut socket, status, &body.to_string()).await;
         return;
     }
     let mut reply = reply;
@@ -649,7 +663,7 @@ async fn handle_connection(inner: Arc<Inner>, mut socket: TcpStream) {
 
     match (method.as_str(), path.as_str()) {
         ("GET", "/models") => {
-            let body = json!({ "object": "list", "data": inner.state().models }).to_string();
+            let body = wire::models_envelope(inner.state().models.clone()).to_string();
             write_response(&mut socket, 200, &body).await;
         }
         ("GET", "/props") => {
@@ -657,21 +671,21 @@ async fn handle_connection(inner: Arc<Inner>, mut socket: TcpStream) {
             write_response(&mut socket, 200, &body).await;
         }
         ("POST", "/models/load") => {
-            write_response(&mut socket, 200, r#"{"success":true}"#).await;
+            write_response(&mut socket, 200, &wire::success().to_string()).await;
             inner.spawn_script(Trigger::Load, &model);
         }
         ("POST", "/models/unload") => {
-            write_response(&mut socket, 200, r#"{"success":true}"#).await;
+            write_response(&mut socket, 200, &wire::success().to_string()).await;
             inner.spawn_script(Trigger::Unload, &model);
         }
         ("POST", "/models") => {
-            write_response(&mut socket, 200, r#"{"success":true}"#).await;
+            write_response(&mut socket, 200, &wire::success().to_string()).await;
             inner.spawn_script(Trigger::Download, &model);
         }
         ("GET", "/models/sse") => serve_sse(inner, socket).await,
         _ => {
-            let body = json!({ "error": { "message": "not found" } }).to_string();
-            write_response(&mut socket, 404, &body).await;
+            let (status, body) = wire::file_not_found();
+            write_response(&mut socket, status, &body.to_string()).await;
         }
     }
 }

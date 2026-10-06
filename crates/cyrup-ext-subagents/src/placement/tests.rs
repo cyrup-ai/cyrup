@@ -1084,6 +1084,10 @@ struct FakeState {
     prompts: usize,
     /// What `pane.read` shows once the external agent has answered.
     pane_text: String,
+    /// The `agent_status` `agent.start` gives the started agent, and `agent.get` keeps reporting.
+    /// `None` is herdr's ordinary `"idle"`; `Some("unknown")` is a herdr v0.9.2+ Codex, which
+    /// `9c96f7dd` (#4563) stopped inferring `idle` for (see `managed_startup_ready`).
+    agent_status: Option<&'static str>,
 }
 
 impl FakeMachine {
@@ -1262,8 +1266,9 @@ async fn serve_one(
                 .find(|pane| pane["pane_id"] == pane_id.as_str())
                 .cloned()
                 .unwrap_or_default();
+            let status = state.agent_status.unwrap_or("idle");
             let agent = json!({"terminal_id":format!("t-{pane_id}"),"name":params["name"],
-                "agent":params["kind"],"agent_status":"idle","workspace_id":pane["workspace_id"],
+                "agent":params["kind"],"agent_status":status,"workspace_id":pane["workspace_id"],
                 "tab_id":pane["tab_id"],"pane_id":pane_id,"focused":false,
                 "interactive_ready":true,"launch_pending":false,"revision":1});
             state.agent = Some(agent.clone());
@@ -2338,4 +2343,122 @@ async fn the_codex_monitor_settles_on_stable_ready_output_and_retains_on_drift()
         never_ready,
         Err(ExternalError::NeedsAttention(ref m)) if m.starts_with("Placed Codex settlement remained ambiguous until timeout")
     ));
+}
+
+/// HERDR-007: the managed-startup gate against a herdr that answers the way `9c96f7dd` (#4563)
+/// made it answer — a READY Codex parked at `agent_status: "unknown"`.
+///
+/// The [`AgentInfo`](cyrup_herdr::schema::AgentInfo) under test is not hand-built: the fake herdr
+/// server is seeded to report `"unknown"`, and the value comes back over the real socket protocol
+/// through the production `cyrup_herdr` client and schema, so the `AgentStatus::Unknown` ->
+/// `"unknown"` round trip [`super::external::managed_startup_ready`] depends on is exercised, not
+/// assumed.
+///
+/// Both halves of the `[CYRUP-DELTA]` are asserted: Codex passes on `unknown`, and NOTHING else
+/// does — not another kind at `unknown`, not a Codex that is not `interactive_ready`, not one
+/// still `launch_pending`, and not `working`. The non-Codex assertion is the scoping: herdr's
+/// fallback-to-`unknown` is Codex-only (`agents.mdx:73` @v0.9.3), so a later pass must not widen
+/// this.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_ready_codex_reporting_unknown_passes_managed_startup_and_no_other_kind_does() {
+    use super::external::{ExternalKind, managed_startup_ready};
+    use cyrup_herdr::schema::{AgentStartParams, WorkspaceCreateParams};
+
+    let machine = FakeMachine::start_with(
+        "#!/bin/sh\nexit 99\n",
+        FakeState {
+            agent_status: Some("unknown"),
+            ..FakeState::default()
+        },
+    );
+    let client = cyrup_herdr::HerdrClient::new(machine.dir.path().join("herdr-api.sock"));
+    let (_, _, pane) = client
+        .workspace_create(WorkspaceCreateParams {
+            cwd: Some(machine.workdir.display().to_string()),
+            label: Some("herdr-007".to_string()),
+            ..WorkspaceCreateParams::default()
+        })
+        .await
+        .unwrap();
+    // One `agent.start` per kind: the fake keeps the LAST started agent, and each is read back
+    // with `agent.get` the way `wait_for_startup` reads it.
+    let started = |kind: &'static str| {
+        let (client, pane_id) = (client.clone(), pane.pane_id.clone());
+        async move {
+            client
+                .agent_start(
+                    AgentStartParams {
+                        name: format!("{kind}-herdr-007"),
+                        kind: kind.to_string(),
+                        pane_id,
+                        args: Vec::new(),
+                        timeout_ms: None,
+                    },
+                    std::time::Duration::from_secs(5),
+                )
+                .await
+                .unwrap();
+            client.agent_get(format!("{kind}-herdr-007")).await.unwrap()
+        }
+    };
+
+    let codex = started("codex").await;
+    assert_eq!(
+        codex.agent_status,
+        cyrup_herdr::schema::AgentStatus::Unknown,
+        "the fake answers as herdr v0.9.2+ does for Codex: {codex:?}"
+    );
+    assert!(
+        codex.interactive_ready && !codex.launch_pending,
+        "herdr's own `agent.rs:613-618` @v0.9.3 acceptance inputs: {codex:?}"
+    );
+    assert!(
+        managed_startup_ready(&codex, ExternalKind::Codex),
+        "[CYRUP-DELTA] a ready Codex at `unknown` closes the startup gate instead of burning the \
+         45 s EXTERNAL_STARTUP_TIMEOUT: {codex:?}"
+    );
+
+    // The scoping. herdr falls back to `unknown` only for Codex; every other known agent still
+    // falls back to `idle`, so `unknown` from one of those is NOT evidence it can take a prompt.
+    let cursor = started("cursor").await;
+    assert!(
+        !managed_startup_ready(&cursor, ExternalKind::Cursor),
+        "the relaxation is Codex-only: an `unknown` Cursor must still wait: {cursor:?}"
+    );
+    let claude = started("claude").await;
+    assert!(
+        !managed_startup_ready(&claude, ExternalKind::Claude),
+        "the relaxation is Codex-only: an `unknown` Claude must still wait: {claude:?}"
+    );
+    // ... and a Codex whose kind does not match the profile being started is still refused.
+    assert!(
+        !managed_startup_ready(&claude, ExternalKind::Codex),
+        "the kind conjunct still holds: {claude:?}"
+    );
+
+    // Codex's other startup inputs are untouched: `unknown` alone is never enough.
+    let mut not_interactive = codex.clone();
+    not_interactive.interactive_ready = false;
+    assert!(
+        !managed_startup_ready(&not_interactive, ExternalKind::Codex),
+        "`interactive_ready` is the whole justification (`agent.rs:615` @v0.9.3)"
+    );
+    let mut launching = codex.clone();
+    launching.launch_pending = true;
+    assert!(
+        !managed_startup_ready(&launching, ExternalKind::Codex),
+        "cyrup stays stricter than herdr's `unknown` arm, which does not test `launch_pending`"
+    );
+    let mut working = codex.clone();
+    working.agent_status = cyrup_herdr::schema::AgentStatus::Working;
+    assert!(
+        !managed_startup_ready(&working, ExternalKind::Codex),
+        "a Codex herdr can SEE is mid-turn is not ready for a prompt"
+    );
+    let mut idle = codex;
+    idle.agent_status = cyrup_herdr::schema::AgentStatus::Idle;
+    assert!(
+        managed_startup_ready(&idle, ExternalKind::Codex),
+        "the pre-v0.9.2 path is unchanged"
+    );
 }
