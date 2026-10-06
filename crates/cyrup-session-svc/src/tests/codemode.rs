@@ -263,6 +263,8 @@ struct Rig {
     factory: ScriptedSandboxFactory,
     requests: Requests,
     events: Arc<Mutex<Vec<AgentSessionEvent>>>,
+    /// The events of the last prompt, in order (`events` is emptied when a prompt returns).
+    last_run: Mutex<Vec<AgentSessionEvent>>,
     _fx: Fixture,
 }
 
@@ -312,6 +314,7 @@ async fn rig(script: Script, options: Options) -> Rig {
         factory,
         requests: Arc::new(Mutex::new(Vec::new())),
         events,
+        last_run: Mutex::new(Vec::new()),
         _fx: fx,
     }
 }
@@ -376,7 +379,7 @@ impl Rig {
         {
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
-        self.events.lock().unwrap().clear();
+        *self.last_run.lock().unwrap() = std::mem::take(&mut *self.events.lock().unwrap());
     }
 
     async fn codemode_result(&self) -> Message {
@@ -749,6 +752,69 @@ async fn nested_calls_are_recorded_as_nested_calls_on_the_tool_result() {
                 json!({ "text": "b" }).as_object().unwrap().clone()
             ),
         ]
+    );
+}
+
+/// The LIVE `message_end` of a tool result carries what the persisted row carries (CODE-006): the
+/// calls the tool made and what they spent. A subscriber of the live event, such as the terminal
+/// renderer of a `codemode` result, reads `nestedCalls` from it; only compaction, export and a
+/// resumed session read the row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_live_message_end_of_a_nested_calling_tool_carries_the_record_and_the_usage() {
+    let mut billed = Fixed::new("billed", "Run a model", "ran");
+    billed.usage = Some(usage(100, 0.25));
+    let rig = rig(
+        script(|_code, env| async move {
+            env.tool("echo", json!({ "text": "a" })).await.unwrap();
+            env.tool("billed", json!({})).await.unwrap();
+            completed(Vec::new(), None)
+        }),
+        Options {
+            ext: Some(ToolsExt::new(vec![echo(), billed.arc()])),
+            ..Options::default()
+        },
+    )
+    .await;
+    rig.set_active(&["codemode", "echo", "billed"]).await;
+
+    let persisted = rig.run("go").await;
+    let Message::ToolResult {
+        nested_calls: persisted_calls,
+        usage: persisted_usage,
+        ..
+    } = &persisted
+    else {
+        panic!("not a tool result")
+    };
+    let persisted_calls = persisted_calls.clone().expect("the persisted record");
+    let persisted_usage = persisted_usage.clone().expect("the persisted usage");
+
+    let live: Vec<cyrup_agent::ToolResultMessage> = rig
+        .last_run
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|event| match event {
+            AgentSessionEvent::MessageEnd {
+                message: cyrup_agent::AgentMessage::ToolResult(result),
+            } => Some(result.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(live.len(), 1, "one tool result ended: {live:#?}");
+    let live = &live[0];
+    assert_eq!(live.tool_name, "codemode");
+    assert_eq!(
+        live.nested_calls.as_ref(),
+        Some(&persisted_calls),
+        "the live message carries the persisted record"
+    );
+    assert_eq!(live.nested_calls.as_ref().map(|n| n.calls.len()), Some(2));
+    assert_eq!(live.usage.as_ref(), Some(&persisted_usage));
+    assert_eq!(
+        live.usage.as_ref().map(|u| u.input),
+        Some(100),
+        "the summed usage of the nested calls"
     );
 }
 

@@ -11,7 +11,7 @@
 use std::sync::{Arc, Mutex};
 
 use cyrup_agent::{AgentEvent, AgentMessage, EventSubscriber, NestedToolCallRunner};
-use cyrup_core::{CancelToken, EventStream, NestedToolCalls, combine_usage};
+use cyrup_core::{CancelToken, EventStream, combine_usage};
 use cyrup_ext::ExtensionHost;
 use cyrup_session::manager::SessionManager;
 use tokio::sync::{Mutex as AsyncMutex, mpsc};
@@ -166,19 +166,12 @@ impl SvcSubscriber {
     /// if (summary?.usage) message.usage = message.usage ? combineUsage(message.usage, summary.usage) : summary.usage;
     /// ```
     ///
-    /// Returns the result as the live transcript should show it (usage folded in) and the record
-    /// for the persisted row. `None` for every message that is not the result of a call that made
-    /// nested calls. Taken once: a second `message_end` for the same call finds nothing.
-    ///
-    /// The record lands on the persisted `cyrup_core::Message` only. The agent loop's own
-    /// [`cyrup_agent::ToolResultMessage`] — the type the live `message_end` event carries — has no
-    /// `nestedCalls` field, so a live subscriber sees the folded `usage` but not the record; both
-    /// reach a session file, which is where pi's consumers (compaction, HTML export, a resumed
-    /// session) read it.
-    fn stamp_nested_calls(
-        &self,
-        event: &AgentEvent,
-    ) -> Option<(AgentMessage, Option<NestedToolCalls>)> {
+    /// Returns the result as every consumer of this `message_end` sees it: the live subscribers, the
+    /// extension seam and the persisted row all read the one stamped message, so the record and the
+    /// folded `usage` are the same on all three. `None` for every message that is not the result of
+    /// a call that made nested calls. Taken once: a second `message_end` for the same call finds
+    /// nothing.
+    fn stamp_nested_calls(&self, event: &AgentEvent) -> Option<AgentMessage> {
         let AgentEvent::MessageEnd {
             message: AgentMessage::ToolResult(result),
         } = event
@@ -186,50 +179,17 @@ impl SvcSubscriber {
             return None;
         };
         let summary = self.nested.take_record(&result.tool_call_id)?;
-        let mut folded = result.clone();
+        let mut stamped = result.clone();
+        if let Some(calls) = summary.calls {
+            stamped.nested_calls = Some(calls);
+        }
         if let Some(nested_usage) = &summary.usage {
-            folded.usage = Some(match &folded.usage {
+            stamped.usage = Some(match &stamped.usage {
                 Some(own) => combine_usage(own, nested_usage),
                 None => nested_usage.clone(),
             });
         }
-        Some((AgentMessage::ToolResult(folded), summary.calls))
-    }
-}
-
-/// `core` with the calls its tool made recorded on it, when it is a tool result and there are any
-/// (pi `message.nestedCalls = summary.calls`, `agent-session.ts:1078`). Applied before the message
-/// goes to the extension seam, so a `message_end` handler sees the record it will be persisted with.
-fn with_nested_calls(
-    core: cyrup_core::Message,
-    calls: Option<&NestedToolCalls>,
-) -> cyrup_core::Message {
-    match (core, calls) {
-        (
-            cyrup_core::Message::ToolResult {
-                tool_call_id,
-                tool_name,
-                content,
-                is_error,
-                details,
-                usage,
-                added_tool_names,
-                timestamp,
-                nested_calls: None,
-            },
-            Some(calls),
-        ) => cyrup_core::Message::ToolResult {
-            tool_call_id,
-            tool_name,
-            content,
-            is_error,
-            details,
-            usage,
-            added_tool_names,
-            timestamp,
-            nested_calls: Some(calls.clone()),
-        },
-        (core, _) => core,
+        Some(AgentMessage::ToolResult(stamped))
     }
 }
 
@@ -269,14 +229,12 @@ impl EventSubscriber for SvcSubscriber {
         // head of `_handleAgentEvent`, ahead of every listener).
         let stamped = self.stamp_nested_calls(event);
         if let AgentEvent::MessageEnd { message } = event {
-            let message = stamped.as_ref().map_or(message, |(folded, _)| folded);
-            let nested_calls = stamped.as_ref().and_then(|(_, calls)| calls.as_ref());
+            let message = stamped.as_ref().unwrap_or(message);
             let effective: Option<cyrup_core::Message> = if !self
                 .ext_host
                 .dispatcher()
                 .no_subscribers(cyrup_ext::EventKind::MessageEnd)
-                && let Some(core) =
-                    agent_message_to_core(message).map(|core| with_nested_calls(core, nested_calls))
+                && let Some(core) = agent_message_to_core(message)
             {
                 let cancel = self.session_cancel.child_token();
                 match self.ext_host.emit_message_end(core.clone(), &cancel).await {
@@ -289,15 +247,16 @@ impl EventSubscriber for SvcSubscriber {
                     None => Some(core),
                 }
             } else {
-                agent_message_to_core(message).map(|core| with_nested_calls(core, nested_calls))
+                agent_message_to_core(message)
             };
-            // The stamped usage must reach the live subscribers too (the TUI folds a tool result's
-            // usage into its footer totals from `message_end`) — unless a handler's replacement
+            // The stamped message must reach the live subscribers too — the TUI folds a tool
+            // result's usage into its footer totals and its codemode renderer reads
+            // `result.nestedCalls`, both from `message_end` — unless a handler's replacement
             // already stands in for it.
             if replaced_end.is_none()
-                && let Some((folded, _)) = &stamped
+                && let Some(stamped) = &stamped
             {
-                replaced_end = Some(folded.clone());
+                replaced_end = Some(stamped.clone());
             }
 
             if let Some(core) = effective {

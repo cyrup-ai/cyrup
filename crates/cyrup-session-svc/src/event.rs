@@ -505,9 +505,9 @@ pub(crate) fn agent_message_to_core(m: &AgentMessage) -> Option<cyrup_core::Mess
             usage: t.usage.clone(),
             added_tool_names: t.added_tool_names.clone(),
             timestamp: t.timestamp,
-            // The agent loop's own result message has no record of nested calls: the session
-            // stamps it on at `message_end` (`SvcSubscriber`), where it holds the runner's record.
-            nested_calls: None,
+            // Stamped on at `message_end` (`SvcSubscriber::stamp_nested_calls`), where the session
+            // holds the runner's record; the persisted row carries what the live message carries.
+            nested_calls: t.nested_calls.clone(),
         }),
         AgentMessage::Custom { .. } => None,
         // SESS-043 — an `App` message is a *projection* of an entry that is already on disk (the
@@ -632,10 +632,7 @@ pub(crate) fn core_message_to_agent(m: &cyrup_core::Message) -> AgentMessage {
             usage,
             added_tool_names,
             timestamp,
-            // Not carried: the agent's in-memory result has no such field, and the persisted row —
-            // which this resume direction reads from — keeps it. A transcript re-seeded from disk
-            // loses nothing the model could see, since `nestedCalls` is never sent to the model.
-            nested_calls: _,
+            nested_calls,
         } => AgentMessage::ToolResult(ToolResultMessage {
             tool_call_id: tool_call_id.clone(),
             tool_name: tool_name.clone(),
@@ -646,6 +643,9 @@ pub(crate) fn core_message_to_agent(m: &cyrup_core::Message) -> AgentMessage {
             added_tool_names: added_tool_names.clone(),
             is_error: *is_error,
             timestamp: *timestamp,
+            // The RESUME direction of the persist copy above: a re-seeded transcript keeps the
+            // record, so a live subscriber of a resumed session reads what a fresh one does.
+            nested_calls: nested_calls.clone(),
         }),
     }
 }

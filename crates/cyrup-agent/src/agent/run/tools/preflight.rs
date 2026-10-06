@@ -191,6 +191,9 @@ pub(crate) fn immediate_error(
         // Pi `createToolResultMessage` stamps every tool result with `Date.now()`
         // (agent-loop.ts:741); this reaches the wire payload via `convert_to_llm`.
         timestamp: now_millis(),
+        // The loop never builds `nestedCalls`: the session assigns it at `message_end`
+        // (`agent-session.ts:1078` @v1.0.1).
+        nested_calls: None,
     };
     // pi's blocked-with-terminate arm assigns `result.terminate = true` only when the hook asked
     // for it; every other error result leaves the key absent. `createErrorToolResult` builds

@@ -239,6 +239,9 @@ pub(super) fn fold_tool_outcome(
         // Pi `createToolResultMessage` stamps every tool result with `Date.now()`
         // (agent-loop.ts:741); this reaches the wire payload via `convert_to_llm`.
         timestamp: now_millis(),
+        // The loop never builds `nestedCalls`: the session assigns it at `message_end`
+        // (`agent-session.ts:1078` @v1.0.1).
+        nested_calls: None,
     };
     Finalized::new(
         source_index,
@@ -465,6 +468,7 @@ mod tests {
             added_tool_names: Vec::new(),
             is_error: true,
             timestamp: now_millis(),
+            nested_calls: None,
         };
         let fin = Finalized::new(7, message, TerminateHint::Continue, None, false);
         assert_eq!(fin.source_index(), 7);

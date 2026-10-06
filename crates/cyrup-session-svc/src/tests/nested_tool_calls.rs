@@ -596,7 +596,7 @@ async fn nested_usage_is_summed_onto_the_result_row_and_the_live_message_end() {
     assert_eq!((got.input, got.output), (22, 44));
     assert_eq!(nested_of(&row).unwrap().calls.len(), 2);
 
-    let live: Vec<Option<Usage>> = run
+    let live: Vec<(Option<Usage>, Option<NestedToolCalls>)> = run
         .events
         .lock()
         .unwrap()
@@ -604,15 +604,62 @@ async fn nested_usage_is_summed_onto_the_result_row_and_the_live_message_end() {
         .filter_map(|e| match e {
             AgentSessionEvent::MessageEnd {
                 message: cyrup_agent::AgentMessage::ToolResult(t),
-            } if t.tool_name == "caller" => Some(t.usage.clone()),
+            } if t.tool_name == "caller" => Some((t.usage.clone(), t.nested_calls.clone())),
             _ => None,
         })
         .collect();
     assert_eq!(live.len(), 1);
     assert_eq!(
-        live[0].as_ref().map(|u| (u.input, u.output)),
+        live[0].0.as_ref().map(|u| (u.input, u.output)),
         Some((22, 44))
     );
+    // The record rides the live message too, not only the row: a subscriber of `message_end`
+    // (the terminal renderer of a `codemode` result) reads `result.nestedCalls` from it.
+    assert_eq!(
+        live[0].1,
+        nested_of(&row),
+        "the live message_end carries the persisted row's record"
+    );
+}
+
+/// A resumed session's live transcript carries the record the session file holds, so a subscriber
+/// of a resumed session reads what a fresh one does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_record_survives_resume_into_the_live_transcript() {
+    let fx = fixture();
+    let billing = Leaf::new("billing", ToolExposure::Codemode)
+        .reporting(usage(1, 2))
+        .arc();
+    let run = run_caller(&fx, vec![("billing", json!({}))], vec![billing], None).await;
+    let row = persisted_caller_result(&run).await;
+    let recorded = nested_of(&row).expect("the persisted record");
+    let session_file = run
+        .session
+        .session_file()
+        .await
+        .expect("the session persists to a file");
+
+    let mut resume_cfg = config(&fx);
+    resume_cfg.target = crate::SessionTarget::Resume(session_file);
+    let resumed = SessionBuilder::new(
+        Arc::new(FauxProvider::new()) as Arc<dyn Provider>,
+        resume_cfg,
+    )
+    .build()
+    .await
+    .unwrap();
+    let live: Vec<Option<NestedToolCalls>> = resumed
+        .agent_messages()
+        .await
+        .into_iter()
+        .filter_map(|m| match m {
+            cyrup_agent::AgentMessage::ToolResult(t) if t.tool_name == "caller" => {
+                Some(t.nested_calls)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(live, vec![Some(recorded)]);
 }
 
 /// (b) Exposure decides what a nested call can reach: the callable view, never the declared one. A

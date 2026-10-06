@@ -4634,6 +4634,7 @@ mod tests {
             added_tool_names: Vec::new(),
             is_error: false,
             timestamp: 0,
+            nested_calls: None,
         })
     }
 

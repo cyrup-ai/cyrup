@@ -717,6 +717,7 @@ fn tool_result(name: &str, text: &str, is_error: bool) -> cyrup_agent::ToolResul
         added_tool_names: Vec::new(),
         is_error,
         timestamp: 0,
+        nested_calls: None,
     }
 }
 

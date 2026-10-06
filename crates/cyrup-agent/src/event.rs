@@ -3,7 +3,9 @@
 //! tagged enums add `rename_all_fields = "camelCase"` so payload fields are camelCase for
 //! Pi-interop (R-00-013).
 
-use cyrup_core::{AssistantMessage, Content, SharedStr, SystemMessage, ToolCallId, Usage};
+use cyrup_core::{
+    AssistantMessage, Content, NestedToolCalls, SharedStr, SystemMessage, ToolCallId, Usage,
+};
 use cyrup_provider::StreamEvent;
 use serde_json::Value;
 use std::sync::Arc;
@@ -346,6 +348,14 @@ pub struct ToolResultMessage {
     #[serde(default)]
     pub is_error: bool,
     pub timestamp: i64,
+    /// The calls the tool made to other tools while it ran (Pi `ToolResultMessage.nestedCalls`,
+    /// `ai/src/types.ts:604-605` @v1.0.1): *"Kept for the session record; not sent to the model."*
+    /// Not produced by the agent loop: the session stamps it onto the result at `message_end` from
+    /// its record of nested calls (`agent-session.ts:1075-1082`), so a live `message_end` subscriber
+    /// reads it where a persisted row, compaction and export do. Last, as in pi's objects, where it
+    /// is assigned after the literal's own keys. Absent when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nested_calls: Option<NestedToolCalls>,
 }
 
 /// The ordered event stream (func-02 §4 / §6).
