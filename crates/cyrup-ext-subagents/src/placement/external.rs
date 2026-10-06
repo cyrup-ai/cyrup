@@ -559,13 +559,89 @@ pub struct CodexSnapshot {
     pub pid: u32,
     /// The pane text.
     pub text: String,
-    /// `visible` or `recent_unwrapped`.
+    /// `visible` or `recent_unwrapped`, as [`codex_evidence_source`] chose it. Because this struct
+    /// carries the source and NOT `agent_status`, the source is also the only channel by which
+    /// [`monitor_codex`] learns herdr's own opinion of the agent — see [`codex_evidence_source`].
     pub source: ReadSource,
 }
 
+/// `#codexSnapshotOnce`'s `source` choice (`herdr-external-adapters.ts:151` @v0.75.0,
+/// `status === "idle" || status === "done" ? "recent_unwrapped" : "visible"`): which pane region a
+/// settlement sample is read from.
+///
+/// Both sources are live reads of the bottom of the pane; neither is the scrollback the user
+/// scrolled to. `Visible` is the rendered viewport (`ghostty_visible_text`,
+/// `src/pane/terminal.rs:2799` @v0.9.3). `RecentUnwrapped` reads the same physical rows as logical
+/// ones with display wrapping undone (`ghostty_recent_text_unwrapped_for_terminal`, `:2986`), its
+/// range anchored on the physical bottom for an alternate-screen TUI like Codex
+/// (`ghostty_recent_read_range`, `:3016` — the non-`Primary` arm returns
+/// `(end + 1 - lines, end)`). So the `Visible` fallback is NOT protecting against a stale or
+/// scrolled-away screen: `RecentUnwrapped` cannot show one. What it is protecting against is
+/// `alt_screen_read_spec` (`src/server/headless.rs:2662` @v0.9.3), which on a `Recent`/
+/// `RecentUnwrapped` read of an idle known agent SCROLLS the pane to harvest alternate-screen
+/// history before answering — and that engages only when herdr's own detection state is `Idle`
+/// (`:2704`), so it is unreachable for a Codex at `unknown` and this choice cannot provoke it. The
+/// mechanism is identical at the pinned `v0.9.1` (`terminal.rs:2731`/`:2918`/`:2948`,
+/// `headless.rs:2751`/`:2793`).
+///
+/// **`[CYRUP-DELTA]` — HERDR-009; a FORWARD-PORT, ahead of the pinned herdr, continuing
+/// HERDR-007.** pi requires `idle`/`done` for every kind at
+/// `herdr-external-adapters.ts:151` @v0.75.0 and so did cyrup. herdr `9c96f7dd` (#4563 "avoid
+/// inferring codex idle from terminal output" — in `v0.9.2` and `v0.9.3`, NOT an ancestor of the
+/// pinned `v0.9.1` = `065ef9d6`) stopped inferring Codex idleness from the screen, and
+/// `docs/next/website/src/content/docs/agents.mdx:77` @v0.9.3 calls the result the STEADY state,
+/// not a transient: "Codex may therefore stay `unknown` after a response, and waits for `idle` or
+/// completion may time out." So against herdr v0.9.2+ a Codex that has answered never yields a
+/// `RecentUnwrapped` sample, [`monitor_codex`]'s settle conjunct never holds, and the run ends
+/// "Placed Codex settlement remained ambiguous until timeout" with its pane retained — the same
+/// upstream cause as HERDR-007, one stage further on. pi still carries the gap at
+/// `herdr-external-adapters.ts:151` @v0.75.0 (and the settle conjunct at `:103`), so this is a
+/// deliberate divergence, not a port correction.
+///
+/// **What replaces the `idle`/`done` guarantee.** The conjunct never meant "trust the
+/// scrollback"; it meant "herdr itself says the turn is over", laundered through the one field
+/// [`CodexSnapshot`] carries. Relaxing it to `unknown` does not drop that, because the SAME
+/// `agents.mdx:77` says herdr can still decide Codex POSITIVELY: "a visible spinner or live
+/// activity timer can establish `working`, and a visible approval prompt can establish `blocked`".
+/// What it cannot do is the other direction: "an ordinary title, composer, or missing spinner
+/// cannot establish that a turn ended". So
+/// after this change the conjunct reads "herdr does not report an active or blocked turn" — a
+/// status herdr DOES still emit for Codex — instead of "herdr reports a finished one", which it no
+/// longer does. The affirmative half moves to the screen evidence [`monitor_codex`] already
+/// requires independently, and which herdr's single-shot manifest match never had: the composer
+/// present ([`codex_ready`]), no spinner or interrupt hint ([`codex_working`] false — the same
+/// signals herdr's own `working` rule reads), non-empty assistant output after the echoed task,
+/// at least one meaningful change since submission, and all of it UNCHANGED for
+/// [`CODEX_QUIET`] past the [`CODEX_STARTUP_GRACE`]. A half-drawn or mid-stream screen fails
+/// `quiet`/`stable`; a stale one is not reachable from either source. Dropping the source conjunct
+/// outright would have traded the hang for a wrong answer, so it is KEPT and only its premise
+/// moves.
+///
+/// **Why Codex ONLY.** herdr's fallback to `unknown` is Codex-specific: `agents.mdx:73` @v0.9.3 —
+/// "If no manifest rule matches for a known agent other than Codex, Herdr falls back to `idle` …
+/// Codex falls back to `unknown`" — and herdr guards its own `unknown` acceptance with
+/// `expected_kind == "codex"` (`src/cli/agent.rs:614` @v0.9.3). For any other kind `unknown` is a
+/// genuine "herdr cannot tell", so it keeps reading `Visible` and cannot settle. `kind` is the
+/// caller's profile, not the agent's self-report, and [`AgentStatus::Unrecognised`] (e.g.
+/// `action_required`) never reaches the relaxed arm. `!launch_pending` is kept for the same reason
+/// [`managed_startup_ready`] keeps it: herdr's `unknown` arm does not test it, so this stays
+/// strictly stricter than the herdr decision it mirrors.
+#[must_use]
+pub fn codex_evidence_source(current: &AgentInfo, kind: ExternalKind) -> ReadSource {
+    let status = status_word(&current.agent_status);
+    if status == "idle"
+        || status == "done"
+        || (kind == ExternalKind::Codex && status == "unknown" && !current.launch_pending)
+    {
+        ReadSource::RecentUnwrapped
+    } else {
+        ReadSource::Visible
+    }
+}
+
 /// `monitorHerdrCodex(input)` (`:98-102`): sample until the echoed task is followed by stable,
-/// quiet, ready, non-working assistant output read from `recent_unwrapped`, past the startup
-/// grace — then `stop` and return it. Attention, identity drift or timeout retain the pane.
+/// quiet, ready, non-working assistant output whose sample herdr did not contradict, past the
+/// startup grace — then `stop` and return it. Attention, identity drift or timeout retain the pane.
 ///
 /// # Errors
 /// [`ExternalError::NeedsAttention`] with upstream's sentences.
@@ -632,6 +708,12 @@ where
         }
         let output = codex_assistant_output(&text, task);
         let quiet = now.duration_since(last_change) >= CODEX_QUIET;
+        // `[CYRUP-DELTA]` — HERDR-009. This conjunct is KEPT, but after [`codex_evidence_source`]
+        // it no longer means "herdr reports `idle`/`done`" (herdr stopped emitting that for Codex
+        // in `9c96f7dd`/#4563): it means "herdr does not report an active or blocked turn". It is
+        // the only channel by which this function sees herdr's own opinion, so removing it would
+        // let a Codex herdr CAN see mid-turn settle on a viewport read. See
+        // [`codex_evidence_source`] for the replacement guarantee.
         if sample.source == ReadSource::RecentUnwrapped
             && now.duration_since(started) >= CODEX_STARTUP_GRACE
             && meaningful
@@ -1268,8 +1350,14 @@ impl ExternalPlacedRun {
         )))
     }
 
-    /// `#codexSnapshotOnce(pid)` (`:131`).
-    async fn codex_snapshot(&self, pid: u32) -> Result<CodexSnapshot, ExternalError> {
+    /// `#codexSnapshotOnce(pid)` (`:131`). `kind` is the caller's launch profile, threaded in
+    /// rather than re-derived, so [`codex_evidence_source`]'s Codex-only relaxation is scoped by
+    /// the call site and not by this method happening to be reached only from the Codex branch.
+    async fn codex_snapshot(
+        &self,
+        pid: u32,
+        kind: ExternalKind,
+    ) -> Result<CodexSnapshot, ExternalError> {
         let current = self.agent_get().await?;
         let owned = self.owned()?.clone();
         let terminal = self.terminal_id.clone().unwrap_or_default();
@@ -1278,12 +1366,7 @@ impl ExternalPlacedRun {
                 "Codex owner identity changed.".to_string(),
             ));
         }
-        let status = status_word(&current.agent_status);
-        let source = if status == "idle" || status == "done" {
-            ReadSource::RecentUnwrapped
-        } else {
-            ReadSource::Visible
-        };
+        let source = codex_evidence_source(&current, kind);
         let pid = self.exact_process(Some(pid)).await?;
         let text = self.read_pane(source, Some(400)).await.map_err(|_| {
             ExternalError::Failed("Codex pane read identity or source changed.".to_string())
@@ -1303,14 +1386,15 @@ impl ExternalPlacedRun {
     async fn codex_snapshot_after_reconnect(
         &self,
         pid: u32,
+        kind: ExternalKind,
     ) -> Result<CodexSnapshot, ExternalError> {
-        match self.codex_snapshot(pid).await {
+        match self.codex_snapshot(pid, kind).await {
             Err(ExternalError::Transport(error)) => {
                 if !self.connection_lost().await {
                     return Err(ExternalError::Transport(error));
                 }
                 self.reconnect().await?;
-                self.codex_snapshot(pid).await
+                self.codex_snapshot(pid, kind).await
             }
             other => other,
         }
@@ -1417,7 +1501,7 @@ impl ExternalPlacedRun {
                 terminal.as_str(),
                 native_pid,
             ),
-            || this.codex_snapshot_after_reconnect(native_pid),
+            || this.codex_snapshot_after_reconnect(native_pid, kind),
             || async {
                 let _ = this.close_pane().await;
             },

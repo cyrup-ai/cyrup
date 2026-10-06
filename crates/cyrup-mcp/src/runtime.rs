@@ -8390,7 +8390,6 @@ done
             .token
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-        let before = fixture.requests().len();
 
         let second = builder()
             .with_provider_token(Arc::clone(&source) as Arc<dyn ProviderTokenSource>)
@@ -8398,10 +8397,44 @@ done
             .await
             .expect("a revoked token is needs-auth");
         assert_eq!(second.status, ConnectionStatus::NeedsAuth);
+
+        // MCP-615: this claim is about the IDENTITY of what reached the server, not about a total.
+        //
+        // The obvious form — sample `fixture.requests().len()` before the second connect and assert
+        // it has not moved — races, because the first connection's server-initiated SSE GET is
+        // issued from a task of rmcp's own (`StreamableHttpClientWorker`), and
+        // `get_stream_with_max_sse_event_size` (`runtime.rs:2391`) reads the token and then hands
+        // the request to the inner client. A GET that captured the live token *before* the
+        // revocation above can therefore still be between `authorization` and the socket when the
+        // sample is taken, and land during the second connect. The total moves, nothing was sent
+        // with a dead credential, and the assertion reported the opposite — observed under
+        // whole-workspace load as `left: 4, right: 3`.
+        //
+        // A dead credential is *identifiable* on the wire: `apply_provider_token`
+        // (`runtime.rs:2321`) is a no-op on `None`, and a plain provider connect starts with no
+        // `Authorization` at all, so a request made without a token arrives bare. Requiring every
+        // recorded request to carry the live bearer therefore catches exactly the violation the
+        // count stood in for — and is immune to whatever the first connection still has in flight,
+        // because everything the first connection sends carries that same live token. The shape is
+        // `a_provider_auth_server_sends_the_providers_token`'s, one row up.
+        for recorded in &fixture.requests() {
+            assert_eq!(
+                recorded.all("authorization"),
+                vec!["Bearer provider-token"],
+                "nothing was put on the wire with a dead credential: {} {}",
+                recorded.method,
+                recorded.body
+            );
+        }
+        // And the second connect specifically reached the wire not at all: the first connection
+        // handshakes exactly once and never re-initializes, so a second `initialize` could only be
+        // the revoked one. A fixed one, unlike a running total, cannot be moved by an in-flight
+        // request from the first connection.
         assert_eq!(
-            fixture.requests().len(),
-            before,
-            "and nothing was put on the wire with a dead credential"
+            fixture.initializes(),
+            1,
+            "only the FIRST connection ever handshaked: {:?}",
+            fixture.requests()
         );
     }
 

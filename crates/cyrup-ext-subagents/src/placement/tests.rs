@@ -2462,3 +2462,207 @@ async fn a_ready_codex_reporting_unknown_passes_managed_startup_and_no_other_kin
         "the pre-v0.9.2 path is unchanged"
     );
 }
+
+/// HERDR-009: the SETTLEMENT read source against a herdr that answers the way `9c96f7dd` (#4563)
+/// made it answer — a Codex that has finished its turn parked at `agent_status: "unknown"`.
+///
+/// This is HERDR-007's downstream half. That row relaxed the startup gate, so the prompt now gets
+/// delivered; this one is why the run could then stall at settlement instead:
+/// `codex_evidence_source` handed back [`Visible`](cyrup_herdr::schema::ReadSource::Visible) for
+/// anything that was not `idle`/`done`, and [`super::external::monitor_codex`]'s settle conjunct
+/// requires [`RecentUnwrapped`](cyrup_herdr::schema::ReadSource::RecentUnwrapped), so a Codex at
+/// `unknown` could never settle and the run ended "Placed Codex settlement remained ambiguous
+/// until timeout".
+///
+/// As in HERDR-007, the [`AgentInfo`](cyrup_herdr::schema::AgentInfo) under test is not hand-built:
+/// the fake herdr server is seeded to report `"unknown"` and the value comes back over the real
+/// socket protocol through the production `cyrup_herdr` client and schema, so the
+/// `AgentStatus::Unknown` -> `"unknown"` round trip the predicate depends on is exercised.
+///
+/// Both halves of the `[CYRUP-DELTA]` are asserted: a Codex at `unknown` becomes settleable
+/// evidence, and NOTHING else does — not another kind at `unknown` (herdr's fallback to `unknown`
+/// is Codex-only, `agents.mdx:73` @v0.9.3), not a Codex herdr can SEE is `working`, and not one
+/// still `launch_pending`. The non-Codex assertion is the scoping a later pass must not widen.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_codex_reporting_unknown_reads_settleable_evidence_and_no_other_kind_does() {
+    use super::external::{ExternalKind, codex_evidence_source};
+    use cyrup_herdr::schema::{AgentStartParams, ReadSource, WorkspaceCreateParams};
+
+    let machine = FakeMachine::start_with(
+        "#!/bin/sh\nexit 99\n",
+        FakeState {
+            agent_status: Some("unknown"),
+            ..FakeState::default()
+        },
+    );
+    let client = cyrup_herdr::HerdrClient::new(machine.dir.path().join("herdr-api.sock"));
+    let (_, _, pane) = client
+        .workspace_create(WorkspaceCreateParams {
+            cwd: Some(machine.workdir.display().to_string()),
+            label: Some("herdr-009".to_string()),
+            ..WorkspaceCreateParams::default()
+        })
+        .await
+        .unwrap();
+    let started = |kind: &'static str| {
+        let (client, pane_id) = (client.clone(), pane.pane_id.clone());
+        async move {
+            client
+                .agent_start(
+                    AgentStartParams {
+                        name: format!("{kind}-herdr-009"),
+                        kind: kind.to_string(),
+                        pane_id,
+                        args: Vec::new(),
+                        timeout_ms: None,
+                    },
+                    std::time::Duration::from_secs(5),
+                )
+                .await
+                .unwrap();
+            client.agent_get(format!("{kind}-herdr-009")).await.unwrap()
+        }
+    };
+
+    let codex = started("codex").await;
+    assert_eq!(
+        codex.agent_status,
+        cyrup_herdr::schema::AgentStatus::Unknown,
+        "the fake answers as herdr v0.9.2+ does for Codex: {codex:?}"
+    );
+    assert_eq!(
+        codex_evidence_source(&codex, ExternalKind::Codex),
+        ReadSource::RecentUnwrapped,
+        "[CYRUP-DELTA] a Codex at `unknown` reads settleable evidence instead of parking the run \
+         on `visible` until the settlement timeout: {codex:?}"
+    );
+
+    // The scoping. herdr falls back to `unknown` only for Codex; for every other known agent
+    // `unknown` is a genuine "herdr cannot tell", so it keeps reading the viewport.
+    for (kind, agent) in [
+        (ExternalKind::Cursor, started("cursor").await),
+        (ExternalKind::Claude, started("claude").await),
+    ] {
+        assert_eq!(
+            codex_evidence_source(&agent, kind),
+            ReadSource::Visible,
+            "the relaxation is Codex-only ({kind:?}): {agent:?}"
+        );
+    }
+
+    // Codex's other statuses are untouched: `unknown` is admitted, not every non-`idle` word.
+    let mut working = codex.clone();
+    working.agent_status = cyrup_herdr::schema::AgentStatus::Working;
+    assert_eq!(
+        codex_evidence_source(&working, ExternalKind::Codex),
+        ReadSource::Visible,
+        "herdr can still establish Codex `working` from a spinner (`agents.mdx:77` @v0.9.3), and \
+         that still blocks settlement"
+    );
+    let mut unrecognised = codex.clone();
+    unrecognised.agent_status =
+        cyrup_herdr::schema::AgentStatus::Unrecognised("action_required".to_string());
+    assert_eq!(
+        codex_evidence_source(&unrecognised, ExternalKind::Codex),
+        ReadSource::Visible,
+        "only the literal `unknown` is relaxed, not every status this build cannot name"
+    );
+    let mut launching = codex.clone();
+    launching.launch_pending = true;
+    assert_eq!(
+        codex_evidence_source(&launching, ExternalKind::Codex),
+        ReadSource::Visible,
+        "cyrup stays stricter than herdr's `unknown` arm, which does not test `launch_pending`"
+    );
+    let mut idle = codex;
+    idle.agent_status = cyrup_herdr::schema::AgentStatus::Idle;
+    assert_eq!(
+        codex_evidence_source(&idle, ExternalKind::Codex),
+        ReadSource::RecentUnwrapped,
+        "the pre-v0.9.2 path is unchanged"
+    );
+}
+
+/// HERDR-009's two halves composed: `codex_evidence_source`'s verdict drives
+/// [`super::external::monitor_codex`]'s settle conjunct, so the SAME settled screen settles for a
+/// Codex at `unknown` and does NOT settle for any other kind at `unknown`.
+///
+/// The source is never written down here — it is computed by `codex_evidence_source` from an
+/// `AgentInfo` and handed to the monitor exactly as `codex_snapshot` hands it over, so widening
+/// the predicate past Codex would make the second half fail. The `AgentInfo` is deserialized from
+/// the same `agent.get` wire shape the fake serves rather than struct-built, and the sibling
+/// `a_codex_reporting_unknown_reads_settleable_evidence_and_no_other_kind_does` proves that shape
+/// really is what a herdr v0.9.2+ socket answers with.
+///
+/// `start_paused` is the clock seam: [`super::external::monitor_codex`] measures with
+/// `tokio::time`, so the 15 s [`super::external::CODEX_STARTUP_GRACE`], the 8 s
+/// [`super::external::CODEX_QUIET`] and the non-Codex run to its full timeout all auto-advance and
+/// cost no wall time.
+#[tokio::test(start_paused = true)]
+async fn the_same_settled_screen_settles_a_codex_at_unknown_and_never_another_kind_at_unknown() {
+    use super::external::{ExternalError, ExternalKind, codex_evidence_source, monitor_codex};
+    use cyrup_herdr::schema::AgentInfo;
+
+    // herdr's `agent.get` answer for a v0.9.2+ Codex that has finished its turn: READY, not
+    // launching, and `unknown` because `9c96f7dd` (#4563) stopped inferring `idle` from the screen.
+    let at_unknown = |kind: &str| -> AgentInfo {
+        serde_json::from_value(json!({
+            "terminal_id":"t1","name":format!("{kind}-herdr-009"),"agent":kind,
+            "agent_status":"unknown","workspace_id":"w1","tab_id":"w1:t1","pane_id":"w1:p1",
+            "focused":false,"interactive_ready":true,"launch_pending":false,"revision":1
+        }))
+        .unwrap()
+    };
+    let done = "› Fix it\n\nFixed parser.rs.\n\n› Ask Codex anything";
+    // One settlement run whose sample source is whatever `codex_evidence_source` decides for this
+    // kind — the production wiring, not a literal.
+    let settle = |kind: ExternalKind, agent: AgentInfo| {
+        let source = codex_evidence_source(&agent, kind);
+        async move {
+            monitor_codex(
+                "Fix it",
+                "› Ask Codex anything",
+                ("w1", "w1:p1", "t1", 7),
+                || async {
+                    Ok(super::external::CodexSnapshot {
+                        workspace_id: "w1".to_string(),
+                        pane_id: "w1:p1".to_string(),
+                        terminal_id: "t1".to_string(),
+                        pid: 7,
+                        text: done.to_string(),
+                        source,
+                    })
+                },
+                || async {},
+                std::time::Duration::from_secs(120),
+            )
+            .await
+        }
+    };
+
+    assert_eq!(
+        settle(ExternalKind::Codex, at_unknown("codex"))
+            .await
+            .ok()
+            .as_deref(),
+        Some("Fixed parser.rs."),
+        "[CYRUP-DELTA] a Codex at `unknown` settles on quiet, stable, ready, non-working output \
+         instead of burning the settlement timeout"
+    );
+
+    // The scoping, end to end: the identical screen must NOT settle for a kind herdr does not fall
+    // back to `unknown` for. `unknown` there is a real "cannot tell", so the run stays ambiguous.
+    for (kind, label) in [
+        (ExternalKind::Cursor, "cursor"),
+        (ExternalKind::Claude, "claude"),
+    ] {
+        assert!(
+            matches!(
+                settle(kind, at_unknown(label)).await,
+                Err(ExternalError::NeedsAttention(ref m))
+                    if m == "Placed Codex settlement remained ambiguous until timeout; truthful pane retained for inspection."
+            ),
+            "the relaxation is Codex-only: {label} at `unknown` must still not settle early"
+        );
+    }
+}
