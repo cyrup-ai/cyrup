@@ -1972,7 +1972,13 @@ impl SessionBuilder {
             docs: DocsPointers::default(),
             today: today(),
         };
-        let system_prompt = SystemPromptBuilder::new().build(&prompt_inputs);
+        // The prompt as the sections the transcript stores (CODE-014): the session writes them to its
+        // file and diffs them at the start of every run, and the model is sent their replay. The
+        // text is those same sections rendered, for the accessors and guests that read a string.
+        let built_prompt = crate::tools::BuiltPrompt::new(
+            SystemPromptBuilder::new().build_sections(&prompt_inputs),
+        );
+        let system_prompt = built_prompt.text().to_owned();
 
         let contributions: std::collections::BTreeMap<String, ToolPromptContribution> =
             registry_tools
@@ -2118,7 +2124,10 @@ impl SessionBuilder {
         // the ordering is forced: the swap wraps the provider that constructor already took.
         host_services.attach_provider_swap(Arc::clone(&provider_swap));
         let mut agent_builder = cyrup_agent::AgentBuilder::new(agent_stream_fn)
-            .system_prompt(system_prompt.clone())
+            // pi builds its `Agent` with `systemPrompt: ""` (`core/sdk.ts:389` @v1.0.0): the prompt is
+            // not a field of the agent but the `sections` of the system rows in its transcript, which
+            // the session writes at the start of each run. Sending a prompt of its own as well is how
+            // a session file pi wrote came to carry its prompt twice.
             .thinking_level(thinking)
             .loadout(initial_loadout)
             .messages(seed)
@@ -2445,6 +2454,7 @@ impl SessionBuilder {
             guest_providers,
             model: resolved_model,
             system_prompt,
+            system_prompt_sections: built_prompt.sections().clone(),
             host_services,
             extension_flag_values: cfg.extension_flag_values.clone(),
             fs: services_fs,

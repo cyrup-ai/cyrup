@@ -10,8 +10,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use cyrup_core::{Tool, ToolExposure, ToolLoadout, ToolNamespace};
-use cyrup_session::prompt::{PromptInputs, SystemPromptBuilder, ToolPromptContribution};
+use cyrup_core::{Sections, Tool, ToolExposure, ToolLoadout, ToolNamespace};
+use cyrup_session::prompt::{
+    PromptInputs, SystemPromptBuilder, ToolPromptContribution, render_sections,
+};
 
 /// A serializable tool descriptor for `getAllTools`/`getToolDefinition` (Pi `ToolInfo`,
 /// agent-session.ts:790-799). Carries the model-visible name/description/parameter schema plus the
@@ -45,6 +47,47 @@ pub struct ToolInfo {
     /// wire.
     #[serde(skip)]
     pub render_kind: cyrup_core::ToolRenderKind,
+}
+
+/// A built system prompt: the named sections the transcript stores, and the text they render to.
+///
+/// The two are one value, never built apart. The sections are what a session writes to its file and
+/// diffs against the transcript (CODE-014, pi `diffSystemPromptSections`); the text is what
+/// `ctx.getSystemPrompt()`, `/export` and a `before_agent_start` handler read, and it is — by
+/// construction — the text a provider is sent for those sections. It derefs to that text.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct BuiltPrompt {
+    sections: Sections,
+    text: String,
+}
+
+impl BuiltPrompt {
+    pub(crate) fn new(sections: Sections) -> Self {
+        let text = render_sections(&sections);
+        Self { sections, text }
+    }
+
+    pub(crate) fn sections(&self) -> &Sections {
+        &self.sections
+    }
+
+    pub(crate) fn text(&self) -> &str {
+        &self.text
+    }
+}
+
+impl std::fmt::Display for BuiltPrompt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text)
+    }
+}
+
+impl std::ops::Deref for BuiltPrompt {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        &self.text
+    }
 }
 
 /// Captures the stable system-prompt inputs so the base prompt can be rebuilt when the active tool
@@ -153,7 +196,7 @@ impl PromptRebuilder {
 
     /// Rebuild the base system prompt for `active` tools, pulling each tool's contribution from the
     /// precomputed map (Pi `_rebuildSystemPrompt`, agent-session.ts:2304-2396).
-    fn rebuild(&self, active: &[String], hidden: &BTreeSet<String>) -> String {
+    fn rebuild(&self, active: &[String], hidden: &BTreeSet<String>) -> BuiltPrompt {
         let mut inputs = self.base.clone();
         inputs.selected_tools = Some(active.iter().map(|n| Arc::from(n.as_str())).collect());
         inputs.tool_contributions = active
@@ -169,7 +212,7 @@ impl PromptRebuilder {
                 c
             })
             .collect();
-        SystemPromptBuilder::new().build(&inputs)
+        BuiltPrompt::new(SystemPromptBuilder::new().build_sections(&inputs))
     }
 }
 
@@ -215,7 +258,7 @@ impl DynamicToolState {
     /// The caller has already dropped the names the session may not expose (pi `_isAllowedTool`,
     /// see [`is_allowed_tool`]). This is `_setActiveTools`, not `setActiveToolsByName`: replacing
     /// the loadout with the restored one must not drop the pending names it just recorded.
-    pub(crate) fn restore_declared(&mut self, declared: &[String]) -> (ToolLoadout, String) {
+    pub(crate) fn restore_declared(&mut self, declared: &[String]) -> (ToolLoadout, BuiltPrompt) {
         self.pending = declared.iter().cloned().collect();
         self.activate(declared)
     }
@@ -235,7 +278,7 @@ impl DynamicToolState {
 
     /// Pi `_setActiveTools` (`agent-session.ts:1495-1499` @v1.0.1): resolve `names`, retire the
     /// pending names that are now active, and rebuild the prompt.
-    fn activate(&mut self, names: &[String]) -> (ToolLoadout, String) {
+    fn activate(&mut self, names: &[String]) -> (ToolLoadout, BuiltPrompt) {
         let registry: Vec<Arc<dyn Tool>> = self.registry.values().cloned().collect();
         self.loadout = ToolLoadout::resolve(names, &registry);
         for tool in self.loadout.executable() {
@@ -245,7 +288,7 @@ impl DynamicToolState {
     }
 
     /// The rebuilt system prompt for the current loadout.
-    pub(crate) fn prompt(&self) -> String {
+    pub(crate) fn prompt(&self) -> BuiltPrompt {
         self.rebuilder
             .rebuild(&self.active_names(), self.loadout.hidden_declarations())
     }
@@ -331,7 +374,7 @@ impl DynamicToolState {
     /// A loadout that deactivates a tool replaces the restored one, so its pending names are
     /// dropped; one that only adds tools, like activating `tool_search`, keeps them (pi
     /// `setActiveToolsByName`, `agent-session.ts:1487-1493` @v1.0.1).
-    pub(crate) fn set_active(&mut self, names: &[String]) -> (ToolLoadout, String) {
+    pub(crate) fn set_active(&mut self, names: &[String]) -> (ToolLoadout, BuiltPrompt) {
         let previous = self.active_names();
         let pushed = self.activate(names);
         let active: BTreeSet<String> = self.active_names().into_iter().collect();
@@ -393,7 +436,7 @@ impl DynamicToolState {
     pub(crate) fn merge_registered(
         &mut self,
         tools: Vec<Arc<dyn Tool>>,
-    ) -> Option<(ToolLoadout, String)> {
+    ) -> Option<(ToolLoadout, BuiltPrompt)> {
         // Pi `previousActivatedOnRegistration` (`agent-session.ts:3446-3449` @v1.0.1): a tool whose
         // exposure changes to `direct` or `model-only` (from `hidden`, say) is activated like a new
         // one, so the comparison is on "activated by registration", not on "was registered".

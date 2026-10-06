@@ -2,3 +2,4 @@
 //! into ONE binary instead of one process per file. Assertions are unchanged.
 
 mod deferred_interop;
+mod prompt_sections_differential;

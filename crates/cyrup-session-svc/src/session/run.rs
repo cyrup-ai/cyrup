@@ -1017,12 +1017,29 @@ impl AgentSession {
             })
     }
 
-    /// Run the `before_agent_start` extension hook and assemble the run's input messages (R-06-014;
-    /// Pi agent-session.ts:1105-1131). The hook chain may (a) **replace** the system prompt — applied
-    /// to the agent before the run, and reset to the assembled base when no handler replaced it — and
-    /// (b) **inject** additional messages, which are appended after the user message. Without this the
-    /// assembled prompt was never offered to extensions (the gap the facade closes).
+    /// The messages a run starts with: [`Self::assemble_run_inputs`]'s, led by the system message
+    /// that brings the transcript's prompt up to date when it is not (pi `messages.unshift(
+    /// updateMessage)`, `agent-session.ts:2058-2060` @v1.0.0).
+    ///
+    /// The comparison is against the transcript as the run starts, after the handlers ran: a
+    /// handler's `setActiveTools` has been applied by then, so the prompt describes the tools the
+    /// run has.
     async fn assemble_run_messages(&self, input: UserInput) -> Vec<AgentMessage> {
+        let mut messages = self.assemble_run_inputs(input).await;
+        let transcript = self.agent.snapshot().await.messages;
+        if let Some(update) = self.prompt_update(&transcript) {
+            messages.insert(0, AgentMessage::System(update));
+        }
+        messages
+    }
+
+    /// Run the `before_agent_start` extension hook and assemble the run's input messages (R-06-014;
+    /// Pi agent-session.ts:1105-1131). The hook chain may (a) **replace** the system prompt — kept in
+    /// its own slot and projected onto the request for this run (pi `forceSystemPrompt`), and reset
+    /// when no handler replaced it — and (b) **inject** additional messages, which are appended after
+    /// the user message. Without this the assembled prompt was never offered to extensions (the gap
+    /// the facade closes).
+    async fn assemble_run_inputs(&self, input: UserInput) -> Vec<AgentMessage> {
         let user_text = input.text.clone();
         let images = input.images.clone();
         let user_msg = input.into_agent_message();
@@ -1073,29 +1090,32 @@ impl AgentSession {
         // have RESTRICTED the active tool set via `HostServices::set_active_tools` (the permission
         // companion's `shouldExposeTool` shaping), which stages the requested NAMES. Drain + apply
         // it IN-TURN here — before `spawn_run` — so the restriction shapes THIS turn (turn 1), not the
-        // next turn boundary where `apply_pending_agent_control` would otherwise pick it up. Apply ONLY
-        // the restricted tool ARRAY; the `DynamicToolState`-rebuilt prompt is DISCARDED so it cannot
-        // clobber the handler's own sanitized system prompt applied just below (pi's `setActiveTools`
-        // and its returned `systemPrompt` are independent). Draining it here also leaves
-        // `pending_active_tools` empty for the later `apply_pending_agent_control` drains, so the
-        // restriction is applied exactly once.
+        // next turn boundary where `apply_pending_agent_control` would otherwise pick it up. The
+        // prompt rebuilt for the restricted set becomes the base (pi `setActiveTools` →
+        // `_rebuildSystemPrompt`), so the tools the handler hid are not listed in the prompt the model
+        // is sent. Draining it here also leaves `pending_active_tools` empty for the later
+        // `apply_pending_agent_control` drains, so the restriction is applied exactly once.
         if let Some(names) = self.services.host_services.take_pending_active_tools() {
-            let (loadout, _rebuilt_prompt) = { Self::lock(&self.dynamic_tools).set_active(&names) };
-            self.apply_loadout(loadout).await;
+            let (loadout, prompt) = { Self::lock(&self.dynamic_tools).set_active(&names) };
+            self.push_active_tools(loadout, prompt).await;
         }
         if let Some(cyrup_ext::BeforeAgentStartReduction {
             system_prompt,
             injected,
         }) = reduced
         {
-            // Apply the (possibly handler-replaced / sanitized) system prompt; reset to base
-            // otherwise. Pi's two branches are `if (result?.systemPrompt !== undefined) {
-            // this._systemPromptOverride = result.systemPrompt; this.agent.state.systemPrompt =
-            // result.systemPrompt; } else { this._systemPromptOverride = undefined;
-            // this.agent.state.systemPrompt = this._baseSystemPrompt; }` (agent-session.ts:1246-1252
-            // @v0.83.0) — the OVERRIDE SLOT is written on both, which is what makes the turn-boundary
-            // refresh able to re-push `override ?? base` without clobbering this sanitization
-            // (DRIFT-033).
+            // Record the (possibly handler-replaced / sanitized) system prompt in the override slot,
+            // or clear it. Pi's two branches are `if (result?.systemPrompt !== undefined) {
+            // this._systemPromptOverride = result.systemPrompt; … } else {
+            // this._systemPromptOverride = undefined; … }` (agent-session.ts:1246-1252 @v0.83.0) —
+            // the slot is written on both, so a replacement never outlives its run and a rebuild
+            // cannot undo one (DRIFT-033).
+            //
+            // The slot is a FORCED prompt (pi `forceSystemPrompt`, `core/system-prompt.ts` @v1.0.0).
+            // It is not written to the transcript, which keeps the structured sections whatever a
+            // handler returned; it is projected onto each request instead, replacing the transcript's
+            // system messages with one holding this text (`PolicyHooks::transform_context`, pi
+            // `_installAgentForcedPromptProjection`, `agent-session.ts:1715-1731`).
             //
             // CYRUP-DELTA on the discriminator only: pi distinguishes "handler returned no prompt"
             // (`undefined`) from "handler returned one"; cyrup's `HostEvent::BeforeAgentStart`
@@ -1104,22 +1124,12 @@ impl AgentSession {
             // prompt only when it differs from `base`, so an unchanged one is read as "no override",
             // which agrees with pi on the resulting prompt for every input and differs only in
             // which slot holds the identical text.
-            match system_prompt {
-                Some(system_prompt) => {
-                    *Self::lock(&self.system_prompt_override) = Some(system_prompt.clone());
-                    self.agent.set_system_prompt(system_prompt).await;
-                }
-                None => {
-                    *Self::lock(&self.system_prompt_override) = None;
-                    self.agent.set_system_prompt(base.clone()).await;
-                }
-            }
+            *Self::lock(&self.system_prompt_override) = system_prompt;
             messages.extend(injected.iter().map(core_message_to_agent));
         } else {
             // Nothing changed, or the chain was blocked/handled (no Pi analogue here): keep the
             // base prompt, no injection.
             *Self::lock(&self.system_prompt_override) = None;
-            self.agent.set_system_prompt(base.clone()).await;
         }
         messages
     }

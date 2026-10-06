@@ -5,6 +5,22 @@ next work item**.
 
 ---
 
+# UPDATE 2026-10-06 (`CODE-014`) — the system prompt is written as `sections` diff rows; `CODE-014` and `SESS-054` close
+
+> Upstream read at pi `v1.0.0` (area 18's pin) through git objects only. The count is whatever
+> `python3 docs/gap-analysis/scripts/count_open_items.py` prints: **before 136 open (1 medium, 135 low;
+> 17 trackers; 921 closed); after 134 open (0 medium, 134 low; 17 trackers; 923 closed)**, both measured
+> on `main` at `5fe93d973` (after #193's `HERDR-009` and `MCP-615` closures). Area 18:
+> 4 → **3** open (`CODE-015`, `-016`, `-017`), 13 → 14 closed. Area 03: `SESS-054` closed. No row filed.
+> `AGENT-039`, `SESS-051` and `EXT-084` carry dated CORRECTED notes and stay open. The closure record,
+> with the corrected `context.rs` cite, the two key orders and the not-ported list, is at the top of
+> `18-pi-codemode.md` ("Closure record, 2026-10-06 — `CODE-014`…").
+>
+> **Model-visible change:** the default prompt is now pi's tagged sections (`<tools>`, `<rules>`, …,
+> `<cwd>`), and a session no longer sends a prompt beside the one in its transcript.
+
+---
+
 # UPDATE 2026-10-06 (codemode) — area 18 closes thirteen rows and opens four; two area-13 rows close, three open
 
 > The unported pi 1.0 `codemode` feature, built end to end on `claude/codemode` (ADR-0031, `deno_core`).

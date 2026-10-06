@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use cyrup_core::{ModelRef, ToolLoadout};
 
-use crate::tools::ToolInfo;
+use crate::tools::{BuiltPrompt, ToolInfo};
 
 use super::AgentSession;
 
@@ -38,31 +38,32 @@ impl AgentSession {
         Self::lock(&self.dynamic_tools).get(name)
     }
 
-    /// Push a rebuilt `(loadout, system_prompt)` onto the agent for the next turn (Pi
-    /// `setActiveToolsByName` tail, agent-session.ts:850-854). Shared by the host/CLI
-    /// [`Self::set_active_tools_by_name`] path and the guest-driven drain in
-    /// [`Self::apply_pending_control`] so both reach the live agent identically.
-    pub(super) async fn push_active_tools(&self, loadout: ToolLoadout, prompt: String) {
+    /// Push a rebuilt `(loadout, system_prompt)` for the next turn (Pi `setActiveToolsByName` tail,
+    /// agent-session.ts:850-854). Shared by the host/CLI [`Self::set_active_tools_by_name`] path and
+    /// the guest-driven drain in [`Self::apply_pending_control`] so both reach the live agent
+    /// identically.
+    pub(super) async fn push_active_tools(&self, loadout: ToolLoadout, prompt: BuiltPrompt) {
         self.apply_loadout(loadout).await;
         // The rebuilt prompt is the new BASE, not just this turn's value (Pi
         // `this._baseSystemPrompt = this._rebuildSystemPrompt(validToolNames)`, agent-session.ts:939).
         // Without this write the next run's `before_agent_start` reset in
         // [`Self::assemble_run_messages`] would restore the startup prompt and the model would be
         // described the startup tool set for the rest of the session.
-        *Self::lock(&self.base_system_prompt) = prompt.clone();
-        // …and what reaches the AGENT is `override ?? base` — pi's very next line,
-        // `this.agent.state.systemPrompt = this._systemPromptOverride ?? this._baseSystemPrompt;`
-        // (agent-session.ts:940 @v0.83.0). A rebuild triggered mid-run by a tool registration used to
-        // overwrite a `before_agent_start` handler's sanitized prompt with the raw rebuilt one
-        // (DRIFT-033); resolving through the override slot is what stops it.
-        let effective = self.effective_system_prompt();
-        self.agent.set_system_prompt(effective).await;
-        // EXT-005: keep the guest-visible `ctx.getSystemPrompt()` mirror in step with the agent —
+        //
+        // That is the whole of it: the agent holds no prompt (CODE-014), so nothing is pushed to it.
+        // The base's SECTIONS reach the model as a diff row the next time the prompt is reconciled
+        // with the transcript — at the start of the next run, and at every turn boundary of a run in
+        // flight (`PolicyHooks::prepare_next_turn`) — which is pi's `_preparePromptAndToolLoadout`.
+        // A `before_agent_start` handler's replacement lives in its own slot and is projected onto
+        // the request, so a rebuild cannot undo it (DRIFT-033).
+        let text = prompt.text().to_owned();
+        *Self::lock(&self.base_prompt) = prompt;
+        // EXT-005: keep the guest-visible `ctx.getSystemPrompt()` mirror in step with the session —
         // a tool-set rebuild rewrites the prompt (Pi `_rebuildSystemPrompt`, agent-session.ts:2304)
         // and a guest reading it back must see the rebuilt one.
         self.services
             .host_services
-            .update_prompt_state(Some(prompt), self.services.settings.project_trusted());
+            .update_prompt_state(Some(text), self.services.settings.project_trusted());
     }
 
     /// Hand a resolved loadout to the agent, reporting the `prepare_loadout` hooks that failed while
@@ -146,25 +147,23 @@ impl AgentSession {
     /// still has the last word. Both are cheap no-ops when nothing changed (a relaxed atomic load
     /// and an `Option` take), which is the common case on every turn of every run.
     ///
-    /// The rebuilt system prompt IS propagated now, through [`Self::effective_system_prompt`] —
-    /// `PolicyHooks::prepare_next_turn` reads it beside this array and returns both, mirroring pi's
-    /// `systemPrompt: this._systemPromptOverride ?? this._baseSystemPrompt` (agent-session.ts:534
-    /// @v0.83.0). The reason it used not to be is gone: cyrup now keeps pi's two slots, so re-pushing
-    /// resolves back to a `before_agent_start` handler's SANITIZED prompt (the permission companion's
-    /// `shouldExposeTool` shaping) rather than clobbering it with the raw rebuild (DRIFT-033). Both
-    /// drains below still discard their locally rebuilt prompt string for the same reason they always
-    /// did — the authority is the base slot [`Self::push_active_tools`] writes, not a drain's
-    /// by-product.
+    /// The rebuilt system prompt follows the tool set: both drains below store the prompt they
+    /// rebuild as the base, and `PolicyHooks::prepare_next_turn` reconciles that base with the
+    /// transcript right after this returns (CODE-014; pi rebuilds its prompt options from
+    /// `getActiveToolNames()` on every turn, `agent-session.ts:880-886` @v1.0.0). Before CODE-014 the
+    /// drains discarded their rebuilt prompt, because storing it and pushing it to the agent would
+    /// have clobbered a `before_agent_start` handler's sanitized replacement (DRIFT-033); that
+    /// replacement now has a slot and a projection of its own, so there is nothing left to protect.
     pub(crate) async fn next_turn_tools(&self) -> ToolLoadout {
         // EXT-004: a tool an extension registered from a LIVE handler during this run.
         self.refresh_extension_tools().await;
         // A guest's `setActiveTools` queued from an event handler / mid-turn tool hook, re-resolved
         // against the registry the refresh above just updated (the queue holds the requested NAMES
-        // precisely so this resolution happens after it — see `PendingActiveTools`). Array only,
-        // prompt discarded — see above, and the identical rule in `assemble_run_messages`.
+        // precisely so this resolution happens after it — see `PendingActiveTools`). The rebuilt
+        // prompt becomes the base, which the next reconciliation with the transcript writes.
         if let Some(names) = self.services.host_services.take_pending_active_tools() {
-            let (loadout, _rebuilt_prompt) = { Self::lock(&self.dynamic_tools).set_active(&names) };
-            self.apply_loadout(loadout).await;
+            let (loadout, prompt) = { Self::lock(&self.dynamic_tools).set_active(&names) };
+            self.push_active_tools(loadout, prompt).await;
         }
         self.agent.loadout().await
     }

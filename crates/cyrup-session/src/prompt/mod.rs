@@ -8,7 +8,8 @@
 //! Pipeline (arch-06 §2):
 //! ```text
 //! caller gathers ToolPromptContribution + SkillPointer + ContextSnapshot
-//!   -> SystemPromptBuilder::build(&PromptInputs) -> String
+//!   -> SystemPromptBuilder::build_sections(&PromptInputs) -> Sections      (what the transcript stores)
+//!   -> SystemPromptBuilder::build(&PromptInputs) -> String                  (those sections, rendered)
 //!   -> apply_before_agent_start(prompt, &inputs, hooks) -> final prompt   (R-06-014)
 //! ```
 //!
@@ -23,6 +24,7 @@ pub mod cache;
 pub mod context_files;
 pub mod hook;
 pub mod overrides;
+pub mod sections;
 pub mod skills_inject;
 pub mod tool_prompts;
 
@@ -35,6 +37,7 @@ pub use hook::{
     BeforeAgentStartHook, BeforeAgentStartInput, BeforeAgentStartOutput, apply_before_agent_start,
 };
 pub use overrides::ResolvedOverride;
+pub use sections::{PREAMBLE, diff_system_prompt_sections, render_sections};
 pub use tool_prompts::ToolPromptContribution;
 
 // Re-export the prompt-facing skill pointer projection (defined in cyrup-resources).

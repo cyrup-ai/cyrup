@@ -11,7 +11,7 @@ use cyrup_agent::{
     AfterOutcome, AfterToolCall, AgentMessage, BeforeOutcome, BeforeToolCall, HookError, Hooks,
     PostTurn, PrepareRequestCtx, RequestUpdate, TurnDecision, TurnUpdate,
 };
-use cyrup_core::{CancelToken, Message, TerminateHint, ToolCallId};
+use cyrup_core::{CancelToken, Content, Message, SystemMessage, TerminateHint, ToolCallId};
 use cyrup_tools::{PermissionPolicy, PolicyDecision};
 
 /// The placeholder text Pi substitutes for a blocked image (sdk.ts:270).
@@ -201,12 +201,28 @@ impl Hooks for PolicyHooks {
             .collect())
     }
 
+    /// The extension seam's transform, then pi's forced-prompt projection over its result
+    /// (`_installAgentForcedPromptProjection`, `agent-session.ts:1715-1731` @v1.0.0 — it wraps the
+    /// previous `transformContext`, so it runs after the `context` extension handlers).
+    ///
+    /// While a `before_agent_start` handler's replacement prompt is in force, the request carries
+    /// that exact text and no other system message: the transcript keeps its structured sections,
+    /// and the request is projected instead, so the replacement is not added to them and they are
+    /// not added to it.
     async fn transform_context(
         &self,
         msgs: Vec<Arc<AgentMessage>>,
         cancel: CancelToken,
     ) -> Result<Vec<Arc<AgentMessage>>, HookError> {
-        self.inner.transform_context(msgs, cancel).await
+        let transformed = self.inner.transform_context(msgs, cancel).await?;
+        let forced = self
+            .session
+            .get()
+            .and_then(|session| session.system_prompt_override());
+        Ok(match forced {
+            Some(forced) => project_forced_prompt(transformed, &forced),
+            None => transformed,
+        })
     }
 
     async fn before_tool_call(
@@ -290,6 +306,10 @@ impl Hooks for PolicyHooks {
         // out of scope here — so `context` is stamped ONLY when a compaction actually ran. Setting
         // it unconditionally would start reseeding the loop's transcript on a path that has never
         // done so.
+        // The transcript the loop is working on, as it stood when the turn ended: the prompt
+        // reconciliation below compares against it unless a hook replaced it (pi reads
+        // `nextContext.messages`, `agent-session.ts:886`).
+        let working: Vec<Arc<AgentMessage>> = ctx.context.messages.to_vec();
         let rebuilt = match self.session.get() {
             Some(session) => session
                 .compact_before_next_assistant_response()
@@ -306,11 +326,22 @@ impl Hooks for PolicyHooks {
             update.context = Some(messages.into_iter().map(std::sync::Arc::new).collect());
         }
         update.tools = Some(session.next_turn_tools().await);
-        // DRIFT-033 — pi's refresh assigns `context.systemPrompt` in the SAME object literal as
-        // `context.tools` (agent-session.ts:534 vs `:535` @v0.83.0), so the prompt the model is sent
-        // always describes the tool array it is sent with. Read AFTER `next_turn_tools`, because the
+        // CODE-014 — the prompt the model is sent always describes the tool array it is sent with
+        // (pi's refresh assigned `context.systemPrompt` in the same object literal as `context.tools`
+        // at v0.83.0, `agent-session.ts:534`; at v1.0.0 it appends the difference between the prompt
+        // the transcript replays and the prompt the tools now call for,
+        // `prepareNextTurnWithContext`, `:876-905`). Read AFTER `next_turn_tools`, because the
         // EXT-004 refresh that call performs is what rewrites the base slot for a late tool.
-        update.system_prompt = Some(session.effective_system_prompt());
+        //
+        // The message goes last among the prepared ones (`[...previousSnapshot.messages,
+        // updateMessage]`, `:896-898`); the loop then merges the tool declarations into it, as it
+        // does for any pending system message.
+        {
+            let transcript: &[Arc<AgentMessage>] = update.context.as_deref().unwrap_or(&working);
+            if let Some(message) = session.prompt_update(transcript.iter().map(AsRef::as_ref)) {
+                update.messages.push(AgentMessage::System(message));
+            }
+        }
         // AGENT-017 — pi's refresh returns THREE session-owned fields after the spread, not one:
         // `context.tools` (agent-session.ts:534 @v0.83.0), `model` (`:537`) and `thinkingLevel`
         // (`:538`). Only `tools` was re-pushed here, so `TurnUpdate::model` /
@@ -391,6 +422,35 @@ impl PolicyHooks {
             None => self.inner.before_tool_call(ctx, cancel).await,
         }
     }
+}
+
+/// Pi `_installAgentForcedPromptProjection`'s body (`agent-session.ts:1720-1731` @v1.0.0): the
+/// transcript with its system messages collapsed into one leading message holding `forced`. The
+/// timestamp is the first system message's, as `getCurrentSystemMessage` would report it.
+///
+/// The tool declarations the head carries upstream are not carried here: a cyrup request declares
+/// its tools through `Context::tools`, and strips them from the message list
+/// (`declare::without_tool_declarations`).
+fn project_forced_prompt(messages: Vec<Arc<AgentMessage>>, forced: &str) -> Vec<Arc<AgentMessage>> {
+    let timestamp = messages
+        .iter()
+        .find_map(|m| match m.as_ref() {
+            AgentMessage::System(s) => Some(s.timestamp),
+            _ => None,
+        })
+        .unwrap_or(0);
+    let head = AgentMessage::System(SystemMessage {
+        content: vec![Content::text(forced)],
+        timestamp,
+        ..SystemMessage::default()
+    });
+    std::iter::once(Arc::new(head))
+        .chain(
+            messages
+                .into_iter()
+                .filter(|m| !matches!(m.as_ref(), AgentMessage::System(_))),
+        )
+        .collect()
 }
 
 /// Whether a content block is an image (the trigger for the `blockImages` rewrite).

@@ -1,0 +1,53 @@
+{
+ "sections": {
+  "preamble": "You are an expert coding assistant operating inside pi, a coding agent harness. You help users by reading files, executing commands, editing code, and writing new files.",
+  "tools": "<tools>\n- read: Read file contents\n- bash: Execute bash commands\n\nIn addition to the tools above, you may have access to other custom tools depending on the project.\n</tools>",
+  "rules": "<rules>\n- Use bash for file operations like ls, rg, find\n- Use read to examine files instead of cat or sed.\n- Keep answers short\n- Be concise in your responses\n- Show file paths clearly when working with files\n</rules>",
+  "docs": "<docs>\nPi documentation (read only when the user asks about pi itself, its SDK, extensions, themes, skills, or TUI):\n- Main documentation: /pi/README.md\n- Additional docs: /pi/docs\n- Examples: /pi/examples (extensions, custom tools, SDK)\n- When reading pi docs or examples, resolve docs/... under Additional docs and examples/... under Examples, not the current working directory\n- When asked about: extensions (docs/extensions.md, examples/extensions/), themes (docs/themes.md), skills (docs/skills.md), prompt templates (docs/prompt-templates.md), TUI components (docs/tui.md), keybindings (docs/keybindings.md), SDK integrations (docs/sdk.md), custom providers (docs/custom-provider.md), adding models (docs/models.md), pi packages (docs/packages.md), environment variables (docs/environment-variables.md), MCP servers (docs/mcp.md), codemode scripts and non-LLM models such as classifiers and image models (docs/codemode.md)\n- When working on pi topics, read the docs and examples, and follow .md cross-references before implementing\n- Always read pi .md files completely and follow links to related docs (e.g., tui.md for TUI API details)\n</docs>",
+  "addendum": "<addendum>\nAPPENDED TEXT\n</addendum>",
+  "project_context": "<project_context>\nProject-specific instructions and guidelines:\n\n<project_instructions path=\"/work/proj/AGENTS.md\">\nhouse rules\n</project_instructions>\n\n<project_instructions path=\"/work/AGENTS.md\">\nmore rules\n</project_instructions>\n</project_context>",
+  "cwd": "<cwd>\n/work/proj\n</cwd>"
+ },
+ "sectionsCustom": {
+  "preamble": "MY OWN PROMPT",
+  "addendum": "<addendum>\nAPPENDED TEXT\n</addendum>",
+  "project_context": "<project_context>\nProject-specific instructions and guidelines:\n\n<project_instructions path=\"/work/proj/AGENTS.md\">\nhouse rules\n</project_instructions>\n\n<project_instructions path=\"/work/AGENTS.md\">\nmore rules\n</project_instructions>\n</project_context>",
+  "cwd": "<cwd>\n/work/proj\n</cwd>"
+ },
+ "sectionsNone": {
+  "preamble": "You are an expert coding assistant operating inside pi, a coding agent harness. You help users by reading files, executing commands, editing code, and writing new files.",
+  "tools": "<tools>\n(none)\n\nIn addition to the tools above, you may have access to other custom tools depending on the project.\n</tools>",
+  "rules": "<rules>\n- Be concise in your responses\n- Show file paths clearly when working with files\n</rules>",
+  "docs": "<docs>\nPi documentation (read only when the user asks about pi itself, its SDK, extensions, themes, skills, or TUI):\n- Main documentation: /pi/README.md\n- Additional docs: /pi/docs\n- Examples: /pi/examples (extensions, custom tools, SDK)\n- When reading pi docs or examples, resolve docs/... under Additional docs and examples/... under Examples, not the current working directory\n- When asked about: extensions (docs/extensions.md, examples/extensions/), themes (docs/themes.md), skills (docs/skills.md), prompt templates (docs/prompt-templates.md), TUI components (docs/tui.md), keybindings (docs/keybindings.md), SDK integrations (docs/sdk.md), custom providers (docs/custom-provider.md), adding models (docs/models.md), pi packages (docs/packages.md), environment variables (docs/environment-variables.md), MCP servers (docs/mcp.md), codemode scripts and non-LLM models such as classifiers and image models (docs/codemode.md)\n- When working on pi topics, read the docs and examples, and follow .md cross-references before implementing\n- Always read pi .md files completely and follow links to related docs (e.g., tui.md for TUI API details)\n</docs>",
+  "cwd": "<cwd>\nC:/win/dir\n</cwd>"
+ },
+ "diffs": {
+  "changedNewRemoved": {
+   "tools": "t2",
+   "fresh": "f",
+   "gone": null
+  },
+  "identical": null,
+  "bothEmpty": null,
+  "fromEmpty": {
+   "preamble": "p",
+   "tools": "t2",
+   "cwd": "c",
+   "fresh": "f"
+  },
+  "unknownFromPi": {
+   "preamble": "cyrup",
+   "experimental_pi_only": null
+  }
+ },
+ "loopPromptAndTools": [
+  "{\"role\":\"system\",\"content\":\"\",\"sections\":{\"preamble\":\"You are pi.\",\"cwd\":\"<cwd>\\n/pi/work\\n</cwd>\"},\"timestamp\":1700000000000,\"toolsAdded\":[{\"name\":\"read\",\"description\":\"Read a file\",\"parameters\":{\"type\":\"object\",\"properties\":{}}},{\"name\":\"bash\",\"description\":\"Run a command\",\"parameters\":{\"type\":\"object\",\"properties\":{}}}]}"
+ ],
+ "loopToolsOnly": [
+  "{\"role\":\"system\",\"content\":\"\",\"timestamp\":1754611203000,\"toolsAdded\":[{\"name\":\"read\",\"description\":\"Read a file\",\"parameters\":{\"type\":\"object\",\"properties\":{}}}]}"
+ ],
+ "loopSwap": [
+  "{\"role\":\"system\",\"content\":\"\",\"timestamp\":1754611203000,\"toolsAdded\":[{\"name\":\"new\",\"description\":\"n\",\"parameters\":{\"type\":\"object\",\"properties\":{}}}],\"toolsRemoved\":[{\"name\":\"old\"}]}"
+ ],
+ "compactionSnapshot": "{\"role\":\"system\",\"content\":\"\",\"sections\":{\"preamble\":\"You are pi.\"},\"toolsAdded\":[{\"name\":\"read\",\"description\":\"Read a file\",\"parameters\":{\"type\":\"object\",\"properties\":{}}}],\"timestamp\":1754611204000}"
+}

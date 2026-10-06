@@ -120,7 +120,16 @@ pub enum KnownEntry {
         /// followed by the summary (`sessionEntryToContextMessages`, `:462-463`). Absent on an entry
         /// written before the transcript carried system messages, and when the replayed state was
         /// empty.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ///
+        /// Written in the order of a REPLAYED snapshot (`toolsAdded` before `timestamp`), which is
+        /// how pi writes it (`session-manager.ts:1270-1283` @v1.0.0 spreads `getCurrentSystemMessage`'s
+        /// result), and not in the order of a `message` entry's system row. See
+        /// [`SystemMessage::serialize_replayed`].
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            serialize_with = "SystemMessage::serialize_replayed_opt"
+        )]
         system_message: Option<SystemMessage>,
     },
     BranchSummary {

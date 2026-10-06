@@ -27,6 +27,7 @@
     clippy::indexing_slicing
 )]
 
+use super::rendered_prompt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
@@ -310,9 +311,7 @@ fn faux_three_turns_capturing_prompts(prompts: &OfferedPrompts) -> Arc<FauxProvi
     let mk = |prompts: &OfferedPrompts, reply: AssistantReply| {
         let cap = prompts.clone();
         FauxResponseStep::factory(move |ctx, _opts, _state, _model| {
-            cap.lock()
-                .unwrap()
-                .push(ctx.system_prompt.clone().unwrap_or_default());
+            cap.lock().unwrap().push(rendered_prompt(ctx));
             match &reply {
                 AssistantReply::Call(name) => faux_assistant_message(
                     vec![faux_tool_call(name.clone(), serde_json::json!({}))],

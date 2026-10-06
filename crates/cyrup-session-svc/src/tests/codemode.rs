@@ -15,6 +15,7 @@
     clippy::indexing_slicing
 )]
 
+use super::rendered_prompt;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -371,10 +372,9 @@ fn steps(requests: &Requests, replies: Vec<Option<Value>>) -> Vec<FauxResponseSt
         .map(|reply| {
             let seen = Arc::clone(requests);
             FauxResponseStep::factory(move |ctx, _opts, _state, _model| {
-                seen.lock().unwrap().push((
-                    ctx.tools.clone(),
-                    ctx.system_prompt.clone().unwrap_or_default(),
-                ));
+                seen.lock()
+                    .unwrap()
+                    .push((ctx.tools.clone(), rendered_prompt(ctx)));
                 match &reply {
                     Some(args) => faux_assistant_message(
                         vec![faux_tool_call("codemode".to_string(), args.clone())],

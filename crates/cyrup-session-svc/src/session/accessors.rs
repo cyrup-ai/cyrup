@@ -171,7 +171,14 @@ impl AgentSession {
     /// [`Self::system_prompt`] until a tool-set rebuild (`/tools` toggle, a guest `setActiveTools`,
     /// or EXT-004 late tool registration) rewrites it via [`Self::push_active_tools`].
     pub fn base_system_prompt(&self) -> String {
-        Self::lock(&self.base_system_prompt).clone()
+        Self::lock(&self.base_prompt).text().to_owned()
+    }
+
+    /// The LIVE base system prompt as the ordered, named sections the transcript stores (pi
+    /// `buildSystemPromptSections`, CODE-014) — the same prompt as [`Self::base_system_prompt`], before
+    /// it is rendered. This is what the session diffs against the transcript at the start of every run.
+    pub fn base_system_prompt_sections(&self) -> cyrup_core::Sections {
+        Self::lock(&self.base_prompt).sections().clone()
     }
 
     /// The `before_agent_start` replacement in force for the CURRENT run, if any (Pi
@@ -194,8 +201,12 @@ impl AgentSession {
 
     /// The agent's *current* system prompt — equal to the base unless a `before_agent_start` handler
     /// replaced it for the in-flight run (Pi `agent.state.systemPrompt`, agent-session.ts:1127).
+    ///
+    /// The agent holds no prompt of its own (CODE-014: pi builds its `Agent` with `systemPrompt: ""`
+    /// and the prompt lives in the transcript), so this is [`Self::effective_system_prompt`] — what
+    /// the request projects — and not a field of the agent's state.
     pub async fn current_system_prompt(&self) -> String {
-        self.agent.snapshot().await.system_prompt
+        self.effective_system_prompt()
     }
 
     /// The current LLM context built from the session tree (leaf→root, R-04-011).

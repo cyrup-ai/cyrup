@@ -14,6 +14,7 @@
     clippy::indexing_slicing
 )]
 
+use super::rendered_prompt;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -210,10 +211,9 @@ fn script(requests: &Requests, replies: Vec<Reply>) -> Arc<FauxProvider> {
         .map(|reply| {
             let seen = Arc::clone(requests);
             FauxResponseStep::factory(move |ctx, _opts, _state, _model| {
-                seen.lock().unwrap().push((
-                    ctx.tools.clone(),
-                    ctx.system_prompt.clone().unwrap_or_default(),
-                ));
+                seen.lock()
+                    .unwrap()
+                    .push((ctx.tools.clone(), rendered_prompt(ctx)));
                 match reply {
                     Reply::Call(name) => faux_assistant_message(
                         vec![faux_tool_call(name.to_string(), serde_json::json!({}))],

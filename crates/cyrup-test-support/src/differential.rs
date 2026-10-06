@@ -5,6 +5,7 @@
 //! (R-00-012). Provides both coarse type/ordering comparison and a normalized full-event diff
 //! (volatile fields folded via [`crate::golden`]).
 
+use cyrup_agent::AgentMessage;
 use cyrup_provider::StreamEvent;
 use cyrup_session_svc::AgentSessionEvent;
 use serde::Serialize;
@@ -164,6 +165,30 @@ pub fn agent_loop_kinds(actual: &[String]) -> Vec<String> {
         .filter(|k| !SESSION_LAYER_ONLY_KINDS.contains(&k.as_str()))
         .cloned()
         .collect()
+}
+
+/// The agent-loop subset of a session's events: [`agent_loop_kinds`] over their kinds, and without
+/// the `message_start`/`message_end` pair of the session layer's PROMPT update.
+///
+/// A session writes its prompt as a system message carrying `sections` and puts it first among the
+/// messages of a run (pi `_preparePromptAndToolLoadout`, `agent-session.ts:1689-1705`, unshifted at
+/// `:2058-2060` @v1.0.0). pi's agent LOOP emits no such message — `agentLoop()` is handed one, and the
+/// loop only ever creates a system message of its own to declare tools — so a capture of the bare
+/// loop has no pair for it, exactly as it has no `agent_settled`. A message that declares tools only
+/// is the loop's and is kept.
+pub fn agent_loop_event_kinds(events: &[AgentSessionEvent]) -> Vec<String> {
+    let kinds: Vec<String> = events
+        .iter()
+        .filter(|e| match e {
+            AgentSessionEvent::MessageStart { message }
+            | AgentSessionEvent::MessageEnd { message } => {
+                !matches!(message, AgentMessage::System(s) if s.sections.is_some())
+            }
+            _ => true,
+        })
+        .map(|e| e.kind().to_string())
+        .collect();
+    agent_loop_kinds(&kinds)
 }
 
 /// A cross-impl-canonical rendering of one event value (volatile fields zeroed, `role` dropped,

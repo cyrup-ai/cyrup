@@ -125,11 +125,11 @@ override `is_hidden`, and files nothing.
 
 ## Open items
 
-> **Next free id: `CODE-018`** (2026-10-06, after the closure pass filed `CODE-014`…`CODE-017`; before that `CODE-014` (2026-10-02, after this file filed `CODE-001`…`CODE-013`)). 2026-10-03: unchanged; the ledger-correction pass filed no new row here (corrections are CORRECTED notes on `CODE-001`, `-002`, `-003`, `-006`, `-008`, `-010`, `-011`, `-012`, `-013`).
+> **Next free id: `CODE-018`** (2026-10-06, unchanged by the `CODE-014` closure, which filed no new row; after the closure pass filed `CODE-014`…`CODE-017`; before that `CODE-014` (2026-10-02, after this file filed `CODE-001`…`CODE-013`)). 2026-10-03: unchanged; the ledger-correction pass filed no new row here (corrections are CORRECTED notes on `CODE-001`, `-002`, `-003`, `-006`, `-008`, `-010`, `-011`, `-012`, `-013`).
 
 > The standard `ID | Severity | Kind | Effort | Title` table, as README's *Item format* requires.
 > **This table is the complete open set for area 18** — `CODE-001`…`CODE-013` all closed 2026-10-06 (see
-> the closure record below), `CODE-014`…`CODE-017` open, no `-S` series and no second table. `scripts/count_open_items.py` lists this file as area `18`; it was added to
+> the closure record below), `CODE-014` closed 2026-10-06 (second closure record below), `CODE-015`…`CODE-017` open, no `-S` series and no second table. `scripts/count_open_items.py` lists this file as area `18`; it was added to
 > `STANDARD_AREAS` in the same change that created the file, because an area the counter does not
 > know is an area whose rows are silently missing from every total.
 >
@@ -153,7 +153,7 @@ override `is_hidden`, and files nothing.
 | ~~CODE-011~~ | ~~low~~ **CLOSED 2026-10-06 — shipped** | not-ported | M | **The codemode TUI renderer is unported** — `codemodeRenderers` at `extensions/codemode/renderer.ts:65`: a live nested-call list with per-call status glyph, duration and USD cost, over a collapsed syntax-highlighted script preview. **FILED 2026-10-02**; body below. **CORRECTED 2026-10-03 (v1.0.1 growth):** `renderer.ts` `codemodeRenderers` `:65` is unchanged at v1.0.1. v1.0.1 adds `pi.registerToolRenderer(resolver)` (`core/extensions/types.ts:1683`, `loader.ts:367`; `packages/coding-agent/CHANGELOG.md` [1.0.1], #10285) and the MCP extension uses it to draw `mcp__<server>__<tool>` calls before their server connects (`extensions/mcp/index.ts:363-366`). A cyrup port that wants parity for resumed sessions needs a renderer-resolver hook for tools that are not registered, in addition to the codemode renderer. |
 | ~~CODE-012~~ | ~~low~~ **CLOSED 2026-10-06 — shipped** | not-ported | S | **The script output budget, truncation and temp-file spill are unported** — `DEFAULT_MAX_OUTPUT_TOKENS` 10 000, `truncateOutput` and `spillOutput` at `execute.ts:233`, `:277`, `:262`. **FILED 2026-10-02**; body below. **CORRECTED 2026-10-03 (v1.0.1 growth):** `execute.ts` `:233`, `:262`, `:277` still hold at v1.0.1. v1.0.1 adds a second, sandbox-level output cap beneath this budget: `MAX_OUTPUT_CHARS` 16 Mi and `MAX_OUTPUT_ITEMS` 100 000 in `packages/codemode/src/runtime/prelude-source.ts:36-37` (see `CODE-002`); a script exceeding either fails with a `RangeError` before `truncateOutput` sees the text. The two caps are independent. |
 | ~~CODE-013~~ | ~~low~~ **CLOSED 2026-10-06 — no counterpart needed: V8 links into the binary** | tooling | M | **Shipping the sandbox runtime in cyrup's build has no counterpart** — `getQuickJSWasmPath()` / `resolveCodemodeWorkerSpecifier()` at `coding-agent/src/config.ts:488`, `:493` resolve a wasm asset and a worker entrypoint per release runtime. **FILED 2026-10-02**; body below. **CORRECTED 2026-10-03:** at v1.0.0 `getQuickJSWasmPath()` is `config.ts:488`, `setEmbeddedQuickJSWasmPath()` `:483` and `resolveCodemodeWorkerSpecifier()` `:493` (as cited); at v1.0.1 they are `:491`, `:486` and `:496`. `loadQuickJSWasm()` is `packages/codemode/src/wasm.ts:21`, not `:24` (same at both tags). The row's "if `CODE-002` lands on `rquickjs`, this row collapses" branch is moot: per `docs/adr/ADR-0031-one-javascript-engine-deno-core.md` a port would use `deno_core` (already linked, V8 fetched by `rusty_v8`'s build, `Cargo.toml:403-415`), so no wasm artifact is embedded and the open question is only how the V8 prebuilt is provisioned, which `workflowScript` already answers. "Nothing embeds a wasm artifact" for assets remains true. |
-| CODE-014 | medium | not-ported | L | **System-prompt `sections` rows are unported, so a session file pi wrote carries its prompt twice and cyrup's `SystemMessage` key order differs from pi's loop** — `core/agent-session.ts:1689-1705` `_preparePromptAndToolLoadout`, `core/system-prompt.ts:121-230` `buildSystemPromptSections`/`diffSystemPromptSections`. The tool-declaration half shipped with `CODE-005`'s transcript restore; the prompt half did not: cyrup still sends the prompt through `Context::system_prompt` and writes no `sections`, so a pi-written file's `sections` rows replay in addition to cyrup's own prompt (pre-existing), and pi's loop writes `toolsAdded` after `timestamp` where cyrup writes `types.ts` declaration order (both load either way; a cyrup rewrite of a pi row reorders keys). **FILED 2026-10-06**; evidence is the `ACTIVESET` lane's measurement, `crates/cyrup-session/src/context.rs`, `crates/cyrup-agent/src/agent/run/declare.rs`. |
+| ~~CODE-014~~ | ~~medium~~ **CLOSED 2026-10-06 — the prompt is written as `sections` diff rows and a pi-written file no longer carries it twice; both key orders pinned byte for byte** | not-ported | L | **System-prompt `sections` rows are unported, so a session file pi wrote carries its prompt twice and cyrup's `SystemMessage` key order differs from pi's loop** — `core/agent-session.ts:1689-1705` `_preparePromptAndToolLoadout`, `core/system-prompt.ts:121-230` `buildSystemPromptSections`/`diffSystemPromptSections`. The tool-declaration half shipped with `CODE-005`'s transcript restore; the prompt half did not: cyrup still sends the prompt through `Context::system_prompt` and writes no `sections`, so a pi-written file's `sections` rows replay in addition to cyrup's own prompt (pre-existing), and pi's loop writes `toolsAdded` after `timestamp` where cyrup writes `types.ts` declaration order (both load either way; a cyrup rewrite of a pi row reorders keys). **FILED 2026-10-06; CLOSED 2026-10-06** (closure record below); evidence is the `ACTIVESET` lane's measurement, `crates/cyrup-session/src/context.rs`, `crates/cyrup-agent/src/agent/run/declare.rs`. |
 | CODE-015 | low | not-ported | M | **A WASM guest tool cannot supply `prepareLoadout`** — `ToolDefinition.prepareLoadout` (`types.ts:625-630`). `Tool::prepare_loadout` is synchronous because it runs inside the session's tool-state lock and a guest `setActiveTools` is synchronous by design (`HostServices::set_active_tools`); a guest export is an async wasmtime call, so `WasmTool` keeps the trait default. Native tools (the `codemode` tool) use hooks today. Needs either an async loadout resolution outside the lock or a cached per-guest answer; neither was built. **FILED 2026-10-06.** |
 | CODE-016 | low | not-ported | M | **The guest side of `ctx.executeTool` has four gaps** — a guest tool cannot pass its own abort `signal` (a suspended guest has no abort handle: the nested call is cancelled only with the calling tool), a guest's `onUpdate` for a nested call receives its partial results batched after the call settles (the same results reach `tool_execution_update` events live), the instance whose own tool makes a nested call does not receive that call's `tool_call`/`tool_result`/`tool_execution_*` events (its lock is held by the call that makes them: a guest that is both permission gate and caller does not gate its own nested calls; recorded `[CYRUP-DELTA]` in `world.wit`), and a guest tool calling a tool of its own extension is refused by name (`GuestReentry`) rather than run. Native tier has none of these. **FILED 2026-10-06.** |
 | CODE-017 | low | not-ported | S | **`ToolDefinition.annotations` and `ToolInfo.annotations` are unported** — `types.ts:601`, `agent-session.ts:1473` (MCP tool annotations: `readOnlyHint`/`destructiveHint`/`idempotentHint`/`openWorldHint`, "permission extensions can use them to decide which calls to confirm"). cyrup's `Tool` has no annotations accessor, so `getAllTools` rows omit them and the MCP adapter cannot attach them to the `deferred` tools it registers. **FILED 2026-10-06** (from `CODE-005`, `MCP-604` and the guest-rows lanes). |
@@ -200,6 +200,104 @@ the transcript restore), `MCP-604` ("decide whether lazy-inactive is redundant":
 mechanism), `SESS-035` (closed as "REFUTED (residual)": `builder.rs` still passes `DocsPointers::default()`,
 so no production prompt carries the docs section; `docs_dir()` now exists, wiring it is a system-prompt
 change that this work did not make).
+
+## Closure record, 2026-10-06 — `CODE-014` (system-prompt `sections` rows) and `SESS-054` (the tagged layout)
+
+Upstream is pi `v1.0.0` for this record, the pin area 18 names; every cite was read with
+`git -C tmp/pi show v1.0.0:<path>`. The `v1.0.1` pin of the section above is not used here.
+
+**What was wrong, in user terms.** A session file pi wrote starts with a `system` row whose
+`sections` hold the whole prompt. cyrup read that row and replayed it, and *also* sent its own prompt
+through `Context::system_prompt` — so the model was told who it was, what tools it had and what the
+rules were twice, in two layouts, one of them from a harness the user had left. And a file cyrup
+wrote carried no `sections` at all, so pi resuming a cyrup session found no prompt in it.
+
+**What shipped**
+
+| piece | where | pi |
+|---|---|---|
+| `build_sections` — the ordered section map | `cyrup-session/src/prompt/builder.rs` | `buildSystemPromptSections`, `system-prompt.ts:121` |
+| `diff_system_prompt_sections`, `render_sections` | `cyrup-session/src/prompt/sections.rs` | `:204`, `getSystemMessageText` |
+| the session prepares a prompt row at run start and at every turn boundary | `cyrup-session-svc/src/session/prompt_update.rs`, `run.rs::assemble_run_messages`, `hooks.rs::prepare_next_turn` | `_preparePromptAndToolLoadout`, `agent-session.ts:1689`, called at `:2058` (run start) and `:887` (turn boundary) |
+| the agent is built with no prompt of its own | `cyrup-session-svc/src/builder.rs` | `sdk.ts:389` (`systemPrompt: ""`) |
+| `before_agent_start`'s replacement projected onto the request, never persisted | `cyrup-session-svc/src/hooks.rs::project_forced_prompt` | `forceSystemPrompt`, `_installAgentForcedPromptProjection` |
+| key order | `cyrup-core/src/message/system.rs` | `declareToolChanges` appends tool keys after `timestamp`; `getCurrentSystemMessage` (compaction `systemMessage`) puts `toolsAdded` before it |
+| subagent prompt stripping | `cyrup-ext-subagents/src/prompt_runtime.rs` | the section delimiters are `<skills>`/`</skills>` now |
+
+**Judgement calls**
+
+1. *Does the diff change what is sent to the model, or only what is in the file?* Both, and they are the
+   same change: pi has no other prompt path (`Agent` is built with an empty prompt; the loop sends
+   `normalizeContext({messages})`), so cyrup's `Context::system_prompt` is now always empty and the
+   model reads the replay of the file. The replay of the rows the session writes equals the prompt
+   `build_sections` renders (`a_new_session_writes_its_prompt_once_and_the_model_reads_that_text`), so
+   with the same inputs the model reads the same words — **except for the layout**, below.
+2. **Model-visible behaviour change, stated plainly:** the prompt is laid out as pi's tagged sections
+   (`<tools>`, `<rules>`, `<docs>`, `<addendum>`, `<project_context>`, `<skills>`, `<cwd>`, joined by a
+   blank line) instead of `Available tools:` / `Guidelines:` / `Current working directory:`. That is
+   `SESS-054`, closed here, because pi's `sections` *are* the tagged form: writing diff rows of the old
+   layout would have been a layout pi's own rows never contain. The preamble keeps cyrup's identity
+   line (the standing `[CYRUP-DELTA]`).
+3. *Unknown section keys on read-modify-write.* A row cyrup did not write is preserved byte for byte
+   (`Sections` keeps unknown names and their order; `a_rewrite_gives_every_pi_system_row_back_byte_for_byte`).
+   A section a pi file carries that cyrup's builder does not produce (pi extensions add them) is
+   **removed by a `null` in the next diff row, never edited** — which is what pi does when its rebuilt
+   map lacks a name (`diffSystemPromptSections` emits `null` for every previous name absent from the
+   current map). Pinned by `a_section_cyrup_does_not_build_is_removed_by_a_null_and_never_edited`.
+4. *Two key orders.* Both are pi's and both are kept: a `message` row is `role, content, sections?,
+   timestamp, toolsAdded?, toolsRemoved?`; a compaction entry's `systemMessage` is `role, content,
+   sections?, toolsAdded?, timestamp` (never `toolsRemoved`). cyrup's old order, `role, content,
+   sections?, toolsAdded?, toolsRemoved?, timestamp`, was neither.
+   `serde_json/preserve_order` **is** enabled workspace-wide (root `Cargo.toml`, pinned by
+   `preserve_order_is_declared_workspace_wide`), contrary to the `Sections` doc comment, which said it
+   was not and is corrected; the byte assertions would catch the opposite anyway.
+
+**Corrections to the row and the brief**
+
+- `crates/cyrup-session/src/context.rs` is **not** the prompt path. It is the transcript→messages walk
+  (`build_session_context`, pi `session-manager.ts:325-433`) and contains no `system_prompt`. The
+  prompt path was: `cyrup-session/src/prompt/builder.rs` (`SystemPromptBuilder`) →
+  `cyrup-session-svc/src/{builder,tools}.rs` (`PromptRebuilder`) → `AgentBuilder::system_prompt` →
+  `cyrup-agent/src/agent/run/stream.rs:144-148` → `cyrup-provider/src/context.rs:8-14`
+  (`Context::system_prompt`). The last two links are what the double prompt travelled through.
+- "What already exists" was half true. Replay did exist (`cyrup-provider/src/utils/transcript.rs`,
+  `get_current_system_message`/`get_current_system_prompt`, with the `:195-196` empty-sections rule
+  there, not in `cyrup-core`; `text.rs:75` is `section_values`; `declare.rs:135` is the
+  empty-system-row filter). **Nothing wrote a prompt row**, and the loop sent the replayed rows
+  *and* its own `Context::system_prompt` — which is the bug.
+- The row said the key-order difference was "`types.ts` declaration order". The old order was cyrup's
+  own (above), and pi has two orders, not one.
+- The old SESS-054 text and the doc comments in `builder.rs` cited `system-prompt.ts` line numbers of
+  v0.87.1; re-derived at v1.0.0.
+- `strip_inherited_skills` (subagents) removed a constant that never appeared in a real prompt, and its
+  tests used fabricated fixtures; it now strips `<skills>…</skills>` and its fixtures come from the real
+  builder.
+
+**Not ported, with evidence**
+
+- `AGENT-039`'s Agent-level fold (the initial `systemPrompt`/`tools` becoming a leading system message,
+  `agent.ts:83-86`): not ported, a judgement call — cyrup's `Agent` is built without a prompt
+  (as pi's `sdk.ts:389` does), so the fold has no input in the session path. It stays open for
+  `Agent` users who still pass `system_prompt` directly.
+- pi's docs section line "When asked about" (`system-prompt.ts:158`): omitted by `docs_section`; cyrup
+  has no docs root to point at (`SESS-035`, residual).
+- `usage` entries (`SESS-051`'s remaining clause) and `EXT-084` (mutable `systemPromptOptions`) stay open.
+- The permission extension's text sanitizer still looks for `Available tools:` / `Guidelines:`
+  (`cyrup-permission-system/src/sanitize/`, `extension/agent_start.rs:130`) and so strips nothing from
+  the new layout (its own tests, `cyrup-it/tests/permission/context_hygiene.rs:148`, feed it the old
+  literal). A denied tool is kept out of the prompt at the source instead — `build_sections` is given
+  the filtered tool set, pinned by `a_tool_a_handler_hides_is_not_in_the_prompt_the_model_reads` — so
+  this is a sanitizer whose premise went stale, not a leak, but it is dead text now. Recorded as a
+  residual lead, not filed as a counted row. pi-subagents upstream still uses the old headers too.
+
+**Evidence.** Differential: `cyrup-test-support/fixtures-capture/code014/` runs pi's own
+`buildSystemPromptSections`, `diffSystemPromptSections` and agent loop under Node 22 and writes
+`fixtures/pi/code014-prompt-sections.pi-captured.json`; `prompt_sections_differential.rs` compares
+cyrup's sections, diffs and rewritten rows with it. Red proofs (revert production code, never the
+test): re-adding the agent prompt fails `a_prompt_pi_wrote_is_replaced_not_repeated` and four more;
+writing the whole blob instead of the diff fails seven; the old key order fails six; the compaction
+snapshot order, the forced-prompt projection, the turn-boundary reconciliation, diff removals, the
+base-prompt-follows-tools update and the differential anchor each fail their own named tests.
 
 ## CODE-001 — `packages/codemode` is unported. DECIDED 2026-10-05: build it, scheduled later
 

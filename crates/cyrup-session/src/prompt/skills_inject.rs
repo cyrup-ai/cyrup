@@ -41,10 +41,11 @@ fn skill_load_instruction(file_read_tool: &str) -> &'static str {
     }
 }
 
-/// Emit the `<available_skills>` block, telling the model to load a skill with `file_read_tool`
-/// (`"read"` or `"bash"`). No-op when `skills` is empty or every skill is
+/// The skills section's text, telling the model to load a skill with `file_read_tool` (`"read"` or
+/// `"bash"`): pi's `formatSkillsForPrompt(skills, fileReadTool).trim()` (`skills.ts:333-382`,
+/// `system-prompt.ts:165-169` @v1.0.0). `None` when `skills` is empty or every skill is
 /// model-invocation-disabled.
-pub(crate) fn emit_skills_section(out: &mut String, skills: &[SkillPointer], file_read_tool: &str) {
+pub(crate) fn skills_section_text(skills: &[SkillPointer], file_read_tool: &str) -> Option<String> {
     // Pi `const visibleSkills = skills.filter((s) => !s.disableModelInvocation);` then
     // `if (visibleSkills.length === 0) return "";` (skills.ts:335-339).
     let visible: Vec<&SkillPointer> = skills
@@ -52,9 +53,9 @@ pub(crate) fn emit_skills_section(out: &mut String, skills: &[SkillPointer], fil
         .filter(|s| !s.disable_model_invocation)
         .collect();
     if visible.is_empty() {
-        return;
+        return None;
     }
-    out.push_str("\n\n");
+    let mut out = String::new();
     out.push_str(SKILLS_PREAMBLE);
     out.push('\n');
     out.push_str(skill_load_instruction(file_read_tool));
@@ -64,19 +65,20 @@ pub(crate) fn emit_skills_section(out: &mut String, skills: &[SkillPointer], fil
     for s in visible {
         out.push_str("  <skill>\n");
         out.push_str("    <name>");
-        push_escaped(out, &s.name);
+        push_escaped(&mut out, &s.name);
         out.push_str("</name>\n");
         if let Some(desc) = &s.description {
             out.push_str("    <description>");
-            push_escaped(out, desc);
+            push_escaped(&mut out, desc);
             out.push_str("</description>\n");
         }
         out.push_str("    <location>");
-        push_escaped(out, &s.path.to_string_lossy());
+        push_escaped(&mut out, &s.path.to_string_lossy());
         out.push_str("</location>\n");
         out.push_str("  </skill>\n");
     }
     out.push_str("</available_skills>");
+    Some(out)
 }
 
 /// XML-escape `& < > " '` (matches Pi's `escapeXml`), appending to `out`.

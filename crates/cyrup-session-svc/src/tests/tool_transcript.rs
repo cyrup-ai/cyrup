@@ -38,13 +38,13 @@ use crate::{AgentSession, NavigateTreeOptions, SessionBuilder, SessionConfig, Se
 
 // ------------------------------------------------------------------------------ fixtures ----
 
-struct Fixture {
+pub(super) struct Fixture {
     _tmp: TempDir,
-    cwd: PathBuf,
-    agent_dir: PathBuf,
+    pub(super) cwd: PathBuf,
+    pub(super) agent_dir: PathBuf,
 }
 
-fn fixture() -> Fixture {
+pub(super) fn fixture() -> Fixture {
     let tmp = TempDir::new().unwrap();
     let cwd = tmp.path().join("project");
     let agent_dir = tmp.path().join("agent");
@@ -57,7 +57,7 @@ fn fixture() -> Fixture {
     }
 }
 
-fn config(fx: &Fixture, target: SessionTarget) -> SessionConfig {
+pub(super) fn config(fx: &Fixture, target: SessionTarget) -> SessionConfig {
     let mut cfg = SessionConfig::new(fx.cwd.clone(), fx.agent_dir.clone());
     cfg.trust_override = Some(true);
     cfg.no_extensions = true;
@@ -140,13 +140,13 @@ impl Tool for Probe {
     }
 }
 
-type SessionSlot = Arc<OnceLock<Weak<AgentSession>>>;
+pub(super) type SessionSlot = Arc<OnceLock<Weak<AgentSession>>>;
 
 /// pi's `tool_search`, reduced to what matters here: while it runs, it widens the active set with
 /// the registered-but-inactive `late` tool.
-struct Loader {
-    slot: SessionSlot,
-    params: Value,
+pub(super) struct Loader {
+    pub(super) slot: SessionSlot,
+    pub(super) params: Value,
 }
 
 #[async_trait::async_trait]
@@ -181,7 +181,7 @@ impl Tool for Loader {
     }
 }
 
-struct ToolsExt(Vec<Arc<dyn Tool>>);
+pub(super) struct ToolsExt(pub(super) Vec<Arc<dyn Tool>>);
 
 #[async_trait::async_trait]
 impl NativeExtension for ToolsExt {
@@ -200,20 +200,24 @@ impl NativeExtension for ToolsExt {
 }
 
 /// One request as the provider received it.
-struct Seen {
-    tools: Vec<String>,
-    messages: String,
+pub(super) struct Seen {
+    pub(super) tools: Vec<String>,
+    pub(super) messages: String,
+    /// The system prompt the PROVIDER renders for this request: the transcript's system messages
+    /// replayed into one (`getCurrentSystemPrompt` over `normalizeContext`), which is the text of
+    /// the leading system message a provider that carries the prompt outside the message list sends.
+    pub(super) system_prompt: String,
 }
 
-type Requests = Arc<Mutex<Vec<Seen>>>;
+pub(super) type Requests = Arc<Mutex<Vec<Seen>>>;
 
 #[derive(Clone)]
-enum Reply {
+pub(super) enum Reply {
     Call(&'static str),
     Text(&'static str),
 }
 
-fn script(requests: &Requests, replies: Vec<Reply>) -> Arc<FauxProvider> {
+pub(super) fn script(requests: &Requests, replies: Vec<Reply>) -> Arc<FauxProvider> {
     let steps: Vec<FauxResponseStep> = replies
         .into_iter()
         .map(|reply| {
@@ -222,6 +226,9 @@ fn script(requests: &Requests, replies: Vec<Reply>) -> Arc<FauxProvider> {
                 seen.lock().unwrap().push(Seen {
                     tools: ctx.tools.iter().map(|t| t.name.clone()).collect(),
                     messages: serde_json::to_string(&ctx.messages).unwrap(),
+                    system_prompt: cyrup_provider::get_current_system_prompt(
+                        cyrup_provider::normalize_context(ctx).messages(),
+                    ),
                 });
                 match reply {
                     Reply::Call(name) => faux_assistant_message(
@@ -242,7 +249,7 @@ fn script(requests: &Requests, replies: Vec<Reply>) -> Arc<FauxProvider> {
 
 /// The tools of the `tool_search` scenario: the loader, one tool that is active from the start,
 /// and `late`, registered `deferred` so that only the loader activates it.
-fn scenario_tools(slot: &SessionSlot) -> Vec<Arc<dyn Tool>> {
+pub(super) fn scenario_tools(slot: &SessionSlot) -> Vec<Arc<dyn Tool>> {
     vec![
         Arc::new(Loader {
             slot: Arc::clone(slot),
@@ -253,7 +260,7 @@ fn scenario_tools(slot: &SessionSlot) -> Vec<Arc<dyn Tool>> {
     ]
 }
 
-async fn open_with(
+pub(super) async fn open_with(
     fx: &Fixture,
     provider: Arc<FauxProvider>,
     tools: impl FnOnce(&SessionSlot) -> Vec<Arc<dyn Tool>>,
@@ -271,7 +278,7 @@ async fn open_with(
     session
 }
 
-async fn open(
+pub(super) async fn open(
     fx: &Fixture,
     provider: Arc<FauxProvider>,
     tools: impl FnOnce(&SessionSlot) -> Vec<Arc<dyn Tool>>,
@@ -280,13 +287,13 @@ async fn open(
     open_with(fx, provider, tools, target, None).await
 }
 
-async fn prompt(session: &AgentSession, text: &str) {
+pub(super) async fn prompt(session: &AgentSession, text: &str) {
     let _ = session.prompt(text).await.unwrap();
     session.wait_for_idle().await;
 }
 
 /// The session file's lines, as written.
-fn lines(file: &Path) -> Vec<String> {
+pub(super) fn lines(file: &Path) -> Vec<String> {
     cyrup_session::flush_session_writes();
     let text = std::fs::read_to_string(file).unwrap();
     text.lines().map(str::to_string).collect()
@@ -300,7 +307,7 @@ fn role_of(line: &str) -> Option<String> {
 }
 
 /// The system messages persisted in the file, in order, with the index of the line they sit on.
-fn system_rows(file: &Path) -> Vec<(usize, Value)> {
+pub(super) fn system_rows(file: &Path) -> Vec<(usize, Value)> {
     lines(file)
         .iter()
         .enumerate()
@@ -314,7 +321,7 @@ fn system_rows(file: &Path) -> Vec<(usize, Value)> {
         .collect()
 }
 
-fn names_of(list: &Value) -> Vec<String> {
+pub(super) fn names_of(list: &Value) -> Vec<String> {
     list.as_array()
         .map(|a| {
             a.iter()
@@ -329,7 +336,7 @@ fn has(active: &[String], name: &str) -> bool {
 }
 
 /// Run the scenario once and hand back the session that wrote the file, and the file.
-async fn written_session(fx: &Fixture) -> (Arc<AgentSession>, PathBuf) {
+pub(super) async fn written_session(fx: &Fixture) -> (Arc<AgentSession>, PathBuf) {
     let requests: Requests = Arc::new(Mutex::new(Vec::new()));
     let faux = script(&requests, vec![Reply::Call("loader"), Reply::Text("done")]);
     let session = open(fx, faux, scenario_tools, SessionTarget::New).await;
@@ -718,10 +725,20 @@ async fn a_session_file_written_by_pi_restores_its_loadout() {
     );
     prompt(&resumed, "hi").await;
     assert_eq!(requests.lock().unwrap()[0].tools, ["loader", "late"]);
+    // pi's declarations already say what the session RUNS, so no tool is declared again. The prompt
+    // pi's row carries is not cyrup's, so the one row the session appends is a patch of prompt
+    // sections (CODE-014) with no loadout in it.
+    let rows = system_rows(&file);
     assert_eq!(
-        system_rows(&file).len(),
-        2,
-        "pi's declarations already say what the session runs; nothing is appended"
+        rows.len(),
+        3,
+        "pi's two rows and one prompt patch: {rows:#?}"
+    );
+    assert!(rows[2].1.get("sections").is_some(), "{:#?}", rows[2].1);
+    assert!(
+        rows[2].1.get("toolsAdded").is_none() && rows[2].1.get("toolsRemoved").is_none(),
+        "no tool is declared a second time: {:#?}",
+        rows[2].1
     );
 }
 
