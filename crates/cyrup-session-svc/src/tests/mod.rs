@@ -81,6 +81,7 @@ mod summarization_retry_events;
 mod thinking_level_on_model_switch;
 mod tool_exposure;
 mod tool_result_structured_content;
+mod tool_search;
 mod tool_transcript;
 mod tool_usage_extension_seam;
 mod transport_setting;

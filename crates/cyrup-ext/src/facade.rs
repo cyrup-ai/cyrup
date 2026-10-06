@@ -1535,6 +1535,11 @@ impl ExtensionHost {
         let Some(owner) = self.registry.tool_renderer_owner(tool_name).ok().flatten() else {
             return RenderOutcome::None;
         };
+        if let Some(outcome) =
+            self.native_tool_tree(&owner, tool_name, call, RenderKind::Call, opts)
+        {
+            return outcome;
+        }
         self.render_via(&owner, tool_name, call, RenderKind::Call, opts)
             .await
     }
@@ -1568,8 +1573,50 @@ impl ExtensionHost {
         let Some(owner) = self.registry.tool_renderer_owner(tool_name).ok().flatten() else {
             return RenderOutcome::None;
         };
+        if let Some(outcome) =
+            self.native_tool_tree(&owner, tool_name, result, RenderKind::Result, opts)
+        {
+            return outcome;
+        }
         self.render_via(&owner, tool_name, result, RenderKind::Result, opts)
             .await
+    }
+
+    /// The component tier of a tool renderer: a NATIVE owner that answers
+    /// [`crate::NativeExtension::render_call_tree`] / `render_result_tree` with a tree. `None` means
+    /// "no tree", and the JSON hooks are tried next — upstream's `Component | undefined`.
+    ///
+    /// A panicking renderer is contained exactly as [`Self::render_via`] contains one, and reported
+    /// as [`RenderOutcome::Failed`] so the surface decides how to degrade.
+    fn native_tool_tree(
+        &self,
+        owner: &ExtensionId,
+        key: &str,
+        payload: &Value,
+        kind: RenderKind,
+        opts: &RenderOptions,
+    ) -> Option<RenderOutcome> {
+        let native = self
+            .native
+            .read()
+            .ok()
+            .and_then(|g| g.get(owner).cloned())?;
+        let drawn = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match kind {
+            RenderKind::Result => native.render_result_tree(key, payload, opts),
+            RenderKind::Call | RenderKind::Entry => native.render_call_tree(key, payload, opts),
+        }));
+        match drawn {
+            Ok(Some(tree)) => Some(RenderOutcome::Tree(tree)),
+            Ok(None) => None,
+            Err(panic) => {
+                let message = native_panic_msg(panic);
+                tracing::warn!(
+                    extension = %owner, key = %key, error = %message,
+                    "native tool tree renderer panicked (contained; the row keeps the built-in shell)"
+                );
+                Some(RenderOutcome::Failed(message))
+            }
+        }
     }
 
     /// Render a CUSTOM MESSAGE through the extension that registered a renderer for `custom_type`
@@ -3086,6 +3133,9 @@ pub enum RenderOutcome {
     /// The renderer handed back a LIVE component, to be re-rendered by the host on every frame at
     /// the current width, theme and expansion. Native-only — see [`crate::RenderedComponent`].
     Live(std::sync::Arc<dyn crate::RenderedComponent>),
+    /// A TOOL renderer handed back a component tree for the host to lay out at the live width — pi
+    /// `renderCall` / `renderResult` returning a `Component`. Native-only, like [`Self::Live`].
+    Tree(std::sync::Arc<dyn crate::RenderedTree>),
 }
 
 impl PartialEq for RenderOutcome {
@@ -3097,6 +3147,7 @@ impl PartialEq for RenderOutcome {
             (Self::Rendered(a), Self::Rendered(b)) => a == b,
             (Self::Failed(a), Self::Failed(b)) => a == b,
             (Self::Live(a), Self::Live(b)) => std::sync::Arc::ptr_eq(a, b),
+            (Self::Tree(a), Self::Tree(b)) => std::sync::Arc::ptr_eq(a, b),
             _ => false,
         }
     }
@@ -3118,7 +3169,7 @@ impl RenderOutcome {
             Self::Rendered(v) => Some(v),
             // A live component is not a `Value` and cannot be collapsed into one; a caller that
             // wants JSON genuinely has none.
-            Self::None | Self::Failed(_) | Self::Live(_) => None,
+            Self::None | Self::Failed(_) | Self::Live(_) | Self::Tree(_) => None,
         }
     }
 

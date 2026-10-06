@@ -314,6 +314,10 @@ pub trait ProxyEnv: Send + Sync {
     /// `syncToolSurface(ctx)` — re-derive direct tools and the `mcp` description after a connect
     /// (dispatch arm 4). A no-op until `HA-1` lands (MCP-193).
     fn sync_tool_surface(&self);
+    /// `activateSearchMatches(matches)` (`index.ts:539`) — load the search-mode tools named by
+    /// `(server, tool)` pairs into the active set, additively. Returns the names that changed
+    /// state; empty when no search-mode tool matched or the host has no tool registry.
+    fn activate_search_matches(&self, matches: &[(String, String)]) -> Vec<String>;
 
     // --- mcp-auth-flow.ts ------------------------------------------------------------------------
     /// `supportsOAuth(definition)`.

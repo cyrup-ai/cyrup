@@ -116,6 +116,10 @@ pub struct McpExtension {
     init_task: Mutex<Option<Arc<InitTask>>>,
     /// `registeredDirectTools` — tool name to fingerprint, surviving re-`init` (MCP-036).
     registered_direct_tools: Mutex<IndexMap<String, String>>,
+    /// `lazyDirectTools` and `deferredToolDefinitions` — the search-mode tools registered by the
+    /// last pass, surviving re-`init`. `mcp({ search })` loads a match only when it is in here, and
+    /// a tool that leaves it is registered again as `hidden`.
+    lazy_direct_tools: Mutex<IndexMap<String, crate::registration::LazyToolRecord>>,
     /// `registeredPromptCommands` — the prompt-command dedup set, surviving re-`init`.
     registered_prompt_commands: Mutex<IndexMap<String, String>>,
     /// `fallbackDeactivatedTools` — tools removed through the `setActiveTools` fallback because
@@ -306,12 +310,40 @@ impl McpExtension {
             .filter(|name| !surface.direct_tool_fingerprints.contains_key(*name))
             .cloned()
             .collect();
+        let previous_lazy: IndexMap<String, crate::registration::LazyToolRecord> = self
+            .lazy_direct_tools
+            .lock()
+            .map(|slot| slot.clone())
+            .unwrap_or_default();
+        // `index.ts:641-648`: a tool that was eager and is now search-mode stays active across its
+        // re-registration, so it is switched off once. The other direction needs nothing here: the
+        // host activates a tool whose exposure changes to `direct` as it activates a new one.
+        let newly_lazy: Vec<String> = surface
+            .lazy_tools
+            .keys()
+            .filter(|name| {
+                sink.known_tools.contains_key(*name) && !previous_lazy.contains_key(*name)
+            })
+            .cloned()
+            .collect();
+        self.hold_back(&newly_lazy);
+        // `deactivateTools` (`index.ts:581-602`): the host cannot unregister a tool, and a
+        // `deferred` one stays callable from codemode while inactive, so a search-mode tool that
+        // went away is registered again as `hidden`.
+        for name in &deactivated {
+            if let Some(record) = previous_lazy.get(name) {
+                self.hide_lazy_tool(record, &config);
+            }
+        }
         self.deactivate_tools(&deactivated);
 
         // ADOPT the new surface, exactly as `init` does: these slots ARE the diff's input next
         // time, so a pass that registers and forgets would re-register everything on every call.
         if let Ok(mut slot) = self.registered_direct_tools.lock() {
             *slot = surface.direct_tool_fingerprints.clone();
+        }
+        if let Ok(mut slot) = self.lazy_direct_tools.lock() {
+            slot.clone_from(&surface.lazy_tools);
         }
         if let Ok(mut slot) = self.registered_prompt_commands.lock() {
             *slot = surface
@@ -342,6 +374,87 @@ impl McpExtension {
             );
         }
         changed > 0
+    }
+
+    /// `activateSearchMatches(matches)` (`index.ts:539-557` @v5.0.0): load the search-mode tools a
+    /// `mcp({ search })` matched, or the one a successful `mcp({ tool })` named, into the active set.
+    ///
+    /// Additive: nothing is ever deactivated here. A match counts only when it is a search-mode tool
+    /// this extension registered for that server, and is not active yet. Returns the names that
+    /// changed state, so the result reports only real additions.
+    ///
+    /// Upstream also records the names in `searchActivatedTools`, which only its pre-0.99 fallback
+    /// (`holdLazyToolsInactive`) reads. A host with the exposure model registers these tools
+    /// inactive on its own, so neither that set nor that fallback exists here.
+    pub fn activate_search_matches(&self, matches: &[(String, String)]) -> Vec<String> {
+        let Some(services) = self.host_services() else {
+            return Vec::new();
+        };
+        let Some(active) = services.active_tools() else {
+            return Vec::new();
+        };
+        let lazy = match self.lazy_direct_tools.lock() {
+            Ok(slot) => slot,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let mut added: Vec<String> = Vec::new();
+        for (server, tool) in matches {
+            let owned = lazy
+                .get(tool)
+                .is_some_and(|record| record.spec.server_name == *server);
+            if !owned || active.contains(tool) || added.contains(tool) {
+                continue;
+            }
+            added.push(tool.clone());
+        }
+        drop(lazy);
+        if !added.is_empty() {
+            let mut next = active;
+            next.extend(added.iter().cloned());
+            services.set_active_tools(&next);
+        }
+        added
+    }
+
+    /// Take `names` out of the active set (`index.ts:644-646`), when they are in it.
+    fn hold_back(&self, names: &[String]) {
+        if names.is_empty() {
+            return;
+        }
+        let Some(services) = self.host_services() else {
+            return;
+        };
+        let Some(active) = services.active_tools() else {
+            return;
+        };
+        let next: Vec<String> = active
+            .iter()
+            .filter(|name| !names.contains(name))
+            .cloned()
+            .collect();
+        if next.len() != active.len() {
+            services.set_active_tools(&next);
+        }
+    }
+
+    /// Register a search-mode tool again as `hidden` (`index.ts:587-592`).
+    fn hide_lazy_tool(&self, record: &crate::registration::LazyToolRecord, config: &McpConfig) {
+        let Some(dispatch) = self.dispatch() else {
+            return;
+        };
+        let Some(registrar) = self.late_registrar.lock().ok().and_then(|g| g.clone()) else {
+            return;
+        };
+        let tool = crate::registration::DirectTool::new(
+            record.spec.clone(),
+            crate::registration::tool_render_kind(config.settings.as_ref()),
+            dispatch,
+            Some(record.deferred.clone()),
+        )
+        .into_hidden();
+        if let Err(e) = registrar.register_tool(Arc::new(tool)) {
+            tracing::warn!(error = %e, "MCP: hiding a removed search-mode tool failed");
+        }
     }
 
     /// `index.ts:186-203` `deactivateTools(toolNames)` — the `setActiveTools` fallback, the ONLY
@@ -436,6 +549,7 @@ impl McpExtension {
             state: Mutex::new(None),
             init_task: Mutex::new(None),
             registered_direct_tools: Mutex::new(IndexMap::new()),
+            lazy_direct_tools: Mutex::new(IndexMap::new()),
             registered_prompt_commands: Mutex::new(IndexMap::new()),
             fallback_deactivated_tools: Mutex::new(Vec::new()),
             proxy_tool_description: Mutex::new(None),
@@ -2181,6 +2295,9 @@ impl NativeExtension for McpExtension {
         if let Ok(mut slot) = self.registered_direct_tools.lock() {
             *slot = surface.direct_tool_fingerprints.clone();
         }
+        if let Ok(mut slot) = self.lazy_direct_tools.lock() {
+            slot.clone_from(&surface.lazy_tools);
+        }
         if let Ok(mut slot) = self.registered_prompt_commands.lock() {
             *slot = surface
                 .prompt_commands
@@ -2779,6 +2896,8 @@ mod tests {
     #[derive(Default)]
     struct RecordingRegistrar {
         tools: Mutex<Vec<String>>,
+        /// The tools as registered, for a test that reads their exposure.
+        kept: Mutex<Vec<Arc<dyn cyrup_core::Tool>>>,
     }
 
     impl RecordingRegistrar {
@@ -2790,6 +2909,7 @@ mod tests {
     impl cyrup_ext::LateRegistrar for RecordingRegistrar {
         fn register_tool(&self, tool: Arc<dyn cyrup_core::Tool>) -> Result<(), ExtError> {
             self.tools.lock().unwrap().push(tool.name().to_string());
+            self.kept.lock().unwrap().push(tool);
             Ok(())
         }
         fn register_command(
@@ -4261,5 +4381,194 @@ done
         ext.set_host_services(Arc::new(FlagServices(None)));
 
         assert_eq!(ext.config_flag_path(), None);
+    }
+
+    // --- MCP-604: search-mode tools ----------------------------------------------------------
+
+    /// A world on disk: `mcp.json` with one server `srv` whose `directTools` is `direct_tools`, and
+    /// an `mcp-cache.json` holding two tools for it (valid for that definition).
+    fn search_world(dir: &Path, direct_tools: Option<serde_json::Value>) -> McpDirs {
+        let mut definition = serde_json::json!({ "command": "x" });
+        if let (Some(value), Some(map)) = (&direct_tools, definition.as_object_mut()) {
+            map.insert("directTools".to_string(), value.clone());
+        }
+        std::fs::write(
+            dir.join("mcp.json"),
+            serde_json::json!({ "mcpServers": { "srv": definition } }).to_string(),
+        )
+        .unwrap();
+        let hash = crate::registration::default_server_hasher(&crate::config::ServerEntry {
+            command: Some("x".to_string()),
+            ..crate::config::ServerEntry::default()
+        })
+        .unwrap();
+        std::fs::write(
+            dir.join("mcp-cache.json"),
+            serde_json::json!({
+                "version": crate::registration::METADATA_CACHE_VERSION,
+                "servers": { "srv": {
+                    "configHash": hash,
+                    "cachedAt": 4_102_444_800_000_u64,
+                    "tools": [{ "name": "one" }, { "name": "two" }],
+                    "resources": []
+                } }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        McpDirs::new(dir.to_path_buf(), dir.to_path_buf())
+    }
+
+    /// `activateSearchMatches` (`index.ts:539-557`): a match loads when it is a search-mode tool
+    /// this extension registered for THAT server and is not active yet; nothing is deactivated; a
+    /// second identical match reports nothing and writes nothing.
+    #[tokio::test]
+    async fn a_search_match_is_loaded_once_and_only_for_the_server_that_owns_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let ext = McpExtension::new(search_world(dir.path(), Some(serde_json::json!("search"))));
+        let mut api = InitApi::new();
+        ext.init(&mut api).await.unwrap();
+        let services = ToolSetServices::with_active(&["read", "srv_two"]);
+        bind_services(&ext, &services);
+
+        let ask = |pairs: &[(&str, &str)]| {
+            let pairs: Vec<(String, String)> = pairs
+                .iter()
+                .map(|(server, tool)| ((*server).to_string(), (*tool).to_string()))
+                .collect();
+            ext.activate_search_matches(&pairs)
+        };
+        // Another server's claim on a name this extension registered for `srv` is not a match.
+        assert!(ask(&[("other", "srv_one")]).is_empty());
+        assert!(
+            services.writes().is_empty(),
+            "a foreign claim writes nothing"
+        );
+
+        let added = ask(&[
+            ("srv", "srv_one"),  // owned, not active: loaded
+            ("srv", "srv_two"),  // owned but already active: not reported
+            ("srv", "srv_nope"), // not a tool of this extension
+            ("srv", "srv_one"),  // repeated in the same call: once
+        ]);
+        assert_eq!(added, vec!["srv_one".to_string()]);
+        assert_eq!(
+            services.writes(),
+            vec![vec![
+                "read".to_string(),
+                "srv_two".to_string(),
+                "srv_one".to_string()
+            ]],
+            "additive: what was active stays, in order"
+        );
+
+        assert!(ask(&[("srv", "srv_one")]).is_empty());
+        assert_eq!(services.writes().len(), 1, "no second write");
+    }
+
+    /// No host registry (`getActiveToolsIfReady()` undefined) loads nothing and writes nothing.
+    #[tokio::test]
+    async fn without_a_tool_registry_a_search_match_loads_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let ext = McpExtension::new(search_world(dir.path(), Some(serde_json::json!("search"))));
+        let mut api = InitApi::new();
+        ext.init(&mut api).await.unwrap();
+        let pairs = vec![("srv".to_string(), "srv_one".to_string())];
+        assert!(
+            ext.activate_search_matches(&pairs).is_empty(),
+            "no host services"
+        );
+        let services = Arc::new(ToolSetServices::default());
+        bind_services(&ext, &services);
+        assert!(
+            ext.activate_search_matches(&pairs).is_empty(),
+            "no active list"
+        );
+        assert!(services.writes().is_empty());
+    }
+
+    /// `index.ts:641-648`: a tool that was eager and is now search-mode stays active across its
+    /// re-registration, so the pass switches it off once. A tool that was search-mode already is
+    /// left alone.
+    #[tokio::test]
+    async fn a_tool_that_turns_search_mode_is_switched_off_across_the_resync() {
+        let dir = tempfile::tempdir().unwrap();
+        let ext = McpExtension::new(search_world(dir.path(), Some(serde_json::json!(true))));
+        let mut api = InitApi::new();
+        ext.init(&mut api).await.unwrap();
+        let registrar = Arc::new(RecordingRegistrar::default());
+        ext.set_late_registrar(Arc::clone(&registrar) as Arc<dyn cyrup_ext::LateRegistrar>);
+        let services = ToolSetServices::with_active(&["read", "srv_one", "srv_two"]);
+        bind_services(&ext, &services);
+
+        // The user flips the server to search mode.
+        search_world(dir.path(), Some(serde_json::json!("search")));
+        assert!(ext.sync_tool_surface());
+
+        let exposures: Vec<(String, cyrup_core::ToolExposure)> = registrar
+            .kept
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|tool| tool.name() != crate::registration::PROXY_TOOL_NAME)
+            .map(|tool| (tool.name().to_string(), tool.exposure()))
+            .collect();
+        assert_eq!(
+            exposures,
+            vec![
+                ("srv_one".to_string(), cyrup_core::ToolExposure::Deferred),
+                ("srv_two".to_string(), cyrup_core::ToolExposure::Deferred),
+            ],
+            "re-registered at the new exposure"
+        );
+        assert_eq!(
+            services.writes(),
+            vec![vec!["read".to_string()]],
+            "both were active as eager tools and are now held back"
+        );
+
+        // A further pass with the mode unchanged writes nothing.
+        let before = services.writes().len();
+        ext.sync_tool_surface();
+        assert_eq!(services.writes().len(), before);
+    }
+
+    /// `deactivateTools` (`index.ts:586-592`): the host cannot unregister a tool, and a `deferred`
+    /// one stays callable from codemode while inactive, so a search-mode tool that went away is
+    /// registered again as `hidden` (and leaves the active set if a search had loaded it).
+    #[tokio::test]
+    async fn a_search_mode_tool_that_went_away_is_registered_again_as_hidden() {
+        let dir = tempfile::tempdir().unwrap();
+        let ext = McpExtension::new(search_world(dir.path(), Some(serde_json::json!("search"))));
+        let mut api = InitApi::new();
+        ext.init(&mut api).await.unwrap();
+        let registrar = Arc::new(RecordingRegistrar::default());
+        ext.set_late_registrar(Arc::clone(&registrar) as Arc<dyn cyrup_ext::LateRegistrar>);
+        let services = ToolSetServices::with_active(&["read", "srv_one"]);
+        bind_services(&ext, &services);
+
+        // The server is removed from the config.
+        std::fs::write(dir.path().join("mcp.json"), "{\"mcpServers\":{}}").unwrap();
+        assert!(ext.sync_tool_surface());
+
+        let hidden: Vec<(String, cyrup_core::ToolExposure)> = registrar
+            .kept
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|tool| tool.name() != crate::registration::PROXY_TOOL_NAME)
+            .map(|tool| (tool.name().to_string(), tool.exposure()))
+            .collect();
+        assert_eq!(
+            hidden,
+            vec![
+                ("srv_one".to_string(), cyrup_core::ToolExposure::Hidden),
+                ("srv_two".to_string(), cyrup_core::ToolExposure::Hidden),
+            ]
+        );
+        assert_eq!(services.writes(), vec![vec!["read".to_string()]]);
+        // And it is no longer something a search may load.
+        let pairs = vec![("srv".to_string(), "srv_one".to_string())];
+        assert!(ext.activate_search_matches(&pairs).is_empty());
     }
 }

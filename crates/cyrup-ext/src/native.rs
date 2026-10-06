@@ -50,6 +50,29 @@ pub trait RenderTheme: Send + Sync {
     fn fg(&self, role: &str, text: &str) -> String;
     /// Pi `theme.bold(text)`.
     fn bold(&self, text: &str) -> String;
+
+    /// Pi `keyHint(keybinding, description)` (`keybinding-hints.ts`): the binding's CURRENT key text
+    /// in `dim`, then ` description` in `muted`. `binding` is pi's keybinding id
+    /// (`"app.tools.expand"`). The default has no keymap to resolve against and shows the id.
+    fn key_hint(&self, binding: &str, description: &str) -> String {
+        format!(
+            "{}{}",
+            self.fg("dim", binding),
+            self.fg("muted", &format!(" {description}"))
+        )
+    }
+
+    /// Pi `highlightCode(code, lang)` (`theme.ts`): one SGR-styled string per source line. The
+    /// default is the unstyled lines, which is pi's own fallback when a language has no grammar.
+    fn highlight_code(&self, code: &str, _lang: &str) -> Vec<String> {
+        code.split('\n').map(str::to_string).collect()
+    }
+
+    /// The per-block transform of pi's `getTextOutput` (`render-utils.ts`):
+    /// `sanitizeBinaryOutput(stripAnsi(text)).replace(/\r/g, "")`. The default is the identity.
+    fn display_text(&self, text: &str) -> String {
+        text.to_string()
+    }
 }
 
 /// Which context tier a handler runs in (arch-08 §6.3, the deadlock rule). Session-mutating control
@@ -1100,6 +1123,35 @@ pub trait NativeExtension: Send + Sync {
         _key: &str,
         _payload: &serde_json::Value,
     ) -> Option<std::sync::Arc<dyn RenderedComponent>> {
+        None
+    }
+
+    /// The component form of [`Self::render_call`] for a tool this extension declared a renderer
+    /// for (pi `ToolDefinition.renderCall` returning a `Component`). Consulted BEFORE the JSON
+    /// hooks; `None` falls through to them. Sync, and a PANIC is contained by the host, for the
+    /// same reasons as [`Self::render_call`].
+    ///
+    /// Unlike [`Self::render_live`] the component hands the host a tree
+    /// ([`crate::RenderedTree`]), so the host wraps and truncates styled text at the live width.
+    fn render_call_tree(
+        &self,
+        _key: &str,
+        _call: &serde_json::Value,
+        _opts: &crate::RenderOptions,
+    ) -> Option<std::sync::Arc<dyn crate::RenderedTree>> {
+        None
+    }
+
+    /// The result-side companion of [`Self::render_call_tree`] (pi `renderResult(result, options,
+    /// theme, context)`). `result` is `{content, details}`; `opts` carries `expanded`, `isPartial`
+    /// and `isError`. Called again for every partial result a streaming tool reports, so a list that
+    /// grows while the tool runs is a new component each time.
+    fn render_result_tree(
+        &self,
+        _key: &str,
+        _result: &serde_json::Value,
+        _opts: &crate::RenderOptions,
+    ) -> Option<std::sync::Arc<dyn crate::RenderedTree>> {
         None
     }
 

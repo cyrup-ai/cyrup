@@ -85,6 +85,8 @@ cyrup-config = { workspace = true }
 # A scripted sandbox and a recording host, so the session tests drive the real `codemode` tool.
 cyrup-codemode-runtime = { workspace = true, features = ["testkit"] }
 cyrup-codemode = { workspace = true }
+# The real `tool_search` tool and extension, so the session tests drive deferred loading end to end.
+cyrup-tool-search = { workspace = true }
 cyrup-tools = { workspace = true }
 # Lock-neutral: cyrup-provider is already a dependency; `faux` pulls no new crate.
 cyrup-provider = { workspace = true, features = ["faux"] }

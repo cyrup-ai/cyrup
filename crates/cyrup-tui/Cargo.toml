@@ -143,6 +143,8 @@ cyrup-tools = { workspace = true }
 regex = "1.12.4"
 
 [dev-dependencies]
+# CODE-011: the renderer test drives the REAL `codemode` extension's component through the tool row.
+cyrup-codemode-runtime = { workspace = true }
 cyrup-provider = { workspace = true, features = ["faux"] }
 # Dev-only: lets the streaming-delta render test build the `AgentMessage` carried by
 # `AgentSessionEvent::MessageUpdate` (the runtime payload the TUI ignores but the variant requires).

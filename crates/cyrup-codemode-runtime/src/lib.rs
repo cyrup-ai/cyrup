@@ -9,12 +9,14 @@
 //! | [`types`] | `packages/codemode/src/types.ts` | CODE-002 |
 //! | `sandbox` | `packages/codemode/src/runtime/*` | CODE-002 |
 //! | [`tool`] | `packages/coding-agent/src/extensions/codemode/{tool,execute}.ts` | CODE-007/008/009/010/012 |
+//! | [`renderer`] | `packages/coding-agent/src/extensions/codemode/renderer.ts` | CODE-011 |
 //! | [`extension`] | `packages/coding-agent/src/extensions/codemode/index.ts` | — |
 //! | `testkit` | — | a scripted sandbox and a recording host, behind the `testkit` feature |
 
 #![forbid(unsafe_code)]
 
 pub mod extension;
+pub mod renderer;
 pub mod sandbox;
 #[cfg(any(test, feature = "testkit"))]
 pub mod testkit;

@@ -339,7 +339,8 @@ impl TranscriptView {
     ///
     /// `live.is_partial` is overridden per tool RESULT from the run's own `done` flag, because
     /// upstream's `ToolRenderResultOptions.isPartial` (`types.ts:417`) is a property of the row,
-    /// not of the frame.
+    /// not of the frame — and `live.is_error` from the run's own `is_error`, for the same reason
+    /// (`ToolRenderContext.isError`).
     pub(crate) fn stale_extension_renders(
         &self,
         live: &cyrup_ext::RenderOptions,
@@ -349,25 +350,25 @@ impl TranscriptView {
         // click override when it has one (`setExpanded` on a single component), and `isPartial`
         // taken from the run for a tool RESULT. Built only for a row that carries an extension
         // render, so a long retained document costs one match per entry, not one clone.
-        let want = |expansion: Option<Expansion>, partial: Option<bool>| {
+        let want = |expansion: Option<Expansion>, result: Option<ResultState>| {
             let mut options = live.clone();
             if let Some(e) = expansion {
                 options.expanded = e.is_open();
             }
-            match partial {
-                Some(p) => options.partial(p),
+            match result {
+                Some(state) => options.partial(state.partial).errored(state.error),
                 None => options,
             }
         };
         let consider = |slot: RenderSlot,
                         rendered: Option<&RenderedText>,
                         expansion: Option<Expansion>,
-                        partial: Option<bool>,
+                        result: Option<ResultState>,
                         out: &mut Vec<StaleRender>| {
             let Some(source) = rendered.and_then(RenderedText::source) else {
                 return;
             };
-            let want = want(expansion, partial);
+            let want = want(expansion, result);
             if source.under == want {
                 return;
             }
@@ -416,7 +417,7 @@ impl TranscriptView {
                             result,
                             run.rendered_result.as_ref(),
                             expansion,
-                            Some(!run.done),
+                            Some(ResultState::of(run)),
                             &mut out,
                         );
                     }
@@ -436,7 +437,7 @@ impl TranscriptView {
                 RenderSlot::ActiveToolResult(i),
                 run.rendered_result.as_ref(),
                 run.live_expansion,
-                Some(!run.done),
+                Some(ResultState::of(run)),
                 &mut out,
             );
         }
@@ -557,5 +558,23 @@ impl TranscriptView {
         }
         self.bump_render_generation();
         self.thinking_display = text;
+    }
+}
+
+/// The per-row half of a tool RESULT's render options: what the run, not the frame, decides.
+#[derive(Clone, Copy)]
+struct ResultState {
+    /// `ToolRenderResultOptions.isPartial`.
+    partial: bool,
+    /// `ToolRenderContext.isError`.
+    error: bool,
+}
+
+impl ResultState {
+    fn of(run: &ToolRun) -> Self {
+        Self {
+            partial: !run.done,
+            error: run.is_error,
+        }
     }
 }

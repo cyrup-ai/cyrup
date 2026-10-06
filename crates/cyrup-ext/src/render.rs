@@ -53,6 +53,12 @@ pub struct RenderOptions {
     /// `ToolRenderResultOptions.isPartial` (`types.ts:417` @v0.84.4) — whether the result being
     /// rendered is a partial/streaming one. `false` on the surfaces whose bag does not carry it.
     pub is_partial: bool,
+    /// `ToolRenderContext.isError` (`extensions/types.ts`) — whether the tool call being rendered
+    /// failed. Pi hands it to `renderResult` next to the options bag, not inside it; it rides here
+    /// because this struct is the one value the host re-invokes a renderer under, and it is a
+    /// property of the row exactly as [`Self::is_partial`] is. `false` on every surface that is
+    /// not a finished tool result.
+    pub is_error: bool,
     /// The name of the theme the renderer should draw for — see the CYRUP-DELTA above. `None` when
     /// the caller has no display (an RPC host, a test) and therefore no active theme to name.
     pub theme: Option<String>,
@@ -65,6 +71,7 @@ impl RenderOptions {
             expanded,
             output_pad,
             is_partial: false,
+            is_error: false,
             theme,
         }
     }
@@ -74,6 +81,13 @@ impl RenderOptions {
     #[must_use]
     pub fn partial(mut self, is_partial: bool) -> Self {
         self.is_partial = is_partial;
+        self
+    }
+
+    /// [`Self::partial`]'s sibling for `ToolRenderContext.isError`.
+    #[must_use]
+    pub fn errored(mut self, is_error: bool) -> Self {
+        self.is_error = is_error;
         self
     }
 
@@ -100,11 +114,14 @@ mod tests {
 
     #[test]
     fn the_wire_spelling_is_upstreams() {
-        let opts = RenderOptions::new(true, 2, Some("dark".into())).partial(true);
+        let opts = RenderOptions::new(true, 2, Some("dark".into()))
+            .partial(true)
+            .errored(true);
         let json = opts.to_json();
         assert!(json.contains("\"expanded\":true"), "{json}");
         assert!(json.contains("\"outputPad\":2"), "{json}");
         assert!(json.contains("\"isPartial\":true"), "{json}");
+        assert!(json.contains("\"isError\":true"), "{json}");
         assert!(json.contains("\"theme\":\"dark\""), "{json}");
         assert_eq!(RenderOptions::from_json(&json), opts);
     }

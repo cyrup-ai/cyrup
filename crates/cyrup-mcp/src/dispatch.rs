@@ -413,6 +413,7 @@ mod tests {
             description: "create an issue".to_string(),
             input_schema: None,
             resource_uri: None,
+            lazy: false,
         }
     }
 

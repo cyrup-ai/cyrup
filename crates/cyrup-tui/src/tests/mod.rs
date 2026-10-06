@@ -47,6 +47,7 @@ mod builtin_collision;
 mod cell_size_query;
 mod chrome;
 mod clipboard;
+mod codemode_renderer;
 mod color_mode_assembled;
 mod command_exec;
 mod commands;

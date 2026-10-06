@@ -205,11 +205,21 @@ impl<B: Backend> App<B> {
                     tool_name,
                     Some(tool_call_id.as_str().to_string()),
                     args,
-                    // A tool ROW is a string surface: it has no live-component tier, so the
-                    // outcome is flattened here rather than carried.
+                    // The text tier: a `Rendered::Text` is flattened here. A renderer's COMPONENT
+                    // (`Rendered::Tree`) has no flattened form and is attached below.
                     rendered.clone().into_text(),
                     definition,
                 );
+                // A tool whose renderer returned a COMPONENT (pi `renderCall` → `Component`) keeps it on
+                // the row; it is laid out on every frame, so the expand toggle and a theme switch
+                // reach it without a re-invocation.
+                if let crate::transcript::Rendered::Tree(tree) = &rendered {
+                    self.state.transcript.set_tool_tree(
+                        tool_call_id.as_str(),
+                        crate::transcript::ToolSide::Call,
+                        Some(tree.clone()),
+                    );
+                }
                 if let Some(preview) = preview {
                     self.state
                         .transcript
@@ -225,6 +235,26 @@ impl<B: Backend> App<B> {
                 self.state
                     .transcript
                     .push_tool_update(Some(tool_call_id.as_str()), Some(partial_result));
+                // `updateResult(partial, true)` re-runs `renderResult` with the partial result, and
+                // its component replaces the previous one — which is how a nested-call list grows
+                // while the script runs.
+                match &rendered {
+                    crate::transcript::Rendered::Tree(tree) => {
+                        self.state.transcript.set_tool_tree(
+                            tool_call_id.as_str(),
+                            crate::transcript::ToolSide::Result,
+                            Some(tree.clone()),
+                        );
+                    }
+                    // A text renderer is asked for every partial result too, and its body replaces
+                    // the previous one until the final result's render does.
+                    crate::transcript::Rendered::Text(text) => {
+                        self.state
+                            .transcript
+                            .set_tool_partial_render(tool_call_id.as_str(), text.clone());
+                    }
+                    _ => {}
+                }
             }
             AgentSessionEvent::ToolExecutionEnd {
                 tool_call_id,
@@ -241,6 +271,16 @@ impl<B: Backend> App<B> {
                     is_error,
                     Some(result),
                     rendered.clone().into_text(),
+                );
+                // The final result's component replaces the last partial's; a final render that
+                // draws no component clears it so the partial's list does not outlive the result.
+                self.state.transcript.set_tool_tree(
+                    tool_call_id.as_str(),
+                    crate::transcript::ToolSide::Result,
+                    match &rendered {
+                        crate::transcript::Rendered::Tree(tree) => Some(tree.clone()),
+                        _ => None,
+                    },
                 );
                 // Progressively flush finished tools to native scrollback mid-turn so the inline
                 // viewport holds only the running tail, not the whole turn's tool stack (the

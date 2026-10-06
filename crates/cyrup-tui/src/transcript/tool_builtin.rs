@@ -601,19 +601,11 @@ pub(super) fn render_extension_call(call: &str, theme: &UiTheme, out: &mut Vec<L
 /// The RESULT text an extension's registered renderer produced, as the block's body (Pi
 /// `ToolDefinition.renderResult`, `tool-execution.ts:94-101`).
 ///
-/// The `run.done || expanded` gate is cyrup's, not Pi's — upstream runs `renderResult` whenever
-/// `this.result` is set (`:296`) and lets the renderer decide. It is kept because it is vacuous
-/// here rather than out of divergence: [`TranscriptView::push_tool_end_rendered`] is the only
-/// writer of `rendered_result` and it sets `done` in the same breath, so the gate can never be the
-/// reason a body is missing.
-pub(super) fn render_extension_result(
-    result: &str,
-    run: &ToolRun,
-    expanded: bool,
-    theme: &UiTheme,
-    out: &mut Vec<Line<'static>>,
-) {
-    if (run.done || expanded) && !result.trim().is_empty() {
+/// Drawn whenever the run has a rendered result, partial or final: upstream runs `renderResult`
+/// whenever `this.result` is set (`:296`) and lets the renderer decide, and
+/// [`TranscriptView::set_tool_partial_render`] files each partial render here while the tool runs.
+pub(super) fn render_extension_result(result: &str, theme: &UiTheme, out: &mut Vec<Line<'static>>) {
+    if !result.trim().is_empty() {
         for l in result.split('\n') {
             out.push(Line::styled(
                 normalize_terminal_output(l).into_owned(),
