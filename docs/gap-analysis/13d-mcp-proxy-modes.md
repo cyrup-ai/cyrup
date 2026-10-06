@@ -70,7 +70,7 @@ upstream conformance cases that transfer verbatim.
 > **Numbering and provenance.** `MCP-587`…`MCP-608` were filed by this pass across `13` and
 > `13a`–`13i`; the allocation, the window census and the canonical status row for each id are in
 > [`13-cyrup-mcp-STATUS.md`](13-cyrup-mcp-STATUS.md) §*Fourth pass — 2026-10-02* (**Table F**).
-> **Next free id: `MCP-615`.** (It was `MCP-612` until 2026-10-06, when `MCP-612`–`MCP-614` were filed by the `MCP-604` closure: `MCP-612` and `MCP-614` in `13e`, `MCP-613` in `13h`. Before that it was `MCP-609` until 2026-10-03, when `MCP-609`–`MCP-611` were filed
+> **Next free id: `MCP-616`.** (It was `MCP-612` until 2026-10-06, when `MCP-615` was filed from the same branch's test run, and before that when `MCP-612`–`MCP-614` were filed by the `MCP-604` closure: `MCP-612` and `MCP-614` in `13e`, `MCP-613` in `13h`. Before that it was `MCP-609` until 2026-10-03, when `MCP-609`–`MCP-611` were filed
 > from the post-pin triage: `MCP-609` in `13e`, `MCP-610` in `13d`, `MCP-611` in `13h`.)
 > Upstream was read only through
 > `git -C tmp/pi-mcp-adapter show v5.0.0:<path>` and `git diff v2.38.0..v5.0.0 -- <path>`, plus

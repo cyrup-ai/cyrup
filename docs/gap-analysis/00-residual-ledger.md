@@ -16,7 +16,7 @@ next work item**.
 > Area 04: `TOOL-052`, `TOOL-053` closed (5 → 3 open). Area 07: `TUI-165`, `TUI-166` filed (23 → 25 open
 > against the 2026-10-05 block's count; the other movement from that block is #187 and #189 landing underneath).
 > Area 13 is counted in its own file: `MCP-561` and `MCP-604` closed; `MCP-612`, `-613`, `-614` filed
-> (`13-cyrup-mcp-STATUS.md`, 551 rows: 349 implemented, 70 partial, 98 missing, 34 not-applicable).
+> (`13-cyrup-mcp-STATUS.md`, 552 rows: 349 implemented, 70 partial, 99 missing, 34 not-applicable).
 >
 > ## Closed
 >
@@ -28,7 +28,7 @@ next work item**.
 >
 > `CODE-014` (system-prompt `sections` rows), `CODE-015` (guest `prepare_loadout`), `CODE-016` (guest nested-call
 > gaps), `CODE-017` (`annotations`), `MCP-612` (server `description`, cached `outputSchema`), `MCP-613` (panel
-> cannot write `"search"`), `MCP-614` (no live-server test), `TUI-165` (call args do not stream into registered
+> cannot write `"search"`), `MCP-614` (no live-server test), `MCP-615` (a racy `cyrup-mcp` test, seen failing once under workspace load), `TUI-165` (call args do not stream into registered
 > renderers), `TUI-166` (result-image ordering, unmeasured).
 >
 > ## Corrections made in place
