@@ -39,11 +39,19 @@ pub struct CompactionPreparation {
 /// `getMessageFromEntryForCompaction` (`compaction.ts:80-85`):
 /// `sessionEntryToContextMessages(entry)[0]`, with `compaction` entries excluded (a previous
 /// compaction's summary reaches the model through `previousSummary`, not the transcript).
+///
+/// A system message is never summarized (pi `getMessagesFromProjectedEntryForCompaction`,
+/// `compaction.ts:98-102` @v1.0.1: "System messages are prompt state, not conversation; the
+/// compaction entry carries their replay"). The loadout a compaction drops from the context is
+/// restored from the compaction entry's own `systemMessage`.
 pub(crate) fn message_for_compaction(entry: &Entry) -> Option<AgentMessage> {
     if matches!(entry, Entry::Known(KnownEntry::Compaction { .. })) {
         return None;
     }
-    raw_context_messages(entry).into_iter().next()
+    raw_context_messages(entry)
+        .into_iter()
+        .next()
+        .filter(|message| !matches!(message, AgentMessage::Core(cyrup_core::Message::System(_))))
 }
 
 /// Project a slice of entries to their raw `AgentMessage` form (drops entries that contribute none).

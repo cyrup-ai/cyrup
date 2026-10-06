@@ -23,6 +23,7 @@ mod accessors;
 mod adapters;
 mod auto_compaction;
 mod bash;
+mod codemode;
 mod commands;
 mod compaction;
 mod control;
@@ -32,6 +33,7 @@ mod inject;
 mod lifecycle;
 mod model;
 pub(crate) mod model_runtime;
+mod nested;
 mod queue;
 mod retry;
 mod run;
@@ -42,6 +44,8 @@ mod transcript;
 mod types;
 
 // The seam surface `lib.rs` re-exports (`pub use session::{...}`) — same names, same paths.
+pub(crate) use codemode::CodemodeSettings;
+pub use codemode::SessionCodemodeHost;
 pub use files::{delete_session_file_at, rename_session_file_at};
 pub use types::{
     BindOptions, CompactionCostKind, DeleteMethod, ForkAnchor, ForkOutcome, ForkPosition,
@@ -120,6 +124,18 @@ pub(crate) struct SessionExtras {
     /// the NEXT command sees the new values without a rebuild
     /// (Pi docs/environment-variables.md:27).
     pub bash_session_env: cyrup_tools::config::SessionEnvHandle,
+    /// The calls tools make while they run (CODE-006). The SAME runner the persist+fan-out
+    /// subscriber was built with: the session produces records through
+    /// [`AgentSession::execute_nested_tool`], the subscriber stamps them onto the tool result.
+    pub nested_calls: Arc<cyrup_agent::NestedToolCallRunner>,
+    /// The hooks the agent was built with — what a nested call runs through, so a call a tool
+    /// makes meets the same permission policy and extension chain as one the model made
+    /// (CODE-006; pi passes `this._beforeToolCall` / `this._afterToolCall` to `runToolCall`,
+    /// `agent-session.ts:719-733` @v1.0.1).
+    pub hooks: Arc<dyn cyrup_agent::Hooks>,
+    /// The host the `codemode` tool acts through, when the builder was given a codemode extension
+    /// (`SessionBuilder::with_codemode`). [`AgentSession::into_shared`] attaches the session to it.
+    pub codemode_host: Option<Arc<SessionCodemodeHost>>,
     /// `read`'s view of whether the ACTIVE model accepts image input, re-pushed on every `/model`
     /// switch so the tool's non-vision warning tracks the live model rather than the startup one.
     pub read_model_vision: cyrup_tools::config::ModelVisionHandle,
@@ -300,6 +316,14 @@ pub struct AgentSession {
     /// Shared (`Arc`) with [`crate::host_services::LiveHostServices`] so a live wasm guest's
     /// `setActiveTools`/`getActiveTools` and the host/CLI tool-toggle read+mutate the SAME state.
     dynamic_tools: Arc<Mutex<DynamicToolState>>,
+    // ---- nested tool calls (Pi `_nestedToolCalls`, agent-session.ts:699-740; CODE-006) ----
+    /// What a call a tool makes while it runs needs: the runner (scopes, the exclusive queue, the
+    /// per-call records), the hooks the agent runs with, the callable tools and the event sinks.
+    /// Also the [`cyrup_ext::NestedToolRunner`] the extension host holds (weakly), which is how an
+    /// extension tool's `ctx.executeTool` reaches [`Self::execute_nested_tool`].
+    nested: Arc<nested::SessionNested>,
+    /// The host the `codemode` tool acts through, if the builder was given a codemode extension.
+    codemode_host: Option<Arc<SessionCodemodeHost>>,
     // ---- post-run execution loop (Pi `_runAgentPrompt`/`_handlePostAgentRun`,
     //      agent-session.ts:973-1022; the assembled-run driver) ----
     /// Weak self-reference, bound by [`Self::into_shared`]; shared with the persist+fan-out
@@ -400,6 +424,20 @@ impl AgentSession {
         let (driver_tx_init, driver_keepalive) = tokio::sync::watch::channel(false);
         // EXT-087 — see `settled_drain_tx`.
         let (settled_drain_init, settled_drain_keepalive) = tokio::sync::watch::channel(false);
+        let nested = Arc::new(nested::SessionNested::new(
+            Arc::clone(&agent),
+            extras.nested_calls,
+            extras.hooks,
+            Arc::clone(&extras.dynamic_tools),
+            Arc::clone(&services.ext_host),
+            Arc::clone(&fanout),
+            session_cancel.clone(),
+        ));
+        // pi binds `executeTool` / `getCallableTools` into the extension runner
+        // (`agent-session.ts:3420-3421`); the host keeps a `Weak`, so it never outlives the session.
+        services
+            .ext_host
+            .set_nested_tool_runner(&(Arc::clone(&nested) as Arc<dyn cyrup_ext::NestedToolRunner>));
         Self {
             agent,
             manager,
@@ -448,6 +486,8 @@ impl AgentSession {
             bash_session_env: extras.bash_session_env,
             read_model_vision: extras.read_model_vision,
             dynamic_tools: extras.dynamic_tools,
+            nested,
+            codemode_host: extras.codemode_host,
             handle: extras.handle,
             last_assistant: Mutex::new(None),
             driver_tx: driver_tx_init,
@@ -496,6 +536,12 @@ impl AgentSession {
         let handle = self.handle.clone();
         let arc = Arc::new(self);
         let _ = handle.weak.set(Arc::downgrade(&arc));
+        // The `codemode` tool acts through the session it runs in: nested calls, the branch its
+        // `store()` replays over, and the model registry behind `models`. Weak, so the host (which
+        // the extension's slot keeps alive) never keeps the session alive.
+        if let Some(host) = &arc.codemode_host {
+            host.attach(Arc::downgrade(&arc));
+        }
         // Bind the message-injection seam (R-SA-101 / P-2): a background task calling
         // `LiveHostServices::inject_message`/`inject_message_ack` (e.g. cyrup-ext-subagents'
         // completion sink, or a native extension holding the P-1 host-services Arc) reaches THIS

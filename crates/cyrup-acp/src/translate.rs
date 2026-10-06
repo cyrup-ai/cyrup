@@ -449,6 +449,19 @@ pub fn translate(
         | AgentSessionEvent::EntryAppended { .. }
         | AgentSessionEvent::SessionStart { .. }
         | AgentSessionEvent::SessionShutdown { .. } => Translated::nothing(TurnSignal::Ignored),
+
+        // * `NestedToolExecution*` (CODE-006) — the `tool_execution_*` events of a call a TOOL made
+        //   while it ran (`ctx.executeTool`). A client is shown the model-issued call, which is the
+        //   only one the model, the transcript and the permission prompts know by id; a nested call
+        //   is that call's own business and is recorded on its result (`nestedCalls`). Surfacing
+        //   each as a top-level tool call would put calls the model never made in the client's
+        //   list — pi's own interactive mode drops them for the same reason
+        //   (`interactive-mode.ts:3558-3559` @v1.0.1). pi-acp has no case for them either.
+        AgentSessionEvent::NestedToolExecutionStart { .. }
+        | AgentSessionEvent::NestedToolExecutionUpdate { .. }
+        | AgentSessionEvent::NestedToolExecutionEnd { .. } => {
+            Translated::nothing(TurnSignal::Ignored)
+        }
     }
 }
 

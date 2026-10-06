@@ -191,6 +191,45 @@ impl AgentSession {
         self.push_active_tools(loadout, prompt).await;
     }
 
+    /// Restore the loadout the session's transcript now declares (pi `_restoreToolsFromTranscript`,
+    /// `agent-session.ts:1762-1769` @v1.0.1), after `/tree` navigation has changed which branch the
+    /// transcript is. `context` is the navigated branch's raw projection.
+    ///
+    /// The restored names replace the active set and stay pending until a tool of that name
+    /// registers. A branch whose transcript declares nothing leaves the loadout as it is.
+    pub(super) async fn restore_tools_from_transcript(
+        &self,
+        context: &[cyrup_session::AgentMessage],
+    ) {
+        let declared = crate::tools::declared_tool_names(context).map(|names| {
+            names
+                .into_iter()
+                .filter(|name| {
+                    crate::tools::is_allowed_tool(
+                        self.services.allowed_tool_names.as_ref(),
+                        &self.services.excluded_tool_names,
+                        name,
+                    )
+                })
+                .collect::<Vec<String>>()
+        });
+        let push = {
+            let mut tools = Self::lock(&self.dynamic_tools);
+            tools.clear_pending();
+            declared.map(|names| tools.restore_declared(&names))
+        };
+        if let Some((loadout, prompt)) = push {
+            self.push_active_tools(loadout, prompt).await;
+        }
+    }
+
+    /// A run starts: the restored tools that did not register by now are dropped, so a tool that
+    /// never registers does not stay pending (pi `_runAgentPrompt`, `agent-session.ts:1778-1782`
+    /// @v1.0.1).
+    pub(super) fn clear_pending_tools(&self) {
+        Self::lock(&self.dynamic_tools).clear_pending();
+    }
+
     /// Register additional custom tools into the enable-able registry (Pi `customTools`, sdk.ts:71,384).
     ///
     /// Each tool goes through [`cyrup_ext::ExtensionHost::wrap_tool`] first, exactly as the

@@ -11,7 +11,7 @@ use cyrup_agent::{
     AfterOutcome, AfterToolCall, AgentMessage, BeforeOutcome, BeforeToolCall, HookError, Hooks,
     PostTurn, PrepareRequestCtx, RequestUpdate, TurnDecision, TurnUpdate,
 };
-use cyrup_core::{CancelToken, Message, TerminateHint};
+use cyrup_core::{CancelToken, Message, TerminateHint, ToolCallId};
 use cyrup_tools::{PermissionPolicy, PolicyDecision};
 
 /// The placeholder text Pi substitutes for a blocked image (sdk.ts:270).
@@ -59,6 +59,9 @@ pub(crate) fn coding_agent_convert_to_llm(msgs: &[Arc<AgentMessage>]) -> Vec<Mes
                 usage: t.usage.clone(),
                 added_tool_names: t.added_tool_names.clone(),
                 timestamp: t.timestamp,
+                // The agent's own result message carries no record; it is stamped on the persisted
+                // row, and `nestedCalls` is never sent to the model.
+                nested_calls: None,
             }),
             // pi's `case "custom"` (`messages.ts:162-168` @v0.83.0): `kind` is the extension's
             // `customType` and `payload` is pi's `content`. Nothing else ever lands here — a `!`
@@ -179,6 +182,7 @@ impl Hooks for PolicyHooks {
                     usage,
                     added_tool_names,
                     timestamp,
+                    nested_calls,
                 } if content.iter().any(is_image) => Message::ToolResult {
                     tool_call_id,
                     tool_name,
@@ -190,6 +194,7 @@ impl Hooks for PolicyHooks {
                     usage,
                     added_tool_names,
                     timestamp,
+                    nested_calls,
                 },
                 other => other,
             })
@@ -209,37 +214,33 @@ impl Hooks for PolicyHooks {
         ctx: BeforeToolCall<'_>,
         cancel: CancelToken,
     ) -> BeforeOutcome {
-        // 1. Opt-in permission policy (empty policy ⇒ always Proceed, the YOLO default R-12-001).
-        match self.policy.evaluate(ctx.tool_name, ctx.args) {
-            PolicyDecision::Proceed => {}
-            PolicyDecision::Mutate { input } => *ctx.args = input,
-            // AGENT-022 `terminate: false` — a POLICY block is not pi's "stop after this batch"
-            // hint; that flag belongs to an extension's `BeforeToolCallResult.terminate`
-            // (`packages/agent/src/types.ts:61-69` @v0.84.1) and the permission gate never sets it.
-            PolicyDecision::Block { reason } => {
-                return BeforeOutcome::Block {
-                    reason: Some(reason),
-                    terminate: TerminateHint::Unspecified,
-                };
-            }
-            PolicyDecision::Confirm { reason } => {
-                if !self.has_ui {
-                    // No UI to prompt: block-by-default (R-12-009).
-                    return BeforeOutcome::Block {
-                        reason: Some(reason),
-                        terminate: TerminateHint::Unspecified,
-                    };
-                }
-                // With UI the front-end resolves confirmation; absent a wired confirm hook we
-                // proceed (the interactive front-end owns the prompt — arch-10/12).
-            }
-        }
-        // 2. Extension mutating seam (may further block / rewrite the — possibly mutated — args).
-        self.inner.before_tool_call(ctx, cancel).await
+        self.before(None, ctx, cancel).await
+    }
+
+    /// A call another tool made goes through the SAME permission policy and the extension seam as
+    /// a model-issued one (pi `_beforeToolCall(context, parentToolCallId)`,
+    /// `agent-session.ts:629-650` @v1.0.1) — the only difference is that the extension chain is
+    /// told the parent.
+    async fn before_nested_tool_call(
+        &self,
+        parent: &ToolCallId,
+        ctx: BeforeToolCall<'_>,
+        cancel: CancelToken,
+    ) -> BeforeOutcome {
+        self.before(Some(parent), ctx, cancel).await
     }
 
     async fn after_tool_call(&self, ctx: AfterToolCall<'_>, cancel: CancelToken) -> AfterOutcome {
         self.inner.after_tool_call(ctx, cancel).await
+    }
+
+    async fn after_nested_tool_call(
+        &self,
+        parent: &ToolCallId,
+        ctx: AfterToolCall<'_>,
+        cancel: CancelToken,
+    ) -> AfterOutcome {
+        self.inner.after_nested_tool_call(parent, ctx, cancel).await
     }
 
     /// Pi `_installAgentNextTurnRefresh` (agent-session.ts:519-540): run whatever
@@ -343,6 +344,52 @@ impl Hooks for PolicyHooks {
         cancel: CancelToken,
     ) -> Result<Option<RequestUpdate>, HookError> {
         self.inner.prepare_request(ctx, cancel).await
+    }
+}
+
+impl PolicyHooks {
+    /// `before_tool_call` / `before_nested_tool_call`: the permission policy first, then the
+    /// extension chain — one body for both, so a nested call cannot be judged by a different gate.
+    async fn before(
+        &self,
+        parent: Option<&ToolCallId>,
+        ctx: BeforeToolCall<'_>,
+        cancel: CancelToken,
+    ) -> BeforeOutcome {
+        // 1. Opt-in permission policy (empty policy ⇒ always Proceed, the YOLO default R-12-001).
+        match self.policy.evaluate(ctx.tool_name, ctx.args) {
+            PolicyDecision::Proceed => {}
+            PolicyDecision::Mutate { input } => *ctx.args = input,
+            // AGENT-022 `terminate: false` — a POLICY block is not pi's "stop after this batch"
+            // hint; that flag belongs to an extension's `BeforeToolCallResult.terminate`
+            // (`packages/agent/src/types.ts:61-69` @v0.84.1) and the permission gate never sets it.
+            PolicyDecision::Block { reason } => {
+                return BeforeOutcome::Block {
+                    reason: Some(reason),
+                    terminate: TerminateHint::Unspecified,
+                };
+            }
+            PolicyDecision::Confirm { reason } => {
+                if !self.has_ui {
+                    // No UI to prompt: block-by-default (R-12-009).
+                    return BeforeOutcome::Block {
+                        reason: Some(reason),
+                        terminate: TerminateHint::Unspecified,
+                    };
+                }
+                // With UI the front-end resolves confirmation; absent a wired confirm hook we
+                // proceed (the interactive front-end owns the prompt — arch-10/12).
+            }
+        }
+        // 2. Extension mutating seam (may further block / rewrite the — possibly mutated — args).
+        match parent {
+            Some(parent) => {
+                self.inner
+                    .before_nested_tool_call(parent, ctx, cancel)
+                    .await
+            }
+            None => self.inner.before_tool_call(ctx, cancel).await,
+        }
     }
 }
 

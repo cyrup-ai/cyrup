@@ -122,6 +122,7 @@ async fn run(mode: Mode, hooks: &dyn Hooks) -> ToolCallOutcome {
             hooks,
             cancel: None,
             on_update: None,
+            parent_tool_call_id: None,
         },
     )
     .await

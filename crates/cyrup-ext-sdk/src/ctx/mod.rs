@@ -55,6 +55,8 @@
 //! - `command` — `control`: [`CommandCtx`].
 //! - `with_session` — the guest-side `withSession` callback registry + [`ReplacedSessionContext`].
 //! - `tool_call` — `host-tool`: [`Signal`] and [`ToolCall`].
+//! - `nested_call` — `host-tool.execute-tool` / `callable-tools`: [`ToolCall::execute_tool`] and
+//!   [`ToolCall::tools`], pi's `ctx.executeTool` / `ctx.tools`.
 //! - `bash_call` — `host-bash`: [`BashCommand`], the one command a guest bash backend runs.
 //!
 //! Because those modules are private, rustdoc does not visit them on a default
@@ -76,6 +78,7 @@ mod exec;
 mod fs;
 mod http;
 mod models;
+mod nested_call;
 mod proc;
 mod session;
 mod tool_call;
@@ -89,6 +92,10 @@ pub use command::CommandCtx;
 pub use exec::ExecResult;
 pub use http::{HttpRequest, HttpResponse, HttpStreamResponse};
 pub use models::Models;
+pub use nested_call::{
+    CallableTool, ExecuteToolOptions, NestedCallError, ToolNamespaceInfo, ToolOutcome,
+    ToolOutcomeResult,
+};
 pub use proc::ProcSpawnOptions;
 pub use session::Session;
 pub use tool_call::{Signal, ToolCall};

@@ -21,6 +21,7 @@ fn function_response_uses_output_and_error_keys() {
                 timestamp: 0,
                 usage: None,
                 added_tool_names: Vec::new(),
+                nested_calls: None,
             },
         ],
         tools: Vec::new(),
@@ -68,6 +69,7 @@ fn gemini3_echoes_tool_call_ids() {
             timestamp: 0,
             usage: None,
             added_tool_names: Vec::new(),
+            nested_calls: None,
         }],
         tools: Vec::new(),
     };
@@ -102,6 +104,7 @@ fn drift048_tool_call_id_follows_the_target_model_not_the_source_message() {
             usage: None,
             added_tool_names: Vec::new(),
             timestamp: 2,
+            nested_calls: None,
         });
         let contents = convert_messages(&model, &ctx);
         let calls = model_turn_parts(&contents);

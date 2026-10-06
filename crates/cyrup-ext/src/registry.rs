@@ -4,6 +4,7 @@
 
 use crate::error::ExtError;
 use crate::provider::{ModelRegistrySink, ProviderHub, ProviderRegistration};
+use crate::replaceable::{ClaimKind, Judgement, OmittedExtension, Replaceables, judge};
 use cyrup_core::{ExecMode, ExtensionId, Tool};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -524,11 +525,85 @@ struct RegistryInner {
     /// one on a real change (`notifyBranchChange`, `:197-199`); a `Vec` reproduces the `Set.add`
     /// idempotence and fixes the order, and `unsubscribe` is upstream's `Set.delete`.
     branch_change_subscribers: Vec<ExtensionId>,
+    /// Which extensions are replaceable built-ins and which of them were left out (pi
+    /// `omitReplacedExtensions`, `core/resource-loader.ts:116-153` @v1.0.1). See
+    /// [`crate::replaceable`].
+    replaceables: Replaceables,
+}
+
+/// What [`ExtensionRegistry::claim`] decided about one registration.
+struct Claim {
+    /// Whether the registration goes on to the ordinary first-wins rule. `false` when the claimant
+    /// was left out (or already had been).
+    proceed: bool,
 }
 
 impl ExtensionRegistry {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Declare `owner` a replaceable built-in (pi `InlineExtension.replaceable`,
+    /// `core/extensions/types.ts:2018-2024` @v1.0.1). Called before the extension's first
+    /// registration, so every name it registers is judged against the other extensions.
+    pub fn mark_replaceable(&self, owner: ExtensionId) -> Result<(), ExtError> {
+        self.lock_write()?.replaceables.mark(owner);
+        Ok(())
+    }
+
+    /// Whether `owner` was left out because another extension registered a name it registered.
+    pub fn is_omitted(&self, owner: &ExtensionId) -> Result<bool, ExtError> {
+        Ok(self.lock_read()?.replaceables.is_omitted(owner))
+    }
+
+    /// Every replaceable extension left out so far, in the order it happened.
+    pub fn omitted_extensions(&self) -> Result<Vec<OmittedExtension>, ExtError> {
+        Ok(self.lock_read()?.replaceables.omitted().to_vec())
+    }
+
+    /// The extensions left out since the last call, which the host still has to drop from what the
+    /// registry does not hold: event handlers, bus subscriptions, the id reservation.
+    pub fn take_pending_unload(&self) -> Result<Vec<ExtensionId>, ExtError> {
+        Ok(self.lock_write()?.replaceables.take_pending_unload())
+    }
+
+    /// Forget `owner`'s replaceable standing after its load failed.
+    pub fn forget_replaceable(&self, owner: &ExtensionId) -> Result<(), ExtError> {
+        self.lock_write()?.replaceables.forget(owner);
+        Ok(())
+    }
+
+    /// Judge `owner`'s claim on `name` against the OTHER extensions that hold it
+    /// ([`crate::replaceable`]). Leaving an extension out purges everything it registered.
+    fn claim(
+        &self,
+        g: &mut RegistryInner,
+        owner: &ExtensionId,
+        kind: ClaimKind,
+        name: &str,
+        holders: Vec<ExtensionId>,
+    ) -> Claim {
+        if g.replaceables.is_omitted(owner) {
+            return Claim { proceed: false };
+        }
+        match judge(g.replaceables.replaceable(), owner, &holders) {
+            Judgement::Ordinary => Claim { proceed: true },
+            Judgement::ClaimantLeftOut { by } => {
+                g.replaceables.omit(owner.clone(), kind, name, by);
+                Self::purge_in(g, owner);
+                self.mark_tools_dirty();
+                Claim { proceed: false }
+            }
+            Judgement::HoldersLeftOut(left_out) => {
+                for holder in left_out {
+                    g.replaceables
+                        .omit(holder.clone(), kind, name, owner.clone());
+                    Self::purge_in(g, &holder);
+                }
+                self.mark_tools_dirty();
+                Claim { proceed: true }
+            }
+        }
     }
 
     /// Register an extension tool. A `PoisonError` degrades to a surfaced error, never a panic
@@ -582,6 +657,16 @@ impl ExtensionRegistry {
         let name = tool.name().to_string();
         require_object_schema(&owner, &name, tool.parameters())?;
         let mut g = self.lock_write()?;
+        let holders = Self::tool_owner_in(&g, &name)
+            .filter(|existing| *existing != owner)
+            .into_iter()
+            .collect();
+        if !self
+            .claim(&mut g, &owner, ClaimKind::Tool, &name, holders)
+            .proceed
+        {
+            return Ok(());
+        }
         if let Some(existing) = Self::tool_owner_in(&g, &name)
             && existing != owner
         {
@@ -668,6 +753,16 @@ impl ExtensionRegistry {
         require_object_schema(&owner, &desc.name, &desc.parameters)?;
         let name = desc.name.clone();
         let mut g = self.lock_write()?;
+        let holders = Self::tool_owner_in(&g, &name)
+            .filter(|existing| *existing != owner)
+            .into_iter()
+            .collect();
+        if !self
+            .claim(&mut g, &owner, ClaimKind::Tool, &name, holders)
+            .proceed
+        {
+            return Ok(());
+        }
         if let Some(existing) = Self::tool_owner_in(&g, &name)
             && existing != owner
         {
@@ -1061,6 +1156,18 @@ impl ExtensionRegistry {
     ) -> Result<(), ExtError> {
         let name = name.into();
         let mut g = self.lock_write()?;
+        let mut holders: Vec<ExtensionId> = Vec::new();
+        for (other, command, _) in &g.command_order {
+            if *command == name && *other != owner && !holders.contains(other) {
+                holders.push(other.clone());
+            }
+        }
+        if !self
+            .claim(&mut g, &owner, ClaimKind::Command, &name, holders)
+            .proceed
+        {
+            return Ok(());
+        }
         g.commands
             .insert(name.clone(), (owner.clone(), desc.clone()));
         if let Some(slot) = g
@@ -1500,6 +1607,18 @@ impl ExtensionRegistry {
     /// the host's reserved-id set (`ExtensionHost::release_id`).
     pub fn purge_owner(&self, owner: &ExtensionId) -> Result<usize, ExtError> {
         let mut g = self.lock_write()?;
+        let dropped = Self::purge_in(&mut g, owner);
+        drop(g);
+        // The descriptors this owner contributed are gone, so the materialized guest-tool set is
+        // stale. Without this the dirty flag would keep re-arming for a dead owner's descriptors
+        // (`ExtensionHost::refresh_tools`).
+        self.mark_tools_dirty();
+        Ok(dropped)
+    }
+
+    /// [`Self::purge_owner`] over a registry already locked, so a registration can leave a
+    /// replaceable extension out in the same critical section that found the overlap.
+    fn purge_in(g: &mut RegistryInner, owner: &ExtensionId) -> usize {
         let mut dropped = 0usize;
 
         // --- tools (host `Arc<dyn Tool>`) ---
@@ -1618,12 +1737,7 @@ impl ExtensionRegistry {
         );
         retain_not_owner!(conflicts, |c: &ExtensionConflict| &c.path != owner);
 
-        drop(g);
-        // The descriptors this owner contributed are gone, so the materialized guest-tool set is
-        // stale. Without this the dirty flag would keep re-arming for a dead owner's descriptors
-        // (`ExtensionHost::refresh_tools`).
-        self.mark_tools_dirty();
-        Ok(dropped)
+        dropped
     }
 
     pub fn unregister_provider(&self, id: &str) -> Result<bool, ExtError> {
@@ -1695,6 +1809,21 @@ impl ExtensionRegistry {
         let name = name.into();
         require_typed_flag_default(&name, &spec)?;
         let mut g = self.lock_write()?;
+        let mut holders: Vec<ExtensionId> = Vec::new();
+        for declaration in &g.flag_declarations {
+            if declaration.name == name
+                && declaration.extension != owner
+                && !holders.contains(&declaration.extension)
+            {
+                holders.push(declaration.extension.clone());
+            }
+        }
+        if !self
+            .claim(&mut g, &owner, ClaimKind::Flag, &name, holders)
+            .proceed
+        {
+            return Ok(());
+        }
         // The per-extension `extension.flags.set(name, …)` (`loader.ts:307-318` @v0.87.1) happens
         // whatever another extension declared: a conflict is only diagnosed later, across the maps.
         let declaration = ExtensionFlagDeclaration::from_spec(owner.clone(), name.clone(), &spec);

@@ -94,6 +94,11 @@ cyrup-intercom = { workspace = true }
 # construction sites below, matching the sibling extension seams above.
 cyrup-flux = { workspace = true }
 cyrup-llama = { workspace = true }
+# The `codemode` built-in (gap-analysis 18): attached by `attach_native_extensions` next to llama.cpp,
+# in pi's `builtInExtensions` order.
+cyrup-codemode-runtime = { workspace = true }
+# The `tool_search` built-in (TOOL-052): the entry after `codemode` in pi's `builtInExtensions`.
+cyrup-tool-search = { workspace = true }
 # The MCP adapter (gap-analysis 13, the `pi-mcp-adapter` port): registered as a native built-in at
 # all three session construction sites below. Upstream is an INSTALLED PACKAGE present in every
 # session of every mode, so `mcp_extension_for_env` attaches unconditionally and `--no-extensions`

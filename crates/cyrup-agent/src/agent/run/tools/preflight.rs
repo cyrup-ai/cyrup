@@ -88,7 +88,16 @@ pub(crate) async fn prepare_tool_call(
             tool_call: call,
             context: env.context,
         };
-        env.hooks.before_tool_call(ctx, env.hook_cancel()).await
+        match env.parent {
+            // CODE-006 — a call another tool made reaches the hooks through the entry point that
+            // names its parent; a model-issued one through the ordinary one.
+            Some(parent) => {
+                env.hooks
+                    .before_nested_tool_call(parent, ctx, env.hook_cancel())
+                    .await
+            }
+            None => env.hooks.before_tool_call(ctx, env.hook_cancel()).await,
+        }
     };
     match before {
         // Pi's `prepareToolCall` wraps the `beforeToolCall` await in the same try that guards
@@ -182,6 +191,9 @@ pub(crate) fn immediate_error(
         // Pi `createToolResultMessage` stamps every tool result with `Date.now()`
         // (agent-loop.ts:741); this reaches the wire payload via `convert_to_llm`.
         timestamp: now_millis(),
+        // The loop never builds `nestedCalls`: the session assigns it at `message_end`
+        // (`agent-session.ts:1078` @v1.0.1).
+        nested_calls: None,
     };
     // pi's blocked-with-terminate arm assigns `result.terminate = true` only when the hook asked
     // for it; every other error result leaves the key absent. `createErrorToolResult` builds

@@ -185,6 +185,33 @@ pub enum Rendered {
     /// `Entry::BranchSummary` already follow, and what makes a resize re-wrap and an expand toggle
     /// open a card that was pushed collapsed.
     Live(std::sync::Arc<dyn cyrup_ext::RenderedComponent>),
+    /// A TOOL renderer's component tree (pi `renderCall` / `renderResult` returning a `Component`).
+    /// Produced only for the two tool surfaces, drawn by the tool row
+    /// ([`ToolRun::live_call`] / [`ToolRun::live_result`]); a custom message or entry never carries
+    /// one and draws as [`Self::None`] if it somehow did.
+    Tree(std::sync::Arc<dyn cyrup_ext::RenderedTree>),
+}
+
+/// A tool renderer's retained component (pi `callRendererComponent` / `resultRendererComponent`,
+/// `tool-execution.ts`), laid out again on every frame at the live width, theme and expansion.
+///
+/// Equality is identity: a trait object has no other honest one.
+#[derive(Clone, Debug)]
+pub struct LiveTree(pub std::sync::Arc<dyn cyrup_ext::RenderedTree>);
+
+impl PartialEq for LiveTree {
+    fn eq(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+/// Which half of a tool row a [`LiveTree`] draws.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ToolSide {
+    /// `renderCall`.
+    Call,
+    /// `renderResult`.
+    Result,
 }
 
 /// One extension render: the flattened rows, and everything it takes to ASK FOR THEM AGAIN
@@ -318,6 +345,7 @@ impl PartialEq for Rendered {
             (Self::Text(a), Self::Text(b)) => a == b,
             (Self::Failed(a), Self::Failed(b)) => a == b,
             (Self::Live(a), Self::Live(b)) => std::sync::Arc::ptr_eq(a, b),
+            (Self::Tree(a), Self::Tree(b)) => std::sync::Arc::ptr_eq(a, b),
             _ => false,
         }
     }
@@ -332,7 +360,7 @@ impl Rendered {
             Self::Text(t) => Some(t),
             // A live component has no flattened text: it is drawn per frame, not folded once. The
             // message surface must carry the `Rendered` through instead of collapsing it here.
-            Self::None | Self::Failed(_) | Self::Live(_) => None,
+            Self::None | Self::Failed(_) | Self::Live(_) | Self::Tree(_) => None,
         }
     }
 
@@ -394,6 +422,13 @@ pub struct ToolRun {
     /// The RESULT text an extension's registered renderer produced (Pi `renderResult`,
     /// extensions/types.ts:493-498 @v0.84.4). See [`ToolRun::rendered_call`].
     pub rendered_result: Option<RenderedText>,
+    /// The component a native tool renderer returned for the CALL side (pi `renderCall` returning a
+    /// `Component`). Preferred over [`Self::rendered_call`] and the built-in header; laid out per
+    /// frame, so it needs no refresh when the expansion or the theme moves.
+    pub live_call: Option<LiveTree>,
+    /// The component for the RESULT side (pi `renderResult`). Replaced by every partial result a
+    /// streaming tool reports and again by the final one.
+    pub live_result: Option<LiveTree>,
     /// What the session's `getToolDefinition(name)` registry (agent-session.ts:806) answered for
     /// [`name`](ToolRun::name) when the run started: `None` = no definition, `Some(shell)` = a
     /// definition declaring that `renderShell`. Two of Pi's `ToolExecutionComponent` questions

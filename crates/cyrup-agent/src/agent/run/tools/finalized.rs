@@ -52,6 +52,30 @@ pub struct ToolCallOutcome {
     pub is_error: bool,
 }
 
+impl ToolCallOutcome {
+    /// The outcome as pi's `AgentToolCallOutcome` object, `{ toolCall, result, isError }`
+    /// (`packages/agent/src/types.ts:449-453` @v1.0.1) — the value `ctx.executeTool()` resolves to
+    /// for an extension that is not Rust. `result` is the same payload a `tool_execution_end` event
+    /// carries (absent keys omitted, `structuredContent` and the tool's own `isError` included),
+    /// and the top-level `isError` is the normalised verdict ([`Self::is_error`]).
+    pub fn to_wire(&self) -> Value {
+        let result = result_value_of(
+            &self.result.content,
+            &self.result.details,
+            self.result.usage.as_ref(),
+            &self.result.added_tool_names,
+            self.result.terminate,
+            self.result.structured_content.as_ref(),
+            self.result.is_error,
+        );
+        serde_json::json!({
+            "toolCall": serde_json::to_value(&self.tool_call).unwrap_or(Value::Null),
+            "result": result,
+            "isError": self.is_error,
+        })
+    }
+}
+
 impl Finalized {
     /// The only constructor. `source_index` is the position of the answered call in the assistant
     /// message's tool-call list; `result_value` is derived here so it can never disagree with

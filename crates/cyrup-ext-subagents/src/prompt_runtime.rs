@@ -2853,6 +2853,7 @@ impl NativeExtension for SubagentPromptRuntime {
                 HookOutcome::Mutate(EventPatch::ToolResult {
                     content: Some(content),
                     details: None,
+                    structured_content: None,
                     is_error: None,
                     usage: None,
                     terminate: None,
@@ -3294,6 +3295,7 @@ mod tool_budget_runtime_tests {
                 text_signature: None,
             }],
             details: None,
+            structured_content: None,
             is_error: false,
             usage: None,
             terminate: cyrup_core::TerminateHint::Unspecified,
@@ -4634,6 +4636,7 @@ mod tests {
             added_tool_names: Vec::new(),
             is_error: false,
             timestamp: 0,
+            nested_calls: None,
         })
     }
 

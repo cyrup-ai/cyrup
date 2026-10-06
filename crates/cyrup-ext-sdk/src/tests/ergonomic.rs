@@ -1066,6 +1066,133 @@ fn tool_result_patch_carries_usage_and_omits_it_when_absent() {
     assert!(!v.as_object().unwrap().contains_key("usage"));
 }
 
+/// pi `ToolResultEventBase.structuredContent` (`extensions/types.ts:1238` @v1.0.1) lowers to the
+/// export's trailing `structured-content-json`, arg 8; empty is `undefined`, and a JSON `null` is a
+/// value.
+#[test]
+fn tool_result_decodes_the_structured_content_argument() {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    let seen: Rc<RefCell<Vec<Option<serde_json::Value>>>> = Rc::default();
+    let sink = seen.clone();
+    let mut api = ExtensionApi::new();
+    api.on_tool_result(move |ev, _| {
+        sink.borrow_mut().push(ev.structured_content.clone());
+        Outcome::noop()
+    });
+    let head = ["c1", "stats", "{}", "[]", "false", "", "", ""];
+    for structured in [r#"{"files":2}"#, "", "null"] {
+        let mut args = head.to_vec();
+        args.push(structured);
+        api.dispatch(1, &args, &Ctx::new());
+    }
+    assert_eq!(
+        *seen.borrow(),
+        vec![
+            Some(serde_json::json!({ "files": 2 })),
+            None,
+            Some(serde_json::Value::Null)
+        ],
+    );
+}
+
+/// The WRITE direction: `ToolResultPatch::structured_content` serializes as `structuredContent` and
+/// is omitted when absent, so the host reads an absent key as "no opinion" (pi
+/// `ToolResultEventResult.structuredContent?`, types.ts:1445).
+#[test]
+fn tool_result_patch_carries_structured_content_and_omits_it_when_absent() {
+    let patch = crate::events::ToolResultPatch {
+        structured_content: Some(serde_json::json!({ "files": 0 })),
+        ..Default::default()
+    };
+    assert_eq!(
+        serde_json::to_value(&patch).unwrap(),
+        serde_json::json!({ "structuredContent": { "files": 0 } })
+    );
+    let empty = serde_json::to_value(crate::events::ToolResultPatch::default()).unwrap();
+    assert!(!empty.as_object().unwrap().contains_key("structuredContent"));
+}
+
+/// pi `emitToolResult` (`runner.ts:1190-1207` @v1.0.1) over SEVERAL handlers of one guest: a
+/// handler that replaces `content` drops the structured content for the next one and for the
+/// combined patch, and a handler's own `structuredContent` puts one back.
+#[test]
+fn tool_result_handlers_chain_the_structured_content_drop_rule() {
+    use serde_json::Value;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    let mutate = |o: RawOutcome| match o {
+        RawOutcome::Mutate(s) => serde_json::from_str::<Value>(&s).unwrap(),
+        other => panic!("expected a combined mutate, got {other:?}"),
+    };
+    let ctx = Ctx::new();
+    let args = [
+        "c1",
+        "stats",
+        "{}",
+        r#"[{"type":"text","text":"2 files"}]"#,
+        "false",
+        "",
+        "",
+        "",
+        r#"{"files":2}"#,
+    ];
+    let text = |s: &str| json!([{"type": "text", "text": s}]);
+
+    // Replaced along with the content: kept, and a details-only handler after it leaves it be.
+    let seen: Rc<RefCell<Vec<Option<Value>>>> = Rc::default();
+    let mut api = ExtensionApi::new();
+    api.on_tool_result(|_, _| {
+        Outcome::mutate(json!({"content": [{"type": "text", "text": "0 files"}], "structuredContent": {"files": 0}}))
+    });
+    let s = seen.clone();
+    api.on_tool_result(move |e, _| {
+        s.borrow_mut().push(e.structured_content.clone());
+        Outcome::mutate(json!({"details": {"audited": true}}))
+    });
+    let out = mutate(api.dispatch(1, &args, &ctx));
+    assert_eq!(*seen.borrow(), [Some(json!({"files": 0}))]);
+    assert_eq!(
+        out,
+        json!({"content": text("0 files"), "structuredContent": {"files": 0}, "details": {"audited": true}})
+    );
+
+    // Content alone, after a handler that set both: dropped, from the next handler's view and from
+    // the combined patch.
+    let seen: Rc<RefCell<Vec<Option<Value>>>> = Rc::default();
+    let mut api = ExtensionApi::new();
+    api.on_tool_result(|_, _| {
+        Outcome::mutate(json!({"content": [{"type": "text", "text": "one"}], "structuredContent": {"files": 1}}))
+    });
+    api.on_tool_result(|_, _| {
+        Outcome::mutate(json!({"content": [{"type": "text", "text": "two"}]}))
+    });
+    let s = seen.clone();
+    api.on_tool_result(move |e, _| {
+        s.borrow_mut().push(e.structured_content.clone());
+        Outcome::noop()
+    });
+    let out = mutate(api.dispatch(1, &args, &ctx));
+    assert_eq!(*seen.borrow(), [None], "the third handler sees none");
+    assert_eq!(
+        out,
+        json!({"content": text("two")}),
+        "no structuredContent key"
+    );
+
+    // A later handler's structured content restores one.
+    let mut api = ExtensionApi::new();
+    api.on_tool_result(|_, _| {
+        Outcome::mutate(json!({"content": [{"type": "text", "text": "one"}]}))
+    });
+    api.on_tool_result(|_, _| Outcome::mutate(json!({"structuredContent": {"files": 7}})));
+    let out = mutate(api.dispatch(1, &args, &ctx));
+    assert_eq!(
+        out,
+        json!({"content": text("one"), "structuredContent": {"files": 7}})
+    );
+}
+
 // --- DRIFT-004: the guest half of pi's `UserBashEventResult.operations` -----------------------
 
 /// A guest bash backend is DECLARED (the `register-bash-operations` import at `init`) and REACHED

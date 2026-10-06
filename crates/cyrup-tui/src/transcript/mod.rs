@@ -64,6 +64,7 @@ mod tool_builtin;
 mod tool_render;
 mod tool_result;
 mod tool_state;
+mod tree_layout;
 mod view;
 
 #[cfg(test)]
@@ -71,7 +72,8 @@ mod tests;
 
 pub use content::{ParsedSkillBlock, content_text, parse_skill_block, thinking_text};
 pub use entry::{
-    CompactionCostKind, Entry, RenderSource, RenderSurface, Rendered, RenderedText, ToolRun,
+    CompactionCostKind, Entry, LiveTree, RenderSource, RenderSurface, Rendered, RenderedText,
+    ToolRun, ToolSide,
 };
 pub(crate) use entry::{RenderSlot, StaleRender};
 pub use expansion::{Expansion, LiveBlock, ToggleTarget};
@@ -82,6 +84,8 @@ pub use message::HIDDEN_THINKING_LABEL;
 pub(crate) use layout::{is_ws_grapheme, text_lines_of, wrap_all_owned, wrap_line, wrapped_height};
 pub(crate) use render::{entry_block, entry_lines};
 pub(crate) use tool_render::{ImageOpts, ThinkingHiding, tool_block, tool_lines};
+/// The stock `app.tools.expand` key text, for a caller that has no keymap in hand.
+pub(crate) const EXPAND_KEY_DEFAULT: &str = tool_render::EXPAND_KEY;
 
 // The transcript-internal helpers the submodules share. Re-bound here so every submodule reaches
 // them through its own `use super::*;`, the same way `crate::app`'s split modules do.
@@ -109,6 +113,7 @@ use tool_result::{
     push_list_output, push_ls_warnings, push_read_truncation, result_text, shorten_path,
     strip_bash_footer, trim_trailing_empty,
 };
+use tree_layout::tree_lines;
 
 /// The ceiling on [`TranscriptView::document()`], in entries — ADR-0005 §B-1's retention bound.
 ///

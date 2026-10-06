@@ -233,6 +233,7 @@ async fn run(call: ToolCall, tools: &[Arc<dyn Tool>], hooks: &dyn Hooks) -> Tool
             hooks,
             cancel: None,
             on_update: None,
+            parent_tool_call_id: None,
         },
     )
     .await
@@ -337,6 +338,7 @@ async fn agent047_resolves_against_the_options_tools_not_the_contexts() {
             hooks: &hooks,
             cancel: None,
             on_update: None,
+            parent_tool_call_id: None,
         },
     )
     .await;
@@ -365,6 +367,7 @@ async fn agent047_resolves_against_the_options_tools_not_the_contexts() {
             hooks: &DefaultHooks,
             cancel: None,
             on_update: None,
+            parent_tool_call_id: None,
         },
     )
     .await;
@@ -428,6 +431,7 @@ async fn agent047_emits_no_event_and_appends_no_message() {
             hooks: hooks.as_ref(),
             cancel: None,
             on_update: None,
+            parent_tool_call_id: None,
         },
     )
     .await;
@@ -508,6 +512,7 @@ async fn agent047_the_callers_on_update_sink_receives_the_tools_partials() {
                     }
                 }
             })),
+            parent_tool_call_id: None,
         },
     )
     .await;
@@ -518,5 +523,59 @@ async fn agent047_the_callers_on_update_sink_receives_the_tools_partials() {
         seen.lock().unwrap().as_slice(),
         ["half way".to_string()],
         "the partial reached the caller's own sink"
+    );
+}
+
+/// `ToolCallOutcome::to_wire` is pi's `AgentToolCallOutcome` as a JSON object,
+/// `{ toolCall, result, isError }` (`packages/agent/src/types.ts:449-453` @v1.0.1) — what an
+/// extension that is not Rust gets from `ctx.executeTool`. `result` carries the tool's own
+/// `structuredContent` and `isError` when it set them, and omits every key it did not.
+#[test]
+fn nested_outcome_wire_shape_is_pi_agent_tool_call_outcome() {
+    let outcome = ToolCallOutcome {
+        tool_call: call("lookup", json!({ "q": "x" })),
+        result: ToolResult {
+            content: vec![Content::text("found")],
+            details: Some(json!({ "rows": 1 })),
+            structured_content: Some(json!({ "id": 7 })),
+            is_error: true,
+            ..ToolResult::default()
+        },
+        // The NORMALISED verdict, which is a different value from the tool's own flag.
+        is_error: false,
+    };
+    assert_eq!(
+        outcome.to_wire(),
+        json!({
+            "toolCall": {
+                "type": "toolCall",
+                "id": "nested-1",
+                "name": "lookup",
+                "arguments": { "q": "x" },
+            },
+            "result": {
+                "content": [{ "type": "text", "text": "found" }],
+                "details": { "rows": 1 },
+                "structuredContent": { "id": 7 },
+                "isError": true,
+            },
+            "isError": false,
+        })
+    );
+
+    let bare = ToolCallOutcome {
+        tool_call: call("lookup", json!({})),
+        result: ToolResult {
+            content: vec![Content::text("ok")],
+            ..ToolResult::default()
+        },
+        is_error: false,
+    };
+    let wire = bare.to_wire();
+    let keys: Vec<&String> = wire["result"].as_object().unwrap().keys().collect();
+    assert_eq!(
+        keys,
+        ["content"],
+        "absent keys are omitted, not null: {wire}"
     );
 }

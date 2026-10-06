@@ -19,7 +19,7 @@
 > dependency on pi's in-monorepo `packages/mcp`, and every citation in `13-cyrup-mcp.md` and
 > `13a`–`13i` resolves at that tag. `MCP-587` records the rule.
 >
-> Numbering resumes from **`MCP-612`** (table F, *Fourth pass*, took `MCP-587`–`MCP-608`; table G,
+> Numbering resumes from **`MCP-616`** (table F, *Fourth pass*, took `MCP-587`–`MCP-608`; table G,
 > *Post-pin triage 2026-10-03*, took `MCP-609`–`MCP-611`; `MCP-586` was never allocated and is still free).
 
 > ### PIN — 2026-09-24 (superseded by the 2026-10-02 pin above). cyrup **`ea23ca2`** · `pi-mcp-adapter` **v2.37.0** (`28049de`)
@@ -435,7 +435,7 @@ at `fe875569`.
 Status is read off each row's own cyrup-side paragraph, not inferred from its kind: **`partial`**
 where the cyrup surface exists and diverges, **`missing`** where there is no counterpart,
 **`not-applicable`** for the one row that is a citation ruling rather than a port obligation.
-Numbering resumes from **`MCP-609`** *(as of the 2026-10-02 pass; now `MCP-612`, see table G below)*.
+Numbering resumes from **`MCP-609`** *(as of the 2026-10-02 pass; now `MCP-616`, see table G below)*.
 
 | id | sev | § | kind | status | eff | title | body |
 |---|---|---|---|---|---|---|---|
@@ -490,7 +490,7 @@ written in the row's `CORRECTED 2026-10-03` note as "Recommended re-rating (not 
 
 #### Table G — both sides read
 
-Numbering resumes from **`MCP-612`**.
+Numbering resumes from **`MCP-616`**.
 
 | id | sev | § | kind | status | eff | title | body |
 |---|---|---|---|---|---|---|---|
@@ -502,6 +502,21 @@ Numbering resumes from **`MCP-612`**.
 none of which existed before, so the counted set is **548**: `implemented` 347, `partial` 67 + 2 = **69**,
 `missing` 97 + 1 = **98**, `not-applicable` 34. Severity of the three new rows: 3 low. Table F's own
 census above is left as filed.
+
+### Closures and additions — 2026-10-06 (`claude/codemode`)
+
+Two rows moved to `implemented` in the tables above (the table rows are left as filed): `MCP-561`
+(`directTools: "search"`: `DirectToolsSetting::Search` in `config.rs`, the specs resolved lazy, held out of the
+request until `mcp({ search })` or a successful `mcp({ tool })` loads them additively) and `MCP-604` (those tools register at
+the `deferred` exposure, so `tool_search` finds them too). `MCP-604`'s own text assumed a lazy-inactive mechanism existed;
+`MCP-561` was `missing`, so the closure built both. Three rows were filed from it: `MCP-612` (13e, low, S,
+**missing**: server `description`, cached `outputSchema`), `MCP-613` (13h, low, S, **partial**: the panel reads
+`"search"` but cannot write it — this is the "panel half" of `MCP-561`), `MCP-614` (13e, low, S, **missing**: no
+live-server test of the search-mode path). `MCP-615` (13i, low, S, `test-defect`) was filed afterwards from the branch's test run, so the totals below count 552.
+
+Arithmetic on table G's census (548: `implemented` 347, `partial` 69, `missing` 98, `not-applicable` 34): +4 rows = **552**;
+`implemented` 347 + 2 = **349**; `partial` 69 + 1 (`MCP-613`) = **70**; `missing` 98 − 2 (`MCP-561`, `MCP-604`) + 2
+(`MCP-612`, `MCP-614`) + 1 (`MCP-615`) = **99**; `not-applicable` 34. 349 + 70 + 99 + 34 = 552.
 
 ### Closures — 2026-10-04
 

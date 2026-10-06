@@ -76,9 +76,10 @@ pub use autocomplete::{
     AutocompleteItem, AutocompleteProvider, AutocompleteQuery, AutocompleteSuggestions,
 };
 pub use ctx::{
-    BashCommand, CommandCtx, Ctx, ExecResult, ExtMode, FooterData, HttpRequest, HttpResponse,
-    HttpStreamResponse, Models, NotifyKind, ProcSpawnOptions, ReplacedSessionContext, Session,
-    Signal, ToolCall, Ui,
+    BashCommand, CallableTool, CommandCtx, Ctx, ExecResult, ExecuteToolOptions, ExtMode,
+    FooterData, HttpRequest, HttpResponse, HttpStreamResponse, Models, NestedCallError, NotifyKind,
+    ProcSpawnOptions, ReplacedSessionContext, Session, Signal, ToolCall, ToolNamespaceInfo,
+    ToolOutcome, ToolOutcomeResult, Ui,
 };
 pub use descriptor::{
     CommandDescriptor, CompactOptions, ConstrainedSampling, ConstrainedSamplingConfig, DeliverAs,
@@ -113,9 +114,10 @@ pub mod prelude {
         AutocompleteItem, AutocompleteProvider, AutocompleteQuery, AutocompleteSuggestions,
     };
     pub use crate::ctx::{
-        BashCommand, CommandCtx, Ctx, ExecResult, ExtMode, FooterData, HttpRequest, HttpResponse,
-        HttpStreamResponse, Models, NotifyKind, ProcSpawnOptions, ReplacedSessionContext, Session,
-        Signal, ToolCall, Ui,
+        BashCommand, CallableTool, CommandCtx, Ctx, ExecResult, ExecuteToolOptions, ExtMode,
+        FooterData, HttpRequest, HttpResponse, HttpStreamResponse, Models, NestedCallError,
+        NotifyKind, ProcSpawnOptions, ReplacedSessionContext, Session, Signal, ToolCall,
+        ToolNamespaceInfo, ToolOutcome, ToolOutcomeResult, Ui,
     };
     pub use crate::descriptor::{
         CommandDescriptor, CompactOptions, ConstrainedSampling, ConstrainedSamplingConfig,

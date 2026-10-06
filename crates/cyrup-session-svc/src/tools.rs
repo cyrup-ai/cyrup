@@ -181,6 +181,11 @@ pub(crate) struct DynamicToolState {
     /// `_hiddenDeclarations`): what the loop runs, and what a request may declare.
     loadout: ToolLoadout,
     rebuilder: PromptRebuilder,
+    /// Tools of the restored loadout that are not registered yet, such as tools of MCP servers that
+    /// are still connecting (pi `_pendingToolNames`, `agent-session.ts:431` @v1.0.1). They are
+    /// activated when they register, and dropped when [`Self::set_active`] deactivates a tool or
+    /// the next run starts ([`Self::clear_pending`]).
+    pending: BTreeSet<String>,
 }
 
 impl DynamicToolState {
@@ -199,7 +204,44 @@ impl DynamicToolState {
             registry,
             loadout,
             rebuilder,
+            pending: BTreeSet::new(),
         }
+    }
+
+    /// Restore the loadout the transcript declares (pi `_restoreToolsFromTranscript`,
+    /// `agent-session.ts:1762-1769` @v1.0.1): `declared` replaces the active set, and every
+    /// declared name stays pending until a tool of that name registers.
+    ///
+    /// The caller has already dropped the names the session may not expose (pi `_isAllowedTool`,
+    /// see [`is_allowed_tool`]). This is `_setActiveTools`, not `setActiveToolsByName`: replacing
+    /// the loadout with the restored one must not drop the pending names it just recorded.
+    pub(crate) fn restore_declared(&mut self, declared: &[String]) -> (ToolLoadout, String) {
+        self.pending = declared.iter().cloned().collect();
+        self.activate(declared)
+    }
+
+    /// Drop the restored names that have not registered (pi `_pendingToolNames.clear()`): at the
+    /// start of a run, "so a tool that never registers does not stay pending"
+    /// (`agent-session.ts:1778-1782`).
+    pub(crate) fn clear_pending(&mut self) {
+        self.pending.clear();
+    }
+
+    /// The names still waiting for a tool to register.
+    #[cfg(test)]
+    pub(crate) fn pending_names(&self) -> Vec<String> {
+        self.pending.iter().cloned().collect()
+    }
+
+    /// Pi `_setActiveTools` (`agent-session.ts:1495-1499` @v1.0.1): resolve `names`, retire the
+    /// pending names that are now active, and rebuild the prompt.
+    fn activate(&mut self, names: &[String]) -> (ToolLoadout, String) {
+        let registry: Vec<Arc<dyn Tool>> = self.registry.values().cloned().collect();
+        self.loadout = ToolLoadout::resolve(names, &registry);
+        for tool in self.loadout.executable() {
+            self.pending.remove(tool.name());
+        }
+        (self.loadout.clone(), self.prompt())
     }
 
     /// The rebuilt system prompt for the current loadout.
@@ -212,13 +254,20 @@ impl DynamicToolState {
     /// every registered `codemode` or `deferred` one (pi `getCallableToolNames` /
     /// `_getCallableTools`, `agent-session.ts:1457-1520` @v1.0.1).
     pub(crate) fn callable_names(&self) -> Vec<String> {
+        self.callable_tools()
+            .iter()
+            .map(|t| t.name().to_string())
+            .collect()
+    }
+
+    /// The tools themselves — what a nested call resolves against (pi `_getCallableTools`,
+    /// `agent-session.ts:1515-1520` @v1.0.1, which [`Self::callable_names`] names). Never the
+    /// declared set: a tool that is hidden, `model-only`, or an inactive `direct` one is not here.
+    pub(crate) fn callable_tools(&self) -> Vec<Arc<dyn Tool>> {
         let active_names: BTreeSet<String> = self.active_names().into_iter().collect();
         let active: BTreeSet<&str> = active_names.iter().map(String::as_str).collect();
         let registry: Vec<Arc<dyn Tool>> = self.registry.values().cloned().collect();
         cyrup_core::callable_tools(&registry, &active)
-            .iter()
-            .map(|t| t.name().to_string())
-            .collect()
     }
 
     /// The base system-prompt options bag for the CURRENT active set (EXT-061) — pi
@@ -278,10 +327,18 @@ impl DynamicToolState {
 
     /// Set the active set by name (Pi `setActiveToolsByName`): unknown names and `hidden` tools are ignored, the
     /// active list is replaced, and the new `(tools, system_prompt)` to push to the agent are returned.
+    ///
+    /// A loadout that deactivates a tool replaces the restored one, so its pending names are
+    /// dropped; one that only adds tools, like activating `tool_search`, keeps them (pi
+    /// `setActiveToolsByName`, `agent-session.ts:1487-1493` @v1.0.1).
     pub(crate) fn set_active(&mut self, names: &[String]) -> (ToolLoadout, String) {
-        let registry: Vec<Arc<dyn Tool>> = self.registry.values().cloned().collect();
-        self.loadout = ToolLoadout::resolve(names, &registry);
-        (self.loadout.clone(), self.prompt())
+        let previous = self.active_names();
+        let pushed = self.activate(names);
+        let active: BTreeSet<String> = self.active_names().into_iter().collect();
+        if previous.iter().any(|name| !active.contains(name)) {
+            self.pending.clear();
+        }
+        pushed
     }
 
     /// Register additional custom tools into the enable-able registry (Pi `customTools`, sdk.ts:71).
@@ -376,8 +433,39 @@ impl DynamicToolState {
             return None;
         }
         names.extend(newly_activated);
-        Some(self.set_active(&names))
+        // Restored tools that are registered now become active (pi `nextActiveToolNames.push(
+        // ...this._pendingToolNames)`, `agent-session.ts:3541-3542` @v1.0.1) — through
+        // `_setActiveTools`, which keeps the names that are still waiting.
+        names.extend(self.pending.iter().cloned());
+        Some(self.activate(&names))
     }
+}
+
+/// pi `_isAllowedTool` (`agent-session.ts:1501-1503` @v1.0.1): inside the session's allowlist, when
+/// it has one, and outside its denylist.
+pub(crate) fn is_allowed_tool(
+    allowed: Option<&std::collections::HashSet<String>>,
+    excluded: &std::collections::HashSet<String>,
+    name: &str,
+) -> bool {
+    allowed.is_none_or(|allowed| allowed.contains(name)) && !excluded.contains(name)
+}
+
+/// The active tool names a transcript declares (pi `_restoreToolsFromTranscript`'s read,
+/// `agent-session.ts:1763-1766` @v1.0.1): the tool set after replaying every system message in
+/// `messages`. `None` when the transcript has no system message, which declares no loadout at all.
+pub(crate) fn declared_tool_names(messages: &[cyrup_session::AgentMessage]) -> Option<Vec<String>> {
+    let system: Vec<cyrup_core::Message> = messages
+        .iter()
+        .filter_map(|m| match m {
+            cyrup_session::AgentMessage::Core(core @ cyrup_core::Message::System(_)) => {
+                Some(core.clone())
+            }
+            _ => None,
+        })
+        .collect();
+    let current = cyrup_provider::get_current_system_message(&system)?;
+    Some(current.tools_added.into_iter().map(|t| t.name).collect())
 }
 
 /// pi `_isActivatedOnRegistration` (`agent-session.ts:3554` @v1.0.1) for a registered tool.
@@ -412,7 +500,9 @@ fn definition_changed(previous: &Arc<dyn Tool>, current: &Arc<dyn Tool>) -> bool
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
     use super::*;
-    use cyrup_core::{CancelToken, ToolCallId, ToolError, ToolResult, ToolUpdateSink};
+    use cyrup_core::{
+        CancelToken, ToolCallId, ToolError, ToolExposure, ToolResult, ToolUpdateSink,
+    };
     use serde_json::{Value, json};
 
     /// A tool double whose whole model-visible definition is settable, so a test can register a
@@ -422,6 +512,7 @@ mod tests {
         description: String,
         params: Value,
         snippet: Option<String>,
+        exposure: ToolExposure,
     }
 
     impl Fake {
@@ -431,7 +522,14 @@ mod tests {
                 description: description.to_string(),
                 params: json!({"type": "object", "properties": {}}),
                 snippet: None,
+                exposure: ToolExposure::Direct,
             }
+        }
+
+        /// Registered but not activated by registration (`deferred`).
+        fn deferred(mut self) -> Self {
+            self.exposure = ToolExposure::Deferred;
+            self
         }
 
         fn with_snippet(mut self, snippet: &str) -> Self {
@@ -457,6 +555,9 @@ mod tests {
         }
         fn prompt_snippet(&self) -> Option<&str> {
             self.snippet.as_deref()
+        }
+        fn exposure(&self) -> ToolExposure {
+            self.exposure
         }
         async fn execute(
             &self,
@@ -615,6 +716,150 @@ mod tests {
         assert!(
             prompt.contains("deploy: ships the build"),
             "the custom tool's snippet reaches the model's system prompt: {prompt}"
+        );
+    }
+
+    fn strings(names: &[&str]) -> Vec<String> {
+        names.iter().map(|n| n.to_string()).collect()
+    }
+
+    /// A state whose registry holds `read` (active) and `search` (registered, not active).
+    fn state_with_inactive_search() -> DynamicToolState {
+        let mut st = state_with(vec![Fake::new("read", "builtin").arc()]);
+        st.register_custom(vec![Fake::new("search", "deferred").deferred().arc()]);
+        st
+    }
+
+    /// pi `_restoreToolsFromTranscript` (`agent-session.ts:1762-1769` @v1.0.1): the declared names
+    /// REPLACE the active set, a declared name nothing has registered yet stays pending, and the
+    /// restore does not drop the names it has just recorded.
+    #[test]
+    fn restore_declared_replaces_the_active_set_and_keeps_the_unregistered_names_pending() {
+        let mut st = state_with_inactive_search();
+        let (loadout, _) = st.restore_declared(&strings(&["search", "mcp__docs__find"]));
+        let active: Vec<&str> = loadout.executable().iter().map(|t| t.name()).collect();
+        assert_eq!(
+            active,
+            ["search"],
+            "read was not declared, so it is not active"
+        );
+        assert_eq!(st.active_names(), ["search"]);
+        assert_eq!(
+            st.pending_names(),
+            ["mcp__docs__find"],
+            "the registered name is retired, the unregistered one waits"
+        );
+    }
+
+    /// pi `setActiveToolsByName` (`:1487-1493`): a loadout that only ADDS tools — activating
+    /// `tool_search` — keeps the pending names; one that deactivates a tool replaces the restored
+    /// loadout and drops them.
+    #[test]
+    fn only_a_deactivating_loadout_drops_the_pending_names() {
+        let mut adds = state_with_inactive_search();
+        adds.restore_declared(&strings(&["read", "mcp__docs__find"]));
+        adds.set_active(&strings(&["read", "search"]));
+        assert_eq!(
+            adds.pending_names(),
+            ["mcp__docs__find"],
+            "an addition keeps them"
+        );
+
+        let mut drops = state_with_inactive_search();
+        drops.restore_declared(&strings(&["read", "mcp__docs__find"]));
+        drops.set_active(&strings(&["search"]));
+        assert!(
+            drops.pending_names().is_empty(),
+            "deactivating `read` replaces the restored loadout: {:?}",
+            drops.pending_names()
+        );
+    }
+
+    /// pi `_refreshToolRegistry` (`:3541-3542`): a pending tool that registers is activated even
+    /// though its exposure (`deferred`) would not activate it on registration, and is retired.
+    #[test]
+    fn a_pending_tool_that_registers_is_activated_and_retired() {
+        let mut st = state_with(vec![Fake::new("read", "builtin").arc()]);
+        st.restore_declared(&strings(&["read", "mcp__docs__find"]));
+        assert_eq!(st.pending_names(), ["mcp__docs__find"]);
+
+        let (loadout, _) = st
+            .merge_registered(vec![
+                Fake::new("mcp__docs__find", "late").deferred().arc(),
+                Fake::new("unrelated", "late").deferred().arc(),
+            ])
+            .expect("a new name pushes");
+        let active: Vec<&str> = loadout.executable().iter().map(|t| t.name()).collect();
+        assert_eq!(active, ["read", "mcp__docs__find"]);
+        assert!(st.pending_names().is_empty());
+    }
+
+    /// pi `_runAgentPrompt` (`:1778-1782`): the names still pending when a run starts are dropped,
+    /// so a tool registering afterwards is not activated by the restore.
+    #[test]
+    fn clearing_the_pending_names_stops_a_later_registration_activating() {
+        let mut st = state_with(vec![Fake::new("read", "builtin").arc()]);
+        st.restore_declared(&strings(&["read", "mcp__docs__find"]));
+        st.clear_pending();
+        let moved =
+            st.merge_registered(vec![Fake::new("mcp__docs__find", "late").deferred().arc()]);
+        let (loadout, _) = moved.expect("the registry moved");
+        let active: Vec<&str> = loadout.executable().iter().map(|t| t.name()).collect();
+        assert_eq!(active, ["read"]);
+    }
+
+    /// pi `_isAllowedTool` (`:1501-1503`).
+    #[test]
+    fn a_tool_is_allowed_inside_the_allowlist_and_outside_the_denylist() {
+        use std::collections::HashSet;
+        let allowed: HashSet<String> = ["a", "b"].iter().map(|s| s.to_string()).collect();
+        let denied: HashSet<String> = ["b"].iter().map(|s| s.to_string()).collect();
+        let none = HashSet::new();
+        assert!(is_allowed_tool(None, &none, "x"), "no lists, everything");
+        assert!(is_allowed_tool(Some(&allowed), &none, "a"));
+        assert!(
+            !is_allowed_tool(Some(&allowed), &none, "x"),
+            "not on the allowlist"
+        );
+        assert!(
+            !is_allowed_tool(Some(&allowed), &denied, "b"),
+            "denied wins"
+        );
+        assert!(!is_allowed_tool(None, &denied, "b"));
+    }
+
+    /// pi `_restoreToolsFromTranscript`'s read (`:1763-1766`): the replayed tool names, or nothing
+    /// at all when the transcript holds no system message.
+    #[test]
+    fn declared_tool_names_replay_the_transcript_and_distinguish_none_from_empty() {
+        use cyrup_core::{Message, SystemMessage, ToolDef, ToolReference};
+        let tool = |n: &str| ToolDef {
+            name: n.to_string(),
+            description: String::new(),
+            parameters: json!({"type": "object"}),
+            constrained_sampling: None,
+        };
+        let row = |added: &[&str], removed: &[&str]| {
+            cyrup_session::AgentMessage::Core(Message::System(SystemMessage {
+                tools_added: added.iter().map(|n| tool(n)).collect(),
+                tools_removed: removed.iter().map(|n| ToolReference::new(*n)).collect(),
+                timestamp: 1,
+                ..SystemMessage::default()
+            }))
+        };
+        assert_eq!(
+            declared_tool_names(&[]),
+            None,
+            "no system message declares nothing"
+        );
+        assert_eq!(
+            declared_tool_names(&[row(&["a", "b"], &[]), row(&["c"], &["a"])]),
+            Some(strings(&["b", "c"]))
+        );
+        assert_eq!(
+            declared_tool_names(&[row(&[], &[])]),
+            Some(Vec::new()),
+            "a system message that declares no tool declares an EMPTY loadout"
         );
     }
 }

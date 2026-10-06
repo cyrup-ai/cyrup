@@ -106,6 +106,7 @@ fn tool_result_id(id: &str, name: &str, body: &str) -> AgentMessage {
         timestamp: 0,
         usage: None,
         added_tool_names: Vec::new(),
+        nested_calls: None,
     })
 }
 

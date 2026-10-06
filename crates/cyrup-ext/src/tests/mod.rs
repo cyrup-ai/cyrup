@@ -31,6 +31,8 @@ mod malformed_manifest;
 mod manifest_cache;
 mod native_ctx_state;
 mod native_dispatch;
+mod nested_tool_context;
+mod nested_tool_events;
 #[cfg(feature = "wasm-host")]
 mod overlay_keys;
 mod payload_and_seam_parity;
@@ -41,10 +43,13 @@ mod provider;
 mod provider_refresh;
 mod quarantined_native;
 mod registration_validation;
+mod replaceable_builtins;
 mod seam_liveness;
 mod startup_timings;
 mod terminal_keys;
 mod tool_exposure;
+mod tool_result_structured_content;
+mod tool_result_structured_guest;
 mod trust_gate_order;
 mod wasm_host;
 #[cfg(feature = "wasm-host")]

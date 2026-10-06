@@ -373,6 +373,10 @@ impl AgentSession {
         drop(guard);
         let msgs: Vec<AgentMessage> = raw.iter().map(raw_message_to_agent).collect();
         self.agent.set_messages(msgs).await;
+        // The branch the leaf moved to declares its own loadout (pi `navigateTree`,
+        // `agent-session.ts:4087-4089` @v1.0.1): navigating before a `tool_search` load drops the
+        // loaded tool, navigating to a later entry restores it.
+        self.restore_tools_from_transcript(&raw).await;
 
         // session_tree notify (agent-session.ts:2877). cyrup collapses the Pi payload into one
         // `tree` JSON value (the SDK forwards it to the guest as `tree_json`).

@@ -247,6 +247,7 @@ async fn the_turn_and_boundary_events_reach_the_runtime() {
                 input: serde_json::Value::Null,
                 content: Vec::new(),
                 details: None,
+                structured_content: None,
                 is_error: false,
                 usage: None,
                 terminate: cyrup_core::TerminateHint::Unspecified,
@@ -717,6 +718,7 @@ fn tool_result(name: &str, text: &str, is_error: bool) -> cyrup_agent::ToolResul
         added_tool_names: Vec::new(),
         is_error,
         timestamp: 0,
+        nested_calls: None,
     }
 }
 

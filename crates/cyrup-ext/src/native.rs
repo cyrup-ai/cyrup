@@ -50,6 +50,29 @@ pub trait RenderTheme: Send + Sync {
     fn fg(&self, role: &str, text: &str) -> String;
     /// Pi `theme.bold(text)`.
     fn bold(&self, text: &str) -> String;
+
+    /// Pi `keyHint(keybinding, description)` (`keybinding-hints.ts`): the binding's CURRENT key text
+    /// in `dim`, then ` description` in `muted`. `binding` is pi's keybinding id
+    /// (`"app.tools.expand"`). The default has no keymap to resolve against and shows the id.
+    fn key_hint(&self, binding: &str, description: &str) -> String {
+        format!(
+            "{}{}",
+            self.fg("dim", binding),
+            self.fg("muted", &format!(" {description}"))
+        )
+    }
+
+    /// Pi `highlightCode(code, lang)` (`theme.ts`): one SGR-styled string per source line. The
+    /// default is the unstyled lines, which is pi's own fallback when a language has no grammar.
+    fn highlight_code(&self, code: &str, _lang: &str) -> Vec<String> {
+        code.split('\n').map(str::to_string).collect()
+    }
+
+    /// The per-block transform of pi's `getTextOutput` (`render-utils.ts`):
+    /// `sanitizeBinaryOutput(stripAnsi(text)).replace(/\r/g, "")`. The default is the identity.
+    fn display_text(&self, text: &str) -> String {
+        text.to_string()
+    }
 }
 
 /// Which context tier a handler runs in (arch-08 §6.3, the deadlock rule). Session-mutating control
@@ -234,6 +257,11 @@ pub struct HostCtx {
     /// [`Self::begin_human_wait`] / [`Self::begin_sanctioned_wait`] and the watchdog consult the SAME
     /// gate. One per handler ctx.
     human_wait: Arc<HumanWaitGate>,
+    /// The tool call that made the call this event is about, when a tool is calling a tool
+    /// (CODE-006; pi's `parentToolCallId` on the `tool_call` / `tool_result` / `tool_execution_*`
+    /// events, `extensions/types.ts:1061-1083`, `:1155-1161`, `:1231` @v1.0.1). `None` for every
+    /// event the agent loop itself raised.
+    parent_tool_call_id: Option<cyrup_core::ToolCallId>,
 }
 
 /// The richer fields a native built-in's [`HostCtx`] exposes (Pi `ExtensionContext`, types.ts:300-333):
@@ -271,6 +299,7 @@ impl HostCtx {
             tier: CtxTier::Event,
             rich: HostCtxRich::default(),
             human_wait: Arc::new(HumanWaitGate::default()),
+            parent_tool_call_id: None,
         }
     }
 
@@ -283,6 +312,7 @@ impl HostCtx {
             tier: CtxTier::Command,
             rich: HostCtxRich::default(),
             human_wait: Arc::new(HumanWaitGate::default()),
+            parent_tool_call_id: None,
         }
     }
 
@@ -296,6 +326,26 @@ impl HostCtx {
     /// The rich native-ctx fields (model/idle/trust/usage/system-prompt).
     pub fn rich(&self) -> &HostCtxRich {
         &self.rich
+    }
+
+    /// Mark this ctx as the one for an event of a call another tool made (CODE-006).
+    #[must_use]
+    pub fn with_parent_tool_call_id(mut self, parent: cyrup_core::ToolCallId) -> Self {
+        self.parent_tool_call_id = Some(parent);
+        self
+    }
+
+    /// The tool call that made the call this event is about — pi's `event.parentToolCallId`
+    /// (`extensions/types.ts:1061-1083`, `:1155-1161`, `:1231` @v1.0.1). `Some` only for the
+    /// `tool_call`, `tool_result` and `tool_execution_*` events of a call a tool made while it ran
+    /// (`ctx.executeTool`), and then it is the id of the calling tool call — which is itself
+    /// `<id>/<n>` when that tool was a nested call. `None` for a model-issued call.
+    ///
+    /// A handler that gates on `tool_call` needs no change to cover nested calls: they reach it
+    /// as the same event. This is for the handler that must tell them apart — one that records
+    /// only what the model asked for, for instance.
+    pub fn parent_tool_call_id(&self) -> Option<&cyrup_core::ToolCallId> {
+        self.parent_tool_call_id.as_ref()
     }
 
     /// The current model ref (Pi `ctx.model`).
@@ -488,6 +538,10 @@ impl InitApi {
     }
 
     /// Register a tool. Overrides a built-in of the same name at the registry (R-08-012).
+    ///
+    /// While the tool's `execute` runs inside a session, [`crate::ExtensionToolContext::current`]
+    /// answers pi's `ctx.executeTool` / `ctx.tools` bound to that call (`extensions/types.ts:367-395`
+    /// @v1.0.1) — see [`crate::nested`].
     pub fn register_tool(&mut self, tool: Arc<dyn Tool>) {
         self.tools.push(tool);
     }
@@ -791,6 +845,20 @@ pub trait NativeExtension: Send + Sync {
         false
     }
 
+    /// Whether this built-in is **replaceable**: left out of the loaded set when another extension
+    /// registers a tool, command or flag with a name it registers, instead of the two colliding
+    /// (pi `InlineExtension.replaceable`, `core/extensions/types.ts:2018-2024` and
+    /// `omitReplacedExtensions`, `core/resource-loader.ts:116-153` @v1.0.1). pi's `codemode`,
+    /// `tool-search` and `mcp` built-ins are replaceable, so a third-party extension that registers
+    /// `codemode`, `tool_search` or `/mcp` takes over cleanly. [`crate::replaceable`] states the
+    /// rule.
+    ///
+    /// `init` still runs for a replaceable built-in that is left out, as the factory does upstream,
+    /// so it should register only tools, commands, flags and event handlers. Default `false`.
+    fn replaceable(&self) -> bool {
+        false
+    }
+
     /// Whether this built-in is **hidden** from the startup `[Extensions]` listing. It is still
     /// loaded, still in [`crate::ExtensionHost::loaded_ids`], and still dispatched; only the list
     /// the user is shown leaves it out.
@@ -1055,6 +1123,35 @@ pub trait NativeExtension: Send + Sync {
         _key: &str,
         _payload: &serde_json::Value,
     ) -> Option<std::sync::Arc<dyn RenderedComponent>> {
+        None
+    }
+
+    /// The component form of [`Self::render_call`] for a tool this extension declared a renderer
+    /// for (pi `ToolDefinition.renderCall` returning a `Component`). Consulted BEFORE the JSON
+    /// hooks; `None` falls through to them. Sync, and a PANIC is contained by the host, for the
+    /// same reasons as [`Self::render_call`].
+    ///
+    /// Unlike [`Self::render_live`] the component hands the host a tree
+    /// ([`crate::RenderedTree`]), so the host wraps and truncates styled text at the live width.
+    fn render_call_tree(
+        &self,
+        _key: &str,
+        _call: &serde_json::Value,
+        _opts: &crate::RenderOptions,
+    ) -> Option<std::sync::Arc<dyn crate::RenderedTree>> {
+        None
+    }
+
+    /// The result-side companion of [`Self::render_call_tree`] (pi `renderResult(result, options,
+    /// theme, context)`). `result` is `{content, details}`; `opts` carries `expanded`, `isPartial`
+    /// and `isError`. Called again for every partial result a streaming tool reports, so a list that
+    /// grows while the tool runs is a new component each time.
+    fn render_result_tree(
+        &self,
+        _key: &str,
+        _result: &serde_json::Value,
+        _opts: &crate::RenderOptions,
+    ) -> Option<std::sync::Arc<dyn crate::RenderedTree>> {
         None
     }
 
@@ -1413,9 +1510,30 @@ impl Extension for NativeHandle {
         ev: &HostEvent,
         cancel: &CancelToken,
     ) -> Result<HookOutcome, ExtError> {
+        self.invoke_in(self.dispatch_ctx(), ev, cancel).await
+    }
+
+    async fn invoke_nested_event(
+        &self,
+        parent: &cyrup_core::ToolCallId,
+        ev: &HostEvent,
+        cancel: &CancelToken,
+    ) -> Result<HookOutcome, ExtError> {
+        let ctx = self.dispatch_ctx().with_parent_tool_call_id(parent.clone());
+        self.invoke_in(ctx, ev, cancel).await
+    }
+}
+
+impl NativeHandle {
+    /// Run the handler with `ctx`, containing a panic and racing `cancel`.
+    async fn invoke_in(
+        &self,
+        ctx: HostCtx,
+        ev: &HostEvent,
+        cancel: &CancelToken,
+    ) -> Result<HookOutcome, ExtError> {
         // Containment: catch a panicking handler (R-08-036). `AssertUnwindSafe` is sound here — on
         // a caught unwind we discard the handler's state and surface an error; we never resume it.
-        let ctx = self.dispatch_ctx();
         let fut = AssertUnwindSafe(self.inner.on_event(ev, &ctx));
         let raced = tokio::select! {
             biased;

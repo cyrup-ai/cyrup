@@ -159,9 +159,12 @@ pub mod hooks;
 pub mod loader;
 pub mod manifest;
 pub mod native;
+pub mod nested;
 pub mod provider;
 pub mod registry;
 pub mod render;
+pub mod render_tree;
+pub mod replaceable;
 pub mod subscriber;
 pub mod ui_prompt;
 pub mod wrapper;
@@ -218,6 +221,10 @@ pub use native::{
     LateRegistrar, NativeExtension, NativeHandle, QuarantinedNative, QuarantinedTier, RenderCtx,
     RenderTheme, RenderedComponent, SanctionedWaitGate, SanctionedWaitGuard, SanctionedWaitKind,
 };
+pub use nested::{
+    ExecuteToolOptions, ExtensionToolContext, NestedRunnerSlot, NestedToolRunner,
+    callable_tools_json, tool_update_json,
+};
 pub use provider::{
     ModelCost, ModelCostTier, ModelRegistrySink, ProviderConfig, ProviderHub, ProviderModelConfig,
     ProviderRegistration, resolve_api_key,
@@ -227,9 +234,13 @@ pub use registry::{
     ExtensionProvenance, ExtensionRegistry, ResolvedCommand, ToolDescriptor,
 };
 pub use render::RenderOptions;
+pub use render_tree::{PreviewKeep, RenderNode, RenderedTree, TreeCtx};
+pub use replaceable::{ClaimKind, OmittedExtension};
 pub use subscriber::ExtSubscriber;
 pub use ui_prompt::{UiPromptGuard, UiPromptKind, UiPromptTracker};
-pub use wrapper::{ActiveToolNames, RegisteredTool, wrap_registered_tool};
+pub use wrapper::{
+    ActiveToolNames, RegisteredTool, wrap_registered_tool, wrap_registered_tool_with_nested,
+};
 
 #[cfg(feature = "wasm-host")]
 pub use host::{

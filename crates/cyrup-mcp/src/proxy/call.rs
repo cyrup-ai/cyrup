@@ -126,15 +126,22 @@ impl AuthRecovery<'_> {
     }
 }
 
-/// `{server, resourceUri}` for a resource tool, `{server, tool: originalName}` otherwise.
+/// `{server, resourceUri, canonicalTool}` for a resource tool, `{server, tool: originalName,
+/// canonicalTool}` otherwise (`proxy-modes.ts:1425-1426` @v5.0.0). `canonicalTool` is the registered,
+/// model-visible name, which is what a search-mode direct tool is keyed on.
 ///
 /// **Fixed once in phase 6 and reused by every subsequent result** — that is why a reconnect which
 /// re-resolves the tool still reports the identity computed before it.
 fn call_identity(server: &str, tool: &ToolMetadata) -> Vec<(String, Value)> {
+    let canonical = (
+        "canonicalTool".to_string(),
+        Value::String(tool.name.clone()),
+    );
     match tool.resource_uri.as_ref() {
         Some(uri) => vec![
             ("server".to_string(), Value::String(server.to_string())),
             ("resourceUri".to_string(), Value::String(uri.clone())),
+            canonical,
         ],
         None => vec![
             ("server".to_string(), Value::String(server.to_string())),
@@ -142,6 +149,7 @@ fn call_identity(server: &str, tool: &ToolMetadata) -> Vec<(String, Value)> {
                 "tool".to_string(),
                 Value::String(tool.original_name.clone()),
             ),
+            canonical,
         ],
     }
 }
@@ -1458,5 +1466,45 @@ mod tests {
             details.get("error").is_none(),
             "a success carries no error code"
         );
+    }
+
+    /// `proxy-modes.ts:1425-1426` @v5.0.0: `callIdentity` carries `canonicalTool`, the registered,
+    /// model-visible name, beside `tool` (or `resourceUri`). A search-mode tool is keyed on it.
+    #[tokio::test]
+    async fn a_success_reports_the_canonical_name_beside_the_identity() {
+        let config = config_with(&[("srv", stdio("a"))]);
+        let env = FakeEnv::default().with_connection("srv", ConnectionStatus::Connected);
+        let mut resource = ToolMetadata::new("srv_read_notes", "read_notes", "");
+        resource.resource_uri = Some("file:///notes.md".to_string());
+        let (ctx, _) = ctx_with(
+            config,
+            &[(
+                "srv",
+                vec![ToolMetadata::new("srv_run", "run", ""), resource],
+            )],
+            &[],
+            env,
+        );
+        let tool = execute_call(&ctx, "srv_run", None, None, &CancelToken::new(), None)
+            .await
+            .unwrap()
+            .details
+            .unwrap();
+        assert_eq!(tool["tool"], json!("run"));
+        assert_eq!(tool["canonicalTool"], json!("srv_run"));
+        let read = execute_call(
+            &ctx,
+            "srv_read_notes",
+            None,
+            None,
+            &CancelToken::new(),
+            None,
+        )
+        .await
+        .unwrap()
+        .details
+        .unwrap();
+        assert_eq!(read["resourceUri"], json!("file:///notes.md"));
+        assert_eq!(read["canonicalTool"], json!("srv_read_notes"));
     }
 }

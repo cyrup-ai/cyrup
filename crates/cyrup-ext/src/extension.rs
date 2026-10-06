@@ -6,7 +6,7 @@
 use crate::contract::HookOutcome;
 use crate::error::ExtError;
 use crate::event::{HostEvent, Subscriptions};
-use cyrup_core::{CancelToken, ExtensionId};
+use cyrup_core::{CancelToken, ExtensionId, ToolCallId};
 
 /// Whether an extension runs in-process (native) or across the wasm boundary.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -39,6 +39,28 @@ pub trait Extension: Send + Sync {
         ev: &HostEvent,
         cancel: &CancelToken,
     ) -> Result<HookOutcome, ExtError>;
+
+    /// Dispatch one event of a call another tool made — a `tool_call`, `tool_result` or
+    /// `tool_execution_*` event whose call was made by `parent` (CODE-006; pi's `parentToolCallId`,
+    /// `core/extensions/types.ts:1061-1083`, `:1155-1161`, `:1231` @v1.0.1).
+    ///
+    /// Defaults to [`Self::invoke_event`], so an extension that does not distinguish the two sees
+    /// the nested call as the ordinary event it is — which is the safe direction: a permission gate
+    /// subscribed to `tool_call` runs on every nested call whether or not it knows about parents. A
+    /// native overrides it to hand `parent` to its handler ([`crate::HostCtx::parent_tool_call_id`]).
+    ///
+    /// A WASM guest takes the default: the guest ABI's `on-tool-*` exports have a fixed signature
+    /// with no parent argument, so what a guest can read of the parent is a change of that ABI,
+    /// not of this seam.
+    async fn invoke_nested_event(
+        &self,
+        parent: &ToolCallId,
+        ev: &HostEvent,
+        cancel: &CancelToken,
+    ) -> Result<HookOutcome, ExtError> {
+        let _ = parent;
+        self.invoke_event(ev, cancel).await
+    }
 
     /// The sanctioned-long-wait coordinator for this extension's dispatch-budget forgiveness (P-3,
     /// `spec/extensions/cyrup-permission-system-port.md §4`; UW-3). `None` (default) ⇒ no

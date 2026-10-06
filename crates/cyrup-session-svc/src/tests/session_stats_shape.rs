@@ -198,9 +198,21 @@ async fn stats_carry_pi_s_identity_fields_and_derived_total() {
             + stats.tokens.cache_write,
         "tokens.total is the derived sum (agent-session.ts:3157): {stats:?}"
     );
+    // pi's `totalMessages` counts every `message` entry (`getSessionStats`, `agent-session.ts:4148-4150`
+    // @v1.0.1), and the run records its tool declarations as a system message ahead of the prompt.
+    let system_entries = session
+        .entries_json()
+        .await
+        .iter()
+        .filter(|e| e.pointer("/message/role").and_then(|r| r.as_str()) == Some("system"))
+        .count();
+    assert_eq!(
+        system_entries, 1,
+        "the loadout declaration is on the branch"
+    );
     assert_eq!(
         stats.total_messages,
-        stats.user_messages + stats.assistant_messages + stats.tool_results,
-        "this run has only user/assistant/toolResult entries, so totalMessages is their sum: {stats:?}"
+        stats.user_messages + stats.assistant_messages + stats.tool_results + system_entries,
+        "this run has user/assistant/toolResult entries plus the declaration, so totalMessages is their sum: {stats:?}"
     );
 }

@@ -2002,13 +2002,35 @@ pub(crate) fn language_from_path(file_path: &str) -> Option<&'static str> {
 /// row back into styled spans at draw time, so the round trip is lossless for the codes emitted here.
 pub struct UiThemeRoles<'a> {
     theme: &'a UiTheme,
+    /// The live `app.tools.expand` key text [`cyrup_ext::RenderTheme::key_hint`] resolves that
+    /// binding to (pi `keyText`, `keybinding-hints.ts:34-36`).
+    expand_key: &'a str,
 }
 
 impl<'a> UiThemeRoles<'a> {
-    /// Borrow a live theme as a renderer-facing palette.
+    /// Borrow a live theme as a renderer-facing palette. The expand hint reads the stock binding
+    /// until [`Self::with_expand_key`] says what the user bound.
     #[must_use]
     pub fn new(theme: &'a UiTheme) -> Self {
-        Self { theme }
+        Self {
+            theme,
+            expand_key: crate::transcript::EXPAND_KEY_DEFAULT,
+        }
+    }
+
+    /// Resolve `app.tools.expand` to the user's live binding.
+    #[must_use]
+    pub fn with_expand_key(mut self, expand_key: &'a str) -> Self {
+        self.expand_key = expand_key;
+        self
+    }
+
+    /// One styled row as the SGR string a renderer would have built with [`Self::paint`].
+    fn line_sgr(line: &ratatui::text::Line<'_>) -> String {
+        line.spans
+            .iter()
+            .map(|span| Self::paint(span.style, &span.content))
+            .collect()
     }
 
     /// Wrap `text` in the truecolor SGR pair for `style`'s foreground, plus bold/dim when set.
@@ -2057,6 +2079,9 @@ impl cyrup_ext::RenderTheme for UiThemeRoles<'_> {
             "dim" => self.theme.dim_style(),
             "accent" => self.theme.accent_style(),
             "error" => self.theme.error_style(),
+            "success" => self.theme.success_style(),
+            "warning" => self.theme.warning_style(),
+            "toolOutput" => self.theme.tool_output_style(),
             _ => return text.to_string(),
         };
         Self::paint(style, text)
@@ -2065,6 +2090,36 @@ impl cyrup_ext::RenderTheme for UiThemeRoles<'_> {
     /// Pi `theme.bold(text)`.
     fn bold(&self, text: &str) -> String {
         format!("\u{1B}[1m{text}\u{1B}[22m")
+    }
+
+    /// Pi `keyHint` (`keybinding-hints.ts:39-41`): the binding's key text dim, ` description` muted.
+    /// `app.tools.expand` is the one binding a tool renderer asks for; any other id is shown as
+    /// given.
+    fn key_hint(&self, binding: &str, description: &str) -> String {
+        let key = if binding == "app.tools.expand" {
+            self.expand_key
+        } else {
+            binding
+        };
+        format!(
+            "{}{}",
+            self.fg("dim", &crate::chrome::format_key_text(key, false)),
+            self.fg("muted", &format!(" {description}"))
+        )
+    }
+
+    /// Pi `highlightCode` (`theme.ts`): syntect rows in the live palette, or the plain source rows
+    /// when the language has no grammar (pi's `catch { return code.split("\n") }`).
+    fn highlight_code(&self, code: &str, lang: &str) -> Vec<String> {
+        match crate::markdown::highlight_code_lines(code, lang, self.theme, usize::MAX) {
+            Some(rows) => rows.iter().map(Self::line_sgr).collect(),
+            None => code.split('\n').map(str::to_string).collect(),
+        }
+    }
+
+    /// `getTextOutput`'s per-block transform (`render-utils.ts:48`).
+    fn display_text(&self, text: &str) -> String {
+        crate::ansi::sanitize_display_text(text)
     }
 }
 

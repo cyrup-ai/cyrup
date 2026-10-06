@@ -828,6 +828,7 @@ mod tests {
                     usage: None,
                     added_tool_names: vec!["late_tool".to_string()],
                     timestamp: 3,
+                    nested_calls: None,
                 },
             ],
             tools,

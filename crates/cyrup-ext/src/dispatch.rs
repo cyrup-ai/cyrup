@@ -12,7 +12,7 @@ use crate::contract::{HandledValue, HookOutcome, Reduced};
 use crate::error::ExtError;
 use crate::event::{EventKind, HostEvent, Subscriptions};
 use crate::extension::Extension;
-use cyrup_core::CancelToken;
+use cyrup_core::{CancelToken, ToolCallId};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -208,6 +208,23 @@ impl Dispatcher {
         Ok(())
     }
 
+    /// Drop an extension from the load order, so it receives no more events. Returns whether it was
+    /// there. Used for a replaceable built-in another extension displaced
+    /// ([`crate::replaceable`]); pi simply never hands such an extension to its runner.
+    pub fn remove(&self, id: &cyrup_core::ExtensionId) -> bool {
+        match self.lock_write() {
+            Ok(mut g) => {
+                let before = g.exts.len();
+                g.exts.retain(|e| e.id() != id);
+                g.exts.len() != before
+            }
+            Err(_) => {
+                self.note_poisoned();
+                false
+            }
+        }
+    }
+
     /// The union of every loaded extension's CURRENT subscription bitset (EXT-058).
     ///
     /// Computed on demand rather than folded once at [`Self::add`]. The load-time aggregate was a
@@ -307,6 +324,32 @@ impl Dispatcher {
         cancel: &CancelToken,
         exclude: Option<&cyrup_core::ExtensionId>,
     ) {
+        self.notify_from(ev, None, cancel, exclude).await
+    }
+
+    /// [`Self::dispatch_notify`] for a `tool_execution_*` event of a call another tool made
+    /// (CODE-006; pi's `parentToolCallId` on `ToolExecution{Start,Update,End}Event`,
+    /// `extensions/types.ts:1061-1083` @v1.0.1). The event is the ordinary one; `parent` — the
+    /// model-issued or nested call that made this one — reaches a native handler as
+    /// [`crate::HostCtx::parent_tool_call_id`].
+    pub async fn dispatch_notify_nested(
+        &self,
+        ev: &HostEvent,
+        parent: &ToolCallId,
+        cancel: &CancelToken,
+    ) {
+        self.notify_from(ev, Some(parent), cancel, None).await
+    }
+
+    /// The notify chain proper, for an event that is a loop event (`parent` is `None`) or the event
+    /// of a nested call.
+    async fn notify_from(
+        &self,
+        ev: &HostEvent,
+        parent: Option<&ToolCallId>,
+        cancel: &CancelToken,
+        exclude: Option<&cyrup_core::ExtensionId>,
+    ) {
         let kind = ev.kind();
         // EXT-034: the subscription gate (R-08-034) skips the HANDLER loop, never the drain. The
         // gate answers "does anyone subscribe to THIS event kind", which has nothing to do with
@@ -320,7 +363,7 @@ impl Dispatcher {
                     continue;
                 }
                 // Fault-contained: an error is reported and skipped (R-08-036).
-                if let Err(e) = self.invoke_contained(&ext, ev, cancel).await {
+                if let Err(e) = self.invoke_contained(&ext, ev, parent, cancel).await {
                     self.report(kind, ext.id(), &e);
                 }
             }
@@ -343,7 +386,7 @@ impl Dispatcher {
         // EXT-034: gate the handler loop, not the drain — see `dispatch_notify_excluding`.
         if !self.no_subscribers(kind) {
             for ext in self.subscribers_for(kind) {
-                match self.invoke_contained(&ext, ev, cancel).await {
+                match self.invoke_contained(&ext, ev, None, cancel).await {
                     Ok(HookOutcome::Handled(v)) => out.push((ext.id().clone(), v)),
                     Ok(_) => {}
                     Err(e) => self.report(kind, ext.id(), &e),
@@ -374,7 +417,7 @@ impl Dispatcher {
             return None;
         }
         for ext in self.subscribers_for(kind) {
-            match self.invoke_contained(&ext, ev, cancel).await {
+            match self.invoke_contained(&ext, ev, None, cancel).await {
                 Ok(HookOutcome::Handled(v)) if decided(&v) => {
                     // EXT-034: the short-circuit return still has to drain — a handler that emitted
                     // AND decided is exactly the coordination case (a permission gate announcing its
@@ -412,7 +455,31 @@ impl Dispatcher {
         cancel: &CancelToken,
         exclude: Option<&cyrup_core::ExtensionId>,
     ) -> Reduced {
-        let reduced = self.block_mutate_chain(ev, cancel, exclude).await;
+        self.block_mutate_from(ev, None, cancel, exclude).await
+    }
+
+    /// [`Self::dispatch_block_mutate`] for the `tool_call` / `tool_result` event of a call another
+    /// tool made (CODE-006; pi's `parentToolCallId` on `ToolCallEvent` / `ToolResultEvent`,
+    /// `extensions/types.ts:1155-1161`, `:1231` @v1.0.1). The same chain, the same fail-closed rule:
+    /// a permission gate that blocks a model-issued call blocks this one. `parent` reaches a native
+    /// handler as [`crate::HostCtx::parent_tool_call_id`].
+    pub async fn dispatch_block_mutate_nested(
+        &self,
+        ev: HostEvent,
+        parent: &ToolCallId,
+        cancel: &CancelToken,
+    ) -> Reduced {
+        self.block_mutate_from(ev, Some(parent), cancel, None).await
+    }
+
+    async fn block_mutate_from(
+        &self,
+        ev: HostEvent,
+        parent: Option<&ToolCallId>,
+        cancel: &CancelToken,
+        exclude: Option<&cyrup_core::ExtensionId>,
+    ) -> Reduced {
+        let reduced = self.block_mutate_chain(ev, parent, cancel, exclude).await;
         // EXT-034: drain on EVERY exit of the chain — including the first-block short-circuit,
         // which is precisely the handler most likely to have announced itself on `pi.events`.
         self.drain_bus(cancel, exclude).await;
@@ -424,6 +491,7 @@ impl Dispatcher {
     async fn block_mutate_chain(
         &self,
         mut ev: HostEvent,
+        parent: Option<&ToolCallId>,
         cancel: &CancelToken,
         exclude: Option<&cyrup_core::ExtensionId>,
     ) -> Reduced {
@@ -435,7 +503,7 @@ impl Dispatcher {
             if exclude.is_some_and(|x| ext.id() == x) {
                 continue;
             }
-            let outcome = match self.invoke_contained(&ext, &ev, cancel).await {
+            let outcome = match self.invoke_contained(&ext, &ev, parent, cancel).await {
                 Ok(o) => o,
                 // A contained fault (returned error, guest trap/OOM, epoch or invocation-budget
                 // timeout, native panic, (de)serialization failure, cancelled/unloaded instance) is
@@ -519,9 +587,15 @@ impl Dispatcher {
         &self,
         ext: &Arc<dyn Extension>,
         ev: &HostEvent,
+        parent: Option<&ToolCallId>,
         cancel: &CancelToken,
     ) -> Result<HookOutcome, ExtError> {
-        let call = ext.invoke_event(ev, cancel);
+        let call = async move {
+            match parent {
+                Some(parent) => ext.invoke_nested_event(parent, ev, cancel).await,
+                None => ext.invoke_event(ev, cancel).await,
+            }
+        };
         match ext.human_wait_gate() {
             Some(gate) => {
                 Self::invoke_with_sanctioned_wait_forgiveness(self.budget, &gate, call).await

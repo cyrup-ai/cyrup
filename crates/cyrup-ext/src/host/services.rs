@@ -7,8 +7,9 @@
 use crate::event::{EventKind, Subscriptions};
 use crate::manifest::Capabilities;
 use crate::native::{CtxTier, ExtMode};
+use crate::nested::ExtensionToolContext;
 use crate::registry::ExtensionRegistry;
-use cyrup_core::{CancelToken, ExtensionId};
+use cyrup_core::{CancelToken, ExtensionId, ToolCallId};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
@@ -1989,6 +1990,31 @@ pub trait ProviderReduction: Send + Sync {
     async fn after_provider_response(&self, from: &ExtensionId, status: u32, headers: Value);
 }
 
+/// The guest tool call executing on an instance (see [`GuestState::bind_tool_call`]).
+struct InFlightToolCall {
+    call_id: ToolCallId,
+    /// What `host-tool.execute-tool` / `callable-tools` act through; `None` when the call runs with
+    /// no session to run nested calls (a host without a runner attached).
+    context: Option<ExtensionToolContext>,
+}
+
+/// Why a guest's `host-tool.execute-tool` or `callable-tools` could not be served at all. A tool
+/// that FAILED is never one of these: it comes back as an outcome with `isError` set.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum NestedImportRefusal {
+    /// The `call-id` the guest passed is not the tool call executing on this instance — a guest
+    /// can only call tools on behalf of its own call in flight.
+    #[error("call-id `{0}` is not the tool call in flight on this extension")]
+    NotInFlight(String),
+    /// The call runs with no session attached, so there is nothing to run a nested call (pi: the
+    /// tool's `ctx` is `undefined`).
+    #[error("no session is attached, so a tool cannot call tools")]
+    NoSession,
+    /// `args-json` is not JSON.
+    #[error("args-json is not valid JSON: {0}")]
+    BadArguments(String),
+}
+
 /// Host-side state backing one loaded WASM extension's imports (arch-08 §3.5/§3.6). Shared (via
 /// `Arc`) between the extension's `Store<HostState>` (so the import Host impls reach it) and the
 /// [`crate::host::LiveExtension`] handle (so the loader reads back what `init` registered).
@@ -2088,6 +2114,12 @@ pub struct GuestState {
     /// The `CancelToken` of the currently-executing guest tool, backing the `host-tool.is-cancelled`
     /// poll (Pi `signal` param). Set before `execute-tool`, cleared after (sdk gap #1).
     tool_cancel: Mutex<Option<CancelToken>>,
+    /// The guest tool call executing on this instance, and the context its `host-tool.execute-tool`
+    /// and `callable-tools` imports act through ([`InFlightToolCall`]). One call at a time can be in
+    /// flight (the instance lock is held for its whole duration), which is what makes binding by
+    /// `call-id` enough; set by `LiveExtension::execute_tool` after it holds that lock, and cleared
+    /// by its guard on every exit path.
+    tool_call_in_flight: Mutex<Option<InFlightToolCall>>,
     /// `host-bash.emit-bash-output` chunks emitted during a guest bash backend's
     /// `bash-operations-exec` — pi's `onData: (data: Buffer) => void`
     /// (`core/tools/bash.ts:75` @v0.84.4). RAW bytes, combined stdout+stderr, keyed by the
@@ -2254,6 +2286,7 @@ impl GuestState {
             stream_handles: Mutex::new(HashSet::new()),
             aborted_signals: Mutex::new(HashSet::new()),
             tool_cancel: Mutex::new(None),
+            tool_call_in_flight: Mutex::new(None),
             bash_output: Mutex::new(Vec::new()),
             bash_cancel: Mutex::new(None),
             pending_with_session: Mutex::new(Vec::new()),
@@ -3063,6 +3096,63 @@ impl GuestState {
             .map(|g| g.as_ref().is_some_and(|t| t.is_cancelled()))
             .unwrap_or(false);
         token_cancelled || self.is_signal_aborted(call_id)
+    }
+
+    // --- nested tool calls (CODE-006; pi `ExtensionToolContext.executeTool` / `.tools`) ---
+
+    /// Record the guest tool call now executing on this instance and the context its nested-call
+    /// imports act through (`None` when the call runs outside a session).
+    pub fn bind_tool_call(&self, call_id: ToolCallId, context: Option<ExtensionToolContext>) {
+        if let Ok(mut g) = self.tool_call_in_flight.lock() {
+            *g = Some(InFlightToolCall { call_id, context });
+        }
+    }
+
+    /// Forget the in-flight tool call; the teardown of [`Self::bind_tool_call`].
+    pub fn unbind_tool_call(&self) {
+        if let Ok(mut g) = self.tool_call_in_flight.lock() {
+            *g = None;
+        }
+    }
+
+    /// The id of the tool call executing on this instance, if one is.
+    pub fn tool_call_in_flight(&self) -> Option<ToolCallId> {
+        self.tool_call_in_flight
+            .lock()
+            .ok()
+            .and_then(|g| g.as_ref().map(|c| c.call_id.clone()))
+    }
+
+    /// The in-flight tool call, when `call_id` is it or a call made, at any depth, by it — the
+    /// calls a nested id `<caller>/<n>` is derived from. Such a call can only be waiting for this
+    /// instance on behalf of the very call that holds it.
+    pub fn in_flight_ancestor_of(&self, call_id: &ToolCallId) -> Option<ToolCallId> {
+        let held = self.tool_call_in_flight()?;
+        let id = call_id.as_str();
+        let held_s = held.as_str();
+        let descends = id == held_s
+            || id
+                .strip_prefix(held_s)
+                .is_some_and(|rest| rest.starts_with('/'));
+        descends.then_some(held)
+    }
+
+    /// The context `call_id`'s nested-call imports act through, or the named reason there is none.
+    pub fn nested_context_for(
+        &self,
+        call_id: &str,
+    ) -> Result<ExtensionToolContext, NestedImportRefusal> {
+        let g = self
+            .tool_call_in_flight
+            .lock()
+            .map_err(|_| NestedImportRefusal::NotInFlight(call_id.to_string()))?;
+        let Some(in_flight) = g.as_ref().filter(|c| c.call_id.as_str() == call_id) else {
+            return Err(NestedImportRefusal::NotInFlight(call_id.to_string()));
+        };
+        in_flight
+            .context
+            .clone()
+            .ok_or(NestedImportRefusal::NoSession)
     }
 
     // --- guest-supplied bash backend (DRIFT-004; pi `BashOperations.exec`'s two closure options) ---

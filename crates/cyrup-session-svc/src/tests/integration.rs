@@ -298,7 +298,8 @@ async fn end_to_end_tool_call_round_trip_with_native_extension() {
         .expect("tool_execution_end");
     assert!(tes < tee, "tool exec start must precede end");
 
-    // message_end role order = user -> assistant(toolCall) -> toolResult -> assistant.
+    // message_end role order = system (the loadout the loop declares before the first request)
+    // -> user -> assistant(toolCall) -> toolResult -> assistant.
     let roles: Vec<&'static str> = events
         .iter()
         .filter_map(|e| match e {
@@ -308,7 +309,13 @@ async fn end_to_end_tool_call_round_trip_with_native_extension() {
         .collect();
     assert_eq!(
         roles,
-        vec!["user", "assistant+toolcall", "toolResult", "assistant"],
+        vec![
+            "system",
+            "user",
+            "assistant+toolcall",
+            "toolResult",
+            "assistant"
+        ],
         "message_end roles out of order: {roles:?}"
     );
 
@@ -324,8 +331,17 @@ async fn end_to_end_tool_call_round_trip_with_native_extension() {
         "extension did not observe the tool_result"
     );
 
-    // (b) the session tree on disk contains user -> assistant(toolCall) -> toolResult -> assistant.
-    let msgs = session.messages().await;
+    // (b) the session tree on disk contains system (the loadout declaration) -> user ->
+    // assistant(toolCall) -> toolResult -> assistant.
+    let all = session.messages().await;
+    assert!(
+        matches!(all.first(), Some(Message::System(s)) if !s.tools_added.is_empty()),
+        "the run's first message declares the loadout: {all:?}"
+    );
+    let msgs: Vec<Message> = all
+        .into_iter()
+        .filter(|m| !matches!(m, Message::System(_)))
+        .collect();
     assert_eq!(
         msgs.len(),
         4,

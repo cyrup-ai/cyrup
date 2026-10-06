@@ -70,9 +70,22 @@ pub(crate) struct FakeEnv {
     /// How many times `touch` ran before the approval gate was entered.
     pub(crate) touches_at_approval: Mutex<Option<usize>>,
     pub(crate) touches: AtomicUsize,
+    /// The search-mode `(server, tool)` pairs `activate_search_matches` may load, and the pairs it
+    /// was asked about, in call order.
+    pub(crate) search_mode_tools: Mutex<BTreeSet<(String, String)>>,
+    pub(crate) activations_asked: Mutex<Vec<Vec<(String, String)>>>,
+    /// The tools `activate_search_matches` has loaded, so a second match is not reported again.
+    pub(crate) activated: Mutex<BTreeSet<String>>,
 }
 
 impl FakeEnv {
+    pub(crate) fn with_search_mode_tool(self, server: &str, tool: &str) -> Self {
+        self.search_mode_tools
+            .lock()
+            .unwrap()
+            .insert((server.to_string(), tool.to_string()));
+        self
+    }
     pub(crate) fn with_connection(self, server: &str, status: ConnectionStatus) -> Self {
         self.connections
             .lock()
@@ -212,6 +225,21 @@ impl ProxyEnv for FakeEnv {
     fn mark_keep_alive_after_connect(&self, _server: &str) {}
     fn commit_prompt_metadata(&self, _server: &str) {}
     fn sync_tool_surface(&self) {}
+    fn activate_search_matches(&self, matches: &[(String, String)]) -> Vec<String> {
+        self.activations_asked
+            .lock()
+            .unwrap()
+            .push(matches.to_vec());
+        let known = self.search_mode_tools.lock().unwrap();
+        let mut activated = self.activated.lock().unwrap();
+        let mut added = Vec::new();
+        for (server, tool) in matches {
+            if known.contains(&(server.clone(), tool.clone())) && activated.insert(tool.clone()) {
+                added.push(tool.clone());
+            }
+        }
+        added
+    }
     fn supports_oauth(&self, definition: &ServerEntry) -> bool {
         definition.url.as_ref().is_some_and(|url| {
             self.oauth_servers

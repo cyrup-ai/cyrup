@@ -414,6 +414,7 @@ impl NativeExtension for ResultAppender {
             return HookOutcome::Mutate(crate::EventPatch::ToolResult {
                 content: Some(vec![Content::text(text)]),
                 details: None,
+                structured_content: None,
                 is_error: None,
                 usage: None,
                 terminate: None,
@@ -450,6 +451,7 @@ async fn a08_3_tool_result_patch_chains() {
         args: &args,
         content: &content,
         details: None,
+        structured_content: None,
         usage: None,
         is_error: false,
         terminate: TerminateHint::Continue,

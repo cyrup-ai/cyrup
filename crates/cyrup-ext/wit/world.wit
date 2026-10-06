@@ -1,4 +1,4 @@
-// cyrup:ext@0.14.0 — the versioned WIT world (arch-08 §4.1).
+// cyrup:ext@0.16.0 — the versioned WIT world (arch-08 §4.1).
 //
 // Single source of truth, shared verbatim by the host (`wasmtime::component::bindgen!`)
 // and the guest (`wit-bindgen` in cyrup-ext-sdk). Open-shaped values (tool params, message
@@ -113,7 +113,24 @@
 // `defaultActive`, `extensions/types.ts:509`, `:527`, `:608` @v1.0.1), which re-signs
 // `registration.register-tool`. A 0.13 guest calls it with the record without them and would fail
 // to LINK against this host, so it takes the bump.
-package cyrup:ext@0.14.0;
+//
+// 0.14 -> 0.15 is the nested-tool-call batch (pi `ExtensionToolContext.executeTool` / `.tools`,
+// `extensions/types.ts:367-395`, and the `parentToolCallId` of `tool_call`, `tool_result` and
+// `tool_execution_*`, `:1061-1083`, `:1155-1161`, `:1231` @v1.0.1), an EXPORT RE-SIGNING:
+// `events.on-tool-call`, `on-tool-result` and `on-tool-execution-{start,update,end}` each gained a
+// trailing `parent-tool-call-id: option<string>`. A 0.14 guest exports the shorter signatures and
+// would fail to LINK against this host, so it takes the bump (the 0.8 -> 0.9 `render-call`
+// precedent). The two `host-tool` imports that make a guest tool's `execute` able to call tools,
+// `execute-tool` and `callable-tools`, are ADDITIVE and would not have required one on their own.
+//
+// 0.15 -> 0.16 is the structured-content batch (pi `ToolResultEventBase.structuredContent` and
+// `ToolResultEventResult.structuredContent`, `extensions/types.ts:1238`, `:1445` @v1.0.1), an EXPORT
+// RE-SIGNING: `events.on-tool-result` gained a trailing `structured-content-json: option<string>`,
+// the tool's machine-readable result (`none` when it returned none). The patch direction needs no
+// new field: it rides the `hook-outcome` mutate JSON, whose `structuredContent` key the host now
+// reads. A 0.15 guest exports the shorter signature and would fail to LINK against this host, so it
+// takes the bump (the 0.14 -> 0.15 and 0.2 -> 0.3 `on-tool-result` precedents).
+package cyrup:ext@0.16.0;
 
 // ---------------------------------------------------------------------------
 // Serializable mirrors of cyrup-core. JSON-as-string at the seam (arch-08 §4.1).
@@ -472,8 +489,27 @@ interface events {
   // `2fd38684`; EXT-072: `:919` is the sibling `isError`) —
   // not just content+isError. A `tool_result` handler inspects and patches all of them; the patch
   // direction rides the `hook-outcome` mutate JSON, whose `usage` key is read back host-side.
-  on-tool-call:    func(call-id: string, name: string, input-json: string) -> hook-outcome;
-  on-tool-result:  func(call-id: string, name: string, input-json: string, content-json: string, is-error: bool, details-json: option<string>, usage-json: option<string>) -> hook-outcome;
+  //
+  // `structured-content-json` (pi `ToolResultEventBase.structuredContent?: JsonValue`,
+  // `extensions/types.ts:1238` @v1.0.1) is the tool's machine-readable result, `none` when it
+  // returned none. The mutate JSON's `structuredContent` key replaces it
+  // (`ToolResultEventResult.structuredContent`, `:1445`), and a patch that replaces `content`
+  // WITHOUT one drops it, "because it may no longer match" (`:1436-1441`; `runner.ts:1194-1198`).
+  //
+  // `parent-tool-call-id` (pi `parentToolCallId?: string`, `extensions/types.ts:1061-1083` @v1.0.1,
+  // on `tool_call`, `tool_result` and the three `tool_execution_*` events below): the id of the
+  // tool call that made THIS call, when a tool is calling a tool (`ctx.executeTool`) — itself
+  // `<id>/<n>` when that tool was a nested call. `none` for every call the model issued, so a
+  // handler that must tell the two apart reads this and one that gates on `tool_call` needs no
+  // change to cover nested calls.
+  //
+  // [CYRUP-DELTA] The ONE instance that does not receive the events of a nested call is the one
+  // whose own tool is making it. pi runs every subscribed handler, that extension's included,
+  // because it is one JS process; here the calling tool is suspended inside `host-tool.execute-tool`
+  // in its own single-instance `Store`, and the lock that would deliver the event is the one it
+  // holds. Every other extension receives them, with `parent-tool-call-id` set.
+  on-tool-call:    func(call-id: string, name: string, input-json: string, parent-tool-call-id: option<string>) -> hook-outcome;
+  on-tool-result:  func(call-id: string, name: string, input-json: string, content-json: string, is-error: bool, details-json: option<string>, usage-json: option<string>, parent-tool-call-id: option<string>, structured-content-json: option<string>) -> hook-outcome;
 
   // --- 5.3 agent & turn ---
   // context [mutate] (subscribed at types.ts:1207 @v0.83.0), message_end [mutate] (:1222),
@@ -551,14 +587,14 @@ interface events {
   // @v0.83.0), so a name-based cross-check of the catalog reported three false gaps and needed a
   // three-entry exception list. Do not re-abbreviate them: every such exception is a place a real
   // gap can hide. The rename re-signed the world (0.7 -> 0.8).
-  on-tool-execution-start:  func(call-id: string, name: string, args-json: string);
+  on-tool-execution-start:  func(call-id: string, name: string, args-json: string, parent-tool-call-id: option<string>);
   // tool_execution_update (pi `ToolExecutionUpdateEvent`, extensions/types.ts:770-776 @v0.83.0):
   // `{type, toolCallId, toolName, args, partialResult}` — FIVE fields; cyrup used to drop `toolName`
   // AND `args`, forcing every observer to keep its own callId->name map (EXT-014).
-  on-tool-execution-update: func(call-id: string, name: string, args-json: string, chunk-json: string); // HIGH-FREQ, gated
+  on-tool-execution-update: func(call-id: string, name: string, args-json: string, chunk-json: string, parent-tool-call-id: option<string>); // HIGH-FREQ, gated
   // tool_execution_end (pi `ToolExecutionEndEvent`, extensions/types.ts:779-785 @v0.83.0):
   // `{type, toolCallId, toolName, result, isError}`.
-  on-tool-execution-end:    func(call-id: string, name: string, result-json: string, is-error: bool);
+  on-tool-execution-end:    func(call-id: string, name: string, result-json: string, is-error: bool, parent-tool-call-id: option<string>);
 
   // --- 5.1/5.2 startup & session lifecycle ---
   // session_start (pi `SessionStartEvent`, extensions/types.ts:562-569 @v0.83.0): the `reason`
@@ -1125,6 +1161,38 @@ interface host-tool {
   // polls this during a long `execute` to cooperatively stop. True once the host cancels the call
   // (epoch/`CancelToken`) or a named signal for this `call-id` was aborted (`ui.abort-signal`).
   is-cancelled: func(call-id: string) -> bool;
+
+  // pi `ExtensionToolContext.executeTool(name, args, options?)` (`extensions/types.ts:394`
+  // @v1.0.1): run another tool from inside this tool's `execute`, through the same validation,
+  // hooks and permission checks as a model-issued call. `call-id` is the id the host passed to
+  // `execute-tool`: the call gets the id `<call-id>/<n>`, its events carry `call-id` as
+  // `parent-tool-call-id`, it never enters the transcript, and a bounded record of it lands as
+  // `nestedCalls` on this call's result message. Cancellation is the calling tool's own
+  // (`signal`'s default; see `is-cancelled`).
+  //
+  // The `ok` value is `(outcome-json, partial-results-json)`: `outcome-json` is pi's
+  // `AgentToolCallOutcome` — `{toolCall, result: {content, details?, usage?, structuredContent?,
+  // isError?, terminate?, addedToolNames?}, isError}` — and `isError` is the normalised verdict.
+  // It NEVER reports a tool failure as `err`: an unknown tool, a tool that is not callable, a
+  // validation error, a blocked call and a failing tool all come back as `ok` with `isError` set.
+  // `err` means the call itself could not be made: `call-id` is not the call in flight on this
+  // instance, no session is attached, the nested call re-enters this same instance, or
+  // `args-json` is not JSON.
+  //
+  // Two of pi's options do not cross as pi has them, and this import does not pretend otherwise.
+  // `options.onUpdate` is a closure and the guest is suspended inside this call, so it inverts
+  // the way `emit-update` does: when `collect-updates` is true the partial results the nested tool
+  // streamed come back, in order, as `partial-results-json` (one `AgentToolResult` JSON each) when
+  // the call settles — BATCHED, not live; the same results ARE delivered live as
+  // `tool_execution_update` events, as in pi. `options.signal` is NOT carried: the nested call's
+  // cancellation is always the calling tool's, because a suspended guest has no abort handle it
+  // could fire on a signal of its own.
+  execute-tool: func(call-id: string, name: string, args-json: string, collect-updates: bool) -> result<tuple<string, list<string>>, string>;
+
+  // pi `ExtensionToolContext.tools` (`extensions/types.ts:385`): what `execute-tool` can call, as a
+  // JSON array of `{name, label?, description, parameters, outputSchema?, exposure, namespace?}`.
+  // `err` when `call-id` is not the call in flight or no session is attached.
+  callable-tools: func(call-id: string) -> result<string, string>;
 }
 
 // The two closure-shaped options of pi's `BashOperations.exec` (`core/tools/bash.ts:71-80`

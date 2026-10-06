@@ -49,7 +49,7 @@ use crate::state::McpState;
 /// ask, and **everything else asks too** — upstream's `if (!Array.isArray(approval)) return true;`
 /// (MCP-602). That arm is the whole point of [`ApproveTools::Other`]: a value this build cannot
 /// read must not read as "never ask", which is what it did while `approveTools` shared
-/// `BoolOrList` and went through `lenient` — `"approveTools": "destructive"`, copied from
+/// `BoolOrList` (the former name of the `directTools` type) and went through `lenient` — `"approveTools": "destructive"`, copied from
 /// upstream's README, silently disabled approval for the server it was written on.
 ///
 /// # The legacy arm, and the collision test that makes it safe

@@ -220,6 +220,40 @@ async fn a_registered_tool_renderer_draws_the_tool_row() {
     );
 }
 
+/// `renderResult` runs for every result the row receives, partial ones included
+/// (`tool-execution.ts:295-296`, `updateResult(result, isPartial)`): while the tool is still
+/// running the extension's body is on screen, and the final result's render replaces it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_registered_tool_renderer_draws_a_partial_result_while_the_tool_runs() {
+    let host = host_with_renderer().await;
+    let mut app = app();
+
+    let start = AgentSessionEvent::ToolExecutionStart {
+        tool_call_id: ToolCallId::from("call-partial"),
+        tool_name: "bash".into(),
+        args: json!({ "command": "sleep 1" }),
+    };
+    app.ingest_event_with_extensions(&start, &host).await;
+    let update = AgentSessionEvent::ToolExecutionUpdate {
+        tool_call_id: ToolCallId::from("call-partial"),
+        tool_name: "bash".into(),
+        args: json!({ "command": "sleep 1" }),
+        partial_result: json!({ "content": [{ "type": "text", "text": "builtin-partial-marker" }] }),
+    };
+    app.ingest_event_with_extensions(&update, &host).await;
+    app.draw().unwrap();
+
+    let live = buffer_text(&app);
+    assert!(
+        live.contains("EXTRESULT[bash]"),
+        "the extension rendered the PARTIAL result while the tool runs:\n{live}"
+    );
+    assert!(
+        !live.contains("builtin-partial-marker"),
+        "the built-in partial body did not also draw:\n{live}"
+    );
+}
+
 /// A tool NO extension claimed keeps its built-in rendering.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_unclaimed_tool_keeps_its_builtin_rendering() {
@@ -777,6 +811,7 @@ fn replay_tool_result(id: &str, name: &str, body: &str) -> SessionMessage {
         timestamp: 0,
         usage: None,
         added_tool_names: Vec::new(),
+        nested_calls: None,
     })
 }
 

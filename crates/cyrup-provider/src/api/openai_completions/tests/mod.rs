@@ -122,6 +122,7 @@ fn ctx_with_tool_call_ids(ids: &[&str]) -> Context {
             timestamp: 0,
             usage: None,
             added_tool_names: Vec::new(),
+            nested_calls: None,
         });
     }
     Context {

@@ -112,6 +112,10 @@ pub use cyrup_agent::QueueMode;
 /// ([`SessionBuilder::stream_fn`]/[`SessionBuilder::key_resolver`], Pi `AgentOptions.streamFn`) and
 /// the built-in proxy transport ([`ProxyStreamFn`]) without a direct `cyrup-agent` dependency.
 pub use cyrup_agent::{ApiKeyResolver, ProxyStreamFn, ProxyStreamOptions, StreamFn};
+/// Re-exported because they are the option and result types of [`AgentSession::execute_nested_tool`]
+/// — the call an extension tool's `ctx.executeTool` binds — so a caller can name them without a
+/// direct `cyrup-agent` dependency.
+pub use cyrup_agent::{NestedToolCallOptions, ToolCallOutcome};
 pub use cyrup_config::AppMode;
 /// Re-exported because it is the argument type of [`SessionBuilder::cli_settings`] — an embedder (or
 /// a front-end test) cannot name that seam's input without a direct `cyrup-config` dependency.

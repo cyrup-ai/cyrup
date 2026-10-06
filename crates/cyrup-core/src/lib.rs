@@ -42,9 +42,10 @@ pub use exposure::{
 pub use keyed_lock::{Cancelled, KeyedAcquire, KeyedGuard, KeyedLockMap, KeyedLocks};
 pub use lazy_args::LazyArgs;
 pub use message::{
-    AssistantMessage, Content, Cost, DeferredHandle, Message, ModelThinkingLevel, Sections,
-    StopReason, SystemMessage, TextPhase, TextSignatureV1, ThinkingLevel, ToolCall, UNRESOLVED_API,
-    Usage,
+    AssistantMessage, Content, Cost, DeferredHandle, Message, ModelThinkingLevel,
+    NESTED_CALL_LIMITS, NestedCallHandle, NestedCallLimits, NestedCallRecorder, NestedCallResult,
+    NestedCallStatus, NestedToolCallRecord, NestedToolCalls, Sections, StopReason, SystemMessage,
+    TextPhase, TextSignatureV1, ThinkingLevel, ToolCall, UNRESOLVED_API, Usage, combine_usage,
 };
 pub use shared_str::SharedStr;
 pub use tool::{

@@ -8,10 +8,11 @@ use serde_json::Value;
 
 use super::layer::Settings;
 use super::types::{
-    BranchSummarySettings, CacheWarmingMode, CompactionSettings, DefaultProjectTrust,
-    FullscreenExitOutput, FullscreenScrollbar, MermaidRenderingMode, PackageSource,
-    ProviderRetrySettings, QuietStartup, RetrySettings, TerminalCapabilityOverrides,
-    TerminalImagesOverride, ThinkingBudgets, TuiMode, Warnings, WheelScrollLines,
+    BranchSummarySettings, CacheWarmingMode, CodemodeMode, CodemodeSettings, CompactionSettings,
+    DEFAULT_CODEMODE_INLINE_BUDGET, DefaultProjectTrust, FullscreenExitOutput, FullscreenScrollbar,
+    MermaidRenderingMode, PackageSource, ProviderRetrySettings, QuietStartup, RetrySettings,
+    TerminalCapabilityOverrides, TerminalImagesOverride, ThinkingBudgets, TuiMode, Warnings,
+    WheelScrollLines,
 };
 use crate::error::ConfigError;
 
@@ -745,6 +746,44 @@ impl EffectiveSettings {
                 anthropic_extra_usage: obj.get("anthropicExtraUsage").and_then(Value::as_bool),
             },
             None => Warnings::default(),
+        }
+    }
+
+    /// The `codemode` object as written (Pi `settings.codemode`, `settings-manager.ts:178`
+    /// @v1.0.1). Parsed field-wise like [`Self::warnings`]: a field of the wrong type or an
+    /// unknown `mode` spelling is `None` without discarding the other.
+    pub fn codemode(&self) -> CodemodeSettings {
+        let Some(obj) = self.merged.get("codemode").and_then(Value::as_object) else {
+            return CodemodeSettings::default();
+        };
+        CodemodeSettings {
+            mode: match obj.get("mode").and_then(Value::as_str) {
+                Some("on") => Some(CodemodeMode::On),
+                Some("only") => Some(CodemodeMode::Only),
+                _ => None,
+            },
+            inline_budget: obj.get("inlineBudget").and_then(Value::as_f64),
+        }
+    }
+
+    /// `codemode.mode` as the codemode extension reads it (`readMode`, `extensions/codemode/
+    /// index.ts:22-24` @v1.0.1): `mode === "only" ? "only" : "on"`, so an unknown value, a
+    /// non-string and an absent key all answer [`CodemodeMode::On`].
+    pub fn codemode_mode(&self) -> CodemodeMode {
+        match self.merged.get_nested_str(&["codemode", "mode"]).as_deref() {
+            Some("only") => CodemodeMode::Only,
+            _ => CodemodeMode::On,
+        }
+    }
+
+    /// `codemode.inlineBudget` as the codemode extension reads it (`readInlineBudget`,
+    /// `index.ts:26-29` @v1.0.1, with the tool's `?? DEFAULT_CODEMODE_INLINE_BUDGET`): a finite
+    /// number `>= 0` is used as is — `0` lists only namespaces — and anything else, including an
+    /// absent key, is [`DEFAULT_CODEMODE_INLINE_BUDGET`].
+    pub fn codemode_inline_budget(&self) -> f64 {
+        match self.merged.get_nested_f64(&["codemode", "inlineBudget"]) {
+            Some(budget) if budget.is_finite() && budget >= 0.0 => budget,
+            _ => DEFAULT_CODEMODE_INLINE_BUDGET,
         }
     }
 

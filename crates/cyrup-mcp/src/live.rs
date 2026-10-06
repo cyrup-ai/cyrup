@@ -1750,6 +1750,13 @@ impl ProxyEnv for RuntimeEnv {
         }
     }
 
+    fn activate_search_matches(&self, matches: &[(String, String)]) -> Vec<String> {
+        self.extension
+            .upgrade()
+            .map(|extension| extension.activate_search_matches(matches))
+            .unwrap_or_default()
+    }
+
     // --- mcp-auth-flow.ts ------------------------------------------------------------------------
 
     fn supports_oauth(&self, definition: &ServerEntry) -> bool {

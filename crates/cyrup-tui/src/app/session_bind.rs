@@ -319,13 +319,16 @@ impl<B: Backend> App<B> {
                         _ => None,
                     }) {
                         let args = Value::Object((*call.arguments).clone());
-                        // A tool ROW is a string surface (see the live fold): `into_text` flattens
-                        // exactly as `events_fold.rs` does, and a fault already collapsed to `None`.
-                        if let Some(text) =
-                            extension_render_tool_call(ext_host, &call.name, &args, &opts)
-                                .await
-                                .into_text()
-                        {
+                        // `into_text` flattens exactly as `events_fold.rs` does, and a fault already
+                        // collapsed to `None`; a renderer's COMPONENT is carried whole beside it.
+                        let drawn =
+                            extension_render_tool_call(ext_host, &call.name, &args, &opts).await;
+                        if let crate::transcript::Rendered::Tree(tree) = &drawn {
+                            rendered
+                                .tool_call_trees
+                                .insert(call.id.as_str().to_string(), tree.clone());
+                        }
+                        if let Some(text) = drawn.into_text() {
                             rendered
                                 .tool_calls
                                 .insert(call.id.as_str().to_string(), text);
@@ -337,6 +340,7 @@ impl<B: Backend> App<B> {
                     tool_name,
                     content,
                     details,
+                    is_error,
                     ..
                 }) => {
                     // The SAME `{content, details}` value the walk hands the built-in renderer,
@@ -344,11 +348,19 @@ impl<B: Backend> App<B> {
                     // (`tool-execution.ts:307-308`: `{ content: this.result.content, details:
                     // this.result.details }`).
                     let result = tool_result_payload(content, details.as_ref());
-                    if let Some(text) =
-                        extension_render_tool_result(ext_host, tool_name, &result, &opts)
-                            .await
-                            .into_text()
-                    {
+                    let drawn = extension_render_tool_result(
+                        ext_host,
+                        tool_name,
+                        &result,
+                        &opts.clone().errored(*is_error),
+                    )
+                    .await;
+                    if let crate::transcript::Rendered::Tree(tree) = &drawn {
+                        rendered
+                            .tool_result_trees
+                            .insert(tool_call_id.as_str().to_string(), tree.clone());
+                    }
+                    if let Some(text) = drawn.into_text() {
                         rendered
                             .tool_results
                             .insert(tool_call_id.as_str().to_string(), text);
@@ -504,6 +516,13 @@ impl<B: Backend> App<B> {
                             rendered.tool_calls.get(call.id.as_str()).cloned(),
                             definition,
                         );
+                        if let Some(tree) = rendered.tool_call_trees.get(call.id.as_str()) {
+                            self.state.transcript.set_tool_tree(
+                                call.id.as_str(),
+                                crate::transcript::ToolSide::Call,
+                                Some(tree.clone()),
+                            );
+                        }
                     }
                     if let Some(notice) = stop_reason_notice(m) {
                         self.state.transcript.push_error(notice);
@@ -530,6 +549,13 @@ impl<B: Backend> App<B> {
                         // EXT-041 — the extension's result body for THIS call id, or the built-in.
                         rendered.tool_results.get(tool_call_id.as_str()).cloned(),
                     );
+                    if let Some(tree) = rendered.tool_result_trees.get(tool_call_id.as_str()) {
+                        self.state.transcript.set_tool_tree(
+                            tool_call_id.as_str(),
+                            crate::transcript::ToolSide::Result,
+                            Some(tree.clone()),
+                        );
+                    }
                     // Keep call order in scrollback: commit the finished leading run now instead of
                     // deferring every tool of the whole replay to the end.
                     self.state.transcript.commit_finished_leading_tools();
@@ -680,11 +706,11 @@ impl<B: Backend> App<B> {
 /// `message.toolCallId` (`:3770`) and a custom ENTRY by `entry.customType` at the walk itself
 /// (`getEntryRenderer`, `:3571`). A key with no entry draws the built-in framing.
 ///
-/// The two tool maps hold flattened text rather than [`crate::transcript::Rendered`] because a
-/// tool row is a string surface — the live fold flattens with `into_text()` at the push
-/// (`events_fold.rs`), and the replay must not carry a tier the row cannot draw. The message and
-/// entry maps carry the whole [`crate::transcript::Rendered`]: a `Live` component draws, and — for
-/// an entry — `Failed` is pi's own third outcome (`custom-entry.ts:47-52`), not an absence.
+/// The two tool text maps hold flattened text rather than [`crate::transcript::Rendered`] because a
+/// tool row draws text the way the live fold does (`into_text()` at the push, `events_fold.rs`); a
+/// renderer's COMPONENT travels in the two `*_trees` maps beside them. The message and entry maps
+/// carry the whole [`crate::transcript::Rendered`]: a `Live` component draws, and — for an entry —
+/// `Failed` is pi's own third outcome (`custom-entry.ts:47-52`), not an absence.
 #[derive(Default)]
 struct ReplayRenders {
     /// MESSAGE index → the custom-message renderer's output (X11 / EXT-006).
@@ -693,6 +719,12 @@ struct ReplayRenders {
     tool_calls: std::collections::HashMap<String, crate::transcript::RenderedText>,
     /// Tool-call id → the extension's `renderResult` text (EXT-041).
     tool_results: std::collections::HashMap<String, crate::transcript::RenderedText>,
+    /// Tool-call id → the component a native renderer returned for `renderCall`. Carried whole,
+    /// not flattened: it is laid out per frame.
+    tool_call_trees: std::collections::HashMap<String, std::sync::Arc<dyn cyrup_ext::RenderedTree>>,
+    /// Tool-call id → the component a native renderer returned for `renderResult`.
+    tool_result_trees:
+        std::collections::HashMap<String, std::sync::Arc<dyn cyrup_ext::RenderedTree>>,
     /// ITEM index → the custom-ENTRY renderer's three-state outcome (EXT-041).
     ///
     /// Keyed by position in the ITEM stream, not by entry id: pi resolves this renderer inside the

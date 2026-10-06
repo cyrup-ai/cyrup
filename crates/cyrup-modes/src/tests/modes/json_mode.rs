@@ -80,7 +80,9 @@ async fn json_mode_emits_ordered_event_stream() {
         .expect("tool_execution_end");
     assert!(tes < tee, "tool exec start must precede end: {kinds:?}");
 
-    // message_end role order = user -> assistant(toolCall) -> toolResult -> assistant.
+    // message_end role order = system (the loadout the loop declares before the first request,
+    // pi `declareToolChanges`, `agent-loop.ts:327-376` @v1.0.1) -> user -> assistant(toolCall) ->
+    // toolResult -> assistant.
     let roles: Vec<String> = events
         .iter()
         .filter(|e| type_of(e) == "message_end")
@@ -88,7 +90,7 @@ async fn json_mode_emits_ordered_event_stream() {
         .collect();
     assert_eq!(
         roles,
-        vec!["user", "assistant", "toolResult", "assistant"],
+        vec!["system", "user", "assistant", "toolResult", "assistant"],
         "message_end roles out of order: {roles:?}"
     );
 }

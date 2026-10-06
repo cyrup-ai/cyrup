@@ -57,6 +57,11 @@ pub(crate) struct ToolCallEnv<'a> {
     pub(crate) new_messages: &'a [Arc<AgentMessage>],
     /// The assistant message the hooks are told issued the call (pi `assistantMessage`).
     pub(crate) assistant: &'a AssistantMessage,
+    /// The tool call that made this call, for a call a tool made while it ran (CODE-006). `None`
+    /// for a model-issued call. It selects which of the hooks' two entry points run
+    /// ([`crate::hooks::Hooks::before_nested_tool_call`] / `after_nested_tool_call`), so a hook
+    /// that tells the two apart is told which one it is looking at.
+    pub(crate) parent: Option<&'a ToolCallId>,
 }
 
 impl ToolCallEnv<'_> {
@@ -99,6 +104,7 @@ impl RunCtx {
             },
             new_messages: &self.new_messages,
             assistant,
+            parent: None,
         }
     }
 }

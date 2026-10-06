@@ -994,6 +994,61 @@ impl Models {
         Ok(out)
     }
 
+    /// Models of every type whose providers have complete auth configuration (Pi
+    /// `Models.getAllAvailable`, `models.ts:716-732` @v1.0.1). PROV-105.
+    ///
+    /// Per provider: the same auth gate as [`Models::get_available`] (an unconfigured provider is
+    /// skipped; an auth-check failure propagates), then [`Provider::get_all_models`] through the
+    /// provider's own [`Provider::filter_all_models`] when it has one. Without it, chat models go
+    /// through [`Provider::filter_models`] and every other model is kept — pi's
+    /// `!isModelType(model, "chat") || availableChatIds.has(model.id)`.
+    pub async fn get_all_available(
+        &self,
+        provider: Option<&str>,
+    ) -> Result<Vec<AnyModel>, ProviderError> {
+        let entries: Vec<&Arc<dyn Provider>> = match provider {
+            Some(id) => self.providers.get(id).into_iter().collect(),
+            None => self.providers.values().collect(),
+        };
+        let mut out = Vec::new();
+        for entry in entries {
+            if self.check_auth(entry.id().as_str()).await?.is_none() {
+                continue;
+            }
+            let credential = self.credentials.read(entry.id()).await?;
+            let all = entry.get_all_models();
+            if let Some(filtered) = entry.filter_all_models(&all, credential.as_ref()) {
+                out.extend(filtered);
+                continue;
+            }
+            let available_chat: std::collections::HashSet<String> = entry
+                .filter_models(entry.models(), credential.as_ref())
+                .into_iter()
+                .map(|model| model.id.as_str().to_string())
+                .collect();
+            out.extend(all.into_iter().filter(|model| match model.as_chat() {
+                Some(chat) => available_chat.contains(chat.id.as_str()),
+                None => true,
+            }));
+        }
+        Ok(out)
+    }
+
+    /// The available models of one type (Pi `Models.getAvailableOfType`, `models.ts:708-714`
+    /// @v1.0.1). PROV-105.
+    pub async fn get_available_of_type(
+        &self,
+        model_type: ModelType,
+        provider: Option<&str>,
+    ) -> Result<Vec<AnyModel>, ProviderError> {
+        Ok(self
+            .get_all_available(provider)
+            .await?
+            .into_iter()
+            .filter(|model| model.model_type() == model_type)
+            .collect())
+    }
+
     /// Run a provider-owned login flow and persist the credential it returns (Pi `Models.login`,
     /// `models.ts:168` @v0.83.0). PROV-031.
     pub async fn login(

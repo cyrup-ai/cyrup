@@ -58,8 +58,20 @@ pub(crate) fn tool_block(
     // undefined` (`tool-execution.ts:103-105`). A registered RENDERER can only have come from a
     // definition, so either rendered side implies one; the rest is what the session's own
     // `getToolDefinition(name)` answered when the run started ([`ToolRun::has_definition`]).
-    let has_definition =
-        run.definition.is_some() || run.rendered_call.is_some() || run.rendered_result.is_some();
+    let has_definition = run.definition.is_some()
+        || run.rendered_call.is_some()
+        || run.rendered_result.is_some()
+        || run.live_call.is_some()
+        || run.live_result.is_some();
+    // `getRenderShell()` (see below) is asked FIRST because a renderer's component is laid out at the
+    // width its container gives it: the default shell's `Box(1, 1)` leaves two columns for padding,
+    // the `"self"` container none.
+    let shell = render_shell(run, builtin);
+    let content_width = match shell {
+        ToolRenderKind::SelfRendered => width,
+        ToolRenderKind::Default => width.saturating_sub(2),
+    }
+    .max(1);
     let generic = builtin.is_none() && !has_definition;
     if generic {
         // The `else` of `hasRendererDefinition()`: the unbounded `formatToolExecution()`
@@ -71,17 +83,35 @@ pub(crate) fn tool_block(
         // built-in's, then the matching fallback. Resolving them together is what used to leave an
         // extension that registered only `renderCall` with no body at all, and what sent every
         // defined-but-unrendered tool through `formatToolExecution`.
-        match &run.rendered_call {
-            Some(call) => render_extension_call(&call.text, theme, &mut block),
-            None => match builtin {
+        // A renderer's COMPONENT is what pi's `ToolExecutionComponent` keeps as
+        // `callRendererComponent` and re-renders per frame; it wins over every string tier.
+        match (&run.live_call, &run.rendered_call) {
+            (Some(live), _) => block.extend(tree_lines(
+                live.0.as_ref(),
+                expanded,
+                content_width,
+                theme,
+                images.expand_key,
+            )),
+            (None, Some(call)) => render_extension_call(&call.text, theme, &mut block),
+            (None, None) => match builtin {
                 Some(kind) => render_builtin_call(kind, run, expanded, theme, images, &mut block),
                 // `createCallFallback()` (`:137-139`, selected at `:281-283`).
                 None => render_call_fallback(run, theme, &mut block),
             },
         }
-        match &run.rendered_result {
-            Some(result) => render_extension_result(&result.text, run, expanded, theme, &mut block),
-            None => match builtin {
+        match (&run.live_result, &run.rendered_result) {
+            (Some(live), _) => block.extend(tree_lines(
+                live.0.as_ref(),
+                expanded,
+                content_width,
+                theme,
+                images.expand_key,
+            )),
+            (None, Some(result)) => {
+                render_extension_result(&result.text, theme, &mut block);
+            }
+            (None, None) => match builtin {
                 Some(kind) => render_builtin_result(kind, run, expanded, theme, images, &mut block),
                 // `createResultFallback()` (`:141-155`, selected at `:298-304`). Upstream reaches
                 // it only inside `if (this.result)` (`:295`); the fallback makes the same check.
@@ -119,28 +149,6 @@ pub(crate) fn tool_block(
     for line in &mut block {
         normalize_line(line);
     }
-    // EXT-024 — `getRenderShell()` (`tool-execution.ts:108-116` @v0.84.4):
-    //
-    // ```ts
-    // if (!this.builtInToolDefinition) return this.toolDefinition?.renderShell ?? "default";
-    // if (!this.toolDefinition) return this.builtInToolDefinition.renderShell ?? "default";
-    // return this.toolDefinition.renderShell ?? this.builtInToolDefinition.renderShell ?? "default";
-    // ```
-    //
-    // `run.definition` is the session registry's answer (`getToolDefinition(name)`), which in
-    // cyrup already merges the built-ins with every custom and extension tool, so the first tier
-    // is one read. The second tier — `builtInToolDefinition.renderShell` — is reached only when
-    // no registry was asked (the id-less constructors, a result whose start was missed), and the
-    // built-in table answers it: `edit` is the one built-in that declares `renderShell: "self"`
-    // (`core/tools/edit.ts:330`; `cyrup-tools/src/tools/edit.rs` `render_kind`), every other
-    // built-in leaves it unset.
-    let shell = match run.definition {
-        Some(kind) => kind,
-        None => match builtin {
-            Some(Builtin::Edit) => ToolRenderKind::SelfRendered,
-            _ => ToolRenderKind::Default,
-        },
-    };
     // `if (this.hasRendererDefinition() && this.getRenderShell() === "self")` (`:237`) — the
     // `hasRendererDefinition()` half is implied: `shell` can only be `SelfRendered` through a
     // definition or the built-in table, each of which satisfies it.
@@ -168,6 +176,31 @@ pub(crate) fn tool_block(
         None
     };
     ToolBlock { lines: out, hit }
+}
+
+/// EXT-024 — `getRenderShell()` (`tool-execution.ts:108-116` @v0.84.4):
+///
+/// ```ts
+/// if (!this.builtInToolDefinition) return this.toolDefinition?.renderShell ?? "default";
+/// if (!this.toolDefinition) return this.builtInToolDefinition.renderShell ?? "default";
+/// return this.toolDefinition.renderShell ?? this.builtInToolDefinition.renderShell ?? "default";
+/// ```
+///
+/// `run.definition` is the session registry's answer (`getToolDefinition(name)`), which in
+/// cyrup already merges the built-ins with every custom and extension tool, so the first tier
+/// is one read. The second tier — `builtInToolDefinition.renderShell` — is reached only when
+/// no registry was asked (the id-less constructors, a result whose start was missed), and the
+/// built-in table answers it: `edit` is the one built-in that declares `renderShell: "self"`
+/// (`core/tools/edit.ts:330`; `cyrup-tools/src/tools/edit.rs` `render_kind`), every other
+/// built-in leaves it unset.
+fn render_shell(run: &ToolRun, builtin: Option<Builtin>) -> ToolRenderKind {
+    match run.definition {
+        Some(kind) => kind,
+        None => match builtin {
+            Some(Builtin::Edit) => ToolRenderKind::SelfRendered,
+            _ => ToolRenderKind::Default,
+        },
+    }
 }
 
 /// The `renderShell: "self"` block — `ToolExecutionComponent.render()`'s first branch
@@ -208,7 +241,9 @@ fn self_rendered_block(
 ) -> ToolBlock {
     let own_edit_component = builtin == Some(Builtin::Edit)
         && run.rendered_call.is_none()
-        && run.rendered_result.is_none();
+        && run.rendered_result.is_none()
+        && run.live_call.is_none()
+        && run.live_result.is_none();
     let content: Vec<Line<'static>> = if own_edit_component {
         let bg = theme.edit_bg_style(Style::default(), edit_header_preview(run), run.is_error);
         box_lines(block, width, 1, 1, bg)

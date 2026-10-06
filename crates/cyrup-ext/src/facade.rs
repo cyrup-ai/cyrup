@@ -315,6 +315,10 @@ pub struct ExtensionHost {
     /// via [`Self::set_active_tool_source`], in which case [`Self::active_tools`] hands tools back
     /// UNWRAPPED — there is no live agent whose tool set could change, so the diff has no meaning.
     active_tool_source: RwLock<Option<Arc<dyn crate::wrapper::ActiveToolNames>>>,
+    /// Where the session's [`crate::NestedToolRunner`] is attached ([`Self::set_nested_tool_runner`]).
+    /// Shared with every tool [`Self::wrap_tool`] / [`Self::active_tools`] wraps, which read it at
+    /// execute time — the runner exists only once the session does, long after the tools were built.
+    nested_runner: Arc<crate::nested::NestedRunnerSlot>,
     /// The bus fan-out (EXT-034). Owned here (strong) and handed to the dispatcher as a `Weak`, so
     /// every dispatch entry point drains after its subscriber loop — not just the two command-tier
     /// call sites that used to be the only drain.
@@ -420,6 +424,7 @@ impl ExtensionHost {
             ctx_source: RwLock::new(None),
             commands_listeners: Arc::new(RwLock::new(Vec::new())),
             active_tool_source: RwLock::new(None),
+            nested_runner: Arc::new(crate::nested::NestedRunnerSlot::default()),
             fanout,
         }
     }
@@ -440,9 +445,25 @@ impl ExtensionHost {
     /// (agent-session.ts:2507-2515) without reaching into the registry.
     pub fn wrap_tool(&self, tool: Arc<dyn Tool>) -> Arc<dyn Tool> {
         match self.active_tool_source.read().ok().and_then(|g| g.clone()) {
-            Some(src) => crate::wrapper::wrap_registered_tool(tool, src),
+            Some(src) => crate::wrapper::wrap_registered_tool_with_nested(
+                tool,
+                src,
+                Arc::clone(&self.nested_runner),
+            ),
             None => tool,
         }
+    }
+
+    /// Attach the session's [`crate::NestedToolRunner`] — the half of pi's `ctx.executeTool`
+    /// (`agent-session.ts:3420-3421`) that only the session can supply. From then on every tool
+    /// this host wrapped ([`Self::wrap_tool`], [`Self::active_tools`],
+    /// [`Self::registered_tools_filtered`]) runs with a [`crate::ExtensionToolContext`] bound to its
+    /// call, and a guest tool's `host-tool.execute-tool` import reaches the same runner.
+    ///
+    /// The host keeps a `Weak`: the session owns the runner, and the session reaches this host.
+    /// Idempotent; the last runner wins.
+    pub fn set_nested_tool_runner(&self, runner: &Arc<dyn crate::NestedToolRunner>) {
+        self.nested_runner.set(runner);
     }
 
     /// Load a compiled-in native extension (R-ARCH-EXT-003). Awaits `init` (R-08-001), registers its
@@ -511,6 +532,7 @@ impl ExtensionHost {
         // registration step that fails after an earlier one succeeded, and through anything an
         // `init`-spawned task pushed via the `LateRegistrar`.
         let result = self.load_native_body(ext, id.clone()).await;
+        self.settle_omissions();
         match &result {
             // A native built-in is compiled in, so like Pi's inline factories
             // (`loadExtensionFromFactory` → `initializeExtension`, `core/extensions/loader.ts:553`
@@ -542,6 +564,10 @@ impl ExtensionHost {
     /// Infallible by design: the load is already returning its own error, and a poisoned registry
     /// lock must not mask it. A purge failure is traced.
     fn discard_registrations(&self, id: &ExtensionId) {
+        // A failed load leaves nothing of the extension, its replaceable standing included.
+        if let Err(e) = self.registry.forget_replaceable(id) {
+            tracing::warn!(extension = %id, error = %e, "could not forget a failed extension's replaceable standing");
+        }
         match self.registry.purge_owner(id) {
             Ok(n) if n > 0 => tracing::debug!(
                 extension = %id,
@@ -570,6 +596,15 @@ impl ExtensionHost {
         // `load_native_with_services`: that method is `cfg(feature = "wasm-host")`, and the whole
         // point of `LateRegistrar` being feature-independent is that both build arms get one.
         ext.set_late_registrar(self.late_registrar_for(id.clone()));
+
+        // An id whose earlier holder was left out names a new extension now: it inherits neither
+        // that standing nor its omission. A replaceable built-in is then known to the registry
+        // before its first registration, so every name it registers is judged against the other
+        // extensions ([`crate::replaceable`]).
+        self.registry.forget_replaceable(&id)?;
+        if ext.replaceable() {
+            self.registry.mark_replaceable(id.clone())?;
+        }
 
         let mut api = InitApi::new();
         ext.init(&mut api).await?;
@@ -609,6 +644,23 @@ impl ExtensionHost {
         for tool in tools {
             self.registry.register_tool(id.clone(), tool)?;
         }
+        // The other two namespaces a replaceable built-in can be left out by (`resource-loader.ts:
+        // 124-128`), registered ahead of the rest so an extension left out has registered nothing
+        // else to leave behind. Each table keeps its own registration order.
+        for (name, desc) in &commands {
+            self.registry
+                .register_command(id.clone(), name.clone(), desc.clone())?;
+        }
+        for (name, spec) in &flags {
+            self.registry
+                .register_flag(id.clone(), name.clone(), spec.clone())?;
+        }
+        if self.registry.is_omitted(&id)? {
+            // Left out: its registrations are already gone from the registry; it must not reach the
+            // dispatcher or the command-routing table either (`settle_omissions`).
+            self.bus.unsubscribe_all(&id);
+            return Ok(());
+        }
         // SEAM-084 — a compiled-in native has no path and no directory, which is exactly upstream's
         // `loadExtensionFromFactory` case: its default `extensionPath` is the literal `"<inline>"`
         // (`core/extensions/loader.ts:490` @v0.83.0), so `createExtension`'s `<…>` split yields
@@ -616,9 +668,6 @@ impl ExtensionHost {
         // and after `init` has succeeded, so a native whose `init` failed leaves no orphan row.
         self.registry
             .record_extension_provenance(id.clone(), crate::ExtensionProvenance::inline())?;
-        for (name, desc) in commands {
-            self.registry.register_command(id.clone(), name, desc)?;
-        }
         // EXT-006: a native built-in's renderer declarations land in the SAME registry tables the
         // guest path writes, so `render_tool_call`/`render_message_call` route by name/type without
         // caring which runtime supplies the renderer.
@@ -643,9 +692,6 @@ impl ExtensionHost {
         // register tools but not shortcuts, flags or providers.
         for (key, desc) in shortcuts {
             self.registry.register_shortcut(id.clone(), key, desc)?;
-        }
-        for (name, spec) in flags {
-            self.registry.register_flag(id.clone(), name, spec)?;
         }
         for (provider_id, config) in providers {
             self.registry
@@ -850,7 +896,13 @@ impl ExtensionHost {
         };
         tools
             .into_iter()
-            .map(|t| crate::wrapper::wrap_registered_tool(t, src.clone()))
+            .map(|t| {
+                crate::wrapper::wrap_registered_tool_with_nested(
+                    t,
+                    src.clone(),
+                    Arc::clone(&self.nested_runner),
+                )
+            })
             .collect()
     }
 
@@ -864,6 +916,9 @@ impl ExtensionHost {
     /// descriptor is pure bookkeeping, so this is callable from `active_tools` and from a
     /// non-async drain alike.
     pub fn refresh_tools(&self) -> Result<bool, ExtError> {
+        // A late registration through a `LateRegistrar` can leave a replaceable built-in out; its
+        // event handlers go before the tool set is rebuilt.
+        self.settle_omissions();
         if !self.registry.take_tools_dirty() {
             return Ok(false);
         }
@@ -944,7 +999,9 @@ impl ExtensionHost {
         owner: ExtensionId,
         tool: Arc<dyn Tool>,
     ) -> Result<(), ExtError> {
-        self.registry.register_tool(owner, tool)
+        let registered = self.registry.register_tool(owner, tool);
+        self.settle_omissions();
+        registered
     }
 
     // NOTE on callers: this is the EMBEDDER-facing door — a host that already holds the
@@ -963,6 +1020,7 @@ impl ExtensionHost {
         desc: CommandDescriptor,
     ) -> Result<(), ExtError> {
         self.registry.register_command(owner, name, desc)?;
+        self.settle_omissions();
         self.notify_commands_changed();
         Ok(())
     }
@@ -1140,6 +1198,22 @@ impl ExtensionHost {
                 InputReduction::Continue
             }
         }
+    }
+
+    /// Deliver a `tool_execution_*` event of a call another tool made to the extensions that
+    /// subscribe to it (CODE-006; pi `this._extensionRunner.emit(event)` with `parentToolCallId`
+    /// set, `agent-session.ts:719-733` @v1.0.1). Notify-only, subscription-gated and fault-contained
+    /// like every other `tool_execution_*` dispatch; a native handler reads the parent from
+    /// [`crate::HostCtx::parent_tool_call_id`].
+    pub async fn emit_nested_tool_execution(
+        &self,
+        event: &cyrup_agent::NestedToolExecutionEvent,
+        cancel: &CancelToken,
+    ) {
+        let (ev, parent) = HostEvent::from_nested_tool_execution(event);
+        self.dispatcher
+            .dispatch_notify_nested(&ev, &parent, cancel)
+            .await;
     }
 
     /// Dispatch `message_end` (Pi `ExtensionRunner.emitMessageEnd`, runner.ts:770-810; gap-08 #3). A
@@ -1461,6 +1535,11 @@ impl ExtensionHost {
         let Some(owner) = self.registry.tool_renderer_owner(tool_name).ok().flatten() else {
             return RenderOutcome::None;
         };
+        if let Some(outcome) =
+            self.native_tool_tree(&owner, tool_name, call, RenderKind::Call, opts)
+        {
+            return outcome;
+        }
         self.render_via(&owner, tool_name, call, RenderKind::Call, opts)
             .await
     }
@@ -1494,8 +1573,50 @@ impl ExtensionHost {
         let Some(owner) = self.registry.tool_renderer_owner(tool_name).ok().flatten() else {
             return RenderOutcome::None;
         };
+        if let Some(outcome) =
+            self.native_tool_tree(&owner, tool_name, result, RenderKind::Result, opts)
+        {
+            return outcome;
+        }
         self.render_via(&owner, tool_name, result, RenderKind::Result, opts)
             .await
+    }
+
+    /// The component tier of a tool renderer: a NATIVE owner that answers
+    /// [`crate::NativeExtension::render_call_tree`] / `render_result_tree` with a tree. `None` means
+    /// "no tree", and the JSON hooks are tried next — upstream's `Component | undefined`.
+    ///
+    /// A panicking renderer is contained exactly as [`Self::render_via`] contains one, and reported
+    /// as [`RenderOutcome::Failed`] so the surface decides how to degrade.
+    fn native_tool_tree(
+        &self,
+        owner: &ExtensionId,
+        key: &str,
+        payload: &Value,
+        kind: RenderKind,
+        opts: &RenderOptions,
+    ) -> Option<RenderOutcome> {
+        let native = self
+            .native
+            .read()
+            .ok()
+            .and_then(|g| g.get(owner).cloned())?;
+        let drawn = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match kind {
+            RenderKind::Result => native.render_result_tree(key, payload, opts),
+            RenderKind::Call | RenderKind::Entry => native.render_call_tree(key, payload, opts),
+        }));
+        match drawn {
+            Ok(Some(tree)) => Some(RenderOutcome::Tree(tree)),
+            Ok(None) => None,
+            Err(panic) => {
+                let message = native_panic_msg(panic);
+                tracing::warn!(
+                    extension = %owner, key = %key, error = %message,
+                    "native tool tree renderer panicked (contained; the row keeps the built-in shell)"
+                );
+                Some(RenderOutcome::Failed(message))
+            }
+        }
     }
 
     /// Render a CUSTOM MESSAGE through the extension that registered a renderer for `custom_type`
@@ -2435,6 +2556,7 @@ impl ExtensionHost {
         // one take exactly the same path — and so a descriptor is bound to its OWNING instance
         // rather than to whichever extension happened to load last.
         self.materialize_guest_tools()?;
+        self.settle_omissions();
         time(&format!("{timing_path} factory"), TimingLabel::Extensions);
         Ok(ext)
     }
@@ -2924,6 +3046,36 @@ impl ExtensionHost {
         Ok(())
     }
 
+    /// Drop what the registry does not hold of every replaceable built-in another extension left
+    /// out ([`crate::replaceable`]): its event handlers, bus subscriptions, command routing and id
+    /// reservation. Upstream never hands such an extension to its runner, so none of these exist
+    /// there. Cheap when nothing was left out.
+    fn settle_omissions(&self) {
+        let Ok(pending) = self.registry.take_pending_unload() else {
+            return;
+        };
+        for id in pending {
+            self.bus.unsubscribe_all(&id);
+            self.dispatcher.remove(&id);
+            if let Ok(mut g) = self.native.write() {
+                g.remove(&id);
+            }
+            #[cfg(feature = "wasm-host")]
+            if let Ok(mut g) = self.live.write() {
+                g.remove(&id);
+            }
+            self.release_id(&id);
+        }
+    }
+
+    /// The replaceable built-ins that were left out because another extension registered a name
+    /// they registered (pi `omitReplacedExtensions`, `core/resource-loader.ts:116-153` @v1.0.1),
+    /// each with the extension that holds the name. [`OmittedExtension::warning`] is upstream's
+    /// warning for it.
+    pub fn omitted_extensions(&self) -> Vec<crate::OmittedExtension> {
+        self.registry.omitted_extensions().unwrap_or_default()
+    }
+
     /// Undo a [`Self::reserve_id`] after the load that claimed it failed (EXT-S01). Silent on a
     /// poisoned lock — the load is already reporting its own error.
     fn release_id(&self, id: &ExtensionId) {
@@ -2981,6 +3133,9 @@ pub enum RenderOutcome {
     /// The renderer handed back a LIVE component, to be re-rendered by the host on every frame at
     /// the current width, theme and expansion. Native-only — see [`crate::RenderedComponent`].
     Live(std::sync::Arc<dyn crate::RenderedComponent>),
+    /// A TOOL renderer handed back a component tree for the host to lay out at the live width — pi
+    /// `renderCall` / `renderResult` returning a `Component`. Native-only, like [`Self::Live`].
+    Tree(std::sync::Arc<dyn crate::RenderedTree>),
 }
 
 impl PartialEq for RenderOutcome {
@@ -2992,6 +3147,7 @@ impl PartialEq for RenderOutcome {
             (Self::Rendered(a), Self::Rendered(b)) => a == b,
             (Self::Failed(a), Self::Failed(b)) => a == b,
             (Self::Live(a), Self::Live(b)) => std::sync::Arc::ptr_eq(a, b),
+            (Self::Tree(a), Self::Tree(b)) => std::sync::Arc::ptr_eq(a, b),
             _ => false,
         }
     }
@@ -3013,7 +3169,7 @@ impl RenderOutcome {
             Self::Rendered(v) => Some(v),
             // A live component is not a `Value` and cannot be collapsed into one; a caller that
             // wants JSON genuinely has none.
-            Self::None | Self::Failed(_) | Self::Live(_) => None,
+            Self::None | Self::Failed(_) | Self::Live(_) | Self::Tree(_) => None,
         }
     }
 

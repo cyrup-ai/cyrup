@@ -5,7 +5,7 @@
 //! `serde(tag=…)` + untagged-fallback shape is not expressible with `serde_derive`, so [`Entry`]
 //! hand-implements `Serialize`/`Deserialize` and delegates known variants to [`KnownEntry`].
 
-use cyrup_core::{Content, EntryId, ModelId, ProviderId, Usage};
+use cyrup_core::{Content, EntryId, ModelId, ProviderId, SystemMessage, Usage};
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
@@ -111,6 +111,17 @@ pub enum KnownEntry {
         usage: Option<Usage>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         from_hook: Option<bool>,
+        /// The complete prompt and tool state at this compaction boundary (Pi
+        /// `CompactionEntry.systemMessage`, `session-manager.ts:103` @v1.0.1).
+        ///
+        /// Compaction drops the entries before the first kept one, and `buildContextEntries` drops
+        /// every system message from the kept range as well (`:506`), so this is the ONLY carrier of
+        /// the loadout across a compaction: the projection of the compaction entry is this message
+        /// followed by the summary (`sessionEntryToContextMessages`, `:462-463`). Absent on an entry
+        /// written before the transcript carried system messages, and when the replayed state was
+        /// empty.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        system_message: Option<SystemMessage>,
     },
     BranchSummary {
         #[serde(flatten)]

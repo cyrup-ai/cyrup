@@ -509,6 +509,9 @@ pub struct SessionBuilder {
     settings_store: Arc<dyn SettingsStore>,
     auth: Option<Arc<AuthStore>>,
     native_extensions: Vec<Arc<dyn NativeExtension>>,
+    /// Where the `codemode` extension finds the session it runs in. Set by [`Self::with_codemode`]
+    /// or [`Self::codemode_host_slot`]; each built session binds its own host into it.
+    codemode_host_slot: Option<cyrup_codemode_runtime::tool::CodemodeHostSlot>,
     cli_settings: Settings,
     /// A pre-built session manager to adopt instead of opening/creating one from `config.target`
     /// (Pi `createAgentSessionFromServices` with a caller-supplied `sessionManager`,
@@ -618,6 +621,7 @@ impl SessionBuilder {
             settings_store: Arc::new(InMemorySettingsStore::new()),
             auth: None,
             native_extensions: Vec::new(),
+            codemode_host_slot: None,
             cli_settings: Settings::new(),
             prebuilt_manager: None,
             provider_resolver: None,
@@ -760,6 +764,28 @@ impl SessionBuilder {
     #[must_use]
     pub fn with_native_extension(mut self, ext: Arc<dyn NativeExtension>) -> Self {
         self.native_extensions.push(ext);
+        self
+    }
+
+    /// Register the built-in `codemode` extension (pi's `builtin:codemode`, `extensions/index.ts:9-14`
+    /// @v1.0.1): the extension is loaded like any native built-in, and each session built from this
+    /// builder is bound into the extension's host slot, so the tool it registers can call tools,
+    /// replay the branch's `store()` entries and reach the model registry as pi's `ctx` lets it.
+    #[must_use]
+    pub fn with_codemode(self, ext: cyrup_codemode_runtime::CodemodeExtension) -> Self {
+        let slot = ext.host().clone();
+        self.with_native_extension(Arc::new(ext))
+            .codemode_host_slot(slot)
+    }
+
+    /// Bind each built session into `slot`, for a codemode extension that is already registered
+    /// through [`Self::with_native_extension`] (what [`crate::SessionFactory`] does per build).
+    #[must_use]
+    pub fn codemode_host_slot(
+        mut self,
+        slot: cyrup_codemode_runtime::tool::CodemodeHostSlot,
+    ) -> Self {
+        self.codemode_host_slot = Some(slot);
         self
     }
 
@@ -1282,6 +1308,23 @@ impl SessionBuilder {
         // built-ins (permission-system, intercom), so anything short of a non-zero exit would turn
         // a failed permission gate into a fail-OPEN session.
         let mut native_load_errors: Vec<crate::services::ExtensionLoadDiagnostic> = Vec::new();
+        // The `codemode` tool's `prepare_loadout` hook reads `codemode.mode` / `codemode.inlineBudget`
+        // while the loadout is resolved (below), long before the session is shared, so its host
+        // exists from here with the settings this session was built with. `into_shared` attaches the
+        // session itself. Pi reads the same two settings from `pi.getSettings()` at hook time
+        // (`extensions/codemode/index.ts:22-29` @v1.0.1); a session's settings are fixed until
+        // `/reload` rebuilds it, so reading them once is the same value.
+        let codemode_host = self.codemode_host_slot.as_ref().map(|slot| {
+            let eff = settings.effective();
+            let host = Arc::new(crate::session::SessionCodemodeHost::new(
+                crate::session::CodemodeSettings {
+                    mode: eff.codemode_mode(),
+                    inline_budget: eff.codemode_inline_budget(),
+                },
+            ));
+            slot.bind(host.clone());
+            host
+        });
         // SEAM-071: `--no-extensions` gates the AMBIENT natives too. It used to gate only the
         // WASM/disk discovery roots (`extension_discovery_roots`), while this loop loaded every
         // native unconditionally — so `cyrup --no-extensions` still started an intercom broker,
@@ -1503,6 +1546,20 @@ impl SessionBuilder {
         }
         #[cfg(not(feature = "wasm-host"))]
         let _ = &ext_roots;
+
+        // Every replaceable built-in another extension displaced is reported as a warning
+        // (`omitReplacedExtensions` pushes one onto the load result per left-out built-in,
+        // `resource-loader.ts:139-150` @v1.0.1). Not fatal: pi keeps the session and the
+        // replacement, and only the collisions it does NOT resolve exit 1.
+        startup_diagnostics
+            .extensions
+            .extend(ext_host.omitted_extensions().iter().map(|omitted| {
+                crate::services::ExtensionLoadDiagnostic {
+                    path: PathBuf::from(omitted.extension.as_str()),
+                    error: omitted.warning(),
+                    fatal: false,
+                }
+            }));
 
         // Apply the CLI-captured extension flag overrides now that every loaded extension's
         // `registerFlag` has run (Pi runs `applyExtensionFlagValues` inside
@@ -1815,8 +1872,34 @@ impl SessionBuilder {
         // prompt is built. It decides the system prompt's tool list (a tool whose declaration a
         // `prepare_loadout` hook hides is not listed, `agent-session.ts:1655-1658`) and is what the
         // agent starts with.
+        //
+        // A session whose caller did not choose its tools resumes with the loadout its transcript
+        // declares (pi `_restoreToolsFromTranscript`, `agent-session.ts:1762-1769` @v1.0.1, taken
+        // at construction when no `initialActiveToolNames` was given, `:497`): what a `tool_search`
+        // load, a `setActiveTools` call or an extension registration recorded survives the
+        // process. A transcript with no system message declares nothing, and the selection above
+        // stands. The names the session may not expose are dropped (`_isAllowedTool`).
+        let restored_loadout: Option<Vec<String>> = if cfg.tools.is_none() && cfg.no_tools.is_none()
+        {
+            crate::tools::declared_tool_names(&existing_raw).map(|names| {
+                names
+                    .into_iter()
+                    .filter(|name| {
+                        crate::tools::is_allowed_tool(
+                            allowed_tool_names.as_ref(),
+                            &excluded_tool_names,
+                            name,
+                        )
+                    })
+                    .collect()
+            })
+        } else {
+            None
+        };
         let initial_loadout = {
-            let names: Vec<String> = active_tools.iter().map(|t| t.name().to_string()).collect();
+            let names: Vec<String> = restored_loadout
+                .clone()
+                .unwrap_or_else(|| active_tools.iter().map(|t| t.name().to_string()).collect());
             cyrup_core::ToolLoadout::resolve(&names, &registry_tools)
         };
         let selected_tools: Vec<Arc<str>> = initial_loadout
@@ -1921,11 +2004,18 @@ impl SessionBuilder {
         // Pi has no such gap: its `nextActiveToolNames` starts from `getActiveToolNames()`, which
         // reads the live `agent.state.tools` (`core/agent-session.ts:2524-2545`), so an extension
         // tool present at build is present in the rebuild.
-        let dynamic_tools = Arc::new(std::sync::Mutex::new(crate::tools::DynamicToolState::new(
+        let mut dynamic_tool_state = crate::tools::DynamicToolState::new(
             registry_tools,
             active_tools.clone(),
             crate::tools::PromptRebuilder::new(rebuild_base, contributions),
-        )));
+        );
+        // The same names `initial_loadout` was resolved from, now with their pending half: a
+        // restored tool that registers after the build (an MCP server still connecting) becomes
+        // active when it does.
+        if let Some(names) = &restored_loadout {
+            dynamic_tool_state.restore_declared(names);
+        }
+        let dynamic_tools = Arc::new(std::sync::Mutex::new(dynamic_tool_state));
         host_services.attach_dynamic_tools(dynamic_tools.clone());
         // EXT-005: seed the guest-visible `ctx.getSystemPrompt()` / `ctx.isProjectTrusted()` reads
         // from the values this build resolved (Pi binds both straight to the session:
@@ -1982,6 +2072,9 @@ impl SessionBuilder {
             block_images,
             handle.clone(),
         ));
+        // The same hooks the agent runs with, for the calls tools make while they run (CODE-006).
+        let nested_hooks: Arc<dyn cyrup_agent::Hooks> = policy_hooks.clone();
+        let nested_calls = Arc::new(cyrup_agent::NestedToolCallRunner::new());
         let eff = settings.effective();
         // Provider attribution + opencode session headers (Pi sdk.ts:323-330, #20). Telemetry is the
         // env override (`CYRUP_TELEMETRY`) else the `enableInstallTelemetry` setting.
@@ -2291,6 +2384,7 @@ impl SessionBuilder {
             handle.clone(),
             ext_host.clone(),
             session_cancel.clone(),
+            nested_calls.clone(),
         )));
         let agent = Arc::new(agent);
 
@@ -2326,6 +2420,9 @@ impl SessionBuilder {
             handle,
             bash_session_env,
             read_model_vision,
+            nested_calls,
+            hooks: nested_hooks,
+            codemode_host,
         };
 
         let services = AgentSessionServices {

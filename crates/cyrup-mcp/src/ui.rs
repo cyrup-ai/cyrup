@@ -1249,11 +1249,13 @@ impl DirectToolsChange {
     /// The `directTools` value this change serialises to, in the shape
     /// [`crate::config::write_direct_tools_config`] consumes.
     #[must_use]
-    pub fn to_setting(&self) -> crate::config::BoolOrList {
+    pub fn to_setting(&self) -> crate::config::DirectToolsSetting {
         match self {
-            DirectToolsChange::All => crate::config::BoolOrList::All(true),
-            DirectToolsChange::None => crate::config::BoolOrList::All(false),
-            DirectToolsChange::Named(names) => crate::config::BoolOrList::Named(names.clone()),
+            DirectToolsChange::All => crate::config::DirectToolsSetting::All(true),
+            DirectToolsChange::None => crate::config::DirectToolsSetting::All(false),
+            DirectToolsChange::Named(names) => {
+                crate::config::DirectToolsSetting::Named(names.clone())
+            }
         }
     }
 }
@@ -1277,7 +1279,7 @@ impl McpPanelResult {
     /// [`open_mcp_panel`]: the `writeDirectToolsConfig` -> `onDirectToolsConfigChanged` chain that
     /// would consume it belongs to the unported `/mcp` dispatcher, not to the panel.
     #[must_use]
-    pub fn to_config_changes(&self) -> IndexMap<String, crate::config::BoolOrList> {
+    pub fn to_config_changes(&self) -> IndexMap<String, crate::config::DirectToolsSetting> {
         self.changes
             .iter()
             .map(|(name, change)| (name.clone(), change.to_setting()))
@@ -1601,8 +1603,8 @@ impl McpPanelModel {
             result: None,
         };
 
-        // `settings.directTools` is a plain boolean upstream (`types.ts:508`), unlike the
-        // per-server field, so a global value can only ever contribute `true`.
+        // `settings.directTools` is `boolean | "search"` upstream (`types.ts:627` @v5.0.0), unlike
+        // the per-server field, so a global value is never a list.
         let global_direct = config.settings_or_default().direct_tools;
         let config_servers = model.config_servers.clone();
         for (server_name, definition) in &config_servers {
@@ -1613,17 +1615,24 @@ impl McpPanelModel {
             let server_cache = model.valid_entry(server_name, definition).cloned();
 
             // `definition.directTools !== undefined` wins outright — **including** an explicit
-            // `false` — else a *truthy* global. The asymmetry is deliberate: a per-server `false`
-            // wins, and a global `false` falls through to the same `false`.
-            let tool_filter = match definition.direct_tools.clone() {
-                Some(value) => Some(value),
-                None if global_direct == Some(true) => Some(crate::config::BoolOrList::All(true)),
-                None => None,
+            // `false` — else the global, which `selected !== undefined` then reads as is.
+            let selected = definition
+                .direct_tools
+                .clone()
+                .or_else(|| global_direct.map(crate::config::DirectToolsSetting::from));
+            // `mcp-panel.ts:503`: search-activated tools are still direct tools for the panel.
+            let tool_filter = match selected {
+                Some(crate::config::DirectToolsSetting::Search) => {
+                    Some(crate::config::DirectToolsSetting::All(true))
+                }
+                other => other,
             };
             let is_direct_for = |name: &str| match &tool_filter {
-                Some(crate::config::BoolOrList::All(all)) => *all,
-                Some(crate::config::BoolOrList::Named(list)) => list.iter().any(|n| n == name),
-                None => false,
+                Some(crate::config::DirectToolsSetting::All(all)) => *all,
+                Some(crate::config::DirectToolsSetting::Named(list)) => {
+                    list.iter().any(|n| n == name)
+                }
+                Some(crate::config::DirectToolsSetting::Search) | None => false,
             };
 
             let mut tools: Vec<ToolState> = Vec::new();
@@ -5236,7 +5245,7 @@ pub fn open_mcp_setup_panel(
 )]
 mod tests {
     use super::*;
-    use crate::config::{BoolOrList, McpSettings};
+    use crate::config::{DirectToolsSetting, McpSettings};
     use crate::dirs::CachedResource;
 
     // ---------------------------------------------------------------------------------------
@@ -5602,7 +5611,7 @@ mod tests {
         };
         config.mcp_servers.insert("a".into(), stdio.clone());
         config.settings = Some(McpSettings {
-            direct_tools: Some(true),
+            direct_tools: Some(crate::config::GlobalDirectTools::All(true)),
             ..McpSettings::default()
         });
         let mut cache = MetadataCache::default();
@@ -5633,12 +5642,12 @@ mod tests {
         let mut config = McpConfig::default();
         let stdio = ServerEntry {
             command: Some("echo".into()),
-            direct_tools: Some(BoolOrList::All(false)),
+            direct_tools: Some(DirectToolsSetting::All(false)),
             ..ServerEntry::default()
         };
         config.mcp_servers.insert("a".into(), stdio.clone());
         config.settings = Some(McpSettings {
-            direct_tools: Some(true),
+            direct_tools: Some(crate::config::GlobalDirectTools::All(true)),
             ..McpSettings::default()
         });
         let mut cache = MetadataCache::default();
@@ -6156,7 +6165,7 @@ mod tests {
         };
         config.mcp_servers.insert("a".into(), stdio.clone());
         config.settings = Some(McpSettings {
-            direct_tools: Some(true),
+            direct_tools: Some(crate::config::GlobalDirectTools::All(true)),
             ..McpSettings::default()
         });
         let mut cache = MetadataCache::default();

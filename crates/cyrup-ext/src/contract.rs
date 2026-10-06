@@ -54,6 +54,15 @@ pub enum EventPatch {
     ToolResult {
         content: Option<Vec<Content>>,
         details: Option<Value>,
+        /// pi `ToolResultEventResult.structuredContent` (`types.ts:1445` @v1.0.1): `Some` REPLACES
+        /// the structured content. `None` keeps it, EXCEPT when `content` is `Some`: pi's runner
+        /// drops the structured content of a result whose content a handler replaced, "because it
+        /// may no longer match" (`runner.ts:1194-1198`), and the fold in
+        /// [`HostEvent::apply_patch`] does the same. Return it along with `content` to keep it.
+        ///
+        /// Boxed: a second inline `Value` makes this variant 210 bytes larger than the next one,
+        /// which every `HookOutcome` (one per handler per event) would then carry.
+        structured_content: Option<Box<Value>>,
         is_error: Option<bool>,
         usage: Option<cyrup_core::Usage>,
         /// pi `ToolResultEventResult.terminate` folded by `afterResult.terminate ?? result.terminate`
@@ -114,6 +123,7 @@ impl HostEvent {
                 HostEvent::ToolResult {
                     content,
                     details,
+                    structured_content,
                     is_error,
                     usage,
                     terminate,
@@ -122,16 +132,24 @@ impl HostEvent {
                 EventPatch::ToolResult {
                     content: c,
                     details: d,
+                    structured_content: sc,
                     is_error: e,
                     usage: u,
                     terminate: t,
                 },
             ) => {
+                // Pi `emitToolResult` (`runner.ts:1190-1207` @v1.0.1), in its order: replacing
+                // `content` first DROPS the structured content (it "may no longer match"), and the
+                // handler's own `structuredContent`, applied after, puts one back.
                 if let Some(c) = c {
                     *content = c;
+                    *structured_content = None;
                 }
                 if d.is_some() {
                     *details = d;
+                }
+                if let Some(sc) = sc {
+                    *structured_content = Some(*sc);
                 }
                 if let Some(e) = e {
                     *is_error = e;

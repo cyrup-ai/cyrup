@@ -5,7 +5,7 @@ use super::util::lock;
 use super::{Agent, AgentBuilder, HeaderFn};
 use crate::error::{AgentError, BusyEntry};
 use crate::event::AgentMessage;
-use crate::queue::QueueMode;
+use crate::queue::{QueueMode, ToolExecution};
 use crate::state::AgentStateSnapshot;
 use crate::stream_fn::StreamFn;
 use crate::subscriber::EventSubscriber;
@@ -315,6 +315,12 @@ impl Agent {
     /// cannot await the latch.
     pub fn is_running(&self) -> bool {
         *self.running_rx.borrow()
+    }
+
+    /// How a batch of tool calls runs (Pi `agent.toolExecution`, read at
+    /// `agent-session.ts:704` @v1.0.1 to decide whether a nested call is exclusive).
+    pub fn tool_execution(&self) -> ToolExecution {
+        self.tool_execution
     }
 
     /// Active run's abort signal, if one is active (Pi `agent.signal`, agent.ts:294-297). Callers can

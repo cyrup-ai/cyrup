@@ -624,6 +624,7 @@ mod tests {
             added_tool_names: Vec::new(),
             is_error: false,
             timestamp: 0,
+            nested_calls: None,
         };
         let message = cyrup_agent::AgentMessage::Custom {
             kind: "probe".to_string(),
@@ -668,6 +669,7 @@ mod tests {
             added_tool_names: Vec::new(),
             is_error: true,
             timestamp: 0,
+            nested_calls: None,
         };
         let message = cyrup_agent::AgentMessage::Custom {
             kind: "probe".to_string(),

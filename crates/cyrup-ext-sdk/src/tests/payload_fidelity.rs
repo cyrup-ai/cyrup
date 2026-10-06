@@ -25,6 +25,8 @@ fn tool_result_carries_input_details_and_usage() {
         is_error: false,
         details: Some(json!({ "exitCode": 0 })),
         usage: Some(json!({ "input": 3, "output": 4 })),
+        structured_content: None,
+        parent_tool_call_id: None,
     };
     assert_eq!(
         serde_json::to_value(&ev).unwrap(),
@@ -53,10 +55,13 @@ fn tool_result_omits_absent_details_and_usage() {
         is_error: false,
         details: None,
         usage: None,
+        structured_content: None,
+        parent_tool_call_id: None,
     };
     let v = serde_json::to_value(&ev).unwrap();
     assert!(!v.as_object().unwrap().contains_key("details"));
     assert!(!v.as_object().unwrap().contains_key("usage"));
+    assert!(!v.as_object().unwrap().contains_key("structuredContent"));
 }
 
 /// `input` (Pi `InputEvent`, types.ts:800-810): the prior struct dropped `images`, `source`, and
@@ -221,10 +226,43 @@ fn tool_call_is_pi_shaped() {
         call_id: "c".into(),
         name: "read".into(),
         input: json!({ "path": "/x" }),
+        parent_tool_call_id: None,
     };
     assert_eq!(
         serde_json::to_value(&ev).unwrap(),
         json!({ "toolCallId": "c", "toolName": "read", "input": { "path": "/x" } })
+    );
+}
+
+/// CODE-006 — pi's `parentToolCallId?: string` on `tool_call` and `tool_result`
+/// (`extensions/types.ts:1061-1083` @v1.0.1): present, camelCase, for a call a tool made; ABSENT
+/// (not `null`) for a call the model issued.
+#[test]
+fn nested_call_events_carry_parent_tool_call_id_in_pi_shape() {
+    let call = ToolCallEvent {
+        call_id: "c/1".into(),
+        name: "read".into(),
+        input: json!({}),
+        parent_tool_call_id: Some("c".into()),
+    };
+    assert_eq!(
+        serde_json::to_value(&call).unwrap(),
+        json!({ "toolCallId": "c/1", "toolName": "read", "input": {}, "parentToolCallId": "c" })
+    );
+    let result = ToolResultEvent {
+        call_id: "c/1".into(),
+        name: "read".into(),
+        input: json!({}),
+        content: json!([]),
+        is_error: false,
+        details: None,
+        usage: None,
+        structured_content: None,
+        parent_tool_call_id: Some("c".into()),
+    };
+    assert_eq!(
+        serde_json::to_value(&result).unwrap()["parentToolCallId"],
+        json!("c")
     );
 }
 

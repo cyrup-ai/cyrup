@@ -61,6 +61,7 @@ fn kimi_deferred_tools_move_from_the_tools_array_into_an_inline_system_message()
                 usage: None,
                 // The anchor: this result introduced `late`.
                 added_tool_names: vec!["late".to_string()],
+                nested_calls: None,
             },
         ]
     }

@@ -210,6 +210,7 @@ mod tests {
             usage: None,
             added_tool_names: added.iter().map(|s| s.to_string()).collect(),
             timestamp: 3,
+            nested_calls: None,
         }
     }
 

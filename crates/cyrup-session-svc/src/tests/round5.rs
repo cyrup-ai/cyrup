@@ -46,6 +46,15 @@ fn base_config(fx: &Fixture) -> SessionConfig {
     cfg
 }
 
+/// The conversation in a projection: everything but the system messages, which carry the loadout
+/// the loop declares (pi `declareToolChanges`, `agent-loop.ts:327-376` @v1.0.1) and are not turns.
+fn conversation(messages: &[cyrup_core::Message]) -> usize {
+    messages
+        .iter()
+        .filter(|m| !matches!(m, cyrup_core::Message::System(_)))
+        .count()
+}
+
 /// Concatenate the text of a core `user` message (the faux summary call's prompt lives here).
 fn user_text(m: &Message) -> Option<String> {
     let Message::User { content, .. } = m else {
@@ -87,7 +96,7 @@ async fn navigate_tree_reedit_user_message_returns_editor_text_and_truncates() {
     session.wait_for_idle().await;
 
     // Two user/assistant pairs are on the branch.
-    assert_eq!(session.messages().await.len(), 4, "u1,a1,u2,a2");
+    assert_eq!(conversation(&session.messages().await), 4, "u1,a1,u2,a2");
     let anchors = session.user_messages_for_forking().await;
     assert_eq!(anchors.len(), 2);
     let u2: EntryId = anchors[1].entry_id.clone();
@@ -117,12 +126,17 @@ async fn navigate_tree_reedit_user_message_returns_editor_text_and_truncates() {
 
     // The transcript is truncated to [u1, a1] and the agent's in-memory state mirrors it.
     assert_eq!(
-        session.messages().await.len(),
+        conversation(&session.messages().await),
         2,
         "u2/a2 are off the active branch"
     );
     assert_eq!(
-        session.agent_messages().await.len(),
+        session
+            .agent_messages()
+            .await
+            .iter()
+            .filter(|m| !matches!(m, cyrup_agent::AgentMessage::System(_)))
+            .count(),
         2,
         "agent transcript rebuilt from context"
     );

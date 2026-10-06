@@ -5,6 +5,57 @@ next work item**.
 
 ---
 
+# UPDATE 2026-10-06 (codemode) — area 18 closes thirteen rows and opens four; two area-13 rows close, three open
+
+> The unported pi 1.0 `codemode` feature, built end to end on `claude/codemode` (ADR-0031, `deno_core`).
+> Upstream read only through git objects at pin `v1.0.1`.
+>
+> The count is whatever `python3 docs/gap-analysis/scripts/count_open_items.py` prints, measured on this
+> branch after the edits: **143 open — 0 critical, 0 high, 6 medium, 137 low; 17 trackers; 912 closed; 0
+> duplicates**. Area 18: 13 open → **4** (`CODE-014` medium; `CODE-015`, `-016`, `-017` low), 0 → 13 closed.
+> Area 04: `TOOL-052`, `TOOL-053` closed (5 → 3 open). Area 07: `TUI-165`, `TUI-166` filed (23 → 25 open
+> against the 2026-10-05 block's count; the other movement from that block is #187 and #189 landing underneath).
+> Area 13 is counted in its own file: `MCP-561` and `MCP-604` closed; `MCP-612`, `-613`, `-614` filed
+> (`13-cyrup-mcp-STATUS.md`, 552 rows: 349 implemented, 70 partial, 99 missing, 34 not-applicable).
+>
+> ## Closed
+>
+> `CODE-001`…`CODE-013`, `TOOL-052`, `TOOL-053`, `MCP-561`, `MCP-604`. Evidence per row is in the closure record
+> at the top of `18-pi-codemode.md`. `PROV-105` is **partial** (the read methods are ported, `refresh_with`'s
+> classifier handling is not), so it stays open with a dated note.
+>
+> ## Filed
+>
+> `CODE-014` (system-prompt `sections` rows), `CODE-015` (guest `prepare_loadout`), `CODE-016` (guest nested-call
+> gaps), `CODE-017` (`annotations`), `MCP-612` (server `description`, cached `outputSchema`), `MCP-613` (panel
+> cannot write `"search"`), `MCP-614` (no live-server test), `MCP-615` (a racy `cyrup-mcp` test, seen failing once under workspace load), `TUI-165` (call args do not stream into registered
+> renderers), `TUI-166` (result-image ordering, unmeasured).
+>
+> ## Corrections made in place
+>
+> Stale evidence in `CODE-002`, `-003`, `-005`, `-008`, `-011`, `-013`, `EXT-020` (`world.wit:180` → `:512`),
+> `TOOL-052` ("survives resume"), `MCP-604`, `SESS-035` (see the closure record). `SESS-035` is closed-with-residual:
+> `builder.rs` still passes `DocsPointers::default()`, so no production prompt carries the docs section.
+>
+> ## Defects this work found in code it did not write, and what happened to them
+>
+> * `Cost` serialised as `0.0` / `1.2e-5` where `JSON.stringify` writes `0` / `0.000012` — session-file
+>   byte-compat. Fixed here (`cyrup-core`).
+> * `RegisteredTool` did not delegate `output_schema()`, so every MCP structured tool looked like a text
+>   tool. Fixed here.
+> * The `Cost` fix and the `serde_json` `raw_value` feature it needs changed text that tests had pinned:
+>   `cyrup-test-support`'s self-recorded goldens and one `deferred_interop` literal wrote `0.0` where pi
+>   writes `0` (corrected; the `*.pi-captured.*` fixtures already had `0`), and two `trybuild` `.stderr`
+>   files list `&'a RawValue` among a trait's implementors now that the feature is workspace-wide
+>   (regenerated). The second is a brittleness this work introduced and did not remove: those
+>   expectations depend on which features the workspace enables on `serde_json`.
+> * `cyrup-test-support`'s differential text-turn anchor compared pi's tool-less `agentLoop()` capture
+>   with a session that has tools; pi 1.0's `declareToolChanges` puts a system message ahead of the prompt
+>   when tools exist, so the anchor now builds a tool-less session and a second test pins the declaration
+>   pair for a session with tools.
+
+---
+
 # UPDATE 2026-10-05 (subagent tool surface) — one medium closed, two advanced with their premises corrected, one filed
 
 > Three `medium` rows in `cyrup-ext-subagents`, two lanes, upstream read only through git objects at the

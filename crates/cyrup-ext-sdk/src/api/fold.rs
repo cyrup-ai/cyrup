@@ -11,7 +11,7 @@
 //! | event | upstream | combination |
 //! |---|---|---|
 //! | `tool_call` | `emitToolCall` `:1134-1152` | the first block returns; the rewritten input chains |
-//! | `tool_result` | `emitToolResult` `:1082-1132` | `content`/`details`/`isError`/`usage` chain, key by key |
+//! | `tool_result` | `emitToolResult` `:1082-1132` | `content`/`details`/`structuredContent`/`isError`/`usage` chain, key by key; `content` alone drops `structuredContent` |
 //! | `context`, `context_with_system` | `emitContext` `:1190-1251` | the returned messages chain |
 //! | `message_end` | `emitMessageEnd` `:1043-1080` | a same-role replacement chains; another role is skipped |
 //! | `before_agent_start` | `emitBeforeAgentStart` `:1312-1364` | every `message` accumulates; the last `systemPrompt` wins and chains |
@@ -123,12 +123,21 @@ fn chain(kind: u8, args: &mut [String], patch: &mut Option<Value>, v: Value) {
             *patch = Some(v);
         }
         // `emitToolResult`: each field a handler returns overwrites `currentEvent`'s
-        // (`:1093-1108`), so the combined patch is the key-wise merge. Args:
-        // `[call_id, name, input, content, is_error, details, usage]`.
+        // (`:1093-1108`), so the combined patch is the key-wise merge — with one exception, pi's
+        // own: replacing `content` DROPS the structured content (`runner.ts:1194-1198` @v1.0.1),
+        // and the handler's own `structuredContent` is applied after, restoring one. Args:
+        // `[call_id, name, input, content, is_error, details, usage, parent, structured_content]`.
         kind::TOOL_RESULT => {
             let Some(obj) = v.as_object() else { return };
             if let Some(c) = obj.get("content") {
                 set(args, 3, c.to_string());
+                set(args, 8, String::new());
+                if let Some(Value::Object(combined)) = patch.as_mut() {
+                    combined.remove("structuredContent");
+                }
+            }
+            if let Some(sc) = obj.get("structuredContent") {
+                set(args, 8, sc.to_string());
             }
             if let Some(e) = obj.get("isError").and_then(Value::as_bool) {
                 set(args, 4, e.to_string());

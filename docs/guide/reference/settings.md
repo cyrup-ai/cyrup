@@ -101,6 +101,16 @@ reasoning off by default.
 The four `thinkingBudgets` fields are parsed independently — one bad field does not discard the
 others. They apply to providers that take a token budget rather than an effort string.
 
+## Tools and codemode
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `defaultTools` | string[] | `["read", "bash", "edit", "write"]` | Tools active at startup. Plain names replace the default; `+name` adds a tool and `-name` removes one, applied in order. A project list made only of `+`/`-` entries is appended to the user list instead of replacing it. |
+| `codemode.mode` | `on`\|`only` | `"on"` | How the `codemode` tool (`docs/codemode.md` in the install) presents tools while it is active. `on` leaves declared tools declared; `only` hides them from the model and lists them in the `codemode` description. |
+| `codemode.inlineBudget` | number | `3000` | Estimated tokens (characters / 4) the `codemode` description may spend on tool declarations. |
+
+`"defaultTools": ["+codemode"]` activates `codemode` next to the four default tools.
+
 ## Network, transport and retry
 
 | Key | Type | Default | Meaning |

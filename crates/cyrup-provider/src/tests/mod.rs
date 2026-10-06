@@ -12,6 +12,7 @@
 
 mod anthropic_sensitive_stop;
 mod api_key_login;
+mod available_of_type;
 mod builtin_oauth;
 mod catalog_data;
 mod catalog_model_types;

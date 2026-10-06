@@ -337,13 +337,18 @@ pub enum HostEvent {
         input: Value,
         content: Vec<Content>,
         details: Option<Value>,
+        /// The tool's machine-readable result (pi `ToolResultEventBase.structuredContent?`,
+        /// `core/extensions/types.ts:1238` @v1.0.1): "Handlers that redact `content` should also
+        /// replace this; replacing `content` alone drops it." `None` is pi's absent key.
+        /// Patchable via [`crate::EventPatch::ToolResult::structured_content`].
+        structured_content: Option<Value>,
         is_error: bool,
         /// Usage the tool execution itself reported (Pi `ToolResultEventBase.usage`,
         /// types.ts:919-921, upstream `2fd38684`). `None` = absent, which is every ordinary tool.
         /// Observable by a handler and patchable via [`crate::EventPatch::ToolResult::usage`].
         usage: Option<cyrup_core::Usage>,
         /// The tool's early-termination hint (pi `AgentToolResult.terminate?`). Host-side only:
-        /// the WIT `on-tool-result` call has a fixed signature and does not carry it, so a guest
+        /// the WIT `on-tool-result` export has no parameter for it, so a guest
         /// cannot OBSERVE it — but a guest CAN set it through
         /// [`crate::EventPatch::ToolResult::terminate`], and this field is what that patch lands
         /// on, exactly as pi's `afterResult.terminate ?? result.terminate` does not require the
@@ -700,6 +705,65 @@ impl HostEvent {
                 messages: messages.clone(),
             },
         })
+    }
+}
+
+impl HostEvent {
+    /// The notify event for a `tool_execution_*` event of a call another tool made (CODE-006): the
+    /// same `ToolExec{Start,Update,End}` a loop event becomes ([`Self::from_agent`]), with its
+    /// parent returned beside it — dispatch it with
+    /// [`crate::Dispatcher::dispatch_notify_nested`] so a native handler reads the parent from
+    /// [`crate::HostCtx::parent_tool_call_id`]. Pi hands the extension runner the same event object
+    /// with `parentToolCallId` set (`agent-session.ts:719-733` @v1.0.1).
+    pub fn from_nested_tool_execution(
+        ev: &cyrup_agent::NestedToolExecutionEvent,
+    ) -> (HostEvent, ToolCallId) {
+        use cyrup_agent::NestedToolExecutionEvent as N;
+        match ev {
+            N::ToolExecutionStart {
+                tool_call_id,
+                tool_name,
+                args,
+                parent_tool_call_id,
+            } => (
+                HostEvent::ToolExecStart {
+                    call_id: tool_call_id.clone(),
+                    name: tool_name.clone(),
+                    args: args.clone(),
+                },
+                parent_tool_call_id.clone(),
+            ),
+            N::ToolExecutionUpdate {
+                tool_call_id,
+                tool_name,
+                args,
+                partial_result,
+                parent_tool_call_id,
+            } => (
+                HostEvent::ToolExecUpdate {
+                    call_id: tool_call_id.clone(),
+                    name: tool_name.clone(),
+                    args: args.clone(),
+                    chunk: partial_result.clone(),
+                },
+                parent_tool_call_id.clone(),
+            ),
+            N::ToolExecutionEnd {
+                tool_call_id,
+                tool_name,
+                result,
+                is_error,
+                parent_tool_call_id,
+            } => (
+                HostEvent::ToolExecEnd {
+                    call_id: tool_call_id.clone(),
+                    name: tool_name.clone(),
+                    result: result.clone(),
+                    is_error: *is_error,
+                },
+                parent_tool_call_id.clone(),
+            ),
+        }
     }
 }
 

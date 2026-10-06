@@ -1512,6 +1512,7 @@ mod tests {
             usage: None,
             added_tool_names: Vec::new(),
             timestamp: 0,
+            nested_calls: None,
         };
         let body = format_request_approval("s", "m", None, &[user_text("u"), tool_result]);
         assert!(body.contains("\n\n1. user: u"), "{body:?}");

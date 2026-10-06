@@ -142,6 +142,7 @@ impl NativeExtension for UsageExt {
             Act::Patch(u) => HookOutcome::Mutate(EventPatch::ToolResult {
                 content: None,
                 details: None,
+                structured_content: None,
                 is_error: None,
                 usage: Some(u.clone()),
                 terminate: None,
@@ -149,6 +150,7 @@ impl NativeExtension for UsageExt {
             Act::PatchContentOnly => HookOutcome::Mutate(EventPatch::ToolResult {
                 content: Some(vec![Content::text("rewritten")]),
                 details: None,
+                structured_content: None,
                 is_error: None,
                 usage: None,
                 terminate: None,

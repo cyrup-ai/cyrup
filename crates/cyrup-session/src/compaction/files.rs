@@ -27,30 +27,56 @@ pub struct FileOps {
 }
 
 impl FileOps {
-    /// Scan an assistant message's tool calls, tracking the `read`/`write`/`edit` tools' `path`
-    /// argument. Pi `extractFileOpsFromMessage` (`utils.ts:38-55`) matches the tool name with an
-    /// EXACT switch (not a substring) and reads the path ONLY from `args.path`, so an unrelated tool
-    /// (e.g. `multiedit`) or a differently-named path arg is not tracked.
+    /// Scan an assistant message's tool calls — or the nested calls recorded on a tool result —
+    /// tracking the `read`/`write`/`edit` tools' `path` argument. Pi `extractFileOpsFromMessage`
+    /// (`utils.ts:38-55` @v0.83.0; `compaction/utils.ts:30-45` @v1.0.1) matches the tool name with
+    /// an EXACT switch (not a substring) and reads the path ONLY from `args.path`, so an unrelated
+    /// tool (e.g. `multiedit`) or a differently-named path arg is not tracked.
+    ///
+    /// A tool result contributes the calls ITS tool made (`nestedCalls.calls`): *"Calls made from
+    /// codemode scripts are recorded on the script's result"* (`utils.ts:33` @v1.0.1), so without
+    /// this every edit a script made would be missing from the summary's `<modified-files>`. A
+    /// nested call whose arguments were omitted for size (`argumentsBytes`) has no path to track —
+    /// pi's `addFileOp(call.name, call.arguments)` finds none either.
     pub fn absorb_message(&mut self, msg: &Message) {
-        if let Message::Assistant(a) = msg {
-            for c in &a.content {
-                if let Content::ToolCall(tc) = c
-                    && let Some(path) = extract_path(&tc.arguments)
-                {
-                    match tc.name.as_str() {
-                        "read" => {
-                            self.read.insert(path);
-                        }
-                        "write" => {
-                            self.written.insert(path);
-                        }
-                        "edit" => {
-                            self.edited.insert(path);
-                        }
-                        _ => {}
+        match msg {
+            Message::Assistant(a) => {
+                for c in &a.content {
+                    if let Content::ToolCall(tc) = c {
+                        self.track(&tc.name, &tc.arguments);
                     }
                 }
             }
+            Message::ToolResult {
+                nested_calls: Some(nested),
+                ..
+            } => {
+                for call in &nested.calls {
+                    if let Some(arguments) = &call.arguments {
+                        self.track(&call.name, arguments);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Pi `addFileOp(toolName, args, fileOps)` (`compaction/utils.ts:47-62` @v1.0.1).
+    fn track(&mut self, tool: &str, arguments: &serde_json::Map<String, Value>) {
+        let Some(path) = extract_path(arguments) else {
+            return;
+        };
+        match tool {
+            "read" => {
+                self.read.insert(path);
+            }
+            "write" => {
+                self.written.insert(path);
+            }
+            "edit" => {
+                self.edited.insert(path);
+            }
+            _ => {}
         }
     }
 

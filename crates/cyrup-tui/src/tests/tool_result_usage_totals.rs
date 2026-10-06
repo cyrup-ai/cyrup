@@ -52,6 +52,7 @@ fn tool_result(usage: Option<Usage>) -> AgentMessage {
         timestamp: 0,
         usage,
         added_tool_names: Vec::new(),
+        nested_calls: None,
     })
 }
 

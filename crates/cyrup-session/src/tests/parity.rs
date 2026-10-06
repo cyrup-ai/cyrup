@@ -339,6 +339,7 @@ fn gap14_15_listing_first_message_user_only_with_sentinel() {
         timestamp: 0,
         usage: None,
         added_tool_names: Vec::new(),
+        nested_calls: None,
     })
     .unwrap();
 
@@ -1236,6 +1237,7 @@ fn g5_summary_messages_carry_entry_timestamp() {
             details: None,
             usage: None,
             from_hook: None,
+            system_message: None,
         }),
     ];
     let refs: Vec<&Entry> = entries.iter().collect();

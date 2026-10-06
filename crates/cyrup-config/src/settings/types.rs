@@ -360,6 +360,52 @@ pub struct ThinkingBudgets {
     pub high: Option<i64>,
 }
 
+/// How the `codemode` tool presents tools while it is active (pi `CodemodeMode`,
+/// `settings-manager.ts:94-101` @v1.0.1).
+///
+/// * `on` — declared tools that scripts can call get a note on calling them from scripts appended
+///   to their description; the codemode description lists only the tools without `direct` exposure.
+/// * `only` — the codemode description lists every tool scripts can call, and active `direct`
+///   tools are not declared to the model.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CodemodeMode {
+    /// Pi's documented default (`settings-manager.ts:105`, `/** Default: `on`. */`).
+    #[default]
+    On,
+    Only,
+}
+
+impl CodemodeMode {
+    /// The settings-file spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::On => "on",
+            Self::Only => "only",
+        }
+    }
+}
+
+/// Default for [`CodemodeSettings::inline_budget`]: the estimated tokens (characters / 4) the
+/// codemode description may spend on tool declarations (pi `DEFAULT_CODEMODE_INLINE_BUDGET`,
+/// `extensions/codemode/tool.ts:154` @v1.0.1; documented as "Default: 3000" at
+/// `settings-manager.ts:107`).
+pub const DEFAULT_CODEMODE_INLINE_BUDGET: f64 = 3000.0;
+
+/// The `codemode` settings object (pi `CodemodeSettings`, `settings-manager.ts:103-108` @v1.0.1,
+/// read into `Settings.codemode` at `:178`). Both fields are as written in the file; the
+/// validated values the codemode extension acts on are
+/// [`EffectiveSettings::codemode_mode`](crate::EffectiveSettings::codemode_mode) and
+/// [`EffectiveSettings::codemode_inline_budget`](crate::EffectiveSettings::codemode_inline_budget).
+#[derive(Clone, Copy, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodemodeSettings {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<CodemodeMode>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inline_budget: Option<f64>,
+}
+
 /// User-facing warning toggles (Pi `WarningSettings`, settings-manager.ts:57-59).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]

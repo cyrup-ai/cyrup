@@ -3,6 +3,7 @@
 //! complete.
 
 use super::assistant_stream::{AssistantStream, Step};
+use super::declare;
 use super::{RunCtx, RunFailure};
 use crate::event::{AgentEvent, AgentMessage};
 use cyrup_core::AssistantMessage;
@@ -58,6 +59,9 @@ impl RunCtx {
             // Same bare await for `convertToLlm` (agent-loop.ts:295) → same `handleRunFailure` text.
             Err(e) => return Err(RunFailure(e.to_string())),
         };
+        // The declarations the transcript records are not repeated in the message list: the
+        // request declares its tools through `Context::tools`, below.
+        let llm = declare::without_tool_declarations(llm);
 
         // Dynamic key wins; fall back to the run's static key (Pi `... || config.apiKey`,
         // agent-loop.ts:301-302).

@@ -83,9 +83,36 @@ pub async fn extension_render(
         AgentSessionEvent::ToolExecutionStart {
             tool_name, args, ..
         } => return extension_render_tool_call(ext_host, tool_name, args, opts).await,
+        // `renderResult` runs for EVERY result the row receives, partial ones included
+        // (`tool-execution.ts:295-296`, `updateResult(result, isPartial)`): a streaming tool's list
+        // is drawn from the partials, not only from the final result.
+        AgentSessionEvent::ToolExecutionUpdate {
+            tool_name,
+            partial_result,
+            ..
+        } => {
+            return extension_render_tool_result(
+                ext_host,
+                tool_name,
+                partial_result,
+                &opts.clone().partial(true),
+            )
+            .await;
+        }
         AgentSessionEvent::ToolExecutionEnd {
-            tool_name, result, ..
-        } => return extension_render_tool_result(ext_host, tool_name, result, opts).await,
+            tool_name,
+            result,
+            is_error,
+            ..
+        } => {
+            return extension_render_tool_result(
+                ext_host,
+                tool_name,
+                result,
+                &opts.clone().errored(*is_error),
+            )
+            .await;
+        }
         _ => return Rendered::None,
     };
     // A FAULTING renderer collapses to `None` here on purpose: both of this function's surfaces
@@ -277,6 +304,8 @@ pub(crate) async fn run_renderer(
         // re-render it per frame. It is deliberately NOT flattened here — that is the freeze this
         // tier exists to avoid.
         Ok(Ok(cyrup_ext::RenderOutcome::Live(component))) => Rendered::Live(component),
+        // A tool renderer's component tree: carried whole, laid out by the tool row per frame.
+        Ok(Ok(cyrup_ext::RenderOutcome::Tree(tree))) => Rendered::Tree(tree),
         Ok(Ok(cyrup_ext::RenderOutcome::None)) => Rendered::None,
         // The renderer TASK itself panicked — outside the host's `catch_unwind`, so no message
         // survived the unwind. Report it as a fault anyway: something threw, and reporting `None`
