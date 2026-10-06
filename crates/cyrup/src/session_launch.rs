@@ -952,6 +952,23 @@ mod tests {
         interactive: bool,
         no_extensions: bool,
     ) -> (Arc<SessionFactory>, cyrup_session_svc::SessionTarget) {
+        factory_over(
+            Arc::new(FauxProvider::new()),
+            agent_dir,
+            cwd,
+            interactive,
+            no_extensions,
+        )
+    }
+
+    /// [`factory_at`] over a provider the test scripts.
+    fn factory_over(
+        provider: Arc<dyn Provider>,
+        agent_dir: &Path,
+        cwd: &Path,
+        interactive: bool,
+        no_extensions: bool,
+    ) -> (Arc<SessionFactory>, cyrup_session_svc::SessionTarget) {
         let env = cyrup_config::EnvVars {
             home: Some(agent_dir.to_path_buf()),
             ..cyrup_config::EnvVars::default()
@@ -969,7 +986,6 @@ mod tests {
         config.no_extensions = no_extensions;
         let target = config.target.clone();
 
-        let provider: Arc<dyn Provider> = Arc::new(FauxProvider::new());
         let factory = build_factory(
             provider,
             config,
@@ -1117,6 +1133,315 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ============================================================================================
+    // MCP-604 — a `directTools: "search"` server's tools reach the model through `tool_search` and
+    // through `mcp({ search })`, over the REAL launch wiring: the MCP adapter and `tool_search` are
+    // the built-ins `attach_native_extensions` attaches, and the provider is scripted.
+    // ============================================================================================
+
+    /// The tool names each provider request declared, in request order.
+    type Declared = Arc<std::sync::Mutex<Vec<Vec<String>>>>;
+
+    /// A provider whose `n`th reply is `replies[n]` — a tool call (`Some((name, args))`) or text —
+    /// recording the tool names every request declared.
+    fn scripted(
+        declared: &Declared,
+        replies: Vec<Option<(&'static str, serde_json::Value)>>,
+    ) -> Arc<FauxProvider> {
+        let faux = Arc::new(FauxProvider::new());
+        faux.set_response_steps(scripted_steps(declared, replies));
+        faux
+    }
+
+    /// The response steps [`scripted`] installs.
+    fn scripted_steps(
+        declared: &Declared,
+        replies: Vec<Option<(&'static str, serde_json::Value)>>,
+    ) -> Vec<cyrup_provider::faux::FauxResponseStep> {
+        use cyrup_core::StopReason;
+        use cyrup_provider::faux::{
+            FauxResponseStep, faux_assistant_message, faux_text, faux_tool_call,
+        };
+        replies
+            .into_iter()
+            .map(|reply| {
+                let seen = Arc::clone(declared);
+                FauxResponseStep::factory(move |ctx, _opts, _state, _model| {
+                    seen.lock()
+                        .unwrap()
+                        .push(ctx.tools.iter().map(|tool| tool.name.clone()).collect());
+                    match &reply {
+                        Some((name, args)) => faux_assistant_message(
+                            vec![faux_tool_call((*name).to_string(), args.clone())],
+                            StopReason::ToolUse,
+                        ),
+                        None => faux_assistant_message(vec![faux_text("done")], StopReason::Stop),
+                    }
+                })
+            })
+            .collect()
+    }
+
+    /// `<agent_dir>/mcp.json` with one server `docs` in search mode, and an `mcp-cache.json` that
+    /// is valid for it: two tools, so only one of them matches a query. No server is spawned.
+    fn write_search_mode_world(agent_dir: &Path) {
+        let definition = cyrup_mcp::config::ServerEntry {
+            command: Some("echo".to_string()),
+            ..cyrup_mcp::config::ServerEntry::default()
+        };
+        let hash = cyrup_mcp::registration::default_server_hasher(&definition).unwrap();
+        std::fs::write(
+            agent_dir.join("mcp.json"),
+            serde_json::json!({
+                "mcpServers": { "docs": { "command": "echo", "directTools": "search" } }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            agent_dir.join("mcp-cache.json"),
+            serde_json::json!({
+                "version": cyrup_mcp::registration::METADATA_CACHE_VERSION,
+                "servers": { "docs": {
+                    "configHash": hash,
+                    "cachedAt": 4_102_444_800_000_u64,
+                    "tools": [
+                        {
+                            "name": "lookup_widget",
+                            "description": "Look up a widget by name.",
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": { "name": { "type": "string" } },
+                                "required": ["name"]
+                            }
+                        },
+                        { "name": "rotate_logs", "description": "Rotate the log files." }
+                    ],
+                    "resources": []
+                } }
+            })
+            .to_string(),
+        )
+        .unwrap();
+    }
+
+    /// A session over [`write_search_mode_world`], built through `build_factory`, with `extra`
+    /// activated on top of the default tools (`--tools`).
+    async fn search_mode_session(
+        provider: Arc<FauxProvider>,
+        extra: &[&str],
+    ) -> (Arc<AgentSessionRuntime>, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path().join("project");
+        let agent_dir = tmp.path().join("agent");
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        write_search_mode_world(&agent_dir);
+        let (factory, target) = factory_over(provider, &agent_dir, &cwd, false, false);
+        // The runtime, as every mode builds its session: it shares the session (which binds the
+        // self-handle the turn-boundary refresh reads, so a mid-run load reaches the next request)
+        // and announces `session_start`, which is what builds the MCP runtime.
+        let runtime = AgentSessionRuntime::create(factory, target).await.unwrap();
+        let session = runtime.session().await;
+        let mut active = session.active_tool_names();
+        active.extend(extra.iter().map(|name| (*name).to_string()));
+        session.set_active_tools_by_name(&active).await;
+        (runtime, tmp)
+    }
+
+    /// The registered tools of a search-mode server are at the `deferred` exposure, in the server's
+    /// namespace, and not in the active set: the model is not shown them.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_search_mode_servers_tools_are_registered_deferred_and_not_declared() {
+        let declared: Declared = Arc::default();
+        let (runtime, _tmp) = search_mode_session(scripted(&declared, vec![None]), &[]).await;
+        let session = runtime.session().await;
+        let rows = session.all_tools();
+        let row = rows
+            .iter()
+            .find(|row| row.name == "docs_lookup_widget")
+            .expect("registered");
+        assert_eq!(row.exposure, cyrup_core::ToolExposure::Deferred);
+        assert_eq!(
+            row.namespace
+                .as_ref()
+                .map(|namespace| namespace.name.as_str()),
+            Some("mcp__docs")
+        );
+        assert!(
+            !session
+                .active_tool_names()
+                .iter()
+                .any(|name| name.starts_with("docs_")),
+            "{:?}",
+            session.active_tool_names()
+        );
+        let _ = session.prompt("hi").await.unwrap();
+        session.wait_for_idle().await;
+        let requests = declared.lock().unwrap().clone();
+        assert!(
+            names_at(&requests, 0)
+                .iter()
+                .all(|name| !name.starts_with("docs_")),
+            "a deferred tool is not in the request: {:?}",
+            names_at(&requests, 0)
+        );
+        assert!(
+            names_at(&requests, 0).iter().any(|name| name == "mcp"),
+            "the gateway is: {:?}",
+            names_at(&requests, 0)
+        );
+    }
+
+    /// MCP-604 `verify`: a search-mode MCP tool is findable by `tool_search` while inactive and is
+    /// activated by it; the very next request declares it, with the cached schema.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tool_search_finds_a_search_mode_mcp_tool_and_the_next_request_declares_it() {
+        let declared: Declared = Arc::default();
+        let provider = scripted(
+            &declared,
+            vec![
+                Some(("tool_search", serde_json::json!({ "query": "widget" }))),
+                None,
+            ],
+        );
+        let (runtime, _tmp) = search_mode_session(provider, &["tool_search"]).await;
+        let session = runtime.session().await;
+        let _ = session.prompt("find the widget tool").await.unwrap();
+        session.wait_for_idle().await;
+
+        let requests = declared.lock().unwrap().clone();
+        assert_eq!(requests.len(), 2, "{requests:?}");
+        assert!(
+            names_at(&requests, 0)
+                .iter()
+                .any(|name| name == "tool_search")
+        );
+        assert!(
+            !names_at(&requests, 0)
+                .iter()
+                .any(|name| name == "docs_lookup_widget")
+        );
+        assert!(
+            names_at(&requests, 1)
+                .iter()
+                .any(|name| name == "docs_lookup_widget"),
+            "{:?}",
+            names_at(&requests, 1)
+        );
+        assert!(
+            !names_at(&requests, 1)
+                .iter()
+                .any(|name| name == "docs_rotate_logs"),
+            "only the match is loaded: {:?}",
+            names_at(&requests, 1)
+        );
+    }
+
+    /// The gateway is the adapter's own entry point: a `mcp({ search })` that matches a search-mode
+    /// tool loads it, so the very next request declares it, and the model is told so.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mcp_search_loads_a_search_mode_tool_for_the_next_request() {
+        let declared: Declared = Arc::default();
+        let provider = scripted(&declared, Vec::new());
+        let (runtime, _tmp) = search_mode_session(Arc::clone(&provider), &[]).await;
+        let session = runtime.session().await;
+
+        // The MCP runtime builds in the background after `session_start`; a call that lands first
+        // answers `not_initialized`. Ask for the gateway's status until it is up.
+        let mut ready = false;
+        for _ in 0..200 {
+            provider.set_response_steps(scripted_steps(
+                &declared,
+                vec![Some(("mcp", serde_json::json!({}))), None],
+            ));
+            let _ = session.prompt("status").await.unwrap();
+            session.wait_for_idle().await;
+            let status = last_tool_result(&session, "mcp").await;
+            if status
+                .1
+                .as_ref()
+                .is_none_or(|details| details["error"] != "not_initialized")
+            {
+                ready = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(ready, "the MCP runtime never came up");
+        declared.lock().unwrap().clear();
+
+        provider.set_response_steps(scripted_steps(
+            &declared,
+            vec![
+                Some(("mcp", serde_json::json!({ "search": "widget" }))),
+                None,
+            ],
+        ));
+        let _ = session.prompt("find the widget tool").await.unwrap();
+        session.wait_for_idle().await;
+
+        let requests = declared.lock().unwrap().clone();
+        assert_eq!(requests.len(), 2, "{requests:?}");
+        assert!(
+            !names_at(&requests, 0)
+                .iter()
+                .any(|name| name == "docs_lookup_widget")
+        );
+        assert!(
+            names_at(&requests, 1)
+                .iter()
+                .any(|name| name == "docs_lookup_widget"),
+            "{:?}",
+            names_at(&requests, 1)
+        );
+        assert!(
+            !names_at(&requests, 1)
+                .iter()
+                .any(|name| name == "docs_rotate_logs")
+        );
+        let (content, details) = last_tool_result(&session, "mcp").await;
+        let text = match content.first() {
+            Some(cyrup_core::Content::Text { text, .. }) => text.to_string(),
+            other => panic!("expected text, got {other:?}"),
+        };
+        assert!(
+            text.starts_with("Activated as direct tools: docs_lookup_widget.\n\n"),
+            "{text}"
+        );
+        assert_eq!(
+            details.as_ref().unwrap()["activated"],
+            serde_json::json!(["docs_lookup_widget"])
+        );
+    }
+
+    /// The tool names request `index` declared (empty when there was no such request).
+    fn names_at(requests: &[Vec<String>], index: usize) -> &[String] {
+        requests.get(index).map_or(&[], Vec::as_slice)
+    }
+
+    /// The newest `tool_name` tool result of `session`: its content and details.
+    async fn last_tool_result(
+        session: &AgentSession,
+        tool_name: &str,
+    ) -> (Vec<cyrup_core::Content>, Option<serde_json::Value>) {
+        session
+            .messages()
+            .await
+            .into_iter()
+            .rev()
+            .find_map(|message| match message {
+                cyrup_core::Message::ToolResult {
+                    tool_name: name,
+                    content,
+                    details,
+                    ..
+                } if name == tool_name => Some((content, details)),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("a `{tool_name}` tool result"))
     }
 
     /// A subagent CHILD, `CYRUP_SUBAGENT_CHILD` set, treats llama.cpp like the other ambient natives
