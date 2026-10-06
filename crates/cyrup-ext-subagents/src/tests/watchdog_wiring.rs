@@ -247,6 +247,7 @@ async fn the_turn_and_boundary_events_reach_the_runtime() {
                 input: serde_json::Value::Null,
                 content: Vec::new(),
                 details: None,
+                structured_content: None,
                 is_error: false,
                 usage: None,
                 terminate: cyrup_core::TerminateHint::Unspecified,
