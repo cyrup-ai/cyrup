@@ -116,6 +116,14 @@ fn the_compaction_entry_names_the_field_as_pi_does() {
         line.contains(",\"systemMessage\":{\"role\":\"system\",\"content\":\"\",\"toolsAdded\":["),
         "{line}"
     );
+    // A snapshot is a replay, so `timestamp` is the LAST key (pi: `{ ...getCurrentSystemMessage(…),
+    // timestamp }`, `session-manager.ts:1283` — the spread leaves `timestamp` where the snapshot put
+    // it), unlike the system row of a `message` entry where `timestamp` precedes `toolsAdded`.
+    let snapshot = &line[line.find("\"systemMessage\":").unwrap()..];
+    assert!(
+        snapshot.find("\"toolsAdded\"").unwrap() < snapshot.find("\"timestamp\"").unwrap(),
+        "{line}"
+    );
 
     let mut bare = manager();
     let u1 = bare.append_message(user("one")).unwrap();

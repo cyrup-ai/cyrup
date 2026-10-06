@@ -18,9 +18,10 @@
 /// update to the original. Avoid integer-like names; JSON objects reorder those."*
 ///
 /// A `HashMap` would make the rendered prompt nondeterministic run to run, and a `BTreeMap` (what
-/// `serde_json::Map` is without the `preserve_order` feature, which this workspace does not
-/// enable) would silently re-sort it alphabetically. Neither `indexmap` nor a `preserve_order`
-/// `serde_json` is a workspace dependency, so the order-preserving container is spelled out here:
+/// `serde_json::Map` is without `preserve_order`) would silently re-sort it alphabetically. The
+/// workspace does declare `serde_json/preserve_order` (root `Cargo.toml`, pinned by
+/// `preserve_order_is_declared_workspace_wide`), but this type does not lean on a cargo feature
+/// that unification could change under it: the order-preserving container is spelled out here as
 /// a `Vec` of `(name, value)` pairs with JS `Map` semantics — [`Sections::set`] keeps an existing
 /// name in its original position, a new name appends, and [`Sections::remove`] drops it.
 ///

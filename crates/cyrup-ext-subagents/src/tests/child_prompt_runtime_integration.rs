@@ -99,34 +99,34 @@ async fn host_with_child_env(
     host
 }
 
-/// A system prompt shaped like the one `cyrup-session/src/prompt/builder.rs` actually assembles for
-/// a child that re-execs in the parent's repo: identity, the project-context block built from the
-/// repo's `AGENTS.md`, the skills block, then the date/cwd footer.
+/// The system prompt `cyrup-session/src/prompt/builder.rs` assembles for a child that re-execs in the
+/// parent's repo: the identity and tool sections, the project-context section built from the repo's
+/// `AGENTS.md`, the skills section, then the cwd.
+///
+/// It is built BY the builder. It used to be written out here, "shaped like" the builder's output, and
+/// the skills line it carried was one the builder never wrote, so `inheritSkills: false` passed these
+/// tests while cutting nothing from a real prompt.
 fn assembled_system_prompt() -> String {
-    [
-        "You are a coding assistant operating inside cyrup, helping with software engineering tasks.",
-        "",
-        "<project_context>",
-        "",
-        "Project-specific instructions follow.",
-        "",
-        "<project_instructions path=\"/repo/AGENTS.md\">",
-        "PARENT-ONLY MARKER: never commit to main.",
-        "</project_instructions>",
-        "",
-        "</project_context>",
-        "",
-        "Available skills (open the SKILL.md with the read tool to use one):",
-        "<available_skills>",
-        "  <skill>",
-        "    <name>deploy-marker</name>",
-        "  </skill>",
-        "</available_skills>",
-        "",
-        "Current date: 2026-08-07",
-        "Current working directory: /repo",
-    ]
-    .join("\n")
+    use cyrup_session::prompt::{
+        ContextFile, ContextScope, PromptInputs, SkillPointer, SystemPromptBuilder,
+    };
+    use std::sync::Arc;
+    SystemPromptBuilder::new().build(&PromptInputs {
+        selected_tools: Some(vec![Arc::from("read")]),
+        cwd: std::path::PathBuf::from("/repo"),
+        context_files: Arc::from(vec![ContextFile {
+            path: std::path::PathBuf::from("/repo/AGENTS.md"),
+            content: Arc::from("PARENT-ONLY MARKER: never commit to main."),
+            scope: ContextScope::Cwd,
+        }]),
+        skills: Arc::from(vec![SkillPointer {
+            name: "deploy-marker".to_string(),
+            description: None,
+            path: std::path::PathBuf::from("/skills/deploy-marker/SKILL.md"),
+            disable_model_invocation: false,
+        }]),
+        ..PromptInputs::default()
+    })
 }
 
 async fn rewritten_prompt(host: &ExtensionHost) -> Option<String> {
@@ -163,8 +163,8 @@ async fn inherit_project_context_false_removes_project_context_from_the_live_pro
         "inheritSkills=1 must leave the skills section alone:\n{prompt}"
     );
     assert!(
-        prompt.contains("Current date: 2026-08-07"),
-        "the footer must survive"
+        prompt.contains("<cwd>\n/repo\n</cwd>"),
+        "the sections after the cut must survive:\n{prompt}"
     );
 }
 

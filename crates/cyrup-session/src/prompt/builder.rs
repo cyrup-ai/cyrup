@@ -1,17 +1,26 @@
 //! Pure system-prompt assembly (arch-06 §3.3/§6.1, R-06-001..005/012/017).
 //!
-//! [`SystemPromptBuilder::build`] is the single hot path: no I/O, no clock, no panics. It writes
-//! into one pre-sized `String` from `&'static` template parts plus the caller-assembled
-//! [`PromptInputs`] (already trust-gated + precedence-resolved upstream).
+//! [`SystemPromptBuilder::build_sections`] is pi's `buildSystemPromptSections`
+//! (`packages/coding-agent/src/core/system-prompt.ts:121-180` @v1.0.0): the prompt as ORDERED, NAMED
+//! sections — an untagged `preamble`, then `tools`, `rules`, `docs`, `addendum`, `project_context`,
+//! `skills` and `cwd`, each wrapped in a tag of its own name — which is the form the transcript
+//! stores (`SystemMessage.sections`) and diffs ([`diff_system_prompt_sections`]).
+//! [`SystemPromptBuilder::build`] is pi's `buildSystemPrompt`: the same sections rendered through
+//! `getSystemMessageText`, so the text a caller reads is the text the model is sent.
+//!
+//! Pure: no I/O, no clock, no panics. The inputs are the caller-assembled [`PromptInputs`] (already
+//! trust-gated + precedence-resolved upstream).
 
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use cyrup_core::Sections;
 use cyrup_resources::SkillPointer;
 
 use super::context_files::ContextFile;
-use super::skills_inject::emit_skills_section;
+use super::sections::{PREAMBLE, render_sections};
+use super::skills_inject::skills_section_text;
 use super::tool_prompts::ToolPromptContribution;
 
 /// Docs-pointer paths for the progressive-disclosure section (DI-4). A `None` field omits its line.
@@ -35,10 +44,10 @@ pub struct PromptInputs {
     pub custom_prompt: Option<Arc<str>>,
     /// Tools currently enabled (active set; may change at runtime — R-06-013).
     ///
-    /// `None` = UNSET, which Pi resolves to its four-tool default (`system-prompt.ts:81`
+    /// `None` = UNSET, which Pi resolves to its four-tool default (`system-prompt.ts:58`
     /// `const tools = selectedTools || ["read","bash","edit","write"]`). `Some(vec![])` is an
     /// EXPLICITLY EMPTY set and is NOT the default: an empty array is truthy in JS, so pi's `tools`
-    /// stays `[]`, every `hasBash`/`hasGrep`/`hasFind`/`hasLs`/`hasRead` (`:97-101`) is false and
+    /// stays `[]`, every `hasBash`/`hasGrep`/`hasFind`/`hasLs` (`:95-99`) is false and
     /// the skills gate at `:155` skips — and the custom-prompt branch does the same at `:64`
     /// (`!selectedTools || selectedTools.includes("read")`). Collapsing the two into one empty
     /// `Vec` advertised skills and tool guidelines to a caller that deliberately restricted the
@@ -79,34 +88,36 @@ impl Default for PromptInputs {
     }
 }
 
-/// Immutable `'static` template parts (DI-1: only the final `String` is allocated per build).
+/// Immutable `'static` template parts.
 struct PromptTemplate {
+    /// The `preamble` of the default prompt. [CYRUP-DELTA]: the product name (pi:
+    /// `system-prompt.ts:146-147`, "You are an expert coding assistant operating inside pi, a coding
+    /// agent harness. You help users by reading files, executing commands, editing code, and writing
+    /// new files.").
     identity: &'static str,
-    tools_header: &'static str,
+    /// What the `tools` section lists when no selected tool has a snippet (`:149`).
     tools_empty: &'static str,
+    /// The closing sentence of the `tools` section (`:151`).
     tools_extra: &'static str,
-    guidelines_header: &'static str,
     baseline_guidelines: &'static [&'static str],
-    /// Pi `system-prompt.ts:105-112` — a THREE-way branch over `hasBash`/`hasPowerShell`, not one
+    /// Pi `system-prompt.ts:101-109` — a THREE-way branch over `hasBash`/`hasPowerShell`, not one
     /// string. Whichever shell tools are selected, the bullet names them.
     bash_fallback_guideline: &'static str,
     powershell_fallback_guideline: &'static str,
     bash_or_powershell_fallback_guideline: &'static str,
     docs_header: &'static str,
     docs_guidance: &'static [&'static str],
-    project_context_open: &'static str,
-    project_context_close: &'static str,
+    /// The first line of the `project_context` section (`renderProjectContext`, `:94-97`).
+    project_context_header: &'static str,
 }
 
 static DEFAULT_TEMPLATE: PromptTemplate = PromptTemplate {
     // [CYRUP-DELTA] identity references cyrup (was "pi").
     identity: "You are a coding assistant operating inside cyrup, helping with software \
                engineering tasks.",
-    tools_header: "Available tools:",
     tools_empty: "(none)",
-    tools_extra: "In addition to the tools above, you may have access to custom tools provided by \
-                  extensions and skills.",
-    guidelines_header: "Guidelines:",
+    tools_extra: "In addition to the tools above, you may have access to other custom tools \
+                  depending on the project.",
     baseline_guidelines: &[
         "Be concise in your responses",
         "Show file paths clearly when working with files",
@@ -114,12 +125,14 @@ static DEFAULT_TEMPLATE: PromptTemplate = PromptTemplate {
     bash_fallback_guideline: "Use bash for file operations like ls, rg, find",
     powershell_fallback_guideline: "Use PowerShell for file operations like listing, searching, and finding files",
     bash_or_powershell_fallback_guideline: "Use bash or PowerShell for file operations like listing, searching, and finding files",
-    // [CYRUP-DELTA] docs pointer references cyrup docs (Pi `system-prompt.ts:131`, "Pi
+    // [CYRUP-DELTA] docs pointer references cyrup docs (Pi `system-prompt.ts:153`, "Pi
     // documentation (read only when the user asks about pi itself, its SDK, extensions, themes,
     // skills, or TUI):").
     docs_header: "cyrup documentation (read only when the user asks about cyrup itself, its SDK, \
          extensions, themes, skills, or TUI):",
-    // [CYRUP-DELTA] product name only; the instructions are Pi's `:135`, `:137`, `:138` verbatim.
+    // [CYRUP-DELTA] product name only; the instructions are Pi's `:157`, `:159`, `:160` verbatim.
+    // Pi's `:158` ("When asked about: extensions (docs/extensions.md, …)") is left out: it lists
+    // documentation files cyrup does not ship at those paths.
     docs_guidance: &[
         "When reading cyrup docs or examples, resolve docs/... under Additional docs and \
          examples/... under Examples, not the current working directory",
@@ -128,12 +141,7 @@ static DEFAULT_TEMPLATE: PromptTemplate = PromptTemplate {
         "Always read cyrup .md files completely and follow links to related docs (e.g., tui.md \
          for TUI API details)",
     ],
-    // Byte-for-byte with Pi `system-prompt.ts:146-147` / `:151` (identical in the custom-prompt
-    // branch at `:55-56` / `:60`): `"\n\n<project_context>\n\n"` + `"Project-specific instructions
-    // and guidelines:\n\n"`, closed by `"</project_context>\n"` — note the TRAILING newline, which
-    // is what separates the block from the `\nCurrent working directory:` footer.
-    project_context_open: "<project_context>\n\nProject-specific instructions and guidelines:\n\n",
-    project_context_close: "</project_context>\n",
+    project_context_header: "Project-specific instructions and guidelines:",
 };
 
 /// Stateless, pure assembler holding only the immutable template.
@@ -155,81 +163,122 @@ impl SystemPromptBuilder {
         }
     }
 
-    /// Build the full prompt (R-06-001..004). Pure: no I/O, no clock, no panics.
+    /// The prompt text the model reads (R-06-001..004): pi's `buildSystemPrompt`
+    /// (`system-prompt.ts:195-197` @v1.0.0), the structured sections of
+    /// [`Self::build_sections`] rendered exactly as the transcript's system message replays them —
+    /// every section's text, joined by a blank line. Pure: no I/O, no clock, no panics.
     pub fn build(&self, inp: &PromptInputs) -> String {
+        render_sections(&self.build_sections(inp))
+    }
+
+    /// The ordered, independently replaceable sections of the structured system prompt: pi's
+    /// `buildSystemPromptSections` (`system-prompt.ts:121-180` @v1.0.0).
+    ///
+    /// `preamble` is untagged text; every other section is `<name>\n…\n</name>`, so the model can
+    /// match a later update to it. The order is the order pi inserts them in, and it is observable —
+    /// it is the order the model reads them in.
+    ///
+    /// Not ported: the `sections` option (extension-supplied sections appended after `cwd`, and the
+    /// name check that rejects `preamble` and any name outside `^[a-z][a-z0-9_-]*$`,
+    /// `:136-140`/`:171-173`). Nothing in cyrup can set it — `before_agent_start` carries no options
+    /// bag to edit (`EXT-084`) — so it would be an input with no producer.
+    pub fn build_sections(&self, inp: &PromptInputs) -> Sections {
         let t = self.tmpl;
-        let mut out = String::with_capacity(2048);
+        let mut parts: Vec<(&'static str, String)> = Vec::with_capacity(8);
 
         // SESS-059 — Pi gates the skills section on a tool that can READ a skill file being in the
         // effective set, `read` first, then `bash`: `const skillFileReadTool = (["read", "bash"]
-        // as const).find((tool) => tools.includes(tool))` (`system-prompt.ts:46` @v0.85.0,
-        // #8552), shared by the custom-prompt branch (`:66`) and the default body (`:161`).
+        // as const).find((tool) => selectedTools.includes(tool))` (`:165`).
         let skill_file_read_tool = ["read", "bash"]
             .into_iter()
             .find(|tool| is_selected(inp.selected_tools.as_ref(), tool));
 
-        if let Some(custom) = &inp.custom_prompt {
-            // ── FULL REPLACEMENT (R-06-003) ──
-            out.push_str(custom);
-        } else {
-            self.build_default_body(&mut out, inp);
+        // `if (customPrompt)` is a truthiness test: the empty string is NOT a custom prompt.
+        match inp.custom_prompt.as_deref().filter(|c| !c.is_empty()) {
+            // ── FULL REPLACEMENT of the preamble (R-06-003); `tools`, `rules` and `docs` are the
+            // default prompt's and do not appear.
+            Some(custom) => parts.push((PREAMBLE, custom.to_owned())),
+            None => {
+                parts.push((PREAMBLE, t.identity.to_owned()));
+                parts.push(("tools", self.tools_section(inp)));
+                parts.push(("rules", self.rules_section(inp)));
+                if let Some(docs) = docs_section(t, &inp.docs) {
+                    parts.push(("docs", docs));
+                }
+            }
         }
 
         // ── SHARED TAIL (runs for BOTH custom + default — R-06-003 mandates it) ──
-        // 5. append
-        if let Some(a) = &inp.append_system_prompt {
-            let a = a.trim();
-            if !a.is_empty() {
-                out.push_str("\n\n");
-                out.push_str(a);
-            }
+        // 5. append (`if (appendSystemPrompt)`: truthy, so only the empty string is skipped)
+        if let Some(a) = inp
+            .append_system_prompt
+            .as_deref()
+            .filter(|a| !a.is_empty())
+        {
+            parts.push(("addendum", a.to_owned()));
         }
         // 6. project context files (already trust-gated + ordered)
-        emit_context_files(&mut out, t, &inp.context_files);
-        // 7. skills (only if `read` or `bash` can load them — R-06-010, SESS-059)
-        if let Some(tool) = skill_file_read_tool {
-            emit_skills_section(&mut out, &inp.skills, tool);
+        if !inp.context_files.is_empty() {
+            parts.push((
+                "project_context",
+                project_context_text(t, &inp.context_files),
+            ));
         }
-        // 8. footer
-        emit_footer(&mut out, inp);
-        out
+        // 7. skills (only if `read` or `bash` can load them — R-06-010, SESS-059)
+        if let Some(tool) = skill_file_read_tool
+            && let Some(skills) = skills_section_text(&inp.skills, tool)
+        {
+            parts.push(("skills", skills));
+        }
+        // 8. cwd
+        parts.push(("cwd", normalize_slashes(&inp.cwd)));
+
+        parts
+            .into_iter()
+            .map(|(name, content)| {
+                let text = if name == PREAMBLE {
+                    content
+                } else {
+                    format!("<{name}>\n{content}\n</{name}>")
+                };
+                (name, Some(text))
+            })
+            .collect()
     }
 
-    fn build_default_body(&self, out: &mut String, inp: &PromptInputs) {
+    /// `promptSections.tools` (`:148-151`): the selected tools that HAVE a snippet, in selection
+    /// order, then the closing sentence (R-06-012).
+    fn tools_section(&self, inp: &PromptInputs) -> String {
         let t = self.tmpl;
-        // 1. identity
-        out.push_str(t.identity);
-
-        // 2. available tools (only tools WITH a snippet AND in the active set — R-06-012)
-        out.push_str("\n\n");
-        out.push_str(t.tools_header);
-        out.push('\n');
-        let mut any = false;
-        for c in &inp.tool_contributions {
-            if !is_selected(inp.selected_tools.as_ref(), &c.tool) {
-                continue;
-            }
-            if let Some(s) = &c.snippet {
-                out.push_str("- ");
-                out.push_str(&c.tool);
-                out.push_str(": ");
-                out.push_str(s);
-                out.push('\n');
-                any = true;
+        let mut listing = String::new();
+        for name in selected_names(inp.selected_tools.as_ref()) {
+            let snippet = inp
+                .tool_contributions
+                .iter()
+                .find(|c| &*c.tool == name)
+                .and_then(|c| c.snippet.as_deref());
+            if let Some(snippet) = snippet {
+                if !listing.is_empty() {
+                    listing.push('\n');
+                }
+                listing.push_str("- ");
+                listing.push_str(name);
+                listing.push_str(": ");
+                listing.push_str(snippet);
             }
         }
-        if !any {
-            out.push_str(t.tools_empty);
-            out.push('\n');
+        if listing.is_empty() {
+            listing.push_str(t.tools_empty);
         }
-        out.push_str(t.tools_extra);
+        format!("{listing}\n\n{}", t.tools_extra)
+    }
 
-        // 3. guidelines (dedup, insertion-order)
-        out.push_str("\n\n");
-        out.push_str(t.guidelines_header);
-        out.push('\n');
-        let mut seen: Vec<String> = Vec::new();
-        // 3a. conditional file-exploration fallback (Pi `system-prompt.ts:97-113`). The gate is
+    /// `promptSections.rules` (`buildRules`, `:81-118`): deduplicated, trimmed bullets in insertion
+    /// order.
+    fn rules_section(&self, inp: &PromptInputs) -> String {
+        let t = self.tmpl;
+        let mut rules: Vec<String> = Vec::new();
+        // 3a. conditional file-exploration fallback (Pi `system-prompt.ts:101-109`). The gate is
         // `(hasBash || hasPowerShell)`, and the bullet names whichever shells are actually selected
         // — a PowerShell-only session must not be told to use `ls, rg, find`.
         let has = |n: &str| is_selected(inp.selected_tools.as_ref(), n);
@@ -243,28 +292,29 @@ impl SystemPromptBuilder {
             } else {
                 t.bash_fallback_guideline
             };
-            push_guideline(out, &mut seen, guideline);
+            push_rule(&mut rules, guideline);
         }
-        // 3b. tool-specific guidelines (named per func-03 R-03-039)
-        for c in &inp.tool_contributions {
-            if !is_selected(inp.selected_tools.as_ref(), &c.tool) {
-                continue;
-            }
-            for g in &c.guidelines {
-                push_guideline(out, &mut seen, g);
+        // 3b. tool-specific guidelines, in selection order (named per func-03 R-03-039)
+        for name in selected_names(inp.selected_tools.as_ref()) {
+            if let Some(c) = inp.tool_contributions.iter().find(|c| &*c.tool == name) {
+                for g in &c.guidelines {
+                    push_rule(&mut rules, g);
+                }
             }
         }
         // 3c. caller-supplied extra guidelines
         for g in &inp.prompt_guidelines {
-            push_guideline(out, &mut seen, g);
+            push_rule(&mut rules, g);
         }
         // 3d. baseline (always)
         for g in t.baseline_guidelines {
-            push_guideline(out, &mut seen, g);
+            push_rule(&mut rules, g);
         }
-
-        // 4. docs pointer (DI-4)
-        emit_docs_section(out, t, &inp.docs);
+        rules
+            .iter()
+            .map(|rule| format!("- {rule}"))
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     /// Cheap, non-cryptographic fingerprint of the output-affecting inputs (R-06-017).
@@ -341,13 +391,13 @@ fn opt_str_hash<H: Hasher>(h: &mut H, s: &Option<Arc<str>>) {
     }
 }
 
-/// Pi's four-tool fallback for an UNSET selection (`system-prompt.ts:81`).
+/// Pi's four-tool fallback for an UNSET selection (`system-prompt.ts:58`).
 pub const DEFAULT_SELECTED_TOOLS: &[&str] = &["read", "bash", "edit", "write"];
 
 /// A tool is selected if the set is unset (Pi's `||` default) or explicitly names it.
 ///
 /// An explicitly EMPTY set selects nothing — including `read`, which is what gates the skills
-/// section (`system-prompt.ts:101,155`).
+/// section (`system-prompt.ts:165`).
 fn is_selected(selected: Option<&Vec<Arc<str>>>, name: &str) -> bool {
     match selected {
         None => DEFAULT_SELECTED_TOOLS.contains(&name),
@@ -355,91 +405,73 @@ fn is_selected(selected: Option<&Vec<Arc<str>>>, name: &str) -> bool {
     }
 }
 
-/// Push a deduped, trimmed guideline bullet (insertion order preserved).
-fn push_guideline(out: &mut String, seen: &mut Vec<String>, g: &str) {
-    let g = g.trim();
-    if g.is_empty() || seen.iter().any(|s| s == g) {
-        return;
+/// The selected tool names, in selection order. UNSET resolves to pi's four-tool default
+/// (`system-prompt.ts:58`); an explicitly empty set stays empty.
+fn selected_names(selected: Option<&Vec<Arc<str>>>) -> Vec<&str> {
+    match selected {
+        None => DEFAULT_SELECTED_TOOLS.to_vec(),
+        Some(v) => v.iter().map(|t| &**t).collect(),
     }
-    seen.push(g.to_owned());
-    out.push_str("- ");
-    out.push_str(g);
-    out.push('\n');
 }
 
-/// Pi `system-prompt.ts:131-138`, ported line-for-line. The three trailing bullets are
-/// BEHAVIOURAL — they are what makes the pointers usable — and were missing entirely:
-/// * `:135` resolve `docs/…` under Additional docs and `examples/…` under Examples, not the cwd;
-/// * `:137` read the docs and examples, and follow `.md` cross-references before implementing;
-/// * `:138` read `.md` files completely and follow links to related docs.
-///
-/// Pi's block sits inside the default-body template literal with **no guard**, so every default
-/// prompt carries it; cyrup's paths are `Option`s and the block is skipped when all three are
-/// absent. That guard is only reachable because the sole production caller still passes
-/// `DocsPointers::default()` — see SESS-035; the path helpers themselves belong in `cyrup-config`
-/// (Pi `config.ts:427-439`, three `resolve(join(getPackageDir(), …))` calls).
-fn emit_docs_section(out: &mut String, t: &PromptTemplate, docs: &DocsPointers) {
-    if docs.is_empty() {
+/// Pi's `addRule` (`system-prompt.ts:88-93`): trimmed, non-empty, first occurrence wins.
+fn push_rule(rules: &mut Vec<String>, rule: &str) {
+    let rule = rule.trim();
+    if rule.is_empty() || rules.iter().any(|r| r == rule) {
         return;
     }
-    out.push('\n');
-    out.push_str(t.docs_header);
+    rules.push(rule.to_owned());
+}
+
+/// Pi `system-prompt.ts:153-160`, ported line-for-line. The three trailing bullets are
+/// BEHAVIOURAL — they are what makes the pointers usable:
+/// * `:157` resolve `docs/…` under Additional docs and `examples/…` under Examples, not the cwd;
+/// * `:159` read the docs and examples, and follow `.md` cross-references before implementing;
+/// * `:160` read `.md` files completely and follow links to related docs.
+///
+/// Pi's block carries **no guard**, so every default prompt has it; cyrup's paths are `Option`s and
+/// the section is left out when all three are absent. That guard is only reachable because the sole
+/// production caller still passes `DocsPointers::default()` — see SESS-035; the path helpers
+/// themselves belong in `cyrup-config` (Pi `config.ts:427-439`, three
+/// `resolve(join(getPackageDir(), …))` calls).
+fn docs_section(t: &PromptTemplate, docs: &DocsPointers) -> Option<String> {
+    if docs.is_empty() {
+        return None;
+    }
+    let mut lines: Vec<String> = Vec::with_capacity(6);
     if let Some(p) = &docs.readme {
-        emit_docs_line(out, "Main documentation: ", p, "");
+        lines.push(format!("- Main documentation: {}", p.to_string_lossy()));
     }
     if let Some(p) = &docs.docs {
-        emit_docs_line(out, "Additional docs: ", p, "");
+        lines.push(format!("- Additional docs: {}", p.to_string_lossy()));
     }
     if let Some(p) = &docs.examples {
-        emit_docs_line(out, "Examples: ", p, " (extensions, custom tools, SDK)");
+        lines.push(format!(
+            "- Examples: {} (extensions, custom tools, SDK)",
+            p.to_string_lossy()
+        ));
     }
-    for line in t.docs_guidance {
-        out.push_str("\n- ");
-        out.push_str(line);
-    }
+    lines.extend(t.docs_guidance.iter().map(|line| format!("- {line}")));
+    Some(format!("{}\n{}", t.docs_header, lines.join("\n")))
 }
 
-fn emit_docs_line(out: &mut String, label: &str, p: &Path, suffix: &str) {
-    out.push_str("\n- ");
-    out.push_str(label);
-    out.push_str(&p.to_string_lossy());
-    out.push_str(suffix);
-}
-
-fn emit_context_files(out: &mut String, t: &PromptTemplate, files: &[ContextFile]) {
-    if files.is_empty() {
-        return;
-    }
-    out.push_str("\n\n");
-    out.push_str(t.project_context_open);
+/// Pi `renderProjectContext` (`system-prompt.ts:72-79`): the header, then one
+/// `<project_instructions path="…">` block per file, joined by a blank line.
+fn project_context_text(t: &PromptTemplate, files: &[ContextFile]) -> String {
+    let mut parts: Vec<String> = Vec::with_capacity(files.len() + 1);
+    parts.push(t.project_context_header.to_owned());
     for cf in files {
-        out.push_str("<project_instructions path=\"");
-        out.push_str(&cf.path.to_string_lossy()); // lossy: never panic on non-UTF8
-        out.push_str("\">\n");
-        out.push_str(&cf.content);
-        out.push_str("\n</project_instructions>\n\n");
+        // lossy: never panic on non-UTF8
+        parts.push(format!(
+            "<project_instructions path=\"{}\">\n{}\n</project_instructions>",
+            cf.path.to_string_lossy(),
+            cf.content
+        ));
     }
-    out.push_str(t.project_context_close);
+    parts.join("\n\n")
 }
 
-/// Pi's footer is exactly one line: `prompt += `\nCurrent working directory: ${promptCwd}``
-/// (`system-prompt.ts:159`, and `:69` in the custom-prompt branch).
-///
-/// cyrup previously also emitted `"\n\nCurrent date: YYYY-MM-DD"` ahead of it. That was NOT a cyrup
-/// invention — it is a faithful port of an older pi — but `git grep 'Current date' v0.83.0 --
-/// packages/coding-agent/src` returns **nothing**, so the removal predates cyrup's own ported
-/// baseline: carrying it was a stale port, not an upstream-drift decision. Removing it also removes
-/// the extra leading `\n` (pi has one newline here, not two) and the only reason
-/// [`SystemPromptBuilder::inputs_fingerprint`] hashed `today`, which forced a daily rebuild.
-fn emit_footer(out: &mut String, inp: &PromptInputs) {
-    use std::fmt::Write as _;
-    let _ = write!(
-        out,
-        "\nCurrent working directory: {}",
-        normalize_slashes(&inp.cwd)
-    );
-}
-
+/// Pi's `promptSections.cwd = cwd.replace(/\\/g, "/")` (`system-prompt.ts:170`).
 fn normalize_slashes(p: &Path) -> String {
     p.to_string_lossy().replace('\\', "/")
 }

@@ -796,16 +796,21 @@ const PARENT_ONLY_CUSTOM_MESSAGE_TYPES: &[&str] = &[
 /// `subagent-prompt-runtime.ts:124,129` @v0.34.0).
 const SUBAGENT_TOOL_NAME: &str = "subagent";
 
-/// Opening delimiter of cyrup's project-context section (`cyrup-session/src/prompt/builder.rs`'s
-/// `project_context_open`). See the module doc's [CYRUP-DELTA] 1.
+/// Opening delimiter of cyrup's project-context section: the tag `cyrup-session/src/prompt/builder.rs`
+/// wraps the section in (pi `system-prompt.ts:177`). See the module doc's [CYRUP-DELTA] 1.
 const PROJECT_CONTEXT_OPEN: &str = "<project_context>";
-/// Closing delimiter of cyrup's project-context section (`builder.rs`'s `project_context_close`).
+/// Closing delimiter of cyrup's project-context section.
 const PROJECT_CONTEXT_CLOSE: &str = "</project_context>";
-/// First line of cyrup's skills section (`cyrup-session/src/prompt/skills_inject.rs`'s
-/// `SKILLS_PREAMBLE`) — the section starts at the preamble, NOT at the `<available_skills>` tag.
-const SKILLS_OPEN: &str = "Available skills (open the SKILL.md with the read tool to use one):";
-/// Closing delimiter of cyrup's skills section (`skills_inject.rs`).
-const SKILLS_CLOSE: &str = "</available_skills>";
+/// Opening tag of cyrup's skills section (`cyrup-session/src/prompt/builder.rs`: every section but
+/// the preamble is `<name>\n…\n</name>`, pi `system-prompt.ts:177`).
+///
+/// This used to be `"Available skills (open the SKILL.md with the read tool to use one):"`, a line the
+/// builder has never written (its skills text opens "The following skills provide specialized
+/// instructions…", and since the sections it is inside `<skills>`), so `inheritSkills: false` cut
+/// nothing from a real prompt: the unit tests built their prompt from this constant.
+const SKILLS_OPEN: &str = "<skills>";
+/// Closing tag of cyrup's skills section.
+const SKILLS_CLOSE: &str = "</skills>";
 
 /// What [`rewrite_subagent_prompt`] was told about this child (pi's three `readBooleanEnv` results
 /// plus the structured-output presence check, `subagent-prompt-runtime.ts:111,330-338` @v0.34.0).
@@ -894,9 +899,9 @@ pub fn strip_inherited_skills(prompt: &str) -> String {
 }
 
 /// Opening tag of one context file inside cyrup's project-context section
-/// (`cyrup-session/src/prompt/builder.rs`'s `emit_context_files`).
+/// (`cyrup-session/src/prompt/builder.rs`'s `project_context_text`).
 const PROJECT_INSTRUCTIONS_OPEN: &str = "<project_instructions";
-/// Closing tag of one context file (`emit_context_files`).
+/// Closing tag of one context file (`project_context_text`).
 const PROJECT_INSTRUCTIONS_CLOSE: &str = "</project_instructions>";
 
 /// pi `GLOBAL_CONTEXT_FILE_NAMES` (`subagent-prompt-runtime.ts:121` @v0.68.0), compared
@@ -4420,10 +4425,66 @@ mod tests {
             "    <name>deploy</name>",
             "  </skill>",
             "</available_skills>",
+            SKILLS_CLOSE,
             "",
             "Current date: 2026-08-07",
         ]
         .join("\n")
+    }
+
+    /// The prompt cyrup's builder REALLY writes, with a project context and a skill in it.
+    ///
+    /// [`assembled_prompt`] is a fixture "shaped like" that output and built from this module's own
+    /// delimiter constants, so it can only confirm the constants to themselves. This one is built by
+    /// the builder, which is what a child's `before_agent_start` handler is handed.
+    fn built_prompt() -> String {
+        use cyrup_session::prompt::{
+            ContextFile, ContextScope, PromptInputs, SkillPointer, SystemPromptBuilder,
+        };
+        use std::sync::Arc;
+        SystemPromptBuilder::new().build(&PromptInputs {
+            selected_tools: Some(vec![Arc::from("read")]),
+            cwd: PathBuf::from("/repo"),
+            context_files: Arc::from(vec![ContextFile {
+                path: PathBuf::from("/repo/AGENTS.md"),
+                content: Arc::from("NEVER commit to main."),
+                scope: ContextScope::Cwd,
+            }]),
+            skills: Arc::from(vec![SkillPointer {
+                name: "deploy".to_string(),
+                description: Some("ship it".to_string()),
+                path: PathBuf::from("/skills/deploy/SKILL.md"),
+                disable_model_invocation: false,
+            }]),
+            ..PromptInputs::default()
+        })
+    }
+
+    #[test]
+    fn the_strippers_cut_the_prompt_the_builder_really_writes() {
+        let prompt = built_prompt();
+        assert!(prompt.contains("NEVER commit to main.") && prompt.contains("<name>deploy</name>"));
+
+        let no_context = rewrite_subagent_prompt(&prompt, &opts(false, true, false));
+        assert!(
+            !no_context.contains("NEVER commit to main."),
+            "{no_context}"
+        );
+        assert!(
+            no_context.contains("<name>deploy</name>"),
+            "skills stay: {no_context}"
+        );
+
+        let no_skills = rewrite_subagent_prompt(&prompt, &opts(true, false, false));
+        assert!(!no_skills.contains("<name>deploy</name>"), "{no_skills}");
+        assert!(
+            no_skills.contains("NEVER commit to main."),
+            "context stays: {no_skills}"
+        );
+        assert!(
+            no_skills.ends_with("<cwd>\n/repo\n</cwd>"),
+            "and the sections after the cut survive: {no_skills}"
+        );
     }
 
     #[test]

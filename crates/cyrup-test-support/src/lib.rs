@@ -479,28 +479,47 @@ mod smoke {
         // `agent_settled` (SEAM-005) — a session-layer event Pi emits from `AgentSession`
         // (agent-session.ts:581-588), never from the loop. Compare the agent-loop subset; padding
         // the EXPECTED side would falsely assert Pi's loop emits it.
-        let actual = crate::differential::agent_loop_kinds(&event_kind_sequence(&events));
+        let actual = crate::differential::agent_loop_event_kinds(&events);
         assert_event_kinds(&expected, &actual).expect(
             "cyrup text-turn ordering diverges from the REAL Pi-captured agent-loop sequence",
         );
     }
 
-    /// With tools in the executable set the loop declares them first: a system message carrying
-    /// `toolsAdded` is emitted as an ordinary message pair before the assistant's reply
-    /// (`declareToolChanges`, `agent-loop.ts:327-376` @v1.0.1), which is why the capture above is
-    /// compared against a tool-less session.
+    /// A session's first run writes ONE system message: its prompt (`sections`), with the tool
+    /// declarations the loop reconciles onto it (`declareToolChanges` over a pending system message,
+    /// `agent-loop.ts:327-376` @v1.0.0). It is a message pair of its own ahead of the prompt, which is
+    /// why the capture above is compared through [`crate::differential::agent_loop_event_kinds`]
+    /// against a tool-less session.
     #[tokio::test]
-    async fn a_session_with_tools_declares_them_with_a_system_message_pair() {
+    async fn a_session_writes_its_prompt_and_declares_its_tools_in_one_system_message() {
         let harness = create_harness(HarnessOptions::with_responses(vec![FauxResponse::text(
             "hi",
         )]))
         .await
         .expect("build harness");
         let events = harness.run("hello").await.expect("run");
-        let kinds = crate::differential::agent_loop_kinds(&event_kind_sequence(&events));
+        let kinds = event_kind_sequence(&events);
         let starts = kinds.iter().filter(|k| *k == "message_start").count();
-        // The user prompt, the declaration, and the assistant's reply.
+        // The system message, the user prompt, and the assistant's reply.
         assert_eq!(starts, 3, "message_start count in {kinds:?}");
+
+        let system: Vec<&cyrup_agent::AgentMessage> = events
+            .iter()
+            .filter_map(|e| match e {
+                cyrup_session_svc::AgentSessionEvent::MessageEnd { message } => Some(message),
+                _ => None,
+            })
+            .filter(|m| matches!(m, cyrup_agent::AgentMessage::System(_)))
+            .collect();
+        assert_eq!(system.len(), 1, "one system message, not one per concern");
+        let cyrup_agent::AgentMessage::System(row) = system[0] else {
+            unreachable!("filtered to system messages");
+        };
+        assert!(row.sections.is_some(), "it carries the prompt");
+        assert!(
+            !row.tools_added.is_empty(),
+            "and the tools the session runs"
+        );
     }
 
     /// The faux core tool-call id matches Pi's `tool:<ts>:<rand>` shape (deterministic [CYRUP-DELTA]).

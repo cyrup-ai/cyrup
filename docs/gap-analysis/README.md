@@ -337,7 +337,7 @@ file; it only says how old each one is.
 > | `11` | cyrup `fe875569` × pi-intercom **v0.16.0** | `ICOM-071`…`ICOM-081` (next id `ICOM-082`) |
 > | `13` · `13a`–`13i` · `13-cyrup-mcp-STATUS.md` | cyrup `fe875569` × pi-mcp-adapter **v5.0.0** (× pi **v1.0.0** for the two new in-monorepo MCP surfaces) | `MCP-587`…`MCP-608` (next id `MCP-609`); census 523 → 545 units. Still counted in its own file |
 > | `17` | cyrup `fe875569` × pi **v1.0.0** | `HARN-003`, `HARN-004`, `DUR-001`…`DUR-004` (next ids `HARN-005`, `DUR-005`) |
-> | `18` (**new**) | cyrup `fe875569` × pi **v1.0.0** | `CODE-001`…`CODE-013` (next id `CODE-014`); added to `STANDARD_AREAS` in `scripts/count_open_items.py` in the same change |
+> | `18` (**new**) | cyrup `fe875569` × pi **v1.0.0** | `CODE-001`…`CODE-013` (next id `CODE-014`; `CODE-014`…`CODE-017` filed and `CODE-014` closed 2026-10-06, next id `CODE-018`); added to `STANDARD_AREAS` in `scripts/count_open_items.py` in the same change |
 >
 > **Not re-read on 2026-10-02**, so their 2026-09-24 rows below stand unqualified: `06`, `08`, `09`,
 > `09a`, `10`, `14`, `15`, `16`. Area 06 has one named lead waiting for it — `builtInExtensions`

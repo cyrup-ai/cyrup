@@ -208,7 +208,7 @@ async fn end_to_end_tool_call_round_trip_with_native_extension() {
     // (c) the assembled system prompt includes tools / skills / context sections.
     let prompt = session.system_prompt().to_string();
     assert!(
-        prompt.contains("Available tools:"),
+        prompt.contains("<tools>\n"),
         "tools section missing:\n{prompt}"
     );
     assert!(prompt.contains("write"), "write tool snippet missing");

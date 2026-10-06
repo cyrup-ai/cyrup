@@ -87,29 +87,42 @@ fn a06_1_default_composition() {
         out.contains("operating inside cyrup"),
         "identity line\n{out}"
     );
-    assert!(out.contains("Available tools:"), "tools header");
+    // SESS-054: pi renders the prompt as tagged, named sections (`system-prompt.ts:121-180`
+    // @v1.0.0); the v0.85 `Available tools:` / `Guidelines:` headings are gone.
+    assert!(!out.contains("Available tools:"), "no tools heading\n{out}");
+    assert!(!out.contains("Guidelines:"), "no guidelines heading\n{out}");
     assert!(
-        out.contains("- read: Read a file from disk"),
-        "read snippet"
+        out.contains("<tools>\n- read: Read a file from disk\n- bash: Run a shell command\n\nIn addition to the tools above"),
+        "tools section\n{out}"
     );
-    assert!(out.contains("- bash: Run a shell command"), "bash snippet");
-    assert!(out.contains("Guidelines:"));
+    assert!(out.contains("<rules>\n"), "rules section\n{out}");
     assert!(
         out.contains("- Be concise in your responses"),
         "baseline guideline"
     );
-    assert!(out.contains("cyrup documentation"), "docs pointer");
+    assert!(out.contains("<docs>\ncyrup documentation"), "docs pointer");
     assert!(out.contains("- Main documentation: /usr/share/cyrup/README.md"));
     // skills present because `read` is available
-    assert!(out.contains("<available_skills>"), "skills section");
+    assert!(out.contains("<skills>\n"), "skills section");
+    assert!(out.contains("<available_skills>"), "skills block");
     assert!(out.contains("<name>rustfmt</name>"));
-    // footer — SESS-019/DRIFT-035: pi's footer is the cwd line ALONE
-    // (`system-prompt.ts:159`); `Current date:` is absent from `packages/coding-agent/src` at
-    // v0.83.0, so asserting it pinned a stale port.
+    // the sections come in pi's order
+    let positions: Vec<usize> = ["<tools>", "<rules>", "<docs>", "<skills>", "<cwd>"]
+        .iter()
+        .map(|tag| {
+            out.find(tag)
+                .unwrap_or_else(|| panic!("{tag} missing\n{out}"))
+        })
+        .collect();
+    assert!(
+        positions.windows(2).all(|w| w[0] < w[1]),
+        "preamble, tools, rules, docs, skills, cwd in that order\n{out}"
+    );
+    // footer — SESS-019/DRIFT-035: no date line; SESS-054: the cwd is its own tagged section
     assert!(!out.contains("Current date"), "pi emits no date line");
     assert!(
-        out.ends_with("\nCurrent working directory: /work/proj"),
-        "cwd footer\n{out}"
+        out.ends_with("\n\n<cwd>\n/work/proj\n</cwd>"),
+        "cwd section\n{out}"
     );
     // compact-ish: DI-1 sanity (well under a few KB for this tiny input)
     assert!(
@@ -144,25 +157,24 @@ fn a06_2_custom_prompt_keeps_tail() {
         !out.contains("operating inside cyrup"),
         "default identity removed"
     );
-    assert!(!out.contains("Available tools:"), "default tools removed");
+    assert!(!out.contains("<tools>"), "default tools removed");
+    assert!(!out.contains("<rules>"), "default rules removed");
     // tail still present
-    assert!(out.contains("APPENDED EXTRA"), "append kept");
+    assert!(
+        out.contains("<addendum>\nAPPENDED EXTRA\n</addendum>"),
+        "append kept"
+    );
     assert!(out.contains("<project_context>"), "context kept");
     assert!(out.contains("project rules"));
     assert!(out.contains("<available_skills>"), "skills kept");
+    assert!(out.ends_with("\n\n<cwd>\n/work/proj\n</cwd>"), "cwd kept");
+    // Pi's `renderProjectContext` (`system-prompt.ts:72-79` @v1.0.0): the header, a blank line, one
+    // `<project_instructions>` block per file, all inside the `project_context` section's own tag.
     assert!(
-        out.ends_with("\nCurrent working directory: /work/proj"),
-        "footer kept"
-    );
-    // Pi's custom-prompt branch emits the same `<project_context>` wording and the same
-    // `</project_context>\n` close as the default body (`system-prompt.ts:55-60` vs `:146-151`).
-    assert!(
-        out.contains("<project_context>\n\nProject-specific instructions and guidelines:\n\n"),
-        "project_context wording matches system-prompt.ts:146-147\n{out}"
-    );
-    assert!(
-        out.contains("</project_context>\n"),
-        "close carries pi's trailing newline"
+        out.contains(
+            "<project_context>\nProject-specific instructions and guidelines:\n\n<project_instructions path=\"/work/proj/AGENTS.md\">\nproject rules\n</project_instructions>\n</project_context>"
+        ),
+        "project_context wording matches renderProjectContext\n{out}"
     );
 }
 
@@ -333,7 +345,7 @@ fn a06_5_untrusted_skips_project_keeps_global() {
 
 // ── A-06-6: a skill-reading tool gates the skills section; empty skills (--no-skills) removes it ─
 // SESS-059 — pi v0.85.0 (#8552): `skillFileReadTool = ["read","bash"].find(selected)`
-// (`system-prompt.ts:46`), and `formatSkillsForPrompt(skills, skillFileReadTool)` names that tool
+// (`system-prompt.ts:165`), and `formatSkillsForPrompt(skills, skillFileReadTool)` names that tool
 // in its load instruction (`skills.ts:364-366` @v0.87.1).
 #[test]
 fn a06_6_read_gates_skills() {
@@ -440,10 +452,10 @@ fn sess003_disabled_skills_are_not_advertised_to_the_model() {
 
 // ── SESS-016: an explicitly EMPTY selected-tools list selects NOTHING ────────────────────────────
 //
-// Pi: `const tools = selectedTools || ["read","bash","edit","write"]` (`system-prompt.ts:81`). An
-// empty array is TRUTHY in JS, so `tools` stays `[]`, `hasRead` (`:101`) is false and the skills
-// gate at `:155` skips; the custom-prompt branch is the same predicate at `:64`
-// (`!selectedTools || selectedTools.includes("read")`). Reachable in production:
+// Pi: `selectedTools: [...(input.selectedTools ?? ["read", "bash", "edit", "write"])]`
+// (`system-prompt.ts:58`). `??` keeps an empty array, so `selectedTools` stays `[]`, no skill-reading
+// tool is found (`:165`) and the skills section is skipped; every `has…` test in `buildRules`
+// (`:95-99`) is false as well. Reachable in production:
 // `cyrup-session-svc/src/tools.rs:61` sets the field from the live active-tool set, so disabling
 // every tool lands here.
 #[test]
@@ -509,7 +521,7 @@ fn sess016_explicitly_empty_tool_set_emits_no_skills_and_no_tool_guidelines() {
         !SystemPromptBuilder::new()
             .build(&grep_only)
             .contains("- grep: search"),
-        "the default set is exactly [read, bash, edit, write] (system-prompt.ts:81)"
+        "the default set is exactly [read, bash, edit, write] (system-prompt.ts:58)"
     );
 }
 
@@ -548,7 +560,7 @@ fn sess024_skills_preamble_carries_pi_relative_path_rule() {
 }
 
 // ── SESS-035: the docs section carries pi's three behavioural bullets ────────────────────────────
-// `system-prompt.ts:135`, `:137`, `:138`. (The production WIRING — populating `DocsPointers` from
+// `system-prompt.ts:157`, `:159`, `:160`. (The production WIRING — populating `DocsPointers` from
 // package-relative paths, pi `config.ts:427-439` — lands in `cyrup-config`/`cyrup-session-svc` and
 // is NOT covered here; this pins the emitter half only.)
 #[test]
@@ -567,22 +579,22 @@ fn sess035_docs_section_emits_pi_resolution_and_cross_reference_rules() {
     assert!(out.contains("- Additional docs: /pkg/docs"));
     assert!(
         out.contains("- Examples: /pkg/examples (extensions, custom tools, SDK)"),
-        "pi's parenthetical rides on the Examples line (system-prompt.ts:134)"
+        "pi's parenthetical rides on the Examples line (system-prompt.ts:156)"
     );
     assert!(
         out.contains(
             "resolve docs/... under Additional docs and examples/... under Examples, not the \
              current working directory"
         ),
-        "system-prompt.ts:135; got:\n{out}"
+        "system-prompt.ts:157; got:\n{out}"
     );
     assert!(
         out.contains("follow .md cross-references before implementing"),
-        "system-prompt.ts:137"
+        "system-prompt.ts:159"
     );
     assert!(
         out.contains("read cyrup .md files completely and follow links to related docs"),
-        "system-prompt.ts:138"
+        "system-prompt.ts:160"
     );
 
     // All-absent stays silent (the guard is only reachable while SESS-035's wiring is missing).
@@ -793,7 +805,7 @@ async fn context_store_reload_cancelled() {
     assert!(matches!(err, ContextError::Cancelled));
 }
 
-/// Pi `system-prompt.ts:97-113` — the file-exploration fallback is a THREE-way branch over
+/// Pi `system-prompt.ts:95-109` — the file-exploration fallback is a THREE-way branch over
 /// `hasBash`/`hasPowerShell`, gated on none of `grep`/`find`/`ls` being selected. A PowerShell-only
 /// session must not be told to reach for `ls, rg, find`.
 #[test]
@@ -829,7 +841,7 @@ fn the_file_exploration_fallback_names_whichever_shells_are_selected() {
         }
     }
 
-    // Any of grep/find/ls closes the gate for every shell combination (`system-prompt.ts:105`).
+    // Any of grep/find/ls closes the gate for every shell combination (`system-prompt.ts:101`).
     for extra in ["grep", "find", "ls"] {
         for shells in [
             &["bash"][..],
@@ -856,4 +868,219 @@ fn the_file_exploration_fallback_names_whichever_shells_are_selected() {
             "no shell selected ⇒ no fallback; got `{g}`"
         );
     }
+}
+
+// ── CODE-014 / SESS-054: the prompt as pi's named, tagged sections ────────────────────────────────
+
+fn names(sections: &cyrup_core::Sections) -> Vec<&str> {
+    sections.iter().map(|(name, _)| name).collect()
+}
+
+/// `buildSystemPromptSections` (`system-prompt.ts:121-180` @v1.0.0), byte for byte for the smallest
+/// default prompt: the untagged preamble, then every other section as `<name>\n…\n</name>`.
+#[test]
+fn the_default_prompt_is_pis_sections_byte_for_byte() {
+    let inp = PromptInputs {
+        selected_tools: Some(vec![arc("read")]),
+        tool_contributions: vec![ToolPromptContribution::snippet("read", "Read a file")],
+        ..base_inputs()
+    };
+    let builder = SystemPromptBuilder::new();
+    let sections = builder.build_sections(&inp);
+
+    assert_eq!(names(&sections), ["preamble", "tools", "rules", "cwd"]);
+    let text = |name: &str| sections.get(name).flatten().map(str::to_owned);
+    assert_eq!(
+        text("preamble").as_deref(),
+        Some(
+            "You are a coding assistant operating inside cyrup, helping with software engineering tasks."
+        ),
+        "the preamble is NOT wrapped in a tag of its own name"
+    );
+    assert_eq!(
+        text("tools").as_deref(),
+        Some(
+            "<tools>\n- read: Read a file\n\nIn addition to the tools above, you may have access to other custom tools depending on the project.\n</tools>"
+        )
+    );
+    assert_eq!(
+        text("rules").as_deref(),
+        Some(
+            "<rules>\n- Be concise in your responses\n- Show file paths clearly when working with files\n</rules>"
+        )
+    );
+    assert_eq!(text("cwd").as_deref(), Some("<cwd>\n/work/proj\n</cwd>"));
+
+    // `buildSystemPrompt` is those sections, each a paragraph.
+    assert_eq!(
+        builder.build(&inp),
+        [
+            "You are a coding assistant operating inside cyrup, helping with software engineering tasks.",
+            "<tools>\n- read: Read a file\n\nIn addition to the tools above, you may have access to other custom tools depending on the project.\n</tools>",
+            "<rules>\n- Be concise in your responses\n- Show file paths clearly when working with files\n</rules>",
+            "<cwd>\n/work/proj\n</cwd>",
+        ]
+        .join("\n\n"),
+    );
+}
+
+/// The order pi inserts the sections in is the order the model reads them in, and a section whose
+/// input is absent is absent — not empty (`system-prompt.ts:143-179`).
+#[test]
+fn every_section_comes_in_pis_order_and_an_absent_one_is_absent() {
+    let full = PromptInputs {
+        selected_tools: Some(vec![arc("read")]),
+        tool_contributions: vec![ToolPromptContribution::snippet("read", "Read a file")],
+        docs: DocsPointers {
+            readme: Some(PathBuf::from("/pkg/README.md")),
+            ..DocsPointers::default()
+        },
+        append_system_prompt: Some(arc("APPENDED")),
+        context_files: Arc::from(vec![ContextFile {
+            path: PathBuf::from("/work/proj/AGENTS.md"),
+            content: arc("rules of the house"),
+            scope: ContextScope::Cwd,
+        }]),
+        skills: Arc::from(vec![skill("s1", "use s1", "/s1/SKILL.md")]),
+        ..base_inputs()
+    };
+    let builder = SystemPromptBuilder::new();
+    assert_eq!(
+        names(&builder.build_sections(&full)),
+        [
+            "preamble",
+            "tools",
+            "rules",
+            "docs",
+            "addendum",
+            "project_context",
+            "skills",
+            "cwd"
+        ]
+    );
+    // Without docs, an append, context files or skills, those four are simply not there.
+    let bare = PromptInputs {
+        selected_tools: Some(vec![arc("read")]),
+        ..base_inputs()
+    };
+    assert_eq!(
+        names(&builder.build_sections(&bare)),
+        ["preamble", "tools", "rules", "cwd"]
+    );
+    // An empty append is `if (appendSystemPrompt)` falsy: no `addendum`.
+    let empty_append = PromptInputs {
+        append_system_prompt: Some(arc("")),
+        ..bare
+    };
+    assert!(
+        builder
+            .build_sections(&empty_append)
+            .get("addendum")
+            .is_none()
+    );
+}
+
+/// A custom prompt replaces the PREAMBLE and nothing else of the default body goes with it:
+/// `tools`, `rules` and `docs` are the default prompt's (`:146-161`), while the shared tail —
+/// addendum, project context, skills, cwd — still applies (R-06-003). An EMPTY custom prompt is not
+/// one (`if (customPrompt)`).
+#[test]
+fn a_custom_prompt_replaces_the_preamble_and_keeps_the_tail() {
+    let inp = PromptInputs {
+        custom_prompt: Some(arc("MY OWN PROMPT")),
+        selected_tools: Some(vec![arc("read")]),
+        append_system_prompt: Some(arc("APPENDED")),
+        ..base_inputs()
+    };
+    let builder = SystemPromptBuilder::new();
+    let sections = builder.build_sections(&inp);
+    assert_eq!(names(&sections), ["preamble", "addendum", "cwd"]);
+    assert_eq!(
+        sections.get("preamble").flatten(),
+        Some("MY OWN PROMPT"),
+        "the custom text, untagged"
+    );
+
+    let empty = PromptInputs {
+        custom_prompt: Some(arc("")),
+        ..inp
+    };
+    assert!(
+        builder.build(&empty).contains("operating inside cyrup"),
+        "an empty custom prompt falls back to the default one"
+    );
+}
+
+/// `diffSystemPromptSections` (`system-prompt.ts:204-216` @v1.0.0).
+#[test]
+fn the_diff_lists_changes_in_current_order_then_removals() {
+    use super::sections::diff_system_prompt_sections as diff;
+    let sections = |pairs: &[(&str, &str)]| -> cyrup_core::Sections {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), Some(v.to_string())))
+            .collect()
+    };
+    let previous = sections(&[
+        ("preamble", "p"),
+        ("tools", "t1"),
+        ("gone", "g"),
+        ("cwd", "c"),
+    ]);
+    let current = sections(&[
+        ("preamble", "p"),
+        ("tools", "t2"),
+        ("cwd", "c"),
+        ("fresh", "f"),
+    ]);
+
+    let patch = diff(&previous, &current).expect("tools changed, fresh is new, gone is removed");
+    assert_eq!(
+        patch.iter().collect::<Vec<_>>(),
+        [("tools", Some("t2")), ("fresh", Some("f")), ("gone", None)],
+        "changed and new in `current`'s order, then the removals; `null` is a removal"
+    );
+    assert_eq!(
+        serde_json::to_string(&patch).expect("serialize"),
+        r#"{"tools":"t2","fresh":"f","gone":null}"#
+    );
+
+    // Nothing changed ⇒ no patch at all (`undefined` upstream), not an empty one.
+    assert!(diff(&current, &current).is_none());
+    assert!(diff(&cyrup_core::Sections::new(), &cyrup_core::Sections::new()).is_none());
+    // Against an empty transcript the patch is the whole prompt, which is how a new session
+    // declares its prompt.
+    assert_eq!(
+        diff(&cyrup_core::Sections::new(), &current)
+            .expect("everything is new")
+            .iter()
+            .map(|(name, _)| name)
+            .collect::<Vec<_>>(),
+        ["preamble", "tools", "cwd", "fresh"]
+    );
+}
+
+/// A section pi wrote under a name cyrup does not build is not special: it is in `previous`, not in
+/// `current`, so the new row removes it. The row that carried it is never edited.
+#[test]
+fn a_section_cyrup_does_not_build_is_removed_by_a_null_and_never_edited() {
+    use super::sections::diff_system_prompt_sections as diff;
+    let from_pi: cyrup_core::Sections = serde_json::from_str(
+        r#"{"preamble":"pi","experimental_pi_only":"<x>\nkept by pi\n</x>","cwd":"<cwd>\n/w\n</cwd>"}"#,
+    )
+    .expect("a pi row's sections");
+    let ours: cyrup_core::Sections =
+        serde_json::from_str(r#"{"preamble":"cyrup","cwd":"<cwd>\n/w\n</cwd>"}"#)
+            .expect("sections");
+
+    let patch = diff(&from_pi, &ours).expect("preamble differs, one section is unknown");
+    assert_eq!(
+        serde_json::to_string(&patch).expect("serialize"),
+        r#"{"preamble":"cyrup","experimental_pi_only":null}"#
+    );
+    // The unknown name survives a load and a re-serialize untouched.
+    assert_eq!(
+        serde_json::to_string(&from_pi).expect("serialize"),
+        r#"{"preamble":"pi","experimental_pi_only":"<x>\nkept by pi\n</x>","cwd":"<cwd>\n/w\n</cwd>"}"#
+    );
 }

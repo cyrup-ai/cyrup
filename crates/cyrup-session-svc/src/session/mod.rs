@@ -34,6 +34,7 @@ mod lifecycle;
 mod model;
 pub(crate) mod model_runtime;
 mod nested;
+mod prompt_update;
 mod queue;
 mod retry;
 mod run;
@@ -181,13 +182,18 @@ pub struct AgentSession {
     /// The LIVE base system prompt — the value a run falls back to when no `before_agent_start`
     /// handler replaced it (Pi `private _baseSystemPrompt`, agent-session.ts:371).
     ///
-    /// Seeded from the builder-assembled `services.system_prompt`, but MUTABLE thereafter: a
+    /// Seeded from the builder-assembled `services.system_prompt_sections`, but MUTABLE thereafter: a
     /// tool-set rebuild rewrites it ([`Self::push_active_tools`]), exactly as Pi reassigns
     /// `this._baseSystemPrompt = this._rebuildSystemPrompt(validToolNames)` inside
     /// `setActiveToolsByName` (agent-session.ts:939). `services.system_prompt` is owned by value on
     /// an all-`&self` type and so is frozen at build time; reading the reset path from it made every
     /// run with a `before_agent_start` subscriber revert the prompt to the startup tool set.
-    base_system_prompt: Mutex<String>,
+    ///
+    /// It holds the prompt as SECTIONS (CODE-014) with the text they render to. The sections are
+    /// what the session writes into the transcript, as a diff against what the transcript already
+    /// replays (pi `_preparePromptAndToolLoadout`, `agent-session.ts:1689-1705` @v1.0.0); the agent
+    /// holds no prompt of its own.
+    base_prompt: Mutex<crate::tools::BuiltPrompt>,
     /// The `before_agent_start` handler's replacement prompt for the CURRENT run, or `None` when no
     /// handler replaced it — Pi `private _systemPromptOverride?: string` (agent-session.ts:373
     /// @v0.83.0). Assigned at `:1247`, cleared at `:1251`, and cleared again in `_runAgentPrompt`'s
@@ -196,8 +202,10 @@ pub struct AgentSession {
     /// (`:534`, `:940`) — [`Self::effective_system_prompt`].
     ///
     /// Holding it apart from [`Self::base_system_prompt`] is the whole point: it is what lets the
-    /// turn-boundary refresh re-push a system prompt WITHOUT undoing a handler's mid-run
-    /// sanitization, which is why cyrup's single-slot version could not push one at all (DRIFT-033).
+    /// turn-boundary refresh keep the structured prompt in the transcript WITHOUT undoing a handler's
+    /// mid-run sanitization, which is why cyrup's single-slot version could not do it at all
+    /// (DRIFT-033). It is the pi `forceSystemPrompt` (`core/system-prompt.ts` @v1.0.0): kept OUT of
+    /// the transcript and projected onto the request instead ([`crate::hooks::PolicyHooks`]).
     system_prompt_override: Mutex<Option<String>>,
     branch_summary_settings: BranchSummarySettings,
     /// Long-lived token handed to the extension subscriber (distinct from per-run cancellation).
@@ -413,7 +421,7 @@ impl AgentSession {
         extras: SessionExtras,
     ) -> Self {
         let compaction_model = services.model.clone();
-        let base_system_prompt = services.system_prompt.clone();
+        let base_prompt = crate::tools::BuiltPrompt::new(services.system_prompt_sections.clone());
         // Seed the queue-mode mirrors from the resolved settings (the builder wired the same modes
         // into the agent), so the getters report the live mode without an agent-side getter.
         let eff = services.settings.effective();
@@ -446,7 +454,7 @@ impl AgentSession {
             services,
             model: Mutex::new(model),
             compaction_model: Mutex::new(compaction_model),
-            base_system_prompt: Mutex::new(base_system_prompt),
+            base_prompt: Mutex::new(base_prompt),
             system_prompt_override: Mutex::new(None),
             branch_summary_settings: extras.branch_summary_settings,
             session_cancel,

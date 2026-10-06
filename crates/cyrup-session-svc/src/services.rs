@@ -171,8 +171,13 @@ pub struct AgentSessionServices {
     /// when nothing is configured (sdk.ts:216-218 ⇒ `modelFallbackMessage`, a banner rather than an
     /// error; model-resolver.ts:648-650). See [`crate::session::AgentSession::model`] (SEAM-075).
     pub model: Option<Model>,
-    /// The assembled system prompt for this session (arch-06).
+    /// The assembled system prompt for this session (arch-06), as text: [`Self::system_prompt_sections`]
+    /// rendered.
     pub system_prompt: String,
+    /// The same prompt as the ordered, named sections a session stores in its transcript (CODE-014;
+    /// pi `buildSystemPromptSections`). Like [`Self::system_prompt`] this is the build-time value; the
+    /// live one follows the active tool set.
+    pub system_prompt_sections: cyrup_core::Sections,
     /// The concrete [`cyrup_ext::host::HostServices`] backend wired to this session's provider +
     /// active model (arch-08 §5.6). A loaded WASM extension's `models`/`session`/`control` imports
     /// resolve through this instead of the deny-all default.

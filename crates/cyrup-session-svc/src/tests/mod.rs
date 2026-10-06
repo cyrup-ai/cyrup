@@ -55,6 +55,7 @@ mod nested_tool_context;
 mod post_login_catalog_refresh;
 mod production_provider_wiring;
 mod project_trust_extension;
+mod prompt_transcript;
 mod provider_refresh;
 mod read_image_auto_resize;
 mod read_model_vision;
@@ -89,3 +90,11 @@ mod tree_branch_summary_cap;
 mod turn_end_steer;
 mod type_driven_boundaries;
 mod ui_prompt_events;
+
+/// The system prompt a request carries, as the provider renders it: the replay of the transcript's
+/// system messages (`getCurrentSystemPrompt` over `normalizeContext`). The agent holds no prompt of
+/// its own since CODE-014, so the request's `Context::system_prompt` field says nothing; the prompt
+/// is the `sections` of the system rows.
+pub(crate) fn rendered_prompt(ctx: &cyrup_provider::Context) -> String {
+    cyrup_provider::get_current_system_prompt(cyrup_provider::normalize_context(ctx).messages())
+}
