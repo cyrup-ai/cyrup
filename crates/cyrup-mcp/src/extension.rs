@@ -4437,12 +4437,18 @@ done
                 .collect();
             ext.activate_search_matches(&pairs)
         };
+        // Another server's claim on a name this extension registered for `srv` is not a match.
+        assert!(ask(&[("other", "srv_one")]).is_empty());
+        assert!(
+            services.writes().is_empty(),
+            "a foreign claim writes nothing"
+        );
+
         let added = ask(&[
-            ("srv", "srv_one"),   // owned, not active: loaded
-            ("other", "srv_one"), // another server's claim on the name: ignored
-            ("srv", "srv_two"),   // owned but already active: not reported
-            ("srv", "srv_nope"),  // not a tool of this extension
-            ("srv", "srv_one"),   // repeated in the same call: once
+            ("srv", "srv_one"),  // owned, not active: loaded
+            ("srv", "srv_two"),  // owned but already active: not reported
+            ("srv", "srv_nope"), // not a tool of this extension
+            ("srv", "srv_one"),  // repeated in the same call: once
         ]);
         assert_eq!(added, vec!["srv_one".to_string()]);
         assert_eq!(

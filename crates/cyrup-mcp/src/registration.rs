@@ -5396,4 +5396,20 @@ mod tests {
             surface.proxy_description
         );
     }
+
+    /// `direct-tool-surface.ts:213-222` @v5.0.0, in the description built from the disk cache (the
+    /// one `register_surface` registers): the model is told how a search-mode server's tools wake up.
+    #[test]
+    fn the_cache_built_gateway_description_names_search_mode_servers() {
+        let config = config_of(&[("docs", search_entry()), ("plain", entry(true))]);
+        let description = build_proxy_description(&config, None, &[]);
+        assert!(
+            description.contains(
+                "\nSearch-mode servers (docs): their tools become real, schema-backed tools the first time mcp({ search }) matches them or mcp({ tool }) calls them — after that, call them directly by name.\n"
+            ),
+            "{description}"
+        );
+        let none = build_proxy_description(&config_of(&[("plain", entry(true))]), None, &[]);
+        assert!(!none.contains("Search-mode servers"), "{none}");
+    }
 }
