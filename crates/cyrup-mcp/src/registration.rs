@@ -60,7 +60,8 @@ use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use cyrup_core::{
-    CancelToken, Content, Tool, ToolCallId, ToolError, ToolRenderKind, ToolResult, ToolUpdateSink,
+    CancelToken, Content, Tool, ToolCallId, ToolError, ToolExposure, ToolNamespace, ToolRenderKind,
+    ToolResult, ToolUpdateSink,
 };
 use cyrup_ext::native::InitApi;
 use cyrup_ext::{CommandDescriptor, EventKind};
@@ -70,7 +71,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::config::{
-    BoolOrList, McpConfig, McpSettings, ServerEntry, ToolPrefix, ToolResultRendering,
+    DirectToolsSetting, McpConfig, McpSettings, ServerEntry, ToolPrefix, ToolResultRendering,
 };
 use crate::dirs::McpDirs;
 use crate::proxy::ToolMetadata;
@@ -1281,34 +1282,66 @@ impl ToolFilter {
     }
 }
 
+/// What `resolveDirectTools` decides for one server (`direct-tools.ts` @v5.0.0 `toolFilter` and
+/// `lazy`): which tools register, and whether they register held back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ToolSelection {
+    filter: ToolFilter,
+    /// `directTools: "search"` — the filter is `true`, and the tools register at the `deferred`
+    /// exposure instead of being declared to the model.
+    lazy: bool,
+}
+
+impl ToolSelection {
+    const OFF: Self = Self {
+        filter: ToolFilter::Off,
+        lazy: false,
+    };
+
+    fn eager(filter: ToolFilter) -> Self {
+        Self {
+            filter,
+            lazy: false,
+        }
+    }
+
+    /// Whether the server contributes any direct tool.
+    fn wants_direct_tools(&self) -> bool {
+        self.filter != ToolFilter::Off
+    }
+}
+
 /// `resolveDirectTools` step 3: the env selection wins outright, then the per-server `directTools`
 /// *if present at all* (so an explicit `false` beats a global `true`), then the global.
-fn resolve_tool_filter(
+fn resolve_tool_selection(
     server_name: &str,
     definition: &ServerEntry,
     settings: Option<&McpSettings>,
     env_selection: Option<&DirectToolSelection>,
-) -> ToolFilter {
+) -> ToolSelection {
     if let Some(selection) = env_selection {
         if selection.servers.contains(server_name) {
-            return ToolFilter::All;
+            return ToolSelection::eager(ToolFilter::All);
         }
         return match selection.tools.get(server_name) {
-            Some(tools) => ToolFilter::Named(tools.iter().cloned().collect()),
-            None => ToolFilter::Off,
+            Some(tools) => ToolSelection::eager(ToolFilter::Named(tools.iter().cloned().collect())),
+            None => ToolSelection::OFF,
         };
     }
-    match &definition.direct_tools {
-        Some(BoolOrList::All(true)) => ToolFilter::All,
-        Some(BoolOrList::All(false)) => ToolFilter::Off,
-        Some(BoolOrList::Named(names)) => ToolFilter::Named(names.clone()),
-        None => {
-            if settings.and_then(|s| s.direct_tools) == Some(true) {
-                ToolFilter::All
-            } else {
-                ToolFilter::Off
-            }
-        }
+    let selected = definition.direct_tools.clone().or_else(|| {
+        settings
+            .and_then(|s| s.direct_tools)
+            .map(DirectToolsSetting::from)
+    });
+    match selected {
+        Some(DirectToolsSetting::All(true)) => ToolSelection::eager(ToolFilter::All),
+        Some(DirectToolsSetting::Named(names)) => ToolSelection::eager(ToolFilter::Named(names)),
+        // Real tools with real schemas, registered held back; `mcp({ search })` loads the matches.
+        Some(DirectToolsSetting::Search) => ToolSelection {
+            filter: ToolFilter::All,
+            lazy: true,
+        },
+        Some(DirectToolsSetting::All(false)) | None => ToolSelection::OFF,
     }
 }
 
@@ -1324,8 +1357,9 @@ pub fn missing_configured_direct_tool_servers(
     let settings = config.settings.as_ref();
     let mut missing = Vec::new();
     for (server_name, definition) in config.enabled_servers() {
-        let wants = resolve_tool_filter(server_name, definition, settings, env_selection.as_ref())
-            != ToolFilter::Off;
+        let wants =
+            resolve_tool_selection(server_name, definition, settings, env_selection.as_ref())
+                .wants_direct_tools();
         if !wants {
             continue;
         }
@@ -1352,6 +1386,11 @@ pub struct DirectToolSpec {
     pub input_schema: Option<Value>,
     /// Set for a resource tool — the URI `resources/read` is called with.
     pub resource_uri: Option<String>,
+    /// `DirectToolSpec.lazy` (`types.ts:773` @v5.0.0): the tool belongs to a `directTools: "search"`
+    /// server. It is registered with its real schema at the `deferred` exposure, so it is not
+    /// declared to the model until `mcp({ search })`, a successful `mcp({ tool })` call or Pi's
+    /// `tool_search` loads it.
+    pub lazy: bool,
 }
 
 /// The `directToolFingerprint` pre-image (13e §8). Field order is the literal's order, and
@@ -1367,6 +1406,9 @@ struct DirectToolFingerprint<'a> {
     input_schema: Option<&'a Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     resource_uri: Option<&'a str>,
+    /// `lazy: spec.lazy === true` (`index.ts:431`): a mode-only change (search to eager) must
+    /// re-register, or the tool keeps the exposure of the mode it was registered under.
+    lazy: bool,
 }
 
 /// `index.ts` `directToolFingerprint` — the change detector `syncDirectTools` diffs against
@@ -1386,6 +1428,7 @@ pub fn direct_tool_fingerprint(spec: &DirectToolSpec) -> String {
         description: &spec.description,
         input_schema: spec.input_schema.as_ref(),
         resource_uri: spec.resource_uri.as_deref(),
+        lazy: spec.lazy,
     })
     .unwrap_or_else(|_| spec.prefixed_name.clone())
 }
@@ -1439,6 +1482,28 @@ fn build_candidate_index(
     CandidateIndex::new(candidates)
 }
 
+/// The advisory `resolveDirectTools` logs for a large direct surface (`direct-tools.ts:227`,
+/// upstream `76a4ea3`, issue #358; `getLargeDirectToolsAdvisory`, `direct-tool-surface.ts:13`
+/// @v5.0.0), or `None`.
+///
+/// The settings test runs FIRST and is `!== false`, so an absent block still warns. It gates the
+/// *message* only: the advisory has never been a cap, so suppressing it changes nothing about which
+/// specs register. That is the whole point: the person who hit it meant to register 75 tools and
+/// wants the line to stop. Search-mode specs are not declared to the model, so they cost no prompt
+/// context and do not count.
+#[must_use]
+pub fn large_direct_tools_advisory(config: &McpConfig, specs: &[DirectToolSpec]) -> Option<String> {
+    if !config.settings_or_default().warn_on_large_direct_tools() {
+        return None;
+    }
+    let eager_count = specs.iter().filter(|spec| !spec.lazy).count();
+    (eager_count >= DIRECT_TOOLS_ADVISORY_THRESHOLD).then(|| {
+        format!(
+            "MCP: {eager_count} direct tools resolved. Each direct tool adds prompt context; README guidance recommends targeted sets of 5-20 tools and using the proxy or an explicit string[] when 75+ direct tools would be registered."
+        )
+    })
+}
+
 /// `direct-tools.ts` `resolveDirectTools` (MCP-212) — the set of tools the model sees on turn 1.
 ///
 /// `cache == None` → **empty**. There are no direct tools until a cache file exists; that is the
@@ -1474,7 +1539,8 @@ pub fn resolve_direct_tools(
         let Some(entry) = valid_entry(Some(cache), server_name, definition) else {
             continue;
         };
-        let filter = resolve_tool_filter(server_name, definition, settings, env_selection.as_ref());
+        let ToolSelection { filter, lazy } =
+            resolve_tool_selection(server_name, definition, settings, env_selection.as_ref());
         if filter == ToolFilter::Off {
             continue;
         }
@@ -1530,6 +1596,7 @@ pub fn resolve_direct_tools(
                 description: tool.description.clone().unwrap_or_default(),
                 input_schema: tool.input_schema.clone(),
                 resource_uri: None,
+                lazy,
             });
         }
 
@@ -1577,21 +1644,13 @@ pub fn resolve_direct_tools(
                 description,
                 input_schema: None,
                 resource_uri: Some(resource.uri.clone()),
+                lazy,
             });
         }
     }
 
-    // `direct-tools.ts:227` (upstream `76a4ea3`, issue #358): the settings test runs FIRST and is
-    // `!== false`, so an absent block still warns. This gates the *message* only — the advisory has
-    // never been a cap, so suppressing it changes nothing about which specs register. That is the
-    // whole point: the person who hit it meant to register 75 tools and wants the line to stop.
-    if config.settings_or_default().warn_on_large_direct_tools()
-        && specs.len() >= DIRECT_TOOLS_ADVISORY_THRESHOLD
-    {
-        tracing::warn!(
-            "MCP: {} direct tools resolved. Each direct tool adds prompt context; README guidance recommends targeted sets of 5-20 tools and using the proxy or an explicit string[] when 75+ direct tools would be registered.",
-            specs.len()
-        );
+    if let Some(advisory) = large_direct_tools_advisory(config, &specs) {
+        tracing::warn!("{advisory}");
     }
 
     specs
@@ -2198,6 +2257,17 @@ pub fn build_proxy_description(
         desc.push_str(&format!("\nServers: {}\n", server_summaries.join(", ")));
     }
 
+    // Search-mode tools are real tools held back. Say how they wake up, or the model reads
+    // `mcp({ tool })` as the only way in and never gets a schema (`direct-tool-surface.ts:213-222`
+    // @v5.0.0).
+    let search_mode_servers = config.search_mode_servers();
+    if !search_mode_servers.is_empty() {
+        desc.push_str(&format!(
+            "\nSearch-mode servers ({}): their tools become real, schema-backed tools the first time mcp({{ search }}) matches them or mcp({{ tool }}) calls them — after that, call them directly by name.\n",
+            search_mode_servers.join(", ")
+        ));
+    }
+
     // 4. Disabled servers.
     let disabled: Vec<&str> = config
         .mcp_servers
@@ -2281,6 +2351,9 @@ pub fn should_register_proxy_tool(
 ) -> bool {
     config.settings_or_default().proxy_tool_enabled()
         || direct_specs.is_empty()
+        // `hasSearchModeSpecs` (`index.ts:2280` @v5.0.0): search-mode tools are held back and the
+        // gateway is one of their entry points, so dropping it would strand them.
+        || direct_specs.iter().any(|spec| spec.lazy)
         || !missing_configured_direct_tool_servers(config, cache, env_override).is_empty()
 }
 
@@ -2400,6 +2473,84 @@ pub fn tool_render_kind(settings: Option<&McpSettings>) -> ToolRenderKind {
     }
 }
 
+/// What a search-mode (`lazy`) direct tool registers beyond an eager one (`deferredToolFields`,
+/// `index.ts:436-463` @v5.0.0, "the fields Pi's built-in MCP registers its tools with"): the
+/// `deferred` exposure, the server's namespace, and the result schema codemode renders as
+/// `CallToolResult<T>`.
+///
+/// Upstream also attaches the tool's MCP `annotations`, which Pi's `getAllTools()` reports to
+/// permission extensions. cyrup's `Tool` carries no annotations (the exposure model was ported
+/// without `ToolDefinition.annotations`, `types.ts:601` @v1.0.1), so they are not attached here.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeferredFields {
+    pub namespace: ToolNamespace,
+    pub output_schema: Value,
+}
+
+/// `deferredToolFields(spec, config, cache)`: `None` unless the spec is `lazy`.
+///
+/// `namespace.name` is `mcp__<server>` with `-` as `_`; its instructions are the server's cached
+/// ones (`serverCache.instructions`, read without the validity gate, as upstream reads
+/// `cache?.servers[spec.serverName]`). Upstream's `config.mcpServers[server].description` has no
+/// counterpart in cyrup's server entry yet, so the namespace carries no description.
+#[must_use]
+pub fn deferred_tool_fields(
+    spec: &DirectToolSpec,
+    cache: Option<&MetadataCache>,
+) -> Option<DeferredFields> {
+    if !spec.lazy {
+        return None;
+    }
+    let instructions = cache
+        .and_then(|cache| cache.servers.get(&spec.server_name))
+        .and_then(|entry| entry.instructions.clone())
+        .filter(|instructions| !instructions.is_empty());
+    Some(DeferredFields {
+        namespace: ToolNamespace {
+            name: format!("mcp__{}", spec.server_name.replace('-', "_")),
+            description: None,
+            instructions,
+        },
+        // `createMcpResultSchema`'s shape (without `structuredContent`: the metadata cache carries
+        // no `outputSchema`, so there is none to nest).
+        output_schema: json!({
+            "type": "object",
+            "properties": {
+                "content": { "type": "array", "items": { "type": "object" } },
+                "isError": { "type": "boolean" },
+                "_meta": { "type": "object" }
+            },
+            "required": ["content"]
+        }),
+    })
+}
+
+/// `toCallToolResult` (`index.ts:68-77`): the `CallToolResult` a codemode script gets from a
+/// search-mode tool, as the result's `structured_content`: its output-guarded content, the
+/// server's `structuredContent`, and `isError` on any failure (`details.error`). The model-facing
+/// `content` is untouched.
+fn with_call_tool_result(mut result: ToolResult) -> ToolResult {
+    let mut call_tool_result = serde_json::Map::new();
+    call_tool_result.insert(
+        "content".to_string(),
+        serde_json::to_value(&result.content).unwrap_or_else(|_| Value::Array(Vec::new())),
+    );
+    if let Some(structured) = result.structured_content.take() {
+        call_tool_result.insert("structuredContent".to_string(), structured);
+    }
+    if result
+        .details
+        .as_ref()
+        .and_then(|details| details.get("error"))
+        .is_some()
+    {
+        call_tool_result.insert("isError".to_string(), Value::Bool(true));
+    }
+    result.structured_content = Some(Value::Object(call_tool_result));
+    result
+}
+
 /// One registered direct tool — `index.ts` `registerDirectTool`'s shape (MCP-216).
 ///
 /// Every string is **owned and computed once at construction**, because `cyrup_core::Tool` returns
@@ -2412,6 +2563,11 @@ pub struct DirectTool {
     parameters: Value,
     render_kind: ToolRenderKind,
     dispatch: Arc<ToolDispatch>,
+    /// Present for a search-mode tool: it registers at the `deferred` exposure.
+    deferred: Option<DeferredFields>,
+    /// Registered again at the `hidden` exposure after its server or its selection went away
+    /// (`deactivateTools`, `index.ts:586-592`). Only a search-mode tool is ever hidden.
+    hidden: bool,
 }
 
 impl DirectTool {
@@ -2420,6 +2576,7 @@ impl DirectTool {
         spec: DirectToolSpec,
         render_kind: ToolRenderKind,
         dispatch: Arc<ToolDispatch>,
+        deferred: Option<DeferredFields>,
     ) -> Self {
         let label = format!("MCP: {}", spec.original_name);
         let description = if spec.description.is_empty() {
@@ -2442,7 +2599,19 @@ impl DirectTool {
             parameters,
             render_kind,
             dispatch,
+            deferred,
+            hidden: false,
         }
+    }
+
+    /// This tool registered again as `hidden`, which is how a host that cannot unregister a tool
+    /// makes it unreachable: a `deferred` tool stays callable from codemode while inactive, and
+    /// only `hidden` ends that (`deactivateTools`, `index.ts:586-592` @v5.0.0). Everything else
+    /// about the definition is unchanged.
+    #[must_use]
+    pub fn into_hidden(mut self) -> Self {
+        self.hidden = true;
+        self
     }
 
     /// The spec this tool was built from — the executor's entire input besides the call arguments.
@@ -2473,6 +2642,26 @@ impl Tool for DirectTool {
         self.render_kind
     }
 
+    /// `deferred` for a search-mode tool (`exposure: "deferred"`, `index.ts:444`), `direct` for
+    /// every other.
+    fn exposure(&self) -> ToolExposure {
+        if self.hidden {
+            ToolExposure::Hidden
+        } else if self.deferred.is_some() {
+            ToolExposure::Deferred
+        } else {
+            ToolExposure::Direct
+        }
+    }
+
+    fn namespace(&self) -> Option<&ToolNamespace> {
+        self.deferred.as_ref().map(|fields| &fields.namespace)
+    }
+
+    fn output_schema(&self) -> Option<&Value> {
+        self.deferred.as_ref().map(|fields| &fields.output_schema)
+    }
+
     async fn execute(
         &self,
         call_id: ToolCallId,
@@ -2480,14 +2669,21 @@ impl Tool for DirectTool {
         cancel: CancelToken,
         on_update: ToolUpdateSink,
     ) -> Result<ToolResult, ToolError> {
-        match self.dispatch.get() {
+        let result = match self.dispatch.get() {
             Some(dispatch) => {
                 dispatch
                     .call_direct(&self.spec, call_id, params, cancel, on_update)
-                    .await
+                    .await?
             }
-            None => Ok(not_initialized_result()),
-        }
+            None => not_initialized_result(),
+        };
+        // `definition.execute = async (...args) => toCallToolResult(await run(...args))`, applied
+        // to search-mode tools only (`index.ts:511-514`).
+        Ok(if self.deferred.is_some() {
+            with_call_tool_result(result)
+        } else {
+            result
+        })
     }
 }
 
@@ -2861,6 +3057,14 @@ pub fn mcp_auth_command_descriptor() -> CommandDescriptor {
 // 8. `register_surface` — `installMcpAdapter`'s synchronous body (MCP-003)
 // ---------------------------------------------------------------------------------------------
 
+/// A search-mode tool as it was registered: enough to register it again as `hidden` when it goes
+/// away (`deferredToolDefinitions`, `index.ts:392`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct LazyToolRecord {
+    pub spec: DirectToolSpec,
+    pub deferred: DeferredFields,
+}
+
 /// What one `init()` pass registered. Returned so [`crate::extension::McpExtension`] can seed the
 /// cross-`init` fingerprint maps that make a session replacement re-register only what changed
 /// (MCP-014, MCP-036) and can install the executor (MCP-214).
@@ -2879,6 +3083,10 @@ pub struct RegisteredSurface {
     /// `prefixedName -> directToolFingerprint`, ready to seed
     /// `McpExtension::registered_direct_tools` so the next pass's diff is meaningful.
     pub direct_tool_fingerprints: IndexMap<String, String>,
+    /// Every resolved search-mode tool, registered this pass or not (`lazyDirectTools` and
+    /// `deferredToolDefinitions`): the set `mcp({ search })` may load, and the tools to hide when
+    /// they go away.
+    pub lazy_tools: IndexMap<String, LazyToolRecord>,
     /// The proxy description as registered, or `None` when the proxy tool was not registered.
     /// Seeds `McpExtension::proxy_tool_description`, whose identity check is what preserves the
     /// provider's prompt-cache prefix.
@@ -3132,7 +3340,17 @@ pub fn register_surface<S: SurfaceSink + ?Sized>(
         )
     };
     for spec in &direct_specs {
-        let fingerprint = direct_tool_fingerprint(spec);
+        let deferred = deferred_tool_fields(spec, cache.as_ref());
+        // `directToolFingerprint(spec) + (deferred ? JSON.stringify(deferred) : "")`
+        // (`index.ts:621`): a change to the namespace or the schema re-registers the tool.
+        let fingerprint = match &deferred {
+            Some(fields) => format!(
+                "{}{}",
+                direct_tool_fingerprint(spec),
+                serde_json::to_string(fields).unwrap_or_default()
+            ),
+            None => direct_tool_fingerprint(spec),
+        };
         // The fingerprint is recorded for EVERY resolved spec, registered or not: it is the
         // extension's memory of what the model is currently shown, and a spec skipped because it
         // is unchanged is still shown. Recording only the registered ones would make the next
@@ -3140,6 +3358,15 @@ pub fn register_surface<S: SurfaceSink + ?Sized>(
         surface
             .direct_tool_fingerprints
             .insert(spec.prefixed_name.clone(), fingerprint.clone());
+        if let Some(fields) = &deferred {
+            surface.lazy_tools.insert(
+                spec.prefixed_name.clone(),
+                LazyToolRecord {
+                    spec: spec.clone(),
+                    deferred: fields.clone(),
+                },
+            );
+        }
         if !api.should_register_tool(&spec.prefixed_name, &fingerprint) {
             continue;
         }
@@ -3148,6 +3375,7 @@ pub fn register_surface<S: SurfaceSink + ?Sized>(
             spec.clone(),
             render_kind,
             Arc::clone(&dispatch),
+            deferred,
         )));
         // MCP-036: declared HERE, beside the registration, rather than in a second loop the caller
         // runs. A tool registered on the LATE path has no caller loop — the same pass is the whole
@@ -3203,7 +3431,7 @@ mod tests {
 
     fn entry(direct: bool) -> ServerEntry {
         ServerEntry {
-            direct_tools: Some(BoolOrList::All(direct)),
+            direct_tools: Some(DirectToolsSetting::All(direct)),
             ..ServerEntry::default()
         }
     }
@@ -3645,7 +3873,7 @@ mod tests {
     fn a_url_naming_a_missing_variable_is_never_cache_valid() {
         let definition = ServerEntry {
             url: Some("https://x.example/${CYRUP_MCP_145_DEFINITELY_UNSET}/mcp".to_string()),
-            direct_tools: Some(BoolOrList::All(true)),
+            direct_tools: Some(DirectToolsSetting::All(true)),
             ..ServerEntry::default()
         };
         assert!(
@@ -4108,11 +4336,13 @@ mod tests {
             description: String::new(),
             input_schema: None,
             resource_uri: None,
+            lazy: false,
         };
         let tool = DirectTool::new(
             spec,
             ToolRenderKind::SelfRendered,
             Arc::new(ToolDispatch::default()),
+            None,
         );
         assert_eq!(tool.name(), "srv_orig");
         assert_eq!(tool.label(), Some("MCP: orig"));
@@ -4352,6 +4582,7 @@ mod tests {
             description: "one".to_string(),
             input_schema: Some(json!({ "type": "object" })),
             resource_uri: None,
+            lazy: false,
         };
         let first = direct_tool_fingerprint(&spec);
         assert_eq!(first, direct_tool_fingerprint(&spec));
@@ -4720,5 +4951,449 @@ mod tests {
         // the global mode rather than being unrepresentable.
         let global = reconstruct_prompt_metadata("demo", &cached, ToolPrefix::Mcp, None);
         assert_eq!(global[0].command_name, "mcp__mcp__demo__brief");
+    }
+
+    // --- MCP-604: search-mode direct tools register at the `deferred` exposure ------------------
+
+    fn search_entry() -> ServerEntry {
+        ServerEntry {
+            direct_tools: Some(DirectToolsSetting::Search),
+            ..ServerEntry::default()
+        }
+    }
+
+    fn two_tool_cache(config: &McpConfig, server: &str) -> MetadataCache {
+        let mut entry = cache_entry(vec![cached_tool("one"), cached_tool("two")]);
+        entry.instructions = Some("Use the docs.".to_string());
+        cache_of(config, &[(server, entry)])
+    }
+
+    /// `direct-tool-surface.ts:92-111` @v5.0.0: `"search"` selects every allowed tool and marks it
+    /// `lazy`; an explicit per-server `false` still beats a global `"search"`, and the env override
+    /// selects eagerly.
+    #[test]
+    fn a_search_mode_server_resolves_every_tool_as_lazy() {
+        let config = config_of(&[("srv", search_entry())]);
+        let cache = two_tool_cache(&config, "srv");
+        let specs = resolve_direct_tools(&config, Some(&cache), ToolPrefix::Server, None);
+        let names: Vec<(&str, bool)> = specs
+            .iter()
+            .map(|spec| (spec.prefixed_name.as_str(), spec.lazy))
+            .collect();
+        assert_eq!(names, [("srv_one", true), ("srv_two", true)]);
+
+        // The global applies to a server that says nothing, and an eager server stays eager.
+        let mut global = config_of(&[("srv", ServerEntry::default()), ("eager", entry(true))]);
+        global.settings = Some(McpSettings {
+            direct_tools: Some(crate::config::GlobalDirectTools::Search),
+            ..McpSettings::default()
+        });
+        let cache = cache_of(
+            &global,
+            &[
+                ("srv", cache_entry(vec![cached_tool("one")])),
+                ("eager", cache_entry(vec![cached_tool("two")])),
+            ],
+        );
+        let specs = resolve_direct_tools(&global, Some(&cache), ToolPrefix::Server, None);
+        let names: Vec<(&str, bool)> = specs
+            .iter()
+            .map(|spec| (spec.prefixed_name.as_str(), spec.lazy))
+            .collect();
+        assert_eq!(names, [("srv_one", true), ("eager_two", false)]);
+
+        // Presence wins: an explicit `false` beats the global.
+        let mut off = global.clone();
+        off.mcp_servers.get_mut("srv").unwrap().direct_tools = Some(DirectToolsSetting::All(false));
+        let specs = resolve_direct_tools(&off, Some(&cache), ToolPrefix::Server, None);
+        assert_eq!(
+            specs
+                .iter()
+                .map(|s| s.prefixed_name.as_str())
+                .collect::<Vec<_>>(),
+            ["eager_two"]
+        );
+
+        // The env override selects, and what it selects is eager.
+        let selectors = vec!["srv".to_string()];
+        let specs = resolve_direct_tools(
+            &config,
+            Some(&two_tool_cache(&config, "srv")),
+            ToolPrefix::Server,
+            Some(&selectors),
+        );
+        assert!(specs.iter().all(|spec| !spec.lazy), "{specs:?}");
+    }
+
+    /// A search-mode server still "wants" direct tools, so a cold cache keeps the gateway honest.
+    #[test]
+    fn a_search_mode_server_is_a_server_that_wants_direct_tools() {
+        let config = config_of(&[("srv", search_entry())]);
+        assert_eq!(
+            missing_configured_direct_tool_servers(&config, None, None),
+            ["srv"]
+        );
+    }
+
+    /// `getLargeDirectToolsAdvisory` (`direct-tool-surface.ts:13-18`): search-mode specs are not
+    /// declared to the model, so they cost no prompt context and do not count toward 75.
+    #[test]
+    fn the_large_surface_advisory_counts_only_eager_specs() {
+        let spec = |index: usize, lazy: bool| DirectToolSpec {
+            server_name: "s".to_string(),
+            original_name: format!("t{index}"),
+            prefixed_name: format!("s_t{index}"),
+            description: String::new(),
+            input_schema: None,
+            resource_uri: None,
+            lazy,
+        };
+        let config = McpConfig::default();
+        let eager: Vec<_> = (0..DIRECT_TOOLS_ADVISORY_THRESHOLD)
+            .map(|i| spec(i, false))
+            .collect();
+        let advisory = large_direct_tools_advisory(&config, &eager).expect("75 eager specs warn");
+        assert!(
+            advisory.starts_with("MCP: 75 direct tools resolved."),
+            "{advisory}"
+        );
+
+        let lazy: Vec<_> = (0..200).map(|i| spec(i, true)).collect();
+        assert_eq!(large_direct_tools_advisory(&config, &lazy), None);
+
+        let mut mixed = lazy;
+        mixed.extend((0..DIRECT_TOOLS_ADVISORY_THRESHOLD - 1).map(|i| spec(1000 + i, false)));
+        assert_eq!(
+            large_direct_tools_advisory(&config, &mixed),
+            None,
+            "74 eager specs"
+        );
+    }
+
+    /// `index.ts:2280` `hasSearchModeSpecs`: search-mode tools are held back and the gateway is one
+    /// of their entry points, so `disableProxyTool` cannot remove it while any is registered.
+    #[test]
+    fn the_gateway_stays_registered_while_any_spec_is_search_mode() {
+        let mut config = config_of(&[("srv", search_entry())]);
+        config.settings = Some(McpSettings {
+            disable_proxy_tool: Some(true),
+            ..McpSettings::default()
+        });
+        let cache = two_tool_cache(&config, "srv");
+        let specs = resolve_direct_tools(&config, Some(&cache), ToolPrefix::Server, None);
+        assert!(!config.settings_or_default().proxy_tool_enabled());
+        assert!(should_register_proxy_tool(
+            &config,
+            Some(&cache),
+            &specs,
+            None
+        ));
+
+        // The same specs, eager, let `disableProxyTool` take effect.
+        let eager: Vec<_> = specs
+            .into_iter()
+            .map(|spec| DirectToolSpec {
+                lazy: false,
+                ..spec
+            })
+            .collect();
+        assert!(!should_register_proxy_tool(
+            &config,
+            Some(&cache),
+            &eager,
+            None
+        ));
+    }
+
+    /// `deferredToolFields` (`index.ts:436-463`): the `deferred` exposure, the server's namespace
+    /// with its cached instructions, and the result schema.
+    #[test]
+    fn a_search_mode_tool_is_deferred_in_the_servers_namespace() {
+        let spec = DirectToolSpec {
+            server_name: "my-srv".to_string(),
+            original_name: "one".to_string(),
+            prefixed_name: "my_srv_one".to_string(),
+            description: "Does one.".to_string(),
+            input_schema: Some(
+                json!({ "type": "object", "properties": { "q": { "type": "string" } } }),
+            ),
+            resource_uri: None,
+            lazy: true,
+        };
+        let config = config_of(&[("my-srv", search_entry())]);
+        let cache = two_tool_cache(&config, "my-srv");
+        let fields = deferred_tool_fields(&spec, Some(&cache)).expect("a lazy spec");
+        assert_eq!(fields.namespace.name, "mcp__my_srv");
+        assert_eq!(
+            fields.namespace.instructions.as_deref(),
+            Some("Use the docs.")
+        );
+        assert_eq!(fields.namespace.description, None);
+        assert_eq!(fields.output_schema["required"], json!(["content"]));
+        assert_eq!(
+            fields.output_schema["properties"]["isError"],
+            json!({ "type": "boolean" })
+        );
+
+        let tool = DirectTool::new(
+            spec.clone(),
+            ToolRenderKind::SelfRendered,
+            Arc::new(ToolDispatch::default()),
+            Some(fields.clone()),
+        );
+        assert_eq!(tool.exposure(), ToolExposure::Deferred);
+        assert_eq!(tool.namespace(), Some(&fields.namespace));
+        assert_eq!(tool.output_schema(), Some(&fields.output_schema));
+        // `execute` and the definition are the eager tool's.
+        assert_eq!(tool.name(), "my_srv_one");
+        assert_eq!(
+            tool.parameters()["properties"]["q"],
+            json!({ "type": "string" })
+        );
+
+        // Registered again as hidden once its server is gone (`deactivateTools`).
+        let hidden = DirectTool::new(
+            spec.clone(),
+            ToolRenderKind::SelfRendered,
+            Arc::new(ToolDispatch::default()),
+            Some(fields),
+        )
+        .into_hidden();
+        assert_eq!(hidden.exposure(), ToolExposure::Hidden);
+        assert_eq!(hidden.name(), "my_srv_one");
+
+        // An eager spec has none of it.
+        assert_eq!(
+            deferred_tool_fields(
+                &DirectToolSpec {
+                    lazy: false,
+                    ..spec.clone()
+                },
+                Some(&cache)
+            ),
+            None
+        );
+        let eager = DirectTool::new(
+            DirectToolSpec {
+                lazy: false,
+                ..spec
+            },
+            ToolRenderKind::SelfRendered,
+            Arc::new(ToolDispatch::default()),
+            None,
+        );
+        assert_eq!(eager.exposure(), ToolExposure::Direct);
+        assert_eq!(eager.namespace(), None);
+        assert_eq!(eager.output_schema(), None);
+    }
+
+    /// A mode-only change (search to eager) must re-register, or the tool keeps the exposure it was
+    /// registered under (`index.ts:429-431`).
+    #[test]
+    fn the_fingerprint_changes_with_the_mode() {
+        let spec = DirectToolSpec {
+            server_name: "s".to_string(),
+            original_name: "t".to_string(),
+            prefixed_name: "s_t".to_string(),
+            description: String::new(),
+            input_schema: None,
+            resource_uri: None,
+            lazy: false,
+        };
+        let lazy = DirectToolSpec {
+            lazy: true,
+            ..spec.clone()
+        };
+        assert_ne!(
+            direct_tool_fingerprint(&spec),
+            direct_tool_fingerprint(&lazy)
+        );
+    }
+
+    /// The registered tool's `execute` is the eager tool's; a search-mode one adds the
+    /// `CallToolResult` codemode scripts read (`toCallToolResult`, `index.ts:68-77`).
+    #[tokio::test]
+    async fn a_search_mode_tool_hands_scripts_a_call_tool_result() {
+        struct Fixed(ToolResult);
+        #[async_trait::async_trait]
+        impl McpToolDispatch for Fixed {
+            async fn call_direct(
+                &self,
+                _spec: &DirectToolSpec,
+                _call_id: ToolCallId,
+                _params: Value,
+                _cancel: CancelToken,
+                _on_update: ToolUpdateSink,
+            ) -> Result<ToolResult, ToolError> {
+                Ok(self.0.clone())
+            }
+            async fn call_proxy(
+                &self,
+                _call_id: ToolCallId,
+                _params: Value,
+                _cancel: CancelToken,
+                _on_update: ToolUpdateSink,
+            ) -> Result<ToolResult, ToolError> {
+                Err(ToolError::new("not a gateway"))
+            }
+        }
+        let spec = DirectToolSpec {
+            server_name: "srv".to_string(),
+            original_name: "one".to_string(),
+            prefixed_name: "srv_one".to_string(),
+            description: String::new(),
+            input_schema: None,
+            resource_uri: None,
+            lazy: true,
+        };
+        let build = |result: ToolResult, lazy: bool| {
+            let dispatch = Arc::new(ToolDispatch::default());
+            assert!(dispatch.install(Arc::new(Fixed(result))));
+            let spec = DirectToolSpec {
+                lazy,
+                ..spec.clone()
+            };
+            let fields = deferred_tool_fields(&spec, None);
+            DirectTool::new(spec, ToolRenderKind::SelfRendered, dispatch, fields)
+        };
+        let run = |tool: DirectTool| async move {
+            tool.execute(
+                ToolCallId::from("c"),
+                json!({}),
+                CancelToken::new(),
+                Box::new(|_| {}),
+            )
+            .await
+            .unwrap()
+        };
+
+        let ok = ToolResult {
+            content: vec![Content::text("hello")],
+            details: Some(json!({ "mode": "call" })),
+            ..ToolResult::default()
+        };
+        let lazy = run(build(ok.clone(), true)).await;
+        assert_eq!(
+            lazy.content, ok.content,
+            "the model-facing content is untouched"
+        );
+        assert_eq!(lazy.details, ok.details);
+        assert_eq!(
+            lazy.structured_content,
+            Some(json!({ "content": [{ "type": "text", "text": "hello" }] }))
+        );
+
+        let failed = ToolResult {
+            content: vec![Content::text("boom")],
+            details: Some(json!({ "error": "tool_error" })),
+            ..ToolResult::default()
+        };
+        let lazy = run(build(failed.clone(), true)).await;
+        assert_eq!(
+            lazy.structured_content.as_ref().unwrap()["isError"],
+            json!(true),
+            "any `details.error` is an error to a script"
+        );
+
+        let with_structured = ToolResult {
+            structured_content: Some(json!({ "rows": 2 })),
+            ..ok.clone()
+        };
+        let lazy = run(build(with_structured, true)).await;
+        assert_eq!(
+            lazy.structured_content.as_ref().unwrap()["structuredContent"],
+            json!({ "rows": 2 })
+        );
+
+        // Eager: the result is exactly the dispatch's.
+        let eager = run(build(ok.clone(), false)).await;
+        assert_eq!(eager.structured_content, None);
+        assert_eq!(eager.content, ok.content);
+    }
+
+    /// A sink that keeps every tool a pass registers, so a test can read their exposures.
+    #[derive(Default)]
+    struct KeepTools {
+        tools: Vec<Arc<dyn Tool>>,
+    }
+
+    impl SurfaceSink for KeepTools {
+        fn register_tool(&mut self, tool: Arc<dyn Tool>) {
+            self.tools.push(tool);
+        }
+        fn register_command(&mut self, _name: String, _desc: CommandDescriptor) {}
+        fn register_tool_renderer(&mut self, _tool_name: String) {}
+    }
+
+    /// The whole pass over a search-mode server: its tools reach the registry at `deferred` with
+    /// the server's namespace, the pass remembers them as lazy, and the gateway is registered even
+    /// though `disableProxyTool` is set.
+    #[test]
+    fn register_surface_registers_search_mode_tools_deferred_and_keeps_the_gateway() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let agent_dir = temp.path().join("agent");
+        std::fs::create_dir_all(&agent_dir).expect("mkdir");
+        let mut config = config_of(&[("srv", search_entry())]);
+        config.settings = Some(McpSettings {
+            disable_proxy_tool: Some(true),
+            ..McpSettings::default()
+        });
+        let hash = default_server_hasher(&search_entry()).expect("no url, so no throw");
+        std::fs::write(
+            agent_dir.join("mcp-cache.json"),
+            serde_json::to_string(&json!({
+                "version": METADATA_CACHE_VERSION,
+                "servers": { "srv": {
+                    "configHash": hash,
+                    "cachedAt": now_ms(),
+                    "tools": [{ "name": "one", "description": "Does one." }, { "name": "two" }],
+                    "resources": [],
+                    "instructions": "Use the docs."
+                } }
+            }))
+            .expect("serialize"),
+        )
+        .expect("write");
+        let dirs = McpDirs::new(agent_dir, temp.path().to_path_buf());
+
+        let mut sink = KeepTools::default();
+        let surface =
+            register_surface(&mut sink, &dirs, &config, Arc::new(ToolDispatch::default()));
+
+        let exposures: Vec<(&str, ToolExposure)> = sink
+            .tools
+            .iter()
+            .map(|tool| (tool.name(), tool.exposure()))
+            .collect();
+        assert_eq!(
+            exposures,
+            [
+                ("srv_one", ToolExposure::Deferred),
+                ("srv_two", ToolExposure::Deferred),
+                (PROXY_TOOL_NAME, ToolExposure::Direct),
+            ]
+        );
+        let one = sink.tools.first().expect("srv_one");
+        assert_eq!(one.namespace().map(|n| n.name.as_str()), Some("mcp__srv"));
+        assert_eq!(
+            one.namespace().and_then(|n| n.instructions.as_deref()),
+            Some("Use the docs.")
+        );
+        assert_eq!(
+            surface
+                .lazy_tools
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["srv_one", "srv_two"]
+        );
+        assert!(
+            surface
+                .proxy_description
+                .as_deref()
+                .is_some_and(|d| d.contains("Search-mode servers (srv)")),
+            "{:?}",
+            surface.proxy_description
+        );
     }
 }

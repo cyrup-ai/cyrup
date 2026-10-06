@@ -9,7 +9,7 @@ use serde::Deserialize;
 use serde_json::{Map as JsonMap, Value, json};
 
 use cyrup_core::{
-    CancelToken, Tool, ToolCallId, ToolError, ToolRenderKind, ToolResult, ToolUpdateSink,
+    CancelToken, Content, Tool, ToolCallId, ToolError, ToolRenderKind, ToolResult, ToolUpdateSink,
 };
 
 use crate::config::{McpSettings, ToolResultRendering};
@@ -490,6 +490,7 @@ impl Tool for McpTool {
                 None,
             )
             .await
+            .map(|result| announce_call_activation(&ctx, result))
             .map_err(to_tool_error);
         }
         if let Some(server) = params.connect.as_deref().filter(|value| !value.is_empty()) {
@@ -513,14 +514,17 @@ impl Tool for McpTool {
         }
         // `!== undefined`, so `search: ""` reaches the mode rather than falling through to status.
         if let Some(query) = params.search.as_deref() {
-            return Ok(execute_search(
+            return Ok(announce_search_activations(
                 &ctx,
-                query,
-                params.regex,
-                params.server.as_deref().filter(|value| !value.is_empty()),
-                params.include_schemas,
-                params.limit,
-                params.offset,
+                execute_search(
+                    &ctx,
+                    query,
+                    params.regex,
+                    params.server.as_deref().filter(|value| !value.is_empty()),
+                    params.include_schemas,
+                    params.limit,
+                    params.offset,
+                ),
             ));
         }
         if let Some(server) = params.server.as_deref().filter(|value| !value.is_empty()) {
@@ -528,6 +532,96 @@ impl Tool for McpTool {
         }
         Ok(execute_status(&ctx))
     }
+}
+
+/// The text blocks of a result, joined as upstream's `result.content.map(b => "text" in b ?
+/// b.text : "").join("\n")` does.
+fn joined_text(result: &ToolResult) -> String {
+    result
+        .content
+        .iter()
+        .map(|block| match block {
+            Content::Text { text, .. } => text.as_str(),
+            _ => "",
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// `details.activated` plus `addedToolNames` (`index.ts:2257-2261`): the names the gateway just
+/// loaded into the active set.
+fn record_activation(result: &mut ToolResult, added: Vec<String>) {
+    let mut details = match result.details.take() {
+        Some(Value::Object(map)) => map,
+        _ => JsonMap::new(),
+    };
+    details.insert("activated".to_string(), json!(added));
+    result.details = Some(Value::Object(details));
+    result.added_tool_names = added;
+}
+
+/// After a `mcp({ search })` (`index.ts:2248-2262` @v5.0.0): load the search-mode tools it matched,
+/// additively, and tell the model which ones are now real tools. A search that loaded nothing is
+/// returned untouched.
+fn announce_search_activations(ctx: &ProxyCtx, mut result: ToolResult) -> ToolResult {
+    let matches: Vec<(String, String)> = result
+        .details
+        .as_ref()
+        .and_then(|details| details.get("matches"))
+        .and_then(Value::as_array)
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|row| {
+                    Some((
+                        row.get("server")?.as_str()?.to_owned(),
+                        row.get("tool")?.as_str()?.to_owned(),
+                    ))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let added = ctx.env.activate_search_matches(&matches);
+    if added.is_empty() {
+        return result;
+    }
+    result.content = vec![Content::Text {
+        text: format!(
+            "Activated as direct tools: {}.\n\n{}",
+            added.join(", "),
+            joined_text(&result)
+        )
+        .into(),
+        text_signature: None,
+    }];
+    record_activation(&mut result, added);
+    result
+}
+
+/// After a `mcp({ tool })` (`index.ts:2220-2237` @v5.0.0): a successful call is as clear a signal
+/// as a search hit, so a search-mode tool it named is loaded the same additive way, keyed on the
+/// registered (prefixed) name the call reports as `canonicalTool`. A failed call carries
+/// `details.error` and loads nothing. The content is untouched: it is already sized to the output
+/// limits.
+fn announce_call_activation(ctx: &ProxyCtx, mut result: ToolResult) -> ToolResult {
+    let Some(details) = result.details.as_ref() else {
+        return result;
+    };
+    if details.get("error").is_some() {
+        return result;
+    }
+    let (Some(server), Some(canonical)) = (
+        details.get("server").and_then(Value::as_str),
+        details.get("canonicalTool").and_then(Value::as_str),
+    ) else {
+        return result;
+    };
+    let added = ctx
+        .env
+        .activate_search_matches(&[(server.to_owned(), canonical.to_owned())]);
+    if !added.is_empty() {
+        record_activation(&mut result, added);
+    }
+    result
 }
 
 #[cfg(test)]
@@ -539,7 +633,7 @@ impl Tool for McpTool {
 )]
 mod tests {
     use super::*;
-    use crate::proxy::testsupport::{FakeEnv, config_with, ctx_with, stdio};
+    use crate::proxy::testsupport::{FakeEnv, config_with, ctx_with, stdio, text_of};
     use crate::proxy::tool_metadata::ToolMetadata;
     use cyrup_core::Content;
 
@@ -939,5 +1033,138 @@ mod tests {
         assert_eq!(present.args, Some(Value::Null));
         let absent: McpToolParams = serde_json::from_value(json!({})).expect("args is optional");
         assert_eq!(absent.args, None);
+    }
+
+    // ---- MCP-604 · search-mode tools are loaded by the gateway ---------------------------------------
+
+    fn report_tools() -> Vec<ToolMetadata> {
+        (0..3)
+            .map(|index| {
+                ToolMetadata::new(
+                    format!("srv_report_{index}"),
+                    format!("report_{index}"),
+                    "Reporting",
+                )
+            })
+            .collect()
+    }
+
+    async fn gateway_call(env: FakeEnv, params: Value) -> (ToolResult, Arc<FakeEnv>) {
+        let config = config_with(&[("srv", stdio("a"))]);
+        let (ctx, env) = ctx_with(config, &[("srv", report_tools())], &[], env);
+        let (_keep, rx) = tokio::sync::watch::channel(InitPhase::Ready(ctx));
+        let gate = Arc::new(ProxyInitGate::new(rx));
+        let tool = McpTool::new(String::new(), &McpSettings::default(), gate);
+        let result = tool
+            .execute(
+                ToolCallId::from("call-1"),
+                params,
+                CancelToken::new(),
+                Box::new(|_| {}),
+            )
+            .await
+            .expect("the gateway call");
+        (result, env)
+    }
+
+    /// `index.ts:2248-2262` @v5.0.0: a search that matches search-mode tools loads them, additively,
+    /// and says so ahead of the results; `details.activated` and `addedToolNames` carry the names.
+    #[tokio::test]
+    async fn a_search_that_matches_search_mode_tools_loads_them_and_says_so() {
+        let env = FakeEnv::default()
+            .with_search_mode_tool("srv", "srv_report_0")
+            .with_search_mode_tool("srv", "srv_report_1");
+        let (result, env) = gateway_call(env, json!({ "search": "report" })).await;
+
+        let text = text_of(&result);
+        assert!(
+            text.starts_with("Activated as direct tools: srv_report_0, srv_report_1.\n\nFound 3 tools matching \"report\""),
+            "{text}"
+        );
+        let details = result.details.clone().expect("details");
+        assert_eq!(
+            details["activated"],
+            json!(["srv_report_0", "srv_report_1"])
+        );
+        assert_eq!(
+            details["mode"],
+            json!("search"),
+            "the search details survive"
+        );
+        assert_eq!(details["count"], json!(3));
+        assert_eq!(
+            result.added_tool_names,
+            vec!["srv_report_0".to_string(), "srv_report_1".to_string()]
+        );
+        // The environment was asked about every row of the page, as `(server, canonical name)`.
+        let asked = env.activations_asked.lock().unwrap().clone();
+        assert_eq!(asked.len(), 1);
+        assert_eq!(asked[0].len(), 3);
+        assert!(asked[0].contains(&("srv".to_string(), "srv_report_2".to_string())));
+    }
+
+    /// A search that loads nothing is the search result, untouched: no prefix, no `activated`.
+    #[tokio::test]
+    async fn a_search_that_loads_nothing_is_returned_untouched() {
+        let (result, _env) = gateway_call(FakeEnv::default(), json!({ "search": "report" })).await;
+        assert!(
+            !text_of(&result).starts_with("Activated"),
+            "{}",
+            text_of(&result)
+        );
+        assert!(result.details.as_ref().unwrap().get("activated").is_none());
+        assert!(result.added_tool_names.is_empty());
+    }
+
+    /// `index.ts:2220-2237`: a successful `mcp({ tool })` for a search-mode tool loads it the same
+    /// way, keyed on `canonicalTool`, and leaves the content untouched.
+    #[tokio::test]
+    async fn a_successful_call_loads_the_search_mode_tool_it_named() {
+        let env = FakeEnv::default()
+            .with_connection("srv", crate::proxy::env::ConnectionStatus::Connected)
+            .with_search_mode_tool("srv", "srv_report_0");
+        let (result, env) = gateway_call(env, json!({ "tool": "srv_report_0" })).await;
+
+        let details = result.details.clone().expect("details");
+        assert!(details.get("error").is_none(), "{details}");
+        assert_eq!(details["canonicalTool"], json!("srv_report_0"));
+        assert_eq!(details["activated"], json!(["srv_report_0"]));
+        assert_eq!(result.added_tool_names, vec!["srv_report_0".to_string()]);
+        assert_eq!(
+            text_of(&result),
+            "(empty result)",
+            "the content is untouched"
+        );
+        assert_eq!(
+            env.activations_asked.lock().unwrap().clone(),
+            vec![vec![("srv".to_string(), "srv_report_0".to_string())]]
+        );
+    }
+
+    /// A failed call carries `details.error` beside its identity (`catch_arm` spreads
+    /// `callIdentity`) and loads nothing.
+    #[test]
+    fn a_failed_call_loads_nothing() {
+        let env = FakeEnv::default().with_search_mode_tool("srv", "srv_report_0");
+        let (ctx, env) = ctx_with(
+            config_with(&[("srv", stdio("a"))]),
+            &[("srv", report_tools())],
+            &[],
+            env,
+        );
+        let failed = ToolResult {
+            details: Some(json!({
+                "mode": "call",
+                "error": "tool_error",
+                "server": "srv",
+                "tool": "report_0",
+                "canonicalTool": "srv_report_0",
+            })),
+            ..ToolResult::default()
+        };
+        let result = announce_call_activation(&ctx, failed);
+        assert!(result.details.as_ref().unwrap().get("activated").is_none());
+        assert!(env.activations_asked.lock().unwrap().is_empty());
+        assert!(result.added_tool_names.is_empty());
     }
 }

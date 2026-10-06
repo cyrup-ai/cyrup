@@ -281,6 +281,17 @@ pub fn build_proxy_description(
         desc.push_str(&format!("\nServers: {}\n", server_summaries.join(", ")));
     }
 
+    // Search-mode tools are real tools held back. Say how they wake up, or the model reads
+    // `mcp({ tool })` as the only way in and never gets a schema (`direct-tool-surface.ts:213-222`
+    // @v5.0.0).
+    let search_mode_servers = config.search_mode_servers();
+    if !search_mode_servers.is_empty() {
+        desc.push_str(&format!(
+            "\nSearch-mode servers ({}): their tools become real, schema-backed tools the first time mcp({{ search }}) matches them or mcp({{ tool }}) calls them — after that, call them directly by name.\n",
+            search_mode_servers.join(", ")
+        ));
+    }
+
     // 4 · Disabled servers.
     let disabled: Vec<&String> = config
         .mcp_servers
@@ -663,5 +674,29 @@ mod tests {
             described.contains("\nServers: b (1 tools)\n"),
             "{described}"
         );
+    }
+
+    /// `direct-tool-surface.ts:213-222` @v5.0.0: the model is told how a search-mode server's tools
+    /// wake up, or it reads `mcp({ tool })` as the only way in and never gets a schema.
+    #[test]
+    fn search_mode_servers_are_named_with_how_their_tools_wake_up() {
+        let mut searching = stdio("a");
+        searching.direct_tools = Some(crate::config::DirectToolsSetting::Search);
+        let mut eager = stdio("b");
+        eager.direct_tools = Some(crate::config::DirectToolsSetting::All(true));
+        let config = config_with(&[("docs", searching), ("plain", eager)]);
+        let description = build_proxy_description(&config, &IndexMap::new(), &[]);
+        assert!(
+            description.contains(
+                "\nSearch-mode servers (docs): their tools become real, schema-backed tools the first time mcp({ search }) matches them or mcp({ tool }) calls them — after that, call them directly by name.\n"
+            ),
+            "{description}"
+        );
+        let none = build_proxy_description(
+            &config_with(&[("plain", stdio("b"))]),
+            &IndexMap::new(),
+            &[],
+        );
+        assert!(!none.contains("Search-mode servers"), "{none}");
     }
 }

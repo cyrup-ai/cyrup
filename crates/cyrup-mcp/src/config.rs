@@ -689,6 +689,24 @@ impl McpConfig {
             .filter(|(_, entry)| !entry.is_disabled())
     }
 
+    /// The enabled servers that use `directTools: "search"`, in file order (`buildProxyDescription`,
+    /// `direct-tool-surface.ts:215-219` @v5.0.0): a per-server value that is present wins, else
+    /// `settings.directTools`.
+    #[must_use]
+    pub fn search_mode_servers(&self) -> Vec<&str> {
+        let global = self
+            .settings
+            .as_ref()
+            .and_then(|settings| settings.direct_tools)
+            .map(DirectToolsSetting::from);
+        self.enabled_servers()
+            .filter(|(_, entry)| {
+                entry.direct_tools.as_ref().or(global.as_ref()) == Some(&DirectToolsSetting::Search)
+            })
+            .map(|(name, _)| name.as_str())
+            .collect()
+    }
+
     /// The `settings` block, or an all-defaults one. Every accessor on [`McpSettings`] encodes its
     /// own read-site predicate, so `config.settings_or_default().notify_on_startup_connect()` is
     /// the whole of `settings?.notifyOnStartupConnect !== false`.
@@ -933,7 +951,7 @@ pub struct ServerEntry {
         deserialize_with = "lenient",
         skip_serializing_if = "Option::is_none"
     )]
-    pub direct_tools: Option<BoolOrList>,
+    pub direct_tools: Option<DirectToolsSetting>,
     /// Overrides `settings.toolPrefix` for this server (`resolveToolPrefix`).
     #[serde(
         default,
@@ -1174,7 +1192,7 @@ pub struct McpSettings {
         deserialize_with = "lenient",
         skip_serializing_if = "Option::is_none"
     )]
-    pub direct_tools: Option<bool>,
+    pub direct_tools: Option<GlobalDirectTools>,
     /// Default `true`, tested `!== false` (`types.ts:509`, `direct-tools.ts:227`; upstream
     /// `76a4ea3`, issue #358). Silences the "75+ direct tools resolved" advisory and **nothing
     /// else** — it is not a cap and never drops a spec, so the user who deliberately registered 75
@@ -1410,13 +1428,6 @@ impl McpSettings {
     pub fn request_timeout_ms(&self) -> Option<f64> {
         self.request_timeout_ms
             .filter(|value| value.is_finite() && *value > 0.0)
-    }
-
-    /// `Boolean(settings?.directTools)` — truthiness, not presence. A per-server value that merely
-    /// *exists* outranks this; that test lives at the per-server read site.
-    #[must_use]
-    pub fn direct_tools(&self) -> bool {
-        self.direct_tools == Some(true)
     }
 
     /// `settings?.warnOnLargeDirectTools !== false` (`direct-tools.ts:227`). A literal `false` is
@@ -1974,18 +1985,107 @@ pub enum OAuthGrantType {
     ClientCredentials,
 }
 
-/// `boolean | string[]` — `directTools`. The distinction that matters is *presence*, not
-/// truthiness: a per-server value that exists at all overrides the global.
+/// A server's `directTools`: `boolean | string[] | "search"` (`types.ts:481` @v5.0.0). The
+/// distinction that matters is *presence*, not truthiness: a per-server value that exists at all
+/// overrides the global.
 ///
-/// `approveTools` shared this type until MCP-602 and now has its own, [`ApproveTools`]; that type's
-/// documentation says why the two cannot be one.
+/// `approveTools` shared this type (then named `BoolOrList`) until MCP-602 and now has its own,
+/// [`ApproveTools`]; that type's documentation says why the two cannot be one.
+///
+/// Any other value reads as absent through [`lenient`], as every field of this module does.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum BoolOrList {
+#[serde(from = "DirectToolsWire", into = "DirectToolsWire")]
+pub enum DirectToolsSetting {
     /// `true` / `false`.
     All(bool),
     /// An explicit name list.
     Named(Vec<String>),
+    /// `"search"`: the server's tools are registered with their real schemas, but not declared to
+    /// the model; `mcp({ search })`, a successful `mcp({ tool })` call or Pi's `tool_search` loads
+    /// them (`docs/tools.md#search-activated-direct-tools` @v5.0.0).
+    Search,
+}
+
+/// `settings.directTools`: `boolean | "search"` (`types.ts:627` @v5.0.0). A list is not a global
+/// value, so it cannot be built here and reads as absent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "GlobalDirectToolsWire", into = "GlobalDirectToolsWire")]
+pub enum GlobalDirectTools {
+    /// `true` / `false`.
+    All(bool),
+    /// `"search"`.
+    Search,
+}
+
+impl From<GlobalDirectTools> for DirectToolsSetting {
+    fn from(global: GlobalDirectTools) -> Self {
+        match global {
+            GlobalDirectTools::All(all) => Self::All(all),
+            GlobalDirectTools::Search => Self::Search,
+        }
+    }
+}
+
+/// The one word `directTools` accepts besides a boolean and a list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+enum SearchWord {
+    #[serde(rename = "search")]
+    Search,
+}
+
+/// The JSON forms of [`DirectToolsSetting`].
+#[derive(Serialize, Deserialize)]
+#[serde(untagged)]
+enum DirectToolsWire {
+    Flag(bool),
+    Names(Vec<String>),
+    Mode(SearchWord),
+}
+
+impl From<DirectToolsWire> for DirectToolsSetting {
+    fn from(wire: DirectToolsWire) -> Self {
+        match wire {
+            DirectToolsWire::Flag(all) => Self::All(all),
+            DirectToolsWire::Names(names) => Self::Named(names),
+            DirectToolsWire::Mode(SearchWord::Search) => Self::Search,
+        }
+    }
+}
+
+impl From<DirectToolsSetting> for DirectToolsWire {
+    fn from(setting: DirectToolsSetting) -> Self {
+        match setting {
+            DirectToolsSetting::All(all) => Self::Flag(all),
+            DirectToolsSetting::Named(names) => Self::Names(names),
+            DirectToolsSetting::Search => Self::Mode(SearchWord::Search),
+        }
+    }
+}
+
+/// The JSON forms of [`GlobalDirectTools`].
+#[derive(Serialize, Deserialize)]
+#[serde(untagged)]
+enum GlobalDirectToolsWire {
+    Flag(bool),
+    Mode(SearchWord),
+}
+
+impl From<GlobalDirectToolsWire> for GlobalDirectTools {
+    fn from(wire: GlobalDirectToolsWire) -> Self {
+        match wire {
+            GlobalDirectToolsWire::Flag(all) => Self::All(all),
+            GlobalDirectToolsWire::Mode(SearchWord::Search) => Self::Search,
+        }
+    }
+}
+
+impl From<GlobalDirectTools> for GlobalDirectToolsWire {
+    fn from(global: GlobalDirectTools) -> Self {
+        match global {
+            GlobalDirectTools::All(all) => Self::Flag(all),
+            GlobalDirectTools::Search => Self::Mode(SearchWord::Search),
+        }
+    }
 }
 
 /// `approveTools: boolean | "destructive" | string[]`, plus a catch-all that fails **closed**
@@ -1994,14 +2094,14 @@ pub enum BoolOrList {
 /// `types.ts:495` (per server) and `types.ts:670` (global) `@v5.0.0`, read as
 /// `isToolCallApprovalRequired` (`tool-approval.ts:25-44 @v5.0.0`) consumes them.
 ///
-/// # Why this is not [`BoolOrList`]
+/// # Why this is not [`DirectToolsSetting`]
 ///
 /// Upstream's two types are not the same type — `directTools` is `boolean | string[] | "search"`
 /// and `approveTools` is `boolean | "destructive" | string[]` — and, the half that matters, the two
 /// consumers answer an unparseable value in **opposite directions**. `approveTools` feeds a security
 /// gate whose unparseable arm is upstream's `if (!Array.isArray(approval)) return true;`, while
 /// `directTools` feeds `resolve_direct_tool_filter`, where the same value is an ordinary
-/// `ToolFilter::Off`. Folding a `Destructive` and a catch-all into [`BoolOrList`] would hand both
+/// `ToolFilter::Off`. Folding a `Destructive` and a catch-all into [`DirectToolsSetting`] would hand both
 /// variants to `directTools`, where neither has a meaning, and would make that filter's exhaustive
 /// match pick one by accident.
 ///
@@ -4768,11 +4868,11 @@ pub fn write_shared_server_entry(
 ///
 /// Called by `crate::commands`' `/mcp` panel arm, with the changes the panel returned.
 pub fn write_direct_tools_config(
-    changes: &IndexMap<String, BoolOrList>,
+    changes: &IndexMap<String, DirectToolsSetting>,
     provenance: &IndexMap<String, ServerProvenance>,
     full_config: &McpConfig,
 ) -> McpResult<()> {
-    let mut by_path: IndexMap<PathBuf, Vec<(String, BoolOrList, ServerProvenance)>> =
+    let mut by_path: IndexMap<PathBuf, Vec<(String, DirectToolsSetting, ServerProvenance)>> =
         IndexMap::new();
     for (server_name, value) in changes {
         let Some(prov) = provenance.get(server_name) else {
@@ -6927,9 +7027,9 @@ mod tests {
         fixture.write(&good, "{\"mcpServers\": {\"a\": {\"command\": \"x\"}}}");
         fixture.write(&bad, "{{{");
 
-        let mut changes: IndexMap<String, BoolOrList> = IndexMap::new();
-        changes.insert("a".to_string(), BoolOrList::All(true));
-        changes.insert("b".to_string(), BoolOrList::All(true));
+        let mut changes: IndexMap<String, DirectToolsSetting> = IndexMap::new();
+        changes.insert("a".to_string(), DirectToolsSetting::All(true));
+        changes.insert("b".to_string(), DirectToolsSetting::All(true));
         let mut provenance: IndexMap<String, ServerProvenance> = IndexMap::new();
         provenance.insert(
             "a".to_string(),
@@ -7188,11 +7288,11 @@ mod tests {
         let provenance = context.server_provenance(&mut diagnostics);
         let loaded = context.load().config;
 
-        let mut changes: IndexMap<String, BoolOrList> = IndexMap::new();
-        changes.insert("alpha".to_string(), BoolOrList::All(true));
+        let mut changes: IndexMap<String, DirectToolsSetting> = IndexMap::new();
+        changes.insert("alpha".to_string(), DirectToolsSetting::All(true));
         changes.insert(
             "beta".to_string(),
-            BoolOrList::Named(vec!["read_x".to_string()]),
+            DirectToolsSetting::Named(vec!["read_x".to_string()]),
         );
         write_direct_tools_config(&changes, &provenance, &loaded).unwrap();
 
@@ -8196,5 +8296,65 @@ mod tests {
             );
         }
         assert_eq!(URL_BOUND_AUTH_FIELDS.len(), 4);
+    }
+
+    // -- MCP-604 / MCP-561 ---------------------------------------------------------------------
+
+    /// `directTools` is `boolean | string[] | "search"` per server (`types.ts:481` @v5.0.0) and
+    /// `boolean | "search"` in `settings` (`:627`). `"search"` used to fail the untagged enum and
+    /// read as absent, which left a search-mode server silently proxy-only.
+    #[test]
+    fn direct_tools_search_is_read_per_server_and_globally_and_round_trips() {
+        let mut diagnostics = Vec::new();
+        let document = parse_json_config(
+            "{\"settings\":{\"directTools\":\"search\"},\
+             \"mcpServers\":{\
+             \"a\":{\"command\":\"a\",\"directTools\":\"search\"},\
+             \"b\":{\"command\":\"b\",\"directTools\":[\"t\"]},\
+             \"c\":{\"command\":\"c\",\"directTools\":true},\
+             \"d\":{\"command\":\"d\",\"directTools\":\"sometimes\"},\
+             \"e\":{\"command\":\"e\"}}}",
+            "test",
+        )
+        .unwrap();
+        let config = validate_config(&document, Path::new("test"), &mut diagnostics);
+        let direct = |name: &str| config.mcp_servers.get(name).unwrap().direct_tools.clone();
+        assert_eq!(direct("a"), Some(DirectToolsSetting::Search));
+        assert_eq!(
+            direct("b"),
+            Some(DirectToolsSetting::Named(vec!["t".to_string()]))
+        );
+        assert_eq!(direct("c"), Some(DirectToolsSetting::All(true)));
+        assert_eq!(direct("d"), None, "any other word reads as absent");
+        assert_eq!(direct("e"), None);
+        assert_eq!(
+            config.settings.as_ref().unwrap().direct_tools,
+            Some(GlobalDirectTools::Search)
+        );
+        // `d` and `e` fall back to the global, so they are search-mode too; `b` and `c` are not.
+        assert_eq!(config.search_mode_servers(), vec!["a", "d", "e"]);
+        // The value written back is the word, not a boolean.
+        assert_eq!(
+            serde_json::to_string(&DirectToolsSetting::Search).unwrap(),
+            "\"search\""
+        );
+        assert_eq!(
+            serde_json::to_string(&GlobalDirectTools::All(false)).unwrap(),
+            "false"
+        );
+    }
+
+    /// A list is not a global value (`types.ts:627`): it reads as absent rather than building a
+    /// global that means something upstream's type forbids.
+    #[test]
+    fn a_global_direct_tools_list_reads_as_absent() {
+        let mut diagnostics = Vec::new();
+        let document = parse_json_config(
+            "{\"settings\":{\"directTools\":[\"x\"]},\"mcpServers\":{}}",
+            "test",
+        )
+        .unwrap();
+        let config = validate_config(&document, Path::new("test"), &mut diagnostics);
+        assert_eq!(config.settings.as_ref().unwrap().direct_tools, None);
     }
 }
