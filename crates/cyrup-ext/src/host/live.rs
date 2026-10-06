@@ -2768,8 +2768,8 @@ async fn invoke(
             api.call_on_tool_call(store, call_id.as_str(), name, &input.to_string(), parent)
                 .await
         }
-        // `terminate` is host-side only: the WIT `on-tool-result` signature is fixed (no ABI
-        // change), so it is not delivered to the guest — see `HostEvent::ToolResult::terminate`.
+        // `terminate` is host-side only: the WIT `on-tool-result` export has no parameter for it,
+        // so it is not delivered to the guest — see `HostEvent::ToolResult::terminate`.
         HostEvent::ToolResult {
             call_id,
             name,

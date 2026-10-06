@@ -348,7 +348,7 @@ pub enum HostEvent {
         /// Observable by a handler and patchable via [`crate::EventPatch::ToolResult::usage`].
         usage: Option<cyrup_core::Usage>,
         /// The tool's early-termination hint (pi `AgentToolResult.terminate?`). Host-side only:
-        /// the WIT `on-tool-result` call has a fixed signature and does not carry it, so a guest
+        /// the WIT `on-tool-result` export has no parameter for it, so a guest
         /// cannot OBSERVE it — but a guest CAN set it through
         /// [`crate::EventPatch::ToolResult::terminate`], and this field is what that patch lands
         /// on, exactly as pi's `afterResult.terminate ?? result.terminate` does not require the
