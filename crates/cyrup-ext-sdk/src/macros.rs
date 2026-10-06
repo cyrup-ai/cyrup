@@ -211,6 +211,7 @@ macro_rules! export_extension {
                     details_json: ::core::option::Option<::std::string::String>,
                     usage_json: ::core::option::Option<::std::string::String>,
                     parent_tool_call_id: ::core::option::Option<::std::string::String>,
+                    structured_content_json: ::core::option::Option<::std::string::String>,
                 ) -> bindings::cyrup::ext::types::HookOutcome {
                     $crate::guest::hook(
                         1,
@@ -223,6 +224,7 @@ macro_rules! export_extension {
                             details_json.as_deref().unwrap_or(""),
                             usage_json.as_deref().unwrap_or(""),
                             parent_tool_call_id.as_deref().unwrap_or(""),
+                            structured_content_json.as_deref().unwrap_or(""),
                         ],
                     )
                 }

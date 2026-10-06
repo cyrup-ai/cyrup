@@ -202,6 +202,7 @@ async fn tool_result_of_a_nested_call_carries_the_parent() {
         args: &args,
         content: &content,
         details: None,
+        structured_content: None,
         usage: None,
         is_error: false,
         terminate: TerminateHint::Unspecified,

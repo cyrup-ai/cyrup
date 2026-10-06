@@ -1,4 +1,4 @@
-;; AGENT-027 fixture: the smallest component that instantiates against the `cyrup:ext@0.15.0`
+;; AGENT-027 fixture: the smallest component that instantiates against the `cyrup:ext@0.16.0`
 ;; `extension` world and whose `init` succeeds, so the host reaches its `${path} factory` timing mark.
 ;; It imports nothing and exports every `events` function plus `init`. Each export returns a
 ;; pointer to zeroed memory, which the canonical ABI reads as the first case / empty value
@@ -33,7 +33,7 @@
     (func (export "bash-operations-exec") (param i32 i32 i32 i32 i32 i32 i32 i32) (result i32) i32.const 16)
     (func (export "on-terminal-input") (param i32 i32) (result i32) i32.const 16)
     (func (export "on-tool-call") (param i32 i32 i32 i32 i32 i32 i32 i32 i32) (result i32) i32.const 16)
-    ;; 18 flat parameters exceed the canonical ABI's 16, so the arguments arrive as ONE pointer to a memory record.
+    ;; 21 flat parameters exceed the canonical ABI's 16, so the arguments arrive as ONE pointer to a memory record.
     (func (export "on-tool-result") (param i32) (result i32) i32.const 16)
     (func (export "on-context") (param i32 i32) (result i32) i32.const 16)
     (func (export "on-context-with-system") (param i32 i32) (result i32) i32.const 16)
@@ -121,7 +121,7 @@
     (canon lift (core func $i "on-terminal-input") (memory $mem) (realloc $realloc)))
   (func $on-tool-call (param "call-id" string) (param "name" string) (param "input-json" string) (param "parent-tool-call-id" (option string)) (result $hook-outcome)
     (canon lift (core func $i "on-tool-call") (memory $mem) (realloc $realloc)))
-  (func $on-tool-result (param "call-id" string) (param "name" string) (param "input-json" string) (param "content-json" string) (param "is-error" bool) (param "details-json" (option string)) (param "usage-json" (option string)) (param "parent-tool-call-id" (option string)) (result $hook-outcome)
+  (func $on-tool-result (param "call-id" string) (param "name" string) (param "input-json" string) (param "content-json" string) (param "is-error" bool) (param "details-json" (option string)) (param "usage-json" (option string)) (param "parent-tool-call-id" (option string)) (param "structured-content-json" (option string)) (result $hook-outcome)
     (canon lift (core func $i "on-tool-result") (memory $mem) (realloc $realloc)))
   (func $on-context (param "messages-json" string) (result $hook-outcome)
     (canon lift (core func $i "on-context") (memory $mem) (realloc $realloc)))
@@ -252,6 +252,6 @@
     (export "on-session-tree" (func $on-session-tree))
     (export "bus-deliver" (func $bus-deliver))
   )
-  (export "cyrup:ext/events@0.15.0" (instance $events))
+  (export "cyrup:ext/events@0.16.0" (instance $events))
   (export "init" (func $init))
 )

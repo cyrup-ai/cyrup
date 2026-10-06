@@ -2776,6 +2776,7 @@ async fn invoke(
             input,
             content,
             details,
+            structured_content,
             is_error,
             usage,
             terminate: _,
@@ -2785,6 +2786,9 @@ async fn invoke(
             // Pi `ToolResultEventBase.usage` (types.ts:919-921): absent for every ordinary tool, so
             // an unserializable value degrades to absent rather than to a bogus payload.
             let usage_json = usage.as_ref().and_then(|u| serde_json::to_string(u).ok());
+            // Pi `ToolResultEventBase.structuredContent` (types.ts:1238 @v1.0.1): absent unless the
+            // tool returned one, and a JSON `null` it did return is still a value.
+            let structured_json = structured_content.as_ref().map(Value::to_string);
             api.call_on_tool_result(
                 store,
                 call_id.as_str(),
@@ -2795,6 +2799,7 @@ async fn invoke(
                 details_json.as_deref(),
                 usage_json.as_deref(),
                 parent,
+                structured_json.as_deref(),
             )
             .await
         }
@@ -3099,6 +3104,9 @@ fn decode_patch(kind: EventKind, v: Value) -> Option<EventPatch> {
                 .cloned()
                 .and_then(|c| serde_json::from_value::<Vec<Content>>(c).ok());
             let details = v.get("details").cloned();
+            // Pi `ToolResultEventResult.structuredContent` (types.ts:1445 @v1.0.1). A present JSON
+            // `null` is `Some(Null)`, which the fold applies as pi's `!== undefined` does.
+            let structured_content = v.get("structuredContent").cloned().map(Box::new);
             let is_error = v.get("isError").and_then(|b| b.as_bool());
             // Pi `ToolResultEventResult.usage` (types.ts:1085-1090). A malformed value is dropped
             // (treated as "not patched") rather than failing the whole patch.
@@ -3114,6 +3122,7 @@ fn decode_patch(kind: EventKind, v: Value) -> Option<EventPatch> {
             Some(EventPatch::ToolResult {
                 content,
                 details,
+                structured_content,
                 is_error,
                 usage,
                 terminate,

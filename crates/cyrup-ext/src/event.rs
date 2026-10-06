@@ -337,6 +337,11 @@ pub enum HostEvent {
         input: Value,
         content: Vec<Content>,
         details: Option<Value>,
+        /// The tool's machine-readable result (pi `ToolResultEventBase.structuredContent?`,
+        /// `core/extensions/types.ts:1238` @v1.0.1): "Handlers that redact `content` should also
+        /// replace this; replacing `content` alone drops it." `None` is pi's absent key.
+        /// Patchable via [`crate::EventPatch::ToolResult::structured_content`].
+        structured_content: Option<Value>,
         is_error: bool,
         /// Usage the tool execution itself reported (Pi `ToolResultEventBase.usage`,
         /// types.ts:919-921, upstream `2fd38684`). `None` = absent, which is every ordinary tool.

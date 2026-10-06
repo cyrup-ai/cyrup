@@ -124,6 +124,13 @@ Your handlers tell a nested call from a model-issued one by `parent_tool_call_id
 `HostCtx::parent_tool_call_id()` in a native). A `tool_call` gate needs no change to cover nested
 calls: they reach it as the same event.
 
+A `tool_result` handler sees the tool's machine-readable result as `structured_content` (a tool
+that declares an `outputSchema` sets it, and a codemode script receives it instead of the text) and
+replaces it through `ToolResultPatch::structured_content` (`EventPatch::ToolResult` in a native).
+Replacing `content` without returning `structured_content` drops it, because it may no longer
+match the text; return it along with `content` to keep it. Handlers chain in load order, and a
+later handler that only touches `details` keeps what an earlier one set.
+
 ## Building
 
 ```sh
@@ -141,7 +148,7 @@ post-processes it.
 {
   "id": "my-ext",
   "version": "1.0.0",
-  "world": "cyrup:ext@0.15",
+  "world": "cyrup:ext@0.16",
   "entry": "crates/my-ext",
   "capabilities": {
     "fs": ["read:.", "write:.cyrup/todo"],
@@ -162,9 +169,9 @@ post-processes it.
 
 ### World compatibility
 
-The host world is `cyrup:ext@0.15` (`HOST_WORLD` in `crates/cyrup-ext/src/manifest.rs`, which also
+The host world is `cyrup:ext@0.16` (`HOST_WORLD` in `crates/cyrup-ext/src/manifest.rs`, which also
 carries the bump history). A manifest's `world` must declare the **same major version** as the host
-and a **minor version at least** the host's. Against today's host, `cyrup:ext@0.15` is the value to
+and a **minor version at least** the host's. Against today's host, `cyrup:ext@0.16` is the value to
 write; an older minor is a mismatch, and so is a different major.
 
 The minor moves whenever an export is added, removed or re-signed, and whenever an import is removed

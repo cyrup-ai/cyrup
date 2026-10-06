@@ -78,6 +78,39 @@ pub(super) fn install(api: &mut ExtensionApi) {
                 .map(|p| format!(" parent={p}"))
                 .unwrap_or_default()
         ));
+        // `structuredContent` (pi `ToolResultEventBase.structuredContent`, types.ts:1238 @v1.0.1),
+        // which the 0.16 world delivers as the export's trailing `structured-content-json`. As with
+        // the usage above, the patch is derived from what was RECEIVED: `structured_probe` hands
+        // back its `files` doubled, replacing `content` ALONG WITH it (so it is kept), while
+        // `redacted_probe` replaces `content` alone (so pi's drop rule discards the structured
+        // half, `runner.ts:1194-1198`).
+        if ev.name == "structured_probe" || ev.name == "redacted_probe" {
+            let received = ev
+                .structured_content
+                .as_ref()
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "none".to_string());
+            ctx.ui().notify(&format!(
+                "demo: tool_result {} structured={received}",
+                ev.name
+            ));
+            let content = json!([{ "type": "text", "text": "rewritten by the guest" }]);
+            return match (ev.name.as_str(), ev.structured_content.clone()) {
+                ("structured_probe", Some(mut structured)) => {
+                    let doubled = structured
+                        .get("files")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0)
+                        * 2;
+                    if let Some(obj) = structured.as_object_mut() {
+                        obj.insert("files".into(), json!(doubled));
+                    }
+                    Outcome::mutate(json!({ "content": content, "structuredContent": structured }))
+                }
+                ("redacted_probe", _) => Outcome::mutate(json!({ "content": content })),
+                _ => Outcome::noop(),
+            };
+        }
         match ev.usage.clone() {
             Some(mut usage) if ev.name == "usage_probe" => {
                 let doubled = usage.get("output").and_then(|v| v.as_u64()).unwrap_or(0) * 2;

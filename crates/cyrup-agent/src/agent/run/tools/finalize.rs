@@ -112,6 +112,7 @@ pub(crate) async fn after_hook(
         args,
         content: &executed.result.content,
         details: executed.result.details.as_ref(),
+        structured_content: executed.result.structured_content.as_ref(),
         usage: executed.result.usage.as_ref(),
         is_error: executed.is_error,
         terminate: executed.result.terminate,
@@ -179,10 +180,13 @@ pub(super) fn fold_tool_outcome(
             // `ov.content.is_some()` is the faithful test. Upstream gates on the truthiness of
             // `afterResult.content`, and an array is truthy in JS even when empty, so a hook that
             // blanks the content with `Some(vec![])` drops the structured half here too.
-            structured_content = match (&ov.structured_content, ov.content.is_some()) {
-                (Some(sc), _) => Some(sc.clone()),
-                (None, true) => None,
-                (None, false) => structured_content,
+            //
+            // `??` is nullish, not just `undefined`: a hook that returns `structuredContent: null`
+            // is treated as returning none, so the pair falls through to the content test.
+            structured_content = match (ov.structured_content.as_ref(), ov.content.is_some()) {
+                (Some(sc), _) if !sc.is_null() => Some(sc.clone()),
+                (_, true) => None,
+                (_, false) => structured_content,
             };
             if let Some(c) = ov.content {
                 content = c;
@@ -637,6 +641,36 @@ mod tests {
             ),
             None,
             "an empty content array is truthy upstream, so it drops the structured half too",
+        );
+    }
+
+    /// `afterResult.structuredContent ?? (...)` (`agent-loop.ts:879-880` @v1.0.1) is nullish: a hook
+    /// whose `structuredContent` is JSON `null` decides nothing, so with `content` it drops and
+    /// without it the tool's own value stays.
+    #[test]
+    fn a_null_structured_content_from_a_hook_decides_nothing() {
+        assert_eq!(
+            folded_structured(
+                AfterOutcome::Override(Box::new(AfterOverride {
+                    content: Some(vec![Content::text("redacted")]),
+                    structured_content: Some(Value::Null),
+                    ..AfterOverride::default()
+                })),
+                ok_result_with_structured(),
+            ),
+            None,
+            "`null ?? (content ? undefined : ...)` is `undefined`",
+        );
+        assert_eq!(
+            folded_structured(
+                AfterOutcome::Override(Box::new(AfterOverride {
+                    structured_content: Some(Value::Null),
+                    ..AfterOverride::default()
+                })),
+                ok_result_with_structured(),
+            ),
+            Some(json!({ "exitCode": 0, "output": "hi" })),
+            "`null ?? result.structuredContent` is the tool's own value",
         );
     }
 

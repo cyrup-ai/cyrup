@@ -1269,6 +1269,9 @@ impl ExtensionApi {
                     // empty arg = pi `undefined`.
                     usage: opt_json(arg(a, 6)),
                     parent_tool_call_id: opt_str(arg(a, 7)),
+                    // pi `ToolResultEventBase.structuredContent` (types.ts:1238 @v1.0.1); the WIT
+                    // export's trailing `structured-content-json`, empty = pi `undefined`.
+                    structured_content: opt_json(arg(a, 8)),
                 };
                 f(ev, c).into_raw()
             }),

@@ -54,6 +54,12 @@ pub struct ToolResultEvent {
     /// dependency on the host's `Usage` type.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub usage: Option<Value>,
+    /// The tool's machine-readable result (Pi `ToolResultEventBase.structuredContent?: JsonValue`,
+    /// `extensions/types.ts:1238` @v1.0.1). `None` (= Pi `undefined`) when the tool returned none.
+    /// "Handlers that redact `content` should also replace this; replacing `content` alone drops
+    /// it": see [`ToolResultPatch::structured_content`].
+    #[serde(rename = "structuredContent", skip_serializing_if = "Option::is_none")]
+    pub structured_content: Option<Value>,
     /// The tool call that made this call, when a tool is calling a tool (`ctx.executeTool`) — pi
     /// `parentToolCallId` (`extensions/types.ts:1061-1083` @v1.0.1). It is itself `<id>/<n>` when
     /// that tool was a nested call. `None` for a call the model issued; absent on the wire then.
@@ -447,6 +453,13 @@ pub struct ToolResultPatch {
     /// types.ts:1089). There is no deep merge (types.ts:70-78); omitted = keep the tool's value.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<Value>,
+    /// Replaces [`ToolResultEvent::structured_content`] in full when present (Pi
+    /// `ToolResultEventResult.structuredContent`, `extensions/types.ts:1445` @v1.0.1). Omitted
+    /// keeps it, EXCEPT when [`Self::content`] is present: replacing `content` without returning
+    /// this drops the structured content, "because it may no longer match. Return it along with
+    /// `content` to keep it" (`:1436-1441`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub structured_content: Option<Value>,
 }
 
 /// `before_agent_start` dual result (Pi `BeforeAgentStartEventResult`, types.ts:1053-1057): inject a

@@ -158,6 +158,7 @@ impl ExtHooks {
         let orig_content = ctx.content.to_vec();
         let orig_is_error = ctx.is_error;
         let orig_details = ctx.details.cloned();
+        let orig_structured = ctx.structured_content.cloned();
         // The tool's own reported usage (Pi `ToolResultEventBase.usage`, types.ts:919-921). Passed
         // in so a handler can OBSERVE it, and diffed below so a handler can PATCH it — Pi wires both
         // directions (`runner.emitToolResult({..., usage: result.usage})` then
@@ -171,6 +172,7 @@ impl ExtHooks {
             input: ctx.args.clone(),
             content: orig_content.clone(),
             details: orig_details.clone(),
+            structured_content: orig_structured.clone(),
             is_error: orig_is_error,
             usage: orig_usage.clone(),
             terminate: orig_terminate,
@@ -180,6 +182,7 @@ impl ExtHooks {
                 let HostEvent::ToolResult {
                     content,
                     details,
+                    structured_content,
                     is_error,
                     usage,
                     terminate,
@@ -190,9 +193,29 @@ impl ExtHooks {
                 };
                 let mut over = AfterOverride::default();
                 let mut changed = false;
-                if content != orig_content {
+                // The agent's fold of this override is pi's `finalizeExecutedToolCall` rule
+                // (`agent-loop.ts:879-880`): the structured content is dropped when `content` is
+                // replaced and `structuredContent` is not. The dispatcher's fold already decided
+                // the pair (`HostEvent::apply_patch`), so the override is built to say exactly
+                // that outcome: a structured content that went from `Some` to `None` can only mean
+                // a handler replaced the content without it, so `content` is sent even when the
+                // replacement equals the original; and whenever `content` is sent, the structured
+                // content the fold ended on is sent with it, or the agent would drop it again.
+                //
+                // pi reads a `null` the same way the agent loop does (`??` is nullish): a handler's
+                // `structuredContent: null` leaves the result without one, so it is "dropped".
+                let structured_content = match structured_content {
+                    Some(v) if v.is_null() && orig_structured.as_ref() != Some(&v) => None,
+                    other => other,
+                };
+                let structured_dropped = orig_structured.is_some() && structured_content.is_none();
+                if content != orig_content || structured_dropped {
                     over.content = Some(content);
                     changed = true;
+                }
+                if over.content.is_some() || structured_content != orig_structured {
+                    over.structured_content = structured_content;
+                    changed |= over.structured_content.is_some();
                 }
                 if details != orig_details {
                     over.details = details;

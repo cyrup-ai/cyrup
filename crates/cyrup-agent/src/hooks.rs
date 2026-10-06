@@ -90,6 +90,11 @@ pub struct AfterToolCall<'a> {
     pub args: &'a Value,
     pub content: &'a [Content],
     pub details: Option<&'a Value>,
+    /// The structured result the tool returned, if any (Pi `AfterToolCallContext.result.
+    /// structuredContent`, `agent/src/types.ts:433` @v1.0.1). Present on the READ side so a hook
+    /// that rewrites `content` can see what it is about to drop — [`AfterOverride::structured_content`]
+    /// is the other direction.
+    pub structured_content: Option<&'a Value>,
     /// Usage reported by the tool execution itself, if any (Pi `AfterToolCallContext.result.usage`,
     /// types.ts:107 → `AgentToolResult.usage`, types.ts:360-361). Present on the READ side so a
     /// hook can inspect what it is about to replace instead of overwriting blind.

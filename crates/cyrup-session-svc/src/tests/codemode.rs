@@ -186,6 +186,8 @@ struct ToolsExt {
     block_forbidden_echo: bool,
     /// Replace the content of the `stats` tool's result.
     redact_stats: bool,
+    /// Replace the content AND the structured content of the `stats` tool's result.
+    replace_stats: bool,
 }
 
 impl ToolsExt {
@@ -195,6 +197,7 @@ impl ToolsExt {
             providers: Vec::new(),
             block_forbidden_echo: false,
             redact_stats: false,
+            replace_stats: false,
         }
     }
 }
@@ -230,6 +233,47 @@ impl NativeExtension for ToolsExt {
                 HookOutcome::Mutate(EventPatch::ToolResult {
                     content: Some(vec![Content::text("redacted")]),
                     details: None,
+                    structured_content: None,
+                    is_error: None,
+                    usage: None,
+                    terminate: None,
+                })
+            }
+            HostEvent::ToolResult { name, .. } if self.replace_stats && name == "stats" => {
+                HookOutcome::Mutate(EventPatch::ToolResult {
+                    content: Some(vec![Content::text("0 files")]),
+                    details: None,
+                    structured_content: Some(Box::new(json!({ "files": 0, "names": [] }))),
+                    is_error: None,
+                    usage: None,
+                    terminate: None,
+                })
+            }
+            _ => HookOutcome::Noop,
+        }
+    }
+}
+
+/// A second `tool_result` handler that only touches `details`, like upstream's: it must keep what
+/// the handler before it set.
+struct AuditExt;
+
+#[async_trait::async_trait]
+impl NativeExtension for AuditExt {
+    fn id(&self) -> ExtensionId {
+        ExtensionId::from("codemode-audit-ext")
+    }
+    async fn init(&self, api: &mut InitApi) -> Result<(), ExtError> {
+        api.subscribe(&[EventKind::ToolResult]);
+        Ok(())
+    }
+    async fn on_event(&self, ev: &HostEvent, _ctx: &HostCtx) -> HookOutcome {
+        match ev {
+            HostEvent::ToolResult { name, .. } if name == "stats" => {
+                HookOutcome::Mutate(EventPatch::ToolResult {
+                    content: None,
+                    details: Some(json!({ "audited": true })),
+                    structured_content: None,
                     is_error: None,
                     usage: None,
                     terminate: None,
@@ -273,6 +317,8 @@ struct Options {
     /// A global `settings.json` document.
     settings: Option<&'static str>,
     ext: Option<ToolsExt>,
+    /// Native extensions loaded after `ext`, in order.
+    also: Vec<Arc<dyn NativeExtension>>,
 }
 
 async fn rig(script: Script, options: Options) -> Rig {
@@ -288,17 +334,17 @@ async fn rig(script: Script, options: Options) -> Rig {
         store.seed(SettingsScope::Global, settings);
     }
     let ext = options.ext.unwrap_or_else(|| ToolsExt::new(Vec::new()));
-    let session = SessionBuilder::new(faux.clone() as Arc<dyn Provider>, cfg)
+    let mut builder = SessionBuilder::new(faux.clone() as Arc<dyn Provider>, cfg)
         .settings_store(store)
         .with_codemode(CodemodeExtension::new(
             Default::default(),
             Arc::new(factory.clone()),
         ))
-        .with_native_extension(Arc::new(ext))
-        .build()
-        .await
-        .unwrap()
-        .into_shared();
+        .with_native_extension(Arc::new(ext));
+    for extension in options.also {
+        builder = builder.with_native_extension(extension);
+    }
+    let session = builder.build().await.unwrap().into_shared();
     let events = Arc::new(Mutex::new(Vec::new()));
     let mut stream = session.subscribe();
     let sink = Arc::clone(&events);
@@ -499,6 +545,7 @@ async fn presents_callable_tools_per_codemode_mode_only() {
         Options {
             settings: Some(r#"{ "codemode": { "mode": "only" } }"#),
             ext: Some(ToolsExt::new(vec![echo(), stats(), screenshot()])),
+            ..Options::default()
         },
     )
     .await;
@@ -542,6 +589,7 @@ async fn an_unknown_codemode_mode_reads_as_on() {
         Options {
             settings: Some(r#"{ "codemode": { "mode": "everything" } }"#),
             ext: Some(ToolsExt::new(vec![echo()])),
+            ..Options::default()
         },
     )
     .await;
@@ -952,6 +1000,35 @@ async fn routes_nested_calls_through_extension_hooks() {
             cyrup_codemode_runtime::tool::CodemodeNestedCallStatus::Error,
             cyrup_codemode_runtime::tool::CodemodeNestedCallStatus::Ok
         ]
+    );
+}
+
+/// Upstream `keeps structured content that tool_result handlers replace along with the content`:
+/// the first handler replaces both, a later one that only touches `details` keeps what it set, and
+/// the script receives the replacement structured content, not the text.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn keeps_structured_content_that_tool_result_handlers_replace_along_with_the_content() {
+    let mut ext = ToolsExt::new(vec![echo(), stats()]);
+    ext.replace_stats = true;
+    let rig = rig(
+        script(|_code, env| async move {
+            let stats = env.tool("stats", json!({})).await;
+            completed(Vec::new(), stats.unwrap())
+        }),
+        Options {
+            ext: Some(ext),
+            also: vec![Arc::new(AuditExt)],
+            ..Options::default()
+        },
+    )
+    .await;
+    rig.set_active(&["codemode", "stats"]).await;
+
+    let result = rig.run("return await tools.stats({});").await;
+
+    assert_eq!(
+        serde_json::from_str::<Value>(&result_text(&result)).unwrap(),
+        json!({ "files": 0, "names": [] })
     );
 }
 

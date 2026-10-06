@@ -2270,6 +2270,7 @@ impl NativeExtension for McpExtension {
                 HookOutcome::Mutate(cyrup_ext::EventPatch::ToolResult {
                     content: None,
                     details: None,
+                    structured_content: None,
                     is_error: Some(true),
                     usage: None,
                     terminate: None,
