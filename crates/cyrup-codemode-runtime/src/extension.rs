@@ -92,6 +92,14 @@ impl NativeExtension for CodemodeExtension {
         true
     }
 
+    /// Replaceable: pi's entry is `{ name: "codemode", factory, replaceable: true, builtin: true }`
+    /// (`extensions/index.ts:11-12` @v1.0.1), so an extension that registers a tool, command or flag
+    /// named like one of this extension's takes over instead of colliding with it
+    /// (`omitReplacedExtensions`, `resource-loader.ts:116-153`).
+    fn replaceable(&self) -> bool {
+        true
+    }
+
     /// Hidden from the startup `[Extensions]` listing, as pi marks every `builtin:` extension
     /// (`resource-loader.ts:729`; EXT-092).
     fn is_hidden(&self) -> bool {

@@ -1547,6 +1547,20 @@ impl SessionBuilder {
         #[cfg(not(feature = "wasm-host"))]
         let _ = &ext_roots;
 
+        // Every replaceable built-in another extension displaced is reported as a warning
+        // (`omitReplacedExtensions` pushes one onto the load result per left-out built-in,
+        // `resource-loader.ts:139-150` @v1.0.1). Not fatal: pi keeps the session and the
+        // replacement, and only the collisions it does NOT resolve exit 1.
+        startup_diagnostics
+            .extensions
+            .extend(ext_host.omitted_extensions().iter().map(|omitted| {
+                crate::services::ExtensionLoadDiagnostic {
+                    path: PathBuf::from(omitted.extension.as_str()),
+                    error: omitted.warning(),
+                    fatal: false,
+                }
+            }));
+
         // Apply the CLI-captured extension flag overrides now that every loaded extension's
         // `registerFlag` has run (Pi runs `applyExtensionFlagValues` inside
         // `createAgentSessionServices`, agent-session-services.ts:167 — AFTER the extensions load).

@@ -818,6 +818,99 @@ async fn the_live_message_end_of_a_nested_calling_tool_carries_the_record_and_th
     );
 }
 
+/// pi's `{ name: "codemode", factory, replaceable: true, builtin: true }`
+/// (`extensions/index.ts:11-12` @v1.0.1): an extension that registers a tool named `codemode`
+/// replaces the built-in instead of colliding with it. The session is built the normal way, with
+/// the built-in attached first; the other extension's tool is the one the provider is offered and
+/// the one a model call runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_extension_registering_codemode_replaces_the_builtin() {
+    let mine = Fixed::new(
+        "codemode",
+        "The other extension's own codemode.",
+        "mine ran",
+    )
+    .arc();
+    let rig = rig(
+        script(|_code, _env| async { panic!("the built-in's sandbox must not run") }),
+        Options {
+            ext: Some(ToolsExt::new(vec![mine])),
+            ..Options::default()
+        },
+    )
+    .await;
+    rig.set_active(&["codemode"]).await;
+
+    let result = rig.run("go").await;
+
+    let tools = rig.request_tools(0);
+    assert_eq!(
+        description(&tools, "codemode"),
+        "The other extension's own codemode.",
+        "the provider is offered the replacement, not the built-in's description"
+    );
+    assert!(
+        rig.factory.runs().is_empty(),
+        "no script ran in the built-in's sandbox"
+    );
+    let Message::ToolResult {
+        content, is_error, ..
+    } = &result
+    else {
+        panic!("not a tool result")
+    };
+    assert!(!is_error, "{content:?}");
+    assert_eq!(
+        content.iter().find_map(|block| match block {
+            Content::Text { text, .. } => Some(text.to_string()),
+            _ => None,
+        }),
+        Some("mine ran".to_owned()),
+        "the model's call ran the replacement"
+    );
+    // Reported as a warning, not as the fatal collision the registry otherwise records.
+    let diagnostics = &rig.session.services().startup_diagnostics.extensions;
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+    assert!(!diagnostics[0].fatal);
+    assert_eq!(diagnostics[0].path, PathBuf::from("codemode"));
+    assert!(
+        diagnostics[0]
+            .error
+            .contains("registers tool `codemode`, so built-in extension `codemode` was not loaded"),
+        "{}",
+        diagnostics[0].error
+    );
+}
+
+/// An extension registering an unrelated tool leaves the built-in loaded: both are offered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_extension_registering_an_unrelated_tool_leaves_the_builtin_in_place() {
+    let rig = rig(
+        no_script(),
+        Options {
+            ext: Some(ToolsExt::new(vec![echo()])),
+            ..Options::default()
+        },
+    )
+    .await;
+    rig.set_active(&["codemode", "echo"]).await;
+    rig.ask("go").await;
+    let tools = rig.request_tools(0);
+    let names = tool_names(&tools);
+    assert!(
+        names.contains(&"codemode") && names.contains(&"echo"),
+        "{names:?}"
+    );
+    assert!(description(&tools, "codemode").starts_with("Run JavaScript that calls other tools."));
+    assert!(
+        rig.session
+            .services()
+            .startup_diagnostics
+            .extensions
+            .is_empty()
+    );
+}
+
 /// Upstream `routes nested calls through extension hooks`: a blocked call rejects with the hook's
 /// reason; a `tool_result` handler's replacement is what the script sees.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

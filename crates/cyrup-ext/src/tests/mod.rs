@@ -43,6 +43,7 @@ mod provider;
 mod provider_refresh;
 mod quarantined_native;
 mod registration_validation;
+mod replaceable_builtins;
 mod seam_liveness;
 mod startup_timings;
 mod terminal_keys;

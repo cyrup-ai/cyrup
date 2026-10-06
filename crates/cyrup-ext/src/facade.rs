@@ -532,6 +532,7 @@ impl ExtensionHost {
         // registration step that fails after an earlier one succeeded, and through anything an
         // `init`-spawned task pushed via the `LateRegistrar`.
         let result = self.load_native_body(ext, id.clone()).await;
+        self.settle_omissions();
         match &result {
             // A native built-in is compiled in, so like Pi's inline factories
             // (`loadExtensionFromFactory` → `initializeExtension`, `core/extensions/loader.ts:553`
@@ -563,6 +564,10 @@ impl ExtensionHost {
     /// Infallible by design: the load is already returning its own error, and a poisoned registry
     /// lock must not mask it. A purge failure is traced.
     fn discard_registrations(&self, id: &ExtensionId) {
+        // A failed load leaves nothing of the extension, its replaceable standing included.
+        if let Err(e) = self.registry.forget_replaceable(id) {
+            tracing::warn!(extension = %id, error = %e, "could not forget a failed extension's replaceable standing");
+        }
         match self.registry.purge_owner(id) {
             Ok(n) if n > 0 => tracing::debug!(
                 extension = %id,
@@ -591,6 +596,15 @@ impl ExtensionHost {
         // `load_native_with_services`: that method is `cfg(feature = "wasm-host")`, and the whole
         // point of `LateRegistrar` being feature-independent is that both build arms get one.
         ext.set_late_registrar(self.late_registrar_for(id.clone()));
+
+        // An id whose earlier holder was left out names a new extension now: it inherits neither
+        // that standing nor its omission. A replaceable built-in is then known to the registry
+        // before its first registration, so every name it registers is judged against the other
+        // extensions ([`crate::replaceable`]).
+        self.registry.forget_replaceable(&id)?;
+        if ext.replaceable() {
+            self.registry.mark_replaceable(id.clone())?;
+        }
 
         let mut api = InitApi::new();
         ext.init(&mut api).await?;
@@ -630,6 +644,23 @@ impl ExtensionHost {
         for tool in tools {
             self.registry.register_tool(id.clone(), tool)?;
         }
+        // The other two namespaces a replaceable built-in can be left out by (`resource-loader.ts:
+        // 124-128`), registered ahead of the rest so an extension left out has registered nothing
+        // else to leave behind. Each table keeps its own registration order.
+        for (name, desc) in &commands {
+            self.registry
+                .register_command(id.clone(), name.clone(), desc.clone())?;
+        }
+        for (name, spec) in &flags {
+            self.registry
+                .register_flag(id.clone(), name.clone(), spec.clone())?;
+        }
+        if self.registry.is_omitted(&id)? {
+            // Left out: its registrations are already gone from the registry; it must not reach the
+            // dispatcher or the command-routing table either (`settle_omissions`).
+            self.bus.unsubscribe_all(&id);
+            return Ok(());
+        }
         // SEAM-084 — a compiled-in native has no path and no directory, which is exactly upstream's
         // `loadExtensionFromFactory` case: its default `extensionPath` is the literal `"<inline>"`
         // (`core/extensions/loader.ts:490` @v0.83.0), so `createExtension`'s `<…>` split yields
@@ -637,9 +668,6 @@ impl ExtensionHost {
         // and after `init` has succeeded, so a native whose `init` failed leaves no orphan row.
         self.registry
             .record_extension_provenance(id.clone(), crate::ExtensionProvenance::inline())?;
-        for (name, desc) in commands {
-            self.registry.register_command(id.clone(), name, desc)?;
-        }
         // EXT-006: a native built-in's renderer declarations land in the SAME registry tables the
         // guest path writes, so `render_tool_call`/`render_message_call` route by name/type without
         // caring which runtime supplies the renderer.
@@ -664,9 +692,6 @@ impl ExtensionHost {
         // register tools but not shortcuts, flags or providers.
         for (key, desc) in shortcuts {
             self.registry.register_shortcut(id.clone(), key, desc)?;
-        }
-        for (name, spec) in flags {
-            self.registry.register_flag(id.clone(), name, spec)?;
         }
         for (provider_id, config) in providers {
             self.registry
@@ -891,6 +916,9 @@ impl ExtensionHost {
     /// descriptor is pure bookkeeping, so this is callable from `active_tools` and from a
     /// non-async drain alike.
     pub fn refresh_tools(&self) -> Result<bool, ExtError> {
+        // A late registration through a `LateRegistrar` can leave a replaceable built-in out; its
+        // event handlers go before the tool set is rebuilt.
+        self.settle_omissions();
         if !self.registry.take_tools_dirty() {
             return Ok(false);
         }
@@ -971,7 +999,9 @@ impl ExtensionHost {
         owner: ExtensionId,
         tool: Arc<dyn Tool>,
     ) -> Result<(), ExtError> {
-        self.registry.register_tool(owner, tool)
+        let registered = self.registry.register_tool(owner, tool);
+        self.settle_omissions();
+        registered
     }
 
     // NOTE on callers: this is the EMBEDDER-facing door — a host that already holds the
@@ -990,6 +1020,7 @@ impl ExtensionHost {
         desc: CommandDescriptor,
     ) -> Result<(), ExtError> {
         self.registry.register_command(owner, name, desc)?;
+        self.settle_omissions();
         self.notify_commands_changed();
         Ok(())
     }
@@ -2478,6 +2509,7 @@ impl ExtensionHost {
         // one take exactly the same path — and so a descriptor is bound to its OWNING instance
         // rather than to whichever extension happened to load last.
         self.materialize_guest_tools()?;
+        self.settle_omissions();
         time(&format!("{timing_path} factory"), TimingLabel::Extensions);
         Ok(ext)
     }
@@ -2965,6 +2997,36 @@ impl ExtensionHost {
         }
         g.push(id.clone());
         Ok(())
+    }
+
+    /// Drop what the registry does not hold of every replaceable built-in another extension left
+    /// out ([`crate::replaceable`]): its event handlers, bus subscriptions, command routing and id
+    /// reservation. Upstream never hands such an extension to its runner, so none of these exist
+    /// there. Cheap when nothing was left out.
+    fn settle_omissions(&self) {
+        let Ok(pending) = self.registry.take_pending_unload() else {
+            return;
+        };
+        for id in pending {
+            self.bus.unsubscribe_all(&id);
+            self.dispatcher.remove(&id);
+            if let Ok(mut g) = self.native.write() {
+                g.remove(&id);
+            }
+            #[cfg(feature = "wasm-host")]
+            if let Ok(mut g) = self.live.write() {
+                g.remove(&id);
+            }
+            self.release_id(&id);
+        }
+    }
+
+    /// The replaceable built-ins that were left out because another extension registered a name
+    /// they registered (pi `omitReplacedExtensions`, `core/resource-loader.ts:116-153` @v1.0.1),
+    /// each with the extension that holds the name. [`OmittedExtension::warning`] is upstream's
+    /// warning for it.
+    pub fn omitted_extensions(&self) -> Vec<crate::OmittedExtension> {
+        self.registry.omitted_extensions().unwrap_or_default()
     }
 
     /// Undo a [`Self::reserve_id`] after the load that claimed it failed (EXT-S01). Silent on a

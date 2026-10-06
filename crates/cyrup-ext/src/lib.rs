@@ -163,6 +163,7 @@ pub mod nested;
 pub mod provider;
 pub mod registry;
 pub mod render;
+pub mod replaceable;
 pub mod subscriber;
 pub mod ui_prompt;
 pub mod wrapper;
@@ -232,6 +233,7 @@ pub use registry::{
     ExtensionProvenance, ExtensionRegistry, ResolvedCommand, ToolDescriptor,
 };
 pub use render::RenderOptions;
+pub use replaceable::{ClaimKind, OmittedExtension};
 pub use subscriber::ExtSubscriber;
 pub use ui_prompt::{UiPromptGuard, UiPromptKind, UiPromptTracker};
 pub use wrapper::{

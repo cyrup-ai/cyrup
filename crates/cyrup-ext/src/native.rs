@@ -822,6 +822,20 @@ pub trait NativeExtension: Send + Sync {
         false
     }
 
+    /// Whether this built-in is **replaceable**: left out of the loaded set when another extension
+    /// registers a tool, command or flag with a name it registers, instead of the two colliding
+    /// (pi `InlineExtension.replaceable`, `core/extensions/types.ts:2018-2024` and
+    /// `omitReplacedExtensions`, `core/resource-loader.ts:116-153` @v1.0.1). pi's `codemode`,
+    /// `tool-search` and `mcp` built-ins are replaceable, so a third-party extension that registers
+    /// `codemode`, `tool_search` or `/mcp` takes over cleanly. [`crate::replaceable`] states the
+    /// rule.
+    ///
+    /// `init` still runs for a replaceable built-in that is left out, as the factory does upstream,
+    /// so it should register only tools, commands, flags and event handlers. Default `false`.
+    fn replaceable(&self) -> bool {
+        false
+    }
+
     /// Whether this built-in is **hidden** from the startup `[Extensions]` listing. It is still
     /// loaded, still in [`crate::ExtensionHost::loaded_ids`], and still dispatched; only the list
     /// the user is shown leaves it out.

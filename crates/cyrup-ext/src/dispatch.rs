@@ -208,6 +208,23 @@ impl Dispatcher {
         Ok(())
     }
 
+    /// Drop an extension from the load order, so it receives no more events. Returns whether it was
+    /// there. Used for a replaceable built-in another extension displaced
+    /// ([`crate::replaceable`]); pi simply never hands such an extension to its runner.
+    pub fn remove(&self, id: &cyrup_core::ExtensionId) -> bool {
+        match self.lock_write() {
+            Ok(mut g) => {
+                let before = g.exts.len();
+                g.exts.retain(|e| e.id() != id);
+                g.exts.len() != before
+            }
+            Err(_) => {
+                self.note_poisoned();
+                false
+            }
+        }
+    }
+
     /// The union of every loaded extension's CURRENT subscription bitset (EXT-058).
     ///
     /// Computed on demand rather than folded once at [`Self::add`]. The load-time aggregate was a
