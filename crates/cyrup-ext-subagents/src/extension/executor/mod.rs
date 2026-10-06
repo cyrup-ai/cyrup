@@ -560,6 +560,22 @@ impl SubagentExecutor {
         self.config_cell().lock().await.clone()
     }
 
+    /// SUBA-152 — the resolved `{features, params, actions}` surface the dispatch gate reads, from
+    /// the live config cell.
+    ///
+    /// A dedicated accessor rather than `config_snapshot().await.disabled_feature_surface()`
+    /// because the gate runs on EVERY `subagent` tool call, ahead of the one
+    /// [`Self::config_snapshot`] the dispatch already takes: resolving the surface under the lock
+    /// returns three small `Vec`s instead of cloning the whole ~60-field config a second time per
+    /// call. It is also the only reason the gate needs the config at all, so naming it here keeps
+    /// [`crate::extension::tool::SubagentTool`]'s prologue a single `await` with no second
+    /// snapshot to keep in step with the first.
+    pub(crate) async fn disabled_feature_surface(
+        &self,
+    ) -> crate::disabled_features::DisabledFeatureSurface {
+        self.config_cell().lock().await.disabled_feature_surface()
+    }
+
     /// LANES_2 — whether a FOREGROUND run this process launched is provably over, for
     /// [`crate::spawn::cleanup_plan`]'s ownership probe. Port of the closure upstream injects at
     /// `subagent-executor.ts:6230-6235` @v0.68.0:

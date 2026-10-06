@@ -1,6 +1,7 @@
 //! The advertised JSON-Schema for the `subagent` tool's parameters, built from one `sj_*`
 //! fragment per property.
 
+use crate::disabled_features::{DisabledFeatureSurface, SubagentFeature, SubagentSurfaceFeature};
 use crate::extension::tool::text::SUBAGENT_ACTIONS;
 
 // -------------------------------------------------------------------------------------------------
@@ -152,12 +153,49 @@ fn sj_tool_budget_override() -> serde_json::Value {
 }
 
 /// `TaskItem` (`schemas.ts:78-90`): one top-level PARALLEL `tasks[]` element (agent+task required).
+/// # SUBA-152 — `agent` carries `minLength: 1`; this item does NOT carry `additionalProperties: false`
+///
+/// `minLength: 1` closes the same defect [`sj_usage_budget_override`]'s `minProperties: 1` note
+/// describes. THE DEFECT: the schema called `{"tasks": [{"agent": "", "task": "x"}]}` legal and the
+/// dispatcher refuses it — `agent not found: ` — so a model was told an empty agent name was a
+/// legal way to name a child and got a discovery error with nothing in it to read back. Upstream's
+/// structured task item declares the same `{ type: "string", minLength: 1 }`
+/// (`extension/schemas.ts:287`). Note what it does NOT cover: a whitespace-only `"   "` satisfies
+/// `minLength: 1` and is refused identically (`agent not found:    `). That gap is upstream's too —
+/// its constraint is also a bare `minLength: 1` — and closing it would need a `pattern`, which is
+/// not what this change ports.
+///
+/// **`additionalProperties: false` is deliberately absent, and that is a measurement rather than an
+/// omission.** [`sj_chain_item`] carries it, which makes this item look inconsistent; the
+/// asymmetry is correct, for two independent reasons.
+///
+/// 1. **The dispatcher does not refuse an unknown key here**, so the defect class does not apply.
+///    [`crate::extension::tool::task_items::ToolTaskItem`] is a plain `serde::Deserialize` with no
+///    `deny_unknown_fields`: `{"tasks": [{"agent": "ghost", "task": "x", "bogusKey": 1}]}` parses,
+///    `bogusKey` is dropped, and the call then fails on agent resolution with the *identical*
+///    `agent not found: ghost` a call without `bogusKey` gets. There is no refusal to advertise.
+/// 2. **It would advertise the inverse defect.** This item declares THIRTEEN properties;
+///    `ToolTaskItem` parses EIGHTEEN. The five it does not declare are `as`, `outputSchema`,
+///    `phase`, `label` and `worktree` — and two of those are not inert: `tool_task_to_spec`
+///    (`task_items.rs:345-346`) threads `outputSchema` onto `structured_output_schema` and `as`
+///    onto the step's named `output`, so both reach the child from a `tasks[]` element today.
+///    `additionalProperties: false` would therefore tell the model that two keys the dispatcher
+///    accepts and USES are illegal — the schema refusing what dispatch admits, which is the exact
+///    mirror of the defect this change exists to close, and a strictly worse trade than the
+///    cosmetic inconsistency with [`sj_chain_item`].
+///
+/// [`sj_chain_item`] is in a different position precisely because it declares every key its parse
+/// honours (`as`, `outputSchema`, `phase`, `label`, `worktree` included), which is why
+/// `additionalProperties: false` is safe there and not here. Advertising this item's five missing
+/// properties first would make the constraint portable; that is a separate change, and it must come
+/// first — `additionalProperties: false` on the current thirteen is not a narrowing, it is a
+/// regression.
 fn sj_task_item() -> serde_json::Value {
     serde_json::json!({
         "type": "object",
         "required": ["agent", "task"],
         "properties": {
-            "agent": { "type": "string" },
+            "agent": { "type": "string", "minLength": 1 },
             "task": { "type": "string" },
             "cwd": { "type": "string" },
             "machine": { "type": "string", "minLength": 1, "maxLength": 128, "description": "Herdr saved machine id or label." },
@@ -337,6 +375,18 @@ fn sj_control_overrides() -> serde_json::Value {
     })
 }
 
+/// The `action` description's feature-independent half — pi's *"Management/control only; omit for
+/// execution."* (`extension/schemas.ts:163` and `:289` @v0.75.0, both sentences), in this port's
+/// own wording.
+const ACTION_DESCRIPTION_BASE: &str = "Management/control action. Omit for execution mode.";
+
+/// The `action` description's `workflow-scripts`-owned half: the ONE sentence pi's
+/// `createSubagentParamsSchema` reduction removes (`extension/schemas.ts:164` carries it,
+/// `:289` does not), because `validate` is the `workflow-scripts` group's only action
+/// ([`crate::disabled_features::SUBAGENT_FEATURES`]) and a disabled group's verb must not be
+/// described as accepting anything.
+const ACTION_VALIDATE_CLAUSE: &str = " validate accepts workflow: true or a script path.";
+
 pub(crate) fn subagent_tool_parameters() -> serde_json::Value {
     // Built via per-property inserts rather than one giant `json!` literal: a single 33-property
     // `json!` object overflows the macro's default `recursion_limit` at expansion time. Each insert
@@ -403,7 +453,11 @@ pub(crate) fn subagent_tool_parameters() -> serde_json::Value {
             "enum": SUBAGENT_ACTIONS,
             // SUBA-150 — pi `:184` @v0.75.0 names what `validate` accepts, and names it as the
             // `workflow` field rather than the two deleted parameters.
-            "description": "Management/control action. Omit for execution mode. validate accepts workflow: true or a script path."
+            // SUBA-151 — composed from the two halves rather than written out, so
+            // [`subagent_tool_parameters_for`]'s reduced form (which drops the `validate` clause,
+            // upstream's ONLY delta between `:162-164` and `:289` @v0.75.0) cannot word the
+            // surviving half differently from this one.
+            "description": format!("{ACTION_DESCRIPTION_BASE}{ACTION_VALIDATE_CLAUSE}")
         }),
     );
     // SUBA-104 — pi `capabilities` (`extension/schemas.ts:287` @v0.68.0), right after `action`
@@ -555,15 +609,30 @@ pub(crate) fn subagent_tool_parameters() -> serde_json::Value {
         "anyOf": [ { "type": "object", "additionalProperties": true }, { "type": "string" } ],
         "description": "Agent/chain config for create/update. Object or JSON string; presence of steps creates a chain."
     }));
+    // SUBA-152 — `minItems: 1`. THE DEFECT: the schema called `tasks: []` legal and the dispatcher
+    // refuses it. Mode is selected by a NON-EMPTY array, so `{"tasks": []}` falls through to
+    // "Provide exactly one mode. Agents: …" rather than running a vacuous 0/0 parallel group
+    // (`subagent_tool_rejects_empty_tasks_and_chain_arrays_as_no_mode_selected`,
+    // `routing_tests.rs:750-770`). Same class as [`sj_usage_budget_override`]'s `minProperties: 1`:
+    // the model was told an empty array was a legal way to ask for PARALLEL mode and got a
+    // mode-selection error it could not have predicted from the schema. Upstream carries
+    // `minItems: 1` on its own reduced pair (`extension/schemas.ts:291` for `tasks`, `:295` for
+    // `chain`), though that pair is a different object from this one — see
+    // [`subagent_tool_parameters_for`]'s note 4 — so the dispatcher, not upstream, is the authority
+    // for porting it here.
     props.insert("tasks".to_string(), serde_json::json!({
         "type": "array",
+        "minItems": 1,
         "items": sj_task_item(),
         "description": "PARALLEL mode: [{agent, task, count?, output?, outputMode?, reads?, progress?}, ...]"
     }));
     props.insert("concurrency".to_string(), serde_json::json!({ "type": "integer", "minimum": 1, "description": "Top-level PARALLEL mode only: max concurrent tasks. Defaults to config.parallel.concurrency or 4." }));
     props.insert("worktree".to_string(), serde_json::json!({ "type": "boolean", "description": "Create isolated git worktrees for parallel tasks; requires clean git state." }));
+    // SUBA-152 — `minItems: 1`, for the reason the `tasks` entry above records: `{"chain": []}` is
+    // refused by the same dispatcher check and the same assertion.
     props.insert("chain".to_string(), serde_json::json!({
         "type": "array",
+        "minItems": 1,
         "items": sj_chain_item(),
         "description": "CHAIN mode: sequential steps; each result becomes {previous}. append-step takes one tail step and may use {chain_dir}/{outputs.name}."
     }));
@@ -806,6 +875,141 @@ pub(crate) fn subagent_tool_parameters() -> serde_json::Value {
         "additionalProperties": true,
         "properties": serde_json::Value::Object(props),
     })
+}
+
+/// SUBA-151 — pi `createSubagentParamsSchema(disabled)` (`extension/schemas.ts:301-312`
+/// @v0.75.0, annotated tag `06f8452c` -> commit `ad56bf92`): the advertised parameter set with
+/// every property an operator's `config.disabledFeatures` removed taken OUT, and — when
+/// `workflow-scripts` is among them — the `action` description reduced to the half that survives.
+///
+/// Upstream's own SAFETY note (`:310`, verbatim): *"only optional properties are dropped or
+/// added; the executor rejects disabled options and admits chain/tasks at runtime."* Both clauses
+/// hold here with ONE caveat. The first clause holds outright: the whole advertised set is
+/// optional (the root object declares no `required`), and `chain`/`tasks` are advertised
+/// unconditionally rather than added by this reduction (see below).
+///
+/// # The caveat is CLOSED — the executor now rejects a disabled option
+///
+/// This block used to read *"[`crate::disabled_features::disabled_feature_use_error`] — the
+/// runtime half upstream's SAFETY clause leans on — has **no production caller in this crate**"*,
+/// and named the remaining work as one call at the tool boundary. SUBA-152 made that call: it is
+/// the first thing [`crate::extension::tool::SubagentTool`]'s `Tool::execute` prologue does, on the
+/// RAW request, ahead of every side effect — pi's `disabledFeatureResult(params)` at
+/// `runs/foreground/subagent-executor.ts:7921` (the closure at `:5287-5291`). Because cyrup's RPC
+/// bridge dispatches through that same `SubagentTool` (`extension/rpc/mod.rs:584`), the one call
+/// also covers the path upstream needs `extension/rpc.ts:535` for.
+///
+/// So BOTH clauses of upstream's SAFETY note now hold, and a reduced schema may be read as what it
+/// says it is: a session that disabled `workflow-scripts` stops telling the model `workflow` is a
+/// legal field, AND a caller that sends it anyway is refused by name rather than dispatched.
+/// `a_disabled_param_is_refused_before_it_dispatches`,
+/// `a_disabled_action_is_refused_before_it_dispatches`,
+/// `a_disabled_workflow_script_carrier_is_refused_before_the_removal_message` (`routing_tests.rs`)
+/// and `rpc_spawn_is_refused_by_the_same_disabled_feature_gate_as_the_tool`
+/// (`tests/rpc_bridge_integration.rs`) are the four that hold it.
+///
+/// # Why a model needs this and not just a runtime refusal
+///
+/// Without it, a session that disabled a group still advertises that group's parameters, so the
+/// model is told a field is legal, sends it, and is refused for a reason it could not have read
+/// off the schema. That is this crate's advertise-vs-dispatch invariant in its second direction,
+/// and the same defect class [`sj_usage_budget_override`]'s `minProperties` note describes.
+///
+/// # The four deltas upstream applies, and what each one does HERE
+///
+/// Upstream's `flatMap` does four things. Two are real work in this port, two are deliberate
+/// no-ops, and the no-ops are no-ops for a stated reason rather than by omission:
+///
+/// 1. **Drop every property named in `disabled.params`** — REAL, and the whole value of this
+///    function. It is generic over all 15 groups plus the synthetic `schedules` surface, so
+///    disabling `usage-budgets` takes `usageBudget` out, `panes` takes `focus` out, and so on.
+///    [`crate::disabled_features::DisabledSurfaceMap`] is the authority for the names; this
+///    function never carries a second copy of them.
+/// 2. **Reduce `action`'s description when `workflow-scripts` is disabled** — REAL. Upstream's
+///    reduced `action` (`:289`) differs from its full one (`:162-164`) in exactly one sentence,
+///    the `validate` clause, so that clause and only that clause is dropped
+///    ([`ACTION_VALIDATE_CLAUSE`]). Upstream additionally replaces the whole property with a
+///    bare `Type.String({minLength: 1})`; this port does NOT, because pi's full `action` is an
+///    undiscriminated string and cyrup's carries the `enum` of
+///    [`crate::extension::tool::text::SUBAGENT_ACTIONS`]. Throwing the enum away to match a shape
+///    pi only has because it has no enum would ADVERTISE LESS than pi does and tell the model to
+///    go read `guide topic tool-reference` for a list the schema was already handing it.
+/// 3. **Re-describe `task` when `workflow-scripts` is disabled** — NO-OP here, for a structural
+///    reason. Upstream's reduced sentence (`:290`) is *"One-child task with agent, or the original
+///    request ({task}) with chain/tasks."*: it has to introduce `chain`/`tasks` because in pi they
+///    exist ONLY in the reduced schema, and `{task}` because that is how a chain step reaches the
+///    original request. In this port `chain`/`tasks` are advertised unconditionally (see 4) and
+///    `{task}` substitution is unconditional too (`extension/executor/chain.rs:403`, and
+///    `extension/tool/text.rs:38` already shows a `task:"Analyze {task}"` chain step in the tool
+///    description). The sentence is therefore equally true with no group disabled, so saying it
+///    only in the reduced schema would make the advertised text vary on something that does not
+///    vary. `task`'s description is left alone in both forms.
+/// 4. **Emit `tasks` and `chain` when `workflow-scripts` is disabled** — NO-OP here, deliberately,
+///    and this is SUBA-151's decision of record. pi `0538e14d` (#2588, v0.74.0) left pi with no
+///    top-level `chain`/`tasks` at all, and `createSubagentParamsSchema` re-adds a MINIMAL pair
+///    (`StructuredWorkflowProperties`, `:287-299`: `{agent, task}` items, nothing else —
+///    upstream's own comment at `:285-286` is *"Kept small because every field is sent on every
+///    request"*) as the script-free way to compose work. This port kept the native graph instead
+///    (option (b); pinned by
+///    `chain_and_tasks_still_dispatch_to_the_native_graph_rather_than_a_removal_refusal`), so
+///    `chain`/`tasks` are already in the default schema at `:575`/`:582` with item schemas that
+///    are strict SUPERSETS of upstream's pair — cyrup's `tasks[]` item carries `agent`/`task` plus
+///    `cwd`/`machine`/`count`/`output`/`outputMode`/`reads`/`progress`/`model`/`fast`/`skill`/
+///    `acceptance`, and its `chain[]` item carries upstream's `agent`/`task`/`as`/`parallel` plus
+///    `phase`/`label`/`outputSchema`/`expand`/`collect`/`concurrency`/`failFast`/`worktree`.
+///    Re-emitting the minimal pair here would therefore REMOVE advertised capability the
+///    dispatcher still accepts, in the one session shape where the model most needs chain/tasks.
+///    `the_reduced_schema_keeps_the_native_chain_and_tasks_rather_than_pis_minimal_pair` pins
+///    that the two entries come through the reduction unchanged.
+///
+/// # The guard is `params`, not `features`
+///
+/// Upstream returns the full schema when `disabled.params.size === 0` (`:302`), not when
+/// `features.size === 0`. The two agree today — every group and the schedule surface owns at least
+/// one param ([`crate::disabled_features::disabled_feature_notice`] relies on the same fact) — and
+/// upstream's condition is the one ported, so a future params-less group would fall through to the
+/// full schema here exactly as it would there.
+#[must_use]
+pub(crate) fn subagent_tool_parameters_for(surface: &DisabledFeatureSurface) -> serde_json::Value {
+    let mut schema = subagent_tool_parameters();
+    // pi `if (!disabled || disabled.params.size === 0) return SubagentParams;` (`:302`).
+    if surface.params().is_empty() {
+        return schema;
+    }
+    let structured = surface.contains(SubagentSurfaceFeature::Feature(
+        SubagentFeature::WorkflowScripts,
+    ));
+    let Some(props) = schema
+        .get_mut("properties")
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        // Unreachable for the literal above, and an early return rather than a panic because this
+        // crate's lints forbid one: a reduction that cannot find the property map must hand back
+        // the full schema it was given, never a half-reduced one.
+        return schema;
+    };
+    for (param, _) in surface.params().iter() {
+        // `shift_remove`, NOT `remove`: with `serde_json/preserve_order` (declared workspace-wide,
+        // `Cargo.toml:253`) a `serde_json::Map` is an `IndexMap` and `Map::remove` is
+        // `swap_remove`, which would drag the LAST property into the hole. Every property in
+        // [`subagent_tool_parameters`] is placed at pi's own position on purpose, and the removal
+        // of one must not reorder the rest.
+        props.shift_remove(param);
+    }
+    // pi `if (structured && name === "action") return [[name, StructuredWorkflowProperties.action]]`
+    // (`:306`), narrowed to the description half per delta 2 above. `Map::insert` on an existing
+    // key keeps that key's position under `preserve_order`, so `action` stays where pi puts it.
+    if structured
+        && let Some(action) = props
+            .get_mut("action")
+            .and_then(serde_json::Value::as_object_mut)
+    {
+        action.insert(
+            "description".to_string(),
+            serde_json::Value::String(ACTION_DESCRIPTION_BASE.to_string()),
+        );
+    }
+    schema
 }
 
 #[cfg(test)]
@@ -2040,5 +2244,435 @@ mod tests {
             "{:?}",
             parsed.provided_keys()
         );
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // SUBA-151 — `createSubagentParamsSchema`'s reduction (`extension/schemas.ts:301-312` @v0.75.0)
+    // ---------------------------------------------------------------------------------------------
+
+    use crate::disabled_features::{
+        SUBAGENT_FEATURES, SubagentFeature, SubagentSurfaceFeature,
+        resolve_disabled_feature_surface,
+    };
+
+    /// The canonical bytes a built schema advertises. `serde_json::to_vec` is deterministic here
+    /// because the workspace declares `serde_json/preserve_order` (`Cargo.toml:253`), so the
+    /// property order in the bytes is the insertion order [`subagent_tool_parameters`] builds.
+    fn schema_bytes(schema: &serde_json::Value) -> Vec<u8> {
+        serde_json::to_vec(schema).expect("a built schema must serialize")
+    }
+
+    /// The same canonical bytes as [`schema_bytes`], as text — so an assertion failure prints the
+    /// JSON a reviewer has to read rather than a byte array.
+    fn schema_text(schema: &serde_json::Value) -> String {
+        serde_json::to_string(schema).expect("a built schema must serialize")
+    }
+
+    fn schema_digest(schema: &serde_json::Value) -> String {
+        use sha2::Digest;
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(schema_bytes(schema));
+        hasher
+            .finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    }
+
+    fn property_names(schema: &serde_json::Value) -> Vec<String> {
+        schema["properties"]
+            .as_object()
+            .expect("the tool schema must expose an object of properties")
+            .keys()
+            .cloned()
+            .collect()
+    }
+
+    /// The DEFAULT advertised schema's measured bytes.
+    ///
+    /// # SUBA-152 RE-BASELINED THIS ON PURPOSE
+    ///
+    /// Before: `beaab01c62a7139e965803c0b7ec617b1ca6249eb18692c8395021e41bd09798` — the value
+    /// SUBA-151 measured on `59186c60`, when this test's job was to prove the reduction changed the
+    /// default schema for NOBODY.
+    ///
+    /// After: `b0e48cee326485971c71662ff9c01192ebc54036ea2fc5715e66fc1784cc402f`.
+    ///
+    /// Three narrowings moved it, and they move it for EVERY session, disabled features or not.
+    /// That is the whole reason they were held back out of SUBA-151 and landed deliberately here:
+    ///
+    /// * `minItems: 1` on `tasks` (`props.insert("tasks", …)`),
+    /// * `minItems: 1` on `chain` (`props.insert("chain", …)`),
+    /// * `minLength: 1` on `agent` inside [`sj_task_item`].
+    ///
+    /// Each one removes a value the schema called legal and the DISPATCHER refuses — `{"tasks":
+    /// []}` and `{"chain": []}` fall through to "Provide exactly one mode. Agents: …", and
+    /// `{"tasks": [{"agent": "", …}]}` dies on `agent not found: ` — so the advertised surface got
+    /// strictly more honest, which is the same trade [`sj_usage_budget_override`]'s
+    /// `minProperties: 1` made. No property was added or removed; only three constraints were
+    /// added, so nothing a conforming caller could previously send has become unsendable.
+    ///
+    /// The digest was recomputed the way it is checked — `schema_digest(&subagent_tool_parameters())`,
+    /// read off this test's own `assert_eq!` failure — not adjusted to make a red test green.
+    /// A fourth narrowing was considered and REJECTED with evidence rather than ported:
+    /// `additionalProperties: false` on [`sj_task_item`], whose doc records why it would advertise
+    /// the inverse defect. Had it been ported silently, this digest would have moved for that too.
+    ///
+    /// # The test was renamed with the re-baseline
+    ///
+    /// It was `the_default_schema_is_byte_identical_to_the_pre_reduction_baseline`. It no longer is
+    /// byte-identical to that baseline, on purpose, so the name had to stop saying so — a suite
+    /// line asserting a claim its own constant contradicts is the same failure mode as a silently
+    /// re-pinned digest, one level up.
+    ///
+    /// # What the test still pins
+    ///
+    /// The contract is unchanged, only its baseline: a session that disabled nothing must receive
+    /// the bytes this constant names, and [`subagent_tool_parameters_for`] with an EMPTY surface
+    /// must return those same bytes — pi's `if (!disabled || disabled.params.size === 0) return
+    /// SubagentParams;` (`extension/schemas.ts:302`) is identity, not a rebuild that happens to
+    /// look similar.
+    ///
+    /// A digest rather than a prose comparison because the schema is ~30 properties of nested
+    /// JSON: an eyeballed diff is exactly how the `action` description could have gained or lost a
+    /// space without anything failing. If this digest changes again, the advertised tool surface
+    /// changed for EVERY session, and that is a decision to make deliberately — re-measure it and
+    /// say here what moved it and why, as this block does. **A silently re-pinned digest is worse
+    /// than no pin at all**: it converts the one automatic signal that the whole fleet's tool
+    /// surface shifted into a line of noise in a diff.
+    const DEFAULT_SCHEMA_DIGEST_AT_SUBA_152: &str =
+        "b0e48cee326485971c71662ff9c01192ebc54036ea2fc5715e66fc1784cc402f";
+
+    /// MUTATION: drop the trailing `.` from [`ACTION_VALIDATE_CLAUSE`] — the digest reads
+    /// `62dc0d2e…` against the digest pinned at the time (`beaab01c…`). Observed RED.
+    /// MUTATION (SUBA-152), each observed RED against the pinned `b0e48cee…`: drop `"minItems": 1`
+    /// from `tasks` and the digest reads `d409cb2d…`; from `chain`, `eeec92f2…`; drop
+    /// `"minLength": 1` from [`sj_task_item`]'s `agent` and it reads `027b9076…`. Three distinct
+    /// digests, so this pin discriminates between the three narrowings rather than merely noticing
+    /// that something moved.
+    #[test]
+    fn the_default_schema_matches_its_deliberately_rebaselined_digest() {
+        let full = subagent_tool_parameters();
+        assert_eq!(
+            schema_digest(&full),
+            DEFAULT_SCHEMA_DIGEST_AT_SUBA_152,
+            "the no-disabled-features schema moved; re-measure it and record WHY on \
+             DEFAULT_SCHEMA_DIGEST_AT_SUBA_152, never silently re-pin it"
+        );
+
+        // Both of pi's two "return the full schema" doors: no surface at all, and a surface that
+        // disabled nothing. `scheduledRuns.enabled: true` is passed so the synthetic `schedules`
+        // group is not folded in either.
+        let nothing_disabled = resolve_disabled_feature_surface(&[], true);
+        assert!(nothing_disabled.params().is_empty());
+        assert_eq!(
+            schema_bytes(&subagent_tool_parameters_for(&nothing_disabled)),
+            schema_bytes(&full),
+            "an empty surface must return the full schema unchanged"
+        );
+    }
+
+    /// SUBA-152 — the three narrowings that moved
+    /// [`DEFAULT_SCHEMA_DIGEST_AT_SUBA_152`], each named, so the digest is not the only thing
+    /// holding them.
+    ///
+    /// The digest pins "the default schema is exactly these bytes" and nothing about INTENT: it
+    /// would go equally red if one of these constraints were deleted and equally green if someone
+    /// re-pinned it. These assertions say which constraints this change added and why they are
+    /// legitimate, naming for each one the dispatcher refusal it now advertises. The matching
+    /// dispatcher behaviour is asserted end-to-end in
+    /// `subagent_tool_rejects_empty_tasks_and_chain_arrays_as_no_mode_selected`
+    /// (`routing_tests.rs`) and
+    /// `an_empty_agent_name_in_a_tasks_item_is_refused_by_the_dispatcher`.
+    ///
+    /// The fourth candidate, `additionalProperties: false` on the `tasks[]` item, is asserted
+    /// ABSENT here with the reason, so a future reader who notices the asymmetry with the
+    /// `chain[]` item finds the measurement instead of repeating it — see [`sj_task_item`]'s doc.
+    ///
+    /// MUTATION: drop `"minItems": 1` from `tasks` — this test names the entry and
+    /// [`the_default_schema_matches_its_deliberately_rebaselined_digest`] reads a different digest.
+    /// Observed RED.
+    #[test]
+    fn the_narrowings_advertise_exactly_what_the_dispatcher_refuses() {
+        let schema = subagent_tool_parameters();
+        let props = &schema["properties"];
+
+        // `{"tasks": []}` / `{"chain": []}` select no mode and are refused.
+        assert_eq!(
+            props["tasks"]["minItems"],
+            serde_json::json!(1),
+            "an empty tasks[] is refused by dispatch, so it must not be advertised as legal"
+        );
+        assert_eq!(
+            props["chain"]["minItems"],
+            serde_json::json!(1),
+            "an empty chain[] is refused by dispatch, so it must not be advertised as legal"
+        );
+
+        // `{"tasks": [{"agent": "", …}]}` dies on `agent not found: `.
+        assert_eq!(
+            props["tasks"]["items"]["properties"]["agent"]["minLength"],
+            serde_json::json!(1),
+            "an empty agent name is refused by dispatch"
+        );
+
+        // NOT ported: the item declares 13 properties and `ToolTaskItem` parses 18, two of which
+        // (`as`, `outputSchema`) reach the child. `additionalProperties: false` would advertise
+        // those two as illegal — the schema refusing what dispatch admits.
+        assert!(
+            props["tasks"]["items"]
+                .get("additionalProperties")
+                .is_none(),
+            "the tasks[] item must not claim a closed property set it does not declare in full"
+        );
+        for honoured in ["as", "outputSchema"] {
+            assert!(
+                props["tasks"]["items"]["properties"]
+                    .get(honoured)
+                    .is_none(),
+                "if `{honoured}` is ever advertised on the tasks[] item, revisit \
+                 additionalProperties: false — this assertion is the only thing recording that the \
+                 constraint was blocked on it"
+            );
+        }
+    }
+
+    /// SUBA-151 — the exact set of group parameters this port can drop, measured rather than
+    /// asserted in prose.
+    ///
+    /// The reduction can only remove a property the schema actually advertises, so "what does
+    /// disabling a group do here" is answered by intersecting each group's `params` with
+    /// [`subagent_tool_parameters`]'s keys. This test pins BOTH sides of that intersection:
+    ///
+    /// * every group param this port advertises (so a future rename of a schema property silently
+    ///   un-gating a group fails here), and
+    /// * every group param it does NOT advertise — five names, each a group member with no cyrup
+    ///   surface, for which disabling the group is a no-op by design (see
+    ///   [`crate::disabled_features`]'s own module doc on why that is the correct outcome and not
+    ///   a defect to "fix" by inventing a parameter).
+    ///
+    /// It corrects a stale claim in that module's doc, which listed `args`, `missionStatus`,
+    /// `missionId`, `runMode`, `runStatus`, `summary`, `laneId`, `supersession` and `planId` as
+    /// unadvertised. All nine ARE advertised — `args` at [`subagent_tool_parameters`]'s
+    /// `props.insert("args", …)` and the other eight alongside the mission/lane surfaces — so
+    /// `workflow-scripts` drops TWO of its five params here (`workflow`, `args`), not one.
+    /// MUTATION: delete `props.insert("args", …)` from [`subagent_tool_parameters`] — the absent
+    /// list grows to six and names `args` first, which is the measurement that corrected the
+    /// stale doc. Observed RED.
+    #[test]
+    fn exactly_five_group_params_have_no_advertised_surface_to_drop() {
+        let advertised = property_names(&subagent_tool_parameters());
+        let mut absent: Vec<&str> = Vec::new();
+        let mut present: Vec<&str> = Vec::new();
+        for entry in SUBAGENT_FEATURES {
+            for param in entry.params {
+                if advertised.iter().any(|name| name == param) {
+                    present.push(param);
+                } else {
+                    absent.push(param);
+                }
+            }
+        }
+        absent.sort_unstable();
+        absent.dedup();
+        present.sort_unstable();
+        present.dedup();
+
+        assert_eq!(
+            absent,
+            [
+                "extensionBindings",
+                "gate",
+                "globalConcurrencyLimit",
+                "maxSubagentSpawnsPerRun",
+                "preflight",
+            ],
+            "the group params with no cyrup surface changed"
+        );
+        assert_eq!(
+            present,
+            [
+                "additional",
+                "args",
+                "config",
+                "control",
+                "focus",
+                "handoffPath",
+                "lane",
+                "laneId",
+                "machine",
+                "merge",
+                "mission",
+                "missionId",
+                "missionScope",
+                "missionStatus",
+                "missionUpdate",
+                "planId",
+                "repo",
+                "runMode",
+                "runStatus",
+                "scope",
+                "summary",
+                "supersession",
+                "target",
+                "thinking",
+                "toolBudget",
+                "usageBudget",
+                "workflow",
+            ],
+            "the group params the reduction can actually drop changed"
+        );
+    }
+
+    /// SUBA-151 — pi `if (disabled.params.has(name)) return [];` (`:305`): disabling a group takes
+    /// that group's advertised params OUT, takes nothing else out, and reorders nothing.
+    ///
+    /// Driven over all 15 groups rather than a sample, so a group whose params stop matching the
+    /// schema fails here instead of quietly advertising a disabled feature. The order assertion is
+    /// what pins `shift_remove` over `serde_json::Map::remove`: under `preserve_order` the latter
+    /// is `swap_remove` and would drag the final property (`args`) into each hole, which no
+    /// property-SET assertion can see.
+    /// MUTATION 1: replace the loop body with `let _ = param;` — `agent-management` leaves
+    /// `config` advertised. Observed RED.
+    ///
+    /// MUTATION 2: `props.shift_remove(param)` -> `props.remove(param)` — the property SET is
+    /// right and the ORDER is not: `args`, the last property, lands in `config`'s hole. Observed
+    /// RED, and the reason this test compares ordered `Vec`s rather than sets.
+    #[test]
+    fn disabling_a_group_removes_exactly_that_groups_advertised_params() {
+        let default_order = property_names(&subagent_tool_parameters());
+        for entry in SUBAGENT_FEATURES {
+            let surface = resolve_disabled_feature_surface(&[entry.feature], true);
+            let reduced = property_names(&subagent_tool_parameters_for(&surface));
+
+            // The group's OWN params are the ones resolution attributes to it, which for
+            // `preflight`/`workflow-scripts` is not the same as the group's member list — the
+            // shared `preflight` param is attributed once. The surface is therefore the authority.
+            let disabled: Vec<&str> = surface.params().iter().map(|(name, _)| name).collect();
+            let expected: Vec<String> = default_order
+                .iter()
+                .filter(|name| !disabled.iter().any(|param| param == name))
+                .cloned()
+                .collect();
+            assert_eq!(
+                reduced,
+                expected,
+                "disabling {} must drop exactly its advertised params, in place",
+                entry.feature.as_str()
+            );
+            for param in entry.params {
+                assert!(
+                    !reduced.iter().any(|name| name == param),
+                    "{} left {param} advertised",
+                    entry.feature.as_str()
+                );
+            }
+        }
+    }
+
+    /// SUBA-151 — pi `const structured = disabled.features.has("workflow-scripts");` (`:303`): the
+    /// `action` re-description fires for THAT group and no other.
+    ///
+    /// Both directions are asserted against the same two constants the builder composes
+    /// ([`ACTION_DESCRIPTION_BASE`], [`ACTION_VALIDATE_CLAUSE`]), so the reduced sentence cannot
+    /// drift from the full one. The control arm is `usage-budgets`: it disables a param, so the
+    /// reduction runs and the schema really is rebuilt — and `action` must come through it with
+    /// the `validate` clause intact, because `validate` is still dispatchable in that session.
+    /// MUTATION: force `let structured = true;` — the `usage-budgets` arm then reads
+    /// `"Management/control action. Omit for execution mode."` where the `validate` clause must
+    /// still be. Observed RED.
+    #[test]
+    fn only_disabling_workflow_scripts_drops_the_validate_clause_from_action() {
+        let action_description = |surface: &crate::disabled_features::DisabledFeatureSurface| {
+            subagent_tool_parameters_for(surface)["properties"]["action"]["description"]
+                .as_str()
+                .expect("action must keep a description through the reduction")
+                .to_string()
+        };
+
+        let scripts_off =
+            resolve_disabled_feature_surface(&[SubagentFeature::WorkflowScripts], true);
+        assert!(scripts_off.contains(SubagentSurfaceFeature::Feature(
+            SubagentFeature::WorkflowScripts
+        )));
+        assert_eq!(action_description(&scripts_off), ACTION_DESCRIPTION_BASE);
+        let reduced = property_names(&subagent_tool_parameters_for(&scripts_off));
+        for gone in ["workflow", "args"] {
+            assert!(
+                !reduced.iter().any(|name| name == gone),
+                "disabling workflow-scripts must stop advertising {gone}"
+            );
+        }
+
+        let budgets_off = resolve_disabled_feature_surface(&[SubagentFeature::UsageBudgets], true);
+        assert!(
+            !budgets_off.params().is_empty(),
+            "the control arm must reach the reduction"
+        );
+        assert_eq!(
+            action_description(&budgets_off),
+            format!("{ACTION_DESCRIPTION_BASE}{ACTION_VALIDATE_CLAUSE}"),
+            "a group that does not own `validate` must leave the clause in place"
+        );
+        let budget_reduced = property_names(&subagent_tool_parameters_for(&budgets_off));
+        assert!(!budget_reduced.iter().any(|name| name == "usageBudget"));
+        for kept in ["workflow", "args"] {
+            assert!(
+                budget_reduced.iter().any(|name| name == kept),
+                "disabling usage-budgets must leave {kept} advertised"
+            );
+        }
+    }
+
+    /// SUBA-151's decision of record (option (b)) at the SCHEMA boundary: the reduced schema keeps
+    /// this port's native `chain`/`tasks` and does not substitute pi's minimal
+    /// `StructuredWorkflowProperties` pair (`extension/schemas.ts:287-299` @v0.75.0).
+    ///
+    /// pi re-adds a `{agent, task}`-only pair in the reduced schema because `0538e14d` (#2588,
+    /// v0.74.0) left it with no top-level `chain`/`tasks` at all. This port kept the native graph,
+    /// so the pair is already advertised in full — and emitting pi's minimal one here would REMOVE
+    /// advertised capability the dispatcher still accepts
+    /// (`chain_and_tasks_still_dispatch_to_the_native_graph_rather_than_a_removal_refusal` pins
+    /// that it does), in the one session shape where a script-less orchestrator needs it most.
+    ///
+    /// Asserted as byte equality against the default entries plus the presence of item members pi's
+    /// pair does not have, so a later "port the pair properly" edit fails here with the reason.
+    /// MUTATION: add `props.shift_remove("tasks"); props.shift_remove("chain");` under
+    /// `structured` — `tasks` reads `"null"` against the full entry. Observed RED.
+    #[test]
+    fn the_reduced_schema_keeps_the_native_chain_and_tasks_rather_than_pis_minimal_pair() {
+        let full = subagent_tool_parameters();
+        let scripts_off =
+            resolve_disabled_feature_surface(&[SubagentFeature::WorkflowScripts], true);
+        let reduced = subagent_tool_parameters_for(&scripts_off);
+
+        for name in ["tasks", "chain"] {
+            assert_eq!(
+                schema_text(&reduced["properties"][name]),
+                schema_text(&full["properties"][name]),
+                "{name} must come through the reduction unchanged"
+            );
+        }
+
+        // pi's `StructuredTask` is `{agent, task}` with `additionalProperties: false`; this port's
+        // `tasks[]` item is a strict superset. Three members pi's pair cannot express:
+        for member in ["count", "reads", "acceptance"] {
+            assert!(
+                reduced["properties"]["tasks"]["items"]["properties"]
+                    .get(member)
+                    .is_some(),
+                "the reduced tasks[] item lost {member}, which pi's minimal pair has no slot for"
+            );
+        }
+        // pi's reduced chain step is `{agent, task?, as?, parallel?}`; this port's carries the
+        // dynamic-fanout surface too.
+        for member in ["expand", "collect", "worktree"] {
+            assert!(
+                reduced["properties"]["chain"]["items"]["properties"]
+                    .get(member)
+                    .is_some(),
+                "the reduced chain[] item lost {member}"
+            );
+        }
     }
 }

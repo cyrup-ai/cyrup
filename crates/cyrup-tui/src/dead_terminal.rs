@@ -130,8 +130,35 @@ mod tests {
 
     use std::io::Read as _;
     use std::process::{Command, Stdio};
+    use std::sync::Mutex;
 
     use super::*;
+
+    /// Serialises every case that touches the process-global [`ARMED`], because losing that race is
+    /// not a failed assertion — it is a dead process.
+    ///
+    /// [`arm`] is process-global and libtest runs these cases on parallel threads, so without this
+    /// the armed window of [`any_other_write_error_is_returned_not_fatal`] can cover
+    /// [`a_disarmed_writer_returns_the_dead_terminal_error`]'s deliberate `BrokenPipe` flush. The
+    /// handler then does exactly what it is built to do — [`emergency_terminal_exit`], which is
+    /// `std::process::exit(129)` — and libtest dies mid-run: cargo reports `error: test failed` and
+    /// *"test exited abnormally"* with **no `test result` line at all**, so the run says nothing
+    /// about the other 2037 cases either. Confirmed by widening the armed window to 300 ms, which
+    /// turns it into a reliable `exit status: 129`.
+    ///
+    /// Same shape and same remedy as [`crate::panic_hook`]'s `HOOK_LOCK` and
+    /// [`crate::terminal_progress::lock_progress_armed`]. The cases below take only this lock, so it
+    /// cannot cycle with either of those.
+    static ARM_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Take [`ARM_LOCK`], ignoring poisoning: a sibling case that panicked has reported its own
+    /// failure already, and refusing the lock here would add a second, misleading one. The idiom is
+    /// `crate::panic_hook`'s `lock_hook`.
+    fn lock_armed() -> std::sync::MutexGuard<'static, ()> {
+        ARM_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 
     /// A writer that fails every call with `kind`.
     struct Failing(io::ErrorKind);
@@ -169,6 +196,7 @@ mod tests {
     /// `PermissionDenied` back to its caller and the process carries on.
     #[test]
     fn any_other_write_error_is_returned_not_fatal() {
+        let _armed = lock_armed();
         arm();
         let mut out = TerminalWriter(Failing(io::ErrorKind::PermissionDenied));
         let err = out.write_all(b"\x1b[?25h").unwrap_err();
@@ -180,6 +208,7 @@ mod tests {
     /// unregistered it — a dead terminal is an ordinary error.
     #[test]
     fn a_disarmed_writer_returns_the_dead_terminal_error() {
+        let _armed = lock_armed();
         disarm();
         let mut out = TerminalWriter(Failing(io::ErrorKind::BrokenPipe));
         assert_eq!(out.flush().unwrap_err().kind(), io::ErrorKind::BrokenPipe);

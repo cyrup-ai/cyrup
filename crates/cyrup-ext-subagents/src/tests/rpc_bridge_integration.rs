@@ -2157,3 +2157,49 @@ async fn interactive_mode_publishes_the_human_async_widget() {
         "the live run's agent is shown: {text}"
     );
 }
+
+/// SUBA-152 — the RPC path is gated by the SAME check as the model-facing tool, because it is the
+/// same seam.
+///
+/// Upstream needs two call sites for this: `disabledFeatureUseError` at
+/// `runs/foreground/subagent-executor.ts:5288` (through `executePublic`/`executeDelegated`, `:7921`
+/// and `:7971`) and a second, narrower one at `extension/rpc.ts:535`, because its bridge builds
+/// params and hands them to a different entry point. cyrup's bridge dispatches through the very
+/// `SubagentTool` instance `init` registered (`extension/rpc/mod.rs:584`), so the single gate in
+/// that tool's prologue covers both — and this test is what makes that structural claim an asserted
+/// one rather than a comment. A second copy of the check inside `spawn_params` would be a way for
+/// the two paths to drift apart, not insurance against it.
+///
+/// It also pins the strictly WIDER coverage that follows from the shared seam. Upstream's RPC call
+/// site is guarded by `options.disabledFeatures?.features.has("workflow-scripts")`, so an RPC
+/// `spawn` carrying a `usageBudget` is NOT gated upstream at `rpc.ts:535` — it reaches the executor
+/// and is caught there by the `:7921` gate instead. Here one gate answers for every group, so the
+/// refusal arrives at the same place for both paths and with the same sentence.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rpc_spawn_is_refused_by_the_same_disabled_feature_gate_as_the_tool() {
+    let harness = Harness::start_with(RegistrationMode::Full, |config| {
+        config.disabled_features = Some(vec![
+            crate::disabled_features::SubagentFeature::UsageBudgets,
+        ]);
+    })
+    .await;
+
+    let reply = harness
+        .round_trip(
+            "pb8-152",
+            "spawn",
+            Some(json!({ "agent": "x", "task": "do it", "usageBudget": { "totalTokens": 10 } })),
+        )
+        .await;
+    // `execution_failed`, not `invalid_params`: the refusal comes from the TOOL, mapped by
+    // `execute_checked`'s error arm, which is the observable proof that it is the tool's gate and
+    // not a bridge-local check.
+    assert_eq!(error_code(&reply), "execution_failed");
+    assert_eq!(
+        reply["error"]["message"],
+        json!(
+            r#"subagent option 'usageBudget' is disabled by config disabledFeatures "usage-budgets"."#
+        ),
+        "pi's sentence with pi's default `subagent` label — the tool's own gate, reached over RPC"
+    );
+}

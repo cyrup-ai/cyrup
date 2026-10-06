@@ -417,6 +417,73 @@ mod tests {
         );
     }
 
+    /// SUBA-152 — `disabledFeatures` reaching this loader, both ways round.
+    ///
+    /// A VALID list loads silently: the key is genuine config now, so the
+    /// `unknown key 'disabledFeatures' (ignored)` line this loader used to print on every such
+    /// file is gone, and the rest of the file is honored alongside it.
+    ///
+    /// An INVALID one REFUSES the whole file rather than warning, because `disabledFeatures` is
+    /// one of [`cyrup_ext_subagents::registration::FAIL_CLOSED_CONFIG_KEYS`] — it was listed there
+    /// deliberately ahead of the port, and now that `validate_raw_config` actually checks the key
+    /// that listing has teeth: an operator who trimmed the tool must not silently get the FULL
+    /// tool back because they typo'd the value. Upstream rethrows the same file
+    /// (`extension/config.ts:226-240` @v0.75.0).
+    ///
+    /// Mutation killed: dropping `validate_disabled_features` from `validate_raw_config` (the bad
+    /// file then loads with the operator's trim silently discarded); renaming the config field
+    /// (the valid file warns again).
+    #[test]
+    fn a_disabled_features_list_loads_silently_and_a_bad_one_refuses_the_file() {
+        let write = |body: &str| {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let subagents_dir = dir.path().join("subagents");
+            std::fs::create_dir_all(&subagents_dir).expect("mkdir");
+            std::fs::write(subagents_dir.join("config.json"), body).expect("write");
+            dir
+        };
+
+        let dir = write(r#"{"maxSubagentDepth": 5, "disabledFeatures": ["panes", "watchdog"]}"#);
+        let raw: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(dir.path().join("subagents").join("config.json")).expect("read"),
+        )
+        .expect("valid JSON");
+        assert!(
+            SubagentExtensionConfig::config_warnings(&raw).is_empty(),
+            "a ported key must not warn: {:?}",
+            SubagentExtensionConfig::config_warnings(&raw)
+        );
+        let cfg = load_subagent_extension_config(&dirs_at(dir.path())).expect("a valid file");
+        assert_eq!(
+            cfg.max_subagent_depth, 5,
+            "the rest of the file still loads"
+        );
+        assert_eq!(
+            cfg.disabled_features.as_deref(),
+            Some(
+                &[
+                    cyrup_ext_subagents::disabled_features::SubagentFeature::Panes,
+                    cyrup_ext_subagents::disabled_features::SubagentFeature::Watchdog,
+                ][..]
+            )
+        );
+
+        // A name that is not one of the fifteen, beside an unrelated setting.
+        let dir = write(r#"{"maxSubagentDepth": 5, "disabledFeatures": ["panez"]}"#);
+        let refused = load_subagent_extension_config(&dirs_at(dir.path()))
+            .expect_err("a declared disabledFeatures must not be replaced by the defaults");
+        assert_eq!(refused.keys(), ["disabledFeatures"]);
+        let shown = refused.to_string();
+        assert!(
+            shown.contains(r#"config.disabledFeatures entry "panez" is not one of: "#),
+            "carries upstream's own sentence, naming the bad entry: {shown}"
+        );
+        assert!(
+            shown.contains("agent-management, watchdog, panes"),
+            "and the full feature list: {shown}"
+        );
+    }
+
     /// SUBA-166 — the exact failure pi's `9f1c2552` (#2624) changelog names: an invalid value for
     /// ANY key used to silently drop `authorityPolicy`, `permissions` and `toolBudget`. A typo in
     /// `artifactDir` sits beside a real `authorityPolicy`, and the whole file — restriction

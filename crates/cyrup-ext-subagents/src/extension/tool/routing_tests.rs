@@ -17,6 +17,7 @@
 use super::*;
 use crate::background::control;
 use crate::extension::SubagentExecutor;
+use crate::extension::testsupport::FixedSessionHost;
 use crate::extension::testsupport::arm_scoped_missions;
 use crate::extension::testsupport::dispatch_tool;
 use crate::extension::testsupport::scoped_missions;
@@ -1965,15 +1966,109 @@ async fn workflow_mode_settles_its_controller_even_when_the_script_fails() {
 // WORKFLOW_19 — `runs.host` is a real verb, and its evidence reaches the receipt.
 // ---------------------------------------------------------------------------------------------
 
+/// SUBA-174 — a dispatch that can actually reach `runs.host`, which since this row means a
+/// workflow whose script came from a RESOLVED WORKFLOW RESOURCE.
+///
+/// `routing.rs`'s RESOURCE arm is the sole writer of the permit [`WorkflowRunHost::supports_host`]
+/// reads, so `workflow: "<resource name>"` is the only `workflow` value that links the op at all:
+/// [`workflow_script_path`] (a raw script FILE) and `workflow: true` both leave it `None` by
+/// construction, which is precisely the behaviour this row introduced. Four links have to line up
+/// for the name to resolve, and every one of them fails as a RESOLUTION refusal rather than as the
+/// authority refusal under test — so each is named here rather than rediscovered:
+///
+/// 1. the lookup is scoped by `self.executor.current_session_id()` (`routing.rs`'s
+///    `SessionId::parse_opt` argument), which reads the BOUND host services
+///    (`executor/session_state.rs`'s `current_session_id`) and is `None` on a bare
+///    [`SubagentExecutor::new`];
+/// 2. with `session_id: None` the registry consults BUILTINS ONLY (`workflows/resources.rs`'s
+///    `find_builtin(&name).map(Arc::new).or_else(|| session_id.and_then(…))`), so a
+///    session-registered resource is invisible — hence [`FixedSessionHost`], and hence the id
+///    registered under must be byte-equal to the one it reports;
+/// 3. no builtin substitutes for the fixture: `run-ci` whitelists `npm test` / `npm run typecheck`
+///    alone (`resources.rs`'s `resolve_run_ci`) where these tests need CHOSEN exit codes, and
+///    `review` declares no grant list at all (which is the `authority.host` falsy arm, covered as
+///    a unit in `executor/workflow.rs`);
+/// 4. a [`crate::workflows::WorkflowResourceRegistration`] DISPOSES ON `Drop`
+///    (`resources.rs`'s `impl Drop for WorkflowResourceRegistration`), so the handle is RETURNED
+///    and the caller holds it across the dispatch — letting it fall here would un-register the
+///    resource before the tool call that needs it, and the test would see
+///    `Unknown workflow resource '…'` instead.
+///
+/// The resolver hands back `script` BYTE-FOR-BYTE, because `drive_workflow_run` consumes the
+/// permit against the script text this arm forwarded; a resolver that reformatted it would fail
+/// the permit's digest check rather than reach the gate.
+async fn host_resource_dispatch(
+    dir: &std::path::Path,
+    session: &'static str,
+    resource: &str,
+    script: &str,
+    grants: &[(&str, &str)],
+) -> (
+    Arc<SubagentExecutor>,
+    SubagentTool,
+    crate::workflows::WorkflowResourceRegistration,
+) {
+    let executor = Arc::new(SubagentExecutor::new());
+    arm_scoped_missions(&executor, dir).await;
+    // Link 1/2: bind the session identity the resolution will be scoped by, BEFORE registering,
+    // so the two ids cannot drift apart.
+    executor.set_host_services(Arc::new(FixedSessionHost(session)));
+    let session_id = crate::identity::SessionId::parse(session).expect("a non-empty session id");
+    assert_eq!(
+        executor.current_session_id().as_deref(),
+        Some(session),
+        "the registration id and the id the dispatch scopes its lookup by must be the SAME string"
+    );
+
+    // Link 8 of the row's chain: `authorize_host` compares `grant.key == key && grant.command ==
+    // command.trim()`, so the grants are stated exactly as the script will ask for them. A
+    // near-miss here does not disable the verb — it produces the per-key refusal, which would read
+    // as a different bug.
+    let host_commands: Vec<crate::workflows::WorkflowResourceHostAuthority> = grants
+        .iter()
+        .map(
+            |(key, command)| crate::workflows::WorkflowResourceHostAuthority {
+                key: crate::workflows::WorkflowKey::parse(key).expect("a safe grant key"),
+                command: (*command).to_string(),
+            },
+        )
+        .collect();
+    let resolved_script = script.to_string();
+    let registration = executor
+        .workflow_resources()
+        .register(
+            &session_id,
+            crate::workflows::WorkflowResourceDefinition {
+                name: crate::workflows::WorkflowKey::parse(resource).expect("a safe resource name"),
+                version: 1,
+                resolve: Arc::new(move |_args| {
+                    Ok(crate::workflows::WorkflowResourceExpansion {
+                        script: resolved_script.clone(),
+                        // `Some`, never `None`: an ABSENT list is upstream's
+                        // `authority.host ? … : undefined` falsy arm and would refuse the verb
+                        // outright, which is the `review` shape rather than this one.
+                        host_commands: Some(host_commands.clone()),
+                    })
+                }),
+            },
+        )
+        .expect("the fixture resource registers");
+    let tool = SubagentTool::new(executor.clone(), dir.to_path_buf());
+    (executor, tool, registration)
+}
+
 /// End to end through the real engine, the real guest realm and the real `tokio::process` runner:
 /// a script runs one passing and one failing host command, and the receipt records BOTH, ONCE
 /// each, TERMINAL.
 ///
 /// Three distinct regressions are pinned here, and each one has a different failure signature:
 ///
-/// * `supports_host()` false ⇒ `prelude.js:574` deletes the property and the script dies with a
-///   `TypeError` on `runs.host` — never the Rust refusal string, which the deleted surface makes
-///   unreachable from the guest.
+/// * `supports_host()` false ⇒ the engine refuses the op (`scripted/engine.rs`'s
+///   `if !shared.host.supports_host()`) with the catchable `runs.host is unavailable in this host
+///   context.`, so the GATE command rejects, nothing is caught around it and the whole call fails.
+///   SUBA-174 made that outcome provenance-dependent, which is why this runs on a resolved
+///   resource: a raw script now gets exactly that refusal, and is asserted to in
+///   [`a_raw_script_file_is_refused_runs_host_at_the_dispatch`].
 /// * `on_host_step: None` ⇒ the run SUCCEEDS and `hostSteps` is simply ABSENT (it is
 ///   `skip_serializing_if = "Vec::is_empty"`, so the silent-failure shape is a missing key, not an
 ///   empty array).
@@ -1987,11 +2082,8 @@ async fn workflow_mode_settles_its_controller_even_when_the_script_fails() {
 #[tokio::test]
 async fn workflow_host_commands_land_in_the_receipt_once_each_and_terminal() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let executor = Arc::new(SubagentExecutor::new());
-    arm_scoped_missions(&executor, dir.path()).await;
-    let tool = SubagentTool::new(executor.clone(), dir.path().to_path_buf());
 
-    let script = r#"
+    const SCRIPT: &str = r#"
         const gate = await runs.host("gate", { kind: "command", command: "exit 0", timeoutMs: 30000, role: "gate" });
         let failure = null;
         try {
@@ -2002,12 +2094,20 @@ async fn workflow_host_commands_land_in_the_receipt_once_each_and_terminal() {
         return { state: gate.state, ok: gate.ok, exitCode: gate.exitCode, failure };
     "#;
 
-    let result = dispatch_tool(
-        &tool,
-        serde_json::json!({ "workflow": workflow_script_path(script)}),
+    // SUBA-174 — both keys granted, so every refusal this test could see is the one under test
+    // rather than an authority refusal: `bad` fails on its EXIT CODE, not on its authority.
+    let (_executor, tool, _resource) = host_resource_dispatch(
+        dir.path(),
+        "suba174-receipt",
+        "receipt-gates",
+        SCRIPT,
+        &[("gate", "exit 0"), ("bad", "exit 7")],
     )
-    .await
-    .expect("the host commands are caught, so the workflow itself must succeed");
+    .await;
+
+    let result = dispatch_tool(&tool, serde_json::json!({ "workflow": "receipt-gates" }))
+        .await
+        .expect("the host commands are caught, so the workflow itself must succeed");
 
     let text = tool_text(&result);
     assert!(
@@ -2070,21 +2170,29 @@ async fn workflow_host_commands_land_in_the_receipt_once_each_and_terminal() {
 #[tokio::test]
 async fn a_workflow_that_dies_on_a_host_command_still_records_the_step() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let executor = Arc::new(SubagentExecutor::new());
-    arm_scoped_missions(&executor, dir.path()).await;
-    let tool = SubagentTool::new(executor.clone(), dir.path().to_path_buf());
 
-    let script = r#"
+    const SCRIPT: &str = r#"
         await runs.host("gate", { kind: "command", command: "exit 9", timeoutMs: 30000, role: "gate" });
         return "unreachable";
     "#;
 
-    let error = dispatch_tool(
-        &tool,
-        serde_json::json!({ "workflow": workflow_script_path(script)}),
+    // SUBA-174 — `gate` IS granted, so the failure the error arm must carry evidence of is the
+    // command's own non-zero exit, not a refused authority. An authority refusal would also fail
+    // the workflow, and with a `hostSteps`-free error at that, so asserting on a bare `Err` here
+    // would be satisfied by the wrong cause entirely — the `exitCode` 9 below is what separates
+    // them.
+    let (_executor, tool, _resource) = host_resource_dispatch(
+        dir.path(),
+        "suba174-failure-arm",
+        "failing-gate",
+        SCRIPT,
+        &[("gate", "exit 9")],
     )
-    .await
-    .expect_err("an uncaught host-command rejection must fail the workflow");
+    .await;
+
+    let error = dispatch_tool(&tool, serde_json::json!({ "workflow": "failing-gate" }))
+        .await
+        .expect_err("an uncaught host-command rejection must fail the workflow");
     assert!(
         error.to_string().contains("Host command 'gate' failed"),
         "{error}"
@@ -2187,20 +2295,26 @@ async fn a_workflow_host_step_reaches_the_async_status_snapshot() {
     };
 
     let dir = tempfile::tempdir().expect("tempdir");
-    let executor = Arc::new(SubagentExecutor::new());
-    arm_scoped_missions(&executor, dir.path()).await;
-    let tool = SubagentTool::new(executor.clone(), dir.path().to_path_buf());
 
-    let script = r#"
+    const SCRIPT: &str = r#"
         const gate = await runs.host("gate", { kind: "command", command: "exit 0", timeoutMs: 30000, role: "gate" });
         return gate.state;
     "#;
-    let result = dispatch_tool(
-        &tool,
-        serde_json::json!({ "workflow": workflow_script_path(script)}),
+    // SUBA-174 — the four-hop chain below starts at a RESOLVED RESOURCE, because that is now the
+    // only provenance whose run has a `runs.host` op to produce a node with. Step 1 of the proof
+    // ("the real dispatch runs a real `runs.host` command") is therefore a resource dispatch; the
+    // remaining three hops are untouched by this row and are asserted exactly as before.
+    let (executor, tool, _resource) = host_resource_dispatch(
+        dir.path(),
+        "suba174-snapshot",
+        "snapshot-gate",
+        SCRIPT,
+        &[("gate", "exit 0")],
     )
-    .await
-    .expect("a passing host command must not fail the workflow");
+    .await;
+    let result = dispatch_tool(&tool, serde_json::json!({ "workflow": "snapshot-gate" }))
+        .await
+        .expect("a passing host command must not fail the workflow");
     let workflow_run_id = result.details.as_ref().expect("details")["workflowRunId"]
         .as_str()
         .expect("the settlement stamps the run id")
@@ -2263,6 +2377,107 @@ async fn a_workflow_host_step_reaches_the_async_status_snapshot() {
     assert!(
         host_step.ended_at.is_some(),
         "a settled monitor is terminal, so it carries an endedAt"
+    );
+}
+
+/// SUBA-174 — THE ROW'S HEADLINE BEHAVIOUR, at the DISPATCH level: a RAW script file gets no
+/// `runs.host` at all.
+///
+/// Upstream's availability decision is a NESTED conditional, and reading only its first arm is
+/// what made this row look like a false alarm:
+///
+/// ```ts
+/// const workflowHost = workflowResource
+///     ? workflowResource.authority.host ? runHostCommand : undefined
+///     : publicExecution ? undefined : runHostCommand;
+/// ```
+///
+/// (`subagent-executor.ts:5965-5967` @v0.75.0.) BOTH of this crate's `drive_workflow_run` callers
+/// are upstream `executePublic` runs — the tool call through `Tool::execute`, and the scheduled
+/// fire whose analogue `executeScheduled` delegates straight to `executePublic` (`:8011`), which
+/// adds its params to the `publicExecutions` set (`:7960`). So the SECOND arm evaluates to
+/// `undefined` for every run cyrup can produce, and a provenance-less script genuinely has no host
+/// op upstream either.
+///
+/// Why this test exists at this altitude when `executor/workflow.rs` already has two unit cases:
+/// those call [`WorkflowRunHost::host_command`] DIRECTLY, which reaches the defence-in-depth arm
+/// inside the method and never exercises `supports_host` as the engine consults it. The engine's
+/// own gate (`scripted/engine.rs`'s `if !shared.host.supports_host()` in `run_host_command`) had
+/// NO test at all, and neither did the hop that decides a `workflow: "<path>"` dispatch leaves
+/// `permit` as `None` (`routing.rs`'s two raw-script arms). This covers both, through the real
+/// tool call.
+///
+/// Two facts, because the refusal's *shape* is as much the parity claim as its text:
+///
+/// * `typeof runs.host` is still `"function"`. Upstream installs the member on the shared guest
+///   surface unconditionally (`scripted-workflow.ts:809-812`) and refuses at the op; the prelude's
+///   `if (!hostEnabled) delete surface.host` branch (`prelude.js:574`) is therefore never taken
+///   here, and a regression that took it would make this a `TypeError` instead.
+/// * the rejection is CATCHABLE and carries upstream's sentence verbatim, so a script can report
+///   it rather than dying on it.
+///
+/// **Gutting mutations this fails on:** `supports_host` returning `true` unconditionally (its
+/// pre-SUBA-174 body); writing `permit` from either raw-script arm in
+/// `lower_workflow_field`; or deleting the guest member instead of refusing the op.
+#[tokio::test]
+async fn a_raw_script_file_is_refused_runs_host_at_the_dispatch() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let executor = Arc::new(SubagentExecutor::new());
+    arm_scoped_missions(&executor, dir.path()).await;
+    let tool = SubagentTool::new(executor.clone(), dir.path().to_path_buf());
+
+    // `exit 0` — a command that would SUCCEED if it ever ran, so a pass here cannot be the
+    // command's own failure wearing the gate's clothes.
+    let script = r#"
+        const shape = typeof runs.host;
+        let refusal = null;
+        try {
+            await runs.host("gate", { kind: "command", command: "exit 0", timeoutMs: 30000, role: "gate" });
+        } catch (error) {
+            refusal = String((error && error.message) || error);
+        }
+        return { shape, refusal };
+    "#;
+
+    let result = dispatch_tool(
+        &tool,
+        serde_json::json!({ "workflow": workflow_script_path(script)}),
+    )
+    .await
+    .expect("the refusal is catchable, so the workflow itself still succeeds");
+
+    let text = tool_text(&result);
+    assert!(
+        text.contains("\"shape\": \"function\"") || text.contains("\"shape\":\"function\""),
+        "the guest member must still EXIST — a missing one is the prelude's delete branch, and a \
+         `TypeError` rather than a refusal: {text}"
+    );
+    assert!(
+        text.contains("runs.host is unavailable in this host context."),
+        "a raw script file carries no resource permit, so the engine must refuse the op with \
+         upstream's own sentence: {text}"
+    );
+
+    let details = result
+        .details
+        .as_ref()
+        .expect("the settlement folds details");
+    // WHICH LAYER refused is observable, and this is the assertion that says so — the sentence
+    // alone cannot, because `host_command`'s defence-in-depth `None` arm produces the IDENTICAL
+    // text one layer further in (deliberately: the two must not disagree about what the script is
+    // told). The discriminator is the receipt. The engine's gate fires BEFORE the op is recorded
+    // (`engine.rs`'s `run_host_command` checks `supports_host` above its `inner.hosts.insert`), so
+    // a correctly gated run emits NO node at all and the key is absent entirely — `hostSteps` is
+    // `skip_serializing_if = "Vec::is_empty"`. Reverting `supports_host` to its pre-SUBA-174 `true`
+    // leaves both assertions above green and is caught HERE, as a `state: "error"`,
+    // `reasonCode: "execution_failed"` node carrying that same sentence as its `detail`.
+    assert!(
+        details["workflowReceipt"]["receipt"]
+            .get("hostSteps")
+            .is_none(),
+        "the ENGINE's gate must refuse before the op is recorded, so the receipt carries no \
+         host-step node at all; a node here means the op was linked and only the inner arm \
+         refused: {details}"
     );
 }
 
@@ -3796,4 +4011,326 @@ async fn a_bare_async_worktree_call_is_probed_with_upstreams_own_sentences() {
         !message.contains("worktree isolation requires"),
         "a child that asked for nothing must not be probed (SUBA-147's premise); got {message}"
     );
+}
+
+// -------------------------------------------------------------------------------------------
+// SUBA-152 — the dispatch gate and the reference-doc notice. Both read the surface
+// `SubagentExtensionConfig::disabled_feature_surface` resolves; neither had a production caller
+// before this change, so every case below is driven through the REAL tool rather than through
+// `disabled_feature_use_error` directly — the point being proven is that the gate sits ahead of
+// dispatch, not that the sentence is well-formed (`disabled_features.rs`'s own tests pin that).
+// -------------------------------------------------------------------------------------------
+
+/// A tool whose executor config disables exactly `features`.
+async fn tool_with_disabled_features(
+    dir: &std::path::Path,
+    features: &[crate::disabled_features::SubagentFeature],
+) -> SubagentTool {
+    let executor = Arc::new(SubagentExecutor::new());
+    arm_scoped_missions(&executor, dir).await;
+    *executor.config_cell().lock().await = SubagentExtensionConfig {
+        disabled_features: Some(features.to_vec()),
+        ..SubagentExtensionConfig::default()
+    };
+    SubagentTool::new(executor, dir.to_path_buf())
+}
+
+/// SUBA-152 — pi `disabledFeatureUseError`'s FIRST check, the request's `action`
+/// (`shared/disabled-features.ts:101-103`), reached through `executePublic`'s opening
+/// `disabledFeatureResult(params)` (`runs/foreground/subagent-executor.ts:7921`).
+///
+/// THE USER ACTION: an operator writes `"disabledFeatures": ["watchdog"]` into `config.json`.
+/// SUBA-151 made the four `watchdog.*` verbs vanish from the advertised schema's `action` enum;
+/// until this gate landed a caller that sent one anyway was still DISPATCHED, which is the half of
+/// upstream's SAFETY note (`extension/schemas.ts:310`) cyrup did not have.
+///
+/// `watchdog.status` is the discriminator because it produces a DIFFERENT, arm-specific error when
+/// it is reached: *"Subagent watchdog runtime is unavailable."*, raised inside the verb's own
+/// handler. So the two halves below distinguish "the gate refused this before dispatch" from "the
+/// verb failed anyway" by the sentence, not by `Ok` vs `Err` — which is the stronger reading, since
+/// a gate that did nothing would leave the arm's sentence in place.
+#[tokio::test]
+async fn a_disabled_action_is_refused_before_it_dispatches() {
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    let gated = tool_with_disabled_features(
+        dir.path(),
+        &[crate::disabled_features::SubagentFeature::Watchdog],
+    )
+    .await;
+    let err = dispatch_tool(&gated, serde_json::json!({ "action": "watchdog.status" }))
+        .await
+        .expect_err("a disabled group's action must be refused at the boundary");
+    assert_eq!(
+        err.to_string(),
+        r#"subagent action 'watchdog.status' is disabled by config disabledFeatures "watchdog"."#,
+        "pi's exact sentence (`disabled-features.ts:102`), with pi's default `subagent` label"
+    );
+
+    // The same call with nothing disabled REACHES the arm, which answers with its own sentence —
+    // so the assertion above is the gate's doing and not a verb that refuses either way.
+    let ungated = scoped_tool(dir.path()).await;
+    let reached = dispatch_tool(&ungated, serde_json::json!({ "action": "watchdog.status" }))
+        .await
+        .expect_err("this box has no watchdog runtime");
+    assert_eq!(
+        reached.to_string(),
+        "Subagent watchdog runtime is unavailable.",
+        "the verb's OWN error, raised inside its handler: with nothing disabled the gate is \
+         transparent and dispatch proceeds to the arm"
+    );
+}
+
+/// SUBA-152 — pi `disabledFeatureUseError`'s SECOND check, each disabled param against the keys
+/// the request CARRIES (`shared/disabled-features.ts:104-106`).
+///
+/// THE USER ACTION: `"disabledFeatures": ["usage-budgets"]`. `usageBudget` leaves the advertised
+/// schema, and a caller that sends it anyway must now be refused rather than silently having its
+/// budget applied.
+///
+/// Two properties are pinned beyond the sentence:
+///
+/// * **presence, not truthiness** — `{"usageBudget": null}` is a USE of `usageBudget`, because
+///   upstream's test is `params[param] !== undefined` and a JSON `null` is not `undefined`. This
+///   is also why the gate has to run on the RAW request: serde folds an explicit `null` into the
+///   same `None` an absent key produces, so the typed `SubagentToolParams` cannot tell them apart.
+/// * **the gate precedes the schema-bounds checks already in the prologue** — the call below would
+///   otherwise be a well-formed SINGLE-mode launch of an unresolvable agent and would die on
+///   discovery.
+#[tokio::test]
+async fn a_disabled_param_is_refused_before_it_dispatches() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let gated = tool_with_disabled_features(
+        dir.path(),
+        &[crate::disabled_features::SubagentFeature::UsageBudgets],
+    )
+    .await;
+
+    for carried in [
+        serde_json::json!({ "totalTokens": 1000 }),
+        // A declared `null` still uses the param.
+        serde_json::Value::Null,
+    ] {
+        let err = dispatch_tool(
+            &gated,
+            serde_json::json!({ "agent": "ghost", "task": "x", "usageBudget": carried }),
+        )
+        .await
+        .expect_err("a disabled group's param must be refused at the boundary");
+        assert_eq!(
+            err.to_string(),
+            r#"subagent option 'usageBudget' is disabled by config disabledFeatures "usage-budgets"."#,
+            "pi's exact sentence (`disabled-features.ts:105`)"
+        );
+    }
+
+    // An ENABLED param on the same gated tool is untouched: the gate refuses the group's members,
+    // never the call shape.
+    let err = dispatch_tool(
+        &gated,
+        serde_json::json!({ "agent": "ghost", "task": "x", "toolBudget": { "hard": 5 } }),
+    )
+    .await
+    .expect_err("an unresolvable agent still fails discovery");
+    assert!(
+        !err.to_string().contains("is disabled by config"),
+        "an enabled param must not be gated; got: {err}"
+    );
+}
+
+/// SUBA-152 — pi `disabledFeatureUseError`'s THIRD check, the internal `workflowScript` carrier
+/// (`shared/disabled-features.ts:109-111`), whose upstream comment is *"workflowScript is the
+/// internal carrier for slash, prompt-workflow, RPC, and scheduled scripts. Callers check the
+/// original request, before the package lowers chain/tasks into its own script."*
+///
+/// This is the case that pins the gate's POSITION rather than just its existence. `workflowScript`
+/// is not a `workflow-scripts` group param — the group owns `workflow`, `args`, `preflight`,
+/// `globalConcurrencyLimit` and `maxSubagentSpawnsPerRun`, not the carrier — so only the third
+/// check can refuse it. And the carrier has a competing refusal one step further down the
+/// prologue: SUBA-150's [`crate::extension::tool::workflow_field::REMOVED_WORKFLOW_SCRIPT`], which
+/// `lower_workflow_field` produces for the same key. Whichever sentence comes back names which
+/// check ran first, so this test reads as an ordering assertion:
+///
+/// * with `workflow-scripts` disabled the operator's setting is named, as upstream's RPC path also
+///   insists (`extension/rpc.ts:535`'s comment: *"With workflow scripts disabled, name the setting
+///   before normalization can report a script-shape error instead."*);
+/// * with nothing disabled the removal message comes back unchanged, so the gate did not displace
+///   SUBA-150's refusal for every other session.
+#[tokio::test]
+async fn a_disabled_workflow_script_carrier_is_refused_before_the_removal_message() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let carrier = serde_json::json!({ "workflowScript": "export default async () => {}" });
+
+    let gated = tool_with_disabled_features(
+        dir.path(),
+        &[crate::disabled_features::SubagentFeature::WorkflowScripts],
+    )
+    .await;
+    let err = dispatch_tool(&gated, carrier.clone())
+        .await
+        .expect_err("the carrier must be refused when workflow scripts are disabled");
+    assert_eq!(
+        err.to_string(),
+        r#"subagent workflow scripts are disabled by config disabledFeatures "workflow-scripts"."#,
+        "pi's exact sentence (`disabled-features.ts:110`)"
+    );
+
+    // The group's own `workflow` param is caught one check EARLIER, by the param loop, and names
+    // the param rather than the carrier — upstream's order, and the reason the gate must see the
+    // request before `lower_workflow_field` rewrites `workflow` into `workflowScript`.
+    let err = dispatch_tool(&gated, serde_json::json!({ "workflow": "./script.js" }))
+        .await
+        .expect_err("`workflow` is a disabled param");
+    assert_eq!(
+        err.to_string(),
+        r#"subagent option 'workflow' is disabled by config disabledFeatures "workflow-scripts"."#,
+        "the param check (`:104-106`) wins over the carrier check (`:109-111`)"
+    );
+
+    // Nothing disabled: SUBA-150's removal message, untouched.
+    let ungated = scoped_tool(dir.path()).await;
+    let err = dispatch_tool(&ungated, carrier)
+        .await
+        .expect_err("the carrier is still removed for everyone else");
+    assert_eq!(
+        err.to_string(),
+        crate::extension::tool::workflow_field::REMOVED_WORKFLOW_SCRIPT,
+        "the gate must not displace SUBA-150's refusal when nothing is disabled"
+    );
+}
+
+/// SUBA-152 — pi `disabledFeatureNotice(disabledFeatures)` prepended to the `tool-reference` guide
+/// topic and that topic only (`runs/foreground/subagent-executor.ts:6883`).
+///
+/// THE USER ACTION: an operator disables two groups, and the model then calls
+/// `{action:"guide", topic:"tool-reference"}` — the one surface that lists every verb and option
+/// this build dispatches. Without the notice the page advertises the full tool to a session where
+/// a third of it is refused, and the model's own recovery path (`guide topic tool-reference`, which
+/// the tool description points it at) is the thing lying to it.
+///
+/// Three halves, because the notice's value is entirely in where it does and does not appear:
+///
+/// 1. it leads the `tool-reference` page, and names both disabled groups in the OPERATOR'S config
+///    order (`DisabledSurfaceMap`'s whole reason for being insertion-ordered);
+/// 2. it is absent from another topic's page — upstream's `=== "tool-reference"`;
+/// 3. it is absent from `tool-reference` when nothing is disabled, which is
+///    `disabled_feature_notice` returning `None` for an empty surface rather than an empty block.
+#[tokio::test]
+async fn the_disabled_feature_notice_leads_the_tool_reference_guide_topic_only() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let gated = tool_with_disabled_features(
+        dir.path(),
+        &[
+            crate::disabled_features::SubagentFeature::Gates,
+            crate::disabled_features::SubagentFeature::Watchdog,
+        ],
+    )
+    .await;
+
+    let reference = tool_text(
+        &dispatch_tool(
+            &gated,
+            serde_json::json!({ "action": "guide", "topic": "tool-reference" }),
+        )
+        .await
+        .expect("the guide action always answers"),
+    );
+    let expected = crate::disabled_features::disabled_feature_notice(
+        &crate::registration::SubagentExtensionConfig {
+            disabled_features: Some(vec![
+                crate::disabled_features::SubagentFeature::Gates,
+                crate::disabled_features::SubagentFeature::Watchdog,
+            ]),
+            ..crate::registration::SubagentExtensionConfig::default()
+        }
+        .disabled_feature_surface(),
+    )
+    .expect("two groups are disabled");
+    assert!(
+        reference.starts_with(&expected),
+        "the notice must LEAD the page, not be appended to it; got: {}",
+        &reference[..expected.len().min(reference.len())]
+    );
+    // The operator listed `gates` first, so its line comes first.
+    let gates_line = reference
+        .find(r#"- disabledFeatures "gates""#)
+        .expect("the gates line");
+    let watchdog_line = reference
+        .find(r#"- disabledFeatures "watchdog""#)
+        .expect("the watchdog line");
+    assert!(
+        gates_line < watchdog_line,
+        "the notice follows the operator's own config order"
+    );
+    // The page itself is still served in full below the notice — the notice says the reference
+    // "still lists these", so trimming the page would make its own sentence false.
+    assert!(
+        reference.contains("watchdog.status"),
+        "the full reference is still served under the notice"
+    );
+
+    // Another topic gets no notice.
+    let agents = tool_text(
+        &dispatch_tool(
+            &gated,
+            serde_json::json!({ "action": "guide", "topic": "agents" }),
+        )
+        .await
+        .expect("the guide action always answers"),
+    );
+    assert!(
+        !agents.contains("Disabled by config in this session."),
+        "only `tool-reference` carries the notice"
+    );
+
+    // Nothing disabled: no notice on `tool-reference` either.
+    let ungated = scoped_tool(dir.path()).await;
+    let plain = tool_text(
+        &dispatch_tool(
+            &ungated,
+            serde_json::json!({ "action": "guide", "topic": "tool-reference" }),
+        )
+        .await
+        .expect("the guide action always answers"),
+    );
+    assert!(
+        !plain.contains("Disabled by config in this session."),
+        "an empty surface produces no notice at all"
+    );
+    assert_eq!(
+        plain,
+        crate::registration::guide::read_subagent_guide(Some("tool-reference")),
+        "and the page is byte-identical to the packaged one"
+    );
+}
+
+/// SUBA-152 — the dispatcher refusal `sj_task_item`'s new `agent` `minLength: 1` advertises.
+///
+/// The narrowing is only legitimate if dispatch really does refuse what the schema now calls
+/// illegal, so the refusal is measured here rather than assumed. `""` is refused — `agent not
+/// found: `, a message with nothing in it for the model to read back, which is exactly the defect
+/// `minLength: 1` closes at decision time.
+///
+/// It also pins the LIMIT of the constraint: `"   "` satisfies `minLength: 1` and is refused
+/// identically. That gap is upstream's too (its structured task item is also a bare
+/// `minLength: 1`, `extension/schemas.ts:287`), and closing it would need a `pattern`; recording
+/// it here stops the next reader from reading `minLength: 1` as "a blank agent is impossible".
+#[tokio::test]
+async fn an_empty_agent_name_in_a_tasks_item_is_refused_by_the_dispatcher() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let tool = scoped_tool(dir.path()).await;
+
+    for blank in ["", "   "] {
+        let err = dispatch_tool(
+            &tool,
+            serde_json::json!({ "tasks": [{ "agent": blank, "task": "x" }] }),
+        )
+        .await
+        .expect_err("a blank agent name must not launch a child");
+        assert_eq!(
+            err.to_string(),
+            format!("agent not found: {blank}"),
+            "the dispatcher refuses it, which is what the schema now says up front"
+        );
+    }
 }

@@ -364,6 +364,20 @@ impl WorkflowResourcePermit {
         })
     }
 
+    /// Whether this permit's resource declared a `runs.host` grant list at all — upstream's
+    /// `workflowResource.authority.host ? runHostCommand : undefined`
+    /// (`subagent-executor.ts:5966`/`:6398` @v0.75.0), which is the test that decides whether the
+    /// op is LINKED for the run.
+    ///
+    /// A pure query over the same two facts [`Self::authorize_host`] reads first, and deliberately
+    /// NOT a second authorization path: an ABSENT grant list means the resource may not reach
+    /// `runs.host`, and an unconsumed permit has no authority to speak for yet. Every *per-key*
+    /// decision stays in [`Self::authorize_host`].
+    #[must_use]
+    pub fn grants_host(&self) -> bool {
+        self.state == WorkflowResourcePermitState::Consumed && self.authority.host.is_some()
+    }
+
     /// pi `authorizeWorkflowResourceHost` (`workflow-child-permit.ts:205-212`): validate one
     /// `runs.host(key, command)` call against the consumed permit's authority.
     ///

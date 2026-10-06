@@ -112,6 +112,18 @@ pub(crate) struct DriveWorkflowRun<'a> {
     pub(crate) on_update: ToolUpdateSink,
     /// The abort token `register_workflow_controller` is keyed on.
     pub(crate) cancel: CancelToken,
+    /// SUBA-174 — the CONSUMED resource permit when `workflow` named an extension-owned resource,
+    /// `None` for a raw script.
+    ///
+    /// This is the `runs.host` authority for the whole run, and it is the whole of it. The permit
+    /// is the side channel upstream implements as a `WeakMap<object, WorkflowResourcePermit>`
+    /// keyed on the params object (`subagent-executor.ts:5282`, written at `:7945`, read at
+    /// `:5314`); here it is an owned Rust value moved down the call stack, so it never enters the
+    /// JSON request a script could influence and no key has to be trusted.
+    ///
+    /// `None` for a scheduled fire: a schedule stores the resolved script TEXT, and upstream's
+    /// `executionParams(schedule)` likewise builds fresh params that no permit is keyed to.
+    pub(crate) resource: Option<crate::workflows::WorkflowResourcePermit>,
 }
 
 /// Phase 1 — mint the run, create its directory, publish `Running`.
@@ -223,6 +235,7 @@ pub(crate) async fn drive_workflow_run(
         state,
         on_update,
         cancel,
+        resource,
     } = request;
 
     // pi `const controller = new AbortController(); state.workflowControllers.set(workflowRunId,
@@ -231,16 +244,26 @@ pub(crate) async fn drive_workflow_run(
     // engine run.
     let _controller = executor.register_workflow_controller(&workflow_run_id, cancel.clone());
 
+    // SUBA-174 — the receipt's `resource` provenance is read off the permit BEFORE it moves into
+    // the host, because the host owns it for the rest of the run. Upstream publishes the same
+    // value from the same place (`liveWorkflow.resource = workflowResource.provenance`,
+    // `subagent-executor.ts:6400`).
+    let resource_provenance = resource.as_ref().map(|permit| permit.provenance().clone());
+
     let host = std::sync::Arc::new(crate::extension::executor::workflow::WorkflowRunHost::new(
-        std::sync::Arc::clone(executor),
-        cwd.to_path_buf(),
-        // Moved, not cloned — `WorkflowRunHost::new` does the `Arc<Mutex<…>>` wrap that lets
-        // each child borrow a forwarding share of this one sink.
-        on_update,
-        workflow_run_id.clone(),
-        std::sync::Arc::clone(&status),
-        run_dir.clone(),
-        async_root.clone(),
+        crate::extension::executor::workflow::NewWorkflowRunHost {
+            executor: std::sync::Arc::clone(executor),
+            cwd: cwd.to_path_buf(),
+            // Moved, not cloned — `WorkflowRunHost::new` does the `Arc<Mutex<…>>` wrap that lets
+            // each child borrow a forwarding share of this one sink.
+            on_update,
+            workflow_run_id: workflow_run_id.clone(),
+            status: std::sync::Arc::clone(&status),
+            run_dir: run_dir.clone(),
+            async_root: async_root.clone(),
+            // SUBA-174 — MOVED, exactly once: this host is the run's only authority holder.
+            resource,
+        },
     ));
 
     // Field order mirrors `RunWorkflowScriptOptions`' own declaration order, so this block can
@@ -249,7 +272,10 @@ pub(crate) async fn drive_workflow_run(
     let outcome = crate::workflows::scripted::run_workflow_script(
         crate::workflows::scripted::RunWorkflowScriptOptions {
             script: script.to_string(),
-            // No resource provenance is wired in this build.
+            // pi `oneUsePermit` (`scripted-workflow.ts:1240`) is the delegated workflow-CHILD
+            // permit (`subagent-executor.ts:6422`, `claimWorkflowChildPermit`), not resource
+            // provenance: `None` here means this build has no `executeDelegated` workflow root,
+            // and SUBA-174's resource permit travels on `DriveWorkflowRun::resource` instead.
             one_use_permit: None,
             timeout_ms,
             // The workspace's ONE abort flag — no subsystem invents its own.
@@ -471,6 +497,7 @@ pub(crate) async fn drive_workflow_run(
                 crate::workflows::WorkflowReceiptState::Complete,
                 &result.children,
                 &host_steps,
+                resource_provenance,
                 &result.trace,
                 text.clone(),
             )
@@ -561,6 +588,7 @@ pub(crate) async fn drive_workflow_run(
                 // `runs.host` settles here, and that is exactly the case the terminal host
                 // step matters most in — the partial carries no host steps of its own.
                 &host_steps,
+                resource_provenance,
                 &error.partial.trace,
                 message.clone(),
             )
@@ -618,6 +646,10 @@ async fn settle_foreground_workflow(
     receipt_state: crate::workflows::WorkflowReceiptState,
     children: &[crate::workflows::WorkflowScriptChildResult],
     host_steps: &[crate::workflows::HostStepNode],
+    // SUBA-174 — read off the permit at the launch site BEFORE it moves into the host, which owns
+    // it for the rest of the run, so it cannot be recovered here. Positioned after `host_steps` to
+    // mirror `BuildWorkflowReceipt`'s own field order, as the rest of this file does.
+    resource_provenance: Option<crate::workflows::WorkflowResourceProvenance>,
     trace: &[crate::workflows::WorkflowScriptTraceEntry],
     summary: String,
 ) -> Result<serde_json::Value, String> {
@@ -657,7 +689,9 @@ async fn settle_foreground_workflow(
             // with it the workflow) sees one terminal entry per command.
             host_steps,
             workflow_children: None,
-            resource: None, // `one_use_permit: None` in this build
+            // SUBA-174 — pi `liveWorkflow.resource` (`subagent-executor.ts:6400`): the resolution's
+            // audit provenance, `None` for a raw script.
+            resource: resource_provenance,
             terminal_outcome: None,
             created_at: None,
         })

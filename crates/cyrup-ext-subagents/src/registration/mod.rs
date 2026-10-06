@@ -363,6 +363,29 @@ pub struct SubagentExtensionConfig {
     /// [`Self::scheduled_runs_enabled`] for why that is upstream's polarity and not an oversight.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scheduled_runs: Option<ScheduledRunsConfig>,
+    /// SUBA-152 — pi `ExtensionConfig.disabledFeatures?: SubagentFeature[]`
+    /// (`shared/types.ts:2679` @v0.75.0): the feature groups an operator removes from the
+    /// parent-facing `subagent` tool.
+    ///
+    /// Typed on the closed [`crate::disabled_features::SubagentFeature`] enum rather than
+    /// `Vec<String>`, so a name that reaches this field was checked twice — once by
+    /// [`Self::validate_disabled_features`] on the raw JSON, with upstream's own sentence, and
+    /// once by serde. The raw validator runs FIRST (it is in [`Self::validate_raw_config`], which
+    /// the loader calls before the typed parse), which is why a typed field is safe here where
+    /// [`Self::checkpoint_before_deadline_ms`] had to be held raw: by the time serde sees this
+    /// array every entry is already known to be one of the 15 names.
+    ///
+    /// Sits beside [`Self::scheduled_runs`] because the two resolve ONE surface together —
+    /// [`Self::disabled_feature_surface`] folds `scheduledRuns.enabled: false` in as the
+    /// synthetic sixteenth group `schedules`, and `disabledFeatures` deliberately refuses that
+    /// name so there is exactly one way to turn schedules off.
+    ///
+    /// `disabledFeatures` is also one of [`FAIL_CLOSED_CONFIG_KEYS`] (upstream
+    /// `extension/config.ts:17`), where it was listed deliberately ahead of this port: a
+    /// `config.json` that declares it and fails validation is refused outright rather than
+    /// replaced by the built-in defaults.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disabled_features: Option<Vec<crate::disabled_features::SubagentFeature>>,
     /// SUBA-059 — pi `ExtensionConfig.artifactConfig?: Pick<ArtifactConfig, "cleanupDays">`
     /// (`shared/types.ts:1859` @v0.47.1, *"Artifact cleanup retention. Set cleanupDays to 0 to
     /// disable cleanup."*), read at `extension/index.ts:369-370` as
@@ -713,6 +736,10 @@ impl Default for SubagentExtensionConfig {
             wait_tool: None,
             missions: None,
             scheduled_runs: None,
+            // SUBA-152 — pi's own default is an absent key, i.e. nothing disabled and the full
+            // tool advertised. `Some(vec![])` would mean the same thing but would also round-trip
+            // an empty array back into a written `config.json`.
+            disabled_features: None,
             artifact_config: None,
             artifact_dir: None,
             authority_policy: None,
@@ -750,6 +777,39 @@ impl SubagentExtensionConfig {
     /// Upstream's typed refusals — see [`authority::validate_authority_policy`].
     pub fn validate_authority_policy(raw: &serde_json::Value) -> Result<(), String> {
         authority::validate_authority_policy(raw.get("authorityPolicy"), "config.authorityPolicy")
+    }
+
+    /// SUBA-152 — pi `validateDisabledFeatures(config.disabledFeatures)`
+    /// (`extension/config.ts:185` @v0.75.0), applied to the RAW config JSON beside
+    /// [`Self::validate_missions`] and for the same reason: serde's own rejection names no key and
+    /// cannot tell the four cases apart, where upstream has a distinct sentence for each.
+    ///
+    /// # Errors
+    ///
+    /// Upstream's four sentences — see
+    /// [`crate::disabled_features::validate_disabled_features`].
+    pub fn validate_disabled_features(raw: &serde_json::Value) -> Result<(), String> {
+        crate::disabled_features::validate_disabled_features(raw)
+    }
+
+    /// SUBA-152 — pi `resolveDisabledFeatureSurface(config)`
+    /// (`shared/disabled-features.ts:82`, called at `extension/index.ts:707`,
+    /// `extension/fanout-child.ts:216` and `runs/foreground/subagent-executor.ts:5286`): the
+    /// `{features, params, actions}` surface every gate and the operator notice read.
+    ///
+    /// This is the ONE production call site of
+    /// [`crate::disabled_features::resolve_disabled_feature_surface`], which takes the
+    /// scheduled-runs switch as an already-resolved `bool` precisely so the tri-state polarity
+    /// lives in exactly one place: [`Self::scheduled_runs_enabled`]. Re-deriving
+    /// `enabled == Some(false)` at the call below would reproduce the inversion that accessor's
+    /// own doc warns about, and would silently strip the nine `schedule.*` verbs from every
+    /// default config.
+    #[must_use]
+    pub fn disabled_feature_surface(&self) -> crate::disabled_features::DisabledFeatureSurface {
+        crate::disabled_features::resolve_disabled_feature_surface(
+            self.disabled_features.as_deref().unwrap_or_default(),
+            self.scheduled_runs_enabled(),
+        )
     }
 
     /// SUBA-016 — pi `scheduledRunsEnabled` (`runs/background/scheduled-runs.ts:96`):
@@ -905,6 +965,13 @@ impl SubagentExtensionConfig {
         Self::validate_artifact_dir(raw)?;
         Self::validate_missions(raw)?;
         Self::validate_authority_policy(raw)?;
+        // SUBA-152 — `validateDisabledFeatures(config.disabledFeatures)`
+        // (`extension/config.ts:185` @v0.75.0), which upstream runs AFTER `validateAuthorityPolicy`
+        // (`:182`) and BEFORE `validateArtifactConfig` (`:187`) — so a file with problems in two
+        // of the three reports the one pi would. (`validatePermissionConfig` `:183` and
+        // `validateScheduledRunsConfig` `:184` sit in between upstream and are not ported, which
+        // is why this lands directly between the two neighbours this chain does have.)
+        Self::validate_disabled_features(raw)?;
         Self::validate_artifact_config(raw)?;
         // SUBA-119 — `validateModelResponseAliases(config.modelResponseAliases)`
         // (`extension/config.ts:176`), which upstream runs AFTER `validateArtifactConfig` (`:173`),
@@ -2430,6 +2497,156 @@ mod tests {
         assert_eq!(
             resolved.parallel_max_tasks.tier,
             ConfigTier::ExtensionConfig
+        );
+    }
+
+    // ---- SUBA-152: `config.disabledFeatures` ----
+
+    /// SUBA-152 — the key is GENUINE CONFIG now, and the three lists that describe the config
+    /// surface have to agree about that.
+    ///
+    /// Before this port `config_warnings` reported `unknown key 'disabledFeatures' (ignored)` —
+    /// the generic TYPO wording, which said nothing about the key being a real upstream feature
+    /// this port lacked. The row's fix is not to reword that warning but to make it go away: the
+    /// census reads the struct's own serde field list
+    /// ([`crate::discovery::key_census::struct_fields`]), so a field named `disabled_features`
+    /// under `rename_all = "camelCase"` is enough to retire it. This asserts that end state
+    /// explicitly, because "the warning is gone" is the observable half of the port.
+    ///
+    /// Mutation killed: renaming the field (the census reports the key as unknown again, which is
+    /// the state the row was filed against); adding the key to [`UNPORTED_CONFIG_KEYS`] (the
+    /// operator is then told a key that WORKS "has no effect"); dropping
+    /// `disabledFeatures` from [`FAIL_CLOSED_CONFIG_KEYS`].
+    #[test]
+    fn a_declared_disabled_features_key_is_config_rather_than_an_unknown_key() {
+        let raw = serde_json::json!({"disabledFeatures": ["watchdog", "gates"]});
+
+        // (1) read by the typed parse, as the named enum rather than strings.
+        let parsed: SubagentExtensionConfig =
+            serde_json::from_value(raw.clone()).expect("a valid list parses");
+        assert_eq!(
+            parsed.disabled_features.as_deref(),
+            Some(
+                &[
+                    crate::disabled_features::SubagentFeature::Watchdog,
+                    crate::disabled_features::SubagentFeature::Gates,
+                ][..]
+            )
+        );
+
+        // (2) no longer censused as unknown — and not as unported either.
+        assert!(
+            SubagentExtensionConfig::config_warnings(&raw).is_empty(),
+            "a ported key must not warn: {:?}",
+            SubagentExtensionConfig::config_warnings(&raw)
+        );
+        assert!(
+            !UNPORTED_CONFIG_KEYS
+                .iter()
+                .any(|(key, _)| *key == "disabledFeatures"),
+            "a key with a reader must not be advertised as unported"
+        );
+        // The deliberate pre-port listing on the fail-closed set is still correct now the field
+        // is real: a declared policy must not be replaced by the built-in defaults.
+        assert!(FAIL_CLOSED_CONFIG_KEYS.contains(&"disabledFeatures"));
+
+        // (3) validated, with upstream's own sentence, through the aggregate the loader calls —
+        // and at upstream's own position in that chain, AFTER `authorityPolicy` and BEFORE
+        // `artifactConfig` (`extension/config.ts:182,185,187` @v0.75.0).
+        assert_eq!(SubagentExtensionConfig::validate_raw_config(&raw), Ok(()));
+        assert_eq!(
+            SubagentExtensionConfig::validate_raw_config(
+                &serde_json::json!({"disabledFeatures": "watchdog"})
+            ),
+            Err("config.disabledFeatures must be an array of feature names".to_string())
+        );
+        assert_eq!(
+            SubagentExtensionConfig::validate_raw_config(&serde_json::json!({
+                "authorityPolicy": {"stopRuns": "allow"},
+                "disabledFeatures": "watchdog",
+            }))
+            .expect_err("both are invalid"),
+            SubagentExtensionConfig::validate_authority_policy(&serde_json::json!({
+                "authorityPolicy": {"stopRuns": "allow"},
+            }))
+            .expect_err("the authority policy is invalid"),
+            "`authorityPolicy` is reported first, as upstream's order does"
+        );
+        assert_eq!(
+            SubagentExtensionConfig::validate_raw_config(&serde_json::json!({
+                "disabledFeatures": "watchdog",
+                "artifactConfig": {"cleanupDays": -1},
+            })),
+            Err("config.disabledFeatures must be an array of feature names".to_string()),
+            "`disabledFeatures` is reported before `artifactConfig`, as upstream's order does"
+        );
+
+        // An absent key is the common case: no warning, no failure, and a surface that gates
+        // nothing beyond whatever `scheduledRuns` says.
+        let quiet = serde_json::json!({});
+        assert_eq!(SubagentExtensionConfig::validate_raw_config(&quiet), Ok(()));
+        assert!(SubagentExtensionConfig::config_warnings(&quiet).is_empty());
+    }
+
+    /// SUBA-152 — [`SubagentExtensionConfig::disabled_feature_surface`] is the one production
+    /// resolver, and it reads the scheduled-runs switch through
+    /// [`SubagentExtensionConfig::scheduled_runs_enabled`] rather than re-deriving the tri-state.
+    ///
+    /// Mutation killed: inverting the polarity at the call site (`enabled == Some(false)` written
+    /// as `enabled != Some(false)`, or `Some(true)` compared instead of `Some(false)`) — the
+    /// all-defaults config then disables the nine `schedule.*` verbs, and a config that really
+    /// did set `enabled: false` stops disabling them.
+    #[test]
+    fn the_config_resolves_its_own_disabled_feature_surface_through_the_tristate_accessor() {
+        use crate::disabled_features::{SubagentFeature, SubagentSurfaceFeature};
+
+        // The all-defaults config disables NOTHING — the absent `scheduledRuns` key enables
+        // schedules, which is the polarity `scheduled_runs_enabled` exists to protect.
+        let defaults = SubagentExtensionConfig::default();
+        assert!(defaults.scheduled_runs_enabled());
+        assert!(defaults.disabled_feature_surface().is_empty());
+
+        // An explicit `enabled: true` is the same.
+        let enabled = SubagentExtensionConfig {
+            scheduled_runs: Some(ScheduledRunsConfig {
+                enabled: Some(true),
+                ..ScheduledRunsConfig::default()
+            }),
+            ..SubagentExtensionConfig::default()
+        };
+        assert!(enabled.disabled_feature_surface().is_empty());
+
+        // Only the literal `false` folds the synthetic `schedules` group in, appended after the
+        // operator's own groups.
+        let config = SubagentExtensionConfig {
+            disabled_features: Some(vec![SubagentFeature::Panes]),
+            scheduled_runs: Some(ScheduledRunsConfig {
+                enabled: Some(false),
+                ..ScheduledRunsConfig::default()
+            }),
+            ..SubagentExtensionConfig::default()
+        };
+        let surface = config.disabled_feature_surface();
+        assert_eq!(
+            surface.features(),
+            [
+                SubagentSurfaceFeature::Feature(SubagentFeature::Panes),
+                SubagentSurfaceFeature::Schedules,
+            ]
+        );
+        assert_eq!(
+            surface
+                .actions()
+                .get("inspector.open")
+                .map(|f| f.disabled_by()),
+            Some(r#"disabledFeatures "panes""#.to_string())
+        );
+        assert_eq!(
+            surface
+                .actions()
+                .get("schedule.run-due")
+                .map(|f| f.disabled_by()),
+            Some("scheduledRuns.enabled=false".to_string())
         );
     }
 

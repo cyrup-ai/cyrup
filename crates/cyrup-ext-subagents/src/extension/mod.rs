@@ -100,10 +100,13 @@ pub use tool::SubagentTool;
 pub use wait_tool::WaitTool;
 
 // The crate-internal surface. `crate::exec` reads [`TOOL_NAME`] and [`resolve_registration_mode`]
-// (both above); `crate::exec::acceptance` re-renders [`sj_acceptance_override`] and
-// `crate::registration::guide` asserts against [`subagent_actions`] — and each of those two reads
-// happens only from a `#[cfg(test)]` context in its consumer, so the re-export carries the same
-// gate rather than standing as a permanently-unused import under `-D warnings`. `WAIT_TOOL_NAME`
+// (both above); `crate::exec::acceptance` re-renders [`sj_acceptance_override`], and
+// `crate::registration::guide` and `crate::disabled_features` both assert against
+// [`subagent_actions`] — the former that the packaged tool-reference names every dispatched verb,
+// the latter (SUBA-152) that every action `config.disabledFeatures` can gate is a verb this port
+// actually dispatches. Each of those reads happens only from a `#[cfg(test)]` context in its
+// consumer, so the re-export carries the same gate rather than standing as a
+// permanently-unused import under `-D warnings`. `WAIT_TOOL_NAME`
 // needs no re-export either, but NOT because `wait_tool` is its only reader — it no longer is.
 // `watchdog::permission_arbiter`'s `INTERNAL_TOOLS` (pi `permissions.ts:8` @v0.68.0) names it
 // through its full `crate::extension::wait_tool::WAIT_TOOL_NAME` path, and that cross-module read

