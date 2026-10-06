@@ -70,10 +70,29 @@ pub use store::{
 /// `CODEMODE_TOOL_NAME` (`tool.ts:50`).
 pub const CODEMODE_TOOL_NAME: &str = "codemode";
 
+/// The script reference's file name inside the shipped docs directory (`tool.ts:133`).
+pub const CODEMODE_DOCS_FILE: &str = "codemode.md";
+
 /// Where the model finds the script reference: globals, tool results, `store()`, the `models` API
-/// and limits (`CODEMODE_DOCS_PATH`, `tool.ts:116`). Shown relative to the docs directory, as the
-/// other doc pointers of this port are (`cyrup-session-svc/src/auth_guidance.rs`).
-pub const CODEMODE_DOCS_PATH: &str = "docs/codemode.md";
+/// and limits (`CODEMODE_DOCS_PATH = join(getDocsPath(), "codemode.md")`, `tool.ts:133` @v1.0.1).
+///
+/// The ABSOLUTE path of the page shipped with the install ([`cyrup_config::docs_dir`], pi's
+/// `getDocsPath()`), so the model can `read` it from any working directory. An install whose asset
+/// directory cannot be located has no shipped docs to point at, and the path is then the page's
+/// location inside the docs directory, `docs/codemode.md`.
+#[must_use]
+pub fn codemode_docs_path() -> String {
+    docs_path_in(cyrup_config::docs_dir().as_deref())
+}
+
+/// [`codemode_docs_path`] over an explicit docs directory.
+#[must_use]
+pub fn docs_path_in(docs_dir: Option<&std::path::Path>) -> String {
+    match docs_dir {
+        Some(dir) => dir.join(CODEMODE_DOCS_FILE).to_string_lossy().into_owned(),
+        None => format!("docs/{CODEMODE_DOCS_FILE}"),
+    }
+}
 
 /// The prompt snippet and guidelines the tool contributes (`codemodeToolSystemPromptContribution`,
 /// `tool.ts:104-109`).
@@ -182,7 +201,7 @@ impl CodemodeToolOptions {
             models: true,
             mode: None,
             inline_budget: None,
-            docs_path: CODEMODE_DOCS_PATH.to_owned(),
+            docs_path: codemode_docs_path(),
         }
     }
 

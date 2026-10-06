@@ -360,3 +360,48 @@ fn models_is_declared_only_when_the_host_has_model_access() {
     )));
     assert!(declared(Some(with_models)));
 }
+
+// ------------------------------------------------------------------------------- docs pointer --
+
+/// `CODEMODE_DOCS_PATH = join(getDocsPath(), "codemode.md")` (`tool.ts:133`): the docs directory
+/// joined with the page's name, and the page's location inside the docs directory when the install
+/// has none.
+#[test]
+fn the_docs_path_is_the_shipped_docs_directory_joined_with_the_page() {
+    use std::path::Path;
+
+    assert_eq!(
+        super::docs_path_in(Some(Path::new("/opt/cyrup/docs"))),
+        "/opt/cyrup/docs/codemode.md"
+    );
+    assert_eq!(super::docs_path_in(None), "docs/codemode.md");
+    assert_eq!(
+        super::codemode_docs_path(),
+        super::docs_path_in(cyrup_config::docs_dir().as_deref())
+    );
+    assert_eq!(
+        CodemodeToolOptions::new(CodemodeHostSlot::new(), Arc::new(UnavailableSandboxFactory))
+            .docs_path,
+        super::codemode_docs_path()
+    );
+}
+
+/// The page the description and the `models` errors send the model to ships in this tree, and has
+/// the sections the errors cite.
+#[test]
+fn the_page_the_description_names_is_shipped_and_has_the_sections_the_errors_cite() {
+    let page = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/codemode.md");
+    let text = std::fs::read_to_string(&page).unwrap();
+    assert!(text.starts_with("# Codemode\n"), "{}", page.display());
+    for heading in [
+        "## Models",
+        "### Classify",
+        "### Generate images",
+        "## Limits",
+    ] {
+        assert!(
+            text.lines().any(|line| line == heading),
+            "docs/codemode.md has no `{heading}` section"
+        );
+    }
+}

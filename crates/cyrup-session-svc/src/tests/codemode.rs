@@ -1540,6 +1540,37 @@ async fn declares_models_for_the_sessions_own_codemode_tool() {
     assert!(description.contains("docs/codemode.md"));
 }
 
+/// `CODEMODE_DOCS_PATH = join(getDocsPath(), "codemode.md")` (`tool.ts:133`): the description a
+/// session sends names the page by an ABSOLUTE path, and a model that `read`s that path gets the
+/// shipped reference, from whatever directory it works in.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_description_names_a_readable_absolute_path_of_the_shipped_reference() {
+    let (rig, _observed) = models_rig(no_script()).await;
+    rig.ask("go").await;
+    let description = description(&rig.request_tools(0), "codemode");
+    let path = description
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("- `models`: classifiers and image generation. Read ")
+                .and_then(|rest| rest.strip_suffix(" first."))
+        })
+        .expect("the models line names the docs");
+    let path = std::path::Path::new(path);
+    assert!(path.is_absolute(), "{}", path.display());
+    assert_eq!(
+        path,
+        cyrup_config::docs_dir().unwrap().join("codemode.md"),
+        "the path is the shipped docs directory's page"
+    );
+    let page = std::fs::read_to_string(path).unwrap_or_else(|error| {
+        panic!(
+            "the page the description names is not readable: {}: {error}",
+            path.display()
+        )
+    });
+    assert!(page.starts_with("# Codemode\n"), "{}", path.display());
+}
+
 /// Upstream `lists models and classifies with catalog auth, ignoring script-supplied fields`: the
 /// provider an extension registered is what scripts list and call, with the catalog's endpoint and
 /// the provider's resolved credentials; a script's own `baseUrl` never reaches it.

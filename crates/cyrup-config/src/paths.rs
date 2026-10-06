@@ -181,6 +181,15 @@ pub fn asset_dir() -> Option<&'static std::path::Path> {
     ASSET_DIR.get_or_init(resolve_asset_dir).as_deref()
 }
 
+/// The shipped documentation directory, `<asset dir>/docs`. Pi `getDocsPath()` (`config.ts:436-439`
+/// @v1.0.1: `resolve(join(getPackageDir(), "docs"))`), the directory a model is told to `read`
+/// when a tool description or an error points at a shipped page.
+///
+/// `None` exactly when [`asset_dir`] is `None`.
+pub fn docs_dir() -> Option<PathBuf> {
+    asset_dir().map(|root| root.join("docs"))
+}
+
 fn resolve_asset_dir() -> Option<PathBuf> {
     if let Some(raw) = std::env::var_os("CYRUP_ASSET_DIR")
         && !raw.is_empty()
@@ -682,5 +691,15 @@ mod tests {
         let home = Path::new("/tmp/home-fixture");
         assert_eq!(normalize_path_with_home("extra", Some(home)), "extra");
         assert_eq!(normalize_path_with_home("/abs/x", Some(home)), "/abs/x");
+    }
+
+    /// Pi `getDocsPath()` is the package dir's `docs` child, and absent exactly when the package
+    /// dir is.
+    #[test]
+    fn the_docs_dir_is_the_asset_dirs_docs_child() {
+        assert_eq!(
+            super::docs_dir(),
+            super::asset_dir().map(|root| root.join("docs"))
+        );
     }
 }

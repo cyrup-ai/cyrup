@@ -18,7 +18,9 @@ use serde_json::json;
 
 use super::{DescriptionOptions, create_codemode_description, describe_script_call};
 use crate::testkit::StubTool;
-use crate::tool::CODEMODE_DOCS_PATH;
+/// An absolute docs path other than the production one, so a test fails when the path is not the one
+/// handed in.
+const CODEMODE_DOCS_PATH: &str = "/opt/cyrup/docs/codemode.md";
 
 fn tool(name: &str, description: &str) -> Arc<dyn Tool> {
     StubTool::new(name, description)

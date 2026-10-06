@@ -22,8 +22,12 @@ use serde_json::{Value, json};
 
 use super::models_globals;
 use crate::testkit::FakeModels;
+use crate::tool::CodemodeNestedCallStatus;
 use crate::tool::recorder::Recorder;
-use crate::tool::{CODEMODE_DOCS_PATH, CodemodeNestedCallStatus};
+
+/// An absolute docs path other than the production one, so a test fails when the path is not the one
+/// handed in.
+const CODEMODE_DOCS_PATH: &str = "/opt/cyrup/docs/codemode.md";
 use crate::types::{CodemodeToolContext, ToolResult};
 
 const TINY_PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg==";
@@ -601,7 +605,7 @@ async fn context_mistakes_never_reach_the_provider() {
             "{message}"
         );
         assert!(
-            message.ends_with(". See \"Classify\" in docs/codemode.md."),
+            message.ends_with(&format!(". See \"Classify\" in {CODEMODE_DOCS_PATH}.")),
             "{message}"
         );
     }
@@ -634,7 +638,9 @@ async fn context_mistakes_never_reach_the_provider() {
             "{message}"
         );
         assert!(
-            message.ends_with(". See \"Generate images\" in docs/codemode.md."),
+            message.ends_with(&format!(
+                ". See \"Generate images\" in {CODEMODE_DOCS_PATH}."
+            )),
             "{message}"
         );
     }
