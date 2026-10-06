@@ -56,7 +56,16 @@ impl RunCtx {
 
                 // Prepared messages first, then the queued ones (`[...preparedMessages,
                 // ...pendingMessages]`, agent-loop.ts:210).
-                for m in prepared.into_iter().chain(std::mem::take(&mut pending)) {
+                // The loadout may have changed since the last request, so the declarations are
+                // reconciled here too (`declareToolChanges(currentContext, [...])`,
+                // agent-loop.ts:210 @v1.0.1).
+                let injected = self.declare_tool_changes(
+                    prepared
+                        .into_iter()
+                        .chain(std::mem::take(&mut pending))
+                        .collect(),
+                );
+                for m in injected {
                     self.emit(AgentEvent::MessageStart { message: m.clone() })
                         .await?;
                     self.emit(AgentEvent::MessageEnd { message: m.clone() })

@@ -2,6 +2,7 @@
 //! phase of the loop shares: event emission, the failure path, queue polls, tool lookup.
 
 mod assistant_stream;
+mod declare;
 mod stream;
 pub(crate) mod tools;
 mod turn;
@@ -326,6 +327,18 @@ impl RunCtx {
         self.new_messages = vec![Arc::new(fm)];
     }
 
+    /// `pending` with the tool declarations the model is missing, judged against the loop's
+    /// working transcript and the CURRENT loadout (pi `declareToolChanges`, `agent-loop.ts:333`
+    /// @v1.0.1).
+    fn declare_tool_changes(&self, pending: Vec<AgentMessage>) -> Vec<AgentMessage> {
+        declare::declare_tool_changes(
+            &self.messages,
+            &self.tools.transcript_declarations(),
+            pending,
+            super::util::now_millis(),
+        )
+    }
+
     fn poll_steering(&self) -> Vec<AgentMessage> {
         lock(&self.steering).drain()
     }
@@ -363,6 +376,10 @@ impl RunCtx {
             RunEntry::Prompt {
                 messages: prompts, ..
             } => {
+                // Pi `declareToolChanges(context, prompts)` (`agent-loop.ts:100` @v1.0.1): the
+                // tool declarations the model is missing ride in with the prompt, ahead of the
+                // first request.
+                let prompts = self.declare_tool_changes(prompts);
                 self.emit(AgentEvent::TurnStart).await?;
                 for p in prompts {
                     self.emit(AgentEvent::MessageStart { message: p.clone() })

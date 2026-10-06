@@ -59,14 +59,33 @@ impl SessionManager {
         usage: Option<Usage>,
         from_hook: bool,
     ) -> Result<EntryId, SessionError> {
+        let base = self.make_base();
+        // Pi `getCurrentSystemMessage(this.buildSessionProjection().messages)`, stamped with the
+        // entry's own time (`session-manager.ts:1096-1116` @v1.0.1): the prompt and tool state the
+        // model holds at this boundary, taken BEFORE the compaction entry is on the path.
+        let replayed: Vec<Message> = self
+            .build_context_raw()
+            .into_iter()
+            .filter_map(|m| match m {
+                AgentMessage::Core(core @ Message::System(_)) => Some(core),
+                _ => None,
+            })
+            .collect();
+        let system_message = cyrup_provider::get_current_system_message(&replayed).map(|s| {
+            cyrup_core::SystemMessage {
+                timestamp: crate::context::parse_entry_ts(&base.timestamp),
+                ..s
+            }
+        });
         self.push_entry(Entry::known(KnownEntry::Compaction {
-            base: self.make_base(),
+            base,
             summary,
             first_kept_entry_id: Some(first_kept),
             tokens_before,
             details,
             usage,
             from_hook: Some(from_hook),
+            system_message,
         }))
     }
 

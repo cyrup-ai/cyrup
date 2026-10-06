@@ -321,7 +321,10 @@ async fn control_fork_actually_branches_and_switches() {
     let entries = session.entries_json().await;
     let anchor = entries
         .iter()
-        .find(|e| e.get("type").and_then(|v| v.as_str()) == Some("message"))
+        .find(|e| {
+            e.get("type").and_then(|v| v.as_str()) == Some("message")
+                && e.pointer("/message/role").and_then(|v| v.as_str()) == Some("user")
+        })
         .and_then(|e| e.get("id"))
         .and_then(|v| v.as_str())
         .expect("a message entry to fork at")

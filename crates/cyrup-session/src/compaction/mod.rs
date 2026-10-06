@@ -495,6 +495,7 @@ fn compaction_entry_of(session: &SessionManager, id: &EntryId) -> Option<Compact
             details,
             usage,
             from_hook,
+            system_message: _,
         })) => Some(CompactionEntry {
             id: base.id.clone(),
             parent_id: base.parent_id.clone(),

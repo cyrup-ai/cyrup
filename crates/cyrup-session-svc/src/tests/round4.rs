@@ -57,6 +57,15 @@ fn base_config(fx: &Fixture) -> SessionConfig {
     cfg
 }
 
+/// The conversation in a projection: everything but the system messages, which carry the loadout
+/// the loop declares (pi `declareToolChanges`, `agent-loop.ts:327-376` @v1.0.1) and are not turns.
+fn conversation(messages: &[cyrup_core::Message]) -> usize {
+    messages
+        .iter()
+        .filter(|m| !matches!(m, cyrup_core::Message::System(_)))
+        .count()
+}
+
 // ============================================================================ #24 diagnostics ====
 
 /// gap #24: the runtime `diagnostics` getter — empty on a clean build, and STILL empty when a
@@ -274,7 +283,7 @@ async fn reload_rebuilds_session_preserving_transcript_and_runs_hook() {
         let _ = s.prompt("remember me").await.unwrap();
         s.wait_for_idle().await;
         assert_eq!(
-            s.messages().await.len(),
+            conversation(&s.messages().await),
             2,
             "user + assistant persisted before reload"
         );
@@ -302,7 +311,7 @@ async fn reload_rebuilds_session_preserving_transcript_and_runs_hook() {
     // The rebuilt session re-opened the SAME persisted file, preserving the transcript.
     let reloaded = runtime.session().await;
     assert_eq!(
-        reloaded.messages().await.len(),
+        conversation(&reloaded.messages().await),
         2,
         "reload preserves the persisted transcript"
     );

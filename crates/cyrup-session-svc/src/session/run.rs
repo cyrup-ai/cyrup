@@ -233,6 +233,9 @@ impl AgentSession {
         // [`Self::run_injection`]), so that single clear point is split across both; they are the
         // same point, not two policies.
         self.set_abort_requested(false);
+        // …and the restored tools that have not registered by now are dropped (pi
+        // `_pendingToolNames.clear()`, `agent-session.ts:1782` @v1.0.1).
+        self.clear_pending_tools();
         match self.handle.get() {
             Some(this) => {
                 // Flag the loop active BEFORE returning so an immediate `wait_for_idle` waits for the
@@ -322,6 +325,9 @@ impl AgentSession {
         // [`Self::run_injection`]), so that single clear point is split across both; they are the
         // same point, not two policies.
         self.set_abort_requested(false);
+        // …and the restored tools that have not registered by now are dropped (pi
+        // `_pendingToolNames.clear()`, `agent-session.ts:1782` @v1.0.1).
+        self.clear_pending_tools();
         let Some(this) = self.handle.get() else {
             // An unbound by-value session has no post-run driver; the run is still claimed here,
             // so the acceptance report stays truthful.

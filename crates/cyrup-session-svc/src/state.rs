@@ -511,6 +511,7 @@ mod prov036_tests {
                 details: None,
                 usage: Some(usage(50, 5, 0.05)),
                 from_hook: None,
+                system_message: None,
             }),
             // As is a branch summary.
             Entry::Known(KnownEntry::BranchSummary {
@@ -597,6 +598,7 @@ mod prov036_tests {
                 details: None,
                 usage: None,
                 from_hook: None,
+                system_message: None,
             }),
             Entry::Known(KnownEntry::Message {
                 base: base("u1"),

@@ -122,7 +122,14 @@ async fn an_aborted_turn_keeps_the_previous_reading_plus_its_trailing_estimate()
     session.abort_and_settle().await;
 
     // Preconditions: the projection is [u1, a1, u2, a2(aborted)] and a1 is the only valid anchor.
-    let projected = session.raw_context_messages().await;
+    // The loadout declaration the loop records ahead of the first request is a system message and
+    // is not part of the conversation this test is about.
+    let projected: Vec<AgentMessage> = session
+        .raw_context_messages()
+        .await
+        .into_iter()
+        .filter(|m| !matches!(m, AgentMessage::Core(Message::System(_))))
+        .collect();
     let [_, AgentMessage::Core(Message::Assistant(a1)), u2, a2] = projected.as_slice() else {
         panic!("expected u1, a1, u2, aborted a2 on the branch: {projected:?}");
     };

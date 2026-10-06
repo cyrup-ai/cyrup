@@ -1872,8 +1872,34 @@ impl SessionBuilder {
         // prompt is built. It decides the system prompt's tool list (a tool whose declaration a
         // `prepare_loadout` hook hides is not listed, `agent-session.ts:1655-1658`) and is what the
         // agent starts with.
+        //
+        // A session whose caller did not choose its tools resumes with the loadout its transcript
+        // declares (pi `_restoreToolsFromTranscript`, `agent-session.ts:1762-1769` @v1.0.1, taken
+        // at construction when no `initialActiveToolNames` was given, `:497`): what a `tool_search`
+        // load, a `setActiveTools` call or an extension registration recorded survives the
+        // process. A transcript with no system message declares nothing, and the selection above
+        // stands. The names the session may not expose are dropped (`_isAllowedTool`).
+        let restored_loadout: Option<Vec<String>> = if cfg.tools.is_none() && cfg.no_tools.is_none()
+        {
+            crate::tools::declared_tool_names(&existing_raw).map(|names| {
+                names
+                    .into_iter()
+                    .filter(|name| {
+                        crate::tools::is_allowed_tool(
+                            allowed_tool_names.as_ref(),
+                            &excluded_tool_names,
+                            name,
+                        )
+                    })
+                    .collect()
+            })
+        } else {
+            None
+        };
         let initial_loadout = {
-            let names: Vec<String> = active_tools.iter().map(|t| t.name().to_string()).collect();
+            let names: Vec<String> = restored_loadout
+                .clone()
+                .unwrap_or_else(|| active_tools.iter().map(|t| t.name().to_string()).collect());
             cyrup_core::ToolLoadout::resolve(&names, &registry_tools)
         };
         let selected_tools: Vec<Arc<str>> = initial_loadout
@@ -1978,11 +2004,18 @@ impl SessionBuilder {
         // Pi has no such gap: its `nextActiveToolNames` starts from `getActiveToolNames()`, which
         // reads the live `agent.state.tools` (`core/agent-session.ts:2524-2545`), so an extension
         // tool present at build is present in the rebuild.
-        let dynamic_tools = Arc::new(std::sync::Mutex::new(crate::tools::DynamicToolState::new(
+        let mut dynamic_tool_state = crate::tools::DynamicToolState::new(
             registry_tools,
             active_tools.clone(),
             crate::tools::PromptRebuilder::new(rebuild_base, contributions),
-        )));
+        );
+        // The same names `initial_loadout` was resolved from, now with their pending half: a
+        // restored tool that registers after the build (an MCP server still connecting) becomes
+        // active when it does.
+        if let Some(names) = &restored_loadout {
+            dynamic_tool_state.restore_declared(names);
+        }
+        let dynamic_tools = Arc::new(std::sync::Mutex::new(dynamic_tool_state));
         host_services.attach_dynamic_tools(dynamic_tools.clone());
         // EXT-005: seed the guest-visible `ctx.getSystemPrompt()` / `ctx.isProjectTrusted()` reads
         // from the values this build resolved (Pi binds both straight to the session:

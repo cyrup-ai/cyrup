@@ -80,8 +80,12 @@ pub fn push_as_message(out: &mut Vec<Message>, e: &Entry) {
                 summary,
                 tokens_before,
                 base,
+                system_message,
                 ..
             } => {
+                if let Some(system) = system_message {
+                    out.push(Message::System(system.clone()));
+                }
                 out.push(compaction_summary_message(
                     summary,
                     *tokens_before,
@@ -234,8 +238,15 @@ fn push_as_raw(out: &mut Vec<AgentMessage>, e: &Entry) {
                 summary,
                 tokens_before,
                 base,
+                system_message,
                 ..
             } => {
+                // Pi `entry.systemMessage ? [entry.systemMessage, summary] : [summary]`
+                // (`session-manager.ts:462-463` @v1.0.1): the boundary's prompt and tool state
+                // precedes the summary.
+                if let Some(system) = system_message {
+                    out.push(AgentMessage::Core(Message::System(system.clone())));
+                }
                 out.push(AgentMessage::CompactionSummary(CompactionSummaryMessage {
                     summary: summary.clone(),
                     tokens_before: *tokens_before,
@@ -484,7 +495,11 @@ pub fn build_context_entries<'a>(path: &[&'a Entry]) -> Vec<&'a Entry> {
                     if &e.id() == first_kept {
                         keeping = true;
                     }
-                    if keeping {
+                    // Pi drops system messages from the kept range
+                    // (`!(entry.type === "message" && entry.message.role === "system")`,
+                    // `session-manager.ts:506` @v1.0.1): the compaction's own `systemMessage`
+                    // holds the state they built up.
+                    if keeping && !is_system_message_entry(e) {
                         out.push(e);
                     }
                 }
@@ -496,6 +511,17 @@ pub fn build_context_entries<'a>(path: &[&'a Entry]) -> Vec<&'a Entry> {
         }
         _ => path.to_vec(),
     }
+}
+
+/// Whether `e` is a `message` entry holding a system message.
+fn is_system_message_entry(e: &Entry) -> bool {
+    matches!(
+        e,
+        Entry::Known(KnownEntry::Message {
+            message: AgentMessage::Core(Message::System(_)),
+            ..
+        })
+    )
 }
 
 /// [`push_as_raw`], tagging every message it produces with the source entry's [`EntryId`].

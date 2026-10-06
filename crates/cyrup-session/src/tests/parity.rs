@@ -1237,6 +1237,7 @@ fn g5_summary_messages_carry_entry_timestamp() {
             details: None,
             usage: None,
             from_hook: None,
+            system_message: None,
         }),
     ];
     let refs: Vec<&Entry> = entries.iter().collect();

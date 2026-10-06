@@ -136,11 +136,28 @@ async fn miss1_context_override_isolated_from_observable_state() {
             .any(|t| t == "CTXOVERRIDE"),
         "the context override must NOT appear in observable agent.state.messages"
     );
-    // Natural transcript: user prompt + assistant(toolcall) + toolResult + assistant(done) = 4.
+    // Natural transcript: user prompt + assistant(toolcall) + toolResult + assistant(done) = 4
+    // conversation messages. The tool declarations the loop records are system messages and are
+    // not part of that count: one before the first request, and a second before the turn-1
+    // request, because the override replaced the loop's working transcript with one that declares
+    // nothing (pi `declareToolChanges(currentContext, …)`, `agent-loop.ts:210` @v1.0.1).
+    let conversation = snap
+        .messages
+        .iter()
+        .filter(|m| !matches!(m, AgentMessage::System(_)))
+        .count();
     assert_eq!(
-        snap.messages.len(),
-        4,
+        conversation, 4,
         "observable state holds the full natural transcript"
+    );
+    let declarations = snap
+        .messages
+        .iter()
+        .filter(|m| matches!(m, AgentMessage::System(_)))
+        .count();
+    assert_eq!(
+        declarations, 2,
+        "the tool declaration is recorded before the first request and again after the override"
     );
 }
 

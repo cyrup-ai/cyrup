@@ -335,6 +335,19 @@ impl ToolLoadout {
         &self.hidden
     }
 
+    /// The declarations the TRANSCRIPT records: every executable tool, hidden declarations
+    /// included — pi's `context.tools.map(toToolDeclaration)` in `declareToolChanges`
+    /// (`packages/agent/src/agent-loop.ts:349-352` @v1.0.1), where `context.tools` is the executable
+    /// set. A hidden declaration is recorded and then projected out of every request
+    /// (`_installHiddenDeclarationsProjection`, `agent-session.ts:1721-1738` @v1.0.1), which is what
+    /// lets the loadout survive a resume.
+    ///
+    /// Not for requests: a request declares [`Self::advertised`], and only that type yields a
+    /// request's `ToolDef`s from a loadout.
+    pub fn transcript_declarations(&self) -> Vec<ToolDef> {
+        self.executable.iter().map(declaration_of).collect()
+    }
+
     /// The hooks that failed while this loadout was resolved.
     pub fn hook_failures(&self) -> &[LoadoutHookFailure] {
         &self.failures
@@ -355,18 +368,7 @@ pub struct AdvertisedTools<'a> {
 impl AdvertisedTools<'_> {
     /// The declarations a provider request carries, in order.
     pub fn declarations(&self) -> Vec<ToolDef> {
-        self.tools
-            .iter()
-            .map(|t| ToolDef {
-                name: t.name().to_string(),
-                description: t.description().to_string(),
-                parameters: t.parameters().clone(),
-                // PROV-011: the declaration is copied off the tool verbatim (pi
-                // `wrapToolDefinition`, `tool-definition-wrapper.ts:14`), so a tool that opted in
-                // to constrained sampling still reaches the provider with it.
-                constrained_sampling: t.constrained_sampling().cloned(),
-            })
-            .collect()
+        self.tools.iter().map(|t| declaration_of(t)).collect()
     }
 
     pub fn names(&self) -> Vec<&str> {
@@ -383,6 +385,19 @@ impl AdvertisedTools<'_> {
 
     pub fn is_empty(&self) -> bool {
         self.tools.is_empty()
+    }
+}
+
+/// The declaration a tool presents to the model (pi `toToolDeclaration`,
+/// `packages/ai/src/utils/transcript.ts:129-137` @v1.0.1): name, description, schema and the
+/// PROV-011 `constrainedSampling` opt-in, copied off the tool verbatim (pi `wrapToolDefinition`,
+/// `tool-definition-wrapper.ts:14`).
+fn declaration_of(tool: &Arc<dyn Tool>) -> ToolDef {
+    ToolDef {
+        name: tool.name().to_string(),
+        description: tool.description().to_string(),
+        parameters: tool.parameters().clone(),
+        constrained_sampling: tool.constrained_sampling().cloned(),
     }
 }
 

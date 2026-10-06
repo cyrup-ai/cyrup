@@ -1105,6 +1105,7 @@ fn m1_tokens_before_byte_matches_pi_over_raw_agent_context() {
         details: None,
         usage: None,
         from_hook: None,
+        system_message: None,
     });
     // e3: EXCLUDED bash (cmd 15 + out 75 = 90 → 23) — Pi raw context still counts it.
     let e3 = Entry::known(KnownEntry::Message {
@@ -1416,6 +1417,7 @@ fn sess002_previous_compaction_summary_counts_toward_the_keep_recent_budget() {
             details: None,
             usage: None,
             from_hook: None,
+            system_message: None,
         }),
         msg_entry("e2", Some("e1"), user("recent turn")),
         msg_entry("e3", Some("e2"), assistant("recent answer")),
@@ -1906,6 +1908,7 @@ fn context_message_role_stays_in_lockstep_with_the_raw_projection() {
             details: None,
             usage: None,
             from_hook: None,
+            system_message: None,
         }),
         Entry::known(KnownEntry::ModelChange {
             base: EntryBase {
@@ -3082,6 +3085,7 @@ fn compaction_entry_with_details(
         details: Some(details),
         usage: None,
         from_hook,
+        system_message: None,
     })
 }
 
