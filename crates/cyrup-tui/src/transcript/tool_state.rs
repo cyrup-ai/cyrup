@@ -58,6 +58,8 @@ impl TranscriptView {
             duration_ms: None,
             rendered_call: rendered,
             rendered_result: None,
+            live_call: None,
+            live_result: None,
             definition,
             preview: None,
             images: Vec::new(),
@@ -84,6 +86,33 @@ impl TranscriptView {
             && partial.is_some()
         {
             run.result = partial;
+        }
+    }
+
+    /// Attach (or, with `None`, clear) the component a native tool renderer returned for one side
+    /// of the run filed under `call_id` — pi's `callRendererComponent` / `resultRendererComponent`.
+    ///
+    /// Unlike [`Self::push_tool_update`] this finds a run that has already finished, because the
+    /// final result's component is attached right after [`Self::push_tool_end_rendered`] settles the
+    /// run; it stays in `active_tools` until the leading-run commit that follows.
+    pub fn set_tool_tree(
+        &mut self,
+        call_id: &str,
+        side: ToolSide,
+        tree: Option<std::sync::Arc<dyn cyrup_ext::RenderedTree>>,
+    ) {
+        self.bump_render_generation();
+        if let Some(run) = self
+            .active_tools
+            .iter_mut()
+            .rev()
+            .find(|r| r.call_id.as_deref() == Some(call_id))
+        {
+            let slot = match side {
+                ToolSide::Call => &mut run.live_call,
+                ToolSide::Result => &mut run.live_result,
+            };
+            *slot = tree.map(LiveTree);
         }
     }
 
@@ -184,6 +213,8 @@ impl TranscriptView {
                 duration_ms: None,
                 rendered_call: None,
                 rendered_result: rendered,
+                live_call: None,
+                live_result: None,
                 // A result whose START was missed carries no registry answer; `None` keeps the
                 // pre-existing `formatToolExecution` shape for an unknown name, and a built-in name
                 // is dispatched by the built-in table regardless.

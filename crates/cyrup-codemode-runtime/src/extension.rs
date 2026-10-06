@@ -15,9 +15,15 @@ use std::sync::Arc;
 
 use cyrup_config::CodemodeMode;
 use cyrup_core::ExtensionId;
-use cyrup_ext::{ExtError, HookOutcome, HostCtx, HostEvent, InitApi, NativeExtension};
+use cyrup_ext::{
+    ExtError, HookOutcome, HostCtx, HostEvent, InitApi, NativeExtension, RenderOptions,
+    RenderedTree,
+};
 
-use crate::tool::{CodemodeHostSlot, CodemodeTool, CodemodeToolOptions, SandboxFactory};
+use crate::renderer;
+use crate::tool::{
+    CODEMODE_TOOL_NAME, CodemodeHostSlot, CodemodeTool, CodemodeToolOptions, SandboxFactory,
+};
 
 /// The id the extension loads under.
 pub const EXTENSION_ID: &str = "codemode";
@@ -78,7 +84,29 @@ impl NativeExtension for CodemodeExtension {
     /// where cyrup reads that flag.
     async fn init(&self, api: &mut InitApi) -> Result<(), ExtError> {
         api.register_tool(Arc::new(CodemodeTool::new(self.options.clone())));
+        // `...codemodeRenderers` (`tool.ts:384`): the tool draws its own call and result.
+        api.register_tool_renderer(CODEMODE_TOOL_NAME);
         Ok(())
+    }
+
+    /// `renderCall` (`renderer.ts:66-92`).
+    fn render_call_tree(
+        &self,
+        key: &str,
+        call: &serde_json::Value,
+        _opts: &RenderOptions,
+    ) -> Option<Arc<dyn RenderedTree>> {
+        (key == CODEMODE_TOOL_NAME).then(|| renderer::render_call(call))
+    }
+
+    /// `renderResult` (`renderer.ts:93-149`).
+    fn render_result_tree(
+        &self,
+        key: &str,
+        result: &serde_json::Value,
+        opts: &RenderOptions,
+    ) -> Option<Arc<dyn RenderedTree>> {
+        (key == CODEMODE_TOOL_NAME).then(|| renderer::render_result(result, opts))
     }
 
     async fn on_event(&self, _ev: &HostEvent, _ctx: &HostCtx) -> HookOutcome {

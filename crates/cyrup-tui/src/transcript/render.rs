@@ -346,7 +346,9 @@ fn render_entry(
             }
             // A bracketed extension-type label + the markdown body (`custom-message.ts`).
             // `custom-message.ts:33`'s constructor `Spacer(1)` — unconditional.
-            Rendered::None => {
+            // A tool-surface outcome never reaches a custom message or entry; if one did it has no
+            // custom-message framing to draw, so the default box stands.
+            Rendered::None | Rendered::Tree(_) => {
                 labeled_message_lines(label, "", body, true, true, theme, width, md_links)
             }
         },

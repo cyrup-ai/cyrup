@@ -2084,6 +2084,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "cyrup-agent",
+ "cyrup-codemode-runtime",
  "cyrup-config",
  "cyrup-core",
  "cyrup-ext",
