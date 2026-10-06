@@ -607,6 +607,30 @@ pub(super) fn fade(scroll: &mut ScrollState) {
     scroll.last_activity = None;
 }
 
+/// `#[cfg(test)]`: hold an `auto` bar up for the rest of the case — the mirror of [`fade`], and
+/// there for the same reason: the instant it compares against is private to this module.
+///
+/// [`recently_active`] measures the last movement against [`Instant::now`], so a case that scrolls
+/// and *then* paints is racing [`SCROLLBAR_HIDE_DELAY`]: on a loaded machine the 1000 ms can expire
+/// between those two statements, the painter correctly draws nothing, and the assertion reads as a
+/// painter bug. `auto_keeps_the_cell_background_and_always_does_not` and
+/// `a_double_width_glyph_under_the_bar_is_blanked` both failed exactly that way in the full `--lib`
+/// binary (2038 cases over 4 threads) while passing alone and passing with their own module, and an
+/// injected 1.1 s sleep reproduces the identical diff. Dating the movement in the FUTURE makes
+/// `saturating_duration_since` answer zero for the rest of the case, so what these cases assert is
+/// the painter and not the scheduler.
+///
+/// This does NOT weaken the fade itself: that it fades at all is still asserted by
+/// `a_hidden_or_faded_bar_paints_nothing`, which calls [`fade`] and holds this seam at arm's length.
+#[cfg(test)]
+pub(super) fn hold_visible(scroll: &mut ScrollState) {
+    let now = Instant::now();
+    // An hour is past any case's runtime and cannot overflow an `Instant`. The `unwrap_or` is the
+    // safe direction on a platform that disagreed: visible NOW, rather than the `None` that means
+    // faded — which is the state this exists to rule out.
+    scroll.last_activity = Some(now.checked_add(Duration::from_secs(3600)).unwrap_or(now));
+}
+
 /// The track glyph — `scrollbarTrackStyle("│")` (`layout.ts:314`).
 const TRACK_GLYPH: &str = "│";
 /// The resting thumb glyph — `scrollbarThumbStyle("┃")` (`:313`).
@@ -784,6 +808,7 @@ mod tests {
         let rect = Rect::new(3, 2, 6, 4);
         let (mut bar, mut state) = view(ScrollbarMode::Auto, 8, 4);
         scroll_by(&mut state, 2);
+        hold_visible(&mut state);
         let theme = themed();
         let rows = ["abcd界", "abcde2", "abcde3", "abcde4"];
         let buffer = paint(
@@ -932,6 +957,7 @@ mod tests {
 
         let (mut bar, mut state) = view(ScrollbarMode::Auto, 8, 4);
         scroll_by(&mut state, 1);
+        hold_visible(&mut state);
         let buffer = paint(&bar, &state, &themed(), rect, &rows, fill);
         for y in 0..4 {
             let cell = buffer.cell((5, y)).unwrap();
@@ -977,6 +1003,7 @@ mod tests {
         let (bar, mut state) = view(ScrollbarMode::Auto, 8, 4);
         scroll_to_row(&mut state, 2);
         scroll_to_top(&mut state);
+        hold_visible(&mut state);
         let rows = ["abcd界", "abcde2", "abcde3", "abcde4"];
         let buffer = paint(
             &bar,
@@ -1041,6 +1068,7 @@ mod tests {
         theme.roles.remove("scrollbarThumb");
         let (bar, mut state) = view(ScrollbarMode::Auto, 8, 4);
         scroll_by(&mut state, 2);
+        hold_visible(&mut state);
         let buffer = paint(
             &bar,
             &state,

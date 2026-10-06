@@ -1216,12 +1216,19 @@ pub(crate) async fn run_steer(
     }
 }
 
-/// `runs.host` — upstream `:2060-2110`.
-/// `runs.host(key, params)` — upstream `:2060-2110`.
+/// `runs.host(key, params)` — upstream `scripted-workflow.ts:2488-2532` @v0.75.0.
 ///
-/// Registered as an op ONLY for `workflow`-provenance runs (§0.4): a raw `workflowScript` isolate
-/// never links this, so `runs.host` is `undefined` there rather than refused. `call_id` is
-/// guest-allocated for the same reason as [`run_steer`]'s.
+/// SUBA-174. An earlier version of this doc said *"a raw `workflowScript` isolate never links
+/// this, so `runs.host` is `undefined` there rather than refused"*, and that is NOT what upstream
+/// does. Measured at the pin: the `host` member is installed on the guest `runs` surface
+/// unconditionally (`:809-812`, inside the worker bootstrap every run shares), and the gate is the
+/// HOST-side `options.host` presence checked here at the op — `if (!options.host) return
+/// respond(Promise.reject(new Error("runs.host is unavailable in this host context.")))` (`:2498`).
+/// So an ungated run that calls `runs.host` anyway gets a catchable `Error` with that sentence,
+/// never a `TypeError`/`ReferenceError`. [`install_sandbox`] installs the member unconditionally
+/// for the same reason, and the refusal below is the one observable.
+///
+/// `call_id` is guest-allocated for the same reason as [`run_steer`]'s.
 #[allow(clippy::too_many_lines)]
 pub(crate) async fn run_host_command(
     shared: &Arc<RunShared>,
@@ -2414,8 +2421,7 @@ fn run_isolate(
                 });
             }
 
-            let host_enabled = shared.host.supports_host();
-            install_sandbox(&mut runtime, state_enabled, host_enabled).map_err(guest_error)?;
+            install_sandbox(&mut runtime, state_enabled).map_err(guest_error)?;
 
             // The host compiles; the guest may not. Upstream's asymmetry (`new vm.Script` against
             // `codeGeneration: { strings: false }`, `:916`) reproduced exactly.
@@ -2496,19 +2502,26 @@ extern "C" fn deny_wasm_codegen(
 
 /// Assemble §3.3's realm: exactly the granted capabilities, `Deno` removed, dynamic code disabled.
 ///
-/// A capability the run may not use is **absent, not present-and-refused** — `state` without a
-/// mission (the schema's *"mission state when enabled"*) and `runs.host` without `workflow`
-/// provenance (§0.4: raw `workflowScript` *"cannot use runs.host"*). `undefined` is what the model
-/// can actually discover; a member that exists and throws teaches it nothing.
+/// `state` without a mission is **absent, not present-and-refused** (the schema's *"mission state
+/// when enabled"*): `undefined` is what the model can actually discover, the analyzer refuses the
+/// script for it before an isolate is spent, and upstream likewise never defines `state` on a
+/// mission-less context (`scripted-workflow.ts:915`).
+///
+/// `runs.host` is the opposite case and `hostEnabled` is therefore passed `true` always
+/// (SUBA-174). This doc used to claim `runs.host` was absent *"without `workflow` provenance"*; it
+/// is not, upstream or here. Upstream installs the `host` member on the shared guest surface
+/// unconditionally (`:809-812`) and refuses an ungated call at the op with the catchable
+/// `runs.host is unavailable in this host context.` (`:2498`). cyrup's authority gate is
+/// [`WorkflowScriptHost::supports_host`] producing exactly that refusal in [`run_host_command`],
+/// which is a behaviour a script can catch and report; deleting the member instead would turn it
+/// into a `TypeError` and a different answer from `typeof runs.host`. The prelude keeps its
+/// `if (!hostEnabled) delete surface.host` branch (`prelude.js:574`) as an unused capability —
+/// it is not this crate's to remove, and nothing here now asks for it.
 ///
 /// Ordering is deliberate: both code-generation switches are thrown BEFORE the install script runs,
 /// and the install hook deletes itself in the same script that uses it, so no agent script can ever
 /// observe a partially-built realm.
-fn install_sandbox(
-    runtime: &mut deno_core::JsRuntime,
-    state_enabled: bool,
-    host_enabled: bool,
-) -> Result<(), String> {
+fn install_sandbox(runtime: &mut deno_core::JsRuntime, state_enabled: bool) -> Result<(), String> {
     // upstream `codeGeneration: { strings: false, wasm: false }` (`:916`), exactly. The HOST may
     // still compile the script (as upstream does with `new vm.Script`); the guest may not.
     runtime
@@ -2521,7 +2534,7 @@ fn install_sandbox(
         context.set_allow_generation_from_strings(false);
     }
     let install = format!(
-        "globalThis.__cyrupWorkflowInstall({{ stateEnabled: {state_enabled}, hostEnabled: {host_enabled} }});\n\
+        "globalThis.__cyrupWorkflowInstall({{ stateEnabled: {state_enabled}, hostEnabled: true }});\n\
          delete globalThis.__cyrupWorkflowInstall;\n\
          delete globalThis.Deno;"
     );

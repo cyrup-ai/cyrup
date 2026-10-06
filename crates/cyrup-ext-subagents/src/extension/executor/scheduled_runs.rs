@@ -125,6 +125,15 @@ impl ScheduleLauncher for ExecutorScheduleLauncher {
                     // `Box<dyn FnMut(ToolUpdate) + Send + 'static>`, so this is legal and free.
                     on_update: Box::new(|_| {}),
                     cancel,
+                    // SUBA-174 — a schedule stores the RESOLVED SCRIPT TEXT, never a resource
+                    // name: `lower_workflow_field` ran at `schedule.create` and the permit it
+                    // minted died with that tool call. Upstream is the same shape — its
+                    // `executionParams(schedule)` builds fresh params no `workflowResourcePermits`
+                    // entry is keyed to (`subagent-executor.ts:5282`), and `executeScheduled`
+                    // routes through `executePublic` (`:8011`), so the raw-script arm of the
+                    // `options.host` decision resolves to `publicExecution ? undefined` (`:6399`).
+                    // A fired schedule therefore reaches no host command, upstream or here.
+                    resource: None,
                 },
             )
             .await;

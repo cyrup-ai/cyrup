@@ -29,7 +29,7 @@ use crate::extension::tool::params::{
     SubagentToolParams, normalize_public_subagent_execution, resolve_execution_agent_scope,
     validate_execution_acceptance,
 };
-use crate::extension::tool::schema::subagent_tool_parameters;
+use crate::extension::tool::schema::{subagent_tool_parameters, subagent_tool_parameters_for};
 use crate::extension::tool::task_items::count_requested_subagent_spawns;
 use crate::extension::tool::text::{
     CHILD_SAFE_SUBAGENT_TOOL_DESCRIPTION, SUBAGENT_TOOL_DESCRIPTION,
@@ -114,6 +114,30 @@ impl SubagentTool {
     #[must_use]
     pub(crate) fn with_description(mut self, description: String) -> Self {
         self.description = description;
+        self
+    }
+
+    /// SUBA-151 — narrow the advertised parameter set to what `config.disabledFeatures` leaves
+    /// enabled (pi `const parameters = createSubagentParamsSchema(disabledFeatures);`,
+    /// `extension/index.ts:717` @v0.75.0, and the same call in the fanout child at
+    /// `extension/fanout-child.ts:219`).
+    ///
+    /// A builder rather than a `new` parameter for [`Self::with_description`]'s reason, which
+    /// applies identically: resolving the surface needs the extension's LOADED config
+    /// ([`crate::registration::SubagentExtensionConfig::disabled_feature_surface`]), which only
+    /// [`cyrup_ext::NativeExtension::init`] has. Every other construction site — this crate's own
+    /// tests, [`crate::extension::SubagentsExtension::subagent_tool`] — keeps the full schema,
+    /// which is exactly what `createSubagentParamsSchema(undefined)` returns.
+    ///
+    /// Applied in BOTH registration modes, because upstream applies it in both: the fanout child
+    /// calls `createSubagentParamsSchema` itself rather than inheriting the parent's object, so a
+    /// child must not re-advertise a parameter the operator disabled for the session.
+    #[must_use]
+    pub(crate) fn with_disabled_features(
+        mut self,
+        surface: &crate::disabled_features::DisabledFeatureSurface,
+    ) -> Self {
+        self.parameters = subagent_tool_parameters_for(surface);
         self
     }
 
@@ -213,13 +237,80 @@ impl Tool for SubagentTool {
         {
             return Err(ToolError::new(refusal));
         }
+        // SUBA-152 — pi `disabledFeatureResult(params)`, the FIRST statement of `executePublic`
+        // (`runs/foreground/subagent-executor.ts:7921`, calling `disabledFeatureUseError` through
+        // the closure at `:5287-5291`; `executeDelegated` repeats it at `:7971`). This is the
+        // runtime half of the SAFETY note `extension/schemas.ts:310` leans on — *"only optional
+        // properties are dropped or added; the executor rejects disabled options and admits
+        // chain/tasks at runtime"* — and until now cyrup had only the advertisement half
+        // (SUBA-151's [`crate::extension::tool::schema::subagent_tool_parameters_for`], whose own
+        // doc named this as the remaining work). A session that disabled a group stopped
+        // ADVERTISING its params but still dispatched a caller who sent one.
+        //
+        // # Why this seam, and why only this seam
+        //
+        // `Tool::execute` is the single boundary BOTH model-facing surfaces and the RPC bridge
+        // pass through: the two registrations are one `SubagentTool` differing only in
+        // `description`/`allow_mutating_management` (see the `normalize_public_subagent_execution`
+        // note below, which sits at this same seam for the same reason), and
+        // [`crate::extension::rpc::SubagentRpcBridge`] dispatches `spawn`/`resume`/`steer` through
+        // the very `SubagentTool` instance `init` registered (`extension/rpc/mod.rs:54-58`,
+        // `:584`). Upstream needs TWO call sites — `executePublic`/`executeDelegated` at `:7921`/
+        // `:7971` plus `extension/rpc.ts:535` — because its RPC bridge builds params and hands
+        // them to a different entry point; cyrup's funnels into this one, so one call covers both
+        // paths and scattering a second copy into the RPC bridge would only add a way for the two
+        // to disagree.
+        //
+        // # Why HERE in the prologue
+        //
+        // Upstream's gate is `executePublic`'s first statement, ahead of
+        // `normalizePublicSubagentExecution`, the workflow lowering and the single-dispatch guard.
+        // Three properties of this position are load-bearing:
+        //
+        // 1. **It is the RAW request.** [`crate::disabled_features::disabled_feature_use_error`]
+        //    tests key PRESENCE, so a declared `{"gate": null}` IS a use of `gate` — a fact the
+        //    typed `SubagentToolParams` below cannot carry, since serde folds an explicit `null`
+        //    into the same `None` an absent key produces.
+        // 2. **It is before the `workflow` -> `workflowScript` lowering.** Upstream's own comment
+        //    on the carrier check is *"Callers check the original request, before the package
+        //    lowers chain/tasks into its own script."* Run after `lower_workflow_field`, a
+        //    `workflow: "./x.js"` call would be refused as a `workflowScript` carrier rather than
+        //    on the `workflow` param it actually sent.
+        // 3. **It is before any action runs.** Nothing above it dispatches: the marker stamp and
+        //    `refuse_nested_workflow` are a map write and a pure check, and every side effect —
+        //    the spawn-budget charge, the single-dispatch slot, agent discovery, `route_action` —
+        //    is below. So the refusal is the tool error the caller sees, with no partial work done.
+        //
+        // It sits just AFTER `refuse_nested_workflow` rather than before it because that guard has
+        // no `executePublic` analogue to order against (it closes WORKFLOW_1 §6.3's nested-script
+        // leak, which upstream prevents structurally) and it is the privilege-escalation refusal of
+        // the two, so a workflow child smuggling a nested script keeps being refused as that.
+        if let Some(map) = request.as_object() {
+            let surface = self.executor.disabled_feature_surface().await;
+            if let Some(refusal) = crate::disabled_features::disabled_feature_use_error(
+                map,
+                &surface,
+                crate::disabled_features::DEFAULT_USE_ERROR_LABEL,
+            ) {
+                return Err(ToolError::new(refusal));
+            }
+        }
         // SUBA-150 — the `workflow` field, lowered onto the internal `workflowScript` carrier
         // before the typed parse (pi `subagent-executor.ts:7928-7958` @v0.75.0). It must run
         // AFTER `refuse_nested_workflow` above, whose `starts_a_script` test already names
         // `workflow` as one of its three disjuncts, so a workflow child asking for a nested
         // script is refused on the field it actually sent rather than on the carrier this
         // rewrites it to. See [`SubagentTool::lower_workflow_field`].
-        self.lower_workflow_field(&mut request, &call_id)?;
+        // SUBA-174 — the resolver's PERMIT, returned rather than written into `request`. It is
+        // the run's whole `runs.host` authority and it travels by ownership from here to the
+        // host, which is cyrup's side channel for pi's `workflowResourcePermits` WeakMap keyed on
+        // the params object (`subagent-executor.ts:5282`/`:7945`). `None` for every raw script.
+        //
+        // Held across the typed parse and the mode gate below, exactly as upstream holds its
+        // WeakMap read across the same span (`:5314`, consumed at `:5370`). A dispatch that is
+        // refused before the WORKFLOW arm simply DROPS it unconsumed, which is unforgeable-safe:
+        // the value is not `Clone`, so a dropped permit is gone, not reusable.
+        let workflow_resource = self.lower_workflow_field(&mut request, &call_id)?;
         // PB-9 — captured BEFORE the typed parse, which consumes `request` and (the field being
         // gone) ignores the key: pi refuses ANY present `clarify` value, `null` and non-booleans
         // included, so presence on the raw map is the test.
@@ -497,7 +588,10 @@ impl Tool for SubagentTool {
                 &call_id,
                 parsed,
                 &effective_cwd,
-                mission_binding.as_ref(),
+                crate::extension::tool::routing::WorkflowDispatchBindings {
+                    mission: mission_binding.as_ref(),
+                    resource: workflow_resource,
+                },
                 on_update,
                 cancel,
             )

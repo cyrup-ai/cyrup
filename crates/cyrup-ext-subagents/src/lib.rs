@@ -26,6 +26,11 @@
 
 pub mod artifacts;
 pub mod background;
+/// SUBA-152 — the crate's single port of pi's `shared/disabled-features.ts`: the 15 feature
+/// groups `config.disabledFeatures` removes from the parent-facing `subagent` tool, and the
+/// validator, surface resolver, per-request refusal and operator notice built on them. See
+/// [`disabled_features`].
+pub mod disabled_features;
 pub mod discovery;
 pub mod error;
 pub mod exec;

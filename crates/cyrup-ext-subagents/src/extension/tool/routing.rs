@@ -99,6 +99,34 @@ struct SingleBackgroundDispatch<'a> {
     tool_surface: Option<&'a crate::exec::tool_surface::ResolvedToolSurface>,
 }
 
+/// What the ONE public boundary already resolved for a WORKFLOW dispatch, carried DOWN rather than
+/// re-derived — the two bindings `Tool::execute` mints before the mode gate.
+///
+/// Both are side-effecting to produce (a mission binding may mark a mission Active or create one;
+/// a resource resolution runs a trusted resolver and mints a single-consumption permit), so
+/// re-resolving either here would do the work twice per tool call.
+///
+/// They travel together in one bundle for the plain reason that
+/// [`SubagentTool::route_workflow_mode`] was already at `clippy::too_many_arguments`' ceiling, and
+/// because what they have in common is exactly that: per-dispatch PROVENANCE, decided at the
+/// boundary, where the decision cannot be re-asked with a different answer.
+pub(crate) struct WorkflowDispatchBindings<'a> {
+    /// WORKFLOW_20 — the mission this dispatch is bound to, ALREADY resolved by `tool/mod.rs`'s
+    /// single `prepare_mission_binding_for_dispatch` seam, which runs for every mode before the
+    /// mode gate. Its `location` + `mission_id` are exactly the two values a mission scratchpad
+    /// needs.
+    pub(crate) mission: Option<&'a crate::missions::MissionLaunchBinding>,
+    /// SUBA-174 — the AVAILABLE (not yet consumed) resource permit
+    /// [`SubagentTool::lower_workflow_field`] returned, `None` for a raw script.
+    ///
+    /// Owned, because [`SubagentTool::route_workflow_mode`] must `consume` it (`&mut self`) and
+    /// then hand it on to the run's host. There is deliberately no way to obtain one except from
+    /// that resolver call: the type has private fields, one constructor, and no `Clone`, `Default`
+    /// or `Deserialize`, so "a script forged a permit" is not a representable state rather than a
+    /// checked one.
+    pub(crate) resource: Option<crate::workflows::WorkflowResourcePermit>,
+}
+
 impl SubagentTool {
     /// The tool surface `agent` would launch with, or `None` when the name does not resolve.
     ///
@@ -390,6 +418,22 @@ impl SubagentTool {
     /// the typed struct's `workflow_script` is a `String`. Upstream has the same split for the
     /// same reason, and keeps `workflowScript` as its internal carrier too.
     ///
+    /// # The permit it returns — SUBA-174's side channel
+    ///
+    /// A named resource resolves to a script AND to a
+    /// [`crate::workflows::WorkflowResourcePermit`], which is the run's entire `runs.host`
+    /// authority. Upstream carries it in a module-private `WeakMap<object,
+    /// WorkflowResourcePermit>` keyed on the forwarded params OBJECT
+    /// (`subagent-executor.ts:5282`, written beside the rewrite at `:7945`, read back at `:5314`),
+    /// because the only unforgeable name JS has for "this exact request" is that object's
+    /// identity.
+    ///
+    /// Rust needs no keying at all: the permit is RETURNED, by value, and moved down the call
+    /// stack to the host. It never enters `request`, so there is nothing in the JSON a script or a
+    /// caller could set to acquire one — and the type is not `Clone`, not `Default`, not
+    /// `Deserialize`, with private fields and one constructor, so it cannot be minted elsewhere
+    /// either. `Ok(None)` is the raw-script answer and is the only other value this can return.
+    ///
     /// # Errors
     ///
     /// Upstream's verbatim refusals: the two parameters v0.74.0 removed
@@ -402,9 +446,9 @@ impl SubagentTool {
         &self,
         request: &mut serde_json::Value,
         call_id: &ToolCallId,
-    ) -> Result<(), ToolError> {
+    ) -> Result<Option<crate::workflows::WorkflowResourcePermit>, ToolError> {
         let Some(map) = request.as_object_mut() else {
-            return Ok(());
+            return Ok(None);
         };
         // pi `:120-122` — `workflow` cannot be combined with the internal carrier. Checked ahead
         // of the removed-parameter refusals so the more specific sentence wins for a caller that
@@ -429,8 +473,11 @@ impl SubagentTool {
             if map.contains_key("args") {
                 return Err(ToolError::new(workflow_field::ARGS_REQUIRES_WORKFLOW));
             }
-            return Ok(());
+            return Ok(None);
         };
+        // SUBA-174 — set by the RESOURCE arm alone. The two raw-script arms leave it `None`, which
+        // is what makes them unable to reach `runs.host`.
+        let mut permit: Option<crate::workflows::WorkflowResourcePermit> = None;
         let script = match workflow {
             // pi `:7955` — `readReplyWorkflowScript(ctx.sessionManager, id)`, whose error is
             // reported WITHOUT the script-text hint (`:7956`).
@@ -460,6 +507,12 @@ impl SubagentTool {
                 match resolved {
                     crate::workflows::WorkflowResourceResolution::Ok(resource) => {
                         map.remove("args");
+                        // SUBA-174 — pi `workflowResourcePermits.set(publicParams,
+                        // resolved.resource.permit)` (`:7945`), as a move instead of a keyed map
+                        // write. The script and the permit that attests to it leave this arm
+                        // together; `drive_workflow_run` consumes the permit against that same
+                        // script text, so a carrier rewritten in between fails the digest check.
+                        permit = Some(resource.permit);
                         resource.script
                     }
                     crate::workflows::WorkflowResourceResolution::Err(error) => {
@@ -475,7 +528,7 @@ impl SubagentTool {
             "workflowScript".to_string(),
             serde_json::Value::String(script),
         );
-        Ok(())
+        Ok(permit)
     }
 
     /// pi `readReplyWorkflowScript` (`extension/reply-workflow-script.ts:14-26` @v0.75.0) — the
@@ -748,21 +801,38 @@ impl SubagentTool {
         call_id: &ToolCallId,
         p: &SubagentToolParams,
         cwd: &Path,
-        // WORKFLOW_20 — the mission this dispatch is bound to, ALREADY resolved by
-        // `tool/mod.rs`'s single `prepare_mission_binding_for_dispatch` seam, which runs for every
-        // mode before the mode gate. It is passed DOWN rather than re-resolved here because
-        // `prepare_mission_launch` is side-effecting (it marks an attached mission Active, and
-        // CREATES one for a `mission: {...}` object) — resolving a second time would write twice
-        // per tool call. Its `location` + `mission_id` are exactly the two values a mission
-        // scratchpad needs.
-        mission: Option<&crate::missions::MissionLaunchBinding>,
+        bindings: WorkflowDispatchBindings<'_>,
         on_update: ToolUpdateSink,
         cancel: CancelToken,
     ) -> Result<ToolResult, ToolError> {
+        let WorkflowDispatchBindings { mission, resource } = bindings;
         let Some(script) = p.workflow_script.as_deref() else {
             return Err(ToolError::new(
                 "subagent WORKFLOW mode requires a non-empty 'workflowScript'.",
             ));
+        };
+
+        // SUBA-174 — pi `subagent-executor.ts:5367-5372`: a resolved resource's permit is CONSUMED
+        // against the script actually about to run, and the consumption's failure is the request's
+        // failure. `consume` is `&mut self` and flips Available -> Consumed permanently, so this
+        // is the one and only consumption; `authorize_host` then refuses outright for any permit
+        // still Available, which is why consuming is a precondition of the gate rather than
+        // bookkeeping.
+        //
+        // The digest check is the point: it binds THIS permit to THIS script text. The resolver
+        // wrote `script_digest` over the expansion it returned, and `lower_workflow_field` put that
+        // same text into the request's `workflowScript`; if anything rewrote the carrier between
+        // the two, the authority does not transfer.
+        //
+        // Upstream's `"Resolved workflow resource is missing its workflow script."` arm (`:5369`)
+        // is structurally absent here: the resolver refuses a blank expansion, so a permit always
+        // arrives beside a non-empty script, and the `let Some(script)` above is the only reader.
+        let resource = match resource {
+            None => None,
+            Some(mut permit) => {
+                permit.consume(script).map_err(ToolError::new)?;
+                Some(permit)
+            }
         };
 
         // The async refusal is permanent (§0.6): `runs.all` already provides real in-workflow
@@ -861,6 +931,8 @@ impl SubagentTool {
                 state,
                 on_update,
                 cancel,
+                // SUBA-174 — the run's whole `runs.host` authority, moved on to the host.
+                resource,
             },
         )
         .await
@@ -1491,14 +1563,68 @@ impl SubagentTool {
             // arm to port — see `registration::guide`'s `[CYRUP-DELTA]`. The unknown-TOPIC branch is
             // NOT an error either, upstream or here: it returns the valid list as ordinary text so a
             // model recovers within the same turn.
-            "guide" => Ok(ToolResult {
-                content: vec![cyrup_core::Content::text(
-                    crate::registration::guide::read_subagent_guide(p.topic.as_deref()),
-                )],
-                details: None,
-                terminate: TerminateHint::Unspecified,
-                ..Default::default()
-            }),
+            // SUBA-152 — pi `disabledFeatureNotice(disabledFeatures)` prepended to the
+            // `tool-reference` topic and that topic ONLY (`subagent-executor.ts:6883` @v0.75.0,
+            // inside this same `action === "guide"` block):
+            //
+            // ```ts
+            // const guide = readSubagentGuide(paramsWithResolvedCwd.topic);
+            // const notice = paramsWithResolvedCwd.topic === "tool-reference" ? disabledFeatureNotice(disabledFeatures) : undefined;
+            // return { content: [{ type: "text", text: notice ? `${notice}\n\n${guide}` : guide }], … };
+            // ```
+            //
+            // This is the third of the three places SUBA-152's row requires the surface consulted
+            // — the config accessor
+            // ([`crate::registration::SubagentExtensionConfig::disabled_feature_surface`]), the
+            // advertised schema (SUBA-151's
+            // [`crate::extension::tool::schema::subagent_tool_parameters_for`]) and this one, the
+            // reference text — with the dispatch gate in
+            // [`crate::extension::tool::SubagentTool`]'s prologue as the enforcement half.
+            //
+            // # Why the guide topic and NOT `registration/tool_description.rs`
+            //
+            // [`crate::disabled_features::disabled_feature_notice`]'s own doc sentence is *"Lists
+            // what config disabled, for prepending to static reference docs that describe the full
+            // tool."* The static reference doc is `resources/docs/tool-reference.md` — the
+            // `include_str!`-backed page [`crate::registration::guide::read_subagent_guide`] serves
+            // — and upstream's single `disabledFeatureNotice` call site is the one above. Upstream's
+            // `extension/tool-description.ts` consumes the surface through a DIFFERENT mechanism
+            // (`featureText`/`on(...)`, `:14-15`, which REMOVES lines for disabled features from
+            // the description) and never calls `disabledFeatureNotice` — `git grep
+            // disabledFeatureNotice v0.75.0 -- src/` returns exactly two hits, this one and the
+            // declaration.
+            //
+            // Putting the notice in the tool description would also invert its purpose. The notice
+            // is a block that says *"The reference below still lists these, but calls that use them
+            // are rejected"* — it ADDS text, so prepending it to the description would make the
+            // single largest prompt cost this crate imposes strictly larger for exactly the
+            // operator who configured a smaller tool. The description's own disabled-feature
+            // trimming is upstream's `featureText` mechanism, which this port does not have
+            // (`registration/tool_description.rs` is static constants, as its module doc records);
+            // that is a separate, larger port and is not what `disabled_feature_notice` is for.
+            //
+            // The topic comparison is on the RESOLVED topic string, so an absent or unknown
+            // `topic` gets no notice — upstream's `=== "tool-reference"` has the same effect, and
+            // the unknown-topic branch returns the valid-topic list, which no notice belongs on.
+            "guide" => {
+                let guide = crate::registration::guide::read_subagent_guide(p.topic.as_deref());
+                let notice = if p.topic.as_deref() == Some("tool-reference") {
+                    crate::disabled_features::disabled_feature_notice(
+                        &self.executor.disabled_feature_surface().await,
+                    )
+                } else {
+                    None
+                };
+                Ok(ToolResult {
+                    content: vec![cyrup_core::Content::text(match notice {
+                        Some(notice) => format!("{notice}\n\n{guide}"),
+                        None => guide,
+                    })],
+                    details: None,
+                    terminate: TerminateHint::Unspecified,
+                    ..Default::default()
+                })
+            }
             // `models` is the runtime builtin-agent -> model mapping (pi `handleModels`), the SAME
             // renderer the `/subagents-models` slash command uses — so the tool and slash surfaces
             // report one consistent mapping, exactly as pi routes both through `handleModels`.

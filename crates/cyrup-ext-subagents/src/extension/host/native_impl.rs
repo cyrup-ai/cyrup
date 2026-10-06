@@ -76,10 +76,20 @@ impl NativeExtension for SubagentsExtension {
     async fn init(&self, api: &mut InitApi) -> Result<(), ExtError> {
         match self.mode {
             RegistrationMode::ChildSafe => {
-                api.register_tool(Arc::new(SubagentTool::new_child_safe(
-                    self.executor.clone(),
-                    self.cwd.clone(),
-                )));
+                // SUBA-151 — pi `const params = createSubagentParamsSchema(disabledFeatures);`
+                // (`extension/fanout-child.ts:219` @v0.75.0): the CHILD resolves the surface and
+                // reduces its own advertised parameters too, so a group the operator disabled for
+                // the session is not re-advertised one level down.
+                api.register_tool(Arc::new(
+                    SubagentTool::new_child_safe(self.executor.clone(), self.cwd.clone())
+                        .with_disabled_features(
+                            &self
+                                .executor
+                                .config_snapshot()
+                                .await
+                                .disabled_feature_surface(),
+                        ),
+                ));
                 // No commands, no subscriptions: a child installs no orchestrator UI/watcher surface.
                 // A fanout-authorized child also runs none of the Full arm's startup housekeeping
                 // below — pi's own `fanout-child.ts` entry point likewise never calls
@@ -174,10 +184,22 @@ impl NativeExtension for SubagentsExtension {
                 // the RPC bridge dispatches into the instance the model uses — same resolved
                 // description, same `allow_mutating_management`, same `DispatchGuard`. See
                 // `SubagentsExtension::rpc_tool` for why this is not `subagent_tool()`.
+                // SUBA-151 — pi `createSubagentParamsSchema(disabledFeatures)`
+                // (`extension/index.ts:707,717` @v0.75.0): the advertised PARAMETERS are resolved
+                // from config at registration for the same reason the description above is, and
+                // from the same snapshot. Without it a session that disabled a feature group
+                // still tells the model that group's parameters are legal.
                 let subagent_tool = Arc::new(
                     SubagentTool::new(self.executor.clone(), self.cwd.clone())
                         .with_watchdog(Arc::clone(&self.watchdog))
-                        .with_description(resolved_description),
+                        .with_description(resolved_description)
+                        .with_disabled_features(
+                            &self
+                                .executor
+                                .config_snapshot()
+                                .await
+                                .disabled_feature_surface(),
+                        ),
                 );
                 let _ = self.rpc_tool.set(Arc::clone(&subagent_tool));
                 api.register_tool(subagent_tool);
@@ -1542,5 +1564,94 @@ mod summary_render_tests {
             render_subagent_summary(&launched)[0],
             serde_json::json!("● single · running")
         );
+    }
+}
+
+/// SUBA-151 — the registration seam that hands [`crate::disabled_features::DisabledFeatureSurface`]
+/// to the advertised parameter schema, in BOTH registration modes.
+#[cfg(test)]
+mod disabled_feature_schema_wiring_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+
+    use super::*;
+    use crate::registration::SubagentExtensionConfig;
+    use cyrup_ext::ExtMode;
+
+    async fn advertised_parameters(
+        disabled_features: Option<Vec<crate::disabled_features::SubagentFeature>>,
+        mode: RegistrationMode,
+    ) -> serde_json::Value {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let host = cyrup_ext::ExtensionHost::new(cyrup_ext::HostConfig {
+            mode: ExtMode::Tui,
+            has_ui: false,
+            cwd: dir.path().to_path_buf(),
+        });
+        let config = SubagentExtensionConfig {
+            disabled_features,
+            ..SubagentExtensionConfig::default()
+        };
+        host.load_native(Arc::new(SubagentsExtension::with_mode(
+            config,
+            dir.path().to_path_buf(),
+            mode,
+        )))
+        .await
+        .expect("the subagents extension must load");
+        let tool = host
+            .registry()
+            .tool(TOOL_NAME)
+            .expect("the registry must be readable")
+            .expect("the subagent tool must be registered");
+        cyrup_core::Tool::parameters(tool.as_ref()).clone()
+    }
+
+    /// The reduction is REACHED from registration, not merely available as a function.
+    ///
+    /// This is the half a unit test of [`crate::extension::tool::schema::subagent_tool_parameters_for`]
+    /// cannot cover: the surface has to come off the LOADED config at registration time (pi
+    /// `const disabledFeatures = resolveDisabledFeatureSurface(config); … const parameters =
+    /// createSubagentParamsSchema(disabledFeatures);`, `extension/index.ts:707,717` @v0.75.0), and
+    /// without the `with_disabled_features` call the tool advertises the full schema while the
+    /// operator believes a group is off.
+    ///
+    /// Both modes are driven because upstream reduces in both — the fanout child calls
+    /// `createSubagentParamsSchema` itself (`extension/fanout-child.ts:219`) rather than inheriting
+    /// the parent's object.
+    ///
+    /// MUTATION: drop either `.with_disabled_features(…)` call in `init` — that mode's assertion
+    /// fails with `workflow` still advertised. Observed RED.
+    #[tokio::test]
+    async fn registration_advertises_the_reduced_schema_in_both_modes() {
+        for mode in [RegistrationMode::Full, RegistrationMode::ChildSafe] {
+            let full = advertised_parameters(None, mode).await;
+            assert!(
+                full["properties"].get("workflow").is_some(),
+                "{mode:?}: a session that disabled nothing must advertise the full schema"
+            );
+
+            let reduced = advertised_parameters(
+                Some(vec![
+                    crate::disabled_features::SubagentFeature::WorkflowScripts,
+                ]),
+                mode,
+            )
+            .await;
+            assert!(
+                reduced["properties"].get("workflow").is_none(),
+                "{mode:?}: disabling workflow-scripts must stop advertising `workflow`"
+            );
+            assert!(
+                reduced["properties"].get("args").is_none(),
+                "{mode:?}: disabling workflow-scripts must stop advertising `args`"
+            );
+            // Option (b)'s guarantee, asserted where the model actually reads the schema.
+            for kept in ["chain", "tasks"] {
+                assert!(
+                    reduced["properties"].get(kept).is_some(),
+                    "{mode:?}: the native {kept} must survive the reduction"
+                );
+            }
+        }
     }
 }

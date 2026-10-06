@@ -1315,30 +1315,67 @@ mod tests {
             "installing the watcher arms the sweep"
         );
 
-        // One second of virtual time at a time, settling in between. A single 61 s jump would not
-        // do: stage 3's own `sleep` is registered only AFTER stages 1-2 finish, so its deadline
-        // would be measured from the already-advanced clock and never fire.
-        // The wait must ADVANCE, not spin. `spin_until` is a busy `yield_now` loop, and on a paused
-        // clock a busy runtime never auto-advances — so once the manual advances below ran out it
-        // could not make progress, it could only burn 200_000 yields and report a failure that was
-        // really "the sweep's real filesystem work lost a race under load". That is what made this
-        // test fail in `--workspace` runs while passing in isolation.
+        // Await the sweep task ITSELF, in place in the slot the install filled.
         //
-        // Advancing one second at a time is load-bearing and not a stylistic choice: stage 3's own
-        // `sleep` is registered only AFTER stages 1-2 finish, so a single 61 s jump would measure
-        // its deadline from the already-advanced clock and never fire. The bound is generous
-        // because each iteration also has to let real file I/O land, not because the arming is slow.
-        let mut armed = false;
-        for _ in 0..600 {
-            if maintenance_log.exists() {
-                armed = true;
-                break;
-            }
-            tokio::time::advance(std::time::Duration::from_secs(1)).await;
-            settle().await;
+        // # The flake this replaced, and why it was a test defect
+        //
+        // This used to poll `maintenance_log.exists()` inside `for _ in 0..600 { advance(1s);
+        // settle(); }`. Every term of that is a budget, not a condition: `settle` is sixteen
+        // `yield_now`s, so the loop's whole allowance was 9_600 yields of a current-thread
+        // runtime. A `yield_now` does NOT wait for anything — a task parked on a `tokio::fs`
+        // completion is simply skipped — so the entire budget could be spent in well under a
+        // millisecond of wall time while stage 3's real filesystem work (lock acquire, run scan,
+        // rename, `remove_dir_all`, log append) was still in flight on a blocking pool that a
+        // full-suite run has saturated. Then `armed` was false and the test reported
+        // "the install really did arm the async-retention pass" — a false negative about the
+        // PRODUCTION invariant, caused entirely by the harness. That is the 4998/1 signature.
+        //
+        // The budget was not a margin. Instrumenting the old loop to report the iterations it
+        // consumed, on this 4-core box:
+        //
+        // * idle, test alone: 83 of 600;
+        // * with 8 spinners against 4 cores: 158, 166, 269, 377, 452 of 600;
+        // * inside `--lib -- --test-threads=48`: 68, 72, 87, 120, 129, 133, 154, 206, 288, 444,
+        //   and once **600 of 600 with `armed=false`** — the budget fully spent while the pass was
+        //   still landing. So the ceiling is reachable in the exact conditions that produced the
+        //   bad baseline, 1-in-11 in that sample, which is why it also passed in isolation every
+        //   time it was ever checked.
+        //
+        // Capping the loop at 62 (below the 83 an idle run needs) made the old shape fail
+        // deterministically with that same sentence while the production arming was perfectly
+        // intact — the harness had simply stopped waiting. That is the whole bug.
+        //
+        // # Why awaiting the handle is deterministic
+        //
+        // `tokio::task::JoinHandle` is `Unpin` and implements `Future`, so `(&mut sweep.handle)`
+        // can be awaited WITHOUT taking the handle out of `executor.retention_sweep` — which
+        // matters, because the teardown half of this test needs the slot still occupied. The await
+        // completes exactly when the sweep task returns, so:
+        //
+        // * there is no iteration budget to exhaust and no deadline to miss — load makes this
+        //   slower, never red;
+        // * `start_paused` auto-advances the clock whenever the runtime has nothing to do but wait
+        //   on timers, which is precisely the state the two staggered `sleep`s leave it in, so the
+        //   30 s and 60 s deadlines are supplied by the runtime rather than counted out by hand;
+        // * the assertions below observe a FINISHED pass, so they are not racing it. The previous
+        //   shape read `maintenance_log.exists()` as a proxy for "the pass is done", which is only
+        //   sound because `cleanup_async_retention` appends the log last
+        //   (`async_retention/sweep.rs:253`, after the deletions) — a coupling this no longer
+        //   depends on.
+        //
+        // What is asserted is unchanged: the install armed the pass (the sweep ran its third stage
+        // and left both effects), and the teardown cancels it (below).
+        {
+            let mut slot = executor.retention_sweep.lock().await;
+            let sweep = slot
+                .as_mut()
+                .expect("the install armed the sweep, asserted above");
+            (&mut sweep.handle)
+                .await
+                .expect("the armed sweep task runs to completion");
         }
         assert!(
-            armed || maintenance_log.exists(),
+            maintenance_log.exists(),
             "the install really did arm the async-retention pass"
         );
         assert!(

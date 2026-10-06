@@ -19,37 +19,75 @@
 //! each one's blind spot is the other's: a capacity reading cannot see an allocation that was not a
 //! map growth, and a malloc counter cannot say *which* allocation it saw.
 //!
-//! Both cases in this file share [`ARMED`], [`ALLOCATIONS`] and the process-global fault hooks, so
-//! they must not run concurrently in one process. `cargo nextest` — the workspace's test runner —
-//! gives every case its own process, which is what makes that safe; under a bare `cargo test` the two
-//! race, the same way `tests/line_hold_budget.rs` says its budget would.
+//! # Why the counter is thread-local
+//!
+//! Each case arms a counter around its own adoption, and `cargo test` runs the two cases
+//! CONCURRENTLY on two threads of one process. That is the shape that has to be right: the merge
+//! gate is `cargo test --workspace` — the root `Cargo.toml` says so, and `.config/nextest.toml`'s
+//! own header concedes it (*"`cargo test --workspace` alone remains the gate until someone
+//! validates a full-workspace nextest run"*) — so the per-process isolation `cargo nextest` would
+//! give is not something this file may assume.
+//!
+//! While the counter and the flag were process-global atomics, a `#[global_allocator]` could not
+//! tell the two threads apart: one case's ordinary allocations landed in the other's count, and
+//! either case's before-adopt hook could zero the other's counter mid-measurement. Measured on one
+//! prebuilt binary, that was **10 failures in 40** default-shape runs, in either case
+//! interchangeably — and `--test-threads=1` only hid it.
+//!
+//! So both live in a [`thread_local!`], which makes the measurement match the seam it reads:
+//! `fault::set_before_adopt` installs a hook on the CALLING THREAD (`src/fault.rs`'s `BEFORE_ADOPT`
+//! is itself a `thread_local!`), and `#[tokio::test(flavor = "current_thread")]` polls the whole
+//! commit on that same thread. Each case therefore counts exactly the allocations its own adoption
+//! made and nothing else, and the two may run in parallel because they no longer share state. No
+//! lock, and no `--test-threads=1` for the reader to remember.
+//!
+//! `tests/line_hold_budget.rs` keeps its sibling case as a plain `async fn` rather than a second
+//! `#[test]`, and that is still right for it: the line-hold budget is process-global *in the
+//! kernel* and no test can make it per-thread. This file's state is the test's own, so it can be,
+//! and both cases stay named tests.
 //!
 //! [`GlobalAlloc`]: std::alloc::GlobalAlloc
 
 #![allow(unsafe_code, clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::cell::Cell;
 
 use cyrup_pico::{CommitOutcome, DocToken, SessionMut};
 use cyrup_pico_doc::{Path, Seg};
 use cyrup_pico_store::{Cx, MemoryStore};
 
-/// Allocations seen while [`ARMED`] is set.
-static ALLOCATIONS: AtomicU64 = AtomicU64::new(0);
-/// Whether to count. Set by the before-adopt hook and cleared by the after-adopt hook, so the counted
-/// window is exactly `Tx::adopt`.
-static ARMED: AtomicBool = AtomicBool::new(false);
+thread_local! {
+    /// Allocations seen **on this thread** while [`ARMED`] is set on it.
+    static ALLOCATIONS: Cell<u64> = const { Cell::new(0) };
+    /// Whether to count on this thread. Set by the before-adopt hook and cleared by the after-adopt
+    /// hook, so the counted window is exactly `Tx::adopt` — on the one thread that armed it.
+    static ARMED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Count one allocation, if the allocating thread is the armed one.
+///
+/// [`LocalKey::try_with`] and not `with`: this runs inside [`GlobalAlloc`], where a panic aborts the
+/// process. Both thread-locals are `const`-initialised and neither `Cell` is `Drop`, so there is no
+/// destructor to have run and no lazy initialisation that could itself allocate — but the allocator
+/// is the one place where being wrong about that costs an abort rather than a red test, so a miss is
+/// simply not counted.
+///
+/// [`LocalKey::try_with`]: std::thread::LocalKey::try_with
+#[inline]
+fn count_allocation() {
+    if ARMED.try_with(Cell::get).unwrap_or(false) {
+        let _ = ALLOCATIONS.try_with(|seen| seen.set(seen.get() + 1));
+    }
+}
 
 struct Counting;
 
-// SAFETY: every method forwards to `System`, unchanged, after an atomic increment. The counter adds
+// SAFETY: every method forwards to `System`, unchanged, after a thread-local increment. The counter adds
 // no aliasing, no layout assumption and no ownership claim of its own.
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        if ARMED.load(Ordering::Relaxed) {
-            ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
-        }
+        count_allocation();
         unsafe { System.alloc(layout) }
     }
 
@@ -58,16 +96,12 @@ unsafe impl GlobalAlloc for Counting {
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        if ARMED.load(Ordering::Relaxed) {
-            ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
-        }
+        count_allocation();
         unsafe { System.realloc(ptr, layout, new_size) }
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        if ARMED.load(Ordering::Relaxed) {
-            ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
-        }
+        count_allocation();
         unsafe { System.alloc_zeroed(layout) }
     }
 }
@@ -128,11 +162,11 @@ async fn adoption_performs_no_allocation() {
     };
 
     cyrup_pico::fault::set_before_adopt(|_window| {
-        ALLOCATIONS.store(0, Ordering::SeqCst);
-        ARMED.store(true, Ordering::SeqCst);
+        ALLOCATIONS.set(0);
+        ARMED.set(true);
     });
     cyrup_pico::fault::set_after_adopt(|_window| {
-        ARMED.store(false, Ordering::SeqCst);
+        ARMED.set(false);
     });
 
     // The measured commit: an ordinary change to a document the authority already holds. This is the
@@ -148,10 +182,10 @@ async fn adoption_performs_no_allocation() {
         panic!("the measured commit must succeed");
     };
     cyrup_pico::fault::clear();
-    ARMED.store(false, Ordering::SeqCst);
+    ARMED.set(false);
 
     assert_eq!(
-        ALLOCATIONS.load(Ordering::SeqCst),
+        ALLOCATIONS.get(),
         0,
         "adoption allocated: `spec.md:1305-1310` forbids it, and the window is unrecoverable"
     );
@@ -168,11 +202,11 @@ async fn adopting_a_creation_performs_no_allocation_either() {
     let addr = address();
 
     cyrup_pico::fault::set_before_adopt(|_window| {
-        ALLOCATIONS.store(0, Ordering::SeqCst);
-        ARMED.store(true, Ordering::SeqCst);
+        ALLOCATIONS.set(0);
+        ARMED.set(true);
     });
     cyrup_pico::fault::set_after_adopt(|_window| {
-        ARMED.store(false, Ordering::SeqCst);
+        ARMED.set(false);
     });
 
     let CommitOutcome::Committed { .. } = handle
@@ -186,10 +220,10 @@ async fn adopting_a_creation_performs_no_allocation_either() {
         panic!("the creating commit must succeed");
     };
     cyrup_pico::fault::clear();
-    ARMED.store(false, Ordering::SeqCst);
+    ARMED.set(false);
 
     assert_eq!(
-        ALLOCATIONS.load(Ordering::SeqCst),
+        ALLOCATIONS.get(),
         0,
         "adopting a creation allocated: `DocIndex::reserve` is supposed to have made room already"
     );
