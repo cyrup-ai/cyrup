@@ -109,7 +109,7 @@ pub(crate) fn tool_block(
                 images.expand_key,
             )),
             (None, Some(result)) => {
-                render_extension_result(&result.text, run, expanded, theme, &mut block);
+                render_extension_result(&result.text, theme, &mut block);
             }
             (None, None) => match builtin {
                 Some(kind) => render_builtin_result(kind, run, expanded, theme, images, &mut block),

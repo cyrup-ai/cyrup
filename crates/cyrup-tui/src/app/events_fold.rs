@@ -238,12 +238,22 @@ impl<B: Backend> App<B> {
                 // `updateResult(partial, true)` re-runs `renderResult` with the partial result, and
                 // its component replaces the previous one — which is how a nested-call list grows
                 // while the script runs.
-                if let crate::transcript::Rendered::Tree(tree) = &rendered {
-                    self.state.transcript.set_tool_tree(
-                        tool_call_id.as_str(),
-                        crate::transcript::ToolSide::Result,
-                        Some(tree.clone()),
-                    );
+                match &rendered {
+                    crate::transcript::Rendered::Tree(tree) => {
+                        self.state.transcript.set_tool_tree(
+                            tool_call_id.as_str(),
+                            crate::transcript::ToolSide::Result,
+                            Some(tree.clone()),
+                        );
+                    }
+                    // A text renderer is asked for every partial result too, and its body replaces
+                    // the previous one until the final result's render does.
+                    crate::transcript::Rendered::Text(text) => {
+                        self.state
+                            .transcript
+                            .set_tool_partial_render(tool_call_id.as_str(), text.clone());
+                    }
+                    _ => {}
                 }
             }
             AgentSessionEvent::ToolExecutionEnd {

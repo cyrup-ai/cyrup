@@ -89,6 +89,22 @@ impl TranscriptView {
         }
     }
 
+    /// File the RESULT text an extension's `renderResult` drew for a PARTIAL result of the run
+    /// under `call_id` (pi `updateResult(result, isPartial = true)` → `renderResult`,
+    /// `tool-execution.ts:295-296`). The final result's render replaces it
+    /// ([`Self::push_tool_end_rendered`] overwrites `rendered_result`, with `None` when the final
+    /// render drew no text), so a partial's body never outlives the result.
+    pub fn set_tool_partial_render(&mut self, call_id: &str, rendered: RenderedText) {
+        self.bump_render_generation();
+        if let Some(run) = self
+            .active_tools
+            .iter_mut()
+            .find(|r| !r.done && r.call_id.as_deref() == Some(call_id))
+        {
+            run.rendered_result = Some(rendered);
+        }
+    }
+
     /// Attach (or, with `None`, clear) the component a native tool renderer returned for one side
     /// of the run filed under `call_id` — pi's `callRendererComponent` / `resultRendererComponent`.
     ///
