@@ -100,6 +100,9 @@ enum Act {
     ReplaceStructuredOnly,
     /// Patch only `details`.
     DetailsOnly,
+    /// Replace the content and hand back the structured content the event carried: "Return it
+    /// along with `content` to keep it".
+    ReplaceContentEchoingStructured,
 }
 
 struct Ext {
@@ -116,7 +119,11 @@ impl NativeExtension for Ext {
         Ok(())
     }
     async fn on_event(&self, ev: &HostEvent, _ctx: &HostCtx) -> HookOutcome {
-        let HostEvent::ToolResult { .. } = ev else {
+        let HostEvent::ToolResult {
+            structured_content: seen,
+            ..
+        } = ev
+        else {
             return HookOutcome::Noop;
         };
         let (content, structured_content, details) = match self.act {
@@ -133,6 +140,11 @@ impl NativeExtension for Ext {
                 None,
             ),
             Act::DetailsOnly => (None, None, Some(json!({ "audited": true }))),
+            Act::ReplaceContentEchoingStructured => (
+                Some(vec![Content::text("two files")]),
+                seen.clone().map(Box::new),
+                None,
+            ),
         };
         HookOutcome::Mutate(EventPatch::ToolResult {
             content,
@@ -264,5 +276,15 @@ async fn a_details_only_handler_keeps_the_structured_content() {
     let (result, end) = run(Act::DetailsOnly).await;
     assert_eq!(text_of(&result), "2 files");
     assert_eq!(result.details, Some(json!({ "audited": true })));
+    assert_eq!(end["structuredContent"], stats());
+}
+
+/// "Return it along with `content` to keep it": a handler that rewrites the text and hands back
+/// the structured content the event carried leaves the settled result with it, which also proves
+/// the tool's structured content reached the handler.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn returning_the_structured_content_it_was_given_keeps_it_with_the_new_content() {
+    let (result, end) = run(Act::ReplaceContentEchoingStructured).await;
+    assert_eq!(text_of(&result), "two files");
     assert_eq!(end["structuredContent"], stats());
 }
