@@ -103,8 +103,11 @@ pub const PROMPT_GUIDELINES: [&str; 1] = [
 
 /// The tool's parameter schema (`codemodeSchema`, `tool.ts:90-94`): `{ code: string }`.
 ///
-/// One `static`, so [`is_codemode_tool`] can tell this tool from another extension's tool of the
-/// same name by identity, as upstream does by comparing the schema object.
+/// One `static`: every wrapper of the tool hands back the same schema object.
+///
+/// Upstream's `isCodemodeTool` (`tool.ts:98-100`) compares that object by identity, and its one caller
+/// is pi's built-in MCP extension (`extensions/mcp/index.ts:478`, `:1081`). cyrup's MCP is the
+/// `pi-mcp-adapter` port, which has no such caller, so the predicate is not ported.
 #[must_use]
 pub fn codemode_schema() -> &'static Value {
     static SCHEMA: LazyLock<Value> = LazyLock::new(|| {
@@ -117,20 +120,6 @@ pub fn codemode_schema() -> &'static Value {
         })
     });
     &SCHEMA
-}
-
-/// Whether a registered tool is this crate's `codemode` tool rather than another extension's tool
-/// with the same name (`isCodemodeTool`, `tool.ts:98-100`). Compares the parameter schema by
-/// identity, which every wrapper of the tool passes through by reference.
-///
-/// # Production call path
-///
-/// Upstream's caller is the MCP extension, which decides whether to activate codemode when MCP
-/// tools are only reachable from scripts (`extensions/mcp/index.ts:478,1081`). cyrup's MCP adapter
-/// does not port that decision yet, so this has no production caller until it does.
-#[must_use]
-pub fn is_codemode_tool(tool: &dyn Tool) -> bool {
-    tool.name() == CODEMODE_TOOL_NAME && std::ptr::eq(tool.parameters(), codemode_schema())
 }
 
 /// How one nested call ended, as the live details list reports it

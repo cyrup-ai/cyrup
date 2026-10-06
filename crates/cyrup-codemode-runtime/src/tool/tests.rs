@@ -15,10 +15,7 @@ use cyrup_config::CodemodeMode;
 use cyrup_core::{ConstrainedSampling, ConstrainedSamplingConfig, Tool, ToolExposure, ToolLoadout};
 use serde_json::json;
 
-use super::{
-    CODEMODE_TOOL_NAME, CodemodeHostSlot, CodemodeTool, CodemodeToolOptions,
-    UnavailableSandboxFactory, codemode_schema, is_codemode_tool,
-};
+use super::{CodemodeHostSlot, CodemodeTool, CodemodeToolOptions, UnavailableSandboxFactory};
 use crate::testkit::{FakeModels, RecordingHost, StubTool};
 
 fn options(host: &CodemodeHostSlot) -> CodemodeToolOptions {
@@ -134,33 +131,6 @@ fn the_registered_description_lists_no_tools() {
             .description()
             .contains("`models`")
     );
-}
-
-/// `isCodemodeTool` compares identity, so another extension's `codemode` tool with an equal-looking
-/// schema is not this tool, and a wrapper that passes the schema through still is.
-#[test]
-fn an_impostor_with_the_same_name_and_an_equal_schema_is_not_the_codemode_tool() {
-    let ours = CodemodeTool::new(options(&CodemodeHostSlot::new()));
-    assert!(is_codemode_tool(&ours));
-
-    let impostor = StubTool::new(CODEMODE_TOOL_NAME, "Mine.")
-        .parameters(codemode_schema().clone())
-        .arc();
-    assert_eq!(impostor.parameters(), codemode_schema(), "equal by value");
-    assert!(!is_codemode_tool(impostor.as_ref()), "not by identity");
-
-    let renamed = StubTool::new("other", "x").parameters(codemode_schema().clone());
-    assert!(!is_codemode_tool(&renamed));
-
-    // The loadout's description wrapper delegates `parameters()` by reference.
-    let slot = host_slot(CodemodeMode::On);
-    let loadout = ToolLoadout::resolve(&names(&["echo", "codemode"]), &[echo(), codemode(&slot)]);
-    let wrapped = loadout
-        .executable()
-        .iter()
-        .find(|tool| tool.name() == "codemode")
-        .unwrap();
-    assert!(is_codemode_tool(wrapped.as_ref()));
 }
 
 /// `on`: declared tools say how scripts call them and are not listed again in codemode.

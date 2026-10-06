@@ -38,7 +38,7 @@ fn user(id: &str, parent: Option<&str>, text: &str) -> String {
 /// Pi bytes under test.
 fn assistant(id: &str, parent: &str, body: &str) -> String {
     format!(
-        r#"{{"type":"message","id":"{id}","parentId":"{parent}","timestamp":"2026-08-08T00:00:00.000Z","message":{{"role":"assistant","content":[],"api":"anthropic-messages","provider":"anthropic","model":"claude-sonnet-4-5","usage":{{"input":10,"output":5,"cacheRead":0,"cacheWrite":0,"totalTokens":15,"cost":{{"input":0.0,"output":0.0,"cacheRead":0.0,"cacheWrite":0.0,"total":0.0}}}},{body},"timestamp":1754611200000}}}}"#
+        r#"{{"type":"message","id":"{id}","parentId":"{parent}","timestamp":"2026-08-08T00:00:00.000Z","message":{{"role":"assistant","content":[],"api":"anthropic-messages","provider":"anthropic","model":"claude-sonnet-4-5","usage":{{"input":10,"output":5,"cacheRead":0,"cacheWrite":0,"totalTokens":15,"cost":{{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}}}},{body},"timestamp":1754611200000}}}}"#
     )
 }
 

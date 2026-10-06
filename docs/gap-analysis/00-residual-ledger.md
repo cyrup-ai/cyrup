@@ -43,8 +43,16 @@ next work item**.
 >   byte-compat. Fixed here (`cyrup-core`).
 > * `RegisteredTool` did not delegate `output_schema()`, so every MCP structured tool looked like a text
 >   tool. Fixed here.
-> * `cyrup-it` `tests/subagents/*` do not compile on the base (a `worktree` field missing from literals).
->   Fixed here.
+> * The `Cost` fix and the `serde_json` `raw_value` feature it needs changed text that tests had pinned:
+>   `cyrup-test-support`'s self-recorded goldens and one `deferred_interop` literal wrote `0.0` where pi
+>   writes `0` (corrected; the `*.pi-captured.*` fixtures already had `0`), and two `trybuild` `.stderr`
+>   files list `&'a RawValue` among a trait's implementors now that the feature is workspace-wide
+>   (regenerated). The second is a brittleness this work introduced and did not remove: those
+>   expectations depend on which features the workspace enables on `serde_json`.
+> * `cyrup-test-support`'s differential text-turn anchor compared pi's tool-less `agentLoop()` capture
+>   with a session that has tools; pi 1.0's `declareToolChanges` puts a system message ahead of the prompt
+>   when tools exist, so the anchor now builds a tool-less session and a second test pins the declaration
+>   pair for a session with tools.
 
 ---
 

@@ -464,9 +464,13 @@ mod smoke {
         let expected = crate::differential::value_type_sequence(&pi_events);
         assert_eq!(expected.len(), 11, "Pi-captured fixture event count");
 
-        let harness = create_harness(HarnessOptions::with_responses(vec![FauxResponse::text(
-            "hi",
-        )]))
+        // The capture drove the loop with no tools, so the session here has none either: with a
+        // tool set, pi 1.0's `declareToolChanges` (agent-loop.ts:327-376) puts a system message
+        // that declares them ahead of the prompt, which the next test pins.
+        let harness = create_harness(HarnessOptions {
+            initial_active_tool_names: Some(Vec::new()),
+            ..HarnessOptions::with_responses(vec![FauxResponse::text("hi")])
+        })
         .await
         .expect("build harness");
         let events = harness.run("hello").await.expect("run");
@@ -479,6 +483,24 @@ mod smoke {
         assert_event_kinds(&expected, &actual).expect(
             "cyrup text-turn ordering diverges from the REAL Pi-captured agent-loop sequence",
         );
+    }
+
+    /// With tools in the executable set the loop declares them first: a system message carrying
+    /// `toolsAdded` is emitted as an ordinary message pair before the assistant's reply
+    /// (`declareToolChanges`, `agent-loop.ts:327-376` @v1.0.1), which is why the capture above is
+    /// compared against a tool-less session.
+    #[tokio::test]
+    async fn a_session_with_tools_declares_them_with_a_system_message_pair() {
+        let harness = create_harness(HarnessOptions::with_responses(vec![FauxResponse::text(
+            "hi",
+        )]))
+        .await
+        .expect("build harness");
+        let events = harness.run("hello").await.expect("run");
+        let kinds = crate::differential::agent_loop_kinds(&event_kind_sequence(&events));
+        let starts = kinds.iter().filter(|k| *k == "message_start").count();
+        // The user prompt, the declaration, and the assistant's reply.
+        assert_eq!(starts, 3, "message_start count in {kinds:?}");
     }
 
     /// The faux core tool-call id matches Pi's `tool:<ts>:<rand>` shape (deterministic [CYRUP-DELTA]).
