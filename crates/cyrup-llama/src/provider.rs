@@ -594,6 +594,25 @@ impl LlamaProvider {
                 )
             })
             .collect();
+        // `if (signal.aborted) return` (`provider.ts:251`), after the props fan-out and before the
+        // final publish.
+        //
+        // **EXT-099c — this line cannot be observed by a test, and here is why.** To take the
+        // `true` branch, the token must be uncancelled at the guard above (`:571`, or this refresh
+        // returns there) and cancelled here. The only `.await` in between is the `try_join_all`
+        // fan-out, and every `props` call inside it goes through `LlamaClient::request`, whose
+        // `tokio::select!` is `biased` with `cancel.cancelled()` FIRST (`client.rs:983-989`): a
+        // cancellation that becomes visible while any props call is in flight makes that call
+        // `Err(LlamaError::Cancelled)`, the `?` propagates, and this line is never reached. Once
+        // the fan-out has resolved there is no await point left before the check, so no other task
+        // can be scheduled in between — on a current-thread runtime the window is empty, and on a
+        // multi-threaded one it is a few instructions wide and cannot be forced. A test that
+        // "covered" this line would have to cancel from inside the fan-out, which is the
+        // `Err(Cancelled)` path instead.
+        //
+        // The guard stays because upstream has it and because that instruction-wide window is
+        // real: a cancel landing in it must not publish. It is unreachable by construction in a
+        // test, NOT untested behaviour that nobody looked at.
         if ctx.cancel.is_cancelled() {
             return Ok(());
         }

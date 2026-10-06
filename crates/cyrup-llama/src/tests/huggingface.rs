@@ -981,3 +981,203 @@ async fn the_client_honours_the_provider_env_overlays_proxy() {
         "the proxy must have been asked for the absolute URL: {targets:?}"
     );
 }
+
+// --------------------------------------------------- EXT-099a: the `new Set(paths)` de-duplication --
+
+/// `huggingface.ts:56`, `for (const path of new Set(paths))`: a file named twice is tried ONCE, at
+/// the position of its first mention.
+///
+/// The de-duplication cannot be seen in [`find_huggingface_token_with_home`]'s answer — reading one
+/// file twice returns the same token — so its only effect is one fewer `readToken` call. The
+/// candidate list is that effect made observable: `token_file_candidates` is the function the `Set`
+/// lives in, and dropping its `contains` check turns this test red (EXT-099a).
+#[test]
+fn token_file_candidates_drop_duplicates_keeping_the_first_position() {
+    use crate::huggingface::token_file_candidates;
+
+    let home = Path::new("/h");
+    let xdg_token = Path::new("/x").join("huggingface").join("token");
+
+    // All four candidates distinct: four entries, in upstream's order (`huggingface.ts:50-55`).
+    let distinct = env_of(&[
+        ("HF_TOKEN_PATH", "/explicit"),
+        ("HF_HOME", "/hf"),
+        ("XDG_CACHE_HOME", "/x"),
+    ]);
+    assert_eq!(
+        token_file_candidates(&distinct, Some(home)),
+        vec![
+            Path::new("/explicit").to_path_buf(),
+            Path::new("/hf").join("token"),
+            xdg_token.clone(),
+            home.join(".cache").join("huggingface").join("token"),
+        ],
+        "four distinct candidates stay four, in order"
+    );
+
+    // `HF_TOKEN_PATH` IS `$XDG_CACHE_HOME/huggingface/token`: three candidates, and the duplicate
+    // keeps slot 0 (the `Set`'s insertion order), not slot 2.
+    let duplicated = env_of(&[
+        ("HF_TOKEN_PATH", &xdg_token.to_string_lossy()),
+        ("HF_HOME", "/hf"),
+        ("XDG_CACHE_HOME", "/x"),
+    ]);
+    assert_eq!(
+        token_file_candidates(&duplicated, Some(home)),
+        vec![
+            xdg_token.clone(),
+            Path::new("/hf").join("token"),
+            home.join(".cache").join("huggingface").join("token"),
+        ],
+        "HF_TOKEN_PATH == $XDG_CACHE_HOME/huggingface/token is tried once, in HF_TOKEN_PATH's slot"
+    );
+
+    // `HF_HOME` IS the home cache dir: `$HF_HOME/token` and `~/.cache/huggingface/token` are one
+    // file, so the home candidate disappears.
+    let hf_home = home.join(".cache").join("huggingface");
+    let folded = env_of(&[("HF_HOME", &hf_home.to_string_lossy())]);
+    assert_eq!(
+        token_file_candidates(&folded, Some(home)),
+        vec![hf_home.join("token")],
+        "HF_HOME == ~/.cache/huggingface collapses two candidates into one"
+    );
+}
+
+/// The de-duplication costs no ANSWER: the same environment with and without the duplicate finds
+/// the same token. This is the half that cannot distinguish the `Set` — it is asserted so the test
+/// above is not mistaken for the whole of what the line does.
+#[tokio::test]
+async fn de_duplication_changes_no_token() {
+    let dir = tempfile::tempdir().unwrap();
+    let xdg = dir.path().join("xdg");
+    let token_file = xdg.join("huggingface").join("token");
+    write_token(&token_file, "hf_dedup");
+    let xdg_s = text(&xdg);
+    let token_s = text(&token_file);
+
+    let with_duplicate = env_of(&[("HF_TOKEN_PATH", &token_s), ("XDG_CACHE_HOME", &xdg_s)]);
+    let without = env_of(&[("XDG_CACHE_HOME", &xdg_s)]);
+    assert_eq!(
+        find_huggingface_token_with_home(&with_duplicate, None)
+            .await
+            .as_deref(),
+        Some("hf_dedup")
+    );
+    assert_eq!(
+        find_huggingface_token_with_home(&without, None)
+            .await
+            .as_deref(),
+        Some("hf_dedup")
+    );
+}
+
+// ------------------------------------------- EXT-099b: `find_huggingface_token`'s `home_dir()` --
+
+/// Environment marker: when set, [`home_dir_probe`] is the BODY of a probe run inside a
+/// re-executed test binary rather than a no-op. Its value is the token the probe must find.
+const HOME_PROBE_ENV: &str = "CYRUP_LLAMA_HOME_DIR_PROBE";
+
+/// `huggingface.ts:54`, `join(homedir(), ".cache", "huggingface", "token")`: the ONE line
+/// [`crate::huggingface::find_huggingface_token`] adds over
+/// [`find_huggingface_token_with_home`] is `std::env::home_dir()`, and it really is the process's
+/// home.
+///
+/// `std::env::set_var` is `unsafe` and this crate is `#![forbid(unsafe_code)]` (`lib.rs:31`), so
+/// the process environment is established the way a real process gets it: by re-executing this
+/// test binary with `HOME` set, running [`home_dir_probe`] as the body. That is the technique
+/// `cyrup/src/session_launch.rs`'s `run_env_probe` uses for the same reason. The child runs under
+/// a deadline and is killed when it passes it, so a wedged child fails this test instead of
+/// hanging the suite, and the success marker is insisted on so a filter that matched NOTHING
+/// cannot pass for a probe that ran.
+#[test]
+fn home_dir_is_the_process_home() {
+    use std::io::Read as _;
+    use std::process::Stdio;
+
+    const DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
+    const TOKEN: &str = "hf_from_process_home";
+
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("home");
+    write_token(
+        &home.join(".cache").join("huggingface").join("token"),
+        TOKEN,
+    );
+
+    let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+    cmd.args([
+        "--exact",
+        "--ignored",
+        "tests::huggingface::home_dir_probe",
+        "--nocapture",
+        "--test-threads=1",
+    ]);
+    cmd.env("HOME", &home);
+    cmd.env(HOME_PROBE_ENV, TOKEN);
+    // The probe passes an EMPTY env map, but `HF_*` in the real process environment must not reach
+    // it by accident through the child's inherited environment either.
+    for inherited in ["HF_TOKEN", "HF_TOKEN_PATH", "HF_HOME", "XDG_CACHE_HOME"] {
+        cmd.env_remove(inherited);
+    }
+    let mut child = cmd
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // Drained on their own threads, so a chatty child cannot fill a pipe and stall.
+    let drain = |mut pipe: Box<dyn std::io::Read + Send>| {
+        std::thread::spawn(move || {
+            let mut text = String::new();
+            let _ = pipe.read_to_string(&mut text);
+            text
+        })
+    };
+    let stdout = drain(Box::new(child.stdout.take().unwrap()));
+    let stderr = drain(Box::new(child.stderr.take().unwrap()));
+    let started = std::time::Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break Some(status);
+        }
+        if started.elapsed() > DEADLINE {
+            let _ = child.kill();
+            let _ = child.wait();
+            break None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    let stdout = stdout.join().unwrap();
+    let stderr = stderr.join().unwrap();
+    assert!(
+        status.is_some(),
+        "the HOME probe did not finish within {DEADLINE:?} and was killed\n\
+         --- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+    );
+    assert!(
+        status.is_some_and(|s| s.success()) && stdout.contains("home-dir-probe-ok"),
+        "the HOME probe failed\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+    );
+}
+
+/// The body of the probe above. `#[ignore]`d, so an ordinary run does not count a vacuous pass:
+/// only the parent test runs it (it passes `--ignored`), in a re-executed binary with `HOME`
+/// pointing at a directory holding a token file. It is still a no-op unless [`HOME_PROBE_ENV`] is
+/// set (a person running the ignored tests by hand), and the parent insists on the success marker
+/// this prints.
+#[tokio::test]
+#[ignore = "re-executed by home_dir_is_the_process_home"]
+async fn home_dir_probe() {
+    let Ok(expected) = std::env::var(HOME_PROBE_ENV) else {
+        return;
+    };
+    // An EMPTY environment map: nothing here names a token file, so the only candidate that can
+    // produce a token is the one built from `std::env::home_dir()`.
+    let found = crate::huggingface::find_huggingface_token(&env_of(&[])).await;
+    assert_eq!(
+        found.as_deref(),
+        Some(expected.as_str()),
+        "find_huggingface_token must read $HOME/.cache/huggingface/token; HOME={:?}",
+        std::env::var_os("HOME")
+    );
+    println!("home-dir-probe-ok");
+}

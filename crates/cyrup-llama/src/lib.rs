@@ -22,6 +22,13 @@
 //! durable TUI's task panel by default`), the 17th first-parent commit after `v0.99.2`. The tag
 //! `v0.99.2-17` itself does not exist in the `tmp/pi` clone, which sits at `v1.0.0-2-g7fbbd5f4a`;
 //! line numbers cited from `resource-loader.ts` are that checkout's.
+//!
+//! Downstream pin: every `llama.cpp@b11436` citation means llama.cpp tag `b11436`
+//! (`b9a5a00b86fd285a445916086a0b1dc35bee6d66`, 2026-10-06), read as
+//! `git -C tmp/llama.cpp show b11436:tools/server/<file>`. The wire shapes that pin grounds, and
+//! the floor release the router management API arrived in (`b9688`, #23976), are recorded ONCE in
+//! `tests/llama_cpp_wire.rs` (EXT-100); the fake server in `tests/fake_server.rs` answers from
+//! that module rather than from a transcription of its own.
 #![deny(
     clippy::unwrap_used,
     clippy::expect_used,

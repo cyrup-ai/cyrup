@@ -241,8 +241,46 @@ async fn read_token(path: &Path) -> Option<String> {
 /// token file of `$HF_TOKEN_PATH`, `$HF_HOME/token`, `$XDG_CACHE_HOME/huggingface/token` and
 /// `~/.cache/huggingface/token`, de-duplicated and read in that order. The home directory is the
 /// process's, as `os.homedir()` is (`huggingface.ts:54`), not one taken from `env`.
+///
+/// The `std::env::home_dir()` call is proven in a RE-EXECUTED child with `HOME` set
+/// (`crate::tests::huggingface::home_dir_is_the_process_home`, EXT-099b), not by mutating this
+/// process: `std::env::set_var` is `unsafe` and this crate is `#![forbid(unsafe_code)]`
+/// (`lib.rs:31`).
 pub async fn find_huggingface_token(env: &BTreeMap<String, String>) -> Option<String> {
     find_huggingface_token_with_home(env, std::env::home_dir().as_deref()).await
+}
+
+/// The token files to try, in order, with duplicates dropped (`huggingface.ts:50-55` builds
+/// the array, `:56` is `for (const path of new Set(paths))`).
+///
+/// This is its own function so the de-duplication is OBSERVABLE (EXT-099a). Reading the same file
+/// twice yields the same token, so the `Set` changes no answer `find_huggingface_token_with_home`
+/// can give — its only effect is one fewer [`read_token`] call when two of the four candidates
+/// name one file, which happens whenever `HF_TOKEN_PATH` is `$HF_HOME/token` or `HF_HOME` is
+/// `$XDG_CACHE_HOME/huggingface`. Returning the list makes that effect something a test can
+/// assert, so dropping the `contains` check below turns
+/// [`crate::tests::huggingface::token_file_candidates_drop_duplicates_keeping_the_first_position`]
+/// red instead of passing silently.
+pub(crate) fn token_file_candidates(
+    env: &BTreeMap<String, String>,
+    home: Option<&Path>,
+) -> Vec<PathBuf> {
+    let non_empty = |name: &str| env.get(name).filter(|value| !value.is_empty());
+    let candidates = [
+        non_empty("HF_TOKEN_PATH").map(PathBuf::from),
+        non_empty("HF_HOME").map(|home| Path::new(home).join("token")),
+        non_empty("XDG_CACHE_HOME").map(|cache| Path::new(cache).join("huggingface").join("token")),
+        home.map(|home| home.join(".cache").join("huggingface").join("token")),
+    ];
+    let mut paths: Vec<PathBuf> = Vec::new();
+    for path in candidates.into_iter().flatten() {
+        // `new Set(paths)` (`huggingface.ts:56`): the FIRST occurrence keeps its position, which is
+        // what JS `Set` insertion order gives.
+        if !paths.contains(&path) {
+            paths.push(path);
+        }
+    }
+    paths
 }
 
 /// [`find_huggingface_token`] with the home directory given explicitly (the seam tests use,
@@ -251,27 +289,14 @@ pub async fn find_huggingface_token_with_home(
     env: &BTreeMap<String, String>,
     home: Option<&Path>,
 ) -> Option<String> {
-    let non_empty = |name: &str| env.get(name).filter(|value| !value.is_empty());
     if let Some(token) = env.get("HF_TOKEN").map(|token| js_trim(token))
         && !token.is_empty()
     {
         return Some(token.to_string());
     }
 
-    let mut paths: Vec<PathBuf> = Vec::new();
-    let candidates = [
-        non_empty("HF_TOKEN_PATH").map(PathBuf::from),
-        non_empty("HF_HOME").map(|home| Path::new(home).join("token")),
-        non_empty("XDG_CACHE_HOME").map(|cache| Path::new(cache).join("huggingface").join("token")),
-        home.map(|home| home.join(".cache").join("huggingface").join("token")),
-    ];
-    for path in candidates.into_iter().flatten() {
-        if !paths.contains(&path) {
-            paths.push(path);
-        }
-    }
-    for path in &paths {
-        if let Some(token) = read_token(path).await {
+    for path in token_file_candidates(env, home) {
+        if let Some(token) = read_token(&path).await {
             return Some(token);
         }
     }

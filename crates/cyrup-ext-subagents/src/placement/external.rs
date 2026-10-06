@@ -657,6 +657,50 @@ fn owns_pane(agent: &AgentInfo, terminal_id: &str, pane_id: &str) -> bool {
     agent.terminal_id == terminal_id && agent.pane_id == pane_id
 }
 
+/// `managedReady` inside `#waitForStartup` (`herdr-external-adapters.ts:150` — the same line at
+/// this port's @v0.68.0 and at pi's current @v0.75.0): herdr's own view that the placed agent is
+/// the one we started and can take a prompt.
+///
+/// **`[CYRUP-DELTA]` — HERDR-007; a FORWARD-PORT, ahead of the pinned herdr.** pi requires
+/// `agent_status` to be `idle` or `done` for EVERY kind (`herdr-external-adapters.ts:150`
+/// @v0.68.0 and @v0.75.0, `… && (status === "idle" || status === "done")`), and so did cyrup. herdr
+/// `9c96f7dd` (#4563 "avoid inferring codex idle from terminal output" — released in `v0.9.2`,
+/// also in `v0.9.3`, and NOT an ancestor of the pinned `v0.9.1` = `065ef9d6`) stopped inferring
+/// Codex idleness from the screen: `docs/next/website/src/content/docs/agents.mdx:77` @v0.9.3 —
+/// "Codex may therefore stay `unknown` after a response, and waits for `idle` or completion may
+/// time out. Managed startup uses the initial composer only to determine when it can accept a
+/// prompt". So against herdr v0.9.2+ a READY Codex sits at `unknown`, pi's gate never closes, the
+/// 45 s [`EXTERNAL_STARTUP_TIMEOUT`] expires and the run ends needs-attention "startup did not
+/// stabilize" with its pane retained. pi still carries that gap at
+/// `herdr-external-adapters.ts:150` @v0.75.0, so this is a deliberate divergence, not a port
+/// correction — and it is deliberately ahead of cyrup's own `v0.9.1` pin, which predates #4563.
+///
+/// Why accepting `unknown` is safe: herdr's OWN managed startup makes exactly this call.
+/// `src/cli/agent.rs:613-618` @v0.9.3 returns the started agent on
+/// `Some("unknown") if expected_kind == "codex" && agent["interactive_ready"] == Some(true)` — so
+/// `interactive_ready`, not the status word, is what herdr uses to decide Codex can accept a
+/// prompt. herdr's `unknown` arm does not test `launch_pending` at all (it reads it only in the
+/// `idle | done` arm at `:623`, to call a non-interactive agent dead); cyrup keeps `!launch_pending`
+/// here, so this gate stays strictly STRICTER than the herdr decision it mirrors.
+///
+/// Why Codex ONLY: herdr's fallback to `unknown` is Codex-specific — `agents.mdx:73` @v0.9.3 says
+/// every other known agent still falls back to `idle` ("Codex falls back to `unknown` because its
+/// title and composer can look the same during an active turn and after a response"), and
+/// `agent.rs:614` @v0.9.3 guards the arm with `expected_kind == "codex"`. Widening the relaxation
+/// to Cursor or Claude would admit a genuinely unready agent, so it is keyed off
+/// [`ExternalKind::Codex`] — and `kind` is not taken on trust: the gate's first conjunct proves
+/// `current.agent` IS that kind's `herdr_kind()`, so a drifted agent cannot borrow the Codex arm.
+#[must_use]
+pub fn managed_startup_ready(current: &AgentInfo, kind: ExternalKind) -> bool {
+    let status = status_word(&current.agent_status);
+    current.agent.as_deref() == Some(kind.herdr_kind())
+        && current.interactive_ready
+        && !current.launch_pending
+        && (status == "idle"
+            || status == "done"
+            || (kind == ExternalKind::Codex && status == "unknown"))
+}
+
 fn status_word(status: &AgentStatus) -> String {
     serde_json::to_value(status)
         .ok()
@@ -1194,10 +1238,7 @@ impl ExternalPlacedRun {
                     "External startup agent kind identity changed.".to_string(),
                 ));
             }
-            let managed_ready = current.agent.as_deref() == Some(kind.herdr_kind())
-                && current.interactive_ready
-                && !current.launch_pending
-                && (status == "idle" || status == "done");
+            let managed_ready = managed_startup_ready(&current, kind);
             if ui_ready && canonical.len() == 1 && managed_ready {
                 return Ok((canonical.first().copied().unwrap_or_default(), text));
             }
