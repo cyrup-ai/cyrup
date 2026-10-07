@@ -407,7 +407,8 @@ fn the_default_trait_surface_is_direct_active_and_ungrouped() {
 /// loadout does not know has none.
 #[test]
 fn a_loadout_hook_reads_the_prompt_guidelines_of_a_registered_tool() {
-    let seen: Arc<std::sync::Mutex<Vec<(String, Vec<String>)>>> = Arc::default();
+    type Seen = Vec<(String, Vec<String>)>;
+    let seen: Arc<std::sync::Mutex<Seen>> = Arc::default();
     let sink = Arc::clone(&seen);
     let reader = Fixture::new("reader", ToolExposure::Direct)
         .hook(move |view| {
