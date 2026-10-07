@@ -10,7 +10,30 @@
 use crate::ops::local::unique_suffix;
 use std::borrow::Cow;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+/// Output can carry private data, so only the user may read the files (pi `OUTPUT_FILE_MODE`,
+/// `utils/output-files.ts:14` @v1.0.4). Unix only: Windows files have no such mode bits.
+#[cfg(unix)]
+const OUTPUT_FILE_MODE: u32 = 0o600;
+
+/// A new output file (pi `createOutputFileStream`, `utils/output-files.ts:31-35` @v1.0.4): created
+/// exclusively, so a path someone else placed there (a link, say) is an error and is never followed
+/// (pi's `flags: "wx"`), and readable only by the user.
+///
+/// # Errors
+///
+/// The file could not be created, including when something already exists at `path`.
+pub fn create_output_file(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(OUTPUT_FILE_MODE);
+    }
+    options.open(path)
+}
 
 /// `U+FEFF` encoded as UTF-8 — the byte-order mark `TextDecoder` removes at the head of a stream
 /// when `ignoreBOM` is false (its default, output-accumulator.ts:40).
@@ -221,7 +244,7 @@ impl OutputAccumulator {
         }
         let name = format!("{}-{}.log", self.prefix, unique_suffix());
         let path = std::env::temp_dir().join(name);
-        if let Ok(mut file) = std::fs::File::create(&path) {
+        if let Ok(mut file) = create_output_file(&path) {
             for chunk in self.raw_chunks.drain(..) {
                 let _ = file.write_all(&chunk);
             }
@@ -359,6 +382,43 @@ mod tests {
         // "c" is the open last line.
         assert_eq!(acc.last_line_bytes(), 1);
         let _ = acc.finalize(2000, 50 * 1024);
+    }
+
+    /// TOOL-057 — pi `d677d0ee7` (v1.0.3): *"Output files … are now readable only by the user"*
+    /// (`utils/output-files.ts` `OUTPUT_FILE_MODE = 0o600`). RED before: the spill was created with
+    /// `File::create`, `0o666` minus the umask, measured `644`.
+    #[cfg(unix)]
+    #[test]
+    fn the_spill_file_is_readable_only_by_its_owner() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mut acc = OutputAccumulator::new("cyrup-test-mode", 2000, 16);
+        acc.append(b"0123456789abcdefghij");
+        let path = acc.finalize(2000, 16).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(mode, 0o600, "the spill must be readable only by the user");
+    }
+
+    /// pi creates output files with `flags: "wx"`: a path someone else placed there is an error and
+    /// is never followed. RED before: `File::create` truncated and followed a link.
+    #[cfg(unix)]
+    #[test]
+    fn an_output_file_is_never_created_through_a_path_someone_else_placed() {
+        let dir = std::env::temp_dir().join(format!("cyrup-output-excl-{}", unique_suffix()));
+        std::fs::create_dir(&dir).unwrap();
+        let target = dir.join("target");
+        std::fs::write(&target, b"keep").unwrap();
+        let link = dir.join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let through_link = create_output_file(&link);
+        let over_file = create_output_file(&target);
+        let kept = std::fs::read(&target).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(through_link.is_err(), "a link at the path must be refused");
+        assert!(over_file.is_err(), "an existing file must be refused");
+        assert_eq!(kept, b"keep", "the file behind the link must be untouched");
     }
 
     #[test]
