@@ -503,6 +503,16 @@ none of which existed before, so the counted set is **548**: `implemented` 347, 
 `missing` 97 + 1 = **98**, `not-applicable` 34. Severity of the three new rows: 3 low. Table F's own
 census above is left as filed.
 
+### Additions — 2026-10-07 (area 18's pi `v1.0.1..v1.0.4` triage)
+
+One row filed: `MCP-616` (13e, low, M, **missing**): `--tools` / `--exclude-tools` accept `*` patterns, `--tools`
+keeps MCP tools unless an entry starts with `mcp__`, and `--no-mcp` (pi `04b97ef00`). cyrup's allowlist is the exact-name
+`HashSet` of v1.0.1 and has no `--no-mcp`. Arithmetic on the 2026-10-06 census (552: `implemented` 349, `partial` 70,
+`missing` 99, `not-applicable` 34): +1 row = **553**; `missing` 99 + 1 = **100**; 349 + 70 + 100 + 34 = 553. Two further pi
+`v1.0.4` MCP changes were **not** read on both sides and are leads for this area's next pass, not rows: `147b50281`
+(`application_type` in OAuth dynamic client registration; cyrup registers through rmcp's fixed request, `oauth.rs`
+`prepare_session`) and `8c911797c` (`close()` aborts a connection that is still connecting).
+
 ### Closures and additions — 2026-10-06 (`claude/codemode`)
 
 Two rows moved to `implemented` in the tables above (the table rows are left as filed): `MCP-561`

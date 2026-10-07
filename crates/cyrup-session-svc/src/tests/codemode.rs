@@ -580,6 +580,44 @@ async fn presents_callable_tools_per_codemode_mode_only() {
     );
 }
 
+/// CODE-020 (pi `c30840c2e` @v1.0.4, #10343). In `only` mode `read` stays active but its declaration
+/// is left out of requests, so the system prompt must not give the model rules for a tool it can
+/// reach only through codemode: its guideline moves from the rules to its codemode section.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_guidelines_of_hidden_tools_move_from_the_rules_to_their_codemode_sections() {
+    let rig = rig(
+        no_script(),
+        Options {
+            settings: Some(r#"{ "codemode": { "mode": "only" } }"#),
+            ext: Some(ToolsExt::new(vec![echo()])),
+            ..Options::default()
+        },
+    )
+    .await;
+
+    rig.set_active(&["read", "echo", "codemode"]).await;
+    rig.ask("only").await;
+
+    let prompt = rig.request_prompt(0);
+    assert!(
+        !prompt.contains("Use read to examine files"),
+        "a hidden tool's guideline is not a rule of the prompt: {prompt}"
+    );
+    assert!(
+        !rig.session
+            .base_system_prompt()
+            .contains("Use read to examine files"),
+        "nor of the stored base prompt"
+    );
+    // The model meets the guideline where it meets the tool.
+    assert!(
+        description(&rig.request_tools(0), "codemode")
+            .contains("- Use read to examine files instead of cat or sed."),
+        "{}",
+        description(&rig.request_tools(0), "codemode")
+    );
+}
+
 /// The settings-driven mode, as `codemode.mode` values pi's extension reads them: anything but
 /// `"only"` is `on`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
