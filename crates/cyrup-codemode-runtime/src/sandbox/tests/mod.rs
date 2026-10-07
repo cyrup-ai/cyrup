@@ -10,6 +10,5 @@
 //! and closing, the heap limit, the global surface.
 
 mod port;
-mod probe_v104;
 mod runtime;
 mod support;
