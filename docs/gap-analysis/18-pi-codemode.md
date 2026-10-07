@@ -1,4 +1,4 @@
-# 18 — pi `packages/codemode` and the `codemode` tool: the `v0.87.1 → v1.0.0` window
+# 18 — pi `packages/codemode` and the `codemode` tool: the `v0.87.1 → v1.0.0` window (re-read at `v1.0.4`, 2026-10-07)
 
 **This file is new (2026-10-02).** `packages/codemode` did not exist at `v0.87.1`. It is the first of
 pi 1.0's headline features, it is a first-party package the coding agent registers as a built-in, and
@@ -43,6 +43,16 @@ Every upstream claim was settled with `git -C tmp/pi show v1.0.0:<path>`,
 `git -C tmp/pi cat-file -e <tag>:<path>` or `git -C tmp/pi log --oneline v0.87.1..v1.0.0 -- <path>`
 at a named tag. **No working tree was read.** Every cyrup claim was read at `fe875569`. **No cargo
 command was run.** This is a static reading.
+
+> **UPDATE 2026-10-07 (re-pin to pi `v1.0.4`).** Area 18's pi pin is now **`v1.0.4`** (2026-10-05, the
+> newest tag); `v1.0.0` and `v1.0.1` were the pins before. The window `v1.0.1..v1.0.4` was triaged for
+> this area (`git -C tmp/pi log --oneline v1.0.1..v1.0.4 -- packages/codemode
+> packages/coding-agent/src/extensions/codemode`; the two `CHANGELOG.md` diffs; every commit read with
+> `git -C tmp/pi show <sha>`; **no working tree read**) and the result is the closure record
+> *"Closure record, 2026-10-07 — the pi `v1.0.1..v1.0.4` window"* below. Everything *above* that record
+> that cites upstream is still pinned as it says (`v1.0.0`/`v1.0.1`); the line cites that moved are listed
+> in the record. The cyrup side of that record was read and measured at this branch's HEAD
+> (`claude/eloquent-lovelace-vivq3h`), after `CODE-014`'s closure, with cargo.
 
 ## Scope
 
@@ -129,7 +139,7 @@ override `is_hidden`, and files nothing.
 
 > The standard `ID | Severity | Kind | Effort | Title` table, as README's *Item format* requires.
 > **This table is the complete open set for area 18** — `CODE-001`…`CODE-013` all closed 2026-10-06 (see
-> the closure record below), `CODE-014` closed 2026-10-06 (second closure record below), `CODE-015`…`CODE-017` open, no `-S` series and no second table. `scripts/count_open_items.py` lists this file as area `18`; it was added to
+> the closure record below), `CODE-014` closed 2026-10-06 (second closure record below), `CODE-018`…`CODE-020` filed from the pi `v1.0.1..v1.0.4` triage and closed the same day, 2026-10-07 (third closure record below), `CODE-015`…`CODE-017` open, no `-S` series and no second table. `scripts/count_open_items.py` lists this file as area `18`; it was added to
 > `STANDARD_AREAS` in the same change that created the file, because an area the counter does not
 > know is an area whose rows are silently missing from every total.
 >
@@ -157,9 +167,9 @@ override `is_hidden`, and files nothing.
 | CODE-015 | low | not-ported | M | **A WASM guest tool cannot supply `prepareLoadout`** — `ToolDefinition.prepareLoadout` (`types.ts:625-630`). `Tool::prepare_loadout` is synchronous because it runs inside the session's tool-state lock and a guest `setActiveTools` is synchronous by design (`HostServices::set_active_tools`); a guest export is an async wasmtime call, so `WasmTool` keeps the trait default. Native tools (the `codemode` tool) use hooks today. Needs either an async loadout resolution outside the lock or a cached per-guest answer; neither was built. **FILED 2026-10-06.** |
 | CODE-016 | low | not-ported | M | **The guest side of `ctx.executeTool` has four gaps** — a guest tool cannot pass its own abort `signal` (a suspended guest has no abort handle: the nested call is cancelled only with the calling tool), a guest's `onUpdate` for a nested call receives its partial results batched after the call settles (the same results reach `tool_execution_update` events live), the instance whose own tool makes a nested call does not receive that call's `tool_call`/`tool_result`/`tool_execution_*` events (its lock is held by the call that makes them: a guest that is both permission gate and caller does not gate its own nested calls; recorded `[CYRUP-DELTA]` in `world.wit`), and a guest tool calling a tool of its own extension is refused by name (`GuestReentry`) rather than run. Native tier has none of these. **FILED 2026-10-06.** |
 | CODE-017 | low | not-ported | S | **`ToolDefinition.annotations` and `ToolInfo.annotations` are unported** — `types.ts:601`, `agent-session.ts:1473` (MCP tool annotations: `readOnlyHint`/`destructiveHint`/`idempotentHint`/`openWorldHint`, "permission extensions can use them to decide which calls to confirm"). cyrup's `Tool` has no annotations accessor, so `getAllTools` rows omit them and the MCP adapter cannot attach them to the `deferred` tools it registers. **FILED 2026-10-06** (from `CODE-005`, `MCP-604` and the guest-rows lanes). |
-| CODE-018 | low | upstream-drift | M | **Built-ins are not frozen, so a script that patches one breaks its own run, and the sandbox reports it badly.** pi `b223082bb` (v1.0.4, #10444; `packages/codemode/src/runtime/prelude-source.ts` `lockdown()`, `runtime/host.ts` `BridgeError`) freezes every object reachable from the built-in globals before the script runs, makes built-in globals read-only, and turns the commonly overridden prototype members (`constructor`, `name`, `message`, `toString`, `toLocaleString`, `valueOf`, `toJSON`, `Object.prototype`'s) into accessors so an instance can still override them; `describeError` coerces `name`/`message` with `String()`. cyrup's `crates/cyrup-codemode-runtime/src/sandbox/prelude.js` freezes only its own `tools`, `allTools`, `console` and namespaces and defines its own globals non-writable (`define`); the built-ins stay writable. **Measured on the V8 sandbox, 2026-10-07** (`sandbox/tests/probe_v104.rs`, output kept with the closure): none of the seven intrinsics upstream's test lists is `Object.isFrozen`; `Error.prototype.name = "Patched"` succeeds where upstream throws a `TypeError`; upstream's own *ignores patches to built-ins* script does not return `[[2], '{"a":1}']`, it runs to the deadline (`Timeout`); `Array.prototype.toJSON = () => null` makes **every** script fail with `sandbox: The script's store writes could not be read: invalid type: null, expected a sequence`; `Object.prototype.toJSON = () => 5; throw new Error("boom")` reports a `script` error with an empty message and no name; `error.message = 42` reports message `""` where upstream reports `"42"`. **The host-crash half of the commit is not a gap here.** The bridge is typed ops and every decode is a `Result` (`protocol.rs` `script_error`, `store_writes`; `execution.rs` `settle`): nothing unwraps and a malformed payload ends the execution as a `sandbox` error, so the process does not crash and `execute()` settles. What differs is strictness: `script_error` accepts a missing `message`, `store_writes` accepts entries of length 0 or 3+, and an unreadable return value is a `script` `RangeError` (a recorded delta), not upstream's `sandbox` `Sandbox bridge broken: …`. Severity low: one isolate per execution, so only the script that patched is affected. **FILED 2026-10-07.** |
-| CODE-019 | low | upstream-drift | M | **`image()` output is not saved to a file, and cyrup's output spill is created with the process umask.** pi `d677d0ee7` (v1.0.3, #10310; `extensions/codemode/execute.ts` `saveImages`, `utils/output-files.ts`): every distinct image a script shows is written to `<tmpdir>/pi-codemode-<16 hex>.<png/jpg/gif/webp>` (mode `0o600`, `wx`), a text item `[Image saved to <path> (<mime>, <size>)]` goes before it, a failed write becomes `[Image (<mime>, <size>) could not be saved: <error>]` and never discards the result, an image shown twice is saved once, and the tool description's globals line gains *"`image()` also saves the image to a temp file and the result names its path."* cyrup: `cyrup-codemode/src/output.rs` `plan_truncation` passes `OutputItem::Image { .. }` through untouched, `cyrup-codemode-runtime/src/tool/execute.rs` attaches the images as given, and the description's globals line is v1.0.1's. The text spill that does exist, `spill_output` / `write_spill` (`output.rs`), opens `OpenOptions::new().write(true).create_new(true)` with no mode, i.e. `0o666` minus the umask (upstream wrote the same at v1.0.1 and tightened it to `0o600` here). Model-visible effect: a later turn cannot refer to an image a script generated, and the model has no other way to reach its bytes (scripts cannot write files). **FILED 2026-10-07.** |
-| CODE-020 | low | upstream-drift | M | **Hidden tools still shape the system prompt, and codemode does not show a tool's guidelines with its declaration.** pi `c30840c2e` (v1.0.4, #10343): `BuildSystemPromptOptions.hiddenTools`; `declaredTools = selectedTools − hiddenTools` drives the tool list, `buildRules` and the skills reader (`read`/`bash` declared → named; a hidden one that is still selected → `indirect`, *"Load a skill's file when the task matches its description."*); `ToolLoadout.getPromptGuidelines(name)`; `toCodemodeDeclaration(tool, guidelines)` appends a tool's guideline bullets to its description in the codemode tool's sections, in `ALL_TOOLS` and in `describeTool()`. cyrup shipped v1.0.1's rule (`CODE-005`) and `CODE-014` carried it: `PromptRebuilder::rebuild` (`cyrup-session-svc/src/tools.rs`) blanks only a hidden tool's snippet and says *"Its guidelines stay"*, and passes the whole active set as `selected_tools`, which `rules_section` and the skills reader (`cyrup-session/src/prompt/builder.rs`) read; `LoadoutView` has no `prompt_guidelines`; `to_codemode_declaration(tool)` (`cyrup-codemode-runtime/src/tool/description.rs`) takes none; the `getSystemPromptOptions()` bag has no `hiddenTools`. **Measured** (`cyrup-session-svc` `tests/codemode.rs::the_guidelines_of_hidden_tools_move_from_the_rules_to_their_codemode_sections`, `only` mode, `read` hidden, red before the fix): the request's `<rules>` still says *"- Use read to examine files instead of cat or sed."* for a tool the model cannot call directly, and the codemode description does not carry that guideline. Wording only, so low. **FILED 2026-10-07.** |
+| ~~CODE-018~~ | ~~low~~ **CLOSED 2026-10-07 — built-ins frozen before a script runs; the prelude's report decoded strictly** | upstream-drift | M | **Built-ins are not frozen, so a script that patches one breaks its own run, and the sandbox reports it badly.** pi `b223082bb` (v1.0.4, #10444; `packages/codemode/src/runtime/prelude-source.ts` `lockdown()`, `runtime/host.ts` `BridgeError`) freezes every object reachable from the built-in globals before the script runs, makes built-in globals read-only, and turns the commonly overridden prototype members (`constructor`, `name`, `message`, `toString`, `toLocaleString`, `valueOf`, `toJSON`, `Object.prototype`'s) into accessors so an instance can still override them; `describeError` coerces `name`/`message` with `String()`. cyrup's `crates/cyrup-codemode-runtime/src/sandbox/prelude.js` freezes only its own `tools`, `allTools`, `console` and namespaces and defines its own globals non-writable (`define`); the built-ins stay writable. **Measured on the V8 sandbox, 2026-10-07** (`sandbox/tests/probe_v104.rs`, output kept with the closure): none of the seven intrinsics upstream's test lists is `Object.isFrozen`; `Error.prototype.name = "Patched"` succeeds where upstream throws a `TypeError`; upstream's own *ignores patches to built-ins* script does not return `[[2], '{"a":1}']`, it runs to the deadline (`Timeout`); `Array.prototype.toJSON = () => null` makes **every** script fail with `sandbox: The script's store writes could not be read: invalid type: null, expected a sequence`; `Object.prototype.toJSON = () => 5; throw new Error("boom")` reports a `script` error with an empty message and no name; `error.message = 42` reports message `""` where upstream reports `"42"`. **The host-crash half of the commit is not a gap here.** The bridge is typed ops and every decode is a `Result` (`protocol.rs` `script_error`, `store_writes`; `execution.rs` `settle`): nothing unwraps and a malformed payload ends the execution as a `sandbox` error, so the process does not crash and `execute()` settles. What differs is strictness: `script_error` accepts a missing `message`, `store_writes` accepts entries of length 0 or 3+, and an unreadable return value is a `script` `RangeError` (a recorded delta), not upstream's `sandbox` `Sandbox bridge broken: …`. Severity low: one isolate per execution, so only the script that patched is affected. **FILED 2026-10-07.** |
+| ~~CODE-019~~ | ~~low~~ **CLOSED 2026-10-07 — `image()` output saved to files readable only by the user, path named before each image; the spill is private too** | upstream-drift | M | **`image()` output is not saved to a file, and cyrup's output spill is created with the process umask.** pi `d677d0ee7` (v1.0.3, #10310; `extensions/codemode/execute.ts` `saveImages`, `utils/output-files.ts`): every distinct image a script shows is written to `<tmpdir>/pi-codemode-<16 hex>.<png/jpg/gif/webp>` (mode `0o600`, `wx`), a text item `[Image saved to <path> (<mime>, <size>)]` goes before it, a failed write becomes `[Image (<mime>, <size>) could not be saved: <error>]` and never discards the result, an image shown twice is saved once, and the tool description's globals line gains *"`image()` also saves the image to a temp file and the result names its path."* cyrup: `cyrup-codemode/src/output.rs` `plan_truncation` passes `OutputItem::Image { .. }` through untouched, `cyrup-codemode-runtime/src/tool/execute.rs` attaches the images as given, and the description's globals line is v1.0.1's. The text spill that does exist, `spill_output` / `write_spill` (`output.rs`), opens `OpenOptions::new().write(true).create_new(true)` with no mode, i.e. `0o666` minus the umask (upstream wrote the same at v1.0.1 and tightened it to `0o600` here). Model-visible effect: a later turn cannot refer to an image a script generated, and the model has no other way to reach its bytes (scripts cannot write files). **FILED 2026-10-07.** |
+| ~~CODE-020~~ | ~~low~~ **CLOSED 2026-10-07 — hidden tools out of the rules, the tool list and the skills hint; guidelines shown with codemode declarations** | upstream-drift | M | **Hidden tools still shape the system prompt, and codemode does not show a tool's guidelines with its declaration.** pi `c30840c2e` (v1.0.4, #10343): `BuildSystemPromptOptions.hiddenTools`; `declaredTools = selectedTools − hiddenTools` drives the tool list, `buildRules` and the skills reader (`read`/`bash` declared → named; a hidden one that is still selected → `indirect`, *"Load a skill's file when the task matches its description."*); `ToolLoadout.getPromptGuidelines(name)`; `toCodemodeDeclaration(tool, guidelines)` appends a tool's guideline bullets to its description in the codemode tool's sections, in `ALL_TOOLS` and in `describeTool()`. cyrup shipped v1.0.1's rule (`CODE-005`) and `CODE-014` carried it: `PromptRebuilder::rebuild` (`cyrup-session-svc/src/tools.rs`) blanks only a hidden tool's snippet and says *"Its guidelines stay"*, and passes the whole active set as `selected_tools`, which `rules_section` and the skills reader (`cyrup-session/src/prompt/builder.rs`) read; `LoadoutView` has no `prompt_guidelines`; `to_codemode_declaration(tool)` (`cyrup-codemode-runtime/src/tool/description.rs`) takes none; the `getSystemPromptOptions()` bag has no `hiddenTools`. **Measured** (`cyrup-session-svc` `tests/codemode.rs::the_guidelines_of_hidden_tools_move_from_the_rules_to_their_codemode_sections`, `only` mode, `read` hidden, red before the fix): the request's `<rules>` still says *"- Use read to examine files instead of cat or sed."* for a tool the model cannot call directly, and the codemode description does not carry that guideline. Wording only, so low. **FILED 2026-10-07.** |
 
 ---
 
@@ -301,6 +311,83 @@ test): re-adding the agent prompt fails `a_prompt_pi_wrote_is_replaced_not_repea
 writing the whole blob instead of the diff fails seven; the old key order fails six; the compaction
 snapshot order, the forced-prompt projection, the turn-boundary reconciliation, diff removals, the
 base-prompt-follows-tools update and the differential anchor each fail their own named tests.
+
+## Closure record, 2026-10-07 — the pi `v1.0.1..v1.0.4` window (`CODE-018`…`CODE-020`; `TOOL-057` in area 04)
+
+Upstream is pi **`v1.0.4`** for this record, read only through git objects
+(`git -C tmp/pi show v1.0.4:<path>`, `git -C tmp/pi log --oneline v1.0.1..v1.0.4 -- <path>`,
+`git -C tmp/pi diff v1.0.1 v1.0.4 -- <path>`); the cyrup side was read at this branch's HEAD and measured by
+running it. Where `v1.0.1` and `v1.0.4` were compared, the row says what differs; no claim is made that
+anything is unchanged between them unless the row says both were read.
+
+**What the window holds for this area.** Nine commits touch `packages/codemode` or
+`packages/coding-agent/src/extensions/codemode` in `v1.0.1..v1.0.4`: three that matter here (`b223082bb`,
+`d677d0ee7`, `c30840c2e`), three `Release` commits and three `[Unreleased]` housekeeping commits. Two more
+that the coding-agent changelog lists for codemode touch other paths (`021eae60a` in `core/tools/read.ts`,
+`1b094148b` in `config.ts` and the bundle script) and are in the table too.
+
+| upstream | what it does | cyrup before | disposition |
+|---|---|---|---|
+| `b223082bb` (v1.0.4, #10444) `fix(codemode): survive scripts that patch built-ins` | `lockdown()` in `prelude-source.ts` freezes the reachable built-ins and makes built-in globals read-only, with "override mistake" accessors; `describeError` coerces with `String()`; `host.ts` `BridgeError` fails an execution whose worker payload is malformed with a `sandbox` error | built-ins writable, probes below | **`CODE-018` closed.** The *host-crash* half is **not a gap**: the bridge is typed ops and every decode is a `Result` (measured: nothing unwraps; a malformed payload already ended the execution as a `sandbox` error). The *strictness* half was a gap and closed with it |
+| `d677d0ee7` (v1.0.3, #10310) `feat(coding-agent): save codemode image() output to temp files` | `image()` writes each distinct image to `pi-codemode-<16 hex>.<ext>` (0600, `wx`) and names the path in the result before the image; every output file becomes owner-only | images unlabelled; the spill file mode 644 | **`CODE-019` closed** (codemode half) and **`TOOL-057` closed** (the two bash spill sites, area 04). The MCP-blob half is the area-13 lead below |
+| `c30840c2e` (v1.0.4, #10343) `fix(coding-agent): keep hidden tools out of prompt rules and skills hint` | `hiddenTools` in the prompt options; `ToolLoadout.getPromptGuidelines()`; codemode declarations carry guidelines | rules and skills hint named hidden tools | **`CODE-020` closed** |
+| `021eae60a` (v1.0.4, #10251) `resolve codemode read calls on images to image blocks` | `read` declares `outputSchema` and sets `structuredContent` | no `output_schema` on `read` | **`TOOL-058` open** (area 04, S) |
+| `1b094148b` (v1.0.3, #10439) `keep codemode working after the install is updated or removed` | resolves the QuickJS wasm path once, spawns the bundled worker from an in-memory `data:` URL, and shows a restart hint when errors follow an on-disk install change (`config.ts`, `interactive-mode.ts`, the bundle script) | there is no wasm asset or worker file to resolve at run time: V8 links into the binary (`CODE-013`) | no row. Read from the commit's stat and message; the diff was not read line by line, so "no counterpart" rests on `CODE-013`'s closure, not on a second reading |
+
+**Measured on this branch before any change** (`cargo nextest`, V8 sandbox, session-svc; outputs in the
+session scratchpad `redproofs-v104/code018-00-BEFORE-probe.txt`, `code019-01-BEFORE.txt`,
+`code020-01-BEFORE.txt`; the throw-away probe module `sandbox/tests/probe_v104.rs` that produced the first was deleted when its cases became the real tests): none of the seven intrinsics upstream's test names was `Object.isFrozen`;
+upstream's own *ignores patches to built-ins* script ran to the deadline; `Array.prototype.toJSON = () =>
+null` made every script fail with `sandbox: The script's store writes could not be read`;
+`Error.prototype.name` could be overwritten; `error.message = 42` reported `""`; the text spill was mode
+`644`; no image carried a label; with `read` hidden in `only` mode the request's `<rules>` still said *"Use
+read to examine files instead of cat or sed."*.
+
+**What shipped, and where.**
+
+| row | shipped in | notes |
+|---|---|---|
+| `CODE-018` | `cyrup-codemode-runtime/src/sandbox/{prelude.js,protocol.rs,execution.rs}` | `lockdown()` after the prelude's own setup and before the script, covering the intrinsics reachable only from instances (generator, async function, typed-array prototypes, …); `describeError` `String()`; `BridgeError`, a strict `script_error` and `store_writes` (a missing `message`, an entry of length 0 or 3+ is now refused with the reason upstream names). **Cost, measured in the dev profile: about 8–10 ms per execution** (one isolate per execution; release not measured). **Recorded delta:** an unreadable *return value* is still a `script` `RangeError`, where upstream reports a `sandbox` `Sandbox bridge broken: …` |
+| `CODE-019` | `cyrup-codemode/src/output.rs`, `cyrup-codemode-runtime/src/tool/{execute,description}.rs`, `Cargo.toml` (`base64`) | labels are added **after** truncation, so a path is never cut; a write that fails becomes `[Image (<mime>, <size>) could not be saved: <error>]` and the image is kept; a type with no extension is refused before anything is written; sizes use `formatSize`'s `toFixed(1)` ties-away-from-zero rounding. The tool description's globals line and `docs/codemode.md` now say so |
+| `CODE-020` | `cyrup-core/src/exposure.rs` (`LoadoutView::prompt_guidelines`, `normalized_prompt_guidelines`), `cyrup-session/src/prompt/{builder,skills_inject}.rs`, `cyrup-session-svc/src/{tools,builder}.rs`, `cyrup-codemode-runtime/src/tool/{description,loadout,execute}.rs` | the prompt follows the *declared* set (active minus hidden); a hidden reader that is still selected makes the skills hint say *"Load a skill's file when the task matches its description."* (pi's `indirect`); the fingerprint hashes the hidden set; the `getSystemPromptOptions()` bag gains `hiddenTools` |
+| `TOOL-057` | `cyrup-tools/src/output.rs` (`create_output_file`), `cyrup-session-svc/src/bash.rs` | the row named one site; there were **two** `File::create` spills (the accumulator and the user-`!` bash buffer). **Recorded delta:** names keep cyrup's `pid-nanos-counter` suffix, not upstream's 8 random bytes; exclusive create, not the name, is what stops a planted path |
+
+**Red proofs.** Every new test was seen to fail against the old behaviour, by reverting one production piece
+at a time (a "mutation"; the mutation diff and the failing output of each are in the session scratchpad
+`redproofs-v104/`, not in the repository): `CODE-018` 8 mutations (no lockdown → 4 tests fail; no `String()`
+coercion, no override accessors, instance-only intrinsics left writable, globals writable, lenient
+`script_error`, lenient `store_writes`, `settle` swallowing the bridge error → one named test each);
+`CODE-020` 10 (declared names, skills reader, rebuild, build-time hidden set, loadout guidelines,
+`describeTool`, view accessor, declaration bullets, options bag, indirect text → 1–3 tests each);
+`CODE-019` 9 (no labels → 5 tests; no dedupe, not private → 6, not exclusive, failure label, no extension
+check, `formatSize` ties, wiring → 6, description line); `TOOL-057` 4 (no mode → 2; not exclusive → 1; each
+bash site back to `File::create` → 1 each).
+
+**Upstream line cites that moved or were wrong** (re-found by symbol, not shifted): `PRELUDE_SOURCE`
+`prelude-source.ts:42` → **`:46`**; `MAX_OUTPUT_CHARS` / `MAX_OUTPUT_ITEMS` `:36-37` → **`:40-41`**;
+`CodemodeSandbox` `host.ts:285` → **`:340`**; the `constrainedSampling` grammar line `tool.ts:380` →
+**`:395`**. **`CodemodeModelRuntime` `tool.ts:70-74` was wrong at every tag read** (`v1.0.0`, `v1.0.1`,
+`v1.0.4`): the `export type` is at `:61-64`, and `:70-74` is the `models?: boolean` option.
+
+**Not done, and leads for other areas** (filed there, not widened here):
+
+- `TOOL-058` (open, area 04): `read` has no `output_schema`, so `image(await tools.read({ path }))` shows
+  nothing in a cyrup script. Needs the structured result at every return site of `read.rs`.
+- `MCP-616` (open, area 13, filed by this triage): `--tools` / `--exclude-tools` `*` patterns, `--tools`
+  keeping MCP tools, and `--no-mcp` (pi `04b97ef00`). It couples to this area: `--tools codemode` is what
+  `codemode.mode: only` invites, and there a script reaches no MCP tool in cyrup. Two other `v1.0.4` MCP
+  commits (`147b50281`, OAuth `application_type`; `8c911797c`, `close()` of a connecting server) are leads in
+  `13-cyrup-mcp-STATUS.md`, not rows.
+- The *binary MCP resources* in `d677d0ee7`'s output-file change: cyrup-mcp's blob path already writes
+  `0o600` + `create_new` (`cyrup-mcp/src/renderers.rs`, read, not measured on a running binary), so no row.
+- Not in this area and not read for a row, only seen in the coding-agent changelog: the Azure provider rename
+  and Foundry Chat Completions (`1.0.3`, area 01), `Home`/`End` (`1.0.3`, area 07),
+  `samplingParamsByThinkingLevel` (`1.0.2`, area 01), the Bedrock retry and the syntax-highlighting fix
+  (`1.0.4`). Not triaged; the next full pass over those areas should diff from their own pins.
+- `packages/codemode/CHANGELOG.md` (`1.0.2`…`1.0.4`) holds exactly the two `1.0.4` entries (lockdown; the
+  `sandbox` error for malformed payloads) and empty `1.0.2` / `1.0.3` sections. The coding-agent
+  `CHANGELOG.md` adds, for this area, the image-save, hidden-tool and `read`-image entries above and the
+  install-update fix (`1b094148b`).
 
 ## CODE-001 — `packages/codemode` is unported. DECIDED 2026-10-05: build it, scheduled later
 
@@ -810,6 +897,7 @@ install location, and that a second sandbox in the same process does not recompi
 - **`docs/codemode.md` was read at the heading level plus its *Models* section.** It is the
   model-facing reference the tool description links to, so its exact wording is part of `CODE-007`'s
   obligation and has not been diffed word by word.
+- **CORRECTED 2026-10-07: `v1.0.1..v1.0.4` was read** for this area (closure record above); the range `v1.0.0..v1.0.1` was read on 2026-10-03 for the growth notes only. What remains unread is anything after `v1.0.4`.
 - **The `v1.0.0..HEAD` range was not read.** Every claim here is pinned to the tag. `packages/codemode`
   is twelve commits old and moving; the next pass should diff `v1.0.0..<next>` before trusting a line
   number above.
