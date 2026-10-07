@@ -138,7 +138,9 @@ impl PromptRebuilder {
     /// - `selectedTools` — the ACTIVE names (pi's `validToolNames`), not `base.selected_tools`,
     ///   which is cleared on the rebuild base by design.
     /// - `toolSnippets` — `{name: snippet}` over the active tools that have one.
-    /// - `promptGuidelines` — each active tool's guidelines in active order, then cyrup's
+    /// - `hiddenTools` — the active tools whose declarations requests leave out
+    ///   (`BuildSystemPromptOptions.hiddenTools`, `system-prompt.ts:16-20` @v1.0.4).
+    /// - `promptGuidelines` — each DECLARED active tool's guidelines in active order, then cyrup's
     ///   free-floating [`PromptInputs::prompt_guidelines`], which upstream has no channel for.
     /// - `customPrompt` / `appendSystemPrompt` — omitted when unset, as pi omits `undefined`.
     /// - `cwd`, `contextFiles` (`{path, content}`), `skills`.
@@ -147,15 +149,15 @@ impl PromptRebuilder {
         let mut guidelines: Vec<String> = Vec::new();
         for name in active {
             if let Some(c) = self.contributions.get(name) {
-                // A hidden declaration is left out of the tool listing, as it is out of the
-                // request (pi `_rebuildSystemPrompt`, `agent-session.ts:1655-1658` @v1.0.1);
-                // its guidelines stay.
-                if !hidden.contains(name)
-                    && let Some(s) = c.snippet.as_ref()
-                {
+                if let Some(s) = c.snippet.as_ref() {
                     snippets.insert(name.clone(), serde_json::Value::String(s.to_string()));
                 }
-                guidelines.extend(c.guidelines.iter().map(|g| g.to_string()));
+                // A hidden declaration is left out of the rules as it is out of the request:
+                // `hiddenTools` names it instead (pi `_rebuildSystemPrompt`,
+                // `agent-session.ts:1688-1710` @v1.0.4).
+                if !hidden.contains(name) {
+                    guidelines.extend(c.guidelines.iter().map(|g| g.to_string()));
+                }
             }
         }
         guidelines.extend(self.base.prompt_guidelines.iter().map(|g| g.to_string()));
@@ -169,6 +171,15 @@ impl PromptRebuilder {
         }
         bag.insert("selectedTools".into(), serde_json::json!(active));
         bag.insert("toolSnippets".into(), serde_json::Value::Object(snippets));
+        bag.insert(
+            "hiddenTools".into(),
+            serde_json::json!(
+                active
+                    .iter()
+                    .filter(|name| hidden.contains(*name))
+                    .collect::<Vec<_>>()
+            ),
+        );
         bag.insert("promptGuidelines".into(), serde_json::json!(guidelines));
         if let Some(append) = self.base.append_system_prompt.as_ref() {
             bag.insert(
@@ -199,18 +210,15 @@ impl PromptRebuilder {
     fn rebuild(&self, active: &[String], hidden: &BTreeSet<String>) -> BuiltPrompt {
         let mut inputs = self.base.clone();
         inputs.selected_tools = Some(active.iter().map(|n| Arc::from(n.as_str())).collect());
+        // The tool list and the rules must match the declarations the request carries: a tool whose
+        // declaration is hidden is reachable only through another tool, so the builder leaves it
+        // out of the listing, the rules and the skills hint (pi `_preparePromptAndToolLoadout`,
+        // `options.hiddenTools = [...this._hiddenDeclarations]`, `agent-session.ts:1727-1728`
+        // @v1.0.4, CODE-020; v1.0.1 blanked the snippet and kept the guidelines).
+        inputs.hidden_tools = hidden.iter().map(|n| Arc::from(n.as_str())).collect();
         inputs.tool_contributions = active
             .iter()
             .filter_map(|n| self.contributions.get(n).cloned())
-            .map(|mut c| {
-                // The listing must match the declarations the request carries, so a tool whose
-                // declaration is hidden is not listed (pi `_preparePromptAndToolLoadout`,
-                // `agent-session.ts:1693-1697` @v1.0.1). Its guidelines stay.
-                if hidden.contains(&*c.tool) {
-                    c.snippet = None;
-                }
-                c
-            })
             .collect();
         BuiltPrompt::new(SystemPromptBuilder::new().build_sections(&inputs))
     }

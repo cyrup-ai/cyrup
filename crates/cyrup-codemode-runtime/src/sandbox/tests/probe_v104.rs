@@ -74,7 +74,11 @@ async fn probe_instance_overrides() {
 #[tokio::test]
 async fn probe_non_string_error_fields() {
     let sandbox = sandbox(vec![]);
-    let result = run(&sandbox, "const error = new Error('x'); error.message = 42; throw error;").await;
+    let result = run(
+        &sandbox,
+        "const error = new Error('x'); error.message = 42; throw error;",
+    )
+    .await;
     eprintln!("PROBE4 {result:#?}");
     let result = run(&sandbox, "const e = new Error('x'); e.name = {}; throw e;").await;
     eprintln!("PROBE4b {result:#?}");

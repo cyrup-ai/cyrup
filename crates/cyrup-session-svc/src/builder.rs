@@ -1907,16 +1907,18 @@ impl SessionBuilder {
             .iter()
             .map(|t| Arc::from(t.name()))
             .collect();
+        // The tool list, the rules and the skills hint follow the DECLARED tools, so the hidden
+        // ones are handed to the builder rather than blanked here (pi `hiddenTools`,
+        // `system-prompt.ts:16-20` @v1.0.4, CODE-020).
         let tool_contributions: Vec<ToolPromptContribution> = initial_loadout
             .executable()
             .iter()
-            .map(|t| {
-                let mut c = tool_contribution(t);
-                if initial_loadout.hidden_declarations().contains(t.name()) {
-                    c.snippet = None;
-                }
-                c
-            })
+            .map(tool_contribution)
+            .collect();
+        let hidden_tools: Vec<Arc<str>> = initial_loadout
+            .hidden_declarations()
+            .iter()
+            .map(|name| Arc::from(name.as_str()))
             .collect();
 
         // CFG-035 — `SYSTEM.md` / `APPEND_SYSTEM.md` discovery. Pi's `load()` resolves
@@ -1959,6 +1961,7 @@ impl SessionBuilder {
                 .or(discovered_system_prompt)
                 .map(Arc::from),
             selected_tools: Some(selected_tools),
+            hidden_tools,
             tool_contributions,
             prompt_guidelines: Vec::new(),
             append_system_prompt: cfg
@@ -1995,6 +1998,7 @@ impl SessionBuilder {
         // (`PromptRebuilder::rebuild` assigns `inputs.selected_tools = Some(active…)`, tools.rs:61),
         // so the value is never observed — but it must not READ as the restricted case.
         rebuild_base.selected_tools = None;
+        rebuild_base.hidden_tools = Vec::new();
         rebuild_base.tool_contributions = Vec::new();
         // Shared with `host_services` so a loaded guest's `setActiveTools`/`getActiveTools`
         // capability read+mutates the SAME authoritative active-tool view the host/CLI toggle uses

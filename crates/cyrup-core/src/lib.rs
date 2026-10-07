@@ -38,6 +38,7 @@ pub use event_stream::{Finalizing, FinalizingSink, FinalizingStream, finalizing_
 pub use exposure::{
     AdvertisedTools, LoadoutHookFailure, LoadoutView, ToolExposure, ToolLoadout,
     ToolLoadoutChanges, ToolNamespace, UnknownExposure, callable_tools,
+    normalized_prompt_guidelines,
 };
 pub use keyed_lock::{Cancelled, KeyedAcquire, KeyedGuard, KeyedLockMap, KeyedLocks};
 pub use lazy_args::LazyArgs;

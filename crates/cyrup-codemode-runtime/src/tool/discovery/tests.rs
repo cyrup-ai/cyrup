@@ -32,7 +32,7 @@ impl Globals {
             .map(|tool| {
                 (
                     tool.name().to_owned(),
-                    render_tool_sample(&to_codemode_declaration(tool.as_ref()), None),
+                    render_tool_sample(&to_codemode_declaration(tool.as_ref(), &[]), None),
                 )
             })
             .collect();

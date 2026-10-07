@@ -53,6 +53,11 @@ pub struct PromptInputs {
     /// `Vec` advertised skills and tool guidelines to a caller that deliberately restricted the
     /// agent to zero tools.
     pub selected_tools: Option<Vec<Arc<str>>>,
+    /// Selected tools whose declarations requests leave out (`prepareLoadout`'s hidden
+    /// declarations; pi `BuildSystemPromptOptions.hiddenTools`, `system-prompt.ts:16-20` @v1.0.4).
+    /// They are reachable only through another tool, so the tool list and the rules leave them out
+    /// too, and the skills hint names none of them (CODE-020).
+    pub hidden_tools: Vec<Arc<str>>,
     /// Per-tool one-line snippets + guideline bullets (R-06-012/013).
     pub tool_contributions: Vec<ToolPromptContribution>,
     /// Extra free-floating guideline bullets (non-tool-specific).
@@ -76,6 +81,7 @@ impl Default for PromptInputs {
         Self {
             custom_prompt: None,
             selected_tools: None,
+            hidden_tools: Vec::new(),
             tool_contributions: Vec::new(),
             prompt_guidelines: Vec::new(),
             append_system_prompt: None,
@@ -187,11 +193,21 @@ impl SystemPromptBuilder {
         let mut parts: Vec<(&'static str, String)> = Vec::with_capacity(8);
 
         // SESS-059 — Pi gates the skills section on a tool that can READ a skill file being in the
-        // effective set, `read` first, then `bash`: `const skillFileReadTool = (["read", "bash"]
-        // as const).find((tool) => selectedTools.includes(tool))` (`:165`).
+        // effective set, `read` first, then `bash`. CODE-020 (`c30840c2e` @v1.0.4): the reader is
+        // looked for among the DECLARED tools first; a reader that is selected but hidden is still
+        // reachable through another tool, so the skills stay and the hint names no tool
+        // (`"indirect"`):
+        // `readers.find((tool) => declaredTools.includes(tool)) ?? (readers.some((tool) =>
+        // selectedTools.includes(tool)) ? "indirect" : undefined)` (`:175-178`).
         let skill_file_read_tool = ["read", "bash"]
             .into_iter()
-            .find(|tool| is_selected(inp.selected_tools.as_ref(), tool));
+            .find(|tool| is_declared(inp, tool))
+            .or_else(|| {
+                ["read", "bash"]
+                    .into_iter()
+                    .any(|tool| is_selected(inp.selected_tools.as_ref(), tool))
+                    .then_some(INDIRECT_READER)
+            });
 
         // `if (customPrompt)` is a truthiness test: the empty string is NOT a custom prompt.
         match inp.custom_prompt.as_deref().filter(|c| !c.is_empty()) {
@@ -251,7 +267,7 @@ impl SystemPromptBuilder {
     fn tools_section(&self, inp: &PromptInputs) -> String {
         let t = self.tmpl;
         let mut listing = String::new();
-        for name in selected_names(inp.selected_tools.as_ref()) {
+        for name in declared_names(inp) {
             let snippet = inp
                 .tool_contributions
                 .iter()
@@ -281,7 +297,7 @@ impl SystemPromptBuilder {
         // 3a. conditional file-exploration fallback (Pi `system-prompt.ts:101-109`). The gate is
         // `(hasBash || hasPowerShell)`, and the bullet names whichever shells are actually selected
         // — a PowerShell-only session must not be told to use `ls, rg, find`.
-        let has = |n: &str| is_selected(inp.selected_tools.as_ref(), n);
+        let has = |n: &str| is_declared(inp, n);
         let has_bash = has("bash");
         let has_powershell = has("powershell");
         if (has_bash || has_powershell) && !has("grep") && !has("find") && !has("ls") {
@@ -294,8 +310,10 @@ impl SystemPromptBuilder {
             };
             push_rule(&mut rules, guideline);
         }
-        // 3b. tool-specific guidelines, in selection order (named per func-03 R-03-039)
-        for name in selected_names(inp.selected_tools.as_ref()) {
+        // 3b. tool-specific guidelines, in selection order (named per func-03 R-03-039), of the
+        // DECLARED tools: a hidden tool's guidelines are shown with its declaration where the model
+        // meets it (codemode), not as rules for a tool the request does not carry (CODE-020).
+        for name in declared_names(inp) {
             if let Some(c) = inp.tool_contributions.iter().find(|c| &*c.tool == name) {
                 for g in &c.guidelines {
                     push_rule(&mut rules, g);
@@ -346,6 +364,9 @@ impl SystemPromptBuilder {
                 tools.hash(&mut h);
             }
         }
+        let mut hidden: Vec<&str> = inp.hidden_tools.iter().map(|t| &**t).collect();
+        hidden.sort_unstable();
+        hidden.hash(&mut h);
         for c in &inp.tool_contributions {
             c.tool.hash(&mut h);
             opt_str_hash(&mut h, &c.snippet);
@@ -412,6 +433,24 @@ fn selected_names(selected: Option<&Vec<Arc<str>>>) -> Vec<&str> {
         None => DEFAULT_SELECTED_TOOLS.to_vec(),
         Some(v) => v.iter().map(|t| &**t).collect(),
     }
+}
+
+/// What the skills hint names when the reader is selected but hidden (pi `formatSkillsForPrompt`'s
+/// third `fileReadTool`, `skills.ts` @v1.0.4): no tool.
+pub(super) const INDIRECT_READER: &str = "indirect";
+
+/// A tool is declared if it is selected and its declaration is not hidden: pi's `declaredTools =
+/// selectedTools.filter((name) => !hiddenTools.includes(name))` (`system-prompt.ts:150` @v1.0.4).
+fn is_declared(inp: &PromptInputs, name: &str) -> bool {
+    is_selected(inp.selected_tools.as_ref(), name) && !inp.hidden_tools.iter().any(|t| &**t == name)
+}
+
+/// The declared tool names, in selection order.
+fn declared_names(inp: &PromptInputs) -> Vec<&str> {
+    selected_names(inp.selected_tools.as_ref())
+        .into_iter()
+        .filter(|name| !inp.hidden_tools.iter().any(|t| &**t == *name))
+        .collect()
 }
 
 /// Pi's `addRule` (`system-prompt.ts:88-93`): trimmed, non-empty, first occurrence wins.

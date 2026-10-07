@@ -1084,3 +1084,100 @@ fn a_section_cyrup_does_not_build_is_removed_by_a_null_and_never_edited() {
         r#"{"preamble":"pi","experimental_pi_only":"<x>\nkept by pi\n</x>","cwd":"<cwd>\n/w\n</cwd>"}"#
     );
 }
+
+// ── CODE-020 (pi `c30840c2e` @v1.0.4, #10343): hidden tools stay out of the tools list, the rules
+// and the skills hint ───────────────────────────────────────────────────────────────────────────
+//
+// Upstream's `describe("hidden tools")` in `test/system-prompt.test.ts`, case by case: `read`,
+// `bash` and `run` are selected, `run` is the only one with a guideline other than `read`'s.
+
+fn hidden_inputs(hidden: &[&str]) -> PromptInputs {
+    PromptInputs {
+        selected_tools: Some(vec![arc("read"), arc("bash"), arc("run")]),
+        hidden_tools: hidden.iter().map(|name| arc(name)).collect(),
+        tool_contributions: vec![
+            ToolPromptContribution::snippet("read", "Read files")
+                .with_guideline("Use read for files."),
+            ToolPromptContribution::snippet("bash", "Run commands"),
+            ToolPromptContribution::snippet("run", "Run a task").with_guideline("Prefer run."),
+        ],
+        skills: Arc::from(vec![skill("demo", "a demo", "/skills/demo/SKILL.md")]),
+        ..base_inputs()
+    }
+}
+
+fn section(inp: &PromptInputs, name: &str) -> String {
+    SystemPromptBuilder::new()
+        .build_sections(inp)
+        .get(name)
+        .flatten()
+        .unwrap_or_default()
+        .to_owned()
+}
+
+#[test]
+fn hidden_tools_are_left_out_of_the_tool_list_and_the_rules() {
+    let inp = hidden_inputs(&["read", "bash"]);
+    let tools = section(&inp, "tools");
+    assert!(tools.starts_with("<tools>\n- run: Run a task\n"), "{tools}");
+    assert!(!tools.contains("- read: "), "{tools}");
+    let rules = section(&inp, "rules");
+    assert!(!rules.contains("Use read for files."), "{rules}");
+    // `bash` is hidden, so the file-operations fallback that names it is not a rule either.
+    assert!(!rules.contains("Use bash for file operations"), "{rules}");
+    assert!(rules.contains("- Prefer run."), "{rules}");
+}
+
+#[test]
+fn the_skills_hint_names_no_tool_when_the_reader_is_hidden() {
+    let hint = |hidden: &[&str]| section(&hidden_inputs(hidden), "skills");
+    // Both readers hidden: the skills stay, and the hint says nothing about how to load them.
+    let both = hint(&["read", "bash"]);
+    assert!(
+        both.contains("\nLoad a skill's file when the task matches its description."),
+        "{both}"
+    );
+    assert!(!both.contains("Use bash to load"), "{both}");
+    assert!(!both.contains("Use the read tool to load"), "{both}");
+    // `read` hidden, `bash` declared.
+    assert!(hint(&["read"]).contains("Use bash to load a skill's file"));
+    // Nothing hidden: unchanged.
+    assert!(hint(&[]).contains("Use the read tool to load a skill's file"));
+}
+
+#[test]
+fn hidden_tools_that_are_not_selected_change_nothing() {
+    // `hiddenTools` is a subset of the selection in pi (`_hiddenDeclarations` ⊆ active); a stale
+    // name must not hide a tool that is not there, nor turn the skills hint indirect.
+    let plain = hidden_inputs(&[]);
+    let stale = hidden_inputs(&["not_a_tool"]);
+    assert_eq!(
+        SystemPromptBuilder::new().build_sections(&plain),
+        SystemPromptBuilder::new().build_sections(&stale)
+    );
+}
+
+#[test]
+fn no_selected_reader_means_no_skills_section_whatever_is_hidden() {
+    let inp = PromptInputs {
+        selected_tools: Some(vec![arc("edit")]),
+        hidden_tools: vec![arc("edit")],
+        skills: Arc::from(vec![skill("demo", "a demo", "/skills/demo/SKILL.md")]),
+        ..base_inputs()
+    };
+    assert!(
+        SystemPromptBuilder::new()
+            .build_sections(&inp)
+            .get("skills")
+            .is_none()
+    );
+}
+
+#[test]
+fn hiding_a_tool_changes_the_fingerprint() {
+    let builder = SystemPromptBuilder::new();
+    assert_ne!(
+        builder.inputs_fingerprint(&hidden_inputs(&[])),
+        builder.inputs_fingerprint(&hidden_inputs(&["read"]))
+    );
+}

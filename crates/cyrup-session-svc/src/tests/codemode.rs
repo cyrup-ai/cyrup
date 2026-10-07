@@ -1589,6 +1589,109 @@ async fn real_javascript_runs_against_the_session() {
     assert_eq!(result_text(&results[1]), "2");
 }
 
+/// CODE-020. The prompt a session is BUILT with follows the declared tools as well, not only the
+/// prompt a later `setActiveTools` rebuilds: `read` is hidden from the start (`--tools read,codemode`
+/// in `only` mode), so its guideline is not in the first request's rules.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_session_that_starts_with_a_hidden_tool_leaves_it_out_of_its_first_prompt() {
+    let fx = fixture();
+    let mut cfg = SessionConfig::new(fx.cwd.clone(), fx.agent_dir.clone());
+    cfg.trust_override = Some(true);
+    cfg.no_extensions = false;
+    cfg.tools = Some(vec!["read".to_owned(), "codemode".to_owned()]);
+    let store = Arc::new(InMemorySettingsStore::new());
+    store.seed(
+        SettingsScope::Global,
+        r#"{ "codemode": { "mode": "only" } }"#,
+    );
+    let faux = Arc::new(FauxProvider::new());
+    let session = SessionBuilder::new(faux.clone() as Arc<dyn Provider>, cfg)
+        .settings_store(store)
+        .with_codemode(CodemodeExtension::new(
+            Default::default(),
+            Arc::new(ScriptedSandboxFactory::new(no_script())),
+        ))
+        .build()
+        .await
+        .unwrap()
+        .into_shared();
+    let built = session.base_system_prompt();
+    assert!(
+        !built.contains("Use read to examine files"),
+        "the prompt the session was built with: {built}"
+    );
+    assert!(built.contains("\n- codemode: "), "{built}");
+    let requests: Requests = Arc::new(Mutex::new(Vec::new()));
+    faux.set_response_steps(steps(&requests, vec![None]));
+    let _ = session.prompt("go").await.unwrap();
+    session.wait_for_idle().await;
+    let prompt = requests.lock().unwrap()[0].1.clone();
+    assert!(!prompt.contains("Use read to examine files"), "{prompt}");
+    assert!(
+        description(&requests.lock().unwrap()[0].0, "codemode")
+            .contains("- Use read to examine files instead of cat or sed.")
+    );
+}
+
+/// CODE-020 (pi `c30840c2e` @v1.0.4, #10343). A tool that does not fit the inline budget has no
+/// section in the codemode description, so its guidelines — which its hidden declaration left out of
+/// the system prompt — reach the model through `describeTool()`, in real JavaScript.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn describe_tool_shows_the_guidelines_of_a_tool_beyond_the_inline_budget() {
+    let fx = fixture();
+    let mut cfg = SessionConfig::new(fx.cwd.clone(), fx.agent_dir.clone());
+    cfg.trust_override = Some(true);
+    cfg.no_extensions = false;
+    let store = Arc::new(InMemorySettingsStore::new());
+    store.seed(
+        SettingsScope::Global,
+        r#"{ "codemode": { "mode": "only", "inlineBudget": 0 } }"#,
+    );
+    let faux = Arc::new(FauxProvider::new());
+    let session = SessionBuilder::new(faux.clone() as Arc<dyn Provider>, cfg)
+        .settings_store(store)
+        .with_codemode(CodemodeExtension::new(
+            Default::default(),
+            Arc::new(cyrup_codemode_runtime::tool::EngineSandboxFactory),
+        ))
+        .build()
+        .await
+        .unwrap()
+        .into_shared();
+    session
+        .set_active_tools_by_name(&["read".to_owned(), "codemode".to_owned()])
+        .await;
+    let requests: Requests = Arc::new(Mutex::new(Vec::new()));
+    faux.set_response_steps(steps(
+        &requests,
+        vec![
+            Some(json!({ "code": "text(await describeTool(\"read\"))" })),
+            None,
+        ],
+    ));
+    let _ = session.prompt("go").await.unwrap();
+    session.wait_for_idle().await;
+
+    let reqs = requests.lock().unwrap().clone();
+    let codemode = description(&reqs[0].0, "codemode");
+    assert!(
+        !codemode.contains("### `read`"),
+        "a zero budget lists no tool section: {codemode}"
+    );
+    let result = session
+        .messages()
+        .await
+        .into_iter()
+        .rev()
+        .find(|m| matches!(m, Message::ToolResult { tool_name, .. } if tool_name == "codemode"))
+        .unwrap();
+    assert!(
+        result_text(&result).contains("- Use read to examine files instead of cat or sed."),
+        "{}",
+        result_text(&result)
+    );
+}
+
 // ------------------------------------------------------------------------------------- models --
 
 /// A provider that lists a classifier and an image model, serves them with fixed credentials, and

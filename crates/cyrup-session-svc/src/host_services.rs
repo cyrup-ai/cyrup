@@ -3876,6 +3876,68 @@ mod tests {
         );
     }
 
+    /// A tool whose loadout hook hides another tool's declaration, as the `codemode` tool does in
+    /// `only` mode.
+    struct HidingTool;
+
+    #[async_trait::async_trait]
+    impl Tool for HidingTool {
+        fn name(&self) -> &str {
+            "hider"
+        }
+        fn parameters(&self) -> &Value {
+            static PARAMS: std::sync::OnceLock<Value> = std::sync::OnceLock::new();
+            PARAMS.get_or_init(|| json!({"type": "object", "properties": {}}))
+        }
+        fn description(&self) -> &str {
+            "hides bash"
+        }
+        fn prepare_loadout(
+            &self,
+            _view: &cyrup_core::LoadoutView<'_>,
+        ) -> Result<cyrup_core::ToolLoadoutChanges, cyrup_core::ToolError> {
+            Ok(cyrup_core::ToolLoadoutChanges {
+                hidden_declarations: vec!["bash".to_owned()],
+                ..Default::default()
+            })
+        }
+        async fn execute(
+            &self,
+            _call_id: cyrup_core::ToolCallId,
+            _args: Value,
+            _cancel: CancelToken,
+            _on_update: cyrup_core::ToolUpdateSink,
+        ) -> Result<cyrup_core::ToolResult, cyrup_core::ToolError> {
+            Ok(cyrup_core::ToolResult::default())
+        }
+    }
+
+    /// CODE-020 (pi `c30840c2e` @v1.0.4): the bag names the tools whose declarations requests leave
+    /// out (`hiddenTools`), and the guidelines it carries are the DECLARED tools' — a hidden tool's
+    /// guideline is not a rule of the prompt the bag stands behind.
+    #[test]
+    fn system_prompt_options_names_the_hidden_tools_and_drops_their_guidelines() {
+        let provider: Arc<dyn Provider> = Arc::new(FauxProvider::new());
+        let svc = svc_with(provider);
+        let read: Arc<dyn Tool> = Arc::new(CatalogTool::new("read", vec!["read: prefer read"]));
+        let bash: Arc<dyn Tool> = Arc::new(CatalogTool::new("bash", vec!["bash: prefer bash"]));
+        let hider: Arc<dyn Tool> = Arc::new(HidingTool);
+        svc.attach_dynamic_tools(dynamic_tools_with(vec![read, bash, hider]));
+
+        let bag = svc.system_prompt_options().expect("a live view answers");
+        assert_eq!(bag["hiddenTools"], json!(["bash"]), "{bag}");
+        assert_eq!(
+            bag["promptGuidelines"],
+            json!(["read: prefer read"]),
+            "bash is hidden, so its guideline is not carried: {bag}"
+        );
+        assert_eq!(
+            bag["selectedTools"],
+            json!(["read", "bash", "hider"]),
+            "a hidden tool stays selected (active): {bag}"
+        );
+    }
+
     /// EXT-038 — `all_tools()` must report the WHOLE merged registry (built-ins included) in pi's
     /// `ToolInfo` shape, not the extension-only view `registry.tool_info()` gives. Guards the
     /// functional half: a plan-mode extension reads this before calling `setActiveTools`, and the
