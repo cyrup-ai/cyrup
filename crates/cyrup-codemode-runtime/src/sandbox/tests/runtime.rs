@@ -310,7 +310,8 @@ async fn hostile_thrown_values_are_still_reported() {
         "const r = Proxy.revocable({}, {}); r.revoke(); throw r.proxy;",
         // A `stack` getter that throws.
         "const e = new Error('bad'); Object.defineProperty(e, 'stack', { get() { throw new Error('no stack'); } }); throw e;",
-        // A stack formatter that throws.
+        // A stack formatter that throws. `Error` is frozen (CODE-018), so the assignment does nothing
+        // and this now shows that the script's own error is the one reported.
         "Error.prepareStackTrace = () => { throw new Error('formatter'); }; throw new Error('bad');",
         // A message that is not a string.
         "throw Object.assign(new Error('x'), { name: 5, message: { not: 'a string' } });",

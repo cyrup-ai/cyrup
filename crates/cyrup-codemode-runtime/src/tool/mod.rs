@@ -247,6 +247,7 @@ impl CodemodeTool {
                 models: options.models,
                 namespaces: &std::collections::BTreeMap::new(),
                 deferred: &std::collections::BTreeSet::new(),
+                guidelines: &std::collections::BTreeMap::new(),
                 inline_budget: None,
                 docs_path: &options.docs_path,
             },

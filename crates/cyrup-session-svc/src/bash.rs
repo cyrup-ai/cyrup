@@ -437,7 +437,7 @@ impl BashOutputBuffer {
             return;
         }
         let path = std::env::temp_dir().join(format!("cyrup-bash-{}.log", unique_temp_suffix()));
-        if let Ok(mut file) = std::fs::File::create(&path) {
+        if let Ok(mut file) = cyrup_tools::output::create_output_file(&path) {
             for chunk in &self.chunks {
                 let _ = file.write_all(chunk.as_bytes());
             }
@@ -774,6 +774,27 @@ mod sanitize_tests {
             let _ = sanitize_binary_output(&stripped);
             let _ = sanitize_chunk(&s);
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+#[allow(clippy::unwrap_used)]
+mod spill_file_tests {
+    use super::{BashOutputBuffer, DEFAULT_MAX_BYTES};
+    use std::os::unix::fs::PermissionsExt as _;
+
+    /// TOOL-057 — the user-`!` bash spill (`bash-executor.ts:66` `createOutputFileStream`, v1.0.4)
+    /// is readable only by the user. RED before: `File::create`, measured `644`.
+    #[test]
+    fn the_full_output_file_is_readable_only_by_its_owner() {
+        let mut buffer = BashOutputBuffer::new();
+        buffer.push_raw(&vec![b'x'; DEFAULT_MAX_BYTES + 1]);
+        let (_, truncated, path) = buffer.finish();
+        let path = path.unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        let _ = std::fs::remove_file(&path);
+        assert!(truncated);
+        assert_eq!(mode, 0o600);
     }
 }
 

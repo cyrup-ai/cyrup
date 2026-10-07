@@ -14,6 +14,7 @@ struct Fixture {
     default_active: bool,
     namespace: Option<ToolNamespace>,
     hook: Option<Hook>,
+    guidelines: Vec<&'static str>,
 }
 
 impl Fixture {
@@ -26,7 +27,13 @@ impl Fixture {
             default_active: true,
             namespace: None,
             hook: None,
+            guidelines: Vec::new(),
         }
+    }
+
+    fn guided(mut self, guidelines: &[&'static str]) -> Self {
+        self.guidelines = guidelines.to_vec();
+        self
     }
 
     fn hook(
@@ -61,6 +68,9 @@ impl Tool for Fixture {
     }
     fn default_active(&self) -> bool {
         self.default_active
+    }
+    fn prompt_guidelines(&self) -> Vec<&str> {
+        self.guidelines.clone()
     }
     fn prepare_loadout(&self, view: &LoadoutView<'_>) -> Result<ToolLoadoutChanges, ToolError> {
         match &self.hook {
@@ -390,4 +400,43 @@ fn the_default_trait_surface_is_direct_active_and_ungrouped() {
     let view_names = names(&["bare"]);
     let l = ToolLoadout::resolve(&view_names, &reg);
     assert_eq!(l.advertised().names(), ["bare"]);
+}
+
+/// CODE-020 (pi `ToolLoadout.getPromptGuidelines`, `extensions/types.ts:549` @v1.0.4): a hook reads
+/// a registered tool's guidelines, trimmed, without the empty ones and without a repeat; a name the
+/// loadout does not know has none.
+#[test]
+fn a_loadout_hook_reads_the_prompt_guidelines_of_a_registered_tool() {
+    type Seen = Vec<(String, Vec<String>)>;
+    let seen: Arc<std::sync::Mutex<Seen>> = Arc::default();
+    let sink = Arc::clone(&seen);
+    let reader = Fixture::new("reader", ToolExposure::Direct)
+        .hook(move |view| {
+            let mut sink = sink.lock().unwrap();
+            for name in ["guided", "bare", "unknown"] {
+                sink.push((name.to_owned(), view.prompt_guidelines(name)));
+            }
+            Ok(ToolLoadoutChanges::default())
+        })
+        .arc();
+    let guided = Fixture::new("guided", ToolExposure::Direct)
+        .guided(&["  Use it.  ", "", "   ", "Use it.", "Then stop."])
+        .arc();
+    let bare = Fixture::new("bare", ToolExposure::Direct).arc();
+    let registry = vec![reader, guided, bare];
+    let _ = ToolLoadout::resolve(
+        &["reader".to_owned(), "guided".to_owned(), "bare".to_owned()],
+        &registry,
+    );
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec![
+            (
+                "guided".to_owned(),
+                vec!["Use it.".to_owned(), "Then stop.".to_owned()]
+            ),
+            ("bare".to_owned(), Vec::new()),
+            ("unknown".to_owned(), Vec::new()),
+        ]
+    );
 }

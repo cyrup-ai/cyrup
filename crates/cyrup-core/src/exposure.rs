@@ -217,6 +217,34 @@ impl<'a> LoadoutView<'a> {
             .find(|t| t.name() == name)
             .and_then(|t| t.namespace().cloned())
     }
+
+    /// The prompt guidelines of the registered tool `name`, normalized as
+    /// [`normalized_prompt_guidelines`] says. A tool the loadout hides from requests leaves them out
+    /// of the system prompt, so a tool that lists it (codemode) shows them with its declaration
+    /// instead (pi `ToolLoadout.getPromptGuidelines`, `extensions/types.ts:549` @v1.0.4, CODE-020).
+    /// An unknown name has none, as upstream's `?? []`.
+    pub fn prompt_guidelines(&self, name: &str) -> Vec<String> {
+        self.registered
+            .iter()
+            .rev()
+            .find(|t| t.name() == name)
+            .map(|t| normalized_prompt_guidelines(t.as_ref()))
+            .unwrap_or_default()
+    }
+}
+
+/// A tool's prompt guidelines as the system prompt and the codemode declarations carry them:
+/// trimmed, empty ones dropped, the first occurrence of a duplicate kept (pi
+/// `_normalizePromptGuidelines`, `core/agent-session.ts:1670-1682` @v1.0.4).
+pub fn normalized_prompt_guidelines(tool: &dyn Tool) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for guideline in tool.prompt_guidelines() {
+        let guideline = guideline.trim();
+        if !guideline.is_empty() && !out.iter().any(|seen| seen == guideline) {
+            out.push(guideline.to_owned());
+        }
+    }
+    out
 }
 
 /// A `prepare_loadout` hook that failed. The hook's tool is named; the message is the error's own

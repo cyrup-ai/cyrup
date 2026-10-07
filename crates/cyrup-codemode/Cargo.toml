@@ -28,6 +28,9 @@ thiserror = { workspace = true }
 # 8 random bytes for the spill file name (`randomBytes(8)`, pi `execute.ts:263`). Same pin as
 # `cyrup-permission-system`; `std` makes its error a `std::error::Error`.
 getrandom = { version = "0.3", features = ["std"] }
+# Decodes an `image()` block's data to the bytes the saved file holds and the size its label names
+# (pi `Buffer.from(data, "base64")`, `execute.ts` `saveImages` @v1.0.3).
+base64 = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

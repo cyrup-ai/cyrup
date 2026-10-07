@@ -1,4 +1,5 @@
-//! `packages/codemode/test/sandbox.test.ts` @v1.0.1, case by case and in its order. A case that
+//! `packages/codemode/test/sandbox.test.ts` @v1.0.1, case by case and in its order (and the four
+//! `escape hatches` cases v1.0.4 adds, at the end of `escape_hatches`). A case that
 //! needed adapting says why in a comment headed `ADAPTED`.
 
 use std::sync::{Arc, Mutex};
@@ -1128,5 +1129,129 @@ mod escape_hatches {
         )
         .await;
         assert_eq!(value(&result), Some(json!([false, "still"])));
+    }
+
+    // The four cases below are `test/sandbox.test.ts` @v1.0.4 (`b223082bb`, #10444), under
+    // `escape hatches`. The prelude shares the built-ins with the script, so patching them could
+    // corrupt what the prelude sends to the host. The upstream cases for a malformed worker payload
+    // (`reports a broken bridge as a sandbox error`) have no worker to post from here: the bridge
+    // is typed ops, and the decoding they exercise is pinned in `protocol.rs` and `execution.rs`.
+
+    #[tokio::test]
+    async fn ignores_patches_to_built_ins_and_built_in_globals() {
+        let sandbox = sandbox(vec![echo()]);
+        let result = run(
+            &sandbox,
+            r#"
+            Array.prototype.toJSON = () => null;
+            Object.prototype.toJSON = () => 5;
+            Promise.prototype.then = () => {};
+            Map.prototype.get = () => undefined;
+            globalThis.JSON = { stringify: () => "x", parse: () => "x" };
+            store("k", [1]);
+            return [await tools.echo([2]), JSON.stringify({ a: 1 })];
+        "#,
+        )
+        .await;
+        assert_eq!(value(&result), Some(json!([[2], "{\"a\":1}"])));
+        let CodemodeResult::Completed { store_writes, .. } = &result else {
+            panic!("{result:#?}");
+        };
+        assert_eq!(store_writes.set.get("k"), Some(&json!([1])));
+    }
+
+    #[tokio::test]
+    async fn freezes_intrinsics_that_are_only_reachable_from_instances() {
+        let sandbox = sandbox(vec![]);
+        let result = run(
+            &sandbox,
+            r#"
+            return [
+                Object.getPrototypeOf(function* () {}).prototype,
+                Object.getPrototypeOf(async function () {}),
+                Object.getPrototypeOf(Int8Array).prototype,
+                Object.getPrototypeOf([][Symbol.iterator]()),
+                Object.getPrototypeOf(Object.getPrototypeOf([][Symbol.iterator]())),
+                Object.getPrototypeOf(new Map()[Symbol.iterator]()),
+                Object.getPrototypeOf(/a/[Symbol.matchAll]("")),
+            ].every((object) => Object.isFrozen(object));
+        "#,
+        )
+        .await;
+        assert_eq!(value(&result), Some(json!(true)));
+    }
+
+    #[tokio::test]
+    async fn still_lets_instances_override_properties_of_frozen_prototypes() {
+        let sandbox = sandbox(vec![]);
+        let result = run(
+            &sandbox,
+            r#"
+            const object = {};
+            object.toString = () => "custom";
+            function Legacy() {}
+            Legacy.prototype = Object.create(Error.prototype);
+            Legacy.prototype.constructor = Legacy;
+            const bare = new Error();
+            bare.message = "set later";
+            class MyError extends Error {
+                constructor(message) {
+                    super(message);
+                    this.name = "MyError";
+                }
+            }
+            let patched = "silent";
+            try { Error.prototype.name = "Patched"; } catch (error) { patched = error.constructor.name; }
+            return [String(object), new Legacy().constructor === Legacy, bare.message, new MyError("x").name, Error.prototype.name, patched];
+        "#,
+        )
+        .await;
+        assert_eq!(
+            value(&result),
+            Some(json!([
+                "custom",
+                true,
+                "set later",
+                "MyError",
+                "Error",
+                "TypeError"
+            ]))
+        );
+    }
+
+    #[tokio::test]
+    async fn reports_errors_whose_name_or_message_is_not_a_string() {
+        let sandbox = sandbox(vec![]);
+        let result = run(
+            &sandbox,
+            "const error = new Error('x'); error.message = 42; throw error;",
+        )
+        .await;
+        let failure = error(&result);
+        assert_eq!(failure.kind, ErrorKind::Script, "{result:?}");
+        assert_eq!(failure.name.as_deref(), Some("Error"));
+        assert_eq!(failure.message, "42");
+    }
+
+    // [CYRUP-DELTA] V8 only: `Error.prepareStackTrace` is a property a script could set to format
+    // its own stack. `Error` is frozen now, so the assignment does nothing and the script's own
+    // error is reported as it was thrown.
+    #[tokio::test]
+    async fn a_script_cannot_install_a_stack_formatter() {
+        let sandbox = sandbox(vec![]);
+        let result = run(
+            &sandbox,
+            "Error.prepareStackTrace = () => { throw new Error('formatter'); }; throw new Error('bad');",
+        )
+        .await;
+        let failure = error(&result);
+        assert_eq!(failure.kind, ErrorKind::Script, "{result:?}");
+        assert_eq!(failure.message, "bad");
+        let result = run(
+            &sandbox,
+            "Error.prepareStackTrace = () => 1; Error.stackTraceLimit = 0; return [typeof Error.prepareStackTrace, Error.stackTraceLimit];",
+        )
+        .await;
+        assert_eq!(value(&result), Some(json!(["undefined", 10])));
     }
 }

@@ -485,6 +485,38 @@ fn result_text(message: &Message) -> String {
         .join("\n")
 }
 
+/// What `image()` leaves in a result since pi `d677d0ee7` (v1.0.3, #10310): the label
+/// `[Image saved to <path>.png (image/png, <n>B)]` before each image. Checks that the file holds the
+/// image `data` (base64), that only its owner can read it, removes it, and replaces the label with
+/// `<saved>` (upstream's `checkSavedImages`, `agent-session-codemode.test.ts`).
+fn check_saved_images(text: &str, data: &str) -> String {
+    use base64::Engine as _;
+    text.split('\n')
+        .map(|line| {
+            let Some(rest) = line.strip_prefix("[Image saved to ") else {
+                return line.to_owned();
+            };
+            let (path, kind) = rest.split_once(" (image/png, ").expect(line);
+            assert!(path.ends_with(".png") && kind.ends_with("B)]"), "{line}");
+            assert_eq!(
+                std::fs::read(path).unwrap(),
+                base64::engine::general_purpose::STANDARD
+                    .decode(data)
+                    .unwrap()
+            );
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                let mode = std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+                assert_eq!(mode, 0o600, "{path}");
+            }
+            std::fs::remove_file(path).unwrap();
+            "<saved>".to_owned()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn is_error(message: &Message) -> bool {
     matches!(message, Message::ToolResult { is_error: true, .. })
 }
@@ -577,6 +609,44 @@ async fn presents_callable_tools_per_codemode_mode_only() {
     assert_eq!(
         description(&rig.request_tools(1), "echo"),
         "Echo text back.\n\nSecond paragraph."
+    );
+}
+
+/// CODE-020 (pi `c30840c2e` @v1.0.4, #10343). In `only` mode `read` stays active but its declaration
+/// is left out of requests, so the system prompt must not give the model rules for a tool it can
+/// reach only through codemode: its guideline moves from the rules to its codemode section.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_guidelines_of_hidden_tools_move_from_the_rules_to_their_codemode_sections() {
+    let rig = rig(
+        no_script(),
+        Options {
+            settings: Some(r#"{ "codemode": { "mode": "only" } }"#),
+            ext: Some(ToolsExt::new(vec![echo()])),
+            ..Options::default()
+        },
+    )
+    .await;
+
+    rig.set_active(&["read", "echo", "codemode"]).await;
+    rig.ask("only").await;
+
+    let prompt = rig.request_prompt(0);
+    assert!(
+        !prompt.contains("Use read to examine files"),
+        "a hidden tool's guideline is not a rule of the prompt: {prompt}"
+    );
+    assert!(
+        !rig.session
+            .base_system_prompt()
+            .contains("Use read to examine files"),
+        "nor of the stored base prompt"
+    );
+    // The model meets the guideline where it meets the tool.
+    assert!(
+        description(&rig.request_tools(0), "codemode")
+            .contains("- Use read to examine files instead of cat or sed."),
+        "{}",
+        description(&rig.request_tools(0), "codemode")
     );
 }
 
@@ -1066,21 +1136,26 @@ async fn adds_the_usage_of_nested_results_to_the_codemode_result() {
     assert!((stats.cost - 0.5).abs() < 1e-10, "{}", stats.cost);
 }
 
-/// Upstream `attaches only the images the script passes to image(), in output order`: output items
-/// keep their order and the image block reaches the persisted result.
+/// Upstream `attaches only the images the script passes to image(), in output order, each after its
+/// saved path` (@v1.0.3): output items keep their order, the image block reaches the persisted
+/// result, and each image follows a text item naming the file it was saved to. The same image shown
+/// twice is saved once, so both labels name one file.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn attaches_only_the_images_the_script_passes_to_image_in_output_order() {
+async fn attaches_only_the_images_the_script_passes_to_image_in_output_order_each_after_its_saved_path()
+ {
     let rig = rig(
         script(|_code, env| async move {
             // Tools without an outputSchema resolve to their text; images are not passed on.
             let shot = env.tool("screenshot", json!({})).await.unwrap().unwrap();
+            let image = || OutputItem::Image {
+                data: TINY_PNG.to_owned(),
+                mime_type: "image/png".to_owned(),
+            };
             completed(
                 vec![
                     OutputItem::Text(shot.as_str().unwrap().to_owned()),
-                    OutputItem::Image {
-                        data: TINY_PNG.to_owned(),
-                        mime_type: "image/png".to_owned(),
-                    },
+                    image(),
+                    image(),
                     text("after"),
                 ],
                 None,
@@ -1094,12 +1169,20 @@ async fn attaches_only_the_images_the_script_passes_to_image_in_output_order() {
     .await;
     rig.set_active(&["codemode", "screenshot"]).await;
     let result = rig.run("go").await;
-    assert_eq!(result_text(&result), "captured\n<image>\nafter");
+    let body = result_text(&result);
+    let lines: Vec<&str> = body.split('\n').collect();
+    assert_eq!(
+        lines,
+        [
+            "captured", lines[1], "<image>", lines[1], "<image>", "after"
+        ]
+    );
+    assert_eq!(check_saved_images(lines[1], TINY_PNG), "<saved>");
     let Message::ToolResult { content, .. } = &result else {
         panic!()
     };
     assert_eq!(
-        content[2],
+        content[3],
         Content::Image {
             data: TINY_PNG.to_owned(),
             mime_type: "image/png".to_owned()
@@ -1337,8 +1420,13 @@ async fn truncates_output_to_the_token_budget_and_spills_the_full_text() {
     let Message::ToolResult { content, .. } = &result else {
         panic!()
     };
-    // Images follow the truncated text.
+    // Images follow the truncated text, each after the path it was saved to.
     assert!(matches!(content.last(), Some(Content::Image { .. })));
+    let lines: Vec<&str> = body.split('\n').collect();
+    assert_eq!(
+        check_saved_images(lines[lines.len() - 2], TINY_PNG),
+        "<saved>"
+    );
     let full = std::fs::read_to_string(&path).unwrap();
     std::fs::remove_file(&path).unwrap();
     assert_eq!(
@@ -1549,6 +1637,109 @@ async fn real_javascript_runs_against_the_session() {
     }
     assert_eq!(result_text(&results[0]), "[\"echo: hi\",[\"a\",\"b\"]]");
     assert_eq!(result_text(&results[1]), "2");
+}
+
+/// CODE-020. The prompt a session is BUILT with follows the declared tools as well, not only the
+/// prompt a later `setActiveTools` rebuilds: `read` is hidden from the start (`--tools read,codemode`
+/// in `only` mode), so its guideline is not in the first request's rules.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_session_that_starts_with_a_hidden_tool_leaves_it_out_of_its_first_prompt() {
+    let fx = fixture();
+    let mut cfg = SessionConfig::new(fx.cwd.clone(), fx.agent_dir.clone());
+    cfg.trust_override = Some(true);
+    cfg.no_extensions = false;
+    cfg.tools = Some(vec!["read".to_owned(), "codemode".to_owned()]);
+    let store = Arc::new(InMemorySettingsStore::new());
+    store.seed(
+        SettingsScope::Global,
+        r#"{ "codemode": { "mode": "only" } }"#,
+    );
+    let faux = Arc::new(FauxProvider::new());
+    let session = SessionBuilder::new(faux.clone() as Arc<dyn Provider>, cfg)
+        .settings_store(store)
+        .with_codemode(CodemodeExtension::new(
+            Default::default(),
+            Arc::new(ScriptedSandboxFactory::new(no_script())),
+        ))
+        .build()
+        .await
+        .unwrap()
+        .into_shared();
+    let built = session.base_system_prompt();
+    assert!(
+        !built.contains("Use read to examine files"),
+        "the prompt the session was built with: {built}"
+    );
+    assert!(built.contains("\n- codemode: "), "{built}");
+    let requests: Requests = Arc::new(Mutex::new(Vec::new()));
+    faux.set_response_steps(steps(&requests, vec![None]));
+    let _ = session.prompt("go").await.unwrap();
+    session.wait_for_idle().await;
+    let prompt = requests.lock().unwrap()[0].1.clone();
+    assert!(!prompt.contains("Use read to examine files"), "{prompt}");
+    assert!(
+        description(&requests.lock().unwrap()[0].0, "codemode")
+            .contains("- Use read to examine files instead of cat or sed.")
+    );
+}
+
+/// CODE-020 (pi `c30840c2e` @v1.0.4, #10343). A tool that does not fit the inline budget has no
+/// section in the codemode description, so its guidelines — which its hidden declaration left out of
+/// the system prompt — reach the model through `describeTool()`, in real JavaScript.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn describe_tool_shows_the_guidelines_of_a_tool_beyond_the_inline_budget() {
+    let fx = fixture();
+    let mut cfg = SessionConfig::new(fx.cwd.clone(), fx.agent_dir.clone());
+    cfg.trust_override = Some(true);
+    cfg.no_extensions = false;
+    let store = Arc::new(InMemorySettingsStore::new());
+    store.seed(
+        SettingsScope::Global,
+        r#"{ "codemode": { "mode": "only", "inlineBudget": 0 } }"#,
+    );
+    let faux = Arc::new(FauxProvider::new());
+    let session = SessionBuilder::new(faux.clone() as Arc<dyn Provider>, cfg)
+        .settings_store(store)
+        .with_codemode(CodemodeExtension::new(
+            Default::default(),
+            Arc::new(cyrup_codemode_runtime::tool::EngineSandboxFactory),
+        ))
+        .build()
+        .await
+        .unwrap()
+        .into_shared();
+    session
+        .set_active_tools_by_name(&["read".to_owned(), "codemode".to_owned()])
+        .await;
+    let requests: Requests = Arc::new(Mutex::new(Vec::new()));
+    faux.set_response_steps(steps(
+        &requests,
+        vec![
+            Some(json!({ "code": "text(await describeTool(\"read\"))" })),
+            None,
+        ],
+    ));
+    let _ = session.prompt("go").await.unwrap();
+    session.wait_for_idle().await;
+
+    let reqs = requests.lock().unwrap().clone();
+    let codemode = description(&reqs[0].0, "codemode");
+    assert!(
+        !codemode.contains("### `read`"),
+        "a zero budget lists no tool section: {codemode}"
+    );
+    let result = session
+        .messages()
+        .await
+        .into_iter()
+        .rev()
+        .find(|m| matches!(m, Message::ToolResult { tool_name, .. } if tool_name == "codemode"))
+        .unwrap();
+    assert!(
+        result_text(&result).contains("- Use read to examine files instead of cat or sed."),
+        "{}",
+        result_text(&result)
+    );
 }
 
 // ------------------------------------------------------------------------------------- models --
@@ -1941,9 +2132,17 @@ async fn generates_images_with_catalog_auth_and_attaches_them_through_image() {
 
     let result = rig.run("go").await;
 
+    let Message::ToolResult { content, .. } = &result else {
+        panic!()
+    };
+    let Some(Content::Image { data, .. }) =
+        content.iter().find(|c| matches!(c, Content::Image { .. }))
+    else {
+        panic!("{content:?}")
+    };
     assert_eq!(
-        result_text(&result),
-        "painted a fox\n<image>\n[\"error\",\"painter exploded\"]"
+        check_saved_images(&result_text(&result), data),
+        "painted a fox\n<saved>\n<image>\n[\"error\",\"painter exploded\"]"
     );
     assert!(
         observed

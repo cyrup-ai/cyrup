@@ -400,7 +400,9 @@ fn millis(duration: Duration) -> u64 {
 /// `host.ts:201-208` `handleDone`.
 fn settle(settled: ScriptSettled) -> Finish {
     match settled {
-        ScriptSettled::Threw(error_json) => Err(script_error(&error_json)),
+        ScriptSettled::Threw(error_json) => {
+            Err(script_error(&error_json).unwrap_or_else(|error| sandbox_error(error.to_string())))
+        }
         ScriptSettled::Returned { value, writes } => {
             let value = value
                 .as_deref()
@@ -457,6 +459,46 @@ mod tests {
             pending: HashMap::new(),
         };
         (run, replies)
+    }
+
+    /// pi's `reports a broken bridge as a sandbox error` (`sandbox.test.ts` @v1.0.4, #10444): what
+    /// the prelude sends when it finishes is decoded strictly, and a payload that does not decode
+    /// ends the execution as a `sandbox` error that says why, instead of a script error with an
+    /// empty message or a store write that is silently dropped.
+    #[test]
+    fn a_settlement_that_does_not_decode_is_a_sandbox_error_naming_the_reason() {
+        let sandbox_message = |settled: ScriptSettled| match settle(settled) {
+            Ok(_) => panic!("a malformed settlement was accepted"),
+            Err(error) => {
+                assert_eq!(error.kind, ErrorKind::Sandbox, "{error:?}");
+                error.message
+            }
+        };
+        let returned = |writes: &str| ScriptSettled::Returned {
+            value: Some(String::from("1")),
+            writes: writes.to_owned(),
+        };
+        for (settled, reason) in [
+            (returned("null"), "store writes are not an array"),
+            (returned("[1]"), "store writes contain a malformed entry"),
+            (
+                returned(r#"[["k","{"]]"#),
+                "store value for \"k\" is not valid JSON",
+            ),
+            (
+                ScriptSettled::Threw(String::from("5")),
+                "script error is not an object",
+            ),
+            (
+                ScriptSettled::Threw(String::from("{}")),
+                "script error is malformed",
+            ),
+        ] {
+            assert!(
+                sandbox_message(settled).starts_with(&format!("Sandbox bridge broken: {reason}. ")),
+                "{reason}"
+            );
+        }
     }
 
     fn call(id: u32, name: &str, args: Option<&str>) -> WorkerMessage {

@@ -5,6 +5,28 @@ next work item**.
 
 ---
 
+# UPDATE 2026-10-07 (area 18, pi `v1.0.1..v1.0.4`) — area 18 re-pinned to `v1.0.4`; `CODE-018`…`CODE-020` and `TOOL-057` filed and closed, `TOOL-058` and `MCP-616` filed open
+
+> Upstream read at pi `v1.0.4` (area 18's pin from today) through git objects only. The count is whatever
+> `python3 -I docs/gap-analysis/scripts/count_open_items.py` prints, measured on `main` at `27814cb6f`
+> (before) and on this branch (after; `main` had not moved): **before 134 open (0 above low; 17 trackers;
+> 923 closed); after 135 open (0 above low; 17 trackers; 927 closed)**. Area 18: 3 → **3** open
+> (`CODE-015`, `-016`, `-017`), 14 → **17** closed. Area 04: 3 → **4** open (`TOOL-058` filed), 42 → **43**
+> closed (`TOOL-057` filed and closed). Area 13 is counted in its own file: `MCP-616` filed, 552 → 553 rows
+> (`13-cyrup-mcp-STATUS.md`).
+>
+> **Closed, with the model-visible effect:** a script that patches a built-in (`Array.prototype.toJSON`,
+> `Error.prototype.name`) can no longer break its own run or the report of it (`CODE-018`); `image()` output is
+> saved to a private file and its path is named before each image (`CODE-019`); the spill and the user-`!`
+> bash output files are created exclusively and mode `0600` (`CODE-019`, `TOOL-057`); a tool hidden by
+> codemode's `only` mode no longer appears in the prompt's rules or skills hint, and the `codemode` tool shows
+> its guidelines with its declaration (`CODE-020`). **Open:** `TOOL-058` (`read` declares no output schema, so
+> `image(await tools.read(..))` shows nothing) and `MCP-616` (`--tools` patterns, `--no-mcp`). The closure
+> record, the host-crash half measured **not a gap**, the moved upstream line cites and the leads for other
+> areas are in `18-pi-codemode.md` ("Closure record, 2026-10-07 …").
+
+---
+
 # UPDATE 2026-10-06 (`CODE-014`) — the system prompt is written as `sections` diff rows; `CODE-014` and `SESS-054` close
 
 > Upstream read at pi `v1.0.0` (area 18's pin) through git objects only. The count is whatever

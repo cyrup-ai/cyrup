@@ -144,23 +144,51 @@ fn json_text<T: Serialize + ?Sized>(value: &T) -> String {
     serde_json::to_string(value).unwrap_or_else(|_| String::from("null"))
 }
 
-/// The error of a script that threw (`host.ts:201-206` `handleDone`). `name` and `stack` are kept
-/// only when they are strings, as `describeError` writes them.
-pub(super) fn script_error(error_json: &str) -> CodemodeError {
-    let parsed: Option<Map<String, Value>> = serde_json::from_str(error_json).ok();
-    let field = |key: &str| {
-        parsed
-            .as_ref()
-            .and_then(|map| map.get(key))
-            .and_then(Value::as_str)
-            .map(str::to_owned)
-    };
-    CodemodeError {
-        kind: ErrorKind::Script,
-        name: field("name"),
-        message: field("message").unwrap_or_default(),
-        stack: field("stack"),
+/// A payload the prelude sent that the host cannot decode (`BridgeError`, `host.ts:49-64` @v1.0.4).
+/// The prelude serializes in the script's own isolate, so a script that patched a built-in, for
+/// example `Array.prototype.toJSON`, could make it send malformed data; the prelude now freezes the
+/// built-ins first, and the execution still ends as a `sandbox` error if one gets through.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "Sandbox bridge broken: {0}. The script may have modified built-ins such as a prototype's toJSON."
+)]
+pub(super) struct BridgeError(String);
+
+impl BridgeError {
+    fn new(reason: impl Into<String>) -> Self {
+        Self(reason.into())
     }
+}
+
+/// `parseBridgeJson` (`host.ts:55-61` @v1.0.4).
+fn parse_bridge_json(json: &str, what: &str) -> Result<Value, BridgeError> {
+    serde_json::from_str(json).map_err(|_| BridgeError::new(format!("{what} is not valid JSON")))
+}
+
+/// The error of a script that threw (`parseScriptError`, `host.ts:81-95` @v1.0.4). `message` must be
+/// a string and `name` and `stack` strings when present, as `describeError` writes them.
+pub(super) fn script_error(error_json: &str) -> Result<CodemodeError, BridgeError> {
+    let parsed = parse_bridge_json(error_json, "script error")?;
+    let Value::Object(map) = parsed else {
+        return Err(BridgeError::new("script error is not an object"));
+    };
+    let malformed = || BridgeError::new("script error is malformed");
+    let text = |key: &str| -> Result<Option<String>, BridgeError> {
+        match map.get(key) {
+            None => Ok(None),
+            Some(Value::String(text)) => Ok(Some(text.clone())),
+            Some(_) => Err(malformed()),
+        }
+    };
+    let Some(message) = text("message")? else {
+        return Err(malformed());
+    };
+    Ok(CodemodeError {
+        kind: ErrorKind::Script,
+        name: text("name")?,
+        message,
+        stack: text("stack")?,
+    })
 }
 
 /// The error report of a script that ran out of its memory budget. Upstream's engine throws
@@ -175,26 +203,27 @@ pub(super) fn out_of_memory_json() -> String {
     }))
 }
 
-/// Why a store-writes report could not be read; the prelude writes it, so this is an engine fault.
-#[derive(Debug, thiserror::Error)]
-#[error("The script's store writes could not be read: {0}")]
-pub(super) struct StoreWritesError(String);
-
-/// `host.ts:49-56` `parseStoreWrites`.
-pub(super) fn store_writes(json: &str) -> Result<CodemodeStoreWrites, StoreWritesError> {
-    let entries: Vec<Vec<String>> =
-        serde_json::from_str(json).map_err(|error| StoreWritesError(error.to_string()))?;
+/// `host.ts:66-79` `parseStoreWrites` @v1.0.4: an array of `[key]` (a delete) and `[key, json]` (a
+/// set) entries, every member a string, every `json` valid JSON.
+pub(super) fn store_writes(json: &str) -> Result<CodemodeStoreWrites, BridgeError> {
+    let Value::Array(entries) = parse_bridge_json(json, "store writes")? else {
+        return Err(BridgeError::new("store writes are not an array"));
+    };
     let mut writes = CodemodeStoreWrites::default();
     for entry in entries {
-        let mut parts = entry.into_iter();
-        let Some(key) = parts.next() else { continue };
-        match parts.next() {
-            None => writes.delete.push(key),
-            Some(text) => {
-                let value = serde_json::from_str(&text)
-                    .map_err(|error| StoreWritesError(error.to_string()))?;
-                writes.set.insert(key, value);
+        let malformed = || BridgeError::new("store writes contain a malformed entry");
+        let Value::Array(parts) = entry else {
+            return Err(malformed());
+        };
+        match parts.as_slice() {
+            [Value::String(key)] => writes.delete.push(key.clone()),
+            [Value::String(key), Value::String(text)] => {
+                let what = format!("store value for {}", json_text(key));
+                writes
+                    .set
+                    .insert(key.clone(), parse_bridge_json(text, &what)?);
             }
+            _ => return Err(malformed()),
         }
     }
     Ok(writes)
@@ -210,12 +239,13 @@ mod tests {
     fn script_error_reads_the_prelude_shape() {
         let error = script_error(
             r#"{"name":"TypeError","message":"boom 1","stack":"TypeError: boom 1\n    at codemode.js:2:7"}"#,
-        );
+        )
+        .unwrap();
         assert_eq!(error.kind, ErrorKind::Script);
         assert_eq!(error.name.as_deref(), Some("TypeError"));
         assert_eq!(error.message, "boom 1");
         assert!(error.stack.unwrap().contains("codemode.js:2"));
-        let bare = script_error(r#"{"message":"{\"code\":7}"}"#);
+        let bare = script_error(r#"{"message":"{\"code\":7}"}"#).unwrap();
         assert_eq!((bare.name, bare.stack), (None, None));
         assert_eq!(bare.message, r#"{"code":7}"#);
     }
@@ -226,6 +256,64 @@ mod tests {
         assert_eq!(writes.delete, vec!["gone".to_owned()]);
         assert_eq!(writes.set.get("a"), Some(&serde_json::json!(1)));
         assert_eq!(writes.set.get("b"), Some(&serde_json::json!({"x": [null]})));
+    }
+
+    /// pi's `reports a broken bridge as a sandbox error` table (`sandbox.test.ts` @v1.0.4), the cases a
+    /// typed op can still carry: the reason each malformed payload is refused for.
+    #[test]
+    fn a_malformed_payload_is_refused_with_the_reason_upstream_names() {
+        let reason = |result: Result<_, BridgeError>| -> String {
+            match result {
+                Ok(_) => String::from("accepted"),
+                Err(error) => error.to_string(),
+            }
+        };
+        let broken = |what: &str| {
+            format!(
+                "Sandbox bridge broken: {what}. The script may have modified built-ins such as a prototype's toJSON."
+            )
+        };
+        assert_eq!(
+            reason(store_writes("null").map(drop)),
+            broken("store writes are not an array")
+        );
+        for entries in [
+            "[1]",
+            "[[]]",
+            r#"[["a","1","extra"]]"#,
+            r#"[[1,"1"]]"#,
+            r#"[["a",1]]"#,
+        ] {
+            assert_eq!(
+                reason(store_writes(entries).map(drop)),
+                broken("store writes contain a malformed entry"),
+                "{entries}"
+            );
+        }
+        assert_eq!(
+            reason(store_writes(r#"[["k","{"]]"#).map(drop)),
+            broken("store value for \"k\" is not valid JSON")
+        );
+        assert_eq!(
+            reason(script_error("5").map(drop)),
+            broken("script error is not an object")
+        );
+        assert_eq!(
+            reason(script_error("{").map(drop)),
+            broken("script error is not valid JSON")
+        );
+        for malformed in [
+            "{}",
+            r#"{"message":5}"#,
+            r#"{"message":"m","name":null}"#,
+            r#"{"message":"m","stack":1}"#,
+        ] {
+            assert_eq!(
+                reason(script_error(malformed).map(drop)),
+                broken("script error is malformed"),
+                "{malformed}"
+            );
+        }
     }
 
     #[test]

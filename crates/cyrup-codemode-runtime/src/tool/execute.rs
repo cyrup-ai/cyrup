@@ -19,7 +19,9 @@ use std::time::{Duration, Instant};
 
 use cyrup_codemode::declarations::render_tool_sample;
 use cyrup_codemode::js::json_stringify;
-use cyrup_codemode::output::{DEFAULT_MAX_OUTPUT_TOKENS, spill_output, truncate_output};
+use cyrup_codemode::output::{
+    DEFAULT_MAX_OUTPUT_TOKENS, label_images, save_image_output, spill_output, truncate_output,
+};
 use cyrup_codemode::source::parse_codemode_source;
 use cyrup_codemode::types::{OutputItem, ToolDeclaration};
 use cyrup_core::{CancelToken, Content, Tool, ToolCallId, ToolError, ToolResult, ToolUpdateSink};
@@ -261,7 +263,13 @@ pub async fn execute_codemode(
         .map(|tool| {
             (
                 tool.name().to_owned(),
-                render_tool_sample(&to_codemode_declaration(tool.as_ref()), None),
+                render_tool_sample(
+                    &to_codemode_declaration(
+                        tool.as_ref(),
+                        &cyrup_core::normalized_prompt_guidelines(tool.as_ref()),
+                    ),
+                    None,
+                ),
             )
         })
         .collect();
@@ -377,6 +385,13 @@ pub async fn execute_codemode(
             .unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS),
         |text| spill_output(&std::env::temp_dir(), text),
     );
+    // After truncation, which joins the text items and moves the images after them, so each path
+    // stays next to its image and is never cut (`execute.ts:462-465` @v1.0.3).
+    let temp_dir = std::env::temp_dir();
+    let output = label_images(truncated.items, |mime_type, bytes| {
+        save_image_output(&temp_dir, mime_type, bytes)
+    })
+    .map_err(|error| ToolError::new(error.to_string()))?;
     let wall_time = to_fixed_1(started.elapsed().as_secs_f64());
     let header = format!(
         "{}\nWall time {wall_time} seconds\nOutput:\n",
@@ -392,7 +407,7 @@ pub async fn execute_codemode(
         .as_ref()
         .map(|path| path.display().to_string());
     let mut content = vec![Content::text(header)];
-    content.extend(truncated.items.into_iter().map(content_of));
+    content.extend(output.into_iter().map(content_of));
     Ok(ToolResult {
         content,
         details: Some(

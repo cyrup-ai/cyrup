@@ -99,6 +99,7 @@ impl Catalog {
                 models: false,
                 namespaces: &self.namespaces,
                 deferred,
+                guidelines: &BTreeMap::new(),
                 inline_budget: budget,
                 docs_path: CODEMODE_DOCS_PATH,
             },
@@ -177,6 +178,7 @@ fn leaves_namespace_instructions_out() {
             models: false,
             namespaces: &namespaces,
             deferred: &BTreeSet::new(),
+            guidelines: &BTreeMap::new(),
             inline_budget: None,
             docs_path: CODEMODE_DOCS_PATH,
         },
@@ -226,6 +228,7 @@ fn every_namespace_is_represented_before_any_namespace_is_complete() {
             models: false,
             namespaces: &namespaces,
             deferred: &BTreeSet::new(),
+            guidelines: &BTreeMap::new(),
             inline_budget: Some(200.0),
             docs_path: CODEMODE_DOCS_PATH,
         },
@@ -266,6 +269,7 @@ fn namespaces_are_ordered_like_locale_compare_after_the_unnamespaced_group() {
             models: false,
             namespaces: &namespaces,
             deferred: &BTreeSet::new(),
+            guidelines: &BTreeMap::new(),
             inline_budget: None,
             docs_path: CODEMODE_DOCS_PATH,
         },
@@ -286,6 +290,7 @@ fn the_description_has_the_intro_the_globals_and_the_models_line_only_when_decla
                 models,
                 namespaces: &none,
                 deferred: &BTreeSet::new(),
+                guidelines: &BTreeMap::new(),
                 inline_budget: None,
                 docs_path: CODEMODE_DOCS_PATH,
             },
@@ -334,6 +339,7 @@ fn a_tool_with_a_non_identifier_name_shows_both_names() {
             models: false,
             namespaces: &none,
             deferred: &BTreeSet::new(),
+            guidelines: &BTreeMap::new(),
             inline_budget: None,
             docs_path: CODEMODE_DOCS_PATH,
         },
@@ -367,6 +373,7 @@ fn the_mcp_preamble_follows_the_listed_tools() {
                 models: false,
                 namespaces: &none,
                 deferred,
+                guidelines: &BTreeMap::new(),
                 inline_budget: None,
                 docs_path: CODEMODE_DOCS_PATH,
             },
@@ -406,5 +413,79 @@ fn a_declared_tool_says_how_scripts_call_it() {
     assert!(
         describe_script_call(dashed.as_ref())
             .starts_with("Padded.\n\nCodemode: `tools.my_tool(args)`")
+    );
+}
+
+/// CODE-020 (pi `toCodemodeDeclaration(tool, guidelines)`, `tool.ts:160-176` @v1.0.4): the
+/// description of a listed tool is followed by its guidelines as bullets — the system prompt only
+/// carries them for declared tools. Blank guidelines are skipped, the description is trimmed when
+/// bullets follow it, and without bullets it is left as it was.
+#[test]
+fn a_listed_tool_carries_its_guidelines_after_its_description() {
+    let listed = tool("lister", "Lists things.  \n");
+    let namespaces = BTreeMap::new();
+    let none: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let deferred = BTreeSet::new();
+    let describe = |guidelines: &BTreeMap<String, Vec<String>>| {
+        create_codemode_description(
+            &[Arc::clone(&listed)],
+            &DescriptionOptions {
+                models: false,
+                namespaces: &namespaces,
+                deferred: &deferred,
+                guidelines,
+                inline_budget: None,
+                docs_path: CODEMODE_DOCS_PATH,
+            },
+        )
+    };
+
+    let guided = BTreeMap::from([(
+        "lister".to_owned(),
+        vec![
+            "  Use it first.  ".to_owned(),
+            "   ".to_owned(),
+            "Then stop.".to_owned(),
+        ],
+    )]);
+    let with = describe(&guided);
+    assert!(
+        with.contains("Lists things.\n\n- Use it first.\n- Then stop."),
+        "{with}"
+    );
+    assert!(
+        !with.contains("- \n"),
+        "a blank guideline is no bullet: {with}"
+    );
+
+    // Another tool's guidelines, or none, add nothing.
+    let other = BTreeMap::from([("other".to_owned(), vec!["Not mine.".to_owned()])]);
+    for map in [&none, &other] {
+        let without = describe(map);
+        assert!(!without.contains("Not mine."), "{without}");
+        assert!(!without.contains("Lists things.\n\n- "), "{without}");
+    }
+}
+
+/// pi `d677d0ee7` (v1.0.3): the globals line tells the model that `image()` also saves the image
+/// and the result names its path, which is how a later turn learns it can reference the file.
+#[test]
+fn the_globals_line_says_image_saves_the_image_and_names_its_path() {
+    let description = create_codemode_description(
+        &[],
+        &DescriptionOptions {
+            models: false,
+            namespaces: &BTreeMap::new(),
+            deferred: &BTreeSet::new(),
+            guidelines: &BTreeMap::new(),
+            inline_budget: None,
+            docs_path: CODEMODE_DOCS_PATH,
+        },
+    );
+    assert!(
+        description.contains(
+            "`exit()` ends the script. `image()` also saves the image to a temp file and the result names its path.\n"
+        ),
+        "{description}"
     );
 }

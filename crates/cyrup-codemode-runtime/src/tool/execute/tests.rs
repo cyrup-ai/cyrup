@@ -131,6 +131,51 @@ fn details(result: &ToolResult) -> CodemodeToolDetails {
     serde_json::from_value(result.details.clone().unwrap()).unwrap()
 }
 
+/// What `image()` leaves in the result since pi `d677d0ee7` (v1.0.3, #10310): the label line
+/// `[Image saved to <path>.png (image/png, <n>B)]` before the image. Checks that the file holds
+/// `TINY_PNG` and is readable only by its owner, removes it, and replaces the label with `<saved>`
+/// (upstream's `checkSavedImages`, `agent-session-codemode.test.ts`).
+fn check_saved_images(text: &str) -> String {
+    use base64::Engine as _;
+    text.split('\n')
+        .map(|line| {
+            let Some(rest) = line.strip_prefix("[Image saved to ") else {
+                return line.to_owned();
+            };
+            let (path, kind) = rest.split_once(" (image/png, ").expect(line);
+            assert!(path.ends_with(".png") && !path.contains(' '), "{line}");
+            assert!(
+                kind.ends_with("B)]") && kind[..kind.len() - 3].chars().all(|c| c.is_ascii_digit()),
+                "{line}"
+            );
+            let bytes = std::fs::read(path).unwrap();
+            assert_eq!(
+                bytes,
+                base64::engine::general_purpose::STANDARD
+                    .decode(TINY_PNG)
+                    .unwrap()
+            );
+            assert_private_file(std::path::Path::new(path));
+            std::fs::remove_file(path).unwrap();
+            "<saved>".to_owned()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Output files can carry private data, so only the user may read them (pi `OUTPUT_FILE_MODE`,
+/// `utils/output-files.ts` @v1.0.3). Unix only: Windows has no such mode bits.
+fn assert_private_file(path: &std::path::Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "{}: mode {mode:o}", path.display());
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+}
+
 fn text(s: &str) -> OutputItem {
     OutputItem::Text(s.to_owned())
 }
@@ -550,35 +595,76 @@ async fn a_returned_value_is_appended_like_text() {
     assert_eq!(value_text(&json!("s")), "s");
 }
 
-/// Upstream `attaches only the images the script passes to image(), in output order`: output items
-/// keep their order and images become image blocks.
+/// Upstream `attaches only the images the script passes to image(), in output order, each after its
+/// saved path` (@v1.0.3): output items keep their order, images become image blocks, and each image
+/// follows a text item naming the file it was saved to. The same image shown twice is saved once.
 #[tokio::test]
-async fn output_items_keep_their_order_and_images_become_image_blocks() {
+async fn output_items_keep_their_order_and_each_image_follows_the_path_it_was_saved_to() {
+    let shown = || OutputItem::Image {
+        data: TINY_PNG.to_owned(),
+        mime_type: "image/png".to_owned(),
+    };
     let rig = rig(
         Vec::new(),
-        script(|_c, _e| async move {
+        script(move |_c, _e| async move {
             completed(
-                vec![
-                    text("captured"),
-                    OutputItem::Image {
-                        data: TINY_PNG.to_owned(),
-                        mime_type: "image/png".to_owned(),
-                    },
-                    text("after"),
-                ],
+                vec![text("captured"), shown(), shown(), text("after")],
                 None,
             )
         }),
     );
     let result = rig.run("x").await.unwrap();
-    assert_eq!(result_text(&result), "captured\n<image>\nafter");
+    let body = result_text(&result);
+    let lines: Vec<&str> = body.split('\n').collect();
     assert_eq!(
-        result.content[2],
+        lines,
+        [
+            "captured", lines[1], "<image>", lines[1], "<image>", "after"
+        ],
+        "both labels name one file"
+    );
+    assert_eq!(check_saved_images(lines[1]), "<saved>");
+    assert_eq!(
+        result.content[3],
         Content::Image {
             data: TINY_PNG.to_owned(),
             mime_type: "image/png".to_owned()
         }
     );
+}
+
+/// pi `saveImages` (`execute.ts` @v1.0.3): a write that fails must not discard the result of a
+/// script whose tool calls already ran, so the failure becomes the label. The temp directory is
+/// the one the process uses, and a stand-in that cannot be written to is a file where the
+/// directory should be.
+#[test]
+fn a_label_says_so_when_the_image_could_not_be_saved() {
+    use cyrup_codemode::output::{ImageLabelError, label_images, save_image_output};
+    let blocker = tempfile::NamedTempFile::new().unwrap();
+    let items = vec![OutputItem::Image {
+        data: TINY_PNG.to_owned(),
+        mime_type: "image/png".to_owned(),
+    }];
+    let labelled = label_images(items, |mime, bytes| {
+        save_image_output(blocker.path(), mime, bytes)
+    })
+    .unwrap();
+    let OutputItem::Text(label) = &labelled[0] else {
+        panic!("{labelled:?}");
+    };
+    assert!(
+        label.starts_with("[Image (image/png, 70B) could not be saved: ") && label.ends_with(']'),
+        "{label}"
+    );
+    assert!(matches!(labelled[1], OutputItem::Image { .. }));
+    let unknown = label_images(
+        vec![OutputItem::Image {
+            data: TINY_PNG.to_owned(),
+            mime_type: "image/bmp".to_owned(),
+        }],
+        |_, _| panic!("a type with no extension is refused before anything is written"),
+    );
+    assert!(matches!(unknown, Err(ImageLabelError::NoExtension(mime)) if mime == "image/bmp"));
 }
 
 /// Upstream `truncates output to the token budget and spills the full text`.
@@ -611,7 +697,12 @@ async fn truncates_output_to_the_token_budget_and_spills_the_full_text() {
     assert!(body.contains("row 99\n"));
     assert!(!body.contains("row 50\n"));
     assert!(body.contains(&format!("[Full output: {path} (read with offset/limit)]")));
-    // Images follow the truncated text.
+    // Images follow the truncated text, each after the path it was saved to; the spill file is
+    // readable only by its owner.
+    assert_private_file(std::path::Path::new(&path));
+    let lines: Vec<&str> = body.split('\n').collect();
+    assert_eq!(check_saved_images(lines[lines.len() - 2]), "<saved>");
+    assert_eq!(lines.last(), Some(&"<image>"));
     assert_eq!(
         result.content.last(),
         Some(&Content::Image {
@@ -1068,7 +1159,7 @@ async fn generated_images_the_script_did_not_show_get_a_note() {
             "stop\nNote: models.generateImages() returned 2 images that the script did not show. Show each image block of result.output with image(block).",
         ),
         // The script showed one: no note.
-        (2, true, "<image>\nstop"),
+        (2, true, "<saved>\n<image>\nstop"),
         // Nothing generated: no note.
         (0, false, "stop"),
     ] {
@@ -1090,7 +1181,7 @@ async fn generated_images_the_script_did_not_show_get_a_note() {
         *rig.host.models.lock().unwrap() = Some(painter_models(images, None));
         let result = rig.run("x").await.unwrap();
         assert_eq!(
-            result_text(&result),
+            check_saved_images(&result_text(&result)),
             expected,
             "{images} images, shown {shown}"
         );

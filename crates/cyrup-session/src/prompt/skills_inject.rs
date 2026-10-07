@@ -34,15 +34,19 @@ const SKILLS_RELATIVE_PATH_RULE: &str = "When a skill file references a relative
 /// the `fileReadTool` parameter new at v0.85.0): the `read` wording for `"read"`, the bash wording
 /// otherwise.
 fn skill_load_instruction(file_read_tool: &str) -> &'static str {
-    if file_read_tool == "read" {
-        "Use the read tool to load a skill's file when the task matches its description."
-    } else {
-        "Use bash to load a skill's file when the task matches its description."
+    match file_read_tool {
+        "read" => "Use the read tool to load a skill's file when the task matches its description.",
+        // A reader that is only reachable through another tool is named by none (`skills.ts`
+        // @v1.0.4, CODE-020).
+        super::builder::INDIRECT_READER => {
+            "Load a skill's file when the task matches its description."
+        }
+        _ => "Use bash to load a skill's file when the task matches its description.",
     }
 }
 
 /// The skills section's text, telling the model to load a skill with `file_read_tool` (`"read"` or
-/// `"bash"`): pi's `formatSkillsForPrompt(skills, fileReadTool).trim()` (`skills.ts:333-382`,
+/// `"bash"`, or `"indirect"` for none): pi's `formatSkillsForPrompt(skills, fileReadTool).trim()` (`skills.ts:333-382`,
 /// `system-prompt.ts:165-169` @v1.0.0). `None` when `skills` is empty or every skill is
 /// model-invocation-disabled.
 pub(crate) fn skills_section_text(skills: &[SkillPointer], file_read_tool: &str) -> Option<String> {

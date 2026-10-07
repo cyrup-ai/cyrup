@@ -61,6 +61,12 @@ pub fn prepare_codemode_loadout(
                 .map(|namespace| (tool.name().to_owned(), namespace))
         })
         .collect();
+    // A listed tool carries its prompt guidelines with its declaration: the system prompt only has
+    // them for declared tools (CODE-020).
+    let guidelines: BTreeMap<String, Vec<String>> = listed
+        .iter()
+        .map(|tool| (tool.name().to_owned(), view.prompt_guidelines(tool.name())))
+        .collect();
     let deferred: BTreeSet<String> = listed
         .iter()
         .filter(|tool| view.exposure(tool.name()) == ToolExposure::Deferred)
@@ -74,6 +80,7 @@ pub fn prepare_codemode_loadout(
                 models: options.declares_models(),
                 namespaces: &namespaces,
                 deferred: &deferred,
+                guidelines: &guidelines,
                 inline_budget: Some(options.effective_inline_budget()),
                 docs_path: &options.docs_path,
             },

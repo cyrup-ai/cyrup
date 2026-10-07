@@ -42,7 +42,7 @@ const DESCRIPTION_INTRO: &str = "Run JavaScript that calls other tools. The inpu
 fn describe_globals(models: bool, docs_path: &str) -> String {
     let mut lines = vec![
         "Globals:".to_owned(),
-        "- `text(value)`, `image(dataUrlOrImageBlock)`, `console.log(...)`, and top-level `return` add output; `exit()` ends the script.".to_owned(),
+        "- `text(value)`, `image(dataUrlOrImageBlock)`, `console.log(...)`, and top-level `return` add output; `exit()` ends the script. `image()` also saves the image to a temp file and the result names its path.".to_owned(),
         "- `store(key, value)` and `load(key)` keep JSON values across codemode calls.".to_owned(),
         "- `ALL_TOOLS`, `searchTools(query, { limit?, namespace? })`, `describeTool(name)`, `describeNamespace(name)`: find unlisted tools, such as MCP tools.".to_owned(),
     ];
@@ -59,13 +59,26 @@ fn text_output_schema() -> Value {
     json!({ "type": "string" })
 }
 
-/// What a script sees of a tool (`toCodemodeDeclaration`, `tool.ts:159-166`). Tools without an
-/// output schema resolve to their text output.
+/// What a script sees of a tool (`toCodemodeDeclaration`, `tool.ts:159-166` @v1.0.1,
+/// `tool.ts:160-176` @v1.0.4): its description followed by its prompt `guidelines` as bullets, which
+/// the system prompt only has for declared tools (CODE-020). Tools without an output schema resolve
+/// to their text output.
 #[must_use]
-pub fn to_codemode_declaration(tool: &dyn Tool) -> ToolDeclaration {
+pub fn to_codemode_declaration(tool: &dyn Tool, guidelines: &[String]) -> ToolDeclaration {
+    let bullets: Vec<String> = guidelines
+        .iter()
+        .map(|guideline| guideline.trim())
+        .filter(|guideline| !guideline.is_empty())
+        .map(|guideline| format!("- {guideline}"))
+        .collect();
+    let description = if bullets.is_empty() {
+        tool.description().to_owned()
+    } else {
+        format!("{}\n\n{}", js_trim(tool.description()), bullets.join("\n"))
+    };
     ToolDeclaration {
         name: tool.name().to_owned(),
-        description: Some(tool.description().to_owned()),
+        description: Some(description),
         input_schema: Some(tool.parameters().clone()),
         output_schema: Some(
             tool.output_schema()
@@ -98,6 +111,8 @@ pub struct DescriptionOptions<'a> {
     pub namespaces: &'a BTreeMap<String, ToolNamespace>,
     /// Tools that are callable but never listed with their declaration (`deferred` exposure).
     pub deferred: &'a std::collections::BTreeSet<String>,
+    /// The prompt guidelines of each tool, by tool name, listed after its description.
+    pub guidelines: &'a BTreeMap<String, Vec<String>>,
     /// Estimated tokens (characters / 4) the tool sections may use. Tools that do not fit are left
     /// out, like deferred tools. `None` lists every tool that is not deferred.
     pub inline_budget: Option<f64>,
@@ -186,7 +201,13 @@ pub fn create_codemode_description(
     let declarations: Vec<ToolDeclaration> = callable_tools(tools)
         .iter()
         .filter(|tool| !options.deferred.contains(tool.name()))
-        .map(|tool| to_codemode_declaration(tool.as_ref()))
+        .map(|tool| {
+            let guidelines = options
+                .guidelines
+                .get(tool.name())
+                .map_or(&[][..], Vec::as_slice);
+            to_codemode_declaration(tool.as_ref(), guidelines)
+        })
         .collect();
 
     // Insertion-ordered groups, the namespace-less one first; then ordered for display.
@@ -329,7 +350,9 @@ fn describe_output(schema: Option<&Value>) -> String {
 /// they are not repeated.
 #[must_use]
 pub fn describe_script_call(tool: &dyn Tool) -> String {
-    let declaration = to_codemode_declaration(tool);
+    // No guidelines: a declared tool's are rules of the system prompt (`describeScriptCall` is
+    // unchanged at v1.0.4).
+    let declaration = to_codemode_declaration(tool, &[]);
     format!(
         "{}\n\nCodemode: `tools.{}(args)` resolves to {}.",
         js_trim(tool.description()),
