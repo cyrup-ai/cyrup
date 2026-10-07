@@ -42,7 +42,7 @@ const DESCRIPTION_INTRO: &str = "Run JavaScript that calls other tools. The inpu
 fn describe_globals(models: bool, docs_path: &str) -> String {
     let mut lines = vec![
         "Globals:".to_owned(),
-        "- `text(value)`, `image(dataUrlOrImageBlock)`, `console.log(...)`, and top-level `return` add output; `exit()` ends the script.".to_owned(),
+        "- `text(value)`, `image(dataUrlOrImageBlock)`, `console.log(...)`, and top-level `return` add output; `exit()` ends the script. `image()` also saves the image to a temp file and the result names its path.".to_owned(),
         "- `store(key, value)` and `load(key)` keep JSON values across codemode calls.".to_owned(),
         "- `ALL_TOOLS`, `searchTools(query, { limit?, namespace? })`, `describeTool(name)`, `describeNamespace(name)`: find unlisted tools, such as MCP tools.".to_owned(),
     ];

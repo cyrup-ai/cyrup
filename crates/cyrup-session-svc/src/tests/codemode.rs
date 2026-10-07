@@ -485,6 +485,38 @@ fn result_text(message: &Message) -> String {
         .join("\n")
 }
 
+/// What `image()` leaves in a result since pi `d677d0ee7` (v1.0.3, #10310): the label
+/// `[Image saved to <path>.png (image/png, <n>B)]` before each image. Checks that the file holds the
+/// image `data` (base64), that only its owner can read it, removes it, and replaces the label with
+/// `<saved>` (upstream's `checkSavedImages`, `agent-session-codemode.test.ts`).
+fn check_saved_images(text: &str, data: &str) -> String {
+    use base64::Engine as _;
+    text.split('\n')
+        .map(|line| {
+            let Some(rest) = line.strip_prefix("[Image saved to ") else {
+                return line.to_owned();
+            };
+            let (path, kind) = rest.split_once(" (image/png, ").expect(line);
+            assert!(path.ends_with(".png") && kind.ends_with("B)]"), "{line}");
+            assert_eq!(
+                std::fs::read(path).unwrap(),
+                base64::engine::general_purpose::STANDARD
+                    .decode(data)
+                    .unwrap()
+            );
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                let mode = std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+                assert_eq!(mode, 0o600, "{path}");
+            }
+            std::fs::remove_file(path).unwrap();
+            "<saved>".to_owned()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn is_error(message: &Message) -> bool {
     matches!(message, Message::ToolResult { is_error: true, .. })
 }
@@ -1104,21 +1136,26 @@ async fn adds_the_usage_of_nested_results_to_the_codemode_result() {
     assert!((stats.cost - 0.5).abs() < 1e-10, "{}", stats.cost);
 }
 
-/// Upstream `attaches only the images the script passes to image(), in output order`: output items
-/// keep their order and the image block reaches the persisted result.
+/// Upstream `attaches only the images the script passes to image(), in output order, each after its
+/// saved path` (@v1.0.3): output items keep their order, the image block reaches the persisted
+/// result, and each image follows a text item naming the file it was saved to. The same image shown
+/// twice is saved once, so both labels name one file.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn attaches_only_the_images_the_script_passes_to_image_in_output_order() {
+async fn attaches_only_the_images_the_script_passes_to_image_in_output_order_each_after_its_saved_path()
+ {
     let rig = rig(
         script(|_code, env| async move {
             // Tools without an outputSchema resolve to their text; images are not passed on.
             let shot = env.tool("screenshot", json!({})).await.unwrap().unwrap();
+            let image = || OutputItem::Image {
+                data: TINY_PNG.to_owned(),
+                mime_type: "image/png".to_owned(),
+            };
             completed(
                 vec![
                     OutputItem::Text(shot.as_str().unwrap().to_owned()),
-                    OutputItem::Image {
-                        data: TINY_PNG.to_owned(),
-                        mime_type: "image/png".to_owned(),
-                    },
+                    image(),
+                    image(),
                     text("after"),
                 ],
                 None,
@@ -1132,12 +1169,20 @@ async fn attaches_only_the_images_the_script_passes_to_image_in_output_order() {
     .await;
     rig.set_active(&["codemode", "screenshot"]).await;
     let result = rig.run("go").await;
-    assert_eq!(result_text(&result), "captured\n<image>\nafter");
+    let body = result_text(&result);
+    let lines: Vec<&str> = body.split('\n').collect();
+    assert_eq!(
+        lines,
+        [
+            "captured", lines[1], "<image>", lines[1], "<image>", "after"
+        ]
+    );
+    assert_eq!(check_saved_images(lines[1], TINY_PNG), "<saved>");
     let Message::ToolResult { content, .. } = &result else {
         panic!()
     };
     assert_eq!(
-        content[2],
+        content[3],
         Content::Image {
             data: TINY_PNG.to_owned(),
             mime_type: "image/png".to_owned()
@@ -1375,8 +1420,13 @@ async fn truncates_output_to_the_token_budget_and_spills_the_full_text() {
     let Message::ToolResult { content, .. } = &result else {
         panic!()
     };
-    // Images follow the truncated text.
+    // Images follow the truncated text, each after the path it was saved to.
     assert!(matches!(content.last(), Some(Content::Image { .. })));
+    let lines: Vec<&str> = body.split('\n').collect();
+    assert_eq!(
+        check_saved_images(lines[lines.len() - 2], TINY_PNG),
+        "<saved>"
+    );
     let full = std::fs::read_to_string(&path).unwrap();
     std::fs::remove_file(&path).unwrap();
     assert_eq!(
@@ -2082,9 +2132,17 @@ async fn generates_images_with_catalog_auth_and_attaches_them_through_image() {
 
     let result = rig.run("go").await;
 
+    let Message::ToolResult { content, .. } = &result else {
+        panic!()
+    };
+    let Some(Content::Image { data, .. }) =
+        content.iter().find(|c| matches!(c, Content::Image { .. }))
+    else {
+        panic!("{content:?}")
+    };
     assert_eq!(
-        result_text(&result),
-        "painted a fox\n<image>\n[\"error\",\"painter exploded\"]"
+        check_saved_images(&result_text(&result), data),
+        "painted a fox\n<saved>\n<image>\n[\"error\",\"painter exploded\"]"
     );
     assert!(
         observed

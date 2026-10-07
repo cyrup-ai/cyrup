@@ -332,3 +332,150 @@ fn truncation_agrees_with_upstream_on_the_corpus() {
     }
     assert!(truncated > 50 && passed > 50, "{truncated} {passed}");
 }
+
+// ── CODE-019 (pi `d677d0ee7` @v1.0.3): saved images and private output files ─────────────────────
+
+fn png(data: &str) -> OutputItem {
+    OutputItem::Image {
+        data: data.into(),
+        mime_type: "image/png".into(),
+    }
+}
+
+/// `AAAA` is three zero bytes.
+const THREE_BYTES: &str = "AAAA";
+
+#[test]
+fn each_image_follows_a_text_item_naming_the_file_it_was_saved_to() {
+    let mut saved: Vec<(String, Vec<u8>)> = Vec::new();
+    let out = label_images(
+        vec![text("a"), png(THREE_BYTES), text("b")],
+        |mime, bytes| {
+            saved.push((mime.to_owned(), bytes.to_vec()));
+            Ok(PathBuf::from("/tmp/pi-codemode-0011223344556677.png"))
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        out,
+        vec![
+            text("a"),
+            text("[Image saved to /tmp/pi-codemode-0011223344556677.png (image/png, 3B)]"),
+            png(THREE_BYTES),
+            text("b"),
+        ]
+    );
+    assert_eq!(saved, vec![("image/png".to_owned(), vec![0, 0, 0])]);
+}
+
+#[test]
+fn an_image_shown_twice_is_saved_once_and_both_copies_name_the_same_file() {
+    let mut calls = 0;
+    let out = label_images(vec![png(THREE_BYTES), png(THREE_BYTES)], |_, _| {
+        calls += 1;
+        Ok(PathBuf::from("/tmp/one.png"))
+    })
+    .unwrap();
+    assert_eq!(calls, 1);
+    assert_eq!(out[0], out[2]);
+    assert_eq!(out.len(), 4);
+}
+
+#[test]
+fn a_failed_write_becomes_the_label_and_the_image_stays() {
+    let out = label_images(vec![png(THREE_BYTES)], |_, _| {
+        Err(SpillError::Write(io::Error::other("disk full")))
+    })
+    .unwrap();
+    assert_eq!(
+        out,
+        vec![
+            text("[Image (image/png, 3B) could not be saved: disk full]"),
+            png(THREE_BYTES)
+        ]
+    );
+}
+
+#[test]
+fn a_type_with_no_extension_is_refused_before_anything_is_written() {
+    let bmp = OutputItem::Image {
+        data: THREE_BYTES.into(),
+        mime_type: "image/bmp".into(),
+    };
+    let result = label_images(vec![text("x"), bmp], |_, _| panic!("nothing is written"));
+    assert!(matches!(result, Err(ImageLabelError::NoExtension(ref mime)) if mime == "image/bmp"));
+    assert_eq!(
+        result.unwrap_err().to_string(),
+        "No file extension for image type image/bmp"
+    );
+}
+
+#[test]
+fn the_four_image_types_image_accepts_have_their_upstream_extensions() {
+    assert_eq!(image_extension("image/png"), Some(".png"));
+    assert_eq!(image_extension("image/jpeg"), Some(".jpg"));
+    assert_eq!(image_extension("image/gif"), Some(".gif"));
+    assert_eq!(image_extension("image/webp"), Some(".webp"));
+    assert_eq!(image_extension("image/svg+xml"), None);
+}
+
+#[test]
+fn sizes_read_as_upstreams_format_size_with_to_fixed_ties_away_from_zero() {
+    assert_eq!(format_size(0), "0B");
+    assert_eq!(format_size(1023), "1023B");
+    assert_eq!(format_size(1024), "1.0KB");
+    // 1.25 KB is a tie: `toFixed(1)` gives 1.3 where `{:.1}` gives 1.2.
+    assert_eq!(format_size(1280), "1.3KB");
+    assert_eq!(format_size(1024 * 1024 - 1), "1024.0KB");
+    assert_eq!(format_size(1024 * 1024), "1.0MB");
+    assert_eq!(format_size(5 * 1024 * 1024 + 512 * 1024), "5.5MB");
+}
+
+#[test]
+fn a_saved_image_is_a_new_file_readable_only_by_its_owner() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = save_image_output(dir.path(), "image/png", &[1, 2, 3]).unwrap();
+    let name = path.file_name().unwrap().to_str().unwrap();
+    assert!(
+        name.starts_with("pi-codemode-")
+            && name.ends_with(".png")
+            && name.len() == "pi-codemode-".len() + 16 + ".png".len(),
+        "{name}"
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), [1, 2, 3]);
+    assert_owner_only(&path);
+    assert!(save_image_output(dir.path(), "image/bmp", &[1]).is_err());
+}
+
+#[test]
+fn the_text_spill_is_readable_only_by_its_owner_too() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = spill_output(dir.path(), "full text").unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "full text");
+    assert_owner_only(&path);
+}
+
+#[test]
+fn an_output_file_is_never_written_through_a_path_someone_else_placed() {
+    let dir = tempfile::tempdir().unwrap();
+    let token = [9u8; 8];
+    let planted = dir
+        .path()
+        .join(output_file_name("pi-codemode", token, ".png"));
+    std::fs::write(&planted, "theirs").unwrap();
+    let result = write_output_file_named(dir.path(), "pi-codemode", ".png", token, b"ours");
+    assert!(result.is_err());
+    assert_eq!(std::fs::read_to_string(&planted).unwrap(), "theirs");
+}
+
+/// Mode bits exist on Unix only (`OUTPUT_FILE_MODE` is ignored on Windows upstream too).
+fn assert_owner_only(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "{}: {mode:o}", path.display());
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+}

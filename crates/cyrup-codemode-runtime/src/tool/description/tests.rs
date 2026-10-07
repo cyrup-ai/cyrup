@@ -466,3 +466,26 @@ fn a_listed_tool_carries_its_guidelines_after_its_description() {
         assert!(!without.contains("Lists things.\n\n- "), "{without}");
     }
 }
+
+/// pi `d677d0ee7` (v1.0.3): the globals line tells the model that `image()` also saves the image
+/// and the result names its path, which is how a later turn learns it can reference the file.
+#[test]
+fn the_globals_line_says_image_saves_the_image_and_names_its_path() {
+    let description = create_codemode_description(
+        &[],
+        &DescriptionOptions {
+            models: false,
+            namespaces: &BTreeMap::new(),
+            deferred: &BTreeSet::new(),
+            guidelines: &BTreeMap::new(),
+            inline_budget: None,
+            docs_path: CODEMODE_DOCS_PATH,
+        },
+    );
+    assert!(
+        description.contains(
+            "`exit()` ends the script. `image()` also saves the image to a temp file and the result names its path.\n"
+        ),
+        "{description}"
+    );
+}

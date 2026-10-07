@@ -39,3 +39,5 @@ deno_core = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# Decodes the image a test finds in a saved file, to compare it with the one the script showed.
+base64 = { workspace = true }
