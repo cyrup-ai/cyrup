@@ -2,6 +2,17 @@
 
 This area covers the extension host itself: the event catalog and dispatch reduction (`cyrup-ext/src/{event,dispatch,facade,registry}.rs`), the WIT world and its wasmtime runtime (`cyrup-ext/wit/world.wit`, `cyrup-ext/src/host/`), the native built-in extension path (`cyrup-ext/src/native.rs`), the guest SDK (`cyrup-ext-sdk/`), and the `cyrup-session-svc` and `cyrup-tui` wiring that is the only production consumer of any of it. It is measured against `pi/packages/coding-agent/src/core/extensions/` at the ported baseline **pi v0.83.0** — `types.ts`, `runner.ts`, `loader.ts` — with post-baseline drift measured against **pi v0.84.1** (the latest tag *at the time of that reading*; the latest tag is now **v0.85.1**, and `v0.84.1..v0.85.1` is unmeasured here — see the provenance block below). The standing caveat is that cyrup's WASM Component Model host is a deliberate *mechanism* divergence from pi's jiti/TypeScript loader; the *semantics* of the event, registration and context surfaces are fully in scope.
 
+> ### CLOSURE 2026-10-08 — `EXT-086` (extension model calls through the session's providers)
+>
+> On `claude/eloquent-ritchie-up17bs`. pi's `ctx.modelRegistry.complete()` / `stream()` / `streamSimple()`
+> (v1.0.4) now reach a WASM guest (five additive `models.*` imports, world stays `cyrup:ext@0.18`, behind the
+> new manifest grant `capabilities.modelCalls`) and a native (`HostServices::model_stream` / `model_complete`).
+> The row's body records the four design decisions with both sides read — only `streamSimple` routes a virtual
+> model; no provider hook runs, matching pi, which corrects the row's own Impact line; reentrancy; cost and
+> cancellation — and the CYRUP-DELTAs. Every new test was red-proved against a neutered implementation. No
+> row was filed to defer any part of it. **Counted set after this pass (`count_open_items.py`): area 06 =
+> 15 open (all low), 89 closed** (was 16 open, 88 closed, after `SEAM-131` closed `EXT-085`). All areas: 127 → 126.
+
 > ### CLOSURES 2026-09-28 — five lows (`EXT-025`, `EXT-051`, `EXT-053`, `EXT-058`, `EXT-075`); three partials (`EXT-079`, `EXT-080`, `EXT-082`)
 >
 > The ext lane. This work is on `claude/lows-next` and not yet committed. Each row and body section carries its
@@ -633,7 +644,7 @@ above opened nothing, closed nothing and re-severitied nothing.
 | ~~EXT-083~~ | ~~medium~~ **CLOSED 2026-09-27** | parity-bug | S | **NEW 2026-09-24 (second pass).** A guest `sendUserMessage` loses its options bag: `apply_pending_control` destructures `SendUserMessage { content, .. }` and calls `send_user_message(content, None)`, so `deliverAs: "followUp"` becomes a steer, and the text goes through `UserInput::text`'s `expand_templates: true` — slash-command dispatch, skill and template expansion — where pi never expands an extension's `sendUserMessage` (v0.83.0) unless it opts in with `expandPromptTemplates` (v0.84.2). See body. — **CLOSED 2026-09-27**: the options bag now reaches the host: `ControlOp::SendUserMessage`'s `opts` is honoured over the same `HostServices::control` seam a guest reaches (`crates/cyrup-ext/src/host/live.rs:1304-1315`), so `expandPromptTemplates` gates the slash-command dispatch and `deliverAs:"followUp"` queues behind the running turn. Verify: `cyrup-session-svc tests::ext_083_send_user_message_options::*` (4). |
 | EXT-084 | low | upstream-drift | M | **CORRECTED 2026-10-06:** `forceSystemPrompt` is half there — a `before_agent_start` `systemPrompt` replacement is now projected onto the request and kept out of the transcript (`cyrup-session-svc/src/hooks.rs::project_forced_prompt`, `CODE-014`); the mutable, normalized `systemPromptOptions` sections object handlers edit is still an opaque read-only value. **NEW 2026-09-24 (second pass).** pi v0.86.0 makes `before_agent_start`'s `systemPromptOptions` a mutable, normalized sections object that later handlers observe and the final prompt is re-rendered from (`systemPrompt` becomes a derived getter; a returned `systemPrompt` sets `forceSystemPrompt`); cyrup passes `options` as an opaque read-only value and reduces only a whole-prompt replacement. See body. |
 | ~~EXT-085~~ | ~~low~~ **CLOSED 2026-10-08** | upstream-drift | M | **NEW 2026-09-24 (second pass).** pi v0.86.0 `cache_warming_decision` (last handler's `action` wins, `runner.ts::emitCacheWarmingDecision`) has no counterpart. Blocked: the prompt-cache warmer it rides on (`core/cache-warmer.ts`) has no cyrup counterpart and **no area item owns it**. See body. — **CLOSED 2026-10-08** (SEAM-131 part 4): `EventKind::CacheWarmingDecision = 36` (`COUNT` 37), `HostEvent::CacheWarmingDecision` with pi's four `Pick`ed fields and nothing else, `aggregate::fold_cache_warming_decision` taking the LAST readable `{action}` over `dispatch_collect_handled` (every handler runs; a fault is contained and skipped, which is pi's `emitError`-and-continue), and `ExtensionHost::aggregate_cache_warming_decision`. Guest tier: `events.on-cache-warming-decision` at world **0.18.0**, an EXPORT ADDITION, with the SDK hook and the within-extension last-wins fold. The decision reaches the warmer through `ExtensionCacheWarmingDecider`, which the builder installs in place of `PiDecision`, and the call is bounded by the refresh deadline so a hung guest cannot freeze warming. The row's old Verify clause named `{action: "skip"}`, which does not exist at v1.0.4 — the union is `"warm" \| "stop"` and the fold ignores anything else; corrected in the body. |
-| EXT-086 | low | upstream-drift | M | **NEW 2026-09-24 (second pass).** A guest cannot make a model call through the session's configured providers: pi's `ctx.modelRegistry.complete()` (v0.84.1) and `stream()`/`streamSimple()` (v0.86.0, #8964) have no WIT verb; `interface models` is read-only plus `set-model`/`set-thinking-level`. See body. |
+| ~~EXT-086~~ | ~~low~~ **CLOSED 2026-10-08** | upstream-drift | M | **CLOSED 2026-10-08** (on `claude/eloquent-ritchie-up17bs`) against its own Verify line: all three verbs ported on both tiers — `complete`, `%stream`, `stream-simple`, `poll-stream`, `close-stream` on `interface models` (additive imports, world stays 0.17), gated by the new manifest grant `capabilities.modelCalls`; native door `HostServices::model_stream` / `model_complete`; session backend `session/model_calls.rs`. A live guest completes against the faux provider and gets its text, is refused without the grant, and drains a paced stream chunk by chunk to its end (`cyrup-it` `session_svc::wasm_model_calls`); hung, panicking, forgetful and unloaded guests leave no provider request running (`ext::wasm_model_calls`). See body. *Was:* a guest could not make a model call through the session's configured providers. |
 | ~~EXT-087~~ | ~~medium~~ **CLOSED 2026-09-29** | parity-bug | M | **NEW 2026-09-24 (second pass).** Guest `send-message` and `send-user-message` call `require_command_tier()`, so from any EVENT handler (`agent_end`, `agent_settled`, `tool_result`, …) they return the "deadlock guard" error; pi's `pi.sendMessage`/`pi.sendUserMessage` are plain `ExtensionAPI` methods callable from any handler (v0.83.0 `loader.ts:304-311`), and v0.87.0 defers a run requested from `agent_settled` until the settled dispatch ends. Subsumes the `agent_settled` deferral lead. See body. — **CLOSED 2026-09-29**: a guest `send-message` / `send-user-message` from a mid-run handler joins the run already going instead of starting a second one. The two send arms moved out of `apply_pending_control` into a shared `AgentSession::apply_send_op`, and `apply_pending_agent_control` -- the turn-boundary drain that runs at `drive_accepted_run`'s `handle.finished()` point and after each `continue_run`, i.e. with the run latch still raised -- now services them whenever `is_run_active()`, re-queueing otherwise; the six-line comment justifying unconditional re-queue is deleted along with the behaviour it defended. Upstream, `pi.sendUserMessage` runs synchronously from the handler into `prompt`, which branches on `isStreaming` and routes to `_queueSteer`/`_queueFollowUp` (`packages/coding-agent/src/core/agent-session.ts:1653-1666`), and `pi.sendMessage` branches the same way at `:1949-1954`: NEITHER starts a run. The latch is what makes that safe -- with it raised `prepare` can answer only `Queued` or `StreamingNeedsBehavior`, never `Run` -- and `queue_steer`/`queue_follow_up` make `has_queued_messages()` true, which is already how `handle_post_agent_run` decides to continue, so the message is delivered BY THE CURRENT RUN and the whole thing settles once instead of producing a second `agent_start`/`agent_end`/`agent_settled` triple and a steer a turn late. A `deliverAs`-less send now comes back `StreamingNeedsBehavior` and is reported through `report_control_failure`, cyrup's twin of `runner.emitError` (`:3047-3064`), where upstream throws "Agent is already processing. Specify streamingBehavior..." (`:1655-1658`) and cyrup silently ran a turn. Verify: `cyrup-session-svc tests::ext_087_send_from_event::a_send_from_a_mid_run_handler_joins_the_current_run_instead_of_starting_a_second`, `::a_send_from_an_agent_settled_handler_starts_exactly_one_run`, `cyrup-it session_svc::wasm_send_from_event::a_live_guest_sends_a_user_message_from_its_agent_settled_handler`. |
 | EXT-088 | *(tracker)* | not-ported | L | **NEW 2026-09-24 (second pass).** `@earendil-works/chord` — watch, do not port. Escalates when any of: `coding-agent/src/experimental/` loses its prefix; `core/extensions/` is deleted; a shipped release loads a chord facet bundle on the default CLI path; `packages/chord` declares a stable public API. None holds at v0.87.1. Not counted. See body. |
 | ~~EXT-089~~ | ~~low~~ **CLOSED 2026-09-30** | port-divergence | M | **CLOSED 2026-09-30** (on `claude/lows-batch3`; filed and closed in the same pass): the SDK's `ExtensionApi` now keeps every handler registered for an event (`crates/cyrup-ext-sdk/src/api.rs:1883`). `dispatch` (`:1900`) snapshots the live handlers, as pi's `snapshotEventHandlers` does, runs them in registration order, and combines their outcomes with pi's rule for that event (`crates/cyrup-ext-sdk/src/api/fold.rs:36`, table in the module doc). EXT-080's per-registration remover still works: `Removal::Remaining` (`api.rs:138`) drops only its own handler, and only the last remover for an event calls `registration.unsubscribe`. Host side: `before_agent_start` folds several handlers' messages, so `EventPatch::SystemPromptAndInject.inject` is now a `Vec<Message>` (`crates/cyrup-ext/src/contract.rs:76`). `decode_patch` (`crates/cyrup-ext/src/host/live.rs:3019`) reads pi's `message` and then the fold's `messages`; five native constructors in `cyrup-ext-subagents`, `cyrup-permission-system` and a `cyrup-session-svc` test moved to the `Vec`. Tests: `cyrup-ext-sdk tests::ergonomic::{two_handlers_for_one_event_both_run_in_order_with_pis_result_combination,removing_the_first_handler_leaves_the_second}` and `cyrup-ext host::live::tests::a_folded_before_agent_start_outcome_injects_every_message_in_order`. With `subscribe` reverted to replace, the first two were red: `left: [Array []]` against the chained `[[], [A]]`, and `left: ["second"]` against `["first", "second"]`. With the `messages` read removed, the third was red: two of the four injected messages were missing. See body. |
@@ -2515,6 +2526,96 @@ capability. Record the decision either way; if deferred, extend the CYRUP-DELTA 
 
 **Verify** — A guest calls `models.complete` against the faux provider and receives its text; a guest
 without the capability is refused.
+
+**CLOSED 2026-10-08** (on `claude/eloquent-ritchie-up17bs`), against the Verify line above and three
+proofs it does not name. Upstream re-read at **v1.0.4** through git objects
+(`core/model-registry.ts`, `core/model-runtime.ts`, `core/virtual-models.ts`, `core/sdk.ts`,
+`core/extensions/{runner,loader}.ts`, `test/virtual-models.test.ts`,
+`test/model-runtime-auth-options.test.ts`); cyrup read at HEAD.
+
+*What landed.* The WIT gains five IMPORTS on `interface models`: `complete`, `%stream` (`stream` is a
+WIT keyword), `stream-simple`, `poll-stream`, `close-stream`. Both `world.wit` copies are byte-identical
+(`cmp`). The world stays `cyrup:ext@0.18` (the version `SEAM-131` moved it to): no export and no existing import changed, which is this
+file's own "ADDED WITHOUT A BUMP" rule (`world.wit` header, `manifest.rs` `HOST_WORLD` history); the
+header records the addition. Host: `crates/cyrup-ext/src/host/model_calls.rs` (call decoding, pi's
+`.result()` fold, a bounded `complete`, the per-guest stream table), `HostServices::model_stream` /
+`model_complete`, the five imports in `host/live.rs`. Backend: `LiveHostServices::model_stream` →
+`AgentSession` via `session/model_calls.rs`, attached in `into_shared` like the other weak session
+handles. SDK: `Models::complete` / `stream` / `stream_simple`, `ModelStream`, `message_text`, and demo
+commands in `example/model_calls.rs`. User docs: `docs/guide/extensions/authoring.md`
+("Calling models", the capability table) and `overview.md`.
+
+*Native tier.* A native reaches the same backend through the `HostServices` it is handed in
+`set_host_services`: `model_complete(ModelCall)` / `model_stream(ModelCall)`. There is no gate:
+natives are in-tree code with no manifest, as for `provider_auth`.
+
+*Capability.* `capabilities.modelCalls` (Rust `model_calls`, default `false`, `true` in
+`host_granted()`), refusal text `DENIED_MODEL_CALLS`. Deliberately not `net`: `net` reaches endpoints
+the guest names with credentials it brings; a model call uses the USER's providers and credentials and
+spends their money. Deliberately not `models`: the read-only `models.*` verbs stay ungated, and a
+`"models": false` that still allowed `list-models` would read as a lie.
+
+*Design questions, settled on evidence.*
+
+1. **Virtual models — matches upstream.** Only `streamSimple` routes: `ModelRuntime.streamSimple`'s
+   virtual arm (`model-runtime.ts:717-734`) asks the router with reason `direct`, caps `maxTokens` to
+   the routed model, and drops caller `apiKey`/`headers`/`env` bound for another provider. `stream`
+   and `complete` have no virtual arm, so a virtual model reaches `withVirtualModels`'
+   `unroutedStream` (`virtual-models.ts:189-194`, `:233-235`) and settles as "must be routed before
+   streaming" (upstream test "fails unrouted stream calls on virtual models"). Ported exactly:
+   `AgentSession::extension_model_stream`.
+2. **`before_provider_request` and siblings — do NOT run, matching upstream.** The row's Impact says
+   pi extensions reuse "the session's auth AND its hooks"; the second half is wrong. pi wires
+   `before_provider_request` / `before_provider_headers` / `after_provider_response` into the AGENT
+   (`onPayload` / `transformHeaders` / `onResponse` in `core/sdk.ts:296-385`), and
+   `ModelRegistry.stream`/`streamSimple`/`complete` call `ModelRuntime` directly, which applies only
+   the caller's options (`prepareRequest`, `model-runtime.ts:658-688`). So an extension call carries
+   none of them, no attribution headers and no session id. Pinned by
+   `extension_model_calls::an_extension_call_carries_none_of_the_agents_request_hooks`.
+3. **Reentrancy.** The call site does not sit inside the session's tool-state or manager lock: the
+   backend reads the composed catalog (two std `RwLock` reads), routes with no branch state, and
+   resolves the provider without installing it; all provider work runs on a spawned task. The one
+   self-reentry is `stream-simple` on a virtual model the CALLING guest routes (its instance is
+   suspended in that call): refused up front by name, as `GuestReentry::RouterOfBusyInstance`
+   refuses a tool. Another guest's busy router is bounded by `ROUTE_LOCK_TIMEOUT`. A guest's own
+   custom-stream provider cannot be re-entered: `LiveExtension::provider_stream_simple` has no
+   production caller at HEAD.
+4. **Cost and cancellation.** Not recorded in session usage, matching upstream: pi's totals are read
+   off session entries (`getSessionStats`, `agent-session.ts:4168-4181`), and only the cache warmer
+   writes a `usage` entry; the settled message carries its own `usage`. A hung, panicking or
+   abandoned guest cannot leak a request: `complete` runs on its own task, aborted (and its
+   `CancelToken` fired) when the caller is dropped or after `MODEL_COMPLETE_TIMEOUT` (600s); a
+   stream's pump is stopped by `close-stream`, by abandonment (`MODEL_STREAM_ABANDON_AFTER`, 120s
+   unpolled), by any trap (a trap poisons a component store for good, so `LiveExtension::fault`
+   closes all the guest's streams), and by `ExtensionHost`'s `Drop`. The last was found by the unload
+   test: a loaded guest is NOT freed with its host (`GuestState` → registry → `WasmTool` →
+   `LiveExtension` → store → `GuestState`, a pre-existing cycle), so the host closes them itself.
+   That cycle is otherwise out of scope and noted here, not filed. No task this adds is awaited by
+   anything that keeps the process alive.
+
+*CYRUP-DELTAs, each recorded in the code.* (a) The model argument is an ADDRESS: the host re-resolves
+`(provider, id)` against its own catalog instead of streaming against the guest's object, so a guest
+cannot point the user's key at its own `baseUrl` (pi takes the whole `Model`). (b) `apiKey`, `env`,
+`signal`, the callback options and `transport` do not cross (`ModelCallOptions`). (c) A provider the
+session is not streaming through is resolved for the call and not installed: cyrup installs one
+provider at a time, and pi keeps every one live. (d) `complete` is bounded at 600s because it holds
+the guest's instance; pi has no bound. (e) `poll-stream` returns a BATCH and waits at most ~1s, unlike
+`http-client.poll-stream-chunk`'s per-chunk, up-to-300s wait: an empty batch is "nothing yet", `none`
+is the end.
+
+*Tests, each red-proved* (every test failed against a neutered implementation before it passed; the neuterings are listed in the PR). `cyrup-ext`
+`host::model_calls::tests` (17): call decoding, `settle`, bounded `complete` (timeout / dropped caller
+/ provider panic), stream drain, silence, close, table drop, `close_all`, abandonment both ways, a
+panicking pump, the cap, the event JSON. `cyrup-session-svc` `tests::extension_model_calls` (8): the
+native tier from a native command handler, no agent hooks, virtual `complete` unrouted, virtual
+`streamSimple` routed `direct` with the cap, header stripping across providers, no provider swap,
+unknown model settles, by-value fallback. `cyrup-it` `session_svc::wasm_model_calls` (3, the Verify
+line plus streaming) and `ext::wasm_model_calls` (6, guest misbehaviour, self-router refusal,
+capability refusal).
+
+*Falsification conditions.* Reopen if pi wires any provider hook into `ModelRuntime` (decision 2), if
+`stream`/`complete` gain a virtual arm upstream (decision 1), or if `ModelRegistry` starts appending
+usage entries (decision 4).
 
 ---
 

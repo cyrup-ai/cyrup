@@ -520,6 +520,7 @@ async fn a_guest_reads_the_footer_data_provider_back() {
         exec: false,
         net: false,
         ui: true,
+        model_calls: false,
     };
     host.load_wasm_with_caps("demo".into(), &bytes, rec.clone(), &caps)
         .await
@@ -817,6 +818,7 @@ async fn the_explicit_grant_entry_point_caps_a_manifest_less_component() {
         exec: false,
         net: false,
         ui: true,
+        model_calls: false,
     };
     host.load_wasm_with_caps("demo".into(), &bytes, rec.clone(), &caps)
         .await

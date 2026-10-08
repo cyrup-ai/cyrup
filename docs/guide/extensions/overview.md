@@ -34,12 +34,13 @@ Every extension ships an `extension.json` manifest that declares what it needs:
 }
 ```
 
-Four capabilities exist: filesystem (`fs`, as a list of read or write grants scoped to relative
-subtrees of your project), process execution (`exec`), network access (`net`), and user-interface
-access (`ui`). Every one of them defaults to the denying value.
+Five capabilities exist: filesystem (`fs`, as a list of read or write grants scoped to relative
+subtrees of your project), process execution (`exec`), network access (`net`), user-interface
+access (`ui`), and model calls through your configured providers (`modelCalls`). Every one of them
+defaults to the denying value.
 
 **An extension gets nothing it did not declare.** A component with no `capabilities` block has no
-filesystem, no exec, no network and no UI. The grant is enforced host-side, so an extension cannot
+filesystem, no exec, no network, no UI and no model calls. The grant is enforced host-side, so an extension cannot
 widen it at runtime — it cannot opt itself back in, and there is no runtime permission prompt that
 grants it more.
 

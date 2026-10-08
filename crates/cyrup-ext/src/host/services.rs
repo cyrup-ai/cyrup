@@ -79,6 +79,11 @@ pub const DENIED_NET: &str =
 /// Refusal for the `ui.*` imports when `capabilities.ui` is false.
 pub const DENIED_UI: &str =
     "capability denied: `extension.json` does not declare `capabilities.ui: true`";
+/// Refusal for the `models.complete` / `stream` / `stream-simple` / `poll-stream` / `close-stream`
+/// imports when `capabilities.modelCalls` is false (EXT-086). The read-only `models.*` imports are
+/// not behind it.
+pub const DENIED_MODEL_CALLS: &str =
+    "capability denied: `extension.json` does not declare `capabilities.modelCalls: true`";
 
 /// How stale [`GuestState::last_wait_touch`] is allowed to be, at the moment
 /// [`GuestState::take_dialog_extra_ticks`] runs, before the recorded wait anchor is distrusted as
@@ -1005,6 +1010,63 @@ pub trait HostServices: Send + Sync {
         Result<cyrup_core::AssistantMessage, StandaloneCompletionRefusal>,
     > {
         Box::pin(async { Err(StandaloneCompletionRefusal::NoModel) })
+    }
+
+    /// pi `ctx.modelRegistry.stream(model, context, options)` and `streamSimple(…)`
+    /// (`core/model-registry.ts` @v1.0.4, delegating to `ModelRuntime.stream` /
+    /// `ModelRuntime.streamSimple`, `core/model-runtime.ts:691-741`): one model call through the
+    /// session's configured providers, with the provider's request auth resolved per call. EXT-086.
+    ///
+    /// Which verb is [`crate::host::ModelCall::verb`], and the two differ exactly where upstream's
+    /// do: only [`crate::host::ModelCallVerb::StreamSimple`] routes a virtual model (reason
+    /// `direct`, re-capping `maxTokens` to the routed model and dropping caller headers bound for
+    /// another provider, `:717-734`); a `Stream` call on a virtual model settles as pi's
+    /// `unroutedStream` error ("must be routed before streaming").
+    ///
+    /// Like pi's, the returned stream NEVER fails as a call: an unknown model, a provider without
+    /// credentials, a routing failure and a transport failure all arrive as one `error` terminal.
+    /// No `before_provider_request` / `before_provider_headers` / `after_provider_response` hook
+    /// runs for it, matching upstream: those hooks are wired into the AGENT's `onPayload` /
+    /// `transformHeaders` / `onResponse` (`core/sdk.ts:296-385` @v1.0.4), never into
+    /// `ModelRuntime`, so an extension's own call is not one of the session's requests. Nor is its
+    /// usage recorded in the session: pi's totals are read off the session's entries
+    /// (`getSessionStats`, `core/agent-session.ts:4168-4181`), which an extension call writes none
+    /// of; the settled message carries its own `usage`.
+    ///
+    /// This is the NATIVE tier's door (a native holds the backend via
+    /// [`crate::Extension::set_host_services`]) and the backend of the WASM tier's
+    /// `models.stream` / `models.stream-simple` imports, which add the `modelCalls` capability gate
+    /// and the guest-owned [`crate::host::ModelStreams`] table on top.
+    ///
+    /// The default — a host with no session — answers one error terminal, never a fabricated reply.
+    fn model_stream(
+        &self,
+        call: crate::host::ModelCall,
+    ) -> cyrup_core::EventStream<cyrup_provider::StreamEvent> {
+        call.errored_stream("this host has no model registry to call through")
+    }
+
+    /// pi `ctx.modelRegistry.complete(model, context, options)`, which upstream defines as
+    /// `stream(…).result()` (`core/model-runtime.ts:707-713` @v1.0.4): a [`Self::model_stream`]
+    /// call with verb `Stream`, folded to the message its terminal carries. A request-time failure
+    /// settles as a message with `stopReason` `error` (or `aborted` when
+    /// [`crate::host::ModelCall::cancel`] fired), never as an `Err` — upstream's `complete`
+    /// resolves those too.
+    ///
+    /// Provided, so a backend implements [`Self::model_stream`] once and both verbs follow.
+    fn model_complete<'a>(
+        &'a self,
+        call: crate::host::ModelCall,
+    ) -> futures::future::BoxFuture<'a, cyrup_core::AssistantMessage> {
+        let call = crate::host::ModelCall {
+            verb: crate::host::ModelCallVerb::Stream,
+            ..call
+        };
+        let (provider, model_id) = (call.provider.clone(), call.model_id.clone());
+        let stream = self.model_stream(call);
+        Box::pin(
+            async move { crate::host::model_calls::settle(stream, &provider, &model_id).await },
+        )
     }
 
     // --- exec capability (R-08-030); denied by default ---
@@ -2078,6 +2140,11 @@ pub struct GuestState {
     /// (gap-08 §5.3) — this log is no longer the delivery mechanism, only a record of what THIS guest
     /// sent.
     bus_emits: Mutex<Vec<(String, Value)>>,
+    /// The model streams this guest opened through `models.stream` / `models.stream-simple`
+    /// (EXT-086). Per guest, so a handle is meaningless to any other extension. Its streams are
+    /// stopped when this state drops, when the guest traps, and when the host drops — see
+    /// [`crate::host::model_calls::ModelStreams`] for why the last needs saying.
+    model_streams: crate::host::model_calls::ModelStreams,
     /// The host-owned inter-extension event bus (Pi's single `createEventBus()` instance,
     /// event-bus.ts:12-32). Shared across every loaded guest by [`crate::ExtensionHost`]; a standalone
     /// [`GuestState`] (unit tests) gets a fresh isolated bus. `bus.subscribe`/`bus.emit` route here so
@@ -2296,6 +2363,7 @@ impl GuestState {
             widgets: Mutex::new(Vec::new()),
             chrome: Mutex::new(UiChrome::default()),
             bus_emits: Mutex::new(Vec::new()),
+            model_streams: crate::host::model_calls::ModelStreams::new(),
             bus: Arc::new(SharedBus::new()),
             tool_updates: Mutex::new(Vec::new()),
             autocomplete_providers: Mutex::new(0),
@@ -2380,6 +2448,24 @@ impl GuestState {
             Ok(())
         } else {
             Err(DENIED_UI.into())
+        }
+    }
+
+    /// This guest's open model streams (EXT-086) — see [`crate::host::model_calls::ModelStreams`].
+    pub fn model_streams(&self) -> &crate::host::model_calls::ModelStreams {
+        &self.model_streams
+    }
+
+    /// Host-side gate for the model-CALL imports of `interface models` (EXT-086): `complete`,
+    /// `stream`, `stream-simple`, `poll-stream` and `close-stream`. A call spends the user's money
+    /// and sends what the guest puts in its context to a provider under the user's credential, which
+    /// is a different authority from reading the catalog, so the read-only `models.*` imports stay
+    /// ungated.
+    pub fn require_model_calls(&self) -> Result<(), String> {
+        if self.caps.model_calls {
+            Ok(())
+        } else {
+            Err(DENIED_MODEL_CALLS.into())
         }
     }
 

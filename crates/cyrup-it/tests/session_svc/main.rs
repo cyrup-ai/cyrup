@@ -53,6 +53,7 @@ mod wasm_active_tools;
 mod wasm_compaction_override;
 mod wasm_exec;
 mod wasm_http;
+mod wasm_model_calls;
 mod wasm_nested_tool_calls;
 mod wasm_proc;
 mod wasm_send_from_event;

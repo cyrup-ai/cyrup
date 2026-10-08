@@ -70,6 +70,16 @@ pub struct Capabilities {
     pub net: bool,
     #[serde(default)]
     pub ui: bool,
+    /// `modelCalls` — make model calls through the session's configured providers, with the
+    /// user's credentials: the `models.complete` / `stream` / `stream-simple` imports and the
+    /// `poll-stream` / `close-stream` verbs that drain a stream (EXT-086; pi
+    /// `ctx.modelRegistry.complete/stream/streamSimple`). Separate from `net` because it is a
+    /// different authority: `net` reaches endpoints the extension names with credentials it brings,
+    /// while a model call reaches the USER's providers with the USER's credentials and spends the
+    /// user's money. The read-only `models.*` imports (`list-models`, `current`, …) are not behind
+    /// it. pi has no capability model at all, so this field is cyrup-original.
+    #[serde(default)]
+    pub model_calls: bool,
 }
 
 /// One parsed `capabilities.fs` entry: `"<mode>:<relative-path>"` where `<mode>` is `read` or
@@ -105,6 +115,7 @@ impl Capabilities {
             exec: true,
             net: true,
             ui: true,
+            model_calls: true,
         }
     }
 

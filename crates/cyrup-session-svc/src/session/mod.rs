@@ -32,6 +32,7 @@ mod forking;
 mod inject;
 mod lifecycle;
 mod model;
+mod model_calls;
 pub(crate) mod model_runtime;
 mod nested;
 mod prompt_update;
@@ -600,6 +601,16 @@ impl AgentSession {
         arc.services
             .host_services
             .attach_session_catalog(Arc::new(SessionCatalogHandle(Arc::downgrade(&arc))));
+        // EXT-086: give the capability backend the session's model-call path, so an extension's
+        // `complete` / `stream` / `streamSimple` resolves against the whole composed catalog, routes
+        // a virtual model the way pi's `ModelRuntime.streamSimple` does, and reaches the owning
+        // provider without swapping the one this session streams through. Weak, so the backend
+        // never keeps the session alive.
+        arc.services
+            .host_services
+            .attach_session_model_calls(Arc::new(model_calls::SessionModelCallsHandle(
+                Arc::downgrade(&arc),
+            )));
         // AGENT-029: install pi's per-request `transformHeaders` (sdk.ts:312-328 @v0.83.0,
         // byte- and offset-identical at v0.84.1). pi merges provider-attribution + session-affinity
         // headers inside a callback closed over the `model` argument of THAT `streamSimple` call —

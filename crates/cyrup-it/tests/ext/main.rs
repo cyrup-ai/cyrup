@@ -63,6 +63,7 @@ mod wasm_component;
 mod wasm_ctx_state;
 mod wasm_dispatch;
 mod wasm_dynamic_tools;
+mod wasm_model_calls;
 mod wasm_provider;
 mod wasm_renderer_routing;
 mod wasm_thinking_level;

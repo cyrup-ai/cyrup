@@ -164,3 +164,252 @@ impl Models {
         }
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// Model CALLS (EXT-086) — pi `ctx.modelRegistry.complete()` / `stream()` / `streamSimple()`.
+// ---------------------------------------------------------------------------------------------
+
+impl Models {
+    /// pi `ctx.modelRegistry.complete(model, context, options)` (`core/model-registry.ts` @v1.0.4):
+    /// one model call through the session's configured providers, with the user's credentials,
+    /// settled to pi's `AssistantMessage` JSON.
+    ///
+    /// * `model` names the model by its `provider` and `id` keys — a row from [`Self::list`] or
+    ///   [`Self::find`] works, and so does `json!({"provider": "…", "id": "…"})`. Only the address is
+    ///   read: the host resolves it against its own catalog, so a `baseUrl` in it is ignored.
+    /// * `context` is pi's `Context`: `{"systemPrompt"?, "messages": [...], "tools"?}`, each message
+    ///   in pi's shape (`{"role": "user", "content": "…", "timestamp": 0}`).
+    /// * `options` is pi's options bag (`maxTokens`, `temperature`, `sessionId`, `cacheRetention`,
+    ///   `headers`, `metadata`, `samplingParams`, `timeoutMs`, `maxRetries`, `maxRetryDelayMs`);
+    ///   `Value::Null` for none. Credentials and callbacks do not cross.
+    ///
+    /// Like pi's, a request-time failure is NOT an `Err`: an unknown model, a provider without
+    /// credentials, a virtual model (which `complete` never routes) or a transport failure all
+    /// come back as `Ok` with `"stopReason": "error"` and an `"errorMessage"`. `Err` means the call
+    /// could not be made — the manifest does not declare `capabilities.modelCalls`, or an argument
+    /// is malformed. [`message_text`] reads the reply's text.
+    ///
+    /// Suspends this extension for the length of the call (every handler of it waits), up to the
+    /// host's ceiling. Prefer [`Self::stream`] for anything long.
+    pub fn complete(
+        &self,
+        model: &Value,
+        context: &Value,
+        options: &Value,
+    ) -> Result<Value, String> {
+        #[cfg(target_arch = "wasm32")]
+        {
+            let reply = crate::guest::bindings::cyrup::ext::models::complete(
+                &model.to_string(),
+                &context.to_string(),
+                &options.to_string(),
+            )?;
+            return Ok(super::parse_json(reply));
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let _ = (model, context, options);
+            Err(NO_HOST.into())
+        }
+    }
+
+    /// pi `ctx.modelRegistry.stream(model, context, options)`: the same call as [`Self::complete`],
+    /// streamed. Arguments as there. `stream` never routes a virtual model (its stream ends with
+    /// pi's "must be routed before streaming" error); [`Self::stream_simple`] does.
+    pub fn stream(
+        &self,
+        model: &Value,
+        context: &Value,
+        options: &Value,
+    ) -> Result<ModelStream, String> {
+        #[cfg(target_arch = "wasm32")]
+        {
+            return crate::guest::bindings::cyrup::ext::models::stream(
+                &model.to_string(),
+                &context.to_string(),
+                &options.to_string(),
+            )
+            .map(ModelStream::new);
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let _ = (model, context, options);
+            Err(NO_HOST.into())
+        }
+    }
+
+    /// pi `ctx.modelRegistry.streamSimple(model, context, options)`: [`Self::stream`] with the
+    /// provider-neutral options — `options.reasoning` is a thinking level (`"minimal"` …
+    /// `"max"`, or `"off"`) — and the one verb that routes a VIRTUAL model, exactly as upstream:
+    /// the router is asked with reason `"direct"`, and `maxTokens` is capped to the model it picks.
+    pub fn stream_simple(
+        &self,
+        model: &Value,
+        context: &Value,
+        options: &Value,
+    ) -> Result<ModelStream, String> {
+        #[cfg(target_arch = "wasm32")]
+        {
+            return crate::guest::bindings::cyrup::ext::models::stream_simple(
+                &model.to_string(),
+                &context.to_string(),
+                &options.to_string(),
+            )
+            .map(ModelStream::new);
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let _ = (model, context, options);
+            Err(NO_HOST.into())
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+const NO_HOST: &str = "model calls are unavailable on the host target";
+
+/// The text of a settled `AssistantMessage` (what [`Models::complete`] and
+/// [`ModelStream::result`] return): its `text` blocks, concatenated in order. Empty for a message
+/// with none — check `stopReason` / `errorMessage` to tell a failure from an empty reply.
+pub fn message_text(message: &Value) -> String {
+    message
+        .get("content")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|block| block.get("type").and_then(Value::as_str) == Some("text"))
+        .filter_map(|block| block.get("text").and_then(Value::as_str))
+        .collect()
+}
+
+/// A model stream the HOST holds open for this extension — pi's `AssistantMessageEventStream`,
+/// drained by polling because a guest cannot hold a live host stream (the same request/poll bridge
+/// as [`crate::HttpStreamResponse`]).
+///
+/// Each event is pi's `AssistantMessageEvent` JSON: `start`, `text_start` / `text_delta` /
+/// `text_end`, the `thinking_*` and `toolcall_*` triples, then exactly ONE terminal — `done`
+/// (`{"type": "done", "reason", "message"}`) or `error` (`{"type": "error", "reason", "error"}`) —
+/// after which the stream is at its end.
+///
+/// Iterate it (`for event in stream { … }`), call [`Self::next_event`], or take whole batches with
+/// [`Self::poll`]. Dropping it closes it, which cancels the provider request if it is still
+/// running; so does [`Self::close`]. A stream the extension stops polling is closed by the host
+/// after a while, and every stream is closed when the extension is unloaded.
+#[derive(Debug)]
+pub struct ModelStream {
+    handle: u32,
+    buffered: std::collections::VecDeque<Value>,
+    ended: bool,
+    closed: bool,
+}
+
+impl ModelStream {
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+    fn new(handle: u32) -> Self {
+        Self {
+            handle,
+            buffered: std::collections::VecDeque::new(),
+            ended: false,
+            closed: false,
+        }
+    }
+
+    /// The host's handle for this stream.
+    pub fn handle(&self) -> u32 {
+        self.handle
+    }
+
+    /// One round trip to the host (`models.poll-stream`): every event that arrived since the last
+    /// one, in order. `Ok(Some(empty))` means nothing arrived within the host's short wait — the
+    /// stream is still live, poll again. `Ok(None)` is the end: the terminal was in an earlier
+    /// batch. Events already buffered by [`Self::next_event`] are returned first.
+    pub fn poll(&mut self) -> Result<Option<Vec<Value>>, String> {
+        if !self.buffered.is_empty() {
+            return Ok(Some(self.buffered.drain(..).collect()));
+        }
+        if self.ended {
+            return Ok(None);
+        }
+        let batch = self.poll_host()?;
+        if batch.is_none() {
+            self.ended = true;
+        }
+        Ok(batch)
+    }
+
+    /// The next event, polling the host as often as it takes; `Ok(None)` after the terminal.
+    pub fn next_event(&mut self) -> Result<Option<Value>, String> {
+        loop {
+            if let Some(event) = self.buffered.pop_front() {
+                return Ok(Some(event));
+            }
+            if self.ended {
+                return Ok(None);
+            }
+            match self.poll_host()? {
+                Some(batch) => self.buffered.extend(batch),
+                None => self.ended = true,
+            }
+        }
+    }
+
+    /// pi `AssistantMessageEventStream.result()`: drain to the terminal and return the message it
+    /// carries (`done`'s `message`, `error`'s `error`).
+    pub fn result(mut self) -> Result<Value, String> {
+        while let Some(event) = self.next_event()? {
+            match event.get("type").and_then(Value::as_str) {
+                Some("done") => return Ok(event.get("message").cloned().unwrap_or(Value::Null)),
+                Some("error") => return Ok(event.get("error").cloned().unwrap_or(Value::Null)),
+                _ => {}
+            }
+        }
+        Err("the model stream ended without a terminal event".into())
+    }
+
+    /// Close the stream now (`models.close-stream`), cancelling the provider request if it is still
+    /// running. Dropping the stream does the same.
+    pub fn close(mut self) {
+        self.close_host();
+    }
+
+    fn poll_host(&mut self) -> Result<Option<Vec<Value>>, String> {
+        #[cfg(target_arch = "wasm32")]
+        {
+            let batch = crate::guest::bindings::cyrup::ext::models::poll_stream(self.handle)?;
+            return Ok(batch.map(|events| events.into_iter().map(super::parse_json).collect()));
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        Err(NO_HOST.into())
+    }
+
+    fn close_host(&mut self) {
+        if self.closed {
+            return;
+        }
+        self.closed = true;
+        #[cfg(target_arch = "wasm32")]
+        crate::guest::bindings::cyrup::ext::models::close_stream(self.handle);
+    }
+}
+
+impl Drop for ModelStream {
+    fn drop(&mut self) {
+        self.close_host();
+    }
+}
+
+impl Iterator for ModelStream {
+    type Item = Result<Value, String>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.next_event() {
+            Ok(Some(event)) => Some(Ok(event)),
+            Ok(None) => None,
+            Err(e) => {
+                // An error ends iteration: yield it once, then stop.
+                self.ended = true;
+                Some(Err(e))
+            }
+        }
+    }
+}

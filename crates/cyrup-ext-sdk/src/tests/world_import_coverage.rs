@@ -136,9 +136,11 @@ fn declared_funcs(interface: &str) -> Vec<String> {
                 return None;
             }
             let (name, rest) = trimmed.split_once(':')?;
+            // `%name` is WIT's escape for an identifier that is also a keyword (`models.%stream`,
+            // EXT-086); the binding the SDK calls is the bare name.
             rest.trim_start()
                 .starts_with("func")
-                .then(|| name.trim().to_string())
+                .then(|| name.trim().trim_start_matches('%').to_string())
         })
         .collect()
 }

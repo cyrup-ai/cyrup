@@ -33,6 +33,7 @@ mod export_html;
 mod ext_077_user_bash_fails_closed;
 mod ext_083_send_user_message_options;
 mod ext_087_send_from_event;
+mod extension_model_calls;
 mod fork_non_persisted;
 mod fork_parent_and_unsaved_guard;
 mod get_commands_source_info;

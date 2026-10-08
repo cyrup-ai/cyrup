@@ -372,6 +372,24 @@ type NativeMap = RwLock<std::collections::HashMap<ExtensionId, Arc<dyn NativeExt
 #[cfg(feature = "wasm-host")]
 pub type LiveMap = RwLock<std::collections::HashMap<ExtensionId, Arc<crate::host::LiveExtension>>>;
 
+/// The host going away closes every model stream its guests left open (EXT-086).
+///
+/// It cannot be left to the instances' own drops: a loaded guest is NOT freed with its host. Its
+/// `GuestState` holds the shared registry, the registry holds the guest's `WasmTool`s, and each
+/// `WasmTool` holds the `LiveExtension` whose store holds that same `GuestState` — a cycle that
+/// predates model calls. A stream table that waited for that drop would keep paying for a provider
+/// request until the abandonment window ran out, so the host closes them itself.
+#[cfg(feature = "wasm-host")]
+impl Drop for ExtensionHost {
+    fn drop(&mut self) {
+        if let Ok(live) = self.live.read() {
+            for ext in live.values() {
+                ext.guest().model_streams().close_all();
+            }
+        }
+    }
+}
+
 /// The inter-extension bus fan-out, extracted from the facade so it can be reached from the
 /// dispatcher (EXT-034).
 ///

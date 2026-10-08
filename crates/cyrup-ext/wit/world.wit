@@ -160,6 +160,17 @@
 // `hook-outcome` return rather than needing a new variant: `handled({"action": "warm" | "stop"})`
 // overrides the host's own economics verdict, `noop` leaves it alone. Nothing else moves in this
 // batch — no new import, no re-signed export.
+//
+// ADDED WITHOUT A BUMP, 0.18 (after the batch above): the model-CALL imports of `interface models` —
+// `complete`, `%stream`, `stream-simple`, `poll-stream` and `close-stream` (EXT-086; pi
+// `ctx.modelRegistry.complete()`, `stream()` and `streamSimple()`, `core/model-registry.ts`
+// @v1.0.4). All five are new IMPORTS and no existing import or export changed shape, so a guest
+// built against an earlier 0.18 still links: the host simply offers imports it does not call (the
+// "ADDED WITHOUT A BUMP" rule above). The manifest grant that gates them, `capabilities.modelCalls`,
+// is a new DEFAULTED field, so an older `extension.json` parses unchanged and gets the denying
+// value. A guest built against THIS file and loaded on a host from before it is accepted by
+// `check_world` and fails on the missing import — the documented limit of the gate, which no bump
+// could change.
 package cyrup:ext@0.18.0;
 
 // ---------------------------------------------------------------------------
@@ -1134,6 +1145,51 @@ interface models {
   // command-tier gate existed to prevent. The `result` stays: it carries a real backend failure
   // (no session attached), not a tier refusal.
   set-thinking-level: func(level: string) -> result<_, string>;
+
+  // --- Model CALLS (EXT-086) ---------------------------------------------------------------------
+  // pi `ctx.modelRegistry.complete(model, context, options)`, `stream(…)` and `streamSimple(…)`
+  // (`core/model-registry.ts` @v1.0.4, delegating to `ModelRuntime`, `core/model-runtime.ts:691-741`):
+  // one model call through the session's configured providers, with the provider's request auth
+  // resolved per call. Gated by the manifest's `capabilities.modelCalls` (cyrup-original — pi has no
+  // capability model); the read-only verbs above stay ungated.
+  //
+  // `model-json` is an ADDRESS: any object with string `provider` and `id` keys (a `list-models` row
+  // qualifies). The host re-resolves it against the session's catalog and ignores the rest, so a
+  // guest cannot point the user's credential at an endpoint of its own. `context-json` is pi's
+  // `Context` (`{systemPrompt?, messages, tools?}`); `opts-json` is pi's options bag minus what cannot
+  // or must not cross (`apiKey`/`env`, `signal`, the callbacks) — "" or "null" for none.
+  //
+  // As upstream, a request-time failure is NOT an `err`: an unknown model, a provider without
+  // credentials, a routing failure or a transport failure SETTLES — `complete` answers `ok` with an
+  // `AssistantMessage` whose `stopReason` is `error`, a stream ends with one `error` terminal. `err`
+  // means the call could not be made: no capability, a malformed argument, too many open streams, or
+  // `stream-simple` on a virtual model whose router is this same extension (its instance is
+  // suspended in this call and cannot route; refused rather than deadlocked).
+  //
+  // Only `stream-simple` routes a virtual model (reason `direct`), as only pi's `streamSimple` does;
+  // `complete` and `stream` on one settle as pi's "must be routed before streaming" error. No
+  // `before_provider_request` hook runs for these calls and their usage is not added to the
+  // session's: pi wires both into the AGENT, not into `ModelRuntime`.
+  //
+  // `complete` holds this extension's instance for the length of the call (bounded by the host);
+  // `ok` is the settled `AssistantMessage` JSON.
+  complete:      func(model-json: string, context-json: string, opts-json: string) -> result<string, string>;
+  // The streaming verbs return a handle into this extension's own stream table; the HOST owns the
+  // provider stream and drains it in the background — the request/poll bridge of
+  // `http-client.request-stream` (a guest cannot hold a live host stream, and the host cannot push
+  // into a guest suspended in a call). `stream` is escaped because it is a WIT keyword; the binding
+  // name is `stream`.
+  %stream:       func(model-json: string, context-json: string, opts-json: string) -> result<u32, string>;
+  stream-simple: func(model-json: string, context-json: string, opts-json: string) -> result<u32, string>;
+  // Every event that arrived since the last poll, each pi's `AssistantMessageEvent` JSON, in order.
+  // UNLIKE `http-client.poll-stream-chunk` it never parks the guest on an open-ended wait: it waits
+  // at most ~1s for the first event, so `some([])` means "nothing yet, still live" — NOT the end.
+  // `none` is the end: the batch carrying the one terminal (`done` / `error`) was returned already.
+  // `err`: an unknown or closed handle, or a stream the host closed because it went unpolled.
+  poll-stream:   func(handle: u32) -> result<option<list<string>>, string>;
+  // Close a stream, cancelling its provider request if it is still running. An unknown handle is a
+  // no-op. Every stream still open is closed when the extension is unloaded or traps.
+  close-stream:  func(handle: u32);
 }
 
 interface exec {

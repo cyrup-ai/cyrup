@@ -14,6 +14,7 @@ use crate::event::{EventKind, HostEvent, InputEventSource, InputStreamingBehavio
 use crate::extension::{ExtKind, Extension};
 use crate::host::engine::map_wasm_error;
 use crate::host::limits::StoreLimits;
+use crate::host::model_calls::{ModelCall, ModelCallVerb};
 use crate::host::services::{
     ControlOp, DialogOptions, ExecOutput, GuestState, NestedImportRefusal, NotifyKind, OAuthEvent,
 };
@@ -92,6 +93,61 @@ fn ui_guest_of(state: &HostState) -> Result<&Arc<GuestState>, String> {
     let guest = guest_of(state)?;
     guest.require_ui()?;
     Ok(guest)
+}
+
+/// [`guest_of`] + the `capabilities.modelCalls` gate — the model-CALL imports of `interface models`
+/// (`complete`, `stream`, `stream-simple`, `poll-stream`, `close-stream`; EXT-086). The read-only
+/// `models.*` imports keep the ungated [`guest_of`].
+fn model_calls_guest_of(state: &HostState) -> Result<&Arc<GuestState>, String> {
+    let guest = guest_of(state)?;
+    guest.require_model_calls()?;
+    Ok(guest)
+}
+
+/// `models.stream` / `models.stream-simple`: decode the call, hand it to the backend, and park the
+/// resulting provider stream in this guest's own table.
+///
+/// One refusal is made HERE rather than left to the backend: `stream-simple` on a virtual model whose
+/// router is THIS extension. Routing it would call this instance's `route-model` export while the
+/// instance is suspended inside the call that asked — a WASM instance runs one call at a time, so
+/// the route would wait on the instance lock until [`LiveExtension::ROUTE_LOCK_TIMEOUT`] and then
+/// fail anyway, holding the guest's poll loop for the whole wait. Upstream has no such case (a JS
+/// router and its caller share one event loop); refusing by name is the same answer
+/// [`GuestReentry::RouterOfBusyInstance`] gives a tool call. Another extension's router is not
+/// refused: its instance is a different store, and a busy one is bounded by that same timeout.
+fn open_model_stream(
+    state: &HostState,
+    verb: ModelCallVerb,
+    model_json: &str,
+    context_json: &str,
+    opts_json: &str,
+) -> Result<u32, String> {
+    let guest = model_calls_guest_of(state)?;
+    let call = ModelCall::from_json(verb, model_json, context_json, opts_json)?;
+    if verb == ModelCallVerb::StreamSimple
+        && guest
+            .registry
+            .virtual_model_owner(&call.provider, &call.model_id)
+            .ok()
+            .flatten()
+            .as_ref()
+            == Some(&guest.owner)
+    {
+        return Err(format!(
+            "virtual model `{}/{}` is routed by this extension, whose instance is busy making \
+             this call; an instance runs one call at a time, so it cannot route its own request",
+            call.provider, call.model_id
+        ));
+    }
+    let (provider, model_id, cancel) = (
+        call.provider.clone(),
+        call.model_id.clone(),
+        call.cancel.clone(),
+    );
+    let stream = guest.services.model_stream(call);
+    guest
+        .model_streams()
+        .open(stream, cancel, &provider, &model_id)
 }
 
 /// Map the WIT `notify-kind` severity onto the host-owned [`NotifyKind`] (keeps bindgen types out
@@ -818,6 +874,106 @@ impl bindings::cyrup::ext::models::Host for HostState {
         // EFFECT on the subsequent turn and the guest observes `Ok(())` — no longer an honest deadlock
         // `Err`.
         guest.services.control(ControlOp::SetThinkingLevel(level))
+    }
+
+    // --- EXT-086: model CALLS through the session's providers ---------------------------------
+    //
+    // pi `ctx.modelRegistry.complete/stream/streamSimple`. The capability gate is
+    // `capabilities.modelCalls`; the backend is `HostServices::model_stream`; the guest-owned
+    // stream table is `GuestState::model_streams`. See `crate::host::model_calls`.
+
+    /// pi `ctx.modelRegistry.complete(…)` = `stream(…).result()`.
+    ///
+    /// The provider work runs on its own task ([`crate::host::model_calls::complete_bounded`]), so
+    /// it never runs inside this guest's frame: if the guest's call is torn down (the call that made
+    /// it was cancelled, the instance trapped) the task is aborted with the provider request, and a
+    /// provider that stalls is cut off at [`crate::host::model_calls::MODEL_COMPLETE_TIMEOUT`]
+    /// rather than holding the instance forever. The wait is forgiven against the epoch budget, as
+    /// every other long host call is ([`GuestState::note_dialog_wait`]).
+    async fn complete(
+        &mut self,
+        model_json: String,
+        context_json: String,
+        opts_json: String,
+    ) -> Result<String, String> {
+        let guest = Arc::clone(model_calls_guest_of(self)?);
+        let call = ModelCall::from_json(
+            ModelCallVerb::Stream,
+            &model_json,
+            &context_json,
+            &opts_json,
+        )?;
+        let (provider, model_id, cancel) = (
+            call.provider.clone(),
+            call.model_id.clone(),
+            call.cancel.clone(),
+        );
+        let started = std::time::Instant::now();
+        let stream = guest.services.model_stream(call);
+        let message = crate::host::model_calls::complete_bounded(
+            stream,
+            cancel,
+            &provider,
+            &model_id,
+            crate::host::model_calls::MODEL_COMPLETE_TIMEOUT,
+        )
+        .await;
+        guest.note_dialog_wait(started);
+        serde_json::to_string(&message).map_err(|e| format!("could not encode the reply: {e}"))
+    }
+
+    /// pi `ctx.modelRegistry.stream(…)`.
+    async fn stream(
+        &mut self,
+        model_json: String,
+        context_json: String,
+        opts_json: String,
+    ) -> Result<u32, String> {
+        open_model_stream(
+            self,
+            ModelCallVerb::Stream,
+            &model_json,
+            &context_json,
+            &opts_json,
+        )
+    }
+
+    /// pi `ctx.modelRegistry.streamSimple(…)`.
+    async fn stream_simple(
+        &mut self,
+        model_json: String,
+        context_json: String,
+        opts_json: String,
+    ) -> Result<u32, String> {
+        open_model_stream(
+            self,
+            ModelCallVerb::StreamSimple,
+            &model_json,
+            &context_json,
+            &opts_json,
+        )
+    }
+
+    async fn poll_stream(&mut self, handle: u32) -> Result<Option<Vec<String>>, String> {
+        let guest = Arc::clone(model_calls_guest_of(self)?);
+        let started = std::time::Instant::now();
+        let batch = guest.model_streams().poll(handle).await;
+        guest.note_dialog_wait(started);
+        Ok(batch?.map(|events| {
+            events
+                .iter()
+                .map(crate::host::model_calls::event_json)
+                .collect()
+        }))
+    }
+
+    async fn close_stream(&mut self, handle: u32) {
+        // No error channel in the signature: a refused or unknown close is a silent no-op, as
+        // `http-client.close-stream`'s is. The table is this guest's own, so there is no foreign
+        // handle to protect.
+        if let Ok(guest) = model_calls_guest_of(self) {
+            guest.model_streams().close(handle);
+        }
     }
 }
 
@@ -1844,6 +2000,16 @@ struct LiveInner {
 }
 
 impl LiveExtension {
+    /// Map a fault out of a guest call — and, because ANY such fault poisons this instance's store
+    /// for good (wasmtime refuses to enter a component store that trapped), close every model
+    /// stream the guest opened (EXT-086). Nothing in the guest can poll or close them any more: a
+    /// hung guest the epoch deadline cut off, or one that panicked, would otherwise leave its
+    /// provider requests running until [`crate::host::model_calls::MODEL_STREAM_ABANDON_AFTER`].
+    fn fault(&self, e: &wasmtime::Error) -> ExtError {
+        self.guest.model_streams().close_all();
+        map_wasm_error(e)
+    }
+
     /// Compile a component's bytes — the Cranelift pass, cyrup's counterpart of Pi's module import
     /// (`loadExtensionModule`, `core/extensions/loader.ts:567` @v0.87.1). Kept apart from
     /// [`Self::load`] so the host can take Pi's `${extensionPath} module import` timing mark
@@ -2038,7 +2204,7 @@ impl LiveExtension {
                 })
             }
             Ok(Err(msg)) => Err(ToolError::new(msg)),
-            Err(e) => Err(ToolError::new(map_wasm_error(&e).to_string())),
+            Err(e) => Err(ToolError::new(self.fault(&e).to_string())),
         }
     }
 
@@ -2146,7 +2312,7 @@ impl LiveExtension {
             // pi's `throw`: `executeBashWithOperations` re-raises everything that is not an abort
             // (`core/bash-executor.ts:154`), so a backend failure is never a successful command.
             Ok(Err(msg)) => Err(ToolError::new(msg)),
-            Err(e) => Err(ToolError::new(map_wasm_error(&e).to_string())),
+            Err(e) => Err(ToolError::new(self.fault(&e).to_string())),
         }
     }
 
@@ -2274,7 +2440,7 @@ impl LiveExtension {
                     Ok(Ok(answer)) => Ok(answer),
                     // pi's `route()` throwing, as a value.
                     Ok(Err(message)) => Err(GuestRouteError::Guest(message)),
-                    Err(e) => Err(GuestRouteError::Host(map_wasm_error(&e))),
+                    Err(e) => Err(GuestRouteError::Host(self.fault(&e))),
                 },
             }
         };
@@ -2315,7 +2481,7 @@ impl LiveExtension {
         let out = match res {
             Ok(Ok(out)) => out,
             Ok(Err(msg)) => return Err(ExtError::Component(msg)),
-            Err(e) => return Err(map_wasm_error(&e)),
+            Err(e) => return Err(self.fault(&e)),
         };
         // Run any `withSession` re-binding callbacks the command scheduled via a `control.*` op (Pi
         // `finishSessionReplacement`, sdk gap #3). Each is a FRESH top-level `with-session` export call
@@ -2335,7 +2501,7 @@ impl LiveExtension {
             match r {
                 Ok(Ok(())) => {}
                 Ok(Err(msg)) => return Err(ExtError::Component(msg)),
-                Err(e) => return Err(map_wasm_error(&e)),
+                Err(e) => return Err(self.fault(&e)),
             }
         }
         Ok(out)
@@ -2365,7 +2531,7 @@ impl LiveExtension {
             _ = cancel.cancelled() => return Err(ExtError::Cancelled),
             r = call => r,
         };
-        res.map_err(|e| map_wasm_error(&e))
+        res.map_err(|e| self.fault(&e))
     }
 
     /// Execute a guest-registered keyboard shortcut (R-08-017; Pi `registerShortcut` handler,
@@ -2388,7 +2554,7 @@ impl LiveExtension {
         match res {
             Ok(Ok(())) => Ok(()),
             Ok(Err(msg)) => Err(ExtError::Component(msg)),
-            Err(e) => Err(map_wasm_error(&e)),
+            Err(e) => Err(self.fault(&e)),
         }
     }
 
@@ -2407,7 +2573,7 @@ impl LiveExtension {
         let api = inner.instance.cyrup_ext_events();
         api.call_get_argument_completions(&mut inner.store, name, prefix)
             .await
-            .map_err(|e| map_wasm_error(&e))
+            .map_err(|e| self.fault(&e))
     }
 
     /// Render a tool call via a guest-registered message renderer (Pi `renderCall`,
@@ -2453,7 +2619,7 @@ impl LiveExtension {
         let api = inner.instance.cyrup_ext_events();
         api.call_transform_markdown(&mut inner.store, markdown, &ctx_s)
             .await
-            .map_err(|e| map_wasm_error(&e))
+            .map_err(|e| self.fault(&e))
     }
 
     /// Offer one raw terminal-input chunk to this guest's `onTerminalInput` handler (EXT-021; pi
@@ -2475,7 +2641,7 @@ impl LiveExtension {
                 consume: r.consume,
                 data: r.data,
             })),
-            Err(e) => Err(map_wasm_error(&e)),
+            Err(e) => Err(self.fault(&e)),
         }
     }
 
@@ -2494,7 +2660,7 @@ impl LiveExtension {
         let api = inner.instance.cyrup_ext_events();
         api.call_on_branch_change(&mut inner.store, branch)
             .await
-            .map_err(|e| map_wasm_error(&e))
+            .map_err(|e| self.fault(&e))
     }
 
     /// Run the guest provider's `login(callbacks)` flow (Pi `oauth.login`, host gap #1). Runs at
@@ -2510,7 +2676,7 @@ impl LiveExtension {
         match api.call_provider_login(&mut inner.store, id).await {
             Ok(Ok(s)) => Ok(serde_json::from_str(&s).unwrap_or(Value::Null)),
             Ok(Err(msg)) => Err(ExtError::Component(msg)),
-            Err(e) => Err(map_wasm_error(&e)),
+            Err(e) => Err(self.fault(&e)),
         }
     }
 
@@ -2533,7 +2699,7 @@ impl LiveExtension {
         {
             Ok(Ok(s)) => Ok(serde_json::from_str(&s).unwrap_or(Value::Null)),
             Ok(Err(msg)) => Err(ExtError::Component(msg)),
-            Err(e) => Err(map_wasm_error(&e)),
+            Err(e) => Err(self.fault(&e)),
         }
     }
 
@@ -2556,7 +2722,7 @@ impl LiveExtension {
         {
             Ok(Ok(key)) => Ok(key),
             Ok(Err(msg)) => Err(ExtError::Component(msg)),
-            Err(e) => Err(map_wasm_error(&e)),
+            Err(e) => Err(self.fault(&e)),
         }
     }
 
@@ -2581,7 +2747,7 @@ impl LiveExtension {
         {
             Ok(Ok(s)) => Ok(serde_json::from_str(&s).unwrap_or(Value::Null)),
             Ok(Err(msg)) => Err(ExtError::Component(msg)),
-            Err(e) => Err(map_wasm_error(&e)),
+            Err(e) => Err(self.fault(&e)),
         }
     }
 
@@ -2618,7 +2784,7 @@ impl LiveExtension {
         {
             Ok(Ok(())) => Ok(()),
             Ok(Err(msg)) => Err(ExtError::Component(msg)),
-            Err(e) => Err(map_wasm_error(&e)),
+            Err(e) => Err(self.fault(&e)),
         }
     }
 
@@ -2644,7 +2810,7 @@ impl LiveExtension {
             .await
         {
             Ok(s) => Ok(serde_json::from_str(&s).unwrap_or(Value::Null)),
-            Err(e) => Err(map_wasm_error(&e)),
+            Err(e) => Err(self.fault(&e)),
         }
     }
 
@@ -2670,7 +2836,7 @@ impl LiveExtension {
         {
             Ok(Some(s)) => Ok(serde_json::from_str::<Value>(&s).ok()),
             Ok(None) => Ok(None),
-            Err(e) => Err(map_wasm_error(&e)),
+            Err(e) => Err(self.fault(&e)),
         }
     }
 
@@ -2699,7 +2865,7 @@ impl LiveExtension {
         match res {
             Ok(Some(s)) => Ok(serde_json::from_str::<Value>(&s).ok()),
             Ok(None) => Ok(None),
-            Err(e) => Err(map_wasm_error(&e)),
+            Err(e) => Err(self.fault(&e)),
         }
     }
 }
@@ -3197,7 +3363,7 @@ impl LiveExtension {
         };
         match outcome {
             Ok(wit) => Ok(decode_outcome(kind, wit)),
-            Err(e) => Err(map_wasm_error(&e)),
+            Err(e) => Err(self.fault(&e)),
         }
     }
 }

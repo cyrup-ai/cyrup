@@ -204,6 +204,25 @@ impl ProviderSwap {
         self.resolver.is_some()
     }
 
+    /// The provider owning `provider_id` — the current one when it is that provider, else a fresh one
+    /// from the resolver — WITHOUT installing it. For a request that is not the session's own (an
+    /// extension's model call, EXT-086): it must reach the provider the model belongs to and must
+    /// not retarget the conversation by swapping the one the agent loop streams through.
+    ///
+    /// # Errors
+    ///
+    /// No resolver is wired, or the resolver fails (unknown provider, missing credentials).
+    pub fn resolve(&self, provider_id: &str) -> Result<Arc<dyn Provider>, String> {
+        let current = self.current();
+        if current.id().as_str() == provider_id {
+            return Ok(current);
+        }
+        let resolver = self.resolver.as_ref().ok_or_else(|| {
+            format!("cannot reach provider '{provider_id}': no provider resolver is configured for this session")
+        })?;
+        resolver.resolve(provider_id)
+    }
+
     /// Resolve the provider owning `provider_id` (installing its credentials) and install it as the
     /// current provider. Errors when no resolver is wired or the resolver fails.
     pub fn resolve_and_store(&self, provider_id: &str) -> Result<Arc<dyn Provider>, String> {
