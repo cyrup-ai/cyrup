@@ -8,7 +8,7 @@
 //!   and any `5xx`; never on `x-should-retry: false` (`provider-retry.ts:22-34`);
 //! - honor a server-requested delay from `retry-after-ms` then `retry-after` (seconds *or* an
 //!   HTTP-date), otherwise back off `min(0.5 * 2^retryIndex, 8)` seconds with jitter
-//!   (`provider-retry.ts:50-66`);
+//!   (`provider-retry.ts:53-69` @ce950d78f; a non-finite header value is ignored);
 //! - fail immediately when the server asks for longer than `maxRetryDelayMs` (default
 //!   [`DEFAULT_MAX_RETRY_DELAY_MS`]; `0` disables the cap) so a higher retry layer can surface it
 //!   with user visibility (`provider-retry.ts:36-48`).
@@ -103,12 +103,14 @@ pub fn exponential_backoff_ms(retry_index: u32) -> u64 {
 }
 
 /// How long to wait before retry number `retry_index` (0-based), given the failing response's
-/// headers (Pi `getRetryDelayMs`, provider-retry.ts:50-66).
+/// headers (Pi `getRetryDelayMs`, provider-retry.ts:53-69 @ce950d78f).
 ///
 /// Header precedence is Pi's: `retry-after-ms` (milliseconds), then `retry-after` (seconds, or an
-/// HTTP-date), then the jittered exponential backoff. A *server-requested* delay above the ceiling
-/// returns [`ProviderError::RetryDelay`] instead of sleeping, so the failure is surfaced rather than
-/// silently absorbed (Pi `validateServerRetryDelayMs` throws).
+/// HTTP-date), then the jittered exponential backoff. A header whose value does not yield a finite
+/// delay — unparseable, or overflowing to infinity — is skipped as if absent (Pi gates both
+/// branches on `Number.isFinite`, provider-retry.ts:57 and :64 @ce950d78f). A *server-requested*
+/// delay above the ceiling returns [`ProviderError::RetryDelay`] instead of sleeping, so the
+/// failure is surfaced rather than silently absorbed (Pi `validateServerRetryDelayMs` throws).
 ///
 /// `error_message` is Pi's `error.message`, appended to the ceiling-exceeded text verbatim.
 pub fn retry_delay_ms(
@@ -123,9 +125,12 @@ pub fn retry_delay_ms(
             .and_then(|v| v.to_str().ok())
     };
 
+    // `if (Number.isFinite(value))` (provider-retry.ts:57 @ce950d78f): NaN and ±Infinity (e.g.
+    // `1e999`) fall through to `retry-after` rather than reaching the ceiling check.
     if let Some(raw) = header("retry-after-ms")
         && !raw.is_empty()
         && let Some(value) = js_parse_float(raw)
+        && value.is_finite()
     {
         return validate_server_retry_delay_ms(value, retry, error_message);
     }
@@ -134,17 +139,18 @@ pub fn retry_delay_ms(
         && !raw.is_empty()
     {
         // `Number.parseFloat(retryAfter)`; NaN falls through to the HTTP-date form
-        // (`Date.parse(retryAfter) - Date.now()`).
+        // (`Date.parse(retryAfter) - Date.now()`), provider-retry.ts:62-63 @ce950d78f. A value that
+        // is neither (`None` here, NaN upstream) or overflows to infinity yields no server delay
+        // and falls through to the exponential ladder (`if (Number.isFinite(delayMs))`, :64).
         let delay_ms = match js_parse_float(raw) {
-            Some(seconds) => seconds * 1000.0,
-            // Pi's unparseable-date branch yields NaN, which `validateServerRetryDelayMs` passes
-            // through (`NaN > max` is false) and `abortableSleep`'s `Math.max(0, NaN)` then floors
-            // to an immediate retry. `0.0` reproduces that without importing NaN into the ladder.
-            None => parse_http_date_ms(raw)
-                .map(|at| (at - now_ms()) as f64)
-                .unwrap_or(0.0),
+            Some(seconds) => Some(seconds * 1000.0),
+            None => parse_http_date_ms(raw).map(|at| (at - now_ms()) as f64),
         };
-        return validate_server_retry_delay_ms(delay_ms, retry, error_message);
+        if let Some(delay_ms) = delay_ms
+            && delay_ms.is_finite()
+        {
+            return validate_server_retry_delay_ms(delay_ms, retry, error_message);
+        }
     }
 
     // No server guidance: jittered exponential backoff. Pi applies NO ceiling here — the ceiling
@@ -409,13 +415,57 @@ mod tests {
         assert!((6_000..=8_000).contains(&d));
     }
 
+    /// PROV-124 — Pi gates `retry-after` on `Number.isFinite(delayMs)` (provider-retry.ts:64
+    /// @ce950d78f), so a value that is neither seconds nor an HTTP-date uses the exponential ladder
+    /// instead of retrying immediately.
     #[test]
-    fn an_unparseable_retry_after_retries_immediately() {
+    fn an_unparseable_retry_after_falls_back_to_exponential_backoff() {
         let h = headers([("retry-after", "not-a-date")]);
-        assert_eq!(
-            retry_delay_ms(Some(&h), "boom", 0, ProviderRetry::NONE).unwrap(),
-            0
-        );
+        for _ in 0..64 {
+            let d = retry_delay_ms(Some(&h), "boom", 3, ProviderRetry::NONE).unwrap();
+            assert!(
+                (3_000..=4_000).contains(&d),
+                "unparseable retry-after must use the jittered 4s backoff, got {d}ms"
+            );
+        }
+    }
+
+    /// PROV-124 — a `retry-after` that overflows to infinity is not finite either, so it falls
+    /// through to the ladder rather than failing the ceiling check (provider-retry.ts:64).
+    #[test]
+    fn an_infinite_retry_after_falls_back_to_exponential_backoff() {
+        for raw in ["Infinity", "1e999", "-1e999"] {
+            let h = headers([("retry-after", raw)]);
+            let d = retry_delay_ms(Some(&h), "boom", 0, ProviderRetry::NONE)
+                .unwrap_or_else(|e| panic!("retry-after: {raw} must not error: {e}"));
+            assert!(
+                (375..=500).contains(&d),
+                "retry-after: {raw} must use the jittered 0.5s backoff, got {d}ms"
+            );
+        }
+    }
+
+    /// PROV-124 — `retry-after-ms` is gated on `Number.isFinite(value)` (provider-retry.ts:57
+    /// @ce950d78f; was `!Number.isNaN`, which let `Infinity` reach the ceiling check and fail the
+    /// request). A non-finite value is skipped, so `retry-after` (or the ladder) decides.
+    #[test]
+    fn an_infinite_retry_after_ms_is_skipped() {
+        for raw in ["Infinity", "1e999", "-1e999"] {
+            let h = headers([("retry-after-ms", raw), ("retry-after", "2")]);
+            assert_eq!(
+                retry_delay_ms(Some(&h), "boom", 0, ProviderRetry::NONE).unwrap(),
+                2_000,
+                "retry-after-ms: {raw} must defer to retry-after"
+            );
+
+            let h = headers([("retry-after-ms", raw)]);
+            let d = retry_delay_ms(Some(&h), "boom", 0, ProviderRetry::NONE)
+                .unwrap_or_else(|e| panic!("retry-after-ms: {raw} must not error: {e}"));
+            assert!(
+                (375..=500).contains(&d),
+                "retry-after-ms: {raw} alone must use the jittered 0.5s backoff, got {d}ms"
+            );
+        }
     }
 
     // ------------------------------------------------------- parseFloat -----------------------

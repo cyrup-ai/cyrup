@@ -56,6 +56,7 @@ use crate::classifier::{
 use crate::stream::ProviderResponse;
 use crate::stream::sse::build_client_for_target;
 use crate::utils::error_body::{MAX_PROVIDER_ERROR_BODY_CHARS, truncate_error_text};
+use crate::utils::headers::provider_headers_to_record;
 use crate::utils::provider_retry::{ProviderRetry, is_retryable_provider_error, retry_delay_ms};
 
 /// Provider label in error text (`const LABEL = "llama.cpp"`, llama-cpp-classify.ts:37).
@@ -656,25 +657,6 @@ struct RequestContext<'a> {
     root: String,
     options: &'a ClassifierOptions,
     client: reqwest::Client,
-}
-
-/// `providerHeadersToRecord` (utils/headers.ts:11-22): later sources override earlier ones by
-/// case-insensitive name and a `None` value removes the header.
-fn provider_headers_to_record(sources: &[Option<&HeaderMap>]) -> Vec<(String, String)> {
-    let mut merged: Vec<(String, String, String)> = Vec::new();
-    for source in sources.iter().copied().flatten() {
-        for (name, value) in source {
-            let normalized = name.to_lowercase();
-            merged.retain(|(existing, _, _)| *existing != normalized);
-            if let Some(value) = value {
-                merged.push((normalized, name.clone(), value.clone()));
-            }
-        }
-    }
-    merged
-        .into_iter()
-        .map(|(_, name, value)| (name, value))
-        .collect()
 }
 
 /// `headersToRecord` (utils/headers.ts:3-9): a `Headers` object read as a name to value record.

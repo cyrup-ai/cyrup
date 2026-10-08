@@ -42,7 +42,7 @@ pub(crate) fn convert_responses_tools(
         .iter()
         .map(|t| {
             let constrained_strict =
-                resolve_json_schema_strict_sampling(t, options.supports_strict_mode)?;
+                resolve_json_schema_strict_sampling(t, options.supports_strict_mode, None)?;
             // `const strict = constrainedStrict ?? defaultStrict` (`:381` @v0.84.2) — resolved
             // BEFORE the schema is converted, so a caller-supplied `default_strict = Some(true)`
             // converts too, and reused verbatim for the `strict` key below.

@@ -344,7 +344,7 @@ pub(super) fn convert_tool_config(
     let bedrock_tools: Vec<Value> = tools
         .iter()
         .map(|tool| {
-            let strict = resolve_json_schema_strict_sampling(tool, supports_strict_mode)?;
+            let strict = resolve_json_schema_strict_sampling(tool, supports_strict_mode, None)?;
             let mut spec = Map::new();
             spec.insert("name".to_string(), json!(tool.name));
             spec.insert("description".to_string(), json!(tool.description));

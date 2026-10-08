@@ -59,6 +59,12 @@ fn err<T>(message: impl Into<String>) -> Result<T> {
     Err(ConstrainedSamplingError(message.into()))
 }
 
+/// Pi `UnsupportedStrictSchemaKeywordCheck` (`constrained-sampling.ts:12-13` @ce950d78f): returns
+/// `true` when a provider's strict mode rejects this schema keyword with this value. PROV-121 —
+/// threaded through [`make_strict_json_schema`] and [`resolve_json_schema_strict_sampling`] so a
+/// provider can refuse extra keywords and a `prefer` tool falls back to non-strict.
+pub type UnsupportedStrictSchemaKeywordCheck = dyn Fn(&str, &Value) -> bool;
+
 /// Pi `UNSUPPORTED_STRICT_SCHEMA_KEYS` (`constrained-sampling.ts:12-29` @v0.84.2). A schema
 /// carrying any of these cannot be expressed in the strict subset the providers constrain against.
 const UNSUPPORTED_STRICT_SCHEMA_KEYS: [&str; 16] = [
@@ -126,13 +132,29 @@ fn schema_allows_null(schema: &Value) -> bool {
 /// Pi `makeJsonSchemaNodeStrict` (`constrained-sampling.ts:53-115` @v0.84.2) — mutates `schema` in
 /// place. The error strings are pi's `UnsupportedStrictJsonSchemaError` messages verbatim; they
 /// reach the model through [`ConstrainedSamplingError`] exactly as pi's thrown text does.
-fn make_json_schema_node_strict(schema: &mut Value) -> Result<()> {
+///
+/// PROV-121: `is_unsupported_keyword` is pi's optional provider predicate
+/// (`constrained-sampling.ts:56`, applied `:65-71` @ce950d78f), checked over every key of every
+/// node after the fixed deny-list and passed down each recursion (`:81`, `:89`, `:117`).
+fn make_json_schema_node_strict(
+    schema: &mut Value,
+    is_unsupported_keyword: Option<&UnsupportedStrictSchemaKeywordCheck>,
+) -> Result<()> {
     let Some(o) = schema.as_object_mut() else {
         return err("boolean schemas are unsupported");
     };
     for key in UNSUPPORTED_STRICT_SCHEMA_KEYS {
         if o.contains_key(key) {
             return err(format!("{key} schemas are unsupported"));
+        }
+    }
+    if let Some(check) = is_unsupported_keyword {
+        // `${key}: ${JSON.stringify(value)} is unsupported` (`:68`). `Object.entries` order is the
+        // map's own order here too: the workspace's `serde_json` has `preserve_order` (ACP-Q1).
+        for (key, value) in o.iter() {
+            if check(key, value) {
+                return err(format!("{key}: {value} is unsupported"));
+            }
         }
     }
 
@@ -144,7 +166,7 @@ fn make_json_schema_node_strict(schema: &mut Value) -> Result<()> {
             if is_structured_schema(variant) {
                 return err("object and array unions are unsupported");
             }
-            make_json_schema_node_strict(variant)?;
+            make_json_schema_node_strict(variant, is_unsupported_keyword)?;
         }
     }
 
@@ -152,7 +174,7 @@ fn make_json_schema_node_strict(schema: &mut Value) -> Result<()> {
         if items.is_array() {
             return err("tuple schemas are unsupported");
         }
-        make_json_schema_node_strict(items)?;
+        make_json_schema_node_strict(items, is_unsupported_keyword)?;
     }
 
     let is_object_schema = o.get("type") == Some(&Value::String("object".to_string()));
@@ -197,7 +219,7 @@ fn make_json_schema_node_strict(schema: &mut Value) -> Result<()> {
 
     if let Some(properties) = o.get_mut("properties").and_then(Value::as_object_mut) {
         for (key, property) in properties.iter_mut() {
-            make_json_schema_node_strict(property)?;
+            make_json_schema_node_strict(property, is_unsupported_keyword)?;
             // Pi wraps every non-required property in `anyOf: [property, {type:"null"}]`
             // (`constrained-sampling.ts:110-112`) so the constrainer can require EVERY key while
             // still letting the model decline one by emitting `null`.
@@ -213,13 +235,18 @@ fn make_json_schema_node_strict(schema: &mut Value) -> Result<()> {
 }
 
 /// Pi `makeStrictJsonSchema` (`constrained-sampling.ts:117-127` @v0.84.2). Clones first — the
-/// caller's schema is never mutated (upstream `structuredClone`).
-pub fn make_strict_json_schema(schema: &Value) -> Result<Value> {
+/// caller's schema is never mutated (upstream `structuredClone`). `is_unsupported_keyword` is the
+/// provider predicate (PROV-121, `constrained-sampling.ts:127-135` @ce950d78f); `None` is pi's
+/// omitted argument.
+pub fn make_strict_json_schema(
+    schema: &Value,
+    is_unsupported_keyword: Option<&UnsupportedStrictSchemaKeywordCheck>,
+) -> Result<Value> {
     let mut cloned = schema.clone();
     if !cloned.is_object() {
         return err("root schema must have type object");
     }
-    make_json_schema_node_strict(&mut cloned)?;
+    make_json_schema_node_strict(&mut cloned, is_unsupported_keyword)?;
     if cloned.get("type") != Some(&Value::String("object".to_string())) {
         return err("root schema must have type object");
     }
@@ -229,10 +256,11 @@ pub fn make_strict_json_schema(schema: &Value) -> Result<Value> {
 /// Pi `getJsonSchemaToolParameters` (`constrained-sampling.ts:129-131` @v0.84.2) — the schema an
 /// adapter must serialize. Upstream does NOT catch the throw here: a `strict === true` that came
 /// from a caller DEFAULT rather than from [`resolve_json_schema_strict_sampling`] surfaces the raw
-/// message, so this returns `Err` carrying that same bare text.
+/// message, so this returns `Err` carrying that same bare text. Upstream passes no keyword predicate
+/// here (`constrained-sampling.ts:142-144` @ce950d78f): the predicate only decides `strict`.
 pub fn json_schema_tool_parameters(tool: &ToolDef, strict: bool) -> Result<Value> {
     if strict {
-        make_strict_json_schema(&tool.parameters)
+        make_strict_json_schema(&tool.parameters, None)
     } else {
         Ok(tool.parameters.clone())
     }
@@ -399,9 +427,14 @@ fn infer_grammar_input_property(tool: &ToolDef) -> Result<String> {
 /// reason. Upstream distinguishes `UnsupportedStrictJsonSchemaError` from any other throw and
 /// rethrows the latter; every error [`make_strict_json_schema`] can produce here is of that one
 /// kind, so the Rust match needs no discriminant.
+///
+/// PROV-121: `is_unsupported_keyword` lets a provider reject extra keywords its strict mode does
+/// not accept (`constrained-sampling.ts:221-235` @ce950d78f); a rejected keyword is the same
+/// conversion error, so `prefer` degrades to `None` and `require` fails with the keyword named.
 pub fn resolve_json_schema_strict_sampling(
     tool: &ToolDef,
     supports_strict_mode: bool,
+    is_unsupported_keyword: Option<&UnsupportedStrictSchemaKeywordCheck>,
 ) -> Result<Option<bool>> {
     let Some(ConstrainedSamplingConfig::JsonSchema { strict }) =
         tool.constrained_sampling.as_ref().and_then(|c| c.config())
@@ -410,7 +443,7 @@ pub fn resolve_json_schema_strict_sampling(
     };
 
     if supports_strict_mode {
-        return match make_strict_json_schema(&tool.parameters) {
+        return match make_strict_json_schema(&tool.parameters, is_unsupported_keyword) {
             Ok(_) => Ok(Some(true)),
             Err(e) if *strict == StrictSampling::Require => err(format!(
                 "Tool \"{}\" requires JSON-schema constrained sampling, but {}.",
@@ -541,20 +574,25 @@ mod tests {
     #[test]
     fn strict_sampling_is_undefined_without_a_config() {
         assert_eq!(
-            resolve_json_schema_strict_sampling(&tool(None), true),
+            resolve_json_schema_strict_sampling(&tool(None), true, None),
             Ok(None)
         );
         // pi's `false` literal is indistinguishable from an absent field.
         assert_eq!(
             resolve_json_schema_strict_sampling(
                 &tool(Some(ConstrainedSampling::Disabled(false))),
-                true
+                true,
+                None
             ),
             Ok(None)
         );
         // A grammar config is not a json_schema config.
         assert_eq!(
-            resolve_json_schema_strict_sampling(&tool(grammar(Some("start: /x/"), None)), true),
+            resolve_json_schema_strict_sampling(
+                &tool(grammar(Some("start: /x/"), None)),
+                true,
+                None
+            ),
             Ok(None)
         );
     }
@@ -563,19 +601,27 @@ mod tests {
     fn strict_sampling_prefers_then_degrades_and_require_throws() {
         for strict in [StrictSampling::Prefer, StrictSampling::Require] {
             assert_eq!(
-                resolve_json_schema_strict_sampling(&tool(json_schema(strict)), true),
+                resolve_json_schema_strict_sampling(&tool(json_schema(strict)), true, None),
                 Ok(Some(true)),
                 "a strict-capable model always resolves true"
             );
         }
         // `prefer` on an incapable model degrades silently.
         assert_eq!(
-            resolve_json_schema_strict_sampling(&tool(json_schema(StrictSampling::Prefer)), false),
+            resolve_json_schema_strict_sampling(
+                &tool(json_schema(StrictSampling::Prefer)),
+                false,
+                None
+            ),
             Ok(None)
         );
         // `require` on an incapable model fails, with pi's exact wording.
         assert_eq!(
-            resolve_json_schema_strict_sampling(&tool(json_schema(StrictSampling::Require)), false),
+            resolve_json_schema_strict_sampling(
+                &tool(json_schema(StrictSampling::Require)),
+                false,
+                None
+            ),
             err(
                 "Tool \"grammar_tool\" requires JSON-schema constrained sampling, but strict tools are unsupported."
             )
@@ -803,7 +849,7 @@ mod tests {
     /// `false`, and each previously-optional property is wrapped in `anyOf: [<original>, null]`.
     #[test]
     fn strict_conversion_requires_every_key_and_makes_optionals_nullable() {
-        let converted = make_strict_json_schema(&read_parameters()).unwrap();
+        let converted = make_strict_json_schema(&read_parameters(), None).unwrap();
         // ACP-Q1 — `serde_json::Map` is an `IndexMap` in this workspace: `agent-client-protocol`
         // (`cyrup-acp`'s wire dependency) declares `serde_json` with a non-optional
         // `preserve_order`, and cargo feature unification is graph-wide. So `Object::keys()` — and
@@ -858,7 +904,7 @@ mod tests {
                 }
             }
         });
-        let converted = make_strict_json_schema(&edit_parameters).unwrap();
+        let converted = make_strict_json_schema(&edit_parameters, None).unwrap();
         // ACP-Q1 — declaration order, not alphabetical; see
         // `strict_conversion_requires_every_key_and_makes_optionals_nullable`.
         assert_eq!(converted["required"], json!(["path", "edits"]));
@@ -874,14 +920,17 @@ mod tests {
     /// A property that ALREADY admits `null` is left alone (pi `schemaAllowsNull`).
     #[test]
     fn strict_conversion_does_not_double_wrap_a_nullable_optional() {
-        let converted = make_strict_json_schema(&json!({
-            "type": "object",
-            "properties": {
-                "a": { "type": ["string", "null"] },
-                "b": { "anyOf": [{ "type": "string" }, { "type": "null" }] },
-                "c": { "enum": ["x", null] }
-            }
-        }))
+        let converted = make_strict_json_schema(
+            &json!({
+                "type": "object",
+                "properties": {
+                    "a": { "type": ["string", "null"] },
+                    "b": { "anyOf": [{ "type": "string" }, { "type": "null" }] },
+                    "c": { "enum": ["x", null] }
+                }
+            }),
+            None,
+        )
         .unwrap();
         assert_eq!(
             converted["properties"]["a"],
@@ -899,7 +948,7 @@ mod tests {
     #[test]
     fn strict_conversion_leaves_the_callers_schema_untouched() {
         let original = read_parameters();
-        let _ = make_strict_json_schema(&original).unwrap();
+        let _ = make_strict_json_schema(&original, None).unwrap();
         assert_eq!(original, read_parameters());
     }
 
@@ -938,7 +987,7 @@ mod tests {
             ),
         ];
         for (schema, message) in cases {
-            let e = make_strict_json_schema(&schema).unwrap_err();
+            let e = make_strict_json_schema(&schema, None).unwrap_err();
             assert_eq!(e.0, message, "for schema {schema}");
         }
     }
@@ -949,11 +998,14 @@ mod tests {
     fn an_unconvertible_schema_degrades_under_prefer_and_fails_under_require() {
         let params = json!({ "type": "object", "$ref": "#/$defs/x" });
         let prefer = schema_tool("weird", params.clone(), StrictSampling::Prefer);
-        assert_eq!(resolve_json_schema_strict_sampling(&prefer, true), Ok(None));
+        assert_eq!(
+            resolve_json_schema_strict_sampling(&prefer, true, None),
+            Ok(None)
+        );
 
         let require = schema_tool("weird", params, StrictSampling::Require);
         assert_eq!(
-            resolve_json_schema_strict_sampling(&require, true)
+            resolve_json_schema_strict_sampling(&require, true, None)
                 .unwrap_err()
                 .0,
             "Tool \"weird\" requires JSON-schema constrained sampling, but $ref schemas are unsupported."
@@ -964,7 +1016,7 @@ mod tests {
     #[test]
     fn a_non_strict_route_keeps_the_raw_schema_and_does_not_fail() {
         let tool = schema_tool("read", read_parameters(), StrictSampling::Prefer);
-        let strict = resolve_json_schema_strict_sampling(&tool, false).unwrap();
+        let strict = resolve_json_schema_strict_sampling(&tool, false, None).unwrap();
         assert_eq!(strict, None);
         assert_eq!(
             json_schema_tool_parameters(&tool, strict == Some(true)).unwrap(),
@@ -976,11 +1028,11 @@ mod tests {
     #[test]
     fn a_strict_capable_route_resolves_true_and_serializes_the_converted_schema() {
         let tool = schema_tool("read", read_parameters(), StrictSampling::Prefer);
-        let strict = resolve_json_schema_strict_sampling(&tool, true).unwrap();
+        let strict = resolve_json_schema_strict_sampling(&tool, true, None).unwrap();
         assert_eq!(strict, Some(true));
         assert_eq!(
             json_schema_tool_parameters(&tool, strict == Some(true)).unwrap(),
-            make_strict_json_schema(&read_parameters()).unwrap()
+            make_strict_json_schema(&read_parameters(), None).unwrap()
         );
     }
 
@@ -990,11 +1042,111 @@ mod tests {
         let mut tool = schema_tool("read", read_parameters(), StrictSampling::Prefer);
         tool.constrained_sampling = None;
         for supports in [false, true] {
-            let strict = resolve_json_schema_strict_sampling(&tool, supports).unwrap();
+            let strict = resolve_json_schema_strict_sampling(&tool, supports, None).unwrap();
             assert_eq!(strict, None);
             assert_eq!(
                 json_schema_tool_parameters(&tool, strict == Some(true)).unwrap(),
                 read_parameters()
+            );
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // PROV-121 — the provider rejected-keyword predicate (`constrained-sampling.ts:13`, `:65-71`,
+    // `:228` @ce950d78f) with Anthropic's rules (`anthropic-messages.ts:1541-1574` @ce950d78f)
+    // ---------------------------------------------------------------------
+
+    use crate::api::anthropic_messages::tools::is_anthropic_strict_unsupported_keyword as anthropic;
+
+    /// An object schema with one required property `p` whose schema is `property`.
+    fn one_property(property: Value) -> Value {
+        json!({ "type": "object", "properties": { "p": property }, "required": ["p"] })
+    }
+
+    /// `minimum` makes a `prefer` tool non-strict under the Anthropic predicate and leaves it strict
+    /// without one; `require` fails naming the keyword with pi's `JSON.stringify` rendering.
+    #[test]
+    fn prov121_a_rejected_keyword_degrades_prefer_and_fails_require() {
+        let params = one_property(json!({ "type": "integer", "minimum": 1 }));
+        let prefer = schema_tool("count", params.clone(), StrictSampling::Prefer);
+        assert_eq!(
+            resolve_json_schema_strict_sampling(&prefer, true, Some(&anthropic)),
+            Ok(None)
+        );
+        assert_eq!(
+            resolve_json_schema_strict_sampling(&prefer, true, None),
+            Ok(Some(true))
+        );
+
+        let require = schema_tool("count", params, StrictSampling::Require);
+        assert_eq!(
+            resolve_json_schema_strict_sampling(&require, true, Some(&anthropic)),
+            err(
+                "Tool \"count\" requires JSON-schema constrained sampling, but minimum: 1 is unsupported."
+            )
+        );
+    }
+
+    /// `minItems` passes only as `0` or `1`; `format` only as one of the ten listed strings.
+    #[test]
+    fn prov121_min_items_and_format_have_allowlists() {
+        let resolves = |property: Value| {
+            let t = schema_tool("t", one_property(property), StrictSampling::Prefer);
+            resolve_json_schema_strict_sampling(&t, true, Some(&anthropic)).unwrap()
+        };
+        let array =
+            |min: Value| json!({ "type": "array", "items": { "type": "string" }, "minItems": min });
+        assert_eq!(resolves(array(json!(0))), Some(true));
+        assert_eq!(resolves(array(json!(1))), Some(true));
+        assert_eq!(resolves(array(json!(2))), None);
+        assert_eq!(resolves(array(json!("1"))), None, "`\"1\" !== 1` upstream");
+
+        let string = |format: Value| json!({ "type": "string", "format": format });
+        assert_eq!(resolves(string(json!("date"))), Some(true));
+        assert_eq!(resolves(string(json!("uuid"))), Some(true));
+        assert_eq!(resolves(string(json!("regex"))), None);
+        assert_eq!(resolves(string(json!(7))), None);
+    }
+
+    /// The predicate covers all eleven outright-rejected keywords and reaches nested nodes through
+    /// every recursion edge: `properties` (`:117`), `items` (`:89`) and `anyOf` (`:81`).
+    #[test]
+    fn prov121_the_predicate_is_checked_at_every_depth() {
+        for key in [
+            "minimum",
+            "maximum",
+            "exclusiveMinimum",
+            "exclusiveMaximum",
+            "multipleOf",
+            "maxItems",
+            "uniqueItems",
+            "minContains",
+            "maxContains",
+            "minProperties",
+            "maxProperties",
+        ] {
+            assert!(anthropic(key, &json!(1)), "{key} is rejected");
+        }
+        assert!(!anthropic("description", &json!("x")));
+
+        let nested = [
+            one_property(json!({ "type": "integer", "maximum": 3 })),
+            one_property(
+                json!({ "type": "array", "items": { "type": "number", "multipleOf": 2 } }),
+            ),
+            one_property(
+                json!({ "anyOf": [{ "type": "string", "format": "regex" }, { "type": "null" }] }),
+            ),
+            json!({ "type": "object", "properties": {}, "maxProperties": 2 }),
+        ];
+        for params in nested {
+            assert!(
+                make_strict_json_schema(&params, Some(&anthropic)).is_err(),
+                "rejected under the predicate: {params}"
+            );
+            assert!(
+                make_strict_json_schema(&params, None).is_ok(),
+                "accepted without it: {params}"
             );
         }
     }

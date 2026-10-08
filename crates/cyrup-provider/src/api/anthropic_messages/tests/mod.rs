@@ -17,6 +17,7 @@ mod params;
 mod perf001;
 mod tool_references;
 mod tools;
+mod usage;
 
 use super::claude_code::*;
 use super::compat::*;

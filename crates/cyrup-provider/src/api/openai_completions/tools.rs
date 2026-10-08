@@ -67,7 +67,7 @@ pub(crate) fn convert_tools(
     tools
         .iter()
         .map(|t| {
-            let strict = resolve_json_schema_strict_sampling(t, compat.supports_strict_mode)?;
+            let strict = resolve_json_schema_strict_sampling(t, compat.supports_strict_mode, None)?;
             let mut function = Map::new();
             function.insert("name".to_string(), json!(t.name));
             function.insert("description".to_string(), json!(t.description));

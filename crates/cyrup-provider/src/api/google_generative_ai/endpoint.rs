@@ -35,18 +35,14 @@ pub(super) fn build_headers(model: &Model, opts: &StreamOptions, api_key: &str) 
     );
     headers.insert("x-goog-api-key".to_string(), Some(api_key.to_string()));
 
-    // model.headers < opts.headers (a `None` suppresses a default — Pi `providerHeadersToRecord`,
-    // google-generative-ai.ts:331).
-    if let Some(overlay) = &model.headers {
-        for (name, value) in overlay {
-            headers.insert(name.clone(), value.clone());
-        }
-    }
-    if let Some(overlay) = &opts.headers {
-        for (name, value) in overlay {
-            headers.insert(name.clone(), value.clone());
-        }
-    }
+    // model.headers < opts.headers, merged case-insensitively with a `None` suppressing a default —
+    // pi `providerHeadersToRecord({ ..., ...model.headers, ...optionsHeaders })`
+    // (google-generative-ai.ts:358 @ce950d78f, utils/headers.ts:11-23), PROV-126.
+    let mut headers = crate::utils::headers::merge_provider_headers(&[
+        Some(&headers),
+        model.headers.as_ref(),
+        opts.headers.as_ref(),
+    ]);
     // PROV-095: `{ "User-Agent": getPiUserAgent(), ...model.headers, ...optionsHeaders }`
     // (google-generative-ai.ts:357 @v0.87.1) — the default sits under every overlay.
     crate::utils::user_agent::insert_default_user_agent(&mut headers);

@@ -7,6 +7,54 @@ use crate::utils::constrained_sampling::{
 };
 use serde_json::{Map, Value, json};
 
+/// Keywords Anthropic strict tool use rejects with a 400 for the whole request (pi
+/// `ANTHROPIC_STRICT_UNSUPPORTED_KEYWORDS`, `anthropic-messages.ts:1541-1555` @ce950d78f).
+/// <https://platform.claude.com/docs/en/build-with-claude/structured-outputs#json-schema-limitations>
+const ANTHROPIC_STRICT_UNSUPPORTED_KEYWORDS: [&str; 11] = [
+    "minimum",
+    "maximum",
+    "exclusiveMinimum",
+    "exclusiveMaximum",
+    "multipleOf",
+    "maxItems",
+    "uniqueItems",
+    "minContains",
+    "maxContains",
+    "minProperties",
+    "maxProperties",
+];
+
+/// The string `format`s Anthropic strict tool use accepts (pi `ANTHROPIC_STRICT_STRING_FORMATS`,
+/// `anthropic-messages.ts:1556-1567` @ce950d78f).
+const ANTHROPIC_STRICT_STRING_FORMATS: [&str; 10] = [
+    "date-time",
+    "time",
+    "date",
+    "duration",
+    "email",
+    "hostname",
+    "uri",
+    "ipv4",
+    "ipv6",
+    "uuid",
+];
+
+/// Pi `isAnthropicStrictUnsupportedKeyword` (`anthropic-messages.ts:1569-1574` @ce950d78f). PROV-121.
+/// `minItems` is accepted only as `0` or `1` (`value !== 0 && value !== 1`, so `1.0` is accepted as
+/// in JS and a string `"1"` is not); `format` only as one of the ten listed strings.
+pub(crate) fn is_anthropic_strict_unsupported_keyword(key: &str, value: &Value) -> bool {
+    if ANTHROPIC_STRICT_UNSUPPORTED_KEYWORDS.contains(&key) {
+        return true;
+    }
+    match key {
+        "minItems" => !value.as_f64().is_some_and(|n| n == 0.0 || n == 1.0),
+        "format" => !value
+            .as_str()
+            .is_some_and(|f| ANTHROPIC_STRICT_STRING_FORMATS.contains(&f)),
+        _ => false,
+    }
+}
+
 /// Map cyrup [`ToolDef`]s to Anthropic `tools` (Pi `convertTools`, anthropic-messages.ts:1188-1211).
 /// `cache_control` is applied to the last tool only; `eager_input_streaming` when supported.
 ///
@@ -28,8 +76,13 @@ pub(crate) fn convert_tools(
         .iter()
         .enumerate()
         .map(|(index, tool)| {
-            // PROV-011 — `anthropic-messages.ts:1337` @v0.84.2.
-            let strict = resolve_json_schema_strict_sampling(tool, supports_strict_tools)?;
+            // PROV-011 — `anthropic-messages.ts:1337` @v0.84.2. PROV-121 — with Anthropic's
+            // rejected-keyword predicate (`:1586` @ce950d78f).
+            let strict = resolve_json_schema_strict_sampling(
+                tool,
+                supports_strict_tools,
+                Some(&is_anthropic_strict_unsupported_keyword),
+            )?;
             // `const parameters = getJsonSchemaToolParameters(tool, strict)` (`:1338` @v0.84.2):
             // BOTH the legacy three-key subset and the strict spread are taken from the CONVERTED
             // schema (`:1339-1344`), not from the tool's raw parameters.

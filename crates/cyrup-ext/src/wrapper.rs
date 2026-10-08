@@ -702,7 +702,7 @@ mod tests {
                 constrained_sampling: wrapped.constrained_sampling().cloned(),
             };
 
-            let strict = resolve_json_schema_strict_sampling(&def, true)
+            let strict = resolve_json_schema_strict_sampling(&def, true, None)
                 .expect("strict `prefer` never fails the request");
             let params = json_schema_tool_parameters(&def, strict == Some(true))
                 .expect("the built-in schemas are all convertible");

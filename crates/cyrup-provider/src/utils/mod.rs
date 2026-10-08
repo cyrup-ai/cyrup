@@ -31,6 +31,9 @@
 //! - [`node_http_proxy`] — `HTTP(S)_PROXY`/`NO_PROXY` resolution (`utils/node-http-proxy.ts`).
 //! - [`provider_retry`] — the server-directed request-retry policy (`utils/provider-retry.ts`).
 //!
+//! [`headers`] (crate-private) is the case-insensitive request-header merge
+//! (`utils/headers.ts` `providerHeadersToRecord`), PROV-126.
+//!
 //! [`user_agent`] (crate-private) is the default client `User-Agent` (`utils/pi-user-agent.ts`),
 //! rebranded to `cyrup`, that seven adapters send under their header overlays (PROV-095).
 //!
@@ -44,6 +47,7 @@ pub mod deferred_tools;
 pub mod error_body;
 pub mod estimate;
 pub mod hash;
+pub(crate) mod headers;
 pub mod http_date;
 pub use cyrup_core::json as json_parse;
 pub mod node_http_proxy;

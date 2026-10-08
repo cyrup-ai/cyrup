@@ -35,7 +35,7 @@ pub(super) fn to_function_tools(tools: &[ToolDef]) -> Result<Vec<Value>, Constra
     tools
         .iter()
         .map(|t| {
-            let strict = resolve_json_schema_strict_sampling(t, true)?;
+            let strict = resolve_json_schema_strict_sampling(t, true, None)?;
             Ok(json!({
                 "type": "function",
                 "function": {

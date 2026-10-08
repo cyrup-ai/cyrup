@@ -121,6 +121,43 @@ fn constrained_sampling_drives_anthropic_strict_tools() {
     );
 }
 
+// PROV-121 — on the wire: a `prefer` tool whose schema carries a keyword Anthropic strict mode
+// rejects is sent without `strict` and with the legacy subset, rather than drawing a 400 for the
+// whole request (`anthropic-messages.ts:1586` @ce950d78f).
+#[test]
+fn a_rejected_keyword_sends_the_tool_non_strict() {
+    use crate::api::compat::AnthropicMessagesCompat;
+    use crate::context::{ConstrainedSampling, ConstrainedSamplingConfig, StrictSampling};
+
+    let mut m = model();
+    m.compat = Some(AnthropicMessagesCompat {
+        supports_strict_tools: Some(true),
+        ..Default::default()
+    });
+    let mut ctx = user_ctx("hi");
+    ctx.tools = vec![ToolDef {
+        name: "count".into(),
+        description: "d".into(),
+        parameters: json!({
+            "type": "object",
+            "properties": { "n": { "type": "integer", "minimum": 1 } },
+            "required": ["n"],
+        }),
+        constrained_sampling: Some(ConstrainedSampling::Config(
+            ConstrainedSamplingConfig::JsonSchema {
+                strict: StrictSampling::Prefer,
+            },
+        )),
+    }];
+    let body = build_body(&m, &ctx, &StreamOptions::default());
+    assert!(body["tools"][0].get("strict").is_none());
+    assert!(
+        body["tools"][0]["input_schema"]
+            .get("additionalProperties")
+            .is_none()
+    );
+}
+
 #[test]
 fn tools_encode_eager_streaming_and_cache_control() {
     let mut ctx = user_ctx("use a tool");

@@ -26,7 +26,7 @@ pub(super) fn apply_message_start_usage(usage: &mut Usage, raw: &Value) {
     usage.cache_write_1h = Some(long);
 }
 
-/// Apply `message_delta` usage (Pi anthropic-messages.ts:690-709): only present fields update,
+/// Apply `message_delta` usage (Pi anthropic-messages.ts:826-852 @ce950d78f): only present fields update,
 /// preserving `input_tokens` from `message_start` when a proxy omits it.
 pub(super) fn apply_message_delta_usage(usage: &mut Usage, raw: &Value) {
     if let Some(v) = raw.get("input_tokens").and_then(Value::as_u64) {
@@ -43,6 +43,17 @@ pub(super) fn apply_message_delta_usage(usage: &mut Usage, raw: &Value) {
         .and_then(Value::as_u64)
     {
         usage.cache_write = v;
+    }
+    // PROV-122 — pi `api/anthropic-messages.ts:841-847` @ce950d78f: Vercel AI Gateway (and other
+    // Anthropic-compatible relays) report the TTL breakdown in deltas too. Same `!= null` guard
+    // as the fields above: an absent breakdown leaves the `message_start` value alone rather
+    // than defaulting to zero the way the `message_start` read does.
+    if let Some(v) = raw
+        .get("cache_creation")
+        .and_then(|c| c.get("ephemeral_1h_input_tokens"))
+        .and_then(Value::as_u64)
+    {
+        usage.cache_write_1h = Some(v);
     }
     if let Some(v) = raw
         .get("output_tokens_details")

@@ -427,16 +427,13 @@ pub fn build_headers(
         headers.insert("authorization".to_string(), Some(format!("Bearer {token}")));
     }
 
-    if let Some(overlay) = &model.headers {
-        for (name, value) in overlay {
-            headers.insert(name.clone(), value.clone());
-        }
-    }
-    if let Some(overlay) = &opts.headers {
-        for (name, value) in overlay {
-            headers.insert(name.clone(), value.clone());
-        }
-    }
+    // Case-insensitive last-wins merge — pi `providerHeadersToRecord({ ..., ...model.headers,
+    // ...optionsHeaders })` (google-vertex.ts:399 @ce950d78f, utils/headers.ts:11-23), PROV-126.
+    let mut headers = crate::utils::headers::merge_provider_headers(&[
+        Some(&headers),
+        model.headers.as_ref(),
+        opts.headers.as_ref(),
+    ]);
     // PROV-095: `{ "User-Agent": getPiUserAgent(), ...model.headers, ...optionsHeaders }`
     // (google-vertex.ts:398 @v0.87.1) — the default sits under every overlay.
     crate::utils::user_agent::insert_default_user_agent(&mut headers);
@@ -688,6 +685,48 @@ mod tests {
             Some("b")
         );
         assert_eq!(headers.get("content-type"), Some(&None));
+    }
+
+    /// PROV-126 — pi `providerHeadersToRecord` (google-vertex.ts:399, utils/headers.ts:11-23
+    /// @ce950d78f): `model.headers` spelled `Authorization` replaces the lowercase bearer default and
+    /// an `opts.headers` `X-Tenant` replaces the model's `x-tenant`, each leaving exactly one header
+    /// with the last writer's spelling. Red before PROV-126 (two of each).
+    #[test]
+    fn differently_cased_overlays_replace_earlier_headers() {
+        let mut model = vertex_model("gemini-2.5-pro");
+        model.headers = Some(HeaderMap::from([
+            (
+                "Authorization".to_string(),
+                Some("Bearer model".to_string()),
+            ),
+            ("x-tenant".to_string(), Some("a".to_string())),
+        ]));
+        let opts = StreamOptions {
+            headers: Some(HeaderMap::from([(
+                "X-Tenant".to_string(),
+                Some("b".to_string()),
+            )])),
+            ..Default::default()
+        };
+        let headers = build_headers(&model, &opts, None, Some("tok"));
+        let named = |name: &str| -> Vec<(String, Option<String>)> {
+            headers
+                .iter()
+                .filter(|(k, _)| k.eq_ignore_ascii_case(name))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect()
+        };
+        assert_eq!(
+            named("authorization"),
+            vec![(
+                "Authorization".to_string(),
+                Some("Bearer model".to_string())
+            )]
+        );
+        assert_eq!(
+            named("x-tenant"),
+            vec![("X-Tenant".to_string(), Some("b".to_string()))]
+        );
     }
 
     /// PROV-095 — pi `{ "User-Agent": getPiUserAgent(), ...model.headers, ...optionsHeaders }`
