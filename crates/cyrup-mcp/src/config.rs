@@ -117,6 +117,14 @@ pub const PROJECT_CONFIG_NAME: &str = ".mcp.json";
 
 /// `getConfigDirName()` — upstream `.pi`. Renamed by settled in-tree precedent; see the module
 /// header.
+///
+/// `[CYRUP-DELTA]` (MCP-588) — the override **filename** inside this directory, and in
+/// `<agent_dir>`, stays [`crate::dirs::MCP_CONFIG_FILE`] (`mcp.json`). Upstream moved both scopes
+/// to `ADAPTER_CONFIG_NAME = "mcp-adapter.json"` (`config.ts:23`, used at `:213` and `:234`,
+/// pi-mcp-adapter `2ccf648`) and added `getLegacyMcpMigrationNotices` (`:270`) because pi's own
+/// built-in MCP now owns `mcp.json` and the adapter had to vacate it. `cyrup-mcp` **is** cyrup's
+/// built-in MCP, so there is no second owner to collide with: renaming would break every existing
+/// config for nothing, and the migration notices are a migration off a name cyrup never left.
 pub const PROJECT_OVERRIDE_DIR: &str = ".cyrup";
 
 /// `REPOPROMPT_BINARY_CANDIDATES[1]`. The `[0]` entry is `~/RepoPrompt/repoprompt_cli` and is built
@@ -3750,6 +3758,10 @@ pub enum SourceId {
     AgentsNestedGlobal,
     /// `<agent_dir>/mcp.json`, or `--mcp-config`'s target. Upstream calls this `pi-global`; the id
     /// string is kept verbatim because it is a panel/fingerprint key, not a brand.
+    ///
+    /// `[CYRUP-DELTA]` (MCP-588) — upstream's file here is `<agent_dir>/mcp-adapter.json`
+    /// (`config.ts:213`, pi-mcp-adapter `2ccf648`); cyrup keeps `mcp.json`. See
+    /// [`PROJECT_OVERRIDE_DIR`] for why. The *label* follows upstream (`config.ts:740`).
     PiGlobal,
     /// `<cwd>/.mcp.json`.
     SharedProject,
@@ -4015,7 +4027,8 @@ impl ConfigContext {
 
         sources.push(ConfigSourceSpec {
             id: SourceId::PiGlobal,
-            label: "Pi global override",
+            // `config.ts:740` (pi-mcp-adapter `2ccf648`) — renamed from `"Pi global override"`.
+            label: "MCP adapter global override",
             read_path: user_path.clone(),
             write_path: user_path.clone(),
             kind: SourceKind::User,
@@ -4040,7 +4053,10 @@ impl ConfigContext {
         if project_override != user_path && project_override != project_path {
             sources.push(ConfigSourceSpec {
                 id: SourceId::PiProject,
-                label: "project Pi override",
+                // `config.ts:816` (pi-mcp-adapter `2ccf648`) — renamed from `"project Pi override"`.
+                // The third renamed label, `"ancestor MCP adapter override"` (`:762`), belongs to
+                // upstream's ancestor discovery, which this ladder does not have.
+                label: "project MCP adapter override",
                 read_path: project_override.clone(),
                 write_path: project_override,
                 kind: SourceKind::Project,
@@ -7753,6 +7769,35 @@ mod tests {
         );
         assert_eq!(ids.len(), 5);
         assert!(context.load().config.mcp_servers.contains_key("only"));
+    }
+
+    // -- MCP-588 -----------------------------------------------------------------------------
+
+    #[test]
+    fn source_labels_follow_upstream_while_the_filenames_stay_mcp_json() {
+        let fixture = Fixture::new();
+        let sources = fixture.context().sources();
+        let find = |id: SourceId| sources.iter().find(|source| source.id == id).unwrap();
+
+        // `config.ts:740` / `:816` at pi-mcp-adapter `2ccf648`.
+        let global = find(SourceId::PiGlobal);
+        assert_eq!(global.label, "MCP adapter global override");
+        let project = find(SourceId::PiProject);
+        assert_eq!(project.label, "project MCP adapter override");
+        assert!(
+            sources.iter().all(|source| !source.label.contains("Pi ")),
+            "no source label names pi"
+        );
+
+        // `[CYRUP-DELTA]`: upstream's `ADAPTER_CONFIG_NAME` is not adopted at either scope.
+        assert_eq!(global.read_path, fixture.user_path());
+        assert_eq!(project.read_path, fixture.project_override());
+        for source in [global, project] {
+            assert_eq!(
+                source.read_path.file_name().and_then(|name| name.to_str()),
+                Some("mcp.json")
+            );
+        }
     }
 
     // -- MCP-003 / the degradation contract ----------------------------------------------------
