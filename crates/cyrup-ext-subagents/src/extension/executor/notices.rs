@@ -698,6 +698,9 @@ impl SubagentExecutor {
     ///
     /// Best-effort by construction, exactly like upstream's `try`/`catch` around the whole block
     /// (`:597-600` logs and moves on): a failure here must never break the turn that just ended.
+    /// Since `36081c57`/#2604 a failure is also scoped to the one goal mission that raised it
+    /// (`missions/goal-driver.ts:141-173` @ad11b7ab): it is logged with that mission's id and the
+    /// other goal missions still raise their notices.
     /// Returns the number of notices delivered, which is what the tests assert on.
     ///
     /// The notice's `source` is [`crate::tui::RunSource::Goal`] — delivered immediately (there is
@@ -732,19 +735,17 @@ impl SubagentExecutor {
             .iter()
             .map(crate::missions::RetainedChild::from)
             .collect();
-        let notices = match crate::missions::collect_goal_continuation_notices(
+        // pi `collectGoalContinuationNotices` (`missions/goal-driver.ts:127-175` @ad11b7ab) scopes
+        // a failure to its own mission and reports it through the default `onError` (`:137`), so
+        // one damaged goal mission no longer silences the healthy ones' notices.
+        let notices = crate::missions::collect_goal_continuation_notices(
             &location,
             &owner_session_id,
             &retained,
             turn_id,
             None,
-        ) {
-            Ok(notices) => notices,
-            Err(e) => {
-                tracing::warn!("Failed to evaluate goal missions: {e}");
-                return 0;
-            }
-        };
+            None,
+        );
         let sink = self.effective_control_notice_sink();
         let delivered = notices.len();
         for notice in notices {
