@@ -807,6 +807,21 @@ pub struct HttpRequestHeadersCommand {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ServerEntry {
+    /// `description?: string` — upstream's **first** `ServerEntry` field (`types.ts:439-440` @
+    /// pi-mcp-adapter `2ccf648`, added by `e12ef73` / #760): "Short human summary shown by
+    /// mcp({ server }) and the /mcp-adapter panel, and ranked by mcp({ search })" (`MCP-592`).
+    ///
+    /// Read by three surfaces, each collapsing it to one line: [`crate::proxy::execute_list`]'s
+    /// `Description:` line, the `/mcp` panel's expanded-server summary, and the ranked search's
+    /// `serverDescription` field. **Not identity** — `computeServerHash` does not hash it
+    /// (`metadata-cache.ts:109-141`), so setting it evicts no cache entry. A present non-string is
+    /// dropped with upstream's warning by [`to_server_entries`].
+    #[serde(
+        default,
+        deserialize_with = "lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub description: Option<String>,
     /// stdio transport: the executable. Exactly one of `command` / `url` must be set, checked at
     /// **connect** time.
     #[serde(
@@ -1068,6 +1083,34 @@ pub struct ServerEntry {
 }
 
 impl ServerEntry {
+    /// [`Self::description`] as `mcp({ server })` prints it — `definition.description?.replace(
+    /// /\s+/g, " ").trim()` (`proxy-modes.ts:1028` @ pi-mcp-adapter `2ccf648`) — or `None` when
+    /// that leaves nothing, which upstream's `description ? … : ""` treats as absent.
+    ///
+    /// `split_whitespace` is Unicode `White_Space`; JS `\s` differs only at U+FEFF (JS collapses it)
+    /// and U+0085 (Rust does), neither of which a hand-written summary carries.
+    #[must_use]
+    pub fn one_line_description(&self) -> Option<String> {
+        let collapsed = self
+            .description
+            .as_deref()?
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        (!collapsed.is_empty()).then_some(collapsed)
+    }
+
+    /// [`Self::description`] under `?.trim()` — the form the `/mcp` panel summary
+    /// (`mcp-panel.ts:63-64`) and the search-mode tool namespace (`index.ts:442`) read — or `None`
+    /// when it is absent or blank, which both treat as falsy.
+    #[must_use]
+    pub fn trimmed_description(&self) -> Option<&str> {
+        self.description
+            .as_deref()
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+    }
+
     /// `isServerDisabled(definition)` — and its doc comment is the specification: *"Only the
     /// literal boolean `true` disables a server."* A truthy string does not.
     #[must_use]
@@ -2692,6 +2735,24 @@ pub fn to_server_entries(
                 });
                 continue;
             }
+            // `config.ts:1364-1369` @ 2ccf648: a present, non-string `description` (JSON `null`
+            // included — the test is `!== undefined`) is dropped with this warning and the entry is
+            // kept. It runs after the `auth.provider` ladder, as upstream's does, so a dropped entry
+            // warns once. `lenient` already drops the value; this is the half that makes it visible.
+            if raw_entry
+                .get("description")
+                .is_some_and(|value| value.as_str().is_none())
+            {
+                let message = format!(
+                    "Ignoring invalid description for MCP server \"{name}\": expected a string"
+                );
+                tracing::warn!("{message}");
+                diagnostics.push(ConfigDiagnostic {
+                    path: path.to_path_buf(),
+                    server: Some(name.clone()),
+                    message,
+                });
+            }
             out.insert(name.clone(), entry);
         }
     }
@@ -2930,6 +2991,7 @@ pub fn merge_entry(base: Option<&ServerEntry>, over: &ServerEntry) -> ServerEntr
     }
 
     let ServerEntry {
+        description,
         command,
         args,
         env,
@@ -2962,6 +3024,9 @@ pub fn merge_entry(base: Option<&ServerEntry>, over: &ServerEntry) -> ServerEntr
     } = over;
 
     ServerEntry {
+        // Plain `??` inheritance, like every non-credential key: a summary is not bound to an
+        // endpoint, so a url switch keeps it.
+        description: description.clone().or(base_entry.description),
         command: command.clone().or(base_entry.command),
         args: args.clone().or(base_entry.args),
         env: env.clone().or(base_entry.env),
@@ -6731,6 +6796,83 @@ mod tests {
                 "{url}"
             );
         }
+    }
+
+    /// `server description` › "keeps a string description and drops a non-string one with a
+    /// warning" (`__tests__/config.test.ts:2348-2366` @ pi-mcp-adapter `2ccf648`, `MCP-592`).
+    #[test]
+    fn a_string_description_is_kept_and_a_non_string_one_dropped_with_a_warning() {
+        let servers = parse_json_config(
+            r#"{
+                "weather": { "command": "node", "description": "Forecasts and severe weather alerts" },
+                "broken": { "command": "node", "description": 42 },
+                "nulled": { "command": "node", "description": null }
+            }"#,
+            "mcp.json",
+        )
+        .unwrap();
+        let mut diagnostics = Vec::new();
+        let entries = to_server_entries(&servers, Path::new("/x/mcp.json"), &mut diagnostics);
+        assert_eq!(
+            entries.get("weather"),
+            Some(&ServerEntry {
+                command: Some("node".into()),
+                description: Some("Forecasts and severe weather alerts".into()),
+                ..ServerEntry::default()
+            })
+        );
+        let bare = ServerEntry {
+            command: Some("node".into()),
+            ..ServerEntry::default()
+        };
+        assert_eq!(
+            entries.get("broken"),
+            Some(&bare),
+            "the entry survives without the field"
+        );
+        assert_eq!(
+            entries.get("nulled"),
+            Some(&bare),
+            "`null !== undefined` upstream"
+        );
+        let messages: Vec<&str> = diagnostics.iter().map(|d| d.message.as_str()).collect();
+        assert_eq!(
+            messages,
+            vec![
+                "Ignoring invalid description for MCP server \"broken\": expected a string",
+                "Ignoring invalid description for MCP server \"nulled\": expected a string",
+            ]
+        );
+    }
+
+    /// `MCP-592`: the description inherits like any non-credential key, survives a url switch,
+    /// and collapses to one line for `mcp({ server })`.
+    #[test]
+    fn the_description_merges_and_collapses_to_one_line() {
+        let base = ServerEntry {
+            url: Some("https://a.example/mcp".into()),
+            description: Some("  Skill\n\t library  ".into()),
+            ..ServerEntry::default()
+        };
+        let over = ServerEntry {
+            url: Some("https://b.example/mcp".into()),
+            ..ServerEntry::default()
+        };
+        let merged = merge_entry(Some(&base), &over);
+        assert_eq!(merged.description, base.description);
+        assert_eq!(
+            merged.one_line_description().as_deref(),
+            Some("Skill library")
+        );
+        assert_eq!(merged.trimmed_description(), Some("Skill\n\t library"));
+
+        let blank = ServerEntry {
+            description: Some(" \n ".into()),
+            ..ServerEntry::default()
+        };
+        assert_eq!(blank.one_line_description(), None);
+        assert_eq!(blank.trimmed_description(), None);
+        assert_eq!(ServerEntry::default().one_line_description(), None);
     }
 
     #[test]

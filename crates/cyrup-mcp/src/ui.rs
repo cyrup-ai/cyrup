@@ -1187,6 +1187,26 @@ pub struct ServerState {
     /// A **valid** cache entry, not merely a present one — this is what drives the `(not cached)`
     /// row.
     pub has_cached_data: bool,
+    /// `summary: serverDescription(definition, serverCache)` (`mcp-panel.ts:63-64`, `:561` @
+    /// pi-mcp-adapter `2ccf648`, `MCP-592`): the configured description, else the first line of the
+    /// valid cache entry's instructions. Shown under the server row while it is expanded.
+    pub summary: Option<String>,
+}
+
+/// `mcp-panel.ts:63-64` `serverDescription(definition, entry)` @ pi-mcp-adapter `2ccf648` —
+/// `definition?.description?.trim() || entry?.instructions?.trim().split("\n", 1)[0] || undefined`.
+fn server_summary(
+    definition: Option<&ServerEntry>,
+    entry: Option<&ServerCacheEntry>,
+) -> Option<String> {
+    if let Some(description) = definition.and_then(ServerEntry::trimmed_description) {
+        return Some(description.to_string());
+    }
+    entry
+        .and_then(|entry| entry.instructions.as_deref())
+        .and_then(|instructions| instructions.trim().split('\n').next())
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
 }
 
 /// `mcp-panel.ts` `VisibleItem` — the flattened list the cursor indexes into.
@@ -1726,6 +1746,7 @@ impl McpPanelModel {
                 failure_message,
                 tools,
                 has_cached_data: server_cache.is_some(),
+                summary: server_summary(Some(definition), server_cache.as_ref()),
             });
         }
 
@@ -2439,6 +2460,12 @@ impl McpPanelModel {
                             if let Some(entry) = entry {
                                 let cache = self.cache.get_or_insert_with(MetadataCache::default);
                                 cache.servers.insert(server.clone(), entry.clone());
+                                // `mcp-panel.ts:932`: the summary follows the refreshed entry.
+                                let summary =
+                                    server_summary(self.config_servers.get(&server), Some(&entry));
+                                if let Some(state) = self.servers.get_mut(index) {
+                                    state.summary = summary;
+                                }
                                 self.rebuild_server_tools(index, &entry);
                             }
                             // Unconditional inside the connected branch — even when the cache
@@ -2741,6 +2768,15 @@ impl McpPanelModel {
                 match item {
                     VisibleItem::Server { .. } => {
                         lines.push(self.row(inner_w, &self.render_server_row(server, is_cursor)));
+                        // `mcp-panel.ts:201-203`.
+                        if server.expanded
+                            && let Some(summary) = server.summary.as_deref()
+                        {
+                            let mut row = StyledText::new();
+                            row.raw("    ")
+                                .push(t.description, sanitize_display_text(Some(summary)));
+                            lines.push(self.row(inner_w, &row));
+                        }
                         if is_cursor
                             && server.connection_status == ConnectionStatus::Failed
                             && let Some(failure) = server.failure_message.as_deref()
@@ -5575,6 +5611,53 @@ mod tests {
     // ---------------------------------------------------------------------------------------
     // MCP-351 — construction
     // ---------------------------------------------------------------------------------------
+
+    /// "shows the server description, or the first instructions line, when a server is expanded"
+    /// (`__tests__/mcp-panel-rendering.test.ts:145-165` @ pi-mcp-adapter `2ccf648`, `MCP-592`).
+    #[test]
+    fn an_expanded_server_shows_its_description_or_first_instructions_line() {
+        let render = |description: Option<&str>| -> (String, String) {
+            let definition = ServerEntry {
+                command: Some("echo".into()),
+                description: description.map(str::to_string),
+                ..ServerEntry::default()
+            };
+            let mut config = McpConfig::default();
+            config
+                .mcp_servers
+                .insert("atlassian".into(), definition.clone());
+            let mut entry = valid_cache_entry(&definition, &["search_issues"]);
+            entry.instructions = Some("\nJira and Confluence tools.\nCall search first.".into());
+            let mut cache = MetadataCache::default();
+            cache.servers.insert("atlassian".into(), entry);
+            let mut model = McpPanelModel::new(
+                &config,
+                Some(cache),
+                &IndexMap::new(),
+                Arc::new(StubCallbacks::default()),
+                PanelOptions::default(),
+            );
+            let collapsed = render_text(&model.render(120));
+            model.handle_key(key(OverlayKeyCode::Enter));
+            let expanded = render_text(&model.render(120));
+            (collapsed, expanded)
+        };
+
+        let (collapsed, expanded) = render(Some("Atlassian Cloud"));
+        assert!(!collapsed.contains("Atlassian Cloud"), "{collapsed}");
+        assert!(expanded.contains("Atlassian Cloud"), "{expanded}");
+        assert!(
+            !expanded.contains("Jira and Confluence tools."),
+            "{expanded}"
+        );
+
+        let (_, fallback) = render(None);
+        assert!(
+            fallback.contains("Jira and Confluence tools."),
+            "{fallback}"
+        );
+        assert!(!fallback.contains("Call search first."), "{fallback}");
+    }
 
     #[test]
     fn construction_honours_config_order_cache_validity_and_the_disabled_gate() {

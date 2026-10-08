@@ -8,7 +8,7 @@ use indexmap::{IndexMap, IndexSet};
 use crate::config::{McpConfig, ServerEntry, ToolPrefix, locale_compare};
 use crate::proxy::constants::{
     MIN_STEM_LENGTH, WEIGHT_DESCRIPTION, WEIGHT_KEYWORDS, WEIGHT_NAME, WEIGHT_ORIGINAL_NAME,
-    WEIGHT_SERVER,
+    WEIGHT_SERVER, WEIGHT_SERVER_DESCRIPTION,
 };
 use crate::proxy::tool_metadata::{
     ToolMetadata, matches_tool_pattern, resolve_tool_prefix, server_prefix, tool_name_candidates,
@@ -162,8 +162,9 @@ fn phrase_bonus(weight: i64, value: &str, normalized_query: &str) -> Option<(i64
 ///
 /// Steps, in order (13d §7):
 /// 1. normalise and tokenize the query; **empty tokens ⇒ `None`**;
-/// 2. four fields — `name`, `originalName`, `server`, `description` — in that exact order, each
-///    normalised but **not trimmed** (a leading space in a description defeats `starts_with`);
+/// 2. five fields — `name`, `originalName`, `server`, `description`, `serverDescription` — in that
+///    exact order, each normalised but **not trimmed** (a leading space in a description defeats
+///    `starts_with`); `serverDescription` is empty here and filled by [`rank_tool_matches`];
 /// 3. one phrase bonus per field;
 /// 4. one token bonus per (field, query token);
 /// 5. keywords, only when `Some` and non-empty — the phrase bonus is a **max over phrases** added
@@ -178,6 +179,22 @@ pub fn score_tool_match(
     query: &str,
     keywords: Option<&[String]>,
 ) -> Option<i64> {
+    // `search-ranking.ts:225-230` @ 2ccf648: the exported form passes no server description, so
+    // its fifth field is the empty string, which no non-empty query can phrase- or token-match.
+    score_prepared(tool, server, None, query, keywords)
+}
+
+/// [`score_tool_match`] with the fifth field filled — `prepareToolSearch(tool, server, keywords,
+/// serverDescription)` (`search-ranking.ts:121-128` @ pi-mcp-adapter `2ccf648`, `MCP-592`), as
+/// [`rank_tool_matches`] calls it with `definition?.description`. The value is normalised exactly
+/// like a tool description (not trimmed, not collapsed to one line).
+fn score_prepared(
+    tool: &ToolMetadata,
+    server: &str,
+    server_description: Option<&str>,
+    query: &str,
+    keywords: Option<&[String]>,
+) -> Option<i64> {
     let normalized_query = normalize_search_text(query).trim().to_string();
     let query_tokens = tokenize(query);
     if query_tokens.is_empty() {
@@ -186,7 +203,7 @@ pub fn score_tool_match(
 
     // Step 2 — the field order is the JS object literal's insertion order, and it matters because
     // the first phrase hit per field is the only one that scores.
-    let fields: [(i64, String); 4] = [
+    let fields: [(i64, String); 5] = [
         (WEIGHT_NAME, normalize_search_text(&tool.name)),
         (
             WEIGHT_ORIGINAL_NAME,
@@ -194,6 +211,10 @@ pub fn score_tool_match(
         ),
         (WEIGHT_SERVER, normalize_search_text(server)),
         (WEIGHT_DESCRIPTION, normalize_search_text(&tool.description)),
+        (
+            WEIGHT_SERVER_DESCRIPTION,
+            normalize_search_text(server_description.unwrap_or_default()),
+        ),
     ];
 
     let mut score: i64 = 0;
@@ -399,7 +420,13 @@ pub fn rank_tool_matches(
             } else {
                 None
             };
-            if let Some(score) = score_tool_match(tool, server_name, query, keywords.as_deref()) {
+            if let Some(score) = score_prepared(
+                tool,
+                server_name,
+                definition.and_then(|entry| entry.description.as_deref()),
+                query,
+                keywords.as_deref(),
+            ) {
                 matches.push(RankedToolMatch {
                     server: server_name.clone(),
                     tool: tool.clone(),
@@ -565,6 +592,43 @@ mod tests {
         assert!(
             exact > description,
             "exact {exact} should beat description {description}"
+        );
+    }
+
+    /// `search ranking` › "matches tools through their server description"
+    /// (`__tests__/search-ranking.test.ts:110-124` @ pi-mcp-adapter `2ccf648`, `MCP-592`).
+    #[test]
+    fn matches_tools_through_their_server_description() {
+        let metadata = metadata_with(&[
+            ("weather", vec![tool("get_alerts", "List active alerts")]),
+            (
+                "calendar",
+                vec![tool("list_events", "List calendar events")],
+            ),
+        ]);
+        let mut config = config_with(&[
+            ("weather", crate::proxy::testsupport::stdio("weather")),
+            ("calendar", crate::proxy::testsupport::stdio("calendar")),
+        ]);
+        assert!(rank_tool_matches(&config, &metadata, "forecast", None, true).is_empty());
+
+        if let Some(weather) = config.mcp_servers.get_mut("weather") {
+            weather.description = Some("Forecasts and severe weather alerts".to_string());
+        }
+        let names: Vec<String> = rank_tool_matches(&config, &metadata, "forecast", None, true)
+            .into_iter()
+            .map(|matched| matched.tool.name)
+            .collect();
+        assert_eq!(names, vec!["get_alerts".to_string()]);
+        // The exported scorer passes no server description, so it still misses.
+        assert_eq!(
+            score_tool_match(
+                &tool("get_alerts", "List active alerts"),
+                "weather",
+                "forecast",
+                None
+            ),
+            None
         );
     }
 

@@ -61,6 +61,8 @@ pub(crate) const WEIGHT_ORIGINAL_NAME: i64 = 10;
 pub(crate) const WEIGHT_SERVER: i64 = 8;
 /// `search-ranking.ts:11` `FIELD_WEIGHTS.description`.
 pub(crate) const WEIGHT_DESCRIPTION: i64 = 5;
+/// `search-ranking.ts:24` `FIELD_WEIGHTS.serverDescription` @ pi-mcp-adapter `2ccf648` (`MCP-592`).
+pub(crate) const WEIGHT_SERVER_DESCRIPTION: i64 = 5;
 /// `search-ranking.ts:11` `FIELD_WEIGHTS.keywords`.
 pub(crate) const WEIGHT_KEYWORDS: i64 = 5;
 

@@ -2013,6 +2013,33 @@ mod tests {
         }
     }
 
+    /// `MCP-592` — `description` is not identity: `computeServerHash`'s object
+    /// (`metadata-cache.ts:109-141` @ pi-mcp-adapter `2ccf648`) has no such member, so adding one
+    /// to a definition leaves upstream's own digests from the vector above untouched.
+    #[test]
+    fn golden_vector_description_moves_nothing() {
+        for (json, upstream_digest) in [
+            (
+                r#"{"description":"Remote API","url":"https://api.example/mcp","auth":{"provider":"anthropic"}}"#,
+                "4526c3c613c6ed34e40774241427547d6c26d378cd15a4999da04a143167ac41",
+            ),
+            (
+                r#"{"url":"https://api.example/mcp","description":"Remote API"}"#,
+                "2db31687b0b59d5c92a24ec3f4a9b4082947160f8ea5de861b1af10a3687e87b",
+            ),
+        ] {
+            let entry: ServerEntry = serde_json::from_str(json).unwrap();
+            assert_eq!(entry.description.as_deref(), Some("Remote API"));
+            let resolved = ResolvedIdentity::verbatim(&entry);
+            assert_eq!(
+                compute_server_hash(&entry, &resolved),
+                upstream_digest,
+                "{json}\n  pre-image: {}",
+                server_identity_pre_image(&entry, &resolved)
+            );
+        }
+    }
+
     /// `MCP-594` — the two stdio-only members `34df4ed` (#687) spread into the identity.
     ///
     /// Every constant here is upstream's own, produced by running `v5.0.0`'s
