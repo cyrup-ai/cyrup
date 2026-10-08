@@ -27,3 +27,4 @@ mod activation;
 mod http_oauth;
 mod live_tool_call;
 mod protocol_13i;
+mod resumed_render;
