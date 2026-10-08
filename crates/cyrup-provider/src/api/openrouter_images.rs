@@ -140,7 +140,7 @@ async fn run(
     .map_err(|e| GenError::Message(e.to_string()))?;
     let mut builder = client.post(&url).bearer_auth(&api_key).json(&params);
     // `defaultHeaders: providerHeadersToRecord({ ...model.headers, ...optionsHeaders })`
-    // (openrouter-images.ts:116). A `None` value suppresses a default; on a fresh request there is no
+    // (openrouter-images.ts:130 @ce950d78f). A `None` value suppresses a default; on a fresh request there is no
     // default to suppress, so only present values are applied (matching cyrup's header overlay).
     for (name, value) in merged_headers(model, options) {
         if let Some(value) = value {
@@ -326,17 +326,14 @@ fn parse_usage(model: &ImageModel, raw: &serde_json::Value) -> Usage {
     usage
 }
 
-/// `{ ...model.headers, ...options.headers }` (openrouter-images.ts:116): the model's default headers
-/// overlaid by the per-request headers (request wins per key).
+/// `providerHeadersToRecord({ ...model.headers, ...optionsHeaders })` (openrouter-images.ts:130
+/// @ce950d78f, utils/headers.ts:11-23): the model's default headers overlaid by the per-request
+/// headers, the request winning per case-insensitive name (PROV-126).
 fn merged_headers(model: &ImageModel, options: &ImagesOptions) -> crate::HeaderMap {
-    let mut merged = crate::HeaderMap::new();
-    if let Some(h) = &model.headers {
-        merged.extend(h.iter().map(|(k, v)| (k.clone(), v.clone())));
-    }
-    if let Some(h) = &options.headers {
-        merged.extend(h.iter().map(|(k, v)| (k.clone(), v.clone())));
-    }
-    merged
+    crate::utils::headers::merge_provider_headers(&[
+        model.headers.as_ref(),
+        options.headers.as_ref(),
+    ])
 }
 
 /// Flatten a `reqwest` header map into the string record Pi's `headersToRecord` produces.
@@ -371,6 +368,41 @@ mod tests {
     }
     fn flux() -> ImageModel {
         openrouter_image_model("black-forest-labs/flux.2-flex").expect("flux")
+    }
+
+    /// PROV-126 — `providerHeadersToRecord({ ...model.headers, ...optionsHeaders })`
+    /// (openrouter-images.ts:130, utils/headers.ts:11-23 @ce950d78f): a request header overrides a
+    /// model header whatever the casing, so only one goes on the wire. Red before PROV-126.
+    #[test]
+    fn request_headers_override_model_headers_case_insensitively() {
+        let mut model = nano_banana();
+        model.headers = Some(crate::HeaderMap::from([
+            (
+                "HTTP-Referer".to_string(),
+                Some("https://model".to_string()),
+            ),
+            ("X-Title".to_string(), Some("model".to_string())),
+        ]));
+        let options = ImagesOptions {
+            headers: Some(crate::HeaderMap::from([
+                (
+                    "http-referer".to_string(),
+                    Some("https://request".to_string()),
+                ),
+                ("x-title".to_string(), None),
+            ])),
+            ..Default::default()
+        };
+        assert_eq!(
+            merged_headers(&model, &options),
+            crate::HeaderMap::from([
+                (
+                    "http-referer".to_string(),
+                    Some("https://request".to_string())
+                ),
+                ("x-title".to_string(), None),
+            ])
+        );
     }
 
     #[test]
