@@ -11,7 +11,8 @@
 //! The only `unsafe` in the crate lives in this module, isolated to the unix process-group calls
 //! (`setsid`/`killpg`, `command::build_command` / `signal::send_sigkill_tree` /
 //! [`kill_process_tree`] and `guard::KillTreeOnDrop`'s `Drop`, used ONLY by [`LocalProc::exec`]
-//! and its shutdown drain), the single-pid `kill(2)` calls ([`terminate_pid`]/[`kill_pid`]), and
+//! and its shutdown drain; plus [`detach_into_new_session`]'s `setsid` for `cyrup-tui`'s browser
+//! launcher), the single-pid `kill(2)` calls ([`terminate_pid`]/[`kill_pid`]), and
 //! the `access(2)` probe in [`LocalFs`] — each with safety comments.
 //!
 //! [`LocalProc::exec`] additionally enrolls each spawned shell in the process-global
@@ -34,6 +35,7 @@ mod tests;
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
+pub use command::detach_into_new_session;
 pub use fs::LocalFs;
 pub use proc::LocalProc;
 pub use signal::{kill_pid, kill_process_tree, terminate_pid};

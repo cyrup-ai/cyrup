@@ -31,6 +31,10 @@
 //! 3. **OSC 52**, emitted when the session is remote (`SSH_CONNECTION`/`SSH_CLIENT`/
 //!    `MOSH_CONNECTION`) *or* when nothing above worked (`clipboard.ts:166-169`) — remote included
 //!    even after a successful local write, because the local clipboard is the wrong machine's.
+//!    TUI-170 `[CYRUP-DELTA]`: inside tmux or GNU screen the escape is wrapped for the
+//!    multiplexer's passthrough, and inside tmux the text also goes through `tmux load-buffer -w`
+//!    ([`Multiplexer`], [`osc52_for_terminal`]); pi writes the bare escape, which tmux's default
+//!    `set-clipboard external` swallows.
 //!
 //! 3b. On Linux under **WSL**, before the OSC 52 decision: Windows Terminal gets the escape
 //!    directly, and otherwise the text is written through Windows interop
@@ -83,6 +87,46 @@ pub(crate) struct ClipboardEnv {
     /// `process.env.WT_SESSION` (`clipboard.ts:112`) — Windows Terminal, which supports OSC 52, so
     /// the escape is preferred over the slower PowerShell round trip.
     pub(crate) wt_session: bool,
+    /// TUI-170 `[CYRUP-DELTA]` — the terminal multiplexer the escape has to cross, if any. Pi has
+    /// no counterpart: its `emitOsc52` writes the bare escape whatever sits in between.
+    pub(crate) multiplexer: Multiplexer,
+}
+
+/// TUI-170 `[CYRUP-DELTA]`, a cyrup improvement over upstream — the terminal multiplexer between
+/// cyrup and the terminal emulator, which decides how an OSC 52 escape has to be sent to reach
+/// the emulator's clipboard at all.
+///
+/// Pi writes the bare escape (`clipboard.ts:15-22` @v1.1.0) and so does nothing useful inside
+/// tmux under its default `set-clipboard external`: tmux swallows an application's OSC 52 unless
+/// `set-clipboard on`, yet `/copy` and the sign-in screen's copy key still report success. That is
+/// exactly the SSH-into-tmux case OSC 52 exists for, so cyrup routes around it (see
+/// [`osc52_for_terminal`] and `emit_osc52`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum Multiplexer {
+    /// A terminal emulator directly — the bare escape, byte-for-byte pi's.
+    #[default]
+    None,
+    /// tmux (`$TMUX` set).
+    Tmux,
+    /// GNU screen (`$STY` set).
+    Screen,
+}
+
+impl Multiplexer {
+    /// From the values of `$TMUX` and `$STY`; an empty value counts as unset, like every other
+    /// variable [`ClipboardEnv`] reads. When both are set (one multiplexer nested in the other)
+    /// tmux wins: the pane's own `$TMUX` is the common case, and `tmux load-buffer -w` reaches
+    /// the outer clipboard from either nesting order.
+    pub(crate) fn from_env(tmux: Option<&str>, sty: Option<&str>) -> Self {
+        let set = |v: Option<&str>| v.is_some_and(|v| !v.is_empty());
+        if set(tmux) {
+            Self::Tmux
+        } else if set(sty) {
+            Self::Screen
+        } else {
+            Self::None
+        }
+    }
 }
 
 impl ClipboardEnv {
@@ -107,6 +151,10 @@ impl ClipboardEnv {
                     release.contains("microsoft") || release.contains("wsl")
                 }),
             wt_session: set("WT_SESSION"),
+            multiplexer: Multiplexer::from_env(
+                std::env::var("TMUX").ok().as_deref(),
+                std::env::var("STY").ok().as_deref(),
+            ),
         }
     }
 }
@@ -236,6 +284,65 @@ pub(crate) fn osc52_sequence(text: &str) -> Option<String> {
         return None;
     }
     Some(format!("\u{1b}]52;c;{encoded}\u{7}"))
+}
+
+/// GNU screen truncates a DCS string past its internal buffer, so the passthrough is sent in
+/// pieces of this many bytes, each its own `ESC P … ESC \` — the chunk size of hterm's
+/// `osc52.sh` and vim-oscyank, both of which screen users have relied on for years.
+const SCREEN_DCS_CHUNK: usize = 76;
+
+/// TUI-170 `[CYRUP-DELTA]` — `seq` (an [`osc52_sequence`]) as it must be written for the
+/// multiplexer in between to hand it to the terminal emulator untouched:
+///
+/// * [`Multiplexer::None`] — `seq` unchanged, so a plain terminal gets pi's exact bytes.
+/// * [`Multiplexer::Tmux`] — tmux's DCS passthrough,
+///   `ESC P tmux; <seq, every ESC doubled> ESC \`. tmux forwards the payload verbatim (since
+///   tmux 3.3 only with `allow-passthrough on`, which is why `emit_osc52` also loads the text
+///   with `tmux load-buffer -w`).
+/// * [`Multiplexer::Screen`] — screen's DCS passthrough, `ESC P <chunk> ESC \` per
+///   [`SCREEN_DCS_CHUNK`]-byte piece of `seq`.
+///
+/// The same wrappers hterm's `osc52.sh` and vim-oscyank write.
+pub(crate) fn osc52_for_terminal(seq: &str, multiplexer: Multiplexer) -> String {
+    match multiplexer {
+        Multiplexer::None => seq.to_string(),
+        Multiplexer::Tmux => format!(
+            "\u{1b}Ptmux;{}\u{1b}\\",
+            seq.replace('\u{1b}', "\u{1b}\u{1b}")
+        ),
+        Multiplexer::Screen => {
+            let mut out = String::with_capacity(seq.len() + seq.len() / SCREEN_DCS_CHUNK * 4 + 4);
+            // `seq` is ASCII (ESC, `]52;c;`, base64, BEL), so byte chunks are char boundaries.
+            for chunk in seq.as_bytes().chunks(SCREEN_DCS_CHUNK) {
+                out.push_str("\u{1b}P");
+                out.push_str(&String::from_utf8_lossy(chunk));
+                out.push_str("\u{1b}\\");
+            }
+            out
+        }
+    }
+}
+
+/// Pi `emitOsc52` (`clipboard.ts:26-32`) with the TUI-170 multiplexer routing: `false` when the
+/// payload is oversized (nothing is written, exactly as upstream), otherwise the escape is written
+/// for the terminal in [`osc52_for_terminal`]'s shape and the call reports `true`.
+///
+/// Inside tmux the text is **also** handed to `tmux load-buffer -w -`: tmux ≥ 3.2 then sets the
+/// outer terminal's clipboard itself, which works under the default `set-clipboard external` and
+/// without `allow-passthrough` — the configuration in which neither the bare escape nor the
+/// passthrough arrives. The passthrough still goes out because tmux < 3.2 has no `-w` and always
+/// passes DCS through. Both reaching the terminal only sets the same text twice. This is the same
+/// `load-buffer -w` route Helix's tmux clipboard provider and `tmux-yank` use. Like the bare escape
+/// upstream, neither route can be verified, so the result is the emit, not the delivery.
+async fn emit_osc52(text: &str, env: &ClipboardEnv) -> bool {
+    let Some(seq) = osc52_sequence(text) else {
+        return false;
+    };
+    if env.multiplexer == Multiplexer::Tmux {
+        let _ = run_command("tmux", &["load-buffer", "-w", "-"], text).await;
+    }
+    write_stdout(&osc52_for_terminal(&seq, env.multiplexer));
+    true
 }
 
 /// Pi's `headless` (`clipboard.ts:118`): `p === "linux" && !DISPLAY && !WAYLAND_DISPLAY &&
@@ -468,10 +575,7 @@ pub(crate) async fn copy_to_clipboard(text: &str) -> Result<(), ClipboardError> 
     // run on WSL without WSLg — there is no Linux display — so this is the first route that exists.
     let mut osc52_emitted = false;
     if !copied && let Some(route) = wsl_route(os, &env) {
-        if route == WslRoute::Osc52
-            && let Some(seq) = osc52_sequence(text)
-        {
-            write_stdout(&seq);
+        if route == WslRoute::Osc52 && emit_osc52(text, &env).await {
             osc52_emitted = true;
         }
         // `copied = osc52Emitted || (await copyViaWindowsClipboard(text))` (`clipboard.ts:113`):
@@ -483,12 +587,10 @@ pub(crate) async fn copy_to_clipboard(text: &str) -> Result<(), ClipboardError> 
     // the first rung of the throw ladder rather than a silent success.
     let mut oversized = false;
     if !osc52_emitted && osc52_required(env.remote, copied, headless(os, &env)) {
-        match osc52_sequence(text) {
-            Some(seq) => {
-                write_stdout(&seq);
-                copied = true;
-            }
-            None => oversized = true,
+        if emit_osc52(text, &env).await {
+            copied = true;
+        } else {
+            oversized = true;
         }
     }
     // `if (copied) return;` then the ladder (`clipboard.ts:124-137`).

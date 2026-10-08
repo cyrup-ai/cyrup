@@ -56,6 +56,42 @@ pub(super) fn build_command(spec: &ExecSpec) -> std::process::Command {
     std_cmd
 }
 
+/// Detach a command the caller spawns and then forgets into a session of its own (`setsid(2)`):
+/// Node's `spawn(…, { detached: true })` on POSIX, for a caller outside this crate's two
+/// [`ProcOps`] builders. Its one consumer is `cyrup-tui`'s browser launcher (pi
+/// `open-browser.ts:21`), whose crate is `#![forbid(unsafe_code)]` and so cannot install the
+/// `pre_exec` hook itself.
+///
+/// A session, not merely a process group: the child has NO controlling terminal, so whatever it
+/// starts (`xdg-open`'s console-browser fallback on a host with no `DISPLAY`) cannot open
+/// `/dev/tty` at all (`ENXIO`). A process group alone relies on job-control signals stopping a
+/// background reader or `tcsetattr` caller, and those are no defence when the parent inherited
+/// `SIGTTIN`/`SIGTTOU` as ignored — `tmux new-session cyrup` does exactly that (tmux 3.4 resets
+/// neither for the pane command), and then a background `tcsetattr` simply succeeds and re-modes
+/// the TUI's terminal. A no-op off unix.
+///
+/// [`ProcOps`]: crate::ops::ProcOps
+#[allow(unsafe_code)]
+pub fn detach_into_new_session(cmd: &mut std::process::Command) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // SAFETY: as in [`build_command`] — `setsid` runs in the forked child before exec, touches
+        // no parent memory and is async-signal-safe. It can fail only with `EPERM` when the child
+        // already leads a process group, which a freshly forked child never does.
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = cmd;
+    }
+}
+
 /// Build the OS command for an [`ArgvSpec`] — a DIRECT argv (shell:false) exec (Pi `execCommand`
 /// spawn with `shell:false`, exec.ts:41-45): the program IS `spec.program`, its args are the literal
 /// `spec.args` (no shell, no word-splitting). Unlike [`build_command`] (the `bash`-tool/shell path,

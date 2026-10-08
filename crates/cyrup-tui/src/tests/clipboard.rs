@@ -25,8 +25,9 @@
 )]
 
 use crate::clipboard::{
-    ClipboardEnv, ClipboardError, ClipboardWrite, MAX_OSC52_ENCODED_LENGTH, WslRoute,
-    clipboard_failure, clipboard_write_plan, headless, osc52_required, osc52_sequence, wsl_route,
+    ClipboardEnv, ClipboardError, ClipboardWrite, MAX_OSC52_ENCODED_LENGTH, Multiplexer, WslRoute,
+    clipboard_failure, clipboard_write_plan, headless, osc52_for_terminal, osc52_required,
+    osc52_sequence, wsl_route,
 };
 
 /// A headless, non-remote desktop with no display server at all.
@@ -800,4 +801,75 @@ mod clipboard_paste_tests {
         assert!(!app.paste_from_clipboard(|| None, || Some(String::new())));
         assert_eq!(app.state().editor.text(), "");
     }
+}
+
+// -- TUI-170: OSC 52 through a terminal multiplexer -------------------------------------------
+
+/// `$TMUX` selects tmux, `$STY` GNU screen, neither a plain terminal; an empty value is unset,
+/// like every other variable `ClipboardEnv` reads; with both set, tmux wins.
+#[test]
+fn the_multiplexer_is_read_from_tmux_then_sty() {
+    assert_eq!(Multiplexer::from_env(None, None), Multiplexer::None);
+    assert_eq!(
+        Multiplexer::from_env(Some("/tmp/tmux-1000/default,4242,0"), None),
+        Multiplexer::Tmux
+    );
+    assert_eq!(
+        Multiplexer::from_env(None, Some("12345.pts-0.host")),
+        Multiplexer::Screen
+    );
+    assert_eq!(
+        Multiplexer::from_env(
+            Some("/tmp/tmux-1000/default,4242,0"),
+            Some("12345.pts-0.host")
+        ),
+        Multiplexer::Tmux
+    );
+    assert_eq!(Multiplexer::from_env(Some(""), Some("")), Multiplexer::None);
+    assert_eq!(
+        Multiplexer::from_env(Some(""), Some("12345.pts-0.host")),
+        Multiplexer::Screen
+    );
+    assert_eq!(ClipboardEnv::default().multiplexer, Multiplexer::None);
+}
+
+/// A plain terminal gets pi's exact bytes — the multiplexer routing changes nothing outside one.
+#[test]
+fn a_plain_terminal_gets_the_bare_escape_unchanged() {
+    let seq = osc52_sequence("hi").unwrap();
+    assert_eq!(osc52_for_terminal(&seq, Multiplexer::None), seq);
+}
+
+/// tmux's DCS passthrough: `ESC P tmux;`, the escape with every ESC doubled, then `ESC \`.
+#[test]
+fn tmux_gets_the_escape_in_its_dcs_passthrough_with_esc_doubled() {
+    let seq = osc52_sequence("hi").unwrap();
+    assert_eq!(
+        osc52_for_terminal(&seq, Multiplexer::Tmux),
+        "\u{1b}Ptmux;\u{1b}\u{1b}]52;c;aGk=\u{7}\u{1b}\\"
+    );
+}
+
+/// GNU screen's DCS passthrough, in 76-byte pieces each wrapped in its own `ESC P … ESC \`, and
+/// the pieces reassemble to the original escape exactly.
+#[test]
+fn screen_gets_the_escape_in_76_byte_dcs_chunks() {
+    let short = osc52_sequence("hi").unwrap();
+    assert_eq!(
+        osc52_for_terminal(&short, Multiplexer::Screen),
+        "\u{1b}P\u{1b}]52;c;aGk=\u{7}\u{1b}\\"
+    );
+
+    let seq = osc52_sequence(&"x".repeat(200)).unwrap();
+    let wrapped = osc52_for_terminal(&seq, Multiplexer::Screen);
+    let pieces: Vec<&str> = wrapped
+        .strip_prefix("\u{1b}P")
+        .and_then(|w| w.strip_suffix("\u{1b}\\"))
+        .unwrap()
+        .split("\u{1b}\\\u{1b}P")
+        .collect();
+    assert_eq!(pieces.len(), seq.len().div_ceil(76), "{wrapped:?}");
+    assert!(pieces.iter().all(|p| p.len() <= 76), "{pieces:?}");
+    assert!(pieces[..pieces.len() - 1].iter().all(|p| p.len() == 76));
+    assert_eq!(pieces.concat(), seq);
 }

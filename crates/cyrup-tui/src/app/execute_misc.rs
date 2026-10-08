@@ -1126,6 +1126,16 @@ impl<B: Backend> App<B> {
                 }
             }
 
+            // `app.message.copy` over the `/login` sign-in URL — pi `AuthUrlComponent.copy()`
+            // (`auth-url.ts:31-38` @v1.1.0): the same `copyToClipboard` the other copy paths use
+            // (OSC 52 when the session is remote or headless), its outcome shown on the dialog.
+            C::CopyAuthUrl(url) => {
+                let result = crate::clipboard::copy_to_clipboard(&url)
+                    .await
+                    .map_err(|error| error.message().to_string());
+                self.apply_auth_url_copy_result(&url, result);
+            }
+
             C::Share => self.share_session(session).await,
 
             // Was `_ => {}` under a comment asserting this is unreachable. Nothing enforced that

@@ -2748,3 +2748,311 @@ async fn ext027_the_login_refresh_honours_the_offline_switch() {
         "nothing was fetched, so nothing is listed"
     );
 }
+
+// ================================================== PROV-120: headless Anthropic login in the TUI
+
+/// The REAL built-in Anthropic provider, exactly as `/login` sources it from
+/// `cyrup_provider::all_providers()` — only the registry is narrowed to that one row.
+fn real_anthropic_only() -> LoginProviderSource {
+    Arc::new(|| {
+        cyrup_provider::all_providers()
+            .into_iter()
+            .filter(|p| p.id().as_str() == "anthropic")
+            .collect()
+    })
+}
+
+/// Open `/login anthropic`, pick the subscription method, and apply the flow's first message
+/// (the method selector). Returns the login channel.
+async fn start_anthropic_oauth_login(
+    app: &mut App<TestBackend>,
+    fx: &Fixture,
+) -> tokio::sync::mpsc::UnboundedReceiver<LoginUiMsg> {
+    let mut rx = app.install_login_channel();
+    app.execute_command(
+        AppCommand::LoginCommand(Some("anthropic".to_string())),
+        &fx.session,
+        None,
+    )
+    .await;
+    // Anthropic offers both an API key and a subscription (`providers/anthropic.ts:50-54`), so the
+    // pinned `/login anthropic` asks which (`showLoginAuthTypeSelector(providerOptions)`,
+    // `interactive-mode.ts:5010`) before any flow runs.
+    assert_eq!(
+        app.active_selector_kind(),
+        Some(SelectorKind::LoginAuthType)
+    );
+    app.execute_command(
+        AppCommand::ConfirmSelection {
+            kind: SelectorKind::LoginAuthType,
+            value: AuthType::Oauth.as_str().to_string(),
+        },
+        &fx.session,
+        None,
+    )
+    .await;
+    assert_eq!(app.active_selector_kind(), Some(SelectorKind::LoginDialog));
+    let msg = next_msg(&mut rx).await;
+    assert!(
+        matches!(&msg, LoginUiMsg::Prompt { .. }),
+        "the method selector is the flow's first message: {msg:?}"
+    );
+    app.apply_login_msg(&fx.session, msg).await;
+    rx
+}
+
+/// PROV-120, the TUI half: `/login anthropic` → "Anthropic (Claude Pro/Max)" reaches upstream's
+/// method selector (`anthropic.ts:282-299` @v1.1.0) INSIDE the dialog, and choosing
+/// "Copy code login (headless)" shows the full authorize URL — redirecting to Anthropic's hosted
+/// code page, not localhost — its instructions, and the `code#state` paste field. `app.message.copy`
+/// then copies that exact URL (pi `ced72c2f0`). The real strategy is driven; it binds no port and
+/// sends nothing, because the copy-code login never listens and the exchange is never reached.
+#[tokio::test]
+async fn real_anthropic_login_offers_copy_code_and_shows_a_copyable_headless_url() {
+    let fx = fixture().await;
+    let mut app = app_with(real_anthropic_only());
+    let mut rx = start_anthropic_oauth_login(&mut app, &fx).await;
+
+    let body = app.login_dialog_body().expect("dialog is open");
+    assert!(body.contains("Select Anthropic login method:"), "{body}");
+    let screen = {
+        app.draw().unwrap();
+        buf_text(&app)
+    };
+    assert!(screen.contains("Browser login (default)"), "{screen}");
+    assert!(screen.contains("Copy code login (headless)"), "{screen}");
+
+    // Down + Enter answers with the option ID `copy_code` (`types.ts:156`).
+    app.handle_input(&key(KeyCode::Down));
+    app.handle_input(&key(KeyCode::Enter));
+
+    // `:215` — the authorize URL, whole, with the copy-code instructions.
+    let msg = next_msg(&mut rx).await;
+    let url = match &msg {
+        LoginUiMsg::Notify(event) => match event.as_ref() {
+            AuthEvent::AuthUrl { url, .. } => url.clone(),
+            other => panic!("expected the auth url, got {other:?}"),
+        },
+        other => panic!("expected the auth url, got {other:?}"),
+    };
+    assert!(
+        url.starts_with("https://claude.ai/oauth/authorize?"),
+        "{url}"
+    );
+    assert!(
+        url.contains("redirect_uri=https%3A%2F%2Fplatform.claude.com%2Foauth%2Fcode%2Fcallback"),
+        "the headless login must not redirect to this machine's loopback: {url}"
+    );
+    app.apply_login_msg(&fx.session, msg).await;
+    let body = app.login_dialog_body().expect("dialog is open");
+    assert!(body.contains(&url), "the URL is shown in full: {body}");
+    assert!(
+        body.contains(
+            "Complete login in your browser, then copy the code Anthropic shows and paste it here."
+        ),
+        "{body}"
+    );
+    assert!(body.contains("ctrl+x to copy"), "{body}");
+
+    // `:218-223` — one paste prompt, with its `code#state` hint in the empty field.
+    let msg = next_msg(&mut rx).await;
+    assert!(matches!(&msg, LoginUiMsg::Prompt { .. }), "{msg:?}");
+    app.apply_login_msg(&fx.session, msg).await;
+    let body = app.login_dialog_body().expect("dialog is open");
+    assert!(
+        body.contains("Paste the code Anthropic shows after you sign in:"),
+        "{body}"
+    );
+    app.draw().unwrap();
+    let screen = buf_text(&app);
+    assert!(screen.contains("code#state"), "{screen}");
+
+    // `app.message.copy` (stock `ctrl+x`) asks the run loop to copy the WHOLE URL, and the dialog
+    // stays up with the paste field empty.
+    let action = app.handle_input(&ctrl(KeyCode::Char('x')));
+    match action {
+        crate::AppAction::Command(AppCommand::CopyAuthUrl(copied)) => assert_eq!(copied, url),
+        other => panic!("expected the copy command, got {other:?}"),
+    }
+    assert_eq!(app.active_selector_kind(), Some(SelectorKind::LoginDialog));
+    app.apply_auth_url_copy_result(&url, Ok(()));
+    let body = app.login_dialog_body().expect("dialog is open");
+    assert!(body.contains("Copied URL to clipboard"), "{body}");
+
+    // Cancelling the paste unwinds the real flow silently.
+    app.handle_input(&key(KeyCode::Esc));
+    let msg = next_msg(&mut rx).await;
+    match &msg {
+        LoginUiMsg::Finished(f) => assert!(f.cancelled, "{f:?}"),
+        other => panic!("expected Finished, got {other:?}"),
+    }
+    app.apply_login_msg(&fx.session, msg).await;
+}
+
+/// A one-request token endpoint on loopback: records the JSON body it receives and answers with a
+/// fixed token response. Stands in for `platform.claude.com/v1/oauth/token`, so the copy-code
+/// login runs to a stored credential without leaving the machine.
+struct FakeTokenEndpoint {
+    url: String,
+    body: std::sync::mpsc::Receiver<String>,
+}
+
+impl FakeTokenEndpoint {
+    fn start(response: &'static str) -> Self {
+        use std::io::{BufRead as _, BufReader, Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/v1/oauth/token", listener.local_addr().unwrap());
+        let (tx, body) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let Ok((stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut length = 0usize;
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                    break;
+                }
+                if let Some((name, value)) = line.split_once(':')
+                    && name.eq_ignore_ascii_case("content-length")
+                {
+                    length = value.trim().parse().unwrap_or(0);
+                }
+            }
+            let mut buf = vec![0u8; length];
+            let _ = reader.read_exact(&mut buf);
+            let _ = tx.send(String::from_utf8_lossy(&buf).into_owned());
+            let mut stream = stream;
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                response.len(),
+                response
+            );
+        });
+        FakeTokenEndpoint { url, body }
+    }
+}
+
+/// PROV-120 end to end in the TUI: pick "Copy code login (headless)", paste what Anthropic's
+/// hosted page shows (`code#state`), and a subscription credential lands in `auth.json`. The
+/// strategy is the real [`cyrup_provider::auth::oauth::AnthropicOAuth`] with only its token
+/// endpoint pointed at loopback; the exchange it sends carries the copy-code redirect.
+///
+/// That the copy-code login starts no listener is asserted where the callback server's test-only
+/// start record is visible (`cyrup-provider`'s
+/// `copy_code_login_exchanges_against_the_copy_code_redirect`; the record is `#[cfg(test)]` there,
+/// so not reachable from this crate). Here the flow is configured with a TEST-NET-1 bind host
+/// (RFC 5737), which no interface carries, so no listener could come up even if one were tried —
+/// nothing to race, no port to pick — and what the TUI can observe of a listener is asserted
+/// instead: the authorize URL and the paste prompt name the hosted copy-code page, never a
+/// loopback redirect.
+#[tokio::test]
+async fn copy_code_login_completes_from_the_tui_with_a_pasted_code() {
+    use cyrup_provider::auth::oauth::{
+        AUTHORIZE_URL, AnthropicOAuth, CALLBACK_PORT, COPY_CODE_REDIRECT_URI,
+    };
+    let token = FakeTokenEndpoint::start(
+        r#"{"access_token":"headless-access","refresh_token":"headless-refresh","expires_in":3600}"#,
+    );
+    let oauth =
+        AnthropicOAuth::with_endpoints(AUTHORIZE_URL, &token.url, "192.0.2.121", CALLBACK_PORT);
+    let fx = fixture().await;
+    let mut app = app_with(registry_for(
+        "anthropic",
+        ProviderAuth {
+            api_key: Some(env_key_like()),
+            ..ProviderAuth::with_oauth(Arc::new(oauth))
+        },
+    ));
+    let mut rx = start_anthropic_oauth_login(&mut app, &fx).await;
+    app.handle_input(&key(KeyCode::Down));
+    app.handle_input(&key(KeyCode::Enter));
+
+    let msg = next_msg(&mut rx).await;
+    let state = match &msg {
+        LoginUiMsg::Notify(event) => match event.as_ref() {
+            AuthEvent::AuthUrl { url, .. } => {
+                // A listener would advertise `http://localhost:{port}/callback` here.
+                let redirect = url
+                    .split_once("redirect_uri=")
+                    .map(|(_, rest)| rest.split('&').next().unwrap_or_default())
+                    .unwrap_or_default();
+                assert_eq!(
+                    redirect, "https%3A%2F%2Fplatform.claude.com%2Foauth%2Fcode%2Fcallback",
+                    "{url}"
+                );
+                assert!(!url.contains("localhost"), "{url}");
+                url.split_once("&state=")
+                    .map(|(_, rest)| rest.split('&').next().unwrap_or_default().to_string())
+                    .expect("the authorize URL carries a state")
+            }
+            other => panic!("expected the auth url, got {other:?}"),
+        },
+        other => panic!("expected the auth url, got {other:?}"),
+    };
+    app.apply_login_msg(&fx.session, msg).await;
+    let msg = next_msg(&mut rx).await;
+    // The browser flow's paste prompt carries the listener's redirect URI as its placeholder;
+    // the copy-code prompt carries `code#state` (`anthropic.ts:218-223` @v1.1.0).
+    match &msg {
+        LoginUiMsg::Prompt { prompt, .. } => {
+            assert_eq!(prompt.placeholder.as_deref(), Some("code#state"));
+        }
+        other => panic!("expected the paste prompt, got {other:?}"),
+    }
+    app.apply_login_msg(&fx.session, msg).await;
+
+    // The user pastes `code#state` from the hosted page (a bracketed paste), then submits.
+    app.handle_input(&crate::component::InputEvent::Paste(format!(
+        "headless-code#{state}"
+    )));
+    app.handle_input(&key(KeyCode::Enter));
+
+    // `:227` — the exchange progress line, then the settle.
+    let mut finished = None;
+    for _ in 0..4 {
+        let msg = next_msg(&mut rx).await;
+        if let LoginUiMsg::Finished(f) = &msg {
+            finished = Some(f.clone());
+            app.apply_login_msg(&fx.session, msg).await;
+            break;
+        }
+        app.apply_login_msg(&fx.session, msg).await;
+    }
+    let finished = finished.expect("the login settles");
+    assert!(finished.result.is_ok(), "{:?}", finished.result);
+
+    // `:228-234` — exchanged against the copy-code redirect, with the pasted code and state.
+    let sent: serde_json::Value = serde_json::from_str(
+        &token
+            .body
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the token endpoint was called"),
+    )
+    .unwrap();
+    assert_eq!(sent["code"], "headless-code");
+    assert_eq!(sent["state"], state.as_str());
+    assert_eq!(sent["redirect_uri"], COPY_CODE_REDIRECT_URI);
+
+    match fx
+        .session
+        .services()
+        .auth
+        .read(&ProviderId::from("anthropic"))
+        .await
+        .unwrap()
+        .expect("a credential is stored")
+    {
+        cyrup_config::auth::Credential::Oauth {
+            access, refresh, ..
+        } => {
+            assert_eq!(access, "headless-access");
+            assert_eq!(refresh, "headless-refresh");
+        }
+        other => panic!("expected an oauth credential, got {other:?}"),
+    }
+    let text = transcript_text(&app);
+    assert!(text.contains("Logged in to"), "{text}");
+}

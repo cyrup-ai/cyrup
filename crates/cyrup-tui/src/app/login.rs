@@ -462,9 +462,29 @@ impl<B: Backend> App<B> {
     /// Put a fresh [`LoginDialog`] in the input slot (`editorContainer.clear(); addChild(dialog);
     /// setFocus(dialog)`, `interactive-mode.ts:5273-5276`). The hint text is taken from the LIVE
     /// `tui.select.*` bindings, matching Pi's `keyHint` (`login-dialog.ts:141`, `:164`).
+    ///
+    /// The copy key is the LIVE `app.message.copy` binding (`login-dialog.ts:230` @v1.1.0 reads
+    /// `getKeybindings()` per keystroke; the dialog lives for one login, so its open is per-login
+    /// enough).
     fn open_login_dialog(&mut self, title: impl Into<String>) {
-        let dialog = LoginDialog::new(title, &self.state.select_keymap);
+        let dialog = LoginDialog::new(title, &self.state.select_keymap).with_copy_keys(
+            self.state
+                .keymap
+                .keys_for(crate::keymap::Action::MessageCopy),
+            self.state
+                .keymap
+                .keys_label(crate::keymap::Action::MessageCopy),
+        );
         self.open_boxed_selector(SelectorKind::LoginDialog, Box::new(dialog));
+    }
+
+    /// Settle an `app.message.copy` of the sign-in URL on the open `/login` dialog
+    /// (`AuthUrlComponent.copy()`'s `setHint`, `auth-url.ts:31-38` @v1.1.0). A dialog that has
+    /// closed, or moved on to another URL, ignores it.
+    pub fn apply_auth_url_copy_result(&mut self, url: &str, result: Result<(), String>) {
+        if let Some(dialog) = self.login_dialog_mut() {
+            dialog.set_auth_url_copy_result(url, result);
+        }
     }
 
     /// Apply one message from the spawned login flow (`notifyAuthDialog` / `showAuthPrompt` /

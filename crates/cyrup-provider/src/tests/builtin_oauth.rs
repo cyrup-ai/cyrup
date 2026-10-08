@@ -257,3 +257,106 @@ async fn the_openai_chatgpt_login_is_reachable_from_all_providers() {
         "the device-id check runs before any authorization starts"
     );
 }
+
+/// PROV-120 — `/login anthropic` must REACH the method selector and, through it, the headless
+/// copy-code login, via the same `all_providers()` → `provider_auth().oauth` chain `/login` walks
+/// (not just the concrete `AnthropicOAuth` the module tests drive).
+///
+/// Upstream `anthropicOAuth.login` (`oauth/anthropic.ts:282-299` @v1.1.0) asks
+/// `"Select Anthropic login method:"` first, offering `browser` then `copy_code`
+/// (pi `test/anthropic-oauth.test.ts:121-129`). The first probe cancels there, so nothing else
+/// runs. The second picks `copy_code` and cancels at the paste prompt: by then the flow has shown
+/// the authorize URL with Anthropic's hosted redirect (`COPY_CODE_REDIRECT_URI`, `:23`) and asked
+/// for `code#state` (`:218-223`). Neither probe binds a port or touches the network — the
+/// copy-code flow starts no listener and the token exchange is never reached.
+#[tokio::test]
+async fn the_anthropic_login_reaches_the_method_selector_and_copy_code_flow() {
+    use crate::auth::oauth::{
+        AuthEvent, AuthPromptKind, AuthSelectOption, OAuthError, ScriptedInteraction,
+    };
+
+    let oauth = oauth_by_id("anthropic").expect("anthropic must expose an oauth strategy");
+    assert_eq!(oauth.name(), "Anthropic (Claude Pro/Max)");
+
+    // 1. The selector is the very first thing `/login anthropic` shows.
+    let interaction = ScriptedInteraction::new(vec![Err(OAuthError::Cancelled)]);
+    let error = match oauth.login(&interaction, &LoginOptions::default()).await {
+        Ok(_) => panic!("the cancelled probe must not produce a credential"),
+        Err(error) => error,
+    };
+    assert!(
+        matches!(error, OAuthError::Cancelled),
+        "/login anthropic must stop at the selector, not reach the trait default ({error})"
+    );
+    let prompts = interaction.prompts();
+    assert_eq!(prompts.len(), 1, "{prompts:?}");
+    assert_eq!(prompts[0].kind, Some(AuthPromptKind::Select));
+    assert_eq!(prompts[0].message, "Select Anthropic login method:");
+    assert_eq!(
+        prompts[0].options,
+        vec![
+            AuthSelectOption {
+                id: "browser".to_string(),
+                label: "Browser login (default)".to_string(),
+                description: None,
+            },
+            AuthSelectOption {
+                id: "copy_code".to_string(),
+                label: "Copy code login (headless)".to_string(),
+                description: None,
+            },
+        ]
+    );
+    assert!(
+        interaction.events().is_empty(),
+        "no authorize URL before a method is chosen"
+    );
+
+    // 2. Choosing `copy_code` runs the headless flow: authorize URL with the hosted redirect,
+    //    then one `code#state` paste prompt.
+    let interaction = ScriptedInteraction::new(vec![
+        Ok("copy_code".to_string()),
+        Err(OAuthError::Cancelled),
+    ]);
+    let error = match oauth.login(&interaction, &LoginOptions::default()).await {
+        Ok(_) => panic!("the cancelled probe must not produce a credential"),
+        Err(error) => error,
+    };
+    assert!(matches!(error, OAuthError::Cancelled), "{error}");
+
+    let events = interaction.events();
+    let url = match events.first() {
+        Some(AuthEvent::AuthUrl { url, instructions }) => {
+            assert_eq!(
+                instructions.as_deref(),
+                Some(
+                    "Complete login in your browser, then copy the code Anthropic shows and paste it here."
+                )
+            );
+            url.clone()
+        }
+        other => panic!("expected the authorize URL first, got {other:?}"),
+    };
+    assert!(
+        url.starts_with("https://claude.ai/oauth/authorize?"),
+        "{url}"
+    );
+    assert!(
+        url.contains("redirect_uri=https%3A%2F%2Fplatform.claude.com%2Foauth%2Fcode%2Fcallback"),
+        "the copy-code login must redirect to Anthropic's hosted code page: {url}"
+    );
+    assert_eq!(
+        events.len(),
+        1,
+        "no exchange after a cancelled paste: {events:?}"
+    );
+
+    let prompts = interaction.prompts();
+    assert_eq!(prompts.len(), 2, "{prompts:?}");
+    assert_eq!(prompts[1].kind, Some(AuthPromptKind::ManualCode));
+    assert_eq!(
+        prompts[1].message,
+        "Paste the code Anthropic shows after you sign in:"
+    );
+    assert_eq!(prompts[1].placeholder.as_deref(), Some("code#state"));
+}

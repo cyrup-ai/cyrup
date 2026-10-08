@@ -1,10 +1,17 @@
-//! Anthropic OAuth flow (Claude Pro/Max) — 1:1 port of pi v0.83.0
-//! `packages/ai/src/auth/oauth/anthropic.ts` (350 lines).
+//! Anthropic OAuth flow (Claude Pro/Max) — 1:1 port of pi
+//! `packages/ai/src/auth/oauth/anthropic.ts`, first from v0.83.0 (350 lines) and re-based onto
+//! v1.1.0 (307 lines) where upstream changed behaviour since: the callback handler, now upstream's
+//! shared `callback-server.ts` (PROV-137); the degraded and free-port listener starts (PROV-117,
+//! PROV-136); the pasted-state handling (PROV-135); and the method selector and copy-code login
+//! (PROV-120). Every unmarked `:N` cite in this file is v0.83.0 `anthropic.ts`; a cite into a later
+//! version carries its `@v1.1.0` (or `@<commit>`) marker, and one into another file names it (or
+//! follows, in the same sentence, a cite that does).
 //!
 //! This is the subscription login: a PKCE authorization-code flow whose redirect lands on the
 //! loopback callback listener, raced against a manual-paste prompt for the case where the browser
-//! runs on another machine. It also owns the refresh-token exchange that
-//! [`crate::auth::resolve`] drives under the credential-store lock.
+//! runs on another machine. PROV-120 adds upstream's method selector in front of it and a second,
+//! copy-code login that never starts a listener at all (the headless path). It also owns the
+//! refresh-token exchange that [`crate::auth::resolve`] drives under the credential-store lock.
 //!
 //! ## Provenance
 //!
@@ -13,10 +20,11 @@
 //! | [`CLIENT_ID`] / [`AUTHORIZE_URL`] / [`TOKEN_URL`] / [`SCOPES`] / [`CALLBACK_PORT`] | `:29-37` |
 //! | [`parse_authorization_input`] | `parseAuthorizationInput`, `:52-79` |
 //! | [`format_error_details`] | `formatErrorDetails`, `:81-97` |
-//! | [`AnthropicCallbackHandler`] | the `createServer` request handler, `:114-148` |
+//! | [`AnthropicCallbackHandler`] | the shared `startOAuthCallbackServer` request handler, `callback-server.ts:78-116` @v1.1.0 (PROV-137; was `:114-148`) |
 //! | [`post_json`] | `postJson`, `:170-188` |
 //! | [`AnthropicOAuth::exchange_authorization_code`] | `exchangeAuthorizationCode`, `:190-227` |
-//! | [`AnthropicOAuth::login`] | `loginAnthropic`, `:229-303` |
+//! | [`AnthropicOAuth::login`] | `loginAnthropic`, `:229-303`; the method selector, `:282-299` @v1.1.0; the free-port fallback, `:140-198` @`8d8ae2fc2` |
+//! | [`AnthropicOAuth::login_copy_code`] | `loginAnthropicCopyCode`, `:200-235` @v1.1.0 (PROV-120) |
 //! | [`AnthropicOAuth::refresh_token`] | `refreshAnthropicToken`, `:308-340` |
 //! | `impl OAuthAuth for AnthropicOAuth` | `anthropicOAuth`, `:342-350` |
 //!
@@ -30,11 +38,20 @@
 //!   `getNodeApis()` guard (`:38-50`) rejects browser environments. Here the listener is
 //!   [`super::callback::CallbackServer`] (a `std::net::TcpListener` accept thread, because this
 //!   crate's `tokio` carries no `net` feature) and the browser guard is dropped: a Rust build is
-//!   never a browser. The 404-on-foreign-route branch (`:117-120`) lives in that shared server.
+//!   never a browser. The 404-on-foreign-route branch (`callback-server.ts:81-84` @v1.1.0) lives
+//!   in that shared server. Two consequences, neither reachable by a browser following a
+//!   redirect, both shared with every flow on that server ([`super::openai_codex`],
+//!   [`super::radius`]): the 404 page reads `"OAuth callback route not found."` where upstream
+//!   says `"Callback route not found."`; and the `claimed || settled` 409 (`:89-92` @v1.1.0) is
+//!   checked by the shared server before the handler's state check (`:85-88` @v1.1.0) and reads
+//!   `"This OAuth callback has already been used."` where upstream says `"This sign-in has already
+//!   been handled."` — after the first good redirect the server stops accepting, so only a request
+//!   racing that one could see either page.
 //! * **Cancellation.** Upstream threads an `AbortSignal` into the manual prompt and calls
-//!   `manualAbort.abort()` in `finally` (`:232`, `:261`, `:300`); here that signal is a
-//!   [`CancelToken`] on `AuthPrompt::cancel`, fired on the branch where the redirect wins.
-//!   `server.server.close()` (`:301`) is the [`super::callback::CallbackServer`] drop.
+//!   `manualAbort.abort()` in `finally` (`:232`, `:261`, `:300`; `callback-server.ts:160-182`
+//!   @v1.1.0); here that signal is a [`CancelToken`] on `AuthPrompt::cancel`, fired by a drop guard
+//!   on every exit from the wait — redirect won, paste won, either failed — as upstream's
+//!   `finally`. `server.server.close()` (`:301`) is the [`super::callback::CallbackServer`] drop.
 //! * **`formatErrorDetails`.** JS `Error` has `name`, `stack`, `code` and `errno` (`:81-97`);
 //!   Rust's [`std::error::Error`] has none of them. [`format_error_details`] emits
 //!   `Error: {Display}` — `Error` being the name of every `new Error(...)` this upstream module
@@ -51,7 +68,7 @@ use super::callback::{
     CallbackControl, CallbackHandler, CallbackOutcome, CallbackReply, CallbackRequest,
     CallbackServer, CallbackServerConfig, callback_host,
 };
-use super::interaction::{AuthEvent, AuthInteraction, AuthPrompt};
+use super::interaction::{AuthEvent, AuthInteraction, AuthPrompt, AuthSelectOption};
 use super::pkce::generate_pkce;
 use super::query::{encode_query, parse_query};
 use super::{OAuthError, now_ms, oauth_credential};
@@ -81,7 +98,10 @@ const CLIENT_ID_BASE64: &str = "OWQxYzI1MGEtZTYxYi00NGQ5LTg4ZWQtNTk0NGQxOTYyZjVl
 pub const AUTHORIZE_URL: &str = "https://claude.ai/oauth/authorize";
 /// `anthropic.ts:31`.
 pub const TOKEN_URL: &str = "https://platform.claude.com/v1/oauth/token";
-/// `anthropic.ts:33` — a fixed, pre-registered port, so a second concurrent login fails to bind.
+/// `anthropic.ts:18-20` @v1.1.0+ — the *preferred* port, so it can be forwarded into a container
+/// or over SSH. Anthropic accepts any loopback port, so since `8d8ae2fc2` (pi #10571) a login
+/// that cannot bind it (a concurrent login, a reserved range) falls back to an OS-chosen free
+/// port; see [`AnthropicOAuth::login`].
 pub const CALLBACK_PORT: u16 = 53692;
 /// `anthropic.ts:34`.
 pub const CALLBACK_PATH: &str = "/callback";
@@ -89,12 +109,24 @@ pub const CALLBACK_PATH: &str = "/callback";
 /// binds `CALLBACK_HOST` (`127.0.0.1` unless `*_OAUTH_CALLBACK_HOST` says otherwise).
 pub const ADVERTISE_HOST: &str = "localhost";
 
-/// `REDIRECT_URI` (`anthropic.ts:20` @v1.0.0) — upstream composes it from the port and path,
-/// ``http://localhost:${CALLBACK_PORT}${CALLBACK_PATH}``, and then reads this one constant
-/// everywhere: the authorize URL (`:155`), the paste prompt's placeholder (`:170`) and the token
-/// exchange (`:185`). It never asks the listener what it bound, which is what lets the login still
-/// work when the listener never came up at all (PROV-117).
+/// `REDIRECT_URI` (`anthropic.ts:22` @v1.1.0+) — upstream composes it from the port and path,
+/// ``http://localhost:${CALLBACK_PORT}${CALLBACK_PATH}``. Since `8d8ae2fc2` it is only the
+/// fallback of `callback?.redirectUri ?? REDIRECT_URI` (`:157` @v1.1.0): the browser flow
+/// advertises and exchanges against whatever its listener bound, and this constant is used only
+/// when no listener came up at all (PROV-117), so the paste still names the preferred redirect.
 pub const REDIRECT_URI: &str = "http://localhost:53692/callback";
+/// `COPY_CODE_REDIRECT_URI` (`anthropic.ts:23` @v1.1.0, `:21` @v1.0.0) — PROV-120. The
+/// copy-code (headless) login registers Anthropic's own hosted callback page instead of the
+/// loopback listener: the page shows `code#state` for the user to paste back, so nothing has to
+/// listen on this machine and the login works over SSH, in a container, or anywhere the browser
+/// cannot reach `localhost`.
+pub const COPY_CODE_REDIRECT_URI: &str = "https://platform.claude.com/oauth/code/callback";
+/// `ANTHROPIC_BROWSER_LOGIN_METHOD` (`anthropic.ts:24` @v1.1.0) — the select option id for the
+/// loopback-redirect login.
+const BROWSER_LOGIN_METHOD: &str = "browser";
+/// `ANTHROPIC_COPY_CODE_LOGIN_METHOD` (`anthropic.ts:25` @v1.1.0) — the select option id for the
+/// copy-code login.
+const COPY_CODE_LOGIN_METHOD: &str = "copy_code";
 /// `anthropic.ts:36-37`. Space-separated; the urlencoded serializer turns the spaces into `+`.
 pub const SCOPES: &str = "org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload";
 
@@ -103,6 +135,19 @@ const AUTH_URL_INSTRUCTIONS: &str = "Complete login in your browser. If the brow
 /// `anthropic.ts:259`.
 const MANUAL_PROMPT_MESSAGE: &str =
     "Complete login in your browser, or paste the authorization code / redirect URL here:";
+/// `anthropic.ts:285` @v1.1.0.
+const SELECT_LOGIN_METHOD_MESSAGE: &str = "Select Anthropic login method:";
+/// `anthropic.ts:287` @v1.1.0.
+const BROWSER_LOGIN_LABEL: &str = "Browser login (default)";
+/// `anthropic.ts:288` @v1.1.0.
+const COPY_CODE_LOGIN_LABEL: &str = "Copy code login (headless)";
+/// `anthropic.ts:215` @v1.1.0 — the copy-code flow's `auth_url` instructions.
+const COPY_CODE_AUTH_URL_INSTRUCTIONS: &str =
+    "Complete login in your browser, then copy the code Anthropic shows and paste it here.";
+/// `anthropic.ts:220` @v1.1.0 — the copy-code flow's `manual_code` prompt.
+const COPY_CODE_PROMPT_MESSAGE: &str = "Paste the code Anthropic shows after you sign in:";
+/// `anthropic.ts:221` @v1.1.0 — what Anthropic's hosted callback page displays.
+const COPY_CODE_PLACEHOLDER: &str = "code#state";
 /// `anthropic.ts:297`.
 const EXCHANGE_PROGRESS_MESSAGE: &str = "Exchanging authorization code for tokens...";
 
@@ -307,7 +352,7 @@ impl TokenResponse {
 }
 
 // ---------------------------------------------------------------------------
-// The callback handler — anthropic.ts:114-148
+// The callback handler — callback-server.ts:78-116 @v1.1.0 (PROV-137)
 // ---------------------------------------------------------------------------
 
 /// A `code`/`state` pair delivered by the browser redirect (`anthropic.ts:18`).
@@ -317,13 +362,20 @@ pub struct AuthorizationCallback {
     pub state: String,
 }
 
-/// The Anthropic-specific half of the callback server (`anthropic.ts:114-148`).
+/// The Anthropic-specific half of the callback server: the request handler of upstream's shared
+/// `startOAuthCallbackServer` (`callback-server.ts:78-116` @v1.1.0), which `loginAnthropic`
+/// starts with `providerName: "Anthropic"`, `state: verifier` and `complete: async (code) => code`
+/// (`anthropic.ts:142-151` @v1.1.0).
 ///
-/// Every rejection branch replies **without** settling the wait, exactly as upstream's handler
-/// `res.end()`s without reaching `settleWait`: the browser sees the error page and the listener
-/// keeps waiting for a good redirect.
+/// PROV-137 — pi `4df157433` (v0.99.0) replaced the hand-rolled v0.83.0 handler
+/// (`anthropic.ts:114-148` @v0.83.0) with that shared one, and the two differ where it matters:
+/// a state-matching `?error=` redirect (the user clicked *Deny*) now **fails the login**
+/// (`finish({ error })`, `callback-server.ts:93-98` @v1.1.0) instead of answering the browser and
+/// leaving the login waiting on the paste prompt. A wrong or missing state, or a missing code,
+/// still replies without settling, so a later good redirect can complete the login.
 pub struct AnthropicCallbackHandler {
-    /// `expectedState` (`anthropic.ts:99`), which is the PKCE verifier (`:231`).
+    /// `options.state` (`callback-server.ts:85` @v1.1.0), which is the PKCE verifier
+    /// (`anthropic.ts:149` @v1.1.0).
     expected_state: String,
 }
 
@@ -336,45 +388,58 @@ impl CallbackHandler for AnthropicCallbackHandler {
         request: CallbackRequest,
         _control: CallbackControl,
     ) -> CallbackOutcome<Self::Value> {
-        // `:122-124`
-        let code = request.param("code");
-        let state = request.param("state");
-        let error = request.param("error");
+        // `callback-server.ts:81-84` @v1.1.0 — the pathname half is checked by the shared server;
+        // this is the method half.
+        if request.method != "GET" {
+            return CallbackOutcome::Continue {
+                reply: CallbackReply::error(404, "OAuth callback route not found.", None)
+                    .no_store(),
+            };
+        }
 
-        // `:126-131` — JS truthiness, so a bare `?error=` is not an error.
+        // `callback-server.ts:85-88` @v1.1.0 — first, and an exact comparison, so a missing state
+        // is a mismatch too.
+        let state = request.param("state");
+        if state != Some(self.expected_state.as_str()) {
+            return CallbackOutcome::Continue {
+                reply: CallbackReply::error(400, "State mismatch.", None).no_store(),
+            };
+        }
+
+        // `callback-server.ts:93-99` @v1.1.0 — JS truthiness, so a bare `?error=` is not an error;
+        // `??`, so a present-but-empty `error_description` is kept.
+        let error = request.param("error");
         if truthy(error) {
             let error = error.unwrap_or_default();
-            return CallbackOutcome::Continue {
+            let description = request.param("error_description").unwrap_or(error);
+            return CallbackOutcome::Failed {
                 reply: CallbackReply::error(
                     400,
-                    "Anthropic authentication did not complete.",
-                    Some(&format!("Error: {error}")),
-                ),
+                    "Anthropic authorization failed.",
+                    Some(description),
+                )
+                .no_store(),
+                error: OAuthError::Failed(format!("Anthropic authorization failed: {description}")),
             };
         }
 
-        // `:133-136`
-        if !truthy(code) || !truthy(state) {
+        // `callback-server.ts:100-104` @v1.1.0
+        let code = request.param("code");
+        if !truthy(code) {
             return CallbackOutcome::Continue {
-                reply: CallbackReply::error(400, "Missing code or state parameter.", None),
-            };
-        }
-        let code = code.unwrap_or_default().to_string();
-        let state = state.unwrap_or_default().to_string();
-
-        // `:138-141`
-        if state != self.expected_state {
-            return CallbackOutcome::Continue {
-                reply: CallbackReply::error(400, "State mismatch.", None),
+                reply: CallbackReply::error(400, "Missing authorization code.", None).no_store(),
             };
         }
 
-        // `:143-147`
+        // `callback-server.ts:105-109` @v1.1.0 — `complete: async (code) => code` cannot fail,
+        // so the 502 branch (`:110-114` @v1.1.0) is unreachable for this flow.
         CallbackOutcome::Complete {
-            reply: CallbackReply::success(
-                "Anthropic authentication completed. You can close this window.",
-            ),
-            value: AuthorizationCallback { code, state },
+            reply: CallbackReply::success("Signed in to Anthropic. You may now close this page.")
+                .no_store(),
+            value: AuthorizationCallback {
+                code: code.unwrap_or_default().to_string(),
+                state: self.expected_state.clone(),
+            },
         }
     }
 }
@@ -554,10 +619,11 @@ impl AnthropicOAuth {
         }
     }
 
-    /// The redirect URI this flow advertises: upstream's module-level `REDIRECT_URI`
-    /// (`anthropic.ts:20` @v1.0.0). Composed the same way — advertise host, port, path — but from
-    /// the *configured* callback port, so [`AnthropicOAuth::with_endpoints`]' test bind is
-    /// described honestly; for the production port it is [`REDIRECT_URI`] verbatim.
+    /// The redirect URI advertised when no listener could be bound: upstream's module-level
+    /// `REDIRECT_URI` (`anthropic.ts:22` @v1.1.0+), the right-hand side of `:157`'s `??` @v1.1.0. Composed
+    /// the same way — advertise host, port, path — but from the *configured* callback port, so
+    /// [`AnthropicOAuth::with_endpoints`]' test bind is described honestly; for the production
+    /// port it is [`REDIRECT_URI`] verbatim.
     fn redirect_uri(&self) -> String {
         format!(
             "http://{ADVERTISE_HOST}:{}{CALLBACK_PATH}",
@@ -581,33 +647,43 @@ impl AnthropicOAuth {
         // `:231` — the verifier doubles as the OAuth state.
         //
         // PROV-117 — `4df157433` ("share OAuth callback server and sign-in page") ends this call
-        // with `.catch(() => undefined)` (`anthropic.ts:148`), and
-        // `waitForCallbackOrManualInput(interaction, callback, …)` takes
-        // `OAuthCallbackServer<T> | undefined` and documents the degraded path: "Without a callback
-        // server only the manual prompt is used" (`callback-server.ts:150-184`). So a listener that
-        // cannot bind — port 53692 already taken by a concurrent login, or a sandbox that refuses
-        // the loopback listen — leaves the authorize URL and the paste prompt, and the login still
-        // completes. `openrouter.ts:116` and `radius.ts:153` keep the hard failure deliberately;
-        // only this flow and the Codex one degrade.
-        let config = CallbackServerConfig::fixed(self.callback_port, CALLBACK_PATH)
-            .with_host(self.bind_host().await)
-            .advertising(ADVERTISE_HOST)
-            .with_interaction(interaction);
-        let server = CallbackServer::start(
-            config,
-            AnthropicCallbackHandler {
-                expected_state: pkce.verifier.clone(),
-            },
-        )
-        .await
-        .ok();
+        // with `.catch(() => undefined)`, and `waitForCallbackOrManualInput(interaction, callback,
+        // …)` takes `OAuthCallbackServer<T> | undefined` and documents the degraded path: "Without
+        // a callback server only the manual prompt is used" (`callback-server.ts:150-183` @v1.1.0).
+        // So a listener that cannot bind leaves the authorize URL and the paste prompt, and the
+        // login still completes. `openrouter.ts:116` and `radius.ts:153` keep the hard failure
+        // deliberately; only this flow and the Codex one degrade.
+        //
+        // `8d8ae2fc2` (pi #10571) puts a second attempt in between (`anthropic.ts:142-156`
+        // @v1.1.0+): the preferred port first, so a forwarded 53692 (SSH, containers) keeps
+        // working; then port `0`, an OS-chosen free loopback port, because Anthropic accepts any
+        // loopback port and 53692 can be taken by a concurrent login or reserved outright (the
+        // Hyper-V/WSL exclusion ranges on Windows); only when that also fails, no listener.
+        // Upstream's `.catch` swallows every rejection, `Cancelled` included, and so does `.ok()`.
+        let bind_host = self.bind_host().await;
+        let start = |port: u16| {
+            CallbackServer::start(
+                CallbackServerConfig::fixed(port, CALLBACK_PATH)
+                    .with_host(bind_host.clone())
+                    // `redirectHost: "localhost"` (`:148` @v1.1.0).
+                    .advertising(ADVERTISE_HOST)
+                    .with_interaction(interaction),
+                AnthropicCallbackHandler {
+                    expected_state: pkce.verifier.clone(),
+                },
+            )
+        };
+        let server = match start(self.callback_port).await {
+            Ok(server) => Some(server),
+            Err(_) => start(0).await.ok(),
+        };
 
-        // `:20` — `http://localhost:{port}/callback`. Upstream reads the module constant and
-        // never asks the listener (`:155`, `:170`, `:185`), which is exactly what makes the
-        // unbound case workable. cyrup prefers the listener's own URI when there is one solely
-        // because [`AnthropicOAuth::with_endpoints`] allows a test-only ephemeral bind, where the
-        // port is not known until `listen` returns; for the production fixed port the two agree
-        // byte for byte, which `redirect_uri_matches_the_bound_listener` pins.
+        // `:157` @v1.1.0 — `callback?.redirectUri ?? REDIRECT_URI`. The BOUND redirect URI (which
+        // on the fallback carries the OS-chosen port) is what the authorize URL (`:164` @v1.1.0),
+        // the paste prompt's placeholder (`:179` @v1.1.0) and the token exchange (`:194` @v1.1.0)
+        // all use, so the code is
+        // exchanged against the very URI it was issued for. With no listener it is the
+        // preferred-port URI, composed from the configured port by [`Self::redirect_uri`].
         let redirect_uri = match &server {
             Some(server) => server.redirect_uri().to_string(),
             None => self.redirect_uri(),
@@ -619,8 +695,14 @@ impl AnthropicOAuth {
             instructions: Some(AUTH_URL_INSTRUCTIONS.to_string()),
         });
 
-        // `:256-262` — `manualAbort` is this token; `:300`'s `abort()` fires it.
+        // `:256-262` — `manualAbort` is this token. Upstream aborts it in `finally` on every exit
+        // from the wait (`:300`; `callback-server.ts:180-182` @v1.1.0): the redirect won, the
+        // paste won (so a UI can dismiss the prompt it still shows), or either failed. The drop
+        // guard is that `finally`: an early `?` return drops it, and the success path drops it
+        // explicitly once the wait has settled, before the exchange — where upstream's
+        // `waitForCallbackOrManualInput` returns.
         let manual_abort = CancelToken::new();
+        let abort_manual_on_exit = manual_abort.clone().drop_guard();
         let mut manual = Box::pin(
             interaction.prompt(
                 AuthPrompt::manual_code(MANUAL_PROMPT_MESSAGE)
@@ -643,11 +725,8 @@ impl AnthropicOAuth {
                     prompted = &mut manual => Winner::Manual(prompted),
                 };
                 match winner {
-                    Winner::Redirect(settled) => {
-                        // `:300` — the redirect won, so abort the pending prompt.
-                        manual_abort.cancel();
-                        settled?
-                    }
+                    // The redirect won; the guard aborts the pending prompt (`:300`).
+                    Winner::Redirect(settled) => settled?,
                     Winner::Manual(prompted) => {
                         // `:273` rethrows a prompt rejection before the redirect result is
                         // consulted.
@@ -660,9 +739,9 @@ impl AnthropicOAuth {
                 }
             }
             // PROV-117 — `await callback?.wait()` on an absent callback is `undefined`
-            // (`callback-server.ts:174`), so there is no race: the prompt is the only channel and
-            // the code below reads it through the `manual_input.is_none()` second chance at
-            // `:284-293`, which upstream reaches by the same `value !== undefined` test.
+            // (`callback-server.ts:174` @v1.1.0), so there is no race: the prompt is the only
+            // channel and the code below reads it through the `manual_input.is_none()` second
+            // chance at `:284-293`, which upstream reaches by the same `value !== undefined` test.
             None => None,
         };
 
@@ -691,8 +770,9 @@ impl AnthropicOAuth {
         }
 
         // `:284-293` — the second chance (`const input = await manual`,
-        // `callback-server.ts:177`). Reached when the listener resolved without a code — which is
-        // `cancel_wait`, a listener that stopped on its own, or (PROV-117) no listener at all.
+        // `callback-server.ts:177` @v1.1.0). Reached when the listener resolved without a code —
+        // which is `cancel_wait`, a listener that stopped on its own, or (PROV-117) no listener at
+        // all.
         if !truthy(code.as_deref()) && manual_input.is_none() {
             let input = manual.await?;
             let parsed = parse_authorization_input(&input);
@@ -704,13 +784,14 @@ impl AnthropicOAuth {
             code = parsed.code;
             state = parsed.state.or_else(|| Some(pkce.verifier.clone()));
         }
+        // `callback-server.ts:180-182` @v1.1.0 — the wait has settled: `manualAbort.abort()`.
+        drop(abort_manual_on_exit);
 
-        // `:295-296`
+        // `:192` @v1.1.0+ — the only post-input check. There is no "Missing OAuth state": pi
+        // removed it in `4df157433` (v0.99.0), so a pasted `code#` keeps its empty state through
+        // `parsed.state ?? verifier` and is exchanged with `state: ""`, exactly as upstream sends.
         if !truthy(code.as_deref()) {
             return Err(OAuthError::Failed("Missing authorization code".to_string()));
-        }
-        if !truthy(state.as_deref()) {
-            return Err(OAuthError::Failed("Missing OAuth state".to_string()));
         }
         let code = code.unwrap_or_default();
         let state = state.unwrap_or_default();
@@ -721,6 +802,55 @@ impl AnthropicOAuth {
         });
         // `:298`
         self.exchange_authorization_code(&code, &state, &pkce.verifier, &redirect_uri)
+            .await
+    }
+
+    /// PROV-120 — 1:1 port of `loginAnthropicCopyCode` (`anthropic.ts:200-235` @v1.1.0, unchanged
+    /// since v1.0.0's `:191-226`): the headless login. The authorize URL redirects to
+    /// [`COPY_CODE_REDIRECT_URI`], Anthropic's hosted page, which shows `code#state`; the user
+    /// pastes it into the one `manual_code` prompt. No callback listener is started and nothing is
+    /// raced, so it works where no browser can reach this machine's loopback.
+    async fn login_copy_code(
+        &self,
+        interaction: &dyn AuthInteraction,
+    ) -> Result<Credential, OAuthError> {
+        // `:201` @v1.1.0
+        let pkce = generate_pkce()?;
+
+        // `:202-216` @v1.1.0 — same authorize parameters as the browser flow, copy-code redirect.
+        interaction.notify(AuthEvent::AuthUrl {
+            url: self.authorization_url(&pkce.challenge, &pkce.verifier, COPY_CODE_REDIRECT_URI),
+            instructions: Some(COPY_CODE_AUTH_URL_INSTRUCTIONS.to_string()),
+        });
+
+        // `:218-223` @v1.1.0 — `signal: interaction.signal` is the login-wide cancel.
+        let mut prompt = AuthPrompt::manual_code(COPY_CODE_PROMPT_MESSAGE)
+            .with_placeholder(COPY_CODE_PLACEHOLDER);
+        prompt.cancel = interaction.cancel().cloned();
+        let input = interaction.prompt(prompt).await?;
+
+        // `:224-226` @v1.1.0 — the browser flow's checks. There is no "Missing OAuth state" check
+        // here: upstream has none in either flow (removed in `4df157433`, v0.99.0), and `??` below
+        // keeps an empty state — the same as `run_login`.
+        let parsed = parse_authorization_input(&input);
+        if truthy(parsed.state.as_deref())
+            && parsed.state.as_deref() != Some(pkce.verifier.as_str())
+        {
+            return Err(OAuthError::Failed("OAuth state mismatch".to_string()));
+        }
+        let code = match parsed.code {
+            Some(code) if !code.is_empty() => code,
+            _ => return Err(OAuthError::Failed("Missing authorization code".to_string())),
+        };
+
+        // `:227` @v1.1.0
+        interaction.notify(AuthEvent::Progress {
+            message: EXCHANGE_PROGRESS_MESSAGE.to_string(),
+        });
+        // `:228-234` @v1.1.0 — `parsed.state ?? verifier`, exchanged against the copy-code
+        // redirect.
+        let state = parsed.state.unwrap_or_else(|| pkce.verifier.clone());
+        self.exchange_authorization_code(&code, &state, &pkce.verifier, COPY_CODE_REDIRECT_URI)
             .await
     }
 }
@@ -746,11 +876,19 @@ impl OAuthAuth for AnthropicOAuth {
     /// cancels the other. When the paste wins we still consult the listener, because upstream
     /// gives a redirect that landed concurrently precedence over the pasted value (`:272-282`).
     ///
-    /// PROV-117 — a listener that cannot bind is **not** fatal: upstream's
-    /// `startOAuthCallbackServer({…}).catch(() => undefined)` (`:148`) hands
-    /// `waitForCallbackOrManualInput` an absent callback and the paste prompt runs alone
-    /// (`callback-server.ts:150-184`). So `/login anthropic` still completes on a host where port
-    /// 53692 is already taken or the loopback listen is refused.
+    /// PROV-117 / pi `8d8ae2fc2` — a listener that cannot bind is **not** fatal:
+    /// `startCallbackServer(CALLBACK_PORT).catch(() => startCallbackServer(0)).catch(() =>
+    /// undefined)` (`anthropic.ts:154-156` @v1.1.0+) first falls back to an OS-chosen free port —
+    /// advertised, prompted and exchanged as the bound redirect URI — and only if that also fails
+    /// hands `waitForCallbackOrManualInput` an absent callback, so the paste prompt runs alone
+    /// (`callback-server.ts:150-183` @v1.1.0). So `/login anthropic` still completes on a host
+    /// where port 53692 is already taken, reserved, or the loopback listen is refused.
+    ///
+    /// PROV-120 — `anthropicOAuth.login` (`anthropic.ts:282-299` @v1.1.0) first asks which method
+    /// to run: `browser` is the flow above, unchanged; `copy_code` is
+    /// [`AnthropicOAuth::login_copy_code`], the headless login with no listener. The `select`
+    /// answer is an option **id**, and anything else is upstream's
+    /// `Unknown Anthropic login method: {method}` (`:296` @v1.1.0).
     ///
     /// This overrides the trait's `LoginUnsupported` default, so the `dyn OAuthAuth` the provider
     /// carries ([`crate::providers::builtin_oauth::builtin_provider_oauth`]) runs the real flow.
@@ -759,6 +897,34 @@ impl OAuthAuth for AnthropicOAuth {
         interaction: &dyn AuthInteraction,
         _options: &LoginOptions,
     ) -> Result<Credential, OAuthError> {
+        // `:283-290` @v1.1.0
+        let method = interaction
+            .prompt(AuthPrompt::select(
+                SELECT_LOGIN_METHOD_MESSAGE,
+                vec![
+                    AuthSelectOption {
+                        id: BROWSER_LOGIN_METHOD.to_string(),
+                        label: BROWSER_LOGIN_LABEL.to_string(),
+                        description: None,
+                    },
+                    AuthSelectOption {
+                        id: COPY_CODE_LOGIN_METHOD.to_string(),
+                        label: COPY_CODE_LOGIN_LABEL.to_string(),
+                        description: None,
+                    },
+                ],
+            ))
+            .await?;
+
+        // `:292-297` @v1.1.0
+        if method == COPY_CODE_LOGIN_METHOD {
+            return self.login_copy_code(interaction).await;
+        }
+        if method != BROWSER_LOGIN_METHOD {
+            return Err(OAuthError::Failed(format!(
+                "Unknown Anthropic login method: {method}"
+            )));
+        }
         self.run_login(interaction).await
     }
 
@@ -803,7 +969,8 @@ mod tests {
     )]
 
     use super::*;
-    use crate::auth::oauth::interaction::ScriptedInteraction;
+    use crate::auth::oauth::callback::bind_attempts;
+    use crate::auth::oauth::interaction::{AuthPromptKind, ScriptedInteraction};
     use base64::Engine as _;
     use std::io::{Read as _, Write as _};
     use std::sync::{Arc, Mutex};
@@ -847,6 +1014,13 @@ mod tests {
         assert_eq!(TOKEN_URL, "https://platform.claude.com/v1/oauth/token");
         assert_eq!(CALLBACK_PORT, 53692);
         assert_eq!(CALLBACK_PATH, "/callback");
+        // anthropic.ts:23-25 @v1.1.0 (PROV-120)
+        assert_eq!(
+            COPY_CODE_REDIRECT_URI,
+            "https://platform.claude.com/oauth/code/callback"
+        );
+        assert_eq!(BROWSER_LOGIN_METHOD, "browser");
+        assert_eq!(COPY_CODE_LOGIN_METHOD, "copy_code");
         assert_eq!(
             SCOPES,
             "org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload"
@@ -1017,6 +1191,11 @@ mod tests {
             let requests = self.requests.lock().unwrap();
             let (head, payload) = requests.first().cloned().unwrap();
             (head, serde_json::from_str(&payload).unwrap())
+        }
+
+        /// How many requests reached the endpoint so far, without waiting for one.
+        fn hits(&self) -> usize {
+            self.requests.lock().unwrap().len()
         }
     }
 
@@ -1245,7 +1424,10 @@ mod tests {
             r#"{"access_token":"dyn-access","refresh_token":"dyn-refresh","expires_in":3600}"#,
         );
         let flow: Arc<dyn OAuthAuth> = Arc::new(strategy_for(&token.url));
-        let interaction = ScriptedInteraction::new(vec![Ok("DYNCODE".to_string())]);
+        let interaction = ScriptedInteraction::new(vec![
+            Ok(BROWSER_LOGIN_METHOD.to_string()),
+            Ok("DYNCODE".to_string()),
+        ]);
         let cred = flow
             .login(&interaction, &LoginOptions::default())
             .await
@@ -1260,9 +1442,26 @@ mod tests {
 
     // -- login, anthropic.ts:229-303 -----------------------------------------
 
-    /// Issue a bare HTTP/1.1 GET against a loopback callback listener.
+    /// The per-test deadline the redirect-driven tests put on the login and on the driver: pi's
+    /// vitest default is 5s per test. Without it, a regression in which the login never settles
+    /// (a missing free-port fallback advertises a squatted port whose backlog never accepts,
+    /// while the manual prompt blocks forever) hangs the suite instead of failing it.
+    const REDIRECT_TEST_DEADLINE: Duration = Duration::from_secs(10);
+
+    /// Await `future`, failing the test with `what` if it outlives [`REDIRECT_TEST_DEADLINE`].
+    async fn within<F: std::future::Future>(what: &str, future: F) -> F::Output {
+        tokio::time::timeout(REDIRECT_TEST_DEADLINE, future)
+            .await
+            .unwrap_or_else(|_| panic!("{what} did not finish within {REDIRECT_TEST_DEADLINE:?}"))
+    }
+
+    /// Issue a bare HTTP/1.1 GET against a loopback callback listener. Reads time out after
+    /// [`REDIRECT_TEST_DEADLINE`], so a listener that accepted nothing fails the test.
     fn http_get(port: u16, target: &str) -> (String, String) {
         let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        stream
+            .set_read_timeout(Some(REDIRECT_TEST_DEADLINE))
+            .unwrap();
         let req = format!("GET {target} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
         stream.write_all(req.as_bytes()).unwrap();
         stream.flush().unwrap();
@@ -1315,8 +1514,12 @@ mod tests {
             r#"{"access_token":"live-access","refresh_token":"live-refresh","expires_in":3600}"#,
         );
         let oauth = strategy_for(&token.url);
-        // The manual prompt never answers, so only the redirect can complete the login.
-        let interaction = Arc::new(ScriptedInteraction::new(Vec::new()).blocking_when_empty());
+        // The selector picks the browser flow (PROV-120); the manual prompt then never answers,
+        // so only the redirect can complete the login.
+        let interaction = Arc::new(
+            ScriptedInteraction::new(vec![Ok(BROWSER_LOGIN_METHOD.to_string())])
+                .blocking_when_empty(),
+        );
 
         let driver = {
             let interaction = interaction.clone();
@@ -1330,15 +1533,18 @@ mod tests {
             })
         };
 
-        let cred = oauth
-            .login(interaction.as_ref(), &LoginOptions::default())
-            .await
-            .unwrap();
-        let (status, page) = driver.await.unwrap();
+        let cred = within(
+            "the login",
+            oauth.login(interaction.as_ref(), &LoginOptions::default()),
+        )
+        .await
+        .unwrap();
+        let (status, page) = within("the redirect", driver).await.unwrap();
         assert!(status.starts_with("HTTP/1.1 200"), "{status}");
-        // anthropic.ts:145-146
+        // `callback-server.ts:108` @v1.1.0; pi `test/anthropic-oauth.test.ts:220` asserts
+        // `toContain("Signed in to Anthropic.")`.
         assert!(
-            page.contains("Anthropic authentication completed. You can close this window."),
+            page.contains("Signed in to Anthropic. You may now close this page."),
             "{page}"
         );
 
@@ -1367,6 +1573,13 @@ mod tests {
             body.get("code_verifier").and_then(|v| v.as_str()),
             Some(param_of(&url, "state").as_str())
         );
+        // pi `8d8ae2fc2` — `expect(login.exchangedRedirectUri).toBe(login.redirectUri)`: the code
+        // is exchanged against the bound redirect URI the authorize URL advertised (`:164`, `:194`
+        // @v1.1.0).
+        assert_eq!(
+            body.get("redirect_uri").and_then(|v| v.as_str()),
+            Some(param_of(&url, "redirect_uri").as_str())
+        );
 
         // anthropic.ts:249-254 then :297 — the two notifications, in order.
         let events = interaction.events();
@@ -1377,10 +1590,16 @@ mod tests {
                 message: "Exchanging authorization code for tokens...".to_string()
             })
         );
-        // anthropic.ts:256-261 — the manual prompt is offered with the redirect URI as its
-        // placeholder.
+        // anthropic.ts:256-261 — after the selector, the manual prompt is offered with the
+        // redirect URI as its placeholder.
         let prompts = interaction.prompts();
-        let prompt = prompts.first().unwrap();
+        assert_eq!(prompts[0].kind, Some(AuthPromptKind::Select));
+        // PROV-120 — choosing `browser` keeps the loopback redirect, not the copy-code page.
+        assert!(
+            param_of(&url, "redirect_uri").starts_with("http://localhost:"),
+            "{url}"
+        );
+        let prompt = prompts.get(1).unwrap();
         assert_eq!(prompt.message, MANUAL_PROMPT_MESSAGE);
         assert_eq!(
             prompt.placeholder.as_deref(),
@@ -1397,7 +1616,10 @@ mod tests {
         );
         let oauth = strategy_for(&token.url);
         // A bare code with no state: upstream falls back to the verifier (`:281`).
-        let interaction = ScriptedInteraction::new(vec![Ok("PASTED_CODE".to_string())]);
+        let interaction = ScriptedInteraction::new(vec![
+            Ok(BROWSER_LOGIN_METHOD.to_string()),
+            Ok("PASTED_CODE".to_string()),
+        ]);
 
         let cred = oauth
             .login(&interaction, &LoginOptions::default())
@@ -1419,29 +1641,36 @@ mod tests {
         assert_eq!(state, param_of(&auth_url_of(&interaction), "state"));
     }
 
-    /// Answers the manual prompt with a full redirect URL carrying the flow's own state, read back
-    /// out of the `auth_url` event this interaction just received.
+    /// Answers the manual prompt with a full redirect URL carrying the flow's own state, built —
+    /// like pi `test/anthropic-oauth.test.ts:62-70` — from the `redirect_uri` and `state` of the
+    /// `auth_url` event this interaction just received.
     #[derive(Default)]
     struct PasteRedirectUrl {
-        state: Mutex<Option<String>>,
+        auth_url: Mutex<Option<String>>,
     }
 
     #[async_trait::async_trait]
     impl AuthInteraction for PasteRedirectUrl {
-        async fn prompt(&self, _prompt: AuthPrompt) -> Result<String, OAuthError> {
-            let state = self.state.lock().ok().and_then(|s| s.clone());
-            match state {
-                Some(state) => Ok(format!(
-                    "http://localhost:53692/callback?code=URLCODE&state={state}"
+        async fn prompt(&self, prompt: AuthPrompt) -> Result<String, OAuthError> {
+            // PROV-120 — the method selector comes first.
+            if prompt.kind == Some(AuthPromptKind::Select) {
+                return Ok(BROWSER_LOGIN_METHOD.to_string());
+            }
+            let auth_url = self.auth_url.lock().ok().and_then(|s| s.clone());
+            match auth_url {
+                Some(url) => Ok(format!(
+                    "{}?code=URLCODE&state={}",
+                    param_of(&url, "redirect_uri"),
+                    param_of(&url, "state")
                 )),
                 None => Err(OAuthError::Failed("no auth_url seen".to_string())),
             }
         }
         fn notify(&self, event: AuthEvent) {
             if let AuthEvent::AuthUrl { url, .. } = event
-                && let Ok(mut slot) = self.state.lock()
+                && let Ok(mut slot) = self.auth_url.lock()
             {
-                *slot = Some(param_of(&url, "state"));
+                *slot = Some(url);
             }
         }
     }
@@ -1464,14 +1693,26 @@ mod tests {
         }
         let (_, body) = token.recorded();
         assert_eq!(body.get("code").and_then(|v| v.as_str()), Some("URLCODE"));
+        // pi `test/anthropic-oauth.test.ts:43-79` — the pasted callback is exchanged against the
+        // same localhost redirect the authorize URL advertised.
+        let advertised = param_of(
+            interaction.auth_url.lock().unwrap().as_deref().unwrap(),
+            "redirect_uri",
+        );
+        assert!(advertised.starts_with("http://localhost:"), "{advertised}");
+        assert_eq!(
+            body.get("redirect_uri").and_then(|v| v.as_str()),
+            Some(advertised.as_str())
+        );
     }
 
     #[tokio::test]
     async fn login_rejects_pasted_state_mismatch() {
         let oauth = strategy_for("http://127.0.0.1:1/never-called");
-        let interaction = ScriptedInteraction::new(vec![Ok(
-            "http://localhost:53692/callback?code=C&state=not-the-verifier".to_string(),
-        )]);
+        let interaction = ScriptedInteraction::new(vec![
+            Ok(BROWSER_LOGIN_METHOD.to_string()),
+            Ok("http://localhost:53692/callback?code=C&state=not-the-verifier".to_string()),
+        ]);
         let err = oauth
             .login(&interaction, &LoginOptions::default())
             .await
@@ -1483,7 +1724,10 @@ mod tests {
     #[tokio::test]
     async fn login_rejects_empty_paste_as_missing_code() {
         let oauth = strategy_for("http://127.0.0.1:1/never-called");
-        let interaction = ScriptedInteraction::new(vec![Ok("   ".to_string())]);
+        let interaction = ScriptedInteraction::new(vec![
+            Ok(BROWSER_LOGIN_METHOD.to_string()),
+            Ok("   ".to_string()),
+        ]);
         let err = oauth
             .login(&interaction, &LoginOptions::default())
             .await
@@ -1492,26 +1736,49 @@ mod tests {
         assert_eq!(err.to_string(), "Missing authorization code");
     }
 
+    /// `anthropic.ts:186-194` @v1.1.0+ — `state = parsed.state ?? verifier` and no "Missing OAuth
+    /// state" check (pi removed it in `4df157433`, v0.99.0). A paste whose state is present but
+    /// empty skips the mismatch check (`:187` @v1.1.0, `""` is falsy), keeps `""` through `??`, and
+    /// is exchanged with `state: ""` — in both the `code#` and the `?code=C&state=` spellings.
     #[tokio::test]
-    async fn login_rejects_paste_with_empty_state_as_missing_state() {
-        let oauth = strategy_for("http://127.0.0.1:1/never-called");
-        // `?code=C&state=` — `state` is "" so the mismatch check is skipped (`:279` is falsy) and
-        // `??` keeps "" rather than defaulting, so `:296` fires.
-        let interaction = ScriptedInteraction::new(vec![Ok(
-            "http://localhost:53692/callback?code=C&state=".to_string(),
-        )]);
-        let err = oauth
-            .login(&interaction, &LoginOptions::default())
-            .await
-            .unwrap_err();
-        assert_eq!(err.to_string(), "Missing OAuth state");
+    async fn login_exchanges_a_paste_with_an_empty_state_like_upstream() {
+        for paste in ["C#", "http://localhost:53692/callback?code=C&state="] {
+            let mut token = FakeTokenServer::start(
+                200,
+                r#"{"access_token":"a","refresh_token":"r","expires_in":3600}"#,
+            );
+            let oauth = strategy_for(&token.url);
+            let interaction = ScriptedInteraction::new(vec![
+                Ok(BROWSER_LOGIN_METHOD.to_string()),
+                Ok(paste.to_string()),
+            ]);
+            oauth
+                .login(&interaction, &LoginOptions::default())
+                .await
+                .unwrap();
+            let (_, body) = token.recorded();
+            assert_eq!(
+                body.get("code").and_then(|v| v.as_str()),
+                Some("C"),
+                "{paste}"
+            );
+            assert_eq!(
+                body.get("state").and_then(|v| v.as_str()),
+                Some(""),
+                "{paste}"
+            );
+        }
     }
 
     #[tokio::test]
     async fn login_propagates_prompt_cancellation() {
-        // anthropic.ts:267-270 + :273 — a rejected prompt aborts the whole login.
+        // anthropic.ts:267-270 + :273 — a rejected prompt aborts the whole login. The selector is
+        // answered first so it is the manual prompt, not the selector, that is cancelled here.
         let oauth = strategy_for("http://127.0.0.1:1/never-called");
-        let interaction = ScriptedInteraction::new(vec![Err(OAuthError::Cancelled)]);
+        let interaction = ScriptedInteraction::new(vec![
+            Ok(BROWSER_LOGIN_METHOD.to_string()),
+            Err(OAuthError::Cancelled),
+        ]);
         let err = oauth
             .login(&interaction, &LoginOptions::default())
             .await
@@ -1519,8 +1786,76 @@ mod tests {
         assert_eq!(err.to_string(), "Login cancelled");
     }
 
-    /// The handler's rejection branches answer the browser and keep listening, so a subsequent,
-    /// correct redirect still completes the login — `:127-141` never reach `settleWait`.
+    /// The `manual_code` prompt's own cancel token, as the login handed it to the interaction.
+    fn manual_prompt_cancel(interaction: &ScriptedInteraction) -> CancelToken {
+        interaction
+            .prompts()
+            .into_iter()
+            .find(|p| p.kind == Some(AuthPromptKind::ManualCode))
+            .and_then(|p| p.cancel)
+            .expect("the manual_code prompt carries its own cancel token")
+    }
+
+    /// pi `test/anthropic-oauth.test.ts:177-211` @v1.1.0 — "anthropicOAuth.login resolves
+    /// through the manual_code prompt and aborts it after settling". The paste wins the race
+    /// against the listener, and the prompt's signal is still aborted once the login settles "so
+    /// UIs can dismiss it" (`callback-server.ts:180-182` @v1.1.0 aborts in `finally`, whichever
+    /// side won).
+    #[tokio::test]
+    async fn login_resolves_through_the_manual_prompt_and_aborts_it_after_settling() {
+        let token = FakeTokenServer::start(
+            200,
+            r#"{"access_token":"access","refresh_token":"refresh","expires_in":3600}"#,
+        );
+        let oauth = strategy_for(&token.url);
+        let interaction = ScriptedInteraction::new(vec![
+            Ok(BROWSER_LOGIN_METHOD.to_string()),
+            Ok("the-code".to_string()),
+        ]);
+
+        let credential = within(
+            "the login",
+            oauth.login(&interaction, &LoginOptions::default()),
+        )
+        .await
+        .unwrap();
+
+        match credential {
+            Credential::Oauth { access, .. } => assert_eq!(access, "access"),
+            other => panic!("expected oauth credential, got {other:?}"),
+        }
+        assert!(
+            interaction
+                .events()
+                .iter()
+                .any(|e| matches!(e, AuthEvent::AuthUrl { .. }))
+        );
+        assert!(
+            manual_prompt_cancel(&interaction).is_cancelled(),
+            "the manual prompt's signal is aborted once the login settles"
+        );
+    }
+
+    /// The same `finally` on the failure exit: a rejected paste still aborts its own prompt.
+    #[tokio::test]
+    async fn a_failed_manual_prompt_is_aborted_too() {
+        let oauth = strategy_for("http://127.0.0.1:1/never-called");
+        let interaction = ScriptedInteraction::new(vec![
+            Ok(BROWSER_LOGIN_METHOD.to_string()),
+            Err(OAuthError::Failed("prompt failed".to_string())),
+        ]);
+        let err = oauth
+            .login(&interaction, &LoginOptions::default())
+            .await
+            .unwrap_err();
+        assert_eq!(err.to_string(), "prompt failed");
+        assert!(manual_prompt_cancel(&interaction).is_cancelled());
+    }
+
+    /// PROV-137 — the non-settling branches of `callback-server.ts:85-104` @v1.1.0 answer the
+    /// browser and keep listening, so a subsequent, correct redirect still completes the login.
+    /// The state check comes first, so an `?error=` redirect without the flow's state is a
+    /// mismatch (it cannot end the login), and a bare `?error=` is not truthy.
     #[tokio::test]
     async fn bad_redirects_are_answered_without_ending_the_login() {
         let mut token = FakeTokenServer::start(
@@ -1528,51 +1863,55 @@ mod tests {
             r#"{"access_token":"second-try","refresh_token":"r","expires_in":3600}"#,
         );
         let oauth = strategy_for(&token.url);
-        let interaction = Arc::new(ScriptedInteraction::new(Vec::new()).blocking_when_empty());
+        let interaction = Arc::new(
+            ScriptedInteraction::new(vec![Ok(BROWSER_LOGIN_METHOD.to_string())])
+                .blocking_when_empty(),
+        );
 
         let driver = {
             let interaction = interaction.clone();
             tokio::spawn(async move {
                 let (port, state) = await_auth_url(&interaction).await;
                 tokio::task::spawn_blocking(move || {
-                    // anthropic.ts:126-130
-                    let denied = http_get(port, "/callback?error=access_denied");
-                    // anthropic.ts:133-136
-                    let missing = http_get(port, "/callback?code=only");
-                    // anthropic.ts:138-141
+                    // `callback-server.ts:85-88` @v1.1.0 — no state at all, so even a denial is a
+                    // mismatch.
+                    let stateless_denial = http_get(port, "/callback?error=access_denied");
+                    // `callback-server.ts:85-88` @v1.1.0
+                    let missing_state = http_get(port, "/callback?code=only");
                     let mismatch = http_get(port, "/callback?code=C&state=wrong");
+                    // `callback-server.ts:93-94` @v1.1.0 — `if (error)`: an empty `error` is falsy;
+                    // then `:100-104`.
+                    let missing_code = http_get(port, &format!("/callback?error=&state={state}"));
                     // …and then the good one.
                     let ok = http_get(port, &format!("/callback?code=GOOD&state={state}"));
-                    (denied, missing, mismatch, ok)
+                    (stateless_denial, missing_state, mismatch, missing_code, ok)
                 })
                 .await
                 .unwrap()
             })
         };
 
-        let cred = oauth
-            .login(interaction.as_ref(), &LoginOptions::default())
-            .await
-            .unwrap();
-        let (denied, missing, mismatch, ok) = driver.await.unwrap();
+        let cred = within(
+            "the login",
+            oauth.login(interaction.as_ref(), &LoginOptions::default()),
+        )
+        .await
+        .unwrap();
+        let (stateless_denial, missing_state, mismatch, missing_code, ok) =
+            within("the redirects", driver).await.unwrap();
 
-        assert!(denied.0.starts_with("HTTP/1.1 400"), "{denied:?}");
+        for page in [&stateless_denial, &missing_state, &mismatch] {
+            assert!(page.0.starts_with("HTTP/1.1 400"), "{page:?}");
+            assert!(page.1.contains("State mismatch."), "{page:?}");
+        }
         assert!(
-            denied
-                .1
-                .contains("Anthropic authentication did not complete."),
-            "{denied:?}"
+            missing_code.0.starts_with("HTTP/1.1 400"),
+            "{missing_code:?}"
         );
-        assert!(denied.1.contains("Error: access_denied"), "{denied:?}");
-
-        assert!(missing.0.starts_with("HTTP/1.1 400"), "{missing:?}");
         assert!(
-            missing.1.contains("Missing code or state parameter."),
-            "{missing:?}"
+            missing_code.1.contains("Missing authorization code."),
+            "{missing_code:?}"
         );
-
-        assert!(mismatch.0.starts_with("HTTP/1.1 400"), "{mismatch:?}");
-        assert!(mismatch.1.contains("State mismatch."), "{mismatch:?}");
 
         assert!(ok.0.starts_with("HTTP/1.1 200"), "{ok:?}");
         match cred {
@@ -1583,25 +1922,76 @@ mod tests {
         assert_eq!(body.get("code").and_then(|v| v.as_str()), Some("GOOD"));
     }
 
-    /// PROV-117 — `4df157433`. A loopback listener that cannot bind must NOT abort the login:
-    /// upstream ends the start call with `.catch(() => undefined)` (`anthropic.ts:148`) and
-    /// `waitForCallbackOrManualInput` runs the paste prompt alone, documented as "Without a
-    /// callback server only the manual prompt is used" (`callback-server.ts:150-184`).
-    ///
-    /// The port is genuinely occupied here rather than mocked — asserted by the control below —
-    /// which is upstream's own stated trigger ("when it is taken, fall back to the pasted redirect
-    /// URL", `openai-codex.ts:361`) and equally a sandbox that refuses the listen.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn login_degrades_to_manual_paste_when_the_callback_port_cannot_bind() {
-        // Hold the port for the whole test. Binding `:0` first and reusing the number avoids
-        // racing another test for a hardcoded port.
-        let squatter = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = squatter.local_addr().unwrap().port();
+    /// PROV-137 — `callback-server.ts:93-99` @v1.1.0 (pi `test/oauth-callback-server.test.ts:103-117`
+    /// for the shared server): a redirect carrying the flow's state and an OAuth `error` — the user
+    /// clicked *Deny* — answers 400 "Anthropic authorization failed." with the description and
+    /// **fails the login** with `Anthropic authorization failed: <error_description ?? error>`,
+    /// rather than leaving it waiting on the paste prompt (which never answers here, so only the
+    /// redirect can end the login). No token exchange is attempted.
+    #[tokio::test]
+    async fn a_denied_redirect_fails_the_login() {
+        for (query, description) in [
+            ("error=access_denied", "access_denied"),
+            (
+                "error=access_denied&error_description=User%20denied%20access",
+                "User denied access",
+            ),
+        ] {
+            let token = FakeTokenServer::start(200, r#"{"access_token":"never"}"#);
+            let oauth = strategy_for(&token.url);
+            let interaction = Arc::new(
+                ScriptedInteraction::new(vec![Ok(BROWSER_LOGIN_METHOD.to_string())])
+                    .blocking_when_empty(),
+            );
+            let driver = {
+                let interaction = interaction.clone();
+                let query = query.to_string();
+                tokio::spawn(async move {
+                    let (port, state) = await_auth_url(&interaction).await;
+                    tokio::task::spawn_blocking(move || {
+                        http_get(port, &format!("/callback?{query}&state={state}"))
+                    })
+                    .await
+                    .unwrap()
+                })
+            };
 
-        // Control: this really is unbindable, so the degraded path below is reached because the
-        // listen failed and not for some other reason.
+            let err = within(
+                "the login",
+                oauth.login(interaction.as_ref(), &LoginOptions::default()),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                format!("Anthropic authorization failed: {description}")
+            );
+
+            let (status, page) = within("the redirect", driver).await.unwrap();
+            assert!(status.starts_with("HTTP/1.1 400"), "{status}");
+            assert!(page.contains("Anthropic authorization failed."), "{page}");
+            assert!(page.contains(description), "{page}");
+            assert_eq!(token.hits(), 0, "a denied login must not exchange a code");
+        }
+    }
+
+    /// pi `8d8ae2fc2` (#10571), `test/anthropic-oauth.test.ts:224-240` — "falls back to a free
+    /// callback port when the preferred port cannot be bound". The preferred port is genuinely
+    /// occupied for the whole login (asserted by the control below), so the flow's
+    /// `.catch(() => startCallbackServer(0))` (`anthropic.ts:155` @v1.1.0) must bind an OS-chosen
+    /// port, advertise it on `localhost`, accept the browser redirect there, and exchange the code
+    /// against that same bound redirect URI.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn login_falls_back_to_a_free_port_when_the_preferred_port_cannot_bind() {
+        // `listen(blocker, 53692)` — held until the end of the test. Binding `:0` and configuring
+        // the flow with the number it got avoids racing another test for a hardcoded port.
+        let squatter = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let preferred = squatter.local_addr().unwrap().port();
+
+        // Control: the preferred port really is unbindable, so the listener the login reaches
+        // below exists because of the fallback and not because the first bind succeeded.
         let blocked = CallbackServer::start(
-            CallbackServerConfig::fixed(port, CALLBACK_PATH).with_host("127.0.0.1"),
+            CallbackServerConfig::fixed(preferred, CALLBACK_PATH).with_host("127.0.0.1"),
             AnthropicCallbackHandler {
                 expected_state: "s".to_string(),
             },
@@ -1619,12 +2009,123 @@ mod tests {
 
         let mut token = FakeTokenServer::start(
             200,
+            r#"{"access_token":"fallback-access","refresh_token":"fallback-refresh","expires_in":3600}"#,
+        );
+        let oauth =
+            AnthropicOAuth::with_endpoints(AUTHORIZE_URL, &token.url, "127.0.0.1", preferred);
+        // `loginThroughBrowserCallback()` — the manual prompt never answers, so only a redirect
+        // delivered to the advertised (fallback) port can complete the login.
+        let interaction = Arc::new(
+            ScriptedInteraction::new(vec![Ok(BROWSER_LOGIN_METHOD.to_string())])
+                .blocking_when_empty(),
+        );
+        let driver = {
+            let interaction = interaction.clone();
+            tokio::spawn(async move {
+                let (port, state) = await_auth_url(&interaction).await;
+                tokio::task::spawn_blocking(move || {
+                    http_get(port, &format!("/callback?code=browser-code&state={state}"))
+                })
+                .await
+                .unwrap()
+            })
+        };
+
+        let cred = within(
+            "the login",
+            oauth.login(interaction.as_ref(), &LoginOptions::default()),
+        )
+        .await
+        .unwrap();
+        let (status, _) = within("the redirect", driver).await.unwrap();
+        // `expect(login.pageStatus).toBe(200)`
+        assert!(status.starts_with("HTTP/1.1 200"), "{status}");
+        match cred {
+            Credential::Oauth { access, .. } => assert_eq!(access, "fallback-access"),
+            other => panic!("expected oauth credential, got {other:?}"),
+        }
+
+        // `redirectUri.hostname` is `localhost`, the path is `/callback`, and the port is NOT the
+        // preferred one.
+        let url = auth_url_of(&interaction);
+        let redirect = param_of(&url, "redirect_uri");
+        let port: u16 = redirect
+            .strip_prefix("http://localhost:")
+            .and_then(|rest| rest.strip_suffix(CALLBACK_PATH))
+            .and_then(|p| p.parse().ok())
+            .unwrap_or_else(|| panic!("not a localhost callback URI: {redirect}"));
+        assert_ne!(
+            port, preferred,
+            "the occupied preferred port was advertised"
+        );
+        assert_ne!(port, 0);
+
+        // `expect(login.exchangedRedirectUri).toBe(login.redirectUri)` (`:194` @v1.1.0), and the
+        // paste prompt names the same bound URI (`:179` @v1.1.0).
+        let (_, body) = token.recorded();
+        assert_eq!(
+            body.get("redirect_uri").and_then(|v| v.as_str()),
+            Some(redirect.as_str())
+        );
+        assert_eq!(
+            body.get("code").and_then(|v| v.as_str()),
+            Some("browser-code")
+        );
+        let prompts = interaction.prompts();
+        let prompt = prompts.get(1).unwrap();
+        assert_eq!(prompt.message, MANUAL_PROMPT_MESSAGE);
+        assert_eq!(prompt.placeholder.as_deref(), Some(redirect.as_str()));
+
+        drop(squatter);
+    }
+
+    /// PROV-117 — `4df157433`, and the last link of `8d8ae2fc2`'s chain: when NEITHER the
+    /// preferred port nor an OS-chosen one can be bound, the final `.catch(() => undefined)`
+    /// (`anthropic.ts:156` @v1.1.0) leaves no listener and `waitForCallbackOrManualInput` runs the
+    /// paste prompt alone — "Without a callback server only the manual prompt is used"
+    /// (`callback-server.ts:150-183` @v1.1.0). The login must still complete.
+    ///
+    /// Both binds fail for real rather than being mocked: the bind host is `192.0.2.117`, a
+    /// TEST-NET-1 address (RFC 5737) that is never assigned to a local interface, so every port —
+    /// fixed or `0` — fails with `EADDRNOTAVAIL` (the control below asserts it). That stands in
+    /// for a sandbox that refuses the loopback listen outright. No other test binds this host,
+    /// so `callback::bind_attempts` shows exactly this login's two attempts, in
+    /// upstream's order.
+    ///
+    /// Host assumption: the kernel refuses to bind an address no interface carries — Linux's
+    /// default `net.ipv4.ip_nonlocal_bind=0`. A host with `ip_nonlocal_bind=1` (some container and
+    /// HA setups) lets the control bind succeed, and the control then fails loudly saying so,
+    /// rather than this test passing for the wrong reason.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn login_degrades_to_manual_paste_when_no_callback_port_can_bind() {
+        const UNBINDABLE: &str = "192.0.2.117";
+        for port in [CALLBACK_PORT, 0] {
+            let blocked = CallbackServer::start(
+                CallbackServerConfig::fixed(port, CALLBACK_PATH).with_host(UNBINDABLE),
+                AnthropicCallbackHandler {
+                    expected_state: "s".to_string(),
+                },
+            )
+            .await;
+            assert!(
+                matches!(blocked, Err(OAuthError::Listen { .. })),
+                "{UNBINDABLE}:{port} must fail to bind; this host allows non-local binds \
+                 (net.ipv4.ip_nonlocal_bind=1?), which this test cannot run under"
+            );
+        }
+        let before = bind_attempts::on_host(UNBINDABLE).len();
+
+        let mut token = FakeTokenServer::start(
+            200,
             r#"{"access_token":"degraded-access","refresh_token":"degraded-refresh","expires_in":3600}"#,
         );
-        let oauth = AnthropicOAuth::with_endpoints(AUTHORIZE_URL, &token.url, "127.0.0.1", port);
-        let interaction = ScriptedInteraction::new(vec![Ok("PASTED_CODE".to_string())]);
+        let oauth =
+            AnthropicOAuth::with_endpoints(AUTHORIZE_URL, &token.url, UNBINDABLE, CALLBACK_PORT);
+        let interaction = ScriptedInteraction::new(vec![
+            Ok(BROWSER_LOGIN_METHOD.to_string()),
+            Ok("PASTED_CODE".to_string()),
+        ]);
 
-        // At HEAD this is `Err(OAuthError::Listen)`; upstream completes the login.
         let cred = oauth
             .login(&interaction, &LoginOptions::default())
             .await
@@ -1639,37 +2140,39 @@ mod tests {
             other => panic!("expected oauth credential, got {other:?}"),
         }
 
-        // The authorize URL still advertises the pre-registered redirect, read from the constant
-        // rather than from a listener that does not exist (`:143` uses `REDIRECT_URI`), and the
-        // exchange reuses the same value (`:298`).
+        // The preferred port, then `0`, then nothing (`:154-156` @v1.1.0).
+        assert_eq!(
+            bind_attempts::on_host(UNBINDABLE)[before..],
+            [
+                format!("{UNBINDABLE}:{CALLBACK_PORT}"),
+                format!("{UNBINDABLE}:0")
+            ]
+        );
+
+        // `callback?.redirectUri ?? REDIRECT_URI` (`:157` @v1.1.0) — with no listener the authorize
+        // URL, the paste prompt and the exchange all name upstream's constant, verbatim.
         let url = auth_url_of(&interaction);
-        let expected = format!("http://{ADVERTISE_HOST}:{port}{CALLBACK_PATH}");
-        assert_eq!(param_of(&url, "redirect_uri"), expected);
+        assert_eq!(param_of(&url, "redirect_uri"), REDIRECT_URI);
         let (_, body) = token.recorded();
         assert_eq!(
             body.get("redirect_uri").and_then(|v| v.as_str()),
-            Some(expected.as_str())
+            Some(REDIRECT_URI)
         );
         assert_eq!(
             body.get("code").and_then(|v| v.as_str()),
             Some("PASTED_CODE")
         );
-
-        // The paste prompt was still offered, with that same redirect as its placeholder
-        // (`:256-261`).
         let prompts = interaction.prompts();
-        let prompt = prompts.first().unwrap();
+        let prompt = prompts.get(1).unwrap();
         assert_eq!(prompt.message, MANUAL_PROMPT_MESSAGE);
-        assert_eq!(prompt.placeholder.as_deref(), Some(expected.as_str()));
-
-        drop(squatter);
+        assert_eq!(prompt.placeholder.as_deref(), Some(REDIRECT_URI));
     }
 
-    /// PROV-117's companion invariant: when the listener DOES bind, the URI it reports and the one
-    /// [`AnthropicOAuth::redirect_uri`] composes are the same string — so reading the constant on
-    /// the degraded path is not a second, divergent spelling of the redirect. Upstream has only the
-    /// constant (`anthropic.ts:35`); cyrup keeps the listener's value for the test-only ephemeral
-    /// bind, and this pins that the two agree for any fixed port, the production 53692 included.
+    /// The listener's own URI and [`AnthropicOAuth::redirect_uri`] (the no-listener fallback) are
+    /// composed the same way — advertise host, port, path — so for any port the bound and the
+    /// unbound spellings agree, and the production composition is upstream's `REDIRECT_URI`
+    /// (`anthropic.ts:22` @v1.1.0) verbatim. The port comes from an ephemeral bind the server still
+    /// holds, so nothing is released and re-bound in between.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn redirect_uri_matches_the_bound_listener() {
         assert_eq!(
@@ -1678,14 +2181,8 @@ mod tests {
             "the production composition is upstream's constant verbatim"
         );
 
-        // A free fixed port: take one, learn its number, release it, then let the flow bind it.
-        let port = {
-            let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            probe.local_addr().unwrap().port()
-        };
-        let oauth = AnthropicOAuth::with_endpoints(AUTHORIZE_URL, TOKEN_URL, "127.0.0.1", port);
         let server = CallbackServer::start(
-            CallbackServerConfig::fixed(port, CALLBACK_PATH)
+            CallbackServerConfig::ephemeral(CALLBACK_PATH)
                 .with_host("127.0.0.1")
                 .advertising(ADVERTISE_HOST),
             AnthropicCallbackHandler {
@@ -1694,7 +2191,324 @@ mod tests {
         )
         .await
         .unwrap();
+        let oauth =
+            AnthropicOAuth::with_endpoints(AUTHORIZE_URL, TOKEN_URL, "127.0.0.1", server.port());
         assert_eq!(server.redirect_uri(), oauth.redirect_uri());
         server.close();
+    }
+
+    // -- PROV-120: method selector + copy-code login, anthropic.ts:200-235 / :282-299 @v1.1.0 --
+
+    /// pi `test/anthropic-oauth.test.ts:121-129` and `:133-143` — the selector is the first
+    /// prompt, with upstream's message, ids, labels and order; cancelling it ends the login before
+    /// either flow starts.
+    #[tokio::test]
+    async fn login_offers_browser_first_then_copy_code() {
+        let oauth = strategy_for("http://127.0.0.1:1/never-called");
+        let interaction = ScriptedInteraction::new(vec![Err(OAuthError::Cancelled)]);
+        let err = oauth
+            .login(&interaction, &LoginOptions::default())
+            .await
+            .unwrap_err();
+        assert_eq!(err.to_string(), "Login cancelled");
+
+        let prompts = interaction.prompts();
+        assert_eq!(
+            prompts.len(),
+            1,
+            "nothing is prompted after a cancelled select"
+        );
+        assert_eq!(prompts[0].kind, Some(AuthPromptKind::Select));
+        assert_eq!(prompts[0].message, "Select Anthropic login method:");
+        assert_eq!(
+            prompts[0].options,
+            vec![
+                AuthSelectOption {
+                    id: "browser".to_string(),
+                    label: "Browser login (default)".to_string(),
+                    description: None,
+                },
+                AuthSelectOption {
+                    id: "copy_code".to_string(),
+                    label: "Copy code login (headless)".to_string(),
+                    description: None,
+                },
+            ]
+        );
+        assert!(
+            interaction.events().is_empty(),
+            "no authorize URL was shown"
+        );
+    }
+
+    /// `anthropic.ts:295-297` @v1.1.0.
+    #[tokio::test]
+    async fn login_rejects_an_unknown_method() {
+        let oauth = strategy_for("http://127.0.0.1:1/never-called");
+        let interaction = ScriptedInteraction::new(vec![Ok("carrier-pigeon".to_string())]);
+        let err = oauth
+            .login(&interaction, &LoginOptions::default())
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Unknown Anthropic login method: carrier-pigeon"
+        );
+        assert_eq!(interaction.prompts().len(), 1);
+        assert!(interaction.events().is_empty());
+    }
+
+    /// Picks `copy_code`, then pastes what Anthropic's hosted page would show — built from the
+    /// `auth_url` event's own state by `paste`.
+    struct CopyCodePaste {
+        paste: fn(&str) -> String,
+        state: Mutex<Option<String>>,
+        prompts: Mutex<Vec<AuthPrompt>>,
+        events: Mutex<Vec<AuthEvent>>,
+    }
+
+    impl CopyCodePaste {
+        fn new(paste: fn(&str) -> String) -> Self {
+            CopyCodePaste {
+                paste,
+                state: Mutex::new(None),
+                prompts: Mutex::new(Vec::new()),
+                events: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AuthInteraction for CopyCodePaste {
+        async fn prompt(&self, prompt: AuthPrompt) -> Result<String, OAuthError> {
+            let kind = prompt.kind;
+            self.prompts.lock().unwrap().push(prompt);
+            if kind == Some(AuthPromptKind::Select) {
+                return Ok(COPY_CODE_LOGIN_METHOD.to_string());
+            }
+            let state = self.state.lock().unwrap().clone();
+            match state {
+                Some(state) => Ok((self.paste)(&state)),
+                None => Err(OAuthError::Failed("no auth_url seen".to_string())),
+            }
+        }
+        fn notify(&self, event: AuthEvent) {
+            if let AuthEvent::AuthUrl { url, .. } = &event {
+                *self.state.lock().unwrap() = Some(param_of(url, "state"));
+            }
+            self.events.lock().unwrap().push(event);
+        }
+    }
+
+    /// The whole copy-code login — `anthropic.ts:200-235` @v1.1.0, pi
+    /// `test/anthropic-oauth.test.ts:81-131`.
+    ///
+    /// "Starts no listener" is proven from the callback server's own record of start calls
+    /// (`callback::bind_attempts`), not by probing a port. A probe is racy whichever way it is
+    /// built: bind-release-rebind of a "free" port can lose it to a parallel test; and holding the
+    /// configured port for the whole login proves nothing since `8d8ae2fc2`, because a flow that
+    /// did try to listen would just fall back to an OS-chosen port nobody is watching. The record
+    /// sees every attempt — preferred port, fallback, or a bind that failed and was swallowed —
+    /// and is scoped to a bind host (`192.0.2.120`, TEST-NET-1) that no other test uses, so it is
+    /// deterministic under parallel test execution. The control at the end shows the record does
+    /// see a start on that host, so the empty result is not vacuous.
+    #[tokio::test]
+    async fn copy_code_login_exchanges_against_the_copy_code_redirect() {
+        const SENTINEL_HOST: &str = "192.0.2.120";
+        let mut token = FakeTokenServer::start(
+            200,
+            r#"{"access_token":"copied-access","refresh_token":"copied-refresh","expires_in":3600}"#,
+        );
+        let oauth =
+            AnthropicOAuth::with_endpoints(AUTHORIZE_URL, &token.url, SENTINEL_HOST, CALLBACK_PORT);
+        let interaction = CopyCodePaste::new(|state| format!("copied-code#{state}"));
+
+        let cred = oauth
+            .login(&interaction, &LoginOptions::default())
+            .await
+            .unwrap();
+        match cred {
+            Credential::Oauth {
+                access, refresh, ..
+            } => {
+                assert_eq!(access, "copied-access");
+                assert_eq!(refresh, "copied-refresh");
+            }
+            other => panic!("expected oauth credential, got {other:?}"),
+        }
+
+        // No callback listener: not on the preferred port, not on a fallback, not even a failed
+        // attempt.
+        assert_eq!(
+            bind_attempts::on_host(SENTINEL_HOST),
+            Vec::<String>::new(),
+            "the copy-code login must not start a callback listener"
+        );
+
+        // `:215` then `:227` @v1.1.0 — the two notifications, in order.
+        let events = interaction.events.lock().unwrap().clone();
+        assert_eq!(events.len(), 2, "{events:?}");
+        let url = match &events[0] {
+            AuthEvent::AuthUrl { url, instructions } => {
+                assert_eq!(
+                    instructions.as_deref(),
+                    Some(
+                        "Complete login in your browser, then copy the code Anthropic shows and paste it here."
+                    )
+                );
+                url.clone()
+            }
+            other => panic!("expected auth_url first, got {other:?}"),
+        };
+        assert_eq!(
+            events[1],
+            AuthEvent::Progress {
+                message: "Exchanging authorization code for tokens...".to_string()
+            }
+        );
+        // `:202-211` @v1.1.0 — the authorize URL carries the copy-code redirect.
+        assert!(url.starts_with(&format!("{AUTHORIZE_URL}?")), "{url}");
+        assert_eq!(param_of(&url, "redirect_uri"), COPY_CODE_REDIRECT_URI);
+        let state = param_of(&url, "state");
+
+        // `:218-223` @v1.1.0 — one paste prompt after the selector.
+        let prompts = interaction.prompts.lock().unwrap().clone();
+        assert_eq!(prompts.len(), 2);
+        assert_eq!(prompts[1].kind, Some(AuthPromptKind::ManualCode));
+        assert_eq!(
+            prompts[1].message,
+            "Paste the code Anthropic shows after you sign in:"
+        );
+        assert_eq!(prompts[1].placeholder.as_deref(), Some("code#state"));
+
+        // `:228-234` @v1.1.0 — the exchange, against the copy-code redirect.
+        let (_, body) = token.recorded();
+        assert_eq!(
+            body.get("redirect_uri").and_then(|v| v.as_str()),
+            Some(COPY_CODE_REDIRECT_URI)
+        );
+        assert_eq!(
+            body.get("code").and_then(|v| v.as_str()),
+            Some("copied-code")
+        );
+        assert_eq!(
+            body.get("state").and_then(|v| v.as_str()),
+            Some(state.as_str())
+        );
+        assert_eq!(
+            body.get("code_verifier").and_then(|v| v.as_str()),
+            Some(state.as_str())
+        );
+
+        // Control: a start on the sentinel host IS recorded, so the empty record above means
+        // "never called", not "not observed". The record is written before the bind, so this
+        // holds whether or not the host lets an unassigned address bind (TEST-NET-1 normally
+        // fails with `EADDRNOTAVAIL`; `net.ipv4.ip_nonlocal_bind=1` lets it succeed).
+        let control = CallbackServer::start(
+            CallbackServerConfig::fixed(CALLBACK_PORT, CALLBACK_PATH).with_host(SENTINEL_HOST),
+            AnthropicCallbackHandler {
+                expected_state: "s".to_string(),
+            },
+        )
+        .await;
+        drop(control);
+        assert_eq!(
+            bind_attempts::on_host(SENTINEL_HOST),
+            vec![format!("{SENTINEL_HOST}:{CALLBACK_PORT}")]
+        );
+    }
+
+    /// `anthropic.ts:218-223` @v1.1.0 — the paste prompt carries the login-wide cancel
+    /// (`signal: interaction.signal`), and a rejected paste aborts the login.
+    #[tokio::test]
+    async fn copy_code_login_propagates_prompt_cancellation() {
+        let oauth = strategy_for("http://127.0.0.1:1/never-called");
+        let cancel = CancelToken::new();
+        let interaction = ScriptedInteraction::new(vec![
+            Ok(COPY_CODE_LOGIN_METHOD.to_string()),
+            Err(OAuthError::Cancelled),
+        ])
+        .with_cancel(cancel);
+        let err = oauth
+            .login(&interaction, &LoginOptions::default())
+            .await
+            .unwrap_err();
+        assert_eq!(err.to_string(), "Login cancelled");
+        let prompts = interaction.prompts();
+        assert_eq!(prompts.len(), 2);
+        assert!(
+            prompts[1].cancel.is_some(),
+            "the paste prompt must carry the cancel token"
+        );
+    }
+
+    /// `anthropic.ts:225` @v1.1.0.
+    #[tokio::test]
+    async fn copy_code_login_rejects_state_mismatch() {
+        let oauth = strategy_for("http://127.0.0.1:1/never-called");
+        let interaction = ScriptedInteraction::new(vec![
+            Ok(COPY_CODE_LOGIN_METHOD.to_string()),
+            Ok("C#not-the-verifier".to_string()),
+        ]);
+        let err = oauth
+            .login(&interaction, &LoginOptions::default())
+            .await
+            .unwrap_err();
+        assert_eq!(err.to_string(), "OAuth state mismatch");
+        assert_eq!(
+            param_of(&auth_url_of(&interaction), "redirect_uri"),
+            COPY_CODE_REDIRECT_URI
+        );
+    }
+
+    /// `anthropic.ts:226` @v1.1.0.
+    #[tokio::test]
+    async fn copy_code_login_rejects_empty_paste_as_missing_code() {
+        let oauth = strategy_for("http://127.0.0.1:1/never-called");
+        let interaction = ScriptedInteraction::new(vec![
+            Ok(COPY_CODE_LOGIN_METHOD.to_string()),
+            Ok("   ".to_string()),
+        ]);
+        let err = oauth
+            .login(&interaction, &LoginOptions::default())
+            .await
+            .unwrap_err();
+        assert_eq!(err.to_string(), "Missing authorization code");
+    }
+
+    /// `anthropic.ts:228-234` @v1.1.0 — `parsed.state ?? verifier`, with no "Missing OAuth state"
+    /// check (upstream dropped it from both flows in `4df157433`): a bare code exchanges with the
+    /// verifier as state, and `code#` sends `""` — as the browser flow does too
+    /// (`login_exchanges_a_paste_with_an_empty_state_like_upstream`).
+    #[tokio::test]
+    async fn copy_code_login_defaults_state_like_upstream() {
+        for (paste, expect_empty_state) in [("BARE", false), ("BARE#", true)] {
+            let mut token = FakeTokenServer::start(
+                200,
+                r#"{"access_token":"a","refresh_token":"r","expires_in":3600}"#,
+            );
+            let oauth = strategy_for(&token.url);
+            let interaction = ScriptedInteraction::new(vec![
+                Ok(COPY_CODE_LOGIN_METHOD.to_string()),
+                Ok(paste.to_string()),
+            ]);
+            oauth
+                .login(&interaction, &LoginOptions::default())
+                .await
+                .unwrap();
+            let (_, body) = token.recorded();
+            let verifier = param_of(&auth_url_of(&interaction), "state");
+            let expected = if expect_empty_state {
+                ""
+            } else {
+                verifier.as_str()
+            };
+            assert_eq!(body.get("code").and_then(|v| v.as_str()), Some("BARE"));
+            assert_eq!(
+                body.get("state").and_then(|v| v.as_str()),
+                Some(expected),
+                "{paste}"
+            );
+        }
     }
 }
