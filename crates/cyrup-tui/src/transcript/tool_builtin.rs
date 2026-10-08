@@ -1,3 +1,4 @@
+use super::tool_args::js_number;
 use super::*;
 
 /// `read`'s `renderCall` — the header `read <path>:<range>` (`read.ts:329-345`).
@@ -619,15 +620,253 @@ pub(super) fn render_extension_result(result: &str, theme: &UiTheme, out: &mut V
 /// (`tool-execution.ts:9`).
 const FALLBACK_PREVIEW_LINES: usize = 10;
 
-/// `createCallFallback()` (`tool-execution.ts:137-139`) — a tool that HAS a definition but no
-/// `renderCall` shows `new Text(theme.fg("toolTitle", theme.bold(this.toolName)))` and nothing
-/// else. No arguments: that is the whole difference from [`render_generic`], and it is why an
-/// MCP-proxied tool no longer commits its entire argument JSON to scrollback.
+/// `COLLAPSED_ARGS_CHARS` (`core/tools/render-utils.ts:71` @ce950d78f) — the collapsed argument preview's
+/// budget, in UTF-16 code units (JS `.length` / `.slice`), not in cells.
+const COLLAPSED_ARGS_CHARS: usize = 100;
+
+/// `createCallFallback()` (`components/tool-execution.ts:142-144` @ce950d78f) — a tool that HAS
+/// a definition but no `renderCall` shows `formatToolCallWithArgs(this.toolName, this.args,
+/// theme, this.expanded)`: the bold name followed by its arguments, bounded when collapsed. See
+/// [`format_tool_call_with_args`].
 ///
-/// (`tool_title_style` already carries `BOLD`, so it is both halves of upstream's
-/// `fg("toolTitle", bold(...))`.)
-pub(super) fn render_call_fallback(run: &ToolRun, theme: &UiTheme, out: &mut Vec<Line<'static>>) {
-    out.push(Line::styled(run.name.clone(), theme.tool_title_style()));
+/// This used to be the bold name alone, upstream's pre-`5257d0d5f` shape, which left a defined
+/// tool with no `renderCall` (`tool_search`, a non-MCP extension tool, or an MCP call before
+/// cyrup-mcp's own call renderer answers) with its arguments invisible (`TUI-138`). The preview is
+/// bounded when collapsed. [`render_generic`] is a different fallback, for a tool with no
+/// definition at all.
+pub(super) fn render_call_fallback(
+    run: &ToolRun,
+    expanded: bool,
+    theme: &UiTheme,
+    out: &mut Vec<Line<'static>>,
+) {
+    format_tool_call_with_args(&run.name, &run.args, expanded, theme, out);
+}
+
+/// Port of `formatToolCallWithArgs(title, args, theme, expanded)`
+/// (`core/tools/render-utils.ts:78-97` @ce950d78f), the generic call header pi also hands its MCP
+/// renderers (`extensions/mcp/tools.ts:302`).
+///
+/// - Header: `theme.fg("toolTitle", theme.bold(title))` — [`UiTheme::tool_title_style`] already
+///   carries `BOLD`. `args == null` returns it alone (`:80`).
+/// - Entries: `Object.entries(args)` for a plain object, else the single `["args", args]` (an
+///   array or a scalar, `:81-84`); none returns the header alone (`:85`). Key order is insertion
+///   order on both sides: the workspace enables `serde_json/preserve_order` (root `Cargo.toml`), so
+///   [`serde_json::Map`] iterates in document order, and [`js_object_entries`] applies the one
+///   reordering `Object.entries` (and `JSON.stringify`) adds: array-index keys first, ascending.
+/// - Collapsed (`:93-96`): `key=${JSON.stringify(value)}` joined by spaces, cut to
+///   [`COLLAPSED_ARGS_CHARS`] with a `...` tail, appended after a space in `muted` — one `Line`
+///   holding the title span and the muted preview span.
+/// - Expanded (`:86-92`): the header line, then `  key: value` per entry — the raw text for a
+///   string, `JSON.stringify(value, null, 2)` otherwise — with tabs replaced, `\r` removed and
+///   continuation lines indented four spaces, every line `muted`.
+///
+/// Upstream builds ONE string and `Text` splits it on `\n` and replaces tabs
+/// (`tui/src/components/text.ts:66`); cyrup builds the same string and splits it the same way, so
+/// a raw key that holds a newline breaks the line in both, and each row gets the
+/// [`normalize_terminal_output`] pass pi's renderer applies.
+pub(super) fn format_tool_call_with_args(
+    title: &str,
+    args: &Value,
+    expanded: bool,
+    theme: &UiTheme,
+    out: &mut Vec<Line<'static>>,
+) {
+    let header = Span::styled(title.to_owned(), theme.tool_title_style());
+    let entries: Vec<(&str, &Value)> = match args {
+        Value::Null => Vec::new(),
+        Value::Object(map) => js_object_entries(map),
+        other => vec![("args", other)],
+    };
+    if entries.is_empty() {
+        out.push(Line::from(header));
+        return;
+    }
+    let muted = theme.muted_style();
+    let muted_line = |text: &str| -> Line<'static> {
+        Line::styled(
+            normalize_terminal_output(&replace_tabs(text)).into_owned(),
+            muted,
+        )
+    };
+    if expanded {
+        let block = entries
+            .iter()
+            .map(|(key, value)| {
+                let text = match value {
+                    Value::String(s) => s.clone(),
+                    other => js_json_stringify(other, true),
+                };
+                let text = replace_tabs(&text).replace('\r', "");
+                format!(
+                    "  {key}: {}",
+                    text.split('\n').collect::<Vec<_>>().join("\n    ")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        out.push(Line::from(header));
+        out.extend(block.split('\n').map(muted_line));
+        return;
+    }
+    let pairs = entries
+        .iter()
+        .map(|(key, value)| format!("{key}={}", js_json_stringify(value, false)))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let preview = truncate_utf16_preview(&pairs, COLLAPSED_ARGS_CHARS);
+    let mut rows = preview.split('\n');
+    let first = rows.next().unwrap_or_default();
+    out.push(Line::from(vec![
+        header,
+        Span::styled(" ", muted),
+        Span::styled(
+            normalize_terminal_output(&replace_tabs(first)).into_owned(),
+            muted,
+        ),
+    ]));
+    out.extend(rows.map(muted_line));
+}
+
+/// `pairs.length > max ? `${pairs.slice(0, max - 3)}...` : pairs` (`render-utils.ts:94`), counted
+/// in UTF-16 code units as JS counts them, and never splitting a `char` (no byte slicing).
+///
+/// When the cut lands between the two halves of a surrogate pair, JS keeps the lone high
+/// surrogate, which Node writes to the terminal as U+FFFD; that replacement character is emitted
+/// here in its place, so the preview is `max` code units long exactly as upstream's is.
+pub(super) fn truncate_utf16_preview(text: &str, max: usize) -> String {
+    if text.encode_utf16().count() <= max {
+        return text.to_owned();
+    }
+    let budget = max.saturating_sub(3);
+    let mut used = 0usize;
+    let mut kept = String::with_capacity(text.len().min(budget * 4) + 3);
+    for c in text.chars() {
+        let units = c.len_utf16();
+        if used + units > budget {
+            if used < budget {
+                kept.push('\u{fffd}');
+            }
+            break;
+        }
+        used += units;
+        kept.push(c);
+    }
+    kept.push_str("...");
+    kept
+}
+
+/// `JSON.stringify(value)` (`pretty == false`) or `JSON.stringify(value, null, 2)` (`pretty`) for a
+/// JSON value.
+///
+/// Not `serde_json::to_string{,_pretty}` because numbers differ: serde writes the float `1` as
+/// `1.0` and uses its own exponent bands, where JS writes `String(n)` (`1`, `1e+21`), so numbers go
+/// through [`js_number`] (an integer beyond 2^53 prints as the nearest double, as `JSON.parse` left
+/// it). Strings and keys use serde's escaper, which matches `JSON.stringify` for a valid string:
+/// `"`, `\` and the C0 controls only, with the `\b \t \n \f \r` short forms and lowercase `\u00xx`.
+/// The pretty layout is the same in both: two-space indent, `"key": value`, `[]` / `{}` for empty.
+pub(super) fn js_json_stringify(value: &Value, pretty: bool) -> String {
+    let mut out = String::new();
+    write_js_json(value, pretty, 0, &mut out);
+    out
+}
+
+fn write_js_json(value: &Value, pretty: bool, depth: usize, out: &mut String) {
+    match value {
+        Value::Null => out.push_str("null"),
+        Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+        Value::Number(n) => out.push_str(&n.as_f64().map_or_else(|| n.to_string(), js_number)),
+        Value::String(s) => push_js_string(s, out),
+        Value::Array(items) => {
+            if items.is_empty() {
+                out.push_str("[]");
+                return;
+            }
+            out.push('[');
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                push_js_json_indent(pretty, depth + 1, out);
+                write_js_json(item, pretty, depth + 1, out);
+            }
+            push_js_json_indent(pretty, depth, out);
+            out.push(']');
+        }
+        Value::Object(map) => {
+            if map.is_empty() {
+                out.push_str("{}");
+                return;
+            }
+            out.push('{');
+            for (i, (key, item)) in js_object_entries(map).into_iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                push_js_json_indent(pretty, depth + 1, out);
+                push_js_string(key, out);
+                out.push(':');
+                if pretty {
+                    out.push(' ');
+                }
+                write_js_json(item, pretty, depth + 1, out);
+            }
+            push_js_json_indent(pretty, depth, out);
+            out.push('}');
+        }
+    }
+}
+
+/// A JS object's own string-keyed property order (`OrdinaryOwnPropertyKeys`, which both
+/// `Object.entries` and `JSON.stringify` follow): array-index keys — the canonical decimal form of
+/// an integer up to `2^32 - 2` — first in ascending numeric order, then every other key in
+/// insertion (document) order.
+pub(super) fn js_object_entries(map: &serde_json::Map<String, Value>) -> Vec<(&str, &Value)> {
+    let mut indexed: Vec<(u32, &str, &Value)> = Vec::new();
+    let mut named: Vec<(&str, &Value)> = Vec::new();
+    for (key, value) in map {
+        match js_array_index(key) {
+            Some(index) => indexed.push((index, key.as_str(), value)),
+            None => named.push((key.as_str(), value)),
+        }
+    }
+    indexed.sort_by_key(|(index, _, _)| *index);
+    indexed
+        .into_iter()
+        .map(|(_, key, value)| (key, value))
+        .chain(named)
+        .collect()
+}
+
+/// `key` as an ECMAScript array index: all ASCII digits, no leading zero unless it is `"0"`, and at
+/// most `2^32 - 2`.
+fn js_array_index(key: &str) -> Option<u32> {
+    if key.is_empty() || !key.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    if key.len() > 1 && key.starts_with('0') {
+        return None;
+    }
+    key.parse::<u32>().ok().filter(|&n| n != u32::MAX)
+}
+
+fn push_js_string(s: &str, out: &mut String) {
+    // Serializing a `&str` cannot fail; the fallback is unreachable but keeps this panic-free.
+    match serde_json::to_string(s) {
+        Ok(quoted) => out.push_str(&quoted),
+        Err(_) => {
+            out.push('"');
+            out.push_str(s);
+            out.push('"');
+        }
+    }
+}
+
+fn push_js_json_indent(pretty: bool, depth: usize, out: &mut String) {
+    if pretty {
+        out.push('\n');
+        out.push_str(&"  ".repeat(depth));
+    }
 }
 
 /// `createResultFallback()` (`tool-execution.ts:141-155`) — a tool that HAS a definition but no

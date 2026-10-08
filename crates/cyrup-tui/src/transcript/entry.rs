@@ -441,7 +441,8 @@ pub struct ToolRun {
     ///   registered a renderer" — that is [`rendered_call`](ToolRun::rendered_call) /
     ///   [`rendered_result`](ToolRun::rendered_result), and a definition with no renderer is the
     ///   normal case for an MCP tool. A defined tool draws through its renderers, falling back
-    ///   per-side to a bold name (`createCallFallback`, `:137-139`) and a ten-line output preview
+    ///   per-side to the bold name plus a bounded argument preview (`createCallFallback`,
+    ///   `:142-144` @ce950d78f, `TUI-138`) and a ten-line output preview
     ///   (`createResultFallback`, `:141-155`); only a tool with NO definition reaches the
     ///   unbounded `formatToolExecution` (`:330-333`) that dumps the full argument JSON.
     /// * `getRenderShell()`, i.e. `toolDefinition.renderShell ?? builtInToolDefinition.renderShell

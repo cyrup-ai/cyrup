@@ -96,8 +96,8 @@ pub(crate) fn tool_block(
             (None, Some(call)) => render_extension_call(&call.text, theme, &mut block),
             (None, None) => match builtin {
                 Some(kind) => render_builtin_call(kind, run, expanded, theme, images, &mut block),
-                // `createCallFallback()` (`:137-139`, selected at `:281-283`).
-                None => render_call_fallback(run, theme, &mut block),
+                // `createCallFallback()` (`:142-144`, selected at `:289` / `:299` @ce950d78f).
+                None => render_call_fallback(run, expanded, theme, &mut block),
             },
         }
         match (&run.live_result, &run.rendered_result) {
