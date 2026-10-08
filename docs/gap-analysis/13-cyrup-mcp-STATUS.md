@@ -449,7 +449,7 @@ Numbering resumes from **`MCP-609`** *(as of the 2026-10-02 pass; now `MCP-616`,
 | `MCP-594` | medium | 13c | `upstream-drift` | **implemented** *(CLOSED 2026-10-04)* | S | the metadata-cache digest pre-image gained two stdio keys | [`13c`](13c-mcp-servers.md) |
 | `MCP-595` | medium | 13c | `upstream-drift` | **implemented** *(CLOSED 2026-10-04)* | S | the seven-day metadata expiry is gone upstream | [`13c`](13c-mcp-servers.md) |
 | `MCP-596` | medium | 13c | `not-ported` | **implemented** *(CLOSED 2026-10-04)* | M | private metadata scope and `discoveryFailed` are unported | [`13c`](13c-mcp-servers.md) |
-| `MCP-597` | low | 13c | `upstream-drift` | **partial** | S | HTTP header validation scope, and the superseded error message | [`13c`](13c-mcp-servers.md) |
+| `MCP-597` | low | 13c | `upstream-drift` | **implemented** *(CLOSED 2026-10-08)* | S | HTTP header validation scope, and the superseded error message | [`13c`](13c-mcp-servers.md) |
 | `MCP-598` | medium | 13a | `upstream-drift` | **implemented** *(CLOSED 2026-10-04)* | M | startup discovery should be per server, and should close what it opened | [`13a`](13a-mcp-activation.md) |
 | `MCP-599` | low | 13a | `not-ported` | **missing** | S | `MCP_RUNTIME_TOOL_CALL_EVENT` | [`13a`](13a-mcp-activation.md) |
 | `MCP-600` | medium | 13e | `parity-bug` | **implemented** *(CLOSED 2026-10-04)* | S | in-flight must be raised before the approval gate, not after it | [`13e`](13e-mcp-tools.md) |

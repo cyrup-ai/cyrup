@@ -2104,11 +2104,10 @@ impl HttpTransportSpec {
 /// # Errors
 ///
 /// [`McpError::Server`] when a header name or value is not representable on the wire.
-/// [`crate::secrets::resolve_http_secrets`] has already validated the command-sourced ones with the
-/// exact upstream sentence (MCP-083, §3.4 step 6); this arm therefore only fires for a *statically
-/// configured* header that upstream would have let through to `fetch` and failed on later — a
-/// **recorded divergence**: cyrup rejects it at transport construction, with a message that does not
-/// falsely blame a command.
+/// [`crate::secrets::resolve_http_secrets`] has already validated every resolved header with
+/// upstream's exact sentence (§3.4 step 6, ungated since MCP-597), so on the
+/// [`HttpTransportSpec::resolve`] path this arm is unreachable; it stays as the guard for a spec
+/// built by hand.
 pub fn build_http_transport_config(
     spec: &HttpTransportSpec,
 ) -> McpResult<StreamableHttpClientTransportConfig> {
@@ -4953,8 +4952,8 @@ impl ConnectionBuilder {
             )));
         };
 
-        // Steps 2–6: `hasCommandHeader`, `resolveCommandSecretsRecord`, `commandBearer`, the bearer
-        // ladder and the `new Headers()` injection guard — all of `crate::secrets`.
+        // Steps 3–6: `resolveCommandSecretsRecord`, `commandBearer`, the bearer ladder and the
+        // per-header `new Headers()` guard (ungated since MCP-597) — all of `crate::secrets`.
         let spec = HttpTransportSpec::resolve(entry, name, server_url.clone(), &self.env)?;
 
         // `server-manager.ts:868-870`: built **once per connect**, above `attempt`, and spread into
@@ -7984,8 +7983,29 @@ done
             .expect_err("a newline cannot go on the wire");
         assert_eq!(
             error.to_string(),
-            "Failed to resolve MCP server \"inject\" HTTP command secret: command returned an invalid header value"
+            "MCP server \"inject\" HTTP header \"x-bad\" has an invalid name or value"
         );
+        assert!(fixture.requests().is_empty(), "nothing was sent");
+    }
+
+    /// MCP-597: a LITERAL header (no `!` anywhere) is refused by the same pre-flight, with the same
+    /// sentence, and its value never reaches the error.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_newline_bearing_literal_header_is_refused_before_anything_is_sent() {
+        let fixture = HttpFixture::start(0).await;
+        let mut entry = http_entry(&fixture.url);
+        entry.headers = Some(record(&[("X-Api-Key", "fake-s3cr3t\nfake-t41l")]));
+
+        let error = builder()
+            .connect_http_client(&request("header", entry))
+            .await
+            .expect_err("a newline cannot go on the wire");
+        let message = error.to_string();
+        assert_eq!(
+            message,
+            "MCP server \"header\" HTTP header \"X-Api-Key\" has an invalid name or value"
+        );
+        assert!(!message.contains("s3cr3t") && !message.contains("t41l"));
         assert!(fixture.requests().is_empty(), "nothing was sent");
     }
 
