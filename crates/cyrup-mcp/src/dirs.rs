@@ -515,6 +515,12 @@ pub struct CachedTool {
     /// registration, not at cache time (MCP-087).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_schema: Option<Value>,
+    /// `outputSchema?: unknown` — the server's JSON Schema for the tool's `structuredContent`
+    /// (`types.ts:801` @ pi-mcp-adapter `2ccf648`), written by [`serialize_tools`] only when the
+    /// server declared one (`metadata-cache.ts:371`). A search-mode direct tool built from the
+    /// cache nests it in its result schema (`MCP-612`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_schema: Option<Value>,
     /// **Cut 2**, retained in the schema. MCP Apps' `ui://` resource for this tool.
     ///
     /// **Never written and never read**: [`serialize_tools`] always writes `None` because MCP Apps is
@@ -918,6 +924,12 @@ pub fn serialize_tools(tools: &[rmcp::model::Tool]) -> Vec<CachedTool> {
                 .as_ref()
                 .map(std::string::ToString::to_string),
             input_schema: Some(Value::Object((*tool.input_schema).clone())),
+            // `...(t.outputSchema !== undefined ? { outputSchema: t.outputSchema } : {})`
+            // (`metadata-cache.ts:371` @ 2ccf648, `MCP-612`).
+            output_schema: tool
+                .output_schema
+                .as_ref()
+                .map(|schema| Value::Object((**schema).clone())),
             ui_resource_uri: None,
             ui_visibility: extract_ui_tool_visibility(
                 tool.meta
