@@ -413,7 +413,8 @@ pub struct ResolvedHttpSecrets {
 /// MCP-084's and the transport assembly is [`crate::runtime::build_http_transport_config`]'s. What
 /// this function owns is every step that can execute a command, in upstream's exact order:
 ///
-/// 2. `hasCommandHeader` — computed from the **raw** header values, before any resolution.
+/// 2. *(gone upstream since `79ad588`)* `hasCommandHeader` existed only to gate step 6; with the
+///    gate removed (MCP-597) it is no longer computed, there or here.
 /// 3. the header record through [`resolve_command_secrets_record`], context
 ///    `` MCP server "{server}" HTTP header "{key}" ``.
 /// 4. `commandBearer` — `definition.bearerToken` starting `!` but **not** `!!`, again raw.
@@ -422,7 +423,7 @@ pub struct ResolvedHttpSecrets {
 ///    [`crate::credentials::resolve_bearer_token`]'s static ladder. Upstream's `if (token)` is a
 ///    **truthiness** test, so a command that could not run is an error (never `""`) and a
 ///    `bearerTokenEnv` pointing at an empty variable sets no header at all.
-/// 6. the injection guard, run only when a command actually sourced one of these values.
+/// 6. the header guard, over **every** resolved header, whether a command sourced it or not.
 ///
 /// # Why step 4 reads the raw `bearerToken` and step 5 can still call the static ladder
 ///
@@ -432,40 +433,40 @@ pub struct ResolvedHttpSecrets {
 /// *output* would execute a `!`-prefixed value that arrived from `bearerTokenEnv` — a shell command
 /// smuggled in through an environment variable, which upstream never executes.
 ///
-/// # The injection guard (step 6)
+/// # The header guard (step 6) — MCP-597
 ///
-/// Upstream validates by constructing `new Headers(headers)` and converts the throw into
-/// `` Failed to resolve MCP server "{server}" HTTP command secret: command returned an invalid
-/// header value ``. Here that is `http::HeaderName`/`HeaderValue`'s `TryFrom`, which rejects the
-/// same CR/LF and control bytes. Two things about it are load-bearing:
+/// Upstream (`server-manager.ts:1664-1671` at pi-mcp-adapter `2ccf648`, from `79ad588`, #770)
+/// constructs `new Headers({ [name]: value })` for each entry of the resolved record, one at a
+/// time, and converts the throw into
+/// `` MCP server "{server}" HTTP header "{name}" has an invalid name or value `` — *"The `Headers`
+/// error quotes the value, which is often a secret."* Here that is `http::HeaderName`/
+/// `HeaderValue`'s `TryFrom`, which rejects the same CR/LF and control bytes. What is
+/// load-bearing:
 ///
-/// * It runs **only** when `hasCommandHeader || commandBearer`, exactly as upstream gates it. A
-///   statically-configured bad header is *not* rejected here — it falls through to
-///   [`crate::runtime::build_http_transport_config`], whose message does not falsely blame a
-///   command.
-/// * The bearer token is validated as the `Bearer {token}` **value** even though the port routes it
-///   through rmcp's `auth_header` rather than the custom-header map. Upstream writes it into
-///   `headers` before the guard, so a newline-bearing token fails pre-flight there; without this
-///   arm it would instead fail inside `reqwest` at first request, long after the connect the user
-///   was watching.
+/// * It is **ungated**. Before `79ad588` the guard ran only when `hasCommandHeader ||
+///   commandBearer`, so a hand-written literal header with a stray newline went through to the
+///   transport and failed there. Every header now fails here, by name.
+/// * The value is never echoed. `http`'s error does not quote it either, so the privacy half of
+///   upstream's fix already held for the Rust API; the sentence carries the name only.
+/// * A **static** bearer is validated as the `Authorization` entry, because upstream assigns
+///   `headers["Authorization"]` before the loop (`:1660`), so its sentence names `"Authorization"`.
+///   The port routes the token through rmcp's `auth_header` rather than the header map, so the
+///   check is made on the `Bearer {token}` value explicitly.
+/// * A **command** bearer is not in upstream's record at all: it goes through
+///   `createBearerCommandFetch` (`:302-321`), whose catch raises
+///   `bearerTokenCommand returned a token that is not a valid header value` on the connect's first
+///   request. The port resolves the command once, here (the per-request TTL half is `MCP-576`), so
+///   it raises the same sentence at the same connect, before anything is sent.
 ///
 /// # Errors
 ///
-/// [`McpError::Other`] with one of [`resolve_command_secret`]'s five sentences, or with the
-/// invalid-header-value sentence above.
+/// [`McpError::Other`] with one of [`resolve_command_secret`]'s five sentences, or with one of the
+/// two header-guard sentences above.
 pub fn resolve_http_secrets(
     entry: &ServerEntry,
     server_name: &str,
     env: &EnvFn,
 ) -> McpResult<ResolvedHttpSecrets> {
-    // Step 2 — the raw values, before resolution, so `!!x` (an escaped literal) never counts.
-    let has_command_header = entry
-        .headers
-        .as_deref()
-        .into_iter()
-        .flatten()
-        .any(|(_, value)| crate::credentials::is_command_secret(value));
-
     // Step 3.
     let mut headers: Vec<(String, String)> =
         resolve_command_secrets_record(entry.headers.as_deref(), |key| {
@@ -510,10 +511,13 @@ pub fn resolve_http_secrets(
         headers.retain(|(name, _)| !name.eq_ignore_ascii_case("authorization"));
     }
 
-    // Step 6.
-    if has_command_header || command_bearer.is_some() {
-        validate_command_sourced_headers(server_name, &headers, bearer_token.as_deref())?;
-    }
+    // Step 6 — every header, not only command-sourced ones (MCP-597).
+    validate_resolved_headers(
+        server_name,
+        &headers,
+        bearer_token.as_deref(),
+        command_bearer.is_some(),
+    )?;
 
     Ok(ResolvedHttpSecrets {
         headers,
@@ -521,29 +525,37 @@ pub fn resolve_http_secrets(
     })
 }
 
-/// `new Headers(headers)` as an injection guard — see [`resolve_http_secrets`] step 6 for why it is
-/// gated and why the bearer value is included.
-fn validate_command_sourced_headers(
+/// The per-header `new Headers({ [name]: value })` loop, `server-manager.ts:1664-1671` at
+/// pi-mcp-adapter `2ccf648` — see [`resolve_http_secrets`] step 6 for the two sentences and why the
+/// bearer is checked separately.
+fn validate_resolved_headers(
     server_name: &str,
     headers: &[(String, String)],
     bearer_token: Option<&str>,
+    command_bearer: bool,
 ) -> McpResult<()> {
-    let invalid = || {
+    // "The Headers error quotes the value, which is often a secret." — so name the header only.
+    let invalid = |name: &str| {
         McpError::other(format!(
-            "Failed to resolve MCP server \"{server_name}\" HTTP command secret: command returned an invalid header value"
+            "MCP server \"{server_name}\" HTTP header \"{name}\" has an invalid name or value"
         ))
     };
     for (name, value) in headers {
         if http::HeaderName::try_from(name.as_str()).is_err()
             || http::HeaderValue::try_from(value.as_str()).is_err()
         {
-            return Err(invalid());
+            return Err(invalid(name));
         }
     }
     if let Some(token) = bearer_token
         && http::HeaderValue::try_from(format!("Bearer {token}")).is_err()
     {
-        return Err(invalid());
+        return Err(if command_bearer {
+            // `createBearerCommandFetch`'s catch, `server-manager.ts:313-318` at `2ccf648`.
+            McpError::other("bearerTokenCommand returned a token that is not a valid header value")
+        } else {
+            invalid("Authorization")
+        });
     }
     Ok(())
 }
@@ -765,15 +777,17 @@ mod tests {
             .to_string();
         assert_eq!(
             err,
-            "Failed to resolve MCP server \"srv\" HTTP command secret: command returned an invalid header value"
+            "MCP server \"srv\" HTTP header \"X-Token\" has an invalid name or value"
         );
     }
 
+    /// The command bearer is not in upstream's header record; `createBearerCommandFetch`'s catch
+    /// (`server-manager.ts:313-318` at pi-mcp-adapter `2ccf648`) owns its sentence.
     #[test]
-    fn a_command_sourced_bearer_carrying_a_newline_fails_the_same_guard() {
+    fn a_command_sourced_bearer_carrying_a_newline_uses_the_bearer_command_sentence() {
         let entry = ServerEntry {
             auth: Some(AuthMode::Named(AuthKind::Bearer)),
-            bearer_token: Some("!printf 'a\\nX-Evil: 1'".to_string()),
+            bearer_token: Some("!printf 'fake-s3cr3t\\nfake-t41l'".to_string()),
             ..http_entry(&[])
         };
         let err = resolve_http_secrets(&entry, "srv", &env_of(&[]))
@@ -781,17 +795,62 @@ mod tests {
             .to_string();
         assert_eq!(
             err,
-            "Failed to resolve MCP server \"srv\" HTTP command secret: command returned an invalid header value"
+            "bearerTokenCommand returned a token that is not a valid header value"
+        );
+        assert!(!err.contains("s3cr3t") && !err.contains("t41l"), "{err}");
+    }
+
+    /// MCP-597: the guard is no longer gated on a command having sourced a value. A hand-written
+    /// literal header with a newline fails at resolve, naming the header and never the value —
+    /// upstream's `server-manager-streamable-http.test.ts:363-385` at `2ccf648`.
+    #[test]
+    fn a_literal_header_carrying_a_newline_fails_at_resolve_naming_only_the_header() {
+        let entry = http_entry(&[("X-Thing", "fake-s3cr3t\nfake-t41l")]);
+        let err = resolve_http_secrets(&entry, "srv", &env_of(&[]))
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            err,
+            "MCP server \"srv\" HTTP header \"X-Thing\" has an invalid name or value"
+        );
+        assert!(!err.contains("s3cr3t") && !err.contains("t41l"), "{err}");
+
+        // A bad NAME fails the same way.
+        let entry = http_entry(&[("X Bad", "ok")]);
+        let err = resolve_http_secrets(&entry, "srv", &env_of(&[]))
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            err,
+            "MCP server \"srv\" HTTP header \"X Bad\" has an invalid name or value"
         );
     }
 
+    /// A statically configured bearer is upstream's `headers["Authorization"]` entry (`:1660`), so
+    /// a malformed one fails the same loop under the name `Authorization`.
     #[test]
-    fn a_statically_configured_bad_header_is_not_blamed_on_a_command() {
-        // No `!` anywhere, so the guard does not run at all and the value survives this stage —
-        // `build_http_transport_config` is what rejects it, with a message that names the header.
-        let entry = http_entry(&[("X-A", "a\r\nX-Evil: 1")]);
+    fn a_static_bearer_carrying_a_newline_fails_as_the_authorization_header() {
+        let entry = ServerEntry {
+            auth: Some(AuthMode::Named(AuthKind::Bearer)),
+            bearer_token: Some("${MCP_TEST_MALFORMED_TOKEN}".to_string()),
+            ..http_entry(&[])
+        };
+        let env = env_of(&[("MCP_TEST_MALFORMED_TOKEN", "fake-s3cr3t\nfake-t41l")]);
+        let err = resolve_http_secrets(&entry, "bearer", &env)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            err,
+            "MCP server \"bearer\" HTTP header \"Authorization\" has an invalid name or value"
+        );
+        assert!(!err.contains("s3cr3t") && !err.contains("t41l"), "{err}");
+    }
+
+    #[test]
+    fn well_formed_literal_headers_still_resolve() {
+        let entry = http_entry(&[("X-A", "a"), ("X-B", "b c")]);
         let resolved = resolve_http_secrets(&entry, "srv", &env_of(&[])).unwrap();
-        assert_eq!(resolved.headers.len(), 1);
+        assert_eq!(resolved.headers.len(), 2);
     }
 
     // --- the non-executing record form (conformance C6) -----------------------------------------

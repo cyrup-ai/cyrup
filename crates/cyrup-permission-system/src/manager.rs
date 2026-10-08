@@ -655,7 +655,13 @@ fn read_configured_mcp_server_names(path: &Path) -> Vec<String> {
     let Ok(text) = std::fs::read_to_string(path) else {
         return Vec::new();
     };
-    let Ok(value) = jsonc::parse(&text) else {
+    // [CYRUP-DELTA] One leading UTF-8 BOM is dropped before the parse, as `cyrup-mcp` drops it for
+    // this same file (`config::parse_json_config`, MCP-590; pi-mcp-adapter `utils.ts:9-15` @
+    // `2ccf648`). Upstream's permission reader does not strip it, but there the adapter reads its
+    // own `mcp-adapter.json`; here both read `mcp.json`, and a BOM the adapter accepted but this
+    // reader rejected would expose servers whose permission targets are never derived.
+    let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
+    let Ok(value) = jsonc::parse(text) else {
         return Vec::new();
     };
     let root = to_record(&value);
@@ -1257,6 +1263,21 @@ mod tests {
             global_mcp_config_path: dir.join("mcp.json"),
             mcp_server_names_override: Some(Vec::new()),
         })
+    }
+
+    #[test]
+    fn a_bom_prefixed_mcp_json_names_the_same_servers_the_adapter_loads() {
+        // MCP-590: `cyrup-mcp` strips one leading BOM from this file; so must the gate.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mcp.json");
+        write(
+            &path,
+            "\u{feff}{\"mcpServers\": {\"github\": {\"command\": \"gh\"}}}",
+        );
+        assert_eq!(
+            read_configured_mcp_server_names(&path),
+            vec!["github".to_string()]
+        );
     }
 
     #[test]

@@ -440,16 +440,16 @@ Numbering resumes from **`MCP-609`** *(as of the 2026-10-02 pass; now `MCP-616`,
 | id | sev | § | kind | status | eff | title | body |
 |---|---|---|---|---|---|---|---|
 | `MCP-587` | low | 13 | `tooling` | **not-applicable** | S | which upstream to diff area 13 against, from v5.0.0 onward | [`13`](13-cyrup-mcp.md) |
-| `MCP-588` | low | 13b | `upstream-drift` | **partial** | S | the adapter config file rename, and why cyrup does not follow it | [`13b`](13b-mcp-config.md) |
+| `MCP-588` | low | 13b | `upstream-drift` | **implemented** *(CLOSED 2026-10-08)* | S | the adapter config file rename, and why cyrup does not follow it | [`13b`](13b-mcp-config.md) |
 | `MCP-589` | medium | 13b | `upstream-drift` | **implemented** *(CLOSED 2026-10-04)* | S | an unparseable config is still silently clobbered by any `/mcp` write | [`13b`](13b-mcp-config.md) |
-| `MCP-590` | low | 13b | `upstream-drift` | **missing** | S | a UTF-8 BOM is not stripped before the config parse | [`13b`](13b-mcp-config.md) |
+| `MCP-590` | low | 13b | `upstream-drift` | **implemented** *(CLOSED 2026-10-08)* | S | a UTF-8 BOM is not stripped before the config parse | [`13b`](13b-mcp-config.md) |
 | `MCP-591` | medium | 13b | `upstream-drift` | **implemented** *(CLOSED 2026-10-04)* | L | project-scoped MCP servers: `MCP-096`'s open decision, now settled upstream | [`13b`](13b-mcp-config.md) |
-| `MCP-592` | low | 13b | `not-ported` | **missing** | S | `ServerEntry.description` is unported | [`13b`](13b-mcp-config.md) |
+| `MCP-592` | low | 13b | `not-ported` | **implemented** *(CLOSED 2026-10-08)* | S | `ServerEntry.description` is unported | [`13b`](13b-mcp-config.md) |
 | `MCP-593` | medium | 13c | `not-ported` | **implemented** *(CLOSED 2026-10-04)* | M | `auth: { provider: "<name>" }` for HTTP MCP servers | [`13c`](13c-mcp-servers.md) |
 | `MCP-594` | medium | 13c | `upstream-drift` | **implemented** *(CLOSED 2026-10-04)* | S | the metadata-cache digest pre-image gained two stdio keys | [`13c`](13c-mcp-servers.md) |
 | `MCP-595` | medium | 13c | `upstream-drift` | **implemented** *(CLOSED 2026-10-04)* | S | the seven-day metadata expiry is gone upstream | [`13c`](13c-mcp-servers.md) |
 | `MCP-596` | medium | 13c | `not-ported` | **implemented** *(CLOSED 2026-10-04)* | M | private metadata scope and `discoveryFailed` are unported | [`13c`](13c-mcp-servers.md) |
-| `MCP-597` | low | 13c | `upstream-drift` | **partial** | S | HTTP header validation scope, and the superseded error message | [`13c`](13c-mcp-servers.md) |
+| `MCP-597` | low | 13c | `upstream-drift` | **implemented** *(CLOSED 2026-10-08)* | S | HTTP header validation scope, and the superseded error message | [`13c`](13c-mcp-servers.md) |
 | `MCP-598` | medium | 13a | `upstream-drift` | **implemented** *(CLOSED 2026-10-04)* | M | startup discovery should be per server, and should close what it opened | [`13a`](13a-mcp-activation.md) |
 | `MCP-599` | low | 13a | `not-ported` | **missing** | S | `MCP_RUNTIME_TOOL_CALL_EVENT` | [`13a`](13a-mcp-activation.md) |
 | `MCP-600` | medium | 13e | `parity-bug` | **implemented** *(CLOSED 2026-10-04)* | S | in-flight must be raised before the approval gate, not after it | [`13e`](13e-mcp-tools.md) |
@@ -457,7 +457,7 @@ Numbering resumes from **`MCP-609`** *(as of the 2026-10-02 pass; now `MCP-616`,
 | `MCP-602` | **high** | 13e | `not-ported` | **implemented** *(CLOSED 2026-10-04)* | M | `approveTools` fails open, and `"destructive"` is the value that makes it bite | [`13e`](13e-mcp-tools.md) |
 | `MCP-603` | low | 13e | `not-ported` | **missing** | M | observed output shapes | [`13e`](13e-mcp-tools.md) |
 | `MCP-604` | low | 13e | `not-ported` | **missing** | S | register search-mode direct tools at the `deferred` exposure | [`13e`](13e-mcp-tools.md) |
-| `MCP-605` | low | 13d | `upstream-drift` | **partial** | S | the failure reason belongs in the agent-facing backoff messages | [`13d`](13d-mcp-proxy-modes.md) |
+| `MCP-605` | low | 13d | `upstream-drift` | **implemented** *(CLOSED 2026-10-08)* | S | the failure reason belongs in the agent-facing backoff messages | [`13d`](13d-mcp-proxy-modes.md) |
 | `MCP-606` | medium | 13i | `not-ported` | **implemented** *(CLOSED 2026-10-04)* | M | the call deadline must pause while an elicitation prompt is open | [`13i`](13i-mcp-protocol-and-verification.md) |
 | `MCP-607` | medium | 13i | `stale-port` | **implemented** *(CLOSED 2026-10-04)* | S | `resetTimeoutOnProgress` now has an upstream analogue, and the doc says it does not | [`13i`](13i-mcp-protocol-and-verification.md) |
 | `MCP-608` | low | 13h | `not-ported` | **partial** | S | completions for MCP prompt argument names | [`13h`](13h-mcp-tui.md) |
@@ -495,7 +495,7 @@ Numbering resumes from **`MCP-616`**.
 | id | sev | § | kind | status | eff | title | body |
 |---|---|---|---|---|---|---|---|
 | `MCP-609` | low | 13e | `not-ported` | **missing** | S | pi's tool-call id is received and dropped; never sent as `_meta["pi-mcp-adapter/toolCallId"]` (`4b7e310`) | [`13e`](13e-mcp-tools.md) |
-| `MCP-610` | low | 13d | `not-ported` | **partial** | S | repeated query tokens are not deduplicated, so the coverage gate rejects `"search search"` (`c9eca7e`) | [`13d`](13d-mcp-proxy-modes.md) |
+| `MCP-610` | low | 13d | `not-ported` | **implemented** *(CLOSED 2026-10-08)* | S | repeated query tokens are not deduplicated, so the coverage gate rejects `"search search"` (`c9eca7e`) | [`13d`](13d-mcp-proxy-modes.md) |
 | `MCP-611` | low | 13h | `not-ported` | **partial** | S | the setup panel reports "Added" for a preset that will not take effect (`c362b08`'s `ignoredBecause`) | [`13h`](13h-mcp-tui.md) |
 
 **Census after table G (arithmetic, not a re-count):** the fourth pass counted **545**; table G adds 3,

@@ -1711,6 +1711,10 @@ impl ProxyEnv for RuntimeEnv {
         failure_age_seconds(&self.state, server)
     }
 
+    fn failure_message(&self, server: &str) -> Option<String> {
+        failure_message(&self.state, server)
+    }
+
     fn record_failure(&self, server: &str, message: &str) {
         record_failure(&self.state, server, message);
     }

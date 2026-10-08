@@ -117,6 +117,14 @@ pub const PROJECT_CONFIG_NAME: &str = ".mcp.json";
 
 /// `getConfigDirName()` — upstream `.pi`. Renamed by settled in-tree precedent; see the module
 /// header.
+///
+/// `[CYRUP-DELTA]` (MCP-588) — the override **filename** inside this directory, and in
+/// `<agent_dir>`, stays [`crate::dirs::MCP_CONFIG_FILE`] (`mcp.json`). Upstream moved both scopes
+/// to `ADAPTER_CONFIG_NAME = "mcp-adapter.json"` (`config.ts:23`, used at `:213` and `:234`,
+/// pi-mcp-adapter `2ccf648`) and added `getLegacyMcpMigrationNotices` (`:270`) because pi's own
+/// built-in MCP now owns `mcp.json` and the adapter had to vacate it. `cyrup-mcp` **is** cyrup's
+/// built-in MCP, so there is no second owner to collide with: renaming would break every existing
+/// config for nothing, and the migration notices are a migration off a name cyrup never left.
 pub const PROJECT_OVERRIDE_DIR: &str = ".cyrup";
 
 /// `REPOPROMPT_BINARY_CANDIDATES[1]`. The `[0]` entry is `~/RepoPrompt/repoprompt_cli` and is built
@@ -799,6 +807,21 @@ pub struct HttpRequestHeadersCommand {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ServerEntry {
+    /// `description?: string` — upstream's **first** `ServerEntry` field (`types.ts:439-440` @
+    /// pi-mcp-adapter `2ccf648`, added by `e12ef73` / #760): "Short human summary shown by
+    /// mcp({ server }) and the /mcp-adapter panel, and ranked by mcp({ search })" (`MCP-592`).
+    ///
+    /// Read by three surfaces, each collapsing it to one line: [`crate::proxy::execute_list`]'s
+    /// `Description:` line, the `/mcp` panel's expanded-server summary, and the ranked search's
+    /// `serverDescription` field. **Not identity** — `computeServerHash` does not hash it
+    /// (`metadata-cache.ts:109-141`), so setting it evicts no cache entry. A present non-string is
+    /// dropped with upstream's warning by [`to_server_entries`].
+    #[serde(
+        default,
+        deserialize_with = "lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub description: Option<String>,
     /// stdio transport: the executable. Exactly one of `command` / `url` must be set, checked at
     /// **connect** time.
     #[serde(
@@ -1060,6 +1083,34 @@ pub struct ServerEntry {
 }
 
 impl ServerEntry {
+    /// [`Self::description`] as `mcp({ server })` prints it — `definition.description?.replace(
+    /// /\s+/g, " ").trim()` (`proxy-modes.ts:1028` @ pi-mcp-adapter `2ccf648`) — or `None` when
+    /// that leaves nothing, which upstream's `description ? … : ""` treats as absent.
+    ///
+    /// `split_whitespace` is Unicode `White_Space`; JS `\s` differs only at U+FEFF (JS collapses it)
+    /// and U+0085 (Rust does), neither of which a hand-written summary carries.
+    #[must_use]
+    pub fn one_line_description(&self) -> Option<String> {
+        let collapsed = self
+            .description
+            .as_deref()?
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        (!collapsed.is_empty()).then_some(collapsed)
+    }
+
+    /// [`Self::description`] under `?.trim()` — the form the `/mcp` panel summary
+    /// (`mcp-panel.ts:63-64`) and the search-mode tool namespace (`index.ts:442`) read — or `None`
+    /// when it is absent or blank, which both treat as falsy.
+    #[must_use]
+    pub fn trimmed_description(&self) -> Option<&str> {
+        self.description
+            .as_deref()
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+    }
+
     /// `isServerDisabled(definition)` — and its doc comment is the specification: *"Only the
     /// literal boolean `true` disables a server."* A truthy string does not.
     #[must_use]
@@ -2492,15 +2543,31 @@ where
     None
 }
 
-/// `parseJsonConfig(raw)` = `JSON.parse(stripJsonComments(raw, { trailingCommas: true }))`
-/// (MCP-051).
+/// `stripUtf8Bom(raw)` — `utils.ts:9` (pi-mcp-adapter `2ccf648`): drop one leading U+FEFF.
+///
+/// MCP-590. `read_to_string` keeps a BOM as a leading `\u{feff}`, which neither the JSONC parser
+/// nor `toml` accepts before the root, so without this a BOM-prefixed config fails to parse and the
+/// load ladder degrades it to `{ mcpServers: {} }`.
+#[must_use]
+pub fn strip_utf8_bom(raw: &str) -> &str {
+    raw.strip_prefix('\u{feff}').unwrap_or(raw)
+}
+
+/// `parseJsonWithComments(raw)` =
+/// `JSON.parse(stripJsonComments(stripUtf8Bom(raw), { trailingCommas: true }))` (`utils.ts:13-15`,
+/// pi-mcp-adapter `2ccf648`; MCP-051, BOM strip MCP-590).
 ///
 /// JSONC comes from `cyrup_permission_system::jsonc` — the same parser
 /// `cyrup_permission_system::manager::read_configured_mcp_server_names` runs over this exact file,
 /// so the permission gate and the adapter agree about which servers exist **by construction**.
-/// Re-porting `strip-json-comments` here would let the two disagree, silently.
+/// Re-porting `strip-json-comments` here would let the two disagree, silently. The BOM strip is
+/// the one step outside the shared parser, and the permission reader applies it too (MCP-590).
 pub fn parse_json_config(raw: &str, path: &str) -> Result<RawJson, String> {
-    cyrup_permission_system::jsonc::parse_config_into::<RawJson>(raw, path, "MCP config")
+    cyrup_permission_system::jsonc::parse_config_into::<RawJson>(
+        strip_utf8_bom(raw),
+        path,
+        "MCP config",
+    )
 }
 
 /// The typed read of one JSONC config document, split out so the source ladder can apply it per
@@ -2667,6 +2734,24 @@ pub fn to_server_entries(
                     message,
                 });
                 continue;
+            }
+            // `config.ts:1364-1369` @ 2ccf648: a present, non-string `description` (JSON `null`
+            // included — the test is `!== undefined`) is dropped with this warning and the entry is
+            // kept. It runs after the `auth.provider` ladder, as upstream's does, so a dropped entry
+            // warns once. `lenient` already drops the value; this is the half that makes it visible.
+            if raw_entry
+                .get("description")
+                .is_some_and(|value| value.as_str().is_none())
+            {
+                let message = format!(
+                    "Ignoring invalid description for MCP server \"{name}\": expected a string"
+                );
+                tracing::warn!("{message}");
+                diagnostics.push(ConfigDiagnostic {
+                    path: path.to_path_buf(),
+                    server: Some(name.clone()),
+                    message,
+                });
             }
             out.insert(name.clone(), entry);
         }
@@ -2906,6 +2991,7 @@ pub fn merge_entry(base: Option<&ServerEntry>, over: &ServerEntry) -> ServerEntr
     }
 
     let ServerEntry {
+        description,
         command,
         args,
         env,
@@ -2938,6 +3024,9 @@ pub fn merge_entry(base: Option<&ServerEntry>, over: &ServerEntry) -> ServerEntr
     } = over;
 
     ServerEntry {
+        // Plain `??` inheritance, like every non-credential key: a summary is not bound to an
+        // endpoint, so a url switch keeps it.
+        description: description.clone().or(base_entry.description),
         command: command.clone().or(base_entry.command),
         args: args.clone().or(base_entry.args),
         env: env.clone().or(base_entry.env),
@@ -3199,7 +3288,11 @@ pub fn resolve_opencode_project_candidate(cwd: &Path) -> PathBuf {
     }
 }
 
-/// `readImportedConfig(path)` = `path.endsWith(".toml") ? parseToml(raw) : parseJsonConfig(raw)`.
+/// `readImportedConfig(path)` =
+/// `path.endsWith(".toml") ? parseToml(stripUtf8Bom(raw)) : parseJsonWithComments(raw)`
+/// (`config.ts:1040-1043`, pi-mcp-adapter `2ccf648`). Both legs strip a BOM (MCP-590): the JSON leg
+/// inside [`parse_json_config`], the TOML leg here. The `toml` crate already accepts a leading BOM,
+/// so the TOML strip changes nothing today; it is kept so the leg does not depend on that.
 /// The only TOML path in the whole package is `~/.codex/config.toml`.
 fn read_imported_config(path: &Path) -> Result<RawJson, String> {
     let raw = std::fs::read_to_string(path).map_err(|error| error.to_string())?;
@@ -3208,7 +3301,7 @@ fn read_imported_config(path: &Path) -> Result<RawJson, String> {
         .is_some_and(|ext| ext.eq_ignore_ascii_case("toml"))
     {
         // `toml`'s deserializer feeds map entries in document order, so `RawJson` keeps it.
-        toml::from_str::<RawJson>(&raw).map_err(|error| error.to_string())
+        toml::from_str::<RawJson>(strip_utf8_bom(&raw)).map_err(|error| error.to_string())
     } else {
         parse_json_config(&raw, &path.to_string_lossy())
     }
@@ -3750,6 +3843,10 @@ pub enum SourceId {
     AgentsNestedGlobal,
     /// `<agent_dir>/mcp.json`, or `--mcp-config`'s target. Upstream calls this `pi-global`; the id
     /// string is kept verbatim because it is a panel/fingerprint key, not a brand.
+    ///
+    /// `[CYRUP-DELTA]` (MCP-588) — upstream's file here is `<agent_dir>/mcp-adapter.json`
+    /// (`config.ts:213`, pi-mcp-adapter `2ccf648`); cyrup keeps `mcp.json`. See
+    /// [`PROJECT_OVERRIDE_DIR`] for why. The *label* follows upstream (`config.ts:740`).
     PiGlobal,
     /// `<cwd>/.mcp.json`.
     SharedProject,
@@ -4015,7 +4112,8 @@ impl ConfigContext {
 
         sources.push(ConfigSourceSpec {
             id: SourceId::PiGlobal,
-            label: "Pi global override",
+            // `config.ts:740` (pi-mcp-adapter `2ccf648`) — renamed from `"Pi global override"`.
+            label: "MCP adapter global override",
             read_path: user_path.clone(),
             write_path: user_path.clone(),
             kind: SourceKind::User,
@@ -4040,7 +4138,10 @@ impl ConfigContext {
         if project_override != user_path && project_override != project_path {
             sources.push(ConfigSourceSpec {
                 id: SourceId::PiProject,
-                label: "project Pi override",
+                // `config.ts:816` (pi-mcp-adapter `2ccf648`) — renamed from `"project Pi override"`.
+                // The third renamed label, `"ancestor MCP adapter override"` (`:762`), belongs to
+                // upstream's ancestor discovery, which this ladder does not have.
+                label: "project MCP adapter override",
                 read_path: project_override.clone(),
                 write_path: project_override,
                 kind: SourceKind::Project,
@@ -4401,7 +4502,12 @@ pub fn read_raw_config_object(path: &Path) -> McpResult<RawObject> {
         return Ok(RawObject::new());
     }
     let text = std::fs::read_to_string(path).map_err(|error| config_read_error(path, &error))?;
-    if text.trim().is_empty() {
+    // `text.trim() === ""` (`config.ts:1626`, pi-mcp-adapter `2ccf648`). JS `trim` also removes
+    // U+FEFF and `str::trim` does not, so a BOM-only file is empty here too (MCP-590).
+    if text
+        .trim_matches(|c: char| c.is_whitespace() || c == '\u{feff}')
+        .is_empty()
+    {
         return Ok(RawObject::new());
     }
     let parsed = parse_json_config(&text, &path.to_string_lossy())
@@ -6692,6 +6798,83 @@ mod tests {
         }
     }
 
+    /// `server description` › "keeps a string description and drops a non-string one with a
+    /// warning" (`__tests__/config.test.ts:2348-2366` @ pi-mcp-adapter `2ccf648`, `MCP-592`).
+    #[test]
+    fn a_string_description_is_kept_and_a_non_string_one_dropped_with_a_warning() {
+        let servers = parse_json_config(
+            r#"{
+                "weather": { "command": "node", "description": "Forecasts and severe weather alerts" },
+                "broken": { "command": "node", "description": 42 },
+                "nulled": { "command": "node", "description": null }
+            }"#,
+            "mcp.json",
+        )
+        .unwrap();
+        let mut diagnostics = Vec::new();
+        let entries = to_server_entries(&servers, Path::new("/x/mcp.json"), &mut diagnostics);
+        assert_eq!(
+            entries.get("weather"),
+            Some(&ServerEntry {
+                command: Some("node".into()),
+                description: Some("Forecasts and severe weather alerts".into()),
+                ..ServerEntry::default()
+            })
+        );
+        let bare = ServerEntry {
+            command: Some("node".into()),
+            ..ServerEntry::default()
+        };
+        assert_eq!(
+            entries.get("broken"),
+            Some(&bare),
+            "the entry survives without the field"
+        );
+        assert_eq!(
+            entries.get("nulled"),
+            Some(&bare),
+            "`null !== undefined` upstream"
+        );
+        let messages: Vec<&str> = diagnostics.iter().map(|d| d.message.as_str()).collect();
+        assert_eq!(
+            messages,
+            vec![
+                "Ignoring invalid description for MCP server \"broken\": expected a string",
+                "Ignoring invalid description for MCP server \"nulled\": expected a string",
+            ]
+        );
+    }
+
+    /// `MCP-592`: the description inherits like any non-credential key, survives a url switch,
+    /// and collapses to one line for `mcp({ server })`.
+    #[test]
+    fn the_description_merges_and_collapses_to_one_line() {
+        let base = ServerEntry {
+            url: Some("https://a.example/mcp".into()),
+            description: Some("  Skill\n\t library  ".into()),
+            ..ServerEntry::default()
+        };
+        let over = ServerEntry {
+            url: Some("https://b.example/mcp".into()),
+            ..ServerEntry::default()
+        };
+        let merged = merge_entry(Some(&base), &over);
+        assert_eq!(merged.description, base.description);
+        assert_eq!(
+            merged.one_line_description().as_deref(),
+            Some("Skill library")
+        );
+        assert_eq!(merged.trimmed_description(), Some("Skill\n\t library"));
+
+        let blank = ServerEntry {
+            description: Some(" \n ".into()),
+            ..ServerEntry::default()
+        };
+        assert_eq!(blank.one_line_description(), None);
+        assert_eq!(blank.trimmed_description(), None);
+        assert_eq!(ServerEntry::default().one_line_description(), None);
+    }
+
     #[test]
     fn to_server_entries_drops_a_misconfigured_provider_server() {
         for (json, reason) in [
@@ -7753,6 +7936,109 @@ mod tests {
         );
         assert_eq!(ids.len(), 5);
         assert!(context.load().config.mcp_servers.contains_key("only"));
+    }
+
+    // -- MCP-588 -----------------------------------------------------------------------------
+
+    #[test]
+    fn source_labels_follow_upstream_while_the_filenames_stay_mcp_json() {
+        let fixture = Fixture::new();
+        let sources = fixture.context().sources();
+        let find = |id: SourceId| sources.iter().find(|source| source.id == id).unwrap();
+
+        // `config.ts:740` / `:816` at pi-mcp-adapter `2ccf648`.
+        let global = find(SourceId::PiGlobal);
+        assert_eq!(global.label, "MCP adapter global override");
+        let project = find(SourceId::PiProject);
+        assert_eq!(project.label, "project MCP adapter override");
+        assert!(
+            sources.iter().all(|source| !source.label.contains("Pi ")),
+            "no source label names pi"
+        );
+
+        // `[CYRUP-DELTA]`: upstream's `ADAPTER_CONFIG_NAME` is not adopted at either scope.
+        assert_eq!(global.read_path, fixture.user_path());
+        assert_eq!(project.read_path, fixture.project_override());
+        for source in [global, project] {
+            assert_eq!(
+                source.read_path.file_name().and_then(|name| name.to_str()),
+                Some("mcp.json")
+            );
+        }
+    }
+
+    // -- MCP-590 -----------------------------------------------------------------------------
+
+    /// `EF BB BF` — the UTF-8 encoding of U+FEFF, as PowerShell's `>` writes it.
+    const UTF8_BOM: &[u8] = b"\xEF\xBB\xBF";
+
+    fn write_with_bom(fixture: &Fixture, path: &Path, text: &str) {
+        let mut bytes = UTF8_BOM.to_vec();
+        bytes.extend_from_slice(text.as_bytes());
+        fixture.write(path, "");
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
+    fn strip_utf8_bom_drops_exactly_one_leading_bom() {
+        // `utils.ts:9-11` at pi-mcp-adapter `2ccf648`.
+        assert_eq!(strip_utf8_bom("\u{feff}{}"), "{}");
+        assert_eq!(strip_utf8_bom("\u{feff}\u{feff}{}"), "\u{feff}{}");
+        assert_eq!(strip_utf8_bom("{}\u{feff}"), "{}\u{feff}");
+        assert_eq!(strip_utf8_bom("{}"), "{}");
+    }
+
+    #[test]
+    fn a_bom_prefixed_config_loads_its_servers() {
+        let fixture = Fixture::new();
+        write_with_bom(
+            &fixture,
+            &fixture.user_path(),
+            "// jsonc\n{\"mcpServers\":{\"bom\":{\"command\":\"x\"}}}",
+        );
+
+        let loaded = fixture.context().load();
+        assert!(loaded.config.mcp_servers.contains_key("bom"));
+        assert!(
+            loaded.diagnostics.is_empty(),
+            "no parse warning: {:?}",
+            loaded.diagnostics
+        );
+    }
+
+    #[test]
+    fn a_bom_prefixed_toml_import_loads_its_servers() {
+        let fixture = Fixture::new();
+        // `readImportedConfig`'s TOML leg, `config.ts:1042` at pi-mcp-adapter `2ccf648`.
+        write_with_bom(
+            &fixture,
+            &fixture.home.join(".codex").join("config.toml"),
+            "[mcp_servers.codexbom]\ncommand = \"x\"\n",
+        );
+        fixture.write(
+            &fixture.user_path(),
+            r#"{"mcpServers":{},"imports":["codex"]}"#,
+        );
+
+        let loaded = fixture.context().load();
+        assert!(loaded.config.mcp_servers.contains_key("codexbom"));
+    }
+
+    #[test]
+    fn the_writer_reads_through_a_bom_and_treats_a_bare_bom_as_empty() {
+        let fixture = Fixture::new();
+        let path = fixture.user_path();
+        write_with_bom(
+            &fixture,
+            &path,
+            "{\"mcpServers\":{\"kept\":{\"command\":\"x\"}}}",
+        );
+        let raw = read_raw_config_object(&path).unwrap();
+        assert!(raw.contains_key("mcpServers"));
+
+        // `text.trim() === ""` — JS `trim` removes U+FEFF.
+        write_with_bom(&fixture, &path, " \n");
+        assert!(read_raw_config_object(&path).unwrap().is_empty());
     }
 
     // -- MCP-003 / the degradation contract ----------------------------------------------------

@@ -205,11 +205,21 @@ impl TrustStore {
 }
 
 /// True if `cwd` has trust-requiring project resources (R-07-006):
-/// `.cyrup/{settings.json,extensions,skills,prompts,themes,SYSTEM.md,APPEND_SYSTEM.md}` or a
-/// `.agents/skills` directory in cwd or an ancestor (excluding `~/.agents/skills`).
+/// `.cyrup/{settings.json,mcp.json,extensions,skills,prompts,themes,SYSTEM.md,APPEND_SYSTEM.md}`
+/// or a `.agents/skills` directory in cwd or an ancestor (excluding `~/.agents/skills`).
+///
+/// The marker list is pi's `TRUST_REQUIRING_PROJECT_CONFIG_RESOURCES`
+/// (`packages/coding-agent/src/core/trust-manager.ts:30-39` @ce950d78f), entry for entry and in
+/// the same order, probed under the project config dir only (`:191-194`). CFG-101: pi's entry is
+/// `.pi/mcp.json`, so it is `.cyrup/mcp.json` here. Two near-misses are deliberately NOT markers,
+/// because pi does not probe them either: the bare `<cwd>/.mcp.json` (shared with every other MCP
+/// client, so listing it would make any repository carrying one prompt for cyrup trust), and
+/// pi-mcp-adapter's `mcp-adapter.json` (MCP-588; the adapter gates its own project servers on
+/// `ctx.isProjectTrusted()`, `project-server-trust.ts:183-207` @2ccf648, and never feeds this list).
 pub fn has_trust_requiring_resources(cwd: &Path, home: &Path) -> bool {
     const CYRUP_MARKERS: &[&str] = &[
         "settings.json",
+        "mcp.json",
         "extensions",
         "skills",
         "prompts",
@@ -861,6 +871,31 @@ mod tests {
         std::fs::create_dir_all(cwd.join(".cyrup")).unwrap();
         std::fs::write(cwd.join(".cyrup").join("settings.json"), "{}").unwrap();
         assert!(has_trust_requiring_resources(&cwd, &home));
+    }
+
+    #[test]
+    fn project_mcp_json_requires_trust_but_bare_dot_mcp_json_does_not() {
+        // CFG-101 — pi `trust-manager.ts:32` @ce950d78f lists `mcp.json` under the project config
+        // dir. RED before: a project whose only config is `.cyrup/mcp.json` never asked for trust.
+        let home = tmp();
+        let root = tmp();
+
+        let cyrup_mcp = root.join("cyrup-mcp");
+        std::fs::create_dir_all(cyrup_mcp.join(".cyrup")).unwrap();
+        std::fs::write(cyrup_mcp.join(".cyrup").join("mcp.json"), "{}").unwrap();
+        assert!(has_trust_requiring_resources(&cyrup_mcp, &home));
+
+        // The shared `<cwd>/.mcp.json` is not under the project config dir; pi does not probe it.
+        let bare_mcp = root.join("bare-mcp");
+        std::fs::create_dir_all(&bare_mcp).unwrap();
+        std::fs::write(bare_mcp.join(".mcp.json"), "{}").unwrap();
+        assert!(!has_trust_requiring_resources(&bare_mcp, &home));
+
+        // pi-mcp-adapter's renamed file (MCP-588) is not in pi's list either.
+        let adapter = root.join("adapter");
+        std::fs::create_dir_all(adapter.join(".cyrup")).unwrap();
+        std::fs::write(adapter.join(".cyrup").join("mcp-adapter.json"), "{}").unwrap();
+        assert!(!has_trust_requiring_resources(&adapter, &home));
     }
 
     #[test]

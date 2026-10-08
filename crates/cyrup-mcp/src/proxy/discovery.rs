@@ -20,8 +20,8 @@ use crate::proxy::ranking::{
     RankedToolMatch, paginate, rank_collate, rank_tool_matches, resolve_search_keywords,
 };
 use crate::proxy::results::{
-    ambiguous_tool_result, details, details_err, disabled_result, get_enabled_tool_matches,
-    not_found_result, text_result,
+    ambiguous_tool_result, describe_failure, details, details_err, disabled_result,
+    get_enabled_tool_matches, not_found_result, text_result,
 };
 use crate::proxy::tool_metadata::{ToolMetadata, find_tool_by_name, truncate_at_word};
 
@@ -120,10 +120,11 @@ pub fn execute_status(ctx: &ProxyCtx) -> ToolResult {
             "needs-auth" => text.push_str(&format!("⚠ {name} (needs auth)\n")),
             "cached" => text.push_str(&format!("○ {name} ({} tools, cached)\n", row.tool_count)),
             "failed" => {
-                text.push_str(&format!(
-                    "✗ {name} (failed {}s ago)\n",
-                    row.failed_ago.unwrap_or(0)
-                ));
+                // `proxy-modes.ts:586-588` @2ccf648 — `describeFailure(...) ?? failed Ns ago`
+                // (MCP-605).
+                let failure = describe_failure(ctx.env.as_ref(), name)
+                    .unwrap_or_else(|| format!("failed {}s ago", row.failed_ago.unwrap_or(0)));
+                text.push_str(&format!("✗ {name} ({failure})\n"));
             }
             _ => text.push_str(&format!("○ {name} (not connected)\n")),
         }
@@ -204,6 +205,16 @@ pub fn execute_list(ctx: &ProxyCtx, server: &str) -> ToolResult {
         }
     }
     let has_instructions = instructions.is_some();
+    // `proxy-modes.ts:1027-1029` @ 2ccf648 (`MCP-592`): the configured summary, collapsed to one
+    // line by `replace(/\s+/g, " ").trim()`. Upstream deliberately has no instructions fallback
+    // here — the instructions preview below already starts with that line.
+    let description_text = ctx
+        .config()
+        .mcp_servers
+        .get(server)
+        .and_then(ServerEntry::one_line_description)
+        .map(|description| format!("\nDescription: {description}"))
+        .unwrap_or_default();
 
     if tool_names.is_empty() {
         if connection == Some(ConnectionStatus::Connected) {
@@ -213,7 +224,7 @@ pub fn execute_list(ctx: &ProxyCtx, server: &str) -> ToolResult {
             map.insert("count".to_string(), json!(0));
             map.insert("hasInstructions".to_string(), Value::Bool(has_instructions));
             return text_result(
-                format!("Server \"{server}\" has no tools.{instructions_text}"),
+                format!("Server \"{server}\" has no tools.{description_text}{instructions_text}"),
                 map,
             );
         }
@@ -226,7 +237,7 @@ pub fn execute_list(ctx: &ProxyCtx, server: &str) -> ToolResult {
             map.insert("hasInstructions".to_string(), Value::Bool(has_instructions));
             return text_result(
                 format!(
-                    "Server \"{server}\" has no cached tools (not connected).{instructions_text}"
+                    "Server \"{server}\" has no cached tools (not connected).{description_text}{instructions_text}"
                 ),
                 map,
             );
@@ -238,7 +249,7 @@ pub fn execute_list(ctx: &ProxyCtx, server: &str) -> ToolResult {
         map.insert("hasInstructions".to_string(), Value::Bool(has_instructions));
         return text_result(
             format!(
-                "Server \"{server}\" is configured but not connected. Use mcp({{ connect: \"{server}\" }}) or /mcp reconnect {server} to retry.{instructions_text}"
+                "Server \"{server}\" is configured but not connected. Use mcp({{ connect: \"{server}\" }}) or /mcp reconnect {server} to retry.{description_text}{instructions_text}"
             ),
             map,
         );
@@ -249,7 +260,10 @@ pub fn execute_list(ctx: &ProxyCtx, server: &str) -> ToolResult {
     } else {
         " (not connected, cached)"
     };
-    let mut text = format!("{server} ({} tools{cached_note}):\n\n", tool_names.len());
+    let mut text = format!(
+        "{server} ({} tools{cached_note}):{description_text}\n\n",
+        tool_names.len()
+    );
     let descriptions: BTreeMap<String, String> = metadata
         .as_ref()
         .map(|tools| {
@@ -890,7 +904,69 @@ mod tests {
         assert_eq!(rows[0]["failedAgo"], Value::Null);
     }
 
+    /// MCP-605 — `proxy-modes.ts:586-588` @2ccf648: a failed row carries `describeFailure`'s
+    /// `failed Ns ago: <reason>`, sanitised.
+    #[test]
+    fn status_names_the_stored_failure_reason() {
+        let config = config_with(&[("broken", stdio("b"))]);
+        let env =
+            FakeEnv::default().with_failure_message("broken", 12, "spawn\nnpx \u{1b}[31mENOENT");
+        let (ctx, _) = ctx_with(config, &[], &[], env);
+        let text = text_of(&execute_status(&ctx));
+        assert!(
+            text.contains("✗ broken (failed 12s ago: spawn npx ENOENT)\n"),
+            "{text}"
+        );
+    }
+
     // ---- MCP-155 · `executeList` ---------------------------------------------------------------------
+
+    /// `executeList` › "shows the configured description under the listing header"
+    /// (`__tests__/proxy-modes-instructions.test.ts:74-80` @ pi-mcp-adapter `2ccf648`, `MCP-592`).
+    #[test]
+    fn list_shows_the_configured_description_under_the_header() {
+        let described = |text: &str| ServerEntry {
+            description: Some(text.to_string()),
+            ..stdio("x")
+        };
+        let config = config_with(&[
+            ("demo", described("Skill\n  library")),
+            ("empty", described("Skill library")),
+            ("blank", described(" \n ")),
+        ]);
+        let env = FakeEnv::default()
+            .with_connection("demo", ConnectionStatus::Connected)
+            .with_connection("empty", ConnectionStatus::Connected)
+            .with_connection("blank", ConnectionStatus::Connected);
+        let (ctx, _) = ctx_with(
+            config,
+            &[(
+                "demo",
+                vec![ToolMetadata::new("demo_read_skill", "read_skill", "Reads")],
+            )],
+            &[("demo", "Short note.")],
+            env,
+        );
+
+        let listed = text_of(&execute_list(&ctx, "demo"));
+        assert!(
+            listed.starts_with("demo (1 tools):\nDescription: Skill library\n\n- demo_read_skill"),
+            "{listed}"
+        );
+        assert!(
+            listed.contains("Server instructions:\nShort note."),
+            "{listed}"
+        );
+        assert_eq!(
+            text_of(&execute_list(&ctx, "empty")),
+            "Server \"empty\" has no tools.\nDescription: Skill library"
+        );
+        // A blank description is falsy upstream: no `Description:` line at all.
+        assert_eq!(
+            text_of(&execute_list(&ctx, "blank")),
+            "Server \"blank\" has no tools."
+        );
+    }
 
     #[test]
     fn list_covers_its_five_outcomes() {

@@ -515,6 +515,12 @@ pub struct CachedTool {
     /// registration, not at cache time (MCP-087).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_schema: Option<Value>,
+    /// `outputSchema?: unknown` — the server's JSON Schema for the tool's `structuredContent`
+    /// (`types.ts:801` @ pi-mcp-adapter `2ccf648`), written by [`serialize_tools`] only when the
+    /// server declared one (`metadata-cache.ts:371`). A search-mode direct tool built from the
+    /// cache nests it in its result schema (`MCP-612`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_schema: Option<Value>,
     /// **Cut 2**, retained in the schema. MCP Apps' `ui://` resource for this tool.
     ///
     /// **Never written and never read**: [`serialize_tools`] always writes `None` because MCP Apps is
@@ -918,6 +924,12 @@ pub fn serialize_tools(tools: &[rmcp::model::Tool]) -> Vec<CachedTool> {
                 .as_ref()
                 .map(std::string::ToString::to_string),
             input_schema: Some(Value::Object((*tool.input_schema).clone())),
+            // `...(t.outputSchema !== undefined ? { outputSchema: t.outputSchema } : {})`
+            // (`metadata-cache.ts:371` @ 2ccf648, `MCP-612`).
+            output_schema: tool
+                .output_schema
+                .as_ref()
+                .map(|schema| Value::Object((**schema).clone())),
             ui_resource_uri: None,
             ui_visibility: extract_ui_tool_visibility(
                 tool.meta
@@ -2003,6 +2015,33 @@ mod tests {
             ),
         ] {
             let entry: ServerEntry = serde_json::from_str(json).unwrap();
+            let resolved = ResolvedIdentity::verbatim(&entry);
+            assert_eq!(
+                compute_server_hash(&entry, &resolved),
+                upstream_digest,
+                "{json}\n  pre-image: {}",
+                server_identity_pre_image(&entry, &resolved)
+            );
+        }
+    }
+
+    /// `MCP-592` — `description` is not identity: `computeServerHash`'s object
+    /// (`metadata-cache.ts:109-141` @ pi-mcp-adapter `2ccf648`) has no such member, so adding one
+    /// to a definition leaves upstream's own digests from the vector above untouched.
+    #[test]
+    fn golden_vector_description_moves_nothing() {
+        for (json, upstream_digest) in [
+            (
+                r#"{"description":"Remote API","url":"https://api.example/mcp","auth":{"provider":"anthropic"}}"#,
+                "4526c3c613c6ed34e40774241427547d6c26d378cd15a4999da04a143167ac41",
+            ),
+            (
+                r#"{"url":"https://api.example/mcp","description":"Remote API"}"#,
+                "2db31687b0b59d5c92a24ec3f4a9b4082947160f8ea5de861b1af10a3687e87b",
+            ),
+        ] {
+            let entry: ServerEntry = serde_json::from_str(json).unwrap();
+            assert_eq!(entry.description.as_deref(), Some("Remote API"));
             let resolved = ResolvedIdentity::verbatim(&entry);
             assert_eq!(
                 compute_server_hash(&entry, &resolved),

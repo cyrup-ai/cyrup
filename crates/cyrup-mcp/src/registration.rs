@@ -964,6 +964,10 @@ pub struct CachedTool {
     pub description: Option<String>,
     #[serde(default)]
     pub input_schema: Option<Value>,
+    /// The server's `structuredContent` schema, verbatim (`types.ts:801` @ pi-mcp-adapter
+    /// `2ccf648`). Read only by [`deferred_tool_fields`], which nests it (`MCP-612`).
+    #[serde(default)]
+    pub output_schema: Option<Value>,
     /// Kept as a raw [`Value`], not `Option<Vec<String>>`: [`is_ui_tool_visible_to_model`]'s
     /// fail-closed semantics depend on telling "absent" from "present but malformed", which a
     /// lenient derive flattens (MCP-208).
@@ -2549,9 +2553,9 @@ pub fn tool_render_kind(settings: Option<&McpSettings>) -> ToolRenderKind {
 }
 
 /// What a search-mode (`lazy`) direct tool registers beyond an eager one (`deferredToolFields`,
-/// `index.ts:436-463` @v5.0.0, "the fields Pi's built-in MCP registers its tools with"): the
-/// `deferred` exposure, the server's namespace, and the result schema codemode renders as
-/// `CallToolResult<T>`.
+/// `index.ts:438-464` @ pi-mcp-adapter `2ccf648`, "the fields Pi's built-in MCP registers its tools
+/// with"): the `deferred` exposure, the server's namespace, and the result schema codemode renders
+/// as `CallToolResult<T>`.
 ///
 /// Upstream also attaches the tool's MCP `annotations`, which Pi's `getAllTools()` reports to
 /// permission extensions. cyrup's `Tool` carries no annotations (the exposure model was ported
@@ -2565,37 +2569,64 @@ pub struct DeferredFields {
 
 /// `deferredToolFields(spec, config, cache)`: `None` unless the spec is `lazy`.
 ///
-/// `namespace.name` is `mcp__<server>` with `-` as `_`; its instructions are the server's cached
-/// ones (`serverCache.instructions`, read without the validity gate, as upstream reads
-/// `cache?.servers[spec.serverName]`). Upstream's `config.mcpServers[server].description` has no
-/// counterpart in cyrup's server entry yet, so the namespace carries no description.
+/// `namespace.name` is `mcp__<server>` with `-` as `_`; its description is the server's
+/// configured `description?.trim()` (`index.ts:442`, `MCP-612`, absent when blank) and its
+/// instructions are the server's cached ones (`serverCache.instructions`, read without the
+/// validity gate, as upstream reads `cache?.servers[spec.serverName]`). The cached tool is looked
+/// up by original name — never for a resource tool (`spec.resourceUri ? undefined : …`) — and its
+/// `outputSchema`, when present, is nested as `properties.structuredContent` (`index.ts:458`).
 #[must_use]
 pub fn deferred_tool_fields(
     spec: &DirectToolSpec,
+    config: &McpConfig,
     cache: Option<&MetadataCache>,
 ) -> Option<DeferredFields> {
     if !spec.lazy {
         return None;
     }
-    let instructions = cache
-        .and_then(|cache| cache.servers.get(&spec.server_name))
+    let server_cache = cache.and_then(|cache| cache.servers.get(&spec.server_name));
+    let output_schema = if spec.resource_uri.is_some() {
+        None
+    } else {
+        server_cache
+            .and_then(|entry| {
+                entry
+                    .tools()
+                    .iter()
+                    .find(|candidate| candidate.name == spec.original_name)
+            })
+            .and_then(|tool| tool.output_schema.clone())
+    };
+    let description = config
+        .mcp_servers
+        .get(&spec.server_name)
+        .and_then(ServerEntry::trimmed_description)
+        .map(str::to_string);
+    let instructions = server_cache
         .and_then(|entry| entry.instructions.clone())
         .filter(|instructions| !instructions.is_empty());
+    // `createMcpResultSchema`'s shape, with `structuredContent` only when the server declared a
+    // schema. (`serde_json::Map` is sorted under this workspace's features, so the serialised key
+    // order — and with it the re-registration fingerprint — is deterministic, not upstream's.)
+    let mut properties = serde_json::Map::new();
+    properties.insert(
+        "content".to_string(),
+        json!({ "type": "array", "items": { "type": "object" } }),
+    );
+    if let Some(schema) = output_schema {
+        properties.insert("structuredContent".to_string(), schema);
+    }
+    properties.insert("isError".to_string(), json!({ "type": "boolean" }));
+    properties.insert("_meta".to_string(), json!({ "type": "object" }));
     Some(DeferredFields {
         namespace: ToolNamespace {
             name: format!("mcp__{}", spec.server_name.replace('-', "_")),
-            description: None,
+            description,
             instructions,
         },
-        // `createMcpResultSchema`'s shape (without `structuredContent`: the metadata cache carries
-        // no `outputSchema`, so there is none to nest).
         output_schema: json!({
             "type": "object",
-            "properties": {
-                "content": { "type": "array", "items": { "type": "object" } },
-                "isError": { "type": "boolean" },
-                "_meta": { "type": "object" }
-            },
+            "properties": Value::Object(properties),
             "required": ["content"]
         }),
     })
@@ -3415,7 +3446,7 @@ pub fn register_surface<S: SurfaceSink + ?Sized>(
         )
     };
     for spec in &direct_specs {
-        let deferred = deferred_tool_fields(spec, cache.as_ref());
+        let deferred = deferred_tool_fields(spec, config, cache.as_ref());
         // `directToolFingerprint(spec) + (deferred ? JSON.stringify(deferred) : "")`
         // (`index.ts:621`): a change to the namespace or the schema re-registers the tool.
         let fingerprint = match &deferred {
@@ -5224,7 +5255,7 @@ mod tests {
         };
         let config = config_of(&[("my-srv", search_entry())]);
         let cache = two_tool_cache(&config, "my-srv");
-        let fields = deferred_tool_fields(&spec, Some(&cache)).expect("a lazy spec");
+        let fields = deferred_tool_fields(&spec, &config, Some(&cache)).expect("a lazy spec");
         assert_eq!(fields.namespace.name, "mcp__my_srv");
         assert_eq!(
             fields.namespace.instructions.as_deref(),
@@ -5271,6 +5302,7 @@ mod tests {
                     lazy: false,
                     ..spec.clone()
                 },
+                &config,
                 Some(&cache)
             ),
             None
@@ -5287,6 +5319,81 @@ mod tests {
         assert_eq!(eager.exposure(), ToolExposure::Direct);
         assert_eq!(eager.namespace(), None);
         assert_eq!(eager.output_schema(), None);
+    }
+
+    /// `MCP-612` — `deferredToolFields` @ pi-mcp-adapter `2ccf648` (`index.ts:438-464`): the
+    /// configured server description reaches the namespace trimmed, and a cached tool's
+    /// `outputSchema` is nested as `structuredContent`; a resource tool never looks one up.
+    #[test]
+    fn a_search_mode_tool_carries_the_server_description_and_its_output_schema() {
+        let spec = DirectToolSpec {
+            server_name: "my-srv".to_string(),
+            original_name: "one".to_string(),
+            prefixed_name: "my_srv_one".to_string(),
+            description: "Does one.".to_string(),
+            input_schema: None,
+            resource_uri: None,
+            lazy: true,
+        };
+        let structured = json!({
+            "type": "object",
+            "properties": { "count": { "type": "integer" } },
+            "required": ["count"]
+        });
+        // The schema arrives through the on-disk cache: written by `serialize_tools`, read back
+        // by this module's reader.
+        let mut live = rmcp::model::Tool::new("one", "Does one.", Arc::new(serde_json::Map::new()));
+        live.output_schema = structured.as_object().cloned().map(Arc::new);
+        let written = crate::dirs::serialize_tools(&[live]);
+        let read: Vec<CachedTool> =
+            serde_json::from_value(serde_json::to_value(&written).unwrap()).unwrap();
+
+        let described = ServerEntry {
+            description: Some("  Docs search \n".to_string()),
+            ..search_entry()
+        };
+        let config = config_of(&[("my-srv", described)]);
+        let cache = cache_of(&config, &[("my-srv", cache_entry(read))]);
+        let fields = deferred_tool_fields(&spec, &config, Some(&cache)).expect("a lazy spec");
+        assert_eq!(fields.namespace.description.as_deref(), Some("Docs search"));
+        assert_eq!(
+            fields.output_schema["properties"]["structuredContent"],
+            structured
+        );
+        assert_eq!(
+            fields.output_schema["properties"]["content"],
+            json!({ "type": "array", "items": { "type": "object" } })
+        );
+
+        // A blank description is absent, and a tool without a schema nests nothing.
+        let blank = config_of(&[(
+            "my-srv",
+            ServerEntry {
+                description: Some(" ".to_string()),
+                ..search_entry()
+            },
+        )]);
+        let bare = cache_of(&blank, &[("my-srv", cache_entry(vec![cached_tool("one")]))]);
+        let fields = deferred_tool_fields(&spec, &blank, Some(&bare)).expect("a lazy spec");
+        assert_eq!(fields.namespace.description, None);
+        assert!(
+            fields.output_schema["properties"]
+                .get("structuredContent")
+                .is_none()
+        );
+
+        // `spec.resourceUri ? undefined : ...` -- a resource tool never borrows a tool's schema,
+        // even one whose original name collides.
+        let resource = DirectToolSpec {
+            resource_uri: Some("docs://one".to_string()),
+            ..spec
+        };
+        let fields = deferred_tool_fields(&resource, &config, Some(&cache)).expect("a lazy spec");
+        assert!(
+            fields.output_schema["properties"]
+                .get("structuredContent")
+                .is_none()
+        );
     }
 
     /// A mode-only change (search to eager) must re-register, or the tool keeps the exposure it was
@@ -5355,7 +5462,7 @@ mod tests {
                 lazy,
                 ..spec.clone()
             };
-            let fields = deferred_tool_fields(&spec, None);
+            let fields = deferred_tool_fields(&spec, &McpConfig::default(), None);
             DirectTool::new(spec, ToolRenderKind::SelfRendered, dispatch, fields)
         };
         let run = |tool: DirectTool| async move {
