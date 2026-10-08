@@ -455,6 +455,14 @@ struct RegistryInner {
     provider_hub: ProviderHub,
     /// Which extension owns each provider id (for diagnostics / unload).
     provider_owner: HashMap<String, ExtensionId>,
+    /// Virtual-model registrations: definition + router, deferred→bind→flush, exactly the
+    /// lifecycle `provider_hub` has (pi: "Registration follows the same queuing and reload rules
+    /// as `pi.registerProvider()`", `docs/virtual-models.md`).
+    virtual_model_hub: crate::virtual_model::VirtualModelHub,
+    /// Which extension owns each `(provider, id)` virtual model. pi has NO such attribution
+    /// (`model-runtime.ts:179`) and leaks a dead extension's routers across a `/reload`; see
+    /// [`crate::virtual_model`]'s module docs for why cyrup keeps it.
+    virtual_model_owner: HashMap<(String, String), ExtensionId>,
     /// Guest (WASM) tool descriptors keyed by name. A guest tool executes back across the boundary
     /// (gap-08 #28), so it is held as a descriptor here rather than as an `Arc<dyn Tool>`.
     guest_tool_order: Vec<String>,
@@ -1537,6 +1545,95 @@ impl ExtensionRegistry {
         Ok(())
     }
 
+    /// Register (or replace) a VIRTUAL model — pi `pi.registerVirtualModel`
+    /// (`extensions/loader.ts:500-513` @v1.0.4), routed through the [`crate::VirtualModelHub`] with
+    /// the same deferral as [`Self::register_provider`]: an immediate sink upsert once the model
+    /// registry is bound, else queued for the next [`Self::bind_model_registry`].
+    ///
+    /// `extension_path` is pi's `extensionPath` on each pending entry (`loader.ts:226-232`), used
+    /// to attribute a flush failure. The `(provider, id)` pair's owner becomes `owner` — last
+    /// registration wins, exactly as both provider doors do — so [`Self::purge_owner`] drops it
+    /// with the rest of the owner's registrations.
+    ///
+    /// # Errors
+    ///
+    /// The registry's own refusal when a sink is already bound and rejects the registration (an
+    /// empty provider or id; an id that already names a PHYSICAL model of that provider). Pre-bind
+    /// the registration is queued and cannot fail, which is upstream's shape too.
+    pub fn register_virtual_model(
+        &self,
+        owner: ExtensionId,
+        definition: cyrup_provider::VirtualModelDefinition,
+        extension_path: impl Into<String>,
+    ) -> Result<(), ExtError> {
+        let key = (
+            definition.spec.provider.as_str().to_string(),
+            definition.spec.id.as_str().to_string(),
+        );
+        let mut g = self.lock_write()?;
+        g.virtual_model_hub
+            .register(definition, extension_path)
+            .map_err(ExtError::Component)?;
+        g.virtual_model_owner.insert(key, owner);
+        Ok(())
+    }
+
+    /// Remove ONE virtual model — pi `pi.unregisterVirtualModel(provider, id)` — but only when
+    /// `owner` is that pair's CURRENT owner. A virtual model someone else (re)registered is left
+    /// alone and the answer is `false`, which is the same narrowing
+    /// [`Self::unregister_provider_owned`] applies and for the same reason: the post-`init`
+    /// `LateRegistrar`'s owner is bound by the host, so a handle can retract what it registered and
+    /// nothing else.
+    ///
+    /// # Errors
+    ///
+    /// Only a poisoned registry lock.
+    pub fn unregister_virtual_model_owned(
+        &self,
+        owner: &ExtensionId,
+        provider: &str,
+        id: &str,
+    ) -> Result<bool, ExtError> {
+        let key = (provider.to_string(), id.to_string());
+        let mut g = self.lock_write()?;
+        if g.virtual_model_owner.get(&key) != Some(owner) {
+            return Ok(false);
+        }
+        g.virtual_model_owner.remove(&key);
+        Ok(g.virtual_model_hub.unregister(provider, id))
+    }
+
+    /// [`Self::unregister_virtual_model_owned`] without the ownership narrowing — the host/embedder
+    /// door, matching [`Self::unregister_provider`].
+    ///
+    /// # Errors
+    ///
+    /// Only a poisoned registry lock.
+    pub fn unregister_virtual_model(&self, provider: &str, id: &str) -> Result<bool, ExtError> {
+        let mut g = self.lock_write()?;
+        g.virtual_model_owner
+            .remove(&(provider.to_string(), id.to_string()));
+        Ok(g.virtual_model_hub.unregister(provider, id))
+    }
+
+    /// The `(provider, id)` pairs still queued for the next [`Self::bind_model_registry`].
+    ///
+    /// # Errors
+    ///
+    /// Only a poisoned registry lock.
+    pub fn virtual_model_pending_pairs(&self) -> Result<Vec<(String, String)>, ExtError> {
+        Ok(self.lock_read()?.virtual_model_hub.pending_pairs())
+    }
+
+    /// Every registered virtual model's `(provider, id)`, in registration order.
+    ///
+    /// # Errors
+    ///
+    /// Only a poisoned registry lock.
+    pub fn virtual_model_keys(&self) -> Result<Vec<(String, String)>, ExtError> {
+        Ok(self.lock_read()?.virtual_model_hub.keys())
+    }
+
     /// Opt a registered command into argument autocomplete — the registry table behind BOTH tiers'
     /// `add-autocomplete` (the native `InitApi` call and, since EXT-065's neighbouring fix, the
     /// guest's `registration.add-autocomplete` import).
@@ -1709,6 +1806,28 @@ impl ExtensionRegistry {
             dropped += 1;
         }
 
+        // --- virtual models. [CYRUP-DELTA], and a deliberate improvement: pi attributes virtual
+        // models to nobody (`model-runtime.ts:179`) and removes them only on an explicit
+        // `unregisterVirtualModel` (`:976-982`), so after a `/reload` a dead extension's router is
+        // still registered and its captured `runtime.createContext()` (`loader.ts:504-508`) throws
+        // against the runtime the reload invalidated (`:191-200`). Dropping them with the owner is
+        // what keeps a reloaded session from routing through a dead extension's closure.
+        //
+        // Note this is purge-by-OWNER only. `provider_hub.unregister` above must NOT reach here:
+        // the docs page says `pi.unregisterProvider()` does not remove virtual models.
+        let keys: Vec<(String, String)> = g
+            .virtual_model_owner
+            .iter()
+            .filter(|(_, o)| *o == owner)
+            .map(|(k, _)| k.clone())
+            .collect();
+        for (provider, id) in &keys {
+            g.virtual_model_owner
+                .remove(&(provider.clone(), id.clone()));
+            g.virtual_model_hub.unregister(provider, id);
+            dropped += 1;
+        }
+
         // --- plain owner-keyed lists and maps ---
         macro_rules! retain_not_owner {
             ($field:ident, $pred:expr) => {{
@@ -1763,10 +1882,27 @@ impl ExtensionRegistry {
         Ok(g.provider_hub.unregister(id))
     }
 
-    /// Bind the model-registry sink and flush queued provider registrations (Pi `bindCore`).
-    pub fn bind_model_registry(&self, sink: Arc<dyn ModelRegistrySink>) -> Result<(), ExtError> {
-        self.lock_write()?.provider_hub.bind(sink);
-        Ok(())
+    /// Bind the model-registry sink and flush queued provider AND virtual-model registrations (Pi
+    /// `bindCore`, `extensions/runner.ts:485-514` @v1.0.4 — the two pending loops run back to back
+    /// against one `providerActions` bag).
+    ///
+    /// Returns the virtual-model registrations the sink refused, in pi's per-item-contained shape
+    /// (`runner.ts:502-514`, and the identical loop at `agent-session-services.ts:182-194`): one
+    /// bad router costs the others nothing and does not fail the extension load. The caller turns
+    /// each into pi's `Extension "{path}" error: {message}` startup diagnostic — see
+    /// [`crate::VirtualModelFlushError::diagnostic`].
+    ///
+    /// # Errors
+    ///
+    /// Only a poisoned registry lock. A refused virtual-model registration is RETURNED, not
+    /// errored.
+    pub fn bind_model_registry(
+        &self,
+        sink: Arc<dyn ModelRegistrySink>,
+    ) -> Result<Vec<crate::VirtualModelFlushError>, ExtError> {
+        let mut g = self.lock_write()?;
+        g.provider_hub.bind(Arc::clone(&sink));
+        Ok(g.virtual_model_hub.bind(sink))
     }
 
     /// Provider ids still queued for the next [`Self::bind_model_registry`] (not yet flushed).

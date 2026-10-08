@@ -10,7 +10,10 @@
 
 use crate::autocomplete::{AutocompleteProvider, AutocompleteQuery, AutocompleteSuggestions};
 use crate::ctx::{BashCommand, CommandCtx, Ctx, ToolCall};
-use crate::descriptor::{CommandDescriptor, FlagSpec, ProviderConfig, ToolDescriptor};
+use crate::descriptor::{
+    CommandDescriptor, FlagSpec, ModelRoute, ModelRouteRequest, ProviderConfig, ToolDescriptor,
+    VirtualModelSpec,
+};
 use crate::events::*;
 use crate::provider::{OAuthCallbacks, OAuthCredentials, ProviderHandlers, ProviderStream};
 use serde::{Deserialize, Serialize};
@@ -805,6 +808,37 @@ where
     }
 }
 
+/// Picks the physical model and thinking level for one request — pi
+/// `ExtensionVirtualModel.route(request, ctx)` (`core/extensions/types.ts:1888` @v1.0.4, over
+/// `VirtualModelDefinition.route`, `core/virtual-models.ts:101`).
+///
+/// Register one with [`ExtensionApi::register_virtual_model`]. The host calls it once per provider
+/// request whose selected model is that virtual one, through the `route-model` export: the callable
+/// stays guest-side because ADR-0002 keeps callables off the value seam, so only the
+/// [`VirtualModelSpec`] crosses at registration time.
+///
+/// The returned [`ModelRoute`]'s `model` need only NAME a physical catalog model — the host
+/// re-resolves `provider`/`id` and rejects an answer that is virtual, unknown, or has no
+/// credentials. The natural body is pi's own: [`Ctx::models`]`().find(provider, id)`.
+///
+/// `Err(message)` is pi's `route()` THROWING, and upstream's contract for it is one sentence: *"If
+/// `route()` throws, or returns a virtual model or a model without credentials, the request ends
+/// with an error response"* (`docs/virtual-models.md` @v1.0.4).
+pub trait VirtualModelRouter: 'static {
+    /// Route ONE request. `ctx` is pi's second argument — the per-request extension context
+    /// (`core/extensions/loader.ts:504`).
+    fn route(&self, request: &ModelRouteRequest, ctx: &Ctx) -> Result<ModelRoute, String>;
+}
+
+impl<F> VirtualModelRouter for F
+where
+    F: Fn(&ModelRouteRequest, &Ctx) -> Result<ModelRoute, String> + 'static,
+{
+    fn route(&self, request: &ModelRouteRequest, ctx: &Ctx) -> Result<ModelRoute, String> {
+        self(request, ctx)
+    }
+}
+
 /// A uniform handler: parses the ordered string args the host passes and returns a [`RawOutcome`].
 type Handler = Box<dyn Fn(&[&str], &Ctx) -> RawOutcome + 'static>;
 
@@ -836,6 +870,12 @@ pub struct ExtensionApi {
     /// DRIFT-004: at most one per extension — upstream reads `operations` off the SINGLE
     /// `UserBashEventResult` whose handler won the reduction (`extensions/runner.ts:1005-1032`).
     pub(crate) bash_operations: Option<Box<dyn BashOperations>>,
+    /// The virtual models this extension registers, in registration order, each with the router
+    /// that stays guest-side behind the `route-model` export. pi's registry is keyed by
+    /// `(provider, id)` and the LISTING ORDER is observable, so this is an ordered `Vec` and a
+    /// re-registration of the same pair REPLACES in place
+    /// (`ExtensionApi::register_virtual_model`).
+    pub(crate) virtual_models: Vec<(VirtualModelSpec, Box<dyn VirtualModelRouter>)>,
     /// EXT-021: this extension's raw terminal-input handler, if it subscribed. AT MOST ONE —
     /// upstream allows several `onTerminalInput` calls per extension, but each returns its own
     /// unsubscribe and the host's subscriber table is keyed by EXTENSION, so a guest with two
@@ -1110,6 +1150,83 @@ impl ExtensionApi {
     /// `registration.register-bash-operations` import at init).
     pub fn has_bash_operations(&self) -> bool {
         self.bash_operations.is_some()
+    }
+
+    /// Register a virtual model: a selectable catalog entry that routes each request to a physical
+    /// model — pi `pi.registerVirtualModel(model)` (`core/extensions/types.ts:1865-1872` @v1.0.4).
+    ///
+    /// The selection (`ctx.model`, `model_change` entries) names the VIRTUAL model; assistant
+    /// messages record the physical model and thinking level `router` picked.
+    ///
+    /// `spec` crosses the seam at `init` through `registration.register-virtual-model`, which the
+    /// host REFUSES for an empty provider or id and for an id that already names a physical model
+    /// of that provider — upstream throws for both, and the SDK propagates that refusal out of
+    /// `init` so the load fails rather than quietly missing a model. `router` stays guest-side and
+    /// is reached through the `route-model` export, once per provider request.
+    ///
+    /// Registering the same `(provider, id)` again REPLACES it, exactly as upstream's `Map.set`
+    /// does, and in place — the listing order is observable.
+    pub fn register_virtual_model(
+        &mut self,
+        spec: VirtualModelSpec,
+        router: impl VirtualModelRouter,
+    ) {
+        let entry = (spec, Box::new(router) as Box<dyn VirtualModelRouter>);
+        match self
+            .virtual_models
+            .iter()
+            .position(|(s, _)| s.provider == entry.0.provider && s.id == entry.0.id)
+        {
+            Some(at) => {
+                if let Some(slot) = self.virtual_models.get_mut(at) {
+                    *slot = entry;
+                }
+            }
+            None => self.virtual_models.push(entry),
+        }
+    }
+
+    /// Remove a virtual model this extension registered — pi `pi.unregisterVirtualModel(provider,
+    /// id)` (`core/extensions/types.ts:1875` @v1.0.4). Returns whether it was present, which is
+    /// upstream's no-op arm.
+    ///
+    /// Call this BEFORE `init` returns to drop a pending registration. From a live handler, use
+    /// [`Ctx::unregister_virtual_model`] instead, which also tells the host.
+    pub fn unregister_virtual_model(&mut self, provider: &str, id: &str) -> bool {
+        let before = self.virtual_models.len();
+        self.virtual_models
+            .retain(|(s, _)| !(s.provider == provider && s.id == id));
+        self.virtual_models.len() != before
+    }
+
+    /// The virtual-model SPECS to flush through `registration.register-virtual-model` at `init`, in
+    /// registration order.
+    pub fn virtual_model_specs(&self) -> Vec<VirtualModelSpec> {
+        self.virtual_models.iter().map(|(s, _)| s.clone()).collect()
+    }
+
+    /// Run the router registered for `(provider, id)` — the `route-model` export body.
+    ///
+    /// `Err` when none is registered, so an unexpected call is a FAILED route rather than a silent
+    /// success: a bogus successful answer would be streamed, which is the one outcome upstream's
+    /// contract rules out.
+    pub fn route_virtual_model(
+        &self,
+        provider: &str,
+        id: &str,
+        request: &ModelRouteRequest,
+        ctx: &Ctx,
+    ) -> Result<ModelRoute, String> {
+        match self
+            .virtual_models
+            .iter()
+            .find(|(s, _)| s.provider == provider && s.id == id)
+        {
+            Some((_, router)) => router.route(request, ctx),
+            None => Err(format!(
+                "this extension registered no router for virtual model `{provider}/{id}`"
+            )),
+        }
     }
 
     /// Listen to raw terminal input (EXT-021; pi `ctx.ui.onTerminalInput(handler)`,

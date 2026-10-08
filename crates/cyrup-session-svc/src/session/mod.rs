@@ -43,6 +43,7 @@ mod thinking;
 mod tools;
 mod transcript;
 mod types;
+mod virtual_models;
 
 // The seam surface `lib.rs` re-exports (`pub use session::{...}`) — same names, same paths.
 pub(crate) use codemode::CodemodeSettings;
@@ -283,6 +284,22 @@ pub struct AgentSession {
     /// Set once after an overflow auto-compaction so a second overflow does not loop (Pi
     /// `_overflowRecoveryAttempted`, agent-session.ts:1859).
     overflow_recovery_attempted: Mutex<bool>,
+    // ---- virtual-model routing (pi agent-session.ts:407,775-831) ----
+    /// The assistant response a retry is about to retry — pi `_failedResponse`
+    /// (`agent-session.ts:407` @v1.0.4).
+    ///
+    /// Written at pi's two sites (after `_prepareRetry` succeeds, `:1852`; after an overflow
+    /// compact-and-retry returns `true`, `:3031`) and cleared at pi's three (the head of a prompt
+    /// run, `:1811`; the run's `finally`, `:1831`; and consumed by the routing step itself,
+    /// `:778-779`). It is what makes the next request's `ModelRouteReason` `Retry` and what carries
+    /// the failed physical request to the router, which the transcript can no longer supply —
+    /// `prepare_retry` has already dropped that message from it.
+    ///
+    /// A missed clear leaks a stale failure into the FIRST request of the next prompt, which would
+    /// then be routed as a retry of a message the transcript does not contain: the same class of
+    /// leak `SESS-062` documents for `retry_attempt`, which is why the clears are at pi's sites and
+    /// nowhere else.
+    failed_response: Mutex<Option<AssistantMessage>>,
     /// Latched by [`Self::abort`] while a run is active, so every post-run decision point can tell
     /// an abort from a normal `agent_end` — Pi `_agentRunAbortRequested`
     /// (`agent-session.ts:339` @v0.87.1), cleared where a run starts (`_runAgentPrompt` :1469) and
@@ -484,6 +501,7 @@ impl AgentSession {
             auto_compaction_enabled_default: extras.auto_compaction_enabled,
             auto_compaction_cancel: Mutex::new(None),
             overflow_recovery_attempted: Mutex::new(false),
+            failed_response: Mutex::new(None),
             agent_run_abort_requested: AtomicBool::new(false),
             proc: extras.proc,
             shell_path: extras.shell_path,

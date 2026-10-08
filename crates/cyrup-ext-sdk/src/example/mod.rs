@@ -15,6 +15,7 @@
 //! - `commands_session` — the commands reading or mutating session / agent state.
 //! - `renderers` — the message and entry renderers, and the types behind them.
 //! - `provider` — the `demo-oauth` provider and the global autocomplete provider.
+//! - `virtual_model` — the `router/demo-auto` virtual model and the router behind it.
 //! - `wiring` — the `demo-flag` CLI flag and the `demo:bus` event-bus subscription.
 
 mod commands_capability;
@@ -24,9 +25,16 @@ mod hooks;
 mod provider;
 mod renderers;
 mod tools;
+pub mod virtual_model;
 mod wiring;
 
 use crate::ExtensionApi;
+
+/// The identifiers a host-side test needs to name this demo's virtual-model seam, so an assertion
+/// cannot drift from the guest by holding its own copy of a literal.
+pub use virtual_model::{
+    CANCEL_OBSERVED, DEMO_ROUTER_ID, DEMO_ROUTER_PROVIDER, HOLD_COMMAND, HOLD_TOOL,
+};
 
 /// Build the demo extension's [`ExtensionApi`]. Pure ergonomic-layer code — also unit-testable on
 /// the host target.
@@ -39,6 +47,7 @@ pub fn build() -> ExtensionApi {
     commands_session::install(&mut api);
     renderers::install(&mut api);
     provider::install(&mut api);
+    virtual_model::install(&mut api);
     wiring::install(&mut api);
     api
 }

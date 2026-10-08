@@ -113,6 +113,7 @@ impl Decoder {
             response_model: self.response_model.clone(),
             response_id: self.response_id.clone(),
             provider_thinking_level: None,
+            thinking_level: None,
             diagnostics: None,
             usage,
             stop_reason: self.stop_reason.unwrap_or(StopReason::Pending),

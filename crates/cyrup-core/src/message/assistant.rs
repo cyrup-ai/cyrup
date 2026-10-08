@@ -15,6 +15,24 @@ use crate::{ApiId, ModelId, ModelRef, ProviderId};
 /// terminal errors, not appendable replay turns).
 pub const UNRESOLVED_API: &str = "unknown";
 
+/// Api id of virtual catalog entries — pi `VIRTUAL_MODEL_API`
+/// (`packages/coding-agent/src/core/virtual-models.ts:29` @v1.0.4).
+///
+/// A **virtual model** is a catalog entry that routes each request to a physical model. Nothing
+/// below the routing step ever sees one: providers stream physical models and assistant messages
+/// record them. A request for a model carrying this api fails unless it was routed first.
+///
+/// It lands on [`AssistantMessage::api`] exactly like [`UNRESOLVED_API`] does, because **failed
+/// routing leaves the virtual model on its message** (`virtual-models.ts:104`, `:137`) — which is
+/// why this sentinel is declared here rather than in a catalog crate.
+///
+/// Home chosen for the dependency direction: `cyrup-session` depends on `cyrup-provider`, so
+/// `cyrup-provider` cannot read the literal out of `cyrup-session`. Both already depend on
+/// `cyrup-core`, so one definition here serves
+/// [`cyrup_provider::virtual_models`](../../../cyrup_provider/virtual_models/index.html) and
+/// `cyrup_session::virtual_models`, which re-exports it.
+pub const VIRTUAL_MODEL_API: &str = "pi-virtual";
+
 /// serde default for [`AssistantMessage::api`]: the [`UNRESOLVED_API`] sentinel, used only when a
 /// deserialized message omits `api` (legacy/foreign data — Pi's runtime accepts the same).
 fn default_api() -> ApiId {
@@ -63,6 +81,27 @@ pub struct AssistantMessage {
     /// re-export silently changes the request prefix and invalidates the cache (PROV-091).
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub provider_thinking_level: Option<String>,
+    /// The Pi thinking level the AGENT LOOP requested for this response (Pi `thinkingLevel?:
+    /// ModelThinkingLevel`, `packages/ai/src/types.ts:558-559` @v1.0.4, declared between
+    /// `providerThinkingLevel` and `diagnostics` — upstream's own wording: *"Pi thinking level the
+    /// agent loop requested for this response. Absent outside the agent loop and for legacy
+    /// responses."*).
+    ///
+    /// Distinct from [`Self::provider_thinking_level`], which is the provider-NATIVE effort string
+    /// the adapter actually sent. This one is the canonical cyrup/pi rung, and it is set in exactly
+    /// one place: the agent loop stamps it on the SETTLED result (Pi `Object.assign(await
+    /// response.result(), { thinkingLevel: config.reasoning ?? "off" })`,
+    /// `packages/agent/src/agent-loop.ts:408-409`), so under a virtual selection it records the
+    /// ROUTED level rather than the selected one. Every other constructor leaves it `None`.
+    ///
+    /// Its reader is the virtual-model routing step: `ModelRouteRequest.previous.thinking_level`
+    /// and `.failed.thinking_level` come from here (`cyrup_provider::message_thinking_level`), and
+    /// every upstream router's sticky idiom is `(failed ?? previous).thinkingLevel ?? <default>` —
+    /// so without this field a continuation silently drops to the router's fallback instead of
+    /// holding the level the turn was answered at, losing the thinking signatures and prompt-cache
+    /// prefix the field exists to preserve.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub thinking_level: Option<crate::ModelThinkingLevel>,
     /// Redacted provider/runtime diagnostics for failures and recoveries (Pi
     /// `diagnostics?: AssistantMessageDiagnostic[]`, types.ts:391). Skipped when empty/none.
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -164,6 +203,7 @@ impl serde::Serialize for AssistantMessage {
             + usize::from(self.response_model.is_some())
             + usize::from(self.response_id.is_some())
             + usize::from(self.provider_thinking_level.is_some())
+            + usize::from(self.thinking_level.is_some())
             + usize::from(self.diagnostics.is_some())
             + usize::from(self.deferred.is_some())
             + usize::from(self.error_message.is_some())
@@ -186,6 +226,10 @@ impl serde::Serialize for AssistantMessage {
         match &self.provider_thinking_level {
             Some(v) => st.serialize_field("providerThinkingLevel", v)?,
             None => st.skip_field("providerThinkingLevel")?,
+        }
+        match &self.thinking_level {
+            Some(v) => st.serialize_field("thinkingLevel", v)?,
+            None => st.skip_field("thinkingLevel")?,
         }
         match &self.diagnostics {
             Some(v) => st.serialize_field("diagnostics", v)?,
@@ -244,6 +288,7 @@ impl AssistantMessage {
             response_model: None,
             response_id: None,
             provider_thinking_level: None,
+            thinking_level: None,
             diagnostics: None,
             usage: Usage::default(),
             stop_reason,
@@ -278,6 +323,7 @@ mod tests {
             response_model: None,
             response_id: None,
             provider_thinking_level: None,
+            thinking_level: None,
             diagnostics: None,
             usage: Usage::default(),
             stop_reason: StopReason::Stop,
@@ -305,6 +351,7 @@ mod tests {
             response_model: None,
             response_id: None,
             provider_thinking_level: None,
+            thinking_level: None,
             diagnostics: None,
             usage: Usage::default(),
             stop_reason: StopReason::Stop,

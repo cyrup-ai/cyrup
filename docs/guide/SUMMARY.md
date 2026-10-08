@@ -28,6 +28,7 @@
 - [The permission system](extensions/permissions.md)
 - [Intercom](extensions/intercom.md)
 - [Flux: the structured pipeline](extensions/flux.md)
+- [Virtual models](extensions/virtual-models.md)
 - [Writing an extension](extensions/authoring.md)
 
 # Reference

@@ -166,6 +166,22 @@ pub struct AgentSessionServices {
     /// installs the owning provider on a matching `set_model` (arch-08 §5.6). Empty until a guest
     /// `registerProvider` fires.
     pub guest_providers: Arc<crate::guest_providers::GuestProviderRegistry>,
+    /// The session's virtual-model registry — pi `ModelRuntime.virtualModels`
+    /// (`packages/coding-agent/src/core/model-runtime.ts:179` @v1.0.4), the two-level
+    /// `Map<providerId, Map<id, {model, route}>>` that `registerVirtualModel` writes and
+    /// `resolveModel` routes through.
+    ///
+    /// Shared, never cloned: the extension seam, the builder and the routing step all hold this one
+    /// `Arc`. Its catalog rows are folded into the composed registry LAST (pi composes the provider
+    /// and only then wraps it with `withVirtualModels`, `:171-178`), and its
+    /// [`generation`](cyrup_provider::VirtualModelRegistry::generation) is the fourth key of the
+    /// registry-snapshot cache — without it a model registered after the first catalog read would
+    /// stay invisible.
+    ///
+    /// Empty for a session that registers none, in which case every path behaves exactly as it did
+    /// before virtual models existed ([`cyrup_provider::VirtualModelRegistry::is_empty`] is the
+    /// cheap test the routing step takes first).
+    pub virtual_models: Arc<cyrup_provider::VirtualModelRegistry>,
     /// The resolved active model for this session, or `None` when the session launched with no
     /// model — pi `AgentSession.model: Model | undefined`, the state `findInitialModel` produces
     /// when nothing is configured (sdk.ts:216-218 ⇒ `modelFallbackMessage`, a banner rather than an

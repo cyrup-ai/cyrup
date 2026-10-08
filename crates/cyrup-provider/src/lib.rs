@@ -36,6 +36,8 @@ pub mod unconfigured;
 pub mod usage;
 pub mod utils;
 pub mod validate;
+pub mod virtual_models;
+pub mod virtual_registry;
 pub mod wire;
 
 // The scripted test double. `feature = "faux"` must reach this crate ONLY through a
@@ -219,6 +221,16 @@ pub use utils::transcript::{
     without_initial_system_message,
 };
 pub use validate::{ToolValidationError, validate_named_tool_call, validate_tool_call};
+pub use virtual_models::{
+    VIRTUAL_MODEL_API, VirtualModelSpec, create_virtual_model, is_virtual_any, is_virtual_model,
+    unrouted_message,
+};
+pub use virtual_registry::{
+    FailedRequest, ModelRoute, ModelRouteError, ModelRouteReason, ModelRouteRequest, ModelRouter,
+    NoCatalog, RouteOptions, RoutedModel, VirtualModelCatalog, VirtualModelDefinition,
+    VirtualModelError, VirtualModelListener, VirtualModelRegistry, find_latest_response,
+    message_thinking_level,
+};
 pub use wire::WireProvider;
 
 /// Header overlay: a `None` value suppresses a would-be default header (arch-01 §3.1).

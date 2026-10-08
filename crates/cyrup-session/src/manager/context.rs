@@ -15,6 +15,23 @@ use crate::entry::{Entry, KnownEntry};
 use super::SessionManager;
 
 impl SessionManager {
+    /// The projection's own model/thinking pass — Pi `getSessionContextSettings`
+    /// (`session-manager.ts:418-433`).
+    ///
+    /// # This is NOT the virtual-aware selection (`SESS-067`)
+    ///
+    /// The `model` this records is a FORWARD last-wins scan, so under a virtual selection it names
+    /// the physical model that answered last, not the router the user selected. That is upstream's
+    /// shape and is deliberately left alone: `getSessionContextSettings`'s body is **byte-identical
+    /// at v0.87.1, v1.0.0 and v1.0.4** (`sha256 1f011ecc8400ee6a…` over `:418-433` at all three),
+    /// i.e. the virtual-models feature did not touch it, and at v1.0.4 `existingSession.model` has
+    /// no reader anywhere in `packages/coding-agent/src` — `sdk.ts` reads only `.messages` (`:201`)
+    /// and `.thinkingLevel` (`:248`).
+    ///
+    /// Upstream applies the hold rule in exactly two places, both against the RAW branch rather
+    /// than this projection: the restore step (`sdk.ts:207-222`) and `_recordSelection`
+    /// (`agent-session.ts:609-625`). A caller that wants the selection asks
+    /// [`Self::branch_selection`]; see [`SessionContext::model`] for the same note at the field.
     pub fn build_context(&self) -> SessionContext {
         let path = self.branch_path(None);
         if path.is_empty() {
@@ -29,6 +46,9 @@ impl SessionManager {
                     KnownEntry::ThinkingLevelChange { thinking_level, .. } => {
                         thinking = thinking_level.clone();
                     }
+                    // Last wins, FORWARD — including over a virtual `model_change` that the
+                    // assistant arm below then overwrites. See the note on `build_context`: this
+                    // is the projection value, not the selection.
                     KnownEntry::ModelChange {
                         provider, model_id, ..
                     } => {
@@ -38,6 +58,10 @@ impl SessionManager {
                             model: model_id.clone(),
                         });
                     }
+                    // Every assistant message counts here, including one left by FAILED ROUTING
+                    // (which names the virtual model, `virtual-models.ts:104`).
+                    // [`crate::virtual_models::branch_selection`] skips those; this pass does not,
+                    // because upstream's does not.
                     KnownEntry::Message {
                         message: AgentMessage::Core(Message::Assistant(a)),
                         ..
@@ -55,6 +79,26 @@ impl SessionManager {
             thinking_level: thinking,
             model,
         }
+    }
+
+    /// The model selection the active branch records — Pi `getBranchSelection(
+    /// sessionManager.getBranch(), getModel)` (`sdk.ts:209-211`, `agent-session.ts:620`).
+    ///
+    /// This is the virtual-aware answer and the one a RESTORE or a selection check wants:
+    /// a virtual `model_change` HOLDS across the physical responses it routed to, where
+    /// [`build_context`](Self::build_context)'s forward pass would report the model that answered.
+    /// See [`crate::virtual_models::branch_selection`] for the rule and for why `get_model` need
+    /// only answer for virtual entries.
+    ///
+    /// Exists so a caller does not have to pair `branch_path(None)` with the free function itself:
+    /// the branch path is borrowed state only the manager holds, exactly as it is for
+    /// [`Self::projected_context_estimate`].
+    #[must_use]
+    pub fn branch_selection(
+        &self,
+        get_model: impl Fn(&str, &str) -> Option<ModelRef>,
+    ) -> Option<ModelRef> {
+        crate::virtual_models::branch_selection(&self.branch_path(None), get_model)
     }
 
     /// The active-path context with its **roles intact** — Pi's

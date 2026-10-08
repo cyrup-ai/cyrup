@@ -185,6 +185,18 @@ impl<B: Backend> App<B> {
                 // `computeCacheWaste(entries, this.session.modelRuntime)` (`:5660`).
                 let breakdown = session.usage_cost_breakdown().await;
                 let cache_waste = session.cache_waste().await;
+                // SESS-065 — `const selectedModelKey = `${model?.provider}/${model?.id}``
+                // (`interactive-mode.ts:6671` @v1.0.4). The spelling must match the breakdown's own
+                // keys, which `usage_cost_breakdown` builds as `{provider}/{response_model ??
+                // model}` (`crate::state::usage_cost_breakdown`). Upstream interpolates
+                // `undefined` for a model-less session, producing the literal
+                // `"undefined/undefined"`, which no breakdown key can equal; cyrup's `None` arm
+                // uses an empty `String` for the same effect — a key that cannot match, so a
+                // model-less session with a one-row breakdown still PRINTS the row.
+                let selected_key = session
+                    .model()
+                    .map(|m| format!("{}/{}", m.provider.as_str(), m.model.as_str()))
+                    .unwrap_or_default();
                 let mut body = format!(
                     "| Field | Value |\n|-------|-------|\n\
                      | file | {} |\n| id | {} |\n\
@@ -210,9 +222,27 @@ impl<B: Backend> App<B> {
                 // `if (stats.cost > 0 || cacheWaste.missedTokens > 0) { … }` (`:5696`). Both
                 // additions live under pi's one guard, so a zero-cost session gains no rows.
                 if stats.cost > 0.0 || cache_waste.missed_tokens > 0 {
-                    // `if (usageBreakdown.length > 1)` (`:5699`) — a single-model session shows the
-                    // total only, because a one-row breakdown restates it.
-                    if breakdown.len() > 1 {
+                    // `if (usageBreakdown.length > 1 || usageBreakdown[0]?.key !==
+                    // selectedModelKey)` (`interactive-mode.ts:6715` @v1.0.4), under its own
+                    // comment: "A single entry repeats the total, unless it names a model other
+                    // than the selected one."
+                    //
+                    // SESS-065 — the second disjunct is what a VIRTUAL selection needs: every
+                    // response under `router/auto` is attributed to the PHYSICAL model that
+                    // answered, so a session that only ever routed to one model has a one-row
+                    // breakdown whose key is not the selection's, and the old
+                    // `breakdown.len() > 1` guard hid the only row that said where the money went.
+                    // It is reachable without any virtual model too — a session whose single
+                    // attributed row is a `response_model` (OpenRouter `auto`), or whose only cost
+                    // is the `Tools/summaries` bucket.
+                    //
+                    // `is_some_and` on an EMPTY breakdown is `false` where pi's
+                    // `usageBreakdown[0]?.key !== selectedModelKey` is `true`; the two agree on
+                    // output, because upstream then enters a loop over an empty array and emits
+                    // nothing.
+                    if breakdown.len() > 1
+                        || breakdown.first().is_some_and(|e| e.key != selected_key)
+                    {
                         for entry in &breakdown {
                             body.push_str(&format!(
                                 "| {} | ${:.3} ({} tokens) |\n",

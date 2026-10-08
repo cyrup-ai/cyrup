@@ -41,6 +41,7 @@ pub(super) fn empty_assistant(model: &ModelRef) -> AssistantMessage {
         response_model: None,
         response_id: None,
         provider_thinking_level: None,
+        thinking_level: None,
         diagnostics: None,
         usage: Usage::default(),
         // This message is only ever a PARTIAL — it seeds `partial` before the first `start` event

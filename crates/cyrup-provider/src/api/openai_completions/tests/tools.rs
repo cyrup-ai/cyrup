@@ -42,6 +42,7 @@ fn kimi_deferred_tools_move_from_the_tools_array_into_an_inline_system_message()
                 response_model: None,
                 response_id: None,
                 provider_thinking_level: None,
+                thinking_level: None,
                 diagnostics: None,
                 usage: Usage::default(),
                 stop_reason: StopReason::ToolUse,

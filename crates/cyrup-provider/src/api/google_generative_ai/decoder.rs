@@ -92,6 +92,7 @@ impl Decoder {
             response_model: None,
             response_id: self.response_id.clone(),
             provider_thinking_level: None,
+            thinking_level: None,
             diagnostics: None,
             usage,
             // Pi's live `partial` carries the raw `output.stopReason`, i.e. `"pending"` until a

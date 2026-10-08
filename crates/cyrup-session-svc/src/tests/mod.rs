@@ -90,6 +90,10 @@ mod tree_branch_summary_cap;
 mod turn_end_steer;
 mod type_driven_boundaries;
 mod ui_prompt_events;
+mod virtual_model_extension;
+mod virtual_model_limits;
+mod virtual_model_restore;
+mod virtual_model_routing;
 
 /// The system prompt a request carries, as the provider renders it: the replay of the transcript's
 /// system messages (`getCurrentSystemPrompt` over `normalizeContext`). The agent holds no prompt of

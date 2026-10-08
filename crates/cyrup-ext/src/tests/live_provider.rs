@@ -84,6 +84,23 @@ impl ModelRegistrySink for Sink {
         self.live.lock().unwrap().remove(id);
         self.events.lock().unwrap().push(format!("remove:{id}"));
     }
+    fn upsert_virtual_model(
+        &self,
+        definition: &cyrup_provider::VirtualModelDefinition,
+    ) -> Result<(), String> {
+        self.events.lock().unwrap().push(format!(
+            "upsert-virtual:{}/{}",
+            definition.spec.provider.as_str(),
+            definition.spec.id.as_str()
+        ));
+        Ok(())
+    }
+    fn remove_virtual_model(&self, provider: &str, id: &str) {
+        self.events
+            .lock()
+            .unwrap()
+            .push(format!("remove-virtual:{provider}/{id}"));
+    }
 }
 
 /// A native that registers live providers at `init` and stashes its [`LateRegistrar`] so a test can

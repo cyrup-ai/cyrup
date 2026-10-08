@@ -254,6 +254,19 @@ impl crate::native::LateRegistrar for HostLateRegistrar {
         self.registry.unregister_provider_owned(&self.owner, id)
     }
 
+    fn register_virtual_model(
+        &self,
+        definition: cyrup_provider::VirtualModelDefinition,
+    ) -> Result<(), ExtError> {
+        self.registry
+            .register_virtual_model(self.owner.clone(), definition, self.owner.as_str())
+    }
+
+    fn unregister_virtual_model(&self, provider: &str, id: &str) -> Result<bool, ExtError> {
+        self.registry
+            .unregister_virtual_model_owned(&self.owner, provider, id)
+    }
+
     fn owner(&self) -> ExtensionId {
         self.owner.clone()
     }
@@ -347,8 +360,17 @@ pub struct ExtensionHost {
 /// The native routing table, shared between the facade and the bus fan-out.
 type NativeMap = RwLock<std::collections::HashMap<ExtensionId, Arc<dyn NativeExtension>>>;
 /// The live-guest routing table, shared between the facade and the bus fan-out.
+///
+/// `pub` because a [`crate::host::GuestModelRouter`] holds a [`std::sync::Weak`] of it: a guest
+/// registers its virtual model from inside `init`, long before [`ExtensionHost::load_wasm`] has an
+/// `Arc<LiveExtension>` to bind a router to (the insert below happens only after
+/// [`crate::host::LiveExtension::load`] has run `init`), so the router resolves its instance out of
+/// this table per `route()` call instead. `Weak`, never `Arc`: facade -> `live` ->
+/// `LiveExtension` -> `GuestState` is already a strong chain and a strong edge back would leak the
+/// whole host, which is the lesson `dispatcher.set_bus_drain(Arc::downgrade(&fanout))` records
+/// below.
 #[cfg(feature = "wasm-host")]
-type LiveMap = RwLock<std::collections::HashMap<ExtensionId, Arc<crate::host::LiveExtension>>>;
+pub type LiveMap = RwLock<std::collections::HashMap<ExtensionId, Arc<crate::host::LiveExtension>>>;
 
 /// The inter-extension bus fan-out, extracted from the facade so it can be reached from the
 /// dispatcher (EXT-034).
@@ -610,6 +632,7 @@ impl ExtensionHost {
         ext.init(&mut api).await?;
         let typed_bus_topics = api.take_typed_bus_topics();
         let live_providers = api.take_live_providers();
+        let virtual_models = api.take_virtual_models();
         let (
             subs,
             tools,
@@ -703,6 +726,17 @@ impl ExtensionHost {
         for (provider_id, provider) in live_providers {
             self.registry
                 .register_provider_live(id.clone(), provider_id, provider)?;
+        }
+        // VIRTUAL models — pi's `pendingVirtualModelRegistrations`, handed from the extension's api
+        // object to the runtime (`extensions/loader.ts:226-228`, drained at `runner.ts:502-514` and
+        // `agent-session-services.ts:182-194`). Registered AFTER the live providers so a native
+        // that registers both has its physical catalog in the hub first, which is the order
+        // upstream's two flush loops run in. A failure here is a failed load, so
+        // `discard_registrations` purges whatever this owner already registered — virtual models
+        // included, through `purge_in`'s virtual block.
+        for definition in virtual_models {
+            self.registry
+                .register_virtual_model(id.clone(), definition, id.as_str())?;
         }
         for command in autocomplete {
             self.registry
@@ -2194,6 +2228,18 @@ impl ExtensionHost {
         &self.registry
     }
 
+    /// The loaded WASM instance for `id`, if one is live.
+    ///
+    /// The live-instance table is otherwise reached only from inside the facade; this is the door a
+    /// caller that holds an instance-scoped seam needs — a guest-supplied bash backend
+    /// ([`crate::host::GuestBashOperations`]) and a guest virtual-model router
+    /// ([`crate::host::GuestModelRouter`]) both hold one, and a test driving either has to name the
+    /// same instance the host routes into rather than loading a second one.
+    #[cfg(feature = "wasm-host")]
+    pub fn live_extension(&self, id: &ExtensionId) -> Option<Arc<crate::host::LiveExtension>> {
+        self.live.read().ok().and_then(|g| g.get(id).cloned())
+    }
+
     /// The host-wide UI-prompt window (EXT-075). The session hands it to its `HostServices`
     /// backend, which wraps its blocking prompts in it, so a NATIVE extension's prompt emits the
     /// pair too — natives call that backend directly, never through a guest import.
@@ -2510,6 +2556,12 @@ impl ExtensionHost {
                 .with_bus(self.bus.clone())
                 // EXT-075: this guest's `ui.*` prompts open the HOST-wide prompt window.
                 .with_ui_prompts(self.ui_prompts.clone())
+                // The late-resolving handle a virtual model registered during `init` is routed
+                // through: this guest's `Arc<LiveExtension>` does not exist until the insert into
+                // `self.live` below, so a `GuestModelRouter` holds this WEAK table instead and
+                // looks its owner up per `route()` call. That also makes `/reload` and a late
+                // (post-`init`) registration correct for free — see `LiveMap`'s own doc.
+                .with_live_map(Arc::downgrade(&self.live))
                 // EXT-054: the declared grant, seeded BEFORE `init` so the guest's very first call
                 // — `init` itself registers tools and can already reach `ui`/`exec` — runs under
                 // the restriction its manifest declared.

@@ -139,6 +139,7 @@ impl Decoder {
             response_model: None,
             response_id: None,
             provider_thinking_level: None,
+            thinking_level: None,
             diagnostics: None,
             usage,
             // pi seeds `output.stopReason = "pending"` (`:128`) and that seed IS the `partial`

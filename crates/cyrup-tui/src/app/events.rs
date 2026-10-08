@@ -343,7 +343,37 @@ impl<B: Backend> App<B> {
         self.refresh_auto_compact(session);
         if usage_may_have_moved {
             self.refresh_context_usage(session).await;
+            // TUI-143 — the routed-model suffix rides the SAME predicate, and the predicate is a
+            // complete cover for it. `routedModel` is `findLatestResponse(messages)` resolved
+            // through the catalog under a virtual selection (`agent-session.ts:1437-1443`), so it
+            // moves only when a response settles (`MessageEnd`, `AgentEnd`), when the selection
+            // changes (`ModelChanged`), or when the session underneath changes (`SessionStart`,
+            // `SessionReplaced`) — which is exactly `context_usage_may_have_moved`'s six events.
+            // `CompactionEnd` is in the set and harmless: a compaction does not remove the latest
+            // response from the branch. Upstream re-reads the getter on every frame, so there is no
+            // seventh site to port.
+            self.refresh_routed_model(session).await;
         }
+    }
+
+    /// Re-read `session.routedModel` into the footer (`footer.ts:241-245`): under a VIRTUAL
+    /// selection, where the latest response was actually dispatched.
+    ///
+    /// `None` for a physical selection — the accessor's own first clause — so this clears the
+    /// suffix on a switch away from a router rather than leaving a stale arrow behind.
+    pub async fn refresh_routed_model(&mut self, session: &Arc<AgentSession>) {
+        let routed = session
+            .routed_model()
+            .await
+            .map(|routed| crate::RoutedModel {
+                // `{provider}/{model}`, matching this footer's selected-model spelling (see
+                // `crate::RoutedModel`'s own [CYRUP-DELTA] note).
+                label: format!("{}/{}", routed.model.provider.as_str(), routed.model.id),
+                thinking_level: routed
+                    .thinking_level
+                    .map(|l| cyrup_provider::api::compat::thinking_level_key(l).to_string()),
+            });
+        self.state.status.set_routed_model(routed);
     }
 
     /// Re-read `getContextUsage()` off the live session into the footer (`footer.ts:106-111`), plus

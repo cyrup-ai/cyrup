@@ -15,3 +15,4 @@ mod sessions;
 mod system_row_bytes;
 mod tool_result_fields;
 mod tool_state;
+mod virtual_models;

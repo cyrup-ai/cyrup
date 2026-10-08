@@ -118,14 +118,17 @@ impl AgentSession {
     pub async fn stats_context_usage(&self) -> Option<crate::state::StatsContextUsage> {
         use cyrup_session::entry::{Entry, KnownEntry};
 
-        // `const model = this.model; if (!model) return undefined;` and
-        // `if (contextWindow <= 0) return undefined;` (`:3859-3863`), taken before the branch lock
-        // exactly as [`Self::context_usage`] takes them.
-        let context_window = {
-            Self::lock(&self.compaction_model)
-                .as_ref()
-                .map_or(0, |m| m.context_window)
-        };
+        // `const model = this._limitsModel(); if (!model) return undefined;` and
+        // `if (contextWindow <= 0) return undefined;` (`:4223-4227` @v1.0.4), taken before the
+        // branch lock exactly as [`Self::context_usage`] takes them.
+        //
+        // [`AgentSession::limits_model`] and NOT the bare selection: under a virtual selection the
+        // window that describes this conversation is the PHYSICAL model's that produced the latest
+        // response — `docs/virtual-models.md:29` — and the selection's own declared window is 0 by
+        // default, which this very guard would then read as "no known window" and report no meter
+        // at all. For a physical selection `limits_model` IS the selection, so every number here is
+        // unchanged.
+        let context_window = self.limits_model().await.map_or(0, |m| m.context_window);
         if context_window == 0 {
             return None;
         }
@@ -182,18 +185,19 @@ impl AgentSession {
         use cyrup_session::AgentMessage;
         use cyrup_session::entry::{Entry, KnownEntry};
 
-        // Pi `getContextUsage`: `const model = this.model; if (!model) return undefined;`
-        // (agent-session.ts:3165-3166) and `if (contextWindow <= 0) return undefined;` (:3168-3169).
-        // Taken FIRST, exactly as Pi orders it — the model read precedes `getBranch()` at :3174 — so
-        // the `compaction_model` leaf lock is released before the async `manager` guard is acquired
-        // and no lock-nesting question arises at all. cyrup's return type is non-optional, so the
+        // Pi `getContextUsage`: `const model = this._limitsModel(); if (!model) return undefined;`
+        // (agent-session.ts:4223-4224 @v1.0.4; `this.model` at `:3165-3166` @v0.83.0, before the
+        // limits model existed) and `if (contextWindow <= 0) return undefined;` (`:4226-4227`).
+        // Taken FIRST, exactly as Pi orders it — the model read precedes `getBranch()` — so the
+        // window read's own manager guard is released before this function's is acquired and no
+        // lock-nesting question arises at all. cyrup's return type is non-optional, so the
         // modelless case degrades to a zero window, which `from_last_assistant` already renders as
         // fraction 0.0 — the same "unknown occupancy" the TUI shows for an undefined usage.
-        let window = {
-            Self::lock(&self.compaction_model)
-                .as_ref()
-                .map_or(0, |m| m.context_window)
-        };
+        //
+        // The limits model, not the selection: this is the SAME window
+        // [`Self::stats_context_usage`] reports and the two must not disagree (SEAM-115 pins one
+        // producer for occupancy). See [`AgentSession::limits_model`].
+        let window = self.limits_model().await.map_or(0, |m| m.context_window);
 
         let guard = self.manager.lock().await;
         // The last assistant ON THE ACTIVE BRANCH, by parent-link walk — the same answer

@@ -38,6 +38,7 @@ fn assistant_blocks(content: Vec<Content>) -> Message {
         response_model: None,
         response_id: None,
         provider_thinking_level: None,
+        thinking_level: None,
         diagnostics: None,
         usage: Usage::default(),
         stop_reason: StopReason::Stop,

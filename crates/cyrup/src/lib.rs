@@ -30,6 +30,7 @@ pub mod output_guard;
 pub mod predispatch;
 pub mod prelaunch;
 pub mod provider;
+pub mod router_example;
 pub mod run;
 pub mod session_launch;
 pub mod session_resolve;

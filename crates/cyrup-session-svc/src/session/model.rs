@@ -57,7 +57,14 @@ impl AgentSession {
                 model.id.as_str()
             )));
         }
-        self.install_owning_provider(&model)?;
+        // A virtual model has NO owning provider to install: providers only ever see physical
+        // models, the routing step installs the routed model's provider per request, and a
+        // virtual-only provider id (`router`) has no entry in the bin's `ProviderResolver` at all —
+        // so `resolve_and_store` would fail with `NoConfiguredAuth` and make the selection
+        // impossible. pi needs no counterpart because it keeps every provider live.
+        if !cyrup_provider::is_virtual_model(&model) {
+            self.install_owning_provider(&model)?;
+        }
         let previous = Self::lock(&self.model).clone();
         self.apply_model_change(&model, previous.as_ref(), "set", None)
             .await?;
@@ -78,7 +85,7 @@ impl AgentSession {
     /// [`Self::set_model_resolved`] **and** both `cycle_model` arms, whose candidate sets span the
     /// whole auth-filtered registry — has to swap it here or the next turn streams against the
     /// wrong provider.
-    fn install_owning_provider(&self, model: &Model) -> Result<(), SessionServiceError> {
+    pub(super) fn install_owning_provider(&self, model: &Model) -> Result<(), SessionServiceError> {
         if self.provider.current().id().as_str() == model.provider.as_str() {
             return Ok(());
         }
@@ -132,6 +139,53 @@ impl AgentSession {
     /// `checkAuth` per provider (model-runtime.ts:302-311). Splitting it changes no answer: the two
     /// arms are the first two arms of `has_configured_auth`, in the same order.
     fn provider_is_available(&self, provider: &ProviderId) -> bool {
+        // pi's `configuredProviders` holds the provisional virtual-only marking alongside the
+        // credential-derived ids (`model-runtime.ts:962-968`), so this predicate answers for both.
+        // The split exists because the ROUTING step must ask the credential question ALONE — see
+        // [`Self::physical_provider_is_configured`].
+        self.physical_provider_is_configured(provider)
+            || self
+                .services
+                .virtual_models
+                .virtual_only_providers()
+                .iter()
+                .any(|p| p == provider)
+    }
+
+    /// Whether the CURRENTLY installed provider exposes any model of `provider` — the per-provider
+    /// form of [`Self::has_configured_auth`]'s offline-faux accommodation (its second arm, "a model
+    /// the CURRENT injected provider exposes in its catalog is always usable", which the scripted
+    /// faux provider needs because it carries no key).
+    ///
+    /// Split out so the routing step's credential validation makes the SAME accommodation every
+    /// other cyrup path makes. pi needs no counterpart: its own test harness registers the faux
+    /// provider with an auth strategy, so `configuredProviders` contains it and
+    /// `hasConfiguredAuth(target.provider)` (`model-runtime.ts:1021`) answers true by the ordinary
+    /// route. Without this, routing to a model of the installed-but-keyless provider would be
+    /// refused with pi's `… which has no credentials.` even though that model is exactly what the
+    /// session streams against.
+    pub(super) fn installed_provider_exposes(&self, provider: &str) -> bool {
+        self.provider
+            .current()
+            .models()
+            .iter()
+            .any(|m| m.provider.as_str() == provider)
+    }
+
+    /// The CREDENTIAL half of [`Self::provider_is_available`], without the virtual-only marking.
+    ///
+    /// Two callers need exactly this and not the union:
+    ///
+    /// * `register_virtual_model`, which decides whether to ADD the marking and so must not see it
+    ///   (pi's `!this.snapshot.configuredProviders.has(providerId)`, `model-runtime.ts:965`,
+    ///   evaluated before the `auth.set`);
+    /// * the routing step's credential validation, whose target is a PHYSICAL model — pi's
+    ///   `hasConfiguredAuth(target.provider)` (`:1021`).
+    ///
+    /// It is also what keeps the two free of re-entrancy: `VirtualModelRegistry::register` holds
+    /// its own write lock while it calls `has_configured_auth`, and a predicate that consulted
+    /// `virtual_only_providers()` there would deadlock on that same `RwLock`.
+    pub(super) fn physical_provider_is_configured(&self, provider: &ProviderId) -> bool {
         // A LIVE extension provider that carries an auth strategy is available exactly when that
         // strategy says so — pi's `snapshot.configuredProviders` is filled by `models.checkAuth`
         // for EVERY composed provider (`model-runtime.ts:334-362`, `checkAuth` at `:342`), and a native
@@ -307,6 +361,10 @@ impl AgentSession {
         let provider = self.provider.current();
         let overlay = self.services.catalog_overlay.load();
         let guest_gen = self.services.guest_providers.generation();
+        // Key FOUR — the virtual-model registry's own counter. A `register_virtual_model` changes
+        // none of the other three keys, so without this the composed catalog served before the
+        // first registration is served forever (see `model_runtime`'s module docs).
+        let virtual_gen = self.services.virtual_models.generation();
 
         // HIT: the same installed provider, the same guest generation and the same overlay compose
         // to the same registry, so hand back the `Arc` (pi reads `this.snapshot.all`, a field).
@@ -315,7 +373,7 @@ impl AgentSession {
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .as_ref()
-            .filter(|snap| snap.matches(&provider, guest_gen, overlay.as_ref()))
+            .filter(|snap| snap.matches(&provider, guest_gen, overlay.as_ref(), virtual_gen))
         {
             return Arc::clone(&cached.models);
         }
@@ -334,6 +392,7 @@ impl AgentSession {
             provider,
             guest_gen,
             overlay,
+            virtual_gen,
             models: Arc::clone(&models),
         });
         models
@@ -392,6 +451,19 @@ impl AgentSession {
         // already reported at startup (`StartupDiagnostics::models`); here a rejected provider block
         // simply keeps its built-ins.
         let (composed, _errors) = self.services.model_config.compose(&base);
+        // --- VIRTUAL layer, applied LAST (pi `recomposeProvider`, model-runtime.ts:171-178) ---
+        // pi composes the provider — which is where `models.json` lands — and only THEN wraps the
+        // result with `withVirtualModels`, so the virtual rows sit on top of everything above.
+        //
+        // It is an OVERLAY and not an append, and that distinction is the whole point: cyrup's
+        // dedupe above is FIRST-WINS, so a physical `faux/auto` already in the union would beat an
+        // appended virtual `faux/auto` — the exact inverse of pi's documented hide rule, where
+        // `withVirtualModels`' physical filter drops a chat model whose id a virtual model holds
+        // (`virtual-models.ts:218`). `apply_to_catalog` removes the colliding row and inserts the
+        // virtual one after that provider's last row, which also reproduces pi's observed listing
+        // order (physical rows, then virtual rows in registration order).
+        let mut composed = composed;
+        self.services.virtual_models.apply_to_catalog(&mut composed);
         composed
     }
 
@@ -451,6 +523,11 @@ impl AgentSession {
     fn availability_filter(&self, registry: &[Model]) -> AvailabilityFilter {
         let mut seen: HashSet<&ProviderId> = HashSet::new();
         let mut configured: HashSet<ProviderId> = HashSet::new();
+        // A provider nothing but virtual models defines is reported configured by
+        // `provider_is_available` below, which is the one place pi's `configuredProviders` is
+        // modelled — including its provisional virtual-only marking (`model-runtime.ts:962-968`).
+        // Seeding it separately here would be redundant: `apply_to_catalog` has already put that
+        // provider's rows in `registry`, so the loop evaluates it like any other.
         for model in registry {
             // `insert` is the distinctness gate: the predicate runs on a provider's FIRST model and
             // is never re-run for its other ~30.

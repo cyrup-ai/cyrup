@@ -367,14 +367,84 @@ impl Hooks for PolicyHooks {
         self.inner.finish_turn(ctx, cancel).await
     }
 
-    /// Same wrap-don't-replace shape for `prepareRequest` (`const previousPrepareRequest =
-    /// this.agent.prepareRequest`, agent-session.ts:608-632 @v0.87.1).
+    /// The VIRTUAL-MODEL ROUTING STEP, in pi's own wrap-don't-replace shape for `prepareRequest`
+    /// (`const previousPrepareRequest = this.agent.prepareRequest`,
+    /// `agent-session.ts:775-831` @v1.0.4).
+    ///
+    /// The agent loop calls this before EVERY provider request, which is precisely why upstream
+    /// routes here and nowhere else: a tool-result continuation and an in-turn retry are each a
+    /// request, and each must be routed.
+    ///
+    /// Four things in the body are load-bearing and easy to get wrong:
+    ///
+    /// 1. The failed-response stash is consumed FIRST and UNCONDITIONALLY — pi's first two
+    ///    statements (`:778-779`), ahead of the virtual test — so a stash never survives into a
+    ///    later request just because this one was not routed.
+    /// 2. The inner (extension) hook runs BEFORE the routing decision and its `model` /
+    ///    `thinking_level` take precedence as the thing to route (pi awaits `previousPrepareRequest`
+    ///    at `:788` and then reads `previous?.model ?? this.agent.state.model`, `:800`).
+    /// 3. The selection is read off the AGENT, never off `ctx.model`: cyrup folds a
+    ///    [`RequestUpdate::model`] into the run baseline stickily, so after the first routed request
+    ///    `ctx.model` holds the PHYSICAL model and trusting it would route exactly once per run.
+    ///    [`Self::prepare_next_turn`]'s AGENT-017 stamping re-asserts the virtual selection at
+    ///    every later turn boundary, which is what makes the per-request override behave as the
+    ///    one-shot it is meant to be despite that stickiness.
+    /// 4. A routing failure is returned as [`HookError`], which the loop turns into a `RunFailure`
+    ///    and then into a terminal assistant message built from the agent's own state model — i.e.
+    ///    one that still names the VIRTUAL model, with api `pi-virtual`. That is upstream's
+    ///    documented behaviour ("If `route()` throws, or returns a virtual model or a model without
+    ///    credentials, the request ends with an error response") and exactly what
+    ///    `cyrup_session::virtual_models::branch_selection` skips when restoring a selection.
     async fn prepare_request(
         &self,
         ctx: PrepareRequestCtx<'_>,
         cancel: CancelToken,
     ) -> Result<Option<RequestUpdate>, HookError> {
-        self.inner.prepare_request(ctx, cancel).await
+        let session = self.session.get();
+        // (1) — pi `const failed = this._failedResponse; this._failedResponse = undefined;`
+        // (`agent-session.ts:778-779`).
+        let failed = session.as_ref().and_then(|s| s.take_failed_response());
+        // The transcript outlives `ctx` (both borrow the loop's working copy), so it is bound
+        // before `ctx` is handed to the inner hook.
+        let messages: &[Arc<AgentMessage>] = ctx.context.messages;
+        // (2) — the extension seam first, its answer kept as the base.
+        let previous = self.inner.prepare_request(ctx, cancel.clone()).await?;
+        let Some(session) = session else {
+            return Ok(previous);
+        };
+        // CYRUP-DELTA, and deliberately narrow: pi's `prepare()` ALSO rebuilds the request's
+        // transcript from the canonical session projection on every request (`:790-796`). That half
+        // is AGENT-038 and is still unported — see `prepare_next_turn`'s note — so this hook routes
+        // without reseeding. Starting to reseed here would silently change every request in a
+        // non-virtual session too.
+        let base = previous.clone().unwrap_or_default();
+        let routed = session
+            .route_request(
+                messages,
+                base.model.clone(),
+                base.thinking_level,
+                failed,
+                cancel,
+            )
+            .await
+            .map_err(|e| HookError::new(e.to_string()))?;
+        // Not a virtual selection: pass the inner seam's answer through untouched, which is what
+        // this hook did before virtual models existed.
+        let Some(routed) = routed else {
+            return Ok(previous);
+        };
+        Ok(Some(RequestUpdate {
+            // A routed-model compaction replaced the working transcript; otherwise whatever the
+            // extension seam asked for stands (pi `{...previous, context, model, thinkingLevel}`,
+            // `:830`).
+            context: routed
+                .context
+                .map(|msgs| msgs.into_iter().map(Arc::new).collect())
+                .or(base.context),
+            model: Some(routed.model),
+            thinking_level: Some(routed.thinking_level),
+            ..base
+        }))
     }
 }
 

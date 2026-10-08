@@ -291,6 +291,7 @@ fn empty_partial(model: &ModelRef) -> AssistantMessage {
         response_model: None,
         response_id: None,
         provider_thinking_level: None,
+        thinking_level: None,
         diagnostics: None,
         usage: Usage::default(),
         // Pi seeds the client-rebuilt partial with `stopReason: "pending"` verbatim

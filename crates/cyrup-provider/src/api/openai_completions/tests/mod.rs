@@ -103,6 +103,7 @@ fn ctx_with_tool_call_ids(ids: &[&str]) -> Context {
         response_model: None,
         response_id: None,
         provider_thinking_level: None,
+        thinking_level: None,
         diagnostics: None,
         usage: Usage::default(),
         stop_reason: StopReason::ToolUse,

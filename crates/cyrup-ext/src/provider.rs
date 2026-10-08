@@ -437,6 +437,31 @@ pub trait ModelRegistrySink: Send + Sync {
     fn upsert_live_provider(&self, id: &str, provider: Arc<dyn cyrup_provider::Provider>);
     /// Remove a provider's models, restoring any built-ins it overrode (Pi `unregisterProvider`).
     fn remove_provider(&self, id: &str);
+
+    /// Register (or replace) a VIRTUAL model — pi `registerVirtualModel`
+    /// (`core/model-runtime.ts:947-974` @v1.0.4), reached through the same `providerActions` bag
+    /// `bindCore` carries the three provider hooks in (`extensions/runner.ts:413-418`), which is
+    /// why it lives on this trait rather than on one of its own.
+    ///
+    /// Fallible where the provider members are not, because upstream's `registerVirtualModel`
+    /// THROWS: on an empty provider or id, and on an id that already names a physical model of that
+    /// provider (`:955-961`). The refusal text is upstream's own, and
+    /// [`crate::virtual_model::VirtualModelHub::bind`] contains it as a per-registration diagnostic
+    /// exactly as both upstream flush loops do.
+    ///
+    /// # Errors
+    ///
+    /// The registry's refusal text, verbatim from upstream.
+    fn upsert_virtual_model(
+        &self,
+        definition: &cyrup_provider::VirtualModelDefinition,
+    ) -> Result<(), String>;
+
+    /// Remove ONE virtual model — pi `unregisterVirtualModel(provider, id)`
+    /// (`core/model-runtime.ts:976-982`). An absent pair is a no-op, as upstream's is, and
+    /// `remove_provider` must NOT imply this one: the docs page states that
+    /// `pi.unregisterProvider()` does not remove virtual models.
+    fn remove_virtual_model(&self, provider: &str, id: &str);
 }
 
 /// The provider registration hub (arch-08 §5.6). Holds resolved registrations and an optional

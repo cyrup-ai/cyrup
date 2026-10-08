@@ -149,6 +149,13 @@ cyrup-provider = { workspace = true, features = ["faux"] }
 # Dev-only: lets the streaming-delta render test build the `AgentMessage` carried by
 # `AgentSessionEvent::MessageUpdate` (the runtime payload the TUI ignores but the variant requires).
 cyrup-agent = { workspace = true }
+# TEST-only. `tests/footer_routed_model.rs` and `tests/session_cost_breakdown.rs` write a PERSISTED
+# branch through the real `SessionManager` and then resume it, because both need a transcript shape
+# a prompt cannot produce deterministically: a virtual `model_change` followed by a physical
+# response that already carries a `thinkingLevel`, and an assistant turn with a chosen non-zero
+# cost. Already a transitive dep via `cyrup-session-svc`, so the lock is unchanged and nothing new
+# enters the library's graph.
+cyrup-session = { workspace = true }
 # `DialogOptions` (the type of `UiRequest::opts`) lives in cyrup-ext (now a direct dependency above,
 # where the `HostServices` trait for the `/tree` label-append is pulled in) and the
 # extension-dialog-countdown test builds a synthetic `UiRequest` from it.

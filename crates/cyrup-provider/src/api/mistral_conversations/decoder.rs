@@ -109,6 +109,7 @@ impl Decoder {
             response_model: None,
             response_id: self.response_id.clone(),
             provider_thinking_level: None,
+            thinking_level: None,
             diagnostics: None,
             usage,
             // In-flight snapshots carry Pi's `"pending"` seed (mistral-conversations.ts:153). The

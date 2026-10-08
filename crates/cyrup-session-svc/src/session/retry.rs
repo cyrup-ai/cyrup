@@ -64,15 +64,23 @@ impl AgentSession {
     /// Whether an assistant error is retryable (Pi `_isRetryableError`, agent-session.ts:2484).
     /// Context-overflow is handled by compaction, never retry.
     pub fn is_retryable_error(&self, message: &AssistantMessage) -> bool {
-        // Pi `if (isContextOverflow(message, this.model?.contextWindow ?? 0)) return false;`
-        // (agent-session.ts:2637).
-        let window = {
-            Some(
-                Self::lock(&self.compaction_model)
-                    .as_ref()
-                    .map_or(0, |m| m.context_window),
-            )
-        };
+        // pi `if (isContextOverflow(message, (this._modelForMessage(message) ?? this.model)
+        // ?.contextWindow ?? 0)) return false;` (`agent-session.ts:3696` @v1.0.4).
+        //
+        // `_modelForMessage` and not the bare selection: under a virtual selection the window that
+        // decides "overflow, so compact" versus "transient, so retry" is the PHYSICAL model that
+        // produced this response. Reading the selection would read the virtual model's declared
+        // window — 0 — which `is_context_overflow` treats as unknown, so a genuine overflow on the
+        // routed model would be retried forever instead of compacted.
+        let window = Some(
+            self.model_for_message(message)
+                .map(|m| m.context_window)
+                .unwrap_or_else(|| {
+                    Self::lock(&self.compaction_model)
+                        .as_ref()
+                        .map_or(0, |m| m.context_window)
+                }),
+        );
         if is_context_overflow(message, window) {
             return false;
         }

@@ -70,7 +70,7 @@ pub use api::{
     MarkdownTransformContext, MarkdownTransformer, MessageRenderer, Outcome, RawOutcome,
     RegisteredCommand, RegisteredRenderer, RegisteredShortcut, RegisteredTool, RegistrationError,
     RenderOptions, ShortcutExec, TerminalInputHandler, TerminalInputResult, ToolExec, ToolOutput,
-    Unsubscribe,
+    Unsubscribe, VirtualModelRouter,
 };
 pub use autocomplete::{
     AutocompleteItem, AutocompleteProvider, AutocompleteQuery, AutocompleteSuggestions,
@@ -83,10 +83,11 @@ pub use ctx::{
 };
 pub use descriptor::{
     CommandDescriptor, CompactOptions, ConstrainedSampling, ConstrainedSamplingConfig, DeliverAs,
-    DialogOptions, ExecMode, ExecOptions, FlagSpec, ForkOptions, ForkPosition, GrammarVariants,
-    ModelCost, ModelCostTier, NavigateOptions, NewSessionOptions, ProviderConfig,
-    ProviderModelConfig, RenderShell, SendUserMessageOptions, StrictSampling, SwitchSessionOptions,
-    ToolDescriptor, ToolExposure, ToolNamespace,
+    DialogOptions, ExecMode, ExecOptions, FailedRequest, FlagSpec, ForkOptions, ForkPosition,
+    GrammarVariants, ModelCost, ModelCostTier, ModelRoute, ModelRouteRequest, NavigateOptions,
+    NewSessionOptions, ProviderConfig, ProviderModelConfig, RenderShell, RoutedModel,
+    SendUserMessageOptions, StrictSampling, SwitchSessionOptions, ToolDescriptor, ToolExposure,
+    ToolNamespace, VirtualModelSpec,
 };
 pub use events::*;
 pub use provider::{
@@ -108,7 +109,7 @@ pub mod prelude {
         MarkdownTransformContext, MarkdownTransformer, MessageRenderer, Outcome, RawOutcome,
         RegisteredCommand, RegisteredRenderer, RegisteredShortcut, RegisteredTool,
         RegistrationError, RenderOptions, ShortcutExec, TerminalInputHandler, TerminalInputResult,
-        ToolExec, ToolOutput, Unsubscribe,
+        ToolExec, ToolOutput, Unsubscribe, VirtualModelRouter,
     };
     pub use crate::autocomplete::{
         AutocompleteItem, AutocompleteProvider, AutocompleteQuery, AutocompleteSuggestions,
@@ -121,10 +122,11 @@ pub mod prelude {
     };
     pub use crate::descriptor::{
         CommandDescriptor, CompactOptions, ConstrainedSampling, ConstrainedSamplingConfig,
-        DeliverAs, DialogOptions, ExecMode, ExecOptions, FlagSpec, ForkOptions, ForkPosition,
-        GrammarVariants, ModelCost, ModelCostTier, NavigateOptions, NewSessionOptions,
-        ProviderConfig, ProviderModelConfig, RenderShell, SendUserMessageOptions, StrictSampling,
-        SwitchSessionOptions, ToolDescriptor, ToolExposure, ToolNamespace,
+        DeliverAs, DialogOptions, ExecMode, ExecOptions, FailedRequest, FlagSpec, ForkOptions,
+        ForkPosition, GrammarVariants, ModelCost, ModelCostTier, ModelRoute, ModelRouteRequest,
+        NavigateOptions, NewSessionOptions, ProviderConfig, ProviderModelConfig, RenderShell,
+        RoutedModel, SendUserMessageOptions, StrictSampling, SwitchSessionOptions, ToolDescriptor,
+        ToolExposure, ToolNamespace, VirtualModelSpec,
     };
     pub use crate::events::*;
     pub use crate::provider::{

@@ -233,6 +233,18 @@ impl AgentSession {
         // [`Self::run_injection`]), so that single clear point is split across both; they are the
         // same point, not two policies.
         self.set_abort_requested(false);
+        // pi's very next statement, with its own comment: "Compaction before the prompt may have
+        // scheduled a retry; the new prompt replaces it." (`this._failedResponse = undefined;`,
+        // `agent-session.ts:1810-1811` @v1.0.4.) A leaked stash would route the first request of
+        // this prompt as a retry of a message the transcript no longer contains.
+        self.clear_failed_response();
+        // pi's NEXT statement again (`this._recordSelection();`, `agent-session.ts:1812` @v1.0.4),
+        // in pi's order: abort latch, failed stash, record, pending tools. `SESS-067` — tree
+        // navigation can leave the branch implying a selection other than the live one, and a
+        // response can never record a VIRTUAL selection because it names the physical model that
+        // answered; this writes the `model_change` a resume restores from. Same "two entry points,
+        // one point" note as the clears above.
+        self.record_selection().await;
         // …and the restored tools that have not registered by now are dropped (pi
         // `_pendingToolNames.clear()`, `agent-session.ts:1782` @v1.0.1).
         self.clear_pending_tools();
@@ -325,6 +337,18 @@ impl AgentSession {
         // [`Self::run_injection`]), so that single clear point is split across both; they are the
         // same point, not two policies.
         self.set_abort_requested(false);
+        // pi's very next statement, with its own comment: "Compaction before the prompt may have
+        // scheduled a retry; the new prompt replaces it." (`this._failedResponse = undefined;`,
+        // `agent-session.ts:1810-1811` @v1.0.4.) A leaked stash would route the first request of
+        // this prompt as a retry of a message the transcript no longer contains.
+        self.clear_failed_response();
+        // pi's NEXT statement again (`this._recordSelection();`, `agent-session.ts:1812` @v1.0.4),
+        // in pi's order: abort latch, failed stash, record, pending tools. `SESS-067` — tree
+        // navigation can leave the branch implying a selection other than the live one, and a
+        // response can never record a VIRTUAL selection because it names the physical model that
+        // answered; this writes the `model_change` a resume restores from. Same "two entry points,
+        // one point" note as the clears above.
+        self.record_selection().await;
         // …and the restored tools that have not registered by now are dropped (pi
         // `_pendingToolNames.clear()`, `agent-session.ts:1782` @v1.0.1).
         self.clear_pending_tools();
@@ -438,6 +462,11 @@ impl AgentSession {
         if self.abort_requested() {
             self.finish_cancelled_retry().await;
         }
+        // pi's `finally` clears the retry stash next (`this._failedResponse = undefined;`,
+        // `agent-session.ts:1831` @v1.0.4), ahead of the system-prompt reset. This is the only
+        // clear that runs when an abort lands DURING a continuation, so without it an aborted
+        // retry sequence leaks its failed response into the next prompt's first request.
+        self.clear_failed_response();
         // Pi `_runAgentPrompt`'s `finally` continues with `this._systemPromptOverride = undefined;`
         // (agent-session.ts:1069 @v0.83.0), BEFORE the bash flush and the settle emit — a
         // `before_agent_start` replacement is scoped to its own run and must not survive into the
@@ -633,6 +662,12 @@ impl AgentSession {
                 self.finish_cancelled_retry().await;
                 return false;
             }
+            // pi `this._failedResponse = message;` immediately after the abort-latch re-read
+            // (`agent-session.ts:1850-1853` @v1.0.4). Under a virtual selection this is what makes
+            // the retried request route as `Retry` and hands the router the failed PHYSICAL
+            // request — `prepare_retry` has already dropped that message from the transcript, so
+            // nothing else can supply it.
+            self.stash_failed_response(&msg);
             return true;
         }
         if self.abort_requested() {

@@ -61,13 +61,23 @@ impl AgentSession {
         // Pi `_checkCompaction` reads `const contextWindow = this.model?.contextWindow ?? 0;`
         // (agent-session.ts:1960) — a modelless session has window 0, which `shouldCompact` and
         // `isContextOverflow` both treat as "unknown", so nothing triggers.
-        let model = { Self::lock(&self.compaction_model).clone() };
-        let window = model.as_ref().map_or(0, |m| m.context_window);
-        let same_model = {
-            let cur = Self::lock(&self.model);
-            cur.as_ref().is_some_and(|c| {
-                assistant.provider == c.provider && assistant.model.as_str() == c.model.as_str()
-            })
+        //
+        // Both the window and `same_model` come from pi's `_modelForMessage`
+        // (`agent-session.ts:2949-2951` @v1.0.4: `const messageModel = this._modelForMessage(
+        // message); const sameModel = messageModel !== undefined; const contextWindow =
+        // (messageModel ?? this.model)?.contextWindow ?? 0;`), which under a virtual selection
+        // resolves the PHYSICAL model that produced this turn. Comparing against the SELECTION
+        // instead is wrong in both directions under a virtual selection: never equal for a real
+        // response (so the overflow arm and the compact-and-retry path become unreachable) and
+        // always equal for a routing-failure message, whose window would then be the virtual
+        // model's declared 0.
+        let message_model = self.model_for_message(assistant);
+        let same_model = message_model.is_some();
+        let window = match message_model.as_ref() {
+            Some(m) => m.context_window,
+            None => Self::lock(&self.compaction_model)
+                .as_ref()
+                .map_or(0, |m| m.context_window),
         };
 
         // Stale-compaction-boundary guard (Pi agent-session.ts:1859-1864): skip all checks if this
@@ -106,9 +116,19 @@ impl AgentSession {
             }
             *Self::lock(&self.overflow_recovery_attempted) = true;
             self.drop_trailing_assistant().await;
-            return self
+            let retry = self
                 .run_auto_compaction(CompactionReason::Overflow, will_retry)
-                .await;
+                .await?;
+            // pi `const retry = await this._runAutoCompaction("overflow", willRetry); if (retry)
+            // this._failedResponse = assistantMessage;` (`agent-session.ts:3030-3031`). The retried
+            // request is then routed as `Retry` and the router is handed THIS response as `failed`
+            // — without the stash it would be routed as `User`, which upstream's own comment rules
+            // out ("Compaction may fold the prompt into the summary, so the retry is not a new user
+            // turn").
+            if retry {
+                self.stash_failed_response(assistant);
+            }
+            return Ok(retry);
         }
 
         // Case 2: threshold — the context is getting large (Pi agent-session.ts:1900-1927). Prefer the
@@ -233,9 +253,16 @@ impl AgentSession {
         // `compaction_end`; it just declines. The check therefore sits ahead of the emit here too.
         // (Unreachable in practice: `check_compaction`'s window is 0 with no model, so neither the
         // overflow nor the threshold arm fires — but pi guards it and so do we.)
-        let Some(model) = ({ Self::lock(&self.compaction_model).clone() }) else {
+        //
+        // SESS-DEFECT-2: only the SELECTION's presence is checked here. The ROUTE is taken below,
+        // after the `session_before_compact` hook and only when this path actually summarizes —
+        // pi routes inside `_runDefaultCompaction` (`agent-session.ts:2704-2727`), reached only
+        // from the `else` arm of `if (extensionCompaction)` (`:3140-3156`). Routing up here made a
+        // `direct`-refusing router break an extension-supplied auto-compaction and turned a
+        // nothing-to-compact check into a routing failure.
+        if Self::lock(&self.compaction_model).is_none() {
             return Ok(false);
-        };
+        }
         let cancel = self.session_cancel.child_token();
         // Same guard as the manual path — an auto compaction runs on the spawned `drive_run` task,
         // but `check_compaction` is also awaited from `prepare` on the CALLER's future
@@ -245,29 +272,20 @@ impl AgentSession {
         self.fanout_emit(AgentSessionEvent::CompactionStart { reason })
             .await;
 
-        // Pi: `this._summarizationRetryCallbacks({ source: "compaction", reason })` — the LIVE
-        // threshold/overflow reason, not a literal (agent-session.ts:2133).
-        let (retry_observer, retry_rx) =
-            crate::compact::summarization_retry_channel(SummarizationRetrySource::Compaction {
-                reason,
-            });
-        let retry_pump = self.spawn_event_pump(retry_rx);
-        let summarizer = DynSummarizer::new(
-            self.provider.current(),
-            model.clone(),
-            self.summarization_retry(),
-        )
-        .with_observer(retry_observer);
-        // Pi threads the session thinking level into every compaction summarization call
-        // (`agent-session.ts:1855,2129`); `summarization_reasoning` applies the `model.reasoning`
-        // gate before it reaches the request.
-        let compactor =
-            Compactor::new(summarizer, NoHooks).with_thinking(self.thinking_level().await);
-
-        // Compute the REAL preparation BEFORE the extension hook (L4 gap #5) — the ONLY preparation.
+        // Compute the REAL preparation BEFORE the extension hook (L4 gap #5) — the ONLY
+        // preparation. [`Compactor::prepare`]'s body is inlined for the same reason as in
+        // [`Self::compact`]: the `Compactor`'s summarizer needs the routed model, and the route is
+        // not taken until after the hook. `prepare` is `Compactor::cache`'s only reader and the
+        // `Compactor` is built fresh per compaction, so the empty cache passed here is the one it
+        // always had.
+        let token_cache = cyrup_session::compaction::TokenCache::default();
         let (prep, branch_entries) = {
             let guard = self.manager.lock().await;
-            match compactor.prepare(&guard, &settings) {
+            let path: Vec<cyrup_session::entry::Entry> =
+                guard.branch_path(None).into_iter().cloned().collect();
+            match cyrup_session::compaction::prepare_compaction(&path, &token_cache, &settings)
+                .map(|prep| (prep, path))
+            {
                 Some(x) => x,
                 None => {
                     drop(guard);
@@ -306,6 +324,77 @@ impl AgentSession {
             }
             BeforeCompactOutcome::Proceed(ov) => ov,
         };
+
+        // THE ROUTE — pi `_getSummarizationRequestAuth` inside `_runDefaultCompaction`
+        // (`agent-session.ts:560-581`, `:2704-2727` @v1.0.4), reached from the auto path's own
+        // `else` arm at `:3140-3156`. Once per compaction, not once per summarization CALL, which
+        // is what upstream's suite pins (one `direct` route sizing two summary calls). With an
+        // extension-supplied compaction there is no model call, so there is no route — and `model`
+        // is then the SELECTION, which is what upstream hands down on both arms and which
+        // `Compactor::finish_compaction`'s override arm never reads.
+        //
+        // `[CYRUP-DELTA]` placement of the FAILURE, unchanged in kind by this move but now
+        // narrower: a routing failure escapes after `compaction_start` was emitted, so it goes
+        // through the reason-tagged `compaction_end` below rather than out of the function bare.
+        let (model, summary_level) = if external_override.is_some() {
+            let Some(selected) = Self::lock(&self.compaction_model).clone() else {
+                cancel_slot.clear();
+                return Ok(false);
+            };
+            (selected, self.thinking_level().await)
+        } else {
+            match self.summarization_model().await {
+                Ok(Some(pair)) => pair,
+                // A selection cleared since the check above: pi's `if (!model) return false`.
+                Ok(None) => {
+                    cancel_slot.clear();
+                    self.fanout_emit(AgentSessionEvent::CompactionEnd {
+                        reason,
+                        result: None,
+                        aborted: false,
+                        will_retry: false,
+                        error_message: None,
+                    })
+                    .await;
+                    return Ok(false);
+                }
+                Err(err) => {
+                    cancel_slot.clear();
+                    let error_message = if reason == CompactionReason::Overflow {
+                        Some(format!("Context overflow recovery failed: {err}"))
+                    } else {
+                        Some(format!("Auto-compaction failed: {err}"))
+                    };
+                    self.fanout_emit(AgentSessionEvent::CompactionEnd {
+                        reason,
+                        result: None,
+                        aborted: false,
+                        will_retry: false,
+                        error_message,
+                    })
+                    .await;
+                    return Ok(false);
+                }
+            }
+        };
+
+        // Pi: `this._summarizationRetryCallbacks({ source: "compaction", reason })` — the LIVE
+        // threshold/overflow reason, not a literal (agent-session.ts:2133).
+        let (retry_observer, retry_rx) =
+            crate::compact::summarization_retry_channel(SummarizationRetrySource::Compaction {
+                reason,
+            });
+        let retry_pump = self.spawn_event_pump(retry_rx);
+        let summarizer = DynSummarizer::new(
+            self.provider.current(),
+            model.clone(),
+            self.summarization_retry(),
+        )
+        .with_observer(retry_observer);
+        // Pi threads the session thinking level into every compaction summarization call
+        // (`agent-session.ts:1855,2129`); `summarization_reasoning` applies the `model.reasoning`
+        // gate before it reaches the request.
+        let compactor = Compactor::new(summarizer, NoHooks).with_thinking(summary_level);
 
         let mut guard = self.manager.lock().await;
         let result = compactor
@@ -545,6 +634,19 @@ impl AgentSession {
         if !settings.enabled {
             return Ok(None);
         }
+        // pi `if (!model || isVirtualModel(model) || !this._exceedsCompactionThreshold(model,
+        // projection)) return ...` (`agent-session.ts:768-770` @v1.0.4), with its own comment: "A
+        // virtual selection is checked in prepareRequest, against the model the request is routed
+        // to." The settings read above still happens first, so an invalid budget still throws
+        // (SESS-055), exactly as it does upstream.
+        //
+        // Without this the between-turns check would run against the VIRTUAL model's declared
+        // window — 0 by default — and `window.saturating_sub(reserve)` would make the threshold 0,
+        // so every single turn would auto-compact. It is also the half that stops this check and
+        // [`Self::compact_before_routed_request`] double-firing.
+        if self.selection_is_virtual() {
+            return Ok(None);
+        }
         let window = {
             Self::lock(&self.compaction_model)
                 .as_ref()
@@ -567,6 +669,64 @@ impl AgentSession {
         // `await this._runAutoCompaction("threshold", false)` (`:602`): a failed summary is its own
         // `return false`, so the only thing that can escape it is the settings throw — which, like
         // the one above, fails the run.
+        if !self
+            .run_auto_compaction(CompactionReason::Threshold, false)
+            .await?
+        {
+            return Ok(None);
+        }
+        Ok(Some(
+            self.raw_context_messages()
+                .await
+                .iter()
+                .map(raw_message_to_agent)
+                .collect(),
+        ))
+    }
+
+    /// The threshold check for a request a virtual selection just ROUTED — pi
+    /// `_exceedsCompactionThreshold(route.model, projection)` followed by
+    /// `_runAutoCompaction("threshold", false)` inside the routing step
+    /// (`agent-session.ts:754-762`, `:824-829` @v1.0.4).
+    ///
+    /// This is the other half of the pair whose first half is
+    /// [`Self::compact_before_next_assistant_response`]'s virtual early return: under a virtual
+    /// selection the window that matters is not the selection's (0 by default) but the one of the
+    /// model THIS request is going to, and that is only known once the router has answered.
+    ///
+    /// Returns the replacement transcript when a compaction ran, so the caller can hand it to the
+    /// loop as `RequestUpdate::context` — pi re-runs its `prepare()` for exactly that
+    /// (`:828`). The ROUTE IS NOT RE-ASKED: upstream's own comment is "The route stands: the router
+    /// already decided this request."
+    ///
+    /// The settings still come from the SELECTION, not from the routed model — pi passes
+    /// `this.model` to `getCompactionSettings` at every call site (`:760`, `:2763`, `:2938`,
+    /// `:3085`), so a `compaction.modelOverrides` entry written for `router/auto` applies while the
+    /// window comes from the physical model.
+    ///
+    /// # Errors
+    ///
+    /// Only the settings throw (SESS-055); a failed summary is its own `false`, as upstream.
+    pub(crate) async fn compact_before_routed_request(
+        &self,
+        routed: &cyrup_provider::Model,
+    ) -> Result<Option<Vec<cyrup_agent::AgentMessage>>, SessionServiceError> {
+        let settings = self.effective_compaction_settings()?;
+        if !settings.enabled {
+            return Ok(None);
+        }
+        // pi `if (model.contextWindow <= 0) return false;` (`:755`) — an unknown window never
+        // triggers.
+        if routed.context_window == 0 {
+            return Ok(None);
+        }
+        let estimate = self.manager.lock().await.projected_context_estimate();
+        let threshold = routed
+            .context_window
+            .saturating_sub(u64::from(settings.reserve_tokens));
+        if u64::from(estimate.tokens) <= threshold {
+            return Ok(None);
+        }
         if !self
             .run_auto_compaction(CompactionReason::Threshold, false)
             .await?

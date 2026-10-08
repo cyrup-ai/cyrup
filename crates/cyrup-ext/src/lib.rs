@@ -167,6 +167,7 @@ pub mod render_tree;
 pub mod replaceable;
 pub mod subscriber;
 pub mod ui_prompt;
+pub mod virtual_model;
 pub mod wrapper;
 
 #[cfg(test)]
@@ -238,6 +239,7 @@ pub use render_tree::{PreviewKeep, RenderNode, RenderedTree, TreeCtx};
 pub use replaceable::{ClaimKind, OmittedExtension};
 pub use subscriber::ExtSubscriber;
 pub use ui_prompt::{UiPromptGuard, UiPromptKind, UiPromptTracker};
+pub use virtual_model::{VirtualModelFlushError, VirtualModelHub};
 pub use wrapper::{
     ActiveToolNames, RegisteredTool, wrap_registered_tool, wrap_registered_tool_with_nested,
 };

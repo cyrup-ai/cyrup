@@ -293,7 +293,19 @@ impl Capabilities {
 ///   A 0.15 guest exports the shorter signature and fails to link, so it takes the bump (the
 ///   0.2 -> 0.3 `usage-json` precedent). The patch direction rides the existing mutate JSON and
 ///   would not have required one on its own.
-pub const HOST_WORLD: &str = "cyrup:ext@0.16";
+/// - 0.16 -> 0.17: EXPORT ADDITION — `events.route-model` (the guest tier of
+///   `pi.registerVirtualModel`), the guest half of pi's `ExtensionVirtualModel.route(request, ctx)`
+///   (`core/extensions/types.ts:1888` @v1.0.4, over `VirtualModelDefinition.route` at
+///   `core/virtual-models.ts:101`). A router is a CALLABLE and ADR-0002 keeps callables off the
+///   value seam, so it stays guest-side behind an export the host calls once per provider request,
+///   keyed by `(provider, id)`. A 0.16 guest exports nothing under that name, which is the same
+///   fails-to-LINK direction a re-signed export is, so it takes the bump on its own (the
+///   0.9 -> 0.10 `bash-operations-exec` precedent). Its declaring imports
+///   `registration.register-virtual-model` / `unregister-virtual-model` and the whole `host-router`
+///   interface (pi's `ModelRouteRequest.signal` as a `route-id`-keyed poll, the
+///   `host-bash.is-bash-cancelled` substitution) are ADDITIVE and would not have required a bump on
+///   their own.
+pub const HOST_WORLD: &str = "cyrup:ext@0.17";
 
 impl ExtensionManifest {
     /// Parse from JSON bytes.

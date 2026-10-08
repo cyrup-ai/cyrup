@@ -33,4 +33,5 @@ mod tool_result_model;
 mod turn_hooks;
 mod turn_tool_refresh;
 mod type_driven_core;
+mod unrouted_virtual_model;
 mod untracked_misses;

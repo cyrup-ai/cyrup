@@ -2937,6 +2937,22 @@ mod tests {
                 "RecordingRegistrar was asked to unregister provider `{id}`"
             )))
         }
+        // Nor any virtual model, for the same reason.
+        fn register_virtual_model(
+            &self,
+            definition: cyrup_provider::VirtualModelDefinition,
+        ) -> Result<(), ExtError> {
+            Err(ExtError::Component(format!(
+                "RecordingRegistrar was asked to register virtual model `{}/{}`",
+                definition.spec.provider.as_str(),
+                definition.spec.id.as_str()
+            )))
+        }
+        fn unregister_virtual_model(&self, provider: &str, id: &str) -> Result<bool, ExtError> {
+            Err(ExtError::Component(format!(
+                "RecordingRegistrar was asked to unregister virtual model `{provider}/{id}`"
+            )))
+        }
         fn owner(&self) -> ExtensionId {
             ExtensionId::from(EXTENSION_ID)
         }

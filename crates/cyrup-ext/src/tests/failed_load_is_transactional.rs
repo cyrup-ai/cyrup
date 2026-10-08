@@ -154,6 +154,24 @@ impl crate::provider::ModelRegistrySink for SinkLog {
             g.push(format!("remove:{id}"));
         }
     }
+    fn upsert_virtual_model(
+        &self,
+        definition: &cyrup_provider::VirtualModelDefinition,
+    ) -> Result<(), String> {
+        if let Ok(mut g) = self.0.lock() {
+            g.push(format!(
+                "upsert-virtual:{}/{}",
+                definition.spec.provider.as_str(),
+                definition.spec.id.as_str()
+            ));
+        }
+        Ok(())
+    }
+    fn remove_virtual_model(&self, provider: &str, id: &str) {
+        if let Ok(mut g) = self.0.lock() {
+            g.push(format!("remove-virtual:{provider}/{id}"));
+        }
+    }
 }
 
 /// Every registration this owner could have made is GONE from every shared table.

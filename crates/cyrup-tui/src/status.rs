@@ -139,6 +139,32 @@ pub struct StatusLine {
     /// **third** footer line, the values sorted by key, sanitized (control chars → space, collapsed),
     /// space-joined, width-truncated with a dim `...` ellipsis. Empty ⇒ no third line.
     pub extension_statuses: std::collections::BTreeMap<String, String>,
+    /// Where the latest response under a VIRTUAL selection actually went — pi's `routedModel`
+    /// (`agent-session.ts:1437-1443`), rendered by the right cluster as ` → {id}` plus ` • {level}`
+    /// (`footer.ts:240-245`). `None` for a physical selection, which is upstream's `undefined`.
+    ///
+    /// Pushed by [`crate::App`]`::refresh_routed_model` from
+    /// `AgentSession::routed_model()`. String-shaped like every other field on this view, so the
+    /// footer gains no dependency on the router types.
+    pub routed_model: Option<RoutedModel>,
+}
+
+/// The footer's view of pi's `routedModel` — the physical model the latest response under a virtual
+/// selection was dispatched to, and the thinking level the agent loop asked that response for.
+///
+/// **[CYRUP-DELTA] on `label`.** pi prints `routed.model.id` ALONE (`footer.ts:244`) because it
+/// shows the provider separately as a `(provider)` prefix (`:249`). cyrup's production writer of
+/// [`StatusLine::model`] feeds `format!("{provider}/{model}")` (`app/events_fold.rs`), so the routed
+/// label is spelled the same way for symmetry — and that is the form TUI-143's own Verify line asks
+/// for (`router/auto → anthropic/claude-opus-5`). The `{provider}/{model}` vs bare-id disagreement
+/// between cyrup's production footer writer and its tests is pre-existing and is NOT this row.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct RoutedModel {
+    /// The routed model's label, `{provider}/{model}`.
+    pub label: String,
+    /// The thinking level the loop requested for that response (`AssistantMessage.thinkingLevel`),
+    /// or `None` — pi's `routed.thinkingLevel ? ` • ${…}` : ""` (`footer.ts:243`).
+    pub thinking_level: Option<String>,
 }
 
 impl StatusLine {
@@ -254,6 +280,12 @@ impl StatusLine {
     /// Set whether the active model supports reasoning (gates the ` • thinking …` suffix).
     pub fn set_reasoning(&mut self, reasoning: bool) {
         self.reasoning = reasoning;
+    }
+    /// Set (or clear) the routed-model suffix — pi reads `this.session.routedModel` on every frame
+    /// (`footer.ts:241`); cyrup's footer is push-fed, so the value arrives here from
+    /// [`crate::App`]`::refresh_routed_model`.
+    pub fn set_routed_model(&mut self, routed: Option<RoutedModel>) {
+        self.routed_model = routed;
     }
     /// Set the active provider id (for the optional `(provider)` prefix).
     pub fn set_provider(&mut self, provider: Option<String>) {
@@ -430,8 +462,33 @@ impl StatusLine {
     }
 
     /// The right cluster **without** the optional `(provider)` prefix (`footer.ts:184-189`):
-    /// `{model}`, plus ` • thinking off` / ` • {level}` when the model supports reasoning.
+    /// `{model}`, plus ` • thinking off` / ` • {level}` when the model supports reasoning, plus
+    /// ` → {routed}` + ` • {level}` under a virtual selection (`footer.ts:240-245`).
+    ///
+    /// The routed suffix is appended as the LAST step of this function, which is where upstream
+    /// appends it: inside `rightSideWithoutProvider`, so it is already part of the cluster when
+    /// [`Self::usage_line`] decides whether the `(provider)` prefix fits (`footer.ts:248-255`) and
+    /// when it does the min-2-space width math (`:257-275`). Appending it after either of those
+    /// would let the footer overflow its width.
     fn right_cluster(&self) -> String {
+        let mut cluster = self.right_cluster_model();
+        // `const routed = this.session.routedModel; if (routed) { … }` (`footer.ts:241-245`).
+        if let Some(routed) = &self.routed_model {
+            cluster.push_str(" \u{2192} ");
+            cluster.push_str(&routed.label);
+            // `const level = routed.thinkingLevel ? ` • ${routed.thinkingLevel}` : ""` (`:243`) —
+            // ABSENT, not `off`: a routed response the loop asked for no level carries no suffix.
+            if let Some(level) = &routed.thinking_level {
+                cluster.push_str(" \u{2022} ");
+                cluster.push_str(level);
+            }
+        }
+        cluster
+    }
+
+    /// The model-and-thinking half of [`Self::right_cluster`] (`footer.ts:184-189`), split out so
+    /// the routed suffix has one unambiguous append point.
+    fn right_cluster_model(&self) -> String {
         let model = if self.model.is_empty() {
             "no-model"
         } else {

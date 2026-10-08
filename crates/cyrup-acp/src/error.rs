@@ -137,6 +137,13 @@ impl AcpFailure {
             | E::AlreadyCompacted
             | E::CompactionCancelled
             | E::NoRuntimeHost(_)
+            // A virtual-model routing refusal. Declined for `AuthRequired` even though one of its
+            // four cases is "the routed model has no credentials": the client selected a model that
+            // IS configured, and the remedy is for the ROUTER to pick differently — an Authenticate
+            // banner would point the user at a credential they cannot usefully supply. Declined for
+            // `InvalidParams` for the same reason as the two `/tree` refusals above: the request was
+            // well-formed.
+            | E::VirtualModelRouting(_)
             | E::SessionNotSaved
             | E::Io(_)
             | E::Bash(_)

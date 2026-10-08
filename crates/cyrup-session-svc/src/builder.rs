@@ -554,6 +554,16 @@ pub struct SessionBuilder {
     ///
     /// [`AgentSessionServices::catalog_overlay`]: crate::services::AgentSessionServices::catalog_overlay
     model_catalog_service: Option<Arc<cyrup_provider::ModelCatalogService>>,
+    /// The virtual-model registry this session will own — pi `ModelRuntime.virtualModels`
+    /// (`model-runtime.ts:179`). `None` (the default) builds an empty one, which is a session with
+    /// no virtual models and therefore byte-for-byte the pre-feature behaviour.
+    ///
+    /// An embedder that registers virtual models BEFORE the session opens injects its own here, so
+    /// the registrations are already visible to the first catalog read and to the restore step —
+    /// upstream's ordering, where `pendingVirtualModelRegistrations` drain in
+    /// `createAgentSessionServices` before `createAgentSession` restores the selection
+    /// (`agent-session-services.ts:182-194`).
+    virtual_models: Option<Arc<cyrup_provider::VirtualModelRegistry>>,
     /// The interactive project-trust prompt (pi `selectProjectTrustOption` → `ctx.ui.select`,
     /// `project-trust.ts:28-44`, `:90-94`). Invoked **only** when the tiered decision comes back
     /// [`TrustOutcome::NeedsPrompt`], i.e. after `pre_trust_extension_verdict` and the store —
@@ -632,6 +642,7 @@ impl SessionBuilder {
             trust_store: None,
             trust_prompt: None,
             model_catalog_service: None,
+            virtual_models: None,
             #[cfg(test)]
             force_pre_trust_wasm_failure: false,
         }
@@ -646,6 +657,15 @@ impl SessionBuilder {
     #[must_use]
     pub fn model_catalog_service(mut self, svc: Arc<cyrup_provider::ModelCatalogService>) -> Self {
         self.model_catalog_service = Some(svc);
+        self
+    }
+
+    /// Adopt a pre-populated virtual-model registry instead of building an empty one — see the
+    /// field of the same name. The registry is shared, not cloned, so later registrations through
+    /// the same `Arc` reach the built session.
+    #[must_use]
+    pub fn virtual_models(mut self, registry: Arc<cyrup_provider::VirtualModelRegistry>) -> Self {
+        self.virtual_models = Some(registry);
         self
     }
 
@@ -1022,7 +1042,28 @@ impl SessionBuilder {
             },
         };
         let session_id = manager.session_id().clone();
+        // Shared with whoever registered virtual models before the session opened, else empty —
+        // pi's `ModelRuntime.virtualModels` (`model-runtime.ts:179`). Taken HERE, ahead of the
+        // restore, because the restore READS it: pi drains
+        // `pendingVirtualModelRegistrations` in `createAgentSessionServices`
+        // (`agent-session-services.ts:182-194`) before `createAgentSession` restores the
+        // selection, so a virtual model registered before the session opened is already in the
+        // registry when `branch_selection` asks whether the branch's selection is virtual.
+        let virtual_models = self
+            .virtual_models
+            .clone()
+            .unwrap_or_else(|| Arc::new(cyrup_provider::VirtualModelRegistry::new()));
         let existing = manager.build_context();
+        // `SESS-067` — the VIRTUAL-AWARE selection, pi `getBranchSelection(sessionManager.
+        // getBranch(), (p, id) => modelRuntime.getModel(p, id))` (`sdk.ts:207-211`). Taken here
+        // beside `existing` under the same SEAM-112 rule, so both reads see one manager state.
+        //
+        // `existing.model` is the FORWARD last-wins projection value and must not be used for the
+        // restore: under a virtual selection it names the physical model that answered, so a
+        // resume would silently drop the router the user selected. The lookup answers only for
+        // REGISTERED VIRTUAL models, which is provably equivalent to a full catalog lookup here —
+        // see `cyrup_session::virtual_models::branch_selection`'s own proof.
+        let session_selection = manager.branch_selection(|p, id| virtual_models.model_ref(p, id));
         // SEAM-112 — the RAW projection, taken here beside `existing` so BOTH reads see the same
         // manager state (pi calls `buildSessionContext()` ONCE, sdk.ts:190, and reuses the result
         // at :374). `existing` stays because `resolve_model` below restores the saved model +
@@ -1065,28 +1106,21 @@ impl SessionBuilder {
         // no `--model` had been given. A pattern that still resolves nowhere at 3b fails with the
         // same `ModelNotFound` this arm used to return, carrying the launch path's own
         // unknown-provider text when a resolver is wired. Same resolution, later.
+        let restore = RestoreInputs {
+            existing: &existing,
+            selection: session_selection.as_ref(),
+            virtual_models: &virtual_models,
+            has_session: has_existing_session,
+            has_thinking_entry,
+        };
         let mut deferred_model_pattern: Option<String> = None;
         let (mut resolved_model, mut model_ref, mut thinking, mut model_fallback_message) =
-            match resolve_model(
-                &*self.provider,
-                &cfg,
-                &settings,
-                &existing,
-                has_existing_session,
-                has_thinking_entry,
-            ) {
+            match resolve_model(&*self.provider, &cfg, &settings, &restore) {
                 Err(SessionServiceError::ModelNotFound(pattern)) if cfg.model_pattern.is_some() => {
                     let mut without_pattern = cfg.clone();
                     without_pattern.model_pattern = None;
                     deferred_model_pattern = Some(pattern);
-                    resolve_model(
-                        &*self.provider,
-                        &without_pattern,
-                        &settings,
-                        &existing,
-                        has_existing_session,
-                        has_thinking_entry,
-                    )?
+                    resolve_model(&*self.provider, &without_pattern, &settings, &restore)?
                 }
                 resolved => resolved?,
             };
@@ -1624,9 +1658,67 @@ impl SessionBuilder {
         // overrides applied above, then the registered default). Weak: the host holds `host_services`.
         host_services.attach_flag_source(Arc::downgrade(&ext_host));
         host_services.attach_provider_auth(auth.clone(), guest_providers.clone());
-        ext_host
+        // SEAM-144 — the cache-only whole-registry refresh pi fires from BOTH virtual-model
+        // mutators (`model-runtime.ts:973`, `:982`). Installed before the flush below, so the
+        // extensions' own registrations fire it too, exactly as upstream's do.
+        virtual_models.set_listener(Arc::new(
+            crate::virtual_models::CachedRestoreOnVirtualChange::new(
+                &guest_providers,
+                cancel.token().clone(),
+            ),
+        ));
+        // The catalog the flush validates against. pi drains `pendingVirtualModelRegistrations`
+        // into a `modelRuntime` that already holds every provider's catalog
+        // (`agent-session-services.ts:182-194`), so the physical-conflict check at
+        // `model-runtime.ts:957` sees the whole catalog; this is the builder's equivalent, unioned
+        // from the same three sources `AgentSession::compose_model_registry` uses and then composed
+        // through `models.json`. No network and no disk: `default_models` is compiled in, and
+        // `model_config` was already read at startup.
+        let virtual_flush_catalog: Arc<dyn cyrup_provider::VirtualModelCatalog> = {
+            let mut base: Vec<cyrup_provider::Model> = initial_provider.models().to_vec();
+            for m in guest_providers.models() {
+                if !base
+                    .iter()
+                    .any(|e| e.provider == m.provider && e.id == m.id)
+                {
+                    base.push(m);
+                }
+            }
+            for m in cyrup_provider::default_models(cyrup_provider::CreateModelsOptions {
+                credentials: None,
+                auth_context: None,
+                catalog_overlay: None,
+            })
+            .get_models(None)
+            {
+                if !base
+                    .iter()
+                    .any(|e| e.provider == m.provider && e.id == m.id)
+                {
+                    base.push(m);
+                }
+            }
+            let (composed, _errors) = model_config.compose(&base);
+            Arc::new(crate::virtual_models::StartupVirtualCatalog::new(composed))
+        };
+        guest_providers.attach_virtual_models(virtual_models.clone(), virtual_flush_catalog);
+        // Bind, flushing BOTH queues (pi `bindCore`'s two pending loops, `runner.ts:485-514`). A
+        // virtual-model registration the registry refuses becomes a startup diagnostic in pi's own
+        // shape and does NOT fail the load — `agent-session-services.ts:185-191` pushes
+        // `Extension "{path}" error: {message}` and carries on. Non-fatal, like the
+        // omitted-extension warnings above: pi keeps the session.
+        for failure in ext_host
             .registry()
-            .bind_model_registry(guest_providers.clone())?;
+            .bind_model_registry(guest_providers.clone())?
+        {
+            startup_diagnostics
+                .extensions
+                .push(crate::services::ExtensionLoadDiagnostic {
+                    path: PathBuf::from(failure.extension_path.clone()),
+                    error: failure.diagnostic(),
+                    fatal: false,
+                });
+        }
         // The startup restore: every provider's PERSISTED catalog is handed to its `refresh_models`
         // with no network, now that the extensions' providers are registered (pi
         // `await modelRuntime.refresh({ allowNetwork: false })`, `agent-session-services.ts:206`
@@ -1682,14 +1774,8 @@ impl SessionBuilder {
                     None => pattern,
                 }));
             };
-            let (model, reference, level, fallback) = resolve_model(
-                &*owner,
-                &cfg,
-                &settings,
-                &existing,
-                has_existing_session,
-                has_thinking_entry,
-            )?;
+            let (model, reference, level, fallback) =
+                resolve_model(&*owner, &cfg, &settings, &restore)?;
             read_model_vision.set(
                 model
                     .as_ref()
@@ -1710,6 +1796,75 @@ impl SessionBuilder {
             (resolved_model, model_ref, thinking, model_fallback_message) =
                 (model, reference, level, fallback);
             initial_provider = owner;
+        }
+        // 3c. `SESS-067`, `[CYRUP-DELTA]` in SHAPE only — re-ask the branch selection once the
+        // EXTENSION-registered virtual models exist.
+        //
+        // Upstream has no counterpart because it does not need one: pi drains
+        // `pendingVirtualModelRegistrations` inside `createAgentSessionServices`
+        // (`agent-session-services.ts:182-194`), which runs BEFORE `createAgentSession` performs the
+        // restore, so by the time `getBranchSelection` is called every extension's router is already
+        // registered. cyrup resolves the model at step 3, long before the extension host is built
+        // (`:1271`-ish) or loaded, so an extension that registers `router/auto` at init cannot be
+        // seen there and a resumed session would come up on the physical model that answered.
+        // Upstream's own test for this shape — `restores a virtual selection registered right
+        // before the session opens` (`test/virtual-models.test.ts:297-317`) — uses a branch whose
+        // last entry is a RESPONSE, so the answer turns on the hold rule and therefore on the
+        // registry.
+        //
+        // This is the same deferral step 3b already performs for a `--model` naming an extension
+        // provider (EXT-027, documented at the step-3 comment), run for the same reason and in the
+        // same place. Three properties matter:
+        //
+        // * The branch is RE-WALKED rather than reusing step 3's `session_selection`. That value
+        //   was computed against an empty registry, so for the hold-rule shape it names the
+        //   physical response and carries no trace of the router at all.
+        // * Only a VIRTUAL selection is reconsidered. A physical one was fully resolvable at step 3
+        //   against `provider.models()`, and re-adopting it here would re-litigate the
+        //   `--model`/settings/catalog precedence step 3 already settled.
+        // * An empty registry short-circuits before the walk, so a session with no virtual models
+        //   does exactly what it did before this block existed — no extra branch walk, no state
+        //   touched.
+        //
+        // Nothing installs a provider for the adopted model: providers never see a virtual model.
+        // The routing step installs the ROUTED model's owning provider per request
+        // (`session/virtual_models.rs`), and `set_model_resolved` skips the install for a virtual
+        // selection for the same reason.
+        if cfg.model_pattern.is_none()
+            && has_existing_session
+            && !virtual_models.is_empty()
+            && let Some(held) = manager.branch_selection(|p, id| virtual_models.model_ref(p, id))
+            && let Some(virtual_model) =
+                virtual_models.get(held.provider.as_str(), held.model.as_str())
+            && resolved_model
+                .as_ref()
+                .is_none_or(|m| m.provider != virtual_model.provider || m.id != virtual_model.id)
+        {
+            thinking = cyrup_provider::clamp_thinking_level(&virtual_model, thinking);
+            model_ref = Some(ModelRef {
+                provider: virtual_model.provider.clone(),
+                api: Some(virtual_model.api.clone()),
+                model: virtual_model.id.clone(),
+            });
+            // Step 3 may have reported a selection as unrestorable that IS restorable after all.
+            model_fallback_message = None;
+            // 3b's own side effects, for the same reason it runs them: `read`'s non-vision warning
+            // and the `bash` child's `CYRUP_MODEL`/`CYRUP_REASONING_LEVEL` must describe the model
+            // the session actually starts on.
+            read_model_vision.set(virtual_model.supports_image_input());
+            bash_session_env.set_model(
+                virtual_model.provider.to_string(),
+                virtual_model.id.to_string(),
+            );
+            bash_session_env.set_reasoning_level(thinking_level_to_str(thinking));
+            if let Some(reference) = model_ref.as_ref() {
+                host_services.update_model(
+                    reference.clone(),
+                    virtual_model.clone(),
+                    Some(thinking_level_to_str(thinking)),
+                );
+            }
+            resolved_model = Some(virtual_model);
         }
         // extendResourcesFromExtensions("startup") (Pi agent-session.ts:2109-2135): fold every
         // `resources_discover` handler's contributed skill/prompt/theme paths into the registry
@@ -2456,6 +2611,7 @@ impl SessionBuilder {
             allowed_tool_names,
             excluded_tool_names,
             guest_providers,
+            virtual_models,
             model: resolved_model,
             system_prompt,
             system_prompt_sections: built_prompt.sections().clone(),
@@ -2559,16 +2715,61 @@ type ResolvedModel = (
 /// credential-less first run still gets a TUI to type `/login` and then `/model` into. Making an
 /// empty catalog fatal HERE would kill that onboarding for every mode, which is exactly the
 /// regression this signature closes.
+/// What [`resolve_model`]'s RESTORE arm reads — pi's `existingSession` / `sessionModel` /
+/// `hasExistingSession` / `hasThinkingEntry` quartet (`sdk.ts:200-222`), grouped so the function
+/// keeps one parameter per concern rather than five positional booleans and borrows.
+struct RestoreInputs<'a> {
+    /// The projection. Read for [`cyrup_session::context::SessionContext::thinking_level`] ONLY
+    /// (pi `existingSession.thinkingLevel`, `sdk.ts:248`); its `model` field is the forward
+    /// last-wins value and is deliberately not the restore input — see `selection`.
+    existing: &'a cyrup_session::context::SessionContext,
+    /// The virtual-aware branch selection — pi `sessionModel` (`sdk.ts:209-211`), i.e.
+    /// [`cyrup_session::SessionManager::branch_selection`]'s answer.
+    selection: Option<&'a ModelRef>,
+    /// Registered virtual models. A virtual selection names no row in any provider's catalog, so it
+    /// resolves against this instead.
+    virtual_models: &'a cyrup_provider::VirtualModelRegistry,
+    /// pi `hasExistingSession` (`sdk.ts:201`).
+    has_session: bool,
+    /// pi `hasThinkingEntry` (`sdk.ts:202`).
+    has_thinking_entry: bool,
+}
+
 fn resolve_model(
     provider: &dyn Provider,
     cfg: &SessionConfig,
     settings: &SettingsManager,
-    existing: &cyrup_session::context::SessionContext,
-    has_existing_session: bool,
-    has_thinking_entry: bool,
+    restore: &RestoreInputs<'_>,
 ) -> Result<ResolvedModel, SessionServiceError> {
-    let available = provider.models();
-    let resolver = ModelResolver::new(available);
+    let RestoreInputs {
+        existing,
+        selection: session_selection,
+        virtual_models,
+        has_session: has_existing_session,
+        has_thinking_entry,
+    } = *restore;
+    // The candidate set EVERY arm below resolves against, with the registered virtual rows merged
+    // in — pi's `modelRuntime`, which is what `resolveCliModel` and `findInitialModel` are handed
+    // (`model-resolver.ts:649`, `:675`) and which lists virtual models because `ModelRuntime`
+    // composes each provider through `withVirtualModels` (`virtual-models.ts:201-238`).
+    //
+    // PROV-DEFECT-3. This used to be the bare `provider.models()`, i.e. the INSTALLED provider's
+    // physical catalog, and the restore arm alone patched around it with its own
+    // `virtual_models.get(...)` fallback. The consequence was that a registered virtual model was
+    // selectable by `/model` (which goes through `AgentSession::full_model_registry`, whose last
+    // step IS `apply_to_catalog`) and restorable on resume, but NOT reachable from `--model` or
+    // from a `defaultModel` in settings: `cyrup --model router/auto` answered `ModelNotFound` with
+    // the router extension loaded and the row in `/model`. Upstream has no such split — step 1 is
+    // `resolveCliModel({ modelRuntime })` and step 3 is `modelRuntime.getModel(defaultProvider,
+    // defaultModelId)`, both over the same virtual-aware catalog.
+    //
+    // `apply_to_catalog` is the SAME overlay the session's composed registry applies, so the two
+    // catalogs cannot disagree about which rows exist or in what order. A provider with no
+    // physical rows appends at the end, which keeps the `available.first()` fallback of step 3 on
+    // a physical model whenever there is one.
+    let mut available = provider.models().to_vec();
+    virtual_models.apply_to_catalog(&mut available);
+    let resolver = ModelResolver::new(&available);
     let mut fallback: Option<String> = None;
 
     // 1. An explicit `--model` pattern (Pi `options.model`) takes precedence over restore.
@@ -2593,18 +2794,48 @@ fn resolve_model(
             None => (None, None),
         };
 
-    // 2. Restore the model from the resumed session (Pi sdk.ts:194-203). The saved model is only
+    // 2. Restore the model from the resumed session (Pi sdk.ts:213-222). The saved model is only
     //    honored when it still resolves in the live catalog (our auth proxy: a model the provider
     //    exposes is usable); otherwise we record the fallback message and keep searching.
+    //
+    //    `SESS-067` — the saved model is the branch SELECTION (pi's `sessionModel`, the
+    //    `getBranchSelection` walk), NOT `existing.model`'s forward last-wins value. The two differ
+    //    exactly when a virtual `model_change` is followed by the physical responses it routed to:
+    //    the projection reports the model that ANSWERED, where the selection is the router the user
+    //    chose and which still holds. `existing` is still read here — for `.thinking_level` at
+    //    step 4, which upstream likewise takes off `existingSession` (`sdk.ts:248`).
+    //
+    //    A virtual selection resolves out of `available` like any other row, because `available`
+    //    is the provider's catalog with `apply_to_catalog`'s virtual overlay on top — see the
+    //    comment where it is built. This arm used to carry its own
+    //    `.or_else(|| virtual_models.get(...))` because `available` was then the bare physical
+    //    catalog; with the overlay in place that fallback returned the same `Model` the lookup
+    //    above already finds (`VirtualModelRegistry::get` and `apply_to_catalog` both hand back
+    //    `entry.model`), so it is gone rather than left as a second path to the same answer.
+    //
+    //    `[CYRUP-DELTA]`, inherited rather than introduced: pi additionally gates the restore on
+    //    `modelRuntime.hasConfiguredAuth(restoredModel.provider)` (`sdk.ts:216`). cyrup has no auth
+    //    snapshot at this point in the build — its proxy is "present in `provider.models()`", which
+    //    this function's own doc records — so a virtual model listed under a THIRD physical provider
+    //    that has no credentials restores here where upstream would reject it. The practical blast
+    //    radius is one request: the routing step re-checks credentials and refuses with pi's own
+    //    `… which has no credentials.` text, so the session comes up on the router and the first
+    //    prompt reports the real problem instead of the selection silently changing at open.
+    //    Upstream's common case needs no check anyway: a provider of only virtual models is marked
+    //    configured at registration (`model-runtime.ts:962-968`). The message when it does NOT resolve names the SELECTION, as
+    //    pi's does (`Could not restore model ${sessionModel.provider}/${sessionModel.modelId}`,
+    //    `sdk.ts:220`), so a dead `router/auto` reports `router/auto` and not the model that
+    //    answered under it.
     if model.is_none()
         && has_existing_session
-        && let Some(saved) = existing.model.as_ref()
+        && let Some(saved) = session_selection
     {
         let restored = available
             .iter()
-            .find(|m| m.provider == saved.provider && m.id == saved.model);
+            .find(|m| m.provider == saved.provider && m.id == saved.model)
+            .cloned();
         match restored {
-            Some(m) => model = Some(m.clone()),
+            Some(m) => model = Some(m),
             None => {
                 fallback = Some(format!(
                     "Could not restore model {}/{}",

@@ -41,7 +41,19 @@ impl AgentSession {
         // available for summarization"); }` (agent-session.ts:2910-2912) — a DIFFERENT string from
         // `formatNoModelSelectedMessage`, and gated on the caller actually asking for a summary, so
         // a modelless session can still navigate the tree without one.
-        let current_model = Self::lock(&self.compaction_model).clone();
+        // A branch summary is a request too, so a virtual selection is routed `direct` first (pi
+        // routes branch summaries through the same `_getSummarizationRequestAuth`,
+        // `agent-session.ts:4046`). Only the MODEL is taken; the level is not threaded into
+        // `run_branch_summary` on this path today.
+        //
+        // Routed ONLY when a summary is actually wanted. pi's gate is the same: it reaches
+        // `_getSummarizationRequestAuth` from the summarizing branch alone, so a plain `/tree`
+        // navigation under a virtual selection must not consult the router at all.
+        let current_model = if user_wants_summary {
+            self.summarization_model().await?.map(|(m, _)| m)
+        } else {
+            Self::lock(&self.compaction_model).clone()
+        };
         let model = match current_model {
             Some(m) => m,
             // pi's gate is on the SUMMARY, not the navigation, so a modelless session still moves
@@ -293,8 +305,10 @@ impl AgentSession {
             // Non-`None` here: the `options.summarize && !this.model` gate above already returned
             // `NoModelForSummarization` (agent-session.ts:2910-2912), and this arm is inside
             // `options.summarize`.
-            let model = Self::lock(&self.compaction_model)
-                .clone()
+            let model = self
+                .summarization_model()
+                .await?
+                .map(|(m, _)| m)
                 .ok_or(SessionServiceError::NoModelForSummarization)?;
             // `(contextWindow || 128000) − reserve` (Pi `branch-summarization.ts:315-317`). The
             // fallback matters: without it a model reporting a zero context window would get budget

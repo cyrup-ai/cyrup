@@ -38,6 +38,7 @@ mod subscriber;
 #[cfg(test)]
 mod tests;
 mod tools;
+mod virtual_models;
 
 pub use attribution::merge_provider_attribution_headers;
 // `BashChunkSink` is exported alongside them because it is the `on_chunk` parameter type of the

@@ -255,6 +255,7 @@ pub fn build_assistant_message(resp: &FauxResponse) -> AssistantMessage {
         response_model: None,
         response_id: None,
         provider_thinking_level: None,
+        thinking_level: None,
         diagnostics: None,
         usage: build_usage(resp.usage.as_ref()),
         stop_reason,

@@ -1,4 +1,4 @@
-// cyrup:ext@0.16.0 — the versioned WIT world (arch-08 §4.1).
+// cyrup:ext@0.17.0 — the versioned WIT world (arch-08 §4.1).
 //
 // Single source of truth, shared verbatim by the host (`wasmtime::component::bindgen!`)
 // and the guest (`wit-bindgen` in cyrup-ext-sdk). Open-shaped values (tool params, message
@@ -130,7 +130,22 @@
 // new field: it rides the `hook-outcome` mutate JSON, whose `structuredContent` key the host now
 // reads. A 0.15 guest exports the shorter signature and would fail to LINK against this host, so it
 // takes the bump (the 0.14 -> 0.15 and 0.2 -> 0.3 `on-tool-result` precedents).
-package cyrup:ext@0.16.0;
+//
+// 0.16 -> 0.17 is the guest-tier VIRTUAL MODEL batch (pi `pi.registerVirtualModel` /
+// `pi.unregisterVirtualModel`, `core/extensions/types.ts:1865-1876` @v1.0.4, the registered type
+// `ExtensionVirtualModel<TState>` at `:1886-1889`), an EXPORT ADDITION: `events.route-model` is
+// NEW, so a 0.16 guest exports nothing under that name and would die inside wasmtime on the link —
+// `check_world` turns that into a typed `ExtError::WorldVersion` instead (the 0.9 -> 0.10
+// `bash-operations-exec` and 0.10 -> 0.11 `on-branch-change` precedents). It is the guest half of
+// pi's `route()` callback, which a WASM guest cannot pass as a VALUE (ADR-0002), so the callable
+// stays guest-side behind an export the host calls once per provider request, keyed by
+// `(provider, id)` because upstream lets one provider list several virtual models. The
+// `registration.register-virtual-model` / `unregister-virtual-model` IMPORTS and the whole
+// `host-router` interface (pi's `ModelRouteRequest.signal`, ported as a poll exactly as
+// `host-bash.is-bash-cancelled` ports `BashOperations.exec`'s) arrive in the same batch and are
+// ADDITIVE — neither would have forced a bump on its own (see the "ADDED WITHOUT A BUMP"
+// paragraph above).
+package cyrup:ext@0.17.0;
 
 // ---------------------------------------------------------------------------
 // Serializable mirrors of cyrup-core. JSON-as-string at the seam (arch-08 §4.1).
@@ -447,6 +462,31 @@ interface events {
   // (`bash-executor.ts:154`) rather than reporting as a successful command.
   bash-operations-exec: func(call-id: string, command: string, cwd: string, opts-json: string) -> result<option<s32>, string>;
 
+  // The guest half of pi's `VirtualModelDefinition.route(request)` /
+  // `ExtensionVirtualModel.route(request, ctx)` (`core/virtual-models.ts:101`,
+  // `core/extensions/types.ts:1888` @v1.0.4), reached because this guest declared
+  // `registration.register-virtual-model` for `(provider, id)`. Called ONCE PER PROVIDER REQUEST
+  // whose selected model is that virtual one — pi creates the ctx per request for exactly this
+  // reason (`core/extensions/loader.ts:500-513`).
+  //
+  // `request-json` is pi's `ModelRouteRequest` in camelCase (`core/virtual-models.ts:52-70`):
+  // `{model, thinkingLevel, reason, previous?, failed?, state?, messages}`, where `model` is the
+  // full VIRTUAL model, `reason` is one of `user`/`continuation`/`retry`/`direct`, and `messages`
+  // is the whole conversation for this request INCLUDING system messages. `ok` is pi's `ModelRoute`
+  // (`:72-82`): `{model, thinkingLevel, state?}`, whose `model` names the PHYSICAL model to use —
+  // the host re-resolves `provider`/`id` against the catalog, so the guest's object is an ADDRESS
+  // rather than a definition. `err` is pi's `route()` THROWING, and upstream's contract for it is
+  // one sentence: "If `route()` throws, or returns a virtual model or a model without credentials,
+  // the request ends with an error response" (`docs/virtual-models.md`).
+  //
+  // Deliberately NOT named `on-*`: this is a keyed CALL like `bash-operations-exec`, not a §5 event
+  // hook, and the header's `on-*` count above is tested against the declarations in this block.
+  //
+  // pi's `ModelRouteRequest.signal?: AbortSignal` is NOT in the JSON — it is the
+  // `host-router.is-route-cancelled(route-id)` poll, keyed by the `route-id` the host passes here,
+  // exactly as `host-bash.is-bash-cancelled` ports `BashOperations.exec`'s `signal`.
+  route-model: func(provider: string, id: string, route-id: string, request-json: string) -> result<string, string>;
+
   // --- raw terminal input (EXT-021's residual; pi `ExtensionUIContext.onTerminalInput(handler)`,
   // `extensions/types.ts:145` @v0.83.0, handler type `TerminalInputHandler` at `:113`:
   // `(data: string) => { consume?: boolean; data?: string } | undefined`) ---
@@ -726,6 +766,31 @@ interface registration {
   // returns the FIRST truthy handler's whole result and stops). This import only declares that
   // this guest HAS one; the last registration wins, as an assignment does upstream.
   register-bash-operations: func();
+  // pi `pi.registerVirtualModel(model)` / `pi.unregisterVirtualModel(provider, id)`
+  // (`core/extensions/types.ts:1865-1876` @v1.0.4). The registered type is
+  // `ExtensionVirtualModel<TState> = Omit<VirtualModelDefinition, "route"> & { route(request, ctx) }`
+  // (`:1886-1889`), over the base definition at `core/virtual-models.ts:84-102`.
+  //
+  // `spec-json` is that `Omit<…, "route">` half in camelCase — `{provider, id, name,
+  // thinkingLevels?, contextWindow?, maxTokens?, input?}`. The `route` CALLBACK is not in it and
+  // cannot be: ADR-0002 forbids a guest handing a callable across the boundary, so this import
+  // declares the SPEC only and the router stays guest-side behind the `events.route-model` export
+  // the host calls once per provider request — the same inversion `register-bash-operations` +
+  // `bash-operations-exec` and `register-markdown-transformer` + `transform-markdown` already make.
+  // Keyed by `(provider, id)` rather than one-per-extension, because upstream lets one provider
+  // list several virtual models beside its physical ones.
+  //
+  // `result<_, string>` follows EXT-082's precedent on `register-tool`/`register-flag` above: pi's
+  // `registerVirtualModel` THROWS for an empty provider or id and for an id that already names a
+  // PHYSICAL model of that provider (`core/model-runtime.ts:955-961` @v1.0.4), so an SDK guest
+  // hands that to the author as a Rust `Result` to `?` out of `init`.
+  //
+  // `unregister-virtual-model` returns nothing, matching the void `unregisterVirtualModel` and the
+  // `unregister-provider` beside it. It removes ONLY that pair, and `unregister-provider` does NOT
+  // imply it — `docs/virtual-models.md` is explicit: "`pi.unregisterVirtualModel(provider, id)`
+  // removes it; `pi.unregisterProvider()` does not."
+  register-virtual-model:   func(spec-json: string) -> result<_, string>;
+  unregister-virtual-model: func(provider: string, id: string);
   // Pi `registerEntryRenderer(customType, renderer)` (`extensions/types.ts:1279` @v0.83.0, the
   // ported baseline — `:1295` @v0.84.1 / `loader.ts:314-318`) — the
   // custom-ENTRY surface, a SEPARATE table from register-message-renderer above (upstream keeps
@@ -1210,6 +1275,19 @@ interface host-bash {
   is-bash-cancelled: func(call-id: string) -> bool;
 }
 
+// The closure-shaped member of pi's `ModelRouteRequest` (`core/virtual-models.ts:69` @v1.0.4,
+// `signal?: AbortSignal`), which cannot cross a component boundary (ADR-0002) — the same
+// substitution `host-bash` above makes for `BashOperations.exec`'s `signal` and `host-tool` for
+// `ToolDefinition.execute`'s. Keyed by the `route-id` the host passed to `events.route-model`, so a
+// stale poll from a later handler can never read a dead route's state (EXT-M06).
+//
+// Deliberately NOT `host-tool.is-cancelled`: that poll reads the `tool_cancel` slot, which
+// `ToolCallBinding`'s `Drop` clears, so a route sharing it would be torn down by an unrelated tool
+// call's unwind.
+interface host-router {
+  is-route-cancelled: func(route-id: string) -> bool;
+}
+
 // OAuth login callbacks (Pi `OAuthLoginCallbacks`, pi-ai oauth/types.ts): the host-side handlers a
 // guest's `login(callbacks)` flow drives during `provider-login`. The host renders the auth URL /
 // device code / prompts and returns the user's answers (the interactive half of `/login`).
@@ -1387,6 +1465,7 @@ world extension {
   import bus;
   import host-tool;
   import host-bash;
+  import host-router;
   import oauth;
   import provider-stream;
   import ext-tools;

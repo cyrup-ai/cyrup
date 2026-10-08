@@ -325,6 +325,24 @@ impl LateRegistrar for FakeRegistrar {
         )))
     }
 
+    /// The llama extension registers no virtual model, so a call here is a bug the test must see.
+    fn register_virtual_model(
+        &self,
+        definition: cyrup_provider::VirtualModelDefinition,
+    ) -> Result<(), ExtError> {
+        Err(ExtError::Component(format!(
+            "FakeRegistrar was asked to register virtual model `{}/{}`",
+            definition.spec.provider.as_str(),
+            definition.spec.id.as_str()
+        )))
+    }
+
+    fn unregister_virtual_model(&self, provider: &str, id: &str) -> Result<bool, ExtError> {
+        Err(ExtError::Component(format!(
+            "FakeRegistrar was asked to unregister virtual model `{provider}/{id}`"
+        )))
+    }
+
     fn owner(&self) -> ExtensionId {
         self.owner.clone()
     }
@@ -1867,6 +1885,25 @@ impl ModelRegistrySink for Sink {
     fn remove_provider(&self, id: &str) {
         self.live.lock().unwrap().remove(id);
         self.events.lock().unwrap().push(format!("remove:{id}"));
+    }
+
+    fn upsert_virtual_model(
+        &self,
+        definition: &cyrup_provider::VirtualModelDefinition,
+    ) -> Result<(), String> {
+        self.events.lock().unwrap().push(format!(
+            "upsert-virtual:{}/{}",
+            definition.spec.provider.as_str(),
+            definition.spec.id.as_str()
+        ));
+        Ok(())
+    }
+
+    fn remove_virtual_model(&self, provider: &str, id: &str) {
+        self.events
+            .lock()
+            .unwrap()
+            .push(format!("remove-virtual:{provider}/{id}"));
     }
 }
 
