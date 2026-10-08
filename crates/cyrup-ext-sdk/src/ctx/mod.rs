@@ -91,7 +91,7 @@ pub use bash_call::BashCommand;
 pub use command::CommandCtx;
 pub use exec::ExecResult;
 pub use http::{HttpRequest, HttpResponse, HttpStreamResponse};
-pub use models::Models;
+pub use models::{ModelStream, Models, message_text};
 pub use nested_call::{
     CallableTool, ExecuteToolOptions, NestedCallError, ToolNamespaceInfo, ToolOutcome,
     ToolOutcomeResult,

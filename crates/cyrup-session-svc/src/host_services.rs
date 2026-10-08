@@ -354,6 +354,23 @@ pub trait SessionCatalog: Send + Sync {
     fn extension_tool_source_info(&self) -> std::collections::HashMap<String, Value>;
 }
 
+/// The live session's MODEL-CALL backend — what [`HostServices::model_stream`] answers from once a
+/// session is attached (EXT-086; pi `ctx.modelRegistry.stream/streamSimple/complete`, which
+/// upstream binds to the session's one `ModelRuntime`).
+///
+/// A separate trait for the reason [`SessionCatalog`] is one: only the running session can answer
+/// it — its composed catalog (virtual rows included), its virtual-model registry, and the provider
+/// resolver its [`crate::ProviderSwap`] holds. Attached by `AgentSession::into_shared` over a weak
+/// self-handle, so it never keeps the session alive.
+pub trait SessionModelCalls: Send + Sync {
+    /// One call; see [`HostServices::model_stream`]. Never fails as a call — every failure is the
+    /// stream's one `error` terminal.
+    fn model_stream(
+        &self,
+        call: cyrup_ext::host::ModelCall,
+    ) -> cyrup_core::EventStream<cyrup_provider::StreamEvent>;
+}
+
 /// The interactive TUI's live THEME seam — the source behind all four of
 /// [`HostServices::theme`], [`HostServices::theme_list`], [`HostServices::theme_by_name`] and
 /// [`HostServices::set_theme`] (SEAM-T01).
@@ -935,6 +952,12 @@ pub struct LiveHostServices {
     /// by-value session (nothing calls `into_shared`), where [`HostServices::commands`] answers
     /// `None` so the guest binding falls back to the extension registry's own resolved commands.
     catalog: Mutex<Option<Arc<dyn SessionCatalog>>>,
+    /// The live session's model-call backend (EXT-086), attached post-build via
+    /// [`Self::attach_session_model_calls`]. `None` on a by-value session and on the default host,
+    /// where [`HostServices::model_stream`] answers from the INSTALLED provider alone — the same
+    /// fallback [`HostServices::complete_standalone`] and [`HostServices::registered_provider`]
+    /// make.
+    model_calls: Mutex<Option<Arc<dyn SessionModelCalls>>>,
     /// EXT-005: `ctx.shutdown()` latched SYNCHRONOUSLY at the capability seam, exactly as Pi does
     /// (`shutdownHandler` is literally `() => { shutdownRequested = true }`, rpc-mode.ts:344-346,
     /// and interactive-mode.ts:1753-1757 sets the field before anything else).
@@ -1109,6 +1132,7 @@ impl LiveHostServices {
             human_interaction: Arc::new(HumanInteractionLock::new()),
             activity: Mutex::new(None),
             catalog: Mutex::new(None),
+            model_calls: Mutex::new(None),
             theme_access: Mutex::new(None),
             footer_data_mirror: Mutex::new(None),
             editor_mirror: Mutex::new(None),
@@ -1258,6 +1282,14 @@ impl LiveHostServices {
     /// self-handle, exactly like [`Self::attach_session_activity`].
     pub fn attach_session_catalog(&self, catalog: Arc<dyn SessionCatalog>) {
         *Self::lock(&self.catalog) = Some(catalog);
+    }
+
+    /// Attach the live session's model-call backend (EXT-086) — the source behind
+    /// [`HostServices::model_stream`] and so behind every extension's `complete` / `stream` /
+    /// `streamSimple`. Installed by `AgentSession::into_shared` over a weak self-handle, exactly
+    /// like [`Self::attach_session_catalog`].
+    pub fn attach_session_model_calls(&self, backend: Arc<dyn SessionModelCalls>) {
+        *Self::lock(&self.model_calls) = Some(backend);
     }
 
     /// Attach the interactive TUI's live theme seam (SEAM-T01) — the source behind all four of
@@ -2043,6 +2075,37 @@ impl HostServices for LiveHostServices {
                 }),
             )
         })
+    }
+
+    /// pi `ctx.modelRegistry.stream(…)` / `streamSimple(…)` (see the trait method; EXT-086).
+    ///
+    /// With a session attached, the session answers ([`SessionModelCalls`]): the whole composed
+    /// catalog, virtual routing for `streamSimple`, and the owning provider resolved without being
+    /// installed. Without one — a by-value session, which nothing in production builds — the
+    /// installed provider is the only provider there is: a model it does not list settles as an
+    /// error, and a virtual model cannot arise (the installed provider's catalog never holds one).
+    fn model_stream(
+        &self,
+        call: cyrup_ext::host::ModelCall,
+    ) -> cyrup_core::EventStream<cyrup_provider::StreamEvent> {
+        if let Some(backend) = Self::lock(&self.model_calls).clone() {
+            return backend.model_stream(call);
+        }
+        let provider = Self::lock(&self.provider_swap)
+            .as_ref()
+            .map_or_else(|| Arc::clone(&self.provider), |swap| swap.current());
+        let model = (provider.id().as_str() == call.provider)
+            .then(|| provider.get_model(&call.model_id).cloned())
+            .flatten();
+        match model {
+            Some(model) if !cyrup_provider::is_virtual_model(&model) => {
+                cyrup_ext::host::model_calls::dispatch(provider.as_ref(), &model, &call)
+            }
+            _ => call.errored_stream(format!(
+                "Model {}/{} is not in this session's model catalog",
+                call.provider, call.model_id
+            )),
+        }
     }
 
     fn provider_credentials(

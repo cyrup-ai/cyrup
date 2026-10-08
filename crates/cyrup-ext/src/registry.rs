@@ -1616,6 +1616,26 @@ impl ExtensionRegistry {
         Ok(g.virtual_model_hub.unregister(provider, id))
     }
 
+    /// The extension that registered the virtual model `(provider, id)`, or `None` when no
+    /// extension did. Read by the guest `models.stream-simple` import to refuse routing a call
+    /// through the CALLING extension's own router, whose instance is suspended in that very call
+    /// (EXT-086).
+    ///
+    /// # Errors
+    ///
+    /// Only a poisoned registry lock.
+    pub fn virtual_model_owner(
+        &self,
+        provider: &str,
+        id: &str,
+    ) -> Result<Option<ExtensionId>, ExtError> {
+        Ok(self
+            .lock_read()?
+            .virtual_model_owner
+            .get(&(provider.to_string(), id.to_string()))
+            .cloned())
+    }
+
     /// The `(provider, id)` pairs still queued for the next [`Self::bind_model_registry`].
     ///
     /// # Errors

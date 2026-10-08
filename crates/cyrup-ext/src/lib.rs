@@ -39,6 +39,24 @@
 //!   mirror of either object and there will not be one, because ADR-0002 makes extension I/O values
 //!   rather than references.
 //!
+//!   **The OPERATIONS of `modelRegistry` are a different matter, and the three that make a model
+//!   call ARE mirrored (EXT-086, 2026-10-08).** `complete`, `stream` and `streamSimple`
+//!   (`core/model-registry.ts` @v1.0.4) are operations, not data, so "the data is exposed via
+//!   `models`" never covered them. They now cross as values: `models.complete` /
+//!   `models.%stream` / `models.stream-simple` take the model ADDRESS, pi's `Context` and the
+//!   crossable options as JSON, and a stream comes back as a handle the guest polls
+//!   (`models.poll-stream` / `models.close-stream`) — the request/poll bridge `http-client` uses,
+//!   because a host stream cannot be handed to a guest. Natives call
+//!   `HostServices::model_stream` / `HostServices::model_complete`. Behind the manifest grant
+//!   `capabilities.modelCalls`. Four deltas inside that mirror are recorded where they live
+//!   (`host::model_calls`): the model is an address re-resolved against the host catalog (pi
+//!   streams against the caller's object); `apiKey` / `env` / `signal` and the callbacks do not
+//!   cross; `complete` is bounded because it holds the guest's instance; `poll-stream` returns a
+//!   batch after at most ~1s. Every OTHER member of `ModelRegistry` (`registerProvider`,
+//!   `getApiKeyAndHeaders`, `classify`, `generateImages`, …) stays under the sentence above: the
+//!   data ones are reachable through `models` / `registration`, and none of the rest was filed by
+//!   this row.
+//!
 //! Anything else `types.ts:305-347` declares should either be reachable from `ctx-state` /
 //! `session` / `models` / `control`, or filed. If you find a third omission, it is a gap, not a
 //! delta — file it rather than adding it here.
@@ -247,12 +265,13 @@ pub use wrapper::{
 
 #[cfg(feature = "wasm-host")]
 pub use host::{
-    CannedResponses, ControlOp, CustomOption, CustomSpec, DENIED_EXEC, DENIED_NET, DENIED_UI,
-    DenyServices, DialogOptions, EpochDriver, ExecOutput, FsCaps, GuestState, HostServices,
-    HttpRequest, HttpResponse, HttpStreamResponse, HumanInteractionGuard, HumanInteractionLock,
-    InteractiveOverlay, LiveExtension, NotifyKind, OAuthEvent, OverlayColor, OverlayKey,
-    OverlayKeyCode, OverlayLine, OverlayMouse, OverlayMouseOutcome, OverlayOptions, OverlayOutcome,
-    OverlaySpan, ProcSpawnSpec, RecordingServices, SpecOverlay, StandaloneCompletion,
+    CannedResponses, ControlOp, CustomOption, CustomSpec, DENIED_EXEC, DENIED_MODEL_CALLS,
+    DENIED_NET, DENIED_UI, DenyServices, DialogOptions, EpochDriver, ExecOutput, FsCaps,
+    GuestState, HostServices, HttpRequest, HttpResponse, HttpStreamResponse, HumanInteractionGuard,
+    HumanInteractionLock, InteractiveOverlay, LiveExtension, ModelCall, ModelCallOptions,
+    ModelCallVerb, ModelStreams, NotifyKind, OAuthEvent, OverlayColor, OverlayKey, OverlayKeyCode,
+    OverlayLine, OverlayMouse, OverlayMouseOutcome, OverlayOptions, OverlayOutcome, OverlaySpan,
+    ProcSpawnSpec, RecordingServices, SpecOverlay, StandaloneCompletion,
     StandaloneCompletionRefusal, StoreLimits, ThemeRole, UiChrome, WasmTool,
 };
 #[cfg(feature = "wasm-host")]
