@@ -19,8 +19,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 pub use local::{
-    kill_pid, kill_process_tree, kill_tracked_detached_children, terminate_pid,
-    track_detached_child_pid, untrack_detached_child_pid,
+    detach_into_new_session, kill_pid, kill_process_tree, kill_tracked_detached_children,
+    terminate_pid, track_detached_child_pid, untrack_detached_child_pid,
 };
 pub use shell::{ShellConfig, Transport, shell_env};
 pub use win::taskkill_program;

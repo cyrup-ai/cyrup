@@ -572,6 +572,14 @@ impl<B: Backend> App<B> {
                 }
             }
             SelectorOutcome::Apply(payload) => {
+                // `app.message.copy` over the `/login` sign-in URL (`login-dialog.ts:230-233`
+                // @v1.1.0). The dialog stays open — copying is not an answer to the flow.
+                if kind == SelectorKind::LoginDialog {
+                    return match crate::login_dialog::parse_copy_auth_url_payload(&payload) {
+                        Some(url) => AppAction::Command(AppCommand::CopyAuthUrl(url.to_string())),
+                        None => AppAction::Redraw,
+                    };
+                }
                 // A `/tree` label save (`e` → `LabelInput` submit, tree_selector.rs) rides an
                 // `"{entry_id}\u{1f}{label}"` `Apply` payload; the entry id is a UUID (never contains
                 // the separator) so the split is unambiguous. Persist it via the session `set_label`

@@ -5,6 +5,28 @@ next work item**.
 
 ---
 
+# UPDATE 2026-10-08 (headless Anthropic login) — `PROV-120` and `TUI-145` closed; `PROV-135`…`PROV-138` and `TUI-167`…`TUI-170` filed and closed
+
+> pi's Anthropic copy-code (headless) login and its method selector, built on `claude/zealous-bell-x0u1h0`
+> (one commit on `main` @ `ef8f867`). Upstream read through git objects at `v0.83.0`, `v1.0.0`, `v1.1.0` and
+> `tmp/pi` HEAD `ce950d78f`.
+>
+> The count is whatever `python3 -I docs/gap-analysis/scripts/count_open_items.py` prints, measured on the
+> branch's base `ef8f867` (before) and on the branch (after): **before 127 open (0 above low; 17
+> trackers; 936 closed); after 125 open (0 above low; 17 trackers; 946 closed)**. Two open rows close —
+> `PROV-120` and `TUI-145` — and eight rows are filed and closed in the same pass, so closed rises by ten.
+> Area 01: 27 → **26** open, 97 → **102** closed. Area 07: 23 → **22** open, 151 → **156** closed.
+>
+> * **Closed:** `PROV-120` (the selector and `login_copy_code`, which starts no listener) and `TUI-145` (the
+>   sign-in screen's copy key).
+> * **Filed and closed:** `PROV-135` (a pasted empty state), `PROV-136` (the free-port fallback), `PROV-137`
+>   (a denied consent fails the login), `PROV-138` (the paste prompt's abort fires on every exit, not only
+>   when the redirect wins; ports pi's "aborts it after settling" test); `TUI-167` (OSC 8 links in the login
+>   dialog), `TUI-168` (the `manual_code` placeholder, a recorded `[CYRUP-DELTA]`), `TUI-169` (the browser
+>   launcher in its own `setsid` session), `TUI-170` (OSC 52 inside tmux and GNU screen: multiplexer
+>   passthrough plus `tmux load-buffer -w`, a cyrup improvement over upstream, which writes the bare escape).
+> * **Next free ids:** `PROV-139`, `TUI-171`; the rest are unchanged.
+
 # UPDATE 2026-10-07 (virtual models, guest tier) — `EXT-109` filed and closed; `SESS-067`'s Fix text CORRECTED, not followed
 
 > The WASM/guest extension tier of pi's virtual models, built on `claude/hopeful-dirac-squ75k`. Upstream
@@ -560,9 +582,9 @@ next work item**.
 >   was never written, and `deno_core` is already in the tree for `workflowScript`; the engine is now recorded in
 >   `ADR-0031`, and `CODE-001` asks only whether and when to build `codemode`.
 > * **Filed (all `NEW 2026-10-03`; post-pin triage of pi v1.0.1, pi-subagents v0.75.0, herdr v0.9.3,
->   pi-mcp-adapter).** `01`: `PROV-130`…`PROV-133`. `05`: `CFG-102`. `06`: `EXT-107`. `07`: `TUI-145`, `TUI-146`.
->   `08`: `SEAM-147`. `09b`: `SUBA-164`…`SUBA-173`. `13`: `MCP-609`…`MCP-611` (outside the count). `16`:
->   `HERDR-007`, `HERDR-008`. **Closed on filing:** `DUR-005` (`17`; the `cyrup-session` rename-durability fix from
+>   pi-mcp-adapter).** `01`: `PROV-130`…`PROV-133`. `05`: `CFG-102`. `06`: `EXT-107`. `07`: `TUI-145`
+>   (closed 2026-10-08, see the block at the top), `TUI-146`. `08`: `SEAM-147`. `09b`: `SUBA-164`…`SUBA-173`.
+>   `13`: `MCP-609`…`MCP-611` (outside the count). `16`: `HERDR-007`, `HERDR-008`. **Closed on filing:** `DUR-005` (`17`; the `cyrup-session` rename-durability fix from
 >   PR #173). **Next free ids:** `PROV-134`, `CFG-103`, `EXT-108`, `TUI-147`, `SEAM-148`, `SUBA-174`, `MCP-612`,
 >   `HERDR-009`, `DUR-006`; the rest are unchanged.
 > * **Not done, and said so.** The pins are not re-pinned (README *Post-pin review*). `code_puppy` (576 commits) and
@@ -663,7 +685,8 @@ next work item**.
 > (`HARN-003`, `HARN-004`).
 >
 > **Next free ids after this pass:** `PROV-130`, `AGENT-048`, `SESS-070`, `TOOL-057`, `CFG-102`,
-> `TUI-145`, `SUBA-164`, `ICOM-082`, `DRIFT-061`, `MCP-609`, `HARN-005`, `DUR-005`, `CODE-014`.
+> `TUI-145` (since filed, 2026-10-03, and closed, 2026-10-08), `SUBA-164`, `ICOM-082`, `DRIFT-061`, `MCP-609`,
+> `HARN-005`, `DUR-005`, `CODE-014`.
 > Unchanged: `EXT-105`, `SEAM-144`, `HERDR-007`. Five single-id gaps were left where a reserved block
 > started one past the counter the file named — `PROV-112`, `CFG-095`, `TUI-129`, `SUBA-149`,
 > `MCP-586` were never allocated and are still free.

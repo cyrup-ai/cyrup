@@ -17,6 +17,7 @@
 //! | [`LoginDialog::show_select`] | `interactive-mode.ts:5294-5325` (`showAuthSelect`) |
 //! | [`TuiAuthInteraction`] | `interactive-mode.ts:5327-5375` (`showAuthPrompt` + `notifyAuthDialog` + `loginProvider`) |
 //! | [`notify_auth_dialog`] | `interactive-mode.ts:5350-5360` (`notifyAuthDialog`) |
+//! | the auth-URL rows + `app.message.copy` | `components/auth-url.ts` (`AuthUrlComponent`) and `login-dialog.ts:16-17`, `:226-233` @v1.1.0 (pi `ced72c2f0`, v1.0.1) |
 //!
 //! ## Why the flow runs off-task
 //!
@@ -38,16 +39,29 @@
 //!   contract is identical: the prompt message is the header, the option **labels** are the rows,
 //!   confirming answers with the option **id**, and cancelling rejects the login with
 //!   `"Login cancelled"` (`:5314-5319`).
-//! * **No OSC-8 hyperlink wrapping** (the browser launch is now ported — DRIFT-042). pi wraps both
-//!   the auth URL and the click hint in `\x1b]8;;<url>\x07…\x1b]8;;\x07`
-//!   (`login-dialog.ts:98-104` @v0.84.2) so the hint itself is the clickable target; cyrup renders
-//!   the bare URL, because the crate drops OSC-8 wrapping everywhere for one reason
-//!   (`image.rs:351`) and the escape must be emitted at paint time rather than stored in the line
-//!   text (`markdown.rs:136`). That is `TUI-020`'s work, not this module's. The URL is shown in
-//!   full so the login stays completable by copy/paste.
-//!   [`LoginDialog::show_auth`] **does** now call pi's `openBrowser(url)` (`:111`) through
-//!   [`crate::open_browser`]; [`LoginDialog::show_device_code`] deliberately does not, matching
-//!   `:118-131`.
+//! * **OSC-8 is written at paint time.** pi wraps the auth URL and the click hint in
+//!   `hyperlink(text, url)` (`auth-url.ts:19`, `:27` @v1.1.0; `showDeviceCode`/`showInfo`,
+//!   `login-dialog.ts:118-131`, `:185-201`); cyrup cannot put the escape in the line text
+//!   (`osc.rs` says why), so the rows are tagged through [`crate::osc::LinkSink`] and
+//!   [`crate::osc::inject_in`] wraps the painted cells — one open/close pair per wrapped row, so a
+//!   long authorize URL is clickable on every row it spans. Gated on the process-wide
+//!   `getCapabilities().hyperlinks` exactly as upstream's `hyperlink` is.
+//! * **The URL is copyable as a whole.** A PKCE authorize URL is several hundred columns, and once it
+//!   wraps a terminal selection over it yields one line per row — useless to paste over SSH or in
+//!   tmux. pi v1.0.1 (`ced72c2f0`) answers that with `app.message.copy` (default `ctrl+x`) on the
+//!   sign-in screen, which copies the full URL (`copyToClipboard`, OSC 52 over SSH) and swaps the
+//!   hint for "Copied URL to clipboard" or the clipboard error. cyrup routes the key out of the
+//!   dialog as a tagged [`SelectorOutcome::Apply`] (the clipboard write is `async` and lives on the
+//!   run loop, the `/tree` copy's shape) and settles it with
+//!   [`LoginDialog::set_auth_url_copy_result`]. [`LoginDialog::show_auth`] **does** call pi's
+//!   `openBrowser(url)` (`:111`) through [`crate::open_browser`]; [`LoginDialog::show_device_code`]
+//!   deliberately does not, matching `:118-131`.
+//! * **`[CYRUP-DELTA]` A `manual_code` prompt keeps its placeholder.** pi's `showAuthPrompt` calls
+//!   `showManualInput(prompt.message)` and drops `prompt.placeholder` (`interactive-mode.ts:6282-6283`
+//!   @v1.1.0). The flows put the expected shape there — Anthropic's copy-code login says
+//!   `code#state` (`anthropic.ts:221`), its browser login the redirect URL — and on a headless host
+//!   that hint is the only description of what to paste, so cyrup shows it as the empty field's
+//!   muted placeholder. It adds no row and vanishes on the first keystroke.
 //! * **Secrets are not masked**, matching upstream — pi's dialog uses a plain `Input` for every
 //!   prompt kind including `secret` (`login-dialog.ts:54`, `:154-172`).
 
@@ -93,6 +107,21 @@ pub enum LoginLineKind {
     Warning,
     /// A blank spacer (`new Spacer(1)`).
     Spacer,
+    /// The auth URL's hint row (`auth-url.ts:27` @v1.1.0): `dim(hyperlink(clickHint, url))`, a
+    /// dim `•`, then the copy hint or the copy's outcome. The stored text is the click hint; the
+    /// rest is drawn from the dialog's copy state.
+    AuthHint,
+}
+
+/// How the auth-URL hint row's tail is coloured (`auth-url.ts:22`, `:33`, `:35`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CopyHint {
+    /// `keyHint("app.message.copy", "to copy")` — dim key, muted description.
+    Key,
+    /// `theme.fg("success", "Copied URL to clipboard")`.
+    Copied,
+    /// `theme.fg("error", error.message)`.
+    Failed,
 }
 
 impl LoginLineKind {
@@ -100,7 +129,7 @@ impl LoginLineKind {
         match self {
             LoginLineKind::Text => theme.base_style(),
             LoginLineKind::Accent => theme.accent_style(),
-            LoginLineKind::Dim => theme.dim_style(),
+            LoginLineKind::Dim | LoginLineKind::AuthHint => theme.dim_style(),
             LoginLineKind::Warning => theme.warning_style(),
             LoginLineKind::Spacer => theme.base_style(),
         }
@@ -146,6 +175,25 @@ pub struct LoginDialog {
     /// invocation is observable in a unit test without a live desktop session; the default is the
     /// real [`crate::open_browser::open_browser`] and nothing but a test replaces it (DRIFT-042).
     launch_browser: std::sync::Arc<dyn Fn(&str) + Send + Sync>,
+    /// The href each entry of `lines` links to, index for index — pi's `hyperlink(text, url)` on
+    /// the auth URL, its click hint, a device-code URI and an info link. Painted as OSC-8 by
+    /// [`Selector::render`] when the terminal supports it.
+    line_links: Vec<Option<String>>,
+    /// `private authUrl?: AuthUrlComponent` (`login-dialog.ts:16-17` @v1.1.0) — the shown sign-in
+    /// URL, which `app.message.copy` copies. Set by `showAuth`, cleared by `showDeviceCode` and
+    /// `showDetails`.
+    auth_url: Option<String>,
+    /// Every key bound to `app.message.copy` (pi `kb.matches(data, "app.message.copy")`,
+    /// `login-dialog.ts:230`). Supplied by the app from the LIVE global keymap.
+    copy_keys: Vec<crate::keymap::Key>,
+    /// `keyText("app.message.copy")` for the `… to copy` hint (`auth-url.ts:22`); `None` when the
+    /// action is unbound, in which case no copy hint is drawn.
+    copy_label: Option<String>,
+    /// What the last copy of `auth_url` did — `AuthUrlComponent.setHint` after `copy()`
+    /// (`auth-url.ts:31-38`): `Ok` is "Copied URL to clipboard", `Err` the clipboard's message.
+    copy_result: Option<Result<(), String>>,
+    /// Test override for the OSC-8 capability; `None` reads the process-wide cache.
+    hyperlinks: Option<bool>,
 }
 
 impl LoginDialog {
@@ -180,7 +228,30 @@ impl LoginDialog {
             } else {
                 std::sync::Arc::new(crate::open_browser::open_browser)
             },
+            line_links: Vec::new(),
+            auth_url: None,
+            copy_keys: Vec::new(),
+            copy_label: None,
+            copy_result: None,
+            hyperlinks: None,
         }
+    }
+
+    /// Arm `app.message.copy` on the sign-in URL (`login-dialog.ts:230-233` @v1.1.0): `keys` are
+    /// the global bindings of [`crate::keymap::Action::MessageCopy`] and `label` their joined
+    /// `keyText`. The app passes the live keymap, so a rebind of the copy key moves this hint too.
+    #[must_use]
+    pub fn with_copy_keys(mut self, keys: Vec<crate::keymap::Key>, label: Option<String>) -> Self {
+        self.copy_keys = keys;
+        self.copy_label = label.filter(|l| !l.is_empty());
+        self
+    }
+
+    /// Force the OSC-8 capability instead of reading the process-wide cache (test seam).
+    #[cfg(test)]
+    pub(crate) fn with_hyperlinks(mut self, on: bool) -> Self {
+        self.hyperlinks = Some(on);
+        self
     }
 
     /// Replace the browser launcher (test seam for DRIFT-042). Production never calls this.
@@ -200,13 +271,55 @@ impl LoginDialog {
         &self.lines
     }
 
-    /// Every body line's text joined by `\n` — the cheap assertion surface for tests.
+    /// Every body line's text joined by `\n` — the cheap assertion surface for tests. The auth
+    /// URL's hint row reads as drawn, copy hint or copy result included.
     pub fn body_text(&self) -> String {
         self.lines
             .iter()
-            .map(|(_, t)| t.as_str())
+            .map(|(kind, t)| self.display_text(*kind, t))
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// The sign-in URL `app.message.copy` would copy, if one is shown.
+    pub fn auth_url(&self) -> Option<&str> {
+        self.auth_url.as_deref()
+    }
+
+    /// The armed free-text prompt's placeholder, if any (test/inspection).
+    pub fn input_placeholder(&self) -> Option<&str> {
+        self.input.as_ref().and_then(|i| i.placeholder.as_deref())
+    }
+
+    /// A line's text as drawn: everything but the auth-URL hint row is stored verbatim.
+    fn display_text(&self, kind: LoginLineKind, text: &str) -> String {
+        match (kind, self.auth_hint_suffix()) {
+            (LoginLineKind::AuthHint, Some((suffix, _))) => format!("{text} \u{2022} {suffix}"),
+            _ => text.to_string(),
+        }
+    }
+
+    /// The part of the auth-URL hint row after the `•` (`auth-url.ts:27`): `keyHint("app.message.copy",
+    /// "to copy")` until a copy settles, then the copy's outcome (`:33`, `:35`). `None` when the
+    /// copy key is unbound and nothing has been copied.
+    fn auth_hint_suffix(&self) -> Option<(String, CopyHint)> {
+        match &self.copy_result {
+            Some(Ok(())) => Some(("Copied URL to clipboard".to_string(), CopyHint::Copied)),
+            Some(Err(message)) => Some((message.clone(), CopyHint::Failed)),
+            None => self
+                .copy_label
+                .as_ref()
+                .map(|key| (format!("{key} to copy"), CopyHint::Key)),
+        }
+    }
+
+    /// Settle a copy of `url` — `AuthUrlComponent.copy()`'s `setHint` (`auth-url.ts:31-38`).
+    /// Ignored when the dialog has since moved to a different URL (or none): upstream's update
+    /// lands on the component that was copied, which is no longer on screen.
+    pub fn set_auth_url_copy_result(&mut self, url: &str, result: Result<(), String>) {
+        if self.auth_url.as_deref() == Some(url) {
+            self.copy_result = Some(result);
+        }
     }
 
     /// The current free-text buffer, or `None` when no text prompt is armed.
@@ -228,11 +341,23 @@ impl LoginDialog {
     }
 
     fn push(&mut self, kind: LoginLineKind, text: impl Into<String>) {
+        self.push_linked(kind, text, None);
+    }
+
+    /// [`Self::push`] for a row pi wraps in `hyperlink(text, href)`.
+    fn push_linked(&mut self, kind: LoginLineKind, text: impl Into<String>, href: Option<&str>) {
         self.lines.push((kind, text.into()));
+        self.line_links.push(href.map(str::to_string));
     }
 
     fn spacer(&mut self) {
-        self.lines.push((LoginLineKind::Spacer, String::new()));
+        self.push(LoginLineKind::Spacer, String::new());
+    }
+
+    /// `contentContainer.clear()`.
+    fn clear_lines(&mut self) {
+        self.lines.clear();
+        self.line_links.clear();
     }
 
     /// `showAuth(url, instructions)` (`login-dialog.ts:96-113` @v0.84.2): clear, then the URL, the
@@ -240,15 +365,19 @@ impl LoginDialog {
     /// the method does before requesting a render.
     ///
     /// DRIFT-042: the launch was disclosed-but-absent here for the whole port. The OSC-8 wrapping
-    /// of the URL and of the click hint (`login-dialog.ts:98-104`) is the *other* half and is NOT
-    /// closed by this method — it is an instance of `TUI-020` (the crate detects and tests
-    /// hyperlink support but emits no OSC-8), and the escape has to be written at paint time
-    /// rather than stored in the line text (`markdown.rs:136`).
+    /// of the URL and of the click hint is recorded in `line_links` and written at paint time
+    /// ([`Selector::render`]); the launch is best-effort and silent when no browser exists
+    /// ([`crate::open_browser`]), which is the copy-code login's normal case.
     pub fn show_auth(&mut self, url: &str, instructions: Option<&str>) {
-        self.lines.clear();
+        self.clear_lines();
         self.spacer();
-        self.push(LoginLineKind::Accent, url);
-        self.push(LoginLineKind::Dim, click_hint());
+        // `this.authUrl = new AuthUrlComponent(this.tui, url)` (`login-dialog.ts:102` @v1.1.0): the
+        // URL as one logical row (`auth-url.ts:19`) — it wraps, but no character is inserted into
+        // it — then the click hint with the copy hint after a `•` (`:20-27`).
+        self.auth_url = Some(url.to_string());
+        self.copy_result = None;
+        self.push_linked(LoginLineKind::Accent, url, Some(url));
+        self.push_linked(LoginLineKind::AuthHint, click_hint(), Some(url));
         if let Some(instructions) = instructions.filter(|s| !s.is_empty()) {
             self.spacer();
             self.push(LoginLineKind::Warning, instructions);
@@ -266,10 +395,18 @@ impl LoginDialog {
     /// A device-code flow expects the user to move to another device, so launching here would be a
     /// divergence, not an improvement.
     pub fn show_device_code(&mut self, user_code: &str, verification_uri: &str) {
-        self.lines.clear();
+        // `this.authUrl = undefined` (`login-dialog.ts:118` @v1.1.0): the copy key does nothing on a
+        // device-code screen.
+        self.auth_url = None;
+        self.copy_result = None;
+        self.clear_lines();
         self.spacer();
-        self.push(LoginLineKind::Accent, verification_uri);
-        self.push(LoginLineKind::Dim, click_hint());
+        self.push_linked(
+            LoginLineKind::Accent,
+            verification_uri,
+            Some(verification_uri),
+        );
+        self.push_linked(LoginLineKind::Dim, click_hint(), Some(verification_uri));
         self.spacer();
         self.push(LoginLineKind::Warning, format!("Enter code: {user_code}"));
     }
@@ -278,11 +415,18 @@ impl LoginDialog {
     /// prompt + the input + the cancel hint. Does NOT clear — the auth URL stays visible above it,
     /// which is the whole point of the manual-code escape hatch.
     pub fn show_manual_input(&mut self, prompt: &str) {
+        self.show_manual_code(prompt, None);
+    }
+
+    /// [`Self::show_manual_input`] plus the prompt's placeholder, drawn muted inside the empty field
+    /// — the module's `[CYRUP-DELTA]` note says why (`code#state` is the copy-code login's only
+    /// description of what to paste).
+    pub fn show_manual_code(&mut self, prompt: &str, placeholder: Option<String>) {
         self.spacer();
         self.push(LoginLineKind::Dim, prompt);
         self.input = Some(LoginInput {
             input: crate::text_input::Input::new(),
-            placeholder: None,
+            placeholder: placeholder.filter(|p| !p.is_empty()),
         });
         self.select = None;
     }
@@ -314,7 +458,10 @@ impl LoginDialog {
 
     /// `showDetails(lines)` (`login-dialog.ts:175-182`): clear, then the given lines verbatim.
     pub fn show_details(&mut self, lines: &[String]) {
-        self.lines.clear();
+        // `this.authUrl = undefined` (`login-dialog.ts:180` @v1.1.0).
+        self.auth_url = None;
+        self.copy_result = None;
+        self.clear_lines();
         self.spacer();
         for line in lines {
             self.push(LoginLineKind::Text, line.clone());
@@ -335,7 +482,7 @@ impl LoginDialog {
                 Some(label) => format!("{label}: {url}"),
                 None => url.clone(),
             };
-            self.push(LoginLineKind::Accent, text);
+            self.push_linked(LoginLineKind::Accent, text, Some(url.as_str()));
         }
         if close_hint {
             self.spacer();
@@ -389,14 +536,51 @@ impl LoginDialog {
     /// ([`Selector::desired_height`]) — the row texts are identical either way, so measuring
     /// through the same function is what guarantees the reserved height can never disagree with
     /// what renders (the invariant `title_wrapped_height` documents for the title area).
-    fn body_lines(&self, width: u16, theme: Option<&UiTheme>) -> Vec<Line<'static>> {
+    fn body_lines(
+        &self,
+        width: u16,
+        theme: Option<&UiTheme>,
+        links: Option<&crate::osc::LinkSink>,
+    ) -> Vec<Line<'static>> {
         let style = |pick: fn(&UiTheme) -> Style| theme.map(pick).unwrap_or_default();
+        // `hyperlink(text, href)`: the row's style carries the link marker that
+        // `osc::inject_in` turns into the escape once the cells exist.
+        let linked = |base: Style, href: Option<&String>| match (links, href) {
+            (Some(sink), Some(href)) => base.patch(sink.mark(href.clone())),
+            _ => base,
+        };
         let mut out: Vec<Line<'static>> = self
             .lines
             .iter()
-            .map(|(kind, text)| {
-                let style = theme.map(|t| kind.style(t)).unwrap_or_default();
-                Line::from(Span::styled(format!(" {text}"), style))
+            .enumerate()
+            .map(|(i, (kind, text))| {
+                let base = theme.map(|t| kind.style(t)).unwrap_or_default();
+                let href = self.line_links.get(i).and_then(Option::as_ref);
+                let mut spans = vec![
+                    Span::styled(" ", base),
+                    Span::styled(text.clone(), linked(base, href)),
+                ];
+                if *kind == LoginLineKind::AuthHint
+                    && let Some((suffix, hint)) = self.auth_hint_suffix()
+                {
+                    spans.push(Span::styled(" \u{2022} ", base));
+                    match hint {
+                        // `keyHint`: `theme.fg("dim", key) + theme.fg("muted", " to copy")`.
+                        CopyHint::Key => {
+                            let key = self.copy_label.clone().unwrap_or_default();
+                            let rest = suffix.strip_prefix(key.as_str()).unwrap_or(&suffix);
+                            spans.push(Span::styled(key.clone(), base));
+                            spans.push(Span::styled(rest.to_string(), style(UiTheme::muted_style)));
+                        }
+                        CopyHint::Copied => {
+                            spans.push(Span::styled(suffix, style(UiTheme::success_style)));
+                        }
+                        CopyHint::Failed => {
+                            spans.push(Span::styled(suffix, style(UiTheme::error_style)));
+                        }
+                    }
+                }
+                Line::from(spans)
             })
             .collect();
         if let Some(select) = &self.select {
@@ -477,7 +661,7 @@ impl LoginDialog {
 impl Selector for LoginDialog {
     fn desired_height(&self, width: u16) -> u16 {
         // Top rule + wrapped title + wrapped body + bottom rule.
-        let body = self.body_lines(width, None);
+        let body = self.body_lines(width, None, None);
         let body_h = crate::transcript::wrapped_height(&body, usize::from(width))
             .min(usize::from(u16::MAX)) as u16;
         title_wrapped_height(&self.title, width)
@@ -487,7 +671,13 @@ impl Selector for LoginDialog {
 
     fn render(&mut self, frame: &mut Frame, area: Rect, theme: &UiTheme) {
         let title_h = title_wrapped_height(&self.title, area.width);
-        let body = self.body_lines(area.width, Some(theme));
+        // `hyperlink()` is gated on `getCapabilities().hyperlinks` upstream; an incapable terminal
+        // gets the same rows with no escape.
+        let sink = crate::osc::LinkSink::new();
+        let hyperlinks = self
+            .hyperlinks
+            .unwrap_or_else(crate::image::hyperlinks_supported);
+        let body = self.body_lines(area.width, Some(theme), hyperlinks.then_some(&sink));
         let body_h = crate::transcript::wrapped_height(&body, usize::from(area.width))
             .min(usize::from(u16::MAX)) as u16;
         let [top, title_area, body_area, bottom] = Layout::vertical([
@@ -505,6 +695,8 @@ impl Selector for LoginDialog {
             title_area,
         );
         frame.render_widget(Paragraph::new(body).wrap(Wrap { trim: false }), body_area);
+        // After the widget, so `Paragraph` measured plain cells (`osc::inject` says why).
+        crate::osc::inject_in(frame.buffer_mut(), body_area, &sink);
         frame.render_widget(border_rule(bottom.width, theme), bottom);
     }
 
@@ -516,7 +708,7 @@ impl Selector for LoginDialog {
         if self.input.is_none() {
             return SelectorOutcome::Ignored;
         }
-        let body = self.body_lines(area.width, None);
+        let body = self.body_lines(area.width, None, None);
         let above = body.get(..self.lines.len()).unwrap_or_default();
         let above_h = crate::transcript::wrapped_height(above, usize::from(area.width));
         let row = title_wrapped_height(&self.title, area.width)
@@ -539,7 +731,17 @@ impl Selector for LoginDialog {
         // `handleInput` (`login-dialog.ts:222-232`): the cancel binding aborts the WHOLE login
         // (`cancel()` → `abortController.abort()` + reject "Login cancelled"); everything else goes
         // to the input. The select prompt's own Esc rejects identically (`:5316-5319`).
-        match keymap.action_for(key) {
+        let action = keymap.action_for(key);
+        // `if (this.authUrl && kb.matches(data, "app.message.copy")) { void this.authUrl.copy();
+        // return; }` (`login-dialog.ts:230-233` @v1.1.0) — after cancel, before the input, so the
+        // copy key never types into a paste field that happens to be armed.
+        if action != Some(SelectAction::Cancel)
+            && let Some(url) = self.auth_url.as_deref()
+            && self.copy_keys.iter().any(|k| k.matches(key))
+        {
+            return SelectorOutcome::Apply(copy_auth_url_payload(url));
+        }
+        match action {
             Some(SelectAction::Cancel) => return SelectorOutcome::Cancel,
             Some(SelectAction::Confirm) => {
                 let Some((answer, echo)) = self.confirm_answer() else {
@@ -605,6 +807,26 @@ impl Selector for LoginDialog {
     fn as_login_dialog(&mut self) -> Option<&mut LoginDialog> {
         Some(self)
     }
+}
+
+/// The tag on the [`SelectorOutcome::Apply`] payload the copy key produces — unit-separator
+/// delimited like `/tree`'s copy payload, so it can never collide with a typed value.
+const COPY_AUTH_URL_TAG: &str = "copy-auth-url";
+
+/// `"\u{1f}copy-auth-url\u{1f}{url}"` — what [`LoginDialog`] hands the run loop when
+/// `app.message.copy` is pressed over a sign-in URL.
+fn copy_auth_url_payload(url: &str) -> String {
+    let sep = crate::FIELD_SEP;
+    format!("{sep}{COPY_AUTH_URL_TAG}{sep}{url}")
+}
+
+/// The URL a [`LoginDialog`] `Apply` payload asks to copy, or `None` for any other payload.
+pub(crate) fn parse_copy_auth_url_payload(payload: &str) -> Option<&str> {
+    let sep = crate::FIELD_SEP;
+    payload
+        .strip_prefix(sep)?
+        .strip_prefix(COPY_AUTH_URL_TAG)?
+        .strip_prefix(sep)
 }
 
 /// One message from the spawned login task to `App::run`'s `select!` loop.
@@ -775,8 +997,9 @@ pub fn notify_auth_dialog(dialog: &mut LoginDialog, event: AuthEvent) {
 }
 
 /// `showAuthPrompt`'s kind dispatch (`interactive-mode.ts:5328-5332`): `select` opens the option
-/// list, `manual_code` opens the bare manual-entry field, everything else (`text`, `secret`, and an
-/// absent `type`) opens the ordinary message+placeholder prompt.
+/// list, `manual_code` opens the bare manual-entry field (keeping its placeholder — the module's
+/// `[CYRUP-DELTA]`), everything else (`text`, `secret`, and an absent `type`) opens the ordinary
+/// message+placeholder prompt.
 pub fn show_auth_prompt(dialog: &mut LoginDialog, prompt: &AuthPrompt) {
     match prompt.kind {
         Some(AuthPromptKind::Select) => {
@@ -787,7 +1010,9 @@ pub fn show_auth_prompt(dialog: &mut LoginDialog, prompt: &AuthPrompt) {
                 .collect();
             dialog.show_select(&prompt.message, options);
         }
-        Some(AuthPromptKind::ManualCode) => dialog.show_manual_input(&prompt.message),
+        Some(AuthPromptKind::ManualCode) => {
+            dialog.show_manual_code(&prompt.message, prompt.placeholder.clone())
+        }
         _ => dialog.show_prompt(&prompt.message, prompt.placeholder.clone()),
     }
 }
@@ -991,6 +1216,239 @@ mod tests {
             },
         );
         assert!(d.body_text().contains("Docs: https://example.test/docs"));
+    }
+
+    // -- pi v1.0.1 `ced72c2f0`: `app.message.copy` on the sign-in URL (`auth-url.ts`) --------------
+
+    /// A sign-in URL as long as a real PKCE authorize URL — pi's own fixture shape
+    /// (`test/auth-url-copy.test.ts:14`).
+    fn long_url() -> String {
+        format!("https://auth.example.invalid/authorize?{}", "x".repeat(300))
+    }
+
+    fn ctrl(c: char) -> KeyEvent {
+        KeyEvent {
+            code: KeyCode::Char(c),
+            modifiers: KeyModifiers::CONTROL,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        }
+    }
+
+    /// The dialog the app opens: `app.message.copy` armed with its stock `ctrl+x`.
+    fn copy_dialog() -> LoginDialog {
+        dialog().with_copy_keys(
+            vec![crate::keymap::Key::ctrl('x')],
+            Some("ctrl+x".to_string()),
+        )
+    }
+
+    /// pi `test/auth-url-copy.test.ts:34-43` — "login dialog copies the auth URL instead of typing
+    /// into the code input": the hint says `ctrl+x to copy`, the key yields the WHOLE URL (here
+    /// as the run loop's copy command), the paste field is left untouched, and the hint then reads
+    /// `Copied URL to clipboard`.
+    ///
+    /// **Red before the fix:** the dialog had no copy key; `ctrl+x` fell through to the paste
+    /// field and nothing on screen offered a way to get an unbroken copy of a wrapped URL.
+    #[test]
+    fn the_copy_key_copies_the_auth_url_instead_of_typing_into_the_code_input() {
+        let url = long_url();
+        let mut d = copy_dialog();
+        d.show_auth(&url, None);
+        d.show_manual_input("Paste the code:");
+        assert!(
+            d.body_text().contains("ctrl+x to copy"),
+            "{}",
+            d.body_text()
+        );
+
+        let outcome = d.handle(&ctrl('x'), &SelectKeymap::default());
+        let SelectorOutcome::Apply(payload) = outcome else {
+            panic!("expected the copy payload, got {outcome:?}");
+        };
+        assert_eq!(parse_copy_auth_url_payload(&payload), Some(url.as_str()));
+        assert_eq!(d.input_text(), Some(""), "the key must not reach the field");
+
+        d.set_auth_url_copy_result(&url, Ok(()));
+        let body = d.body_text();
+        assert!(body.contains("Copied URL to clipboard"), "{body}");
+        assert!(
+            !body.contains("to copy"),
+            "the result replaces the hint: {body}"
+        );
+    }
+
+    /// `auth-url.ts:34-36` — a failing clipboard shows its own message in the hint row.
+    #[test]
+    fn a_failed_copy_shows_the_clipboard_error_in_the_hint_row() {
+        let url = long_url();
+        let mut d = copy_dialog();
+        d.show_auth(&url, None);
+        d.set_auth_url_copy_result(&url, Err("Failed to copy to clipboard".to_string()));
+        assert!(
+            d.body_text().contains("Failed to copy to clipboard"),
+            "{}",
+            d.body_text()
+        );
+    }
+
+    /// pi `test/auth-url-copy.test.ts:45-50` — "login dialog ignores the copy key without an auth
+    /// URL": a device-code screen clears `authUrl` (`login-dialog.ts:118`).
+    #[test]
+    fn the_copy_key_does_nothing_without_an_auth_url() {
+        let mut d = copy_dialog();
+        d.show_auth("https://example.test/auth", None);
+        d.show_device_code("ABCD", "https://example.invalid/device");
+        assert_eq!(d.auth_url(), None);
+        assert_eq!(
+            d.handle(&ctrl('x'), &SelectKeymap::default()),
+            SelectorOutcome::Ignored
+        );
+        let mut d = copy_dialog();
+        d.show_auth("https://example.test/auth", None);
+        d.show_details(&["Configure it elsewhere".to_string()]);
+        assert_eq!(d.auth_url(), None, "showDetails clears it too (`:180`)");
+    }
+
+    /// A copy that settles after the dialog moved to a new URL lands on nothing — upstream's
+    /// `setHint` updates the component that was copied, which is no longer shown.
+    #[test]
+    fn a_stale_copy_result_is_ignored() {
+        let mut d = copy_dialog();
+        d.show_auth("https://example.test/first", None);
+        d.show_auth("https://example.test/second", None);
+        d.set_auth_url_copy_result("https://example.test/first", Ok(()));
+        assert!(
+            d.body_text().contains("ctrl+x to copy"),
+            "{}",
+            d.body_text()
+        );
+        assert!(!d.body_text().contains("Copied"), "{}", d.body_text());
+    }
+
+    /// With the copy action unbound there is no `… to copy` promise to break.
+    #[test]
+    fn an_unbound_copy_key_draws_no_copy_hint() {
+        let mut d = dialog();
+        d.show_auth("https://example.test/auth", None);
+        let body = d.body_text();
+        assert!(body.contains("click to open"), "{body}");
+        assert!(!body.contains("to copy"), "{body}");
+        assert_eq!(
+            d.handle(&ctrl('x'), &SelectKeymap::default()),
+            SelectorOutcome::Ignored
+        );
+    }
+
+    /// Paint the dialog into an 80-column buffer and return each row's raw cell symbols.
+    fn painted_rows(d: &mut LoginDialog) -> Vec<String> {
+        let width = 80;
+        let height = d.desired_height(width);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+        let theme = UiTheme::dark();
+        terminal
+            .draw(|frame| d.render(frame, frame.area(), &theme))
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    /// pi `auth-url.ts:19` (`hyperlink(url, url)`) and `:27` (`hyperlink(clickHint, url)`): on a
+    /// hyperlink-capable terminal every row the wrapped URL occupies is an OSC-8 link to the FULL
+    /// URL, so a click on any row opens the whole thing — and wrapping inserts nothing into it:
+    /// the rows' visible text, concatenated, is the URL exactly.
+    ///
+    /// **Red before the fix:** the dialog emitted no OSC-8 at all (`TUI-020` was cited as the
+    /// reason), so on a wrapped URL only a copy-and-repair of each row could reach the browser.
+    #[test]
+    fn a_wrapped_auth_url_is_one_osc8_link_per_row_and_reassembles_exactly() {
+        let url = long_url();
+        let mut d = copy_dialog().with_hyperlinks(true);
+        d.show_auth(&url, Some("Complete login in your browser."));
+        let rows = painted_rows(&mut d);
+        let open = crate::osc::open(&url);
+        let url_rows: Vec<&String> = rows.iter().filter(|r| r.contains(&open)).collect();
+        assert!(
+            url_rows.len() >= 5,
+            "a {}-char URL spans several 80-column rows, each linked: {rows:#?}",
+            url.len()
+        );
+        // The URL rows plus the click-hint row are all linked to the same full URL.
+        let visible: Vec<String> = url_rows
+            .iter()
+            .map(|r| crate::ansi::strip_ansi(r).trim().to_string())
+            .collect();
+        let hint_row = visible.last().unwrap().clone();
+        assert!(
+            hint_row.starts_with("Ctrl+click to open") || hint_row.starts_with("Cmd+click to open"),
+            "{hint_row}"
+        );
+        assert!(hint_row.contains("ctrl+x to copy"), "{hint_row}");
+        let reassembled: String = visible[..visible.len() - 1].concat();
+        assert_eq!(
+            reassembled, url,
+            "wrapping must not insert or drop a character"
+        );
+    }
+
+    /// `hyperlink()` is gated on `getCapabilities().hyperlinks`: an incapable terminal gets plain
+    /// cells, never a literal escape.
+    #[test]
+    fn no_osc8_is_painted_when_the_terminal_lacks_hyperlinks() {
+        let mut d = copy_dialog().with_hyperlinks(false);
+        d.show_auth(&long_url(), None);
+        let rows = painted_rows(&mut d);
+        assert!(
+            rows.iter().all(|r| !r.contains('\u{1b}')),
+            "no escape on an incapable terminal: {rows:#?}"
+        );
+        assert!(
+            rows.iter()
+                .any(|r| r.contains("https://auth.example.invalid"))
+        );
+    }
+
+    /// The copy-code (headless) login's paste prompt: Anthropic's `manual_code` prompt carries
+    /// `placeholder: "code#state"` (`anthropic.ts:221` @v1.1.0). It is drawn muted inside the empty
+    /// field (the module's `[CYRUP-DELTA]`) under the instructions and the URL.
+    ///
+    /// **Red before the fix:** `show_auth_prompt` routed `manual_code` to `show_manual_input`,
+    /// which dropped the placeholder, so nothing on screen said what shape to paste.
+    #[test]
+    fn a_manual_code_prompt_shows_its_placeholder_in_the_empty_field() {
+        let mut d = copy_dialog().with_hyperlinks(false);
+        d.show_auth(
+            "https://claude.ai/oauth/authorize?code=true",
+            Some("Complete login in your browser, then copy the code Anthropic shows and paste it here."),
+        );
+        show_auth_prompt(
+            &mut d,
+            &AuthPrompt::manual_code("Paste the code Anthropic shows after you sign in:")
+                .with_placeholder("code#state"),
+        );
+        assert_eq!(d.input_placeholder(), Some("code#state"));
+        let rows = painted_rows(&mut d).join("\n");
+        assert!(
+            rows.contains("then copy the code Anthropic shows"),
+            "{rows}"
+        );
+        assert!(
+            rows.contains("Paste the code Anthropic shows after you sign in:"),
+            "{rows}"
+        );
+        assert!(rows.contains("> code#state"), "{rows}");
+        // The placeholder is not a value: typing replaces it.
+        let km = SelectKeymap::default();
+        d.handle(&key(KeyCode::Char('a')), &km);
+        assert_eq!(d.input_text(), Some("a"));
+        assert!(!painted_rows(&mut d).join("\n").contains("code#state"));
     }
 
     #[tokio::test]

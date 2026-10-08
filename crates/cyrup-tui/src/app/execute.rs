@@ -60,7 +60,8 @@ impl<B: Backend> App<B> {
             | C::Share
             | C::ShowName
             | C::ThinkingCommand(_)
-            | C::CopyEntry(_) => self.execute_misc_command(cmd, session).await,
+            | C::CopyEntry(_)
+            | C::CopyAuthUrl(_) => self.execute_misc_command(cmd, session).await,
         }
     }
 

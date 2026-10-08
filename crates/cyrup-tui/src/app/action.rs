@@ -213,6 +213,12 @@ pub enum AppCommand {
     /// clipped one-line row labels; materialising every entry's full body into the node list to
     /// serve one keystroke would put the whole transcript in the selector.
     CopyEntry(String),
+    /// `app.message.copy` pressed while the `/login` dialog shows a sign-in URL: copy the WHOLE URL
+    /// to the clipboard — pi `AuthUrlComponent.copy()` (`components/auth-url.ts:31-38` @v1.1.0,
+    /// `ced72c2f0`), for when the browser cannot be opened (SSH, a container) and the wrapped link
+    /// cannot be selected as one piece. The result is reported back on the dialog's hint row
+    /// ([`crate::LoginDialog::set_auth_url_copy_result`]), not in the transcript.
+    CopyAuthUrl(String),
     /// `/name <name>` — set the session display name (`handleNameCommand`).
     SetName(String),
     /// `/name` with NO argument — the GETTER half of `handleNameCommand`

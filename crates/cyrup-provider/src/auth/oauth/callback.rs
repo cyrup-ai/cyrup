@@ -302,6 +302,10 @@ impl<T: Send + 'static> CallbackServer<T> {
     where
         H: CallbackHandler<Value = T>,
     {
+        let bind_addr = format!("{}:{}", bracket_host(&config.host), config.port);
+        #[cfg(test)]
+        bind_attempts::record(&bind_addr);
+
         if config
             .cancel
             .as_ref()
@@ -310,7 +314,6 @@ impl<T: Send + 'static> CallbackServer<T> {
             return Err(OAuthError::Cancelled);
         }
 
-        let bind_addr = format!("{}:{}", bracket_host(&config.host), config.port);
         let listener = TcpListener::bind(&bind_addr).map_err(|source| OAuthError::Listen {
             address: bind_addr.clone(),
             source,
@@ -490,6 +493,42 @@ fn finish<T>(shared: &Arc<Shared>, settle: &Arc<SettleSlot<T>>, result: Settled<
         && let Some(sender) = slot.take()
     {
         let _ = sender.send(result);
+    }
+}
+
+/// Test-only record of every [`CallbackServer::start`] call, as the `host:port` it set out to bind.
+///
+/// Whether a flow *tried* to start a listener is otherwise unobservable without a race: a failed
+/// bind is swallowed by the flows that degrade (`anthropic.ts:154-156`), and probing a port for
+/// "nobody is listening" means binding it, releasing it and hoping no parallel test grabs it in
+/// between. Tests that assert on this record pass a bind host no other test uses (a TEST-NET-1
+/// address, RFC 5737, which also guarantees the bind itself fails), so the shared record cannot
+/// be polluted by concurrently running tests. Compiled out of non-test builds.
+#[cfg(test)]
+pub(crate) mod bind_attempts {
+    use std::sync::Mutex;
+
+    static ATTEMPTS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+    pub(super) fn record(bind_addr: &str) {
+        if let Ok(mut attempts) = ATTEMPTS.lock() {
+            attempts.push(bind_addr.to_string());
+        }
+    }
+
+    /// Every `host:port` attempted on `host`, in call order.
+    pub(crate) fn on_host(host: &str) -> Vec<String> {
+        let prefix = format!("{host}:");
+        ATTEMPTS
+            .lock()
+            .map(|attempts| {
+                attempts
+                    .iter()
+                    .filter(|a| a.starts_with(&prefix))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 }
 

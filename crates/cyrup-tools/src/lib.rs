@@ -45,9 +45,9 @@ pub use isolation::{
 pub use lock::FileMutationLocks;
 pub use ops::{
     Access, ArgvOutput, ArgvSpec, Backend, DirEntry, ExecSpec, ExitStatus, FsOps, ImageMime, Meta,
-    ProcOps, ShellConfig, Transport, WalkFlavor, WalkItem, WalkOpts, kill_pid, kill_process_tree,
-    kill_tracked_detached_children, terminate_pid, track_detached_child_pid,
-    untrack_detached_child_pid,
+    ProcOps, ShellConfig, Transport, WalkFlavor, WalkItem, WalkOpts, detach_into_new_session,
+    kill_pid, kill_process_tree, kill_tracked_detached_children, terminate_pid,
+    track_detached_child_pid, untrack_detached_child_pid,
 };
 pub use registry::{
     Availability, BUILTIN_NAMES, ToolRegistry, all_tools, coding_tools, read_only_tools,
