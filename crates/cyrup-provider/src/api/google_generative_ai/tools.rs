@@ -27,7 +27,7 @@ pub(super) fn convert_tools(
     let decls: Vec<Value> = tools
         .iter()
         .map(|t| {
-            let strict = resolve_json_schema_strict_sampling(t, supports_strict_mode)?;
+            let strict = resolve_json_schema_strict_sampling(t, supports_strict_mode, None)?;
             Ok(json!({
                 "name": t.name,
                 "description": t.description,
@@ -74,7 +74,7 @@ pub(super) fn resolve_google_function_calling_mode(
 ) -> Result<Option<&'static str>, ConstrainedSamplingError> {
     let mut use_strict_mode = false;
     for tool in tools {
-        if resolve_json_schema_strict_sampling(tool, supports_strict_mode)? == Some(true) {
+        if resolve_json_schema_strict_sampling(tool, supports_strict_mode, None)? == Some(true) {
             use_strict_mode = true;
             break;
         }

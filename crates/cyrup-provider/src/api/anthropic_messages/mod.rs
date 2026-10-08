@@ -22,7 +22,7 @@ mod messages;
 mod options;
 mod params;
 mod stop_reason;
-mod tools;
+pub(crate) mod tools;
 mod usage;
 
 #[cfg(test)]
