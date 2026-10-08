@@ -296,6 +296,9 @@ pub trait ProxyEnv: Send + Sync {
     // --- init.ts ---------------------------------------------------------------------------------
     /// `getFailureAgeSeconds(state, server)` — `None` outside the 60-second backoff window.
     fn failure_age_seconds(&self, server: &str) -> Option<u64>;
+    /// `getFailureMessage(state, server)` (`failure-backoff.ts:16-19` @2ccf648) — the reason
+    /// `recordFailure` stored, read inside the same 60-second window; `None` outside it.
+    fn failure_message(&self, server: &str) -> Option<String>;
     /// `recordFailure(state, server, message)`. Never called for an abort.
     fn record_failure(&self, server: &str, message: &str);
     /// `clearFailure(state, server)`.

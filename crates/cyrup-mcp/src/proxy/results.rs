@@ -8,9 +8,10 @@ use serde_json::{Map as JsonMap, Value};
 use cyrup_core::{Content, ToolResult};
 
 use crate::config::{McpConfig, ServerEntry};
-use crate::proxy::env::format_auth_required_message;
+use crate::proxy::env::{ProxyEnv, format_auth_required_message};
 use crate::proxy::error_vocab::McpErrorCode;
-use crate::proxy::tool_metadata::ToolMetadata;
+use crate::proxy::tool_metadata::{ToolMetadata, truncate_at_word};
+use crate::ui::sanitize_terminal_text;
 
 // ==================================================================================================
 // 5 · Shared result helpers (13d §12)
@@ -98,6 +99,30 @@ pub(crate) fn not_found_result(mode: &str, server_name: &str) -> ToolResult {
         format!("Server \"{server_name}\" not found. Use mcp({{}}) to see available servers."),
         map,
     )
+}
+
+/// `failure-backoff.ts:5-6` @2ccf648 `AGENT_FAILURE_REASON_CHARS` — "Stored failures can hold 8 KiB
+/// of stderr; agents see the reason on every blocked call."
+pub(crate) const AGENT_FAILURE_REASON_CHARS: usize = 300;
+
+/// `failure-backoff.ts:21-27` @2ccf648 `describeFailure(state, serverName)` (MCP-605) —
+/// `failed 12s ago: <reason>` for agent-facing text, `failed 12s ago` when no reason is stored,
+/// or `None` outside the backoff window.
+///
+/// The reason is sanitised and then cut at a word boundary to [`AGENT_FAILURE_REASON_CHARS`], as
+/// upstream does. This is the **agent-facing** form, with a colon; `/mcp`'s status line
+/// (`commands.rs`) renders the same pair with an em-dash for the TUI and is deliberately separate.
+pub(crate) fn describe_failure(env: &dyn ProxyEnv, server: &str) -> Option<String> {
+    let failed_ago = env.failure_age_seconds(server)?;
+    let reason = sanitize_terminal_text(&env.failure_message(server).unwrap_or_default());
+    Some(if reason.is_empty() {
+        format!("failed {failed_ago}s ago")
+    } else {
+        format!(
+            "failed {failed_ago}s ago: {}",
+            truncate_at_word(&reason, AGENT_FAILURE_REASON_CHARS)
+        )
+    })
 }
 
 /// `proxy-modes.ts:77` `getAuthRequiredMessage(state, serverName, defaultMessage?)`.
@@ -330,5 +355,45 @@ mod tests {
             details["message"],
             json!("Server \"gh\" is disabled. Run /mcp enable gh and /reload to enable it.")
         );
+    }
+
+    // ---- MCP-605 · `describeFailure` (`failure-backoff.ts:21-27` @2ccf648) ----------------------
+
+    #[test]
+    fn describe_failure_is_none_outside_the_backoff_window() {
+        let env = crate::proxy::testsupport::FakeEnv::default();
+        assert_eq!(describe_failure(&env, "srv"), None);
+    }
+
+    #[test]
+    fn describe_failure_with_no_stored_reason_has_no_colon() {
+        let env = crate::proxy::testsupport::FakeEnv::default().with_failure("srv", 4);
+        assert_eq!(
+            describe_failure(&env, "srv").as_deref(),
+            Some("failed 4s ago")
+        );
+        // A reason that sanitises to nothing is the same as no reason.
+        let env = crate::proxy::testsupport::FakeEnv::default().with_failure_message(
+            "srv",
+            4,
+            " \u{1b}[0m\n ",
+        );
+        assert_eq!(
+            describe_failure(&env, "srv").as_deref(),
+            Some("failed 4s ago")
+        );
+    }
+
+    #[test]
+    fn describe_failure_cuts_a_long_reason_at_a_word_boundary() {
+        let reason = "word ".repeat(100);
+        let env =
+            crate::proxy::testsupport::FakeEnv::default().with_failure_message("srv", 9, &reason);
+        let described = describe_failure(&env, "srv").unwrap();
+        let tail = described.strip_prefix("failed 9s ago: ").unwrap();
+        // `truncateAtWord(reason, 300)`: the 300-unit cut ends on a space, so it backs up to the
+        // last space and appends `...`.
+        assert_eq!(tail, format!("{}...", "word ".repeat(59) + "word"));
+        assert!(tail.len() <= AGENT_FAILURE_REASON_CHARS + 3);
     }
 }

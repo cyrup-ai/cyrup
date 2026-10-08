@@ -457,7 +457,7 @@ Numbering resumes from **`MCP-609`** *(as of the 2026-10-02 pass; now `MCP-616`,
 | `MCP-602` | **high** | 13e | `not-ported` | **implemented** *(CLOSED 2026-10-04)* | M | `approveTools` fails open, and `"destructive"` is the value that makes it bite | [`13e`](13e-mcp-tools.md) |
 | `MCP-603` | low | 13e | `not-ported` | **missing** | M | observed output shapes | [`13e`](13e-mcp-tools.md) |
 | `MCP-604` | low | 13e | `not-ported` | **missing** | S | register search-mode direct tools at the `deferred` exposure | [`13e`](13e-mcp-tools.md) |
-| `MCP-605` | low | 13d | `upstream-drift` | **partial** | S | the failure reason belongs in the agent-facing backoff messages | [`13d`](13d-mcp-proxy-modes.md) |
+| `MCP-605` | low | 13d | `upstream-drift` | **implemented** *(CLOSED 2026-10-08)* | S | the failure reason belongs in the agent-facing backoff messages | [`13d`](13d-mcp-proxy-modes.md) |
 | `MCP-606` | medium | 13i | `not-ported` | **implemented** *(CLOSED 2026-10-04)* | M | the call deadline must pause while an elicitation prompt is open | [`13i`](13i-mcp-protocol-and-verification.md) |
 | `MCP-607` | medium | 13i | `stale-port` | **implemented** *(CLOSED 2026-10-04)* | S | `resetTimeoutOnProgress` now has an upstream analogue, and the doc says it does not | [`13i`](13i-mcp-protocol-and-verification.md) |
 | `MCP-608` | low | 13h | `not-ported` | **partial** | S | completions for MCP prompt argument names | [`13h`](13h-mcp-tui.md) |

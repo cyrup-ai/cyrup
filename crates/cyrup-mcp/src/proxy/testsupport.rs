@@ -47,6 +47,8 @@ pub(crate) struct FakeEnv {
     pub(crate) connections: Mutex<BTreeMap<String, ConnectionStatus>>,
     pub(crate) connecting: Mutex<BTreeSet<String>>,
     pub(crate) failures: Mutex<BTreeMap<String, u64>>,
+    /// `state.failureMessages` — the reason stored beside each entry of [`Self::failures`].
+    pub(crate) failure_messages: Mutex<BTreeMap<String, String>>,
     /// Servers `lazy_connect` succeeds for; everything else fails.
     pub(crate) lazy_ok: Mutex<BTreeSet<String>>,
     /// How many times `authenticate` was invoked — the latch assertion.
@@ -103,6 +105,13 @@ impl FakeEnv {
             .unwrap()
             .insert(server.to_string(), age);
         self
+    }
+    pub(crate) fn with_failure_message(self, server: &str, age: u64, message: &str) -> Self {
+        self.failure_messages
+            .lock()
+            .unwrap()
+            .insert(server.to_string(), message.to_string());
+        self.with_failure(server, age)
     }
     pub(crate) fn with_oauth(self, server: &str) -> Self {
         self.oauth_servers
@@ -213,11 +222,20 @@ impl ProxyEnv for FakeEnv {
     fn failure_age_seconds(&self, server: &str) -> Option<u64> {
         self.failures.lock().unwrap().get(server).copied()
     }
-    fn record_failure(&self, server: &str, _message: &str) {
+    fn failure_message(&self, server: &str) -> Option<String> {
+        self.failure_age_seconds(server)?;
+        self.failure_messages.lock().unwrap().get(server).cloned()
+    }
+    fn record_failure(&self, server: &str, message: &str) {
         self.failures.lock().unwrap().insert(server.to_string(), 0);
+        self.failure_messages
+            .lock()
+            .unwrap()
+            .insert(server.to_string(), message.to_string());
     }
     fn clear_failure(&self, server: &str) {
         self.failures.lock().unwrap().remove(server);
+        self.failure_messages.lock().unwrap().remove(server);
     }
     fn update_status_bar(&self) {}
     fn update_server_metadata(&self, _server: &str) {}

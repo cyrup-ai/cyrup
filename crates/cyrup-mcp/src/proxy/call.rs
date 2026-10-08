@@ -20,8 +20,9 @@ use crate::proxy::env::{
 };
 use crate::proxy::error_vocab::McpErrorCode;
 use crate::proxy::results::{
-    SingleMatch, ambiguous_tool_result, details, details_err, get_auth_required_message,
-    get_enabled_tool_matches, get_single_tool_match, get_tool_matches, text_result,
+    SingleMatch, ambiguous_tool_result, describe_failure, details, details_err,
+    get_auth_required_message, get_enabled_tool_matches, get_single_tool_match, get_tool_matches,
+    text_result,
 };
 use crate::proxy::tool_metadata::{ToolMetadata, find_tool_by_name, server_prefix};
 
@@ -432,8 +433,9 @@ pub async fn execute_call(
                 }
             }
 
+            // `proxy-modes.ts:1331-1338` @2ccf648 — the stored reason rides along (MCP-605).
             if tool_meta.is_none()
-                && let Some(failed_ago) = ctx.env.failure_age_seconds(&hint)
+                && let Some(failure) = describe_failure(ctx.env.as_ref(), &hint)
             {
                 let mut map = details_err("call", McpErrorCode::ServerBackoff);
                 map.insert("server".to_string(), Value::String(hint.clone()));
@@ -442,7 +444,7 @@ pub async fn execute_call(
                     Value::String(tool_name.to_string()),
                 );
                 return Ok(text_result(
-                    format!("Server \"{hint}\" not available (last failed {failed_ago}s ago)"),
+                    format!("Server \"{hint}\" not available (last {failure})"),
                     map,
                 ));
             }
@@ -658,11 +660,12 @@ pub async fn execute_call(
     }
 
     if connection != Some(ConnectionStatus::Connected) {
-        if let Some(failed_ago) = ctx.env.failure_age_seconds(&server_name) {
+        // `proxy-modes.ts:1454-1461` @2ccf648 — the stored reason rides along (MCP-605).
+        if let Some(failure) = describe_failure(ctx.env.as_ref(), &server_name) {
             let mut map = details_err("call", McpErrorCode::ServerBackoff);
             spread(&mut map, &identity);
             return Ok(text_result(
-                format!("Server \"{server_name}\" not available (last failed {failed_ago}s ago)"),
+                format!("Server \"{server_name}\" not available (last {failure})"),
                 map,
             ));
         }
@@ -1297,6 +1300,57 @@ mod tests {
         assert_eq!(
             text_of(&result),
             "Server \"srv\" not available (last failed 7s ago)"
+        );
+    }
+
+    // MCP-605 — `describeFailure` (`failure-backoff.ts:21-27` @2ccf648): the stored reason follows
+    // the age with a colon, at both of `executeCall`'s backoff sites.
+
+    #[tokio::test]
+    async fn a_hinted_call_in_backoff_names_the_stored_reason() {
+        let config = config_with(&[("srv", stdio("a"))]);
+        let env = FakeEnv::default().with_failure_message("srv", 7, "spawn npx ENOENT");
+        let (ctx, _) = ctx_with(config, &[], &[], env);
+        let result = execute_call(&ctx, "thing", None, Some("srv"), &CancelToken::new(), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            result.details.clone().unwrap()["error"],
+            json!("server_backoff")
+        );
+        assert_eq!(
+            text_of(&result),
+            "Server \"srv\" not available (last failed 7s ago: spawn npx ENOENT)"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_resolved_tool_on_a_server_in_backoff_names_the_stored_reason() {
+        let config = config_with(&[("srv", stdio("a"))]);
+        let env = FakeEnv::default().with_failure_message("srv", 3, "401 Unauthorized");
+        let (ctx, _) = ctx_with(
+            config,
+            &[("srv", vec![ToolMetadata::new("srv_thing", "thing", "")])],
+            &[],
+            env,
+        );
+        let result = execute_call(
+            &ctx,
+            "srv_thing",
+            None,
+            Some("srv"),
+            &CancelToken::new(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            result.details.clone().unwrap()["error"],
+            json!("server_backoff")
+        );
+        assert_eq!(
+            text_of(&result),
+            "Server \"srv\" not available (last failed 3s ago: 401 Unauthorized)"
         );
     }
 

@@ -20,8 +20,8 @@ use crate::proxy::ranking::{
     RankedToolMatch, paginate, rank_collate, rank_tool_matches, resolve_search_keywords,
 };
 use crate::proxy::results::{
-    ambiguous_tool_result, details, details_err, disabled_result, get_enabled_tool_matches,
-    not_found_result, text_result,
+    ambiguous_tool_result, describe_failure, details, details_err, disabled_result,
+    get_enabled_tool_matches, not_found_result, text_result,
 };
 use crate::proxy::tool_metadata::{ToolMetadata, find_tool_by_name, truncate_at_word};
 
@@ -120,10 +120,11 @@ pub fn execute_status(ctx: &ProxyCtx) -> ToolResult {
             "needs-auth" => text.push_str(&format!("⚠ {name} (needs auth)\n")),
             "cached" => text.push_str(&format!("○ {name} ({} tools, cached)\n", row.tool_count)),
             "failed" => {
-                text.push_str(&format!(
-                    "✗ {name} (failed {}s ago)\n",
-                    row.failed_ago.unwrap_or(0)
-                ));
+                // `proxy-modes.ts:586-588` @2ccf648 — `describeFailure(...) ?? failed Ns ago`
+                // (MCP-605).
+                let failure = describe_failure(ctx.env.as_ref(), name)
+                    .unwrap_or_else(|| format!("failed {}s ago", row.failed_ago.unwrap_or(0)));
+                text.push_str(&format!("✗ {name} ({failure})\n"));
             }
             _ => text.push_str(&format!("○ {name} (not connected)\n")),
         }
@@ -901,6 +902,21 @@ mod tests {
         assert_eq!(rows[5]["disabled"], json!(true));
         assert_eq!(rows[2]["failedAgo"], json!(12));
         assert_eq!(rows[0]["failedAgo"], Value::Null);
+    }
+
+    /// MCP-605 — `proxy-modes.ts:586-588` @2ccf648: a failed row carries `describeFailure`'s
+    /// `failed Ns ago: <reason>`, sanitised.
+    #[test]
+    fn status_names_the_stored_failure_reason() {
+        let config = config_with(&[("broken", stdio("b"))]);
+        let env =
+            FakeEnv::default().with_failure_message("broken", 12, "spawn\nnpx \u{1b}[31mENOENT");
+        let (ctx, _) = ctx_with(config, &[], &[], env);
+        let text = text_of(&execute_status(&ctx));
+        assert!(
+            text.contains("✗ broken (failed 12s ago: spawn npx ENOENT)\n"),
+            "{text}"
+        );
     }
 
     // ---- MCP-155 · `executeList` ---------------------------------------------------------------------
