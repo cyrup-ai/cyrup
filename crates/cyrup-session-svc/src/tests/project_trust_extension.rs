@@ -451,6 +451,40 @@ async fn no_prompt_callback_is_pis_no_ui_branch() {
     assert!(!session.services().settings.project_trusted());
 }
 
+/// Build an interactive session in `cwd` with a prompt callback, and return how often it ran.
+async fn prompts_offered(fx: &Fixture) -> usize {
+    let prompted = Arc::new(AtomicUsize::new(0));
+    let counter = prompted.clone();
+    let mut cfg = SessionConfig::new(fx.cwd.clone(), fx.agent_dir.clone());
+    cfg.home = fx.agent_dir.clone();
+    cfg.app_mode = cyrup_config::AppMode::Interactive;
+    SessionBuilder::new(Arc::new(FauxProvider::new()) as Arc<dyn Provider>, cfg)
+        .trust_prompt(Arc::new(move |_options, _saved| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Some(false) })
+        }))
+        .build()
+        .await
+        .unwrap();
+    prompted.load(Ordering::SeqCst)
+}
+
+/// CFG-101 — pi's `TRUST_REQUIRING_PROJECT_CONFIG_RESOURCES` lists `mcp.json`
+/// (`core/trust-manager.ts:32` @ce950d78f), so a project whose ONLY project config is
+/// `.cyrup/mcp.json` must reach the interactive trust prompt. RED before: the prompt never ran.
+/// The bare `<cwd>/.mcp.json` is not under the config dir and must still not prompt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_project_with_only_cyrup_mcp_json_is_offered_the_trust_prompt() {
+    let fx = fixture_bare();
+    std::fs::create_dir_all(fx.cwd.join(".cyrup")).unwrap();
+    std::fs::write(fx.cwd.join(".cyrup/mcp.json"), "{}").unwrap();
+    assert_eq!(prompts_offered(&fx).await, 1);
+
+    let bare = fixture_bare();
+    std::fs::write(bare.cwd.join(".mcp.json"), "{}").unwrap();
+    assert_eq!(prompts_offered(&bare).await, 0);
+}
+
 // ==================== EXT-003: a dead wasm runtime must not silence the natives ================
 
 /// EXT-003 residual — the pre-trust pass opened with `ExtensionHost::with_wasm(host_config).ok()?`
