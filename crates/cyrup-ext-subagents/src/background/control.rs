@@ -302,6 +302,8 @@ fn terminal_status_from_result(result: &ResultFile, pid: Option<u32>) -> RunStat
         mode: result.mode,
         state: result.state,
         pid,
+        // SUBA-159: a terminal status is never liveness-probed, so no namespace is recorded.
+        pid_namespace_scope: None,
         // Carry the authoritative ResultFile's own `cwd`/`sessionFile` through the repair (pi's
         // `status.cwd ?? result.cwd` fallback, `background/async-resume.ts:323,345,373` @v0.34.0, has
         // nothing to fall back FROM here otherwise — this is the terminal-repair path where

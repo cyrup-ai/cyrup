@@ -157,6 +157,68 @@ pub fn check_pid_liveness(pid: u32) -> Liveness {
         Liveness::Unknown
     }
 }
+/// SUBA-159 — pi `currentPidNamespaceScope` (`runs/background/pid-namespace.ts:6-18` @ad11b7ab):
+/// this process's Linux PID namespace identity, the `readlink("/proc/self/ns/pid")` target (for
+/// example `pid:[4026531836]`), cached because reconciliation is a polling path. `None` off Linux,
+/// and when the link cannot be read or is blank.
+#[must_use]
+pub fn current_pid_namespace_scope() -> Option<String> {
+    static SCOPE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    SCOPE
+        .get_or_init(|| {
+            #[cfg(target_os = "linux")]
+            {
+                std::fs::read_link("/proc/self/ns/pid")
+                    .ok()
+                    .and_then(|target| {
+                        let scope = target.to_string_lossy().trim().to_string();
+                        (!scope.is_empty()).then_some(scope)
+                    })
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                None
+            }
+        })
+        .clone()
+}
+
+/// pi `checkPidLiveness(pid, kill, probeZombie)` (`stale-run-reconciler.ts:360-379` @ad11b7ab):
+/// [`check_pid_liveness`], plus — when `probe_zombie` is set and the probe found the pid — a read
+/// of `/proc/<pid>/stat` whose state field (the character after the LAST `") "`, since the comm
+/// field may itself contain one) reports a zombie as [`Liveness::Dead`]. A zombie answers
+/// `kill(pid, 0)` but will never write another status, which is what a runner reparented to an
+/// init that does not reap looks like.
+///
+/// Callers set `probe_zombie` only when the pid's recorded namespace equals this process's
+/// (upstream's `pidScopeVerified`): a local `/proc/<pid>` says nothing about a pid from another
+/// namespace. An unreadable `stat` falls back to the `kill(pid, 0)` answer, as upstream does.
+#[must_use]
+pub fn check_pid_liveness_probing_zombie(pid: u32, probe_zombie: bool) -> Liveness {
+    let liveness = check_pid_liveness(pid);
+    if liveness != Liveness::Alive || !probe_zombie {
+        return liveness;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            && stat_reports_zombie(&stat)
+        {
+            return Liveness::Dead;
+        }
+    }
+    liveness
+}
+
+/// The state-field test of [`check_pid_liveness_probing_zombie`], split out so the parse is
+/// testable against fixed text: pi `stat.lastIndexOf(") ")` then `stat[closeParen + 2] === "Z"`.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn stat_reports_zombie(stat: &str) -> bool {
+    stat.rfind(") ")
+        .and_then(|close| stat.as_bytes().get(close + 2))
+        .is_some_and(|state| *state == b'Z')
+}
+
 /// The `runnerProcessInstanceId` upstream stamps on BOTH reconciler-written process-terminal
 /// records (`stale-run-reconciler.ts:187`, `:249` @v0.68.0). It is a fixed literal there, not a
 /// restatement of the record's `reason`: the reconciler observed no runner instance at all, and
@@ -287,9 +349,14 @@ pub enum ReconcileAction {
 ///   treated as outside the grace window (nothing to be provisional about).
 /// - `now`: the current wall-clock time, injected so tests can simulate arbitrary elapsed time
 ///   without a real wait (see module docs).
+/// - `observed_scope`: this process's PID namespace (production:
+///   [`current_pid_namespace_scope`]), injected so a test can stand in for an observer in another
+///   namespace (SUBA-159, pi's `options.pidNamespaceScope`).
 /// - `check_liveness`: the liveness probe to use, injected for the identical reason — production
-///   callers pass [`check_pid_liveness`]; tests can pass a closure that returns a fixed
-///   [`Liveness`] for a pid regardless of whether it is real.
+///   callers pass [`check_pid_liveness_probing_zombie`]; tests can pass a closure that returns a
+///   fixed [`Liveness`] for a pid regardless of whether it is real. Its second argument is
+///   upstream's `probeZombie`: `true` only when the status's recorded namespace equals
+///   `observed_scope`.
 /// - `grace`: the spawn grace window duration (production default [`DEFAULT_SPAWN_GRACE`]).
 /// - `stale_after`: the long-staleness threshold (production default [`DEFAULT_STALE_AFTER`]).
 ///
@@ -318,7 +385,8 @@ pub async fn reconcile(
     paths: &RunPaths,
     spawn_confirmed_at: Option<SystemTime>,
     now: SystemTime,
-    check_liveness: impl Fn(u32) -> Liveness,
+    observed_scope: Option<&str>,
+    check_liveness: impl Fn(u32, bool) -> Liveness,
     grace: Duration,
     stale_after: Duration,
 ) -> std::io::Result<ReconcileOutcome> {
@@ -376,8 +444,20 @@ pub async fn reconcile(
         });
     };
 
-    // Step 4: claims Running with a numeric pid — probe liveness.
-    let liveness = check_liveness(pid);
+    // Step 4: claims Running with a numeric pid — probe liveness, scoped to the PID namespace
+    // (SUBA-159, pi `stale-run-reconciler.ts:446-452` @ad11b7ab). An observer without a scope (a
+    // non-Linux host sharing a container's run tree) cannot match a recorded one, so its `ESRCH`
+    // is inconclusive rather than proof of death; a local zombie is evidence about this runner
+    // only when the namespaces are known to match.
+    let recorded_scope = status.pid_namespace_scope.as_deref();
+    let pid_scope_mismatch = recorded_scope.is_some() && recorded_scope != observed_scope;
+    let pid_scope_verified = recorded_scope.is_some() && recorded_scope == observed_scope;
+    let observed_liveness = check_liveness(pid, pid_scope_verified);
+    let liveness = if observed_liveness == Liveness::Dead && pid_scope_mismatch {
+        Liveness::Unknown
+    } else {
+        observed_liveness
+    };
     let stale = is_stale(status.last_update, now, stale_after);
 
     let should_fail = match liveness {
@@ -392,22 +472,26 @@ pub async fn reconcile(
         });
     }
 
-    // pi `reconcileAsyncRun`'s two failure sentences (`stale-run-reconciler.ts:434-444` @v0.71.0):
+    // pi `reconcileAsyncRun`'s failure sentences (`stale-run-reconciler.ts:453-461` @ad11b7ab):
     // a dead pid is `buildFailedRepair`'s base message, naming the runner's recorded exit when
-    // one was observed (SUBA-141, `:231-238`); a pid that is alive — or whose liveness cannot be
-    // confirmed, which upstream treats the same — but has gone stale is its own sentence.
+    // one was observed (SUBA-141, `:241`); a pid that has gone stale gets its own sentence, which
+    // says whether the pid answered or could not be probed from this process at all (SUBA-159,
+    // `:457`) — the latter covers both a permission-denied probe and a cross-namespace `ESRCH`.
+    let stale_text = |probe: &str| {
+        format!(
+            "Async runner PID {pid} {probe}; status has not updated for {}ms, so stale-run \
+             reconciliation marked the run failed because PID ownership is unverified.",
+            (crate::time::epoch_millis(now) - status.last_update).max(0)
+        )
+    };
     let reason = match liveness {
         Liveness::Dead => format!(
             "Async runner process {pid} {} before writing a result. Marked run failed by \
              stale-run reconciliation.",
             runner_exit_text(paths, &status).await
         ),
-        Liveness::Alive | Liveness::Unknown => format!(
-            "Async runner process {pid} still has a live PID, but status has not updated for \
-             {}ms. Marked run failed by stale-run reconciliation because PID ownership cannot \
-             be verified.",
-            (crate::time::epoch_millis(now) - status.last_update).max(0)
-        ),
+        Liveness::Alive => stale_text("is still live"),
+        Liveness::Unknown => stale_text("cannot be probed from this process"),
     };
 
     synthesize_failure(paths, &mut status, &reason).await
@@ -428,7 +512,8 @@ pub async fn reconcile_now(
         paths,
         spawn_confirmed_at,
         SystemTime::now(),
-        check_pid_liveness,
+        current_pid_namespace_scope().as_deref(),
+        check_pid_liveness_probing_zombie,
         DEFAULT_SPAWN_GRACE,
         DEFAULT_STALE_AFTER,
     )
@@ -1339,7 +1424,8 @@ mod tests {
             &paths,
             None,
             SystemTime::now(),
-            |_| Liveness::Alive,
+            None,
+            |_, _| Liveness::Alive,
             DEFAULT_SPAWN_GRACE,
             DEFAULT_STALE_AFTER,
         )
@@ -1405,7 +1491,8 @@ mod tests {
             &paths,
             None,
             SystemTime::now(),
-            |_| Liveness::Alive,
+            None,
+            |_, _| Liveness::Alive,
             DEFAULT_SPAWN_GRACE,
             DEFAULT_STALE_AFTER,
         )
@@ -1471,7 +1558,8 @@ mod tests {
             &paths,
             None,
             SystemTime::now(),
-            |_| Liveness::Dead,
+            None,
+            |_, _| Liveness::Dead,
             DEFAULT_SPAWN_GRACE,
             DEFAULT_STALE_AFTER,
         )
@@ -1500,7 +1588,8 @@ mod tests {
             &paths,
             None,
             SystemTime::now(),
-            |_| panic!("liveness must not be probed for a Paused run"),
+            None,
+            |_, _| panic!("liveness must not be probed for a Paused run"),
             DEFAULT_SPAWN_GRACE,
             DEFAULT_STALE_AFTER,
         )
@@ -1524,7 +1613,8 @@ mod tests {
             &paths,
             None,
             SystemTime::now(),
-            |_| panic!("liveness must not be probed without a numeric pid"),
+            None,
+            |_, _| panic!("liveness must not be probed without a numeric pid"),
             DEFAULT_SPAWN_GRACE,
             DEFAULT_STALE_AFTER,
         )
@@ -1548,7 +1638,8 @@ mod tests {
             &paths,
             Some(spawned_at),
             spawned_at + Duration::from_millis(100),
-            |_| panic!("liveness must not be probed when status.json is absent"),
+            None,
+            |_, _| panic!("liveness must not be probed when status.json is absent"),
             DEFAULT_SPAWN_GRACE,
             DEFAULT_STALE_AFTER,
         )
@@ -1572,7 +1663,8 @@ mod tests {
             &paths,
             Some(spawned_at),
             spawned_at + Duration::from_secs(10),
-            |_| panic!("liveness must not be probed when status.json is absent"),
+            None,
+            |_, _| panic!("liveness must not be probed when status.json is absent"),
             DEFAULT_SPAWN_GRACE,
             DEFAULT_STALE_AFTER,
         )
@@ -1612,7 +1704,8 @@ mod tests {
             &paths,
             None,
             SystemTime::now(),
-            check_pid_liveness, // the REAL probe, against the REAL dead pid
+            None,
+            check_pid_liveness_probing_zombie, // the REAL probe, against the REAL dead pid
             DEFAULT_SPAWN_GRACE,
             DEFAULT_STALE_AFTER,
         )
@@ -1738,7 +1831,8 @@ mod tests {
             &paths,
             None,
             SystemTime::now(),
-            check_pid_liveness,
+            None,
+            check_pid_liveness_probing_zombie,
             DEFAULT_SPAWN_GRACE,
             DEFAULT_STALE_AFTER,
         )
@@ -1778,7 +1872,8 @@ mod tests {
             &paths,
             None,
             SystemTime::now(),
-            check_pid_liveness,
+            None,
+            check_pid_liveness_probing_zombie,
             DEFAULT_SPAWN_GRACE,
             DEFAULT_STALE_AFTER,
         )
@@ -1850,7 +1945,8 @@ mod tests {
             &paths,
             None,
             SystemTime::now(),
-            check_pid_liveness,
+            None,
+            check_pid_liveness_probing_zombie,
             DEFAULT_SPAWN_GRACE,
             DEFAULT_STALE_AFTER,
         )
@@ -1929,7 +2025,8 @@ mod tests {
             &paths2,
             None,
             SystemTime::now(),
-            check_pid_liveness,
+            None,
+            check_pid_liveness_probing_zombie,
             DEFAULT_SPAWN_GRACE,
             DEFAULT_STALE_AFTER,
         )
@@ -1980,7 +2077,8 @@ mod tests {
             &paths3,
             None,
             SystemTime::now(),
-            check_pid_liveness,
+            None,
+            check_pid_liveness_probing_zombie,
             DEFAULT_SPAWN_GRACE,
             DEFAULT_STALE_AFTER,
         )
@@ -2024,7 +2122,8 @@ mod tests {
             &paths,
             None,
             SystemTime::now(), // real "now" — the STALENESS comes from last_update being old
-            check_pid_liveness, // the REAL probe, against the REAL alive pid
+            None,
+            check_pid_liveness_probing_zombie, // the REAL probe, against the REAL alive pid
             DEFAULT_SPAWN_GRACE,
             DEFAULT_STALE_AFTER,
         )
@@ -2067,7 +2166,8 @@ mod tests {
             &paths,
             None,
             SystemTime::now(),
-            check_pid_liveness, // the REAL probe, against the REAL alive pid
+            None,
+            check_pid_liveness_probing_zombie, // the REAL probe, against the REAL alive pid
             DEFAULT_SPAWN_GRACE,
             DEFAULT_STALE_AFTER,
         )
@@ -2116,7 +2216,8 @@ mod tests {
             &paths,
             None,
             SystemTime::now(),
-            |_| Liveness::Unknown,
+            None,
+            |_, _| Liveness::Unknown,
             DEFAULT_SPAWN_GRACE,
             DEFAULT_STALE_AFTER,
         )
@@ -2145,7 +2246,8 @@ mod tests {
             &paths,
             None,
             SystemTime::now(),
-            |_| Liveness::Unknown,
+            None,
+            |_, _| Liveness::Unknown,
             DEFAULT_SPAWN_GRACE,
             DEFAULT_STALE_AFTER,
         )
@@ -2214,5 +2316,194 @@ mod tests {
                 "\u{1F600}".repeat(1999)
             )
         );
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // SUBA-159 — liveness is scoped to the PID namespace (pi `stale-run-reconciler.ts:446-461`
+    // @ad11b7ab)
+    // ---------------------------------------------------------------------------------------
+
+    const RUNNER_SCOPE: &str = "pid:[4026531836]";
+    const OTHER_SCOPE: &str = "pid:[4026532999]";
+
+    /// Writes a running status for a pid absent from the observer, stamped with `recorded`, whose
+    /// last update is `age` ago, then reconciles it as an observer in `observed`. Returns the
+    /// outcome and every `probe_zombie` flag the probe was called with.
+    async fn reconcile_scoped(
+        recorded: Option<&str>,
+        observed: Option<&str>,
+        age: Duration,
+        probe: Liveness,
+    ) -> (ReconcileOutcome, Vec<bool>) {
+        let (_dir, paths) = temp_paths();
+        let run_id = run_id_from_paths(&paths);
+        let now = SystemTime::now();
+        let mut status = running_status(run_id, 777_777, crate::time::epoch_millis(now - age));
+        status.pid_namespace_scope = recorded.map(str::to_string);
+        crate::background::atomic::write_atomic_json(&paths.status, &status)
+            .await
+            .expect("write status");
+        let flags = std::sync::Mutex::new(Vec::new());
+        let outcome = reconcile(
+            &paths,
+            None,
+            now,
+            observed,
+            |_, probe_zombie| {
+                flags.lock().expect("flags").push(probe_zombie);
+                probe
+            },
+            DEFAULT_SPAWN_GRACE,
+            DEFAULT_STALE_AFTER,
+        )
+        .await
+        .expect("reconcile succeeds");
+        (outcome, flags.into_inner().expect("flags"))
+    }
+
+    fn step_error(outcome: &ReconcileOutcome) -> String {
+        outcome.status.steps[0].error.clone().unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn a_cross_namespace_esrch_is_not_death_inside_the_stale_window() {
+        let fresh = Duration::from_secs(60);
+        let (outcome, flags) =
+            reconcile_scoped(Some(RUNNER_SCOPE), Some(OTHER_SCOPE), fresh, Liveness::Dead).await;
+        assert_eq!(outcome.action, ReconcileAction::NoneNeeded);
+        assert_eq!(outcome.status.state, RunState::Running);
+        // A zombie in this namespace says nothing about a pid from another one.
+        assert_eq!(flags, vec![false]);
+
+        // An observer with no scope at all (a non-Linux host sharing the run tree) cannot match
+        // a recorded one either (pi `:447`).
+        let (outcome, _) = reconcile_scoped(Some(RUNNER_SCOPE), None, fresh, Liveness::Dead).await;
+        assert_eq!(outcome.action, ReconcileAction::NoneNeeded);
+    }
+
+    #[tokio::test]
+    async fn a_cross_namespace_run_fails_only_once_stale_and_says_it_could_not_be_probed() {
+        let stale = DEFAULT_STALE_AFTER + Duration::from_secs(60);
+        let (outcome, _) =
+            reconcile_scoped(Some(RUNNER_SCOPE), Some(OTHER_SCOPE), stale, Liveness::Dead).await;
+        assert_eq!(outcome.action, ReconcileAction::SynthesizedFailure);
+        let error = step_error(&outcome);
+        assert!(
+            error.starts_with(
+                "Async runner PID 777777 cannot be probed from this process; status has not \
+                 updated for "
+            ),
+            "{error}"
+        );
+        assert!(
+            error.contains(
+                "so stale-run reconciliation marked the run failed because PID ownership is \
+                 unverified."
+            ),
+            "{error}"
+        );
+
+        // pi `:457` — a pid that answered is "still live", in the same sentence.
+        let (outcome, _) = reconcile_scoped(
+            Some(RUNNER_SCOPE),
+            Some(RUNNER_SCOPE),
+            stale,
+            Liveness::Alive,
+        )
+        .await;
+        assert!(
+            step_error(&outcome).starts_with("Async runner PID 777777 is still live; "),
+            "{}",
+            step_error(&outcome)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_matching_or_absent_scope_still_fails_a_dead_pid_at_once() {
+        let fresh = Duration::from_secs(60);
+        let (outcome, flags) = reconcile_scoped(
+            Some(RUNNER_SCOPE),
+            Some(RUNNER_SCOPE),
+            fresh,
+            Liveness::Dead,
+        )
+        .await;
+        assert_eq!(outcome.action, ReconcileAction::SynthesizedFailure);
+        // Same namespace: a local zombie IS evidence about this runner (pi `:450-451`).
+        assert_eq!(flags, vec![true]);
+
+        // A status from a build without the field probes exactly as before.
+        let (outcome, flags) =
+            reconcile_scoped(None, Some(RUNNER_SCOPE), fresh, Liveness::Dead).await;
+        assert_eq!(outcome.action, ReconcileAction::SynthesizedFailure);
+        assert!(
+            step_error(&outcome).starts_with("Async runner process 777777 "),
+            "{}",
+            step_error(&outcome)
+        );
+        assert_eq!(flags, vec![false]);
+    }
+
+    #[test]
+    fn the_stat_state_field_is_read_after_the_last_close_paren() {
+        assert!(stat_reports_zombie("4242 (runner) Z 1 4242 4242 0 -1"));
+        // The comm field may itself contain ") " — pi reads after the LAST one.
+        assert!(stat_reports_zombie("4242 (a) S (b) Z 1 4242"));
+        assert!(!stat_reports_zombie("4242 (a) Z (b) S 1 4242"));
+        assert!(!stat_reports_zombie("4242 (runner) S 1 4242 4242 0 -1"));
+        assert!(!stat_reports_zombie("4242 (runner)"));
+        assert!(!stat_reports_zombie(""));
+    }
+
+    #[test]
+    fn the_runner_scope_is_persisted_as_pid_namespace_scope() {
+        let mut status = RunStatus::queued(RunId::new(), RunMode::Single, Some(1));
+        let absent = serde_json::to_value(&status).expect("serialize");
+        assert!(absent.get("pidNamespaceScope").is_none());
+        status.pid_namespace_scope = Some(RUNNER_SCOPE.to_string());
+        let value = serde_json::to_value(&status).expect("serialize");
+        assert_eq!(value["pidNamespaceScope"], RUNNER_SCOPE);
+        let back: RunStatus = serde_json::from_value(value).expect("deserialize");
+        assert_eq!(back.pid_namespace_scope.as_deref(), Some(RUNNER_SCOPE));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn this_process_reads_its_own_pid_namespace() {
+        let scope = current_pid_namespace_scope();
+        if std::path::Path::new("/proc/self/ns/pid").exists() {
+            let scope = scope.expect("a readable namespace link");
+            assert!(scope.starts_with("pid:["), "{scope}");
+        }
+    }
+
+    /// SUBA-159 fold-in (pi #2606, `stale-run-reconciler.ts:363-369` @ad11b7ab): an unreaped
+    /// child answers `kill(pid, 0)`, so only the `/proc/<pid>/stat` probe sees it is gone.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_unreaped_zombie_is_dead_only_when_the_zombie_probe_is_asked_for() {
+        let mut child = std::process::Command::new("true")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("`true` spawns");
+        let pid = child.id();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let stat_path = format!("/proc/{pid}/stat");
+        while !std::fs::read_to_string(&stat_path).is_ok_and(|stat| stat_reports_zombie(&stat)) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "child never became a zombie"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(check_pid_liveness(pid), Liveness::Alive);
+        assert_eq!(
+            check_pid_liveness_probing_zombie(pid, false),
+            Liveness::Alive
+        );
+        assert_eq!(check_pid_liveness_probing_zombie(pid, true), Liveness::Dead);
+        child.wait().expect("reap");
     }
 }

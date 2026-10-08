@@ -387,6 +387,9 @@ async fn refuse_run(
     );
     let mut status =
         RunStatus::queued(config.run_id.clone(), config.mode, Some(std::process::id()));
+    // SUBA-159 — pi stamps `pidNamespaceScope: currentPidNamespaceScope()` wherever it stamps the
+    // runner pid (`async-execution.ts:875`, `stale-run-reconciler.ts:215-216` @ad11b7ab).
+    status.pid_namespace_scope = crate::background::reconcile::current_pid_namespace_scope();
     // pi `:634` — the run-level message, which is what an operator and a delegating agent read.
     status.error = Some(error.to_string());
     // pi `:636-640`.
@@ -647,6 +650,9 @@ pub(super) async fn publish_initial_status(
 ) -> Option<RunStatus> {
     let mut status =
         RunStatus::queued(config.run_id.clone(), config.mode, Some(std::process::id()));
+    // SUBA-159 — pi stamps `pidNamespaceScope: currentPidNamespaceScope()` wherever it stamps the
+    // runner pid (`async-execution.ts:875`, `stale-run-reconciler.ts:215-216` @ad11b7ab).
+    status.pid_namespace_scope = crate::background::reconcile::current_pid_namespace_scope();
     // pi `...(config.sessionId ? { sessionId: config.sessionId } : {})` (`subagent-runner.ts:2088`):
     // stamp the ORCHESTRATOR session onto the run's own `status.json`, so a later reader can scope
     // the async root to one session (`async-status.ts:432`).

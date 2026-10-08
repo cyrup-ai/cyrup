@@ -379,6 +379,16 @@ pub struct RunStatus {
     /// `background/reconcile.rs`, which may synthesize a status for a run whose pid was never
     /// successfully recorded).
     pub pid: Option<u32>,
+    /// SUBA-159 — the Linux PID namespace [`Self::pid`] belongs to (pi
+    /// `AsyncStatus.pidNamespaceScope`, `shared/types.ts:1932-1933` @ad11b7ab: "Linux PID namespace
+    /// identity used to scope liveness probes"), the `readlink("/proc/self/ns/pid")` value of the
+    /// runner that stamped its own pid
+    /// ([`current_pid_namespace_scope`](crate::background::reconcile::current_pid_namespace_scope)).
+    /// Reconciliation reads a cross-namespace `ESRCH` as inconclusive rather than as death, and
+    /// trusts a `/proc/<pid>/stat` zombie only when the namespaces match. `None` off Linux, and on
+    /// a status written by a build that predates the field — both probe exactly as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid_namespace_scope: Option<String>,
     /// The working directory this run's steps actually execute in (pi `AsyncStatus.cwd`,
     /// `shared/types.ts:592`), set once by the detached runner at its very first status write and
     /// never changed thereafter (a run's cwd is fixed for its whole lifetime). `resume`'s
@@ -538,6 +548,9 @@ impl RunStatus {
             mode,
             state: RunState::Queued,
             pid,
+            // SUBA-159: stamped by the runner beside its own pid (`runner_main/entry.rs`), never
+            // inferred here — a caller-supplied pid may belong to another process's namespace.
+            pid_namespace_scope: None,
             cwd: None,
             session_file: None,
             started_at: now,
