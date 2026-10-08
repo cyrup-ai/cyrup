@@ -495,7 +495,7 @@ Numbering resumes from **`MCP-616`**.
 | id | sev | § | kind | status | eff | title | body |
 |---|---|---|---|---|---|---|---|
 | `MCP-609` | low | 13e | `not-ported` | **missing** | S | pi's tool-call id is received and dropped; never sent as `_meta["pi-mcp-adapter/toolCallId"]` (`4b7e310`) | [`13e`](13e-mcp-tools.md) |
-| `MCP-610` | low | 13d | `not-ported` | **partial** | S | repeated query tokens are not deduplicated, so the coverage gate rejects `"search search"` (`c9eca7e`) | [`13d`](13d-mcp-proxy-modes.md) |
+| `MCP-610` | low | 13d | `not-ported` | **implemented** *(CLOSED 2026-10-08)* | S | repeated query tokens are not deduplicated, so the coverage gate rejects `"search search"` (`c9eca7e`) | [`13d`](13d-mcp-proxy-modes.md) |
 | `MCP-611` | low | 13h | `not-ported` | **partial** | S | the setup panel reports "Added" for a preset that will not take effect (`c362b08`'s `ignoredBecause`) | [`13h`](13h-mcp-tui.md) |
 
 **Census after table G (arithmetic, not a re-count):** the fourth pass counted **545**; table G adds 3,

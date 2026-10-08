@@ -78,22 +78,27 @@ pub fn normalize_search_text(value: &str) -> String {
 ///
 /// ASCII-only by construction: any non-`[a-z0-9]` byte is a separator, so a non-ASCII identifier
 /// tokenizes to nothing. That is upstream's behaviour and is load-bearing for the coverage gate.
+///
+/// **Distinct tokens, first-seen order** (MCP-610): `search-ranking.ts:92-112` @2ccf648 ends
+/// `return [...new Set(tokens)];` (`c9eca7e`, #686). The query's token count is the coverage gate's
+/// denominator, so a repeated word must count once — otherwise `"search search"` is a two-token
+/// query with one distinct match and fails the "1-2 tokens must all match" rule.
 #[must_use]
 pub fn tokenize(value: &str) -> Vec<String> {
     let normalized = normalize_search_text(value);
-    let mut tokens = Vec::new();
+    let mut tokens: IndexSet<String> = IndexSet::new();
     let mut current = String::new();
     for ch in normalized.chars() {
         if ch.is_ascii_lowercase() || ch.is_ascii_digit() {
             current.push(ch);
         } else if !current.is_empty() {
-            tokens.push(std::mem::take(&mut current));
+            tokens.insert(std::mem::take(&mut current));
         }
     }
     if !current.is_empty() {
-        tokens.push(current);
+        tokens.insert(current);
     }
-    tokens
+    tokens.into_iter().collect()
 }
 
 /// One scored `(server, tool)` pair — `search-ranking.ts:20` `RankedToolMatch`.
@@ -568,6 +573,64 @@ mod tests {
         assert_eq!(tokenize("get_user_id"), vec!["get", "user", "id"]);
         // Non-ASCII identifiers tokenize to nothing — upstream's ASCII-only split.
         assert!(tokenize("日本語").is_empty());
+    }
+
+    // ---- MCP-610 · repeated query tokens (`c9eca7e`, `search-ranking.ts:112` @2ccf648) ----------
+
+    #[test]
+    fn tokenize_keeps_each_token_once_in_first_seen_order() {
+        assert_eq!(tokenize("search search"), vec!["search"]);
+        assert_eq!(
+            tokenize("b_a.b-c a"),
+            vec!["b", "a", "c"],
+            "distinct, in first-seen order"
+        );
+    }
+
+    /// `search ranking` › "does not penalize repeated query tokens".
+    #[test]
+    fn a_repeated_query_token_scores_and_ranks_like_the_single_token() {
+        let records = tool("search_records", "Find records");
+        assert!(score_tool_match(&records, "demo", "search", None).is_some());
+        // Upstream asserts only `not.toBeNull()`: the score itself differs, because the phrase
+        // `"search search"` earns no phrase bonus where `"search"` does.
+        assert!(score_tool_match(&records, "demo", "search search", None).is_some());
+        let config = config_with(&[("demo", ServerEntry::default())]);
+        let metadata = metadata_with(&[(
+            "demo",
+            vec![tool("find_records", "Search records"), records.clone()],
+        )]);
+        let names = |query: &str| -> Vec<String> {
+            let mut names: Vec<String> = rank_tool_matches(&config, &metadata, query, None, false)
+                .into_iter()
+                .map(|m| m.tool.name)
+                .collect();
+            names.truncate(1);
+            names
+        };
+        assert_eq!(names("search search"), names("search"));
+        assert_eq!(
+            names("search search").first().map(String::as_str),
+            Some("search_records")
+        );
+    }
+
+    #[test]
+    fn a_repeated_token_does_not_change_a_longer_querys_coverage() {
+        let records = tool("search_records", "Find records");
+        // Three distinct tokens, two matched: 2/3 clears the 0.6 gate. Counting the repeats would
+        // make it 2/5 and reject the tool.
+        let distinct = score_tool_match(&records, "demo", "find records widget", None);
+        assert!(distinct.is_some());
+        assert_eq!(
+            score_tool_match(
+                &records,
+                "demo",
+                "find records records records widget",
+                None
+            ),
+            distinct
+        );
     }
 
     // ---- MCP-195 · the eleven upstream ranking cases ----------------------------------------------
