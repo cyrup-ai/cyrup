@@ -66,7 +66,14 @@ impl<B: Backend> App<B> {
         // `addCustomEntryToChat` resolves the entry one at `interactive-mode.ts:3432`). It rides in
         // the same way and for the same reason: the fold is sync, the guest call is async.
         let entry = match &ev {
-            AgentSessionEvent::EntryAppended { entry } => {
+            // A `cache_warm` `usage` entry has no renderer surface at all: pi reaches
+            // `addCustomEntryToChat` (and therefore `getEntryRenderer`) only under
+            // `entry.type === "custom"`, and routes the usage shape to `addCacheWarmingUsage`
+            // instead (`interactive-mode.ts:3428-3430` @v1.0.4). Resolving an entry renderer for
+            // it would ask every loaded extension to claim the type `usage`.
+            AgentSessionEvent::EntryAppended { entry }
+                if crate::app::cache_warm_usage_fields(entry).is_none() =>
+            {
                 let custom_type = custom_entry_type(entry);
                 extension_render_entry(ext_host, &custom_type, entry, &opts).await
             }

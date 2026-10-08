@@ -431,9 +431,14 @@ fn dag_display(e: &cyrup_session::Entry) -> (SessionDagKind, String) {
                 }
             ),
         ),
-        // pi v0.86+'s cache-warm `usage` entry (SESS-051) still loads as `Entry::Unknown`; it is
-        // classed apart so the `/tree` filter can drop it in every mode, as pi's
-        // `if (entry.type === "usage") return false;` does (`tree-selector.ts:341` @v0.87.1).
+        // A `usage` entry is classed apart so the `/tree` filter can drop it in every mode, as
+        // pi's `if (entry.type === "usage") return false;` does (`tree-selector.ts:341` @v0.87.1).
+        // SESS-051 promoted it to a KNOWN variant, which is why this match — exhaustive over every
+        // `KnownEntry` — stopped compiling and forced the arm to move here.
+        Entry::Known(KnownEntry::Usage { .. }) => (SessionDagKind::Usage, "(entry)".to_string()),
+        // The degraded path is KEPT: a pi-written `usage` line whose body does not fit the variant
+        // still demotes to `Entry::Unknown` (`entry.rs`'s `Err(_) => Entry::Unknown(v)`), and it
+        // must stay hidden rather than reappearing in `/tree` as a bare `(entry)`.
         Entry::Unknown(v) if v.get("type").and_then(serde_json::Value::as_str) == Some("usage") => {
             (SessionDagKind::Usage, "(entry)".to_string())
         }

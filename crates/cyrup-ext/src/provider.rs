@@ -182,6 +182,14 @@ pub struct ProviderModelConfig {
     /// OpenAI-compat settings (Pi `compat`, types.ts:1430): open-shaped `Model<Api>["compat"]`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compat: Option<Value>,
+    /// Prompt-cache lifetimes per retention tier, in SECONDS (Pi
+    /// `promptCache?: Model<Api>["promptCache"]`, `extensions/types.ts:1978` @v1.0.4) — what
+    /// `cyrup_provider::prompt_cache_ttl_ms` schedules cache warming against. Absent on every
+    /// extension-declared model that does not say otherwise: `apply_prompt_cache_metadata` only
+    /// stamps DIRECT Anthropic catalog rows, so an extension provider opts itself in by declaring
+    /// this rather than by claiming an api family.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_cache: Option<cyrup_provider::ModelPromptCache>,
 }
 
 /// A resolved provider registration: the parsed config, the resolved API key (if any), and whether
@@ -327,6 +335,7 @@ impl ProviderRegistration {
                 // plumbing. An extension-declared model therefore carries no defaults upstream
                 // either, so `None` is the port, not a stub.
                 sampling_params: None,
+                prompt_cache: m.prompt_cache.clone(),
                 thinking_level_map,
                 compat,
                 headers,

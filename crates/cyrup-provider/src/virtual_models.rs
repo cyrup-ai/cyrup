@@ -165,6 +165,7 @@ pub fn create_virtual_model(spec: &VirtualModelSpec) -> Model {
         cost: ModelCost::default(),
         // `contextWindow: definition.contextWindow ?? 0`, `maxTokens: definition.maxTokens ?? 0`
         // (`:184-185`) — "unset limits are unknown (0)".
+        prompt_cache: None,
         context_window: spec.context_window.unwrap_or(0),
         max_tokens: spec.max_tokens.unwrap_or(0),
         sampling_params: None,

@@ -72,6 +72,13 @@ impl AgentSession {
         target_session_file: Option<String>,
     ) {
         self.abort_and_settle().await;
+        // SEAM-131 — pi's `dispose()` clears `onWarmed` and then cancels the warmer
+        // (`agent-session.ts:1395-1397` @v1.0.4). The run token is a child of `session_cancel`, so
+        // the cancel below would stop it anyway; this makes the status read `Inactive (inactive)`
+        // rather than leaving the last scheduled decision standing on a dead session.
+        if let Some(warmer) = self.provider.cache_warmer() {
+            warmer.cancel();
+        }
         self.fanout_emit(AgentSessionEvent::SessionShutdown {
             reason: reason.to_string(),
         })

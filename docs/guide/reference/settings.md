@@ -58,7 +58,7 @@ reasoning off by default.
 |---|---|---|---|
 | `theme` | string | *unset* | Theme name, or an auto pair. See below. |
 | `hideThinkingBlock` | bool | `false` | Hide thinking blocks in responses. |
-| `showCacheMissNotices` | bool | `false` | Per-message cache-miss notices; nothing in the interface reads this setting. |
+| `showCacheMissNotices` | bool | `false` | Per-message cache-miss notices, and the one-line `Cache warmed: $…` notice each [cache warm](#cachewarming) prints. |
 | `showHardwareCursor` | bool | `false` | Show the terminal's hardware cursor. |
 | `editorPaddingX` | integer | `0` | Input-editor horizontal padding; the settings editor clamps this to 0–3. |
 | `outputPad` | `0`\|`1` | `1` | Chat-output horizontal padding; only an explicit `0` removes it. |
@@ -117,6 +117,7 @@ others. They apply to providers that take a token budget rather than an effort s
 |---|---|---|---|
 | `transport` | `sse`\|`websocket`\|`websocket-cached`\|`auto` | `"auto"` | Preferred transport for providers that offer more than one. |
 | `httpIdleTimeoutMs` | number \| numeric string \| `"disabled"` | `300000` | Longest idle gap while awaiting HTTP headers or body. See below. |
+| `cacheWarming` | `off`\|`streaming`\|`idle` | `"streaming"` | Keep a provider's prompt cache alive across a long turn. **Global scope only.** See below. |
 | `websocketConnectTimeoutMs` | number \| numeric string | *unset* | WebSocket connect timeout. See below. |
 | `httpProxy` | string | *unset* | Proxy URL. **Global scope only** — see below. Blank or whitespace falls through to the proxy environment variables. |
 | `retry.enabled` | bool | `true` | Retry failed requests. |
@@ -140,6 +141,65 @@ exists, so the pre-session network paths honour it too: `cyrup update --models`,
 and `cyrup auth print-bearer-token`'s OAuth refresh. Earlier builds configured the proxy only when
 a session was built, so those three went direct to the network and reported success. An ambient
 `HTTP_PROXY`/`HTTPS_PROXY` still wins over the setting at the point a request is made.
+
+## cacheWarming
+
+A provider's prompt cache expires on its own clock — five minutes on Anthropic's short tier, an
+hour on the long one. If a single turn runs longer than that, because a tool call or a subagent
+took a while, the cache entry is gone by the time the next request goes out and you pay a full
+cache **write** of the whole prompt instead of a cheap cache **read**.
+
+Cache warming avoids that. Shortly before the entry would expire, cyrup re-sends the request it
+already sent, unchanged except for a one-token output cap, which refreshes the cache for the price
+of one cache read plus one output token.
+
+| Value | Meaning |
+|---|---|
+| `off` | Never send a warm request. |
+| `streaming` | Warm while the agent is running. The default. |
+| `idle` | Also warm between runs, for as long as continuing to pay for it still looks cheaper than losing the cache. |
+
+It only ever warms when the arithmetic says it saves money: cyrup prices the cache write you would
+otherwise pay, prices the warm, and sends nothing unless the expected saving is at least **$0.05**.
+In `idle` it additionally discounts that saving by the chance you come back and use the cache at
+all, so an idle session with a small prompt stops warming rather than paying to hold a cache nobody
+will read. Two fixed safety limits cap a run whatever the economics say — one hour from the first
+request while streaming, thirty minutes once idle — and a successful warm never pushes them out.
+
+**Today this only applies to models served directly by Anthropic.** Warming needs to know when the
+cache expires, and cyrup records a cache lifetime only for Anthropic's own API (`anthropic` over
+`anthropic-messages`). Every other provider — including a gateway or proxy that speaks Anthropic's
+wire format — is left unannotated on purpose: its cache is its own, and guessing Anthropic's five
+minutes for someone else's cache would spend your money on a request that refreshes nothing. On
+those models `/session` reports `Inactive (cache lifetime unavailable)`, which is the setting
+working as intended rather than a fault. A model declared in
+[`models.json`](../guides/models.md#custom-providers-and-models) can carry its own `promptCache`
+lifetimes, and warming then applies to it too.
+
+A request that asked for no caching at all is reported as `Inactive (request disabled prompt
+caching)`. An Anthropic request using budget-based thinking is never warmed: Anthropic derives the
+thinking budget from the output cap and keys the cache on it, so a one-token replay would be a
+different request — and could still think for thousands of tokens, which is the opposite of cheap.
+
+Each warm is recorded in the session as a `usage` entry, so it shows up in `/session`'s cost and in
+the per-model cost breakdown; a warm is real spend and cyrup does not hide it. With
+`showCacheMissNotices` on, each one also prints a dim `Cache warmed: $0.0012` line in the
+transcript.
+
+`/session` shows the live decision — the mode, the status, and, when both the prompt size and the
+model's prices are known, what a cache miss would cost against what a warm costs. `/settings` has
+the same three values under **Cache warming**, and changing it there reaches the running session
+immediately: switching to `off` disarms a warm that was already scheduled rather than waiting for
+the next turn. See [Sessions](../guides/sessions.md#prompt-cache-warming).
+
+Like `httpProxy`, this key is **global scope only** and is stripped from the project layer before
+the merge, so a repository you open cannot start spending your money on warm requests.
+
+An extension can override each decision, forcing a warm cyrup would have skipped or vetoing one it
+would have sent, by handling the `cache_warming_decision` event — the guest export
+`events.on-cache-warming-decision`. Where two handlers disagree the last one to answer wins, and a
+handler that faults, hangs or answers with anything but `warm` or `stop` leaves cyrup's own decision
+in force. See [Writing an extension](../extensions/authoring.md).
 
 ## Telemetry and privacy
 

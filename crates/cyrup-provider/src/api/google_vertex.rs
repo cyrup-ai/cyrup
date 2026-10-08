@@ -467,6 +467,7 @@ mod tests {
                 cache_write: 0.0,
                 tiers: None,
             },
+            prompt_cache: None,
             context_window: 1_048_576,
             max_tokens: 65_536,
             sampling_params: None,

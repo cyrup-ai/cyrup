@@ -74,6 +74,8 @@ pub(crate) mod run_action;
 mod run_arms;
 mod selectors;
 mod session_bind;
+#[cfg(test)]
+pub(crate) use session_bind::ReplayRenders;
 mod session_list;
 mod settings_rows;
 mod share;
@@ -99,8 +101,8 @@ pub(crate) use event_extract::{
     read_clipboard_image_to_temp, stop_reason_notice, tool_result_usage_from_event,
     truncate_summary, user_message_text_from_event,
 };
-pub(crate) use extension_render_impl::custom_entry_type;
 pub(crate) use extension_render_impl::run_renderer;
+pub(crate) use extension_render_impl::{cache_warm_usage_fields, custom_entry_type};
 pub use extension_render_impl::{
     extension_render, extension_render_entry, extension_render_message, extension_render_tool_call,
     extension_render_tool_result, should_honor_extension_shutdown,

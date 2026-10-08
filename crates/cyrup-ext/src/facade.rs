@@ -1131,6 +1131,51 @@ impl ExtensionHost {
         crate::fold_project_trust(std::slice::from_ref(&hit))
     }
 
+    /// Resolve one prompt-cache warm-or-stop decision across extensions (pi
+    /// `emitCacheWarmingDecision`, `core/extensions/runner.ts:1121-1142` @v1.0.4; EXT-085).
+    ///
+    /// `action` is the host's own decision — the warmer's economics verdict. EVERY subscribed
+    /// extension's handler runs, in load order, and the LAST one that answers with a readable
+    /// `{"action": "warm" | "stop"}` wins; the returned action is the FINAL one, which is
+    /// `action` itself when nobody overrode it. That is deliberately NOT
+    /// [`Self::aggregate_project_trust`]'s rule: there the first decision ends the walk, here
+    /// every handler runs for its side effects and only the last opinion counts.
+    ///
+    /// A handler that faults, traps, panics or overruns the invocation budget is contained and
+    /// SKIPPED by the dispatcher (`dispatch_collect_handled`, R-08-036), which is pi's
+    /// `emitError`-and-continue (`runner.ts:1134-1141`): a broken extension leaves the action as
+    /// it stood instead of cancelling warming. The budget is also what bounds a guest that hangs —
+    /// a `cache_warming_decision` handler is on the path of a refresh with a deadline, so it
+    /// cannot be allowed to wait forever.
+    ///
+    /// There is deliberately NO `decides_cache_warming` manifest gate. The analogous
+    /// `decides_project_trust` flag exists only because `project_trust` is also dispatched in the
+    /// pre-trust bootstrap pass, where the host has to know which extensions to load FIRST; a
+    /// warming decision happens long after load.
+    pub async fn aggregate_cache_warming_decision(
+        &self,
+        warm_cost: f64,
+        miss_cost: f64,
+        continuation_probability: f64,
+        action: crate::CacheWarmingAction,
+        cancel: &CancelToken,
+    ) -> crate::CacheWarmingAction {
+        use crate::event::HostEvent;
+        let handled = self
+            .dispatcher
+            .dispatch_collect_handled(
+                &HostEvent::CacheWarmingDecision {
+                    warm_cost,
+                    miss_cost,
+                    continuation_probability,
+                    action: action.as_str().to_string(),
+                },
+                cancel,
+            )
+            .await;
+        crate::fold_cache_warming_decision(&handled).map_or(action, |(_, a)| a)
+    }
+
     /// Aggregate the skill/prompt/theme paths every extension provides (Pi `resources_discover`,
     /// runner.ts:197; gap-08 #4) into a typed, attributed [`crate::ResourcesAggregate`].
     pub async fn aggregate_resources(&self, cancel: &CancelToken) -> crate::ResourcesAggregate {

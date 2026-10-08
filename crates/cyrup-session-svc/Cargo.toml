@@ -72,7 +72,10 @@ time = { workspace = true }
 base64 = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true }
+# `test-util` supplies `#[tokio::test(start_paused = true)]` + `tokio::time::advance`, which is how
+# the prompt-cache warmer's timers (4m30s delays, 30- and 60-minute safety windows) are tested
+# without sleeping for real — the clock seam the codemode and herdr suites already use.
+tokio = { workspace = true, features = ["test-util"] }
 tempfile = { workspace = true }
 futures = { workspace = true }
 async-trait = { workspace = true }

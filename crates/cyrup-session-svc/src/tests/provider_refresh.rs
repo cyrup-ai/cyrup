@@ -136,6 +136,7 @@ fn catalog(provider: &str, ids: &[&str]) -> Vec<Model> {
             context_window: 4096,
             max_tokens: 4096,
             sampling_params: None,
+            prompt_cache: None,
             thinking_level_map: None,
             compat: None,
             headers: None,

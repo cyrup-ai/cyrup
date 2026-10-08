@@ -119,3 +119,73 @@ fn append_attributed(
         }
     }
 }
+
+/// pi `CacheWarmingAction` (`core/cache-warmer.ts:88` @v1.0.4): the only two values that exist.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CacheWarmingAction {
+    Warm,
+    Stop,
+}
+
+impl CacheWarmingAction {
+    /// The wire spelling pi uses on both legs of the hook.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CacheWarmingAction::Warm => "warm",
+            CacheWarmingAction::Stop => "stop",
+        }
+    }
+}
+
+/// Parse a `cache_warming_decision` handled value's `{action}` (pi
+/// `CacheWarmingDecisionEventResult`, `core/cache-warmer.ts:117-120` @v1.0.4). `None` = this
+/// handler expressed NO opinion, which is upstream's `result?.action !== undefined` guard
+/// (`runner.ts:1131`) and leaves the action as it stood.
+///
+/// An action that is present but is neither `"warm"` nor `"stop"` is treated as no opinion rather
+/// than forwarded. **This is a DELIBERATE divergence, and the direction matters.** Upstream's
+/// untyped `action = result.action` (`runner.ts:1131`) propagates a third string straight through,
+/// and its only consumer tests `if (action === "stop")` (`cache-warmer.ts:320`) — so an
+/// unrecognised action reads as **warm**: pi SENDS the refresh and, because
+/// `extensionOverride = action !== decision.action` (`:319`) is true, persists it as
+/// `Cache warmed (extension override): $…`. In other words upstream spends money under an action
+/// name its own union does not have. cyrup refuses instead: the fold falls back to the previous
+/// readable opinion, or to the host's own economics verdict, so "last override wins" is strictly
+/// "last PARSEABLE override wins". That costs strict parity on an input no correct extension
+/// produces and buys back the case where a sloppy guest cannot make the host pay.
+///
+/// Do not "fix" this back toward parity on the strength of the old comment here, which claimed the
+/// opposite — that a third string read as `"stop"` upstream. It does not; it reads as a warm.
+/// (Both sides re-read at v1.0.4 and at this HEAD.) If strict parity is ever wanted, the change is
+/// to map an unrecognised-but-present action to [`CacheWarmingAction::Warm`] with
+/// `extension_override = true`, not to drop the guard.
+pub fn parse_cache_warming_action(v: &serde_json::Value) -> Option<CacheWarmingAction> {
+    match v.get("action")?.as_str()? {
+        "warm" => Some(CacheWarmingAction::Warm),
+        "stop" => Some(CacheWarmingAction::Stop),
+        _ => None,
+    }
+}
+
+/// Fold the collected `cache_warming_decision` handled values into the final action override: the
+/// LAST handler that returned a readable `{action}` wins (pi `emitCacheWarmingDecision`,
+/// `core/extensions/runner.ts:1121-1142` @v1.0.4 — `if (result?.action !== undefined) action =
+/// result.action`, assigned inside the loop and never returned early). `None` = nobody overrode,
+/// so the caller keeps the host's own `event.action`.
+///
+/// **This is the OPPOSITE rule to [`fold_project_trust`] next door, and the asymmetry is
+/// upstream's.** `project_trust` returns the instant a handler decides, so a later handler must
+/// not run at all; `cache_warming_decision` runs every handler of every extension for its side
+/// effects (a telemetry handler that also wants to observe the economics) and only then takes the
+/// last opinion. Dispatch it with
+/// [`crate::dispatch::Dispatcher::dispatch_collect_handled`], never `dispatch_first_handled` — a
+/// reader who assumes symmetry with this file's other fold gets first-wins and a silently
+/// skipped handler.
+pub fn fold_cache_warming_decision(
+    handled: &[(ExtensionId, HandledValue)],
+) -> Option<(ExtensionId, CacheWarmingAction)> {
+    handled
+        .iter()
+        .rev()
+        .find_map(|(id, HandledValue(v))| parse_cache_warming_action(v).map(|a| (id.clone(), a)))
+}

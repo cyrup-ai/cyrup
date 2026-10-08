@@ -224,7 +224,24 @@ pub fn parse_catalog(
                 "provider".to_string(),
                 serde_json::Value::String(provider_id.to_string()),
             );
-            serde_json::from_value::<AnyModel>(serde_json::Value::Object(owned)).ok()
+            let parsed =
+                serde_json::from_value::<AnyModel>(serde_json::Value::Object(owned)).ok()?;
+            // SEAM-131 — the same load-time fill the EMBEDDED catalogs get
+            // (`catalog::load_catalog`). An overlay row never passes through that function:
+            // `merge_models` replaces a baseline entry wholesale by id, so a refreshed
+            // `anthropic` row that omits `promptCache` would arrive with `prompt_cache: None`,
+            // `prompt_cache_ttl_ms` would answer `None`, and every session on that model would
+            // report `Inactive (cache lifetime unavailable)` — the whole feature off, with no
+            // other symptom. The pass only ever fills a key the row left unset, so an overlay
+            // that does carry `promptCache` is untouched, and it is gated on direct Anthropic
+            // exactly as the embedded pass is, so no gateway row gains an invented lifetime.
+            Some(match parsed {
+                AnyModel::Chat(mut model) => {
+                    crate::catalog::apply_prompt_cache_metadata(&mut model);
+                    AnyModel::Chat(model)
+                }
+                other => other,
+            })
         })
         .collect())
 }
@@ -1131,6 +1148,7 @@ mod tests {
             reasoning: false,
             input: vec![Modality::Text],
             cost: ModelCost::default(),
+            prompt_cache: None,
             context_window,
             max_tokens: 4096,
             sampling_params: None,

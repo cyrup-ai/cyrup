@@ -71,6 +71,14 @@ pub enum EventKind {
     /// @v0.87.1, added v0.87.0). Mutating: the request-time transform that runs after every
     /// `context` handler, whose result is sent as returned. EXT-079.
     ContextWithSystem = 35,
+    /// `cache_warming_decision` (pi `CacheWarmingDecisionEvent`, `core/cache-warmer.ts:112-115`
+    /// @v1.0.4 — declared in the warmer, not `extensions/types.ts`, and put in the
+    /// `ExtensionEvent` union there instead). Fired before each prompt-cache
+    /// refresh with pi's own warm-or-stop decision filled in; a handler may override it through
+    /// `{action}`. Reduced by `emitCacheWarmingDecision` (`core/extensions/runner.ts:1121-1142`),
+    /// whose rule is NOT this file's other result-bearing event's: every handler of every
+    /// extension runs and the LAST one that returns an `action` wins. EXT-085.
+    CacheWarmingDecision = 36,
 }
 
 impl EventKind {
@@ -87,7 +95,14 @@ impl EventKind {
     /// **36 against pi v0.87.1**: the three events pi added after that baseline —
     /// `ui_prompt_start`/`ui_prompt_end` (v0.84.4, EXT-075) and `context_with_system` (v0.87.0,
     /// EXT-079) — are ported as kinds 33-35.
-    pub const COUNT: u8 = 36;
+    ///
+    /// **37 against pi v1.0.4**: `cache_warming_decision` is kind 36 (EXT-085). It is the one
+    /// event pi does NOT declare in `extensions/types.ts` — the type lives in
+    /// `core/cache-warmer.ts:112-115` and is pulled into the `ExtensionEvent` union in
+    /// `core/extensions/types.ts` @v1.0.4, with its `on(event: "cache_warming_decision")` overload at
+    /// `:1589-1591` — so a name-set difference computed from the overload block alone still comes
+    /// out empty in both directions.
+    pub const COUNT: u8 = 37;
 
     /// Parse the `u8` a guest passes via `subscribe(event-kinds)`.
     pub fn from_u8(v: u8) -> Option<EventKind> {
@@ -129,6 +144,7 @@ impl EventKind {
             33 => UiPromptStart,
             34 => UiPromptEnd,
             35 => ContextWithSystem,
+            36 => CacheWarmingDecision,
             _ => return None,
         })
     }
@@ -174,6 +190,7 @@ impl EventKind {
             UiPromptStart => "ui_prompt_start",
             UiPromptEnd => "ui_prompt_end",
             ContextWithSystem => "context_with_system",
+            CacheWarmingDecision => "cache_warming_decision",
         }
     }
 
@@ -478,6 +495,23 @@ pub enum HostEvent {
     ProjectTrust {
         cwd: String,
     },
+    /// `cache_warming_decision` (pi `CacheWarmingDecisionEvent`, `core/cache-warmer.ts:112-115`
+    /// @v1.0.4): a `Pick` of EXACTLY these four fields of `CacheWarmingDecision`. `phase`,
+    /// `expectedSavings` and `economicsAvailable` are withheld on purpose — upstream's comment is
+    /// *"Everything else an extension might want (model, idle state, context size) is on the
+    /// context."* The verdict comes back as `hook-outcome::handled({"action": "warm" | "stop"})`
+    /// (pi `CacheWarmingDecisionEventResult`, `:117-120`), folded by
+    /// [`crate::fold_cache_warming_decision`]. EXT-085.
+    CacheWarmingDecision {
+        /// Price of this refresh: a cache read of the prompt plus one output token.
+        warm_cost: f64,
+        /// Extra price of the next real request if the cache entry is lost.
+        miss_cost: f64,
+        /// Estimated chance a real request arrives before the entry expires.
+        continuation_probability: f64,
+        /// pi's own decision, `"warm"` or `"stop"`, which a handler may override.
+        action: String,
+    },
     // 5.5 input / 5.6 provider / model (pi's overload block, extensions/types.ts:1190-1231 @v0.83.0)
     // Carries the submission text AND the attached images (Pi `InputEvent.text`/`.images`,
     // types.ts:792-802) so an `input` handler can `transform` either (Pi runner.ts:1116-1119),
@@ -629,6 +663,7 @@ impl HostEvent {
             HostEvent::SessionBeforeTree { .. } => K::SessionBeforeTree,
             HostEvent::SessionTree { .. } => K::SessionTree,
             HostEvent::AgentSettled => K::AgentSettled,
+            HostEvent::CacheWarmingDecision { .. } => K::CacheWarmingDecision,
         }
     }
 

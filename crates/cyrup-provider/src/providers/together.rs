@@ -83,6 +83,7 @@ fn model(
         reasoning,
         input,
         cost,
+        prompt_cache: None,
         context_window,
         max_tokens,
         sampling_params: None,

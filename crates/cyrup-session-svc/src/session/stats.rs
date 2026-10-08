@@ -260,6 +260,55 @@ impl AgentSession {
     }
 }
 
+impl AgentSession {
+    /// The live prompt-cache warming status — pi `get cacheWarmingStatus(): CacheWarmingStatus |
+    /// undefined` (`agent-session.ts:1417-1419` @v1.0.4), the `/session` row's input.
+    ///
+    /// `None` means this session has NO warmer, which is a different statement from "warming is
+    /// inactive": pi holds the warmer as an optional `Pick<CacheWarmer, …>` (`:261`) and its
+    /// `/session` prints the distinct literal `Inactive (cache warming unavailable)` for the
+    /// absent case. A session built with an embedder-supplied custom `StreamFn` is exactly that
+    /// case here, because such a transport replaces the `ProviderSwap` the warmer hangs off.
+    /// The warmer itself, for the in-crate tests that need to drive it (the settle-order test
+    /// drives a refresh from inside the `agent_settled` dispatch window).
+    #[cfg(test)]
+    pub(crate) fn cache_warmer_for_test(
+        &self,
+    ) -> Option<std::sync::Arc<crate::cache_warmer::CacheWarmer>> {
+        self.provider.cache_warmer().cloned()
+    }
+
+    pub async fn cache_warming_status(&self) -> Option<crate::cache_warmer::CacheWarmingStatus> {
+        let warmer = self.provider.cache_warmer()?;
+        Some(warmer.status().await)
+    }
+
+    /// The live warming mode — pi `settingsManager.getCacheWarmingMode()` as `/session` and
+    /// `/settings` read it. `None` when the session has no warmer.
+    #[must_use]
+    pub fn cache_warming_mode(&self) -> Option<cyrup_config::CacheWarmingMode> {
+        Some(self.provider.cache_warmer()?.mode())
+    }
+
+    /// Apply a new warming mode to the LIVE run — pi `setCacheWarmingMode(mode)`, which is
+    /// `settingsManager.setCacheWarmingMode(mode)` then `this._cacheWarmer?.onModeChanged()`
+    /// (`agent-session.ts:1422-1425` @v1.0.4).
+    ///
+    /// This is the live half only, matching [`Self::set_transport`]: persisting the value is the
+    /// front-end's `/settings` write, as it is for every other settings row cyrup applies live.
+    /// Without the reconcile a switch to `off` would leave an armed timer standing until its next
+    /// checkpoint — which is the bug class `execute_misc.rs` already records for `transport`.
+    /// Returns `false` when the session has no warmer.
+    pub fn set_cache_warming_mode(&self, mode: cyrup_config::CacheWarmingMode) -> bool {
+        let Some(warmer) = self.provider.cache_warmer() else {
+            return false;
+        };
+        warmer.set_mode(mode);
+        warmer.on_mode_changed();
+        true
+    }
+}
+
 /// The per-message predicate of Pi's `projectedAssistants` set (`agent-session.ts:3873-3885`
 /// @v0.87.1) — the same three clauses `getAssistantUsage` applies (`compaction.ts:170-183`): an
 /// assistant that neither aborted nor errored, whose `calculateContextTokens(usage)` —

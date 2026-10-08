@@ -291,6 +291,10 @@ fn model_from_json(
             .clone()
             .unwrap_or_else(|| vec![cyrup_provider::Modality::Text]),
         cost: definition.cost.clone().unwrap_or_default(),
+        // `promptCache: definition.promptCache` (provider-composer.ts:241 @v1.0.4) — verbatim, no
+        // provider-level or built-in fallback. `apply_prompt_cache_metadata` fills direct-Anthropic
+        // rows that leave it unset; a row that sets it keeps what it set.
+        prompt_cache: definition.prompt_cache.clone(),
         // Both are guaranteed `> 0` by the checks above, so the cast is total.
         context_window: definition.context_window.map_or(128_000, |v| v as u64),
         max_tokens: definition.max_tokens.map_or(16_384, |v| v as u64),
@@ -351,6 +355,20 @@ fn apply_model_override(model: &mut Model, ov: &ModelOverride) {
     // ...override.samplingParams } : model.samplingParams`. This is a per-key MERGE, not a
     // replacement — the same shape as `thinkingLevelMap` above and unlike every other field here —
     // so an override naming only `top_p` must leave a model-level `top_k` in place. CFG-039.
+    // Pi `:196` @v1.0.4: `override.promptCache ? { ...model.promptCache, ...override.promptCache }
+    // : model.promptCache` — a per-TIER merge, like `samplingParams` and `thinkingLevelMap` and
+    // unlike `cost`/`input`. An override naming only one tier must leave the other in place, so a
+    // `{ "long": 7200 }` override cannot silently disable short-tier cache warming.
+    if let Some(pc) = &ov.prompt_cache {
+        let mut merged = model.prompt_cache.clone().unwrap_or_default();
+        if pc.short.is_some() {
+            merged.short = pc.short;
+        }
+        if pc.long.is_some() {
+            merged.long = pc.long;
+        }
+        model.prompt_cache = Some(merged);
+    }
     if let Some(params) = &ov.sampling_params {
         let mut merged = model.sampling_params.clone().unwrap_or_default();
         for (key, value) in params {

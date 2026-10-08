@@ -113,6 +113,12 @@ impl SessionStats {
                         s.add_usage(u);
                     }
                 }
+                // `if (entry.type === "usage") addUsageToTotals(usageTotals, entry.usage);`
+                // (pi `modes/interactive/components/footer.ts:125-126` @v1.0.4). A cache-warm
+                // request spends real tokens on a real model, so it belongs in the footer's
+                // cumulative totals and in `/session`'s Tokens rows — the clause area 07's ledger
+                // struck as owned by SESS-051. Not a message, so it moves no message counter.
+                KnownEntry::Usage { usage, .. } => s.add_usage(usage),
                 // `if (entry.type !== "message") continue;` (agent-session.ts:3123).
                 KnownEntry::Message { message, .. } => {
                     s.total_messages += 1;
@@ -229,6 +235,19 @@ pub fn usage_cost_breakdown(entries: &[Entry]) -> Vec<UsageCostBreakdownEntry> {
             | KnownEntry::BranchSummary { usage: Some(u), .. } => {
                 add(TOOLS_SUMMARIES_KEY.to_string(), u);
             }
+            // `else if (entry.type === "usage") { key = `${entry.provider}/${entry.model}`;
+            // usage = entry.usage; }` (`usage-totals.ts:70-72` @v1.0.4) — attributed to the warm's
+            // OWN model, NOT the `Tools/summaries` bucket the two arms above use. A warm is a real
+            // request to a real model; bucketing it with tool results would hide which model's
+            // cache is being paid to stay warm, which is the whole point of the breakdown.
+            KnownEntry::Usage {
+                provider,
+                model,
+                usage,
+                ..
+            } => {
+                add(format!("{}/{}", provider.as_str(), model.as_str()), usage);
+            }
             _ => {}
         }
     }
@@ -271,6 +290,27 @@ pub fn cache_scan_entries(
                 message: AgentMessage::Core(Message::Assistant(a)),
                 ..
             }) => CacheScanEntry::Assistant(a),
+            // pi's third scan arm (`cache-stats.ts:120-130` @v1.0.4): a `cache_warm` usage entry
+            // REFRESHED the cache, so it becomes the previous request the next turn is compared
+            // against. Falling through to `Other` here is what makes the next assistant turn — the
+            // one the warm bought a cheap cache read for — report a full cache miss.
+            //
+            // A usage entry of any OTHER kind is `Other`, matching pi's `entry.kind ===
+            // "cache_warm"` guard: only a warm is known to have re-sent the whole prompt.
+            Entry::Known(KnownEntry::Usage {
+                kind,
+                provider,
+                model,
+                usage,
+                base,
+                ..
+            }) if kind == "cache_warm" => CacheScanEntry::CacheWarm {
+                prompt_tokens: usage.input + usage.cache_read + usage.cache_write,
+                model_key: format!("{}/{}", provider.as_str(), model.as_str()),
+                // `Date.parse(entry.timestamp)` — the same parse every other timestamp on this
+                // path goes through.
+                timestamp: cyrup_session::context::parse_entry_ts(&base.timestamp),
+            },
             _ => CacheScanEntry::Other,
         })
         .collect()
@@ -618,6 +658,238 @@ mod prov036_tests {
             matches!(scan[2], CacheScanEntry::Other),
             "a user message is ignored and specifically NOT a reset"
         );
+    }
+
+    /// An assistant entry whose MESSAGE timestamp is set — `detect_miss` reads
+    /// `message.timestamp` for `idle_ms`, which the `assistant` helper above leaves at 0.
+    fn assistant_at(id: &str, model: &str, u: Usage, ts: i64) -> Entry {
+        let e = assistant(id, "anthropic", model, None, u);
+        let Entry::Known(KnownEntry::Message {
+            base,
+            message: AgentMessage::Core(Message::Assistant(mut a)),
+        }) = e
+        else {
+            panic!("assistant() builds an assistant message entry");
+        };
+        a.timestamp = ts;
+        Entry::Known(KnownEntry::Message {
+            base,
+            message: AgentMessage::Core(Message::Assistant(a)),
+        })
+    }
+
+    /// A `cache_warm` `usage` entry, as the warmer persists one.
+    fn warm(id: &str, provider: &str, model: &str, u: Usage) -> Entry {
+        Entry::Known(KnownEntry::Usage {
+            base: base(id),
+            kind: "cache_warm".to_string(),
+            provider: ProviderId::from(provider),
+            model: model.into(),
+            usage: u,
+            note: None,
+        })
+    }
+
+    /// A usage entry of some OTHER kind — pi's scan arm is guarded on `kind === "cache_warm"`.
+    fn other_usage(id: &str, u: Usage) -> Entry {
+        Entry::Known(KnownEntry::Usage {
+            base: base(id),
+            kind: "something_else".to_string(),
+            provider: ProviderId::from("anthropic"),
+            model: "m".into(),
+            usage: u,
+            note: None,
+        })
+    }
+
+    fn prompt_usage(cache_read: u64, output: u64, cost: f64) -> Usage {
+        Usage {
+            cache_read,
+            output,
+            cost: Cost {
+                total: cost,
+                ..Cost::default()
+            },
+            ..Usage::default()
+        }
+    }
+
+    /// SESS-051 — a warm's tokens and cost reach `SessionStats` (pi `footer.ts:125-126`
+    /// @v1.0.4: `if (entry.type === "usage") addUsageToTotals(usageTotals, entry.usage);`) and the
+    /// breakdown attributes them to the warm's OWN `provider/model`, not the `Tools/summaries`
+    /// bucket (pi `usage-totals.ts:70-72`). The breakdown still reconciles with
+    /// `SessionStats::cost`.
+    ///
+    /// **Red-proved** twice, and in both cases this was the only test that failed:
+    /// * deleting the `KnownEntry::Usage` arm from `SessionStats::from_entries`, restoring the
+    ///   `_ => {}` catch-all → FAILED (the warm's 42000 cache-read tokens and its cost vanished),
+    ///   and the reconciliation assertion ALSO failed, because the breakdown row survived while
+    ///   `stats.cost` did not — exactly the silent divergence this pair of arms exists to prevent;
+    /// * routing the breakdown row to `TOOLS_SUMMARIES_KEY` instead of `{provider}/{model}` →
+    ///   FAILED on the key assertion.
+    #[test]
+    fn sess051_a_warm_counts_in_stats_and_is_attributed_to_its_own_model() {
+        let entries = vec![
+            assistant(
+                "a1",
+                "anthropic",
+                "claude-sonnet-5",
+                None,
+                usage(100, 10, 0.10),
+            ),
+            warm(
+                "w1",
+                "anthropic",
+                "claude-sonnet-5",
+                prompt_usage(42_000, 1, 0.0126),
+            ),
+        ];
+
+        let stats = SessionStats::from_entries(&entries, "sid".to_string(), None, None);
+        assert_eq!(
+            stats.tokens.cache_read, 42_000,
+            "the warm's cache-read tokens belong in the footer totals"
+        );
+        assert!(
+            (stats.cost - 0.112_6).abs() < 1e-9,
+            "the warm's cost belongs in the session cost: {}",
+            stats.cost
+        );
+        // A warm is not a message: it moves no message counter.
+        assert_eq!(stats.total_messages, 1);
+        assert_eq!(stats.assistant_messages, 1);
+
+        let rows = usage_cost_breakdown(&entries);
+        assert_eq!(rows.len(), 1, "same provider/model coalesces into one row");
+        assert_eq!(rows[0].key, "anthropic/claude-sonnet-5");
+        assert!(
+            !rows.iter().any(|r| r.key == TOOLS_SUMMARIES_KEY),
+            "a warm is a real request to a real model, not unattributable spend"
+        );
+        let summed: f64 = rows.iter().map(|r| r.cost).sum();
+        assert!(
+            (summed - stats.cost).abs() < 1e-9,
+            "breakdown {summed} must reconcile with SessionStats::cost {}",
+            stats.cost
+        );
+    }
+
+    /// SESS-051 — the three facts [`CacheScanEntry::CacheWarm`] carries all have to be the WARM's
+    /// own, because pi's third scan arm (`cache-stats.ts:120-130` @v1.0.4) replaces `prev` outright:
+    ///
+    /// * `reported_cache: true` — a warm PROVES the provider caches, so a later zero-cache turn is
+    ///   a real total miss. Without the arm `prev` is the earlier no-cache turn, whose
+    ///   `reportedCache` is false, and `detectMiss` returns `undefined` (`:62-66`): the miss is
+    ///   silently not counted at all.
+    /// * `timestamp` — `idleMs` is measured from the WARM, which is what last refreshed the cache,
+    ///   not from the assistant turn before it.
+    /// * `model_key` — `modelChanged` compares against the warm's `${provider}/${model}`.
+    ///
+    /// The session is: a no-cache turn on a provider that reports nothing, a warm, then a turn that
+    /// re-billed its whole 42k prompt. With the arm the miss is counted and attributed; without it
+    /// the whole miss disappears.
+    ///
+    /// **Red-proved** by disabling the arm (`if kind == "cache_warm" && false`, so the entry falls
+    /// to `CacheScanEntry::Other`): FAILED on the shape assertion AND, with that assertion removed
+    /// too, on `miss_count` — `0` instead of `1`, the re-billed 42k prompt going unreported. Also
+    /// **red-proved** by hardcoding `timestamp: 0` in the arm (`idle_ms` became the whole epoch) and
+    /// by hardcoding `model_key: String::new()` (`model_changed` flipped to `true`).
+    #[test]
+    fn sess051_a_warm_is_the_previous_request_for_the_cache_waste_scan() {
+        use cyrup_provider::cache_stats::CacheScanEntry;
+
+        const T_WARM: &str = "2026-10-08T00:05:00.000Z";
+        let warm_ms = cyrup_session::context::parse_entry_ts(T_WARM);
+        // The re-billing turn, two minutes after the warm.
+        let turn_ms = warm_ms + 120_000;
+
+        // A provider that reports NO cache activity on either real turn.
+        let no_cache_first = Usage {
+            input: 1_000,
+            output: 5,
+            ..Usage::default()
+        };
+        let rebilled = Usage {
+            input: 42_000,
+            output: 5,
+            ..Usage::default()
+        };
+
+        let warm_entry = Entry::Known(KnownEntry::Usage {
+            base: EntryBase {
+                id: EntryId::from("w1"),
+                parent_id: None,
+                timestamp: T_WARM.to_string(),
+                extra: serde_json::Map::new(),
+            },
+            kind: "cache_warm".to_string(),
+            provider: ProviderId::from("anthropic"),
+            model: "claude-sonnet-5".into(),
+            usage: prompt_usage(42_000, 1, 0.0126),
+            note: None,
+        });
+
+        let with_warm = vec![
+            assistant_at("a1", "claude-sonnet-5", no_cache_first.clone(), 0),
+            warm_entry,
+            assistant_at("a2", "claude-sonnet-5", rebilled.clone(), turn_ms),
+        ];
+
+        let scan = cache_scan_entries(&with_warm);
+        assert!(
+            matches!(
+                &scan[1],
+                CacheScanEntry::CacheWarm {
+                    prompt_tokens: 42_000,
+                    model_key,
+                    timestamp,
+                } if model_key == "anthropic/claude-sonnet-5" && *timestamp == warm_ms
+            ),
+            "a cache_warm usage entry is the scan's third arm, not `Other`: {:?}",
+            scan[1]
+        );
+
+        let models = cyrup_provider::cache_stats::NoPrices;
+        let misses = cyrup_provider::cache_stats::collect_cache_misses(&scan, &models);
+        assert_eq!(
+            misses.len(),
+            1,
+            "the warm proved the provider caches, so the re-billed turn IS a counted miss"
+        );
+        let miss = misses[&2];
+        assert_eq!(miss.missed_tokens, 42_000);
+        assert_eq!(
+            miss.idle_ms, 120_000,
+            "idle is measured from the WARM, the thing that last refreshed the cache"
+        );
+        assert!(
+            !miss.model_changed,
+            "the warm ran on the same model, so this is not a model switch"
+        );
+
+        // Without the warm, `prev` is the first turn, whose `reportedCache` is false — pi's
+        // `detectMiss` bails at `:62-66` and the whole 42k re-bill goes UNREPORTED.
+        let without = vec![
+            assistant_at("a1", "claude-sonnet-5", no_cache_first, 0),
+            assistant_at("a2", "claude-sonnet-5", rebilled, turn_ms),
+        ];
+        assert_eq!(
+            cyrup_provider::cache_stats::compute_cache_waste(
+                &cache_scan_entries(&without),
+                &models
+            )
+            .miss_count,
+            0,
+            "a provider that never reported caching gives the scan nothing to go on"
+        );
+
+        // A usage entry of any OTHER kind stays `Other`: only a warm is known to have re-sent the
+        // whole prompt, which is pi's `entry.kind === "cache_warm"` guard.
+        let other = vec![other_usage("o1", prompt_usage(42_000, 1, 0.0126))];
+        assert!(matches!(
+            cache_scan_entries(&other)[0],
+            CacheScanEntry::Other
+        ));
     }
 }
 

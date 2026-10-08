@@ -312,6 +312,19 @@ impl AgentSession {
             // front-end hands its registered ENTRY renderer the same JSON on both paths. pi's
             // `addCustomEntryToChat` is reached identically from the live event (`:3217-3218`) and
             // from the replay walk (`:3717-3719`).
+            // SESS-051/SEAM-131 — the second entry kind pi's flat-map admits whole:
+            // `(entry.type === "usage" && entry.kind === "cache_warm")` (`:4058`). Like the
+            // `custom` arm below it `continue`s before the message projection, because a usage
+            // entry projects no message (`sessionEntryToContextMessages` has no `usage` arm) and
+            // would otherwise vanish from a resumed transcript while a live one showed it.
+            if let Entry::Known(KnownEntry::Usage { kind, .. }) = entry
+                && kind == "cache_warm"
+            {
+                out.push(ReplayItem::UsageEntry(
+                    serde_json::to_value(entry).unwrap_or(serde_json::Value::Null),
+                ));
+                continue;
+            }
             if let Entry::Known(KnownEntry::Custom { .. }) = entry {
                 // A serialization failure is unreachable for `Entry` (no map with non-string keys,
                 // no non-finite float), but if it ever happened the entry must still reach the

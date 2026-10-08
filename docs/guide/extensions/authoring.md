@@ -148,7 +148,7 @@ post-processes it.
 {
   "id": "my-ext",
   "version": "1.0.0",
-  "world": "cyrup:ext@0.17",
+  "world": "cyrup:ext@0.18",
   "entry": "crates/my-ext",
   "capabilities": {
     "fs": ["read:.", "write:.cyrup/todo"],
@@ -169,15 +169,17 @@ post-processes it.
 
 ### World compatibility
 
-The host world is `cyrup:ext@0.17` (`HOST_WORLD` in `crates/cyrup-ext/src/manifest.rs`, which also
+The host world is `cyrup:ext@0.18` (`HOST_WORLD` in `crates/cyrup-ext/src/manifest.rs`, which also
 carries the bump history). A manifest's `world` must declare the **same major version** as the host
-and a **minor version at least** the host's. Against today's host, `cyrup:ext@0.17` is the value to
+and a **minor version at least** the host's. Against today's host, `cyrup:ext@0.18` is the value to
 write; an older minor is a mismatch, and so is a different major.
 
 The minor moves whenever an export is added, removed or re-signed, and whenever an import is removed
 or re-signed — both of those break an already-built guest at link time. A purely additive import does
-not move it. `0.17` is the current value because the route callback of a virtual model is a guest
-export (see [Virtual models](virtual-models.md)), so a `0.16` component does not have it. That is why the rule is one-directional: a *higher* minor than the host is accepted,
+not move it. `0.18` is the current value because the prompt-cache warming decision an extension can
+override is a guest export, `events.on-cache-warming-decision`, so a `0.17` component does not have
+it; `0.17` was the route callback of a virtual model (see [Virtual models](virtual-models.md)),
+which a `0.16` component does not have. That is why the rule is one-directional: a *higher* minor than the host is accepted,
 a lower one is refused.
 
 A mismatch gives you a clear version error naming the problem. It does not become a link failure

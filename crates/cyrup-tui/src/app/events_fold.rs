@@ -561,7 +561,23 @@ impl<B: Backend> App<B> {
                 // interactive-mode.ts:3217-3218). The replay walk reaches the SAME method
                 // ([`Self::push_custom_entry`]) from `renderSessionItems`' custom arm (`:3717-3719`)
                 // — EXT-041.
-                self.push_custom_entry(custom_entry_type(&entry), entry_rendered);
+                // The arm branches on the payload's own `type`/`kind` FIRST: pi's live arm is a
+                // three-way `if (entry.type === "custom") … else if (entry.type === "usage" &&
+                // entry.kind === "cache_warm") …` (`interactive-mode.ts:3428-3430` @v1.0.4).
+                // Routing a usage entry through `push_custom_entry` would draw it as an unclaimed
+                // custom entry. The replay path reaches the SAME renderer from its own
+                // `ReplayItem::UsageEntry` arm — EXT-041.
+                if let Some((note, cost)) = crate::app::cache_warm_usage_fields(&entry) {
+                    // pi re-reads `getShowCacheMissNotices()` inside `addCacheWarmingUsage`
+                    // (`:4071`), so the gate is here and at the replay site, not at the source.
+                    if self.state.show_cache_miss_notices {
+                        self.state
+                            .transcript
+                            .push_cache_warming_usage(note.as_deref(), cost);
+                    }
+                } else {
+                    self.push_custom_entry(custom_entry_type(&entry), entry_rendered);
+                }
             }
             // pi routes `session_start`/`session_shutdown` to EXTENSIONS ONLY — declared
             // `extensions/types.ts:563`/`:632`, subscribed via `on("session_start", …)` at

@@ -840,6 +840,65 @@ fn two_handlers_for_one_event_both_run_in_order_with_pis_result_combination() {
     };
     assert_eq!(serde_json::from_str::<Value>(&h).unwrap()["trusted"], "yes");
 
+    // `cache_warming_decision` (`emitCacheWarmingDecision`, `runner.ts:1121-1142` @v1.0.4): every
+    // handler runs and the LAST readable `{action}` wins — the OPPOSITE of `project_trust` above,
+    // which is the whole reason this case is here. EXT-085.
+    let ran: Rc<RefCell<Vec<u8>>> = Rc::default();
+    let mut api = ExtensionApi::new();
+    let r = ran.clone();
+    api.on_cache_warming_decision(move |_, _| {
+        r.borrow_mut().push(1);
+        Outcome::handled(json!({"action": "warm"}))
+    });
+    let r = ran.clone();
+    api.on_cache_warming_decision(move |_, _| {
+        r.borrow_mut().push(2);
+        Outcome::handled(json!({"action": "stop"}))
+    });
+    // No opinion, in both its shapes: a `noop`, and an action pi's union does not have. Neither
+    // may displace handler 2's answer.
+    let r = ran.clone();
+    api.on_cache_warming_decision(move |_, _| {
+        r.borrow_mut().push(3);
+        Outcome::noop()
+    });
+    let r = ran.clone();
+    api.on_cache_warming_decision(move |_, _| {
+        r.borrow_mut().push(4);
+        Outcome::handled(json!({"action": "skip"}))
+    });
+    let decision = json!({
+        "warmCost": 0.004, "missCost": 0.42, "continuationProbability": 1.0, "action": "warm"
+    })
+    .to_string();
+    let RawOutcome::Handled(h) = api.dispatch(36, &[&decision], &ctx) else {
+        panic!("the last readable action is returned")
+    };
+    assert_eq!(serde_json::from_str::<Value>(&h).unwrap()["action"], "stop");
+    assert_eq!(
+        *ran.borrow(),
+        vec![1, 2, 3, 4],
+        "no short-circuit: pi assigns inside the loop and runs every handler"
+    );
+
+    // The payload a handler sees is pi's four `Pick`ed fields, parsed. Named so the tuple reads
+    // as the event's own field order rather than as four anonymous numbers.
+    type SeenDecision = (f64, f64, f64, String);
+    let seen: Rc<RefCell<Option<SeenDecision>>> = Rc::default();
+    let mut api = ExtensionApi::new();
+    let s2 = seen.clone();
+    api.on_cache_warming_decision(move |e, _| {
+        *s2.borrow_mut() = Some((
+            e.warm_cost,
+            e.miss_cost,
+            e.continuation_probability,
+            e.action,
+        ));
+        Outcome::noop()
+    });
+    api.dispatch(36, &[&decision], &ctx);
+    assert_eq!(*seen.borrow(), Some((0.004, 0.42, 1.0, "warm".to_string())));
+
     // A notify event: both run, in registration order.
     let order: Rc<RefCell<Vec<u8>>> = Rc::default();
     let mut api = ExtensionApi::new();

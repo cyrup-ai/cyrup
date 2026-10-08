@@ -100,7 +100,7 @@ pub use images::{
     KnownImageApi, OPENROUTER_IMAGES, ProviderImages, generate_images, images_builtin_registry,
     register_images_builtins,
 };
-pub use model::{Modality, Model, ModelCost, ModelCostTier};
+pub use model::{Modality, Model, ModelCost, ModelCostTier, ModelPromptCache, prompt_cache_ttl_ms};
 pub use models_store::{
     InMemoryModelsStore, ModelsStore, ModelsStoreEntry, ModelsStoreOperationOptions,
     ProviderModelsStore,

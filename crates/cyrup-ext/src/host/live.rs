@@ -3317,6 +3317,23 @@ async fn invoke(
             api.call_on_resources_discover(store, cwd, reason).await
         }
         HostEvent::ProjectTrust { cwd } => api.call_on_project_trust(store, cwd).await,
+        // EXT-085 — pi `CacheWarmingDecisionEvent` (`core/cache-warmer.ts:112-115` @v1.0.4) is a
+        // `Pick` of exactly these four fields, camelCase on the wire. Do NOT widen it: upstream
+        // withholds `phase`, `expectedSavings` and `economicsAvailable` on purpose.
+        HostEvent::CacheWarmingDecision {
+            warm_cost,
+            miss_cost,
+            continuation_probability,
+            action,
+        } => {
+            let decision = cache_warming_decision_json(
+                *warm_cost,
+                *miss_cost,
+                *continuation_probability,
+                action,
+            );
+            api.call_on_cache_warming_decision(store, &decision).await
+        }
         // EXT-015: the four session-lifecycle events keep their discriminating fields.
         HostEvent::SessionBeforeSwitch {
             reason,
@@ -3637,6 +3654,29 @@ fn decode_patch(kind: EventKind, v: Value) -> Option<EventPatch> {
         // `handled` channel, not `mutate`); ignore.
         _ => None,
     }
+}
+
+/// The `decision-json` a `cache_warming_decision` guest receives (pi `CacheWarmingDecisionEvent`,
+/// `core/cache-warmer.ts:112-115` @v1.0.4): upstream's `Pick` of EXACTLY four fields, camelCase.
+///
+/// Named rather than inlined so the SHAPE is testable without a store. `phase`,
+/// `expectedSavings` and `economicsAvailable` are withheld on purpose — upstream's comment is
+/// *"Everything else an extension might want (model, idle state, context size) is on the
+/// context."* A test asserts the key set, because a widened payload is not a compile error and
+/// extensions would start depending on a field pi does not promise.
+pub(crate) fn cache_warming_decision_json(
+    warm_cost: f64,
+    miss_cost: f64,
+    continuation_probability: f64,
+    action: &str,
+) -> String {
+    serde_json::json!({
+        "warmCost": warm_cost,
+        "missCost": miss_cost,
+        "continuationProbability": continuation_probability,
+        "action": action,
+    })
+    .to_string()
 }
 
 #[cfg(test)]

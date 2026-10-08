@@ -142,6 +142,7 @@ async fn a_custom_entry_replays_between_the_messages_that_surround_it() {
             ReplayItem::CustomEntry(_) => "custom-entry",
             ReplayItem::CacheMiss(_) => "cache-miss",
             ReplayItem::CompactionCost { .. } => "compaction-cost",
+            ReplayItem::UsageEntry(_) => "usage-entry",
         })
         .collect();
     assert_eq!(
@@ -208,5 +209,110 @@ async fn compaction_admission_applies_to_custom_entries_too() {
         matches!(items.first(), Some(ReplayItem::Message(m))
             if matches!(m.as_ref(), cyrup_session::agent_message::AgentMessage::CompactionSummary(_))),
         "the governing compaction still heads the stream: {items:#?}"
+    );
+}
+
+/// SESS-051/SEAM-131 — the SECOND entry kind pi's replay flat-map admits whole:
+///
+/// ```ts
+/// // interactive-mode.ts:4058 @v1.0.4
+/// if (entry.type === "custom" || (entry.type === "usage" && entry.kind === "cache_warm")) {
+///     return [entry];
+/// }
+/// ```
+///
+/// A `usage` entry projects no message (`sessionEntryToContextMessages` has no `usage` arm), so
+/// without its own arm it cannot reach a front-end on `/resume` at all and a resumed session shows
+/// none of its past warms — the exact hole EXT-041 closed for `custom` entries. The JSON carried is
+/// the same JSON the live `entry_appended` event carries, so the front-end's two arms stay one
+/// behaviour.
+///
+/// A usage entry of any other `kind` is NOT admitted, matching pi's guard: it is bookkeeping with no
+/// renderer.
+///
+/// **Red-proved** by deleting the `KnownEntry::Usage` admission from `replay_items`: FAILED with an
+/// empty `usage-entry` list while `a_custom_entry_replays_between_the_messages_that_surround_it`
+/// kept passing. Also **red-proved** by dropping the `kind == "cache_warm"` guard: FAILED on the
+/// second half, which then admitted the bookkeeping row too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cache_warm_usage_entry_replays_between_the_messages_that_surround_it() {
+    use cyrup_core::Usage;
+
+    let warm_usage = Usage {
+        output: 1,
+        cache_read: 42_000,
+        total_tokens: 42_001,
+        ..Usage::default()
+    };
+
+    let tmp = TempDir::new().unwrap();
+    let session = session_over(&tmp, |mgr| {
+        mgr.append_message(user("before")).unwrap();
+        mgr.append_usage(
+            "cache_warm",
+            "anthropic".into(),
+            "claude-sonnet-5".into(),
+            warm_usage.clone(),
+            Some("extension override"),
+        )
+        .unwrap();
+        // Bookkeeping usage of another kind: pi's guard excludes it.
+        mgr.append_usage(
+            "something_else",
+            "anthropic".into(),
+            "claude-sonnet-5".into(),
+            warm_usage,
+            None,
+        )
+        .unwrap();
+        mgr.append_message(user("after")).unwrap();
+    })
+    .await;
+
+    let items = session.replay_items().await;
+
+    let warms: Vec<&Value> = items
+        .iter()
+        .filter_map(|i| match i {
+            ReplayItem::UsageEntry(v) => Some(v),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        warms.len(),
+        1,
+        "exactly the `cache_warm` entry is admitted, not the other-kind one: {items:#?}"
+    );
+    assert_eq!(warms[0].get("type").and_then(Value::as_str), Some("usage"));
+    assert_eq!(
+        warms[0].get("kind").and_then(Value::as_str),
+        Some("cache_warm")
+    );
+    assert_eq!(
+        warms[0].get("note").and_then(Value::as_str),
+        Some("extension override"),
+        "the note the notice renders travels with the entry"
+    );
+
+    // Stream ORDER: pi's flat-map keeps the entry where the branch put it.
+    let positions: Vec<&str> = items
+        .iter()
+        .map(|i| match i {
+            ReplayItem::Message(_) => "message",
+            ReplayItem::CustomEntry(_) => "custom-entry",
+            ReplayItem::CacheMiss(_) => "cache-miss",
+            ReplayItem::CompactionCost { .. } => "compaction-cost",
+            ReplayItem::UsageEntry(_) => "usage-entry",
+        })
+        .collect();
+    assert_eq!(
+        positions,
+        vec!["message", "usage-entry", "message"],
+        "branch order preserved, and the other-kind usage entry contributes nothing: {items:#?}"
+    );
+    assert_eq!(
+        user_texts(&items),
+        vec!["before".to_string(), "after".to_string()],
+        "the messages around it are untouched: {items:#?}"
     );
 }

@@ -1,11 +1,11 @@
-// cyrup:ext@0.17.0 — the versioned WIT world (arch-08 §4.1).
+// cyrup:ext@0.18.0 — the versioned WIT world (arch-08 §4.1).
 //
 // Single source of truth, shared verbatim by the host (`wasmtime::component::bindgen!`)
 // and the guest (`wit-bindgen` in cyrup-ext-sdk). Open-shaped values (tool params, message
 // lists, patches, custom payloads) cross as `string` carrying serde_json; fixed-shape control
 // values (ids, enums, exec results) are real WIT records for type safety (arch-08 §4.1).
 //
-// The `events` interface exports 38 `on-*` hooks. THIRTY-THREE of them mirror pi's `pi.on(...)`
+// The `events` interface exports 39 `on-*` hooks. THIRTY-THREE of them mirror pi's `pi.on(...)`
 // catalog one-for-one (`extensions/types.ts:1190-1231` @v0.83.0 — 33 `on(event: "…")` overloads,
 // hand re-derived; the range `:1198-1239` this header used to cite corresponds to NO upstream
 // version and was fabricated, EXT-036). `before_provider_headers` (EXT-009, upstream `:1212`) and
@@ -22,7 +22,12 @@
 // `ui.subscribe-branch-change` import (EXT-064). Count the `on-*` lines, not the pi events: the two
 // numbers are 35 and 33. Three more mirror events pi added AFTER that tag and cyrup ported in the
 // 0.11 -> 0.12 batch below: `ui_prompt_start`/`ui_prompt_end` (v0.84.4) and `context_with_system`
-// (v0.87.0) — so 38 `on-*` exports against 36 pi events at v0.87.1.
+// (v0.87.0). The 39th, `on-cache-warming-decision` (EXT-085), mirrors a pi event too, but the one
+// pi declares OUTSIDE `extensions/types.ts`: `CacheWarmingDecisionEvent` lives in
+// `core/cache-warmer.ts:112-115` @v1.0.4 and is pulled into the `ExtensionEvent` union in
+// `core/extensions/types.ts` @v1.0.4, with its `on(event: …)` overload at `:1589-1591` — so it is
+// absent from the overload band this header counts and has to be added by hand. That makes it
+// 39 `on-*` exports against 37 pi events at v1.0.4.
 // The host calls only the exports a guest subscribed to (the subscription gate, R-08-034).
 //
 // VERSIONING (EXT-028): this package version and `cyrup_ext::HOST_WORLD` move TOGETHER, and ANY
@@ -145,7 +150,17 @@
 // `host-bash.is-bash-cancelled` ports `BashOperations.exec`'s) arrive in the same batch and are
 // ADDITIVE — neither would have forced a bump on its own (see the "ADDED WITHOUT A BUMP"
 // paragraph above).
-package cyrup:ext@0.17.0;
+// 0.17 -> 0.18 is the `cache_warming_decision` hook (pi `CacheWarmingDecisionEvent` /
+// `CacheWarmingDecisionEventResult`, `core/cache-warmer.ts:112-120` @v1.0.4, reduced by
+// `emitCacheWarmingDecision`, `core/extensions/runner.ts:1121-1142`), an EXPORT ADDITION:
+// `events.on-cache-warming-decision` is NEW, so a 0.17 guest exports nothing under that name and
+// would die inside wasmtime on the link — `check_world` turns that into a typed
+// `ExtError::WorldVersion` instead (the 0.16 -> 0.17 `route-model` and 0.9 -> 0.10
+// `bash-operations-exec` precedents). It is an EVENT WITH A RESULT, so it rides the existing
+// `hook-outcome` return rather than needing a new variant: `handled({"action": "warm" | "stop"})`
+// overrides the host's own economics verdict, `noop` leaves it alone. Nothing else moves in this
+// batch — no new import, no re-signed export.
+package cyrup:ext@0.18.0;
 
 // ---------------------------------------------------------------------------
 // Serializable mirrors of cyrup-core. JSON-as-string at the seam (arch-08 §4.1).
@@ -667,6 +682,20 @@ interface events {
   // (`options.trustStore.set(options.cwd, trusted)`, core/project-trust.ts:63-65) — so a handler
   // that cannot see the cwd cannot key an allowlist or honour `remember` (EXT-043).
   on-project-trust:         func(cwd: string) -> hook-outcome;    // decide {trusted, remember}
+  // cache_warming_decision (pi `CacheWarmingDecisionEvent`, `core/cache-warmer.ts:112-115`
+  // @v1.0.4): fired before each prompt-cache refresh with the host's own warm-or-stop verdict
+  // filled in. `decision-json` is upstream's `Pick` of EXACTLY four fields —
+  // `{warmCost, missCost, continuationProbability, action}`, camelCase. `phase`,
+  // `expectedSavings` and `economicsAvailable` are withheld on purpose: upstream's comment is
+  // "Everything else an extension might want (model, idle state, context size) is on the
+  // context." The answer is `hook-outcome::handled({"action": "warm" | "stop"})` (pi
+  // `CacheWarmingDecisionEventResult`, `:117-120`); `noop` means no opinion. Across extensions
+  // the LAST readable action wins, which is NOT `on-project-trust`'s first-decides rule —
+  // `emitCacheWarmingDecision` assigns inside its loop and never returns early
+  // (`runner.ts:1131`). A handler that faults, traps or overruns the invocation budget is skipped
+  // and the host's own action stands (pi's `emitError`-and-continue, `:1134-1141`); the budget is
+  // what stops a hanging handler from sitting on a refresh that has a deadline. EXT-085.
+  on-cache-warming-decision: func(decision-json: string) -> hook-outcome;  // override {action}
 
   // session control hooks (pi's overload block, extensions/types.ts:1190-1231 @v0.83.0):
   // before_* are block/mutate, the rest notify.

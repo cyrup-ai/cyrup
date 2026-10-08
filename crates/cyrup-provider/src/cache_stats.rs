@@ -118,9 +118,12 @@ impl ModelPriceSource for NoPrices {
     }
 }
 
-/// The only two facts the scan reads out of a session entry — see the module note on why this
-/// exists instead of a `SessionEntry`.
-#[derive(Clone, Copy, Debug)]
+/// The facts the scan reads out of a session entry — see the module note on why this exists
+/// instead of a `SessionEntry`.
+///
+/// Not `Copy`: [`Self::CacheWarm`] carries an owned `${provider}/${model}` key, because a warm's
+/// facts live on the usage ENTRY rather than on any [`AssistantMessage`] the adapter could borrow.
+#[derive(Clone, Debug)]
 pub enum CacheScanEntry<'a> {
     /// A settled assistant turn (pi `entry.type === "message" && entry.message.role ===
     /// "assistant"`, `cache-stats.ts:117`).
@@ -129,6 +132,36 @@ pub enum CacheScanEntry<'a> {
     /// legitimately changed, so the next turn's prompt is new content rather than re-billed
     /// content.
     Reset,
+    /// A persisted cache-warming `usage` entry — pi's third scan arm (`cache-stats.ts:120-130`
+    /// @v1.0.4):
+    ///
+    /// ```ts
+    /// if (entry.type === "usage" && entry.kind === "cache_warm") {
+    ///     const promptTokens = entry.usage.input + entry.usage.cacheRead + entry.usage.cacheWrite;
+    ///     if (promptTokens > 0) {
+    ///         prev = { promptTokens, modelKey: `${entry.provider}/${entry.model}`,
+    ///                  timestamp: Date.parse(entry.timestamp), reportedCache: true };
+    ///     }
+    /// }
+    /// ```
+    ///
+    /// A warm REFRESHED the cache, so it becomes the previous request the next turn is compared
+    /// against. Without this arm the warm reads as a hole in the scan and the next assistant turn —
+    /// which legitimately cache-READ everything the warm refreshed — is mis-reported as a full cache
+    /// miss, inverting the very saving the warmer bought.
+    ///
+    /// Unlike [`Self::Assistant`], `reported_cache` is set to `true` unconditionally rather than
+    /// sticky-or'd: the warm request is a cache read by construction.
+    CacheWarm {
+        /// `usage.input + usage.cacheRead + usage.cacheWrite`. A zero here leaves the previous
+        /// request untouched, as pi's `if (promptTokens > 0)` does.
+        prompt_tokens: u64,
+        /// `${provider}/${model}` of the warm, from the ENTRY — the facts are not on any assistant
+        /// message, which is why this variant has to carry them.
+        model_key: String,
+        /// `Date.parse(entry.timestamp)` — epoch milliseconds.
+        timestamp: i64,
+    },
     /// Anything else — user messages, tool results, settings entries. Ignored, and specifically NOT
     /// a reset.
     Other,
@@ -252,6 +285,21 @@ pub fn scan(entries: &[CacheScanEntry<'_>], models: &dyn ModelPriceSource) -> Ca
             // re-bill the full prompt and SHOULD be counted.
             CacheScanEntry::Reset => {
                 out.prev = None;
+            }
+            // `:120-130` — a warm refreshed the cache; it IS the previous request from here on.
+            CacheScanEntry::CacheWarm {
+                prompt_tokens,
+                model_key,
+                timestamp,
+            } => {
+                if *prompt_tokens > 0 {
+                    out.prev = Some(PreviousRequest {
+                        prompt_tokens: *prompt_tokens,
+                        model_key: model_key.clone(),
+                        timestamp: *timestamp,
+                        reported_cache: true,
+                    });
+                }
             }
             CacheScanEntry::Other => {}
             CacheScanEntry::Assistant(message) => {

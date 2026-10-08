@@ -210,6 +210,7 @@ mod tests {
             reasoning: false,
             input: Vec::new(),
             cost: crate::model::ModelCost::default(),
+            prompt_cache: None,
             context_window: 0,
             max_tokens: 0,
             sampling_params: None,

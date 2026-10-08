@@ -46,7 +46,23 @@ use cyrup_provider::faux::{FauxProvider, faux_assistant_message, faux_text};
 use cyrup_session_svc::{AgentSession, SessionBuilder, SessionConfig, SessionTarget};
 use ratatui::backend::TestBackend;
 
-/// `u1 → a1 → usage → thinking_level_change → context_edit(omit a1) → u2`, as pi v0.87 writes it.
+/// `u1 → a1 → usage → usage(malformed) → thinking_level_change → context_edit(omit a1) → u2`, as
+/// pi writes it.
+///
+/// **The first `usage` row is COMPLETE** (`kind`/`provider`/`model`/`usage`, pi `UsageEntry`
+/// @v1.0.4), so it promotes to `KnownEntry::Usage` and exercises `dag_display`'s KNOWN arm. SESS-051
+/// promoted the variant; before it, every `usage` row — including this fixture's original one, which
+/// carried no `kind` — demoted to `Entry::Unknown` and this test passed through the `Entry::Unknown`
+/// guard instead. It would have kept passing after the promotion, for the wrong reason, so the
+/// fixture had to be re-pointed.
+///
+/// **The second is deliberately malformed** (no `kind`), so it still demotes, pinning the degraded
+/// path `dag_display` keeps beside the known arm. Both must be hidden in every filter mode.
+///
+/// The complete row needs its `usage.cost` block: `cyrup_core::Usage::cost` is REQUIRED (pi always
+/// writes it), so a `usage` row without one fails `from_value::<KnownEntry>` and demotes. The
+/// first attempt at this fixture omitted it and the re-proof below silently did not fire — which is
+/// the same trap, one level down.
 fn pi_session(dir: &Path, cwd: &Path) -> std::path::PathBuf {
     let ts = "2026-01-01T00:00:00.000Z";
     let assistant = serde_json::to_value(Message::Assistant(faux_assistant_message(
@@ -58,8 +74,9 @@ fn pi_session(dir: &Path, cwd: &Path) -> std::path::PathBuf {
         serde_json::json!({"type": "session", "version": 3, "id": "0199aaaa-bbbb-7ccc-8ddd-eeeeffff0003", "timestamp": ts, "cwd": cwd}),
         serde_json::json!({"type": "message", "id": "u1", "parentId": null, "timestamp": ts, "message": {"role": "user", "content": "first question", "timestamp": 1}}),
         serde_json::json!({"type": "message", "id": "a1", "parentId": "u1", "timestamp": ts, "message": assistant}),
-        serde_json::json!({"type": "usage", "id": "w1", "parentId": "a1", "timestamp": ts, "usage": {"input": 10, "output": 0, "cacheRead": 9000, "cacheWrite": 0, "totalTokens": 9010}}),
-        serde_json::json!({"type": "thinking_level_change", "id": "t1", "parentId": "w1", "timestamp": ts, "thinkingLevel": "high"}),
+        serde_json::json!({"type": "usage", "id": "w1", "parentId": "a1", "timestamp": ts, "kind": "cache_warm", "provider": "anthropic", "model": "claude-sonnet-5", "usage": {"input": 10, "output": 1, "cacheRead": 9000, "cacheWrite": 0, "totalTokens": 9011, "cost": {"input": 0, "output": 0.000015, "cacheRead": 0.0027, "cacheWrite": 0, "total": 0.002715}}}),
+        serde_json::json!({"type": "usage", "id": "w2", "parentId": "w1", "timestamp": ts, "usage": {"input": 10, "output": 0, "cacheRead": 9000, "cacheWrite": 0, "totalTokens": 9010}}),
+        serde_json::json!({"type": "thinking_level_change", "id": "t1", "parentId": "w2", "timestamp": ts, "thinkingLevel": "high"}),
         serde_json::json!({"type": "context_edit", "id": "e1", "parentId": "t1", "timestamp": ts, "targetId": "a1", "replacement": null}),
         serde_json::json!({"type": "message", "id": "u2", "parentId": "e1", "timestamp": ts, "message": {"role": "user", "content": "second question", "timestamp": 2}}),
     ];
@@ -84,7 +101,8 @@ async fn resumed(dir: &Path) -> Arc<AgentSession> {
 
 /// The row's Verify, through the production `/tree` command: in `default` neither the `usage` nor
 /// the `context_edit` (nor the thinking change) is a row; `all` brings the `context_edit` back with
-/// pi's `[context omit: <targetId>]` text; the `usage` entry is in no view at all.
+/// pi's `[context omit: <targetId>]` text; NEITHER `usage` entry — the promoted one or the
+/// malformed one — is in any view at all.
 #[tokio::test]
 async fn tree_hides_usage_always_and_context_edit_outside_the_all_filter() {
     let dir = tempfile::tempdir().unwrap();
@@ -122,7 +140,8 @@ async fn tree_hides_usage_always_and_context_edit_outside_the_all_filter() {
     );
     assert!(
         !all_view.contains("(entry)"),
-        "a `usage` entry is dropped before any filter mode is consulted (`:341`):\n{all_view}"
+        "a `usage` entry is dropped before any filter mode is consulted (`:341`), whether it \
+         promoted to `KnownEntry::Usage` or demoted to `Entry::Unknown`:\n{all_view}"
     );
 }
 

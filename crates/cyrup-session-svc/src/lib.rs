@@ -20,6 +20,7 @@ mod attribution;
 pub mod auth_guidance;
 mod bash;
 mod builder;
+pub mod cache_warmer;
 mod command;
 mod compact;
 mod error;
@@ -48,6 +49,13 @@ pub use bash::{BashChunkSink, BashOptions, BashResult};
 pub use builder::{
     ExtensionFlagValue, NoTools, SessionBuilder, SessionConfig, SessionTarget, TrustPromptFn,
     extension_discovery_roots,
+};
+pub use cache_warmer::{
+    CacheWarmRequest, CacheWarmStream, CacheWarmer, CacheWarmingAction, CacheWarmingDecider,
+    CacheWarmingDecision, CacheWarmingDecisionEvent, CacheWarmingHost, CacheWarmingPhase,
+    CacheWarmingState, CacheWarmingStatus, ExtensionCacheWarmingDecider, IsCurrent, PiDecision,
+    ProviderWarmStream, cache_warming_delay_ms, format_cache_warming_decision_time,
+    format_cache_warming_status, format_cache_warming_usage, is_replayable, last_prompt_tokens,
 };
 pub use command::{SessionCommand, SessionCommandOutput};
 /// The message carried on [`AgentSessionEvent::MessageStart`] / [`AgentSessionEvent::MessageUpdate`]

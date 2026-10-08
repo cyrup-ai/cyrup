@@ -313,9 +313,9 @@ fn tool_execution_update_and_end_carry_the_tool_name_and_the_update_carries_args
 fn before_provider_headers_patches_in_place_and_a_null_value_deletes_the_header() {
     assert_eq!(
         EventKind::COUNT,
-        36,
+        37,
         "31 + before_provider_headers + session_info_changed + ui_prompt_start + ui_prompt_end \
-         + context_with_system"
+         + context_with_system + cache_warming_decision (EXT-085)"
     );
     assert_eq!(
         EventKind::from_u8(31),
