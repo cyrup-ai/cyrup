@@ -2500,15 +2500,31 @@ where
     None
 }
 
-/// `parseJsonConfig(raw)` = `JSON.parse(stripJsonComments(raw, { trailingCommas: true }))`
-/// (MCP-051).
+/// `stripUtf8Bom(raw)` — `utils.ts:9` (pi-mcp-adapter `2ccf648`): drop one leading U+FEFF.
+///
+/// MCP-590. `read_to_string` keeps a BOM as a leading `\u{feff}`, which neither the JSONC parser
+/// nor `toml` accepts before the root, so without this a BOM-prefixed config fails to parse and the
+/// load ladder degrades it to `{ mcpServers: {} }`.
+#[must_use]
+pub fn strip_utf8_bom(raw: &str) -> &str {
+    raw.strip_prefix('\u{feff}').unwrap_or(raw)
+}
+
+/// `parseJsonWithComments(raw)` =
+/// `JSON.parse(stripJsonComments(stripUtf8Bom(raw), { trailingCommas: true }))` (`utils.ts:13-15`,
+/// pi-mcp-adapter `2ccf648`; MCP-051, BOM strip MCP-590).
 ///
 /// JSONC comes from `cyrup_permission_system::jsonc` — the same parser
 /// `cyrup_permission_system::manager::read_configured_mcp_server_names` runs over this exact file,
 /// so the permission gate and the adapter agree about which servers exist **by construction**.
-/// Re-porting `strip-json-comments` here would let the two disagree, silently.
+/// Re-porting `strip-json-comments` here would let the two disagree, silently. The BOM strip is
+/// the one step outside the shared parser, and the permission reader applies it too (MCP-590).
 pub fn parse_json_config(raw: &str, path: &str) -> Result<RawJson, String> {
-    cyrup_permission_system::jsonc::parse_config_into::<RawJson>(raw, path, "MCP config")
+    cyrup_permission_system::jsonc::parse_config_into::<RawJson>(
+        strip_utf8_bom(raw),
+        path,
+        "MCP config",
+    )
 }
 
 /// The typed read of one JSONC config document, split out so the source ladder can apply it per
@@ -3207,7 +3223,11 @@ pub fn resolve_opencode_project_candidate(cwd: &Path) -> PathBuf {
     }
 }
 
-/// `readImportedConfig(path)` = `path.endsWith(".toml") ? parseToml(raw) : parseJsonConfig(raw)`.
+/// `readImportedConfig(path)` =
+/// `path.endsWith(".toml") ? parseToml(stripUtf8Bom(raw)) : parseJsonWithComments(raw)`
+/// (`config.ts:1040-1043`, pi-mcp-adapter `2ccf648`). Both legs strip a BOM (MCP-590): the JSON leg
+/// inside [`parse_json_config`], the TOML leg here. The `toml` crate already accepts a leading BOM,
+/// so the TOML strip changes nothing today; it is kept so the leg does not depend on that.
 /// The only TOML path in the whole package is `~/.codex/config.toml`.
 fn read_imported_config(path: &Path) -> Result<RawJson, String> {
     let raw = std::fs::read_to_string(path).map_err(|error| error.to_string())?;
@@ -3216,7 +3236,7 @@ fn read_imported_config(path: &Path) -> Result<RawJson, String> {
         .is_some_and(|ext| ext.eq_ignore_ascii_case("toml"))
     {
         // `toml`'s deserializer feeds map entries in document order, so `RawJson` keeps it.
-        toml::from_str::<RawJson>(&raw).map_err(|error| error.to_string())
+        toml::from_str::<RawJson>(strip_utf8_bom(&raw)).map_err(|error| error.to_string())
     } else {
         parse_json_config(&raw, &path.to_string_lossy())
     }
@@ -4417,7 +4437,12 @@ pub fn read_raw_config_object(path: &Path) -> McpResult<RawObject> {
         return Ok(RawObject::new());
     }
     let text = std::fs::read_to_string(path).map_err(|error| config_read_error(path, &error))?;
-    if text.trim().is_empty() {
+    // `text.trim() === ""` (`config.ts:1626`, pi-mcp-adapter `2ccf648`). JS `trim` also removes
+    // U+FEFF and `str::trim` does not, so a BOM-only file is empty here too (MCP-590).
+    if text
+        .trim_matches(|c: char| c.is_whitespace() || c == '\u{feff}')
+        .is_empty()
+    {
         return Ok(RawObject::new());
     }
     let parsed = parse_json_config(&text, &path.to_string_lossy())
@@ -7798,6 +7823,80 @@ mod tests {
                 Some("mcp.json")
             );
         }
+    }
+
+    // -- MCP-590 -----------------------------------------------------------------------------
+
+    /// `EF BB BF` — the UTF-8 encoding of U+FEFF, as PowerShell's `>` writes it.
+    const UTF8_BOM: &[u8] = b"\xEF\xBB\xBF";
+
+    fn write_with_bom(fixture: &Fixture, path: &Path, text: &str) {
+        let mut bytes = UTF8_BOM.to_vec();
+        bytes.extend_from_slice(text.as_bytes());
+        fixture.write(path, "");
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
+    fn strip_utf8_bom_drops_exactly_one_leading_bom() {
+        // `utils.ts:9-11` at pi-mcp-adapter `2ccf648`.
+        assert_eq!(strip_utf8_bom("\u{feff}{}"), "{}");
+        assert_eq!(strip_utf8_bom("\u{feff}\u{feff}{}"), "\u{feff}{}");
+        assert_eq!(strip_utf8_bom("{}\u{feff}"), "{}\u{feff}");
+        assert_eq!(strip_utf8_bom("{}"), "{}");
+    }
+
+    #[test]
+    fn a_bom_prefixed_config_loads_its_servers() {
+        let fixture = Fixture::new();
+        write_with_bom(
+            &fixture,
+            &fixture.user_path(),
+            "// jsonc\n{\"mcpServers\":{\"bom\":{\"command\":\"x\"}}}",
+        );
+
+        let loaded = fixture.context().load();
+        assert!(loaded.config.mcp_servers.contains_key("bom"));
+        assert!(
+            loaded.diagnostics.is_empty(),
+            "no parse warning: {:?}",
+            loaded.diagnostics
+        );
+    }
+
+    #[test]
+    fn a_bom_prefixed_toml_import_loads_its_servers() {
+        let fixture = Fixture::new();
+        // `readImportedConfig`'s TOML leg, `config.ts:1042` at pi-mcp-adapter `2ccf648`.
+        write_with_bom(
+            &fixture,
+            &fixture.home.join(".codex").join("config.toml"),
+            "[mcp_servers.codexbom]\ncommand = \"x\"\n",
+        );
+        fixture.write(
+            &fixture.user_path(),
+            r#"{"mcpServers":{},"imports":["codex"]}"#,
+        );
+
+        let loaded = fixture.context().load();
+        assert!(loaded.config.mcp_servers.contains_key("codexbom"));
+    }
+
+    #[test]
+    fn the_writer_reads_through_a_bom_and_treats_a_bare_bom_as_empty() {
+        let fixture = Fixture::new();
+        let path = fixture.user_path();
+        write_with_bom(
+            &fixture,
+            &path,
+            "{\"mcpServers\":{\"kept\":{\"command\":\"x\"}}}",
+        );
+        let raw = read_raw_config_object(&path).unwrap();
+        assert!(raw.contains_key("mcpServers"));
+
+        // `text.trim() === ""` — JS `trim` removes U+FEFF.
+        write_with_bom(&fixture, &path, " \n");
+        assert!(read_raw_config_object(&path).unwrap().is_empty());
     }
 
     // -- MCP-003 / the degradation contract ----------------------------------------------------

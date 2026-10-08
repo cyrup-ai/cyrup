@@ -442,7 +442,7 @@ Numbering resumes from **`MCP-609`** *(as of the 2026-10-02 pass; now `MCP-616`,
 | `MCP-587` | low | 13 | `tooling` | **not-applicable** | S | which upstream to diff area 13 against, from v5.0.0 onward | [`13`](13-cyrup-mcp.md) |
 | `MCP-588` | low | 13b | `upstream-drift` | **implemented** *(CLOSED 2026-10-08)* | S | the adapter config file rename, and why cyrup does not follow it | [`13b`](13b-mcp-config.md) |
 | `MCP-589` | medium | 13b | `upstream-drift` | **implemented** *(CLOSED 2026-10-04)* | S | an unparseable config is still silently clobbered by any `/mcp` write | [`13b`](13b-mcp-config.md) |
-| `MCP-590` | low | 13b | `upstream-drift` | **missing** | S | a UTF-8 BOM is not stripped before the config parse | [`13b`](13b-mcp-config.md) |
+| `MCP-590` | low | 13b | `upstream-drift` | **implemented** *(CLOSED 2026-10-08)* | S | a UTF-8 BOM is not stripped before the config parse | [`13b`](13b-mcp-config.md) |
 | `MCP-591` | medium | 13b | `upstream-drift` | **implemented** *(CLOSED 2026-10-04)* | L | project-scoped MCP servers: `MCP-096`'s open decision, now settled upstream | [`13b`](13b-mcp-config.md) |
 | `MCP-592` | low | 13b | `not-ported` | **missing** | S | `ServerEntry.description` is unported | [`13b`](13b-mcp-config.md) |
 | `MCP-593` | medium | 13c | `not-ported` | **implemented** *(CLOSED 2026-10-04)* | M | `auth: { provider: "<name>" }` for HTTP MCP servers | [`13c`](13c-mcp-servers.md) |
