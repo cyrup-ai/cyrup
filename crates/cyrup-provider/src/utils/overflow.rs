@@ -4,6 +4,10 @@
 //! exceeding the model's context window. Compaction depends on this signal. The provider-specific
 //! regex set, the non-overflow exclusions, and the three detection cases below are a faithful port
 //! of Pi `overflow.ts:37-62,64,136-149` (pi v0.87.1).
+//!
+//! z.ai reports overflow as `{"code":"1261","message":"Prompt too long"}`, or, from its CN
+//! endpoint, `{"code":"1261","message":"Prompt exceeds max length"}` (Pi `overflow.ts:30`
+//! @ce950d78f), or silently via `usage.input > contextWindow`.
 
 use crate::utils::regexlite::Regex;
 use cyrup_core::{AssistantMessage, StopReason};
@@ -13,8 +17,9 @@ use std::sync::OnceLock;
 /// is the exact Pi source pattern, in Pi's order (the `/i` flag is implicit — [`Regex`] is always
 /// case-insensitive).
 const OVERFLOW_PATTERNS: &[&str] = &[
-    r"prompt (?:is )?too long", // Anthropic and z.ai token overflow
-    r"request_too_large",       // Anthropic request byte-size overflow (HTTP 413)
+    r"prompt (?:is )?too long",   // Anthropic and z.ai token overflow
+    r"prompt exceeds max length", // z.ai CN endpoint token overflow (overflow.ts:39 @ce950d78f)
+    r"request_too_large",         // Anthropic request byte-size overflow (HTTP 413)
     r"input is too long for requested model", // Amazon Bedrock
     r"exceeds the context window", // OpenAI (Completions & Responses API)
     r"exceeds (?:the )?(?:model'?s )?maximum context length(?: of [\d,]+ tokens?|\s*\([\d,]+\))", // OpenAI-compatible proxies (LiteLLM)
@@ -222,12 +227,20 @@ mod tests {
         }
     }
 
-    /// z.ai's `Prompt too long` (no `is`) is overflow, and the bodyless 400/413 pattern is gated on
-    /// the cerebras provider (Pi overflow.ts:38, :64, :141-148).
+    /// z.ai's `Prompt too long` (no `is`) and its CN endpoint's `Prompt exceeds max length` are
+    /// overflow (Pi overflow.ts:38-39 @ce950d78f, test/overflow.test.ts:44-48 @ce950d78f), and the
+    /// bodyless 400/413 pattern is gated on the cerebras provider (Pi overflow.ts:64, :141-148).
     #[test]
     fn zai_prompt_too_long_and_provider_gated_bodyless() {
         assert!(is_context_overflow(
             &err_from("zai", "{\"code\":\"1261\",\"message\":\"Prompt too long\"}"),
+            None
+        ));
+        assert!(is_context_overflow(
+            &err_from(
+                "zai",
+                "400 {\"code\":\"1261\",\"message\":\"Prompt exceeds max length\"}"
+            ),
             None
         ));
         assert!(is_context_overflow(
