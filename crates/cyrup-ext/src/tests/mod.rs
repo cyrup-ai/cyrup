@@ -24,6 +24,8 @@ mod ext_fail_closed;
 mod extension_flag_diagnostics;
 mod extension_name_conflicts;
 mod failed_load_is_transactional;
+#[cfg(feature = "wasm-host")]
+mod guest_virtual_model;
 mod live_provider;
 mod loader;
 mod loader_direct_file;
@@ -51,6 +53,7 @@ mod tool_exposure;
 mod tool_result_structured_content;
 mod tool_result_structured_guest;
 mod trust_gate_order;
+mod virtual_models;
 mod wasm_host;
 #[cfg(feature = "wasm-host")]
 mod wat_guest;

@@ -46,7 +46,8 @@ pub use message::{
     AssistantMessage, Content, Cost, DeferredHandle, Message, ModelThinkingLevel,
     NESTED_CALL_LIMITS, NestedCallHandle, NestedCallLimits, NestedCallRecorder, NestedCallResult,
     NestedCallStatus, NestedToolCallRecord, NestedToolCalls, Sections, StopReason, SystemMessage,
-    TextPhase, TextSignatureV1, ThinkingLevel, ToolCall, UNRESOLVED_API, Usage, combine_usage,
+    TextPhase, TextSignatureV1, ThinkingLevel, ToolCall, UNRESOLVED_API, Usage, VIRTUAL_MODEL_API,
+    combine_usage,
 };
 pub use shared_str::SharedStr;
 pub use tool::{

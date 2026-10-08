@@ -47,6 +47,17 @@ pub enum SessionServiceError {
     #[error("no configured auth for model: {0}")]
     NoConfiguredAuth(String),
 
+    /// A virtual-model routing step refused — the virtual model is not registered, the router
+    /// failed, or it routed to another virtual model or to one without credentials.
+    ///
+    /// Displayed BARE (`{0}`) because the payload is already
+    /// [`cyrup_provider::VirtualModelError`]'s own text, which is byte-for-byte upstream's thrown
+    /// message. It reaches the user as the `errorMessage` of the terminal assistant turn, which is
+    /// upstream's documented outcome for all four cases: *"If `route()` throws, or returns a
+    /// virtual model or a model without credentials, the request ends with an error response."*
+    #[error("{0}")]
+    VirtualModelRouting(String),
+
     /// The pre-send auth preflight refused, carrying **pi's own message text verbatim** — either
     /// `formatNoApiKeyFoundMessage(provider)` (`auth-guidance.ts:22-25`, thrown at
     /// `core/agent-session.ts:1194`) or the OAuth-expiry variant (`:1188-1192`). PROV-037.

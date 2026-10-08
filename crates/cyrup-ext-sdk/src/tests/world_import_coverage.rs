@@ -61,6 +61,11 @@ const SDK_SOURCES: &str = concat!(
     include_str!("../guest.rs"),
     include_str!("../provider.rs"),
     include_str!("../api.rs"),
+    // `descriptor.rs` holds one binding call: `ModelRouteRequest::is_cancelled` is the guest's
+    // only caller of `host-router.is-route-cancelled`, pi's `ModelRouteRequest.signal` as a poll.
+    // It lives there rather than in `ctx/` because the poll is a method on the REQUEST, which is
+    // what pi's `request.signal.aborted` is too.
+    include_str!("../descriptor.rs"),
     include_str!("../widget.rs"),
 );
 
@@ -171,6 +176,7 @@ const IMPORT_INTERFACES: &[&str] = &[
     "provider-stream",
     "host-tool",
     "host-bash",
+    "host-router",
     "oauth",
     "control",
     "session",

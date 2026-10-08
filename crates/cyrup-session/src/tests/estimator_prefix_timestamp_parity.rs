@@ -60,6 +60,7 @@ fn assistant_with_usage(text: &str, timestamp: i64, total_tokens: u64) -> Messag
         response_model: None,
         response_id: None,
         provider_thinking_level: None,
+        thinking_level: None,
         diagnostics: None,
         usage: Usage {
             total_tokens,

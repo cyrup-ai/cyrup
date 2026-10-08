@@ -48,7 +48,17 @@
 //! key changes. Same for `CatalogOverlay`,
 //! which is immutable once built (`remote_catalog.rs`, `from_entries` and read-only accessors).
 //!
-//! A fourth input exists and is deliberately absent: `services.model_config`, the `models.json`
+//! 4. **The virtual-model registry** — mutated in place behind one long-lived `Arc` exactly as
+//!    (2) is, so it carries its own monotonic counter
+//!    ([`cyrup_provider::VirtualModelRegistry::generation`]), bumped by every `register` and every
+//!    `unregister` that removed something. pi has no counterpart because `registerVirtualModel`
+//!    mutates the `Models` collection in place and then fires `refresh({allowNetwork: false})`
+//!    (`model-runtime.ts:971`, `:982`); cyrup recomposes behind this cache, so a registration
+//!    changes none of keys 1-3 and WITHOUT this key the pre-registration catalog is served for the
+//!    rest of the session. The failure is quiet — the virtual model simply never appears in
+//!    `/model` — and it is undetectable by a test that registers before the first catalog read.
+//!
+//! A fifth input exists and is deliberately absent: `services.model_config`, the `models.json`
 //! snapshot composed LAST. It is an immutable `Arc` field on [`AgentSessionServices`], fixed when
 //! the session is built (`services.rs:119`) — there is no writer at all, so it cannot invalidate
 //! anything. That immutability is load-bearing for this cache; if `models.json` ever becomes
@@ -87,6 +97,8 @@ pub(super) struct RegistrySnapshot {
     pub(super) guest_gen: u64,
     /// The catalog overlay this was composed against (held to pin its address).
     pub(super) overlay: Option<Arc<CatalogOverlay>>,
+    /// [`cyrup_provider::VirtualModelRegistry::generation`] at composition time.
+    pub(super) virtual_gen: u64,
     /// The composed, deduped, `models.json`-overlaid registry — pi's `snapshot.all`.
     pub(super) models: Arc<Vec<Model>>,
 }
@@ -98,8 +110,10 @@ impl RegistrySnapshot {
         provider: &Arc<dyn Provider>,
         guest_gen: u64,
         overlay: Option<&Arc<CatalogOverlay>>,
+        virtual_gen: u64,
     ) -> bool {
         self.guest_gen == guest_gen
+            && self.virtual_gen == virtual_gen
             && Arc::ptr_eq(&self.provider, provider)
             && match (self.overlay.as_ref(), overlay) {
                 (None, None) => true,

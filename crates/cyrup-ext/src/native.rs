@@ -503,6 +503,13 @@ pub struct InitApi {
     /// [`InitParts`]' `serde_json::Value`. Taken by the facade with
     /// [`Self::take_live_providers`] before [`Self::into_parts`].
     live_providers: Vec<(String, Arc<dyn cyrup_provider::Provider>)>,
+    /// VIRTUAL models ([`Self::register_virtual_model`]): pi's `pi.registerVirtualModel()` at
+    /// extension-load time, which upstream pushes onto `pendingVirtualModelRegistrations`
+    /// (`extensions/loader.ts:226-228` @v1.0.4). Kept apart from `providers` for the same reason
+    /// `live_providers` is: a `VirtualModelDefinition` carries an `Arc<dyn ModelRouter>` and cannot
+    /// ride in [`InitParts`]' `serde_json::Value`. Taken by the facade with
+    /// [`Self::take_virtual_models`] before [`Self::into_parts`].
+    virtual_models: Vec<cyrup_provider::VirtualModelDefinition>,
     autocomplete: Vec<String>,
     autocomplete_providers: u32,
     /// EXT-018: bus topics, pi's `events` on the same one API object.
@@ -657,6 +664,29 @@ impl InitApi {
         provider: Arc<dyn cyrup_provider::Provider>,
     ) {
         self.live_providers.push((id.into(), provider));
+    }
+
+    /// Register a VIRTUAL model: a selectable catalog entry that routes each request to a physical
+    /// model — pi `pi.registerVirtualModel(model)` (`extensions/types.ts:1865-1873` @v1.0.4).
+    ///
+    /// The selection (`ctx.model`, the branch's `model_change` entries) names the VIRTUAL model;
+    /// assistant messages record the physical model and thinking level the router picked. `provider`
+    /// may be any provider id, including one that already has physical models, and may list several
+    /// virtual models. Registering the same `(provider, id)` again REPLACES the virtual model, in
+    /// place — pi's `Map.set` keeps the key's position and the position is observable in `/model`.
+    ///
+    /// At `init` time this QUEUES, exactly as upstream's pre-bind
+    /// `pendingVirtualModelRegistrations` does (`extensions/loader.ts:226-228`): the model registry
+    /// does not exist yet. The facade hands the queue to the registry after `init` returns, and
+    /// [`crate::registry::ExtensionRegistry::bind_model_registry`] flushes it into the session's
+    /// registry. Post-`init`, use [`LateRegistrar::register_virtual_model`].
+    pub fn register_virtual_model(&mut self, definition: cyrup_provider::VirtualModelDefinition) {
+        self.virtual_models.push(definition);
+    }
+
+    /// The virtual models declared through [`Self::register_virtual_model`], moved out.
+    pub(crate) fn take_virtual_models(&mut self) -> Vec<cyrup_provider::VirtualModelDefinition> {
+        std::mem::take(&mut self.virtual_models)
     }
 
     /// Opt a registered command into argument autocomplete (EXT-035; the native analog of the
@@ -1415,6 +1445,28 @@ pub trait LateRegistrar: Send + Sync {
     /// present. A provider another extension owns is left alone and reads as `false`. Required for
     /// the same reason as [`Self::register_provider_live`].
     fn unregister_provider(&self, id: &str) -> Result<bool, ExtError>;
+
+    /// pi `api.registerVirtualModel` from a live handler or background task
+    /// ([`InitApi::register_virtual_model`] is the `init`-time form). Lands in the session's
+    /// virtual-model registry immediately and bumps its generation, so the next catalog read lists
+    /// it; re-registering a `(provider, id)` REPLACES it in place.
+    ///
+    /// Required for the same reason as [`Self::register_provider_live`]: upstream's post-bind
+    /// `runtime.registerVirtualModel` is a direct call into the model registry
+    /// (`extensions/runner.ts:539`), so an implementor either does the registration or returns an
+    /// `Err` of its own. There is no default that would let a registrar compile and then refuse.
+    fn register_virtual_model(
+        &self,
+        definition: cyrup_provider::VirtualModelDefinition,
+    ) -> Result<(), ExtError>;
+
+    /// pi `api.unregisterVirtualModel(provider, id)` (`extensions/types.ts:1875-1876` @v1.0.4), for
+    /// a virtual model THIS extension registered: removes it and returns whether it was present. A
+    /// pair another extension owns is left alone and reads as `false`.
+    ///
+    /// Scoped to the ONE pair, never to the provider: upstream's docs page states that
+    /// `pi.unregisterProvider()` does not remove virtual models, and the converse holds too.
+    fn unregister_virtual_model(&self, provider: &str, id: &str) -> Result<bool, ExtError>;
 
     /// The extension this handle registers on behalf of. The host binds it at construction, so an
     /// extension holding the handle cannot register under another extension's id — the reason this

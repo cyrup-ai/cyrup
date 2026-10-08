@@ -161,6 +161,16 @@ impl RunCtx {
             }
         };
 
+        // Record the level the request was MADE with on the settled message, before anything
+        // observes it — pi `Object.assign(await response.result(), { thinkingLevel:
+        // config.reasoning ?? "off" })` (`packages/agent/src/agent-loop.ts:408-409`, "Record the
+        // requested level, whichever stream function answered"). `effective_thinking` is read at
+        // the head of this function from the run baseline a `prepare_request` override has already
+        // been folded into, so under a virtual selection this is the ROUTED level. It must land
+        // BEFORE `message_end` is emitted, because that event is what the session persists and what
+        // the routing step later reads back as `previous`/`failed`.
+        let settled = settled.with_thinking_level(effective_thinking);
+
         // The one emission tail. `settled.start` is `Some` iff the stream never yielded a
         // `Start` — the exactly-once decision is the accumulator's, not this function's.
         if let Some(first) = settled.start {

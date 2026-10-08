@@ -31,6 +31,7 @@ pub mod manager;
 pub mod migrate;
 pub mod prompt;
 pub mod store;
+pub mod virtual_models;
 
 pub use agent_message::{
     AgentMessage, BashExecutionMessage, BranchSummaryMessage, CompactionSummaryMessage,

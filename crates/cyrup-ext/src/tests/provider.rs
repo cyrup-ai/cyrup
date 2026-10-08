@@ -27,6 +27,23 @@ impl ModelRegistrySink for FakeSink {
     fn remove_provider(&self, id: &str) {
         self.removes.lock().unwrap().push(id.to_string());
     }
+    fn upsert_virtual_model(
+        &self,
+        definition: &cyrup_provider::VirtualModelDefinition,
+    ) -> Result<(), String> {
+        self.upserts.lock().unwrap().push(format!(
+            "virtual:{}/{}",
+            definition.spec.provider.as_str(),
+            definition.spec.id.as_str()
+        ));
+        Ok(())
+    }
+    fn remove_virtual_model(&self, provider: &str, id: &str) {
+        self.removes
+            .lock()
+            .unwrap()
+            .push(format!("virtual:{provider}/{id}"));
+    }
 }
 
 #[test]

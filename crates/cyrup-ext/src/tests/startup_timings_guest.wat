@@ -1,4 +1,4 @@
-;; AGENT-027 fixture: the smallest component that instantiates against the `cyrup:ext@0.16.0`
+;; AGENT-027 fixture: the smallest component that instantiates against the `cyrup:ext@0.17.0`
 ;; `extension` world and whose `init` succeeds, so the host reaches its `${path} factory` timing mark.
 ;; It imports nothing and exports every `events` function plus `init`. Each export returns a
 ;; pointer to zeroed memory, which the canonical ABI reads as the first case / empty value
@@ -31,6 +31,7 @@
     (func (export "render-result") (param i32 i32 i32 i32 i32 i32) (result i32) i32.const 16)
     (func (export "transform-markdown") (param i32 i32 i32 i32) (result i32) i32.const 16)
     (func (export "bash-operations-exec") (param i32 i32 i32 i32 i32 i32 i32 i32) (result i32) i32.const 16)
+    (func (export "route-model") (param i32 i32 i32 i32 i32 i32 i32 i32) (result i32) i32.const 16)
     (func (export "on-terminal-input") (param i32 i32) (result i32) i32.const 16)
     (func (export "on-tool-call") (param i32 i32 i32 i32 i32 i32 i32 i32 i32) (result i32) i32.const 16)
     ;; 21 flat parameters exceed the canonical ABI's 16, so the arguments arrive as ONE pointer to a memory record.
@@ -117,6 +118,8 @@
     (canon lift (core func $i "transform-markdown") (memory $mem) (realloc $realloc)))
   (func $bash-operations-exec (param "call-id" string) (param "command" string) (param "cwd" string) (param "opts-json" string) (result (result (option s32) (error string)))
     (canon lift (core func $i "bash-operations-exec") (memory $mem) (realloc $realloc)))
+  (func $route-model (param "provider" string) (param "id" string) (param "route-id" string) (param "request-json" string) (result (result string (error string)))
+    (canon lift (core func $i "route-model") (memory $mem) (realloc $realloc)))
   (func $on-terminal-input (param "data" string) (result (option $terminal-input-result))
     (canon lift (core func $i "on-terminal-input") (memory $mem) (realloc $realloc)))
   (func $on-tool-call (param "call-id" string) (param "name" string) (param "input-json" string) (param "parent-tool-call-id" (option string)) (result $hook-outcome)
@@ -212,6 +215,7 @@
     (export "render-result" (func $render-result))
     (export "transform-markdown" (func $transform-markdown))
     (export "bash-operations-exec" (func $bash-operations-exec))
+    (export "route-model" (func $route-model))
     (export "on-terminal-input" (func $on-terminal-input))
     (export "on-tool-call" (func $on-tool-call))
     (export "on-tool-result" (func $on-tool-result))
@@ -252,6 +256,6 @@
     (export "on-session-tree" (func $on-session-tree))
     (export "bus-deliver" (func $bus-deliver))
   )
-  (export "cyrup:ext/events@0.16.0" (instance $events))
+  (export "cyrup:ext/events@0.17.0" (instance $events))
   (export "init" (func $init))
 )

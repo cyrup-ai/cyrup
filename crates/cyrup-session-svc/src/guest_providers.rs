@@ -73,6 +73,67 @@ pub struct GuestProviderRegistry {
     /// [`GuestProviderRegistry::begin_late_restore`]): everything registered before is covered by
     /// the startup restore, which would only supersede a second one.
     restore_started: AtomicBool,
+    /// The session's virtual-model registry and the catalog its registrations validate against,
+    /// once [`GuestProviderRegistry::attach_virtual_models`] bound them.
+    ///
+    /// This slot exists because `ModelRegistrySink` is ONE trait with ONE bind — upstream carries
+    /// all five provider actions in one `providerActions` bag (`extensions/runner.ts:413-418`) — so
+    /// the sink that answers `upsert_provider` is also the sink that answers
+    /// `upsert_virtual_model`. The registry is pi's `ModelRuntime.virtualModels`
+    /// (`model-runtime.ts:179`); the catalog is the two reads pi's `registerVirtualModel` takes off
+    /// `this` (`:957`, `:962-968`).
+    virtual_models: Mutex<Option<VirtualModelSink>>,
+}
+
+/// What [`GuestProviderRegistry::attach_virtual_models`] binds: the registry a registration lands
+/// in, and the catalog its two validations read.
+struct VirtualModelSink {
+    registry: Arc<cyrup_provider::VirtualModelRegistry>,
+    catalog: Arc<dyn cyrup_provider::VirtualModelCatalog>,
+}
+
+/// The attached snapshot with the LIVE guest-provider catalog layered over it, so a provider
+/// registered after the session was built still answers as physical.
+struct LiveGuestCatalog<'a> {
+    guest: &'a GuestProviderRegistry,
+    snapshot: &'a dyn cyrup_provider::VirtualModelCatalog,
+}
+
+impl cyrup_provider::VirtualModelCatalog for LiveGuestCatalog<'_> {
+    fn get_model(&self, provider: &str, model_id: &str) -> Option<Model> {
+        self.snapshot.get_model(provider, model_id).or_else(|| {
+            self.guest
+                .models()
+                .into_iter()
+                .find(|m| m.provider.as_str() == provider && m.id.as_str() == model_id)
+        })
+    }
+
+    fn models(&self) -> Vec<Model> {
+        let mut models = self.snapshot.models();
+        for m in self.guest.models() {
+            if !models
+                .iter()
+                .any(|e| e.provider == m.provider && e.id == m.id)
+            {
+                models.push(m);
+            }
+        }
+        models
+    }
+
+    fn has_configured_auth(&self, provider: &str) -> bool {
+        self.snapshot.has_configured_auth(provider)
+    }
+
+    fn has_physical_provider(&self, provider: &str) -> bool {
+        self.snapshot.has_physical_provider(provider)
+            || self
+                .guest
+                .models()
+                .iter()
+                .any(|m| m.provider.as_str() == provider && !cyrup_provider::is_virtual_model(m))
+    }
 }
 
 impl GuestProviderRegistry {
@@ -121,6 +182,24 @@ impl GuestProviderRegistry {
     /// `/llama`'s replacement reached the registry but never the provider the session streams
     /// through, which kept shadowing the replacement's catalog (the composed registry starts from
     /// the installed provider's models).
+    /// Bind the virtual-model registry an extension registration lands in, plus the catalog its
+    /// two validations read — pi's `registerVirtualModel` reads `this.models.getModel(providerId,
+    /// id)` for the physical-conflict check (`model-runtime.ts:957`) and
+    /// `recomposeProvider`/`configuredProviders` for the virtual-only marking (`:962-968`).
+    ///
+    /// Called by [`crate::SessionBuilder`] BEFORE
+    /// [`cyrup_ext::ExtensionRegistry::bind_model_registry`], so the bind-time flush of the
+    /// extensions' queued registrations has somewhere to land — which is upstream's ordering:
+    /// `createAgentSessionServices` drains `pendingVirtualModelRegistrations` into a `modelRuntime`
+    /// that already holds the catalog (`agent-session-services.ts:182-194`).
+    pub fn attach_virtual_models(
+        &self,
+        registry: Arc<cyrup_provider::VirtualModelRegistry>,
+        catalog: Arc<dyn cyrup_provider::VirtualModelCatalog>,
+    ) {
+        *poison_safe(&self.virtual_models) = Some(VirtualModelSink { registry, catalog });
+    }
+
     pub fn follow_installed(&self, swap: &Arc<ProviderSwap>) {
         *poison_safe(&self.installed) = Some(Arc::downgrade(swap));
     }
@@ -930,6 +1009,58 @@ impl ModelRegistrySink for GuestProviderRegistry {
         self.supersede_refresh(id);
         self.lock().remove(id);
         self.generation.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn upsert_virtual_model(
+        &self,
+        definition: &cyrup_provider::VirtualModelDefinition,
+    ) -> Result<(), String> {
+        // Not `self.generation`: the virtual registry carries its OWN monotonic generation, and
+        // that counter is already the fourth key of `RegistrySnapshot` (step 2's contract), so a
+        // registration invalidates the composed-catalog cache through it. Bumping this counter too
+        // would invalidate the guest-provider half for no reason.
+        let Some(sink) = poison_safe(&self.virtual_models)
+            .as_ref()
+            .map(|s| VirtualModelSink {
+                registry: Arc::clone(&s.registry),
+                catalog: Arc::clone(&s.catalog),
+            })
+        else {
+            // No registry bound: nothing in this process can route, so a registration cannot be
+            // honoured. Refused rather than dropped, because the hub turns the refusal into pi's
+            // `Extension "{path}" error: …` startup diagnostic — a silent drop is how an extension
+            // author debugs a router that "registered" and never appears in `/model`.
+            return Err("virtual-model registry is not bound to this session".to_string());
+        };
+        // The guard is RELEASED before `register`, which takes the registry's own lock and reads
+        // the catalog under it. Holding this `Mutex` across that call would nest two locks on a
+        // path an extension can drive from a background task.
+        //
+        // The attached catalog is a SNAPSHOT taken when the session was built; the live guest
+        // catalog is layered over it so a provider registered after that — by a later extension or
+        // a `LateRegistrar` — is still seen as physical. What the snapshot deliberately does NOT
+        // pick up is a physical model a later catalog REFRESH adds, and that is upstream's
+        // behaviour, not a shortfall: "If a catalog refresh later adds a physical model with the
+        // same ID, the virtual model hides it" (`docs/virtual-models.md`) — a later arrival is
+        // hidden, never a conflict.
+        let catalog = LiveGuestCatalog {
+            guest: self,
+            snapshot: sink.catalog.as_ref(),
+        };
+        sink.registry
+            .register(definition.clone(), &catalog)
+            .map_err(|e| e.to_string())
+    }
+
+    fn remove_virtual_model(&self, provider: &str, id: &str) {
+        let registry = poison_safe(&self.virtual_models)
+            .as_ref()
+            .map(|s| Arc::clone(&s.registry));
+        if let Some(registry) = registry {
+            // `false` is pi's no-op arm (`model-runtime.ts:977`): an absent pair recomposes nothing
+            // and fires no refresh. `unregister` enforces that itself.
+            registry.unregister(provider, id);
+        }
     }
 }
 

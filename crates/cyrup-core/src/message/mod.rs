@@ -15,7 +15,8 @@
 //! - `usage` — token + cost accounting ([`Usage`], [`Cost`]).
 //! - `nested` — the record of the calls a tool made to other tools ([`NestedToolCalls`]) and its
 //!   bounded [`NestedCallRecorder`].
-//! - `assistant` — [`AssistantMessage`], [`DeferredHandle`], [`UNRESOLVED_API`].
+//! - `assistant` — [`AssistantMessage`], [`DeferredHandle`], [`UNRESOLVED_API`],
+//!   [`VIRTUAL_MODEL_API`].
 //! - `conversation` — the role-tagged [`Message`] enum.
 //! - `sections` — the ordered named prompt sections of a system message ([`Sections`]).
 //! - `system` — [`SystemMessage`], the transcript's prompt + tool-declaration state.
@@ -32,7 +33,7 @@ mod thinking;
 mod tool_call;
 mod usage;
 
-pub use assistant::{AssistantMessage, DeferredHandle, UNRESOLVED_API};
+pub use assistant::{AssistantMessage, DeferredHandle, UNRESOLVED_API, VIRTUAL_MODEL_API};
 pub use content::Content;
 pub use conversation::Message;
 pub use nested::{

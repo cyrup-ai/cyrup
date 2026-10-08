@@ -959,6 +959,7 @@ pub fn faux_assistant_message_with(
         response_model: None,
         response_id: options.response_id,
         provider_thinking_level: None,
+        thinking_level: None,
         diagnostics: None,
         usage: Usage {
             output,
@@ -999,6 +1000,7 @@ pub fn faux_deferred_message(model: &Model, handle: DeferredHandle) -> Assistant
         response_model: None,
         response_id: None,
         provider_thinking_level: None,
+        thinking_level: None,
         diagnostics: None,
         usage: Usage::default(),
         stop_reason: StopReason::Deferred,

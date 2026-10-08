@@ -79,6 +79,11 @@ cyrup-tools = { workspace = true }
 # turns it on for the shipped binary (see that crate's Cargo.toml:40-53).
 cyrup-ext = { workspace = true }
 cyrup-core = { workspace = true }
+# The bundled worked virtual-model router (`src/router_example.rs`) implements two `#[async_trait]`
+# traits — `cyrup_provider::ModelRouter` and `cyrup_ext::native::NativeExtension` — so the macro is
+# needed in the NORMAL graph, not only in dev. Lock-neutral: every crate this binary already
+# depends on pulls the same `async-trait`.
+async-trait = { workspace = true }
 # The SubAgents extension (arch-SA): registered as a native built-in at all three session
 # construction sites below, plus this bin owns the internal `__subagent-runner --config <path>`
 # hop-2 subcommand (`subagent_runner_cmd.rs`) that calls straight into its `background::runner_main`.

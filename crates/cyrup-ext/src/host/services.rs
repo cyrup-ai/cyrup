@@ -2134,6 +2134,27 @@ pub struct GuestState {
     /// `host-bash.is-bash-cancelled` poll — pi's `signal?: AbortSignal`
     /// (`core/tools/bash.ts:76` @v0.84.4). Set before `bash-operations-exec`, cleared after.
     bash_cancel: Mutex<Option<(String, CancelToken)>>,
+    /// The `route-id` + `CancelToken` of the virtual-model route currently running on this
+    /// instance, backing the `host-router.is-route-cancelled` poll — pi's
+    /// `ModelRouteRequest.signal?: AbortSignal` (`core/virtual-models.ts:69` @v1.0.4). Set before
+    /// `events.route-model`, cleared by `RouteCallBinding`'s `Drop` on every
+    /// exit path.
+    ///
+    /// A SEPARATE slot from [`Self::tool_cancel`] on purpose: that one is cleared by
+    /// `ToolCallBinding`'s `Drop`, so a route sharing it would have its token torn down by an
+    /// unrelated tool call's unwind.
+    route_cancel: Mutex<Option<(String, CancelToken)>>,
+    /// The host's live-guest routing table, as a [`std::sync::Weak`]. `None` for a standalone
+    /// `GuestState` (unit tests, a host built without the facade), which then has no instance to
+    /// route back into.
+    ///
+    /// Needed because the registration import runs INSIDE `init`, at which point
+    /// `Arc<LiveExtension>` does not exist yet (`facade.rs`'s `load_wasm_body` inserts into `live`
+    /// only after `LiveExtension::load` has returned), so a
+    /// [`crate::host::GuestModelRouter`] cannot capture the instance at registration time and
+    /// resolves it per `route()` call instead. See [`crate::facade::LiveMap`] for why it is `Weak`.
+    #[cfg(feature = "wasm-host")]
+    live: Option<std::sync::Weak<crate::facade::LiveMap>>,
     /// `withSession` callback ids the guest scheduled via a `control.*` op carrying a
     /// `withSessionCallbackId`; the host invokes the `with-session` export for each after the command
     /// body returns (Pi `finishSessionReplacement`, agent-session-runtime.ts:184; sdk gap #3).
@@ -2289,6 +2310,9 @@ impl GuestState {
             tool_call_in_flight: Mutex::new(None),
             bash_output: Mutex::new(Vec::new()),
             bash_cancel: Mutex::new(None),
+            route_cancel: Mutex::new(None),
+            #[cfg(feature = "wasm-host")]
+            live: None,
             pending_with_session: Mutex::new(Vec::new()),
             deadline_estimate: Mutex::new(None),
             first_wait_started: Mutex::new(None),
@@ -2492,6 +2516,24 @@ impl GuestState {
     pub fn with_ui_prompts(mut self, tracker: Arc<crate::ui_prompt::UiPromptTracker>) -> Self {
         self.ui_prompts = Some(tracker);
         self
+    }
+
+    /// Hand this guest a late-resolving handle to the host's live-instance table, so a virtual
+    /// model it registers during `init` can be routed through its own instance afterwards. Called
+    /// by the facade before `init` with `Arc::downgrade(&self.live)`; see the [`Self::live`] field
+    /// and [`crate::facade::LiveMap`] for why it is a [`std::sync::Weak`].
+    #[cfg(feature = "wasm-host")]
+    #[must_use]
+    pub fn with_live_map(mut self, live: std::sync::Weak<crate::facade::LiveMap>) -> Self {
+        self.live = Some(live);
+        self
+    }
+
+    /// The live-instance table handle installed by [`Self::with_live_map`], if any.
+    #[cfg(feature = "wasm-host")]
+    #[must_use]
+    pub fn live_map(&self) -> Option<std::sync::Weak<crate::facade::LiveMap>> {
+        self.live.clone()
     }
 
     /// Open the UI-prompt window for one of this guest's blocking `ui.*` prompts (pi
@@ -3219,6 +3261,28 @@ impl GuestState {
             .map(|g| {
                 g.as_ref()
                     .is_some_and(|(id, t)| id == call_id && t.is_cancelled())
+            })
+            .unwrap_or(false)
+    }
+
+    /// Bind the currently-executing virtual-model route's `route-id` + `CancelToken` for the
+    /// `host-router.is-route-cancelled` poll (pi's `ModelRouteRequest.signal`). `None` clears the
+    /// binding — which is `RouteCallBinding`'s whole job.
+    pub fn set_route_cancel(&self, binding: Option<(String, CancelToken)>) {
+        if let Ok(mut g) = self.route_cancel.lock() {
+            *g = binding;
+        }
+    }
+
+    /// The route `signal` poll (pi `signal.aborted`): true only for the LIVE `route_id`, so a
+    /// stale poll from a later handler — or a forged id — can never report another route's
+    /// cancellation (EXT-M06's rule, applied to this seam).
+    pub fn route_is_cancelled(&self, route_id: &str) -> bool {
+        self.route_cancel
+            .lock()
+            .map(|g| {
+                g.as_ref()
+                    .is_some_and(|(id, t)| id == route_id && t.is_cancelled())
             })
             .unwrap_or(false)
     }

@@ -2102,6 +2102,38 @@ impl HostServices for LiveHostServices {
             let (Some(model_ref), Some(model)) = (model_ref, model) else {
                 return Err(Refusal::NoModel);
             };
+            // A VIRTUAL selection must never reach the provider. `model` here is the SELECTION
+            // (`LiveSnapshot::resolved_model`), and under a router that is a `pi-virtual` row with
+            // `base_url: ""` and `max_tokens: 0` — which the installed provider would stream
+            // against some arbitrary catalog entry of its own, silently wrong.
+            //
+            // Upstream refuses it, and this is its refusal. `ctx.modelRegistry.complete` is
+            // `runtime.complete` -> `ModelRuntime.stream` -> `provider.stream`
+            // (`core/model-registry.ts:141-146`, `core/model-runtime.ts:691-706` @v1.0.4), and
+            // `stream` has NO virtual arm — only `streamSimple` routes (`:714-733`). So the call
+            // lands on the `withVirtualModels` decorator, whose `stream` answers `unroutedStream`
+            // for a virtual model (`core/virtual-models.ts:233-235` -> `:189-194`).
+            //
+            // It SETTLES rather than refusing: `lazyStream`'s failure arm pushes one error event
+            // and `end(message)`s with the errored message (`packages/ai/src/api/lazy.ts:50-55`),
+            // so `complete`'s `.result()` resolves with it. That is the same classification this
+            // method already gives a provider failure — "a completion that ran and failed is NOT a
+            // [`StandaloneCompletionRefusal`]" — and `cyrup_agent::ProviderStreamFn` answers the
+            // loop's equivalent the same way, with the same text out of the same function.
+            //
+            // Routing it instead would be wrong, not merely different: upstream deliberately does
+            // not route `complete`, and the `maxTokens` re-cap its `streamSimple` arm applies
+            // (`:722-724`) has no counterpart here because the caller sized its request against
+            // the virtual model's declared limits.
+            if cyrup_provider::is_virtual_model(&model) {
+                return Ok(cyrup_core::AssistantMessage::errored(
+                    model.provider.clone(),
+                    model.id.as_str(),
+                    Some(model.api.clone()),
+                    cyrup_core::StopReason::Error,
+                    cyrup_provider::unrouted_message(model.provider.as_str(), model.id.as_str()),
+                ));
+            }
             let summarization = cyrup_session::compaction::SummarizationRequest {
                 system_prompt: &request.system_prompt,
                 prompt_text: request.user_text,
@@ -4832,5 +4864,67 @@ mod tests {
             .expect("an errored turn is still a turn");
         assert_eq!(reply.stop_reason, cyrup_core::StopReason::Error);
         assert_eq!(reply.error_message.as_deref(), Some("429 slow down"));
+    }
+
+    /// A VIRTUAL selection must never reach the provider — the one thing the virtual-model feature
+    /// may not allow.
+    ///
+    /// `complete_standalone` is pi's `ctx.modelRegistry.complete(ctx.model, …)`
+    /// (`core/model-registry.ts:141` @v1.0.4), which is `runtime.complete` ->
+    /// `ModelRuntime.stream` -> `provider.stream`. `stream`/`complete` have NO virtual arm
+    /// (`core/model-runtime.ts:691-712`; only `streamSimple` routes, `:714-733`), so upstream
+    /// reaches the `withVirtualModels` decorator, whose `stream` answers `unroutedStream` for a
+    /// virtual model (`core/virtual-models.ts:233-235` -> `:189-194`). `lazyStream`'s failure arm
+    /// pushes one error event and `end(message)`s with it (`packages/ai/src/api/lazy.ts:50-55`),
+    /// so `complete`'s `.result()` RESOLVES with an errored `AssistantMessage` rather than
+    /// rejecting — which is why this is `Ok(message)` and not a `StandaloneCompletionRefusal`, the
+    /// same classification the sibling provider-failure test above pins.
+    ///
+    /// Before the fix this test failed on its first assertion: `snapshot.resolved_model` is the
+    /// SELECTION, so the faux provider was asked to stream `pi-virtual` `router/auto` with
+    /// `base_url: ""` and `max_tokens: 0`, and answered `StopReason::Stop` with the scripted reply.
+    #[tokio::test]
+    async fn complete_standalone_refuses_a_virtual_selection_with_pis_unrouted_text() {
+        let (provider, seen) = recording_provider("must never be produced", 1);
+        let svc = svc_with(provider.clone());
+        let virtual_model =
+            cyrup_provider::create_virtual_model(&cyrup_provider::VirtualModelSpec {
+                provider: cyrup_core::ProviderId::from("router"),
+                id: "auto".into(),
+                name: "Auto".to_string(),
+                thinking_levels: None,
+                context_window: None,
+                max_tokens: None,
+                input: None,
+            });
+        svc.update_model(
+            ModelRef {
+                provider: virtual_model.provider.clone(),
+                api: Some(virtual_model.api.clone()),
+                model: virtual_model.id.clone(),
+            },
+            virtual_model,
+            Some("high".into()),
+        );
+
+        let reply = svc
+            .complete_standalone(request("x"), CancelToken::new())
+            .await
+            .expect("an unrouted refusal is a settled turn, not a refusal to run");
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "the provider must not have been asked at all, saw: {:?}",
+            seen.lock().unwrap()
+        );
+        assert_eq!(reply.stop_reason, cyrup_core::StopReason::Error);
+        assert_eq!(
+            reply.error_message.as_deref(),
+            Some("Virtual model router/auto must be routed before streaming")
+        );
+        // The errored message names the VIRTUAL model, as pi's `createSetupErrorMessage(model, …)`
+        // does — a failed routing leaves the virtual model on its own message, which is exactly
+        // what `find_latest_response` and `physical_model` rely on to skip it.
+        assert_eq!(reply.provider.as_str(), "router");
+        assert_eq!(reply.model.as_str(), "auto");
     }
 }

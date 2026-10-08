@@ -67,6 +67,7 @@ mod wasm_renderer_routing;
 mod wasm_thinking_level;
 mod wasm_tool_result_structured;
 mod wasm_tool_result_usage;
+mod wasm_virtual_model;
 
 // §4 R5 layer 3 — the ambient-credential guard now lives as a `#[test]` inside `support::env`
 // itself (plus the feature-gate guard and the hermetic-spawn lint), so every target that declares

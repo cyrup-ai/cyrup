@@ -169,6 +169,7 @@ impl Decoder {
             response_model: self.response_model.clone(),
             response_id: self.response_id.clone(),
             provider_thinking_level: self.provider_thinking_level.clone(),
+            thinking_level: None,
             diagnostics: None,
             usage,
             // In-flight: Pi's `output.stopReason` is still its `"pending"` seed until a

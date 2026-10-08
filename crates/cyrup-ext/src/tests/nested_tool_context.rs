@@ -411,7 +411,7 @@ mod wasm {
     };
 
     /// The `host-tool` import, declaring the two functions this change adds.
-    const HOST_TOOL_IMPORT: &str = r#"  (import "cyrup:ext/host-tool@0.16.0" (instance $ht
+    const HOST_TOOL_IMPORT: &str = r#"  (import "cyrup:ext/host-tool@0.17.0" (instance $ht
     (export "execute-tool" (func (param "call-id" string) (param "name" string) (param "args-json" string) (param "collect-updates" bool) (result (result (tuple string (list string)) (error string)))))
     (export "callable-tools" (func (param "call-id" string) (result (result string (error string)))))))
   (alias export $ht "execute-tool" (func $execute-tool-import))

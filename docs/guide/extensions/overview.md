@@ -24,7 +24,7 @@ Every extension ships an `extension.json` manifest that declares what it needs:
 {
   "id": "todo",
   "version": "1.0.0",
-  "world": "cyrup:ext@0.16",
+  "world": "cyrup:ext@0.17",
   "capabilities": {
     "fs": ["read:.", "write:.cyrup/todo"],
     "exec": false,
@@ -165,5 +165,7 @@ subagent child process.
 ## Where to go next
 
 To install someone else's package, read [Installing extensions](managing.md). To build your own,
-read [Writing an extension](authoring.md). For the tool allowlist and the built-in tools that
-extensions sit alongside, read [Tools and permissions](../guides/tools-and-permissions.md).
+read [Writing an extension](authoring.md). To make a model that routes each request to a physical
+model, read [Virtual models](virtual-models.md) — either extension tier can register one. For the
+tool allowlist and the built-in tools that extensions sit alongside, read
+[Tools and permissions](../guides/tools-and-permissions.md).

@@ -148,7 +148,7 @@ post-processes it.
 {
   "id": "my-ext",
   "version": "1.0.0",
-  "world": "cyrup:ext@0.16",
+  "world": "cyrup:ext@0.17",
   "entry": "crates/my-ext",
   "capabilities": {
     "fs": ["read:.", "write:.cyrup/todo"],
@@ -169,14 +169,15 @@ post-processes it.
 
 ### World compatibility
 
-The host world is `cyrup:ext@0.16` (`HOST_WORLD` in `crates/cyrup-ext/src/manifest.rs`, which also
+The host world is `cyrup:ext@0.17` (`HOST_WORLD` in `crates/cyrup-ext/src/manifest.rs`, which also
 carries the bump history). A manifest's `world` must declare the **same major version** as the host
-and a **minor version at least** the host's. Against today's host, `cyrup:ext@0.16` is the value to
+and a **minor version at least** the host's. Against today's host, `cyrup:ext@0.17` is the value to
 write; an older minor is a mismatch, and so is a different major.
 
 The minor moves whenever an export is added, removed or re-signed, and whenever an import is removed
 or re-signed — both of those break an already-built guest at link time. A purely additive import does
-not move it. That is why the rule is one-directional: a *higher* minor than the host is accepted,
+not move it. `0.17` is the current value because the route callback of a virtual model is a guest
+export (see [Virtual models](virtual-models.md)), so a `0.16` component does not have it. That is why the rule is one-directional: a *higher* minor than the host is accepted,
 a lower one is refused.
 
 A mismatch gives you a clear version error naming the problem. It does not become a link failure
@@ -255,10 +256,11 @@ directory goes directly in `extensions/`, not nested inside another folder.
 
 ## The reference implementation
 
-`crates/cyrup-ext-sdk/src/example.rs` in the cyrup repository is a working extension exported through
+`crates/cyrup-ext-sdk/src/example/` in the cyrup repository is a working extension exported through
 the same `export_extension!` macro you use. It demonstrates a permission gate on `tool_call`, a
-notify hook on session start, a dynamically registered streaming tool, and custom renderers for tool
-calls, tool results and transcript entries. It is exercised by cyrup's own end-to-end tests, so it
-is a live example rather than a snippet that may have drifted.
+notify hook on session start, a dynamically registered streaming tool, custom renderers for tool
+calls, tool results and transcript entries, a bash backend, and a virtual model with a router. It is
+exercised by cyrup's own end-to-end tests, so it is a live example rather than a snippet that may
+have drifted.
 
 Start there, delete what you do not need, and keep the manifest honest about what is left.

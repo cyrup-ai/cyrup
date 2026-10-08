@@ -109,6 +109,7 @@ impl RDecoder {
             response_model: None,
             response_id: self.response_id.clone(),
             provider_thinking_level: None,
+            thinking_level: None,
             diagnostics: None,
             usage: self.usage.clone(),
             stop_reason: self.stop_reason,

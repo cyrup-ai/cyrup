@@ -42,6 +42,32 @@ impl StreamFn for ProviderStreamFn {
         ctx: &Context,
         opts: &StreamOptions,
     ) -> EventStream<StreamEvent> {
+        // A VIRTUAL model must never reach a provider: it is a catalog entry that routes each
+        // request to a physical model, and the routing step is what replaces it. Guarded ahead of
+        // the resolution below because that resolution FALLS BACK to the provider's first catalog
+        // entry — so an unrouted virtual model would otherwise stream against an arbitrary model
+        // with no error anywhere, which is silently wrong rather than loudly broken.
+        //
+        // Defence in depth, matching upstream's shape: pi's `withVirtualModels` decorator is the
+        // only thing a virtual model can reach and it answers with this same text
+        // (`unroutedStream`, `packages/coding-agent/src/core/virtual-models.ts:189-194` @v1.0.4),
+        // because `ModelRuntime.stream` has no virtual arm at all.
+        if model
+            .api
+            .as_ref()
+            .is_some_and(|api| api.as_str() == cyrup_core::VIRTUAL_MODEL_API)
+        {
+            let err = AssistantMessage::errored(
+                model.provider.clone(),
+                model.model.as_str(),
+                model.api.clone(),
+                StopReason::Error,
+                // One spelling of upstream's asserted text, shared with the extension seam's
+                // `complete_standalone` — see `cyrup_provider::unrouted_message`.
+                cyrup_provider::unrouted_message(model.provider.as_str(), model.model.as_str()),
+            );
+            return Box::pin(futures::stream::iter(vec![StreamEvent::terminal(err)]));
+        }
         // Resolve the concrete Model from the ModelRef; fall back to the first catalog entry.
         let resolved = self
             .provider

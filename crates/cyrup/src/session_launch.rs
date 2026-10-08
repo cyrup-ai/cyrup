@@ -119,6 +119,15 @@ fn attach_native_extensions(
     if let Some(ext) = cyrup_llama::llama_extension_for_env(agent_dir) {
         builder = builder.with_native_extension(ext);
     }
+    // The bundled worked virtual-model router ([`crate::router_example`]), behind
+    // `CYRUP_ROUTER_EXAMPLE`. Gated OFF by default and attached the same way `llama` is, so an
+    // existing session's catalog is byte-for-byte unchanged unless the user asks for a router.
+    // Without it the virtual-model feature has no in-tree registrant and is unreachable from the
+    // shipped binary — pi ships its equivalent as `examples/extensions/jev-router.ts`, which cyrup
+    // has no place for (natives are compile-time and there is no `examples/` directory).
+    if let Some(ext) = crate::router_example::router_extension_for_env() {
+        builder = builder.with_native_extension(ext);
+    }
     // `codemode` is the next entry of pi's `builtInExtensions` (`extensions/index.ts:9-14`
     // @v1.0.1), registered inactive and replaceable. Its scripts run in V8 isolates
     // ([`cyrup_codemode_runtime::tool::EngineSandboxFactory`], ADR-0031).

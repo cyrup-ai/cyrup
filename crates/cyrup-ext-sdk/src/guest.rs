@@ -60,6 +60,14 @@ thread_local! {
     /// `runtime.refreshTools()`). Kept in a SEPARATE cell from `API` because a handler runs while
     /// `API` is already immutably borrowed by [`dispatch`] — pushing into it would panic the guest.
     static LATE_TOOLS: RefCell<Vec<crate::api::RegisteredTool>> = const { RefCell::new(Vec::new()) };
+
+    /// Virtual-model routers registered from a LIVE handler, after `init` (pi
+    /// `pi.registerVirtualModel()` called at runtime — `loader.ts:500-513` has no init-only gate,
+    /// only `assertActive()`). A SEPARATE cell from `API` for the same reason `LATE_TOOLS` is: a
+    /// handler runs while `API` is already immutably borrowed by [`dispatch`], so pushing into it
+    /// would panic the guest.
+    static LATE_ROUTERS: RefCell<Vec<(crate::descriptor::VirtualModelSpec, Box<dyn crate::api::VirtualModelRouter>)>> =
+        const { RefCell::new(Vec::new()) };
 }
 
 /// Lower an author-facing [`crate::descriptor::ToolDescriptor`] onto the WIT record.
@@ -154,6 +162,46 @@ pub fn register_flag_late(
     registration::register_flag(name, &spec_json).map_err(RegistrationError::new)
 }
 
+/// Register a virtual model from inside a live handler (the body behind
+/// [`crate::ctx::Ctx::register_virtual_model`]).
+///
+/// The host import goes FIRST and a refusal stores nothing, exactly as `register_tool_late` does:
+/// a router the host does not know about would never be called, so recording it would be a lie.
+pub fn register_virtual_model_late(
+    spec: crate::descriptor::VirtualModelSpec,
+    router: Box<dyn crate::api::VirtualModelRouter>,
+) -> Result<(), RegistrationError> {
+    let spec_json = serde_json::to_string(&spec).unwrap_or_else(|_| "{}".into());
+    registration::register_virtual_model(&spec_json).map_err(RegistrationError::new)?;
+    LATE_ROUTERS.with(|c| {
+        let mut routers = c.borrow_mut();
+        // Re-registering the same pair REPLACES in place, as upstream's `Map.set` does.
+        match routers
+            .iter()
+            .position(|(s, _)| s.provider == spec.provider && s.id == spec.id)
+        {
+            Some(at) => {
+                if let Some(slot) = routers.get_mut(at) {
+                    *slot = (spec, router);
+                }
+            }
+            None => routers.push((spec, router)),
+        }
+    });
+    Ok(())
+}
+
+/// Unregister a virtual model from inside a live handler (the body behind
+/// [`crate::ctx::Ctx::unregister_virtual_model`]). pi `pi.unregisterVirtualModel(provider, id)`,
+/// which is void and whose absent-pair case is a no-op.
+pub fn unregister_virtual_model_late(provider: &str, id: &str) {
+    registration::unregister_virtual_model(provider, id);
+    LATE_ROUTERS.with(|c| {
+        c.borrow_mut()
+            .retain(|(s, _)| !(s.provider == provider && s.id == id));
+    });
+}
+
 /// Flush the author's declared registrations through the host imports + declare the subscription set.
 /// The first registration the host refuses (EXT-082) is returned, and nothing after it is sent —
 /// pi's factory stops at its first throw.
@@ -177,6 +225,15 @@ fn push_registrations(api: &ExtensionApi) -> Result<(), String> {
     for (id, config) in &api.providers {
         let config_json = serde_json::to_string(config).unwrap_or_else(|_| "{}".into());
         registration::register_provider(id, &config_json);
+    }
+    // The guest tier of pi `pi.registerVirtualModel(model)`: the SPEC crosses, the router stays
+    // guest-side behind the `route-model` export. The import's `err` arm is pi's
+    // `registerVirtualModel` throw (an empty provider/id, or an id that already names a physical
+    // model of that provider), propagated with `?` so an invalid registration fails the load the
+    // way pi's throwing factory does — EXT-082's rule, applied to this seam.
+    for spec in api.virtual_model_specs() {
+        let spec_json = serde_json::to_string(&spec).unwrap_or_else(|_| "{}".into());
+        registration::register_virtual_model(&spec_json)?;
     }
     for r in &api.renderers {
         registration::register_message_renderer(&r.custom_type);
@@ -414,6 +471,48 @@ pub fn bash_operations_exec(
         Some(api) => api.exec_bash_operations(&cmd),
         None => Err("extension not initialized".into()),
     })
+}
+
+/// `route-model` export body — the guest half of pi's `ExtensionVirtualModel.route(request, ctx)`
+/// (`core/extensions/types.ts:1888` @v1.0.4). Called once per provider request whose selected model
+/// is the virtual one `(provider, id)` names.
+///
+/// `ctx` is built fresh here, which is upstream's own behaviour: its api object closes over
+/// `runtime.createContext()` and calls it PER REQUEST (`core/extensions/loader.ts:504-508`).
+///
+/// `Err` when this guest is not initialized or registered no router for the pair, so an unexpected
+/// call surfaces as a FAILED route rather than a silent success — a bogus successful answer would
+/// be streamed, which is the one outcome upstream's contract rules out.
+pub fn route_model(
+    provider: String,
+    id: String,
+    route_id: String,
+    request_json: String,
+) -> Result<String, String> {
+    let mut request: crate::descriptor::ModelRouteRequest = serde_json::from_str(&request_json)
+        .map_err(|e| format!("route-model: request-json is not a ModelRouteRequest: {e}"))?;
+    // Not on the wire (pi has no such member): the host passes it as its own argument and it is
+    // what `ModelRouteRequest::is_cancelled` polls, which is this port of pi's `request.signal`.
+    request.route_id = route_id;
+    let ctx = crate::ctx::Ctx::new();
+    // A router registered from a LIVE handler is not in `API.virtual_models`; check that table
+    // first so a dynamically-registered virtual model is genuinely routable, not just announced —
+    // the same ordering `run_tool` applies to `LATE_TOOLS`.
+    let late = LATE_ROUTERS.with(|c| {
+        c.borrow()
+            .iter()
+            .find(|(s, _)| s.provider == provider && s.id == id)
+            .map(|(_, router)| router.route(&request, &ctx))
+    });
+    let route = match late {
+        Some(route) => route,
+        None => API.with(|c| match c.borrow().as_ref() {
+            Some(api) => api.route_virtual_model(&provider, &id, &request, &ctx),
+            None => Err("extension not initialized".into()),
+        }),
+    }?;
+    serde_json::to_string(&route)
+        .map_err(|e| format!("route-model: the route this router returned is not JSON: {e}"))
 }
 
 /// `on-terminal-input` export body (EXT-021; Pi `TerminalInputHandler`, types.ts:113 @v0.83.0).

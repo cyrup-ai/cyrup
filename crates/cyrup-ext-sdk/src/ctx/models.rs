@@ -57,6 +57,25 @@ impl Models {
         #[cfg(not(target_arch = "wasm32"))]
         Value::Array(vec![])
     }
+    /// One model by `(provider, id)` — pi `ctx.modelRegistry.find(provider, id)`, which
+    /// `docs/virtual-models.md` tells a virtual-model router to use to name the physical model it
+    /// is routing to.
+    ///
+    /// `None` when no row matches, when the host sent JSON this SDK could not parse, or on the host
+    /// (non-`wasm32`) target, where there is no host to ask. Returned whole, because that is what a
+    /// [`ModelRoute`](crate::ModelRoute) carries: the host re-resolves the address against its own
+    /// catalog, but the full object is the answer that decodes on every path.
+    pub fn find(&self, provider: &str, id: &str) -> Option<Value> {
+        self.list()
+            .as_array()?
+            .iter()
+            .find(|m| {
+                m.get("provider").and_then(Value::as_str) == Some(provider)
+                    && m.get("id").and_then(Value::as_str) == Some(id)
+            })
+            .cloned()
+    }
+
     /// The model currently selected for this session (WIT `models.current`, `wit/world.wit:777`);
     /// `None` when the host has none to report, and always `None` on the host (non-`wasm32`)
     /// target, where there is no host to ask.

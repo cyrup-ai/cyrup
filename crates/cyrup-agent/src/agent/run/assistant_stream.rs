@@ -5,7 +5,7 @@
 //! at three exits.
 
 use crate::agent::message::{empty_assistant, errored_assistant};
-use cyrup_core::{AssistantMessage, ModelRef, StopReason};
+use cyrup_core::{AssistantMessage, ModelRef, ModelThinkingLevel, StopReason};
 use cyrup_provider::StreamEvent;
 use std::sync::Arc;
 
@@ -43,6 +43,31 @@ pub(super) enum Step {
 pub(super) struct Settled {
     pub(super) start: Option<Arc<AssistantMessage>>,
     pub(super) end: Arc<AssistantMessage>,
+}
+
+impl Settled {
+    /// Record the Pi thinking level the loop REQUESTED for this response on the settled message —
+    /// pi `const result = async () => Object.assign(await response.result(), { thinkingLevel:
+    /// config.reasoning ?? "off" })` (`packages/agent/src/agent-loop.ts:408-409`), whose own
+    /// comment is *"Record the requested level, whichever stream function answered."*
+    ///
+    /// Under a virtual selection the requested level is the one the ROUTER chose, because
+    /// `prepare_request` folded it into the run baseline before this request was built — which is
+    /// what makes `ModelRouteRequest.previous.thinking_level` / `.failed.thinking_level` carry the
+    /// level a turn was actually answered at rather than the selection's.
+    ///
+    /// Stamped by rebuilding the `Arc`, not through `Arc::get_mut`: all three settle paths publish
+    /// the SAME pointer as `start` when a `message_start` is still owed, so the two must stay the
+    /// one message pi's `Object.assign` mutates in place.
+    pub(super) fn with_thinking_level(self, level: ModelThinkingLevel) -> Self {
+        let mut message = (*self.end).clone();
+        message.thinking_level = Some(level);
+        let end = Arc::new(message);
+        Self {
+            start: self.start.map(|_| Arc::clone(&end)),
+            end,
+        }
+    }
 }
 
 pub(super) struct AssistantStream {

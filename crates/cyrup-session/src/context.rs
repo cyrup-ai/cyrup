@@ -32,6 +32,14 @@ pub struct SessionContext {
     /// Most recent thinking level on the path, else `"off"`.
     pub thinking_level: String,
     /// Most recent model on the path (session-local — `api: None`), if any.
+    ///
+    /// The FORWARD last-wins value, Pi `getSessionContextSettings`'s `model`
+    /// (`session-manager.ts:418-433`) — **not** the virtual-aware selection. Under a virtual
+    /// selection an assistant message names the physical model that answered, so this field
+    /// reports that model and a routing failure makes it report the virtual one. A caller that
+    /// wants the selection uses [`crate::SessionManager::branch_selection`]; see the note on
+    /// [`crate::SessionManager::build_context`] for the byte evidence that upstream left this pass
+    /// alone and reads `existingSession.model` nowhere at v1.0.4.
     pub model: Option<ModelRef>,
 }
 

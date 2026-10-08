@@ -5,6 +5,60 @@ next work item**.
 
 ---
 
+# UPDATE 2026-10-07 (virtual models, guest tier) — `EXT-109` filed and closed; `SESS-067`'s Fix text CORRECTED, not followed
+
+> The WASM/guest extension tier of pi's virtual models, built on `claude/hopeful-dirac-squ75k`. Upstream
+> read only through git objects at pin `v1.0.4`.
+>
+> The count is whatever `python3 -I docs/gap-analysis/scripts/count_open_items.py` prints, measured on
+> `main` at `4f649ab6` (before) and on this branch rebased onto it (after): **before 135 open (0 above
+> low; 17 trackers; 927 closed); after 132 open (0 above low; 17 trackers; 931 closed)**. Four rows
+> close — `SESS-067`, `SESS-065`, `TUI-143` and `EXT-109` — and open falls by three rather than four
+> because `EXT-109` was filed and closed in the same pass. Area 03: 6 → **4**. Area 07: 25 → **24**.
+> Area 06: 18 → **17** open, 86 → **87** closed. `SEAM-144` stays open with a dated note; area 08
+> unchanged at 7.
+>
+> ## Filed and closed
+>
+> `EXT-109` — `pi.registerVirtualModel()` / `unregisterVirtualModel()` (`core/extensions/types.ts:1865-1876`
+> @v1.0.4), BOTH extension tiers. Neither had a filed row: `SESS-067`'s own body recorded the seam as
+> *"still unowned and unfiled"*. The native tier was already in the tree; the guest tier is this work.
+> World **0.16 -> 0.17**, an EXPORT ADDITION: `events.route-model` is new, so a 0.16 guest exports nothing
+> under that name and `check_world` refuses it rather than letting it die in wasmtime. A router is a
+> CALLABLE and ADR-0002 keeps callables off the value seam, so the two new `registration` imports declare
+> the SPEC and the host reaches the callable through the export, keyed by `(provider, id)` — the
+> `register-bash-operations` + `bash-operations-exec` inversion. pi's `ModelRouteRequest.signal` becomes a
+> new `interface host-router`'s `is-route-cancelled(route-id)` poll. Both imports and that interface are
+> ADDITIVE and would not have forced the bump on their own. Evidence, tests and the full site list are in
+> the row in `06-cyrup-ext.md`.
+>
+> ## Corrections made in place
+>
+> **`SESS-067`'s Fix text, on its `build_context` half — the instruction was WRONG and has been struck
+> rather than followed.** `build_context`'s counterpart is `getSessionContextSettings`
+> (`packages/coding-agent/src/core/session-manager.ts:418` @v1.0.4), a forward last-wins loop upstream
+> never changed for virtual models: `sed -n '418,440p'` hashes to sha256
+> `1f011ecc8400ee6a4d850156477a795da07bab57404f59c8919cb5f7c5422990` at v0.87.1, v1.0.0 **and** v1.0.4, and
+> `git grep 'existingSession\.'` over `packages/coding-agent/src` at v1.0.4 returns only `.messages`,
+> `.thinkingLevel` and `.path` — no reader of `existingSession.model` anywhere. Upstream applies the hold
+> rule at exactly two places, both against the raw branch (`core/sdk.ts:207-222` and `_recordSelection`).
+> So `build_context` stays a forward last-wins projection. Re-measured independently on 2026-10-07; the
+> falsification condition is written into the row: a future pi tag that changes that hash, or adds a reader
+> of `existingSession.model`, re-opens the half.
+>
+> **`CODE-016`** carries a dated note (it stays open): the route export is a SECOND async guest export and
+> it hits none of CODE-016's four gaps, and CODE-015's lock hazard does not apply to routing — the
+> session's tool-state lock is a `std::sync::Mutex` whose `!Send` guard cannot be held across an `.await`,
+> while routing is awaited bare at a turn boundary holding no lock. What routing DOES add is the one wait
+> the epoch budget does not cover: the instance mutex, because every export arms `set_epoch_deadline` only
+> after taking it. `route_model` is the first export to bound that wait.
+>
+> ## Noted and moved on, not filed here
+>
+> Per-model `inputLimits` (`PROV-134` / `CFG-085`) is a genuinely different feature and stays where it is.
+> It touches virtual models at one point — pi's `_limitsModel()?.inputLimits?.images?.resize` sizes image
+> auto-resize to the ROUTED model — which is why `limits_model` has only one reader in the tree.
+
 # UPDATE 2026-10-07 (area 18, pi `v1.0.1..v1.0.4`) — area 18 re-pinned to `v1.0.4`; `CODE-018`…`CODE-020` and `TOOL-057` filed and closed, `TOOL-058` and `MCP-616` filed open
 
 > Upstream read at pi `v1.0.4` (area 18's pin from today) through git objects only. The count is whatever

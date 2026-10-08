@@ -271,6 +271,55 @@ impl bindings::cyrup::ext::registration::Host for HostState {
         let _ = guest.registry.register_bash_operations(guest.owner.clone());
     }
 
+    /// The GUEST tier of pi `pi.registerVirtualModel(model)`
+    /// (`core/extensions/types.ts:1865-1872` @v1.0.4, impl `core/extensions/loader.ts:500-513`).
+    ///
+    /// `spec_json` is pi's `Omit<VirtualModelDefinition, "route">`; the route callback stays
+    /// guest-side behind the `events.route-model` export, reached through a
+    /// [`GuestModelRouter`]. The registration itself goes through the SAME registry door the
+    /// native tier uses ([`crate::ExtensionRegistry::register_virtual_model`], which
+    /// `facade.rs::load_native_body` also calls), so the pre-bind pending queue, the bind-time
+    /// flush with pi's per-item diagnostic, the owner attribution and the `/reload` purge are
+    /// inherited rather than forked.
+    ///
+    /// No capability gate: `interface registration` sits outside the `capabilities.{fs,exec,net,ui}`
+    /// block, exactly like `register-provider` and `register-bash-operations`, because upstream
+    /// binds `registerVirtualModel` behind nothing but `assertActive()`.
+    async fn register_virtual_model(&mut self, spec_json: String) -> Result<(), String> {
+        let guest = guest_of(self)?;
+        // A guest author's typo in the spec is pi's throwing factory: the `err` arm carries the
+        // serde message and an SDK `init` that propagates it fails the load.
+        let spec: cyrup_provider::VirtualModelSpec =
+            serde_json::from_str(&spec_json).map_err(|e| {
+                format!("register-virtual-model: spec-json is not a virtual model spec: {e}")
+            })?;
+        let provider = spec.provider.as_str().to_string();
+        let id = spec.id.as_str().to_string();
+        let router = Arc::new(GuestModelRouter {
+            live: guest.live_map(),
+            owner: guest.owner.clone(),
+            provider: provider.clone(),
+            id: id.clone(),
+        });
+        let definition = cyrup_provider::VirtualModelDefinition::new(spec, router);
+        guest
+            .registry
+            .register_virtual_model(guest.owner.clone(), definition, guest.owner.as_str())
+            .map_err(|e| e.to_string())
+    }
+
+    /// The GUEST tier of pi `pi.unregisterVirtualModel(provider, id)`
+    /// (`core/extensions/types.ts:1875` @v1.0.4). Void like upstream's, so the `bool` the registry
+    /// answers is discarded. Owner-narrowed
+    /// ([`crate::ExtensionRegistry::unregister_virtual_model_owned`]), which is what stops one
+    /// guest removing another's virtual model.
+    async fn unregister_virtual_model(&mut self, provider: String, id: String) {
+        let Ok(guest) = guest_of(self) else { return };
+        let _ = guest
+            .registry
+            .unregister_virtual_model_owned(&guest.owner, &provider, &id);
+    }
+
     async fn register_message_renderer(&mut self, custom_type: String) {
         let Ok(guest) = guest_of(self) else { return };
         // Record it in the SHARED registry so the host can route a custom type back to its owning
@@ -698,6 +747,19 @@ impl bindings::cyrup::ext::session::Host for HostState {
         if let Ok(guest) = guest_of(self) {
             guest.services.set_label(&entry_id, label.as_deref());
         }
+    }
+}
+
+/// pi's `ModelRouteRequest.signal?: AbortSignal` (`core/virtual-models.ts:69` @v1.0.4), as the poll
+/// a `CancelToken` has to become to cross the Component Model — the same substitution
+/// `host-bash.is-bash-cancelled` makes for `BashOperations.exec`'s `signal`.
+impl bindings::cyrup::ext::host_router::Host for HostState {
+    /// `false` for any `route-id` that is not the route running on this instance, so a stale poll
+    /// from a later handler cannot read a dead route's state (EXT-M06).
+    async fn is_route_cancelled(&mut self, route_id: String) -> bool {
+        guest_of(self)
+            .map(|g| g.route_is_cancelled(&route_id))
+            .unwrap_or(false)
     }
 }
 
@@ -1616,6 +1678,56 @@ pub enum GuestReentry {
         /// The call that holds the instance.
         holder: ToolCallId,
     },
+    /// A virtual-model `route()` was asked of an instance that is already executing a tool call.
+    /// Same hazard as [`Self::ToolOfSameExtension`] and the same answer: the holder is suspended
+    /// wasm, an instance runs one call at a time, so queueing the route behind it can wait
+    /// indefinitely. Refusing by name lands on upstream's documented contract for a failing router
+    /// — *"If `route()` throws … the request ends with an error response"*
+    /// (`docs/virtual-models.md` @v1.0.4) — instead of hanging the user's turn.
+    #[error(
+        "virtual model `{provider}/{id}` could not be routed: its extension instance is executing tool call `{holder}`, and an instance runs one call at a time"
+    )]
+    RouterOfBusyInstance {
+        /// The virtual model's provider id.
+        provider: String,
+        /// The virtual model's id.
+        id: String,
+        /// The tool call that holds the instance.
+        holder: ToolCallId,
+    },
+}
+
+/// Why one `events.route-model` dispatch did not produce a route. Every arm becomes a
+/// [`cyrup_provider::ModelRouteError`] in [`GuestModelRouter::route`], which upstream's contract
+/// turns into an error response for the request — *"If `route()` throws, or returns a virtual model
+/// or a model without credentials, the request ends with an error response"*
+/// (`docs/virtual-models.md` @v1.0.4).
+#[derive(Debug, thiserror::Error)]
+pub enum GuestRouteError {
+    /// The instance was already executing a tool call, so the route was refused rather than queued
+    /// behind suspended wasm.
+    #[error(transparent)]
+    Reentry(#[from] GuestReentry),
+    /// The instance mutex did not become available in time — the one wait the epoch budget does not
+    /// cover (see [`LiveExtension::ROUTE_LOCK_TIMEOUT`]).
+    #[error(
+        "virtual model `{provider}/{id}` could not be routed: its extension instance was still \
+         busy after {timeout_ms}ms"
+    )]
+    LockTimeout {
+        /// The virtual model's provider id.
+        provider: String,
+        /// The virtual model's id.
+        id: String,
+        /// The bound that elapsed, in milliseconds.
+        timeout_ms: u64,
+    },
+    /// The guest's own `err` arm — pi's `route()` throwing, carried across as a value.
+    #[error("{0}")]
+    Guest(String),
+    /// A host-side failure: a trap, an epoch timeout, an OOM, or the request being cancelled.
+    #[error(transparent)]
+    Host(#[from] ExtError),
 }
 
 /// Unwinds the two pieces of INSTANCE-scoped state `execute_tool` binds for the duration of ONE
@@ -1688,6 +1800,31 @@ impl Drop for BashCallBinding<'_> {
                  abandoned); discarded so it cannot surface in the next command"
             );
         }
+    }
+}
+
+/// The `route-model` sibling of [`ToolCallBinding`] / [`BashCallBinding`], with the same job on the
+/// same three exit paths (settled / cancelled / future dropped): unbind this route's
+/// `route-id` + `CancelToken` so a later `host-router.is-route-cancelled` poll cannot read a dead
+/// route's state (EXT-M06).
+///
+/// It is NOT ceremony and NOT optional here. [`ToolCallBinding`]'s own doc records that the third
+/// exit — the whole future being dropped mid-await by an outer `select!`/`timeout`/aborted
+/// `JoinHandle` — leaks the bound token, and [`LiveExtension::route_model`] makes that path
+/// reachable BY CONSTRUCTION: it wraps lock-acquisition-plus-call in a `tokio::time::timeout`
+/// because the epoch budget does not cover the mutex wait.
+///
+/// There is no queue half: a route returns one answer and streams nothing, so unlike its two
+/// siblings there are no undelivered chunks to discard.
+///
+/// Declared AFTER the `inner` mutex guard in `route_model` so it drops BEFORE it, for the same
+/// reason: the unwind happens while the instance lock is still held, so no other call can observe
+/// the gap.
+pub(crate) struct RouteCallBinding<'a>(pub(crate) &'a Arc<GuestState>);
+
+impl Drop for RouteCallBinding<'_> {
+    fn drop(&mut self) {
+        self.0.set_route_cancel(None);
     }
 }
 
@@ -2022,6 +2159,133 @@ impl LiveExtension {
             .map(|t| u64::try_from(t.as_millis().div_ceil(tick_ms)).unwrap_or(u64::MAX))
             .unwrap_or(0);
         self.epoch_ticks.saturating_add(extra)
+    }
+
+    /// How long [`Self::route_model`] waits for the instance mutex before giving up.
+    ///
+    /// This bound is NOT redundant with the epoch budget, and that is a measured claim: every
+    /// existing export arms the budget only AFTER it holds the lock
+    /// (`inner.store.set_epoch_deadline(…)` sits below `self.inner.lock().await` in
+    /// [`Self::execute_tool`], [`Self::bash_operations_exec`] and [`Self::execute_command`]), so
+    /// the mutex wait itself is unbudgeted. A tool has an outer caller that can give up; a router
+    /// runs inside the agent's request preflight, where a hang is a hung user turn.
+    const ROUTE_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+    /// Run this guest's virtual-model router for ONE request — pi
+    /// `VirtualModelDefinition.route(request)` / `ExtensionVirtualModel.route(request, ctx)`
+    /// (`core/virtual-models.ts:101`, `core/extensions/types.ts:1888` @v1.0.4), reached because
+    /// the guest declared `registration.register-virtual-model` for `(provider, id)`.
+    ///
+    /// `request_json` is pi's `ModelRouteRequest` in camelCase and the answer is its `ModelRoute`;
+    /// shaping and validating both is [`GuestModelRouter`]'s job, because the answer has to be
+    /// re-resolved against the catalog before anyone streams it
+    /// ([`cyrup_provider::VirtualModelRegistry::resolve_model`]).
+    ///
+    /// Modelled on [`Self::execute_tool`], with four deliberate differences:
+    ///
+    /// 1. **Reentrancy is refused, not queued, BEFORE the lock is touched.** A route asked of an
+    ///    instance already executing a tool call is [`GuestReentry::RouterOfBusyInstance`]: the
+    ///    holder is suspended wasm and an instance runs one call at a time, so queueing behind it
+    ///    can wait indefinitely. Upstream has no such case — a JS router and a JS tool share one
+    ///    event loop — and its documented answer to a failing router is an error response, which
+    ///    is exactly where this lands.
+    /// 2. **Acquisition is bounded** by [`Self::ROUTE_LOCK_TIMEOUT`], for the reason that constant
+    ///    records. A timeout becomes a typed error, never a hung turn.
+    /// 3. **EVENT tier**, not command tier: routing runs inside the agent's request preflight
+    ///    rather than from a command handler, so session-replacement ops stay refused — the same
+    ///    reasoning [`Self::execute_tool`] applies.
+    /// 4. **No replay tail.** A route returns one answer and streams nothing, so unlike
+    ///    `execute_tool`/`bash_operations_exec` the cancelled arm has nothing to hand over and
+    ///    returns straight away.
+    ///
+    /// A trap, OOM or runaway loop is contained by [`map_wasm_error`] into a typed [`ExtError`]
+    /// ([`ExtError::EpochTimeout`] for the epoch case) and never crashes the host. A router that
+    /// legitimately blocks on I/O is not punished for it: `http_client`, `exec`, `proc`, `oauth`
+    /// and `host_tool.execute_tool` all call [`GuestState::note_dialog_wait`], and the store's
+    /// `epoch_deadline_callback` forgives that unused budget instead of trapping.
+    ///
+    /// # Errors
+    ///
+    /// [`GuestRouteError`] — the reentrancy refusal, the acquisition timeout, the guest's own
+    /// `err` arm (pi's `route()` throwing), a host-side trap/cancellation.
+    pub async fn route_model(
+        &self,
+        provider: &str,
+        id: &str,
+        route_id: &str,
+        request_json: &str,
+        cancel: &CancelToken,
+    ) -> Result<String, GuestRouteError> {
+        self.route_model_with_timeout(
+            provider,
+            id,
+            route_id,
+            request_json,
+            cancel,
+            Self::ROUTE_LOCK_TIMEOUT,
+        )
+        .await
+    }
+
+    /// [`Self::route_model`] with the acquisition bound as a parameter, so a test can pin the
+    /// bounded-wait behaviour without waiting [`Self::ROUTE_LOCK_TIMEOUT`] for it. Production
+    /// always goes through `route_model`, which supplies that constant.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::route_model`].
+    pub async fn route_model_with_timeout(
+        &self,
+        provider: &str,
+        id: &str,
+        route_id: &str,
+        request_json: &str,
+        cancel: &CancelToken,
+        timeout: std::time::Duration,
+    ) -> Result<String, GuestRouteError> {
+        if let Some(holder) = self.guest.tool_call_in_flight() {
+            return Err(GuestRouteError::Reentry(
+                GuestReentry::RouterOfBusyInstance {
+                    provider: provider.to_string(),
+                    id: id.to_string(),
+                    holder,
+                },
+            ));
+        }
+        let dispatch = async {
+            let mut guard = self.inner.lock().await;
+            let inner = &mut *guard;
+            inner.store.set_epoch_deadline(self.epoch_ticks);
+            self.guest.arm_epoch_deadline_estimate(self.epoch_ticks);
+            self.guest.set_tier(CtxTier::Event);
+            // Bind this route's token for the guest's `host-router.is-route-cancelled` poll (pi's
+            // `ModelRouteRequest.signal`). Unbound by `RouteCallBinding`'s `Drop`, NOT by hand:
+            // this future is dropped at the `select!` below when the outer `timeout` fires, and a
+            // hand-written clear on each arm does not run on that path.
+            self.guest
+                .set_route_cancel(Some((route_id.to_string(), cancel.clone())));
+            let _route_call = RouteCallBinding(&self.guest);
+            let api = inner.instance.cyrup_ext_events();
+            let call = api.call_route_model(&mut inner.store, provider, id, route_id, request_json);
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => Err(GuestRouteError::Host(ExtError::Cancelled)),
+                r = call => match r {
+                    Ok(Ok(answer)) => Ok(answer),
+                    // pi's `route()` throwing, as a value.
+                    Ok(Err(message)) => Err(GuestRouteError::Guest(message)),
+                    Err(e) => Err(GuestRouteError::Host(map_wasm_error(&e))),
+                },
+            }
+        };
+        match tokio::time::timeout(timeout, dispatch).await {
+            Ok(res) => res,
+            Err(_) => Err(GuestRouteError::LockTimeout {
+                provider: provider.to_string(),
+                id: id.to_string(),
+                timeout_ms: u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
+            }),
+        }
     }
 
     /// Execute a guest-registered slash command (R-08-016). Mirrors Pi's
@@ -2663,6 +2927,194 @@ impl cyrup_tools::ops::BashOperations for GuestBashOperations {
         self.ext
             .bash_operations_exec(&Self::next_call_id(), command, cwd, opts)
             .await
+    }
+}
+
+/// The virtual-model router a WASM guest supplies — pi's `ExtensionVirtualModel.route`
+/// (`core/extensions/types.ts:1888` @v1.0.4, over `VirtualModelDefinition.route`,
+/// `core/virtual-models.ts:101`), reconstituted host-side as a [`cyrup_provider::ModelRouter`] that
+/// forwards each call to the owning guest's `events.route-model` export.
+///
+/// This is the GUEST tier beside the native one (an ordinary Rust `Arc<dyn ModelRouter>` handed to
+/// [`crate::InitApi::register_virtual_model`]). ADR-0002 forbids a guest RETURNING a callable, so
+/// the callable stays guest-side and the host holds this forwarder — the same substitution
+/// [`GuestBashOperations`] makes for `BashOperations`, and `register-message-renderer` +
+/// `render-call` for a renderer.
+///
+/// # Why the instance is resolved per call
+///
+/// `live` is a [`std::sync::Weak`] of the host's live-instance table, not an
+/// `Arc<LiveExtension>`, for two reasons that both matter. (1) The registration import runs INSIDE
+/// `init`, before the facade has an `Arc<LiveExtension>` to bind at all. (2) A strong edge back
+/// from the router to the table would close the cycle facade -> `live` -> `LiveExtension` ->
+/// `GuestState` -> router and leak the whole host. Resolving per call also makes `/reload` and a
+/// late (post-`init`) registration correct with no second table and no materialization pass: after
+/// the owner leaves `live`, the route answers that the extension is no longer loaded, which is the
+/// honest answer and lands on upstream's error-response contract.
+pub struct GuestModelRouter {
+    /// The host's live-instance table; `None` for a guest built outside an
+    /// [`crate::ExtensionHost`], which then has no instance to route into.
+    pub(crate) live: Option<std::sync::Weak<crate::facade::LiveMap>>,
+    /// The extension that registered this virtual model.
+    pub(crate) owner: ExtensionId,
+    /// The virtual model's provider id, as the export's first argument.
+    pub(crate) provider: String,
+    /// The virtual model's id, as the export's second argument. One guest may register several
+    /// virtual models, which is why the export is keyed by the pair.
+    pub(crate) id: String,
+}
+
+impl GuestModelRouter {
+    /// A fresh key for one route, so `host-router.is-route-cancelled` is attributable to the route
+    /// that is actually running (EXT-M06's rule, applied to this seam). Upstream needs no key: its
+    /// `signal` IS the request.
+    pub(crate) fn next_route_id() -> String {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        format!("route-{}", NEXT.fetch_add(1, Ordering::Relaxed))
+    }
+
+    /// pi's `ModelRouteRequest` (`core/virtual-models.ts:52-70` @v1.0.4) as camelCase JSON. pi's
+    /// `signal?` is deliberately absent: it is the `route-id`-keyed poll instead.
+    pub(crate) fn request_json(request: &cyrup_provider::ModelRouteRequest<'_>) -> Value {
+        let routed = |r: &cyrup_provider::RoutedModel| serde_json::json!({ "model": r.model, "thinkingLevel": r.thinking_level });
+        let mut out = serde_json::Map::new();
+        out.insert(
+            "model".into(),
+            serde_json::to_value(request.model).unwrap_or(Value::Null),
+        );
+        out.insert(
+            "thinkingLevel".into(),
+            serde_json::to_value(request.thinking_level).unwrap_or(Value::Null),
+        );
+        out.insert(
+            "reason".into(),
+            Value::String(request.reason.as_str().to_string()),
+        );
+        // `previous?` / `failed?` / `state?` are OMITTED when absent, as upstream's optional
+        // members are — a guest reading `"previous" in request` must see what a pi extension sees.
+        if let Some(previous) = &request.previous {
+            out.insert("previous".into(), routed(previous));
+        }
+        if let Some(failed) = &request.failed {
+            out.insert(
+                "failed".into(),
+                serde_json::json!({
+                    "model": failed.model,
+                    "thinkingLevel": failed.thinking_level,
+                    "message": failed.message,
+                }),
+            );
+        }
+        if let Some(state) = request.state {
+            out.insert("state".into(), state.clone());
+        }
+        out.insert(
+            "messages".into(),
+            serde_json::to_value(request.messages).unwrap_or(Value::Array(Vec::new())),
+        );
+        Value::Object(out)
+    }
+
+    /// Decode the guest's `ModelRoute` (`core/virtual-models.ts:72-82` @v1.0.4).
+    ///
+    /// `model` is expected to be the whole model object the guest got from its `models.list-models`
+    /// import — which is the host's own [`cyrup_provider::Model`] serialization round-tripped
+    /// (`models.list-models` answers `guest.services.models().to_string()`), so it decodes by
+    /// construction, and it is what upstream's docs tell a router to return
+    /// (`ctx.modelRegistry.find(…)`). Because [`cyrup_provider::Model`] has ten non-defaulted
+    /// fields, the `{provider, id}` stub a Rust author will naturally write does NOT deserialize —
+    /// so that shape is resolved out of the guest's own catalog view instead. Both are safe: the
+    /// router's model is only an ADDRESS, and
+    /// [`cyrup_provider::VirtualModelRegistry::resolve_model`] returns the CATALOG's row.
+    pub(crate) fn decode_route(
+        &self,
+        answer: &str,
+        catalog: &Value,
+    ) -> Result<cyrup_provider::ModelRoute, String> {
+        let value: Value = serde_json::from_str(answer)
+            .map_err(|e| format!("route-model answered JSON this host cannot read: {e}"))?;
+        let model_value = value
+            .get("model")
+            .ok_or_else(|| "route-model answered no `model`".to_string())?;
+        let model = match serde_json::from_value::<cyrup_provider::Model>(model_value.clone()) {
+            Ok(model) => model,
+            Err(full_err) => {
+                let provider = model_value.get("provider").and_then(Value::as_str);
+                let id = model_value.get("id").and_then(Value::as_str);
+                let (Some(provider), Some(id)) = (provider, id) else {
+                    return Err(format!(
+                        "route-model's `model` is neither a model nor a {{provider, id}}: {full_err}"
+                    ));
+                };
+                let row = catalog
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .find(|m| {
+                        m.get("provider").and_then(Value::as_str) == Some(provider)
+                            && m.get("id").and_then(Value::as_str) == Some(id)
+                    })
+                    .ok_or_else(|| {
+                        format!(
+                            "route-model named `{provider}/{id}`, which is not in this \
+                             extension's model catalog"
+                        )
+                    })?;
+                serde_json::from_value::<cyrup_provider::Model>(row.clone()).map_err(|e| {
+                    format!("`{provider}/{id}` is in the catalog but did not decode: {e}")
+                })?
+            }
+        };
+        // pi's `thinkingLevel` is REQUIRED on `ModelRoute`; a guest that omits it gets the level
+        // the request carried, which `resolve_model` then clamps to the answering model.
+        let thinking_level = match value.get("thinkingLevel") {
+            Some(Value::Null) | None => None,
+            Some(level) => Some(
+                serde_json::from_value::<cyrup_core::ModelThinkingLevel>(level.clone())
+                    .map_err(|e| format!("route-model's `thinkingLevel` is not a level: {e}"))?,
+            ),
+        };
+        Ok(cyrup_provider::ModelRoute {
+            model,
+            thinking_level: thinking_level.unwrap_or_default(),
+            // pi: "Return `request.state` or undefined to keep the current state." Both arrive
+            // here as absent-or-null, and the session's persist step compares by value.
+            state: value.get("state").filter(|v| !v.is_null()).cloned(),
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl cyrup_provider::ModelRouter for GuestModelRouter {
+    async fn route(
+        &self,
+        request: cyrup_provider::ModelRouteRequest<'_>,
+    ) -> Result<cyrup_provider::ModelRoute, cyrup_provider::ModelRouteError> {
+        let fail = |message: String| cyrup_provider::ModelRouteError(message);
+        let Some(live) = self.live.as_ref().and_then(std::sync::Weak::upgrade) else {
+            return Err(fail(format!(
+                "virtual model `{}/{}` cannot be routed: extension `{}` is no longer loaded",
+                self.provider, self.id, self.owner
+            )));
+        };
+        let Some(ext) = live.read().ok().and_then(|g| g.get(&self.owner).cloned()) else {
+            return Err(fail(format!(
+                "virtual model `{}/{}` cannot be routed: extension `{}` is no longer loaded",
+                self.provider, self.id, self.owner
+            )));
+        };
+        let route_id = Self::next_route_id();
+        let request_json = Self::request_json(&request).to_string();
+        let cancel = request.cancel.clone();
+        let answer = ext
+            .route_model(&self.provider, &self.id, &route_id, &request_json, &cancel)
+            .await
+            .map_err(|e| fail(e.to_string()))?;
+        // Read the guest's own catalog view ONLY for the `{provider, id}` fallback, and only after
+        // the call, so the common path costs nothing.
+        let catalog = ext.guest().services.models();
+        self.decode_route(&answer, &catalog).map_err(fail)
     }
 }
 

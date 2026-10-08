@@ -2093,6 +2093,7 @@ dependencies = [
  "cyrup-ext",
  "cyrup-provider",
  "cyrup-resources",
+ "cyrup-session",
  "cyrup-session-svc",
  "cyrup-tools",
  "futures",

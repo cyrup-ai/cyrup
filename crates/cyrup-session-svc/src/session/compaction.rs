@@ -62,23 +62,33 @@ impl AgentSession {
         // caught by the same handler that emits `compaction_end` with
         // `errorMessage: "Compaction failed: …"` (`:1908-1917`), which is why the exit below mirrors
         // the `NothingToCompact` arm rather than returning bare.
-        let current_model = Self::lock(&self.compaction_model).clone();
-        let model = match current_model {
-            Some(m) => m,
-            None => {
-                cancel_slot.clear();
-                let err = SessionServiceError::NoModelSelected;
-                self.fanout_emit(AgentSessionEvent::CompactionEnd {
-                    reason,
-                    result: None,
-                    aborted: false,
-                    will_retry: false,
-                    error_message: Some(format!("Compaction failed: {err}")),
-                })
-                .await;
-                return Err(err);
-            }
-        };
+        // pi `const model = this.model; if (!model) { throw … }` (`agent-session.ts:2758-2761`
+        // @v1.0.4) — the SELECTION, which under a router is the VIRTUAL model. Only its PRESENCE
+        // is checked here.
+        //
+        // SESS-DEFECT-2: the ROUTE used to be taken right here, which was wrong in two observable
+        // ways. Upstream routes inside `_runDefaultCompaction` (`:2704-2727`), reached only from
+        // the `else` arm of `if (extensionCompaction)` (`:2806-2815`), so an extension-supplied
+        // compaction is never routed and a session with nothing to compact never reaches the
+        // router either. With the route taken up here, a router that is unavailable for `direct`
+        // requests — upstream's own test installs exactly that one
+        // (`test/suite/virtual-models.test.ts:346`, "does not route compactions that an extension
+        // supplies") — failed a compaction the extension had already supplied, and turned
+        // "nothing to compact" into a routing failure. The route now happens below, in the one arm
+        // that makes a model call.
+        if Self::lock(&self.compaction_model).is_none() {
+            cancel_slot.clear();
+            let err = SessionServiceError::NoModelSelected;
+            self.fanout_emit(AgentSessionEvent::CompactionEnd {
+                reason,
+                result: None,
+                aborted: false,
+                will_retry: false,
+                error_message: Some(format!("Compaction failed: {err}")),
+            })
+            .await;
+            return Err(err);
+        }
         // Pi reads `getCompactionSettings(model)` next (`agent-session.ts:2419` @v0.87.1), inside
         // the same `try`, so an invalid budget (SESS-055) ends in the same
         // `"Compaction failed: …"` `compaction_end` as the model check above.
@@ -97,32 +107,24 @@ impl AgentSession {
                 return Err(err);
             }
         };
-        // Pi: `this._summarizationRetryCallbacks({ source: "compaction", reason: "manual" })`
-        // (agent-session.ts:1859).
-        let (retry_observer, retry_rx) =
-            crate::compact::summarization_retry_channel(SummarizationRetrySource::Compaction {
-                reason,
-            });
-        let retry_pump = self.spawn_event_pump(retry_rx);
-        let summarizer = DynSummarizer::new(
-            self.provider.current(),
-            model.clone(),
-            self.summarization_retry(),
-        )
-        .with_observer(retry_observer);
-        // Pi threads the session thinking level into every compaction summarization call
-        // (`agent-session.ts:1855,2129`); `summarization_reasoning` applies the `model.reasoning`
-        // gate before it reaches the request.
-        let compactor =
-            Compactor::new(summarizer, NoHooks).with_thinking(self.thinking_level().await);
-
         // Compute the REAL preparation BEFORE the extension hook (Pi computes `prepareCompaction`
         // then fires `session_before_compact` against it, agent-session.ts:1663-1693; L4 gap #5).
         // `None` ⇒ nothing to compact — this is the ONLY preparation (no double-prep: the same
         // `prep` feeds `run_compaction_prepared` below).
+        //
+        // SESS-DEFECT-2: this is [`Compactor::prepare`]'s body, inlined, because the `Compactor`
+        // itself cannot be built yet — its summarizer needs the routed model, and the route is
+        // not taken until after the hook. Behaviourally identical: `prepare` is the only reader of
+        // `Compactor::cache`, and a `Compactor` is built fresh per compaction here, so its cache
+        // was always the empty one this call passes.
+        let token_cache = cyrup_session::compaction::TokenCache::default();
         let (prep, branch_entries) = {
             let guard = self.manager.lock().await;
-            match compactor.prepare(&guard, &settings) {
+            let path: Vec<cyrup_session::entry::Entry> =
+                guard.branch_path(None).into_iter().cloned().collect();
+            match cyrup_session::compaction::prepare_compaction(&path, &token_cache, &settings)
+                .map(|prep| (prep, path))
+            {
                 Some(x) => x,
                 None => {
                     // Distinguish WHY, exactly as Pi does (agent-session.ts:1801-1807): a branch that
@@ -186,6 +188,73 @@ impl AgentSession {
             }
             BeforeCompactOutcome::Proceed(ov) => ov,
         };
+
+        // THE ROUTE, here and nowhere earlier. pi `_getSummarizationRequestAuth(model, signal)`
+        // (`agent-session.ts:560-581` @v1.0.4, whose own comment is *"Route a virtual model first:
+        // summaries size their input and output from the model they get"*), called from
+        // `_runDefaultCompaction` (`:2704-2727`) — which `compact()` reaches ONLY in the `else`
+        // arm of `if (extensionCompaction)` (`:2806-2815`).
+        //
+        // So: an extension-supplied compaction makes no model call and takes no route, and a
+        // `direct`-refusing router cannot break it (upstream's own
+        // `test/suite/virtual-models.test.ts:346`). Under a virtual selection with no override
+        // this is a `direct` route; otherwise it is the selection and the session level,
+        // unchanged. Handing the summarizer the VIRTUAL model instead would send `pi-virtual` to a
+        // provider, which answers with the unrouted-stream error.
+        //
+        // With an override, `model` is the SELECTION — which is what upstream passes down as
+        // `model` on both arms, routing being a detail inside the default one — and
+        // `Compactor::finish_compaction`'s override arm never reads it or the summarizer.
+        //
+        // A routing failure lands in the same `"Compaction failed: …"` `compaction_end` as the
+        // checks above, because upstream calls it inside the same `try`.
+        let (model, summary_level) = if external_override.is_some() {
+            let selected = Self::lock(&self.compaction_model)
+                .clone()
+                .ok_or(SessionServiceError::NoModelSelected)?;
+            (selected, self.thinking_level().await)
+        } else {
+            // `Ok(None)` is a modelless session, which the presence check above already refused;
+            // if the selection was cleared in between it is still that refusal and not a routing
+            // failure.
+            match self
+                .summarization_model()
+                .await
+                .and_then(|pair| pair.ok_or(SessionServiceError::NoModelSelected))
+            {
+                Ok(pair) => pair,
+                Err(err) => {
+                    cancel_slot.clear();
+                    self.fanout_emit(AgentSessionEvent::CompactionEnd {
+                        reason,
+                        result: None,
+                        aborted: false,
+                        will_retry: false,
+                        error_message: Some(format!("Compaction failed: {err}")),
+                    })
+                    .await;
+                    return Err(err);
+                }
+            }
+        };
+
+        // Pi: `this._summarizationRetryCallbacks({ source: "compaction", reason: "manual" })`
+        // (agent-session.ts:1859).
+        let (retry_observer, retry_rx) =
+            crate::compact::summarization_retry_channel(SummarizationRetrySource::Compaction {
+                reason,
+            });
+        let retry_pump = self.spawn_event_pump(retry_rx);
+        let summarizer = DynSummarizer::new(
+            self.provider.current(),
+            model.clone(),
+            self.summarization_retry(),
+        )
+        .with_observer(retry_observer);
+        // Pi threads the session thinking level into every compaction summarization call
+        // (`agent-session.ts:1855,2129`); `summarization_reasoning` applies the `model.reasoning`
+        // gate before it reaches the request.
+        let compactor = Compactor::new(summarizer, NoHooks).with_thinking(summary_level);
 
         let mut guard = self.manager.lock().await;
         let result = compactor

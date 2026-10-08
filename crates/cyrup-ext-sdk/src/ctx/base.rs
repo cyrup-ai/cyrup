@@ -167,6 +167,44 @@ impl Ctx {
         }
     }
 
+    /// Register a virtual model from inside a LIVE handler, after `init` — pi
+    /// `pi.registerVirtualModel(model)` called at runtime, which upstream gates behind nothing but
+    /// `assertActive()` (`core/extensions/loader.ts:500-513` @v1.0.4), so a `session_start` handler
+    /// may add one exactly as `examples/extensions/dynamic-tools.ts` adds a tool.
+    ///
+    /// `Err` is pi's `registerVirtualModel` throw: an empty provider or id, or an id that already
+    /// names a PHYSICAL model of that provider. Nothing is registered. `?` stops the handler here
+    /// and fails its call, as pi's uncaught throw does; handling the `Err` is pi's `try`/`catch`,
+    /// and the handler carries on.
+    #[must_use = "a refused registration is pi's throw: `?` it out of the handler, or handle it"]
+    pub fn register_virtual_model(
+        &self,
+        spec: crate::descriptor::VirtualModelSpec,
+        router: impl crate::api::VirtualModelRouter,
+    ) -> Result<(), crate::api::RegistrationError> {
+        #[cfg(target_arch = "wasm32")]
+        return crate::guest::register_virtual_model_late(spec, Box::new(router));
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let _ = (spec, router);
+            Ok(())
+        }
+    }
+
+    /// Remove a virtual model this extension registered — pi `pi.unregisterVirtualModel(provider,
+    /// id)` (`core/extensions/types.ts:1875` @v1.0.4). Void like upstream's, and an absent pair is
+    /// a no-op.
+    ///
+    /// `pi.unregisterProvider()` does NOT imply this, which the host honours too.
+    pub fn unregister_virtual_model(&self, provider: &str, id: &str) {
+        #[cfg(target_arch = "wasm32")]
+        crate::guest::unregister_virtual_model_late(provider, id);
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let _ = (provider, id);
+        }
+    }
+
     // --- base-context state + lifecycle (pi `ExtensionContext`, types.ts:307-347 @v0.83.0;
     // EXT-072: `:305` is `ExtensionMode`). Pi puts ALL of
     // these on the base context — "Available in all contexts" — so they live on `Ctx`, not on

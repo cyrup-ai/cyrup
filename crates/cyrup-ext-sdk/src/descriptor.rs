@@ -504,6 +504,218 @@ pub struct FlagSpec {
     pub description: Option<String>,
 }
 
+// --- Virtual models (pi `pi.registerVirtualModel`, `extensions/types.ts:1865-1876` @v1.0.4) ---
+
+/// What a virtual model declares — pi's `Omit<VirtualModelDefinition, "route">`
+/// (`core/virtual-models.ts:84-102` @v1.0.4), which `ExtensionVirtualModel` extends (`:1886-1889`).
+///
+/// A virtual model is a selectable catalog entry that routes each request to a PHYSICAL model. The
+/// selection (`ctx.model`, `model_change` entries) names the virtual model; assistant messages
+/// record the physical model and thinking level the router picked.
+///
+/// The `route` callback is deliberately NOT a member: a callable cannot cross a component boundary
+/// (ADR-0002), so it is supplied separately to
+/// [`ExtensionApi::register_virtual_model`](crate::ExtensionApi::register_virtual_model) and stays
+/// guest-side behind the `route-model` export the host calls once per request.
+///
+/// This crate depends only on `serde`, so these are the SDK's own mirrors of
+/// `cyrup_provider::VirtualModelSpec` rather than that type; they are field-for-field pi's, which
+/// is what keeps the two sides from drifting.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VirtualModelSpec {
+    /// pi `provider` — the provider id this virtual model is listed under. May be a provider that
+    /// also has physical models, and one provider may list several virtual models.
+    pub provider: String,
+    /// pi `id` — must not be the id of a physical model of `provider`. The host REFUSES such a
+    /// registration (the import's `err` arm), as pi's `registerVirtualModel` throws for it.
+    pub id: String,
+    /// pi `name` — the display name.
+    pub name: String,
+    /// pi `thinkingLevels?` — levels offered for selection. Omitted means pi's `["off"]` default;
+    /// an explicitly EMPTY list stays empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_levels: Option<Vec<String>>,
+    /// pi `contextWindow?` — the limit shown BEFORE the first response. Afterwards the limits of
+    /// the physical model that answered apply. Omitted is "unknown".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u64>,
+    /// pi `maxTokens?`. Omitted is "unknown".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u64>,
+    /// pi `input?` — input types accepted for selection (`"text"` / `"image"`). Omitted defaults to
+    /// text and images; a routed model without image support gets placeholders.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input: Option<Vec<String>>,
+}
+
+impl VirtualModelSpec {
+    /// The three required members, with every optional one left at pi's default.
+    pub fn new(
+        provider: impl Into<String>,
+        id: impl Into<String>,
+        name: impl Into<String>,
+    ) -> Self {
+        Self {
+            provider: provider.into(),
+            id: id.into(),
+            name: name.into(),
+            thinking_levels: None,
+            context_window: None,
+            max_tokens: None,
+            input: None,
+        }
+    }
+
+    /// pi `thinkingLevels` — the levels offered for selection.
+    #[must_use]
+    pub fn with_thinking_levels<S: Into<String>>(
+        mut self,
+        levels: impl IntoIterator<Item = S>,
+    ) -> Self {
+        self.thinking_levels = Some(levels.into_iter().map(Into::into).collect());
+        self
+    }
+
+    /// pi `contextWindow` / `maxTokens` — the limits shown before the first response.
+    #[must_use]
+    pub fn with_limits(mut self, context_window: u64, max_tokens: u64) -> Self {
+        self.context_window = Some(context_window);
+        self.max_tokens = Some(max_tokens);
+        self
+    }
+}
+
+/// A physical model and the thinking level that went with it — pi's
+/// `{ model, thinkingLevel? }` (`core/virtual-models.ts:58` @v1.0.4).
+///
+/// `model` stays a [`Value`] because it is the host's whole model object: a router that wants to
+/// stay on it returns it unchanged, which is what makes the sticky rule a one-liner.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RoutedModel {
+    /// The physical model that answered.
+    pub model: Value,
+    /// Its thinking level. Absent for a response the agent loop did not produce.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_level: Option<String>,
+}
+
+/// The failed request a `retry` is retrying — pi's
+/// `{ model, thinkingLevel?, message }` (`core/virtual-models.ts:63` @v1.0.4).
+///
+/// `message` carries the failure's `stopReason` and `errorMessage`, which is how a router decides
+/// whether to re-route (an overload) or stay put (a tool-format error).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FailedRequest {
+    /// The physical model whose request failed.
+    pub model: Value,
+    /// Its thinking level, when the message carried one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_level: Option<String>,
+    /// The failed assistant message.
+    pub message: Value,
+}
+
+/// Everything a router is told about one request — pi `ModelRouteRequest`
+/// (`core/virtual-models.ts:52-70` @v1.0.4).
+///
+/// pi's `signal?: AbortSignal` has no member here: a signal is not a WIT value, so it is the
+/// `route-id`-keyed poll behind [`Self::is_cancelled`] instead — the same substitution
+/// [`crate::BashCommand::is_cancelled`] makes for `BashOperations.exec`'s.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelRouteRequest {
+    /// The selected VIRTUAL model (pi `model`) — not the one being routed to.
+    pub model: Value,
+    /// The selected thinking level. **Its meaning is up to the router** (pi's own words): it may be
+    /// read as a budget hint rather than as a level to pass on.
+    pub thinking_level: String,
+    /// Why this request is being routed, one of pi's four: `user` (first request after a message
+    /// the user wrote), `continuation` (any other request in the agent loop), `retry` (automatic
+    /// retry after a failed request, including after compaction for a context overflow), `direct`
+    /// (a request outside the agent loop, e.g. a compaction summary).
+    pub reason: String,
+    /// Physical model and thinking level of the latest SUCCESSFUL response in `messages`
+    /// (pi `previous?`). Failed and aborted requests, including failed routing, are skipped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous: Option<RoutedModel>,
+    /// For `retry`: the failed request, which `messages` no longer contains (pi `failed?`).
+    /// **Absent when the routing itself failed** — there is then no physical request to report.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failed: Option<FailedRequest>,
+    /// The state this router last returned on this session branch (pi `state?`). Absent before the
+    /// first state and for every `direct` request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<Value>,
+    /// The conversation for this request, INCLUDING system messages (pi `messages`).
+    #[serde(default)]
+    pub messages: Value,
+    /// The host's key for this route, used by [`Self::is_cancelled`]. Not part of pi's type and not
+    /// on the wire — the host passes it as its own export argument and the export body fills it in.
+    #[serde(skip)]
+    pub route_id: String,
+}
+
+impl ModelRouteRequest {
+    /// pi's `request.signal.aborted`, as the poll a `CancelToken` has to become to cross a
+    /// component boundary. A router doing real work (classifying the prompt, calling a model)
+    /// should check it between units of work and return promptly once it is true.
+    ///
+    /// Always `false` on the host (non-`wasm32`) target, where there is no host to ask.
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        #[cfg(target_arch = "wasm32")]
+        {
+            return crate::guest::bindings::cyrup::ext::host_router::is_route_cancelled(
+                &self.route_id,
+            );
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        false
+    }
+}
+
+/// A physical model and thinking level for one request — pi `ModelRoute`
+/// (`core/virtual-models.ts:72-82` @v1.0.4).
+///
+/// `model` names the PHYSICAL model to use. Return the whole object a
+/// [`Models::find`](crate::Models::find) answered: the host re-resolves `provider`/`id` against the
+/// catalog, so what travels is an ADDRESS rather than a definition, and a route to a VIRTUAL model
+/// or to a provider without credentials ends the request with an error response.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelRoute {
+    /// The physical model to send this request to.
+    pub model: Value,
+    /// The thinking level to send it at. The host clamps it to what the answering model supports.
+    pub thinking_level: String,
+    /// New router state, stored on the session branch unless it is `request.state` itself. Return
+    /// `request.state` or `None` to keep the current state. Must be JSON-serializable (it is a
+    /// [`Value`], so it is). **Ignored for `direct` requests.**
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<Value>,
+}
+
+impl ModelRoute {
+    /// Route to `model` at `thinking_level`, keeping the current router state.
+    pub fn new(model: Value, thinking_level: impl Into<String>) -> Self {
+        Self {
+            model,
+            thinking_level: thinking_level.into(),
+            state: None,
+        }
+    }
+
+    /// pi `ModelRoute.state` — the state to store on this session branch.
+    #[must_use]
+    pub fn with_state(mut self, state: Value) -> Self {
+        self.state = Some(state);
+        self
+    }
+}
+
 // --- Provider registration (Pi `ProviderConfig`, types.ts:1363-1421; R-08-019) ---
 
 /// A custom LLM provider configuration registered via `register_provider`.

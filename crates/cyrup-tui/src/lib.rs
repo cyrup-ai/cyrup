@@ -243,7 +243,8 @@ pub use startup_loop::StartupSessionLoads;
 pub use startup_selector::{run_startup_selector, run_startup_session_selector};
 pub use startup_theme::StartupTheme;
 pub use status::{
-    StatusLine, experimental_features_enabled, experimental_features_enabled_from, format_tokens,
+    RoutedModel, StatusLine, experimental_features_enabled, experimental_features_enabled_from,
+    format_tokens,
 };
 pub use status_indicator::{
     IndicatorKind, SPINNER_FRAMES, SPINNER_INTERVAL, StatusIndicator, WorkingIndicator,

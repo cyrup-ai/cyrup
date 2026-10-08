@@ -516,6 +516,7 @@ fn error_event(
         response_model: None,
         response_id: None,
         provider_thinking_level: None,
+        thinking_level: None,
         diagnostics: None,
         usage: Usage::default(),
         stop_reason: if aborted {
@@ -612,6 +613,7 @@ impl Decoder {
             response_model: None,
             response_id: self.response_id.clone(),
             provider_thinking_level: self.provider_thinking_level.clone(),
+            thinking_level: None,
             diagnostics: self.diagnostics.clone(),
             usage: self.usage.clone(),
             stop_reason: self.stop_reason,

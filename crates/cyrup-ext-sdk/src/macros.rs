@@ -115,6 +115,17 @@ macro_rules! export_extension {
                 {
                     $crate::guest::bash_operations_exec(call_id, command, cwd, opts_json)
                 }
+                // The guest half of pi's `ExtensionVirtualModel.route(request, ctx)`. Called
+                // only on a guest that declared `registration.register-virtual-model`, once per
+                // provider request whose selected model is that virtual one.
+                fn route_model(
+                    provider: ::std::string::String,
+                    id: ::std::string::String,
+                    route_id: ::std::string::String,
+                    request_json: ::std::string::String,
+                ) -> ::core::result::Result<::std::string::String, ::std::string::String> {
+                    $crate::guest::route_model(provider, id, route_id, request_json)
+                }
                 fn on_terminal_input(
                     data: ::std::string::String,
                 ) -> ::core::option::Option<
