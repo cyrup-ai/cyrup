@@ -32,6 +32,7 @@ fn physical(id: &str, context_window: u64) -> Model {
         context_window,
         max_tokens: 4096,
         sampling_params: None,
+        prompt_cache: None,
         thinking_level_map: None,
         compat: None,
         headers: None,

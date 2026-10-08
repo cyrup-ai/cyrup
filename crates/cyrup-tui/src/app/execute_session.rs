@@ -185,6 +185,11 @@ impl<B: Backend> App<B> {
                 // `computeCacheWaste(entries, this.session.modelRuntime)` (`:5660`).
                 let breakdown = session.usage_cost_breakdown().await;
                 let cache_waste = session.cache_waste().await;
+                // SEAM-131 / EXT-085 — snapshotted here beside the others, as upstream snapshots
+                // both before building the text (`interactive-mode.ts:6668-6671` @v1.0.4). What
+                // they render is at the `warming` block below.
+                let warming_status = session.cache_warming_status().await;
+                let warming_mode = session.cache_warming_mode();
                 // SESS-065 — `const selectedModelKey = `${model?.provider}/${model?.id}``
                 // (`interactive-mode.ts:6671` @v1.0.4). The spelling must match the breakdown's own
                 // keys, which `usage_cost_breakdown` builds as `{provider}/{response_model ??
@@ -197,6 +202,48 @@ impl<B: Backend> App<B> {
                     .model()
                     .map(|m| format!("{}/{}", m.provider.as_str(), m.model.as_str()))
                     .unwrap_or_default();
+                // The `Cache Warming` section, in pi's own position: after the
+                // token rows and BEFORE the cost section (`interactive-mode.ts:6702-6709`
+                // @v1.0.4, where the `if (stats.cost > 0 || …)` guard opens only at `:6711`). Sitting
+                // outside that guard is the point: a session that has spent nothing is exactly the
+                // one whose user wants to know WHY nothing is being warmed, and on any
+                // non-Anthropic provider the answer is the status line itself.
+                //
+                // `cache_warming_status()` is `Option` on purpose. `None` means this session has NO
+                // warmer at all (an embedder-supplied `StreamFn` replaces the `ProviderSwap`), which
+                // upstream reports with its own distinct literal rather than a default-constructed
+                // status — that would read `Inactive (waiting for first request)` and describe a
+                // warmer which is merely idle, not one that does not exist.
+                // [CYRUP-DELTA] The labels are upstream's words without its section prefix:
+                // upstream prints a bold `Cache Warming` heading and then `Mode:` / `Status:` /
+                // `Cache miss penalty:` / `Refresh cost:`, while cyrup renders `/session` as one
+                // flat Field/Value table that has no headings. A literal `cache warming mode`
+                // field is 18 characters and would widen the Field column for EVERY row (today's
+                // longest is 12), taking that width off the Value column and wrapping the labels
+                // anyway. So the section is carried on the two rows that need it and dropped from
+                // the two whose own words already say it.
+                let mut warming = format!(
+                    "| warming mode | {} |\n| warming | {} |\n",
+                    warming_mode.map_or("unavailable", cyrup_config::CacheWarmingMode::as_str),
+                    warming_status.as_ref().map_or_else(
+                        || "Inactive (cache warming unavailable)".to_string(),
+                        cyrup_session_svc::format_cache_warming_status,
+                    ),
+                );
+                // `if (decision?.economicsAvailable)` (`:6705`): the two price rows ONLY when the
+                // prompt size and the model's prices are both known, at 3dp. Without the guard a
+                // session on an unpriced model would print `$0.000` penalties as if warming had
+                // been costed.
+                if let Some(d) = warming_status
+                    .as_ref()
+                    .and_then(|s| s.decision)
+                    .filter(|d| d.economics_available)
+                {
+                    warming.push_str(&format!(
+                        "| miss penalty | ${:.3} |\n| refresh cost | ${:.3} |\n",
+                        d.miss_cost, d.warm_cost
+                    ));
+                }
                 let mut body = format!(
                     "| Field | Value |\n|-------|-------|\n\
                      | file | {} |\n| id | {} |\n\
@@ -204,7 +251,7 @@ impl<B: Backend> App<B> {
                      | tool calls | {} |\n| tool results | {} |\n\
                      | input tokens | {} |\n| output tokens | {} |\n\
                      | cache read | {} |\n| cache write | {} |\n| total tokens | {} |\n\
-                     | cost | ${:.3} |\n",
+                     {}| cost | ${:.3} |\n",
                     stats.session_file.as_deref().unwrap_or("In-memory"),
                     stats.session_id,
                     stats.total_messages,
@@ -217,6 +264,7 @@ impl<B: Backend> App<B> {
                     stats.tokens.cache_read,
                     stats.tokens.cache_write,
                     stats.tokens.total,
+                    warming,
                     stats.cost,
                 );
                 // `if (stats.cost > 0 || cacheWaste.missedTokens > 0) { … }` (`:5696`). Both

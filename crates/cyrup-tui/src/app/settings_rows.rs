@@ -154,6 +154,23 @@ pub(crate) fn settings_rows(
             "Maximum idle gap while waiting for HTTP headers or body chunks. Disable for local \
              models that pause longer than five minutes.",
         ),
+        // `cacheWarming` (CFG-093 / SEAM-131) — pi's own slot in the list: after
+        // `http-idle-timeout`, before `hide-thinking` (`settings-selector.ts:518-525` @v1.0.4).
+        // Label and description are its verbatim strings; the three values are
+        // `CacheWarmingMode`'s own settings-file spellings, in upstream's `CACHE_WARMING_MODES`
+        // order. The row has a LIVE half in `execute_misc.rs` beside `transport`'s: persisting
+        // alone would leave an armed refresh timer standing after a switch to `off`, because the
+        // warmer re-reads its mode only at its own checkpoints.
+        SettingRow::choice(
+            "cacheWarming",
+            "Cache warming",
+            eff.cache_warming_mode().as_str(),
+            choices(&["off", "streaming", "idle"]),
+        )
+        .with_description(
+            "off; streaming while the agent runs; idle also between runs while continuation stays \
+             profitable",
+        ),
         SettingRow::toggle("hideThinkingBlock", "Hide thinking", eff.hide_thinking_block())
             .with_description("Hide thinking blocks in assistant responses"),
         // `markdown.mermaid` — Pi's own position in the list: `hide-thinking`, then

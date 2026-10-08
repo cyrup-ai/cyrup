@@ -242,6 +242,30 @@ impl TranscriptView {
     ///
     /// The sum is `saturating_add`ed rather than `+`ed: `Usage`'s four counters are `u64` read off
     /// a provider response, and a debug overflow panic here would be a crash in a cost notice.
+    /// pi `addCacheWarmingUsage` (`interactive-mode.ts:4070-4076` @v1.0.4) — the ONE method both
+    /// the live `entry_appended` arm (`:3428-3430`) and the replay walk (`:4058`) call:
+    ///
+    /// ```ts
+    /// if (!this.settingsManager.getShowCacheMissNotices()) return;
+    /// this.chatContainer.addChild(new Spacer(1));
+    /// const usage = formatCacheWarmingUsage(entry);
+    /// this.chatContainer.addChild(new ThemedText(() => theme.fg("dim", usage), 1, 0));
+    /// ```
+    ///
+    /// `Spacer(1)` + a DIM `Text` at paddingX 1 is exactly [`crate::transcript::Entry::Status`]
+    /// (see `showStatus`, `:3411-3429`, and that variant's render arm) — NOT the warning colour the
+    /// cache-miss and compaction-cost notices use. A warm is good news: it is the line that says
+    /// money was SAVED, so upstream draws it dim like a status rather than amber like a loss.
+    ///
+    /// The `showCacheMissNotices` gate is the CALLER's, re-read at each render site exactly as pi
+    /// re-reads `getShowCacheMissNotices()` inside this method on both paths — the two existing
+    /// notices above follow the same split.
+    pub fn push_cache_warming_usage(&mut self, note: Option<&str>, cost_total: f64) {
+        self.push_status(cyrup_session_svc::format_cache_warming_usage(
+            note, cost_total,
+        ));
+    }
+
     pub fn push_compaction_cost_notice(
         &mut self,
         kind: crate::transcript::CompactionCostKind,

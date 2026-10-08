@@ -38,6 +38,7 @@ pub fn load_catalog(json: &str) -> Result<Vec<Model>, serde_json::Error> {
     let mut models: Vec<Model> = serde_json::from_str(json)?;
     for model in &mut models {
         apply_openai_completions_compat_metadata(model);
+        apply_prompt_cache_metadata(model);
     }
     Ok(models)
 }
@@ -67,6 +68,39 @@ fn apply_openai_completions_compat_metadata(model: &mut Model) {
         .get_or_insert_with(crate::api::compat::ModelCompat::default);
     if compat.supports_strict_mode.is_none() {
         compat.supports_strict_mode = Some(true);
+    }
+}
+
+/// Pi `applyPromptCacheMetadata` (`packages/ai/scripts/generate-models.ts:985-992` @v1.0.4).
+///
+/// Anthropic ephemeral cache entries have a hard five-minute lifetime, which `ttl: "1h"` extends to
+/// one hour, so the two tiers are `{ short: 300, long: 3600 }` seconds
+/// (`ANTHROPIC_PROMPT_CACHE`, `:983`).
+///
+/// **Only DIRECT Anthropic is annotated**, and that is upstream's explicit reasoning, not a
+/// shortcut: *"Only direct Anthropic is annotated so cache warming does not assume equivalent
+/// behavior through proxies."* A Claude model reached through OpenRouter or any other gateway is
+/// `openai-completions` or a different provider id, keeps `prompt_cache: None`, and therefore never
+/// gets a warm scheduled — which is the safe answer, because we do not know that the proxy's cache
+/// behaves like Anthropic's.
+///
+/// Upstream also declines to annotate OpenAI, with its reasoning recorded at `:989-991`: a
+/// documented TTL alone does not establish full cache loss, so warming there needs observed expiry,
+/// replay and billing behaviour first. That omission is reproduced deliberately.
+///
+/// Like its sibling above, this only ever fills a key the row left unset, so a generated catalog
+/// that one day bakes `promptCache` in makes this a no-op by construction.
+pub(crate) fn apply_prompt_cache_metadata(model: &mut Model) {
+    if model.provider.as_str() != "anthropic"
+        || model.api.as_str() != crate::known_api::ANTHROPIC_MESSAGES
+    {
+        return;
+    }
+    if model.prompt_cache.is_none() {
+        model.prompt_cache = Some(crate::model::ModelPromptCache {
+            short: Some(300),
+            long: Some(3600),
+        });
     }
 }
 

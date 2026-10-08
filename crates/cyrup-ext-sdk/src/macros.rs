@@ -17,7 +17,7 @@
 //! ```
 //!
 //! `cargo build --target wasm32-wasip2` then yields a loadable `cyrup:ext` COMPONENT. The macro emits
-//! the wasm guest glue — the world's `init` + `events` (all 36 hooks + `execute-tool` +
+//! the wasm guest glue — the world's `init` + `events` (all 37 hooks + `execute-tool` +
 //! `execute-command`/`get-argument-completions` + `render-call`/`render-result`) exports + the
 //! `export!` invocation — each delegating to the routing helpers in `crate::guest`. The
 //! `wit_bindgen::generate!` (with `pub_export_macro`) runs once in this crate; the downstream author's
@@ -314,6 +314,13 @@ macro_rules! export_extension {
                     cwd: ::std::string::String,
                 ) -> bindings::cyrup::ext::types::HookOutcome {
                     $crate::guest::hook(6, &[&cwd])
+                }
+                // EXT-085 — `cache_warming_decision` (pi `CacheWarmingDecisionEvent`,
+                // `core/cache-warmer.ts:112-115` @v1.0.4). Kind 36.
+                fn on_cache_warming_decision(
+                    decision_json: ::std::string::String,
+                ) -> bindings::cyrup::ext::types::HookOutcome {
+                    $crate::guest::hook(36, &[&decision_json])
                 }
                 fn on_session_before_switch(
                     reason: ::std::string::String,

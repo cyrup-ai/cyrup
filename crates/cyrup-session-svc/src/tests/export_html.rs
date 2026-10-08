@@ -881,3 +881,35 @@ fn the_template_renders_the_nested_calls_of_a_tool_result() {
         "the nested record is rendered inside the tool block"
     );
 }
+
+/// SESS-051 — a `usage` entry needs NO export arm, on either side, and this pins that rather than
+/// leaving it as a claim.
+///
+/// The payload is built from raw JSONL `serde_json::Value`s filtered only on `type != "session"`
+/// (`export/mod.rs`'s `session_data`), so a `usage` row reaches pi's vendored `template.js`
+/// byte-for-byte — and `template.js` reads `msg.usage` only on MESSAGE entries, so both sides render
+/// a usage row the same way: not at all, while still carrying it for anything downstream that reads
+/// the embedded JSONL. Stated here so nobody ports an export arm upstream does not have either.
+#[test]
+fn a_usage_entry_reaches_the_embedded_payload_untouched_and_renders_nothing() {
+    const WARM: &str = r#"{"type":"usage","id":"ffffffff","parentId":"eeeeeeee","timestamp":"2026-09-04T10:00:06.000Z","kind":"cache_warm","provider":"anthropic","model":"claude-sonnet-5","usage":{"input":0,"output":1,"cacheRead":42000,"cacheWrite":0,"totalTokens":42001,"cost":{"input":0,"output":0.000015,"cacheRead":0.0126,"cacheWrite":0,"total":0.012615}},"note":"extension override"}"#;
+    let fixture = format!("{FIXTURE}{WARM}\n");
+    let html = session_jsonl_to_html(&fixture);
+    let data = session_data(&html);
+
+    let expected: Value = serde_json::from_str(WARM).unwrap();
+    let entries = data["entries"].as_array().unwrap();
+    assert_eq!(
+        entries.last().unwrap(),
+        &expected,
+        "the usage row passes through the export verbatim"
+    );
+    // It is the last non-session entry, so it is also the leaf — the usage entry advances the leaf.
+    assert_eq!(data["leafId"], "ffffffff");
+    // The row exists ONLY inside the base64 payload: the document itself never names it, because
+    // the export inlines no per-entry markup and `template.js` has no `usage` arm to add any.
+    assert!(
+        !html.contains("cache_warm"),
+        "the warm must appear only in the embedded payload, never as emitted markup"
+    );
+}

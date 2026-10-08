@@ -527,11 +527,13 @@ impl EffectiveSettings {
     /// `CACHE_WARMING_MODES`, else `"streaming"`. The key is in [`super::layer`]'s global-only
     /// list, so a project or CLI value never reaches this merged view. CFG-093.
     pub fn cache_warming_mode(&self) -> CacheWarmingMode {
-        match self.merged.get_str("cacheWarming").as_deref() {
-            Some("off") => CacheWarmingMode::Off,
-            Some("idle") => CacheWarmingMode::Idle,
-            _ => CacheWarmingMode::Streaming,
-        }
+        // Upstream's default is `streaming`, and an unreadable value degrades to it rather than
+        // disabling warming (`settings-manager.ts::getCacheWarmingMode`).
+        self.merged
+            .get_str("cacheWarming")
+            .as_deref()
+            .and_then(CacheWarmingMode::parse)
+            .unwrap_or(CacheWarmingMode::Streaming)
     }
 
     /// `images.autoResize` (default true; :1107-1109).

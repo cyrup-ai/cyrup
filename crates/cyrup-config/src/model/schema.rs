@@ -135,6 +135,13 @@ pub struct ModelDefinition {
     /// twin. CFG-039.
     #[serde(default)]
     pub sampling_params: Option<serde_json::Map<String, serde_json::Value>>,
+    /// Prompt-cache lifetimes, in SECONDS, per retention tier — Pi
+    /// `promptCache: Type.Optional(ModelPromptCacheSchema)` (`model-config.ts:209` for a
+    /// definition, `:233` for an override). Copied verbatim onto the composed model
+    /// (`provider-composer.ts:241`); it is what `cyrup_provider::prompt_cache_ttl_ms` schedules
+    /// cache warming against, so a row that sets it opts a non-Anthropic provider in.
+    #[serde(default)]
+    pub prompt_cache: Option<cyrup_provider::ModelPromptCache>,
     #[serde(default)]
     pub headers: Option<std::collections::BTreeMap<String, String>>,
     #[serde(default)]
@@ -167,6 +174,12 @@ pub struct ModelOverride {
     /// model.samplingParams` (`provider-composer.ts:123-125`). CFG-039.
     #[serde(default)]
     pub sampling_params: Option<serde_json::Map<String, serde_json::Value>>,
+    /// Pi `:233`. Unlike most override fields this MERGES per tier:
+    /// `override.promptCache ? { ...model.promptCache, ...override.promptCache } :
+    /// model.promptCache` (`provider-composer.ts:196`), the same shape as `samplingParams` above —
+    /// so an override naming only `long` leaves a composed `short` in place.
+    #[serde(default)]
+    pub prompt_cache: Option<cyrup_provider::ModelPromptCache>,
     #[serde(default)]
     pub headers: Option<std::collections::BTreeMap<String, String>>,
     #[serde(default)]

@@ -411,7 +411,7 @@ async fn a_refused_register_flag_propagated_with_question_mark_stops_and_fails_t
 /// `registration` import declaring `register-tool` (its `tool-descriptor` aliased from the `types`
 /// import, as `use types.{tool-descriptor}` encodes it) and `register-flag`.
 #[cfg(feature = "wasm-host")]
-const REGISTRATION_TOOL_AND_FLAG: &str = r#"  (import "cyrup:ext/types@0.17.0" (instance $types
+const REGISTRATION_TOOL_AND_FLAG: &str = r#"  (import "cyrup:ext/types@0.18.0" (instance $types
     (type $em (enum "parallel" "sequential"))
     (export "exec-mode" (type $em-x (eq $em)))
     (type $tn (record
@@ -428,7 +428,7 @@ const REGISTRATION_TOOL_AND_FLAG: &str = r#"  (import "cyrup:ext/types@0.17.0" (
       (field "default-active" (option bool))))
     (export "tool-descriptor" (type $td-x (eq $td)))))
   (alias export $types "tool-descriptor" (type $tool-descriptor))
-  (import "cyrup:ext/registration@0.17.0" (instance $reg
+  (import "cyrup:ext/registration@0.18.0" (instance $reg
     (alias outer 1 $tool-descriptor (type $td))
     (export "tool-descriptor" (type $td-x (eq $td)))
     (export "register-tool" (func (param "t" $td-x) (result (result (error string)))))

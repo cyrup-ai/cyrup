@@ -1,6 +1,6 @@
 //! The ergonomic guest API (arch-08 §3.6) — the Rust analog of Pi's `ExtensionAPI` (the `pi` object
 //! an extension factory receives, types.ts:1185-1420 @v0.83.0; EXT-072 corrected `:1128-1356`). An
-//! author subscribes to any of the 36 events
+//! author subscribes to any of the 37 events
 //! with a typed handler `(event, &Ctx) -> Outcome`, registers tools/commands/shortcuts/flags/
 //! providers/renderers/autocomplete, and the SDK lowers all of it onto the `cyrup:ext` WIT world.
 //!
@@ -83,6 +83,10 @@ mod kind {
     /// `context_with_system` (pi `ContextWithSystemEvent`, `core/extensions/types.ts:708-711`
     /// @v0.87.1) — EXT-079.
     pub const CONTEXT_WITH_SYSTEM: u8 = 35;
+    /// `cache_warming_decision` (pi `CacheWarmingDecisionEvent`, `core/cache-warmer.ts:112-115`
+    /// @v1.0.4 — declared in the warmer, pulled into the event union at
+    /// `core/extensions/types.ts` @v1.0.4) — EXT-085.
+    pub const CACHE_WARMING_DECISION: u8 = 36;
 }
 
 /// The remover every `on_*` subscriber returns — pi's `on(event, handler): () => void`
@@ -1335,13 +1339,13 @@ impl ExtensionApi {
             .push((topic.into(), Box::new(handler)));
     }
 
-    // --- the 36 event subscriptions ---
+    // --- the 37 event subscriptions ---
 
     /// `tool_call` — VETOABLE (returns [`Outcome`]): block the call with [`Outcome::block`]
     /// (first block wins host-side) or rewrite its arguments with
     /// [`Outcome::replace_tool_input`]. Payload [`ToolCallEvent`].
     ///
-    /// The first of this type's 36 event subscribers (pi `pi.on`, types.ts:1190-1231 @v0.83.0,
+    /// The first of this type's 37 event subscribers (pi `pi.on`, types.ts:1190-1231 @v0.83.0,
     /// plus the three pi added by v0.87.1 — EXT-075, EXT-079; EXT-072 corrected the count AND the
     /// range, which cited the message-rendering block). Each returns the [`Unsubscribe`] remover
     /// pi's `on()` has returned since v0.86.0 (EXT-080).
@@ -1430,6 +1434,30 @@ impl ExtensionApi {
                     c,
                 )
                 .into_raw()
+            }),
+        )
+    }
+    /// `cache_warming_decision` (EXT-085) — VETOABLE (returns [`Outcome`]): override whether the
+    /// next prompt-cache refresh is sent. Answer [`Outcome::handled`] with
+    /// `{"action": "warm"}` or `{"action": "stop"}`; [`Outcome::noop`] (or any other shape) is no
+    /// opinion and leaves the host's own economics verdict in force. Payload
+    /// [`CacheWarmingDecisionEvent`].
+    ///
+    /// Across extensions the LAST readable action wins — deliberately NOT
+    /// [`Self::on_project_trust`]'s first-decides rule (pi `emitCacheWarmingDecision`,
+    /// `core/extensions/runner.ts:1121-1142` @v1.0.4, which assigns inside its loop and never
+    /// returns early). Within ONE extension several handlers combine the same way.
+    ///
+    /// The host runs this on the path of a refresh that has a deadline, so a handler that sits
+    /// there is cut at the invocation budget and the host's own action stands. Do the cheap thing.
+    pub fn on_cache_warming_decision(
+        &mut self,
+        f: impl Fn(CacheWarmingDecisionEvent, &Ctx) -> Outcome + 'static,
+    ) -> Unsubscribe {
+        self.subscribe(
+            kind::CACHE_WARMING_DECISION,
+            Box::new(move |a, c| {
+                f(CacheWarmingDecisionEvent::from_json(&json(arg(a, 0))), c).into_raw()
             }),
         )
     }

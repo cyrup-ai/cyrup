@@ -27,6 +27,7 @@ mod llama_cpp_classify_render;
 mod llama_cpp_classify_wire;
 mod openrouter_anthropic_route;
 mod overflow_estimate_parity;
+mod prompt_cache;
 mod remote_catalog;
 mod sampling_params;
 mod thinking_max;

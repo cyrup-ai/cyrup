@@ -73,6 +73,20 @@ impl Agent {
         lock(&self.state).snapshot(running)
     }
 
+    /// The live `(model, messages)` pair, read SYNCHRONOUSLY — pi's `agent.state.model` /
+    /// `agent.state.messages` field reads (`core/sdk.ts:350-357` @v1.0.4).
+    ///
+    /// [`Self::snapshot`] is `async` only by signature: its body takes the same `std::sync::Mutex`
+    /// and never awaits. Prompt-cache warming needs exactly these two fields from a non-async
+    /// context (its `isCurrent` predicate, which upstream evaluates inline inside a getter), so this
+    /// is the narrow synchronous read rather than an `async` snapshot of nine fields. Cloning the
+    /// transcript is the same clone `snapshot` already makes.
+    #[must_use]
+    pub fn current_model_and_messages(&self) -> (Option<ModelRef>, Vec<AgentMessage>) {
+        let st = lock(&self.state);
+        (st.model.clone(), st.messages.clone())
+    }
+
     // --- scalar/array state setters (R-02-038/044) ---
     pub async fn set_system_prompt(&self, s: String) {
         lock(&self.state).system_prompt = s;

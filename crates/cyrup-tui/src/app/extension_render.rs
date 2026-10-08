@@ -244,6 +244,40 @@ pub(crate) fn custom_entry_type(entry: &serde_json::Value) -> String {
         .to_string()
 }
 
+/// The `(note, cost.total)` of a serialized `cache_warm` `usage` session entry, or `None` when the
+/// JSON is not one — pi's `entry.type === "usage" && entry.kind === "cache_warm"` guard, which
+/// gates the warm notice on BOTH its render paths (live `entry_appended`,
+/// `interactive-mode.ts:3428-3430`; replay flat-map, `:4058`).
+///
+/// One parser for both paths deliberately: a serialized `Entry` is what the live
+/// [`cyrup_session_svc::AgentSessionEvent::EntryAppended`] event and the replay
+/// [`cyrup_session_svc::ReplayItem::UsageEntry`] both carry, and a second copy of this guard is how
+/// the two arms would drift into rendering different things (EXT-041).
+///
+/// Reads camelCase, which is what `KnownEntry::Usage` serializes to and what pi writes. A missing
+/// or non-numeric `usage.cost.total` reads as `0.0` rather than suppressing the line: the entry
+/// exists, so the warm happened, and `$0.000` is the honest rendering of an unpriced model — the
+/// same choice `cost_suffix` makes for an unpriced miss.
+pub(crate) fn cache_warm_usage_fields(entry: &serde_json::Value) -> Option<(Option<String>, f64)> {
+    if entry.get("type").and_then(|v| v.as_str()) != Some("usage")
+        || entry.get("kind").and_then(|v| v.as_str()) != Some("cache_warm")
+    {
+        return None;
+    }
+    let note = entry
+        .get("note")
+        .and_then(|v| v.as_str())
+        .filter(|n| !n.is_empty())
+        .map(str::to_string);
+    let cost = entry
+        .get("usage")
+        .and_then(|u| u.get("cost"))
+        .and_then(|c| c.get("total"))
+        .and_then(serde_json::Value::as_f64)
+        .unwrap_or(0.0);
+    Some((note, cost))
+}
+
 /// Resolve an extension's registered MESSAGE renderer for `custom_type` and run it against
 /// `payload` (Pi `getMessageRenderer(customType)`, `extensions/runner.ts:579-587`).
 ///

@@ -973,6 +973,22 @@ impl<B: Backend> App<B> {
                 if id == "transport" {
                     session.set_transport(&value).await;
                 }
+                // `cacheWarming` is live for the same reason, and pi routes it through the SESSION
+                // rather than the settings manager for exactly this: `onCacheWarmingModeChange` is
+                // `this.session.setCacheWarmingMode(mode)` (`interactive-mode.ts:4965-4968`
+                // @v1.0.4), which persists AND calls `cacheWarmer.onModeChanged()`
+                // (`agent-session.ts:1422-1425`). Persisting alone would be silently broken: the
+                // warmer re-reads its mode only at its own checkpoints, so switching to `off`
+                // while a refresh timer is armed would leave it armed and the next warm would be
+                // sent against a setting that already said not to.
+                // An unparseable value deliberately falls through without touching the live
+                // mode, so a malformed row cannot silently degrade the running warmer to the
+                // getter's `streaming` default while the document says otherwise.
+                if id == "cacheWarming"
+                    && let Some(mode) = cyrup_config::CacheWarmingMode::parse(&value)
+                {
+                    session.set_cache_warming_mode(mode);
+                }
                 match session
                     .persist_setting(cyrup_session_svc::SettingsScope::Global, &id, json)
                     .await

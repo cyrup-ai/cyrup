@@ -305,7 +305,16 @@ impl Capabilities {
 ///   interface (pi's `ModelRouteRequest.signal` as a `route-id`-keyed poll, the
 ///   `host-bash.is-bash-cancelled` substitution) are ADDITIVE and would not have required a bump on
 ///   their own.
-pub const HOST_WORLD: &str = "cyrup:ext@0.17";
+/// - 0.17 -> 0.18: EXPORT ADDITION — `events.on-cache-warming-decision` (EXT-085), the guest tier
+///   of pi's `cache_warming_decision` event (`CacheWarmingDecisionEvent` /
+///   `CacheWarmingDecisionEventResult`, `core/cache-warmer.ts:112-120` @v1.0.4, reduced by
+///   `emitCacheWarmingDecision`, `core/extensions/runner.ts:1121-1142`). It is an EVENT WITH A
+///   RESULT, so it needed no new `hook-outcome` variant and no new import — a handler answers
+///   `handled({"action": "warm" | "stop"})` to override the host's own prompt-cache economics
+///   verdict, and `noop` to leave it. A 0.17 guest exports nothing under that name, the same
+///   fails-to-LINK direction a re-signed export is, so it takes the bump on its own (the
+///   0.16 -> 0.17 `route-model` precedent).
+pub const HOST_WORLD: &str = "cyrup:ext@0.18";
 
 impl ExtensionManifest {
     /// Parse from JSON bytes.

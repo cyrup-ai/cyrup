@@ -62,6 +62,19 @@ impl CacheWarmingMode {
             Self::Idle => "idle",
         }
     }
+
+    /// Parse a settings-file spelling. `None` for anything outside the three
+    /// `CACHE_WARMING_MODES` values, so a caller can tell an unknown string from a real choice —
+    /// unlike [`crate::EffectiveSettings::cache_warming_mode`], which must answer with upstream's
+    /// default for an absent or malformed key.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "off" => Some(Self::Off),
+            "streaming" => Some(Self::Streaming),
+            "idle" => Some(Self::Idle),
+            _ => None,
+        }
+    }
 }
 
 /// A forced `terminal.images` value (Pi `TerminalSettings.images`, `settings-manager.ts:58`

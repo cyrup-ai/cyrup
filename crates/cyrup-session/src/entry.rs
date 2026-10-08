@@ -153,6 +153,39 @@ pub enum KnownEntry {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         data: Option<Value>,
     },
+    /// Model-attributed token spend that does NOT participate in LLM context — Pi `UsageEntry`
+    /// (`session-manager.ts:80-89` @v1.0.4), written by `appendUsage`
+    /// (`session-manager.ts:1244-1259`). `kind` is Pi's "arbitrary usage category, such as
+    /// `cache_warm`"; `note` its "optional human-readable qualifier for usage notices".
+    ///
+    /// **Context-invisible, but a link in the chain.** Pi's `_appendEntry` sets
+    /// `this.leafId = entry.id` for EVERY entry (`session-manager.ts:1191-1196`), so a usage entry
+    /// advances the branch leaf and every backwards walk traverses it — while
+    /// `sessionEntryToContextMessages` has no `usage` arm and falls through to `return []`
+    /// (`:439-465`), so it projects no message, costs 0 tokens in the compaction budget walk, and
+    /// is FOLDED INTO the kept region by the cut-point back-scan.
+    ///
+    /// Both of those behaviours arrive here through CATCH-ALLS — [`crate::context::push_as_raw`]'s
+    /// and [`crate::context::context_message_role`]'s `_ =>`, and
+    /// `crate::compaction::cutpoint`'s `is_context_visible` test. Nothing will make a future
+    /// reviewer notice if one of them grows an arm by accident, so the invisibility is pinned by
+    /// `tests::usage_entry::sess051_usage_entry_is_context_invisible_and_folded_by_the_back_scan`.
+    ///
+    /// Field order is the WIRE order Pi writes (`kind, provider, model, usage, note`), with `base`
+    /// first so `type,id,parentId,timestamp` stay ahead of the payload. `note` is elided when
+    /// absent because Pi spreads it in conditionally — `...(note ? { note } : {})`, so an empty
+    /// string is ABSENT rather than `null`.
+    Usage {
+        #[serde(flatten)]
+        base: EntryBase,
+        kind: String,
+        provider: ProviderId,
+        model: ModelId,
+        /// REQUIRED on the wire: Pi always writes it.
+        usage: Usage,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        note: Option<String>,
+    },
     CustomMessage {
         #[serde(flatten)]
         base: EntryBase,
@@ -251,6 +284,7 @@ const KNOWN_TYPES: &[&str] = &[
     "label",
     "session_info",
     "context_edit",
+    "usage",
 ];
 
 impl KnownEntry {
@@ -265,7 +299,8 @@ impl KnownEntry {
             | KnownEntry::CustomMessage { base, .. }
             | KnownEntry::Label { base, .. }
             | KnownEntry::SessionInfo { base, .. }
-            | KnownEntry::ContextEdit { base, .. } => base,
+            | KnownEntry::ContextEdit { base, .. }
+            | KnownEntry::Usage { base, .. } => base,
         }
     }
 
@@ -280,7 +315,8 @@ impl KnownEntry {
             | KnownEntry::CustomMessage { base, .. }
             | KnownEntry::Label { base, .. }
             | KnownEntry::SessionInfo { base, .. }
-            | KnownEntry::ContextEdit { base, .. } => base,
+            | KnownEntry::ContextEdit { base, .. }
+            | KnownEntry::Usage { base, .. } => base,
         }
     }
 }

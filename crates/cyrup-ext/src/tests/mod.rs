@@ -15,6 +15,7 @@
 mod aggregation;
 mod bash_operations_seam;
 mod branch_change;
+mod cache_warming_decision;
 mod capability_handle_ownership;
 mod command_dispatch;
 mod entry_renderer;

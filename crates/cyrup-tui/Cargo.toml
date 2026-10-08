@@ -160,6 +160,10 @@ cyrup-session = { workspace = true }
 # where the `HostServices` trait for the `/tree` label-append is pulled in) and the
 # extension-dialog-countdown test builds a synthetic `UiRequest` from it.
 tempfile.workspace = true
+# `test-util` supplies `#[tokio::test(start_paused = true)]` + `tokio::time::advance`, which is how
+# `tests/cache_warming_ui.rs`'s end-to-end prompt-cache warming test crosses the 4m30s warm delay
+# without sleeping for real. The library's own `tokio` dependency above is unchanged.
+tokio = { workspace = true, features = ["test-util"] }
 # The byte reader's pty tests (`src/tests/input_pty.rs`): a real pseudo-terminal for the reader under
 # test to own (`pty`), and `TIOCSWINSZ` on its master so the kernel sends the child a real `SIGWINCH`
 # (`termios`). Both are safe wrappers, so `#![forbid(unsafe_code)]` holds in the tests too.

@@ -407,6 +407,7 @@ mod tests {
             // never reads it (the model report and the scope checks are cost/context-window
             // driven), so the fixture states the unset form rather than inventing a value.
             sampling_params: None,
+            prompt_cache: None,
             thinking_level_map: None,
             compat: None,
             headers: None,

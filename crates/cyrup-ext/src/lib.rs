@@ -182,7 +182,8 @@ pub mod host_runtime;
 
 // --- Re-exports: the load-bearing surface (arch-08 §3). ---
 pub use aggregate::{
-    AttributedPath, ProjectTrustDecision, ResourcesAggregate, fold_project_trust, fold_resources,
+    AttributedPath, CacheWarmingAction, ProjectTrustDecision, ResourcesAggregate,
+    fold_cache_warming_decision, fold_project_trust, fold_resources, parse_cache_warming_action,
 };
 // The inter-extension bus is NOT `wasm-host`-gated (EXT-018): pi hangs `events` on the one base
 // `ExtensionAPI` every extension receives (extensions/loader.ts:389 @v0.83.0), so which tier an

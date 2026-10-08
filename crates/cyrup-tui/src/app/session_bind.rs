@@ -408,7 +408,7 @@ impl<B: Backend> App<B> {
     /// the built-in framing, which is Pi's `getMessageRenderer(...) === undefined` outcome for a
     /// message and `getCallRenderer()`/`getResultRenderer()` resolving to the built-in definition
     /// (`tool-execution.ts:84-101`) for a tool row.
-    fn replay_session_rendered(
+    pub(crate) fn replay_session_rendered(
         &mut self,
         items: &[cyrup_session_svc::ReplayItem],
         rendered: &ReplayRenders,
@@ -454,6 +454,21 @@ impl<B: Backend> App<B> {
                 // (`interactive-mode.ts:3717-3719`), the SAME method its live `entry_appended` arm
                 // calls (`:3217-3218`). The three-state outcome the pre-pass resolved decides what
                 // draws, exactly as it does live.
+                // SESS-051/SEAM-131 — pi's replay flat-map admits a `cache_warm` usage entry
+                // beside a `custom` one (`interactive-mode.ts:4058` @v1.0.4) and dispatches it to
+                // `addCacheWarmingUsage`, the SAME method its live `entry_appended` arm calls
+                // (`:3428-3430`). The gate is re-read here because pi re-reads it inside that
+                // method, on both paths.
+                ReplayItem::UsageEntry(entry) => {
+                    if let Some((note, cost)) = crate::app::cache_warm_usage_fields(entry)
+                        && self.state.show_cache_miss_notices
+                    {
+                        self.state
+                            .transcript
+                            .push_cache_warming_usage(note.as_deref(), cost);
+                    }
+                    continue;
+                }
                 ReplayItem::CustomEntry(entry) => {
                     let ty = custom_entry_type(entry);
                     let r = rendered
@@ -712,7 +727,7 @@ impl<B: Backend> App<B> {
 /// carry the whole [`crate::transcript::Rendered`]: a `Live` component draws, and — for an entry —
 /// `Failed` is pi's own third outcome (`custom-entry.ts:47-52`), not an absence.
 #[derive(Default)]
-struct ReplayRenders {
+pub(crate) struct ReplayRenders {
     /// MESSAGE index → the custom-message renderer's output (X11 / EXT-006).
     messages: std::collections::HashMap<usize, crate::transcript::Rendered>,
     /// Tool-call id → the extension's `renderCall` text (EXT-041).

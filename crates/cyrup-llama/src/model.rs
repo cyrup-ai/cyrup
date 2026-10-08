@@ -198,6 +198,7 @@ pub fn to_model(
         context_window,
         max_tokens: context_window,
         sampling_params: None,
+        prompt_cache: None,
         thinking_level_map: reasoning.then_some(thinking_level_map),
         compat: Some(ModelCompat {
             supports_store: Some(false),

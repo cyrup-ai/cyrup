@@ -10,6 +10,11 @@
 use crate::{ExtensionApi, NotifyKind, Outcome, ToolCall, ToolDescriptor, ToolOutput};
 use serde_json::json;
 
+/// The demo's per-refresh cost ceiling for `cache_warming_decision`, in dollars. Chosen well above
+/// a realistic warm (a cache read of a large prompt plus one output token) so the host's own
+/// verdict stands in the ordinary case, and low enough that a test can step over it deliberately.
+pub const DEMO_WARM_COST_CEILING: f64 = 0.01;
+
 pub(super) fn install(api: &mut ExtensionApi) {
     // Permission gate (R-08-010): block any `bash` tool call with a reason.
     api.on_tool_call(|ev, ctx| {
@@ -198,6 +203,34 @@ pub(super) fn install(api: &mut ExtensionApi) {
     //
     // Unconditional, unlike the `/armsend` latch above: it fires only when the host actually
     // reports a branch change, which no other test in the shared `cyrup-it` suite provokes.
+    // EXT-085 — the guest half of pi's `cache_warming_decision`
+    // (`core/cache-warmer.ts:112-115`, emitted at `:325-333` @v1.0.4). The host has already run its
+    // own economics and hands us its verdict; the LAST readable `{action}` across all handlers
+    // wins, and returning the verdict unchanged — or any other shape — is "no opinion".
+    //
+    // What a real extension would plausibly do, and what this does: impose a per-refresh COST
+    // CEILING the host's own rule has no concept of. The host asks "does this save money"; an
+    // operator may additionally want "never spend more than this on one refresh, however good the
+    // arithmetic looks".
+    //
+    // Unconditional, like `on_branch_change` above and unlike the `/armsend` latch: this fires only
+    // when the host actually emits a warming decision, which no other test in the shared
+    // `cyrup-it` suite provokes.
+    api.on_cache_warming_decision(|ev, ctx| {
+        if ev.warm_cost > DEMO_WARM_COST_CEILING {
+            ctx.ui().notify(&format!(
+                "demo: refusing a ${:.4} refresh (ceiling ${DEMO_WARM_COST_CEILING:.4})",
+                ev.warm_cost
+            ));
+            return Outcome::handled(json!({ "action": "stop" }));
+        }
+        ctx.ui().notify(&format!(
+            "demo: no opinion on a ${:.4} refresh",
+            ev.warm_cost
+        ));
+        Outcome::noop()
+    });
+
     api.on_branch_change(|branch: Option<&str>, ctx: &crate::Ctx| {
         let shown = branch.unwrap_or("(no repo)");
         ctx.ui().notify(&format!("demo: branch changed to {shown}"));

@@ -197,6 +197,26 @@ pub enum ReplayItem {
     /// `entry_appended` event sends keeps the front-end's live and replay arms one arm
     /// (EXT-041).
     CustomEntry(serde_json::Value),
+    /// A `cache_warm` `usage` ENTRY on the replayed branch, serialized exactly as
+    /// [`crate::AgentSessionEvent::EntryAppended`] carries it live — the other half of pi's
+    /// `RenderSessionItem` entry arm, `Extract<SessionEntry, { type: "custom" | "usage" }>`
+    /// (`interactive-mode.ts:277` @v1.0.4), admitted by `renderSessionEntries` with
+    ///
+    /// ```ts
+    /// if (entry.type === "custom" || (entry.type === "usage" && entry.kind === "cache_warm")) {
+    ///     return [entry];
+    /// }
+    /// ```
+    ///
+    /// (`:4058`) and dispatched to `addCacheWarmingUsage` (`:4070-4076`) — the SAME method the live
+    /// `entry_appended` arm calls (`:3428-3430`). Sending the identical JSON on both paths keeps the
+    /// front-end's live and replay arms one arm, the EXT-041 discipline [`Self::CustomEntry`]
+    /// already follows.
+    ///
+    /// The entry travels whole rather than pre-formatted because the renderer's gate is the
+    /// front-end's live `showCacheMissNotices` value, which the service does not read — the same
+    /// reason [`Self::CacheMiss`] carries facts and not a string.
+    UsageEntry(serde_json::Value),
 }
 
 /// A scoped model in the `cycle_model` set (Pi `{model, thinkingLevel?}`, agent-session.ts:870). An

@@ -84,6 +84,10 @@ pub struct FauxModelDefinition {
     pub cost: ModelCost,
     pub context_window: u64,
     pub max_tokens: u64,
+    /// Prompt-cache lifetimes per retention tier, in SECONDS (`Model::prompt_cache`). `None` by
+    /// default, which is what every non-Anthropic model carries — a test that needs prompt-cache
+    /// warming to be eligible sets it, and one that needs warming to decline leaves it unset.
+    pub prompt_cache: Option<crate::ModelPromptCache>,
 }
 
 impl FauxModelDefinition {
@@ -98,6 +102,7 @@ impl FauxModelDefinition {
             cost: ModelCost::default(),
             context_window: DEFAULT_CONTEXT_WINDOW,
             max_tokens: DEFAULT_MAX_TOKENS,
+            prompt_cache: None,
         }
     }
 
@@ -112,6 +117,7 @@ impl FauxModelDefinition {
             reasoning: self.reasoning,
             input: self.input,
             cost: self.cost,
+            prompt_cache: self.prompt_cache,
             context_window: self.context_window,
             max_tokens: self.max_tokens,
             sampling_params: None,

@@ -101,6 +101,41 @@ impl SessionManager {
         }))
     }
 
+    /// Append model-attributed usage that does not participate in LLM context — Pi `appendUsage`
+    /// (`session-manager.ts:1244-1259` @v1.0.4).
+    ///
+    /// The ONE `append_*` that returns the whole [`Entry`] rather than its [`EntryId`], because
+    /// Pi's returns the `UsageEntry` itself: `cache-warmer.ts` hands it straight to `onWarmed(entry)`
+    /// and from there to the `entry_appended` fan-out, which carries the serialized entry. Reading
+    /// it back through `push_entry` keeps the single write path (and its leaf advance, Pi's
+    /// `_appendEntry`) untouched instead of duplicating it for one caller.
+    ///
+    /// `note` is `None`-or-non-empty on the wire: Pi's `...(note ? { note } : {})` drops an empty
+    /// string as well as `undefined`, so `Some("")` is normalized to `None` here rather than
+    /// written as `"note": ""`.
+    pub fn append_usage(
+        &mut self,
+        kind: &str,
+        provider: ProviderId,
+        model: ModelId,
+        usage: Usage,
+        note: Option<&str>,
+    ) -> Result<Entry, SessionError> {
+        let id = self.push_entry(Entry::known(KnownEntry::Usage {
+            base: self.make_base(),
+            kind: kind.to_string(),
+            provider,
+            model,
+            usage,
+            note: note.filter(|n| !n.is_empty()).map(str::to_string),
+        }))?;
+        // `push_entry` returns the id; the entry is the one it just pushed. Unreachable `None`
+        // (the index was inserted by `push_entry` itself), but an `Err` beats a panic.
+        self.entry(&id)
+            .cloned()
+            .ok_or(SessionError::EntryNotFound(id))
+    }
+
     pub fn append_custom_message(
         &mut self,
         ty: &str,

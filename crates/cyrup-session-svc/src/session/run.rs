@@ -628,6 +628,19 @@ impl AgentSession {
     /// `agent_end` cannot tell a consumer whether more work is coming, which is why Pi's RPC host
     /// checks its shutdown request here and nowhere else (rpc-mode.ts:355-358).
     pub(crate) async fn emit_agent_settled(&self) {
+        // SEAM-131 — pi calls `this._cacheWarmer?.onAgentSettled()` as the FIRST statement of
+        // `_emitAgentSettled` (`agent-session.ts:1067` @v1.0.4), BEFORE
+        // `await this._extensionRunner.emit({ type: "agent_settled" })` and before its own
+        // `_emit`. The order is load-bearing, not cosmetic: the extension dispatch below awaits
+        // guest wasm handlers, each up to its invocation budget, and a refresh timer that comes
+        // due inside that window would still read mode=streaming/phase=streaming — so
+        // `validate_run` would admit it and a paid warm request would go out that upstream had
+        // already stopped with "agent run settled". In `idle` mode the same window would price
+        // the refresh at a continuation probability of 1.0 instead of 0.15 and clear the $0.05
+        // floor it should have failed. Settling first closes both.
+        if let Some(warmer) = self.provider.cache_warmer() {
+            warmer.on_agent_settled();
+        }
         let cancel = self.session_cancel.child_token();
         self.services
             .ext_host

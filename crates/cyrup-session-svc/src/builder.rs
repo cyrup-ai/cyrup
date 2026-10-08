@@ -2544,6 +2544,33 @@ impl SessionBuilder {
         host_services.attach_session(manager.clone());
         let fanout = Arc::new(Fanout::new());
 
+        // SEAM-131 — prompt-cache warming. Installed on the `ProviderSwap` the agent streams
+        // through, which is cyrup's counterpart of the pi `streamFn` closure that holds
+        // `cacheWarmer.start(...)` (`core/sdk.ts:403-412` @v1.0.4): the one session request site.
+        // Built here and not beside the swap itself because the host it needs is this session tree
+        // plus this fan-out, and both exist only now; nothing can stream through the swap before
+        // the agent is handed out below.
+        //
+        // The decider is the `cache_warming_decision` extension hook (EXT-085), cyrup's
+        // counterpart of pi's `decide` closure (`core/sdk.ts:316-321` @v1.0.4): every subscribed
+        // extension's handler runs and the LAST readable `{action}` overrides the economics
+        // verdict. With no extension subscribed the fold answers with pi's own action, so this is
+        // [`crate::cache_warmer::PiDecision`]'s behaviour plus the hook — `PiDecision` remains the
+        // default for a warmer built without an extension host (tests, embedders).
+        let cache_warmer = crate::cache_warmer::CacheWarmer::new(
+            Arc::new(crate::cache_warmer::SessionCacheWarmingHost::new(
+                manager.clone(),
+                fanout.clone(),
+            )),
+            settings.effective().cache_warming_mode(),
+            Arc::new(crate::cache_warmer::ExtensionCacheWarmingDecider::new(
+                &ext_host,
+                session_cancel.clone(),
+            )),
+            session_cancel.clone(),
+        );
+        provider_swap.attach_cache_warming(cache_warmer, session_id.clone());
+
         // Attach the extension notify seam, then the facade's persist+fan-out subscriber.
         agent.subscribe(ext_subscriber);
         agent.subscribe(Arc::new(SvcSubscriber::new(
@@ -2555,6 +2582,9 @@ impl SessionBuilder {
             nested_calls.clone(),
         )));
         let agent = Arc::new(agent);
+        // The `(model, messages)` pair pi's `cacheContextIsCurrent` reads (`sdk.ts:350-357`). Weak,
+        // and only now available: the agent was built WITH this swap as its `StreamFn`.
+        provider_swap.attach_agent(&agent);
 
         // ---- 10. assemble the session --------------------------------------------------------
         // `host_services` (the concrete arch-08 §5.6 backend) was built + seeded + control-wired at

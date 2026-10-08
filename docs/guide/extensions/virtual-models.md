@@ -182,7 +182,7 @@ re-registering a pair replaces it, `Ctx::register_virtual_model` registers one f
 `Ctx::unregister_virtual_model(provider, id)` removes one, unregistering the *provider* does not, and
 unloading the extension drops its virtual models.
 
-A WebAssembly extension that registers a virtual model needs `"world": "cyrup:ext@0.17"` or newer in
+A WebAssembly extension that registers a virtual model needs `"world": "cyrup:ext@0.18"` or newer in
 its `extension.json`: the route callback is a guest export, and a component built against an older
 world does not have it.
 

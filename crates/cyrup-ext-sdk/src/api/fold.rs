@@ -21,6 +21,7 @@
 //! | `before_provider_headers` | `emitBeforeProviderHeaders` `:1284-1310` | the header edits chain; `null` deletes |
 //! | `resources_discover` | `emitResourcesDiscover` `:1366-1409` | every handler's paths concatenate |
 //! | `project_trust` | `emitProjectTrustEvent` `:291-316` | the first `yes`/`no` returns; `undecided` falls through |
+//! | `cache_warming_decision` | `emitCacheWarmingDecision` `:1121-1142` | all run; the LAST readable `{action}` wins |
 //! | `session_before_*` | `emit` `:988-1017` | a cancel (block) returns; the last result wins |
 //! | every notify event | `emit` `:988-1017` | all run; nothing to combine |
 //!
@@ -42,6 +43,7 @@ pub(super) fn run(kind: u8, args: &[&str], handlers: &[&Handler], ctx: &Ctx) -> 
     let mut patch: Option<Value> = None;
     let mut resources: Vec<Value> = Vec::new();
     let mut undecided: Option<String> = None;
+    let mut last_action: Option<String> = None;
     for handler in handlers {
         let view: Vec<&str> = args.iter().map(String::as_str).collect();
         match handler(&view, ctx) {
@@ -54,6 +56,17 @@ pub(super) fn run(kind: u8, args: &[&str], handlers: &[&Handler], ctx: &Ctx) -> 
                     }
                 }
                 kind::PROJECT_TRUST if !trust_decided(&value) => undecided = Some(value),
+                // EXT-085 `emitCacheWarmingDecision` (`runner.ts:1121-1142` @v1.0.4): every
+                // handler runs and `action = result.action` is assigned INSIDE the loop, so the
+                // LAST readable opinion is the one that reaches the host — the opposite of the
+                // first-handled default above. An unreadable action is no opinion, exactly as
+                // upstream's `result?.action !== undefined` guard ignores a missing one, so it
+                // must not displace an earlier handler's answer either.
+                kind::CACHE_WARMING_DECISION => {
+                    if cache_warming_action_readable(&value) {
+                        last_action = Some(value);
+                    }
+                }
                 _ => return RawOutcome::Handled(value),
             },
             RawOutcome::Mutate(value) => {
@@ -71,7 +84,23 @@ pub(super) fn run(kind: u8, args: &[&str], handlers: &[&Handler], ctx: &Ctx) -> 
     if let Some(p) = patch {
         return RawOutcome::Mutate(p.to_string());
     }
+    if let Some(action) = last_action {
+        return RawOutcome::Handled(action);
+    }
     undecided.map_or(RawOutcome::Noop, RawOutcome::Handled)
+}
+
+/// Does this `cache_warming_decision` answer carry an action the host will read (pi
+/// `CacheWarmingDecisionEventResult.action`, `core/cache-warmer.ts:117-120` @v1.0.4 — only
+/// `"warm"` and `"stop"` exist)? Mirrors the host's `parse_cache_warming_action`, so a handler
+/// whose answer the host would ignore does not displace an earlier handler's here.
+fn cache_warming_action_readable(value: &str) -> bool {
+    serde_json::from_str::<Value>(value).is_ok_and(|v| {
+        matches!(
+            v.get("action").and_then(Value::as_str),
+            Some("warm" | "stop")
+        )
+    })
 }
 
 /// Replace ordered arg `i` (the handlers' args are the event's fields in WIT parameter order).

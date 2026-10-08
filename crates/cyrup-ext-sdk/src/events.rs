@@ -85,6 +85,45 @@ pub struct ContextWithSystemEvent {
     pub messages: Value,
 }
 
+/// `cache_warming_decision` (pi `CacheWarmingDecisionEvent`, `core/cache-warmer.ts:112-115`
+/// @v1.0.4) — EXT-085. Fired before each prompt-cache refresh with the host's own warm-or-stop
+/// verdict filled in; a handler overrides it by answering
+/// [`crate::Outcome::handled`] with `{"action": "warm" | "stop"}`.
+///
+/// Upstream's type is a `Pick` of EXACTLY these four fields. `phase`, `expectedSavings` and
+/// `economicsAvailable` are withheld on purpose — *"Everything else an extension might want
+/// (model, idle state, context size) is on the context."*
+#[derive(Clone, Debug)]
+pub struct CacheWarmingDecisionEvent {
+    /// Price of this refresh: a cache read of the prompt plus one output token, in dollars.
+    pub warm_cost: f64,
+    /// Extra price of the next real request if the cache entry is lost, in dollars.
+    pub miss_cost: f64,
+    /// Estimated chance a real request arrives before the entry expires (1.0 while the agent run
+    /// is still streaming, 0.15 once it has settled and warming continues on spec).
+    pub continuation_probability: f64,
+    /// The host's own decision, `"warm"` or `"stop"`. Returning it unchanged is "no opinion".
+    pub action: String,
+}
+
+impl CacheWarmingDecisionEvent {
+    /// Parse the one `decision-json` argument. A missing or unreadable field reads as `0.0` /
+    /// `""` rather than failing the handler, because a guest cannot refuse a host payload.
+    pub(crate) fn from_json(v: &Value) -> Self {
+        let num = |k: &str| v.get(k).and_then(Value::as_f64).unwrap_or(0.0);
+        Self {
+            warm_cost: num("warmCost"),
+            miss_cost: num("missCost"),
+            continuation_probability: num("continuationProbability"),
+            action: v
+                .get("action")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+        }
+    }
+}
+
 /// `message_end` (Pi types.ts:1222) — replace the just-finished message (same role).
 #[derive(Clone, Debug)]
 pub struct MessageEndEvent {

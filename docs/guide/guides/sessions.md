@@ -248,6 +248,74 @@ a full export.
 role, tool calls and results, input, output, cache-read and cache-write tokens, and cost. It is the
 quickest way to answer "how much has this conversation cost me" and "which file am I actually in".
 
+## Prompt-cache warming
+
+The token counts `/session` prints split cache **reads** from cache **writes** for a reason: a read
+is a fraction of the price of a write. A provider's prompt cache expires on its own clock, though —
+five minutes on Anthropic's short tier — so a turn that spends longer than that inside one tool
+call comes back to an expired entry and pays to write the whole prompt again.
+
+cyrup keeps the entry alive instead. Shortly before it would expire, it re-sends the request it
+already sent, capped to a single output token, which refreshes the cache for about the price of one
+cache read. It does this only while the arithmetic says it saves money, and it is on by default.
+
+`/session` reports the decision in two rows, plus two more when it has prices to work with:
+
+```text
+| warming mode  | streaming                                                        |
+| warming       | Decision in 4m 12s (100% continuation probability while agent is  |
+|               | running, expected savings $0.412 >= $0.050 -> warm)              |
+| miss penalty  | $0.421                                                           |
+| refresh cost  | $0.009                                                           |
+```
+
+- **warming mode** is the [`cacheWarming`](../reference/settings.md#cachewarming) setting:
+  `off`, `streaming` (the default) or `idle`.
+- **warming** is what it has decided and when it will act. `Decision in …` means a warm is
+  scheduled and `Warming cache (…)` means one is in flight, both followed by the arithmetic behind
+  it. `Stopped (…)` carries that same arithmetic for a run that has finished deciding — a warm the
+  economics turned down reads `Stopped (… expected savings $0.004 < $0.050 -> stop)`. `Inactive (…)`
+  is the one that names a plain reason instead, because there was no decision to report.
+- **miss penalty** and **refresh cost** are what losing the cache would cost against what keeping
+  it costs. They only appear when cyrup knows both the prompt size and the model's prices.
+
+Those `Inactive` reasons are worth reading rather than guessing at.
+`Inactive (cache lifetime unavailable)` is the common one and is not a fault: **warming applies only
+to models served directly by Anthropic today**, because that is the only cache whose expiry cyrup
+knows. `Inactive (cache warming unavailable)` is a different thing — it means this session has no
+warmer at all, which is the case for an embedded session that supplied its own request path. The
+rest are self-describing:
+
+| Reason | What happened |
+|---|---|
+| `waiting for first request` | Nothing has been sent yet, so there is no cache to keep alive. |
+| `cache warming disabled` | `cacheWarming` is `off`. |
+| `cache lifetime unavailable` | This model has no known cache expiry — today, anything but direct Anthropic. A virtual-model selection reports this too: a virtual model is routed rather than sent, so there is no cache entry of its own to keep alive. |
+| `request disabled prompt caching` | The request asked for no caching, so there is nothing to refresh. |
+| `request cannot be replayed safely` | An Anthropic request using budget-based thinking, which cannot be replayed cheaply — see [`cacheWarming`](../reference/settings.md#cachewarming). |
+| `agent run settled` | The turn finished and the mode is `streaming` rather than `idle`. |
+| `conversation context changed` | The model or the conversation moved on, so the cached prefix is no longer the one in play. |
+| `one-hour safety limit reached` | A streaming run hit its fixed one-hour ceiling. |
+| `30-minute idle safety limit reached` | An idle run hit its fixed thirty-minute ceiling. |
+| `cache refresh deadline missed` | The warm came due too late to still be cheap, so it was dropped rather than sent at full price. |
+
+Each warm is a real, small charge and is recorded as such: it becomes a `usage` entry in the session
+file, it is included in `/session`'s cost and in the per-model cost breakdown, and with
+`showCacheMissNotices` on it prints a dim one-liner in the transcript as it happens.
+
+```text
+Cache warmed: $0.0009
+```
+
+Resuming a session replays those lines along with the rest of the transcript, so a session you come
+back to shows what warming spent while you were away. Warm entries are left out of `/tree` — they
+are not part of the conversation and never enter the model's context.
+
+`/settings` has the same three values under **Cache warming**, and a change there takes effect in
+the running session straight away: switching to `off` disarms a warm that was already scheduled.
+The full economics — the $0.05 floor, the idle discount and the two safety limits — are in
+[`cacheWarming`](../reference/settings.md#cachewarming).
+
 `/name <session name>` sets the display name, which is what the footer and the `/resume` picker
 show. `--name` does the same at launch. The name is re-read from the session after the write and
 echoed back as `Session name set: <name>`, so if the store normalised what you typed you are told:
