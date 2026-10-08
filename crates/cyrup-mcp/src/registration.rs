@@ -1523,6 +1523,66 @@ pub fn resolve_direct_tools(
     global_prefix: ToolPrefix,
     env_override: Option<&[String]>,
 ) -> Vec<DirectToolSpec> {
+    let specs = resolve_direct_tools_from(
+        config,
+        cache,
+        global_prefix,
+        env_override,
+        CacheEntries::Valid,
+    );
+    if let Some(advisory) = large_direct_tools_advisory(config, &specs) {
+        tracing::warn!("{advisory}");
+    }
+    specs
+}
+
+/// The direct tools a configured server's cache entry still names although the entry is **no
+/// longer valid** (changed config hash, past its server-declared `ttlMs`, `cacheScope: "private"`),
+/// so [`resolve_direct_tools`] does not register them until the server connects (TUI-146).
+///
+/// Only their NAMES are used: [`register_surface`] declares a renderer for each one and registers no
+/// tool, which is the cyrup form of pi's "render MCP tool calls before their server connects"
+/// (`11449730c`, #10285): `pi.registerToolRenderer` routes an `mcp__<server>__<tool>` name to
+/// `createMcpToolRenderers` whether or not that tool is registered
+/// (`coding-agent/src/extensions/mcp/index.ts:383-386` @ce950d78f). pi's built-in extension can
+/// match a name pattern because `mcp__` is its reserved namespace; this adapter's default names are
+/// `<server>_<tool>` (see [`format_tool_name`]), which any tool could carry, so the set is taken
+/// from what the cache says this config's servers expose instead of from the name's shape. Same
+/// filters as [`resolve_direct_tools`], so a name lands here only if it would be a direct tool of
+/// this config once its server reconnects; it therefore claims no renderer the later registration
+/// would not claim anyway.
+#[must_use]
+pub fn resolve_stale_direct_tools(
+    config: &McpConfig,
+    cache: Option<&MetadataCache>,
+    global_prefix: ToolPrefix,
+    env_override: Option<&[String]>,
+) -> Vec<DirectToolSpec> {
+    resolve_direct_tools_from(
+        config,
+        cache,
+        global_prefix,
+        env_override,
+        CacheEntries::Stale,
+    )
+}
+
+/// Which cache entries [`resolve_direct_tools_from`] reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CacheEntries {
+    /// [`valid_entry`] — the registration surface.
+    Valid,
+    /// Present but rejected by [`valid_entry`] — [`resolve_stale_direct_tools`].
+    Stale,
+}
+
+fn resolve_direct_tools_from(
+    config: &McpConfig,
+    cache: Option<&MetadataCache>,
+    global_prefix: ToolPrefix,
+    env_override: Option<&[String]>,
+    entries: CacheEntries,
+) -> Vec<DirectToolSpec> {
     let mut specs: Vec<DirectToolSpec> = Vec::new();
     let Some(cache) = cache else {
         return specs;
@@ -1536,7 +1596,14 @@ pub fn resolve_direct_tools(
         if definition.is_disabled() {
             continue;
         }
-        let Some(entry) = valid_entry(Some(cache), server_name, definition) else {
+        let entry = match entries {
+            CacheEntries::Valid => valid_entry(Some(cache), server_name, definition),
+            CacheEntries::Stale => cache
+                .servers
+                .get(server_name)
+                .filter(|_| valid_entry(Some(cache), server_name, definition).is_none()),
+        };
+        let Some(entry) = entry else {
             continue;
         };
         let ToolSelection { filter, lazy } =
@@ -1577,15 +1644,21 @@ pub fn resolve_direct_tools(
             }
             let prefixed_name = format_tool_name(&tool.name, server_name, effective_prefix);
             if BUILTIN_NAMES.contains(&prefixed_name.as_str()) {
-                tracing::warn!(
-                    "MCP: skipping direct tool \"{prefixed_name}\" (collides with builtin)"
-                );
+                // Logged once, by the registration pass; the stale pass only collects names.
+                if entries == CacheEntries::Valid {
+                    tracing::warn!(
+                        "MCP: skipping direct tool \"{prefixed_name}\" (collides with builtin)"
+                    );
+                }
                 continue;
             }
             if seen_names.contains(&prefixed_name) {
-                tracing::warn!(
-                    "MCP: skipping duplicate direct tool \"{prefixed_name}\" from \"{server_name}\""
-                );
+                // Logged once, by the registration pass; the stale pass only collects names.
+                if entries == CacheEntries::Valid {
+                    tracing::warn!(
+                        "MCP: skipping duplicate direct tool \"{prefixed_name}\" from \"{server_name}\""
+                    );
+                }
                 continue;
             }
             seen_names.insert(prefixed_name.clone());
@@ -1621,15 +1694,21 @@ pub fn resolve_direct_tools(
             }
             let prefixed_name = format_tool_name(&base_name, server_name, effective_prefix);
             if BUILTIN_NAMES.contains(&prefixed_name.as_str()) {
-                tracing::warn!(
-                    "MCP: skipping direct resource tool \"{prefixed_name}\" (collides with builtin)"
-                );
+                // Logged once, by the registration pass; the stale pass only collects names.
+                if entries == CacheEntries::Valid {
+                    tracing::warn!(
+                        "MCP: skipping direct resource tool \"{prefixed_name}\" (collides with builtin)"
+                    );
+                }
                 continue;
             }
             if seen_names.contains(&prefixed_name) {
-                tracing::warn!(
-                    "MCP: skipping duplicate direct resource tool \"{prefixed_name}\" from \"{server_name}\""
-                );
+                // Logged once, by the registration pass; the stale pass only collects names.
+                if entries == CacheEntries::Valid {
+                    tracing::warn!(
+                        "MCP: skipping duplicate direct resource tool \"{prefixed_name}\" from \"{server_name}\""
+                    );
+                }
                 continue;
             }
             seen_names.insert(prefixed_name.clone());
@@ -1647,10 +1726,6 @@ pub fn resolve_direct_tools(
                 lazy,
             });
         }
-    }
-
-    if let Some(advisory) = large_direct_tools_advisory(config, &specs) {
-        tracing::warn!("{advisory}");
     }
 
     specs
@@ -3381,6 +3456,33 @@ pub fn register_surface<S: SurfaceSink + ?Sized>(
         // runs. A tool registered on the LATE path has no caller loop — the same pass is the whole
         // registration — so a renderer declared anywhere else would silently not exist for it.
         api.register_tool_renderer(spec.prefixed_name.clone());
+    }
+
+    // --- TUI-146: renderers for the direct tools a stale cache entry still names ---------------
+    // pi draws a call to an MCP tool whose server has not connected with the MCP renderers, not
+    // with the unbounded `formatToolExecution` it keeps for an unknown tool
+    // (`coding-agent/src/extensions/mcp/index.ts:383-386` @ce950d78f, `11449730c`). A tool this
+    // pass registered already has its renderer; one whose cache entry is no longer valid is not
+    // registered until its server reconnects, yet a resumed session's history may call it, and the
+    // replay walk draws that history from the renderer table alone
+    // (`cyrup-tui/src/app/session_bind.rs` `replay_items_with_extensions`). Declaring the renderer
+    // without the tool is enough: the late registration that follows a connect declares the same
+    // name for the same owner.
+    if !env_is_none_sentinel {
+        let registered: HashSet<&str> = direct_specs
+            .iter()
+            .map(|spec| spec.prefixed_name.as_str())
+            .collect();
+        for spec in resolve_stale_direct_tools(
+            config,
+            cache.as_ref(),
+            config.tool_prefix(),
+            env_selectors.as_deref(),
+        ) {
+            if !registered.contains(spec.prefixed_name.as_str()) {
+                api.register_tool_renderer(spec.prefixed_name);
+            }
+        }
     }
 
     // --- syncProxyTool (MCP-213 / MCP-218 / MCP-247) --------------------------------------------
@@ -5411,5 +5513,121 @@ mod tests {
         );
         let none = build_proxy_description(&config_of(&[("plain", entry(true))]), None, &[]);
         assert!(!none.contains("Search-mode servers"), "{none}");
+    }
+
+    // --- TUI-146: renderers for tools a stale cache entry still names ----------------------------
+
+    /// A sink that keeps the names of the tools and of the renderers a pass declares.
+    #[derive(Default)]
+    struct KeepNames {
+        tools: Vec<String>,
+        renderers: Vec<String>,
+    }
+
+    impl SurfaceSink for KeepNames {
+        fn register_tool(&mut self, tool: Arc<dyn Tool>) {
+            self.tools.push(tool.name().to_string());
+        }
+        fn register_command(&mut self, _name: String, _desc: CommandDescriptor) {}
+        fn register_tool_renderer(&mut self, tool_name: String) {
+            self.renderers.push(tool_name);
+        }
+    }
+
+    fn stale_config() -> McpConfig {
+        config_of(&[
+            ("live", entry(true)),
+            ("moved", entry(true)),
+            ("expired", entry(true)),
+            ("private", entry(true)),
+            ("proxied", entry(false)),
+        ])
+    }
+
+    /// A cache whose `live` entry is valid and whose `moved`, `expired` and `private` entries are
+    /// not: a config hash that no longer matches, a server-declared `ttlMs` of `0`, and
+    /// `cacheScope: "private"` — the three ways a configured server with a catalogue on disk is
+    /// left unregistered until it connects. `proxied` wants no direct tools at all.
+    fn stale_cache_json(config: &McpConfig) -> Value {
+        let hash = |name: &str| config.mcp_servers.get(name).and_then(default_server_hasher);
+        json!({
+            "version": METADATA_CACHE_VERSION,
+            "servers": {
+                "live": { "configHash": hash("live"), "cachedAt": now_ms(), "tools": [{ "name": "ping" }] },
+                "moved": { "configHash": "0".repeat(64), "cachedAt": now_ms(), "tools": [{ "name": "edit" }] },
+                "expired": { "configHash": hash("expired"), "cachedAt": now_ms(), "ttlMs": 0, "tools": [{ "name": "fetch" }] },
+                "private": { "configHash": hash("private"), "cachedAt": now_ms(), "cacheScope": "private", "tools": [{ "name": "whoami" }] },
+                "proxied": { "configHash": "0".repeat(64), "cachedAt": now_ms(), "tools": [{ "name": "hidden" }] }
+            }
+        })
+    }
+
+    /// The stale resolution covers exactly the entries the registration pass rejects: every name
+    /// [`resolve_direct_tools`] skips for an invalid entry, and none it registers.
+    #[test]
+    fn stale_direct_tools_are_the_ones_an_invalid_entry_still_names() {
+        let config = stale_config();
+        let cache: MetadataCache =
+            serde_json::from_value(stale_cache_json(&config)).expect("cache");
+        let names = |specs: Vec<DirectToolSpec>| -> Vec<String> {
+            specs.into_iter().map(|spec| spec.prefixed_name).collect()
+        };
+        assert_eq!(
+            names(resolve_direct_tools(
+                &config,
+                Some(&cache),
+                ToolPrefix::Server,
+                None
+            )),
+            ["live_ping"]
+        );
+        assert_eq!(
+            names(resolve_stale_direct_tools(
+                &config,
+                Some(&cache),
+                ToolPrefix::Server,
+                None
+            )),
+            ["moved_edit", "expired_fetch", "private_whoami"]
+        );
+        assert!(resolve_stale_direct_tools(&config, None, ToolPrefix::Server, None).is_empty());
+    }
+
+    /// TUI-146 — a resumed session's history can call a direct tool whose server's cache entry is no
+    /// longer valid. The pass registers no tool for it (the server has not connected), but it must
+    /// still claim the NAME's renderer, so the replay draws the call and result with the MCP
+    /// renderers rather than the host's unbounded unknown-tool shape — pi's `registerToolRenderer`
+    /// route (`coding-agent/src/extensions/mcp/index.ts:383-386` @ce950d78f). Before the fix the
+    /// renderer list was exactly the registered tools.
+    #[test]
+    fn register_surface_declares_renderers_for_tools_a_stale_entry_still_names() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let agent_dir = temp.path().join("agent");
+        std::fs::create_dir_all(&agent_dir).expect("mkdir");
+        let config = stale_config();
+        std::fs::write(
+            agent_dir.join("mcp-cache.json"),
+            serde_json::to_string(&stale_cache_json(&config)).expect("serialize"),
+        )
+        .expect("write");
+        let dirs = McpDirs::new(agent_dir, temp.path().to_path_buf());
+
+        let mut sink = KeepNames::default();
+        let surface =
+            register_surface(&mut sink, &dirs, &config, Arc::new(ToolDispatch::default()));
+
+        assert_eq!(sink.tools, ["live_ping", PROXY_TOOL_NAME]);
+        assert_eq!(surface.tool_names, ["live_ping", PROXY_TOOL_NAME]);
+        assert_eq!(
+            sink.renderers,
+            [
+                "live_ping",
+                "moved_edit",
+                "expired_fetch",
+                "private_whoami",
+                PROXY_TOOL_NAME
+            ],
+            "a server that wants no direct tools (`proxied`) claims no direct-tool name"
+        );
     }
 }
