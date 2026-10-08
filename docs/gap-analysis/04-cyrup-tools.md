@@ -1852,6 +1852,8 @@ no others.
    correct on both sides; do not refile it here. One cross-reference worth carrying into it: the
    `tool_search` tool of `TOOL-052` ships no renderer, so it takes this path too — under the current
    fallback a `tool_search` call renders as the bare word `tool_search` with the query invisible.
+   **`TUI-138` CLOSED 2026-10-08**: the fallback now draws the argument preview, so a `tool_search`
+   call renders `tool_search query="…"` collapsed and its arguments expanded.
 
 ## Coverage
 

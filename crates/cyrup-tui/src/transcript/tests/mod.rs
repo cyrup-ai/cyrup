@@ -3,6 +3,7 @@
 //! [`TranscriptView`](super::TranscriptView)'s private render-cache fields.
 
 mod bash_duration;
+mod call_fallback;
 mod js_arg;
 mod js_number;
 mod osc_hyperlinks;
