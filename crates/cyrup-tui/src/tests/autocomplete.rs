@@ -932,3 +932,95 @@ fn a_single_match_auto_apply_leaves_no_forced_popup_behind() {
         "prose after an auto-applied file must not pop a path list"
     );
 }
+
+// ---- TUI-139: a slash command after leading whitespace -----------------------------------------
+
+/// Every value a popup would insert, in row order.
+fn completion_values(ac: &Autocomplete) -> Vec<String> {
+    (0..ac.list.len())
+        .filter_map(|i| {
+            let mut probe = ac.clone();
+            probe.list.set_selected(i);
+            probe.selected().map(|c| c.value.clone())
+        })
+        .collect()
+}
+
+/// `const commandText = textBeforeCursor.trimStart()` (`autocomplete.ts:338` @f1b2e77f5, #10218):
+/// `  /mo` opens the command popup with the trimmed `/mo` as its prefix, and accepting splices the
+/// name after the leading whitespace — not over it, and not doubling the `/`.
+#[test]
+fn a_slash_command_after_leading_whitespace_completes() {
+    let mut ed = InputEditor::new();
+    type_str(&mut ed, "  /mo");
+    let ac = ed
+        .autocomplete()
+        .expect("the command popup must open after leading whitespace")
+        .clone();
+    assert_eq!(ac.context, crate::CompletionContext::Slash);
+    assert_eq!(ac.prefix, "/mo");
+    let index = ac
+        .list
+        .items()
+        .iter()
+        .position(|item| item.label == "model")
+        .expect("`/model` must be offered");
+
+    // Select `model` explicitly so the splice does not depend on fuzzy ranking.
+    let mut ac = ac;
+    ac.list.set_selected(index);
+    let line = "  /mo".to_string();
+    let applied = ac.apply(std::slice::from_ref(&line), 0, 5).unwrap();
+    assert_eq!(applied.lines, vec!["  /model ".to_string()]);
+    assert_eq!(applied.cursor_col, "  /model ".chars().count());
+}
+
+/// The argument branch reads `commandText` too (`autocomplete.ts:379-398` @f1b2e77f5):
+/// `  /thinking ` offers exactly what `/thinking ` does, and the accepted value lands after the
+/// space.
+#[test]
+fn argument_completion_after_leading_whitespace_matches_the_unindented_line() {
+    let sources = crate::ArgumentSources {
+        thinking_levels: vec!["low".to_string(), "high".to_string()].into(),
+        ..Default::default()
+    };
+    let registry = CommandRegistry::new();
+    let compute = |line: &str| {
+        Autocomplete::compute(
+            &registry,
+            &sources,
+            &[line.to_string()],
+            0,
+            line.chars().count(),
+            false,
+            Path::new("."),
+        )
+    };
+    let plain = compute("/thinking ").expect("baseline: `/thinking ` offers levels");
+    let indented = compute("  /thinking ").expect("leading whitespace must not hide the levels");
+    assert_eq!(indented.context, crate::CompletionContext::SlashArgument);
+    assert_eq!(indented.prefix, plain.prefix);
+    assert_eq!(completion_values(&indented), completion_values(&plain));
+    // `/tree` owns no completer: both forms answer nothing, and neither falls through to paths.
+    assert!(compute("/tree ").is_none());
+    assert!(compute("  /tree ").is_none());
+
+    let mut ed = InputEditor::new();
+    ed.set_argument_sources(sources.clone());
+    type_str(&mut ed, "  /thinking hi");
+    let ac = ed.autocomplete().expect("the argument popup must open");
+    assert_eq!(ac.context, crate::CompletionContext::SlashArgument);
+    ed.handle_key(&key(KeyCode::Tab));
+    assert_eq!(ed.text(), "  /thinking high");
+}
+
+/// The terminal half of the slash branch trims as well: an indented `/export ./sr` offers no paths
+/// unforced, exactly as the unindented line does (`autocomplete.ts:339` @f1b2e77f5).
+#[test]
+fn an_indented_slash_line_never_falls_through_to_paths() {
+    let dir = slash_path_fixture();
+    let cwd = dir.path();
+    assert!(compute_at_end("  /export ./sr", false, cwd).is_none());
+    let forced = compute_at_end("  /export ./sr", true, cwd).expect("forced path completion");
+    assert_eq!(forced.context, crate::CompletionContext::Path);
+}

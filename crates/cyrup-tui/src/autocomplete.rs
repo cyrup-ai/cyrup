@@ -235,6 +235,14 @@ impl Autocomplete {
     ) -> Option<Autocomplete> {
         let line = lines.get(cursor_line).map(String::as_str).unwrap_or("");
         let before: String = line.chars().take(cursor_col).collect();
+        // TUI-139 — `const commandText = textBeforeCursor.trimStart()` (`autocomplete.ts:338`
+        // @f1b2e77f5, #10218): the whole slash branch reads the TRIMMED text — its `/` test, the
+        // space split, both slices and the returned prefix (`:339-380`) — so ` /mod` still
+        // completes. The prefix being the trimmed text is what makes the accepted name splice
+        // after the leading whitespace rather than over it. `str::trim_start` is Unicode
+        // `White_Space`, JS's `trimStart` is `\s` plus line terminators: the same set less U+FEFF
+        // and plus U+0085, neither of which a key event leaves in the buffer.
+        let command_text = before.trim_start();
 
         // 1. Slash command (`autocomplete.ts:313-363` @v0.84.3) — the name list before the first
         //    space, the argument list after it.
@@ -247,12 +255,12 @@ impl Autocomplete {
         //    tries the argument list on the forced path too — completing an argument is exactly
         //    what Tab is for, and answering it with a directory listing is a wrong answer rather
         //    than a missing one.
-        if let Some(ac) = slash_context(registry, arguments, &before) {
+        if let Some(ac) = slash_context(registry, arguments, command_text) {
             return Some(ac);
         }
         // The forced half of the deviation above: a `/name <arg>` line whose command OWNS a
         // completer stays terminal on Tab too, rather than falling through to a path listing.
-        if argument_completer(registry, &before).is_some() {
+        if argument_completer(registry, command_text).is_some() {
             return None;
         }
         // TUI-077 — the unforced slash branch is TERMINAL upstream: every exit of the
@@ -262,7 +270,7 @@ impl Autocomplete {
         // `/Users/dav` offer no paths while a popup is open. A FORCED popup (Tab on `/export ./sr`)
         // is unaffected: the editor re-asks with `force` for as long as it stays open, pi's
         // `autocompleteState === "force"` (`components/editor.ts:2468`).
-        if !force && before.starts_with('/') {
+        if !force && command_text.starts_with('/') {
             return None;
         }
         // 2. Bare path.
@@ -345,7 +353,8 @@ impl Autocomplete {
     }
 }
 
-/// Slash context (`autocomplete.ts:313-363` @v0.84.3): `before` starts with `/`, split on the FIRST
+/// Slash context (`autocomplete.ts:313-363` @v0.84.3): `before` — the caller's leading-whitespace-
+/// trimmed `commandText` (TUI-139) — starts with `/`, split on the FIRST
 /// SPACE (`:314` `textBeforeCursor.indexOf(" ")` — a literal space, not any whitespace, so a tab
 /// keeps the line in the name branch). No space → the command-name list (`:316-341`); a space → the
 /// argument list (`:344-363`), which never falls back to the name list.
@@ -370,6 +379,11 @@ fn slash_context(
 /// predicate in [`Autocomplete::compute`]. `str::get`, never a slice expression
 /// (`deny(clippy::string_slice)`).
 ///
+/// TUI-139 — `before` is trimmed of leading whitespace first, as `commandText` is upstream
+/// (`autocomplete.ts:338-380` @f1b2e77f5), here rather than at each caller so the async extension
+/// fetch ([`crate::InputEditor::pending_extension_argument`]) resolves ` /cmd arg` the same way the
+/// popup does.
+///
 /// The command NAME rides back out alongside the completer because
 /// [`ArgumentCompleter::Extension`] is one tag shared by every registered extension command — the
 /// name is how its own completer is identified, standing in for the per-command closure pi binds
@@ -378,7 +392,7 @@ pub(crate) fn argument_completer<'a>(
     registry: &CommandRegistry,
     before: &'a str,
 ) -> Option<(ArgumentCompleter, &'a str, &'a str)> {
-    let rest = before.strip_prefix('/')?;
+    let rest = before.trim_start().strip_prefix('/')?;
     let space = rest.find(' ')?;
     let name = rest.get(..space)?;
     let argument = rest.get(space + 1..)?;
