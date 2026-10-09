@@ -2684,6 +2684,54 @@ mod tests {
         assert_eq!(wire["childTotal"]["input"], serde_json::json!(30));
     }
 
+    /// SUBA-175: an async child's turns come from the `_meta.json` the real producer writes.
+    /// `run_artifact_metadata` puts the run's turn count into `usage.turns`, pi's shape
+    /// (`subagent-runner.ts:1238`, `:1509` @v0.76.1), and `metadata_usage` reads it from there
+    /// (`subagent-cost.ts:137`). A `_meta.json` written before that has no `usage.turns` and still
+    /// resolves, with 0 turns.
+    #[tokio::test]
+    async fn an_async_childs_turns_come_from_the_metadata_the_runner_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        write_async_status(dir.path(), "as-1", &[("worker", StepState::Complete)]).await;
+        let config = crate::exec::testsupport::sample_agent_config("fixture/model", &[]);
+        let mut result = crate::exec::pre_spawn_failure(&config, "task", String::new());
+        result.agent = "worker".to_string();
+        result.exit_code = 0;
+        result.error = None;
+        result.turns = 3;
+        result.usage.input = 30;
+        let artifacts = crate::artifacts::resolve_artifacts_dir(
+            None,
+            Some(dir.path()),
+            dir.path(),
+            crate::artifacts::ArtifactDirPreference::Project,
+        );
+        std::fs::create_dir_all(&artifacts).unwrap();
+        std::fs::write(
+            crate::artifacts::artifact_paths(&artifacts, "as-1", "worker", Some(0)).metadata_path,
+            serde_json::to_vec(&crate::artifacts::run_artifact_metadata("as-1", &result)).unwrap(),
+        )
+        .unwrap();
+        let launch = async_launch_entry("t0000001", "single", "as-1", dir.path());
+
+        let report = collect_in(dir.path(), [&launch]).await;
+
+        assert_eq!(report.children.len(), 1, "{report:?}");
+        assert_eq!(report.children[0].usage.input, 30, "{report:?}");
+        assert_eq!(report.children[0].usage.turns, 3, "{report:?}");
+        assert_eq!(report.child_total.turns, 3, "{report:?}");
+
+        // A pre-SUBA-175 file: the same usage with no `turns` key.
+        let legacy = tempfile::tempdir().unwrap();
+        write_async_status(legacy.path(), "as-1", &[("worker", StepState::Complete)]).await;
+        write_meta(legacy.path(), "as-1", "worker", Some(0), 30);
+        let launch = async_launch_entry("t0000001", "single", "as-1", legacy.path());
+        let report = collect_in(legacy.path(), [&launch]).await;
+        assert_eq!(report.children[0].usage.input, 30, "{report:?}");
+        assert_eq!(report.children[0].usage.turns, 0, "{report:?}");
+        assert_eq!(report.unresolved_async_children, 0, "{report:?}");
+    }
+
     /// pi `:268-278`: a multi-step async run (chain or parallel) reads each step's own indexed
     /// metadata under a per-step identity, so two steps of one run do not collapse into one. A
     /// pending step is not yet unresolved; a settled step with no metadata is.

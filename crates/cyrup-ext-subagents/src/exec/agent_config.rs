@@ -32,6 +32,12 @@ pub struct AgentConfig {
     /// [`crate::exec::acceptance::AcceptanceContract::heuristic_default`] classifies.
     pub name: String,
     pub model: Option<ModelId>,
+    /// SUBA-167 — [`Self::model`] is the `subagents.defaultModel` fill
+    /// ([`crate::discovery::types::AgentModelSourceInfo::SettingsDefault`]), not a model the
+    /// operator pinned on this agent. A Claude Code adapter never passes such a model as `--model`
+    /// (pi `agentPinnedModel`, `claude-code-adapter.ts:91-100` @v0.76.1): it is a default for Pi
+    /// children only.
+    pub model_is_settings_default: bool,
     /// SUBA-088 — pi `AgentConfig.modelProvider` (`agents.ts:144` @v0.64.0), copied off
     /// [`AgentDefinition::model_provider`]: the provider this agent's BARE model ids resolve
     /// against, consumed by `run_sync`'s ladder as `agent.modelProvider ??
@@ -150,6 +156,8 @@ impl AgentConfig {
             mutation_tools: agent.mutation_tools.clone(),
             name: agent.local_name.clone(),
             model: agent.model.clone(),
+            model_is_settings_default: agent.model_source
+                == Some(crate::discovery::types::AgentModelSourceInfo::SettingsDefault),
             model_provider: agent.model_provider.clone(),
             fallback_models: agent.fallback_models.clone(),
             thinking: agent.thinking.clone(),
@@ -211,6 +219,13 @@ pub struct ResolvedAgentPersona {
     /// The agent's local (unqualified) name — exactly [`AgentConfig::name`].
     pub name: String,
     pub model: Option<ModelId>,
+    /// SUBA-167 — see [`AgentConfig::model_is_settings_default`]; carried so a background or
+    /// chain step's Claude Code launch keeps a `subagents.defaultModel` fill out of `--model` as
+    /// the single-run path does. `#[serde(default)]` keeps an older on-disk config deserializable,
+    /// and the `false` default is omitted on write, so a persona that never had the fill
+    /// serializes — and digests — exactly as before.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub model_is_settings_default: bool,
     /// SUBA-088 — the persona's `modelProvider` (see [`AgentConfig::model_provider`]), carried
     /// across the runner-config hand-off so a background/chain step qualifies its bare ids the
     /// same way the single-run path does. `#[serde(default)]` keeps an older on-disk config
@@ -391,6 +406,8 @@ impl ResolvedAgentPersona {
             mutation_tools: agent.mutation_tools.clone(),
             name: agent.local_name.clone(),
             model: agent.model.clone(),
+            model_is_settings_default: agent.model_source
+                == Some(crate::discovery::types::AgentModelSourceInfo::SettingsDefault),
             model_provider: agent.model_provider.clone(),
             fallback_models: agent.fallback_models.clone(),
             thinking: agent.thinking.clone(),
@@ -431,6 +448,7 @@ impl ResolvedAgentPersona {
             mutation_tools: self.mutation_tools.clone(),
             name: self.name.clone(),
             model: self.model.clone(),
+            model_is_settings_default: self.model_is_settings_default,
             model_provider: self.model_provider.clone(),
             fallback_models: self.fallback_models.clone(),
             thinking: self.thinking.clone(),
@@ -545,6 +563,13 @@ pub struct RunOptions {
     /// cross-session default inside [`crate::exec::run_sync`]; a caller wanting that global-default behavior
     /// resolves it explicitly before constructing this struct.
     pub model_override: ModelOverride,
+    /// SUBA-167 — the caller's or step's `model` AS TYPED: before session-model inheritance and
+    /// with any `:level` suffix intact. Read only by a Claude Code launch, whose `--model`/
+    /// `--effort` come from it (pi `resolveClaudeCodeOverride({ model: s.model, … })`,
+    /// `async-execution.ts:1103` @v0.76.1). [`Self::model_override`] cannot serve: it is the
+    /// POST-inheritance value, so a parent session's model would become the CLI's `--model`.
+    /// `None` when the launch named no model.
+    pub launch_model: Option<ModelId>,
     /// SUBA-088 — pi `preferredModelProvider: currentProvider` (`subagent-executor.ts:3825`
     /// @v0.64.0, `currentProvider = parentModel?.provider` at `:3648`; the async runner's
     /// `ctx.currentModelProvider`, `:1297`): the PARENT session's provider, the second rung of
@@ -1140,6 +1165,7 @@ mod tests {
     #[test]
     fn resolved_agent_persona_round_trips_through_json_preserving_every_field() {
         let persona = ResolvedAgentPersona {
+            model_is_settings_default: false,
             default_tool_timeout_ms: None,
             inherit_global_context: true,
             machine: None,
@@ -1235,6 +1261,7 @@ mod tests {
     #[test]
     fn to_agent_config_stamps_the_live_depth_and_reproduces_the_persona() {
         let persona = ResolvedAgentPersona {
+            model_is_settings_default: false,
             default_tool_timeout_ms: None,
             inherit_global_context: true,
             machine: None,

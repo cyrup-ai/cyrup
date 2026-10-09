@@ -614,6 +614,19 @@ pub(crate) fn run_artifact_metadata(run_id: &str, result: &SingleResult) -> serd
             .map(|d| d.as_millis())
             .unwrap_or(0),
     });
+    // SUBA-175 — pi's `usage` is a full `Usage`, whose interface carries `turns`
+    // (`src/shared/types.ts:261-268` @v0.76.1): the async runner folds each run's `usage.turns`
+    // into the usage it writes (`runs/background/subagent-runner.ts:1238`, `:1509`) and the
+    // foreground writer persists `target.usage` (`runs/foreground/execution.ts:154`).
+    // `cyrup_core::Usage` has no `turns`, so the count is kept beside it on `SingleResult` and
+    // written back into the object here; `/subagent-cost`'s `metadata_usage` reads it from there
+    // (pi `metadataUsage`, `slash/subagent-cost.ts:137`).
+    if let Some(usage) = metadata
+        .get_mut("usage")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        usage.insert("turns".to_string(), serde_json::Value::from(result.turns));
+    }
     // PB-14 — pi persists `skillsWarning` into `_meta.json` (`execution.ts:174` @v0.68.0), and
     // only when set (an `undefined` property is not serialized).
     if let (Some(warning), Some(object)) =

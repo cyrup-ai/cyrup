@@ -2016,6 +2016,15 @@ impl HostServices for LiveHostServices {
             .map(|m| format!("{}/{}", m.provider.as_str(), m.model.as_str()))
     }
 
+    /// The full [`Model`] [`LiveHostServices::update_model`] pushed — on build and on every
+    /// `set_model`, so it follows `/model` exactly as [`HostServices::current_model`] does.
+    fn current_model_info(&self) -> Option<Value> {
+        Self::lock(&self.snapshot)
+            .resolved_model
+            .as_ref()
+            .and_then(|m| serde_json::to_value(m).ok())
+    }
+
     fn thinking_level(&self) -> Option<String> {
         Self::lock(&self.snapshot).thinking_level.clone()
     }
@@ -3257,6 +3266,59 @@ mod tests {
         let usage = svc.context_usage();
         assert_eq!(usage["usedTokens"], json!(42));
         assert_eq!(usage["contextWindow"], json!(128_000));
+    }
+
+    /// SUBA-153 — `current_model_info` is pi's `ctx.model`: the whole catalog entry, raw compat
+    /// included, and it follows `update_model` (build and every `set_model`) rather than being
+    /// captured once. The trait default answers `None` for a host with no live session.
+    #[test]
+    fn current_model_info_reports_the_full_model_and_follows_update_model() {
+        let provider: Arc<dyn Provider> = Arc::new(FauxProvider::new());
+        let svc = svc_with(provider.clone());
+        assert!(svc.current_model_info().is_none(), "no model pushed yet");
+
+        let mut capable = provider.models()[0].clone();
+        capable.api = cyrup_provider::known_api::ANTHROPIC_MESSAGES.into();
+        capable.compat = Some(cyrup_provider::api::compat::ModelCompat {
+            supports_mid_convo_system_messages: Some(true),
+            supports_mid_convo_tool_changes: Some(true),
+            ..Default::default()
+        });
+        let model_ref = |id: &str| ModelRef {
+            provider: "faux".into(),
+            api: None,
+            model: id.into(),
+        };
+        svc.update_model(model_ref("faux-1"), capable, None);
+        let info = svc
+            .current_model_info()
+            .expect("model info after update_model");
+        assert_eq!(info["api"], json!("anthropic-messages"));
+        assert_eq!(
+            info["compat"]["supportsMidConvoSystemMessages"],
+            json!(true)
+        );
+        assert_eq!(info["compat"]["supportsMidConvoToolChanges"], json!(true));
+        assert!(
+            info["compat"].get("supportsAdditionalTools").is_none(),
+            "an undeclared compat key stays absent, as pi's raw `model.compat` read needs: {info}"
+        );
+
+        let mut other = provider.models()[0].clone();
+        other.id = "faux-2".into();
+        other.api = cyrup_provider::known_api::OPENAI_COMPLETIONS.into();
+        other.compat = None;
+        svc.update_model(model_ref("faux-2"), other, None);
+        let info = svc
+            .current_model_info()
+            .expect("model info after set_model");
+        assert_eq!(info["id"], json!("faux-2"));
+        assert_eq!(info["api"], json!("openai-completions"));
+        assert!(info.get("compat").is_none(), "{info}");
+
+        struct NoSession;
+        impl HostServices for NoSession {}
+        assert!(NoSession.current_model_info().is_none());
     }
 
     /// A session that already carries a name when the manager is attached (a resumed session, or

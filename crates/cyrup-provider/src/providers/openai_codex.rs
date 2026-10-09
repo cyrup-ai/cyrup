@@ -789,7 +789,28 @@ mod tests {
             .expect("spark carries a compat block now");
         assert_eq!(compat.supports_openai_grammar_tools, Some(true));
         assert_eq!(compat.supports_tool_search, None);
+        assert_eq!(compat.supports_additional_tools, None);
         assert_eq!(compat.supports_mid_convo_system_messages, None);
+
+        // SUBA-153: the catalog's `supportsAdditionalTools` survives the load (serde dropped the key
+        // before the field existed). Six rows carry it; `gpt-5.5` and the spark row do not.
+        let mut additional: Vec<&str> = models
+            .iter()
+            .filter(|m| m.compat.as_ref().and_then(|c| c.supports_additional_tools) == Some(true))
+            .map(|m| m.id.as_str())
+            .collect();
+        additional.sort_unstable();
+        assert_eq!(
+            additional,
+            [
+                "gpt-5.6-luna",
+                "gpt-5.6-sol",
+                "gpt-5.6-terra",
+                "gpt-6-astra",
+                "gpt-6-luna",
+                "gpt-6-sol"
+            ]
+        );
 
         // Every other row opts into tool search.
         for m in models

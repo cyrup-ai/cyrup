@@ -534,6 +534,7 @@ pub(super) async fn load_runner_config(
                  subcommand against the same --config path); nothing to run"
                     .to_string(),
                 WorkflowResultFields::default(),
+                None,
             )
             .await;
             None
@@ -554,6 +555,7 @@ pub(super) async fn load_runner_config(
                 None,
                 format!("failed to read runner-config.json: {err}"),
                 WorkflowResultFields::default(),
+                None,
             )
             .await;
             None

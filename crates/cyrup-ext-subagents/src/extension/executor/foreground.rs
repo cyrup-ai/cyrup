@@ -142,6 +142,8 @@ struct ForegroundRunOptionsInput<'a> {
     max_thinking: Option<String>,
     available_models: Vec<ModelId>,
     effective_override: crate::exec::fallback::ModelOverride,
+    /// SUBA-167 — [`RunOptions::launch_model`]: the request's `model` as typed.
+    launch_model: Option<ModelId>,
     /// SUBA-119 — pi's `options.modelOverrideFromParent` (`execution.ts:1836`).
     model_override_from_parent: bool,
     /// SUBA-119 — pi's `options.modelResponseAliases`, resolved from the same live
@@ -221,6 +223,53 @@ struct DetachedRunHandoff<'a> {
     /// through (R-VLS11b-02). Owned because that task outlives this call; unused on the workflow
     /// arm, which persists through `&self` in `settle_attached_foreground_run`.
     persist_roots: crate::paths::Roots,
+    /// SUBA-172 — the run's history recorder. Owned for the same reason as `art_paths`: the plain
+    /// arm moves it into the continuation task, which records once the child really exits.
+    history: ForegroundRunHistory,
+}
+
+/// SUBA-172 — everything pi's foreground `recordRun(params.agent!, cleanTask, r.exitCode,
+/// r.progressSummary?.durationMs ?? 0, r)` call needs (`subagent-executor.ts:4371,4396`
+/// @v0.76.1), captured once when the run starts.
+///
+/// The path is the config snapshot's `roots.agent_dir()` — pi `getHistoryPath()`
+/// (`run-history.ts:27-29`) — never the env-global `run_history_path()`, so a sandboxed executor
+/// (`Roots::sandboxed`) records into its sandbox, the same principle as `run_history_path_for`.
+///
+/// `[CYRUP-DELTA]` the task is the AUTHORED task. Upstream hashes `cleanTask`, which is
+/// `wrapForkTask(task)` for a forked agent (`:4172-4175`); cyrup forks at the session level and
+/// has no wrapper, so a fork run's `taskHash` differs from upstream's for the same prompt.
+/// Nothing compares hashes across runtimes.
+#[derive(Clone, Debug)]
+pub(crate) struct ForegroundRunHistory {
+    path: PathBuf,
+    agent: String,
+    task: String,
+    /// The run's start — `progressSummary.durationMs` is measured from it upstream.
+    started: std::time::Instant,
+}
+
+impl ForegroundRunHistory {
+    pub(crate) fn new(roots: &crate::paths::Roots, agent: &str, task: &str) -> Self {
+        Self {
+            path: roots.agent_dir().join("run-history.jsonl"),
+            agent: agent.to_string(),
+            task: task.to_string(),
+            started: std::time::Instant::now(),
+        }
+    }
+
+    /// Record the run's TERMINAL result. Best-effort, like every history write.
+    fn record(&self, result: &SingleResult) {
+        crate::background::record_run(
+            &self.path,
+            &self.agent,
+            &self.task,
+            result.exit_code,
+            i64::try_from(self.started.elapsed().as_millis()).unwrap_or(i64::MAX),
+            &crate::background::RunTerminal::from_result(result),
+        );
+    }
 }
 
 impl SubagentExecutor {
@@ -383,6 +432,8 @@ impl SubagentExecutor {
             workflow_key,
             workflow_steer,
             worktree,
+            // SUBA-167 — the caller's model AS TYPED, for a Claude Code launch's `--model`.
+            model_override: launch_model,
             ..
         } = req;
 
@@ -456,6 +507,7 @@ impl SubagentExecutor {
             max_thinking,
             available_models,
             effective_override,
+            launch_model,
             model_override_from_parent,
             model_response_aliases: cfg.model_response_aliases.clone(),
             preferred_provider,
@@ -531,6 +583,10 @@ impl SubagentExecutor {
         // whole value MOVED into a spawned task on a detach — the child is handed over, never
         // dropped. (A stack `tokio::pin!` would be racy-cheap but unmovable, which is exactly the
         // property this needs to NOT have.)
+        // SUBA-172 — started here, just before the child is driven, so the recorded duration is
+        // the child's run (pi `progressSummary.durationMs`).
+        let history = ForegroundRunHistory::new(&cfg.roots, &agent.name, task);
+
         let mut drive: std::pin::Pin<Box<dyn std::future::Future<Output = SingleResult> + Send>> = {
             let agent_config = agent_config.clone();
             let drive_task = task.to_string();
@@ -572,6 +628,7 @@ impl SubagentExecutor {
                         &art_paths,
                         &art_cfg,
                         &settled,
+                        &history,
                     )
                     .await;
                     hand_back_managed_worktree(&managed, &art_dir, &run_id, &agent.name, &settled)
@@ -632,6 +689,7 @@ impl SubagentExecutor {
                 &art_paths,
                 &art_cfg,
                 &settled,
+                &history,
             )
             .await;
             hand_back_managed_worktree(&managed, &art_dir, &run_id, &agent.name, &settled).await;
@@ -649,6 +707,7 @@ impl SubagentExecutor {
                     art_cfg,
                     parent_workflow_run_id: parent_workflow_run_id.as_ref(),
                     persist_roots: cfg.roots.clone(),
+                    history,
                 },
                 drive,
                 receipt.result,
@@ -733,6 +792,7 @@ impl SubagentExecutor {
             art_cfg,
             parent_workflow_run_id,
             persist_roots,
+            history,
         } = handoff;
 
         if let Some(parent_workflow_run_id) = parent_workflow_run_id {
@@ -758,6 +818,7 @@ impl SubagentExecutor {
                 &art_paths,
                 &art_cfg,
                 &settled,
+                &history,
             )
             .await;
             tracing::debug!(
@@ -787,6 +848,7 @@ impl SubagentExecutor {
             art_paths,
             art_cfg,
             (persist_roots, cwd.to_path_buf()),
+            history,
         );
 
         receipt
@@ -798,6 +860,9 @@ impl SubagentExecutor {
     /// Factored out because there are now TWO paths that reach it: the ordinary settle, and a
     /// detach whose receipt could not be published (which leaves the run attached, pi
     /// `execution.ts:643-645`). Two copies of this ordering would be two orderings.
+    // One over clippy's ceiling since SUBA-172 added `history`; every argument is a distinct
+    // borrow its three callers already hold, and a struct would exist only to satisfy the lint.
+    #[allow(clippy::too_many_arguments)]
     async fn settle_attached_foreground_run(
         &self,
         run_id: &RunId,
@@ -806,6 +871,7 @@ impl SubagentExecutor {
         art_paths: &crate::artifacts::ArtifactPaths,
         art_cfg: &crate::artifacts::ArtifactConfig,
         result: &SingleResult,
+        history: &ForegroundRunHistory,
     ) {
         // WORKFLOW_7 — pi `rememberForegroundRun` (`subagent-executor.ts:4057`), on the settle
         // path with the results in hand. BEFORE `settle_foreground_run`, whose own doc calls out
@@ -821,8 +887,18 @@ impl SubagentExecutor {
 
         // pi `persistForegroundRunHistory` (`foreground-history.ts:136`), after the in-memory
         // record exists. Bounded, 0600, atomic; a write failure never alters the `SingleResult`
-        // the caller observes, exactly as `record_run_history`'s own best-effort contract.
+        // the caller observes, exactly as `record_run`'s own best-effort contract.
         self.persist_foreground_run_history_for(cwd).await;
+
+        // SUBA-172 — pi `if (!r.detached) recordRun(…)` (`subagent-executor.ts:4396` @v0.76.1).
+        // Every result that reaches this tail is TERMINAL, so it records unconditionally: the
+        // ordinary settle, a refused detach, and a workflow-awaited user detach (pi `:4382`, the
+        // real result `r`, recorded once here and never in `onDetachedExit`, which returns early
+        // for it at `:4336-4338`). A result still carrying `detached` came from the INTERCOM
+        // producer, whose cyrup drive loop keeps driving to the child's real exit
+        // (`exec/drive_attempt.rs`); upstream records that exit too, through `onDetachedExit` with
+        // `detached` cleared (`execution.ts:2212-2218` → `subagent-executor.ts:4371`).
+        history.record(result);
 
         // R-SA-058: the per-attempt raw-stdout tee `run_sync` writes to
         // `<attempt_scratch_dir(cwd)>/attempt-<n>.jsonl` (SUBA-072: `<temp_root_dir>/scratch/
@@ -976,12 +1052,26 @@ impl SubagentExecutor {
         // The ceiling sweep below this fold polices the WINNER, so an explicit or inherited level
         // above the configured ceiling is refused with the existing ceiling error — inheritance
         // moves the default, never the limit.
+        //
+        // SUBA-167 — rung 4 is OFF for an external runner: upstream never inherits the parent's
+        // level into one (`effectiveThinking = externalRunner ? undefined : …`,
+        // `async-execution.ts:1117,1934` @v0.76.1). A Claude Code agent turns `agent.thinking`
+        // into `--effort`, so inheriting here would give every child launched from a `high`
+        // session `--effort high` it was never asked for.
+        let external_runner = agent_config
+            .runner
+            .as_ref()
+            .is_some_and(crate::runner::AgentRunnerConfig::is_external);
         agent_config.thinking = req
             .overrides
             .thinking
             .clone()
             .or(agent_config.thinking)
-            .or_else(|| self.remembered_parent_thinking());
+            .or_else(|| {
+                (!external_runner)
+                    .then(|| self.remembered_parent_thinking())
+                    .flatten()
+            });
         // SUBA-008 / pi `resolveTurnBudgetConfig(effectiveParams.turnBudget ?? deps.config.turnBudget)`
         // (`subagent-executor.ts:4928-4929` @v0.43.0), where `effectiveParams.turnBudget` has
         // already absorbed the agent's own frontmatter through `applySingleAgentLaunchDefaults`
@@ -1054,25 +1144,36 @@ impl SubagentExecutor {
         // parent model, not a bare live `ctx.model` read. See
         // [`SubagentExecutor::remembered_parent_model`] for why the two differ.
         let parent_model = self.remembered_parent_model();
-        let effective_override = resolve_model_inheritance(
-            req.model_override.as_ref(),
-            agent_config.model.as_ref(),
-            parent_model.as_ref(),
-            &mut available_models,
-            model_scope.as_ref(),
-            // SUBA-155 — the canonical agent name selects any `modelScope.agents.<name>` rule.
-            &agent_config.name,
-        )
-        .map_err(|refusal| SubagentError::ModelOutOfScope(refusal.message()))?;
+        // SUBA-167 — native model resolution never runs for an external runner (pi `primaryModel =
+        // externalRunner ? undefined : …`, `async-execution.ts:1091,1905` @v0.76.1): the foreign
+        // process runs no Pi model, so neither the parent model nor `defaultModel` may reach a
+        // scope check on its behalf. A Claude Code agent's own scope check is
+        // `exec::external_cli::resolve_claude_code_launch_override`, over the model the CLI will
+        // actually run; `run_sync` returns at the runner dispatch before this override is read.
+        let effective_override = if external_runner {
+            crate::exec::fallback::ModelOverride::Inherit
+        } else {
+            resolve_model_inheritance(
+                req.model_override.as_ref(),
+                agent_config.model.as_ref(),
+                parent_model.as_ref(),
+                &mut available_models,
+                model_scope.as_ref(),
+                // SUBA-155 — the canonical agent name selects any `modelScope.agents.<name>` rule.
+                &agent_config.name,
+            )
+            .map_err(|refusal| SubagentError::ModelOutOfScope(refusal.message()))?
+        };
         // SUBA-119 — the same three inputs the resolution above just consumed, read for pi's
         // `modelOverrideFromParent` (`execution.ts:1836`). It must be computed HERE: once
         // `resolve_model_inheritance` has returned `Explicit(model)`, a parent-inherited model and a
         // caller-supplied one are the same value.
-        let model_override_from_parent = crate::exec::fallback::model_override_is_from_parent(
-            req.model_override.as_ref(),
-            agent_config.model.as_ref(),
-            parent_model.as_ref(),
-        );
+        let model_override_from_parent = !external_runner
+            && crate::exec::fallback::model_override_is_from_parent(
+                req.model_override.as_ref(),
+                agent_config.model.as_ref(),
+                parent_model.as_ref(),
+            );
         // SUBA-088 / pi `const currentProvider = parentModel?.provider` (`subagent-executor.ts:3648`
         // @v0.64.0), from the same remembered parent model the inheritance above used.
         let preferred_provider = parent_model.as_ref().and_then(provider_of);
@@ -1244,6 +1345,7 @@ impl SubagentExecutor {
             max_thinking,
             available_models,
             effective_override,
+            launch_model,
             model_override_from_parent,
             model_response_aliases,
             preferred_provider,
@@ -1328,6 +1430,7 @@ impl SubagentExecutor {
             // which is what made SUBA-S01's capture machinery unreachable from the single surface.
             structured_output_schema: overrides.output_schema.clone(),
             model_override: effective_override,
+            launch_model,
             // SUBA-003: the same policy that just gated the explicit override, carried into
             // `run_sync` so the fallback ladder's own out-of-scope entries warn (pi
             // `execution.ts:1069`).
@@ -1879,6 +1982,7 @@ fn spawn_detached_foreground_continuation(
     art_paths: crate::artifacts::ArtifactPaths,
     art_cfg: crate::artifacts::ArtifactConfig,
     persist_to: (crate::paths::Roots, PathBuf),
+    history: ForegroundRunHistory,
 ) {
     tokio::spawn(async move {
         // The future is AWAITED here, in a task that owns it — the child keeps running exactly as
@@ -1902,6 +2006,10 @@ fn spawn_detached_foreground_continuation(
             &roots,
             &cwd,
         );
+        // SUBA-172 — pi `onDetachedExit`'s last statement (`subagent-executor.ts:4371` @v0.76.1):
+        // the detached child's TERMINAL result is recorded once it really exits — never the
+        // receipt the caller was answered with.
+        history.record(&result);
         tracing::debug!(
             run_id = %run_id,
             exit_code = result.exit_code,
@@ -2277,6 +2385,64 @@ mod tests {
             matches!(err, SubagentError::DepthExceeded { current: 0, max: 0 }),
             "expected DepthExceeded (proving the guard ran BEFORE discovery could report its own \
              AgentNotFound for the same unresolvable name), got: {err:?}"
+        );
+    }
+
+    /// SUBA-167 — the foreground launch site of a Claude Code agent.
+    ///
+    /// Under a live session reasoning at `high` on `anthropic/parent`, an agent with no level and
+    /// no model of its own gets NEITHER: upstream never inherits the parent's level into an
+    /// external runner (`effectiveThinking = externalRunner ? undefined`,
+    /// `async-execution.ts:1117,1934` @v0.76.1), and the CLI's `--model` comes only from the
+    /// caller's model as typed (`model: s.model`, `:1103`), never from the post-inheritance one.
+    #[tokio::test]
+    async fn a_claude_code_launch_takes_the_callers_model_and_never_the_sessions_thinking() {
+        struct ReasoningSession;
+        impl cyrup_ext::host::HostServices for ReasoningSession {
+            fn session_id(&self) -> Option<String> {
+                Some("s-167".to_string())
+            }
+            fn current_model(&self) -> Option<String> {
+                Some("anthropic/parent".to_string())
+            }
+            fn thinking_level(&self) -> Option<String> {
+                Some("high".to_string())
+            }
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (script, _) = crate::exec::testsupport::write_fake_claude(dir.path());
+        let agents_dir = dir.path().join(".cyrup").join("agents");
+        std::fs::create_dir_all(&agents_dir).expect("mkdir agents dir");
+        std::fs::write(
+            agents_dir.join("cc-reviewer.md"),
+            format!(
+                "---\nname: cc-reviewer\ndescription: Claude reviewer\nrunner: {{\"type\": \"external-cli\", \"adapter\": \"claude-code\", \"command\": \"{}\"}}\n---\nReview.\n",
+                script.display()
+            ),
+        )
+        .expect("write agent");
+        let executor = SubagentExecutor::new();
+        executor.set_host_services(std::sync::Arc::new(ReasoningSession));
+
+        let run = |model: Option<&str>| {
+            executor.run_foreground(
+                dir.path(),
+                "cc-reviewer",
+                "review",
+                Some(ContextRequest::Fresh),
+                model.map(ModelId::from),
+                None,
+            )
+        };
+        let result = run(None).await.expect("runs");
+        assert_eq!(result.error, None, "{result:?}");
+        assert_eq!(result.final_output.as_deref(), Some("argv:--no-chrome"));
+
+        let result = run(Some("claude-opus-5.5:low")).await.expect("runs");
+        assert_eq!(
+            result.final_output.as_deref(),
+            Some("argv:--no-chrome --model claude-opus-5.5 --effort low")
         );
     }
 
@@ -2731,6 +2897,11 @@ mod detach_producer_tests {
             },
             parent_workflow_run_id,
             persist_roots: crate::paths::Roots::sandboxed(cwd),
+            history: ForegroundRunHistory::new(
+                &crate::paths::Roots::sandboxed(cwd),
+                "scout",
+                "hold the line",
+            ),
         }
     }
 
@@ -2815,6 +2986,83 @@ mod detach_producer_tests {
             runs.get(&run_id).expect("still remembered").children[0].status,
             "completed"
         );
+        drop(runs);
+
+        // SUBA-172 — the workflow-awaited child is recorded EXACTLY ONCE, by the settle tail with
+        // its real result (pi `:4396`; `onDetachedExit` returns early for it at `:4336-4338`).
+        let rows = history_rows(home.path());
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0]["agent"], "scout");
+        assert_eq!(rows[0]["outcome"], "completed");
+        assert_eq!(
+            rows[0]["taskHash"],
+            crate::exec::mcp_direct_tools::hex_sha256("hold the line").as_str()
+        );
+    }
+
+    /// The sandbox agent dir's `run-history.jsonl`, one parsed value per line (empty when absent).
+    fn history_rows(home: &Path) -> Vec<serde_json::Value> {
+        let path = crate::paths::Roots::sandboxed(home)
+            .agent_dir()
+            .join("run-history.jsonl");
+        match std::fs::read_to_string(path) {
+            Ok(raw) => raw
+                .lines()
+                .map(|line| serde_json::from_str(line).expect("history line is JSON"))
+                .collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// SUBA-172 — a PLAIN user detach records nothing when the caller is answered with the
+    /// receipt, and one row — the child's real terminal result — once the continuation observes
+    /// the child exit (pi `onDetachedExit`'s `recordRun`, `subagent-executor.ts:4371` @v0.76.1).
+    ///
+    /// *Gutted by*: removing the continuation's `history.record` (no row ever appears), or
+    /// recording the receipt in the plain arm (a row at receipt time, with exit `-2`).
+    #[tokio::test]
+    async fn a_detached_plain_single_records_its_terminal_result_once_the_child_exits() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let executor = sandboxed_executor(home.path(), "session-h");
+        let run_id = RunId::from_token("fgdetach0008".to_string());
+        let receipt = publish_detach(&executor, &run_id, DetachReason::UserRequest, true);
+        let notifier = notifier_for(&executor, &run_id);
+
+        let released = Arc::new(tokio::sync::Notify::new());
+        let wait = Arc::clone(&released);
+        let drive: std::pin::Pin<Box<dyn std::future::Future<Output = SingleResult> + Send>> =
+            Box::pin(async move {
+                wait.notified().await;
+                let mut failed = terminal_result("partial answer");
+                failed.exit_code = 3;
+                failed
+            });
+
+        let answered = executor
+            .hand_off_detached_foreground_run(
+                handoff(&run_id, home.path(), &notifier, None),
+                drive,
+                receipt.result,
+            )
+            .await;
+        assert!(answered.detached, "the caller gets the receipt");
+        assert!(
+            history_rows(home.path()).is_empty(),
+            "the receipt is never recorded"
+        );
+
+        released.notify_one();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let rows = loop {
+            let rows = history_rows(home.path());
+            if !rows.is_empty() || std::time::Instant::now() > deadline {
+                break rows;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        };
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0]["outcome"], "failed");
+        assert_eq!(rows[0]["exit"], 3);
     }
 
     /// A user detach of a workflow child keeps the child's LIVE control until it really settles,
@@ -2870,6 +3118,11 @@ mod detach_producer_tests {
                         art_cfg,
                         parent_workflow_run_id: Some(&parent_owned),
                         persist_roots: crate::paths::Roots::sandboxed(&home_owned),
+                        history: ForegroundRunHistory::new(
+                            &crate::paths::Roots::sandboxed(&home_owned),
+                            "scout",
+                            "hold the line",
+                        ),
                     },
                     drive,
                     receipt.result,
@@ -2980,6 +3233,7 @@ mod detach_producer_tests {
             .expect("the fixture persona parses");
             executor
                 .build_foreground_run_options(ForegroundRunOptionsInput {
+                    launch_model: None,
                     tool_timeout_ms: None,
                     overrides: SingleRunOverrides::default(),
                     cwd: dir.path(),

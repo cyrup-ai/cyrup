@@ -57,6 +57,7 @@ use cyrup_ext_subagents::spawn::nested_events::{
 
 fn persona(name: &str) -> ResolvedAgentPersona {
     ResolvedAgentPersona {
+        model_is_settings_default: false,
         default_tool_timeout_ms: None,
         machine: None,
         file_path: None,

@@ -151,6 +151,11 @@ pub struct SubagentsExtension {
     /// the same bridge answers the disposal that the registration came from. Filled for BOTH
     /// registration modes; only the [`RegistrationMode::Full`] arm subscribes it to a topic.
     runtime_agent_bridge: crate::discovery::runtime_agent_events::RuntimeAgentEventBridge,
+    /// SUBA-139/SUBA-153 — pi `registerSubagentToolActivation`'s closure state
+    /// (`extension/tool-activation.ts:85,135` @v0.76.1): the mode the `subagents_enable` loader was
+    /// registered under, and whether this session selected it. Process-lifetime like upstream's
+    /// closure; re-decided at every `session_start` and `session_tree`.
+    tool_activation: crate::extension::tool_activation::ToolActivationState,
 }
 
 impl SubagentsExtension {
@@ -331,6 +336,7 @@ impl SubagentsExtension {
             rpc_bridge: crate::extension::rpc::SubagentRpcBridge::new(),
             runtime_agent_bridge:
                 crate::discovery::runtime_agent_events::RuntimeAgentEventBridge::new(),
+            tool_activation: crate::extension::tool_activation::ToolActivationState::default(),
         }
     }
 

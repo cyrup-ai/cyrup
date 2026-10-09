@@ -33,8 +33,10 @@
 //!
 //! # What may never be sent
 //!
-//! - [`crate::background::RunHistoryEntry::task`] (`background/run_history.rs:24`), the
-//!   200-char capture of the user's task text, and every other prompt field.
+//! - [`crate::background::RunHistoryEntry::task`] and
+//!   [`crate::background::RunHistoryEntry::task_hash`] (`background/run_history.rs`) — the task
+//!   is always `"[redacted]"` on disk since SUBA-172, but its hash still identifies the user's
+//!   task text — and every other prompt field.
 //! - `AsyncRunView::description` — pi's `AsyncJobState.description`, a free-text run description
 //!   whose provenance is the launch call. [`RunLabel::from_async_run`] does not read it, and the
 //!   test at the bottom of this file fails if it ever starts to.

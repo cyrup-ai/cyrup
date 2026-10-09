@@ -62,6 +62,7 @@ use cyrup_ext_subagents::spawn::chain_graph::{ParallelGroupSpec, RunnerStep, Sin
 /// an unresolved agent as `Unknown agent` rather than synthesizing a placeholder.
 fn fixture_persona(name: &str) -> ResolvedAgentPersona {
     ResolvedAgentPersona {
+        model_is_settings_default: false,
         default_tool_timeout_ms: None,
         machine: None,
         file_path: None,
@@ -2703,6 +2704,94 @@ async fn a_child_scoped_stop_for_a_pending_step_is_queued_and_skips_it_when_reac
         "the skipped step must never be reported started: {events:?}"
     );
     assert!(of("subagent.run.stopped").is_empty());
+
+    // SUBA-172 — pi `async-run-history.test.ts:53`'s rule on a real run: the step a child-scoped
+    // stop skipped before dispatch never launched, so only the step that ran records a row.
+    let rows = history_rows(dir.path());
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0]["agent"], "first");
+    assert_eq!(rows[0]["outcome"], "completed");
+}
+
+/// `run-history.jsonl` beside a redirected run's async root (`run_history_path_for`): the
+/// fixture runs put the async root at `<dir>/async`, so history lands at `<dir>/run-history.jsonl`.
+fn history_rows(dir: &Path) -> Vec<serde_json::Value> {
+    match std::fs::read_to_string(dir.join("run-history.jsonl")) {
+        Ok(raw) => raw
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("history line is JSON"))
+            .collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// The `taskHash` `record_run` writes for `task` — read back off a scratch record, since this
+/// crate carries no SHA-256 of its own.
+fn task_hash_of(task: &str) -> String {
+    let scratch = tempfile::tempdir().expect("tempdir");
+    let path = scratch.path().join("run-history.jsonl");
+    cyrup_ext_subagents::background::record_run(
+        &path,
+        "probe",
+        task,
+        0,
+        0,
+        &cyrup_ext_subagents::background::RunTerminal::default(),
+    );
+    cyrup_ext_subagents::background::load_runs_for_agent(&path, "probe")[0]
+        .task_hash
+        .clone()
+        .expect("record_run always hashes")
+}
+
+/// SUBA-172 — a finished background chain records ONE redacted, private history row PER STEP
+/// (pi `planBackgroundRunHistory`, `run-history.ts:155-221` @v0.76.1; `async-run-history.test.ts:99`):
+/// `task` is `"[redacted]"`, `taskHash` hashes the MODE WORD (multi-step rows never hash a
+/// per-step prompt), each row carries its own outcome, and the file is 0600. Before SUBA-172 the
+/// rows held each step's task text in plaintext and no outcome.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_finished_background_chain_writes_one_redacted_private_history_row_per_step() {
+    let dir = tempfile::tempdir().expect("real tempdir");
+    let script = serde_json::json!({
+        "steps": [{"kind": "emit", "line": message_end_line("all done")}],
+        "exit_code": 0
+    });
+    let run_id = RunId::from_token("histchain01");
+    let config = child_stop_chain_config(
+        dir.path(),
+        &run_id,
+        &dir.path().join("async"),
+        &dir.path().join("results"),
+    );
+    let (status, _) = run_against_fixture(dir.path(), &script, config).await;
+    assert_eq!(status.state, RunState::Complete, "{status:?}");
+
+    let raw = std::fs::read_to_string(dir.path().join("run-history.jsonl"))
+        .expect("the run recorded history");
+    assert!(
+        !raw.contains("step one") && !raw.contains("step two"),
+        "no task text reaches the file: {raw}"
+    );
+    let rows = history_rows(dir.path());
+    assert_eq!(rows.len(), 2, "{raw}");
+    let chain_hash = task_hash_of("chain");
+    for (row, agent) in rows.iter().zip(["first", "second"]) {
+        assert_eq!(row["agent"], agent);
+        assert_eq!(row["task"], "[redacted]");
+        assert_eq!(row["taskHash"], chain_hash.as_str());
+        assert_eq!(row["status"], "ok");
+        assert_eq!(row["outcome"], "completed");
+        assert!(row.get("exit").is_none(), "{row}");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = std::fs::metadata(dir.path().join("run-history.jsonl"))
+            .expect("history file")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
 }
 
 /// SUBA-093 — a child-scoped stop aimed at ONE member of a `tasks[]` fan-out tears that member

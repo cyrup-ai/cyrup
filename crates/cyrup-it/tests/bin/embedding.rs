@@ -155,21 +155,27 @@ async fn reads_state_after_a_run() {
         Some("stateful reply")
     );
 
-    // messages: user prompt then assistant reply persisted on the branch.
+    // messages: the prompt's `system` row, then the user prompt and the assistant reply, all
+    // persisted on the branch. The session records its system prompt as a transcript row since
+    // CODE-014 (pi `core/agent-session.ts`, `sections` diff rows), so it leads the list.
     let msgs = session.messages().await;
     assert_eq!(
         msgs.len(),
-        2,
-        "expected user + assistant, got {}",
+        3,
+        "expected system + user + assistant, got {}",
         msgs.len()
     );
     assert!(
-        matches!(msgs[0], cyrup_core::Message::User { .. }),
-        "first message is the user prompt"
+        matches!(msgs[0], cyrup_core::Message::System(_)),
+        "first message is the system prompt row"
     );
     assert!(
-        matches!(msgs[1], cyrup_core::Message::Assistant(_)),
-        "second message is the assistant reply"
+        matches!(msgs[1], cyrup_core::Message::User { .. }),
+        "second message is the user prompt"
+    );
+    assert!(
+        matches!(msgs[2], cyrup_core::Message::Assistant(_)),
+        "third message is the assistant reply"
     );
 
     // session_id is stable; the system prompt is assembled (non-empty).

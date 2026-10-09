@@ -180,8 +180,11 @@ fn supports_anthropic_mid_convo_system_messages(id: &str) -> bool {
 ///   reject `tool_addition`/`tool_removal` blocks, so tool changes stay top-level there."*
 ///
 /// It lives as a RUNTIME predicate rather than as catalog data for the reason DRIFT-001 recorded for
-/// `supportsToolReferences`: not one of cyrup's 35 catalog files carries a `supportsMidConvo*` key,
-/// so with a constant `false` default the entire mid-conversation port would be unreachable code.
+/// `supportsToolReferences`: when it was written not one of cyrup's catalog files carried a
+/// `supportsMidConvo*` key, so with a constant `false` default the entire mid-conversation port
+/// would have been unreachable code. The embedded `anthropic.json` now declares both flags on its
+/// six qualifying rows (a declared value wins); the predicate stays the default for any row that
+/// declares nothing, such as a `models.json` entry.
 pub fn default_supports_mid_convo_system_messages(model: &Model) -> bool {
     matches!(
         model.provider.as_str(),

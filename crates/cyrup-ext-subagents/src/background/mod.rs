@@ -143,7 +143,10 @@ pub use retained_children::{
     list_retained_children,
 };
 pub use run_history::{
-    RunHistoryEntry, record_run_history, run_history_path, run_history_path_for,
+    BackgroundRunHistoryInput, BackgroundRunHistoryRow, BackgroundRunHistoryStep, REDACTED_TASK,
+    RunHistoryEntry, RunOutcome, RunTerminal, background_run_history_task, load_runs_for_agent,
+    plan_background_run_history, record_run, run_history_path, run_history_path_for, run_outcome,
+    sole_single_step_task,
 };
 pub use run_id::RunId;
 pub use run_id_resolver::{

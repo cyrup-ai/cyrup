@@ -780,6 +780,7 @@ async fn artifacts_false_disarms_verify_memoization_along_with_the_quadruple() {
 
 fn fixture_persona(name: &str) -> ResolvedAgentPersona {
     ResolvedAgentPersona {
+        model_is_settings_default: false,
         default_tool_timeout_ms: None,
         machine: None,
         file_path: None,

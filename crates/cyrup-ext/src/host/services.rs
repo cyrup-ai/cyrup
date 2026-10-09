@@ -901,6 +901,17 @@ pub trait HostServices: Send + Sync {
     fn current_model(&self) -> Option<String> {
         None
     }
+    /// pi `ctx.model` (`ExtensionContext.model`, read by pi-subagents' `addsToolsWithoutCheckpoint`
+    /// at `src/extension/tool-activation.ts:36-53` @v0.76.1): the FULL catalog entry the session
+    /// is on — `id`, `provider`, `api`, `compat`, … — serialized exactly as
+    /// [`cyrup_provider::Model`] serializes (camelCase keys, unset compat keys ABSENT, so a reader
+    /// can tell "declared false" from "not declared" the way pi's raw `model.compat` read does).
+    ///
+    /// [`Self::current_model`] is only the `"provider/id"` ref; this is the rest of the object.
+    /// `None` when no live session is attached or no model is bound.
+    fn current_model_info(&self) -> Option<Value> {
+        None
+    }
     fn context_usage(&self) -> Value {
         json!({})
     }

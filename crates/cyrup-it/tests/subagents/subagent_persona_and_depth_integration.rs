@@ -140,6 +140,7 @@ async fn chain_step_dispatches_the_real_named_persona_reaching_the_child_with_it
     // orchestrator produces via `exec::resolve_step_agent_config` for a discovered `reviewer`
     // agent.
     let reviewer = ResolvedAgentPersona {
+        model_is_settings_default: false,
         default_tool_timeout_ms: None,
         machine: None,
         file_path: None,
@@ -377,6 +378,7 @@ async fn chain_step_task_placeholder_resolves_to_the_configs_original_task() {
     // A Replace-mode persona with an empty system prompt so the child's task text is the raw
     // (substituted) step task — no appended prompt to obscure the marker.
     let worker = ResolvedAgentPersona {
+        model_is_settings_default: false,
         default_tool_timeout_ms: None,
         machine: None,
         file_path: None,
@@ -525,6 +527,7 @@ async fn chain_step_task_placeholder_resolves_to_the_configs_original_task() {
 
 fn base_run_options(cwd: &Path, model: &str) -> RunOptions {
     RunOptions {
+        launch_model: None,
         tool_timeout_ms: None,
         // SUBA-119 — a fixture launch whose model comes from its own agent config, so
         // native-child model verification is armed and no response-id alias is declared.
@@ -606,6 +609,7 @@ fn depth_echo_agent(
     max_subagent_depth: Option<u32>,
 ) -> AgentConfig {
     AgentConfig {
+        model_is_settings_default: false,
         machine: None,
         acceptance_role: None, // SUBA-082: no declared role, the name decides
         default_acceptance: None,
@@ -772,6 +776,7 @@ async fn deep_chain_at_the_ceiling_trips_the_guard_and_spawns_no_further_child()
     resolved_agents.insert(
         "reviewer".to_string(),
         ResolvedAgentPersona {
+            model_is_settings_default: false,
             default_tool_timeout_ms: None,
             machine: None,
             file_path: None,
@@ -960,6 +965,7 @@ async fn a_step_with_output_writes_the_file_and_returns_the_saved_output_referen
     // heuristic is NotRequired and the completion guard — also disabled here — never fires): the run
     // stays exit 0, which is what gates the saved-output reference.
     let reporter = ResolvedAgentPersona {
+        model_is_settings_default: false,
         default_tool_timeout_ms: None,
         machine: None,
         file_path: None,
@@ -1110,6 +1116,7 @@ async fn chain_wide_timeout_ms_reaches_the_real_child_and_terminates_it() {
     let script_path = write_script(dir.path(), "script-chain-timeout.json", &script);
 
     let reporter = ResolvedAgentPersona {
+        model_is_settings_default: false,
         default_tool_timeout_ms: None,
         machine: None,
         file_path: None,
@@ -1368,6 +1375,7 @@ async fn spawn_background_steps_bakes_the_configured_dynamic_fanout_max_items_in
 /// these two tests is the `verify[]` command's own real exit code.
 fn acceptance_persona(name: &str) -> ResolvedAgentPersona {
     ResolvedAgentPersona {
+        model_is_settings_default: false,
         default_tool_timeout_ms: None,
         machine: None,
         file_path: None,

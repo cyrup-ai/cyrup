@@ -611,6 +611,7 @@ mod tests {
         default_context: Option<ContextMode>,
     ) -> ResolvedAgentPersona {
         ResolvedAgentPersona {
+            model_is_settings_default: false,
             default_tool_timeout_ms: None,
             inherit_global_context: false,
             machine: None,

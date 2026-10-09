@@ -239,6 +239,120 @@ pub(crate) fn apply_workflow_settlement_plan(
     }
 }
 
+/// SUBA-172 — what [`finish_run`] needs, beyond the terminal status it already holds, to plan
+/// this run's history rows: the inputs of pi's `planBackgroundRunHistory` call
+/// (`subagent-runner.ts:5104-5122` @v0.76.1) that are not on `status.json`.
+///
+/// `Some` only from the ordinary runner tail (`entry.rs`). Every early-failure caller passes
+/// `None`: those runs never dispatched a child, and upstream records no row for a step it never
+/// launched (`async-run-history.test.ts:53`). Before this, they wrote the synthesized placeholder
+/// result as a history row — under the run id when the run had no steps.
+#[derive(Clone, Debug, Default)]
+pub(super) struct RunHistoryPlan {
+    /// The task of the run's sole top-level step, when it is a single step
+    /// ([`crate::background::sole_single_step_task`] over `config.steps`).
+    pub sole_single_task: Option<String>,
+    /// pi `launchedFlatIndices` (`:1887`), as the run's executor marked it.
+    pub launched: std::collections::BTreeSet<usize>,
+    /// pi `runEndedAt - overallStartTime`.
+    pub run_duration_ms: i64,
+    /// pi's run-wide `stopped` / `interrupted` / `timedOut`.
+    pub stopped: bool,
+    /// See [`Self::stopped`].
+    pub interrupted: bool,
+    /// See [`Self::stopped`].
+    pub timed_out: bool,
+}
+
+impl RunHistoryPlan {
+    /// The run-wide terminal flags of a loop outcome, read BEFORE [`settle_loop_outcome`]
+    /// consumes it — that function folds `TimedOut` into `RunState::Failed`, after which the
+    /// timeout is no longer recoverable. pi sets the same three flags in `stopRunner`,
+    /// `interruptRunner` and `timeoutRunner` (`subagent-runner.ts:3319,3292,3353`).
+    pub(super) fn with_loop_flags(
+        mut self,
+        loop_outcome: &Result<LoopOutcome, SubagentError>,
+    ) -> Self {
+        match loop_outcome {
+            Ok(LoopOutcome::Stopped { .. }) => self.stopped = true,
+            Ok(LoopOutcome::Interrupted { .. }) => self.interrupted = true,
+            Ok(LoopOutcome::TimedOut { .. }) => self.timed_out = true,
+            Ok(LoopOutcome::Completed { .. }) | Err(_) => {}
+        }
+        self
+    }
+}
+
+/// pi's census loop (`subagent-runner.ts:5103-5122` @v0.76.1): plan one row per launched flat
+/// step and [`record_run`](crate::background::record_run) each into the run's history file.
+///
+/// `results` is the terminal [`ResultFile::results`], aligned with `status.steps` by flat index
+/// (SCOPE_17's invariant; a `DynamicGroup` and an attached root each own one slot and one result,
+/// so a dynamic group records ONE row, under its display agent — the SUBA-093 residual).
+fn record_background_run_history(
+    history_path: &std::path::Path,
+    status: &RunStatus,
+    results: &[SingleResult],
+    plan: &RunHistoryPlan,
+) {
+    let mode = serde_json::to_value(status.mode)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_string))
+        .unwrap_or_default();
+    // pi reads `steps` AFTER chain appends have been pushed onto it (`:2541`). cyrup's appended
+    // steps live in `run_inner`'s own copy, but every append adds at least one flat status slot,
+    // so a run that started as one single step is still one exactly when `status.steps` is.
+    let sole_single_task = plan
+        .sole_single_task
+        .as_deref()
+        .filter(|_| status.steps.len() == 1);
+    let status_steps: Vec<crate::background::BackgroundRunHistoryStep<'_>> = status
+        .steps
+        .iter()
+        .enumerate()
+        .map(
+            |(index, step)| crate::background::BackgroundRunHistoryStep {
+                agent: &step.agent,
+                status: step.status,
+                duration_ms: step
+                    .started_at
+                    .zip(step.ended_at)
+                    .map(|(started, ended)| (ended - started).max(0)),
+                // pi `step.timedOut`, which upstream's `timeoutRunner` stamps on every running or
+                // pending step (`:3360-3366`) and the parallel relabel on an unlaunched member
+                // (`:1666`). cyrup's status step has no such field: `mark_remaining_timed_out` only
+                // ever relabels steps from the next UNDISPATCHED index, so the only launched step
+                // that can carry the fact is one whose own child hit the deadline — and its result
+                // says so.
+                timed_out: results.get(index).is_some_and(|result| result.timed_out),
+                stopped: step.stopped,
+                launched: plan.launched.contains(&index),
+            },
+        )
+        .collect();
+    let rows = crate::background::plan_background_run_history(
+        &crate::background::BackgroundRunHistoryInput {
+            task: crate::background::background_run_history_task(sole_single_task, &mode),
+            status_steps: &status_steps,
+            step_results: results,
+            run_duration_ms: plan.run_duration_ms,
+            stopped: plan.stopped,
+            interrupted: plan.interrupted,
+            timed_out: plan.timed_out,
+        },
+    );
+    for row in rows {
+        crate::background::record_run(
+            history_path,
+            &row.agent,
+            &row.task,
+            row.exit_code,
+            row.duration_ms,
+            &row.terminal,
+        );
+    }
+}
+
 // `finish_run` was already at clippy's `too_many_arguments` ceiling (seven) before WORKFLOW_3;
 // `workflow` is the one addition this task's own doc anticipated ("a struct is the better
 // shape") — it IS a struct, bundling two fields into one parameter rather than two, but the
@@ -253,6 +367,7 @@ pub(super) async fn finish_run(
     session_file: Option<PathBuf>,
     error: String,
     workflow: WorkflowResultFields,
+    history: Option<RunHistoryPlan>,
 ) {
     if terminal_result_exists(run_paths, &status).await {
         tracing::warn!(
@@ -509,19 +624,25 @@ pub(super) async fn finish_run(
         );
     }
 
-    // Best-effort run-history recording (pi's `recordRun`, `run-history.ts`): one line per
-    // top-level result appended to `<agent_dir>/run-history.jsonl` (pi `getHistoryPath()`,
-    // `runs/shared/run-history.ts:23-25` @v0.43.0 — the DURABLE agent dir, deliberately not the
-    // disposable `temp_root_dir` scratch tree). Placed AFTER the
-    // authoritative status/ResultFile writes (and inside the double-invocation guard above, so a
-    // no-op re-invocation never double-records) — a history-write failure never affects the run.
+    // SUBA-172 — best-effort run-history recording, pi `planBackgroundRunHistory` + `recordRun`
+    // (`subagent-runner.ts:5103-5122` @v0.76.1, "Paused runs record an interrupted attempt; a
+    // later resume records another."): one redacted row per LAUNCHED flat step, appended to the
+    // durable agent-dir history (`run-history.ts:27-29`). Placed AFTER the authoritative
+    // status/ResultFile writes (and inside the double-invocation guard above, so a no-op
+    // re-invocation never double-records) — a history-write failure never affects the run.
     //
     // The run's OWN async root (`run_dir`'s parent) is handed over rather than re-derived, so a run
     // whose roots were redirected records its history with them instead of in the real user's agent
     // dir — see [`crate::background::run_history_path_for`].
-    let async_root = run_paths.run_dir.parent().unwrap_or(&run_paths.run_dir);
-    crate::background::record_run_history(async_root, status.started_at, &result_file.results)
-        .await;
+    if let Some(plan) = history {
+        let async_root = run_paths.run_dir.parent().unwrap_or(&run_paths.run_dir);
+        record_background_run_history(
+            &crate::background::run_history_path_for(async_root),
+            &status,
+            &result_file.results,
+            &plan,
+        );
+    }
 }
 
 /// Write the terminal [`ResultFile`] through the session-partitioned index.
@@ -692,6 +813,7 @@ mod tests {
             None,
             String::new(),
             WorkflowResultFields::default(),
+            None,
         )
         .await;
         let written: RunStatus =
@@ -823,6 +945,13 @@ mod tests {
         let result_file: ResultFile = serde_json::from_slice(&result_bytes).expect("valid JSON");
         assert_eq!(result_file.state, RunState::Failed);
         assert!(!result_file.success);
+
+        // SUBA-172 — an early failure dispatched no child, so it records no history row. Before,
+        // its synthesized placeholder result (agent `worker`) was appended as one.
+        assert!(
+            !dir.path().join("run-history.jsonl").exists(),
+            "an early-failure exit must not write run history"
+        );
     }
 
     #[tokio::test]
@@ -904,6 +1033,7 @@ mod tests {
             None,
             String::new(),
             WorkflowResultFields::default(),
+            None,
         )
         .await;
 
@@ -938,6 +1068,7 @@ mod tests {
             None,
             "runner-config.json was already consumed".to_string(),
             WorkflowResultFields::default(),
+            None,
         )
         .await;
 
@@ -987,6 +1118,7 @@ mod tests {
             None,
             "boom".to_string(),
             WorkflowResultFields::default(),
+            None,
         )
         .await;
 
@@ -1039,6 +1171,7 @@ mod tests {
             None,
             "boom".to_string(),
             WorkflowResultFields::default(),
+            None,
         )
         .await;
 
@@ -1148,6 +1281,7 @@ mod tests {
             Some(session_file.clone()),
             String::new(),
             WorkflowResultFields::default(),
+            None,
         )
         .await;
 
@@ -1241,6 +1375,7 @@ mod tests {
                 None,
                 control::STOP_MESSAGE.to_string(),
                 WorkflowResultFields::default(),
+                None,
             )
             .await;
 
@@ -1304,6 +1439,298 @@ mod tests {
                 "{terminal_state:?}: the synthesized child's flags are what `resolveGroupedStatus` \
                  reads: {payload:?}"
             );
+        }
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // SUBA-172 — the terminal tail's run-history census (pi `subagent-runner.ts:5103-5122`).
+    // `run_paths_in` puts the async root at `<dir>/async`, so `run_history_path_for` records to
+    // `<dir>/run-history.jsonl`.
+    // ---------------------------------------------------------------------------------------
+
+    fn history_rows(dir: &std::path::Path) -> Vec<serde_json::Value> {
+        match std::fs::read_to_string(dir.join("run-history.jsonl")) {
+            Ok(raw) => raw
+                .lines()
+                .map(|line| serde_json::from_str(line).expect("history line is JSON"))
+                .collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    fn settled_step(
+        agent: &str,
+        state: crate::background::StepState,
+        span: Option<(i64, i64)>,
+    ) -> crate::background::StepStatus {
+        let mut step = crate::background::StepStatus::pending(agent);
+        step.status = state;
+        step.stopped = state == crate::background::StepState::Stopped;
+        if let Some((started, ended)) = span {
+            step.started_at = Some(started);
+            step.ended_at = Some(ended);
+        }
+        step
+    }
+
+    fn step_result(agent_name: &str, exit_code: i32) -> SingleResult {
+        let agent = crate::exec::testsupport::sample_agent_config("m1", &[]);
+        let mut result = crate::exec::pre_spawn_failure(&agent, "t", String::new());
+        result.agent = agent_name.to_string();
+        result.exit_code = exit_code;
+        result.error = None;
+        result
+    }
+
+    async fn finish_with_history(
+        dir: &std::path::Path,
+        token: &str,
+        mode: RunMode,
+        steps: Vec<crate::background::StepStatus>,
+        results: Vec<SingleResult>,
+        terminal_state: RunState,
+        history: RunHistoryPlan,
+    ) {
+        let run_id = RunId::from_token(token);
+        let run_paths = run_paths_in(dir, &run_id);
+        tokio::fs::create_dir_all(&run_paths.run_dir)
+            .await
+            .expect("mkdir run_dir");
+        tokio::fs::create_dir_all(dir.join("results"))
+            .await
+            .expect("mkdir results_dir");
+        let mut status = RunStatus::queued(run_id, mode, Some(1));
+        status.session_id = crate::identity::SessionId::parse("test-session");
+        status.steps = steps;
+        finish_run(
+            &run_paths,
+            status,
+            terminal_state,
+            results,
+            dir.to_path_buf(),
+            None,
+            String::new(),
+            WorkflowResultFields::default(),
+            Some(history),
+        )
+        .await;
+    }
+
+    /// pi `async-run-history.test.ts:74-99`: a chain records ONE redacted row per launched step,
+    /// each with its OWN duration (not the run's), keyed on the mode word — and a step the runner
+    /// never launched (here a fail-fast skip relabelled `failed`) records nothing.
+    ///
+    /// *Gutted by*: dropping the `launched` gate in `plan_background_run_history` (a third,
+    /// ghost row), or feeding the run duration to every row (both durations become 9999).
+    #[tokio::test]
+    async fn a_chain_records_one_row_per_launched_step_with_its_own_duration() {
+        use crate::background::StepState;
+        let dir = tempfile::tempdir().expect("real tempdir");
+        finish_with_history(
+            dir.path(),
+            "run-historychain",
+            RunMode::Chain,
+            vec![
+                settled_step("scout", StepState::Complete, Some((1_000, 1_400))),
+                settled_step("worker", StepState::Failed, Some((1_400, 1_500))),
+                settled_step("reviewer", StepState::Failed, Some((1_500, 1_500))),
+                settled_step("never", StepState::Pending, None),
+            ],
+            vec![
+                step_result("scout", 0),
+                step_result("worker", 1),
+                step_result("reviewer", -1),
+            ],
+            RunState::Failed,
+            RunHistoryPlan {
+                sole_single_task: None,
+                launched: [0, 1].into_iter().collect(),
+                run_duration_ms: 9_999,
+                ..RunHistoryPlan::default()
+            },
+        )
+        .await;
+
+        let rows = history_rows(dir.path());
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        let chain_hash = crate::exec::mcp_direct_tools::hex_sha256("chain");
+        for (row, (agent, outcome, duration)) in rows
+            .iter()
+            .zip([("scout", "completed", 400), ("worker", "failed", 100)])
+        {
+            assert_eq!(row["agent"], agent);
+            assert_eq!(row["task"], "[redacted]");
+            assert_eq!(row["taskHash"], chain_hash.as_str());
+            assert_eq!(row["outcome"], outcome);
+            assert_eq!(row["duration"], duration);
+        }
+        assert_eq!(rows[1]["exit"], 1);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(dir.path().join("run-history.jsonl"))
+                .expect("history exists")
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+    }
+
+    /// pi `async-run-history.test.ts:53`: a stop that lands before the first dispatch leaves two
+    /// steps relabelled `stopped` and NO history row. The synthesized placeholder result (agent =
+    /// the first step's) that this path used to record as a row is gone too.
+    ///
+    /// *Gutted by*: treating every non-pending status step as launched (the pre-SUBA-172 shape,
+    /// which recorded one row per result).
+    #[tokio::test]
+    async fn a_stop_before_the_first_dispatch_records_no_rows() {
+        use crate::background::StepState;
+        let dir = tempfile::tempdir().expect("real tempdir");
+        let stopped: Result<LoopOutcome, SubagentError> = Ok(LoopOutcome::Stopped {
+            results: Vec::new(),
+            message: control::STOP_MESSAGE.to_string(),
+        });
+        let run_id = RunId::from_token("run-historystopped");
+        let run_paths = run_paths_in(dir.path(), &run_id);
+        tokio::fs::create_dir_all(&run_paths.run_dir)
+            .await
+            .expect("mkdir run_dir");
+        tokio::fs::create_dir_all(dir.path().join("results"))
+            .await
+            .expect("mkdir results_dir");
+        let mut status = RunStatus::queued(run_id, RunMode::Chain, Some(1));
+        status.session_id = crate::identity::SessionId::parse("test-session");
+        status.steps = vec![
+            settled_step("scout", StepState::Stopped, Some((1, 1))),
+            settled_step("worker", StepState::Stopped, Some((1, 1))),
+        ];
+        finish_run(
+            &run_paths,
+            status,
+            RunState::Stopped,
+            Vec::new(),
+            dir.path().to_path_buf(),
+            None,
+            control::STOP_MESSAGE.to_string(),
+            WorkflowResultFields::default(),
+            Some(RunHistoryPlan::default().with_loop_flags(&stopped)),
+        )
+        .await;
+        assert!(history_rows(dir.path()).is_empty());
+        assert!(!dir.path().join("run-history.jsonl").exists());
+    }
+
+    /// pi `pi-coding-agent-dir.test.ts:606-620` end to end through `finish_run`: a paused run
+    /// records `interrupted` for the step it interrupted and keeps `completed` for the one that
+    /// finished first; a stopped run records `stopped` for its launched, stopped step; a timed-out
+    /// run's step records `timed_out` from its own result. The flags are read off the loop
+    /// outcome BEFORE `settle_loop_outcome` collapses `TimedOut` into `Failed`.
+    ///
+    /// *Gutted by*: `with_loop_flags` ignoring an arm (that row reads `failed`), or
+    /// `record_background_run_history` not reading the result's `timed_out`.
+    #[tokio::test]
+    async fn run_wide_terminal_flags_reach_only_the_steps_that_did_not_finish_on_their_own() {
+        use crate::background::StepState;
+        let outcome = |kind: &str| -> Result<LoopOutcome, SubagentError> {
+            match kind {
+                "interrupted" => Ok(LoopOutcome::Interrupted {
+                    results: Vec::new(),
+                }),
+                "stopped" => Ok(LoopOutcome::Stopped {
+                    results: Vec::new(),
+                    message: String::new(),
+                }),
+                _ => Ok(LoopOutcome::TimedOut {
+                    results: Vec::new(),
+                    message: String::new(),
+                }),
+            }
+        };
+        let mut timed_out_result = step_result("worker", 1);
+        timed_out_result.timed_out = true;
+        for (kind, second, second_result, terminal_state, expected) in [
+            (
+                "interrupted",
+                StepState::Paused,
+                step_result("worker", 0),
+                RunState::Paused,
+                "interrupted",
+            ),
+            (
+                "stopped",
+                StepState::Stopped,
+                step_result("worker", 1),
+                RunState::Stopped,
+                "stopped",
+            ),
+            (
+                "timed_out",
+                StepState::Failed,
+                timed_out_result.clone(),
+                RunState::Failed,
+                "timed_out",
+            ),
+        ] {
+            let dir = tempfile::tempdir().expect("real tempdir");
+            finish_with_history(
+                dir.path(),
+                &format!("run-history{}", kind.replace('_', "")),
+                RunMode::Chain,
+                vec![
+                    settled_step("scout", StepState::Complete, Some((0, 10))),
+                    settled_step("worker", second, Some((10, 30))),
+                ],
+                vec![step_result("scout", 0), second_result],
+                terminal_state,
+                RunHistoryPlan {
+                    launched: [0, 1].into_iter().collect(),
+                    run_duration_ms: 30,
+                    ..RunHistoryPlan::default()
+                }
+                .with_loop_flags(&outcome(kind)),
+            )
+            .await;
+            let rows = history_rows(dir.path());
+            assert_eq!(rows.len(), 2, "{kind}: {rows:?}");
+            assert_eq!(rows[0]["outcome"], "completed", "{kind}");
+            assert_eq!(rows[1]["outcome"], expected, "{kind}: {rows:?}");
+        }
+    }
+
+    /// A run that is still ONE single step hashes that step's task; an appended step (two status
+    /// slots) makes it a chain and the mode word is hashed instead (pi reads `steps` after
+    /// `steps.push(...appendedSteps)`, `subagent-runner.ts:2541`).
+    #[tokio::test]
+    async fn a_single_step_run_hashes_its_task_until_an_append_widens_it() {
+        use crate::background::StepState;
+        for (steps, expected) in [
+            (
+                1,
+                crate::exec::mcp_direct_tools::hex_sha256("fix the flaky test"),
+            ),
+            (2, crate::exec::mcp_direct_tools::hex_sha256("single")),
+        ] {
+            let dir = tempfile::tempdir().expect("real tempdir");
+            finish_with_history(
+                dir.path(),
+                &format!("run-historysingle{steps}"),
+                RunMode::Single,
+                (0..steps)
+                    .map(|_| settled_step("worker", StepState::Complete, Some((0, 5))))
+                    .collect(),
+                (0..steps).map(|_| step_result("worker", 0)).collect(),
+                RunState::Complete,
+                RunHistoryPlan {
+                    sole_single_task: Some("fix the flaky test".to_string()),
+                    launched: (0..steps).collect(),
+                    run_duration_ms: 5,
+                    ..RunHistoryPlan::default()
+                },
+            )
+            .await;
+            let rows = history_rows(dir.path());
+            assert_eq!(rows.len(), steps);
+            assert!(rows.iter().all(|row| row["taskHash"] == expected.as_str()));
         }
     }
 }

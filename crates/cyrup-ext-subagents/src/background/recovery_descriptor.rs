@@ -902,6 +902,11 @@ impl RecoveryDescriptor {
     /// whole of pi's `:628` effect; writing an absolute path into the spec slot would change
     /// nothing the runner reads.
     pub fn apply_to_persona(&self, persona: &mut ResolvedAgentPersona) {
+        // SUBA-167 — pi keeps the discovered `modelSource` through the overlay and
+        // `agentPinnedModel` honours it only while `modelSource.model === model`
+        // (`claude-code-adapter.ts:98` @v0.76.1), so the `defaultModel` provenance survives only
+        // when the descriptor's model IS the model it was stamped on.
+        persona.model_is_settings_default &= persona.model == self.model;
         persona.model = self.model.clone();
         persona.model_provider = self.model_provider.clone();
         persona.thinking = self.thinking.clone();
@@ -963,6 +968,7 @@ impl RecoveryDescriptor {
             mutation_tools: None,
             name: self.agent.clone(),
             model: None,
+            model_is_settings_default: false,
             model_provider: None,
             fallback_models: Vec::new(),
             thinking: None,
@@ -1171,6 +1177,7 @@ mod tests {
     /// than a matching default.
     fn distinctive_persona() -> ResolvedAgentPersona {
         ResolvedAgentPersona {
+            model_is_settings_default: false,
             default_tool_timeout_ms: None,
             // SUBA-101: `true` against `inherit_project_context: false`, so the legacy default
             // (`None` -> the project flag) is distinguishable from the recorded value.
@@ -1911,6 +1918,7 @@ mod tests {
         let config = runner_config(distinctive_step(), distinctive_persona());
         let d = RecoveryDescriptor::for_single_launch(&config, LaunchInputs::default()).unwrap();
         let mut widened = ResolvedAgentPersona {
+            model_is_settings_default: false,
             default_tool_timeout_ms: None,
             inherit_global_context: false,
             machine: None,

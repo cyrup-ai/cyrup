@@ -124,6 +124,7 @@ async fn a_wasm_guests_widget_tree_draws_on_screen_as_rows() {
         tool_name: "demo_echo".into(),
         is_error: false,
         result: json!({ "content": [{ "type": "text", "text": "echo: hi" }] }),
+        duration_ms: None,
     };
     app.ingest_event_with_extensions(&end, &host).await;
     app.draw().unwrap();

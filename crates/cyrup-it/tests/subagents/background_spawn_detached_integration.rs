@@ -482,6 +482,7 @@ fn orchestrator_sim_binary_path() -> PathBuf {
 /// mode. Every step's agent must now have a plan-time persona in `resolved_agents`.
 fn fixture_persona(name: &str) -> ResolvedAgentPersona {
     ResolvedAgentPersona {
+        model_is_settings_default: false,
         default_tool_timeout_ms: None,
         machine: None,
         file_path: None,
