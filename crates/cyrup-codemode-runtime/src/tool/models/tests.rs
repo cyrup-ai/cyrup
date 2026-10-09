@@ -1,6 +1,6 @@
 //! The `models.*` script globals (pi `createModelGlobals`, `extensions/codemode/execute.ts:524-630`
 //! @v1.0.1), ported from upstream's `describe("codemode models")`
-//! (`test/agent-session-codemode.test.ts:536-845`) at the tool's own seam: the five functions are
+//! (`test/suite/agent-session-codemode.test.ts:536-845`) at the tool's own seam: the five functions are
 //! called as a script calls them, over a scripted [`CodemodeModels`].
 #![allow(
     clippy::unwrap_used,

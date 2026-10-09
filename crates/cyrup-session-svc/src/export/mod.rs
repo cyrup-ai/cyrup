@@ -1,6 +1,6 @@
 //! Standalone-HTML session export — pi `core/export-html/index.ts` (`generateHtml`,
-//! `exportSessionToHtml`, `exportFromFile`) @v0.84.4, reached from pi's
-//! `agent-session.ts:3427 exportToHtml`.
+//! `exportSessionToHtml`, `exportFromFile`) @v0.84.4 (unchanged through v1.1.0), reached from
+//! pi's `agent-session.ts:3427 exportToHtml`.
 //!
 //! pi renders the transcript into a **templated document**, not a text dump: `generateHtml`
 //! (`index.ts:143-175`) base64-encodes a `SessionData{header, entries, leafId, systemPrompt, tools,
@@ -25,19 +25,23 @@
 //! `cyrup --export`.
 //!
 //! **Assets.** `assets/{template.html,template.css,template.js}` and
-//! `assets/vendor/{marked.min.js,highlight.min.js}` are byte-identical copies of pi v0.84.4's
-//! `packages/coding-agent/src/core/export-html/`, `include_str!`-ed rather than read from a
-//! template directory at run time (pi's `getExportTemplateDir()`, `index.ts:144`) because cyrup
-//! ships a single binary with no sibling asset tree. `src/tests/export_html.rs` pins each file's
+//! `assets/vendor/{marked.min.js,highlight.min.js}` are byte-identical copies of pi v1.1.0's
+//! `packages/coding-agent/src/core/export-html/` (`template.html` and `vendor/` are unchanged since
+//! v0.84.4), `include_str!`-ed rather than read from a template directory at run time (pi's
+//! `getExportTemplateDir()`, `index.ts:144`) because cyrup ships a single binary with no sibling
+//! asset tree. `src/tests/export_html.rs` pins each file's
 //! SHA-256 so a local edit cannot silently fork them from upstream. See `assets/vendor/README.md`
 //! for the vendored libraries' provenance and licences.
 //!
 //! **Residual.** `ExportOptions.toolRenderer` / `preRenderCustomTools` (`index.ts:15-33`,
 //! `:177-230`) — the `renderedTools` map that pre-renders EXTENSION tool calls and results through
 //! their TUI renderers and converts the resulting ANSI to HTML (`export-html/tool-renderer.ts`,
-//! `export-html/ansi-to-html.ts`) — is not ported. `template.js:1026` reads `renderedTools?.[…]`
-//! and falls back to its own built-in rendering when the key is absent, so the document is complete
-//! for every built-in tool and degrades only for a custom-rendered extension tool.
+//! `export-html/ansi-to-html.ts`) — is not ported. `template.js:1046` @v1.1.0 reads
+//! `renderedTools?.[…]` and falls back to its own built-in rendering when the key is absent, so the
+//! document is complete for every built-in tool and degrades only for a custom-rendered extension
+//! tool. A port must target `tool-renderer.ts` @v1.1.0, which since v1.0.0 resolves renderers
+//! through `getToolRenderers` (the `registerToolRenderer` chain, so an MCP tool renders before its
+//! server connects) and passes `durationMs` / `outputPad` in its render context.
 //!
 //! That degradation is a LIVE-path gap, not a shape upstream also has. pi's `exportFromFile`
 //! (`index.ts:288-316`) does pass no renderer — but pi's LIVE path always does:
@@ -354,8 +358,8 @@ impl ExportTheme {
 /// `Pick<ToolDefinition, "name" | "description" | "parameters">` (`export-html/index.ts:135`
 /// @v0.84.4), built from `state.tools.map((t) => ({ name, description, parameters }))` (`:268`).
 ///
-/// `template.js:1425-1452` renders one row per element, expanding `parameters.properties` with each
-/// property's `type`, its `required`/`optional` label and its description.
+/// `template.js:1448-1475` @v1.1.0 renders one row per element, expanding `parameters.properties`
+/// with each property's `type`, its `required`/`optional` label and its description.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ExportTool {
     /// `ToolDefinition.name`.
@@ -363,7 +367,7 @@ pub struct ExportTool {
     /// `ToolDefinition.description` — the text shown after the tool name.
     pub description: String,
     /// `ToolDefinition.parameters` — a JSON Schema object; the row expands it only when
-    /// `parameters.properties` is a non-empty object (`template.js:1430`).
+    /// `parameters.properties` is a non-empty object (`template.js:1453`).
     pub parameters: Value,
 }
 
@@ -407,7 +411,7 @@ pub struct ExportState {
     /// pi `state?.systemPrompt` (`:267`).
     system_prompt: Option<String>,
     /// pi `state?.tools?.map(...)` (`:268`). `None` is `undefined` — the key is omitted, as
-    /// `JSON.stringify` omits it; `Some(vec![])` is an empty array, which `template.js:1425`'s
+    /// `JSON.stringify` omits it; `Some(vec![])` is an empty array, which `template.js:1448`'s
     /// `tools && tools.length > 0` guard renders identically but which is a different payload.
     tools: Option<Vec<ExportTool>>,
 }

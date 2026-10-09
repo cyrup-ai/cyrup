@@ -78,8 +78,8 @@ fn empty_input_still_yields_a_document() {
 /// moves its leaf without appending (`SessionManager::branch`), so after a `/tree` switch with no
 /// new message the last line of the exported file belongs to the abandoned branch; and without
 /// `systemPrompt`/`tools` the document loses its System Prompt and Available Tools sections
-/// (`template.js:1403-1452`). `AgentSession::export_state()` composes all three. Read from the
-/// source for the same reason `theme_reapply_on_reload.rs` reads its arm: neither `/export` nor
+/// (`template.js:1428-1475` @v1.1.0). `AgentSession::export_state()` composes all three. Read from
+/// the source for the same reason `theme_reapply_on_reload.rs` reads its arm: neither `/export` nor
 /// `/share` can be driven from this crate without a live `AgentSession`.
 #[test]
 fn both_tui_export_sites_pass_the_live_session_state() {

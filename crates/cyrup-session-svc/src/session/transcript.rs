@@ -162,11 +162,11 @@ impl AgentSession {
     ///
     /// DRIFT-054. The leaf used to be threaded alone, and the two keys pi reads off `this.state`
     /// were never supplied at all, so EVERY exported document lost its **System Prompt** and
-    /// **Available Tools** sections — `template.js:1403-1452` renders both blocks from exactly
-    /// those keys. Composing them here is what stops a fourth export path from repeating it: the
-    /// renderer takes one [`crate::ExportState`], whose two agent keys cannot be split from each
-    /// other. This method is the only PRODUCER of a live value in the workspace, but it is not the
-    /// only way to build one — `ExportState::live` is `pub` and the tests call it — and
+    /// **Available Tools** sections — `template.js:1428-1475` @v1.1.0 renders both blocks from
+    /// exactly those keys. Composing them here is what stops a fourth export path from repeating
+    /// it: the renderer takes one [`crate::ExportState`], whose two agent keys cannot be split from
+    /// each other. This method is the only PRODUCER of a live value in the workspace, but it is
+    /// not the only way to build one — `ExportState::live` is `pub` and the tests call it — and
     /// `ExportState::from_file` remains passable from a live caller. See [`crate::ExportState`] for
     /// exactly what the type does and does not make impossible.
     ///
@@ -212,8 +212,8 @@ impl AgentSession {
     /// (`export-html/index.ts:254-261`, `:269`). Citing `exportFromFile`, which omits it, would be
     /// citing the FILE entry point to excuse a live-path gap — the same false comfort DRIFT-054 was
     /// itself about. A custom-rendered extension tool therefore falls back to `template.js`'s
-    /// built-in rendering (`:1026` reads `renderedTools?.[…]`) where pi would show the extension's
-    /// own card; every built-in tool is unaffected.
+    /// built-in rendering (`:1046` @v1.1.0 reads `renderedTools?.[…]`) where pi would show the
+    /// extension's own card; every built-in tool is unaffected.
     pub async fn export_to_html(
         &self,
         path: Option<&Path>,

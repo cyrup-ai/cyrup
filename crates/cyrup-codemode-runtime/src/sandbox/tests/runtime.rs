@@ -262,7 +262,7 @@ async fn output_and_calls_survive_a_timeout_and_a_pending_call_is_cancelled() {
     )
     .await;
     assert_eq!(error(&result).kind, ErrorKind::Timeout);
-    assert_eq!(output(&result), [text("before"), text("also")]);
+    assert_eq!(output(&result), [text("before"), console("also")]);
     assert_eq!(
         call_summary(&result),
         [("hang".to_owned(), CallStatus::Cancelled)]
@@ -1150,9 +1150,9 @@ async fn output_items_keep_their_order_across_text_and_image() {
                 data: "iVBORw0KGgo=".into(),
                 mime_type: "image/png".into()
             },
-            text("b"),
-            text("1 2"),
-            text("null"),
+            console("b"),
+            console("1 2"),
+            console("null"),
         ]
     );
 }

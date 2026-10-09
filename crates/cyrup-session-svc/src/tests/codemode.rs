@@ -3,7 +3,7 @@
 //! session's hooks, the nested calls recorded on the tool result, the branch-scoped `store()`, the
 //! output budget, and the `models` namespace over the session's own registry.
 //!
-//! Ported from pi's `test/agent-session-codemode.test.ts` @v1.0.1 (845 lines), case by case: the
+//! Ported from pi's `test/suite/agent-session-codemode.test.ts` @v1.0.1 (845 lines), case by case: the
 //! upstream test names are kept recognisable. The one thing that differs is the engine: a script is
 //! a Rust closure run by [`cyrup_codemode_runtime::testkit::ScriptedSandboxFactory`], so what is
 //! under test is the tool, the extension, the host and the session, with the sandbox's own
@@ -532,6 +532,10 @@ fn text(s: &str) -> OutputItem {
     OutputItem::Text(s.to_owned())
 }
 
+fn console(s: &str) -> OutputItem {
+    OutputItem::Console(s.to_owned())
+}
+
 // ------------------------------------------------------------------------ AgentSession codemode --
 
 /// Upstream `presents callable tools per codemode.mode`, `on` half: declared tools say how scripts
@@ -768,7 +772,10 @@ async fn runs_nested_calls_in_parallel_and_returns_only_the_script_result() {
             );
             let stats = stats.unwrap().unwrap();
             completed(
-                vec![text(&format!("files {}", stats["files"]))],
+                vec![
+                    console(&format!("files {}", stats["files"])),
+                    text("echo,stats,screenshot"),
+                ],
                 Some(json!({ "a": a.unwrap(), "b": b.unwrap(), "names": stats["names"] })),
             )
         }),
@@ -785,7 +792,7 @@ async fn runs_nested_calls_in_parallel_and_returns_only_the_script_result() {
     assert!(!is_error(&result));
     assert_eq!(
         result_text(&result),
-        "files 2\n{\"a\":\"echo: one\",\"b\":\"echo: two\",\"names\":[\"a\",\"b\"]}"
+        "==> text 1/2 <==\necho,stats,screenshot\n==> text 2/2 <==\n{\"a\":\"echo: one\",\"b\":\"echo: two\",\"names\":[\"a\",\"b\"]}\n<console_output>\nfiles 2\n</console_output>"
     );
     let Message::ToolResult { tool_call_id, .. } = &result else {
         panic!()
@@ -1174,15 +1181,22 @@ async fn attaches_only_the_images_the_script_passes_to_image_in_output_order_eac
     assert_eq!(
         lines,
         [
-            "captured", lines[1], "<image>", lines[1], "<image>", "after"
+            "==> text 1/2 <==",
+            "captured",
+            lines[2],
+            "<image>",
+            lines[2],
+            "<image>",
+            "==> text 2/2 <==",
+            "after"
         ]
     );
-    assert_eq!(check_saved_images(lines[1], TINY_PNG), "<saved>");
+    assert_eq!(check_saved_images(lines[2], TINY_PNG), "<saved>");
     let Message::ToolResult { content, .. } = &result else {
         panic!()
     };
     assert_eq!(
-        content[3],
+        content[2],
         Content::Image {
             data: TINY_PNG.to_owned(),
             mime_type: "image/png".to_owned()
@@ -1199,8 +1213,8 @@ async fn reports_script_failures_as_results_that_keep_partial_output_and_the_cal
             failed(
                 ErrorKind::Script,
                 "boom",
-                Some("Error: boom\n    at codemode.js:3:7"),
-                vec![text("partial")],
+                Some("Error: boom\n    at codemode.js:4:7"),
+                vec![text("partial"), console("log")],
             )
         }),
         Options {
@@ -1222,10 +1236,12 @@ async fn reports_script_failures_as_results_that_keep_partial_output_and_the_cal
     assert!(header.starts_with("Script failed\n"));
     let body = result_text(&result);
     assert!(
-        body.starts_with("partial\nScript error:\nError: boom\n"),
+        body.starts_with(
+            "partial\n<console_output>\nlog\n</console_output>\nScript error:\nError: boom\n"
+        ),
         "{body}"
     );
-    assert!(body.contains("codemode.js:3"));
+    assert!(body.contains("codemode.js:4"));
     assert!(body.contains("Tool calls made before the failure (they are not undone): echo (ok)"));
     assert_eq!(
         details(&result)
@@ -1406,7 +1422,7 @@ async fn truncates_output_to_the_token_budget_and_spills_the_full_text() {
     rig.set_active(&["codemode"]).await;
 
     let result = rig
-        .run("// @options: {\"max_output_tokens\": 10}\nrows")
+        .run("// @options: {\"max_output_tokens\": 30}\nrows")
         .await;
 
     let path = details(&result).full_output_path.expect("a spill file");
@@ -1432,7 +1448,7 @@ async fn truncates_output_to_the_token_budget_and_spills_the_full_text() {
     assert_eq!(
         full,
         (0..100)
-            .map(|i| format!("row {i}"))
+            .map(|i| format!("==> text {}/100 <==\nrow {i}", i + 1))
             .collect::<Vec<_>>()
             .join("\n")
     );
@@ -1637,6 +1653,162 @@ async fn real_javascript_runs_against_the_session() {
     }
     assert_eq!(result_text(&results[0]), "[\"echo: hi\",[\"a\",\"b\"]]");
     assert_eq!(result_text(&results[1]), "2");
+}
+
+/// A session running real JavaScript in the V8 sandbox against the session's real built-in tools,
+/// with `active` the active tool set.
+async fn real_session(fx: &Fixture, active: &[&str]) -> (Arc<AgentSession>, Arc<FauxProvider>) {
+    let mut cfg = SessionConfig::new(fx.cwd.clone(), fx.agent_dir.clone());
+    cfg.trust_override = Some(true);
+    cfg.no_extensions = false;
+    let faux = Arc::new(FauxProvider::new());
+    let session = SessionBuilder::new(faux.clone() as Arc<dyn Provider>, cfg)
+        .with_codemode(CodemodeExtension::new(
+            Default::default(),
+            Arc::new(cyrup_codemode_runtime::tool::EngineSandboxFactory),
+        ))
+        .build()
+        .await
+        .unwrap()
+        .into_shared();
+    let active: Vec<String> = active.iter().map(|n| (*n).to_owned()).collect();
+    session.set_active_tools_by_name(&active).await;
+    (session, faux)
+}
+
+/// One prompt whose model reply runs `code` through `codemode`; the codemode tool result.
+async fn run_real(session: &AgentSession, faux: &FauxProvider, code: &str) -> Message {
+    let requests: Requests = Arc::new(Mutex::new(Vec::new()));
+    faux.set_response_steps(steps(&requests, vec![Some(json!({ "code": code })), None]));
+    let _ = session.prompt("go").await.unwrap();
+    session.wait_for_idle().await;
+    session
+        .messages()
+        .await
+        .into_iter()
+        .rev()
+        .find(|m| matches!(m, Message::ToolResult { tool_name, .. } if tool_name == "codemode"))
+        .expect("a codemode tool result")
+}
+
+/// TOOL-054 — upstream `resolves bash calls to structured results, also for non-zero exit codes`
+/// (`test/suite/agent-session-codemode.test.ts:544-556` @v1.1.0). The real `bash` tool declares
+/// `bashOutputSchema`, and its non-zero exit is an error result that still carries
+/// `structuredContent`, so the script resolves to it instead of rejecting.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resolves_bash_calls_to_structured_results_also_for_non_zero_exit_codes() {
+    let fx = fixture();
+    let (session, faux) = real_session(&fx, &["codemode", "bash"]).await;
+    let result = run_real(
+        &session,
+        &faux,
+        "const r = await tools.bash({ command: \"echo out; exit 3\" });\ntext(JSON.stringify([r.output, r.exit_code, typeof r.wall_time_seconds]));",
+    )
+    .await;
+    assert!(!is_error(&result));
+    assert_eq!(result_text(&result), "[\"out\\n\",3,\"number\"]");
+}
+
+/// TOOL-058 — upstream `resolves read calls to text for text files and to image blocks that
+/// image() shows` (`test/suite/agent-session-codemode.test.ts:558-576` @v1.1.0, issue #10251).
+/// The real `read` tool declares `readOutputSchema`: a text file resolves to its text, an image to
+/// the block and its note, which the script's `image()` accepts as is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resolves_read_calls_to_text_for_text_files_and_to_image_blocks_that_image_shows() {
+    use base64::Engine as _;
+    let fx = fixture();
+    std::fs::write(fx.cwd.join("notes.txt"), "hello").unwrap();
+    std::fs::write(
+        fx.cwd.join("pixel.png"),
+        base64::engine::general_purpose::STANDARD
+            .decode(TINY_PNG)
+            .unwrap(),
+    )
+    .unwrap();
+    let (session, faux) = real_session(&fx, &["codemode", "read"]).await;
+    let result = run_real(
+        &session,
+        &faux,
+        "text(await tools.read({ path: \"notes.txt\" }));\nconst shot = await tools.read({ path: \"pixel.png\" });\ntext(shot.note);\nimage(shot);",
+    )
+    .await;
+    assert!(!is_error(&result));
+    assert_eq!(
+        check_saved_images(&result_text(&result), TINY_PNG),
+        "==> text 1/2 <==\nhello\n==> text 2/2 <==\nRead image file [image/png]\n<saved>\n<image>"
+    );
+    let Message::ToolResult { content, .. } = &result else {
+        panic!()
+    };
+    assert_eq!(
+        content.last(),
+        Some(&Content::Image {
+            data: TINY_PNG.to_owned(),
+            mime_type: "image/png".to_owned()
+        })
+    );
+}
+
+/// TOOL-054 / TOOL-058 — what the model is told the real `bash` and `read` resolve to in a script,
+/// rendered from their output schemas both ways codemode renders a tool. Declared (`on`), the
+/// tool's own description ends with `describeScriptCall`'s sentence (`extensions/codemode/tool.ts:
+/// 304-327` @v1.1.0): an object schema names its fields in declaration order, a union is its type
+/// on one line. Listed (`only`), the codemode description carries `renderToolSignature`'s
+/// `Promise<…>` (`packages/codemode/src/declarations.ts:138-188`), whose object members are sorted
+/// and keep their descriptions as comments. The expected strings are what pi's own
+/// `declarations.ts` and `describeOutput` print for these two schemas.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_bash_and_read_declarations_render_their_output_schemas() {
+    let rig = rig(no_script(), Options::default()).await;
+    rig.set_active(&["read", "bash", "codemode"]).await;
+    rig.ask("on").await;
+    let tools = rig.request_tools(0);
+    assert!(
+        description(&tools, "bash").ends_with(
+            "\n\nCodemode: `tools.bash(args)` resolves to \
+             `{ output, truncated, full_output_path?, exit_code, wall_time_seconds }`."
+        ),
+        "{}",
+        description(&tools, "bash")
+    );
+    assert!(
+        description(&tools, "read").ends_with(
+            "\n\nCodemode: `tools.read(args)` resolves to \
+             `string | { data: string; mimeType: string; note: string; type: \"image\"; }`."
+        ),
+        "{}",
+        description(&tools, "read")
+    );
+
+    let rig = rig_only().await;
+    rig.set_active(&["read", "bash", "codemode"]).await;
+    rig.ask("only").await;
+    let codemode = description(&rig.request_tools(0), "codemode");
+    assert!(
+        codemode.contains(
+            "): Promise<{\n  exit_code: number;\n  // Full output, when truncated\n  \
+             full_output_path?: string;\n  // Combined stdout and stderr, possibly truncated\n  \
+             output: string;\n  truncated: boolean;\n  wall_time_seconds: number;\n}>; };"
+        ),
+        "{codemode}"
+    );
+    assert!(
+        codemode.contains(
+            "): Promise<string | { data: string; mimeType: string; note: string; type: \"image\"; }>; };"
+        ),
+        "{codemode}"
+    );
+}
+
+async fn rig_only() -> Rig {
+    rig(
+        no_script(),
+        Options {
+            settings: Some(r#"{ "codemode": { "mode": "only" } }"#),
+            ..Options::default()
+        },
+    )
+    .await
 }
 
 /// CODE-020. The prompt a session is BUILT with follows the declared tools as well, not only the
@@ -2146,7 +2318,7 @@ async fn generates_images_with_catalog_auth_and_attaches_them_through_image() {
     };
     assert_eq!(
         check_saved_images(&result_text(&result), data),
-        "painted a fox\n<saved>\n<image>\n[\"error\",\"painter exploded\"]"
+        "==> text 1/2 <==\npainted a fox\n<saved>\n<image>\n==> text 2/2 <==\n[\"error\",\"painter exploded\"]"
     );
     assert!(
         observed

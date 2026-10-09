@@ -1,5 +1,5 @@
 //! Port of upstream's `folds store entries from the root, ignoring malformed data`
-//! (`test/agent-session-codemode.test.ts:516-533` @v1.0.1) plus the entry shape.
+//! (`test/suite/agent-session-codemode.test.ts:516-533` @v1.0.1) plus the entry shape.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,

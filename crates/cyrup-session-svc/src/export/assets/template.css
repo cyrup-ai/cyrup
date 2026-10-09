@@ -792,6 +792,10 @@
       border-radius: 4px;
     }
 
+    body:not(.show-hidden-messages) .hook-message-hidden {
+      display: none;
+    }
+
     .hook-type {
       color: var(--customMessageLabel);
       font-weight: bold;

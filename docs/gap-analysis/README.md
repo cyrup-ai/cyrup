@@ -238,6 +238,13 @@ a six-column table is an empty `Dedup`, which is what "not a duplicate" means.
 > `MCP-618`, `ACP-303`, `DUR-007`, `CODE-024`; unchanged: `AGENT-048`, `TOOL-059`, `DRIFT-061`, `HARN-005`, `ICOM-087`,
 > `HERDR-009`.
 >
+> **Later the same day, on top of this triage** (the pi v1.1.0 built-in tools pass, rebased onto it; ledger UPDATE
+> 2026-10-09 *structured tool results + HTML export*): `TOOL-059`…`TOOL-061`, `SESS-071`, `SESS-072`, `CFG-108` and
+> `CFG-109` filed and closed (that pass's `SESS-070`/`SESS-071`/`CFG-103` were renumbered, as these ids were taken
+> here); `CODE-021`, `CODE-022` closed (filed here and by that pass for the same commits); `SEAM-149` closed as a
+> duplicate of `TOOL-061`. **Next free ids now:** `TOOL-062`, `SESS-073`, `CFG-110`; the others above stand
+> (`CODE-024` included).
+>
 > **Structural census of the pi monorepo at `f1b2e77f5`, with proposed ownership:**
 >
 > | package | in the window | owner |
@@ -329,7 +336,7 @@ a six-column table is an empty `Dedup`, which is what "not a duplicate" means.
 > `SEAM-147`, `SUBA-164`…`SUBA-173`, `MCP-609`…`MCP-611`, `HERDR-007`, `HERDR-008`, and `DUR-005` (closed).
 > **Next free ids now:** `PROV-134`, `CFG-103`, `EXT-108`, `TUI-147`, `SEAM-148`, `SUBA-174`, `MCP-612`,
 > `HERDR-009`, `DUR-006` (`HARN-005`, `CODE-014`, `AGENT-048`, `SESS-070`, `TOOL-057`, `ICOM-082`, `DRIFT-061`
-> unchanged; `ICOM-082` has since been used, and area 11's counter reads `ICOM-086` after the 2026-10-08 v0.16.1 pass, and `ICOM-087` after the 2026-10-09 E2E run filed and closed `ICOM-086`). The 2026-10-02 table further down quotes the
+> unchanged; `ICOM-082` has since been used, and area 11's counter reads `ICOM-086` after the 2026-10-08 v0.16.1 pass, and `ICOM-087` after the 2026-10-09 E2E run filed and closed `ICOM-086`; the 2026-10-09 pi v1.1.0 drift triage and the structured-results pass rebased onto it moved `TOOL-057` → `TOOL-062`, `SESS-070` → `SESS-073`, `CFG-103` → `CFG-110` and `CODE-014` → `CODE-024`, see each file's *Next free id* line). The 2026-10-02 table further down quotes the
 > counters as they were that day.
 >
 > **ADR-0012 does not exist.** Several rows and `MCP-PORT-METHODOLOGY.md` cited it; no such file was ever
@@ -380,15 +387,15 @@ file; it only says how old each one is.
 > | area file(s) | re-pinned at | filed 2026-10-09 |
 > |---|---|---|
 > | `01` · `12` | cyrup `6b14575` × pi **`f1b2e77f5`** (`packages/ai` `v1.0.1..f1b2e77f5`) | `PROV-139`…`PROV-149` (next id `PROV-150`); area 12 none, `DRIFT-060` retitled (next id `DRIFT-061`) |
-> | `02` · `03` · `05` · `08` | cyrup `6b14575` × pi **`f1b2e77f5`** (core-runtime lane, 27 commits) | `02` none; `SESS-070` (next `SESS-071`); `CFG-103`…`CFG-107` (next `CFG-108`); `SEAM-148`, `SEAM-149` (next `SEAM-150`) |
-> | `04` | cyrup `6b14575` × pi **`f1b2e77f5`** (`core/tools`, 4 commits) | none (next id `TOOL-059`) |
+> | `02` · `03` · `05` · `08` | cyrup `6b14575` × pi **`f1b2e77f5`** (core-runtime lane, 27 commits) | `02` none; `SESS-070` (next `SESS-071`); `CFG-103`…`CFG-107` (next `CFG-108`); `SEAM-148`, `SEAM-149` (next `SEAM-150`). Later the same day: `SESS-071`, `SESS-072`, `CFG-108`, `CFG-109` filed and closed, `SEAM-149` closed as a duplicate of `TOOL-061` (next `SESS-073`, `CFG-110`, `SEAM-150`) |
+> | `04` | cyrup `6b14575` × pi **`f1b2e77f5`** (`core/tools`, 4 commits) | none (next id `TOOL-059`). Later the same day: `TOOL-054`…`TOOL-056`, `TOOL-058` closed and `TOOL-059`…`TOOL-061` filed and closed; `TOOL-055` reopened in owner review; **1 open** (next id `TOOL-062`) |
 > | `06` | cyrup `6b14575` × pi **`f1b2e77f5`** (`core/extensions`, `src/extensions`, 14 commits) — first re-read since 2026-09-24 | `EXT-110` (next id `EXT-111`; the counter was stale at `EXT-109`) |
 > | `07` | cyrup `6b14575` × pi **`f1b2e77f5`** (`packages/tui`, `modes/interactive`, 21 commits) | `TUI-171`…`TUI-180` (next id `TUI-181`) |
 > | `09b` | cyrup `6b14575` × pi-subagents **`ad11b7ab`** (window now `v0.57.0..ad11b7ab`) | `SUBA-176`…`SUBA-203` (next id `SUBA-204`) |
 > | `13` · `13a`–`13i` · `13-cyrup-mcp-STATUS.md` | cyrup `6b14575` × pi-mcp-adapter **`2ccf648`** | `MCP-617` (next id `MCP-618`); census 553 → 554. Still counted in its own file |
 > | `15` | cyrup `6b14575` × pi-acp **`04d0a15`** — the file's own pin text moves off v0.0.33 | `ACP-299`…`ACP-302` (next id `ACP-303`). Still counted in its own file |
 > | `17` | cyrup `6b14575` × pi **`f1b2e77f5`** (`packages/durable`, new `packages/env`) | `DUR-006` (next ids `HARN-005`, `DUR-007`) |
-> | `18` | cyrup `6b14575` × pi **`f1b2e77f5`** (`packages/codemode` from v1.0.4; `extensions/codemode` from v1.0.1) | `CODE-021`…`CODE-023` (next id `CODE-024`) |
+> | `18` | cyrup `6b14575` × pi **`f1b2e77f5`** (`packages/codemode` from v1.0.4; `extensions/codemode` from v1.0.1) | `CODE-021`…`CODE-023` (next id `CODE-024`). Later the same day: `CODE-021`, `CODE-022` closed |
 >
 > **Not re-read on 2026-10-09:** `09`, `09a` (beyond the `SUBA-185` supersession note on `09`), `10`, `11`, `14`, `16`.
 
@@ -400,15 +407,15 @@ file; it only says how old each one is.
 > |---|---|---|
 > | `01` · `12` | cyrup `fe875569` × pi **v1.0.0** | `PROV-113`…`PROV-129` (next id `PROV-130`; later filings are in the file's *Next free id* line, which reads `PROV-139` after `PROV-135`…`PROV-138` were filed and closed with `PROV-120` on 2026-10-08), `DRIFT-060` (next id `DRIFT-061`) |
 > | `02` | cyrup `fe875569` × pi **v1.0.0** | `AGENT-045`…`AGENT-047` (next id `AGENT-048`) |
-> | `03` | cyrup `fe875569` × pi **v1.0.0** | `SESS-064`…`SESS-069` (next id `SESS-070`) |
-> | `04` | cyrup `fe875569` × pi **v1.0.0** | `TOOL-052`…`TOOL-056` (next id `TOOL-057`; `TOOL-057`, `TOOL-058` filed 2026-10-07 by the area-18 `v1.0.1..v1.0.4` triage, `TOOL-057` closed the same day, next id `TOOL-059`). The built-in tool set is byte-identical in the window — recorded in the file, nothing filed for it |
-> | `05` | cyrup `fe875569` × pi **v1.0.0** | `CFG-096`…`CFG-101` (next id `CFG-102`); `CFG-098` and `CFG-100` are `duplicate-of` area 07 and are not counted |
+> | `03` | cyrup `fe875569` × pi **v1.0.0** | `SESS-064`…`SESS-069` (next id `SESS-070`; 2026-10-09: the pi v1.1.0 drift triage filed `SESS-070`, and the pi v1.1.0 HTML-export re-vendor closed `SESS-069` and filed and closed `SESS-071`, `SESS-072`, next id `SESS-073`) |
+> | `04` | cyrup `fe875569` × pi **v1.0.0** | `TOOL-052`…`TOOL-056` (next id `TOOL-057`; `TOOL-057`, `TOOL-058` filed 2026-10-07 by the area-18 `v1.0.1..v1.0.4` triage, `TOOL-057` closed the same day, next id `TOOL-059`; 2026-10-09: `TOOL-054`, `TOOL-056`, `TOOL-058` closed, `TOOL-055` briefly closed as "not owed" and reopened in owner review, `TOOL-059` filed and closed by the pi v1.1.0 structured-results pass, next id `TOOL-060`; its review filed and closed `TOOL-060` and `TOOL-061`, next id `TOOL-062`; area 04 now has **0 open**; the drift triage of the same day filed nothing here). The built-in tool set is byte-identical in the window — recorded in the file, nothing filed for it |
+> | `05` | cyrup `fe875569` × pi **v1.0.0** | `CFG-096`…`CFG-101` (next id `CFG-102`; later filings are in the file's *Next free id* line, which reads `CFG-110` after the 2026-10-09 drift triage filed `CFG-103`…`CFG-107` and the pi v1.1.0 tools pass filed and closed `CFG-108`, `CFG-109`); `CFG-098` and `CFG-100` are `duplicate-of` area 07 and are not counted |
 > | `07` | cyrup `fe875569` × pi **v1.0.0** | `TUI-130`…`TUI-144` (next id `TUI-145`; later filings are in the file's *Next free id* line, which reads `TUI-171` after the 2026-10-08 `PROV-120` pass closed `TUI-145` and filed and closed `TUI-167`…`TUI-170`); `TUI-135` is `duplicate-of` `CFG-096` and is not counted |
 > | `09b` | cyrup `fe875569` × pi-subagents **v0.74.0** (window is now `v0.57.0..v0.74.0`) | `SUBA-150`…`SUBA-163` (next id `SUBA-164`) |
 > | `11` | cyrup `fe875569` × pi-intercom **v0.16.0** (**re-pinned to pi-intercom v0.16.1, 2026-10-08**: `v0.16.0..v0.16.1` read in full) | `ICOM-071`…`ICOM-081` (next id `ICOM-082`; `ICOM-082` filed and closed 2026-10-04, next id `ICOM-083`; 2026-10-08: every open row closed — `ICOM-071`, `073`, `075` were already closed by #187/#178 and only stale — and `ICOM-083`…`ICOM-085` filed and closed (#153, #154, `PARITY-GAPS.md` `UW-10`), next id `ICOM-086`; area 11 now has **0 open**; 2026-10-09 E2E run: `ICOM-086` filed and closed, next id `ICOM-087`) |
 > | `13` · `13a`–`13i` · `13-cyrup-mcp-STATUS.md` | cyrup `fe875569` × pi-mcp-adapter **v5.0.0** (× pi **v1.0.0** for the two new in-monorepo MCP surfaces) | `MCP-587`…`MCP-608` (next id `MCP-609`); census 523 → 545 units. Still counted in its own file |
 > | `17` | cyrup `fe875569` × pi **v1.0.0** | `HARN-003`, `HARN-004`, `DUR-001`…`DUR-004` (next ids `HARN-005`, `DUR-005`) |
-> | `18` (**new**) | cyrup `fe875569` × pi **v1.0.0** (**re-pinned to pi v1.0.4, 2026-10-07**: `v1.0.1..v1.0.4` triaged) | `CODE-001`…`CODE-013` (next id `CODE-014`; `CODE-014`…`CODE-017` filed and `CODE-014` closed 2026-10-06, next id `CODE-018`; `CODE-018`…`CODE-020` filed and closed 2026-10-07, next id `CODE-021`); added to `STANDARD_AREAS` in `scripts/count_open_items.py` in the same change |
+> | `18` (**new**) | cyrup `fe875569` × pi **v1.0.0** (**re-pinned to pi v1.0.4, 2026-10-07**: `v1.0.1..v1.0.4` triaged) | `CODE-001`…`CODE-013` (next id `CODE-014`; `CODE-014`…`CODE-017` filed and `CODE-014` closed 2026-10-06, next id `CODE-018`; `CODE-018`…`CODE-020` filed and closed 2026-10-07, next id `CODE-021`; 2026-10-09: the pi v1.1.0 drift triage filed `CODE-021`…`CODE-023`, and the structured-results pass, which had filed `CODE-021` and `CODE-022` for the same two commits, closed them, next id `CODE-024`); added to `STANDARD_AREAS` in `scripts/count_open_items.py` in the same change |
 >
 > **Not re-read on 2026-10-02**, so their 2026-09-24 rows below stand unqualified: `06`, `08`, `09`,
 > `09a`, `10`, `14`, `15`, `16`. Area 06 has one named lead waiting for it — `builtInExtensions`

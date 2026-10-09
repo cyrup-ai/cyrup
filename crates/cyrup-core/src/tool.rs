@@ -200,9 +200,11 @@ pub struct ToolError {
     ///
     /// # [CYRUP-DELTA] — a failing tool may report structure, where pi can only report a string
     ///
-    /// **What differs.** A tool that knows something machine-readable about its own failure — the
-    /// bash tool's process exit code is the case this was added for — can put it here instead of
-    /// leaving a front-end to parse it back out of the human-readable message. `details` is
+    /// **What differs.** A tool that knows something machine-readable about its own failure can
+    /// put it here instead of leaving a front-end to parse it back out of the human-readable
+    /// message. The bash tool's process exit code was the case this was added for; since TOOL-054
+    /// that failure resolves as an [`ToolResult::is_error`] result instead, as pi v1.1.0's does, and
+    /// what still throws with a payload is its exit with no exit code (truncation details). `details` is
     /// documented as "not shown to the model", so nothing the model reads changes; what changes is
     /// the `details` object on the persisted `ToolResultMessage` of a failing tool, which is `{}`
     /// in pi and in cyrup for every tool that does not opt in.

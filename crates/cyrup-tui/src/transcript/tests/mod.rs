@@ -9,6 +9,7 @@ mod js_number;
 mod osc_hyperlinks;
 mod output_pad;
 mod progressive_commit;
+mod read_null_range;
 mod recorded_duration;
 mod render_cache;
 mod rhythm_followup;

@@ -3,7 +3,9 @@
 //! The failure type itself is `cyrup_core::ToolError` (a flat `{message}` struct) — re-exported by
 //! the crate root so built-ins and callers refer to a single type. These helpers build the
 //! model-observed messages with a consistent vocabulary. The agent runtime maps any `Err` to an
-//! `isError:true` tool result (R-03-038); a normal `Ok` is never an error.
+//! `isError:true` tool result (R-03-038). An `Ok` is an error only when the tool sets
+//! `ToolResult::is_error` to keep structured data with the failure, as `bash` does for a non-zero
+//! exit (TOOL-054).
 
 use cyrup_core::ToolError;
 use std::path::Path;

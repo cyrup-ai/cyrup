@@ -23,7 +23,8 @@ use serde_json::json;
 ///
 /// - `limit` (grep/find/ls, `grep.ts:89`) — `!== undefined`, so a present `null` renders `"null"`.
 /// - `timeout` (bash, `bash.ts:241`) — truthiness, so `null` drops the suffix entirely.
-/// - `offset` (read, `read.ts:75`) — `??`, so `null` becomes `1`.
+/// - `offset` (read, `renderers/read.ts:31` @v1.1.0) — `??`, so `null` becomes `1` (once the
+///   `== null` gate has passed on a present `limit`).
 ///
 /// A single shared rule cannot satisfy all three, which is why they are ported separately.
 #[test]
@@ -33,7 +34,10 @@ fn the_three_operators_disagree_on_null() {
     // truthiness — falsy, so the whole suffix is dropped.
     assert!(!js_truthy(&json!(null)));
     // `?? 1` — nullish, so it becomes 1 and the range still renders.
-    assert_eq!(read_line_range(&json!({"offset": null})).unwrap(), ":1");
+    assert_eq!(
+        read_line_range(&json!({"offset": null, "limit": 5})).unwrap(),
+        ":1-5"
+    );
 }
 
 #[test]
@@ -72,24 +76,33 @@ fn js_truthy_is_ecmascript_to_boolean() {
     }
 }
 
-/// `read.ts:74-77` is four rules in four lines. Each is pinned here.
+/// `renderers/read.ts:30-33` @v1.1.0 is four rules in four lines. Each is pinned here.
 #[test]
 fn read_line_range_ports_all_four_rules() {
-    // Rule 1 — presence gate: neither key present, no range at all.
+    // Rule 1 — `== null` gate: neither key present, no range at all.
     assert_eq!(read_line_range(&json!({})), None);
     assert_eq!(read_line_range(&json!({"path": "x"})), None);
 
-    // Rule 1 again — an explicit `null` IS present, so the gate passes.
-    assert_eq!(read_line_range(&json!({"offset": null})).unwrap(), ":1");
+    // Rule 1 again — `== null` is loose, so an explicit `null` counts as omitted: strict tool
+    // schemas make models send `null` for every optional field (pi #9996).
+    assert_eq!(read_line_range(&json!({"offset": null})), None);
+    assert_eq!(read_line_range(&json!({"limit": null})), None);
+    assert_eq!(
+        read_line_range(&json!({"offset": null, "limit": null})),
+        None
+    );
 
     // Rule 2 — `?? 1` yields the VALUE, not a number, so a string offset survives verbatim.
     assert_eq!(read_line_range(&json!({"offset": 5})).unwrap(), ":5");
     assert_eq!(read_line_range(&json!({"offset": "5"})).unwrap(), ":5");
     assert_eq!(read_line_range(&json!({"offset": true})).unwrap(), ":true");
 
-    // Rule 3 — `limit !== undefined`, so a `null` limit still computes: `1 + null - 1` is `0`.
-    // Rule 4 then drops the `-<end>` half because `0` is falsy.
-    assert_eq!(read_line_range(&json!({"limit": null})).unwrap(), ":1");
+    // Rule 3 — `limit != null`, so a `null` limit renders no end.
+    assert_eq!(
+        read_line_range(&json!({"offset": 10, "limit": null})).unwrap(),
+        ":10"
+    );
+    // Rule 4 — truthiness drops the `-<end>` half when the end computes to `0`.
     assert_eq!(
         read_line_range(&json!({"offset": 1, "limit": 0})).unwrap(),
         ":1"

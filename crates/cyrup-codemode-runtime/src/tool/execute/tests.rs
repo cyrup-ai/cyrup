@@ -180,6 +180,10 @@ fn text(s: &str) -> OutputItem {
     OutputItem::Text(s.to_owned())
 }
 
+fn console(s: &str) -> OutputItem {
+    OutputItem::Console(s.to_owned())
+}
+
 // ------------------------------------------------------------------------------------ results --
 
 /// Upstream `runs nested calls in parallel and returns only the script result`.
@@ -195,7 +199,10 @@ async fn runs_nested_calls_in_parallel_and_returns_only_the_script_result() {
             );
             let stats = stats.unwrap().unwrap();
             completed(
-                vec![text(&format!("files {}", stats["files"]))],
+                vec![
+                    console(&format!("files {}", stats["files"])),
+                    text("echo,stats"),
+                ],
                 Some(json!({ "a": a.unwrap(), "b": b.unwrap(), "names": stats["names"] })),
             )
         }),
@@ -219,7 +226,7 @@ async fn runs_nested_calls_in_parallel_and_returns_only_the_script_result() {
     assert!(!result.is_error);
     assert_eq!(
         result_text(&result),
-        "files 2\n{\"a\":\"echo: one\",\"b\":\"echo: two\",\"names\":[\"a\",\"b\"]}"
+        "==> text 1/2 <==\necho,stats\n==> text 2/2 <==\n{\"a\":\"echo: one\",\"b\":\"echo: two\",\"names\":[\"a\",\"b\"]}\n<console_output>\nfiles 2\n</console_output>"
     );
     let details = details(&result);
     assert_eq!(
@@ -358,13 +365,16 @@ async fn reports_script_failures_as_results_that_keep_partial_output_and_the_cal
             failed(
                 ErrorKind::Script,
                 "boom",
-                Some("Error: boom\n    at codemode.js:3:7"),
-                vec![text("partial")],
+                Some("Error: boom\n    at codemode.js:4:7"),
+                vec![text("partial"), console("log")],
             )
         }),
     );
 
-    let result = rig.run("text('partial'); ...").await.unwrap();
+    let result = rig
+        .run("text('partial'); console.log('log'); ...")
+        .await
+        .unwrap();
 
     assert!(result.is_error);
     let Some(Content::Text { text: header, .. }) = result.content.first() else {
@@ -373,10 +383,12 @@ async fn reports_script_failures_as_results_that_keep_partial_output_and_the_cal
     assert!(header.starts_with("Script failed\n"));
     let body = result_text(&result);
     assert!(
-        body.starts_with("partial\nScript error:\nError: boom\n"),
+        body.starts_with(
+            "partial\n<console_output>\nlog\n</console_output>\nScript error:\nError: boom\n"
+        ),
         "{body}"
     );
-    assert!(body.contains("codemode.js:3"));
+    assert!(body.contains("codemode.js:4"));
     assert!(body.contains("Tool calls made before the failure (they are not undone): echo (ok)"));
     assert_eq!(
         details(&result)
@@ -596,8 +608,9 @@ async fn a_returned_value_is_appended_like_text() {
 }
 
 /// Upstream `attaches only the images the script passes to image(), in output order, each after its
-/// saved path` (@v1.0.3): output items keep their order, images become image blocks, and each image
+/// saved path` (@v1.1.0): output items keep their order, images become image blocks, and each image
 /// follows a text item naming the file it was saved to. The same image shown twice is saved once.
+/// With two text items each starts with its `==> text N/M <==` line (pi `eb326d265`).
 #[tokio::test]
 async fn output_items_keep_their_order_and_each_image_follows_the_path_it_was_saved_to() {
     let shown = || OutputItem::Image {
@@ -619,13 +632,22 @@ async fn output_items_keep_their_order_and_each_image_follows_the_path_it_was_sa
     assert_eq!(
         lines,
         [
-            "captured", lines[1], "<image>", lines[1], "<image>", "after"
+            "==> text 1/2 <==",
+            "captured",
+            lines[2],
+            "<image>",
+            lines[2],
+            "<image>",
+            "==> text 2/2 <==",
+            "after"
         ],
         "both labels name one file"
     );
-    assert_eq!(check_saved_images(lines[1]), "<saved>");
+    assert_eq!(check_saved_images(lines[2]), "<saved>");
+    // Each label is joined to the text before it: header, text, image, label, image, text.
+    assert_eq!(result.content.len(), 6);
     assert_eq!(
-        result.content[3],
+        result.content[2],
         Content::Image {
             data: TINY_PNG.to_owned(),
             mime_type: "image/png".to_owned()
@@ -684,7 +706,7 @@ async fn truncates_output_to_the_token_budget_and_spills_the_full_text() {
     });
 
     let result = rig
-        .run("// @options: {\"max_output_tokens\": 10}\nfor (...) text(...)")
+        .run("// @options: {\"max_output_tokens\": 30}\nfor (...) text(...)")
         .await
         .unwrap();
 
@@ -715,7 +737,7 @@ async fn truncates_output_to_the_token_budget_and_spills_the_full_text() {
     assert_eq!(
         full,
         (0..100)
-            .map(|i| format!("row {i}"))
+            .map(|i| format!("==> text {}/100 <==\nrow {i}", i + 1))
             .collect::<Vec<_>>()
             .join("\n")
     );

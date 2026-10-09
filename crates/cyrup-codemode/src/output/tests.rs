@@ -468,6 +468,66 @@ fn an_output_file_is_never_written_through_a_path_someone_else_placed() {
     assert_eq!(std::fs::read_to_string(&planted).unwrap(), "theirs");
 }
 
+fn console(value: &str) -> OutputItem {
+    OutputItem::Console(value.to_owned())
+}
+
+/// `formatOutput` then `joinAdjacentText`, as the execute path applies them, rendered as the one
+/// text the model reads (pi `agent-session-codemode.test.ts:396-418` @v1.1.0).
+#[test]
+fn several_text_items_get_numbered_headers_and_console_lines_go_last_in_one_block() {
+    let laid_out = join_adjacent_text(format_output(vec![
+        text("one\ntwo"),
+        console("a"),
+        console("b"),
+        text("three\n"),
+        text("4"),
+    ]));
+    assert_eq!(
+        laid_out,
+        vec![text(
+            "==> text 1/3 <==\none\ntwo\n==> text 2/3 <==\nthree\n==> text 3/3 <==\n4\n<console_output>\na\nb\n</console_output>"
+        )]
+    );
+}
+
+#[test]
+fn a_single_text_item_gets_no_header_and_images_keep_their_place() {
+    assert_eq!(
+        format_output(vec![text("only"), image(), console("log")]),
+        vec![
+            text("only"),
+            image(),
+            text("<console_output>\nlog\n</console_output>")
+        ]
+    );
+    assert_eq!(
+        format_output(vec![text("a"), image(), text("b")]),
+        vec![
+            text("==> text 1/2 <==\na"),
+            image(),
+            text("==> text 2/2 <==\nb")
+        ]
+    );
+    assert_eq!(format_output(Vec::new()), Vec::new());
+}
+
+#[test]
+fn join_adjacent_text_adds_a_newline_only_where_a_part_does_not_end_one() {
+    assert_eq!(
+        join_adjacent_text(vec![
+            text("a"),
+            text("b\n"),
+            text("c"),
+            image(),
+            text(""),
+            text("d"),
+            image(),
+        ]),
+        vec![text("a\nb\nc"), image(), text("d"), image()]
+    );
+}
+
 /// Mode bits exist on Unix only (`OUTPUT_FILE_MODE` is ignored on Windows upstream too).
 fn assert_owner_only(path: &Path) {
     #[cfg(unix)]

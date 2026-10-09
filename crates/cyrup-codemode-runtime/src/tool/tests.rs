@@ -1,7 +1,7 @@
 //! The tool as the registry and the loadout see it: its metadata, its identity, and how it presents
 //! the other tools per `codemode.mode` (pi `createCodemodeToolDefinition`,
 //! `prepareCodemodeLoadout`, `isCodemodeTool` @v1.0.1; upstream's session-level
-//! `presents callable tools per codemode.mode`, `test/agent-session-codemode.test.ts:118-159`).
+//! `presents callable tools per codemode.mode`, `test/suite/agent-session-codemode.test.ts:118-159`).
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,

@@ -19,7 +19,7 @@ A script may start with an options line:
 - `max_output_tokens` (default 10000) limits the output. Longer output keeps its start and end, and the full text is written to a temp file whose path is included in the result. A script fails when its output passes 16777216 characters of text and base64 image data or 100000 `text()`, `image()`, and `console` calls; write large data to a file with a tool instead.
 - `timeout_ms` is a hard deadline for the whole script. It is unset by default. Image generation can take minutes, so do not set a short deadline for scripts that generate images.
 
-The result starts with `Script completed` or `Script failed`, the wall time, and the output. A failed script keeps its partial output, followed by `Script error:` and the error. The error is the script's stack: its first line is `Name: message`, and the frames read `at codemode.js:LINE:COLUMN`, where `LINE` counts the script's own lines. Tool calls are real: calls made before a failure are not undone. Calls still running when the script ends are cancelled, and unawaited promises are discarded.
+The result starts with `Script completed` or `Script failed`, the wall time, and the output. Text and image items appear in order, each on its own line. When the output has more than one text item (from `text()` or `return`), each starts with a `==> text N/M <==` line. `console` calls follow in one `<console_output>` block with one line per call. A failed script keeps its partial output, followed by `Script error:` and the error. The error is the script's stack: its first line is `Name: message`, and the frames read `at codemode.js:LINE:COLUMN`, where `LINE` counts the script's own lines. Tool calls are real: calls made before a failure are not undone. Calls still running when the script ends are cancelled, and unawaited promises are discarded.
 
 ## Globals
 
@@ -28,7 +28,7 @@ The result starts with `Script completed` or `Script failed`, the wall time, and
 | `tools.<name>(args)` | Call a tool. See [Call tools](#call-tools). |
 | `text(value)` | Add a text item to the output. Strings are added as is, other values as JSON. |
 | `image(value)` | Add an image to the output: a base64 `data:` URL, an `{ image_url }` object, or an image block `{ type: "image", data, mimeType }` such as those returned by MCP tools and `models.generateImages()`. Remote URLs are not supported. PNG, JPEG, GIF, and WebP are accepted. Each image is also saved to a temp file, and the result names the path before the image. |
-| `console.log(...)` | Like `text()`; `info`, `warn`, `error`, and `debug` do the same. |
+| `console.log(...)` | Add a line to the `<console_output>` block after the other output. Arguments are joined with spaces; `info`, `warn`, `error`, and `debug` do the same. |
 | `return value` | A top-level `return` adds the value like `text()`. |
 | `exit()` | End the script successfully. |
 | `store(key, value)` / `load(key)` | Keep small JSON values across `codemode` calls. See [Store values](#store-values). |
@@ -44,10 +44,11 @@ Every tool the session can call is a method of `tools`, named by its identifier:
 
 What a call resolves to depends on the tool:
 
-- Tools that declare an output schema resolve to their structured value, also when the result is an error that carries one. None of cyrup's built-in tools declares an output schema yet.
-- Other tools resolve to their text output: `read`, `edit`, `write`, and `grep` resolve to the text the model would see. `bash` resolves to its output text; the 2000 lines or 50KB limit the model sees applies to it too, and the full output is kept in the file named in that text.
+- Tools that declare an output schema resolve to their structured value, also when the result is an error that carries one. `bash` resolves to `{ output, truncated, full_output_path?, exit_code, wall_time_seconds }`, also for non-zero exit codes. Its `output` is not limited to the 2000 lines or 50KB the model sees: it holds up to 1 MiB, and longer output keeps its first and last 512 KiB around a `[... N bytes omitted ...]` marker, with `truncated` set and the full output in `full_output_path`.
+- `read` resolves to the file's text, or for an image to an image block `{ type: "image", data, mimeType, note }` that `image()` shows. `data` is the base64 image the model would see and `note` the text that goes with it, such as resize hints.
+- Other tools, such as `edit`, `write`, and `grep`, resolve to their text output.
 
-A call that fails, is blocked, or gets invalid arguments rejects with an `Error` that carries the tool's error text. A `bash` command that exits with a non-zero code is such a failure. Use `Promise.allSettled()` to keep the results of the calls that succeed.
+A call that fails, is blocked, or gets invalid arguments rejects with an `Error` that carries the tool's error text. Use `Promise.allSettled()` to keep the results of the calls that succeed.
 
 The `codemode` description lists tools with their TypeScript declarations, grouped by namespace. Tools with `deferred` exposure are not listed, so the description stays the same while extensions register and change such tools. Listed declarations share a budget of 3000 estimated tokens (`codemode.inlineBudget` in [settings](guide/reference/settings.md#tools-and-codemode)). Scripts find the other tools with `searchTools()`, `describeTool()`, `describeNamespace()`, or by filtering `ALL_TOOLS`.
 

@@ -19,11 +19,12 @@ pub struct BashDetails {
     pub full_output_path: Option<String>,
     /// The process exit code, on the non-zero-exit path only (`ACP-141`).
     ///
-    /// Pi has no counterpart: its bash tool throws a string and the exit code survives only inside
-    /// `Command exited with code {n}`. Every front-end that wants the number then has to parse it
-    /// back out of a human-readable sentence — which is what pi-acp's `bashExitCode` does through
-    /// a four-key `Record<string, unknown>` probe that hits nothing, and why an ACP client showed
-    /// `terminal_exit.exit_code: 1` for `sh -c 'exit 42'`.
+    /// Pi's `details` have no counterpart: its bash tool reports the number in
+    /// `structuredContent.exit_code` (`bash.ts:391-399` @v1.1.0, which cyrup carries too since
+    /// TOOL-054), and its `details` stay `formatOutput`'s `{ truncation, fullOutputPath }`.
+    /// pi-acp's `bashExitCode` reads `details` through a four-key `Record<string, unknown>` probe
+    /// that hits nothing there, which is why an ACP client showed `terminal_exit.exit_code: 1` for
+    /// `sh -c 'exit 42'`.
     ///
     /// Absent (not `null`) on every other path: a clean exit reports through the ordinary success
     /// result, and a timeout or a kill has no exit code to report. Carried to the client by

@@ -20,7 +20,8 @@ use std::time::{Duration, Instant};
 use cyrup_codemode::declarations::render_tool_sample;
 use cyrup_codemode::js::json_stringify;
 use cyrup_codemode::output::{
-    DEFAULT_MAX_OUTPUT_TOKENS, label_images, save_image_output, spill_output, truncate_output,
+    DEFAULT_MAX_OUTPUT_TOKENS, format_output, join_adjacent_text, label_images, save_image_output,
+    spill_output, truncate_output,
 };
 use cyrup_codemode::source::parse_codemode_source;
 use cyrup_codemode::types::{OutputItem, ToolDeclaration};
@@ -225,7 +226,7 @@ fn nested_tool(
 
 fn content_of(item: OutputItem) -> Content {
     match item {
-        OutputItem::Text(text) => Content::text(text),
+        OutputItem::Text(text) | OutputItem::Console(text) => Content::text(text),
         OutputItem::Image { data, mime_type } => Content::Image { data, mime_type },
     }
 }
@@ -334,15 +335,16 @@ pub async fn execute_codemode(
     let calls = recorder.finish();
 
     let ok = matches!(result, CodemodeResult::Completed { .. });
+    // The returned value is laid out with the script's own output; the error and the note below
+    // are not script output, so they get no `==> text N/M <==` line (`execute.ts:502-512` @v1.1.0).
     let mut items: Vec<OutputItem>;
     match result {
         CodemodeResult::Completed {
             value,
-            output,
+            mut output,
             store_writes,
             ..
         } => {
-            items = output;
             if let (Some(host), Some(entry)) =
                 (&host, CodemodeStoreEntryData::from_writes(store_writes))
             {
@@ -354,11 +356,12 @@ pub async fn execute_codemode(
             }
             // pi extension: a returned value is appended like text().
             if let Some(value) = value {
-                items.push(OutputItem::Text(value_text(&value)));
+                output.push(OutputItem::Text(value_text(&value)));
             }
+            items = format_output(output);
         }
         CodemodeResult::Failed { error, output, .. } => {
-            items = output;
+            items = format_output(output);
             items.push(OutputItem::Text(format!(
                 "Script error:\n{}",
                 format_error(&error, &calls)
@@ -378,7 +381,7 @@ pub async fn execute_codemode(
     }
 
     let truncated = truncate_output(
-        items,
+        join_adjacent_text(items),
         parsed
             .options
             .max_output_tokens
@@ -386,12 +389,15 @@ pub async fn execute_codemode(
         |text| spill_output(&std::env::temp_dir(), text),
     );
     // After truncation, which joins the text items and moves the images after them, so each path
-    // stays next to its image and is never cut (`execute.ts:462-465` @v1.0.3).
+    // stays next to its image and is never cut (`execute.ts:519-526` @v1.1.0). Each label is
+    // then joined to the text around it, so adjacent text reaches the model as one block.
     let temp_dir = std::env::temp_dir();
-    let output = label_images(truncated.items, |mime_type, bytes| {
-        save_image_output(&temp_dir, mime_type, bytes)
-    })
-    .map_err(|error| ToolError::new(error.to_string()))?;
+    let output = join_adjacent_text(
+        label_images(truncated.items, |mime_type, bytes| {
+            save_image_output(&temp_dir, mime_type, bytes)
+        })
+        .map_err(|error| ToolError::new(error.to_string()))?,
+    );
     let wall_time = to_fixed_1(started.elapsed().as_secs_f64());
     let header = format!(
         "{}\nWall time {wall_time} seconds\nOutput:\n",

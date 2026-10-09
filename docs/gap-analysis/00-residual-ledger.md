@@ -5,6 +5,148 @@ next work item**.
 
 ---
 
+# UPDATE 2026-10-09 (pi v1.1.0 structured tool results + HTML export, rebased onto #210) — `TOOL-054`, `TOOL-056`, `TOOL-058`, `SESS-069`, `CODE-021` and `CODE-022` closed; `SEAM-149` closed as a duplicate; `TOOL-059`…`TOOL-061`, `SESS-071`, `SESS-072`, `CFG-108` and `CFG-109` filed and closed
+
+> **Rebased onto `77daee4` (#210, the pi v1.1.0 drift triage) and then onto `7599bf4` (#212, the pi-subagents v0.76.1 drift, the next UPDATE below; it touched no row this pass changed).** The
+> passes recorded in the sub-sections that follow were built and gated on `bcf48e8`; their counts and *Next
+> free ids* lines are as measured there and are superseded by this paragraph. Where #210 had filed the same
+> finding, its row was closed with this pass's evidence instead of keeping two; where #210 had allocated an id
+> this pass also used for something else, this pass's row was renumbered.
+>
+> * **Merged into #210's rows (same id, same finding):** `CODE-021` (pi `eb326d265`, output items) and `CODE-022`
+>   (pi `269121616`, `await` on the lookup helpers): #210 filed both open, this pass had filed and closed them;
+>   #210's rows and bodies are kept and closed (area 18).
+> * **#210's row closed as a duplicate:** `SEAM-149` (pi `27c7b6ff4`, split escape sequences in `!` output) is
+>   `TOOL-061`; closed with `TOOL-061`'s evidence (area 08).
+> * **Renumbered (old → new):** `SESS-070` → **`SESS-071`** and `SESS-071` → **`SESS-072`** (#210's `SESS-070` is
+>   the symlinked-worktree `AGENTS.md` row); `CFG-103` → **`CFG-108`** (#210's `CFG-103`…`CFG-107` are other
+>   rows). No code or test comment cited the old ids.
+> * **Filed and closed after the rebase:** `CFG-108` (from the end-to-end run: `"defaultTools": ["+codemode"]`
+>   now activates the extension tools it names) and **`CFG-109`** (pi `db6cc71dc`: `/reload` activates tools
+>   newly added to `defaultTools`, on top of `CFG-108`'s `activate_default_extension_tools`; the rule
+>   `CFG-097`'s body had recorded and left unfiled). Area 05's CLOSURES block of this date.
+> * **Review fixes:** `TOOL-059`/`TOOL-060`/`TOOL-061` line cites re-verified against this tree (the
+>   `cyrup-session-svc/src/bash.rs` cites were 12 lines short; `TOOL-059` no longer says `bash.rs:643` returns
+>   the error); the codemode declarations rendered from the new output schemas are pinned by
+>   `cyrup-session-svc` `tests::codemode::the_bash_and_read_declarations_render_their_output_schemas` (expected
+>   strings printed by pi v1.1.0's own `declarations.ts` / `describeOutput`).
+> * **Not changed by this pass:** `SEAM-148` (`--tools +codemode`, #210, medium) stays open; it is the CLI half
+>   that `CFG-108` does not cover, and pi's `defaultToolModifiers` reload half waits on it.
+>
+> The count is whatever `python3 -I docs/gap-analysis/scripts/count_open_items.py` prints: **before 155 open
+> (0 above medium, 5 medium; 17 trackers; 989 closed), on `7599bf4` (`origin/main` after #212, measured in a scratch
+> worktree); after 148 open (0 above medium, 5 medium; 17 trackers; 1003 closed)**. Seven open rows close (three
+> in 04, one in 03, two in 18, one in 08) and seven rows are filed and closed (`TOOL-059`…`TOOL-061`,
+> `SESS-071`, `SESS-072`, `CFG-108`, `CFG-109`), so open falls by seven and closed rises by fourteen. By area:
+> 03 3 → **2** open (`SESS-066`, `SESS-070`), 52 → **55** closed; 04 4 → **1** open (`TOOL-055`), 43 → **49** closed; 05 9
+> open, 84 → **86** closed; 08 7 → **6** open, 98 → **99** closed; 18 6 → **4** open (`CODE-015`…`CODE-017`,
+> `CODE-023`), 17 → **19** closed. The five mediums are #210's, unchanged.
+>
+> Gates on the rebased tree (`CARGO_INCREMENTAL=0`): `cargo fmt --all -- --check` clean; `cargo clippy --workspace
+> --all-targets -- -D warnings` clean; `cargo test -p cyrup-session-svc -p cyrup-tools -p cyrup-core -p cyrup-codemode
+> -p cyrup-codemode-runtime -p cyrup-acp -p cyrup-tui` green: `cyrup-session-svc` 800, `cyrup-tools` 407 + 3
+> integration, `cyrup-core` 112, `cyrup-codemode` 112, `cyrup-codemode-runtime` 189, `cyrup-acp` 243 + 9
+> integration, `cyrup-tui` 2126 + 1 ignored + 2 integration, plus doc tests.
+>
+> **Next free ids after the rebase:** `TOOL-062`, `SESS-073`, `CFG-110`, `CODE-024` (unchanged by this pass);
+> the rest are as #210 left them.
+>
+> ## The pass as built on `bcf48e8` (before the rebase; ids renumbered above are shown with their new numbers)
+>
+> Built on `claude/zealous-bell-x0u1h0` off `main` @ `bcf48e8` (the merge of #208); not yet committed. The pass
+> began on `3cbd858` (#207) and was rebased onto #208 before it was gated: #208 rewrites the `read` image path
+> (resizing against the model's profile) that `TOOL-058`'s `to_read_output` wraps, and adds the session-level
+> `after_tool_call` image normalizer, which already carries `structured_content` through unchanged as pi's
+> `_afterToolCall` does (`agent-session.ts:712-723` @v1.1.0). Upstream read at pi **v1.1.0** through git
+> objects only; every row re-verified at the tag before it was closed. Details, evidence and test names are on
+> each row and in the `CLOSURES 2026-10-09` blocks at the top of `04-cyrup-tools.md` and `03-cyrup-session.md`,
+> and the `CLOSURES 2026-10-09` block at the top of `18-pi-codemode.md` (a `TRIAGE` block before the rebase).
+>
+> Gates on `bcf48e8` (`CARGO_INCREMENTAL=0`): `cargo fmt --all -- --check`, then `cargo clippy -p <crate>
+> --all-targets -- -D warnings` and `cargo test -p <crate>` green for every touched crate: `cyrup-tools` 407 +
+> 3 doc/bin, `cyrup-session-svc` 784, `cyrup-tui` 2109 + 1 ignored, `cyrup-core` 112 + 1, `cyrup-acp` 243 +
+> 9, `cyrup-codemode-runtime` 187 (comment-only: its upstream test cites now name `test/suite/`).
+>
+> The count is whatever `python3 -I docs/gap-analysis/scripts/count_open_items.py` prints: **before 96 open
+> (0 above low; 17 trackers; 980 closed), on `bcf48e8`; after 92 open (0 above low; 17 trackers; 988
+> closed)**. Five open rows close, three rows are filed and closed, and one is filed open, so open falls by
+> four and closed rises by eight. Area 04: 4 → **0** open, 43 → **48** closed. Area 03: 2 → **1** open
+> (`SESS-066`), 52 → **55** closed. Area 18: 3 → **4** open, 17 closed.
+>
+> * **Closed:** `TOOL-054` (`bash`/`powershell` declare pi's output schema and return up to 1 MiB of output as
+>   `structuredContent`; a non-zero exit is an `isError` result instead of an `Err`), `TOOL-056` (the TUI `read`
+>   header treats `null` offset/limit as omitted), `TOOL-058` (`read` declares pi's output schema and returns its
+>   text or image as `structuredContent`), `SESS-069` (hidden custom messages in the HTML export, by a whole-file
+>   re-vendor of `template.js`/`template.css` at v1.1.0).
+> * **`TOOL-055` (`truncateMiddle`) is OPEN — reopened in owner review.** It was briefly closed as "not owed", a disposition the README does not allow; the row now records why and pairs it with `MCP-558` (one decision on `cyrup-mcp`'s output shape). The superseded closure reasoning: Its only upstream consumer is pi's built-in MCP
+>   extension, which cyrup does not port (`MCP-587`); pi-mcp-adapter v5.1.0 still head-truncates, as
+>   `cyrup-mcp` does, and pi's package API does not export it. Reasons on the row.
+> * **Filed and closed:** `TOOL-059` (a failed bash spill file silently dropped the rest of the output; now
+>   the call fails with the spill error, a `[CYRUP-DELTA]`: pi gets that outcome only when the stream errors
+>   after `end()`, and an earlier error leaves pi's call pending), `SESS-071` (`context_edit` entries in the export's tree
+>   sidebar), `SESS-072` (the export's single-key shortcuts ignore Ctrl/Alt/Meta). The last two ride on the same
+>   re-vendor and had been named, unfiled, in `SESS-068`'s 2026-10-03 correction.
+> * **Filed open:** `CODE-021` (pi `eb326d265`, v1.1.0: codemode's `==> text N/M <==` item headers, the
+>   `<console_output>` block and the text-joining). Area 18 is **not** re-pinned to v1.1.0 by this; only that
+>   commit was read. (#210 filed the same finding as `CODE-021`; merged on the rebase.)
+> * **Behaviour change:** `tool_execution_end` results for `bash` and `read` now carry `structuredContent` (up to
+>   1 MiB for `bash`; a second copy of the text or image for `read`), so RPC, extension and TUI event payloads
+>   grow. Session files do not.
+> * **Next free ids** (on `bcf48e8`, superseded above): `TOOL-060`, `SESS-072` (as then numbered), `CODE-022`.
+>
+> ## Review pass, same day — `CODE-021` closed; `TOOL-060`, `TOOL-061` filed and closed
+>
+> Review findings on the pass above, each re-verified at v1.1.0 before it was acted on. Ledger cite fixes on
+> `TOOL-054` (`output.rs:471`, `bash.rs:678-684` / `:705-706`, pi `bash.ts:400-407`) and `TOOL-055` (its
+> CORRECTED note no longer says the row stays open), and `read.rs`'s `toReadOutput` cite (`read.ts:72-77`).
+> Then three code changes:
+>
+> * **Closed:** `CODE-021` — pi `eb326d265` ported whole: a `console` output item, `format_output`'s
+>   `==> text N/M <==` headers and `<console_output>` block, `join_adjacent_text` at pi's two call points, the
+>   description sentence and `docs/codemode.md`. Every codemode test that pinned the old run-together output
+>   now expects upstream's bytes, and pi's new item-layout case runs on real V8.
+> * **Filed and closed:** `TOOL-060` — the user `!` bash spill (`cyrup-session-svc/src/bash.rs`) swallowed a
+>   failed create or write like `TOOL-059`'s; it now fails the call with the spill error (the same
+>   `[CYRUP-DELTA]`). `TOOL-061` — pi `27c7b6ff4` (v1.1.0, #10504), drift found on that buffer (unledgered on
+>   `bcf48e8`; #210's `SEAM-149` is the same finding): an
+>   escape sequence split across output chunks is held back and stripped whole, and the decoder's end of stream
+>   is flushed.
+>
+> Gates (`CARGO_INCREMENTAL=0`): `cargo fmt --all -- --check`, `cargo clippy -p <crate> --all-targets -- -D
+> warnings` and `cargo test -p <crate>` green for `cyrup-codemode` 112, `cyrup-codemode-runtime` 188,
+> `cyrup-tools` 407 + 3 doc/bin, `cyrup-session-svc` 796. Count after: **91 open (0 above low; 17 trackers; 991
+> closed)**. Area 04: 0 open, **50** closed. Area 18: 4 → **3** open, 17 → **18** closed.
+>
+> ## Second review pass, same day — `CODE-022` filed and closed
+>
+> * **Filed and closed:** `CODE-022` — pi `269121616` (v1.1.0, #10555): the codemode globals line says
+>   `await searchTools(…)`, `await describeTool(name)`, `await describeNamespace(name)`.
+> * **Docs:** `docs/codemode.md`'s *Call tools* section now matches pi v1.1.0 `docs/codemode.md:40-47`: `bash`
+>   resolves to its structured value also for a non-zero exit, `read` to its text or an image block, and a
+>   non-zero `bash` exit is no longer listed as a rejection. That page is the one the `models` line sends the
+>   model to.
+> * **Amended:** `TOOL-059`, `TOOL-060` — a spill failure still fails the call, but the error now leads with
+>   how the command ended (and, for the agent-loop `bash`, the preview), so the model is not left to guess
+>   whether the command ran. A note on `TOOL-058` (its codemode test now matches upstream byte for byte) and
+>   the `TOOL-054` line cites moved with the `bash.rs` block. One finding was not acted on (an empty path in a
+>   `read_full_output` error); the reason is in `04-cyrup-tools.md`'s 2026-10-09 block.
+>
+> Gates (`CARGO_INCREMENTAL=0`): `cargo fmt --all -- --check`, `cargo clippy -p <crate> --all-targets -- -D
+> warnings` and `cargo test -p <crate>` green for `cyrup-tools` 407 + 3 doc/bin, `cyrup-codemode-runtime` 189,
+> `cyrup-session-svc` 796. Count after: **91 open (0 above low; 17 trackers; 992 closed)**. Area 18: 3 open,
+> **19** closed. **Next free ids** (on `bcf48e8`, superseded above): `TOOL-062`, `SESS-072` (as then numbered),
+> `CODE-023`.
+>
+> ## Leads this pass produced — recorded, NOT counted, not filed
+>
+> * ~~**pi `18336987a` (#10557, v1.1.0) "apply outputPad to all transcript blocks"**~~ — filed by #210 as
+>   `TUI-175` (area 07); its export-html half is #210's recorded lead below.
+> * ~~**pi `269121616` (#10555, v1.1.0) "mark codemode lookup helpers as async in description"**~~ — **PORTED in
+>   the second review pass** as `CODE-022` (filed and closed): the line `CODE-021` edited. #210 re-pinned area 18
+>   to `f1b2e77f5` and filed the same row; merged on the rebase.
+
+---
+
 # UPDATE 2026-10-09 (pi-subagents v0.76.1 drift) — `SUBA-139`, `SUBA-153`, `SUBA-167`, `SUBA-172` and `SUBA-175` closed; `SUBA-204`…`SUBA-209` filed
 
 > Upstream read at pi-subagents `v0.76.1` through git objects only (`git -C tmp/pi-subagents show
@@ -81,7 +223,8 @@ next work item**.
 > * **Filed by this pass from verifier leads, both sides re-read:** `TUI-180` (dead-terminal `ENOTTY`) and `ACP-302`
 >   (the v0.0.34 context-usage `usage_update` lead area 15 recorded on 2026-09-24 and never filed).
 > * **Next free ids:** `PROV-150`, `SESS-071`, `CFG-108`, `EXT-111`, `TUI-181`, `SEAM-150`, `SUBA-204`, `MCP-618`,
->   `ACP-303`, `DUR-007`, `CODE-024`; the rest are unchanged.
+>   `ACP-303`, `DUR-007`, `CODE-024`; the rest are unchanged. *(Superseded for two areas by the UPDATE above, which landed on
+>   top of this one: `SESS-073`, `CFG-110`; `TOOL-059` is now `TOOL-062`.)*
 >
 > ## Structural census (README *CURRENT PINS* has the table)
 >
@@ -108,6 +251,36 @@ next work item**.
 > * `06c12df` (pi-mcp-adapter, SSE abort through fetch wrappers): judged not to apply by construction; a one-off
 >   `cyrup -p` exit check against a kept-alive bearer-command server would confirm it.
 > * The export-html renderer's `outputPad: 1` (pi `18336987a`) was not read against cyrup's export path.
+
+# UPDATE 2026-10-09 (pi v1.1.0 extension event surface) — `EXT-078`, `EXT-084` and `SESS-050` closed; pi's timings commit and `agent_settled.aborted` ported
+
+> Upstream read at pi `v1.1.0` through git objects only (`git -C tmp/pi show v1.1.0:<path>`). The count is
+> whatever `python3 -I docs/gap-analysis/scripts/count_open_items.py` prints, measured on `main` at
+> `5a2c8d9` (before) and on this branch rebased onto it (after): **before 117 open (0 above low; 17
+> trackers; 954 closed); after 114 open (0 above low; 17 trackers; 957 closed)**. Area 03: 3 → **2** open (`SESS-050`),
+> area 06: 15 → **13** open (`EXT-078`, `EXT-084`). Nothing filed.
+>
+> **Closed, with the observable effect:** an extension can append entries at the end of a turn or before
+> a run settles, and ask for one more provider request there (`EXT-078`, pi `turn_end` boundary +
+> `agent_before_settle`); a `before_agent_start` handler edits the prompt's options — adds or replaces a
+> section, changes the tool selection — and the next handler and the model see the result (`EXT-084`);
+> extensions are told when a compaction fails or is cancelled (`SESS-050`).
+>
+> **Ported without a ledger row** (both read at v1.1.0 and found absent; recorded here so the trace is
+> not only the PR): pi commit `36a686ee8` (#10549) — assistant and tool-result messages carry
+> `durationMs`, `tool_execution_end` carries it, the render context has it, the TUI's "Took" reads the
+> recorded value, and durable task records carry `startedAt`/`endedAt` (carried, never stamped, per
+> ADR-0029); and `AgentSettledEvent.aborted`.
+>
+> **Extension world:** `cyrup:ext` 0.18 → **0.19** (one bump for the whole batch): `on-tool-execution-end`
+> gains `duration-ms`, `on-agent-settled` gains `aborted`, `on-turn-end` is re-signed to pi's boundary
+> event, `on-session-compact-failed` and `on-agent-before-settle` are new, and `ctx-state` gains
+> `render-system-prompt` and `preview-boundary`. Both `world.wit` copies are byte-identical.
+>
+> **Every new test was red-proved** against a neutered implementation: 31 cases for the timings,
+> `aborted` and `SESS-050`; 15 for `EXT-084`; 20 for `EXT-078`; 8 on the guest tier. One gap the
+> neutering found (an abort during `agent_before_settle` was covered only by the run latch) has its own
+> test.
 
 # UPDATE 2026-10-08 (intercom, pi-intercom v0.16.1) — area 11 emptied: `ICOM-071`, `073`, `075`, `076`, `078`, `079`, `080`, `081` closed; `ICOM-083`…`ICOM-086` filed and closed
 
@@ -166,36 +339,6 @@ next work item**.
 > * **The intercom suite needs `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` unset in this container** —
 >   `support::env::no_ambient_provider_credentials` refuses ambient keys, by design. Environment, not code;
 >   noted so the next run does not read it as a regression.
-
-# UPDATE 2026-10-09 (pi v1.1.0 extension event surface) — `EXT-078`, `EXT-084` and `SESS-050` closed; pi's timings commit and `agent_settled.aborted` ported
-
-> Upstream read at pi `v1.1.0` through git objects only (`git -C tmp/pi show v1.1.0:<path>`). The count is
-> whatever `python3 -I docs/gap-analysis/scripts/count_open_items.py` prints, measured on `main` at
-> `5a2c8d9` (before) and on this branch rebased onto it (after): **before 117 open (0 above low; 17
-> trackers; 954 closed); after 114 open (0 above low; 17 trackers; 957 closed)**. Area 03: 3 → **2** open (`SESS-050`),
-> area 06: 15 → **13** open (`EXT-078`, `EXT-084`). Nothing filed.
->
-> **Closed, with the observable effect:** an extension can append entries at the end of a turn or before
-> a run settles, and ask for one more provider request there (`EXT-078`, pi `turn_end` boundary +
-> `agent_before_settle`); a `before_agent_start` handler edits the prompt's options — adds or replaces a
-> section, changes the tool selection — and the next handler and the model see the result (`EXT-084`);
-> extensions are told when a compaction fails or is cancelled (`SESS-050`).
->
-> **Ported without a ledger row** (both read at v1.1.0 and found absent; recorded here so the trace is
-> not only the PR): pi commit `36a686ee8` (#10549) — assistant and tool-result messages carry
-> `durationMs`, `tool_execution_end` carries it, the render context has it, the TUI's "Took" reads the
-> recorded value, and durable task records carry `startedAt`/`endedAt` (carried, never stamped, per
-> ADR-0029); and `AgentSettledEvent.aborted`.
->
-> **Extension world:** `cyrup:ext` 0.18 → **0.19** (one bump for the whole batch): `on-tool-execution-end`
-> gains `duration-ms`, `on-agent-settled` gains `aborted`, `on-turn-end` is re-signed to pi's boundary
-> event, `on-session-compact-failed` and `on-agent-before-settle` are new, and `ctx-state` gains
-> `render-system-prompt` and `preview-boundary`. Both `world.wit` copies are byte-identical.
->
-> **Every new test was red-proved** against a neutered implementation: 31 cases for the timings,
-> `aborted` and `SESS-050`; 15 for `EXT-084`; 20 for `EXT-078`; 8 on the guest tier. One gap the
-> neutering found (an abort during `agent_before_settle` was covered only by the run latch) has its own
-> test.
 
 ---
 
