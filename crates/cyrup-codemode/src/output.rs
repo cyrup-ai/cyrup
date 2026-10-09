@@ -1,6 +1,7 @@
 //! The script output budget, its truncation, the temp-file spill and the saved images (pi
 //! `packages/coding-agent/src/extensions/codemode/execute.ts:232-300` @v1.0.1, CODE-012; the saved
-//! images and the file mode are `d677d0ee7` @v1.0.3, CODE-019).
+//! images and the file mode are `d677d0ee7` @v1.0.3, CODE-019; the item layout,
+//! [`format_output`] and [`join_adjacent_text`], is `eb326d265` @v1.1.0, CODE-021).
 //!
 //! The budget is an *estimate*: [`CHARS_PER_TOKEN`] characters per token over the text's UTF-16
 //! length, which is `execute.ts`' own `CHARS_PER_TOKEN = 4` (`:235`). Upstream does not use a
@@ -116,7 +117,7 @@ pub fn plan_truncation(items: Vec<OutputItem>, max_tokens: u64) -> OutputPlan {
     let texts: Vec<&str> = items
         .iter()
         .filter_map(|item| match item {
-            OutputItem::Text(text) => Some(text.as_str()),
+            OutputItem::Text(text) | OutputItem::Console(text) => Some(text.as_str()),
             OutputItem::Image { .. } => None,
         })
         .collect();
@@ -158,6 +159,66 @@ pub fn plan_truncation(items: Vec<OutputItem>, max_tokens: u64) -> OutputPlan {
         full_text: combined,
         images,
     })
+}
+
+/// Lay out the script's output so the model can tell items apart (`formatOutput`,
+/// `execute.ts:262-281` @v1.1.0, pi `eb326d265`): providers join adjacent text blocks with a
+/// newline or with nothing. With more than one text item (`text()` or the returned value), each
+/// starts with a `==> text N/M <==` line. [`OutputItem::Console`] lines follow all other output in
+/// one `<console_output>` text item. Images keep their place.
+#[must_use]
+pub fn format_output(output: Vec<OutputItem>) -> Vec<OutputItem> {
+    let total = output
+        .iter()
+        .filter(|item| matches!(item, OutputItem::Text(_)))
+        .count();
+    let mut items = Vec::with_capacity(output.len() + 1);
+    let mut console_lines = Vec::new();
+    let mut index = 0;
+    for item in output {
+        match item {
+            OutputItem::Image { .. } => items.push(item),
+            OutputItem::Console(line) => console_lines.push(line),
+            OutputItem::Text(text) => {
+                index += 1;
+                items.push(OutputItem::Text(if total > 1 {
+                    format!("==> text {index}/{total} <==\n{text}")
+                } else {
+                    text
+                }));
+            }
+        }
+    }
+    if !console_lines.is_empty() {
+        items.push(OutputItem::Text(format!(
+            "<console_output>\n{}\n</console_output>",
+            console_lines.join("\n")
+        )));
+    }
+    items
+}
+
+/// Join adjacent text items into one, each part starting on its own line (`joinAdjacentText`,
+/// `execute.ts:284-296` @v1.1.0). A part that already ends in a newline, or is empty, gets no
+/// separator.
+#[must_use]
+pub fn join_adjacent_text(items: Vec<OutputItem>) -> Vec<OutputItem> {
+    let mut joined: Vec<OutputItem> = Vec::with_capacity(items.len());
+    for item in items {
+        match (joined.last_mut(), item) {
+            (
+                Some(OutputItem::Text(last) | OutputItem::Console(last)),
+                OutputItem::Text(text) | OutputItem::Console(text),
+            ) => {
+                if !last.is_empty() && !last.ends_with('\n') {
+                    last.push('\n');
+                }
+                last.push_str(&text);
+            }
+            (_, item) => joined.push(item),
+        }
+    }
+    joined
 }
 
 /// [`plan_truncation`], saving the full text with `spill` when the output is over budget

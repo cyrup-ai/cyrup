@@ -147,7 +147,7 @@ async fn a_script_calls_tools_and_returns_a_value() {
     assert!(header(&result).starts_with("Script completed\nWall time "));
     assert_eq!(
         body(&result),
-        "files 2\n{\"a\":\"echo: one\",\"names\":[\"echo\",\"stats\"]}"
+        "{\"a\":\"echo: one\",\"names\":[\"echo\",\"stats\"]}\n<console_output>\nfiles 2\n</console_output>"
     );
     assert_eq!(
         details(&result)
@@ -167,13 +167,33 @@ async fn a_script_calls_tools_and_returns_a_value() {
     );
 }
 
+/// Upstream `marks where each text item starts and puts console lines last in one text block`
+/// (pi `eb326d265`, `agent-session-codemode.test.ts:396-418` @v1.1.0): providers join adjacent text
+/// blocks with nothing or a newline, so the output reaches the model as one block after the header.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn each_text_item_is_marked_and_console_lines_come_last_in_one_block() {
+    let tool = tool_over(&host());
+    let result = run(
+        &tool,
+        "text(\"one\\ntwo\");\nconsole.log(\"a\");\nconsole.log(\"b\");\ntext(\"three\\n\");\nreturn 4;",
+    )
+    .await;
+
+    assert!(!result.is_error, "{}", body(&result));
+    assert_eq!(result.content.len(), 2, "{:?}", result.content);
+    assert_eq!(
+        body(&result),
+        "==> text 1/3 <==\none\ntwo\n==> text 2/3 <==\nthree\n==> text 3/3 <==\n4\n<console_output>\na\nb\n</console_output>"
+    );
+}
+
 /// Upstream `reports script failures as results that keep partial output and the calls that ran`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_throwing_script_keeps_its_output_and_names_the_calls_that_ran() {
     let tool = tool_over(&host());
     let result = run(
         &tool,
-        "text('partial');\nawait tools.echo({ text: 'x' });\nthrow new Error('boom');",
+        "text('partial');\nconsole.log('log');\nawait tools.echo({ text: 'x' });\nthrow new Error('boom');",
     )
     .await;
 
@@ -181,10 +201,12 @@ async fn a_throwing_script_keeps_its_output_and_names_the_calls_that_ran() {
     assert!(header(&result).starts_with("Script failed\n"));
     let body = body(&result);
     assert!(
-        body.starts_with("partial\nScript error:\nError: boom\n"),
+        body.starts_with(
+            "partial\n<console_output>\nlog\n</console_output>\nScript error:\nError: boom\n"
+        ),
         "{body}"
     );
-    assert!(body.contains("codemode.js:3"), "{body}");
+    assert!(body.contains("codemode.js:4"), "{body}");
     assert!(body.contains("Tool calls made before the failure (they are not undone): echo (ok)"));
 }
 

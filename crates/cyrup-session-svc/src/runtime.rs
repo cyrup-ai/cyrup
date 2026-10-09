@@ -860,8 +860,15 @@ impl AgentSessionRuntime {
             None => SessionTarget::New,
         };
         let cwd = current.services().cwd.clone();
+        // pi `previousDefaultTools`, read before the settings reload (`agent-session.ts:3672`
+        // @v1.1.0). The rebuilt session starts from its transcript's loadout (or, unpersisted, from
+        // the setting itself), so the names the reloaded setting newly adds are activated on it
+        // before `session_start{reload}`, as pi's `_buildRuntime` does with `addedDefaultTools`.
+        let previous_default_tools = current.reload_default_tools();
         drop(current);
         let next = self.factory.build(target, Some(cwd)).await?.into_shared();
+        next.activate_added_default_tools(&previous_default_tools)
+            .await;
         self.install_inner(next, "reload", previous, before_start)
             .await;
         Ok(())

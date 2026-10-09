@@ -28,6 +28,8 @@ pub struct ReadTool {
     cwd: PathBuf,
     opts: ReadOpts,
     params: serde_json::Value,
+    /// Pi's `readOutputSchema` (`read.ts:33-36` @v1.1.0).
+    output_schema: serde_json::Value,
 }
 
 impl ReadTool {
@@ -46,12 +48,57 @@ impl ReadTool {
                 "limit": { "type": "number", "description": "Maximum number of lines to read" }
             }
         });
+        // `readOutputSchema` as TypeBox 1.3.27 emits it (read.ts:27-36 @v1.1.0): the text, or the
+        // image block codemode's `image()` accepts with the note that goes with it. `Type.Literal`
+        // emits `type` beside `const`, and upstream leaves out property descriptions on purpose so
+        // the declared type stays on one line.
+        let output_schema = serde_json::json!({
+            "anyOf": [
+                { "type": "string" },
+                {
+                    "type": "object",
+                    "required": ["type", "data", "mimeType", "note"],
+                    "properties": {
+                        "type": { "type": "string", "const": "image" },
+                        "data": { "type": "string" },
+                        "mimeType": { "type": "string" },
+                        "note": { "type": "string" }
+                    }
+                }
+            ]
+        });
         Self {
             fs,
             cwd,
             opts,
             params,
+            output_schema,
         }
+    }
+}
+
+/// Pi's `toReadOutput` (`read.ts:72-77` @v1.1.0): the first text block's text, or `""`; with an
+/// image block, that block and the text as its `note`.
+fn to_read_output(content: &[Content]) -> serde_json::Value {
+    let text = content
+        .iter()
+        .find_map(|block| match block {
+            Content::Text { text, .. } => Some(text.to_string()),
+            _ => None,
+        })
+        .unwrap_or_default();
+    let image = content.iter().find_map(|block| match block {
+        Content::Image { data, mime_type } => Some((data, mime_type)),
+        _ => None,
+    });
+    match image {
+        Some((data, mime_type)) => serde_json::json!({
+            "type": "image",
+            "data": data,
+            "mimeType": mime_type,
+            "note": text,
+        }),
+        None => serde_json::Value::String(text),
     }
 }
 
@@ -78,6 +125,12 @@ impl Tool for ReadTool {
         &self.params
     }
 
+    /// TOOL-058 — `outputSchema: readOutputSchema` (`read.ts:100` @v1.1.0), so a codemode script's
+    /// `tools.read` resolves to the text, or to an image block its `image()` shows.
+    fn output_schema(&self) -> Option<&serde_json::Value> {
+        Some(&self.output_schema)
+    }
+
     // Verbatim from Pi (read.ts:212-214). DEFAULT_MAX_LINES=2000, DEFAULT_MAX_BYTES/1024=50.
     fn description(&self) -> &str {
         "Read the contents of a file. Supports text files and images (jpg, png, gif, webp, bmp). \
@@ -100,12 +153,28 @@ impl Tool for ReadTool {
         crate::tools::prefer_strict_tool_sampling()
     }
 
+    /// TOOL-058 — pi's `.then((result) => ({ ...result, structuredContent: toReadOutput(result.content) }))`
+    /// (`read.ts:216` @v1.1.0): EVERY resolved read carries the structured half, whichever branch
+    /// produced it, and a failure rejects before it exists.
     async fn execute(
         &self,
         _call_id: ToolCallId,
         params: serde_json::Value,
         cancel: CancelToken,
         _on_update: ToolUpdateSink,
+    ) -> Result<ToolResult, ToolError> {
+        let mut result = self.read_file(params, cancel).await?;
+        result.structured_content = Some(to_read_output(&result.content));
+        Ok(result)
+    }
+}
+
+impl ReadTool {
+    /// The read itself; [`Tool::execute`] adds the structured half to whatever this resolves.
+    async fn read_file(
+        &self,
+        params: serde_json::Value,
+        cancel: CancelToken,
     ) -> Result<ToolResult, ToolError> {
         // Pi's FIRST statement inside the promise body (read.ts:232-235), ahead of
         // `resolveReadPathAsync` and ahead of any argument handling — Pi never validates tool
@@ -324,9 +393,7 @@ impl Tool for ReadTool {
             ..Default::default()
         })
     }
-}
 
-impl ReadTool {
     /// Faithful port of Pi's image read path (read.ts:247-263). The model-facing note is
     /// `Read image file [<mime>]` plus any processing hints, and — for non-vision models — the
     /// image block is STILL returned together with a warning note (Pi keeps the block; the request

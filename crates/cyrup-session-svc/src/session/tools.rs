@@ -188,6 +188,56 @@ impl AgentSession {
         self.push_active_tools(loadout, prompt).await;
     }
 
+    /// pi `reload`'s `getDefaultTools()` (`agent-session.ts:3665-3671` @v1.1.0): the resolved
+    /// `defaultTools` setting, or pi's four defaults when it is unset, for a session whose initial
+    /// tools came from it; nothing for one started with `tools` or `noTools`.
+    pub(crate) fn reload_default_tools(&self) -> Vec<String> {
+        if !self.services.uses_default_tools {
+            return Vec::new();
+        }
+        self.services
+            .settings
+            .effective()
+            .default_tools()
+            .unwrap_or_else(|| {
+                cyrup_config::DEFAULT_TOOL_NAMES
+                    .iter()
+                    .map(|name| (*name).to_owned())
+                    .collect()
+            })
+    }
+
+    /// pi `reload`'s activation of the tools newly added to `defaultTools`
+    /// (`agent-session.ts:3672-3685` @v1.1.0): the names this session's setting resolves to that
+    /// `previous` (the setting before the reload) did not, appended to the active set. A name the
+    /// setting dropped stays active, and a tool disabled during the session stays disabled unless
+    /// the setting newly adds it. An added name must be allowed (pi `_isAllowedTool`) and, as at
+    /// build time, declarable (`activate_default_extension_tools`); an unknown one is ignored.
+    pub(crate) async fn activate_added_default_tools(&self, previous: &[String]) {
+        let mut names = self.active_tool_names();
+        let mut changed = false;
+        for name in self.reload_default_tools() {
+            if previous.contains(&name) || names.contains(&name) {
+                continue;
+            }
+            let allowed = crate::tools::is_allowed_tool(
+                self.services.allowed_tool_names.as_ref(),
+                &self.services.excluded_tool_names,
+                &name,
+            );
+            let declarable = self
+                .tool_definition(&name)
+                .is_some_and(|tool| tool.exposure.declarable());
+            if allowed && declarable {
+                names.push(name);
+                changed = true;
+            }
+        }
+        if changed {
+            self.set_active_tools_by_name(&names).await;
+        }
+    }
+
     /// Restore the loadout the session's transcript now declares (pi `_restoreToolsFromTranscript`,
     /// `agent-session.ts:1762-1769` @v1.0.1), after `/tree` navigation has changed which branch the
     /// transcript is. `context` is the navigated branch's raw projection.

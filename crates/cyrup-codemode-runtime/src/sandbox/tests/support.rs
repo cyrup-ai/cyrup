@@ -153,6 +153,11 @@ pub fn text(text: &str) -> OutputItem {
     OutputItem::Text(text.to_owned())
 }
 
+/// A `console.*` line (pi's text item with `console: true`).
+pub fn console(text: &str) -> OutputItem {
+    OutputItem::Console(text.to_owned())
+}
+
 pub fn image(data: &str, mime_type: &str) -> OutputItem {
     OutputItem::Image {
         data: data.to_owned(),

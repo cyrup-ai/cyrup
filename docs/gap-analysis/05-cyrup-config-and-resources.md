@@ -2,6 +2,27 @@
 
 Covers `cyrup/crates/cyrup-config` (settings, auth store, trust, model resolution, config values, login) and `cyrup/crates/cyrup-resources` (packages, discovery, skills/prompts/themes), plus the launch-path glue in `cyrup/crates/cyrup/src/main.rs`, `migrations.rs`, `cli.rs` and `cyrup-session-svc/src/builder.rs` that consumes them. Measured against `pi/packages/coding-agent/src/core/{settings-manager,model-resolver,model-runtime,models-store,model-config,auth-storage,trust-manager,project-trust,package-manager,provider-composer,resource-loader,prompt-templates,skills,slash-commands,keybindings,resolve-config-value}.ts`, `src/{config,migrations,main}.ts`, `src/utils/paths.ts` and `modes/interactive/theme/theme.ts` — read at the explicit tags **v0.83.0** (the ported baseline) and **v0.84.1** (the latest tag *at the time of that reading*; the latest tag is now **v0.85.1** — see the provenance block below) rather than a floating HEAD.
 
+> ### CLOSURES 2026-10-09 — `CFG-108` and `CFG-109` filed and closed (`defaultTools` names extension tools; `/reload` activates newly added names)
+>
+> From the end-to-end run of the pi v1.1.0 built-in tools pass (area 04's CLOSURES block of the same date), on
+> `claude/zealous-bell-x0u1h0` rebased onto `77daee4` (#210, the pi v1.1.0 drift triage, whose PIN block follows);
+> not yet committed. Upstream read at pi **v1.1.0** through git objects. **Renumbered on that rebase:** the first
+> row was filed as `CFG-103`, which #210 had allocated to the keybinding row, so it is **`CFG-108`**; `CFG-109` is
+> new. #210's `CFG-103`…`CFG-107` are unrelated and stay open. Related, still open: `SEAM-148` (#210, medium) —
+> `--tools +codemode` is not parsed as a modifier list; neither row here changes that, and pi's
+> `defaultToolModifiers` half of the reload rule waits on it.
+>
+> - `CFG-108` — `"defaultTools": ["+codemode"]` started a session without `codemode`: the setting selected
+>   built-ins only. `activate_default_extension_tools` (`crates/cyrup-session-svc/src/builder.rs:488`, called at
+>   `:2065`) appends the registered, declarable extension tools it names.
+> - `CFG-109` — `/reload` never re-read `defaultTools`: a persisted session resumed its transcript's loadout, so
+>   a name added to the setting stayed off. pi `db6cc71dc` (v0.99.2~7, #10245; `core/agent-session.ts:3660-3685`
+>   @v1.1.0) activates the names the reloaded setting newly adds. Ported on top of `CFG-108`'s rule.
+>
+> Gates (`CARGO_INCREMENTAL=0`) on the rebased tree: see `00-residual-ledger.md`'s 2026-10-09 update.
+> **Counted set after this block (`count_open_items.py`): 9 low open, 86 closed** (was 9 low open, 84 closed on
+> `main` @ `77daee4`).
+
 > ### PIN 2026-10-09 — pi v1.1.0 drift triage: cyrup `6b14575` × pi **`f1b2e77f5`** (= `v1.1.0-11-gf1b2e77f5`)
 >
 > **Window read:** pi `v1.0.1..f1b2e77f5` (= `v1.1.0-11-gf1b2e77f5`), `git log --no-merges` over the core-runtime
@@ -617,7 +638,7 @@ above opened nothing, closed nothing and re-severitied nothing.
 
 ## Open items
 
-> **Next free id: `CFG-108`** (2026-10-09, the pi v1.1.0 drift triage filed `CFG-103`…`CFG-107`; before that `CFG-103`, 2026-10-03, after the post-pin triage filed `CFG-102`; before that 2026-10-02, after the pi v1.0.0 pass filed `CFG-096`…`CFG-101`; `CFG-095` was never allocated and is still free).
+> **Next free id: `CFG-110`** (2026-10-09, after the end-to-end run of the pi v1.1.0 tools pass, rebased onto #210, filed and closed `CFG-108` (filed as `CFG-103`, renumbered) and `CFG-109`; before that `CFG-108`, 2026-10-09, the pi v1.1.0 drift triage filed `CFG-103`…`CFG-107`; before that `CFG-103`, 2026-10-03, after the post-pin triage filed `CFG-102`; before that 2026-10-02, after the pi v1.0.0 pass filed `CFG-096`…`CFG-101`; `CFG-095` was never allocated and is still free).
 
 > **This table carries a trailing `Dedup` column (added 2026-10-02).** It holds
 > `duplicate-of: <ID>` for a row whose finding another area owns, exactly as area 12's does, and
@@ -914,6 +935,8 @@ above opened nothing, closed nothing and re-severitied nothing.
 | CFG-105 | low | upstream-drift | S | **`models.json` `contextWindow`/`maxTokens` ≤ 0 is now a whole-file schema error in pi, overrides included; cyrup rejects only the defining provider and clamps overrides to 0** **Filed 2026-10-09 from the pi v1.1.0 drift triage**; body below. |  |
 | CFG-106 | low | not-ported | L | **pi ships JSON Schemas for `settings.json`, `models.json`, `keybindings.json` and themes; cyrup publishes none, so editors get no completion or validation for cyrup config files** **Filed 2026-10-09 from the pi v1.1.0 drift triage**; body below. |  |
 | CFG-107 | low | upstream-drift | S | **Clipboard text paste reads nothing on Termux (Ctrl+V text fallback and right-click paste), and a failed copy there shows no Termux:API hint: cyrup's clipboard read has no `termux-clipboard-get`, and its hint is gated on `os == "linux"`, where Termux reports `android`** **Filed 2026-10-09 from the pi v1.1.0 drift triage**; body below. |  |
+| ~~CFG-108~~ | ~~low~~ **CLOSED 2026-10-09** | parity-bug | S | **`"defaultTools": ["+codemode"]` starts a session without `codemode`** — the setting only selected built-ins (`select_active_tools`), and an extension tool started active only when registration activates it, which `codemode` (`defaultActive: false`) never does. pi seeds `_refreshToolRegistry` with `initialActiveToolNames`, the resolved `defaultTools` when neither `tools` nor `noTools` is given (`sdk.ts:282-294` @v1.1.0), and keeps every allowed name whatever `defaultActive` (`agent-session.ts:3566-3568`); its docs give `["+codemode"]` as the way to turn codemode on (`docs/cli.md:164`, `docs/mcp.md:230`), and so do cyrup's (`docs/codemode.md`, `docs/guide/reference/settings.md:112`). CFG-097's selector test used `+grep`, a built-in, so it never saw this. Found by the real binary: the request's `tools` were `read bash edit write big_dump mcp ask_user_question`, no `codemode`; `--tools …,codemode` worked. **FILED AND CLOSED 2026-10-09** (filed as `CFG-103`; renumbered on the rebase onto #210, whose `CFG-103` is the keybinding row): `crates/cyrup-session-svc/src/builder.rs:488` `activate_default_extension_tools` (called at `:2065`) appends each registered, declarable extension tool the setting names to the active set the build starts from (skipped under `tools`/`noTools`; `excludeTools` already narrowed the registry). Declarable only, the rule `--tools` follows here, so a `codemode`/`deferred`/`hidden` tool is never declared. After: the same run's `tools` end in `codemode`. Not covered here: `/reload` did not re-read `defaultTools` at all (pi enables newly added names there) — filed and closed as `CFG-109`. `--tools +codemode` is `SEAM-148` (open). Verify: `cyrup-session-svc` `builder::tests::the_default_tools_setting_activates_the_extension_tools_it_names` (red with the append removed). |  |
+| ~~CFG-109~~ | ~~low~~ **CLOSED 2026-10-09** | upstream-drift | S | **`/reload` never re-reads `defaultTools`, so a tool newly added to the setting stays off until a new session** — pi `db6cc71dc` (v0.99.2~7, #10245, *"enable tools newly added to defaultTools on reload"*): when the initial tools came from the setting (`usesDefaultTools`, `sdk.ts:472` @v1.1.0: no plain `tools` list and no `noTools`), `reload` reads the resolved setting before (`previousDefaultTools`, `core/agent-session.ts:3665-3672`) and after the settings reload, and rebuilds with `[...getActiveToolNames(), ...addedDefaultTools]` (`:3677-3685`). Removed names stay active, and a tool turned off during the session stays off unless the setting newly adds it (`docs/settings.md:56`). cyrup's `AgentSessionRuntime::reload` rebuilds the session through the factory; a persisted session resumes the loadout its transcript declares (`builder.rs:2117-2133`), so the new setting never reached the active set. Found by the end-to-end run of the pi v1.1.0 tools pass (`CFG-108`'s run); `CFG-097`'s body had recorded the rule and left it unfiled as a reload-contract boundary. **FILED AND CLOSED 2026-10-09:** `AgentSessionServices::uses_default_tools` (`crates/cyrup-session-svc/src/services.rs:168`, set at `builder.rs:2730`) is pi's `_usesDefaultTools`; `AgentSession::reload_default_tools` (`session/tools.rs:194`) is `reload`'s `getDefaultTools()` (the resolved setting, or pi's four defaults when unset; nothing without `usesDefaultTools`); `runtime.rs:867` reads it from the outgoing session before the rebuild and `:870` hands it to `activate_added_default_tools` (`session/tools.rs:216`) on the rebuilt one, before `session_start{reload}`. That appends each newly added name that is allowed (`_isAllowedTool`) and, as for `CFG-108`, declarable. **[CYRUP-DELTA] scope:** pi's `defaultToolModifiers` (`--tools +x` entries re-applied to the reloaded setting) has no cyrup counterpart until `SEAM-148` lands; an unpersisted session is still rebuilt fresh from the setting (its active set is not carried, as before). Verify: `cyrup-session-svc` `tests::reload_default_tools::reload_activates_the_tools_newly_added_to_default_tools` (a persisted session, `edit` turned off, then `["+grep", "+codemode"]`: `grep` and `codemode` come on, `edit` stays off; dropping `+grep` leaves it on; red without the `runtime.rs` call: the active set stays `bash, read, write`) and `::reload_keeps_explicit_tool_options` (`tools`, `noTools: builtin` and `excludeTools`; mirrors `test/default-tools-setting.test.ts:269-290` @v1.1.0). The first test mirrors `:241-256`, with `codemode` as the inactive extension tool. |  |
 
 ## CFG-081 — `retry.maxAgentDelayMs` is not modelled, so agent-level retry backoff is uncapped
 
@@ -2812,7 +2835,7 @@ part of this row: pi carries it with a `usesDefaultTools` flag (`core/sdk.ts:448
 (`crates/cyrup-session-svc/src/runtime.rs:847-867`) rebuilds the session through
 `self.factory.build(..)` from a fixed `base_config`, re-deriving the active set from settings. That
 difference predates v1.0.0 and is a boundary of this row rather than part of it: it is recorded here and
-not filed, because it is `cyrup-session-svc`'s reload contract (area 08) and not a `defaultTools` gap.
+not filed, because it is `cyrup-session-svc`'s reload contract (area 08) and not a `defaultTools` gap. *(2026-10-09: filed and closed as `CFG-109`, from the end-to-end run of the pi v1.1.0 tools pass.)*
 
 **Verify** — table-driven tests on `default_tools()`: `["+codemode"]` → the four defaults plus `codemode`;
 `["read","+grep","-read"]` → `["grep"]` (order matters); `[]` → `[]`; `["+"]` → the four defaults unchanged

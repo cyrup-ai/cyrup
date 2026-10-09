@@ -161,6 +161,11 @@ pub struct AgentSessionServices {
     /// pi `AgentSession._excludedToolNames` (`agent-session.ts:360`, bound at `:396`; `sdk.ts:259`).
     /// Applied on both paths alongside [`Self::allowed_tool_names`].
     pub excluded_tool_names: std::collections::HashSet<String>,
+    /// pi `AgentSession._usesDefaultTools` (`agent-session.ts:270-273`, set from `sdk.ts:472`
+    /// @v1.1.0): the initial tools came from the `defaultTools` setting, because neither `tools`
+    /// nor `noTools` was given. Only then does a reload activate the names the setting newly adds
+    /// ([`crate::AgentSessionRuntime::reload`]).
+    pub uses_default_tools: bool,
     /// The shared model-registry sink bound to `ext_host` (Pi `bindCore`): guest-registered providers
     /// realized as concrete `Provider`s. The session UNIONs their catalogs into the model registry and
     /// installs the owning provider on a matching `set_model` (arch-08 §5.6). Empty until a guest

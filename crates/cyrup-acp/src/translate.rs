@@ -922,8 +922,9 @@ fn edit_old_texts(args: &Value) -> Vec<String> {
 /// **What differs.** Step 3 upstream is a stdout/stderr/exitCode ladder assembled as `stdout`,
 /// `stderr:\n…`, `exit code: n` and joined with `\n\n`. It is **dead against every cyrup built-in**:
 /// the result shape is `result_value_of`'s `{content, details?, usage?, addedToolNames?,
-/// terminate?}` (`crates/cyrup-agent/src/agent/message.rs`), which is the one place that object is
-/// built, and no cyrup tool puts `stdout`/`stderr`/`exitCode` at either level. Upstream's own
+/// structuredContent?, isError?, terminate?}` (`crates/cyrup-agent/src/agent/message.rs`), which is
+/// the one place that object is built, and no cyrup tool puts `stdout`/`stderr`/`exitCode` at
+/// either level (bash's `structuredContent` is pi's `{output, exit_code, …}`). Upstream's own
 /// `JSON.stringify` fallback (`String(result)` on a circular-reference throw) is cut too:
 /// `serde_json::to_string_pretty` on a `Value` cannot fail.
 ///
@@ -1010,15 +1011,13 @@ fn bash_result_text(result: &Value) -> String {
 /// (b) stays refused: it would turn a human-readable diagnostic into an API, so a copy-edit of
 /// that sentence becomes a wire regression.
 ///
-/// (c) needed one thing the unit did not name. A non-zero exit is an `Err(ToolError)` from
-/// `crates/cyrup-tools/src/tools/bash.rs`, and `ToolError` carried only a message — so the failing
-/// path had no `details` object for a new field to ride on, and `Executed::from`
-/// (`crates/cyrup-agent/src/agent/run/tools/finalize.rs`) built pi's
-/// `createErrorToolResult` shape, `{content:[text], details:{}}`. `ToolError::details` closes
-/// that: it is `None` for every tool that does not opt in — so `{}` is still what a throwing tool
-/// produces, exactly as upstream — and the bash tool's non-zero-exit arm now sets
-/// `BashDetails { exit_code: Some(code), .. }`. `details.exitCode` is the first key this probes,
-/// so `sh -c 'exit 42'` reports 42.
+/// (c) once needed one thing the unit did not name: a non-zero exit was an `Err(ToolError)`, which
+/// carried only a message, so `ToolError::details` was added for the field to ride on. Since
+/// TOOL-054 the shell tool follows pi v1.1.0 instead (`bash.ts:400-407`): a non-zero exit RESOLVES
+/// as an `isError` result that keeps its `details` and `structuredContent`, and its `details` are
+/// `BashDetails { exit_code: Some(code), .. }`. The `details` object this function reads is the
+/// same either way, and `details.exitCode` is the first key it probes, so `sh -c 'exit 42'`
+/// reports 42.
 ///
 /// # [CYRUP-DELTA] — three of the four probe keys are unreachable, and are kept anyway
 ///
@@ -2132,11 +2131,11 @@ mod tests {
     /// The `details.exitCode` row is the one that goes green the day `BashDetails` grows the field.
     #[test]
     fn the_exit_code_probe_is_upstreams_and_its_fallback_is_the_known_gap() {
-        // The `sh -c 'exit 42'` shape, as it now reaches this function: `ToolError::details`
-        // carries `BashDetails { exit_code: Some(42), .. }` through `Executed::from` into
-        // `ToolResult.details`, and `details.exitCode` is the first key probed. This is the
-        // assertion the gap analysis says to write knowing it fails — it passes now, and it fails
-        // again the moment either `BashDetails::exit_code` or `ToolError::details` is dropped.
+        // The `sh -c 'exit 42'` shape, as it now reaches this function: the shell tool's
+        // `isError` result carries `BashDetails { exit_code: Some(42), .. }` as its `details`, and
+        // `details.exitCode` is the first key probed. This is the assertion the gap analysis says
+        // to write knowing it fails — it passes now, and it fails again the moment
+        // `BashDetails::exit_code` is dropped.
         let failed_command = json!({
             "content": [{ "type": "text", "text": "boom\n\nCommand exited with code 42" }],
             "details": { "exitCode": 42 },

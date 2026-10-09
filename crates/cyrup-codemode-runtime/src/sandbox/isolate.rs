@@ -94,7 +94,8 @@ fn op_codemode_call(
     );
 }
 
-/// `bridge("output", "text", text)` and `bridge("output", "image", data, mimeType)`.
+/// `bridge("output", "text", text)`, `bridge("output", "console", text)` and
+/// `bridge("output", "image", data, mimeType)` (`worker.ts:80-85` @v1.1.0).
 #[op2(fast)]
 fn op_codemode_output(
     state: &mut OpState,
@@ -102,10 +103,10 @@ fn op_codemode_output(
     #[string] data: String,
     #[string] mime_type: String,
 ) {
-    let item = if kind == "image" {
-        OutputItem::Image { data, mime_type }
-    } else {
-        OutputItem::Text(data)
+    let item = match kind {
+        "image" => OutputItem::Image { data, mime_type },
+        "console" => OutputItem::Console(data),
+        _ => OutputItem::Text(data),
     };
     post(state, WorkerMessage::Output(item));
 }

@@ -1,7 +1,8 @@
 //! DRIFT-041 — the HTML session export is pi's templated document, not a text dump.
 //!
-//! Upstream: pi `v0.84.4` `packages/coding-agent/src/core/export-html/` (`index.ts` 316 lines,
-//! `template.js` 1864, `template.css` 1066, `template.html` 55, plus the two vendored libraries).
+//! Upstream: pi `packages/coding-agent/src/core/export-html/` — `index.ts` @v0.84.4 (316 lines,
+//! unchanged through v1.1.0) and the shipped assets @v1.1.0 (`template.js` 1918, `template.css`
+//! 1076, `template.html` 55, plus the two vendored libraries).
 //! `generateHtml` (`index.ts:143-175`) base64-encodes a `SessionData{header, entries, leafId, …}`
 //! payload into `<script id="session-data">` and substitutes five placeholders into
 //! `template.html`, while `template.css`'s own four carry the ACTIVE theme's colours
@@ -73,8 +74,8 @@ fn builtin(json: &str) -> Theme {
 
 /// pi's template scaffold reaches the reader: the sidebar with its search box and five filters
 /// (`template.html:12-40`), the image modal, and BOTH vendored libraries that `template.js`
-/// depends on (`marked.parse` at `:1641`, `hljs.highlight` at `:857`/`:1618`). Every one of the
-/// nine `{{…}}` placeholders must be gone.
+/// depends on (`marked.parse` at `:1672`, `hljs.highlight` at `:862`/`:1649` @v1.1.0). Every one
+/// of the nine `{{…}}` placeholders must be gone.
 #[test]
 fn document_carries_the_template_and_both_vendored_libraries() {
     let html = session_jsonl_to_html(FIXTURE);
@@ -306,8 +307,8 @@ fn export_to_html_passes_the_live_session_state_to_the_renderer() {
 /// `this.state` (`agent-session.ts:3439`) — it is the only entry point `/export`, `/share` and RPC
 /// `export_html` have. The byte-identical `template.js` this crate ships renders a collapsible
 /// **System Prompt** block and an **Available Tools** list from exactly those two keys
-/// (`:1403-1452`, destructured at `:15`), so without them every exported document was missing two
-/// visible sections.
+/// (`:1428-1475` @v1.1.0, destructured at `:15`), so without them every exported document was
+/// missing two visible sections.
 ///
 /// RED before the fix: `session_data` inserted `header`, `entries` and `leafId` only, so both
 /// lookups were `Value::Null`.
@@ -341,13 +342,13 @@ fn a_live_export_carries_the_system_prompt_and_the_active_tools() {
 
     assert_eq!(
         data["systemPrompt"], "You are cyrup.\nBe brief.",
-        "`systemPrompt: state?.systemPrompt` (`index.ts:267`) — `template.js:1404` renders the \
+        "`systemPrompt: state?.systemPrompt` (`index.ts:267`) — `template.js:1428` renders the \
          System Prompt block from it"
     );
 
     let tools = data["tools"]
         .as_array()
-        .expect("`tools` must be an array — `template.js:1425` reads `tools.length`");
+        .expect("`tools` must be an array — `template.js:1448` reads `tools.length`");
     assert_eq!(tools.len(), 2);
     assert_eq!(tools[0]["name"], "bash");
     assert_eq!(tools[0]["description"], "Run a shell command");
@@ -399,7 +400,7 @@ fn the_file_only_export_omits_both_agent_keys_the_way_pi_does() {
 
 /// A live session whose tool set is EMPTY still sends `tools: []`, not nothing: pi's `state.tools`
 /// is a required array (`packages/agent/src/types.ts:341-342` @v0.84.4), so `state?.tools?.map(...)`
-/// yields `[]`. `template.js:1425`'s `tools && tools.length > 0` renders the two cases identically,
+/// yields `[]`. `template.js:1448`'s `tools && tools.length > 0` renders the two cases identically,
 /// but the payload is what this seam owes upstream.
 #[test]
 fn an_empty_live_tool_set_is_an_empty_array_not_an_absent_key() {
@@ -619,26 +620,19 @@ fn adjust_brightness_saturates_at_both_ends() {
 // Asset provenance
 // ---------------------------------------------------------------------------------------------
 
-/// The five embedded assets are byte-identical copies of pi's
-/// `packages/coding-agent/src/core/export-html/`, at the tag named per file. A local edit — a
-/// "small fix" to `template.js`, a re-minified vendor drop — fails here instead of silently
-/// forking cyrup's export from upstream's. Re-derive with
-/// `git -C tmp/pi show <tag>:packages/coding-agent/src/core/export-html/<file> | sha256sum`.
+/// The five embedded assets are whole-file, byte-identical copies of pi v1.1.0's
+/// `packages/coding-agent/src/core/export-html/` (`template.html` and `vendor/*` are unchanged since
+/// v0.84.4; `template.js` and `template.css` are identical at v1.0.0, v1.0.1 and v1.1.0). A local
+/// edit — a "small fix" to `template.js`, a re-minified vendor drop — fails here instead of
+/// silently forking cyrup's export from upstream's. Re-derive with
+/// `git -C tmp/pi show v1.1.0:packages/coding-agent/src/core/export-html/<file> | sha256sum`.
 ///
-/// **`template.js` and `template.css` are no longer whole-file copies of one tag.** `SESS-068`
-/// ported pi v1.0.0's toggle refactor into them — `setThinkingExpanded` /
-/// `setToolOutputsExpanded` as idempotent setters that also write `aria-pressed`, the two
-/// `navigateTo` reapply calls, the two header buttons' `aria-pressed` attributes and the
-/// `.header-toggle-btn[aria-pressed="true"]` rule — and each of those regions IS byte-identical
-/// to v1.0.0 (verified by region diff when the row landed). CODE-006 added v1.0.1's
-/// `renderNestedCalls` helper and its call in `renderToolCall` to `template.js`, the one region of
-/// the v1.0.1 file that renders the `nestedCalls` record of a tool result; it too is byte-identical
-/// to v1.0.1 (the same region diff). What is still missing is `SESS-069`'s
-/// hidden-message half: `setHiddenMessagesVisible`, the third header button, the `H` key, the
-/// `hook-message-hidden` rendering and `navigateTo`'s auto-reveal. So these two files sit between
-/// v0.84.4 and v1.0.0 on purpose, and the pin below is a drift detector, not a claim of identity
-/// with either tag. When `SESS-069` lands, both files should become whole-file copies of v1.0.0
-/// and these two digests should be re-derived from that tag directly.
+/// The two templates were briefly region ports: SESS-068 carried v1.0.0's toggle-setter refactor
+/// and CODE-006 v1.0.1's `renderNestedCalls` into a v0.84.4 base. SESS-069 re-vendored both files
+/// whole from v1.1.0, which absorbed those regions unchanged and brought the three upstream changes
+/// still missing: the hidden-message toggle, `466db0fec`'s `context_edit` handling in the tree
+/// sidebar, and `b2bd111f2`'s Ctrl/Alt/Meta guard on the single-key shortcuts. So this pin is a
+/// claim of identity with one tag again, not a drift detector over a hand-merged file.
 #[test]
 fn embedded_assets_match_their_pinned_upstream_bytes() {
     let pins = [
@@ -648,18 +642,14 @@ fn embedded_assets_match_their_pinned_upstream_bytes() {
             "916782b1184a9597527605ad751e2b3af30fcea23ba2194002969cd217a06881",
         ),
         (
-            // v0.84.4 + SESS-068's `.header-toggle-btn[aria-pressed="true"]` rule from v1.0.0.
             "template.css",
             include_str!("../export/assets/template.css"),
-            "4ed5d504acc41d368a87133096c9c1a7475837e68f0d24ecf2fef9457331dfa2",
+            "8ee19851f8e583277ed396cbb76496687aa556707fdfc1f78d1118bff87c740a",
         ),
         (
-            // v0.84.4 + SESS-068's v1.0.0 toggle-setter refactor + CODE-006's v1.0.1
-            // `renderNestedCalls` (the `nestedCalls` rendering, `template.js:933-947` and its one
-            // call, `:1081`); awaiting SESS-069. See above.
             "template.js",
             include_str!("../export/assets/template.js"),
-            "7cebf881657d93846ccc5613e5b1d682a78ff6149553cd26629ab2b325735df8",
+            "b5bbffdf5d9ec8bb519df45c7ff953ac1969af80e8aba33331b9f87983f91fa5",
         ),
         (
             "vendor/marked.min.js",
@@ -817,6 +807,288 @@ fn sess068_the_keyboard_shortcuts_route_through_the_setters() {
         !html.contains("toggleThinking()") && !html.contains("toggleToolOutputs()"),
         "no call site may still reach an argument-less toggler"
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// SESS-069 — a `display: false` custom message is exported behind a toggle, not dropped
+// ---------------------------------------------------------------------------------------------
+
+/// [`FIXTURE`] plus two custom messages on the active path: one the terminal shows
+/// (`display: true`) and one it hides (`display: false`), both carrying an explicit `display`
+/// because pi tests `entry.display === false` strictly and cyrup always writes the key.
+const HIDDEN_FIXTURE: &str = concat!(
+    r#"{"type":"session","version":3,"id":"0199aaaa-bbbb-7ccc-8ddd-eeeeffff0002","timestamp":"2026-09-04T10:00:00.000Z","cwd":"/home/dev/proj"}"#,
+    "\n",
+    r#"{"type":"message","id":"aaaaaaaa","parentId":null,"timestamp":"2026-09-04T10:00:01.000Z","message":{"role":"user","content":"hello"}}"#,
+    "\n",
+    r#"{"type":"custom_message","id":"bbbbbbbb","parentId":"aaaaaaaa","timestamp":"2026-09-04T10:00:02.000Z","customType":"shown_note","content":"shown in the terminal","display":true}"#,
+    "\n",
+    r#"{"type":"custom_message","id":"cccccccc","parentId":"bbbbbbbb","timestamp":"2026-09-04T10:00:03.000Z","customType":"hidden_note","content":"hidden in the terminal","display":false}"#,
+    "\n",
+);
+
+/// The hidden entry reaches the browser with its `display: false` intact — the payload is the raw
+/// JSONL, so `template.js` sees exactly what pi's sees and can decide on its own.
+#[test]
+fn sess069_hidden_custom_messages_reach_the_payload() {
+    let data = session_data(&session_jsonl_to_html(HIDDEN_FIXTURE));
+    let entries = data["entries"].as_array().unwrap();
+    let hidden: Value = serde_json::from_str(HIDDEN_FIXTURE.lines().nth(3).unwrap()).unwrap();
+    assert_eq!(
+        entries[2], hidden,
+        "the hidden entry passes through verbatim"
+    );
+    assert_eq!(entries[2]["display"], false);
+    assert_eq!(entries[1]["display"], true);
+}
+
+/// pi v1.1.0 renders EVERY custom message and marks a `display: false` one with
+/// `hook-message-hidden` plus a ` · Hidden in terminal` suffix on its type label
+/// (`template.js:1330-1336` @v1.1.0); the stylesheet hides that class unless the body carries
+/// `show-hidden-messages` (`template.css:795-797`).
+///
+/// RED before the fix: cyrup's template still had pi v0.84.4's
+/// `entry.type === 'custom_message' && entry.display` guard, so a hidden message rendered nothing
+/// at all and could not be revealed.
+#[test]
+fn sess069_the_template_renders_hidden_custom_messages_behind_a_class() {
+    let html = session_jsonl_to_html(HIDDEN_FIXTURE);
+    let render = js_body(&html, "function renderEntry(");
+    for needle in [
+        "if (entry.type === 'custom_message') {",
+        "const hidden = entry.display === false;",
+        "${hidden ? ' hook-message-hidden' : ''}",
+        "${hidden ? ' · Hidden in terminal' : ''}",
+    ] {
+        assert!(
+            render.contains(needle),
+            "SESS-069: renderEntry lost `{needle}`"
+        );
+    }
+    assert!(
+        !render.contains("custom_message' && entry.display)"),
+        "SESS-069: the v0.84.4 guard that dropped hidden messages outright must be gone"
+    );
+    let rule = html
+        .find("body:not(.show-hidden-messages) .hook-message-hidden {")
+        .expect("SESS-069: the stylesheet hides the class unless the body opts in");
+    assert!(
+        html[rule..].trim_start_matches(|c| c != '{')[1..]
+            .trim_start()
+            .starts_with("display: none;"),
+        "the hiding rule is `display: none;`"
+    );
+}
+
+/// The toggle itself: an idempotent setter that flips the body class and keeps its header button's
+/// `aria-pressed` and caption in step (`template.js:1822-1832` @v1.1.0), a third header button
+/// rendered from the live flag (`:1413`) with the help hint naming `H` (`:1409`), a click handler
+/// (`:1866-1868`) and the `H` key (`:1899-1901`) — both routed through the setter, behind the
+/// Ctrl/Alt/Meta guard (`:1888`) that keeps browser shortcuts such as Ctrl+T from also toggling.
+#[test]
+fn sess069_the_hidden_message_toggle_is_wired_to_the_header_click_and_key() {
+    let html = session_jsonl_to_html(HIDDEN_FIXTURE);
+    assert!(html.contains("let showHiddenMessages = false;"));
+    let setter = js_body(&html, "function setHiddenMessagesVisible(visible)");
+    for needle in [
+        "showHiddenMessages = visible;",
+        "document.body.classList.toggle('show-hidden-messages', visible);",
+        "document.querySelector('[data-action=\"toggle-hidden-messages\"]')",
+        "button.setAttribute('aria-pressed', String(visible));",
+        "button.textContent = visible ? 'Hide hidden messages' : 'Show hidden messages';",
+    ] {
+        assert!(
+            setter.contains(needle),
+            "SESS-069: setHiddenMessagesVisible lost `{needle}`"
+        );
+    }
+
+    let header = js_body(&html, "function renderHeader()");
+    assert!(
+        header.contains(
+            r#"data-action="toggle-hidden-messages" aria-pressed="${showHiddenMessages}""#
+        )
+    );
+    assert!(
+        header.contains("${showHiddenMessages ? 'Hide hidden messages' : 'Show hidden messages'}")
+    );
+    assert!(header.contains("T toggle thinking · O toggle tools · H toggle hidden messages"));
+
+    let handlers = js_body(&html, "const attachHeaderHandlers = () =>");
+    let click = handlers
+        .find("[data-action=\"toggle-hidden-messages\"]')?.addEventListener('click'")
+        .expect("SESS-069: the third header button has a click handler");
+    assert!(handlers[click..].contains("setHiddenMessagesVisible(!showHiddenMessages);"));
+
+    let keys = js_body(&html, "document.addEventListener('keydown', (e) =>");
+    let guard = keys
+        .find("if (e.ctrlKey || e.metaKey || e.altKey || isEditableTarget(document.activeElement))")
+        .expect("modified keys and editable targets return before any single-key shortcut");
+    let h = keys
+        .find("} else if (key === 'h') {")
+        .expect("SESS-069: `H` toggles hidden messages");
+    assert!(guard < h, "the modifier guard runs first");
+    assert!(keys[h..].contains("setHiddenMessagesVisible(!showHiddenMessages);"));
+}
+
+/// A deep link or tree click that TARGETS a hidden message reveals hidden messages first, or the
+/// navigation would scroll to an element `display: none` keeps off screen (`template.js:1521-1524`
+/// @v1.1.0). It runs before the tree and header re-render, so the rebuilt header button already
+/// reads the revealed state; a `bottom` scroll (the initial render, Escape) never reveals.
+#[test]
+fn sess069_navigating_to_a_hidden_message_reveals_hidden_messages() {
+    let html = session_jsonl_to_html(HIDDEN_FIXTURE);
+    let body = js_body(&html, "function navigateTo(");
+    let reveal = body
+        .find(
+            "if (scrollMode === 'target' && targetEntry?.type === 'custom_message' && \
+             targetEntry.display === false) {",
+        )
+        .expect("SESS-069: navigateTo reveals a hidden target");
+    assert!(body[reveal..].contains("setHiddenMessagesVisible(true);"));
+    let header = body
+        .find("document.getElementById('header-container').innerHTML = renderHeader();")
+        .expect("navigateTo still rebuilds the header");
+    let swap = body
+        .find("messagesEl.appendChild(fragment)")
+        .expect("navigateTo still swaps in the rebuilt fragment");
+    assert!(
+        reveal < header && reveal < swap,
+        "the reveal precedes the header rebuild and the swap"
+    );
+}
+
+/// The production path: a `display: false` message appended through the LIVE session
+/// ([`crate::AgentSession::append_custom_message`], the durable arm extensions reach) is in the
+/// document `/export`, `/share` and RPC `export_html` all publish
+/// ([`crate::AgentSession::export_html_document`]), with `display: false` serialized — cyrup's
+/// `CustomMessage.display` is a plain `bool` with no `skip_serializing_if`, so the strict
+/// `=== false` test in the template always sees it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sess069_a_live_hidden_custom_message_is_exported_with_display_false() {
+    use std::sync::Arc;
+
+    use cyrup_provider::Provider;
+    use cyrup_provider::faux::FauxProvider;
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    let cwd = tmp.path().join("project");
+    let agent_dir = tmp.path().join("agent");
+    std::fs::create_dir_all(&cwd).unwrap();
+    std::fs::create_dir_all(&agent_dir).unwrap();
+    let mut cfg = crate::SessionConfig::new(cwd, agent_dir);
+    cfg.trust_override = Some(true);
+    let session =
+        crate::SessionBuilder::new(Arc::new(FauxProvider::new()) as Arc<dyn Provider>, cfg)
+            .build()
+            .await
+            .unwrap()
+            .into_shared();
+
+    let shown = session
+        .append_custom_message("shown_note", Value::from("shown"), true)
+        .await
+        .unwrap();
+    let hidden = session
+        .append_custom_message("hidden_note", Value::from("hidden"), false)
+        .await
+        .unwrap();
+
+    let html = session.export_html_document().await.unwrap();
+    let data = session_data(&html);
+    let by_id = |id: &str| {
+        data["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["id"] == id)
+            .cloned()
+            .unwrap_or_else(|| panic!("entry {id} missing from the export"))
+    };
+    let hidden_entry = by_id(hidden.as_str());
+    assert_eq!(hidden_entry["type"], "custom_message");
+    assert_eq!(hidden_entry["customType"], "hidden_note");
+    assert_eq!(hidden_entry["display"], false);
+    assert_eq!(by_id(shown.as_str())["display"], true);
+    assert_eq!(data["leafId"], hidden.as_str());
+    assert!(html.contains("function setHiddenMessagesVisible(visible)"));
+}
+
+// ---------------------------------------------------------------------------------------------
+// `context_edit` in the tree sidebar (pi `466db0fec`, shipped with the v1.1.0 re-vendor)
+// ---------------------------------------------------------------------------------------------
+
+/// cyrup writes `context_edit` entries (`SessionManager::append_context_edit`, EXT-078). pi's
+/// sidebar labels one `[context omit|replace: <targetId>]` (`template.js:702-703` @v1.1.0), indexes
+/// it for search (`:360-362`) and files it under the settings filter (`:391`); the v0.84.4 template
+/// cyrup used to ship fell through to the generic `[context_edit]` label, left it out of the
+/// settings filter and made it unsearchable.
+#[test]
+fn context_edits_are_labelled_searchable_and_filtered_as_settings_in_the_tree() {
+    let html = session_jsonl_to_html(FIXTURE);
+    let label = js_body(&html, "function getTreeNodeDisplayHtml(entry, label)");
+    assert!(label.contains(
+        "case 'context_edit':\n            return labelHtml + `<span class=\"tree-muted\">[context \
+         ${entry.replacement === null ? 'omit' : 'replace'}: ${escapeHtml(entry.targetId)}]</span>`;"
+    ));
+    let search = js_body(&html, "function getSearchableText(entry, label)");
+    assert!(search.contains(
+        "parts.push('context edit', entry.replacement === null ? 'omit' : 'replace', entry.targetId);"
+    ));
+    let filter = js_body(&html, "function filterNodes(flatNodes, currentLeafId)");
+    assert!(filter.contains(
+        "['label', 'custom', 'context_edit', 'model_change', 'thinking_level_change'].includes(entry.type)"
+    ));
+}
+
+/// …and the entries cyrup's own writer produces carry exactly the keys those arms read:
+/// `targetId`, and `replacement` as an explicit `null` for an omit (never absent, which
+/// `=== null` would misread as a replace) or as `{ content }` for a replacement.
+#[test]
+fn context_edits_written_by_the_session_manager_reach_the_export_in_the_shape_the_template_reads() {
+    use cyrup_session::entry::{ContextEditReplacement, ContextEditableContent};
+    use cyrup_session::{NewSessionOpts, SessionManager};
+
+    let mut manager = SessionManager::in_memory(
+        std::path::Path::new("/home/dev/proj"),
+        NewSessionOpts::default(),
+    )
+    .unwrap();
+    let omitted = manager
+        .append_custom_message("note", Value::from("first"), true, None)
+        .unwrap();
+    let replaced = manager
+        .append_custom_message("note", Value::from("second"), false, None)
+        .unwrap();
+    let omit = manager.append_context_edit(&omitted, None).unwrap();
+    let replace = manager
+        .append_context_edit(
+            &replaced,
+            Some(ContextEditReplacement {
+                content: ContextEditableContent::Text("shorter".to_string()),
+            }),
+        )
+        .unwrap();
+    let mut buf = Vec::new();
+    manager.export_jsonl(&mut buf).unwrap();
+
+    let data = session_data(&session_jsonl_to_html(&String::from_utf8(buf).unwrap()));
+    let entries = data["entries"].as_array().unwrap();
+    let by_id = |id: &str| entries.iter().find(|e| e["id"] == id).unwrap();
+
+    let omit = by_id(omit.as_str()).as_object().unwrap();
+    assert_eq!(omit["type"], "context_edit");
+    assert_eq!(omit["targetId"], omitted.as_str());
+    assert!(
+        omit.get("replacement").is_some_and(Value::is_null),
+        "an omit is an explicit `replacement: null`, which the template's `=== null` reads as omit"
+    );
+
+    let replace = by_id(replace.as_str());
+    assert_eq!(replace["targetId"], replaced.as_str());
+    assert_eq!(replace["replacement"]["content"], "shorter");
+    // The hidden target travels with its `display: false` for SESS-069's toggle too.
+    assert_eq!(by_id(replaced.as_str())["display"], false);
 }
 
 // ---------------------------------------------------------------------------------------------

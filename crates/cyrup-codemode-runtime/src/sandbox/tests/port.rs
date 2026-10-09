@@ -105,7 +105,7 @@ mod script_execution {
         assert_eq!(
             head,
             [
-                text(r#"hello 1 {"a":1}"#),
+                console(r#"hello 1 {"a":1}"#),
                 text(r#"{"json":true}"#),
                 text("undefined"),
                 text("7"),
@@ -117,8 +117,8 @@ mod script_execution {
                 image(PNG, "image/png"),
             ]
         );
-        let OutputItem::Text(last) = last else {
-            panic!("expected text, got {last:?}");
+        let OutputItem::Console(last) = last else {
+            panic!("expected a console line, got {last:?}");
         };
         assert!(last.starts_with("Error: bad"), "{last}");
     }
@@ -285,7 +285,7 @@ mod script_execution {
             "{stack}"
         );
         assert!(!stack.contains("codemode-prelude.js"), "{stack}");
-        let OutputItem::Text(printed) = &output(&result)[0] else {
+        let OutputItem::Console(printed) = &output(&result)[0] else {
             panic!("{result:#?}");
         };
         let mut printed_lines = printed.lines();
@@ -966,7 +966,9 @@ mod limits_and_lifetime {
             let chars: usize = output(&result)
                 .iter()
                 .map(|item| match item {
-                    OutputItem::Text(text) => text.encode_utf16().count(),
+                    OutputItem::Text(text) | OutputItem::Console(text) => {
+                        text.encode_utf16().count()
+                    }
                     OutputItem::Image { data, .. } => data.encode_utf16().count(),
                 })
                 .sum();

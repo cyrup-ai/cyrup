@@ -474,6 +474,41 @@ fn select_active_tools(
         .collect()
 }
 
+/// The extension tools the `defaultTools` setting names, appended to the active set registration
+/// produced. pi seeds `_refreshToolRegistry` with `initialActiveToolNames` — the resolved
+/// `defaultTools` when neither `tools` nor `noTools` is given (`sdk.ts:282-294` @v1.1.0) — and
+/// keeps every allowed name of it whatever the tool's `defaultActive` (`agent-session.ts:3566-3568`),
+/// so a named `codemode` starts active. [`select_active_tools`] applies the setting to built-ins
+/// only, which left `"defaultTools": ["+codemode"]` without a `codemode` tool. A named tool must be
+/// declarable, the rule an explicit `tools` list follows here too: a `codemode`, `deferred` or
+/// `hidden` tool is reached through `codemode` or `tool_search`, never declared.
+///
+/// `registered` is already narrowed by `excludeTools`; with `noTools` pi's default list is empty,
+/// and an explicit `tools` list is resolved by [`select_active_tools`] and the registry filter.
+fn activate_default_extension_tools(
+    mut active: Vec<Arc<dyn cyrup_core::Tool>>,
+    registered: &[Arc<dyn cyrup_core::Tool>],
+    cfg: &SessionConfig,
+    default_tools: Option<&[String]>,
+) -> Vec<Arc<dyn cyrup_core::Tool>> {
+    let Some(names) = default_tools else {
+        return active;
+    };
+    if cfg.tools.is_some() || cfg.no_tools.is_some() {
+        return active;
+    }
+    for tool in registered {
+        let name = tool.name();
+        if names.iter().any(|n| n == name)
+            && tool.exposure().declarable()
+            && !active.iter().any(|t| t.name() == name)
+        {
+            active.push(tool.clone());
+        }
+    }
+    active
+}
+
 /// pi `sdk.ts:258`'s `allowedToolNames` —
 /// `options.tools ?? (options.noTools === "all" ? [] : undefined)` — the SESSION-level allowlist.
 ///
@@ -2025,6 +2060,14 @@ impl SessionBuilder {
             allowed_tool_names.as_ref(),
             &excluded_tool_names,
         )?;
+        // `defaultTools` names extension tools too: `"defaultTools": ["+codemode"]` is how pi's
+        // docs turn `codemode` on (`docs/mcp.md:230`, `docs/cli.md:164` @v1.1.0).
+        let active_tools = activate_default_extension_tools(
+            active_tools,
+            &registered_tools,
+            &cfg,
+            configured_default_tools.as_deref(),
+        );
         // The dynamic-tool registry (Pi `_toolRegistry`): every Availability-visible tool, the caller's
         // custom tools, AND the extension-contributed/override tools are enable-able; the active set
         // starts at the build-time selection. Including the extension tools is load-bearing: (a) the
@@ -2684,6 +2727,7 @@ impl SessionBuilder {
             ext_host,
             allowed_tool_names,
             excluded_tool_names,
+            uses_default_tools: cfg.tools.is_none() && cfg.no_tools.is_none(),
             guest_providers,
             virtual_models,
             model: resolved_model,
@@ -3717,6 +3761,69 @@ mod tests {
             "x_model_only",
         ]));
         assert_eq!(pick(&allow), names(&["x_model_only", "x_inactive"]));
+    }
+
+    /// `defaultTools` activates the extension tools it names, the way pi's `initialActiveToolNames`
+    /// does (`sdk.ts:282-294`, `agent-session.ts:3566-3568` @v1.1.0): `["+codemode"]` must start
+    /// `codemode` (`defaultActive: false`) active. A non-declarable tool stays inactive, and
+    /// `tools` / `noTools` leave the setting out of it.
+    #[test]
+    fn the_default_tools_setting_activates_the_extension_tools_it_names() {
+        use cyrup_core::ToolExposure as E;
+        let tool = |name, exposure, default_active| {
+            std::sync::Arc::new(ExposedTool {
+                name,
+                exposure,
+                default_active,
+                params: serde_json::json!({}),
+            }) as std::sync::Arc<dyn cyrup_core::Tool>
+        };
+        let registered = vec![
+            tool("read", E::Direct, true),
+            tool("x_direct", E::Direct, true),
+            tool("codemode", E::ModelOnly, false),
+            tool("x_deferred", E::Deferred, true),
+            tool("x_unnamed", E::Direct, false),
+        ];
+        let active = || vec![registered[0].clone(), registered[1].clone()];
+        let pick = |cfg: &super::SessionConfig, default_tools: Option<&[String]>| -> Vec<String> {
+            super::activate_default_extension_tools(active(), &registered, cfg, default_tools)
+                .iter()
+                .map(|t| t.name().to_string())
+                .collect()
+        };
+        let cfg = super::SessionConfig::new("/tmp", "/tmp/agent");
+        let eff = |json: &str| {
+            cyrup_config::EffectiveSettings::from_settings(
+                cyrup_config::Settings::parse(json).unwrap(),
+            )
+            .default_tools()
+        };
+
+        let plus_codemode = eff(r#"{"defaultTools":["+codemode"]}"#);
+        assert_eq!(
+            pick(&cfg, plus_codemode.as_deref()),
+            names(&["read", "x_direct", "codemode"])
+        );
+        // Unset, nothing extra; a non-declarable name and an already-active name add nothing.
+        assert_eq!(pick(&cfg, None), names(&["read", "x_direct"]));
+        assert_eq!(
+            pick(&cfg, Some(&names(&["read", "x_direct", "x_deferred"]))),
+            names(&["read", "x_direct"])
+        );
+
+        let mut allow = super::SessionConfig::new("/tmp", "/tmp/agent");
+        allow.tools = Some(names(&["read"]));
+        assert_eq!(
+            pick(&allow, plus_codemode.as_deref()),
+            names(&["read", "x_direct"])
+        );
+        let mut no_builtin = super::SessionConfig::new("/tmp", "/tmp/agent");
+        no_builtin.no_tools = Some(super::NoTools::Builtin);
+        assert_eq!(
+            pick(&no_builtin, plus_codemode.as_deref()),
+            names(&["read", "x_direct"])
+        );
     }
 
     #[test]

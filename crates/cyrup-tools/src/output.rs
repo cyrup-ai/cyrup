@@ -9,7 +9,7 @@
 
 use crate::ops::local::unique_suffix;
 use std::borrow::Cow;
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 /// Output can carry private data, so only the user may read the files (pi `OUTPUT_FILE_MODE`,
@@ -38,6 +38,49 @@ pub fn create_output_file(path: &Path) -> std::io::Result<std::fs::File> {
 /// `U+FEFF` encoded as UTF-8 — the byte-order mark `TextDecoder` removes at the head of a stream
 /// when `ignoreBOM` is false (its default, output-accumulator.ts:40).
 const UTF8_BOM: [u8; 3] = [0xEF, 0xBB, 0xBF];
+
+/// The complete output, for callers that can take more than the display snapshot (pi `FullOutput`,
+/// `output-accumulator.ts:18-22` @v1.1.0).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FullOutput {
+    pub content: String,
+    /// Whether `content` omits part of the output.
+    pub truncated: bool,
+}
+
+/// `new TextDecoder().decode(bytes, { stream })` over a standalone buffer: one leading BOM is
+/// removed, each invalid subsequence becomes U+FFFD, and an incomplete trailing sequence is
+/// dropped when `stream` is set (held for a next call that never comes) or becomes one U+FFFD
+/// when it is not. Rust's lossy decoding and the WHATWG decoder agree on maximal-subpart
+/// replacement, so only the BOM and the held-back tail need handling here.
+fn text_decode(bytes: &[u8], stream: bool) -> String {
+    let bytes = bytes.strip_prefix(&UTF8_BOM[..]).unwrap_or(bytes);
+    if !stream {
+        return String::from_utf8_lossy(bytes).into_owned();
+    }
+    let mut out = String::with_capacity(bytes.len());
+    let mut rest = bytes;
+    loop {
+        match std::str::from_utf8(rest) {
+            Ok(s) => {
+                out.push_str(s);
+                return out;
+            }
+            Err(e) => {
+                let (valid, after) = rest.split_at(e.valid_up_to());
+                out.push_str(&String::from_utf8_lossy(valid));
+                match e.error_len() {
+                    Some(bad) => {
+                        out.push('\u{FFFD}');
+                        rest = after.get(bad..).unwrap_or_default();
+                    }
+                    // A valid prefix of a sequence that the buffer cut off.
+                    None => return out,
+                }
+            }
+        }
+    }
+}
 
 /// Stream-head BOM filter, mirroring `TextDecoder`'s default `ignoreBOM: false`
 /// (output-accumulator.ts:40,70).
@@ -86,6 +129,14 @@ pub struct OutputAccumulator {
     bom: BomFilter,
     temp_path: Option<PathBuf>,
     temp_file: Option<std::fs::File>,
+    /// The first failure to create or write the spill file; [`Self::take_spill_error`] hands it to
+    /// the caller, so the tool fails instead of returning an output it silently lost.
+    /// [CYRUP-DELTA] pi attaches its stream's `error` listener only inside `closeTempFile`
+    /// (output-accumulator.ts:121-142 @v1.1.0; `createOutputFileStream` adds none), so it rejects
+    /// only for a failure seen after `end()`; one raised mid-run is an uncaught stream `error` that
+    /// leaves `closeTempFile` unsettled. cyrup always takes pi's rejecting outcome. Once set, the
+    /// spill is not retried and later chunks go nowhere, like pi's errored stream.
+    spill_error: Option<(PathBuf, std::io::Error)>,
     prefix: &'static str,
 }
 
@@ -107,6 +158,7 @@ impl OutputAccumulator {
             bom: BomFilter::Matching(0),
             temp_path: None,
             temp_file: None,
+            spill_error: None,
             prefix,
         }
     }
@@ -239,18 +291,60 @@ impl OutputAccumulator {
 
     /// Open the temp file (if not already open) and replay any buffered chunks into it.
     fn ensure_temp_replay(&mut self) {
-        if self.temp_file.is_some() {
+        if self.temp_file.is_some() || self.spill_error.is_some() {
             return;
         }
         let name = format!("{}-{}.log", self.prefix, unique_suffix());
         let path = std::env::temp_dir().join(name);
-        if let Ok(mut file) = create_output_file(&path) {
-            for chunk in self.raw_chunks.drain(..) {
-                let _ = file.write_all(&chunk);
+        match create_output_file(&path) {
+            Ok(file) => {
+                self.temp_file = Some(file);
+                self.temp_path = Some(path);
+                for chunk in std::mem::take(&mut self.raw_chunks) {
+                    self.write_spill(&chunk);
+                }
             }
-            self.temp_file = Some(file);
-            self.temp_path = Some(path);
+            Err(e) => {
+                // Pi's `rawChunks = []` after the replay (output-accumulator.ts:255 @v1.1.0): the
+                // buffered output goes to the failed stream and is gone either way.
+                self.raw_chunks.clear();
+                self.spill_error = Some((path, e));
+            }
         }
+    }
+
+    /// Write to the open spill file, recording the first failure (see [`Self::spill_error`]).
+    fn write_spill(&mut self, chunk: &[u8]) {
+        let Some(file) = self.temp_file.as_mut() else {
+            return;
+        };
+        if let Err(e) = file.write_all(chunk)
+            && let Some(path) = self.temp_path.clone()
+        {
+            self.temp_file = None;
+            self.spill_error = Some((path, e));
+        }
+    }
+
+    /// Flush the spill file, recording a failure like [`Self::write_spill`].
+    fn flush_spill(&mut self) {
+        if let Some(file) = self.temp_file.as_mut()
+            && let Err(e) = file.flush()
+            && let Some(path) = self.temp_path.clone()
+        {
+            self.temp_file = None;
+            self.spill_error = Some((path, e));
+        }
+    }
+
+    /// The failure that cost the spill file part of the output, if any, as the `"{path}: {error}"`
+    /// message the tool fails with: pi's outcome when `closeTempFile` rejects with the stream's
+    /// error and `finishOutput` propagates it out of `execute` (output-accumulator.ts:121-142
+    /// @v1.1.0). See [`Self::spill_error`] for the [CYRUP-DELTA] in when that happens.
+    pub fn take_spill_error(&mut self) -> Option<String> {
+        self.spill_error
+            .take()
+            .map(|(path, e)| format!("{}: {e}", path.display()))
     }
 
     /// Append a raw chunk (called from the `ProcOps::exec` data callback).
@@ -288,9 +382,7 @@ impl OutputAccumulator {
         // ORIGINAL chunk, BOM included — Pi writes the raw `Buffer` (:74-77).
         if self.temp_file.is_some() || self.should_use_temp_file() {
             self.ensure_temp_replay();
-            if let Some(file) = self.temp_file.as_mut() {
-                let _ = file.write_all(chunk);
-            }
+            self.write_spill(chunk);
         } else {
             self.raw_chunks.push(chunk.to_vec());
         }
@@ -338,9 +430,7 @@ impl OutputAccumulator {
             return None;
         }
         self.ensure_temp_replay();
-        if let Some(file) = self.temp_file.as_mut() {
-            let _ = file.flush();
-        }
+        self.flush_spill();
         self.temp_path.clone()
     }
 
@@ -360,11 +450,59 @@ impl OutputAccumulator {
         }
         // Truncated: make sure the full output is on disk (it should already be, but be safe).
         self.ensure_temp_replay();
-        if let Some(file) = self.temp_file.as_mut() {
-            let _ = file.flush();
-        }
+        self.flush_spill();
         self.temp_file = None;
         self.temp_path.clone()
+    }
+
+    /// The complete output, for callers that can take more than the display snapshot (pi
+    /// `readFullOutput`, output-accumulator.ts:144-176 @v1.1.0). Call after [`Self::finalize`].
+    /// Output longer than `max_bytes` raw bytes keeps its first and last `max_bytes / 2` bytes
+    /// around an omission marker.
+    ///
+    /// Without a spill file the buffered chunks are the whole output, and pi decodes them all
+    /// whatever their size. With one, the cut points land on character boundaries: the head is a
+    /// streaming decode that holds back an incomplete trailing sequence, and the tail skips leading
+    /// continuation bytes.
+    ///
+    /// # Errors
+    ///
+    /// The spill file could not be opened or read.
+    pub fn read_full_output(&self, max_bytes: usize) -> std::io::Result<FullOutput> {
+        let Some(path) = &self.temp_path else {
+            return Ok(FullOutput {
+                content: text_decode(&self.raw_chunks.concat(), false),
+                truncated: false,
+            });
+        };
+        let mut file = std::fs::File::open(path)?;
+        let size = usize::try_from(file.metadata()?.len()).unwrap_or(usize::MAX);
+        if size <= max_bytes {
+            let mut all = Vec::with_capacity(size);
+            file.read_to_end(&mut all)?;
+            return Ok(FullOutput {
+                content: text_decode(&all, false),
+                truncated: false,
+            });
+        }
+        let head_bytes = max_bytes / 2;
+        let tail_bytes = max_bytes - head_bytes;
+        let mut head = vec![0; head_bytes];
+        file.read_exact(&mut head)?;
+        let mut tail = vec![0; tail_bytes];
+        file.seek(SeekFrom::Start((size - tail_bytes) as u64))?;
+        file.read_exact(&mut tail)?;
+        let head_text = text_decode(&head, true);
+        let tail_start = tail
+            .iter()
+            .position(|b| b & 0xC0 != 0x80)
+            .unwrap_or(tail.len());
+        let tail_text = text_decode(tail.get(tail_start..).unwrap_or_default(), false);
+        let omitted = size - head_bytes - tail_bytes;
+        Ok(FullOutput {
+            content: format!("{head_text}\n\n[... {omitted} bytes omitted ...]\n\n{tail_text}"),
+            truncated: true,
+        })
     }
 }
 
@@ -714,6 +852,136 @@ mod tests {
             "finalize's internal finish is also a no-op"
         );
         assert_eq!(acc.total_bytes(), 3);
+    }
+
+    /// Spill `bytes` and finalize, so `read_full_output` reads them back from the temp file.
+    fn spilled(bytes: &[u8]) -> (OutputAccumulator, PathBuf) {
+        let mut acc = OutputAccumulator::new("cyrup-test-full", 2000, 16);
+        acc.append(bytes);
+        let path = acc.finalize(2000, 16).unwrap();
+        (acc, path)
+    }
+
+    /// TOOL-054 — pi `readFullOutput` (output-accumulator.ts:144-176 @v1.1.0): over the limit, the
+    /// first `floor(max / 2)` and the last `max - floor(max / 2)` raw bytes around a marker that
+    /// counts the bytes in between.
+    #[test]
+    fn full_output_keeps_head_and_tail_around_an_omission_marker() {
+        let size = 3 * 1024 * 1024;
+        let bytes: Vec<u8> = (0..size).map(|i| b'a' + (i % 26) as u8).collect();
+        let (acc, path) = spilled(&bytes);
+        let full = acc.read_full_output(1024 * 1024).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(full.truncated);
+        let half = 512 * 1024;
+        let expected = format!(
+            "{}\n\n[... {} bytes omitted ...]\n\n{}",
+            std::str::from_utf8(&bytes[..half]).unwrap(),
+            size - 1024 * 1024,
+            std::str::from_utf8(&bytes[size - half..]).unwrap(),
+        );
+        assert_eq!(full.content, expected);
+
+        // An odd budget gives the extra byte to the tail.
+        let (acc, path) = spilled(b"0123456789abcdefghij");
+        let full = acc.read_full_output(5).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(full.content, "01\n\n[... 15 bytes omitted ...]\n\nhij");
+    }
+
+    /// The cut never splits a character: the head holds back an incomplete trailing sequence and
+    /// the tail skips leading continuation bytes, at every phase of a multi-byte stream.
+    #[test]
+    fn full_output_cuts_on_character_boundaries() {
+        for unit in ["é", "€", "😀"] {
+            for pad in 0..4 {
+                let mut text = "x".repeat(pad);
+                text.push_str(&unit.repeat(40));
+                let (acc, path) = spilled(text.as_bytes());
+                let full = acc.read_full_output(21).unwrap();
+                let _ = std::fs::remove_file(&path);
+                assert!(full.truncated);
+                assert!(
+                    !full.content.contains('\u{FFFD}'),
+                    "{unit} pad {pad}: {:?}",
+                    full.content
+                );
+                let (head, tail) = full.content.split_once("\n\n[... ").unwrap();
+                assert!(text.starts_with(head), "{unit} pad {pad}");
+                let tail = tail.split_once("...]\n\n").unwrap().1;
+                assert!(text.ends_with(tail), "{unit} pad {pad}");
+                assert!(
+                    head.len() <= 10 && head.len() > 10 - unit.len(),
+                    "{unit} pad {pad}"
+                );
+                assert!(
+                    tail.len() <= 11 && tail.len() > 11 - unit.len(),
+                    "{unit} pad {pad}"
+                );
+            }
+        }
+    }
+
+    /// Without a spill file the buffered chunks are the whole output, decoded like `TextDecoder`:
+    /// the leading BOM goes, an invalid byte becomes U+FFFD, and nothing is cut.
+    #[test]
+    fn full_output_without_a_spill_is_the_whole_decoded_output() {
+        let mut acc = OutputAccumulator::new("cyrup-test-full", 2000, 1024);
+        acc.append(b"\xEF\xBB\xBFone\n");
+        acc.append(b"two \xFF\n");
+        assert!(acc.finalize(2000, 1024).is_none());
+        let full = acc.read_full_output(4).unwrap();
+        assert_eq!(
+            full,
+            FullOutput {
+                content: "one\ntwo \u{FFFD}\n".to_owned(),
+                truncated: false,
+            }
+        );
+
+        // A spill under the budget is read whole, with its BOM removed the same way.
+        let (acc, path) = spilled(b"\xEF\xBB\xBF0123456789abcdefghij");
+        let full = acc.read_full_output(1024).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(!full.truncated);
+        assert_eq!(full.content, "0123456789abcdefghij");
+    }
+
+    /// A spill file that cannot be created loses the output pi's stream would also lose, and the
+    /// failure is reported instead of the loss passing silently (pi's rejecting `closeTempFile`,
+    /// output-accumulator.ts:121-142 @v1.1.0; [CYRUP-DELTA] in that cyrup reports it every time).
+    #[test]
+    fn a_spill_file_that_cannot_be_created_is_reported() {
+        let mut acc = OutputAccumulator::new("cyrup-missing-dir/cyrup-test", 2000, 16);
+        acc.append(b"0123456789");
+        acc.append(b"abcdefghij");
+        assert!(acc.finalize(2000, 16).is_none());
+        let message = acc.take_spill_error().unwrap();
+        assert!(message.contains("cyrup-missing-dir"), "{message}");
+        assert!(acc.take_spill_error().is_none(), "taken once");
+    }
+
+    /// A spill file that was created but then refuses a write is reported the same way, and the
+    /// spill stops there: later chunks are not written to it.
+    #[test]
+    fn a_spill_write_that_fails_is_reported() {
+        let mut acc = OutputAccumulator::new("cyrup-test-write-fail", 2000, 16);
+        acc.append(b"0123456789");
+        acc.append(b"abcdefghij");
+        let path = acc.temp_path.clone().unwrap();
+        // Swap the writable handle for a read-only one so the next write fails with EBADF.
+        acc.temp_file = Some(std::fs::File::open(&path).unwrap());
+        acc.append(b"klmnopqrst");
+        assert!(acc.temp_file.is_none(), "a failed write closes the spill");
+        acc.append(b"uvwxyz");
+        let message = acc.take_spill_error().unwrap();
+        assert!(
+            message.starts_with(&format!("{}: ", path.display())),
+            "{message}"
+        );
+        let kept = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(kept, "0123456789abcdefghij");
     }
 
     #[test]

@@ -1,12 +1,14 @@
 # Vendored libraries — HTML session export
 
 These two files are copied **byte-for-byte** from pi `v0.84.4`
-(`packages/coding-agent/src/core/export-html/vendor/`) and are embedded verbatim into every
-exported transcript by `crates/cyrup-session-svc/src/export/mod.rs`, exactly as pi's
+(`packages/coding-agent/src/core/export-html/vendor/`); pi `v1.1.0` ships the same bytes, so they
+are also exact copies of the revision the sibling `template.*` files are taken from. They are
+embedded verbatim into every exported transcript by `crates/cyrup-session-svc/src/export/mod.rs`,
+exactly as pi's
 `generateHtml` does (`export-html/index.ts:148-149`, `:173-174`). They are the two runtime
 dependencies of the shipped `assets/template.js`: `marked.parse` renders assistant markdown
-(`template.js:1557-1641`) and `hljs.highlight` colours code blocks (`template.js:857`, `:866`,
-`:1616-1630`). An export must open with no network, so they are inlined rather than linked.
+(`template.js:1588-1672` @v1.1.0) and `hljs.highlight` colours code blocks (`template.js:862`,
+`:871`, `:1647-1661`). An export must open with no network, so they are inlined rather than linked.
 
 They are **not** compiled, executed or otherwise reachable from cyrup itself — they are opaque
 payload bytes in the generated document, run only by the browser a user opens the export in.

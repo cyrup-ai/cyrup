@@ -33,6 +33,23 @@ struct BashInput {
 /// Pi's `MAX_TIMEOUT_MS` (bash.ts:24): the 32-bit `setTimeout` ceiling.
 const MAX_TIMEOUT_MS: f64 = 2_147_483_647.0;
 
+/// Output limit of `structuredContent.output`, which programmatic callers such as codemode scripts
+/// receive (pi `STRUCTURED_OUTPUT_MAX_BYTES`, `bash.ts:23-24` @v1.1.0).
+const STRUCTURED_OUTPUT_MAX_BYTES: usize = 1024 * 1024;
+
+/// Pi's `Math.round(ms / 100) / 10` (`bash.ts:389` @v1.1.0): seconds to one decimal, rounding half
+/// up like `Math.round`. A whole value is an integer JSON number, as `JSON.stringify` prints it
+/// (`0`, never `0.0`).
+fn wall_time_seconds(elapsed: Duration) -> serde_json::Value {
+    let tenths = (elapsed.as_secs_f64() * 10.0 + 0.5).floor();
+    if tenths % 10.0 == 0.0 {
+        // Integral and non-negative, so the cast is exact.
+        serde_json::Value::from((tenths / 10.0) as u64)
+    } else {
+        serde_json::Value::from(tenths / 10.0)
+    }
+}
+
 /// Port of Pi's `resolveTimeoutMs` (bash.ts:27-38), called at the top of `exec` (bash.ts:85). The
 /// input is a count of SECONDS. `None` stays `None` (no default timeout). A non-finite or
 /// non-positive value throws Pi's exact `"Invalid timeout: must be a finite number of seconds"`;
@@ -113,6 +130,9 @@ pub struct ShellTool {
     cwd: PathBuf,
     opts: BashOpts,
     params: serde_json::Value,
+    /// Pi's `bashOutputSchema` (`bash.ts:52-62` @v1.1.0), declared by the shared factory
+    /// (`bash.ts:259`), so `powershell` declares it too.
+    output_schema: serde_json::Value,
     /// `Execute a ${config.shellName} command …` (bash.ts:350) — interpolated, so it must be owned.
     description: String,
 }
@@ -141,6 +161,19 @@ impl ShellTool {
                 "timeout": { "type": "number", "description": "Timeout in seconds (optional, no default timeout)" }
             }
         });
+        // `bashOutputSchema` as TypeBox emits it (bash.ts:52-62 @v1.1.0): `full_output_path` is
+        // the one `Type.Optional`, so it is the one property missing from `required`.
+        let output_schema = serde_json::json!({
+            "type": "object",
+            "required": ["output", "truncated", "exit_code", "wall_time_seconds"],
+            "properties": {
+                "output": { "type": "string", "description": "Combined stdout and stderr, possibly truncated" },
+                "truncated": { "type": "boolean" },
+                "full_output_path": { "type": "string", "description": "Full output, when truncated" },
+                "exit_code": { "type": "number" },
+                "wall_time_seconds": { "type": "number" }
+            }
+        });
         // bash.ts:350 verbatim, with `${config.shellName}`, `${DEFAULT_MAX_LINES}` and
         // `${DEFAULT_MAX_BYTES / 1024}` interpolated. The two limits are Pi's MODULE constants, not
         // the per-call `opts` — upstream interpolates the constants even though its own truncation
@@ -159,6 +192,7 @@ impl ShellTool {
             cwd,
             opts,
             params,
+            output_schema,
             description,
         }
     }
@@ -182,6 +216,13 @@ impl Tool for ShellTool {
     }
     fn parameters(&self) -> &serde_json::Value {
         &self.params
+    }
+
+    /// TOOL-054 — `outputSchema: bashOutputSchema` (`bash.ts:259` @v1.1.0). Every result that
+    /// reaches an exit code carries the matching `structured_content`, the non-zero ones included,
+    /// so a codemode script resolves to `{ output, exit_code, … }` where the model sees an error.
+    fn output_schema(&self) -> Option<&serde_json::Value> {
+        Some(&self.output_schema)
     }
 
     // Verbatim from Pi (bash.ts:350), interpolated per config at construction.
@@ -376,6 +417,10 @@ impl Tool for ShellTool {
             details: None,
             terminate: TerminateHint::Unspecified,
         });
+
+        // Pi's `startedAt = performance.now()` (bash.ts:359 @v1.1.0), taken just before `ops.exec`,
+        // which is where the timeout, abort and shell checks below run upstream.
+        let started = std::time::Instant::now();
 
         // Pi's `resolveTimeoutMs` (bash.ts:85), called at the top of `ops.exec` right after the
         // initial `onUpdate`. An invalid value reaches Pi's catch as a plain `Error` that matches
@@ -585,7 +630,7 @@ impl Tool for ShellTool {
         // Final settlement update (ignored if the sink is already settled, R-03-040). Pi sends the
         // footer-less preview content here with the same `details` shape it sends mid-stream.
         sink(ToolUpdate {
-            content: vec![Content::text(preview_content)],
+            content: vec![Content::text(preview_content.clone())],
             details: details.clone(),
             terminate: TerminateHint::Unspecified,
         });
@@ -597,50 +642,88 @@ impl Tool for ShellTool {
             ExitStatus::Signaled(Some(signo)) => ExitStatus::Exited(128 + signo),
             other => other,
         };
+
+        // `finishOutput` awaits `closeTempFile` right after that update (bash.ts:328-336
+        // @v1.1.0). [CYRUP-DELTA] A spill that failed always fails the call here, whatever the
+        // command did, because the output it would have kept is incomplete. pi gets there only when
+        // the stream errors after `end()`; an earlier error is an uncaught stream `error` that
+        // leaves the call pending (see `OutputAccumulator::spill_error`). pi's error is the bare
+        // stream error; cyrup leads with the footer-less preview and how the command ended, so the
+        // model knows the command ran and is not led to re-run it.
+        if let Some(message) = acc.take_spill_error() {
+            let ended = match status {
+                ExitStatus::Exited(code) => format!("Command exited with code {code}"),
+                ExitStatus::Signaled(_) => "Command terminated without an exit code".to_string(),
+                ExitStatus::TimedOut => format!(
+                    "Command timed out after {} seconds",
+                    input.timeout.unwrap_or(0.0)
+                ),
+                ExitStatus::Killed => "Command aborted".to_string(),
+            };
+            return Err(error::invalid(append_status(
+                &append_status(&preview_content, &ended),
+                &format!("Full output could not be saved: {message}"),
+            )));
+        }
         match status {
-            // Both this arm and the failure arms go through `formatOutput`, whose `emptyText`
-            // defaults to `"(no output)"` (bash.ts:357,375).
-            ExitStatus::Exited(0) => {
-                let body = if text.is_empty() {
-                    "(no output)".to_string()
-                } else {
-                    text
-                };
-                Ok(ToolResult {
-                    content: vec![Content::text(body)],
-                    details,
-                    ..Default::default()
-                })
-            }
-            // Non-zero exit: `formatOutput(snapshot)` uses the `"(no output)"` default for empty
-            // output, then `appendStatus` joins it (bash.ts:404-406).
+            // TOOL-054 — every exit code resolves (bash.ts:389-408 @v1.1.0). Both arms go through
+            // `formatOutput`, whose `emptyText` defaults to `"(no output)"` (bash.ts:338).
             ExitStatus::Exited(code) => {
                 let body = if text.is_empty() {
                     "(no output)".to_string()
                 } else {
                     text
                 };
-                // `ACP-141` — the exit code, structured, alongside the sentence rather than only
-                // inside it. `ToolError::with_details` overrides `createErrorToolResult`'s `{}`
-                // for this one tool; see that method and `BashDetails::exit_code`. `truncation`
-                // and `fullOutputPath` ride along when they were computed, so the failing row
-                // carries the same side-channel the succeeding one does.
-                let mut failure = error::invalid(append_status(
-                    &body,
-                    &format!("Command exited with code {code}"),
-                ));
-                if let Ok(payload) = serde_json::to_value(BashDetails {
-                    truncation: if truncated { Some(info) } else { None },
-                    full_output_path,
-                    exit_code: Some(code),
-                }) {
-                    failure = failure.with_details(payload);
+                let wall_time = wall_time_seconds(started.elapsed());
+                let full = acc
+                    .read_full_output(STRUCTURED_OUTPUT_MAX_BYTES)
+                    .map_err(|e| error::io(full_output_path.as_deref().unwrap_or_default(), &e))?;
+                let mut structured = serde_json::Map::new();
+                structured.insert("output".into(), full.content.into());
+                structured.insert("truncated".into(), full.truncated.into());
+                if full.truncated
+                    && let Some(path) = &full_output_path
+                {
+                    structured.insert("full_output_path".into(), path.clone().into());
                 }
-                Err(failure)
+                structured.insert("exit_code".into(), code.into());
+                structured.insert("wall_time_seconds".into(), wall_time);
+                let structured_content = Some(serde_json::Value::Object(structured));
+                if code == 0 {
+                    return Ok(ToolResult {
+                        content: vec![Content::text(body)],
+                        details,
+                        structured_content,
+                        ..Default::default()
+                    });
+                }
+                // A non-zero exit is an error result for the model that still carries
+                // `details` and `structuredContent` (bash.ts:400-407): `isError: true` on an
+                // `Ok`, not a throw, so a codemode script resolves to the exit code and output.
+                //
+                // `ACP-141` — the exit code, structured, alongside the sentence rather than only
+                // inside it: `details.exitCode`, which pi's `formatOutput` details never carry.
+                // `truncation` and `fullOutputPath` ride along when they were computed, so the
+                // failing row carries the same side-channel the succeeding one does.
+                Ok(ToolResult {
+                    content: vec![Content::text(append_status(
+                        &body,
+                        &format!("Command exited with code {code}"),
+                    ))],
+                    details: serde_json::to_value(BashDetails {
+                        truncation: if truncated { Some(info) } else { None },
+                        full_output_path,
+                        exit_code: Some(code),
+                    })
+                    .ok(),
+                    structured_content,
+                    is_error: true,
+                    ..Default::default()
+                })
             }
             // No exit code and no signal number (`Signaled(Some)` became `Exited` above): a guest
-            // backend's `exitCode: null`. Pi throws `Command terminated without an exit code`
-            // (`bash.ts:368-370` @v0.87.1).
+            // backend's `exitCode: null`. Pi still throws `Command terminated without an exit code`
+            // (`bash.ts:386-388` @v1.1.0), before any structured result exists.
             ExitStatus::Signaled(_) => {
                 let body = if text.is_empty() {
                     "(no output)".to_string()
@@ -776,7 +859,22 @@ fn flush_update(
 
 #[cfg(test)]
 mod tests {
-    use super::{BASH_CONFIG, ShellTool};
+    use super::{BASH_CONFIG, ShellTool, wall_time_seconds};
+    use std::time::Duration;
+
+    /// Pi's `Math.round(ms / 100) / 10` (`bash.ts:389` @v1.1.0): half rounds up, and a whole
+    /// second serializes like `JSON.stringify` does (`2`, never `2.0`).
+    #[test]
+    fn wall_time_is_rounded_to_tenths_like_math_round() {
+        let at = |ms| wall_time_seconds(Duration::from_millis(ms)).to_string();
+        assert_eq!(at(1250), "1.3");
+        assert_eq!(at(1249), "1.2");
+        assert_eq!(at(50), "0.1");
+        assert_eq!(at(49), "0");
+        assert_eq!(at(0), "0");
+        assert_eq!(at(1950), "2");
+        assert_eq!(at(61_234), "61.2");
+    }
     use crate::config::BashOpts;
     use crate::ops::local::LocalProc;
     use cyrup_core::{ConstrainedSampling, ConstrainedSamplingConfig, StrictSampling, Tool};

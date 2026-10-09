@@ -177,6 +177,178 @@ async fn read_missing_file_errors() {
     assert!(msg.contains("No such file or directory"), "got: {msg}");
 }
 
+// TOOL-058 — every resolved read carries `structuredContent: toReadOutput(result.content)`
+// (`read.ts:216` @v1.1.0): the model text itself for a text read, whichever branch produced it.
+// Mirrors pi `test/tools.test.ts:92` (`expect(result.structuredContent).toBe(content)`).
+#[tokio::test]
+async fn read_structured_content_is_the_text_the_model_sees() {
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = dir.path().to_path_buf();
+    std::fs::write(cwd.join("plain.txt"), "hello\nworld\n").unwrap();
+    let ten = (1..=10)
+        .map(|i| format!("line{i}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    std::fs::write(cwd.join("ten.txt"), &ten).unwrap();
+    std::fs::write(cwd.join("long.txt"), "x".repeat(200)).unwrap();
+    let run = |opts: ReadOpts, args: serde_json::Value| {
+        let read = ReadTool::new(fs(), cwd.clone(), opts);
+        async move {
+            read.execute(cid(), args, CancelToken::new(), noop_sink())
+                .await
+                .unwrap()
+        }
+    };
+
+    let plain = run(
+        ReadOpts::default(),
+        serde_json::json!({ "path": "plain.txt" }),
+    )
+    .await;
+    assert_eq!(
+        plain.structured_content,
+        Some(serde_json::json!("hello\nworld\n"))
+    );
+
+    // A truncated window carries its continuation notice, as the model text does.
+    let truncated = run(
+        ReadOpts {
+            max_lines: 3,
+            ..ReadOpts::default()
+        },
+        serde_json::json!({ "path": "ten.txt" }),
+    )
+    .await;
+    let text = first_text(&truncated);
+    assert!(text.contains("Use offset=4 to continue."), "got: {text}");
+    assert_eq!(
+        truncated.structured_content,
+        Some(serde_json::Value::String(text))
+    );
+
+    // A user-limited window and its "more lines" notice.
+    let limited = run(
+        ReadOpts::default(),
+        serde_json::json!({ "path": "ten.txt", "offset": 2, "limit": 3 }),
+    )
+    .await;
+    let text = first_text(&limited);
+    assert!(text.contains("more lines in file"), "got: {text}");
+    assert_eq!(
+        limited.structured_content,
+        Some(serde_json::Value::String(text))
+    );
+
+    // The first-line-exceeds note.
+    let note = run(
+        ReadOpts {
+            max_bytes: 50,
+            ..ReadOpts::default()
+        },
+        serde_json::json!({ "path": "long.txt" }),
+    )
+    .await;
+    let text = first_text(&note);
+    assert!(text.starts_with("[Line 1 is "), "got: {text}");
+    assert_eq!(
+        note.structured_content,
+        Some(serde_json::Value::String(text))
+    );
+}
+
+// TOOL-058 — `readOutputSchema` as TypeBox 1.3.27 emits it (read.ts:27-36 @v1.1.0), checked
+// against the typebox package's own output: `Type.Literal("image")` is `{type, const}`.
+#[test]
+fn read_declares_pi_read_output_schema() {
+    let read = ReadTool::new(fs(), PathBuf::from("."), ReadOpts::default());
+    assert_eq!(
+        read.output_schema(),
+        Some(&serde_json::json!({
+            "anyOf": [
+                { "type": "string" },
+                {
+                    "type": "object",
+                    "required": ["type", "data", "mimeType", "note"],
+                    "properties": {
+                        "type": { "type": "string", "const": "image" },
+                        "data": { "type": "string" },
+                        "mimeType": { "type": "string" },
+                        "note": { "type": "string" }
+                    }
+                }
+            ]
+        }))
+    );
+}
+
+// TOOL-058 — mirrors pi `test/tools.test.ts:205-227` @v1.1.0: a PNG detected by its magic bytes
+// behind a `.txt` name resolves to the image block with the full text as its `note`
+// (issue #10251).
+#[cfg(feature = "inline-images")]
+#[tokio::test]
+async fn read_image_structured_content_is_the_image_block_and_its_note() {
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = dir.path().to_path_buf();
+    let img = image::RgbaImage::from_pixel(2, 2, image::Rgba([10, 20, 30, 255]));
+    img.save_with_format(cwd.join("image.txt"), image::ImageFormat::Png)
+        .unwrap();
+    let read = ReadTool::new(fs(), cwd, ReadOpts::default());
+    let r = read
+        .execute(
+            cid(),
+            serde_json::json!({ "path": "image.txt" }),
+            CancelToken::new(),
+            noop_sink(),
+        )
+        .await
+        .unwrap();
+    let text = first_text(&r);
+    assert!(text.contains("Read image file [image/png]"), "got: {text}");
+    let data = r
+        .content
+        .iter()
+        .find_map(|c| match c {
+            Content::Image { data, mime_type } if mime_type == "image/png" => Some(data.clone()),
+            _ => None,
+        })
+        .expect("image block");
+    assert!(!data.is_empty());
+    assert_eq!(
+        r.structured_content,
+        Some(serde_json::json!({
+            "type": "image",
+            "data": data,
+            "mimeType": "image/png",
+            "note": text,
+        }))
+    );
+
+    // An image the model cannot see still resolves to the block: the note says it is omitted.
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = dir.path().to_path_buf();
+    img.save(cwd.join("pic.png")).unwrap();
+    let read = ReadTool::new(
+        fs(),
+        cwd,
+        ReadOpts {
+            supports_images: false,
+            ..ReadOpts::default()
+        },
+    );
+    let r = read
+        .execute(
+            cid(),
+            serde_json::json!({ "path": "pic.png" }),
+            CancelToken::new(),
+            noop_sink(),
+        )
+        .await
+        .unwrap();
+    let structured = r.structured_content.as_ref().unwrap();
+    assert_eq!(structured["type"], "image");
+    assert_eq!(structured["note"], first_text(&r).as_str());
+}
+
 // ---------------------------------------------------------------- A-03-2 image
 
 // Pi (read.ts:246-263) STILL returns the image block for a non-vision model — together with the
@@ -684,11 +856,13 @@ async fn bash_streams_and_exit_zero() {
     assert!(count.load(Ordering::SeqCst) >= 1, "expected >=1 update");
 }
 
+/// TOOL-054 — a non-zero exit RESOLVES as an error result (bash.ts:400-407 @v1.1.0); it no longer
+/// throws, so `details` and `structuredContent` survive for programmatic callers.
 #[tokio::test]
-async fn bash_nonzero_exit_throws_with_output() {
+async fn bash_nonzero_exit_is_an_error_result_with_output() {
     let dir = tempfile::tempdir().unwrap();
     let bash = bash_tool(dir.path().to_path_buf(), BashOpts::default());
-    let err = bash
+    let r = bash
         .execute(
             cid(),
             serde_json::json!({ "command": "echo boom; exit 3" }),
@@ -696,10 +870,17 @@ async fn bash_nonzero_exit_throws_with_output() {
             noop_sink(),
         )
         .await
-        .unwrap_err();
-    let msg = err.to_string();
-    assert!(msg.contains("boom"), "output included: {msg}");
-    assert!(msg.contains("exited with code 3"), "got: {msg}");
+        .unwrap();
+    assert!(
+        r.is_error,
+        "a non-zero exit is an error result for the model"
+    );
+    assert_eq!(first_text(&r), "boom\n\n\nCommand exited with code 3");
+    let structured = r
+        .structured_content
+        .expect("structuredContent on the error result");
+    assert_eq!(structured["output"], "boom\n");
+    assert_eq!(structured["exit_code"], 3);
 }
 
 #[tokio::test]
@@ -769,6 +950,55 @@ async fn bash_truncation_spills_to_temp_file() {
         .expect("full output path");
     let full = std::fs::read_to_string(path).unwrap();
     assert!(full.contains("line1\n") && full.contains("line200"));
+}
+
+// TOOL-059 — a spill file that cannot be created fails the call with the spill error, and the
+// check runs ahead of the exit-code match, so a failing command fails the same way instead of
+// resolving as an `is_error` result with incomplete output. The error still carries the preview
+// and the exit code.
+#[tokio::test]
+async fn bash_fails_when_the_spill_file_cannot_be_created() {
+    static MISSING_DIR_CONFIG: crate::tools::ShellToolConfig = crate::tools::ShellToolConfig {
+        temp_file_prefix: "cyrup-missing-dir/cyrup-bash",
+        ..crate::tools::BASH_CONFIG
+    };
+    assert!(
+        !std::env::temp_dir().join("cyrup-missing-dir").exists(),
+        "the spill directory must not exist for this test"
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let bash = ShellTool::new(
+        &MISSING_DIR_CONFIG,
+        proc(),
+        dir.path().to_path_buf(),
+        BashOpts::default(),
+    );
+    for (command, code) in [("seq 1 3000", 0), ("seq 1 3000; exit 3", 3)] {
+        let err = bash
+            .execute(
+                cid(),
+                serde_json::json!({ "command": command }),
+                CancelToken::new(),
+                noop_sink(),
+            )
+            .await
+            .expect_err(command)
+            .to_string();
+        // The preview (no `Full output:` footer naming the broken file) and how the command
+        // ended come first, so the model knows it ran; the spill failure closes the message.
+        assert!(
+            err.contains("\n3000\n\nCommand exited with code "),
+            "{command}: {err}"
+        );
+        assert!(
+            err.contains(&format!(
+                "Command exited with code {code}\n\nFull output could not be saved: "
+            )),
+            "{command}: {err}"
+        );
+        assert!(err.contains("cyrup-missing-dir"), "{command}: {err}");
+        assert!(!err.contains("Full output: "), "{command}: {err}");
+    }
 }
 
 // ---------------------------------------------------------------- A-03-6 / A-03-9
@@ -1999,7 +2229,7 @@ async fn read_image_oversized_is_resized_with_dimension_note() {
 async fn bash_nonzero_exit_empty_output_labels_no_output() {
     let dir = tempfile::tempdir().unwrap();
     let bash = bash_tool(dir.path().to_path_buf(), BashOpts::default());
-    let err = bash
+    let r = bash
         .execute(
             cid(),
             serde_json::json!({ "command": "exit 1" }),
@@ -2007,8 +2237,9 @@ async fn bash_nonzero_exit_empty_output_labels_no_output() {
             noop_sink(),
         )
         .await
-        .unwrap_err();
-    let msg = err.to_string();
+        .unwrap();
+    assert!(r.is_error);
+    let msg = first_text(&r);
     assert_eq!(
         msg, "(no output)\n\nCommand exited with code 1",
         "got: {msg}"
@@ -2027,7 +2258,9 @@ async fn bash_signal_killed_command_fails_with_128_plus_signo() {
         ("printf partial; kill -KILL $$", 137),
         ("printf partial; kill -SEGV $$", 139),
     ] {
-        let err = bash
+        // TOOL-054: a failure the model sees as an error result, not a throw (bash.ts:400-407
+        // @v1.1.0).
+        let r = bash
             .execute(
                 cid(),
                 serde_json::json!({ "command": command }),
@@ -2035,18 +2268,144 @@ async fn bash_signal_killed_command_fails_with_128_plus_signo() {
                 noop_sink(),
             )
             .await
-            .expect_err("a signal-killed command is a failure, not a success");
+            .unwrap();
+        assert!(
+            r.is_error,
+            "a signal-killed command is a failure, not a success"
+        );
         assert_eq!(
-            err.to_string(),
+            first_text(&r),
             format!("partial\n\nCommand exited with code {code}"),
             "{command}"
         );
-        let details = err
+        let details = r
             .details
             .as_ref()
             .expect("the code is carried structurally");
         assert_eq!(details["exitCode"], code, "{command}");
+        let structured = r.structured_content.as_ref().expect("structuredContent");
+        assert_eq!(structured["exit_code"], code, "{command}");
+        assert_eq!(structured["output"], "partial", "{command}");
     }
+}
+
+// TOOL-054 — mirrors pi `test/tools.test.ts:500-519` @v1.1.0 ("should report non-zero exit codes
+// as error results with structured content").
+#[tokio::test]
+async fn bash_reports_non_zero_exit_codes_as_error_results_with_structured_content() {
+    let dir = tempfile::tempdir().unwrap();
+    let bash = bash_tool(dir.path().to_path_buf(), BashOpts::default());
+    let run = |command: &'static str| {
+        bash.execute(
+            cid(),
+            serde_json::json!({ "command": command }),
+            CancelToken::new(),
+            noop_sink(),
+        )
+    };
+
+    let result = run("echo out; exit 3").await.unwrap();
+    assert!(result.is_error);
+    assert_eq!(first_text(&result), "out\n\n\nCommand exited with code 3");
+    let structured = result.structured_content.unwrap();
+    assert!(structured["wall_time_seconds"].is_number(), "{structured}");
+    let mut without_time = structured.as_object().unwrap().clone();
+    without_time.remove("wall_time_seconds");
+    // `toEqual`: exactly these keys, so no `full_output_path` when nothing was cut.
+    assert_eq!(
+        serde_json::Value::Object(without_time),
+        serde_json::json!({ "output": "out\n", "truncated": false, "exit_code": 3 })
+    );
+
+    let ok = run("echo fine").await.unwrap();
+    assert!(!ok.is_error);
+    let structured = ok.structured_content.unwrap();
+    assert_eq!(structured["output"], "fine\n");
+    assert_eq!(structured["exit_code"], 0);
+
+    let empty = run("true").await.unwrap();
+    assert_eq!(first_text(&empty), "(no output)");
+    let structured = empty.structured_content.unwrap();
+    assert_eq!(structured["output"], "");
+    assert_eq!(structured["truncated"], false);
+}
+
+// TOOL-054 — mirrors pi `test/tools.test.ts:521-545` @v1.1.0 ("should return up to 1 MiB of output
+// in structured content").
+#[tokio::test]
+async fn bash_returns_up_to_one_mib_of_output_in_structured_content() {
+    let dir = tempfile::tempdir().unwrap();
+    let bash = bash_tool(dir.path().to_path_buf(), BashOpts::default());
+
+    // 3000 lines exceed the model-facing 2000 line limit but not 1 MiB.
+    let medium = bash
+        .execute(
+            cid(),
+            serde_json::json!({ "command": "seq 1 3000" }),
+            CancelToken::new(),
+            noop_sink(),
+        )
+        .await
+        .unwrap();
+    assert!(!first_text(&medium).contains("\n1\n2\n"));
+    assert_eq!(
+        medium.details.as_ref().unwrap()["truncation"]["truncated"],
+        true
+    );
+    let medium_output = medium.structured_content.unwrap();
+    assert_eq!(medium_output["truncated"], false);
+    let expected: String = (1..=3000).map(|i| format!("{i}\n")).collect();
+    assert_eq!(medium_output["output"], expected.as_str());
+    assert!(medium_output.get("full_output_path").is_none());
+
+    // About 2 MB: keeps the first and last 512 KiB around an omission marker.
+    let large = bash
+        .execute(
+            cid(),
+            serde_json::json!({ "command": "seq 1 300000" }),
+            CancelToken::new(),
+            noop_sink(),
+        )
+        .await
+        .unwrap();
+    let large_output = large.structured_content.unwrap();
+    assert_eq!(large_output["truncated"], true);
+    let output = large_output["output"].as_str().unwrap();
+    assert!(output.starts_with("1\n2\n3\n"));
+    assert!(output.ends_with("299999\n300000\n"));
+    let marker = output.find("\n\n[... ").expect("omission marker");
+    let rest = &output[marker + "\n\n[... ".len()..];
+    let digits = rest.split(' ').next().unwrap();
+    assert!(digits.parse::<u64>().is_ok(), "{digits}");
+    assert!(rest[digits.len()..].starts_with(" bytes omitted ...]\n\n"));
+    assert!(output.len() < 1024 * 1024 + 100);
+    let path = large_output["full_output_path"].as_str().unwrap();
+    assert_eq!(path, large.details.as_ref().unwrap()["fullOutputPath"]);
+    let full = std::fs::read_to_string(path).unwrap();
+    assert!(full.ends_with("300000\n"));
+    let _ = std::fs::remove_file(path);
+}
+
+// TOOL-054 — `outputSchema: bashOutputSchema` sits on the shared `createShellToolDefinition`
+// (bash.ts:259 @v1.1.0), so `powershell` declares it too. The JSON is what TypeBox 1.3.27 emits for
+// `bashOutputSchema` (bash.ts:52-62).
+#[test]
+fn both_shell_tools_declare_pi_bash_output_schema() {
+    let expected = serde_json::json!({
+        "type": "object",
+        "required": ["output", "truncated", "exit_code", "wall_time_seconds"],
+        "properties": {
+            "output": { "type": "string", "description": "Combined stdout and stderr, possibly truncated" },
+            "truncated": { "type": "boolean" },
+            "full_output_path": { "type": "string", "description": "Full output, when truncated" },
+            "exit_code": { "type": "number" },
+            "wall_time_seconds": { "type": "number" }
+        }
+    });
+    let bash = bash_tool(PathBuf::from("."), BashOpts::default());
+    let powershell = ShellTool::powershell(proc(), PathBuf::from("."), PowerShellOpts::default());
+    assert_eq!(bash.output_schema(), Some(&expected));
+    assert_eq!(powershell.output_schema(), Some(&expected));
 }
 
 // ACP-141 — a non-zero exit reports its code STRUCTURALLY, not only inside the sentence.
@@ -2059,7 +2418,7 @@ async fn bash_signal_killed_command_fails_with_128_plus_signo() {
 async fn bash_nonzero_exit_reports_its_code_in_details() {
     let dir = tempfile::tempdir().unwrap();
     let bash = bash_tool(dir.path().to_path_buf(), BashOpts::default());
-    let err = bash
+    let r = bash
         .execute(
             cid(),
             serde_json::json!({ "command": "exit 42" }),
@@ -2067,12 +2426,10 @@ async fn bash_nonzero_exit_reports_its_code_in_details() {
             noop_sink(),
         )
         .await
-        .unwrap_err();
-    assert_eq!(
-        err.to_string(),
-        "(no output)\n\nCommand exited with code 42"
-    );
-    let details = err.details.as_ref().expect("ACP-141 attaches details");
+        .unwrap();
+    assert!(r.is_error);
+    assert_eq!(first_text(&r), "(no output)\n\nCommand exited with code 42");
+    let details = r.details.as_ref().expect("ACP-141 attaches details");
     assert_eq!(details["exitCode"], 42);
 
     // A CLEAN exit does not: `details` is `None` unless the output was truncated, which is pi's

@@ -484,8 +484,38 @@ fn the_globals_line_says_image_saves_the_image_and_names_its_path() {
     );
     assert!(
         description.contains(
-            "`exit()` ends the script. `image()` also saves the image to a temp file and the result names its path.\n"
+            "`exit()` ends the script. With several text items, each starts with a `==> text N/M <==` line, and `console` lines follow the other output in one `<console_output>` block. `image()` also saves the image to a temp file and the result names its path.\n"
         ),
+        "{description}"
+    );
+}
+
+/// pi `269121616` (v1.1.0, #10555; `tool.ts:147`): the lookup helpers are async, and the globals
+/// line says `await`, because models that left it off serialized the unawaited promise as `{}`.
+/// cyrup's helpers return promises too (`prelude.js` `caller`).
+#[test]
+fn the_globals_line_marks_the_lookup_helpers_as_async() {
+    let description = create_codemode_description(
+        &[],
+        &DescriptionOptions {
+            models: false,
+            namespaces: &BTreeMap::new(),
+            deferred: &BTreeSet::new(),
+            guidelines: &BTreeMap::new(),
+            inline_budget: None,
+            docs_path: CODEMODE_DOCS_PATH,
+        },
+    );
+    assert!(
+        description.contains("`await searchTools(query, { limit?, namespace? })`"),
+        "{description}"
+    );
+    assert!(
+        description.contains("`await describeTool(name)`"),
+        "{description}"
+    );
+    assert!(
+        description.contains("`await describeNamespace(name)`"),
         "{description}"
     );
 }

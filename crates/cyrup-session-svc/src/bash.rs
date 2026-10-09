@@ -131,9 +131,10 @@ impl std::fmt::Debug for BashOptions {
 ///
 /// A genuine backend failure (spawn error, missing cwd, …) is returned as a real `Err`, NOT
 /// fabricated into a "successful" [`BashResult`] — Pi's `executeBashWithOperations` only catches the
-/// abort case in its `catch` block (`bash-executor.ts:130-155`); every other error hits `throw err`
-/// (line 154), discarding whatever partial output had been captured. Mirror that exactly: the
-/// caller must NOT record a history entry for a call that never really completed.
+/// abort case in its `catch` block (`bash-executor.ts:122-128` @v1.1.0); every other error hits
+/// `throw err` (`:126`), discarding whatever partial output had been captured. Mirror that exactly:
+/// the caller must NOT record a history entry for a call that never really completed. A spill file
+/// that could not be written fails the call the same way (see `BashOutputBuffer::spill_error`).
 ///
 /// `operations` is Pi's `options?.operations ?? createLocalBashOperations({ shellPath })`
 /// (`agent-session.ts:2782`): when `Some`, the command is handed to that backend instead of the
@@ -197,8 +198,9 @@ pub(crate) async fn run_bash(
     // an overriding backend gets the identical sanitize→buffer→spill treatment. Hoisted out of the
     // call so the two arms below cannot drift on it.
     let mut sink = |data: &[u8]| {
-        let sanitized = buffer.push_raw(data);
-        if let Some(cb) = on_chunk.as_mut() {
+        if let Some(sanitized) = buffer.push_raw(data)
+            && let Some(cb) = on_chunk.as_mut()
+        {
             cb(&sanitized);
         }
     };
@@ -238,13 +240,55 @@ pub(crate) async fn run_bash(
     };
     // `sink` is not dropped explicitly: it holds only a `&mut` borrow of `buffer` (and of
     // `on_chunk`), and that borrow already ends at its last use above, which is what lets
-    // `buffer.finish()` take `buffer` by value on the next line. The `on_chunk` box itself — and so
-    // the caller's `chunk_tx` — is released when this function returns, which is what the caller
+    // `settle` take `buffer` by value on the next line. The `on_chunk` box itself — and so the
+    // caller's `chunk_tx` — is released when this function returns, which is what the caller
     // waits on before draining its event pump (`session/bash.rs`).
-    let (output, truncated, full_output_path) = buffer.finish();
+    settle(buffer, status, &mut on_chunk)
+}
+
+/// The end of `executeBashWithOperations` once `exec` has settled (`bash-executor.ts:119-145`
+/// @v1.1.0): a backend failure re-throws without flushing (`:122-127`); every other outcome, an
+/// abort included, flushes the held-back text to the sink first (`:130`), then truncates and
+/// reports.
+fn settle(
+    mut buffer: BashOutputBuffer,
+    status: Result<ExitStatus, cyrup_core::ToolError>,
+    on_chunk: &mut BashChunkSink,
+) -> Result<BashResult, cyrup_core::ToolError> {
+    let status = status?;
+    if let Some(rest) = buffer.flush()
+        && let Some(cb) = on_chunk.as_mut()
+    {
+        cb(&rest);
+    }
+    let FinishedOutput {
+        output,
+        truncated,
+        full_output_path,
+        spill_error,
+    } = buffer.finish();
+    // [CYRUP-DELTA] A spill that failed fails the call whatever the command did, because the full
+    // output it names is incomplete: the agent-loop `bash` tool's `TOOL-059` choice, here for the
+    // user `!` path (see `BashOutputBuffer::spill_error`). As with any backend failure, the caller
+    // records no history entry. The output already streamed to the user, so the message leads with
+    // how the command ended rather than repeating it.
+    if let Some(message) = spill_error {
+        let ended = match status {
+            ExitStatus::Exited(code) => format!("Command exited with code {code}"),
+            ExitStatus::Signaled(Some(signo)) => {
+                format!("Command exited with code {}", 128 + signo)
+            }
+            ExitStatus::Signaled(None) => "Command terminated without an exit code".to_string(),
+            ExitStatus::Killed => "Command aborted".to_string(),
+            ExitStatus::TimedOut => "Command timed out".to_string(),
+        };
+        return Err(cyrup_core::ToolError::new(format!(
+            "{ended}\n\nFull output could not be saved: {message}"
+        )));
+    }
 
     match status {
-        Ok(ExitStatus::Exited(code)) => Ok(BashResult {
+        ExitStatus::Exited(code) => Ok(BashResult {
             output,
             exit_code: Some(code),
             cancelled: false,
@@ -255,28 +299,27 @@ pub(crate) async fn run_bash(
         // a signal-killed shell as `128 + signo` since v0.86.0 (`tools/bash.ts:139-142` @v0.87.1).
         // Without a signal number (a guest backend's `exitCode: null`) pi's `executeBashWithOperations`
         // keeps `exitCode: undefined` (`core/bash-executor.ts:125`).
-        Ok(ExitStatus::Signaled(signo)) => Ok(BashResult {
+        ExitStatus::Signaled(signo) => Ok(BashResult {
             output,
             exit_code: signo.map(|n| 128 + n),
             cancelled: false,
             truncated,
             full_output_path,
         }),
-        Ok(ExitStatus::Killed) => Ok(BashResult {
+        ExitStatus::Killed => Ok(BashResult {
             output,
             exit_code: None,
             cancelled: true,
             truncated,
             full_output_path,
         }),
-        Ok(ExitStatus::TimedOut) => Ok(BashResult {
+        ExitStatus::TimedOut => Ok(BashResult {
             output,
             exit_code: None,
             cancelled: false,
             truncated,
             full_output_path,
         }),
-        Err(e) => Err(e),
     }
 }
 
@@ -327,18 +370,22 @@ pub(crate) fn bash_message_payload(
 
 /// Streaming sanitize + rolling-buffer + tempfile-spill for immediate-bash output — a direct port of
 /// Pi's hand-rolled pipeline inside `executeBashWithOperations`'s `onData`/success path
-/// (`bash-executor.ts:57-124`). Deliberately NOT `cyrup_tools::output::OutputAccumulator`: that type
-/// backs the AGENT-LOOP `bash` TOOL (Pi's shared `OutputAccumulator` class, `output-accumulator.ts`,
+/// (`bash-executor.ts:48-146` @v1.1.0). Deliberately NOT `cyrup_tools::output::OutputAccumulator`:
+/// that type backs the AGENT-LOOP `bash` TOOL (Pi's shared `OutputAccumulator` class, `output-accumulator.ts`,
 /// used by `tools/bash.ts` — which never sanitizes) and has a different spill threshold. THIS seam's
 /// real Pi consumer, `bash-executor.ts`, sanitizes (strips ANSI, filters unsafe control/format
 /// chars, drops CR) EVERY chunk before it ever lands in the rolling buffer or the temp file, and
 /// gates the temp-file spill on raw byte count alone (no line-count trigger mid-stream).
 struct BashOutputBuffer {
     /// Incomplete trailing UTF-8 sequence carried across chunks (mirrors `TextDecoder{stream:true}`
-    /// state). Pi never flushes this at the end (no final no-stream `decoder.decode()` call
-    /// anywhere in `executeBashWithOperations`) — a truly incomplete trailing multi-byte sequence at
-    /// the tail of the raw stream is silently dropped, not replaced; mirrored in [`Self::finish`].
+    /// state). [`Self::flush`] ends the stream as pi's final no-argument `decoder.decode()` does
+    /// (`flushOutput`, `bash-executor.ts:113-117` @v1.1.0): an incomplete sequence left here
+    /// becomes one U+FFFD.
     pending: Vec<u8>,
+    /// Unfinished escape sequence at the end of the decoded text so far, held back until the next
+    /// chunk completes it (Pi `pendingAnsi`, `bash-executor.ts:73-74` @v1.1.0, `27c7b6ff4`), so a
+    /// color code split across chunks is stripped whole instead of leaving a stray `m`.
+    pending_ansi: String,
     /// Raw bytes seen so far, PRE-sanitize (Pi `totalBytes`) — gates the lazy temp-file open.
     total_raw_bytes: usize,
     /// Rolling sanitized-text chunks kept in memory (Pi `outputChunks`).
@@ -347,51 +394,112 @@ struct BashOutputBuffer {
     chunks_bytes: usize,
     temp_file: Option<std::fs::File>,
     temp_path: Option<PathBuf>,
+    /// Where the spill file is created: the OS temp directory (pi `tmpdir()`,
+    /// `utils/output-files.ts:19` @v1.1.0). A test points it at a directory that does not exist.
+    spill_dir: PathBuf,
+    /// The first failure to create or write the spill file. [`run_bash`] fails the call with it, as
+    /// the agent-loop `bash` tool does with `OutputAccumulator::take_spill_error` (`TOOL-059`).
+    /// [CYRUP-DELTA] pi's `createOutputFileStream` (`utils/output-files.ts:31-34` @v1.1.0) adds no
+    /// `error` listener and `executeBashWithOperations` never awaits the stream, so a failed open
+    /// or write is an uncaught stream `error` there, not a result. Once set, the spill is not
+    /// retried and later text goes only to the rolling buffer, like pi's errored stream.
+    spill_error: Option<(PathBuf, std::io::Error)>,
 }
 
-/// Rolling in-memory preview cap (Pi `maxOutputBytes`, `bash-executor.ts:57`: `DEFAULT_MAX_BYTES * 2`).
+/// What [`BashOutputBuffer::finish`] hands [`run_bash`].
+struct FinishedOutput {
+    /// The tail-truncated output (Pi `BashResult.output`).
+    output: String,
+    truncated: bool,
+    full_output_path: Option<String>,
+    /// `"{path}: {error}"` when the spill file lost part of the output.
+    spill_error: Option<String>,
+}
+
+/// Rolling in-memory preview cap (Pi `maxOutputBytes`, `bash-executor.ts:56` @v1.1.0: `DEFAULT_MAX_BYTES * 2`).
 const ROLLING_MAX_BYTES: usize = DEFAULT_MAX_BYTES * 2;
 
 impl BashOutputBuffer {
     fn new() -> Self {
         Self {
             pending: Vec::new(),
+            pending_ansi: String::new(),
             total_raw_bytes: 0,
             chunks: Vec::new(),
             chunks_bytes: 0,
             temp_file: None,
             temp_path: None,
+            spill_dir: std::env::temp_dir(),
+            spill_error: None,
         }
     }
 
-    /// Decode one raw chunk, sanitize it, fold it into the rolling buffer / temp file (mirroring
-    /// Pi's `onData`, `bash-executor.ts:77-124`, in the SAME order: spill-check, then temp-file
-    /// write, then rolling-buffer push+evict), and return the sanitized text for `on_chunk`.
-    fn push_raw(&mut self, data: &[u8]) -> String {
+    /// Pi's `onData` (`bash-executor.ts:106-111` @v1.1.0): decode one raw chunk, hold back an
+    /// unfinished escape sequence at its end, and pass the rest to [`Self::append_text`]. Returns
+    /// the sanitized text for `on_chunk`, or `None` when there is none.
+    fn push_raw(&mut self, data: &[u8]) -> Option<String> {
         self.total_raw_bytes += data.len();
         let decoded = self.decode_streaming(data);
-        let sanitized = sanitize_chunk(&decoded);
+        let mut text = std::mem::take(&mut self.pending_ansi);
+        text.push_str(&decoded);
+        let (complete, pending) = split_incomplete_ansi_suffix(&text);
+        self.pending_ansi = pending.to_owned();
+        self.append_text(complete)
+    }
+
+    /// Pi's `flushOutput` (`bash-executor.ts:113-117` @v1.1.0), run once the command has ended:
+    /// the held-back escape sequence and the decoder's end of stream (one U+FFFD for an incomplete
+    /// UTF-8 sequence), through [`Self::append_text`]. Returns the text for `on_chunk`, if any.
+    fn flush(&mut self) -> Option<String> {
+        let mut rest = std::mem::take(&mut self.pending_ansi);
+        if !self.pending.is_empty() {
+            self.pending.clear();
+            rest.push('\u{FFFD}');
+        }
+        self.append_text(&rest)
+    }
+
+    /// Sanitize decoded text and fold it into the temp file / rolling buffer (Pi `appendText`,
+    /// `bash-executor.ts:76-104` @v1.1.0, in the SAME order: spill-check, then temp-file write,
+    /// then rolling-buffer push+evict). Text that sanitizes to nothing is dropped before any of it,
+    /// and is not streamed.
+    fn append_text(&mut self, raw: &str) -> Option<String> {
+        let sanitized = sanitize_chunk(raw);
+        if sanitized.is_empty() {
+            return None;
+        }
 
         // Lazily open the temp file once RAW bytes exceed the spill threshold (Pi:
-        // `if (totalBytes > DEFAULT_MAX_BYTES) ensureTempFile();`, bash-executor.ts:83-85) — BEFORE
+        // `if (totalBytes > DEFAULT_MAX_BYTES) ensureTempFile();`, bash-executor.ts:84-86) — BEFORE
         // this chunk is folded into `chunks`, exactly mirroring Pi's ordering.
-        if self.temp_file.is_none() && self.total_raw_bytes > DEFAULT_MAX_BYTES {
+        if self.total_raw_bytes > DEFAULT_MAX_BYTES {
             self.ensure_temp_file();
         }
-        if let Some(f) = self.temp_file.as_mut() {
-            let _ = f.write_all(sanitized.as_bytes());
-        }
+        self.write_spill(&sanitized);
 
         self.chunks_bytes += sanitized.len();
         self.chunks.push(sanitized.clone());
         // Rolling cap: drop the oldest chunks once the in-memory preview exceeds 2x the spill
-        // threshold (Pi `maxOutputBytes`, bash-executor.ts:96-99).
+        // threshold (Pi `maxOutputBytes`, bash-executor.ts:95-98).
         while self.chunks_bytes > ROLLING_MAX_BYTES && self.chunks.len() > 1 {
             let removed = self.chunks.remove(0);
             self.chunks_bytes = self.chunks_bytes.saturating_sub(removed.len());
         }
 
-        sanitized
+        Some(sanitized)
+    }
+
+    /// Write to the open spill file, recording the first failure (see [`Self::spill_error`]).
+    fn write_spill(&mut self, text: &str) {
+        let Some(file) = self.temp_file.as_mut() else {
+            return;
+        };
+        if let Err(e) = file.write_all(text.as_bytes())
+            && let Some(path) = self.temp_path.clone()
+        {
+            self.temp_file = None;
+            self.spill_error = Some((path, e));
+        }
     }
 
     /// Streaming UTF-8 decode with a carried-over incomplete-sequence tail (mirrors
@@ -432,27 +540,37 @@ impl BashOutputBuffer {
         out
     }
 
+    /// Pi `ensureTempFile` (`bash-executor.ts:62-70` @v1.1.0): open the spill file once and write
+    /// the rolling buffer into it. A failure is recorded (see [`Self::spill_error`]) and the spill
+    /// is not tried again.
     fn ensure_temp_file(&mut self) {
-        if self.temp_file.is_some() {
+        if self.temp_file.is_some() || self.spill_error.is_some() {
             return;
         }
-        let path = std::env::temp_dir().join(format!("cyrup-bash-{}.log", unique_temp_suffix()));
-        if let Ok(mut file) = cyrup_tools::output::create_output_file(&path) {
+        let path = self
+            .spill_dir
+            .join(format!("cyrup-bash-{}.log", unique_temp_suffix()));
+        let opened = cyrup_tools::output::create_output_file(&path).and_then(|mut file| {
             for chunk in &self.chunks {
-                let _ = file.write_all(chunk.as_bytes());
+                file.write_all(chunk.as_bytes())?;
             }
-            self.temp_file = Some(file);
-            self.temp_path = Some(path);
+            Ok(file)
+        });
+        match opened {
+            Ok(file) => {
+                self.temp_file = Some(file);
+                self.temp_path = Some(path);
+            }
+            Err(e) => self.spill_error = Some((path, e)),
         }
     }
 
     /// Compute the final tail-truncated `output` (Pi `truncateTail(fullOutput)`,
-    /// `bash-executor.ts:107-108`), force the temp file open if truncation demands one Pi's raw-byte
-    /// spill check never triggered on (a many-short-lines overflow, `bash-executor.ts:110`), and
-    /// return `(output, truncated, full_output_path)` — `full_output_path` mirrors Pi's
-    /// unconditional `fullOutputPath: tempFilePath` (`bash-executor.ts:121`): whatever path is open,
-    /// regardless of the final `truncated` value.
-    fn finish(mut self) -> (String, bool, Option<String>) {
+    /// `bash-executor.ts:131-132` @v1.1.0), force the temp file open if truncation demands one Pi's
+    /// raw-byte spill check never triggered on (a many-short-lines overflow, `:133-135`), and
+    /// report `full_output_path` as Pi's unconditional `fullOutputPath: tempFilePath` (`:144`):
+    /// whatever path is open, regardless of the final `truncated` value.
+    fn finish(mut self) -> FinishedOutput {
         let full_output = self.chunks.concat();
         let truncation = cyrup_tools::truncate::truncate_tail(
             &full_output,
@@ -461,16 +579,25 @@ impl BashOutputBuffer {
         if truncation.info.truncated {
             self.ensure_temp_file();
         }
-        if let Some(f) = self.temp_file.as_mut() {
-            let _ = f.flush();
+        if let Some(f) = self.temp_file.as_mut()
+            && let Err(e) = f.flush()
+            && let Some(path) = self.temp_path.clone()
+        {
+            self.spill_error = Some((path, e));
         }
         let output = if truncation.info.truncated {
             truncation.content
         } else {
             full_output
         };
-        let full_output_path = self.temp_path.map(|p| p.to_string_lossy().into_owned());
-        (output, truncation.info.truncated, full_output_path)
+        FinishedOutput {
+            output,
+            truncated: truncation.info.truncated,
+            full_output_path: self.temp_path.map(|p| p.to_string_lossy().into_owned()),
+            spill_error: self
+                .spill_error
+                .map(|(path, e)| format!("{}: {e}", path.display())),
+        }
     }
 }
 
@@ -632,6 +759,68 @@ fn is_csi_final_byte(c: char) -> bool {
         )
 }
 
+/// Longest unfinished sequence held back while streaming, in UTF-16 units; a longer one is
+/// processed as-is (Pi `MAX_PENDING_ANSI_LENGTH`, `utils/ansi.ts:49` @v1.1.0).
+const MAX_PENDING_ANSI_LENGTH: usize = 256;
+
+/// Split streamed text into the part that is safe to strip now and a trailing unfinished escape
+/// sequence to prepend to the next chunk (Pi `splitIncompleteAnsiSuffix`, `utils/ansi.ts:55-66`
+/// @v1.1.0). The pending part is the leftmost suffix, starting within the last
+/// [`MAX_PENDING_ANSI_LENGTH`] UTF-16 units, that `unfinishedAnsiAtEndRegex` (`:44-47`) matches:
+/// see [`is_unfinished_ansi`].
+fn split_incomplete_ansi_suffix(value: &str) -> (&str, &str) {
+    if !value.contains(['\u{1B}', '\u{9B}']) {
+        return (value, "");
+    }
+    let window_start = value
+        .encode_utf16()
+        .count()
+        .saturating_sub(MAX_PENDING_ANSI_LENGTH);
+    let mut units = 0;
+    for (index, c) in value.char_indices() {
+        if units >= window_start
+            && matches!(c, '\u{1B}' | '\u{9B}')
+            && let Some((complete, pending)) = value.split_at_checked(index)
+            && is_unfinished_ansi(pending)
+        {
+            return (complete, pending);
+        }
+        units += c.len_utf16();
+    }
+    (value, "")
+}
+
+/// Whether all of `tail` (which starts with ESC or 0x9B) is an unfinished sequence, the
+/// `unfinishedAnsiAtEndRegex` of `utils/ansi.ts:44-47` @v1.1.0: an OSC without its terminator
+/// (`ESC ]` then no BEL, no 0x9C and no `ESC \`; a trailing ESC may start `ESC \`), or a CSI
+/// introducer with intermediates and params but no final byte.
+fn is_unfinished_ansi(tail: &str) -> bool {
+    if let Some(body) = tail.strip_prefix("\u{1B}]") {
+        let mut chars = body.chars().peekable();
+        let mut terminated = false;
+        while let Some(c) = chars.next() {
+            if matches!(c, '\u{07}' | '\u{9C}') || (c == '\u{1B}' && chars.peek() == Some(&'\\')) {
+                terminated = true;
+                break;
+            }
+        }
+        if !terminated {
+            return true;
+        }
+    }
+    // `CSI_START` alone up to the end: `[\u001B\u009B][[\]()#;?]*(?:\d{1,4}(?:[;:]\d{0,4})*)?$`.
+    // The params cannot start with an intermediate, so the greedy intermediates decide the split.
+    let mut it = tail.chars();
+    if !matches!(it.next(), Some('\u{1B}' | '\u{9B}')) {
+        return false;
+    }
+    let rest = it
+        .as_str()
+        .trim_start_matches(['[', ']', '(', ')', '#', ';', '?']);
+    rest.is_empty()
+        || (rest.starts_with(|c: char| c.is_ascii_digit()) && consume_params(rest).is_empty())
+}
+
 /// Process-unique-ish suffix for the spill temp-file name (no rng dependency) — the same scheme as
 /// `cyrup_tools::ops::local::unique_suffix`, duplicated locally rather than widening that
 /// `pub(crate)` helper's visibility for one caller.
@@ -773,14 +962,125 @@ mod sanitize_tests {
             let stripped = strip_ansi(&s);
             let _ = sanitize_binary_output(&stripped);
             let _ = sanitize_chunk(&s);
+            // The split never loses or reorders text, and holds back only a sequence's start.
+            let (complete, pending) = split_incomplete_ansi_suffix(&s);
+            assert_eq!(format!("{complete}{pending}"), s);
+            assert!(pending.is_empty() || pending.starts_with(['\u{1B}', '\u{9B}']));
         }
+    }
+
+    /// `splitIncompleteAnsiSuffix` (`utils/ansi.ts:55-66` @v1.1.0, `27c7b6ff4`).
+    #[test]
+    fn split_holds_back_only_an_unfinished_sequence_at_the_end() {
+        let cases = [
+            ("plain", ("plain", "")),
+            ("a\u{1B}[31mb", ("a\u{1B}[31mb", "")),
+            ("ERROR\u{1B}[0", ("ERROR", "\u{1B}[0")),
+            ("before\u{1B}", ("before", "\u{1B}")),
+            ("x\u{9B}1;2:", ("x", "\u{9B}1;2:")),
+            ("x\u{1B}[?", ("x", "\u{1B}[?")),
+            // Five digits cannot be params, and the fifth is a final byte: complete.
+            ("x\u{1B}[12345", ("x\u{1B}[12345", "")),
+            ("a\u{1B}]0;window ", ("a", "\u{1B}]0;window ")),
+            // A trailing ESC may start `ESC \`.
+            ("a\u{1B}]0;title\u{1B}", ("a", "\u{1B}]0;title\u{1B}")),
+            ("a\u{1B}]0;t\u{07}b", ("a\u{1B}]0;t\u{07}b", "")),
+            ("a\u{1B}]0;t\u{1B}\\b", ("a\u{1B}]0;t\u{1B}\\b", "")),
+            // The leftmost start wins: the OSC swallows the later CSI introducer.
+            ("a\u{1B}]t\u{1B}[3", ("a", "\u{1B}]t\u{1B}[3")),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(split_incomplete_ansi_suffix(input), expected, "{input:?}");
+        }
+        // Only the last 256 UTF-16 units are searched, so a longer unterminated OSC is not held.
+        let long = format!("\u{1B}]{}", "x".repeat(300));
+        assert_eq!(split_incomplete_ansi_suffix(&long), (long.as_str(), ""));
+        let short = format!("ok\u{1B}]{}", "x".repeat(250));
+        assert_eq!(split_incomplete_ansi_suffix(&short).0, "ok");
+    }
+
+    /// Feed `chunks` through the buffer as a command's output, then settle it with exit 0;
+    /// returns the result's output and everything streamed to the sink.
+    fn run_chunks(chunks: &[&[u8]]) -> (String, String) {
+        let streamed = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let sink_out = streamed.clone();
+        let mut sink: BashChunkSink = Some(Box::new(move |delta: &str| {
+            sink_out.lock().unwrap().push_str(delta);
+        }));
+        let mut buffer = BashOutputBuffer::new();
+        for chunk in chunks {
+            if let Some(text) = buffer.push_raw(chunk)
+                && let Some(cb) = sink.as_mut()
+            {
+                cb(&text);
+            }
+        }
+        let result = settle(buffer, Ok(ExitStatus::Exited(0)), &mut sink).unwrap();
+        let streamed = streamed.lock().unwrap().clone();
+        (result.output, streamed)
+    }
+
+    /// pi `27c7b6ff4` (#10504): an escape sequence split across output chunks is stripped whole,
+    /// in the result and in what was streamed, instead of leaving a stray `m`
+    /// (`agent-session-bash-persistence.test.ts` "escape sequences split across output chunks").
+    /// RED before: `"ERROR: file.py:1[0m\n"` (the ESC was dropped, its `[0` and `m` kept).
+    #[test]
+    fn escape_sequences_split_across_chunks_are_stripped_whole() {
+        assert_eq!(
+            run_chunks(&[b"\x1b[31mERROR: file.py:1\x1b[0", b"m\n"]),
+            (
+                "ERROR: file.py:1\n".to_owned(),
+                "ERROR: file.py:1\n".to_owned()
+            )
+        );
+        assert_eq!(
+            run_chunks(&[b"before\x1b", b"[32mafter\n"]),
+            ("beforeafter\n".to_owned(), "beforeafter\n".to_owned())
+        );
+        assert_eq!(
+            run_chunks(&[b"a\x1b]0;window ", b"title\x1b", b"\\b\n"]).0,
+            "ab\n"
+        );
+    }
+
+    /// pi `flushOutput` (`bash-executor.ts:113-117` @v1.1.0): the decoder's end of stream turns an
+    /// incomplete multi-byte character into U+FFFD, in the result and the stream.
+    /// RED before: the trailing byte was dropped, `"ok"`.
+    #[test]
+    fn an_incomplete_multi_byte_character_at_the_end_is_flushed() {
+        let e_acute = "\u{e9}".as_bytes();
+        assert_eq!(
+            run_chunks(&[b"ok", &e_acute[..1]]),
+            ("ok\u{FFFD}".to_owned(), "ok\u{FFFD}".to_owned())
+        );
+    }
+
+    /// A long unterminated sequence is not held back: it streams before the command ends.
+    #[test]
+    fn a_long_unterminated_sequence_is_not_held_back() {
+        let long = "x".repeat(300);
+        let mut buffer = BashOutputBuffer::new();
+        let streamed = buffer.push_raw(format!("\x1b]{long}").as_bytes());
+        assert_eq!(streamed, Some(format!("]{long}")));
+    }
+
+    /// Text that sanitizes to nothing is neither buffered nor streamed (`if (!text) return`).
+    #[test]
+    fn text_that_sanitizes_to_nothing_is_not_streamed() {
+        let mut buffer = BashOutputBuffer::new();
+        assert_eq!(buffer.push_raw(b"\x1b[0m"), None);
+        assert_eq!(buffer.push_raw(b"\x1b[3"), None);
+        assert_eq!(buffer.push_raw(b"1m\r"), None);
+        assert!(buffer.chunks.is_empty());
+        assert_eq!(buffer.flush(), None);
     }
 }
 
 #[cfg(all(test, unix))]
 #[allow(clippy::unwrap_used)]
 mod spill_file_tests {
-    use super::{BashOutputBuffer, DEFAULT_MAX_BYTES};
+    use super::{BashOutputBuffer, DEFAULT_MAX_BYTES, settle};
+    use cyrup_tools::ExitStatus;
     use std::os::unix::fs::PermissionsExt as _;
 
     /// TOOL-057 — the user-`!` bash spill (`bash-executor.ts:66` `createOutputFileStream`, v1.0.4)
@@ -789,12 +1089,78 @@ mod spill_file_tests {
     fn the_full_output_file_is_readable_only_by_its_owner() {
         let mut buffer = BashOutputBuffer::new();
         buffer.push_raw(&vec![b'x'; DEFAULT_MAX_BYTES + 1]);
-        let (_, truncated, path) = buffer.finish();
-        let path = path.unwrap();
+        let finished = buffer.finish();
+        let path = finished.full_output_path.unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         let _ = std::fs::remove_file(&path);
-        assert!(truncated);
+        assert!(finished.truncated);
+        assert!(finished.spill_error.is_none());
         assert_eq!(mode, 0o600);
+    }
+
+    /// TOOL-060 — a spill file that cannot be created is reported, not dropped: the call fails with
+    /// how the command ended and `"{path}: {error}"` whatever the exit code, as the agent-loop
+    /// `bash` tool does (TOOL-059).
+    /// RED before: `ensure_temp_file` ignored the failed create and the call returned `Ok`.
+    #[test]
+    fn a_spill_file_that_cannot_be_created_fails_the_call() {
+        for code in [0, 3] {
+            let mut buffer = BashOutputBuffer::new();
+            buffer.spill_dir = std::env::temp_dir().join("cyrup-missing-dir-for-bash-spill");
+            buffer.push_raw(&vec![b'x'; DEFAULT_MAX_BYTES + 1]);
+            buffer.push_raw(b"more");
+            let error = settle(buffer, Ok(ExitStatus::Exited(code)), &mut None).unwrap_err();
+            assert!(
+                error.message.starts_with(&format!(
+                    "Command exited with code {code}\n\nFull output could not be saved: "
+                )),
+                "{error:?}"
+            );
+            assert!(
+                error.message.contains("cyrup-missing-dir-for-bash-spill"),
+                "{error:?}"
+            );
+        }
+    }
+
+    /// A spill file that was created but then refuses a write is reported the same way, and the
+    /// spill stops there: later text goes only to the rolling buffer.
+    #[test]
+    fn a_spill_write_that_fails_is_reported_and_ends_the_spill() {
+        let mut buffer = BashOutputBuffer::new();
+        buffer.push_raw(&vec![b'x'; DEFAULT_MAX_BYTES + 1]);
+        let path = buffer.temp_path.clone().unwrap();
+        // Swap the writable handle for a read-only one so the next write fails with EBADF.
+        buffer.temp_file = Some(std::fs::File::open(&path).unwrap());
+        buffer.push_raw(b"lost");
+        assert!(
+            buffer.temp_file.is_none(),
+            "a failed write closes the spill"
+        );
+        buffer.push_raw(b"later");
+        let finished = buffer.finish();
+        let kept = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let message = finished.spill_error.unwrap();
+        assert!(
+            message.starts_with(&format!("{}: ", path.display())),
+            "{message}"
+        );
+        assert_eq!(kept.len(), DEFAULT_MAX_BYTES + 1);
+        assert!(finished.output.ends_with("lostlater"));
+    }
+
+    /// The control: the same output with a writable spill directory settles as a result that
+    /// names the file.
+    #[test]
+    fn a_spill_that_succeeds_settles_as_a_result() {
+        let mut buffer = BashOutputBuffer::new();
+        buffer.push_raw(&vec![b'x'; DEFAULT_MAX_BYTES + 1]);
+        let result = settle(buffer, Ok(ExitStatus::Exited(3)), &mut None).unwrap();
+        let path = result.full_output_path.unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(result.exit_code, Some(3));
+        assert!(result.truncated);
     }
 }
 

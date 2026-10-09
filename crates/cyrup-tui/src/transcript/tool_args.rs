@@ -308,20 +308,22 @@ fn js_add(a: &Value, b: &Value) -> Value {
     }
 }
 
-/// `formatReadLineRange` (read.ts:73-78): `:<start>` or `:<start>-<end>` from `offset`/`limit`.
+/// `formatReadLineRange` (`renderers/read.ts:28-34` @v1.1.0): `:<start>` or `:<start>-<end>` from
+/// `offset`/`limit`.
 ///
 /// ```ts
-/// if (args?.offset === undefined && args?.limit === undefined) return "";
+/// // Strict tool schemas make models send null for omitted optional fields.
+/// if (args?.offset == null && args?.limit == null) return "";
 /// const startLine = args.offset ?? 1;
-/// const endLine = args.limit !== undefined ? startLine + args.limit - 1 : "";
+/// const endLine = args.limit != null ? startLine + args.limit - 1 : "";
 /// return theme.fg("warning", `:${startLine}${endLine ? `-${endLine}` : ""}`);
 /// ```
 ///
-/// There is NO numeric extractor here, deliberately. Each of those four lines is a different JS
-/// operator — presence, nullish, presence again, truthiness — and they disagree on `null`, so
-/// reading `offset`/`limit` through [`Value::as_f64`] collapsed all four into "is it a number" and
-/// dropped every non-number silently. The values stay raw `Value`s and each rule is applied as
-/// itself; see the comments in the body.
+/// There is NO numeric extractor here, deliberately. Three of those four lines treat `null` like
+/// a missing key (`== null`, `??`, `!= null`) while the fourth is truthiness on the computed
+/// number, and none of them is "is it a number": reading `offset`/`limit` through
+/// [`Value::as_f64`] dropped a string offset, which pi interpolates as is. The values stay raw
+/// `Value`s and each rule is applied as itself; see the comments in the body.
 ///
 /// The arithmetic is JS `+` via [`js_add`], not double arithmetic: `+` string-CONCATENATES when
 /// either operand is a string, and only the trailing `- 1` coerces back to a number. So
@@ -335,29 +337,24 @@ fn js_add(a: &Value, b: &Value) -> Value {
 /// `JSON.parse` does with the same literal. A fractional `offset` reaches the header unrounded, as
 /// it does upstream.
 pub(super) fn read_line_range(args: &Value) -> Option<String> {
-    // Four separate JS rules in four lines (read.ts:74-77), and they do NOT agree with each other
-    // on `null` — which is why each is ported as itself rather than folded into one extractor:
+    // Four JS rules in four lines (renderers/read.ts:30-33 @v1.1.0):
     //
-    //   1. `args?.offset === undefined && args?.limit === undefined` — a PRESENCE gate. An explicit
-    //      JSON `null` is present, so it passes and a range still renders.
+    //   1. `args?.offset == null && args?.limit == null` — loose equality, so an explicit JSON
+    //      `null` counts as omitted. Strict tool schemas make models send `null` for every optional
+    //      field (pi #9996), and `read` declares strict sampling, so a full-file read must not
+    //      render a `:1` range.
     //   2. `args.offset ?? 1` — NULLISH. `null` becomes `1`; a string stays the string.
-    //   3. `args.limit !== undefined ? … : ""` — PRESENCE again, so a `null` limit still computes.
+    //   3. `args.limit != null ? … : ""` — loose again, so a `null` limit renders no end.
     //   4. `endLine ? … : ""` — TRUTHINESS on the computed number, so `0` and `NaN` drop the
     //      `-<end>` half.
-    //
-    // Reading both through `Value::as_f64` collapsed rules 1-3 into "is it a number", so
-    // `{"offset": null}` rendered nothing where pi renders `:1`.
-    let offset = args.get("offset");
-    let limit = args.get("limit");
+    let offset = args.get("offset").filter(|v| !v.is_null());
+    let limit = args.get("limit").filter(|v| !v.is_null());
     if offset.is_none() && limit.is_none() {
         return None;
     }
     // Rule 2. `??` yields the value itself, not a number, so a non-numeric offset survives to the
     // screen exactly as pi interpolates it.
-    let start: Value = match offset {
-        Some(v) if !v.is_null() => v.clone(),
-        _ => Value::from(1),
-    };
+    let start: Value = offset.cloned().unwrap_or_else(|| Value::from(1));
     // Rules 3 and 4. `startLine + args.limit` is JS `+` — string-concatenating when either side is
     // a string — and the trailing `- 1` then forces `ToNumber` on the result, so `endLine` is
     // always a Number by the time the truthiness gate sees it.

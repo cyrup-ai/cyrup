@@ -65,11 +65,16 @@ impl ToolDeclaration {
     }
 }
 
-/// One item of a script's output, in the order the script produced it: `text()` and `console.*`
-/// produce text items, `image()` image items (pi `CodemodeOutputItem`, `types.ts:47`).
+/// One item of a script's output, in the order the script produced it: `text()` produces text
+/// items, `console.*` console items, `image()` image items (pi `CodemodeOutputItem`,
+/// `types.ts:44-49` @v1.1.0).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum OutputItem {
     Text(String),
+    /// One `console.*` call's line: pi's text item with `console: true` (`types.ts:48` @v1.1.0,
+    /// `eb326d265`). [`format_output`](crate::output::format_output) moves these into one trailing
+    /// `<console_output>` block.
+    Console(String),
     /// `data` is base64.
     Image {
         data: String,
