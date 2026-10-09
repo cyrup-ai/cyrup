@@ -83,6 +83,7 @@ fn read_attempt_tee(cwd: &Path) -> String {
 
 fn single_step(agent: &str, task: &str) -> SingleStepSpec {
     SingleStepSpec {
+        worktree: cyrup_ext_subagents::spawn::worktree::WorktreeRequest::Shared,
         machine: None,
         skills: None,
         session_dir: None,
@@ -995,6 +996,7 @@ async fn a_step_with_output_writes_the_file_and_returns_the_saved_output_referen
 
     // The step carries an `output` FILE path (relative — resolved against the run cwd).
     let step = SingleStepSpec {
+        worktree: cyrup_ext_subagents::spawn::worktree::WorktreeRequest::Shared,
         machine: None,
         skills: None,
         session_dir: None,
@@ -1143,6 +1145,7 @@ async fn chain_wide_timeout_ms_reaches_the_real_child_and_terminates_it() {
     resolved_agents.insert("reporter".to_string(), reporter);
 
     let step = SingleStepSpec {
+        worktree: cyrup_ext_subagents::spawn::worktree::WorktreeRequest::Shared,
         machine: None,
         skills: None,
         session_dir: None,
@@ -1250,6 +1253,7 @@ async fn spawn_background_steps_bakes_the_configured_dynamic_fanout_max_items_in
     let executor = ext.executor();
 
     let step = SingleStepSpec {
+        worktree: cyrup_ext_subagents::spawn::worktree::WorktreeRequest::Shared,
         machine: None,
         skills: None,
         session_dir: None,

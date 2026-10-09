@@ -10,8 +10,13 @@
 //!   registers an entry renderer for `intercom_message` and implements
 //!   `NativeExtension::render_entry`. Before that the payload was written and consumed by nothing —
 //!   the transcript showed a grey `entry appended → intercom_message` line instead of the card.
-//! - [`session_list::SessionListOverlay::render`] + [`compose::compose_send`] are driven by the
-//!   `/intercom` slash command ([`crate::extension::IntercomExtension`]'s `execute_command`).
+//! - [`session_list::SessionListOverlay`], [`compose::ComposeOverlay`] and
+//!   [`handover_picker::HandoverPicker`] are LIVE overlays: `/intercom` (and its `alt+m` shortcut)
+//!   and `/handover` hand them to the host through `HostServices::open_overlay`, wrapped by the
+//!   `*Host` adapters next to each port, with keystrokes routed back through [`overlay::key_to_data`]
+//!   and rows painted through [`overlay::OverlayTheme`]. When no interactive surface takes an overlay
+//!   (`open_overlay` returns `false` — headless print/json/RPC), `/intercom` falls back to rendering
+//!   the same ports as text through [`PlainTheme`], which is pi's own `!ctx.hasUI` branch.
 //!
 //! **What DEGRADES (the port doc §4.3, precise later-phase TODO):** the live *message* renderer for
 //! the injected `intercom_message` custom message is still unreachable, blocked outside this crate
@@ -24,12 +29,6 @@
 //! the seam cannot draw the live-width, expandable, themed card this would exist for. Until both
 //! clear, a registered message renderer would return exactly the fixed-width string
 //! `IntercomExtension`'s `render_entry` (ICOM-028) already returns.
-//! The *interactive* overlay-host surface — the `alt+m` shortcut opening a live
-//! [`compose::ComposeOverlay`]/[`session_list::SessionListOverlay`] with live keystroke handling —
-//! is likewise not reachable yet. The overlays' interactive `handle_input` state machines are ported faithfully and
-//! exercised by unit tests; they are wired to a real event source only once Phase 6 adds those two
-//! `InitApi` hooks (a small arch-08 addition). This is DOCUMENTED, not silently dead: the render/send
-//! paths ARE wired via the command + inbound surface above.
 //!
 //! [`visible_width`]/[`truncate_to_width`] port pi's `visibleWidth`/`truncateToWidth`
 //! (`packages/tui/src/utils.ts`) width semantics exactly: ANSI/OSC/APC escape sequences are stripped
@@ -41,20 +40,36 @@
 use unicode_width::UnicodeWidthChar;
 
 pub mod compose;
+pub mod handover_loader;
+pub mod handover_picker;
 pub mod inline_message;
+pub mod input;
+pub mod overlay;
 pub mod session_list;
 
 pub use compose::{ComposeAction, ComposeOverlay, compose_send};
 pub use inline_message::{InlineMessage, InlineMessageComponent};
 pub use session_list::SessionListOverlay;
 
-/// A color/emphasis theme (pi `Theme`, `@earendil-works/pi-coding-agent`). Only the two methods the
-/// overlays actually call are modeled: `fg(color, text)` and `bold(text)`.
+/// A color/emphasis theme (pi `Theme`, `@earendil-works/pi-coding-agent`). Only the methods the
+/// overlays actually call are modeled: `fg(color, text)` and `bold(text)`, plus the two pi-tui
+/// effects a live overlay needs that pi's `Theme` does not own — the fake cursor's reverse video
+/// (pi-tui `renderFakeCursor`) and the end-of-row reset `truncateToWidth(…, pad = true)` appends.
+/// Both default to nothing, which is right for every text surface.
 pub trait Theme {
     /// Colorize `text` under the named palette slot (`"accent"`/`"dim"`/`"error"`).
     fn fg(&self, color: &str, text: &str) -> String;
     /// Embolden `text`.
     fn bold(&self, text: &str) -> String;
+    /// Reverse-video `text` (pi-tui `renderFakeCursor`, `tui.ts:205-207`).
+    fn inverse(&self, text: &str) -> String {
+        text.to_string()
+    }
+    /// A zero-width "close every open style" code, emitted after a clipped row's content so a style
+    /// whose close was cut by truncation does not leak onto the row's right border.
+    fn reset(&self) -> String {
+        String::new()
+    }
 }
 
 /// The cyrup degrade theme: identity (no ANSI). The overlays render into `append_entry` payloads /
@@ -82,8 +97,9 @@ pub trait Keybindings {
 }
 
 /// The default terminal bindings the overlays fall back to (Enter=confirm, Esc/Ctrl+C=cancel,
-/// arrows=up/down, Backspace=delete). Exact-match so an arrow escape (`\x1b[A`) is never mistaken for
-/// a bare-Esc cancel (`\x1b`).
+/// arrows=up/down, Backspace=delete, Tab=`tui.input.tab`, and the pi-tui `Input` cursor/deletion
+/// keys). Exact-match so an arrow escape (`\x1b[A`) is never mistaken for a bare-Esc cancel
+/// (`\x1b`). The ids and their default keys are pi's (`packages/tui/src/keybindings.ts`).
 #[derive(Clone, Copy, Debug, Default)]
 pub struct DefaultKeybindings;
 
@@ -95,6 +111,14 @@ impl Keybindings for DefaultKeybindings {
             "tui.select.up" => data == "\x1b[A",
             "tui.select.down" => data == "\x1b[B",
             "tui.editor.deleteCharBackward" => data == "\x7f" || data == "\x08",
+            "tui.editor.deleteCharForward" => data == "\x1b[3~" || data == "\x04",
+            "tui.editor.cursorLeft" => data == "\x1b[D" || data == "\x02",
+            "tui.editor.cursorRight" => data == "\x1b[C" || data == "\x06",
+            "tui.editor.cursorLineStart" => data == "\x1b[H" || data == "\x01",
+            "tui.editor.cursorLineEnd" => data == "\x1b[F" || data == "\x05",
+            "tui.editor.deleteToLineStart" => data == "\x15",
+            "tui.editor.deleteToLineEnd" => data == "\x0b",
+            "tui.input.tab" => data == "\t",
             _ => false,
         }
     }
@@ -104,6 +128,7 @@ impl Keybindings for DefaultKeybindings {
             "tui.select.cancel" => vec!["escape".to_string(), "ctrl+c".to_string()],
             "tui.select.up" => vec!["up".to_string()],
             "tui.select.down" => vec!["down".to_string()],
+            "tui.input.tab" => vec!["tab".to_string()],
             _ => Vec::new(),
         }
     }

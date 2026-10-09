@@ -130,6 +130,7 @@ async fn foreground_run_streams_live_progress_through_on_update() {
         Duration::from_secs(15),
         executor.run_foreground_streaming(
             ForegroundRunRequest {
+                worktree: cyrup_ext_subagents::spawn::worktree::WorktreeRequest::Shared,
                 // SUBA-041: this test exercises live progress, not the per-call override surface.
                 overrides: SingleRunOverrides::default(),
                 cwd: dir.path(),
@@ -293,6 +294,7 @@ async fn foreground_run_honors_an_already_cancelled_host_token() {
         Duration::from_secs(15),
         executor.run_foreground_streaming(
             ForegroundRunRequest {
+                worktree: cyrup_ext_subagents::spawn::worktree::WorktreeRequest::Shared,
                 // SUBA-041: this test exercises live progress, not the per-call override surface.
                 overrides: SingleRunOverrides::default(),
                 cwd: dir.path(),

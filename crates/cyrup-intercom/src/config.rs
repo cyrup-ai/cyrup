@@ -67,20 +67,30 @@ pub struct CrossMachineConfig {
 /// The default `crossMachine.remoteCommand`.
 ///
 /// Upstream's is the literal `"pi-intercom"` (`v0.16.0 config.ts:84`), the bin its package
-/// exposes. cyrup's counterpart bin is `cyrup-intercom-cli` — the same substitution ICOM-067
-/// settled for the CLI's usage line, default name and model — so the default here names the
-/// command that actually exists on a cyrup host. A `config.json` written for pi still works: the
-/// key is read verbatim when present.
-pub const DEFAULT_REMOTE_COMMAND: &str = "cyrup-intercom-cli";
+/// exposes — which every pi-intercom install has. cyrup's client ([`crate::cli`]) is compiled
+/// into the `cyrup` binary as the `cyrup intercom` subcommand, so THAT is the command every cyrup
+/// host has, and the sender runs `cyrup intercom relay --envelope-stdin --json` over ssh. The
+/// standalone `cyrup-intercom-cli` binary runs the same code but ships only with the separate
+/// `cyrup-intercom` package, so defaulting to it made every relay to a host installed the
+/// documented way (`cargo install … cyrup`) fail. A `config.json` written for pi still works: the
+/// key is read verbatim when present, and the value may carry arguments or an absolute path.
+pub const DEFAULT_REMOTE_COMMAND: &str = "cyrup intercom";
 
-/// `IntercomConfig` (`v0.14.0 config.ts:29-53`). `broker_command`/`broker_args` are parsed for wire-parity
-/// with pi's `config.json`, but cyrup's broker spawn re-execs `current_exe __intercom-broker`
-/// (`transport::spawn`) rather than shelling out to `npx tsx`, so they are informational on cyrup.
+/// `IntercomConfig` (`v0.14.0 config.ts:29-53`). `broker_command`/`broker_args` keep pi's literal
+/// defaults as the "unconfigured" sentinel (`usesDefaultBrokerCommand`, `spawn.ts:67-72`): while
+/// BOTH equal them, cyrup's broker spawn re-execs `current_exe __intercom-broker` rather than
+/// shelling out to `npx tsx`; a value moved off the default is a live setting, run as
+/// `broker_command broker_args… __intercom-broker`
+/// ([`crate::transport::spawn::resolve_broker_command`], ICOM-081).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IntercomConfig {
-    /// Broker command (`config.ts:24`, default `"npx"`). Informational on cyrup (re-exec path).
+    /// Broker command (`config.ts:24`, default `"npx"`). The default (together with the default
+    /// [`Self::broker_args`]) means "re-exec cyrup"; anything else is the program the broker spawn
+    /// runs, unless `CYRUP_INTERCOM_BROKER_BINARY` overrides it.
     pub broker_command: String,
-    /// Broker args (`config.ts:26`, default `["--no-install","tsx"]`). Informational on cyrup.
+    /// Broker args (`config.ts:26`, default `["--no-install","tsx"]`). The default is half of the
+    /// re-exec sentinel; otherwise passed to [`Self::broker_command`] ahead of `__intercom-broker`
+    /// (dropped when `CYRUP_INTERCOM_BROKER_BINARY` is set).
     pub broker_args: Vec<String>,
     /// Require confirmation before non-reply sends from interactive sessions (`config.ts:52`, false).
     pub confirm_send: bool,

@@ -19,10 +19,13 @@ use std::sync::Arc;
 use serde_json::json;
 
 use crate::config::{BusyDelivery, InboundTrigger};
+use crate::cross_machine::relay_sender_name;
 use crate::reply_tracker::IntercomContext;
 use crate::session_state::SharedIntercomState;
 use crate::transport::client::{InboundEvent, IntercomClient, SendOptions};
-use crate::transport::protocol::{Attachment, Message, MessageReceiptStatus, SessionInfo, now_ms};
+use crate::transport::protocol::{
+    Attachment, CrossMachineProvenance, Message, MessageReceiptStatus, SessionInfo, now_ms,
+};
 use crate::ui::{InlineMessage, PlainTheme};
 
 /// The width the degraded inline card is pre-rendered at for the `append_entry` payload (cyrup has no
@@ -56,9 +59,9 @@ const NON_INTERACTIVE_BUSY_NOTICE: &str = "This agent is running in non-interact
 /// delivery, and the busy auto-reply is reachable only while a run is actually in flight.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InboundPolicy {
-    /// The session is IDLE: deliver the message through `HostServices::inject_message` (pi
-    /// `sendIncomingMessage(entry, "trigger")`), with `trigger` deciding whether that call also
-    /// drives an agent turn OVER it (pi's `shouldTriggerInboundMessage`, `index.ts:641-651`, applied
+    /// The session is IDLE: deliver the message (pi `sendIncomingMessage(entry, "trigger")`) as a
+    /// no-turn card, with `trigger` deciding whether the session is then WOKEN to answer it with
+    /// [`IDLE_WAKE_PROMPT`] (ICOM-084, see [`deliver_card`]) (pi's `shouldTriggerInboundMessage`, `index.ts:641-651`, applied
     /// at `delivery === "trigger" && shouldTriggerInboundMessage(entry)`, `index.ts:669-671`):
     /// `config.inbound_trigger == Always` -> always `true`; `== Replies` -> `true` only when the
     /// message is itself a reply (`reply_to.is_some()`); `== Never` -> always `false` (still
@@ -254,7 +257,7 @@ pub fn hold_incoming_broker_message(
 ///
 /// ```text
 /// if (config.busyDelivery === "human-first" && ctx.hasUI) {
-///   if (ctx.isIdle() && heldInboundMessages.length > 0) {
+///   if (ctx.isIdle() && !idleWakePending() && heldInboundMessages.length > 0) {   // v0.16.1
 ///     deliverIncomingBrokerMessage(heldInboundMessages.shift()!, ctx, generation);
 ///   }
 ///   if (heldInboundMessages.length === 0) clearHeldInboundTimer();
@@ -270,7 +273,12 @@ pub fn flush_held_inbound_messages(state: &Arc<SharedIntercomState>, generation:
         return;
     }
     if human_first_ui(state) {
+        // `ctx.isIdle() && !idleWakePending()` (`index.ts:1338@v0.16.1`, `104b83c` #154): a peer
+        // released a moment ago woke the session, and until that run's `agent_start` the session
+        // still reads idle — releasing the next held peer in that gap would put two peers into one
+        // woken turn, where human-first promises one per turn.
         if state.is_idle()
+            && !state.idle_wake_pending()
             && let Some(entry) = state.pop_held_inbound()
         {
             deliver_incoming_broker_message(state, &entry.from, &entry.message, generation);
@@ -410,11 +418,16 @@ pub fn deliver_incoming_broker_message(
 ///   ? `intercom({ action: "reply", replyTo: ${JSON.stringify(entry.message.id)}, message: "..." })`
 ///   : entry.replyCommand;
 /// replyTracker.queueTurnContext({ from: entry.from, message: injectedMessage, receivedAt: Date.now() });
+/// const trigger = delivery === "trigger" && shouldTriggerInboundMessage(entry, forceTrigger);
 /// pi.sendMessage({ customType: "intercom_message", content: …, display: true, details: deliveredEntry },
-///   delivery === "trigger" && shouldTriggerInboundMessage(entry, forceTrigger)
-///     ? { triggerTurn: true } : { deliverAs: "steer" });
+///   trigger ? undefined : { deliverAs: "steer" });
+/// if (trigger && !idleWakePending() && getLiveContext(runtimeContext, generation)?.isIdle()) {
+///   idleWakeRequestedAt = Date.now();
+///   pi.sendUserMessage("New intercom message above.");
+/// }
 /// emitMessageReceipt(injectedMessage.id, "injected");   // v0.14.0: AFTER the hand-off (ICOM-069)
 /// ```
+/// (`index.ts:1273-1304@v0.16.1`; the wake is `104b83c` #154, ICOM-084 — see [`deliver_card`].)
 ///
 /// Three mechanisms live here, all load-bearing:
 /// - **the `injectedAt` stamp** is on a per-delivery COPY, and it is that copy which is queued as
@@ -484,17 +497,10 @@ pub fn send_incoming_message_at(
     let card = build_inline_message_for(state, from, message, delivery);
     let content = card.content_markdown();
     let details = serde_json::to_value(&card).ok();
-    // `{ triggerTurn: true }` vs `{ deliverAs: "steer" }` (`v0.14.0 index.ts:1236-1238`) — two
-    // different host deliveries, so two different seam calls (ICOM-035). The steer goes through
-    // `HostServices::inject_message_steer`: while a run is active the live host steers it onto the
-    // running agent synchronously, inside this call — pi's `agent.steer(appMessage)` for a streaming
-    // session (`agent-session.ts:1949-1954` @v0.87.1; ICOM-063) — and its injection pump
-    // (`cyrup-session-svc` `session/mod.rs` `drive_injections`) owns the steer's fate. When the
-    // session is idle (or the steer landed past the run's last steering poll) the pump appends it to
-    // the session tree AND the agent transcript with no turn, pi's `_appendCustomMessage`
-    // (ICOM-068). Upstream takes the steer branch for every delivery that does not trigger, so an
-    // idle `inboundTrigger: "never"` delivery is one too.
-    let trigger_turn = delivery == InboundDelivery::Trigger
+    // `const trigger = delivery === "trigger" && shouldTriggerInboundMessage(entry, forceTrigger)`
+    // (`index.ts:1288@v0.16.1`). Since `104b83c` (#154) the trigger no longer picks a different
+    // card delivery — see [`deliver_card`] — it decides whether an idle session is WOKEN after it.
+    let trigger = delivery == InboundDelivery::Trigger
         && should_trigger_inbound_message(state.config.inbound_trigger, message);
     deliver_card(
         state,
@@ -502,7 +508,8 @@ pub fn send_incoming_message_at(
         message,
         &content,
         details.as_ref(),
-        trigger_turn,
+        trigger,
+        generation,
     )
 }
 
@@ -531,6 +538,8 @@ pub fn trigger_turn_over_inbound(
     let card = build_inline_message(state, from, message);
     let content = card.content_markdown();
     let details = serde_json::to_value(&card).ok();
+    // `sendIncomingMessage(…, "trigger", runtimeGeneration, true)` (`index.ts:1866@v0.16.1`): the
+    // relay passes the CURRENT generation, so its wake is gated on the live runtime like any other.
     deliver_card(
         state,
         services.as_ref(),
@@ -538,13 +547,38 @@ pub fn trigger_turn_over_inbound(
         &content,
         details.as_ref(),
         trigger,
+        state.connect.generation(),
     )
 }
 
+/// `pi.sendUserMessage("New intercom message above.")` (`index.ts:1302@v0.16.1`, `104b83c` #154) —
+/// the user prompt an idle session is woken with after an inbound card. Upstream's literal: it lands
+/// in the transcript as the user turn the woken run answers.
+pub const IDLE_WAKE_PROMPT: &str = "New intercom message above.";
+
 /// `pi.sendMessage({ customType: "intercom_message", content, display: true, details }, trigger ?
-/// { triggerTurn: true } : { deliverAs: "steer" }); emitMessageReceipt(injectedMessage.id,
-/// "injected")` (`v0.14.0 index.ts:1230-1245`) — the one place an inbound card is handed to the host,
-/// and the one place the sender is told `injected`. Returns whether the host took it.
+/// undefined : { deliverAs: "steer" }); if (trigger && …) pi.sendUserMessage(…);
+/// emitMessageReceipt(injectedMessage.id, "injected")` (`index.ts:1289-1303@v0.16.1`) — the one place
+/// an inbound card is handed to the host, the one place an idle session is woken for it, and the one
+/// place the sender is told `injected`. Returns whether the host took the card.
+///
+/// ICOM-084 (`104b83c` #154) — the card is ALWAYS handed over with pi's no-option `sendMessage`,
+/// which on pi's `sendCustomMessage` is the steer route while a run is active and the no-turn append
+/// while idle — exactly [`cyrup_ext::HostServices::inject_message_steer`] (ICOM-035 / ICOM-068). It
+/// used to be `inject_message(…, trigger_turn = true)` for a trigger, i.e. `{ triggerTurn: true }`,
+/// whose turn pi (pi#5581) and cyrup's injection pump alike run straight through the agent, skipping
+/// `before_agent_start`: on an intercom-woken turn `cyrup-permission-system` never shaped the active
+/// tools or sanitized the prompt, and no other `before_agent_start` handler ran. Upstream's comment:
+/// "Pi skips before_agent_start for sendMessage({ triggerTurn: true }) turns (pi#5581), so wake an
+/// idle session with a user prompt that runs the normal prompt lifecycle."
+///
+/// So a trigger now wakes the session — [`cyrup_ext::HostServices::wake_user_prompt`] with
+/// [`IDLE_WAKE_PROMPT`], a real prompt — and only when all of upstream's conditions hold: the
+/// session is idle (a busy one already had the card steered onto its run), the runtime is still
+/// `generation`'s (`getLiveContext(runtimeContext, generation)`, which is null before the first
+/// runtime starts), and no earlier wake is still pending (`!idleWakePending()`) — that wake's run
+/// will carry this card too, since the card is appended before it starts. A wake the host refuses
+/// does not unsend the card; the reservation is released so the next delivery can try again.
 ///
 /// ICOM-069 — `17699ba` (v0.14.0) moved the receipt from before the hand-off to after it, so a
 /// hand-off that fails emits nothing and the sender's last known state stays what it was
@@ -560,21 +594,25 @@ fn deliver_card(
     message: &Message,
     content: &str,
     details: Option<&serde_json::Value>,
-    trigger_turn: bool,
+    trigger: bool,
+    generation: u64,
 ) -> bool {
-    let delivered = if trigger_turn {
-        services.inject_message(
-            content,
-            Some(INBOUND_MESSAGE_CUSTOM_TYPE),
-            true,
-            details,
-            true,
-        )
-    } else {
-        services.inject_message_steer(content, Some(INBOUND_MESSAGE_CUSTOM_TYPE), true, details)
-    };
+    let delivered =
+        services.inject_message_steer(content, Some(INBOUND_MESSAGE_CUSTOM_TYPE), true, details);
     match delivered {
         Ok(()) => {
+            if trigger
+                && !state.idle_wake_pending()
+                && state.connect.runtime_ever_started()
+                && crate::connect::is_live_at(state, generation)
+                && state.is_idle()
+            {
+                state.request_idle_wake();
+                if let Err(e) = services.wake_user_prompt(IDLE_WAKE_PROMPT) {
+                    tracing::warn!(error = %e, "intercom: failed to wake the idle session");
+                    state.clear_idle_wake();
+                }
+            }
             state.emit_message_receipt(&message.id, MessageReceiptStatus::Injected, None);
             true
         }
@@ -839,8 +877,10 @@ pub fn format_attachments(attachments: &[Attachment]) -> String {
 }
 
 /// Build the inline card for an inbound message (pi's `entry` in `handleIncomingMessage`,
-/// `index.ts:725-733`): body = text + attachment text; reply hint when the sender expects a reply and
-/// `reply_hint` is on. Collapsed by default (pi opens the renderer with `!options.expanded`).
+/// `index.ts:725-733`): body = text + attachment text; with `reply_hint` on, a send-back hint for a
+/// relayed (`crossMachine`) message or a reply hint when the sender expects a reply
+/// (`v0.16.1 index.ts:1389-1393`). Collapsed by default (pi opens the renderer with
+/// `!options.expanded`).
 #[must_use]
 pub fn build_inline_message(
     state: &SharedIntercomState,
@@ -878,17 +918,31 @@ pub fn build_inline_message_for(
         .map(format_attachments)
         .unwrap_or_default();
     let body_text = format!("{}{attachment_text}", message.content.text);
-    let reply_command =
-        (state.config.reply_hint && message.expects_reply == Some(true)).then(|| {
-            if delivery == InboundDelivery::Steer {
-                format!(
-                    "intercom({{ action: \"reply\", replyTo: {}, message: \"...\" }})",
-                    serde_json::Value::String(message.id.clone())
-                )
-            } else {
-                REPLY_HINT_COMMAND.to_string()
-            }
-        });
+    // Stage 1 — the hint the entry is built with (`v0.16.1 index.ts:1389-1393`, ICOM-076): a
+    // relayed message gets a fresh `send` back to its asserted `name@machine` whether or not it
+    // expects a reply (the relay session that delivered it is gone, so `reply` cannot reach it),
+    // otherwise an ask gets the plain reply command.
+    let expects_reply = message.expects_reply == Some(true);
+    let base_hint = if !state.config.reply_hint {
+        None
+    } else if let Some(cm) = &message.cross_machine {
+        Some(cross_machine_send_hint(cm))
+    } else if expects_reply {
+        Some(REPLY_HINT_COMMAND.to_string())
+    } else {
+        None
+    };
+    // Stage 2 — `sendIncomingMessage`'s steer rewrite (`v0.16.1 index.ts:1278-1280`), applied to
+    // whatever stage 1 produced. Faithfully, that includes a relayed message that ALSO carries
+    // `expectsReply` (the relay CLI never sets it, but a local peer can send both): under steer it
+    // becomes the explicit `replyTo` form, exactly as upstream does.
+    let reply_command = match base_hint {
+        Some(_) if delivery == InboundDelivery::Steer && expects_reply => Some(format!(
+            "intercom({{ action: \"reply\", replyTo: {}, message: \"...\" }})",
+            serde_json::Value::String(message.id.clone())
+        )),
+        other => other,
+    };
     InlineMessage {
         from: from.clone(),
         message: message.clone(),
@@ -896,6 +950,30 @@ pub fn build_inline_message_for(
         body_text: Some(body_text),
         collapsed: true,
     }
+}
+
+/// ICOM-076 — the send-back hint for a relayed message (`v0.16.1 index.ts:1390`):
+///
+/// ```text
+/// `intercom({ action: "send", to: ${JSON.stringify(relaySenderName(receivedMessage.crossMachine.origin))}, message: "..." })`
+/// ```
+///
+/// `name@machine` is attacker-asserted, so it is quoted the `JSON.stringify` way — a `"` or a
+/// newline in it is escaped rather than closing the string the model is shown.
+///
+/// The hint is always this cyrup form — the `intercom` tool's own `send` to `name@machine` — never
+/// a pi spelling, because a relayed message here can only have come from another cyrup. Remote
+/// discovery admits Herdr agents by kind on both sides: pi's only `"pi"`
+/// (`tmp/pi-intercom/cross-machine-discovery.ts:62@v0.16.1`, `row.agent !== "pi"`) and cyrup's only
+/// `"cyrup"` ([`cyrup_ext_subagents::herdr::AGENT`], `cross_machine/discovery.rs:234-237`). So pi's
+/// send path never resolves a cyrup session as a target, and this send-back resolves only through
+/// cyrup's discovery, which finds the sender because it is a cyrup agent. Cross-machine relay is
+/// cyrup↔cyrup; there is no pi sender this hint would need to address.
+fn cross_machine_send_hint(cm: &CrossMachineProvenance) -> String {
+    format!(
+        "intercom({{ action: \"send\", to: {}, message: \"...\" }})",
+        serde_json::Value::String(relay_sender_name(&cm.origin.name, &cm.origin.machine))
+    )
 }
 
 /// Surface an inbound message to the human via `HostServices::append_entry("intercom_message", …)`
@@ -1013,6 +1091,110 @@ mod tests {
             build_inline_message(&s2, &from(), &ask("Which DB?"))
                 .reply_command
                 .is_none()
+        );
+    }
+
+    /// A message the relay CLI delivered (`cli.ts:219-224`), asserting `name@machine`.
+    fn relayed(name: &str, expects_reply: Option<bool>) -> Message {
+        use crate::transport::protocol::{ProvenanceOrigin, RelayTrust};
+        Message {
+            expects_reply,
+            cross_machine: Some(CrossMachineProvenance::ssh_relay(
+                ProvenanceOrigin {
+                    name: name.to_string(),
+                    session_id: "00000000-0000-4000-8000-000000000001".to_string(),
+                    machine: "laptop".to_string(),
+                    extra: Default::default(),
+                },
+                RelayTrust::SshAsserted,
+            )),
+            ..ask("[Unverified cross-machine origin] hello")
+        }
+    }
+
+    const SEND_HINT: &str =
+        "intercom({ action: \"send\", to: \"worker@laptop\", message: \"...\" })";
+    const STEER_REPLY_HINT: &str =
+        "intercom({ action: \"reply\", replyTo: \"q1\", message: \"...\" })";
+
+    /// ICOM-076 / `v0.16.1 index.ts:1389-1390`: a relayed message gets the send-back hint even
+    /// though it does not expect a reply — and never the `reply` form, which could not reach it.
+    #[test]
+    fn a_relayed_message_gets_a_send_back_hint_without_expects_reply() {
+        for delivery in [InboundDelivery::Trigger, InboundDelivery::Steer] {
+            let card =
+                build_inline_message_for(&state(true), &from(), &relayed("worker", None), delivery);
+            assert_eq!(
+                card.reply_command.as_deref(),
+                Some(SEND_HINT),
+                "{delivery:?}"
+            );
+            let md = card.content_markdown();
+            assert!(
+                md.starts_with("**From worker@laptop · unverified cross-machine** (/w)"),
+                "{md}"
+            );
+            assert!(
+                md.contains(&format!("To reply, use the intercom tool: {SEND_HINT}")),
+                "{md}"
+            );
+        }
+    }
+
+    /// `config.replyHint &&` guards the cross-machine arm too (`v0.16.1 index.ts:1389`).
+    #[test]
+    fn the_reply_hint_switch_also_suppresses_the_cross_machine_hint() {
+        for expects in [None, Some(true)] {
+            let card = build_inline_message(&state(false), &from(), &relayed("worker", expects));
+            assert!(card.reply_command.is_none());
+            // The attribution is not a hint: it stays.
+            assert!(
+                card.content_markdown()
+                    .starts_with("**From worker@laptop · unverified cross-machine**")
+            );
+        }
+    }
+
+    /// Stage ordering (`v0.16.1 index.ts:1389-1393` then `:1278-1280`): the cross-machine arm wins
+    /// over `expectsReply` when the entry is built, and the steer rewrite then turns ANY hint on an
+    /// `expectsReply` message into the explicit `replyTo` form — upstream does not exempt relayed
+    /// messages from it.
+    #[test]
+    fn a_relayed_ask_keeps_the_send_hint_on_trigger_and_takes_the_reply_to_form_on_steer() {
+        let msg = relayed("worker", Some(true));
+        let trigger =
+            build_inline_message_for(&state(true), &from(), &msg, InboundDelivery::Trigger);
+        assert_eq!(trigger.reply_command.as_deref(), Some(SEND_HINT));
+        let steer = build_inline_message_for(&state(true), &from(), &msg, InboundDelivery::Steer);
+        assert_eq!(steer.reply_command.as_deref(), Some(STEER_REPLY_HINT));
+    }
+
+    /// `JSON.stringify` quoting: an asserted name cannot close the string the model is shown.
+    #[test]
+    fn the_send_back_target_is_json_escaped() {
+        let card = build_inline_message(&state(true), &from(), &relayed("wo\"rk\ner", None));
+        assert_eq!(
+            card.reply_command.as_deref(),
+            Some("intercom({ action: \"send\", to: \"wo\\\"rk\\ner@laptop\", message: \"...\" })")
+        );
+    }
+
+    /// Local messages are untouched: no hint without `expectsReply`, the plain reply command with
+    /// it, and the local sender name in the attribution.
+    #[test]
+    fn local_messages_keep_their_reply_hint_and_attribution() {
+        let mut plain = ask("hi");
+        plain.expects_reply = None;
+        assert!(
+            build_inline_message(&state(true), &from(), &plain)
+                .reply_command
+                .is_none()
+        );
+        let card = build_inline_message(&state(true), &from(), &ask("hi"));
+        assert_eq!(card.reply_command.as_deref(), Some(REPLY_HINT_COMMAND));
+        assert!(
+            card.content_markdown()
+                .starts_with("**From subagent-chat-1** (/w)")
         );
     }
 
@@ -1147,16 +1329,22 @@ mod tests {
     struct IdleControlledHost {
         idle: bool,
         injected: std::sync::Mutex<Vec<InjectedCall>>,
+        /// ICOM-084 — every `wake_user_prompt` text, in call order.
+        wakes: std::sync::Mutex<Vec<String>>,
     }
     impl IdleControlledHost {
         fn new(idle: bool) -> Self {
             Self {
                 idle,
                 injected: std::sync::Mutex::new(Vec::new()),
+                wakes: std::sync::Mutex::new(Vec::new()),
             }
         }
         fn injected(&self) -> Vec<InjectedCall> {
             self.injected.lock().unwrap().clone()
+        }
+        fn wakes(&self) -> Vec<String> {
+            self.wakes.lock().unwrap().clone()
         }
     }
     impl IdleControlledHost {
@@ -1167,6 +1355,10 @@ mod tests {
     impl cyrup_ext::HostServices for IdleControlledHost {
         fn is_idle(&self) -> bool {
             self.idle
+        }
+        fn wake_user_prompt(&self, text: &str) -> std::result::Result<(), String> {
+            self.wakes.lock().unwrap().push(text.to_string());
+            Ok(())
         }
         fn append_entry(
             &self,
@@ -1391,10 +1583,12 @@ mod tests {
     /// NOTHING was injected.
     #[tokio::test]
     async fn idle_headless_session_delivers_instead_of_auto_replying() {
+        let dir = tempfile::tempdir().unwrap();
         let s = Arc::new(state(true));
         let host = Arc::new(IdleControlledHost::new(true));
         s.set_host_services(host.clone());
         s.set_has_ui(false);
+        crate::connect::begin_runtime(&s, runtime_params(dir.path()));
 
         let policy = decide_inbound_policy(
             s.is_idle(),
@@ -1422,10 +1616,229 @@ mod tests {
             "the message reaches the agent: {injected:?}"
         );
         assert!(injected[0].0.contains("ping"));
-        assert!(
-            injected[0].3,
-            "an idle session gets a real turn-driving delivery"
+        // ICOM-084: a real turn — through the wake prompt, not a `triggerTurn` card.
+        assert!(!injected[0].3, "the card itself asks for no turn");
+        assert_eq!(
+            host.wakes(),
+            vec![IDLE_WAKE_PROMPT.to_string()],
+            "an idle session is woken to answer the message"
         );
+    }
+
+    /// ICOM-084 — `intercom.integration.test.ts` "idle interactive sessions wake through a user
+    /// prompt instead of triggerTurn" (`104b83c` #154): an idle trigger hands the card over with no
+    /// turn and wakes the session with [`IDLE_WAKE_PROMPT`]; a second delivery inside the
+    /// reservation adds no wake (its card rides the woken run); once that run's `agent_start`
+    /// spends the reservation, the next delivery wakes again ("a started run re-arms the wake").
+    #[tokio::test]
+    async fn an_idle_trigger_wakes_once_per_reservation_and_a_started_run_rearms_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Arc::new(state(true));
+        let host = Arc::new(IdleControlledHost::new(true));
+        s.set_host_services(host.clone());
+        s.set_has_ui(true);
+        crate::connect::begin_runtime(&s, runtime_params(dir.path()));
+        let generation = s.connect.generation();
+
+        assert!(send_incoming_message_at(
+            &s,
+            &from(),
+            &msg("a", "first"),
+            InboundDelivery::Trigger,
+            generation
+        ));
+        assert_eq!(host.wakes(), vec![IDLE_WAKE_PROMPT.to_string()]);
+        assert!(s.idle_wake_pending());
+        assert!(send_incoming_message_at(
+            &s,
+            &from(),
+            &msg("b", "second"),
+            InboundDelivery::Trigger,
+            generation
+        ));
+        assert_eq!(host.wakes().len(), 1, "one wake covers both messages");
+        let cards = host.injected();
+        assert_eq!(cards.len(), 2);
+        assert!(
+            cards.iter().all(|c| !c.3),
+            "triggerTurn would bypass before_agent_start: {cards:?}"
+        );
+
+        s.clear_idle_wake(); // the woken run's `agent_start`
+        assert!(send_incoming_message_at(
+            &s,
+            &from(),
+            &msg("c", "third"),
+            InboundDelivery::Trigger,
+            generation
+        ));
+        assert_eq!(host.wakes().len(), 2, "a started run re-arms the wake");
+    }
+
+    /// A busy session gets its card steered and is never woken (`getLiveContext(…)?.isIdle()`), a
+    /// non-trigger delivery (`inboundTrigger: "never"`, or the steer arm) never wakes, and a
+    /// delivery before the first runtime starts — `getLiveContext` is null without a
+    /// `runtimeContext` — or at a replaced generation never wakes either.
+    #[tokio::test]
+    async fn only_a_live_idle_trigger_wakes() {
+        let dir = tempfile::tempdir().unwrap();
+        // Busy.
+        let s = Arc::new(state(true));
+        let busy = Arc::new(IdleControlledHost::new(false));
+        s.set_host_services(busy.clone());
+        s.set_has_ui(true);
+        crate::connect::begin_runtime(&s, runtime_params(dir.path()));
+        assert!(trigger_turn_over_inbound(&s, &from(), &ask("x"), true));
+        assert_eq!(busy.injected().len(), 1);
+        assert!(
+            busy.wakes().is_empty(),
+            "a busy session must not get a wake prompt"
+        );
+        assert!(!s.idle_wake_pending());
+
+        // Idle, but the delivery does not trigger.
+        let idle = Arc::new(IdleControlledHost::new(true));
+        s.set_host_services(idle.clone());
+        let generation = s.connect.generation();
+        assert!(send_incoming_message_at(
+            &s,
+            &from(),
+            &ask("y"),
+            InboundDelivery::Steer,
+            generation
+        ));
+        assert!(trigger_turn_over_inbound(&s, &from(), &ask("z"), false));
+        assert_eq!(idle.injected().len(), 2);
+        assert!(idle.wakes().is_empty());
+
+        // Idle and triggering, but at a replaced generation. `send_incoming_message_at` already
+        // turns a stale generation away before the card (`is_live_at` at its head), so
+        // `deliver_card` is driven directly: this pins the wake gate's OWN `is_live_at` term, the
+        // one that keeps a card handed over across a `begin_runtime` from waking the new runtime.
+        let stale = s.connect.generation();
+        crate::connect::begin_runtime(&s, runtime_params(dir.path()));
+        assert_ne!(stale, s.connect.generation(), "begin_runtime replaced it");
+        assert!(deliver_card(
+            &s,
+            idle.as_ref(),
+            &ask("v"),
+            "card",
+            None,
+            true,
+            stale
+        ));
+        assert_eq!(idle.injected().len(), 3, "the card itself is delivered");
+        assert!(
+            idle.wakes().is_empty(),
+            "a replaced generation must not wake the session"
+        );
+        // Control: the same delivery at the live generation does wake, so the miss above is the
+        // generation term and not some other gate.
+        assert!(deliver_card(
+            &s,
+            idle.as_ref(),
+            &ask("u"),
+            "card",
+            None,
+            true,
+            s.connect.generation()
+        ));
+        assert_eq!(idle.wakes().len(), 1);
+
+        // No runtime has ever started.
+        let fresh = Arc::new(state(true));
+        let host = Arc::new(IdleControlledHost::new(true));
+        fresh.set_host_services(host.clone());
+        assert!(trigger_turn_over_inbound(&fresh, &from(), &ask("w"), true));
+        assert_eq!(host.injected().len(), 1, "the card is still delivered");
+        assert!(
+            host.wakes().is_empty(),
+            "but nothing is woken without a runtime"
+        );
+    }
+
+    /// `intercom.integration.test.ts` "a wake prompt that never starts a run stops blocking later
+    /// wakes after its window" (`104b83c` #154): an `input` handler can service the wake prompt, so
+    /// no `agent_start` follows — the reservation must expire after [`IDLE_WAKE_RESERVATION`]
+    /// instead of latching.
+    #[tokio::test]
+    async fn a_wake_that_never_starts_a_run_stops_blocking_after_its_window() {
+        use crate::session_state::IDLE_WAKE_RESERVATION;
+        let dir = tempfile::tempdir().unwrap();
+        let s = Arc::new(state(true));
+        let host = Arc::new(IdleControlledHost::new(true));
+        s.set_host_services(host.clone());
+        s.set_has_ui(true);
+        crate::connect::begin_runtime(&s, runtime_params(dir.path()));
+
+        assert!(trigger_turn_over_inbound(&s, &from(), &ask("first"), true));
+        assert!(trigger_turn_over_inbound(&s, &from(), &ask("second"), true));
+        assert_eq!(host.wakes().len(), 1, "a recent wake may still be starting");
+
+        // The predicate itself, at explicit instants: pending strictly inside the window.
+        let now = std::time::Instant::now();
+        s.request_idle_wake_at(now);
+        assert!(s.idle_wake_pending_at(
+            now + IDLE_WAKE_RESERVATION - std::time::Duration::from_millis(1)
+        ));
+        assert!(!s.idle_wake_pending_at(now + IDLE_WAKE_RESERVATION));
+
+        // Backdate the reservation past its window (`offset += 10_001`).
+        let expired = now
+            .checked_sub(IDLE_WAKE_RESERVATION + std::time::Duration::from_millis(1))
+            .expect("the monotonic clock is past 10 s");
+        s.request_idle_wake_at(expired);
+        assert!(!s.idle_wake_pending());
+        assert!(trigger_turn_over_inbound(&s, &from(), &ask("third"), true));
+        assert_eq!(
+            host.wakes().len(),
+            2,
+            "an expired wake must not block the next one"
+        );
+    }
+
+    /// A wake the host refuses does not unsend the card (it was already taken, and the sender is
+    /// told `injected`), and it releases the reservation so the next delivery can try again.
+    #[tokio::test]
+    async fn a_refused_wake_keeps_the_card_and_releases_the_reservation() {
+        struct NoWakeHost(IdleControlledHost);
+        impl cyrup_ext::HostServices for NoWakeHost {
+            fn is_idle(&self) -> bool {
+                true
+            }
+            fn inject_message(
+                &self,
+                content: &str,
+                custom_type: Option<&str>,
+                display: bool,
+                details: Option<&serde_json::Value>,
+                trigger_turn: bool,
+            ) -> std::result::Result<(), String> {
+                self.0
+                    .inject_message(content, custom_type, display, details, trigger_turn)
+            }
+            fn wake_user_prompt(&self, _text: &str) -> std::result::Result<(), String> {
+                Err("no live prompt path".to_string())
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let s = Arc::new(state(true));
+        let host = Arc::new(NoWakeHost(IdleControlledHost::new(true)));
+        s.set_host_services(host.clone());
+        s.set_has_ui(true);
+        crate::connect::begin_runtime(&s, runtime_params(dir.path()));
+
+        assert!(trigger_turn_over_inbound(&s, &from(), &ask("kept"), true));
+        assert_eq!(host.0.injected().len(), 1);
+        assert!(!s.idle_wake_pending());
+    }
+
+    fn runtime_params(dir: &std::path::Path) -> crate::connect::ConnectParams {
+        crate::connect::ConnectParams {
+            agent_dir: dir.join("agent"),
+            metadata: None,
+            model: None,
+        }
     }
 
     /// ICOM-022 regression (pi `sendIncomingMessage`, `index.ts:652-672`): the string the model
@@ -1634,10 +2047,16 @@ mod tests {
         /// `ctx.hasPendingMessages()` — a human steer/follow-up queued in the host.
         pending: std::sync::atomic::AtomicBool,
         injected: std::sync::Mutex<Vec<InjectedCall>>,
+        /// ICOM-084 — every `wake_user_prompt` text, in call order.
+        wakes: std::sync::Mutex<Vec<String>>,
     }
     impl cyrup_ext::HostServices for FlippableHost {
         fn is_idle(&self) -> bool {
             self.idle.load(std::sync::atomic::Ordering::SeqCst)
+        }
+        fn wake_user_prompt(&self, text: &str) -> std::result::Result<(), String> {
+            self.wakes.lock().unwrap().push(text.to_string());
+            Ok(())
         }
         fn has_pending_messages(&self) -> bool {
             self.pending.load(std::sync::atomic::Ordering::SeqCst)
@@ -1672,6 +2091,7 @@ mod tests {
             idle: std::sync::atomic::AtomicBool::new(idle),
             pending: std::sync::atomic::AtomicBool::new(false),
             injected: std::sync::Mutex::new(Vec::new()),
+            wakes: std::sync::Mutex::new(Vec::new()),
         })
     }
 
@@ -1732,9 +2152,13 @@ mod tests {
         flush_held_inbound_messages(&s, generation);
         let triggered = host.injected.lock().unwrap().clone();
         assert_eq!(triggered.len(), 1);
-        assert!(
-            triggered[0].3,
-            "idle delivery drives a turn under inboundTrigger: always"
+        // ICOM-084 (`104b83c` #154): the card itself asks for no turn; the idle session is woken
+        // with the prompt-lifecycle user message instead.
+        assert!(!triggered[0].3, "the card is handed over with no turn");
+        assert_eq!(
+            *host.wakes.lock().unwrap(),
+            vec![IDLE_WAKE_PROMPT.to_string()],
+            "idle delivery under inboundTrigger: always wakes the session once"
         );
     }
 
@@ -1882,13 +2306,43 @@ mod tests {
         ));
         s.set_agent_running(false);
 
-        // The idle flush: ONE peer, through the normal delivery decision (a turn under `always`).
+        // The idle flush: ONE peer, through the normal delivery decision (a wake under `always`).
         host.injected.lock().unwrap().clear();
         flush_held_inbound_messages(&s, generation);
         let triggered = host.injected.lock().unwrap().clone();
         assert_eq!(triggered.len(), 1, "one peer per flush: {triggered:?}");
-        assert!(triggered[0].0.ends_with("m2") && triggered[0].3);
+        assert!(triggered[0].0.ends_with("m2") && !triggered[0].3);
+        assert_eq!(
+            *host.wakes.lock().unwrap(),
+            vec![IDLE_WAKE_PROMPT.to_string()]
+        );
         assert_eq!(s.held_inbound_len(), 1, "m3 waits for a later turn or tick");
+
+        // ICOM-084 — `intercom.integration.test.ts` "human-first releases the next held peer only
+        // after the woken run starts" (`104b83c` #154): the wake prompt's preflight keeps the
+        // session idle across several flush ticks, and none of them may release m3 into the SAME
+        // woken run.
+        for _ in 0..3 {
+            flush_held_inbound_messages(&s, generation);
+        }
+        assert_eq!(
+            host.injected.lock().unwrap().len(),
+            1,
+            "peer m3 must wait for a later turn"
+        );
+        assert_eq!(s.held_inbound_len(), 1);
+        // `agent_start` spends the reservation (`index.ts:2077`); the next idle tick releases m3.
+        s.clear_idle_wake();
+        flush_held_inbound_messages(&s, generation);
+        let released = host.injected.lock().unwrap().clone();
+        assert_eq!(released.len(), 2);
+        assert!(released[1].0.ends_with("m3"));
+        assert_eq!(
+            host.wakes.lock().unwrap().len(),
+            2,
+            "a started run re-arms the wake"
+        );
+        assert_eq!(s.held_inbound_len(), 0);
 
         // The default policy never releases at a turn boundary.
         let steer = Arc::new(state(false));

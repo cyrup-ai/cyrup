@@ -14,7 +14,8 @@
 //! **re-execs the broker as a detached OS process** — the configured `broker_command`/`broker_args`
 //! (`IntercomConfig`, `config.ts:24,26`) if they differ from pi's own `"npx" ["--no-install","tsx"]`
 //! default, else `current_exe()` (or the `CYRUP_INTERCOM_BROKER_BINARY` override) with argv
-//! `["__intercom-broker"]` — mirroring `getBrokerLaunchSpec`'s `usesDefaultBrokerCommand` gate
+//! `["__intercom-broker"]`, run with its cwd at the intercom runtime dir (`broker/spawn.ts:119-120`,
+//! see [`resolve_broker_program`] for how a relative configured command resolves) — mirroring `getBrokerLaunchSpec`'s `usesDefaultBrokerCommand` gate
 //! (`spawn.ts:67-72,121-154`) and `ensureConnected`'s `spawnBrokerIfNeeded(config.brokerCommand,
 //! config.brokerArgs)` call (`index.ts:828`). Stdin/stdout null and stderr PIPED into a bounded 4 KB
 //! tail (`v0.10.1 broker/spawn.ts:25,156-176,216-232`, commit `c9675a5`) so a startup failure can
@@ -90,6 +91,7 @@ pub async fn ensure_broker(agent_dir: &Path) -> Result<()> {
     // Owner path — release the lock on every exit (spawn.ts:238-240).
     let result = spawn_owner(
         agent_dir,
+        &intercom_dir,
         &pid_path,
         &config.broker_command,
         &config.broker_args,
@@ -101,6 +103,7 @@ pub async fn ensure_broker(agent_dir: &Path) -> Result<()> {
 
 async fn spawn_owner(
     agent_dir: &Path,
+    intercom_dir: &Path,
     pid_path: &Path,
     broker_command: &str,
     broker_args: &[String],
@@ -109,7 +112,8 @@ async fn spawn_owner(
     if is_broker_running_for(agent_dir, pid_path).await {
         return Ok(());
     }
-    let (mut child, stderr_tail) = spawn_detached_broker(agent_dir, broker_command, broker_args)?;
+    let (mut child, stderr_tail) =
+        spawn_detached_broker(agent_dir, intercom_dir, broker_command, broker_args)?;
     // Race the health-poll against the child's own exit (spawn.ts:205-236): a broker that fails to
     // spawn or dies before startup completes must fail fast with its exit code/signal, not silently
     // wait out the full 5s timeout only to report a generic "timed out".
@@ -173,21 +177,57 @@ pub fn resolve_broker_command(
     (PathBuf::from(broker_command), args)
 }
 
+/// A user-configured RELATIVE program path that names a file (it has more than one path component,
+/// e.g. `./bin/broker` or `tools/broker`) resolved against the broker's working directory, the
+/// intercom runtime dir. README.md:488@v0.16.1 (`ac9cc1a`, #140): "Custom broker commands can use
+/// executables on `PATH` or absolute paths; relative file paths in commands and arguments resolve
+/// from the runtime directory." Node gets that for free from `spawn(command, { cwd })`; Rust's
+/// `Command::new(relative)` + `current_dir` is documented as platform-specific (whether the program
+/// is looked up relative to the parent's cwd or the child's), so the join is made explicit here
+/// rather than left to the platform. A bare name (one component, e.g. `my-broker`) keeps the PATH
+/// lookup, and an absolute path — `current_exe()`, the `CYRUP_INTERCOM_BROKER_BINARY` override, or
+/// an absolute configured command — is unchanged. Relative ARGUMENTS need no rewriting: they are
+/// interpreted by the broker program itself, against the cwd the spawn sets.
+#[must_use]
+pub fn resolve_broker_program(binary: &Path, intercom_dir: &Path) -> PathBuf {
+    if binary.is_relative() && binary.components().count() > 1 {
+        intercom_dir.join(binary)
+    } else {
+        binary.to_path_buf()
+    }
+}
+
 /// Spawn the broker as a genuinely detached process (`spawn.ts:202-203`, cyrup form): stdio null,
-/// `process_group(0)`, env overlay `CYRUP_CODING_AGENT_DIR=<abs agent dir>`. The child handle is
+/// `process_group(0)`, cwd = the intercom runtime dir, env overlay
+/// `CYRUP_CODING_AGENT_DIR=<abs agent dir>`. The child handle is
 /// returned (rather than dropped) so the caller can race it against `wait_for_broker` (spawn.ts:205-
 /// 236); it keeps running detached under its own process group however the caller's handle is
 /// eventually dropped. Mirrors `cyrup-ext-subagents::background::spawn_detached_runner`.
 fn spawn_detached_broker(
     agent_dir: &Path,
+    intercom_dir: &Path,
     broker_command: &str,
     broker_args: &[String],
 ) -> Result<(tokio::process::Child, BrokerStderrTail)> {
+    // Both directories are made absolute BEFORE the cwd moves: the broker re-derives every path
+    // from `CYRUP_CODING_AGENT_DIR`, and `agent_dir_path` resolves a relative value against the
+    // broker's own cwd (`paths.ts:27-31` / `agent_dir_path_from`), which below is no longer ours.
+    let agent_dir = std::path::absolute(agent_dir).unwrap_or_else(|_| agent_dir.to_path_buf());
+    let intercom_dir =
+        std::path::absolute(intercom_dir).unwrap_or_else(|_| intercom_dir.to_path_buf());
     let (binary, args) = resolve_broker_command(broker_command, broker_args);
+    let binary = resolve_broker_program(&binary, &intercom_dir);
     let mut command = tokio::process::Command::new(&binary);
     command
         .args(&args)
-        .env(paths::ENV_CODING_AGENT_DIR, agent_dir)
+        // `cwd: getIntercomDirPath(agentDir)` (`broker/spawn.ts:119-120@v0.16.1`, `ac9cc1a` #140):
+        // "Windows locks a process's cwd against renames, so keep it outside the package." cyrup's
+        // own reason is the same lock seen from the other side: without this the long-lived,
+        // detached broker inherits the cwd of whichever SESSION happened to spawn it, pinning that
+        // project directory (undeletable / unrenamable on Windows, an unmountable busy dir on
+        // unix) for as long as the broker outlives the session that started it.
+        .current_dir(&intercom_dir)
+        .env(paths::ENV_CODING_AGENT_DIR, &agent_dir)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         // `getBrokerSpawnOptions(extensionDir, env, captureStderr)` switches stdio to
@@ -740,6 +780,118 @@ mod tests {
         );
     }
 
+    /// README.md:488@v0.16.1: PATH names and absolute paths are launched as given; a relative FILE
+    /// path resolves from the runtime directory.
+    #[test]
+    fn resolve_broker_program_joins_only_relative_file_paths_onto_the_runtime_dir() {
+        let rt = Path::new("/srv/agent/intercom");
+        // A bare name keeps the PATH lookup.
+        assert_eq!(
+            resolve_broker_program(Path::new("my-broker"), rt),
+            PathBuf::from("my-broker")
+        );
+        // A relative path with a separator is a file path: it resolves from the runtime dir.
+        assert_eq!(
+            resolve_broker_program(Path::new("./bin/broker"), rt),
+            rt.join("./bin/broker")
+        );
+        assert_eq!(
+            resolve_broker_program(Path::new("tools/broker"), rt),
+            rt.join("tools/broker")
+        );
+        // An absolute path is unchanged.
+        let abs = std::env::temp_dir().join("broker");
+        assert_eq!(resolve_broker_program(&abs, rt), abs);
+    }
+
+    /// `broker/spawn.test.ts:82@v0.16.1` (`assert.equal(options.cwd, getIntercomDirPath())`),
+    /// production form: a real detached spawn through `spawn_owner` runs with its cwd at the
+    /// intercom runtime dir — not the spawning test's (session's) cwd — and a RELATIVE configured
+    /// command and a relative argument both resolve from there. The "broker" is a two-line script
+    /// at `<intercom>/bin/fake-broker` that records `pwd`, its relative-arg read and the
+    /// `CYRUP_CODING_AGENT_DIR` it was handed, then exits; its early exit is the expected error,
+    /// and the recorded file is what is asserted.
+    ///
+    /// The agent dir is passed RELATIVE to this process's cwd (a `../..` walk to the root, then the
+    /// tempdir), so it names the right directory only from here. Dropping the
+    /// `std::path::absolute(agent_dir)` in `spawn_detached_broker` hands the broker that relative
+    /// string, to be re-resolved against a cwd that has moved, and the `is_absolute` assertion
+    /// fails. No
+    /// `set_current_dir`: the walk is computed from the cwd the test already has, so sibling tests
+    /// running as threads of this process are undisturbed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_broker_runs_from_the_intercom_runtime_dir_and_relative_paths_resolve_there() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let intercom_dir = dir.path().join("intercom");
+        std::fs::create_dir_all(intercom_dir.join("bin")).unwrap();
+        std::fs::write(intercom_dir.join("note.txt"), "found-relative-arg\n").unwrap();
+        let script = intercom_dir.join("bin").join("fake-broker");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\n[ -z \"$1\" ] && exit 0\npwd -P > cwd.out\ncat \"$1\" >> cwd.out\nprintf '%s\\n' \"$CYRUP_CODING_AGENT_DIR\" >> cwd.out\nexit 3\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // Tests run as threads of one process: a sibling's `fork` during the write above inherits
+        // the write fd, and `exec` answers ETXTBSY until it closes. One argument-less probe run
+        // (which the script's first line turns into a no-op) proves the file is exec-able.
+        for _ in 0..500 {
+            match std::process::Command::new(&script).status() {
+                Err(e) if e.raw_os_error() == Some(26) => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                _ => break,
+            }
+        }
+        let pid_path = intercom_dir.join("broker.pid");
+        // `getcwd` is already physical, so each `..` climbs a real parent.
+        let cwd = std::env::current_dir().unwrap();
+        let mut relative_agent_dir = PathBuf::new();
+        for _ in cwd.components().skip(1) {
+            relative_agent_dir.push("..");
+        }
+        relative_agent_dir.push(dir.path().strip_prefix("/").unwrap());
+        assert!(relative_agent_dir.is_relative());
+        assert_eq!(
+            cwd.join(&relative_agent_dir).canonicalize().unwrap(),
+            dir.path().canonicalize().unwrap(),
+            "the relative agent dir names the tempdir from this process's cwd"
+        );
+
+        let result = spawn_owner(
+            &relative_agent_dir,
+            &intercom_dir,
+            &pid_path,
+            "./bin/fake-broker",
+            &["note.txt".to_string()],
+        )
+        .await;
+        let msg = result
+            .expect_err("the fake broker exits before startup")
+            .to_string();
+        assert!(msg.contains("exited before startup"), "{msg}");
+
+        let out = std::fs::read_to_string(intercom_dir.join("cwd.out"))
+            .expect("the broker wrote cwd.out relative to its cwd, i.e. into the runtime dir");
+        let mut lines = out.lines();
+        assert_eq!(
+            Path::new(lines.next().unwrap()),
+            intercom_dir.canonicalize().unwrap(),
+            "cwd is getIntercomDirPath(agentDir)"
+        );
+        assert_eq!(lines.next(), Some("found-relative-arg"));
+        // The agent dir handed over is absolute — made so against OUR cwd before the broker's
+        // moved — so it still names the tempdir, not a path re-resolved from the runtime dir.
+        let handed = Path::new(lines.next().unwrap());
+        assert!(handed.is_absolute(), "{}", handed.display());
+        assert_eq!(
+            handed.canonicalize().unwrap(),
+            dir.path().canonicalize().unwrap()
+        );
+    }
+
     #[test]
     fn uses_default_broker_command_matches_pis_literal_default() {
         assert!(uses_default_broker_command(
@@ -768,7 +920,7 @@ mod tests {
         let start = std::time::Instant::now();
         // "false" is a non-default broker_command (per `uses_default_broker_command`), so this also
         // exercises the custom-command path landing on a real, immediately-exiting process.
-        let result = spawn_owner(dir.path(), &pid_path, "false", &[]).await;
+        let result = spawn_owner(dir.path(), &intercom_dir, &pid_path, "false", &[]).await;
         let elapsed = start.elapsed();
 
         assert!(

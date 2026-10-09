@@ -815,6 +815,7 @@ fn fixture_persona(name: &str) -> ResolvedAgentPersona {
 
 fn single_step(agent: &str, task: &str, acceptance: serde_json::Value) -> SingleStepSpec {
     SingleStepSpec {
+        worktree: cyrup_ext_subagents::spawn::worktree::WorktreeRequest::Shared,
         machine: None,
         skills: Some(Vec::new()),
         session_dir: None,

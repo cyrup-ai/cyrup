@@ -27,7 +27,10 @@ mod session_target;
 mod tests;
 
 pub use args::Cli;
-pub use argv::{ExtFlagValue, ExtensionFlag, normalize_short_aliases, partition_extension_flags};
+pub use argv::{
+    ExtFlagValue, ExtensionFlag, normalize_process_argv, normalize_short_aliases,
+    partition_extension_flags,
+};
 pub use config_map::{is_local_path, resolve_cli_paths, resolve_prompt_input};
 // ACP-213 — `crate::prelaunch::resolve_session` is the second call site of the one `config.persist`
 // rule; re-exported at the module root so it does not have to reach into `config_map` by path.

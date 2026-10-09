@@ -20,7 +20,13 @@
 //! - [`InlineMessage::render`] draws the bordered card (`registerMessageRenderer("intercom_message",
 //!   …)`, `index.ts:1142-1146`); cyrup embeds the rendered lines in the same `append_entry` payload
 //!   (`card`) so the human still sees the framed message even without a live renderer.
+//!
+//! Both roles attribute a message that arrived over the SSH relay (`Message::cross_machine`,
+//! ICOM-076) to its ASSERTED `name@machine` with a `· unverified cross-machine` suffix, and the card
+//! labels its hint `To send a new message to name@machine:` instead of `To reply:`
+//! (`v0.16.1 ui/inline-message.ts:40-47`, `index.ts:1283-1285`).
 
+use crate::cross_machine::relay_sender_name;
 use crate::transport::protocol::{Message, SessionInfo};
 use crate::ui::{Theme, truncate_to_width, visible_width, wrap_text};
 
@@ -39,7 +45,9 @@ pub struct InlineMessage {
     pub from: SessionInfo,
     /// The received message.
     pub message: Message,
-    /// The reply-hint command shown in the card, when the sender expects a reply and the hint is on.
+    /// The command hint shown in the card when the hint is on: the reply command when the sender
+    /// expects a reply, or — for a relayed (`crossMachine`) message — a `send` back to its asserted
+    /// `name@machine` (ICOM-076, `v0.16.1 index.ts:1389-1393`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reply_command: Option<String>,
     /// The pre-formatted body (text + attachment text). `None` falls back to `message.content.text`
@@ -74,15 +82,52 @@ impl InlineMessage {
             .unwrap_or(&self.message.content.text)
     }
 
-    /// The sender display label (pi `from.name || from.id.slice(0, 8)`).
+    /// ICOM-076 — the ASSERTED `name@machine` of a message that arrived over the SSH relay, or
+    /// `None` for an ordinary local message (`v0.16.1 ui/inline-message.ts:40`):
+    ///
+    /// ```text
+    /// const remoteSender = this.message.crossMachine && relaySenderName(this.message.crossMachine.origin);
+    /// ```
+    ///
+    /// The relay CLI registers under this same `name@machine` (`cli.ts:193`), so `from.name` would
+    /// usually read the same — but `from` is the transient relay session, and a local peer can put a
+    /// `crossMachine` block on a frame it sends straight to the broker. The provenance, not `from`,
+    /// is what upstream attributes.
+    fn remote_sender(&self) -> Option<String> {
+        self.message
+            .cross_machine
+            .as_ref()
+            .map(|cm| relay_sender_name(&cm.origin.name, &cm.origin.machine))
+    }
+
+    /// The sender display label. A relayed message is attributed to its asserted origin and marked
+    /// `· unverified cross-machine` (`v0.16.1 ui/inline-message.ts:41-43`, and the identical
+    /// `senderDisplay` the model reads at `index.ts:1283-1285`); a local one is pi's
+    /// `from.name || from.id.slice(0, 8)`.
+    ///
+    /// The separator is U+00B7 with a space each side, byte-identical to upstream: this string
+    /// reaches the MODEL through [`Self::content_markdown`], not just the card.
     #[must_use]
     pub fn sender_display(&self) -> String {
+        if let Some(remote) = self.remote_sender() {
+            return format!("{remote} · unverified cross-machine");
+        }
         self.from
             .name
             .as_deref()
             .filter(|n| !n.is_empty())
             .map(str::to_string)
             .unwrap_or_else(|| self.from.id.chars().take(8).collect())
+    }
+
+    /// The label in front of the card's command hint (`v0.16.1 ui/inline-message.ts:44-46`). A
+    /// relayed message cannot be REPLIED to — the relay session that delivered it is gone the
+    /// moment the CLI exits — so its hint is a fresh `send` back over SSH and the card says so.
+    fn reply_label(&self) -> String {
+        match self.remote_sender() {
+            Some(remote) => format!("To send a new message to {remote}:"),
+            None => "To reply:".to_string(),
+        }
     }
 
     /// The human-readable body pi's `sendIncomingMessage` injects into the session
@@ -98,6 +143,12 @@ impl InlineMessage {
     /// - the `_{deliveryMetadata}_` segment has been present since v0.9.2 and was never ported. It
     ///   always carries at least `id {message.id}`, which is the only way the model learns the id
     ///   `intercom({action:"reply", replyTo})` needs without a separate `pending` round trip.
+    ///
+    /// ICOM-076: for a relayed message `senderDisplay` carries the `· unverified cross-machine`
+    /// suffix ([`Self::sender_display`]), but the `To reply, use the intercom tool:` prefix is
+    /// deliberately NOT relabelled — `v0.16.1 index.ts:1286` keeps that wording for every message and
+    /// only the command after it becomes the `send` hint. Only the CARD's label changes
+    /// ([`Self::reply_label`]); do not harmonise the two.
     #[must_use]
     pub fn content_markdown(&self) -> String {
         let reply_instruction = self
@@ -174,10 +225,10 @@ impl InlineMessage {
             lines.push(card_row(theme, body_width, &theme.fg("text", &line)));
         }
 
-        // Reply hint block.
+        // Reply hint block (`v0.16.1 ui/inline-message.ts:98`: `` ` ${replyLabel} ${replyCommand}` ``).
         if let Some(rc) = &self.reply_command {
             lines.push(card_row(theme, body_width, ""));
-            let hint = theme.fg("dim", &format!(" To reply: {rc}"));
+            let hint = theme.fg("dim", &format!(" {} {rc}", self.reply_label()));
             for line in wrap_text(&hint, body_width) {
                 lines.push(card_row(theme, body_width, &line));
             }
@@ -242,8 +293,9 @@ impl InlineMessage {
         lines.push(card_row(theme, body_width, &theme.fg("text", &preview)));
 
         let mut meta: Vec<String> = Vec::new();
+        // `v0.16.1 ui/inline-message.ts:72`: `` `${replyLabel} ${this.replyCommand}` ``.
         if let Some(rc) = &self.reply_command {
-            meta.push(format!("To reply: {rc}"));
+            meta.push(format!("{} {rc}", self.reply_label()));
         }
         if let Some(atts) = &self.message.content.attachments {
             let count = atts.len();
@@ -739,6 +791,120 @@ mod tests {
             card.render(&PlainTheme, 120)
                 .join("\n")
                 .contains("Attachment: note.txt")
+        );
+    }
+
+    /// The provenance the relay CLI stamps (`test/inline-message.test.ts:57-62@v0.16.1`).
+    fn relayed(text: &str) -> Message {
+        use crate::transport::protocol::{CrossMachineProvenance, ProvenanceOrigin, RelayTrust};
+        let mut msg = message(text);
+        msg.cross_machine = Some(CrossMachineProvenance::ssh_relay(
+            ProvenanceOrigin {
+                name: "worker".to_string(),
+                session_id: "00000000-0000-4000-8000-000000000001".to_string(),
+                machine: "laptop".to_string(),
+                extra: Default::default(),
+            },
+            RelayTrust::SshAsserted,
+        ));
+        msg
+    }
+
+    const LONG: &str = "This is a long message that should use the available terminal width instead of a narrow fixed card.";
+    const SEND_HINT: &str =
+        "intercom({ action: \"send\", to: \"worker@laptop\", message: \"...\" })";
+
+    // Port of test/inline-message.test.ts:54-69@v0.16.1.
+    #[test]
+    fn cross_machine_messages_label_the_asserted_identity_as_unverified() {
+        let card = InlineMessage {
+            reply_command: Some(SEND_HINT.to_string()),
+            ..InlineMessage::new(from(), relayed(LONG))
+        };
+        let rendered = card.render(&PlainTheme, 120).join("\n");
+        assert!(
+            rendered.contains("worker@laptop · unverified cross-machine"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("To send a new message to worker@laptop: intercom"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("To reply"), "{rendered}");
+    }
+
+    // Port of test/inline-message.test.ts:71-86@v0.16.1.
+    #[test]
+    fn collapsed_cross_machine_messages_keep_the_unverified_identity_and_new_message_affordance() {
+        let card = InlineMessage {
+            reply_command: Some(SEND_HINT.to_string()),
+            collapsed: true,
+            ..InlineMessage::new(from(), relayed(LONG))
+        };
+        let rendered = card.render(&PlainTheme, 160).join("\n");
+        assert!(
+            rendered.contains("From: worker@laptop · unverified cross-machine"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("To send a new message to worker@laptop: intercom"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("To reply"), "{rendered}");
+    }
+
+    // Port of test/inline-message.test.ts:88-95@v0.16.1.
+    #[test]
+    fn local_message_header_and_reply_affordance_remain_unchanged() {
+        let card = InlineMessage {
+            reply_command: Some("intercom reply".to_string()),
+            ..InlineMessage::new(from(), message(LONG))
+        };
+        let rendered = card.render(&PlainTheme, 100).join("\n");
+        assert!(
+            rendered.contains("From: sender (/tmp/project)"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("To reply: intercom reply"), "{rendered}");
+        assert!(!rendered.contains("unverified cross-machine"), "{rendered}");
+        assert!(!rendered.contains("To send a new message to"), "{rendered}");
+    }
+
+    /// `v0.16.1 index.ts:1283-1286` byte for byte: the MODEL-facing attribution carries the
+    /// unverified suffix, while the `To reply, use the intercom tool:` prefix is upstream's
+    /// unchanged wording around the `send` hint.
+    #[test]
+    fn cross_machine_content_markdown_attributes_the_asserted_origin_as_unverified() {
+        let card = InlineMessage {
+            reply_command: Some(SEND_HINT.to_string()),
+            ..InlineMessage::new(from(), relayed("body here"))
+        };
+        assert_eq!(
+            card.content_markdown(),
+            "**From worker@laptop · unverified cross-machine** (/tmp/project)\n\nTo reply, use the intercom tool: intercom({ action: \"send\", to: \"worker@laptop\", message: \"...\" })\n\n_id message-1 · sent 1970-01-01T00:00:00.000Z_\n\nbody here"
+        );
+    }
+
+    /// The provenance wins over `from`: a relayed frame is attributed to what it asserts even when
+    /// the delivering session's own name says something else.
+    #[test]
+    fn cross_machine_attribution_comes_from_the_provenance_not_the_delivering_session() {
+        let mut sender = from();
+        sender.name = Some("relay-cli".to_string());
+        let card = InlineMessage::new(sender, relayed("x"));
+        assert_eq!(
+            card.sender_display(),
+            "worker@laptop · unverified cross-machine"
+        );
+        assert!(
+            card.render(&PlainTheme, 2)[0].starts_with("Fr"),
+            "narrow width still degrades to the From line"
+        );
+        assert!(
+            !card
+                .render(&PlainTheme, 120)
+                .join("\n")
+                .contains("relay-cli")
         );
     }
 

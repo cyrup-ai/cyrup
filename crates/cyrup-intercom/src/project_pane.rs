@@ -22,9 +22,7 @@ use std::time::Duration;
 
 use cyrup_core::CancelToken;
 use cyrup_herdr::Unavailable;
-use cyrup_herdr::cli::{
-    CliError, CliOutput, HerdrCli, extract_pane_id, parse_herdr_version, shell_quote,
-};
+use cyrup_herdr::cli::{CliError, CliOutput, HerdrCli, extract_pane_id, parse_herdr_version};
 // `parseLastJson` runs inside `HerdrCli::run` now, so the port has no call of its own — but this
 // file's test for it predates the move and must keep passing unmodified against the one
 // implementation, which is what this import gives it through `use super::*`.
@@ -297,6 +295,30 @@ pub(crate) fn resolve_agent_command(env: impl Fn(&str) -> Option<String>) -> Str
         .unwrap_or_else(|| "cyrup".to_string())
 }
 
+/// The text `herdr pane run` types into the pane's shell for `command`.
+///
+/// `herdr pane run` joins its argv and sends it as keystrokes (`tmp/herdr/src/cli/pane.rs:1047-1051`),
+/// so the pane's shell — not an `exec` — splits it. A command made only of characters no POSIX
+/// shell treats specially is returned unchanged, which is upstream's argv byte for byte
+/// (`project-agent.ts:240-241@v0.16.1`). Anything else (whitespace, quotes, `$`, `;`, …) is
+/// single-quoted on unix via [`cyrup_herdr::remote::shell_quote_remote`] so it reaches the shell as
+/// one word. On Windows the pane's shell is not POSIX, a single quote is a literal there, and that
+/// literal is exactly the bug `e3a5258` fixed, so the command is returned unchanged.
+fn pane_run_command(command: &str) -> String {
+    #[cfg(unix)]
+    {
+        let plain = !command.is_empty()
+            && command.chars().all(|c| {
+                c.is_ascii_alphanumeric()
+                    || matches!(c, '/' | '.' | '_' | '-' | '+' | ':' | ',' | '=' | '@' | '%')
+            });
+        if !plain {
+            return cyrup_herdr::remote::shell_quote_remote(command);
+        }
+    }
+    command.to_string()
+}
+
 /// [`cyrup_herdr::EnvSource`] over a plain `Fn(&str) -> Option<String>`.
 ///
 /// Every `*_with_env` constructor in this crate takes a closure, and its tests are written against
@@ -539,10 +561,25 @@ impl ProjectPaneLauncher for HerdrLauncher {
             ));
         };
 
-        let command = shell_quote(&self.agent_command);
+        // `client.run(["pane", "run", paneId, command], …)` (`project-agent.ts:240-241@v0.16.1`,
+        // `e3a5258` #143): a plain command is ONE argv token, never pre-quoted. `herdr pane run`
+        // takes variadic argv, joins it and types it into the pane's shell itself
+        // (`tmp/herdr/src/cli/pane.rs:1047-1051`), so a pre-quote reached the pane as literal
+        // quote characters — `"cyrup"` on a Windows pane, which is not a command, so the agent
+        // never started and the caller timed out waiting for its session.
+        //
+        // cyrup diverges for one case upstream never meets by default: pi's default is the bare
+        // `pi`, but cyrup's is `current_exe()` ([`resolve_agent_command`]) — an absolute path, and
+        // on a default install possibly one with a space in it. Because herdr TYPES the joined text
+        // into the pane's shell, an unquoted space splits it there. See [`pane_run_command`]: a
+        // command that needs no quoting is passed byte-identical to upstream; one that does is
+        // POSIX single-quoted on unix; on Windows it stays unquoted (upstream's trade-off — point
+        // `CYRUP_INTERCOM_CYRUP_BIN` at a space-free path or a bare name on PATH).
+        let command = self.agent_command.clone();
+        let typed = pane_run_command(&command);
         if let Err(e) = self
             .run(
-                &["pane", "run", &pane_id, &command],
+                &["pane", "run", &pane_id, &typed],
                 PANE_COMMAND_TIMEOUT_MS,
                 request.cancel,
             )
@@ -654,16 +691,6 @@ mod tests {
         assert!(supports_raw_panes((0, 8, 0)));
         assert!(supports_raw_panes((1, 0, 0)));
         assert!(!supports_raw_panes((0, 6, 9)));
-    }
-
-    #[test]
-    fn shell_quote_wraps_and_escapes_for_the_host_platform() {
-        if cfg!(windows) {
-            assert_eq!(shell_quote(r#"a"b"#), r#""a\"b""#);
-        } else {
-            assert_eq!(shell_quote("/usr/bin/my cyrup"), "'/usr/bin/my cyrup'");
-            assert_eq!(shell_quote("it's"), r"'it'\''s'");
-        }
     }
 
     #[test]
@@ -941,6 +968,90 @@ mod tests {
             err.to_string(),
             "Herdr project pane error (HERDR_UNSUPPORTED_VERSION): Herdr herdr 0.7.4 does not \
              support raw panes. Upgrade to Herdr 0.7.5 or newer."
+        );
+    }
+
+    /// Drive [`HerdrLauncher::open`] against a fake herdr that records every argv it is handed, one
+    /// token per line, with `agent` as the agent command. Returns the launch's reported command,
+    /// the last recorded call (`pane run`) and the whole log.
+    #[cfg(unix)]
+    async fn launch_recording(agent: &str) -> (String, Vec<String>, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("argv.log");
+        let bin = fake_herdr_script(
+            dir.path(),
+            &format!(
+                "for a in \"$@\"; do printf '%s\\n' \"$a\" >> '{log}'; done\n\
+                 printf -- '--\\n' >> '{log}'\n\
+                 case \"$1 $2\" in\n  \
+                 --version*) echo 'herdr 0.9.1' ;;\n  \
+                 'pane split') echo '{{\"type\":\"pane_info\",\"pane\":{{\"pane_id\":\"w1:p2\"}}}}' ;;\n  \
+                 'pane run') echo '{{\"type\":\"ok\"}}' ;;\n  \
+                 *) exit 1 ;;\nesac",
+                log = log.display()
+            ),
+        );
+        let agent = agent.to_string();
+        let launcher = HerdrLauncher::with_env(move |k| match k {
+            ENV_HERDR_BIN => Some(bin.display().to_string()),
+            ENV_INTERCOM_CYRUP_BIN => Some(agent.clone()),
+            _ => None,
+        });
+
+        let launch = launcher
+            .open(ProjectPaneRequest {
+                project_root: dir.path().to_path_buf(),
+                focus: false,
+                cancel: &CancelToken::new(),
+            })
+            .await
+            .expect("the fake herdr splits and runs");
+
+        assert_eq!(launch.pane_id, "w1:p2");
+        let recorded = std::fs::read_to_string(&log).unwrap();
+        let last = recorded
+            .split("--\n")
+            .filter(|c| !c.is_empty())
+            .last()
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect();
+        (launch.command, last, recorded)
+    }
+
+    /// `project-agent.test.ts:93@v0.16.1` (`e3a5258`, #143): `pane run` receives a plain agent
+    /// command as one unquoted argv token — `["pane", "run", "pane-1", "pi"]`, not `"'pi'"`. A
+    /// pre-quote (or a split) would show up verbatim in the fake's log.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pane_run_receives_a_plain_agent_command_as_one_unquoted_argv_token() {
+        let (command, last, recorded) = launch_recording("/usr/bin/my-cyrup").await;
+
+        // The launch reports the command it ran (`return { paneId, projectRoot, command … }`,
+        // `:247`).
+        assert_eq!(command, "/usr/bin/my-cyrup");
+        assert_eq!(last, ["pane", "run", "w1:p2", "/usr/bin/my-cyrup"]);
+        assert!(
+            !recorded.contains('\''),
+            "no pre-quote reached herdr: {recorded}"
+        );
+    }
+
+    /// cyrup's divergence: its default agent command is `current_exe()`, an absolute path that can
+    /// hold a space. herdr types the joined argv into the pane's shell, so on unix such a path is
+    /// POSIX single-quoted — still ONE argv token, which the shell then reads as one word.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pane_run_single_quotes_a_spaced_agent_path_as_one_token_on_unix() {
+        let (command, last, _) = launch_recording("/opt/My Apps/cyrup").await;
+
+        // The reported command is still the unquoted path; only the typed text is quoted.
+        assert_eq!(command, "/opt/My Apps/cyrup");
+        assert_eq!(last, ["pane", "run", "w1:p2", "'/opt/My Apps/cyrup'"]);
+        assert_eq!(
+            pane_run_command("/it's here/cyrup"),
+            "'/it'\\''s here/cyrup'"
         );
     }
 

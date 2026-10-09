@@ -17,8 +17,13 @@
 # that instead of naming a session identity cyrup does not register.)
 #
 # (ICOM-079 carries in v0.16.0 `31e73d2`'s "Pattern 6b: Hand Over Your Session"
-# (`skills/pi-intercom/SKILL.md:163-181`) byte for byte, placed after Pattern 6's `list-cwd` example
-# so that pattern stays whole.)
+# (`skills/pi-intercom/SKILL.md:163-181`) byte for byte, between Pattern 6 and Pattern 7
+# exactly as upstream places it. Its "Humans can run `/handover …`" lines are TRUE as of ICOM-078,
+# which registered the command and its picker.)
+#
+# (ICOM-079 also carries v0.13.0 `90e6ad4`'s `/name` -> `/alias` edits, unchanged through v0.16.1:
+# Pattern 1's setup block and "Name sessions meaningfully", upstream `:36-37` and `:331-337`. cyrup
+# registers `/alias` (ICOM-061), so the old `/name` advice named the wrong command for intercom.)
 #
 # YAML comments are ignored by the front-matter parser, exactly as in
 # `cyrup-ext-subagents/resources/agents/researcher.md`.
@@ -56,8 +61,8 @@ The most common pattern. One session holds the big picture, others do hands-on w
 
 **Setup** (in each session):
 ```
-/name planner    # Terminal 1
-/name worker     # Terminal 2
+/alias planner   # Terminal 1
+/alias worker    # Terminal 2
 ```
 
 **Planner delegates a task** (fire-and-forget):
@@ -181,12 +186,7 @@ intercom({
 ```
 
 If a live session already exists in that `cwd`, intercom reuses it. If multiple
-sessions are active there, pass `to` to select one by name or
-session ID. To see who is live in a directory first:
-
-```typescript
-intercom({ action: "list-cwd", cwd: "/path/to/other-repo" })
-```
+sessions are active there, pass `to` to select one by name or session ID.
 
 ### Pattern 6b: Hand Over Your Session
 
@@ -356,12 +356,13 @@ intercom({
 
 ### Name sessions meaningfully
 
-Use `/name` so others can target you easily:
+Use `/alias` so others can target you easily. It names the current session and
+is shown in intercom lists, send/reply results, overlays, and incoming headers:
 
 ```
-/name api-worker
-/name frontend-dev
-/name planner
+/alias api-worker
+/alias frontend-dev
+/alias planner
 ```
 
 ## Error Handling

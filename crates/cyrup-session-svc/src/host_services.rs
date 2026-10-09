@@ -856,6 +856,20 @@ pub enum InjectItem {
     /// back and appended with no turn, exactly as for a steer the pump made itself. The producer
     /// is fire-and-forget (pi's `sendMessage`), so there is no obligation to carry.
     Steered(AgentMessage),
+    /// ICOM-084 — [`HostServices::wake_user_prompt`]: wake the idle session with this user prompt
+    /// through the REAL prompt path (`prompt_with`, so `input` → `before_agent_start` →
+    /// `agent_start` all run), after every item queued before it has been settled. Dropped when a
+    /// run claimed the session first — that run already carries what the wake was for.
+    WakePrompt(String),
+    /// [`HostServices::send_user_message`]: pi `sendUserMessage(text, { deliverAs })` from a
+    /// native extension's own task. The pump runs it through `prompt_with` — so `input` always
+    /// runs, and an idle session gets `before_agent_start` / `agent_start` too — queueing it onto a
+    /// live run as a steer / follow-up when `deliver_as` names one, and otherwise holding it for
+    /// the next idle edge. Never dropped: unlike a wake, it IS the message.
+    UserMessage {
+        text: String,
+        deliver_as: Option<crate::event::StreamingBehavior>,
+    },
 }
 
 /// The live host-services backend (arch-08 §5.6).
@@ -1259,6 +1273,14 @@ impl LiveHostServices {
         g.thinking_level = thinking_level;
     }
 
+    /// Refresh the snapshot's session name after a HOST-side rename (`AgentSession::set_session_name`
+    /// — `/name`, `--name`, RPC `set_session_name`), so [`HostServices::session_name`] tracks the
+    /// manager the way pi's live `getSessionName()` does (`agent-session.ts:865`). A guest-side
+    /// rename goes through [`HostServices::set_session_name`], which refreshes it itself.
+    pub fn set_snapshot_session_name(&self, session_name: Option<String>) {
+        Self::lock(&self.snapshot).session_name = session_name;
+    }
+
     /// Push session-level state (name + last-turn token occupancy) for the read views.
     pub fn update_state(&self, session_name: Option<String>, used_tokens: u64) {
         let mut g = Self::lock(&self.snapshot);
@@ -1518,6 +1540,10 @@ impl LiveHostServices {
             let mut snap = Self::lock(&self.snapshot);
             snap.session_id = Some(mgr.session_id().as_str().to_string());
             snap.session_file = mgr.session_file().map(Path::to_path_buf);
+            // A resumed (or `--name`d-before-attach) session already carries its name; seed it so
+            // `session_name()` — pi's live `getSessionName()` (`agent-session.ts:865`) — is right
+            // from the first extension read, not only after a rename.
+            snap.session_name = mgr.session_name();
         }
         *Self::lock(&self.manager) = Some(manager);
     }
@@ -2375,6 +2401,39 @@ impl HostServices for LiveHostServices {
         )
     }
 
+    fn wake_user_prompt(&self, text: &str) -> Result<(), String> {
+        // ICOM-084 — the same queue and single consumer as every injection, so the wake is
+        // scheduled strictly AFTER the card its producer handed over a moment earlier (FIFO), and
+        // the pump runs it through `prompt_with` at the idle edge (pi `sendUserMessage`).
+        Self::send_injection(
+            &self.injection_sink()?,
+            InjectItem::WakePrompt(text.to_string()),
+        )
+    }
+
+    fn send_user_message(
+        &self,
+        text: &str,
+        deliver_as: Option<cyrup_ext::InputStreamingBehavior>,
+    ) -> Result<(), String> {
+        // The same single consumer as every injection (FIFO with them), because the pump is the
+        // one place that can both see whether a run is live and run `prompt_with` on the session.
+        Self::send_injection(
+            &self.injection_sink()?,
+            InjectItem::UserMessage {
+                text: text.to_string(),
+                deliver_as: deliver_as.map(|behavior| match behavior {
+                    cyrup_ext::InputStreamingBehavior::Steer => {
+                        crate::event::StreamingBehavior::Steer
+                    }
+                    cyrup_ext::InputStreamingBehavior::FollowUp => {
+                        crate::event::StreamingBehavior::FollowUp
+                    }
+                }),
+            },
+        )
+    }
+
     fn inject_message_ack(
         &self,
         content: &str,
@@ -3198,6 +3257,33 @@ mod tests {
         let usage = svc.context_usage();
         assert_eq!(usage["usedTokens"], json!(42));
         assert_eq!(usage["contextWindow"], json!(128_000));
+    }
+
+    /// A session that already carries a name when the manager is attached (a resumed session, or
+    /// one named before attach) reports it at once — pi's `getSessionName()` reads the manager live
+    /// (`agent-session.ts:865`), so there is no window where an extension sees "unnamed". Before
+    /// this, `attach_session` seeded the id and file only, and pi-intercom registered such a
+    /// session under its unnamed `subagent-chat-<id>` alias.
+    #[test]
+    fn attach_session_seeds_the_session_name_from_the_manager() {
+        let provider: Arc<dyn Provider> = Arc::new(FauxProvider::new());
+        let svc = svc_with(provider);
+        assert_eq!(svc.session_name(), None, "unattached ⇒ unnamed");
+
+        let mut mgr = SessionManager::in_memory(
+            &std::env::temp_dir(),
+            cyrup_session::manager::NewSessionOpts::default(),
+        )
+        .expect("an in-memory session tree");
+        mgr.append_session_info("beta-worker").expect("name it");
+        svc.attach_session(Arc::new(AsyncMutex::new(mgr)));
+        assert_eq!(svc.session_name().as_deref(), Some("beta-worker"));
+
+        // The host-side rename hook replaces it, and a cleared name reads as unnamed again.
+        svc.set_snapshot_session_name(Some("renamed".into()));
+        assert_eq!(svc.session_name().as_deref(), Some("renamed"));
+        svc.set_snapshot_session_name(None);
+        assert_eq!(svc.session_name(), None);
     }
 
     #[test]

@@ -431,6 +431,12 @@ async fn held_peers_drain_one_per_turn_and_human_input_between_them_wins() {
 /// `held peers hand off one triggered turn when a busy run ends without a turn boundary`: the run
 /// is aborted, so its `turn_end` (`stopReason: "aborted"`) cannot take a steer; the idle flush then
 /// releases ONE peer as a triggered turn, and the second rides that turn's boundary.
+///
+/// ICOM-084 (`104b83c` #154, v0.16.1) — also upstream's "human-first releases the next held peer
+/// only after the woken run starts": the handoff turn is the WAKE prompt's run (the first peer's
+/// card is appended with no turn, then `New intercom message above.` starts the run through the
+/// prompt lifecycle), and while that wake is pending the session still reads idle — the second
+/// peer must stay held across those flush ticks rather than ride the same woken turn.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn held_peers_hand_off_one_triggered_turn_when_the_run_ends_without_a_turn_boundary() {
     let w = Worker::start().await;
@@ -442,10 +448,20 @@ async fn held_peers_hand_off_one_triggered_turn_when_the_run_ends_without_a_turn
     w.live.session.abort();
     w.releases.release(0);
     w.live.until_receipt("handoff-a", "injected").await;
+    assert_eq!(
+        w.live.ext.state().held_inbound_len(),
+        1,
+        "peer B must wait for a later turn"
+    );
     w.model_call(2).await;
     assert!(
         !w.injected("handoff-b"),
         "the idle flush releases one peer, not the queue"
+    );
+    assert_eq!(
+        w.last_inputs().last().map(String::as_str),
+        Some(cyrup_intercom::inbound::IDLE_WAKE_PROMPT),
+        "the handoff turn is the wake prompt's run, not a triggerTurn card"
     );
     w.releases.release(1);
     w.live.until_receipt("handoff-b", "injected").await;

@@ -5,6 +5,64 @@ next work item**.
 
 ---
 
+# UPDATE 2026-10-08 (intercom, pi-intercom v0.16.1) — area 11 emptied: `ICOM-071`, `073`, `075`, `076`, `078`, `079`, `080`, `081` closed; `ICOM-083`…`ICOM-086` filed and closed
+
+> The whole `v0.14.0..v0.16.1` intercom backlog, built on `claude/zealous-bell-x0u1h0` off `main` @ `d5d14cb`.
+> Upstream re-pinned to **pi-intercom v0.16.1** (`a5fad4d`; `v0.16.0..v0.16.1` = `d5a8fd1` #153, `104b83c` #154 and
+> the release, read in full at the tag). Details, evidence and test names are on each row and in the
+> `CLOSURES 2026-10-08` and `PIN 2026-10-08` blocks at the top of `11-cyrup-intercom.md`.
+>
+> The count is whatever `python3 -I docs/gap-analysis/scripts/count_open_items.py` prints, measured on `main` @
+> `d5d14cb` (before) and on the branch (after): **before 107 open (0 above low; 17 trackers; 965 closed); after
+> 99 open (0 above low; 17 trackers; 977 closed)**. Eight open rows close and four rows are filed and closed in
+> the same pass, so closed rises by twelve. Area 11: 8 → **0** open, 67 → **79** closed — the first time the
+> area has no open row.
+>
+> * **Already closed, only stale in the ledger** ("EVIDENCE CORRECTED: closed before this cycle"): `ICOM-071`
+>   (`Message.crossMachine`) and `ICOM-075` (`relay --envelope-stdin`) by #187 (`3c8376e`); `ICOM-073` (the
+>   `crossMachine` config) by #178 (`8120040`); and `ICOM-079`'s skill half (Pattern 6b) by #187. Same failure as
+>   `ICOM-074`/`ICOM-077` last cycle: a lane told not to edit `docs/gap-analysis/` landed the code and the rows
+>   stayed open.
+> * **Closed by code this pass:** `ICOM-076` (relayed messages attributed `name@machine · unverified
+>   cross-machine` with a `send`-back hint), `ICOM-078` (`/handover`, the handover picker, `h` in the list),
+>   `ICOM-079`'s docs half and the `/name` → `/alias` drift, `ICOM-080` (the pane-run command goes to herdr as one
+>   argv token, unquoted when plain like upstream and single-quoted on unix only when it needs it, since cyrup's
+>   default is the absolute `current_exe()` path), `ICOM-081` (the broker runs from the runtime dir,
+>   and a relative custom `brokerCommand` resolves there — a recorded behaviour change).
+> * **Filed and closed:** `ICOM-083` (#153, Ctrl+O shows an outgoing call's full message), `ICOM-084` (#154,
+>   medium: an idle wake runs through the prompt lifecycle — a new `HostServices::wake_user_prompt` seam in
+>   `cyrup-ext`, implemented in `cyrup-session-svc`), `ICOM-085` (`PARITY-GAPS.md` `UW-10`: `/intercom` and
+>   Alt+M open the live session list and compose box). **`UW-10` is struck in `PARITY-GAPS.md`**, which ends
+>   this file's standing "no area-11 id — file one" note on it (row `3` of "THE RANKED SET" further down, kept as history).
+> * **Next free id:** `ICOM-086`; the rest are unchanged. (2026-10-09: the real-binary E2E run filed and
+>   closed `ICOM-086` — a `--name`d / `/name`d session registered under its unnamed alias, fixed in
+>   `cyrup-session-svc`'s host-services snapshot; next free id `ICOM-087`.)
+>
+> ## Leads this pass produced — recorded, NOT counted, not filed
+>
+> * ~~**Subagent turns skip the prompt lifecycle the way `ICOM-084` did**~~ — **FIXED in the same pass**
+>   (review follow-up, 2026-10-09; recorded on `ICOM-084`'s row, no new id). The steering inbox and the
+>   watchdog auto-follow now send through a new `HostServices::send_user_message` seam that runs `prompt_with`,
+>   so a steered child runs `input` / `before_agent_start`, a busy child is steered mid-run, and a follow-up
+>   reaches the session's follow-up queue instead of being appended with no turn. Subagent completion turns
+>   were left alone: they are custom messages, and pi's own `sendMessage({ triggerTurn })` skips
+>   `before_agent_start` too.
+> * **pi-subagents wakes an idle parent with `sendUserMessage` after cyrup's pin** (area 09b, upstream drift,
+>   not filed): `tmp/pi-subagents` HEAD `src/shared/parent-wake.ts` appends a turn-triggering completion with
+>   no turn and wakes an idle parent with `sendUserMessage(PARENT_WAKE_TEXT, { deliverAs: "steer" })` (the
+>   pi#5581 workaround, like pi-intercom #154). The `HostServices::send_user_message` seam it would need now
+>   exists. Needs a `SUBA-` row when area 09b re-pins.
+> * ~~**`cargo nextest run -p cyrup-it --features it --test subagents` does not compile on `main`**~~ — **FIXED
+>   in the same pass** (2026-10-09): 19 initializers in 15 files under `crates/cyrup-it/tests/subagents/` built
+>   `SingleStepSpec` / `ForegroundRunRequest` without the `worktree` field `81c7572` (`PROV-118` / `SUBA-149`)
+>   made mandatory; each now states `WorktreeRequest::Shared`, which is what they ran with before. The suite
+>   then ran **287/287**. Also fixed: `session_svc::late_tools::a_tool_registered_from_session_start_reaches_the_live_agent`
+>   read the system prompt from `Context::system_prompt`, which is empty since CODE-014 / SESS-054 (`659e840`);
+>   it now renders it from the transcript's system rows, and `--test session_svc` runs **49/49**.
+> * **The intercom suite needs `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` unset in this container** —
+>   `support::env::no_ambient_provider_credentials` refuses ambient keys, by design. Environment, not code;
+>   noted so the next run does not read it as a regression.
+
 # UPDATE 2026-10-09 (pi v1.1.0 extension event surface) — `EXT-078`, `EXT-084` and `SESS-050` closed; pi's timings commit and `agent_settled.aborted` ported
 
 > Upstream read at pi `v1.1.0` through git objects only (`git -C tmp/pi show v1.1.0:<path>`). The count is
@@ -36,6 +94,7 @@ next work item**.
 > test.
 
 ---
+
 
 # UPDATE 2026-10-08 (headless Anthropic login) — `PROV-120` and `TUI-145` closed; `PROV-135`…`PROV-138` and `TUI-167`…`TUI-170` filed and closed
 

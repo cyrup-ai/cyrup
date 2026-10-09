@@ -4,8 +4,11 @@
 //! WIRING (all reachable in this phase, no dead primitives):
 //! - `init` registers the `intercom` tool always, and `contact_supervisor` ONLY when child-
 //!   orchestrator metadata is present (`index.ts:1162-1163`); it subscribes the lifecycle events.
-//! - `init` also registers BOTH slash commands: `/intercom` (`index.ts:2360-2363`) and
-//!   `/intercom-id` (`v0.9.2 index.ts:2365-2368`), dispatched by [`IntercomExtension::execute_command`].
+//! - `init` also registers the four slash commands — `/intercom`, `/intercom-id`, `/alias` and
+//!   `/handover` (`v0.16.1 index.ts:3223-3241`), dispatched by
+//!   [`IntercomExtension::execute_command`] — and the `alt+m` shortcut (`:3243-3246`), dispatched by
+//!   [`IntercomExtension::execute_shortcut`]. Bare `/intercom`, `alt+m` and `/handover` drive LIVE
+//!   overlays through `HostServices::open_overlay` (`crate::ui`).
 //! - `on_event(SessionStart)` spawns the connect: `ensure_broker` (re-exec the detached broker) →
 //!   `IntercomClient::connect` → stash the live client + start the inbound event loop (the outbound
 //!   waiter match + `ReplyTracker` record, `index.ts:709-764`).
@@ -27,13 +30,14 @@
 //! `IntercomDeliveryChannel::send` no-supervisor branch in [`crate::seams`].
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use cyrup_core::ExtensionId;
 use cyrup_ext::registry::CommandDescriptor;
 use cyrup_ext::{
-    EventKind, ExtError, HookOutcome, HostCtx, HostEvent, HostServices, InitApi, NativeExtension,
+    EventKind, ExtError, ExtMode, HookOutcome, HostCtx, HostEvent, HostServices, InitApi,
+    NativeExtension, NotifyKind,
 };
 use cyrup_ext_subagents::tui::intercom::{ClarifyChannel, DeliveryChannel, SteerChannel};
 
@@ -46,10 +50,15 @@ use crate::paths::{agent_dir_path, intercom_dir_path};
 use crate::seams::{IntercomClarifyChannel, IntercomDeliveryChannel, IntercomSteerChannel};
 use crate::session_state::SharedIntercomState;
 use crate::tools::contact_supervisor::ContactSupervisorTool;
-use crate::tools::intercom::IntercomTool;
+use crate::tools::intercom::{HandoverRoute, IntercomTool, build_handover_text, deliver_handover};
 use crate::transport::client::IntercomClient;
 use crate::transport::protocol::{SessionInfo, now_ms};
-use crate::ui::compose::COMPOSE_MAX_WIDTH;
+use crate::ui::compose::{COMPOSE_MAX_WIDTH, ComposeOverlayHost};
+use crate::ui::handover_loader::{HandoverGeneration, HandoverLoader, HandoverTextFuture};
+use crate::ui::handover_picker::{
+    HandoverPicker, HandoverPickerHost, HandoverPickerTarget, HerdrRemoteLister,
+};
+use crate::ui::session_list::{SessionListOverlayHost, SessionListSelection};
 use crate::ui::{ComposeOverlay, DefaultKeybindings, PlainTheme, SessionListOverlay, compose_send};
 
 /// The `/intercom` overlay slash command (pi `pi.registerCommand("intercom", …)`, `index.ts:1877`).
@@ -64,6 +73,15 @@ pub const INTERCOM_ID_COMMAND: &str = "intercom-id";
 /// The `/alias` session-alias command (ICOM-061; `v0.14.0 index.ts:2911-2914` —
 /// `pi.registerCommand("alias", { description, handler })`, added by `90e6ad4`, v0.13.0 #126).
 pub const ALIAS_COMMAND: &str = "alias";
+/// The `/handover` command (ICOM-078; `v0.16.1 index.ts:3238-3241` —
+/// `pi.registerCommand("handover", { description, handler: runHandoverCommand })`).
+pub const HANDOVER_COMMAND: &str = "handover";
+/// The `/intercom` overlay's keyboard shortcut (`v0.16.1 index.ts:3243-3246` —
+/// `pi.registerShortcut("alt+m", { description: "Open session intercom", handler:
+/// openIntercomOverlay })`).
+pub const INTERCOM_SHORTCUT: &str = "alt+m";
+/// `/handover`'s refusal outside the interactive terminal UI (`v0.16.1 index.ts:3027`), verbatim.
+pub const HANDOVER_REQUIRES_TUI: &str = "/handover requires the interactive terminal UI; use the intercom tool's handover action instead.";
 /// The width the `/intercom` session picker renders at (the session-list overlay's max width).
 const INTERCOM_OVERLAY_WIDTH: usize = crate::ui::session_list::SESSION_LIST_MAX_WIDTH;
 
@@ -85,6 +103,24 @@ fn format_intercom_contact_snippet(session_id: &str) -> String {
     format!(
         r#"Use cyrup-intercom: intercom({{ action: "send", to: "{session_id}", message: "..." }})"#
     )
+}
+
+/// How a live overlay run ended.
+enum OverlayRun {
+    /// The overlay ran (or a failure before it was reported); the command's output, if any.
+    Ran(Option<String>),
+    /// No interactive surface took the overlay — fall back to the text rendering.
+    NoSurface,
+}
+
+/// `/^(\/|\.\.?\/|~(\/|$))/.test(target)` (`v0.16.1 index.ts:3038`): `/`, `./`, `../`, `~/` or a
+/// bare `~` makes a `/handover` target a project path.
+fn is_project_path(target: &str) -> bool {
+    target.starts_with('/')
+        || target.starts_with("./")
+        || target.starts_with("../")
+        || target.starts_with("~/")
+        || target == "~"
 }
 
 /// The extension's fixed id.
@@ -372,7 +408,7 @@ impl IntercomExtension {
     /// tick. Bare `/alias` and `/alias menu` open an input dialog when there is a UI; without one,
     /// bare `/alias` reports the current alias and `/alias menu` warns (`:2786-2796`).
     ///
-    /// Output follows [`Self::notify_alias_command`]. `ui.input` is the blocking
+    /// Output follows [`Self::notify_command`]. `ui.input` is the blocking
     /// `HostServices::input` bridge, so it is driven on a blocking thread exactly as the clarify
     /// seam drives it (`seams.rs`).
     async fn run_alias_command(&self, args: &str, ctx: &HostCtx) -> Option<String> {
@@ -410,7 +446,7 @@ impl IntercomExtension {
                         cyrup_ext::NotifyKind::Info,
                     )
                 };
-                return self.notify_alias_command(ctx, generation, message, kind);
+                return self.notify_command(ctx, generation, message, kind);
             }
             // No bound backend has no dialog to open: the same "dismissed" outcome as the
             // `HostServices::input` default, so the command ends silently.
@@ -430,7 +466,7 @@ impl IntercomExtension {
             let entered = match entered {
                 Ok(entered) => entered,
                 Err(e) => {
-                    return self.notify_alias_command(
+                    return self.notify_command(
                         ctx,
                         generation,
                         format!("Unable to set session alias: {e}"),
@@ -442,7 +478,7 @@ impl IntercomExtension {
             let entered = entered?;
             alias = entered.trim().to_string();
             if alias.is_empty() {
-                return self.notify_alias_command(
+                return self.notify_command(
                     ctx,
                     generation,
                     "Session alias cannot be empty.".to_string(),
@@ -458,7 +494,7 @@ impl IntercomExtension {
         // `pi.setSessionName(alias)` — always present upstream. A session with no bound backend
         // has nothing to rename, which is upstream's `catch` arm rather than a claimed success.
         let Some(services) = services else {
-            return self.notify_alias_command(
+            return self.notify_command(
                 ctx,
                 generation,
                 "Unable to set session alias: no live session".to_string(),
@@ -472,7 +508,7 @@ impl IntercomExtension {
         // a rename that did not land is upstream's error arm, not a success that pushes the old
         // name to every peer.
         if services.session_name().as_deref().map(str::trim) != Some(alias.as_str()) {
-            return self.notify_alias_command(
+            return self.notify_command(
                 ctx,
                 generation,
                 "Unable to set session alias: the session did not accept the rename (it may be \
@@ -482,7 +518,7 @@ impl IntercomExtension {
             );
         }
         self.sync_presence_identity();
-        self.notify_alias_command(
+        self.notify_command(
             ctx,
             generation,
             format!("Session alias set: {alias}"),
@@ -490,7 +526,9 @@ impl IntercomExtension {
         )
     }
 
-    /// pi `notifyAliasCommand(ctx, message, level, generation)` (`v0.14.0 index.ts:799-809`): nothing
+    /// pi `notifyAliasCommand(ctx, message, level, generation)` (`v0.14.0 index.ts:799-809`), which
+    /// `/handover` uses too (`v0.16.1 index.ts:3027`), and — because every `/handover` and live
+    /// `/intercom` path runs only with a UI — what pi's `notifyIfLive` amounts to there: nothing
     /// once the runtime has moved on; without a UI the text goes to the one channel a headless
     /// session has (upstream `console.error`, "Keep alias guidance visible without injecting a
     /// synthetic Pi message"); with one, a notification at `level`.
@@ -499,7 +537,7 @@ impl IntercomExtension {
     /// `Ok(None)` convention on [`NativeExtension::execute_command`], as in
     /// [`Self::run_intercom_id_command`]), so a UI warning or error notifies itself at its own level
     /// and returns nothing — returning it would show it at Info.
-    fn notify_alias_command(
+    fn notify_command(
         &self,
         ctx: &HostCtx,
         generation: u64,
@@ -521,6 +559,496 @@ impl IntercomExtension {
         }
     }
 
+    /// pi `openIntercomOverlay(ctx)` (`v0.16.1 index.ts:3149-3220`) — the LIVE session list bare
+    /// `/intercom` and `alt+m` open, then either the compose box (Enter) or the handover picker
+    /// (`h`, `:3191-3194`).
+    ///
+    /// [`OverlayRun::NoSurface`] is the one outcome upstream cannot have: `open_overlay` returned
+    /// `false` because nothing interactive is attached, which is pi's `!ctx.hasUI` branch reached
+    /// late. `/intercom` then renders the same list as text; the shortcut has nothing to fall back
+    /// to.
+    async fn open_intercom_overlay(&self, ctx: &HostCtx) -> OverlayRun {
+        let generation = self.state.connect.generation();
+        if !connect::is_live_at(&self.state, generation) {
+            return OverlayRun::Ran(None);
+        }
+        let Some(services) = self.state.host_services() else {
+            return OverlayRun::NoSurface;
+        };
+        let client =
+            match connect::ensure_connected(&self.state, connect::ConnectReason::Overlay).await {
+                Ok(client) => client,
+                Err(e) => {
+                    return OverlayRun::Ran(self.notify_command(
+                        ctx,
+                        generation,
+                        format!("Intercom unavailable: {e}"),
+                        NotifyKind::Error,
+                    ));
+                }
+            };
+        if !connect::is_live_at(&self.state, generation) {
+            return OverlayRun::Ran(None);
+        }
+        self.sync_presence_identity();
+        let all_sessions = match client.list_sessions().await {
+            Ok(sessions) => sessions,
+            Err(e) => {
+                return OverlayRun::Ran(self.notify_command(
+                    ctx,
+                    generation,
+                    format!("Failed to list sessions: {e}"),
+                    NotifyKind::Error,
+                ));
+            }
+        };
+        if !connect::is_live_at(&self.state, generation) {
+            return OverlayRun::Ran(None);
+        }
+        let my_id = client.session_id();
+        let Some(current) = my_id
+            .as_deref()
+            .and_then(|id| all_sessions.iter().find(|s| s.id == id).cloned())
+        else {
+            return OverlayRun::Ran(self.notify_command(
+                ctx,
+                generation,
+                "Current session is missing from intercom session list".to_string(),
+                NotifyKind::Error,
+            ));
+        };
+        let duplicates = crate::identity::duplicate_session_names(
+            all_sessions.iter().map(|s| s.name.as_deref()),
+        );
+        let others: Vec<SessionInfo> = all_sessions
+            .into_iter()
+            .filter(|s| Some(s.id.as_str()) != my_id.as_deref())
+            .collect();
+
+        let picked = Arc::new(Mutex::new(None));
+        let list =
+            SessionListOverlayHost::new(SessionListOverlay::new(current, others), picked.clone());
+        if !services.open_overlay(Box::new(list)) {
+            return OverlayRun::NoSurface;
+        }
+        let selection = picked.lock().unwrap_or_else(|e| e.into_inner()).take();
+        let Some(selection) = selection else {
+            return OverlayRun::Ran(None);
+        };
+        if !connect::is_live_at(&self.state, generation) {
+            return OverlayRun::Ran(None);
+        }
+        let selected = match selection {
+            SessionListSelection::Handover(session) => {
+                return OverlayRun::Ran(
+                    self.open_handover_picker(ctx, generation, Some(session.id))
+                        .await,
+                );
+            }
+            SessionListSelection::Message(session) => session,
+        };
+
+        let client =
+            match connect::ensure_connected(&self.state, connect::ConnectReason::Overlay).await {
+                Ok(client) => client,
+                Err(e) => {
+                    return OverlayRun::Ran(self.notify_command(
+                        ctx,
+                        generation,
+                        format!("Intercom unavailable: {e}"),
+                        NotifyKind::Error,
+                    ));
+                }
+            };
+        if !connect::is_live_at(&self.state, generation) {
+            return OverlayRun::Ran(None);
+        }
+        let target_label = crate::identity::format_session_label(
+            selected.name.as_deref(),
+            &selected.id,
+            &duplicates,
+        );
+        let composed = Arc::new(Mutex::new(None));
+        let compose = ComposeOverlayHost::new(
+            ComposeOverlay::new(selected.clone(), target_label.clone()),
+            client,
+            tokio::runtime::Handle::current(),
+            composed.clone(),
+        );
+        if !services.open_overlay(Box::new(compose)) {
+            return OverlayRun::Ran(None);
+        }
+        let result = composed.lock().unwrap_or_else(|e| e.into_inner()).take();
+        // `if (result?.sent && result.messageId && result.text && getLiveContext(…))` (`:3212`).
+        let Some(crate::ui::compose::ComposeResult {
+            sent: true,
+            message_id: Some(message_id),
+            text: Some(text),
+        }) = result
+        else {
+            return OverlayRun::Ran(None);
+        };
+        if !connect::is_live_at(&self.state, generation) {
+            return OverlayRun::Ran(None);
+        }
+        // `pi.appendEntry("intercom_sent", { to: selectedSession.name || selectedSession.id, … })`.
+        let to = selected
+            .name
+            .clone()
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| selected.id.clone());
+        if let Err(e) = services.append_entry(
+            "intercom_sent",
+            &serde_json::json!({
+                "to": to,
+                "message": { "text": text },
+                "messageId": message_id,
+                "timestamp": now_ms(),
+            }),
+        ) {
+            tracing::warn!(error = %e, kind = "intercom_sent", "intercom: failed to append audit entry");
+        }
+        OverlayRun::Ran(self.notify_command(
+            ctx,
+            generation,
+            format!("Message sent to {target_label}"),
+            NotifyKind::Info,
+        ))
+    }
+
+    /// pi `runHandoverCommand(args, ctx)` (`v0.16.1 index.ts:3023-3041`).
+    ///
+    /// `/handover` alone opens the picker; `/handover <target> [next task]` hands over directly. A
+    /// target that starts like a path (`/`, `./`, `../`, `~/` or a bare `~`) is a PROJECT: the
+    /// session live there, or a new Herdr pane started there (`openProjectPaneIfMissing: true`).
+    /// Anything else is a session name, id or id prefix, and a target with `@` is a session on
+    /// another machine.
+    async fn run_handover_command(&self, args: &str, ctx: &HostCtx) -> Option<String> {
+        let generation = self.state.connect.generation();
+        if !connect::is_live_at(&self.state, generation) {
+            return None;
+        }
+        if !ctx.has_ui || ctx.mode != ExtMode::Tui {
+            return self.notify_command(
+                ctx,
+                generation,
+                HANDOVER_REQUIRES_TUI.to_string(),
+                NotifyKind::Error,
+            );
+        }
+        let input = args.trim();
+        if input.is_empty() {
+            return self.open_handover_picker(ctx, generation, None).await;
+        }
+        // `input.split(/\s+/, 1)[0]` and `input.slice(target.length).trim() || undefined`.
+        let target = input.split_whitespace().next().unwrap_or_default();
+        let goal = input
+            .get(target.len()..)
+            .map(str::trim)
+            .filter(|goal| !goal.is_empty())
+            .map(str::to_string);
+        let is_path = is_project_path(target);
+        let route = if is_path {
+            HandoverRoute {
+                cwd: Some(crate::cwd::expand_home_path(target)),
+                open_project_pane_if_missing: true,
+                ..HandoverRoute::default()
+            }
+        } else {
+            HandoverRoute {
+                to: Some(target.to_string()),
+                ..HandoverRoute::default()
+            }
+        };
+        self.perform_handover(
+            ctx,
+            generation,
+            route,
+            goal,
+            !is_path && target.contains('@'),
+        )
+        .await
+    }
+
+    /// pi `openHandoverPicker(ctx, generation, preselectSessionId)` (`v0.16.1 index.ts:3043-3095`).
+    async fn open_handover_picker(
+        &self,
+        ctx: &HostCtx,
+        generation: u64,
+        preselect_session_id: Option<String>,
+    ) -> Option<String> {
+        let client =
+            match connect::ensure_connected(&self.state, connect::ConnectReason::Tool).await {
+                Ok(client) => client,
+                Err(e) => {
+                    return self.notify_command(
+                        ctx,
+                        generation,
+                        format!("Intercom unavailable: {e}"),
+                        NotifyKind::Error,
+                    );
+                }
+            };
+        if !connect::is_live_at(&self.state, generation) {
+            return None;
+        }
+        self.sync_presence_identity();
+        let sessions = match client.list_sessions().await {
+            Ok(sessions) => sessions,
+            Err(e) => {
+                return self.notify_command(
+                    ctx,
+                    generation,
+                    format!("Failed to list sessions: {e}"),
+                    NotifyKind::Error,
+                );
+            }
+        };
+        let my_id = client.session_id();
+        let Some(current) = my_id
+            .as_deref()
+            .and_then(|id| sessions.iter().find(|s| s.id == id).cloned())
+        else {
+            return self.notify_command(
+                ctx,
+                generation,
+                "Current session is missing from intercom session list".to_string(),
+                NotifyKind::Error,
+            );
+        };
+        if !connect::is_live_at(&self.state, generation) {
+            return None;
+        }
+        let Some(services) = self.state.host_services() else {
+            return Some(HANDOVER_REQUIRES_TUI.to_string());
+        };
+        // `{ run: runCommand, herdrBin: process.env.HERDR_BIN_PATH ?? "herdr" }` (`:3064`), over the
+        // session's own runner so a test can stand in for `herdr`.
+        let lister = Arc::new(HerdrRemoteLister::new(
+            self.state.cross_machine_runner(),
+            crate::cross_machine::herdr_bin_from(|key| std::env::var(key).ok()),
+        ));
+        let picker = HandoverPicker::new(
+            &current,
+            sessions,
+            lister,
+            preselect_session_id.as_deref(),
+            tokio::runtime::Handle::current(),
+        );
+        let picked = Arc::new(Mutex::new(None));
+        if !services.open_overlay(Box::new(HandoverPickerHost::new(picker, picked.clone()))) {
+            // Inside the TUI gate a host that takes no overlay has no interactive surface after
+            // all; say so rather than end silently.
+            return self.notify_command(
+                ctx,
+                generation,
+                HANDOVER_REQUIRES_TUI.to_string(),
+                NotifyKind::Error,
+            );
+        }
+        let picked = picked.lock().unwrap_or_else(|e| e.into_inner()).take();
+        // `if (!picked || !getLiveContext(ctx, generation)) return;` — Escape is silent.
+        let picked = picked?;
+        if !connect::is_live_at(&self.state, generation) {
+            return None;
+        }
+        let goal = picked.goal;
+        match picked.target {
+            HandoverPickerTarget::Local(session) => {
+                let route = HandoverRoute {
+                    to: Some(session.id.clone()),
+                    ..HandoverRoute::default()
+                };
+                self.perform_handover(ctx, generation, route, goal, false)
+                    .await
+            }
+            HandoverPickerTarget::Remote(target) => {
+                let route = HandoverRoute {
+                    to: Some(target),
+                    ..HandoverRoute::default()
+                };
+                self.perform_handover(ctx, generation, route, goal, true)
+                    .await
+            }
+            HandoverPickerTarget::Project => {
+                // `(await ctx.ui.input("Project path for the new session", "~/dev/project"))?.trim()`
+                // — the blocking dialog bridge, driven off the async worker as `/alias` drives it.
+                let dialog = services.clone();
+                let path = tokio::task::spawn_blocking(move || {
+                    dialog.input(
+                        "Project path for the new session",
+                        Some("~/dev/project"),
+                        &cyrup_ext::DialogOptions::default(),
+                    )
+                })
+                .await
+                .ok()
+                .flatten()
+                .map(|path| path.trim().to_string())
+                .filter(|path| !path.is_empty());
+                if !connect::is_live_at(&self.state, generation) {
+                    return None;
+                }
+                let Some(path) = path else {
+                    return self.notify_command(
+                        ctx,
+                        generation,
+                        "Handover cancelled".to_string(),
+                        NotifyKind::Info,
+                    );
+                };
+                let route = HandoverRoute {
+                    cwd: Some(crate::cwd::expand_home_path(&path)),
+                    open_project_pane_if_missing: true,
+                    ..HandoverRoute::default()
+                };
+                self.perform_handover(ctx, generation, route, goal, false)
+                    .await
+            }
+        }
+    }
+
+    /// pi `performHandover(ctx, generation, request, { goal, crossMachine })`
+    /// (`v0.16.1 index.ts:3097-3147`): generate under a cancellable loader, let the human edit the
+    /// summary, then send it through the shared delivery. Nothing is sent unless the editor returns
+    /// non-blank text; `confirmSend` still applies on top, as upstream's README says.
+    async fn perform_handover(
+        &self,
+        ctx: &HostCtx,
+        generation: u64,
+        route: HandoverRoute,
+        goal: Option<String>,
+        cross_machine: bool,
+    ) -> Option<String> {
+        let client =
+            match connect::ensure_connected(&self.state, connect::ConnectReason::Tool).await {
+                Ok(client) => client,
+                Err(e) => {
+                    return self.notify_command(
+                        ctx,
+                        generation,
+                        format!("Intercom unavailable: {e}"),
+                        NotifyKind::Error,
+                    );
+                }
+            };
+        if !connect::is_live_at(&self.state, generation) {
+            return None;
+        }
+        let Some(services) = self.state.host_services() else {
+            return Some(HANDOVER_REQUIRES_TUI.to_string());
+        };
+
+        // The `BorderedLoader` (`:3112-3121`): `buildHandoverText(…, loader.signal)` under the
+        // loader's own token, so Escape aborts the model call.
+        let cancel = cyrup_core::CancelToken::new();
+        let generation_future: HandoverTextFuture = {
+            let state = self.state.clone();
+            let client = client.clone();
+            let cancel = cancel.clone();
+            Box::pin(async move {
+                build_handover_text(&state, &client, goal.as_deref(), cross_machine, &cancel).await
+            })
+        };
+        let generated = Arc::new(Mutex::new(None));
+        let loader = HandoverLoader::spawn(
+            generation_future,
+            cancel,
+            &tokio::runtime::Handle::current(),
+            generated.clone(),
+        );
+        if !services.open_overlay(Box::new(loader)) {
+            return self.notify_command(
+                ctx,
+                generation,
+                HANDOVER_REQUIRES_TUI.to_string(),
+                NotifyKind::Error,
+            );
+        }
+        if !connect::is_live_at(&self.state, generation) {
+            return None;
+        }
+        let generated = generated.lock().unwrap_or_else(|e| e.into_inner()).take();
+        let text = match generated {
+            Some(HandoverGeneration::Text(text)) => text,
+            Some(HandoverGeneration::Failed(error)) => {
+                return self.notify_command(
+                    ctx,
+                    generation,
+                    format!("Handover failed: {error}"),
+                    NotifyKind::Error,
+                );
+            }
+            Some(HandoverGeneration::Cancelled) | None => {
+                return self.notify_command(
+                    ctx,
+                    generation,
+                    "Handover cancelled".to_string(),
+                    NotifyKind::Info,
+                );
+            }
+        };
+
+        // `ctx.ui.editor("Edit handover", generated.text)` (`:3131`).
+        let dialog = services.clone();
+        let edited = tokio::task::spawn_blocking(move || dialog.editor("Edit handover", &text))
+            .await
+            .ok()
+            .flatten();
+        if !connect::is_live_at(&self.state, generation) {
+            return None;
+        }
+        let Some(edited) = edited.filter(|edited| !edited.trim().is_empty()) else {
+            return self.notify_command(
+                ctx,
+                generation,
+                "Handover cancelled".to_string(),
+                NotifyKind::Info,
+            );
+        };
+
+        // The editor can be open for a long time; reconnect before sending (`:3138-3143`).
+        let client =
+            match connect::ensure_connected(&self.state, connect::ConnectReason::Tool).await {
+                Ok(client) => client,
+                Err(e) => {
+                    return self.notify_command(
+                        ctx,
+                        generation,
+                        format!("Intercom unavailable: {e}"),
+                        NotifyKind::Error,
+                    );
+                }
+            };
+        let result = deliver_handover(&self.state, &client, &route, &edited).await;
+        // `const failed = result.details.error === true || result.details.delivered === false;`
+        // cyrup's shared delivery reports every upstream error RESULT as an `Err` carrying the same
+        // sentence, so both shapes are read here.
+        let (failed, text) = match result {
+            Ok(result) => {
+                let details = result.details.as_ref();
+                let flag = |key: &str| {
+                    details
+                        .and_then(|d| d.get(key))
+                        .and_then(serde_json::Value::as_bool)
+                };
+                let failed = flag("error") == Some(true) || flag("delivered") == Some(false);
+                (failed, crate::tools::first_text_content(&result))
+            }
+            Err(error) => (true, error.message.replace("**", "")),
+        };
+        if failed {
+            self.notify_command(ctx, generation, text, NotifyKind::Error)
+        } else {
+            self.notify_command(
+                ctx,
+                generation,
+                format!("Handover: {text}"),
+                NotifyKind::Info,
+            )
+        }
+    }
+
     /// The `/intercom` command body (pi `openIntercomOverlay`, `index.ts:1810-1874`, degraded to text
     /// per the port doc §4.3): list sessions over the live broker, then either render the session
     /// picker (no args) or resolve `<target>` + send `<message…>` via [`compose_send`].
@@ -535,7 +1063,8 @@ impl IntercomExtension {
             .as_deref()
             .and_then(|id| sessions.iter().find(|s| s.id == id).cloned())
         else {
-            return Ok("Current session is missing from the intercom session list.".to_string());
+            // `v0.16.1 index.ts:3174` — no article, no trailing period.
+            return Ok("Current session is missing from intercom session list".to_string());
         };
         // `duplicates = duplicateSessionNames(allSessions)` (`v0.10.1 index.ts:2393`) — computed
         // over EVERY session including the current one, before the self-filter below, so a peer
@@ -722,9 +1251,10 @@ impl NativeExtension for IntercomExtension {
         // custom message is upstream's ONE surface for an inbound message; `render_live` answers for
         // it with a component the TUI re-renders per frame at the live width, theme and expansion.
         api.register_message_renderer(crate::inbound::INBOUND_MESSAGE_CUSTOM_TYPE);
-        // The `/intercom` overlay command (pi `registerCommand("intercom", …)`, index.ts:1877). cyrup
-        // has no `register_shortcut`, so the `alt+m` binding degrades to this command (the port doc
-        // §4.3); `execute_command` renders the session picker + drives the compose send.
+        // The `/intercom` overlay command (pi `registerCommand("intercom", …)`, `v0.16.1
+        // index.ts:3223-3226`). Bare, with a terminal UI, it opens the live session list
+        // ([`Self::open_intercom_overlay`]); `/intercom <target> <message>` is cyrup's text form of
+        // the compose send, and without an interactive surface the list renders as text.
         api.register_command(
             INTERCOM_COMMAND,
             CommandDescriptor {
@@ -752,6 +1282,18 @@ impl NativeExtension for IntercomExtension {
                 completions: Vec::new(),
             },
         );
+        // `/handover` (`v0.16.1 index.ts:3238-3241`), description verbatim (`:3239`).
+        api.register_command(
+            HANDOVER_COMMAND,
+            CommandDescriptor {
+                description: "Summarize this session and hand it over to another session (usage: /handover to pick a session, or /handover <target or project path> [next task])"
+                    .to_string(),
+                completions: Vec::new(),
+            },
+        );
+        // `pi.registerShortcut("alt+m", { description: "Open session intercom", … })`
+        // (`v0.16.1 index.ts:3243-3246`); the press lands at [`Self::execute_shortcut`].
+        api.register_shortcut(INTERCOM_SHORTCUT, Some("Open session intercom".to_string()));
         // Lifecycle: connect/disconnect + presence sync (never blocks/mutates a tool call).
         api.subscribe(&[
             EventKind::SessionStart,
@@ -836,10 +1378,13 @@ impl NativeExtension for IntercomExtension {
             .set_project_pane_launcher(Arc::new(crate::project_pane::HerdrLauncher::from_env()));
     }
 
-    /// Dispatch this extension's three commands (command-tier).
+    /// Dispatch this extension's four commands (command-tier).
     ///
-    /// - `/intercom` — no args → render the session picker; `<target> <message…>` → resolve the
-    ///   target and send it over the broker (the port doc §4.3 degrade of pi's interactive overlay).
+    /// - `/intercom` — no args → the live session list ([`Self::open_intercom_overlay`]), or its
+    ///   text rendering when no interactive surface takes the overlay; `<target> <message…>` →
+    ///   resolve the target and send it over the broker.
+    /// - `/handover` — summarize this session and hand it over ([`Self::run_handover_command`], pi
+    ///   `v0.16.1 index.ts:3023-3147`).
     /// - `/intercom-id` — insert this session's handoff snippet into the editor
     ///   ([`Self::run_intercom_id_command`], pi `v0.9.2 index.ts:2270-2289`).
     /// - `/alias` — rename this session and push the new identity to peers at once
@@ -857,10 +1402,22 @@ impl NativeExtension for IntercomExtension {
         if name == ALIAS_COMMAND {
             return Ok(self.run_alias_command(args, ctx).await);
         }
+        if name == HANDOVER_COMMAND {
+            return Ok(self.run_handover_command(args, ctx).await);
+        }
         if name != INTERCOM_COMMAND {
             return Err(ExtError::Component(format!(
                 "native extension has no handler for command `{name}`"
             )));
+        }
+        // UW-10 / ICOM-085 — bare `/intercom` in the terminal UI is pi's live overlay
+        // (`openIntercomOverlay`'s `hasUI && mode === "tui"` gate, `v0.16.1 index.ts:3152`). Only
+        // when no interactive surface takes it does the text rendering below stand in.
+        if args.trim().is_empty() && ctx.has_ui && ctx.mode == ExtMode::Tui {
+            match self.open_intercom_overlay(ctx).await {
+                OverlayRun::Ran(output) => return Ok(output),
+                OverlayRun::NoSurface => {}
+            }
         }
         // pi's overlay opens through `ensureConnected("overlay")` (index.ts:1827,1864) rather than a
         // bare `client` read: an overlay is a deliberate user action, so it is worth (re)spawning the
@@ -877,6 +1434,28 @@ impl NativeExtension for IntercomExtension {
             .await
             .unwrap_or_else(|e| format!("intercom command failed: {e}"));
         Ok(Some(output))
+    }
+
+    /// `alt+m` — pi's shortcut handler `async (ctx) => openIntercomOverlay(ctx)`
+    /// (`v0.16.1 index.ts:3243-3246`). A shortcut returns nothing, so an outcome the command form
+    /// would return as text (an Info notification) is notified here instead.
+    async fn execute_shortcut(&self, key: &str, ctx: &HostCtx) -> Result<(), ExtError> {
+        ctx.require_command_tier()?;
+        if key != INTERCOM_SHORTCUT {
+            return Err(ExtError::Component(format!(
+                "native extension has no handler for shortcut `{key}`"
+            )));
+        }
+        // `if (!liveContext?.hasUI || mode !== "tui") return;` (`:3152`).
+        if !ctx.has_ui || ctx.mode != ExtMode::Tui {
+            return Ok(());
+        }
+        if let OverlayRun::Ran(Some(message)) = self.open_intercom_overlay(ctx).await
+            && let Some(services) = self.state.host_services()
+        {
+            services.notify(&message, NotifyKind::Info);
+        }
+        Ok(())
     }
 
     async fn on_event(&self, ev: &HostEvent, ctx: &HostCtx) -> HookOutcome {
@@ -961,6 +1540,11 @@ impl NativeExtension for IntercomExtension {
                 HookOutcome::Noop
             }
             HostEvent::AgentStart => {
+                // `idleWakeRequestedAt = 0;` FIRST (`index.ts:2077@v0.16.1`, `104b83c` #154): the
+                // woken run has started, so the reservation is spent — before the liveness test,
+                // exactly as upstream orders it, and before the flush below, so a `human-first`
+                // idle release is no longer held back by it.
+                self.state.clear_idle_wake();
                 // `agentRunning = true; if (runtimeContext) flushHeldInboundMessages(runtimeContext,
                 // runtimeGeneration); activeTools.clear(); syncPresenceStatus()`
                 // (`v0.14.0 index.ts:1824-1832`). The flush is ICOM-062's `agent_start` edge: a
@@ -1088,12 +1672,28 @@ impl NativeExtension for IntercomExtension {
     /// `contact_supervisor` row in the transcript fell back to the host's generic tool rendering —
     /// upstream draws an action-coloured header with the target and a message preview.
     ///
-    /// See [`crate::tools::render`] for the three upstream renderer inputs this seam does not carry
-    /// (`theme`, `isPartial`, `context`) and which branches are therefore unreachable.
+    /// The options-free form of [`Self::render_call_under`], under the default (collapsed)
+    /// options.
     fn render_call(&self, key: &str, call: &serde_json::Value) -> Option<serde_json::Value> {
+        self.render_call_under(key, call, &cyrup_ext::RenderOptions::default())
+    }
+
+    /// `renderCall(args, theme, context)` for both tools (`index.ts:2394-2411` and
+    /// `:2891-2914@v0.16.1`). ICOM-083 (`d5a8fd1` #153): `context.expanded` swaps the 96-char
+    /// message preview for the full, raw outgoing body, so this is the hook the host re-invokes
+    /// when Ctrl+O toggles. See [`crate::tools::render`] for what the seam still does not carry
+    /// (`theme`).
+    fn render_call_under(
+        &self,
+        key: &str,
+        call: &serde_json::Value,
+        opts: &cyrup_ext::RenderOptions,
+    ) -> Option<serde_json::Value> {
         let text = match key {
-            "intercom" => crate::tools::render::render_intercom_call(call),
-            "contact_supervisor" => crate::tools::render::render_contact_supervisor_call(call),
+            "intercom" => crate::tools::render::render_intercom_call(call, opts.expanded),
+            "contact_supervisor" => {
+                crate::tools::render::render_contact_supervisor_call(call, opts.expanded)
+            }
             _ => return None,
         };
         Some(serde_json::Value::String(text))
@@ -1300,6 +1900,32 @@ mod tests {
         )
         .expect("a default config builds an extension");
         (dir, ext)
+    }
+
+    /// ICOM-084 — `pi.on("agent_start", () => { idleWakeRequestedAt = 0; … })`
+    /// (`index.ts:2077@v0.16.1`) and `startSessionRuntime`'s `idleWakeRequestedAt = 0` (`:1883`):
+    /// the woken run starting spends the reservation, and so does a new runtime. Without the first,
+    /// every idle delivery after the first wake would be denied its wake for 10 s; without the
+    /// second, a wake reserved by the previous session would gag the new one.
+    #[tokio::test]
+    async fn agent_start_and_a_new_runtime_spend_the_idle_wake_reservation() {
+        let (dir, ext) = test_extension();
+        let ctx = HostCtx::event(cyrup_ext::ExtMode::Print, false, dir.path().to_path_buf());
+        ext.state.request_idle_wake();
+        assert!(ext.state.idle_wake_pending());
+        let _ = ext.on_event(&HostEvent::AgentStart, &ctx).await;
+        assert!(!ext.state.idle_wake_pending(), "agent_start clears it");
+
+        ext.state.request_idle_wake();
+        crate::connect::begin_runtime(
+            &ext.state,
+            crate::connect::ConnectParams {
+                agent_dir: dir.path().join("agent"),
+                metadata: None,
+                model: None,
+            },
+        );
+        assert!(!ext.state.idle_wake_pending(), "a new runtime clears it");
     }
 
     /// ICOM-004 — the bundled operational skill is DECLARED to cyrup's resource discovery.
@@ -1514,6 +2140,32 @@ mod tests {
                 .is_some()
         );
         assert!(ext.render_call("not_our_tool", &call).is_none());
+        // ICOM-083: the options-aware hook is the one the host re-invokes on Ctrl+O, and expanded
+        // it shows the raw body instead of the normalized preview.
+        let spaced =
+            serde_json::json!({ "action": "send", "to": "reviewer", "message": "a\n\n  b" });
+        let expanded = cyrup_ext::RenderOptions {
+            expanded: true,
+            ..cyrup_ext::RenderOptions::default()
+        };
+        assert_eq!(
+            ext.render_call_under("intercom", &spaced, &expanded)
+                .unwrap()
+                .as_str()
+                .unwrap(),
+            "intercom send → reviewer\n  a\n\n  b"
+        );
+        assert_eq!(
+            ext.render_call("intercom", &spaced)
+                .unwrap()
+                .as_str()
+                .unwrap(),
+            "intercom send → reviewer\n  a b"
+        );
+        assert!(
+            ext.render_call_under("not_our_tool", &spaced, &expanded)
+                .is_none()
+        );
 
         let result = serde_json::json!({
             "content": [{ "type": "text", "text": "Message sent to reviewer" }],

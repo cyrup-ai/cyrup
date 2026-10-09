@@ -80,7 +80,12 @@ fn faux_capturing_tools(captured: &CapturedTurns) -> Arc<FauxProvider> {
     let step = FauxResponseStep::factory(move |ctx, _opts, _state, _model| {
         cap.lock().unwrap().push((
             ctx.tools.iter().map(|t| t.name.clone()).collect::<Vec<_>>(),
-            ctx.system_prompt.clone().unwrap_or_default(),
+            // The prompt as the provider renders it: the replay of the transcript's system rows.
+            // Since CODE-014 / SESS-054 (`659e840`) the agent holds no prompt of its own, so
+            // `Context::system_prompt` is empty and reading it made this test red on `main`.
+            cyrup_provider::get_current_system_prompt(
+                cyrup_provider::normalize_context(ctx).messages(),
+            ),
         ));
         faux_assistant_message(vec![faux_text("ok")], StopReason::Stop)
     });

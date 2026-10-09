@@ -820,6 +820,7 @@ fn launch_workflow_child(
         executor
             .run_foreground_streaming(
                 ForegroundRunRequest {
+                    worktree: cyrup_ext_subagents::spawn::worktree::WorktreeRequest::Shared,
                     overrides: SingleRunOverrides::default(),
                     cwd: &cwd,
                     agent_name: "worker",

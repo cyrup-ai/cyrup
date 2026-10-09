@@ -164,9 +164,10 @@ fn deliver_local_relay(state: &SharedIntercomState, text: String) -> Result<bool
     // an unattributed string indistinguishable from a human turn.
     //
     // cyrup's port of `sendIncomingMessage` is `inbound::{surface_incoming_message,
-    // trigger_turn_over_inbound}` (pi's single `pi.sendMessage(display:true, triggerTurn)`
-    // splits into cyrup's durable `append_entry` surface + the model-facing
-    // `inject_message`), so this site calls THOSE rather than re-deriving the header —
+    // trigger_turn_over_inbound}` (pi's single `pi.sendMessage(display:true)` splits into
+    // cyrup's durable `append_entry` surface + the model-facing card hand-off, which since
+    // ICOM-084 also wakes an idle orchestrator through the prompt lifecycle and only steers a
+    // busy one — `104b83c` #154), so this site calls THOSE rather than re-deriving the header —
     // which also restores the `queueTurnContext` leg (`index.ts:657-659`) this site
     // previously skipped, so a bare `intercom({action:"reply"})` in the triggered turn
     // resolves against the entry that actually drove it.
@@ -620,8 +621,19 @@ mod tests {
     struct SurfaceRecorder {
         entries: std::sync::Mutex<Vec<(String, serde_json::Value)>>,
         injected: std::sync::Mutex<Vec<InjectedCall>>,
+        /// ICOM-084 — every `wake_user_prompt` text, in call order.
+        wakes: std::sync::Mutex<Vec<String>>,
+        /// `ctx.isIdle()` inverted, so the `Default` recorder is an idle session.
+        busy: std::sync::atomic::AtomicBool,
     }
     impl cyrup_ext::HostServices for SurfaceRecorder {
+        fn is_idle(&self) -> bool {
+            !self.busy.load(std::sync::atomic::Ordering::SeqCst)
+        }
+        fn wake_user_prompt(&self, text: &str) -> std::result::Result<(), String> {
+            self.wakes.lock().unwrap().push(text.to_string());
+            Ok(())
+        }
         fn append_entry(
             &self,
             custom_type: &str,
@@ -674,6 +686,15 @@ mod tests {
         ));
         let rec = Arc::new(SurfaceRecorder::default());
         state.set_host_services(rec.clone());
+        let agent_dir = tempfile::tempdir().unwrap();
+        crate::connect::begin_runtime(
+            &state,
+            crate::connect::ConnectParams {
+                agent_dir: agent_dir.path().join("agent"),
+                metadata: None,
+                model: None,
+            },
+        );
         let channel = IntercomDeliveryChannel::new(state, None);
         let payload = IntercomPayload {
             run_id: cyrup_ext_subagents::background::RunId::from_token("run00000000000002"),
@@ -713,7 +734,11 @@ mod tests {
         );
 
         let injected = rec.injected.lock().unwrap();
-        assert_eq!(injected.len(), 1, "a turn is triggered over the relay");
+        assert_eq!(
+            injected.len(),
+            1,
+            "the relay card is handed to the host once"
+        );
         let content = &injected[0].0;
         assert!(
             content.contains("the answer"),
@@ -744,9 +769,73 @@ mod tests {
             injected[0].2,
             "display=true, as on every `sendIncomingMessage` delivery"
         );
+        // ICOM-084 (`104b83c` #154): `forceTrigger = true` (`index.ts:1866@v0.16.1`) still makes
+        // the relay a trigger, but a trigger now WAKES the idle orchestrator through the prompt
+        // lifecycle instead of asking for a `triggerTurn` on the card.
         assert!(
-            injected[0].3,
-            "trigger_turn is true (pi's `forceTrigger = true`, `v0.10.1 index.ts:1239`)"
+            !injected[0].3,
+            "the card asks for no turn: triggerTurn would bypass before_agent_start"
+        );
+        assert_eq!(
+            *rec.wakes.lock().unwrap(),
+            vec![crate::inbound::IDLE_WAKE_PROMPT.to_string()]
+        );
+    }
+
+    /// `intercom.integration.test.ts` "subagent relay events wake an idle orchestrator and steer a
+    /// busy one" (`104b83c` #154, v0.16.1): the idle relay wakes once; after that run's
+    /// `agent_start`, a relay into the now-busy orchestrator is steered (no turn on the card) and
+    /// gets no wake prompt.
+    #[tokio::test]
+    async fn subagent_relay_wakes_an_idle_orchestrator_and_steers_a_busy_one() {
+        let state = Arc::new(SharedIntercomState::new(
+            IntercomConfig::default(),
+            600_000,
+            std::path::PathBuf::from("/w"),
+        ));
+        let rec = Arc::new(SurfaceRecorder::default());
+        state.set_host_services(rec.clone());
+        let agent_dir = tempfile::tempdir().unwrap();
+        crate::connect::begin_runtime(
+            &state,
+            crate::connect::ConnectParams {
+                agent_dir: agent_dir.path().join("agent"),
+                metadata: None,
+                model: None,
+            },
+        );
+        let channel = IntercomDeliveryChannel::new(Arc::clone(&state), None);
+        let payload = |token: &str| IntercomPayload {
+            run_id: cyrup_ext_subagents::background::RunId::from_token(token),
+            agent: "researcher".to_string(),
+            success: true,
+            outputs: vec!["done".to_string()],
+            status: cyrup_ext_subagents::tui::intercom::SubagentResultStatus::Completed,
+            summary: "1 completed".to_string(),
+            child_statuses: vec![
+                cyrup_ext_subagents::tui::intercom::SubagentResultStatus::Completed,
+            ],
+            total_tokens: 10,
+        };
+
+        assert_eq!(channel.send(payload("run00000000000010")).await, Ok(true));
+        assert_eq!(rec.injected.lock().unwrap().len(), 1);
+        assert_eq!(rec.wakes.lock().unwrap().len(), 1);
+
+        // The woken run starts (`agent_start` spends the reservation) and the session is busy.
+        state.clear_idle_wake();
+        rec.busy.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(channel.send(payload("run00000000000011")).await, Ok(true));
+        let injected = rec.injected.lock().unwrap();
+        assert_eq!(injected.len(), 2, "busy relay message");
+        assert!(
+            !injected[1].3,
+            "Pi steers untriggered messages while streaming"
+        );
+        assert_eq!(
+            rec.wakes.lock().unwrap().len(),
+            1,
+            "a busy session must not get a wake prompt"
         );
     }
 

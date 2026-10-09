@@ -90,8 +90,11 @@ pub const REMOTE_COMMAND_TIMEOUT: Duration = Duration::from_secs(15);
 pub struct RemoteError(pub String);
 
 /// `shellQuoteRemote(value)` (`herdr-connection.ts:25`): always single-quote, POSIX-escaping every
-/// embedded quote. Unlike [`crate::cli::shell_quote`] this never takes a Windows arm — the remote
-/// is a POSIX shell by contract.
+/// embedded quote. It never takes a Windows arm — the remote is a POSIX shell by contract. (Upstream's
+/// local `pane run` path has no quoter at all: `project-agent.ts:240-241@v0.16.1` passes the
+/// command as one plain argv token since `e3a5258` #143. cyrup's `project_pane::pane_run_command`
+/// reuses this helper on unix only for a command that needs quoting, e.g. a spaced default
+/// `current_exe()` path.)
 #[must_use]
 pub fn shell_quote_remote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))

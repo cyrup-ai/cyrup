@@ -455,20 +455,6 @@ pub fn extract_pane_id(value: &serde_json::Value) -> Option<String> {
     })
 }
 
-/// `shellQuote(value)` (`project-agent.ts:174-177`).
-///
-/// `herdr pane run` hands its command to the pane's shell (`tmp/herdr/src/cli/pane.rs:1047-1051`
-/// sends it as `pane.send_input{text, keys:["Enter"]}`), so a path with a space must survive the
-/// round trip. `cfg!(windows)` is upstream's `process.platform === "win32"`.
-#[must_use]
-pub fn shell_quote(value: &str) -> String {
-    if cfg!(windows) {
-        format!("\"{}\"", value.replace('"', "\\\""))
-    } else {
-        format!("'{}'", value.replace('\'', "'\\''"))
-    }
-}
-
 /// The leading run of ASCII digits, and how many bytes it spans. `None` when there is none, or when
 /// the run overflows `u64` — an overflowing "version" is not one.
 fn leading_digits(rest: &[u8]) -> Option<(u64, usize)> {

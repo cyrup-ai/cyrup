@@ -534,6 +534,7 @@ async fn the_startup_retry_note_reaches_the_live_progress_surface_of_the_relaunc
         Duration::from_secs(60),
         executor.run_foreground_streaming(
             ForegroundRunRequest {
+                worktree: cyrup_ext_subagents::spawn::worktree::WorktreeRequest::Shared,
                 overrides: SingleRunOverrides::default(),
                 cwd: dir.path(),
                 agent_name: "streamtest",

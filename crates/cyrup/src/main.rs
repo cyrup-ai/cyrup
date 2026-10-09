@@ -39,7 +39,7 @@ use cyrup::predispatch::Internal;
 use cyrup::session_launch::PostBuild;
 use cyrup::{
     AppMode, Cli, Diagnostic, DiagnosticLevel, actions, apply_arg_leniency, bootstrap,
-    build_inputs, diagnostics, interactive, migrations, normalize_short_aliases,
+    build_inputs, diagnostics, interactive, migrations, normalize_process_argv,
     partition_extension_flags, predispatch, prelaunch, resolve_app_mode, run_acp_dispatch,
     run_json_dispatch, run_print_dispatch, run_rpc_dispatch, select_provider, session_launch,
     should_take_over_stdout, spawn_abort_on_signal, timings,
@@ -247,8 +247,10 @@ async fn run() -> anyhow::Result<i32> {
     timings::reset_timings(timings::TimingLabel::Main);
 
     // Pi rewrites its multi-char short aliases in its hand-rolled parser; clap cannot express them as
-    // native shorts, so normalize them up front (`-nt` ⇒ `--no-tools`, …).
-    let mut raw: Vec<String> = normalize_short_aliases(std::env::args());
+    // native shorts, so normalize them up front (`-nt` ⇒ `--no-tools`, …). `cyrup intercom …` is
+    // exempt: its `--text`/`--to`/`--name` values reach `cyrup_intercom::cli` verbatim
+    // (`normalize_process_argv`).
+    let mut raw: Vec<String> = normalize_process_argv(std::env::args());
 
     // The four internal, never-advertised subcommands — `__subagent-runner --config <path>`
     // (arch-SA §2.2/§6.5), `__subagent-inspector --async-dir <dir> --run-id <id>` (VL-S6),

@@ -1,21 +1,22 @@
 //! [`ComposeOverlay`] — a port of `pi-intercom/ui/compose.ts` `ComposeOverlay` (the width-72
 //! message-compose box), plus [`compose_send`] — the send leg the `/intercom` slash command drives.
 //!
-//! WIRING: [`compose_send`] runs the actual broker send for `/intercom <target> <message>`
-//! ([`crate::extension::IntercomExtension`]'s `execute_command`). The interactive input-buffer state
-//! machine ([`ComposeOverlay::handle_input`], [`ComposeOverlay::send_message`],
-//! [`ComposeOverlay::render`]) is the faithful port of the live overlay, including its own
-//! `client.send` leg and [`ComposeResult`] outcome (pi's `sendMessage`/`ComposeResult`,
-//! `compose.ts:7-11,76-103`); a live keystroke source (the `alt+m` shortcut + overlay renderer) is
-//! the Phase-6 `register_shortcut`/overlay-host gap (the port doc §4.3/§5 Phase 6), so the overlay's
-//! own state machine is unit-tested here and wired to real input only once that host hook lands.
+//! WIRING: picking a session with Enter in the live `/intercom` list opens [`ComposeOverlayHost`]
+//! through `HostServices::open_overlay` (`v0.16.1 index.ts:3207-3210`): keystrokes reach
+//! [`ComposeOverlay::handle_input`], Enter sends over the broker from inside the overlay (pi's
+//! private `sendMessage`, `compose.ts:76-103`) and a delivery failure stays on screen with the
+//! buffer intact. [`compose_send`] runs the broker send for the text form
+//! `/intercom <target> <message>` ([`crate::extension::IntercomExtension`]'s `execute_command`).
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+
+use cyrup_ext::{InteractiveOverlay, OverlayKey, OverlayLine, OverlayOptions, OverlayOutcome};
 
 use crate::error::{IntercomError, Result};
 use crate::transport::client::{IntercomClient, SendOptions, SendResult};
 use crate::transport::protocol::SessionInfo;
-use crate::ui::{Keybindings, Theme, truncate_to_width, visible_width};
+use crate::ui::overlay::{OverlayTheme, key_to_data, to_overlay_line};
+use crate::ui::{DefaultKeybindings, Keybindings, Theme, truncate_to_width, visible_width};
 
 /// The maximum inner width of the compose overlay (pi `Math.min(width, 72)`).
 pub const COMPOSE_MAX_WIDTH: usize = 72;
@@ -67,6 +68,12 @@ impl ComposeOverlay {
             sending: false,
             error: None,
         }
+    }
+
+    /// The session this overlay sends to.
+    #[must_use]
+    pub fn target(&self) -> &SessionInfo {
+        &self.target
     }
 
     /// The current input text (for the caller's send on [`ComposeAction::Submit`]).
@@ -237,11 +244,148 @@ fn box_row(theme: &dyn Theme, content_width: usize, text: &str) -> String {
     let clipped = truncate_to_width(text, content_width);
     let pad = content_width.saturating_sub(visible_width(&clipped));
     format!(
-        "{}{clipped}{}{}",
+        "{}{clipped}{}{}{}",
         theme.fg("accent", "│"),
+        theme.reset(),
         " ".repeat(pad),
         theme.fg("accent", "│")
     )
+}
+
+/// The outcome of one in-flight send, handed from the spawned broker call back to the overlay.
+type SendOutcome = std::result::Result<SendResult, String>;
+
+/// The live compose box: [`ComposeOverlay`] behind the host's overlay seam — pi `ctx.ui.custom((tui,
+/// theme, keybindings, done) => new ComposeOverlay(…, overlayClient, done), { overlay: true,
+/// overlayOptions: { width: 72 } })` (`v0.16.1 index.ts:3207-3210`).
+///
+/// [`InteractiveOverlay::handle_key`] is synchronous, so pi's `async sendMessage` is split at its
+/// `await`: Enter marks the overlay sending and spawns `client.send` on the captured runtime, and
+/// [`InteractiveOverlay::tick`] collects the answer — `done({ sent: true, … })` closes the overlay,
+/// a refusal or a transport error is shown inline with the buffer kept (`compose.ts:76-103`).
+pub struct ComposeOverlayHost {
+    overlay: ComposeOverlay,
+    client: Arc<IntercomClient>,
+    runtime: tokio::runtime::Handle,
+    in_flight: Option<(String, tokio::sync::oneshot::Receiver<SendOutcome>)>,
+    result: Arc<Mutex<Option<ComposeResult>>>,
+    closed: bool,
+}
+
+impl ComposeOverlayHost {
+    /// Wrap `overlay`, sending through `client` on `runtime` and publishing the outcome into
+    /// `result`.
+    #[must_use]
+    pub fn new(
+        overlay: ComposeOverlay,
+        client: Arc<IntercomClient>,
+        runtime: tokio::runtime::Handle,
+        result: Arc<Mutex<Option<ComposeResult>>>,
+    ) -> Self {
+        Self {
+            overlay,
+            client,
+            runtime,
+            in_flight: None,
+            result,
+            closed: false,
+        }
+    }
+
+    fn done(&mut self, result: ComposeResult) {
+        *self.result.lock().unwrap_or_else(|e| e.into_inner()) = Some(result);
+        self.closed = true;
+    }
+}
+
+impl InteractiveOverlay for ComposeOverlayHost {
+    fn render(&mut self, width: usize, _height: usize) -> Vec<OverlayLine> {
+        self.overlay
+            .render(&OverlayTheme, &DefaultKeybindings, width)
+            .iter()
+            .map(|line| to_overlay_line(line))
+            .collect()
+    }
+
+    fn handle_key(&mut self, key: OverlayKey) -> OverlayOutcome {
+        let Some(data) = key_to_data(key) else {
+            return OverlayOutcome::Ignored;
+        };
+        match self.overlay.handle_input(&DefaultKeybindings, &data) {
+            ComposeAction::Redraw => OverlayOutcome::Redraw,
+            ComposeAction::Ignore => OverlayOutcome::Ignored,
+            ComposeAction::Cancel => {
+                self.done(ComposeResult::default());
+                OverlayOutcome::Close
+            }
+            ComposeAction::Submit(text) => {
+                // `sendMessage()`'s synchronous prelude: `sending = true; error = null`.
+                self.overlay.set_sending(true);
+                self.overlay.error = None;
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                let client = self.client.clone();
+                let target = self.overlay.target.id.clone();
+                let body = text.clone();
+                self.runtime.spawn(async move {
+                    let outcome = client
+                        .send(
+                            &target,
+                            SendOptions {
+                                text: body,
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                        .map_err(|e| e.to_string());
+                    let _ = tx.send(outcome);
+                });
+                self.in_flight = Some((text, rx));
+                OverlayOutcome::Redraw
+            }
+        }
+    }
+
+    fn refresh_ms(&self) -> u64 {
+        50
+    }
+
+    fn tick(&mut self) -> bool {
+        let Some((text, rx)) = self.in_flight.as_mut() else {
+            return false;
+        };
+        let outcome = match rx.try_recv() {
+            Ok(outcome) => outcome,
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => return false,
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                Err("the send task ended without an answer".to_string())
+            }
+        };
+        let text = std::mem::take(text);
+        self.in_flight = None;
+        match outcome {
+            Ok(result) if result.delivered => self.done(ComposeResult {
+                sent: true,
+                message_id: Some(result.id),
+                text: Some(text),
+            }),
+            Ok(result) => self.overlay.set_error(result.reason.unwrap_or_else(|| {
+                "Message not delivered. Session may not exist or has disconnected.".to_string()
+            })),
+            Err(error) => self.overlay.set_error(error),
+        }
+        true
+    }
+
+    fn should_close(&self) -> bool {
+        self.closed
+    }
+
+    fn options(&self) -> OverlayOptions {
+        OverlayOptions {
+            width: Some(COMPOSE_MAX_WIDTH as u16),
+            ..OverlayOptions::default()
+        }
+    }
 }
 
 /// Send a composed message to `target_id` over the broker (pi `ComposeOverlay.sendMessage`,

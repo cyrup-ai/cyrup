@@ -25,9 +25,9 @@
 //!
 //! `pi.sendMessage(msg, {deliverAs:"steer"})` becomes
 //! [`cyrup_ext::host::HostServices::inject_message`] with `trigger_turn` set: a steer re-enters the
-//! live turn loop, which is what upstream's `deliverAs: "steer"` does, and what this crate's own
-//! steering inbox already uses (`prompt_runtime.rs:338`). `pi.sendUserMessage(message)` is the same
-//! call with no custom type, which routes to `send_user_message` and always triggers a turn.
+//! live turn loop, which is what upstream's `deliverAs: "steer"` does. `pi.sendUserMessage(message)`
+//! is [`cyrup_ext::host::HostServices::send_user_message`] — a real prompt, so its turn runs
+//! `input` and `before_agent_start`, which an injected turn would skip.
 //!
 //! That seam carries `content` but no `details` object, so the renderer cannot read
 //! `message.details` the way upstream's does (`:393`). It is not lost: `content` IS the
@@ -240,9 +240,12 @@ pub fn register_main_watchdog(
         })),
         send_user_message: Some(Arc::new(move |message: &str| {
             let services = user_message_services().ok_or_else(|| "no live session".to_string())?;
-            // `:389` — `pi.sendUserMessage(message)`: a plain user message, which always triggers.
-            // `sendUserMessage` takes a bare string in pi; there is no `details` to carry.
-            services.inject_message(message, None, true, None, true)
+            // `:389` @v0.60.0 — `pi.sendUserMessage(message)`: `prompt(message)`, so the auto-follow
+            // turn runs `input` and `before_agent_start` like any user prompt (NOT
+            // `inject_message(…, None, …, trigger_turn: true)`, whose `run_injection` turn skips
+            // both — pi#5581). No `deliverAs`, as upstream: the host holds it for the next idle
+            // edge rather than throwing (see `HostServices::send_user_message`).
+            services.send_user_message(message, None)
         })),
         review_changes_only: true,
         // The two real collectors, replacing the runtime's `UnavailableLspDiagnostics` /

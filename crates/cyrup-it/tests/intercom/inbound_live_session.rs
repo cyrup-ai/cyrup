@@ -560,6 +560,179 @@ async fn inbound_trigger_never_reaches_the_model_on_the_next_prompt() {
     live.shutdown().await;
 }
 
+/// ICOM-076 — a message delivered over the SSH relay (`crossMachine` provenance, the frame
+/// `cyrup-intercom-cli relay` sends, `cli.ts:219-224@v0.16.1`) reaches an idle live session's MODEL
+/// attributed to its ASSERTED `name@machine`, marked unverified, with a `send` hint back over SSH
+/// rather than a `reply` the vanished relay session could never receive
+/// (`index.ts:1283-1286,1389-1393@v0.16.1`). The persisted card says the same to the human.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn relayed_inbound_is_attributed_unverified_with_a_send_back_hint() {
+    use cyrup_intercom::transport::protocol::{
+        CrossMachineProvenance, ProvenanceOrigin, RelayTrust,
+    };
+    let live = live(Options::interactive(), answer_every_turn(), no_summaries()).await;
+
+    let sent = live
+        .peer
+        .send_relayed(
+            &live.target,
+            SendOptions {
+                text: "[Unverified cross-machine origin] build is green on the laptop".to_string(),
+                message_id: Some("relayed-1".to_string()),
+                ..Default::default()
+            },
+            CrossMachineProvenance::ssh_relay(
+                ProvenanceOrigin {
+                    name: "worker".to_string(),
+                    session_id: "00000000-0000-4000-8000-000000000001".to_string(),
+                    machine: "laptop".to_string(),
+                    extra: Default::default(),
+                },
+                RelayTrust::SshAsserted,
+            ),
+        )
+        .await
+        .expect("the broker accepts a relayed message");
+    assert!(sent.delivered, "the broker delivered the relayed message");
+    live.until_receipt("relayed-1", "injected").await;
+    let script = live.script.clone();
+    assert!(
+        within(Duration::from_secs(15), || script.model_turns() >= 1).await,
+        "the relayed message drives a turn on the idle session"
+    );
+    live.session.wait_for_idle().await;
+
+    let send_hint = r#"intercom({ action: "send", to: "worker@laptop", message: "..." })"#;
+    let texts = user_texts(&live.script.requests()[0]);
+    let card = texts
+        .iter()
+        .find(|t| t.contains("build is green"))
+        .unwrap_or_else(|| panic!("the relayed message reached the model: {texts:?}"));
+    assert!(
+        card.starts_with("**From worker@laptop · unverified cross-machine** ("),
+        "attributed to the asserted origin, marked unverified: {card}"
+    );
+    assert!(
+        card.contains(&format!("To reply, use the intercom tool: {send_hint}")),
+        "with the send-back hint: {card}"
+    );
+    assert!(
+        !card.contains(r#"action: "reply""#),
+        "never a reply hint: {card}"
+    );
+    assert!(
+        !card.contains("**From peer**"),
+        "not the delivering session: {card}"
+    );
+
+    let persisted = live.persisted().await;
+    assert_eq!(persisted.len(), 1, "persisted once: {persisted:?}");
+    assert!(
+        persisted[0].contains("**From worker@laptop · unverified cross-machine**"),
+        "{persisted:?}"
+    );
+    live.shutdown().await;
+}
+
+/// Records the `prompt` of every `before_agent_start` it is dispatched (ICOM-084).
+#[derive(Default)]
+struct BeforeAgentStartProbe {
+    prompts: Mutex<Vec<String>>,
+}
+
+#[async_trait::async_trait]
+impl NativeExtension for BeforeAgentStartProbe {
+    fn id(&self) -> ExtensionId {
+        ExtensionId::from("before-agent-start-probe")
+    }
+    async fn init(&self, api: &mut InitApi) -> Result<(), ExtError> {
+        api.subscribe(&[EventKind::BeforeAgentStart]);
+        Ok(())
+    }
+    async fn on_event(&self, ev: &HostEvent, _ctx: &HostCtx) -> HookOutcome {
+        if let HostEvent::BeforeAgentStart { prompt, .. } = ev {
+            self.prompts.lock().unwrap().push(prompt.clone());
+        }
+        HookOutcome::Noop
+    }
+}
+
+/// ICOM-084 — pi-intercom `104b83c` (#154, v0.16.1) "idle interactive sessions wake through a user
+/// prompt instead of triggerTurn", over the production path: a peer message to an IDLE live session
+/// is appended as its card with no turn, and the session is woken with the user prompt
+/// `New intercom message above.` through the REAL prompt lifecycle — so a `before_agent_start`
+/// handler (cyrup-permission-system's tool shaping and prompt sanitization, in production) sees the
+/// intercom-woken turn. Before the fix the card asked for `triggerTurn`, the injection pump ran it
+/// through `run_injection`, and this probe saw nothing. Then "a started run re-arms the wake": a
+/// second message after that run wakes the session again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_idle_peer_message_wakes_the_session_through_before_agent_start() {
+    use cyrup_intercom::inbound::IDLE_WAKE_PROMPT;
+    let probe = Arc::new(BeforeAgentStartProbe::default());
+    let options = Options {
+        first: Some(probe.clone() as Arc<dyn NativeExtension>),
+        ..Options::interactive()
+    };
+    let live = live(options, answer_every_turn(), no_summaries()).await;
+
+    live.send("idle-1", "Please look at the parser", false)
+        .await;
+    assert_eq!(
+        live.until_receipt("idle-1", "injected").await,
+        ["receiver_received", "acknowledged", "injected"]
+    );
+    let script = live.script.clone();
+    assert!(
+        within(Duration::from_secs(15), || script.model_turns() >= 1).await,
+        "the woken session answers"
+    );
+    live.session.wait_for_idle().await;
+
+    assert_eq!(
+        *probe.prompts.lock().unwrap(),
+        vec![IDLE_WAKE_PROMPT.to_string()],
+        "the intercom-woken turn ran before_agent_start, over the wake prompt"
+    );
+    let texts = user_texts(&live.script.requests()[0]);
+    let card = texts
+        .iter()
+        .position(|t| t.contains("Please look at the parser"))
+        .unwrap_or_else(|| panic!("the card reached the model: {texts:?}"));
+    assert_eq!(
+        texts.last().map(String::as_str),
+        Some(IDLE_WAKE_PROMPT),
+        "the wake prompt is the turn's user message: {texts:?}"
+    );
+    assert!(
+        card < texts.len() - 1,
+        "the card precedes the wake: {texts:?}"
+    );
+    assert_eq!(
+        live.persisted().await.len(),
+        1,
+        "the card is persisted once"
+    );
+    assert_eq!(live.script.model_turns(), 1, "one woken run");
+
+    // `agent_start` of that run spent the reservation, so the next idle message wakes again.
+    live.send("idle-2", "And the lexer", false).await;
+    live.until_receipt("idle-2", "injected").await;
+    let script = live.script.clone();
+    assert!(
+        within(Duration::from_secs(15), || script.model_turns() >= 2).await,
+        "a started run re-arms the wake"
+    );
+    live.session.wait_for_idle().await;
+    assert_eq!(probe.prompts.lock().unwrap().len(), 2);
+    let texts = user_texts(&live.script.requests()[1]);
+    assert!(
+        texts.iter().any(|t| t.contains("And the lexer")),
+        "{texts:?}"
+    );
+    assert_eq!(texts.last().map(String::as_str), Some(IDLE_WAKE_PROMPT));
+    live.shutdown().await;
+}
+
 /// How a held compaction ends.
 #[derive(Clone, Copy, Debug)]
 enum Outcome {

@@ -7,11 +7,14 @@
 //! host flattens, and every branch upstream returns exactly one `Text`. This mirrors
 //! `cyrup-ext-subagents/src/extension.rs`, which took the same shape for `subagent`.
 //!
-//! **Of upstream's four renderer inputs, the options bag arrives and the theme and `context` do
-//! not.** [`cyrup_ext::NativeExtension::render_result_under`] carries [`cyrup_ext::RenderOptions`]
-//! — `expanded` and `isPartial` — and the host re-invokes it whenever either moves
-//! (`cyrup_tui::App::refresh_extension_renders`), so both branches that read them are ported live.
-//! What is still absent:
+//! **Of upstream's renderer inputs, the options bag arrives and the theme does not.**
+//! [`cyrup_ext::NativeExtension::render_result_under`] and
+//! [`cyrup_ext::NativeExtension::render_call_under`] carry [`cyrup_ext::RenderOptions`] —
+//! `expanded` (upstream's `context.expanded` on `renderCall`, and on `renderResult`) and
+//! `isPartial` — and the host re-invokes both whenever either moves
+//! (`cyrup_tui::App::refresh_extension_renders`), so every branch that reads them is ported live,
+//! including `renderCall`'s Ctrl+O full-message arm (ICOM-083, `d5a8fd1` #153). What is still
+//! absent:
 //!
 //! * every `theme.fg(...)` / `theme.bold(...)` wrapper degrades to its plain content (the same
 //!   carve-out `cyrup-ext-subagents` records for `subagent`, and the reason the ✓/✗/⚠ glyphs — which
@@ -81,15 +84,33 @@ fn string_field<'a>(v: &'a Value, key: &str) -> Option<&'a str> {
     v.get(key).and_then(Value::as_str)
 }
 
-/// `renderCall` for `intercom` (`v0.10.1 index.ts:2298-2315`).
-pub(crate) fn render_intercom_call(args: &Value) -> String {
+/// The message line of both `renderCall`s (`index.ts:2396-2400` / `:2894-2899@v0.16.1`, `d5a8fd1`
+/// #153): `context.expanded && typeof args.message === "string" ? args.message :
+/// previewText(args.message, 96)`, drawn only `if (messageText)`.
+///
+/// Expanded, the RAW string is shown — not whitespace-normalized, not truncated — so Ctrl+O reveals
+/// the outgoing body exactly as the model wrote it. JS truthiness carries over exactly: an expanded
+/// `""` draws nothing, while an expanded all-whitespace string is truthy and IS drawn raw. A
+/// non-string message draws nothing in either state (`previewText` returns `undefined` for it).
+fn call_message_text(args: &Value, expanded: bool) -> Option<String> {
+    let message = args.get("message");
+    let text = if expanded && let Some(raw) = message.and_then(Value::as_str) {
+        Some(raw.to_string())
+    } else {
+        preview_text(message, 96)
+    };
+    text.filter(|t| !t.is_empty())
+}
+
+/// `renderCall` for `intercom` (`index.ts:2891-2914@v0.16.1`).
+pub(crate) fn render_intercom_call(args: &Value, expanded: bool) -> String {
     // `typeof args.action === "string" ? args.action : "intercom"`.
     let action = string_field(args, "action").unwrap_or("intercom");
     // `typeof args.to === "string" && args.to.trim() ? args.to.trim() : undefined`.
     let target = string_field(args, "to")
         .map(str::trim)
         .filter(|t| !t.is_empty());
-    let message_preview = preview_text(args.get("message"), 96);
+    let message_preview = call_message_text(args, expanded);
     let attachment_count = args
         .get("attachments")
         .and_then(Value::as_array)
@@ -166,11 +187,11 @@ pub(crate) fn render_intercom_result(result: &Value, opts: &cyrup_ext::RenderOpt
     text
 }
 
-/// `renderCall` for `contact_supervisor` (`v0.10.1 index.ts:1743-1756`).
-pub(crate) fn render_contact_supervisor_call(args: &Value) -> String {
+/// `renderCall` for `contact_supervisor` (`index.ts:2394-2411@v0.16.1`).
+pub(crate) fn render_contact_supervisor_call(args: &Value, expanded: bool) -> String {
     // `typeof args.reason === "string" ? args.reason : "contact"`.
     let reason = string_field(args, "reason").unwrap_or("contact");
-    let message_preview = preview_text(args.get("message"), 96);
+    let message_preview = call_message_text(args, expanded);
     // `args.interview && typeof args.interview === "object"` — an ARRAY passes upstream's test too
     // (`typeof [] === "object"`), but then `.title` is `undefined` and the branch is skipped, which
     // is what reading `title` off a non-object here also produces.
@@ -280,12 +301,15 @@ mod tests {
 
     #[test]
     fn intercom_call_renders_action_target_attachments_and_preview() {
-        let text = render_intercom_call(&json!({
-            "action": "ask",
-            "to": "  reviewer  ",
-            "attachments": [{ "name": "a" }],
-            "message": "please   review\nthis",
-        }));
+        let text = render_intercom_call(
+            &json!({
+                "action": "ask",
+                "to": "  reviewer  ",
+                "attachments": [{ "name": "a" }],
+                "message": "please   review\nthis",
+            }),
+            false,
+        );
         // Upstream's guard is `if (attachmentCount > 0)` (`v0.10.1 index.ts:2308`), so ONE
         // attachment draws the segment too — singular, with no `s`. This assertion originally
         // omitted it while still passing an `attachments` array, contradicting both the test's own
@@ -296,20 +320,84 @@ mod tests {
         );
         // Zero attachments is the only count that draws nothing.
         assert_eq!(
-            render_intercom_call(&json!({ "action": "ask", "to": "reviewer", "attachments": [] })),
+            render_intercom_call(
+                &json!({ "action": "ask", "to": "reviewer", "attachments": [] }),
+                false
+            ),
             "intercom ask → reviewer"
         );
         // One attachment is singular; two are plural.
-        let two = render_intercom_call(&json!({
-            "action": "send",
-            "attachments": [1, 2],
-            "message": "hi",
-        }));
+        let two = render_intercom_call(
+            &json!({
+                "action": "send",
+                "attachments": [1, 2],
+                "message": "hi",
+            }),
+            false,
+        );
         assert_eq!(two, "intercom send (2 attachments)\n  hi");
         // A blank `to` is dropped (`args.to.trim()` truthiness), and a missing action is "intercom".
         assert_eq!(
-            render_intercom_call(&json!({ "to": "   " })),
+            render_intercom_call(&json!({ "to": "   " }), false),
             "intercom intercom"
+        );
+    }
+
+    /// `intercom.integration.test.ts` "outgoing tool calls preserve full messages when expanded"
+    /// (`d5a8fd1` #153, v0.16.1): the same leading-space, blank-line, CJK + emoji body, rendered
+    /// raw when expanded and as the 96-char normalized preview when collapsed, for BOTH tools.
+    #[test]
+    fn outgoing_tool_calls_preserve_full_messages_when_expanded() {
+        let message = format!("  {}\n\n    中文🧪 tail", "a".repeat(100));
+        let cases = [
+            (
+                render_intercom_call as fn(&Value, bool) -> String,
+                json!({ "action": "send", "to": "planner", "message": message }),
+                "intercom send → planner",
+            ),
+            (
+                render_contact_supervisor_call,
+                json!({ "reason": "progress_update", "message": message }),
+                "contact_supervisor progress_update",
+            ),
+        ];
+        for (render, args, title) in cases {
+            assert_eq!(render(&args, true), format!("{title}\n  {message}"));
+            assert_eq!(
+                render(&args, false),
+                format!("{title}\n  {}…", "a".repeat(95))
+            );
+            // The renderer reads the args; it never rewrites them.
+            assert_eq!(args.get("message"), Some(&json!(message)));
+        }
+    }
+
+    /// JS truthiness on `messageText`: an expanded `""` draws nothing, an expanded all-whitespace
+    /// string is truthy and is drawn raw (collapsed, it normalizes to empty and draws nothing), and
+    /// a non-string message draws nothing in either state.
+    #[test]
+    fn expanded_call_message_follows_upstreams_truthiness() {
+        for expanded in [false, true] {
+            assert_eq!(
+                render_intercom_call(&json!({ "action": "send", "message": "" }), expanded),
+                "intercom send"
+            );
+            assert_eq!(
+                render_intercom_call(&json!({ "action": "send", "message": 42 }), expanded),
+                "intercom send"
+            );
+            assert_eq!(
+                render_contact_supervisor_call(&json!({ "message": ["x"] }), expanded),
+                "contact_supervisor contact"
+            );
+        }
+        assert_eq!(
+            render_intercom_call(&json!({ "action": "send", "message": "   " }), false),
+            "intercom send"
+        );
+        assert_eq!(
+            render_intercom_call(&json!({ "action": "send", "message": "   " }), true),
+            "intercom send\n     "
         );
     }
 
@@ -421,18 +509,21 @@ mod tests {
 
     #[test]
     fn contact_supervisor_renderers_port_the_reason_title_and_parse_warning() {
-        let call = render_contact_supervisor_call(&json!({
-            "reason": "interview_request",
-            "interview": { "title": "  Pick a plan  " },
-            "message": "which one?",
-        }));
+        let call = render_contact_supervisor_call(
+            &json!({
+                "reason": "interview_request",
+                "interview": { "title": "  Pick a plan  " },
+                "message": "which one?",
+            }),
+            false,
+        );
         assert_eq!(
             call,
             "contact_supervisor interview_request Pick a plan\n  which one?"
         );
         // Missing reason is upstream's "contact".
         assert_eq!(
-            render_contact_supervisor_call(&json!({})),
+            render_contact_supervisor_call(&json!({}), false),
             "contact_supervisor contact"
         );
 
