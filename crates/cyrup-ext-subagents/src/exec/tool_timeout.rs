@@ -216,8 +216,10 @@ fn number_coercion(raw: &str) -> Option<f64> {
     trimmed.parse::<f64>().ok()
 }
 
-/// pi's single refusal string (`tool-timeout.ts:82`).
-fn invalid_tool_timeout_message(label: &str) -> String {
+/// pi's single refusal string (`runs/shared/tool-timeout.ts:85` @ad11b7ab), which is also the
+/// executor's `timerDelayOverflowError` text (`runs/foreground/subagent-executor.ts:3001`), so
+/// SUBA-160's `timeoutMs`/`maxRuntimeMs` refusals reuse it.
+pub(crate) fn invalid_tool_timeout_message(label: &str) -> String {
     format!("{label} must be a positive integer no larger than {MAX_TIMER_DELAY_MS}.")
 }
 

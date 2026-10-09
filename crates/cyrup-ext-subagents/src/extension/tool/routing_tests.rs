@@ -4334,3 +4334,88 @@ async fn an_empty_agent_name_in_a_tasks_item_is_refused_by_the_dispatcher() {
         );
     }
 }
+
+/// SUBA-160 — pi `resumeAsyncRun` refuses an oversized `timeoutMs` right after its
+/// `requires message` check (`runs/foreground/subagent-executor.ts:1917-1933` @ad11b7ab), before
+/// the run is looked up; the bound itself passes through to the lookup.
+#[tokio::test]
+async fn resume_refuses_a_timeout_above_the_timer_delay_cap() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let tool = scoped_tool(dir.path()).await;
+    let resume = |extra: serde_json::Value| {
+        let tool = &tool;
+        async move {
+            let mut params = serde_json::json!({ "action": "resume", "id": "run00000000" });
+            for (key, value) in extra.as_object().expect("object") {
+                params[key] = value.clone();
+            }
+            dispatch_tool(tool, params)
+                .await
+                .expect_err("no such run, so every call here is refused")
+                .to_string()
+        }
+    };
+
+    assert_eq!(
+        resume(serde_json::json!({ "message": "go on", "timeoutMs": 2_147_483_648_u64 })).await,
+        "timeoutMs must be a positive integer no larger than 2147483647."
+    );
+    // Upstream's message check comes first.
+    assert_eq!(
+        resume(serde_json::json!({ "timeoutMs": 2_147_483_648_u64 })).await,
+        "action='resume' requires message."
+    );
+    // ...and the overflow check precedes the attach-chain acceptance check (`:1926` vs `:1940`).
+    assert_eq!(
+        resume(serde_json::json!({
+            "timeoutMs": 2_147_483_648_u64,
+            "chain": [{ "agent": "worker", "task": "t", "acceptance": { "bogus": 1 } }]
+        }))
+        .await,
+        "timeoutMs must be a positive integer no larger than 2147483647."
+    );
+    let at_the_bound =
+        resume(serde_json::json!({ "message": "go on", "timeoutMs": 2_147_483_647_u64 })).await;
+    assert!(
+        !at_the_bound.contains("no larger than"),
+        "the bound itself is accepted: {at_the_bound}"
+    );
+}
+
+/// SUBA-160 — an agent's frontmatter `timeoutMs` above `MAX_TIMER_DELAY_MS` refuses a SINGLE
+/// launch. Upstream's `applySingleAgentLaunchDefaults` (`runs/foreground/subagent-executor.ts:
+/// 2949-2951` @ad11b7ab, applied at `:7423`) copies the agent's `defaultTimeoutMs` into
+/// `params.timeoutMs` when the call set neither alias, so `resolveForegroundTimeout`'s overflow
+/// check (`:3028`) refuses it under the name `timeoutMs`. A call-site value still outranks the
+/// agent's, exactly as the copy is skipped when either alias is set.
+#[tokio::test]
+async fn an_agent_frontmatter_timeout_above_the_timer_delay_cap_refuses_a_single_launch() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let project_agents = dir.path().join(".cyrup").join("agents");
+    std::fs::create_dir_all(&project_agents).expect("mkdir");
+    std::fs::write(
+        project_agents.join("slowpoke.md"),
+        "---\nname: slowpoke\ndescription: d\ntimeoutMs: 2147483648\n---\n\nBody\n",
+    )
+    .expect("write slowpoke");
+    let tool = scoped_tool(dir.path()).await;
+
+    for extra in [
+        serde_json::json!({}),
+        serde_json::json!({ "async": true }),
+        serde_json::json!({ "async": false }),
+    ] {
+        let mut params = serde_json::json!({ "agent": "slowpoke", "task": "do it" });
+        for (key, value) in extra.as_object().expect("object") {
+            params[key] = value.clone();
+        }
+        let refused = dispatch_tool(&tool, params)
+            .await
+            .expect_err("the agent's oversized timeoutMs must refuse the launch")
+            .to_string();
+        assert_eq!(
+            refused, "timeoutMs must be a positive integer no larger than 2147483647.",
+            "extra params: {extra}"
+        );
+    }
+}

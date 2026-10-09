@@ -1039,6 +1039,47 @@ mod tests {
         }
     }
 
+    /// SUBA-160 — `/run` reaches upstream's same `executor.execute`, where
+    /// `applySingleAgentLaunchDefaults` (`runs/foreground/subagent-executor.ts:2949-2951` @ad11b7ab)
+    /// copies the agent's frontmatter `timeoutMs` into `params.timeoutMs` and
+    /// `resolveSingleAgentLaunchTimeout` (`:7558`) refuses it above `MAX_TIMER_DELAY_MS` — before
+    /// the spawn reservation (`:7719`), so the refused `/run` bills nothing.
+    #[tokio::test]
+    async fn run_refuses_an_agent_frontmatter_timeout_above_the_timer_delay_cap() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let project_agents = dir.path().join(".cyrup").join("agents");
+        std::fs::create_dir_all(&project_agents).expect("mkdir");
+        std::fs::write(
+            project_agents.join("slowpoke.md"),
+            "---\nname: slowpoke\ndescription: d\ntimeoutMs: 2147483648\n---\n\nBody\n",
+        )
+        .expect("write slowpoke");
+        let ext = SubagentsExtension::with_config_and_cwd(
+            SubagentExtensionConfig {
+                max_subagent_spawns_per_session: 1,
+                missions: Some(scoped_missions(dir.path())),
+                ..SubagentExtensionConfig::default()
+            },
+            dir.path().to_path_buf(),
+        );
+        for args in ["slowpoke do the thing", "slowpoke do the thing --bg"] {
+            ext.executor().reset_spawn_budget();
+            let err = ext
+                .dispatch_slash(SlashCommandName::Run, args, dir.path(), false)
+                .await
+                .expect_err("the agent's oversized timeoutMs must refuse `/run`");
+            assert_eq!(
+                err.to_string(),
+                "timeoutMs must be a positive integer no larger than 2147483647.",
+                "`/run {args}`"
+            );
+            assert!(
+                ext.executor().reserve_subagent_spawns(1, 1).is_ok(),
+                "a refused `/run {args}` must not have consumed the session's only spawn"
+            );
+        }
+    }
+
     /// SUBA-002's no-double-charge invariant: the `subagent` TOOL's chain/parallel shapes reserve
     /// exactly ONCE (in [`SubagentTool::execute`]) and then reach
     /// [`SubagentExecutor::run_or_background_graph`] through
