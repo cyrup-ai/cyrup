@@ -123,6 +123,7 @@ mod package_update_notice;
 mod pending_messages;
 mod project_trust_banner;
 mod quiet_startup_setting;
+mod recorded_duration;
 mod reload_implicit_trust;
 mod render;
 mod render_cache_tick;

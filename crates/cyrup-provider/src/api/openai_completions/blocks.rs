@@ -3,7 +3,6 @@
 use crate::api::content_cache::ContentCache;
 use crate::model::Model;
 use crate::usage::apply_cost;
-use crate::utils::provider_plumbing::now_millis;
 use cyrup_core::{
     ApiId, AssistantMessage, Content, LazyArgs, SharedStr, StopReason, ToolCall, ToolCallId, Usage,
 };
@@ -32,6 +31,11 @@ pub(super) enum Block {
 /// Streaming-decode state.
 #[derive(Default)]
 pub(super) struct Decoder {
+    /// Wall-clock start of this response — the `timestamp` of every message it produces (pi seeds
+    /// `output.timestamp = Date.now()` once, before the request, and the v1.1.0 type documents it
+    /// as *"when the request started"*). Set from [`crate::api::EventSink::started_at`] by the
+    /// driver; `0` only in a decoder a unit test built by hand.
+    pub(super) started_at: i64,
     pub(super) blocks: Vec<Block>,
     /// Memoised projection of `blocks` (PERF-001). Write to `blocks` ONLY through
     /// [`Self::push_block`] and [`Self::block_mut`], or this goes stale.
@@ -121,7 +125,8 @@ impl Decoder {
             error_message: self.error_message.clone(),
             raw_stop_reason: self.raw_stop_reason.clone(),
             end_turn: None,
-            timestamp: now_millis(),
+            timestamp: self.started_at,
+            duration_ms: None,
         }
     }
 }

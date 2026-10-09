@@ -50,6 +50,7 @@ pub(crate) fn coding_agent_convert_to_llm(msgs: &[Arc<AgentMessage>]) -> Vec<Mes
             }
             AgentMessage::Assistant(a) => out.push(Message::Assistant((**a).clone())),
             AgentMessage::ToolResult(t) => out.push(Message::ToolResult {
+                duration_ms: t.duration_ms,
                 tool_call_id: t.tool_call_id.clone(),
                 tool_name: t.tool_name.clone(),
                 content: t.content.clone(),
@@ -174,6 +175,7 @@ impl Hooks for PolicyHooks {
                     }
                 }
                 Message::ToolResult {
+                    duration_ms,
                     tool_call_id,
                     tool_name,
                     content,
@@ -184,6 +186,7 @@ impl Hooks for PolicyHooks {
                     timestamp,
                     nested_calls,
                 } if content.iter().any(is_image) => Message::ToolResult {
+                    duration_ms,
                     tool_call_id,
                     tool_name,
                     content: filter_images(&content),
@@ -325,6 +328,12 @@ impl Hooks for PolicyHooks {
         if let Some(messages) = rebuilt {
             update.context = Some(messages.into_iter().map(std::sync::Arc::new).collect());
         }
+        // EXT-078 — a boundary commit that changed the context while this run was in flight (pi
+        // `_commitBoundaryDrafts` → `_refreshFinalizedContext`, `agent-session.ts:1024-1028`
+        // @v1.1.0): the loop continues on the refreshed transcript.
+        if let Some(messages) = session.take_boundary_context().await {
+            update.context = Some(messages.into_iter().map(std::sync::Arc::new).collect());
+        }
         update.tools = Some(session.next_turn_tools().await);
         // CODE-014 — the prompt the model is sent always describes the tool array it is sent with
         // (pi's refresh assigned `context.systemPrompt` in the same object literal as `context.tools`
@@ -336,6 +345,9 @@ impl Hooks for PolicyHooks {
         // The message goes last among the prepared ones (`[...previousSnapshot.messages,
         // updateMessage]`, `:896-898`); the loop then merges the tool declarations into it, as it
         // does for any pending system message.
+        // EXT-084 — pi refreshes the run's options from the live loadout before it diffs them
+        // (`agent-session.ts:908-917` @v1.1.0).
+        session.refresh_run_prompt_options();
         {
             let transcript: &[Arc<AgentMessage>] = update.context.as_deref().unwrap_or(&working);
             if let Some(message) = session.prompt_update(transcript.iter().map(AsRef::as_ref)) {
@@ -359,12 +371,31 @@ impl Hooks for PolicyHooks {
     /// pi's session wraps whatever `finishTurn` was already installed rather than replacing it
     /// (`const previousFinishTurn = this.agent.finishTurn`, agent-session.ts:676-684 @v0.87.1), so
     /// the inner seam's decision is passed through.
+    ///
+    /// EXT-078 — pi `_installAgentBoundaryHooks` (`agent-session.ts:885-895` @v1.1.0): the turn's
+    /// `turn_end` boundary is dispatched first, then the previous hook decides; its `end` wins, and
+    /// either one's `continue` asks for one more provider request.
     async fn finish_turn(
         &self,
         ctx: PostTurn<'_>,
         cancel: CancelToken,
     ) -> Result<Option<TurnDecision>, HookError> {
-        self.inner.finish_turn(ctx, cancel).await
+        let extension_continue = match self.session.get() {
+            Some(session) => {
+                session
+                    .dispatch_turn_end_boundary(ctx.message, ctx.tool_results)
+                    .await
+            }
+            None => false,
+        };
+        let previous = self.inner.finish_turn(ctx, cancel).await?;
+        Ok(match previous {
+            Some(TurnDecision::End) => previous,
+            _ if extension_continue || previous == Some(TurnDecision::Continue) => {
+                Some(TurnDecision::Continue)
+            }
+            _ => None,
+        })
     }
 
     /// The VIRTUAL-MODEL ROUTING STEP, in pi's own wrap-don't-replace shape for `prepareRequest`

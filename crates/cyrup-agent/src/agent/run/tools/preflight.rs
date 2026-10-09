@@ -188,6 +188,8 @@ pub(crate) fn immediate_error(
         usage: None,
         added_tool_names: Vec::new(),
         is_error: true,
+        // The call did not run (pi: `durationMs` is spread only from an executed outcome).
+        duration_ms: None,
         // Pi `createToolResultMessage` stamps every tool result with `Date.now()`
         // (agent-loop.ts:741); this reaches the wire payload via `convert_to_llm`.
         timestamp: now_millis(),

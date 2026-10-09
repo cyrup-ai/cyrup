@@ -7,6 +7,7 @@ use super::declare;
 use super::{RunCtx, RunFailure};
 use crate::event::{AgentEvent, AgentMessage};
 use cyrup_core::AssistantMessage;
+use cyrup_provider::timing::ResponseTimer;
 use cyrup_provider::{Context, StreamOptions};
 use futures::StreamExt;
 use std::sync::Arc;
@@ -135,6 +136,12 @@ impl RunCtx {
             tools: tool_defs,
         };
 
+        // The response's clock (pi `AssistantMessageEventStream`, `utils/event-stream.ts` @v1.1.0),
+        // started as the request is made. Whatever stream function answers, the settled message
+        // gets `durationMs` — from the provider's own timer when it has one (that one wins), from
+        // this one otherwise, and for the messages settled HERE (an abort, a stream that ended
+        // without a terminal), which pi's stream times as the `error` event the abort produces.
+        let timer = ResponseTimer::start();
         let mut stream = self.stream_fn.stream(&model, &ctx, &opts);
         let cancel_tok = self.cancel.token();
         let mut acc = AssistantStream::new(&model);
@@ -169,7 +176,9 @@ impl RunCtx {
         // been folded into, so under a virtual selection this is the ROUTED level. It must land
         // BEFORE `message_end` is emitted, because that event is what the session persists and what
         // the routing step later reads back as `previous`/`failed`.
-        let settled = settled.with_thinking_level(effective_thinking);
+        let settled = settled
+            .timed(&timer)
+            .with_thinking_level(effective_thinking);
 
         // The one emission tail. `settled.start` is `Some` iff the stream never yielded a
         // `Start` — the exactly-once decision is the accumulator's, not this function's.

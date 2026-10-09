@@ -207,6 +207,60 @@ is a `cyrup_ext::host::ModelCall` (verb, provider, model id, context, options an
 that stands in for pi's `signal`). Natives are trusted in-tree code with no manifest, so no
 capability gates them.
 
+## Editing the system prompt
+
+A `before_agent_start` handler is handed the options the prompt is built from as well as the prompt
+itself (`event.options`, pi's `systemPromptOptions`). Edit a copy and return it, and the next handler —
+in your extension or another — reads the prompt those options render to, and so does the model:
+
+```rust
+api.on_before_agent_start(|ev, _ctx| {
+    let mut options = ev.options.clone();
+    options["sections"]["team"] = json!("Prefer small, reviewed changes.");
+    Outcome::before_agent_start(BeforeAgentStartResult {
+        system_prompt_options: Some(options),
+        ..Default::default()
+    })
+});
+```
+
+`sections` adds XML-wrapped sections after `<cwd>`; a name the prompt already has (`rules`, `tools`,
+…) replaces that section where it stands. A name must match `^[a-z][a-z0-9_-]*$` and may not be
+`preamble`, or the prompt is refused. Editing `selectedTools` changes which tools the run has.
+Returning `system_prompt` instead replaces the whole prompt the model is sent for this run; the
+session file keeps the structured sections either way.
+
+## Run boundaries
+
+`turn_end` and `agent_before_settle` are boundaries: a handler may append entries to the session and
+ask for one more provider request. `agent_before_settle` runs once nothing else — a retry, a
+compaction, a queued message — would continue the run.
+
+```rust
+api.on_turn_end(|ev, _ctx| {
+    if wants_another_look(&ev) {
+        return Outcome::boundary(BoundaryResult {
+            entries: Some(json!([{
+                "type": "custom_message",
+                "customType": "review",
+                "content": "Check the diff once more before finishing.",
+                "display": true,
+            }])),
+            continue_: Some(true),
+        });
+    }
+    Outcome::noop()
+});
+```
+
+An entry is one of pi's drafts: `custom` (state only), `custom_message` (model context),
+`context_edit` (`{targetId, replacement: {content} | null}` — replace or omit an earlier entry's
+contribution) or `compaction` (`{summary, firstKeptEntryId}`; `null` keeps nothing before it).
+`ev.boundary.context` previews the model context with the drafts so far appended, rebuilt after each
+handler; a continuation is honoured only when that context can be continued from — a context that
+ends on the assistant's reply needs something after it. `turn_end` also names the entries the turn was
+persisted as (`message_entry_id`, `tool_result_entry_ids`), which a `context_edit` can target.
+
 ## Building
 
 ```sh
@@ -224,7 +278,7 @@ post-processes it.
 {
   "id": "my-ext",
   "version": "1.0.0",
-  "world": "cyrup:ext@0.18",
+  "world": "cyrup:ext@0.19",
   "entry": "crates/my-ext",
   "capabilities": {
     "fs": ["read:.", "write:.cyrup/todo"],
@@ -246,16 +300,17 @@ post-processes it.
 
 ### World compatibility
 
-The host world is `cyrup:ext@0.18` (`HOST_WORLD` in `crates/cyrup-ext/src/manifest.rs`, which also
+The host world is `cyrup:ext@0.19` (`HOST_WORLD` in `crates/cyrup-ext/src/manifest.rs`, which also
 carries the bump history). A manifest's `world` must declare the **same major version** as the host
-and a **minor version at least** the host's. Against today's host, `cyrup:ext@0.18` is the value to
+and a **minor version at least** the host's. Against today's host, `cyrup:ext@0.19` is the value to
 write; an older minor is a mismatch, and so is a different major.
 
 The minor moves whenever an export is added, removed or re-signed, and whenever an import is removed
 or re-signed — both of those break an already-built guest at link time. A purely additive import does
-not move it. `0.18` is the current value because the prompt-cache warming decision an extension can
-override is a guest export, `events.on-cache-warming-decision`, so a `0.17` component does not have
-it; `0.17` was the route callback of a virtual model (see [Virtual models](virtual-models.md)),
+not move it. `0.19` is the current value because `events.on-tool-execution-end` now carries how long
+the tool ran and `events.on-turn-end` returns a result (see [Run boundaries](#run-boundaries)), so a
+`0.18` component exports the older signatures; `0.18` was the prompt-cache warming
+decision an extension can override, a guest export a `0.17` component does not have; `0.17` was the route callback of a virtual model (see [Virtual models](virtual-models.md)),
 which a `0.16` component does not have. That is why the rule is one-directional: a *higher* minor than the host is accepted,
 a lower one is refused.
 

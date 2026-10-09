@@ -10,9 +10,61 @@
 //! import, that keeps it out of `tools`, where every method wraps `ext-tools`/`registration` and
 //! nothing else.
 
+use std::cell::RefCell;
+
 use serde::Serialize;
 
 use super::{Models, Session, Ui};
+
+thread_local! {
+    /// The prompt a `before_agent_start` handler's options render to while its handler chain runs
+    /// (EXT-084). pi's runner rebinds `ctx.getSystemPrompt` for that chain to render the options
+    /// every handler edits (`core/extensions/runner.ts:1431-1434` @v1.1.0), so a handler reads
+    /// the prompt as the handlers before it left it, not the one the session last sent.
+    static BEFORE_AGENT_START_PROMPT: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+/// Set (or, with `None`, clear) the prompt [`Ctx::system_prompt`] answers during a
+/// `before_agent_start` handler chain.
+pub(crate) fn set_before_agent_start_prompt(prompt: Option<String>) {
+    BEFORE_AGENT_START_PROMPT.with(|p| *p.borrow_mut() = prompt);
+}
+
+/// pi `_buildBoundaryContext(entries, boundary)` through the host's `ctx-state.preview-boundary`
+/// import (EXT-078): the `BoundaryContextPreview` JSON for `entries_json` at `boundary`
+/// (`"turn_end"` / `"agent_before_settle"`). `None` when the drafts do not apply, and on the host
+/// target.
+pub(crate) fn preview_boundary(boundary: &str, entries_json: &str) -> Option<String> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        return crate::guest::bindings::cyrup::ext::ctx_state::preview_boundary(
+            boundary,
+            entries_json,
+        )
+        .ok();
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = (boundary, entries_json);
+        None
+    }
+}
+
+/// pi `buildSystemPrompt(options)` through the host's `ctx-state.render-system-prompt` import
+/// (EXT-084). `None` when the options do not render, and on the host target, where there is no
+/// host to ask.
+pub(crate) fn render_system_prompt(options_json: &str) -> Option<String> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        return crate::guest::bindings::cyrup::ext::ctx_state::render_system_prompt(options_json)
+            .ok();
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = options_json;
+        None
+    }
+}
 
 /// The mode the host is running in (Pi `ExtensionMode`, types.ts:305 — `"tui" | "rpc" | "json" |
 /// "print"`); the WIT `types.ext-mode` enum. Mirrored here rather than re-exported from the
@@ -314,8 +366,12 @@ impl Ctx {
     }
 
     /// The active system prompt (Pi `ctx.getSystemPrompt()`, types.ts:346); empty when no session
-    /// backend is attached.
+    /// backend is attached. Inside a `before_agent_start` handler it is the prompt the
+    /// `systemPromptOptions` render to as the handlers before this one left them (EXT-084).
     pub fn system_prompt(&self) -> String {
+        if let Some(prompt) = BEFORE_AGENT_START_PROMPT.with(|p| p.borrow().clone()) {
+            return prompt;
+        }
         #[cfg(target_arch = "wasm32")]
         {
             return crate::guest::bindings::cyrup::ext::ctx_state::get_system_prompt();

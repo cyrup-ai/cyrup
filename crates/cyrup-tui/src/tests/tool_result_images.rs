@@ -73,6 +73,7 @@ fn run_read_tool(app: &mut App<TestBackend>, result: serde_json::Value) {
         args: serde_json::json!({ "file_path": "/tmp/shot.png" }),
     });
     app.ingest_event(&AgentSessionEvent::ToolExecutionEnd {
+        duration_ms: None,
         tool_call_id: cyrup_core::ToolCallId::from("call_1"),
         tool_name: "read".into(),
         is_error: false,

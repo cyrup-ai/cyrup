@@ -41,6 +41,17 @@ pub enum SessionServiceError {
     #[error("context load: {0}")]
     Context(#[from] cyrup_session::prompt::ContextError),
 
+    /// pi `buildSystemPromptSections` refusing a `before_agent_start` handler's custom section
+    /// name (`Invalid system prompt section name: <name>`, `core/system-prompt.ts:141` @v1.1.0;
+    /// EXT-084), thrown out of `prompt()`.
+    #[error(transparent)]
+    SystemPromptSection(#[from] cyrup_session::prompt::InvalidSectionName),
+
+    /// A `before_agent_start` handler returned `systemPromptOptions` that are not pi's
+    /// `BuildSystemPromptOptions` shape (EXT-084).
+    #[error("invalid system prompt options: {0}")]
+    SystemPromptOptions(String),
+
     #[error("model not found: {0}")]
     ModelNotFound(String),
 

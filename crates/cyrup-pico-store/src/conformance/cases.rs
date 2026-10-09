@@ -656,6 +656,8 @@ async fn one_number_is_owned_by_one_record_type(store: &mut dyn Storage) -> Resu
             owner: None,
             background: false,
             abort_requested: false,
+            started_at: None,
+            ended_at: None,
             state: crate::TaskState::Pending {
                 checkpoint: DocValue::Null,
                 memos: None,

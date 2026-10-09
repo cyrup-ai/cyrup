@@ -120,7 +120,7 @@ impl NativeExtension for Probe {
                     }
                 }
             }
-            HostEvent::AgentSettled if !self.first => {
+            HostEvent::AgentSettled { .. } if !self.first => {
                 self.handoff.settled.fetch_add(1, Ordering::SeqCst);
             }
             _ => {}

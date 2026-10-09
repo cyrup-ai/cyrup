@@ -347,6 +347,12 @@ pub struct ToolResultMessage {
     pub added_tool_names: Vec<String>,
     #[serde(default)]
     pub is_error: bool,
+    /// Milliseconds the tool's `execute()` took, measured with a monotonic clock (pi
+    /// `ToolResultMessage.durationMs?`, `packages/ai/src/types.ts` @v1.1.0). Absent when the tool
+    /// did not run. Declared between `isError` and `timestamp`, where pi's `createToolResultMessage`
+    /// spreads it (`packages/agent/src/agent-loop.ts:940-942` @v1.1.0).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
     pub timestamp: i64,
     /// The calls the tool made to other tools while it ran (Pi `ToolResultMessage.nestedCalls`,
     /// `ai/src/types.ts:604-605` @v1.0.1): *"Kept for the session record; not sent to the model."*
@@ -400,6 +406,10 @@ pub enum AgentEvent {
         tool_name: String,
         result: Value,
         is_error: bool,
+        /// Milliseconds `execute()` took (pi `durationMs?`, `packages/agent/src/types.ts` @v1.1.0);
+        /// absent when the tool did not run.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        duration_ms: Option<u64>,
     },
     TurnEnd {
         message: AgentMessage,

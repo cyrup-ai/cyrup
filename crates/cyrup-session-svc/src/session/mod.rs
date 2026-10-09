@@ -23,6 +23,7 @@ mod accessors;
 mod adapters;
 mod auto_compaction;
 mod bash;
+mod boundary;
 mod codemode;
 mod commands;
 mod compaction;
@@ -131,6 +132,10 @@ pub(crate) struct SessionExtras {
     /// subscriber was built with: the session produces records through
     /// [`AgentSession::execute_nested_tool`], the subscriber stamps them onto the tool result.
     pub nested_calls: Arc<cyrup_agent::NestedToolCallRunner>,
+    /// pi's `_agentRunAbortRequested`, shared with the persist+fan-out subscriber so the
+    /// `agent_settled` it emits for an UNBOUND session reports the same `aborted` the post-run
+    /// driver reports for a bound one.
+    pub run_abort_requested: Arc<AtomicBool>,
     /// The hooks the agent was built with — what a nested call runs through, so a call a tool
     /// makes meets the same permission policy and extension chain as one the model made
     /// (CODE-006; pi passes `this._beforeToolCall` / `this._afterToolCall` to `runToolCall`,
@@ -196,19 +201,18 @@ pub struct AgentSession {
     /// replays (pi `_preparePromptAndToolLoadout`, `agent-session.ts:1689-1705` @v1.0.0); the agent
     /// holds no prompt of its own.
     base_prompt: Mutex<crate::tools::BuiltPrompt>,
-    /// The `before_agent_start` handler's replacement prompt for the CURRENT run, or `None` when no
-    /// handler replaced it — Pi `private _systemPromptOverride?: string` (agent-session.ts:373
-    /// @v0.83.0). Assigned at `:1247`, cleared at `:1251`, and cleared again in `_runAgentPrompt`'s
-    /// `finally` (`:1069`) so it never outlives its run. Every site that writes
-    /// `agent.state.systemPrompt` resolves `this._systemPromptOverride ?? this._baseSystemPrompt`
-    /// (`:534`, `:940`) — [`Self::effective_system_prompt`].
+    /// The prompt options of the CURRENT run, as the `before_agent_start` handlers left them — pi
+    /// `private _runSystemPromptOptions?: NormalizedBuildSystemPromptOptions`
+    /// (`core/agent-session.ts:483` @v1.1.0; EXT-084). Set from the handlers' result at `:2106`,
+    /// refreshed at every turn boundary (`:908-917`), and cleared in `_runAgentPrompt`'s `finally`
+    /// (`:1846`) so it never outlives its run. `None` between runs, when the base options apply.
     ///
-    /// Holding it apart from [`Self::base_system_prompt`] is the whole point: it is what lets the
-    /// turn-boundary refresh keep the structured prompt in the transcript WITHOUT undoing a handler's
-    /// mid-run sanitization, which is why cyrup's single-slot version could not do it at all
-    /// (DRIFT-033). It is the pi `forceSystemPrompt` (`core/system-prompt.ts` @v1.0.0): kept OUT of
-    /// the transcript and projected onto the request instead ([`crate::hooks::PolicyHooks`]).
-    system_prompt_override: Mutex<Option<String>>,
+    /// Its `forceSystemPrompt` is the run's forced prompt: kept OUT of the transcript, which keeps
+    /// the structured sections of these options, and projected onto the request instead
+    /// ([`crate::hooks::PolicyHooks`], pi `_installAgentForcedPromptProjection`). Holding the run's
+    /// options apart from [`Self::base_system_prompt`] is what lets the turn-boundary refresh keep
+    /// the structured prompt current without undoing a handler's edits (DRIFT-033).
+    run_prompt_options: Mutex<Option<cyrup_session::prompt::SystemPromptOptions>>,
     branch_summary_settings: BranchSummarySettings,
     /// Long-lived token handed to the extension subscriber (distinct from per-run cancellation).
     session_cancel: CancelToken,
@@ -310,7 +314,21 @@ pub struct AgentSession {
     /// An `AtomicBool` rather than a `Mutex<bool>`: it is WRITTEN from a signal handler / RPC cancel
     /// and READ from the driver task, so it must be lock-free on the writer side. `SeqCst`
     /// throughout — the latch orders against the cancel-token stores in the same `abort()`.
-    agent_run_abort_requested: AtomicBool,
+    agent_run_abort_requested: Arc<AtomicBool>,
+    // ---- run boundaries (EXT-078; pi `core/agent-session.ts:425-433` @v1.1.0) ----
+    /// pi `_turnIndex`: reset at `agent_start`, advanced after each `turn_end`.
+    turn_index: std::sync::atomic::AtomicU32,
+    /// Set when `finishTurn` dispatched the turn's `turn_end` boundary, so its `turn_end` event
+    /// does not dispatch it again (pi `_boundaryDispatchedMessages`).
+    turn_end_dispatched: AtomicBool,
+    /// pi `_lastActivityOutcome` (`AgentActivityOutcome`), read by `agent_before_settle`.
+    last_activity_outcome: Mutex<&'static str>,
+    /// pi `_isBeforeSettle` / `_abortDuringBeforeSettle`.
+    is_before_settle: AtomicBool,
+    abort_during_before_settle: AtomicBool,
+    /// A boundary commit changed the context while a run was in flight; the next turn boundary
+    /// hands the running loop the refreshed transcript.
+    boundary_context_dirty: AtomicBool,
     // ---- immediate-bash seam (Pi agent-session.ts:2582-2684) ----
     proc: Arc<dyn ProcOps>,
     shell_path: Option<String>,
@@ -439,7 +457,9 @@ impl AgentSession {
         extras: SessionExtras,
     ) -> Self {
         let compaction_model = services.model.clone();
-        let base_prompt = crate::tools::BuiltPrompt::new(services.system_prompt_sections.clone());
+        // The base prompt WITH the options it was built from (EXT-084): the same rebuild every
+        // tool-set change performs, over the active set the builder chose.
+        let base_prompt = Self::lock(&extras.dynamic_tools).prompt();
         // Seed the queue-mode mirrors from the resolved settings (the builder wired the same modes
         // into the agent), so the getters report the live mode without an agent-side getter.
         let eff = services.settings.effective();
@@ -473,7 +493,7 @@ impl AgentSession {
             model: Mutex::new(model),
             compaction_model: Mutex::new(compaction_model),
             base_prompt: Mutex::new(base_prompt),
-            system_prompt_override: Mutex::new(None),
+            run_prompt_options: Mutex::new(None),
             branch_summary_settings: extras.branch_summary_settings,
             session_cancel,
             session_id,
@@ -503,7 +523,13 @@ impl AgentSession {
             auto_compaction_cancel: Mutex::new(None),
             overflow_recovery_attempted: Mutex::new(false),
             failed_response: Mutex::new(None),
-            agent_run_abort_requested: AtomicBool::new(false),
+            agent_run_abort_requested: extras.run_abort_requested,
+            turn_index: std::sync::atomic::AtomicU32::new(0),
+            turn_end_dispatched: AtomicBool::new(false),
+            last_activity_outcome: Mutex::new("completed"),
+            is_before_settle: AtomicBool::new(false),
+            abort_during_before_settle: AtomicBool::new(false),
+            boundary_context_dirty: AtomicBool::new(false),
             proc: extras.proc,
             shell_path: extras.shell_path,
             shell_command_prefix: extras.shell_command_prefix,
@@ -586,6 +612,32 @@ impl AgentSession {
             runtime.spawn(drive_injections(weak, rx));
             arc.services.host_services.set_inject_sink(tx);
         }
+        // EXT-084: a `before_agent_start` handler's edited options render with this session's
+        // documentation pointers, and `ctx.getSystemPrompt()` follows them through the chain (pi
+        // rebinds it to `renderCurrentSystemPrompt` for the chain, `core/extensions/runner.ts:
+        // 1431-1434` @v1.1.0). Weak, so the extension host never keeps the session alive.
+        {
+            let weak = Arc::downgrade(&arc);
+            arc.services
+                .ext_host
+                .dispatcher()
+                .set_system_prompt_renderer(Arc::new(move |options| match weak.upgrade() {
+                    Some(session) => {
+                        let text = session.render_prompt_options(options)?;
+                        session.services.host_services.update_prompt_state(
+                            Some(text.clone()),
+                            session.services.settings.project_trusted(),
+                        );
+                        Ok(text)
+                    }
+                    None => cyrup_ext::render_system_prompt_options(options),
+                }));
+        }
+        // EXT-078: this session dispatches `turn_end` itself, as pi's boundary.
+        arc.services
+            .ext_host
+            .dispatcher()
+            .set_session_owns_boundaries();
         // EXT-005: give the capability backend a LIVE readback of run activity + a real interrupt,
         // so a guest's `ctx.isIdle()`/`ctx.hasPendingMessages()` answer from this session and its
         // `ctx.abort()` stops the run that is in flight (Pi binds all three straight to the session,

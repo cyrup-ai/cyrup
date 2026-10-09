@@ -64,6 +64,12 @@ impl EventSubscriber for ExtSubscriber {
         let Some(kind) = EventKind::from_agent(event) else {
             return;
         };
+        // EXT-078: a session that dispatches `turn_end` as pi's boundary (`emitBoundary`, with the
+        // persisted entry ids and the context preview) owns the event; pi's `emit()` no longer
+        // accepts `turn_end` at all (CHANGELOG 0.87.0 *Breaking*).
+        if kind == EventKind::TurnEnd && self.dispatcher.session_owns_boundaries() {
+            return;
+        }
         if self.dispatcher.no_subscribers(kind) {
             return;
         }
@@ -79,11 +85,17 @@ impl EventSubscriber for ExtSubscriber {
             HostEvent::TurnEnd {
                 message,
                 tool_results,
+                message_entry_id,
+                tool_result_entry_ids,
+                boundary,
                 ..
             } => HostEvent::TurnEnd {
                 turn_index,
                 message,
                 tool_results,
+                message_entry_id,
+                tool_result_entry_ids,
+                boundary,
             },
             other => other,
         };

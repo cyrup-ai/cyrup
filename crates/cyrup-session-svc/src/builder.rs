@@ -2110,6 +2110,7 @@ impl SessionBuilder {
             .and_then(|p| read_discovered_prompt(&p, "append system prompt"));
 
         let prompt_inputs = PromptInputs {
+            sections: Vec::new(),
             custom_prompt: cfg
                 .system_prompt
                 .clone()
@@ -2571,6 +2572,9 @@ impl SessionBuilder {
         );
         provider_swap.attach_cache_warming(cache_warmer, session_id.clone());
 
+        // pi's `_agentRunAbortRequested`: ONE latch, read by the post-run driver of a bound session
+        // and by the subscriber that settles an unbound one, so both report the same `aborted`.
+        let run_abort_requested = Arc::new(std::sync::atomic::AtomicBool::new(false));
         // Attach the extension notify seam, then the facade's persist+fan-out subscriber.
         agent.subscribe(ext_subscriber);
         agent.subscribe(Arc::new(SvcSubscriber::new(
@@ -2580,6 +2584,7 @@ impl SessionBuilder {
             ext_host.clone(),
             session_cancel.clone(),
             nested_calls.clone(),
+            Arc::clone(&run_abort_requested),
         )));
         let agent = Arc::new(agent);
         // The `(model, messages)` pair pi's `cacheContextIsCurrent` reads (`sdk.ts:350-357`). Weak,
@@ -2619,6 +2624,7 @@ impl SessionBuilder {
             bash_session_env,
             read_model_vision,
             nested_calls,
+            run_abort_requested,
             hooks: nested_hooks,
             codemode_host,
         };

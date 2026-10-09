@@ -41,6 +41,7 @@ pub(crate) async fn decode_stream<S>(
         tools.iter().map(|t| t.name.clone()).collect(),
         provider_thinking_level,
     );
+    dec.started_at = sink.started_at();
     if !sink
         .send(StreamEvent::Start {
             partial: dec.snapshot(model, api),

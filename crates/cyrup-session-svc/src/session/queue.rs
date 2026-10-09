@@ -111,11 +111,16 @@ impl AgentSession {
         self.abort_retry();
         self.abort_compaction();
         self.abort_branch_summary();
-        // CYRUP-DELTA: Pi's `if (this._isBeforeSettle) this._abortDuringBeforeSettle = true;`
-        // (`agent-session.ts:2082` @v0.87.1) is NOT ported, because cyrup has no
-        // `agent_before_settle` boundary at all — `_runBeforeSettleBoundary`
-        // (`agent-session.ts:1531`) has no counterpart in `run.rs`, so there is no window the flag
-        // could describe. It arrives with that boundary (EXT-078), not here.
+        // EXT-078: an abort while the `agent_before_settle` chain runs stops the continuation it
+        // could ask for (`if (this._isBeforeSettle) this._abortDuringBeforeSettle = true;`,
+        // `agent-session.ts:2441` @v1.1.0).
+        if self
+            .is_before_settle
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            self.abort_during_before_settle
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
         self.agent.abort();
     }
 

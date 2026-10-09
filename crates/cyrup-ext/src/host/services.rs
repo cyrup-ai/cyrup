@@ -1200,6 +1200,22 @@ pub trait HostServices: Send + Sync {
         None
     }
 
+    /// pi `buildSystemPrompt(normalizeBuildSystemPromptOptions(options))` (EXT-084) — what a
+    /// guest's `render-system-prompt` import answers. Rendering needs no session state beyond the
+    /// documentation pointers, which every session builds its prompt with at their defaults, so
+    /// the default is the answer on every backend.
+    fn render_system_prompt(&self, options: &Value) -> Result<String, String> {
+        crate::dispatch::render_system_prompt_options(options)
+    }
+
+    /// pi `_buildBoundaryContext(entries, boundary)` (`core/agent-session.ts:999-1022` @v1.1.0;
+    /// EXT-078) — what a guest's `preview-boundary` import answers: the `BoundaryContextPreview`
+    /// JSON for `entries` (a `SessionBoundaryDraft[]`) at the `boundary` (`"turn_end"` or
+    /// `"agent_before_settle"`). Only a session can build one; the default host has none.
+    fn preview_boundary(&self, _boundary: &str, _entries: &Value) -> Result<Value, String> {
+        Err("no session to preview a boundary on".into())
+    }
+
     /// Persist a custom (non-LLM) entry (R-08-026); returns the new entry id.
     fn append_entry(&self, _custom_type: &str, _data: &Value) -> Result<String, String> {
         Err("append_entry not available".into())

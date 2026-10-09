@@ -10,6 +10,7 @@ fn tool_results_collapse_into_one_user_message() {
         system_prompt: None,
         messages: vec![
             Message::ToolResult {
+                duration_ms: None,
                 tool_call_id: ToolCallId::from("toolu_1"),
                 tool_name: "read".to_string(),
                 content: vec![Content::text("result A")],
@@ -21,6 +22,7 @@ fn tool_results_collapse_into_one_user_message() {
                 nested_calls: None,
             },
             Message::ToolResult {
+                duration_ms: None,
                 tool_call_id: ToolCallId::from("toolu_2"),
                 tool_name: "read".to_string(),
                 content: vec![Content::text("result B")],
@@ -94,6 +96,7 @@ fn redacted_thinking_replays_as_redacted_block() {
         raw_stop_reason: None,
         end_turn: None,
         timestamp: 0,
+        duration_ms: None,
     };
     let value = build_assistant(&am, false, false).expect("assistant");
     assert_eq!(value["content"][0]["type"], "redacted_thinking");
@@ -123,6 +126,7 @@ fn empty_signature_thinking_becomes_text_unless_allowed() {
         raw_stop_reason: None,
         end_turn: None,
         timestamp: 0,
+        duration_ms: None,
     };
     // default: convert to text.
     let v = build_assistant(&am, false, false).expect("assistant");

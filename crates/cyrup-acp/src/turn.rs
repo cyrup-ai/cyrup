@@ -2329,7 +2329,8 @@ mod tests {
             "an AgentEnd is not a settle (ACP-121), so no usage is reported yet"
         );
 
-        h.feed(AgentSessionEvent::AgentSettled).await;
+        h.feed(AgentSessionEvent::AgentSettled { aborted: false })
+            .await;
         h.settle_scheduler().await;
         assert_eq!(h.answers.taken(), vec![Ok(StopReason::EndTurn)]);
 
@@ -2367,7 +2368,8 @@ mod tests {
         let h = Harness::new();
         h.prompt();
         h.settle_scheduler().await;
-        h.feed(AgentSessionEvent::AgentSettled).await;
+        h.feed(AgentSessionEvent::AgentSettled { aborted: false })
+            .await;
         h.settle_scheduler().await;
         assert!(
             h.sink
@@ -2424,14 +2426,16 @@ mod tests {
             "the retry chunk did reach the client while the turn stayed open"
         );
 
-        h.feed(AgentSessionEvent::AgentSettled).await;
+        h.feed(AgentSessionEvent::AgentSettled { aborted: false })
+            .await;
         h.settle_scheduler().await;
         assert_eq!(h.answers.taken(), vec![Ok(StopReason::EndTurn)]);
 
         // A second settle — a late one from a replaced session — must not respond again. Injected
         // rather than fed, because in production the run-scoped stream is already gone by now:
         // `Fanout::end_run` clears it immediately after `emit_agent_settled`.
-        h.handle.inject(AgentSessionEvent::AgentSettled);
+        h.handle
+            .inject(AgentSessionEvent::AgentSettled { aborted: false });
         h.settle_scheduler().await;
         assert_eq!(h.answers.taken().len(), 1, "exactly one PromptResponse");
         h.shutdown().await;
@@ -2459,7 +2463,8 @@ mod tests {
             "ACP-121 still holds: AgentEnd does not settle"
         );
 
-        h.feed(AgentSessionEvent::AgentSettled).await;
+        h.feed(AgentSessionEvent::AgentSettled { aborted: false })
+            .await;
         h.settle_scheduler().await;
         assert_eq!(
             h.answers.taken(),
@@ -2483,7 +2488,8 @@ mod tests {
         h.prompt();
         h.settle_scheduler().await;
         h.feed(failed_run("http 401: invalid x-api-key")).await;
-        h.feed(AgentSessionEvent::AgentSettled).await;
+        h.feed(AgentSessionEvent::AgentSettled { aborted: false })
+            .await;
         h.settle_scheduler().await;
 
         assert_eq!(
@@ -2534,7 +2540,8 @@ mod tests {
         })
         .await;
         h.feed(settled_run()).await;
-        h.feed(AgentSessionEvent::AgentSettled).await;
+        h.feed(AgentSessionEvent::AgentSettled { aborted: false })
+            .await;
         h.settle_scheduler().await;
 
         assert_eq!(h.answers.taken(), vec![Ok(StopReason::EndTurn)]);
@@ -2576,7 +2583,8 @@ mod tests {
             final_error: Some("http 500: still down".into()),
         })
         .await;
-        h.feed(AgentSessionEvent::AgentSettled).await;
+        h.feed(AgentSessionEvent::AgentSettled { aborted: false })
+            .await;
         h.settle_scheduler().await;
 
         assert_eq!(
@@ -2612,7 +2620,8 @@ mod tests {
         h.handle.cancel();
         h.settle_scheduler().await;
         h.feed(failed_run("http 401: invalid x-api-key")).await;
-        h.feed(AgentSessionEvent::AgentSettled).await;
+        h.feed(AgentSessionEvent::AgentSettled { aborted: false })
+            .await;
         h.settle_scheduler().await;
 
         assert_eq!(h.answers.taken(), vec![Ok(StopReason::Cancelled)]);
@@ -2631,7 +2640,8 @@ mod tests {
         h.settle_scheduler().await;
         h.feed(run_ending_in(cyrup_core::StopReason::Length, None))
             .await;
-        h.feed(AgentSessionEvent::AgentSettled).await;
+        h.feed(AgentSessionEvent::AgentSettled { aborted: false })
+            .await;
         h.settle_scheduler().await;
         assert_eq!(h.answers.taken(), vec![Ok(StopReason::MaxTokens)]);
         h.shutdown().await;
@@ -2648,7 +2658,8 @@ mod tests {
         h.prompt();
         h.settle_scheduler().await;
         h.feed(failed_run("http 500: once")).await;
-        h.feed(AgentSessionEvent::AgentSettled).await;
+        h.feed(AgentSessionEvent::AgentSettled { aborted: false })
+            .await;
         h.settle_scheduler().await;
         assert_eq!(
             h.answers.taken(),
@@ -2660,7 +2671,8 @@ mod tests {
         h.prompt();
         h.settle_scheduler().await;
         h.handle.inject(settled_run());
-        h.handle.inject(AgentSessionEvent::AgentSettled);
+        h.handle
+            .inject(AgentSessionEvent::AgentSettled { aborted: false });
         h.settle_scheduler().await;
         assert_eq!(
             h.answers.taken(),
@@ -2683,7 +2695,8 @@ mod tests {
         h.settle_scheduler().await;
         let before_settle = h.sink.count();
 
-        h.feed(AgentSessionEvent::AgentSettled).await;
+        h.feed(AgentSessionEvent::AgentSettled { aborted: false })
+            .await;
         h.settle_scheduler().await;
 
         assert_eq!(h.answers.taken(), vec![Ok(StopReason::EndTurn)]);
@@ -2715,7 +2728,8 @@ mod tests {
         h.settle_scheduler().await;
         assert!(h.answers.taken().is_empty());
 
-        h.feed(AgentSessionEvent::AgentSettled).await;
+        h.feed(AgentSessionEvent::AgentSettled { aborted: false })
+            .await;
         h.settle_scheduler().await;
         assert_eq!(h.answers.taken(), vec![Ok(StopReason::Cancelled)]);
         h.shutdown().await;
@@ -2787,13 +2801,15 @@ mod tests {
         let h = Harness::new();
         h.prompt();
         h.settle_scheduler().await;
-        h.feed(AgentSessionEvent::AgentSettled).await;
+        h.feed(AgentSessionEvent::AgentSettled { aborted: false })
+            .await;
         h.settle_scheduler().await;
         assert_eq!(h.answers.taken().len(), 1);
 
         // Injected directly, i.e. as if a session-wide subscription had delivered it: with no turn
         // running there is nothing to settle and nothing is answered.
-        h.handle.inject(AgentSessionEvent::AgentSettled);
+        h.handle
+            .inject(AgentSessionEvent::AgentSettled { aborted: false });
         h.settle_scheduler().await;
         assert_eq!(
             h.answers.taken().len(),
@@ -2874,7 +2890,8 @@ mod tests {
         );
         assert!(h.answers.taken().is_empty(), "neither has settled yet");
 
-        h.feed(AgentSessionEvent::AgentSettled).await;
+        h.feed(AgentSessionEvent::AgentSettled { aborted: false })
+            .await;
         h.settle_scheduler().await;
         assert_eq!(
             h.answers.taken(),
@@ -3034,7 +3051,8 @@ mod tests {
             "the latched cancel reached the turn as soon as it existed"
         );
 
-        h.feed(AgentSessionEvent::AgentSettled).await;
+        h.feed(AgentSessionEvent::AgentSettled { aborted: false })
+            .await;
         h.settle_scheduler().await;
         assert_eq!(h.answers.taken(), vec![Ok(StopReason::Cancelled)]);
         h.shutdown().await;
@@ -3234,6 +3252,7 @@ mod tests {
         let out = translate(
             &mut ledger,
             &cyrup_session_svc::AgentSessionEvent::ToolExecutionEnd {
+                duration_ms: None,
                 tool_call_id: "w1".into(),
                 tool_name: "write".into(),
                 result: serde_json::json!({ "content": [{ "type": "text", "text": "ok" }] }),

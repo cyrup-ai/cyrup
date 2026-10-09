@@ -59,7 +59,50 @@ impl SessionManager {
         usage: Option<Usage>,
         from_hook: bool,
     ) -> Result<EntryId, SessionError> {
+        self.push_compaction(
+            summary,
+            Some(first_kept),
+            tokens_before,
+            details,
+            usage,
+            from_hook,
+        )
+    }
+
+    /// [`Self::append_compaction`] with pi's nullable `firstKeptEntryId` (EXT-078): `None` writes
+    /// a SELF-RETAINING compaction that keeps no preceding entries — pi stores the entry's own id
+    /// (`firstKeptEntryId: firstKeptEntryId ?? id`, `session-manager.ts:1271-1278` @v1.1.0), which
+    /// no earlier entry carries, so the projection keeps nothing before it.
+    pub fn append_compaction_keeping(
+        &mut self,
+        summary: String,
+        first_kept: Option<EntryId>,
+        tokens_before: u64,
+        details: Option<Value>,
+        usage: Option<Usage>,
+        from_hook: bool,
+    ) -> Result<EntryId, SessionError> {
+        self.push_compaction(
+            summary,
+            first_kept,
+            tokens_before,
+            details,
+            usage,
+            from_hook,
+        )
+    }
+
+    fn push_compaction(
+        &mut self,
+        summary: String,
+        first_kept: Option<EntryId>,
+        tokens_before: u64,
+        details: Option<Value>,
+        usage: Option<Usage>,
+        from_hook: bool,
+    ) -> Result<EntryId, SessionError> {
         let base = self.make_base();
+        let first_kept = first_kept.unwrap_or_else(|| base.id.clone());
         // Pi `getCurrentSystemMessage(this.buildSessionProjection().messages)`, stamped with the
         // entry's own time (`session-manager.ts:1096-1116` @v1.0.1): the prompt and tool state the
         // model holds at this boundary, taken BEFORE the compaction entry is on the path.

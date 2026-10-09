@@ -45,6 +45,7 @@ fn record(
 /// file whose arguments were too large to record.
 fn codemode_result() -> Message {
     Message::ToolResult {
+        duration_ms: None,
         tool_call_id: ToolCallId::from("codemode-1"),
         tool_name: "codemode".to_string(),
         content: vec![],
@@ -101,6 +102,7 @@ fn nested_calls_are_read_off_the_raw_agent_message_too() {
 fn a_tool_result_without_nested_calls_contributes_nothing() {
     let mut ops = FileOps::default();
     ops.absorb_message(&Message::ToolResult {
+        duration_ms: None,
         tool_call_id: ToolCallId::from("t"),
         tool_name: "read".to_string(),
         content: vec![Content::text("ok")],
@@ -120,6 +122,7 @@ fn a_tool_result_without_nested_calls_contributes_nothing() {
 fn nested_calls_follow_the_same_tool_and_argument_rules_as_model_calls() {
     let mut ops = FileOps::default();
     ops.absorb_message(&Message::ToolResult {
+        duration_ms: None,
         tool_call_id: ToolCallId::from("t"),
         tool_name: "codemode".to_string(),
         content: vec![],
@@ -159,6 +162,7 @@ fn assistant(text: &str) -> Message {
         raw_stop_reason: None,
         end_turn: None,
         timestamp: 0,
+        duration_ms: None,
     })
 }
 

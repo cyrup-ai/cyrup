@@ -197,10 +197,29 @@ impl Wire {
 
 /// Drive one wire API's decoder over `raw` and return **every** event it emitted, in order.
 async fn events(wire: Wire, raw: &str) -> Vec<StreamEvent> {
+    events_paced(wire, raw, None).await.1
+}
+
+/// [`events`], with each SSE frame held back by `pace` when one is given, and the wall-clock start
+/// of the response the sink recorded.
+async fn events_paced(
+    wire: Wire,
+    raw: &str,
+    pace: Option<std::time::Duration>,
+) -> (i64, Vec<StreamEvent>) {
+    use futures::StreamExt as _;
     let (sink, mut rx) = channel(256);
+    let started_at = sink.started_at();
     let model = model_for(wire.api_id(), wire.provider());
     let api = ApiId::from(wire.api_id());
-    let frames = decode_sse_bytes(raw.as_bytes().to_vec());
+    let frames = Box::pin(decode_sse_bytes(raw.as_bytes().to_vec()).then(
+        move |frame| async move {
+            if let Some(pace) = pace {
+                tokio::time::sleep(pace).await;
+            }
+            frame
+        },
+    ));
 
     let task = tokio::spawn(async move {
         match wire {
@@ -238,7 +257,7 @@ async fn events(wire: Wire, raw: &str) -> Vec<StreamEvent> {
         out.push(ev);
     }
     task.await.unwrap();
-    out
+    (started_at, out)
 }
 
 /// Drive one wire API's decoder over `raw` and return the terminal event.
@@ -586,5 +605,44 @@ fn end_of_stream_maps_no_delivered_reason_to_the_error_terminal() {
             "a delivered reason must not be overwritten by the truncation diagnostic"
         );
         assert_eq!(matches!(ev, StreamEvent::Done { .. }), want_done);
+    }
+}
+
+/// pi v1.1.0 documents `AssistantMessage.timestamp` as *"Unix timestamp in milliseconds when the
+/// request started"* (`packages/ai/src/types.ts`, commit 36a686ee8), and every api implementation
+/// seeds `output.timestamp = Date.now()` once, before the request, then never moves it. So every
+/// partial AND the terminal carry the response's start — the sink's — and the terminal carries
+/// `durationMs` from that same start. Frames are paced so a decoder that stamps each snapshot with
+/// the CURRENT time cannot pass by landing in the same millisecond.
+#[tokio::test]
+async fn every_message_of_a_response_carries_its_start_and_the_terminal_its_duration() {
+    let pace = std::time::Duration::from_millis(5);
+    for wire in Wire::ALL {
+        let (started_at, evs) = events_paced(wire, wire.complete(), Some(pace)).await;
+        assert!(evs.len() > 2, "{wire:?}: {evs:?}");
+        for ev in &evs {
+            let m = ev
+                .partial()
+                .or_else(|| ev.terminal_message())
+                .unwrap_or_else(|| panic!("{wire:?}: an event with no message: {ev:?}"));
+            assert_eq!(
+                m.timestamp, started_at,
+                "{wire:?}: `timestamp` is the request's start, not the snapshot's time: {ev:?}"
+            );
+        }
+        let last = evs.last().and_then(StreamEvent::terminal_message).unwrap();
+        let took = last
+            .duration_ms
+            .unwrap_or_else(|| panic!("{wire:?}: the terminal is untimed"));
+        assert!(
+            took >= 5,
+            "{wire:?}: {took} ms for a response paced at 5 ms a frame"
+        );
+        for ev in &evs[..evs.len() - 1] {
+            assert!(
+                ev.partial().is_some_and(|p| p.duration_ms.is_none()),
+                "{wire:?}: only the final message is timed: {ev:?}"
+            );
+        }
     }
 }

@@ -86,7 +86,7 @@ impl NativeExtension for SettleSender {
     }
 
     async fn on_event(&self, ev: &HostEvent, _ctx: &HostCtx) -> HookOutcome {
-        if !matches!(ev, HostEvent::AgentSettled) {
+        if !matches!(ev, HostEvent::AgentSettled { .. }) {
             return HookOutcome::Noop;
         }
         if self.in_handler.swap(true, Ordering::SeqCst) {
@@ -394,7 +394,7 @@ impl NativeExtension for MidRunSender {
 
     async fn on_event(&self, ev: &HostEvent, _ctx: &HostCtx) -> HookOutcome {
         match ev {
-            HostEvent::AgentSettled => {
+            HostEvent::AgentSettled { .. } => {
                 self.settles.fetch_add(1, Ordering::SeqCst);
             }
             HostEvent::AgentEnd { .. } if !self.sent.swap(true, Ordering::SeqCst) => {

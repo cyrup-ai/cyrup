@@ -56,6 +56,7 @@ fn assistant_reply(text: &str, workflow_arguments: &[serde_json::Value]) -> Mess
         raw_stop_reason: None,
         end_turn: None,
         timestamp: 0,
+        duration_ms: None,
     })
 }
 

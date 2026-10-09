@@ -35,6 +35,7 @@ use crate::auth::AuthResult;
 use crate::context::Context;
 use crate::model::Model;
 use crate::stream::{StreamEvent, StreamOptions};
+use crate::timing::ResponseTimer;
 use cyrup_core::{ApiId, CancelToken};
 use dashmap::DashMap;
 use std::collections::HashMap;
@@ -68,16 +69,28 @@ mod truncation_parity;
 
 /// Producer side of the provider stream channel. `ApiImpl::run` pushes the EXISTING
 /// `cyrup_provider::StreamEvent` here; the receiver is wrapped as the returned `EventStream`.
+///
+/// It is also the response's clock (pi `AssistantMessageEventStream`, `utils/event-stream.ts`
+/// @v1.1.0): [`channel`] starts a [`ResponseTimer`], shared by every clone, and [`Self::send`] sets
+/// `durationMs` on the first terminal pushed through it. See [`crate::timing`].
 #[derive(Clone)]
 pub struct EventSink {
     tx: tokio::sync::mpsc::Sender<StreamEvent>,
+    timer: Arc<ResponseTimer>,
 }
 
 impl EventSink {
     /// Push one event. Returns `false` if the consumer has dropped the stream (the producer should
     /// stop). Never panics.
-    pub async fn send(&self, event: StreamEvent) -> bool {
+    pub async fn send(&self, mut event: StreamEvent) -> bool {
+        self.timer.time_created_terminal(&mut event);
         self.tx.send(event).await.is_ok()
+    }
+
+    /// Wall-clock start of this response (pi `AssistantMessageEventStream.startedAt`): the
+    /// `timestamp` a decoder gives every message of the response.
+    pub fn started_at(&self) -> i64 {
+        self.timer.started_at()
     }
 
     /// `true` once the consumer has dropped the receiver.
@@ -89,7 +102,8 @@ impl EventSink {
 /// Create a bounded producer/consumer channel (bounded for back-pressure, arch-01 §10).
 pub fn channel(buffer: usize) -> (EventSink, tokio::sync::mpsc::Receiver<StreamEvent>) {
     let (tx, rx) = tokio::sync::mpsc::channel(buffer.max(1));
-    (EventSink { tx }, rx)
+    let timer = Arc::new(ResponseTimer::start());
+    (EventSink { tx, timer }, rx)
 }
 
 /// One wire protocol (arch-01 §3.4). Builds the payload, opens the SSE transport, assembles events,

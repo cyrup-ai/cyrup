@@ -14,6 +14,8 @@
 
 mod aggregation;
 mod bash_operations_seam;
+mod before_agent_start_options;
+mod boundary_dispatch;
 mod branch_change;
 mod cache_warming_decision;
 mod capability_handle_ownership;

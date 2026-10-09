@@ -34,7 +34,9 @@ pub use diagnostics::{
     create_assistant_message_diagnostic_from, extract_diagnostic_error, format_thrown_value,
 };
 pub use error::CoreError;
-pub use event_stream::{Finalizing, FinalizingSink, FinalizingStream, finalizing_channel};
+pub use event_stream::{
+    Finalizing, FinalizingSink, FinalizingStream, finalizing_channel, finalizing_channel_stamped,
+};
 pub use exposure::{
     AdvertisedTools, LoadoutHookFailure, LoadoutView, ToolExposure, ToolLoadout,
     ToolLoadoutChanges, ToolNamespace, UnknownExposure, callable_tools,

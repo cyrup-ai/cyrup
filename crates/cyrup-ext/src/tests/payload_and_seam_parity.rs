@@ -277,6 +277,7 @@ fn tool_execution_update_and_end_carry_the_tool_name_and_the_update_carries_args
     }
 
     let end = HostEvent::from_agent(&AgentEvent::ToolExecutionEnd {
+        duration_ms: Some(31),
         tool_call_id: "tc1".into(),
         tool_name: "bash".into(),
         result: json!({ "ok": true }),
@@ -288,8 +289,11 @@ fn tool_execution_update_and_end_carry_the_tool_name_and_the_update_carries_args
             call_id,
             name,
             is_error,
+            duration_ms,
             ..
         } => {
+            // pi v1.1.0 `ToolExecutionEndEvent.durationMs?`: the loop's measurement, carried.
+            assert_eq!(duration_ms, Some(31));
             assert_eq!(call_id.as_str(), "tc1");
             assert_eq!(
                 name, "bash",
@@ -313,9 +317,10 @@ fn tool_execution_update_and_end_carry_the_tool_name_and_the_update_carries_args
 fn before_provider_headers_patches_in_place_and_a_null_value_deletes_the_header() {
     assert_eq!(
         EventKind::COUNT,
-        37,
+        39,
         "31 + before_provider_headers + session_info_changed + ui_prompt_start + ui_prompt_end \
-         + context_with_system + cache_warming_decision (EXT-085)"
+         + context_with_system + cache_warming_decision (EXT-085) + session_compact_failed \
+         (SESS-050) + agent_before_settle (EXT-078)"
     );
     assert_eq!(
         EventKind::from_u8(31),

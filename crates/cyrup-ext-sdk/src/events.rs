@@ -141,7 +141,14 @@ pub struct BeforeAgentStartEvent {
     /// The system prompt the run is about to use; replace it through
     /// [`BeforeAgentStartResult::system_prompt`].
     pub system_prompt: String,
-    /// The run's options bag, as raw JSON.
+    /// The options the prompt is built from (pi `systemPromptOptions:
+    /// NormalizedBuildSystemPromptOptions`, `core/system-prompt.ts:9-49` @v1.1.0; EXT-084):
+    /// `{customPrompt?, forceSystemPrompt?, selectedTools, hiddenTools, toolSnippets,
+    /// toolGuidelines, promptGuidelines, appendSystemPrompt, sections, cwd, contextFiles, skills}`.
+    /// Edit a copy and return it through [`BeforeAgentStartResult::system_prompt_options`]; the
+    /// next handler, and the run, see the edit. `sections` adds XML-wrapped prompt sections keyed
+    /// by a name matching `^[a-z][a-z0-9_-]*$` (never `preamble`); a name the prompt already has
+    /// replaces that section in place.
     pub options: Value,
 }
 
@@ -236,8 +243,30 @@ pub struct TurnStartEvent {
     pub timestamp: u64,
 }
 
-/// `turn_end` (Pi `TurnEndEvent`, types.ts:703-709). Byte-shape: `{turnIndex, message, toolResults}`
-/// — the finalized assistant `message` AND the `toolResults` produced this turn.
+/// pi `BoundaryState` (`core/extensions/types.ts:987-992` @v1.1.0; EXT-078): what a `turn_end` /
+/// `agent_before_settle` handler is handed beside the event's own fields, and what the handlers of
+/// every extension fold.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct BoundaryState {
+    /// The `SessionBoundaryDraft[]` the handlers so far left: `{type: "custom", customType,
+    /// data?}`, `{type: "custom_message", customType, content, display, details?}`, `{type:
+    /// "context_edit", targetId, replacement: {content} | null}` or `{type: "compaction", summary,
+    /// firstKeptEntryId: string | null, details?, usage?}`.
+    pub entries: Value,
+    /// Whether one more provider request is wanted.
+    #[serde(rename = "continue")]
+    pub continue_: bool,
+    /// pi `BoundaryContextPreview`: `{contextEntries, contextMessages, llmMessages,
+    /// pendingMessages, canContinue}` — the model context as it would be with `entries` appended.
+    pub context: Value,
+    /// pi `AgentActivityOutcome`: `"completed" | "aborted" | "error"`.
+    pub outcome: String,
+}
+
+/// `turn_end` (pi `TurnEndEvent extends BoundaryState`, `core/extensions/types.ts:1036-1044`
+/// @v1.1.0). Byte-shape: `{turnIndex, message, toolResults, messageEntryId, toolResultEntryIds,
+/// entries, continue, context, outcome}`. A handler may answer [`crate::Outcome::boundary`]
+/// (EXT-078).
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TurnEndEvent {
@@ -247,6 +276,37 @@ pub struct TurnEndEvent {
     pub message: Value,
     /// The tool-result messages produced this turn (Pi `TurnEndEvent.toolResults`, types.ts:708).
     pub tool_results: Value,
+    /// The id of the entry the assistant message was persisted as (pi `messageEntryId`).
+    pub message_entry_id: String,
+    /// The ids of the entries the tool results were persisted as (pi `toolResultEntryIds`).
+    pub tool_result_entry_ids: Vec<String>,
+    /// The boundary state the handlers fold.
+    #[serde(flatten)]
+    pub boundary: BoundaryState,
+}
+
+/// `agent_before_settle` (pi `AgentBeforeSettleEvent extends BoundaryState`,
+/// `core/extensions/types.ts:999-1002` @v1.1.0): *"Fired before final settlement. May append
+/// entries and ensure one next provider request."* A handler may answer
+/// [`crate::Outcome::boundary`] (EXT-078).
+#[derive(Clone, Debug, Serialize)]
+pub struct AgentBeforeSettleEvent {
+    /// The boundary state the handlers fold.
+    #[serde(flatten)]
+    pub boundary: BoundaryState,
+}
+
+/// pi `BoundaryResult` (`core/extensions/types.ts:994-997` @v1.1.0; EXT-078): `entries` REPLACES the
+/// drafts the handlers so far left, `continue` the request for one more provider request; an
+/// omitted key leaves either as it was.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct BoundaryResult {
+    /// The drafts to leave in place of the ones the handler was handed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entries: Option<Value>,
+    /// Whether one more provider request is wanted.
+    #[serde(default, rename = "continue", skip_serializing_if = "Option::is_none")]
+    pub continue_: Option<bool>,
 }
 
 /// `message_start` (Pi `MessageStartEvent`, types.ts:711-715). Byte-shape: `{message}` — the full
@@ -302,6 +362,13 @@ pub struct ToolExecUpdateEvent {
     pub parent_tool_call_id: Option<String>,
 }
 
+/// `agent_settled` (pi `AgentSettledEvent`, `core/extensions/types.ts:1005-1009` @v1.1.0).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AgentSettledEvent {
+    /// Whether the run ended because it was aborted, for example with Escape (pi's own words).
+    pub aborted: bool,
+}
+
 /// `tool_execution_end` (Pi types.ts).
 #[derive(Clone, Debug)]
 pub struct ToolExecEndEvent {
@@ -315,6 +382,10 @@ pub struct ToolExecEndEvent {
     pub result: Value,
     /// Whether that result is a failure.
     pub is_error: bool,
+    /// Milliseconds the tool's `execute()` took, measured with a monotonic clock; `None` when the
+    /// tool did not run — blocked, unknown, invalid or aborted before it started (pi
+    /// `ToolExecutionEndEvent.durationMs?`, `core/extensions/types.ts` @v1.1.0).
+    pub duration_ms: Option<u64>,
     /// The tool call that made this call, when a tool is calling a tool (`ctx.executeTool`) — pi
     /// `parentToolCallId` (`extensions/types.ts:1155-1161`, `:1231` @v1.0.1), itself `<id>/<n>`
     /// when that tool was a nested call. `None` for a call the model issued.
@@ -466,6 +537,22 @@ pub struct SessionCompactEvent {
     pub will_retry: bool,
 }
 
+/// `session_compact_failed` (pi `SessionCompactFailedEvent`, `core/extensions/types.ts:795-807`
+/// @v1.1.0): a compaction that started ended without a result. SESS-050.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionCompactFailedEvent {
+    /// What triggered the compaction: `"manual"`, `"threshold"` or `"overflow"`.
+    pub reason: String,
+    /// Error text when compaction failed for a non-abort reason.
+    pub error_message: Option<String>,
+    /// True when compaction was cancelled or aborted.
+    pub aborted: bool,
+    /// True when the aborted turn would have been retried after this compaction.
+    pub will_retry: bool,
+    /// True when the failing compaction content came from a `session_before_compact` handler.
+    pub from_extension: bool,
+}
+
 /// `session_tree` (Pi types.ts:1156).
 #[derive(Clone, Debug)]
 pub struct SessionTreeEvent {
@@ -509,9 +596,14 @@ pub struct BeforeAgentStartResult {
     /// A message to inject before the run starts; omitted injects nothing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<Value>,
-    /// A replacement for [`BeforeAgentStartEvent::system_prompt`]; omitted keeps the host's.
+    /// A replacement for [`BeforeAgentStartEvent::system_prompt`]; omitted keeps the host's. It
+    /// is sent as the run's prompt exactly (pi records it as `forceSystemPrompt`), while the
+    /// transcript keeps the structured sections.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub system_prompt: Option<String>,
+    /// The edited [`BeforeAgentStartEvent::options`] (EXT-084); omitted leaves them as they were.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_prompt_options: Option<Value>,
 }
 
 /// `resources_discover` result (Pi types.ts:528-539): skill/prompt/theme paths the extension provides.

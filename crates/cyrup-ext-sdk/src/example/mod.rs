@@ -17,11 +17,13 @@
 //! - `provider` — the `demo-oauth` provider and the global autocomplete provider.
 //! - `virtual_model` — the `router/demo-auto` virtual model and the router behind it.
 //! - `model_calls` — the commands that make model calls through the session's providers.
+//! - `event_probe` — what the guest observed of the pi v1.1.0 event batch, reported on demand.
 //! - `wiring` — the `demo-flag` CLI flag and the `demo:bus` event-bus subscription.
 
 mod commands_capability;
 mod commands_session;
 mod commands_ui;
+pub mod event_probe;
 mod hooks;
 pub mod model_calls;
 mod provider;
@@ -51,6 +53,7 @@ pub fn build() -> ExtensionApi {
     provider::install(&mut api);
     virtual_model::install(&mut api);
     model_calls::install(&mut api);
+    event_probe::install(&mut api);
     wiring::install(&mut api);
     api
 }

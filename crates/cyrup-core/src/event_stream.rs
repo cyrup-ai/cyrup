@@ -35,6 +35,16 @@ struct Shared<T, F> {
     extract: Box<dyn Fn(&T) -> F + Send + Sync>,
     fallback: Box<dyn Fn() -> F + Send + Sync>,
     final_value: Mutex<Option<F>>,
+    /// Runs on every event pushed, and on the result handed to `end`, while the stream is still
+    /// open — the seam pi's `AssistantMessageEventStream` overrides `push`/`end` through to time a
+    /// response (`utils/event-stream.ts` @v1.1.0). `None` for a plain stream.
+    stamp: Option<Stamp<T, F>>,
+}
+
+/// The two halves of [`Shared::stamp`].
+struct Stamp<T, F> {
+    event: Box<dyn Fn(&mut T) + Send + Sync>,
+    result: Box<dyn Fn(&mut F) + Send + Sync>,
 }
 
 /// The producer half (Pi `EventStream.push`/`end`, event-stream.ts:21-48). Drives a push-based
@@ -49,9 +59,12 @@ impl<T, F> FinalizingSink<T, F> {
     /// Push one event (Pi `push`, event-stream.ts:21-36). When the event satisfies `is_complete`,
     /// the final value is captured via `extract` before the event is delivered. No-op after the
     /// stream is complete or ended.
-    pub fn push(&mut self, event: T) {
+    pub fn push(&mut self, mut event: T) {
         if self.done {
             return;
+        }
+        if let Some(stamp) = &self.shared.stamp {
+            (stamp.event)(&mut event);
         }
         if (self.shared.is_complete)(&event) {
             self.done = true;
@@ -67,7 +80,12 @@ impl<T, F> FinalizingSink<T, F> {
 
     /// End the stream (Pi `end`, event-stream.ts:38-48). Closes the consumer iteration; an
     /// optional pre-computed final result overrides the extracted one.
-    pub fn end(&mut self, result: Option<F>) {
+    pub fn end(&mut self, mut result: Option<F>) {
+        if !self.done
+            && let (Some(stamp), Some(r)) = (&self.shared.stamp, result.as_mut())
+        {
+            (stamp.result)(r);
+        }
         self.done = true;
         if let Some(r) = result
             && let Ok(mut slot) = self.shared.final_value.lock()
@@ -137,12 +155,41 @@ pub fn finalizing_channel<T, F>(
     extract: impl Fn(&T) -> F + Send + Sync + 'static,
     fallback: impl Fn() -> F + Send + Sync + 'static,
 ) -> (FinalizingSink<T, F>, FinalizingStream<T, F>) {
-    let shared = Arc::new(Shared {
+    build(Shared {
         is_complete: Box::new(is_complete),
         extract: Box::new(extract),
         fallback: Box::new(fallback),
         final_value: Mutex::new(None),
-    });
+        stamp: None,
+    })
+}
+
+/// [`finalizing_channel`] whose sink first passes every event it pushes through `stamp_event`, and
+/// the result handed to [`FinalizingSink::end`] through `stamp_result` — both only while the
+/// stream is still open, so nothing is stamped after a terminal (pi's `AssistantMessageEventStream`
+/// overriding `push`/`end`, `utils/event-stream.ts` @v1.1.0). The stamped event is what `extract`
+/// sees and what the consumer receives.
+pub fn finalizing_channel_stamped<T, F>(
+    is_complete: impl Fn(&T) -> bool + Send + Sync + 'static,
+    extract: impl Fn(&T) -> F + Send + Sync + 'static,
+    fallback: impl Fn() -> F + Send + Sync + 'static,
+    stamp_event: impl Fn(&mut T) + Send + Sync + 'static,
+    stamp_result: impl Fn(&mut F) + Send + Sync + 'static,
+) -> (FinalizingSink<T, F>, FinalizingStream<T, F>) {
+    build(Shared {
+        is_complete: Box::new(is_complete),
+        extract: Box::new(extract),
+        fallback: Box::new(fallback),
+        final_value: Mutex::new(None),
+        stamp: Some(Stamp {
+            event: Box::new(stamp_event),
+            result: Box::new(stamp_result),
+        }),
+    })
+}
+
+fn build<T, F>(shared: Shared<T, F>) -> (FinalizingSink<T, F>, FinalizingStream<T, F>) {
+    let shared = Arc::new(shared);
     let (tx, rx) = mpsc::unbounded_channel();
     let sink = FinalizingSink {
         tx: Some(tx),

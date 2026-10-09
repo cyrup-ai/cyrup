@@ -87,8 +87,10 @@ fn request_body_matches_openai_shape() {
                 raw_stop_reason: None,
                 end_turn: None,
                 timestamp: 0,
+                duration_ms: None,
             }),
             Message::ToolResult {
+                duration_ms: None,
                 tool_call_id: ToolCallId::from("call_1"),
                 tool_name: "get_weather".into(),
                 content: vec![Content::text("sunny")],

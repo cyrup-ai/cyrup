@@ -365,7 +365,7 @@ impl App<InlineBackend<TuiStdout>> {
             // Computed BEFORE the ingest call so F8's by-value swap stays a one-line
             // change (the owned call moves `ev`).
             let info_changed = matches!(ev, AgentSessionEvent::SessionInfoChanged { .. });
-            let settled = matches!(ev, AgentSessionEvent::AgentSettled);
+            let settled = matches!(ev, AgentSessionEvent::AgentSettled { .. });
             // EXT-006: fold through the extension-aware path so a registered renderer
             // actually draws the block (a custom message / a tool row). No renderer for the
             // event's key ⇒ a sync pre-check short-circuits and this is the old behavior.

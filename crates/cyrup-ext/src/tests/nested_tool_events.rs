@@ -122,6 +122,7 @@ fn assistant_and_call(
         raw_stop_reason: None,
         end_turn: None,
         timestamp: 0,
+        duration_ms: None,
     };
     (msg, call)
 }
@@ -248,6 +249,7 @@ async fn tool_execution_events_of_a_nested_call_carry_the_parent_and_the_loops_d
             parent_tool_call_id: parent.clone(),
         },
         NestedToolExecutionEvent::ToolExecutionEnd {
+            duration_ms: None,
             tool_call_id: nested.clone(),
             tool_name: "read".into(),
             result: Value::Null,
@@ -262,6 +264,7 @@ async fn tool_execution_events_of_a_nested_call_carry_the_parent_and_the_loops_d
     host.subscriber()
         .on_event(
             &AgentEvent::ToolExecutionEnd {
+                duration_ms: None,
                 tool_call_id: parent.clone(),
                 tool_name: "codemode".into(),
                 result: Value::Null,

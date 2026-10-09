@@ -3,7 +3,6 @@
 
 use crate::model::Model;
 use crate::usage::compute_cost;
-use crate::utils::provider_plumbing::now_millis;
 use cyrup_core::{ApiId, AssistantMessage, Content, StopReason, Usage};
 use std::sync::Arc;
 
@@ -36,6 +35,11 @@ pub(super) enum CurrentKind {
 /// here, it buys nothing.
 #[derive(Default)]
 pub(super) struct Decoder {
+    /// Wall-clock start of this response — the `timestamp` of every message it produces (pi seeds
+    /// `output.timestamp = Date.now()` once, before the request, and the v1.1.0 type documents it
+    /// as *"when the request started"*). Set from [`crate::api::EventSink::started_at`] by the
+    /// driver; `0` only in a decoder a unit test built by hand.
+    pub(super) started_at: i64,
     pub(super) blocks: Vec<Content>,
     pub(super) current: Option<CurrentKind>,
     pub(super) usage: Usage,
@@ -104,7 +108,8 @@ impl Decoder {
             error_message: self.error_message.clone(),
             raw_stop_reason: self.raw_stop_reason.clone(),
             end_turn: None,
-            timestamp: now_millis(),
+            timestamp: self.started_at,
+            duration_ms: None,
         }
     }
 

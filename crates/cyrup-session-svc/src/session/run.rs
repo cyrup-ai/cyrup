@@ -416,7 +416,34 @@ impl AgentSession {
             // Pi's continuation loop is `while (!this._agentRunAbortRequested)`
             // (`agent-session.ts:1473` @v0.87.1), so an abort landing DURING a `continue_run` also
             // stops the loop — not only one that lands before the post-run step.
-            while !self.abort_requested() && self.handle_post_agent_run().await {
+            //
+            // EXT-078 — pi v1.1.0's loop (`agent-session.ts:1832-1842`): when no retry,
+            // compaction or queued message continues the run, the `agent_before_settle` boundary
+            // may still ask for one more provider request before it settles.
+            //
+            //   while (!this._agentRunAbortRequested) {
+            //     if (await this._handlePostAgentRun()) {
+            //       if (this._agentRunAbortRequested) break;
+            //       await this.agent.continue(); continue;
+            //     }
+            //     if (this._agentRunAbortRequested || !(await this._runBeforeSettleBoundary())) break;
+            //     if (this._agentRunAbortRequested) break;
+            //     await this.agent.continue();
+            //   }
+            while !self.abort_requested() {
+                match self.handle_post_agent_run().await {
+                    PostRun::Continue => {}
+                    // `_checkCompaction`'s throw leaves the loop for the `finally` (SESS-055).
+                    PostRun::Threw => break,
+                    PostRun::Settle => {
+                        if self.abort_requested() || !self.run_before_settle_boundary().await {
+                            break;
+                        }
+                    }
+                }
+                if self.abort_requested() {
+                    break;
+                }
                 match self.agent.continue_run().await {
                     Ok(h) => {
                         let _ = h.finished().await;
@@ -467,11 +494,13 @@ impl AgentSession {
         // clear that runs when an abort lands DURING a continuation, so without it an aborted
         // retry sequence leaks its failed response into the next prompt's first request.
         self.clear_failed_response();
-        // Pi `_runAgentPrompt`'s `finally` continues with `this._systemPromptOverride = undefined;`
-        // (agent-session.ts:1069 @v0.83.0), BEFORE the bash flush and the settle emit — a
-        // `before_agent_start` replacement is scoped to its own run and must not survive into the
-        // next one (DRIFT-033).
-        *Self::lock(&self.system_prompt_override) = None;
+        // Pi `_runAgentPrompt`'s `finally` continues with `this._runSystemPromptOptions =
+        // undefined;` (`core/agent-session.ts:1846` @v1.1.0), BEFORE the bash flush and the settle
+        // emit — the options a run's `before_agent_start` handlers edited, and the prompt they
+        // forced, are scoped to that run and must not survive into the next one (DRIFT-033,
+        // EXT-084).
+        *Self::lock(&self.run_prompt_options) = None;
+        self.sync_prompt_mirror();
         // Pi `finally` (agent-session.ts:982-984): flush deferred bash messages from this turn.
         self.flush_pending_bash_messages().await;
         // …and, immediately after it, the deferred custom messages — pi's `finally` calls the two
@@ -641,20 +670,25 @@ impl AgentSession {
         if let Some(warmer) = self.provider.cache_warmer() {
             warmer.on_agent_settled();
         }
+        // pi v1.1.0 reads the run-abort latch once, then hands the same value to the extension
+        // runner and the session subscribers (`const aborted = this._agentRunAbortRequested;`,
+        // `_emitAgentSettled`, `agent-session.ts:1083-1085`).
+        let aborted = self.abort_requested();
         let cancel = self.session_cancel.child_token();
         self.services
             .ext_host
             .dispatcher()
-            .dispatch_notify(&HostEvent::AgentSettled, &cancel)
+            .dispatch_notify(&HostEvent::AgentSettled { aborted }, &cancel)
             .await;
-        self.fanout_emit(AgentSessionEvent::AgentSettled).await;
+        self.fanout_emit(AgentSessionEvent::AgentSettled { aborted })
+            .await;
     }
 
     /// Decide whether the just-finished run needs a continuation (Pi `_handlePostAgentRun`,
     /// agent-session.ts:986-1013): retry a transient error after backoff, close a spent retry
     /// sequence, run a post-run threshold/overflow compaction, or continue for `agent_end`-queued
-    /// messages. Returns `true` when the driver should `agent.continue()`.
-    async fn handle_post_agent_run(&self) -> bool {
+    /// messages. Answers [`PostRun::Continue`] when the driver should `agent.continue()`.
+    async fn handle_post_agent_run(&self) -> PostRun {
         // Pi checks `_agentRunAbortRequested` FOUR times inside `_handlePostAgentRun`
         // (`agent-session.ts:1497-1500,1504-1505,1507-1510,1522-1523` @v0.87.1) plus once more in
         // its tail (:1528). Each one turns a decision that would have CONTINUED the run into a
@@ -662,10 +696,10 @@ impl AgentSession {
         // function, during `prepare_retry`'s backoff, or during `check_compaction`'s summary call.
         if self.abort_requested() {
             self.finish_cancelled_retry().await;
-            return false;
+            return PostRun::Settle;
         }
         let Some(msg) = Self::lock(&self.last_assistant).take() else {
-            return false;
+            return PostRun::Settle;
         };
         // Retryable transient error → backoff + continue (Pi :991-993). The backoff is awaited
         // inside `prepare_retry`, so an abort can land there: Pi re-reads the latch straight after
@@ -673,7 +707,7 @@ impl AgentSession {
         if self.is_retryable_error(&msg) && self.prepare_retry(&msg).await {
             if self.abort_requested() {
                 self.finish_cancelled_retry().await;
-                return false;
+                return PostRun::Settle;
             }
             // pi `this._failedResponse = message;` immediately after the abort-latch re-read
             // (`agent-session.ts:1850-1853` @v1.0.4). Under a virtual selection this is what makes
@@ -681,11 +715,11 @@ impl AgentSession {
             // request — `prepare_retry` has already dropped that message from the transcript, so
             // nothing else can supply it.
             self.stash_failed_response(&msg);
-            return true;
+            return PostRun::Continue;
         }
         if self.abort_requested() {
             self.finish_cancelled_retry().await;
-            return false;
+            return PostRun::Settle;
         }
         // A terminal error with a spent / non-retryable budget closes the retry sequence (Pi :995-1003).
         if msg.stop_reason == cyrup_core::StopReason::Error && self.retry_attempt() > 0 {
@@ -699,13 +733,13 @@ impl AgentSession {
         }
         if self.abort_requested() {
             self.finish_cancelled_retry().await;
-            return false;
+            return PostRun::Settle;
         }
         // Threshold / overflow post-run compaction → continue (Pi :1005-1007). The summary call is
         // awaited inside, and `abort()` cancels it, so the latch is re-read on the way out
         // (Pi `return !this._agentRunAbortRequested;`, :1522).
         match self.check_compaction(&msg, true).await {
-            Ok(true) => return !self.abort_requested(),
+            Ok(true) => return PostRun::from_continue(!self.abort_requested()),
             Ok(false) => {}
             // SESS-055 — the one throw `_checkCompaction` has is `getCompactionSettings(model)`
             // (`agent-session.ts:2604` @v0.87.1). It leaves `_runAgentPrompt`'s `while` for the
@@ -715,12 +749,12 @@ impl AgentSession {
             // pre-send check refuses with the same message.
             Err(e) => {
                 tracing::warn!(error = %e, "post-run compaction check failed");
-                return false;
+                return PostRun::Threw;
             }
         }
         // Messages queued by `agent_end` extension handlers need a continuation (Pi :1009-1012),
         // unless the run was aborted (Pi :1528).
-        !self.abort_requested() && self.agent.has_queued_messages()
+        PostRun::from_continue(!self.abort_requested() && self.agent.has_queued_messages())
     }
 
     /// Close a retry sequence that an abort cut short — Pi `_finishCancelledRetry`
@@ -1003,7 +1037,7 @@ impl AgentSession {
             let _ = self.check_compaction(&last, false).await?;
         }
         // 5. Assemble (before_agent_start hook + ordering).
-        Ok(self.assemble_run_messages(input).await)
+        self.assemble_run_messages(input).await
     }
 
     /// Expand a `/skill:name args` command to the skill block + args, or a `/name args` prompt
@@ -1072,114 +1106,115 @@ impl AgentSession {
     /// The comparison is against the transcript as the run starts, after the handlers ran: a
     /// handler's `setActiveTools` has been applied by then, so the prompt describes the tools the
     /// run has.
-    async fn assemble_run_messages(&self, input: UserInput) -> Vec<AgentMessage> {
-        let mut messages = self.assemble_run_inputs(input).await;
+    async fn assemble_run_messages(
+        &self,
+        input: UserInput,
+    ) -> Result<Vec<AgentMessage>, SessionServiceError> {
+        let mut messages = self.assemble_run_inputs(input).await?;
         let transcript = self.agent.snapshot().await.messages;
         if let Some(update) = self.prompt_update(&transcript) {
             messages.insert(0, AgentMessage::System(update));
         }
-        messages
+        Ok(messages)
     }
 
     /// Run the `before_agent_start` extension hook and assemble the run's input messages (R-06-014;
-    /// Pi agent-session.ts:1105-1131). The hook chain may (a) **replace** the system prompt — kept in
-    /// its own slot and projected onto the request for this run (pi `forceSystemPrompt`), and reset
-    /// when no handler replaced it — and (b) **inject** additional messages, which are appended after
-    /// the user message. Without this the assembled prompt was never offered to extensions (the gap
-    /// the facade closes).
-    async fn assemble_run_inputs(&self, input: UserInput) -> Vec<AgentMessage> {
+    /// pi `prompt()`, `core/agent-session.ts:2061-2110` @v1.1.0). The handlers edit ONE copy of the
+    /// base prompt options (EXT-084, pi `emitBeforeAgentStart`): they may add or replace prompt
+    /// sections, change any other option, force the whole prompt with a returned `systemPrompt`,
+    /// and inject messages, which are appended after the user message. The options they leave are
+    /// the RUN's ([`Self::run_prompt_options`]) — what the run's prompt is built from, refreshed at
+    /// every turn boundary and dropped when the run settles.
+    ///
+    /// Options that do not build a prompt (pi's `Invalid system prompt section name`) refuse the
+    /// prompt, as pi's `buildSystemPromptSections` throws out of `prompt()`.
+    async fn assemble_run_inputs(
+        &self,
+        input: UserInput,
+    ) -> Result<Vec<AgentMessage>, SessionServiceError> {
         let user_text = input.text.clone();
         let images = input.images.clone();
         let user_msg = input.into_agent_message();
         // Drain any messages staged for this turn (Pi `_pendingNextTurnMessages`,
         // agent-session.ts:1099-1103); they are injected AFTER the user message in the run input.
         let pending: Vec<AgentMessage> = std::mem::take(&mut *Self::lock(&self.pending_next_turn));
+        let mut messages = vec![user_msg];
+        messages.extend(pending);
 
-        // The LIVE base (Pi reads the mutable field: `this._baseSystemPrompt`, agent-session.ts:1228
-        // into `emitBeforeAgentStart`, :1252 for the reset) — NOT the frozen builder-assembled
-        // `services.system_prompt`, which predates every `set_active_tools_by_name` /
-        // `refresh_extension_tools` rebuild this session performed.
-        let base = self.base_system_prompt();
-        // Fast path: no extension listens for `before_agent_start` — keep the assembled base prompt.
-        if self
+        // The LIVE base (pi passes `this._baseSystemPromptOptions`, which every tool-set rebuild
+        // reassigns) — not the builder's startup prompt.
+        let (base_options, base_text) = {
+            let base = Self::lock(&self.base_prompt);
+            (base.options().clone(), base.text().to_owned())
+        };
+        let mut options = base_options.clone();
+        // Fast path: no extension listens for `before_agent_start`, so the run's options are the
+        // base's (pi's runner returns the normalized copy unchanged).
+        if !self
             .services
             .ext_host
             .dispatcher()
             .no_subscribers(cyrup_ext::EventKind::BeforeAgentStart)
         {
-            // No handler ran, so there is nothing to override with — pi's `else` branch
-            // (agent-session.ts:1251 @v0.83.0) clears the slot for exactly this reason, and a stale
-            // override from a PREVIOUS run must not leak into this one.
-            *Self::lock(&self.system_prompt_override) = None;
-            let mut messages = vec![user_msg];
-            messages.extend(pending);
-            return messages;
+            // EXT-025: the ONE `before_agent_start` emitter is the extension host's (pi's runner
+            // `emitBeforeAgentStart`); it answers `None` when no handler changed anything and for a
+            // blocked/handled chain alike, both of which keep the base below.
+            let cancel = self.session_cancel.child_token();
+            let reduced = self
+                .services
+                .ext_host
+                .emit_before_agent_start(
+                    &user_text,
+                    serde_json::to_value(&images).unwrap_or(serde_json::Value::Null),
+                    &base_text,
+                    base_options.to_value(),
+                    &cancel,
+                )
+                .await;
+            // Pi `setActiveTools` (pi-permission-system index.ts:2155): a handler may have
+            // RESTRICTED the active tool set via `HostServices::set_active_tools`, which stages the
+            // requested NAMES. Drain + apply it IN-TURN here — before `spawn_run` — so the
+            // restriction shapes THIS turn, not the next turn boundary where
+            // `apply_pending_agent_control` would otherwise pick it up. pi applies it to the live
+            // loadout synchronously, which the selected-tools rule below reads.
+            if let Some(names) = self.services.host_services.take_pending_active_tools() {
+                let (loadout, prompt) = { Self::lock(&self.dynamic_tools).set_active(&names) };
+                self.push_active_tools(loadout, prompt).await;
+            }
+            if let Some(cyrup_ext::BeforeAgentStartReduction {
+                injected,
+                options: edited,
+                ..
+            }) = reduced
+            {
+                // The reduction's options carry every handler's edits and, when a handler
+                // returned a prompt, `forceSystemPrompt` (pi `currentOptions.forceSystemPrompt =
+                // result.systemPrompt`). The forced prompt is kept OUT of the transcript, which
+                // keeps the structured sections; it is projected onto each request instead
+                // (`PolicyHooks::transform_context`, pi `_installAgentForcedPromptProjection`).
+                if edited.is_object() {
+                    options = cyrup_session::prompt::SystemPromptOptions::normalize(&edited)
+                        .map_err(SessionServiceError::SystemPromptOptions)?;
+                }
+                messages.extend(injected.iter().map(core_message_to_agent));
+            }
         }
-
-        // EXT-025: the ONE `before_agent_start` emitter is the extension host's (pi's runner
-        // `emitBeforeAgentStart`); it answers `None` for an unchanged prompt with nothing injected
-        // and for a blocked/handled chain alike, both of which keep the base below.
-        let cancel = self.session_cancel.child_token();
-        let reduced = self
-            .services
-            .ext_host
-            .emit_before_agent_start(
-                &user_text,
-                serde_json::to_value(&images).unwrap_or(serde_json::Value::Null),
-                &base,
-                serde_json::Value::Null,
-                &cancel,
-            )
-            .await;
-
-        let mut messages = vec![user_msg];
-        messages.extend(pending);
-        // Pi `setActiveTools` (pi-permission-system index.ts:2155): a `before_agent_start` handler may
-        // have RESTRICTED the active tool set via `HostServices::set_active_tools` (the permission
-        // companion's `shouldExposeTool` shaping), which stages the requested NAMES. Drain + apply
-        // it IN-TURN here — before `spawn_run` — so the restriction shapes THIS turn (turn 1), not the
-        // next turn boundary where `apply_pending_agent_control` would otherwise pick it up. The
-        // prompt rebuilt for the restricted set becomes the base (pi `setActiveTools` →
-        // `_rebuildSystemPrompt`), so the tools the handler hid are not listed in the prompt the model
-        // is sent. Draining it here also leaves `pending_active_tools` empty for the later
-        // `apply_pending_agent_control` drains, so the restriction is applied exactly once.
-        if let Some(names) = self.services.host_services.take_pending_active_tools() {
-            let (loadout, prompt) = { Self::lock(&self.dynamic_tools).set_active(&names) };
+        // pi `prompt()` (`agent-session.ts:2069-2075` @v1.1.0): "An explicit edit wins; otherwise
+        // the live loadout is authoritative, so a setActiveTools() call is not undone here." An
+        // edited `selectedTools` is then APPLIED as the loadout (`_preparePromptAndToolLoadout` →
+        // `_applyToolLoadout(options.selectedTools)`, `:1742`).
+        if options.selected_tools != base_options.selected_tools {
+            let (loadout, prompt) =
+                { Self::lock(&self.dynamic_tools).set_active(&options.selected_tools) };
             self.push_active_tools(loadout, prompt).await;
         }
-        if let Some(cyrup_ext::BeforeAgentStartReduction {
-            system_prompt,
-            injected,
-        }) = reduced
-        {
-            // Record the (possibly handler-replaced / sanitized) system prompt in the override slot,
-            // or clear it. Pi's two branches are `if (result?.systemPrompt !== undefined) {
-            // this._systemPromptOverride = result.systemPrompt; … } else {
-            // this._systemPromptOverride = undefined; … }` (agent-session.ts:1246-1252 @v0.83.0) —
-            // the slot is written on both, so a replacement never outlives its run and a rebuild
-            // cannot undo one (DRIFT-033).
-            //
-            // The slot is a FORCED prompt (pi `forceSystemPrompt`, `core/system-prompt.ts` @v1.0.0).
-            // It is not written to the transcript, which keeps the structured sections whatever a
-            // handler returned; it is projected onto each request instead, replacing the transcript's
-            // system messages with one holding this text (`PolicyHooks::transform_context`, pi
-            // `_installAgentForcedPromptProjection`, `agent-session.ts:1715-1731`).
-            //
-            // CYRUP-DELTA on the discriminator only: pi distinguishes "handler returned no prompt"
-            // (`undefined`) from "handler returned one"; cyrup's `HostEvent::BeforeAgentStart`
-            // carries the prompt as a mutated-in-place `String`, so a handler that returns the base
-            // verbatim is indistinguishable from one that returns nothing. The reduction reports a
-            // prompt only when it differs from `base`, so an unchanged one is read as "no override",
-            // which agrees with pi on the resulting prompt for every input and differs only in
-            // which slot holds the identical text.
-            *Self::lock(&self.system_prompt_override) = system_prompt;
-            messages.extend(injected.iter().map(core_message_to_agent));
-        } else {
-            // Nothing changed, or the chain was blocked/handled (no Pi analogue here): keep the
-            // base prompt, no injection.
-            *Self::lock(&self.system_prompt_override) = None;
-        }
-        messages
+        self.stamp_live_loadout(&mut options);
+        // pi builds the sections from these options in `_preparePromptAndToolLoadout`, where an
+        // invalid custom section name throws out of `prompt()`.
+        options.validate()?;
+        *Self::lock(&self.run_prompt_options) = Some(options);
+        self.sync_prompt_mirror();
+        Ok(messages)
     }
 
     /// Await [`Self::is_idle`]: full settlement of the in-flight run AND its post-run loop
@@ -1396,5 +1431,26 @@ fn agent_user_text(m: &AgentMessage) -> Option<String> {
                 .join(""),
         ),
         _ => None,
+    }
+}
+
+/// What pi's `_handlePostAgentRun` decided (`agent-session.ts:1839-1879` @v1.1.0).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PostRun {
+    /// A retry, a compaction or a queued message continues the run.
+    Continue,
+    /// Nothing continues it: the `agent_before_settle` boundary runs next (EXT-078).
+    Settle,
+    /// `_checkCompaction` threw, which leaves the loop for the `finally` with no boundary.
+    Threw,
+}
+
+impl PostRun {
+    fn from_continue(continue_: bool) -> Self {
+        if continue_ {
+            PostRun::Continue
+        } else {
+            PostRun::Settle
+        }
     }
 }

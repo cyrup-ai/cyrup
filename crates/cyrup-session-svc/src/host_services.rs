@@ -947,6 +947,10 @@ pub struct LiveHostServices {
     /// [`Self::attach_session_activity`]. `None` on the default/by-value host, where the trait
     /// defaults (idle, no pending messages, a no-op abort) are the honest answers.
     activity: Mutex<Option<Arc<dyn SessionActivity>>>,
+    /// EXT-078: the preview a guest's `preview-boundary` import builds while a `turn_end` /
+    /// `agent_before_settle` chain runs — installed by the session for the chain and cleared after
+    /// it, so a guest folding several handlers previews against the same session copy the host does.
+    boundary_preview: Mutex<Option<BoundaryPreviewFn>>,
     /// The live session's guest-facing introspection catalog (EXT-037 / EXT-038), attached
     /// post-build via [`Self::attach_session_catalog`]. `None` on the default host and on a
     /// by-value session (nothing calls `into_shared`), where [`HostServices::commands`] answers
@@ -1105,7 +1109,17 @@ impl cyrup_provider::CredentialStore for ScopedCredentialStore {
     }
 }
 
+/// Builds pi's `BoundaryContextPreview` for `(boundary, entries)` (EXT-078).
+pub(crate) type BoundaryPreviewFn =
+    Arc<dyn Fn(&str, &Value) -> Result<Value, String> + Send + Sync>;
+
 impl LiveHostServices {
+    /// Install (or, with `None`, clear) the preview a boundary chain answers `preview-boundary`
+    /// with (EXT-078).
+    pub(crate) fn set_boundary_preview(&self, preview: Option<BoundaryPreviewFn>) {
+        *Self::lock(&self.boundary_preview) = preview;
+    }
+
     /// Wire a backend to the session's `provider`, process ops (`proc`), and session `cwd`. Model/state
     /// are seeded via [`Self::update_model`] and [`Self::update_state`]; the control sink is attached
     /// later by the runtime. `proc` + `cwd` back the `exec` capability grant (Pi `execCommand`).
@@ -1131,6 +1145,7 @@ impl LiveHostServices {
             inject_sink: Mutex::new(None),
             human_interaction: Arc::new(HumanInteractionLock::new()),
             activity: Mutex::new(None),
+            boundary_preview: Mutex::new(None),
             catalog: Mutex::new(None),
             model_calls: Mutex::new(None),
             theme_access: Mutex::new(None),
@@ -2433,6 +2448,14 @@ impl HostServices for LiveHostServices {
 
     fn system_prompt(&self) -> Option<String> {
         Self::lock(&self.snapshot).system_prompt.clone()
+    }
+
+    fn preview_boundary(&self, boundary: &str, entries: &Value) -> Result<Value, String> {
+        let preview = Self::lock(&self.boundary_preview).clone();
+        match preview {
+            Some(preview) => preview(boundary, entries),
+            None => Err("no boundary is being dispatched".into()),
+        }
     }
 
     fn exec(
@@ -3955,20 +3978,24 @@ mod tests {
             bag.get("cwd").is_some(),
             "`cwd` is the one REQUIRED key of pi's bag: {bag}"
         );
+        // pi v1.1.0 keys each tool's guidelines by name (`toolGuidelines:
+        // Object.fromEntries(this._toolPromptGuidelines)`, `agent-session.ts:1724`), only for the
+        // tools that have some, and leaves `promptGuidelines` for extensions (EXT-084).
         assert_eq!(
-            bag["promptGuidelines"],
-            json!(["read: prefer read"]),
-            "each active tool's guidelines, in active order (agent-session.ts:1031-1034): {bag}"
+            bag["toolGuidelines"],
+            json!({"read": ["read: prefer read"]}),
+            "each tool's guidelines, by name: {bag}"
         );
-        // pi omits `customPrompt`/`appendSystemPrompt` when unset rather than emitting null.
+        assert_eq!(bag["promptGuidelines"], json!([]), "{bag}");
+        // `normalizeBuildSystemPromptOptions` (`system-prompt.ts:60-75` @v1.1.0): `customPrompt`
+        // stays `undefined` (omitted from the JSON), `appendSystemPrompt` defaults to `""`, and
+        // every collection is present.
         assert!(
             bag.get("customPrompt").is_none(),
             "an unset optional is OMITTED, not null: {bag}"
         );
-        assert!(
-            bag.get("appendSystemPrompt").is_none(),
-            "an unset optional is OMITTED, not null: {bag}"
-        );
+        assert_eq!(bag["appendSystemPrompt"], json!(""), "{bag}");
+        assert_eq!(bag["sections"], json!({}), "{bag}");
     }
 
     /// A tool whose loadout hook hides another tool's declaration, as the `codemode` tool does in
@@ -4008,8 +4035,10 @@ mod tests {
     }
 
     /// CODE-020 (pi `c30840c2e` @v1.0.4): the bag names the tools whose declarations requests leave
-    /// out (`hiddenTools`), and the guidelines it carries are the DECLARED tools' — a hidden tool's
-    /// guideline is not a rule of the prompt the bag stands behind.
+    /// out (`hiddenTools`), and a hidden tool's guideline is not a rule of the prompt the bag
+    /// renders to. pi v1.1.0 carries every tool's guidelines in `toolGuidelines` and leaves the
+    /// hidden ones out when it renders (`buildSystemPromptSections`), so the bag holds both and
+    /// the prompt it renders holds only the declared tool's (EXT-084).
     #[test]
     fn system_prompt_options_names_the_hidden_tools_and_drops_their_guidelines() {
         let provider: Arc<dyn Provider> = Arc::new(FauxProvider::new());
@@ -4022,9 +4051,15 @@ mod tests {
         let bag = svc.system_prompt_options().expect("a live view answers");
         assert_eq!(bag["hiddenTools"], json!(["bash"]), "{bag}");
         assert_eq!(
-            bag["promptGuidelines"],
-            json!(["read: prefer read"]),
-            "bash is hidden, so its guideline is not carried: {bag}"
+            bag["toolGuidelines"],
+            json!({"bash": ["bash: prefer bash"], "read": ["read: prefer read"]}),
+            "{bag}"
+        );
+        let rendered = cyrup_ext::render_system_prompt_options(&bag).expect("the bag renders");
+        assert!(rendered.contains("read: prefer read"), "{rendered}");
+        assert!(
+            !rendered.contains("bash: prefer bash"),
+            "bash is hidden, so its guideline is not a rule: {rendered}"
         );
         assert_eq!(
             bag["selectedTools"],

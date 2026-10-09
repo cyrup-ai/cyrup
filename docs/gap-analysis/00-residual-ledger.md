@@ -5,6 +5,38 @@ next work item**.
 
 ---
 
+# UPDATE 2026-10-09 (pi v1.1.0 extension event surface) — `EXT-078`, `EXT-084` and `SESS-050` closed; pi's timings commit and `agent_settled.aborted` ported
+
+> Upstream read at pi `v1.1.0` through git objects only (`git -C tmp/pi show v1.1.0:<path>`). The count is
+> whatever `python3 -I docs/gap-analysis/scripts/count_open_items.py` prints, measured on `main` at
+> `5a2c8d9` (before) and on this branch rebased onto it (after): **before 117 open (0 above low; 17
+> trackers; 954 closed); after 114 open (0 above low; 17 trackers; 957 closed)**. Area 03: 3 → **2** open (`SESS-050`),
+> area 06: 15 → **13** open (`EXT-078`, `EXT-084`). Nothing filed.
+>
+> **Closed, with the observable effect:** an extension can append entries at the end of a turn or before
+> a run settles, and ask for one more provider request there (`EXT-078`, pi `turn_end` boundary +
+> `agent_before_settle`); a `before_agent_start` handler edits the prompt's options — adds or replaces a
+> section, changes the tool selection — and the next handler and the model see the result (`EXT-084`);
+> extensions are told when a compaction fails or is cancelled (`SESS-050`).
+>
+> **Ported without a ledger row** (both read at v1.1.0 and found absent; recorded here so the trace is
+> not only the PR): pi commit `36a686ee8` (#10549) — assistant and tool-result messages carry
+> `durationMs`, `tool_execution_end` carries it, the render context has it, the TUI's "Took" reads the
+> recorded value, and durable task records carry `startedAt`/`endedAt` (carried, never stamped, per
+> ADR-0029); and `AgentSettledEvent.aborted`.
+>
+> **Extension world:** `cyrup:ext` 0.18 → **0.19** (one bump for the whole batch): `on-tool-execution-end`
+> gains `duration-ms`, `on-agent-settled` gains `aborted`, `on-turn-end` is re-signed to pi's boundary
+> event, `on-session-compact-failed` and `on-agent-before-settle` are new, and `ctx-state` gains
+> `render-system-prompt` and `preview-boundary`. Both `world.wit` copies are byte-identical.
+>
+> **Every new test was red-proved** against a neutered implementation: 31 cases for the timings,
+> `aborted` and `SESS-050`; 15 for `EXT-084`; 20 for `EXT-078`; 8 on the guest tier. One gap the
+> neutering found (an abort during `agent_before_settle` was covered only by the run latch) has its own
+> test.
+
+---
+
 # UPDATE 2026-10-08 (headless Anthropic login) — `PROV-120` and `TUI-145` closed; `PROV-135`…`PROV-138` and `TUI-167`…`TUI-170` filed and closed
 
 > pi's Anthropic copy-code (headless) login and its method selector, built on `claude/zealous-bell-x0u1h0`
@@ -110,7 +142,7 @@ next work item**.
 > 17 trackers; 921 closed); after 134 open (0 medium, 134 low; 17 trackers; 923 closed)**, both measured
 > on `main` at `5fe93d973` (after #193's `HERDR-009` and `MCP-615` closures). Area 18:
 > 4 → **3** open (`CODE-015`, `-016`, `-017`), 13 → 14 closed. Area 03: `SESS-054` closed. No row filed.
-> `AGENT-039`, `SESS-051` and `EXT-084` carry dated CORRECTED notes and stay open. The closure record,
+> `AGENT-039`, `SESS-051` and `EXT-084` carry dated CORRECTED notes and stay open (`EXT-084` closed 2026-10-09). The closure record,
 > with the corrected `context.rs` cite, the two key orders and the not-ported list, is at the top of
 > `18-pi-codemode.md` ("Closure record, 2026-10-06 — `CODE-014`…").
 >

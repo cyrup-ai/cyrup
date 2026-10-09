@@ -2,6 +2,7 @@
 //! into ONE binary instead of one process per file. Assertions are unchanged.
 
 mod area03_repairs;
+mod boundary_drafts;
 mod branch_provenance_and_export;
 mod compaction;
 mod compaction_nested_calls;

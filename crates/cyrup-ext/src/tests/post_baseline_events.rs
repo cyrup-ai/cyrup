@@ -190,6 +190,9 @@ mod wasm {
             turn_index: 0,
             message: AgentMessage::user_text("turn"),
             tool_results: Vec::new(),
+            message_entry_id: String::new(),
+            tool_result_entry_ids: Vec::new(),
+            boundary: crate::BoundaryState::default(),
         }
     }
 
@@ -277,9 +280,9 @@ mod wasm {
                 ("init", init_subscribing(1)),
                 (
                     "on-turn-end",
-                    "    (func (export \"on-turn-end\") (param i32 i32 i32 i32 i32) \
+                    "    (func (export \"on-turn-end\") (param i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32) (result i32) \
                      (call $set_status (i32.const 16400) (i32.const 3) (i32.const 0) (i32.const 0) (i32.const 0)) \
-                     (call $unsubscribe (i32.const 16384) (i32.const 1)))"
+                     (call $unsubscribe (i32.const 16384) (i32.const 1)) i32.const 16)"
                         .to_string(),
                 ),
             ],
@@ -400,9 +403,9 @@ mod wasm {
                 ("init", init_subscribing(3)),
                 (
                     "on-turn-end",
-                    "    (func (export \"on-turn-end\") (param i32 i32 i32 i32 i32) \
+                    "    (func (export \"on-turn-end\") (param i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32) (result i32) \
                      (call $select (i32.const 16400) (i32.const 4) (i32.const 16410) (i32.const 2) \
-                     (i32.const 16420) (i32.const 2) (i32.const 16448)))"
+                     (i32.const 16420) (i32.const 2) (i32.const 16448)) i32.const 16)"
                         .to_string(),
                 ),
                 // The prompter's own start handler marks a status, so a self-delivery would show.

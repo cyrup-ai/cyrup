@@ -95,6 +95,7 @@ fn tool_result(name: &str, body: &str) -> AgentMessage {
 
 fn tool_result_id(id: &str, name: &str, body: &str) -> AgentMessage {
     AgentMessage::Core(Message::ToolResult {
+        duration_ms: None,
         tool_call_id: ToolCallId::from(id),
         tool_name: name.to_string(),
         content: vec![Content::Text {
@@ -522,6 +523,7 @@ fn live_tool_events_pair_same_name_results_by_call_id() {
             args: serde_json::json!({ "file_path": "/etc/bravo.toml" }),
         },
         AgentSessionEvent::ToolExecutionEnd {
+            duration_ms: None,
             tool_call_id: ToolCallId::from("call_a"),
             tool_name: "read".to_string(),
             result: serde_json::json!({
@@ -530,6 +532,7 @@ fn live_tool_events_pair_same_name_results_by_call_id() {
             is_error: false,
         },
         AgentSessionEvent::ToolExecutionEnd {
+            duration_ms: None,
             tool_call_id: ToolCallId::from("call_b"),
             tool_name: "read".to_string(),
             result: serde_json::json!({

@@ -13,6 +13,7 @@ fn function_response_uses_output_and_error_keys() {
                 timestamp: 0,
             },
             Message::ToolResult {
+                duration_ms: None,
                 tool_call_id: cyrup_core::ToolCallId::from("c1"),
                 tool_name: "read".to_string(),
                 content: vec![Content::text("file body")],
@@ -61,6 +62,7 @@ fn gemini3_echoes_tool_call_ids() {
     let ctx = Context {
         system_prompt: None,
         messages: vec![Message::ToolResult {
+            duration_ms: None,
             tool_call_id: cyrup_core::ToolCallId::from("call_1"),
             tool_name: "read".to_string(),
             content: vec![Content::text("file body")],
@@ -96,6 +98,7 @@ fn drift048_tool_call_id_follows_the_target_model_not_the_source_message() {
         let model = model_with(target, true);
         let mut ctx = signed_block_ctx("google", source_model, vec![a_tool_call()]);
         ctx.messages.push(Message::ToolResult {
+            duration_ms: None,
             tool_name: "bash".to_string(),
             tool_call_id: ToolCallId::from("call_1"),
             content: vec![Content::text("ok")],

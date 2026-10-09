@@ -55,6 +55,21 @@ pub struct TaskRecord {
     pub background: bool,
     /// Whether an abort has been durably requested.
     pub abort_requested: bool,
+    /// Wall-clock milliseconds of the record's first change to `running` (pi `startedAt?`,
+    /// `packages/durable/src/types.ts` and `spec.md:1645-1646` @v1.1.0, commit 36a686ee8): *"Kept
+    /// through waits and recovery, so the span to `endedAt` includes them. Absent before the task
+    /// first runs, and on records written by earlier versions."*
+    ///
+    /// Storage carries it because the record is a storage obligation; STAMPING it is not. Upstream
+    /// stamps it in the Session as part of a task transition (`spec.md:1913-1923`, §5.3), and
+    /// ADR-0029 keeps §5 — the task machine and its transitions — out of build scope, so nothing in
+    /// cyrup writes it: it is preserved, as a record written elsewhere carries it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<i64>,
+    /// Wall-clock milliseconds of the change to `terminal` (pi `endedAt?`, `spec.md:1647-1648`
+    /// @v1.1.0); absent while live. Carried, not stamped, for the reason [`Self::started_at`] is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended_at: Option<i64>,
     /// Its state, and — for a live state only — its memos.
     pub state: TaskState,
 }

@@ -2762,6 +2762,7 @@ impl NativeExtension for SubagentPromptRuntime {
                         rewrite.is_some_and(|opts| opts.structured_output),
                     )),
                     inject: Vec::new(),
+                    options: None,
                 })
             }
             HostEvent::BeforeAgentStart { system_prompt, .. } => {
@@ -2776,6 +2777,7 @@ impl NativeExtension for SubagentPromptRuntime {
                     HookOutcome::Mutate(EventPatch::SystemPromptAndInject {
                         system: Some(rewritten),
                         inject: Vec::new(),
+                        options: None,
                     })
                 }
             }
@@ -4689,6 +4691,7 @@ mod tests {
 
     fn tool_result(tool_name: &str) -> AgentMessage {
         AgentMessage::ToolResult(cyrup_agent::ToolResultMessage {
+            duration_ms: None,
             tool_call_id: ToolCallId::from("tc-1"),
             tool_name: tool_name.to_string(),
             content: vec![Content::text("done")],

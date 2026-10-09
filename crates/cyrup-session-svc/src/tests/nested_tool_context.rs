@@ -219,7 +219,7 @@ async fn run_native_tool(fx: &Fixture) -> Run {
         .lock()
         .unwrap()
         .iter()
-        .any(|e| matches!(e, AgentSessionEvent::AgentSettled))
+        .any(|e| matches!(e, AgentSessionEvent::AgentSettled { .. }))
         && started.elapsed() < std::time::Duration::from_secs(10)
     {
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;

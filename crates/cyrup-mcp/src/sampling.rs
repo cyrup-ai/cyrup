@@ -300,6 +300,7 @@ fn convert_sampling_message(message: &SamplingMessage) -> Result<Message, ErrorD
             raw_stop_reason: None,
             end_turn: None,
             timestamp,
+            duration_ms: None,
         })),
     }
 }
@@ -616,6 +617,7 @@ mod tests {
             raw_stop_reason: None,
             end_turn: None,
             timestamp: 0,
+            duration_ms: None,
         }
     }
 

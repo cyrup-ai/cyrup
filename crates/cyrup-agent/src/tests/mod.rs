@@ -27,6 +27,7 @@ mod prepared_call_abort;
 mod proxy_live_turn;
 mod round2_parity;
 mod settlement_latch;
+mod timings;
 mod tool_declarations;
 mod tool_exposure;
 mod tool_result_model;

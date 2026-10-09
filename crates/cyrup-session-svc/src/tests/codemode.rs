@@ -421,7 +421,7 @@ impl Rig {
                 .lock()
                 .unwrap()
                 .iter()
-                .any(|e| matches!(e, AgentSessionEvent::AgentSettled))
+                .any(|e| matches!(e, AgentSessionEvent::AgentSettled { .. }))
         {
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }

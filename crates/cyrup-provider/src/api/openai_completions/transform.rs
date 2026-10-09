@@ -111,6 +111,7 @@ fn downgrade_unsupported_images(messages: &[Message], model: &Model) -> Vec<Mess
                 timestamp: *timestamp,
             },
             Message::ToolResult {
+                duration_ms,
                 tool_call_id,
                 tool_name,
                 content,
@@ -121,6 +122,7 @@ fn downgrade_unsupported_images(messages: &[Message], model: &Model) -> Vec<Mess
                 timestamp,
                 nested_calls,
             } => Message::ToolResult {
+                duration_ms: *duration_ms,
                 tool_call_id: tool_call_id.clone(),
                 tool_name: tool_name.clone(),
                 content: replace_images_with_placeholder(
@@ -165,6 +167,7 @@ fn close_pending_tool_calls(
     for tc in pending.iter() {
         if !existing.contains(tc.id.as_str()) {
             result.push(Message::ToolResult {
+                duration_ms: None,
                 tool_call_id: tc.id.clone(),
                 tool_name: tc.name.clone(),
                 content: vec![Content::text("No result provided")],
@@ -221,6 +224,7 @@ pub(crate) fn transform_messages_with_source(
             // — neither role carries a tool call or a cross-model thinking block to rewrite.
             Message::System(_) | Message::User { .. } => msg.clone(),
             Message::ToolResult {
+                duration_ms,
                 tool_call_id,
                 tool_name,
                 content,
@@ -235,6 +239,7 @@ pub(crate) fn transform_messages_with_source(
                     && norm != tool_call_id.as_str()
                 {
                     return Message::ToolResult {
+                        duration_ms: *duration_ms,
                         tool_call_id: ToolCallId::from(norm.as_str()),
                         tool_name: tool_name.clone(),
                         content: content.clone(),

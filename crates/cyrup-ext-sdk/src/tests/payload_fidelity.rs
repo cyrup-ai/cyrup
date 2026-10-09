@@ -145,21 +145,37 @@ fn message_update_carries_message_and_delta() {
     );
 }
 
-/// `turn_end` (Pi `TurnEndEvent`, types.ts:703-709): the prior struct dropped `toolResults`. Full
-/// shape: `{turnIndex, message, toolResults}`.
+/// `turn_end` (pi `TurnEndEvent extends BoundaryState`, `core/extensions/types.ts:1036-1044`
+/// @v1.1.0): the prior struct dropped `toolResults`, and before EXT-078 the boundary keys. Full
+/// shape: `{turnIndex, message, toolResults, messageEntryId, toolResultEntryIds, entries, continue,
+/// context, outcome}`.
 #[test]
 fn turn_end_carries_tool_results() {
     let ev = TurnEndEvent {
         turn_index: 3,
         message: json!({ "role": "assistant" }),
         tool_results: json!([{ "toolCallId": "c", "toolName": "bash", "content": [], "isError": false, "timestamp": 0 }]),
+        message_entry_id: "e1".into(),
+        tool_result_entry_ids: vec!["e2".into()],
+        boundary: crate::BoundaryState {
+            entries: json!([]),
+            continue_: false,
+            context: json!({"canContinue": false}),
+            outcome: "completed".into(),
+        },
     };
     assert_eq!(
         serde_json::to_value(&ev).unwrap(),
         json!({
             "turnIndex": 3,
             "message": { "role": "assistant" },
-            "toolResults": [{ "toolCallId": "c", "toolName": "bash", "content": [], "isError": false, "timestamp": 0 }]
+            "toolResults": [{ "toolCallId": "c", "toolName": "bash", "content": [], "isError": false, "timestamp": 0 }],
+            "messageEntryId": "e1",
+            "toolResultEntryIds": ["e2"],
+            "entries": [],
+            "continue": false,
+            "context": {"canContinue": false},
+            "outcome": "completed",
         })
     );
 }

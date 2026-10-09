@@ -583,6 +583,9 @@ async fn a_follow_up_steer_is_held_until_the_next_turn_boundary() {
                     timestamp: None,
                 },
                 tool_results: Vec::new(),
+                message_entry_id: String::new(),
+                tool_result_entry_ids: Vec::new(),
+                boundary: cyrup_ext::BoundaryState::default(),
             },
             &ctx,
         )

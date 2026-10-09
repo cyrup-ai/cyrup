@@ -13,6 +13,7 @@ use crate::error::ExtError;
 use crate::event::{EventKind, HostEvent, Subscriptions};
 use crate::extension::Extension;
 use cyrup_core::{CancelToken, ToolCallId};
+use serde_json::Value;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -44,6 +45,40 @@ pub struct ExtensionError {
 /// A registered error listener (Pi `onError`). `Send + Sync` so it can be shared across the host.
 pub type ErrorListener = Arc<dyn Fn(&ExtensionError) + Send + Sync>;
 
+/// Renders a `before_agent_start` handler's `systemPromptOptions` to the prompt text (pi
+/// `buildSystemPrompt(currentOptions)`, `core/extensions/runner.ts:1426` @v1.1.0; EXT-084). A
+/// refusal carries pi's error text, e.g. an invalid custom section name.
+pub type SystemPromptRenderer = Arc<dyn Fn(&Value) -> Result<String, String> + Send + Sync>;
+
+/// pi `buildSystemPrompt(normalizeBuildSystemPromptOptions(options))` with no session to ask —
+/// what [`Dispatcher::render_system_prompt`] falls back to before a session installs its own
+/// renderer. The session builds its prompt with the same default documentation pointers.
+pub fn render_system_prompt_options(options: &Value) -> Result<String, String> {
+    let options = cyrup_session::prompt::SystemPromptOptions::normalize(options)?;
+    options
+        .render(&cyrup_session::prompt::DocsPointers::default())
+        .map_err(|e| e.to_string())
+}
+
+/// What [`Dispatcher::dispatch_boundary`] folded out of a `turn_end` / `agent_before_settle` chain
+/// (pi `BoundaryDispatchResult`, `core/extensions/runner.ts:222-227` @v1.1.0; EXT-078).
+#[derive(Clone, Debug, PartialEq)]
+pub struct BoundaryDispatch {
+    /// The `SessionBoundaryDraft[]` to commit — empty when `valid` is false.
+    pub entries: Value,
+    /// Whether one more provider request was asked for — false when `valid` is false.
+    pub continue_: bool,
+    /// The last `BoundaryContextPreview` built.
+    pub context: Value,
+    /// Whether the final drafts built a preview. pi discards every draft and the continuation
+    /// otherwise.
+    pub valid: bool,
+}
+
+/// Builds pi's `BoundaryContextPreview` for a draft list (`buildContext(entries)` in
+/// `emitBoundary`); a refusal is the reason the drafts cannot be applied.
+pub type BoundaryPreview<'a> = &'a (dyn Fn(&Value) -> Result<Value, String> + Send + Sync);
+
 /// The subscription-gated, load-ordered dispatcher (arch-08 §3.1 / §6.1).
 pub struct Dispatcher {
     inner: RwLock<DispatchInner>,
@@ -58,6 +93,12 @@ pub struct Dispatcher {
     /// Latch so the "lock poisoned" diagnostic is emitted ONCE rather than on every dispatch
     /// (poisoning is permanent for the lock's lifetime). See [`Self::note_poisoned`].
     poison_reported: std::sync::atomic::AtomicBool,
+    /// The session's prompt renderer (EXT-084), consulted after every `before_agent_start` patch.
+    /// `None` until a session installs one; [`render_system_prompt_options`] stands in.
+    prompt_renderer: RwLock<Option<SystemPromptRenderer>>,
+    /// EXT-078: set once a session dispatches `turn_end` itself, as pi's boundary; the
+    /// [`crate::ExtSubscriber`] then leaves the event to it.
+    boundary_owner: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Default)]
@@ -84,6 +125,37 @@ impl Dispatcher {
             error_listeners: RwLock::new(Vec::new()),
             bus_drain: RwLock::new(None),
             poison_reported: std::sync::atomic::AtomicBool::new(false),
+            prompt_renderer: RwLock::new(None),
+            boundary_owner: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// A session announces that it dispatches `turn_end` itself (EXT-078).
+    pub fn set_session_owns_boundaries(&self) {
+        self.boundary_owner
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Whether a session dispatches `turn_end` (see [`Self::set_session_owns_boundaries`]).
+    pub fn session_owns_boundaries(&self) -> bool {
+        self.boundary_owner
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Install the session's prompt renderer (EXT-084). The last one installed wins.
+    pub fn set_system_prompt_renderer(&self, renderer: SystemPromptRenderer) {
+        if let Ok(mut g) = self.prompt_renderer.write() {
+            *g = Some(renderer);
+        }
+    }
+
+    /// Render a `systemPromptOptions` object to the prompt text: the session's renderer when one is
+    /// installed, otherwise [`render_system_prompt_options`].
+    pub fn render_system_prompt(&self, options: &Value) -> Result<String, String> {
+        let renderer = self.prompt_renderer.read().ok().and_then(|g| g.clone());
+        match renderer {
+            Some(render) => render(options),
+            None => render_system_prompt_options(options),
         }
     }
 
@@ -371,6 +443,76 @@ impl Dispatcher {
         self.drain_bus(cancel, exclude).await;
     }
 
+    /// pi `emitBoundary(baseEvent, buildContext)` (`core/extensions/runner.ts:1029-1080` @v1.1.0;
+    /// EXT-078) for a `turn_end` or `agent_before_settle` event. Every subscribed extension is handed
+    /// the drafts, the continuation request and the context preview the chain has so far; a
+    /// `{entries?, continue?}` answer replaces either; and after EVERY extension — whatever it
+    /// answered, a fault included — the preview is rebuilt from the drafts. A draft list that does
+    /// not build is reported (`Invalid boundary entries: <cause>`) and, if it is still the list when
+    /// the chain ends, every draft and the continuation are discarded. A fault is reported and
+    /// skipped, as pi's `try`/`catch` around the handler does.
+    pub async fn dispatch_boundary(
+        &self,
+        mut ev: HostEvent,
+        preview: BoundaryPreview<'_>,
+        cancel: &CancelToken,
+    ) -> BoundaryDispatch {
+        let kind = ev.kind();
+        let Some(state) = boundary_of(&mut ev) else {
+            return BoundaryDispatch {
+                entries: Value::Array(Vec::new()),
+                continue_: false,
+                context: Value::Null,
+                valid: true,
+            };
+        };
+        state.entries = Value::Array(Vec::new());
+        state.continue_ = false;
+        state.context = preview(&state.entries).unwrap_or(Value::Null);
+        let mut valid = true;
+        for ext in self.subscribers_for(kind) {
+            match self.invoke_contained(&ext, &ev, None, cancel).await {
+                Ok(HookOutcome::Mutate(patch)) => ev.apply_patch(patch),
+                Ok(_) => {}
+                Err(e) => self.report(kind, ext.id(), &e),
+            }
+            let Some(state) = boundary_of(&mut ev) else {
+                break;
+            };
+            match preview(&state.entries) {
+                Ok(context) => {
+                    state.context = context;
+                    valid = true;
+                }
+                Err(cause) => {
+                    valid = false;
+                    self.report_external(ExtensionError {
+                        extension: ext.id().clone(),
+                        event: kind.name(),
+                        error: format!("Invalid boundary entries: {cause}"),
+                    });
+                }
+            }
+        }
+        self.drain_bus(cancel, None).await;
+        let state = boundary_of(&mut ev).cloned().unwrap_or_default();
+        if valid {
+            BoundaryDispatch {
+                entries: state.entries,
+                continue_: state.continue_,
+                context: state.context,
+                valid: true,
+            }
+        } else {
+            BoundaryDispatch {
+                entries: Value::Array(Vec::new()),
+                continue_: false,
+                context: state.context,
+                valid: false,
+            }
+        }
+    }
+
     /// Collect EVERY subscribed extension's `handled` contribution for a discovery/aggregation event
     /// (Pi `resources_discover`/`project_trust`, runner.ts:197/1046). Unlike `dispatch_block_mutate`
     /// this does NOT short-circuit on the first `Handled`: it runs all subscribers in load order and
@@ -567,11 +709,44 @@ impl Dispatcher {
                         by: ext.id().clone(),
                     };
                 }
-                HookOutcome::Mutate(patch) => ev.apply_patch(patch),
+                HookOutcome::Mutate(patch) => {
+                    let edits_options = matches!(
+                        &patch,
+                        crate::contract::EventPatch::SystemPromptAndInject {
+                            options: Some(_),
+                            ..
+                        }
+                    );
+                    ev.apply_patch(patch);
+                    if edits_options {
+                        self.rerender_system_prompt(&mut ev);
+                    }
+                }
                 HookOutcome::Noop => {}
             }
         }
         Reduced::Pass(Box::new(ev))
+    }
+
+    /// pi's `event.systemPrompt` is a getter over the options every handler edits
+    /// (`get systemPrompt() { return renderCurrentSystemPrompt(); }`, `core/extensions/runner.ts:1446`
+    /// @v1.1.0; EXT-084), so the next handler reads the prompt the edited options render to. A
+    /// patch that edits the options is followed by a re-render (one that does not leaves the options,
+    /// and so the prompt, as they were; a bare `system` replacement renders to itself as the forced
+    /// prompt). Options that do not render (an invalid custom section name) leave the last prompt in
+    /// place; the run refuses them when it builds its prompt, where pi's `buildSystemPromptSections`
+    /// throws.
+    fn rerender_system_prompt(&self, ev: &mut HostEvent) {
+        if let HostEvent::BeforeAgentStart {
+            system_prompt,
+            options,
+            ..
+        } = ev
+            && options.is_object()
+            && let Ok(text) = self.render_system_prompt(options)
+        {
+            *system_prompt = text;
+        }
     }
 
     /// Wrap one guest call with the invocation budget. The `Extension` impl already contains panics
@@ -669,5 +844,15 @@ impl Dispatcher {
         self.inner
             .write()
             .map_err(|_| ExtError::Io("dispatcher lock poisoned".into()))
+    }
+}
+
+/// The boundary state of a `turn_end` / `agent_before_settle` event (EXT-078).
+fn boundary_of(ev: &mut HostEvent) -> Option<&mut crate::event::BoundaryState> {
+    match ev {
+        HostEvent::TurnEnd { boundary, .. } | HostEvent::AgentBeforeSettle { boundary } => {
+            Some(boundary)
+        }
+        _ => None,
     }
 }

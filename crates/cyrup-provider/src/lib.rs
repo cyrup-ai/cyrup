@@ -32,6 +32,7 @@ pub mod providers;
 pub mod remote_catalog;
 pub mod session_resources;
 pub mod stream;
+pub mod timing;
 pub mod unconfigured;
 pub mod usage;
 pub mod utils;

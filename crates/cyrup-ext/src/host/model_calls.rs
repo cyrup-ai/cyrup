@@ -378,7 +378,10 @@ pub fn dispatch(
     model: &cyrup_provider::Model,
     call: &ModelCall,
 ) -> EventStream<StreamEvent> {
-    match call.verb {
+    // Timed here as well as by any timer inside the provider (that one wins): a provider that does
+    // not time its own responses — a faux, local or extension provider — still answers with
+    // `durationMs`, as every pi `AssistantMessageEventStream` does (`utils/event-stream.ts` @v1.1.0).
+    cyrup_provider::timing::timed(match call.verb {
         ModelCallVerb::Stream => provider.stream(
             model,
             &call.context,
@@ -389,7 +392,7 @@ pub fn dispatch(
             &call.context,
             &call.options.simple_options(&call.cancel),
         ),
-    }
+    })
 }
 
 /// pi `complete`, for a caller that must not hang: [`settle`] runs on its OWN task, so the provider

@@ -55,6 +55,7 @@ fn answered(provider: &str, model: &str, api: &str) -> Message {
         raw_stop_reason: None,
         end_turn: None,
         timestamp: 0,
+        duration_ms: None,
     })
 }
 

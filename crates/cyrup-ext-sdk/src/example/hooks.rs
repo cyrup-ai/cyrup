@@ -173,7 +173,7 @@ pub(super) fn install(api: &mut ExtensionApi) {
     // per run, after every automatic retry / post-run compaction / queued continuation — unlike
     // `agent_start`/`agent_end` above, which fire once per agent loop. The distinct notification
     // text is what lets a host test prove the GUEST's handler ran across the WIT boundary.
-    api.on_agent_settled(|ctx| {
+    api.on_agent_settled(|_ev, ctx| {
         ctx.ui().notify("demo: agent settled");
         // EXT-087 — a send from an EVENT handler, which upstream allows from every handler
         // (`ctx.sendUserMessage` is `assertActive(); runtime.sendUserMessage(...)`,
@@ -280,6 +280,7 @@ pub(super) fn install(api: &mut ExtensionApi) {
                     json!({ "role": "user", "content": "injected by demo", "timestamp": 0 }),
                 ),
                 system_prompt: Some(format!("INJECTED:{}", ev.system_prompt)),
+                ..Default::default()
             })
         } else {
             Outcome::noop()

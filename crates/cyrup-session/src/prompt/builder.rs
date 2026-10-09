@@ -64,6 +64,14 @@ pub struct PromptInputs {
     pub prompt_guidelines: Vec<Arc<str>>,
     /// Append text: all append sources pre-joined in precedence order (R-06-004).
     pub append_system_prompt: Option<Arc<str>>,
+    /// Extension-supplied sections, keyed by tag name, in insertion order (pi
+    /// `BuildSystemPromptOptions.sections`, *"Additional XML-wrapped prompt sections keyed by tag
+    /// name"*, `system-prompt.ts:29-30` @v1.1.0; EXT-084). A section whose name is one the builder
+    /// already writes REPLACES that section where it stands; any other is appended after `cwd`;
+    /// an empty one is skipped. The name check (`^[a-z][a-z0-9_-]*$`, never `preamble`) is
+    /// [`super::SystemPromptOptions::validate`]'s, which the extension path runs before it gets
+    /// here; the builder skips a name that fails it rather than panic.
+    pub sections: Vec<(Arc<str>, Arc<str>)>,
     /// Working directory (footer + path normalization).
     pub cwd: PathBuf,
     /// Pre-loaded, trust-gated context files in final concat order (R-06-007/009).
@@ -85,6 +93,7 @@ impl Default for PromptInputs {
             tool_contributions: Vec::new(),
             prompt_guidelines: Vec::new(),
             append_system_prompt: None,
+            sections: Vec::new(),
             cwd: PathBuf::new(),
             context_files: Arc::from(Vec::new()),
             skills: Arc::from(Vec::new()),
@@ -184,13 +193,14 @@ impl SystemPromptBuilder {
     /// match a later update to it. The order is the order pi inserts them in, and it is observable —
     /// it is the order the model reads them in.
     ///
-    /// Not ported: the `sections` option (extension-supplied sections appended after `cwd`, and the
-    /// name check that rejects `preamble` and any name outside `^[a-z][a-z0-9_-]*$`,
-    /// `:136-140`/`:171-173`). Nothing in cyrup can set it — `before_agent_start` carries no options
-    /// bag to edit (`EXT-084`) — so it would be an input with no producer.
+    /// Extension-supplied sections ([`PromptInputs::sections`]) are applied last, as pi's
+    /// `for (const [name, content] of Object.entries(customSections)) if (content)
+    /// promptSections[name] = content;` (`system-prompt.ts:185-187` @v1.1.0): assigning an existing
+    /// key keeps its position in a JS object, so a custom `rules` replaces the built rules in place
+    /// and a new name lands after `cwd`.
     pub fn build_sections(&self, inp: &PromptInputs) -> Sections {
         let t = self.tmpl;
-        let mut parts: Vec<(&'static str, String)> = Vec::with_capacity(8);
+        let mut parts: Vec<(std::borrow::Cow<'static, str>, String)> = Vec::with_capacity(8);
 
         // SESS-059 — Pi gates the skills section on a tool that can READ a skill file being in the
         // effective set, `read` first, then `bash`. CODE-020 (`c30840c2e` @v1.0.4): the reader is
@@ -213,13 +223,13 @@ impl SystemPromptBuilder {
         match inp.custom_prompt.as_deref().filter(|c| !c.is_empty()) {
             // ── FULL REPLACEMENT of the preamble (R-06-003); `tools`, `rules` and `docs` are the
             // default prompt's and do not appear.
-            Some(custom) => parts.push((PREAMBLE, custom.to_owned())),
+            Some(custom) => parts.push((PREAMBLE.into(), custom.to_owned())),
             None => {
-                parts.push((PREAMBLE, t.identity.to_owned()));
-                parts.push(("tools", self.tools_section(inp)));
-                parts.push(("rules", self.rules_section(inp)));
+                parts.push((PREAMBLE.into(), t.identity.to_owned()));
+                parts.push(("tools".into(), self.tools_section(inp)));
+                parts.push(("rules".into(), self.rules_section(inp)));
                 if let Some(docs) = docs_section(t, &inp.docs) {
-                    parts.push(("docs", docs));
+                    parts.push(("docs".into(), docs));
                 }
             }
         }
@@ -231,12 +241,12 @@ impl SystemPromptBuilder {
             .as_deref()
             .filter(|a| !a.is_empty())
         {
-            parts.push(("addendum", a.to_owned()));
+            parts.push(("addendum".into(), a.to_owned()));
         }
         // 6. project context files (already trust-gated + ordered)
         if !inp.context_files.is_empty() {
             parts.push((
-                "project_context",
+                "project_context".into(),
                 project_context_text(t, &inp.context_files),
             ));
         }
@@ -244,10 +254,20 @@ impl SystemPromptBuilder {
         if let Some(tool) = skill_file_read_tool
             && let Some(skills) = skills_section_text(&inp.skills, tool)
         {
-            parts.push(("skills", skills));
+            parts.push(("skills".into(), skills));
         }
         // 8. cwd
-        parts.push(("cwd", normalize_slashes(&inp.cwd)));
+        parts.push(("cwd".into(), normalize_slashes(&inp.cwd)));
+        // 9. extension sections (EXT-084)
+        for (name, content) in &inp.sections {
+            if content.is_empty() || !super::options::is_valid_section_name(name) {
+                continue;
+            }
+            match parts.iter_mut().find(|(n, _)| **n == **name) {
+                Some(slot) => slot.1 = content.to_string(),
+                None => parts.push((name.to_string().into(), content.to_string())),
+            }
+        }
 
         parts
             .into_iter()

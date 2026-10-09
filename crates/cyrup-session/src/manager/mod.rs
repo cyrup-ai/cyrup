@@ -17,6 +17,7 @@
 
 mod accessors;
 mod append;
+mod boundary;
 mod branched_session;
 mod context;
 mod lifecycle;
@@ -25,6 +26,7 @@ mod navigate;
 mod tree;
 
 // The surface `lib.rs` re-exports (`pub use manager::{…}`) — same names, same paths.
+pub use boundary::SessionBoundaryDraft;
 pub use lifecycle::NewSessionOpts;
 pub use tree::TreeNode;
 

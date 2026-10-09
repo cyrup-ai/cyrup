@@ -156,7 +156,16 @@ pub struct AssistantMessage {
     /// everywhere else. It round-trips so a session file keeps the field pi's carries (DRIFT-059).
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub end_turn: Option<bool>,
+    /// Unix milliseconds when the request started (pi `timestamp`, `packages/ai/src/types.ts`
+    /// @v1.1.0: *"Unix timestamp in milliseconds when the request started."*).
     pub timestamp: i64,
+    /// Milliseconds from [`Self::timestamp`] until the response ended, measured with a monotonic
+    /// clock (pi `durationMs?: number`, declared after `timestamp`, `packages/ai/src/types.ts`
+    /// @v1.1.0). Set once, on the final message of a response its stream saw start — see
+    /// `cyrup_provider::api::EventSink` — and absent for legacy messages and for results that
+    /// started elsewhere.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub duration_ms: Option<u64>,
 }
 
 /// A durable provider token identifying an in-flight request that will be completed later (Pi
@@ -189,7 +198,7 @@ impl serde::Serialize for AssistantMessage {
     /// Self-tagging serializer: emits `role: "assistant"` FIRST (Pi's `AssistantMessage` literal
     /// always carries it, `ai/src/types.ts:384`), then Pi's exact field order — role, content, api,
     /// provider, model, responseModel?, responseId?, providerThinkingLevel?, diagnostics?, usage, stopReason, deferred?,
-    /// errorMessage?, rawStopReason?, endTurn?, timestamp (`v0.87.1 ai/src/types.ts:515-536`, read field
+    /// errorMessage?, rawStopReason?, endTurn?, timestamp, durationMs? (`v0.87.1 ai/src/types.ts:515-536`, read field
     /// for field). So every wire-serialized assistant turn — and every `StreamEvent` `partial`/
     /// `done.message`/`error.error` that embeds one — is byte-1:1 with Pi. Verified against captured
     /// Pi bytes (`text-turn.pi-captured` `start` partial begins `{"role":"assistant","content":[],
@@ -208,7 +217,8 @@ impl serde::Serialize for AssistantMessage {
             + usize::from(self.deferred.is_some())
             + usize::from(self.error_message.is_some())
             + usize::from(self.raw_stop_reason.is_some())
-            + usize::from(self.end_turn.is_some());
+            + usize::from(self.end_turn.is_some())
+            + usize::from(self.duration_ms.is_some());
         let mut st = serializer.serialize_struct("AssistantMessage", len)?;
         st.serialize_field("role", "assistant")?;
         st.serialize_field("content", &self.content)?;
@@ -254,6 +264,12 @@ impl serde::Serialize for AssistantMessage {
             None => st.skip_field("endTurn")?,
         }
         st.serialize_field("timestamp", &self.timestamp)?;
+        // After `timestamp`: pi's event stream assigns it to the settled message, so it lands after
+        // every key the api implementation wrote (`utils/event-stream.ts` @v1.1.0, `#time`).
+        match &self.duration_ms {
+            Some(v) => st.serialize_field("durationMs", v)?,
+            None => st.skip_field("durationMs")?,
+        }
         st.end()
     }
 }
@@ -297,6 +313,7 @@ impl AssistantMessage {
             raw_stop_reason: None,
             end_turn: None,
             timestamp: 0,
+            duration_ms: None,
         }
     }
 
@@ -332,6 +349,7 @@ mod tests {
             raw_stop_reason: None,
             end_turn: None,
             timestamp: 0,
+            duration_ms: None,
         });
         let v = serde_json::to_value(&m).expect("serialize");
         assert_eq!(v["role"], "assistant");
@@ -360,6 +378,7 @@ mod tests {
             raw_stop_reason: None,
             end_turn: None,
             timestamp: 0,
+            duration_ms: None,
         };
         // Standalone (as embedded in `StreamEvent.partial`): role:"assistant" FIRST, Pi field order.
         let s = serde_json::to_string(&m).expect("serialize");
@@ -399,6 +418,30 @@ mod tests {
             wrapped.starts_with(r#"{"role":"assistant","content":"#),
             "{wrapped}"
         );
+    }
+
+    /// pi v1.1.0 times a response and writes `durationMs` onto the settled message after every key
+    /// the api implementation wrote, so it follows `timestamp` (`utils/event-stream.ts` `#time`,
+    /// commit 36a686ee8). Absent when `None`, so a legacy line re-exports unchanged.
+    #[test]
+    fn duration_ms_follows_timestamp_and_is_absent_when_unset() {
+        let pi = concat!(
+            r#"{"role":"assistant","content":[],"api":"faux","provider":"faux","model":"faux-1","#,
+            r#""usage":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"totalTokens":0,"#,
+            r#""cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},"#,
+            r#""stopReason":"stop","timestamp":1700000000000,"durationMs":1834}"#
+        );
+        let m: AssistantMessage = serde_json::from_str(pi).expect("pi's line parses");
+        assert_eq!(m.duration_ms, Some(1834));
+        assert_eq!(serde_json::to_string(&m).expect("serialize"), pi);
+
+        let legacy = AssistantMessage {
+            duration_ms: None,
+            ..m
+        };
+        let bytes = serde_json::to_string(&legacy).expect("serialize");
+        assert!(!bytes.contains("durationMs"), "{bytes}");
+        assert!(bytes.ends_with(r#""timestamp":1700000000000}"#), "{bytes}");
     }
 
     #[test]

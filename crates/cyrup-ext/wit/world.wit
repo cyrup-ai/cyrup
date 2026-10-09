@@ -1,11 +1,11 @@
-// cyrup:ext@0.18.0 — the versioned WIT world (arch-08 §4.1).
+// cyrup:ext@0.19.0 — the versioned WIT world (arch-08 §4.1).
 //
 // Single source of truth, shared verbatim by the host (`wasmtime::component::bindgen!`)
 // and the guest (`wit-bindgen` in cyrup-ext-sdk). Open-shaped values (tool params, message
 // lists, patches, custom payloads) cross as `string` carrying serde_json; fixed-shape control
 // values (ids, enums, exec results) are real WIT records for type safety (arch-08 §4.1).
 //
-// The `events` interface exports 39 `on-*` hooks. THIRTY-THREE of them mirror pi's `pi.on(...)`
+// The `events` interface exports 41 `on-*` hooks. THIRTY-THREE of them mirror pi's `pi.on(...)`
 // catalog one-for-one (`extensions/types.ts:1190-1231` @v0.83.0 — 33 `on(event: "…")` overloads,
 // hand re-derived; the range `:1198-1239` this header used to cite corresponds to NO upstream
 // version and was fabricated, EXT-036). `before_provider_headers` (EXT-009, upstream `:1212`) and
@@ -27,7 +27,11 @@
 // `core/cache-warmer.ts:112-115` @v1.0.4 and is pulled into the `ExtensionEvent` union in
 // `core/extensions/types.ts` @v1.0.4, with its `on(event: …)` overload at `:1589-1591` — so it is
 // absent from the overload band this header counts and has to be added by hand. That makes it
-// 39 `on-*` exports against 37 pi events at v1.0.4.
+// 39 `on-*` exports against 37 pi events at v1.0.4. The 40th, `on-session-compact-failed`
+// (SESS-050), mirrors pi's `session_compact_failed` (v0.84.2; `core/extensions/types.ts:795-807`
+// @v1.1.0), which the overload band does carry. The 41st, `on-agent-before-settle` (EXT-078),
+// mirrors pi's `agent_before_settle` (v0.87.0; `core/extensions/types.ts:999-1002` @v1.1.0): 41
+// `on-*` exports against 39 pi events.
 // The host calls only the exports a guest subscribed to (the subscription gate, R-08-034).
 //
 // VERSIONING (EXT-028): this package version and `cyrup_ext::HOST_WORLD` move TOGETHER, and ANY
@@ -171,7 +175,21 @@
 // value. A guest built against THIS file and loaded on a host from before it is accepted by
 // `check_world` and fails on the missing import — the documented limit of the gate, which no bump
 // could change.
-package cyrup:ext@0.18.0;
+//
+// 0.18 -> 0.19 is the pi v1.1.0 event batch, an EXPORT RE-SIGNING:
+// `events.on-tool-execution-end` gained `duration-ms: option<u64>` between `is-error` and
+// `parent-tool-call-id` — pi `ToolExecutionEndEvent.durationMs?`, how long the tool's `execute()`
+// took, `none` when it did not run (`core/extensions/types.ts` @v1.1.0, commit 36a686ee8; the key
+// sits where pi's object puts it). A 0.18 guest exports the shorter signature and would fail to
+// LINK against this host, so it takes the bump (the 0.14 -> 0.15 `parent-tool-call-id` precedent).
+// `events.on-agent-settled` gained `aborted: bool` in the same batch — pi `AgentSettledEvent.aborted`,
+// whether the run ended because it was aborted (`core/extensions/types.ts:1005-1009` @v1.1.0).
+// `events.on-session-compact-failed` is NEW in the same batch (an EXPORT ADDITION, SESS-050): pi
+// `SessionCompactFailedEvent`, `core/extensions/types.ts:795-807` @v1.1.0. `events.on-turn-end` is
+// RE-SIGNED to pi's boundary event (it returns a `hook-outcome` and gains `message-entry-id`,
+// `tool-result-entry-ids-json` and `boundary-json`) and `events.on-agent-before-settle` is new
+// (EXT-078; pi `TurnEndEvent` / `AgentBeforeSettleEvent`, `core/extensions/types.ts:987-1044`).
+package cyrup:ext@0.19.0;
 
 // ---------------------------------------------------------------------------
 // Serializable mirrors of cyrup-core. JSON-as-string at the seam (arch-08 §4.1).
@@ -591,6 +609,19 @@ interface events {
   on-message-end:        func(message-json: string) -> hook-outcome;
   on-before-agent-start: func(prompt: string, images-json: string, system-prompt: string, options-json: string) -> hook-outcome;
 
+  // turn_end + agent_before_settle [boundary] (pi `TurnEndEvent` / `AgentBeforeSettleEvent`, both
+  // `extends BoundaryState`, `core/extensions/types.ts:987-1044` @v1.1.0; EXT-078). `turn_end` was
+  // notify-only before pi v0.87.0. `boundary-json` is pi's `BoundaryState`: `{entries, continue,
+  // context, outcome}` — the boundary drafts the handlers so far left (`SessionBoundaryDraft[]`),
+  // whether one more provider request is wanted, the model context as it would be with those
+  // drafts appended (`BoundaryContextPreview`), and the run's outcome (`"completed" | "aborted" |
+  // "error"`). A handler answers `noop`, or `mutate` with pi's `BoundaryResult`
+  // `{entries?, continue?}`: `entries` replaces the drafts and `continue` the request. `turn_end`
+  // also carries the turn index, the finalized assistant `message`, the turn's tool results, and
+  // the ids of the entries those were persisted as (`messageEntryId`, `toolResultEntryIds`).
+  on-turn-end: func(turn-index: u32, message-json: string, tool-results-json: string, message-entry-id: string, tool-result-entry-ids-json: string, boundary-json: string) -> hook-outcome;
+  on-agent-before-settle: func(boundary-json: string) -> hook-outcome;
+
   // input [block/mutate/handled] (subscribed at types.ts:1231 @v0.83.0), user_bash
   // [block/mutate/handled] (:1230). EXT-073: `:1158`/`:1159` land on the Command Registration banner.
   // `input` carries the full pi `InputEvent` (types.ts:831-841 @v0.83.0): the submission `text`, the attached
@@ -635,12 +666,10 @@ interface events {
   // follow. Distinct from on-agent-end, which fires once per agent.prompt/agent.continue: a run that
   // auto-retries delivers TWO on-agent-end calls and exactly ONE on-agent-settled. Pi emits it from
   // the `finally` of _runAgentPrompt (agent-session.ts:1063-1072), to the extension runner FIRST and
-  // the session subscribers second.
-  on-agent-settled:         func();
+  // the session subscribers second. `aborted` (pi v1.1.0 `AgentSettledEvent.aborted`,
+  // `core/extensions/types.ts:1005-1009`): whether the run ended because it was aborted (0.18 -> 0.19).
+  on-agent-settled:         func(aborted: bool);
   on-turn-start:            func(turn-index: u32, timestamp: u64);
-  // turn_end (pi `TurnEndEvent`, types.ts:735-740 @v0.83.0): the turn index, the finalized assistant `message`,
-  // AND the `tool-results` produced this turn (`ToolResultMessage[]`).
-  on-turn-end:              func(turn-index: u32, message-json: string, tool-results-json: string);
   // message_start (pi `MessageStartEvent`, types.ts:743-746 @v0.83.0): the full `message` (user|assistant|
   // toolResult), not just its role.
   on-message-start:         func(message-json: string);
@@ -659,8 +688,9 @@ interface events {
   // AND `args`, forcing every observer to keep its own callId->name map (EXT-014).
   on-tool-execution-update: func(call-id: string, name: string, args-json: string, chunk-json: string, parent-tool-call-id: option<string>); // HIGH-FREQ, gated
   // tool_execution_end (pi `ToolExecutionEndEvent`, extensions/types.ts:779-785 @v0.83.0):
-  // `{type, toolCallId, toolName, result, isError}`.
-  on-tool-execution-end:    func(call-id: string, name: string, result-json: string, is-error: bool, parent-tool-call-id: option<string>);
+  // `{type, toolCallId, toolName, result, isError}`, and since v1.1.0 `durationMs?` — the
+  // milliseconds `execute()` took, `none` when the tool did not run (0.18 -> 0.19).
+  on-tool-execution-end:    func(call-id: string, name: string, result-json: string, is-error: bool, duration-ms: option<u64>, parent-tool-call-id: option<string>);
 
   // --- 5.1/5.2 startup & session lifecycle ---
   // session_start (pi `SessionStartEvent`, extensions/types.ts:562-569 @v0.83.0): the `reason`
@@ -741,6 +771,12 @@ interface events {
   // `summary` field carries the summary text), whether an extension drove it (`from-extension`), the
   // trigger `reason`, and `will-retry`.
   on-session-compact:        func(compaction-entry-json: string, from-extension: bool, reason: string, will-retry: bool);
+  // session_compact_failed (pi `SessionCompactFailedEvent`, `core/extensions/types.ts:795-807`
+  // @v1.1.0, added v0.84.2; SESS-050): a compaction that started ended without a result. Pi pairs
+  // it with every failing `compaction_end` (`_emitSessionCompactFailed`,
+  // `core/agent-session.ts:1053-1057`). `reason` is "manual" | "threshold" | "overflow";
+  // `error-message` is `none` for a cancel or an abort (0.18 -> 0.19).
+  on-session-compact-failed: func(reason: string, error-message: option<string>, aborted: bool, will-retry: bool, from-extension: bool);
   // session_before_tree (pi `SessionBeforeTreeEvent`, extensions/types.ts:639-643 @v0.83.0 — the
   // value the CYRUP-DELTA below already cites; EXT-072: `:623-628` lands on `TreePreparation`, a
   // different type): the computed `preparation`
@@ -1476,6 +1512,22 @@ interface ctx-state {
   // empty object: `() => ({ cwd: this.cwd })` (`core/extensions/runner.ts:287`, re-bound at `:350`
   // @v0.83.0). A bag carrying only `cwd` is therefore a valid answer, not a broken one.
   get-system-prompt-options: func() -> result<string, string>;
+  // pi `buildSystemPrompt(options)` (`core/system-prompt.ts:199-210` @v1.1.0) over a
+  // `systemPromptOptions` object (EXT-084): the prompt those options render to — the forced prompt
+  // when `forceSystemPrompt` is set, otherwise the structured sections. pi's `before_agent_start`
+  // event exposes `systemPrompt` as a getter over the options every handler edits
+  // (`core/extensions/runner.ts:1426-1448`), so a guest that folds several handlers re-renders the
+  // prompt after each edit through this. The options are normalized first, as pi normalizes them
+  // before any handler sees them. Pure: no capability gates it. A refusal carries pi's text
+  // (`Invalid system prompt section name: <name>`) or why the value is not an options object.
+  render-system-prompt: func(options-json: string) -> result<string, string>;
+  // pi `_buildBoundaryContext(entries, boundary)` (`core/agent-session.ts:999-1022` @v1.1.0;
+  // EXT-078): the `BoundaryContextPreview` JSON for `entries-json` (a `SessionBoundaryDraft[]`)
+  // appended to an in-memory copy of the session at a `turn_end` or `agent_before_settle`
+  // boundary (`boundary` is the event name). A guest that folds several boundary handlers
+  // rebuilds the preview after each one through this, as pi's `emitBoundary` does. A refusal
+  // carries why the drafts could not be applied (pi's `Invalid boundary entries` cause).
+  preview-boundary: func(boundary: string, entries-json: string) -> result<string, string>;
   // pi `ctx.cwd: string` (extensions/types.ts:315 @v0.83.0) — on the BASE `ExtensionContext`, in
   // the same block as `mode` (:311) and `hasUI` (:313), so it is available to every handler and
   // every tool `execute`, not just command handlers. Without it a guest can resolve no relative

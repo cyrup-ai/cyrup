@@ -331,6 +331,7 @@ pub fn default_convert_to_llm(msgs: &[Arc<AgentMessage>]) -> Vec<Message> {
             }),
             AgentMessage::Assistant(a) => Some(Message::Assistant((**a).clone())),
             AgentMessage::ToolResult(t) => Some(Message::ToolResult {
+                duration_ms: t.duration_ms,
                 tool_call_id: t.tool_call_id.clone(),
                 tool_name: t.tool_name.clone(),
                 content: t.content.clone(),

@@ -23,6 +23,7 @@ pub mod builder;
 pub mod cache;
 pub mod context_files;
 pub mod hook;
+pub mod options;
 pub mod overrides;
 pub mod sections;
 pub mod skills_inject;
@@ -35,6 +36,9 @@ pub use context_files::{
 };
 pub use hook::{
     BeforeAgentStartHook, BeforeAgentStartInput, BeforeAgentStartOutput, apply_before_agent_start,
+};
+pub use options::{
+    InvalidSectionName, PromptContextFile, PromptSkill, SystemPromptOptions, is_valid_section_name,
 };
 pub use overrides::ResolvedOverride;
 pub use sections::{PREAMBLE, diff_system_prompt_sections, render_sections};

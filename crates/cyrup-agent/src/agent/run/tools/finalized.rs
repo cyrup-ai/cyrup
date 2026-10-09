@@ -50,6 +50,9 @@ pub struct ToolCallOutcome {
     /// `true` for every failure class: unknown tool, validation failure, blocked call, thrown
     /// tool, failing `after_tool_call` (pi `isError`, `types.ts:452`).
     pub is_error: bool,
+    /// Milliseconds `execute()` took, measured with a monotonic clock; `None` when the tool did not
+    /// run (pi `durationMs?`, `packages/agent/src/types.ts` @v1.1.0).
+    pub duration_ms: Option<u64>,
 }
 
 impl ToolCallOutcome {
@@ -68,11 +71,16 @@ impl ToolCallOutcome {
             self.result.structured_content.as_ref(),
             self.result.is_error,
         );
-        serde_json::json!({
+        let mut wire = serde_json::json!({
             "toolCall": serde_json::to_value(&self.tool_call).unwrap_or(Value::Null),
             "result": result,
             "isError": self.is_error,
-        })
+        });
+        // pi's `finalizeExecutedToolCall` adds the key last, and only for a call that ran.
+        if let (Some(ms), Some(object)) = (self.duration_ms, wire.as_object_mut()) {
+            object.insert("durationMs".to_string(), Value::from(ms));
+        }
+        wire
     }
 }
 
@@ -131,6 +139,7 @@ impl Finalized {
         ToolCallOutcome {
             // The NORMALISED verdict — pi's `isError` local, not `result.isError` (`:898-902`).
             is_error: message.is_error,
+            duration_ms: message.duration_ms,
             result: ToolResult {
                 content: message.content,
                 details: message.details,
@@ -160,6 +169,7 @@ impl Finalized {
             tool_name: self.message.tool_name.clone(),
             result: self.result_value.clone(),
             is_error: self.message.is_error,
+            duration_ms: self.message.duration_ms,
         }
     }
 

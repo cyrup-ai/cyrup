@@ -82,7 +82,7 @@ impl NativeExtension for SettledSubmitter {
     }
 
     async fn on_event(&self, ev: &HostEvent, _ctx: &HostCtx) -> HookOutcome {
-        if !matches!(ev, HostEvent::AgentSettled) {
+        if !matches!(ev, HostEvent::AgentSettled { .. }) {
             return HookOutcome::Noop;
         }
         if self.settled.fetch_add(1, Ordering::SeqCst) != 0 {

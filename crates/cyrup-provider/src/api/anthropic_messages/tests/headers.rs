@@ -230,6 +230,7 @@ fn copilot_uses_bearer_and_dynamic_headers_not_x_api_key() {
     // An agent-loop follow-up (last turn is a toolResult carrying an image) flips both.
     let mut agent_ctx = ctx.clone();
     agent_ctx.messages.push(Message::ToolResult {
+        duration_ms: None,
         tool_call_id: cyrup_core::ToolCallId::from("call_1"),
         tool_name: "screenshot".to_string(),
         content: vec![Content::Image {

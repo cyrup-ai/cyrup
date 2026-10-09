@@ -64,6 +64,7 @@ fn start_edit(app: &mut App<TestBackend>, call_id: &str, args: serde_json::Value
 
 fn end_edit(app: &mut App<TestBackend>, call_id: &str, is_error: bool, result: serde_json::Value) {
     app.ingest_event(&AgentSessionEvent::ToolExecutionEnd {
+        duration_ms: None,
         tool_call_id: ToolCallId::from(call_id),
         tool_name: "edit".to_string(),
         result,

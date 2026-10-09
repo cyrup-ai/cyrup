@@ -100,17 +100,16 @@ impl AgentSession {
                     .await;
             }
             if *Self::lock(&self.overflow_recovery_attempted) {
-                self.fanout_emit(AgentSessionEvent::CompactionEnd {
-                    reason: CompactionReason::Overflow,
-                    result: None,
-                    aborted: false,
-                    will_retry: false,
-                    error_message: Some(
+                self.emit_compaction_failure(
+                    CompactionReason::Overflow,
+                    false,
+                    Some(
                         "Context overflow recovery failed after one compact-and-retry attempt. \
                          Try reducing context or switching to a larger-context model."
                             .to_string(),
                     ),
-                })
+                    false,
+                )
                 .await;
                 return Ok(false);
             }
@@ -263,6 +262,31 @@ impl AgentSession {
         if Self::lock(&self.compaction_model).is_none() {
             return Ok(false);
         }
+        // Compute the REAL preparation BEFORE the extension hook (L4 gap #5) — the ONLY
+        // preparation. [`Compactor::prepare`]'s body is inlined for the same reason as in
+        // [`Self::compact`]: the `Compactor`'s summarizer needs the routed model, and the route is
+        // not taken until after the hook. `prepare` is `Compactor::cache`'s only reader and the
+        // `Compactor` is built fresh per compaction, so the empty cache passed here is the one it
+        // always had.
+        //
+        // SESS-050 — and BEFORE `compaction_start`, as pi orders it: `const preparation =
+        // prepareCompaction(...); if (!preparation) { return false; }`, and only then the abort
+        // controller, `started = true` and the `compaction_start` emit (`_runAutoCompaction`,
+        // `agent-session.ts:3110-3119` @v1.1.0). A branch with nothing to compact is no
+        // compaction at all — no start, no end, and so no `session_compact_failed`, which pi emits
+        // only `if (started)` (`:3215`). cyrup used to open with the start and close it with an
+        // empty `compaction_end`.
+        let token_cache = cyrup_session::compaction::TokenCache::default();
+        let prepared = {
+            let guard = self.manager.lock().await;
+            let path: Vec<cyrup_session::entry::Entry> =
+                guard.branch_path(None).into_iter().cloned().collect();
+            cyrup_session::compaction::prepare_compaction(&path, &token_cache, &settings)
+                .map(|prep| (prep, path))
+        };
+        let Some((prep, branch_entries)) = prepared else {
+            return Ok(false);
+        };
         let cancel = self.session_cancel.child_token();
         // Same guard as the manual path — an auto compaction runs on the spawned `drive_run` task,
         // but `check_compaction` is also awaited from `prepare` on the CALLER's future
@@ -271,37 +295,6 @@ impl AgentSession {
             CompactionCancelGuard::install(self, &self.auto_compaction_cancel, cancel.clone());
         self.fanout_emit(AgentSessionEvent::CompactionStart { reason })
             .await;
-
-        // Compute the REAL preparation BEFORE the extension hook (L4 gap #5) — the ONLY
-        // preparation. [`Compactor::prepare`]'s body is inlined for the same reason as in
-        // [`Self::compact`]: the `Compactor`'s summarizer needs the routed model, and the route is
-        // not taken until after the hook. `prepare` is `Compactor::cache`'s only reader and the
-        // `Compactor` is built fresh per compaction, so the empty cache passed here is the one it
-        // always had.
-        let token_cache = cyrup_session::compaction::TokenCache::default();
-        let (prep, branch_entries) = {
-            let guard = self.manager.lock().await;
-            let path: Vec<cyrup_session::entry::Entry> =
-                guard.branch_path(None).into_iter().cloned().collect();
-            match cyrup_session::compaction::prepare_compaction(&path, &token_cache, &settings)
-                .map(|prep| (prep, path))
-            {
-                Some(x) => x,
-                None => {
-                    drop(guard);
-                    cancel_slot.clear();
-                    self.fanout_emit(AgentSessionEvent::CompactionEnd {
-                        reason,
-                        result: None,
-                        aborted: false,
-                        will_retry: false,
-                        error_message: None,
-                    })
-                    .await;
-                    return Ok(false);
-                }
-            }
-        };
 
         // session_before_compact ext hook: veto OR compaction override, against the real preparation
         // (agent-session.ts:1980-1990).
@@ -312,14 +305,8 @@ impl AgentSession {
             BeforeCompactOutcome::Cancel => {
                 cancel_slot.clear();
                 // Pi agent-session.ts:1984-1990: a cancelling handler emits aborted:true, willRetry:false.
-                self.fanout_emit(AgentSessionEvent::CompactionEnd {
-                    reason,
-                    result: None,
-                    aborted: true,
-                    will_retry: false,
-                    error_message: None,
-                })
-                .await;
+                self.emit_compaction_failure(reason, true, None, false)
+                    .await;
                 return Ok(false);
             }
             BeforeCompactOutcome::Proceed(ov) => ov,
@@ -336,9 +323,16 @@ impl AgentSession {
         // `[CYRUP-DELTA]` placement of the FAILURE, unchanged in kind by this move but now
         // narrower: a routing failure escapes after `compaction_start` was emitted, so it goes
         // through the reason-tagged `compaction_end` below rather than out of the function bare.
-        let (model, summary_level) = if external_override.is_some() {
+        // pi `fromExtension = true` once a handler supplies `result.compaction` (`:3139-3142`).
+        let from_extension = external_override.is_some();
+        let (model, summary_level) = if from_extension {
+            // A selection cleared since the check above: the compaction started, so it ends the way
+            // the `Ok(None)` arm below ends one, with its `compaction_end` and
+            // `session_compact_failed`, rather than leaving the `compaction_start` open.
             let Some(selected) = Self::lock(&self.compaction_model).clone() else {
                 cancel_slot.clear();
+                self.emit_compaction_failure(reason, false, None, from_extension)
+                    .await;
                 return Ok(false);
             };
             (selected, self.thinking_level().await)
@@ -348,14 +342,8 @@ impl AgentSession {
                 // A selection cleared since the check above: pi's `if (!model) return false`.
                 Ok(None) => {
                     cancel_slot.clear();
-                    self.fanout_emit(AgentSessionEvent::CompactionEnd {
-                        reason,
-                        result: None,
-                        aborted: false,
-                        will_retry: false,
-                        error_message: None,
-                    })
-                    .await;
+                    self.emit_compaction_failure(reason, false, None, false)
+                        .await;
                     return Ok(false);
                 }
                 Err(err) => {
@@ -365,14 +353,8 @@ impl AgentSession {
                     } else {
                         Some(format!("Auto-compaction failed: {err}"))
                     };
-                    self.fanout_emit(AgentSessionEvent::CompactionEnd {
-                        reason,
-                        result: None,
-                        aborted: false,
-                        will_retry: false,
-                        error_message,
-                    })
-                    .await;
+                    self.emit_compaction_failure(reason, false, error_message, false)
+                        .await;
                     return Ok(false);
                 }
             }
@@ -551,14 +533,8 @@ impl AgentSession {
             }
             Ok(None) => {
                 cancel_slot.clear();
-                self.fanout_emit(AgentSessionEvent::CompactionEnd {
-                    reason,
-                    result: None,
-                    aborted: false,
-                    will_retry: false,
-                    error_message: None,
-                })
-                .await;
+                self.emit_compaction_failure(reason, false, None, from_extension)
+                    .await;
                 Ok(false)
             }
             Err(e) => {
@@ -573,14 +549,8 @@ impl AgentSession {
                 } else {
                     Some(format!("Auto-compaction failed: {e}"))
                 };
-                self.fanout_emit(AgentSessionEvent::CompactionEnd {
-                    reason,
-                    result: None,
-                    aborted,
-                    will_retry: false,
-                    error_message,
-                })
-                .await;
+                self.emit_compaction_failure(reason, aborted, error_message, from_extension)
+                    .await;
                 // Pi's `catch` ends in `return false` for an abort and a failure alike
                 // (`agent-session.ts:2873-2896` @v0.87.1): a failed summary is reported through
                 // `compaction_end.errorMessage` and never thrown, so neither the pre-prompt check

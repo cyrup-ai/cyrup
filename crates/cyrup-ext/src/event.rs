@@ -79,6 +79,17 @@ pub enum EventKind {
     /// whose rule is NOT this file's other result-bearing event's: every handler of every
     /// extension runs and the LAST one that returns an `action` wins. EXT-085.
     CacheWarmingDecision = 36,
+    /// `session_compact_failed` (pi `SessionCompactFailedEvent`, `core/extensions/types.ts:795-807`
+    /// @v1.1.0; added v0.84.2). Notify-only: a compaction that STARTED ended without a result —
+    /// failed, cancelled by an extension, or aborted. Pi pairs it with every failing
+    /// `compaction_end` (`_emitSessionCompactFailed`, `agent-session.ts:1053-1057`). SESS-050.
+    SessionCompactFailed = 37,
+    /// `agent_before_settle` (pi `AgentBeforeSettleEvent`, `core/extensions/types.ts:999-1002`
+    /// @v1.1.0; added v0.87.0): *"Fired before final settlement. May append entries and ensure one
+    /// next provider request."* A BOUNDARY event, like `turn_end`: handlers return a
+    /// [`BoundaryState`] edit (`{entries?, continue?}`), folded by `emitBoundary`
+    /// (`core/extensions/runner.ts:1029-1080`). EXT-078.
+    AgentBeforeSettle = 38,
 }
 
 impl EventKind {
@@ -102,7 +113,10 @@ impl EventKind {
     /// `core/extensions/types.ts` @v1.0.4, with its `on(event: "cache_warming_decision")` overload at
     /// `:1589-1591` — so a name-set difference computed from the overload block alone still comes
     /// out empty in both directions.
-    pub const COUNT: u8 = 37;
+    ///
+    /// **39 against pi v1.1.0**: `session_compact_failed` is kind 37 (SESS-050) and
+    /// `agent_before_settle` kind 38 (EXT-078).
+    pub const COUNT: u8 = 39;
 
     /// Parse the `u8` a guest passes via `subscribe(event-kinds)`.
     pub fn from_u8(v: u8) -> Option<EventKind> {
@@ -145,6 +159,8 @@ impl EventKind {
             34 => UiPromptEnd,
             35 => ContextWithSystem,
             36 => CacheWarmingDecision,
+            37 => SessionCompactFailed,
+            38 => AgentBeforeSettle,
             _ => return None,
         })
     }
@@ -191,6 +207,8 @@ impl EventKind {
             UiPromptEnd => "ui_prompt_end",
             ContextWithSystem => "context_with_system",
             CacheWarmingDecision => "cache_warming_decision",
+            SessionCompactFailed => "session_compact_failed",
+            AgentBeforeSettle => "agent_before_settle",
         }
     }
 
@@ -337,6 +355,34 @@ pub enum InputStreamingBehavior {
     FollowUp,
 }
 
+/// pi `BoundaryState` (`core/extensions/types.ts:987-992` @v1.1.0), the part of a `turn_end` /
+/// `agent_before_settle` event the handler chain folds (EXT-078):
+///
+/// - `entries` — the `SessionBoundaryDraft[]` the handlers so far left, as pi's JSON;
+/// - `continue` — whether one more provider request is wanted;
+/// - `context` — pi `BoundaryContextPreview` (`{contextEntries, contextMessages, llmMessages,
+///   pendingMessages, canContinue}`): the model context as it would be with `entries` appended,
+///   rebuilt after every handler;
+/// - `outcome` — pi `AgentActivityOutcome`: `"completed" | "aborted" | "error"`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BoundaryState {
+    pub entries: Value,
+    pub continue_: bool,
+    pub context: Value,
+    pub outcome: String,
+}
+
+impl Default for BoundaryState {
+    fn default() -> Self {
+        Self {
+            entries: Value::Array(Vec::new()),
+            continue_: false,
+            context: Value::Null,
+            outcome: "completed".to_string(),
+        }
+    }
+}
+
 /// The host event (host -> guest). One arm per func-08 §5 event; payload = minimum-spec record.
 /// Open-shaped fields carry `serde_json::Value`; fixed-shape ids/roles are typed (arch-08 §3.4).
 #[derive(Clone, Debug)]
@@ -408,10 +454,23 @@ pub enum HostEvent {
         turn_index: u32,
         timestamp: u64,
     },
+    /// `turn_end` (pi `TurnEndEvent extends BoundaryState`, `core/extensions/types.ts:1036-1044`
+    /// @v1.1.0): the turn, the ids of the entries its assistant message and tool results were
+    /// persisted as, and the [`BoundaryState`] the handlers fold. EXT-078.
     TurnEnd {
         turn_index: u32,
         message: AgentMessage,
         tool_results: Vec<ToolResultMessage>,
+        /// pi `messageEntryId`: the persisted assistant entry's id. Empty when the turn was not
+        /// dispatched through a session (no file to name).
+        message_entry_id: String,
+        /// pi `toolResultEntryIds`, in result order, for the results that were persisted.
+        tool_result_entry_ids: Vec<String>,
+        boundary: BoundaryState,
+    },
+    /// `agent_before_settle` (pi `AgentBeforeSettleEvent extends BoundaryState`). EXT-078.
+    AgentBeforeSettle {
+        boundary: BoundaryState,
     },
     /// `message_start` (Pi `MessageStartEvent`, types.ts:711-715): the full message (user|assistant|
     /// toolResult), serialized — not just its role.
@@ -441,12 +500,15 @@ pub enum HostEvent {
         chunk: Value,
     },
     /// `tool_execution_end` (pi `ToolExecutionEndEvent`, extensions/types.ts:779-785 @v0.83.0):
-    /// `{type, toolCallId, toolName, result, isError}` (EXT-014).
+    /// `{type, toolCallId, toolName, result, isError}` (EXT-014), plus `durationMs?` since v1.1.0.
     ToolExecEnd {
         call_id: ToolCallId,
         name: String,
         result: Value,
         is_error: bool,
+        /// Milliseconds `execute()` took, measured with a monotonic clock; `None` when the tool did
+        /// not run (pi `ToolExecutionEndEvent.durationMs?`, `extensions/types.ts` @v1.1.0).
+        duration_ms: Option<u64>,
     },
     // 5.1/5.2 startup & session
     /// `session_start` (pi `SessionStartEvent`, extensions/types.ts:562-569 @v0.83.0): `reason`
@@ -601,6 +663,19 @@ pub enum HostEvent {
         reason: String,
         will_retry: bool,
     },
+    /// `session_compact_failed` (pi `SessionCompactFailedEvent`, `core/extensions/types.ts:795-807`
+    /// @v1.1.0): the trigger `reason` (`"manual"|"threshold"|"overflow"`); `errorMessage` *"when
+    /// compaction failed for a non-abort reason"*; `aborted` *"when compaction was cancelled or
+    /// aborted"*; `willRetry` *"when the aborted turn would have been retried after this
+    /// compaction"*; `fromExtension` *"when the failing compaction content came from a
+    /// session_before_compact handler"*. SESS-050.
+    SessionCompactFailed {
+        reason: String,
+        error_message: Option<String>,
+        aborted: bool,
+        will_retry: bool,
+        from_extension: bool,
+    },
     /// `session_before_tree` (Pi `SessionBeforeTreeEvent`, types.ts:623-628): the computed
     /// `preparation` (`TreePreparation`). A handler may veto (`block`) or return a
     /// summary/customInstructions/label override via `mutate` (folded into `override_result`).
@@ -612,15 +687,19 @@ pub enum HostEvent {
     SessionTree {
         tree: Value,
     },
-    /// `agent_settled` (Pi `AgentSettledEvent`, extensions/types.ts:721-725) — a payload-free
-    /// notification that the whole run, including every automatic continuation, has settled.
+    /// `agent_settled` (Pi `AgentSettledEvent`, extensions/types.ts:721-725) — the notification that
+    /// the whole run, including every automatic continuation, has settled. Since pi v1.1.0 it
+    /// carries `aborted` (`core/extensions/types.ts:1005-1009`): *"Whether the run ended because it
+    /// was aborted, for example with Escape."*
     ///
     /// Deliberately absent from [`HostEvent::from_agent`]: it has NO `AgentEvent` source. It is
     /// SYNTHESISED by `cyrup-session-svc` at the post-run driver's tail (the point that corresponds
     /// to Pi's `_runAgentPrompt` `finally`), which is the only place that knows the retry /
     /// compaction / queued-continuation loop is done. Routing it through the `ExtSubscriber` seam
     /// would fire it once per `agent_end` instead of once per run.
-    AgentSettled,
+    AgentSettled {
+        aborted: bool,
+    },
 }
 
 impl HostEvent {
@@ -660,9 +739,11 @@ impl HostEvent {
             HostEvent::SessionBeforeFork { .. } => K::SessionBeforeFork,
             HostEvent::SessionBeforeCompact { .. } => K::SessionBeforeCompact,
             HostEvent::SessionCompact { .. } => K::SessionCompact,
+            HostEvent::SessionCompactFailed { .. } => K::SessionCompactFailed,
+            HostEvent::AgentBeforeSettle { .. } => K::AgentBeforeSettle,
             HostEvent::SessionBeforeTree { .. } => K::SessionBeforeTree,
             HostEvent::SessionTree { .. } => K::SessionTree,
-            HostEvent::AgentSettled => K::AgentSettled,
+            HostEvent::AgentSettled { .. } => K::AgentSettled,
             HostEvent::CacheWarmingDecision { .. } => K::CacheWarmingDecision,
         }
     }
@@ -718,6 +799,7 @@ impl HostEvent {
                 chunk: partial_result.clone(),
             },
             AgentEvent::ToolExecutionEnd {
+                duration_ms,
                 tool_call_id,
                 tool_name,
                 result,
@@ -727,6 +809,7 @@ impl HostEvent {
                 name: tool_name.clone(),
                 result: result.clone(),
                 is_error: *is_error,
+                duration_ms: *duration_ms,
             },
             AgentEvent::TurnEnd {
                 message,
@@ -735,6 +818,9 @@ impl HostEvent {
                 turn_index: 0,
                 message: message.clone(),
                 tool_results: tool_results.clone(),
+                message_entry_id: String::new(),
+                tool_result_entry_ids: Vec::new(),
+                boundary: BoundaryState::default(),
             },
             AgentEvent::AgentEnd { messages } => HostEvent::AgentEnd {
                 messages: messages.clone(),
@@ -788,6 +874,7 @@ impl HostEvent {
                 tool_name,
                 result,
                 is_error,
+                duration_ms,
                 parent_tool_call_id,
             } => (
                 HostEvent::ToolExecEnd {
@@ -795,6 +882,7 @@ impl HostEvent {
                     name: tool_name.clone(),
                     result: result.clone(),
                     is_error: *is_error,
+                    duration_ms: *duration_ms,
                 },
                 parent_tool_call_id.clone(),
             ),

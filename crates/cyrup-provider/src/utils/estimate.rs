@@ -432,6 +432,7 @@ mod tests {
             constrained_sampling: None,
         };
         let tool_result = |added: Vec<String>| Message::ToolResult {
+            duration_ms: None,
             tool_call_id: ToolCallId::from("tc1"),
             tool_name: "loader".into(),
             content: vec![Content::Text {

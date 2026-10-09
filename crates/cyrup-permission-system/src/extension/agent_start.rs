@@ -123,6 +123,7 @@ impl PermissionSystemExtension {
                 Some(prompt) => HookOutcome::Mutate(EventPatch::SystemPromptAndInject {
                     system: Some(prompt),
                     inject: Vec::new(),
+                    options: None,
                 }),
             };
         }
@@ -182,6 +183,7 @@ impl PermissionSystemExtension {
             Some(prompt) => HookOutcome::Mutate(EventPatch::SystemPromptAndInject {
                 system: Some(prompt),
                 inject: Vec::new(),
+                options: None,
             }),
         }
     }

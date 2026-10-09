@@ -475,7 +475,8 @@ impl NativeExtension for SettleInjector {
         *self.services.lock().unwrap() = Some(services);
     }
     async fn on_event(&self, ev: &HostEvent, _ctx: &HostCtx) -> HookOutcome {
-        if matches!(ev, HostEvent::AgentSettled) && !self.fired.swap(true, Ordering::SeqCst) {
+        if matches!(ev, HostEvent::AgentSettled { .. }) && !self.fired.swap(true, Ordering::SeqCst)
+        {
             let services = self.services.lock().unwrap().clone().unwrap();
             services
                 .inject_message_steer("settle-time peer note", Some(NOTE), true, None)

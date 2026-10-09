@@ -519,7 +519,9 @@ async fn seam127_deferred_message_is_displayed_at_the_turn_boundary_not_at_settl
             },
             crate::AgentSessionEvent::TurnEnd { .. } => order.push("turn_end".to_string()),
             crate::AgentSessionEvent::AgentEnd { .. } => order.push("agent_end".to_string()),
-            crate::AgentSessionEvent::AgentSettled => order.push("agent_settled".to_string()),
+            crate::AgentSessionEvent::AgentSettled { .. } => {
+                order.push("agent_settled".to_string())
+            }
             _ => {}
         }
     }

@@ -130,6 +130,7 @@ mod tests {
 
     fn tool_result(content: Vec<Content>) -> Message {
         Message::ToolResult {
+            duration_ms: None,
             tool_call_id: ToolCallId::from("call_1"),
             tool_name: "read".to_string(),
             content,
@@ -160,6 +161,7 @@ mod tests {
             raw_stop_reason: None,
             end_turn: None,
             timestamp: 0,
+            duration_ms: None,
         })
     }
 

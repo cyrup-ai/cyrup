@@ -56,6 +56,7 @@ impl TranscriptView {
             done: false,
             started_at: Some(std::time::Instant::now()),
             duration_ms: None,
+            recorded_ms: None,
             rendered_call: rendered,
             rendered_result: None,
             live_call: None,
@@ -185,7 +186,7 @@ impl TranscriptView {
         result: Option<Value>,
     ) {
         self.bump_render_generation();
-        self.push_tool_end_rendered(name, None, is_error, result, None);
+        self.push_tool_end_rendered(name, None, is_error, result, None, None);
     }
 
     /// [`Self::push_tool_end`] with the result's `toolCallId` and the RESULT text an extension's
@@ -194,6 +195,11 @@ impl TranscriptView {
     /// `call_id` selects the run this result belongs to — Pi's
     /// `renderedPendingTools.get(message.toolCallId)` (interactive-mode.ts:3483) / `pendingTools.get
     /// (event.toolCallId)` (`:3113`). `rendered = None` keeps the built-in body.
+    ///
+    /// `recorded_ms` is the result's own `durationMs` — the event's live, the tool-result message's
+    /// on replay (pi `updateResult({ ...event.result, isError, durationMs })` and
+    /// `updateResult(message)`, `interactive-mode.ts:3646`, `:4070` @v1.1.0) — see
+    /// [`ToolRun::recorded_ms`].
     pub fn push_tool_end_rendered(
         &mut self,
         name: impl Into<String>,
@@ -201,6 +207,7 @@ impl TranscriptView {
         is_error: bool,
         result: Option<Value>,
         rendered: Option<RenderedText>,
+        recorded_ms: Option<u64>,
     ) {
         self.bump_render_generation();
         let name = name.into();
@@ -215,6 +222,7 @@ impl TranscriptView {
             run.is_error = is_error;
             run.result = result;
             run.duration_ms = run.started_at.map(|s| s.elapsed().as_millis() as u64);
+            run.recorded_ms = recorded_ms;
             run.rendered_result = rendered;
             run.images = images;
         } else {
@@ -227,6 +235,7 @@ impl TranscriptView {
                 done: true,
                 started_at: None,
                 duration_ms: None,
+                recorded_ms,
                 rendered_call: None,
                 rendered_result: rendered,
                 live_call: None,
@@ -239,6 +248,19 @@ impl TranscriptView {
                 images,
                 live_expansion: None,
             });
+        }
+    }
+
+    /// Forget when the run for `call_id` started executing — for a call that is being REPLAYED, not
+    /// run, so no clock of this TUI's measured it. See the replay walk in `session_bind`.
+    pub fn clear_tool_start(&mut self, call_id: &str) {
+        if let Some(run) = self
+            .active_tools
+            .iter_mut()
+            .rev()
+            .find(|r| r.call_id.as_deref() == Some(call_id))
+        {
+            run.started_at = None;
         }
     }
 

@@ -59,6 +59,13 @@ pub struct RenderOptions {
     /// property of the row exactly as [`Self::is_partial`] is. `false` on every surface that is
     /// not a finished tool result.
     pub is_error: bool,
+    /// `ToolRenderContext.durationMs` (`core/extensions/types.ts` @v1.1.0, commit 36a686ee8):
+    /// *"Milliseconds the tool's execution took, from the final result; `undefined` while it runs,
+    /// when it did not run, or for results stored before durations were recorded."* Like
+    /// [`Self::is_error`] it is a property of the row, so it rides here; absent from the JSON when
+    /// `None`, which is pi's `undefined`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
     /// The name of the theme the renderer should draw for — see the CYRUP-DELTA above. `None` when
     /// the caller has no display (an RPC host, a test) and therefore no active theme to name.
     pub theme: Option<String>,
@@ -72,6 +79,7 @@ impl RenderOptions {
             output_pad,
             is_partial: false,
             is_error: false,
+            duration_ms: None,
             theme,
         }
     }
@@ -91,9 +99,19 @@ impl RenderOptions {
         self
     }
 
+    /// [`Self::partial`]'s sibling for `ToolRenderContext.durationMs`: the FINAL result's recorded
+    /// duration. A partial result never carries one — pi's `durationMs: this.isPartial ? undefined
+    /// : this.result?.durationMs` (`tool-execution.ts:137` @v1.1.0) — so call this after
+    /// [`Self::partial`].
+    #[must_use]
+    pub fn recorded(mut self, duration_ms: Option<u64>) -> Self {
+        self.duration_ms = if self.is_partial { None } else { duration_ms };
+        self
+    }
+
     /// The JSON the guest export receives as `opts-json`, in upstream's field spelling.
     ///
-    /// Infallible: every field is a bool, a `u32` or a `String`, so `to_string` cannot fail; the
+    /// Infallible: every field is a bool, an integer or a `String`, so `to_string` cannot fail; the
     /// empty object is the shape-preserving last resort rather than a panic the workspace lints
     /// forbid.
     pub fn to_json(&self) -> String {
@@ -124,6 +142,27 @@ mod tests {
         assert!(json.contains("\"isError\":true"), "{json}");
         assert!(json.contains("\"theme\":\"dark\""), "{json}");
         assert_eq!(RenderOptions::from_json(&json), opts);
+    }
+
+    /// pi `ToolRenderContext.durationMs` (v1.1.0): the final result's recorded duration, spelled
+    /// `durationMs`, absent (pi's `undefined`) when there is none — and never on a partial, which
+    /// pi gives `this.isPartial ? undefined : this.result?.durationMs` (`tool-execution.ts:137`).
+    #[test]
+    fn a_final_results_recorded_duration_is_durationms_and_a_partial_never_has_one() {
+        let base = RenderOptions::new(false, 1, None);
+        let fin = base.clone().partial(false).recorded(Some(4200));
+        assert_eq!(fin.duration_ms, Some(4200));
+        assert!(
+            fin.to_json().contains("\"durationMs\":4200"),
+            "{}",
+            fin.to_json()
+        );
+        assert_eq!(RenderOptions::from_json(&fin.to_json()), fin);
+
+        let streaming = base.clone().partial(true).recorded(Some(4200));
+        assert_eq!(streaming.duration_ms, None);
+        assert!(!streaming.to_json().contains("durationMs"));
+        assert!(!base.recorded(None).to_json().contains("durationMs"));
     }
 
     #[test]

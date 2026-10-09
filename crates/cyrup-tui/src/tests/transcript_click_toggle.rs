@@ -719,6 +719,7 @@ fn toggling_a_retained_tool_makes_its_extension_render_stale() {
         false,
         Some(read_result("out")),
         Some(RenderedText::new("snapshot", source.clone())),
+        None,
     );
     t.commit_tools();
     t.drain_committed();

@@ -978,6 +978,7 @@ pub fn faux_assistant_message_with(
         raw_stop_reason: None,
         end_turn: None,
         timestamp: options.timestamp.unwrap_or(0),
+        duration_ms: None,
     }
 }
 
@@ -1015,6 +1016,7 @@ pub fn faux_deferred_message(model: &Model, handle: DeferredHandle) -> Assistant
         raw_stop_reason: None,
         end_turn: None,
         timestamp: 0,
+        duration_ms: None,
     }
 }
 

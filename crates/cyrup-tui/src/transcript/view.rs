@@ -356,7 +356,10 @@ impl TranscriptView {
                 options.expanded = e.is_open();
             }
             match result {
-                Some(state) => options.partial(state.partial).errored(state.error),
+                Some(state) => options
+                    .partial(state.partial)
+                    .errored(state.error)
+                    .recorded(state.recorded_ms),
                 None => options,
             }
         };
@@ -568,6 +571,10 @@ struct ResultState {
     partial: bool,
     /// `ToolRenderContext.isError`.
     error: bool,
+    /// `ToolRenderContext.durationMs`. Part of the row's state for the same reason as the two
+    /// above: the options a render was drawn under are compared with these, so leaving it out
+    /// would make every row with a recorded duration look stale on every pass.
+    recorded_ms: Option<u64>,
 }
 
 impl ResultState {
@@ -575,6 +582,7 @@ impl ResultState {
         Self {
             partial: !run.done,
             error: run.is_error,
+            recorded_ms: run.recorded_ms,
         }
     }
 }

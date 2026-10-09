@@ -12,7 +12,8 @@ use std::sync::Arc;
 
 use cyrup_core::{Sections, Tool, ToolExposure, ToolLoadout, ToolNamespace};
 use cyrup_session::prompt::{
-    PromptInputs, SystemPromptBuilder, ToolPromptContribution, render_sections,
+    DocsPointers, PromptContextFile, PromptInputs, PromptSkill, SystemPromptOptions,
+    ToolPromptContribution, render_sections,
 };
 
 /// A serializable tool descriptor for `getAllTools`/`getToolDefinition` (Pi `ToolInfo`,
@@ -55,16 +56,55 @@ pub struct ToolInfo {
 /// diffs against the transcript (CODE-014, pi `diffSystemPromptSections`); the text is what
 /// `ctx.getSystemPrompt()`, `/export` and a `before_agent_start` handler read, and it is — by
 /// construction — the text a provider is sent for those sections. It derefs to that text.
+///
+/// EXT-084 — it also carries the OPTIONS it was built from (pi `NormalizedBuildSystemPromptOptions`),
+/// because those, not the text, are what a `before_agent_start` handler edits and what the run's
+/// prompt is re-rendered from; and the documentation pointers, the one input pi's options do not
+/// carry, so the session can render an edited copy the same way.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct BuiltPrompt {
+    options: SystemPromptOptions,
+    docs: DocsPointers,
     sections: Sections,
     text: String,
 }
 
 impl BuiltPrompt {
+    /// A prompt known only by its sections (the startup text the builder reports before the
+    /// session exists); its options are empty.
     pub(crate) fn new(sections: Sections) -> Self {
         let text = render_sections(&sections);
-        Self { sections, text }
+        Self {
+            sections,
+            text,
+            ..Self::default()
+        }
+    }
+
+    /// The prompt pi's `buildSystemPromptSections(options)` builds. Options the session itself
+    /// assembled never carry a custom section, so they cannot fail the section-name check; if they
+    /// somehow did, the prompt is built without its custom sections rather than not at all.
+    pub(crate) fn from_options(options: SystemPromptOptions, docs: DocsPointers) -> Self {
+        let sections = options.build_sections(&docs).unwrap_or_else(|_| {
+            let mut plain = options.clone();
+            plain.sections.clear();
+            plain.build_sections(&docs).unwrap_or_default()
+        });
+        let text = render_sections(&sections);
+        Self {
+            options,
+            docs,
+            sections,
+            text,
+        }
+    }
+
+    pub(crate) fn options(&self) -> &SystemPromptOptions {
+        &self.options
+    }
+
+    pub(crate) fn docs(&self) -> &DocsPointers {
+        &self.docs
     }
 
     pub(crate) fn sections(&self) -> &Sections {
@@ -124,103 +164,84 @@ impl PromptRebuilder {
         );
     }
 
-    /// The base bag itself, serialized as pi's `BuildSystemPromptOptions` — what
-    /// `ctx.getSystemPromptOptions()` hands a command handler (EXT-061).
+    /// The base options for the active set — pi `_rebuildSystemPrompt`'s
+    /// `this._baseSystemPromptOptions = normalizeBuildSystemPromptOptions({...})`
+    /// (`core/agent-session.ts:1700-1726` @v1.1.0), which `ctx.getSystemPromptOptions()` returns
+    /// (EXT-061) and every `before_agent_start` handler edits a copy of (EXT-084).
     ///
-    /// Upstream this is not derived at all: `_rebuildSystemPrompt` ASSIGNS
-    /// `this._baseSystemPromptOptions` on its way to building the string
-    /// (`core/agent-session.ts:1044-1053` @v0.83.0) and `getSystemPromptOptions` returns that field
-    /// verbatim (`:2436`). cyrup keeps the same two halves in one place — [`Self::base`] plus the
-    /// active set — so the bag a guest reads is BY CONSTRUCTION the bag the next
-    /// [`Self::rebuild`] would use, rather than a second snapshot that can drift from it.
-    ///
-    /// Key set and derivation, matching `:1021-1053`:
-    /// - `selectedTools` — the ACTIVE names (pi's `validToolNames`), not `base.selected_tools`,
-    ///   which is cleared on the rebuild base by design.
-    /// - `toolSnippets` — `{name: snippet}` over the active tools that have one.
-    /// - `hiddenTools` — the active tools whose declarations requests leave out
-    ///   (`BuildSystemPromptOptions.hiddenTools`, `system-prompt.ts:16-20` @v1.0.4).
-    /// - `promptGuidelines` — each DECLARED active tool's guidelines in active order, then cyrup's
-    ///   free-floating [`PromptInputs::prompt_guidelines`], which upstream has no channel for.
-    /// - `customPrompt` / `appendSystemPrompt` — omitted when unset, as pi omits `undefined`.
-    /// - `cwd`, `contextFiles` (`{path, content}`), `skills`.
-    fn base_options(&self, active: &[String], hidden: &BTreeSet<String>) -> serde_json::Value {
-        let mut snippets = serde_json::Map::new();
-        let mut guidelines: Vec<String> = Vec::new();
-        for name in active {
-            if let Some(c) = self.contributions.get(name) {
-                if let Some(s) = c.snippet.as_ref() {
-                    snippets.insert(name.clone(), serde_json::Value::String(s.to_string()));
-                }
-                // A hidden declaration is left out of the rules as it is out of the request:
-                // `hiddenTools` names it instead (pi `_rebuildSystemPrompt`,
-                // `agent-session.ts:1688-1710` @v1.0.4).
-                if !hidden.contains(name) {
-                    guidelines.extend(c.guidelines.iter().map(|g| g.to_string()));
-                }
+    /// Field for field, as pi assembles it:
+    /// - `selectedTools` — the ACTIVE names (pi's `validToolNames`).
+    /// - `hiddenTools` — every hidden declaration (`[...this._hiddenDeclarations]`).
+    /// - `toolSnippets` / `toolGuidelines` — EVERY registered tool's, not only the active ones'
+    ///   (`for (const name of this._toolRegistry.keys())`, `Object.fromEntries(
+    ///   this._toolPromptGuidelines)`): the builder lists only the declared ones, so a handler that
+    ///   adds a tool to `selectedTools` finds its snippet already there.
+    /// - `promptGuidelines` — cyrup's free-floating guidelines, which pi leaves unset.
+    /// - `customPrompt`, `appendSystemPrompt` (`""` when none), `cwd`, `contextFiles`, `skills`.
+    fn base_options(&self, active: &[String], hidden: &BTreeSet<String>) -> SystemPromptOptions {
+        let mut tool_snippets = indexmap::IndexMap::new();
+        let mut tool_guidelines = indexmap::IndexMap::new();
+        for (name, c) in &self.contributions {
+            if let Some(snippet) = c.snippet.as_ref().filter(|s| !s.is_empty()) {
+                tool_snippets.insert(name.clone(), snippet.to_string());
+            }
+            if !c.guidelines.is_empty() {
+                tool_guidelines.insert(
+                    name.clone(),
+                    c.guidelines.iter().map(|g| g.to_string()).collect(),
+                );
             }
         }
-        guidelines.extend(self.base.prompt_guidelines.iter().map(|g| g.to_string()));
-
-        let mut bag = serde_json::Map::new();
-        if let Some(custom) = self.base.custom_prompt.as_ref() {
-            bag.insert(
-                "customPrompt".into(),
-                serde_json::Value::String(custom.to_string()),
-            );
+        SystemPromptOptions {
+            custom_prompt: self.base.custom_prompt.as_deref().map(str::to_string),
+            force_system_prompt: None,
+            selected_tools: active.to_vec(),
+            hidden_tools: hidden.iter().cloned().collect(),
+            tool_snippets,
+            tool_guidelines,
+            prompt_guidelines: self
+                .base
+                .prompt_guidelines
+                .iter()
+                .map(|g| g.to_string())
+                .collect(),
+            append_system_prompt: self
+                .base
+                .append_system_prompt
+                .as_deref()
+                .unwrap_or_default()
+                .to_string(),
+            sections: indexmap::IndexMap::new(),
+            cwd: self.base.cwd.to_string_lossy().into_owned(),
+            context_files: self
+                .base
+                .context_files
+                .iter()
+                .map(|f| PromptContextFile {
+                    path: f.path.to_string_lossy().into_owned(),
+                    content: f.content.to_string(),
+                })
+                .collect(),
+            skills: self
+                .base
+                .skills
+                .iter()
+                .map(|s| PromptSkill {
+                    name: s.name.clone(),
+                    description: s.description.clone(),
+                    file_path: s.path.to_string_lossy().into_owned(),
+                    disable_model_invocation: s.disable_model_invocation,
+                    rest: serde_json::Map::new(),
+                })
+                .collect(),
         }
-        bag.insert("selectedTools".into(), serde_json::json!(active));
-        bag.insert("toolSnippets".into(), serde_json::Value::Object(snippets));
-        bag.insert(
-            "hiddenTools".into(),
-            serde_json::json!(
-                active
-                    .iter()
-                    .filter(|name| hidden.contains(*name))
-                    .collect::<Vec<_>>()
-            ),
-        );
-        bag.insert("promptGuidelines".into(), serde_json::json!(guidelines));
-        if let Some(append) = self.base.append_system_prompt.as_ref() {
-            bag.insert(
-                "appendSystemPrompt".into(),
-                serde_json::Value::String(append.to_string()),
-            );
-        }
-        bag.insert("cwd".into(), serde_json::json!(self.base.cwd));
-        bag.insert(
-            "contextFiles".into(),
-            serde_json::json!(
-                self.base
-                    .context_files
-                    .iter()
-                    .map(|f| serde_json::json!({"path": f.path, "content": f.content.to_string()}))
-                    .collect::<Vec<_>>()
-            ),
-        );
-        bag.insert(
-            "skills".into(),
-            serde_json::json!(self.base.skills.as_ref()),
-        );
-        serde_json::Value::Object(bag)
     }
 
-    /// Rebuild the base system prompt for `active` tools, pulling each tool's contribution from the
-    /// precomputed map (Pi `_rebuildSystemPrompt`, agent-session.ts:2304-2396).
+    /// Rebuild the base system prompt for `active` tools from [`Self::base_options`] (Pi
+    /// `_rebuildSystemPrompt`, `agent-session.ts:1700-1726` @v1.1.0, then
+    /// `_preparePromptAndToolLoadout`'s `buildSystemPromptSections(options)`).
     fn rebuild(&self, active: &[String], hidden: &BTreeSet<String>) -> BuiltPrompt {
-        let mut inputs = self.base.clone();
-        inputs.selected_tools = Some(active.iter().map(|n| Arc::from(n.as_str())).collect());
-        // The tool list and the rules must match the declarations the request carries: a tool whose
-        // declaration is hidden is reachable only through another tool, so the builder leaves it
-        // out of the listing, the rules and the skills hint (pi `_preparePromptAndToolLoadout`,
-        // `options.hiddenTools = [...this._hiddenDeclarations]`, `agent-session.ts:1727-1728`
-        // @v1.0.4, CODE-020; v1.0.1 blanked the snippet and kept the guidelines).
-        inputs.hidden_tools = hidden.iter().map(|n| Arc::from(n.as_str())).collect();
-        inputs.tool_contributions = active
-            .iter()
-            .filter_map(|n| self.contributions.get(n).cloned())
-            .collect();
-        BuiltPrompt::new(SystemPromptBuilder::new().build_sections(&inputs))
+        BuiltPrompt::from_options(self.base_options(active, hidden), self.base.docs.clone())
     }
 }
 
@@ -327,6 +348,12 @@ impl DynamicToolState {
     pub(crate) fn base_prompt_options(&self) -> serde_json::Value {
         self.rebuilder
             .base_options(&self.active_names(), self.loadout.hidden_declarations())
+            .to_value()
+    }
+
+    /// Names of the declarations requests leave out (pi `[...this._hiddenDeclarations]`).
+    pub(crate) fn hidden_names(&self) -> Vec<String> {
+        self.loadout.hidden_declarations().iter().cloned().collect()
     }
 
     /// Names of the currently-active tools (Pi `getActiveToolNames`).

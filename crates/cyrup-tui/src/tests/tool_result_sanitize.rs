@@ -37,6 +37,7 @@ fn ls_result_text(output: &str) -> String {
         args: json!({ "path": "." }),
     });
     app.ingest_event(&AgentSessionEvent::ToolExecutionEnd {
+        duration_ms: None,
         tool_call_id: ToolCallId::from("call-ls"),
         tool_name: "ls".to_string(),
         result: json!({ "content": [{ "type": "text", "text": output }] }),

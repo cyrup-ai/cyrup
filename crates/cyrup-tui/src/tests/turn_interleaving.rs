@@ -109,6 +109,7 @@ fn run_tool(app: &mut App<TestBackend>, id: &str, name: &str, args: serde_json::
         args: args.clone(),
     });
     app.ingest_event(&AgentSessionEvent::ToolExecutionEnd {
+        duration_ms: None,
         tool_call_id: cyrup_core::ToolCallId::from(id),
         tool_name: name.into(),
         is_error: false,

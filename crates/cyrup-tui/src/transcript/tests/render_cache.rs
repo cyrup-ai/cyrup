@@ -261,7 +261,7 @@ fn every_bump_list_mutator_advances_the_generation() {
             v.push_tool_end("read", false, None)
         }),
         ("push_tool_end_rendered", noop, |v| {
-            v.push_tool_end_rendered("read", None, false, None, None);
+            v.push_tool_end_rendered("read", None, false, None, None, None);
         }),
         ("commit_tools", live_tool, |v| v.commit_tools()),
         (

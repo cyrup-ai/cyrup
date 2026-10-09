@@ -158,6 +158,10 @@ pub enum AgentSessionEvent {
         tool_name: String,
         result: Value,
         is_error: bool,
+        /// Milliseconds `execute()` took; absent when the tool did not run (pi `durationMs?`,
+        /// `packages/coding-agent/src/core/extensions/types.ts` @v1.1.0).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        duration_ms: Option<u64>,
     },
     /// `tool_execution_start` of a call a tool made while it ran (`ctx.executeTool`), carrying the
     /// `parentToolCallId` of the call that made it (pi `AgentSessionEvent`'s
@@ -191,6 +195,10 @@ pub enum AgentSessionEvent {
         tool_name: String,
         result: Value,
         is_error: bool,
+        /// Before `parentToolCallId`, as pi's `NestedToolCallRunner` spreads it
+        /// (`nested-tool-calls.ts:240-247` @v1.1.0); absent when the call did not run.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        duration_ms: Option<u64>,
         parent_tool_call_id: ToolCallId,
     },
     TurnEnd {
@@ -308,7 +316,14 @@ pub enum AgentSessionEvent {
     /// and exactly ONE `agent_settled`. Pi emits it from the `finally` of `_runAgentPrompt`
     /// (:1063-1072), after `_flushPendingBashMessages()`, and its hosts key shutdown + idle
     /// bookkeeping off it (rpc-mode.ts:355-358, interactive-mode.ts:3137).
-    AgentSettled,
+    ///
+    /// `aborted` (pi v1.1.0, `{ type: "agent_settled"; aborted: boolean }`, `agent-session.ts:203`,
+    /// commit 503c60552): *"Whether the run ended because it was aborted, for example with
+    /// Escape"* — the run-abort latch (`_agentRunAbortRequested`) as it stands when the event is
+    /// emitted (`_emitAgentSettled`, `:1078-1086`).
+    AgentSettled {
+        aborted: bool,
+    },
     /// A session was started/replaced by the runtime (Pi `session_start`,
     /// agent-session-runtime.ts:215). `reason` ∈ `new`/`resume`/`fork`/`reload`.
     SessionStart {
@@ -371,11 +386,13 @@ impl AgentSessionEvent {
                 tool_name,
                 result,
                 is_error,
+                duration_ms,
             } => AgentSessionEvent::ToolExecutionEnd {
                 tool_call_id: tool_call_id.clone(),
                 tool_name: tool_name.clone(),
                 result: result.clone(),
                 is_error: *is_error,
+                duration_ms: *duration_ms,
             },
             AgentEvent::TurnEnd {
                 message,
@@ -409,7 +426,7 @@ impl AgentSessionEvent {
             AgentSessionEvent::NestedToolExecutionEnd { .. } => "tool_execution_end",
             AgentSessionEvent::TurnEnd { .. } => "turn_end",
             AgentSessionEvent::AgentEnd { .. } => "agent_end",
-            AgentSessionEvent::AgentSettled => "agent_settled",
+            AgentSessionEvent::AgentSettled { .. } => "agent_settled",
             AgentSessionEvent::QueueUpdate { .. } => "queue_update",
             AgentSessionEvent::CompactionStart { .. } => "compaction_start",
             AgentSessionEvent::CompactionEnd { .. } => "compaction_end",
@@ -467,12 +484,14 @@ impl From<NestedToolExecutionEvent> for AgentSessionEvent {
                 tool_name,
                 result,
                 is_error,
+                duration_ms,
                 parent_tool_call_id,
             } => AgentSessionEvent::NestedToolExecutionEnd {
                 tool_call_id,
                 tool_name,
                 result,
                 is_error,
+                duration_ms,
                 parent_tool_call_id,
             },
         }
@@ -494,6 +513,7 @@ pub(crate) fn agent_message_to_core(m: &AgentMessage) -> Option<cyrup_core::Mess
         }),
         AgentMessage::Assistant(a) => Some(Message::Assistant((**a).clone())),
         AgentMessage::ToolResult(t) => Some(Message::ToolResult {
+            duration_ms: t.duration_ms,
             tool_call_id: t.tool_call_id.clone(),
             tool_name: t.tool_name.clone(),
             content: t.content.clone(),
@@ -624,6 +644,7 @@ pub(crate) fn core_message_to_agent(m: &cyrup_core::Message) -> AgentMessage {
         },
         Message::Assistant(a) => AgentMessage::Assistant(Arc::new(a.clone())),
         Message::ToolResult {
+            duration_ms,
             tool_call_id,
             tool_name,
             content,
@@ -642,6 +663,7 @@ pub(crate) fn core_message_to_agent(m: &cyrup_core::Message) -> AgentMessage {
             usage: usage.clone(),
             added_tool_names: added_tool_names.clone(),
             is_error: *is_error,
+            duration_ms: *duration_ms,
             timestamp: *timestamp,
             // The RESUME direction of the persist copy above: a re-seeded transcript keeps the
             // record, so a live subscriber of a resumed session reads what a fresh one does.

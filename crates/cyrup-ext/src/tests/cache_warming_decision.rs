@@ -108,12 +108,13 @@ fn the_kind_is_36_and_count_grew_with_it() {
         EventKind::CacheWarmingDecision.name(),
         "cache_warming_decision"
     );
-    assert_eq!(
-        EventKind::COUNT,
-        37,
-        "COUNT indexes the 64-bit subscription bitset: left at 36 a guest's `subscribe(36)` is \
-         dropped by the gate and the hook never fires"
-    );
+    const {
+        assert!(
+            EventKind::COUNT > 36,
+            "COUNT indexes the 64-bit subscription bitset: left at 36 a guest's `subscribe(36)` is \
+             dropped by the gate and the hook never fires"
+        );
+    }
     const { assert!(EventKind::COUNT <= 64, "the bitset holds 64 kinds") }
 }
 
@@ -434,7 +435,7 @@ fn a_guest_built_before_the_cache_warming_export_is_refused() {
          typed `ExtError::WorldVersion` — which is only possible because HOST_WORLD moved with the \
          WIT package line: {err:?}"
     );
-    assert_eq!(crate::HOST_WORLD, "cyrup:ext@0.18");
+    assert_eq!(crate::HOST_WORLD, "cyrup:ext@0.19");
 }
 
 // ---------------------------------------------------------------------------
