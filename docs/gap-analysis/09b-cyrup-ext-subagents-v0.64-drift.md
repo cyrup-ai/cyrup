@@ -4,7 +4,7 @@
 replaces neither of them.** `09` remains the area's file of record for `SUBA-001`…`SUBA-071` and its
 Trackers. `09a` remains the file of record for `SUBA-072`…`SUBA-106`, including the ids it filed past
 its own scope line, which stay where they are. This file adds **`SUBA-107`…`SUBA-113`** (first pass)
-and **`SUBA-114`…`SUBA-143`** (pass 2, 2026-09-24); the next free id is **`SUBA-176`** (`SUBA-164`…`SUBA-173` filed 2026-10-03; `SUBA-174` filed 2026-10-04, closed 2026-10-05; `SUBA-175` filed 2026-10-09). Ids are
+and **`SUBA-114`…`SUBA-143`** (pass 2, 2026-09-24); the next free id is **`SUBA-204`** (`SUBA-176`…`SUBA-203` filed 2026-10-09 by the pi v1.1.0 drift triage; `SUBA-164`…`SUBA-173` filed 2026-10-03; `SUBA-174` filed 2026-10-04, closed 2026-10-05; `SUBA-175` filed 2026-10-09). Ids are
 never renumbered, so an item never moves between the three files.
 
 This file was created because README's pin table (*Which area file is pinned where*, row `09a`)
@@ -18,6 +18,48 @@ the name.
 blocks hold UNVERIFIED leads for `v0.57.0..v0.67.0` (2026-09-14). By scope, this file now owns them.
 They were **not** re-verified here and are not restated. `## Leads` below says which of them this pass
 happened to settle.
+
+> ### PIN 2026-10-09 — pi v1.1.0 drift triage: cyrup `6b14575` × pi-subagents **`ad11b7ab`** (= `v0.76.1-29-gad11b7ab`)
+>
+> **Window read:** `git log --no-merges v0.74.0..ad11b7ab` = **92** commits (the lane recorded 88; 92 is the
+> measured figure), split `v0.74.0..v0.75.0` = 31 (already dispositioned commit by commit by the 2026-10-03 pass,
+> `## Findings filed 2026-10-03`; spot-checked, no new evidence against them) and `v0.75.0..ad11b7ab` = **61**
+> (the lane recorded 57; reconciling all 61 against the filed rows and the list below, every one has a
+> disposition). Upstream read through `git -C tmp/pi-subagents show` only; cyrup at `6b14575`. Nothing was run.
+> **This file's window is now `v0.57.0..ad11b7ab`.** The pin is untagged, deliberately (README *CURRENT PINS*).
+>
+> **Filed (28):** `SUBA-176`…`SUBA-203` — three medium (`SUBA-176` the `deprecated` schema keyword, `SUBA-177` the
+> paused-run stop seal, `SUBA-178` runner launchers failing open), the rest low. Kind corrections applied at
+> filing: `SUBA-177`, `SUBA-181`, `SUBA-196` and `SUBA-203` are `upstream-drift`, not `parity-bug` (upstream had
+> the same behaviour until a commit after the baseline). `SUBA-187` is PLAUSIBLE (read, not run). `SUBA-185`
+> supersedes `09-cyrup-ext-subagents.md:901`; `SUBA-188` is the row the ledger's 2026-10-08 UPDATE asked for;
+> `SUBA-186` is blocked on `TUI-171` (area 07).
+>
+> **Read in scope and deliberately NOT filed (`v0.75.0..ad11b7ab`):**
+> * *Folded into the open `SUBA-162`* (progressive widget tier): `8d804895` / #2662, `588d2cfd` / #2738.
+> * *Folded into filed rows:* `ed942575` / #2746 (`SUBA-186`), `620cefa3` / #2670 (`SUBA-179`), `4c63aa07` /
+>   #2747 (`SUBA-180`), `d67d3173` / #2675 (`SUBA-182`), `58c7f613` / #2722 (RPC half already matched,
+>   `extension/rpc/mod.rs:62-68`; paused half is `SUBA-177`).
+> * *Not applicable by construction:* `50412418` / #2683 and `7fd88df8` / #2687 (pi-web liveness, N/A per 09a:112);
+>   `33f427fc` / #2671 (Pi's `builtin:mcp` selector; cyrup ships cyrup-mcp); `48f7e28c` / #2732 (in-process
+>   foreground children; cyrup spawns processes; `SUBA-142`); `3be46a22` / #2723 (background workflow usage; cyrup
+>   refuses async workflows, `extension/tool/routing.rs:851`); `3c729c4f` / #2710 (HerdrPlacedRun bridge backlog;
+>   no herdr-placed pi bridge session); `542cf504` / #2739 (cyrup's schedule root is `<cwd>/.cyrup-subagents`,
+>   `artifacts.rs:43`, `:162`); `5855164a` / #2686 and `1edc2b20` / #2684 (Windows file ids as JS numbers; Rust
+>   `u64` is exact); `6826b054` / #2697 (Node module cache).
+> * *Already matched:* `f738f855` / #2700 (doctor and admission key capacity by `services.session_id()`,
+>   `extension/executor/reports.rs:57-66`); `dbd40216` / #2743 (stage → index → promote,
+>   `background/result_index/write.rs:205-227`).
+> * *Perf only:* `1ec410b3` / #2708, `e44fe0df` / #2709.
+> * *Docs / tests / CI / release / chore:* `8323c6d5`, `1a255e91`, `448a395a`, `0c33ec7c`, `655986a0`, `9a40e7fb`,
+>   `026f6ee0`, `7d072b91` (v0.76.1), `99ccd391` (v0.76.0), `700c91bc`.
+>
+> **Leads recorded, not filed:** `ad11b7ab` / #2757 (per-run result lease vs a consumer of a paused result; cyrup's
+> runner publishes once, `runner_main/finish.rs:257-265`; `workflow_detach`'s reconcile write not traced);
+> `5da80816` / #2712 (output-less workflow resume reusing an earlier stage's report path; cyrup scoped out
+> `resumeContract`, `foreground_history/record.rs:73`, so the collision cannot be located; whether a cyrup resume
+> overwrites the earlier report was not determined); `8fb89814`'s first commit (async-workflow-child release; no
+> async workflow children; the namespace half is `SUBA-194`).
 
 > ### CLOSURES 2026-09-28 (second batch) — five lows (`SUBA-133`, `SUBA-136`, `SUBA-137`, `SUBA-138`, `SUBA-140`); two partials (`SUBA-134`, `SUBA-141`)
 >
@@ -117,7 +159,7 @@ happened to settle.
 > **Filed:** `SUBA-114`…`SUBA-143` (two high, eleven medium, sixteen low, one tracker). **Closed:**
 > none. `SUBA-144`…`SUBA-148` were filed later by the low-severity batches, and the
 > `v0.71.0..v0.74.0` pass filed `SUBA-150`…`SUBA-163`, and batch 6 filed `SUBA-149` in the gap that pass
-> left. **Next free id: `SUBA-176`** *(2026-10-09: `SUBA-175` filed reviewing `SUBA-163`. 2026-10-03: the `v0.74.0..v0.75.0` pass filed `SUBA-164`…`SUBA-173`; before that the counter read `SUBA-164`)*. `SUBA-113`'s tracker escalated two of its keys
+> left. **Next free id: `SUBA-204`** *(2026-10-09: the pi v1.1.0 drift triage filed `SUBA-176`…`SUBA-203`. 2026-10-09: `SUBA-175` filed reviewing `SUBA-163`. 2026-10-03: the `v0.74.0..v0.75.0` pass filed `SUBA-164`…`SUBA-173`; before that the counter read `SUBA-164`)*. `SUBA-113`'s tracker escalated two of its keys
 > (`checkpointBeforeDeadlineMs` → `SUBA-128`, `modelResponseAliases` → `SUBA-119`).
 >
 > **Still unread, stated exactly.** (a) The **`v0.57.0..v0.67.0` `src/` diff was NOT read line by
@@ -277,6 +319,34 @@ v0.70.1 and v0.71.0.
 | SUBA-172 | low | stale-port | M | **`run-history.jsonl` has the pre-hardening shape, and foreground runs are never recorded** — upstream's `recordRun` (`src/runs/shared/run-history.ts:223` @v0.75.0) writes `task: "[redacted]"` with a sha256 `taskHash` and an `outcome`, in a `0600` file under a `0700` directory, with rotation on load (`:262`); v0.75.0 (`f517481f`/#2620) adds `planBackgroundRunHistory` (`:180`) so async runs record one row per launched step. Cyrup's `record_run_history` (`background/run_history.rs:86-135`) stores the first 200 characters of the task in plaintext, with default mode, no hash, no outcome and no rotation, and only the async runner calls it (`background/runner_main/finish.rs:523`). **FILED 2026-10-03** from the post-pin triage (pi v1.0.1 / pi-subagents v0.75.0); body below. |
 | ~~SUBA-173~~ | ~~low~~ **CLOSED 2026-10-08** | parity-bug | S | **A saved profile's `machine` string is not validated before `/subagents-load-profile` writes settings** — upstream's `validateSubagentProfile` (`src/profiles/profiles.ts:125,148` @v0.75.0, `8a577c27`/#2619) calls the now-exported `validateOptionalMachine` (`src/agents/agents.ts:1035`) per override, so a bad value is rejected before any write; cyrup's `load_profile` (`registration/profiles.rs:211`) only serde-parses, and `placement/resolve.rs:33` already has `validate_optional_machine`. **FILED 2026-10-03** from the post-pin triage (pi v1.0.1 / pi-subagents v0.75.0); body below. — **CLOSED 2026-10-08** (on `claude/subagents-robustness-sweep`, checked against pi-subagents ad11b7ab, where the check is `src/profiles/profiles.ts:148-150` and `validateOptionalMachine` is `src/agents/agents.ts:1012-1019`): `load_profile` (`registration/profiles.rs`) now parses to a JSON value and runs `validate_profile_machines` before the typed parse: every override's `machine` other than absent or `false` goes through `placement::resolve::validate_optional_machine` with upstream's label `Profile '<file>' has invalid machine for '<name>'`, and the trimmed value replaces the raw one. `/subagents-load-profile` and `/subagents-check-profile` both call `load_profile` first, so a bad value is refused before `apply_profile_to_settings_file` writes. Verify: `an_invalid_profile_machine_is_refused_before_settings_are_written` (blank, 129 characters, a control character, `true`; settings byte-identical), `a_false_profile_machine_still_clears_the_pin`, `a_valid_profile_machine_is_applied_trimmed`. |
 | SUBA-175 | low | port-divergence | S | **`/subagent-cost` reports 0 turns for every async child resolved from `_meta.json`** — upstream's `metadataUsage` reads `turns` off the artifact metadata's `usage` (`src/slash/subagent-cost.ts:137` @ad11b7ab), and both producers write a `Usage` that carries `turns` (`src/shared/types.ts:261-268`; async runner `src/runs/background/subagent-runner.ts:1241,1512`; foreground `src/runs/foreground/execution.ts:154`). Cyrup's `_meta.json` writes `cyrup_core::Usage`, which has no `turns` (`crates/cyrup-ext-subagents/src/artifacts.rs:577`; the count lives beside it on `SingleResult::turns`, `exec/run_result.rs:120`), so `metadata_usage` (`registration/cost.rs:943`, called at `:1292` and `:1346`) always yields `turns: 0`. **FILED 2026-10-09** while reviewing `SUBA-163`; body below. |
+| SUBA-176 | medium | upstream-drift | S | **The `subagent` tool schema still emits `deprecated: true`, which strict tool-schema validators reject with HTTP 400, so every request carrying the tool fails on those providers** **Filed 2026-10-09 from the pi v1.1.0 drift triage**; body below. |
+| SUBA-177 | medium | upstream-drift | S | **A paused async run cannot be stopped once its paused result was delivered: the seal refuses with "paused result is missing" and the run keeps its capacity slot (extends the closed `SUBA-116`)** **Filed 2026-10-09 from the pi v1.1.0 drift triage**; body below. |
+| SUBA-178 | medium | not-ported | L | **Runner launchers (`runnerLaunchers` config, agent `launcher:` frontmatter) are unported, and an agent that names a launcher silently runs unwrapped instead of failing** **Filed 2026-10-09 from the pi v1.1.0 drift triage**; body below. |
+| SUBA-179 | low | upstream-drift | S | **`workflow: true` still fails "found 0" when the model fences its script as plain ```js, and says nothing when the reply's text never reached the session** **Filed 2026-10-09 from the pi v1.1.0 drift triage**; body below. |
+| SUBA-180 | low | upstream-drift | M | **The child boundary instructions are prepended ahead of the base prompt, and the child runtime returns a frozen full prompt instead of filtering the prompt options** **Filed 2026-10-09 from the pi v1.1.0 drift triage**; body below. |
+| SUBA-181 | low | upstream-drift | S | **Saving an agent whose description has a newline writes invalid frontmatter** **Filed 2026-10-09 from the pi v1.1.0 drift triage**; body below. |
+| SUBA-182 | low | upstream-drift | S | **A schedule claim whose lock write fails wedges the schedule, and a lost claim overwrites the owner's schedule record from a stale snapshot** **Filed 2026-10-09 from the pi v1.1.0 drift triage**; body below. |
+| SUBA-183 | low | upstream-drift | M | **Schedule `history.json` is rewritten from each session's own snapshot with no lease, so concurrent sessions lose runs from the index** **Filed 2026-10-09 from the pi v1.1.0 drift triage**; body below. |
+| SUBA-184 | low | upstream-drift | S | **Watchdog settings writes and `/subagents-load-profile` read-modify-write `settings.json` with no lock, so concurrent sessions lose each other's changes** **Filed 2026-10-09 from the pi v1.1.0 drift triage**; body below. |
+| SUBA-185 | low | not-ported | L | **Daily and weekly zoned calendar schedules (`every: "day"\|"week"`, `at: "HH:mm"`, `on`, `timezone`) are still refused (supersedes `09-cyrup-ext-subagents.md:901`)** **Filed 2026-10-09 from the pi v1.1.0 drift triage**; body below. |
+| SUBA-186 | low | not-ported | M | **Subagent run state is not reported to the terminal with OSC 7501 (`programStatus`); blocked on `TUI-171`, which owns the root record** **Filed 2026-10-09 from the pi v1.1.0 drift triage**; body below. |
+| SUBA-187 | low | upstream-drift | S | **In headless mode, results that finished during the `agent_end` drain still wait out the completion batch window, so a print-mode parent can exit before they are delivered** **Filed 2026-10-09 from the pi v1.1.0 drift triage**; body below. |
+| SUBA-188 | low | upstream-drift | M | **Subagent notices wake an idle parent with a triggered custom message, which starts a run without `before_agent_start`, so extension-set prompt sections are missing from the woken run** **Filed 2026-10-09 from the pi v1.1.0 drift triage**; body below. |
+| SUBA-189 | low | not-ported | M | **A parent that ends its turn without acting on a completion wake or a supervisor ask gets no reminder: the bounded `agent_before_settle` continuation is unported** **Filed 2026-10-09 from the pi v1.1.0 drift triage**; body below. |
+| SUBA-190 | low | upstream-drift | M | **Subagent messages in the main chat still use per-type cards and glyph lines instead of Pi's collapsible `[subagent]` block** **Filed 2026-10-09 from the pi v1.1.0 drift triage**; body below. |
+| SUBA-191 | low | upstream-drift | S | **Subagent model displays strip the provider, so the same model id from two providers is indistinguishable** **Filed 2026-10-09 from the pi v1.1.0 drift triage**; body below. |
+| SUBA-192 | low | upstream-drift | S | **A blocking `bg_wait` ignores a steer or follow-up the operator types, holding the message until the wait window ends** **Filed 2026-10-09 from the pi v1.1.0 drift triage**; body below. |
+| SUBA-193 | low | not-ported | M | **Async runs cannot be found by the tool-call id that launched them: no async status records `toolCallId` and the run-id resolver has no tool-call lookup** **Filed 2026-10-09 from the pi v1.1.0 drift triage**; body below. |
+| SUBA-194 | low | upstream-drift | S | **The abandoned-slot release reads a runner PID from another PID namespace as dead, so capacity can be reclaimed while the runner is alive (the residual `SUBA-159` recorded)** **Filed 2026-10-09 from the pi v1.1.0 drift triage**; body below. |
+| SUBA-195 | low | upstream-drift | M | **Text still streaming when a child times out or errors is lost: the partial-output tracker is unported** **Filed 2026-10-09 from the pi v1.1.0 drift triage**; body below. |
+| SUBA-196 | low | upstream-drift | S | **A child ended by a per-tool timeout is reported as "Subagent timed out after {run budget}ms" with the real cause shown as partial output** **Filed 2026-10-09 from the pi v1.1.0 drift triage**; body below. |
+| SUBA-197 | low | upstream-drift | S | **With `outputSchema`, a bound output file receives the child's closing prose instead of the structured result** **Filed 2026-10-09 from the pi v1.1.0 drift triage**; body below. |
+| SUBA-198 | low | upstream-drift | S | **The main watchdog never records mid-run user input in scope, so a steer typed while the agent streams is later flagged as scope drift** **Filed 2026-10-09 from the pi v1.1.0 drift triage**; body below. |
+| SUBA-199 | low | not-ported | L | **`worktree.cleanup` is still plan-only: reviewed plans cannot be applied** **Filed 2026-10-09 from the pi v1.1.0 drift triage**; body below. |
+| SUBA-200 | low | upstream-drift | S | **The herdr bridge marks the pane `blocked` when a child needs attention, though that attention is for the parent agent, not the user** **Filed 2026-10-09 from the pi v1.1.0 drift triage**; body below. |
+| SUBA-201 | low | upstream-drift | S | **Inspector open and close are not serialized per run, so concurrent opens can create two panes and one overwrites the other's binding** **Filed 2026-10-09 from the pi v1.1.0 drift triage**; body below. |
+| SUBA-202 | low | not-ported | M | **The bundled tmux inspector plugin is unported** **Filed 2026-10-09 from the pi v1.1.0 drift triage**; body below. |
+| SUBA-203 | low | upstream-drift | S | **Workflow `emit()` rejects objects with undefined fields, failing the whole workflow where `return` accepts the same value** **Filed 2026-10-09 from the pi v1.1.0 drift triage**; body below. |
 
 ---
 
@@ -2271,6 +2341,458 @@ Filed 2026-10-09 while reviewing the `SUBA-163` closure on `claude/subagents-rob
 **Fix** — Write the turn count into `_meta.json`'s `usage` as `turns` (upstream's shape) in `run_artifact_metadata`, so `metadata_usage` reads it with no reader change; alternatively read a top-level `turns` beside `usage` as the override, mirroring `add_result_child`. The first keeps `_meta.json` byte-compatible with upstream's.
 
 **Verify** — An async single run whose child took 3 turns reports `turns: 3` in `/subagent-cost` (extend `registration::cost::tests::an_async_single_launch_contributes_its_child_usage` to write `_meta.json` through `run_artifact_metadata` and assert the turns); a `_meta.json` written before the fix still resolves with 0 turns.
+
+## Findings filed 2026-10-09 — pi-subagents `v0.74.0..ad11b7ab` (the pi v1.1.0 drift triage)
+
+Upstream read through `git -C tmp/pi-subagents show` only, at `ad11b7ab` (= `v0.76.1-29-gad11b7ab`); cyrup read at `6b14575`. Nothing was run. The window record is the PIN 2026-10-09 block at the top of this file.
+
+## SUBA-176 — The `subagent` tool schema still emits `deprecated: true`, which strict tool-schema validators reject with HTTP 400, so every request carrying the tool fails on those providers
+
+**Kind** upstream-drift · **Severity** medium · **Effort** S · **Confidence** confirmed (both sides read; static, nothing run) · **Filed** 2026-10-09
+
+> **Filed 2026-10-09 from the pi v1.1.0 drift triage** (pi-subagents `v0.74.0..ad11b7ab`, cyrup `6b14575`).
+
+**upstream** — `50c280f1` / #2721 (related #2713): drops `deprecated: true` from the `reviewed` branch of `AcceptanceOverride` (`src/extension/schemas.ts:64-70` @ad11b7ab; `git show ad11b7ab:src/extension/schemas.ts | grep -c deprecated` = 0) and adds `deprecated` to the test's provider-rejected keyword list (`test/unit/schemas.test.ts` "does not emit provider-rejected schema shapes"). The CHANGELOG (@ad11b7ab `:33`) states the 400.
+
+**cyrup** — `crates/cyrup-ext-subagents/src/extension/tool/schema.rs:63` (`sj_acceptance_override`: the `reviewed` branch still carries `"deprecated": true`), plus two `CYRUP-DELTA` uses upstream never had: `:488` (the `runId` alias) and `:657` (the `maxRuntimeMs` alias). No provider adapter strips the keyword (`grep -rn '"deprecated"' crates/cyrup-provider/src` has no schema hit). `exec/acceptance/lattice/lowering.rs:603` reads the flag in a test as the sanctioned-exception marker.
+
+**Impact** — On a provider whose tool-schema validator is strict, the parent's whole request (the tool list rides every turn) is rejected with 400, so the session cannot run at all while the subagent tool is registered. Medium: a broken user-facing flow on those providers.
+
+**Fix** — Remove `"deprecated": true` from all three schema sites; keep the `reviewed` branch and its description (upstream keeps it so preflight can explain). Re-key `lowering.rs`'s test off the branch's enum value instead of the flag. Add a schema test that walks the whole tool schema and rejects `allOf` / `const` / `if` / `then` / `not` / `deprecated`, as upstream's does.
+
+**Verify** — `grep -rn '"deprecated"' crates/cyrup-ext-subagents/src/extension/tool/schema.rs` is empty; the keyword-walk test passes; `acceptance: "reviewed"` is still refused with the explanatory preflight sentence.
+
+## SUBA-177 — A paused async run cannot be stopped once its paused result was delivered: the seal refuses with "paused result is missing" and the run keeps its capacity slot (extends the closed `SUBA-116`)
+
+**Kind** upstream-drift · **Severity** medium · **Effort** S · **Confidence** confirmed (both sides read; static, nothing run) · **Filed** 2026-10-09
+
+> **Filed 2026-10-09 from the pi v1.1.0 drift triage** (pi-subagents `v0.74.0..ad11b7ab`, cyrup `6b14575`).
+
+**upstream** — `15757b00` / #2701: `sealPausedRun` (`src/runs/foreground/async-stop-action.ts:32` @ad11b7ab) falls back to `resultPayloadFileForSessionRun` and, when no payload exists at all, seals from `status.json` (`:45`: "Delivery deletes the paused result, and an interrupted parent may never have received one; seal from status"). `58c7f613` / #2722 routes the RPC stop through the same `deliverAsyncRunStop` (`:124`). Until `15757b00` upstream had the same refusal.
+
+**cyrup** — `crates/cyrup-ext-subagents/src/background/control.rs:1134-1147` (`seal_paused_run`): `result_payload_path_for_session_run` returning `Ok(None) | Err(_)` is `return Some("paused result is missing")`. The delivered payload is unlinked by `background/watch/results_watcher.rs:648` (`consume`), so after the ordinary paused-result notification the seal can never succeed. `SUBA-116` (closed 2026-09-29) ported the v0.71.0 `sealPausedRun`, which ended at this same rung; this row extends that port. The RPC half of #2722 is already matched: RPC `stop` routes through the tool's `control_stop` (`extension/rpc/mod.rs:62-68`).
+
+**Impact** — `stop` on a paused run whose pause notice already reached the parent (the normal case) returns an error; the run stays paused and holds its `maxActiveAsyncRunsPerSession` slot until resumed. `SUBA-116`'s symptom, back on the common path.
+
+**Fix** — Port the fallback: when no validated payload resolves, try the unvalidated pending / public file, and when none exists build the stopped result from `RunStatus` (id, mode, sessionId, asyncDir, completionOwnerId, toolCallId, per-step agent / success / error / exitCode) and continue the seal.
+
+**Verify** — Pause an async run, let the watcher deliver and consume its paused result, then `subagent({action:"stop", id})` succeeds: `status.json` reads `stopped`, a stopped result is published and the capacity slot is released. Change the `seal_paused_run` test near `control.rs:4600-4620`, which asserts the refusal sentence today, to expect success.
+
+## SUBA-178 — Runner launchers (`runnerLaunchers` config, agent `launcher:` frontmatter) are unported, and an agent that names a launcher silently runs unwrapped instead of failing
+
+**Kind** not-ported · **Severity** medium · **Effort** L · **Confidence** confirmed (both sides read; static, nothing run) · **Filed** 2026-10-09
+
+> **Filed 2026-10-09 from the pi v1.1.0 drift triage** (pi-subagents `v0.74.0..ad11b7ab`, cyrup `6b14575`).
+
+**upstream** — `e4b52b4b` / #2720: the `runnerLaunchers` user-config key, validated fail-closed (`src/extension/config.ts:108-111`, `:211`; added to `FAIL_CLOSED_CONFIG_KEYS` at `:17`, now 12 keys); `resolveAgentRunnerLauncher` / `runnerLauncherPlacementError` (`src/runs/shared/runner-launcher.ts:5-27` @ad11b7ab): an undefined name fails before launch and never falls back; a launcher forces background, refuses `machine` / external runners, records `launcher:{name,argv}` in status and survives resume. `docs/agents.md` "Sandboxing background children with a launcher".
+
+**cyrup** — `grep -rn 'runnerLaunchers\|launcher' crates --include=*.rs` has no hit. `FAIL_CLOSED_CONFIG_KEYS` is the 11-key list (`crates/cyrup-ext-subagents/src/registration/mod.rs:630-642`). An unknown frontmatter key is kept verbatim in `extra_fields` and binds nothing (`discovery/frontmatter.rs:54`, `:78`), so `launcher: net` is dropped and the runner spawns directly.
+
+**Impact** — An agent file written to run in a dedicated sandbox runs in the parent's environment instead, with no error: a declared isolation boundary fails open. Medium only for that fail-open; the feature itself is low.
+
+**Fix** — Minimum: type `launcher` in `KNOWN_FIELDS` and refuse a launch whose agent names one (upstream's "not defined in runnerLaunchers" sentence) until ported, and add `runnerLaunchers` to `FAIL_CLOSED_CONFIG_KEYS`. Full port: parse and validate the key from user config only, prefix the runner argv in `spawn_detached`, force background, refuse machine / external-runner combinations and mixed-launcher chains, record `launcher` in `RunStatus`, reuse the recorded launcher on resume.
+
+**Verify** — An agent with `launcher: nope` and no config entry fails before any run dir or fan-out slot is created; with `runnerLaunchers.net = ["env","X=1","--"]` the runner's process tree shows the wrapper and `status.json` records `launcher`; a config with an invalid `runnerLaunchers` value refuses the whole file.
+
+## SUBA-179 — `workflow: true` still fails "found 0" when the model fences its script as plain ```js, and says nothing when the reply's text never reached the session
+
+**Kind** upstream-drift · **Severity** low · **Effort** S · **Confidence** confirmed (both sides read; static, nothing run) · **Filed** 2026-10-09
+
+> **Filed 2026-10-09 from the pi v1.1.0 drift triage** (pi-subagents `v0.74.0..ad11b7ab`, cyrup `6b14575`).
+
+**upstream** — `7cb20ce9` / #2660: `PLAIN_JS_FENCE` (`src/extension/reply-workflow-script.ts:5` @ad11b7ab); a reply with no tagged block and exactly one plain js block runs it (`:38-41`); the found-0 error names the exact opener and the file fallback (`:8`, `:40-41`); tagged / plain collection at `:49-58`. `620cefa3` / #2670: when the issuing assistant message has no text blocks, a dedicated error says the text never reached the session (`:33`).
+
+**cyrup** — `crates/cyrup-ext-subagents/src/extension/reply_workflow_script.rs:91` (`workflow_blocks` collects tagged blocks only) and `:146-168` (`script_from_reply`: the old "requires exactly one ```js workflow fenced block ... found {n}" sentence, no plain-block fallback); its own test at `:217` asserts a plain block is invisible. `extension/tool/workflow_field.rs:226-240` joins text blocks with no check that any exist.
+
+**Impact** — A model that drops the `workflow` tag (common) gets a failed tool call and must retry; a reply whose text was stripped gets a misleading "found 0".
+
+**Fix** — Port the tagged / plain split and the selection rule, the new error sentences (including the multiple-untagged hint and the file-path fallback), the "not closed" / "empty" rewording, and the no-text-block check in `script_from_branch` before joining.
+
+**Verify** — A reply with one ```js block and `workflow: true` runs it; two untagged blocks give the "untagged js blocks" sentence; an assistant message with only a tool call gives the never-reached-the-session error; update the `:217` test.
+
+## SUBA-180 — The child boundary instructions are prepended ahead of the base prompt, and the child runtime returns a frozen full prompt instead of filtering the prompt options
+
+**Kind** upstream-drift · **Severity** low · **Effort** M · **Confidence** confirmed (both sides read; static, nothing run) · **Filed** 2026-10-09
+
+> **Filed 2026-10-09 from the pi v1.1.0 drift triage** (pi-subagents `v0.74.0..ad11b7ab`, cyrup `6b14575`).
+
+**upstream** — `17e17673` / #2693: `appendChildBoundary` puts the base prompt first (`src/runs/shared/subagent-prompt-runtime.ts:224-227` @ad11b7ab), so providers that recognise Pi's opening still do. `4c63aa07` / #2747: the runtime filters `systemPromptOptions` in place (`filterChildPromptOptions`, `:236`) and a last-position hook appends the boundary (`registerSubagentPromptBoundary`, `:250`; ordering `orderChildPromptHooks`, `src/runs/shared/child-session.ts:197`), so sections later extensions add in `before_agent_start` reach the provider request. `stripChildBoundaryInstructions` (~`:199-205`) strips each instruction in both its `\n\n`-prefixed and bare form, `STRUCTURED_OUTPUT_INSTRUCTIONS` included.
+
+**cyrup** — `crates/cyrup-ext-subagents/src/prompt_runtime.rs:1238` returns `format!("{boundary}{structured}\n\n{rewritten}")` (boundary first); `:1169-1178` strips only the two boundary texts, not `STRUCTURED_OUTPUT_INSTRUCTION` in either form; the `BeforeAgentStart` arm (`:2763-2777`) returns a whole rewritten `system` string. cyrup's dispatcher re-renders the prompt from `options` after any later handler that edits options (`crates/cyrup-ext/src/dispatch.rs:712-722`), which would discard the rewrite.
+
+**Impact** — Providers and extensions that key on the base prompt's first sentence mis-handle every child; a later child extension that edits prompt options re-renders from unfiltered options, dropping both the stripping and the boundary.
+
+**Fix** — Append the boundary after the rewritten prompt; strip `STRUCTURED_OUTPUT_INSTRUCTION` too, in both its prefixed and bare forms. Then split the hook as upstream does: filter `options` (context files, skills, customPrompt, appendSystemPrompt) in place in the first handler, and append the boundary from a handler registered last.
+
+**Verify** — `rewrite_subagent_prompt("BASE", ..)` starts with `BASE`; a child with a second extension adding a prompt section in `before_agent_start` sends a request whose system prompt holds that section, the stripped context is absent and the boundary is last.
+
+## SUBA-181 — Saving an agent whose description has a newline writes invalid frontmatter
+
+**Kind** upstream-drift · **Severity** low · **Effort** S · **Confidence** confirmed (both sides read; static, nothing run) · **Filed** 2026-10-09
+
+> **Filed 2026-10-09 from the pi v1.1.0 drift triage** (pi-subagents `v0.74.0..ad11b7ab`, cyrup `6b14575`).
+
+**upstream** — `49a3ec7f` / #2681: `serializeAgent` writes `description: |-` with each line indented when the description contains `\n` (`src/agents/agent-serializer.ts:67-71` @ad11b7ab). Upstream's serializer had the same single-line write until this commit.
+
+**cyrup** — `crates/cyrup-ext-subagents/src/discovery/management/frontmatter_write.rs:59`: `lines.push(format!("description: {}", def.description))` unconditionally. The parser accepts `|` / `|-` literal blocks (`discovery/frontmatter.rs:610-613`), so a multiline description can be read in and then written back broken.
+
+**Impact** — An update or eject of an agent with a multiline description corrupts its file (the continuation lines become stray keys or a parse failure).
+
+**Fix** — Port the branch: `description: |-` plus two-space-indented lines when the text contains `\n`.
+
+**Verify** — Round trip: an agent with `description: |-\n  a\n  b` saved through `serialize_agent` and re-parsed yields `"a\nb"`.
+
+## SUBA-182 — A schedule claim whose lock write fails wedges the schedule, and a lost claim overwrites the owner's schedule record from a stale snapshot
+
+**Kind** upstream-drift · **Severity** low · **Effort** S · **Confidence** confirmed (both sides read; static, nothing run) · **Filed** 2026-10-09
+
+> **Filed 2026-10-09 from the pi v1.1.0 drift triage** (pi-subagents `v0.74.0..ad11b7ab`, cyrup `6b14575`).
+
+**upstream** — `cccba0cf` / #2679: when writing the run id into `active.lock` fails, the claim removes the lock only if it is still its own inode, closes it and rethrows (`src/runs/background/scheduled-runs.ts:943-958` @ad11b7ab; the bigint inode compare comes from `1edc2b20`). `d67d3173` / #2675: on EEXIST the loser re-reads the record (`store.find`), writes only the skipped run and re-arms locally without advancing the owner's cursor (`:962`: "Losing the claim gives this snapshot no authority to change the owner").
+
+**cyrup** — `crates/cyrup-ext-subagents/src/background/scheduled_runs/store.rs:618-639` (`acquire_active_lock`): a `write_all` / `flush` failure after `create_new` returns via `?` and leaves an empty `active.lock`; `restore_one`'s stale-claim recovery runs only when `active_run_id` is set (`trigger.rs:807`, `:839`), so nothing removes it. `trigger.rs:567-591` (`skip_overlap`, reached from the claim caller at `:498`) writes the caller's `schedule` snapshot (`store.write(schedule)`) after advancing its trigger.
+
+**Impact** — After an ENOSPC-style failure every later fire is skipped forever; two sessions racing one schedule can clobber the owner's `activeRunId` / cursor with the loser's stale copy.
+
+**Fix** — In `acquire_active_lock`, on a post-create write failure remove the file if its (dev, ino) still matches the handle, then return the error. In `skip_overlap`, re-read the record, write only the skipped run against it, and re-arm without persisting a cursor change (once-triggers clear their timer).
+
+**Verify** — A fault-injected write failure leaves no `active.lock` and the next tick launches; a two-store race shows the loser's skip leaves the owner's `active_run_id` and `next_run_at` unchanged.
+
+## SUBA-183 — Schedule `history.json` is rewritten from each session's own snapshot with no lease, so concurrent sessions lose runs from the index
+
+**Kind** upstream-drift · **Severity** low · **Effort** M · **Confidence** confirmed (both sides read; static, nothing run) · **Filed** 2026-10-09
+
+> **Filed 2026-10-09 from the pi v1.1.0 drift triage** (pi-subagents `v0.74.0..ad11b7ab`, cyrup `6b14575`).
+
+**upstream** — `650244c3` / #2682: `writeRun` holds `withFileLease(history.json)` around the read-modify-write and prefers a running entry's own receipt (`src/runs/background/scheduled-runs.ts:420`; `getRun` `:407`; `withFileLease`, `src/shared/file-lease.ts:61`); completion, restore and delete read the run receipt through `activeRun` (`:1134`); an unlaunched claim is released when its first records cannot be saved (`:990`); completion and a failed launch release the lock and re-arm before writing history. @ad11b7ab.
+
+**cyrup** — `crates/cyrup-ext-subagents/src/background/scheduled_runs/store.rs:526-566` (`write_run`) reads `history()`, prepends, and writes `history.json` with no lock. `restore_one` and completion matching find the active run only in `history()` (`trigger.rs:794-800`).
+
+**Impact** — Two sessions recording runs for one project schedule can drop an entry; restore then misreads a live claim as stale (or never settles it), leaving the schedule claimed or failing a live run.
+
+**Fix** — Put a pid-owned lease (or `cyrup_config::lock::FileLock`, as `SUBA-029` does) around `write_run`'s read-modify-write; add `get_run` reading `runs/<id>.json` and use it for active-run lookup in completion / restore / delete; reorder completion and failed launch so lock release and re-arm precede the history write.
+
+**Verify** — Two stores appending different runs concurrently keep both in `history.json`; a restore whose history entry is missing still finds the run via its receipt.
+
+## SUBA-184 — Watchdog settings writes and `/subagents-load-profile` read-modify-write `settings.json` with no lock, so concurrent sessions lose each other's changes
+
+**Kind** upstream-drift · **Severity** low · **Effort** S · **Confidence** confirmed (both sides read; static, nothing run) · **Filed** 2026-10-09
+
+> **Filed 2026-10-09 from the pi v1.1.0 drift triage** (pi-subagents `v0.74.0..ad11b7ab`, cyrup `6b14575`).
+
+**upstream** — `2d3f6471` / #2680: all seven settings writers hold `withSettingsFileLease` from read to save: agent overrides (`src/agents/agents.ts:1722`, `:1744` @ad11b7ab), profile application (`src/profiles/profiles.ts:487`), watchdog settings (`src/watchdog/settings.ts:465`, `:477`); the lease is `src/shared/settings-file-lease.ts` over `src/shared/file-lease.ts:61`.
+
+**cyrup** — Agent overrides are already locked (`discovery/settings_write.rs:87-99`, `:270`, `:301`, `:330`, `:379`; `SUBA-029`, and `SUBA-171`, closed 2026-10-08, which hardened that writer only). **Not a duplicate of `SUBA-171`:** the other two writers are unlocked: `watchdog/settings.rs:1036-1054` (`edit_watchdog_settings`: read, edit, `write_settings_file` `:1013-1024` = plain `std::fs::write`) and `registration/profiles.rs:600-687` (`apply_profile_to_settings_file`: read, merge, `std::fs::write` at `:686`).
+
+**Impact** — A watchdog toggle or profile load racing another session's settings save drops one change; a crash mid-`fs::write` truncates `settings.json`.
+
+**Fix** — Route both writers through `settings_write_target` + `lock_settings_file` (the `SUBA-029` / `SUBA-171` path) and write atomically, keeping each writer's merge logic.
+
+**Verify** — Concurrent `write_user_watchdog_enabled` and `merge_builtin_agent_override` on one file both survive; a symlinked `settings.json` is locked on its target's sidecar.
+
+## SUBA-185 — Daily and weekly zoned calendar schedules (`every: "day"|"week"`, `at: "HH:mm"`, `on`, `timezone`) are still refused (supersedes `09-cyrup-ext-subagents.md:901`)
+
+**Kind** not-ported · **Severity** low · **Effort** L · **Confidence** confirmed (both sides read; static, nothing run) · **Filed** 2026-10-09
+
+> **Filed 2026-10-09 from the pi v1.1.0 drift triage** (pi-subagents `v0.74.0..ad11b7ab`, cyrup `6b14575`).
+
+**upstream** — `a4b1fb9d` / #2656: `src/runs/background/calendar-schedule.ts:13-80` @ad11b7ab (`normalizeCalendarRule`, `nextCalendarOccurrence`, `latestCalendarOccurrence`, `calendarDateAfter`, `restoreCalendarTrigger`); `scheduled-runs.ts:678-704` creates `kind: "calendar"` triggers, and `:448`, `:467`, `:473`, `:777-780`, `:829` advance, restore, describe and manually run them; the schema (`src/extension/schemas.ts:199-203`) takes an `on` weekday array and an IANA / UTC `timezone`; `docs/missions.md` gives the calendar rules (skipped local times; a repeated time fires once).
+
+**cyrup** — `crates/cyrup-ext-subagents/src/background/scheduled_runs/tool.rs:492-500` refuses `on` / `timezone` and `every` in `day|week|month|year` with "Calendar schedules are deferred from this first safe slice"; `extension/tool/schema.rs:844-845` still advertises `on` as `string|integer` "Reserved calendar selector"; `schedule.rs:1240` asserts `"day"` is malformed. `09-cyrup-ext-subagents.md:901` recorded calendar triggers as "NOT a residual" because upstream also refused them then (`scheduled-runs.ts:622`); `a4b1fb9d` is what makes them a gap, so this row supersedes that note.
+
+**Impact** — An operator cannot schedule "weekdays at 09:00 America/New_York"; a pi-written calendar schedule in a shared project store is an unknown trigger kind to cyrup.
+
+**Fix** — Port the calendar trigger (a `Calendar` variant beside interval / once) with a tz database (`jiff` or `chrono-tz`), the schema change, create-time validation, next / latest occurrence, manual-run consumption rules and the restore-time UTC cache refresh.
+
+**Verify** — `every:"week", on:["mon","fri"], at:"09:00", timezone:"America/New_York"` creates a schedule whose `nextRunAt` is the next Mon/Fri 09:00 local across a DST change; a nonexistent local time is skipped; `every:"day"` with `on` is refused.
+
+## SUBA-186 — Subagent run state is not reported to the terminal with OSC 7501 (`programStatus`); blocked on `TUI-171`, which owns the root record
+
+**Kind** not-ported · **Severity** low · **Effort** M · **Confidence** confirmed (both sides read; static, nothing run) · **Filed** 2026-10-09
+
+> **Filed 2026-10-09 from the pi v1.1.0 drift triage** (pi-subagents `v0.74.0..ad11b7ab`, cyrup `6b14575`).
+
+**upstream** — `ac848775` / #2725 and `ed942575` / #2746: `registerProgramStatusReporter` (`src/integrations/program-status.ts:131-215` @ad11b7ab) writes one `subagents/<run>` (or `subagents/<workflow-run>.<key>`) record per async run: working / blocked (kind=question) / done / error / idle; title = agents or key; msg = current tool or outcome; at most 64 records; resend on SIGCONT; clear on non-quit dispose. Gated on interactive TUI, a TTY, `TERM != dumb`, `PI_PROGRAM_STATUS != 0` and the config key `programStatus` (default true, `src/extension/config.ts`); wired at `src/extension/index.ts:462-478`, `:1037`, `:1044`, `:1092`.
+
+**cyrup** — `grep -rn 7501 crates --include=*.rs` has no hit and no `programStatus` config key exists (`registration/mod.rs` key list). pi core's own OSC 7501 root record (pi `503c60552`, `packages/tui/src/program-status.ts`) is also absent; it is filed in this triage as `TUI-171` (area 07).
+
+**Impact** — Terminals that render the Program Status Protocol show nothing for cyrup's background runs.
+
+**Fix** — After `TUI-171` lands the root record and its negotiation, port the reporter over the async job tracker and the supervisor pending set, with the config key and the env gates; coordinate with area 07, which owns the root record and the suspend / editor clears.
+
+**Verify** — With a TTY and `programStatus` unset, an async run emits `ESC]7501;state=working:id=subagents/<12 chars>:app=...` then `state=done`; `CYRUP_PROGRAM_STATUS=0` and `programStatus:false` emit nothing; an unanswered supervisor ask after the parent settles reports `blocked:kind=question`.
+
+## SUBA-187 — In headless mode, results that finished during the `agent_end` drain still wait out the completion batch window, so a print-mode parent can exit before they are delivered
+
+**Kind** upstream-drift · **Severity** low · **Effort** S · **Confidence** plausible (static read; not run) · **Filed** 2026-10-09
+
+> **Filed 2026-10-09 from the pi v1.1.0 drift triage** (pi-subagents `v0.74.0..ad11b7ab`, cyrup `6b14575`).
+
+**upstream** — `3bb9b203` / #2666: after `drainOutstandingWork`, headless `agent_end` calls `resultWatcher.deliverPendingResults` (`src/extension/index.ts:728` @ad11b7ab), which flushes the notifier's batchers and hands every on-disk result to it with no coalescing (`src/runs/background/result-watcher.ts:698`; `notify.ts` `flush()`).
+
+**cyrup** — `crates/cyrup-ext-subagents/src/extension/host/native_impl.rs:706-731` awaits the drain and returns; nothing flushes the batcher (`background/watch/batch.rs:240`, `:249`, `:560` flush only on their own timers; default debounce 650 ms / max-wait 1500 ms, `:93-110`). `cyrup-modes/src/print.rs:109-118` ends after `wait_for_idle`, which returns while a completion is still held in the batch. cyrup's results watcher also polls every 500 ms (`RESULTS_DIR_POLL_INTERVAL`) before the debounce, so the gap is likely wider than upstream's was.
+
+**Impact** — `cyrup -p` orchestrations whose async children finish near the end of the turn can exit without the parent seeing those results (they stay on disk). Confirmed by reading, not by running.
+
+**Fix** — Expose a `flush_now` on the batching sink and a `deliver_pending_results` on the results watcher that rescans the results dir and delivers immediately; call it after a successful drain in the headless `AgentEnd` arm.
+
+**Verify** — Headless test: an async child completes during the drain; the parent's queued completion turn runs before `run_print` returns (a `subagent-notify` message is in the transcript).
+
+## SUBA-188 — Subagent notices wake an idle parent with a triggered custom message, which starts a run without `before_agent_start`, so extension-set prompt sections are missing from the woken run
+
+**Kind** upstream-drift · **Severity** low · **Effort** M · **Confidence** confirmed (both sides read; static, nothing run) · **Filed** 2026-10-09
+
+> **Filed 2026-10-09 from the pi v1.1.0 drift triage** (pi-subagents `v0.74.0..ad11b7ab`, cyrup `6b14575`).
+
+**upstream** — `65dff229` / #2689: `createParentWake` (`src/shared/parent-wake.ts:29-66` @ad11b7ab): to an idle parent a turn-triggering notice is appended with `triggerTurn:false` and the run is started with `sendUserMessage(PARENT_WAKE_TEXT, {deliverAs:"steer"})` (`:43-47`), because Pi starts a `sendMessage`-triggered run without `before_agent_start` (earendil-works/pi#5581, still true in pi `agent-session.ts:2314-2319`); every waking notice (completions, supervisor asks, control / steering, wait subscriptions, compaction resume) goes through it (`src/extension/index.ts:347`).
+
+**cyrup** — Same core behaviour: `crates/cyrup-session-svc/src/session/run.rs:330-366` (`run_injection`) prompts the agent directly, while `before_agent_start` and the run's prompt options are built only in `assemble_run_inputs` (`:1135`). The subagent notices inject with `trigger_turn` (`background/watch/batch.rs`; `session/inject.rs:659-664` puts them on `plan.turn`). `00-residual-ledger.md:49-54` (UPDATE 2026-10-08) recorded exactly this drift and said it "Needs a `SUBA-` row when area 09b re-pins".
+
+**Impact** — A parent woken by a completion runs without the prompt sections other extensions add per run (and without the watchdog's per-run additions), so its behaviour differs between user-started and completion-started turns.
+
+**Fix** — Port parent-wake on the seam that now exists, as intercom did for `ICOM-084` (closed 2026-10-08, `11-cyrup-intercom.md:740`): `HostServices::wake_user_prompt` (`crates/cyrup-ext/src/host/services.rs:861`), whose session-svc `InjectItem::WakePrompt` runs the prompt lifecycle. Append the notice without a turn, then wake an idle parent with a short steer-delivered prompt and upstream's 10 s pending reservation. No core change is needed.
+
+**Verify** — With a test extension adding a prompt section in `before_agent_start`, an idle parent woken by an async completion sends a provider request whose system prompt contains that section.
+
+## SUBA-189 — A parent that ends its turn without acting on a completion wake or a supervisor ask gets no reminder: the bounded `agent_before_settle` continuation is unported
+
+**Kind** not-ported · **Severity** low · **Effort** M · **Confidence** confirmed (both sides read; static, nothing run) · **Filed** 2026-10-09
+
+> **Filed 2026-10-09 from the pi v1.1.0 drift triage** (pi-subagents `v0.74.0..ad11b7ab`, cyrup `6b14575`).
+
+**upstream** — `3d4764de` / #2716: completion wakes carry `Parent action: …` (`src/runs/background/notify.ts:621`, `COMPLETION_ACTION` at `:615` @ad11b7ab); `handleBeforeSettle` (`:925-926`, registered through `pi.on("agent_before_settle")` at `:975`) finds a wake the assistant never answered with text or a tool call, continues once with `subagent-completion-unanswered` (`:957`), then ends with `subagent-completion-unhandled` (`:968`). The supervisor channel does the same per pending request (`src/intercom/native-supervisor-channel.ts:854` registration, the unanswered notice at `:827`, BLOCKED at `:845`). State survives reload per session UUID.
+
+**cyrup** — No subagents handler subscribes `agent_before_settle` (`grep -rn 'BeforeSettle' crates/cyrup-ext-subagents/src` is empty), though the host dispatches the boundary (`crates/cyrup-ext/src/dispatch.rs:62-75`, `EXT-078`). `grep -rn 'Parent action' crates` is empty.
+
+**Impact** — A model that silently yields on a completion or a supervisor ask leaves the work unacknowledged and the child blocked, with no visible marker.
+
+**Fix** — Append the `Parent action` line to triggered completion content; register a `before_settle` handler in the notifier and in the native supervisor channel with upstream's one-reminder-then-warn budget and its acted-on test (a later assistant message with text or a tool call).
+
+**Verify** — A scripted parent that replies empty to a completion wake gets exactly one continuation with the unanswered notice, then an UNHANDLED entry, and settles; a parent that calls a tool after the wake gets neither.
+
+## SUBA-190 — Subagent messages in the main chat still use per-type cards and glyph lines instead of Pi's collapsible `[subagent]` block
+
+**Kind** upstream-drift · **Severity** low · **Effort** M · **Confidence** confirmed (both sides read; static, nothing run) · **Filed** 2026-10-09
+
+> **Filed 2026-10-09 from the pi v1.1.0 drift triage** (pi-subagents `v0.74.0..ad11b7ab`, cyrup `6b14575`).
+
+**upstream** — `699429b4` / #2753: one registry renders every pi-subagents message and entry type as a single `[subagent]` headline (kind-coloured label, status words in status colours, `ctrl+o to expand` hint) that expands to the model-visible text as markdown (`src/tui/subagent-messages.ts` @ad11b7ab, 311 lines). The per-type card renderers are removed from `src/intercom/supervisor-ui.ts` (−176 lines), `src/watchdog/render.ts` (reworked) and `src/watchdog/register-main.ts` (−20); the files still exist. Collapsed watchdog lines keep the stalemate / stale / failed-review labels.
+
+**cyrup** — Per-type renderers remain: the supervisor request / reply renderers registered at `crates/cyrup-ext-subagents/src/extension/host/native_impl.rs:235-240`, `:339` (`tui/supervisor_ui.rs`), and the watchdog warning renderer at `:1199` (`watchdog/register_main.rs:1054`).
+
+**Impact** — Visual drift only: cyrup's chat looks like pre-#2753 pi.
+
+**Fix** — Add one message-renderer registry mirroring `subagent-messages.ts` (headline plus markdown body per custom type, collapsed by default, expand on click or the expand key) and register it for every subagent custom type, retiring the per-type renderers.
+
+**Verify** — Snapshot tests: a completion, a supervisor ask, a reply and a watchdog blocker each render as one collapsed `[subagent]` line and the model text when expanded.
+
+## SUBA-191 — Subagent model displays strip the provider, so the same model id from two providers is indistinguishable
+
+**Kind** upstream-drift · **Severity** low · **Effort** S · **Confidence** confirmed (both sides read; static, nothing run) · **Filed** 2026-10-09
+
+> **Filed 2026-10-09 from the pi v1.1.0 drift triage** (pi-subagents `v0.74.0..ad11b7ab`, cyrup `6b14575`).
+
+**upstream** — `f318c82e` / #2734: `formatModelThinking` no longer cuts at the last `/` (`src/shared/formatters.ts:35` @ad11b7ab); observed models are qualified with the serving provider via `qualifyModelWithProvider` (`src/shared/model-info.ts:90`) in the foreground and background child loops; cards prefer the observed `progress.model`; Fleet transcripts show `provider/model`.
+
+**cyrup** — `crates/cyrup-ext-subagents/src/formatters.rs:31-36` (`format_model_thinking`) keeps only the text after the last `/`.
+
+**Impact** — Operators running two logins or providers of one model cannot tell which served a child.
+
+**Fix** — Drop the slash-stripping, add a `qualify_model_with_provider` over the model registry, apply it where the child's assistant `message_end` model is recorded, and prefer the observed model in compact rows.
+
+**Verify** — A child served by `opencode-go/deepseek-v4.1-flash` renders that full id in the card and in Fleet; an id already qualified for its provider is unchanged.
+
+## SUBA-192 — A blocking `bg_wait` ignores a steer or follow-up the operator types, holding the message until the wait window ends
+
+**Kind** upstream-drift · **Severity** low · **Effort** S · **Confidence** confirmed (both sides read; static, nothing run) · **Filed** 2026-10-09
+
+> **Filed 2026-10-09 from the pi v1.1.0 drift triage** (pi-subagents `v0.74.0..ad11b7ab`, cyrup `6b14575`).
+
+**upstream** — `ecc9bc41` / #2736: the wait tool listens to `input` events (non-extension, with `streamingBehavior`) and aborts open waits (`src/runs/background/wait-tool.ts:31-52` @ad11b7ab); `waitForSubagents` then yields a non-error `user_input` result listing still-active work (`src/runs/background/subagent-wait.ts:411-422`, `:595`, `:794`).
+
+**cyrup** — `crates/cyrup-ext-subagents/src/extension/wait_tool.rs` and `background/wait.rs` have no input signal (no `steer` / `user_input` reference; only `window_elapsed` yields, `wait.rs:1043`). The host publishes `Input` with `streaming_behavior` (`crates/cyrup-ext/src/event.rs:580-587`).
+
+**Impact** — An operator correction typed during a long wait reaches the model only after the window (default 30 min) or a run change.
+
+**Fix** — Subscribe the wait tool to `Input` (skip extension-sourced and non-streaming inputs), cancel a per-call token, and return the `user_input` yield with upstream's text and active ids.
+
+**Verify** — A blocking wait on a long run returns within one poll of a steer typed by the user, with `details.wait.reason == "user_input"` and not an error; an extension-sent input does not end it.
+
+## SUBA-193 — Async runs cannot be found by the tool-call id that launched them: no async status records `toolCallId` and the run-id resolver has no tool-call lookup
+
+**Kind** not-ported · **Severity** low · **Effort** M · **Confidence** confirmed (both sides read; static, nothing run) · **Filed** 2026-10-09
+
+> **Filed 2026-10-09 from the pi v1.1.0 drift triage** (pi-subagents `v0.74.0..ad11b7ab`, cyrup `6b14575`).
+
+**upstream** — `6a6675c9` / #2717: direct async singles carry `toolCallId` into status, result and launch details (`src/runs/background/async-execution.ts:265`, `:2196` @ad11b7ab); terminal indexing keeps an `@tool-calls` alias (`src/runs/background/terminal-run-index.ts:14`, `:127`); the resolver merges live and terminal aliases and reports a shared alias as ambiguous (`src/runs/background/run-id-resolver.ts:155-159`). Documented as RPC lost-reply recovery via `id: "rpc-spawn-<requestId>"` (`docs/extension-api.md` "Direct async launch correlation"). The live-index tool-call lookup predates the window (`run-id-resolver.ts:105-109`).
+
+**cyrup** — `RunStatus.tool_call_id` exists (`crates/cyrup-ext-subagents/src/background/records.rs:466-472`) but no launch path sets it: the only production writer is the `active_run_index.rs:478` helper path, and `runner_main/finish.rs:569` hard-codes `None` for the result. `read_active_run_tool_call_index` (`background/active_run_index.rs:437`) has no production caller; `run_id_resolver.rs:263` resolves by run-id prefix only. cyrup's RPC bridge already mints the call id as `rpc-<method>-<requestId>` (`extension/rpc/mod.rs:577`), so `rpc-spawn-R` is the right alias once stamped.
+
+**Impact** — An RPC client whose spawn reply was lost cannot recover the run id from its own request id, and must not redispatch blind.
+
+**Fix** — Stamp the executor tool-call id into `RunStatus` and the result write's `tool_call_id` for async launches, add the terminal `@tool-calls` alias, and resolve exact tool-call ids (live and terminal) before prefix matching, with upstream's ambiguity error.
+
+**Verify** — An RPC spawn with requestId R whose reply is dropped: `status` with `id: "rpc-spawn-R"` returns the run with `toolCallId` in details, before and after its result is delivered; two runs sharing the alias give the ambiguity error.
+
+## SUBA-194 — The abandoned-slot release reads a runner PID from another PID namespace as dead, so capacity can be reclaimed while the runner is alive (the residual `SUBA-159` recorded)
+
+**Kind** upstream-drift · **Severity** low · **Effort** S · **Confidence** confirmed (both sides read; static, nothing run) · **Filed** 2026-10-09
+
+> **Filed 2026-10-09 from the pi v1.1.0 drift triage** (pi-subagents `v0.74.0..ad11b7ab`, cyrup `6b14575`).
+
+**upstream** — `8fb89814` / #2663 (second commit): `abandonedRunnerReleaseVerdict` retains the slot when `status.pidNamespaceScope` differs from the current namespace (`src/runs/background/active-async-capacity.ts:255` @ad11b7ab). The workflow-child half (`abandonedWorkflowReleaseVerdict`, `:291`) is for async workflow children, which cyrup does not have.
+
+**cyrup** — `crates/cyrup-ext-subagents/src/background/active_async_capacity/inspect.rs:386-440` (`abandoned_runner_release_verdict`) and the workflow fallback `child_pid_is_gone` (`:643-647`) call `options.pid_liveness(pid)` with no namespace check, although `RunStatus.pid_namespace_scope` is now stamped (`background/records.rs:391`) and used only by `reconcile.rs:452`. The closed `SUBA-159` (09b:264) recorded this exact gap under "Not in this row (recorded, not claimed)" (the capacity release still probes with bare liveness, `active_async_capacity/config.rs:151`), together with a second unchecked reader, upstream `runnerExitedWithoutResult` (`await-async-run.ts:18-26`).
+
+**Impact** — A failed run whose runner lives in another PID namespace (container, sandbox) can have its slot released after the threshold while still running, over-admitting async work.
+
+**Fix** — Before the liveness probe, retain with upstream's reason when `status.pid_namespace_scope` is set and differs from `reconcile::current_pid_namespace_scope()`; apply the same guard in `child_pid_is_gone`. Check cyrup's counterpart of `runnerExitedWithoutResult` and either guard it here or record why it is excluded.
+
+**Verify** — A failed status with a foreign `pid_namespace_scope` and a dead-looking pid past the threshold is `retained` with the namespace reason.
+
+## SUBA-195 — Text still streaming when a child times out or errors is lost: the partial-output tracker is unported
+
+**Kind** upstream-drift · **Severity** low · **Effort** M · **Confidence** confirmed (both sides read; static, nothing run) · **Filed** 2026-10-09
+
+> **Filed 2026-10-09 from the pi v1.1.0 drift triage** (pi-subagents `v0.74.0..ad11b7ab`, cyrup `6b14575`).
+
+**upstream** — `9bc8f2d1` / #2653: `createPartialOutputTracker` keeps the latest unfinished assistant message from `message_update` (`src/runs/shared/partial-output.ts` @ad11b7ab); on timeout or a thrown child error it becomes the output (`Partial output before child error:` for errors), with `outputPartial: true`, never satisfying acceptance or an output file (`src/runs/foreground/execution.ts:566`, `:1547`; runner `src/runs/background/run-child-session.ts`).
+
+**cyrup** — `crates/cyrup-ext-subagents/src/exec/ndjson.rs:114` parses `MessageUpdate` but nothing consumes it (`grep -rn 'SubagentEvent::MessageUpdate' src` hits only `ndjson.rs`); `exec/mod.rs:1566-1572` builds "Partial output before timeout" only from completed output; no `output_partial` field exists. cyrup's child json mode emits `message_update` as a delta-only projection, `{type, assistantMessageEvent}`, with no cumulative `message` snapshot (`exec/ndjson.rs:99-116`).
+
+**Impact** — A child that times out mid-answer returns only the timeout sentence, discarding the visible partial answer.
+
+**Fix** — Track the streaming text per attempt by accumulating `text_delta` events per content index and resetting on `message_start` / `message_end` (cyrup cannot read a partial message snapshot the way upstream does); clear on a completed reply, keep on an errored one; use it as the partial body on timeout or child error; add `output_partial` to `SingleResult` and keep it out of acceptance and output-file saves.
+
+**Verify** — A child killed by `timeoutMs` while streaming "half an answer" returns that text under the timeout preamble with `outputPartial: true`; a tool-only completed reply before the timeout clears it.
+
+## SUBA-196 — A child ended by a per-tool timeout is reported as "Subagent timed out after {run budget}ms" with the real cause shown as partial output
+
+**Kind** upstream-drift · **Severity** low · **Effort** S · **Confidence** confirmed (both sides read; static, nothing run) · **Filed** 2026-10-09
+
+> **Filed 2026-10-09 from the pi v1.1.0 drift triage** (pi-subagents `v0.74.0..ad11b7ab`, cyrup `6b14575`).
+
+**upstream** — `ba008223` / #2694: `timeoutCause` records whichever timer fired (`src/runs/foreground/execution.ts:1215`, `:1267` @ad11b7ab); the terminal preamble uses it (`:1557`), so a tool timeout leads with the tool's own message; the run timer and the tool timer cannot both fire. Upstream emitted the same "timed out after <run timeout>ms" preamble until this commit.
+
+**cyrup** — `crates/cyrup-ext-subagents/src/exec/attempt_runner.rs:1170-1193` sets `timed_out: true` and `final_output = tool_timeout_error`; `exec/mod.rs:1556-1572` (`apply_terminal_preamble`) then prepends `format_timeout_message(opts.timeout_ms.unwrap_or(0))` and puts the tool message under "Partial output before timeout:".
+
+**Impact** — Operators read a run-deadline timeout (often "after 0ms" when no run timeout was set) for what was a single tool exceeding its limit.
+
+**Fix** — Carry the timeout cause (tool vs run) from the attempt and lead the preamble with it; do not treat the tool message as partial output.
+
+**Verify** — A child whose `bash` exceeds its tool timeout with no `timeoutMs` reports the tool-timeout sentence first and no "timed out after 0ms".
+
+## SUBA-197 — With `outputSchema`, a bound output file receives the child's closing prose instead of the structured result
+
+**Kind** upstream-drift · **Severity** low · **Effort** S · **Confidence** confirmed (both sides read; static, nothing run) · **Filed** 2026-10-09
+
+> **Filed 2026-10-09 from the pi v1.1.0 drift triage** (pi-subagents `v0.74.0..ad11b7ab`, cyrup `6b14575`).
+
+**upstream** — `8983754b` / #2673 (#2672): when a structured value exists the output file is written from `structuredText ?? fullOutput` (`src/runs/foreground/execution.ts:1582` @ad11b7ab; runner `src/runs/background/subagent-runner.ts:1389`). `docs/tool-reference.md`: "the runtime persists the structured result as indented JSON instead of the final prose". After saving, upstream sets `fullOutput = stripAcceptanceReport(resolvedOutput.fullOutput)` (`:1582-1583`), so the reply text may change too.
+
+**cyrup** — `crates/cyrup-ext-subagents/src/exec/mod.rs:745-768`: the structured value replaces `final_output` only when the prose is blank (`SUBA-126`), and `resolve_saved_output` saves `final_output`.
+
+**Impact** — A workflow step that binds `output` and `outputSchema` gets prose in the file where later steps expect the JSON contract.
+
+**Fix** — Pass `serde_json::to_string_pretty(value)` to the output-file save whenever a structured value exists. For the reply text, follow whatever upstream's post-save assignment produces rather than assuming it is unchanged.
+
+**Verify** — A child that calls `structured_output({a:1})` then says "Done." with `output: "r.json"` writes `{\n  "a": 1\n}` to `r.json`. Pin the reply text to what upstream's tests assert (`test/integration/async-execution.part-2` / `part-3` in `8983754b`), not to an unchanged "Done." by assumption.
+
+## SUBA-198 — The main watchdog never records mid-run user input in scope, so a steer typed while the agent streams is later flagged as scope drift
+
+**Kind** upstream-drift · **Severity** low · **Effort** S · **Confidence** confirmed (both sides read; static, nothing run) · **Filed** 2026-10-09
+
+> **Filed 2026-10-09 from the pi v1.1.0 drift triage** (pi-subagents `v0.74.0..ad11b7ab`, cyrup `6b14575`).
+
+**upstream** — `ff2e00bd` / #2661: `pi.on("input", (event) => runtime.handleUserInput(event))` (`src/watchdog/register-main.ts:406` @ad11b7ab); `handleUserInput` adds non-extension input with `streamingBehavior` to scope (`src/watchdog/runtime.ts:513`); changed paths are labelled as every dirty path with unverified authorship (`:855`), and `watchdog_diff`'s description says it includes other sessions' edits (`src/watchdog/diff-tool.ts:80-81`).
+
+**cyrup** — No `Input` handler in the watchdog (`grep -rn 'HostEvent::Input' crates/cyrup-ext-subagents/src` is empty); scope prompts are added only at agent start (`watchdog/runtime.rs:867`). The review input header is the bare "Changed repo paths:" (`watchdog/runtime.rs:1939`).
+
+**Impact** — False scope-drift warnings for work the user asked for mid-run; reviews treat other sessions' dirty files as this session's.
+
+**Fix** — Handle `Input` in the main watchdog: skip extension input, reset clarification as upstream does, and `scope.add_prompt(text)` when `streaming_behavior` is set; change the changed-paths header and the diff tool description to upstream's wording.
+
+**Verify** — A steer typed during a run appears in the next review's scope block; the review input carries the authorship caveat.
+
+## SUBA-199 — `worktree.cleanup` is still plan-only: reviewed plans cannot be applied
+
+**Kind** not-ported · **Severity** low · **Effort** L · **Confidence** confirmed (both sides read; static, nothing run) · **Filed** 2026-10-09
+
+> **Filed 2026-10-09 from the pi v1.1.0 drift triage** (pi-subagents `v0.74.0..ad11b7ab`, cyrup `6b14575`).
+
+**upstream** — `3ae772c9` / #2655: `mode: "apply"` with an explicit `repo` and a saved `planId` (`src/runs/shared/worktree-cleanup-apply.ts:30`, `:63`, `:157` @ad11b7ab; dispatch `src/runs/foreground/subagent-executor.ts:6701`), under `authorityPolicy.discardWorktree`, with a plan hash and 30-minute expiry, a repository lock shared with retained-resume admission (`src/runs/shared/worktree-lock.ts`), the recorded creation base, and a one-shot claim with a durable receipt.
+
+**cyrup** — `crates/cyrup-ext-subagents/src/extension/tool/lane_actions.rs:133`, `:137` refuse `mode='apply'` and `planId` ("apply/removal is not available yet"); `spawn/cleanup_plan/mod.rs:14-24` documents the plan-only state; the schema (`extension/tool/schema.rs:548-555`) says "Reserved; cleanup is plan-only".
+
+**Impact** — Stale managed worktrees must be removed by hand.
+
+**Fix** — Port the apply path behind the existing authority gate: plan persistence with hash and expiry, the shared repo lock with resume admission, a per-candidate recheck, creation-base proof, claim plus receipt, and non-forced `git worktree remove` only.
+
+**Verify** — Plan then apply on a repo with one clean terminal managed worktree removes it and writes a receipt; a dirty, locked or resumed tree is kept; re-applying the plan shows the receipt and removes nothing.
+
+## SUBA-200 — The herdr bridge marks the pane `blocked` when a child needs attention, though that attention is for the parent agent, not the user
+
+**Kind** upstream-drift · **Severity** low · **Effort** S · **Confidence** confirmed (both sides read; static, nothing run) · **Filed** 2026-10-09
+
+> **Filed 2026-10-09 from the pi v1.1.0 drift triage** (pi-subagents `v0.74.0..ad11b7ab`, cyrup `6b14575`).
+
+**upstream** — `1faa0c08` / #2703: the bridge never raises `herdr:blocked` for child attention and only emits `herdr:busy` while async work remains (`src/integrations/herdr-status.ts` @ad11b7ab; `docs/extension-api.md` Herdr section).
+
+**cyrup** — `crates/cyrup-ext-subagents/src/herdr/state.rs:317-321` (`StateModel::desired`): any `attention` entry returns `PaneAgentState::Blocked` with the attention message, ranked above `Working`.
+
+**Impact** — herdr's sidebar tells the human a pane needs them when only the parent model does.
+
+**Fix** — Keep `Blocked` only for `human_waiting`; report attention through the label / metadata (the `⚠` suffix) with state `Working` while work is active.
+
+**Verify** — Update the `state.rs` tests at `:553`, `:574`, `:642`: an attention entry with runs active yields `Working` plus the attention label; a permission dialog still yields `Blocked`.
+
+## SUBA-201 — Inspector open and close are not serialized per run, so concurrent opens can create two panes and one overwrites the other's binding
+
+**Kind** upstream-drift · **Severity** low · **Effort** S · **Confidence** confirmed (both sides read; static, nothing run) · **Filed** 2026-10-09
+
+> **Filed 2026-10-09 from the pi v1.1.0 drift triage** (pi-subagents `v0.74.0..ad11b7ab`, cyrup `6b14575`).
+
+**upstream** — `5096985c` / #2728: the dispatcher holds a file lease in the run directory around open and close per target (`src/inspectors/actions.ts` @ad11b7ab, `tryLease` from `src/shared/file-lease.ts`), across processes; status and command stay unlocked. A held lease is waited for, not refused: the dispatcher polls `tryLease` every 50 ms for up to `INSPECTOR_LEASE_WAIT_MS = 30 s` (`actions.ts:22`, `:149-155`), and only an abort ends the wait, with "was cancelled while waiting for another inspector open or close to finish".
+
+**cyrup** — `crates/cyrup-ext-subagents/src/inspectors/actions.rs:622` (`plugin.open`) and `:645` (`owner.close`) run with no lock; the herdr plugin writes a binding per target.
+
+**Impact** — Double-clicking inspect, or two sessions inspecting one run, can leave an orphaned herdr pane and a binding that close cannot reach.
+
+**Fix** — Take a per-target, pid-owned lock file in the run directory (dead-owner reclaim) around open and close, and wait for it as upstream does (50 ms polls, 30 s cap), ending early only on abort with upstream's cancellation sentence.
+
+**Verify** — Two concurrent `inspector.open` calls on one target open one pane; a racing close finds the binding the open wrote; an aborted waiter returns the cancellation sentence.
+
+## SUBA-202 — The bundled tmux inspector plugin is unported
+
+**Kind** not-ported · **Severity** low · **Effort** M · **Confidence** confirmed (both sides read; static, nothing run) · **Filed** 2026-10-09
+
+> **Filed 2026-10-09 from the pi v1.1.0 drift triage** (pi-subagents `v0.74.0..ad11b7ab`, cyrup `6b14575`).
+
+**upstream** — `cceb676c` / #2719: `createTmuxInspectorPlugin` (`src/inspectors/tmux/plugin.ts` @ad11b7ab; actions `src/inspectors/tmux/actions.ts`, client `src/inspectors/tmux/client.ts`): available when `TMUX` is set and not on Windows; splits the focused window and records a binding so status and close work. Dispatcher order Herdr → Ghostty → tmux → external, and `tmux` joins the reserved names (`docs/extension-api.md`).
+
+**cyrup** — `crates/cyrup-ext-subagents/src/inspectors/plugins.rs:67-74` registers herdr and ghostty only; `grep -rn tmux src/inspectors` is empty.
+
+**Impact** — Inside tmux, Fleet's inspect / `H` has no pane backend.
+
+**Fix** — Port the tmux plugin (split-window, pane-id binding, status via `display-message`, close via `kill-pane`), add it third in the built-in list and to the reserved external names.
+
+**Verify** — With `TMUX` set and a fake tmux client: open writes a binding and splits; status reports the pane; close kills it; an external plugin named `tmux` is rejected.
+
+## SUBA-203 — Workflow `emit()` rejects objects with undefined fields, failing the whole workflow where `return` accepts the same value
+
+**Kind** upstream-drift · **Severity** low · **Effort** S · **Confidence** confirmed (both sides read; static, nothing run) · **Filed** 2026-10-09
+
+> **Filed 2026-10-09 from the pi v1.1.0 drift triage** (pi-subagents `v0.74.0..ad11b7ab`, cyrup `6b14575`).
+
+**upstream** — `1325e95a` / #2755: `emit` normalizes with `omitUndefinedWorkflowValues` (and `undefined` → `null`) before `assertJsonValue` (`src/workflows/scripted-workflow.ts` sandbox `emit`, @ad11b7ab); the offline validator stops rejecting undefined emit values; syntax-error lines are reported relative to the user's script. Upstream's `emit` had the same un-normalized assertion until this commit.
+
+**cyrup** — `crates/cyrup-workflow-runtime/src/js/prelude.js:559-562`: `assertJsonValue(emittedValue)` runs on the raw value, so `emit({a: undefined})` throws "emit.a must contain only JSON values"; the return path already normalizes (`:590`).
+
+**Impact** — Emitting a child result with an absent optional field (for example `outputPathMapping`) kills the workflow.
+
+**Fix** — In `emit`, map `undefined` to `null` and apply `omitUndefinedWorkflowValues` before the assertion; mirror the analyzer relaxation; subtract the wrapper line from reported syntax-error positions if cyrup wraps the script.
+
+**Verify** — A script calling `emit({a: 1, b: undefined})` emits `{a:1}` and completes; `emit(undefined)` emits `null`.
 
 ## Items in this window held by `09a`
 

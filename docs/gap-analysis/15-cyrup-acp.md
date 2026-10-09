@@ -104,6 +104,28 @@ print/json, and everything below the front-end is the `AgentSession` those three
 > 3. **`e96c7e8` — Windows session-path launch** (`cross-spawn` for `.cmd` launchers): no child
 >    process in cyrup. Not applicable. (`7ddbf02`, `42926cc`, `470c7e6` are test/CI/README only.)
 
+> ### PIN 2026-10-09 — pi v1.1.0 drift triage: cyrup `6b14575` × pi-acp **`04d0a15`** (= `v0.0.34-3-g04d0a15`)
+>
+> **This is the file's current upstream pin; the v0.0.33 pins above are history.** README has recorded the tag as
+> v0.0.34 since 2026-10-02 while this file still said v0.0.33. `git -C tmp/pi-acp log --no-merges v0.0.34..04d0a15`
+> = **2** commits (`c94b3db`, `1c89fd5`; plus the merge `04d0a15` of PR #126), both read through `git show`; cyrup at
+> `6b14575`. Nothing was run. The pin is untagged, deliberately (README *CURRENT PINS*).
+>
+> **Filed (4, all low; §6, *Items filed 2026-10-09*):** `ACP-299` (auto-title from the first prompt, `c94b3db`),
+> `ACP-300` (publish the stored title on load / restore, `1c89fd5`), `ACP-301` (listing fallback normalisation,
+> `1c89fd5`), and `ACP-302` (the v0.0.34 context-usage `usage_update` lead from the 2026-09-24 post-tag block
+> above, never filed once v0.0.34 was tagged; both sides re-read by this pass). **Next free id: `ACP-303`.**
+>
+> **Read in scope and deliberately NOT filed:** `c94b3db`'s other halves (forwarding pi renames as
+> `session_info_update` exists through `config_pump` → `rename_update`, `sessions.rs:1239-1261`; the `/name` single
+> emitter is `ACP-285` / `ACP-Q20` via `RenameEcho`, which subsumes upstream's `lastPublishedTitle` dedupe).
+> `1c89fd5`: a cleared name stopping the name scan and falling back to the first prompt is already cyrup's
+> behaviour (`title_of` falls through a blank name to `first_message`; `ACP-228` recorded the clear surfacing as
+> `null`); joining text blocks with ' ' and counting code points are already done; rename-event validation does not
+> apply (`SessionInfoChanged { name: Option<String> }` is typed); the 2000-line head-scan fix does not apply
+> (`listing::list_in_dir` reads cyrup's own format in one pass). The v0.0.34 `64f680c` stats timeout and `e96c7e8`
+> Windows launch stay not applicable as ruled above.
+
 ## UNVERIFIED census 2026-09-14 — leads against the current pins
 
 > **RESOLVED 2026-09-24 (pass 2) — every lead below has a disposition; none is left unverified.**
@@ -3012,6 +3034,10 @@ unanswered), `ACP-294` (low, partial) and `ACP-296` (low, pin test absent). **Tw
 | low | ACP-296 | Legacy `skills.enableSkillCommands` resolves to a different layer — **re-read 2026-09-24 (pass 2) — stays OPEN, note present / pin absent.** Read both orders: upstream `getEnableSkillCommands` (src/acp/pi-settings.ts:47-58 @v0.0.33) deep-merges global and project first, then prefers the top-level key, so global `{enableSkillCommands:true}` + project `{skills:{enableSkillCommands:false}}` resolves **true**; cyrup migrates each layer before the merge (`migrate_settings` step 3, `crates/cyrup-config/src/settings/migrate.rs:36-41`, called per layer from `settings/layer.rs:51`) and reads `EffectiveSettings::enable_skill_commands`, so the same pair resolves **false**. The divergence is recorded in `commands.rs`'s module doc (`ACP-296`), but no test pins the combined case, which is the tabled verify. | XS | 4e | single-source |
 | low | ACP-297 | The startup prelude drops upstream's version header and update notice with no `CYRUP-DELTA` — filed 2026-09-24 (pass 2), see body below | S | 4b | verified |
 | low | ACP-298 | `session/set_config_option` `model` rejects a bare model id that upstream resolves by catalog lookup — filed 2026-09-24 (pass 2), see body below | S | 4b | verified |
+| low | ACP-299 | A new ACP session is never titled from its first prompt, so Zed's thread list shows it untitled until the user runs `/name` — **Filed 2026-10-09 from the pi v1.1.0 drift triage**, see body below | M | 4e | verified |
+| low | ACP-300 | `session/load` (and the prompt-path restore) never publishes the stored session's title, so a reopened thread loses its name in the client — **Filed 2026-10-09 from the pi v1.1.0 drift triage**, see body below | S | 4d | verified |
+| low | ACP-301 | `session/list`'s fallback title is not whitespace-normalised, and a whitespace-only first user message yields `title: null` instead of the next message — **Filed 2026-10-09 from the pi v1.1.0 drift triage**, see body below | S | 4d | verified |
+| low | ACP-302 | No `usage_update` after `session/new`, after `session/load` or on a model change, so the client's context meter is empty until the first settle and shows the old window size after a model switch — **Filed 2026-10-09 from the pi v1.1.0 drift triage**, see body below | S | 4b | verified |
 
 
 ### Items filed 2026-09-24 (pass 2)
@@ -3036,6 +3062,70 @@ means both sides were read by this pass, not that an adversary pass ran.
 **Impact** — a client (or script) that sends a bare id such as `claude-sonnet-4-5` gets an invalid-params error where pi-acp switched models. Zed's picker is unaffected: it sends the advertised `provider/id` values.
 **Fix** — in the `Model` arm, when the value contains no `/`, take the first catalog entry whose `id` equals it exactly (upstream's rule, still exact, so the CYRUP-DELTA's `"4"` example stays rejected); extend the CYRUP-DELTA to say so.
 **Verify** — unit over the lookup: catalog `[a/x, b/y]`, value `"y"` resolves to `b/y`; `"4"` and `"zz"` answer `Unknown modelId: …`; `"b/y"` unchanged.
+
+### Items filed 2026-10-09 (pi v1.1.0 drift triage; pi-acp `v0.0.34..04d0a15`)
+
+**Filed 2026-10-09 from the pi v1.1.0 drift triage.** Both sides read by this pass; `verified` in the table means
+that, not that an adversary pass ran. **Arithmetic: +4 rows** on the pass-2 figure above (152 rows), all open and
+low; re-derive the open count from the table before quoting it.
+
+**ACP-299 — A new ACP session is never titled from its first prompt, so Zed's thread list shows it untitled until the user runs `/name`.**
+
+**Kind** upstream-drift · **Severity** low · **Effort** M · **Area** 4e · **Confidence** confirmed (both sides read; static) · **Filed** 2026-10-09
+
+**upstream** — `c94b3db` ("name sessions from initial prompts"), @04d0a15: `src/acp/translate/prompt.ts:9-19` `promptToSessionTitle` joins the prompt's text blocks with ' ', collapses `/\s+/gu` to ' ', trims, and clips to 80 code points (`Array.from(...).slice(0, 80)`), or returns null. `agent.ts:887` passes the title into `session.prompt(message, images, title)`. `session.ts:247` sets `autoTitle: true` only for sessions made by `session/new` (`:275` sets false for restored ones); `session.ts:600` calls `maybeAutoTitle(t.title)` when the turn is dequeued. `maybeAutoTitle` (`:455-474`) runs once: it returns early if `lastPublishedTitle` is already set; if `getState().sessionName` is non-blank it publishes that name; otherwise it calls `setSessionName(title)` (persisting a `session_info` entry) and publishes `session_info_update {title, updatedAt}`. Errors are swallowed. `initialTitlePending` is cleared only once a title has been produced, so an image-only first prompt leaves it pending. `publishTitle` (`:444-452`) dedupes against `lastPublishedTitle`, and title updates are serialized on `titleUpdateQueue` (`:428-441`).
+
+**cyrup** — `crates/cyrup-acp/src/sessions.rs:1941` `new_session` builds the runtime and returns with no title state; `:2541` `serve_prompt` goes from `prompt_to_user_input` (`:2547`) to `restore_session` to `intercept` to the turn, and nothing derives or sets a name. The crate emits `session_info_update` from two places only: `commands.rs:798` (the `/name` arm) and `sessions.rs:1256` `rename_update` (the pump's `SessionInfoChanged` arm). `grep -rni 'auto_title\|title_from\|auto_name' crates --include=*.rs` returns nothing.
+
+**Impact** — An editor client such as Zed shows every new cyrup ACP thread as untitled (`session/list`'s `title_of` falls back to the clipped first message, so only the listing has a usable label). Upstream also names the session in the session file, so the name appears in `cyrup --resume` pickers for sessions started from the editor. Cosmetic.
+
+**Fix** — Add `prompt_to_session_title(blocks: &[ContentBlock]) -> Option<String>` beside `prompt_to_user_input` in `commands.rs`: text blocks only, joined with ' ', Unicode whitespace runs collapsed to ' ', trimmed, `chars().take(80)`, or `None` when empty (`ACP-300` and `ACP-301` reuse it). Give `LiveSession` an `initial_title_pending` flag, true only on the `new_session` path. In `serve_prompt`, on the first non-builtin prompt that yields a title, clear the flag and, under a `RenameEcho` claim so the pump does not double-emit: if `session.session_name()` is non-blank emit `session_info_update(Some(that))`, otherwise `set_session_name(title)` and emit `session_info_update(Some(title), now)` before the turn's first chunk. Swallow failures. Record as a `[CYRUP-DELTA]` that cyrup fires this at prompt admission rather than at dequeue, if that is where it lands.
+
+**Verify** — Component test: `session/new`, then `session/prompt` with text blocks `"  Fix\n\nthe   bug  "` and `"now"` emits exactly one `session_info_update` with `title == "Fix the bug now"`, and the session file's last `session_info.name` equals it; a second prompt emits no further title update; a session `/name`d before its first prompt keeps that name; a restored session (`session/load` then prompt) is never auto-titled; an 81-code-point prompt with an astral character clips to 80 chars; an image-only first prompt leaves the flag pending.
+
+**ACP-300 — `session/load` (and the prompt-path restore) never publishes the stored session's title, so a reopened thread loses its name in the client.**
+
+**Kind** upstream-drift · **Severity** low · **Effort** S · **Area** 4d · **Confidence** confirmed (both sides read; static) · **Filed** 2026-10-09
+
+**upstream** — `1c89fd5` ("restore session titles and validate rename events"), @04d0a15: `src/acp/agent.ts:224-225`, inside `restoreSession` (used by `loadSession` `:950` and by the prompt, mode and config paths `:450`, `:1148`, `:1155`, `:1170`), calls `readPiSessionTitle(stored.sessionFile)` then `await session.publishTitle(title, null)`. `pi-sessions.ts:273-280` `readPiSessionTitle` resolves the newest `session_info.name` (a cleared name counts and stops the scan), else the first user message through `promptToSessionTitle`. `session.ts:444-452` `publishTitle(title, updatedAt = now)` omits `updatedAt` when passed null, so a restore does not bump the client's activity time. Ordering: upstream publishes the title inside `restoreSession`, i.e. **before** `loadSession` replays history and before the `LoadSessionResponse`; `loadSession` closes the live session first, so the `maybeGet` short-circuit never applies to load.
+
+**cyrup** — `crates/cyrup-acp/src/sessions.rs:2100-2146` `prepare_load` returns `replay` + response + `follow_up: [available_commands_update]`, with no `session_info_update`; `:1856` `restore_session` (the prompt-path restore) emits nothing either. `crates/cyrup-acp/src/config_options.rs:929` `session_info_update(name: Option<String>, updated_at: String)` always sets `updatedAt` and cannot express the omitted-timestamp form.
+
+**Impact** — After the editor reloads a cyrup thread, the client gets no title notification for it: it keeps whatever its `session/list` row said, or shows the thread untitled when it was opened by id. A rename made in another front-end before the load is never pushed. Cosmetic.
+
+**Fix** — Make `session_info_update` take `updated_at: Option<String>` and set the field only when `Some`; the two existing callers pass `Some(now)`. In `prepare_load`, compute the title from the rebuilt session: `session_name()` when the newest `session_info` is non-blank, else the first user message normalised by `ACP-299`'s `prompt_to_session_title` (this rung depends on `ACP-299`). When `Some`, emit `session_info_update(Some(title), None)`. Do the same at the end of `restore_session`'s build branch, not on its live short-circuit (upstream's `maybeGet` early return). **Placement:** upstream's order is before the replay and the response; putting the update after the response, beside `available_commands_update`, is defensible because ACP-217 records that Zed ignores notifications for an unknown sessionId, but it is a divergence and must be recorded as a `[CYRUP-DELTA]`; otherwise follow upstream's order. Land with `ACP-301`, which shares the normaliser.
+
+**Verify** — A session file with a `session_info` name `"saved"`: `session/load` emits one `session_info_update` with `title:"saved"` and no `updatedAt` key, at the position the fix chose (upstream's order, or the recorded delta); a file with no name and first user message `"hello   world"` gives `title:"hello world"`; a file whose last `session_info` clears the name falls back to the first prompt, not an older name; a file with neither emits no update.
+
+**ACP-301 — `session/list`'s fallback title is not whitespace-normalised, and a whitespace-only first user message yields `title: null` instead of the next message.**
+
+**Kind** upstream-drift · **Severity** low · **Effort** S · **Area** 4d · **Confidence** confirmed (both sides read; static) · **Filed** 2026-10-09
+
+**upstream** — `1c89fd5`, @04d0a15: `src/acp/pi-sessions.ts:233-271` `pickFallbackTitleFromHead` runs every user message through `promptToSessionTitle` (`translate/prompt.ts:9-19`: join text blocks with ' ', collapse `/\s+/gu`, trim, clip to 80 code points), moves on to the next user message when the result is null, and scans `lines.slice(0, 2000)` (`:236`; the pre-fix loop broke after the first line of any file over 2000 lines). `listPiSessions` uses it through `readPiSessionTitle` (`:300`), whose `name || pickFallbackTitleFromHead` makes a cleared name stop the scan and fall back to the first prompt.
+
+**cyrup** — `crates/cyrup-acp/src/sessions.rs:479-492` `title_of` checks emptiness on `first_message.trim()` but returns `info.first_message.chars().take(80)` (`:491`) on the untrimmed, uncollapsed string, so leading whitespace and newlines reach the wire. `crates/cyrup-session/src/listing.rs:415-421` assigns the first user message with non-empty `role_text` to `first_message` without normalising it, so a whitespace-only message becomes `first_message` and `title_of` maps it to `None` instead of trying the second. **Already converged, not owed:** `title_of` filters a blank name and falls through to `first_message`, which is 1c89fd5's new cleared-name behaviour (v0.0.34 had skipped blank entries and used an older name). The doc comment at `:466-478` still lists deltas (2) and (3) (joining text blocks, counting code points), which now match upstream. The 2000-line head-scan fix does not apply (cyrup reads its own format in one pass).
+
+**Impact** — A listed session whose first prompt starts with a blank line or contains newlines shows a title with raw newlines or leading spaces in the client's picker; a session opened with a whitespace-only prompt shows no title. Display only.
+
+**Fix** — Build `title_of`'s fallback with `ACP-299`'s normaliser (collapse whitespace runs, trim, clip at 80 chars). To skip whitespace-only messages, have `listing::scan_file` skip a user message whose `role_text.trim()` is empty when picking `first_message`, or, if `cyrup-session` is not this port's to reshape, record that as a `[CYRUP-DELTA]` beside the existing sentinel note. Rewrite the doc comment at `:466-478`, since deltas (2) and (3) now match upstream. Land with `ACP-300`.
+
+**Verify** — Unit tests on `title_of`: `first_message = "\n  Fix\tthe\n bug "` gives `Some("Fix the bug")`; a 100-char message with internal newlines gives 80 chars with no `\n`. A listing test over a file whose first user message is `"   "` and second is `"real"` gives `title:"real"` (or the recorded delta).
+
+**ACP-302 — No `usage_update` after `session/new`, after `session/load` or on a model change, so the client's context meter is empty until the first settle and shows the old window size after a model switch.**
+
+**Kind** upstream-drift · **Severity** low · **Effort** S · **Area** 4b · **Confidence** confirmed (both sides read; static) · **Filed** 2026-10-09
+
+**upstream** — pi-acp **v0.0.34** (`b21894c`, `64f680c`; the lead recorded in this file's 2026-09-24 post-tag block, never filed once v0.0.34 was tagged). `git -C tmp/pi-acp show v0.0.34:src/acp/agent.ts`: `session.publishContextUsage()` (`session.ts:446`) is awaited after the `session/new` response is delivered (`agent.ts:400-406`, "Publish real context usage now that the client knows the sessionId … so the window size is correct before the first prompt"), after `session/load` (`:1088-1093`, before `available_commands_update`), in `unstable_setSessionModel` (`:1157`) and after a `model` `set_config_option` (`:1199`, "A different model can mean a different context window; refresh it immediately"), as well as at settle (`session.ts:463`).
+
+**cyrup** — cyrup emits `usage_update` only at settle: `crates/cyrup-acp/src/turn.rs:1490` (`TurnActor::on_event`'s `Settled` arm → `self.agent.usage()` → `usage_update(stats)`, `:771`), forwarded by `AcpTurnAgent::usage` (`sessions.rs:1106`). `grep -n '\.usage()' crates/cyrup-acp/src/*.rs` shows that one call site and the forwarder only: nothing after `session/new` (`new_session`), `session/load` (`prepare_load`'s follow-up carries only `available_commands_update`), or a model change (`config_pump`'s `ModelChanged` arm sends only `config_option_update`).
+
+**Impact** — Zed's context-window meter is empty from session creation or load until the first turn settles, and after a model switch it shows the previous model's window size until the next settle. Display only.
+
+**Fix** — Emit the existing `usage_update(&session_stats())` (or `None` → nothing) in the three places upstream does: after the `session/new` response and after the `session/load` response (both before `available_commands_update`, in the ordered follow-up), and in `config_pump`'s `ModelChanged` arm after the `config_option_update`. Keep cyrup's extra `cost` field.
+
+**Verify** — Component tests: `session/new` emits one `usage_update` (with `size` = the model's context window) after the response and before `available_commands_update`; `session/load` likewise; a `model` `set_config_option` to a model with a different window emits a `usage_update` with the new `size`; a session whose stats have no `context_usage` emits none.
+
+**Notes** — Filed by this triage from the mcp-acp lane's flag (outside its `v0.0.34..04d0a15` window but never filed); both sides read by this pass.
 
 ---
 

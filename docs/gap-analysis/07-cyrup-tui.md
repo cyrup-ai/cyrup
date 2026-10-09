@@ -2,6 +2,40 @@
 
 This area covers `cyrup/crates/cyrup-tui` (the interactive chat UI: transcript, editor, footer, selectors, themes, images, keymap, autocomplete, startup panel, terminal negotiation) plus the TUI wiring in `cyrup/crates/cyrup/src/main.rs`. It is measured against `pi/packages/tui/` (rendering primitives and terminal control) and `pi/packages/coding-agent/src/modes/interactive/` (components and `interactive-mode.ts`).
 
+> ### PIN 2026-10-09 — pi v1.1.0 drift triage: cyrup `6b14575` × pi **`f1b2e77f5`** (= `v1.1.0-11-gf1b2e77f5`)
+>
+> **Window read:** pi `v1.0.1..f1b2e77f5`, `git log --no-merges` over `packages/tui` and
+> `packages/coding-agent/src/modes/interactive` = **21** commits, each read; upstream through `git -C tmp/pi show`
+> only, cyrup at `6b14575`. Nothing was run. The pin is untagged, deliberately (README *CURRENT PINS*).
+>
+> **Filed (10, all low):** `TUI-171` (OSC 7501 program status, `503c60552`; the root record `SUBA-186` assumes),
+> `TUI-172` (hardware cursor, `1cedd3272`), `TUI-173` (Home/End in fullscreen, `6100fe5a8`; **schedule first**),
+> `TUI-174` (`!!` header colour) and `TUI-175` (`outputPad` everywhere), both `18336987a` and both filed by the TUI
+> and tools lanes and merged, `TUI-176` (Herdr capabilities, `b2363841a`), `TUI-177` (key-spec grammar,
+> `7f9e1198f`; pairs with `CFG-103`), `TUI-178` (strict theme validation, `7f9e1198f`), `TUI-179` (Ruby `subst`,
+> `b9ab918c6`), `TUI-180` (`ENOTTY` dead terminal, `4c6b724ea`; the lane recorded it as a lead and this pass
+> confirmed it on both sides).
+>
+> **Read in scope and deliberately NOT filed:**
+> * `1cedd3272`'s overlay `CURSOR_MARKER` compositing fix: ratatui has no in-band marker and `app/render.rs:134`
+>   hides the hardware cursor while an overlay is up.
+> * `b9ab918c6`'s multiline half: syntect keeps the scope stack across lines (`markdown/highlight.rs:345`, `:382`,
+>   `:439`).
+> * `7f9e1198f`: the shifted-symbol *match* (needs `REPORT_ALTERNATE_KEYS` / modifyOtherKeys, withheld as the
+>   recorded `TUI-046` delta; the decoder already substitutes the shifted key when sent); `THEME_TOKENS`
+>   (same five fallbacks, a refactor); the `/`-in-name theme check (predates the window); `$schema` URL changes;
+>   `SETTINGS_DEFAULTS` in the settings selector (`anthropicExtraUsage` default unchanged).
+> * `83c9e2645` (clear the fullscreen selection on transcript rebuild): `App::rebind_session` already calls
+>   `alt.reset_selection()` (`app/session_bind.rs:35`); pi's other rebuild callers have no transcript-rebuild
+>   counterpart in cyrup (`apply_tree_nav_outcome` only appends, `app/tree_nav.rs:191-250`).
+> * `4c6b724ea`'s crash-record half (cyrup records no crashes, `TUI-118`); its `ENOTTY` half is `TUI-180`.
+> * `36a686ee8` (ported, ledger UPDATE 2026-10-09); `1b094148b` (ruled in area 18, `18-pi-codemode.md:335`).
+> * Release / changelog / package-only: `dce4ae6f7`, `75a99721d`, `28dcce2ba`, `997d31f28`, `200387122`,
+>   `4c6fb7cfe`, `abe508e1b`, `7c10bd433`, `d78dc83d6`, `cd32f7725`.
+>
+> **Lead, not filed:** `18336987a`'s export-html `outputPad: 1` (`core/export-html/tool-renderer.ts`) was not read
+> against cyrup's export path.
+
 > ### CLOSURES 2026-09-28 — six lows (`TUI-040`, `TUI-065` as a divergence, `TUI-066`, `TUI-071`, `TUI-108`, `TUI-S02`); one not closed (`TUI-050`)
 >
 > The tui-input lane. This work is on `claude/lows-next` and not yet committed. Each row and body section carries
@@ -841,7 +875,7 @@ above opened nothing, closed nothing and re-severitied nothing.
 
 ## Open items
 
-> **Next free id: `TUI-171`** (2026-10-08, the headless Anthropic login audit (`PROV-120`, area 01) closed `TUI-145` and filed and closed `TUI-167`…`TUI-169`, and its second review filed and closed `TUI-170`; before that 2026-10-06, after the codemode change filed `TUI-165` and `TUI-166`; before that 2026-10-05, after the fullscreen shortfalls pass filed `TUI-150`…`TUI-164`; before that 2026-10-04, after the fullscreen change filed `TUI-147`…`TUI-149`; before that 2026-10-03, after the post-pin triage filed `TUI-145` and `TUI-146`; before that 2026-10-02, after the pi v1.0.0 pass filed `TUI-130`…`TUI-144`; `TUI-129` was never allocated and is still free).
+> **Next free id: `TUI-181`** (2026-10-09, the pi v1.1.0 drift triage filed `TUI-171`…`TUI-180`; before that `TUI-171`, 2026-10-08, the headless Anthropic login audit (`PROV-120`, area 01) closed `TUI-145` and filed and closed `TUI-167`…`TUI-169`, and its second review filed and closed `TUI-170`; before that 2026-10-06, after the codemode change filed `TUI-165` and `TUI-166`; before that 2026-10-05, after the fullscreen shortfalls pass filed `TUI-150`…`TUI-164`; before that 2026-10-04, after the fullscreen change filed `TUI-147`…`TUI-149`; before that 2026-10-03, after the post-pin triage filed `TUI-145` and `TUI-146`; before that 2026-10-02, after the pi v1.0.0 pass filed `TUI-130`…`TUI-144`; `TUI-129` was never allocated and is still free).
 
 > **This table carries a trailing `Dedup` column (added 2026-10-02).** It holds
 > `duplicate-of: <ID>` for a row whose finding another area owns, exactly as area 12's does, and
@@ -1274,6 +1308,16 @@ above opened nothing, closed nothing and re-severitied nothing.
 | ~~TUI-168~~ | ~~low~~ **CLOSED 2026-10-08 — record-only `[CYRUP-DELTA]`** | cyrup-original | S | **Filed 2026-10-08 and closed on arrival** (the headless Anthropic login audit for `PROV-120`, area 01). **A `manual_code` prompt now shows its placeholder; pi drops it.** pi's `showAuthPrompt` calls `dialog.showManualInput(prompt.message)` for `manual_code` and discards `prompt.placeholder` (`interactive-mode.ts:6282-6283` @v1.1.0). Only `showPrompt` renders `e.g., <placeholder>` (`login-dialog.ts:154-158`). The Anthropic flows put the paste shape there: `code#state` for copy-code, the redirect URL for the browser flow. On a headless host that hint is the only description of what to paste, so cyrup keeps it. `show_auth_prompt` routes `manual_code` to `LoginDialog::show_manual_code` with the placeholder (`crates/cyrup-tui/src/login_dialog.rs:1003-1016`, `:424`). It is drawn muted inside the empty field (`:606`), adds no row, and disappears on the first keystroke. The `[CYRUP-DELTA]` is recorded in the module doc (`:59-64`). To restore strict parity, drop the placeholder in `show_manual_code`. Test: `login_dialog.rs` `a_manual_code_prompt_shows_its_placeholder_in_the_empty_field`; end to end, `tests/login_flow.rs` `real_anthropic_login_offers_copy_code_and_shows_a_copyable_headless_url`. |
 | ~~TUI-169~~ | ~~low~~ **CLOSED 2026-10-08** | parity-bug | S | **Filed 2026-10-08 and closed on arrival** (the headless Anthropic login audit for `PROV-120`, area 01). **The browser launcher ran in the TUI's foreground process group, so a console browser could take the terminal from the TUI.** Over SSH, or in a container with no `DISPLAY`, `xdg-open` falls back to `www-browser`/`lynx`/`w3m`. pi spawns the launcher with `detached: true` (`packages/coding-agent/src/utils/open-browser.ts:21`), which is `setsid(2)` on POSIX, so nothing it starts can read the user's keystrokes or switch the tty out of raw mode. cyrup's `open_browser` spawned with the inherited process group. **Fix** — `launcher` (`crates/cyrup-tui/src/open_browser.rs:87`) applies `detach` (`:120`), which calls `cyrup_tools::detach_into_new_session` (`crates/cyrup-tools/src/ops/local/command.rs:75`): a `pre_exec` `setsid`, upstream's exact semantics. The TUI crate is `#![forbid(unsafe_code)]`, so the hook lives in `cyrup-tools`, which already isolates its unix process `unsafe` (the `bash` tool's `setsid`). The launcher has no controlling terminal, so a console browser cannot even open `/dev/tty`. The first fix was `CommandExt::process_group(0)` and relied on `SIGTTIN`/`SIGTTOU` to stop a background group that touched the tty; the end-to-end check in the real binary showed that is no defence when cyrup is launched as `tmux new-session cyrup`, because tmux 3.4 leaves both signals ignored for a pane command, and a fake `xdg-open` running `stty -echo raw < /dev/tty` succeeded (exit 0) underneath the live TUI. From an interactive shell the same probe was stopped (`T`). With `setsid` neither case can reach the tty. On Windows `detach` does nothing (`:126`). A missing launcher was already silent and non-blocking (`launch`, `:102`), and is now pinned. Tests: `open_browser.rs` `the_launcher_leads_its_own_session_without_a_controlling_terminal` (Linux; asserts session id == pid, a different session from the test's, and `tty_nr == 0`; red against `process_group(0)` on the session assertion), `a_missing_launcher_is_silent_and_does_not_block`. |
 | ~~TUI-170~~ | ~~low~~ **CLOSED 2026-10-08 — `[CYRUP-DELTA]`, a cyrup improvement over upstream** | cyrup-original | S | **Filed 2026-10-08 and closed on arrival** (second review of the headless Anthropic login audit for `PROV-120`, area 01). **Over SSH inside tmux, copying the sign-in URL (ctrl+x, `TUI-145`) or anything else reported `Copied URL to clipboard` while the text never reached the user's clipboard.** pi's `emitOsc52` writes the bare `ESC ] 52 ; c ; <base64> BEL` (`coding-agent/src/utils/clipboard.ts:15-22` @v1.1.0), and so did cyrup. tmux's default `set-clipboard external` discards an application's OSC 52, and since tmux 3.3 a DCS passthrough is dropped unless `allow-passthrough on`; the remote OSC 52 route exists for exactly this SSH case, yet it reported success for a write that went nowhere. pi has the same gap (its alt-screen copy comment names tmux, `tui/src/tui-alt-screen.ts:1469-1472` @v1.1.0, but nothing routes around it). **Fix** — `ClipboardEnv` gains `multiplexer` (`crates/cyrup-tui/src/clipboard.rs:92`), read by `Multiplexer::from_env` (`:105`, `:120`) from `$TMUX`, then `$STY` (GNU screen). `emit_osc52` (`:337`, used by both OSC 52 sites in `copy_to_clipboard`, `:578`, `:590`) writes the escape in `osc52_for_terminal`'s shape (`:306`): unchanged outside a multiplexer, so a plain terminal gets pi's exact bytes; tmux's DCS passthrough `ESC P tmux; <seq with every ESC doubled> ESC \`; screen's `ESC P … ESC \` in 76-byte pieces (`SCREEN_DCS_CHUNK`, `:292`). Inside tmux the text also goes to `tmux load-buffer -w -`, which on tmux ≥ 3.2 sets the outer terminal's clipboard itself under the default `set-clipboard external` and without `allow-passthrough`; the passthrough covers tmux < 3.2, which has no `-w` and always passes DCS through. Both arriving only sets the same text twice. These are the routes hterm's `osc52.sh`, vim-oscyank (the wrappers and screen's chunk size) and Helix's tmux provider / `tmux-yank` (`load-buffer -w`) use. As upstream, the escape cannot be verified, so success is the emit; an oversized payload still fails with pi's message and writes nothing. Tests: `tests/clipboard.rs` `the_multiplexer_is_read_from_tmux_then_sty`, `a_plain_terminal_gets_the_bare_escape_unchanged`, `tmux_gets_the_escape_in_its_dcs_passthrough_with_esc_doubled`, `screen_gets_the_escape_in_76_byte_dcs_chunks` (exact bytes, and the chunks reassemble to the escape). `tmux load-buffer -w -` was checked by hand under tmux 3.4 inside a pane: exit 0, and `show-buffer` returns the text. |
+| TUI-171 | low | not-ported | M | **cyrup never reports program status over OSC 7501: a terminal that supports the Program Status Protocol shows no working, blocked, done or error state for a cyrup session** **Filed 2026-10-09 from the pi v1.1.0 drift triage**; body below. |  |
+| TUI-172 | low | upstream-drift | S | **With `showHardwareCursor` on, cyrup still paints its reverse-video caret under the terminal cursor; pi 1.1 drops the drawn caret of the focused editor or input so only the terminal cursor shows** **Filed 2026-10-09 from the pi v1.1.0 drift triage**; body below. |  |
+| TUI-173 | low | upstream-drift | S | **In fullscreen (cyrup's default mode), Home and End scroll the transcript instead of moving the editor caret; pi 1.0.3 moved transcript top/bottom to Ctrl+Home/Ctrl+End and gave Home/End back to the editor. Schedule first among this triage's lows** **Filed 2026-10-09 from the pi v1.1.0 drift triage**; body below. |  |
+| TUI-174 | low | upstream-drift | S | **A `!!` (excluded-from-context) command's `$ command` header is still bash-green; pi now dims it like the border and spinner** **Filed 2026-10-09 from the pi v1.1.0 drift triage**; body below. |  |
+| TUI-175 | low | upstream-drift | M | **`outputPad: 0` pads only user, assistant and thinking blocks; tool rows (the edit renderer included), `!` bash blocks, compaction and branch summaries, skill blocks, the default custom-message box and custom-entry failure boxes stay hard-wired to one column** **Filed 2026-10-09 from the pi v1.1.0 drift triage**; body below. |  |
+| TUI-176 | low | upstream-drift | S | **Inside a Herdr pane cyrup emits no OSC 8 links, and if the outer terminal's `KITTY_WINDOW_ID` (or similar) leaks into the pane it turns on Kitty images Herdr does not forward; pi 1.1 checks `TERM_PROGRAM=herdr` first** **Filed 2026-10-09 from the pi v1.1.0 drift triage**; body below. |  |
+| TUI-177 | low | upstream-drift | S | **A key spec that names `+` (`"+"`, `"ctrl++"`) is rejected as invalid, and a malformed spec (`"ctrl+ctrl+a"`, `"a+b"`) is silently accepted; pi 1.1's `parseKeyId` takes the reverse view of both** **Filed 2026-10-09 from the pi v1.1.0 drift triage**; body below. |  |
+| TUI-178 | low | upstream-drift | S | **Theme JSON with unknown keys in `colors`, in `export`, or at the top level loads silently in cyrup; pi 1.1 made its runtime theme validation strict and rejects it with a named error** **Filed 2026-10-09 from the pi v1.1.0 drift triage**; body below. |  |
+| TUI-179 | low | upstream-drift | S | **Code inside a Ruby string interpolation keeps the string colour in cyrup's highlighter (`"a #{foo} b"`); pi 1.0.4 maps highlight.js `subst` to the `text` colour** **Filed 2026-10-09 from the pi v1.1.0 drift triage**; body below. |  |
+| TUI-180 | low | upstream-drift | S | **The dead-terminal check still misses `ENOTTY`, which pi added for revoked macOS ttys, so a restore write failing with `ENOTTY` is not treated as a dead terminal** **Filed 2026-10-09 from the pi v1.1.0 drift triage**; body below. |  |
 
 ## TUI-042 — The undo snapshot omits the paste registry — undoing a delete over a `[paste #N …]` marker silently drops the pasted content from the submitted message
 
@@ -4257,6 +4301,180 @@ once, under `SESS-065`.
 **Fix**      — `M`, and read the scope line first. **Only the overlay and the menu placement are this row**: the credential flow belongs to area 01 (`auth/oauth/radius.ts`), and writing `"auth": { "provider": "radius" }` into the global `mcp.json` belongs to the MCP areas (`13b-mcp-config.md`). The shimmer needs `mixColors` in sRGB from `TUI-131`, so it is blocked on that. Two pieces of the changelog's behaviour are worth porting independently of the animation and are cheap: the top-level last-entry placement with its status, and "cancelling a login returns to the menu it was started from".
 
 **Verify**   — `/login` lists "Sign in with Radius" last at the top level with its configured status; cancelling it returns to the `/login` menu rather than the editor; the shimmer advances on a 50 ms timer and stops when the overlay closes.
+
+## Findings filed 2026-10-09 — the pi v1.1.0 drift triage
+
+## TUI-171 — cyrup never reports program status over OSC 7501: a terminal that supports the Program Status Protocol shows no working, blocked, done or error state for a cyrup session
+
+**Kind** not-ported · **Severity** low · **Effort** M · **Confidence** confirmed (both sides read; static, nothing run) · **Filed** 2026-10-09
+
+> **Filed 2026-10-09 from the pi v1.1.0 drift triage** (pi `v1.0.1..f1b2e77f5` = v1.1.0+11, `packages/tui` + `modes/interactive`, cyrup `6b14575`).
+
+**upstream** — `503c60552` (#10607), @f1b2e77f5. `packages/tui/src/program-status.ts:1-53` (new): `PROGRAM_STATUS_QUERY = "\x1b]7501;?\x1b\\"`, `isProgramStatusReply`, `formatProgramStatus` (state / app / kind / base64 msg, control characters replaced, 2048-byte cap). `packages/tui/src/terminal.ts:165-169`, `:239-246`, `:286-299`, `:573-585`: the query rides between the kitty flags query and the DA1 sentinel, support counts only if the reply arrives before DA1, `PI_PROGRAM_STATUS=1|0` overrides detection, `stop()` writes `state=clear`, `start()` re-sends the last status. `packages/coding-agent/src/modes/interactive/program-status-reporter.ts:1-111` (new): working during runs and compaction; blocked (kind permission / question / auth) while an extension dialog or login waits; then done, error (first line of the error) or idle (aborted run) once `agent_settled` fires. Wired at `interactive-mode.ts:551, 1000, 2095, 2729, 2742, 2810, 2823, 2854, 2866, 3412, 6321, 6334`; documented in `docs/terminal-setup.md:221-233` and `docs/environment-variables.md:92`.
+
+**cyrup** — `git grep -n -i '7501\|program_status\|ProgramStatus\|PROGRAM_STATUS' 6b14575 -- 'crates/*.rs'` returns nothing, and no area file mentioned it. The startup probe this would ride on is `crates/cyrup-tui/src/keyboard_protocol.rs:336` `negotiate()`, which sends the push, `KITTY_FLAGS_QUERY` (`:175-176`) and the DA1 sentinel (`terminal_query.rs:118`). OSC 9;4 progress has a writer (`terminal_progress.rs:149` `TerminalProgress`); nothing writes OSC 7501. The `aborted` flag on `agent_settled` the reporter needs is already ported (cyrup:ext 0.19). cyrup's herdr agent-status reporting goes over herdr's socket API for subagent panes, not OSC 7501 for the main session, so it does not cover this.
+
+**Impact** — On a terminal or multiplexer that implements the protocol, where pi lights a per-pane working / blocked / done badge, cyrup shows nothing; in particular nothing says a cyrup pane is waiting on a permission or login dialog. Nothing breaks. Prompts and model output are never reported, so a port has no privacy cost. `SUBA-186` (area 09b, the subagents' per-run records) assumes this root record exists.
+
+**Fix** — Port `program-status.ts` as `crates/cyrup-tui/src/program_status.rs`. In `keyboard_protocol::negotiate`, put `PROGRAM_STATUS_QUERY` between `CSI ? u` and DA1 and accept a 7501 reply only if it arrives before DA1; honour `CYRUP_PROGRAM_STATUS=1|0`. Add a `ProgramStatusReporter` on `App`, fed from the session-event fold (`agent_start`, assistant `message_end`, `compaction_start` / `compaction_end`, `agent_settled{aborted}`, `session_info_changed`); call `set_blocked` from the extension select / confirm / input / editor dialog open and close paths and from `/login` (kind `auth`, message `Log in to <provider>`); `reset()` on session rebind; write `state=clear` in the teardown / suspend restore and re-send on resume; deduplicate as pi's `lastReport` does.
+
+**Verify** — Port `packages/tui/test/program-status.test.ts` (encoding, app pattern, control-character replacement, UTF-8 truncation) and `packages/coding-agent/test/program-status-reporter.test.ts` (run → working → done; error then successful retry → done; aborted → idle; manual compaction error → error; nested dialogs report the latest). For negotiation, a fake tty that answers `ESC]7501;?ESC\` before `CSI ?62c` enables reports and one that answers DA1 only does not. Red without the fix.
+
+## TUI-172 — With `showHardwareCursor` on, cyrup still paints its reverse-video caret under the terminal cursor; pi 1.1 drops the drawn caret of the focused editor or input so only the terminal cursor shows
+
+**Kind** upstream-drift · **Severity** low · **Effort** S · **Confidence** confirmed (both sides read; static, nothing run) · **Filed** 2026-10-09
+
+> **Filed 2026-10-09 from the pi v1.1.0 drift triage** (pi `v1.0.1..f1b2e77f5` = v1.1.0+11, `packages/tui` + `modes/interactive`, cyrup `6b14575`).
+
+**upstream** — `1cedd3272`, @f1b2e77f5. `packages/tui/src/tui.ts:198-207` adds the `FAKE_CURSOR_START` / `END` APC markers and `renderFakeCursor`; `:1478-1484` `resolveFakeCursors`: when `showHardwareCursor` is set, the fake cursor right after `CURSOR_MARKER` (the focused component's) is removed and every other fake cursor becomes `\x1b[7m…\x1b[27m`. `components/editor.ts:591`, `:596` and `components/input.ts:433`, `:491` emit `renderFakeCursor(...)`. The settings description becomes "Use the terminal cursor instead of Pi's drawn cursor" (`modes/interactive/components/settings-selector.ts:812`). The commit's overlay-compositing fix for a dropped `CURSOR_MARKER` (`utils.ts` `extractSegments`) does not apply: `app/render.rs:134` hides the hardware cursor while any overlay is up.
+
+**cyrup** — `crates/cyrup-tui/src/editor/render.rs:317` sets `cursor_style = base.add_modifier(Modifier::REVERSED)` without checking `show_hardware_cursor`, and `:136`, `:146`, `:162` always draw the caret cell with it; `:445` only adds `set_cursor_position` on top, so both cursors show. The selector search caret is always reversed too (`selector/mod.rs:198-205`). `app/render.rs:134-153` places the hardware cursor when the flag is on. The `/settings` row still says "Show the terminal cursor while still positioning it for IME support" (`app/settings_rows.rs:116-117`).
+
+**Impact** — Users who enable `showHardwareCursor` get a doubled caret, the terminal's block or bar over a reverse-video cell. On terminals that extend edge-cell colours into the window padding (the reason for the upstream change), a drawn caret at column 0 or the last column paints a coloured stripe into the padding. Cosmetic.
+
+**Fix** — In `InputEditor::render`, use `base` instead of `cursor_style` for the caret cell when `self.show_hardware_cursor` is set and the editor has focus, gating focus on the same condition `app/render.rs:134` uses (no selector and no overlay owns the slot). Keep the caret for an unfocused editor, as pi does and as the E13 comment near `render.rs:318` requires. Do the same in the selector `search_input_spans` path; that is harder, because `selector::caret_cell` (`render.rs:149-153`) and `tests/selector_cursor.rs:77` find the caret by scanning for the REVERSED cell, so thread the input's own caret column through before dropping the style. Update the settings description to pi's text.
+
+**Verify** — An editor render test with `set_show_hardware_cursor(true)` and focus: the caret cell carries no `REVERSED` and `set_cursor_position` is still called at that cell; with the flag off the cell is `REVERSED` as before. The same pair for a selector search box, checking the hardware cursor still lands on the typed position. Mirror pi's `tui-render.test.ts` cases from `1cedd3272`. Red without the fix.
+
+## TUI-173 — In fullscreen (cyrup's default mode), Home and End scroll the transcript instead of moving the editor caret; pi 1.0.3 moved transcript top/bottom to Ctrl+Home/Ctrl+End and gave Home/End back to the editor. Schedule first among this triage's lows
+
+**Kind** upstream-drift · **Severity** low · **Effort** S · **Confidence** confirmed (both sides read; static, nothing run) · **Filed** 2026-10-09
+
+> **Filed 2026-10-09 from the pi v1.1.0 drift triage** (pi `v1.0.1..f1b2e77f5` = v1.1.0+11, `packages/tui` + `modes/interactive`, cyrup `6b14575`).
+
+**upstream** — `6100fe5a8` (#10314), @f1b2e77f5. `packages/tui/src/keybindings.ts:208-209`: `tui.altScreen.top` is now `ctrl+home` and `tui.altScreen.bottom` is `ctrl+end` (were `home` / `end`). `:98-105`: `tui.editor.cursorLineStart` / `cursorLineEnd` lose `ctrl+home` / `ctrl+end` and are `["home","ctrl+a"]` / `["end","ctrl+e"]`. `docs/keybindings.md:60-61`, `:116` match.
+
+**cyrup** — `crates/cyrup-tui/src/keymap.rs:2337-2338` still binds `Key::plain(KeyCode::Home)` → `AltScreenAction::Top` and `Key::plain(KeyCode::End)` → `AltScreenAction::Bottom`; the docs at `:2176-2180` say "Default `home`" / "`end`". The editor table carries `ctrl_code(Home)` / `ctrl_code(End)` at `:1985` and `:1988` (added for `TUI-072`). `app/input.rs:58-71` offers every key to `alt.handle_key` before the selector, keymap and editor, `altscreen/mod.rs:1090` calls `keys::route` with `TuiRenderMode::Fullscreen` without checking editor focus or emptiness, and `cyrup-config/src/settings/effective.rs:635-639` makes `TuiMode::Fullscreen` the default. So by default Home and End never reach the editor.
+
+**Impact** — In the default fullscreen mode, Home and End in the prompt editor jump the transcript to top or bottom instead of moving to line start or end, the exact bug pi fixed in #10314. Ctrl+A and Ctrl+E still work, so nothing is lost, but it hits every Home/End press in the default mode, which makes it the most user-visible of this triage's lows. The "Jump to latest message" indicator (`altscreen/indicator.rs:16`) and `/hotkeys` show `End` where pi shows `Ctrl+End`.
+
+**Fix** — In `AltScreenKeymap::default` (`keymap.rs:2337-2338`), bind `ctrl_code(KeyCode::Home)` → `Top` and `ctrl_code(KeyCode::End)` → `Bottom`. Drop `ctrl_code(Home)` / `ctrl_code(End)` from `CursorLineStart` / `CursorLineEnd` (`:1985`, `:1988`) and update the `TUI-072` comment there; update the variant docs at `:2176-2180`; add a note to `TUI-072`'s row that upstream reverted its `ctrl+home` / `ctrl+end` half in v1.0.3.
+
+**Verify** — Keymap test: under `TuiRenderMode::Fullscreen`, `AltScreenKeymap::action_in_mode(Home)` is `None` and `Ctrl+Home` is `Top`. App-level test: with the alternate screen live, `Home` moves the editor caret to column 0 and leaves the viewport offset unchanged, and `Ctrl+End` scrolls to the bottom. The `/hotkeys` editor rows read `Home/Ctrl+A` and `End/Ctrl+E`. Red without the fix.
+
+## TUI-174 — A `!!` (excluded-from-context) command's `$ command` header is still bash-green; pi now dims it like the border and spinner
+
+**Kind** upstream-drift · **Severity** low · **Effort** S · **Confidence** confirmed (both sides read; static, nothing run) · **Filed** 2026-10-09
+
+> **Filed 2026-10-09 from the pi v1.1.0 drift triage** (pi `v1.0.1..f1b2e77f5` = v1.1.0+11, `packages/tui` + `modes/interactive`, cyrup `6b14575`).
+
+**upstream** — `18336987a` (#10557). `packages/coding-agent/src/modes/interactive/components/bash-execution.ts:32` `colorKey: "dim" | "bashMode"` is stored once (`:38`), and the header rebuilt in `updateDisplay` uses it at `:141`: `theme.fg(this.colorKey, theme.bold(`$ ${this.command}`))`. Before this commit the constructor's header was already dim and only the `updateDisplay` rebuild hardcoded `"bashMode"`, so a `!!` header lost its dim colour once output arrived. CHANGELOG: "Fixed `!!` command headers losing their dim color once output arrives".
+
+**cyrup** — `crates/cyrup-tui/src/bash.rs:260-269` deliberately mirrors the old bug: its comment says the header "is **always** bash-green (Pi's `updateDisplay` header, bash-execution.ts:138, uses `theme.fg(\"bashMode\", …)` regardless of `excludeFromContext`)", and the code is `let header_style = theme.bash_mode_style().add_modifier(Modifier::BOLD);` while `border_style` is dim for `excluded`. The test at `:915-936` pins the green header for an excluded run. The comment's description of upstream was accurate at v1.0.x and is now stale.
+
+**Impact** — In a `!!` run the only cue that the output is not going to the model is the dim colour; cyrup shows a green header between dim borders, the inconsistent look upstream fixed. Cosmetic.
+
+**Fix** — `header_style = if self.excluded { theme.dim_style() } else { theme.bash_mode_style() }.add_modifier(Modifier::BOLD)`, reusing `border_style`'s choice, on every render path. Rewrite the comment at `:260-263` to cite `bash-execution.ts:141` @f1b2e77f5.
+
+**Verify** — Invert the test at `bash.rs:915-936`: for `BashExecution::new(cmd, true)` the header span style is dim+bold both before and after output arrives; for `false`, bash_mode+bold.
+
+**Notes** — Filed by both the TUI lane (inside its `outputPad` row) and the tools lane (as its own row); split out here so the one-liner can land alone. `TUI-175` is the `outputPad` half of the same commit.
+
+## TUI-175 — `outputPad: 0` pads only user, assistant and thinking blocks; tool rows (the edit renderer included), `!` bash blocks, compaction and branch summaries, skill blocks, the default custom-message box and custom-entry failure boxes stay hard-wired to one column
+
+**Kind** upstream-drift · **Severity** low · **Effort** M · **Confidence** confirmed (both sides read; static, nothing run) · **Filed** 2026-10-09
+
+> **Filed 2026-10-09 from the pi v1.1.0 drift triage** (pi `v1.0.1..f1b2e77f5` = v1.1.0+11, `packages/tui` + `modes/interactive`, cyrup `6b14575`).
+
+**upstream** — `18336987a` (#10557) threads `outputPad` into every transcript component at f1b2e77f5: `components/tool-execution.ts:28`, `:81`, `:138`, `:207-210`, `:283`, `:335` (render shell `Box.setPaddingX`, fallback `Text.setPaddingX`, and `ToolRenderContext.outputPad`, `core/extensions/types.ts:492`, for "self"-shell extension tool renderers); `bash-execution.ts:35`, `:73`, `:141`, `:149`, `:159`, `:205` (header, output, preview truncation width and status at `this.outputPad`); `compaction-summary-message.ts:15-16`, `:27-28`, `branch-summary-message.ts:15-16`, `:27-28` and `skill-invocation-message.ts:16-17`, `:28-29` (`Box(outputPad, 1)`); `custom-entry.ts` (constructor arg, `setOutputPad`, failure box `new Box(this.outputPad, 1, …)`); `custom-message.ts` (`this.box.setPaddingX(this.outputPad)` in the default-rendering path); `core/tools/renderers/edit.ts:136-139`, `:249` (the edit call header and result text use `context.outputPad`). `interactive-mode.ts:5078-5088`: `onOutputPadChange` calls `setOutputPad` on every child of the chat and pending containers. Settings text (`settings-selector.ts:832`): "Horizontal padding for messages, tool output, and command output"; `docs/settings.md` likewise.
+
+**cyrup** — `TranscriptView::output_pad` (`crates/cyrup-tui/src/transcript/view.rs:22-33`) feeds only the user, assistant, thinking and error paths (`transcript/render.rs:116`, `:131`, `:164`, `:178`, `:201`, `:211`, `:336`, `:344`, `:487`). The rest hard-code one column: `render.rs:235` calls `tool_lines(run, …)` with no pad; `transcript/tool_render.rs:70-73` (`ToolRenderKind::Default => width.saturating_sub(2)`) and `:249` (`box_lines(block, width, 1, 1, bg)`); the edit tool's own box (`tool_render.rs` ~`:224-242`, `own_edit_component`, `Box(1,1)`); `crates/cyrup-tui/src/bash.rs:286-290`, `:300`, `:466` (`text_lines_of(…, width, 1)`, `body_width = width.saturating_sub(2)`); `transcript/message.rs:107`, `:125`, `:148` (collapsed summary and skill) and `:184`, `:217` (`labeled_message_lines`, `box_lines(children, width, 1, 1, fill)`); the custom renderer-failed box, `Rendered::Failed` at `render.rs:290-305` (still citing the old `Box(1, 1)`). The settings description (`app/settings_rows.rs:136`) has the old text. Extension message renderers already get `output_pad` (`app/events.rs:107-113`, `EXT-006`); `cyrup-ext/src/render.rs:50-52` says `output_pad` is "Zero on the surfaces whose bag does not carry it", so the tool-render bag is unverified.
+
+**Impact** — A user who sets `outputPad` to 0 to use the full width gets flush messages while tool output, `!` command blocks, summaries and skill blocks stay inset by a column on each side, so the transcript has two left edges. At the default of 1 the output is identical. Cosmetic.
+
+**Fix** — Pass `output_pad` in place of the literal `1` / `2` into `tool_lines` (default-shell content width `width - 2*pad`, `box_lines(block, width, pad, 1, bg)`) and the built-in edit renderer's box, `BashExecution::render_lines` (header, output, preview width, status), `collapsed_summary_lines`, `collapsed_skill_lines`, `labeled_message_lines`, the default custom-message box and the `Rendered::Failed` box. Confirm the tool-render opts bag carries the real `output_pad` for extension tool renderers, not zero. Update the settings description. The `/settings` toggle already re-renders live (`execute_misc.rs:846-848`). The `!!` header colour from the same commit is `TUI-174`.
+
+**Verify** — Render tests at `output_pad = 0`: a built-in tool row, an edit tool row, a `!` block, a compaction summary, a branch summary, an expanded skill block, a default custom message and a renderer-failed custom entry each start at column 0 and fill the width; at `output_pad = 1` the output is unchanged; an extension tool renderer receives `outputPad == 0`. Port `packages/coding-agent/test/output-pad.test.ts`. Red without the fix.
+
+**Notes** — Filed by the TUI and tools lanes and merged. The export-html renderer's `outputPad: 1` (`core/export-html/tool-renderer.ts`) is a lead for cyrup's export path, not part of this row.
+
+## TUI-176 — Inside a Herdr pane cyrup emits no OSC 8 links, and if the outer terminal's `KITTY_WINDOW_ID` (or similar) leaks into the pane it turns on Kitty images Herdr does not forward; pi 1.1 checks `TERM_PROGRAM=herdr` first
+
+**Kind** upstream-drift · **Severity** low · **Effort** S · **Confidence** confirmed (both sides read; static, nothing run) · **Filed** 2026-10-09
+
+> **Filed 2026-10-09 from the pi v1.1.0 drift triage** (pi `v1.0.1..f1b2e77f5` = v1.1.0+11, `packages/tui` + `modes/interactive`, cyrup `6b14575`).
+
+**upstream** — `b2363841a` (#10573). `packages/tui/src/terminal-image.ts:89-93` @f1b2e77f5: right after the tmux / screen checks and before the kitty / ghostty / wezterm arms, `if (termProgram === "herdr") return { images: null, trueColor: hasTrueColorHint, hyperlinks: true }`. Tests at `packages/tui/test/terminal-image.test.ts:322-330`.
+
+**cyrup** — `crates/cyrup-tui/src/image.rs:884-960` `detect_capabilities_on_platform` has no herdr arm: after the multiplexer checks (`:906-920`) it goes straight to `if has("KITTY_WINDOW_ID") || term_program == "kitty"` (`:922`). Under `TERM_PROGRAM=herdr` with no leaked variables, the conservative default disables hyperlinks.
+
+**Impact** — cyrup ships a Herdr integration (area 16), so Herdr panes are a first-class host. There, links in markdown, the login URL and tool output are not clickable; when the parent terminal's variables leak in, cyrup sends Kitty graphics Herdr does not forward, so images do not render and can leave stray output.
+
+**Fix** — Add pi's arm right after the `screen` check: `if term_program == "herdr" { return TerminalCapabilities { images: None, true_color: has_true_color, hyperlinks: true }; }`, citing `terminal-image.ts:89-93`.
+
+**Verify** — Port both upstream cases: `TERM_PROGRAM=herdr TERM=xterm-256color COLORTERM=truecolor KITTY_WINDOW_ID=1` gives `images: None, hyperlinks: true, true_color: true`; map the `PI_HYPERLINKS=0` case to cyrup's hyperlink override if one exists, otherwise drop it. Red without the fix.
+
+**Notes** — No herdr checkout is present (`tmp/herdr` is absent), so cyrup cannot confirm in-tree that herdr exports `TERM_PROGRAM=herdr`; the row relies on pi's comment and tests for that.
+
+## TUI-177 — A key spec that names `+` (`"+"`, `"ctrl++"`) is rejected as invalid, and a malformed spec (`"ctrl+ctrl+a"`, `"a+b"`) is silently accepted; pi 1.1's `parseKeyId` takes the reverse view of both
+
+**Kind** upstream-drift · **Severity** low · **Effort** S · **Confidence** confirmed (both sides read; static, nothing run) · **Filed** 2026-10-09
+
+> **Filed 2026-10-09 from the pi v1.1.0 drift triage** (pi `v1.0.1..f1b2e77f5` = v1.1.0+11, `packages/tui` + `modes/interactive`, cyrup `6b14575`).
+
+**upstream** — `7f9e1198f` (#9880, "normalize shifted symbol keybindings", "validate keybinding schema grammar"). `packages/tui/src/keys.ts:820-840` @f1b2e77f5 `parseKeyId` strips leading `shift+` / `alt+` / `ctrl+` / `super+` one at a time, returns `null` for a repeated modifier, and accepts the remainder only if it has no `+` or is exactly `"+"`: `ctrl++` parses as ctrl plus `+`; `a+b` and `ctrl+ctrl+a` are invalid. `:292` `SHIFTED_SYMBOL_KEYS`, `:372-381` `getLogicalShiftedSymbolCandidate`, `:686-696` (Kitty logical match via the shifted-key field) and `matchesPrintableModifyOtherKeys` let `ctrl++` match Shift+`=`. Tests: `test/keys.test.ts:137-143`, `:278-279`. At v1.0.1 `parseKeyId` split on `+` and took the last part, the same grammar as cyrup's.
+
+**cyrup** — `crates/cyrup-tui/src/keymap.rs:670-743` `Key::parse` splits on every `+` (`:673`) and skips empty tokens (`:675-677`), so `"ctrl++"` and `"+"` end with `code == None` and return `TuiError::KeySpec`; every token overwrites `code`, so `"a+b"` parses as `b`; modifiers OR together, so `"ctrl+ctrl+a"` is ctrl+a. The logical shifted-symbol match is already done at decode time when the terminal sends the shifted key (`input/decode.rs:491-501`). cyrup withholds `REPORT_ALTERNATE_KEYS` and never enables modifyOtherKeys (`keyboard_protocol.rs:150-155`, `:178-184`, `TUI-046`), so the match half is out of scope and only the grammar half is filed.
+
+**Impact** — A `keybindings.json` entry such as `"app.model.cycleForward": "ctrl++"`, valid in pi, is reported invalid and binds nothing; a typo such as `"ctrl+shift+k+j"` silently binds `ctrl+shift+j` where pi reports it. Rare, hand-written configs.
+
+**Fix** — Rewrite `Key::parse` with pi's grammar: lowercase, peel recognised modifier prefixes in a loop, reject a duplicate modifier, then require the remainder to be one key token with no `+` unless it is exactly `+` (`KeyCode::Char('+')`). Keep the named-key table and the `clear` diagnostic. `Key::label` already prints `ctrl++` for `Char('+')`, so the round trip holds. `CFG-103` (area 05) needs this grammar to decide which entries keep their default; land them together.
+
+**Verify** — `Key::parse("ctrl++")` is `Char('+')`+CONTROL and `Key::parse("+")` is plain `Char('+')`; `"ctrl+ctrl+a"` and `"a+b"` are `Err(KeySpec)`; `label(parse(s)) == s` for `ctrl++`; a `Char('+')`+CONTROL event (what `decode.rs` produces from `CSI 61:43;5u`) matches `ctrl++`. The red cases are `ctrl++`, `+`, `a+b` and `ctrl+ctrl+a`; `"shift+"` is already `Err(KeySpec)` and is kept only as a regression pin.
+
+**Notes** — Under Kitty disambiguate without `REPORT_ALTERNATE_KEYS`, a US-layout Ctrl+Shift+= arrives as `=` with SHIFT, so a `ctrl++` binding matches only on layouts where `+` is unshifted. That follows from the recorded `TUI-046` delta and does not count against this row.
+
+## TUI-178 — Theme JSON with unknown keys in `colors`, in `export`, or at the top level loads silently in cyrup; pi 1.1 made its runtime theme validation strict and rejects it with a named error
+
+**Kind** upstream-drift · **Severity** low · **Effort** S · **Confidence** confirmed (both sides read; static, nothing run) · **Filed** 2026-10-09
+
+> **Filed 2026-10-09 from the pi v1.1.0 drift triage** (pi `v1.0.1..f1b2e77f5` = v1.1.0+11, `packages/tui` + `modes/interactive`, cyrup `6b14575`).
+
+**upstream** — `7f9e1198f` (#9880, "document strict theme validation"). `packages/coding-agent/src/modes/interactive/theme/theme-schema.ts` @f1b2e77f5: `:44-49` `ThemeColorsSchema` has `additionalProperties: false`; `:72-81` `export` has only `pageBg` / `cardBg` / `infoBg`, closed; `:52-89` the top level allows only `$schema` / `name` / `appearance` / `vars` / `colors` / `export`, closed; `:97-149` `validateThemeJson` reports each violation under "Other errors". `docs/themes.md` gains "Theme objects are strict: … custom keys under `colors` or `export` and additional top-level metadata are rejected." Refinement: at v1.0.1 the static, editor-facing `theme-schema.json` was already strict (`additionalProperties: false` at `:322`, `:341`, `:344`), but the runtime validator `theme-json.ts` used plain `Type.Object`, so extra keys loaded silently in pi too. The drift is the runtime check becoming strict.
+
+**cyrup** — `crates/cyrup-resources/src/theme.rs:21-35` `ThemeData` has no `deny_unknown_fields`, and `colors` / `export` are open `BTreeMap<String, ColorValue>`. `collect_theme_errors` (`:170-222`) checks extra `colors` keys only for a well-formed colour value (`:204-210`), checks `export` only as a colour record (`:220-221`), and never inspects top-level keys.
+
+**Impact** — A theme with a misspelled token (`"sucess": "#0f0"`) loads in cyrup; the misspelled key is ignored, and the role it was meant for is missing (so the theme fails) or keeps another value, with no hint about the typo. pi now names the bad key, and a theme written for cyrup can fail in pi 1.1.
+
+**Fix** — In `collect_theme_errors`, push an "Other errors" line for every `colors` key outside `REQUIRED_COLOR_TOKENS` ∪ the optional tokens (`scrollbarTrack`, `scrollbarThumb`, `thinkingMax`, `searchMatchBg`, `searchMatchText`), every `export` key other than `pageBg` / `cardBg` / `infoBg`, and every top-level key outside `$schema` / `name` / `appearance` / `vars` / `colors` / `export`, in TypeBox's additional-properties wording so `build_theme_error` keeps its shape. Check the bundled and fixture themes carry no extra keys first. `CFG-106`'s theme schema depends on this row.
+
+**Verify** — `Theme::parse` on a complete theme plus `colors.sucess` returns `ResourceError::Theme` whose reason names `/colors` and the key; the same for `export.foo` and a top-level `author`; the bundled dark, light and system themes and every test fixture still parse. Red without the fix.
+
+**Notes** — Area 07 is the right home: theme-loading rows such as `TUI-131` live here, and area 05 has no reference to `cyrup-resources/src/theme.rs`.
+
+## TUI-179 — Code inside a Ruby string interpolation keeps the string colour in cyrup's highlighter (`"a #{foo} b"`); pi 1.0.4 maps highlight.js `subst` to the `text` colour
+
+**Kind** upstream-drift · **Severity** low · **Effort** S · **Confidence** confirmed (both sides read; static, nothing run) · **Filed** 2026-10-09
+
+> **Filed 2026-10-09 from the pi v1.1.0 drift triage** (pi `v1.0.1..f1b2e77f5` = v1.1.0+11, `packages/tui` + `modes/interactive`, cyrup `6b14575`).
+
+**upstream** — `b9ab918c6` (#10356). `packages/coding-agent/src/modes/interactive/theme/theme.ts:894` @f1b2e77f5 adds `subst: (s) => t.fg("text", s)` to `buildCliHighlightTheme`; before, an interpolation inherited its enclosing `string` formatter. The commit's other half, a formatter per line of a multiline token (`utils/syntax-highlight.ts:156-163`), is already true in cyrup: syntect highlights line by line and carries the scope stack across lines.
+
+**cyrup** — `crates/cyrup-tui/src/markdown/highlight.rs:485-505` `scope_style` takes the deepest scope the prefix table knows (`theme.rs:1117-1159`), and `theme.rs:1122` maps any `string*` scope to `syntaxString`. A syntect 5.3.0 `load_defaults_newlines` probe (scratch, not in the repo) gives `foo` in Ruby `"a #{foo} b"` the scopes `[source.ruby, string.quoted.double.ruby, source.ruby.embedded.source]`; no deeper scope matches, so `foo` paints `syntaxString`. Other grammars already escape: JS template expressions are `meta.template.expression.js` (not under `string.*`) and Python f-string fields are `meta.interpolation.python`. Shell does too: the same probe gives `ls` in `"$(ls)"` `variable.function.shell` and `x` in `"${x}"` `variable.other.readwrite.shell`; only `$`, `(` and `{` carry punctuation scopes.
+
+**Impact** — In Ruby (and any grammar whose embedded scope is just `source.X.embedded` under `string.*`), interpolated expressions look like part of the string literal, where pi paints them in the normal text colour. Cosmetic.
+
+**Fix** — In `scope_style`, before the deepest-first walk, if the stack has an embedded-source scope (`source.*.embedded*`, `meta.interpolation*`, `meta.template.expression*`) above a `string*` scope, ignore every scope below the embedded one, so an otherwise unmatched token gets `theme.role_style("text", …)` (pi's `subst` → `text`) and tokens with their own class keep it.
+
+**Verify** — Highlight `s = "a #{foo} b"` as `ruby`: `a ` and ` b` carry `syntaxString` and `foo` carries the `text` role style. Add a JS template-literal case to pin the existing behaviour. Red without the fix.
+
+## TUI-180 — The dead-terminal check still misses `ENOTTY`, which pi added for revoked macOS ttys, so a restore write failing with `ENOTTY` is not treated as a dead terminal
+
+**Kind** upstream-drift · **Severity** low · **Effort** S · **Confidence** confirmed (both sides read; static, nothing run) · **Filed** 2026-10-09
+
+> **Filed 2026-10-09 from the pi v1.1.0 drift triage** (pi `v1.0.1..f1b2e77f5` = v1.1.0+11, `packages/tui` + `modes/interactive`, cyrup `6b14575`).
+
+**upstream** — `4c6b724ea` ("do not report dead terminal stdin errors as crashes"). `packages/coding-agent/src/modes/interactive/interactive-mode.ts:294` @f1b2e77f5: `DEAD_TERMINAL_ERROR_CODES = new Set(["EIO", "EPIPE", "ENOTCONN", "ENOTTY"])` (`:301` uses it); at v1.0.1 the set was `["EIO", "EPIPE", "ENOTCONN"]` (`:290`). The commit's other half, not recording a dead-terminal stdin error as a crash, has no cyrup counterpart because cyrup records no crashes (`TUI-118`).
+
+**cyrup** — `crates/cyrup-tui/src/dead_terminal.rs:71-84` `is_dead_terminal_error` matches `BrokenPipe`, `NotConnected` and raw `EIO` only, and its doc still quotes pi's three-code set (`interactive-mode.ts:264-272`). A stdin read error ends the tty reader thread (`input/reader.rs:225`, `app/input_reader.rs:484-486`), the run loop breaks normally (`run_action.rs:264-266`) and the restore writes go through the armed dead-terminal writer (`dead_terminal.rs:90-99`), which exits 129 only on the three codes.
+
+**Impact** — On a revoked tty that reports `ENOTTY` (pi's macOS case), cyrup's restore path treats the write failure as an ordinary error instead of taking the quiet 129 exit. Whether a restore write actually returns `ENOTTY` on a revoked tty was not observed, so the reach is unverified; the set membership itself has drifted, which is what this row files.
+
+**Fix** — Add `ENOTTY` (`rustix::io::Errno::NOTTY`) to `is_dead_terminal_error` beside `is_eio`, and update the doc comment to pi's four-code set at f1b2e77f5.
+
+**Verify** — A unit test: an `io::Error::from_raw_os_error(ENOTTY)` is a dead-terminal error; `EIO`, `EPIPE`, `ENOTCONN` still are; `EAGAIN` is not. Red without the fix.
+
+**Notes** — Found by the TUI lane's verifier as a lead (the reader recorded it unfiled); confirmed by this pass on both sides (`git show v1.0.1:` vs `f1b2e77f5:` of `interactive-mode.ts`, and `dead_terminal.rs`).
 
 ## Coverage
 

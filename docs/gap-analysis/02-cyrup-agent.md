@@ -1,5 +1,14 @@
 # 02 — cyrup-agent (the turn loop)
 
+> ### PIN 2026-10-09 — pi v1.1.0 drift triage: cyrup `6b14575` × pi **`f1b2e77f5`** (= `v1.1.0-11-gf1b2e77f5`); nothing filed
+>
+> `git -C tmp/pi log --no-merges v1.0.1..f1b2e77f5 -- packages/agent` = **11** commits, read by the core-runtime lane:
+> nine release / `[Unreleased]` housekeeping commits (`4c6fb7cfe`, `cd32f7725`, `200387122`, `d78dc83d6`, `997d31f28`,
+> `7c10bd433`, `28dcce2ba`, `abe508e1b`, `75a99721d`), `36a686ee8` (durationMs on messages and tool results, already
+> ported: `cyrup-agent` `run/tools/exec.rs:76`, `nested.rs:276`; ledger UPDATE 2026-10-09) and `f284a2460` (proxied
+> responses time correctly; the agent loop times every stream fn, `agent/run/stream.rs:144`, `:180`). **No row filed;
+> next free id unchanged (`AGENT-048`).** The lane's full not-filed record is in area 08's pin block of the same date.
+
 > ### CLOSURES 2026-09-27 — eight lows (`AGENT-027`, `AGENT-036`, `AGENT-037`, `AGENT-038`, `AGENT-040`, `AGENT-042`, `AGENT-043`, `AGENT-044`)
 >
 > Landed on `claude/agent-lows`. Every closure has a test through the real loop, proxy or host (except

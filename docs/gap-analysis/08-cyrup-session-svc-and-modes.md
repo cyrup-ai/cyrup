@@ -1,5 +1,34 @@
 # 08 — cyrup-session-svc + cyrup-modes + bin + sdk
 
+> ### PIN 2026-10-09 — pi v1.1.0 drift triage: cyrup `6b14575` × pi **`f1b2e77f5`** (= `v1.1.0-11-gf1b2e77f5`)
+>
+> **Window read:** pi `v1.0.1..f1b2e77f5` (= `v1.1.0-11-gf1b2e77f5`), `git log --no-merges` over the core-runtime
+> lane's paths (`packages/agent`, `packages/coding-agent/src/core` and `src/cli`/`src/utils`, `core/extensions` and
+> `core/tools` excluded) = **27** commits; upstream read through `git -C tmp/pi show` only, cyrup at `6b14575`.
+> Nothing was run. The pin is untagged, deliberately (README *CURRENT PINS*).
+>
+> **Filed in area 08 (2):** `SEAM-148` (medium, `--tools +name` / `-name` modifiers, `ddaa0a034`) and `SEAM-149`
+> (low, bash output ANSI split across chunks, `27c7b6ff4`). Other rows from the same lane: `SESS-070` (03),
+> `CFG-103`…`CFG-107` (05). `SEAM-148` and `MCP-616` (13e) should be scheduled as one change.
+>
+> **Read in scope and deliberately NOT filed (core-runtime lane, all areas):**
+> * *Release / housekeeping:* `4c6fb7cfe`, `cd32f7725`, `200387122`, `d78dc83d6`, `997d31f28`, `7c10bd433`,
+>   `28dcce2ba`, `abe508e1b`, `75a99721d`.
+> * *Already ported or already a row:* `36a686ee8` (durationMs; ledger UPDATE 2026-10-09); `503c60552`'s core
+>   half (`agent_settled.aborted`; the OSC 7501 reporter is `TUI-171`); `f284a2460` (the agent loop times every
+>   stream fn, `cyrup-agent/src/agent/run/stream.rs:144`, `:180`); `c30840c2e` (`CODE-020`, closed);
+>   `04b97ef00` (`MCP-616`); `d677d0ee7` (`TOOL-057`, `CODE-019`, closed); `ddaa0a034`'s settings refactor
+>   (behaviour-neutral; `CFG-097`; the CLI half is `SEAM-148`).
+> * *Mechanism N/A:* `1b094148b` (Node install layout; V8 is linked in, `CODE-013`; area 18 ruled it at
+>   `18-pi-codemode.md:335`); `b30a6dd77` (Node worker message tagging); `b9ab918c6`'s multiline half (syntect
+>   highlights line by line; the `subst` half is `TUI-179`).
+> * *Out of lane, another area's change:* `a37306d43`'s one-line `defaultModelPerProvider` key
+>   (`model-resolver.ts:25`) waits on `PROV-145`; `ce8972a0e`'s one-line `assertClassifierInputSupported` call is
+>   `PROV-148`; `18336987a`'s settings comment and export-html `outputPad: 1` are `TUI-175` and a lead;
+>   `7f9e1198f`'s `SETTINGS_DEFAULTS` refactor (every literal checked equal), settings `$schema` (already
+>   round-tripped, `layer.rs:26-29`), `setThemeJsonValidator` ordering (Node-specific) and the theme / key-grammar
+>   halves (`TUI-177`, `TUI-178`).
+
 > ### CLOSURES 2026-10-09 — one low (`SEAM-128`), with `PROV-134` (area 01) and `CFG-085` (area 05) in one PR
 >
 > The three rows are one feature and none of their Verify lines can be met alone, so they closed
@@ -565,7 +594,7 @@ above opened nothing, closed nothing and re-severitied nothing.
 
 ## Open items
 
-> **Next free id: `SEAM-148`** (2026-10-03, after the post-pin triage filed `SEAM-147`; before that 2026-10-03, after `SEAM-144`…`SEAM-146` were filed by batch 6; before that 2026-10-01, after the `EXT-027` closure filed `SEAM-137`…`SEAM-143`).
+> **Next free id: `SEAM-150`** (2026-10-09, the pi v1.1.0 drift triage filed `SEAM-148` and `SEAM-149`; before that `SEAM-148`, 2026-10-03, after the post-pin triage filed `SEAM-147`; before that 2026-10-03, after `SEAM-144`…`SEAM-146` were filed by batch 6; before that 2026-10-01, after the `EXT-027` closure filed `SEAM-137`…`SEAM-143`).
 
 This is the **complete** open set for area 08 — one table, deliberately. The `-SNN` ids came from the
 2026-08-03 surface-driven sweep and are otherwise ordinary items; four of the five have now closed.
@@ -949,6 +978,8 @@ the check that establishes it. Do not "recover" them.
 | SEAM-145 | low | parity-bug | S | **NEW 2026-10-03** (filed while closing `SEAM-141` on `claude/lows-batch6`). `publish_queued` in `GuestProviderRegistry` checks `is_current` and then runs the provider's `update()` without holding any lock against a concurrent `supersede`; if another thread re-registers the same id between the two steps, the stale `update` can still run afterwards. pi is single-threaded and has no such window. Pre-existing and narrow; the late restore of `SEAM-141` adds one more caller of the same window. Not changed because holding a lock across an arbitrary `update` risks deadlock. **Fix** — recheck the generation after `update`, or serialise per id, without holding a lock across the provider's code. **Verify** — a test that re-registers an id between the check and the update and asserts the stale update does not win. |
 | SEAM-146 | low | not-ported | S | **NEW 2026-10-03** (filed while closing `SEAM-141` on `claude/lows-batch6`). A provider registered from a thread with no tokio runtime gets no late restore and nothing tells the caller: `begin_late_restore` returns `None` because there is nothing to spawn on (`cyrup-session-svc/src/guest_providers.rs`). A provider that registered before the startup restore is covered by it; one registered after, from outside a runtime, is not. pi restores on every registration with no such condition. **Fix** — report the skip, or run the cache-only phase inline when there is no runtime. **Verify** — a registration from outside a runtime either restores or reports. |
 | SEAM-147 | low | upstream-drift | S | **Filed 2026-10-03 from the post-pin triage (pi v1.0.1).** **`--models "a,"` still yields an empty pattern; pi v1.0.1 drops empty entries. In cyrup the effect is a spurious `No models match pattern ""` warning, not an extra model.** pi `9b3c19da5` (fixes #10334) makes `cli/args.ts:141-145` @v1.0.1 `.split(",").map((s) => s.trim()).filter((pattern) => pattern.length > 0)`; at v0.87.1 (`args.ts:142`) there was no filter, and an empty pattern then matched every model by substring in pi's `tryMatchModel`, adding an extra model to the cycle. cyrup declares the flag as `value_delimiter = ','` (`crates/cyrup/src/cli/args.rs:72-73`) and `Cli::normalize_list_flags` (`crates/cyrup/src/cli/config_map.rs:228-232`) trims each entry and deliberately keeps empties (its doc comment, `:223-225`, quotes the v0.87.1 behaviour: "Pi does not `.filter`; an empty pattern resolves to nothing"). **The triage's claim of an extra model does not hold on the cyrup side:** `ModelResolver::match_reference` and `exact_reference_match` return nothing for an empty reference (`crates/cyrup-config/src/model/resolver.rs:84-86`, `:117-120`), so the empty pattern takes the non-glob arm and is reported as `No models match pattern ""` (`resolver.rs:343-350`), which `session_launch.rs:383-384` prints. Static read; not run. Impact: a stray trailing comma prints a warning pi v1.0.1 no longer prints, and the comment above is now stale. **Fix** — drop empty entries after the trim, but keep the "flag was supplied" signal: `--models ""` must stay non-empty for the `--api-key` gate (`main.rs:474-482`), the fresh-session gate (`bootstrap.rs:252`) and the `enabledModels` fallback (`session_launch.rs:365`), because pi's `parsed.models ?? settingsManager.getEnabledModels()` (`main.ts:809` @v1.0.1) falls back only when the flag is absent, and `[]` then skips scoping (`modelPatterns.length > 0`, `:811`). **Verify** — `--models "faux/*,"` resolves and warns exactly as `--models "faux/*"`; `--models ""` still counts as a supplied flag and resolves no scope. |
+| SEAM-148 | medium | upstream-drift | S | **`--tools +codemode` starts a session with no tools at all: cyrup reads a `+name`/`-name`-only `--tools` list as an exact allowlist, where pi v1.1.0 applies it to the default selection** **Filed 2026-10-09 from the pi v1.1.0 drift triage**; body below. |
+| SEAM-149 | low | upstream-drift | S | **`!` and RPC `bash` output keeps fragments of colour codes (a stray `m`, `[0`) when an escape sequence is split across two output chunks, and a trailing incomplete UTF-8 sequence is dropped instead of becoming U+FFFD** **Filed 2026-10-09 from the pi v1.1.0 drift triage**; body below. |
 
 **43 items — 0 critical, 8 high, 20 medium, 15 low.** (SEAM-071, SEAM-072 and SEAM-073 were added by
 the later suite-verification pass, SEAM-072 closed on arrival; the 40/7/19/14 counts below predate
@@ -1266,6 +1297,40 @@ status shape, transcript line and documented setting value back to the code that
 **Impact**   — an `@notes.txt` whose content begins `BMW …` or `BMI …` is treated as a bitmap: decoding fails and the model gets a processing-failure hint instead of the file's text; an animated PNG is sent as an image pi would not send. A BOM'd text file reaches the model with a stray U+FEFF.
 **Fix**      — delete `detect_image_mime` and call `cyrup_tools`' `ImageMime` sniffer over the first 4 100 bytes (keeping `TOOL-048`'s GIF fix in the one copy); strip a leading BOM from `@file` text. Natural to do together with `SEAM-128`, which moves this module's image processing into the session.
 **Verify**   — `@f.txt` containing `BMW service log` inlines as text; a 1-frame APNG and a JPEG with `FF D8 FF F7` inline as text; a BOM'd text file inlines without U+FEFF.
+
+## Findings filed 2026-10-09 — the pi v1.1.0 drift triage
+
+## SEAM-148 — `--tools +codemode` starts a session with no tools at all: cyrup reads a `+name`/`-name`-only `--tools` list as an exact allowlist, where pi v1.1.0 applies it to the default selection
+
+**Kind** upstream-drift · **Severity** medium · **Effort** S · **Confidence** confirmed (both sides read; static, nothing run) · **Filed** 2026-10-09
+
+> **Filed 2026-10-09 from the pi v1.1.0 drift triage** (pi `v1.0.1..f1b2e77f5` = v1.1.0+11, core-runtime lane, cyrup `6b14575`).
+
+**upstream** — `ddaa0a034` (v1.1.0), all @f1b2e77f5. `core/settings-manager.ts:86` `isToolModifier`; `:95-104` `getToolListError` (rejects a list that mixes modifiers with plain names, and a modifier that contains `*`; a plain `mcp__*` allowlist is legal and is `MCP-616`'s business); `:108-119` `applyToolModifiers`. `cli/args.ts:151-161` turns a `getToolListError` result into the error diagnostic `${arg}: ${error}` (for example `--tools: tool names cannot be mixed with +name or -name entries`) and leaves `result.tools` unset. `core/sdk.ts:280-291`: a modifier-only `tools` list becomes `applyToolModifiers(settings.defaultTools ?? DEFAULT_TOOL_NAMES, tools)`, `allowedToolNames` stays `undefined` (unless `noTools === "all"`), and `usesDefaultTools` stays true with `defaultToolModifiers` kept. `core/agent-session.ts:3663-3677` (the reapply at `:3666-3669`) reapplies `_defaultToolModifiers` on `/reload`, so a `-name` tool stays removed. `--help` documents `pi --tools +codemode` (`args.ts:406`).
+
+**cyrup** — `crates/cyrup/src/cli/args.rs:91-92` (`--tools`, `value_delimiter = ','`, no `allow_hyphen_values`) → `cli/config_map.rs:188-189` copies the list verbatim into `SessionConfig.tools`. `crates/cyrup-session-svc/src/builder.rs:417-420` (`select_active_tools`, arm `(Some(allow), _) => allow.iter().any(|a| a == name)`) and `:490-494` (`resolve_allowed_tool_names`, `Some(allow) => Some(allow.iter().cloned().collect())`) treat `"+codemode"` as a literal tool name; the call site that takes `configured_default_tools` is `:1286-1287`. `grep -rn is_tool_modifier crates/cyrup crates/cyrup-session-svc` finds nothing; the only modifier logic is the settings-side `crates/cyrup-config/src/settings/default_tools.rs:44` / `:88` (`CFG-097`, closed), which the CLI path never calls. Not a duplicate: `MCP-616` (13e) covers `*` patterns, MCP retention and `--no-mcp` from `04b97ef00`, not modifiers; `CFG-097` covers only the `defaultTools` setting.
+
+**Impact** — A user following pi's `--help` example (`--tools +codemode`) gets an allowlist holding one name that matches no tool, so the session runs with no built-in, extension or MCP tools and nothing is reported. `-t -bash` is likely rejected by clap as an unknown flag, because the value starts with a hyphen. A mixed list (`read,+codemode`) is accepted silently where pi rejects it with a diagnostic. Medium, matching `CFG-097`'s original rating for the same silent loss of every tool.
+
+**Fix** — Reuse `cyrup_config::settings::{is_tool_modifier, resolve_default_tools}` and add `get_tool_list_error` / `apply_tool_modifiers` beside them as ports of `settings-manager.ts:95-119`. In `config_map.rs`, report `get_tool_list_error` as a startup error diagnostic (`args.ts:156-160`). In `SessionConfig`, keep a modifier-only list apart from the allowlist (a `default_tool_modifiers` field) and apply it on the `(None, None)` arm of `select_active_tools`, combined with `configured_default_tools` at `builder.rs:1286-1287`. Leave `resolve_allowed_tool_names` returning `None` for that arm, or the post-modifier set under `NoTools::All` (`sdk.ts:287-291`). Add `allow_hyphen_values = true` to `--tools`. Once cyrup's `/reload` re-reads `defaultTools`, reapply the modifiers. Schedule with `MCP-616`: both change how `builder.rs` builds the allowlist, and pi's `*`-in-a-modifier rule ties them together.
+
+**Verify** — `cyrup --tools +grep -p …` starts with `read,bash,edit,write,grep` active; `--tools=-bash` (and `-t -bash`) starts with `read,edit,write`; `--tools read,+grep` and `--tools +mcp__*` each exit with pi's diagnostic text; `--tools read` is unchanged; `--no-tools --tools +read` gives an allowlist of exactly `read`.
+
+## SEAM-149 — `!` and RPC `bash` output keeps fragments of colour codes (a stray `m`, `[0`) when an escape sequence is split across two output chunks, and a trailing incomplete UTF-8 sequence is dropped instead of becoming U+FFFD
+
+**Kind** upstream-drift · **Severity** low · **Effort** S · **Confidence** confirmed (both sides read; static, nothing run) · **Filed** 2026-10-09
+
+> **Filed 2026-10-09 from the pi v1.1.0 drift triage** (pi `v1.0.1..f1b2e77f5` = v1.1.0+11, core-runtime lane, cyrup `6b14575`).
+
+**upstream** — `27c7b6ff4` (v1.1.0, fixes #10504), @f1b2e77f5. `utils/ansi.ts:55-67` `splitIncompleteAnsiSuffix` holds back an unfinished OSC (no ST yet) or a CSI with no final byte at the end of a chunk, up to `MAX_PENDING_ANSI_LENGTH = 256`. `core/bash-executor.ts:74` `pendingAnsi`; `:106-111` `onData` prepends the pending fragment and strips only the complete part; `:113-117` `flushOutput` adds `pendingAnsi + decoder.decode()` at exit (the final decode flushes an incomplete UTF-8 tail as U+FFFD); `:130` calls it after the try/catch, so the abort path flushes too. The leftover fragment still goes through `stripAnsi` at flush.
+
+**cyrup** — `crates/cyrup-session-svc/src/bash.rs:370-373` `BashOutputBuffer::push_raw` runs `decode_streaming` then `sanitize_chunk` (`:479-480`: `strip_ansi` + `sanitize_binary_output` + CR drop) on each chunk alone, so nothing carries between chunks. `strip_ansi` (`:509`) leaves an unterminated escape in place and `sanitize_binary_output` removes the ESC and keeps its tail. `finish` (`:455-475`) never flushes `self.pending`, where `decode_streaming` keeps an incomplete trailing sequence (`:423-425`), so it is dropped silently. The single seam `run_bash` (`:155`) is reached through `session/bash.rs:163` for both the TUI `!` path (`cyrup-tui/src/app/bash_spawn.rs:29`) and RPC `bash`. `grep -rn 'pending_ansi\|split_incomplete' crates` finds only an unrelated cyrup-intercom UI wrap helper.
+
+**Impact** — When coloured output (`ls --color`, `git -c color.ui=always`, test runners) crosses a pipe-read boundary mid-sequence, the user sees literal fragments such as `31m` in `!` output and in the `bashExecution` message saved to the session and sent to the model. Cosmetic, intermittent, read-size dependent.
+
+**Fix** — Port `splitIncompleteAnsiSuffix` as a byte-safe `split_incomplete_ansi_suffix(&str) -> (&str, &str)` using the recognisers `strip_ansi` / `try_csi` / `find_osc_terminator` already implement, with the 256-char cap. Give `BashOutputBuffer` a `pending_ansi: String`; in `push_raw`, prepend it, split, and sanitize only the complete part, returning an empty string when nothing is complete (pi's `if (!text) return`). In `finish`, first push `pending_ansi` plus a lossy decode of `self.pending` through the same path; `finish` already runs on the cancel path.
+
+**Verify** — Feeding `b"a\x1b[3"` then `b"1mred\x1b[0m"` gives `"ared"` with no `1m`; the same for an OSC 8 link split before its ST; a trailing `0xE2 0x82` gives `\u{FFFD}` in the final output; a spawned `printf '\033[3'; sleep 0.1; printf '1mX\033[0m'` returns `X`. Do **not** expect an escape still unfinished at EOF to vanish: pi's `flushOutput` still runs it through `stripAnsi`, so the ESC is dropped and its tail kept, as cyrup does today.
 
 ## SEAM-047 — First SIGTERM/SIGHUP neither tears down nor exits 143/129; `--mode rpc` keeps running forever and never emits session_shutdown
 
