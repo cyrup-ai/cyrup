@@ -814,18 +814,64 @@ fn parent_usage_from_entry(entry: &Entry) -> Option<SubagentCostUsage> {
     usage_from_value(Some(&usage), Some(&serde_json::Value::from(turns)))
 }
 
-/// pi `isSubagentDetails` (`:104-108`): an object with a string `mode` and an array `results`.
+/// pi `isSubagentDetails` (`subagent-cost.ts:105-109` @ad11b7ab): an object with a string `mode`
+/// and an array `results`.
+///
+/// **[CYRUP-DELTA, representation]** A foreground workflow's details are also accepted when they
+/// carry `mode: "workflow"` and an array `children` but no `results`. Upstream flattens each
+/// child's per-round results into `details.results` (`workflowDetailsResults`,
+/// `src/runs/foreground/subagent-executor.ts:4758-4764`, used at `:6625` and `:6657` @ad11b7ab);
+/// cyrup's details keep them on `children[].results` instead (`workflow_launch.rs`), and
+/// [`foreground_workflow_results`] does the same flatten here.
 fn subagent_details(
     value: &serde_json::Value,
 ) -> Option<&serde_json::Map<String, serde_json::Value>> {
     let details = value.as_object()?;
-    (details
-        .get("mode")
-        .is_some_and(serde_json::Value::is_string)
+    let mode = details.get("mode").and_then(serde_json::Value::as_str)?;
+    let has_results = details
+        .get("results")
+        .is_some_and(serde_json::Value::is_array);
+    let has_workflow_children = mode == "workflow"
         && details
-            .get("results")
-            .is_some_and(serde_json::Value::is_array))
-    .then_some(details)
+            .get("children")
+            .is_some_and(serde_json::Value::is_array);
+    (has_results || has_workflow_children).then_some(details)
+}
+
+/// pi `workflowDetailsResults` (`src/runs/foreground/subagent-executor.ts:4758-4764` @ad11b7ab)
+/// over cyrup's foreground workflow `details.children`: every child's per-round `results`,
+/// flattened, each taking the child's `runId` only when the round names none of its own.
+///
+/// Each round keeps its own run id, so every round of a resumed child is a distinct `run:<id>`
+/// identity and counts (#2612); a round without one shares the child's. A cyrup foreground
+/// `SingleResult` spells its run id `childRunId` and leaves it unset for a foreground child, so
+/// both spellings are read before the child's id is used.
+fn foreground_workflow_results(
+    details: &serde_json::Map<String, serde_json::Value>,
+) -> Vec<(Option<String>, &serde_json::Value)> {
+    if details.get("mode").and_then(serde_json::Value::as_str) != Some("workflow") {
+        return Vec::new();
+    }
+    details
+        .get("children")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .flat_map(|child| {
+            let child_run_id = string_field(child, "runId");
+            child
+                .get("results")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .map(move |result| {
+                    let run_id = string_field(result, "runId")
+                        .or_else(|| string_field(result, "childRunId"))
+                        .or_else(|| child_run_id.clone());
+                    (run_id, result)
+                })
+        })
+        .collect()
 }
 
 /// pi `detailsFromSessionEntry` (`:110-120`): subagent details stored directly on a `subagent` or
@@ -890,12 +936,15 @@ fn read_usage_metadata(
         }))
 }
 
-/// pi `metadataUsage` (`:122-143`): the first artifact `_meta.json` — index `0`, then unindexed, in
-/// each artifacts directory — whose `runId` and `agent` match and whose usage is non-zero.
+/// pi `metadataUsage` (`subagent-cost.ts:124-145` @ad11b7ab): the first artifact `_meta.json` —
+/// each of `indexes` in order (upstream's default is index `0`, then unindexed:
+/// [`DEFAULT_METADATA_INDEXES`]), in each artifacts directory — whose `runId` and `agent` match and
+/// whose usage is non-zero.
 fn metadata_usage(
     artifacts_dirs: &[PathBuf],
     run_id: &str,
     agent: &str,
+    indexes: &[Option<usize>],
 ) -> Option<SubagentCostUsage> {
     if run_id.is_empty()
         || !run_id
@@ -905,7 +954,7 @@ fn metadata_usage(
         return None;
     }
     for dir in artifacts_dirs {
-        for index in [Some(0), None] {
+        for &index in indexes {
             let path = crate::artifacts::artifact_paths(dir, run_id, agent, index).metadata_path;
             match read_usage_metadata(&path) {
                 Ok(Some(metadata)) => {
@@ -934,6 +983,10 @@ fn metadata_usage(
     None
 }
 
+/// pi `metadataUsage`'s default `indexes` (`subagent-cost.ts:127` @ad11b7ab): index `0`, then the
+/// unindexed form.
+const DEFAULT_METADATA_INDEXES: [Option<usize>; 2] = [Some(0), None];
+
 /// The accumulator behind [`collect_subagent_cost`] — pi's closure state (`:153-176`).
 #[derive(Default)]
 struct CostCollector {
@@ -943,23 +996,28 @@ struct CostCollector {
 }
 
 impl CostCollector {
-    /// pi `addChild` (`:161-176`): a zero-usage child is not listed and answers `false`; a child
-    /// already listed under the same `run:<id>` or `session:<file>` identity answers `true` without
-    /// being counted twice.
+    /// pi `addChild` (`subagent-cost.ts:167-182` @ad11b7ab): a zero-usage child is not listed and
+    /// answers `false`; a child already listed under the same identity answers `true` without being
+    /// counted twice. The identity is `identity` when given (an async run's per-step
+    /// `run:<id>:<index>`, so a step does not collide with its run), else `run:<id>`, else
+    /// `session:<file>`.
     fn add_child(
         &mut self,
         agent: Option<String>,
         run_id: Option<String>,
+        identity: Option<String>,
         usage: Option<SubagentCostUsage>,
         session_file: Option<String>,
     ) -> bool {
         let Some(usage) = usage.filter(SubagentCostUsage::has_value) else {
             return false;
         };
-        let identity = run_id
-            .as_ref()
-            .map(|id| format!("run:{id}"))
-            .or_else(|| session_file.as_ref().map(|file| format!("session:{file}")));
+        let identity = identity.or_else(|| {
+            run_id
+                .as_ref()
+                .map(|id| format!("run:{id}"))
+                .or_else(|| session_file.as_ref().map(|file| format!("session:{file}")))
+        });
         if let Some(identity) = identity
             && !self.seen.insert(identity)
         {
@@ -981,10 +1039,31 @@ impl CostCollector {
     }
 }
 
+/// One child result off a details `results` list (pi `subagent-cost.ts:194-196` @ad11b7ab). Its
+/// turn count is the usage record's own, else the result's (cyrup keeps `turns` beside `usage`).
+fn add_result_child(
+    collector: &mut CostCollector,
+    run_id: Option<String>,
+    result: &serde_json::Value,
+) {
+    let usage_record = result.get("usage");
+    let turns = usage_record
+        .and_then(|usage| usage.get("turns"))
+        .or_else(|| result.get("turns"));
+    collector.add_child(
+        string_field(result, "agent"),
+        run_id,
+        None,
+        usage_from_value(usage_record, turns),
+        string_field(result, "sessionFile"),
+    );
+}
+
 /// Collect parent and child usage for one session branch (pi `collectSubagentCost`,
-/// `subagent-cost.ts:145-240`). Foreground children come from persisted `subagent`/`bg_wait`
-/// tool-result details; async workflow children are resolved through their receipts and artifact
-/// metadata.
+/// `subagent-cost.ts:153-288` @ad11b7ab). Foreground children come from persisted
+/// `subagent`/`bg_wait` tool-result details; async workflow children are resolved through their
+/// receipts, and other async runs (single, chain, parallel) through their status steps, then
+/// artifact metadata.
 ///
 /// `branch` is the root→leaf entry sequence — pi's `ctx.sessionManager.getBranch()`.
 ///
@@ -998,9 +1077,11 @@ pub async fn collect_subagent_cost<'a>(
 ) -> SubagentCostReport {
     let mut parent = SubagentCostUsage::default();
     let mut collector = CostCollector::default();
-    // Insertion-ordered, as upstream's `Set` is.
+    // Insertion-ordered, as upstream's `Set`s are (`subagent-cost.ts:162-164` @ad11b7ab).
     let mut workflow_run_ids: Vec<String> = Vec::new();
-    let add_workflow_run_id = |id: &str, ids: &mut Vec<String>| {
+    let mut async_run_ids: Vec<String> = Vec::new();
+    let mut completed_run_ids: Vec<String> = Vec::new();
+    let add_unique = |id: &str, ids: &mut Vec<String>| {
         if !ids.iter().any(|seen| seen == id) {
             ids.push(id.to_string());
         }
@@ -1013,32 +1094,38 @@ pub async fn collect_subagent_cost<'a>(
         let Some(details) = details_from_session_entry(entry) else {
             continue;
         };
-        if details.get("mode").and_then(serde_json::Value::as_str) == Some("workflow")
-            && let Some(run_id) = details
-                .get("runId")
-                .and_then(serde_json::Value::as_str)
-                .filter(|id| !id.is_empty())
-        {
-            add_workflow_run_id(run_id, &mut workflow_run_ids);
-        }
-        for result in details
+        let results = details
             .get("results")
             .and_then(serde_json::Value::as_array)
-            .into_iter()
-            .flatten()
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let async_id = details
+            .get("asyncId")
+            .and_then(serde_json::Value::as_str)
+            .filter(|id| !id.is_empty());
+        let workflow_run_id = details
+            .get("runId")
+            .and_then(serde_json::Value::as_str)
+            .filter(|id| !id.is_empty());
+        // pi `subagent-cost.ts:190-193` @ad11b7ab: only an ASYNC workflow persists a receipt
+        // (a foreground workflow's child usage is already in its details), and an async launch
+        // result has no child results — its usage lands in run artifacts.
+        if details.get("mode").and_then(serde_json::Value::as_str) == Some("workflow")
+            && let (Some(run_id), Some(_)) = (workflow_run_id, async_id)
         {
+            add_unique(run_id, &mut workflow_run_ids);
+        } else if let Some(async_id) = async_id
+            && results.is_empty()
+        {
+            add_unique(async_id, &mut async_run_ids);
+        }
+        for result in results {
             let run_id =
                 string_field(result, "runId").or_else(|| string_field(result, "childRunId"));
-            let usage_record = result.get("usage");
-            let turns = usage_record
-                .and_then(|usage| usage.get("turns"))
-                .or_else(|| result.get("turns"));
-            collector.add_child(
-                string_field(result, "agent"),
-                run_id,
-                usage_from_value(usage_record, turns),
-                string_field(result, "sessionFile"),
-            );
+            add_result_child(&mut collector, run_id, result);
+        }
+        for (run_id, result) in foreground_workflow_results(details) {
+            add_result_child(&mut collector, run_id, result);
         }
         for completion in details
             .get("completions")
@@ -1046,10 +1133,13 @@ pub async fn collect_subagent_cost<'a>(
             .into_iter()
             .flatten()
         {
-            if completion.get("mode").and_then(serde_json::Value::as_str) == Some("workflow")
-                && let Some(run_id) = completion.get("runId").and_then(serde_json::Value::as_str)
-            {
-                add_workflow_run_id(run_id, &mut workflow_run_ids);
+            // pi `:197-203`: every completion's run is marked completed, so the async arm below
+            // does not count it a second time off its artifacts.
+            if let Some(run_id) = completion.get("runId").and_then(serde_json::Value::as_str) {
+                if completion.get("mode").and_then(serde_json::Value::as_str) == Some("workflow") {
+                    add_unique(run_id, &mut workflow_run_ids);
+                }
+                add_unique(run_id, &mut completed_run_ids);
             }
             for result in completion
                 .get("results")
@@ -1060,6 +1150,7 @@ pub async fn collect_subagent_cost<'a>(
                 collector.add_child(
                     string_field(result, "agent"),
                     string_field(result, "runId"),
+                    None,
                     usage_from_value(result.get("usage"), None),
                     string_field(result, "sessionFile"),
                 );
@@ -1085,7 +1176,9 @@ pub async fn collect_subagent_cost<'a>(
 
     let mut unresolved_async_children: u64 = 0;
     for workflow_run_id in &workflow_run_ids {
+        // An id that cannot name a run directory is upstream's receipt-read throw (`:250-252`).
         let Some(run) = crate::identity::RunDirName::parse(workflow_run_id) else {
+            unresolved_async_children += 1;
             continue;
         };
         let run_dir = run.resolve_in(sources.async_root);
@@ -1097,10 +1190,21 @@ pub async fn collect_subagent_cost<'a>(
         {
             add_artifacts_dir(cwd, &mut artifacts_dirs);
         }
+        // pi `subagent-cost.ts:250-256` @ad11b7ab: without a receipt, a bg_wait completion cannot
+        // prove it reported every child (a stopped workflow may omit one), so a missing or
+        // unreadable receipt is COUNTED unresolved. A missing one (a running workflow has no
+        // receipt yet; upstream's `ENOENT`, also via `error.cause`) is not logged.
         let receipt = match crate::workflows::read_workflow_receipt(sources.async_root, &run) {
             Ok(receipt) => receipt,
-            Err(crate::workflows::WorkflowReceiptError::NotFound { .. }) => continue,
+            Err(
+                crate::workflows::WorkflowReceiptError::NotFound { .. }
+                | crate::workflows::WorkflowReceiptError::MayStillBeActive { .. },
+            ) => {
+                unresolved_async_children += 1;
+                continue;
+            }
             Err(error) => {
+                unresolved_async_children += 1;
                 tracing::warn!(
                     target: "cyrup_ext_subagents::cost",
                     workflow_run_id = %workflow_run_id,
@@ -1185,8 +1289,74 @@ pub async fn collect_subagent_cost<'a>(
                 unresolved_async_children += 1;
                 continue;
             };
-            let usage = metadata_usage(&artifacts_dirs, &run_id, &agent);
-            if usage.is_none() || !collector.add_child(Some(agent), Some(run_id), usage, None) {
+            let usage = metadata_usage(&artifacts_dirs, &run_id, &agent, &DEFAULT_METADATA_INDEXES);
+            if usage.is_none() || !collector.add_child(Some(agent), Some(run_id), None, usage, None)
+            {
+                unresolved_async_children += 1;
+            }
+        }
+    }
+
+    // pi `subagent-cost.ts:259-283` @ad11b7ab: an async single, chain or parallel launch — its
+    // usage is resolved through the run's status steps, then each step's artifact metadata.
+    for async_run_id in &async_run_ids {
+        // A bg_wait completion already reported this run's results; its children carry no child
+        // runId.
+        if completed_run_ids.contains(async_run_id) {
+            continue;
+        }
+        // An id that cannot name a run directory is upstream's `readStatus` throw (`:279-282`).
+        let Some(run) = crate::identity::RunDirName::parse(async_run_id) else {
+            unresolved_async_children += 1;
+            continue;
+        };
+        let status_path =
+            crate::background::RunDir::for_existing(&run.resolve_in(sources.async_root)).status();
+        let status = match crate::background::control::read_status_file(&status_path).await {
+            Ok(Some(status)) if !status.steps.is_empty() => status,
+            Ok(_) => {
+                unresolved_async_children += 1;
+                continue;
+            }
+            Err(error) => {
+                unresolved_async_children += 1;
+                tracing::warn!(
+                    target: "cyrup_ext_subagents::cost",
+                    async_run_id = %async_run_id,
+                    %error,
+                    "failed to resolve async subagent usage"
+                );
+                continue;
+            }
+        };
+        if let Some(cwd) = status.cwd.as_deref() {
+            add_artifacts_dir(cwd, &mut artifacts_dirs);
+        }
+        let multi_step = status.steps.len() > 1;
+        for (index, step) in status.steps.iter().enumerate() {
+            // The runner suffixes artifact names with the flat step index only for multi-step
+            // runs upstream (`:270-273`); a one-step run reads unindexed, then index `0`. Cyrup's
+            // runner always writes `Some(flat_index)` (`background/flat_index.rs`), which the
+            // one-step `[None, Some(0)]` order already covers.
+            let (indexes, identity) = if multi_step {
+                (vec![Some(index)], format!("run:{async_run_id}:{index}"))
+            } else {
+                (vec![None, Some(0)], format!("run:{async_run_id}"))
+            };
+            let usage = metadata_usage(&artifacts_dirs, async_run_id, &step.agent, &indexes);
+            // Pending and running steps have not finalized their metadata yet.
+            let settled = !matches!(
+                step.status,
+                crate::background::StepState::Pending | crate::background::StepState::Running
+            );
+            if !collector.add_child(
+                Some(step.agent.clone()),
+                Some(async_run_id.clone()),
+                Some(identity),
+                usage,
+                None,
+            ) && settled
+            {
                 unresolved_async_children += 1;
             }
         }
@@ -2267,10 +2437,11 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
+        // SUBA-163: only an ASYNC workflow (one carrying `asyncId`) names a receipt to resolve.
         let workflow = tool_result_entry(
             "w0000001",
             "subagent",
-            serde_json::json!({ "mode": "workflow", "runId": "wf-1", "results": [] }),
+            serde_json::json!({ "mode": "workflow", "runId": "wf-1", "asyncId": "wf-1", "results": [] }),
         );
 
         let report = collect_in(dir.path(), [&workflow]).await;
@@ -2422,5 +2593,273 @@ mod tests {
         let report = report_of([&custom]).await;
         assert!(report.contains("Child 1 (scout)"), "report: {report}");
         assert!(report.contains("Children: ↑12 ↓8"), "report: {report}");
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // SUBA-163 — pi `collectSubagentCost` @ad11b7ab: async launches, `completions`, the
+    // async-gated workflow arm, a missing receipt, and foreground workflow children.
+    // ---------------------------------------------------------------------------------------
+
+    /// The details a confirmed async launch stores — `extension/executor/paths.rs`'s
+    /// `async_launch_details` shape (`{ mode, runId, results: [], asyncId, asyncDir }`), whose
+    /// module is private to `extension`.
+    fn async_launch_entry(id: &str, mode: &str, run_id: &str, root: &Path) -> Entry {
+        tool_result_entry(
+            id,
+            "subagent",
+            serde_json::json!({
+                "mode": mode,
+                "runId": run_id,
+                "results": [],
+                "asyncId": run_id,
+                "asyncDir": root.join("async").join(run_id),
+            }),
+        )
+    }
+
+    /// Writes `async/<run_id>/status.json` with one step per `(agent, state)`.
+    async fn write_async_status(root: &Path, run_id: &str, steps: &[(&str, StepState)]) {
+        let run = crate::identity::RunDirName::parse(run_id).expect("a valid run dir name");
+        let path =
+            crate::background::RunDir::for_existing(&run.resolve_in(&root.join("async"))).status();
+        let mut status = RunStatus::queued(
+            RunId::from_token(run_id.to_string()),
+            RunMode::Chain,
+            Some(u32::try_from(steps.len()).unwrap()),
+        );
+        status.state = RunState::Complete;
+        status.steps = steps
+            .iter()
+            .map(|(agent, state)| {
+                let mut step = step_with_usage(agent, 0, 0, 0.0);
+                step.status = *state;
+                step
+            })
+            .collect();
+        write_atomic_test_json(&path, &status).await;
+    }
+
+    /// Writes one artifact `_meta.json` under the project artifacts dir of `root`.
+    fn write_meta(root: &Path, run_id: &str, agent: &str, index: Option<usize>, input: u64) {
+        let artifacts = crate::artifacts::resolve_artifacts_dir(
+            None,
+            Some(root),
+            root,
+            crate::artifacts::ArtifactDirPreference::Project,
+        );
+        std::fs::create_dir_all(&artifacts).unwrap();
+        std::fs::write(
+            crate::artifacts::artifact_paths(&artifacts, run_id, agent, index).metadata_path,
+            serde_json::to_vec(&serde_json::json!({
+                "runId": run_id,
+                "agent": agent,
+                "usage": usage_json(input, 1, 0, 0, 0.001),
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// pi `subagent-cost.ts:193,259-278` @ad11b7ab: an async single launch's result has an
+    /// `asyncId` and no `results`, so its usage is read off the run's status steps and artifact
+    /// metadata. Cyrup's runner always writes the indexed `_0` form for a one-step run.
+    ///
+    /// Before SUBA-163 the collector tracked workflow run ids only, and this reported no children.
+    #[tokio::test]
+    async fn an_async_single_launch_contributes_its_child_usage() {
+        let dir = tempfile::tempdir().unwrap();
+        write_async_status(dir.path(), "as-1", &[("worker", StepState::Complete)]).await;
+        write_meta(dir.path(), "as-1", "worker", Some(0), 30);
+        let launch = async_launch_entry("t0000001", "single", "as-1", dir.path());
+
+        let report = collect_in(dir.path(), [&launch]).await;
+
+        assert_eq!(report.children.len(), 1, "{report:?}");
+        assert_eq!(report.children[0].agent.as_deref(), Some("worker"));
+        assert_eq!(report.children[0].run_id.as_deref(), Some("as-1"));
+        assert_eq!(report.child_total.input, 30);
+        assert_eq!(report.unresolved_async_children, 0, "{report:?}");
+        // The RPC `cost` payload is the same struct.
+        let wire = serde_json::to_value(&report).unwrap();
+        assert_eq!(wire["childTotal"]["input"], serde_json::json!(30));
+    }
+
+    /// pi `:268-278`: a multi-step async run (chain or parallel) reads each step's own indexed
+    /// metadata under a per-step identity, so two steps of one run do not collapse into one. A
+    /// pending step is not yet unresolved; a settled step with no metadata is.
+    #[tokio::test]
+    async fn an_async_chain_and_parallel_launch_each_contribute_every_steps_usage() {
+        for mode in ["chain", "parallel"] {
+            let dir = tempfile::tempdir().unwrap();
+            let run_id = format!("{mode}-1");
+            write_async_status(
+                dir.path(),
+                &run_id,
+                &[
+                    ("scout", StepState::Complete),
+                    ("worker", StepState::Complete),
+                    ("reviewer", StepState::Failed),
+                    ("tester", StepState::Pending),
+                ],
+            )
+            .await;
+            write_meta(dir.path(), &run_id, "scout", Some(0), 10);
+            write_meta(dir.path(), &run_id, "worker", Some(1), 20);
+            // Index 0 is the scout's slot: the worker must not be read from it.
+            write_meta(dir.path(), &run_id, "worker", Some(0), 999);
+            let launch = async_launch_entry("t0000001", mode, &run_id, dir.path());
+
+            let report = collect_in(dir.path(), [&launch]).await;
+
+            let agents: Vec<_> = report
+                .children
+                .iter()
+                .map(|child| child.agent.as_deref().unwrap_or_default())
+                .collect();
+            assert_eq!(agents, ["scout", "worker"], "{mode}: {report:?}");
+            assert_eq!(report.child_total.input, 30, "{mode}: {report:?}");
+            assert_eq!(
+                report.unresolved_async_children, 1,
+                "{mode}: the settled metadata-less reviewer, not the pending tester: {report:?}"
+            );
+        }
+    }
+
+    /// pi `:197-199,261`: a `bg_wait` completion for an async run marks it completed, so its usage
+    /// is counted once, off the completion, and not again off the run's artifacts.
+    #[tokio::test]
+    async fn a_bg_wait_completion_does_not_double_count_an_async_launch() {
+        let dir = tempfile::tempdir().unwrap();
+        write_async_status(
+            dir.path(),
+            "ap-1",
+            &[
+                ("scout", StepState::Complete),
+                ("worker", StepState::Complete),
+            ],
+        )
+        .await;
+        write_meta(dir.path(), "ap-1", "scout", Some(0), 10);
+        write_meta(dir.path(), "ap-1", "worker", Some(1), 20);
+        let launch = async_launch_entry("t0000001", "parallel", "ap-1", dir.path());
+        let waited = tool_result_entry(
+            "t0000002",
+            crate::extension::wait_tool::WAIT_TOOL_NAME,
+            serde_json::json!({
+                "mode": "management",
+                "results": [],
+                "completions": [{ "runId": "ap-1", "mode": "parallel", "results": [
+                    { "agent": "scout", "usage": { "input": 10, "output": 1, "cost": 0.001, "turns": 1 } },
+                    { "agent": "worker", "usage": { "input": 20, "output": 1, "cost": 0.001, "turns": 1 } },
+                ] }],
+            }),
+        );
+
+        let report = collect_in(dir.path(), [&launch, &waited]).await;
+
+        assert_eq!(report.children.len(), 2, "{report:?}");
+        assert_eq!(report.child_total.input, 30, "{report:?}");
+        assert_eq!(report.unresolved_async_children, 0, "{report:?}");
+    }
+
+    /// pi `:191` @ad11b7ab: a workflow id joins the receipt set only with an `asyncId`. A
+    /// foreground workflow's details name its run but have no receipt to resolve, so nothing is
+    /// read for it and nothing is counted unresolved — even when a receipt for that id exists.
+    #[tokio::test]
+    async fn a_foreground_workflow_run_id_is_not_resolved_through_a_receipt() {
+        let dir = tempfile::tempdir().unwrap();
+        let run_dir = dir.path().join("async").join("wf-fg");
+        std::fs::create_dir_all(&run_dir).unwrap();
+        std::fs::write(
+            run_dir.join(crate::workflows::WORKFLOW_RECEIPT_FILE),
+            serde_json::to_vec(&serde_json::json!({
+                "version": 1,
+                "workflowRunId": "wf-fg",
+                "state": "complete",
+                "createdAt": 1,
+                "entries": {
+                    "a": { "key": "a", "agent": "worker", "continuation": { "runIds": ["r-fg"] },
+                           "latestRunId": "r-fg", "resumability": { "state": "resumable" } },
+                },
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        write_meta(dir.path(), "r-fg", "worker", None, 40);
+        let foreground = tool_result_entry(
+            "w0000001",
+            "subagent",
+            serde_json::json!({ "mode": "workflow", "runId": "wf-fg", "results": [] }),
+        );
+
+        let report = collect_in(dir.path(), [&foreground]).await;
+
+        assert!(report.children.is_empty(), "{report:?}");
+        assert_eq!(report.unresolved_async_children, 0, "{report:?}");
+    }
+
+    /// pi `:250-256` @ad11b7ab (#2615): an async workflow with no receipt yet is COUNTED as
+    /// unresolved, so the report says its child total is a lower bound.
+    #[tokio::test]
+    async fn an_async_workflow_without_a_receipt_is_listed_as_unavailable() {
+        let dir = tempfile::tempdir().unwrap();
+        let running = tool_result_entry(
+            "w0000001",
+            "subagent",
+            serde_json::json!({ "mode": "workflow", "runId": "wf-2", "asyncId": "wf-2", "results": [] }),
+        );
+
+        let report = collect_in(dir.path(), [&running]).await;
+
+        assert_eq!(report.unresolved_async_children, 1, "{report:?}");
+        let text = format_subagent_cost_report(&report);
+        assert!(text.contains("Async child usage unavailable: 1."), "{text}");
+    }
+
+    /// pi `workflowDetailsResults` (`src/runs/foreground/subagent-executor.ts:4758-4764`
+    /// @ad11b7ab): a foreground workflow's child usage is counted, every round of a resumed child
+    /// under its own run id (#2612), and a round without one under the child's.
+    #[tokio::test]
+    async fn a_foreground_workflow_counts_every_childs_usage() {
+        let dir = tempfile::tempdir().unwrap();
+        let workflow = tool_result_entry(
+            "w0000001",
+            "subagent",
+            serde_json::json!({
+                "mode": "workflow",
+                "workflowRunId": "wf-fg",
+                "children": [
+                    { "key": "a", "ok": true, "runId": "r-a", "output": "",
+                      "results": [{ "agent": "scout", "turns": 2, "usage": usage_json(11, 1, 0, 0, 0.001) }] },
+                    { "key": "b", "ok": true, "runId": "r-b2", "output": "",
+                      "results": [
+                          { "agent": "worker", "runId": "r-b1", "usage": usage_json(5, 1, 0, 0, 0.001) },
+                          { "agent": "worker", "runId": "r-b2", "usage": usage_json(7, 1, 0, 0, 0.001) },
+                      ] },
+                ],
+            }),
+        );
+        // The failure arm's shape: no `workflowRunId` when settlement itself failed, same `children`.
+        let failed = tool_result_entry(
+            "w0000002",
+            "subagent",
+            serde_json::json!({
+                "mode": "workflow",
+                "children": [{ "key": "c", "ok": false, "runId": "r-c", "output": "",
+                               "results": [{ "agent": "tester", "usage": usage_json(3, 1, 0, 0, 0.001) }] }],
+            }),
+        );
+
+        let report = collect_in(dir.path(), [&workflow, &failed]).await;
+
+        let runs: Vec<_> = report
+            .children
+            .iter()
+            .map(|child| child.run_id.as_deref().unwrap_or_default())
+            .collect();
+        assert_eq!(runs, ["r-a", "r-b1", "r-b2", "r-c"], "{report:?}");
+        assert_eq!(report.children[0].usage.turns, 2);
+        assert_eq!(report.child_total.input, 26, "{report:?}");
+        assert_eq!(report.unresolved_async_children, 0, "{report:?}");
     }
 }
