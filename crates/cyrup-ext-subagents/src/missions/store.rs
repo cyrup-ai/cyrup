@@ -1365,9 +1365,14 @@ fn resolve_for_comparison(path: &str) -> PathBuf {
     }
 }
 
-/// pi `listGlobalMissions` (`store.ts:477-507`): read every pointer, verify the record it points
-/// at still exists and agrees about its own id, DELETE the pointer when the record is gone, and
-/// mark it STALE (without deleting) when it exists but does not validate.
+/// pi `listGlobalMissions` (`store.ts:554-597` @ad11b7ab): read every pointer, verify the record
+/// it points at still exists and agrees about its own id, DELETE the pointer when the record is
+/// gone, and mark it STALE (without deleting) when it exists but does not validate.
+///
+/// A readable, id-matching record is PROJECTED over its pointer (`:563-572`): the listed `title`,
+/// `status`, `updatedAt` and `lastRunId` are the record's, not the pointer's copies, so a lagging
+/// pointer never shows an old status or title, and the list is sorted by the record's `updatedAt`.
+/// The pointer file itself is not rewritten.
 #[must_use]
 pub fn list_global_missions(global_index_dir: &Path) -> GlobalMissionListResult {
     let Ok(dir) = std::fs::read_dir(global_index_dir) else {
@@ -1425,7 +1430,7 @@ pub fn list_global_missions(global_index_dir: &Path) -> GlobalMissionListResult 
             .and_then(|value| parse_mission_record(&value, &entry.record_path))
             .and_then(|record| {
                 if record.id == entry.mission_id {
-                    Ok(())
+                    Ok(record)
                 } else {
                     Err(MissionError::invalid(format!(
                         "record id '{}' does not match index id '{}'",
@@ -1434,8 +1439,21 @@ pub fn list_global_missions(global_index_dir: &Path) -> GlobalMissionListResult 
                 }
             });
         match verdict {
-            Ok(()) => entries.push(GlobalMissionIndexRecord {
-                entry,
+            Ok(record) => entries.push(GlobalMissionIndexRecord {
+                // pi `:563-572`: `{ ...entry, title, status, updatedAt }` from the record, then
+                // `lastRunId` from the record's last run, and none at all when it has no runs
+                // (`delete projection.lastRunId`; `if (lastRunId)`).
+                entry: MissionIndexEntry {
+                    title: record.title,
+                    status: record.status,
+                    updated_at: record.updated_at,
+                    last_run_id: record
+                        .runs
+                        .last()
+                        .map(|run| run.run_id.clone())
+                        .filter(|run_id| !run_id.is_empty()),
+                    ..entry
+                },
                 stale: false,
                 stale_reason: None,
             }),
@@ -2198,5 +2216,131 @@ mod tests {
             assert_eq!(mode, 0o600, "writePrivateAtomicJson writes mode 0600");
         }
         assert!(path.exists());
+    }
+
+    /// Rewrite a mission's global pointer so its copied fields lag the record, as a pointer does
+    /// when its refresh was missed.
+    fn lag_pointer(loc: &MissionStoreLocation, record: &MissionRecord, fields: Value) {
+        let pointer = index_path(loc, record);
+        let mut value: Value =
+            serde_json::from_str(&std::fs::read_to_string(&pointer).unwrap()).unwrap();
+        for (key, field) in fields.as_object().unwrap() {
+            value[key.as_str()] = field.clone();
+        }
+        std::fs::write(&pointer, serde_json::to_string(&value).unwrap()).unwrap();
+    }
+
+    /// SUBA-170 — pi `listGlobalMissions` (`store.ts:563-572` @ad11b7ab) projects the readable
+    /// record over its pointer: a stale pointer lists the RECORD's title, status, `updatedAt` and
+    /// last run id, and the pointer file itself is left as it was.
+    #[test]
+    fn a_stale_global_pointer_lists_the_records_title_status_and_last_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        let loc = location(tmp.path());
+        let created = create(&loc, "Current title");
+        let record = update_mission(
+            &loc,
+            &created.id,
+            &MissionUpdateInput {
+                status: Some(MissionStatus::Active),
+                add_runs: vec![MissionRunLink {
+                    run_id: "run-new".to_string(),
+                    mode: crate::missions::MissionRunMode::Single,
+                    async_dir: None,
+                    child_index: None,
+                    agent: None,
+                    status: None,
+                    started_at: None,
+                    completed_at: None,
+                    usage: None,
+                }],
+                ..Default::default()
+            },
+            5_000,
+            None,
+        )
+        .unwrap();
+        lag_pointer(
+            &loc,
+            &record,
+            serde_json::json!({
+                "title": "Old title",
+                "status": "planned",
+                "updatedAt": "1970-01-01T00:00:00.000Z",
+                "lastRunId": "run-old",
+            }),
+        );
+        let pointer_before = std::fs::read_to_string(index_path(&loc, &record)).unwrap();
+
+        let listed = list_global_missions(&loc.global_index_dir);
+
+        assert_eq!(listed.entries.len(), 1, "{listed:?}");
+        let entry = &listed.entries[0];
+        assert!(!entry.stale);
+        assert_eq!(entry.entry.title, "Current title");
+        assert_eq!(entry.entry.status, MissionStatus::Active);
+        assert_eq!(entry.entry.updated_at, record.updated_at);
+        assert_eq!(entry.entry.last_run_id.as_deref(), Some("run-new"));
+        // The projection is read-only: the pointer is not rewritten.
+        assert_eq!(
+            std::fs::read_to_string(index_path(&loc, &record)).unwrap(),
+            pointer_before
+        );
+    }
+
+    /// pi `delete projection.lastRunId` then `if (lastRunId)` (`store.ts:569-571` @ad11b7ab): a
+    /// record with no runs lists no `lastRunId`, even when its pointer still names one.
+    #[test]
+    fn a_record_with_no_runs_lists_no_last_run_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let loc = location(tmp.path());
+        let record = create(&loc, "No runs");
+        lag_pointer(
+            &loc,
+            &record,
+            serde_json::json!({ "lastRunId": "run-gone" }),
+        );
+
+        let listed = list_global_missions(&loc.global_index_dir);
+
+        assert_eq!(listed.entries.len(), 1, "{listed:?}");
+        assert_eq!(listed.entries[0].entry.last_run_id, None);
+        let rendered = serde_json::to_value(&listed.entries[0]).unwrap();
+        assert!(rendered.get("lastRunId").is_none(), "{rendered}");
+    }
+
+    /// The sort (`store.ts:594`) runs over the projection, so a lagging pointer's `updatedAt` does
+    /// not misorder the list.
+    #[test]
+    fn the_global_list_is_sorted_by_the_records_updated_at() {
+        let tmp = tempfile::tempdir().unwrap();
+        let loc = location(tmp.path());
+        let older = create(&loc, "Older");
+        let newer = update_mission(
+            &loc,
+            &create(&loc, "Newer").id,
+            &MissionUpdateInput {
+                summary: Some("touched".to_string()),
+                ..Default::default()
+            },
+            9_000,
+            None,
+        )
+        .unwrap();
+        // The newer mission's pointer lags behind the older mission's.
+        lag_pointer(
+            &loc,
+            &newer,
+            serde_json::json!({ "updatedAt": "1969-12-31T00:00:00.000Z" }),
+        );
+
+        let listed = list_global_missions(&loc.global_index_dir);
+
+        let order: Vec<&str> = listed
+            .entries
+            .iter()
+            .map(|e| e.entry.mission_id.as_str())
+            .collect();
+        assert_eq!(order, vec![newer.id.as_str(), older.id.as_str()]);
     }
 }
