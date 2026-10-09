@@ -29,7 +29,7 @@
 //! drops `subagents` — so an enable/reset round-trip leaves a settings file that is byte-identical
 //! in structure to one that never had the override (no `"subagents": {}` residue).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde_json::{Map, Value};
 
@@ -72,12 +72,18 @@ fn read_settings_file_strict(path: &Path) -> Result<Map<String, Value>, Subagent
 ///
 /// This is a `cyrup-original` finding: pi's `agents.ts` is likewise unlocked, so the bar being
 /// missed is **cyrup's own** — `cyrup-config`'s `FileSettingsStore::with_lock` takes a `FileLock`
-/// plus `write_atomic` for exactly this file. Without it two concurrent `disable`/`enable`/`reset`
+/// plus `write_atomic` for settings files. Without it two concurrent `disable`/`enable`/`reset`
 /// actions can lose one another's write (both read the same base, the second write wins), or leave
 /// a truncated `settings.json` if the process dies mid-`fs::write` — disabling every agent until
 /// the file is hand-repaired.
 ///
 /// The lock lives on a sidecar `<path>.lock`, so it survives the atomic rename over the target.
+/// SUBA-171: every caller passes the PHYSICAL write target ([`settings_write_target`]), as pi's
+/// `withSettingsFileLease` resolves the target before it takes the lease
+/// (`src/shared/settings-file-lease.ts:33-36` @ad11b7ab), so a symlinked `settings.json` is locked
+/// on its target's sidecar. `FileSettingsStore::with_lock` locks the path it is given, so for a
+/// symlinked file the two take DIFFERENT sidecars and do not exclude each other; for a regular file
+/// they are the same lock.
 async fn lock_settings_file(path: &Path) -> Result<cyrup_config::lock::FileLock, SubagentError> {
     // `None`: this crate holds no `CancelToken` at these sites, and every non-`models_store`
     // caller of `FileLock::acquire` passes `None` for the same reason.
@@ -91,24 +97,122 @@ async fn lock_settings_file(path: &Path) -> Result<cyrup_config::lock::FileLock,
         })
 }
 
-/// pi `writeSettingsFile` (`agents.ts:706-709`): `mkdir -p` the parent, then write
-/// `JSON.stringify(settings, null, 2) + "\n"`. The two-space indent and the trailing newline are
-/// matched exactly so a cyrup-written settings file is diff-clean against a pi-written one.
-///
-/// SUBA-029: the bytes are unchanged; only the DELIVERY changed, from a bare `std::fs::write` to
-/// `cyrup_config::lock::write_atomic`'s temp-then-rename. `secret: false` because a settings file
-/// is not a credential store and pi writes it with the ordinary umask — this is a durability fix,
-/// not a permissions change.
-fn write_settings_file(path: &Path, settings: &Map<String, Value>) -> Result<(), SubagentError> {
-    let mut body = serde_json::to_string_pretty(&Value::Object(settings.clone()))
-        .map_err(|e| SubagentError::Spawn(std::io::Error::other(e)))?;
-    body.push('\n');
-    cyrup_config::lock::write_atomic(path, body.as_bytes(), false).map_err(|e| {
+/// SUBA-171 — pi `resolveSettingsWriteTarget` (`src/shared/settings-file-lease.ts:6-30`
+/// @ad11b7ab): the physical file a settings path writes to, following file and directory links,
+/// including a dangling file link (whose link text names the file to create). A missing target is
+/// allowed only when its physical parent exists; a path ending in a separator cannot name a new
+/// settings file. The atomic rename then lands on the link's TARGET and the link stays in place.
+fn resolve_settings_write_target(file_path: &Path) -> std::io::Result<PathBuf> {
+    let mut target = file_path.to_path_buf();
+    loop {
+        match std::fs::canonicalize(&target) {
+            Ok(resolved) => return Ok(resolved),
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+            Err(e) => {
+                let text = target.as_os_str().to_string_lossy();
+                if text.ends_with('/') || text.ends_with(std::path::MAIN_SEPARATOR) {
+                    return Err(e);
+                }
+            }
+        }
+        let parent = match target.parent() {
+            Some(p) if !p.as_os_str().is_empty() => p,
+            _ => Path::new("."),
+        };
+        let parent_path = std::fs::canonicalize(parent)?;
+        let Some(base) = target.file_name() else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("settings path '{}' names no file", target.display()),
+            ));
+        };
+        let unresolved = parent_path.join(base);
+        let link_text = match std::fs::read_link(&unresolved) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(unresolved),
+            Err(e) => return Err(e),
+        };
+        // Keep the link text intact (no normalization) so the filesystem follows directory links
+        // before any `..`, as upstream's string join does.
+        target = if link_text.is_absolute() {
+            link_text
+        } else {
+            parent_path.join(link_text)
+        };
+    }
+}
+
+/// SUBA-171 — `mkdir -p` the parent of `path`, then resolve the physical write target. pi does
+/// both before it takes the settings lease (`withSettingsFileLease`,
+/// `src/shared/settings-file-lease.ts:33-36` @ad11b7ab), so the lease, the read-modify-write and
+/// the rename all act on the same physical file whether it is reached directly or through a link.
+fn settings_write_target(path: &Path) -> Result<PathBuf, SubagentError> {
+    let fail = |e: std::io::Error| {
         SubagentError::MalformedSettings(format!(
             "Failed to write settings file '{}': {e}",
             path.display()
         ))
-    })
+    };
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent).map_err(fail)?;
+    }
+    resolve_settings_write_target(path).map_err(fail)
+}
+
+/// pi `writeSettingsFile` (`src/agents/agents.ts:950-978` @ad11b7ab): write
+/// `JSON.stringify(settings, null, 2) + "\n"` atomically. The two-space indent and the trailing
+/// newline are matched exactly so a cyrup-written settings file is diff-clean against a pi-written
+/// one.
+///
+/// SUBA-029: the delivery is temp-then-rename, so an interrupted save leaves the previous settings
+/// readable. SUBA-171: `target` is the PHYSICAL file ([`settings_write_target`]), so a symlinked
+/// `settings.json` keeps its link and the save lands on the link's target; an existing file's mode
+/// (`stat().mode & 0o7777`) is checked for write access (pi `accessSync(W_OK)`) and carried onto
+/// the temp before the rename, so a `0600` file stays `0600` and a read-only file is refused
+/// instead of replaced. A new file gets the umask default, as pi's does.
+fn write_settings_file(
+    path: &Path,
+    target: &Path,
+    settings: &Map<String, Value>,
+) -> Result<(), SubagentError> {
+    let fail = |e: &dyn std::fmt::Display| {
+        SubagentError::MalformedSettings(format!(
+            "Failed to write settings file '{}': {e}",
+            path.display()
+        ))
+    };
+    let existing_mode = match std::fs::metadata(target) {
+        Ok(meta) => Some(file_mode(&meta)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(fail(&e)),
+    };
+    if existing_mode.is_some() {
+        // pi `fs.accessSync(targetPath, W_OK)`. This crate forbids `unsafe`, so the probe is an
+        // open-for-write that neither truncates nor creates: it is refused exactly when `access(2)`
+        // with `W_OK` would be for a regular file the caller owns or is permitted to write.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(target)
+            .map_err(|e| fail(&e))?;
+    }
+    let mut body = serde_json::to_string_pretty(&Value::Object(settings.clone()))
+        .map_err(|e| SubagentError::Spawn(std::io::Error::other(e)))?;
+    body.push('\n');
+    cyrup_config::lock::write_atomic_with_mode(target, body.as_bytes(), existing_mode)
+        .map_err(|e| fail(&e))
+}
+
+/// `stat().mode & 0o7777` on unix; `None`-equivalent elsewhere, where a file has no mode bits and
+/// `write_atomic_with_mode` ignores the value.
+#[cfg(unix)]
+fn file_mode(meta: &std::fs::Metadata) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    meta.permissions().mode() & 0o7777
+}
+
+#[cfg(not(unix))]
+fn file_mode(_meta: &std::fs::Metadata) -> u32 {
+    0
 }
 
 /// Borrow `settings.subagents.agentOverrides` as an object, if all three levels are objects.
@@ -162,7 +266,8 @@ pub async fn merge_builtin_agent_override(
 ) -> Result<(), SubagentError> {
     // SUBA-029: ONE lock spans the read AND the write, so the read-modify-write is atomic against
     // a concurrent management action on the same file rather than three independent operations.
-    let _lock = lock_settings_file(path).await?;
+    let target = settings_write_target(path)?;
+    let _lock = lock_settings_file(&target).await?;
     let mut settings = read_settings_file_strict(path)?;
     let mut next_overrides = overrides_of(&settings).cloned().unwrap_or_default();
     let mut entry = next_overrides
@@ -175,7 +280,7 @@ pub async fn merge_builtin_agent_override(
     }
     next_overrides.insert(name.to_string(), Value::Object(entry));
     store_overrides(&mut settings, next_overrides);
-    write_settings_file(path, &settings)
+    write_settings_file(path, &target, &settings)
 }
 
 /// pi `removeBuiltinAgentOverride` (`agents.ts:1276-1299`): delete the WHOLE
@@ -192,7 +297,8 @@ pub async fn merge_builtin_agent_override(
 /// As [`merge_builtin_agent_override`].
 pub async fn remove_builtin_agent_override(path: &Path, name: &str) -> Result<bool, SubagentError> {
     // SUBA-029: held across read+write; see `lock_settings_file`.
-    let _lock = lock_settings_file(path).await?;
+    let target = settings_write_target(path)?;
+    let _lock = lock_settings_file(&target).await?;
     let mut settings = read_settings_file_strict(path)?;
     let Some(overrides) = overrides_of(&settings) else {
         return Ok(false);
@@ -203,7 +309,7 @@ pub async fn remove_builtin_agent_override(path: &Path, name: &str) -> Result<bo
     let mut next_overrides = overrides.clone();
     next_overrides.remove(name);
     store_overrides(&mut settings, next_overrides);
-    write_settings_file(path, &settings)?;
+    write_settings_file(path, &target, &settings)?;
     Ok(true)
 }
 
@@ -220,7 +326,8 @@ pub async fn reset_builtin_agent_override_preserving_machine(
     path: &Path,
     name: &str,
 ) -> Result<(bool, bool), SubagentError> {
-    let _lock = lock_settings_file(path).await?;
+    let target = settings_write_target(path)?;
+    let _lock = lock_settings_file(&target).await?;
     let mut settings = read_settings_file_strict(path)?;
     let Some(overrides) = overrides_of(&settings) else {
         return Ok((false, false));
@@ -245,7 +352,7 @@ pub async fn reset_builtin_agent_override_preserving_machine(
         }
     };
     store_overrides(&mut settings, next_overrides);
-    write_settings_file(path, &settings)?;
+    write_settings_file(path, &target, &settings)?;
     Ok((true, preserved))
 }
 
@@ -268,7 +375,8 @@ pub async fn remove_builtin_agent_override_fields(
     fields: &[&str],
 ) -> Result<bool, SubagentError> {
     // SUBA-029: held across read+write; see `lock_settings_file`.
-    let _lock = lock_settings_file(path).await?;
+    let target = settings_write_target(path)?;
+    let _lock = lock_settings_file(&target).await?;
     let mut settings = read_settings_file_strict(path)?;
     let Some(overrides) = overrides_of(&settings) else {
         return Ok(false);
@@ -293,7 +401,7 @@ pub async fn remove_builtin_agent_override_fields(
         next_overrides.insert(name.to_string(), Value::Object(next_entry));
     }
     store_overrides(&mut settings, next_overrides);
-    write_settings_file(path, &settings)?;
+    write_settings_file(path, &target, &settings)?;
     Ok(true)
 }
 
@@ -564,6 +672,198 @@ mod tests {
                 .expect_err("malformed settings must abort");
         assert!(matches!(err, SubagentError::MalformedSettings(_)), "{err}");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "{ not json");
+    }
+
+    /// SUBA-171 — a save through a symlinked `settings.json` (a dotfile manager's layout) updates
+    /// the link's target and leaves the link in place. Red before: `write_atomic` renamed the temp
+    /// over the link itself, so the link became a plain file and the target kept the old content.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_save_through_a_symlink_updates_the_target_and_keeps_the_link() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dotfiles = tmp.path().join("dotfiles");
+        std::fs::create_dir(&dotfiles).unwrap();
+        let real = dotfiles.join("settings.json");
+        std::fs::write(&real, r#"{"theme":"dark"}"#).unwrap();
+        let link = tmp.path().join("settings.json");
+        std::os::unix::fs::symlink("dotfiles/settings.json", &link).unwrap();
+
+        merge_builtin_agent_override(&link, "scout", &field("disabled", Value::Bool(true)))
+            .await
+            .unwrap();
+
+        let meta = std::fs::symlink_metadata(&link).unwrap();
+        assert!(
+            meta.file_type().is_symlink(),
+            "the link must survive the save"
+        );
+        assert_eq!(
+            std::fs::read_link(&link).unwrap(),
+            Path::new("dotfiles/settings.json"),
+            "the link text is untouched"
+        );
+        let after = read(&real);
+        assert_eq!(after["theme"], Value::String("dark".to_string()));
+        assert_eq!(
+            after["subagents"]["agentOverrides"]["scout"]["disabled"],
+            Value::Bool(true)
+        );
+    }
+
+    /// SUBA-171 — a dangling link names the file to create (pi `resolveSettingsWriteTarget`'s
+    /// readlink arm): the save creates the target and the link then resolves to it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_save_through_a_dangling_symlink_creates_the_link_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dotfiles = tmp.path().join("dotfiles");
+        std::fs::create_dir(&dotfiles).unwrap();
+        let link = tmp.path().join("settings.json");
+        std::os::unix::fs::symlink(dotfiles.join("settings.json"), &link).unwrap();
+
+        merge_builtin_agent_override(&link, "scout", &field("disabled", Value::Bool(true)))
+            .await
+            .unwrap();
+
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            read(&dotfiles.join("settings.json"))["subagents"]["agentOverrides"]["scout"]["disabled"],
+            Value::Bool(true)
+        );
+    }
+
+    /// SUBA-171 — the existing mode survives the atomic rename exactly (`stat().mode & 0o7777`,
+    /// pi `agents.ts:955,971` @ad11b7ab), for a restricted file and for a file whose mode the
+    /// umask would never produce. Red before: the temp was created at the umask default, so a
+    /// `0600` file came back `0644`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_save_keeps_the_existing_file_mode_exactly() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        for mode in [0o600, 0o660, 0o640] {
+            let path = tmp.path().join(format!("settings-{mode:o}.json"));
+            std::fs::write(&path, "{}").unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+
+            merge_builtin_agent_override(&path, "scout", &field("disabled", Value::Bool(true)))
+                .await
+                .unwrap();
+            assert!(remove_builtin_agent_override(&path, "scout").await.unwrap());
+
+            let after = std::fs::metadata(&path).unwrap().permissions().mode() & 0o7777;
+            assert_eq!(after, mode, "mode {mode:o} must survive the save");
+        }
+    }
+
+    /// SUBA-171 — the mode of a symlink's TARGET is the one kept (the link's own mode is
+    /// meaningless on Linux).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_save_through_a_symlink_keeps_the_targets_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real.json");
+        std::fs::write(&real, "{}").unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let link = tmp.path().join("settings.json");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        merge_builtin_agent_override(&link, "scout", &field("disabled", Value::Bool(true)))
+            .await
+            .unwrap();
+
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            std::fs::metadata(&real).unwrap().permissions().mode() & 0o7777,
+            0o600
+        );
+    }
+
+    /// SUBA-171 — a read-only settings file is refused (pi `accessSync(W_OK)`), not replaced, and
+    /// its content and mode are untouched. Red before: the rename replaced it regardless.
+    ///
+    /// `root` passes every `W_OK` check (pi's `accessSync` included), so when the probe below can
+    /// open a `0444` file for writing the refusal is unobservable and the test stops there.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_read_only_settings_file_is_refused_and_left_untouched() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("settings.json");
+        std::fs::write(&path, r#"{"theme":"dark"}"#).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
+        if std::fs::OpenOptions::new().write(true).open(&path).is_ok() {
+            eprintln!("skipping: this user bypasses file permissions (root)");
+            return;
+        }
+
+        let err =
+            merge_builtin_agent_override(&path, "scout", &field("disabled", Value::Bool(true)))
+                .await
+                .expect_err("a read-only settings file must be refused");
+        assert!(
+            err.to_string().contains("Failed to write settings file"),
+            "{err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            r#"{"theme":"dark"}"#
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o7777,
+            0o444
+        );
+    }
+
+    /// SUBA-171 — the write-access probe as such: with the probe pointed at a target that cannot
+    /// be opened for writing, `write_settings_file` refuses before any temp or rename. A directory
+    /// stands in for the read-only file so this half is observable as `root` too (where the test
+    /// above cannot refuse anything). Without the probe the call still fails — the rename cannot
+    /// replace a non-empty directory — but only AFTER `write_atomic_with_mode` has written its
+    /// `settings.json.tmp.<pid>` beside the target, which it does not clean up; so "no temp left in
+    /// the parent" is what proves the refusal came first.
+    #[tokio::test]
+    async fn the_write_access_probe_refuses_before_any_rename() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("settings.json");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("keep"), "x").unwrap();
+        let err = write_settings_file(&target, &target, &Map::new())
+            .expect_err("an unwritable target must be refused");
+        assert!(
+            err.to_string().contains("Failed to write settings file"),
+            "{err}"
+        );
+        assert!(target.join("keep").is_file(), "the target is untouched");
+        let temps: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with("settings.json.tmp."))
+            .collect();
+        assert!(
+            temps.is_empty(),
+            "no temp was written before the refusal: {temps:?}"
+        );
+    }
+
+    /// pi `resolveSettingsWriteTarget`: a path ending in a separator cannot name a new file.
+    #[test]
+    fn a_missing_path_with_a_trailing_separator_is_not_a_write_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut path = tmp.path().join("missing").into_os_string();
+        path.push("/");
+        assert!(resolve_settings_write_target(Path::new(&path)).is_err());
     }
 
     #[tokio::test]
