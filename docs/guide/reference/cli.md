@@ -395,8 +395,11 @@ cyrup @prompt.md @screenshot.png "what is wrong with this layout?"
 
 An argument beginning with `@` is a file reference: the path is tilde-expanded and resolved against
 the current directory. Text files are inlined into the first message; image files are attached as
-images, downscaled to fit 2000×2000 when the `images.autoResize` setting is on. Empty files are
-skipped, and a missing file is an error that exits 1.
+images. An oversized image is not downscaled here — the session does that once the request model is
+known, against that model's
+[resize profile](../guides/models.md#how-big-an-image-gets-sent), which is what the
+`images.autoResize` setting governs. Empty files are skipped, and a missing file is an error that
+exits 1.
 
 Write `@@` to send a message that legitimately starts with `@` — `@@channel` becomes the literal text
 `@channel`.

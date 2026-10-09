@@ -70,6 +70,7 @@ fn model(id: &str, api: &str, adaptive: bool, prompt_cache: Option<ModelPromptCa
         base_url: "https://example.invalid".to_string(),
         reasoning: true,
         input: vec![Modality::Text],
+        input_limits: None,
         cost: anthropic_cost(),
         prompt_cache,
         context_window: 200_000,

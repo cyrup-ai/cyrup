@@ -54,6 +54,7 @@ fn codex_model(id: &str) -> Model {
             cache_write: 0.0,
             tiers: None,
         },
+        input_limits: None,
         prompt_cache: None,
         context_window: 1000,
         max_tokens: 1000,

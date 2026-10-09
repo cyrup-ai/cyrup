@@ -749,10 +749,11 @@ async fn run() -> anyhow::Result<i32> {
         // legacy `hooks/` directory has stopped loading one frame ahead of the paint that erases it.
         migrations::show_deprecation_warnings(&deprecation_warnings);
         let _signals = spawn_abort_on_signal(runtime.clone(), cancel.clone(), AppMode::Interactive);
-        // Pi `prepareInitialMessage(parsed, settingsManager.getImageAutoResize(), stdinContent)`
-        // (main.ts:828-832): the `images.autoResize` setting decides whether an `@image.png`
-        // positional is downsampled to 2000px or inlined at full resolution.
-        let auto_resize_images = session.services().settings.effective().image_auto_resize();
+        // SEAM-128 — no `images.autoResize` read here any more. pi's `prepareInitialMessage` took
+        // that flag and now hardcodes `autoResizeImages: false` (main.ts:223, "AgentSession resizes
+        // these after extension hooks select the request model"), because the resize belongs to the
+        // session, where the REQUEST model's `inputLimits.images.resize` is known. The setting is
+        // still read — once, per prompt, by `AgentSession::normalize_prompt_images`.
         // Pi main.ts:819-826 reads piped stdin in `main` (never in `prepareInitialMessage`, and
         // never for RPC mode, which owns stdin for JSON-RPC) and passes the string in at :831.
         let piped_stdin = cyrup::read_piped_stdin().await?;
@@ -761,7 +762,7 @@ async fn run() -> anyhow::Result<i32> {
         // theme boot happens inside `run_interactive`, downstream of the print below, so a mark
         // placed here would time nothing. Recorded rather than silently dropped.
         timings::time("readPipedStdin", timings::TimingLabel::Main);
-        let inputs = build_inputs(&cli, &dirs.cwd, auto_resize_images, piped_stdin).await?;
+        let inputs = build_inputs(&cli, &dirs.cwd, piped_stdin).await?;
         timings::time("prepareInitialMessage", timings::TimingLabel::Main);
         // `PI_STARTUP_BENCHMARK` interactive run path (Pi main.ts:950-958): init the TUI, let stdin
         // drain terminal query replies for ~150ms, stop, then print timings — never the event loop.
@@ -976,9 +977,6 @@ async fn run() -> anyhow::Result<i32> {
             // and swallowed), and since this arm is what a spawned subagent child re-execs into,
             // EVERY subagent run inherited the missing host.
             //
-            // `settingsManager.getImageAutoResize()` for the `@file` image path (Pi main.ts:830),
-            // read before `session` moves into the signal guard.
-            let auto_resize_images = session.services().settings.effective().image_auto_resize();
             // `mode` here is `Print` or `Json`; both are pi's `runPrintMode` host, whose handler
             // exits 143/129 on the first SIGTERM/SIGHUP (print-mode.ts:48-64).
             let _signals = spawn_abort_on_signal(runtime.clone(), cancel.clone(), mode);
@@ -995,7 +993,7 @@ async fn run() -> anyhow::Result<i32> {
             // AGENT-027 — pi's `time("readPipedStdin")` / `time("prepareInitialMessage")`
             // (main.ts:826/:833) are on the shared path, so they cover this arm too.
             timings::time("readPipedStdin", timings::TimingLabel::Main);
-            let inputs = build_inputs(&cli, &dirs.cwd, auto_resize_images, piped_stdin).await?;
+            let inputs = build_inputs(&cli, &dirs.cwd, piped_stdin).await?;
             timings::time("prepareInitialMessage", timings::TimingLabel::Main);
             // Pi prints once every `main` mark has been taken, immediately before entering the mode
             // (main.ts:902).

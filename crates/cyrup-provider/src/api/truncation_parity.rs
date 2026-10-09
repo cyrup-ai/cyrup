@@ -48,6 +48,7 @@ fn model_for(api: &str, provider: &str) -> Model {
             cache_write: 0.0,
             tiers: None,
         },
+        input_limits: None,
         prompt_cache: None,
         context_window: 128_000,
         max_tokens: 4_096,

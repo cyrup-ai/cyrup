@@ -523,6 +523,7 @@ mod tests {
             context_window: 1000,
             max_tokens: 100,
             sampling_params: None,
+            input_limits: None,
             prompt_cache: None,
             thinking_level_map: None,
             compat: None,

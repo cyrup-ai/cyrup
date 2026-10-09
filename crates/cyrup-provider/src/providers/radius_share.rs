@@ -302,6 +302,7 @@ fn provider_auth_model(provider_id: &ProviderId, gateway: &str) -> Model {
         reasoning: false,
         input: vec![Modality::Text],
         cost: ModelCost::default(),
+        input_limits: None,
         prompt_cache: None,
         context_window: 0,
         max_tokens: 0,

@@ -499,6 +499,45 @@ impl AgentSession {
         }
     }
 
+    /// Apply ONLY the agent-state control ops a handler queued, re-queuing everything else — the
+    /// narrow drain `assemble_run_inputs` runs between the `before_agent_start` dispatch and the
+    /// prompt-image normalization (SEAM-128).
+    ///
+    /// # Why this exists at all
+    ///
+    /// Upstream's placement of `_normalizePromptImages` AFTER `emitBeforeAgentStart` is load-bearing
+    /// and says so: *"Emit before_agent_start before normalizing images so extension-driven model
+    /// selection determines the resize profile used for the request and history"*
+    /// (`agent-session.ts:2045-2046` @v1.0.4). That buys something upstream only because pi's
+    /// `ctx.setModel` mutates `this.model` SYNCHRONOUSLY from inside the handler, so
+    /// `this._limitsModel()` on the next line already answers the new model.
+    ///
+    /// In cyrup a guest `setModel` is a QUEUED [`ControlOp::SetModel`] on
+    /// [`crate::host_services::LiveHostServices`], and `assemble_run_inputs` drains only
+    /// `take_pending_active_tools()` after the hook — the control queue is next drained at the
+    /// FOLLOWING turn boundary. Porting the position without this drain would leave
+    /// [`super::AgentSession::limits_model`] answering the PREVIOUS model: the placement would be
+    /// cargo-culted and the row's stated purpose silently unmet, with every other image test still
+    /// green. `the_extension_selected_model_decides_the_profile` is the test that pins it.
+    ///
+    /// # Why not [`Self::apply_pending_agent_control`]
+    ///
+    /// That drain also calls `refresh_extension_tools()` and `set_active_tools_by_name()`, which
+    /// would DOUBLE-APPLY the restriction `assemble_run_inputs` has just applied in-turn (and
+    /// re-resolve it against a registry refreshed mid-assembly). It also services the two SEND ops,
+    /// which must not start or join a run from inside prompt assembly. This one touches
+    /// `SetModel`/`SetThinkingLevel`/`Abort`/`Shutdown` and nothing else; every other op is
+    /// re-queued, never dropped, so the command-tier / post-settle drains still see it. GAP-11's
+    /// focused store-free drains are the precedent for narrowing this way.
+    pub(super) async fn apply_pending_agent_state_only(&self) {
+        for op in self.services.host_services.take_pending_control() {
+            let Some(op) = self.apply_agent_state_op(op).await else {
+                continue;
+            };
+            let _ = cyrup_ext::host::HostServices::control(&*self.services.host_services, op);
+        }
+    }
+
     /// GAP-11 event-tier turn-boundary drain: apply the AGENT-STATE control ops
     /// (`SetModel`/`SetThinkingLevel`) a guest queued from an EVENT handler (`on_message_end` /
     /// `on_input` / a mid-turn tool hook / `on_agent_end`), at a STORE-FREE point (after a run settles

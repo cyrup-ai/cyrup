@@ -52,6 +52,7 @@ fn model() -> Model {
             cache_write: 0.0,
             tiers: None,
         },
+        input_limits: None,
         prompt_cache: None,
         context_window: 131072,
         max_tokens: 131072,

@@ -422,17 +422,29 @@ impl ReadTool {
             // what makes the race expressible at all. `Processed` is owned (`String` /
             // `Vec<String>`), so it crosses the boundary unchanged; `ImageMime` is `Copy` and the
             // two option fields are scalars, so nothing borrows `self` across the spawn.
-            let max_dim = self.opts.max_image_dim;
+            // The profile is resolved to an OWNED value here, before the spawn: Pi reads
+            // `ctx?.model?.inputLimits?.images?.resize` per call (read.ts:138), and cloning out of
+            // the options is what keeps the resolve on the async side while the decode runs on the
+            // blocking pool with nothing borrowed from `self`.
+            let resize = self.opts.resize_profile_now();
             let auto_resize = self.opts.auto_resize_images;
+            let mime_str = mime.mime();
             let processing = tokio::task::spawn_blocking(move || {
-                image_proc::process_image(&bytes, mime, max_dim, auto_resize)
+                crate::image_proc::process_image(
+                    &bytes,
+                    mime_str,
+                    crate::image_proc::ProcessImageOptions {
+                        auto_resize_images: auto_resize,
+                        resize: resize.as_ref(),
+                    },
+                )
             });
             let Some(joined) = cancel.run_until_cancelled(processing).await else {
                 return Err(error::aborted());
             };
             let processed = joined.map_err(|e| error::invalid(format!("read: {e}")))?;
             match processed {
-                image_proc::Processed::Ok {
+                crate::image_proc::Processed::Ok {
                     data,
                     mime: out_mime,
                     hints,
@@ -459,7 +471,7 @@ impl ReadTool {
                         ..Default::default()
                     })
                 }
-                image_proc::Processed::Failed { message } => {
+                crate::image_proc::Processed::Failed { message } => {
                     // `Read image file [${mimeType}]\n${message}` + nonVisionNote (no image block).
                     let mut note = format!("Read image file [{}]\n{message}", mime.mime());
                     if let Some(nv) = non_vision_note {
@@ -501,291 +513,6 @@ impl ReadTool {
             })
         }
     }
-}
-
-/// Image normalize+resize, a faithful port of Pi's `processImage`/`resizeImageInProcess`
-/// (image-process.ts, image-resize-core.ts). Decodes via the `image` crate (already in the
-/// lockfile), applies EXIF orientation, preserves the source format when it is an inline-supported
-/// type, converts unsupported types (bmp) to PNG, and resizes to fit 2000x2000 / 4.5MB of base64.
-#[cfg(feature = "inline-images")]
-mod image_proc {
-    use super::base64_encode;
-    use crate::ops::ImageMime;
-    use image::{DynamicImage, ImageDecoder};
-    use std::io::Cursor;
-
-    /// 4.5MB of base64 payload — Pi's headroom below Anthropic's 5MB limit (image-resize-core.ts:22).
-    const MAX_B64_BYTES: usize = 4_718_592;
-    /// Pi's default JPEG quality (image-resize-core.ts:28) + its descending retry ladder (line 122).
-    const JPEG_QUALITIES: [u8; 5] = [80, 85, 70, 55, 40];
-
-    pub enum Processed {
-        Ok {
-            data: String,
-            mime: String,
-            hints: Vec<String>,
-        },
-        Failed {
-            message: String,
-        },
-    }
-
-    struct Resized {
-        data: String,
-        mime: String,
-        original_width: u32,
-        original_height: u32,
-        width: u32,
-        height: u32,
-        was_resized: bool,
-    }
-
-    /// `processImage` (image-process.ts:72-119). `auto_resize` is Pi's `options.autoResizeImages`,
-    /// threaded down from the `images.autoResize` setting: `true` runs `normalizeImage` then the
-    /// `resizeImage` ladder; `false` normalizes ONLY and inlines the original bytes, with the
-    /// conversion hint compared against the NORMALIZED mime (never a re-encoded one) and no
-    /// dimension note, exactly like image-process.ts's trailing else-branch.
-    pub fn process_image(
-        orig: &[u8],
-        detected: ImageMime,
-        max_dim: u32,
-        auto_resize: bool,
-    ) -> Processed {
-        // normalizeImage (image-process.ts:49-65): keep supported inline formats as-is; convert
-        // everything else (bmp) to PNG, baking EXIF orientation in.
-        let (norm_bytes, norm_mime, converted_from): (std::borrow::Cow<[u8]>, &str, Option<&str>) =
-            match detected {
-                ImageMime::Png => (std::borrow::Cow::Borrowed(orig), "image/png", None),
-                ImageMime::Jpeg => (std::borrow::Cow::Borrowed(orig), "image/jpeg", None),
-                ImageMime::Gif => (std::borrow::Cow::Borrowed(orig), "image/gif", None),
-                ImageMime::Webp => (std::borrow::Cow::Borrowed(orig), "image/webp", None),
-                ImageMime::Bmp => match convert_to_png(orig) {
-                    Some(png) => (std::borrow::Cow::Owned(png), "image/png", Some("image/bmp")),
-                    None => {
-                        return Processed::Failed {
-                            message:
-                                "[Image omitted: could not be converted to a supported inline image format.]"
-                                    .to_string(),
-                        }
-                    }
-                },
-            };
-
-        // `if (autoResizeImages) { … }` — the false path returns the normalized bytes base64-encoded
-        // with no resize, no byte-cap ladder and no dimension note (image-process.ts, final block).
-        if !auto_resize {
-            let mut hints: Vec<String> = Vec::new();
-            if let Some(from) = converted_from
-                && from != norm_mime
-            {
-                hints.push(format!("[Image converted from {from} to {norm_mime}.]"));
-            }
-            return Processed::Ok {
-                data: base64_encode(&norm_bytes),
-                mime: norm_mime.to_string(),
-                hints,
-            };
-        }
-
-        match resize_image(&norm_bytes, norm_mime, max_dim) {
-            Some(r) => {
-                let mut hints: Vec<String> = Vec::new();
-                // conversionHint (image-process.ts:67-70).
-                if let Some(from) = converted_from
-                    && from != r.mime
-                {
-                    hints.push(format!("[Image converted from {from} to {}.]", r.mime));
-                }
-                // formatDimensionNote (image-resize.ts:116-123).
-                if r.was_resized {
-                    let scale = f64::from(r.original_width) / f64::from(r.width.max(1));
-                    hints.push(format!(
-                        "[Image: original {}x{}, displayed at {}x{}. Multiply coordinates by {:.2} \
-                         to map to original image.]",
-                        r.original_width, r.original_height, r.width, r.height, scale
-                    ));
-                }
-                Processed::Ok {
-                    data: r.data,
-                    mime: r.mime,
-                    hints,
-                }
-            }
-            None => Processed::Failed {
-                message: "[Image omitted: could not be resized below the inline image size limit.]"
-                    .to_string(),
-            },
-        }
-    }
-
-    /// `convertImageBytesToPng` (image-convert.ts:4-24): decode (EXIF-oriented) + re-encode PNG.
-    fn convert_to_png(bytes: &[u8]) -> Option<Vec<u8>> {
-        let img = decode_with_orientation(bytes)?;
-        encode_png(&img)
-    }
-
-    /// Decode + apply EXIF orientation (Pi `applyExifOrientation`). The `image` crate exposes the
-    /// decoder's EXIF orientation (0.25+) which we bake into the pixels.
-    fn decode_with_orientation(bytes: &[u8]) -> Option<DynamicImage> {
-        let reader = image::ImageReader::new(Cursor::new(bytes))
-            .with_guessed_format()
-            .ok()?;
-        let mut decoder = reader.into_decoder().ok()?;
-        let orientation = decoder
-            .orientation()
-            .unwrap_or(image::metadata::Orientation::NoTransforms);
-        let mut img = DynamicImage::from_decoder(decoder).ok()?;
-        img.apply_orientation(orientation);
-        Some(img)
-    }
-
-    fn encode_png(img: &DynamicImage) -> Option<Vec<u8>> {
-        let mut buf = Vec::new();
-        img.write_to(&mut Cursor::new(&mut buf), image::ImageFormat::Png)
-            .ok()?;
-        Some(buf)
-    }
-
-    fn encode_jpeg(img: &DynamicImage, quality: u8) -> Option<Vec<u8>> {
-        let mut buf = Vec::new();
-        let rgb = img.to_rgb8();
-        let mut enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, quality);
-        enc.encode_image(&rgb).ok()?;
-        Some(buf)
-    }
-
-    /// `resizeImageInProcess` (image-resize-core.ts:59-164). Returns `None` only when the image
-    /// cannot be brought under the base64 budget even at 1x1 (or decode fails).
-    fn resize_image(bytes: &[u8], mime: &str, max_dim: u32) -> Option<Resized> {
-        let input_base64_size = bytes.len().div_ceil(3) * 4;
-        let img = decode_with_orientation(bytes)?;
-        let original_width = img.width();
-        let original_height = img.height();
-
-        // Already within all limits ⇒ send the ORIGINAL (normalized) bytes untouched.
-        if original_width <= max_dim
-            && original_height <= max_dim
-            && input_base64_size < MAX_B64_BYTES
-        {
-            return Some(Resized {
-                data: base64_encode(bytes),
-                mime: mime.to_string(),
-                original_width,
-                original_height,
-                width: original_width,
-                height: original_height,
-                was_resized: false,
-            });
-        }
-
-        // Initial target dims, preserving aspect ratio (image-resize-core.ts:96-106).
-        let (mut target_w, mut target_h) = (original_width, original_height);
-        if target_w > max_dim {
-            target_h =
-                ((f64::from(target_h) * f64::from(max_dim)) / f64::from(target_w)).round() as u32;
-            target_w = max_dim;
-        }
-        if target_h > max_dim {
-            target_w =
-                ((f64::from(target_w) * f64::from(max_dim)) / f64::from(target_h)).round() as u32;
-            target_h = max_dim;
-        }
-
-        let (mut cw, mut ch) = (target_w.max(1), target_h.max(1));
-        loop {
-            let resized = img.resize_exact(cw, ch, image::imageops::FilterType::Lanczos3);
-            // Candidate order (image-resize-core.ts:112-115): PNG first, then JPEG by quality.
-            if let Some(png) = encode_png(&resized) {
-                let data = base64_encode(&png);
-                if data.len() < MAX_B64_BYTES {
-                    return Some(Resized {
-                        data,
-                        mime: "image/png".to_string(),
-                        original_width,
-                        original_height,
-                        width: cw,
-                        height: ch,
-                        was_resized: true,
-                    });
-                }
-            }
-            for q in dedup_qualities() {
-                if let Some(jpg) = encode_jpeg(&resized, q) {
-                    let data = base64_encode(&jpg);
-                    if data.len() < MAX_B64_BYTES {
-                        return Some(Resized {
-                            data,
-                            mime: "image/jpeg".to_string(),
-                            original_width,
-                            original_height,
-                            width: cw,
-                            height: ch,
-                            was_resized: true,
-                        });
-                    }
-                }
-            }
-
-            if cw == 1 && ch == 1 {
-                break;
-            }
-            let nw = if cw == 1 {
-                1
-            } else {
-                1.max((f64::from(cw) * 0.75).floor() as u32)
-            };
-            let nh = if ch == 1 {
-                1
-            } else {
-                1.max((f64::from(ch) * 0.75).floor() as u32)
-            };
-            if nw == cw && nh == ch {
-                break;
-            }
-            cw = nw;
-            ch = nh;
-        }
-        None
-    }
-
-    fn dedup_qualities() -> Vec<u8> {
-        let mut out: Vec<u8> = Vec::new();
-        for q in JPEG_QUALITIES {
-            if !out.contains(&q) {
-                out.push(q);
-            }
-        }
-        out
-    }
-}
-
-/// Minimal RFC 4648 standard base64 (matches Node's `Buffer.toString("base64")`).
-#[cfg(feature = "inline-images")]
-fn base64_encode(data: &[u8]) -> String {
-    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
-    for chunk in data.chunks(3) {
-        let b0 = *chunk.first().unwrap_or(&0);
-        let b1 = *chunk.get(1).unwrap_or(&0);
-        let b2 = *chunk.get(2).unwrap_or(&0);
-        let n = ((b0 as u32) << 16) | ((b1 as u32) << 8) | (b2 as u32);
-        let push = |out: &mut String, idx: usize| {
-            out.push(*TABLE.get(idx & 63).unwrap_or(&b'A') as char);
-        };
-        push(&mut out, (n >> 18) as usize);
-        push(&mut out, (n >> 12) as usize);
-        if chunk.len() > 1 {
-            push(&mut out, (n >> 6) as usize);
-        } else {
-            out.push('=');
-        }
-        if chunk.len() > 2 {
-            push(&mut out, n as usize);
-        } else {
-            out.push('=');
-        }
-    }
-    out
 }
 
 #[cfg(test)]

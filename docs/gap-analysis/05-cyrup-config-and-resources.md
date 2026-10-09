@@ -2,6 +2,53 @@
 
 Covers `cyrup/crates/cyrup-config` (settings, auth store, trust, model resolution, config values, login) and `cyrup/crates/cyrup-resources` (packages, discovery, skills/prompts/themes), plus the launch-path glue in `cyrup/crates/cyrup/src/main.rs`, `migrations.rs`, `cli.rs` and `cyrup-session-svc/src/builder.rs` that consumes them. Measured against `pi/packages/coding-agent/src/core/{settings-manager,model-resolver,model-runtime,models-store,model-config,auth-storage,trust-manager,project-trust,package-manager,provider-composer,resource-loader,prompt-templates,skills,slash-commands,keybindings,resolve-config-value}.ts`, `src/{config,migrations,main}.ts`, `src/utils/paths.ts` and `modes/interactive/theme/theme.ts` — read at the explicit tags **v0.83.0** (the ported baseline) and **v0.84.1** (the latest tag *at the time of that reading*; the latest tag is now **v0.85.1** — see the provenance block below) rather than a floating HEAD.
 
+> ### CLOSURES 2026-10-09 — one low (`CFG-085`, its last clause), with `PROV-134` (area 01) and `SEAM-128` (area 08) in one PR
+>
+> The three rows are one feature and none of their Verify lines can be met alone, so they closed
+> together in five commits on `claude/hopeful-dirac-squ75k`. **Gates, measured on the combined tree:**
+> `cargo nextest run --workspace --features test-fixtures` → **14903 passed · 0 failed · 12 skipped**,
+> against a measured `main`/`515a0d0a` baseline of 14868 · 0 · 12;
+> `cargo clippy --workspace --all-targets -- -D warnings` clean; `cargo fmt --all` clean.
+>
+> **`CFG-085` — Verify, quoted in full:** *"a model with
+> `"inputLimits":{"images":{"resize":{"maxWidth":512}}}` makes `read` of a 2 000 px PNG return a
+> ≤512 px image."* Met and executed by
+> `cyrup-session-svc tests::read_model_resize::read_resizes_to_the_models_declared_profile`, which
+> reads an oversized PNG under a model declaring exactly that and decodes the returned payload to
+> measure its real width. `::a_model_switch_reaches_the_next_read` pins the half the Verify line does
+> not state but upstream requires: pi reads `ctx?.model?.inputLimits?.images?.resize` PER CALL
+> (`core/tools/read.ts:137-138`), so the profile is a live `ModelResizeHandle` re-pushed by BOTH
+> model-switch paths rather than baked at construction. Without that, `read` would have resolved the
+> startup model's profile forever and the Verify line would have been met only for a session that
+> never switched.
+>
+> All three of the row's clauses are therefore satisfied, which is why it closes rather than
+> narrowing again: `inputLimits` (here), `promptCache` (the 2026-10-08 note in the body) and anthropic
+> `compat.allowedFallbackModels` (`PROV-090`, area 01, closed 2026-09-27 — this row claims no credit
+> for it).
+>
+> **The declare-and-override half, which is what "a user `models.json`" means.** One shared
+> `cyrup_provider::ModelInputLimits` on `ModelDefinition` and `ModelOverride` — one type, not two,
+> because upstream reuses the same `ModelInputLimitsSchema` object at both sites
+> (`model-config.ts:207` and `:223`), unlike `cost`, which genuinely does get a partial override
+> shape. `model_from_json` copies a definition's verbatim with no provider-block and no
+> same-id-builtin fallback (`provider-composer.ts:239`). An override goes through `merge_input_limits`,
+> a branch-for-branch port of `mergeInputLimits` (`provider-composer.ts:144-162`): a THREE-LEVEL
+> per-key merge, strictly deeper than the flat one-level `promptCache` spread sitting on the adjacent
+> line at `:196`. **The `promptCache` analogy the row's own Fix text invites is right for the schema
+> and wrong for the merge**, which is what the nine tests in
+> `cyrup-config model::compose::input_limits_tests` exist to catch: red-proved by first writing the
+> flat spread and watching each level clobber its sibling.
+>
+> **The catalog stamp is deliberately NOT wired here, and that is tested.** Upstream's
+> `applyImageInputMetadata` is generator-only and `modelFromJson` copies verbatim, so
+> `apply_image_input_metadata` is gated to catalog parse sites and must not reach a user
+> `models.json` (`::the_catalog_stamp_does_not_run_over_a_user_models_json`). A declared
+> image-capable row therefore composes with no profile and the resizer falls back to
+> `DEFAULT_IMAGE_RESIZE` — byte-for-byte the numbers the generator would have stamped
+> (`image-resize-core.ts:24-29` == `generate-models.ts:424-430`), so a declared row and a stamped one
+> resolve the same profile.
+
 > ### CLOSURES 2026-09-28 — six lows (`CFG-077`, `CFG-081`, `CFG-083`, `CFG-086`, `CFG-089`, `CFG-090`); three partials (`CFG-084`, `CFG-088`, `CFG-093`)
 >
 > The config-settings lane. This work is on `claude/lows-next` and not yet committed. Each row and body section
@@ -809,7 +856,7 @@ above opened nothing, closed nothing and re-severitied nothing.
 | ~~CFG-082~~ | ~~low~~ **CLOSED 2026-09-28** | upstream-drift | S | **CLOSED 2026-09-28** (on `claude/lows-next`): `compaction.modelOverrides` is modelled. `compaction_reserve_tokens(model)`, `compaction_keep_recent_tokens(model)` and `compaction_settings(model)` take an optional `(provider, model_id)` and return `Result` (`crates/cyrup-config/src/settings/effective.rs:251`, `:260`, `:748`). All three go through `compaction_token_setting` (`:276`), which is pi's `getCompactionTokenSetting` (`settings-manager.ts:859-907` @v0.87.1): the exact `"provider/modelId"` entry, then the ordinary `compaction.<field>`, then the default (16384 / 20000). The ordinary value is validated first, even when an override would win. A non-object entry is refused. A value must be a non-negative `Number.isSafeInteger`, and an integral float is accepted (`non_negative_safe_integer`, `:898`). The errors are pi's three messages verbatim, with the value rendered by JS `String()` (`js_string`, `:913`), carried as `ConfigError::InvalidCompactionSetting` (`crates/cyrup-config/src/error.rs:47`). cyrup's `deep_merge` keeps a JSON `null`, as pi's `deepMergeObjects` does, so `null` is refused on both sides. A malformed entry for another model is never read. The consumer passes the active model: `AgentSession::compaction_settings_for_model` (`crates/cyrup-session-svc/src/session/auto_compaction.rs:584-600`), used by auto-compaction and by manual compaction (`session/compaction.rs:85`). Verify: `cyrup-config settings::tests::getters::{compaction_model_overrides_resolve_per_model_and_per_field, compaction_token_settings_refuse_invalid_values_with_pis_messages}` and `cyrup-session-svc tests::compaction_model_overrides::*` (the consumer half); red without the fix. **Ledger correction:** the Fix's "two error strings as load errors" is wrong on both counts. Upstream at v0.87.1 has THREE messages (ordinary value, non-object entry, override field), and the getter throws them at compaction time, not at load. **Remaining (cosmetic):** `js_string` prints a non-integral or very large f64 through serde_json, so an exotic invalid value such as `1e21` or `1e-7` can be spelled differently from JS `String()` in the error text (`1e21` vs `1e+21`). The consumer half is area 03's `SESS-055`, closed separately in the same batch. *Original text:* **NEW 2026-09-24.** `compaction.modelOverrides` (per-model `reserveTokens`/`keepRecentTokens`, pi v0.86.0) is not modelled, and pi's invalid-value throws are absent — see the body. |
 | ~~CFG-083~~ | ~~low~~ **CLOSED 2026-09-28** | parity-bug | S | **CLOSED 2026-09-28** (on `claude/lows-next`): a malformed template is dropped with a warning. `parse_frontmatter` (`crates/cyrup-resources/src/prompt.rs:403`) returns `Err` on a YAML syntax fault only, and `load_with_root` maps it to `ResourceError::FrontMatter` (`prompt.rs:68`). Every scan site turns that into a prompt warning naming the path, and the template is not registered. This matches pi v0.87.1 `loadTemplateFromFile` (`core/prompt-templates.ts:104-150`), which catches the parse error, pushes the warning and returns null. A document that parses to a non-mapping still loads (`prompt.rs:411`), as pi's `parsed ?? {}` does (`utils/frontmatter.ts:29-37`), and an empty YAML block is `{}` in both. The wrong in-source comment is gone. Verify: `cyrup-resources tests::resources::prompts::a_template_with_malformed_frontmatter_is_dropped_with_a_warning` (a `bad.md`, a scalar-frontmatter `scalar.md` and a `good.md`: one warning, for `bad.md`); red without the fix. **Ledger correction:** the `Fix` names `ResourceError::Manifest`, but the port uses `ResourceError::FrontMatter`, the variant the skill loader already uses. pi throws only on a YAML syntax error, so a non-mapping document is not an error and still loads. *Original text:* **NEW 2026-09-24.** A prompt template with malformed YAML frontmatter is LOADED (as `{}`) with no warning; pi drops it at every tag since v0.83.0 and, from v0.87.0, reports a resource warning. The in-source comment claiming pi treats the fault as `{}` is wrong — see the body. |
 | ~~CFG-084~~ | ~~low~~ **CLOSED 2026-09-29** | upstream-drift | S | **CLOSED 2026-09-29** (on `claude/lows-next`, rebased over #163): every provider cyrup ships now matches pi v0.87.1 in `default_model_per_provider` (`crates/cyrup-config/src/model/defaults.rs`). This branch chased `radius => balanced` (`:20`) and `xai => grok-4.7` (`:28`); #163's PROV-071 moved every provider catalog to the live pi.dev path and chased `cerebras => gpt-oss-120b`, `zai`/`zai-coding-cn => glm-5.3` (`:37-39`). The test's `PI` table is v0.87.1's and `DEFERRED` (`:339`) holds only `meta`, which has no cyrup provider to default and is area 01's `PROV-080`. *Earlier partial disposition:* three of the six providers now match pi v0.87.1 in `default_model_per_provider` (`crates/cyrup-config/src/model/defaults.rs`): `radius => balanced` (`:23`), `xai => grok-4.7` (`:31`) and `cerebras => gpt-oss-120b` (`:33`). `xai` became resolvable when `catalog/xai.json` was refreshed from pi.dev's live xai endpoint with the sanctioned generator (`cargo run -p xtask -- gen-catalogs --pi tmp/pi`; XAI_1). That refresh wrote only `crates/cyrup-provider/src/providers/catalog/xai.json` (adds `grok-4.7`, cost tiers and the `inputLimits`/`type` data fields) and xai's `fetchedAt`/`revision` in `catalog_manifest.json`. The other `openrouter-images.json` and manifest-note changes in the same tree belong to area 01's `PROV-089`. The test's `PI` table is v0.87.1's, and the remaining gaps are named in `DEFERRED` (`defaults.rs:324`). Verify: `cyrup-config model::defaults::tests::default_model_per_provider_matches_pi_and_every_default_resolves` (red without the fix), and the full `cyrup-provider` suite (1248 passed, including the `catalog_data` xai tests, which deliberately pin no id or count). **Remaining:** `zai` and `zai-coding-cn` still need `glm-5.3` (`:35-36` keep `glm-5.1`). Their embedded catalogs come from the pinned `b0c2a90e`, and only the live pi.dev endpoint carries `glm-5.3`. That endpoint also drops `glm-5.1` and `glm-4.5-air`, so moving these catalogs to the live path is XAI_5's job (area 01), not this row's. `meta` (`muse-spark-1.3`) needs the Meta Muse provider, also area 01. **Ledger correction:** `radius` was never blocked on a catalog, because its models come from the gateway at runtime. `xai` was only blocked by a stale snapshot: the live endpoint the generator already uses carries `grok-4.7`. *Original text:* **NEW 2026-09-24.** `default_model_per_provider` differs from pi v0.87.1 on six providers (`cerebras`, `zai`, `zai-coding-cn`, `xai`, `radius`, and `meta`, which cyrup does not have) — see the body. |
-| CFG-085 | low | upstream-drift | M | **STILL OPEN — NOTE 2026-10-08:** the `promptCache` clause is satisfied (`SEAM-131` part 1 needed it): `ModelPromptCache` is modelled on `ModelDefinition` and `ModelOverride` (`crates/cyrup-config/src/model/schema.rs:144`, `:182`), copied by the composer and merged PER TIER by `apply_model_override`, and consumed by `cyrup_provider::prompt_cache_ttl_ms`. The row stays open on `inputLimits`, which nothing in that work touched and which is still unmodelled (`grep -rn 'input_limits' crates/ --include=*.rs` is empty) — and `inputLimits` is exactly what the row's own **Verify** tests, so it is NOT met. CORRECTION to this note's first draft: the third clause, anthropic `compat.allowedFallbackModels`, was already satisfied — not here, but by `PROV-090` (closed 2026-09-27): `AnthropicCompat::allowed_fallback_models` (`crates/cyrup-provider/src/api/compat.rs:529`) is read by the request builder and the beta header (`api/anthropic_messages/{params,headers,driver}.rs`). **NEW 2026-09-24.** models.json `inputLimits` (image resize profile, per-message/per-request image caps, `maxRequestBytes`), `promptCache` and anthropic `compat.allowedFallbackModels` (pi v0.86.0–v0.87.0) are silently ignored — see the body. |
+| ~~CFG-085~~ | ~~low~~ **CLOSED 2026-10-09** | upstream-drift | M | **CLOSED 2026-10-09** — the consumer half landed with `SEAM-128` and `PROV-134` in the same PR, so the row's **Verify** is now met and executed: `cyrup-session-svc tests::read_model_resize::read_resizes_to_the_models_declared_profile` reads a 2600px PNG under a model declaring `inputLimits.images.resize` of 512px and gets a ≤512px image back, and `a_model_switch_reaches_the_next_read` pins that the profile is LIVE across both switch paths (`/model` and an extension's queued `SetModel`) rather than baked at construction, which is what `ModelResizeHandle` exists for. All three of the row's clauses are therefore satisfied: `inputLimits` (here), `promptCache` (note below) and `compat.allowedFallbackModels` (`PROV-090`). **NOTE 2026-10-08 (b):** the `inputLimits` CONFIG clause is landed — `cyrup_provider::ModelInputLimits` on `ModelDefinition` and `ModelOverride` (one shared type, `model-config.ts:207`/`:223`), copied verbatim by `model_from_json` and merged by `merge_input_limits`, a branch-for-branch port of `mergeInputLimits`'s THREE-LEVEL per-key merge (`provider-composer.ts:144-162`), with nine red-proved tests in `crates/cyrup-config/src/model/compose.rs` `mod input_limits_tests`. The row's **Verify** is a `read`-tool assertion, so it stays open on the consumer half (`SEAM-128`, same PR). *(Superseded by the 2026-10-09 closure above: that consumer landed.)* **NOTE 2026-10-08:** the `promptCache` clause is satisfied (`SEAM-131` part 1 needed it): `ModelPromptCache` is modelled on `ModelDefinition` and `ModelOverride` (`crates/cyrup-config/src/model/schema.rs:144`, `:182`), copied by the composer and merged PER TIER by `apply_model_override`, and consumed by `cyrup_provider::prompt_cache_ttl_ms`. The row stays open on `inputLimits`, which nothing in that work touched and which is still unmodelled (`grep -rn 'input_limits' crates/ --include=*.rs` is empty) *(that grep claim is stale as of the 2026-10-08 (b) and 2026-10-09 notes)* — and `inputLimits` is exactly what the row's own **Verify** tests, so it is NOT met. CORRECTION to this note's first draft: the third clause, anthropic `compat.allowedFallbackModels`, was already satisfied — not here, but by `PROV-090` (closed 2026-09-27): `AnthropicCompat::allowed_fallback_models` (`crates/cyrup-provider/src/api/compat.rs:529`) is read by the request builder and the beta header (`api/anthropic_messages/{params,headers,driver}.rs`). **NEW 2026-09-24.** models.json `inputLimits` (image resize profile, per-message/per-request image caps, `maxRequestBytes`), `promptCache` and anthropic `compat.allowedFallbackModels` (pi v0.86.0–v0.87.0) are silently ignored — see the body. |
 | ~~CFG-086~~ | ~~low~~ **CLOSED 2026-09-28** | upstream-drift | S | **CLOSED 2026-09-28** (on `claude/lows-next`): `Skill::load_with_diagnostics` (`crates/cyrup-resources/src/skill.rs:182`) follows pi's `loadSkillFromFile` (`core/skills.ts:277-345` @v0.87.1). Only a file named `SKILL.md` counts as declared (`:187`). A YAML fault in a declared file still warns (`:191`). A YAML fault in a loose file, or a loose file with no string description, is skipped silently (`:203`), so a `README.md` in a skills root is no longer a broken skill. `parse_skill_front_matter` (`:273`) type-guards the keys before the serde parse (`:282-285`): `name` and `description` are kept only as strings, so a non-string `name` falls back to the directory name, and `disable-model-invocation` is kept only as a bool. Verify: `cyrup-resources tests::resources::skills::loose_root_markdown_is_not_a_broken_skill_and_name_is_type_guarded` (`crates/cyrup-resources/src/tests/resources/skills.rs:445`; `README.md` and malformed `bad.md` give no skill and no diagnostic, `name: 123` loads under its directory name, and `z/SKILL.md` with numeric and boolean keys `1: one` / `true: yes` still loads, as in pi); red without the fix. **Ledger correction:** the port also type-guards `disable-model-invocation` (pi reads it `=== true`) and `allowed-tools`. Both used to be strict serde fields, so one wrongly typed value dropped the whole skill. *Original text:* **NEW 2026-09-24 (second pass; two 2026-09-14 leads).** The skills loader reports every loose root `.md` (README, AGENTS…) as a broken skill and fails a skill whose `name` is not a string; pi v0.84.3 only diagnoses files named `SKILL.md` and type-guards `name` — see the body. |
 | ~~CFG-087~~ | ~~medium~~ **CLOSED 2026-09-27** | upstream-drift | S | **NEW 2026-09-24 (second pass; was a 2026-09-14 lead).** No config reader strips a UTF-8 BOM, so a Windows-authored `settings.json`/`auth.json`/`trust.json`/`keybindings.json`/`models.json` fails to parse; pi v0.84.3 strips it at every read site — see the body. — **CLOSED 2026-09-27**: every production JSON/frontmatter reader in the crate strips U+FEFF at the parse site: `model/load.rs:31,117,150` (all three model loaders, `strip_bom` NESTED INSIDE `strip_json_comments` as upstream nests it), `settings/layer.rs:50`, `auth.rs:61`, `trust.rs:115`, `keybindings.rs:321`, `cyrup-resources/src/skill.rs:283` and `cyrup/src/cli/config_map.rs:298`. Verify: `cyrup-config model::load::tests::a_bom_does_not_drop_the_declared_providers` and `cyrup cli::tests::config_map::a_bom_is_stripped_from_a_prompt_file_and_from_every_append_part`. |
 | ~~CFG-088~~ | ~~low~~ **CLOSED 2026-09-30** | upstream-drift | S | **CLOSED 2026-09-30** (on `claude/lows-batch3`): both remaining items landed. (1) `--help` prints the startup settings diagnostics. It now exits only once the runtime exists (`crates/cyrup/src/session_launch.rs:262`, pi `main.ts:857-864` @v0.87.1), calling `reportDiagnostics(startupSettingsDiagnostics)` before the help; see `SEAM-020`. (2) `<msg>` is `JSON.parse`'s own message. `SettingsLoadError::parse` (`crates/cyrup-config/src/error.rs:124`) takes it from `js_json::json_parse_error_message` (`crates/cyrup-config/src/js_json.rs:95`), a validating port of V8's `JsonParser` error reporting as Node 22 ships it (pi's `engines` is `>=22.19.0`): the templates, UTF-16 positions, line/column and ellipsis context. It falls back to serde's message only for a document V8 would accept. The write-refusal latch is now typed: `SettingsLoadError::{Parse, Read}` (`error.rs:112`) is what `load_error` returns (`settings/manager.rs:189`) and what `ConfigError::SettingsWriteRefused { scope, cause }` carries (`error.rs:39`). Nothing matches on message text. Verify: `cyrup-config js_json::tests::v8s_message_for_every_corpus_document` (60 documents in `js_json_node22_corpus.json`; each expected message was re-checked against Node v22.22.2 in this pass); `settings::tests::write_refusal::cfg088_a_parse_failure_carries_json_parses_message_and_still_latches` and `cfg088_the_refusal_reports_the_parse_failure_it_latched`, both red with the old text (`left: Some(Parse("parse error: trailing comma at line 5 column 1"))`); and `cyrup-it bin help_after_runtime::help_lists_extension_flags_after_the_startup_settings_diagnostics`. That test spawns the binary with a malformed global `settings.json` and asserts exactly one `Warning: Invalid settings file <path>: Expected double-quoted property name in JSON at position 21 (line 3 column 1)` on stderr. It is red against the pre-fix binary, which printed `parse error: trailing comma at line 3 column 1`, and against an early `--help` exit (`left: []`). *Earlier text:* **PARTIALLY CLOSED 2026-09-28** (on `claude/lows-next`): settings load errors now use pi's shape and routing. `ScopedError` carries the file path (`crates/cyrup-config/src/error.rs:106`), and `diagnostic_message` (`:117`) renders pi's `Invalid settings file <path>: <msg>`, or `Invalid <scope> settings: <msg>` when there is no path (`core/settings-diagnostics.ts` @v0.87.1). The path comes from `SettingsStore::location` (`settings/store.rs:77`) through `record_load_error` (`settings/manager.rs:71`). The session's own manager's errors now reach `runtime.diagnostics` in pi's array position (`crates/cyrup-session-svc/src/runtime.rs:110`, with `StartupDiagnostics.settings` at `services.rs:76`). `report_runtime` (`crates/cyrup/src/diagnostics.rs:461`) merges the startup and runtime diagnostics, deduplicates on type+message, and prints them for print/json/rpc or on a runtime error (pi `main.ts:782-789`, `:896-900`). An interactive run shows them in the transcript instead, through `push_startup_warnings` (`crates/cyrup/src/interactive.rs:45`), in pi's order: the diagnostics, then the migrated-credential notice (`interactive-mode.ts:1130-1142`). Verify: `cyrup-config settings::tests::merge_and_scope::a_load_error_names_its_file_in_pis_diagnostic_shape`, `cyrup-session-svc tests::build_containment_and_flag_diagnostics::an_invalid_settings_file_is_a_runtime_warning_naming_the_file`, `cyrup diagnostics::tests::startup_and_runtime_diagnostics_merge_dedup_and_route_by_mode` and `cyrup::settings_diagnostics a_broken_global_settings_file_is_one_warning_naming_the_file`; red without the fix. `cyrup interactive::tests::startup_diagnostics_head_the_transcript_warnings_in_pis_order` is new and has **not been compiled or run** (low disk). **Remaining:** `--help` does not print the startup settings diagnostics (pi `main.ts:858`), because cyrup handles `--help` before dirs are resolved. Moving it after runtime creation, where pi has it, belongs to open row `SEAM-020`, which also owns `--help`'s missing extension flags. The `<msg>` text also differs: cyrup prints serde's error prefixed with `parse error:` (`settings/manager.rs:89`), where pi prints `JSON.parse`'s message. The prefix also feeds the write-refusal latch text, so it was left alone. **Ledger correction:** the row says both managers were drained and both lists reported. In fact the session's own manager's load errors were never reported anywhere. *Original text:* **NEW 2026-09-24 (second pass; was a 2026-09-14 lead).** Settings load diagnostics keep v0.84.1's `(<context>, <scope> settings) <msg>` form: no file path, no dedup across the two managers, and printed pre-TUI in interactive mode; pi v0.84.3 names the file, dedups, and hands them to the TUI — see the body. |
@@ -871,7 +918,58 @@ above opened nothing, closed nothing and re-severitied nothing.
 **Fix**      — per row, only once the embedded catalog carries the id (the blocker `:24-33` records still applies; `find_initial_model` must not resolve a default to a missing model); `meta` waits on the provider.
 **Verify**   — the `PI` table in the test is re-derived from v0.87.1 and `CHASED` is empty.
 
-## CFG-085 — models.json `inputLimits`, `promptCache` and `compat.allowedFallbackModels` are silently ignored
+## ~~CFG-085~~ — models.json `inputLimits`, `promptCache` and `compat.allowedFallbackModels` are silently ignored — **CLOSED 2026-10-09**
+
+> **CLOSED 2026-10-09** — all three clauses satisfied; the row's **Verify** is met and executed. The
+> `inputLimits` clause, which is the one the Verify line tests, landed on
+> `claude/hopeful-dirac-squ75k` with `PROV-134` (the model shape) and `SEAM-128` (the consumer) in
+> one PR — the three are one feature. **Evidence, the closure note and the gate numbers are in the
+> `CLOSURES 2026-10-09` block at the head of this file;** it quotes the Verify line and names the two
+> tests that execute it.
+>
+> **ADDENDUM 2026-10-09 (b) — two things the first closure claimed on insufficient evidence.**
+>
+> 1. **Nothing joined the config half to the session half, and the join was BROKEN.** Every test
+>    behind the first closure injected the profile through `FauxModelDefinition::input_limits`, i.e.
+>    through the catalog row, so the composer and the consumers were each tested and the file on
+>    disk — which is what this row is actually about — was tested nowhere. It did not work:
+>    `resolve_model` (`crates/cyrup-session-svc/src/builder.rs`) resolved the startup model against
+>    the bare `provider.models()`, while `/model` resolved against
+>    `AgentSession::compose_model_registry`, which DOES apply `models.json`. So a `modelOverrides`
+>    patch reached the model picker and not the model the session ran on, and a declared
+>    `inputLimits` was inert for the whole first selection. Upstream has no such split —
+>    `resolveCliModel` and `findInitialModel` are handed the `modelRuntime`
+>    (`model-resolver.ts:649`, `:675`) and every provider in a `ModelRuntime` has already been
+>    through `composeModelProvider` (`model-runtime.ts:215`). Fixed by composing in `resolve_model`,
+>    `models.json` first and the virtual overlay after — the same order both the session registry
+>    and pi use. With no `models.json` the composition returns the provider's own rows unchanged, so
+>    the common path is untouched. Verify, through a real file on disk:
+>    `tests::prompt_image_normalization::a_user_models_json_override_decides_the_prompt_image_size`,
+>    `::a_user_models_json_declared_row_decides_the_prompt_image_size` and
+>    `tests::read_model_resize::a_user_models_json_override_decides_the_read_result_size` — all three
+>    RED against the uncomposed resolution.
+>
+> 2. **The schema BOUNDS were not ported, and the `.max(1)` that replaced them was silent.**
+>    Pi's `ImageResizeSchema` bounds all four resize keys (`model-config.ts:154-159`: `minimum: 1`,
+>    plus `maximum: 100` on `jpegQuality`) and `ModelInputLimitsSchema` bounds the three caps
+>    (`:160-169`), so an out-of-range key is a config ERROR naming the key. cyrup typed them
+>    `Option<u32>`/`Option<u8>` with no check, and `ModelImageResizeOptions::resolve`'s defensive
+>    `.unwrap_or(2000).max(1)` turned `"maxWidth": 0` into a ONE-PIXEL clamp on every image in the
+>    session — upstream has no such clamp precisely because the schema makes a zero unreachable, so
+>    porting the clamp without the bound converted a loud error into a silent behaviour change.
+>    `validate_input_limits` (`crates/cyrup-config/src/model/compose.rs`) now enforces all seven
+>    bounds on BOTH layers, a definition and an override, as upstream's single shared schema does.
+>    **[CYRUP-DELTA] in granularity, deliberately:** upstream's TypeBox failure rejects the whole
+>    `models.json`; this rejects the one provider block, the way the `contextWindow`/`maxTokens`
+>    checks beside it do (`CFG-046`), so one bad key never costs the user the rest of their
+>    registry. Verify: six tests in `mod input_limits_tests`, red-proved by making the validator
+>    accept everything (4 of 6 go red; the other two are the legal-profile mirrors).
+>
+> **The two notes below are superseded and kept for the record, not as current fact.** Each states
+> at its head that the row is NOT closed, which was true when written and is now wrong; and the
+> 2026-10-08 note's `grep -rn 'input_limits' crates/ --include=*.rs is empty` no longer holds on
+> either half — the field is now on `ModelDefinition`, `ModelOverride` and all three catalog model
+> types, with consumers in the session prompt path and the `read` tool.
 
 > **NOTE 2026-10-08 — one of three clauses satisfied; the row stays OPEN.** `promptCache` is
 > modelled and consumed, because `SEAM-131`'s warmer needed the lifetime to schedule against:
@@ -904,6 +1002,34 @@ above opened nothing, closed nothing and re-severitied nothing.
 > only on `inputLimits`; the `Fix`'s "`promptCache` has no consumer until cache warming exists" is
 > now answered — cache warming exists. What remains for a closure is the schema half for
 > `inputLimits` plus its `read`-tool and attachment consumers (areas 04 / 08).
+>
+> **NOTE 2026-10-08 (second note, same day) — the `inputLimits` CONFIG clause is now landed; the
+> row still awaits its consumer, which is in flight in the same PR.** `cyrup_provider::
+> ModelInputLimits` now sits on `ModelDefinition` and `ModelOverride` — ONE shared type, because
+> upstream reuses the same `ModelInputLimitsSchema` object at `model-config.ts:207` (definition)
+> and `:223` (override), unlike `cost`, which does get a separate partial shape. A definition's
+> value is copied VERBATIM by `model_from_json` (`provider-composer.ts:239`), with no
+> provider-block or same-id-builtin fallback, exactly as `promptCache` is at `:241`. An override
+> goes through `merge_input_limits`, a branch-for-branch port of `mergeInputLimits`
+> (`provider-composer.ts:144-162`): a THREE-LEVEL conditional per-key merge, strictly deeper than
+> the flat one-level `promptCache` spread beside it at `:196` — `maxRequestBytes` merges per key;
+> an override naming no `images` keeps the composed block WHOLE including its `resize`; one naming
+> `images` merges `maxPerMessage`/`maxPerRequest` per key and keeps the whole `resize` unless
+> `resize` is also named, in which case all four resize keys merge per key. So
+> `{"images":{"resize":{"maxWidth":800}}}` leaves `maxHeight`, `maxBytes`, `jpegQuality`,
+> `images.maxPerRequest` and `maxRequestBytes` all in place. Nine tests in
+> `crates/cyrup-config/src/model/compose.rs` `mod input_limits_tests` pin one level each, every one
+> red-proved: the flat `promptCache`-shaped merge fails three of them, a level-2 clobber two, a
+> level-3 clobber one, deleting the composer copy one, dropping `if (!override) return base` one,
+> and removing the `ModelOverride` field is a compile error. One test pins the NEGATIVE: the
+> catalog stamp `apply_image_input_metadata` must NOT run over a user `models.json`, because
+> upstream's `applyImageInputMetadata` is generator-only and `modelFromJson` copies verbatim.
+>
+> The row's **Verify** is a `read`-tool assertion, so it is still not met and this is NOT a closure:
+> the consumer half (the `read` tool's live resize profile and the prompt-image normalizer) is
+> `SEAM-128`, landing in this same PR. The earlier note's "`grep -rn 'input_limits' crates/` is
+> empty" is now stale on both halves — `PROV-134` landed the catalog shape and this lands the
+> config shape.
 
 **Kind** upstream-drift · **Severity** low · **Effort** M · **Confidence** confirmed for the schema; consumers read on the pi side only
 **cyrup**    — `crates/cyrup-config/src/model/schema.rs:106` `ModelDefinition` and `:148` `ModelOverride` have no `input_limits` or `prompt_cache` field and no `deny_unknown_fields`, so both keys deserialize into nothing without an error; `grep -rn 'input_limits\|inputLimits\|allowed_fallback' crates/` is empty.

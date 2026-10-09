@@ -412,6 +412,7 @@ pub(super) fn model(base_url: &str) -> ClassifierModel {
         provider: "llama.cpp".into(),
         base_url: base_url.to_string(),
         input: vec![Modality::Text],
+        input_limits: None,
         cost: ModelCost::default(),
         headers: None,
         context_window: 32768,

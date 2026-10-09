@@ -223,6 +223,7 @@ mod tests {
             reasoning: true,
             input: vec![Modality::Text],
             cost: ModelCost::default(),
+            input_limits: None,
             prompt_cache: None,
             context_window,
             max_tokens,

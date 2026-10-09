@@ -62,6 +62,52 @@ pub struct ModelPromptCache {
     pub long: Option<u64>,
 }
 
+/// The cache-safe resize profile a model row declares, re-exported from its home in `cyrup-core`.
+///
+/// Upstream declares these four keys twice over — `ModelImageResizeOptions` beside the catalog
+/// types (`packages/ai/src/types.ts:1075-1081` @v1.0.4) and `ImageResizeOptions` beside the resizer
+/// (`packages/coding-agent/src/utils/image-resize-core.ts:4-9` @v1.0.4) — and passes one straight
+/// into the other (`agent-session.ts:1933`: `resizeOptions: this._limitsModel()?.inputLimits?.images?.resize`).
+/// cyrup therefore has ONE type, and it is homed in `cyrup-core` because that is the only crate
+/// below both this one and `cyrup-tools`, where the resizer lives. The path
+/// `cyrup_provider::ModelImageResizeOptions` is unchanged for every catalog-side caller.
+pub use cyrup_core::ModelImageResizeOptions;
+
+/// Per-image provider input limits (Pi `ModelImageInputLimits`, `types.ts:1083-1090` @v1.0.4).
+///
+/// Only [`Self::resize`] has a consumer. [`Self::max_per_message`] and [`Self::max_per_request`]
+/// are modelled, parsed and round-tripped WITHOUT enforcement, which is parity and not a
+/// shortfall: upstream declares, generates, schema-validates and tests them but has no runtime
+/// reader, and says so — *"Pi does not yet rewrite or reject history based on them"*
+/// (`packages/coding-agent/docs/models.md:89` @v1.0.4). Dropping them instead would lose catalog
+/// information on every parse and every write back to the models store.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelImageInputLimits {
+    /// Cache-safe resize profile applied before a new image enters conversation history.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resize: Option<ModelImageResizeOptions>,
+    /// Maximum images accepted in one provider MESSAGE. Descriptive only — see the type docs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_per_message: Option<u64>,
+    /// Maximum images accepted across one provider REQUEST. Descriptive only — see the type docs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_per_request: Option<u64>,
+}
+
+/// Provider input limits and cache-safe preprocessing metadata (Pi `ModelInputLimits`,
+/// `types.ts:1092-1096` @v1.0.4).
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelInputLimits {
+    /// Maximum serialized provider request size in bytes. Descriptive only — see
+    /// [`ModelImageInputLimits`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_request_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub images: Option<ModelImageInputLimits>,
+}
+
 /// Lifetime in MILLISECONDS of the prompt-cache entry a request writes, from the model's
 /// [`ModelPromptCache`] tier for the retention that request used — Pi `getPromptCacheTtlMs`
 /// (`core/cache-warmer.ts:38-47` @v1.0.4).
@@ -110,6 +156,24 @@ pub struct Model {
     pub base_url: String,
     pub reasoning: bool,
     pub input: Vec<Modality>,
+    /// Provider input limits and cache-safe image preprocessing metadata (Pi
+    /// `BaseModel.inputLimits: ModelInputLimits`, `packages/ai/src/types.ts:1105` @v1.0.4,
+    /// declared immediately after `input` and immediately before `cost` — which is why it sits
+    /// here).
+    ///
+    /// It is on `BaseModel`, so chat, image AND classifier rows all carry it
+    /// ([`crate::ImageModel::input_limits`], [`crate::ClassifierModel::input_limits`]).
+    ///
+    /// The one consumer is `inputLimits.images.resize`: the cache-safe profile a new image is
+    /// resized to before it enters conversation history, read off the REQUEST model
+    /// (`agent-session.ts:1933` and `:694`, `tools/read.ts:138` @v1.0.4). The other three keys are
+    /// descriptive — see [`ModelImageInputLimits`].
+    ///
+    /// Absent means the row publishes no limits; the resizer then falls back to the shared default
+    /// profile ([`crate::catalog::DEFAULT_IMAGE_RESIZE`]), which is the same 2000px / 4.5 MiB /
+    /// quality-80 profile the generator stamps, so a stamped and an unstamped row resolve alike.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_limits: Option<ModelInputLimits>,
     pub cost: ModelCost,
     /// Best-effort prompt-cache lifetime in SECONDS for each retention tier a request can ask
     /// for (Pi `Model.promptCache: ModelPromptCache`, `packages/ai/src/types.ts:1127` @v1.0.4,
@@ -149,5 +213,18 @@ pub struct Model {
 impl Model {
     pub fn supports_image_input(&self) -> bool {
         self.input.contains(&Modality::Image)
+    }
+
+    /// This model's cache-safe image resize profile, i.e. pi's
+    /// `model.inputLimits?.images?.resize` (`core/agent-session.ts:1932`,
+    /// `core/tools/read.ts:138` @v1.0.4).
+    ///
+    /// One accessor rather than the three-`and_then` chain repeated at each consumer: the prompt
+    /// normalizer, the `read` tool's live handle and every site that re-pushes it on a model switch
+    /// all want exactly this projection, and `None` is the answer at any of the three levels —
+    /// which the resizer resolves per key against [`crate::DEFAULT_IMAGE_RESIZE`].
+    #[must_use]
+    pub fn image_resize_profile(&self) -> Option<cyrup_core::ModelImageResizeOptions> {
+        self.input_limits.as_ref()?.images.as_ref()?.resize.clone()
     }
 }

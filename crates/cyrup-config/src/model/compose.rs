@@ -197,7 +197,14 @@ pub(crate) fn apply_models_json(
         }
     }
 
-    // Step 3: modelOverrides are the topmost user-config layer (:433-436).
+    // Step 3: modelOverrides are the topmost user-config layer (:433-436). Upstream validates an
+    // override's `inputLimits` against the SAME `ModelInputLimitsSchema` as a definition's
+    // (`model-config.ts:223` vs `:206`), so the bounds are checked on both layers — and on every
+    // override in the block, not only the ones whose id matched a model, because the schema layer
+    // upstream never looks at whether the id resolves.
+    for (model_id, ov) in &config.model_overrides {
+        validate_input_limits(provider_id, model_id, ov.input_limits.as_ref())?;
+    }
     for m in &mut models {
         if let Some(ov) = config.model_overrides.get(m.id.as_str()) {
             apply_model_override(m, ov);
@@ -276,6 +283,11 @@ fn model_from_json(
             definition.id
         ));
     }
+    validate_input_limits(
+        provider_id,
+        &definition.id,
+        definition.input_limits.as_ref(),
+    )?;
     Ok(Model {
         id: definition.id.as_str().into(),
         name: definition
@@ -290,6 +302,15 @@ fn model_from_json(
             .input
             .clone()
             .unwrap_or_else(|| vec![cyrup_provider::Modality::Text]),
+        // `inputLimits: definition.inputLimits` (provider-composer.ts:239 @v1.0.4) — verbatim,
+        // with NO provider-block or same-id-builtin fallback, exactly like `prompt_cache` below.
+        // The generator stamp (`apply_image_input_metadata`) deliberately does NOT run here: it is
+        // gated to catalog parse sites, as upstream's is generator-only. A row that leaves this
+        // unset therefore carries no profile and the resizer falls back to
+        // `cyrup_provider::DEFAULT_IMAGE_RESIZE`, which is byte-for-byte the same 2000/2000/4.5
+        // MiB/80 profile the generator would have stamped (`image-resize-core.ts:24-29` ==
+        // `generate-models.ts:424-430`). CFG-085.
+        input_limits: definition.input_limits.clone(),
         cost: definition.cost.clone().unwrap_or_default(),
         // `promptCache: definition.promptCache` (provider-composer.ts:241 @v1.0.4) — verbatim, no
         // provider-level or built-in fallback. `apply_prompt_cache_metadata` fills direct-Anthropic
@@ -314,8 +335,135 @@ fn model_from_json(
     })
 }
 
+/// Pi `mergeInputLimits` (provider-composer.ts:144-162 @v1.0.4), ported branch for branch:
+///
+/// ```ts
+/// if (!override) return base;
+/// return {
+///   ...base, ...override,
+///   images: override.images
+///     ? { ...base?.images, ...override.images,
+///         resize: override.images.resize
+///           ? { ...base?.images?.resize, ...override.images.resize }
+///           : base?.images?.resize }
+///     : base?.images,
+/// };
+/// ```
+///
+/// A THREE-LEVEL conditional per-key merge, and NOT the flat one-level spread `promptCache` gets
+/// next to it at `:196`. Copying that shape by analogy gets this wrong in two directions at once:
+/// replacing the whole `images` would reset a generator-stamped `maxPerRequest`, and replacing the
+/// whole `resize` would erase three of the four resize keys for an override naming one. A JS spread
+/// copies only keys that are PRESENT, which is what each `Option::or` below reproduces.
+fn merge_input_limits(
+    model: &mut Option<cyrup_provider::ModelInputLimits>,
+    ov: Option<&cyrup_provider::ModelInputLimits>,
+) {
+    // `if (!override) return base;` — an absent override leaves the composed model untouched.
+    let Some(ov) = ov else { return };
+    let base = model.take().unwrap_or_default();
+    *model = Some(cyrup_provider::ModelInputLimits {
+        // Level 1: `...base, ...override` over the scalar key.
+        max_request_bytes: ov.max_request_bytes.or(base.max_request_bytes),
+        images: match ov.images.as_ref() {
+            // `: base?.images` — the override names no `images`, so the base block survives WHOLE,
+            // including its `resize`.
+            None => base.images,
+            Some(ov_images) => {
+                let base_images = base.images.unwrap_or_default();
+                Some(cyrup_provider::ModelImageInputLimits {
+                    // Level 2: `...base?.images, ...override.images` over the two scalars.
+                    max_per_message: ov_images.max_per_message.or(base_images.max_per_message),
+                    max_per_request: ov_images.max_per_request.or(base_images.max_per_request),
+                    resize: match ov_images.resize.as_ref() {
+                        // `: base?.images?.resize` — the base profile survives whole.
+                        None => base_images.resize,
+                        Some(ov_resize) => {
+                            let base_resize = base_images.resize.unwrap_or_default();
+                            // Level 3: `...base?.images?.resize, ...override.images.resize`.
+                            Some(cyrup_provider::ModelImageResizeOptions {
+                                max_width: ov_resize.max_width.or(base_resize.max_width),
+                                max_height: ov_resize.max_height.or(base_resize.max_height),
+                                max_bytes: ov_resize.max_bytes.or(base_resize.max_bytes),
+                                jpeg_quality: ov_resize.jpeg_quality.or(base_resize.jpeg_quality),
+                            })
+                        }
+                    },
+                })
+            }
+        },
+    });
+}
+
 /// Pi `applyModelOverride` (provider-composer.ts): patch a composed model with a `modelOverrides`
 /// entry. Every field is individually optional; an absent field leaves the model unchanged.
+/// Pi's `ModelInputLimitsSchema` bounds (`core/model-config.ts:154-169` @v1.0.4), enforced.
+///
+/// ```ts
+/// const ImageResizeSchema = Type.Object({
+///   maxWidth: Type.Optional(Type.Integer({ minimum: 1 })),
+///   maxHeight: Type.Optional(Type.Integer({ minimum: 1 })),
+///   maxBytes: Type.Optional(Type.Integer({ minimum: 1 })),
+///   jpegQuality: Type.Optional(Type.Integer({ minimum: 1, maximum: 100 })),
+/// });
+/// const ModelInputLimitsSchema = Type.Object({
+///   maxRequestBytes: Type.Optional(Type.Integer({ minimum: 1 })),
+///   images: Type.Optional(Type.Object({
+///     resize: Type.Optional(ImageResizeSchema),
+///     maxPerMessage: Type.Optional(Type.Integer({ minimum: 1 })),
+///     maxPerRequest: Type.Optional(Type.Integer({ minimum: 1 })),
+///   })),
+/// });
+/// ```
+///
+/// Without this, `"maxWidth": 0` deserializes happily into `Option<u32>` and
+/// `ModelImageResizeOptions::resolve`'s defensive `.max(1)` turns it into a ONE-PIXEL clamp, so
+/// every image in the session silently becomes 1px wide instead of the user being told their
+/// config is wrong. `"jpegQuality": 200` likewise reached `JpegEncoder::new_with_quality`.
+/// Upstream has no `.max(1)` precisely because the schema makes a zero unreachable; porting the
+/// clamp without the bound turned a loud config error into a silent behaviour change.
+///
+/// [CYRUP-DELTA] The GRANULARITY differs, deliberately and in the user's favour. Upstream's bound
+/// is a TypeBox schema check that fails the whole `models.json`; this rejects the one provider
+/// block, the same way the `contextWindow`/`maxTokens` checks above do (CFG-046), so one bad key
+/// never costs the user the rest of their registry. The key is named either way.
+fn validate_input_limits(
+    provider_id: &str,
+    model_id: &str,
+    limits: Option<&cyrup_provider::ModelInputLimits>,
+) -> Result<(), String> {
+    let Some(limits) = limits else {
+        return Ok(());
+    };
+    let at_least_one = |value: Option<u64>, key: &str| -> Result<(), String> {
+        match value {
+            Some(v) if v < 1 => Err(format!(
+                "Provider {provider_id}, model {model_id}: invalid inputLimits.{key} ({v}); expected an integer >= 1"
+            )),
+            _ => Ok(()),
+        }
+    };
+    at_least_one(limits.max_request_bytes, "maxRequestBytes")?;
+    if let Some(images) = &limits.images {
+        at_least_one(images.max_per_message, "images.maxPerMessage")?;
+        at_least_one(images.max_per_request, "images.maxPerRequest")?;
+        if let Some(resize) = &images.resize {
+            at_least_one(resize.max_width.map(u64::from), "images.resize.maxWidth")?;
+            at_least_one(resize.max_height.map(u64::from), "images.resize.maxHeight")?;
+            at_least_one(resize.max_bytes, "images.resize.maxBytes")?;
+            // The only key with an UPPER bound: `Type.Integer({ minimum: 1, maximum: 100 })`.
+            if let Some(q) = resize.jpeg_quality
+                && !(1..=100).contains(&q)
+            {
+                return Err(format!(
+                    "Provider {provider_id}, model {model_id}: invalid inputLimits.images.resize.jpegQuality ({q}); expected an integer in 1..=100"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn apply_model_override(model: &mut Model, ov: &ModelOverride) {
     if let Some(name) = &ov.name {
         model.name = name.clone();
@@ -338,6 +486,8 @@ fn apply_model_override(model: &mut Model, ov: &ModelOverride) {
     if let Some(input) = &ov.input {
         model.input = input.clone();
     }
+    // Pi `inputLimits: mergeInputLimits(model.inputLimits, override.inputLimits)` (`:186`).
+    merge_input_limits(&mut model.input_limits, ov.input_limits.as_ref());
     // `contextWindow: override.contextWindow ?? model.contextWindow` (provider-composer.ts:118-119
     // @v0.83.0) — the override path has NO positivity check, unlike `modelFromJson`'s.
     //
@@ -809,5 +959,409 @@ mod tests {
         let (out, errors) = file.compose(&base);
         assert!(errors.is_empty(), "{errors:?}");
         assert_eq!(out[0].base_url, "https://gateway.acme.test/v1");
+    }
+}
+
+// ---- CFG-085: `inputLimits` on a definition and an override -------------------------------------
+//
+// Pi `ModelInputLimitsSchema` is reused for BOTH (`model-config.ts:207` and `:223`), a definition's
+// value is copied verbatim (`provider-composer.ts:239`) and an override goes through
+// `mergeInputLimits` (`:144-162`), a three-level conditional per-key merge. Every level gets its own
+// test, because the mistake this code invites is replacing a level wholesale.
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+mod input_limits_tests {
+    use cyrup_provider::{
+        Modality, Model, ModelImageInputLimits, ModelImageResizeOptions, ModelInputLimits,
+    };
+
+    use super::ModelFile;
+    use crate::model::fixtures::model;
+
+    fn composed(base: &[Model], json: &str) -> Vec<Model> {
+        let file: ModelFile = serde_json::from_str(json).unwrap();
+        let (out, errors) = file.compose(base);
+        assert!(errors.is_empty(), "{errors:?}");
+        out
+    }
+
+    fn by_id<'a>(models: &'a [Model], id: &str) -> &'a Model {
+        models
+            .iter()
+            .find(|m| m.id.as_str() == id)
+            .expect("composed model present")
+    }
+
+    /// The shape a generator-stamped anthropic image-capable row carries
+    /// (`generate-models.ts:994-1020`): every level of the nesting populated, so an override that
+    /// clobbers a level is visible as a loss rather than as a change.
+    fn stamped() -> ModelInputLimits {
+        ModelInputLimits {
+            max_request_bytes: Some(33_554_432),
+            images: Some(ModelImageInputLimits {
+                resize: Some(ModelImageResizeOptions {
+                    max_width: Some(2000),
+                    max_height: Some(2000),
+                    max_bytes: Some(4_718_592),
+                    jpeg_quality: Some(80),
+                }),
+                max_per_message: Some(20),
+                max_per_request: Some(600),
+            }),
+        }
+    }
+
+    fn base_with_limits() -> Vec<Model> {
+        let mut m = model("acme", "img", "img");
+        m.base_url = "https://acme.example/v1".into();
+        m.input = vec![Modality::Text, Modality::Image];
+        m.input_limits = Some(stamped());
+        vec![m]
+    }
+
+    fn overridden(json: &str) -> ModelInputLimits {
+        let out = composed(&base_with_limits(), json);
+        by_id(&out, "img")
+            .input_limits
+            .clone()
+            .expect("the composed model keeps an inputLimits block")
+    }
+
+    #[test]
+    fn a_definition_declares_input_limits_and_the_composer_copies_them_verbatim() {
+        // CFG-085's declare half. camelCase keys at all three levels, so this also pins the serde
+        // renaming — a snake_case leak would deserialize to `None` and fail here.
+        let out = composed(
+            &[],
+            r#"{"providers":{"acme":{"baseUrl":"https://acme.example/v1","api":"openai-completions",
+                "models":[{"id":"m","input":["text","image"],"inputLimits":{
+                  "maxRequestBytes":32768,
+                  "images":{"maxPerMessage":4,"maxPerRequest":9,
+                            "resize":{"maxWidth":512,"maxHeight":384,"maxBytes":1000,"jpegQuality":55}}}}]}}}"#,
+        );
+        assert_eq!(
+            by_id(&out, "m").input_limits,
+            Some(ModelInputLimits {
+                max_request_bytes: Some(32_768),
+                images: Some(ModelImageInputLimits {
+                    resize: Some(ModelImageResizeOptions {
+                        max_width: Some(512),
+                        max_height: Some(384),
+                        max_bytes: Some(1000),
+                        jpeg_quality: Some(55),
+                    }),
+                    max_per_message: Some(4),
+                    max_per_request: Some(9),
+                }),
+            }),
+            "`inputLimits: definition.inputLimits` (provider-composer.ts:239) — verbatim"
+        );
+    }
+
+    #[test]
+    fn a_definition_without_input_limits_still_composes_and_carries_no_profile() {
+        // PROV-134's "a row without the field still parses" half. Weak on its own — it would pass
+        // with the feature deleted — so it is a guard against a non-`Option` field or a missing
+        // `#[serde(default)]`, not evidence of the merge.
+        let out = composed(
+            &[],
+            r#"{"providers":{"acme":{"baseUrl":"https://acme.example/v1","api":"openai-completions",
+                "models":[{"id":"m"}]}}}"#,
+        );
+        assert_eq!(by_id(&out, "m").input_limits, None);
+    }
+
+    #[test]
+    fn the_catalog_stamp_does_not_run_over_a_user_models_json() {
+        // Upstream's `applyImageInputMetadata` is GENERATOR-only; `modelFromJson` copies verbatim.
+        // An image-capable declared row must therefore NOT acquire DEFAULT_IMAGE_RESIZE here.
+        let out = composed(
+            &[],
+            r#"{"providers":{"acme":{"baseUrl":"https://acme.example/v1","api":"openai-completions",
+                "models":[{"id":"m","input":["text","image"]}]}}}"#,
+        );
+        assert_eq!(
+            by_id(&out, "m").input_limits,
+            None,
+            "a user models.json row must not be stamped — compose.rs is not a catalog parse site"
+        );
+    }
+
+    #[test]
+    fn an_override_of_one_resize_leaf_keeps_its_three_siblings_and_both_outer_levels() {
+        // THE test. `{"inputLimits":{"images":{"resize":{"maxWidth":800}}}}` touches exactly one of
+        // seven populated keys. A flat `model.input_limits = ov.input_limits.clone()` loses six.
+        let merged = overridden(
+            r#"{"providers":{"acme":{"modelOverrides":{"img":{"inputLimits":{"images":{"resize":{"maxWidth":800}}}}}}}}"#,
+        );
+        let images = merged.images.as_ref().unwrap();
+        let resize = images.resize.as_ref().unwrap();
+        assert_eq!(resize.max_width, Some(800), "the named leaf wins");
+        assert_eq!(resize.max_height, Some(2000), "level 3 sibling survives");
+        assert_eq!(
+            resize.max_bytes,
+            Some(4_718_592),
+            "level 3 sibling survives"
+        );
+        assert_eq!(resize.jpeg_quality, Some(80), "level 3 sibling survives");
+        assert_eq!(images.max_per_message, Some(20), "level 2 sibling survives");
+        assert_eq!(
+            images.max_per_request,
+            Some(600),
+            "level 2 sibling survives"
+        );
+        assert_eq!(
+            merged.max_request_bytes,
+            Some(33_554_432),
+            "level 1 sibling survives"
+        );
+    }
+
+    #[test]
+    fn an_override_naming_no_images_keeps_the_whole_images_block() {
+        // Pi's `: base?.images` arm.
+        let merged = overridden(
+            r#"{"providers":{"acme":{"modelOverrides":{"img":{"inputLimits":{"maxRequestBytes":99}}}}}}"#,
+        );
+        assert_eq!(merged.max_request_bytes, Some(99));
+        assert_eq!(
+            merged.images,
+            stamped().images,
+            "an override naming only maxRequestBytes must leave `images` entirely alone"
+        );
+    }
+
+    #[test]
+    fn an_override_naming_images_but_no_resize_keeps_the_whole_resize_profile() {
+        // Pi's `: base?.images?.resize` arm — the level-2/level-3 boundary.
+        let merged = overridden(
+            r#"{"providers":{"acme":{"modelOverrides":{"img":{"inputLimits":{"images":{"maxPerMessage":3}}}}}}}"#,
+        );
+        let images = merged.images.as_ref().unwrap();
+        assert_eq!(images.max_per_message, Some(3));
+        assert_eq!(
+            images.max_per_request,
+            Some(600),
+            "level 2 sibling survives"
+        );
+        assert_eq!(
+            images.resize,
+            stamped().images.unwrap().resize,
+            "an override naming only images.maxPerMessage must leave `resize` intact"
+        );
+        assert_eq!(merged.max_request_bytes, Some(33_554_432));
+    }
+
+    #[test]
+    fn an_override_without_input_limits_leaves_the_composed_profile_untouched() {
+        // Pi's `if (!override) return base;`. Guards against the merge running unconditionally and
+        // installing an empty block (which would serialize as `{}` where pi emits nothing).
+        let merged =
+            overridden(r#"{"providers":{"acme":{"modelOverrides":{"img":{"maxTokens":4096}}}}}"#);
+        assert_eq!(merged, stamped());
+    }
+
+    #[test]
+    fn an_override_without_input_limits_cannot_install_an_empty_block() {
+        // The other half of `if (!override) return base;`. Dropping the guard and treating an
+        // absent override as an empty one is indistinguishable on a model that HAS a profile, but
+        // on one that does not it turns `undefined` into `{}` — which `skip_serializing_if` would
+        // then emit as `"inputLimits":{}` where pi emits no key at all.
+        let mut m = model("acme", "plain", "plain");
+        m.base_url = "https://acme.example/v1".into();
+        let out = composed(
+            &[m],
+            r#"{"providers":{"acme":{"modelOverrides":{"plain":{"maxTokens":4096}}}}}"#,
+        );
+        assert_eq!(by_id(&out, "plain").input_limits, None);
+    }
+
+    #[test]
+    fn an_override_onto_a_model_with_no_profile_installs_the_override_alone() {
+        // `{...base, ...override}` with `base` undefined: the result is the override's keys and
+        // nothing invented around them.
+        let mut m = model("acme", "plain", "plain");
+        m.base_url = "https://acme.example/v1".into();
+        let out = composed(
+            &[m],
+            r#"{"providers":{"acme":{"modelOverrides":{"plain":{"inputLimits":{"images":{"resize":{"jpegQuality":40}}}}}}}}"#,
+        );
+        assert_eq!(
+            by_id(&out, "plain").input_limits,
+            Some(ModelInputLimits {
+                max_request_bytes: None,
+                images: Some(ModelImageInputLimits {
+                    resize: Some(ModelImageResizeOptions {
+                        max_width: None,
+                        max_height: None,
+                        max_bytes: None,
+                        jpeg_quality: Some(40),
+                    }),
+                    max_per_message: None,
+                    max_per_request: None,
+                }),
+            }),
+            "no key may be invented; the resizer fills the gaps from DEFAULT_IMAGE_RESIZE"
+        );
+    }
+
+    // ---- The schema BOUNDS (CFG-085, validation half) -------------------------------------------
+    //
+    // Pi's `ImageResizeSchema` is `{ maxWidth: Integer({minimum:1}), maxHeight: Integer({minimum:1}),
+    // maxBytes: Integer({minimum:1}), jpegQuality: Integer({minimum:1, maximum:100}) }`
+    // (`model-config.ts:154-159` @v1.0.4) and `ModelInputLimitsSchema` bounds `maxRequestBytes`,
+    // `images.maxPerMessage` and `images.maxPerRequest` the same way (`:160-169`). A user
+    // `models.json` is validated against it, so an out-of-range key is a config ERROR naming the
+    // key — not a value that reaches the resizer.
+    //
+    // Without these, `maxWidth: 0` deserialized fine and `resolve`'s defensive `.max(1)` turned it
+    // into a ONE-PIXEL clamp on every image in the session. Upstream has no such clamp precisely
+    // because the schema makes a zero unreachable.
+
+    /// `compose` keeps the untouched built-ins for a rejected block and returns its message, so
+    /// this returns the errors rather than asserting them empty.
+    fn errors_of(base: &[Model], json: &str) -> Vec<String> {
+        let file: ModelFile = serde_json::from_str(json).unwrap();
+        let (_, errors) = file.compose(base);
+        errors
+    }
+
+    #[test]
+    fn a_zero_resize_dimension_on_a_definition_is_rejected_by_name() {
+        let errors = errors_of(
+            &[model("acme", "m1", "M1")],
+            r#"{"providers":{"acme":{"models":[{"id":"custom","inputLimits":{"images":{"resize":{"maxWidth":0}}}}]}}}"#,
+        );
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(
+            errors[0].contains("invalid inputLimits.images.resize.maxWidth"),
+            "the message must name the offending key: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn a_zero_resize_dimension_on_an_override_is_rejected_by_name() {
+        let errors = errors_of(
+            &[model("acme", "m1", "M1")],
+            r#"{"providers":{"acme":{"modelOverrides":{"m1":{"inputLimits":{"images":{"resize":{"maxHeight":0}}}}}}}}"#,
+        );
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(
+            errors[0].contains("invalid inputLimits.images.resize.maxHeight"),
+            "an override is validated against the SAME schema as a definition: {errors:?}"
+        );
+    }
+
+    /// `jpegQuality` is the one key with an UPPER bound. Both ends are rejected; `1` and `100` are
+    /// the inclusive extremes and must still compose.
+    #[test]
+    fn jpeg_quality_is_bounded_to_1_through_100_inclusive() {
+        let base = vec![model("acme", "m1", "M1")];
+        let quality_json = |q: &str| {
+            format!(
+                "{}{q}{}",
+                r#"{"providers":{"acme":{"modelOverrides":{"m1":{"inputLimits":{"images":{"resize":{"jpegQuality":"#,
+                r#"}}}}}}}}"#
+            )
+        };
+        for bad in ["0", "101", "200"] {
+            let errors = errors_of(&base, &quality_json(bad));
+            assert_eq!(errors.len(), 1, "jpegQuality {bad} must reject: {errors:?}");
+            assert!(
+                errors[0].contains("invalid inputLimits.images.resize.jpegQuality"),
+                "{errors:?}"
+            );
+        }
+        for ok in ["1", "100"] {
+            let out = composed(&base, &quality_json(ok));
+            assert_eq!(
+                by_id(&out, "m1")
+                    .input_limits
+                    .as_ref()
+                    .and_then(|l| l.images.as_ref())
+                    .and_then(|i| i.resize.as_ref())
+                    .and_then(|r| r.jpeg_quality),
+                Some(ok.parse::<u8>().unwrap()),
+                "the inclusive extremes must still compose"
+            );
+        }
+    }
+
+    /// The three inert caps are bounded too — upstream's schema does not exempt them for having no
+    /// runtime reader.
+    #[test]
+    fn the_inert_caps_are_bounded_as_well() {
+        let base = vec![model("acme", "m1", "M1")];
+        for (json_key, message_key) in [
+            (
+                "\"maxRequestBytes\":0",
+                "invalid inputLimits.maxRequestBytes",
+            ),
+            (
+                "\"images\":{\"maxPerMessage\":0}",
+                "invalid inputLimits.images.maxPerMessage",
+            ),
+            (
+                "\"images\":{\"maxPerRequest\":0}",
+                "invalid inputLimits.images.maxPerRequest",
+            ),
+        ] {
+            let json = format!(
+                "{}{json_key}{}",
+                r#"{"providers":{"acme":{"modelOverrides":{"m1":{"inputLimits":{"#, r#"}}}}}}"#
+            );
+            let errors = errors_of(&base, &json);
+            assert_eq!(errors.len(), 1, "{json_key} must reject: {errors:?}");
+            assert!(errors[0].contains(message_key), "{errors:?}");
+        }
+    }
+
+    /// A rejected block costs the user that block and nothing else — the built-ins for the provider
+    /// stay, and so does every other provider (CFG-046's rule, applied here).
+    #[test]
+    fn a_rejected_input_limits_block_keeps_the_builtins_and_the_other_providers() {
+        let base = vec![model("acme", "m1", "M1"), model("other", "o1", "O1")];
+        let file: ModelFile = serde_json::from_str(
+            r#"{"providers":{"acme":{"modelOverrides":{"m1":{"name":"Renamed","inputLimits":{"images":{"resize":{"maxBytes":0}}}}}}}}"#,
+        )
+        .unwrap();
+        let (out, errors) = file.compose(&base);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].contains("invalid inputLimits.images.resize.maxBytes"));
+        assert_eq!(
+            by_id(&out, "m1").name,
+            "M1",
+            "the built-in stands untouched, including the `name` the same override tried to set"
+        );
+        assert!(
+            out.iter().any(|m| m.id.as_str() == "o1"),
+            "another provider must be unaffected"
+        );
+    }
+
+    /// The mirror that keeps the above non-vacuous: a legal profile still composes.
+    #[test]
+    fn a_legal_profile_is_not_rejected() {
+        let out = composed(
+            &[model("acme", "m1", "M1")],
+            r#"{"providers":{"acme":{"modelOverrides":{"m1":{"inputLimits":{"maxRequestBytes":1,"images":{"maxPerMessage":1,"maxPerRequest":1,"resize":{"maxWidth":1,"maxHeight":1,"maxBytes":1,"jpegQuality":50}}}}}}}}"#,
+        );
+        assert_eq!(
+            by_id(&out, "m1").input_limits,
+            Some(ModelInputLimits {
+                max_request_bytes: Some(1),
+                images: Some(ModelImageInputLimits {
+                    resize: Some(ModelImageResizeOptions {
+                        max_width: Some(1),
+                        max_height: Some(1),
+                        max_bytes: Some(1),
+                        jpeg_quality: Some(50),
+                    }),
+                    max_per_message: Some(1),
+                    max_per_request: Some(1),
+                }),
+            }),
+            "every key at its inclusive minimum is legal"
+        );
     }
 }

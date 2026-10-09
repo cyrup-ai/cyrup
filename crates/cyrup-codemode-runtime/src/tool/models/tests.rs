@@ -40,6 +40,7 @@ fn scorer_model() -> ClassifierModel {
         provider: "scorer".into(),
         base_url: "https://classifier.test/v1".into(),
         input: vec![Modality::Text],
+        input_limits: None,
         cost: ModelCost::default(),
         headers: Some(HeaderMap::from([(
             "X-Secret".to_owned(),
@@ -58,6 +59,7 @@ fn painter_model() -> ImageModel {
         base_url: "https://images.test/v1".into(),
         input: vec![Modality::Text, Modality::Image],
         output: vec![Modality::Text, Modality::Image],
+        input_limits: None,
         cost: ModelCost::default(),
         headers: None,
     }

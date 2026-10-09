@@ -24,7 +24,6 @@ mod dispatch;
 mod extension_provider_launch;
 mod footer_provider_count;
 mod image_auto_resize_file_args;
-mod image_bytecap;
 mod install_package_dir;
 mod list_models_session;
 mod model_scope_announce;

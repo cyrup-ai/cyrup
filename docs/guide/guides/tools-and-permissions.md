@@ -10,7 +10,7 @@ Seven tools ship in the binary.
 
 | Tool | What it does |
 |---|---|
-| `read` | Read a file. Text and images (jpg, png, gif, webp, bmp); images arrive as attachments. |
+| `read` | Read a file. Text and images (jpg, png, gif, webp, bmp); images arrive as attachments, re-encoded to fit the model's [resize profile](models.md#how-big-an-image-gets-sent). |
 | `write` | Write a file, creating parent directories and overwriting what is there. |
 | `edit` | Replace exact text in one file. One call carries a list of edits, each matching a unique, non-overlapping region of the original. |
 | `bash` | Run a shell command in the working directory and return stdout and stderr. |

@@ -84,6 +84,11 @@ pub struct FauxModelDefinition {
     pub cost: ModelCost,
     pub context_window: u64,
     pub max_tokens: u64,
+    /// Provider input limits and the cache-safe image resize profile (`Model::input_limits`;
+    /// upstream declares it on `FauxModelDefinition` at `packages/ai/src/providers/faux.ts:46`
+    /// and copies it onto the built model at `:484`). `None` by default, so a faux model resolves
+    /// the shared default profile; a test that needs a specific profile sets it here.
+    pub input_limits: Option<crate::ModelInputLimits>,
     /// Prompt-cache lifetimes per retention tier, in SECONDS (`Model::prompt_cache`). `None` by
     /// default, which is what every non-Anthropic model carries — a test that needs prompt-cache
     /// warming to be eligible sets it, and one that needs warming to decline leaves it unset.
@@ -102,6 +107,7 @@ impl FauxModelDefinition {
             cost: ModelCost::default(),
             context_window: DEFAULT_CONTEXT_WINDOW,
             max_tokens: DEFAULT_MAX_TOKENS,
+            input_limits: None,
             prompt_cache: None,
         }
     }
@@ -116,6 +122,7 @@ impl FauxModelDefinition {
             base_url: "http://localhost:0".into(),
             reasoning: self.reasoning,
             input: self.input,
+            input_limits: self.input_limits,
             cost: self.cost,
             prompt_cache: self.prompt_cache,
             context_window: self.context_window,

@@ -429,6 +429,15 @@ impl AgentSession {
         &self.read_model_vision
     }
 
+    /// The handle the `read` tool reads for the ACTIVE model's `inputLimits.images.resize`
+    /// (pi `tools/read.ts:138`'s `ctx?.model?.inputLimits?.images?.resize`). Seeded from the
+    /// resolved model's row at build and re-pushed wherever the selection changes, so a `/model`
+    /// switch reaches the very next `read`.
+    #[must_use]
+    pub fn read_model_resize(&self) -> &cyrup_tools::config::ModelResizeHandle {
+        &self.read_model_resize
+    }
+
     /// The agent's LIVE per-request header overlay (pi `SimpleStreamOptions.headers`, recomputed
     /// per request in `streamFn`, `sdk.ts:318-327`). Tracks the active model via
     /// [`Self::attribution_headers`] on both model-change paths.

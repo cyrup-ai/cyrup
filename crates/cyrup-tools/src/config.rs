@@ -153,6 +153,43 @@ impl ModelVisionHandle {
     }
 }
 
+/// A shared, mutable handle to "what resize profile does the model that is active RIGHT NOW
+/// declare?" — the twin of [`ModelVisionHandle`], for `inputLimits.images.resize`.
+///
+/// Pi reads the profile PER CALL off the context it threads into every tool:
+/// `resizeOptions: ctx?.model?.inputLimits?.images?.resize ?? fallbackResizeOptions`
+/// (`core/tools/read.ts:137-138` @v1.0.4), and `ctx.model` is the agent's live state model — so a
+/// mid-session `/model` switch changes the very next `read`. cyrup's `Tool::execute` has no context
+/// argument, so the session layer hands `read` this handle at build time and re-pushes the profile
+/// on every model change, exactly as it does the vision bool.
+///
+/// A `Mutex` rather than an atomic because the profile is four scalars, not a flag; the lock is held
+/// only for a clone-out. The racing semantics are [`ModelVisionHandle`]'s and for the same reason: a
+/// `read` racing an in-flight `/model` switch may legitimately see either model's profile.
+#[derive(Clone, Debug, Default)]
+pub struct ModelResizeHandle(Arc<std::sync::Mutex<Option<cyrup_core::ModelImageResizeOptions>>>);
+
+impl ModelResizeHandle {
+    pub fn new(profile: Option<cyrup_core::ModelImageResizeOptions>) -> Self {
+        Self(Arc::new(std::sync::Mutex::new(profile)))
+    }
+
+    /// The profile of the currently-selected model, cloned out so no guard is held across the
+    /// `spawn_blocking` hop the resizer runs on.
+    pub fn get(&self) -> Option<cyrup_core::ModelImageResizeOptions> {
+        // A poisoned lock means some other reader panicked while holding it; answering `None` (the
+        // shared default profile) is strictly better than propagating that panic into a `read`.
+        self.0.lock().ok().and_then(|g| g.clone())
+    }
+
+    /// Push the profile of a newly-selected model (Pi's `ctx.model` changing under the tool).
+    pub fn set(&self, profile: Option<cyrup_core::ModelImageResizeOptions>) {
+        if let Ok(mut g) = self.0.lock() {
+            *g = profile;
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ReadOpts {
     pub max_lines: usize,
@@ -165,8 +202,22 @@ pub struct ReadOpts {
     /// whenever it is set. `None` (no session layer wired) keeps the static fallback, mirroring how
     /// [`BashOpts::session_env`] treats Pi's `ctx === undefined`. See [`ModelVisionHandle`].
     pub model_vision: Option<ModelVisionHandle>,
-    /// Max image bound (both dimensions) before resize.
-    pub max_image_dim: u32,
+    /// The request model's `inputLimits.images.resize` — the cache-safe resize profile `read`
+    /// applies before an image enters history (Pi `resizeOptions: ctx?.model?.inputLimits?.images?.resize
+    /// ?? fallbackResizeOptions`, read.ts:138).
+    ///
+    /// Every key inside it is `Option` and resolves independently against
+    /// [`cyrup_core::DEFAULT_IMAGE_RESIZE`], and `None` resolves to those defaults in full — the
+    /// 2000×2000 / 4.5 MiB / quality-80 profile that the previous `max_image_dim: u32` hardcoded.
+    /// So the default value of this field is behaviour-identical to the field it replaces, while a
+    /// non-square profile (which one `max_dim` could not express, since upstream applies `maxWidth`
+    /// and `maxHeight` as two SEQUENTIAL clamps) is now expressible.
+    pub image_resize: Option<cyrup_core::ModelImageResizeOptions>,
+    /// The LIVE profile of the active model, read at execute time; overrides `image_resize`
+    /// whenever it is set. `None` (no session layer wired) keeps the static fallback, exactly as
+    /// `model_vision` does for the vision bool. See [`ModelResizeHandle`], and prefer
+    /// [`ReadOpts::resize_profile_now`] over reading either field directly.
+    pub model_resize: Option<ModelResizeHandle>,
     /// `images.autoResize` (Pi `ReadToolOptions.autoResizeImages`, read.ts:58-60, defaulted at
     /// read.ts:207 with `?? true`). When `false`, `read` skips `resizeImage` entirely and inlines the
     /// NORMALIZED original bytes with no dimension note (image-process.ts's else-branch), so a vision
@@ -187,6 +238,19 @@ impl ReadOpts {
             .as_ref()
             .map_or(self.supports_images, ModelVisionHandle::get)
     }
+
+    /// Resolve the resize profile the way Pi does — from the model active AT CALL TIME
+    /// (`read.ts:138`'s `ctx?.model?.inputLimits?.images?.resize`), falling back to the static
+    /// `image_resize` when no session layer wired a handle (Pi's `?? fallbackResizeOptions`).
+    ///
+    /// The result is OWNED: `read` hands it to `process_image` inside `spawn_blocking`, so nothing
+    /// borrowed from the handle may cross that boundary.
+    pub fn resize_profile_now(&self) -> Option<cyrup_core::ModelImageResizeOptions> {
+        match self.model_resize.as_ref() {
+            Some(handle) => handle.get().or_else(|| self.image_resize.clone()),
+            None => self.image_resize.clone(),
+        }
+    }
 }
 
 impl Default for ReadOpts {
@@ -196,7 +260,11 @@ impl Default for ReadOpts {
             max_bytes: DEFAULT_MAX_BYTES,
             supports_images: true,
             model_vision: None,
-            max_image_dim: 2000,
+            model_resize: None,
+            // `None`, not an explicit 2000×2000: an absent profile resolves per key against
+            // `DEFAULT_IMAGE_RESIZE`, so this is the same 2000px clamp the old `max_image_dim`
+            // default carried, and it stays correct if upstream's defaults ever move.
+            image_resize: None,
             // Pi `options?.autoResizeImages ?? true` (read.ts:207).
             auto_resize_images: true,
         }

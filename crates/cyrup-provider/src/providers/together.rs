@@ -74,7 +74,7 @@ fn model(
     if image {
         input.push(Modality::Image);
     }
-    Model {
+    let mut model = Model {
         id: id.into(),
         name: name.into(),
         api: OPENAI_COMPLETIONS.into(),
@@ -82,6 +82,7 @@ fn model(
         base_url: TOGETHER_BASE_URL.to_string(),
         reasoning,
         input,
+        input_limits: None,
         cost,
         prompt_cache: None,
         context_window,
@@ -90,7 +91,15 @@ fn model(
         thinking_level_map,
         compat: Some(compat),
         headers: None,
-    }
+    };
+    // PROV-134 — Together is the ONE built-in whose catalog is hand-written Rust literals rather
+    // than embedded JSON, so its rows never pass through `catalog::load_catalog` and would be the
+    // only image-capable rows in the whole built-in registry with no resize profile (measured: 6
+    // of them). Upstream's `together.models.ts` is generated data and is stamped with everything
+    // else at `generate-models.ts:3487`, so stamping here is the parity-preserving placement, not
+    // a cyrup invention. Same fill-only discipline as every other pass.
+    crate::catalog::apply_image_input_metadata(&mut model);
+    model
 }
 
 /// The full Together chat catalog — a verbatim 1:1 port of Pi's `together.models.ts` at

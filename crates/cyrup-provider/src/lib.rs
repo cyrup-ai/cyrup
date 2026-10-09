@@ -68,7 +68,7 @@ pub use cache_stats::{
     CACHE_TTL_MS, CacheMiss, CacheScan, CacheScanEntry, CacheWasteTotals, ModelPriceSource,
     NOISE_FLOOR_TOKENS, NoPrices, collect_cache_misses, compute_cache_waste, detect_cache_miss,
 };
-pub use catalog::{builtin_catalog, load_catalog};
+pub use catalog::{DEFAULT_IMAGE_RESIZE, builtin_catalog, load_catalog};
 pub use catalog_refresh::{
     CatalogOverlaySlot, CatalogRefreshCoordinator, CatalogRefreshResult, ModelCatalogService,
     refresh_and_install,
@@ -101,7 +101,10 @@ pub use images::{
     KnownImageApi, OPENROUTER_IMAGES, ProviderImages, generate_images, images_builtin_registry,
     register_images_builtins,
 };
-pub use model::{Modality, Model, ModelCost, ModelCostTier, ModelPromptCache, prompt_cache_ttl_ms};
+pub use model::{
+    Modality, Model, ModelCost, ModelCostTier, ModelImageInputLimits, ModelImageResizeOptions,
+    ModelInputLimits, ModelPromptCache, prompt_cache_ttl_ms,
+};
 pub use models_store::{
     InMemoryModelsStore, ModelsStore, ModelsStoreEntry, ModelsStoreOperationOptions,
     ProviderModelsStore,

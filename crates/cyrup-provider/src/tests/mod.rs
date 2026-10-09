@@ -21,6 +21,7 @@ mod classifier_dispatch;
 mod classifier_store;
 mod classifier_support;
 mod classifier_types;
+mod input_limits;
 mod llama_cpp_classify;
 mod llama_cpp_classify_fake_server;
 mod llama_cpp_classify_render;

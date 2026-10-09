@@ -167,6 +167,16 @@ pub struct ProviderModelConfig {
     /// Supported input modalities (Pi `input: ("text"|"image")[]`, types.ts:1418).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub input: Vec<String>,
+    /// Provider input limits and the cache-safe image resize profile (Pi
+    /// `inputLimits?: AnyModel["inputLimits"]`, `extensions/types.ts:1961` @v1.0.4, declared on
+    /// `ProviderModelConfigBase` immediately after `input` and immediately BEFORE `promptCache`
+    /// on the chat subtype — which is why it sits here rather than beside `prompt_cache`).
+    ///
+    /// Without it an extension-registered provider could not declare a resize profile at all, and
+    /// the resize profile read off the model an extension's `before_agent_start` handler selects
+    /// would have nothing to read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_limits: Option<cyrup_provider::ModelInputLimits>,
     /// Per-token cost (Pi `cost`, types.ts:1422).
     #[serde(default)]
     pub cost: ModelCost,
@@ -308,6 +318,7 @@ impl ProviderRegistration {
                 base_url,
                 reasoning: m.reasoning,
                 input,
+                input_limits: m.input_limits.clone(),
                 cost: ModelCost {
                     input: m.cost.input,
                     output: m.cost.output,

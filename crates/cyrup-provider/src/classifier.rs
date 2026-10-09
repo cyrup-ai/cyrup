@@ -37,7 +37,7 @@
 
 use crate::HeaderMap;
 use crate::auth::ProviderEnv;
-use crate::model::{Modality, Model, ModelCost};
+use crate::model::{Modality, Model, ModelCost, ModelInputLimits};
 use crate::stream::{ProviderResponse, TransformHeadersFn};
 use cyrup_core::{ApiId, CancelToken, ModelId, ProviderId, Usage};
 use std::collections::BTreeMap;
@@ -134,6 +134,12 @@ pub struct ClassifierModel {
     pub provider: ProviderId,
     pub base_url: String,
     pub input: Vec<Modality>,
+    /// Provider input limits and cache-safe image preprocessing metadata (pi
+    /// `BaseModel.inputLimits`, `types.ts:1105` @v1.0.4, declared between `input` and `cost`).
+    /// Declared on `BaseModel`, which this type extends, so an classifier row carries it exactly as a
+    /// chat [`Model`] does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_limits: Option<ModelInputLimits>,
     pub cost: ModelCost,
     /// Top-level per-provider request headers (pi `BaseModel.headers`, types.ts:1107).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -161,6 +167,11 @@ struct ClassifierModelWire {
     provider: ProviderId,
     base_url: String,
     input: Vec<Modality>,
+    // Mirrors `ClassifierModel::input_limits`. A field added to the public struct but FORGOTTEN
+    // here compiles clean, serializes correctly and silently reads `None` on every row — the
+    // exact silent-data-loss mode these two hand-written mirrors invite.
+    #[serde(default)]
+    input_limits: Option<ModelInputLimits>,
     cost: ModelCost,
     #[serde(default)]
     headers: Option<HeaderMap>,
@@ -177,6 +188,7 @@ impl<'de> serde::Deserialize<'de> for ClassifierModel {
             provider: wire.provider,
             base_url: wire.base_url,
             input: wire.input,
+            input_limits: wire.input_limits,
             cost: wire.cost,
             headers: wire.headers,
             context_window: wire.context_window,
@@ -198,6 +210,10 @@ impl ClassifierModel {
             base_url: self.base_url.clone(),
             reasoning: false,
             input: self.input.clone(),
+            // Carried, not dropped: upstream's `resolveProviderAuth` receives the REAL model, so
+            // it sees `inputLimits`. The chat-only members below are `None`/`0` because an image
+            // or classifier row genuinely has no source for them; this one has one.
+            input_limits: self.input_limits.clone(),
             cost: self.cost.clone(),
             prompt_cache: None,
             context_window: self.context_window,
@@ -232,6 +248,13 @@ pub struct ImageModel {
     pub provider: ProviderId,
     pub base_url: String,
     pub input: Vec<Modality>,
+    /// Provider input limits and cache-safe image preprocessing metadata (pi
+    /// `BaseModel.inputLimits`, `types.ts:1105` @v1.0.4, declared between `input` and `cost`).
+    /// Declared on `BaseModel`, which this type extends, so an image row carries it exactly as a
+    /// chat [`Model`] does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_limits: Option<ModelInputLimits>,
+
     /// Output modalities. Always includes `image`; `text` means the model can also return text
     /// blocks (pi `ImageModel.output`, types.ts:1148).
     pub output: Vec<Modality>,
@@ -261,6 +284,9 @@ struct ImageModelWire {
     provider: ProviderId,
     base_url: String,
     input: Vec<Modality>,
+    // Mirrors `ImageModel::input_limits` — see the note on `ClassifierModelWire`.
+    #[serde(default)]
+    input_limits: Option<ModelInputLimits>,
     output: Vec<Modality>,
     cost: ModelCost,
     #[serde(default)]
@@ -277,6 +303,7 @@ impl<'de> serde::Deserialize<'de> for ImageModel {
             provider: wire.provider,
             base_url: wire.base_url,
             input: wire.input,
+            input_limits: wire.input_limits,
             output: wire.output,
             cost: wire.cost,
             headers: wire.headers,
@@ -307,6 +334,10 @@ impl ImageModel {
             base_url: self.base_url.clone(),
             reasoning: false,
             input: self.input.clone(),
+            // Carried, not dropped: upstream's `resolveProviderAuth` receives the REAL model, so
+            // it sees `inputLimits`. The chat-only members below are `None`/`0` because an image
+            // or classifier row genuinely has no source for them; this one has one.
+            input_limits: self.input_limits.clone(),
             cost: self.cost.clone(),
             prompt_cache: None,
             context_window: 0,

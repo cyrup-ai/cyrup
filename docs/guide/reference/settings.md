@@ -74,7 +74,7 @@ reasoning off by default.
 | `terminal.images` | `kitty`\|`iterm2`\|`false`\|`auto` | `"auto"` | Force the inline-image protocol, or `false` for none (images fall back to block characters); `auto` keeps the detected one. |
 | `terminal.hyperlinks` | bool\|`auto` | `"auto"` | Force OSC 8 hyperlinks on or off; `auto` keeps the detected answer. |
 | `terminal.trueColor` | bool\|`auto` | `"auto"` | Force 24-bit colour on or off (off renders 256 colours); `auto` keeps the detected answer. |
-| `images.autoResize` | bool | `true` | Resize large images to 2000×2000 before sending. |
+| `images.autoResize` | bool | `true` | Re-encode a new image to fit the request model's [resize profile](../guides/models.md#how-big-an-image-gets-sent) — 2000×2000 and 4.5 MB unless the model declares otherwise — before it enters the conversation. `false` still converts an unsupported format, but sends the original size. |
 | `images.blockImages` | bool | `false` | Never send images to providers. |
 | `markdown.codeBlockIndent` | string | `"  "` | Indent applied to rendered code fences. |
 | `markdown.mermaid` | `off`\|`final`\|`streaming` | `"streaming"` | Mermaid fence rendering; an unrecognised value falls back to `streaming`. |

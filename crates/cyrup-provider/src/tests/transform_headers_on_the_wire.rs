@@ -135,6 +135,7 @@ fn model(api: &str, provider: &str, id: &str, base_url: String) -> Model {
             cache_write: 0.0,
             tiers: None,
         },
+        input_limits: None,
         prompt_cache: None,
         context_window: 100_000,
         max_tokens: 4_096,

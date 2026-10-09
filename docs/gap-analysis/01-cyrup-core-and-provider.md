@@ -2,6 +2,50 @@
 
 This area covers `cyrup/crates/cyrup-core` (message/type model, JSONL serialization) and `cyrup/crates/cyrup-provider` (wire APIs, providers, catalogs, auth, streaming, validation), measured against `pi/packages/ai/`, `pi/packages/agent/` and the provider-facing half of `pi/packages/coding-agent/src/core/`. The ported baseline is **pi `v0.83.0`**; post-baseline drift is measured against **pi `v0.84.1`**.
 
+> ### CLOSURES 2026-10-09 — one low (`PROV-134`), with `SEAM-128` (area 08) and `CFG-085` (area 05) in one PR
+>
+> The three rows are one feature and none of their Verify lines can be met alone, so they closed
+> together in five commits on `claude/hopeful-dirac-squ75k`. **Gates, measured on the combined tree
+> rather than per lane:** `cargo nextest run --workspace --features test-fixtures` (the canonical
+> command, `README.md:28`) → **14903 passed · 0 failed · 12 skipped**, against a measured
+> `main`/`515a0d0a` baseline of 14868 passed · 0 failed · 12 skipped;
+> `cargo clippy --workspace --all-targets -- -D warnings` clean; `cargo fmt --all` clean. Every new
+> test was shown red before its fix.
+>
+> **`PROV-134` — Verify, quoted in full:** *"a catalog row carrying `inputLimits` round-trips it
+> through parse, store and overlay; an image request against a model whose row sets `images.resize`
+> honours it; a row without the field still parses."* Clause by clause:
+>
+> - *parse* — `cyrup-provider tests::input_limits::a_text_only_rows_declared_limits_survive_the_parse_untouched`
+>   and `::the_image_and_classifier_wire_mirrors_both_copy_the_field`. The mirrors are the clause
+>   that matters: `ImageModelWire`/`ClassifierModelWire` exist only to make `type` mandatory, so a
+>   field on the public struct but absent from the mirror compiles, serializes correctly and reads
+>   back `None`.
+> - *store* — `cyrup-config tests::models_store_images::an_input_limits_profile_survives_a_restart_on_every_type`,
+>   added by this closure because nothing covered the store leg: it writes a full four-key profile on
+>   a chat, an image AND a classifier row, asserts the camelCase keys are really on disk, and asserts
+>   all three come back through `FileModelsStore`. Red-proved three ways — neutering the
+>   `ClassifierModelWire` copy, the `ImageModelWire` copy, and the chat `Model`'s serde each failed it
+>   on that leg alone while the other two assertions still passed.
+> - *overlay* — `::the_live_overlay_body_keeps_its_profile_on_chat_and_image_rows_alike` and
+>   `::an_overlay_row_served_without_the_field_is_stamped_on_all_three_variants`.
+> - *an image request honours `images.resize`* — the consumers, which are the paths by which images
+>   ENTER a provider request: `cyrup-session-svc tests::prompt_image_normalization::*` (9) and
+>   `tests::read_model_resize::*` (2). **This clause does NOT mean `generate_images`** — see the
+>   correction in the row.
+> - *a row without the field still parses* — `::a_row_with_no_input_limits_still_parses_weak_guard`,
+>   reported as the weak guard it is: it would pass with the feature deleted, and earns its keep only
+>   against a non-`Option` field or a missing `#[serde(default)]`.
+>
+> **`maxRequestBytes`, `images.maxPerMessage` and `images.maxPerRequest` are modelled, round-tripped
+> and deliberately inert, and that is parity, not cyrup lagging.** Upstream declares them
+> (`types.ts:1087-1094`), generates them (`generate-models.ts:1000-1008`), schema-validates them
+> (`model-config.ts:161-166`) and asserts them in its own tests, and has no runtime reader for any of
+> the three: `packages/coding-agent/docs/models.md:89` says outright that pi "does not yet rewrite or
+> reject history based on them". Only `images.resize` has a consumer, on either side. A cyrup-side
+> enforcement would be an invented surface. This is recorded so a later pass reads the absence as
+> intended rather than as an unwired field.
+
 > ### CLOSURES 2026-09-28 — twelve lows (`PROV-070`, `PROV-072`, `PROV-076`, `PROV-077`, `PROV-079`, `PROV-081`, `PROV-086`, `PROV-089`, `PROV-093`, `PROV-094`, `PROV-095`, `PROV-100`); no partials
 >
 > Landed on `claude/lows-next`, not yet committed. Each row and body section carries its evidence. Every
@@ -859,7 +903,7 @@ data only (Copilot Opus 5.5 effort map; image regeneration).
 > that goes from 0 hits to N hits is a prompt to re-read the row, not a closure.
 | ID | Severity | Kind | Effort | Title |
 |---|---|---|---|---|
-| PROV-134 | low | not-ported | M | **`BaseModel.inputLimits` is unported, so every model's provider input limits and cache-safe preprocessing metadata are silently discarded** — `types.ts:1105` @v1.0.1 declares `inputLimits?` on `BaseModel`, i.e. on chat, image AND classifier models alike, described as "Provider input limits and cache-safe preprocessing metadata"; upstream's image preprocessing reads `inputLimits.images.resize`. cyrup has **no counterpart anywhere**: `grep -rn 'input_limits\|inputLimits' crates/ --include='*.rs'` is empty, including on the chat `Model`. Nothing is broken — serde ignores the unknown field, so rows still parse — but the metadata never reaches a consumer. **Measured on the live catalog 2026-10-05:** present on **270 of 400** openrouter chat rows and **57 of 59** image rows, so this is the common case rather than an edge. **FILED 2026-10-05** by the coordinator while recording `PROV-128`, which made it visible and more relevant: image models are now reachable, and `inputLimits.images.resize` is exactly the field an image request would need. Pre-existing and NOT introduced by `PROV-128`; the chat half has been discarded for as long as the field has existed upstream. **Fix** — model `inputLimits` on the shared base shape so all three model types carry it, deserialize it, and thread `images.resize` to the image request path. **Verify** — a catalog row carrying `inputLimits` round-trips it through parse, store and overlay; an image request against a model whose row sets `images.resize` honours it; a row without the field still parses. |
+| ~~PROV-134~~ | ~~low~~ **CLOSED 2026-10-09** | not-ported | M | **`BaseModel.inputLimits` is unported, so every model's provider input limits and cache-safe preprocessing metadata are silently discarded** — `types.ts:1105` @v1.0.1 declares `inputLimits?` on `BaseModel`, i.e. on chat, image AND classifier models alike, described as "Provider input limits and cache-safe preprocessing metadata"; upstream's image preprocessing reads `inputLimits.images.resize`. cyrup has **no counterpart anywhere**: `grep -rn 'input_limits\|inputLimits' crates/ --include='*.rs'` is empty, including on the chat `Model`. Nothing is broken — serde ignores the unknown field, so rows still parse — but the metadata never reaches a consumer. **Measured on the live catalog 2026-10-05:** present on **270 of 400** openrouter chat rows and **57 of 59** image rows, so this is the common case rather than an edge. **FILED 2026-10-05** by the coordinator while recording `PROV-128`, which made it visible and more relevant: image models are now reachable, and `inputLimits.images.resize` is exactly the field an image request would need. Pre-existing and NOT introduced by `PROV-128`; the chat half has been discarded for as long as the field has existed upstream. **Fix** — model `inputLimits` on the shared base shape so all three model types carry it, deserialize it, and thread `images.resize` to the image request path. **Verify** — a catalog row carrying `inputLimits` round-trips it through parse, store and overlay; an image request against a model whose row sets `images.resize` honours it; a row without the field still parses. — **CLOSED 2026-10-09**, in four commits on this branch with `SEAM-128` and `CFG-085`'s last clause. The three types (`ModelImageResizeOptions`/`ModelImageInputLimits`/`ModelInputLimits`, `types.ts:1075-1096`) and `input_limits` on `Model`, `ImageModel` and `ClassifierModel` — in upstream's `BaseModel` slot between `input` and `cost` — plus both hand-written `*Wire` mirrors and both `to_auth_model` shims, which is where the silent drop lived; a generation-time `apply_image_input_metadata` port of `applyImageInputMetadata` (`generate-models.ts:994-1020`) at the four catalog parse sites; and the two other declaration surfaces `promptCache` reached (`FauxModelDefinition`, `cyrup_ext::ProviderModelConfig`). The consumers: `AgentSession::normalize_prompt_images` (`SEAM-128`) and the `read` tool, whose profile is now the LIVE `ModelResizeHandle` re-pushed on both model-switch paths, which is this row's read-tool clause. **The stamp question was settled the other way, with evidence rather than the `promptCache` analogy:** upstream DOES inject at generation time (`applyImageInputMetadata` called at `generate-models.ts:3487` and `:3505`, `DEFAULT_IMAGE_RESIZE` at `:424-430`, upstream's own assertions at `packages/ai/test/providers.test.ts:111-136`). **Two corrections to this row.** (a) "thread `images.resize` to the image request path" does NOT mean `generate_images`: at v1.0.4 `packages/ai/src/images.ts` and `api/openrouter-images.ts` contain no reference to `inputLimits`, `resize` or `processImage`, and the only three consumers are `agent-session.ts:694`, `:1933` and `tools/read.ts:138` — so it means the paths by which images ENTER a provider request, and a pre-resize inside `generate_images` would have been an invention. (b) the "270 of 400 / 57 of 59" figures are the LIVE pi.dev body (`src/tests/fixtures/pi-dev-openrouter-all-types.json`, which reproduces exactly); the FROZEN catalogs measure 265/393 chat and 0 of 54 image-capable rows — the embedded chat rows already carry the field (1011 of 1519, and 0 text-only rows do), so adding the serde field recovers real generated data, while the image catalog is what the stamp actually fixes. `maxRequestBytes`, `images.maxPerMessage` and `images.maxPerRequest` are modelled and round-tripped with NO enforcement, which is parity: `packages/coding-agent/docs/models.md:89` says outright that pi does not rewrite or reject history based on them. |
 | ~~PROV-M01~~ | ~~medium~~ **FILED AND CLOSED 2026-08-14** | parity-bug | S | Two hand-written `impl Provider` decorators dropped the trait-defaulted half of the surface pi's object spread carries — `github-copilot`'s credential filter was discarded in the overlay configuration — **FILED AND CLOSED 2026-08-14**: sweep 8. See the body below. |
 | ~~PROV-030~~ | ~~high~~ **CLOSED 2026-08-14** | not-ported | L | `google-vertex` is registered with 10 models and no wire API — every request dies with `NoApiImpl` — **CLOSED 2026-08-14**: sweep 2 — the area's headline `high`. `api/google_vertex.rs` + `auth/google_adc.rs` ported end to end (express-mode vs ADC split, `resolveProject`/`resolveLocation` with pi's two verbatim throw strings, `{location}` interpolation, ADC search order, refresh-token exchange, RS256 JWT-bearer assertion, google-auth-library's 5-minute eager refresh); body/decoder delegate to `api::google_generative_ai` because pi's two `buildParams` are line-for-line identical at v0.83.0. **Sweep 1's stated blocker was false**: `ring` 0.17 was already resolved in Cargo.lock via rustls, so RS256 needed no new crate. `KNOWN_DANGLING = ["google-vertex"]` deleted from `every_catalog_row_names_a_registered_api` — the Verify clause is now enforced with no carve-out. |
 | ~~PROV-027~~ | ~~high~~ **CLOSED 2026-08-14 — REFUTED** | parity-bug | S | Copilot's Claude models send `x-api-key`; pi sends `Authorization: Bearer` — **REFUTED, CLOSED 2026-08-14**: sweep 2 — **REFUTED at HEAD**, and not in sweep 1's fixedIds, so it had been stale for at least one pass. `api/anthropic_messages.rs:434` carries the `model.provider === "github-copilot"` branch documented as "the branch Pi tests FIRST inside createClient", with a fixture at :2399. |

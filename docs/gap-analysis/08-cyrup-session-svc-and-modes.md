@@ -1,5 +1,51 @@
 # 08 — cyrup-session-svc + cyrup-modes + bin + sdk
 
+> ### CLOSURES 2026-10-09 — one low (`SEAM-128`), with `PROV-134` (area 01) and `CFG-085` (area 05) in one PR
+>
+> The three rows are one feature and none of their Verify lines can be met alone, so they closed
+> together in five commits on `claude/hopeful-dirac-squ75k`. **Gates, measured on the combined tree:**
+> `cargo nextest run --workspace --features test-fixtures` → **14903 passed · 0 failed · 12 skipped**,
+> against a measured `main`/`515a0d0a` baseline of 14868 · 0 · 12;
+> `cargo clippy --workspace --all-targets -- -D warnings` clean; `cargo fmt --all` clean. Twelve
+> neuters; every new test was shown red before its fix.
+>
+> **`SEAM-128` — Verify, quoted in full:** *"an RPC `prompt` carrying a 6 000 px PNG reaches the
+> provider at ≤2 000 px; a corrupt PNG yields a prompt whose text ends with the processing hint and no
+> image block."* Both halves are asserted at the PROVIDER BOUNDARY — the `Context` a
+> `FauxResponseStep` factory is handed is the request as the provider sees it — with output dimensions
+> measured by DECODING the base64, never inferred from a hint string:
+>
+> - *6 000 px → ≤2 000 px over RPC* — `cyrup-session-svc tests::prompt_image_normalization::rpc_prompt_image_reaches_the_provider_downscaled`,
+>   which submits a `UserInput` of the RPC `prompt` arm's exact shape with `InputSource::Rpc`.
+>   `cyrup-modes` needed no edit, and that is the finding rather than an omission: its `prompt` arm
+>   passes wire images into `prompt_with`, which reaches the one seam.
+> - *corrupt PNG → hint, no image block* — `::a_corrupt_image_becomes_a_hint_and_no_image_block`,
+>   plus `::an_image_only_prompt_whose_image_fails_still_runs_and_both_messages_are_reachable` for the
+>   empty-text case (pi's `${expandedText}\n\n${hints}` with an empty `expandedText`, byte for byte —
+>   neither side has an empty-text guard). Both of pi's two
+>   `[Image omitted: …]` strings are reachable and are covered separately; the first draft of this
+>   test expected the CONVERT-stage message and the code produced the RESIZE-stage one — reading
+>   `processImage` at v1.0.4 showed the code was right (a supported MIME skips the decode in
+>   `normalizeImage`, so the ladder is the first decode), and the test was corrected rather than the
+>   code.
+>
+> **Two findings beyond the Fix text, both fixed here rather than filed.** (a) The port is an ORDER
+> change, not an added call: the user message was built BEFORE `emit_before_agent_start`, so a naive
+> added call would have normalized against the pre-hook model and defeated the whole reason upstream
+> puts the normalization here. (b) cyrup's guest `setModel` is a QUEUED `ControlOp`, not pi's
+> synchronous assignment, so the placement alone does nothing without
+> `apply_pending_agent_state_only` — and `set_model_id` did not update the session's resolved
+> selection at all, leaving every `Model`-shaped reader, the context window included, on the previous
+> model. The fast path (`no_subscribers(BeforeAgentStart)`) is a SECOND exit and is every install
+> with no extension loaded; it is covered, and neutering only that arm failed 7 of 9 tests while the
+> extension-flavoured one stayed green.
+>
+> **Deliberately NOT normalized, and that is parity by inaction:** `queue_steer`/`queue_follow_up`
+> and the RPC `steer`/`follow_up` arms. Upstream's `_queueSteer`/`_queueFollowUp`
+> (`agent-session.ts:2224-2250`) do no processing either, and `prompt` while streaming queues its
+> images BEFORE its own normalization (`:2005-2009`). A later pass that "improves" this would be
+> introducing a divergence.
+
 > ### CLOSURES 2026-09-28 — five lows (`SEAM-057` as a divergence, `SEAM-073`, `SEAM-119`, `SEAM-129`, `SEAM-130`); no partials
 >
 > Landed on `claude/lows-next`, not yet committed. Each row and body section carries its evidence.
@@ -884,7 +930,7 @@ the check that establishes it. Do not "recover" them.
 | ~~SEAM-125~~ | ~~low~~ **CLOSED 2026-09-27** | upstream-drift | S | **CLOSED 2026-09-27**: `AgentSession::is_idle` = `!is_run_active() && !is_compacting()` (pi v0.85.1+), with `is_run_active` now the run latches alone (pi `isStreaming`); `wait_for_idle` also waits on a `compaction_settled` watch raised by `CompactionCancelGuard::clear` (which now also guards both branch-summary slots in `forking.rs`); `abort_and_settle` keeps waiting on the run latches only (`wait_for_run_settled`) until `SESS-062` makes `abort()` cancel a compaction; `cyrup-modes` RPC `latch_if_running` reads `is_run_active`. Unblocks `ICOM-062`. Verify: `cyrup-it --test session_svc injection_pump::a_manual_compaction_is_busy_and_holds_an_injected_turn_until_it_ends` (`is_idle()` and extension `ctx.isIdle()` false, `is_run_active()` false, `wait_for_idle()` resolves only after `compaction_end`, no model run under it). — *Original:* **NEW 2026-09-24 (second pass; the idle half of a 2026-09-14 lead).** `is_idle`/`wait_for_idle` ignore a running MANUAL compaction or branch summary; pi v0.85.0's `isIdle` is `!_isAgentRunActive && !isCompacting` — see the body. |
 | ~~SEAM-126~~ | ~~medium~~ **CLOSED 2026-09-27** | upstream-drift | M | **NEW 2026-09-24 (second pass).** No threshold compaction before a post-tool model request: cyrup compacts only after `agent_end`, so a long tool loop runs into the provider's context limit mid-run; pi v0.84.4 (#8782) compacts in `prepareNextTurn` — see the body. **2026-09-27:** area 02's `AGENT-036`/`AGENT-038` closed — `prepare_next_turn` now runs only when another turn follows, immediately before its `turn_start`, followed by a gated steering re-poll (pi's position for this compaction); see the Fix note in the body. — **CLOSED 2026-09-27**: `PolicyHooks::prepare_next_turn` now calls `compact_before_next_assistant_response` at its head (`crates/cyrup-session-svc/src/hooks.rs:290`, the estimate-and-compact at `session/auto_compaction.rs:512`), so a long tool loop compacts between turns. Verify: `cyrup-session-svc tests::round10_medium::{seam126_threshold_compaction_runs_before_the_next_provider_request,seam126_no_compaction_when_under_threshold}`. |
 | ~~SEAM-127~~ | ~~medium~~ **CLOSED 2026-09-27** | upstream-drift | S | **NEW 2026-09-24 (second pass).** An extension `sendMessage(msg, {triggerTurn:false})` during a run is steered (or follow-up-queued) into the loop, driving another model turn; pi v0.84.2 (#8022) + v0.84.4 append it at the end of the current turn and start nothing — see the body. — **CLOSED 2026-09-27**: `triggerTurn` is kept as a raw `Option<bool>` and an explicit `false` during a run is deferred to a pending-custom queue flushed at `turn_end` and at settle, never steered (`crates/cyrup-session-svc/src/session/control.rs:329-356`, `session/inject.rs:91-165,241`). Verify: `cyrup-session-svc tests::round10_medium::seam127_*` (6). |
-| SEAM-128 | low | upstream-drift | M | **NEW 2026-09-24 (second pass; absorbs the 2026-09-24 `@file`-resize lead).** Prompt images from RPC/SDK/extensions reach the provider unresized and unvalidated; pi v0.87.0 normalizes every prompt image in `AgentSession.prompt` against the request model's resize profile and folds failures into text hints — see the body. |
+| ~~SEAM-128~~ | ~~low~~ **CLOSED 2026-10-09** | upstream-drift | M | **NEW 2026-09-24 (second pass; absorbs the 2026-09-24 `@file`-resize lead).** Prompt images from RPC/SDK/extensions reach the provider unresized and unvalidated; pi v0.87.0 normalizes every prompt image in `AgentSession.prompt` against the request model's resize profile and folds failures into text hints — see the body. — **CLOSED 2026-10-09**, in four commits on this branch with `PROV-134` and `CFG-085`'s last clause: `AgentSession::normalize_prompt_images` (`crates/cyrup-session-svc/src/session/prompt_images.rs`) runs the ONE shared resizer over every prompt image with the REQUEST model's `inputLimits.images.resize` off `limits_model()`, dropping a failure and folding its message into the user text; it is called from `assemble_run_inputs` on BOTH exits, after the `before_agent_start` dispatch and a narrow agent-state drain, and the user message is built only afterwards. The `@file` startup resize is dropped as pi's `main.ts:223` does. **Three citations corrected (README.md:495 — leads, not addresses):** the verbatim copy is `assemble_run_inputs` (`session/run.rs:~1090`) over `UserInput::into_agent_message` (`crates/cyrup-session-svc/src/event.rs:49`), not `run.rs:708`; `input.rs`'s resizer was `:184-446`, not `:288-400`. **Two findings beyond the Fix text,** both fixed here: the port is an ORDER change, not an added call (the user message was built BEFORE the hook, so a naive call would have normalized against the pre-hook model); and cyrup's guest `setModel` is a QUEUED `ControlOp`, so the placement alone does nothing without `apply_pending_agent_state_only` — and `set_model_id` did not update the session's resolved selection at all, leaving every `Model`-shaped reader (the context window as well as this profile) on the previous model. Verify: `cyrup-session-svc tests::prompt_image_normalization::*` (9) and `tests::read_model_resize::*` (2); `cyrup tests::image_auto_resize_file_args::*` (2) and `input::tests::process_file_args_still_resizes_when_asked_to`. Red-proved with twelve neuters. |
 | ~~SEAM-129~~ | ~~low~~ **CLOSED 2026-09-28** | parity-bug | S | **CLOSED 2026-09-28** (on `claude/lows-next`): the port of `_emitAgentSettled` @v0.87.1 releases the run latch BEFORE the emit, so `is_run_active` and `is_idle` read as pi's do inside an `agent_settled` handler, and defers `prompt_run`, `prompt_with` and control's `triggerTurn` arm while the emit runs (`DeferredSettled`, `crates/cyrup-session-svc/src/session/run.rs:41-59`; deferral `:142-151`, `:195-202`; `settle_run` tail and `claim_run_latch` `:424-462`; `crates/cyrup-session-svc/src/session/mod.rs:312-323`, `:565-571`; `crates/cyrup-session-svc/src/session/control.rs:349-354`; `crates/cyrup-session-svc/src/subscriber.rs:58-80`). The deferred actions run in order before the idle latch drops, and a deferred `prompt_run`'s stream follows the run it starts. **One divergence found and fixed in the same pass:** pi runs them as `for (const action of deferred) await action();` and its `prompt()` rethrows preflight errors (`agent-session.ts:1748-1751`), so the first failing action ends the loop and drops the rest; cyrup had logged and kept going. It now stops at the first failure (`run_deferred_settled_inner`, `run.rs:473-520`), and a dropped `PromptRun` sender ends its caller's stream. Tests (`cyrup-session-svc tests::agent_settled_deferral::`): `a_prompt_from_an_agent_settled_handler_starts_the_next_run`, `the_deferred_prompts_stream_follows_the_run_it_started`, `an_agent_settled_handler_sees_the_run_latch_released`, `a_trigger_turn_message_from_an_agent_settled_handler_runs_a_turn`, `a_failed_deferred_action_drops_the_actions_after_it` (an invalid `compaction.keepRecentTokens` makes the deferred prompt throw; the trigger-turn message behind it must not run — 1 model call, not 2), mirror `a_prompt_during_the_run_itself_is_still_refused`. Red without the fix: yes (release after the emit, no emitting flag). **Remaining, outside the row:** unbound (by-value) sessions still emit `agent_settled` from the subscriber path with no deferral (pi has no such mode); and pi's `waitForIdle` returns at once when `isIdle` while cyrup's `wait_for_idle` blocks on the driver latch, so an in-process handler awaiting `wait_for_idle` inside `agent_settled` still blocks in cyrup, as it did before. — **NEW 2026-09-24 (second pass).** A `prompt` submitted while `agent_settled` is being delivered is refused with `StreamingNeedsBehavior`; pi accepts it (v0.83.0 clears the run latch before emitting; v0.87.0 defers it until the emit returns) — see the body. |
 | ~~SEAM-130~~ | ~~low~~ **CLOSED 2026-09-28** | upstream-drift | S | **CLOSED 2026-09-28** (on `claude/lows-next`): the non-persisted fork arm now runs `abort_and_settle()` → `branch_live_manager(leaf)` → `take_manager()` (`crates/cyrup-session-svc/src/runtime.rs:699-714`), matching `agent-session-runtime.ts:335-341` @v0.87.1, where `teardownCurrent` precedes `createBranchedSession` (pi `56c6fb33c`, #8937), and the comment that described v0.84's order as pi's is rewritten (`runtime.rs:666-672`; `take_manager`'s caller contract, `crates/cyrup-session-svc/src/session/lifecycle.rs:135-138`). Test: `cyrup-session-svc tests::fork_non_persisted::a_fork_during_a_live_turn_leaves_the_dying_turn_out_of_the_branch`; red without the fix: yes. **Ledger correction:** the no-leaf arm's comment (`runtime.rs:715-721`) is corrected too — at v0.87.1 the in-memory `newSession({parentSession})` (`:338`) comes AFTER `teardownCurrent`; only the persisted arm (`:298`) still precedes it. **Remaining, outside the row and pre-existing on every fork arm:** cyrup builds the next session before `install` emits `session_shutdown` for the old one, where pi's `teardownCurrent` emits `session_shutdown` and disposes first. — **NEW 2026-09-24 (second pass; was a 2026-09-14 lead).** An in-memory fork branches the live manager BEFORE settling the outgoing run, so the aborted turn's tail lands in the fork; pi v0.85.0 (#8937) settles first — cyrup's comment still describes the v0.84 order as pi's — see the body. |
 | ~~SEAM-131~~ | ~~low~~ **CLOSED 2026-10-08** | upstream-drift | L | **NEW 2026-09-24 (second pass).** Prompt-cache warming (`core/cache-warmer.ts`, pi v0.86.0, default mode `streaming`) is not ported: no warm requests, no `usage` entries, no `/session` status. Owns the blocker `EXT-085` names; the settings key is `CFG-093` — see the body. — **CLOSED 2026-10-08** in four commits: the TTL metadata and `prompt_cache_ttl_ms`; `SESS-051`'s `usage` entry type and all of its readers; the warmer itself (`crates/cyrup-session-svc/src/cache_warmer.rs`) seamed into `ProviderSwap::stream` with pi's session-id guard and `cacheContextIsCurrent`; and `EXT-085`'s `cache_warming_decision` hook on both tiers plus the `/session` and `/settings` surfaces, the latter with a live half so switching to `off` disarms a standing timer. `CFG-093`'s setting now has readers and a writer. Verify: `cyrup-session-svc tests::cache_warmer_state::*` (27), `cyrup-tui tests::cache_warming_ui::*` (7) and `tests::cache_warming_notice::*`, `cyrup-ext tests::cache_warming_decision::*` (17). |
@@ -1001,7 +1047,129 @@ Keeps its ID and its body; proposes no schedulable work today.
 **Fix**      — keep the raw `Option<bool>`; route `is_run_active() && trigger_turn == Some(false)` (and `deliverAs` set) to a pending-custom queue flushed in the `turn_end` subscriber and in `settle_run` before `emit_agent_settled`, persisting and emitting exactly like the idle append arm.
 **Verify**   — during a run, `sendMessage({customType:"x"}, {triggerTurn:false})` produces no extra provider request; the entry is persisted after the turn's last `toolResult`, and `message_start`/`message_end` for it are emitted then, not at the call.
 
-## SEAM-128 — Prompt images are not normalized in the session
+## ~~SEAM-128~~ — Prompt images are not normalized in the session — **CLOSED 2026-10-09**
+
+> **CLOSED 2026-10-09**, on this branch, with `PROV-134` (the model shape) and `CFG-085`'s last
+> clause (the user override) in the same PR — the three are one feature and the row's Verify line
+> cannot be met without all of them.
+>
+> **The normalizer.** `AgentSession::normalize_prompt_images`
+> (`crates/cyrup-session-svc/src/session/prompt_images.rs`) is a port of `_normalizePromptImages`
+> (`core/agent-session.ts:1923-1943` @v1.0.4): per image, decode and hand the bytes to the one
+> shared `cyrup_tools::image_proc::process_image` with `auto_resize_images` from the
+> `images.autoResize` setting (read PER PROMPT, as pi does at `:1931`) and `resize` from
+> `limits_model()`'s `inputLimits.images.resize` (`:1932`); a failure DROPS the image and its
+> message becomes a hint, and a success contributes its hints too. The hints are folded into the
+> user text (`:2062`), which lands them in the same single leading text block as pi's
+> `userContent[0]` because `UserInput::into_agent_message` already emits `[text, …images]`. The
+> whole loop runs on the blocking pool — the decode + EXIF + clamp + JPEG ladder is CPU-bound, and
+> the profile is resolved to an owned value before the hop so no lock or borrow crosses it.
+>
+> **It is an ORDER change, not an added call.** `assemble_run_inputs` built the user message as its
+> third statement, BEFORE `emit_before_agent_start`. Upstream builds it only after the hook and the
+> normalization and says why: *"Build messages only after hooks and image normalization have
+> completed"* (`:2064`), *"Emit before_agent_start before normalizing images so extension-driven
+> model selection determines the resize profile"* (`:2045-2046`). `input` is now held as a
+> `mut UserInput` across the hook and moved on each exit.
+>
+> **BOTH exits.** The `no_subscribers(BeforeAgentStart)` fast path is every install with no
+> extension loaded — the common case. `tests::prompt_image_normalization::both_exits_normalize`
+> asserts the same downscale with and without a subscriber; neutering the fast-path call failed 7 of
+> the 9 tests while leaving the extension-flavoured one green, which is what makes the pair evidence
+> rather than decoration.
+>
+> **One finding the Fix text did not anticipate, and it is what the ordering actually needed.**
+> Upstream's placement buys something only because `ctx.setModel` mutates `this.model`
+> synchronously inside the handler. In cyrup a guest `setModel` is a QUEUED `ControlOp::SetModel`,
+> and `assemble_run_inputs` drained only `take_pending_active_tools()` after the hook. So the port
+> needed a narrow drain — `AgentSession::apply_pending_agent_state_only`
+> (`session/control.rs`), which routes only `SetModel`/`SetThinkingLevel`/`Abort`/`Shutdown` through
+> the existing `apply_agent_state_op` and re-queues everything else; it deliberately is NOT
+> `apply_pending_agent_control`, which would double-apply the active-tool restriction
+> `assemble_run_inputs` has just applied in-turn and would service the two SEND ops from inside
+> prompt assembly. And `set_model_id` — the function that drain reaches — did not update
+> `compaction_model`, cyrup's `this.model` analogue, so `limits_model()` kept answering the previous
+> model. That was a pre-existing divergence affecting the context window too; it is fixed here
+> (`session/model.rs`), because the feature cannot work without it.
+> `the_extension_selected_model_decides_the_profile` is the only test that fails without either
+> half.
+>
+> **The `@file` startup resize is dropped,** as pi's `prepareInitialMessage` does: it no longer takes
+> an `autoResizeImages` argument and calls
+> `processFileArguments(parsed.fileArgs, { autoResizeImages: false })` with the comment *"AgentSession
+> resizes these after extension hooks select the request model"* (`main.ts:221-223`). So
+> `build_inputs` lost its parameter and hands `process_file_args` a hard `false`;
+> `process_file_args` KEEPS its parameter and its true branch, exactly as pi keeps the option, and
+> `input::tests::process_file_args_still_resizes_when_asked_to` pins that so it cannot rot.
+> `tests::image_auto_resize_file_args` is rewritten rather than deleted — its two assertions are now
+> that the `@file` attachment is byte-identical to the file on disk and that the byte cap is not
+> applied either (`image_bytecap`'s substance, folded in from the other side) — and the end-to-end
+> guarantee it used to provide moved to
+> `tests::prompt_image_normalization::a_cli_file_image_still_reaches_the_provider_downscaled`,
+> without which dropping the startup resize would have been a silent CLI regression with everything
+> else green.
+>
+> **The `read` tool's profile is now LIVE, not baked.** `ReadOpts::image_resize` alone would have
+> kept the startup model's profile across a `/model` switch, where pi reads
+> `ctx?.model?.inputLimits?.images?.resize` per call (`core/tools/read.ts:137-138`). So
+> `ModelResizeHandle` joins `ModelVisionHandle` in `crates/cyrup-tools/src/config.rs`, wired at the
+> same five builder sites and re-pushed by BOTH switch paths (`apply_model_change` for `/model`,
+> `set_model_id` for an extension's queued op — the test exercises both, because a push added to only
+> one of them passes a test that uses the other). That is `PROV-134`'s read-tool clause and
+> `CFG-085`'s Verify line.
+>
+> **Citation corrections** (README.md:495 — every `<file>:<line>` is a lead): the verbatim copy is
+> `assemble_run_inputs` (`session/run.rs:~1090`) over `UserInput::into_agent_message`
+> (`crates/cyrup-session-svc/src/event.rs:49`), not `run.rs:708`, which is in the retry/post-run
+> driver; `input.rs`'s resizer was `:184-446`, not `:288-400`.
+>
+> **The THIRD consumer — ported here, not deferred.** Upstream reads
+> `inputLimits.images.resize` in three places, not two: the `read` tool, `_normalizePromptImages`,
+> and `agent-session.ts:693-698` → `utils/tool-result-images.ts`, which normalizes the image blocks
+> of EVERY tool result. An earlier revision of this note named it as outside all three rows' Fix
+> text and asked for its own area-08 row; it is instead **landed in this PR**, because the row it
+> would have been filed as is `PARITY-GAPS.md`'s `VL-P12` (which already owned it, so a second
+> filing would have duplicated it) and because leaving it open left the one image path cyrup does
+> not normalize at all — and the worst one, since a tool result is PERSISTED and is therefore re-sent
+> at full size on every later request in the session, which is exactly upstream's stated reason
+> (*"oversized images make the provider reject the whole conversation, not just the offending
+> turn"*).
+>
+> `crates/cyrup-session-svc/src/session/tool_result_images.rs` is the port, called from
+> `hooks.rs`'s `after_tool_call` / `after_nested_tool_call` AFTER the extension `tool_result` chain,
+> as upstream does (*"Runs after the extension hook so images injected or replaced by extensions are
+> normalized too"*). Its failure semantics are deliberately the OPPOSITE of the prompt path's: on
+> `ok:false` the ORIGINAL block is kept rather than dropped and no hint is emitted, because the tool
+> already produced the image and the failure may be an unavailable backend. Upstream's
+> return-the-original-array-when-unchanged short-circuit is modelled as `Option<Vec<Content>>`, where
+> `None` is pi's `normalizedContent === content` — in cyrup that identity decides between
+> `AfterOutcome::Keep` and a replace-not-merge fold, so it is load-bearing in a way it is not
+> upstream. One cyrup-specific consequence of that fold: `content` replaced without
+> `structured_content` DROPS the structured half (pi `agent-loop.ts:877-889`), so the no-hook arm
+> carries the original structured content explicitly, which upstream's
+> `structuredContent: hookResult ? hookResult.structuredContent : result.structuredContent` does too.
+> Verify: `cyrup-session-svc tests::tool_result_image_normalization::*` (6), red-proved with five
+> neuters (no normalization; normalize the pre-hook content; drop the structured carry; drop instead
+> of keep on failure; ignore `limits_model()`'s profile).
+>
+> **Queued submissions are still NOT normalized, and that is parity.** An image attached to a
+> `steer`, a `follow_up`, or a `prompt` that arrives while a run is live goes through
+> `queue_user_input` → `queue_steer`/`queue_follow_up` (`session/run.rs`), which call
+> `into_agent_message()` directly. Upstream's `_queueSteer`/`_queueFollowUp`
+> (`agent-session.ts:2222-2248` @v1.0.4) likewise push `...images` onto the queued message and never
+> call `_normalizePromptImages`, which only `prompt()` does. Recorded here and in
+> `docs/guide/guides/models.md` so the next reader does not mistake this row for total coverage.
+>
+> **The stamp's call sites are BROADER than upstream's, and that is safe.** `applyImageInputMetadata`
+> lives in `packages/ai/scripts/generate-models.ts`, a build script, so nothing stamps a catalog
+> fetched at runtime; cyrup's `apply_image_input_metadata` runs at every catalog PARSE site,
+> including the remote overlay. Nothing changes on the wire either way: `DEFAULT_IMAGE_RESIZE` is
+> byte-for-byte the resizer's own `DEFAULT_OPTIONS`, so an absent profile resolves to the same four
+> numbers a stamp would have written, and `maxRequestBytes`/`maxPerMessage`/`maxPerRequest` have no
+> runtime reader at v1.0.4. The one observable difference is persistence — a served row round-tripped
+> through the models store carries an `inputLimits` block pi's row for the same model would not have.
+> Described here rather than changed, because the stamp cannot alter resolution.
+
 
 **Kind** upstream-drift · **Severity** low · **Effort** M · **Confidence** confirmed (both sides read 2026-09-24; not run)
 **cyrup**    — images on a prompt are carried verbatim: `crates/cyrup-session-svc/src/session/run.rs:708` copies `input.images` into the user message; the RPC `prompt` arm builds `user_input(message, images)` straight from the wire (`crates/cyrup-modes/src/rpc/mod.rs:892-896`). The only resize is the CLI `@file` path, `crates/cyrup/src/input.rs:288-400` (`MAX_IMAGE_EDGE = 2000`, the 4.5 MB base64 cap), a fixed profile applied at startup.

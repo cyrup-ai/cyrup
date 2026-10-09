@@ -20,6 +20,9 @@
 pub mod config;
 pub mod details;
 pub(crate) mod error;
+/// The one image normalize + resize path, shared by `read` and the CLI `@file` boundary.
+#[cfg(feature = "inline-images")]
+pub mod image_proc;
 pub mod isolation;
 pub(crate) mod jsnum;
 pub mod lock;
