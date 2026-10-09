@@ -1012,6 +1012,90 @@ fn mirror_meta_container_still_greys_the_whole_annotation() {
 }
 
 // ---------------------------------------------------------------------------------------------
+// TUI-179 — code inside a string interpolation is highlight.js's `subst`, painted `text`.
+// ---------------------------------------------------------------------------------------------
+
+/// pi maps `subst` to `text` (`subst: (s) => t.fg("text", s)`, `theme/theme.ts:895` @f1b2e77f5).
+/// syntect scopes Ruby's `foo` `[source.ruby, string.quoted.double.ruby,
+/// source.ruby.embedded.source]`; the deepest-first walk used to reach the string scope and paint
+/// it `syntaxString`. FAILS before the fix: `foo` came back with the string colour.
+#[test]
+fn ruby_interpolation_is_text_coloured_inside_a_string() {
+    let t = UiTheme::dark();
+    let string = t
+        .syntax_style_for_scope("string.quoted.double.ruby")
+        .and_then(|s| s.fg);
+    let text = t.syntax_subst_style().fg;
+    assert_ne!(string, text, "the two roles must be distinguishable");
+
+    let rb = render_markdown("```ruby\ns = \"a #{foo} b\"\n```", 60, &t);
+    assert_eq!(span_style(&rb, "a ").and_then(|s| s.fg), string, "{rb:?}");
+    assert_eq!(span_style(&rb, " b").and_then(|s| s.fg), string, "{rb:?}");
+    assert_eq!(
+        span_style(&rb, "foo"),
+        Some(t.syntax_subst_style()),
+        "{rb:?}"
+    );
+    // highlight.js's `subst` mode owns its `#{` / `}` delimiters, so they are `text` as well.
+    for delimiter in ["#{", "}"] {
+        assert_eq!(
+            span_style(&rb, delimiter),
+            Some(t.syntax_subst_style()),
+            "`{delimiter}`: {rb:?}"
+        );
+    }
+
+    // Inside the interpolation, a token with its own class keeps it: a nested string literal and a
+    // number, while an unclassified method name is `text` too.
+    let nested = render_markdown("```ruby\ns = \"a #{foo.bar(1, \"x\")} b\"\n```", 60, &t);
+    let number = t
+        .syntax_style_for_scope("constant.numeric.ruby")
+        .and_then(|s| s.fg);
+    assert_eq!(
+        span_style(&nested, "x").and_then(|s| s.fg),
+        string,
+        "{nested:?}"
+    );
+    assert_eq!(
+        span_style(&nested, "1").and_then(|s| s.fg),
+        number,
+        "{nested:?}"
+    );
+    assert_eq!(
+        span_style(&nested, "bar"),
+        Some(t.syntax_subst_style()),
+        "{nested:?}"
+    );
+    assert_eq!(
+        span_style(&nested, " b").and_then(|s| s.fg),
+        string,
+        "{nested:?}"
+    );
+}
+
+/// MIRROR (pins existing behaviour): a JS template expression already leaves the string, because
+/// syntect pops `string.template.js` for `meta.template.expression.js`, so its identifier keeps
+/// `syntaxVariable` and the literal parts stay `syntaxString`.
+#[test]
+fn js_template_expression_is_not_string_coloured() {
+    let t = UiTheme::dark();
+    let string = t
+        .syntax_style_for_scope("string.template.js")
+        .and_then(|s| s.fg);
+    let variable = t
+        .syntax_style_for_scope("variable.other.readwrite.js")
+        .and_then(|s| s.fg);
+    let js = render_markdown("```js\nconst s = `a ${foo} b`;\n```", 60, &t);
+    assert_eq!(span_style(&js, "a ").and_then(|s| s.fg), string, "{js:?}");
+    assert_eq!(span_style(&js, " b").and_then(|s| s.fg), string, "{js:?}");
+    assert_eq!(
+        span_style(&js, "foo").and_then(|s| s.fg),
+        variable,
+        "{js:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
 // T9 continued — `customMessageBg` / `customMessageText` must reach the screen.
 // ---------------------------------------------------------------------------------------------
 

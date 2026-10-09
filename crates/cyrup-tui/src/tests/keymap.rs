@@ -787,3 +787,61 @@ fn tui071_native_windows_undo_is_ctrl_z() {
         Some(EditorAction::Undo)
     );
 }
+
+// ------------------------------------------------------- TUI-177: pi 1.1's key-spec grammar --
+// `parseKeyId` (`packages/tui/src/keys.ts:820-840` @f1b2e77f5; `test/keys.test.ts:137-143`,
+// `:278-279`).
+
+#[test]
+fn tui177_a_spec_can_name_the_plus_key() {
+    assert_eq!(
+        Key::parse("ctrl++").unwrap(),
+        Key {
+            code: KeyCode::Char('+'),
+            mods: KeyModifiers::CONTROL,
+        }
+    );
+    assert_eq!(Key::parse("+").unwrap(), Key::plain(KeyCode::Char('+')));
+}
+
+#[test]
+fn tui177_malformed_specs_are_rejected() {
+    for spec in ["ctrl+ctrl+a", "a+b", "ctrl+shift+k+j", "shift+alt+shift+x"] {
+        assert!(
+            matches!(Key::parse(spec), Err(crate::TuiError::KeySpec(ref s)) if s == spec),
+            "{spec} must be a KeySpec error, got {:?}",
+            Key::parse(spec)
+        );
+    }
+    // Regression pin: already an error before TUI-177 and still one.
+    assert!(matches!(
+        Key::parse("shift+"),
+        Err(crate::TuiError::KeySpec(_))
+    ));
+}
+
+#[test]
+fn tui177_ctrl_plus_label_round_trips() {
+    for spec in ["ctrl++", "+"] {
+        assert_eq!(Key::parse(spec).unwrap().label(), spec);
+    }
+}
+
+/// The match half: what `input/decode.rs` produces for a Kitty `CSI 61:43;6u` (Ctrl+Shift+`=`
+/// reporting the shifted `+`; pi's `keys.test.ts:142-143` sequence) is `Char('+')` + CONTROL with
+/// SHIFT cleared, and a `ctrl++` binding matches it. `CSI 43;5u` (a layout where `+` is unshifted)
+/// decodes to the same event.
+#[test]
+fn tui177_a_decoded_ctrl_plus_event_matches_ctrl_plus_plus() {
+    use crate::input::decode::{Decoded, decode_seq};
+    use ratatui::crossterm::event::Event;
+    let spec = Key::parse("ctrl++").unwrap();
+    for seq in [&b"\x1b[61:43;6u"[..], &b"\x1b[43;5u"[..]] {
+        let Decoded::Event(Event::Key(ev)) = decode_seq(seq) else {
+            panic!("{seq:?} decodes to a key");
+        };
+        assert_eq!(ev.code, KeyCode::Char('+'), "{seq:?}");
+        assert_eq!(ev.modifiers, KeyModifiers::CONTROL, "{seq:?}");
+        assert!(spec.matches(&ev), "{seq:?} matches ctrl++");
+    }
+}

@@ -7,9 +7,10 @@
 //! v0.84.1. cyrup had no `EditorAction` page variant at all, so PgUp/PgDn resolved globally and
 //! always scrolled the transcript — even with a multi-page buffer under the caret.
 //!
-//! The `ctrl+pageUp`/`ctrl+pageDown` and `ctrl+home`/`ctrl+end` aliases asserted at the bottom are
-//! **v0.84.1** additions (`keybindings.ts:92-99,108-109`), i.e. version lag rather than a port bug;
-//! they are covered here because they land in the same key table.
+//! The `ctrl+pageUp`/`ctrl+pageDown` aliases asserted at the bottom are **v0.84.1** additions
+//! (`keybindings.ts:108-109`), i.e. version lag rather than a port bug; they are covered here
+//! because they land in the same key table. The `ctrl+home`/`ctrl+end` aliases v0.84.1 also added
+//! were removed again in pi 1.0.3 (TUI-173).
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -229,14 +230,18 @@ fn ctrl_pgup_and_ctrl_pgdn_are_page_aliases() {
 }
 
 #[test]
-fn ctrl_home_and_ctrl_end_are_line_start_and_line_end_aliases() {
-    // v0.84.1 `keybindings.ts:92-99`: `["home", "ctrl+home", "ctrl+a"]` / `["end", "ctrl+end", "ctrl+e"]`.
+fn ctrl_home_and_ctrl_end_no_longer_move_the_editor_caret() {
+    // v0.84.1 added `ctrl+home` / `ctrl+end` to the line-start/line-end sets; pi 1.0.3 took them
+    // back (`6100fe5a8`, #10314) and gave them to the fullscreen transcript's top/bottom:
+    // `["home", "ctrl+a"]` / `["end", "ctrl+e"]` at `keybindings.ts:98-105` @f1b2e77f5 (TUI-173).
     let mut app = new_app();
     app.editor_mut().set_view_width(40);
     app.editor_mut().set_text("hello world");
-    app.handle_input(&ctrl(KeyCode::Home));
-    assert_eq!(app.state().editor.cursor(), (0, 0));
+    app.handle_input(&key(KeyCode::Home));
     app.handle_input(&ctrl(KeyCode::End));
+    assert_eq!(app.state().editor.cursor(), (0, 0));
+    app.handle_input(&key(KeyCode::End));
+    app.handle_input(&ctrl(KeyCode::Home));
     assert_eq!(app.state().editor.cursor(), (0, 11));
 }
 

@@ -482,24 +482,70 @@ fn push_code_span(
 ///    `syntaxString` while the annotation around them stays `muted`.
 /// 2. **Deepest-first** — the innermost scope that the prefix table knows wins, so a `string` inside
 ///    a `meta.function` still comes out as a string.
+///
+/// Both passes run over the scopes from the innermost **string interpolation** down (TUI-179): see
+/// [`interpolation_scopes`]. Inside one, a token no deeper scope classifies gets the `text` role.
 fn scope_style(stack: &ScopeStack, theme: &UiTheme) -> Option<Style> {
-    let container = stack
-        .as_slice()
+    let (scopes, in_subst) = interpolation_scopes(stack.as_slice());
+    // highlight.js's `subst` mode matches its own `#{` and `}` (`begin: /#\{/, end: /\}/`, no
+    // `excludeBegin`, highlight.js 10.7.3 `languages/ruby.js:81-86`), so the delimiters are `text`
+    // too, where syntect gives them a punctuation scope of their own.
+    if in_subst
+        && scopes
+            .last()
+            .is_some_and(|s| s.build_string().starts_with("punctuation.section.embedded"))
+    {
+        return Some(theme.syntax_subst_style());
+    }
+    let container = scopes
         .iter()
         .find_map(|scope| theme.syntax_meta_container_style(&scope.build_string()));
     if let Some(container) = container {
-        for scope in stack.as_slice().iter().rev() {
+        for scope in scopes.iter().rev() {
             if let Some(style) = theme.syntax_meta_nested_style(&scope.build_string()) {
                 return Some(style);
             }
         }
         return Some(container);
     }
-    for scope in stack.as_slice().iter().rev() {
+    for scope in scopes.iter().rev() {
         let s = scope.build_string();
         if let Some(style) = theme.syntax_style_for_scope(&s) {
             return Some(style);
         }
     }
-    None
+    in_subst.then(|| theme.syntax_subst_style())
+}
+
+/// Whether `scope` opens embedded code inside a literal: Ruby's `source.ruby.embedded.source`, JS's
+/// `meta.template.expression.js` / `source.js.embedded.expression`, Python's
+/// `meta.interpolation.python` / `source.python.embedded`.
+fn is_interpolation_scope(scope: &str) -> bool {
+    scope.starts_with("meta.interpolation")
+        || scope.starts_with("meta.template.expression")
+        || (scope.starts_with("source.") && scope.contains(".embedded"))
+}
+
+/// The scopes that decide a token's colour, and whether the token sits in a string interpolation.
+///
+/// pi maps highlight.js's `subst` class (the code in `"a #{foo} b"`) to the `text` colour —
+/// `subst: (s) => t.fg("text", s)`, `theme/theme.ts:895` @f1b2e77f5 (`b9ab918c6`). Before that an
+/// interpolation inherited its enclosing `string` formatter, and so did cyrup: syntect scopes Ruby's
+/// `foo` `[source.ruby, string.quoted.double.ruby, source.ruby.embedded.source]`, nothing deeper
+/// than the string matches, and the deepest-first walk reached `string.*`. So when an
+/// interpolation scope sits above a `string*` scope, everything below the innermost such
+/// interpolation is cut off: a token with its own class keeps it, and one without falls to `text`
+/// (the `true`). JS template expressions and Python f-string fields already pop the string scope,
+/// so they are unaffected.
+fn interpolation_scopes(scopes: &[Scope]) -> (&[Scope], bool) {
+    let names: Vec<String> = scopes.iter().map(|scope| scope.build_string()).collect();
+    let cut = names.iter().enumerate().rev().find_map(|(at, name)| {
+        let below = names.get(..at)?;
+        (is_interpolation_scope(name) && below.iter().any(|s| s.starts_with("string")))
+            .then_some(at)
+    });
+    match cut.and_then(|at| scopes.get(at..)) {
+        Some(inner) => (inner, true),
+        None => (scopes, false),
+    }
 }

@@ -45,7 +45,7 @@ use std::sync::OnceLock;
 use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use syntect::parsing::{ParseState, ScopeStack, SyntaxSet};
+use syntect::parsing::{ParseState, Scope, ScopeStack, SyntaxSet};
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::text_width::spans_width;

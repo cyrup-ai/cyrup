@@ -666,78 +666,97 @@ impl Key {
         }
     }
 
-    /// Parse a string spec like `"ctrl+c"`, `"shift+tab"`, `"alt+enter"`, `"esc"` (R-10-023).
+    /// Parse a string spec like `"ctrl+c"`, `"shift+tab"`, `"alt+enter"`, `"esc"`, `"ctrl++"`
+    /// (R-10-023).
+    ///
+    /// TUI-177 — pi 1.1's grammar, `parseKeyId` (`packages/tui/src/keys.ts:820-840` @f1b2e77f5,
+    /// `7f9e1198f`): lowercase, peel the recognised modifier prefixes `shift+` / `alt+` / `ctrl+` /
+    /// `super+` one at a time in any order, reject a modifier named twice, then require the
+    /// remainder to be ONE key token — non-empty and free of `+` unless it is exactly `+`. So
+    /// `"+"` is plain `+`, `"ctrl++"` is Ctrl with `+`, and `"a+b"` and `"ctrl+ctrl+a"` are
+    /// invalid. The old grammar split on every `+`, skipped empty tokens (so a `+` key could not be
+    /// written) and let every token overwrite the code (so `"a+b"` bound `b`).
     pub fn parse(s: &str) -> Result<Key, TuiError> {
+        const MODIFIERS: [(&str, KeyModifiers); 4] = [
+            ("shift+", KeyModifiers::SHIFT),
+            ("alt+", KeyModifiers::ALT),
+            ("ctrl+", KeyModifiers::CONTROL),
+            ("super+", KeyModifiers::SUPER),
+        ];
+        let lower = s.to_ascii_lowercase();
+        let mut token = lower.as_str();
         let mut mods = KeyModifiers::NONE;
-        let mut code: Option<KeyCode> = None;
-        for part in s.split('+') {
-            let token = part.trim();
-            if token.is_empty() {
-                continue;
+        while let Some((rest, m)) = MODIFIERS
+            .iter()
+            .find_map(|(prefix, m)| token.strip_prefix(prefix).map(|rest| (rest, *m)))
+        {
+            if mods.contains(m) {
+                return Err(TuiError::KeySpec(s.to_string()));
             }
-            match token.to_ascii_lowercase().as_str() {
-                "ctrl" => mods |= KeyModifiers::CONTROL,
-                "shift" => mods |= KeyModifiers::SHIFT,
-                "alt" => mods |= KeyModifiers::ALT,
-                "super" => mods |= KeyModifiers::SUPER,
-                "enter" | "return" => code = Some(KeyCode::Enter),
-                "tab" => code = Some(KeyCode::Tab),
-                "esc" | "escape" => code = Some(KeyCode::Esc),
-                "space" => code = Some(KeyCode::Char(' ')),
-                "up" => code = Some(KeyCode::Up),
-                "down" => code = Some(KeyCode::Down),
-                "left" => code = Some(KeyCode::Left),
-                "right" => code = Some(KeyCode::Right),
-                "home" => code = Some(KeyCode::Home),
-                "end" => code = Some(KeyCode::End),
-                "backspace" => code = Some(KeyCode::Backspace),
-                "delete" => code = Some(KeyCode::Delete),
-                // Upstream `KeyId` spells these `pageUp`/`pageDown` (`tui/src/keys.ts:122-123`) and
-                // `parseKeyId` lowercases before matching (`:791`); `label()` emits the camelCase
-                // spelling, so the label round-trips.
-                "pageup" => code = Some(KeyCode::PageUp),
-                "pagedown" => code = Some(KeyCode::PageDown),
-                // `insert` and `f1`…`f12` are `SpecialKey`s upstream (`tui/src/keys.ts:118`,
-                // `:128-139` @v0.83.0), with real sequence tables (`:380`, `:456-476`) and real
-                // `matchesKey` arms (`:1128-1139`). cyrup had neither, so the multi-character token
-                // fell through to the `_ => Err` arm below and the WHOLE entry was rejected — which
-                // meant `{"app.model.select": "f5"}` silently bound nothing. Found by TUI-008's own
-                // round-trip test, which used `f9` as an arbitrary second key.
-                //
-                // TUI-073 — **[CYRUP-DELTA]**. `clear` IS a pi `SpecialKey` (`keys.ts:119`
-                // @v0.85.1) with real sequence tables (`:379`, `:399`, `:413`), real reverse-lookup
-                // rows (`:429-432`, which spell `ctrl+clear` and `shift+clear`) and a real
-                // `matchesKey` arm (`:990-994`) — pi binds `{"app.interrupt": "clear"}` happily.
-                // crossterm's `KeyCode` enumerates no counterpart, so cyrup cannot. It used to fall
-                // through to the `_ => Err(KeySpec)` arm below, which told the user their spec was
-                // INVALID — indistinguishable from a typo. Reject it with its own diagnostic
-                // instead. No upstream default uses `clear`
-                // (`git show v0.85.1:packages/tui/src/keybindings.ts | grep '"clear"'` -> nothing),
-                // so no default chord is dead; only a hand-written config can reach this.
-                //
-                // The literal token is reported, not `s`, so `"ctrl+clear"` also reads
-                // `unsupported key "clear"` rather than blaming the whole spec.
-                "clear" => return Err(TuiError::UnsupportedKey("clear".to_string())),
-                "insert" => code = Some(KeyCode::Insert),
-                other
-                    if other.strip_prefix('f').is_some_and(|d| {
-                        !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit())
-                    }) =>
-                {
-                    match other.strip_prefix('f').and_then(|d| d.parse::<u8>().ok()) {
-                        Some(n @ 1..=12) => code = Some(KeyCode::F(n)),
-                        _ => return Err(TuiError::KeySpec(s.to_string())),
-                    }
-                }
-                other => {
-                    let mut chars = other.chars();
-                    match (chars.next(), chars.next()) {
-                        (Some(c), None) => code = Some(KeyCode::Char(c)),
-                        _ => return Err(TuiError::KeySpec(s.to_string())),
-                    }
-                }
-            }
+            mods |= m;
+            token = rest;
         }
+        if token.is_empty() || (token.contains('+') && token != "+") {
+            return Err(TuiError::KeySpec(s.to_string()));
+        }
+        let code = match token {
+            "enter" | "return" => Some(KeyCode::Enter),
+            "tab" => Some(KeyCode::Tab),
+            "esc" | "escape" => Some(KeyCode::Esc),
+            "space" => Some(KeyCode::Char(' ')),
+            "up" => Some(KeyCode::Up),
+            "down" => Some(KeyCode::Down),
+            "left" => Some(KeyCode::Left),
+            "right" => Some(KeyCode::Right),
+            "home" => Some(KeyCode::Home),
+            "end" => Some(KeyCode::End),
+            "backspace" => Some(KeyCode::Backspace),
+            "delete" => Some(KeyCode::Delete),
+            // Upstream `KeyId` spells these `pageUp`/`pageDown` (`tui/src/keys.ts:122-123`) and
+            // `parseKeyId` lowercases before matching (`:791`); `label()` emits the camelCase
+            // spelling, so the label round-trips.
+            "pageup" => Some(KeyCode::PageUp),
+            "pagedown" => Some(KeyCode::PageDown),
+            // `insert` and `f1`…`f12` are `SpecialKey`s upstream (`tui/src/keys.ts:118`,
+            // `:128-139` @v0.83.0), with real sequence tables (`:380`, `:456-476`) and real
+            // `matchesKey` arms (`:1128-1139`). cyrup had neither, so the multi-character token
+            // fell through to the `_ => Err` arm below and the WHOLE entry was rejected — which
+            // meant `{"app.model.select": "f5"}` silently bound nothing. Found by TUI-008's own
+            // round-trip test, which used `f9` as an arbitrary second key.
+            //
+            // TUI-073 — **[CYRUP-DELTA]**. `clear` IS a pi `SpecialKey` (`keys.ts:119`
+            // @v0.85.1) with real sequence tables (`:379`, `:399`, `:413`), real reverse-lookup
+            // rows (`:429-432`, which spell `ctrl+clear` and `shift+clear`) and a real
+            // `matchesKey` arm (`:990-994`) — pi binds `{"app.interrupt": "clear"}` happily.
+            // crossterm's `KeyCode` enumerates no counterpart, so cyrup cannot. It used to fall
+            // through to the `_ => Err(KeySpec)` arm below, which told the user their spec was
+            // INVALID — indistinguishable from a typo. Reject it with its own diagnostic
+            // instead. No upstream default uses `clear`
+            // (`git show v0.85.1:packages/tui/src/keybindings.ts | grep '"clear"'` -> nothing),
+            // so no default chord is dead; only a hand-written config can reach this.
+            //
+            // The literal token is reported, not `s`, so `"ctrl+clear"` also reads
+            // `unsupported key "clear"` rather than blaming the whole spec.
+            "clear" => return Err(TuiError::UnsupportedKey("clear".to_string())),
+            "insert" => Some(KeyCode::Insert),
+            other
+                if other
+                    .strip_prefix('f')
+                    .is_some_and(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit())) =>
+            {
+                match other.strip_prefix('f').and_then(|d| d.parse::<u8>().ok()) {
+                    Some(n @ 1..=12) => Some(KeyCode::F(n)),
+                    _ => None,
+                }
+            }
+            other => {
+                let mut chars = other.chars();
+                match (chars.next(), chars.next()) {
+                    (Some(c), None) => Some(KeyCode::Char(c)),
+                    _ => None,
+                }
+            }
+        };
         match code {
             Some(code) => Ok(Key { code, mods }),
             None => Err(TuiError::KeySpec(s.to_string())),
@@ -1977,15 +1996,14 @@ impl EditorKeymap {
                 (alt_code(Right), E::CursorWordRight),
                 (ctrl_code(Right), E::CursorWordRight),
                 (alt('f'), E::CursorWordRight),
+                // `["home", "ctrl+a"]` / `["end", "ctrl+e"]` (`tui/src/keybindings.ts:98-105`
+                // @f1b2e77f5). v0.84.1 had added `ctrl+home` / `ctrl+end` to these sets (TUI-072);
+                // pi 1.0.3 took them back (`6100fe5a8`, #10314) when it moved the fullscreen
+                // transcript's top/bottom onto those two chords so that bare Home/End always reach
+                // the editor (TUI-173, see `AltScreenKeymap::for_platform`).
                 (Key::plain(Home), E::CursorLineStart),
-                // `ctrl+home` / `ctrl+end` joined the line-start/line-end key sets in **v0.84.1**
-                // (`tui/src/keybindings.ts:92-99`: `["home", "ctrl+home", "ctrl+a"]` /
-                // `["end", "ctrl+end", "ctrl+e"]`); at the v0.83.0 baseline the sets were
-                // `["home","ctrl+a"]` / `["end","ctrl+e"]`. Version lag, not a port bug.
-                (ctrl_code(Home), E::CursorLineStart),
                 (ctrl('a'), E::CursorLineStart),
                 (Key::plain(End), E::CursorLineEnd),
-                (ctrl_code(End), E::CursorLineEnd),
                 (ctrl('e'), E::CursorLineEnd),
                 // Page motion (`keybindings.ts:89-90` at v0.83.0 — `pageUp`/`pageDown` are EDITOR
                 // bindings upstream and always have been; pi has no `app.pageUp` at either tag).
@@ -2146,13 +2164,15 @@ impl EditorKeymap {
 /// renderer's half and lives in `altscreen/keys.rs`, over pi's `tui-alt-screen.ts:600-644`.
 ///
 /// # Why this is a map of its own
-/// The four unmodified defaults (`pageUp`, `pageDown`, `home`, `end`) are already bound elsewhere:
-/// `pageUp`/`pageDown` to [`EditorAction::PageUp`]/[`EditorAction::PageDown`], `home`/`end` to
-/// [`EditorAction::CursorLineStart`]/[`EditorAction::CursorLineEnd`]. Upstream's comment at
-/// `keybindings.ts:159` — "These intentionally shadow the unmodified editor bindings in fullscreen
-/// mode" — is exactly that collision, declared deliberate. Keeping the family in a separate table
-/// is what lets the collision be resolved by *mode* ([`AltScreenKeymap::action_in_mode`]) instead
-/// of by rebinding anything the inline renderer depends on.
+/// The two unmodified defaults (`pageUp`, `pageDown`) are already bound elsewhere, to
+/// [`EditorAction::PageUp`]/[`EditorAction::PageDown`]. Upstream's comment at `keybindings.ts:159`
+/// — "These intentionally shadow the unmodified editor bindings in fullscreen mode" — is exactly
+/// that collision, declared deliberate. `home`/`end` used to be the other two; since pi 1.0.3
+/// (`6100fe5a8`, #10314) top/bottom are `ctrl+home`/`ctrl+end` and bare Home/End reach
+/// [`EditorAction::CursorLineStart`]/[`EditorAction::CursorLineEnd`] in every mode (TUI-173).
+/// Keeping the family in a separate table is what lets the collision be resolved by *mode*
+/// ([`AltScreenKeymap::action_in_mode`]) instead of by rebinding anything the inline renderer
+/// depends on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum AltScreenAction {
     /// Scroll the viewport up one page — `tui.altScreen.pageUp` (`keybindings.ts:160-163`,
@@ -2174,10 +2194,12 @@ pub enum AltScreenAction {
     /// Jump to the next semantic prompt — `tui.altScreen.nextPrompt` (`:188-191`; `:633-636`).
     NextPrompt,
     /// Scroll the viewport to its first row — `tui.altScreen.top` (`:208`; `:637-640`). Default
-    /// `home`.
+    /// `ctrl+home` since pi 1.0.3 (`6100fe5a8`, #10314; `keybindings.ts:208` @f1b2e77f5) — it was
+    /// `home`, which shadowed the editor's line-start in fullscreen (TUI-173).
     Top,
     /// Scroll the viewport to its last row, re-arming the tail follow — `tui.altScreen.bottom`
-    /// (`:209`; `:641-644`). Default `end`.
+    /// (`:209`; `:641-644`). Default `ctrl+end` since pi 1.0.3 (`keybindings.ts:209` @f1b2e77f5);
+    /// it was `end`.
     Bottom,
 }
 
@@ -2275,9 +2297,9 @@ impl AltScreenAction {
 ///
 /// **Every method that resolves an event takes the render mode**, or is documented as the
 /// unconditional form the mode-aware one is built from — see [`Self::action_in_mode`]. That is the
-/// shadowing rule of `keybindings.ts:159`, and it is the reason this table can bind `pageUp`,
-/// `pageDown`, `home` and `end` without disturbing the inline renderer, which resolves those same
-/// four chords through [`Keymap`] and [`EditorKeymap`] exactly as it did before ADR-0005.
+/// shadowing rule of `keybindings.ts:159`, and it is the reason this table can bind `pageUp` and
+/// `pageDown` without disturbing the inline renderer, which resolves those same chords through
+/// [`Keymap`] and [`EditorKeymap`] exactly as it did before ADR-0005.
 #[derive(Clone, Debug)]
 pub struct AltScreenKeymap {
     bindings: Vec<(Key, AltScreenAction)>,
@@ -2298,9 +2320,9 @@ impl Default for AltScreenKeymap {
     /// `previousPrompt`/`nextPrompt` carry **two** chords each. ADR-0005 §Decision C's table records
     /// the single `ctrl+shift+up` / `ctrl+shift+down` of @v0.84.1; the bare `ctrl+up` / `ctrl+down`
     /// joined those key sets by @v0.84.3 (`keybindings.ts:184-191`), which is the tree this port
-    /// reads. Version lag in the table, not a divergence here — the same call
-    /// [`EditorKeymap::default`] makes for `ctrl+home`/`ctrl+end`. Neither chord is bound by any
-    /// other cyrup map, so nothing is taken away from the editor to add them.
+    /// reads. Version lag in the table, not a divergence here. Neither chord is bound by any
+    /// other cyrup map, so nothing is taken away from the editor to add them; the same holds for
+    /// `ctrl+home`/`ctrl+end` since [`EditorKeymap::default`] dropped them (TUI-173).
     fn default() -> Self {
         AltScreenKeymap::for_platform(KeybindingPlatform::current())
     }
@@ -2334,8 +2356,10 @@ impl AltScreenKeymap {
             bindings.push((ctrl_shift(KeyCode::Down), A::NextPrompt));
         }
         bindings.push((ctrl_code(KeyCode::Down), A::NextPrompt));
-        bindings.push((Key::plain(KeyCode::Home), A::Top));
-        bindings.push((Key::plain(KeyCode::End), A::Bottom));
+        // TUI-173: `ctrl+home` / `ctrl+end` (`keybindings.ts:208-209` @f1b2e77f5, pi `6100fe5a8`).
+        // Bare Home/End are the editor's in every render mode.
+        bindings.push((ctrl_code(KeyCode::Home), A::Top));
+        bindings.push((ctrl_code(KeyCode::End), A::Bottom));
         AltScreenKeymap { bindings }
     }
 
@@ -2344,7 +2368,7 @@ impl AltScreenKeymap {
     ///
     /// This is the raw table lookup. Anything routing real input wants
     /// [`Self::action_in_mode`] instead: calling this from the inline renderer would give
-    /// `pageUp`, `pageDown`, `home` and `end` a second meaning there, which is precisely what
+    /// `pageUp` and `pageDown` a second meaning there, which is precisely what
     /// ADR-0005 §Decision B forbids. Kept public because a keybindings *surface* — a `/hotkeys`
     /// row, a conflict report — asks "what does this chord mean in fullscreen?" with no live
     /// renderer to ask about.
@@ -2357,10 +2381,9 @@ impl AltScreenKeymap {
     /// Resolve the viewport action for an event **only while the fullscreen renderer is live** —
     /// the mode half of the shadowing rule (`keybindings.ts:159`, ADR-0005 §Decision C rule i).
     ///
-    /// Under [`TuiRenderMode::Regular`] this answers `None` for every event, including the four
-    /// chords the table binds, so an inline session's `pageUp` still reaches
-    /// [`EditorAction::PageUp`], and its `home`/`end` still reach
-    /// [`EditorAction::CursorLineStart`]/[`EditorAction::CursorLineEnd`]. Under
+    /// Under [`TuiRenderMode::Regular`] this answers `None` for every event, including every
+    /// chord the table binds, so an inline session's `pageUp` still reaches
+    /// [`EditorAction::PageUp`]. Under
     /// [`TuiRenderMode::Fullscreen`] it is [`Self::action_for`], and the alternate screen's
     /// dispatcher resolves it ahead of the editor — which is where upstream's precedence comes
     /// from, since it registers the viewport handler as an input listener that runs before the

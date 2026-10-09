@@ -100,7 +100,9 @@ in `colors`:
 | Bash mode | `bashMode` |
 
 `thinkingMax` is the one optional role: leave it out and the `max` level borrows `thinkingXhigh`.
-Extra keys are allowed — their values are still checked for validity — but nothing reads them.
+Theme files are strict: a key the schema does not declare is a load error, whether it sits in
+`colors`, in `export` (only `pageBg`, `cardBg` and `infoBg`) or at the top level (only `$schema`,
+`name`, `appearance`, `vars`, `colors` and `export`). Put your own named colours under `vars`.
 
 **Naming a role is required; giving it a colour is not.** Set a role to `""` and it inherits the
 terminal's own colour, which is how you decline one without dropping it. A reference to a `vars` key

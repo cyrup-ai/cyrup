@@ -130,6 +130,47 @@ fn zed_is_identified_as_truecolor_and_hyperlink_capable() {
     }
 }
 
+/// TUI-176 — pi `b2363841a` (#10573), `terminal-image.ts:89-93` @f1b2e77f5 and its test
+/// `terminal-image.test.ts:321-331`. Herdr forwards OSC-8 but not image protocols, and the outer
+/// terminal's `KITTY_WINDOW_ID` may leak into a Herdr pane, so `TERM_PROGRAM=herdr` is checked
+/// before the Kitty arm. Before the port the first case negotiated Kitty images, and a clean Herdr
+/// pane fell through to the conservative default with OSC-8 off.
+#[test]
+fn herdr_enables_hyperlinks_without_images_even_with_a_leaked_kitty_window_id() {
+    // Pi's first case, verbatim.
+    let env = [
+        ("TERM_PROGRAM", "herdr"),
+        ("TERM", "xterm-256color"),
+        ("COLORTERM", "truecolor"),
+        ("KITTY_WINDOW_ID", "1"),
+    ];
+    let caps = detect_capabilities_from(env_of(&env), false);
+    assert_eq!(caps.images, None, "Herdr does not forward Kitty graphics");
+    assert!(caps.hyperlinks, "Herdr forwards OSC-8");
+    assert!(caps.true_color, "COLORTERM=truecolor is honoured");
+    let caps = crate::detect_capabilities_with_overrides(env_of(&env), || false);
+    assert!(caps.images.is_none() && caps.hyperlinks && caps.true_color);
+
+    // A clean pane: hyperlinks still on; truecolor follows the hint, as in pi's arm.
+    let caps = detect_capabilities_from(env_of(&[("TERM_PROGRAM", "herdr")]), false);
+    assert_eq!(caps.images, None);
+    assert!(
+        caps.hyperlinks,
+        "a Herdr pane with no leaked variables still gets OSC-8"
+    );
+    assert!(
+        !caps.true_color,
+        "no COLORTERM hint, so no assumed truecolor"
+    );
+
+    // Pi's second case (`PI_HYPERLINKS=0`) maps to cyrup's `CYRUP_HYPERLINKS` override.
+    let caps = crate::detect_capabilities_with_overrides(
+        env_of(&[("TERM_PROGRAM", "herdr"), ("CYRUP_HYPERLINKS", "0")]),
+        || panic!("a set CYRUP_HYPERLINKS must not probe tmux"),
+    );
+    assert!(!caps.hyperlinks, "the env override still wins inside Herdr");
+}
+
 /// Pi v0.84.1 `tui/src/terminal-image.ts:124-129` — a Windows console that set no `WT_SESSION`
 /// (Windows Terminal hosting a `cmd.exe` launched straight from Win+R) still gets truecolor, and
 /// still does not get OSC-8. Added upstream in `fa07e7bd9`, after cyrup's v0.83.0 baseline.

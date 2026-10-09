@@ -356,3 +356,37 @@ fn saturation_is_clamped_into_zero_to_one() {
     assert_eq!(Saturation::new(f64::NAN).get(), 0.0);
     assert_eq!(Saturation::new(0.25).get(), 0.25);
 }
+
+// ------------------------------------------------------------------ strict theme schema ----
+
+/// TUI-178 regression pin: the `system` theme's generated document, written out as theme JSON the
+/// way `UiTheme`'s publication builds it, carries only keys pi 1.1's closed schema declares, so it
+/// still loads through [`crate::Theme::parse`] for every one of pi's nineteen terminals.
+#[test]
+fn every_generated_system_theme_document_passes_the_strict_theme_check() {
+    let fixtures: Vec<Value> = serde_json::from_str(GOLDEN).unwrap();
+    for fixture in &fixtures {
+        let name = fixture["name"].as_str().unwrap();
+        let generated = generate_system_theme_colors(&input_of(fixture));
+        let colors: serde_json::Map<String, Value> = generated
+            .colors
+            .iter()
+            .map(|(token, color)| {
+                let value = match color {
+                    SystemColor::Rgb(rgb) => Value::from(rgb.hex()),
+                    SystemColor::Indexed(index) => Value::from(*index),
+                    SystemColor::Default => Value::from(""),
+                };
+                ((*token).to_string(), value)
+            })
+            .collect();
+        let document = serde_json::json!({ "name": SYSTEM_THEME_NAME, "colors": colors });
+        crate::Theme::parse(
+            &document.to_string(),
+            None,
+            crate::ResourceScope::Builtin,
+            crate::ResourceOrigin::Builtin,
+        )
+        .unwrap_or_else(|e| panic!("{name}: generated system theme rejected: {e}"));
+    }
+}

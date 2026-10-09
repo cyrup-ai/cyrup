@@ -231,9 +231,16 @@ impl BashExecution {
     /// expanded, else the trailing [`PREVIEW_LINES`] with a `… N more lines` hint), the running
     /// spinner-or-status line, and the bottom `DynamicBorder`. `cancel_hint`/`expand_hint` are the
     /// live key labels (`Esc`, `Ctrl+O`) so rebinds reflect.
+    ///
+    /// TUI-175 — `output_pad` is the `outputPad` setting: every child of `contentContainer` (the
+    /// header, the output, the preview truncation width and the status rows) is laid out at
+    /// `paddingX = this.outputPad` (`bash-execution.ts:141`, `:149`, `:159`, `:205` @f1b2e77f5),
+    /// except the running `Loader`, which keeps its own paddingX 1. The two `DynamicBorder` rules
+    /// stay full width.
     pub fn render_lines(
         &self,
         width: usize,
+        output_pad: usize,
         theme: &UiTheme,
         cancel_hint: Option<&str>,
         expand_hint: Option<&str>,
@@ -241,6 +248,7 @@ impl BashExecution {
         self.render_lines_at(
             self.started.elapsed(),
             width,
+            output_pad,
             theme,
             cancel_hint,
             expand_hint,
@@ -253,20 +261,24 @@ impl BashExecution {
         &self,
         elapsed: Duration,
         width: usize,
+        output_pad: usize,
         theme: &UiTheme,
         cancel_hint: Option<&str>,
         expand_hint: Option<&str>,
     ) -> Vec<Line<'static>> {
-        // The BORDER color is dim for a `!!` (excluded-from-context) run, bash-green otherwise — set
-        // once at construction and sticky (Pi bash-execution.ts:37-44,64). The `$ command` HEADER,
-        // however, is **always** bash-green (Pi's `updateDisplay` header, bash-execution.ts:138, uses
-        // `theme.fg("bashMode", …)` regardless of `excludeFromContext`) — item #5 "!! header green".
+        // TUI-174 — ONE `colorKey` drives the border, the spinner AND the `$ command` header: `dim`
+        // for a `!!` (excluded-from-context) run, `bashMode` otherwise. Pi stores it once in the
+        // constructor (`bash-execution.ts:32`, `:38` @f1b2e77f5) and `updateDisplay` rebuilds the
+        // header from it on every render, before and after output arrives:
+        // `theme.fg(this.colorKey, theme.bold(`$ ${this.command}`))` (`:141`). Before `18336987a`
+        // (#10557) that rebuild hard-coded `"bashMode"`, so a `!!` header turned green once output
+        // arrived; cyrup had copied that bug.
         let border_style = if self.excluded {
             theme.dim_style()
         } else {
             theme.bash_mode_style()
         };
-        let header_style = theme.bash_mode_style().add_modifier(Modifier::BOLD);
+        let header_style = border_style.add_modifier(Modifier::BOLD);
         let rule = "─".repeat(width.max(1));
         let mut out: Vec<Line<'static>> = Vec::new();
         out.push(Line::default());
@@ -286,7 +298,7 @@ impl BashExecution {
         out.extend(crate::transcript::text_lines_of(
             &Line::from(Span::styled(format!("$ {}", self.command), header_style)),
             width,
-            1,
+            output_pad,
         ));
 
         // Collapse to the trailing [`PREVIEW_LINES`] **visual** (wrap-aware) lines, exactly like Pi's
@@ -299,7 +311,9 @@ impl BashExecution {
         // makes the `(… to collapse)` hint reachable at all: an expanded block still knows how many
         // lines the collapsed form would have hidden. cyrup zeroed it when expanded, so the collapse
         // hint was dead code that could never render.
-        let body_width = width.saturating_sub(2).max(1);
+        // TUI-175 — `truncateToVisualLines(styledInput, PREVIEW_LINES, width, this.outputPad)`
+        // (`bash-execution.ts:159` @f1b2e77f5) wraps at the output `Text`'s content width.
+        let body_width = width.saturating_sub(output_pad * 2).max(1);
         let joined = self
             .output_lines
             .iter()
@@ -336,7 +350,7 @@ impl BashExecution {
                         theme.dim_style(),
                     )]),
                     width,
-                    1,
+                    output_pad,
                 ));
             }
             for line in &visible {
@@ -348,7 +362,7 @@ impl BashExecution {
                 out.extend(crate::transcript::text_lines_of(
                     &Line::from(Span::styled(line.clone(), theme.muted_style())),
                     width,
-                    1,
+                    output_pad,
                 ));
             }
         }
@@ -371,6 +385,11 @@ impl BashExecution {
                 // `Loader`'s `Text` base is `super("", 1, 0)` (`loader.ts:35`) — paddingX 1 — so the
                 // inset is `Text.render`'s `leftMargin`, a SEPARATE span concatenated ahead of the
                 // row (`text.ts:70`, `:76`), not part of the styled spinner content.
+                //
+                // TUI-175 — the one child that does NOT follow `outputPad`: `18336987a` threads it
+                // into the header, output and status `Text`s but never calls `setPaddingX` on the
+                // `Loader`, which keeps its constructor's 1 (`loader.ts:35`, `bash-execution.ts:52-57`
+                // @f1b2e77f5).
                 out.extend(crate::transcript::text_lines_of(
                     &Line::from(vec![
                         Span::styled(format!("{spinner} "), border_style),
@@ -463,7 +482,7 @@ impl BashExecution {
                     // margin every produced row. X13's truncation-warning part carries a full
                     // filesystem path and is the one that actually needs the wrap.
                     for part in parts {
-                        out.extend(crate::transcript::text_lines_of(&part, width, 1));
+                        out.extend(crate::transcript::text_lines_of(&part, width, output_pad));
                     }
                 }
             }
@@ -512,7 +531,7 @@ mod tests {
     fn render_shows_header_and_running_hint() {
         let theme = UiTheme::dark();
         let b = BashExecution::new("ls -la", false);
-        let lines = b.render_lines(40, &theme, Some("Esc"), Some("Ctrl+O"));
+        let lines = b.render_lines(40, 1, &theme, Some("Esc"), Some("Ctrl+O"));
         let text: Vec<String> = lines.iter().map(plain).collect();
         assert!(
             text.iter().any(|l| l.contains("$ ls -la")),
@@ -541,7 +560,7 @@ mod tests {
             "a missing exit code is not an error"
         );
         let text: Vec<String> = sig
-            .render_lines(40, &theme, None, None)
+            .render_lines(40, 1, &theme, None, None)
             .iter()
             .map(plain)
             .collect();
@@ -556,7 +575,7 @@ mod tests {
         err.set_complete(Some(3), false, false, None);
         assert_eq!(err.status(), BashStatus::Error);
         let etext: Vec<String> = err
-            .render_lines(40, &theme, None, None)
+            .render_lines(40, 1, &theme, None, None)
             .iter()
             .map(plain)
             .collect();
@@ -577,7 +596,7 @@ mod tests {
         b.append_output("alpha\nbeta");
         b.set_complete(Some(7), false, false, None);
         let text: Vec<String> = b
-            .render_lines(40, &theme, None, Some("Ctrl+O"))
+            .render_lines(40, 1, &theme, None, Some("Ctrl+O"))
             .iter()
             .map(plain)
             .collect();
@@ -602,7 +621,7 @@ mod tests {
         let mut empty = BashExecution::new("true", false);
         empty.set_complete(Some(0), false, false, None);
         let etext: Vec<String> = empty
-            .render_lines(40, &theme, None, None)
+            .render_lines(40, 1, &theme, None, None)
             .iter()
             .map(plain)
             .collect();
@@ -627,7 +646,14 @@ mod tests {
         use crate::status_indicator::SPINNER_FRAMES;
         let theme = UiTheme::dark();
         let b = BashExecution::new("sleep 1", false);
-        let lines = b.render_lines_at(Duration::from_millis(0), 40, &theme, Some("escape"), None);
+        let lines = b.render_lines_at(
+            Duration::from_millis(0),
+            40,
+            1,
+            &theme,
+            Some("escape"),
+            None,
+        );
         let text: Vec<String> = lines.iter().map(plain).collect();
         assert_eq!(
             text[3], "",
@@ -658,14 +684,21 @@ mod tests {
         );
 
         // The glyph advances with elapsed time (`loader.ts:77-80`'s setInterval, re-derived here).
-        let later = b.render_lines_at(Duration::from_millis(240), 40, &theme, Some("escape"), None);
+        let later = b.render_lines_at(
+            Duration::from_millis(240),
+            40,
+            1,
+            &theme,
+            Some("escape"),
+            None,
+        );
         assert_eq!(plain(&later[4]), " ⠸ Running... (escape to cancel)");
         assert!(SPINNER_FRAMES.contains(&"⠸"));
 
         // MIRROR: a `!!` (excluded-from-context) run colours its spinner `dim`, the same `colorKey`
         // its border uses (`bash-execution.ts:37`).
         let excluded = BashExecution::new("secret", true);
-        let el = excluded.render_lines_at(Duration::from_millis(0), 40, &theme, None, None);
+        let el = excluded.render_lines_at(Duration::from_millis(0), 40, 1, &theme, None, None);
         assert_eq!(el[4].spans[1].style, theme.dim_style());
     }
 
@@ -683,7 +716,7 @@ mod tests {
         }
         b.set_complete(Some(0), false, false, None);
 
-        let lines = b.render_lines(40, &theme, None, Some("ctrl+o"));
+        let lines = b.render_lines(40, 1, &theme, None, Some("ctrl+o"));
         let hint = lines
             .iter()
             .find(|l| plain(l).contains("more lines"))
@@ -709,7 +742,7 @@ mod tests {
         // MIRROR: the expanded form keeps its parentheses and drops the count.
         let mut e = b.clone();
         e.set_expanded(true);
-        let el = e.render_lines(40, &theme, None, Some("ctrl+o"));
+        let el = e.render_lines(40, 1, &theme, None, Some("ctrl+o"));
         let ehint = el.iter().find(|l| plain(l).contains("collapse")).unwrap();
         assert_eq!(plain(ehint), " (ctrl+o to collapse)");
     }
@@ -722,7 +755,7 @@ mod tests {
             b.append_output(&format!("line{i}\n"));
         }
         b.set_complete(Some(0), false, false, None);
-        let lines = b.render_lines(40, &theme, None, Some("Ctrl+O"));
+        let lines = b.render_lines(40, 1, &theme, None, Some("Ctrl+O"));
         let text: Vec<String> = lines.iter().map(plain).collect();
         // 30 output lines + a trailing empty (from the final "\n") → preview keeps the last 20.
         assert!(
@@ -743,7 +776,7 @@ mod tests {
         let mut e = b.clone();
         e.set_expanded(true);
         let etext: Vec<String> = e
-            .render_lines(40, &theme, None, None)
+            .render_lines(40, 1, &theme, None, None)
             .iter()
             .map(plain)
             .collect();
@@ -770,7 +803,7 @@ mod tests {
             "a very long line of program output that certainly does not fit in thirty\n",
         );
         b.set_complete(Some(0), false, false, None);
-        let lines = b.render_lines(30, &theme, None, None);
+        let lines = b.render_lines(30, 1, &theme, None, None);
         let text: Vec<String> = lines.iter().map(plain).collect();
 
         // The header wrapped: more than one row mentions the command.
@@ -811,7 +844,7 @@ mod tests {
         let mut short = BashExecution::new("true", false);
         short.set_complete(Some(0), false, false, None);
         let stext: Vec<String> = short
-            .render_lines(40, &theme, None, None)
+            .render_lines(40, 1, &theme, None, None)
             .iter()
             .map(plain)
             .collect();
@@ -842,7 +875,7 @@ mod tests {
         // status `Text` a `contentWidth` of 28, so upstream breaks it in two — after `lines`, since
         // `(ctrl+shift+o` is one 13-cell token and 18 + 13 > 28. The first piece is `trimEnd`ed
         // (`utils.ts:934`) and the second never starts with whitespace (`:912-915`).
-        let lines = b.render_lines(30, &theme, None, Some("ctrl+shift+o"));
+        let lines = b.render_lines(30, 1, &theme, None, Some("ctrl+shift+o"));
         let text: Vec<String> = lines.iter().map(plain).collect();
         let hint: Vec<(usize, &String)> = text
             .iter()
@@ -898,7 +931,7 @@ mod tests {
         let mut short = BashExecution::new("false", false);
         short.set_complete(Some(1), false, false, None);
         let stext: Vec<String> = short
-            .render_lines(40, &theme, None, None)
+            .render_lines(40, 1, &theme, None, None)
             .iter()
             .map(plain)
             .collect();
@@ -910,30 +943,54 @@ mod tests {
         assert!(stext.iter().any(|r| r == " (exit 1)"), "{stext:?}");
     }
 
+    /// TUI-174 — one `colorKey` (`bash-execution.ts:32`, `:38` @f1b2e77f5) colours the border AND
+    /// the `$ command` header, which `updateDisplay` rebuilds on every render as
+    /// `theme.fg(this.colorKey, theme.bold(`$ ${this.command}`))` (`:141`). So a `!!` header is
+    /// dim+bold both before and after output arrives; a `!` header is bashMode+bold.
     #[test]
-    fn excluded_uses_dim_border_but_green_header() {
+    fn excluded_header_is_dim_like_its_border_before_and_after_output() {
         let theme = UiTheme::dark();
-        let b = BashExecution::new("secret", true);
-        assert!(b.excluded());
-        let lines = b.render_lines(20, &theme, None, None);
-        // Top border (line index 1, after the spacer) carries the dim style for `!!`.
-        assert_eq!(lines[1].style, theme.dim_style());
-        // The `$ command` header (line index 2), however, is ALWAYS bash-green + bold even for a `!!`
-        // excluded run (Pi `updateDisplay` header, bash-execution.ts:138) — item #5 "!! header green".
-        // The colour now rides on the SPAN, not the `Line`: the header row is `leftMargin + line`
-        // (`text.ts:70`, `:76`), i.e. an unstyled 1-column margin followed by the styled `$ command`.
-        let header_style = theme.bash_mode_style().add_modifier(Modifier::BOLD);
-        assert_eq!(lines[2].spans[0].content.as_ref(), " ");
-        assert_eq!(lines[2].spans[0].style, Style::default());
+        // The header row is `leftMargin + line` (`text.ts:70`, `:76`): an unstyled 1-column
+        // margin, then the styled `$ command` span.
+        let header_span_style = |b: &BashExecution| {
+            let lines = b.render_lines(20, 1, &theme, None, None);
+            assert_eq!(lines[2].spans[0].content.as_ref(), " ");
+            assert_eq!(lines[2].spans[0].style, Style::default());
+            assert!(plain(&lines[2]).contains("$ secret"));
+            (lines[1].style, lines[2].spans[1].style)
+        };
+        let dim_bold = theme.dim_style().add_modifier(Modifier::BOLD);
+        let green_bold = theme.bash_mode_style().add_modifier(Modifier::BOLD);
+        assert_ne!(dim_bold, green_bold, "the theme must tell the two apart");
+
+        let mut excluded = BashExecution::new("secret", true);
+        assert!(excluded.excluded());
         assert_eq!(
-            lines[2].spans[1].style, header_style,
-            "!! header must stay bash-green, not dim"
+            header_span_style(&excluded),
+            (theme.dim_style(), dim_bold),
+            "`!!` before output: dim border, dim+bold header"
         );
-        assert!(plain(&lines[2]).contains("$ secret"));
-        // And a `!` (included) run's border matches the same green header.
-        let inc = BashExecution::new("secret", false);
-        let inc_lines = inc.render_lines(20, &theme, None, None);
-        assert_eq!(inc_lines[2].spans[1].style, header_style);
+        excluded.append_output("out\n");
+        assert_eq!(
+            header_span_style(&excluded),
+            (theme.dim_style(), dim_bold),
+            "`!!` once output arrives: the header keeps its dim colour"
+        );
+        excluded.set_complete(Some(0), false, false, None);
+        assert_eq!(header_span_style(&excluded).1, dim_bold, "`!!` finished");
+
+        // MIRROR: a `!` (included) run is bashMode+bold, before and after output.
+        let mut inc = BashExecution::new("secret", false);
+        assert_eq!(
+            header_span_style(&inc),
+            (theme.bash_mode_style(), green_bold)
+        );
+        inc.append_output("out\n");
+        inc.set_complete(Some(0), false, false, None);
+        assert_eq!(
+            header_span_style(&inc),
+            (theme.bash_mode_style(), green_bold)
+        );
     }
 
     /// **X13 — the truncation warning row (`bash-execution.ts:195-199`).**
@@ -950,7 +1007,7 @@ mod tests {
         let mut b = BashExecution::new("gen", false);
         b.append_output("a\nb\n");
         b.set_complete(Some(0), false, true, Some("/tmp/pi-bash-1.log".to_string()));
-        let lines = b.render_lines(80, &theme, None, None);
+        let lines = b.render_lines(80, 1, &theme, None, None);
         let row = lines
             .iter()
             .find(|l| plain(l).contains("Output truncated"))
@@ -974,7 +1031,7 @@ mod tests {
         no_path.set_complete(Some(0), false, true, None);
         assert!(
             !no_path
-                .render_lines(80, &theme, None, None)
+                .render_lines(80, 1, &theme, None, None)
                 .iter()
                 .any(|l| plain(l).contains("truncated")),
             "no path ⇒ no row"
@@ -986,7 +1043,7 @@ mod tests {
         untruncated.set_complete(Some(0), false, false, Some("/tmp/x.log".to_string()));
         assert!(
             !untruncated
-                .render_lines(80, &theme, None, None)
+                .render_lines(80, 1, &theme, None, None)
                 .iter()
                 .any(|l| plain(l).contains("truncated")),
             "not truncated ⇒ no row"
@@ -998,7 +1055,7 @@ mod tests {
         ctx.append_output(&"x\n".repeat(2001));
         ctx.set_complete(Some(0), false, false, Some("/tmp/x.log".to_string()));
         assert!(
-            ctx.render_lines(80, &theme, None, None)
+            ctx.render_lines(80, 1, &theme, None, None)
                 .iter()
                 .any(|l| plain(l).contains("Output truncated")),
             "contextTruncation.truncated is the second leg of `wasTruncated`"
@@ -1009,7 +1066,7 @@ mod tests {
         failed.append_output("a\n");
         failed.set_complete(Some(2), false, true, Some("/tmp/x.log".to_string()));
         let rows: Vec<String> = failed
-            .render_lines(80, &theme, None, None)
+            .render_lines(80, 1, &theme, None, None)
             .iter()
             .map(plain)
             .collect();

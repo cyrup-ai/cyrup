@@ -455,6 +455,117 @@ fn focus_loss_still_withdraws_the_hardware_cursor() {
     );
 }
 
+// --------------------------------------------------------------------- TUI-172 ------------------
+
+/// Pi 1.1 `tui-render.test.ts` "draws the focused fake cursor in reverse video and omits it when the
+/// hardware cursor is shown" (`1cedd3272`), for the chat editor. `Editor` wraps its caret in
+/// `renderFakeCursor` (`editor.ts:591,596` @f1b2e77f5) and `resolveFakeCursors`
+/// (`tui.ts:1478-1484`) drops the one after `CURSOR_MARKER` when `showHardwareCursor` is on.
+/// cyrup painted its reverse-video cell under the terminal cursor regardless: two carets.
+#[test]
+fn the_hardware_cursor_replaces_the_drawn_caret_of_the_focused_editor() {
+    let mut app = App::new(TestBackend::new(48, 24), UiTheme::dark()).unwrap();
+    type_text(&mut app, "hello");
+    app.handle_input(&code(KeyCode::Left));
+    app.handle_input(&code(KeyCode::Left));
+
+    // Flag off (the default): reverse video on the `l` at column 3, no terminal cursor.
+    app.draw().unwrap();
+    let drawn = caret_cell(&app).expect("flag off: the editor draws its caret");
+    assert_eq!(drawn.1, 3, "two Lefts from the end of `hello`");
+    assert!(!app.terminal().backend().cursor_visible());
+
+    // Flag on: no REVERSED cell anywhere, and `set_cursor_position` still lands on that cell.
+    app.editor_mut().set_show_hardware_cursor(true);
+    app.draw().unwrap();
+    assert_eq!(
+        caret_cell(&app),
+        None,
+        "TUI-172: the focused editor's drawn caret is dropped under the hardware cursor:\n{}",
+        rows(&app).join("\n")
+    );
+    let backend = app.terminal().backend();
+    assert!(backend.cursor_visible(), "the terminal cursor is shown");
+    let pos = backend.cursor_position();
+    assert_eq!((pos.y, pos.x), drawn, "…on the cell the drawn caret used");
+    assert_eq!(
+        backend.buffer().cell((pos.x, pos.y)).unwrap().symbol(),
+        "l",
+        "only the reverse video goes; the character under the caret stays"
+    );
+
+    // Flag off again: the drawn caret is back, exactly as before.
+    app.editor_mut().set_show_hardware_cursor(false);
+    app.draw().unwrap();
+    assert_eq!(caret_cell(&app), Some(drawn));
+}
+
+/// Pi 1.1 `tui-render.test.ts` "keeps the fake cursor of an unfocused input when the hardware
+/// cursor is shown" (`1cedd3272`): an unfocused component emits no `CURSOR_MARKER`, so its fake
+/// cursor resolves to reverse video. Here the blurred editor (E13) keeps its caret with the flag on,
+/// and the focused half proves the flag is really doing something.
+#[test]
+fn an_unfocused_editor_keeps_its_drawn_caret_under_the_hardware_cursor_setting() {
+    let mut app = App::new(TestBackend::new(48, 24), UiTheme::dark()).unwrap();
+    app.editor_mut().set_show_hardware_cursor(true);
+    type_text(&mut app, "abc");
+    app.draw().unwrap();
+    assert_eq!(caret_cell(&app), None, "focused: the terminal cursor alone");
+    let pos = app.terminal().backend().cursor_position();
+
+    app.handle_input(&InputEvent::FocusLost);
+    app.draw().unwrap();
+    assert_eq!(
+        caret_cell(&app),
+        Some((pos.y, pos.x)),
+        "blurred: the drawn caret comes back on the same cell"
+    );
+    assert!(!app.terminal().backend().cursor_visible());
+}
+
+/// An overlay that paints one word in the top-left corner and takes no keys.
+struct Marker;
+
+impl crate::overlay::Overlay for Marker {
+    fn render(&mut self, frame: &mut ratatui::Frame, area: ratatui::layout::Rect, _: &UiTheme) {
+        frame.render_widget(
+            ratatui::widgets::Paragraph::new("OVERLAY"),
+            ratatui::layout::Rect::new(area.x, area.y, 7, 1),
+        );
+    }
+    fn handle(&mut self, _key: &KeyEvent) -> crate::overlay::OverlayOutcome {
+        crate::overlay::OverlayOutcome::Ignored
+    }
+}
+
+/// Pi 1.1's overlay case: a capturing overlay takes focus (`showOverlay`'s `setFocus(component)`,
+/// then `hideTerminalCursor()`, `tui.ts:729-742` @f1b2e77f5), so the editor below is unfocused and
+/// emits no `CURSOR_MARKER` (`editor.ts:570`, `emitCursorMarker = this.focused`): its fake cursor
+/// stays reverse video and no hardware cursor is placed at it. cyrup's chrome already gated the selector slot on `overlays.is_empty()`
+/// (`app/render.rs`); the editor now honours the same gate, so it neither drops its caret nor
+/// parks the terminal cursor on a field the user cannot type into.
+#[test]
+fn under_an_overlay_the_editor_keeps_its_drawn_caret_and_no_hardware_cursor() {
+    let mut app = App::new(TestBackend::new(48, 24), UiTheme::dark()).unwrap();
+    app.editor_mut().set_show_hardware_cursor(true);
+    type_text(&mut app, "abc");
+    app.state_mut().overlays.push(Box::new(Marker));
+    app.draw().unwrap();
+    assert!(
+        rows(&app).iter().any(|r| r.contains("OVERLAY")),
+        "precondition: the overlay is painted"
+    );
+    assert!(
+        caret_cell(&app).is_some_and(|(_, x)| x == 3),
+        "the editor under an overlay keeps its drawn caret:\n{}",
+        rows(&app).join("\n")
+    );
+    assert!(
+        !app.terminal().backend().cursor_visible(),
+        "and places no hardware cursor while the overlay owns input"
+    );
+}
+
 // ----------------------------------------------------------------------- E14 --------------------
 
 /// **E14.** The autocomplete popup lives inside the editor's padding frame.
@@ -702,11 +813,14 @@ fn a_grapheme_cluster_is_never_torn_across_the_wrap_boundary() {
 fn the_hardware_cursor_rides_the_scrolled_window_not_the_absolute_row() {
     // 24 rows ⇒ max(5, floor(24 * 0.3)) = 7 visible text rows.
     let mut app = App::new(TestBackend::new(48, 24), UiTheme::dark()).unwrap();
-    app.editor_mut().set_show_hardware_cursor(true);
     for i in 0..12 {
         type_text(&mut app, &format!("line {i}"));
         app.handle_input(&shift_enter());
     }
+    // The drawn caret is read with the flag OFF: with it on, TUI-172 drops it.
+    app.draw().unwrap();
+    let soft = caret_cell(&app).expect("the soft caret is inside the window");
+    app.editor_mut().set_show_hardware_cursor(true);
     app.draw().unwrap();
 
     let top = editor_top_rule(&app);
@@ -722,7 +836,6 @@ fn the_hardware_cursor_rides_the_scrolled_window_not_the_absolute_row() {
     );
 
     let pos = app.terminal().backend().cursor_position();
-    let soft = caret_cell(&app).expect("the soft caret is inside the window");
     assert_eq!(
         (usize::from(pos.y), pos.x),
         (bottom - 1, soft.1),
@@ -757,15 +870,18 @@ fn the_hardware_cursor_column_is_display_width_not_char_count() {
     assert_eq!(text.chars().count(), 10, "10 chars…");
 
     let mut app = App::new(TestBackend::new(60, 24), UiTheme::dark()).unwrap();
-    app.editor_mut().set_show_hardware_cursor(true);
     type_text(&mut app, &text);
+    // The drawn caret is read with the flag OFF: with it on, TUI-172 drops it.
+    app.draw().unwrap();
+    let soft = caret_cell(&app).expect("the soft caret");
+    app.editor_mut().set_show_hardware_cursor(true);
     app.draw().unwrap();
 
     let pos = app.terminal().backend().cursor_position();
     assert_eq!(pos.x, 7, "…and 4 + 2 + 1 = 7 COLUMNS: {pos:?}");
     assert_eq!(
         (pos.y, pos.x),
-        caret_cell(&app).expect("the soft caret"),
+        soft,
         "the hardware cursor and the reverse-video cell must be the same cell — that is the whole \
          point of computing the column in display units"
     );

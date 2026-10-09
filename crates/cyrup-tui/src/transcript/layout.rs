@@ -262,13 +262,16 @@ pub(super) fn text_lines(
     out
 }
 
-/// The tool block's shell: `new Box(1, 1, <state bg>)` (tool-execution.ts:68).
+/// The tool block's shell: `new Box(1, 1, <state bg>)` (tool-execution.ts:68), whose paddingX
+/// `updateDisplay` resets to `outputPad` (`renderContainer.setPaddingX(this.outputPad)`,
+/// `tool-execution.ts:283` @f1b2e77f5; TUI-175).
 pub(super) fn finalize_block(
     lines: Vec<Line<'static>>,
     width: usize,
+    output_pad: usize,
     bg: Style,
 ) -> Vec<Line<'static>> {
-    box_lines(lines, width, 1, 1, bg)
+    box_lines(lines, width, output_pad, 1, bg)
 }
 
 // --- per-tool renderers ------------------------------------------------------------------------

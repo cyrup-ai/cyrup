@@ -93,6 +93,7 @@ mod footer_subscription;
 mod fork_selector;
 mod fullscreen_chrome;
 mod fullscreen_document;
+mod fullscreen_home_end;
 mod fullscreen_leave;
 mod fullscreen_scrollback;
 mod fullscreen_settings;

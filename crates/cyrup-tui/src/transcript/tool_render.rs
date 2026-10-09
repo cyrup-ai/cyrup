@@ -18,14 +18,20 @@ pub(super) const EXPAND_KEY: &str = "ctrl+o";
 /// (`toolPendingBg`/`toolSuccessBg`/`toolErrorBg`, tool-execution.ts:253-258) — the bg is the state
 /// affordance (Pi has no gear/check glyph), preceded by an untinted blank (the component's `Spacer(1)`,
 /// tool-execution.ts:63).
+///
+/// TUI-175 — `output_pad` is the `outputPad` setting. pi threads it into the block's shell
+/// (`renderContainer.setPaddingX(this.outputPad)` / `this.contentText.setPaddingX(this.outputPad)`,
+/// `components/tool-execution.ts:283`, `:335` @f1b2e77f5) and into the built-in `edit` component
+/// (`buildEditCallComponent`'s `component.setPaddingX(outputPad)`, `core/tools/renderers/edit.ts:139`).
 pub(crate) fn tool_lines(
     run: &ToolRun,
     expanded: bool,
     width: usize,
+    output_pad: usize,
     theme: &UiTheme,
     images: ImageOpts,
 ) -> Vec<Line<'static>> {
-    tool_block(run, expanded, width, theme, images).lines
+    tool_block(run, expanded, width, output_pad, theme, images).lines
 }
 
 /// One tool block's rows, and where a left click on it toggles it.
@@ -47,6 +53,7 @@ pub(crate) fn tool_block(
     run: &ToolRun,
     expanded: bool,
     width: usize,
+    output_pad: usize,
     theme: &UiTheme,
     images: ImageOpts,
 ) -> ToolBlock {
@@ -64,12 +71,12 @@ pub(crate) fn tool_block(
         || run.live_call.is_some()
         || run.live_result.is_some();
     // `getRenderShell()` (see below) is asked FIRST because a renderer's component is laid out at the
-    // width its container gives it: the default shell's `Box(1, 1)` leaves two columns for padding,
-    // the `"self"` container none.
+    // width its container gives it: the default shell's `Box(outputPad, 1)` leaves `2 * outputPad`
+    // columns for padding (`tool-execution.ts:283` @f1b2e77f5), the `"self"` container none.
     let shell = render_shell(run, builtin);
     let content_width = match shell {
         ToolRenderKind::SelfRendered => width,
-        ToolRenderKind::Default => width.saturating_sub(2),
+        ToolRenderKind::Default => width.saturating_sub(output_pad * 2),
     }
     .max(1);
     let generic = builtin.is_none() && !has_definition;
@@ -153,25 +160,33 @@ pub(crate) fn tool_block(
     // `hasRendererDefinition()` half is implied: `shell` can only be `SelfRendered` through a
     // definition or the built-in table, each of which satisfies it.
     if shell == ToolRenderKind::SelfRendered {
-        return self_rendered_block(run, builtin, block, inline, width, theme, images);
+        return self_rendered_block(
+            run, builtin, block, inline, width, output_pad, theme, images,
+        );
     }
     // The DEFAULT shell: `this.contentBox = new Box(1, 1, bgFn)` (`:71`), tinted by execution
     // state (`updateDisplay`, `:265-269` — `toolPendingBg` while partial, else `toolErrorBg` /
-    // `toolSuccessBg`), preceded by the untinted `Spacer(1)` the constructor adds (`:66`).
+    // `toolSuccessBg`), preceded by the untinted `Spacer(1)` the constructor adds (`:66`). Its
+    // paddingX is reset to `outputPad` on every update (`tool-execution.ts:283`, and the
+    // no-definition `Text`'s at `:335` @f1b2e77f5; TUI-175).
     let bg = theme.tool_bg_style(Style::default(), run.done, run.is_error);
     let mut out = vec![Line::default()];
-    let boxed = finalize_block(block, width, bg);
+    let boxed = finalize_block(block, width, output_pad, bg);
     let boxed_len = boxed.len();
     out.extend(boxed);
     if inline {
         out.extend(image_raster_lines(run, width, images.width_cells));
     }
-    // Rows: the `Spacer(1)`, then the `Box(1, 1)` — a padding row, the content, a padding row.
+    // Rows: the `Spacer(1)`, then the `Box(outputPad, 1)` — a padding row, the content, a padding
+    // row; the content box is `outputPad` columns in from either edge.
     let hit = if generic {
         // No definition: the `Text` itself is the region child of a bare container, padding and all.
         (boxed_len > 0).then(|| ToggleRegion::new(1..1 + boxed_len, 0..width))
     } else if boxed_len >= 3 {
-        Some(ToggleRegion::new(2..boxed_len, 1..width.saturating_sub(1)))
+        Some(ToggleRegion::new(
+            2..boxed_len,
+            output_pad..width.saturating_sub(output_pad),
+        ))
     } else {
         None
     };
@@ -222,20 +237,24 @@ fn render_shell(run: &ToolRun, builtin: Option<Builtin>) -> ToolRenderKind {
 /// **no** state tint, and no blank row when the renderers drew nothing. The tool owns its framing.
 ///
 /// The one built-in that declares `"self"` is `edit`, and its framing is the `EditCallRenderComponent`
-/// itself — a `Box(1, 1)` whose fill is `getEditHeaderBg(preview, settledError)` (`edit.ts:258-273`,
-/// applied at `:281`), which tests the PREVIEW first and never looks at `done`: a diff computed from
+/// itself — a `Box(outputPad, 1)` whose fill is `getEditHeaderBg(preview, settledError)`
+/// (`edit.ts:258-273`, applied at `:281`; the paddingX is `component.setPaddingX(outputPad)`,
+/// `core/tools/renderers/edit.ts:139` @f1b2e77f5, TUI-175), which tests the PREVIEW first and never looks at `done`: a diff computed from
 /// the streamed arguments greens the block while the call is still pending, and a preview that
 /// failed reds it (X8). cyrup's built-in `edit` renderers push bare rows, so that component's box
 /// is drawn here, around them — the same rows the shell tail used to paint under the `edit`
 /// special case, now attributed to the renderer that owns them. An extension renderer that takes
 /// `edit` over (`rendered_call`/`rendered_result`) replaces the component, box and all, exactly as
 /// `toolDefinition.renderCall ?? builtInToolDefinition.renderCall` (`:84-92`) would.
+// Eight: the block's own inputs plus the shared per-paint ones `tool_block` already took apart.
+#[allow(clippy::too_many_arguments)]
 fn self_rendered_block(
     run: &ToolRun,
     builtin: Option<Builtin>,
     block: Vec<Line<'static>>,
     inline: bool,
     width: usize,
+    output_pad: usize,
     theme: &UiTheme,
     images: ImageOpts,
 ) -> ToolBlock {
@@ -246,7 +265,7 @@ fn self_rendered_block(
         && run.live_result.is_none();
     let content: Vec<Line<'static>> = if own_edit_component {
         let bg = theme.edit_bg_style(Style::default(), edit_header_preview(run), run.is_error);
-        box_lines(block, width, 1, 1, bg)
+        box_lines(block, width, output_pad, 1, bg)
     } else {
         // `Container.render(width)`: each child at the full width, wrapped as `Text` wraps
         // (`text.ts:60-87`), with nothing added around it.

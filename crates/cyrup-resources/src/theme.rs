@@ -162,17 +162,60 @@ fn validate_color_record(prefix: &str, value: &serde_json::Value, other: &mut Ve
     }
 }
 
+/// The keys a theme document may carry at the top level (`ThemeJsonSchema`,
+/// `theme-schema.ts:52-90` @f1b2e77f5, `additionalProperties: false`).
+const THEME_TOP_LEVEL_KEYS: [&str; 6] =
+    ["$schema", "name", "appearance", "vars", "colors", "export"];
+
+/// The keys the `export` object may carry (`theme-schema.ts:71-83` @f1b2e77f5,
+/// `additionalProperties: false`).
+const THEME_EXPORT_KEYS: [&str; 3] = ["pageBg", "cardBg", "infoBg"];
+
+/// Pi 1.1's closed objects (`additionalProperties: false` on the top level, `colors` and `export`,
+/// `theme-schema.ts:44-90` @f1b2e77f5): push TypeBox 1.3's errors for every key of `obj` outside
+/// `allowed`. TypeBox checks each extra key against the `false` schema first (`schema is false` at
+/// `<path>/<key>`), then reports the object once (`must not have additional properties` at
+/// `<path>`, `/` for the document root), so pi's "Other errors" name both the object and the key.
+fn push_unknown_keys(
+    path: &str,
+    obj: &serde_json::Map<String, serde_json::Value>,
+    allowed: impl Fn(&str) -> bool,
+    other: &mut Vec<String>,
+) {
+    let mut any = false;
+    for key in obj.keys().filter(|k| !allowed(k)) {
+        other.push(format!("  - {path}/{key}: schema is false"));
+        any = true;
+    }
+    if any {
+        let object = if path.is_empty() { "/" } else { path };
+        other.push(format!("  - {object}: must not have additional properties"));
+    }
+}
+
+/// Whether `token` is a `colors` key pi's schema declares: a required token or one of the optional
+/// tokens with a fallback (`THEME_TOKENS`, `theme-tokens.ts` @f1b2e77f5).
+fn is_known_color_token(token: &str) -> bool {
+    REQUIRED_COLOR_TOKENS.contains(&token)
+        || OPTIONAL_TOKEN_FALLBACKS
+            .iter()
+            .any(|(optional, _)| *optional == token)
+}
+
 /// Collect the schema violations Pi reports together (theme.ts:514-548): the set of missing
-/// required `colors` tokens, and the "Other errors" list of malformed color values across
-/// `vars`/`colors`/`export`. Iteration order mirrors the schema declaration order (`vars` →
-/// `colors` (required tokens, then extras) → `export`) so the "Other errors" lines come out in a
-/// stable, Pi-like order.
+/// required `colors` tokens, and the "Other errors" list of unknown keys (TUI-178: pi 1.1 closes
+/// the top level, `colors` and `export`) and malformed color values across
+/// `vars`/`colors`/`export`. Iteration order mirrors TypeBox's (unknown top-level keys, then each
+/// property in declaration order: `vars` → `colors` (unknown keys, required tokens, optional
+/// tokens) → `export`) so the "Other errors" lines come out in a stable, Pi-like order.
 fn collect_theme_errors(
     value: &serde_json::Value,
     missing: &mut Vec<String>,
     other: &mut Vec<String>,
 ) {
     let Some(obj) = value.as_object() else { return };
+
+    push_unknown_keys("", obj, |k| THEME_TOP_LEVEL_KEYS.contains(&k), other);
 
     // `appearance: Type.Optional(Type.Union([Type.Literal("dark"), Type.Literal("light")]))`
     // (`theme-schema.json:17-21`).
@@ -193,7 +236,8 @@ fn collect_theme_errors(
                     missing.push(token.to_string());
                 }
             }
-            // Required tokens first (schema order), then any extra keys.
+            push_unknown_keys("/colors", colors, is_known_color_token, other);
+            // Required tokens first (schema order), then the optional ones.
             for token in REQUIRED_COLOR_TOKENS {
                 if let Some(val) = colors.get(token)
                     && let Some(msg) = bad_color(val)
@@ -203,6 +247,7 @@ fn collect_theme_errors(
             }
             for (k, val) in colors {
                 if !REQUIRED_COLOR_TOKENS.contains(&k.as_str())
+                    && is_known_color_token(k)
                     && let Some(msg) = bad_color(val)
                 {
                     other.push(format!("  - /colors/{k}: {msg}"));
@@ -217,8 +262,13 @@ fn collect_theme_errors(
         }
     }
 
-    if let Some(export) = obj.get("export") {
-        validate_color_record("/export", export, other);
+    if let Some(export) = obj.get("export").and_then(|e| e.as_object()) {
+        push_unknown_keys("/export", export, |k| THEME_EXPORT_KEYS.contains(&k), other);
+        for key in THEME_EXPORT_KEYS {
+            if let Some(msg) = export.get(key).and_then(bad_color) {
+                other.push(format!("  - /export/{key}: {msg}"));
+            }
+        }
     }
 }
 

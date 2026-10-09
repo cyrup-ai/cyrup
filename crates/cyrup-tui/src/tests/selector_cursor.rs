@@ -26,7 +26,8 @@ use cyrup_session_svc::{UiKind, UiRequest};
 use ratatui::backend::TestBackend;
 use ratatui::style::Modifier;
 
-use crate::{App, SelectorKind, UiTheme};
+use crate::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crate::{App, InputEvent, SelectorKind, UiTheme};
 
 /// The first reverse-video cell in the rendered buffer, scanning bottom-up exactly as
 /// `caret_cell`/`extractCursorPosition` do — i.e. where the caret actually is on screen.
@@ -70,14 +71,16 @@ fn app_with_input_dialog() -> App<TestBackend> {
 }
 
 /// The regression: with the hardware cursor enabled, the terminal cursor is shown AND parked on the
-/// dialog's caret cell — not left wherever the last frame put it.
+/// dialog's caret cell — not left wherever the last frame put it. The caret cell is read from a frame
+/// drawn with the flag OFF: with it on, TUI-172 drops the drawn caret.
 #[test]
 fn an_input_dialogs_caret_gets_the_hardware_cursor() {
     let mut app = app_with_input_dialog();
+    app.draw().unwrap();
+    let caret = caret_in_buffer(&app).expect("the input dialog draws a reverse-video caret");
+
     app.state_mut().editor.set_show_hardware_cursor(true);
     app.draw().unwrap();
-
-    let caret = caret_in_buffer(&app).expect("the input dialog draws a reverse-video caret");
     let backend = app.terminal().backend();
     assert!(
         backend.cursor_visible(),
@@ -141,4 +144,67 @@ fn a_list_selector_without_an_input_shows_no_hardware_cursor() {
         "a confirm dialog has no Input and no caret"
     );
     assert!(!app.terminal().backend().cursor_visible());
+}
+
+// ---------------------------------------------------------------------- TUI-172 ----------------
+
+fn key(code: KeyCode) -> InputEvent {
+    InputEvent::Key(KeyEvent::new(code, KeyModifiers::NONE))
+}
+
+/// Pi 1.1 `tui-render.test.ts` "draws the focused fake cursor in reverse video and omits it when the
+/// hardware cursor is shown" (`1cedd3272`), for a selector's text `Input`: `Input` wraps its caret
+/// in `renderFakeCursor` (`input.ts:491` @f1b2e77f5) and `resolveFakeCursors` (`tui.ts:1478-1484`)
+/// drops the one after `CURSOR_MARKER` when `showHardwareCursor` is on. Before TUI-172 the dialog
+/// kept its reverse-video caret under the terminal cursor: two carets on one cell.
+#[test]
+fn the_hardware_cursor_replaces_the_drawn_caret_of_a_selector_input() {
+    let mut app = app_with_input_dialog();
+    for c in "abc".chars() {
+        app.handle_input(&key(KeyCode::Char(c)));
+    }
+    app.handle_input(&key(KeyCode::Left));
+    app.handle_input(&key(KeyCode::Left));
+
+    // Flag off: the drawn caret is on the typed position (`b`), and no terminal cursor shows.
+    app.draw().unwrap();
+    let caret = caret_in_buffer(&app).expect("flag off: the dialog draws its caret");
+    assert_eq!(
+        app.terminal()
+            .backend()
+            .buffer()
+            .cell(caret)
+            .unwrap()
+            .symbol(),
+        "b",
+        "two Lefts from the end of `abc`"
+    );
+    assert!(!app.terminal().backend().cursor_visible());
+
+    // Flag on: the terminal cursor sits on that same cell, which no longer carries REVERSED.
+    app.state_mut().editor.set_show_hardware_cursor(true);
+    app.draw().unwrap();
+    assert_eq!(
+        caret_in_buffer(&app),
+        None,
+        "TUI-172: with showHardwareCursor on, the focused input's drawn caret is dropped"
+    );
+    let backend = app.terminal().backend();
+    assert!(backend.cursor_visible());
+    let pos = backend.cursor_position();
+    assert_eq!(
+        (pos.x, pos.y),
+        caret,
+        "the hardware cursor still lands on the typed position"
+    );
+    assert_eq!(
+        backend.buffer().cell(caret).unwrap().symbol(),
+        "b",
+        "only the reverse video goes; the character under the caret stays"
+    );
+
+    // And back off: the drawn caret returns where it was.
+    app.state_mut().editor.set_show_hardware_cursor(false);
+    app.draw().unwrap();
+    assert_eq!(caret_in_buffer(&app), Some(caret));
 }

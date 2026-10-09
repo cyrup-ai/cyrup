@@ -114,7 +114,8 @@ pub(crate) fn settings_rows(
         // row looked like a no-op. Pi renders every row from the same resolved value the runtime
         // uses; it has no second, env-blind read path.
         SettingRow::toggle("showHardwareCursor", "Show hardware cursor", eff.show_hardware_cursor(env))
-            .with_description("Show the terminal cursor while still positioning it for IME support"),
+            // TUI-172: pi 1.1's text (`settings-selector.ts:812` @f1b2e77f5), "Pi's" → "cyrup's".
+            .with_description("Use the terminal cursor instead of cyrup's drawn cursor"),
         SettingRow::toggle("terminal.clearOnShrink", "Clear on shrink", eff.clear_on_shrink(env))
             .with_description("Clear empty rows when content shrinks (may cause flicker)"),
         SettingRow::choice(
@@ -132,9 +133,8 @@ pub(crate) fn settings_rows(
             eff.output_pad().to_string(),
             choices(&["0", "1"]),
         )
-        .with_description(
-            "Horizontal padding for user messages, assistant messages, and thinking",
-        ),
+        // TUI-175 — `settings-selector.ts:831` @f1b2e77f5.
+        .with_description("Horizontal padding for messages, tool output, and command output"),
         SettingRow::choice(
             "autocompleteMaxVisible",
             "Autocomplete max items",

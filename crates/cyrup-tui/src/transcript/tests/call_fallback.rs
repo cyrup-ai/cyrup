@@ -258,7 +258,7 @@ fn tool_block_passes_its_expanded_state_to_the_call_fallback() {
     let run = view.active_tools().last().cloned().expect("a run");
     let theme = UiTheme::dark();
     let rows = |expanded| -> Vec<String> {
-        tool_block(&run, expanded, 80, &theme, ImageOpts::default())
+        tool_block(&run, expanded, 80, 1, &theme, ImageOpts::default())
             .lines
             .iter()
             .map(text)

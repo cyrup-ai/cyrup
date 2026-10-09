@@ -374,3 +374,264 @@ fn the_migrated_credential_notice_renders_first_and_verbatim_in_the_transcript()
         "the notice must render in the warning colour (`theme.fg(\"warning\", …)`)"
     );
 }
+
+// --- TUI-175: `outputPad` reaches every transcript block -----------------------------------------
+//
+// pi `18336987a` (#10557) threads `outputPad` into every chat component at f1b2e77f5: the tool
+// shell (`components/tool-execution.ts:283`, `:335`), the built-in `edit` component
+// (`core/tools/renderers/edit.ts:139`), `BashExecutionComponent` (`bash-execution.ts:141`, `:149`,
+// `:159`, `:205`), the compaction, branch and skill boxes (`super(outputPad, 1, …)`), the default
+// custom-message box (`custom-message.ts:90`) and the renderer-failed custom-entry box
+// (`custom-entry.ts:56`). Ported from `packages/coding-agent/test/output-pad.test.ts`, whose cases
+// are the bash block, a defined tool, a tool with no definition, the self-rendered edit result and
+// the compaction summary; this extends the table to every block the row names.
+
+/// The render width `output-pad.test.ts` uses (`component.render(60)`).
+const PAD_WIDTH: usize = 60;
+
+/// A settled tool run, as the transcript holds it.
+fn settled_tool(
+    name: &str,
+    args: Value,
+    is_error: bool,
+    text: &str,
+    definition: Option<ToolRenderKind>,
+) -> Entry {
+    let mut view = TranscriptView::new();
+    view.push_tool_start_defined(name, Some("id".into()), args, None, definition);
+    view.push_tool_end_rendered(
+        name,
+        Some("id"),
+        is_error,
+        Some(serde_json::json!({ "content": [{ "type": "text", "text": text }], "details": {} })),
+        None,
+        None,
+    );
+    Entry::Tool(view.active_tools()[0].clone())
+}
+
+type MakeEntry = Box<dyn Fn(&str) -> Entry>;
+
+/// One block per case the Verify line names; the closure's argument is the block's own body text,
+/// so the same table drives the short-text comparison and the long-text width check. The `bool` is
+/// the live `toolOutputExpanded` the block is painted under.
+fn pad_cases() -> Vec<(&'static str, bool, MakeEntry)> {
+    vec![
+        (
+            "built-in bash tool row",
+            false,
+            Box::new(|t: &str| {
+                settled_tool(
+                    "bash",
+                    serde_json::json!({ "command": "pwd" }),
+                    false,
+                    t,
+                    None,
+                )
+            }),
+        ),
+        (
+            "defined tool with no renderers",
+            false,
+            Box::new(|t: &str| {
+                settled_tool(
+                    "custom_tool",
+                    serde_json::json!({}),
+                    false,
+                    t,
+                    Some(ToolRenderKind::Default),
+                )
+            }),
+        ),
+        (
+            "tool with no definition",
+            false,
+            Box::new(|t: &str| settled_tool("custom_tool", serde_json::json!({}), false, t, None)),
+        ),
+        (
+            "self-rendered edit result",
+            false,
+            Box::new(|t: &str| {
+                settled_tool(
+                    "edit",
+                    serde_json::json!({
+                        "path": "file.txt",
+                        "edits": [{ "oldText": "old", "newText": "new" }],
+                    }),
+                    true,
+                    t,
+                    None,
+                )
+            }),
+        ),
+        (
+            "`!` bash block",
+            false,
+            Box::new(|t: &str| {
+                let mut b = BashExecution::new("pwd", false);
+                b.append_output(t);
+                b.set_complete(Some(1), false, false, None);
+                Entry::Bash(b)
+            }),
+        ),
+        (
+            "collapsed compaction summary",
+            false,
+            Box::new(|t: &str| Entry::CompactionSummary {
+                tokens_before: 10,
+                summary: t.to_string(),
+            }),
+        ),
+        (
+            "expanded compaction summary",
+            true,
+            Box::new(|t: &str| Entry::CompactionSummary {
+                tokens_before: 10,
+                summary: t.to_string(),
+            }),
+        ),
+        (
+            "collapsed branch summary",
+            false,
+            Box::new(|t: &str| Entry::BranchSummary {
+                summary: t.to_string(),
+            }),
+        ),
+        (
+            "expanded branch summary",
+            true,
+            Box::new(|t: &str| Entry::BranchSummary {
+                summary: t.to_string(),
+            }),
+        ),
+        (
+            "collapsed skill block",
+            false,
+            Box::new(|t: &str| Entry::SkillInvocation {
+                name: "demo".into(),
+                content: t.to_string(),
+                lead_spacer: true,
+            }),
+        ),
+        (
+            "expanded skill block",
+            true,
+            Box::new(|t: &str| Entry::SkillInvocation {
+                name: "demo".into(),
+                content: t.to_string(),
+                lead_spacer: true,
+            }),
+        ),
+        (
+            "default custom message",
+            false,
+            Box::new(|t: &str| Entry::Custom {
+                label: "note".into(),
+                body: t.to_string(),
+                rendered: Rendered::None,
+            }),
+        ),
+        (
+            "renderer-failed custom entry",
+            false,
+            Box::new(|t: &str| Entry::Custom {
+                label: "note".into(),
+                body: String::new(),
+                rendered: Rendered::Failed(t.to_string()),
+            }),
+        ),
+    ]
+}
+
+/// `output-pad.test.ts`'s `renderLines`: text without trailing fill, keeping only rows that carry a
+/// word character, `$` or `(` (so blank rows, tinted padding rows and full-width rules drop out).
+fn pad_rows(entry: &Entry, pad: usize, expanded: bool) -> Vec<String> {
+    let opts = ImageOpts {
+        tools_expanded: expanded,
+        ..ImageOpts::default()
+    };
+    entry_lines(entry, &UiTheme::dark(), PAD_WIDTH, pad, opts)
+        .iter()
+        .map(|l| line_text(l).trim_end().to_string())
+        .filter(|l| l.chars().any(|c| c.is_alphanumeric() || "_$(".contains(c)))
+        .collect()
+}
+
+/// The port of `output-pad.test.ts`'s one assertion, per block: at `outputPad = 0` no content row
+/// starts with a space, and at `outputPad = 1` every row is exactly the `0` row shifted one column.
+#[test]
+fn every_transcript_block_renders_flush_at_output_pad_zero_and_shifted_at_one() {
+    for (name, expanded, make) in pad_cases() {
+        let entry = make("ok");
+        let flush = pad_rows(&entry, 0, expanded);
+        assert!(!flush.is_empty(), "{name}: rendered nothing");
+        let indented: Vec<&String> = flush.iter().filter(|l| l.starts_with(' ')).collect();
+        assert!(
+            indented.is_empty(),
+            "{name}: rows still inset at outputPad 0: {indented:?} in {flush:?}"
+        );
+        let padded = pad_rows(&entry, 1, expanded);
+        let shifted: Vec<String> = flush.iter().map(|l| format!(" {l}")).collect();
+        assert_eq!(
+            padded, shifted,
+            "{name}: outputPad 1 is not outputPad 0 shifted by one"
+        );
+    }
+}
+
+/// "…and fill the width": a body token longer than the pane hard-wraps at the block's content
+/// width, `width - 2 * outputPad`. At `0` a row of it starts at column 0 and runs to the last
+/// column; at `1` the same row is inset one column on each side, which is the pre-TUI-175 output.
+#[test]
+fn every_transcript_block_uses_the_full_width_at_output_pad_zero() {
+    let token = "x".repeat(PAD_WIDTH * 2);
+    let full = "x".repeat(PAD_WIDTH);
+    let inset = format!(" {}", "x".repeat(PAD_WIDTH - 2));
+    for (name, expanded, make) in pad_cases() {
+        let entry = make(&token);
+        let flush = pad_rows(&entry, 0, expanded);
+        let padded = pad_rows(&entry, 1, expanded);
+        // The collapsed summaries and the collapsed skill block draw no body, so the flush/shifted
+        // comparison above is all there is to check for them.
+        if !flush.iter().any(|l| l.contains("xxxx")) {
+            assert!(
+                name.starts_with("collapsed"),
+                "{name}: body missing: {flush:?}"
+            );
+            continue;
+        }
+        assert!(
+            flush.contains(&full),
+            "{name}: no row fills all {PAD_WIDTH} columns at outputPad 0: {flush:?}"
+        );
+        assert!(
+            padded.contains(&inset),
+            "{name}: outputPad 1 no longer insets the body one column each side: {padded:?}"
+        );
+        assert!(
+            padded.iter().all(|l| l.starts_with(' ')),
+            "{name}: a row lost its outputPad 1 margin: {padded:?}"
+        );
+    }
+}
+
+/// The live region paints its tool rows and `!` block at the view's `outputPad` too, not only the
+/// committed entries (`onOutputPadChange` calls `setOutputPad` on every child of the chat AND the
+/// pending containers, `interactive-mode.ts:5079-5088` @f1b2e77f5).
+#[test]
+fn the_live_tool_row_and_bash_block_follow_the_views_output_pad() {
+    let theme = UiTheme::dark();
+    let mut view = TranscriptView::new();
+    view.push_tool_start("bash", serde_json::json!({ "command": "pwd" }));
+    view.start_bash("live", false, None, None);
+    let rows = |view: &mut TranscriptView| -> Vec<String> {
+        view.lines(PAD_WIDTH, &theme)
+            .iter()
+            .map(|l| line_text(l).trim_end().to_string())
+            .filter(|l| l.contains("$ pwd") || l.contains("$ live"))
+            .collect()
+    };
+    assert_eq!(rows(&mut view), vec![" $ pwd", " $ live"]);
+    view.set_output_pad(0);
+    assert_eq!(rows(&mut view), vec!["$ pwd", "$ live"]);
+}

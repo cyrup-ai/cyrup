@@ -49,7 +49,7 @@ fn run_lines(
     }
     let run = view.active_tools()[0].clone();
     let mut out = Vec::new();
-    out.extend(tool_lines(&run, expanded, 100, &theme, opts));
+    out.extend(tool_lines(&run, expanded, 100, 1, &theme, opts));
     out
 }
 
@@ -474,7 +474,7 @@ fn x8_edit_tint_follows_the_preview_not_done() {
     view.set_edit_preview(Some("call-1"), Ok("@@\n-old\n+new".to_string()));
     let run = view.active_tools()[0].clone();
     assert!(!run.done, "still pending — a permission prompt is up");
-    let lines = tool_lines(&run, false, 60, &theme, ImageOpts::default());
+    let lines = tool_lines(&run, false, 60, 1, &theme, ImageOpts::default());
     let success = theme.tool_bg_style(Style::default(), true, false);
     let pending = theme.tool_bg_style(Style::default(), false, false);
     assert_ne!(
@@ -497,7 +497,7 @@ fn x8_edit_tint_follows_the_preview_not_done() {
     v2.set_edit_preview(Some("c"), Err("no match for oldText".to_string()));
     let r2 = v2.active_tools()[0].clone();
     assert_eq!(
-        tool_lines(&r2, false, 60, &theme, ImageOpts::default())[1].style,
+        tool_lines(&r2, false, 60, 1, &theme, ImageOpts::default())[1].style,
         theme.tool_bg_style(Style::default(), false, true),
         "a failed preview reds it (edit.ts:245-246)"
     );
@@ -508,7 +508,7 @@ fn x8_edit_tint_follows_the_preview_not_done() {
     v3.push_tool_start("edit", json!({ "path": "a.rs" }));
     let r3 = v3.active_tools()[0].clone();
     assert_eq!(
-        tool_lines(&r3, false, 60, &theme, ImageOpts::default())[1].style,
+        tool_lines(&r3, false, 60, 1, &theme, ImageOpts::default())[1].style,
         pending
     );
 

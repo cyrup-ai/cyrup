@@ -142,9 +142,12 @@ fn paint_dock_inner(frame: &mut Frame, state: &mut AppState, regions: &Regions, 
         // terminal cursor wherever the previous frame put it, which is what an IME composes
         // against and what a screen reader follows. [`crate::selector::caret_cell`] is the same
         // scan over the rendered CELLS; see its doc for why the reversed caret is the marker.
+        // TUI-172: the scan also drops the drawn caret it found, as Pi 1.1's `resolveFakeCursors`
+        // removes the fake cursor right after `CURSOR_MARKER` (`tui.ts:1478-1484` @f1b2e77f5), so
+        // the terminal cursor is the only caret.
         if show_hardware_cursor {
             // Bound the buffer borrow to this statement so `set_cursor_position` can take `frame`.
-            let caret = crate::selector::caret_cell(frame.buffer_mut(), slot_area);
+            let caret = crate::selector::take_caret_cell(frame.buffer_mut(), slot_area);
             if let Some(pos) = caret {
                 frame.set_cursor_position(pos);
             }
@@ -153,7 +156,11 @@ fn paint_dock_inner(frame: &mut Frame, state: &mut AppState, regions: &Regions, 
         // A long inline op (e.g. `/share`'s gist creation) owns the slot with a `BorderedLoader`.
         loader.render(frame, slot_area, &state.theme, state.loader_tick);
     } else {
-        state.editor.render(frame, slot_area, &state.theme);
+        // TUI-172: under an overlay the editor is not the focused component, so it keeps its drawn
+        // caret and places no hardware cursor (Pi: no `CURSOR_MARKER` ⇒ no dropped fake cursor).
+        state
+            .editor
+            .render_in_slot(frame, slot_area, &state.theme, state.overlays.is_empty());
         if let Some(ac) = state.editor.autocomplete() {
             // E14: the popup lives INSIDE the editor's padding frame. Pi renders it at
             // `contentWidth` (= `width - paddingX * 2`) and prefixes the same `leftPadding` every

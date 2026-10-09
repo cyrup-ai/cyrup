@@ -20,9 +20,13 @@ use super::overlay::{OverlayKey, OverlayKeyCode};
 /// One `KeyId` spec, parsed from the grammar pi's `matchesKey` accepts (`"ctrl+c"`, `"up"`,
 /// `"return"`, `"pageUp"`).
 ///
-/// Mirrors `cyrup-tui`'s `Key::parse` token for token (`crates/cyrup-tui/src/keymap.rs`), including
-/// the `enter`/`return` and `esc`/`escape` aliases, over [`OverlayKeyCode`] rather than crossterm's
-/// `KeyCode`. Pi source: `pi/packages/tui/src/keys.ts` `parseKeyId` / `matchesKey`.
+/// Shares `cyrup-tui`'s `Key::parse` token table (`crates/cyrup-tui/src/keymap.rs`), including the
+/// `enter`/`return` and `esc`/`escape` aliases, over [`OverlayKeyCode`] rather than crossterm's
+/// `KeyCode`, but still uses the pre-pi-1.1 grammar: split on every `+`, skip empty tokens, let the
+/// last key token win and OR the modifiers together. So `"+"` and `"ctrl++"` name no key here,
+/// `"a+b"` parses as `b` and `"ctrl+ctrl+a"` as ctrl+a. pi 1.1's stricter `parseKeyId` grammar
+/// (TUI-177) lives in `Key::parse` only. Pi source: `pi/packages/tui/src/keys.ts` `parseKeyId` /
+/// `matchesKey`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct KeySpec {
     /// The key itself.

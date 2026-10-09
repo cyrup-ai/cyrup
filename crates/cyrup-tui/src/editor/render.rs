@@ -107,11 +107,17 @@ pub(super) fn style_zones(
 /// whitespace (GB3's `CR LF` is the sole exception and the buffer cannot contain `\r`). The `after`
 /// slice is still clamped to the zone, which costs one `saturating_sub` and makes the property
 /// enforced rather than merely argued.
+///
+/// `cursor_style` is the drawn caret's style, or `None` when the hardware cursor stands in for it
+/// (TUI-172). Then the caret grapheme keeps its zone's style, accent inside a command token: pi
+/// drops the fake cursor by deleting only its markers (`resolveFakeCursors`, `tui.ts:1478-1484`
+/// @f1b2e77f5), so the character under the terminal cursor keeps the styling around it. The
+/// end-of-line cell is a space outside every zone and stays `base`.
 pub(super) fn spans_for_segment(
     seg: &[char],
     zones: &[Option<(usize, usize, Style)>],
     cursor: Option<usize>,
-    cursor_style: Style,
+    cursor_style: Option<Style>,
     base: Style,
 ) -> Vec<Span<'static>> {
     let mut spans: Vec<Span<'static>> = Vec::new();
@@ -133,7 +139,7 @@ pub(super) fn spans_for_segment(
                 match tail.graphemes(true).next() {
                     Some(g) => {
                         let after_at = c.saturating_add(g.chars().count());
-                        spans.push(Span::styled(g.to_string(), cursor_style));
+                        spans.push(Span::styled(g.to_string(), cursor_style.unwrap_or(style)));
                         let after: String = seg
                             .iter()
                             .skip(after_at)
@@ -143,7 +149,7 @@ pub(super) fn spans_for_segment(
                             spans.push(Span::styled(after, style));
                         }
                     }
-                    None => spans.push(Span::styled(" ", cursor_style)),
+                    None => spans.push(Span::styled(" ", cursor_style.unwrap_or(base))),
                 }
             }
             None => {
@@ -159,7 +165,7 @@ pub(super) fn spans_for_segment(
     // takes the `None` arm there (`0 >= 0 && 0 < 0` is false) and emits nothing, so this push is the
     // caret's only producer for an empty buffer.
     if cursor == Some(seg.len()) {
-        spans.push(Span::styled(" ", cursor_style));
+        spans.push(Span::styled(" ", cursor_style.unwrap_or(base)));
     }
     if spans.is_empty() {
         // An empty visual line that is NOT the cursor's. Today's code pushes an empty `base` span
@@ -269,7 +275,33 @@ impl Component for InputEditor {
     /// Render the editor with **top + bottom rules only** (no side bars, no title) — Pi
     /// `editor.ts:476,517,575` (spec/tui/03 §3.1). The rule color flips to bash-green while the buffer
     /// starts with `!` (spec/tui/03 §7.1); otherwise it uses the border role, accented when focused.
+    ///
+    /// A bare `render` assumes the editor owns the input; the app's chrome calls
+    /// [`InputEditor::render_in_slot`] instead so a floating overlay can withdraw the hardware cursor.
     fn render(&mut self, frame: &mut Frame, area: Rect, theme: &UiTheme) {
+        self.render_in_slot(frame, area, theme, true);
+    }
+}
+
+impl InputEditor {
+    /// [`Component::render`] with the caller's say over whether the editor holds input focus at the
+    /// TUI level: `owns_input` is false while a floating overlay draws over the live region and
+    /// captures keys (`app/render.rs`, the same gate the selector slot uses).
+    ///
+    /// **TUI-172 — one caret, never two.** Pi 1.1 (`1cedd3272`) wraps the drawn caret in
+    /// `renderFakeCursor` (`editor.ts:591,596` @f1b2e77f5), and `TUI.resolveFakeCursors`
+    /// (`tui.ts:1478-1484`) drops the fake cursor that directly follows `CURSOR_MARKER` when
+    /// `showHardwareCursor` is on, so the terminal's own cursor is the only caret; every other fake
+    /// cursor still resolves to reverse video. `CURSOR_MARKER` is emitted only while focused
+    /// (`editor.ts:570`), so an unfocused editor keeps its drawn caret (E13 below). Here the marker is
+    /// the `set_cursor_position` call, and both decisions hang off the one `hardware_caret` flag.
+    pub fn render_in_slot(
+        &mut self,
+        frame: &mut Frame,
+        area: Rect,
+        theme: &UiTheme,
+        owns_input: bool,
+    ) {
         // Record the layout width so vertical (visual-line) motion wraps the same way it is drawn.
         // The editor has no side borders; one column is reserved for the end-of-line cursor cell
         // (`editor.ts:471` `layout_width = content_width - 1`) — unless `editorPaddingX` gave the
@@ -314,7 +346,9 @@ impl Component for InputEditor {
         // the right edge) while rows 1..n started two columns to its left — a permanent ragged left
         // edge. Every row now starts flush at `leftPadding`, exactly as `:578` does.
         let base = theme.base_style();
-        let cursor_style = base.add_modifier(Modifier::REVERSED);
+        let hardware_caret = owns_input && self.show_hardware_cursor && self.focused;
+        // `None`: the hardware cursor is the caret, so the grapheme under it keeps its zone style.
+        let cursor_style = (!hardware_caret).then(|| base.add_modifier(Modifier::REVERSED));
         // Expand each LOGICAL line into its wrapped VISUAL lines at `view_width` (`editor.ts:1690`
         // `build_visual_line_map`, the same primitive vertical motion uses) and emit one ratatui
         // `Line` per visual line — so text past the width flows onto the next row instead of clipping
@@ -442,9 +476,9 @@ impl Component for InputEditor {
         // Pi hides the terminal's real cursor unless `showHardwareCursor` is on (`tui.ts:1659-1663`
         // `if (this.showHardwareCursor) showCursor() else hideCursor()`); ratatui's `Terminal::draw`
         // hides it for us whenever no position was set, so the gate is the call itself.
-        if self.show_hardware_cursor
-            && let Some((x, y)) = self.cursor_in(area)
-        {
+        // `cursor_in` is `Some` exactly when `focused`, so the cursor is placed precisely when the
+        // drawn caret above was dropped (TUI-172).
+        if hardware_caret && let Some((x, y)) = self.cursor_in(area) {
             frame.set_cursor_position((x, y));
         }
     }

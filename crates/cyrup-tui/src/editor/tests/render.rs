@@ -133,3 +133,60 @@ fn render_never_grows_a_row_for_a_clipped_ghost() {
         "the ghost must not grow the editor's row count: {row2:?}"
     );
 }
+
+/// TUI-172 under a command token. Pi drops the fake cursor by deleting only its markers
+/// (`resolveFakeCursors`, `line.replace(FOCUSED_FAKE_CURSOR, "$1$2")`, `tui.ts:1478-1484`
+/// @f1b2e77f5); `renderFakeCursor` only wraps the grapheme (`tui.ts:204-206`, `editor.ts:591`), so
+/// the character under the hardware cursor keeps whatever styling surrounds it. Here that is the
+/// accent of `/model`: with the hardware caret on, the caret grapheme stays accent and is not
+/// reversed; with it off, the drawn caret is reverse video as before.
+#[test]
+fn the_caret_grapheme_in_an_accented_token_keeps_the_accent_under_the_hardware_cursor() {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use ratatui::layout::Rect;
+    use ratatui::style::Modifier;
+
+    let theme = UiTheme::default();
+    let mut ed = InputEditor::new();
+    ed.set_text("/model ");
+    ed.move_home();
+    ed.move_right();
+    ed.move_right();
+    let area = Rect {
+        x: 0,
+        y: 0,
+        width: 40,
+        height: 4,
+    };
+    let accent_fg = theme.accent_style().fg.unwrap();
+
+    ed.set_show_hardware_cursor(true);
+    let mut term = Terminal::new(TestBackend::new(40, 4)).unwrap();
+    term.draw(|f| ed.render(f, area, &theme)).unwrap();
+    let cell = term.backend().buffer().cell((2, 1)).unwrap().clone();
+    assert_eq!(cell.symbol(), "o", "the caret sits on the `o` of `/model`");
+    assert_eq!(
+        cell.fg, accent_fg,
+        "hardware caret on: the grapheme under it keeps the token's accent"
+    );
+    assert!(
+        !cell.modifier.contains(Modifier::REVERSED),
+        "hardware caret on: no drawn caret"
+    );
+    assert_eq!(
+        term.backend().cursor_position(),
+        (2, 1).into(),
+        "and the terminal cursor is on that cell"
+    );
+
+    ed.set_show_hardware_cursor(false);
+    let mut term = Terminal::new(TestBackend::new(40, 4)).unwrap();
+    term.draw(|f| ed.render(f, area, &theme)).unwrap();
+    let cell = term.backend().buffer().cell((2, 1)).unwrap().clone();
+    assert_eq!(cell.symbol(), "o");
+    assert!(
+        cell.modifier.contains(Modifier::REVERSED),
+        "hardware caret off: the drawn caret is reverse video as before"
+    );
+}
