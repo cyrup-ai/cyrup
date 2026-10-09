@@ -172,6 +172,26 @@ impl<B: Backend> App<B> {
         self.refresh_argument_sources(session);
     }
 
+    /// TUI-141: the selector row's `subscription` flag for an extension provider. pi sets it from
+    /// `provider.auth.oauth?.isSubscription === true` (`interactive-mode.ts:5798`, `:5832`
+    /// @f1b2e77f5) over the composed registry, so a JSON-registered extension provider's adapted
+    /// `oauth` answers for its id. cyrup's option builders see only the built-in and live
+    /// providers' strategies ([`Self::build_login_inputs`]), which already carry `is_subscription`;
+    /// a JSON registration is known only through [`AppState::extension_oauth_subscription`]
+    /// (recorded by [`Self::refresh_auth_snapshot`]), so its entry overrides the row's flag here —
+    /// the same precedence [`Self::provider_uses_subscription`] gives it.
+    pub(crate) fn apply_extension_oauth_subscription(&self, options: &mut [LoginProviderOption]) {
+        for option in options {
+            if let Some(is_subscription) = self
+                .state
+                .extension_oauth_subscription
+                .get(option.id.as_str())
+            {
+                option.subscription = Some(*is_subscription);
+            }
+        }
+    }
+
     /// The provider registry the subscription predicate reads — pi's `this.models.getProvider(id)`
     /// (`model-runtime.ts:463`). Same source [`Self::build_login_inputs`] uses, so a test that
     /// substitutes the registry through [`Self::set_login_provider_source`] substitutes it here too.
@@ -346,7 +366,8 @@ impl<B: Backend> App<B> {
         auth_type: Option<AuthType>,
         initial_search: Option<String>,
     ) {
-        let options = cyrup_config::login::login_provider_options(inputs, auth_type);
+        let mut options = cyrup_config::login::login_provider_options(inputs, auth_type);
+        self.apply_extension_oauth_subscription(&mut options);
         if options.is_empty() {
             self.state.transcript.push_status(
                 cyrup_config::login::provider_selector_empty_message(auth_type),

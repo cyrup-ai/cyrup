@@ -616,3 +616,130 @@ async fn a_live_extension_provider_with_subscription_oauth_lights_the_marker() {
         "a live provider whose OAuth strategy is metered must not be labelled a subscription:\n{t}"
     );
 }
+
+// ================================================================ TUI-141
+
+/// Store `credential` for `id` in the session's auth store.
+async fn store_credential(
+    session: &Arc<AgentSession>,
+    id: &str,
+    credential: cyrup_config::auth::Credential,
+) {
+    session
+        .services()
+        .auth
+        .modify(&ProviderId::from(id), move |_| async move {
+            Ok(Some(credential))
+        })
+        .await
+        .unwrap();
+}
+
+fn oauth_credential() -> cyrup_config::auth::Credential {
+    cyrup_config::auth::Credential::Oauth {
+        refresh: "rt".into(),
+        access: "at".into(),
+        expires: 1_700_000_000_000,
+        ext: serde_json::Map::new(),
+    }
+}
+
+/// TUI-141 — `/login`'s rows carry `subscription: provider.auth.oauth?.isSubscription === true`
+/// (`interactive-mode.ts:5798` @f1b2e77f5), on BOTH of a provider's rows. A built-in provider
+/// whose OAuth strategy is metered badges its OAuth row `[account]`, and its API-key row, over a
+/// stored OAuth credential, reads `• account configured` (`oauth-selector.ts:39`); a
+/// subscription-backed provider keeps `[subscription]`, and an unconfigured row reads
+/// `• not configured` (`:37`).
+///
+/// RED before the change: every OAuth row said `[subscription]`, the mismatch said
+/// `subscription configured`, and the empty status said `• unconfigured`.
+#[tokio::test]
+async fn login_selector_labels_a_metered_oauth_provider_as_an_account() {
+    let fx = fixture().await;
+    let registry: LoginProviderSource = Arc::new(|| {
+        let account: Arc<dyn Provider> = Arc::new(StubProvider {
+            id: ProviderId::from("acct"),
+            auth: ProviderAuth {
+                api_key: Some(env_key_like()),
+                oauth: Some(Arc::new(ScriptedOauth::<false>)),
+            },
+            models: Vec::new(),
+        });
+        let subscription: Arc<dyn Provider> = Arc::new(StubProvider {
+            id: ProviderId::from("subs"),
+            auth: ProviderAuth {
+                api_key: Some(env_key_like()),
+                oauth: Some(Arc::new(ScriptedOauth::<true>)),
+            },
+            models: Vec::new(),
+        });
+        vec![account, subscription]
+    });
+    let mut app = App::new(TestBackend::new(100, 24), UiTheme::dark()).unwrap();
+    app.set_login_provider_source(registry);
+    store_credential(&fx.session, "acct", oauth_credential()).await;
+
+    let inputs = app.login_provider_inputs(&fx.session).await;
+    app.open_login_provider_selector(&inputs, None, None);
+    assert_eq!(app.active_selector_kind(), Some(SelectorKind::Login));
+    app.draw().unwrap();
+    let t = buf_text(&app);
+    assert!(t.contains("Acct [account] ✓ stored"), "{t}");
+    assert!(t.contains("Acct [API key] • account configured"), "{t}");
+    assert!(t.contains("Subs [subscription] • not configured"), "{t}");
+    assert!(t.contains("Subs [API key] • not configured"), "{t}");
+    assert!(!t.contains("unconfigured"), "{t}");
+}
+
+/// TUI-141 — `/logout`'s rows carry `subscription: provider?.auth.oauth?.isSubscription === true`
+/// (`interactive-mode.ts:5832` @f1b2e77f5) for the provider pi's composed registry holds, which
+/// includes a JSON-registered extension provider's adapted `oauth`. cyrup knows such a provider's
+/// flag only through `extension_oauth_subscription` (`refresh_auth_snapshot`, TUI-127), and that is
+/// what the row reads: `ext-sub` declares `isSubscription: true` and keeps `[subscription]`,
+/// `ext-metered` does not and reads `[account]`. A stored API key makes the list mix both kinds,
+/// so the badges show (`oauth-selector.ts:63`).
+///
+/// RED without the `extension_oauth_subscription` overlay: neither id is in the built-in
+/// registry, so both would read `[account]`; RED on the old code: both read `[subscription]`.
+#[tokio::test]
+async fn logout_selector_reads_an_extension_providers_subscription_flag() {
+    let tmp = TempDir::new().unwrap();
+    let cwd = tmp.path().join("project");
+    let agent_dir = tmp.path().join("agent");
+    std::fs::create_dir_all(&cwd).unwrap();
+    std::fs::create_dir_all(&agent_dir).unwrap();
+    let mut config = SessionConfig::new(cwd, agent_dir);
+    config.trust_override = Some(true);
+    config.no_extensions = true;
+    let session = Arc::new(
+        SessionBuilder::new(Arc::new(FauxProvider::new()) as Arc<dyn Provider>, config)
+            .with_native_extension(Arc::new(OauthProviders) as Arc<dyn cyrup_ext::NativeExtension>)
+            .build()
+            .await
+            .unwrap(),
+    );
+    store_credential(&session, "ext-sub", oauth_credential()).await;
+    store_credential(&session, "ext-metered", oauth_credential()).await;
+    store_credential(
+        &session,
+        "keyed",
+        cyrup_config::auth::Credential::api_key("sk-test"),
+    )
+    .await;
+
+    let mut app = App::new(TestBackend::new(100, 24), UiTheme::dark()).unwrap();
+    app.set_login_provider_source(Arc::new(Vec::new));
+    app.refresh_auth_snapshot(&session).await;
+    app.execute_command(
+        AppCommand::OpenSelector(SelectorKind::Logout),
+        &session,
+        None,
+    )
+    .await;
+    assert_eq!(app.active_selector_kind(), Some(SelectorKind::Logout));
+    app.draw().unwrap();
+    let t = buf_text(&app);
+    assert!(t.contains("ext-sub [subscription] ✓ configured"), "{t}");
+    assert!(t.contains("ext-metered [account] ✓ configured"), "{t}");
+    assert!(t.contains("keyed [API key] ✓ configured"), "{t}");
+}

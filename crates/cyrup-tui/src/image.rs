@@ -179,25 +179,43 @@ impl ImageRenderer {
         !matches!(self.picker.protocol_type(), ProtocolType::Halfblocks)
     }
 
-    /// One image's natural footprint in terminal **cells** at this picker's font size, clamped to the
+    /// One image's footprint in terminal **cells** at this picker's font size, clamped to the
     /// available `width` (so the live-region layout can reserve the right number of rows before draw).
+    ///
+    /// A port of `calculateImageCellSize` (`packages/tui/src/terminal-image.ts:481-519` @f1b2e77f5)
+    /// with no `maxHeightCells`, so width is always the binding axis. The size is computed from one
+    /// fractional scale, as upstream does (`:493-501`): a width-clamped image's rows are
+    /// `ceil(height * scale / cell height)`, not the old integer rescale of the already-ceilinged
+    /// natural rows, which truncated and could under-reserve by a row.
+    ///
+    /// One deliberate difference: upstream always scales the image to `maxWidthCells`, enlarging a
+    /// small one, while cyrup draws with `Resize::Fit`, which never enlarges, so the scale here is
+    /// capped at 1 and an image narrower than `width` keeps its natural size.
+    ///
+    /// Not ported: pi's Kitty-only `chooseLessDistortedCellCount` step (`:472-479`, `:506-516`,
+    /// selected by `renderImage` at `:682-689`), which may reserve `ceil - 1` rows. It corrects a
+    /// distortion cyrup's renderer never produces. [`ImageRenderer::render`] draws through
+    /// `ratatui-image` `Resize::Fit`, which scales the raster proportionally into the box and pads the
+    /// remainder (`Resize::resize` overlays it on a background canvas), and the crate's Kitty
+    /// transmit (`a=T,U=1,f=32,t=d,s={w},v={h}`) sends no `c`/`r` cell box for Kitty to stretch into. A
+    /// smaller row count would only shrink the drawn image, so every protocol keeps the ceiling.
     pub fn cell_size(&self, block: &ImageBlock, width: u16) -> (u16, u16) {
         let font = self.picker.font_size();
-        let fw = u32::from(font.width.max(1));
-        let fh = u32::from(font.height.max(1));
+        let cell_w = f64::from(font.width.max(1));
+        let cell_h = f64::from(font.height.max(1));
         let (iw, ih) = block.dimensions();
-        let cols = iw.div_ceil(fw).max(1);
-        let rows = ih.div_ceil(fh).max(1);
-        let cols = cols.min(u32::from(width.max(1)));
-        // Preserve aspect when width-clamped.
-        let rows = if cols < iw.div_ceil(fw).max(1) {
-            (rows * cols / iw.div_ceil(fw).max(1)).max(1)
-        } else {
-            rows
-        };
+        let max_width = f64::from(width.max(1));
+        // `:490-491` — a zero-sized image counts as one pixel.
+        let image_w = f64::from(iw.max(1));
+        let image_h = f64::from(ih.max(1));
+        // `:493-495`, capped at 1 (no enlarging; see the doc comment).
+        let scale = ((max_width * cell_w) / image_w).min(1.0);
+        // `:499-501`.
+        let cols = ((image_w * scale) / cell_w).ceil().clamp(1.0, max_width);
+        let rows = ((image_h * scale) / cell_h).ceil().max(1.0);
         (
-            cols.min(u32::from(u16::MAX)) as u16,
-            rows.min(u32::from(u16::MAX)) as u16,
+            cols.min(f64::from(u16::MAX)) as u16,
+            rows.min(f64::from(u16::MAX)) as u16,
         )
     }
 

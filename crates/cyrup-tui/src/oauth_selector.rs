@@ -121,8 +121,14 @@ impl OAuthSelector {
                 };
                 ProviderRow {
                     name: o.name.clone(),
-                    auth_type_label: show_auth_type_labels
-                        .then(|| format!(" [{}]", format_auth_selector_provider_type(o.auth_type))),
+                    // `` ` [${formatAuthSelectorProviderType(provider.authType, provider.subscription)}]` ``
+                    // (`oauth-selector.ts:161` @f1b2e77f5).
+                    auth_type_label: show_auth_type_labels.then(|| {
+                        format!(
+                            " [{}]",
+                            format_auth_selector_provider_type(o.auth_type, o.subscription)
+                        )
+                    }),
                     status: status_indicator_runs(o),
                     search_text: format!(
                         "{} {} {auth_type} {}",

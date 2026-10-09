@@ -31,7 +31,8 @@ pub enum AuthState {
     /// No stored credential, but an environment var / `--api-key` runtime key is present
     /// (Pi api-key `configured via env`, the muted line).
     EnvConfigured,
-    /// Nothing configured for this provider (Pi `• unconfigured`).
+    /// Nothing configured for this provider (Pi `• not configured`,
+    /// `oauth-selector.ts:37` @f1b2e77f5).
     Unconfigured,
 }
 
@@ -55,7 +56,7 @@ impl AuthState {
         match self {
             AuthState::Configured => "✓ configured",
             AuthState::EnvConfigured => "configured via env",
-            AuthState::Unconfigured => "• unconfigured",
+            AuthState::Unconfigured => "• not configured",
         }
     }
 }
@@ -120,12 +121,30 @@ pub fn provider_rows(entries: Vec<(String, AuthState)>) -> Vec<(String, String, 
     rows
 }
 
-/// `formatAuthSelectorProviderType` (`oauth-selector.ts:22-24`).
-pub fn format_auth_selector_provider_type(auth_type: AuthType) -> &'static str {
+/// `formatAuthSelectorProviderType(authType, subscription)` (`oauth-selector.ts:27-33`
+/// @f1b2e77f5): `"API key"` for an API-key row; for an OAuth row, `"account"` when the provider's
+/// sign-in is explicitly NOT a subscription (`subscription === false`), else `"subscription"` —
+/// so an unset flag keeps the old label.
+pub fn format_auth_selector_provider_type(
+    auth_type: AuthType,
+    subscription: Option<bool>,
+) -> &'static str {
     match auth_type {
-        AuthType::Oauth => "subscription",
         AuthType::ApiKey => "API key",
+        AuthType::Oauth if subscription == Some(false) => "account",
+        AuthType::Oauth => "subscription",
     }
+}
+
+/// `` `${formatAuthSelectorProviderType(provider.status.type, provider.subscription)} configured` ``
+/// (`oauth-selector.ts:39` @f1b2e77f5) — the warning label of a row whose stored credential is of
+/// the other kind. Built from the type label, so an account-backed OAuth credential reads
+/// `account configured`, not `subscription configured`.
+fn mismatch_label(status_type: AuthType, subscription: Option<bool>) -> String {
+    format!(
+        "{} configured",
+        format_auth_selector_provider_type(status_type, subscription)
+    )
 }
 
 /// `/^[A-Z][A-Z0-9_]*(?:, [A-Z][A-Z0-9_]*)*$/` (`oauth-selector.ts:176`) — "does this source read
@@ -147,10 +166,10 @@ fn looks_like_env_var_list(source: &str) -> bool {
 
 /// The theme colour one run of the status indicator is painted in.
 ///
-/// **S21.** `formatStatusIndicator` (`oauth-selector.ts:164-181`) does not return one uniformly
-/// coloured string: `" ✓ configured"` is `theme.fg("success", …)` (`:175`), the mismatch case is
-/// `theme.fg("muted", " • ") + theme.fg("warning", label)` (`:168`) — **two** runs — and
-/// `" • unconfigured"` is `theme.fg("muted", …)` (`:165`). cyrup folded the whole thing into a
+/// **S21.** `formatAuthSelectorProviderStatus` (`oauth-selector.ts:36-53` @f1b2e77f5) does not
+/// return one uniformly coloured string: `" ✓ configured"` is `theme.fg("success", …)` (`:47`), the
+/// mismatch case is `theme.fg("muted", " • ") + theme.fg("warning", label)` (`:40`) — **two** runs —
+/// and `" • not configured"` is `theme.fg("muted", …)` (`:37`). cyrup folded the whole thing into a
 /// `SelectItem.description`, which `select_list.rs` paints uniformly `muted` (or, on the highlighted
 /// row, uniformly `accent`), so a configured provider read grey instead of green and a credential
 /// mismatch lost its warning entirely.
@@ -173,19 +192,19 @@ pub enum StatusTone {
 /// and its status. [`format_status_indicator`] keeps returning the space-less form, because that one
 /// feeds a padded description column rather than this concatenation.
 pub fn status_indicator_runs(option: &LoginProviderOption) -> Vec<(StatusTone, String)> {
-    // `if (!provider.status) return theme.fg("muted", " • unconfigured")` (`:165`).
+    // `if (!provider.status) return theme.fg("muted", " • not configured")`
+    // (`oauth-selector.ts:37` @f1b2e77f5).
     let Some(status) = option.status.as_ref() else {
-        return vec![(StatusTone::Muted, " • unconfigured".to_string())];
+        return vec![(StatusTone::Muted, " • not configured".to_string())];
     };
-    // `:166-169` — a stored credential of the OTHER kind: muted bullet, warning label.
+    // `:38-41` — a stored credential of the OTHER kind: muted bullet, warning label.
     if status.auth_type != option.auth_type {
-        let label = match status.auth_type {
-            AuthType::Oauth => "subscription configured",
-            AuthType::ApiKey => "API key configured",
-        };
         return vec![
             (StatusTone::Muted, " • ".to_string()),
-            (StatusTone::Warning, label.to_string()),
+            (
+                StatusTone::Warning,
+                mismatch_label(status.auth_type, option.subscription),
+            ),
         ];
     }
     // `:170-176`.
@@ -204,19 +223,19 @@ pub fn status_indicator_runs(option: &LoginProviderOption) -> Vec<(StatusTone, S
 
 /// `formatStatusIndicator(provider)` (`oauth-selector.ts:164-181`) — the row's trailing status,
 /// verbatim including the mismatch case (a provider whose STORED credential is of the other kind
-/// shows `• subscription configured` / `• API key configured`, not `✓ configured`).
+/// shows `• subscription configured` / `• account configured` / `• API key configured`, not
+/// `✓ configured`).
 pub fn format_status_indicator(option: &LoginProviderOption) -> String {
-    // `if (!provider.status) return " • unconfigured"` (`:165`).
+    // `if (!provider.status) return " • not configured"` (`oauth-selector.ts:37` @f1b2e77f5).
     let Some(status) = option.status.as_ref() else {
-        return "• unconfigured".to_string();
+        return "• not configured".to_string();
     };
-    // `if (provider.status.type !== provider.authType)` (`:166-169`).
+    // `if (provider.status.type !== provider.authType)` (`:38-41`).
     if status.auth_type != option.auth_type {
-        let label = match status.auth_type {
-            AuthType::Oauth => "subscription configured",
-            AuthType::ApiKey => "API key configured",
-        };
-        return format!("• {label}");
+        return format!(
+            "• {}",
+            mismatch_label(status.auth_type, option.subscription)
+        );
     }
     // `if (!source || source === "OAuth" || source === "stored credential")` (`:170-176`).
     let source = match status.source.as_deref() {
@@ -259,7 +278,7 @@ pub fn login_selector_rows(
                 format!(
                     "{} [{}]",
                     option.name,
-                    format_auth_selector_provider_type(option.auth_type)
+                    format_auth_selector_provider_type(option.auth_type, option.subscription)
                 )
             } else {
                 option.name.clone()
@@ -298,7 +317,7 @@ mod tests {
     fn status_text_matches_pi_lines() {
         assert_eq!(AuthState::Configured.status_text(), "✓ configured");
         assert_eq!(AuthState::EnvConfigured.status_text(), "configured via env");
-        assert_eq!(AuthState::Unconfigured.status_text(), "• unconfigured");
+        assert_eq!(AuthState::Unconfigured.status_text(), "• not configured");
     }
 
     #[test]
@@ -326,6 +345,6 @@ mod tests {
         assert_eq!(rows[0].1, "Anthropic");
         assert_eq!(rows[0].2.as_deref(), Some("✓ configured"));
         assert_eq!(rows[1].0, "openai");
-        assert_eq!(rows[1].2.as_deref(), Some("• unconfigured"));
+        assert_eq!(rows[1].2.as_deref(), Some("• not configured"));
     }
 }

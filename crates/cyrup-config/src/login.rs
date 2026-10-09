@@ -145,6 +145,12 @@ pub struct LoginProviderOption {
     /// the front-end shows the ambient dialog instead (`interactive-mode.ts:4942`).
     pub supports_login: bool,
     pub status: Option<AuthCheck>,
+    /// `subscription?: boolean` (`components/oauth-selector.ts:20-24` @f1b2e77f5): "Whether the
+    /// provider's OAuth sign-in is backed by a subscription. `false` labels it as an account;
+    /// unset keeps the "subscription" label." pi's option builders always set it, to
+    /// `provider.auth.oauth?.isSubscription === true` (`interactive-mode.ts:5798`, `:5832`), on
+    /// the API-key row too.
+    pub subscription: Option<bool>,
 }
 
 /// A login failure. pi throws `ModelsError(code, message)` and every caller surfaces
@@ -397,6 +403,15 @@ pub fn login_provider_options(
         } else {
             None
         };
+        // `const subscription = provider.auth.oauth?.isSubscription === true`
+        // (`interactive-mode.ts:5798` @f1b2e77f5), carried on both rows.
+        let subscription = Some(
+            provider
+                .auth
+                .oauth
+                .as_ref()
+                .is_some_and(|oauth| oauth.is_subscription()),
+        );
 
         // `if ((!authType || authType === "oauth") && provider.auth.oauth)` (:4867).
         if matches!(auth_type, None | Some(AuthType::Oauth))
@@ -412,6 +427,7 @@ pub fn login_provider_options(
                 // OAuth option always offers a login.
                 supports_login: true,
                 status: status.clone(),
+                subscription,
             });
         }
 
@@ -431,6 +447,7 @@ pub fn login_provider_options(
                 // `method.login !== undefined` (`interactive-mode.ts:4942`).
                 supports_login: api_key.supports_login(),
                 status: status.clone(),
+                subscription,
             });
         }
     }
@@ -450,21 +467,29 @@ pub fn logout_provider_options(
 ) -> Vec<LoginProviderOption> {
     let mut options: Vec<LoginProviderOption> = stored
         .iter()
-        .map(|(id, auth_type)| LoginProviderOption {
-            id: id.clone(),
-            name: known
-                .iter()
-                .find(|p| p.id.as_str() == id.as_str())
-                .map(|p| p.name.clone())
-                .unwrap_or_else(|| id.as_str().to_string()),
-            auth_type: *auth_type,
-            method_name: None,
-            login_label: None,
-            supports_login: false,
-            status: Some(AuthCheck {
+        .map(|(id, auth_type)| {
+            let provider = known.iter().find(|p| p.id.as_str() == id.as_str());
+            LoginProviderOption {
+                id: id.clone(),
+                name: provider
+                    .map(|p| p.name.clone())
+                    .unwrap_or_else(|| id.as_str().to_string()),
                 auth_type: *auth_type,
-                source: Some("stored credential".to_string()),
-            }),
+                method_name: None,
+                login_label: None,
+                supports_login: false,
+                status: Some(AuthCheck {
+                    auth_type: *auth_type,
+                    source: Some("stored credential".to_string()),
+                }),
+                // `subscription: provider?.auth.oauth?.isSubscription === true`
+                // (`interactive-mode.ts:5832` @f1b2e77f5).
+                subscription: Some(
+                    provider
+                        .and_then(|p| p.auth.oauth.as_ref())
+                        .is_some_and(|oauth| oauth.is_subscription()),
+                ),
+            }
         })
         .collect();
     sort_by_name(&mut options);
@@ -2019,6 +2044,78 @@ mod tests {
         assert_eq!(
             credential_from_provider(cyrup_provider::Credential::from(api_key.clone())),
             api_key
+        );
+    }
+
+    // ---------------------------------------------------------------- TUI-141
+
+    /// The real built-in provider under `id`, as `/login` sees it.
+    fn built_in(id: &str) -> ProviderLoginInput {
+        let built_in = cyrup_provider::all_providers()
+            .into_iter()
+            .find(|p| p.id().as_str() == id)
+            .unwrap_or_else(|| panic!("no built-in provider {id}"));
+        provider(
+            id,
+            id,
+            built_in
+                .provider_auth()
+                .cloned()
+                .unwrap_or_else(|| panic!("{id} has no auth")),
+        )
+    }
+
+    /// TUI-141: `subscription: provider.auth.oauth?.isSubscription === true`, on both of a
+    /// provider's rows (`interactive-mode.ts:5798` @f1b2e77f5). The built-in strategies answer it:
+    /// Anthropic's OAuth sets `isSubscription: true` (`ai/src/auth/oauth/anthropic.ts:280`),
+    /// OpenRouter's and Radius's leave it unset, so the selector labels them `account`; a provider
+    /// with no OAuth strategy reads `false` too (its rows are all `API key`).
+    #[test]
+    fn login_options_carry_the_oauth_strategys_subscription_flag() {
+        let providers = vec![
+            built_in("anthropic"),
+            built_in("openrouter"),
+            built_in("radius"),
+            env_key_provider("groq", "groq"),
+        ];
+        let options = login_provider_options(&providers, None);
+        let flags: Vec<(&str, AuthType, Option<bool>)> = options
+            .iter()
+            .map(|o| (o.id.as_str(), o.auth_type, o.subscription))
+            .collect();
+        for (id, auth_type, subscription) in &flags {
+            let want = Some(*id == "anthropic");
+            assert_eq!(*subscription, want, "{id} {auth_type:?}: {flags:?}");
+        }
+        assert!(
+            flags
+                .iter()
+                .any(|(id, t, _)| *id == "openrouter" && *t == AuthType::Oauth),
+            "openrouter offers an OAuth row: {flags:?}"
+        );
+    }
+
+    /// TUI-141: `/logout` reads the flag off `getProvider(providerId)`
+    /// (`interactive-mode.ts:5832` @f1b2e77f5); a stored id no provider knows reads `false`.
+    #[test]
+    fn logout_options_carry_the_known_providers_subscription_flag() {
+        let known = vec![built_in("anthropic"), built_in("openrouter")];
+        let stored = vec![
+            (ProviderId::from("anthropic"), AuthType::Oauth),
+            (ProviderId::from("openrouter"), AuthType::Oauth),
+            (ProviderId::from("orphan"), AuthType::Oauth),
+        ];
+        let flags: Vec<(String, Option<bool>)> = logout_provider_options(&stored, &known)
+            .into_iter()
+            .map(|o| (o.id.as_str().to_string(), o.subscription))
+            .collect();
+        assert_eq!(
+            flags,
+            vec![
+                ("anthropic".to_string(), Some(true)),
+                ("openrouter".to_string(), Some(false)),
+                ("orphan".to_string(), Some(false)),
+            ]
         );
     }
 }

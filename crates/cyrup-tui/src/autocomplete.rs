@@ -162,6 +162,10 @@ pub struct LoginProviderArgument {
     pub id: String,
     pub name: String,
     pub auth_types: Vec<cyrup_config::login::AuthType>,
+    /// `LoginProviderCompletionOption.subscription` (`interactive-mode.ts:368`, set from the
+    /// provider's first row at `:403` @f1b2e77f5) — picks `account` over `subscription` for an OAuth
+    /// sign-in that is not one.
+    pub subscription: Option<bool>,
 }
 
 /// Which completion context produced the active popup.
@@ -235,6 +239,14 @@ impl Autocomplete {
     ) -> Option<Autocomplete> {
         let line = lines.get(cursor_line).map(String::as_str).unwrap_or("");
         let before: String = line.chars().take(cursor_col).collect();
+        // TUI-139 — `const commandText = textBeforeCursor.trimStart()` (`autocomplete.ts:338`
+        // @f1b2e77f5, #10218): the whole slash branch reads the TRIMMED text — its `/` test, the
+        // space split, both slices and the returned prefix (`:339-380`) — so ` /mod` still
+        // completes. The prefix being the trimmed text is what makes the accepted name splice
+        // after the leading whitespace rather than over it. `str::trim_start` is Unicode
+        // `White_Space`, JS's `trimStart` is `\s` plus line terminators: the same set less U+FEFF
+        // and plus U+0085, neither of which a key event leaves in the buffer.
+        let command_text = before.trim_start();
 
         // 1. Slash command (`autocomplete.ts:313-363` @v0.84.3) — the name list before the first
         //    space, the argument list after it.
@@ -247,12 +259,12 @@ impl Autocomplete {
         //    tries the argument list on the forced path too — completing an argument is exactly
         //    what Tab is for, and answering it with a directory listing is a wrong answer rather
         //    than a missing one.
-        if let Some(ac) = slash_context(registry, arguments, &before) {
+        if let Some(ac) = slash_context(registry, arguments, command_text) {
             return Some(ac);
         }
         // The forced half of the deviation above: a `/name <arg>` line whose command OWNS a
         // completer stays terminal on Tab too, rather than falling through to a path listing.
-        if argument_completer(registry, &before).is_some() {
+        if argument_completer(registry, command_text).is_some() {
             return None;
         }
         // TUI-077 — the unforced slash branch is TERMINAL upstream: every exit of the
@@ -262,7 +274,7 @@ impl Autocomplete {
         // `/Users/dav` offer no paths while a popup is open. A FORCED popup (Tab on `/export ./sr`)
         // is unaffected: the editor re-asks with `force` for as long as it stays open, pi's
         // `autocompleteState === "force"` (`components/editor.ts:2468`).
-        if !force && before.starts_with('/') {
+        if !force && command_text.starts_with('/') {
             return None;
         }
         // 2. Bare path.
@@ -345,7 +357,8 @@ impl Autocomplete {
     }
 }
 
-/// Slash context (`autocomplete.ts:313-363` @v0.84.3): `before` starts with `/`, split on the FIRST
+/// Slash context (`autocomplete.ts:313-363` @v0.84.3): `before` — the caller's leading-whitespace-
+/// trimmed `commandText` (TUI-139) — starts with `/`, split on the FIRST
 /// SPACE (`:314` `textBeforeCursor.indexOf(" ")` — a literal space, not any whitespace, so a tab
 /// keeps the line in the name branch). No space → the command-name list (`:316-341`); a space → the
 /// argument list (`:344-363`), which never falls back to the name list.
@@ -370,6 +383,11 @@ fn slash_context(
 /// predicate in [`Autocomplete::compute`]. `str::get`, never a slice expression
 /// (`deny(clippy::string_slice)`).
 ///
+/// TUI-139 — `before` is trimmed of leading whitespace first, as `commandText` is upstream
+/// (`autocomplete.ts:338-380` @f1b2e77f5), here rather than at each caller so the async extension
+/// fetch ([`crate::InputEditor::pending_extension_argument`]) resolves ` /cmd arg` the same way the
+/// popup does.
+///
 /// The command NAME rides back out alongside the completer because
 /// [`ArgumentCompleter::Extension`] is one tag shared by every registered extension command — the
 /// name is how its own completer is identified, standing in for the per-command closure pi binds
@@ -378,7 +396,7 @@ pub(crate) fn argument_completer<'a>(
     registry: &CommandRegistry,
     before: &'a str,
 ) -> Option<(ArgumentCompleter, &'a str, &'a str)> {
-    let rest = before.strip_prefix('/')?;
+    let rest = before.trim_start().strip_prefix('/')?;
     let space = rest.find(' ')?;
     let name = rest.get(..space)?;
     let argument = rest.get(space + 1..)?;
@@ -491,7 +509,7 @@ fn login_provider_rows(
                 text.push_str(&format!(
                     " {} {}",
                     auth.as_str(),
-                    crate::auth_select::format_auth_selector_provider_type(*auth)
+                    crate::auth_select::format_auth_selector_provider_type(*auth, p.subscription)
                 ));
             }
             text
@@ -510,7 +528,9 @@ fn login_provider_rows(
         let labels: Vec<&str> = provider
             .auth_types
             .iter()
-            .map(|a| crate::auth_select::format_auth_selector_provider_type(*a))
+            .map(|a| {
+                crate::auth_select::format_auth_selector_provider_type(*a, provider.subscription)
+            })
             .collect();
         let joined = labels.join("/");
         // `provider.name === provider.id ? authTypes : `${provider.name} · ${authTypes}`` (`:330`).
@@ -714,6 +734,37 @@ fn is_path_delimiter(c: char) -> bool {
     PATH_DELIMS.contains(&c) || is_autocomplete_separator(c)
 }
 
+/// TUI-140 — `PATH_WRAPPERS` (`autocomplete.ts:10-11` @f1b2e77f5): "Opening wrappers that may
+/// precede a path in prose, mapped to their closing counterpart." `None` for anything else. A
+/// separate class from [`PATH_DELIMS`]: a wrapper is peeled off the front of a token, never split on.
+fn path_wrapper_closer(c: char) -> Option<char> {
+    match c {
+        '(' => Some(')'),
+        '[' => Some(']'),
+        '{' => Some('}'),
+        '<' => Some('>'),
+        '`' => Some('`'),
+        _ => None,
+    }
+}
+
+/// TUI-140 — `stripLeadingWrappers` (`autocomplete.ts:61-73` @f1b2e77f5): peel opening wrappers off
+/// the front of a token one at a time — `(~/Dev` → `~/Dev`, `` `src/ma `` → `src/ma` — and stop at
+/// the first one whose closer also appears later in the token (`result.includes(closer, 1)`), so
+/// `app/[slug]/pa` and `(group)/pa` stay literal. Searching from the second character is what lets a
+/// backtick, its own closer, be stripped.
+fn strip_leading_wrappers(token: &str) -> &str {
+    let mut result = token;
+    while let Some(first) = result.chars().next() {
+        let rest = result.get(first.len_utf8()..).unwrap_or("");
+        match path_wrapper_closer(first) {
+            Some(closer) if !rest.contains(closer) => result = rest,
+            _ => break,
+        }
+    }
+    result
+}
+
 /// Bare-path context (`extractPathPrefix` `:480-507` + `getFileSuggestions` `:560-693`).
 fn path_context(before: &str, force: bool, cwd: &Path) -> Option<Autocomplete> {
     let raw_token = trailing_token(before);
@@ -783,16 +834,20 @@ fn find_unclosed_quote_start(text: &str) -> Option<usize> {
     in_quotes.then_some(quote_start)
 }
 
-/// `isTokenStart` (`autocomplete.ts:75-77` @v0.86.0): index 0, or preceded by a [`PATH_DELIMS`]
+/// `isTokenStart` (`autocomplete.ts:91-97` @f1b2e77f5): index 0, or preceded by a [`PATH_DELIMS`]
 /// character or an autocomplete separator — `tokenStartRegex` is `(?:^|separator)$` over
 /// `text.slice(0, index)` (`:9`), so `，@src` starts a token as `␠@src` does.
+///
+/// TUI-140 — the test runs after walking back over any run of opening wrappers
+/// ([`path_wrapper_closer`], `:93-95`), so `("my dir/fi` and `(@"my dir` start a token.
 fn is_token_start(text: &str, index: usize) -> bool {
-    if index == 0 {
-        return true;
-    }
-    text.get(..index)
-        .and_then(|s| s.chars().next_back())
-        .is_some_and(is_path_delimiter)
+    let Some(head) = text.get(..index) else {
+        return false;
+    };
+    head.trim_end_matches(|c| path_wrapper_closer(c).is_some())
+        .chars()
+        .next_back()
+        .is_none_or(is_path_delimiter)
 }
 
 /// `extractQuotedPrefix` (`autocomplete.ts:74-92`): when a quote is open, the token is everything
@@ -816,26 +871,36 @@ fn extract_quoted_prefix(text: &str) -> Option<String> {
 /// The trailing token of `before`, bounded by [`PATH_DELIMS`], an autocomplete separator, or
 /// start-of-line.
 ///
-/// **TUI-013.** An unclosed quote wins over the delimiter split, exactly as
-/// `extractPathPrefix`/`extractAtPrefix` order the two upstream (`autocomplete.ts:463-470` and
-/// `:480-487`: `const quotedPrefix = extractQuotedPrefix(text); if (quotedPrefix) return
-/// quotedPrefix;` **before** `findLastDelimiter`). Without it `"` is itself a `PATH_DELIMS`
+/// **TUI-013.** An unclosed quote wins over the delimiter split, exactly as `extractPathPrefix`
+/// orders the two upstream (`autocomplete.ts:520-524` @f1b2e77f5: `const quotedPrefix =
+/// extractQuotedPrefix(text); if (quotedPrefix) return quotedPrefix;` **before**
+/// `findLastDelimiter`). This is the path extractor only: `extractAtPrefix` keeps a quoted prefix
+/// only when it starts with `@"`, which [`at_prefix`] ports. Without it `"` is itself a `PATH_DELIMS`
 /// character, so `see @"my dir/fi` split on the SPACE INSIDE the quotes and yielded `dir/fi`, whose
 /// `strip_prefix('@')` then failed — any path containing a space was uncompletable.
 fn trailing_token(before: &str) -> String {
     if let Some(quoted) = extract_quoted_prefix(before) {
         return quoted;
     }
-    // `findLastDelimiter` (`autocomplete.ts:47-57` @v0.86.0) — CJK punctuation bounds the token
-    // too (TUI-101), so `看看，@src` yields `@src` rather than one unbroken `看看，@src`. The token
-    // starts past the delimiter's full UTF-8 width: `，` is three bytes, not one.
-    match before
+    // TUI-140 — `extractPathPrefix` strips opening wrappers off the split token (`autocomplete.ts:527`
+    // @f1b2e77f5), so `(~/De` completes `~/De`. The stripped token is also the replaced prefix, so
+    // the opener stays on the line. A quoted prefix above is returned whole, as upstream returns it.
+    // The `@`-mention extractor orders the two differently; see [`at_prefix`].
+    strip_leading_wrappers(last_delimited_token(before)).to_string()
+}
+
+/// `findLastDelimiter` (`autocomplete.ts:47-57` @v0.86.0) and the slice after it: the text past the
+/// last [`is_path_delimiter`] character, or all of `text`. CJK punctuation bounds the token too
+/// (TUI-101), so `看看，@src` yields `@src` rather than one unbroken `看看，@src`. The token starts
+/// past the delimiter's full UTF-8 width: `，` is three bytes, not one.
+fn last_delimited_token(text: &str) -> &str {
+    match text
         .char_indices()
         .rev()
         .find(|&(_, c)| is_path_delimiter(c))
     {
-        Some((idx, c)) => before.get(idx + c.len_utf8()..).unwrap_or("").to_string(),
-        None => before.to_string(),
+        Some((idx, c)) => text.get(idx + c.len_utf8()..).unwrap_or(""),
+        None => text,
     }
 }
 
@@ -885,13 +950,29 @@ fn home_dir() -> Option<PathBuf> {
 
 // ----------------------------------------------------------------- @-mention search ----
 
-/// The `@`-mention query under the cursor (`autocomplete.ts:101` `@`-prefix detect), if the trailing
-/// token is a mention. Returns the text *after* the `@`, with a leading `"` stripped (the `@"quoted
+/// The `@`-mention query under the cursor (`autocomplete.ts:101` `@`-prefix detect), if the token
+/// [`at_prefix`] extracts is a mention. Returns the text *after* the `@`, with a leading `"` stripped (the `@"quoted
 /// path"` form, `:408`). `Some("")` immediately after typing `@` (open the popup with the whole tree).
 pub fn mention_query(before: &str) -> Option<String> {
-    let token = trailing_token(before);
+    let token = at_prefix(before)?;
     let rest = token.strip_prefix('@')?;
     Some(rest.strip_prefix('"').unwrap_or(rest).to_string())
+}
+
+/// `extractAtPrefix` (`autocomplete.ts:503-517` @f1b2e77f5): the `@` token under the cursor,
+/// leading `@` included, or `None`. Upstream orders it unlike [`trailing_token`] (which ports
+/// `extractPathPrefix`, `:520-527`): the unclosed-quote prefix wins only when it starts with `@"`.
+/// Any other open quote falls through to `findLastDelimiter` + `stripLeadingWrappers`, so the `@src`
+/// in `see ("foo @src` or `see "foo @src` is still a mention instead of being swallowed by the
+/// quoted span `"foo @src`, which does not start with `@`.
+fn at_prefix(before: &str) -> Option<String> {
+    if let Some(quoted) = extract_quoted_prefix(before)
+        && quoted.starts_with("@\"")
+    {
+        return Some(quoted);
+    }
+    let token = strip_leading_wrappers(last_delimited_token(before));
+    token.starts_with('@').then(|| token.to_string())
 }
 
 /// Pi's directory bonus (`scoreEntry`, `autocomplete.ts:717-719`: `if (isDirectory && score > 0)
@@ -921,8 +1002,8 @@ const DIRECTORY_SCORE_BONUS: f64 = 10.0;
 /// [`fuzzy::filter`] splits the query on `/` as well as whitespace (`fuzzy.rs:144`), so that query
 /// tokenises to `["src", "ma"]` and every token must match.
 pub fn mention_autocomplete(before: &str, candidates: &[String]) -> Option<Autocomplete> {
+    let token = at_prefix(before)?;
     let query = mention_query(before)?;
-    let token = trailing_token(before);
     let mut matches = fuzzy::filter(candidates, &query, |c| c.as_str());
     if matches.is_empty() {
         return None;

@@ -200,7 +200,8 @@ impl<B: Backend> App<B> {
                             return;
                         }
                     };
-                let options = cyrup_config::login::logout_provider_options(&stored, &inputs);
+                let mut options = cyrup_config::login::logout_provider_options(&stored, &inputs);
+                self.apply_extension_oauth_subscription(&mut options);
                 if options.is_empty() {
                     // Pi's verbatim copy (`interactive-mode.ts:5136-5138`).
                     self.state

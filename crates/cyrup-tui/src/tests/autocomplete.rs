@@ -932,3 +932,247 @@ fn a_single_match_auto_apply_leaves_no_forced_popup_behind() {
         "prose after an auto-applied file must not pop a path list"
     );
 }
+
+// ---- TUI-139: a slash command after leading whitespace -----------------------------------------
+
+/// Every value a popup would insert, in row order.
+fn completion_values(ac: &Autocomplete) -> Vec<String> {
+    (0..ac.list.len())
+        .filter_map(|i| {
+            let mut probe = ac.clone();
+            probe.list.set_selected(i);
+            probe.selected().map(|c| c.value.clone())
+        })
+        .collect()
+}
+
+/// `const commandText = textBeforeCursor.trimStart()` (`autocomplete.ts:338` @f1b2e77f5, #10218):
+/// `  /mo` opens the command popup with the trimmed `/mo` as its prefix, and accepting splices the
+/// name after the leading whitespace — not over it, and not doubling the `/`.
+#[test]
+fn a_slash_command_after_leading_whitespace_completes() {
+    let mut ed = InputEditor::new();
+    type_str(&mut ed, "  /mo");
+    let ac = ed
+        .autocomplete()
+        .expect("the command popup must open after leading whitespace")
+        .clone();
+    assert_eq!(ac.context, crate::CompletionContext::Slash);
+    assert_eq!(ac.prefix, "/mo");
+    let index = ac
+        .list
+        .items()
+        .iter()
+        .position(|item| item.label == "model")
+        .expect("`/model` must be offered");
+
+    // Select `model` explicitly so the splice does not depend on fuzzy ranking.
+    let mut ac = ac;
+    ac.list.set_selected(index);
+    let line = "  /mo".to_string();
+    let applied = ac.apply(std::slice::from_ref(&line), 0, 5).unwrap();
+    assert_eq!(applied.lines, vec!["  /model ".to_string()]);
+    assert_eq!(applied.cursor_col, "  /model ".chars().count());
+}
+
+/// The argument branch reads `commandText` too (`autocomplete.ts:379-398` @f1b2e77f5):
+/// `  /thinking ` offers exactly what `/thinking ` does, and the accepted value lands after the
+/// space.
+#[test]
+fn argument_completion_after_leading_whitespace_matches_the_unindented_line() {
+    let sources = crate::ArgumentSources {
+        thinking_levels: vec!["low".to_string(), "high".to_string()].into(),
+        ..Default::default()
+    };
+    let registry = CommandRegistry::new();
+    let compute = |line: &str| {
+        Autocomplete::compute(
+            &registry,
+            &sources,
+            &[line.to_string()],
+            0,
+            line.chars().count(),
+            false,
+            Path::new("."),
+        )
+    };
+    let plain = compute("/thinking ").expect("baseline: `/thinking ` offers levels");
+    let indented = compute("  /thinking ").expect("leading whitespace must not hide the levels");
+    assert_eq!(indented.context, crate::CompletionContext::SlashArgument);
+    assert_eq!(indented.prefix, plain.prefix);
+    assert_eq!(completion_values(&indented), completion_values(&plain));
+    // `/tree` owns no completer: both forms answer nothing, and neither falls through to paths.
+    assert!(compute("/tree ").is_none());
+    assert!(compute("  /tree ").is_none());
+
+    let mut ed = InputEditor::new();
+    ed.set_argument_sources(sources.clone());
+    type_str(&mut ed, "  /thinking hi");
+    let ac = ed.autocomplete().expect("the argument popup must open");
+    assert_eq!(ac.context, crate::CompletionContext::SlashArgument);
+    ed.handle_key(&key(KeyCode::Tab));
+    assert_eq!(ed.text(), "  /thinking high");
+}
+
+/// The terminal half of the slash branch trims as well: an indented `/export ./sr` offers no paths
+/// unforced, exactly as the unindented line does (`autocomplete.ts:339` @f1b2e77f5).
+#[test]
+fn an_indented_slash_line_never_falls_through_to_paths() {
+    let dir = slash_path_fixture();
+    let cwd = dir.path();
+    assert!(compute_at_end("  /export ./sr", false, cwd).is_none());
+    let forced = compute_at_end("  /export ./sr", true, cwd).expect("forced path completion");
+    assert_eq!(forced.context, crate::CompletionContext::Path);
+}
+
+// ---- TUI-140: path and @ completion after an opening wrapper -----------------------------------
+
+/// A scratch cwd with `src/main.rs`, `src/mod.rs`, `docs/plan.md`, `app/[slug]/page.tsx` and
+/// `(group)/page.tsx`.
+fn wrapper_fixture() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    for d in ["src", "docs", "app/[slug]", "(group)"] {
+        std::fs::create_dir_all(root.join(d)).unwrap();
+    }
+    for f in [
+        "src/main.rs",
+        "src/mod.rs",
+        "docs/plan.md",
+        "app/[slug]/page.tsx",
+        "(group)/page.tsx",
+    ] {
+        std::fs::write(root.join(f), "").unwrap();
+    }
+    dir
+}
+
+/// `(prefix, inserted values)` for an unforced request at the end of `line`.
+fn path_answer(line: &str, cwd: &Path) -> Option<(String, Vec<String>)> {
+    compute_at_end(line, false, cwd).map(|ac| (ac.prefix.clone(), completion_values(&ac)))
+}
+
+/// `stripLeadingWrappers` in both extractors (`autocomplete.ts:510`, `:527` @f1b2e77f5): a path
+/// after `(`, `[`, `{`, `<` or a backtick gets the candidates the bare path gets, and the replaced
+/// prefix is the bare path, so the opener stays on the line.
+#[test]
+fn a_path_after_an_opening_wrapper_completes_like_the_bare_path() {
+    let dir = wrapper_fixture();
+    let cwd = dir.path();
+    let bare = path_answer("src/m", cwd).expect("baseline: `src/m` completes");
+    assert_eq!(bare.0, "src/m");
+    for opener in ['(', '[', '{', '<', '`'] {
+        let line = format!("see {opener}src/m");
+        assert_eq!(
+            path_answer(&line, cwd).as_ref(),
+            Some(&bare),
+            "{line:?} must complete as `src/m`"
+        );
+    }
+    // A run of openers is peeled one at a time, and at line start too.
+    assert_eq!(path_answer("([src/m", cwd), Some(bare));
+    let plan = path_answer("<docs/pl", cwd).expect("`<docs/pl` completes");
+    assert_eq!(
+        plan,
+        ("docs/pl".to_string(), vec!["docs/plan.md".to_string()])
+    );
+    // `~/` is resolved against the real home: whatever the bare prefix answers, the wrapped one
+    // answers the same.
+    assert_eq!(path_answer("(~/", cwd), path_answer("~/", cwd));
+
+    // Accepting keeps the opener and replaces only the path.
+    let mut ed = InputEditor::new();
+    ed.set_cwd(cwd.to_path_buf());
+    ed.set_text("see (docs/pl");
+    ed.handle_key(&key(KeyCode::Tab));
+    assert_eq!(ed.text(), "see (docs/plan.md ");
+}
+
+/// The "keep the opener if its closer also appears later in the token" rule
+/// (`autocomplete.ts:61-73` @f1b2e77f5): `app/[slug]/pa` and `(group)/pa` complete as those
+/// literal prefixes.
+#[test]
+fn a_wrapper_whose_closer_follows_is_part_of_the_path() {
+    let dir = wrapper_fixture();
+    let cwd = dir.path();
+    assert_eq!(
+        path_answer("app/[slug]/pa", cwd),
+        Some((
+            "app/[slug]/pa".to_string(),
+            vec!["app/[slug]/page.tsx".to_string()]
+        ))
+    );
+    assert_eq!(
+        path_answer("(group)/pa", cwd),
+        Some((
+            "(group)/pa".to_string(),
+            vec!["(group)/page.tsx".to_string()]
+        ))
+    );
+    // A backtick closed later in the token is kept as well.
+    assert!(path_answer("`src/m`", cwd).is_none_or(|(prefix, _)| prefix.starts_with('`')));
+}
+
+/// `extractAtPrefix` tests `startsWith("@")` on the stripped token (`autocomplete.ts:510-512`
+/// @f1b2e77f5): `(@fi` offers mentions, and accepting keeps the `(`.
+#[test]
+fn a_mention_after_an_opening_wrapper_opens_the_mention_popup() {
+    assert_eq!(crate::mention_query("(@fi").as_deref(), Some("fi"));
+    assert_eq!(crate::mention_query("see `@fi").as_deref(), Some("fi"));
+    let mut ed = InputEditor::new();
+    ed.set_mention_files(vec!["src/file.rs".to_string()]);
+    type_str(&mut ed, "see (@fi");
+    let ac = ed.autocomplete().expect("the mention popup must open");
+    assert_eq!(ac.context, crate::CompletionContext::Mention);
+    assert_eq!(ac.prefix, "@fi");
+    ed.handle_key(&key(KeyCode::Tab));
+    assert_eq!(ed.text(), "see (@src/file.rs ");
+}
+
+/// `isTokenStart` walks back over openers (`autocomplete.ts:91-97` @f1b2e77f5): a quoted prefix or a
+/// quoted mention right after `(` starts a token, while one glued to a word still does not.
+#[test]
+fn a_quote_after_an_opening_wrapper_starts_a_token() {
+    assert_eq!(
+        crate::mention_query("see (@\"my dir/fi").as_deref(),
+        Some("my dir/fi")
+    );
+    assert_eq!(
+        crate::mention_query("(@\"my dir/fi").as_deref(),
+        Some("my dir/fi")
+    );
+    assert_eq!(crate::mention_query("x(@\"my dir/fi").as_deref(), None);
+}
+
+/// `extractAtPrefix` (`autocomplete.ts:503-517` @f1b2e77f5) takes the quoted prefix only when it
+/// starts with `@"`; any other open quote falls through to `findLastDelimiter` +
+/// `stripLeadingWrappers`, so a plain `@word` typed inside an unclosed `"` (bare or after an opener)
+/// is still a mention, while the `@"quoted` form keeps its spaces.
+#[test]
+fn a_mention_inside_an_unclosed_plain_quote_is_still_a_mention() {
+    assert_eq!(
+        crate::mention_query("see (\"foo @src").as_deref(),
+        Some("src")
+    );
+    assert_eq!(
+        crate::mention_query("see \"foo @src").as_deref(),
+        Some("src")
+    );
+    assert_eq!(
+        crate::mention_query("see (\"foo (@src").as_deref(),
+        Some("src")
+    );
+    assert_eq!(crate::mention_query("see (\"foo").as_deref(), None);
+    assert_eq!(
+        crate::mention_query("see @\"quoted dir/fi").as_deref(),
+        Some("quoted dir/fi")
+    );
+    let candidates = vec!["src/".to_string(), "src/main.rs".to_string()];
+    let ac = crate::mention_autocomplete("see (\"foo @src", &candidates)
+        .expect("the mention popup must open");
+    assert_eq!(ac.context, crate::CompletionContext::Mention);
+    assert_eq!(ac.prefix, "@src");
+    let ac = crate::mention_autocomplete("see @\"quoted", &["quoted dir/".to_string()])
+        .expect("the quoted mention popup must open");
+    assert_eq!(ac.prefix, "@\"quoted");
+}
