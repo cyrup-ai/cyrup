@@ -1106,6 +1106,19 @@ impl SessionBuilder {
         // no `--model` had been given. A pattern that still resolves nowhere at 3b fails with the
         // same `ModelNotFound` this arm used to return, carrying the launch path's own
         // unknown-provider text when a resolver is wired. Same resolution, later.
+        // CFG-002/CFG-085 — `<agent_dir>/models.json`, read HERE rather than at the diagnostics
+        // block below, because the startup model must be resolved against the COMPOSED catalog.
+        // Upstream's `resolveCliModel`/`findInitialModel` are handed the `modelRuntime`
+        // (`model-resolver.ts:649`, `:675`), and every provider in a `ModelRuntime` has already
+        // been through `composeModelProvider` (`model-runtime.ts:215`) — so a `models.json` patch
+        // is part of the row pi resolves, not a later amendment to it. cyrup resolved against the
+        // bare `provider.models()`, which is why a `modelOverrides` patch reached `/model` (whose
+        // registry IS composed, `session/model.rs`'s `compose_model_registry`) but not the model
+        // the session started on: the two catalogs disagreed, and `inputLimits` declared on disk
+        // was therefore inert for the whole first selection. The errors are still surfaced once,
+        // below, where the rest of the startup diagnostics are assembled.
+        let (model_file, model_file_error) =
+            cyrup_config::load_models_file_reporting(&cfg.agent_dir.join("models.json"));
         let restore = RestoreInputs {
             existing: &existing,
             selection: session_selection.as_ref(),
@@ -1115,12 +1128,18 @@ impl SessionBuilder {
         };
         let mut deferred_model_pattern: Option<String> = None;
         let (mut resolved_model, mut model_ref, mut thinking, mut model_fallback_message) =
-            match resolve_model(&*self.provider, &cfg, &settings, &restore) {
+            match resolve_model(&*self.provider, &cfg, &settings, &restore, &model_file) {
                 Err(SessionServiceError::ModelNotFound(pattern)) if cfg.model_pattern.is_some() => {
                     let mut without_pattern = cfg.clone();
                     without_pattern.model_pattern = None;
                     deferred_model_pattern = Some(pattern);
-                    resolve_model(&*self.provider, &without_pattern, &settings, &restore)?
+                    resolve_model(
+                        &*self.provider,
+                        &without_pattern,
+                        &settings,
+                        &restore,
+                        &model_file,
+                    )?
                 }
                 resolved => resolved?,
             };
@@ -1184,6 +1203,17 @@ impl SessionBuilder {
                 .as_ref()
                 .is_none_or(cyrup_provider::Model::supports_image_input),
         );
+        // …and the twin handle for the resize PROFILE (PROV-134's read-tool clause / CFG-085's
+        // Verify). Pi reads `ctx?.model?.inputLimits?.images?.resize` per call (`read.ts:138`), so
+        // this must track `/model` the same way the vision bool does; seeded here from the resolved
+        // model's row and re-pushed at every site below that re-pushes `read_model_vision`. Without
+        // it `read` resolved `DEFAULT_IMAGE_RESIZE` for every model, so a row declaring a 512px
+        // profile had no effect on the one tool whose whole job is putting images into history.
+        let read_model_resize = cyrup_tools::config::ModelResizeHandle::new(
+            resolved_model
+                .as_ref()
+                .and_then(cyrup_provider::Model::image_resize_profile),
+        );
         let bash_session_env =
             cyrup_tools::config::SessionEnvHandle::new(cyrup_tools::config::SessionEnvInfo {
                 session_id: Some(session_id.to_string()),
@@ -1203,6 +1233,7 @@ impl SessionBuilder {
             ToolsOptions {
                 read: cyrup_tools::config::ReadOpts {
                     model_vision: Some(read_model_vision.clone()),
+                    model_resize: Some(read_model_resize.clone()),
                     // `images.autoResize` (Pi `_buildRuntime`: `const autoResizeImages =
                     // this.settingsManager.getImageAutoResize()` → `read: { autoResizeImages }`,
                     // agent-session.ts:2553,2564). Without this the setting had no consumer at all
@@ -1494,8 +1525,6 @@ impl SessionBuilder {
         // the entire custom-provider surface was dead. A malformed file is reported and skipped —
         // never fatal, never a panic (Pi keeps an empty snapshot + one error string,
         // model-config.ts:248-271).
-        let (model_file, model_file_error) =
-            cyrup_config::load_models_file_reporting(&cfg.agent_dir.join("models.json"));
         startup_diagnostics.models.extend(model_file_error);
         // The runtime pi.dev catalog overlay slot (DRIFT-007 + XAI_3, FINDING 3). An injected
         // service's slot is SHARED with whatever else refreshes through that service (the binary's
@@ -1523,7 +1552,9 @@ impl SessionBuilder {
             let (_, errors) = model_file.compose(&base);
             startup_diagnostics.models.extend(errors);
         }
-        let model_config = Arc::new(model_file);
+        // `model_file` is still borrowed by the 3b re-resolution below, so the shared handle is a
+        // clone rather than a move.
+        let model_config = Arc::new(model_file.clone());
 
         // Resolve the on-disk extension discovery roots from `--extension`/`--no-extensions` (Pi
         // `resourceLoaderOptions.additionalExtensionPaths`/`noExtensions`, main.ts:660,664), then
@@ -1775,11 +1806,16 @@ impl SessionBuilder {
                 }));
             };
             let (model, reference, level, fallback) =
-                resolve_model(&*owner, &cfg, &settings, &restore)?;
+                resolve_model(&*owner, &cfg, &settings, &restore, &model_file)?;
             read_model_vision.set(
                 model
                     .as_ref()
                     .is_none_or(cyrup_provider::Model::supports_image_input),
+            );
+            read_model_resize.set(
+                model
+                    .as_ref()
+                    .and_then(cyrup_provider::Model::image_resize_profile),
             );
             if let Some(reference) = reference.as_ref() {
                 bash_session_env
@@ -1852,6 +1888,7 @@ impl SessionBuilder {
             // and the `bash` child's `CYRUP_MODEL`/`CYRUP_REASONING_LEVEL` must describe the model
             // the session actually starts on.
             read_model_vision.set(virtual_model.supports_image_input());
+            read_model_resize.set(virtual_model.image_resize_profile());
             bash_session_env.set_model(
                 virtual_model.provider.to_string(),
                 virtual_model.id.to_string(),
@@ -2623,6 +2660,7 @@ impl SessionBuilder {
             handle,
             bash_session_env,
             read_model_vision,
+            read_model_resize,
             nested_calls,
             run_abort_requested,
             hooks: nested_hooks,
@@ -2776,6 +2814,7 @@ fn resolve_model(
     cfg: &SessionConfig,
     settings: &SettingsManager,
     restore: &RestoreInputs<'_>,
+    model_config: &cyrup_config::ModelFile,
 ) -> Result<ResolvedModel, SessionServiceError> {
     let RestoreInputs {
         existing,
@@ -2803,7 +2842,15 @@ fn resolve_model(
     // catalogs cannot disagree about which rows exist or in what order. A provider with no
     // physical rows appends at the end, which keeps the `available.first()` fallback of step 3 on
     // a physical model whenever there is one.
-    let mut available = provider.models().to_vec();
+    //
+    // `models.json` is composed FIRST and the virtual overlay applied after, the same order
+    // `AgentSession::compose_model_registry` uses and the same order pi uses (`recomposeProvider`
+    // composes the provider and only then calls `withVirtualModels`, `model-runtime.ts:171-215`).
+    // Composing here is what makes a declared row or a `modelOverrides` patch — `inputLimits`
+    // among them — part of the model the session STARTS on, and therefore part of
+    // `limits_model()`'s answer and of the `read` tool's seeded profile. With no `models.json` the
+    // composition returns the provider's own rows in their own order, unchanged.
+    let (mut available, _errors) = model_config.compose(provider.models());
     virtual_models.apply_to_catalog(&mut available);
     let resolver = ModelResolver::new(&available);
     let mut fallback: Option<String> = None;

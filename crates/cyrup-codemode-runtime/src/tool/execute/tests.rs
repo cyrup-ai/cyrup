@@ -1106,6 +1106,7 @@ fn painter_models(
         base_url: "https://images.test/v1".into(),
         input: vec![Modality::Text],
         output: vec![Modality::Image],
+        input_limits: None,
         cost: ModelCost::default(),
         headers: None,
     };

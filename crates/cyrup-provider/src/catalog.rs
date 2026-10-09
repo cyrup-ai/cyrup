@@ -11,7 +11,10 @@
 //! here remain the source of truth and the floor, and the overlay can only add or replace models by
 //! id, never remove one.
 
-use crate::model::Model;
+use crate::classifier::{ClassifierModel, ImageModel, ModelType};
+use crate::model::{
+    Modality, Model, ModelImageInputLimits, ModelImageResizeOptions, ModelInputLimits,
+};
 
 /// Parse a catalog from a JSON array of [`Model`] records (the neutral, camelCase serde form),
 /// then apply pi's generated-catalog compat metadata to every row.
@@ -39,6 +42,7 @@ pub fn load_catalog(json: &str) -> Result<Vec<Model>, serde_json::Error> {
     for model in &mut models {
         apply_openai_completions_compat_metadata(model);
         apply_prompt_cache_metadata(model);
+        apply_image_input_metadata(model);
     }
     Ok(models)
 }
@@ -102,6 +106,164 @@ pub(crate) fn apply_prompt_cache_metadata(model: &mut Model) {
             long: Some(3600),
         });
     }
+}
+
+/// The resize profile every image-capable model resolves to when its row declares none — Pi
+/// `DEFAULT_IMAGE_RESIZE` (`packages/ai/scripts/generate-models.ts:424-430` @v1.0.4).
+///
+/// Re-exported from its home in `cyrup-core` beside [`ModelImageResizeOptions`], so the generator
+/// stamp here and the resizer in `cyrup-tools` read the SAME four numbers rather than two copies
+/// that can drift. See [`cyrup_core::image`] for why the type is homed there.
+pub use cyrup_core::DEFAULT_IMAGE_RESIZE;
+
+/// Pi `applyImageInputMetadata` (`packages/ai/scripts/generate-models.ts:994-1020` @v1.0.4), the
+/// third of this module's generated-catalog passes.
+///
+/// **A stamp here is warranted by direct evidence, not by analogy with
+/// [`apply_prompt_cache_metadata`].** Upstream really does inject `inputLimits` at generation
+/// time: `applyImageInputMetadata` is called once over the chat + classifier list (`:3487`) and
+/// again over the openrouter IMAGE list (`:3505`). Its numbers are pinned by upstream's own
+/// assertions (`packages/ai/test/providers.test.ts:111-136`).
+///
+/// It differs from its prompt-cache sibling in REACH, which is why copying that one's shape
+/// without re-reading would under-port it: that pass is narrow (direct Anthropic only), this one
+/// is broad (every image-capable row of four named providers, PLUS a universal resize default for
+/// every other provider).
+///
+/// The shape, in full:
+///
+/// 1. Return unchanged unless `input` contains [`Modality::Image`] — upstream's
+///    `if (!model.input.includes("image")) return;`. A text-only row keeps `input_limits: None`,
+///    which is what makes the field's absence meaningful rather than merely unset.
+/// 2. Pick the provider's hard limits: `anthropic` → 32 MiB and `maxPerRequest` **100** for a
+///    non-image row whose `contextWindow` is exactly 200000, else **600**; `amazon-bedrock` →
+///    `maxPerMessage: 20`; `openai` → 512 MiB and 1500; `google` → 20 MiB and 3600; anything else
+///    → nothing.
+/// 3. Merge so the ROW wins over the provider table (`{...providerLimits, ...model.inputLimits}`),
+///    and fill `images.resize` PER KEY from [`DEFAULT_IMAGE_RESIZE`] under whatever the row
+///    declared (`{...DEFAULT_IMAGE_RESIZE, ...configuredImages?.resize}`). So `resize` on an
+///    image-capable row is ALWAYS complete afterwards, and a row that declares one key keeps it
+///    and gains the other three.
+///
+/// `[CYRUP-DELTA]` **Mechanism, at full parity** — the same note [`load_catalog`] carries, for the
+/// same reason (PROV-071: cyrup's generator analogue cannot be run at this pin). cyrup stamps when
+/// the frozen JSON is parsed rather than when it is generated. Measured at HEAD over the 39
+/// embedded catalogs: 1519 rows, 1065 image-capable, and 1011 of those already carry `inputLimits`
+/// in exactly these shapes, so over the JSON CHAT catalogs this pass is already a no-op and merely
+/// adds nothing a generator run would not. It earns its keep in two places where the data really
+/// is absent: [`crate::providers::openrouter::openrouter_image_models`], whose
+/// `catalog/openrouter-images.json` was frozen at v0.87.1 before the field existed and carries one
+/// on **0 of its 54 image-capable rows**; and [`crate::providers::together::together_models`], the
+/// one built-in catalog written as Rust literals rather than JSON, which therefore never reaches
+/// `load_catalog` at all (6 image-capable rows).
+///
+/// Like both siblings, it only ever fills what the row left unset, so a future generator run that
+/// bakes the key in makes it a no-op by construction. And like both siblings it runs ONLY at
+/// catalog parse sites — never over a user `models.json`, which upstream's `modelFromJson` copies
+/// verbatim (`provider-composer.ts:239`).
+pub(crate) fn apply_image_input_metadata(model: &mut Model) {
+    stamp_image_input_limits(
+        model.provider.as_str(),
+        &model.input,
+        ModelType::Chat,
+        Some(model.context_window),
+        &mut model.input_limits,
+    );
+}
+
+/// [`apply_image_input_metadata`] for an image row — upstream's second call site (`:3505`), where
+/// `model.type === "image"` short-circuits Anthropic's `contextWindow` branch to 600.
+pub(crate) fn apply_image_input_metadata_to_image(model: &mut ImageModel) {
+    stamp_image_input_limits(
+        model.provider.as_str(),
+        &model.input,
+        ModelType::Image,
+        // pi's `ImageModel` extends `BaseModel`, which declares no `contextWindow`
+        // (`types.ts:1097-1108`), so the `=== 200000` test is `undefined === 200000` → false.
+        None,
+        &mut model.input_limits,
+    );
+}
+
+/// [`apply_image_input_metadata`] for a classifier row. Classifiers go through upstream's FIRST
+/// call site with the chat models (`:3487`), so the `type !== "image"` half of Anthropic's branch
+/// is true for them and their own `contextWindow` decides 100 vs 600.
+pub(crate) fn apply_image_input_metadata_to_classifier(model: &mut ClassifierModel) {
+    stamp_image_input_limits(
+        model.provider.as_str(),
+        &model.input,
+        ModelType::Classifier,
+        Some(model.context_window),
+        &mut model.input_limits,
+    );
+}
+
+/// The one body the three wrappers share, held apart from them because pi's `AnyModel` parameter
+/// has no Rust counterpart that is `&mut` across all three concrete types.
+fn stamp_image_input_limits(
+    provider: &str,
+    input: &[Modality],
+    model_type: ModelType,
+    context_window: Option<u64>,
+    limits: &mut Option<ModelInputLimits>,
+) {
+    if !input.contains(&Modality::Image) {
+        return;
+    }
+
+    // `providerLimits` (`generate-models.ts:997-1008`). Tuple order:
+    // (maxRequestBytes, images.maxPerMessage, images.maxPerRequest).
+    let (provider_request_bytes, provider_per_message, provider_per_request) = match provider {
+        "anthropic" => {
+            let per_request = if model_type != ModelType::Image && context_window == Some(200_000) {
+                100
+            } else {
+                600
+            };
+            (Some(32 * 1024 * 1024), None, Some(per_request))
+        }
+        "amazon-bedrock" => (None, Some(20), None),
+        "openai" => (Some(512 * 1024 * 1024), None, Some(1500)),
+        "google" => (Some(20 * 1024 * 1024), None, Some(3600)),
+        _ => (None, None, None),
+    };
+
+    let configured = limits.take();
+    let configured_images = configured.as_ref().and_then(|l| l.images.as_ref());
+    let configured_resize = configured_images.and_then(|i| i.resize.as_ref());
+
+    *limits = Some(ModelInputLimits {
+        // `{ ...providerLimits, ...model.inputLimits }`: the row's value wins.
+        max_request_bytes: configured
+            .as_ref()
+            .and_then(|l| l.max_request_bytes)
+            .or(provider_request_bytes),
+        images: Some(ModelImageInputLimits {
+            // `resize: { ...DEFAULT_IMAGE_RESIZE, ...configuredImages?.resize }` — per key, so a
+            // row declaring only `jpegQuality` keeps it and gains the other three defaults.
+            resize: Some(ModelImageResizeOptions {
+                max_width: configured_resize
+                    .and_then(|r| r.max_width)
+                    .or(DEFAULT_IMAGE_RESIZE.max_width),
+                max_height: configured_resize
+                    .and_then(|r| r.max_height)
+                    .or(DEFAULT_IMAGE_RESIZE.max_height),
+                max_bytes: configured_resize
+                    .and_then(|r| r.max_bytes)
+                    .or(DEFAULT_IMAGE_RESIZE.max_bytes),
+                jpeg_quality: configured_resize
+                    .and_then(|r| r.jpeg_quality)
+                    .or(DEFAULT_IMAGE_RESIZE.jpeg_quality),
+            }),
+            // `{ ...providerLimits?.images, ...configuredImages }`: again the row wins.
+            max_per_message: configured_images
+                .and_then(|i| i.max_per_message)
+                .or(provider_per_message),
+            max_per_request: configured_images
+                .and_then(|i| i.max_per_request)
+                .or(provider_per_request),
+        }),
+    });
 }
 
 /// Every model the implemented built-in providers ship — the real, whole model registry catalog

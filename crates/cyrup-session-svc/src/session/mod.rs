@@ -36,12 +36,14 @@ mod model;
 mod model_calls;
 pub(crate) mod model_runtime;
 mod nested;
+pub(crate) mod prompt_images;
 mod prompt_update;
 mod queue;
 mod retry;
 mod run;
 mod stats;
 mod thinking;
+mod tool_result_images;
 mod tools;
 mod transcript;
 mod types;
@@ -147,6 +149,9 @@ pub(crate) struct SessionExtras {
     /// `read`'s view of whether the ACTIVE model accepts image input, re-pushed on every `/model`
     /// switch so the tool's non-vision warning tracks the live model rather than the startup one.
     pub read_model_vision: cyrup_tools::config::ModelVisionHandle,
+    /// `read`'s view of the ACTIVE model's `inputLimits.images.resize`, re-pushed on every `/model`
+    /// switch for the same reason [`Self::read_model_vision`] is (pi `read.ts:138`).
+    pub read_model_resize: cyrup_tools::config::ModelResizeHandle,
 }
 
 /// A settable, weak self-reference so the persist+fan-out subscriber (which the agent owns) and the
@@ -356,6 +361,7 @@ pub struct AgentSession {
     /// too, rather than only of the tool in isolation.
     bash_session_env: cyrup_tools::config::SessionEnvHandle,
     read_model_vision: cyrup_tools::config::ModelVisionHandle,
+    read_model_resize: cyrup_tools::config::ModelResizeHandle,
     // ---- dynamic tools (Pi agent-session.ts:786-828,2304) ----
     /// Shared (`Arc`) with [`crate::host_services::LiveHostServices`] so a live wasm guest's
     /// `setActiveTools`/`getActiveTools` and the host/CLI tool-toggle read+mutate the SAME state.
@@ -538,6 +544,7 @@ impl AgentSession {
             pending_bash: Mutex::new(Vec::new()),
             bash_session_env: extras.bash_session_env,
             read_model_vision: extras.read_model_vision,
+            read_model_resize: extras.read_model_resize,
             dynamic_tools: extras.dynamic_tools,
             nested,
             codemode_host: extras.codemode_host,

@@ -2,10 +2,15 @@
 //!
 //! A 1:1 port of Pi `cli/file-processor.ts` + `cli/initial-message.ts`: `@`-prefixed positionals are
 //! file references. Each text file is wrapped `<file name="ABS">\n{content}\n</file>\n`
-//! (file-processor.ts:77); each image file is MIME-sniffed, downscaled to fit 2000×2000 AND re-encoded
-//! below the 4.5MB base64 cap (Pi `resizeImage`) WHEN the effective `images.autoResize` setting is on
-//! (Pi threads `settingsManager.getImageAutoResize()` main.ts:830 → file-processor.ts:53; when off,
-//! the normalized original bytes are inlined verbatim), attached as a base64 `Content::Image`, and
+//! (file-processor.ts:77); each image file is MIME-sniffed and handed to the ONE shared
+//! `cyrup_tools::image_proc::process_image` (Pi `processImage`) — which, when the effective
+//! `images.autoResize` setting is on, downscales it to fit the resize profile's clamps AND
+//! re-encodes it below the profile's base64 cap, and when off inlines the normalized original bytes
+//! verbatim (Pi threads `settingsManager.getImageAutoResize()` main.ts:830 → file-processor.ts:53).
+//! No profile is supplied at this boundary — it is argv, reached before any model is selected, so
+//! every key resolves to `DEFAULT_IMAGE_RESIZE` (2000×2000, 4.5 MiB of base64, quality 80), exactly
+//! as Pi's `file-processor.ts:54` passes no `resizeOptions`. The result is attached as a base64
+//! `Content::Image`, and
 //! referenced with an empty `<file name="ABS"></file>\n` tag
 //! (file-processor.ts:48-72). Empty files are skipped (file-processor.ts:43); a missing file is a
 //! hard error the bin maps to exit 1 (file-processor.ts:37). The initial message is
@@ -16,14 +21,10 @@ use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
-use base64::Engine;
 use cyrup_sdk::core::Content;
 use tokio::io::AsyncReadExt;
 
 use crate::cli::Cli;
-
-/// Max image edge before downscale (file-processor.ts `processImage` 2000×2000, image-process.ts).
-const MAX_IMAGE_EDGE: u32 = 2000;
 
 /// The assembled prompt inputs for a one-shot / interactive launch.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -153,297 +154,6 @@ struct ProcessedFiles {
     images: Vec<Content>,
 }
 
-/// A processed-image result mirroring Pi `ProcessImageResult` (image-process.ts:11-20): the base64
-/// data, the (preserved-or-converted) MIME type, and the processing hint lines.
-struct ProcessedImage {
-    data: String,
-    mime_type: String,
-    hints: Vec<String>,
-}
-
-/// Map a detected MIME type onto the supported inline image MIME, keeping the original format (Pi
-/// `normalizeSupportedImageMimeType`, image-process.ts:33-46). `image/jpg` folds to `image/jpeg`.
-/// Anything else (e.g. `image/bmp`) returns `None`, signalling a PNG conversion.
-fn supported_inline_mime(mime: &str) -> Option<&'static str> {
-    match mime
-        .split(';')
-        .next()
-        .unwrap_or(mime)
-        .trim()
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "image/png" => Some("image/png"),
-        "image/jpeg" | "image/jpg" => Some("image/jpeg"),
-        "image/gif" => Some("image/gif"),
-        "image/webp" => Some("image/webp"),
-        _ => None,
-    }
-}
-
-/// The 4.5MB base64-payload cap Pi enforces on inline images (Pi `DEFAULT_MAX_BYTES`,
-/// image-resize-core.ts:22): `4.5 · 1024 · 1024` bytes of base64, headroom below Anthropic's 5MB limit.
-const MAX_IMAGE_BASE64_BYTES: usize = 4_718_592;
-
-/// The JPEG quality ladder tried at each dimension step (Pi `qualitySteps`, image-resize-core.ts:122 —
-/// `Array.from(new Set([jpegQuality=80, 85, 70, 55, 40]))`).
-const JPEG_QUALITY_STEPS: [u8; 5] = [80, 85, 70, 55, 40];
-
-/// Why an image could not be inlined, mapping to Pi's two distinct `[Image omitted: …]` messages
-/// (image-process.ts:80-92): a normalization failure vs a resize-below-cap failure. The caller renders
-/// the matching placeholder into the `<file>` tag (Pi `processed.ok === false`, file-processor.ts).
-enum ImageOmit {
-    /// Pi `normalizeImage` returned null — an unsupported format that could not be converted to PNG.
-    Convert,
-    /// Pi `resizeImage` returned null — could not be re-encoded/downscaled below `maxBytes`.
-    Resize,
-}
-
-impl ImageOmit {
-    fn message(&self) -> &'static str {
-        match self {
-            ImageOmit::Convert => {
-                "[Image omitted: could not be converted to a supported inline image format.]"
-            }
-            ImageOmit::Resize => {
-                "[Image omitted: could not be resized below the inline image size limit.]"
-            }
-        }
-    }
-}
-
-/// A settled resize result mirroring Pi `ResizedImage` (image-resize-core.ts:11-19): the base64 data,
-/// its (possibly format-switched) MIME, the original + displayed dimensions, and whether any re-encode
-/// or downscale occurred (drives `formatDimensionNote`).
-struct Resized {
-    data: String,
-    mime_type: String,
-    original_width: u32,
-    original_height: u32,
-    width: u32,
-    height: u32,
-    was_resized: bool,
-}
-
-/// The first base64-encoded candidate under the byte cap at a fixed dimension, tried in Pi's exact
-/// preference order (Pi `tryEncodings` candidate array, image-resize-core.ts:108-120): PNG first
-/// (lossless when it fits), then JPEG at each quality step. Returns `None` when nothing fits at these
-/// dimensions, so the caller shrinks and retries.
-fn first_candidate_under_cap(img: &image::DynamicImage) -> Option<(String, &'static str)> {
-    use image::ImageEncoder;
-
-    // PNG candidate (Pi `encodeCandidate(resized.get_bytes(), "image/png")`).
-    let mut png = Vec::new();
-    if img
-        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
-        .is_ok()
-    {
-        let data = base64::engine::general_purpose::STANDARD.encode(&png);
-        if data.len() < MAX_IMAGE_BASE64_BYTES {
-            return Some((data, "image/png"));
-        }
-    }
-
-    // JPEG candidates at each quality step (Pi `resized.get_bytes_jpeg(quality)`); JPEG has no alpha
-    // channel, so flatten to RGB8 first (Photon's JPEG encoder likewise drops alpha).
-    let rgb = img.to_rgb8();
-    for quality in JPEG_QUALITY_STEPS {
-        let mut jpeg = Vec::new();
-        if image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, quality)
-            .write_image(
-                rgb.as_raw(),
-                rgb.width(),
-                rgb.height(),
-                image::ExtendedColorType::Rgb8,
-            )
-            .is_ok()
-        {
-            let data = base64::engine::general_purpose::STANDARD.encode(&jpeg);
-            if data.len() < MAX_IMAGE_BASE64_BYTES {
-                return Some((data, "image/jpeg"));
-            }
-        }
-    }
-    None
-}
-
-/// Resize an image to fit BOTH `MAX_IMAGE_EDGE` and the base64 byte cap — a 1:1 port of Pi
-/// `resizeImageInProcess` (image-resize-core.ts:59-164). If the input is already within the pixel
-/// bounds AND under the byte cap it is returned as-is (`was_resized = false`). Otherwise it is scaled
-/// to fit the pixel bounds and, at each dimension step, encoded PNG-first then JPEG down the quality
-/// ladder; the first candidate under the cap wins. When nothing fits, dimensions shrink by ×0.75 (min
-/// 1×1) and the ladder repeats. Returns `None` only when the image cannot be brought under the cap (Pi
-/// returns null → the caller emits the "could not be resized" placeholder).
-fn resize_image(input_bytes: &[u8], mime_type: &str) -> Option<Resized> {
-    // Pi `inputBase64Size = Math.ceil(inputBytes.byteLength / 3) * 4` (image-resize-core.ts:65).
-    let input_base64_size = input_bytes.len().div_ceil(3) * 4;
-
-    let decoded = image::load_from_memory(input_bytes).ok()?;
-    let original_width = decoded.width();
-    let original_height = decoded.height();
-
-    // Already within all limits (dimensions AND encoded size) → return untouched (Pi lines 83-93).
-    if original_width <= MAX_IMAGE_EDGE
-        && original_height <= MAX_IMAGE_EDGE
-        && input_base64_size < MAX_IMAGE_BASE64_BYTES
-    {
-        return Some(Resized {
-            data: base64::engine::general_purpose::STANDARD.encode(input_bytes),
-            mime_type: mime_type.to_string(),
-            original_width,
-            original_height,
-            width: original_width,
-            height: original_height,
-            was_resized: false,
-        });
-    }
-
-    // Initial target dimensions respecting the max edge, aspect-ratio-preserving (Pi lines 96-106,
-    // `Math.round`). `resize_exact` below then reproduces Photon's exact-size resize at each step.
-    let mut target_width = original_width;
-    let mut target_height = original_height;
-    if target_width > MAX_IMAGE_EDGE {
-        target_height =
-            ((target_height as f64 * MAX_IMAGE_EDGE as f64) / target_width as f64).round() as u32;
-        target_width = MAX_IMAGE_EDGE;
-    }
-    if target_height > MAX_IMAGE_EDGE {
-        target_width =
-            ((target_width as f64 * MAX_IMAGE_EDGE as f64) / target_height as f64).round() as u32;
-        target_height = MAX_IMAGE_EDGE;
-    }
-
-    let mut current_width = target_width.max(1);
-    let mut current_height = target_height.max(1);
-    loop {
-        let resized = decoded.resize_exact(
-            current_width,
-            current_height,
-            image::imageops::FilterType::Lanczos3,
-        );
-        if let Some((data, mime)) = first_candidate_under_cap(&resized) {
-            return Some(Resized {
-                data,
-                mime_type: mime.to_string(),
-                original_width,
-                original_height,
-                width: current_width,
-                height: current_height,
-                was_resized: true,
-            });
-        }
-
-        if current_width == 1 && current_height == 1 {
-            break;
-        }
-        // Pi lines 146-153: shrink each axis by ×0.75 (floor, min 1); stop when neither axis moves.
-        let next_width = if current_width == 1 {
-            1
-        } else {
-            ((current_width as f64) * 0.75).floor().max(1.0) as u32
-        };
-        let next_height = if current_height == 1 {
-            1
-        } else {
-            ((current_height as f64) * 0.75).floor().max(1.0) as u32
-        };
-        if next_width == current_width && next_height == current_height {
-            break;
-        }
-        current_width = next_width;
-        current_height = next_height;
-    }
-    None
-}
-
-/// Process an image faithfully to Pi `processImage` (image-process.ts:71-118): first `normalizeImage`
-/// — KEEP the source MIME for the supported inline formats (PNG/JPEG/GIF/WebP), converting only
-/// unsupported formats to PNG — then `resizeImage`, the byte-cap re-encode ladder ([`resize_image`])
-/// that enforces the 4.5MB base64 limit AS WELL AS the 2000px edge. Emits the `[Image converted from …
-/// to …]` hint (compared against the FINAL re-encoded MIME, Pi image-process.ts:96) and the `[Image:
-/// original WxH, displayed at WxH. Multiply coordinates by S …]` dimension note when a resize occurred
-/// (Pi `formatDimensionNote`, image-resize.ts:116-123). Returns [`ImageOmit`] on failure so the caller
-/// emits Pi's matching placeholder (image-process.ts:80-92).
-fn process_image(
-    bytes: &[u8],
-    detected_mime: &str,
-    auto_resize: bool,
-) -> Result<ProcessedImage, ImageOmit> {
-    // normalizeImage: keep the source format when supported inline, else convert to PNG.
-    let (norm_mime, norm_bytes, converted_from): (String, Vec<u8>, Option<String>) =
-        match supported_inline_mime(detected_mime) {
-            Some(mime) => (mime.to_string(), bytes.to_vec(), None),
-            None => {
-                // Pi `convertImageBytesToPng`; a decode/encode failure is the "could not be converted"
-                // omission (image-process.ts:79-83).
-                let decoded = image::load_from_memory(bytes).map_err(|_| ImageOmit::Convert)?;
-                let mut buf = std::io::Cursor::new(Vec::new());
-                decoded
-                    .write_to(&mut buf, image::ImageFormat::Png)
-                    .map_err(|_| ImageOmit::Convert)?;
-                (
-                    "image/png".to_string(),
-                    buf.into_inner(),
-                    Some(
-                        detected_mime
-                            .split(';')
-                            .next()
-                            .unwrap_or(detected_mime)
-                            .trim()
-                            .to_ascii_lowercase(),
-                    ),
-                )
-            }
-        };
-
-    // `if (autoResizeImages) { … }` (image-process.ts). The FALSE branch skips `resizeImage`
-    // entirely and inlines the normalized original bytes: no byte-cap ladder, no dimension note, and
-    // the conversion hint compared against the NORMALIZED mime rather than a re-encoded one.
-    if !auto_resize {
-        let mut hints: Vec<String> = Vec::new();
-        if let Some(from) = converted_from.as_ref()
-            && from != &norm_mime
-        {
-            hints.push(format!("[Image converted from {from} to {norm_mime}.]"));
-        }
-        return Ok(ProcessedImage {
-            data: base64::engine::general_purpose::STANDARD.encode(&norm_bytes),
-            mime_type: norm_mime,
-            hints,
-        });
-    }
-
-    // resizeImage: the byte-cap re-encode ladder. `None` ⇒ the "could not be resized" omission.
-    let resized = resize_image(&norm_bytes, &norm_mime).ok_or(ImageOmit::Resize)?;
-
-    let mut hints: Vec<String> = Vec::new();
-    // conversionHint(convertedFrom, resized.mimeType): compared against the FINAL MIME, so a BMP that
-    // converts to PNG but re-encodes to JPEG reads "converted from image/bmp to image/jpeg"
-    // (image-process.ts:67-69,96).
-    if let Some(from) = converted_from.as_ref()
-        && from != &resized.mime_type
-    {
-        hints.push(format!(
-            "[Image converted from {from} to {}.]",
-            resized.mime_type
-        ));
-    }
-    // formatDimensionNote (image-resize.ts:116-123): only when a resize/re-encode occurred.
-    if resized.was_resized {
-        let scale = resized.original_width as f64 / resized.width.max(1) as f64;
-        hints.push(format!(
-            "[Image: original {}x{}, displayed at {}x{}. Multiply coordinates by {scale:.2} to map to original image.]",
-            resized.original_width, resized.original_height, resized.width, resized.height
-        ));
-    }
-
-    Ok(ProcessedImage {
-        data: resized.data,
-        mime_type: resized.mime_type,
-        hints,
-    })
-}
-
 /// Process the `@file` references into wrapped text + image attachments (Pi `processFileArguments`).
 /// `auto_resize` is Pi's `options.autoResizeImages` (file-processor.ts:24-25), threaded from
 /// `settingsManager.getImageAutoResize()` at main.ts:830 and handed to `processImage` at
@@ -478,31 +188,55 @@ async fn process_file_args(
         // beginning `BMW …` reached the model as an image-processing failure instead of its text)
         // and claimed `FF D8 FF F7` as JPEG. There is now one copy of this predicate.
         match cyrup_tools::ImageMime::from_file_head(&bytes) {
-            Some(mime) => match process_image(&bytes, mime.mime(), auto_resize) {
-                Ok(processed) => {
+            // SEAM-128 — one `process_image` for the whole tree. This path used to carry its own
+            // ~215-line copy of Pi's `processImage`/`resizeImageInProcess`, which (a) had no EXIF
+            // orientation handling at all, so a rotated phone screenshot reached the model
+            // sideways where upstream bakes the tag in (`image-resize-core.ts:72`), and (b)
+            // hardcoded its profile as `MAX_IMAGE_EDGE`/`MAX_IMAGE_BASE64_BYTES`/
+            // `JPEG_QUALITY_STEPS` consts with no `jpegQuality` parameter at all. The shared
+            // module takes the profile as `Option<&ModelImageResizeOptions>`.
+            //
+            // `resize: None` here is not a stub, it is the only honest value: this is the CLI
+            // ARGV boundary, reached before any session exists and therefore before any model is
+            // selected — Pi's own `file-processor.ts:54` likewise passes no `resizeOptions`. An
+            // absent profile resolves per key against `DEFAULT_IMAGE_RESIZE`, i.e. byte-for-byte
+            // the 2000px / 4.5 MiB / quality-80 numbers the deleted consts held.
+            Some(mime) => match cyrup_tools::image_proc::process_image(
+                &bytes,
+                mime.mime(),
+                cyrup_tools::image_proc::ProcessImageOptions {
+                    auto_resize_images: auto_resize,
+                    resize: None,
+                },
+            ) {
+                cyrup_tools::image_proc::Processed::Ok {
+                    data,
+                    mime: out_mime,
+                    hints,
+                } => {
                     out.images.push(Content::Image {
-                        data: processed.data,
-                        mime_type: processed.mime_type,
+                        data,
+                        mime_type: out_mime,
                     });
                     // Reference the image with its processing hints (Pi file-processor.ts:67-72): the
                     // hint lines joined with "\n" inside the `<file>` tag, or an empty tag when none.
-                    if processed.hints.is_empty() {
+                    if hints.is_empty() {
                         out.text
                             .push_str(&format!("<file name=\"{name}\"></file>\n"));
                     } else {
                         out.text.push_str(&format!(
                             "<file name=\"{name}\">{}</file>\n",
-                            processed.hints.join("\n")
+                            hints.join("\n")
                         ));
                     }
                 }
                 // Unprocessable image → text placeholder (Pi `processed.ok === false`,
-                // file-processor.ts:55-58); the omission reason picks Pi's matching message
-                // (image-process.ts:80-92).
-                Err(reason) => out.text.push_str(&format!(
-                    "<file name=\"{name}\">{}</file>\n",
-                    reason.message()
-                )),
+                // file-processor.ts:55-58). The message now comes from the shared module's
+                // `Failed { message }` arm rather than being reconstructed here from a
+                // two-variant enum — which is what lets it carry a per-call message at all.
+                cyrup_tools::image_proc::Processed::Failed { message } => out
+                    .text
+                    .push_str(&format!("<file name=\"{name}\">{message}</file>\n")),
             },
             None => {
                 // Text file: wrap content in <file> tags with the absolute path. A `null` sniff
@@ -596,25 +330,34 @@ pub async fn read_piped_stdin() -> anyhow::Result<Option<String>> {
 /// Build the prompt inputs from the CLI: split positionals, process `@file` text + images, merge
 /// piped stdin. `cwd` resolves relative `@file` paths (Pi uses `process.cwd()`).
 ///
-/// `auto_resize` is the effective `images.autoResize` setting, mirroring Pi's
-/// `prepareInitialMessage(parsed, settingsManager.getImageAutoResize(), stdinContent)`
-/// (main.ts:828-832 → :181 → file-processor.ts:53). It is a required argument rather than a
-/// defaulted option precisely because it used to be missing: `@screenshot.png` always downsampled to
-/// 2000px and injected a `[Image: original …, displayed at …]` note no matter what the settings
-/// panel's "Auto-resize images" toggle said.
+/// # The `@file` resize is the SESSION's job, not this function's (SEAM-128)
+///
+/// There is deliberately no `auto_resize` parameter here, and the one this function hands
+/// [`process_file_args`] is a hard `false`. That is upstream's own shape: `prepareInitialMessage`
+/// took an `autoResizeImages` argument until pi dropped it, and now calls
+/// `processFileArguments(parsed.fileArgs, { autoResizeImages: false })` with the comment
+/// *"AgentSession resizes these after extension hooks select the request model"*
+/// (`packages/coding-agent/src/main.ts:221-223` @v1.0.4).
+///
+/// The reason is the whole point of SEAM-128. This is the ARGV boundary: it runs before a session
+/// exists, so before any model is selected and before any `before_agent_start` handler has had the
+/// chance to select another one. A resize applied here is applied against a profile nobody chose —
+/// which is exactly what cyrup used to do, with a hardcoded 2000px / 4.5 MiB profile baked into
+/// `input.rs` as consts. `AgentSession::normalize_prompt_images` now resizes every prompt image,
+/// from every entry point, against the REQUEST model's `inputLimits.images.resize`; doing it twice
+/// would re-encode an already-downscaled image for no gain and against the wrong profile.
+///
+/// `process_file_args` keeps its `auto_resize` parameter and its true branch, exactly as pi keeps
+/// `processFileArguments`' option — only the CALL here stops asking for it.
 ///
 /// `piped` is the already-read piped-stdin content — Pi's third `prepareInitialMessage` argument
 /// (`stdinContent`, main.ts:831), produced by [`read_piped_stdin`] at the call site. It is a
 /// parameter and not an internal read for the same reason it is one upstream: this function is the
 /// prompt-assembly step, not the descriptor-owning step.
-pub async fn build_inputs(
-    cli: &Cli,
-    cwd: &Path,
-    auto_resize: bool,
-    piped: Option<String>,
-) -> anyhow::Result<Inputs> {
+pub async fn build_inputs(cli: &Cli, cwd: &Path, piped: Option<String>) -> anyhow::Result<Inputs> {
     let (files, messages) = split_positionals(&cli.positionals);
-    let processed = process_file_args(&files, cwd, auto_resize).await?;
+    // `{ autoResizeImages: false }` — pi main.ts:223. See this function's docs.
+    let processed = process_file_args(&files, cwd, false).await?;
     let file_text = if processed.text.is_empty() {
         None
     } else {
@@ -743,6 +486,42 @@ mod tests {
         assert_eq!(
             processed.text,
             format!("<file name=\"{}\"></file>\n", path.display())
+        );
+    }
+
+    /// SEAM-128 — `process_file_args` KEEPS its `auto_resize` parameter and its true branch, as pi
+    /// keeps `processFileArguments`' `autoResizeImages` option (`cli/file-processor.ts:24-25,53`);
+    /// only [`build_inputs`]'s CALL stopped asking for it (pi `main.ts:223`). This pins the branch
+    /// so the parameter cannot rot into a dead argument: with it on, the same 2600px fixture
+    /// `tests/image_auto_resize_file_args.rs` inlines verbatim is downscaled and annotated.
+    #[tokio::test]
+    async fn process_file_args_still_resizes_when_asked_to() {
+        let dir = tempfile::tempdir().unwrap();
+        let img: image::ImageBuffer<image::Rgb<u8>, Vec<u8>> =
+            image::ImageBuffer::from_fn(2600, 800, |x, y| {
+                image::Rgb([(x % 251) as u8, (y % 241) as u8, 0])
+            });
+        let path = dir.path().join("wide.png");
+        img.save_with_format(&path, image::ImageFormat::Png)
+            .unwrap();
+
+        let on = process_file_args(&[path.to_string_lossy().into_owned()], dir.path(), true)
+            .await
+            .unwrap();
+        assert!(
+            on.text
+                .contains("[Image: original 2600x800, displayed at 2000x"),
+            "auto_resize=true must still downscale and annotate: {}",
+            on.text
+        );
+
+        let off = process_file_args(&[path.to_string_lossy().into_owned()], dir.path(), false)
+            .await
+            .unwrap();
+        assert!(
+            !off.text.contains("displayed at"),
+            "auto_resize=false must not resize: {}",
+            off.text
         );
     }
 

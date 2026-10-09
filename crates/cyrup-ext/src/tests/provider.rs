@@ -77,6 +77,70 @@ fn api_key_resolution_literal_env_command() {
     );
 }
 
+/// PROV-134, extension surface: pi declares `inputLimits` on `ProviderModelConfigBase`
+/// (`coding-agent/src/core/extensions/types.ts:1961` @v1.0.4), immediately after `input` and
+/// before `promptCache` on the chat subtype. Without it an extension-registered provider cannot
+/// declare a resize profile at all, and the profile read off a model an extension's
+/// `before_agent_start` handler selects would have nothing to read.
+///
+/// Declared with NON-DEFAULT numbers on purpose: the catalog stamp fills an image-capable row with
+/// 2000/2000/4718592/80, so default values here would prove nothing about the seam.
+#[test]
+fn registered_model_carries_input_limits_across_the_seam() {
+    let mut hub = ProviderHub::new();
+    let cfg = json!({
+        "name": "Acme",
+        "apiKey": "sk-x",
+        "api": "openai-completions",
+        "baseUrl": "https://acme.example/v1",
+        "models": [{
+            "id": "acme-vision",
+            "name": "Acme Vision",
+            "input": ["text", "image"],
+            "inputLimits": {
+                "maxRequestBytes": 1_234_567,
+                "images": {
+                    "maxPerMessage": 4,
+                    "maxPerRequest": 11,
+                    "resize": {
+                        "maxWidth": 512,
+                        "maxHeight": 384,
+                        "maxBytes": 65_536,
+                        "jpegQuality": 55
+                    }
+                }
+            },
+            "contextWindow": 200_000,
+            "maxTokens": 8_192,
+            "cost": {"input": 0.0, "output": 0.0, "cacheRead": 0.0, "cacheWrite": 0.0}
+        }]
+    });
+    hub.register("acme".into(), &cfg).unwrap();
+    let reg = hub.get("acme").expect("registration stored");
+
+    let models = reg.build_models();
+    assert_eq!(models.len(), 1);
+    let limits = models[0]
+        .input_limits
+        .as_ref()
+        .expect("inputLimits survived the seam");
+    assert_eq!(limits.max_request_bytes, Some(1_234_567));
+    assert_eq!(
+        limits.images,
+        Some(cyrup_provider::ModelImageInputLimits {
+            resize: Some(cyrup_provider::ModelImageResizeOptions {
+                max_width: Some(512),
+                max_height: Some(384),
+                max_bytes: Some(65_536),
+                jpeg_quality: Some(55),
+            }),
+            max_per_message: Some(4),
+            max_per_request: Some(11),
+        }),
+        "the profile an extension-selected model decides the request with"
+    );
+}
+
 /// PROV-001, extension surface: Pi's `ProviderModelConfig.cost` is a full `ModelCost`, tiers
 /// included (coding-agent/src/core/extensions/types.ts:1493). A registered long-context model whose
 /// tiers were dropped at the seam gets billed at half the real rate above the threshold.

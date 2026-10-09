@@ -252,8 +252,9 @@ trimmed stdout becomes the key, and `$VAR` / `${VAR}` interpolate from the envir
 
 Alongside `models`, a provider block accepts `headers`, `compat` for protocol quirks, and
 `modelOverrides` for patching individual models — including the built-in ones — with a different
-`contextWindow`, `maxTokens`, `reasoning` flag, `thinkingLevelMap`, or `samplingParams`. A provider
-declared here is selectable with `--provider` and appears in `--list-models` once its key resolves.
+`contextWindow`, `maxTokens`, `reasoning` flag, `thinkingLevelMap`, `samplingParams`, `promptCache`
+lifetimes, or [`inputLimits`](#how-big-an-image-gets-sent). A provider declared here is selectable
+with `--provider` and appears in `--list-models` once its key resolves.
 
 `samplingParams` is the escape hatch for parameters cyrup does not model — `top_p`, `top_k`,
 `min_p`, `repetition_penalty`, anything your server accepts:
@@ -267,3 +268,103 @@ The map is written onto the request body **last**, so a key here beats the `temp
 replacing it, so a `top_p`-only patch leaves `min_p` alone. Only the three OpenAI-compatible wire
 protocols apply it (`openai-completions`, `openai-responses`, `azure-openai-responses`); every other
 api — including `openai-codex-responses` — ignores it silently.
+
+## How big an image gets sent
+
+Images are not sent at whatever size you hand them over. Before a new image enters the
+conversation, cyrup re-encodes it to fit a **resize profile** that belongs to the model the request
+is actually going to — so the same screenshot costs the same whether it arrived as an `@file`
+argument, from the `read` tool, over the RPC or SDK transport (which is also how the editor
+integrations send one), or as the result of a tool that produces pictures itself, such as an MCP
+screenshot bridge.
+
+One case is deliberately left alone: an image attached to a message you **queue while the agent is
+already running** — a steer, a follow-up, or a `prompt` that arrives mid-stream — is sent at its
+original size. The resize profile is chosen when a prompt is turned into a request, and a queued
+message skips that step by design; this matches upstream.
+
+The default profile is 2000×2000 pixels, 4.5 MB of base64, JPEG quality 80. A model can declare its
+own under `inputLimits`, and a `modelOverrides` entry can patch one:
+
+```json
+{
+  "providers": {
+    "my-gateway": {
+      "modelOverrides": {
+        "internal-large": {
+          "inputLimits": { "images": { "resize": { "maxWidth": 1024, "maxHeight": 1024 } } }
+        }
+      }
+    }
+  }
+}
+```
+
+| Key under `inputLimits.images.resize` | Default | Meaning |
+|---|---|---|
+| `maxWidth` | `2000` | Width clamp, in pixels. |
+| `maxHeight` | `2000` | Height clamp, applied as a second clamp after `maxWidth`. |
+| `maxBytes` | `4718592` | Ceiling on the **base64-encoded** payload, not on the raw bytes. |
+| `jpegQuality` | `80` | Leading quality of the JPEG re-encode ladder, `1`–`100`. |
+
+Each key resolves on its own, so a profile naming only `maxBytes` keeps the 2000-pixel clamps. The
+two clamps are sequential rather than interchangeable: a 3000×500 image under
+`{"maxWidth": 1000, "maxHeight": 2000}` lands at 1000×167, with the height clamp never binding. If
+the image is already inside the profile it is sent byte-for-byte, untouched.
+
+A clamp alone does not always get a picture under `maxBytes`, so cyrup re-encodes down a ladder:
+PNG first at each size, then JPEG at `jpegQuality` and then 85, 70, 55 and 40, shrinking by a
+quarter and trying again until something fits. `jpegQuality` leads that ladder rather than replacing
+it, so setting it to 40 starts low instead of walking down from 80.
+
+`inputLimits` also accepts `maxRequestBytes`, `images.maxPerMessage` and `images.maxPerRequest`.
+cyrup reads them, keeps them and hands them back out unchanged, but **nothing enforces them** — and
+that is not cyrup lagging behind: upstream declares, generates and validates the same three keys
+without rewriting or rejecting a conversation on their basis either. Only `images.resize` changes
+what is sent.
+
+### Which model's profile you get
+
+The profile comes from the model the request will actually use, resolved **after** extensions have
+had their say — so an extension that switches the model in `before_agent_start` switches the resize
+profile with it.
+
+The prompt path and the `read` tool ask slightly different questions, and under a
+[virtual model](../extensions/virtual-models.md) the two answers differ:
+
+| Path | Whose profile |
+|---|---|
+| Prompt images, and images returned by a tool | The **physical** model that answers the request — under a virtual selection, the row the virtual model routed to, not the virtual row itself. |
+| The `read` tool | The model **currently selected**, which under a virtual selection is the virtual row. |
+
+That split is upstream's own (`ctx.model` for `read` against `_limitsModel()` for everything else),
+not a cyrup quirk. In the ordinary case — no virtual model — both are the same model and the
+distinction never shows. The `read` tool reads the profile per call, so a `/model` switch
+mid-session reaches the very next `read` rather than the one after it.
+
+An image is encoded **once**, on the way into history. Switching models afterwards does not re-encode
+what is already there.
+
+### When an image cannot be sent
+
+A picture cyrup cannot decode, or cannot get under `maxBytes` at any size, does not fail your
+request. The image block is dropped and a note is appended to your message text instead, so the
+model is told what happened:
+
+```
+[Image omitted: could not be converted to a supported inline image format.]
+[Image omitted: could not be resized below the inline image size limit.]
+```
+
+A successful send can add a note too. A converted format says so, and anything that was actually
+downscaled carries the scale factor, so the model can map coordinates back:
+
+```
+[Image converted from image/bmp to image/png.]
+[Image: original 6000x4000, displayed at 2000x1333. Multiply coordinates by 3.00 to map to original image.]
+```
+
+Setting [`images.autoResize`](../reference/settings.md#appearance-and-the-terminal-interface) to
+`false` turns the clamps and the byte ladder off: an image is still converted to a format the
+provider accepts, but it is sent at its original size, and an oversized one is then the provider's
+problem rather than cyrup's. `images.blockImages` drops images altogether.

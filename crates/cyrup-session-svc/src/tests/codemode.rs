@@ -1809,6 +1809,7 @@ mod models {
                 context_window: 1000,
                 max_tokens: 100,
                 sampling_params: None,
+                input_limits: None,
                 prompt_cache: None,
                 thinking_level_map: None,
                 compat: None,
@@ -1824,6 +1825,7 @@ mod models {
                     provider: "scorer".into(),
                     base_url: "https://classifier.test/v1".into(),
                     input: vec![Modality::Text],
+                    input_limits: None,
                     cost: ModelCost::default(),
                     headers: Some(HeaderMap::from([(
                         "X-Secret".to_owned(),
@@ -1839,6 +1841,7 @@ mod models {
                     base_url: "https://images.test/v1".into(),
                     input: vec![Modality::Text, Modality::Image],
                     output: vec![Modality::Text, Modality::Image],
+                    input_limits: None,
                     cost: ModelCost::default(),
                     headers: None,
                 },

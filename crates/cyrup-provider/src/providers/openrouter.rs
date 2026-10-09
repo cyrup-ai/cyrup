@@ -63,7 +63,18 @@ pub fn openrouter_image_models() -> Vec<ImageModel> {
                 "type".to_string(),
                 serde_json::Value::String(crate::classifier::ModelType::Image.as_str().to_string()),
             );
-            serde_json::from_value::<ImageModel>(row).ok()
+            let mut model = serde_json::from_value::<ImageModel>(row).ok()?;
+            // PROV-134 — and this is the one place the stamp is not already a no-op. These rows
+            // were extracted at v0.87.1, before `inputLimits` existed on any model shape, so all
+            // 54 image-capable ones carry no resize profile (measured at HEAD), while the live
+            // pi.dev body carries one on 57 of its 59 image rows. Upstream's generator stamps the
+            // image catalog with the identical pass it stamps the chat catalog with
+            // (`applyImageInputMetadata`, `generate-models.ts:3505`), so without this an image
+            // model would resolve no profile at all. Same `[CYRUP-DELTA]` mechanism note as
+            // `catalog::load_catalog` carries: parse time instead of generation time, because the
+            // generator analogue is unreachable at this pin (PROV-071).
+            crate::catalog::apply_image_input_metadata_to_image(&mut model);
+            Some(model)
         })
         .collect()
 }

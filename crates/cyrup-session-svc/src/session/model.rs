@@ -825,6 +825,34 @@ impl AgentSession {
         self.agent
             .set_headers(resolved.as_ref().and_then(|m| self.attribution_headers(m)))
             .await;
+        // …and the RESOLVED model becomes the session's selection, not just its `ModelRef`.
+        //
+        // `compaction_model` is cyrup's `this.model` analogue: it is what
+        // [`AgentSession::limits_model`] falls back to (pi `this.routedModel?.model ?? this.model`,
+        // `agent-session.ts:628-630`) and therefore what decides the context window
+        // (`session/stats.rs`) and — since SEAM-128 — the prompt-image resize profile. Upstream's
+        // `ctx.setModel` assigns the real `Model`, so `_limitsModel()` answers the new one on the
+        // very next line; this path updated only the `ModelRef` and the agent, leaving every
+        // `Model`-shaped reader on the PREVIOUS model until something else refreshed it.
+        //
+        // That was invisible while the only readers were numbers nobody asserted on. It is not
+        // invisible now: `the_extension_selected_model_decides_the_profile` resizes a prompt image
+        // against the model an extension selected from `before_agent_start`, and without this line
+        // it lands at the old model's profile — upstream's stated reason for normalizing after the
+        // hook, silently unmet. `apply_model_change` (the `/model` path) has always done this
+        // (`:1004`); only this one did not.
+        //
+        // `None` leaves the slot alone deliberately: an unresolvable id means the registry does not
+        // know that model, and overwriting a known selection with nothing would make every limit
+        // read "unknown" rather than merely stale. The headers above clear on the same input for the
+        // opposite reason — a stale ATTRIBUTION is actively wrong, a stale limit is only imprecise.
+        if let Some(m) = resolved {
+            // `read`'s live profile follows the selection here too — this path is the extension
+            // `setModel` seam, and `apply_model_change` is the `/model` one.
+            self.read_model_resize.set(m.image_resize_profile());
+            self.read_model_vision.set(m.supports_image_input());
+            *Self::lock(&self.compaction_model) = Some(m);
+        }
         self.manager
             .lock()
             .await
@@ -1013,6 +1041,9 @@ impl AgentSession {
         // non-vision warning must describe the model the NEXT read will actually run against,
         // not the one resolved at startup.
         self.read_model_vision.set(next.supports_image_input());
+        // …and the new model's resize profile, for the same reason and from the same row
+        // (pi `read.ts:138` reads it per call off the live `ctx.model`).
+        self.read_model_resize.set(next.image_resize_profile());
         // pi recomputes provider-attribution + opencode session-affinity headers INSIDE `streamFn`,
         // dispatched on the model the request is actually going to (`sdk.ts:318-327`). cyrup merged
         // them once at session build and pinned them via `AgentBuilder::headers`, so a

@@ -8,8 +8,8 @@
 use std::sync::Arc;
 
 use cyrup_agent::{
-    AfterOutcome, AfterToolCall, AgentMessage, BeforeOutcome, BeforeToolCall, HookError, Hooks,
-    PostTurn, PrepareRequestCtx, RequestUpdate, TurnDecision, TurnUpdate,
+    AfterOutcome, AfterOverride, AfterToolCall, AgentMessage, BeforeOutcome, BeforeToolCall,
+    HookError, Hooks, PostTurn, PrepareRequestCtx, RequestUpdate, TurnDecision, TurnUpdate,
 };
 use cyrup_core::{CancelToken, Content, Message, SystemMessage, TerminateHint, ToolCallId};
 use cyrup_tools::{PermissionPolicy, PolicyDecision};
@@ -122,6 +122,75 @@ impl PolicyHooks {
             has_ui,
             block_images,
             session,
+        }
+    }
+
+    /// Pi `_afterToolCall`'s tail (`agent-session.ts:688-711` @v1.0.4): normalize the image blocks
+    /// of whatever content is now in force, then decide between `undefined` and a full override.
+    ///
+    /// ```text
+    /// const content = hookResult?.content ?? result.content ?? [];
+    /// const normalizedContent = await normalizeToolResultImages(content, { … });
+    /// if (!hookResult && normalizedContent === content) return undefined;
+    /// return { content: normalizedContent, details: hookResult?.details,
+    ///          structuredContent: hookResult ? hookResult.structuredContent : result.structuredContent,
+    ///          isError: hookResult?.isError ?? isError, usage: hookResult?.usage };
+    /// ```
+    ///
+    /// Two cyrup-specific points in that last statement:
+    ///
+    /// * `structuredContent` is carried EXPLICITLY on the no-hook arm. cyrup's fold implements
+    ///   upstream's "content provided without structured content drops it" rule
+    ///   (`fold_tool_outcome`, pi `agent-loop.ts:877-889`), so returning a resized `content` while
+    ///   leaving `structured_content: None` would silently delete a structured half that only the
+    ///   IMAGES changed. Upstream's `result.structuredContent` on that branch is the same guard.
+    /// * `details`/`usage`/`is_error`/`terminate` stay `None`, which in cyrup means *keep the
+    ///   tool's own value*. Upstream's `hookResult?.details` is `undefined` on that arm and
+    ///   `isError: isError` re-states the value it already had, so the behaviour is the same.
+    ///
+    /// An `AfterOutcome::Failed` short-circuits: upstream's `emitToolResult` is awaited BEFORE the
+    /// normalization, so a throwing `tool_result` handler means the normalization never runs and
+    /// the whole result becomes the hook's error.
+    ///
+    /// On an UNBOUND session (no self-handle to upgrade) this degrades to the plain delegate, the
+    /// same graceful no-op `prepare_next_turn` and the inject sink take.
+    async fn normalize_after(
+        &self,
+        hook: AfterOutcome,
+        original_content: &[Content],
+        original_structured: Option<&serde_json::Value>,
+    ) -> AfterOutcome {
+        let hook_override = match hook {
+            AfterOutcome::Failed(e) => return AfterOutcome::Failed(e),
+            AfterOutcome::Keep => None,
+            AfterOutcome::Override(ov) => Some(ov),
+        };
+        let Some(session) = self.session.get() else {
+            return match hook_override {
+                Some(ov) => AfterOutcome::Override(ov),
+                None => AfterOutcome::Keep,
+            };
+        };
+        // `hookResult?.content ?? result.content` — an extension that REPLACED the content is what
+        // gets normalized, so an image a `tool_result` handler injected is clamped too.
+        let base: &[Content] = hook_override
+            .as_ref()
+            .and_then(|ov| ov.content.as_deref())
+            .unwrap_or(original_content);
+        let normalized = session.normalize_tool_result_images(base).await;
+        match (hook_override, normalized) {
+            // `if (!hookResult && normalizedContent === content) return undefined`.
+            (None, None) => AfterOutcome::Keep,
+            (Some(ov), None) => AfterOutcome::Override(ov),
+            (None, Some(content)) => AfterOutcome::Override(Box::new(AfterOverride {
+                content: Some(content),
+                structured_content: original_structured.cloned(),
+                ..Default::default()
+            })),
+            (Some(mut ov), Some(content)) => {
+                ov.content = Some(content);
+                AfterOutcome::Override(ov)
+            }
         }
     }
 }
@@ -249,8 +318,24 @@ impl Hooks for PolicyHooks {
         self.before(Some(parent), ctx, cancel).await
     }
 
+    /// The extension seam's `tool_result` chain, then tool-result image normalization — pi
+    /// `_afterToolCall` (`agent-session.ts:671-711` @v1.0.4), whose two halves are in exactly this
+    /// order under the comment *"Runs after the extension hook so images injected or replaced by
+    /// extensions are normalized too"* (`:692`).
+    ///
+    /// This is upstream's THIRD consumer of `inputLimits.images.resize` (the other two are the
+    /// `read` tool and the prompt path). Without it, an image from an MCP bridge, an extension tool
+    /// or a screenshot tool entered history at whatever size the tool produced and was re-sent at
+    /// that size on every later request in the session — the failure the prompt path was just
+    /// fixed for, one seam over and persisted.
     async fn after_tool_call(&self, ctx: AfterToolCall<'_>, cancel: CancelToken) -> AfterOutcome {
-        self.inner.after_tool_call(ctx, cancel).await
+        // The two `ctx` fields the normalization fold needs, copied out before `ctx` is consumed.
+        // Both are `&'_`, so this is a pointer copy and not a borrow of `ctx` itself.
+        let original_content = ctx.content;
+        let original_structured = ctx.structured_content;
+        let hook = self.inner.after_tool_call(ctx, cancel).await;
+        self.normalize_after(hook, original_content, original_structured)
+            .await
     }
 
     async fn after_nested_tool_call(
@@ -259,7 +344,13 @@ impl Hooks for PolicyHooks {
         ctx: AfterToolCall<'_>,
         cancel: CancelToken,
     ) -> AfterOutcome {
-        self.inner.after_nested_tool_call(parent, ctx, cancel).await
+        // A nested call goes through the SAME normalization: upstream has one `_afterToolCall` and
+        // `parentToolCallId` only changes what the extension chain is told (`:671-676`).
+        let original_content = ctx.content;
+        let original_structured = ctx.structured_content;
+        let hook = self.inner.after_nested_tool_call(parent, ctx, cancel).await;
+        self.normalize_after(hook, original_content, original_structured)
+            .await
     }
 
     /// Pi `_installAgentNextTurnRefresh` (agent-session.ts:519-540): run whatever

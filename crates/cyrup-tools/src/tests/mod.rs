@@ -8,12 +8,16 @@ mod cross_registry_mutation_lock;
 mod edit_preview_diff;
 mod find_abort;
 mod grep_context_zero_line_text;
+#[cfg(feature = "inline-images")]
+mod image_proc;
 mod isolation;
 mod mutation_lock_is_first_await;
 mod no_inherited_harness_stdio;
 mod pi_schema;
 mod pi_tool_semantics;
 mod read_access_errno;
+#[cfg(feature = "inline-images")]
+mod read_image_resize_profile;
 mod read_model_vision;
 mod tools;
 mod walk_error_text;

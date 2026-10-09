@@ -45,6 +45,7 @@ fn chat(provider: &str, id: &str, context_window: u64, max_tokens: u64, reasonin
         reasoning,
         input: vec![Modality::Text],
         cost: ModelCost::default(),
+        input_limits: None,
         prompt_cache: None,
         context_window,
         max_tokens,

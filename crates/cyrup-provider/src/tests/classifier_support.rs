@@ -35,6 +35,7 @@ pub(super) fn chat_model(provider: &str, id: &str) -> Model {
         reasoning: false,
         input: vec![Modality::Text],
         cost: ModelCost::default(),
+        input_limits: None,
         prompt_cache: None,
         context_window: 1000,
         max_tokens: 100,
@@ -53,6 +54,7 @@ pub(super) fn classifier_model(provider: &str, id: &str, api: &str) -> Classifie
         provider: provider.into(),
         base_url: "http://model.test/v1".into(),
         input: vec![Modality::Text],
+        input_limits: None,
         cost: ModelCost::default(),
         headers: None,
         context_window: 4096,
@@ -71,6 +73,7 @@ pub(super) fn image_model(provider: &str, id: &str, api: &str) -> ImageModel {
         base_url: "http://image.test/api/v1".into(),
         input: vec![Modality::Text, Modality::Image],
         output: vec![Modality::Text, Modality::Image],
+        input_limits: None,
         cost: ModelCost::default(),
         headers: None,
     }

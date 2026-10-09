@@ -14,6 +14,7 @@ pub mod diagnostics;
 pub mod error;
 pub mod event_stream;
 pub mod exposure;
+pub mod image;
 pub mod json;
 pub mod keyed_lock;
 pub mod lazy_args;
@@ -42,6 +43,7 @@ pub use exposure::{
     ToolLoadoutChanges, ToolNamespace, UnknownExposure, callable_tools,
     normalized_prompt_guidelines,
 };
+pub use image::{DEFAULT_IMAGE_RESIZE, ModelImageResizeOptions, ResolvedResize};
 pub use keyed_lock::{Cancelled, KeyedAcquire, KeyedGuard, KeyedLockMap, KeyedLocks};
 pub use lazy_args::LazyArgs;
 pub use message::{

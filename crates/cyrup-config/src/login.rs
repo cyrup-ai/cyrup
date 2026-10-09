@@ -938,6 +938,7 @@ pub fn auth_probe_model(provider: &ProviderId) -> cyrup_provider::Model {
         reasoning: false,
         input: vec![cyrup_provider::Modality::Text],
         cost: cyrup_provider::ModelCost::default(),
+        input_limits: None,
         prompt_cache: None,
         context_window: 0,
         max_tokens: 0,

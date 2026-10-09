@@ -1128,18 +1128,30 @@ impl AgentSession {
     ///
     /// Options that do not build a prompt (pi's `Invalid system prompt section name`) refuse the
     /// prompt, as pi's `buildSystemPromptSections` throws out of `prompt()`.
+    ///
+    /// SEAM-128: the prompt's images are normalized against the model's `inputLimits` profile after
+    /// the hook chain has settled and before the user message is built — *"Build messages only
+    /// after hooks and image normalization have completed"* (`agent-session.ts:2064`).
     async fn assemble_run_inputs(
         &self,
-        input: UserInput,
+        mut input: UserInput,
     ) -> Result<Vec<AgentMessage>, SessionServiceError> {
         let user_text = input.text.clone();
+        // The PRE-normalization images, which is what the hook is handed: upstream passes
+        // `currentImages` to `emitBeforeAgentStart` and only then normalizes
+        // (`agent-session.ts:2048`, `:2061`), so a handler sees what the caller actually sent.
         let images = input.images.clone();
-        let user_msg = input.into_agent_message();
+        // SEAM-128 — `input` is deliberately NOT consumed here any more. It used to be:
+        // `into_agent_message()` was the function's third statement, i.e. the user message was
+        // built BEFORE `emit_before_agent_start` ran. Upstream builds it only after the hook AND
+        // the image normalization, and says why: *"Build messages only after hooks and image
+        // normalization have completed"* (`agent-session.ts:2064`). Normalizing against the
+        // pre-hook model would defeat the whole reason the normalization sits in the session rather
+        // than at the CLI boundary. `input` therefore stays alive and mutable across the hook, and
+        // the move happens only after the normalization below.
         // Drain any messages staged for this turn (Pi `_pendingNextTurnMessages`,
         // agent-session.ts:1099-1103); they are injected AFTER the user message in the run input.
         let pending: Vec<AgentMessage> = std::mem::take(&mut *Self::lock(&self.pending_next_turn));
-        let mut messages = vec![user_msg];
-        messages.extend(pending);
 
         // The LIVE base (pi passes `this._baseSystemPromptOptions`, which every tool-set rebuild
         // reassigns) — not the builder's startup prompt.
@@ -1148,6 +1160,9 @@ impl AgentSession {
             (base.options().clone(), base.text().to_owned())
         };
         let mut options = base_options.clone();
+        // A handler's injected messages, held until the user message exists (it is built only after
+        // the normalization below) so they keep their place AFTER it.
+        let mut injected_messages: Vec<AgentMessage> = Vec::new();
         // Fast path: no extension listens for `before_agent_start`, so the run's options are the
         // base's (pi's runner returns the normalized copy unchanged).
         if !self
@@ -1181,6 +1196,15 @@ impl AgentSession {
                 let (loadout, prompt) = { Self::lock(&self.dynamic_tools).set_active(&names) };
                 self.push_active_tools(loadout, prompt).await;
             }
+            // SEAM-128 — apply a handler's `setModel`/`setThinkingLevel` BEFORE reading the resize
+            // profile. Upstream's `ctx.setModel` mutates `this.model` synchronously inside the
+            // handler, so by the time it reaches `_normalizePromptImages` the new model is already
+            // the one `_limitsModel()` answers; cyrup's is a queued `ControlOp`, so without this
+            // narrow drain the extension-selected model would NOT decide the profile and
+            // upstream's stated reason for this ordering would be unmet. See
+            // `apply_pending_agent_state_only` for why it is not the full
+            // `apply_pending_agent_control`.
+            self.apply_pending_agent_state_only().await;
             if let Some(cyrup_ext::BeforeAgentStartReduction {
                 injected,
                 options: edited,
@@ -1196,9 +1220,20 @@ impl AgentSession {
                     options = cyrup_session::prompt::SystemPromptOptions::normalize(&edited)
                         .map_err(SessionServiceError::SystemPromptOptions)?;
                 }
-                messages.extend(injected.iter().map(core_message_to_agent));
+                injected_messages.extend(injected.iter().map(core_message_to_agent));
             }
         }
+        // SEAM-128 — …and only now normalize, with the model the hook chain settled on
+        // (`agent-session.ts:2061`), folding the hints into the user text (`:2062`). This runs on
+        // the fast path too: no `before_agent_start` subscriber is the common case, not the exotic
+        // one (it is every install with no extension loaded), so normalizing only on the dispatch
+        // path would ship a feature that is inert for almost all users while every
+        // extension-flavoured test stayed green. `the_fast_path_normalizes_too` pins it.
+        self.normalize_prompt_images_into(&mut input).await;
+        // "Build messages only after hooks and image normalization have completed" (`:2064`).
+        let mut messages = vec![input.into_agent_message()];
+        messages.extend(pending);
+        messages.extend(injected_messages);
         // pi `prompt()` (`agent-session.ts:2069-2075` @v1.1.0): "An explicit edit wins; otherwise
         // the live loadout is authoritative, so a setActiveTools() call is not undone here." An
         // edited `selectedTools` is then APPLIED as the loadout (`_preparePromptAndToolLoadout` →

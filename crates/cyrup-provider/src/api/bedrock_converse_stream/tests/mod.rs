@@ -59,6 +59,7 @@ fn model_with(id: &str, name: &str) -> Model {
             cache_write: 3.75,
             tiers: None,
         },
+        input_limits: None,
         prompt_cache: None,
         context_window: 200_000,
         max_tokens: 64_000,

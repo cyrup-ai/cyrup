@@ -80,6 +80,7 @@ fn model(provider: &str, id: &str, max_tokens: u64) -> Model {
         thinking_level_map: None,
         compat: None,
         headers: None,
+        input_limits: None,
         prompt_cache: None,
     }
 }

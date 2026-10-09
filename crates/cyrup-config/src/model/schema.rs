@@ -117,6 +117,24 @@ pub struct ModelDefinition {
     pub thinking_level_map: Option<cyrup_provider::model::ThinkingLevelMap>,
     #[serde(default)]
     pub input: Option<Vec<cyrup_provider::Modality>>,
+    /// Per-model image/request input limits — Pi
+    /// `inputLimits: Type.Optional(ModelInputLimitsSchema)` (`model-config.ts:207` for a
+    /// definition, `:223` for an override, @v1.0.4). Declared immediately after `input` and before
+    /// `cost` in both schemas, the same slot upstream gives it on `BaseModel` (`types.ts:1105`) —
+    /// which is why it sits here.
+    ///
+    /// ONE shared type serves both a definition and an override: upstream reuses the SAME
+    /// `ModelInputLimitsSchema` object at both sites, unlike `cost`, which does get a separate
+    /// partial override shape. Copied verbatim onto the composed model by `model_from_json`
+    /// (`provider-composer.ts:239`) with no provider-block or same-id-builtin fallback, exactly as
+    /// `prompt_cache` is.
+    ///
+    /// Only `images.resize` has a consumer. `max_request_bytes`, `images.max_per_message` and
+    /// `images.max_per_request` are modelled and round-tripped but enforced nowhere — knowingly
+    /// inert, matching upstream (`packages/coding-agent/docs/models.md:89`: "Pi does not yet
+    /// rewrite or reject history based on them"). CFG-085.
+    #[serde(default)]
+    pub input_limits: Option<cyrup_provider::ModelInputLimits>,
     #[serde(default)]
     pub cost: Option<cyrup_provider::ModelCost>,
     /// `Type.Optional(Type.Number())` (model-config.ts:163 @v0.83.0) — SIGNED, because pi accepts a
@@ -161,6 +179,23 @@ pub struct ModelOverride {
     pub thinking_level_map: Option<cyrup_provider::model::ThinkingLevelMap>,
     #[serde(default)]
     pub input: Option<Vec<cyrup_provider::Modality>>,
+    /// Pi `:223`. The SAME `ModelInputLimitsSchema` as a definition's (see
+    /// [`ModelDefinition::input_limits`]), but applied through `mergeInputLimits`
+    /// (`provider-composer.ts:144-162`), which is a THREE-LEVEL per-key merge and strictly deeper
+    /// than `prompt_cache`'s flat per-tier merge below:
+    ///
+    /// - `maxRequestBytes` merges per key;
+    /// - `images` ABSENT keeps the composed model's whole `images` block;
+    /// - `images` PRESENT merges `maxPerMessage`/`maxPerRequest` per key, and keeps the model's
+    ///   whole `resize` unless `resize` is also present, in which case all four resize keys merge
+    ///   per key.
+    ///
+    /// So an override naming only `images.resize.maxWidth` must leave `maxHeight`, `maxBytes`,
+    /// `jpegQuality`, `images.maxPerRequest` and `maxRequestBytes` all in place. Replacing a level
+    /// wholesale would silently reset a generator-stamped `maxPerRequest` or zero three resize
+    /// keys. CFG-085.
+    #[serde(default)]
+    pub input_limits: Option<cyrup_provider::ModelInputLimits>,
     #[serde(default)]
     pub cost: Option<ModelCostOverride>,
     /// Signed for the same reason as [`ModelDefinition::context_window`] (model-config.ts:184).

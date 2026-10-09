@@ -138,6 +138,7 @@ pub fn to_classifier_model(
         provider: LLAMA_PROVIDER_ID.into(),
         base_url: server_url.to_string(),
         input: vec![Modality::Text],
+        input_limits: None,
         cost: ModelCost::default(),
         headers: None,
         context_window: context_window_of(model, cached_context_window),
@@ -198,6 +199,7 @@ pub fn to_model(
         context_window,
         max_tokens: context_window,
         sampling_params: None,
+        input_limits: None,
         prompt_cache: None,
         thinking_level_map: reasoning.then_some(thinking_level_map),
         compat: Some(ModelCompat {

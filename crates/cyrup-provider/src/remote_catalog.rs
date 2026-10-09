@@ -235,12 +235,28 @@ pub fn parse_catalog(
             // other symptom. The pass only ever fills a key the row left unset, so an overlay
             // that does carry `promptCache` is untouched, and it is gated on direct Anthropic
             // exactly as the embedded pass is, so no gateway row gains an invented lifetime.
+            //
+            // PROV-134 — `apply_image_input_metadata` is applied here for the same reason, and on
+            // all THREE variants rather than just chat, because upstream's `inputLimits` is on
+            // `BaseModel` and its generator stamps `AnyModel` (`generate-models.ts:3487` and
+            // `:3505`). The live pi.dev body is already stamped — measured on
+            // `tests/fixtures/pi-dev-openrouter-all-types.json`, every image-capable row carries
+            // `inputLimits` (270/270 chat, 57/57 image) and no text-only row does — so this is a
+            // fill-only no-op against today's endpoint and a floor if a future shard regresses.
             Some(match parsed {
                 AnyModel::Chat(mut model) => {
                     crate::catalog::apply_prompt_cache_metadata(&mut model);
+                    crate::catalog::apply_image_input_metadata(&mut model);
                     AnyModel::Chat(model)
                 }
-                other => other,
+                AnyModel::Image(mut model) => {
+                    crate::catalog::apply_image_input_metadata_to_image(&mut model);
+                    AnyModel::Image(model)
+                }
+                AnyModel::Classifier(mut model) => {
+                    crate::catalog::apply_image_input_metadata_to_classifier(&mut model);
+                    AnyModel::Classifier(model)
+                }
             })
         })
         .collect())
@@ -1148,6 +1164,7 @@ mod tests {
             reasoning: false,
             input: vec![Modality::Text],
             cost: ModelCost::default(),
+            input_limits: None,
             prompt_cache: None,
             context_window,
             max_tokens: 4096,

@@ -32,7 +32,8 @@ use cyrup_provider::faux::{
 use serde_json::json;
 use tempfile::TempDir;
 
-/// The fixture image is deliberately WIDER than `ReadOpts::max_image_dim` (2000) so the resize path
+/// The fixture image is deliberately WIDER than the 2000px clamp `ReadOpts::image_resize` resolves
+/// to when no model profile is supplied, so the resize path
 /// is unambiguously reachable, and a flat gradient so its PNG stays far below the 4.5MB base64 cap —
 /// the byte ladder must not be what moves, only the `autoResize` branch.
 const FIXTURE_W: u32 = 2600;
