@@ -47,6 +47,27 @@ pub(crate) type WriterProcessLedgers = Arc<
     >,
 >;
 
+/// SUBA-172 — pi `launchedFlatIndices` (`subagent-runner.ts:1882-1887` @v0.76.1): the flat step
+/// indices a child was ACTUALLY dispatched for, the ground truth run history keys on. A stop, a
+/// fail-fast skip, a timeout relabel or a child-scoped stop applied before dispatch all relabel a
+/// never-launched step to a terminal status, so status alone cannot tell them from a step that ran.
+///
+/// A plain `Mutex` for the reason [`WriterProcessLedgers`] is one: a `ParallelGroup`'s members
+/// mark their own slots concurrently, and every touch is one insert with no `.await` inside.
+pub(crate) type LaunchedSteps = Arc<std::sync::Mutex<std::collections::BTreeSet<usize>>>;
+
+/// Record that flat step `index` dispatched a child (pi `launchedFlatIndices.add(fi)`). A
+/// poisoned lock is recovered rather than propagated — losing a history row must never fail a
+/// step.
+pub(crate) fn mark_launched(launched: Option<&LaunchedSteps>, index: usize) {
+    if let Some(launched) = launched {
+        launched
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(index);
+    }
+}
+
 /// Fold one [`WriterProcessObservation`](crate::exec::WriterProcessObservation) into the flat
 /// step's ledger.
 ///
@@ -147,6 +168,11 @@ pub(crate) struct ExecSingleStepExecutor {
     /// because a `ParallelGroup` dispatches its members CONCURRENTLY and each member's sink writes
     /// its own flat slot.
     pub(crate) writer_ledgers: Option<WriterProcessLedgers>,
+    /// SUBA-172 — the run's [`LaunchedSteps`] set, marked by [`Self::run_single`] immediately
+    /// before `exec::run_sync` (pi's three `launchedFlatIndices.add` sites,
+    /// `subagent-runner.ts:3725,4130,4519`). `None` for a foreground executor, which records no
+    /// per-step background history.
+    pub(crate) launched: Option<LaunchedSteps>,
     /// The REVIVAL lease's writer channel, when this run holds a lease.
     ///
     /// `Some` only on a background runner whose launch carried a
@@ -392,6 +418,7 @@ impl ExecSingleStepExecutor {
             // A foreground run writes no process-terminal candidate: it has no detached runner
             // whose close anyone has to prove, and nothing would ever read the ledger.
             writer_ledgers: None,
+            launched: None,
             lease_writer: None,
             resolved_agents,
             tool_timeouts,
@@ -599,7 +626,15 @@ impl ExecSingleStepExecutor {
         // persona stamp), so the full order is: model `:suffix` > caller param > persona > session
         // > off. A `:suffix` still wins downstream because `apply_thinking_suffix` never replaces
         // an existing recognized suffix without a fork override's licence.
-        if agent.thinking.is_none() {
+        //
+        // SUBA-167 — the session rung is OFF for an external runner (pi `effectiveThinking =
+        // externalRunner ? undefined : …`, `async-execution.ts:1117` @v0.76.1): a Claude Code
+        // agent turns `agent.thinking` into `--effort`, which no session level may set for it.
+        let external_runner = agent
+            .runner
+            .as_ref()
+            .is_some_and(crate::runner::AgentRunnerConfig::is_external);
+        if agent.thinking.is_none() && !external_runner {
             agent.thinking = self.inherited_session_thinking.clone();
         }
         // Per-step tri-state tool override (func-SA §4.2): `Some(_)` overrides the persona's own
@@ -637,27 +672,37 @@ impl ExecSingleStepExecutor {
         // failure — not a `SubagentError` — because that is how this executor reports every other
         // pre-spawn rejection (`Unknown agent: …` directly above), keeping the run's own status
         // record and the surrounding chain semantics intact.
-        let model_override = match crate::exec::fallback::resolve_model_inheritance(
-            step.model.as_ref(),
-            agent.model.as_ref(),
-            self.inherited_session_model.as_ref(),
-            &mut available_models,
-            self.model_scope.as_ref(),
-            // SUBA-155 — the canonical agent name selects any `modelScope.agents.<name>` rule;
-            // the hop-2 runner enforces the same policy the foreground path does.
-            &agent.name,
-        ) {
-            Ok(resolved) => resolved,
-            Err(refusal) => return Err(Box::new(StepResult::failure(refusal.message()))),
+        //
+        // SUBA-167 — skipped for an external runner (pi `primaryModel = externalRunner ? undefined
+        // : …`, `async-execution.ts:1091` @v0.76.1): a Claude Code step's scope check runs over the
+        // model the CLI will run, inside `run_sync`, and nothing below the runner dispatch reads
+        // this override.
+        let model_override = if external_runner {
+            crate::exec::fallback::ModelOverride::Inherit
+        } else {
+            match crate::exec::fallback::resolve_model_inheritance(
+                step.model.as_ref(),
+                agent.model.as_ref(),
+                self.inherited_session_model.as_ref(),
+                &mut available_models,
+                self.model_scope.as_ref(),
+                // SUBA-155 — the canonical agent name selects any `modelScope.agents.<name>`
+                // rule; the hop-2 runner enforces the same policy the foreground path does.
+                &agent.name,
+            ) {
+                Ok(resolved) => resolved,
+                Err(refusal) => return Err(Box::new(StepResult::failure(refusal.message()))),
+            }
         };
         // SUBA-119 — pi's `modelOverrideFromParent` (`execution.ts:1836`), over the same three inputs
         // the resolution above just consumed. Model verification is OFF for a run whose model came
         // from the parent session rather than being chosen for it.
-        let model_override_from_parent = crate::exec::fallback::model_override_is_from_parent(
-            step.model.as_ref(),
-            agent.model.as_ref(),
-            self.inherited_session_model.as_ref(),
-        );
+        let model_override_from_parent = !external_runner
+            && crate::exec::fallback::model_override_is_from_parent(
+                step.model.as_ref(),
+                agent.model.as_ref(),
+                self.inherited_session_model.as_ref(),
+            );
 
         // SUBA-N04: lower THIS step's declared acceptance contract (pi `chain-execution.ts:400`
         // `acceptance: task.acceptance` for a parallel task / `:1335` `acceptance:
@@ -943,6 +988,10 @@ impl ExecSingleStepExecutor {
             reads: None,
             structured_output_schema: step.structured_output_schema.clone(),
             model_override,
+            // SUBA-167 — the step's own `model:` as typed (pi `s.model`, `async-execution.ts:1103`
+            // @v0.76.1). A revived step re-derives the same Claude Code argv from it and the
+            // persona, so nothing about the override needs persisting separately.
+            launch_model: step.model.clone(),
             // SUBA-078: hop 2 does not re-read settings — its ceiling arrives through the
             // `CYRUP_SUBAGENT_THINKING_CEILING` env var hop 1 wrote, and `run_sync` folds that
             // inherited value in. `None` here is "nothing beyond what the environment says".
@@ -1262,6 +1311,11 @@ impl SingleStepExecutor for ExecSingleStepExecutor {
             let _ = sender.send(crate::background::session_lease::WriterUpdate::Spawning);
         }
 
+        // SUBA-172 — pi `launchedFlatIndices.add(fi)` sits AFTER the child-stop gate above and
+        // immediately before the child session is dispatched (`subagent-runner.ts:3725` dynamic,
+        // `:4130` parallel, `:4519` sequential @v0.76.1). A dynamic group's members share one flat
+        // slot (the SUBA-093 residual), so the group records one row.
+        mark_launched(self.launched.as_ref(), ctx.step_slot.index());
         let result = exec::run_sync(&agent, resolved_task, &opts).await;
 
         self.write_step_result_artifacts(artifact_paths.as_ref(), &result);
@@ -1463,6 +1517,7 @@ mod tests {
             tool_timeouts: Arc::new(BTreeMap::new()),
             model_response_aliases: None,
             writer_ledgers: None,
+            launched: None,
             lease_writer: Some(lease_tx),
             // A binary that does not exist: `SpawnedChild::spawn` fails, so no `Launched` and no
             // `Closed` observation is ever produced.
@@ -1546,6 +1601,7 @@ mod tests {
             tool_timeouts: Arc::new(BTreeMap::new()),
             model_response_aliases: None,
             writer_ledgers: None,
+            launched: None,
             lease_writer: None,
             spawn_command: None,
             child_env: std::collections::HashMap::new(),
@@ -1787,6 +1843,7 @@ mod tests {
             tool_timeouts: Arc::new(BTreeMap::new()),
             model_response_aliases: None,
             writer_ledgers: None,
+            launched: None,
             lease_writer: None,
             spawn_command: None,
             child_env: std::collections::HashMap::new(),
@@ -1997,6 +2054,71 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(&closed.stderr_path).expect("stderr log"),
             "warming up\n"
+        );
+    }
+
+    /// SUBA-167 — the hop-2 launch site of a Claude Code step (upstream's
+    /// `buildAsyncRunnerSteps`, `async-execution.ts:1100-1117` @v0.76.1).
+    ///
+    /// - The session's thinking level is NOT inherited into an external runner, so a step with no
+    ///   level of its own gets no `--effort` (`effectiveThinking = externalRunner ? undefined`).
+    /// - The session's model never becomes `--model`; the step's own `model:` does, suffix and
+    ///   all (`model: typeof s.model === "string" ? s.model : undefined`).
+    /// - Native model resolution is skipped (`primaryModel = externalRunner ? undefined`), so an
+    ///   enforced `inherit` scope with no parent model refuses the step with the CLAUDE CODE scope
+    ///   check's text, not the native reserved-token refusal.
+    #[tokio::test]
+    async fn a_claude_code_step_takes_its_own_model_and_never_the_sessions_thinking_or_model() {
+        let dir = tempfile::tempdir().expect("real tempdir");
+        let (script, _) = crate::exec::testsupport::write_fake_claude(dir.path());
+        let mut persona = super::super::tests::resolved_persona("cc");
+        persona.model = None;
+        persona.thinking = None;
+        persona.runner = Some(crate::exec::testsupport::claude_code_runner(&script));
+        let mut runner = runner_shaped(None, crate::artifacts::ArtifactConfig::default());
+        runner.resolved_agents = Arc::new([("cc".to_string(), persona)].into_iter().collect());
+        runner.inherited_session_thinking = Some("high".to_string());
+        runner.inherited_session_model = Some(cyrup_core::ModelId::from("anthropic/parent"));
+        let ctx = step_test_ctx(dir.path());
+
+        let step = single_step("cc", "review");
+        let result = runner
+            .run_single(&step, "review", &ctx)
+            .await
+            .expect("run_single");
+        assert!(result.success, "{result:?}");
+        assert_eq!(result.final_output.as_deref(), Some("argv:--no-chrome"));
+
+        let mut pinned = single_step("cc", "review");
+        pinned.model = Some(cyrup_core::ModelId::from("claude-opus-5.5:low"));
+        let result = runner
+            .run_single(&pinned, "review", &ctx)
+            .await
+            .expect("run_single");
+        assert!(result.success, "{result:?}");
+        assert_eq!(
+            result.final_output.as_deref(),
+            Some("argv:--no-chrome --model claude-opus-5.5 --effort low")
+        );
+
+        runner.inherited_session_model = None;
+        runner.model_scope = Some(crate::exec::model_scope::ModelScopeConfig {
+            enforce: Some(true),
+            allow: Some(vec!["inherit".to_string()]),
+            ..crate::exec::model_scope::ModelScopeConfig::default()
+        });
+        let result = runner
+            .run_single(&step, "review", &ctx)
+            .await
+            .expect("run_single");
+        assert!(!result.success, "{result:?}");
+        assert_eq!(
+            result.error.as_deref(),
+            Some(
+                "agent 'cc' does not name a Claude Code model, so it cannot be checked against an \
+                 enforced subagent model scope (modelScope). Name the model on the launch, or in \
+                 the agent's frontmatter, or turn enforcement off."
+            )
         );
     }
 

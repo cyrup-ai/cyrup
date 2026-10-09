@@ -122,6 +122,7 @@ pub(super) async fn run_inner(
     interrupt_cancel: &cyrup_core::CancelToken,
     telemetry: tokio::sync::mpsc::UnboundedSender<TelemetryMsg>,
     writer_ledgers: super::executor::WriterProcessLedgers,
+    launched: super::executor::LaunchedSteps,
     lease_writer: Option<super::executor::LeaseWriterSender>,
     events: &mut Option<RunEventLog>,
 ) -> Result<LoopOutcome, SubagentError> {
@@ -142,10 +143,12 @@ pub(super) async fn run_inner(
         interrupt_cancel,
         telemetry,
         writer_ledgers,
+        launched,
         lease_writer,
         depth,
     )?;
     // SUBA-119: widen once, here, so `build_chain_context` can stay concrete and testable.
+    let executor_launched = step_executor.launched.clone();
     let executor: Arc<dyn SingleStepExecutor> = step_executor;
 
     let mut io = TurnLoopIo {
@@ -251,6 +254,11 @@ pub(super) async fn run_inner(
         .await;
 
         if let RunnerStep::ImportAsyncRoot(spec) = &step {
+            // SUBA-172 — upstream marks an attached root LAUNCHED like any sequential step: the
+            // `launchedFlatIndices.add(flatIndex)` at `subagent-runner.ts:4519` @v0.76.1 precedes
+            // `runSingleStepWithTimeout`, whose inner `runSingleStepInner` is what handles
+            // `step.importAsyncRoot` (`:731-735`). So the attached root records a history row.
+            super::executor::mark_launched(executor_launched.as_ref(), flat_slots.start);
             run_import_async_root(
                 &mut io,
                 &steps,
@@ -354,6 +362,7 @@ fn build_chain_context(
     interrupt_cancel: &cyrup_core::CancelToken,
     telemetry: tokio::sync::mpsc::UnboundedSender<TelemetryMsg>,
     writer_ledgers: super::executor::WriterProcessLedgers,
+    launched: super::executor::LaunchedSteps,
     lease_writer: Option<super::executor::LeaseWriterSender>,
     depth: DepthEnvelope,
     // SUBA-119: the CONCRETE executor, not `Arc<dyn SingleStepExecutor>`. This is a private
@@ -403,6 +412,9 @@ fn build_chain_context(
         // dispatched step's live sink — what makes this run's process-terminal candidate carry
         // REAL writer records instead of upstream's structurally empty ones.
         writer_ledgers: Some(writer_ledgers),
+        // SUBA-172 — the run's launch facts, marked per dispatch and read back by `finish_run`'s
+        // history planner (pi `launchedFlatIndices`, `subagent-runner.ts:1887`).
+        launched: Some(launched),
         // The revival lease's writer channel, when this run holds a lease. `None` on every
         // ordinary launch — upstream acquires a lease on the revival path alone
         // (`subagent-runner.ts:5241`), and a step that reported into a channel nobody drains would
@@ -1009,6 +1021,7 @@ mod tests {
             &cyrup_core::CancelToken::new(),
             telemetry,
             Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new())),
+            Arc::new(std::sync::Mutex::new(std::collections::BTreeSet::new())),
             None,
             DepthEnvelope {
                 current_depth: 0,

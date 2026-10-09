@@ -48,6 +48,7 @@ use cyrup_ext_subagents::spawn::chain_graph::{RunnerStep, SingleStepSpec};
 
 fn fixture_persona(name: &str) -> ResolvedAgentPersona {
     ResolvedAgentPersona {
+        model_is_settings_default: false,
         default_tool_timeout_ms: None,
         machine: None,
         file_path: None,

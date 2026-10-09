@@ -761,7 +761,7 @@ mod tests {
         );
     }
 
-    /// `getHistoryPath()` (`runs/shared/run-history.ts:23-25` @v0.43.0):
+    /// `getHistoryPath()` (`runs/shared/run-history.ts:27-29` @v0.76.1):
     /// `path.join(getAgentDir(), "run-history.jsonl")` — the DURABLE agent dir, not the disposable
     /// temp root. This port had it under `<home>/.cyrup/subagents/`, i.e. inside the run-scratch
     /// tree, where a temp sweep would have silently discarded the user's run history.

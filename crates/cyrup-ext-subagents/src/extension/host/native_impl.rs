@@ -204,6 +204,27 @@ impl NativeExtension for SubagentsExtension {
                 let _ = self.rpc_tool.set(Arc::clone(&subagent_tool));
                 api.register_tool(subagent_tool);
 
+                // SUBA-139/SUBA-153 — pi `registerSubagentToolActivation(pi, { mode:
+                // config.toolActivation, advertisedPrompt })` (`extension/index.ts:1193-1199`
+                // @v0.76.1, impl `extension/tool-activation.ts`). `eager` registers no loader
+                // (`:86-87`, "Same as --exclude-tools subagents_enable"). Full arm only: upstream's
+                // `fanout-child.ts` has no loader. The loader is not active on registration
+                // (`default_active() == false`); `SessionStart` decides the selection.
+                let tool_activation = self
+                    .executor
+                    .config_snapshot()
+                    .await
+                    .tool_activation
+                    .unwrap_or_default();
+                if tool_activation != crate::registration::ToolActivationMode::Eager {
+                    api.register_tool(Arc::new(
+                        crate::extension::tool_activation::SubagentsEnableTool::new(
+                            self.executor.clone(),
+                        ),
+                    ));
+                    self.tool_activation.loader_registered(tool_activation);
+                }
+
                 // SUBA-004 (pi `extension/index.ts:519-527`): the `wait` tool registers alongside
                 // `subagent`, in the Full arm only. Without it an orchestrator has NO way to block
                 // on a background run — it can only end its turn and hope a completion notification
@@ -404,6 +425,10 @@ impl NativeExtension for SubagentsExtension {
                     cyrup_ext::EventKind::SessionBeforeSwitch,
                     cyrup_ext::EventKind::SessionBeforeFork,
                     cyrup_ext::EventKind::SessionCompact,
+                    // SUBA-139 — pi `pi.on("session_tree", …)` (`tool-activation.ts:137`
+                    // @v0.76.1): tree navigation re-decides the loader selection from the branch
+                    // it lands on.
+                    cyrup_ext::EventKind::SessionTree,
                     // R-SA-132/134 — the packaged-resources contribution. Upstream declares it
                     // statically in `package.json`'s `pi` block (`"skills": ["./skills"]`,
                     // `"prompts": ["./prompts"]`, `pi-subagents/package.json:52-62` @v0.34.0), which
@@ -445,6 +470,14 @@ impl NativeExtension for SubagentsExtension {
         crate::extension::host::slash_inspect_rpc::record_attached_mode(ctx.mode);
         match ev {
             HostEvent::SessionStart { .. } => {
+                // SUBA-139/SUBA-153 — pi `pi.on("session_start", …applyRecordedSelection…)`
+                // (`tool-activation.ts:136` @v0.76.1). First in the arm: it reads the transcript
+                // and the dynamic-tool view and writes the active set, all cheap, and nothing
+                // below it reads or changes the tool selection.
+                self.tool_activation
+                    .on_session_start_or_tree(self.executor.host_services())
+                    .await;
+
                 // T6's once-per-load housekeeping (`ensureAccessibleDir`/`cleanupOldChainDirs`/
                 // `cleanupAllArtifactDirs`) now runs in `init()`, above — matching pi's own
                 // registration-time closure body exactly (`extension/index.ts:257-264` runs once,
@@ -858,6 +891,16 @@ impl NativeExtension for SubagentsExtension {
                 // @v0.71.0): the advertised catalog rides the system prompt only while the
                 // `subagent` tool is selected (`systemPromptOptions.selectedTools ??
                 // getActiveTools()`), and a stale block is stripped either way.
+                //
+                // SUBA-139 — pi's tool-activation `before_agent_start` handler
+                // (`tool-activation.ts:138-145` @v0.76.1) keeps a selected loader in
+                // `selectedTools`. Its edit and the catalog rewrite below leave in ONE `Mutate`:
+                // upstream both handlers edit the same event object, so both edits survive, and
+                // a second early return here would drop whichever came first.
+                let loader_options = self
+                    .tool_activation
+                    .on_before_agent_start(self.executor.host_services(), options);
+                let options = loader_options.as_ref().unwrap_or(options);
                 let selected_tools: Vec<String> = match options.get("selectedTools") {
                     Some(serde_json::Value::Array(names)) => names
                         .iter()
@@ -878,13 +921,23 @@ impl NativeExtension for SubagentsExtension {
                     system_prompt,
                     advertised.as_deref(),
                 );
-                if rewritten != *system_prompt {
+                let system = (rewritten != *system_prompt).then_some(rewritten);
+                if system.is_some() || loader_options.is_some() {
                     return HookOutcome::Mutate(cyrup_ext::EventPatch::SystemPromptAndInject {
-                        system: Some(rewritten),
+                        system,
                         inject: Vec::new(),
-                        options: None,
+                        options: loader_options,
                     });
                 }
+            }
+            // SUBA-139 — pi `pi.on("session_tree", …applyRecordedSelection…)`
+            // (`tool-activation.ts:137` @v0.76.1). The host has already restored the declared
+            // loadout for the branch (`session/forking.rs`); this re-applies the loader rule on
+            // top of it.
+            HostEvent::SessionTree { .. } => {
+                self.tool_activation
+                    .on_session_start_or_tree(self.executor.host_services())
+                    .await;
             }
             // pi `register-main.ts:419-422`. The event is re-shaped into the `{type:"turn_end",
             // message, toolResults}` object `formatWatchdogTurnDelta`/`eventIndicatesRepoEdit`

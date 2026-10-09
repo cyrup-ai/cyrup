@@ -76,6 +76,9 @@ pub(crate) mod rpc;
 // that owns the branch supplies the joined reply text and the `workflow: true` call count.
 pub mod reply_workflow_script;
 mod tool;
+// SUBA-139 / SUBA-153 — the `subagents_enable` loader and `config.toolActivation` (pi
+// `src/extension/tool-activation.ts` @v0.76.1). Registered and driven from `host::native_impl`.
+pub(crate) mod tool_activation;
 pub(crate) mod wait_tool;
 
 pub use executor::SubagentExecutor;

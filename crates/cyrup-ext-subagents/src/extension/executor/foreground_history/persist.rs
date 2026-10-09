@@ -130,7 +130,7 @@ pub(crate) fn persist_foreground_run_history_from(
     let runs = sort_and_bound(merged.into_values().collect(), limit);
     // pi `writePrivateAtomicJson` (`:146`) — 0600, creates the parent dir, atomic rename.
     // Best-effort: a write failure here must never surface as a tool/run failure — exactly
-    // `record_run_history`'s own best-effort contract.
+    // `background::record_run`'s own best-effort contract.
     let _ = crate::background::atomic::write_private_atomic_json_blocking(
         &history_path(results_dir),
         &ForegroundHistoryIndex {

@@ -411,6 +411,17 @@ pub struct SubagentExtensionConfig {
     /// config load — see [`Self::validate_artifact_dir`], which is upstream's own `throw`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub artifact_dir: Option<crate::artifacts::ArtifactDirPreference>,
+    /// SUBA-139/SUBA-153 — pi `ExtensionConfig.toolActivation?: ToolActivationMode`
+    /// (`shared/types.ts:2686-2687` @v0.76.1: *"How a new parent session offers the subagent tool.
+    /// Defaults to auto."*), handed to `registerSubagentToolActivation` at
+    /// `extension/index.ts:1193-1199`. See [`crate::extension::tool_activation`].
+    ///
+    /// `None` (the key omitted) is pi's `options.mode ?? "auto"`. A typed enum is safe for the
+    /// [`Self::disabled_features`] reason: [`Self::validate_tool_activation`] runs on the raw JSON
+    /// first, with upstream's own sentence, and `toolActivation` is one of
+    /// [`FAIL_CLOSED_CONFIG_KEYS`], so an invalid value refuses the file before serde sees it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_activation: Option<ToolActivationMode>,
     /// SUBA-064 — pi `ExtensionConfig.authorityPolicy?: AuthorityPolicyConfig`, consulted by
     /// `resolveAuthorityDecision` (`policy/authority.ts:23`) and — the live-reachable half — by the
     /// `stop`/`steer` gate at `runs/foreground/subagent-executor.ts:4412-4423` @v0.43.0.
@@ -608,6 +619,22 @@ pub const UNPORTED_CONFIG_KEYS: [(&str, &str); 10] = [
     ("resultScanLogging", "result-index scan logging"),
 ];
 
+/// SUBA-153 — pi `ToolActivationMode` (`shared/types.ts:2608` @v0.76.1): how a new parent session
+/// offers the `subagent` tool. The wire spelling is upstream's lowercase string.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ToolActivationMode {
+    /// pi `"auto"`, the default: a fresh session starts with the `subagents_enable` loader only
+    /// when enabling `subagent` mid-conversation is cache-safe for its model; otherwise
+    /// `subagent` is active from the start and no loader is offered.
+    #[default]
+    Auto,
+    /// pi `"dynamic"`: every session is offered the loader, whatever the model.
+    Dynamic,
+    /// pi `"eager"`: no loader is registered, so `subagent` is active from the first request.
+    Eager,
+}
+
 /// SUBA-166 — pi `FAIL_CLOSED_CONFIG_KEYS` (`extension/config.ts:17` @v0.75.0): the `config.json`
 /// keys whose mere PRESENCE turns a validation failure from "warn and use the built-in defaults"
 /// into a refusal of the whole file. Upstream's own comment: explicit route identity, worktree,
@@ -619,11 +646,11 @@ pub const UNPORTED_CONFIG_KEYS: [(&str, &str); 10] = [
 /// key "silently drops `authorityPolicy`, `permissions`, or `toolBudget`".
 ///
 /// A closed set that lives with the schema, not with the loader — the keys are a property of what
-/// `config.json` may declare, and three of them
-/// ([`UNPORTED_CONFIG_KEYS`]'s `toolBudget`, plus `disabledFeatures` and `toolActivation`, which
-/// this port has no field for at all) are listed anyway: a key nothing reads yet still means the
-/// operator was declaring a policy, so the list is complete BEFORE those keys are ported and does
-/// not have to be revisited when they are.
+/// `config.json` may declare, and some of them were listed before this port had a field for them
+/// ([`UNPORTED_CONFIG_KEYS`]'s `toolBudget` still has none; `disabledFeatures` landed with
+/// SUBA-152 and `toolActivation` with SUBA-153): a key nothing reads yet still means the operator
+/// was declaring a policy, so the list is complete BEFORE those keys are ported and does not have
+/// to be revisited when they are.
 ///
 /// Order is upstream's, so [`SubagentExtensionConfig::invalid_config_disposition`] reports the keys
 /// in the order pi declares them.
@@ -742,6 +769,8 @@ impl Default for SubagentExtensionConfig {
             disabled_features: None,
             artifact_config: None,
             artifact_dir: None,
+            // SUBA-153 — pi `options.mode ?? "auto"` (`tool-activation.ts:85`).
+            tool_activation: None,
             authority_policy: None,
             turn_budget: None,
             timeout_ms: None,
@@ -879,6 +908,25 @@ impl SubagentExtensionConfig {
         crate::artifacts::ArtifactDirPreference::parse(text).map(|_| ())
     }
 
+    /// SUBA-153 — pi `validateConfig`'s `toolActivation` clause (`extension/config.ts:178-180`
+    /// @v0.76.1): `if (config.toolActivation !== undefined && config.toolActivation !== "auto" &&
+    /// config.toolActivation !== "dynamic" && config.toolActivation !== "eager") throw ...`.
+    /// Applied to the RAW config JSON for [`Self::validate_artifact_dir`]'s reason. An explicit
+    /// `null` is refused too: it is not `undefined`.
+    ///
+    /// # Errors
+    ///
+    /// `config.toolActivation must be "auto", "dynamic", or "eager"`.
+    pub fn validate_tool_activation(raw: &serde_json::Value) -> Result<(), String> {
+        let Some(value) = raw.get("toolActivation") else {
+            return Ok(());
+        };
+        match value.as_str() {
+            Some("auto" | "dynamic" | "eager") => Ok(()),
+            _ => Err(r#"config.toolActivation must be "auto", "dynamic", or "eager""#.to_string()),
+        }
+    }
+
     /// SUBA-059 — the retention horizon this load will sweep with: pi
     /// `config.artifactConfig?.cleanupDays ?? DEFAULT_ARTIFACT_CONFIG.cleanupDays`
     /// (`extension/index.ts:369` @v0.47.1).
@@ -963,6 +1011,10 @@ impl SubagentExtensionConfig {
         // ahead of `artifactDir` (`:155`).
         Self::validate_checkpoint_before_deadline_ms(raw)?;
         Self::validate_artifact_dir(raw)?;
+        // SUBA-153 — upstream checks `toolActivation` (`extension/config.ts:178-180` @v0.76.1)
+        // after `artifactDir` (`:162`) and before `validateMissionStoreConfig` (`:181`); the
+        // checks between them upstream are not ported.
+        Self::validate_tool_activation(raw)?;
         Self::validate_missions(raw)?;
         Self::validate_authority_policy(raw)?;
         // SUBA-152 — `validateDisabledFeatures(config.disabledFeatures)`

@@ -127,6 +127,8 @@ mod registration_commands_integration;
 // sandboxed root and, in its extra-dirs case, is this binary's one environment mutator.
 mod subagents_admin_integration;
 mod subagents_optin_gate_integration;
+// SUBA-139/SUBA-153 — the `subagents_enable` loader shaping real request tool lists.
+mod tool_activation_integration;
 mod wait_tool_registration_integration;
 mod watchdog_model_turn_integration;
 mod watchdog_permission_arbiter_integration;

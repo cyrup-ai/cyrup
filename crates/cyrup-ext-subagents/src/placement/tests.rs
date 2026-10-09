@@ -2047,6 +2047,9 @@ async fn a_placed_external_run_reconnects_a_lost_transport_and_settles() {
     );
     let local = tempfile::tempdir().unwrap();
     let mut agent = crate::exec::testsupport::sample_agent_config("m1", &[]);
+    // SUBA-167 — a pinned model on a Claude Code agent becomes `--model`, which a saved machine
+    // cannot honour (`assertClaudeCodeOverrideIsLocal`); this placed agent pins none.
+    agent.model = None;
     agent.runner = Some(crate::runner::AgentRunnerConfig::ExternalCli(
         crate::runner::ExternalCliRunner {
             adapter: Some(AdapterId::ClaudeCode),

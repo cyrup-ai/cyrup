@@ -892,6 +892,7 @@ mod tests {
             tool_timeouts: Arc::new(BTreeMap::new()),
             model_response_aliases: None,
             writer_ledgers: None,
+            launched: None,
             lease_writer: None,
             spawn_command: None,
             child_env: std::collections::HashMap::new(),

@@ -305,6 +305,19 @@ fn history_path(home: &Path, cwd: &Path) -> PathBuf {
         .join("foreground-history.json")
 }
 
+/// SUBA-172 — the sandbox agent dir's `run-history.jsonl` (pi `getHistoryPath()`,
+/// `run-history.ts:27-29`), one parsed value per line; empty when the file does not exist.
+fn run_history_rows(home: &Path) -> Vec<serde_json::Value> {
+    let path = Roots::sandboxed(home).agent_dir().join("run-history.jsonl");
+    match std::fs::read_to_string(path) {
+        Ok(raw) => raw
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("history line is JSON"))
+            .collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
 /// Whether the on-disk foreground history names `run_id` at all. A missing file is "no".
 fn history_names(path: &Path, run_id: &str) -> bool {
     std::fs::read_to_string(path)
@@ -502,6 +515,12 @@ async fn a_live_detach_returns_the_receipt_and_leaves_its_child_running() {
 
     // ---- (a) the receipt sentence ----
     let receipt = detach(&ext, "", &ctx).await;
+    // SUBA-172 — the receipt is never recorded (pi `if (!r.detached) recordRun(…)`,
+    // `subagent-executor.ts:4396`); the child's real exit is, below.
+    assert!(
+        run_history_rows(home.path()).is_empty(),
+        "a detach receipt must not write run history"
+    );
     assert!(
         receipt.contains(&format!(
             "Detached foreground run {run_id} without terminating its child."
@@ -732,6 +751,25 @@ async fn a_live_detach_returns_the_receipt_and_leaves_its_child_running() {
         },
     )
     .await;
+
+    // SUBA-172 — pi `onDetachedExit`'s `recordRun` (`subagent-executor.ts:4371` @v0.76.1): the
+    // detached child's terminal result is recorded exactly once, by the continuation, redacted.
+    let rows = eventually(
+        SETTLE_BUDGET,
+        "the detached child's exit never reached run-history.jsonl",
+        || {
+            let home = home.path().to_path_buf();
+            async move {
+                let rows = run_history_rows(&home);
+                (!rows.is_empty()).then_some(rows)
+            }
+        },
+    )
+    .await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0]["agent"], "worker");
+    assert_eq!(rows[0]["task"], "[redacted]");
+    assert_ne!(rows[0]["exit"], -2, "the receipt is never the recorded row");
 
     for pid in fixture_pids(&script) {
         kill_pid_for_cleanup(pid);
@@ -968,6 +1006,81 @@ async fn a_detached_workflow_child_settles_back_into_the_step_that_launched_it()
             .is_none_or(|out| !out.contains("Detached at user request")),
         "the detach sentence is the RECEIPT's output, never the child's: {settled:?}"
     );
+
+    // SUBA-172 — the workflow-awaited child is recorded EXACTLY ONCE: by the settle tail with its
+    // real result (pi `:4396`), never also by `onDetachedExit`, which returns early for it
+    // (`subagent-executor.ts:4336-4338`).
+    let rows = run_history_rows(home.path());
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0]["agent"], "worker");
+
+    for pid in fixture_pids(&script) {
+        kill_pid_for_cleanup(pid);
+    }
+}
+
+/// SUBA-172 — an ordinary attached foreground `/run` single records ONE redacted, private row in
+/// the agent dir's `run-history.jsonl` (pi `recordRun`, `subagent-executor.ts:4396` @v0.76.1),
+/// carrying the run's own duration and an explicit outcome. Before SUBA-172 the foreground path
+/// recorded nothing at all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_attached_foreground_single_records_one_redacted_private_history_row() {
+    let home = tempfile::tempdir().expect("home tempdir");
+    let cwd = tempfile::tempdir().expect("cwd tempdir");
+    write_worker_persona(cwd.path());
+    let script = blocking_child_script(cwd.path(), "quick.json", 50);
+    let ext = extension(home.path(), cwd.path(), &script);
+
+    let result = ext
+        .executor()
+        .run_foreground(
+            cwd.path(),
+            "worker",
+            "SUBA172_SENTINEL audit the ledger",
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("the foreground run resolves its persona and spawns its child");
+
+    let path = Roots::sandboxed(home.path())
+        .agent_dir()
+        .join("run-history.jsonl");
+    let raw = std::fs::read_to_string(&path).expect("the settle tail recorded history");
+    assert!(!raw.contains("SUBA172_SENTINEL"), "{raw}");
+    let rows = run_history_rows(home.path());
+    assert_eq!(rows.len(), 1, "{raw}");
+    let row = &rows[0];
+    assert_eq!(row["agent"], "worker");
+    assert_eq!(row["task"], "[redacted]");
+    let hash = row["taskHash"].as_str().expect("taskHash");
+    assert_eq!(hash.len(), 64);
+    assert!(hash.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f')));
+    let expected = if result.exit_code == 0 {
+        "completed"
+    } else {
+        "failed"
+    };
+    assert_eq!(row["outcome"], expected, "{row} vs {result:?}");
+    assert!(
+        row["duration"].as_i64().is_some_and(|ms| ms >= 50),
+        "the run's own duration, at least the child's sleep: {row}"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = std::fs::metadata(&path)
+            .expect("history file")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+        let dir_mode = std::fs::metadata(path.parent().expect("agent dir"))
+            .expect("agent dir")
+            .permissions()
+            .mode();
+        assert_eq!(dir_mode & 0o777, 0o700);
+    }
 
     for pid in fixture_pids(&script) {
         kill_pid_for_cleanup(pid);

@@ -147,6 +147,7 @@ fn spawn_env_child_role_entry() {
 /// the persona name all come out of the same assembly a real `subagent` tool call performs.
 fn production_child_env(cwd: &Path, parent_id: &str) -> std::collections::HashMap<String, String> {
     let agent = AgentConfig {
+        model_is_settings_default: false,
         machine: None,
         acceptance_role: None, // SUBA-082: no declared role, the name decides
         default_acceptance: None,
@@ -183,6 +184,7 @@ fn production_child_env(cwd: &Path, parent_id: &str) -> std::collections::HashMa
         runner: None, // SUBA-074: the native child, as before
     };
     let opts = RunOptions {
+        launch_model: None,
         tool_timeout_ms: None,
         parent_env_overrides: std::collections::BTreeMap::new(),
         machine: None,

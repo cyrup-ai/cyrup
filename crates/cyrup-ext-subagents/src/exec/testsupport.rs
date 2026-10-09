@@ -22,6 +22,7 @@ use std::path::{Path, PathBuf};
 
 pub(crate) fn sample_agent_config(model: &str, fallback: &[&str]) -> AgentConfig {
     AgentConfig {
+        model_is_settings_default: false,
         inherit_global_context: false,
         machine: None,
         mutation_tools: None,
@@ -58,6 +59,7 @@ pub(crate) fn sample_agent_config(model: &str, fallback: &[&str]) -> AgentConfig
 
 pub(crate) fn base_opts(cwd: &std::path::Path, available: &[&str]) -> RunOptions {
     RunOptions {
+        launch_model: None,
         tool_timeout_ms: None,
         // SUBA-119 — a test fixture's model is chosen for the run, not inherited from a parent
         // session, so verification is ON and no aliases are declared.
@@ -259,4 +261,54 @@ pub(crate) fn write_mcp_fixture(
             }
         }),
     );
+}
+
+/// SUBA-167 — a fake `claude` for the Claude Code adapter's end-to-end tests (upstream's
+/// `claude-argv.cjs`, `test/unit/claude-code-adapter.test.ts:305-323` @v0.76.1), as a POSIX shell
+/// script named directly as the runner's `command`.
+///
+/// It answers the two preflight probes, then reports, as its `result` text, `argv:--no-chrome`
+/// followed by every token AFTER `--no-chrome` — the override tail and nothing else (the fixed
+/// argv carries `{"mcpServers":{}}`, which a shell cannot safely re-embed in JSON). It touches
+/// `marker` on ANY invocation, probes included, so a test can prove nothing ran at all.
+pub(crate) fn write_fake_claude(dir: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
+    use std::os::unix::fs::PermissionsExt as _;
+    let script = dir.join("fake-claude.sh");
+    let marker = dir.join("fake-claude.ran");
+    std::fs::write(
+        &script,
+        format!(
+            r#"#!/bin/sh
+: > "{marker}"
+case "$1" in
+  --version) echo "2.1.150 (Claude Code)"; exit 0 ;;
+  --help) echo "Claude Code - starts an interactive session --print --input-format text --output-format stream-json --verbose --permission-mode plan acceptEdits --tools --strict-mcp-config --mcp-config --setting-sources --no-session-persistence --disable-slash-commands --no-chrome"; exit 0 ;;
+esac
+cat >/dev/null
+tail=""
+seen=0
+for arg in "$@"; do
+  if [ "$seen" = 1 ]; then tail="$tail $arg"; fi
+  if [ "$arg" = "--no-chrome" ]; then seen=1; fi
+done
+printf '{{"type":"result","subtype":"success","is_error":false,"result":"argv:--no-chrome%s"}}\n' "$tail"
+"#,
+            marker = marker.display()
+        ),
+    )
+    .expect("write fake claude");
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod fake claude");
+    (script, marker)
+}
+
+/// SUBA-167 — a `claude-code` runner over `command`.
+pub(crate) fn claude_code_runner(command: &std::path::Path) -> crate::runner::AgentRunnerConfig {
+    crate::runner::AgentRunnerConfig::ExternalCli(crate::runner::ExternalCliRunner {
+        adapter: Some(crate::runner::contract::AdapterId::ClaudeCode),
+        command: command.display().to_string(),
+        args: Vec::new(),
+        prompt_delivery_stdin: false,
+        capabilities: None,
+    })
 }

@@ -99,6 +99,23 @@ impl AgentRunnerConfig {
             _ => None,
         }
     }
+    /// SUBA-167 — pi `runner.type === "external-cli" && isClaudeCodeAdapterId(runner.adapter)`
+    /// (`claude-code-adapter.ts:13-16`, `agents.ts:2074` @v0.76.1): the two code-owned adapters
+    /// that take a per-launch model and thinking level.
+    #[must_use]
+    pub fn is_claude_code(&self) -> bool {
+        matches!(
+            self.code_owned_adapter(),
+            Some(AdapterId::ClaudeCode | AdapterId::ClaudeCodeWriter)
+        )
+    }
+
+    /// Whether this runner is a foreign process rather than the native Pi child (pi's
+    /// `externalRunner`, `async-execution.ts:1091` @v0.76.1).
+    #[must_use]
+    pub fn is_external(&self) -> bool {
+        !matches!(self, Self::Pi)
+    }
 }
 
 /// Re-emit an [`AgentRunnerConfig`] as the compact JSON an agent file's `runner:` line carries.
@@ -221,9 +238,14 @@ pub fn validate_external_runner_profile(
     if matches!(runner, AgentRunnerConfig::Pi) {
         return Ok(());
     }
+    // SUBA-167 — the code-owned Claude Code adapters accept an explicit model and thinking level:
+    // both are translated into their own argv rather than into a Pi child model
+    // (`agents.ts:2072-2076` @v0.76.1).
+    let adapter_accepts_overrides = runner.is_claude_code();
     let unsupported: Vec<&str> = PI_ONLY_FIELDS
         .into_iter()
         .filter(|field| present(field))
+        .filter(|field| !(adapter_accepts_overrides && matches!(*field, "model" | "thinking")))
         .collect();
     if unsupported.is_empty() {
         return Ok(());
@@ -598,6 +620,49 @@ mod tests {
                 .is_ok()
         );
         assert!(validate_external_runner_profile("worker", None, |_| true).is_ok());
+    }
+
+    /// SUBA-167 — the two Claude Code adapters accept `model` and `thinking` frontmatter, which
+    /// they translate into their own argv; every other external runner still refuses both, and the
+    /// Claude Code exemption covers those two keys only (`agents.ts:2072-2076` @v0.76.1).
+    #[test]
+    fn claude_code_adapters_accept_model_and_thinking_frontmatter() {
+        let runner = |adapter: Option<AdapterId>| {
+            AgentRunnerConfig::ExternalCli(ExternalCliRunner {
+                adapter,
+                command: "c".to_string(),
+                args: Vec::new(),
+                prompt_delivery_stdin: false,
+                capabilities: None,
+            })
+        };
+        let model_and_thinking = |f: &str| matches!(f, "model" | "thinking");
+        for adapter in [AdapterId::ClaudeCode, AdapterId::ClaudeCodeWriter] {
+            assert!(
+                validate_external_runner_profile("cc", Some(&runner(Some(adapter))), |f| {
+                    model_and_thinking(f)
+                })
+                .is_ok(),
+                "{adapter:?}"
+            );
+            assert_eq!(
+                validate_external_runner_profile("cc", Some(&runner(Some(adapter))), |f| {
+                    matches!(f, "model" | "thinking" | "tools")
+                })
+                .unwrap_err(),
+                "Agent 'cc' uses runner.type='external-cli' and declares unsupported Pi-only \
+                 fields: tools."
+            );
+        }
+        for adapter in [None, Some(AdapterId::CodexExec)] {
+            assert_eq!(
+                validate_external_runner_profile("ccx", Some(&runner(adapter)), |f| f == "model")
+                    .unwrap_err(),
+                "Agent 'ccx' uses runner.type='external-cli' and declares unsupported Pi-only \
+                 fields: model.",
+                "{adapter:?}"
+            );
+        }
     }
 
     /// SUBA-074 stage 2 rewrote the stage-1 gate: "which runners are honourable" is no longer an

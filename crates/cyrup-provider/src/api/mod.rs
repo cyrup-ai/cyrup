@@ -232,11 +232,60 @@ pub fn register_builtins(reg: &mut ApiRegistry) {
     );
 }
 
+/// Whether the adapter for `api` sends a mid-conversation tool change NATIVELY — keeping the
+/// request-level tool list fixed and anchoring later tools in the transcript — rather than
+/// rebuilding the request's tool list, which changes the cached prefix and misses the prompt
+/// cache. pi-ai does this per api when the model's compat flags allow it (pi-subagents
+/// `tool-activation.ts:34-35` @v0.76.1: *"Mirrors pi-ai's per-API transcript handling"*):
+/// `tool_addition`/`tool_removal` blocks on `anthropic-messages`, mid-conversation system
+/// messages on `openai-completions`, `additional_tools` / tool search on the three Responses apis.
+///
+/// **`false` for every api today** `[CYRUP-DELTA]`. Every cyrup adapter skips `Message::System`
+/// and sends the full tool list on each request (`anthropic_messages/messages.rs:53-60`,
+/// `anthropic_messages/params.rs:115`, `openai_completions/convert.rs:49-56`,
+/// `openai_responses/convert.rs:81-88`): the native emitters are the adapter half of PROV-083 that
+/// code comments call "PROV-083b", ledgered as **PROV-133**
+/// (`docs/gap-analysis/01-cyrup-core-and-provider.md`) for the Anthropic route. The compat
+/// flags alone therefore over-promise in cyrup, and a consumer that uses them to decide whether a
+/// mid-conversation tool change is cache-safe (pi-subagents' `toolActivation: "auto"`, SUBA-153)
+/// must also ask this. When an adapter gains its native emitter, its api returns `true` here, and
+/// `tests::no_adapter_emits_native_tool_additions_yet` must change with it.
+#[must_use]
+pub const fn emits_native_tool_additions(_api: &str) -> bool {
+    false
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Pins [`emits_native_tool_additions`] to `false` for every api cyrup registers, so the day an
+    /// adapter gains a native mid-conversation tool emitter (PROV-133 / "PROV-083b") this test has
+    /// to be edited alongside it, which flips pi-subagents' `toolActivation: "auto"` gate for that
+    /// api on purpose rather than by accident.
+    #[test]
+    fn no_adapter_emits_native_tool_additions_yet() {
+        let registry = builtin_registry();
+        let ids = registry.ids();
+        assert!(!ids.is_empty());
+        for api in &ids {
+            assert!(
+                !emits_native_tool_additions(api.as_str()),
+                "{api:?} has no native mid-conversation tool emitter yet"
+            );
+        }
+        for api in [
+            crate::known_api::ANTHROPIC_MESSAGES,
+            crate::known_api::OPENAI_COMPLETIONS,
+            crate::known_api::OPENAI_RESPONSES,
+            crate::known_api::OPENAI_CODEX_RESPONSES,
+            crate::known_api::AZURE_OPENAI_RESPONSES,
+        ] {
+            assert!(!emits_native_tool_additions(api), "{api}");
+        }
+    }
 
     static FACTORY_CALLS: AtomicUsize = AtomicUsize::new(0);
 

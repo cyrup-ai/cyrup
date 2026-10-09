@@ -416,8 +416,20 @@ async fn run_sync_unnamed(agent: &AgentConfig, task: &str, opts: &RunOptions) ->
     // adapter is supported. Upstream resolves NO model for an external runner at all
     // (`api/preflight.ts:322-343` @v0.64.0), so the external arm returns from here rather than
     // entering the ladder below.
+    //
+    // SUBA-167 — a Claude Code agent's per-launch `--model`/`--effort` is resolved and checked
+    // HERE, before the dispatch builds the launch, so an unusable model, an out-of-ceiling level,
+    // an enforced scope the model falls outside, or an override on a saved machine refuses the
+    // run before any probe or process starts (upstream's `AsyncStartValidationError`,
+    // `async-execution.ts:1100-1116` @v0.76.1). Empty for every other runner.
+    let claude_code_override_args =
+        match crate::exec::external_cli::resolve_claude_code_launch_override(agent, opts) {
+            Ok(args) => args,
+            Err(error) => return pre_spawn_failure(agent, task, error),
+        };
     let launch_ctx = crate::exec::external_cli::ExternalCliLaunchContext {
         command_prefix_args: Vec::new(),
+        claude_code_override_args,
     };
     match crate::runner::dispatch::resolve_runner_dispatch(agent.runner.as_ref(), &launch_ctx) {
         crate::runner::dispatch::RunnerDispatch::Refused(reason) => {
@@ -2865,6 +2877,119 @@ mod tests {
         assert!(process.stderr_path.ends_with(".stderr.log"), "{process:?}");
         assert!(process.duration_ms.is_some(), "{process:?}");
         assert!(result.runner.is_some(), "{result:?}");
+    }
+
+    /// SUBA-167 — upstream `passes an explicit model and effort to a real launch`
+    /// (`test/unit/claude-code-adapter.test.ts:305-323` @v0.76.1), driven through `run_sync`: the
+    /// launch's model as typed becomes `--model <base> --effort <level>` at the END of the argv.
+    #[tokio::test]
+    async fn run_sync_passes_a_claude_code_launch_model_and_effort_to_the_cli() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (script, _) = crate::exec::testsupport::write_fake_claude(dir.path());
+        let mut agent = sample_agent_config("m1", &[]);
+        agent.model = None;
+        agent.runner = Some(crate::exec::testsupport::claude_code_runner(&script));
+        let mut opts = base_opts(dir.path(), &["m1"]);
+        opts.launch_model = Some(cyrup_core::ModelId::from("claude-opus-5.5:high"));
+        // The post-inheritance override is NOT what reaches the CLI.
+        opts.model_override = crate::exec::fallback::ModelOverride::Explicit(
+            cyrup_core::ModelId::from("parent/model"),
+        );
+
+        let result = run_sync(&agent, "review", &opts).await;
+
+        assert_eq!(result.error, None, "{result:?}");
+        assert_eq!(
+            result.final_output.as_deref(),
+            Some("argv:--no-chrome --model claude-opus-5.5 --effort high")
+        );
+        assert_eq!(
+            result.model, None,
+            "an external result still names no model"
+        );
+        let runner = result.runner.as_ref().expect("runner receipt");
+        assert_eq!(
+            runner.args[runner.args.len() - 4..],
+            ["--model", "claude-opus-5.5", "--effort", "high"],
+            "the published status carries the override tokens"
+        );
+    }
+
+    /// SUBA-167 — with no launch model, the agent's own `thinking:` is the level
+    /// (`resolveClaudeCodeThinking(thinkingOverride, a.thinking)`, `async-execution.ts:1104`
+    /// @v0.76.1), and a `subagents.defaultModel` fill on the agent never becomes `--model`.
+    #[tokio::test]
+    async fn run_sync_maps_a_claude_code_agents_thinking_to_effort_and_keeps_a_default_model_out() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (script, _) = crate::exec::testsupport::write_fake_claude(dir.path());
+        let mut agent = sample_agent_config("anthropic/claude-sonnet-4-5", &[]);
+        agent.model_is_settings_default = true;
+        agent.thinking = Some("medium".to_string());
+        agent.runner = Some(crate::exec::testsupport::claude_code_runner(&script));
+        let opts = base_opts(dir.path(), &["anthropic/claude-sonnet-4-5"]);
+
+        let result = run_sync(&agent, "review", &opts).await;
+
+        assert_eq!(result.error, None, "{result:?}");
+        assert_eq!(
+            result.final_output.as_deref(),
+            Some("argv:--no-chrome --effort medium")
+        );
+    }
+
+    /// SUBA-167 — an unusable request refuses the run BEFORE anything is spawned, the probes
+    /// included (upstream's `AsyncStartValidationError`, `async-execution.ts:1114-1116` @v0.76.1);
+    /// so does an override on a saved machine (`assertClaudeCodeOverrideIsLocal`, `:893-896`).
+    #[tokio::test]
+    async fn run_sync_refuses_an_unusable_claude_code_override_before_anything_spawns() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (script, marker) = crate::exec::testsupport::write_fake_claude(dir.path());
+        let mut agent = sample_agent_config("m1", &[]);
+        agent.model = None;
+        agent.name = "cc".to_string();
+        agent.runner = Some(crate::exec::testsupport::claude_code_runner(&script));
+
+        let mut invalid = agent.clone();
+        invalid.thinking = Some("turbo".to_string());
+        let result = run_sync(&invalid, "review", &base_opts(dir.path(), &["m1"])).await;
+        assert_eq!(result.exit_code, 1, "{result:?}");
+        assert_eq!(
+            result.error.as_deref(),
+            Some(
+                "Invalid thinking level \"turbo\"; expected one of off, minimal, low, medium, \
+                 high, xhigh, max."
+            )
+        );
+        assert!(
+            !marker.exists(),
+            "nothing may run, not even a preflight probe"
+        );
+
+        let mut placed = base_opts(dir.path(), &["m1"]);
+        placed.launch_model = Some(cyrup_core::ModelId::from(":high"));
+        placed.machine = Some(crate::placement::HerdrMachineReference {
+            provider: crate::placement::MachineProvider::Herdr,
+            id: "m-1".to_string(),
+            label: Some("gpu-box".to_string()),
+            target: "me@gpu".to_string(),
+            session: None,
+            cwd: "/srv/repo".to_string(),
+            transport: None,
+            agent_dir: None,
+        });
+        let result = run_sync(&agent, "review", &placed).await;
+        assert_eq!(
+            result.error.as_deref(),
+            Some(
+                "Agent 'cc' requested machine 'gpu-box', but a Claude Code model or thinking \
+                 level cannot be honored on a saved machine. Remove the model or thinking request, \
+                 or run the agent locally."
+            )
+        );
+        assert!(
+            !marker.exists(),
+            "a placed override is refused before the pane launch"
+        );
     }
 
     /// `runner: {"type":"pi"}` is the native child, so it is indistinguishable from declaring no

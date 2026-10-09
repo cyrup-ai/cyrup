@@ -35,7 +35,7 @@ async fn host_with_demo() -> ExtensionHost {
     host.load_wasm(
         "demo".into(),
         &bytes,
-        Arc::new(DenyServices::default()) as Arc<dyn cyrup_ext::HostServices>,
+        Arc::new(DenyServices) as Arc<dyn cyrup_ext::HostServices>,
     )
     .await
     .expect("demo component loads");

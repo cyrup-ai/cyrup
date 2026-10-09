@@ -450,8 +450,10 @@ pub struct ModelCompat {
     ///
     /// The ANTHROPIC route does not fall back to that constant: it defaults from the runtime
     /// predicate `crate::api::anthropic_messages::default_supports_mid_convo_system_messages`, the
-    /// same treatment DRIFT-001 gave `supports_tool_references` and for the same reason — no cyrup
-    /// catalog carries this key, so a constant default would make the whole port dead code.
+    /// same treatment DRIFT-001 gave `supports_tool_references`. When that predicate was written no
+    /// cyrup catalog carried this key; the embedded `anthropic.json` (and several
+    /// `openai-completions`/Responses catalogs) now do, and a declared value wins over the
+    /// predicate, which remains the default for rows that declare nothing (a `models.json` entry).
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub supports_mid_convo_system_messages: Option<bool>,
     /// Pi `supportsMidConvoToolAdditions` (`types.ts:733` @v0.87.1, `OpenAICompletionsCompat`):
@@ -564,9 +566,22 @@ pub struct ModelCompat {
     /// Unlike `supports_tool_references` this has **no runtime predicate** — Pi's gate is flatly
     /// `model.compat?.supportsToolSearch ?? false` (openai-responses.ts:74) and enablement is baked
     /// into the generated catalog by `ai/scripts/generate-models.ts:731-738` against a hardcoded id
-    /// set. No cyrup catalog sets it today, so it resolves `false` everywhere.
+    /// set. The embedded `openai.json` and `openai-codex.json` catalogs carry it for the ids that
+    /// set lists, so it resolves `true` for those rows and `false` everywhere else.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub supports_tool_search: Option<bool>,
+    /// Pi `supportsAdditionalTools` (`packages/ai/src/types.ts:903-904` @v1.1.0,
+    /// `OpenAIResponsesCompat`): *"Whether the model supports message-anchored `additional_tools`
+    /// input items. Default: false."* Read by pi-ai at `api/openai-responses.ts:90,314` @v1.1.0.
+    ///
+    /// Catalog data only: the embedded `openai.json`, `openai-codex.json`, `github-copilot.json`,
+    /// `opencode.json` and `opencode-go.json` rows carry it, and before this field existed serde
+    /// dropped the key on load. cyrup reads it ONLY for pi-subagents' tool-activation gate
+    /// (`cyrup_ext_subagents`' `compat_adds_tools_without_checkpoint`, SUBA-153) today: no
+    /// adapter emits `additional_tools` yet (the adapter half code comments call "PROV-083b";
+    /// see [`crate::api::emits_native_tool_additions`]).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub supports_additional_tools: Option<bool>,
 }
 
 /// The `openai-responses` view of [`ModelCompat`] (Pi `OpenAIResponsesCompat`,
@@ -1179,6 +1194,25 @@ mod tests {
             compat: None,
             headers: None,
         }
+    }
+
+    /// SUBA-153 — pi `supportsAdditionalTools` (`types.ts:904` @v1.1.0) survives a catalog load and
+    /// writes back under its camelCase key; an absent key stays absent rather than becoming
+    /// `false`, which is what lets a consumer read the raw compat the way pi-subagents does.
+    #[test]
+    fn supports_additional_tools_round_trips_and_stays_absent_when_unset() {
+        let compat: ModelCompat =
+            serde_json::from_value(serde_json::json!({ "supportsAdditionalTools": true }))
+                .expect("compat parses");
+        assert_eq!(compat.supports_additional_tools, Some(true));
+        let written = serde_json::to_value(&compat).expect("compat serializes");
+        assert_eq!(
+            written,
+            serde_json::json!({ "supportsAdditionalTools": true })
+        );
+
+        let unset = serde_json::to_value(ModelCompat::default()).expect("compat serializes");
+        assert!(unset.get("supportsAdditionalTools").is_none(), "{unset}");
     }
 
     #[test]

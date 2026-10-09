@@ -67,6 +67,7 @@ fn write_script(dir: &Path, name: &str, script: &serde_json::Value) -> PathBuf {
 
 fn base_agent_config(model: &str) -> AgentConfig {
     AgentConfig {
+        model_is_settings_default: false,
         machine: None,
         name: "worker".to_string(),
         model: Some(ModelId::from(model)),
@@ -117,6 +118,7 @@ fn fixture_spawn_command(script_path: &Path) -> SpawnCommand {
 
 fn base_run_options(cwd: &Path, model: &str) -> RunOptions {
     RunOptions {
+        launch_model: None,
         tool_timeout_ms: None,
         // SUBA-119 — a fixture launch whose model comes from its own agent config, so
         // native-child model verification is armed and no response-id alias is declared.

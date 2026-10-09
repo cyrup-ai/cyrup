@@ -1178,7 +1178,7 @@ pub fn compute_mcp_server_hash_with(
 }
 
 /// `createHash("sha256").update(preImage).digest("hex")`.
-fn hex_sha256(pre_image: &str) -> String {
+pub(crate) fn hex_sha256(pre_image: &str) -> String {
     use std::fmt::Write as _;
     let mut hasher = Sha256::new();
     hasher.update(pre_image.as_bytes());

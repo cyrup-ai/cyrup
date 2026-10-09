@@ -55,6 +55,11 @@ pub struct ExternalCliLaunchContext {
     /// FRONT of the adapter's own, so a test can point `command` at an interpreter and still
     /// exercise the real flags against a fake process. Empty in production.
     pub command_prefix_args: Vec<String>,
+    /// SUBA-167 — upstream's `overrideArgs` (`claude-code-adapter.ts:233-234,263` @v0.76.1): the
+    /// `--model`/`--effort` tokens [`resolve_claude_code_launch_override`] resolved for this run,
+    /// appended AFTER the adapter's fixed argv. Read only by the Claude Code resolver;
+    /// [`resolve_generic_launch`] ignores it.
+    pub claude_code_override_args: Vec<String>,
 }
 
 /// A resolved external-CLI launch — the proof that this build can actually execute the declared
@@ -143,7 +148,13 @@ pub fn resolve_claude_code_launch(
     cli: &crate::runner::ExternalCliRunner,
     ctx: &ExternalCliLaunchContext,
 ) -> Result<ExternalCliLaunch, String> {
-    let args = claude_code::launch_args(adapter, &ctx.command_prefix_args);
+    let args = claude_code::launch_args(
+        adapter,
+        &ctx.command_prefix_args,
+        &ctx.claude_code_override_args,
+    );
+    // The probes are built from the prefix ALONE, so the per-launch override tokens never reach
+    // `--version`/`--help` (`claude-code-adapter.ts:261-262,271-272` @v0.76.1).
     let mut version_args = ctx.command_prefix_args.clone();
     version_args.push("--version".to_string());
     let mut help_args = ctx.command_prefix_args.clone();
@@ -169,6 +180,84 @@ pub fn resolve_claude_code_launch(
         delivery: PromptDelivery::Stdin,
         final_output_path: None,
     })
+}
+
+/// SUBA-167 — the per-launch `--model`/`--effort` tokens for a Claude Code agent, or an empty list
+/// for every other runner.
+///
+/// Upstream runs the same three calls at both of its background launch sites
+/// (`async-execution.ts:1100-1116` chain/parallel, `:1917-1932` single @v0.76.1):
+/// `resolveClaudeCodeOverride`, then `assertClaudeCodeModelScope`, then
+/// `assertClaudeCodeOverrideIsLocal`, each throw refusing the launch before it starts.
+/// [`crate::exec::run_sync`] is the one chokepoint cyrup's foreground single, chain/parallel and
+/// hop-2 runner launches all reach, so it calls this once, ahead of the runner dispatch.
+///
+/// - The model is [`RunOptions::launch_model`] — the caller's or step's model AS TYPED, never the
+///   post-inheritance [`RunOptions::model_override`], which may be the parent session's model.
+/// - The thinking level is `agent.thinking`, which already holds the caller's explicit per-call
+///   `thinking` over the persona's own (upstream's `resolveClaudeCodeThinking(thinkingOverride,
+///   a.thinking)`, `:886-889`). Both launch sites leave the parent-session rung OFF for a Claude
+///   Code agent (upstream never inherits it for an external runner: `effectiveThinking =
+///   externalRunner ? undefined : …`, `:1117`).
+/// - The ceiling is folded exactly as `run_sync`'s Step 2b folds it.
+///
+/// # Errors
+///
+/// Upstream's verbatim refusal from whichever of the three checks fails, or a malformed inherited
+/// ceiling.
+pub fn resolve_claude_code_launch_override(
+    agent: &AgentConfig,
+    opts: &RunOptions,
+) -> Result<Vec<String>, String> {
+    if !agent
+        .runner
+        .as_ref()
+        .is_some_and(crate::runner::AgentRunnerConfig::is_claude_code)
+    {
+        return Ok(Vec::new());
+    }
+    let thinking_ceiling =
+        crate::exec::thinking_ceiling::inherited_thinking_ceiling().and_then(|inherited| {
+            crate::exec::thinking_ceiling::intersect_thinking_ceilings(&[
+                opts.thinking_ceiling.as_deref(),
+                inherited.as_deref(),
+            ])
+        })?;
+    let run_id = opts.run_id.as_ref().map(crate::background::RunId::as_str);
+    let claude_code_override =
+        claude_code::resolve_claude_code_override(claude_code::ClaudeCodeOverrideInput {
+            model: opts.launch_model.as_ref().map(cyrup_core::ModelId::as_str),
+            agent_model: agent.model.as_ref().map(cyrup_core::ModelId::as_str),
+            agent_model_is_settings_default: agent.model_is_settings_default,
+            thinking: agent.thinking.as_deref(),
+            thinking_ceiling: thinking_ceiling.as_deref(),
+            agent_name: Some(agent.name.as_str()),
+            run_id,
+        })?;
+    let scopes = crate::exec::model_scope::resolve_model_scopes_for_agent(
+        opts.model_scope.as_ref(),
+        &agent.name,
+        opts.parent_model.as_ref().map(cyrup_core::ModelId::as_str),
+    );
+    claude_code::assert_claude_code_model_scope(
+        &scopes,
+        claude_code_override
+            .as_ref()
+            .and_then(|resolved| resolved.model.as_deref()),
+        &agent.name,
+        run_id,
+    )?;
+    // [CYRUP-DELTA] upstream names the REQUESTED selector string; a resolved
+    // [`crate::placement::HerdrMachineReference`] is all `RunOptions` carries, so the refusal
+    // names its display name — the same choice the placement refusals in `run_external_cli` make.
+    claude_code::assert_claude_code_override_is_local(
+        &agent.name,
+        opts.machine
+            .as_ref()
+            .map(crate::placement::HerdrMachineReference::display_name),
+        claude_code_override.as_ref(),
+    )?;
+    Ok(claude_code_override.map_or_else(Vec::new, |resolved| resolved.args))
 }
 
 /// Execute an external-CLI runner and lower its outcome into a [`SingleResult`].
@@ -582,6 +671,7 @@ mod tests {
     fn the_command_prefix_reaches_the_argv_and_both_probes() {
         let ctx = ExternalCliLaunchContext {
             command_prefix_args: vec!["--fake".to_string()],
+            ..ExternalCliLaunchContext::default()
         };
         let launch = resolve_claude_code_launch(
             AdapterId::ClaudeCode,
@@ -599,5 +689,40 @@ mod tests {
             spec.help_args,
             vec!["--fake".to_string(), "--help".to_string()]
         );
+    }
+
+    /// SUBA-167 — upstream `appends an override after the fixed argv and keeps it out of
+    /// preflight` (`test/unit/claude-code-adapter.test.ts:293-303` @v0.76.1): both adapters END
+    /// with the override tokens, the probes stay prefix-only, and the published runner status
+    /// carries the final argv including the tokens (`subagent-runner.ts:916,920`).
+    #[test]
+    fn the_override_is_appended_after_the_fixed_argv_and_kept_out_of_preflight() {
+        let override_args =
+            claude_code::resolve_claude_code_override(claude_code::ClaudeCodeOverrideInput {
+                model: Some("claude-opus-5.5:medium"),
+                ..claude_code::ClaudeCodeOverrideInput::default()
+            })
+            .unwrap()
+            .unwrap()
+            .args;
+        let ctx = ExternalCliLaunchContext {
+            claude_code_override_args: override_args,
+            ..ExternalCliLaunchContext::default()
+        };
+        let tail = ["--model", "claude-opus-5.5", "--effort", "medium"];
+        for adapter in [AdapterId::ClaudeCode, AdapterId::ClaudeCodeWriter] {
+            let launch =
+                resolve_claude_code_launch(adapter, &cli(Some(adapter), "claude", &[]), &ctx)
+                    .unwrap();
+            let args = launch.args();
+            assert_eq!(&args[args.len() - 4..], tail, "{adapter:?}");
+            assert_eq!(&args[..2], ["-p", "--input-format"], "{adapter:?}");
+            assert_eq!(args[args.len() - 5], "--no-chrome", "{adapter:?}");
+            let spec = launch.preflight.as_ref().unwrap();
+            assert_eq!(spec.version_args, vec!["--version".to_string()]);
+            assert_eq!(spec.help_args, vec!["--help".to_string()]);
+            let published = &launch.status().args;
+            assert_eq!(&published[published.len() - 4..], tail, "{adapter:?}");
+        }
     }
 }

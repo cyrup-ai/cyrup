@@ -79,6 +79,7 @@ fn message_end_line(text: &str) -> String {
 
 fn base_agent_config(model: &str) -> AgentConfig {
     AgentConfig {
+        model_is_settings_default: false,
         machine: None,
         acceptance_role: None, // SUBA-082: no declared role, the name decides
         default_acceptance: None,
@@ -116,6 +117,7 @@ fn base_agent_config(model: &str) -> AgentConfig {
 
 fn base_run_options(cwd: &Path, model: &str) -> RunOptions {
     RunOptions {
+        launch_model: None,
         tool_timeout_ms: None,
         // SUBA-119 — a fixture launch whose model comes from its own agent config, so
         // native-child model verification is armed and no response-id alias is declared.

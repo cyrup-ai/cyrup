@@ -115,6 +115,7 @@ pub(crate) mod tests {
     /// persona-map lookup and reach the spawn.
     pub(crate) fn resolved_persona(name: &str) -> crate::exec::ResolvedAgentPersona {
         crate::exec::ResolvedAgentPersona {
+            model_is_settings_default: false,
             default_tool_timeout_ms: None,
             inherit_global_context: false,
             machine: None,
@@ -411,5 +412,23 @@ pub(crate) mod tests {
         );
         assert_eq!(first.final_output.as_deref(), Some("root output"));
         assert_eq!(first.exit_code, 0);
+
+        // SUBA-172 — upstream marks an attached root launched like any sequential step
+        // (`subagent-runner.ts:4519` precedes `runSingleStepInner`'s `importAsyncRoot` arm), so
+        // the run records ONE row under the step's agent, hashing the mode word (the attached
+        // root's own task is `""`, `async-execution.ts:1352`).
+        let history = std::fs::read_to_string(dir.path().join("run-history.jsonl"))
+            .expect("the attached root records a history row");
+        let rows: Vec<serde_json::Value> = history
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("history line"))
+            .collect();
+        assert_eq!(rows.len(), 1, "{history}");
+        assert_eq!(rows[0]["agent"], "attached-root");
+        assert_eq!(rows[0]["outcome"], "completed");
+        assert_eq!(
+            rows[0]["taskHash"],
+            crate::exec::mcp_direct_tools::hex_sha256("chain").as_str()
+        );
     }
 }

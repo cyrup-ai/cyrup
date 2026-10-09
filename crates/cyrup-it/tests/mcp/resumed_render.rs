@@ -133,6 +133,7 @@ fn result(id: &str, name: &str, prefix: &str) -> ReplayItem {
         usage: None,
         added_tool_names: Vec::new(),
         nested_calls: None,
+        duration_ms: None,
     })))
 }
 

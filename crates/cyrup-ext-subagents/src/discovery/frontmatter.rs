@@ -1723,6 +1723,27 @@ mod tests {
         );
     }
 
+    /// SUBA-167 — upstream `accepts model and thinking frontmatter only on the Claude Code
+    /// adapters` (`test/unit/claude-code-adapter.test.ts:325-336` @v0.76.1): a `claude-code`
+    /// profile pinning `model` and `thinking` loads with both on the definition, while a
+    /// `codex-exec` profile pinning `model` is still skipped.
+    #[test]
+    fn a_claude_code_profile_loads_with_model_and_thinking_frontmatter() {
+        let pinned = "---\nname: cc-pinned\ndescription: Pinned Claude\nmodel: claude-opus-5.5\nthinking: medium\nrunner: {\"type\": \"external-cli\", \"adapter\": \"claude-code\", \"command\": \"claude\"}\n---\n\nReview.\n";
+        let def = parse_agent_file(pinned, AgentSource::Project, Path::new("/cc.md"))
+            .expect("a Claude Code profile may pin model and thinking");
+        assert_eq!(
+            def.model.as_ref().map(cyrup_core::ModelId::as_str),
+            Some("claude-opus-5.5")
+        );
+        assert_eq!(def.thinking.as_deref(), Some("medium"));
+        let codex = "---\nname: ccx-pinned\ndescription: Pinned Codex\nmodel: gpt-5\nrunner: {\"type\": \"external-cli\", \"adapter\": \"codex-exec\", \"command\": \"codex\"}\n---\n\nReview.\n";
+        assert!(
+            parse_agent_file(codex, AgentSource::Project, Path::new("/ccx.md")).is_none(),
+            "only the Claude Code adapters accept a model"
+        );
+    }
+
     /// SUBA-074 — the reserved-selection-name guard (`validateCodeOwnedProfileRunner`). An agent
     /// reachable as `claude-code` that is NOT the read-only `claude-code` adapter would shadow the
     /// sandboxed profile, so it is refused.

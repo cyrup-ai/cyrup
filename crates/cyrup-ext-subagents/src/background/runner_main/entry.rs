@@ -203,6 +203,10 @@ pub async fn run_with(
     // in-process (`subagent-runner.ts:5168-5190`, its own comment at `:5169`).
     let writer_ledgers: super::executor::WriterProcessLedgers =
         std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
+    // SUBA-172 — the run's launch facts (pi `launchedFlatIndices`, `subagent-runner.ts:1887`), a
+    // side channel every dispatch marks and the terminal history planner reads, like the ledgers.
+    let launched: super::executor::LaunchedSteps =
+        std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeSet::new()));
     let (telemetry_tx, telemetry_rx) = tokio::sync::mpsc::unbounded_channel::<TelemetryMsg>();
     // The telemetry pump's own `events.jsonl` handle, opened with the same operator cap: it is the
     // ONE writer of child diagnostic lines, so the one-shot truncation marker is written once.
@@ -243,6 +247,7 @@ pub async fn run_with(
         &interrupt_cancel,
         telemetry_tx,
         std::sync::Arc::clone(&writer_ledgers),
+        std::sync::Arc::clone(&launched),
         lease_tx,
         &mut events,
     )
@@ -260,6 +265,19 @@ pub async fn run_with(
     };
 
     let duration_ms = (crate::time::now_epoch_millis() - overall_started_at).max(0);
+    // SUBA-172 — captured before `settle_loop_outcome` consumes the outcome (see
+    // `RunHistoryPlan::with_loop_flags`).
+    let history = super::finish::RunHistoryPlan {
+        sole_single_task: crate::background::sole_single_step_task(&config.steps)
+            .map(str::to_string),
+        launched: launched
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone(),
+        run_duration_ms: duration_ms,
+        ..super::finish::RunHistoryPlan::default()
+    }
+    .with_loop_flags(&loop_outcome);
     let (terminal_state, results, final_error) =
         settle_loop_outcome(loop_outcome, &config, &mut events, duration_ms).await;
 
@@ -285,6 +303,7 @@ pub async fn run_with(
         // write (WORKFLOW_3 §3c: a future async workflow arm is the first caller to supply a
         // non-default value here, via `apply_workflow_settlement_plan`).
         WorkflowResultFields::default(),
+        Some(history),
     )
     .await;
 
@@ -410,6 +429,7 @@ async fn refuse_run(
         config.session_file.clone(),
         error.to_string(),
         WorkflowResultFields::default(),
+        None,
     )
     .await;
 }
@@ -726,6 +746,7 @@ pub(super) async fn publish_initial_status(
             config.session_file.clone(),
             "internal error: Queued -> Running transition was rejected".to_string(),
             WorkflowResultFields::default(),
+            None,
         )
         .await;
         return None;
@@ -740,6 +761,7 @@ pub(super) async fn publish_initial_status(
             config.session_file.clone(),
             format!("failed to write initial status.json: {err}"),
             WorkflowResultFields::default(),
+            None,
         )
         .await;
         return None;
@@ -811,6 +833,7 @@ pub(super) async fn ensure_control_inbox_dir(
             config.session_file.clone(),
             format!("failed to create control-inbox directory: {err}"),
             WorkflowResultFields::default(),
+            None,
         )
         .await;
         return None;

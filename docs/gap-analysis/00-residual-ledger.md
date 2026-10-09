@@ -5,6 +5,40 @@ next work item**.
 
 ---
 
+# UPDATE 2026-10-09 (pi-subagents v0.76.1 drift) — `SUBA-139`, `SUBA-153`, `SUBA-167`, `SUBA-172` and `SUBA-175` closed; `SUBA-204`…`SUBA-209` filed
+
+> Upstream read at pi-subagents `v0.76.1` through git objects only (`git -C tmp/pi-subagents show
+> v0.76.1:<path>`). The count is whatever `python3 -I docs/gap-analysis/scripts/count_open_items.py`
+> prints, measured on `main` at `77daee4` (before) and on this branch rebased onto it (after): **before
+> 154 open (5 medium, 149 low; 17 trackers; 984 closed); after 155 open (5 medium, 150 low; 17
+> trackers; 989 closed)**. Area 09b: 43 → **44** open (five closed, six filed).
+>
+> **Closed, with the observable effect:**
+> - `SUBA-139` + `SUBA-153`: `subagents.toolActivation` (`auto` | `dynamic` | `eager`, upstream's
+>   validator text) and the small `subagents_enable` loader. Under `dynamic` a session starts with the
+>   loader instead of the full `subagent` schema and enables it on demand, through the
+>   `set_active_tools` seam the host already had (`SUBA-139`'s `MCP-037a` prerequisite was wrong).
+>   **Deviation:** `auto` also requires `cyrup_provider::api::emits_native_tool_additions`, false for
+>   every api until `PROV-133` lands, so `auto` acts as `eager` and never costs a prompt-cache miss.
+>   Upstream's own predicate is ported verbatim and tested on its own.
+> - `SUBA-167`: the two Claude Code adapters take a per-launch `--model` and `--effort` from the call's
+>   model, a `:level` suffix or the agent's thinking, with upstream's refusals verbatim (invalid model or
+>   level, ceiling, enforced model scope, saved machine). External runners no longer inherit the parent
+>   session's thinking or model.
+> - `SUBA-172`: `run-history.jsonl` has upstream's hardened shape (`task: "[redacted]"`, sha256
+>   `taskHash`, `outcome`, 0600/0700), one row per launched step with its own duration, and foreground
+>   runs are recorded.
+> - `SUBA-175`: `_meta.json` usage carries `turns`, so `/subagent-cost` reports async children's turns.
+>
+> **Filed** (all low, both sides read): `SUBA-204` generic external runners ignore `model`/`thinking`;
+> `SUBA-205` the Claude Code version check rejects calendar versions; `SUBA-206` `_meta.json` and
+> `_input.md` keep the task in plaintext; `SUBA-207` `PI_ONLY_FIELDS` lacks `allowedAgents`;
+> `SUBA-208` `subagent` and three siblings are not model-only; `SUBA-209` the advertised catalog is a
+> rewritten prompt string, not an `advertised_subagents` section. `PROV-133` notes that its closure
+> flips `emits_native_tool_additions`.
+
+---
+
 # UPDATE 2026-10-09 (pi v1.1.0 drift triage) — 62 counted rows filed across ten areas, plus `MCP-617` (13) and `ACP-299`…`ACP-302` (15); `DRIFT-060` retitled
 
 > Docs-only. Upstreams re-pinned to **untagged** shas, deliberately (README *CURRENT PINS*): pi **`f1b2e77f5`**
