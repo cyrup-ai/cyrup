@@ -99,6 +99,7 @@ mod fullscreen_settings;
 pub(crate) mod harness;
 mod image;
 mod image_capabilities;
+mod image_cell_size;
 mod import_confirm;
 mod inline_stacking;
 mod input_pipeline;
