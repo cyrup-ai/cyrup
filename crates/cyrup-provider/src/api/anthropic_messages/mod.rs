@@ -17,6 +17,7 @@ mod compat;
 mod convert;
 mod driver;
 mod events;
+mod federation;
 mod headers;
 mod messages;
 mod options;
@@ -110,6 +111,38 @@ impl ApiImpl for AnthropicMessagesApi {
         };
 
         let is_oauth = resolve_is_oauth(model, auth);
+        // PROV-119 — workload identity federation. The exchange happens BEFORE the headers are
+        // built, because the minted token is carried as an `Authorization: Bearer` overlay on a
+        // local copy of the auth (pi keeps it out of `apiKey` too, `anthropic-messages.ts:1066`).
+        // `is_oauth` is deliberately computed from the ORIGINAL auth above: a federated token is
+        // `sk-ant-oat01-…`, so deriving it after the overlay would rewrite every tool name to its
+        // Claude Code alias. There is no key to fall back to, so an exchange failure fails the
+        // turn, with the Console's authentication history named as where the real reason lives.
+        // The API BASE, as `resolve_url` derives it — `url` above is already the `/v1/messages`
+        // endpoint, and the exchange lives at `/v1/oauth/token` off the same base.
+        let api_base = auth
+            .auth
+            .base_url
+            .as_deref()
+            .unwrap_or(model.base_url.as_str())
+            .to_string();
+        let federated_auth = match federation::FederationConfig::from_env(
+            model,
+            auth,
+            EnvSource::new(auth.env.as_ref()),
+        ) {
+            Some(config) => match federation::access_token(&api_base, &config).await {
+                Ok(token) => Some(federation::apply_to_auth(auth, &token)),
+                Err(e) => {
+                    let e = ProviderError::Transport(e.to_string().into());
+                    sink.send(e.into_error_event(provider, &model_id, Some(model.api.clone())))
+                        .await;
+                    return;
+                }
+            },
+            None => None,
+        };
+        let auth = federated_auth.as_ref().unwrap_or(auth);
         // PROV-011: an unsatisfiable `constrainedSampling` fails the turn before any HTTP, with
         // pi's own message.
         let params = match build_params(

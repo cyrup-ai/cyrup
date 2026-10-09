@@ -1,7 +1,10 @@
 //! Request encoding — endpoint resolution and request headers.
 
 use super::claude_code::is_github_copilot;
-use super::compat::{force_adaptive_thinking, get_anthropic_compat, supports_mid_convo_effort};
+use super::compat::{
+    force_adaptive_thinking, get_anthropic_compat, supports_mid_convo_effort,
+    uses_native_tool_changes,
+};
 use crate::HeaderMap;
 use crate::api::compat::SessionAffinityFormat;
 use crate::auth::AuthResult;
@@ -27,6 +30,10 @@ pub(super) const MID_CONVERSATION_OUTPUT_CONFIG_BETA: &str =
 /// `thinking.block_binding.prefix_mismatch_behavior` control the managed branch always sets
 /// (PROV-091). Pushed TOGETHER with [`MID_CONVERSATION_OUTPUT_CONFIG_BETA`], never alone.
 pub(super) const THINKING_BINDING_CONTROLS_BETA: &str = "thinking-binding-controls-2026-08-01";
+/// Pi `INLINE_TOOLS_BETA` (`anthropic-messages.ts:195` @v1.1.0) — sent only when the request
+/// actually uses native mid-conversation tool changes (PROV-133), which is pi's own gate at
+/// `:1120`: `if (nativeToolChanges) features.push(INLINE_TOOLS_BETA)`.
+pub(super) const INLINE_TOOLS_BETA: &str = "inline-tools-2026-09-15";
 
 /// Stealth-mode Claude Code identity (Pi `claudeCodeVersion`, `anthropic-messages.ts:87` @v0.87.1;
 /// `2.1.75` through v0.84.4, `2.1.251` from v0.85.0, `2.1.280` from v0.87.1).
@@ -114,6 +121,11 @@ pub(crate) fn build_headers(
     if supports_mid_convo_effort(model) {
         betas.push(MID_CONVERSATION_OUTPUT_CONFIG_BETA);
         betas.push(THINKING_BINDING_CONTROLS_BETA);
+    }
+    // PROV-133 — pi `:1120`. The predicate is shared with the params builder rather than threaded
+    // as a bool, so the header and the body can never disagree about which shape was sent.
+    if uses_native_tool_changes(model, &ctx.messages) {
+        betas.push(INLINE_TOOLS_BETA);
     }
 
     let mut headers = HeaderMap::new();

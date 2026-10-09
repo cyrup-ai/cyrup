@@ -786,9 +786,23 @@ async fn agent023_reset_is_refused_while_a_run_is_in_flight() {
     handle.finished().await;
     agent.wait_for_idle().await;
 
-    // Once idle it is allowed again, and it really does clear.
+    // Once idle it is allowed again, and it really does clear the TURNS.
+    //
+    // AGENT-039 — this assertion was `messages.is_empty()`, which pinned a cyrup divergence: pi's
+    // `reset` keeps the baseline (`const baseline = getCurrentSystemMessage(this._state.messages);
+    // this._state.messages = baseline ? [baseline] : []`, `agent.ts:360-361` @v1.1.0), so a reset
+    // agent still declares the tools it can call. What must be gone is every user, assistant and
+    // tool-result turn.
     assert!(agent.reset().await.is_ok());
-    assert!(agent.snapshot().await.messages.is_empty());
+    let after = agent.snapshot().await.messages;
+    assert!(
+        after.iter().all(|m| matches!(m, AgentMessage::System(_))),
+        "every turn must be gone; only the baseline survives: {after:?}"
+    );
+    assert!(
+        after.len() <= 1,
+        "the baseline is a single replayed system message: {after:?}"
+    );
 }
 
 // ===========================================================================

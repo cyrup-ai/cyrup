@@ -323,3 +323,59 @@ async fn a_provider_replaying_the_request_sees_each_advertised_tool_once() {
         assert_eq!(replayed, advertised, "request: {ctx:?}");
     }
 }
+
+/// AGENT-039 — `reset()` KEEPS the baseline: the replayed current system message, so a reset agent
+/// still declares the tools it can call and keeps its prompt. pi `agent.ts:360-361`.
+///
+/// Red before the fix: `reset()` was `st.messages.clear()`, so the transcript came back empty.
+#[tokio::test]
+async fn reset_keeps_the_current_system_message_as_the_baseline() {
+    let (sf, _seen) = spy(2);
+    let agent = Agent::builder(model_ref(), sf)
+        .loadout(loadout(vec![Probe::new("a").arc(), Probe::new("b").arc()]))
+        .build();
+    run(&agent, "one").await;
+    // A mid-run change, so the baseline is the REPLAYED set and not the first declaration seen.
+    agent
+        .set_loadout(loadout(vec![Probe::new("a").arc(), Probe::new("c").arc()]))
+        .await;
+    run(&agent, "two").await;
+
+    agent.reset().await.expect("reset with no run in flight");
+
+    let messages = agent.snapshot().await.messages;
+    assert_eq!(
+        messages.len(),
+        1,
+        "reset keeps exactly the baseline, nothing else: {messages:?}"
+    );
+    let rows = system_rows(&messages);
+    assert_eq!(
+        rows.len(),
+        1,
+        "the baseline is a system message: {messages:?}"
+    );
+    let mut names = added(rows[0]).to_vec();
+    names.sort_unstable();
+    assert_eq!(
+        names,
+        ["a", "c"],
+        "the baseline carries the REPLAYED tool set, not the original one"
+    );
+}
+
+/// Resetting an agent that never ran has nothing to keep, and must not invent a baseline.
+#[tokio::test]
+async fn reset_before_any_run_leaves_an_empty_transcript() {
+    let (sf, _seen) = spy(1);
+    let agent = Agent::builder(model_ref(), sf)
+        .loadout(loadout(vec![Probe::new("a").arc()]))
+        .build();
+
+    agent.reset().await.expect("reset");
+
+    assert!(
+        agent.snapshot().await.messages.is_empty(),
+        "no declarations have been made yet, so there is no baseline to keep"
+    );
+}

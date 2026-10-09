@@ -240,19 +240,50 @@ pub fn register_builtins(reg: &mut ApiRegistry) {
 /// `tool_addition`/`tool_removal` blocks on `anthropic-messages`, mid-conversation system
 /// messages on `openai-completions`, `additional_tools` / tool search on the three Responses apis.
 ///
-/// **`false` for every api today** `[CYRUP-DELTA]`. Every cyrup adapter skips `Message::System`
-/// and sends the full tool list on each request (`anthropic_messages/messages.rs:53-60`,
-/// `anthropic_messages/params.rs:115`, `openai_completions/convert.rs:49-56`,
-/// `openai_responses/convert.rs:81-88`): the native emitters are the adapter half of PROV-083 that
-/// code comments call "PROV-083b", ledgered as **PROV-133**
-/// (`docs/gap-analysis/01-cyrup-core-and-provider.md`) for the Anthropic route. The compat
-/// flags alone therefore over-promise in cyrup, and a consumer that uses them to decide whether a
-/// mid-conversation tool change is cache-safe (pi-subagents' `toolActivation: "auto"`, SUBA-153)
-/// must also ask this. When an adapter gains its native emitter, its api returns `true` here, and
-/// `tests::no_adapter_emits_native_tool_additions_yet` must change with it.
+/// **`true` for `anthropic-messages` since PROV-133; `false` for every other api** `[CYRUP-DELTA]`.
+///
+/// The Anthropic adapter now has its native emitter: under
+/// `anthropic_messages::compat::uses_native_tool_changes` the request-level tool list is fixed and
+/// every later change travels as a `tool_addition` / `tool_removal` block, so a mid-conversation
+/// tool change no longer discards the cached prefix. The other adapters still skip
+/// `Message::System` and resend the full tool list each request
+/// (`openai_completions/convert.rs`, `openai_responses/convert.rs`), which is the remaining half of
+/// PROV-083 that code comments call "PROV-083b".
+///
+/// This is deliberately a PER-API capability, not a per-request one: the answer is "this adapter
+/// can express a mid-conversation tool change natively", which is the question
+/// pi-subagents' `toolActivation: "auto"` asks when deciding whether to choose the
+/// `subagents_enable` loader (SUBA-153). The per-model gate — a model whose compat declares both
+/// mid-convo capabilities, with an initial tool to anchor the placeholder — lives in the adapter
+/// and decides the shape of each individual request.
+///
+/// When another adapter gains its emitter, its api returns `true` here and
+/// `tests::anthropic_messages_is_the_only_api_with_a_native_tool_emitter` must change with it.
 #[must_use]
-pub const fn emits_native_tool_additions(_api: &str) -> bool {
-    false
+// The byte loop below indexes two slices whose bounds are proved on the lines above it: the
+// lengths are compared first and the index is `< api.len()` by the `while` condition. `slice::get`
+// is the lint's suggested fix and is not const-stable, and dropping `const` from this public
+// signature to use `==` would narrow the API for callers, so the allow is the narrow choice.
+#[allow(clippy::indexing_slicing)]
+pub const fn emits_native_tool_additions(api: &str) -> bool {
+    // A hand-rolled byte compare because `const fn` cannot `match` on `str` and `PartialEq` is not
+    // const-stable. Dropping the `const` from this public signature would be the semver-breaking
+    // alternative, so the loop stays.
+    let (api, anthropic) = (
+        api.as_bytes(),
+        crate::known_api::ANTHROPIC_MESSAGES.as_bytes(),
+    );
+    if api.len() != anthropic.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < api.len() {
+        if api[i] != anthropic[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
 }
 
 #[cfg(test)]
@@ -261,29 +292,42 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    /// Pins [`emits_native_tool_additions`] to `false` for every api cyrup registers, so the day an
-    /// adapter gains a native mid-conversation tool emitter (PROV-133 / "PROV-083b") this test has
-    /// to be edited alongside it, which flips pi-subagents' `toolActivation: "auto"` gate for that
-    /// api on purpose rather than by accident.
+    /// Pins [`emits_native_tool_additions`] to EXACTLY the set of adapters that have a native
+    /// mid-conversation tool emitter — `anthropic-messages` alone, since PROV-133. The day another
+    /// adapter gains one, this test has to be edited alongside it, which flips pi-subagents'
+    /// `toolActivation: "auto"` gate for that api on purpose rather than by accident.
+    ///
+    /// It was `no_adapter_emits_native_tool_additions_yet` and asserted `false` everywhere; that
+    /// name and that assertion were the pin PROV-133 was required to break.
     #[test]
-    fn no_adapter_emits_native_tool_additions_yet() {
-        let registry = builtin_registry();
-        let ids = registry.ids();
-        assert!(!ids.is_empty());
-        for api in &ids {
-            assert!(
-                !emits_native_tool_additions(api.as_str()),
-                "{api:?} has no native mid-conversation tool emitter yet"
-            );
-        }
+    fn anthropic_messages_is_the_only_api_with_a_native_tool_emitter() {
+        assert!(
+            emits_native_tool_additions(crate::known_api::ANTHROPIC_MESSAGES),
+            "PROV-133 gave anthropic-messages its native emitter; without this, subagents' \
+             `toolActivation: \"auto\"` would never choose the lazy loader for it"
+        );
         for api in [
-            crate::known_api::ANTHROPIC_MESSAGES,
             crate::known_api::OPENAI_COMPLETIONS,
             crate::known_api::OPENAI_RESPONSES,
             crate::known_api::OPENAI_CODEX_RESPONSES,
             crate::known_api::AZURE_OPENAI_RESPONSES,
         ] {
-            assert!(!emits_native_tool_additions(api), "{api}");
+            assert!(
+                !emits_native_tool_additions(api),
+                "{api} still resends its whole tool list each request (PROV-083b)"
+            );
+        }
+        // Every REGISTERED api, so a newly registered one cannot quietly claim the capability.
+        let registry = builtin_registry();
+        let ids = registry.ids();
+        assert!(!ids.is_empty());
+        for api in &ids {
+            let expected = api.as_str() == crate::known_api::ANTHROPIC_MESSAGES;
+            assert_eq!(
+                emits_native_tool_additions(api.as_str()),
+                expected,
+                "{api:?}"
+            );
         }
     }
 

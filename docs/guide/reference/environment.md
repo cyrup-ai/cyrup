@@ -134,7 +134,7 @@ credential, then the environment variable, then a key configured in `models.json
 |---|---|
 | `amazon-bedrock` | *ambient — see below* |
 | `ant-ling` | `ANT_LING_API_KEY` |
-| `anthropic` | `ANTHROPIC_OAUTH_TOKEN`, then `ANTHROPIC_API_KEY` |
+| `anthropic` | `ANTHROPIC_OAUTH_TOKEN`, then `ANTHROPIC_API_KEY`; or workload identity federation — see below |
 | `azure-openai-responses` | `AZURE_OPENAI_API_KEY`, plus `AZURE_OPENAI_BASE_URL` or `AZURE_OPENAI_RESOURCE_NAME`, and optionally `AZURE_OPENAI_API_VERSION` and `AZURE_OPENAI_DEPLOYMENT_NAME_MAP` |
 | `cerebras` | `CEREBRAS_API_KEY` |
 | `cloudflare-ai-gateway` | `CLOUDFLARE_API_KEY` + `CLOUDFLARE_ACCOUNT_ID` + `CLOUDFLARE_GATEWAY_ID` |
@@ -190,6 +190,32 @@ environment.
 route all three of these must hold: `GOOGLE_APPLICATION_CREDENTIALS` points at a credentials file, or
 `~/.config/gcloud/application_default_credentials.json` exists; `GOOGLE_CLOUD_PROJECT` or
 `GCLOUD_PROJECT` is set; and `GOOGLE_CLOUD_LOCATION` is set.
+
+### Anthropic workload identity federation
+
+`anthropic` can authenticate without any key by exchanging an OIDC identity token your platform
+already issues for a short-lived Anthropic access token. Federation resolves **last**, after a
+stored credential and all three key variables, and activates only when all four required variables
+are set.
+
+| Variable | Required | Meaning |
+|---|---|---|
+| `ANTHROPIC_FEDERATION_RULE_ID` | yes | `fdrl_...` — the federation rule to evaluate |
+| `ANTHROPIC_ORGANIZATION_ID` | yes | UUID of your Anthropic organization |
+| `ANTHROPIC_SERVICE_ACCOUNT_ID` | yes | `svac_...` — the service account the minted token acts as |
+| `ANTHROPIC_IDENTITY_TOKEN_FILE` | one of the two | Path to the IdP-issued JWT; re-read on every exchange |
+| `ANTHROPIC_IDENTITY_TOKEN` | one of the two | The JWT itself, for platforms that inject it as a variable |
+| `ANTHROPIC_WORKSPACE_ID` | conditional | `wrkspc_...`, required only when the rule covers more than one workspace. Does **not** gate activation |
+
+The token is exchanged at `POST /v1/oauth/token` against the model's base URL, cached for its
+lifetime, and re-exchanged shortly before it expires. The identity token file is re-read on every
+exchange: a projected token rotates on disk, and an assertion carrying a `jti` claim may be
+exchanged only once, so a cached one would be refused as a replay.
+
+Every denial comes back as the same opaque `401 Authentication failed`; the reason is recorded in
+the Claude Console's federation authentication history, not in the response. Walkthroughs for each
+identity provider are in
+[Anthropic's documentation](https://platform.claude.com/docs/en/manage-claude/workload-identity-federation).
 
 ### OAuth callback
 

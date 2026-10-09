@@ -287,6 +287,11 @@ impl Hooks for PolicyHooks {
         cancel: CancelToken,
     ) -> Result<Vec<Arc<AgentMessage>>, HookError> {
         let transformed = self.inner.transform_context(msgs, cancel).await?;
+        // AGENT-039 — the hidden-declaration projection is the AGENT's here, not the session's:
+        // cyrup's loadout belongs to the `Agent` (`Agent::builder().loadout(..)`), so that is
+        // where the hidden set is known. pi installs its own at the session only because pi's
+        // `_hiddenDeclarations` is the session's. See `cyrup-agent`'s
+        // `declare::project_hidden_declarations`.
         let forced = self
             .session
             .get()
@@ -620,9 +625,10 @@ impl PolicyHooks {
 /// transcript with its system messages collapsed into one leading message holding `forced`. The
 /// timestamp is the first system message's, as `getCurrentSystemMessage` would report it.
 ///
-/// The tool declarations the head carries upstream are not carried here: a cyrup request declares
-/// its tools through `Context::tools`, and strips them from the message list
-/// (`declare::without_tool_declarations`).
+/// AGENT-039 — the head carries the current system message's `toolsAdded`, as pi's does
+/// (`...(current?.toolsAdded ? { toolsAdded: current.toolsAdded } : {})`, `:1797`). It previously
+/// did not, which was a second casualty of the blanket declaration strip: a run with a forced
+/// prompt lost its tool declarations even once they were kept everywhere else.
 fn project_forced_prompt(messages: Vec<Arc<AgentMessage>>, forced: &str) -> Vec<Arc<AgentMessage>> {
     let timestamp = messages
         .iter()
@@ -631,8 +637,20 @@ fn project_forced_prompt(messages: Vec<Arc<AgentMessage>>, forced: &str) -> Vec<
             _ => None,
         })
         .unwrap_or(0);
+    // `getCurrentSystemMessage(transformed)?.toolsAdded` (pi `:1795`) — the REPLAYED current set,
+    // not the first declaration seen: a tool added and later removed must not come back on the
+    // forced head. `cyrup-provider`'s helper is the port of the same upstream function and folds
+    // `get_current_tools` in, so the two agree by construction.
+    let replayed: Vec<cyrup_core::Message> = messages
+        .iter()
+        .filter_map(|m| crate::event::agent_message_to_core(m.as_ref()))
+        .collect();
+    let tools_added = cyrup_provider::utils::transcript::get_current_system_message(&replayed)
+        .map(|s| s.tools_added)
+        .unwrap_or_default();
     let head = AgentMessage::System(SystemMessage {
         content: vec![Content::text(forced)],
+        tools_added,
         timestamp,
         ..SystemMessage::default()
     });

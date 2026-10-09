@@ -29,6 +29,14 @@ pub(super) fn is_anthropic_effort(value: Option<&str>) -> bool {
 ///
 /// Takes messages that have ALREADY been through `transform_messages_with` — [`build_params`](super::params::build_params)
 /// hoists that call so the deferred-tool split sees the same list this does (Pi :947-961).
+/// pi `convertToolDefinitions?: (tools: Tool[]) => BetaTool[]` (`anthropic-messages.ts:1315`
+/// @v1.1.0): one wire definition per declared tool, for the `tool_addition` blocks (PROV-133).
+pub(crate) type ToolDefinitionConverter<'a> = &'a dyn Fn(&[crate::ToolDef]) -> Vec<Value>;
+
+// One argument over clippy's limit, which is the repo's `#[allow]` pattern (44 other sites):
+// the alternative is an args struct used by exactly one caller, and pi's own signature is this
+// same positional list.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn convert_messages(
     transformed: &[Message],
     is_oauth: bool,
@@ -37,8 +45,18 @@ pub(crate) fn convert_messages(
     deferred_tool_names: &HashSet<String>,
     normalize_tool_name: &dyn Fn(&str) -> String,
     managed_provider: Option<&ProviderId>,
+    // PROV-133 — pi `convertToolDefinitions?: (tools: Tool[]) => BetaTool[]` (`:1315`). `Some`
+    // exactly when native mid-conversation tool changes are in use; `None` keeps the pre-existing
+    // behaviour of dropping a later system message, which is what every model that cannot express
+    // the blocks still needs.
+    convert_tool_definitions: Option<ToolDefinitionConverter<'_>>,
 ) -> ConvertedMessages {
     let mut params: Vec<Value> = Vec::new();
+    // PROV-133 — pi `pendingSystemMessages` (`:1324`): a later system message is held back and
+    // flushed immediately BEFORE the next assistant turn (`:1394`), and once more after the loop
+    // (`:1481`) so a trailing one is not lost. pi notes the consequence itself: an update placed
+    // before a user message in the transcript lands AFTER it on the wire (`:1322-1323`).
+    let mut pending_system: Vec<Value> = Vec::new();
     let mut assistant_levels: HashMap<usize, String> = HashMap::new();
     // Declared once per request so a deferred tool is referenced exactly once (Pi :1125).
     let mut anchors = ToolAnchors {
@@ -57,13 +75,58 @@ pub(crate) fn convert_messages(
             // params builder and no later one survives; skipping is exactly what that collapsed
             // transcript yields. PROV-083b wires each adapter's own `resolve_transcript` and, where
             // the transport can express it, emits later system messages in place.
-            Message::System(_) => {}
+            Message::System(system) => {
+                // The INITIAL system message is the request's prompt, not a turn: pi slices it off
+                // before the loop (`conversationMessages`, `:1135`). Index 0 is the only place it
+                // can be (`getInitialSystemMessage` is `messages.first()`).
+                let is_initial = i == 0;
+                if let (false, Some(convert_defs)) = (is_initial, convert_tool_definitions) {
+                    let mut blocks: Vec<Value> = Vec::new();
+                    let text = crate::render_system_message_update(system);
+                    if !text.is_empty() {
+                        blocks.push(serde_json::json!({
+                            "type": "text",
+                            "text": sanitize_surrogates(&text),
+                        }));
+                    }
+                    // A new definition under the same name REPLACES the old one, so no removal is
+                    // needed for a name that is also re-added (pi `:1341-1343`).
+                    let redefined: HashSet<&str> =
+                        system.tools_added.iter().map(|t| t.name.as_str()).collect();
+                    for tool in &system.tools_removed {
+                        if redefined.contains(tool.name.as_str()) {
+                            continue;
+                        }
+                        blocks.push(serde_json::json!({
+                            "type": "tool_removal",
+                            "tool": {
+                                "type": "tool_reference",
+                                "name": normalize_tool_name(&tool.name),
+                            },
+                        }));
+                    }
+                    for definition in convert_defs(&system.tools_added) {
+                        blocks.push(serde_json::json!({
+                            "type": "tool_addition",
+                            "tool": { "type": "tool_definition", "definition": definition },
+                        }));
+                    }
+                    if !blocks.is_empty() {
+                        pending_system.push(serde_json::json!({
+                            "role": "system",
+                            "content": Value::Array(blocks),
+                        }));
+                    }
+                }
+            }
             Message::User { content, .. } => {
                 if let Some(value) = build_user(content) {
                     params.push(value);
                 }
             }
             Message::Assistant(am) => {
+                // pi `:1394` — the held system messages land immediately before this turn.
+                params.append(&mut pending_system);
                 if let Some(value) = build_assistant(am, is_oauth, allow_empty_signature) {
                     // Pi records `params.length` BEFORE the push and only for a turn that
                     // converted to at least one block (`:1364-1378`), which is exactly the
@@ -116,6 +179,8 @@ pub(crate) fn convert_messages(
         }
         i += 1;
     }
+    // pi `:1481` — a trailing system message (no assistant turn after it) still reaches the wire.
+    params.append(&mut pending_system);
 
     // cache_control on the last user message's last block (Pi anthropic-messages.ts:1157-1179).
     if let Some(cc) = cache_control {

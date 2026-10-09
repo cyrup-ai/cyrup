@@ -2,6 +2,7 @@
 
 use crate::api::compat::{AnthropicMessagesCompat, SessionAffinityFormat};
 use crate::model::Model;
+use cyrup_core::Message;
 
 /// Resolved Anthropic compat (Pi `Required<Omit<AnthropicMessagesCompat,"forceAdaptiveThinking">>`).
 pub(super) struct ResolvedAnthropicCompat {
@@ -305,4 +306,30 @@ pub(super) fn off_is_not_null(model: &Model) -> bool {
         model.thinking_level_map.as_ref().and_then(|m| m.get("off")),
         Some(None)
     )
+}
+
+/// PROV-133 — whether this request uses NATIVE mid-conversation tool changes: a fixed
+/// request-level tool list plus `tool_addition`/`tool_removal` blocks, behind the
+/// `inline-tools-2026-09-15` beta.
+///
+/// pi's gate verbatim (`anthropic-messages.ts:1139-1141` @v1.1.0):
+/// `compat.supportsMidConvoSystemMessages && compat.supportsMidConvoToolChanges &&
+/// initialTools.length > 0`. The third term is not decoration — *"Anthropic rejects a tool list
+/// where every tool is deferred, so there must be an initial active tool to anchor the
+/// placeholder"* (`:1136-1138`).
+///
+/// `initialTools` is the INITIAL system message's `toolsAdded`, which is reachable only because
+/// the request keeps its tool declarations (AGENT-039). While cyrup stripped them this predicate
+/// was always false and the whole native path was dead code.
+pub(super) fn uses_native_tool_changes(model: &Model, messages: &[Message]) -> bool {
+    supports_mid_convo_system_messages(model)
+        && supports_mid_convo_tool_changes(model)
+        && !initial_tools(messages).is_empty()
+}
+
+/// `initialSystemMessage?.toolsAdded ?? []` (`anthropic-messages.ts:1139`).
+pub(super) fn initial_tools(messages: &[Message]) -> Vec<crate::ToolDef> {
+    crate::utils::transcript::get_initial_system_message(messages)
+        .map(|s| s.tools_added.clone())
+        .unwrap_or_default()
 }

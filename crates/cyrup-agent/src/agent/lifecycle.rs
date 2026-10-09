@@ -116,7 +116,30 @@ impl Agent {
         }
         {
             let mut st = lock(&self.state);
-            st.messages.clear();
+            // AGENT-039 — pi `reset` KEEPS the baseline (`agent.ts:360-361` @v1.1.0):
+            // `const baseline = getCurrentSystemMessage(this._state.messages);`
+            // `this._state.messages = baseline ? [baseline] : [];`
+            //
+            // The baseline is the REPLAYED current system message — the prompt and the tools as
+            // they stand after every mid-run change — so a reset agent still declares what it can
+            // call. Clearing outright (what this did) left the next request with no declarations at
+            // all until `declare_tool_changes` rebuilt them from scratch, and dropped the prompt
+            // sections with them.
+            //
+            // `get_current_system_message` reads only system messages, so projecting just those is
+            // equivalent to handing it the whole transcript.
+            let baseline = {
+                let system_only: Vec<cyrup_core::Message> = st
+                    .messages
+                    .iter()
+                    .filter_map(|m| match m {
+                        AgentMessage::System(s) => Some(cyrup_core::Message::System(s.clone())),
+                        _ => None,
+                    })
+                    .collect();
+                cyrup_provider::utils::transcript::get_current_system_message(&system_only)
+            };
+            st.messages = baseline.map(AgentMessage::System).into_iter().collect();
             st.streaming_message = None;
             st.pending_tool_calls.clear();
             st.error_message = None;

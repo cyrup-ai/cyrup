@@ -142,7 +142,66 @@ impl crate::auth::ApiKeyAuth for AnthropicApiKeyAuth {
                 }));
             }
         }
-        Ok(None)
+
+        // PROV-119 — workload identity federation, resolved LAST so every key and the bearer token
+        // keep winning (pi `providers/anthropic.ts:49-69` @v1.0.0: "Last in line so keys and
+        // ANTHROPIC_AUTH_TOKEN keep winning, as in the SDK").
+        //
+        // The ids are provider CONFIG, not a credential: they travel in `env` and the exchange
+        // happens in `api::anthropic_messages::federation`, which is also where the four-variable
+        // activation gate is documented. `auth` is left EMPTY on purpose — a federated access token
+        // is `sk-ant-oat01-…`, and putting one in `api_key` would flip `is_oauth` and rewrite every
+        // tool name on the wire (see that module's header).
+        let mut federation = crate::auth::types::ProviderEnv::new();
+        for var in [
+            crate::env_api_keys::ANTHROPIC_FEDERATION_RULE_ID_ENV,
+            crate::env_api_keys::ANTHROPIC_ORGANIZATION_ID_ENV,
+            crate::env_api_keys::ANTHROPIC_SERVICE_ACCOUNT_ID_ENV,
+        ] {
+            match ctx.env(var).await {
+                Some(value) if !value.is_empty() => {
+                    federation.insert(var.to_string(), value);
+                }
+                // pi returns `undefined` the moment a REQUIRED id is missing, so a partially
+                // configured workload resolves to no auth at all rather than to a half-built
+                // federation config.
+                _ => return Ok(None),
+            }
+        }
+        // One of the two token sources is required; `_FILE` wins when both are set.
+        let token_vars = [
+            crate::env_api_keys::ANTHROPIC_IDENTITY_TOKEN_FILE_ENV,
+            crate::env_api_keys::ANTHROPIC_IDENTITY_TOKEN_ENV,
+        ];
+        let mut have_token = false;
+        for var in token_vars {
+            if let Some(value) = ctx.env(var).await
+                && !value.is_empty()
+            {
+                federation.insert(var.to_string(), value);
+                have_token = true;
+                break;
+            }
+        }
+        if !have_token {
+            return Ok(None);
+        }
+        // Optional, and it does not gate activation.
+        if let Some(value) = ctx
+            .env(crate::env_api_keys::ANTHROPIC_WORKSPACE_ID_ENV)
+            .await
+            && !value.is_empty()
+        {
+            federation.insert(
+                crate::env_api_keys::ANTHROPIC_WORKSPACE_ID_ENV.to_string(),
+                value,
+            );
+        }
+        Ok(Some(crate::auth::AuthResult {
+            auth: crate::auth::ModelAuth::default(),
+            env: Some(federation),
+            source: Some("workload identity federation".to_string()),
+        }))
     }
 }
 
@@ -615,6 +674,257 @@ mod tests {
         assert_eq!(
             crate::env_api_keys::get_env_api_key("anthropic", &both, None).await,
             Some("k".to_string())
+        );
+    }
+
+    // ---- PROV-119: federation resolution order --------------------------------------------
+
+    /// Every federation variable, so the arm's own gate is the only thing under test.
+    fn federation_env() -> BTreeMap<String, String> {
+        BTreeMap::from([
+            (
+                crate::env_api_keys::ANTHROPIC_FEDERATION_RULE_ID_ENV.to_string(),
+                "fdrl_rule".to_string(),
+            ),
+            (
+                crate::env_api_keys::ANTHROPIC_ORGANIZATION_ID_ENV.to_string(),
+                "org-uuid".to_string(),
+            ),
+            (
+                crate::env_api_keys::ANTHROPIC_SERVICE_ACCOUNT_ID_ENV.to_string(),
+                "svac_account".to_string(),
+            ),
+            (
+                crate::env_api_keys::ANTHROPIC_IDENTITY_TOKEN_FILE_ENV.to_string(),
+                "/var/run/secrets/anthropic.com/token".to_string(),
+            ),
+        ])
+    }
+
+    async fn resolve_with(env: BTreeMap<String, String>) -> Option<crate::auth::AuthResult> {
+        let model = anthropic_models()
+            .into_iter()
+            .find(|m| m.id.as_str() == "claude-opus-4-5")
+            .expect("catalog model");
+        crate::auth::ApiKeyAuth::resolve(&AnthropicApiKeyAuth, &model, &MapEnv(env), None)
+            .await
+            .expect("resolution must not error")
+    }
+
+    /// The ids arrive in `env` and NOT as a credential: `auth` stays empty, because the exchange
+    /// happens later and a federated token must never land in `api_key` (see
+    /// `api::anthropic_messages::federation`).
+    #[tokio::test]
+    async fn federation_resolves_the_ids_into_env_with_no_credential() {
+        let resolved = resolve_with(federation_env())
+            .await
+            .expect("federation applies");
+        assert_eq!(
+            resolved.source.as_deref(),
+            Some("workload identity federation")
+        );
+        assert_eq!(
+            resolved.auth.api_key, None,
+            "federation yields config, not a key"
+        );
+        assert!(
+            resolved.auth.headers.is_none(),
+            "no header is minted at resolution time"
+        );
+        let env = resolved.env.expect("the ids travel in env");
+        assert_eq!(
+            env.get(crate::env_api_keys::ANTHROPIC_FEDERATION_RULE_ID_ENV)
+                .map(String::as_str),
+            Some("fdrl_rule")
+        );
+        assert_eq!(
+            env.get(crate::env_api_keys::ANTHROPIC_SERVICE_ACCOUNT_ID_ENV)
+                .map(String::as_str),
+            Some("svac_account")
+        );
+        assert_eq!(
+            env.get(crate::env_api_keys::ANTHROPIC_IDENTITY_TOKEN_FILE_ENV)
+                .map(String::as_str),
+            Some("/var/run/secrets/anthropic.com/token")
+        );
+    }
+
+    /// Federation is LAST: each of the three key variables wins over a complete federation
+    /// configuration (pi: "Last in line so keys and ANTHROPIC_AUTH_TOKEN keep winning").
+    #[tokio::test]
+    async fn every_key_variable_wins_over_federation() {
+        for (var, expected_source) in [
+            (ANTHROPIC_AUTH_TOKEN_ENV, ANTHROPIC_AUTH_TOKEN_ENV),
+            (ANTHROPIC_OAUTH_TOKEN_ENV, ANTHROPIC_OAUTH_TOKEN_ENV),
+            (ANTHROPIC_API_KEY_ENV, ANTHROPIC_API_KEY_ENV),
+        ] {
+            let mut env = federation_env();
+            env.insert(var.to_string(), "secret-value".to_string());
+            let resolved = resolve_with(env).await.expect("a key resolves");
+            assert_eq!(
+                resolved.source.as_deref(),
+                Some(expected_source),
+                "{var} must win over federation"
+            );
+            assert!(
+                resolved.env.is_none(),
+                "{var} must not also carry the federation ids"
+            );
+        }
+    }
+
+    /// A partially configured workload resolves to NOTHING rather than to a half-built federation
+    /// config, so the failure is "not configured" and not an opaque 401 from the exchange.
+    #[tokio::test]
+    async fn a_partial_federation_configuration_resolves_to_nothing() {
+        for missing in [
+            crate::env_api_keys::ANTHROPIC_FEDERATION_RULE_ID_ENV,
+            crate::env_api_keys::ANTHROPIC_ORGANIZATION_ID_ENV,
+            crate::env_api_keys::ANTHROPIC_SERVICE_ACCOUNT_ID_ENV,
+            crate::env_api_keys::ANTHROPIC_IDENTITY_TOKEN_FILE_ENV,
+        ] {
+            let mut env = federation_env();
+            env.remove(missing);
+            assert!(
+                resolve_with(env).await.is_none(),
+                "federation must not activate without {missing}"
+            );
+        }
+    }
+
+    /// `ANTHROPIC_IDENTITY_TOKEN` stands in for the file (CYRUP-DELTA: pi reads only the file).
+    #[tokio::test]
+    async fn the_inline_identity_token_also_activates_federation() {
+        let mut env = federation_env();
+        env.remove(crate::env_api_keys::ANTHROPIC_IDENTITY_TOKEN_FILE_ENV);
+        env.insert(
+            crate::env_api_keys::ANTHROPIC_IDENTITY_TOKEN_ENV.to_string(),
+            "header.payload.signature".to_string(),
+        );
+        let resolved = resolve_with(env)
+            .await
+            .expect("the inline token activates federation");
+        let carried = resolved.env.expect("ids in env");
+        assert_eq!(
+            carried
+                .get(crate::env_api_keys::ANTHROPIC_IDENTITY_TOKEN_ENV)
+                .map(String::as_str),
+            Some("header.payload.signature")
+        );
+    }
+
+    /// END TO END: resolve → exchange → the minted token on the actual `/v1/messages` request.
+    ///
+    /// This is the test that proves the feature is not inert. The unit tests cover the gate and the
+    /// exchange separately; this one drives `provider.stream()` with only federation variables set
+    /// and asserts that (a) the request is NOT rejected as "not configured", (b) the exchange was
+    /// performed, and (c) the messages request carries `Authorization: Bearer <minted>` and no
+    /// `x-api-key`.
+    #[tokio::test]
+    async fn a_federated_request_carries_the_minted_token_and_no_api_key() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let dir = std::env::temp_dir().join(format!(
+            "cyrup-prov119-e2e-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let token_path = dir.join("token");
+        std::fs::write(&token_path, "header.payload.signature").expect("write token");
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let seen = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::<String>::new()));
+        let recorded = std::sync::Arc::clone(&seen);
+        tokio::spawn(async move {
+            // 1: the token exchange. 2: the messages request, answered 500 so the turn ends fast.
+            for i in 0..2 {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut buf = vec![0u8; 16384];
+                let read = socket.read(&mut buf).await.unwrap_or(0);
+                recorded
+                    .lock()
+                    .await
+                    .push(String::from_utf8_lossy(&buf[..read]).to_string());
+                let body = if i == 0 {
+                    r#"{"access_token":"sk-ant-oat01-federated","token_type":"Bearer","expires_in":3600,"scope":"workspace:inference"}"#
+                } else {
+                    r#"{"type":"error","error":{"type":"api_error","message":"stop here"}}"#
+                };
+                let status = if i == 0 {
+                    "200 OK"
+                } else {
+                    "500 Internal Server Error"
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.flush().await;
+            }
+        });
+
+        let mut env = federation_env();
+        env.insert(
+            crate::env_api_keys::ANTHROPIC_IDENTITY_TOKEN_FILE_ENV.to_string(),
+            token_path.to_string_lossy().to_string(),
+        );
+        let provider = anthropic_provider_with(
+            Arc::new(InMemoryCredentialStore::new()),
+            Arc::new(builtin_registry()),
+        )
+        .with_auth_context(Arc::new(MapEnv(env)));
+        let mut model = provider.get_model("claude-opus-4-5").unwrap().clone();
+        model.base_url = format!("http://127.0.0.1:{port}");
+
+        let msg = collect_message(provider.stream(
+            &model,
+            &Context::default(),
+            &StreamOptions::default(),
+        ))
+        .await;
+
+        let err = msg.error_message.unwrap_or_default();
+        assert!(
+            !err.contains("not configured"),
+            "federation must resolve as configured auth, got: {err}"
+        );
+
+        let requests = seen.lock().await.clone();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            requests.len(),
+            2,
+            "expected the exchange and then the messages request, got {} — last: {:?}",
+            requests.len(),
+            requests.last()
+        );
+        assert!(
+            requests[0].starts_with("POST /v1/oauth/token "),
+            "the first call must be the token exchange:\n{}",
+            requests[0]
+        );
+        let messages_request = &requests[1];
+        assert!(
+            messages_request.starts_with("POST /v1/messages "),
+            "the second call must be the messages request:\n{messages_request}"
+        );
+        let lower = messages_request.to_ascii_lowercase();
+        assert!(
+            lower.contains("authorization: bearer sk-ant-oat01-federated"),
+            "the minted token must be on the messages request:\n{messages_request}"
+        );
+        assert!(
+            !lower.contains("x-api-key"),
+            "a federated request must send no x-api-key:\n{messages_request}"
         );
     }
 }

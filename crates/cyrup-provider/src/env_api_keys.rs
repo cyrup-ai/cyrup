@@ -115,12 +115,55 @@ pub fn api_key_env_vars(provider: &str) -> Option<&'static [&'static str]> {
 /// file's own source: any new `SOMETHING_API_KEY` literal added to [`api_key_env_vars`] (or
 /// anywhere else in this module) fails that test until it is added here too. Entries may be a
 /// SUPERSET of what the file names (the AWS companions are), never a subset.
+/// Anthropic workload identity federation (PROV-119), pi `env-api-keys.ts:32-36` @v1.0.0.
+///
+/// These five are NOT api-key env vars and are deliberately absent from [`api_key_env_vars`]:
+/// federation resolves LAST, after every key, and yields provider CONFIG rather than a credential
+/// (pi `providers/anthropic.ts:49-69` returns `{ auth: {}, env: federation }`). They are read by
+/// the anthropic `ProviderAuth` and consumed by
+/// `api::anthropic_messages::federation`, which performs the token exchange.
+pub const ANTHROPIC_FEDERATION_RULE_ID_ENV: &str = "ANTHROPIC_FEDERATION_RULE_ID";
+/// See [`ANTHROPIC_FEDERATION_RULE_ID_ENV`].
+pub const ANTHROPIC_ORGANIZATION_ID_ENV: &str = "ANTHROPIC_ORGANIZATION_ID";
+/// See [`ANTHROPIC_FEDERATION_RULE_ID_ENV`].
+pub const ANTHROPIC_SERVICE_ACCOUNT_ID_ENV: &str = "ANTHROPIC_SERVICE_ACCOUNT_ID";
+/// See [`ANTHROPIC_FEDERATION_RULE_ID_ENV`]. Path to the IdP-issued JWT; re-read on EVERY exchange,
+/// because a projected token rotates on disk and an `assertion` carrying a `jti` may be exchanged
+/// only once per issuer.
+pub const ANTHROPIC_IDENTITY_TOKEN_FILE_ENV: &str = "ANTHROPIC_IDENTITY_TOKEN_FILE";
+/// See [`ANTHROPIC_FEDERATION_RULE_ID_ENV`]. The literal JWT, for platforms that inject it as an
+/// env var rather than a file.
+///
+/// CYRUP-DELTA: pi reads only `ANTHROPIC_IDENTITY_TOKEN_FILE`, so a platform that injects the JWT
+/// as a variable cannot federate under pi. The documented contract makes the two alternatives of
+/// equal standing ("One of `_TOKEN_FILE` or `_TOKEN`",
+/// <https://platform.claude.com/docs/en/manage-claude/wif-reference>), and cyrup performs the
+/// exchange itself rather than delegating to the Anthropic SDK, so there is no SDK fallback to
+/// cover the gap. Both are read here.
+pub const ANTHROPIC_IDENTITY_TOKEN_ENV: &str = "ANTHROPIC_IDENTITY_TOKEN";
+/// See [`ANTHROPIC_FEDERATION_RULE_ID_ENV`]. Optional: required only when the federation rule is
+/// enabled for more than one workspace, and it does NOT gate activation.
+pub const ANTHROPIC_WORKSPACE_ID_ENV: &str = "ANTHROPIC_WORKSPACE_ID";
+
 pub const CREDENTIAL_ENV_VARS: &[&str] = &[
     // -- literal API keys / tokens, one per `api_key_env_vars` arm --------------------------
     "COPILOT_GITHUB_TOKEN",
     "ANTHROPIC_AUTH_TOKEN",
     "ANTHROPIC_OAUTH_TOKEN",
     "ANTHROPIC_API_KEY",
+    // -- Anthropic workload identity federation (PROV-119) ----------------------------------
+    // `ANTHROPIC_IDENTITY_TOKEN` is a bearer-able credential: it exchanges for an access token
+    // that spends real money, so it belongs in the scrub for the same reason a key does. The four
+    // ids are provider CONFIG, not secrets — they are listed because the slice is allowed to be a
+    // superset, and because a spawned child that inherits them alongside a projected token file
+    // would federate and bill without ever being handed a key. `_TOKEN_FILE` is a path; what it
+    // points at is the credential, and the path is scrubbed so the child cannot read it either.
+    "ANTHROPIC_FEDERATION_RULE_ID",
+    "ANTHROPIC_ORGANIZATION_ID",
+    "ANTHROPIC_SERVICE_ACCOUNT_ID",
+    "ANTHROPIC_IDENTITY_TOKEN_FILE",
+    "ANTHROPIC_IDENTITY_TOKEN",
+    "ANTHROPIC_WORKSPACE_ID",
     "ANT_LING_API_KEY",
     "QWEN_TOKEN_PLAN_API_KEY",
     "QWEN_TOKEN_PLAN_CN_API_KEY",

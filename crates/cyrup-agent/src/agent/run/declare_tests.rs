@@ -7,6 +7,7 @@
 
 use super::*;
 use cyrup_core::{Content, ToolReference};
+use std::collections::BTreeSet;
 
 fn tool(name: &str) -> ToolDef {
     ToolDef {
@@ -117,30 +118,75 @@ fn a_redefined_tool_is_removed_and_added() {
     assert_eq!(row.tools_removed, vec![ToolReference::new("a")]);
 }
 
-/// The request projection removes the declarations and keeps every other part of a system
-/// message; a message that held only declarations disappears.
+/// AGENT-039 — the request projection filters ONLY hidden declarations and keeps everything else,
+/// which is pi's `_installHiddenDeclarationsProjection`. The assertion here previously pinned the
+/// opposite (a blanket strip, with a declaration-only message dropped); that was a cyrup-original
+/// divergence, and it is what made the native mid-conversation tool-change shapes unreachable.
 #[test]
-fn the_request_projection_strips_declarations_only() {
-    let out = without_tool_declarations(vec![
-        Message::System(SystemMessage {
-            tools_added: vec![tool("a")],
-            timestamp: 1,
-            ..SystemMessage::default()
-        }),
-        Message::System(SystemMessage {
-            content: vec![Content::text("keep me")],
-            tools_added: vec![tool("b")],
-            tools_removed: vec![ToolReference::new("c")],
-            timestamp: 2,
-            ..SystemMessage::default()
-        }),
-    ]);
-    assert_eq!(out.len(), 1, "{out:?}");
+fn the_request_projection_removes_only_hidden_declarations() {
+    let hidden = BTreeSet::from(["a".to_string(), "c".to_string()]);
+    let out = project_hidden_declarations(
+        vec![
+            Message::System(SystemMessage {
+                tools_added: vec![tool("a")],
+                timestamp: 1,
+                ..SystemMessage::default()
+            }),
+            Message::System(SystemMessage {
+                content: vec![Content::text("keep me")],
+                tools_added: vec![tool("b")],
+                tools_removed: vec![ToolReference::new("c"), ToolReference::new("d")],
+                timestamp: 2,
+                ..SystemMessage::default()
+            }),
+        ],
+        &hidden,
+    );
+
+    // Both messages survive: pi keeps a message whose declarations were all hidden, empty.
+    assert_eq!(out.len(), 2, "{out:?}");
     match &out[0] {
         Message::System(s) => {
-            assert_eq!(s.content, vec![Content::text("keep me")]);
-            assert!(s.tools_added.is_empty() && s.tools_removed.is_empty());
+            assert!(s.tools_added.is_empty(), "the hidden `a` is projected out");
+            assert_eq!(s.timestamp, 1, "every other field is untouched");
         }
         other => panic!("{other:?}"),
     }
+    match &out[1] {
+        Message::System(s) => {
+            assert_eq!(s.content, vec![Content::text("keep me")]);
+            assert_eq!(
+                s.tools_added
+                    .iter()
+                    .map(|t| t.name.as_str())
+                    .collect::<Vec<_>>(),
+                ["b"],
+                "a non-hidden declaration STAYS in the transcript"
+            );
+            assert_eq!(
+                s.tools_removed
+                    .iter()
+                    .map(|t| t.name.as_str())
+                    .collect::<Vec<_>>(),
+                ["d"],
+                "the hidden removal is projected out, the visible one kept"
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+/// With nothing hidden the transcript is returned untouched — the common case, and the one the
+/// blanket strip used to mangle.
+#[test]
+fn an_empty_hidden_set_keeps_every_declaration() {
+    let messages = vec![Message::System(SystemMessage {
+        content: vec![Content::text("prompt")],
+        tools_added: vec![tool("a"), tool("b")],
+        tools_removed: vec![ToolReference::new("c")],
+        timestamp: 7,
+        ..SystemMessage::default()
+    })];
+    let out = project_hidden_declarations(messages.clone(), &BTreeSet::new());
+    assert_eq!(out, messages);
 }
