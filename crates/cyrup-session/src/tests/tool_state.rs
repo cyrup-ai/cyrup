@@ -219,6 +219,7 @@ fn a_system_message_is_never_summarized() {
         raw_stop_reason: None,
         end_turn: None,
         timestamp: 0,
+        duration_ms: None,
     }))
     .unwrap();
     let path: Vec<Entry> = m.branch_path(None).into_iter().cloned().collect();

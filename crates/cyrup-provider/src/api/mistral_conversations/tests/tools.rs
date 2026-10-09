@@ -26,6 +26,7 @@ fn tools_encode_function_shape() {
 #[test]
 fn tool_result_message_shape() {
     let messages = vec![Message::ToolResult {
+        duration_ms: None,
         tool_call_id: CoreToolCallId::from("call12345"),
         tool_name: "read".to_string(),
         content: vec![Content::text("file body")],

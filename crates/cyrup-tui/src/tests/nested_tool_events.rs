@@ -47,6 +47,7 @@ fn events(with_nested: bool) -> Vec<AgentSessionEvent> {
                 parent_tool_call_id: ToolCallId::from("call-ls"),
             },
             AgentSessionEvent::NestedToolExecutionEnd {
+                duration_ms: None,
                 tool_call_id: ToolCallId::from("call-ls/1"),
                 tool_name: "read".to_string(),
                 result: json!({ "content": [{ "type": "text", "text": "NESTED_RESULT_TEXT" }] }),
@@ -56,6 +57,7 @@ fn events(with_nested: bool) -> Vec<AgentSessionEvent> {
         ]);
     }
     evs.push(AgentSessionEvent::ToolExecutionEnd {
+        duration_ms: None,
         tool_call_id: ToolCallId::from("call-ls"),
         tool_name: "ls".to_string(),
         result: json!({ "content": [{ "type": "text", "text": "src\nREADME.md" }] }),
@@ -115,6 +117,7 @@ fn a_nested_end_does_not_close_the_parents_running_row() {
         args: json!({ "path": "." }),
     });
     app.ingest_event(&AgentSessionEvent::NestedToolExecutionEnd {
+        duration_ms: None,
         tool_call_id: ToolCallId::from("call-ls/1"),
         tool_name: "ls".to_string(),
         result: json!({ "content": [{ "type": "text", "text": "NESTED_RESULT_TEXT" }] }),
@@ -126,6 +129,7 @@ fn a_nested_end_does_not_close_the_parents_running_row() {
     assert!(!mid.contains("NESTED_RESULT_TEXT"), "{mid}");
     // The parent can still finish normally afterwards.
     app.ingest_event(&AgentSessionEvent::ToolExecutionEnd {
+        duration_ms: None,
         tool_call_id: ToolCallId::from("call-ls"),
         tool_name: "ls".to_string(),
         result: json!({ "content": [{ "type": "text", "text": "PARENT_RESULT" }] }),

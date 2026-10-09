@@ -820,8 +820,10 @@ mod tests {
                     raw_stop_reason: None,
                     end_turn: None,
                     timestamp: 2,
+                    duration_ms: None,
                 }),
                 cyrup_core::Message::ToolResult {
+                    duration_ms: None,
                     tool_call_id: cyrup_core::ToolCallId::from("call_1"),
                     tool_name: "base_tool".to_string(),
                     content: vec![cyrup_core::Content::text("done")],

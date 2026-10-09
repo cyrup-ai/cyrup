@@ -345,6 +345,7 @@ pub(crate) fn fork_assistant_msg(text: &str) -> cyrup_core::Message {
         raw_stop_reason: None,
         end_turn: None,
         timestamp: 0,
+        duration_ms: None,
     })
 }
 

@@ -3,17 +3,17 @@
 //! Compiled to `wasm32-wasip2` (cdylib) it implements the `cyrup:ext` WIT world and emits a loadable
 //! COMPONENT; compiled for the host (rlib) the ergonomic layer (events, descriptors, outcomes,
 //! dispatch) is unit-testable. An author builds an [`ExtensionApi`] in a factory, subscribing to any
-//! of the 37 lifecycle events with typed `(event, &Ctx) -> Outcome` handlers and registering
+//! of the 39 lifecycle events with typed `(event, &Ctx) -> Outcome` handlers and registering
 //! tools/commands/shortcuts/flags/providers/renderers/autocomplete — the Rust analog of Pi's
 //! `ExtensionAPI` (extensions/types.ts:1128-1356).
 //!
 //! ## Modules
 //! - [`prelude`] — the author entry point: `use cyrup_ext_sdk::prelude::*;`.
 //! - [`api`] — [`ExtensionApi`], [`Outcome`], tool execution ([`ToolExec`]/[`ToolOutput`]).
-//! - [`events`] — the 33 typed event payloads + per-event result shapes (37 subscribable events;
-//!   32 payload structs, because some events share one — [`SessionLifecycleEvent`] serves both
+//! - [`events`] — the typed event payloads + per-event result shapes (39 subscribable events;
+//!   36 payload structs, because some events share one — [`SessionLifecycleEvent`] serves both
 //!   `session_start` and `session_shutdown`, [`UiPromptEvent`] both `ui_prompt_start` and
-//!   `ui_prompt_end` — and `agent_start`/`agent_settled` carry none).
+//!   `ui_prompt_end` — and `agent_start` carries none).
 //! - [`ctx`] — [`Ctx`]/[`CommandCtx`]/[`Ui`]/[`Session`]/[`Models`] capability wrappers.
 //! - [`descriptor`] — tool/command/flag/provider descriptors.
 //! - [`tool_factory`] — [`define_tool`], plus the `bash`/`read`/`write` descriptor builders

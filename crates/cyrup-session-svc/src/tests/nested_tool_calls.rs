@@ -387,7 +387,7 @@ async fn run_caller(
         .lock()
         .unwrap()
         .iter()
-        .any(|e| matches!(e, AgentSessionEvent::AgentSettled))
+        .any(|e| matches!(e, AgentSessionEvent::AgentSettled { .. }))
         && settled.elapsed() < std::time::Duration::from_secs(10)
     {
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;

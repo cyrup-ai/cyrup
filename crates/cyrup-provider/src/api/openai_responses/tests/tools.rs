@@ -103,11 +103,13 @@ fn assistant_tool_call(id: &str, name: &str) -> Message {
         raw_stop_reason: None,
         end_turn: None,
         timestamp: 2,
+        duration_ms: None,
     })
 }
 
 fn marked_tool_result(id: &str, added: &[&str]) -> Message {
     Message::ToolResult {
+        duration_ms: None,
         tool_call_id: ToolCallId::from(id),
         tool_name: "base_tool".to_string(),
         content: vec![Content::text("done")],
@@ -443,6 +445,7 @@ fn the_search_call_id_hashes_the_full_tool_call_id_and_comma_joined_names() {
         raw_stop_reason: None,
         end_turn: None,
         timestamp: 2,
+        duration_ms: None,
     });
     ctx.messages[2] = marked_tool_result("call_1|fc_item_1", &["late_tool", "later_tool"]);
 

@@ -768,9 +768,15 @@ pub type AssistantMessageEventSink = cyrup_core::FinalizingSink<StreamEvent, Ass
 /// `createAssistantMessageEventStream()`, event-stream.ts:85-88). The sink's `push`/`end` feed the
 /// stream; `result()` resolves to the terminal message (or a synthesized error if it ends without
 /// a terminal, matching [`collect_message`]'s no-panic policy).
+///
+/// The stream times its response from the moment it is created, like every pi
+/// `AssistantMessageEventStream` (`utils/event-stream.ts` @v1.1.0): the first terminal pushed, or
+/// the result handed to `end` before one, gets `durationMs` — see [`crate::timing`].
 pub fn create_assistant_message_event_stream()
 -> (AssistantMessageEventSink, AssistantMessageEventStream) {
-    cyrup_core::finalizing_channel(
+    let timer = Arc::new(crate::timing::ResponseTimer::start());
+    let on_result = Arc::clone(&timer);
+    cyrup_core::finalizing_channel_stamped(
         |e: &StreamEvent| matches!(e, StreamEvent::Done { .. } | StreamEvent::Error { .. }),
         |e: &StreamEvent| {
             e.terminal_message()
@@ -778,6 +784,10 @@ pub fn create_assistant_message_event_stream()
                 .unwrap_or_else(synth_terminal_less_message)
         },
         synth_terminal_less_message,
+        move |e: &mut StreamEvent| timer.time_terminal(e),
+        move |m: &mut AssistantMessage| {
+            on_result.time(m);
+        },
     )
 }
 
@@ -817,6 +827,7 @@ mod tests {
             raw_stop_reason: None,
             end_turn: None,
             timestamp: 0,
+            duration_ms: None,
         })
     }
 

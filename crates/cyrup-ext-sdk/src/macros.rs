@@ -17,7 +17,7 @@
 //! ```
 //!
 //! `cargo build --target wasm32-wasip2` then yields a loadable `cyrup:ext` COMPONENT. The macro emits
-//! the wasm guest glue — the world's `init` + `events` (all 37 hooks + `execute-tool` +
+//! the wasm guest glue — the world's `init` + `events` (all 39 hooks + `execute-tool` +
 //! `execute-command`/`get-argument-completions` + `render-call`/`render-result`) exports + the
 //! `export!` invocation — each delegating to the routing helpers in `crate::guest`. The
 //! `wit_bindgen::generate!` (with `pub_export_macro`) runs once in this crate; the downstream author's
@@ -368,8 +368,8 @@ macro_rules! export_extension {
                 fn on_agent_end(messages_json: ::std::string::String) {
                     $crate::guest::notify(8, &[&messages_json]);
                 }
-                fn on_agent_settled() {
-                    $crate::guest::notify(30, &[]);
+                fn on_agent_settled(aborted: bool) {
+                    $crate::guest::notify(30, &[$crate::guest::b(aborted)]);
                 }
                 fn on_turn_start(turn_index: u32, timestamp: u64) {
                     $crate::guest::notify(9, &[&turn_index.to_string(), &timestamp.to_string()]);
@@ -378,11 +378,26 @@ macro_rules! export_extension {
                     turn_index: u32,
                     message_json: ::std::string::String,
                     tool_results_json: ::std::string::String,
-                ) {
-                    $crate::guest::notify(
+                    message_entry_id: ::std::string::String,
+                    tool_result_entry_ids_json: ::std::string::String,
+                    boundary_json: ::std::string::String,
+                ) -> bindings::cyrup::ext::types::HookOutcome {
+                    $crate::guest::hook(
                         10,
-                        &[&turn_index.to_string(), &message_json, &tool_results_json],
-                    );
+                        &[
+                            &turn_index.to_string(),
+                            &message_json,
+                            &tool_results_json,
+                            &message_entry_id,
+                            &tool_result_entry_ids_json,
+                            &boundary_json,
+                        ],
+                    )
+                }
+                fn on_agent_before_settle(
+                    boundary_json: ::std::string::String,
+                ) -> bindings::cyrup::ext::types::HookOutcome {
+                    $crate::guest::hook(38, &[&boundary_json])
                 }
                 fn on_message_start(message_json: ::std::string::String) {
                     $crate::guest::notify(11, &[&message_json]);
@@ -432,8 +447,11 @@ macro_rules! export_extension {
                     name: ::std::string::String,
                     result_json: ::std::string::String,
                     is_error: bool,
+                    duration_ms: ::core::option::Option<u64>,
                     parent_tool_call_id: ::core::option::Option<::std::string::String>,
                 ) {
+                    // `none` crosses as "", like every optional arg on this path.
+                    let duration_ms = duration_ms.map(|ms| ms.to_string()).unwrap_or_default();
                     $crate::guest::notify(
                         15,
                         &[
@@ -441,6 +459,7 @@ macro_rules! export_extension {
                             &name,
                             &result_json,
                             $crate::guest::b(is_error),
+                            &duration_ms,
                             parent_tool_call_id.as_deref().unwrap_or(""),
                         ],
                     );
@@ -519,6 +538,24 @@ macro_rules! export_extension {
                             $crate::guest::b(from_extension),
                             &reason,
                             $crate::guest::b(will_retry),
+                        ],
+                    );
+                }
+                fn on_session_compact_failed(
+                    reason: ::std::string::String,
+                    error_message: ::core::option::Option<::std::string::String>,
+                    aborted: bool,
+                    will_retry: bool,
+                    from_extension: bool,
+                ) {
+                    $crate::guest::notify(
+                        37,
+                        &[
+                            &reason,
+                            error_message.as_deref().unwrap_or(""),
+                            $crate::guest::b(aborted),
+                            $crate::guest::b(will_retry),
+                            $crate::guest::b(from_extension),
                         ],
                     );
                 }

@@ -7,6 +7,7 @@
 use crate::agent::message::{empty_assistant, errored_assistant};
 use cyrup_core::{AssistantMessage, ModelRef, ModelThinkingLevel, StopReason};
 use cyrup_provider::StreamEvent;
+use cyrup_provider::timing::ResponseTimer;
 use std::sync::Arc;
 
 /// Where the stream is: pi's `partialMessage === null` / non-null (`agent-loop.ts:314-315`), plus
@@ -43,9 +44,37 @@ pub(super) enum Step {
 pub(super) struct Settled {
     pub(super) start: Option<Arc<AssistantMessage>>,
     pub(super) end: Arc<AssistantMessage>,
+    /// Whether the loop BUILT `end` itself (an abort, a stream that ended without a terminal)
+    /// rather than receiving it from the stream. Only such a message may take the response's start
+    /// as its timestamp — see `ResponseTimer::time_created`.
+    created: bool,
 }
 
 impl Settled {
+    /// Time the settled message as this response's final one (pi `AssistantMessageEventStream`'s
+    /// `#time`, `utils/event-stream.ts` @v1.1.0): a no-op when the provider's own timer already set
+    /// `durationMs`. See `cyrup_provider::timing`.
+    pub(super) fn timed(self, timer: &ResponseTimer) -> Self {
+        // Before the thinking level, as pi's stream times the message before the loop's
+        // `Object.assign` sees it. Rebuilt for the reason `with_thinking_level` rebuilds: `start`
+        // and `end` are one message.
+        let mut message = (*self.end).clone();
+        let stamped = if self.created {
+            timer.time_created(&mut message)
+        } else {
+            timer.time(&mut message)
+        };
+        if !stamped {
+            return self;
+        }
+        let end = Arc::new(message);
+        Self {
+            start: self.start.map(|_| Arc::clone(&end)),
+            end,
+            created: self.created,
+        }
+    }
+
     /// Record the Pi thinking level the loop REQUESTED for this response on the settled message —
     /// pi `const result = async () => Object.assign(await response.result(), { thinkingLevel:
     /// config.reasoning ?? "off" })` (`packages/agent/src/agent-loop.ts:408-409`), whose own
@@ -66,6 +95,7 @@ impl Settled {
         Self {
             start: self.start.map(|_| Arc::clone(&end)),
             end,
+            created: self.created,
         }
     }
 }
@@ -147,6 +177,7 @@ impl AssistantStream {
         Settled {
             start,
             end: terminal,
+            created: false,
         }
     }
 
@@ -165,7 +196,11 @@ impl AssistantStream {
         aborted.error_message = Some("Request was aborted".to_string());
         let end = Arc::new(aborted);
         let start = self.owes_start().then(|| Arc::clone(&end));
-        Settled { start, end }
+        Settled {
+            start,
+            end,
+            created: true,
+        }
     }
 
     /// The stream ended without a `done`/`error` terminal.
@@ -178,7 +213,11 @@ impl AssistantStream {
             "stream ended without a terminal event",
         ));
         let start = self.owes_start().then(|| Arc::clone(&end));
-        Settled { start, end }
+        Settled {
+            start,
+            end,
+            created: true,
+        }
     }
 
     fn owes_start(&self) -> bool {

@@ -16,6 +16,7 @@
 //! | `message_end` | `emitMessageEnd` `:1043-1080` | a same-role replacement chains; another role is skipped |
 //! | `before_agent_start` | `emitBeforeAgentStart` `:1312-1364` | every `message` accumulates; the last `systemPrompt` wins and chains |
 //! | `input` | `emitInput` `:1412-1451` | `handled` returns; a transform's text/images chain |
+//! | `turn_end`, `agent_before_settle` | `emitBoundary` `:1029-1080` @v1.1.0 | `entries`/`continue` replace and chain; the preview is rebuilt after each |
 //! | `user_bash` | `emitUserBash` `:1154-1188` | the first result returns |
 //! | `before_provider_request` | `emitBeforeProviderRequest` `:1253-1282` | the returned payload chains |
 //! | `before_provider_headers` | `emitBeforeProviderHeaders` `:1284-1310` | the header edits chain; `null` deletes |
@@ -35,6 +36,19 @@ use serde_json::{Map, Value};
 
 /// Run `handlers` in order over `args` and combine their outcomes (see the module docs).
 pub(super) fn run(kind: u8, args: &[&str], handlers: &[&Handler], ctx: &Ctx) -> RawOutcome {
+    if kind != kind::BEFORE_AGENT_START {
+        return run_chain(kind, args, handlers, ctx);
+    }
+    // EXT-084: while a `before_agent_start` chain runs, `ctx.system_prompt()` is the prompt the
+    // options render to as the handlers so far left them (pi rebinds `ctx.getSystemPrompt` for
+    // the chain, `core/extensions/runner.ts:1431-1434` @v1.1.0); `run_chain` moves it along.
+    crate::ctx::base::set_before_agent_start_prompt(args.get(2).map(|p| (*p).to_string()));
+    let outcome = run_chain(kind, args, handlers, ctx);
+    crate::ctx::base::set_before_agent_start_prompt(None);
+    outcome
+}
+
+fn run_chain(kind: u8, args: &[&str], handlers: &[&Handler], ctx: &Ctx) -> RawOutcome {
     // One handler: its own outcome, byte for byte — nothing to combine.
     if let [only] = handlers {
         return only(args, ctx);
@@ -193,19 +207,55 @@ fn chain(kind: u8, args: &mut [String], patch: &mut Option<Value>, v: Value) {
             }
             merge_keys(patch, obj);
         }
-        // `emitBeforeAgentStart`: every handler's `message` is pushed (`:1345`), and a
-        // `systemPrompt` becomes the prompt the next handler reads (`:1346-1348`). One outcome
-        // carries them all as `messages`, which the host's `decode_patch` reads after `message`.
-        // Args: `[prompt, images, system_prompt, options]`.
+        // `emitBeforeAgentStart` (`core/extensions/runner.ts:1420-1476` @v1.1.0): every handler's
+        // `message` is pushed, and the handlers share ONE `systemPromptOptions` object (EXT-084):
+        // an edit is what the next handler reads, `event.systemPrompt` renders it, and a returned
+        // `systemPrompt` is recorded in it as `forceSystemPrompt`. One outcome carries the
+        // messages as `messages` (the host's `decode_patch` reads them after `message`) and the
+        // options as the chain left them. Args: `[prompt, images, system_prompt, options]`.
         kind::BEFORE_AGENT_START => {
             let Some(obj) = v.as_object() else { return };
             let target = patch.get_or_insert_with(|| Value::Object(Map::new()));
             let Some(combined) = target.as_object_mut() else {
                 return;
             };
+            let mut options = obj
+                .get("systemPromptOptions")
+                .filter(|o| o.is_object())
+                .cloned();
+            if options.is_some() {
+                // The returned options hold any earlier forced prompt (or its removal), so an
+                // earlier `systemPrompt` must not be replayed over them.
+                combined.remove("systemPrompt");
+            }
             if let Some(system) = obj.get("systemPrompt").and_then(Value::as_str) {
-                set(args, 2, system.to_string());
                 combined.insert("systemPrompt".into(), Value::String(system.to_string()));
+                let mut current = options.take().unwrap_or_else(|| {
+                    args.get(3)
+                        .and_then(|o| serde_json::from_str::<Value>(o).ok())
+                        .unwrap_or(Value::Null)
+                });
+                if let Some(object) = current.as_object_mut() {
+                    object.insert(
+                        "forceSystemPrompt".into(),
+                        Value::String(system.to_string()),
+                    );
+                    options = Some(current);
+                }
+                set(args, 2, system.to_string());
+            }
+            if let Some(options) = options {
+                let json = options.to_string();
+                // The host renders them (a forced prompt renders to itself); options it refuses
+                // keep the last prompt, as the host's own chain does.
+                if let Some(text) = crate::ctx::base::render_system_prompt(&json) {
+                    set(args, 2, text);
+                }
+                set(args, 3, json);
+                combined.insert("systemPromptOptions".into(), options);
+            }
+            if let Some(prompt) = args.get(2) {
+                crate::ctx::base::set_before_agent_start_prompt(Some(prompt.clone()));
             }
             let added = obj
                 .get("message")
@@ -223,6 +273,47 @@ fn chain(kind: u8, args: &mut [String], patch: &mut Option<Value>, v: Value) {
             {
                 messages.extend(added);
             }
+        }
+        // `emitBoundary` (`core/extensions/runner.ts:1029-1080` @v1.1.0; EXT-078): a returned
+        // `entries` replaces the drafts and `continue` the request, and the context preview is
+        // rebuilt after every handler — here through the host's `preview-boundary` import, a
+        // refusal keeping the last preview as the host's own chain does. Args: `turn_end`
+        // `[turn_index, message, tool_results, message_entry_id, tool_result_entry_ids,
+        // boundary]`, `agent_before_settle` `[boundary]`.
+        kind::TURN_END | kind::AGENT_BEFORE_SETTLE => {
+            let Some(obj) = v.as_object() else { return };
+            let (index, name) = if kind == kind::TURN_END {
+                (5, "turn_end")
+            } else {
+                (0, "agent_before_settle")
+            };
+            let mut state = args
+                .get(index)
+                .and_then(|b| serde_json::from_str::<Value>(b).ok())
+                .unwrap_or_else(|| Value::Object(Map::new()));
+            let Some(fields) = state.as_object_mut() else {
+                return;
+            };
+            let mut edit = Map::new();
+            if let Some(entries) = obj.get("entries").filter(|e| e.is_array()) {
+                fields.insert("entries".into(), entries.clone());
+                edit.insert("entries".into(), entries.clone());
+            }
+            if let Some(c) = obj.get("continue").filter(|c| c.is_boolean()) {
+                fields.insert("continue".into(), c.clone());
+                edit.insert("continue".into(), c.clone());
+            }
+            let entries = fields
+                .get("entries")
+                .cloned()
+                .unwrap_or_else(|| Value::Array(Vec::new()));
+            if let Some(context) = crate::ctx::base::preview_boundary(name, &entries.to_string())
+                .and_then(|c| serde_json::from_str::<Value>(&c).ok())
+            {
+                fields.insert("context".into(), context);
+            }
+            set(args, index, state.to_string());
+            merge_keys(patch, &edit);
         }
         // `emitBeforeProviderHeaders`: handlers edit ONE `headers` object in place — set a key,
         // delete it with `null` — so the next handler sees the edits, and the combined patch is the

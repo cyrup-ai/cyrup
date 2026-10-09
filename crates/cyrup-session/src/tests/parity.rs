@@ -331,6 +331,7 @@ fn gap14_15_listing_first_message_user_only_with_sentinel() {
         .unwrap();
     a.append_message(user("the user question")).unwrap();
     a.append_message(Message::ToolResult {
+        duration_ms: None,
         tool_call_id: "t".into(),
         tool_name: "n".into(),
         content: vec![Content::text("TOOL-OUTPUT-SHOULD-NOT-APPEAR")],
@@ -381,6 +382,7 @@ fn assistant_text(s: &str) -> cyrup_core::AssistantMessage {
         raw_stop_reason: None,
         end_turn: None,
         timestamp: 0,
+        duration_ms: None,
     }
 }
 
@@ -472,6 +474,7 @@ fn gap17_serialize_separators_json_args_and_skips_empty() {
         raw_stop_reason: None,
         end_turn: None,
         timestamp: 0,
+        duration_ms: None,
     });
     // An empty user message must NOT emit a "[User]: " line.
     let empty_user = Message::User {
@@ -1146,6 +1149,7 @@ fn asst_toolcall(name: &str, key: &str, path: &str) -> Message {
         raw_stop_reason: None,
         end_turn: None,
         timestamp: 0,
+        duration_ms: None,
     })
 }
 

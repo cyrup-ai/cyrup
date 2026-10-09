@@ -664,7 +664,7 @@ where
                     // fast turn, race the trailing `agent_settled` line off the wire entirely).
                     // `agent_settled` is emitted exactly once, at the end of the whole run, on every
                     // path — including a failed `agent.prompt`, whose settle still runs.
-                    if matches!(ev, AgentSessionEvent::AgentSettled) {
+                    if matches!(ev, AgentSessionEvent::AgentSettled { .. }) {
                         in_flight = false;
                     }
                     // SEAM-005 + EXT-005: a loaded extension's `ctx.shutdown()` is honoured at the
@@ -673,7 +673,7 @@ where
                     // rpc-mode.ts:355-358). Waiting for `agent_settled` rather than `agent_end` is
                     // load-bearing: `agent_end` fires again after an auto-retry or a post-run
                     // compaction, so exiting there would cut a run that is still going.
-                    let settled = matches!(ev, AgentSessionEvent::AgentSettled);
+                    let settled = matches!(ev, AgentSessionEvent::AgentSettled { .. });
                     // Only members of pi's own `AgentSessionEvent` union reach stdout. The internal
                     // `SessionReplaced` terminal is a rebind signal, not a pi event; `model_changed`
                     // (SEAM-080) and `session_start`/`session_shutdown` (SEAM-081) are cyrup

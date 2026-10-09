@@ -181,22 +181,45 @@ impl AgentSession {
         Self::lock(&self.base_prompt).sections().clone()
     }
 
-    /// The `before_agent_start` replacement in force for the CURRENT run, if any (Pi
-    /// `this._systemPromptOverride`, agent-session.ts:373 @v0.83.0). `None` between runs and
-    /// whenever no handler replaced the prompt.
+    /// The prompt a `before_agent_start` handler FORCED for the CURRENT run, if any (pi
+    /// `this._runSystemPromptOptions?.forceSystemPrompt`, `core/agent-session.ts:1791` @v1.1.0).
+    /// `None` between runs and whenever no handler returned a prompt.
     pub fn system_prompt_override(&self) -> Option<String> {
-        Self::lock(&self.system_prompt_override).clone()
+        Self::lock(&self.run_prompt_options)
+            .as_ref()
+            .and_then(|o| o.force_system_prompt.clone())
     }
 
-    /// `override ?? base` — the exact expression pi evaluates at every site that writes
-    /// `agent.state.systemPrompt` (agent-session.ts:534 in the turn-boundary refresh, `:940` in
-    /// `setActiveToolsByName` @v0.83.0). This is the value the agent must be running with at any
-    /// moment, and the value the per-turn refresh re-pushes (DRIFT-033).
+    /// pi `get systemPrompt()` — `buildSystemPrompt(this._runSystemPromptOptions ??
+    /// this._baseSystemPromptOptions)` (`core/agent-session.ts:1470-1472` @v1.1.0): *"Current
+    /// effective system prompt, including changes not yet sent to the model."* The forced prompt
+    /// when a handler forced one, otherwise the run's (or the base's) sections rendered.
     pub fn effective_system_prompt(&self) -> String {
-        // Two statements, not one chained expression: the override guard must be released before
-        // `base_system_prompt()` takes the second lock.
-        let over = Self::lock(&self.system_prompt_override).clone();
-        over.unwrap_or_else(|| self.base_system_prompt())
+        let run = Self::lock(&self.run_prompt_options).clone();
+        match run {
+            Some(options) => {
+                let docs = Self::lock(&self.base_prompt).docs().clone();
+                match options.force_system_prompt.clone() {
+                    Some(forced) => forced,
+                    None => crate::tools::BuiltPrompt::from_options(options, docs)
+                        .text()
+                        .to_owned(),
+                }
+            }
+            None => self.base_system_prompt(),
+        }
+    }
+
+    /// pi `buildSystemPrompt(options)` for an options object an extension holds — what a
+    /// `before_agent_start` handler's `event.systemPrompt` and `ctx.getSystemPrompt()` render from
+    /// the options it is editing (`core/extensions/runner.ts:1426-1446` @v1.1.0; EXT-084). The
+    /// options are normalized first, as pi's runner normalizes them before any handler sees them,
+    /// and rendered with this session's documentation pointers. A refusal carries pi's text (an
+    /// invalid custom section name) or the reason the value is not an options object.
+    pub fn render_prompt_options(&self, options: &serde_json::Value) -> Result<String, String> {
+        let options = cyrup_session::prompt::SystemPromptOptions::normalize(options)?;
+        let docs = Self::lock(&self.base_prompt).docs().clone();
+        options.render(&docs).map_err(|e| e.to_string())
     }
 
     /// The agent's *current* system prompt — equal to the base unless a `before_agent_start` handler

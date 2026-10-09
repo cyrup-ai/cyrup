@@ -136,6 +136,9 @@ pub(crate) struct SvcSubscriber {
     /// result is stamped with at `message_end`, and what `agent_end` clears. Shared with the
     /// session, whose `execute_nested_tool` is the producer.
     nested: Arc<NestedToolCallRunner>,
+    /// The session's run-abort latch (pi `_agentRunAbortRequested`), read when this subscriber
+    /// settles an UNBOUND session's run — see the `agent_settled` emit below.
+    run_abort_requested: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl SvcSubscriber {
@@ -146,6 +149,7 @@ impl SvcSubscriber {
         ext_host: Arc<ExtensionHost>,
         session_cancel: CancelToken,
         nested: Arc<NestedToolCallRunner>,
+        run_abort_requested: Arc<std::sync::atomic::AtomicBool>,
     ) -> Self {
         Self {
             fanout,
@@ -154,6 +158,7 @@ impl SvcSubscriber {
             ext_host,
             session_cancel,
             nested,
+            run_abort_requested,
         }
     }
 
@@ -292,6 +297,20 @@ impl EventSubscriber for SvcSubscriber {
             }
         }
 
+        // 1b. EXT-078 — pi `_emitExtensionEvent`'s `agent_start` / `turn_end` arms
+        //     (`agent-session.ts:1285-1301` @v1.1.0), ahead of the listeners: the turn index, and
+        //     the `turn_end` boundary of a turn whose `finishTurn` did not dispatch it.
+        if let Some(s) = &session {
+            match event {
+                AgentEvent::AgentStart => s.on_agent_start_event(),
+                AgentEvent::TurnEnd {
+                    message,
+                    tool_results,
+                } => s.on_turn_end_event(message, tool_results).await,
+                _ => {}
+            }
+        }
+
         // 2. Fan the event out to live subscriptions (awaited, in order). `agent_end` carries the
         //    live `willRetry` decision when bound (Pi :541); unbound emits `false`.
         let is_end = matches!(event, AgentEvent::AgentEnd { .. });
@@ -334,12 +353,19 @@ impl EventSubscriber for SvcSubscriber {
         //    the model was still streaming. Ordered before `end_run` so a run-scoped subscriber sees
         //    it, and — like the bound path — extensions are notified before subscribers.
         if is_end && session.is_none() {
+            // pi v1.1.0 `const aborted = this._agentRunAbortRequested;` — the same latch the bound
+            // path reads, which `AgentSession::abort` sets on an unbound session too.
+            let aborted = self
+                .run_abort_requested
+                .load(std::sync::atomic::Ordering::SeqCst);
             let cancel = self.session_cancel.child_token();
             self.ext_host
                 .dispatcher()
-                .dispatch_notify(&cyrup_ext::HostEvent::AgentSettled, &cancel)
+                .dispatch_notify(&cyrup_ext::HostEvent::AgentSettled { aborted }, &cancel)
                 .await;
-            self.fanout.emit(AgentSessionEvent::AgentSettled).await;
+            self.fanout
+                .emit(AgentSessionEvent::AgentSettled { aborted })
+                .await;
             self.fanout.end_run();
         }
     }

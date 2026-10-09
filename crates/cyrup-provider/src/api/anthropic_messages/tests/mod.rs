@@ -155,11 +155,13 @@ fn tc_assistant(calls: &[(&str, &str)]) -> Message {
         raw_stop_reason: None,
         end_turn: None,
         timestamp: 2,
+        duration_ms: None,
     })
 }
 
 fn tr(id: &str, content: Vec<Content>, added: &[&str]) -> Message {
     Message::ToolResult {
+        duration_ms: None,
         tool_call_id: ToolCallId::from(id),
         tool_name: "base_tool".to_string(),
         content,

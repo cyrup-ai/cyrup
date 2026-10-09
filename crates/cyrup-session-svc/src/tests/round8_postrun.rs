@@ -178,11 +178,32 @@ async fn assembled_run_triggers_post_run_overflow_compaction() {
     let fx = fixture();
     let faux = Arc::new(FauxProvider::new());
     let provider: Arc<dyn Provider> = faux.clone();
+    let mut compaction = cyrup_config::Settings::new();
+    compaction
+        .set_field(
+            "compaction",
+            serde_json::json!({"enabled": true, "keepRecentTokens": 0, "reserveTokens": 0}),
+        )
+        .expect("settings");
     let session = SessionBuilder::new(provider, base_config(&fx))
+        .cli_settings(compaction)
         .build()
         .await
         .expect("build")
         .into_shared();
+
+    // A first, ordinary turn, so the branch HAS something to compact: pi prepares the compaction
+    // before it starts one, and a branch with nothing to compact starts nothing
+    // (`_runAutoCompaction`, `core/agent-session.ts:3110-3119` @v1.1.0, SESS-050).
+    faux.set_responses(vec![faux_assistant_message(
+        vec![faux_text("an earlier answer")],
+        StopReason::Stop,
+    )]);
+    let _ = session
+        .prompt(UserInput::text("warm up", InputSource::Sdk))
+        .await
+        .expect("prompt accepted");
+    session.wait_for_idle().await;
 
     // The overflow error must be attributed to the SAME model the session runs (Pi `_checkCompaction`
     // same-model guard), so build it from the live model address.

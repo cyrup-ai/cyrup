@@ -211,7 +211,10 @@ pub use contract::{
     EventPatch, HandledValue, HookOutcome, Reduced, TerminalInputDecision, TerminalInputResult,
     TerminalKey, TerminalKeyEvent, TerminalKeyModifiers, decode_terminal_key, encode_terminal_key,
 };
-pub use dispatch::{Dispatcher, ErrorListener, ExtensionError};
+pub use dispatch::{
+    BoundaryDispatch, BoundaryPreview, Dispatcher, ErrorListener, ExtensionError,
+    SystemPromptRenderer, render_system_prompt_options,
+};
 
 /// Notified after a command registration lands from a LIVE handler (HA-1's command leg). Takes no
 /// argument: the consumer rebuilds from `slash_command_catalog()`, which is already live, so the
@@ -219,7 +222,9 @@ pub use dispatch::{Dispatcher, ErrorListener, ExtensionError};
 pub type CommandsListener = std::sync::Arc<dyn Fn() + Send + Sync>;
 pub use build::build_component;
 pub use error::ExtError;
-pub use event::{EventKind, HostEvent, InputEventSource, InputStreamingBehavior, Subscriptions};
+pub use event::{
+    BoundaryState, EventKind, HostEvent, InputEventSource, InputStreamingBehavior, Subscriptions,
+};
 pub use extension::{ExtKind, Extension};
 pub use facade::{
     BeforeAgentStartReduction, CompactionReduction, ExtensionFlagOverride, ExtensionHost,

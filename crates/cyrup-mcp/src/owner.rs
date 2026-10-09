@@ -1501,6 +1501,7 @@ mod tests {
     #[test]
     fn the_rows_carry_the_wire_role_spellings() {
         let tool_result = Message::ToolResult {
+            duration_ms: None,
             tool_call_id: cyrup_core::ToolCallId::from("call-1"),
             tool_name: "search".to_string(),
             content: vec![Content::Text {

@@ -7,6 +7,7 @@ mod finalized;
 mod preflight;
 pub(crate) mod single;
 
+use finalize::Executed;
 use finalized::Finalized;
 
 use super::{RunCtx, RunFailure};
@@ -14,8 +15,7 @@ use crate::event::{AgentEvent, AgentMessage, ToolResultMessage};
 use crate::hooks::{AgentContextView, Hooks};
 use crate::queue::ToolExecution;
 use cyrup_core::{
-    AssistantMessage, CancelToken, ExecMode, TerminateHint, Tool, ToolCall, ToolCallId, ToolError,
-    ToolResult, ToolUpdate,
+    AssistantMessage, CancelToken, ExecMode, TerminateHint, Tool, ToolCall, ToolCallId, ToolUpdate,
 };
 use serde_json::Value;
 use std::sync::Arc;
@@ -126,7 +126,7 @@ enum ToolRuntimeMsg {
         /// and `Aborted` arms, so an unboxed outcome makes every message on this channel —
         /// including each of a tool's streamed updates — pay for the largest one. AGENT-045 grew
         /// `ToolResult` by its `structured_content`, which is what tipped the balance.
-        outcome: Box<Result<ToolResult, ToolError>>,
+        outcome: Box<Executed>,
     },
     /// A prepared call whose turn to start came after the run was aborted: it was never executed
     /// and settles as `Operation aborted` without `after_tool_call` (AGENT-042, pi v0.85.0).

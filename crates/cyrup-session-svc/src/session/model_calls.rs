@@ -55,8 +55,10 @@ impl crate::host_services::SessionModelCalls for SessionModelCallsHandle {
         let session = self.0.clone();
         // pi's `lazyStream`: the work happens when the stream is first polled, and every failure is
         // a terminal event. The session is upgraded only for the setup and released before the
-        // provider streams, so an open stream never keeps an ended session alive.
-        Box::pin(
+        // provider streams, so an open stream never keeps an ended session alive. Timed from the
+        // call, as pi's `lazyStream` outer stream is: a failure before the provider is reached still
+        // gets `durationMs`, and a provider that times its own response wins.
+        cyrup_provider::timing::timed(Box::pin(
             futures::stream::once(async move {
                 match session.upgrade() {
                     Some(session) => session.extension_model_stream(call).await,
@@ -64,7 +66,7 @@ impl crate::host_services::SessionModelCalls for SessionModelCallsHandle {
                 }
             })
             .flatten(),
-        )
+        ))
     }
 }
 

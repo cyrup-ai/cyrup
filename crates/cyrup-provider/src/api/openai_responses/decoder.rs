@@ -11,7 +11,6 @@ use crate::error::ProviderError;
 use crate::model::Model;
 use crate::stream::StreamEvent;
 use crate::stream::sse::SseFrame;
-use crate::utils::provider_plumbing::now_millis;
 use cyrup_core::{ApiId, AssistantMessage, StopReason, Usage};
 use futures::{Stream, StreamExt};
 use serde_json::Value;
@@ -25,6 +24,11 @@ use std::sync::{Arc, OnceLock};
 pub(crate) type EndTurnCell = Arc<OnceLock<bool>>;
 
 pub(super) struct RDecoder {
+    /// Wall-clock start of this response — the `timestamp` of every message it produces (pi seeds
+    /// `output.timestamp = Date.now()` once, before the request, and the v1.1.0 type documents it
+    /// as *"when the request started"*). Set from [`crate::api::EventSink::started_at`] by the
+    /// driver; `0` only in a decoder a unit test built by hand.
+    pub(super) started_at: i64,
     pub(super) blocks: Vec<RBlock>,
     /// Memoised projection of `blocks` (PERF-001). Write to `blocks` ONLY through
     /// [`Self::push_block`] and [`Self::block_mut`], or this goes stale.
@@ -52,6 +56,7 @@ pub(super) struct RDecoder {
 impl Default for RDecoder {
     fn default() -> Self {
         Self {
+            started_at: 0,
             blocks: Vec::new(),
             cache: ContentCache::default(),
             slots: HashMap::new(),
@@ -120,7 +125,8 @@ impl RDecoder {
             error_message: self.error_message.clone(),
             raw_stop_reason: self.raw_stop_reason.clone(),
             end_turn: self.end_turn.as_ref().and_then(|cell| cell.get().copied()),
-            timestamp: now_millis(),
+            timestamp: self.started_at,
+            duration_ms: None,
         }
     }
 
@@ -178,6 +184,7 @@ pub(crate) async fn decode_stream_with_end_turn<S>(
     let model_id = model.id.as_str().to_string();
 
     let mut dec = RDecoder {
+        started_at: sink.started_at(),
         end_turn,
         ..RDecoder::default()
     };

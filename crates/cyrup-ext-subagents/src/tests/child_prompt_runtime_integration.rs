@@ -390,6 +390,7 @@ fn bash_tool_result() -> AgentMessage {
 
 fn tool_result_named(tool_name: &str, id: &str) -> AgentMessage {
     AgentMessage::ToolResult(cyrup_agent::ToolResultMessage {
+        duration_ms: None,
         tool_call_id: ToolCallId::from(id),
         tool_name: tool_name.to_string(),
         content: vec![Content::text("ok")],

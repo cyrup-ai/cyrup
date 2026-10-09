@@ -62,7 +62,7 @@ impl<B: Backend> App<B> {
             // async event-loop arm (`run`, the `events.next()` branch) rather than in this sync
             // fold, which cannot `await` or return control to the caller — so this arm is a
             // deliberate no-op, NOT a missing case.
-            AgentSessionEvent::AgentSettled => {}
+            AgentSessionEvent::AgentSettled { .. } => {}
             // Pi `case "turn_start"` (`interactive-mode.ts:3302-3314` @v0.87.1): raise terminal
             // progress on EVERY turn, not once per run, so a threshold compaction between a tool
             // result and the next request — whose `compaction_end` clears it — does not leave the
@@ -257,6 +257,7 @@ impl<B: Backend> App<B> {
                 }
             }
             AgentSessionEvent::ToolExecutionEnd {
+                duration_ms,
                 tool_call_id,
                 tool_name,
                 is_error,
@@ -271,6 +272,7 @@ impl<B: Backend> App<B> {
                     is_error,
                     Some(result),
                     rendered.clone().into_text(),
+                    duration_ms,
                 );
                 // The final result's component replaces the last partial's; a final render that
                 // draws no component clears it so the partial's list does not outlive the result.

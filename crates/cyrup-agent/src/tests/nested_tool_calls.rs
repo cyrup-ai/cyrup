@@ -97,6 +97,7 @@ impl NestedToolCallHost for TestHost {
             .find(|candidate| candidate.name() == call.name);
         let Some(tool) = tool else {
             return ToolCallOutcome {
+                duration_ms: None,
                 result: ToolResult {
                     content: vec![Content::text(format!("Tool {} not found", call.name))],
                     details: Some(json!({})),
@@ -116,11 +117,13 @@ impl NestedToolCallHost for TestHost {
             .await;
         match result {
             Ok(result) => ToolCallOutcome {
+                duration_ms: None,
                 is_error: result.is_error,
                 result,
                 tool_call: call,
             },
             Err(e) => ToolCallOutcome {
+                duration_ms: None,
                 result: ToolResult {
                     content: vec![Content::text(e.message)],
                     ..ToolResult::default()
@@ -718,6 +721,7 @@ fn nested_events_carry_the_parent_id_and_loop_events_do_not() {
         r#"{"type":"tool_execution_start","toolCallId":"call/1","toolName":"read","args":{"path":"a"},"parentToolCallId":"call"}"#
     );
     let end = NestedToolExecutionEvent::ToolExecutionEnd {
+        duration_ms: None,
         tool_call_id: id("call/1"),
         tool_name: "read".into(),
         result: json!({ "content": [] }),
@@ -742,6 +746,7 @@ fn nested_events_carry_the_parent_id_and_loop_events_do_not() {
             partial_result: json!({}),
         },
         AgentEvent::ToolExecutionEnd {
+            duration_ms: None,
             tool_call_id: id("c"),
             tool_name: "read".into(),
             result: json!({}),

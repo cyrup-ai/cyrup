@@ -38,6 +38,7 @@ cyrup-config = { workspace = true }
 # (`session/codemode.rs`) and `SessionBuilder::with_codemode` binds it.
 cyrup-codemode-runtime = { workspace = true }
 cyrup-resources = { workspace = true }
+indexmap = { workspace = true }
 # `src/host_services.rs:17-19` opens with `cyrup_ext::caps::http::HttpCaps`,
 # `cyrup_ext::caps::proc::ProcCaps` and `cyrup_ext::host::{...}` — all three modules exist only under
 # `wasm-host` (`cyrup-ext/src/lib.rs:147-152`) — and `src/lib.rs:30` declares `mod host_services;`

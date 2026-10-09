@@ -91,6 +91,7 @@ fn a_settled_bash_call_renders_took_not_elapsed() {
         false,
         Some(json!({ "content": [{ "type": "text", "text": "hi" }] })),
         None,
+        None,
     );
     app.draw().unwrap();
 
@@ -162,6 +163,7 @@ fn the_elapsed_tick_is_armed_only_while_a_bash_call_runs() {
         Some("call-1"),
         false,
         Some(json!({ "content": [] })),
+        None,
         None,
     );
     assert!(

@@ -113,9 +113,11 @@ fn ctx_with_tool_call_ids(ids: &[&str]) -> Context {
         raw_stop_reason: None,
         end_turn: None,
         timestamp: 0,
+        duration_ms: None,
     })];
     for id in ids {
         messages.push(Message::ToolResult {
+            duration_ms: None,
             tool_call_id: ToolCallId::from(*id),
             tool_name: "read".into(),
             content: vec![Content::text("ok")],

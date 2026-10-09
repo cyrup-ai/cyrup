@@ -55,6 +55,7 @@ pub(super) async fn run_inner(
     let bedrock = BedrockOptions::from_stream_options(opts);
     let env = EnvSource::new(opts.env.as_ref().or(auth.env.as_ref()));
     let mut dec = Decoder::default();
+    dec.started_at = sink.started_at();
 
     let config = resolve_client_config(model, opts, &bedrock, auth, &env);
 

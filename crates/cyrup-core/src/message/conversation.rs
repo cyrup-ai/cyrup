@@ -61,6 +61,13 @@ pub enum Message {
         #[serde(skip_serializing_if = "Vec::is_empty", default)]
         added_tool_names: Vec<String>,
         timestamp: i64,
+        /// Milliseconds the tool's `execute()` took, measured with a monotonic clock (pi
+        /// `ToolResultMessage.durationMs?`, `packages/ai/src/types.ts` @v1.1.0). Absent when the tool
+        /// did not run (a blocked, unknown or invalid call) and for legacy results. Written between
+        /// `isError` and `timestamp`, where pi's `createToolResultMessage` spreads it
+        /// (`packages/agent/src/agent-loop.ts:940-942` @v1.1.0).
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        duration_ms: Option<u64>,
         /// The calls this tool made to other tools while it ran (Pi `ToolResultMessage.nestedCalls`,
         /// `ai/src/types.ts:604-605` @v1.0.1): *"Kept for the session record; not sent to the
         /// model."* Absent when the tool made none.
@@ -109,6 +116,7 @@ impl serde::Serialize for Message {
                 usage,
                 added_tool_names,
                 timestamp,
+                duration_ms,
                 nested_calls,
             } => {
                 // The key ORDER is pi's `createToolResultMessage` object literal
@@ -131,6 +139,7 @@ impl serde::Serialize for Message {
                     + usize::from(details.is_some())
                     + usize::from(usage.is_some())
                     + usize::from(!added_tool_names.is_empty())
+                    + usize::from(duration_ms.is_some())
                     + usize::from(nested_calls.is_some());
                 let mut st = serializer.serialize_struct("Message", len)?;
                 st.serialize_field("role", "toolResult")?;
@@ -151,6 +160,12 @@ impl serde::Serialize for Message {
                     st.serialize_field("addedToolNames", added_tool_names)?;
                 }
                 st.serialize_field("isError", is_error)?;
+                // pi v1.1.0 spreads `durationMs` between `isError` and `timestamp`
+                // (`agent-loop.ts:940-942`), and only when the tool ran.
+                match duration_ms {
+                    Some(d) => st.serialize_field("durationMs", d)?,
+                    None => st.skip_field("durationMs")?,
+                }
                 st.serialize_field("timestamp", timestamp)?;
                 // After `timestamp`: pi assigns `nestedCalls` onto the finished message object
                 // (see the field), so JSON.stringify writes it last.
@@ -173,6 +188,7 @@ mod tests {
     #[test]
     fn tool_result_message_uses_camelcase_fields() {
         let m = Message::ToolResult {
+            duration_ms: None,
             tool_call_id: "tc1".into(),
             tool_name: "read".into(),
             content: vec![Content::text("ok")],
@@ -196,6 +212,7 @@ mod tests {
     #[test]
     fn tool_result_usage_and_added_tool_names_round_trip_byte_identically() {
         let m = Message::ToolResult {
+            duration_ms: None,
             tool_call_id: "tc1".into(),
             tool_name: "loader".into(),
             content: vec![Content::text("ok")],
@@ -239,6 +256,32 @@ mod tests {
             first,
             "bytes round-trip"
         );
+    }
+
+    /// pi v1.1.0's tool-result line, byte for byte: `durationMs` sits between `isError` and
+    /// `timestamp`, where `createToolResultMessage` spreads it (`agent-loop.ts:940-942`, commit
+    /// 36a686ee8), and `nestedCalls` stays last (the session assigns it onto the built object). A
+    /// result without one (a call that did not run, or a legacy result) has no key at all.
+    #[test]
+    fn duration_ms_is_written_between_is_error_and_timestamp_as_pi_writes_it() {
+        let pi = concat!(
+            r#"{"role":"toolResult","toolCallId":"tc1","toolName":"bash","#,
+            r#""content":[{"type":"text","text":"ok"}],"isError":false,"durationMs":4200,"#,
+            r#""timestamp":7,"nestedCalls":{"calls":[],"complete":true}}"#
+        );
+        let m: Message = serde_json::from_str(pi).expect("pi's line parses");
+        let Message::ToolResult { duration_ms, .. } = &m else {
+            panic!("a tool result: {m:?}");
+        };
+        assert_eq!(*duration_ms, Some(4200));
+        assert_eq!(serde_json::to_string(&m).expect("serialize"), pi);
+
+        let untimed = concat!(
+            r#"{"role":"toolResult","toolCallId":"tc1","toolName":"bash","#,
+            r#""content":[],"isError":true,"timestamp":7}"#
+        );
+        let m: Message = serde_json::from_str(untimed).expect("parses");
+        assert_eq!(serde_json::to_string(&m).expect("serialize"), untimed);
     }
 
     /// BACKWARD compatibility — NEW code reading an OLD session file. The two keys are absent, so
@@ -295,6 +338,7 @@ mod tests {
         }
 
         let new_msg = Message::ToolResult {
+            duration_ms: None,
             tool_call_id: "tc1".into(),
             tool_name: "loader".into(),
             content: vec![Content::text("ok")],
@@ -387,6 +431,7 @@ mod tests {
     #[test]
     fn tool_result_without_nested_calls_writes_no_key() {
         let m = Message::ToolResult {
+            duration_ms: None,
             tool_call_id: "tc1".into(),
             tool_name: "read".into(),
             content: vec![Content::text("ok")],

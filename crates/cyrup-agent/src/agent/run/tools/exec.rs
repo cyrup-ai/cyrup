@@ -2,6 +2,7 @@
 //! while events stay in source order, and the sequential runtime that fully processes each call
 //! before starting the next.
 
+use super::finalize::Executed;
 use super::preflight::immediate_error;
 use super::{Batch, Finalized, Prep, PreparedCall, ToolRuntimeMsg};
 use crate::agent::message::update_value;
@@ -10,7 +11,7 @@ use crate::agent::util::panic_message;
 use crate::event::{AgentEvent, AgentMessage};
 use cyrup_core::{
     AssistantMessage, CancelToken, TerminateHint, Tool, ToolCall, ToolCallId, ToolError,
-    ToolResult, ToolUpdate, ToolUpdateSink,
+    ToolUpdate, ToolUpdateSink,
 };
 use futures::future::FutureExt;
 use serde_json::Value;
@@ -18,6 +19,7 @@ use std::future::{Future, poll_fn};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::Poll;
+use std::time::Instant;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio::task::JoinSet;
@@ -52,7 +54,7 @@ pub(crate) async fn execute_prepared(
     args: Value,
     cancel: CancelToken,
     mut on_update: ToolUpdateSink,
-) -> Result<ToolResult, ToolError> {
+) -> Executed {
     let accepting = Arc::new(AtomicBool::new(true));
     let gate = accepting.clone();
     let gated: ToolUpdateSink = Box::new(move |u: ToolUpdate| {
@@ -60,6 +62,10 @@ pub(crate) async fn execute_prepared(
             on_update(u);
         }
     });
+    // pi v1.1.0 `const startedAt = performance.now()` around `prepared.tool.execute(...)` and
+    // `elapsed()` the moment it settles, before the pending updates are awaited (`:828-846`):
+    // monotonic, rounded, the same on the success and the throw path.
+    let started = Instant::now();
     let outcome = match std::panic::AssertUnwindSafe(tool.execute(call_id, args, cancel, gated))
         .catch_unwind()
         .await
@@ -67,10 +73,20 @@ pub(crate) async fn execute_prepared(
         Ok(r) => r,
         Err(payload) => Err(ToolError::new(panic_message(payload.as_ref()))),
     };
+    let duration_ms = elapsed_ms(started);
     // pi's `finally { acceptingUpdates = false; }` (`:848-850`) — closed on the success and the
     // throw path alike, BEFORE the caller observes the outcome.
     accepting.store(false, Ordering::Release);
-    outcome
+    Executed::new(outcome, duration_ms)
+}
+
+/// Milliseconds since `started`, rounded as pi rounds them (`Math.round(performance.now() - …)`).
+fn elapsed_ms(started: Instant) -> u64 {
+    let ms = (started.elapsed().as_secs_f64() * 1000.0).round();
+    // `as` saturates a float into the integer range.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let ms = ms.max(0.0) as u64;
+    ms
 }
 
 impl RunCtx {

@@ -29,6 +29,7 @@ where
     let model_id = model.id.as_str().to_string();
 
     let mut dec = Decoder::default();
+    dec.started_at = sink.started_at();
 
     if !sink
         .send(StreamEvent::Start {

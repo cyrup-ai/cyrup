@@ -236,12 +236,12 @@ pub enum KnownEntry {
     /// (`agent-session.ts:1015-1031` @v0.87.1) appends `appendContextEdit(targetId, null)` for an
     /// abandoned assistant attempt and for each of its tool results.
     ///
-    /// CYRUP-DELTA: cyrup never WRITES one — there is no `append_context_edit` counterpart to Pi
-    /// `appendContextEdit` (`session-manager.ts:1358-1395` @v0.87.1); that follows with EXT-078.
-    /// Reading and projecting them is what this variant is for, so a pi-written session no longer
-    /// degrades the edit to [`Entry::Unknown`] and silently projects the target UNEDITED. Because
-    /// cyrup only reads, the string→text-block normalisation Pi performs at WRITE time is done
-    /// defensively in the projection instead. See `session-manager.ts:174-180, 519-566 @v0.87.1`.
+    /// Written by `SessionManager::append_context_edit` (pi `appendContextEdit`,
+    /// `session-manager.ts:1360-1395` @v1.1.0), which a `turn_end` / `agent_before_settle`
+    /// extension reaches through a `context_edit` boundary draft (EXT-078); it normalizes a string
+    /// replacement of an assistant or tool result to a text block as pi does. The projection
+    /// normalizes defensively as well, for a file another writer produced. See
+    /// `session-manager.ts:174-180, 519-566 @v0.87.1`.
     ContextEdit {
         #[serde(flatten)]
         base: EntryBase,

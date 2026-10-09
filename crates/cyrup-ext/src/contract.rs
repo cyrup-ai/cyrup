@@ -80,9 +80,25 @@ pub enum EventPatch {
     /// `Vec` because pi accumulates every handler's `message` (`emitBeforeAgentStart`,
     /// `core/extensions/runner.ts:1330-1360` @v0.87.1), and one guest that registered several
     /// handlers folds all of their messages into ONE outcome (the SDK's per-event fold).
+    ///
+    /// `options` is the handler's edited `systemPromptOptions` (EXT-084, pi
+    /// `NormalizedBuildSystemPromptOptions`, `core/system-prompt.ts:9-49` @v1.1.0): pi hands every
+    /// handler ONE mutable options object, so an edit a handler makes is what the next handler
+    /// sees and what the run's prompt is built from. `None` leaves the options as they were. A
+    /// `system` replacement is recorded in the options as `forceSystemPrompt`, as pi records it
+    /// (`core/extensions/runner.ts:1456-1458`).
     SystemPromptAndInject {
         system: Option<String>,
         inject: Vec<Message>,
+        options: Option<Value>,
+    },
+    /// `turn_end` / `agent_before_settle` (pi `BoundaryResult { entries?, continue? }`,
+    /// `core/extensions/types.ts:994-997` @v1.1.0; EXT-078): `entries` REPLACES the drafts the chain
+    /// has so far (pi `if (handlerResult?.entries !== undefined) entries = handlerResult.entries`),
+    /// and `continue` replaces the continuation request; `None` leaves either as it was.
+    Boundary {
+        entries: Option<Value>,
+        continue_: Option<bool>,
     },
     /// `input` (Pi `action:"transform"`, runner.ts:1116-1119): rewrite the submission text and
     /// (optionally) its images. `images: None` keeps the current images (Pi `result.images ??
@@ -180,15 +196,42 @@ impl HostEvent {
             (
                 HostEvent::BeforeAgentStart {
                     system_prompt,
+                    options,
                     injected,
                     ..
                 },
-                EventPatch::SystemPromptAndInject { system, inject },
+                EventPatch::SystemPromptAndInject {
+                    system,
+                    inject,
+                    options: edited,
+                },
             ) => {
+                // The edited options replace the running ones; a non-object is not an options
+                // object and is ignored (pi's handler edits the object in place, so it has no way
+                // to hand back anything else).
+                if let Some(edited) = edited.filter(Value::is_object) {
+                    *options = edited;
+                }
                 if let Some(s) = system {
+                    // pi `currentOptions.forceSystemPrompt = result.systemPrompt`
+                    // (`runner.ts:1456-1458` @v1.1.0).
+                    if let Some(object) = options.as_object_mut() {
+                        object.insert("forceSystemPrompt".into(), Value::String(s.clone()));
+                    }
                     *system_prompt = s;
                 }
                 injected.extend(inject);
+            }
+            (
+                HostEvent::TurnEnd { boundary, .. } | HostEvent::AgentBeforeSettle { boundary },
+                EventPatch::Boundary { entries, continue_ },
+            ) => {
+                if let Some(entries) = entries {
+                    boundary.entries = entries;
+                }
+                if let Some(c) = continue_ {
+                    boundary.continue_ = c;
+                }
             }
             // `input` (Pi runner.ts:1116-1119): always rewrite the text; replace images only when
             // the handler supplied them (`Some`), else keep the folded-so-far images.

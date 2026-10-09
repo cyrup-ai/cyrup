@@ -51,8 +51,10 @@ fn kimi_deferred_tools_move_from_the_tools_array_into_an_inline_system_message()
                 raw_stop_reason: None,
                 end_turn: None,
                 timestamp: 0,
+                duration_ms: None,
             }),
             Message::ToolResult {
+                duration_ms: None,
                 tool_call_id: ToolCallId::from("c1"),
                 tool_name: "early".into(),
                 content: vec![Content::text("ok")],

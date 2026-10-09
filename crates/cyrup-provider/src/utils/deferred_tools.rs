@@ -198,11 +198,13 @@ mod tests {
             raw_stop_reason: None,
             end_turn: None,
             timestamp: 2,
+            duration_ms: None,
         })
     }
 
     fn tool_result(added: &[&str]) -> Message {
         Message::ToolResult {
+            duration_ms: None,
             tool_call_id: ToolCallId::from("call_1"),
             tool_name: "base_tool".to_string(),
             content: vec![Content::text("done")],

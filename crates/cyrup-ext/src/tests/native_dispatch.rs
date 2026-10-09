@@ -66,6 +66,7 @@ fn tool_call_msg(
         raw_stop_reason: None,
         end_turn: None,
         timestamp: 0,
+        duration_ms: None,
     };
     (msg, tc)
 }
@@ -127,6 +128,7 @@ async fn a08_1_event_fires_with_payload_notify() {
         .await;
     sub.on_event(
         &AgentEvent::ToolExecutionEnd {
+            duration_ms: None,
             tool_call_id: "tc1".into(),
             tool_name: "bash".into(),
             result: json!({"ok": true}),

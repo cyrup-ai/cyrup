@@ -199,6 +199,7 @@ async fn a_registered_tool_renderer_draws_the_tool_row() {
     );
 
     let end = AgentSessionEvent::ToolExecutionEnd {
+        duration_ms: None,
         tool_call_id: ToolCallId::from("call-1"),
         tool_name: "bash".into(),
         is_error: false,
@@ -432,6 +433,7 @@ async fn a_widget_tree_draws_on_the_tool_surface_too() {
     assert!(!live.contains("\"widget\""), "not as JSON:\n{live}");
 
     let end = AgentSessionEvent::ToolExecutionEnd {
+        duration_ms: None,
         tool_call_id: ToolCallId::from("call-w"),
         tool_name: "bash".into(),
         is_error: false,
@@ -800,6 +802,7 @@ fn replay_tool_call(id: &str, name: &str, args: Value) -> cyrup_core::Content {
 /// The persisted `toolResult` message the walk matches back to its call by `toolCallId`.
 fn replay_tool_result(id: &str, name: &str, body: &str) -> SessionMessage {
     SessionMessage::Core(cyrup_core::Message::ToolResult {
+        duration_ms: None,
         tool_call_id: ToolCallId::from(id),
         tool_name: name.to_string(),
         content: vec![cyrup_core::Content::Text {

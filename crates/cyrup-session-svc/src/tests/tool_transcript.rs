@@ -215,6 +215,8 @@ pub(super) type Requests = Arc<Mutex<Vec<Seen>>>;
 pub(super) enum Reply {
     Call(&'static str),
     Text(&'static str),
+    /// A response that ends in a (non-retryable) error.
+    Fail(&'static str),
 }
 
 pub(super) fn script(requests: &Requests, replies: Vec<Reply>) -> Arc<FauxProvider> {
@@ -238,6 +240,11 @@ pub(super) fn script(requests: &Requests, replies: Vec<Reply>) -> Arc<FauxProvid
                     Reply::Text(t) => {
                         faux_assistant_message(vec![faux_text(t.to_string())], StopReason::Stop)
                     }
+                    Reply::Fail(e) => {
+                        let mut failed = faux_assistant_message(Vec::new(), StopReason::Error);
+                        failed.error_message = Some(e.to_string());
+                        failed
+                    }
                 }
             })
         })
@@ -249,6 +256,11 @@ pub(super) fn script(requests: &Requests, replies: Vec<Reply>) -> Arc<FauxProvid
 
 /// The tools of the `tool_search` scenario: the loader, one tool that is active from the start,
 /// and `late`, registered `deferred` so that only the loader activates it.
+/// One direct probe tool, for a scenario that only needs a tool to call.
+pub(super) fn scenario_probe(name: &str) -> Arc<dyn Tool> {
+    Probe::new(name, ToolExposure::Direct).arc()
+}
+
 pub(super) fn scenario_tools(slot: &SessionSlot) -> Vec<Arc<dyn Tool>> {
     vec![
         Arc::new(Loader {

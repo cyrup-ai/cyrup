@@ -71,7 +71,7 @@
 //! undocumented public item in these private submodules exactly as it would in `api.rs`.
 #![allow(clippy::needless_return)]
 
-mod base;
+pub(crate) mod base;
 mod bash_call;
 mod command;
 mod exec;

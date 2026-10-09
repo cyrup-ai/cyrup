@@ -51,7 +51,7 @@ pub use listing::{
     SessionInfo, SessionListProgress, SessionListing, SessionSelector, list, list_all,
     list_all_in_dir, list_all_with_progress, list_in_dir, newest_session, resolve,
 };
-pub use manager::{NewSessionOpts, SessionManager, TreeNode};
+pub use manager::{NewSessionOpts, SessionBoundaryDraft, SessionManager, TreeNode};
 pub use prompt::{
     BeforeAgentStartHook, BeforeAgentStartInput, BeforeAgentStartOutput, ContextDiagnostic,
     ContextError, ContextFile, ContextFileLoader, ContextScope, ContextSnapshot, ContextStore,

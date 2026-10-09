@@ -51,6 +51,7 @@ mod late_tools;
 mod model_registry;
 mod wasm_active_tools;
 mod wasm_compaction_override;
+mod wasm_event_batch;
 mod wasm_exec;
 mod wasm_http;
 mod wasm_model_calls;

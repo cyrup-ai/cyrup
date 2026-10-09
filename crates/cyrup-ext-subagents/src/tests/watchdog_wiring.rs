@@ -59,6 +59,9 @@ fn turn_end(text: &str) -> HostEvent {
             timestamp: Some(0),
         },
         tool_results: Vec::new(),
+        message_entry_id: String::new(),
+        tool_result_entry_ids: Vec::new(),
+        boundary: cyrup_ext::BoundaryState::default(),
     }
 }
 
@@ -702,11 +705,15 @@ fn assistant_turn_end(text: &str, tool_results: Vec<cyrup_agent::ToolResultMessa
         turn_index: 1,
         message: cyrup_agent::AgentMessage::Assistant(std::sync::Arc::new(message)),
         tool_results,
+        message_entry_id: String::new(),
+        tool_result_entry_ids: Vec::new(),
+        boundary: cyrup_ext::BoundaryState::default(),
     }
 }
 
 fn tool_result(name: &str, text: &str, is_error: bool) -> cyrup_agent::ToolResultMessage {
     cyrup_agent::ToolResultMessage {
+        duration_ms: None,
         tool_call_id: cyrup_core::ToolCallId::from("call-1"),
         tool_name: name.to_string(),
         content: vec![cyrup_core::Content::Text {

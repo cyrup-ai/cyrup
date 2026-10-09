@@ -22,6 +22,7 @@ fn assistant_text_replay_carries_message_item() {
         raw_stop_reason: None,
         end_turn: None,
         timestamp: 0,
+        duration_ms: None,
     };
     ctx.messages.push(Message::Assistant(am));
     let body = build_params(&model(), &ctx, &StreamOptions::default(), None);
@@ -71,6 +72,7 @@ fn namespaced_call_context() -> Context {
         raw_stop_reason: None,
         end_turn: None,
         timestamp: 0,
+        duration_ms: None,
     }));
     ctx
 }

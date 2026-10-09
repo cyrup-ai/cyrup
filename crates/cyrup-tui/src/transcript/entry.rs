@@ -408,8 +408,16 @@ pub struct ToolRun {
     /// bash `Took …` duration line (`formatDuration`, renderers/bash.ts:32-42 @v0.87.1).
     pub(super) started_at: Option<std::time::Instant>,
     /// Frozen run duration in milliseconds, set on [`TranscriptView::push_tool_end`]. Rendered as the
-    /// bash `Took …` footer once the command finishes.
+    /// bash `Took …` footer once the command finishes, when the result carries no
+    /// [`Self::recorded_ms`].
     pub(super) duration_ms: Option<u64>,
+    /// The result's RECORDED duration — how long the tool's `execute()` took, measured by the agent
+    /// loop with a monotonic clock and stored on the tool-result message (pi `durationMs`, commit
+    /// 36a686ee8 @v1.1.0). It wins over the TUI's own clock for a final result, and it is what a
+    /// replayed run shows: pi's bash renderer *"A final result's recorded duration wins: it is
+    /// monotonic and survives reloads"* (`core/tools/renderers/bash.ts:102-106` @v1.1.0). `None`
+    /// while running, for a tool that did not run, and for results stored before durations were.
+    pub(super) recorded_ms: Option<u64>,
     /// The CALL text an extension's registered renderer produced for this tool (EXT-006; Pi
     /// `ToolDefinition.renderCall`, extensions/types.ts:491 @v0.84.4, preferred over the built-in by
     /// `tool-execution.ts:81-112`). `None` = no extension renders this tool, so the built-in

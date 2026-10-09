@@ -118,6 +118,7 @@ fn assistant(model: &Model, provider: &str, level: Option<&str>) -> Message {
         error_message: None,
         raw_stop_reason: None,
         timestamp: 1,
+        duration_ms: None,
     })
 }
 

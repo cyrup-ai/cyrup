@@ -3,7 +3,6 @@
 use super::blocks::{Decoder, project_block};
 use crate::model::Model;
 use crate::usage::apply_cost;
-use crate::utils::provider_plumbing::now_millis;
 use cyrup_core::{ApiId, AssistantMessage, StopReason, Usage};
 use serde_json::{Map, Value};
 
@@ -36,7 +35,8 @@ pub(super) fn build_final_message(dec: Decoder, model: &Model, api: &ApiId) -> A
         error_message: dec.error_message,
         raw_stop_reason: dec.raw_stop_reason,
         end_turn: None,
-        timestamp: now_millis(),
+        timestamp: dec.started_at,
+        duration_ms: None,
     }
 }
 

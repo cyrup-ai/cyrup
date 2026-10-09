@@ -75,7 +75,7 @@ impl NativeExtension for SettleObserver {
     }
 
     async fn on_event(&self, ev: &HostEvent, _ctx: &HostCtx) -> HookOutcome {
-        if !matches!(ev, HostEvent::AgentSettled) {
+        if !matches!(ev, HostEvent::AgentSettled { .. }) {
             return HookOutcome::Noop;
         }
         self.settles.fetch_add(1, Ordering::SeqCst);

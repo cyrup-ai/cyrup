@@ -258,6 +258,7 @@ async fn routed_session() -> (TempDir, Arc<AgentSession>) {
             raw_stop_reason: None,
             end_turn: None,
             timestamp: 0,
+            duration_ms: None,
         },
     ))
     .unwrap();

@@ -56,7 +56,7 @@ impl NativeExtension for SettleCounter {
 
     async fn on_event(&self, ev: &HostEvent, _ctx: &HostCtx) -> HookOutcome {
         match ev {
-            HostEvent::AgentSettled => {
+            HostEvent::AgentSettled { .. } => {
                 self.settled.fetch_add(1, Ordering::SeqCst);
             }
             HostEvent::AgentEnd { .. } => {
@@ -290,10 +290,13 @@ async fn an_unbound_session_settles_too() {
     );
 }
 
-/// The wire shape a front-end / RPC client sees (Pi `{ "type": "agent_settled" }`,
-/// agent-session.ts:146).
+/// The wire shape a front-end / RPC client sees: pi v1.1.0's `{ type: "agent_settled"; aborted:
+/// boolean }` (`core/agent-session.ts:203`; `aborted` was added in commit 503c60552).
 #[test]
 fn agent_settled_serializes_with_pis_wire_tag() {
-    let wire = serde_json::to_value(AgentSessionEvent::AgentSettled).unwrap();
-    assert_eq!(wire, serde_json::json!({ "type": "agent_settled" }));
+    let wire = serde_json::to_value(AgentSessionEvent::AgentSettled { aborted: false }).unwrap();
+    assert_eq!(
+        wire,
+        serde_json::json!({ "type": "agent_settled", "aborted": false })
+    );
 }

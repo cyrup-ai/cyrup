@@ -71,6 +71,7 @@ fn assistant(s: &str) -> Message {
         raw_stop_reason: None,
         end_turn: None,
         timestamp: 0,
+        duration_ms: None,
     })
 }
 
@@ -103,11 +104,13 @@ fn assistant_tool(name: &str, path: &str) -> Message {
         raw_stop_reason: None,
         end_turn: None,
         timestamp: 0,
+        duration_ms: None,
     })
 }
 
 fn tool_result(name: &str, path: &str, body: &str) -> Message {
     Message::ToolResult {
+        duration_ms: None,
         tool_call_id: ToolCallId::from(format!("tc-{name}-{path}")),
         tool_name: name.to_string(),
         content: vec![Content::text(body)],

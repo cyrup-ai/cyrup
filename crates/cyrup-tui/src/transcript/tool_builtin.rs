@@ -377,7 +377,21 @@ pub(super) fn render_bash_result(
         // Before this, cyrup keyed the line on `duration_ms`, which is written only on settle
         // (`push_tool_end_rendered`), so a long-running command rendered NO duration at all — the
         // one number that tells a user a 10-minute build is still alive.
-        if let Some(started) = run.started_at {
+        //
+        // pi v1.1.0 put a rule ahead of that one (`bash.ts:102-106`, commit 36a686ee8): *"A final
+        // result's recorded duration wins: it is monotonic and survives reloads. The renderer's own
+        // clock is the fallback for live progress and for results stored without one."* So a
+        // settled run with a recorded `durationMs` shows it whether or not this TUI saw the start
+        // — which is what puts `Took …` back on a replayed transcript.
+        if run.done
+            && let Some(ms) = run.recorded_ms
+        {
+            out.push(Line::default());
+            out.push(Line::styled(
+                format!("Took {}", format_duration(ms)),
+                theme.muted_style(),
+            ));
+        } else if let Some(started) = run.started_at {
             let (label, ms) = match run.duration_ms {
                 Some(ms) => ("Took", ms),
                 None => ("Elapsed", started.elapsed().as_millis() as u64),

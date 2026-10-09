@@ -45,6 +45,7 @@ pub fn assistant_msg(text: impl Into<SharedStr>) -> Message {
         raw_stop_reason: None,
         end_turn: None,
         timestamp: 0,
+        duration_ms: None,
     })
 }
 
@@ -73,5 +74,6 @@ pub fn create_assistant_message(text: impl Into<SharedStr>) -> AgentMessage {
         raw_stop_reason: None,
         end_turn: None,
         timestamp: 0,
+        duration_ms: None,
     }))
 }

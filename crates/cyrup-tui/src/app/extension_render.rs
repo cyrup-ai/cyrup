@@ -103,13 +103,14 @@ pub async fn extension_render(
             tool_name,
             result,
             is_error,
+            duration_ms,
             ..
         } => {
             return extension_render_tool_result(
                 ext_host,
                 tool_name,
                 result,
-                &opts.clone().errored(*is_error),
+                &opts.clone().errored(*is_error).recorded(*duration_ms),
             )
             .await;
         }

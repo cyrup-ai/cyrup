@@ -144,6 +144,11 @@ impl AcpFailure {
             // `InvalidParams` for the same reason as the two `/tree` refusals above: the request was
             // well-formed.
             | E::VirtualModelRouting(_)
+            // EXT-084: a `before_agent_start` extension handed back prompt options pi refuses
+            // (an invalid custom section name, or options of the wrong shape). An extension
+            // fault, not the client's: the request was well-formed and no credential is involved.
+            | E::SystemPromptSection(_)
+            | E::SystemPromptOptions(_)
             | E::SessionNotSaved
             | E::Io(_)
             | E::Bash(_)

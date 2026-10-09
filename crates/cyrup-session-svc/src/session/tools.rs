@@ -56,14 +56,12 @@ impl AgentSession {
         // flight (`PolicyHooks::prepare_next_turn`) — which is pi's `_preparePromptAndToolLoadout`.
         // A `before_agent_start` handler's replacement lives in its own slot and is projected onto
         // the request, so a rebuild cannot undo it (DRIFT-033).
-        let text = prompt.text().to_owned();
         *Self::lock(&self.base_prompt) = prompt;
         // EXT-005: keep the guest-visible `ctx.getSystemPrompt()` mirror in step with the session —
         // a tool-set rebuild rewrites the prompt (Pi `_rebuildSystemPrompt`, agent-session.ts:2304)
-        // and a guest reading it back must see the rebuilt one.
-        self.services
-            .host_services
-            .update_prompt_state(Some(text), self.services.settings.project_trusted());
+        // and a guest reading it back must see the rebuilt one. Between runs that is the base; in
+        // a run it is the run's options until the turn boundary refreshes them (EXT-084).
+        self.sync_prompt_mirror();
     }
 
     /// Hand a resolved loadout to the agent, reporting the `prepare_loadout` hooks that failed while

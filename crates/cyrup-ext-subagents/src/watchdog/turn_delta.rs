@@ -613,6 +613,7 @@ mod tests {
     #[test]
     fn a_real_host_tool_result_reaches_the_delta_only_because_the_event_stamps_its_role() {
         let result = cyrup_agent::ToolResultMessage {
+            duration_ms: None,
             tool_call_id: cyrup_core::ToolCallId::from("call-1"),
             tool_name: "read".to_string(),
             content: vec![cyrup_core::Content::Text {
@@ -658,6 +659,7 @@ mod tests {
     #[test]
     fn a_failed_host_tool_result_renders_its_error_section_through_the_event_shape() {
         let result = cyrup_agent::ToolResultMessage {
+            duration_ms: None,
             tool_call_id: cyrup_core::ToolCallId::from("call-2"),
             tool_name: "bash".to_string(),
             content: vec![cyrup_core::Content::Text {

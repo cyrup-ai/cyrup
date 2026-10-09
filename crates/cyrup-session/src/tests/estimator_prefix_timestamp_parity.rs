@@ -72,6 +72,7 @@ fn assistant_with_usage(text: &str, timestamp: i64, total_tokens: u64) -> Messag
         raw_stop_reason: None,
         end_turn: None,
         timestamp,
+        duration_ms: None,
     })
 }
 

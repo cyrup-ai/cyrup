@@ -26,6 +26,49 @@ use super::AgentSession;
 use super::bash::BashCancelGuard;
 
 impl AgentSession {
+    /// End a compaction that STARTED without a result: pi's failing `compaction_end` to the session
+    /// subscribers, then `session_compact_failed` to the extensions, always together and in that
+    /// order. pi emits the pair from each of its three failure sites — the manual `compact()`
+    /// catch, the overflow-recovery-already-attempted refusal and `_runAutoCompaction`'s catch when
+    /// `started` (`core/agent-session.ts:2889-2905`, `:3022-3037`, `:3218-3236` @v1.1.0) — with the
+    /// same `reason`, `errorMessage` and `aborted` on both, and `willRetry: false` on both, since a
+    /// failed compaction retries nothing (`_emitSessionCompactFailed`, `:1053-1057`). SESS-050.
+    ///
+    /// cyrup has more exits than pi has `throw`s (it reports each refusal where it happens rather
+    /// than throwing to one catch), and every one of them comes through here, so no exit can emit
+    /// the first half without the second.
+    pub(crate) async fn emit_compaction_failure(
+        &self,
+        reason: CompactionReason,
+        aborted: bool,
+        error_message: Option<String>,
+        from_extension: bool,
+    ) {
+        self.fanout_emit(AgentSessionEvent::CompactionEnd {
+            reason,
+            result: None,
+            aborted,
+            will_retry: false,
+            error_message: error_message.clone(),
+        })
+        .await;
+        let cancel = self.session_cancel.child_token();
+        self.services
+            .ext_host
+            .dispatcher()
+            .dispatch_notify(
+                &HostEvent::SessionCompactFailed {
+                    reason: compaction_reason_str(reason).to_string(),
+                    error_message,
+                    aborted,
+                    will_retry: false,
+                    from_extension,
+                },
+                &cancel,
+            )
+            .await;
+    }
+
     /// Trigger a compaction of the current branch (R-11-014 `compact`; Pi `compact`,
     /// agent-session.ts:1647-1788). Aborts any active run first, emits
     /// `compaction_start`/`compaction_end`, offers the extension `session_before_compact` veto hook,
@@ -79,13 +122,12 @@ impl AgentSession {
         if Self::lock(&self.compaction_model).is_none() {
             cancel_slot.clear();
             let err = SessionServiceError::NoModelSelected;
-            self.fanout_emit(AgentSessionEvent::CompactionEnd {
+            self.emit_compaction_failure(
                 reason,
-                result: None,
-                aborted: false,
-                will_retry: false,
-                error_message: Some(format!("Compaction failed: {err}")),
-            })
+                false,
+                Some(format!("Compaction failed: {err}")),
+                false,
+            )
             .await;
             return Err(err);
         }
@@ -96,13 +138,12 @@ impl AgentSession {
             Ok(settings) => settings,
             Err(err) => {
                 cancel_slot.clear();
-                self.fanout_emit(AgentSessionEvent::CompactionEnd {
+                self.emit_compaction_failure(
                     reason,
-                    result: None,
-                    aborted: false,
-                    will_retry: false,
-                    error_message: Some(format!("Compaction failed: {err}")),
-                })
+                    false,
+                    Some(format!("Compaction failed: {err}")),
+                    false,
+                )
                 .await;
                 return Err(err);
             }
@@ -145,13 +186,12 @@ impl AgentSession {
                     };
                     // Pi's catch emits `compaction_end` with `errorMessage: "Compaction failed: …"`
                     // for a non-abort throw (agent-session.ts:1908-1917).
-                    self.fanout_emit(AgentSessionEvent::CompactionEnd {
+                    self.emit_compaction_failure(
                         reason,
-                        result: None,
-                        aborted: false,
-                        will_retry: false,
-                        error_message: Some(format!("Compaction failed: {err}")),
-                    })
+                        false,
+                        Some(format!("Compaction failed: {err}")),
+                        false,
+                    )
                     .await;
                     return Err(err);
                 }
@@ -176,14 +216,8 @@ impl AgentSession {
                 // Pi throws "Compaction cancelled" (agent-session.ts:1824); its catch classifies that
                 // exact message as an ABORT, so `compaction_end` carries `aborted:true` and NO
                 // errorMessage (agent-session.ts:1909-1916).
-                self.fanout_emit(AgentSessionEvent::CompactionEnd {
-                    reason,
-                    result: None,
-                    aborted: true,
-                    will_retry: false,
-                    error_message: None,
-                })
-                .await;
+                self.emit_compaction_failure(reason, true, None, false)
+                    .await;
                 return Err(SessionServiceError::CompactionCancelled);
             }
             BeforeCompactOutcome::Proceed(ov) => ov,
@@ -208,10 +242,26 @@ impl AgentSession {
         //
         // A routing failure lands in the same `"Compaction failed: …"` `compaction_end` as the
         // checks above, because upstream calls it inside the same `try`.
-        let (model, summary_level) = if external_override.is_some() {
-            let selected = Self::lock(&self.compaction_model)
-                .clone()
-                .ok_or(SessionServiceError::NoModelSelected)?;
+        // pi `fromExtension = true` the moment a handler supplies `result.compaction`
+        // (`agent-session.ts:2809-2812` @v1.1.0), so a failure from here on reports it.
+        let from_extension = external_override.is_some();
+        let (model, summary_level) = if from_extension {
+            // The selection was checked above; one cleared since then is that same refusal, and it
+            // ends the compaction the way every other refusal here does — with a failing
+            // `compaction_end` and its `session_compact_failed` — rather than out of the function
+            // with the `compaction_start` left open.
+            let Some(selected) = Self::lock(&self.compaction_model).clone() else {
+                cancel_slot.clear();
+                let err = SessionServiceError::NoModelSelected;
+                self.emit_compaction_failure(
+                    reason,
+                    false,
+                    Some(format!("Compaction failed: {err}")),
+                    from_extension,
+                )
+                .await;
+                return Err(err);
+            };
             (selected, self.thinking_level().await)
         } else {
             // `Ok(None)` is a modelless session, which the presence check above already refused;
@@ -225,13 +275,12 @@ impl AgentSession {
                 Ok(pair) => pair,
                 Err(err) => {
                     cancel_slot.clear();
-                    self.fanout_emit(AgentSessionEvent::CompactionEnd {
+                    self.emit_compaction_failure(
                         reason,
-                        result: None,
-                        aborted: false,
-                        will_retry: false,
-                        error_message: Some(format!("Compaction failed: {err}")),
-                    })
+                        false,
+                        Some(format!("Compaction failed: {err}")),
+                        false,
+                    )
                     .await;
                     return Err(err);
                 }
@@ -397,14 +446,8 @@ impl AgentSession {
             Ok(None) => {
                 // pi's `catch` clears before its `compaction_end` too (`:2541`).
                 cancel_slot.clear();
-                self.fanout_emit(AgentSessionEvent::CompactionEnd {
-                    reason,
-                    result: None,
-                    aborted: true,
-                    will_retry: false,
-                    error_message: None,
-                })
-                .await;
+                self.emit_compaction_failure(reason, true, None, from_extension)
+                    .await;
                 Err(SessionServiceError::CompactionCancelled)
             }
             Err(e) => {
@@ -415,14 +458,8 @@ impl AgentSession {
                     Some(format!("Compaction failed: {e}"))
                 };
                 cancel_slot.clear();
-                self.fanout_emit(AgentSessionEvent::CompactionEnd {
-                    reason,
-                    result: None,
-                    aborted,
-                    will_retry: false,
-                    error_message,
-                })
-                .await;
+                self.emit_compaction_failure(reason, aborted, error_message, from_extension)
+                    .await;
                 if aborted {
                     // An in-flight abort (Esc during `/compact` → `abort_compaction`) is the SAME
                     // refusal Pi raises as the bare `Compaction cancelled`

@@ -276,3 +276,16 @@ mod prov097_redacted_reasoning {
         );
     }
 }
+
+/// Every message of a response carries the response's start as its `timestamp` — pi seeds
+/// `output.timestamp = Date.now()` once, before the request (`bedrock-converse-stream.ts` @v1.1.0,
+/// whose type documents it as *"when the request started"*) — not the time each snapshot was
+/// taken. The driver sets the start from the response's sink.
+#[test]
+fn a_snapshot_carries_the_responses_start_not_the_current_time() {
+    let mut dec = Decoder::default();
+    dec.started_at = 42;
+    let m = sonnet_45();
+    let api = ApiId::from(API_ID);
+    assert_eq!(dec.snapshot_owned(&m, &api).timestamp, 42);
+}

@@ -22,7 +22,10 @@ where
     let provider = model.provider.clone();
     let model_id = model.id.as_str().to_string();
 
-    let mut dec = Decoder::default();
+    let mut dec = Decoder {
+        started_at: sink.started_at(),
+        ..Decoder::default()
+    };
     if !sink
         .send(StreamEvent::Start {
             partial: dec.snapshot(model, api),

@@ -2778,6 +2778,7 @@ mod tests {
         details: Option<Value>,
     ) -> ReplayItem {
         ReplayItem::Message(Box::new(AgentMessage::Core(Message::ToolResult {
+            duration_ms: None,
             tool_call_id: CoreToolCallId::from(id),
             tool_name: name.to_string(),
             content: if body.is_empty() {

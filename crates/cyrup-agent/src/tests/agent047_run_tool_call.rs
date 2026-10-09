@@ -533,6 +533,7 @@ async fn agent047_the_callers_on_update_sink_receives_the_tools_partials() {
 #[test]
 fn nested_outcome_wire_shape_is_pi_agent_tool_call_outcome() {
     let outcome = ToolCallOutcome {
+        duration_ms: None,
         tool_call: call("lookup", json!({ "q": "x" })),
         result: ToolResult {
             content: vec![Content::text("found")],
@@ -564,6 +565,7 @@ fn nested_outcome_wire_shape_is_pi_agent_tool_call_outcome() {
     );
 
     let bare = ToolCallOutcome {
+        duration_ms: None,
         tool_call: call("lookup", json!({})),
         result: ToolResult {
             content: vec![Content::text("ok")],

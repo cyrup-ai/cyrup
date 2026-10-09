@@ -247,7 +247,7 @@ async fn run_bulky_loop(compaction: serde_json::Value) -> Vec<AgentSessionEvent>
     });
     let mut events = Vec::new();
     while let Ok(Some(ev)) = tokio::time::timeout(Duration::from_secs(20), stream.next()).await {
-        let settled = matches!(ev, AgentSessionEvent::AgentSettled);
+        let settled = matches!(ev, AgentSessionEvent::AgentSettled { .. });
         events.push(ev);
         if settled {
             break;

@@ -60,6 +60,10 @@ pub enum NestedToolExecutionEvent {
         tool_name: String,
         result: Value,
         is_error: bool,
+        /// Milliseconds the nested call's `execute()` took; absent when it did not run (pi
+        /// `durationMs?`, before `parentToolCallId`, `nested-tool-calls.ts:124-128` @v1.1.0).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        duration_ms: Option<u64>,
         parent_tool_call_id: ToolCallId,
     },
 }
@@ -229,6 +233,8 @@ impl NestedToolCallRunner {
         let outcome = match malformed {
             Some(kind) => ToolCallOutcome {
                 is_error: true,
+                // Refused before it ran.
+                duration_ms: None,
                 result: cyrup_core::ToolResult {
                     content: vec![Content::text(format!(
                         "Invalid arguments for tool {name}: expected an object, got {kind}"
@@ -267,6 +273,7 @@ impl NestedToolCallRunner {
                 outcome.result.is_error,
             ),
             is_error: outcome.is_error,
+            duration_ms: outcome.duration_ms,
             parent_tool_call_id: caller.clone(),
         })
         .await;

@@ -154,6 +154,8 @@ async fn put_task(
             owner: None,
             background,
             abort_requested,
+            started_at: None,
+            ended_at: None,
             state,
         })
         .expect("staging a task");

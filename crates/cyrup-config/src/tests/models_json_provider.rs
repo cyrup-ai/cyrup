@@ -105,6 +105,7 @@ impl ApiImpl for RecordingApi {
             raw_stop_reason: None,
             end_turn: None,
             timestamp: 0,
+            duration_ms: None,
         };
         sink.send(StreamEvent::terminal(message)).await;
     }

@@ -335,9 +335,11 @@ fn project_context_entry(out: &mut Vec<AgentMessage>, e: &Entry, edit: Option<&K
                 usage,
                 added_tool_names,
                 timestamp,
+                duration_ms,
                 nested_calls,
                 ..
             }) => AgentMessage::Core(Message::ToolResult {
+                duration_ms,
                 tool_call_id,
                 tool_name,
                 content: blocks(&r.content),
@@ -458,6 +460,23 @@ pub fn build_context_agent_messages_tagged(path: &[&Entry]) -> Vec<(EntryId, Age
         push_as_raw_tagged(&mut messages, e, edits.get(&e.id()).copied());
     }
     messages
+}
+
+/// pi `buildSessionProjection(...).entries` (`core/session-manager.ts:543-573` @v1.1.0): each
+/// admitted entry with the model-visible messages it contributes after context edits — empty for a
+/// state-only entry and for an omitted one. Flattening the messages gives
+/// [`build_context_agent_messages`].
+pub fn build_session_projection<'a>(path: &[&'a Entry]) -> Vec<(&'a Entry, Vec<AgentMessage>)> {
+    let admitted = build_context_entries(path);
+    let edits = context_edits(&admitted);
+    admitted
+        .iter()
+        .map(|e| {
+            let mut messages = Vec::new();
+            project_context_entry(&mut messages, e, edits.get(&e.id()).copied());
+            (*e, messages)
+        })
+        .collect()
 }
 
 /// The active, compaction-aware ENTRY list — Pi `buildContextEntries`

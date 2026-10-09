@@ -20,6 +20,7 @@ use cyrup_core::{Content, Message, Usage};
 
 fn tool_result(usage: Option<Usage>, added: &[&str]) -> Message {
     Message::ToolResult {
+        duration_ms: None,
         tool_call_id: "tc1".into(),
         tool_name: "loader".into(),
         content: vec![Content::text("ok")],

@@ -440,6 +440,7 @@ impl NativeExtension for ForcePrompt {
                 HookOutcome::Mutate(EventPatch::SystemPromptAndInject {
                     system: Some("FORCED PROMPT, EXACTLY".to_string()),
                     inject: Vec::new(),
+                    options: None,
                 })
             }
             _ => HookOutcome::Noop,

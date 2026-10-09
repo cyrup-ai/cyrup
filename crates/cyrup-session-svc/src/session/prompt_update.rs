@@ -58,12 +58,70 @@ impl AgentSession {
         transcript: impl IntoIterator<Item = &'a AgentMessage>,
     ) -> Option<SystemMessage> {
         let previous = replayed_sections(transcript);
-        let current = Self::lock(&self.base_prompt).sections().clone();
+        // The run's options when its `before_agent_start` handlers set some, the base otherwise
+        // (pi diffs `buildSystemPromptSections(result.systemPromptOptions)` at run start and the
+        // refreshed run options at every turn boundary, `agent-session.ts:2105`, `:915` @v1.1.0;
+        // EXT-084). A forced prompt changes no section: the transcript keeps the structured ones.
+        let run = Self::lock(&self.run_prompt_options).clone();
+        let current = match run {
+            Some(options) => {
+                let docs = Self::lock(&self.base_prompt).docs().clone();
+                crate::tools::BuiltPrompt::from_options(options, docs)
+                    .sections()
+                    .clone()
+            }
+            None => Self::lock(&self.base_prompt).sections().clone(),
+        };
         let patch = diff_system_prompt_sections(&previous, &current)?;
         Some(SystemMessage {
             sections: Some(patch),
             timestamp: super::now_ms(),
             ..SystemMessage::default()
         })
+    }
+}
+
+impl AgentSession {
+    /// pi `_preparePromptAndToolLoadout`'s two stamps (`core/agent-session.ts:1742-1744` @v1.1.0):
+    /// the options list the tools the loadout now has, and hide the declarations requests leave
+    /// out, so the prompt describes exactly the tools the request carries.
+    pub(crate) fn stamp_live_loadout(
+        &self,
+        options: &mut cyrup_session::prompt::SystemPromptOptions,
+    ) {
+        let dynamic = Self::lock(&self.dynamic_tools);
+        options.selected_tools = dynamic.active_names();
+        options.hidden_tools = dynamic.hidden_names();
+    }
+
+    /// The turn-boundary refresh of the run's options (pi `_installAgentNextTurnRefresh`,
+    /// `core/agent-session.ts:908-917` @v1.1.0; EXT-084): the run's options — or the base's,
+    /// when the run has none — with the live active tools, and every tool's snippet and
+    /// guidelines (the base's, then the run's over them, so a tool registered mid-run is
+    /// described). pi stores the result as the run's options "to keep session.systemPrompt and
+    /// ctx.getSystemPrompt() in step with what the provider sees".
+    pub(crate) fn refresh_run_prompt_options(&self) {
+        let base = Self::lock(&self.base_prompt).options().clone();
+        let run = Self::lock(&self.run_prompt_options).clone();
+        let mut options = run.unwrap_or_else(|| base.clone());
+        let mut snippets = base.tool_snippets;
+        snippets.extend(std::mem::take(&mut options.tool_snippets));
+        options.tool_snippets = snippets;
+        let mut guidelines = base.tool_guidelines;
+        guidelines.extend(std::mem::take(&mut options.tool_guidelines));
+        options.tool_guidelines = guidelines;
+        self.stamp_live_loadout(&mut options);
+        *Self::lock(&self.run_prompt_options) = Some(options);
+        self.sync_prompt_mirror();
+    }
+
+    /// Keep the prompt `ctx.getSystemPrompt()` reads equal to [`Self::effective_system_prompt`]
+    /// (pi binds it to `this.systemPrompt`, `buildSystemPrompt(this._runSystemPromptOptions ??
+    /// this._baseSystemPromptOptions)`, `core/agent-session.ts:1470-1472`, `:3465` @v1.1.0).
+    pub(crate) fn sync_prompt_mirror(&self) {
+        self.services.host_services.update_prompt_state(
+            Some(self.effective_system_prompt()),
+            self.services.settings.project_trusted(),
+        );
     }
 }

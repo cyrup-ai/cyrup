@@ -73,6 +73,7 @@ fn update(calls: Value) -> AgentSessionEvent {
 
 fn end(is_error: bool, result: Value) -> AgentSessionEvent {
     AgentSessionEvent::ToolExecutionEnd {
+        duration_ms: None,
         tool_call_id: id(),
         tool_name: "codemode".into(),
         is_error,
@@ -457,6 +458,7 @@ async fn a_resumed_session_replays_the_nested_call_list() {
         namespace: None,
     })];
     let result = AgentMessage::Core(Message::ToolResult {
+        duration_ms: None,
         tool_call_id: id(),
         tool_name: "codemode".into(),
         content: vec![

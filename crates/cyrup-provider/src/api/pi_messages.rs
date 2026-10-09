@@ -529,6 +529,7 @@ fn error_event(
         raw_stop_reason: None,
         end_turn: None,
         timestamp: now_millis(),
+        duration_ms: None,
     };
     // Pi attaches the diagnostic only on the non-aborted `PiMessagesResponseError` path
     // (pi-messages.ts:327-332).
@@ -555,6 +556,9 @@ fn transport_error_event(model: &Model, api: &ApiId, e: &ProviderError) -> Strea
 /// Streaming-decode state — Pi's `partial` closure variable plus its `toolJson` map
 /// (pi-messages.ts:177-187).
 struct Decoder {
+    /// Pi's `partial.timestamp`: `Date.now()` when the converter is created, kept for the whole
+    /// response (`createEventConverter`, `api/pi-messages.ts:180-189` @v1.1.0).
+    started_at: i64,
     content: Vec<Content>,
     /// Accumulated tool-call JSON per content index (Pi `toolJson: Map<number, string>`).
     ///
@@ -576,6 +580,7 @@ struct Decoder {
 impl Decoder {
     fn new() -> Self {
         Self {
+            started_at: now_millis(),
             content: Vec::new(),
             tool_json: HashMap::new(),
             usage: Usage::default(),
@@ -621,7 +626,8 @@ impl Decoder {
             error_message: self.error_message.clone(),
             raw_stop_reason: None,
             end_turn: None,
-            timestamp: now_millis(),
+            timestamp: self.started_at,
+            duration_ms: None,
         }
     }
 
@@ -1282,6 +1288,49 @@ mod tests {
         }
         task.await.unwrap();
         events
+    }
+
+    /// pi's converter seeds `partial.timestamp = Date.now()` once (`createEventConverter`,
+    /// `api/pi-messages.ts:180-189` @v1.1.0) and every event carries that same object, so all of a
+    /// response's messages share one timestamp; the terminal is timed. Frames are paced so a
+    /// per-snapshot clock cannot pass by landing in the same millisecond.
+    #[tokio::test]
+    async fn every_message_shares_the_converters_timestamp_and_the_terminal_is_timed() {
+        use futures::StreamExt as _;
+        let raw = concat!(
+            "data: {\"type\":\"start\"}\n\n",
+            "data: {\"type\":\"text_start\",\"contentIndex\":0}\n\n",
+            "data: {\"type\":\"text_delta\",\"contentIndex\":0,\"delta\":\"Hi\"}\n\n",
+            "data: {\"type\":\"text_end\",\"contentIndex\":0,\"content\":\"Hi\"}\n\n",
+            "data: {\"type\":\"done\",\"reason\":\"stop\"}\n\n",
+        );
+        let m = model();
+        let (sink, mut rx) = channel(64);
+        let api = ApiId::from(API_ID);
+        let frames = Box::pin(
+            decode_sse_bytes_flushing_at_eof(raw.as_bytes().to_vec()).then(|f| async move {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                f
+            }),
+        );
+        let task = tokio::spawn(async move { decode_stream(frames, &m, &api, &sink).await });
+        let mut events = Vec::new();
+        while let Some(ev) = rx.recv().await {
+            events.push(ev);
+        }
+        task.await.unwrap();
+        let stamps: Vec<i64> = events
+            .iter()
+            .filter_map(|e| e.partial().or_else(|| e.terminal_message()))
+            .map(|m| m.timestamp)
+            .collect();
+        assert!(stamps.len() > 2, "{events:?}");
+        assert!(stamps.windows(2).all(|w| w[0] == w[1]), "{stamps:?}");
+        let last = events
+            .last()
+            .and_then(StreamEvent::terminal_message)
+            .unwrap();
+        assert!(last.duration_ms.is_some_and(|d| d >= 5), "{last:?}");
     }
 
     /// A full upstream-shaped transcript: text block, thinking block, tool call, terminal `done`

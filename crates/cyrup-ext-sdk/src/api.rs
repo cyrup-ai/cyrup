@@ -1,6 +1,6 @@
 //! The ergonomic guest API (arch-08 §3.6) — the Rust analog of Pi's `ExtensionAPI` (the `pi` object
 //! an extension factory receives, types.ts:1185-1420 @v0.83.0; EXT-072 corrected `:1128-1356`). An
-//! author subscribes to any of the 37 events
+//! author subscribes to any of the 39 events
 //! with a typed handler `(event, &Ctx) -> Outcome`, registers tools/commands/shortcuts/flags/
 //! providers/renderers/autocomplete, and the SDK lowers all of it onto the `cyrup:ext` WIT world.
 //!
@@ -87,6 +87,12 @@ mod kind {
     /// @v1.0.4 — declared in the warmer, pulled into the event union at
     /// `core/extensions/types.ts` @v1.0.4) — EXT-085.
     pub const CACHE_WARMING_DECISION: u8 = 36;
+    /// `session_compact_failed` (pi `SessionCompactFailedEvent`, `core/extensions/types.ts:795-807`
+    /// @v1.1.0) — SESS-050.
+    pub const SESSION_COMPACT_FAILED: u8 = 37;
+    /// `agent_before_settle` (pi `AgentBeforeSettleEvent`, `core/extensions/types.ts:999-1002`
+    /// @v1.1.0) — EXT-078.
+    pub const AGENT_BEFORE_SETTLE: u8 = 38;
 }
 
 /// The remover every `on_*` subscriber returns — pi's `on(event, handler): () => void`
@@ -333,6 +339,11 @@ impl Outcome {
     /// `message_end`: replace the message (same role enforced host-side).
     pub fn replace_message(message: impl Serialize) -> Self {
         Outcome::mutate(message)
+    }
+    /// `turn_end` / `agent_before_settle`: replace the boundary drafts and/or ask for one more
+    /// provider request (pi `BoundaryResult`; EXT-078).
+    pub fn boundary(result: BoundaryResult) -> Self {
+        Outcome::mutate(result)
     }
     /// `before_agent_start`: inject a message and/or replace the system prompt.
     pub fn before_agent_start(result: BeforeAgentStartResult) -> Self {
@@ -581,6 +592,12 @@ pub struct RenderOptions {
     pub output_pad: u32,
     /// `ToolRenderResultOptions.isPartial` — whether the result being drawn is still streaming.
     pub is_partial: bool,
+    /// `ToolRenderContext.isError` — whether the tool call being drawn failed.
+    pub is_error: bool,
+    /// `ToolRenderContext.durationMs` — how long the tool's `execute()` took, from the FINAL result;
+    /// `None` while it runs, when it did not run, and for results stored before durations were
+    /// recorded (pi v1.1.0).
+    pub duration_ms: Option<u64>,
     /// The NAME of the active theme. Pi passes the whole `Theme` object; an object cannot cross the
     /// component boundary, so a guest that needs the PALETTE calls `ui.theme_get_json()` (EXT-066).
     /// `None` when the host has no display (an RPC host, a test).
@@ -600,6 +617,8 @@ impl RenderOptions {
                 .and_then(|w| u32::try_from(w).ok())
                 .unwrap_or(0),
             is_partial: v.get("isPartial").and_then(Value::as_bool).unwrap_or(false),
+            is_error: v.get("isError").and_then(Value::as_bool).unwrap_or(false),
+            duration_ms: v.get("durationMs").and_then(Value::as_u64),
             theme: v
                 .get("theme")
                 .and_then(Value::as_str)
@@ -1339,13 +1358,13 @@ impl ExtensionApi {
             .push((topic.into(), Box::new(handler)));
     }
 
-    // --- the 37 event subscriptions ---
+    // --- the 39 event subscriptions ---
 
     /// `tool_call` — VETOABLE (returns [`Outcome`]): block the call with [`Outcome::block`]
     /// (first block wins host-side) or rewrite its arguments with
     /// [`Outcome::replace_tool_input`]. Payload [`ToolCallEvent`].
     ///
-    /// The first of this type's 37 event subscribers (pi `pi.on`, types.ts:1190-1231 @v0.83.0,
+    /// The first of this type's 39 event subscribers (pi `pi.on`, types.ts:1190-1231 @v0.83.0,
     /// plus the three pi added by v0.87.1 — EXT-075, EXT-079; EXT-072 corrected the count AND the
     /// range, which cited the message-rendering block). Each returns the [`Unsubscribe`] remover
     /// pi's `on()` has returned since v0.86.0 (EXT-080).
@@ -1759,15 +1778,27 @@ impl ExtensionApi {
             }),
         )
     }
-    /// `agent_settled` — notify-only (returns `()`), and payload-free like
-    /// [`Self::on_agent_start`]: the handler receives only the [`Ctx`].
+    /// `agent_settled` — notify-only (returns `()`). Payload [`AgentSettledEvent`].
     ///
     /// pi `on("agent_settled", handler)` (extensions/types.ts:1217 @v0.83.0; EXT-073: `:1225` is
     /// `tool_execution_end`). Fires ONCE per run, after every
     /// automatic retry / post-run compaction / queued continuation has finished — unlike
     /// [`Self::on_agent_end`], which fires once per `agent.prompt`/`agent.continue`.
-    pub fn on_agent_settled(&mut self, f: impl Fn(&Ctx) + 'static) -> Unsubscribe {
-        self.subscribe(kind::AGENT_SETTLED, notify(move |_a, c| f(c)))
+    pub fn on_agent_settled(
+        &mut self,
+        f: impl Fn(AgentSettledEvent, &Ctx) + 'static,
+    ) -> Unsubscribe {
+        self.subscribe(
+            kind::AGENT_SETTLED,
+            notify(move |a, c| {
+                f(
+                    AgentSettledEvent {
+                        aborted: arg(a, 0) == "true",
+                    },
+                    c,
+                )
+            }),
+        )
     }
     /// `turn_start` — notify-only (returns `()`). Payload [`TurnStartEvent`].
     pub fn on_turn_start(&mut self, f: impl Fn(TurnStartEvent, &Ctx) + 'static) -> Unsubscribe {
@@ -1784,20 +1815,51 @@ impl ExtensionApi {
             }),
         )
     }
-    /// `turn_end` — notify-only (returns `()`). Payload [`TurnEndEvent`]: the finalized assistant
-    /// message AND the tool results produced this turn.
-    pub fn on_turn_end(&mut self, f: impl Fn(TurnEndEvent, &Ctx) + 'static) -> Unsubscribe {
+    /// `turn_end` — a BOUNDARY (returns [`Outcome`]; EXT-078, pi v0.87.0): answer
+    /// [`Outcome::boundary`] to append entries at the end of the turn and/or ask for one more
+    /// provider request, or [`Outcome::noop`]. Payload [`TurnEndEvent`]: the finalized assistant
+    /// message, the tool results produced this turn, the ids they were persisted as, and the
+    /// [`BoundaryState`] the handlers fold.
+    pub fn on_turn_end(
+        &mut self,
+        f: impl Fn(TurnEndEvent, &Ctx) -> Outcome + 'static,
+    ) -> Unsubscribe {
         self.subscribe(
             kind::TURN_END,
-            notify(move |a, c| {
+            Box::new(move |a, c| {
                 f(
                     TurnEndEvent {
                         turn_index: arg(a, 0).parse().unwrap_or(0),
                         message: json(arg(a, 1)),
                         tool_results: json(arg(a, 2)),
+                        message_entry_id: arg(a, 3).to_string(),
+                        tool_result_entry_ids: serde_json::from_str(arg(a, 4)).unwrap_or_default(),
+                        boundary: boundary(arg(a, 5)),
                     },
                     c,
                 )
+                .into_raw()
+            }),
+        )
+    }
+    /// `agent_before_settle` — a BOUNDARY (returns [`Outcome`]; EXT-078, pi v0.87.0): fired before
+    /// the run settles, when no retry, compaction or queued message will continue it. Answer
+    /// [`Outcome::boundary`] to append entries and/or ask for one more provider request. Payload
+    /// [`AgentBeforeSettleEvent`].
+    pub fn on_agent_before_settle(
+        &mut self,
+        f: impl Fn(AgentBeforeSettleEvent, &Ctx) -> Outcome + 'static,
+    ) -> Unsubscribe {
+        self.subscribe(
+            kind::AGENT_BEFORE_SETTLE,
+            Box::new(move |a, c| {
+                f(
+                    AgentBeforeSettleEvent {
+                        boundary: boundary(arg(a, 0)),
+                    },
+                    c,
+                )
+                .into_raw()
             }),
         )
     }
@@ -1895,7 +1957,8 @@ impl ExtensionApi {
                         name: arg(a, 1).into(),
                         result: json(arg(a, 2)),
                         is_error: arg(a, 3) == "true",
-                        parent_tool_call_id: opt_str(arg(a, 4)),
+                        duration_ms: arg(a, 4).parse().ok(),
+                        parent_tool_call_id: opt_str(arg(a, 5)),
                     },
                     c,
                 )
@@ -2014,6 +2077,28 @@ impl ExtensionApi {
                     will_retry: arg(a, 3) == "true",
                 };
                 f(ev, c)
+            }),
+        )
+    }
+    /// `session_compact_failed` — notify-only (returns `()`): a compaction that started ended
+    /// without a result. Payload [`SessionCompactFailedEvent`].
+    pub fn on_session_compact_failed(
+        &mut self,
+        f: impl Fn(SessionCompactFailedEvent, &Ctx) + 'static,
+    ) -> Unsubscribe {
+        self.subscribe(
+            kind::SESSION_COMPACT_FAILED,
+            notify(move |a, c| {
+                f(
+                    SessionCompactFailedEvent {
+                        reason: arg(a, 0).into(),
+                        error_message: opt_str(arg(a, 1)),
+                        aborted: arg(a, 2) == "true",
+                        will_retry: arg(a, 3) == "true",
+                        from_extension: arg(a, 4) == "true",
+                    },
+                    c,
+                )
             }),
         )
     }
@@ -2301,6 +2386,15 @@ impl ExtensionApi {
 }
 
 /// Wrap a notify (`-> ()`) closure into the uniform handler shape (returns `Noop`).
+/// A boundary event's `boundary-json` arg (EXT-078); an unreadable one is the empty state.
+fn boundary(raw: &str) -> BoundaryState {
+    serde_json::from_str(raw).unwrap_or_else(|_| BoundaryState {
+        entries: Value::Array(Vec::new()),
+        outcome: "completed".into(),
+        ..BoundaryState::default()
+    })
+}
+
 fn notify(f: impl Fn(&[&str], &Ctx) + 'static) -> Handler {
     Box::new(move |a, c| {
         f(a, c);

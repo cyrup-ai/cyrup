@@ -325,7 +325,23 @@ impl Capabilities {
 ///   verdict, and `noop` to leave it. A 0.17 guest exports nothing under that name, the same
 ///   fails-to-LINK direction a re-signed export is, so it takes the bump on its own (the
 ///   0.16 -> 0.17 `route-model` precedent).
-pub const HOST_WORLD: &str = "cyrup:ext@0.18";
+/// - 0.18 -> 0.19: EXPORT RE-SIGNING — the pi v1.1.0 event batch. `events.on-tool-execution-end`
+///   gained `duration-ms: option<u64>` before `parent-tool-call-id` (pi
+///   `ToolExecutionEndEvent.durationMs?`, `core/extensions/types.ts` @v1.1.0). A 0.18 guest exports
+///   the shorter signature and fails to link, so it takes the bump (the 0.14 -> 0.15
+///   `parent-tool-call-id` precedent). `events.on-agent-settled` gained `aborted: bool` (pi
+///   `AgentSettledEvent.aborted`, `:1005-1009`) in the same batch, and `events.on-session-compact-failed`
+///   is new (an EXPORT ADDITION; pi `SessionCompactFailedEvent`, `:795-807`, SESS-050).
+///   `ctx-state.render-system-prompt` is an IMPORT ADDITION in the same world (EXT-084; pi
+///   `buildSystemPrompt(options)`, `core/system-prompt.ts:199-210`): a guest that folds several
+///   `before_agent_start` handlers re-renders the prompt after each one's `systemPromptOptions`
+///   edit. On its own it would not bump, for the reason the `get-system-prompt-options` entry
+///   above gives. EXT-078 rides the same bump: `events.on-turn-end` is RE-SIGNED to pi's boundary
+///   event (`TurnEndEvent extends BoundaryState`, `core/extensions/types.ts:1036-1044` — it returns
+///   a `hook-outcome` and carries the persisted entry ids and the boundary state),
+///   `events.on-agent-before-settle` is an EXPORT ADDITION (`AgentBeforeSettleEvent`, `:999-1002`),
+///   and `ctx-state.preview-boundary` an IMPORT ADDITION (pi `_buildBoundaryContext`).
+pub const HOST_WORLD: &str = "cyrup:ext@0.19";
 
 impl ExtensionManifest {
     /// Parse from JSON bytes.

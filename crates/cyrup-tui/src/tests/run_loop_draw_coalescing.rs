@@ -147,7 +147,7 @@ fn the_events_arm_drains_every_ready_event_then_draws_once() {
     );
     let settled = pos(
         arm,
-        "let settled = matches!(ev, AgentSessionEvent::AgentSettled);",
+        "let settled = matches!(ev, AgentSessionEvent::AgentSettled { .. });",
     );
     let ingest = pos(
         arm,

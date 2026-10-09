@@ -58,6 +58,7 @@ fn an_assistant_turn_whose_blocks_all_filter_out_is_dropped() {
         raw_stop_reason: None,
         end_turn: None,
         timestamp: 0,
+        duration_ms: None,
     };
     let ctx = Context {
         system_prompt: None,
@@ -112,8 +113,10 @@ fn blank_tool_result_content_becomes_the_empty_placeholder() {
                 raw_stop_reason: None,
                 end_turn: None,
                 timestamp: 0,
+                duration_ms: None,
             }),
             Message::ToolResult {
+                duration_ms: None,
                 tool_call_id: ToolCallId::from("tool-1"),
                 tool_name: "tool".to_string(),
                 content: vec![Content::text("")],
@@ -178,10 +181,12 @@ fn consecutive_tool_results_collapse_into_one_user_message() {
             raw_stop_reason: None,
             end_turn: None,
             timestamp: 0,
+            duration_ms: None,
         }),
     ];
     for id in calls {
         messages.push(Message::ToolResult {
+            duration_ms: None,
             tool_call_id: ToolCallId::from(id),
             tool_name: "tool".to_string(),
             content: vec![Content::text(format!("result {id}"))],
@@ -250,6 +255,7 @@ fn signatureless_thinking_replays_as_text_on_claude_and_as_reasoning_elsewhere()
                 raw_stop_reason: None,
                 end_turn: None,
                 timestamp: 0,
+                duration_ms: None,
             }),
         ],
         tools: Vec::new(),
@@ -433,6 +439,7 @@ mod prov097_replay {
             raw_stop_reason: None,
             end_turn: None,
             timestamp: 1,
+            duration_ms: None,
         })
     }
 

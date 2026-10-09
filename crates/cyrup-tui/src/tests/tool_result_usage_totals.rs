@@ -44,6 +44,7 @@ fn usage(input: u64, output: u64, cache_read: u64) -> Usage {
 
 fn tool_result(usage: Option<Usage>) -> AgentMessage {
     AgentMessage::ToolResult(ToolResultMessage {
+        duration_ms: None,
         tool_call_id: ToolCallId::from("c1"),
         tool_name: "summarize".to_string(),
         content: vec![Content::text("summarized")],

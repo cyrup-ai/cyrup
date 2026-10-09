@@ -1794,6 +1794,27 @@ impl bindings::cyrup::ext::ctx_state::Host for HostState {
         );
         Ok(bag.to_string())
     }
+    /// EXT-084 — pi `buildSystemPrompt(options)` over a guest's `systemPromptOptions` (see the
+    /// import's doc in `world.wit`). Ungated: it reads nothing and changes nothing.
+    async fn render_system_prompt(&mut self, options_json: String) -> Result<String, String> {
+        let guest = guest_of(self)?;
+        let options: Value = serde_json::from_str(&options_json).map_err(|e| e.to_string())?;
+        guest.services.render_system_prompt(&options)
+    }
+    /// EXT-078 — pi `_buildBoundaryContext(entries, boundary)` (see the import's doc in
+    /// `world.wit`). Ungated: it previews and writes nothing.
+    async fn preview_boundary(
+        &mut self,
+        boundary: String,
+        entries_json: String,
+    ) -> Result<String, String> {
+        let guest = guest_of(self)?;
+        let entries: Value = serde_json::from_str(&entries_json).map_err(|e| e.to_string())?;
+        guest
+            .services
+            .preview_boundary(&boundary, &entries)
+            .map(|context| context.to_string())
+    }
     /// pi `ctx.cwd` (extensions/types.ts:315 @v0.83.0) — on the BASE `ExtensionContext`, so every
     /// handler and every tool `execute` can read it, not just command handlers (EXT-044). Sourced
     /// from the `HostConfig.cwd` copy `GuestState` takes at load time — the same value the native
@@ -3541,7 +3562,10 @@ async fn invoke(
             api.call_on_agent_end(store, &m).await.and_then(|()| noop())
         }
         // agent_settled (Pi `_emitAgentSettled`, agent-session.ts:581-588): payload-free, notify-only.
-        HostEvent::AgentSettled => api.call_on_agent_settled(store).await.and_then(|()| noop()),
+        HostEvent::AgentSettled { aborted } => api
+            .call_on_agent_settled(store, *aborted)
+            .await
+            .and_then(|()| noop()),
         HostEvent::UiPromptStart { kind, title } => api
             .call_on_ui_prompt_start(store, kind, title.as_deref())
             .await
@@ -3557,16 +3581,32 @@ async fn invoke(
             .call_on_turn_start(store, *turn_index, *timestamp)
             .await
             .and_then(|()| noop()),
+        // EXT-078: a boundary event — the guest may return `{entries?, continue?}`.
         HostEvent::TurnEnd {
             turn_index,
             message,
             tool_results,
+            message_entry_id,
+            tool_result_entry_ids,
+            boundary,
         } => {
             let m = serde_json::to_string(message).unwrap_or_else(|_| "null".into());
             let tr = serde_json::to_string(tool_results).unwrap_or_else(|_| "[]".into());
-            api.call_on_turn_end(store, *turn_index, &m, &tr)
+            let ids = serde_json::to_string(tool_result_entry_ids).unwrap_or_else(|_| "[]".into());
+            api.call_on_turn_end(
+                store,
+                *turn_index,
+                &m,
+                &tr,
+                message_entry_id,
+                &ids,
+                &boundary_json(boundary),
+            )
+            .await
+        }
+        HostEvent::AgentBeforeSettle { boundary } => {
+            api.call_on_agent_before_settle(store, &boundary_json(boundary))
                 .await
-                .and_then(|()| noop())
         }
         HostEvent::MessageStart { message } => api
             .call_on_message_start(store, &message.to_string())
@@ -3605,6 +3645,7 @@ async fn invoke(
             name,
             result,
             is_error,
+            duration_ms,
         } => api
             .call_on_tool_execution_end(
                 store,
@@ -3612,6 +3653,7 @@ async fn invoke(
                 name,
                 &result.to_string(),
                 *is_error,
+                *duration_ms,
                 parent,
             )
             .await
@@ -3677,7 +3719,36 @@ async fn invoke(
             .call_on_session_tree(store, &tree.to_string())
             .await
             .and_then(|()| noop()),
+        HostEvent::SessionCompactFailed {
+            reason,
+            error_message,
+            aborted,
+            will_retry,
+            from_extension,
+        } => api
+            .call_on_session_compact_failed(
+                store,
+                reason,
+                error_message.as_deref(),
+                *aborted,
+                *will_retry,
+                *from_extension,
+            )
+            .await
+            .and_then(|()| noop()),
     }
+}
+
+/// pi `BoundaryState` as the guest receives it: `{entries, continue, context, outcome}`
+/// (`core/extensions/types.ts:987-992` @v1.1.0; EXT-078).
+fn boundary_json(boundary: &crate::event::BoundaryState) -> String {
+    serde_json::json!({
+        "entries": boundary.entries,
+        "continue": boundary.continue_,
+        "context": boundary.context,
+        "outcome": boundary.outcome,
+    })
+    .to_string()
 }
 
 /// The Pi `InputSource` wire string (types.ts:797) for the `on-input` seam.
@@ -3732,6 +3803,13 @@ fn decode_outcome(kind: EventKind, wit: wit_types::HookOutcome) -> HookOutcome {
 /// Interpret a guest mutate-payload as a typed [`EventPatch`] for `kind`.
 fn decode_patch(kind: EventKind, v: Value) -> Option<EventPatch> {
     match kind {
+        // EXT-078: pi `BoundaryResult { entries?, continue? }` (`core/extensions/types.ts:994-997`
+        // @v1.1.0). A key that is absent (or of the wrong type) leaves the folded value as it was,
+        // as pi's `!== undefined` checks do.
+        EventKind::TurnEnd | EventKind::AgentBeforeSettle => Some(EventPatch::Boundary {
+            entries: v.get("entries").filter(|e| e.is_array()).cloned(),
+            continue_: v.get("continue").and_then(Value::as_bool),
+        }),
         EventKind::ToolCall => Some(EventPatch::ToolInput(v)),
         EventKind::ToolResult => {
             let content = v
@@ -3791,7 +3869,17 @@ fn decode_patch(kind: EventKind, v: Value) -> Option<EventPatch> {
                 )
                 .filter_map(|m| serde_json::from_value::<Message>(m.clone()).ok())
                 .collect();
-            Some(EventPatch::SystemPromptAndInject { system, inject })
+            // EXT-084: the handler's edited `event.systemPromptOptions` (pi hands the handler the
+            // object itself; a guest edits a copy and returns it).
+            let options = v
+                .get("systemPromptOptions")
+                .filter(|o| o.is_object())
+                .cloned();
+            Some(EventPatch::SystemPromptAndInject {
+                system,
+                inject,
+                options,
+            })
         }
         // `input` (Pi `InputEventResult` `{action:"transform", text, images?}`, types.ts:805): the
         // guest's transform rewrites the submission text and optionally its images. `text` is

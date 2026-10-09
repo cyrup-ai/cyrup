@@ -363,7 +363,7 @@ pub fn translate(
         //
         // `ACP-122` — and the arm emits nothing, so there is no update the shell could leave
         // behind a response.
-        AgentSessionEvent::AgentSettled => {
+        AgentSessionEvent::AgentSettled { .. } => {
             ledger.clear();
             Translated::nothing(TurnSignal::Settled)
         }
@@ -1174,7 +1174,7 @@ mod tests {
     fn agent_settled_settles_and_session_replaced_rebinds() {
         let mut ledger = fresh();
 
-        let settled = AgentSessionEvent::AgentSettled;
+        let settled = AgentSessionEvent::AgentSettled { aborted: false };
         assert!(matches!(
             translate(&mut ledger, &settled, None).turn,
             TurnSignal::Settled
@@ -1223,7 +1223,12 @@ mod tests {
             );
         }
         assert!(matches!(
-            translate(&mut ledger, &AgentSessionEvent::AgentSettled, None).turn,
+            translate(
+                &mut ledger,
+                &AgentSessionEvent::AgentSettled { aborted: false },
+                None
+            )
+            .turn,
             TurnSignal::Settled
         ));
     }
@@ -1353,7 +1358,11 @@ mod tests {
         );
         assert_eq!(ledger.len(), 1);
 
-        let settled = translate(&mut ledger, &AgentSessionEvent::AgentSettled, None);
+        let settled = translate(
+            &mut ledger,
+            &AgentSessionEvent::AgentSettled { aborted: false },
+            None,
+        );
         assert!(settled.updates.is_empty());
         // ACP-137: and the ledger is bounded at the same point.
         assert!(ledger.is_empty(), "the settle is also the teardown");
@@ -1605,7 +1614,9 @@ mod tests {
     #[test]
     fn snapshot_needed_asks_only_for_file_mutations() {
         let mut ledger = fresh();
-        assert!(snapshot_needed(&ledger, &AgentSessionEvent::AgentSettled).is_none());
+        assert!(
+            snapshot_needed(&ledger, &AgentSessionEvent::AgentSettled { aborted: false }).is_none()
+        );
         assert!(
             snapshot_needed(
                 &ledger,
@@ -1655,6 +1666,7 @@ mod tests {
             Some(FileSnapshot::read("a.rs", "old\n")),
         );
         let end = AgentSessionEvent::ToolExecutionEnd {
+            duration_ms: None,
             tool_call_id: "e1".into(),
             tool_name: "edit".into(),
             result: tool_result("ok"),
@@ -1681,6 +1693,7 @@ mod tests {
             snapshot_needed(
                 &ledger,
                 &AgentSessionEvent::ToolExecutionEnd {
+                    duration_ms: None,
                     tool_call_id: "e1".into(),
                     tool_name: "edit".into(),
                     result: tool_result("ok"),
@@ -1697,6 +1710,7 @@ mod tests {
             snapshot_needed(
                 &ledger,
                 &AgentSessionEvent::ToolExecutionEnd {
+                    duration_ms: None,
                     tool_call_id: "e1".into(),
                     tool_name: "edit".into(),
                     result: tool_result("boom"),
@@ -1873,6 +1887,7 @@ mod tests {
         let out = translate(
             &mut ledger,
             &AgentSessionEvent::ToolExecutionEnd {
+                duration_ms: None,
                 tool_call_id: "w1".into(),
                 tool_name: "write".into(),
                 result: tool_result("wrote new.rs"),
@@ -1911,6 +1926,7 @@ mod tests {
         let out = translate(
             &mut ledger,
             &AgentSessionEvent::ToolExecutionEnd {
+                duration_ms: None,
                 tool_call_id: "e1".into(),
                 tool_name: "edit".into(),
                 result: tool_result("edited"),
@@ -1941,6 +1957,7 @@ mod tests {
         let out = translate(
             &mut ledger,
             &AgentSessionEvent::ToolExecutionEnd {
+                duration_ms: None,
                 tool_call_id: "e2".into(),
                 tool_name: "edit".into(),
                 result: tool_result("edited"),
@@ -1971,6 +1988,7 @@ mod tests {
             let out = translate(
                 &mut ledger,
                 &AgentSessionEvent::ToolExecutionEnd {
+                    duration_ms: None,
                     tool_call_id: "e1".into(),
                     tool_name: "edit".into(),
                     result: tool_result("body"),
@@ -2092,6 +2110,7 @@ mod tests {
         let end = translate(
             &mut ledger,
             &AgentSessionEvent::ToolExecutionEnd {
+                duration_ms: None,
                 tool_call_id: "sh1".into(),
                 tool_name: "bash".into(),
                 result: tool_result("1\n2\n3\n"),
@@ -2380,6 +2399,7 @@ mod tests {
                 partial_result: tool_result("a.rs:1"),
             },
             AgentSessionEvent::ToolExecutionEnd {
+                duration_ms: None,
                 tool_call_id: "t1".into(),
                 tool_name: "grep".into(),
                 result: tool_result("a.rs:1"),

@@ -32,10 +32,14 @@ use std::sync::{Arc, RwLock};
 /// messages injected across the handler chain (accumulated, Pi `messages.push`, runner.ts:1014).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct BeforeAgentStartReduction {
-    /// The replaced system prompt, iff at least one handler changed it (Pi `systemPromptModified`).
+    /// The system prompt the final options render to, iff it differs from the one passed in.
     pub system_prompt: Option<String>,
     /// Messages injected by handlers, in chain order (Pi `messages`).
     pub injected: Vec<Message>,
+    /// The `systemPromptOptions` as the handlers left them (pi `{ messages, systemPromptOptions:
+    /// currentOptions }`, `core/extensions/runner.ts:1475` @v1.1.0; EXT-084): the options passed
+    /// in, with every handler's edits and, when a handler returned a prompt, `forceSystemPrompt`.
+    pub options: Value,
 }
 
 /// The reduced result of [`ExtensionHost::emit_input`] (Pi `InputEventResult`, types.ts:805-808):
@@ -1235,7 +1239,7 @@ impl ExtensionHost {
             prompt: prompt.to_string(),
             images,
             system_prompt: system_prompt.to_string(),
-            options,
+            options: options.clone(),
             injected: Vec::new(),
         };
         match self.dispatcher.dispatch_block_mutate(ev, cancel).await {
@@ -1243,16 +1247,18 @@ impl ExtensionHost {
                 let HostEvent::BeforeAgentStart {
                     system_prompt: sp,
                     injected,
+                    options: edited,
                     ..
                 } = *ev
                 else {
                     return None;
                 };
                 let changed = sp != system_prompt;
-                if changed || !injected.is_empty() {
+                if changed || !injected.is_empty() || edited != options {
                     Some(BeforeAgentStartReduction {
                         system_prompt: if changed { Some(sp) } else { None },
                         injected,
+                        options: edited,
                     })
                 } else {
                     None

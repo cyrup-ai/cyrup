@@ -21,6 +21,10 @@ pub enum SessionError {
     AmbiguousSelector { prefix: String, n: usize },
     #[error("entry not found: {0}")]
     EntryNotFound(EntryId),
+    /// pi `appendContextEdit`'s refusals (`core/session-manager.ts:1360-1385` @v1.1.0), with
+    /// pi's own text.
+    #[error("{0}")]
+    ContextEdit(String),
     #[error("{0}")]
     InvalidSessionId(String),
     #[error("cannot fork: source empty/invalid: {0}")]

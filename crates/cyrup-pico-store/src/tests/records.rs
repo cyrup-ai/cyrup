@@ -139,6 +139,8 @@ fn a_terminal_task_has_no_memos_field() {
         owner: None,
         background: false,
         abort_requested: false,
+        started_at: None,
+        ended_at: None,
         state: TaskState::Terminal {
             outcome: TaskOutcome::Completed {
                 result: DocValue::integer(1),
@@ -152,6 +154,55 @@ fn a_terminal_task_has_no_memos_field() {
     assert_eq!(
         serde_json::from_str::<TaskRecord>(&json).expect("re-decodes"),
         terminal
+    );
+}
+
+/// pi v1.1.0 task records carry `startedAt`/`endedAt` (`packages/durable/src/types.ts`,
+/// `spec.md:1645-1648`, commit 36a686ee8). Storage keeps them through a write and a read, omits them
+/// when absent — a record from before the fields existed reads unchanged — and does not invent them:
+/// stamping is the task machine's job, which ADR-0029 keeps out of scope.
+#[test]
+fn a_task_records_lifecycle_times_round_trip_and_are_absent_when_unset() {
+    let ran = TaskRecord {
+        id: id(5),
+        conversation_id: id(1),
+        kind: kind("cyrup.generation"),
+        version: cyrup_pico_doc::DefVersion::FIRST,
+        input: DocValue::Null,
+        owner: None,
+        background: false,
+        abort_requested: false,
+        started_at: Some(1_700_000_000_000),
+        ended_at: Some(1_700_000_004_200),
+        state: TaskState::Terminal {
+            outcome: TaskOutcome::Completed {
+                result: DocValue::integer(1),
+            },
+        },
+    };
+    let json = serde_json::to_string(&ran).expect("serializes");
+    assert!(
+        json.contains("1700000000000") && json.contains("1700000004200"),
+        "{json}"
+    );
+    assert_eq!(
+        serde_json::from_str::<TaskRecord>(&json).expect("re-decodes"),
+        ran
+    );
+
+    let legacy = TaskRecord {
+        started_at: None,
+        ended_at: None,
+        ..ran
+    };
+    let json = serde_json::to_string(&legacy).expect("serializes");
+    assert!(
+        !json.contains("started_at") && !json.contains("ended_at"),
+        "{json}"
+    );
+    assert_eq!(
+        serde_json::from_str::<TaskRecord>(&json).expect("a record without them reads"),
+        legacy
     );
 }
 

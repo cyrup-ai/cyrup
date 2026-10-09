@@ -341,6 +341,7 @@ impl<B: Backend> App<B> {
                     content,
                     details,
                     is_error,
+                    duration_ms,
                     ..
                 }) => {
                     // The SAME `{content, details}` value the walk hands the built-in renderer,
@@ -352,7 +353,7 @@ impl<B: Backend> App<B> {
                         ext_host,
                         tool_name,
                         &result,
-                        &opts.clone().errored(*is_error),
+                        &opts.clone().errored(*is_error).recorded(*duration_ms),
                     )
                     .await;
                     if let crate::transcript::Rendered::Tree(tree) = &drawn {
@@ -531,6 +532,12 @@ impl<B: Backend> App<B> {
                             rendered.tool_calls.get(call.id.as_str()).cloned(),
                             definition,
                         );
+                        // A replayed call did not start executing NOW: pi's replay never calls
+                        // `markExecutionStarted` (only the live `tool_execution_start` does,
+                        // `interactive-mode.ts:3628` @v1.1.0), so its bash renderer has no
+                        // `startedAt` and shows only a RECORDED duration. Leaving the start stamp
+                        // made every replayed command read `Took 0.0s`.
+                        self.state.transcript.clear_tool_start(call.id.as_str());
                         if let Some(tree) = rendered.tool_call_trees.get(call.id.as_str()) {
                             self.state.transcript.set_tool_tree(
                                 call.id.as_str(),
@@ -549,6 +556,7 @@ impl<B: Backend> App<B> {
                     content,
                     is_error,
                     details,
+                    duration_ms,
                     ..
                 }) => {
                     // The shape every per-tool `renderResult` reads (`{content, details}`) — the
@@ -563,6 +571,9 @@ impl<B: Backend> App<B> {
                         Some(result),
                         // EXT-041 — the extension's result body for THIS call id, or the built-in.
                         rendered.tool_results.get(tool_call_id.as_str()).cloned(),
+                        // pi replays a result with `updateResult(message)`, so the recorded
+                        // `durationMs` reaches the renderer (`interactive-mode.ts:4070` @v1.1.0).
+                        *duration_ms,
                     );
                     if let Some(tree) = rendered.tool_result_trees.get(tool_call_id.as_str()) {
                         self.state.transcript.set_tool_tree(

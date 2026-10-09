@@ -70,6 +70,7 @@ fn before_agent_start_dual_result_carries_both_fields() {
         Outcome::before_agent_start(BeforeAgentStartResult {
             message: Some(json!({"role": "user", "content": "x"})),
             system_prompt: Some("new prompt".into()),
+            ..Default::default()
         })
     });
     let out = api.dispatch(4, &["prompt", "[]", "sys", "{}"], &Ctx::new());
@@ -220,6 +221,7 @@ fn a_renderer_sees_the_display_options_and_the_theme_name() {
         output_pad: 2,
         is_partial: true,
         theme: Some("dark".to_string()),
+        ..crate::RenderOptions::default()
     };
     let out = api.render_call("demo", &json!({}), &expanded).unwrap();
     assert_eq!(out["expanded"], json!(true));
@@ -236,6 +238,8 @@ fn the_hosts_opts_json_parses_into_the_guest_mirror() {
         "expanded": true,
         "outputPad": 3,
         "isPartial": true,
+        "isError": true,
+        "durationMs": 4200,
         "theme": "solarized",
     }));
     assert_eq!(
@@ -244,6 +248,8 @@ fn the_hosts_opts_json_parses_into_the_guest_mirror() {
             expanded: true,
             output_pad: 3,
             is_partial: true,
+            is_error: true,
+            duration_ms: Some(4200),
             theme: Some("solarized".to_string()),
         }
     );
@@ -558,7 +564,7 @@ fn all_33_event_kinds_are_registerable() {
     api.on_agent_start(|_| {});
     api.on_agent_end(|_, _| {});
     api.on_turn_start(|_, _| {});
-    api.on_turn_end(|_, _| {});
+    api.on_turn_end(|_, _| Outcome::noop());
     api.on_message_start(|_, _| {});
     api.on_message_update(|_, _| {});
     api.on_tool_exec_start(|_, _| {});
@@ -581,7 +587,7 @@ fn all_33_event_kinds_are_registerable() {
     // Kinds 30-32, added after this test was written: `agent_settled`
     // (pi `AgentSettledEvent`), `before_provider_headers` (`extensions/types.ts:686-689`
     // @v0.83.0, EXT-009) and `session_info_changed` (`extensions/types.ts:571-575`, EXT-011).
-    api.on_agent_settled(|_| {});
+    api.on_agent_settled(|_, _| {});
     api.on_before_provider_headers(|_, _| Outcome::noop());
     api.on_session_info_changed(|_, _| {});
     // Kinds 33-35, pi's post-baseline events: `ui_prompt_start`/`ui_prompt_end` (v0.84.4,
@@ -607,7 +613,7 @@ fn every_subscriber_returns_the_remover_for_its_own_event() {
     use crate::api::Removal;
 
     let mut api = ExtensionApi::new();
-    let turn_end = api.on_turn_end(|_, _| {});
+    let turn_end = api.on_turn_end(|_, _| Outcome::noop());
     let context = api.on_context(|_, _| Outcome::noop());
     let prompt_end = api.on_ui_prompt_end(|_, _| {});
     let kinds = api.subscription_kinds();
@@ -641,7 +647,10 @@ fn a_remover_run_inside_the_factory_leaves_the_event_unsubscribed() {
     let called = Rc::new(Cell::new(false));
     let mut api = ExtensionApi::new();
     let c = called.clone();
-    let off = api.on_turn_end(move |_, _| c.set(true));
+    let off = api.on_turn_end(move |_, _| {
+        c.set(true);
+        Outcome::noop()
+    });
     api.on_agent_start(|_| {});
     off.unsubscribe();
 
@@ -669,9 +678,15 @@ fn removing_the_first_handler_leaves_the_second() {
     let calls: Rc<RefCell<Vec<&str>>> = Rc::default();
     let mut api = ExtensionApi::new();
     let c = calls.clone();
-    let first = api.on_turn_end(move |_, _| c.borrow_mut().push("first"));
+    let first = api.on_turn_end(move |_, _| {
+        c.borrow_mut().push("first");
+        Outcome::noop()
+    });
     let c = calls.clone();
-    let second = api.on_turn_end(move |_, _| c.borrow_mut().push("second"));
+    let second = api.on_turn_end(move |_, _| {
+        c.borrow_mut().push("second");
+        Outcome::noop()
+    });
     assert_ne!(first, second, "two registrations, two identities");
 
     api.dispatch(10, &["0", "{}", "[]"], &Ctx::new());
@@ -784,9 +799,70 @@ fn two_handlers_for_one_event_both_run_in_order_with_pis_result_combination() {
     });
     let out = mutate(api.dispatch(4, &["hi", "[]", "base", "{}"], &ctx));
     assert_eq!(*seen.borrow(), ["base", "one"]);
+    // EXT-084: a returned prompt is recorded in the shared options as `forceSystemPrompt`.
     assert_eq!(
         out,
-        json!({"systemPrompt": "two", "messages": [{"role": "custom", "n": 1}, {"role": "custom", "n": 2}]})
+        json!({
+            "systemPrompt": "two",
+            "systemPromptOptions": {"forceSystemPrompt": "two"},
+            "messages": [{"role": "custom", "n": 1}, {"role": "custom", "n": 2}],
+        })
+    );
+
+    // EXT-084 (`emitBeforeAgentStart` @v1.1.0): the handlers share ONE `systemPromptOptions`; the
+    // second reads the first one's edit — and its forced prompt — and `ctx.system_prompt()`
+    // follows the chain. The combined outcome carries the options as the chain left them, and
+    // drops an earlier `systemPrompt` the returned options already account for.
+    let seen: Rc<RefCell<Vec<(Value, String)>>> = Rc::default();
+    let mut api = ExtensionApi::new();
+    let s = seen.clone();
+    api.on_before_agent_start(move |e, c| {
+        s.borrow_mut().push((e.options.clone(), c.system_prompt()));
+        Outcome::before_agent_start(BeforeAgentStartResult {
+            system_prompt: Some("forced".into()),
+            ..Default::default()
+        })
+    });
+    let s = seen.clone();
+    api.on_before_agent_start(move |e, c| {
+        s.borrow_mut().push((e.options.clone(), c.system_prompt()));
+        let mut options = e.options.clone();
+        options["sections"] = json!({"team": "notes"});
+        options.as_object_mut().unwrap().remove("forceSystemPrompt");
+        Outcome::before_agent_start(BeforeAgentStartResult {
+            system_prompt_options: Some(options),
+            ..Default::default()
+        })
+    });
+    let s = seen.clone();
+    api.on_before_agent_start(move |e, c| {
+        s.borrow_mut().push((e.options.clone(), c.system_prompt()));
+        Outcome::noop()
+    });
+    let out = mutate(api.dispatch(4, &["hi", "[]", "base", r#"{"cwd":"/p"}"#], &ctx));
+    let seen = seen.borrow();
+    assert_eq!(seen[0], (json!({"cwd": "/p"}), "base".to_string()));
+    assert_eq!(
+        seen[1],
+        (
+            json!({"cwd": "/p", "forceSystemPrompt": "forced"}),
+            "forced".to_string()
+        )
+    );
+    // The host target has no host to render the edited options, so the prompt stays as the
+    // last one rendered; on a guest the `render-system-prompt` import answers.
+    assert_eq!(
+        seen[2].0,
+        json!({"cwd": "/p", "sections": {"team": "notes"}})
+    );
+    assert_eq!(
+        out,
+        json!({"systemPromptOptions": {"cwd": "/p", "sections": {"team": "notes"}}, "messages": []})
+    );
+    assert_eq!(
+        Ctx::new().system_prompt(),
+        "",
+        "outside the chain `ctx.system_prompt()` is the host's again"
     );
 
     // `tool_result` (`emitToolResult`): each returned field overwrites, key by key.
@@ -1388,4 +1464,65 @@ fn a_registration_error_propagates_out_of_a_handler_with_question_mark() {
         Err("Invalid default for flag \"x\": expected boolean, got string".to_string())
     );
     assert!(!reached.get(), "the rest of the handler did not run");
+}
+
+/// The pi v1.1.0 event batch, decoded from the positional strings `export_extension!` sends (the
+/// export glue in `src/macros.rs`): `tool_execution_end` carries `durationMs` at index 4 ("" when
+/// the tool did not run) with `parentToolCallId` after it; `agent_settled` carries `aborted`;
+/// `session_compact_failed` carries pi's five fields.
+#[test]
+fn the_v1_1_event_batch_decodes_from_the_export_args() {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    let seen: Rc<RefCell<Vec<String>>> = Rc::default();
+    let mut api = ExtensionApi::new();
+    let s = Rc::clone(&seen);
+    api.on_tool_exec_end(move |ev, _| {
+        s.borrow_mut().push(format!(
+            "end {} {:?} {:?}",
+            ev.call_id, ev.duration_ms, ev.parent_tool_call_id
+        ));
+    });
+    let s = Rc::clone(&seen);
+    api.on_agent_settled(move |ev, _| s.borrow_mut().push(format!("settled {}", ev.aborted)));
+    let s = Rc::clone(&seen);
+    api.on_session_compact_failed(move |ev, _| s.borrow_mut().push(format!("{ev:?}")));
+
+    let ctx = Ctx::new();
+    api.dispatch(15, &["c1", "bash", "{}", "false", "42", "p1"], &ctx);
+    api.dispatch(15, &["c2", "bash", "{}", "true", "", ""], &ctx);
+    api.dispatch(30, &["true"], &ctx);
+    api.dispatch(30, &["false"], &ctx);
+    api.dispatch(37, &["overflow", "boom", "false", "false", "true"], &ctx);
+    api.dispatch(37, &["manual", "", "true", "false", "false"], &ctx);
+
+    assert_eq!(
+        *seen.borrow(),
+        vec![
+            "end c1 Some(42) Some(\"p1\")".to_string(),
+            "end c2 None None".to_string(),
+            "settled true".to_string(),
+            "settled false".to_string(),
+            format!(
+                "{:?}",
+                crate::SessionCompactFailedEvent {
+                    reason: "overflow".into(),
+                    error_message: Some("boom".into()),
+                    aborted: false,
+                    will_retry: false,
+                    from_extension: true,
+                }
+            ),
+            format!(
+                "{:?}",
+                crate::SessionCompactFailedEvent {
+                    reason: "manual".into(),
+                    error_message: None,
+                    aborted: true,
+                    will_retry: false,
+                    from_extension: false,
+                }
+            ),
+        ]
+    );
 }

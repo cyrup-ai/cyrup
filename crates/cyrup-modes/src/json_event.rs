@@ -169,7 +169,7 @@ pub fn is_upstream_wire_event(event: &AgentSessionEvent) -> bool {
         | AgentSessionEvent::NestedToolExecutionEnd { .. }
         | AgentSessionEvent::TurnEnd { .. }
         | AgentSessionEvent::AgentEnd { .. }
-        | AgentSessionEvent::AgentSettled
+        | AgentSessionEvent::AgentSettled { .. }
         | AgentSessionEvent::QueueUpdate { .. }
         | AgentSessionEvent::CompactionStart { .. }
         | AgentSessionEvent::CompactionEnd { .. }

@@ -578,6 +578,23 @@ mod tests {
         assert_eq!(delta["delta"], "Hello", "the delta payload is still read");
     }
 
+    /// A cyrup or pi v1.1.0 child writes `agent_settled` with `aborted` (pi `{ type: "agent_settled";
+    /// aborted: boolean }`, `core/agent-session.ts:203`). The parent reads the event as the drain
+    /// start it is and must not lose it to the new key; a child from before the key still parses.
+    #[test]
+    fn parses_agent_settled_with_or_without_aborted() {
+        for line in [
+            r#"{"type":"agent_settled","aborted":true}"#,
+            r#"{"type":"agent_settled","aborted":false}"#,
+            r#"{"type":"agent_settled"}"#,
+        ] {
+            assert!(
+                matches!(parse_line(line), Some(SubagentEvent::AgentSettled)),
+                "{line}"
+            );
+        }
+    }
+
     #[test]
     fn parses_tool_execution_end_with_is_error_flag() {
         let line = r#"{"type":"tool_execution_end","toolCallId":"c1","toolName":"bash","result":"ok","isError":false}"#;

@@ -106,7 +106,7 @@ pub async fn run_json<W: Write>(
         // Drain until this run settles. `agent_settled` is pi's own terminal for a submission
         // (`AgentSettledEvent`, extensions/types.ts:721-725) and is what the RPC host waits on too.
         while let Some(ev) = events.next().await {
-            let settled = matches!(ev, AgentSessionEvent::AgentSettled);
+            let settled = matches!(ev, AgentSessionEvent::AgentSettled { .. });
             write_event(out, &ev).await?;
             if settled {
                 break;
@@ -225,7 +225,7 @@ mod tests {
             AgentSessionEvent::SessionInfoChanged {
                 name: Some("work".into()),
             },
-            AgentSessionEvent::AgentSettled,
+            AgentSessionEvent::AgentSettled { aborted: false },
         ];
         for ev in &kept {
             let line = wire(ev);

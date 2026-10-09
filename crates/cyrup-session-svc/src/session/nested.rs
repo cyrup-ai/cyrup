@@ -181,6 +181,7 @@ struct SessionNestedHost<'a> {
 
 fn refusal(call: ToolCall, text: &str) -> ToolCallOutcome {
     ToolCallOutcome {
+        duration_ms: None,
         tool_call: call,
         result: ToolResult {
             content: vec![Content::text(text)],
