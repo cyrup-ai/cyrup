@@ -2,6 +2,57 @@
 
 This area covers `cyrup/crates/cyrup-core` (message/type model, JSONL serialization) and `cyrup/crates/cyrup-provider` (wire APIs, providers, catalogs, auth, streaming, validation), measured against `pi/packages/ai/`, `pi/packages/agent/` and the provider-facing half of `pi/packages/coding-agent/src/core/`. The ported baseline is **pi `v0.83.0`**; post-baseline drift is measured against **pi `v0.84.1`**.
 
+> ### PIN 2026-10-09 — pi v1.1.0 drift triage: cyrup `6b14575` × pi **`f1b2e77f5`** (= `v1.1.0-11-gf1b2e77f5`), `packages/ai`
+>
+> **Window read:** `git log --no-merges v1.0.1..f1b2e77f5 -- packages/ai` = **37** commits (the lane's own
+> count said 36; the verifier's 37 is the measured figure, and every commit has a disposition). Upstream read
+> through `git -C tmp/pi show <commit>` / `show f1b2e77f5:<path>` only; cyrup read at `6b14575`. Nothing was run.
+> The pin is an untagged commit eleven past `v1.1.0`, chosen deliberately so that post-tag fixes are in scope;
+> every row cites `@f1b2e77f5` (README *CURRENT PINS* records the departure from the tag-only rule).
+>
+> **Filed (11):** `PROV-139` (medium), `PROV-140`…`PROV-149` (low). **Moved elsewhere:** the three v1.1.0 retry
+> literals (`8b5708dbb`, `5b6c792b4`) are growth on area 12's open `DRIFT-060`, which owns `utils/retry.rs`'s
+> lists by precedent and already recorded `3874b3e98`'s `model is at capacity`; that row is retitled and its
+> `subscription_sharing_*` half marked closed (landed through `PROV-118`).
+>
+> **Read in scope and deliberately NOT filed:**
+> * *Release / changelog only:* `4c6fb7cfe`, `200387122`, `997d31f28`, `28dcce2ba`, `75a99721d`, `cd32f7725`
+>   (v1.0.2), `d78dc83d6` (v1.0.3), `7c10bd433` (v1.0.4), `abe508e1b` (v1.1.0); `dce4ae6f7` and `750105c80`
+>   (changelog edits whose substance the filed rows carry).
+> * *Tests / README only:* `311f0e020` (output-limit assertions after `27075fe07`, covered by `PROV-142`);
+>   `f6127a1bf`'s `packages/ai` half (README; the coding-agent half is `EXT-110`).
+> * *Type-only, no runtime behaviour:* `6b5854454`; `3ba22ce17` and `f284a2460` (how the event stream stores
+>   its start; cyrup's `ResponseTimer`, `timing.rs:66-93`, already has the behaviour); `7f9e1198f`'s
+>   `packages/ai` half (compat/model types moved into TypeBox schemas; a field-name diff of `types.ts`
+>   before against `types.ts` + `compat-schema.ts` + `model-schema.ts` after shows no new keys).
+> * *Already in cyrup:* `36a686ee8` (ported, ledger UPDATE 2026-10-09); `8d8ae2fc2` (`PROV-136`, closed);
+>   `fe11328b0` (faux-provider perf only); `a2eef9eb6` (Kimi K3 cacheWrite already 0 in all three catalogs).
+> * *Behaviour already as fixed:* `6b07b4e57` (cyrup never had Mistral's total deadline; reqwest
+>   `read_timeout` re-arms per read, `stream/sse.rs:40`, `:141`; residual, covered by the shared
+>   `[CYRUP-DELTA]`: upstream's Mistral header wait defaults to 60 s, cyrup's to the global 300 s idle value);
+>   `43d376399` (radius has no embedded rows, so the overlay already replaces); `bde882c74` (a started OAuth
+>   refresh runs in a detached spawn, `wire.rs:250`, `resolve.rs:199`, and always persists).
+> * *Folded into filed rows:* `943a10e74`, `ce950d78f` and `f76c1db66`'s catalog half → `PROV-149`; the
+>   anthropic-messages half of `f76c1db66` needs no code (pi.dev serves `claude-haiku-5-5` with full compat);
+>   `ce8972a0e` → `PROV-147` and `PROV-148` (its `classifier-shared.ts` extraction is a refactor over
+>   `PROV-104`'s unported apis); `76dfb88f6` → `PROV-146` (its `reasoningEffort` rewrite is
+>   behaviour-equivalent); `a37306d43` → `PROV-145`.
+>
+> **Leads recorded, not filed:**
+> * **`VL-P6` caution** (`PARITY-GAPS.md:2418`): when the auth-operation signal is ported, it must cancel only
+>   the lock wait and leave the refresh bounded by the 15 s timeout alone, per `refreshStoredOAuthCredential`
+>   (`auth/resolve.ts` @f1b2e77f5); otherwise porting `VL-P6` reintroduces `bde882c74`'s bug.
+> * **models.json `compat` became one open object** (`7f9e1198f`): pi replaced the `compat` union
+>   (OpenAICompletions | OpenAIResponses | AnthropicMessages) with a single `ProviderCompatSchema`
+>   (`additionalProperties: true`, `packages/ai/src/providers/compat-schema.ts:604-607`). cyrup leaves
+>   `compat` to serde under a `[CYRUP-DELTA]` (`crates/cyrup-config/src/model/validate.rs:246-249`). Whether
+>   serde now rejects a mixed-arm compat block pi accepts was not checked.
+>
+> **Ownership questions raised (README *Decisions for the maintainers*):** the `azure` rename (`PROV-145`) is an
+> area 05 migration decision, and urgent for tooling because the overlay and `gen-catalogs` already 404 on the
+> old stem; `7f9e1198f`'s published JSON Schemas are area 05's (`CFG-106`) and its theme strictness area 07's
+> (`TUI-178`).
+
 > ### CLOSURES 2026-10-09 — one low (`PROV-134`), with `SEAM-128` (area 08) and `CFG-085` (area 05) in one PR
 >
 > The three rows are one feature and none of their Verify lines can be met alone, so they closed
@@ -757,7 +808,7 @@ data only (Copilot Opus 5.5 effort map; image regeneration).
 
 ## Open items
 
-> **Next free id: `PROV-139`** (2026-10-08, the `PROV-120` follow-ups filed and closed `PROV-135`, `PROV-136`, in its review pass `PROV-137`, and in its second review `PROV-138`; `PROV-134` was taken on 2026-10-05 by the coordinator while recording `PROV-128`, which is why this line already read `PROV-135`; before that 2026-10-03, post-pin triage of pi v1.0.1: filed `PROV-130`…`PROV-133`; earlier on 2026-10-03 batch 6 filed `PROV-112`, an id the pi v1.0.0 pass left free, so the counter did not move then; before that 2026-10-02, after the pi v1.0.0 pass filed `PROV-113`…`PROV-129`).
+> **Next free id: `PROV-150`** (2026-10-09, the pi v1.1.0 drift triage filed `PROV-139`…`PROV-149`; before that `PROV-139`, 2026-10-08, the `PROV-120` follow-ups filed and closed `PROV-135`, `PROV-136`, in its review pass `PROV-137`, and in its second review `PROV-138`; `PROV-134` was taken on 2026-10-05 by the coordinator while recording `PROV-128`, which is why this line already read `PROV-135`; before that 2026-10-03, post-pin triage of pi v1.0.1: filed `PROV-130`…`PROV-133`; earlier on 2026-10-03 batch 6 filed `PROV-112`, an id the pi v1.0.0 pass left free, so the counter did not move then; before that 2026-10-02, after the pi v1.0.0 pass filed `PROV-113`…`PROV-129`).
 
 > **This table is the complete open set for area 01 — 41 rows: 40 counted items plus the one
 > `tracker` (`PROV-004`), including the `-S` surface-sweep ids, everything filed on 2026-08-12 and
@@ -1031,6 +1082,17 @@ data only (Copilot Opus 5.5 effort map; image regeneration).
 | ~~PROV-136~~ | ~~low~~ **CLOSED 2026-10-08** | upstream-drift | S | **Filed 2026-10-08 and closed on arrival** (while closing `PROV-120`). **When port 53692 cannot be bound, the Anthropic browser login drops straight to paste-only; pi v1.1.0 first falls back to an OS-chosen free port.** pi `8d8ae2fc2` (#10571): `startCallbackServer(CALLBACK_PORT).catch(() => startCallbackServer(0)).catch(() => undefined)` and `redirectUri = callback?.redirectUri ?? REDIRECT_URI` (`anthropic.ts:154-157` @v1.1.0), used by the authorize URL (`:164`), the paste placeholder (`:179`) and the exchange (`:194`). cyrup tried the configured port once (`.ok()`, `anthropic.rs:630` in the `PROV-120` first pass). **CLOSED 2026-10-08:** `run_login` tries the configured port, then `0`, then none (`crates/cyrup-provider/src/auth/oauth/anthropic.rs:676-679`), and uses the bound URI everywhere, falling back to `Self::redirect_uri` (`REDIRECT_URI` in production) only with no listener (`:681-684`). Verify: `login_falls_back_to_a_free_port_when_the_preferred_port_cannot_bind`, `login_degrades_to_manual_paste_when_no_callback_port_can_bind`, `login_completes_via_browser_redirect`, `login_accepts_a_pasted_redirect_url_with_the_matching_state`, `redirect_uri_matches_the_bound_listener`. Body below. |
 | ~~PROV-137~~ | ~~low~~ **CLOSED 2026-10-08** | upstream-drift | S | **Filed 2026-10-08 and closed on arrival** (review of the `PROV-120` pass). **When the user denies consent in the browser, the Anthropic browser login answered with an error page and kept waiting on the paste prompt; pi fails the login at once with `Anthropic authorization failed: <description>`.** pi `4df157433` (v0.99.0) moved `loginAnthropic` onto the shared `startOAuthCallbackServer` (`anthropic.ts:142-151` @v1.1.0, `state: verifier`), whose handler (`callback-server.ts:78-116`) checks the state first (`:85-88`, 400 `State mismatch.`, so a missing state too), then settles a truthy `error` with `finish({ error })` and a 400 `Anthropic authorization failed.` page carrying `error_description ?? error` (`:93-99`), then answers a missing code with 400 `Missing authorization code.` (`:100-104`), and on success shows `Signed in to Anthropic. You may now close this page.` (`:108`; pi `test/anthropic-oauth.test.ts:220`). `AnthropicCallbackHandler` was still the v0.83.0 hand-rolled handler (`anthropic.ts:114-148` @v0.83.0): an `?error=` was a non-settling `Continue` ("Anthropic authentication did not complete."), checked before the state, and the pages had the old wording; `bad_redirects_are_answered_without_ending_the_login` pinned that. **CLOSED 2026-10-08:** `AnthropicCallbackHandler::handle` (`crates/cyrup-provider/src/auth/oauth/anthropic.rs:383-445`) ports `:81-109` in upstream order — a non-GET 404 (the shared server owns the pathname half), state, `error` as `CallbackOutcome::Failed` with `OAuthError::Failed("Anthropic authorization failed: {description}")`, code, then the 200 page — all `no_store()` like `openrouter.rs`. The 502 branch (`:110-114`) is unreachable because `complete` is the identity. The redirect losing to an `Err` already ends `run_login` (the `settled?` arm propagates and the paste prompt is aborted on the way out, as a rejected `await callback?.wait()` throws out of `waitForCallbackOrManualInput` at `callback-server.ts:174` and its `finally` aborts the prompt; since `PROV-138` that abort is a drop guard covering every exit). The module header and provenance row now cite `callback-server.ts:78-116` @v1.1.0, and the header records the two remaining shared-server wording differences (the 404 and 409 pages), which no browser following a redirect can reach and which every flow on that server shares. Verify: `a_denied_redirect_fails_the_login` (`?error=access_denied&state=<verifier>` and the `error_description` variant: the login errs with `Anthropic authorization failed: access_denied` / `…: User denied access`, the page is 400 with the description, the token endpoint is never hit), `bad_redirects_are_answered_without_ending_the_login` (stateless denial, missing state and wrong state each get `State mismatch.`; `?error=&state=<verifier>` gets `Missing authorization code.`; a later good redirect completes), `login_completes_via_browser_redirect` (the `Signed in to Anthropic.` page). The redirect-driven tests now run under a 10s deadline (`within`, and a read timeout in `http_get`): with the free-port fallback mutated out, `login_falls_back_to_a_free_port_when_the_preferred_port_cannot_bind` fails in 10s where it used to hang. Body below. |
 | ~~PROV-138~~ | ~~low~~ **CLOSED 2026-10-08** | parity-bug | S | **Filed 2026-10-08 and closed on arrival** (second review of the `PROV-120` pass). **When the paste won the Anthropic browser login's race, or the paste prompt failed, the prompt's own abort signal was never fired; pi aborts it on every exit.** Upstream threads `manualAbort.signal` into the `manual_code` prompt and calls `manualAbort.abort()` in a `finally` that runs whichever side settles the wait (`anthropic.ts:232`, `:261`, `:299-300` @v0.83.0; `waitForCallbackOrManualInput`, `callback-server.ts:160-182` @v1.1.0, the abort at `:180-182`), so a UI can dismiss a prompt it still shows; pi `test/anthropic-oauth.test.ts:177-211` @v1.1.0 ("resolves through the manual_code prompt and aborts it after settling") asserts `manualSignal.aborted` after a paste-won login. cyrup's `run_login` cancelled the token only in the `Winner::Redirect` arm (`anthropic.rs:648` at `d3789b1`, `:675` in the `PROV-120` first pass), so the paste-won path, the prompt-rejected path and the second-chance path all returned with the prompt's token live; the port was like this from the first v0.83.0 port. **CLOSED 2026-10-08:** the token's `drop_guard()` (`crates/cyrup-provider/src/auth/oauth/anthropic.rs:705`) is upstream's `finally`: every `?` return drops it, and the success path drops it once the wait has settled and before the exchange (`:788`), where `waitForCallbackOrManualInput` returns. The `Winner::Redirect` arm no longer cancels by hand (`:729`). The module header's *Cancellation* divergence note says so. Verify (`auth/oauth/anthropic.rs` tests): `login_resolves_through_the_manual_prompt_and_aborts_it_after_settling` (the port of pi's test: the paste wins, the login completes, the `manual_code` prompt's token is cancelled; red before the fix) and `a_failed_manual_prompt_is_aborted_too` (a rejected paste fails the login and its token is cancelled). The redirect-won path is still covered by `login_completes_via_browser_redirect`, whose blocking paste prompt only returns when its token fires. Body below. |
+| PROV-139 | medium | upstream-drift | S | **Bedrock does not recognise Claude Haiku 5.5: no prompt caching, budget thinking instead of adaptive, and no native `xhigh` or block binding** **Filed 2026-10-09 from the pi v1.1.0 drift triage**; body below. |
+| PROV-140 | low | upstream-drift | S | **Bedrock Converse sends no reasoning effort to OpenAI GPT models, so the configured thinking level never reaches them** **Filed 2026-10-09 from the pi v1.1.0 drift triage**; body below. |
+| PROV-141 | low | upstream-drift | S | **Mistral `finish_reason: "error"` is not retried, because its message lacks the `server error` marker upstream added** **Filed 2026-10-09 from the pi v1.1.0 drift triage**; body below. |
+| PROV-142 | low | upstream-drift | S | **The request-context estimate still uses 4 characters per token; pi 1.1.0 uses 3.5, so cyrup's output-token clamp leaves less headroom and long prompts can overflow** **Filed 2026-10-09 from the pi v1.1.0 drift triage**; body below. |
+| PROV-143 | low | upstream-drift | S | **Codex Responses still pins `originator` and `User-Agent` after the caller's headers, so `model.headers` / `options.headers` cannot override them as pi 1.1.0 allows** **Filed 2026-10-09 from the pi v1.1.0 drift triage**; body below. |
+| PROV-144 | low | not-ported | S | **`LoginOptions.agentName` is unported, so an embedding app cannot name itself in the Sign in with ChatGPT or Codex browser login** **Filed 2026-10-09 from the pi v1.1.0 drift triage**; body below. |
+| PROV-145 | low | upstream-drift | M | **The Azure provider is still `azure-openai-responses` and serves only the Responses API; pi 1.0.3 renamed it to `azure` and added Foundry Chat Completions deployments (DeepSeek V4 Pro). Decision-gated: the rename needs an owner decision first** **Filed 2026-10-09 from the pi v1.1.0 drift triage**; body below. |
+| PROV-146 | low | not-ported | M | **`Model.samplingParamsByThinkingLevel` is unported, so per-thinking-level sampling overrides are ignored at request time (the request half; lands with `PROV-123`, and `CFG-104` is the models.json half)** **Filed 2026-10-09 from the pi v1.1.0 drift triage**; body below. |
+| PROV-147 | low | not-ported | M | **The `openai-decisions` classifier API (OpenAI's Decisions API, `openai/gpt-6-luna` as a classifier) is unported** **Filed 2026-10-09 from the pi v1.1.0 drift triage**; body below. |
+| PROV-148 | low | not-ported | S | **`ClassifierContext.images` is unported, so a classify request cannot carry images and no model-level image check exists** **Filed 2026-10-09 from the pi v1.1.0 drift triage**; body below. |
+| PROV-149 | low | stale-port | S | **The embedded catalogs predate pi 1.1.0: no Claude Haiku 5.5 rows, Sonnet 5.5 cache reads priced at 0.2 instead of 0.1, Sonnet 4.5 embedded at a 1M context window, and no prompt-length tiers for Google, OpenCode, OpenCode Go, OpenRouter, Vercel or MiniMax** **Filed 2026-10-09 from the pi v1.1.0 drift triage**; body below. |
 
 ## PROV-003 — `ApiKeyAuth` has no `login`; `Models` has no `login`/`logout` (OAuth flow half closed)
 
@@ -3983,6 +4045,186 @@ The tests that drive the listener over HTTP while the paste prompt blocks now ha
 **Verify** — in `auth/oauth/anthropic.rs` tests:
 - `login_resolves_through_the_manual_prompt_and_aborts_it_after_settling`: the port of pi's test. The paste wins, the credential is stored from the fake token endpoint, an `auth_url` was emitted, and the `manual_code` prompt's token is cancelled. It fails against the previous code.
 - `a_failed_manual_prompt_is_aborted_too`: a paste prompt that rejects fails the login with its own error, and its token is cancelled.
+
+## Findings filed 2026-10-09 — the pi v1.1.0 drift triage (`v1.0.1..f1b2e77f5`)
+
+Upstream read through `git -C tmp/pi show` only, at `f1b2e77f5` (= `v1.1.0-11-gf1b2e77f5`); cyrup read at `6b14575`. Nothing was run. The window record (what was read and not filed) is the PIN 2026-10-09 block at the top of this file.
+
+## PROV-139 — Bedrock does not recognise Claude Haiku 5.5: no prompt caching, budget thinking instead of adaptive, and no native `xhigh` or block binding
+
+**Kind** upstream-drift · **Severity** medium · **Effort** S · **Confidence** confirmed (both sides read; static, nothing run) · **Filed** 2026-10-09
+
+> **Filed 2026-10-09 from the pi v1.1.0 drift triage** (pi `v1.0.1..f1b2e77f5` = v1.1.0+11, `packages/ai`, cyrup `6b14575`).
+
+**upstream** — `f76c1db66` (Haiku 5.5, in v1.1.0) adds the `haiku-5` needle to all four Bedrock predicates in `packages/ai/src/api/bedrock-converse-stream.ts` @f1b2e77f5: `supportsAdaptiveThinking` `:766` (needle `:776`), `supportsNativeXhighEffort` `:781` (`:789`), `supportsThinkingBlockBinding` `:798` (`:806`) and `supportsPromptCaching` `:876` (the Claude 5 branch, `:886-889`).
+
+**cyrup** — `crates/cyrup-provider/src/api/bedrock_converse_stream/capabilities.rs`: `supports_adaptive_thinking`'s `NEEDLES` (`:40-49`, seven entries, no `haiku-5`), `supports_thinking_block_binding` `:61`, `supports_native_xhigh_effort` `:70`, `supports_prompt_caching` `:126` (`any(&["fable-5", "opus-5", "sonnet-5"])`). `rg 'haiku-5' crates/cyrup-provider/src --glob '!**/tests/**'` finds nothing. The rows do reach cyrup: the live pi.dev `amazon-bedrock` catalog (fetched 2026-10-09) serves six `*.anthropic.claude-haiku-5-5` rows, which the runtime overlay merges in, and Haiku 4.x's `-4-` needle does not match `haiku-5-5`. The module's comments also still cite v1.0.1-era upstream lines (for example `:588-600` and `:679-698`).
+
+**Impact** — A Bedrock Haiku 5.5 session sends no cache points, so every turn bills the whole prompt at the full input rate: real extra spend, not just a wrong display. With thinking on, cyrup sends `thinking:{type:"enabled",budget_tokens}` plus the interleaved beta where upstream sends adaptive thinking with `output_config.effort`; `xhigh` is downgraded to `high`; replayed thinking gets no `block_binding`. **The impact is probably understated:** pi's compat doc says `forceAdaptiveThinking` is for models whose upstream *requires* the adaptive format, and pi's Anthropic catalog sets it for Haiku 5.5, so the budget-thinking request cyrup builds may be rejected outright when thinking is on. That is plausible, not run-verified. Severity medium stands.
+
+**Fix** — Add `"haiku-5"` to the four needle lists in `capabilities.rs` in upstream's order. Refresh every upstream line citation in the module's comments to @f1b2e77f5, not only the four needles' citations.
+
+**Verify** — Unit tests in `bedrock_converse_stream/tests` for `global.anthropic.claude-haiku-5-5`: `supports_prompt_caching` is true, so a `cachePoint` is emitted; the request uses `thinking.type == "adaptive"` with `block_binding` and the binding beta; `map_thinking_level_to_effort(Xhigh) == "xhigh"`. Each is red before the needle is added. `anthropic.claude-haiku-4-5` keeps its current shape.
+
+## PROV-140 — Bedrock Converse sends no reasoning effort to OpenAI GPT models, so the configured thinking level never reaches them
+
+**Kind** upstream-drift · **Severity** low · **Effort** S · **Confidence** confirmed (both sides read; static, nothing run) · **Filed** 2026-10-09
+
+> **Filed 2026-10-09 from the pi v1.1.0 drift triage** (pi `v1.0.1..f1b2e77f5` = v1.1.0+11, `packages/ai`, cyrup `6b14575`).
+
+**upstream** — `2989eb581` (#10142, closes #9331): `buildAdditionalModelRequestFields` (`packages/ai/src/api/bedrock-converse-stream.ts:1262` @f1b2e77f5) gains two non-Claude branches at `:1318-1330`. gpt-oss gets a flat `reasoning_effort` from `OPENAI_GPT_OSS_EFFORT`, clamped to low/medium/high. Other `gpt-` models get `reasoning:{effort}` from `thinkingLevelMap`, else from `OPENAI_GPT_EFFORT`, where minimal becomes low. The two tables are at `:1339-1356`. Only the nested `gpt-` branch consults `thinkingLevelMap`; the gpt-oss branch uses its table unconditionally.
+
+**cyrup** — `crates/cyrup-provider/src/api/bedrock_converse_stream/params.rs:128-140`: `build_additional_model_request_fields` returns `None` unless `is_anthropic_claude_model(model)`. `rg -n 'gpt|reasoning_effort' crates/cyrup-provider/src/api/bedrock_converse_stream/` finds nothing. The embedded `amazon-bedrock.json` carries 33 `openai.gpt` rows, among them `global.openai.gpt-5.6-*` / `gpt-6-*` (e.g. `:2254`, `:2436`) and `openai.gpt-oss-120b` (`:4300`).
+
+**Impact** — On Bedrock, GPT-5.x, GPT-6 and gpt-oss always run at Bedrock's default effort; the thinking-level selector has no effect for them.
+
+**Fix** — Port both branches after the Claude branch, using the same `model_match_candidates` (`capabilities.rs:12`), and add the two effort tables. Test `gpt-oss` before `gpt-`, because `gpt-oss` also contains `gpt-`. In the nested form only, a `thinking_level_map` string entry overrides the table, as upstream does.
+
+**Verify** — Port `test/bedrock-thinking-payload.test.ts`'s new cases: gpt-oss at `xhigh` sends `reasoning_effort:"high"`; GPT-6 at `minimal` sends `reasoning:{effort:"low"}`; a mapped level wins for `gpt-`; a gpt-oss model ignores the map; a Claude model is unchanged; reasoning off sends no field.
+
+## PROV-141 — Mistral `finish_reason: "error"` is not retried, because its message lacks the `server error` marker upstream added
+
+**Kind** upstream-drift · **Severity** low · **Effort** S · **Confidence** confirmed (both sides read; static, nothing run) · **Filed** 2026-10-09
+
+> **Filed 2026-10-09 from the pi v1.1.0 drift triage** (pi `v1.0.1..f1b2e77f5` = v1.1.0+11, `packages/ai`, cyrup `6b14575`).
+
+**upstream** — `7fb59f995` (#10487): `mapChatStopReason`'s `"error"` arm returns `errorMessage: "Provider stopped with: error (server error)"` (`packages/ai/src/api/mistral-conversations.ts:946-948` @f1b2e77f5), so `server.?error` in the retry classifier matches. The test asserts `isRetryableAssistantError(message) === true` and that an unknown reason stays non-retryable.
+
+**cyrup** — `crates/cyrup-provider/src/api/mistral_conversations/finish.rs:76-79` still returns `"Provider stopped with: error"`; its doc comment at `:68-70` quotes the old text and cites stale upstream lines (`:672-675`); `tests/stop_reason.rs:31` pins it. cyrup's retry list already has `server.?error` (`utils/retry.rs:84`), so the one-string change makes the error retryable.
+
+**Impact** — Mistral reports transient server failures this way. In cyrup they end the turn with an error banner where pi auto-retries.
+
+**Fix** — Change the string to `"Provider stopped with: error (server error)"` with upstream's comment; update the doc comment (text and upstream line citation) and the stop-reason test.
+
+**Verify** — `map_chat_stop_reason(Some("error"))` yields the new message and `utils::retry::is_retryable_assistant_error` on the resulting message is true; `Some("unmapped_error")` stays non-retryable. Red before.
+
+## PROV-142 — The request-context estimate still uses 4 characters per token; pi 1.1.0 uses 3.5, so cyrup's output-token clamp leaves less headroom and long prompts can overflow
+
+**Kind** upstream-drift · **Severity** low · **Effort** S · **Confidence** confirmed (both sides read; static, nothing run) · **Filed** 2026-10-09
+
+> **Filed 2026-10-09 from the pi v1.1.0 drift triage** (pi `v1.0.1..f1b2e77f5` = v1.1.0+11, `packages/ai`, cyrup `6b14575`).
+
+**upstream** — `27075fe07` (#10497), which touches only `estimate.ts` and its test: `CHARS_PER_TOKEN = 3.5` (`packages/ai/src/utils/estimate.ts:15` @f1b2e77f5). It drives `clampMaxTokensToContext` (`api/simple-options.ts:18`, used at `:46`). The coding-agent compaction estimator (`coding-agent/src/core/compaction/compaction.ts:311`, `:317`) deliberately stays at `/ 4`.
+
+**cyrup** — `crates/cyrup-provider/src/utils/estimate.rs:27` is `const CHARS_PER_TOKEN: u64 = 4;`, with `ceil_div` (`:36-38`) using `div_ceil`. Its only production consumer is `utils/simple_options.rs:52` (`clamp_max_tokens_to_context`). cyrup-session's compaction has its own estimator (`compaction/tokens.rs`) and must not change. Two other consumers see the value: `estimate_*` is public API (`lib.rs:191-194`), so SDK users see the change; and the test `cyrup-session-svc/src/tests/compaction_tokens_after.rs:134-138` sums `cyrup_provider::estimate_message_tokens` directly.
+
+**Impact** — For large inputs cyrup computes a higher `max_tokens` than pi. Providers that reject `input + max_tokens > context` (verified upstream on OpenRouter DeepSeek V4 Flash) fail the request where pi succeeds.
+
+**Fix** — Use 3.5 with an integer-exact ceiling, `ceil(chars / 3.5) == (2*chars).div_ceil(7)`, on the text and image paths. Leave `cyrup-session` compaction at `/4`, as upstream does.
+
+**Verify** — Port `test/context-estimate.test.ts`'s new expectations (20 chars give 6, not 5; one image gives `ceil(4800/3.5)` = 1372). The existing `"20 chars / 4"` assertion at `estimate.rs:524` flips. Check, rather than assume, that the `compaction_tokens_after` tests still pass, since one of them sums the provider estimate.
+
+## PROV-143 — Codex Responses still pins `originator` and `User-Agent` after the caller's headers, so `model.headers` / `options.headers` cannot override them as pi 1.1.0 allows
+
+**Kind** upstream-drift · **Severity** low · **Effort** S · **Confidence** confirmed (both sides read; static, nothing run) · **Filed** 2026-10-09
+
+> **Filed 2026-10-09 from the pi v1.1.0 drift triage** (pi `v1.0.1..f1b2e77f5` = v1.1.0+11, `packages/ai`, cyrup `6b14575`).
+
+**upstream** — `0cf65d2bf` (#10429): `buildBaseCodexHeaders` (`packages/ai/src/api/openai-codex-responses.ts:1640-1661` @f1b2e77f5) now seeds `{originator:"pi", "User-Agent": getPiUserAgent()}` first (`:1646-1647`), then applies init and additional headers. Only `Authorization` and `chatgpt-account-id` are set last (`:1658-1659`).
+
+**cyrup** — `crates/cyrup-provider/src/api/openai_codex_responses/headers.rs:55-96`: the overlays come first (`:63-80`), then `Authorization`, `chatgpt-account-id`, `originator` (`:93`) and `User-Agent` (`:94`). The doc comment (`:44-48`) states that the four "cannot be overridden", and its upstream citation (`:1577-1617`) is stale. cyrup has three overlay loops, the third being the per-credential `auth.auth.headers`.
+
+**Impact** — An extension or models.json entry that sets `originator` or `User-Agent` for openai-codex is silently overwritten, unlike every other adapter.
+
+**Fix** — Seed `originator` and `User-Agent` before all three overlay loops (including `auth.auth.headers`), keep `Authorization` and `chatgpt-account-id` last, and rewrite the doc comment and its citation. A `None` overlay value on `originator` then deletes it, as `headers.delete` does upstream.
+
+**Verify** — Port the two cases from `test/openai-codex-stream.test.ts`: a caller `originator` / `User-Agent` wins; a caller `Authorization` / `chatgpt-account-id` is still replaced. Red before.
+
+## PROV-144 — `LoginOptions.agentName` is unported, so an embedding app cannot name itself in the Sign in with ChatGPT or Codex browser login
+
+**Kind** not-ported · **Severity** low · **Effort** S · **Confidence** confirmed (both sides read; static, nothing run) · **Filed** 2026-10-09
+
+> **Filed 2026-10-09 from the pi v1.1.0 drift triage** (pi `v1.0.1..f1b2e77f5` = v1.1.0+11, `packages/ai`, cyrup `6b14575`).
+
+**upstream** — `9ad083102` (#10433): `LoginOptions.agentName?` (`packages/ai/src/auth/types.ts:209-213`, the field at `:213` @f1b2e77f5) replaces `AGENT_NAME_HINT` in the ChatGPT authorize URL (`auth/oauth/openai-chatgpt.ts:253`) and the Codex browser-login `originator` (`auth/oauth/openai-codex.ts:363`, threaded from `login(interaction, options)`).
+
+**cyrup** — `crates/cyrup-provider/src/auth/mod.rs:41-45`: `LoginOptions` has only `get_device_id`. The two flows hold private fields only the constants fill: `auth/oauth/openai_chatgpt.rs:527` / `:547` (`AGENT_NAME_HINT`, `:125`) and `auth/oauth/openai_codex.rs:520` / `:543` (`ORIGINATOR`, `:148`; the authorize parameter at `:588`).
+
+**Impact** — SDK embedders (`cyrup-sdk`) always present as "Pi" / `pi` on OpenAI's consent screen. cyrup's own CLI is unaffected: it deliberately sends the upstream values.
+
+**Fix** — Add `agent_name: Option<String>` to `LoginOptions` and use `options.agent_name.unwrap_or(AGENT_NAME_HINT / ORIGINATOR)` in both `login` paths. Keep the defaults and their divergence notes.
+
+**Verify** — Port `openai-chatgpt-oauth.test.ts` / `openai-codex-oauth.test.ts`: with `agent_name: Some("Acme")` the authorize URL carries `agent_name_hint=Acme` / `originator=Acme`; without it the values stay `Pi` / `pi`.
+
+## PROV-145 — The Azure provider is still `azure-openai-responses` and serves only the Responses API; pi 1.0.3 renamed it to `azure` and added Foundry Chat Completions deployments (DeepSeek V4 Pro). Decision-gated: the rename needs an owner decision first
+
+**Kind** upstream-drift · **Severity** low · **Effort** M · **Confidence** confirmed (both sides read; static, nothing run) · **Filed** 2026-10-09
+
+> **Filed 2026-10-09 from the pi v1.1.0 drift triage** (pi `v1.0.1..f1b2e77f5` = v1.1.0+11, `packages/ai`, cyrup `6b14575`).
+
+**upstream** — `a37306d43` (#9714, closes #9645; first contained in v1.0.3). `providers/azure.ts` (`id: "azure"` `:46`) dispatches `azure-openai-responses` and `openai-completions` (`:52`) through `azureStreams`, which resolves the endpoint onto the model; `withDeploymentName` (`:15`) swaps the `AZURE_OPENAI_DEPLOYMENT_NAME_MAP` deployment into the payload via `onPayload`. The shared helpers moved to `api/azure-openai-config.ts`; `env-api-keys.ts:90` and `all.ts:141` were renamed. The generator adds `azure/deepseek-v4-pro` with compat `supportsDeveloperRole:false`, `supportsMidConvoSystemMessages:true`, `thinkingFormat:"openai"`, `supportsLongCacheRetention:false`, Azure pricing and `AZURE_DEEPSEEK_V4_THINKING_LEVEL_MAP` (`scripts/generate-models.ts:290`, `:3330-3343`), all @f1b2e77f5. The rename is a recorded upstream breaking change for auth.json, models.json and settings.json keys; the coding-agent half is the one-line `defaultModelPerProvider` key in `model-resolver.ts:25`.
+
+**cyrup** — `crates/cyrup-provider/src/providers/azure_openai_responses.rs:16`: `AZURE_OPENAI_RESPONSES_PROVIDER_ID = "azure-openai-responses"`, one api, models from `catalog/azure-openai-responses.json`; also `env_api_keys.rs:61` and `providers/all.rs:270-271`, and `crates/cyrup-config/src/model/defaults.rs:17` / `:77` / `:278` (the default-model key). Measured 2026-10-09: `https://pi.dev/api/models/providers/azure-openai-responses` returns **404** and `/azure` returns 200 with a `deepseek-v4-pro` row.
+
+**Impact** — **The user-visible part:** the runtime overlay fetch for this stem now 404s, so Azure users silently stop receiving live catalog updates and their catalog is frozen at the embedded floor. `cargo run -p xtask -- gen-catalogs` also fails or skips the stem. Foundry Chat Completions deployments are unusable. Low, because the existing Responses deployments keep working.
+
+**Fix** — **Owner decision first:** whether to follow the rename touches auth.json and models.json keys, so it is an area 05 migration question. Then: register `openai-completions` on the Azure provider behind an endpoint-resolving wrapper; apply the deployment-name map via `on_payload`; point the catalog and overlay id at `azure`; carry a read-side alias for stored `azure-openai-responses` credentials if the id changes; extend `CFG-102`'s default-model table work with the renamed key.
+
+**Verify** — `azure/deepseek-v4-pro` streams through openai-completions against a loopback server: the body carries the mapped deployment as `model`, has `reasoning_effort` and no `thinking` / `prompt_cache_key`, and goes to the resolved Azure base URL. `gen-catalogs --check --only azure` reproduces pi.dev. A stored `azure-openai-responses` credential still resolves, if an alias is chosen.
+
+## PROV-146 — `Model.samplingParamsByThinkingLevel` is unported, so per-thinking-level sampling overrides are ignored at request time (the request half; lands with `PROV-123`, and `CFG-104` is the models.json half)
+
+**Kind** not-ported · **Severity** low · **Effort** M · **Confidence** confirmed (both sides read; static, nothing run) · **Filed** 2026-10-09
+
+> **Filed 2026-10-09 from the pi v1.1.0 drift triage** (pi `v1.0.1..f1b2e77f5` = v1.1.0+11, `packages/ai`, cyrup `6b14575`).
+
+**upstream** — `76dfb88f6` (#9776, v1.0.2). `samplingParamsByThinkingLevel?` on `Model` (`packages/ai/src/types.ts:854` @f1b2e77f5). `resolveSamplingParams(model, level, request)` (`api/simple-options.ts:24-34`) spreads `model.samplingParams`, then the entry for `clampThinkingLevel(model, level)`, then the request params. At f1b2e77f5 it is called from **both** sites: `buildBaseOptions` (`:41-42`) and the three OpenAI-compatible `buildParams` (`openai-completions.ts:1004`, `openai-responses.ts:383`, `azure-openai-responses.ts:243`). No pi.dev catalog row carries the field; it reaches users through models.json only (coding-agent `provider-composer.ts:72`, `:165-202`).
+
+**cyrup** — `rg 'sampling_params_by_thinking_level|samplingParamsByThinkingLevel' crates` finds only a doc mention at `crates/cyrup-provider/src/virtual_models.rs:130`. `Model` has `sampling_params` only (`model.rs:197`). `utils/simple_options.rs:64-106` (`merge_sampling_params`, `build_base_options`) merges model and request params with no level layer, and the adapters apply `opts.sampling_params` (`api/openai_completions/params.rs:282`).
+
+**Impact** — A model configured with, for example, `samplingParamsByThinkingLevel.high.temperature` gets the base sampling at every level. The key parses (serde ignores it) and has no effect.
+
+**Fix** — **This is an amendment to the open `PROV-123`, not an independent change.** `PROV-123` says pi moved the `model.samplingParams` merge out of `buildBaseOptions` into the three `buildParams`; since `76dfb88f6` both sites call `resolveSamplingParams`, which changes `PROV-123`'s shape. Re-read `PROV-123` at f1b2e77f5 and land both together at `simple_options.rs:57-106` so the two fixes do not clash. Then: add `sampling_params_by_thinking_level: Option<BTreeMap<ModelThinkingLevel, Map>>` to `Model` (serde camelCase); port `resolve_sampling_params` with the existing thinking-level clamp; call it from `build_base_options` and the three adapters' param builders with the effort or `"off"`. The models.json and composer half is `CFG-104` (area 05).
+
+**Verify** — Port `test/sampling-options.test.ts`'s new cases: a level entry overrides the model default and is overridden by the request; an unsupported level clamps to the model's nearest; reasoning off selects the `off` entry; no params at all yields `None`.
+
+## PROV-147 — The `openai-decisions` classifier API (OpenAI's Decisions API, `openai/gpt-6-luna` as a classifier) is unported
+
+**Kind** not-ported · **Severity** low · **Effort** M · **Confidence** confirmed (both sides read; static, nothing run) · **Filed** 2026-10-09
+
+> **Filed 2026-10-09 from the pi v1.1.0 drift triage** (pi `v1.0.1..f1b2e77f5` = v1.1.0+11, `packages/ai`, cyrup `6b14575`).
+
+**upstream** — `ce8972a0e`. `api/openai-decisions.ts` maps `POST {baseUrl}/decisions`: bool becomes a predicate with the criteria appended to the instructions (`:51-71`); up to 128 images go as `input_image` data URLs (`:33`, `:73-91`); a refusal fails the result; 504 is not retried (`NO_RETRY_STATUSES` `:151`; `noRetryStatuses` in `utils/provider-retry.ts:8`, `:121`). `classify` is at `:161`; the shared HTTP code is in `api/classifier-shared.ts`. Registration is `providers/openai.ts:25-32`, with `filterAllModels` hiding classifiers under Sign in with ChatGPT OAuth (`:28`). The api id is at `types.ts:83`; the catalog row is `gpt-6-luna`, input `[text,image]`, `contextWindow` 922000, input-only cost with the long-context tier (`scripts/generate-models.ts`, `OPENAI_CLASSIFIER_MODELS`). All @f1b2e77f5.
+
+**cyrup** — `crates/cyrup-provider/src/classifier.rs:84-110`: `KnownClassifierApi` has `LlamaCppClassify` only. `rg -i 'decisions' crates --type rust` finds nothing. `gpt-6-luna` exists only as a chat row (`providers/catalog/openai.json:1451`). `utils/provider_retry.rs` has no per-call no-retry status list. pi.dev already serves `gpt-6-luna` with `api:"openai-decisions", type:"classifier"` on `/providers/openai?types=chat,image,classifier` (fetched 2026-10-09), so the runtime overlay already hands cyrup a classifier row whose api it cannot dispatch. Related, already filed: `PROV-104` (System One apis), `PROV-105` (`filterAllModels`).
+
+**Impact** — No hosted classifier is available on the `openai` provider; codemode's `models.classify()` (area 18) cannot use an OpenAI API key for classification.
+
+**Fix** — Add `KnownClassifierApi::OpenAiDecisions`, a port of `openai-decisions.ts` on the llama-cpp classifier's HTTP/retry plumbing extended with a `no_retry_statuses` option. Register it on the openai provider with the API-key-only filter (with `PROV-105`) and add the classifier row to the openai catalog. Check what `Models::classify` does today with the overlay's `openai-decisions` row: an error is expected, and it should be the upstream-shaped `Unsupported classifier API`. Same commit and same struct as `PROV-148`; the two may land together.
+
+**Verify** — Port `test/openai-decisions.test.ts` against a loopback server: the wire shape for choice / score / bool; images; more than 128 images is an error; a refusal gives an error result with usage kept; 504 is not retried while 500 is; under OAuth the model is absent from the available classifiers.
+
+## PROV-148 — `ClassifierContext.images` is unported, so a classify request cannot carry images and no model-level image check exists
+
+**Kind** not-ported · **Severity** low · **Effort** S · **Confidence** confirmed (both sides read; static, nothing run) · **Filed** 2026-10-09
+
+> **Filed 2026-10-09 from the pi v1.1.0 drift triage** (pi `v1.0.1..f1b2e77f5` = v1.1.0+11, `packages/ai`, cyrup `6b14575`).
+
+**upstream** — `ce8972a0e`: `ClassifierContext.images?: ImageContent[]` (`packages/ai/src/types.ts:682-690`, the field at `:688` @f1b2e77f5). `assertClassifierInputSupported` (`utils/model-operations.ts:46-53`), called from `Models.classify` (`models.ts:979`), errors with `Model <p>/<id> does not accept image input` unless `model.input` includes `image`. `llama-cpp-classify` rejects images explicitly (`api/llama-cpp-classify.ts:437`: `${LABEL} classification does not support image input`, turned into an error result).
+
+**cyrup** — `crates/cyrup-provider/src/classifier.rs:676-680`: `ClassifierContext { state, questions }`, with no images. `Models::classify` (`collection.rs:658`) has no input-modality check, and `api/llama_cpp_classify.rs` has no image guard.
+
+**Impact** — An image-judging classify is not expressible; codemode's `models.classify({images})` (`CODE-023`, area 18) has nothing to pass them into, so a script's images are dropped and the classifier answers from `state` alone where pi returns an error result. Once a second classifier API lands (`PROV-147`), the missing guard would silently drop images there too.
+
+**Fix** — Add `images: Option<Vec<ImageContent>>` (serde default) to `ClassifierContext`, the modality assert in `Models::classify`, and the llama-cpp guard returning an error result with upstream's message whenever `images` is non-empty.
+
+**Verify** — `classify` with images on a text-only classifier model returns an error result naming the model; on llama-cpp it returns `llama.cpp classification does not support image input`; without images behaviour is unchanged.
+
+## PROV-149 — The embedded catalogs predate pi 1.1.0: no Claude Haiku 5.5 rows, Sonnet 5.5 cache reads priced at 0.2 instead of 0.1, Sonnet 4.5 embedded at a 1M context window, and no prompt-length tiers for Google, OpenCode, OpenCode Go, OpenRouter, Vercel or MiniMax
+
+**Kind** stale-port · **Severity** low · **Effort** S · **Confidence** confirmed (both sides read; static, nothing run) · **Filed** 2026-10-09
+
+> **Filed 2026-10-09 from the pi v1.1.0 drift triage** (pi `v1.0.1..f1b2e77f5` = v1.1.0+11, `packages/ai`, cyrup `6b14575`).
+
+**upstream** — `f76c1db66` adds Haiku 5.5 (a tier above 100k input at 5x). `ce950d78f` drops the hand-written 5.5 fallbacks, so models.dev's Sonnet 5.5 `cacheRead: 0.1` wins (`test/supports-xhigh.test.ts`). `943a10e74` keeps prompt-length tiers from every catalog (`scripts/ai-gateway-pricing.ts`, `scripts/openrouter-catalog.ts`, `getModelsDevCost` in `generate-models.ts`). `a2eef9eb6` pins Kimi K3 to cacheWrite 0. All @f1b2e77f5 and served at pi.dev. Separately, with no upstream commit behind it, models.dev now serves `claude-sonnet-4-5` and `claude-sonnet-4-5-20250929` at `contextWindow` 200000 and `inputLimits.images.maxPerRequest` 100.
+
+**cyrup** — `crates/cyrup-provider/src/providers/catalog_manifest.json`: `anthropic` fetchedAt 2026-09-28. Measured 2026-10-09, embedded vs pi.dev (rows / tiered): anthropic 16/0 vs 17/1 (missing `claude-haiku-5-5`; `claude-sonnet-5-5` cacheRead 0.2 vs 0.1; `claude-sonnet-4-5` and `-20250929` embedded at `contextWindow` 1000000 and 600 images where pi.dev serves 200000 and 100); amazon-bedrock 183/23 vs 193/29 (six Haiku 5.5 rows missing); google 22/0 vs 22/6; opencode 76/0 vs 83/16; opencode-go 29/0 vs 31/7; openrouter 393/0 vs 403/81 (46 base-cost diffs); vercel-ai-gateway 248/0 vs 252/49; minimax 3/0 vs 3/1; github-copilot 32/11 vs 35/13. Kimi K3 already matches (cacheWrite 0 in `moonshotai.json`, `moonshotai-cn.json` and `kimi-coding.json`).
+
+**Impact** — Offline or first-run sessions, and any provider whose overlay has not refreshed, undercount long-prompt cost on tiered models and overcount Sonnet 5.5 cache reads by 2x; Haiku 5.5 is unknown until the overlay arrives. More than a cost mismatch: such a session on Sonnet 4.5 can budget context to 1M and hit provider overflow errors. Online sessions are corrected by the runtime pi.dev overlay, which is why this stays low.
+
+**Fix** — Run `cargo run -p xtask -- gen-catalogs` and review the diff, as `PROV-131` did. The `azure-openai-responses` stem 404s now (`PROV-145`), so do that row first or regenerate with `--only` excluding it.
+
+**Verify** — `gen-catalogs --check` reproduces pi.dev for every regenerated stem. A cost test prices a 150k-input Haiku 5.5 turn at the tier rate and Sonnet 5.5 cache reads at 0.1/M. `claude-sonnet-4-5` resolves with `context_window == 200000` and an image limit of 100.
 
 ## Coverage
 

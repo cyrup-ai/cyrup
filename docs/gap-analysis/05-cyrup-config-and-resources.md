@@ -2,6 +2,42 @@
 
 Covers `cyrup/crates/cyrup-config` (settings, auth store, trust, model resolution, config values, login) and `cyrup/crates/cyrup-resources` (packages, discovery, skills/prompts/themes), plus the launch-path glue in `cyrup/crates/cyrup/src/main.rs`, `migrations.rs`, `cli.rs` and `cyrup-session-svc/src/builder.rs` that consumes them. Measured against `pi/packages/coding-agent/src/core/{settings-manager,model-resolver,model-runtime,models-store,model-config,auth-storage,trust-manager,project-trust,package-manager,provider-composer,resource-loader,prompt-templates,skills,slash-commands,keybindings,resolve-config-value}.ts`, `src/{config,migrations,main}.ts`, `src/utils/paths.ts` and `modes/interactive/theme/theme.ts` — read at the explicit tags **v0.83.0** (the ported baseline) and **v0.84.1** (the latest tag *at the time of that reading*; the latest tag is now **v0.85.1** — see the provenance block below) rather than a floating HEAD.
 
+> ### PIN 2026-10-09 — pi v1.1.0 drift triage: cyrup `6b14575` × pi **`f1b2e77f5`** (= `v1.1.0-11-gf1b2e77f5`)
+>
+> **Window read:** pi `v1.0.1..f1b2e77f5` (= `v1.1.0-11-gf1b2e77f5`), `git log --no-merges` over the core-runtime
+> lane's paths (`packages/agent`, `packages/coding-agent/src/core` and `src/cli`/`src/utils`, `core/extensions` and
+> `core/tools` excluded) = **27** commits; upstream read through `git -C tmp/pi show` only, cyrup at `6b14575`.
+> Nothing was run. The pin is untagged, deliberately (README *CURRENT PINS*).
+>
+> **Filed in area 05 (5):** `CFG-103` (invalid keybinding entry keeps the default; supersedes `CFG-038`'s parity
+> choice), `CFG-104` (models.json `samplingParamsByThinkingLevel`; with `PROV-146` and `PROV-123`), `CFG-105`
+> (positive token counts and `$schema` in models.json), `CFG-106` (published JSON Schemas, effort L), `CFG-107`
+> (Termux clipboard read; the `CFG-066` residual). All low. `CFG-107` is filed here because `CFG-066` lives here;
+> its code is `cyrup-tui/src/clipboard.rs`, so move it to 07 if that area now owns the file.
+>
+> **Owner decision recorded here (README *Decisions for the maintainers*):** pi renamed the built-in provider
+> `azure-openai-responses` → `azure` (`a37306d43`, v1.0.3), a declared breaking change for auth.json, models.json
+> and settings.json keys. Whether cyrup follows, and how stored credentials migrate, is this area's decision;
+> `PROV-145` (area 01) is gated on it.
+>
+> **Read in scope and deliberately NOT filed (core-runtime lane, all areas):**
+> * *Release / housekeeping:* `4c6fb7cfe`, `cd32f7725`, `200387122`, `d78dc83d6`, `997d31f28`, `7c10bd433`,
+>   `28dcce2ba`, `abe508e1b`, `75a99721d`.
+> * *Already ported or already a row:* `36a686ee8` (durationMs; ledger UPDATE 2026-10-09); `503c60552`'s core
+>   half (`agent_settled.aborted`; the OSC 7501 reporter is `TUI-171`); `f284a2460` (the agent loop times every
+>   stream fn, `cyrup-agent/src/agent/run/stream.rs:144`, `:180`); `c30840c2e` (`CODE-020`, closed);
+>   `04b97ef00` (`MCP-616`); `d677d0ee7` (`TOOL-057`, `CODE-019`, closed); `ddaa0a034`'s settings refactor
+>   (behaviour-neutral; `CFG-097`; the CLI half is `SEAM-148`).
+> * *Mechanism N/A:* `1b094148b` (Node install layout; V8 is linked in, `CODE-013`; area 18 ruled it at
+>   `18-pi-codemode.md:335`); `b30a6dd77` (Node worker message tagging); `b9ab918c6`'s multiline half (syntect
+>   highlights line by line; the `subst` half is `TUI-179`).
+> * *Out of lane, another area's change:* `a37306d43`'s one-line `defaultModelPerProvider` key
+>   (`model-resolver.ts:25`) waits on `PROV-145`; `ce8972a0e`'s one-line `assertClassifierInputSupported` call is
+>   `PROV-148`; `18336987a`'s settings comment and export-html `outputPad: 1` are `TUI-175` and a lead;
+>   `7f9e1198f`'s `SETTINGS_DEFAULTS` refactor (every literal checked equal), settings `$schema` (already
+>   round-tripped, `layer.rs:26-29`), `setThemeJsonValidator` ordering (Node-specific) and the theme / key-grammar
+>   halves (`TUI-177`, `TUI-178`).
+
 > ### CLOSURES 2026-10-09 — one low (`CFG-085`, its last clause), with `PROV-134` (area 01) and `SEAM-128` (area 08) in one PR
 >
 > The three rows are one feature and none of their Verify lines can be met alone, so they closed
@@ -581,7 +617,7 @@ above opened nothing, closed nothing and re-severitied nothing.
 
 ## Open items
 
-> **Next free id: `CFG-103`** (2026-10-03, after the post-pin triage filed `CFG-102`; before that 2026-10-02, after the pi v1.0.0 pass filed `CFG-096`…`CFG-101`; `CFG-095` was never allocated and is still free).
+> **Next free id: `CFG-108`** (2026-10-09, the pi v1.1.0 drift triage filed `CFG-103`…`CFG-107`; before that `CFG-103`, 2026-10-03, after the post-pin triage filed `CFG-102`; before that 2026-10-02, after the pi v1.0.0 pass filed `CFG-096`…`CFG-101`; `CFG-095` was never allocated and is still free).
 
 > **This table carries a trailing `Dedup` column (added 2026-10-02).** It holds
 > `duplicate-of: <ID>` for a row whose finding another area owns, exactly as area 12's does, and
@@ -873,6 +909,11 @@ above opened nothing, closed nothing and re-severitied nothing.
 | ~~CFG-100~~ | ~~low~~ **CLOSED 2026-10-04** | upstream-drift | S | **`fullscreenWheelScrollLines` is not modelled; cyrup's wheel step is hard-coded** — pi `core/settings-manager.ts:188`, getter/setter `:1389`/`:1399` (`"auto"` or a value clamped to 1–100); cyrup's `wheel_scroll_lines` is a constant table in `crates/cyrup-tui/src/altscreen/wheel.rs:71`. **FILED 2026-10-02**; body below. | duplicate-of: `TUI-136` — **CLOSED 2026-10-04** with it: `fullscreenWheelScrollLines` is modelled (`WheelScrollLines`, clamped 1–100 independently on read and write; `settings/effective.rs`, `settings/manager.rs`) and drives the accelerator. |
 | ~~CFG-101~~ | ~~low~~ **CLOSED 2026-10-08** | upstream-drift | S | **CLOSED 2026-10-08** (on `claude/mcp-drift-sweep`, checked against pi ce950d78f): `"mcp.json"` is now the second entry of `CYRUP_MARKERS` (`crates/cyrup-config/src/trust.rs`, `has_trust_requiring_resources`), so the list matches pi's `TRUST_REQUIRING_PROJECT_CONFIG_RESOURCES` (`core/trust-manager.ts:30-39`) entry for entry and in order. Scope re-checked at ce950d78f: pi probes only `<cwd>/.pi/<entry>` (`:191-194`), so `.cyrup/mcp.json` is covered and the bare `<cwd>/.mcp.json` is still not a marker. MCP-588's `mcp-adapter.json` is NOT added: pi core's list does not contain it, and pi-mcp-adapter 2ccf648 gates its own project servers on `ctx.isProjectTrusted()` (`project-server-trust.ts:183-207`) without feeding the list. Verify: `cyrup-config trust::tests::project_mcp_json_requires_trust_but_bare_dot_mcp_json_does_not` (`.cyrup/mcp.json` alone → true; bare `.mcp.json` alone → false; `.cyrup/mcp-adapter.json` alone → false) and `cyrup-session-svc tests::project_trust_extension::a_project_with_only_cyrup_mcp_json_is_offered_the_trust_prompt` (the interactive host's `trust_prompt` callback runs once for `.cyrup/mcp.json` alone and zero times for a bare `.mcp.json`); both red without the marker. The prompt seam is the builder callback the TUI host wires (`crates/cyrup/src/prelaunch.rs` `trust_prompt_callback`), so the "TUI-side" assertion is pinned there rather than in `cyrup-tui`. The CORRECTED note below still stands: the verdict has no effect on MCP loading until `MCP-591` / `MCP-096` thread it into `ConfigContext`. *Original text:* **`mcp.json` was added to the resources that make a project require trust; cyrup's probe list omits it** — pi `core/trust-manager.ts:32`; cyrup's `CYRUP_MARKERS` (`crates/cyrup-config/src/trust.rs:211-219`) has seven entries and no `mcp.json`, so a repo whose only project config is `.cyrup/mcp.json` is never offered the trust prompt and its servers stay silently unloaded. **FILED 2026-10-02**; body below. **CORRECTED 2026-10-03:** the "fail-closed" claim and the body's Impact paragraph are false. `ConfigContext::new` defaults `project_trusted` to `true` (`crates/cyrup-mcp/src/config.rs:3124-3133`, "upstream's behaviour exactly") and `with_project_trusted` (`:3160`) is documented "**No production caller yet.**" (`:3150-3154`); the production builders (`crates/cyrup-mcp/src/extension.rs:556-563` `config_context`, `crates/cyrup-mcp/src/panel_host.rs:320`, `crates/cyrup/src/mcp_cmd.rs:72,208,226,254`) never call it, and its only callers are tests (`config.rs:5855`). So `<cwd>/.mcp.json` and `<cwd>/.cyrup/mcp.json` from an UNTRUSTED project load today (`MCP-096` / `MCP-591`, area 13). Consequences: the missing marker is not "the benign direction", and adding `"mcp.json"` to `CYRUP_MARKERS` only makes the trust prompt appear; the user's answer has no effect on MCP until `MCP-591` / `MCP-096` threads the verdict into `ConfigContext`. The ungated load is those rows' defect (the review recommends `MCP-591` be raised to high); this row's own Fix (one marker, S) is unchanged and `mcp.json` is at `core/trust-manager.ts:32` at v1.0.1 (file byte-identical to v1.0.0). |
 | CFG-102 | low | upstream-drift | S | **`default_model_per_provider` is still the v0.87.1 table; pi v1.0.0/v1.0.1 changed five defaults** — **Filed 2026-10-03 from the post-pin triage (pi v1.0.1).** pi `core/model-resolver.ts:20-60` @v1.0.1 (now `Partial<Record<KnownProvider, string>>`): `openai-codex` -> `gpt-6.1-sol`, `fireworks` -> `accounts/fireworks/models/kimi-k3`, `together` -> `moonshotai/Kimi-K3`, `opencode-go` -> `kimi-k3` (all four already at v1.0.0), and `nvidia` -> `nvidia/nemotron-3-ultra-550b-a55b` (v1.0.1, `49b9df489`: "NVIDIA no longer serves nvidia/nemotron-3-super-120b-a12b", per the commit message; not independently checked). cyrup `crates/cyrup-config/src/model/defaults.rs:18` (`openai-codex` -> `gpt-5.5`), `:21` (nvidia -> super), `:46` (fireworks -> `kimi-k2p6`), `:47` (together -> `Kimi-K2.6`), `:50` (opencode-go -> `kimi-k2.6`) keep the v0.87.1 values, and the test table `PI` (`:273`) pins them. The test's `STALE_UPSTREAM` array (`:331`) and the `CFG-084` rationale (that pi's own default names ids pi's catalog lacks for fireworks and opencode-go) are void at v1.0.0: pi's defaults are now `kimi-k3` for both. **Ordering caveat:** `gpt-6.1-sol` is not in the embedded catalog (`crates/cyrup-provider/src/providers/catalog/openai-codex.json` carries `gpt-6-astra`, `gpt-6-luna`, `gpt-6-sol` and no `gpt-6.1-sol`), so a catalog regeneration must land before the codex edit; otherwise `first_default_or_first` (`defaults.rs:121`) finds no match for `openai-codex` and skips it. The other four ids are present (`nvidia.json` carries both the super and the ultra id; `fireworks.json` and `opencode-go.json` carry `kimi-k3`; `together.rs:265` carries `moonshotai/Kimi-K3`), so those four can move now. Impact: a user whose first available provider is one of the five launches on a different default model than pi's. **Fix** — update the match arms, the `PI` table, and shrink or delete `STALE_UPSTREAM`; do the `openai-codex` arm only after the catalog carries `gpt-6.1-sol`. **Verify** — `default_model_per_provider_matches_pi_and_every_default_resolves` passes against `git show v1.0.1:packages/coding-agent/src/core/model-resolver.ts`. |
+| CFG-103 | low | upstream-drift | S | **A keybinding entry with an invalid key now keeps the action's default in pi; cyrup drops only the bad key and leaves the action unbound or partly bound** **Filed 2026-10-09 from the pi v1.1.0 drift triage**; body below. |  |
+| CFG-104 | low | upstream-drift | M | **`models.json` `samplingParamsByThinkingLevel` is unported: per-thinking-level sampling overrides are silently ignored (the config half; `PROV-146` is the request half)** **Filed 2026-10-09 from the pi v1.1.0 drift triage**; body below. |  |
+| CFG-105 | low | upstream-drift | S | **`models.json` `contextWindow`/`maxTokens` ≤ 0 is now a whole-file schema error in pi, overrides included; cyrup rejects only the defining provider and clamps overrides to 0** **Filed 2026-10-09 from the pi v1.1.0 drift triage**; body below. |  |
+| CFG-106 | low | not-ported | L | **pi ships JSON Schemas for `settings.json`, `models.json`, `keybindings.json` and themes; cyrup publishes none, so editors get no completion or validation for cyrup config files** **Filed 2026-10-09 from the pi v1.1.0 drift triage**; body below. |  |
+| CFG-107 | low | upstream-drift | S | **Clipboard text paste reads nothing on Termux (Ctrl+V text fallback and right-click paste), and a failed copy there shows no Termux:API hint: cyrup's clipboard read has no `termux-clipboard-get`, and its hint is gated on `os == "linux"`, where Termux reports `android`** **Filed 2026-10-09 from the pi v1.1.0 drift triage**; body below. |  |
 
 ## CFG-081 — `retry.maxAgentDelayMs` is not modelled, so agent-level retry backoff is uncapped
 
@@ -2945,6 +2986,88 @@ it, or every repository with a `.mcp.json` for any other agent starts prompting 
 **Verify** — `has_trust_requiring_resources` returns true for a cwd containing only `.cyrup/mcp.json` and
 still false for a cwd containing only a bare `.mcp.json`; plus the TUI-side assertion that the trust prompt
 is offered in the first case.
+
+## Findings filed 2026-10-09 — the pi v1.1.0 drift triage
+
+## CFG-103 — A keybinding entry with an invalid key now keeps the action's default in pi; cyrup drops only the bad key and leaves the action unbound or partly bound
+
+**Kind** upstream-drift · **Severity** low · **Effort** S · **Confidence** confirmed (both sides read; static, nothing run) · **Filed** 2026-10-09
+
+> **Filed 2026-10-09 from the pi v1.1.0 drift triage** (pi `v1.0.1..f1b2e77f5` = v1.1.0+11, core-runtime lane, cyrup `6b14575`).
+
+**upstream** — `7f9e1198f` (post-v1.1.0, #9880). `core/keybindings.ts:267` `validateKeybindingValue = Compile(KeybindingValueSchema)`; `:272` skips `$schema`; `:273` `if (validateKeybindingValue.Check(binding)) config[key] = binding`. An entry whose value (string or array) contains any key failing the `KeyIdSchema` grammar (`core/key-id-schema.ts:10-15`: up to four distinct `ctrl|shift|alt|super` modifiers plus a known base key, duplicates rejected, **case-sensitive lowercase**) is dropped whole, so the action keeps its default. Test: `test/config-schemas.test.ts` `accepts $schema in keybindings.json without treating it as an action` (`"extension.invalid": "ctrl+not-a-key"` is absent from `getUserBindings()`). Before this commit any string was kept as a `KeyId` that never matches, so the action was unbound.
+
+**cyrup** — `crates/cyrup-tui/src/keymap.rs:211-241` `merge_entries`: for each spec a `Key::parse` failure pushes a `KeybindingIssue` and **drops that key only**, then `apply(action, keys)` (`:239`) runs with the survivors, possibly an empty vec (`set_action(action, vec![])` leaves the action unbound). The doc comment at `:190-201` says this deliberately mirrors pi's old never-matching `KeyId`. `$schema` is already harmless (`from_id` returns `None`, skipped at `:220`). That parity choice is `CFG-038`'s (closed), which this commit supersedes.
+
+**Impact** — A typo in one key (`"app.model.select": ["ctrl+l", "ctrl+nope"]`) gives `ctrl+l` only in cyrup where pi keeps the default; a single bad key (`"app.session.tree": "ctrl+nope"`) leaves the action with no binding where pi keeps its default. cyrup still prints the warning, so this is visible, but it is not pi's outcome.
+
+**Fix** — In `merge_entries`, if any spec in an entry fails `Key::parse`, record the issues and `continue` without `apply`, so the default stays. Make `Key::parse` reject everything `KeyIdSchema` rejects: a duplicate modifier (`ctrl+ctrl+x`), more than four modifiers, an unknown base key, and any spelling the lowercase-only schema rejects but `Key::parse` accepts today (for example `Ctrl+L`, or another modifier alias). The grammar half overlaps `TUI-177` (area 07, `Key::parse`'s grammar), so land them together. Rewrite the `:190-201` doc comment and annotate `CFG-038` as superseded at f1b2e77f5.
+
+**Verify** — `merge_json(r#"{"app.session.tree":"ctrl+nope"}"#)` leaves `app.session.tree` on its default and returns one issue; `["ctrl+l","ctrl+nope"]` on `app.model.select` leaves the default, not `ctrl+l`; `"ctrl+ctrl+x"` and `"Ctrl+L"` are reported as issues; a `$schema` key yields no issue.
+
+## CFG-104 — `models.json` `samplingParamsByThinkingLevel` is unported: per-thinking-level sampling overrides are silently ignored (the config half; `PROV-146` is the request half)
+
+**Kind** upstream-drift · **Severity** low · **Effort** M · **Confidence** confirmed (both sides read; static, nothing run) · **Filed** 2026-10-09
+
+> **Filed 2026-10-09 from the pi v1.1.0 drift triage** (pi `v1.0.1..f1b2e77f5` = v1.1.0+11, core-runtime lane, cyrup `6b14575`).
+
+**upstream** — `76dfb88f6` (v1.0.2, #9776), @f1b2e77f5. `core/model-config.ts:20-28` `SamplingParamsByThinkingLevelSchema` (`off`…`max`, each a free-form record) on `ModelDefinitionSchema` (`:46`) and `ModelOverrideSchema` (`:62`). `core/provider-composer.ts:245` `modelFromJson` copies it verbatim; `:164-175` `mergeSamplingParamsByThinkingLevel` merges an override per level and per key (`{ ...base[level], ...override[level] }`); `:202-205` applies it in `applyModelOverride`. Request side (area 01): `packages/ai/src/api/simple-options.ts:24-33` `resolveSamplingParams` = `{ ...model.samplingParams, ...model.samplingParamsByThinkingLevel[clampThinkingLevel(model, level)], ...requestParams }`, called from `buildBaseOptions` (`:41`) and from `openai-completions.ts:1004` / `openai-responses.ts:383`.
+
+**cyrup** — `grep -rn 'sampling_params_by_thinking_level\|samplingParamsByThinkingLevel' crates` finds only a doc comment in `crates/cyrup-provider/src/virtual_models.rs:130`. `crates/cyrup-config/src/model/schema.rs:155` and `:211` carry only `sampling_params`; `compose.rs:326` (definition) and `:522-527` (override merge) handle only that field; `crates/cyrup-provider/src/utils/simple_options.rs:103-106` merges `model.sampling_params` with the request's only. Unknown `models.json` keys pass `validate_models_config`, so the field is dropped with no warning. Area 18's record (`18-pi-codemode.md:385`) names it as untriaged.
+
+**Impact** — A user who sets, say, `temperature: 0.6` for `high` and `1.0` for `off` on a local model, following pi's docs, gets neither and no warning; requests go out with the flat `samplingParams` only.
+
+**Fix** — Add `sampling_params_by_thinking_level` (a `BTreeMap<ThinkingLevel, Map<String, Value>>`, or a struct keyed `off`…`max`) to `ModelDefinition`, `ModelOverride` and `cyrup_provider::Model`. Validate each level as an object in `validate.rs`; copy it in `model_from_json`; port `mergeSamplingParamsByThinkingLevel` for overrides. The request half is `PROV-146`, which is itself an amendment to the open `PROV-123` (at f1b2e77f5 both `buildBaseOptions` and the OpenAI `buildParams` call `resolveSamplingParams`, which changes `PROV-123`'s shape). Land this row with those two so the fixes do not clash at `simple_options.rs:57-105`.
+
+**Verify** — With a model defining `samplingParams: {top_p: 0.9}` and `samplingParamsByThinkingLevel: {high: {temperature: 0.6}}`, an openai-completions request at `high` carries both keys and the same request at `off` carries only `top_p`; a request `samplingParams: {temperature: 1}` wins over the level value; an override `{high: {top_k: 20}}` keeps the definition's `temperature` for `high`.
+
+## CFG-105 — `models.json` `contextWindow`/`maxTokens` ≤ 0 is now a whole-file schema error in pi, overrides included; cyrup rejects only the defining provider and clamps overrides to 0
+
+**Kind** upstream-drift · **Severity** low · **Effort** S · **Confidence** confirmed (both sides read; static, nothing run) · **Filed** 2026-10-09
+
+> **Filed 2026-10-09 from the pi v1.1.0 drift triage** (pi `v1.0.1..f1b2e77f5` = v1.1.0+11, core-runtime lane, cyrup `6b14575`).
+
+**upstream** — `7f9e1198f` (post-v1.1.0, #9880). `core/model-config.ts:30` `PositiveTokenCountSchema = Type.Number({ exclusiveMinimum: 0 })` on the definition (`:43-44`) and the override (`:59-60`). A failing value fails `validateModelsConfig.Check` (`:148-155`), which returns `Invalid models.json schema:` with an empty provider map. The per-provider check in `provider-composer.ts:224-229` stays, reachable only for SDK-built configs. `$schema` is a declared optional string at the top level (`:85`); `$schema: 42` is a schema error (test `validates $schema in models.json at runtime`).
+
+**cyrup** — `crates/cyrup-config/src/model/validate.rs:217-218` and `:237-238` call `check_opt_number`, which accepts any number including 0 or a negative one. `compose.rs:274-285` rejects `<= 0` for that provider only (`CFG-046`'s behaviour, quoting v0.83.0). `compose.rs:494-502` clamps an override's negative value to 0 under a `[CYRUP-DELTA]` saying pi "stores a negative override verbatim", which is no longer true. `$schema` is not checked.
+
+**Impact** — A `models.json` with `"contextWindow": 0` on one model loads every other provider in cyrup and none in pi; an override with `"maxTokens": 0` produces a model with a 0-token output budget in cyrup, where pi refuses the file and says why. Malformed files only: the difference is which error the user sees and how much of the file survives.
+
+**Fix** — In `validate.rs`, add `check_opt_positive_number` (pi's `exclusiveMinimum` message as TypeBox renders it) for `contextWindow` / `maxTokens` on both shapes, and `check_opt_string` for a top-level `$schema`. Keep the `compose.rs` checks as defence for programmatic configs, and remove the stale `[CYRUP-DELTA]` at `:494-497` (the clamp is unreachable from a file once the schema check runs).
+
+**Verify** — `load` of a file with one `contextWindow: 0` model returns no providers and an `Invalid models.json schema:` error naming `providers.<id>.models.0.contextWindow`; the same for a `modelOverrides` `maxTokens: -1`; `$schema: "https://…"` loads and `$schema: 42` is an error naming `$schema`. Update `a_non_positive_context_window_rejects_only_its_own_provider_block` (`compose.rs:796`) to drive `compose` directly rather than `load`.
+
+## CFG-106 — pi ships JSON Schemas for `settings.json`, `models.json`, `keybindings.json` and themes; cyrup publishes none, so editors get no completion or validation for cyrup config files
+
+**Kind** not-ported · **Severity** low · **Effort** L · **Confidence** confirmed (both sides read; static, nothing run) · **Filed** 2026-10-09
+
+> **Filed 2026-10-09 from the pi v1.1.0 drift triage** (pi `v1.0.1..f1b2e77f5` = v1.1.0+11, core-runtime lane, cyrup `6b14575`).
+
+**upstream** — `7f9e1198f` (post-v1.1.0, #9880). `packages/coding-agent/schemas/{settings,models,keybindings,theme}.schema.json` are generated by `scripts/generate-schemas.ts` from `core/settings-schema.ts` (474 lines, descriptions and defaults from `core/settings-defaults.ts`), `core/model-config.ts` `ModelsConfigSchema` (with the ~600-line compat schema now in pi-ai `providers/compat-schema.ts`), `core/keybindings-schema.ts` and `theme-schema.ts`. They are listed in `package.json` `files` (`:36`), and every document accepts a `$schema` key (settings: preserved; keybindings: `keybindings.ts:272`; models: `model-config.ts:85`). `test/config-schemas.test.ts` `matches the four committed artifacts` keeps them in sync.
+
+**cyrup** — `find /home/user/cyrup -name '*.schema.json' -not -path '*/tmp/*' -not -path '*/target/*'` finds only `crates/cyrup-permission-system/schemas/cyrup-permissions.schema.json`. There is no schema generator for `cyrup_config::Settings` (a raw `serde_json::Map` wrapper, `crates/cyrup-config/src/settings/layer.rs:26-29`), `ModelsConfig` (`model/schema.rs`) or keybindings. The runtime already tolerates `$schema` in settings (unknown keys round-trip, R-07-004) and in keybindings (`keymap.rs:220`).
+
+**Impact** — Developer experience only. A user who points `$schema` at pi's published URL gets pi's key set, which differs from cyrup's (`CYRUP_` env twins, cyrup-only keys); without a cyrup schema there is no editor completion, hover documentation or typo detection for `~/.cyrup/agent/settings.json`, `models.json` or `keybindings.json`.
+
+**Fix** — Add a `cyrup config schemas` generator or a build-time `xtask` that emits the documents: `schemars` derives where the type is typed (`ModelsConfig`, keybinding ids from the keymap tables); a hand-written table for `settings.json` mirroring `settings-schema.ts`, carrying pi's descriptions and the defaults the getters use (~70 keys). Commit the outputs under `schemas/` with a regenerate-and-diff test like pi's. Effort is **L**, not M: the settings table and the models compat schema are the bulk. The theme schema depends on `TUI-178` (area 07's theme strictness) and should not be emitted before it.
+
+**Verify** — `schemas/settings.schema.json` validates every `settings.json` fixture under `crates/cyrup-config/src/settings/tests` and rejects `{"compaction":{"reserveTokens":-1}}` and `{"httpIdleTimeoutMs":"bogus"}`, as pi's `rejects settings values that runtime accessors reject` does; the models schema accepts every `models.json` fixture in `cyrup-config`; the regenerate-and-diff test fails when a settings key is added without regenerating.
+
+## CFG-107 — Clipboard text paste reads nothing on Termux (Ctrl+V text fallback and right-click paste), and a failed copy there shows no Termux:API hint: cyrup's clipboard read has no `termux-clipboard-get`, and its hint is gated on `os == "linux"`, where Termux reports `android`
+
+**Kind** upstream-drift · **Severity** low · **Effort** S · **Confidence** confirmed (both sides read; static, nothing run) · **Filed** 2026-10-09
+
+> **Filed 2026-10-09 from the pi v1.1.0 drift triage** (pi `v1.0.1..f1b2e77f5` = v1.1.0+11, core-runtime lane, cyrup `6b14575`).
+
+**upstream** — `592fb57b7` (v1.1.0, fixes #10391), @f1b2e77f5. `utils/clipboard.ts:53-70` `readClipboardText`: `termux-clipboard-get` is tried whenever `TERMUX_VERSION` is set, now outside the `platform() === "linux"` block (Termux reports `android`), before `wl-paste` and `xclip -out` / `xsel --output`. `:133-135`: the `install the Termux:API app` error is now thrown on any platform when `TERMUX_VERSION` is set. Callers: `interactive-mode.ts:3143` (right-click paste) and `:3184` (the Ctrl+V text fallback, `handleClipboardPaste`, which is the user-visible bug in #10391). The xclip/xsel/termux read steps themselves arrived earlier, in `caf6dfe73` (v0.86.0, #9163), whose shape also gates `wl-paste` on `WAYLAND_DISPLAY` alone.
+
+**cyrup** — `crates/cyrup-tui/src/clipboard.rs:634-643` `clipboard_read_plan` has only `WlPaste` (linux, Wayland) and `Native` (`native_clipboard_available`, `:220-226`, false for `android`), so on Termux it is empty and `read_clipboard_text` (`:711`) returns `None`. Its callers are `crates/cyrup-tui/src/app/shell.rs:532` (`try_paste_clipboard_image_path`, the Ctrl+V text fallback) and `altscreen/selection.rs:405` (right-click paste). The `WlPaste` arm still requires DRIFT-045's three-way `wayland_session && wayland_display` conjunction (closed against v0.84.2). `clipboard_failure` (`:405-421`) checks `env.termux` only inside `if os == "linux"`, so on Android a failed copy returns `ClipboardError::Unavailable`. The write plan's `_` arm (`:254-256`) already tries `termux-clipboard-set` on Android. This picks up the residual `CFG-066`'s closure recorded as "out of scope, untouched … clipboard-chain drift" (`05-cyrup-config-and-resources.md:840`).
+
+**Impact** — On Termux, Ctrl+V text paste and right-click paste in the alt-screen do nothing, and a failed copy shows a bare `Clipboard unavailable` instead of the hint to install Termux:API. xclip/xsel reads are missing on X11 too. Narrow platform.
+
+**Fix** — Add `ClipboardRead::Command(&'static str, &'static [&'static str])` and build the read plan as pi does at `:54-62`: `termux-clipboard-get` when `env.termux` on any OS; then on linux `wl-paste` gated on `WAYLAND_DISPLAY` alone (drop the `wayland_session` term), then `xclip -selection clipboard -out` and `xsel --clipboard --output` (when `DISPLAY` is set); then `Native`. Each command uses pi's "a command that ran wins, even empty" rule, which `read_wayland_clipboard_text` already models. In `clipboard_failure`, check `env.termux` before the `os == "linux"` block. If area 07 now owns `clipboard.rs`, move this row there.
+
+**Verify** — `clipboard_read_plan("android", &ClipboardEnv{termux: true, ..})` == `[Command("termux-clipboard-get", [])]`; `clipboard_read_plan("linux", {x11_display: true, ..})` lists `xclip`, then `xsel`, then `Native`; `clipboard_failure("android", {termux: true}, false)` == `ClipboardError::Termux`; update `the_wayland_read_branch_is_gated_on_pis_three_way_conjunction` to the `WAYLAND_DISPLAY`-only gate; the write-plan tests are unchanged.
 
 ## Coverage
 

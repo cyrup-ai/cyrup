@@ -97,7 +97,7 @@ else in these eleven files ports.
 > **Numbering and provenance.** `MCP-587`…`MCP-608` were filed by this pass across `13` and
 > `13a`–`13i`; the allocation, the window census and the canonical status row for each id are in
 > [`13-cyrup-mcp-STATUS.md`](13-cyrup-mcp-STATUS.md) §*Fourth pass — 2026-10-02* (**Table F**).
-> **Next free id: `MCP-617`.** (It was `MCP-616` until 2026-10-07, when the area-18 `v1.0.1..v1.0.4` triage filed it; before that `MCP-612` until 2026-10-06, when `MCP-615` was filed from the same branch's test run, and before that when `MCP-612`–`MCP-614` were filed by the `MCP-604` closure: `MCP-612` and `MCP-614` in `13e`, `MCP-613` in `13h`. Before that it was `MCP-609` until 2026-10-03, when `MCP-609`–`MCP-611` were filed
+> **Next free id: `MCP-618`.** (It was `MCP-617` until 2026-10-09, when the pi v1.1.0 drift triage filed it in `13a`; before that `MCP-616` until 2026-10-07, when the area-18 `v1.0.1..v1.0.4` triage filed it; before that `MCP-612` until 2026-10-06, when `MCP-615` was filed from the same branch's test run, and before that when `MCP-612`–`MCP-614` were filed by the `MCP-604` closure: `MCP-612` and `MCP-614` in `13e`, `MCP-613` in `13h`. Before that it was `MCP-609` until 2026-10-03, when `MCP-609`–`MCP-611` were filed
 > from the post-pin triage: `MCP-609` in `13e`, `MCP-610` in `13d`, `MCP-611` in `13h`.)
 > Upstream was read only through
 > `git -C tmp/pi-mcp-adapter show v5.0.0:<path>` and `git diff v2.38.0..v5.0.0 -- <path>`, plus
@@ -193,6 +193,33 @@ not independent work, and it should be closed by whoever closes that unit.
 
 `verify` — covered by `MCP-510`'s verification, plus one assertion that a bus-initiated call is
 subject to the same approval gate as a proxy call.
+
+### Items filed 2026-10-09 — `pi-mcp-adapter` `v5.0.0..2ccf648` (pi v1.1.0 drift triage)
+
+> **Filed 2026-10-09 from the pi v1.1.0 drift triage.** `git -C tmp/pi-mcp-adapter log --no-merges v5.0.0..2ccf648`
+> = **10** commits (`2ccf648` = `v5.1.0-3-g2ccf648`, an untagged pin chosen deliberately; README *CURRENT PINS*),
+> each read through `git show`; cyrup at `6b14575`. One row filed, `MCP-617`; the window census and the status row
+> are in [`13-cyrup-mcp-STATUS.md`](13-cyrup-mcp-STATUS.md) §*Additions — 2026-10-09*. **Next free id: `MCP-618`.**
+
+| ID | Severity | Kind | Effort | Title |
+|---|---|---|---|---|
+| MCP-617 | low | not-ported | L | **`registerMcpProtocol`, the mediated protocol-extension API for companion extensions, is unported: no extension can reach a configured MCP server for non-tool protocol methods (custom requests, correlated streams, notification observers)** — an amendment to `MCP-510` **Filed 2026-10-09 from the pi v1.1.0 drift triage**; body below. |
+
+#### MCP-617 — `registerMcpProtocol`, the mediated protocol-extension API for companion extensions, is unported: no extension can reach a configured MCP server for non-tool protocol methods (custom requests, correlated streams, notification observers) — an amendment to `MCP-510`
+
+**Kind** not-ported · **Severity** low · **Effort** L · **Confidence** confirmed (both sides read; static, nothing run) · **Filed** 2026-10-09
+
+> **Filed 2026-10-09 from the pi v1.1.0 drift triage** (pi-mcp-adapter `v5.0.0..2ccf648`, cyrup `6b14575`).
+
+**upstream** — `d0fa269` (#807, released in v5.1.0), @2ccf648. `runtime-protocol.ts` (new, 501 lines): `MCP_PROTOCOL_EVENT = "pi-mcp-adapter:protocol:v1"` (`:8`), the reserved core namespaces `tools` / `resources` / `subscriptions` (`:55`), correlation by `_meta["io.modelcontextprotocol/subscriptionId"]` (`:155`), `createProtocolSession` (`:262`) offering `request` / `openStream` / `watchNotifications` restricted to methods declared in a namespace and owning cancellation, `registerProtocolBridge` (`:436`, listening on the bus at `:443`) and `registerMcpProtocol` (`:491`). `index.ts:997-1015` resolves a connection through the normal path (active session, enabled server, `lazyConnect`, runtime guard). `server-manager.ts:223`, `:2176` add `activeProtocolOperations`, so an active protocol op blocks idle cleanup. `mcp-trace.ts:230-236` stops a chained router from tracing a frame twice. Docs: `docs/protocol-extensions.md`.
+
+**cyrup** — `grep -rn -i 'custom_request\|subscriptionId\|protocol:v1' crates/cyrup-mcp/src` finds only `CustomNotification` imports used for elicitation and `list_changed` (`runtime.rs:1670`, `:3532`). No public API lets another extension issue a declared request on a connection. `server_manager.rs:851` `in_flight` is the only idle guard. `MCP-510` (`13-cyrup-mcp-STATUS.md`, high, **missing**) already owns the runtime cross-extension seam (`registerMcpServer` on a versioned bus contract), and `MCP-599` was filed as a low amendment to it on the same basis. A cross-extension bus exists (`crates/cyrup-ext/src/bus.rs`), but nothing in cyrup-mcp listens on it for this.
+
+**Impact** — No user-visible effect today: cyrup has no companion extension (for example the draft MCP Events capability) that would consume the API, so nothing is broken. The gap matters once a cyrup extension wants a server's non-tool capabilities through cyrup-mcp's auth, trust, approval and connection lifetime instead of opening its own client. Low. The census may instead rule it `open-decision` for lack of a consumer, as X-6 / the status-snapshot row was.
+
+**Fix** — Fold this into `MCP-510`'s design, which has to build the same bus endpoint. Expose an `McpProtocol` handle registered by namespace, rejecting the reserved core namespaces, with `connect(server) -> ProtocolSession` resolving through the same `lazy_connect`, trust and enabled checks as a tool call. `ProtocolSession::request` / `open_stream` / `watch_notifications` accept only declared methods; the handle never exposes the rmcp `Peer`. Each active op increments a per-connection counter the idle reaper checks beside `in_flight`, never carried across a reconnect. Route correlated notifications by `_meta["io.modelcontextprotocol/subscriptionId"]` ahead of rmcp's default handler and forward everything else unchanged. If the census rules no-consumer, record the ruling on `MCP-510` instead and close this as `not-applicable`. Effort is **L** as a standalone build; **M** is fairer if it folds into `MCP-510`'s bus endpoint.
+
+**Verify** — Against a fixture stdio server that answers `example/list` and streams `notifications/example/item` frames tagged with a subscriptionId: registering namespace `example` and calling `request("example/list")` returns the result; `request("tools/call")` is rejected; a stream receives only its own correlated notifications while an uncorrelated one still reaches the default handler; cancelling the stream sends `notifications/cancelled`; while a stream is open the idle reaper does not close the connection, and after reconnect the counter starts at zero; registering a second `example` namespace fails.
 
 ### UNVERIFIED — 2026-09-14 census of the `v2.32.1..v2.33.0` window (leads, not units)
 

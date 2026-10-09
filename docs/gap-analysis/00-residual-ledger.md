@@ -5,6 +5,76 @@ next work item**.
 
 ---
 
+# UPDATE 2026-10-09 (pi v1.1.0 drift triage) — 62 counted rows filed across ten areas, plus `MCP-617` (13) and `ACP-299`…`ACP-302` (15); `DRIFT-060` retitled
+
+> Docs-only. Upstreams re-pinned to **untagged** shas, deliberately (README *CURRENT PINS*): pi **`f1b2e77f5`**
+> (= `v1.1.0-11`, window `v1.0.1..f1b2e77f5`, 121 commits), pi-subagents **`ad11b7ab`** (= `v0.76.1-29`, window
+> `v0.74.0..ad11b7ab`, 92 commits), pi-mcp-adapter **`2ccf648`** (= `v5.1.0-3`, 10 commits) and pi-acp **`04d0a15`**
+> (= `v0.0.34-3`, 2 commits). Read in seven lanes (ai, core-runtime, extensions, tui, tools/codemode/new packages,
+> subagents, mcp/acp), each candidate verified on both sides through `git show` only; cyrup read at `6b14575`.
+> Nothing was built or run. Each touched area file carries a `PIN 2026-10-09` block with the window, the rows filed and
+> a "read in scope and deliberately NOT filed" record.
+>
+> The count is whatever `python3 -I docs/gap-analysis/scripts/count_open_items.py` prints, measured on `6b14575`
+> (before) and on this branch (after): **before 92 open (0 above medium, 0 medium; 17 trackers; 984 closed); after 154
+> open (0 above medium, 5 medium; 17 trackers; 984 closed)**. Nothing closes; 62 counted rows are filed. By area:
+> 01 20 → **31**, 03 2 → **3**, 05 4 → **9**, 06 13 → **14**, 07 17 → **27**, 08 5 → **7**, 09b 15 → **43**,
+> 17 1 → **2**, 18 3 → **6**; 02, 04 and 12 unchanged. Areas 13 and 15 count in their own files: `MCP-617` (census
+> 553 → 554) and `ACP-299`…`ACP-302`.
+>
+> * **The five mediums, first:** `SUBA-176` (the `subagent` tool schema still emits `deprecated: true`, which strict
+>   tool-schema validators reject with 400, so the whole session fails on those providers); `SEAM-148` (`--tools
+>   +codemode`, pi's own `--help` example, starts a session with no tools at all); `PROV-139` (Bedrock does not
+>   recognise Claude Haiku 5.5: no cache points, so every turn bills the full input rate, and the budget-thinking request
+>   may be rejected outright); `SUBA-177` (a paused async run whose result was delivered cannot be stopped and keeps its
+>   capacity slot; extends the closed `SUBA-116`); `SUBA-178` (an agent naming a runner launcher runs unwrapped instead
+>   of failing: a declared sandbox fails open).
+> * **Low rows worth scheduling early:** `TUI-173` (Home/End scroll the transcript instead of moving the caret in the
+>   default fullscreen mode, every press), `PROV-149` (embedded catalogs: Sonnet 4.5 at a 1M window offline, Haiku 5.5
+>   absent), `PROV-145` (pi.dev already 404s on the `azure-openai-responses` stem, so Azure users' catalogs are frozen;
+>   gated on an owner decision), `SESS-070` (a symlinked worktree `AGENTS.md` loads no project instructions at all).
+> * **Bookkeeping:** `DRIFT-060` (12) retitled to the four retry literals still missing (`model is at capacity`,
+>   `server_busy`, `servers are currently busy`, `pending stream has been canceled`); its `subscription_sharing_*`
+>   half had landed through `PROV-118` and is marked closed. The three v1.1.0 literals were routed there, not filed as
+>   a new area-01 row. Area 06's *Next free id* read `EXT-109`, which was filed and closed on 2026-10-07; repaired
+>   (`EXT-111`). Area 15's pin text moves off v0.0.33. `09-cyrup-ext-subagents.md:901` (calendar triggers "NOT a
+>   residual") is superseded by `SUBA-185`. The 2026-10-08 UPDATE's lead "pi-subagents wakes an idle parent with
+>   `sendUserMessage`" is filed as `SUBA-188`, on the `HostServices::wake_user_prompt` seam `ICOM-084` added.
+> * **Merged duplicates:** the codemode output-items row (extensions and tools lanes → `CODE-021`); `outputPad` and the
+>   `!!` header (TUI and tools lanes → `TUI-175` and `TUI-174`); `samplingParamsByThinkingLevel` is one finding in two
+>   halves, `PROV-146` (request, an amendment to the open `PROV-123`) and `CFG-104` (models.json); classifier images is
+>   `PROV-148` (provider) plus `CODE-023` (codemode, depends on it).
+> * **Filed by this pass from verifier leads, both sides re-read:** `TUI-180` (dead-terminal `ENOTTY`) and `ACP-302`
+>   (the v0.0.34 context-usage `usage_update` lead area 15 recorded on 2026-09-24 and never filed).
+> * **Next free ids:** `PROV-150`, `SESS-071`, `CFG-108`, `EXT-111`, `TUI-181`, `SEAM-150`, `SUBA-204`, `MCP-618`,
+>   `ACP-303`, `DUR-007`, `CODE-024`; the rest are unchanged.
+>
+> ## Structural census (README *CURRENT PINS* has the table)
+>
+> One new pi package in the window: **`packages/env`** (`@earendil-works/pi-env`, remote execution environments for
+> Pi Durable, with a Rust SSH-deployed daemon). Nothing in pi depends on it; it is Durable §7, out of scope by
+> ADR-0029, so it goes to area 17 under `HARN-004`'s tracker with no row. `server`, `protocol`, `client`,
+> `telemetry` and `evals` are not new (present at v1.0.0, version bumps only); `packages/mcp` has no structural growth;
+> `packages/durable` grew to ~20 400 lines, all §5–§9 except `ScanOrder` (`DUR-006`). **No new area file is needed**;
+> README lists that and four other decisions for the maintainers (untagged pins, the `azure` rename, `DUR-006`'s spec
+> re-pin, `MCP-617`'s possible `open-decision` ruling).
+>
+> ## Leads this pass produced — recorded, NOT counted, not filed
+>
+> * models.json `compat` became one open object in pi (`7f9e1198f`, `providers/compat-schema.ts:604-607`); whether
+>   cyrup's serde `compat` (`validate.rs:246-249`, `[CYRUP-DELTA]`) rejects a mixed-arm block pi accepts is unchecked
+>   (area 01).
+> * `VL-P6` caution: when auth operations take a signal, it must cancel only the lock wait, not a started refresh
+>   (`bde882c74`), or the port reintroduces that bug (area 01's pin block).
+> * pi-subagents `ad11b7ab` (#2757, per-run result lease), `5da80816` (#2712, output-less workflow resume) and
+>   `8fb89814`'s first commit: mechanisms cyrup lacks or could not locate (09b's pin block).
+> * pi's built-in MCP `f10993bc7` (Esc cancel, `mcp login --timeout`) and `2db5e359b` (manager before connections):
+>   leads for area 13 only if pi-mcp-adapter adopts them. Area 13's two 2026-10-07 leads are settled: `147b50281` is
+>   handled by rmcp, `8c911797c` is already present.
+> * `06c12df` (pi-mcp-adapter, SSE abort through fetch wrappers): judged not to apply by construction; a one-off
+>   `cyrup -p` exit check against a kept-alive bearer-command server would confirm it.
+> * The export-html renderer's `outputPad: 1` (pi `18336987a`) was not read against cyrup's export path.
+
 # UPDATE 2026-10-08 (intercom, pi-intercom v0.16.1) — area 11 emptied: `ICOM-071`, `073`, `075`, `076`, `078`, `079`, `080`, `081` closed; `ICOM-083`…`ICOM-086` filed and closed
 
 > The whole `v0.14.0..v0.16.1` intercom backlog, built on `claude/zealous-bell-x0u1h0` off `main` @ `d5d14cb`.

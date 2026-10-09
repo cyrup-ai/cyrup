@@ -212,7 +212,59 @@ a six-column table is an empty `Dedup`, which is what "not a duplicate" means.
 
 ## Baselines measured against
 
-> ### CURRENT PINS — re-pinned 2026-10-02, pi 1.0
+> ### CURRENT PINS — re-pinned 2026-10-09, pi v1.1.0+11 (the pi v1.1.0 drift triage)
+>
+> **cyrup code pin: `6b14575`** (the `main` merge of #209). Every cyrup claim filed on 2026-10-09 was read there.
+> **The four upstream pins are untagged commits, chosen deliberately** so that fixes landed after each release are in
+> scope; every row filed on 2026-10-09 cites `@<sha>`. This departs from the tag-only rule in *Three standing hazards*
+> below for this pass, and is recorded here as a decision for the maintainers to keep or reverse (next pass: diff from
+> these shas, or from the next tags if the rule is restored).
+>
+> | repo | was | now | non-merge commits in the window |
+> |---|---|---|---|
+> | `pi/` | v1.0.0 (v1.0.1 post-pin triage; area 18 at v1.0.4) | **`f1b2e77f5`** = `v1.1.0-11-gf1b2e77f5` | 121 in `v1.0.1..f1b2e77f5` (37 in `packages/ai`) |
+> | `pi-subagents/` | v0.74.0 (v0.75.0 post-pin triage) | **`ad11b7ab`** = `v0.76.1-29-gad11b7ab` | 92 in `v0.74.0..ad11b7ab` (61 after v0.75.0) |
+> | `pi-mcp-adapter/` | v5.0.0 | **`2ccf648`** = `v5.1.0-3-g2ccf648` | 10 |
+> | `pi-acp/` | v0.0.34 (area 15's own text still said v0.0.33) | **`04d0a15`** = `v0.0.34-3-g04d0a15` | 2 (plus the merge `04d0a15`) |
+> | `pi-intercom/` · `pi-permission-system/` · `herdr` | unchanged by this triage | — | — |
+>
+> **Rows filed 2026-10-09, by area** (each area file's PIN 2026-10-09 block has the window record and the
+> deliberately-not-filed list): `01` `PROV-139`…`PROV-149` (11; `PROV-139` medium); `12` none, `DRIFT-060` retitled
+> and its `subscription_sharing_*` half closed; `02` and `04` none (pin blocks only); `03` `SESS-070`; `05`
+> `CFG-103`…`CFG-107`; `06` `EXT-110`; `07` `TUI-171`…`TUI-180`; `08` `SEAM-148` (medium), `SEAM-149`; `09b`
+> `SUBA-176`…`SUBA-203` (28; `SUBA-176`…`SUBA-178` medium); `13a` `MCP-617`; `15` `ACP-299`…`ACP-302`; `17` `DUR-006`;
+> `18` `CODE-021`…`CODE-023`. **Next free ids now:** `PROV-150`, `SESS-071`, `CFG-108`, `EXT-111` (the area-06 counter
+> read `EXT-109`, which was already filed and closed on 2026-10-07; repaired), `TUI-181`, `SEAM-150`, `SUBA-204`,
+> `MCP-618`, `ACP-303`, `DUR-007`, `CODE-024`; unchanged: `AGENT-048`, `TOOL-059`, `DRIFT-061`, `HARN-005`, `ICOM-087`,
+> `HERDR-009`.
+>
+> **Structural census of the pi monorepo at `f1b2e77f5`, with proposed ownership:**
+>
+> | package | in the window | owner |
+> |---|---|---|
+> | `packages/env` (`@earendil-works/pi-env` 1.1.0) | **new** (absent at v1.0.0 and v1.0.1; first commit `ba03e03f2`, 11 commits; ~2 070 lines of TS plus a ~4 030-line Rust daemon). Remote execution environments for Pi Durable: an SSH-deployed daemon with a framed stdio protocol, and `RemoteExecutionEnv`, a Durable `ExecutionEnv` client. Nothing in pi depends on it | area **17**, under `HARN-004`'s tracker: Durable §7, out of scope by ADR-0029; no cyrup remote-execution backend. No new area needed unless coding-agent ships a remote env |
+> | `packages/server`, `protocol`, `client` | not new (present at v1.0.0); version bumps and CHANGELOG only | unchanged: `SEAM-058` (08), context in `DUR-002` (17) |
+> | `packages/telemetry` | not new; version bump only | unchanged: `DRIFT-047` (duplicate of `PARITY-GAPS` `VL-P5`) |
+> | `packages/evals` | not new; private dev tooling, one install-script change (`23cf2b948`) | unchanged: ruled no-port (`12`) |
+> | `packages/mcp` | no structural growth (18 src files at both ends); `147b50281` already handled by rmcp 3.1.4, `f10993bc7` leads | area 13 (`MCP-587`: compare with rmcp, not the adapter) |
+> | `packages/durable` | 60 files / 17 662 lines → 67 / 20 404; almost all §5–§9 harness / env / tools; one kernel change, the breaking `ScanOrder` | area 17: `DUR-006`; `HARN-004`'s sizing is stale (~20 400) |
+>
+> `packages/coding-agent/suite`, named in one lane's brief, does not exist; the real path is
+> `packages/coding-agent/test/suite`. pi's new `packages/tui/src/program-status.ts` (OSC 7501) had no owner: it is now
+> `TUI-171` (area 07), which `SUBA-186` (09b) depends on.
+>
+> **Decisions for the maintainers (recorded, not taken):**
+> 1. **Untagged pins** — keep this pass's `@<sha>` pins, or restore the tag-only rule at the next pass.
+> 2. **pi renamed `azure-openai-responses` → `azure`** (`a37306d43`, v1.0.3; a declared breaking change for auth.json,
+>    models.json and settings.json keys). Whether cyrup follows, and how stored credentials migrate, is area 05's call;
+>    `PROV-145` is gated on it. Urgent for tooling: pi.dev's `/providers/azure-openai-responses` already returns 404,
+>    so the runtime overlay and `gen-catalogs` for that stem are broken today.
+> 3. **`DUR-006` re-pins area 17's kernel clauses to spec v1.1.0** (`PICO5-PLAN.md` pins v1.0.0).
+> 4. **`MCP-617` may be ruled `open-decision`** on `MCP-510` for lack of a cyrup consumer.
+> 5. **No new area file is needed.** `packages/env` fits area 17 under `HARN-004`; a new area is warranted only if
+>    pi's coding-agent starts shipping a remote env.
+
+> ### PINS — re-pinned 2026-10-02, pi 1.0 (superseded 2026-10-09 by the block above)
 >
 > **cyrup code pin: `592bf2c3`** (2026-10-02; was `ea23ca2`) — the last commit that touches `crates/`.
 > Every cyrup claim filed on 2026-10-02 was read at `fe875569`, the docs HEAD at the time, and
@@ -321,6 +373,24 @@ those blocks, collected on 2026-09-24. Older pins stay in each file's header and
 opinion; it is not a backlog and it is not a count. **Where an area file states its own per-module
 range, that range wins over the single tag in this column.** Nothing in this table re-verifies any
 file; it only says how old each one is.
+
+> **Re-pinned 2026-10-09 (pi v1.1.0 drift triage).** These areas' own PIN 2026-10-09 blocks are now newer than both
+> tables below; where they disagree, the file wins.
+>
+> | area file(s) | re-pinned at | filed 2026-10-09 |
+> |---|---|---|
+> | `01` · `12` | cyrup `6b14575` × pi **`f1b2e77f5`** (`packages/ai` `v1.0.1..f1b2e77f5`) | `PROV-139`…`PROV-149` (next id `PROV-150`); area 12 none, `DRIFT-060` retitled (next id `DRIFT-061`) |
+> | `02` · `03` · `05` · `08` | cyrup `6b14575` × pi **`f1b2e77f5`** (core-runtime lane, 27 commits) | `02` none; `SESS-070` (next `SESS-071`); `CFG-103`…`CFG-107` (next `CFG-108`); `SEAM-148`, `SEAM-149` (next `SEAM-150`) |
+> | `04` | cyrup `6b14575` × pi **`f1b2e77f5`** (`core/tools`, 4 commits) | none (next id `TOOL-059`) |
+> | `06` | cyrup `6b14575` × pi **`f1b2e77f5`** (`core/extensions`, `src/extensions`, 14 commits) — first re-read since 2026-09-24 | `EXT-110` (next id `EXT-111`; the counter was stale at `EXT-109`) |
+> | `07` | cyrup `6b14575` × pi **`f1b2e77f5`** (`packages/tui`, `modes/interactive`, 21 commits) | `TUI-171`…`TUI-180` (next id `TUI-181`) |
+> | `09b` | cyrup `6b14575` × pi-subagents **`ad11b7ab`** (window now `v0.57.0..ad11b7ab`) | `SUBA-176`…`SUBA-203` (next id `SUBA-204`) |
+> | `13` · `13a`–`13i` · `13-cyrup-mcp-STATUS.md` | cyrup `6b14575` × pi-mcp-adapter **`2ccf648`** | `MCP-617` (next id `MCP-618`); census 553 → 554. Still counted in its own file |
+> | `15` | cyrup `6b14575` × pi-acp **`04d0a15`** — the file's own pin text moves off v0.0.33 | `ACP-299`…`ACP-302` (next id `ACP-303`). Still counted in its own file |
+> | `17` | cyrup `6b14575` × pi **`f1b2e77f5`** (`packages/durable`, new `packages/env`) | `DUR-006` (next ids `HARN-005`, `DUR-007`) |
+> | `18` | cyrup `6b14575` × pi **`f1b2e77f5`** (`packages/codemode` from v1.0.4; `extensions/codemode` from v1.0.1) | `CODE-021`…`CODE-023` (next id `CODE-024`) |
+>
+> **Not re-read on 2026-10-09:** `09`, `09a` (beyond the `SUBA-185` supersession note on `09`), `10`, `11`, `14`, `16`.
 
 > **Re-pinned 2026-10-02 (pi 1.0).** The table below is the 2026-09-24 collection and is kept as
 > written. These areas were re-read against the new tags on 2026-10-02 and their own pin blocks are

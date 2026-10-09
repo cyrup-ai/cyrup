@@ -21,6 +21,9 @@
 >
 > Numbering resumes from **`MCP-616`** (table F, *Fourth pass*, took `MCP-587`–`MCP-608`; table G,
 > *Post-pin triage 2026-10-03*, took `MCP-609`–`MCP-611`; `MCP-586` was never allocated and is still free).
+> **2026-10-09:** numbering now resumes from **`MCP-618`** (`MCP-612`–`MCP-616` were filed 2026-10-06 and 2026-10-07;
+> `MCP-617` by the pi v1.1.0 drift triage, §*Additions — 2026-10-09*). The `pi-mcp-adapter` pin is now **`2ccf648`**
+> (= `v5.1.0-3-g2ccf648`); `v5.0.0..2ccf648` (10 commits) was read in full.
 
 > ### PIN — 2026-09-24 (superseded by the 2026-10-02 pin above). cyrup **`ea23ca2`** · `pi-mcp-adapter` **v2.37.0** (`28049de`)
 >
@@ -502,6 +505,44 @@ Numbering resumes from **`MCP-616`**.
 none of which existed before, so the counted set is **548**: `implemented` 347, `partial` 67 + 2 = **69**,
 `missing` 97 + 1 = **98**, `not-applicable` 34. Severity of the three new rows: 3 low. Table F's own
 census above is left as filed.
+
+### Additions — 2026-10-09 (pi v1.1.0 drift triage; `pi-mcp-adapter` `v5.0.0..2ccf648`, pi `v1.0.1..f1b2e77f5`)
+
+**Re-pin.** This area's upstream moves from `v5.0.0` to **`2ccf648`** (= `v5.1.0-3-g2ccf648`), an untagged pin chosen
+deliberately (README *CURRENT PINS*). `git -C tmp/pi-mcp-adapter log --no-merges v5.0.0..2ccf648` = **10** commits,
+each read through `git show`; cyrup read at `6b14575`. Nothing was run. **`pi-mcp-adapter` is still the authoritative
+upstream** (`MCP-587`).
+
+One row filed: `MCP-617` (13a, low, L, **missing**): `registerMcpProtocol`, the mediated protocol-extension API
+(`d0fa269`, #807), an amendment to `MCP-510`; the census may rule it `open-decision` for lack of a cyrup consumer.
+Arithmetic on the 2026-10-07 census (553): +1 row = **554**; `missing` +1. **Next free id: `MCP-618`** (`MCP-586` is
+still unallocated).
+
+| id | sev | § | kind | status | eff | title | body |
+|---|---|---|---|---|---|---|---|
+| `MCP-617` | low | 13a | `not-ported` | **missing** | L | `registerMcpProtocol`: the mediated protocol-extension API for companion extensions | [`13a`](13a-mcp-activation.md) |
+
+**Read in scope and deliberately NOT filed (`v5.0.0..2ccf648`):** `d6ffcca` (#800, keyless Tavily preset; noted on
+`MCP-529`); `0f0ed94` (#801) and `85db03d` (#806) (npm peer ranges only, as `MCP-538`); `06c12df` (#802, keep the SSE
+abort reachable through fetch wrappers: undici's weak signal link is JS-specific; cyrup's `ProviderTokenClient`
+(`runtime.rs:2249`) and the bearer-command client delegate by value and cancel by drop, so the defect class cannot
+occur — a one-off `cyrup -p` exit check against a kept-alive bearer-command server would confirm it); `5de8201` (#804,
+per-server `openUi: false`: MCP Apps is CUT; unknown keys round-trip, `config.rs:48-60`, `:800-806`); `5d2b583`
+(release v5.1.0); `08d001b` (#813, Jev/System One loopback, `MCP-550` ruled not-applicable); `be91dc6` (#812, Pi
+`builtin:mcp` coexistence, inapplicable per `MCP-587`); `2ccf648` (#814, CLI `doctor` trust; the adapter `doctor`
+subcommand was ruled not filed, and in-session trust goes through `HostServices::is_project_trusted`,
+`runtime.rs:189-201`, with the marker list aligned by `CFG-101`).
+
+**Leads from the 2026-10-07 additions, now settled (both sides read by this triage's lanes):** `147b50281`
+(`application_type` in OAuth dynamic client registration) is **already handled** by rmcp 3.1.4:
+`DEFAULT_APPLICATION_TYPE = "native"` (`transport/auth.rs:204`, used at `:684` and `:1318`) is sent in the
+registration body, and cyrup's loopback redirect (`oauth.rs:2715`) makes `"native"` the right SEP-837 value. `8c911797c`
+(`close()` aborts a connection that is still connecting) is **already present**: `server_manager.rs:2796-2843`
+`close_all_inner` bumps close generations, aborts each `connect_attempts` handle and awaits the pending connects (test
+`close_all_disposes_a_live_connection_and_one_that_is_mid_connect`, `:4633`). Neither needs a row. pi's built-in MCP
+extension (`f10993bc7`, `2db5e359b`) stays secondary (`MCP-587`): `f10993bc7`'s shutdown cancellation is present
+(`oauth.rs:2035` `shutdown_oauth`) and its request timeout duplicates `MCP-569`; its Esc cancel and
+`mcp login --timeout`, and `2db5e359b`'s manager-before-connections change, are leads only if the adapter adopts them.
 
 ### Additions — 2026-10-07 (area 18's pi `v1.0.1..v1.0.4` triage)
 

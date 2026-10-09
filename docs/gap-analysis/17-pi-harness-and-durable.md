@@ -39,6 +39,8 @@ own*, for their owners to apply. This pass does not edit those files.
 
 ## Provenance and pins
 
+> **Re-pinned 2026-10-09 to pi `f1b2e77f5` (= `v1.1.0-11-gf1b2e77f5`)** by the pi v1.1.0 drift triage; the window record, the rows filed and the not-filed list are in §*Triage 2026-10-09 — pi `v1.0.1..f1b2e77f5` (`packages/durable`, and the new `packages/env`)* below. The table here is the earlier pin, kept as history.
+
 | side | pin | how obtained |
 |---|---|---|
 | cyrup | **`fe875569`** (HEAD, 2026-10-02) — was `ea23ca2` for the `v0.85.1..v0.87.1` half | `git log -1` |
@@ -134,7 +136,7 @@ Negative results, recorded so the next pass does not repeat them: `grep -rli
 
 ## Open items
 
-> **Next free ids: `HARN-005` and `DUR-006`** (2026-10-02, after the pi v1.0.0 pass filed `HARN-003`, `HARN-004` and `DUR-001`…`DUR-004`). **2026-10-03:** `DUR-005` was filed and closed (cyrup-original, the `cyrup-session` rename-durability fix landed with PR #173; it is the only closed row in this table) — `DUR-006` is next; `HARN-005` is unallocated.
+> **Next free ids: `HARN-005` and `DUR-007`** (2026-10-09: the pi v1.1.0 drift triage filed `DUR-006`; before that `HARN-005` and `DUR-006`, 2026-10-02, after the pi v1.0.0 pass filed `HARN-003`, `HARN-004` and `DUR-001`…`DUR-004`). **2026-10-03:** `DUR-005` was filed and closed (cyrup-original, the `cyrup-session` rename-durability fix landed with PR #173; it is the only closed row in this table) — `DUR-006` is next; `HARN-005` is unallocated.
 
 > The standard `ID | Severity | Kind | Effort | Title` table, as README's *Item format* requires and
 > as `09b` uses. Two id series: `HARN-NNN` for pi's harness, `DUR-NNN` for `packages/durable` and the
@@ -161,6 +163,7 @@ Negative results, recorded so the next pass does not repeat them: `grep -rli
 | DUR-003 | low | upstream-drift | S | **`packages/durable/docs/pico-v5.md` does not exist at v1.0.0 — it is `docs/spec.md` — so `HARN-002`'s Fix and `HARN-004`'s Fix both route the OQ-7 reader to a dead path** — `git cat-file -e v1.0.0:packages/durable/docs/pico-v5.md` fails; `docs/spec.md` is 4 601 lines with §10 *Storage contract* at line 4188. The acceptance artifacts to cite instead are named below. **FILED 2026-10-02**; body below. **CORRECTED 2026-10-03:** the row's Fix edits 1 and 2 are now applied as CORRECTED notes at the dead cites (`HARN-002` Fix and `HARN-004` Impact point 1 point to `docs/spec.md` §10, line 4188 @v1.0.0, verified with `git -C tmp/pi show v1.0.0:packages/durable/docs/spec.md`); the original sentences are kept per the ledger's no-rewrite rule, so a grep of `pico-v5\.md` still hits them. `pico-v5.md` is absent at v1.0.0 (`cat-file -e` fails). `docs/adr/ADR-0029-durable-pico5-scope.md` and `ADR-0030-durable-rust-architecture.md` cite `spec.md` throughout. Edit 3 (name `spec-usage.test.ts`, `test/examples/**` and `./testing` as acceptance artifacts) is not applied. Row left open. |
 | DUR-004 | tracker | upstream-drift | S | **The release post's "Pi Durable ships `pi-durable`, `pi-ai` and `chord`" is a re-announcement of three packages already publishable at `v0.87.1`, and `pi-ai` is `packages/ai` itself, not a repackaging** — all three carried `"version": "0.87.1"`, `files`, `prepublishOnly`, no `private`, and a root-`README.md` table entry at the old pin. Recorded as a negative result so no later pass re-derives it, with the three genuinely new packaging surfaces named. **FILED 2026-10-02**; body below. |
 | ~~DUR-005~~ | ~~low~~ **CLOSED 2026-10-03** | cyrup-original | S | **Filed and closed 2026-10-03** (fixed outside any ledger batch, in PR #173's build commit `d9fe2b05`, merge `6bd82cb2`; slice S11 of `docs/PICO5-PLAN.md`, ADR-0029 decision 6, ADR-0030 §3). `DiskStore::rewrite` (`crates/cyrup-session/src/store.rs`) replaced a session file by temp-file-and-rename but never fsynced the parent directory: at `d9fe2b05^` it did `f.sync_data()?` then `std::fs::rename(&tmp, &self.path)?` (`store.rs:322-324`), which makes the new inode durable and leaves the directory entry naming it in the page cache, so after power loss a unix filesystem could legally restore the pre-rewrite entry while `rewrite` had returned `Ok(())`. `rewrite` is reached only to persist a format migration or an eager clone seed (`manager/lifecycle.rs`, `manager/branched_session.rs`), i.e. when the only copy of the history is rebuilt from memory; the old file stays intact, so this is a silent lost-rewrite, not lost history (rated low on that basis; the README rubric rates on consequence when reached). No pi basis: pi's `_rewriteFile` truncates in place (`session-manager.ts:979-988` @v0.83.0, already recorded in `03-cyrup-session.md` as `VL-P22` partially addressed), so this is not a parity row. Fixed: `store.rs:329` now calls `crate::durable::durable_rename(&tmp, &self.path)` (`crates/cyrup-session/src/durable.rs:71`: fsync the temp payload, rename, fsync the parent directory; unix arm only, the Windows arm is open as ADR-0030 §14 item 1). Verify: `cyrup-session` `tests::durable_rewrite::{rewrite_fsyncs_the_directory_its_rename_rewrote,rewrite_replaces_a_live_file_and_leaves_no_temp_sibling,rewrite_creates_a_missing_parent_chain}` (the first asserts the syscall-level parent-directory fsync; the power-loss outcome itself cannot be asserted in-process, per `durable.rs`'s module doc). Not re-run here (docs-only pass). |
+| DUR-006 | low | upstream-drift | M | **The Pico5 storage contract gained a breaking `ScanOrder` on conversation, entry, task and submission scans, and cyrup-pico-store's queries and cursors have no order** **Filed 2026-10-09 from the pi v1.1.0 drift triage**; body below. |
 
 ---
 
@@ -823,6 +826,62 @@ grew a runtime inside it (which is `HARN-004`'s measurement, and the right one t
 **The npm registry was not queried**, so the *date* each version first appeared on npm is unknown.
 Nothing in this file rests on it: the claim is "already publishable and already advertised in-repo at
 v0.87.1", which the two tags settle on their own.
+
+## Triage 2026-10-09 — pi `v1.0.1..f1b2e77f5` (`packages/durable`, and the new `packages/env`)
+
+> **PIN 2026-10-09 — cyrup `6b14575` × pi `f1b2e77f5` (= `v1.1.0-11-gf1b2e77f5`).** Upstream read through
+> `git -C tmp/pi show` only; nothing run. The pin is untagged, deliberately (README *CURRENT PINS*).
+>
+> **Filed (1):** `DUR-006` (low, M) — the breaking `ScanOrder` storage-contract change (`4dd2af42c`), the only
+> change in the window to the kernel cyrup ports (§1–§4, §10–§11). The lane proposed it as `HARN-005`; area 17 files
+> spec / kernel drift as `DUR-nnn`, and `DUR-005` is taken (filed and closed 2026-10-03), so it is `DUR-006`.
+> **Next free ids: `HARN-005` and `DUR-007`.**
+>
+> **`packages/durable` growth:** 60 files / 17 662 lines at v1.0.1 → 67 files / 20 404 lines at f1b2e77f5 (+3 027 /
+> −285 across 34 files). New files: `env/node-watch.ts`, `env/line-scan.ts`, `env/decode.ts`, `storage/scan.ts`,
+> `storage/sqlite/cloudflare.ts` (a Durable Object SQLite adapter, S12 territory), `harness/provider.ts`,
+> `tools/image.ts`. `HARN-004`'s sizing (17 662) is stale and should read ~20 400; its escalation greps were re-run at
+> f1b2e77f5 and are still negative (no `pi-durable` in `coding-agent/package.json`, no import outside
+> `experimental/`, `files` / `tsconfig.build` still exclude `experimental`, no durable flag in `cli.ts` / `main.ts`).
+>
+> **New package `packages/env` (`@earendil-works/pi-env` 1.1.0; first commit `ba03e03f2`, v1.0.4 cycle; ~2 070 lines
+> of TS plus ~4 030 lines of Rust daemon) — census, no row.** Remote execution environments for Pi Durable: a small
+> Rust daemon (`daemon/`, a framed stdin/stdout protocol, `docs/protocol.md`) deployed over SSH with a hardened
+> bootstrap (BatchMode, a pinned `known_hosts` alias, no forwarding, a SHA-256-named binary verified before each
+> start, lazy connections), and `RemoteExecutionEnv`, a Durable `ExecutionEnv` client whose results match
+> `NodeExecutionEnv` (`docs/semantics.md`); Linux, macOS, Termux and Windows on x86-64 and arm64. Nothing in pi
+> depends on it (no other `package.json` names it; coding-agent does not import it). It implements Durable's §7
+> `ExecutionEnv`, out of cyrup's scope by ADR-0029, and cyrup has no remote-execution backend. **Owner: this area,
+> under `HARN-004`'s tracker** (same escalation conditions). No new area is needed unless coding-agent ships a remote
+> env. Commits: `ba03e03f2`, `b78e6a908`, `46d0ff936`, `956e81504`, `97a600395`, `4bf5a6bc5`, `6fa21f2a3`,
+> `9a193ff7e`, `b7dfc049e`, `031b24aa6`, `5b3189647`.
+>
+> **Read in scope and deliberately NOT filed (§5–§9 harness / env / tools, out of scope by ADR-0029 and
+> `PICO5-PLAN.md:3-8`; `HARN-004` covers them):** context — `da866ada1`, `ae92585d3`, `92216fa15`, `636703a0a`
+> (touches `src/types.ts` only for `TaskRuntime.context`), `76f6c06da`, `68ccef176`, `311f0e020`; harness API and
+> identities — `b0114ef5f`, `70eceaade` (adds a `pi.provider` harness document to the spec, not kernel); progress and
+> output — `674d64f09`, `cdf79797b`, `ed94330a2`; env, watch and tools — `4748c627a`, `a19c09d9b` (the durable tools
+> are byte-identical twins of coding-agent's, per `HARN-004`), `a84510819`, `864777ba6`, `1965a8069`, `cd60a5b99`,
+> `68c22123b`, `1543dd8f6`; docs and tests — `be882f3fa`, `acfc60198`, `f5d20047b`, `2e63fcdfb`, `b5b490601`.
+> `36a686ee8`'s task `startedAt` / `endedAt` are present (`cyrup-pico-store/src/records/task.rs:68-72`; ledger
+> UPDATE 2026-10-09). The other packages in the census (`server`, `protocol`, `client`, `telemetry`, `evals`) are not
+> new in the window and changed only by version bumps; see README *CURRENT PINS*.
+
+## DUR-006 — The Pico5 storage contract gained a breaking `ScanOrder` on conversation, entry, task and submission scans, and cyrup-pico-store's queries and cursors have no order
+
+**Kind** upstream-drift · **Severity** low · **Effort** M · **Confidence** confirmed (both sides read; static, nothing run) · **Filed** 2026-10-09
+
+> **Filed 2026-10-09 from the pi v1.1.0 drift triage** (pi `v1.0.1..f1b2e77f5`, `packages/durable`, cyrup `6b14575`).
+
+**upstream** — `4dd2af42c` (#10546), listed under Breaking Changes in `packages/durable/CHANGELOG.md` for v1.1.0 (lines 7-9, 16). `packages/durable/src/types.ts:621` `ScanOrder = "ascending" | "descending"`, and `order?` on `ConversationQuery` `:628`, `EntryQuery` `:639`, `TaskQuery` `:650` and `SubmissionQuery` `:658`; entries default to descending and the other three to ascending. `packages/durable/src/storage/scan.ts` (new): a cursor carries its order, a later page continues in that order whether or not `order` is repeated, and a request for the other order throws. `docs/spec.md:4333-4360` and the §10 text: storage implementations MUST honour order, and an ascending entry scan reads the root segment first and then each fork. `src/testing/storage-conformance.ts:457`, `:574-577` test both orders and the cursor-order rejection. `Tx.scanTasks()` and `Conversation.entries()` take it (the latter via `harness/harness.ts` and `harness/types.ts`).
+
+**cyrup** — `crates/cyrup-pico-store/src/query.rs:22` `ConversationQuery`, `:36` `EntryQuery`, `:62` `TaskQuery` and `:77` `SubmissionQuery` have no order field; the module doc (`query.rs:8-11`) says "What is not here is … a sort order", and `EntryQuery`'s doc pins "newest-first order". `crates/cyrup-pico-store/src/storage.rs:159`, `:224`, `:244`, `:268` (`scan_*`) and `crates/cyrup-pico/src/tx.rs:598` (`scan_tasks`) take only the query and the cursor; `cursor.rs` carries no order. A grep for `ScanOrder` or `descending` over `crates/cyrup-pico*` finds only a comment at `cyrup-pico-store-jsonl/src/index.rs:405`. cyrup ports the v1.0.0 spec (`PICO5-PLAN.md:3-8`, S3/S10 landed), and the storage contract is in ADR-0029's scope (§10–§11).
+
+**Impact** — No user is affected yet: the kernel crates have no consumer outside `cyrup-pico*`. The contract cyrup claims parity with (`G-BACKEND-PARITY-BY-CONFORMANCE`, the conformance suite as the contract) has drifted: a host cannot page the newest tasks first, and pi's v1.1.0 conformance cases for order cannot be carried over. An S12 or harness built against the v1.1.0 spec would need this first.
+
+**Fix** — **Re-pin decision first:** `PICO5-PLAN.md:4`, `:15` pin the kernel to spec v1.0.0; filing this row means area 17's kernel pin moves to v1.1.0 for these clauses, which is a decision to record in `PICO5-PLAN`, not leave implicit. Then add `ScanOrder { Ascending, Descending }` to cyrup-pico-store; give the four query structs `order: Option<ScanOrder>` with upstream's defaults (entries descending, the rest ascending); store the resolved order in each scan's typed cursor and return a typed error, not a panic, when an explicit order contradicts the cursor's; implement both directions in `MemoryStore` and the JSONL backend's indexes (the `index.rs:405` merge of per-ancestry descending ranges needs an ascending twin: root segment first, then each fork — the risky part); thread the order through `Tx::scan_*`; port the conformance cases. `Conversation.entries()`'s pass-through is §5+ harness surface and is **not owed** (ADR-0029, `PICO5-PLAN.md:4`).
+
+**Verify** — Port the conformance cases behind feature `conformance` and run them against `MemoryStore` and `JsonlStore`: all four scans page identically in both orders, each the reverse of the other; the default orders are unchanged; a descending cursor continued with `order: None` stays descending; a descending cursor continued with `order: Some(Ascending)` is rejected; an ascending entry scan over a fork returns the root's segment before the fork's entries. Then `cargo test -p cyrup-pico-store -p cyrup-pico-store-jsonl --features conformance`.
 
 ## Growth for items other files own
 

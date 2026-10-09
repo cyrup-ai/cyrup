@@ -2,6 +2,15 @@
 
 This area covers `crates/cyrup-tools` — the seven built-in tools (`read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`), their registry, the `ops` filesystem/process/shell seam, the glob matchers, the file-mutation lock and the `isolation/` decorators — plus the places tool metadata crosses into `cyrup-core`, `cyrup-ext`, `cyrup-tui` and `cyrup-session-svc`, which are the tool *surface* and are routed explicitly per item. It is measured against `pi/packages/coding-agent/src/core/tools/` at **pi v0.84.1** (the coding-agent copy is pi's live path; the thinner `packages/agent/src/harness/tools/` fork is not the reference). Headline: **both prior highs are gone** — `write`/`edit` now write in place (TOOL-004) and `bash` now injects and scrubs the session environment (TOOL-008) — and the entire 2026-08-03 surface sweep (`TOOL-S01`…`TOOL-S06`) is closed. **A new high replaced them**, from the same first-ever audit of `ops/shell.rs`: **TOOL-039**, the ambient `CYRUP_SHELL` override with no pi analogue, which sits ahead of `/bin/bash` in the shell resolution every model-issued command goes through, is unscrubbed so it propagates into subagent re-execs, and is invisible in the transcript. It ships with **TOOL-007** as one shell-surface decision. The rest is a different shape of debt: two streaming/limit defects in `grep` that mirror the known one in `find`, a guest-tool metadata surface that is still dead end-to-end, a silent `cmd.exe` substitution on Windows, and five tests that still assert timing or nothing at all.
 
+> ### PIN 2026-10-09 — pi v1.1.0 drift triage: cyrup `6b14575` × pi **`f1b2e77f5`** (= `v1.1.0-11-gf1b2e77f5`); nothing filed
+>
+> `git -C tmp/pi log --no-merges v1.0.1..f1b2e77f5 -- packages/coding-agent/src/core/tools` = **4** commits, read by the
+> tools / codemode lane: `021eae60a` (`read` resolves codemode image reads to image blocks) is the open `TOOL-058`;
+> `d677d0ee7` (0600 output files, codemode `image()` to temp files) is `TOOL-057` / `CODE-019`, closed; `36a686ee8`
+> (the bash renderer's "Took" reads the recorded duration) is ported (ledger UPDATE 2026-10-09); `18336987a`'s
+> `renderers/edit.ts` padding is a TUI surface and is in `TUI-175` (area 07). **No row filed; next free id unchanged
+> (`TOOL-059`).**
+
 > ### CLOSURES 2026-09-28 — three lows (`TOOL-049`, `TOOL-050`, `TOOL-051`); no partials
 >
 > Landed on `claude/lows-next`, not yet committed. Each row and body section carries its evidence. All

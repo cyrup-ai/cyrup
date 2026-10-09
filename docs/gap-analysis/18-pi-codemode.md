@@ -34,6 +34,8 @@ the coupling.
 
 ## Provenance and pins
 
+> **Re-pinned 2026-10-09 to pi `f1b2e77f5` (= `v1.1.0-11-gf1b2e77f5`)** by the pi v1.1.0 drift triage; the window record, the rows filed and the not-filed list are in §*Triage 2026-10-09 — pi `v1.0.4..f1b2e77f5` (codemode) and pi `v1.0.1..f1b2e77f5` (codemode extension)* below. The table here is the earlier pin, kept as history.
+
 | side | pin | how obtained |
 |---|---|---|
 | cyrup | code pin **`592bf2c3`** — the last commit touching `crates/`. Read at `fe875569`, the docs HEAD on 2026-10-02; `git diff 592bf2c3..fe875569` is docs-only, so the two name the same code | `git log -1`, `git diff --name-only 592bf2c3..fe875569` |
@@ -135,7 +137,7 @@ override `is_hidden`, and files nothing.
 
 ## Open items
 
-> **Next free id: `CODE-021`** (2026-10-07: the pi `v1.0.1..v1.0.4` triage filed `CODE-018`…`CODE-020`; before that `CODE-018`, 2026-10-06, unchanged by the `CODE-014` closure, which filed no new row; after the closure pass filed `CODE-014`…`CODE-017`; before that `CODE-014` (2026-10-02, after this file filed `CODE-001`…`CODE-013`)). 2026-10-03: unchanged; the ledger-correction pass filed no new row here (corrections are CORRECTED notes on `CODE-001`, `-002`, `-003`, `-006`, `-008`, `-010`, `-011`, `-012`, `-013`).
+> **Next free id: `CODE-024`** (2026-10-09: the pi v1.1.0 drift triage filed `CODE-021`…`CODE-023`; 2026-10-07: the pi `v1.0.1..v1.0.4` triage filed `CODE-018`…`CODE-020`; before that `CODE-018`, 2026-10-06, unchanged by the `CODE-014` closure, which filed no new row; after the closure pass filed `CODE-014`…`CODE-017`; before that `CODE-014` (2026-10-02, after this file filed `CODE-001`…`CODE-013`)). 2026-10-03: unchanged; the ledger-correction pass filed no new row here (corrections are CORRECTED notes on `CODE-001`, `-002`, `-003`, `-006`, `-008`, `-010`, `-011`, `-012`, `-013`).
 
 > The standard `ID | Severity | Kind | Effort | Title` table, as README's *Item format* requires.
 > **This table is the complete open set for area 18** — `CODE-001`…`CODE-013` all closed 2026-10-06 (see
@@ -170,6 +172,9 @@ override `is_hidden`, and files nothing.
 | ~~CODE-018~~ | ~~low~~ **CLOSED 2026-10-07 — built-ins frozen before a script runs; the prelude's report decoded strictly** | upstream-drift | M | **Built-ins are not frozen, so a script that patches one breaks its own run, and the sandbox reports it badly.** pi `b223082bb` (v1.0.4, #10444; `packages/codemode/src/runtime/prelude-source.ts` `lockdown()`, `runtime/host.ts` `BridgeError`) freezes every object reachable from the built-in globals before the script runs, makes built-in globals read-only, and turns the commonly overridden prototype members (`constructor`, `name`, `message`, `toString`, `toLocaleString`, `valueOf`, `toJSON`, `Object.prototype`'s) into accessors so an instance can still override them; `describeError` coerces `name`/`message` with `String()`. cyrup's `crates/cyrup-codemode-runtime/src/sandbox/prelude.js` freezes only its own `tools`, `allTools`, `console` and namespaces and defines its own globals non-writable (`define`); the built-ins stay writable. **Measured on the V8 sandbox, 2026-10-07** (`sandbox/tests/probe_v104.rs`, output kept with the closure): none of the seven intrinsics upstream's test lists is `Object.isFrozen`; `Error.prototype.name = "Patched"` succeeds where upstream throws a `TypeError`; upstream's own *ignores patches to built-ins* script does not return `[[2], '{"a":1}']`, it runs to the deadline (`Timeout`); `Array.prototype.toJSON = () => null` makes **every** script fail with `sandbox: The script's store writes could not be read: invalid type: null, expected a sequence`; `Object.prototype.toJSON = () => 5; throw new Error("boom")` reports a `script` error with an empty message and no name; `error.message = 42` reports message `""` where upstream reports `"42"`. **The host-crash half of the commit is not a gap here.** The bridge is typed ops and every decode is a `Result` (`protocol.rs` `script_error`, `store_writes`; `execution.rs` `settle`): nothing unwraps and a malformed payload ends the execution as a `sandbox` error, so the process does not crash and `execute()` settles. What differs is strictness: `script_error` accepts a missing `message`, `store_writes` accepts entries of length 0 or 3+, and an unreadable return value is a `script` `RangeError` (a recorded delta), not upstream's `sandbox` `Sandbox bridge broken: …`. Severity low: one isolate per execution, so only the script that patched is affected. **FILED 2026-10-07.** |
 | ~~CODE-019~~ | ~~low~~ **CLOSED 2026-10-07 — `image()` output saved to files readable only by the user, path named before each image; the spill is private too** | upstream-drift | M | **`image()` output is not saved to a file, and cyrup's output spill is created with the process umask.** pi `d677d0ee7` (v1.0.3, #10310; `extensions/codemode/execute.ts` `saveImages`, `utils/output-files.ts`): every distinct image a script shows is written to `<tmpdir>/pi-codemode-<16 hex>.<png/jpg/gif/webp>` (mode `0o600`, `wx`), a text item `[Image saved to <path> (<mime>, <size>)]` goes before it, a failed write becomes `[Image (<mime>, <size>) could not be saved: <error>]` and never discards the result, an image shown twice is saved once, and the tool description's globals line gains *"`image()` also saves the image to a temp file and the result names its path."* cyrup: `cyrup-codemode/src/output.rs` `plan_truncation` passes `OutputItem::Image { .. }` through untouched, `cyrup-codemode-runtime/src/tool/execute.rs` attaches the images as given, and the description's globals line is v1.0.1's. The text spill that does exist, `spill_output` / `write_spill` (`output.rs`), opens `OpenOptions::new().write(true).create_new(true)` with no mode, i.e. `0o666` minus the umask (upstream wrote the same at v1.0.1 and tightened it to `0o600` here). Model-visible effect: a later turn cannot refer to an image a script generated, and the model has no other way to reach its bytes (scripts cannot write files). **FILED 2026-10-07.** |
 | ~~CODE-020~~ | ~~low~~ **CLOSED 2026-10-07 — hidden tools out of the rules, the tool list and the skills hint; guidelines shown with codemode declarations** | upstream-drift | M | **Hidden tools still shape the system prompt, and codemode does not show a tool's guidelines with its declaration.** pi `c30840c2e` (v1.0.4, #10343): `BuildSystemPromptOptions.hiddenTools`; `declaredTools = selectedTools − hiddenTools` drives the tool list, `buildRules` and the skills reader (`read`/`bash` declared → named; a hidden one that is still selected → `indirect`, *"Load a skill's file when the task matches its description."*); `ToolLoadout.getPromptGuidelines(name)`; `toCodemodeDeclaration(tool, guidelines)` appends a tool's guideline bullets to its description in the codemode tool's sections, in `ALL_TOOLS` and in `describeTool()`. cyrup shipped v1.0.1's rule (`CODE-005`) and `CODE-014` carried it: `PromptRebuilder::rebuild` (`cyrup-session-svc/src/tools.rs`) blanks only a hidden tool's snippet and says *"Its guidelines stay"*, and passes the whole active set as `selected_tools`, which `rules_section` and the skills reader (`cyrup-session/src/prompt/builder.rs`) read; `LoadoutView` has no `prompt_guidelines`; `to_codemode_declaration(tool)` (`cyrup-codemode-runtime/src/tool/description.rs`) takes none; the `getSystemPromptOptions()` bag has no `hiddenTools`. **Measured** (`cyrup-session-svc` `tests/codemode.rs::the_guidelines_of_hidden_tools_move_from_the_rules_to_their_codemode_sections`, `only` mode, `read` hidden, red before the fix): the request's `<rules>` still says *"- Use read to examine files instead of cat or sed."* for a tool the model cannot call directly, and the codemode description does not carry that guideline. Wording only, so low. **FILED 2026-10-07.** |
+| CODE-021 | low | upstream-drift | M | **Codemode output items run together: several `text()` items get no `==> text N/M <==` headers, and `console.*` lines are interleaved with them instead of being grouped in one `<console_output>` block** **Filed 2026-10-09 from the pi v1.1.0 drift triage**; body below. |
+| CODE-022 | low | upstream-drift | S | **The codemode tool description does not tell the model that `searchTools`, `describeTool` and `describeNamespace` must be awaited** **Filed 2026-10-09 from the pi v1.1.0 drift triage**; body below. |
+| CODE-023 | low | upstream-drift | M | **Codemode `models.classify()` does not accept `context.images`, and the classifier context has no images field to carry them, so a script's images are dropped silently** **Filed 2026-10-09 from the pi v1.1.0 drift triage**; body below. |
 
 ---
 
@@ -883,6 +888,76 @@ port.
 
 **Verify** — whichever is chosen: a test that the runtime resolves its VM artifact from a fresh
 install location, and that a second sandbox in the same process does not recompile it.
+
+## Triage 2026-10-09 — pi `v1.0.4..f1b2e77f5` (codemode) and pi `v1.0.1..f1b2e77f5` (codemode extension)
+
+> **PIN 2026-10-09 — cyrup `6b14575` × pi `f1b2e77f5` (= `v1.1.0-11-gf1b2e77f5`).** This area's window moves from
+> `v1.0.4` to `f1b2e77f5`. `packages/codemode` was read over `v1.0.4..f1b2e77f5` (area 18 had already triaged
+> `v1.0.1..v1.0.4`), and `extensions/codemode` over `v1.0.1..f1b2e77f5` by the extensions lane. Upstream read
+> through `git -C tmp/pi show` only; nothing run. The pin is untagged, deliberately (README *CURRENT PINS*).
+>
+> **Filed (3, all low):** `CODE-021` (output items run together; `eb326d265`; filed by both the extensions and the
+> tools/codemode lanes and merged), `CODE-022` (the `await` on the discovery helpers; `269121616`), `CODE-023`
+> (`models.classify()` images; `ce8972a0e`; depends on `PROV-148`). Related rows elsewhere: `PROV-147` (the
+> `openai-decisions` classifier, area 01).
+>
+> **Read in scope and deliberately NOT filed:** `021eae60a` (read `outputSchema` image block) is the open
+> `TOOL-058`; `d677d0ee7` is `TOOL-057` / `CODE-019` (closed); `b223082bb` is `CODE-018` (closed); `c30840c2e` is
+> `CODE-020` (closed); `7f9e1198f` swaps two literals for `SETTINGS_DEFAULTS` values, unchanged; `1b094148b`
+> (Node install-layout restart hint) stays ruled at `:335` above; `36a686ee8` is ported (ledger UPDATE 2026-10-09).
+> `packages/coding-agent/suite` named in the lane brief does not exist; the real path, `test/suite`, adds only
+> test files whose sources are other lanes' (`04b97ef00` → `MCP-616`; `27c7b6ff4` → `SEAM-149`; `503c60552` →
+> `TUI-171`; `ce8972a0e` → `PROV-147`/`PROV-148`/`CODE-023`; `4c6b724ea` → `TUI-180`).
+
+## CODE-021 — Codemode output items run together: several `text()` items get no `==> text N/M <==` headers, and `console.*` lines are interleaved with them instead of being grouped in one `<console_output>` block
+
+**Kind** upstream-drift · **Severity** low · **Effort** M · **Confidence** confirmed (both sides read; static, nothing run) · **Filed** 2026-10-09
+
+> **Filed 2026-10-09 from the pi v1.1.0 drift triage** (pi `v1.0.4..f1b2e77f5` (codemode) / `v1.0.1..f1b2e77f5` (extension), cyrup `6b14575`).
+
+**upstream** — `eb326d265` (v1.1.0~21). `packages/codemode/src/types.ts:48-50` adds `console?: true` to the text arm of `CodemodeOutputItem`; `packages/codemode/src/runtime/prelude-source.ts:444` makes `console[level]` emit `output("console", …)`, and `runtime/worker.ts:83-86` maps it to `{ type: "text", text, console: true }`. `packages/coding-agent/src/extensions/codemode/execute.ts` @f1b2e77f5: `formatOutput()` (`:255-283`) numbers the non-console text items (`text()` and the returned value) with `==> text N/M <==\n` when there is more than one, keeps images in place, and appends all console lines as one trailing `<console_output>\n…\n</console_output>` item; `joinAdjacentText()` (`:284-298`) joins neighbouring text blocks with a newline before truncation and again after `saveImages`. The returned value is pushed before formatting (`:509`), `formatOutput` runs at `:511`, and `Script error:` is appended after it (`:512`). The model-facing description (`tool.ts:146`) and `docs/codemode.md:18`, `:27` document the layout.
+
+**cyrup** — `crates/cyrup-codemode-runtime/src/sandbox/prelude.js:341-345` sends `console.*` as `output("text", …)` (`:344`), the same kind as `text()` (`:271`). `crates/cyrup-codemode-runtime/src/sandbox/isolate.rs:97-110` `op_codemode_output` knows only `"image"`; everything else becomes `OutputItem::Text(data)`. `crates/cyrup-codemode/src/types.rs:71-78` `OutputItem::Text(String)` has no console marker. `crates/cyrup-codemode-runtime/src/tool/execute.rs:336-384` passes the raw item list (value at `:357`, `Script error:` pushed inside the `Failed` arm at `:361-362`) straight to `truncate_output` (`:380`) and `label_images`. `truncate_output` joins text items with `"\n"` only on its over-budget path (`crates/cyrup-codemode/src/output.rs:109-123`). `grep -rn 'console_output\|==> text' crates/` finds nothing. The description (`tool/description.rs:45`) and `docs/codemode.md:31` ("Like `text()`") keep the v1.0.4 wording.
+
+**Impact** — Providers join adjacent text blocks with a newline or with nothing, so a script that calls `text()` twice and logs with `console.log` reaches the model as one undifferentiated blob: it cannot tell items apart, or debug logging from deliberate output. The prompt also describes the old layout. Readability for the model only; no data loss.
+
+**Fix** — Carry a console marker end to end: emit `output("console", …)` in `prelude.js`; accept the `"console"` kind in `op_codemode_output` and the worker decode; model it as `OutputItem::Text { text, console: bool }` or a third `OutputItem::Console(String)`. Port `formatOutput` and `joinAdjacentText` as pure functions in `crates/cyrup-codemode/src/output.rs` and apply them in pi's order in `execute.rs`: value, format, `Script error:`, generated-images note, join, truncate, label images, join. `Script error:` is pushed inside the `Failed` arm today, so it must move after `format_output`. `join_adjacent_text` must run before the budget check, not only on `truncate_output`'s over-budget path. Update `description.rs:45` and `docs/codemode.md:31` to the v1.1.0 text, in the same edit as `CODE-022`'s neighbouring line so the description-snapshot test is regenerated once.
+
+**Verify** — Port pi's `test/suite/agent-session-codemode.test.ts` cases from `eb326d265`: `text("a"); text("b")` gives `==> text 1/2 <==\na` … `==> text 2/2 <==\nb`; a single text item gets no header; `console.log(1); text("x"); console.log(2)` gives `x` followed by `<console_output>\n1\n2\n</console_output>`; a returned value counts as a text item; a failed script's `Script error:` comes after the formatted output. A sandbox test asserts that a console item carries the marker and a `text()` item does not; the description-snapshot test picks up the new Globals line.
+
+**Notes** — Filed by two lanes (extensions and tools/codemode) and merged here. Effort M: the change crosses three crates (codemode types, the runtime op, execute).
+
+## CODE-022 — The codemode tool description does not tell the model that `searchTools`, `describeTool` and `describeNamespace` must be awaited
+
+**Kind** upstream-drift · **Severity** low · **Effort** S · **Confidence** confirmed (both sides read; static, nothing run) · **Filed** 2026-10-09
+
+> **Filed 2026-10-09 from the pi v1.1.0 drift triage** (pi `v1.0.4..f1b2e77f5` (codemode) / `v1.0.1..f1b2e77f5` (extension), cyrup `6b14575`).
+
+**upstream** — `269121616` (v1.1.0~35, #10555), `packages/coding-agent/src/extensions/codemode/tool.ts:148` @f1b2e77f5: the Globals line now reads ``- `ALL_TOOLS`, `await searchTools(query, { limit?, namespace? })`, `await describeTool(name)`, `await describeNamespace(name)`: find unlisted tools, such as MCP tools.``
+
+**cyrup** — `crates/cyrup-codemode-runtime/src/tool/description.rs:47` still has the pre-fix text with no `await`. The helpers are asynchronous in cyrup too: `tool/discovery.rs:65` / `:96` / `:111` register them through `spread_global` (`tool/globals.rs:24-37`, an async host call), and `sandbox/prelude.js:88-90` `caller()` returns a `new Promise`.
+
+**Impact** — The model is told the lookup helpers are synchronous. A script that writes `searchTools(q).map(...)` or reads `describeTool(n).parameters` gets a Promise and fails with a TypeError (or serializes it as `{}`), costing a codemode round trip before the model retries with `await`.
+
+**Fix** — Copy upstream's line verbatim into `describe_globals` at `description.rs:47`. The "With several text items…" sentence `eb326d265` added to the line above belongs to `CODE-021`; land the two together so the description snapshot is regenerated once.
+
+**Verify** — Extend the description test in `crates/cyrup-codemode-runtime/src/tool/description/tests.rs` so the Globals block matches pi `tool.ts:144-149` @f1b2e77f5 byte for byte, and confirm it fails against the current line.
+
+## CODE-023 — Codemode `models.classify()` does not accept `context.images`, and the classifier context has no images field to carry them, so a script's images are dropped silently
+
+**Kind** upstream-drift · **Severity** low · **Effort** M · **Confidence** confirmed (both sides read; static, nothing run) · **Filed** 2026-10-09
+
+> **Filed 2026-10-09 from the pi v1.1.0 drift triage** (pi `v1.0.4..f1b2e77f5` (codemode) / `v1.0.1..f1b2e77f5` (extension), cyrup `6b14575`).
+
+**upstream** — `ce8972a0e` (v1.1.0~20): `packages/ai/src/types.ts:682-690` @f1b2e77f5 adds `ClassifierContext.images?: ImageContent[]` ("Only models whose `input` includes `image` accept them; other models return an error result"). `packages/coding-agent/src/extensions/codemode/execute.ts:118-119` adds `images?: [{ type: "image", data: <base64>, mimeType }]` to `CLASSIFIER_CONTEXT_SHAPE`, and `:129-142` validates `context.images`: it must be an array, and each entry must be `{type:"image", data:string, mimeType:string}`, with the errors `context.images must be an array, got …` and `context.images[i] must be an image block, got …`. pi's `llama-cpp-classify` never sends images: the same commit makes it throw `${LABEL} classification does not support image input` (`llama-cpp-classify.ts:437`), which becomes an error result, and llama classifier twins declare `input: ["text"]` only.
+
+**cyrup** — `crates/cyrup-codemode-runtime/src/tool/models.rs:199` `CLASSIFIER_CONTEXT_SHAPE` has no `images?`, and `check_classifier_context` (`:203`) does not read it. `crates/cyrup-provider/src/classifier.rs:676-680` `ClassifierContext { state, questions }` has no images field, so an image a script passes is dropped. cyrup's only classifier api is `LlamaCppClassify`, so it has no vision-capable classifier today.
+
+**Impact** — A script that passes images gets an answer computed from `state` alone, with no error, where pi returns an error result. The model also never learns the field exists. The "judge a screenshot with a vision-capable classifier" scenario becomes possible only after `PROV-147` (openai-decisions) or `PROV-104` (System One) is ported.
+
+**Fix** — (1) The provider half is `PROV-148` (area 01): `images: Option<Vec<ImageContent>>` on `ClassifierContext`, the model-input check, and `llama_cpp_classify` returning an error result whenever images is non-empty. (2) In `models.rs`, port pi's shape string and the `context.images` validation with its exact messages, and pass the images through. This row depends on `PROV-148`.
+
+**Verify** — Codemode tests modelled on pi's `agent-session-codemode.test.ts` cases from `ce8972a0e`: `images: 'x'` and `images: [{type:'text'}]` fail with pi's messages and the shape string; a valid image reaches the fake classifier's context; on the llama-cpp classifier a valid image gives the `does not support image input` error result.
 
 ## Blind spots — read before the next pass
 

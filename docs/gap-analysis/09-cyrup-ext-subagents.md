@@ -899,7 +899,9 @@ other items own. A planner should not pick one up; the next audit pass maintains
 > `09a`'s scope line binds it to `v0.47.1..v0.57.0`. Minting an id for one arbitrary member of an
 > unmeasured window would misrepresent that window as measured. It belongs to the `09b` the census
 > above already argues for. Calendar triggers (`on`/`timezone`/`every:"day"`) are NOT a residual:
-> upstream refuses them too, at `scheduled-runs.ts:622`, and cyrup reproduces the sentence.
+> upstream refuses them too, at `scheduled-runs.ts:622`, and cyrup reproduces the sentence. *(Superseded 2026-10-09:
+> pi-subagents `a4b1fb9d` (#2656, after v0.75.0) ported daily and weekly zoned calendar schedules, so this is now a gap,
+> filed as `SUBA-185` in `09b`.)*
 >
 > **BLOCKED 2026-08-15 (sweep 9) — see the table row for the full evidence. Everything below is the
 > filing text and its Verify line is WRONG.** The nine-verb count is confirmed. The blocker is that
