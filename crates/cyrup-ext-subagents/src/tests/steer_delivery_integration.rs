@@ -13,13 +13,14 @@
 //!
 //! The batch that added the parent half called the child hop "genuinely blocked" on `HostCtx` not
 //! exposing `ControlOp::SendUserMessage`. That is false twice over. `HostCtx` is a data-only struct
-//! and was never the seam; the seam is `cyrup_ext::host::HostServices::inject_message`
-//! (`cyrup-ext/src/host/services.rs:311`), late-bound through
-//! `NativeExtension::set_host_services` (`cyrup-ext/src/native.rs:449`), live-implemented at
-//! `cyrup-session-svc/src/host_services.rs:735` and routed to `AgentSession::send_user_message`,
-//! which STEERS the running turn while streaming (`session.rs:3671-3677`) — i.e. exactly
-//! `pi.sendUserMessage(text, { deliverAs: "steer" })`. This crate already called it from two other
-//! places before this test existed.
+//! and was never the seam; the seam is `cyrup_ext::host::HostServices::send_user_message` — pi
+//! `pi.sendUserMessage(text, { deliverAs })` itself — late-bound through
+//! `NativeExtension::set_host_services` (`cyrup-ext/src/native.rs:449`) and live-implemented in
+//! `cyrup-session-svc` as an item on the session's injection pump that runs
+//! `AgentSession::prompt_with`: it STEERS a running turn while streaming and runs a full prompt
+//! (`input`, `before_agent_start`) on an idle child. (The first cut used `inject_message(…, None,
+//! …, trigger_turn: true)`, whose `run_injection` turn skips both events and never steers a busy
+//! run; `cyrup-session-svc/src/tests/send_user_message.rs` pins the host half of the fix.)
 //!
 //! # What this file proves
 //!
@@ -46,25 +47,24 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use cyrup_ext::native::{ExtMode, HostCtx, InitApi, NativeExtension};
-use cyrup_ext::{EventKind, HostEvent};
+use cyrup_ext::{EventKind, HostEvent, InputStreamingBehavior};
 
 use crate::background::control;
 use crate::prompt_runtime::STEER_INBOX_ENV;
 
-/// A stand-in for the live session's capability backend. `inject_message` is the ONE seam under
-/// test, so it records rather than performs; `fail_next` lets the write-back-on-failure path be
-/// driven without a broken session.
-/// One recorded `inject_message` call — the four arguments whose values are the whole contract
-/// (`custom_type: None` in particular is what routes to `send_user_message` rather than a
-/// non-LLM custom message).
+/// One recorded `send_user_message` call — pi `sendUserMessage(text, { deliverAs })`, the two
+/// arguments whose values are the whole contract.
 #[derive(Clone, Debug)]
 struct Injection {
     content: String,
-    custom_type: Option<String>,
-    display: bool,
-    trigger_turn: bool,
+    deliver_as: Option<InputStreamingBehavior>,
 }
 
+/// A stand-in for the live session's capability backend. `send_user_message` is the ONE seam under
+/// test, so it records rather than performs; `fail` lets the write-back-on-failure path be driven
+/// without a broken session. `inject_message` is deliberately left on the trait default (which
+/// denies): the steering inbox must not route through the injected-turn seam, whose turn skips
+/// `input` and `before_agent_start` and never steers a busy run.
 #[derive(Default)]
 struct RecordingServices {
     injected: Mutex<Vec<Injection>>,
@@ -72,22 +72,17 @@ struct RecordingServices {
 }
 
 impl cyrup_ext::host::HostServices for RecordingServices {
-    fn inject_message(
+    fn send_user_message(
         &self,
-        content: &str,
-        custom_type: Option<&str>,
-        display: bool,
-        _details: Option<&serde_json::Value>,
-        trigger_turn: bool,
+        text: &str,
+        deliver_as: Option<InputStreamingBehavior>,
     ) -> Result<(), String> {
         if *self.fail.lock().unwrap() {
             return Err("no live session".to_string());
         }
         self.injected.lock().unwrap().push(Injection {
-            content: content.to_string(),
-            custom_type: custom_type.map(str::to_string),
-            display,
-            trigger_turn,
+            content: text.to_string(),
+            deliver_as,
         });
         Ok(())
     }
@@ -212,9 +207,7 @@ async fn a_queued_steer_message_is_delivered_into_the_childs_live_turn() {
     );
     let Injection {
         content,
-        custom_type,
-        display,
-        trigger_turn,
+        deliver_as,
     } = &injected[0];
     assert_eq!(
         content,
@@ -226,20 +219,11 @@ async fn a_queued_steer_message_is_delivered_into_the_childs_live_turn() {
          (`subagent-prompt-runtime.ts:161-169` @v0.34.0)"
     );
     assert_eq!(
-        custom_type.as_deref(),
-        None,
-        "`custom_type: None` is load-bearing: it routes to `send_user_message`, i.e. a real USER \
-         message the model must answer. A custom type would make it a non-LLM message the model \
-         never sees — the dead letter, one layer further in."
-    );
-    assert!(
-        *display,
-        "the operator watching the child's transcript must see the guidance arrive"
-    );
-    assert!(
-        *trigger_turn,
-        "an IDLE child must actually act on the guidance rather than parking it until its next \
-         self-initiated turn"
+        *deliver_as,
+        Some(InputStreamingBehavior::Steer),
+        "pi `sendUserMessage(formatted, {{ deliverAs: \"steer\" }})`: a real USER message through \
+         the prompt path — steered onto a busy child's live run, a full prompt (input, \
+         before_agent_start) on an idle one"
     );
 
     // The request is consumed: a second flush must not re-deliver it.
@@ -461,10 +445,17 @@ async fn a_full_follow_up_queue_is_refused_with_pis_exact_text() {
         )
         .await;
 
+    let sent = services.injected.lock().unwrap().clone();
+    assert_eq!(
+        sent.len(),
+        control::MAX_STEER_QUEUE_SIZE,
+        "exactly the cap is handed to the session; the overflowing one never is"
+    );
     assert!(
-        services.injected.lock().unwrap().is_empty(),
-        "a `follow_up` steer must NOT be injected on arrival — that is the whole difference \
-         between it and `steer`"
+        sent.iter()
+            .all(|s| s.deliver_as == Some(InputStreamingBehavior::FollowUp)),
+        "a `follow_up` steer goes as `deliverAs: \"followUp\"` (pi `:386`) — the session's \
+         follow-up queue, not a steer into the running turn: {sent:?}"
     );
 
     let acks = control::consume_steer_acks(&run_dir).await;
@@ -545,8 +536,9 @@ async fn a_follow_up_steer_is_held_until_the_next_turn_boundary() {
         )
         .await;
 
-    // A turn is now IN FLIGHT. The request is consumed and parked, not injected — and it is parked
-    // NOT-ready, so this very turn cannot deliver it.
+    // A turn is now IN FLIGHT. The request is consumed and handed to the session as a FOLLOW-UP
+    // (pi `:386`), whose queue holds it until the run's work is done — and it is recorded NOT-ready,
+    // so this very turn's boundary cannot report it delivered.
     child
         .on_event(
             &HostEvent::TurnStart {
@@ -556,9 +548,14 @@ async fn a_follow_up_steer_is_held_until_the_next_turn_boundary() {
             &ctx,
         )
         .await;
-    assert!(
-        services.injected.lock().unwrap().is_empty(),
-        "a `follow_up` steer must not land inside the turn that was already running"
+    let sent = services.injected.lock().unwrap().clone();
+    assert_eq!(sent.len(), 1, "handed over once; got {sent:?}");
+    assert!(sent[0].content.contains("prefer the smaller refactor"));
+    assert_eq!(
+        sent[0].deliver_as,
+        Some(InputStreamingBehavior::FollowUp),
+        "a `follow_up` steer must not land inside the turn that was already running: it goes to \
+         the session's follow-up queue, never as a steer"
     );
     let acks = control::take_steer_acks(&run_dir, None).await;
     assert_eq!(
@@ -590,9 +587,10 @@ async fn a_follow_up_steer_is_held_until_the_next_turn_boundary() {
             &ctx,
         )
         .await;
-    assert!(
-        services.injected.lock().unwrap().is_empty(),
-        "turn_end makes it READY, it does not deliver it — delivery is the next turn's job"
+    assert_eq!(
+        services.injected.lock().unwrap().len(),
+        1,
+        "turn_end makes it READY; nothing is sent again"
     );
 
     // ...and the NEXT turn boundary delivers it.
@@ -605,20 +603,11 @@ async fn a_follow_up_steer_is_held_until_the_next_turn_boundary() {
             &ctx,
         )
         .await;
-    let injected = services.injected.lock().unwrap().clone();
     assert_eq!(
-        injected.len(),
+        services.injected.lock().unwrap().len(),
         1,
-        "delivered exactly once at the boundary; got {injected:?}"
-    );
-    assert!(
-        injected[0].content.contains("prefer the smaller refactor"),
-        "{:?}",
-        injected[0]
-    );
-    assert!(
-        !injected[0].trigger_turn,
-        "a follow-up released INTO a turn that is starting must not start a second one"
+        "the boundary only reports the delivery (pi `:450-452`); the message was handed over once, \
+         at arrival"
     );
     let acks = control::take_steer_acks(&run_dir, None).await;
     assert_eq!(

@@ -165,6 +165,17 @@ pub struct SharedIntercomState {
     /// second half of the hold rule: a session that is busy WITHOUT an agent run cannot take a
     /// steer, so an inbound message waits in [`Self::held_inbound`].
     agent_running: AtomicBool,
+    /// ICOM-084 — `idleWakeRequestedAt` (`index.ts:675-679@v0.16.1`, `104b83c` #154): when this
+    /// session last asked the host to wake it with [`crate::inbound::IDLE_WAKE_PROMPT`], until the
+    /// woken run's `agent_start` clears it. Upstream's comment, verbatim: "A wake prompt stays
+    /// pending until agent_start: Pi marks the run active only after its async preflight. Pi exposes
+    /// no prompt completion, and a handled or failed preflight never emits agent_start, so the
+    /// reservation expires after a bounded window instead of latching."
+    ///
+    /// An [`std::time::Instant`] where upstream stores `Date.now()`: the window is a duration, so a
+    /// monotonic clock is the faithful reading of it — a wall-clock step can neither latch the
+    /// reservation for ever nor expire it early.
+    idle_wake_requested_at: Mutex<Option<std::time::Instant>>,
     /// `heldInboundMessages` (`v0.14.0 index.ts:628`, `17699ba`) — inbound messages that arrived
     /// while the session was busy without an agent run (a manual `/compact`, a branch summary, the
     /// post-run gap), in arrival order. Upstream's reason, verbatim: "Busy without an agent run
@@ -233,6 +244,10 @@ pub struct SharedIntercomState {
     pub cwd: std::path::PathBuf,
 }
 
+/// The `10_000` ms window of `idleWakePending()` (`index.ts:679@v0.16.1`): how long a requested
+/// wake holds back a second one (and the `human-first` idle release) without its run starting.
+pub const IDLE_WAKE_RESERVATION: Duration = Duration::from_millis(10_000);
+
 impl SharedIntercomState {
     /// Build the shared state with no client connected yet.
     #[must_use]
@@ -245,6 +260,7 @@ impl SharedIntercomState {
             has_ui: AtomicBool::new(false),
             active_tools: Mutex::new(Vec::new()),
             agent_running: AtomicBool::new(false),
+            idle_wake_requested_at: Mutex::new(None),
             held_inbound: Mutex::new(VecDeque::new()),
             held_inbound_timer: Mutex::new(None),
             held_inbound_timer_serial: std::sync::atomic::AtomicU64::new(0),
@@ -523,6 +539,46 @@ impl SharedIntercomState {
     #[must_use]
     pub fn agent_running(&self) -> bool {
         self.agent_running.load(Ordering::SeqCst)
+    }
+
+    /// `idleWakePending()` (`index.ts:679@v0.16.1`): `idleWakeRequestedAt > 0 && Date.now() -
+    /// idleWakeRequestedAt < 10_000` — a wake was requested and its run has not started, within
+    /// [`IDLE_WAKE_RESERVATION`].
+    #[must_use]
+    pub fn idle_wake_pending(&self) -> bool {
+        self.idle_wake_pending_at(std::time::Instant::now())
+    }
+
+    /// [`Self::idle_wake_pending`] at an explicit `now`, so the expiry is testable without sleeping
+    /// out the window.
+    #[must_use]
+    pub fn idle_wake_pending_at(&self, now: std::time::Instant) -> bool {
+        self.idle_wake_requested_at
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some_and(|at| now.saturating_duration_since(at) < IDLE_WAKE_RESERVATION)
+    }
+
+    /// `idleWakeRequestedAt = Date.now()` (`index.ts:1301@v0.16.1`).
+    pub fn request_idle_wake(&self) {
+        self.request_idle_wake_at(std::time::Instant::now());
+    }
+
+    /// [`Self::request_idle_wake`] stamped at an explicit instant (tests).
+    pub fn request_idle_wake_at(&self, at: std::time::Instant) {
+        *self
+            .idle_wake_requested_at
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(at);
+    }
+
+    /// `idleWakeRequestedAt = 0` — at runtime start (`index.ts:1883@v0.16.1`) and on `agent_start`
+    /// (`:2077`), and after a wake the host refused to take.
+    pub fn clear_idle_wake(&self) {
+        *self
+            .idle_wake_requested_at
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
     }
 
     /// How many inbound messages are held (`heldInboundMessages.length`).

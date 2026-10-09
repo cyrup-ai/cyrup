@@ -29,6 +29,15 @@ impl AgentSession {
             guard.append_session_info(name)?;
             guard.session_name()
         };
+        // Pi's `getSessionName()` reads the session manager live (`agent-session.ts:865`), so an
+        // extension sees a `/name` or `--name` rename at once. Here an extension reads the
+        // `LiveHostServices` snapshot instead, and only ITS OWN `set_session_name` refreshed it —
+        // so pi-intercom's presence name stayed the unnamed `subagent-chat-<id>` alias for a session
+        // started with `--name` or renamed with `/name`, and peers could not address it by name.
+        // Refresh it here, before the fan-out, so a listener that re-reads the name sees the new one.
+        self.services
+            .host_services
+            .set_snapshot_session_name(resolved.clone());
         // Emit `session_info_changed { name }` to every live subscription (Pi `_emit(event)`,
         // agent-session.ts:2714-2715); the `name` is re-read from the manager so it byte-matches Pi's
         // `getSessionName()` (an empty/whitespace name resolves to `None`).

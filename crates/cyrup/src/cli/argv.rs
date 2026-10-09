@@ -56,6 +56,27 @@ where
     out
 }
 
+/// The process-argv pre-pass `main` runs: [`normalize_short_aliases`], except when the first
+/// argument after the program name is the `intercom` subcommand.
+///
+/// `cyrup intercom …` hands its tail to `cyrup_intercom::cli`, whose grammar is pi-intercom's
+/// `cli.ts` — it has no multi-letter short flags, and its `--text`/`--to`/`--name` take VALUES that
+/// may legitimately be `-nc` or `-na`. Rewriting those would deliver different text than was typed
+/// (the same defect SEAM-123 fixed for the post-`--` tail), so the intercom argv is returned
+/// verbatim. A subcommand is only recognised in that first position
+/// ([`crate::subcommands::first_subcommand`]), so there is no pre-subcommand prefix to normalize.
+pub fn normalize_process_argv<I, S>(args: I) -> Vec<String>
+where
+    I: IntoIterator<Item = S>,
+    S: Into<String>,
+{
+    let raw: Vec<String> = args.into_iter().map(Into::into).collect();
+    if raw.get(1).map(String::as_str) == Some("intercom") {
+        return raw;
+    }
+    normalize_short_aliases(raw)
+}
+
 /// Partition `argv` (program name already stripped, short-aliases already normalized) into the args
 /// clap should parse and the captured unknown `--flag[=val]` extension flags — a 1:1 port of Pi's
 /// hand-rolled unknown-flag arm (args.ts:188-201). A `--flag=val` captures `(flag,val)`; a bare

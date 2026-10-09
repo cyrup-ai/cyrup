@@ -344,6 +344,9 @@ pub fn begin_runtime(state: &Arc<SharedIntercomState>, params: ConnectParams) {
     // The dedupe window IS the runtime, so a requestId replayed across a restart is legal.
     state.clear_outbox_request_ids();
     sup.generation.fetch_add(1, Ordering::SeqCst);
+    // `idleWakeRequestedAt = 0` (`index.ts:1883@v0.16.1`): a wake reserved by the previous runtime
+    // belongs to a run this one will never see start.
+    state.clear_idle_wake();
     sup.attempt.store(0, Ordering::SeqCst);
     sup.set_timer(None);
     *sup.last_error.lock().unwrap_or_else(|e| e.into_inner()) = None;

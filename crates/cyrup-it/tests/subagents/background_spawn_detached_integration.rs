@@ -529,6 +529,7 @@ fn all_personas() -> BTreeMap<String, ResolvedAgentPersona> {
 /// all-other-fields-`None` [`SingleStepSpec`] for `agent`/`task`.
 fn single_step(agent: &str, task: &str) -> SingleStepSpec {
     SingleStepSpec {
+        worktree: cyrup_ext_subagents::spawn::worktree::WorktreeRequest::Shared,
         machine: None,
         skills: None,
         session_dir: None,

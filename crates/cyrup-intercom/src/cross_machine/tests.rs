@@ -382,6 +382,48 @@ async fn a_blank_or_control_bearing_remote_command_is_refused_before_any_process
     }
 }
 
+/// A remote shell that cannot find `remoteCommand` (exit 127, nothing on stdout) gets its own
+/// sentence naming the program and the PATH fix, not "needs upgrading" — which would send the
+/// operator after a binary that is not there. Only that exact shape: a 127 that DID print a reply,
+/// or any other exit with no JSON, is still the upgrade notice.
+#[tokio::test]
+async fn a_remote_command_the_shell_cannot_find_says_so() {
+    let reply = |stdout: &str, code: i32| CommandResult {
+        stdout: stdout.to_string(),
+        stderr: "sh: 1: cyrup: not found\n".to_string(),
+        code,
+        timed_out: false,
+    };
+    let runner = ScriptedRunner::new(ok(MACHINES), ok(AGENTS), reply("", 127));
+    let deps = CrossMachineDeps::new(&runner, "herdr", "cyrup intercom");
+    let error = send_cross_machine("reviewer@workstation", "hi", origin(), &deps)
+        .await
+        .expect_err("not found");
+    assert_eq!(
+        error,
+        CrossMachineError::RemoteCommandNotFound {
+            machine: "workstation".to_string(),
+            command: "cyrup".to_string(),
+        }
+    );
+    assert_eq!(
+        error.to_string(),
+        "Remote command \"cyrup\" was not found on \"workstation\". Install cyrup there, or set \
+         crossMachine.remoteCommand to its absolute path (non-interactive ssh often lacks \
+         ~/.cargo/bin on PATH)."
+    );
+
+    let upgrade = "Remote cyrup-intercom on \"workstation\" has no compatible relay support and needs upgrading.";
+    for (stdout, code) in [("garbage", 127), ("", 1)] {
+        let runner = ScriptedRunner::new(ok(MACHINES), ok(AGENTS), reply(stdout, code));
+        let deps = CrossMachineDeps::new(&runner, "herdr", "cyrup intercom");
+        let error = send_cross_machine("reviewer@workstation", "hi", origin(), &deps)
+            .await
+            .expect_err(stdout);
+        assert_eq!(error.to_string(), upgrade, "{stdout:?} / {code}");
+    }
+}
+
 /// `relaySupportError` (`:68-70`) vs a real refusal (`:106-109`) — a non-JSON, non-record,
 /// `ok`-less or version-mismatched reply means "upgrade", and only an `{ok:false, error}` object is
 /// reported as a delivery failure.

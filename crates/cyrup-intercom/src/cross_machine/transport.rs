@@ -298,6 +298,26 @@ pub enum CrossMachineError {
         /// The saved machine's label.
         machine: String,
     },
+    /// The remote shell could not find `remoteCommand` at all: no JSON on stdout and exit status
+    /// 127, POSIX `sh`'s "command not found" (ssh passes the remote status through; its own
+    /// failures are 255).
+    ///
+    /// [CYRUP-DELTA] upstream folds this into `relaySupportError` (`:100-104`), which tells the
+    /// operator to UPGRADE a binary that is not there. The usual cause is not a missing install but
+    /// a non-interactive ssh `PATH` that lacks the directory `cyrup` lives in (`~/.cargo/bin` is
+    /// added by login profiles that `ssh host cmd` never reads), and the fix is a different one, so
+    /// it gets its own sentence. Any other unreadable reply is still [`Self::NoRelaySupport`].
+    #[error(
+        "Remote command \"{command}\" was not found on \"{machine}\". Install cyrup there, or set \
+         crossMachine.remoteCommand to its absolute path (non-interactive ssh often lacks \
+         ~/.cargo/bin on PATH)."
+    )]
+    RemoteCommandNotFound {
+        /// The saved machine's label.
+        machine: String,
+        /// The first word of `crossMachine.remoteCommand` — the program the shell looked up.
+        command: String,
+    },
     /// The relay answered `{ok: false, error}` or exited non-zero with a readable error (`:109`).
     #[error("Remote intercom delivery via {machine} failed: {error}")]
     RemoteRefused {
@@ -370,8 +390,25 @@ pub async fn send_cross_machine(
     let no_support = || CrossMachineError::NoRelaySupport {
         machine: discovered.machine.label.clone(),
     };
-    let response: serde_json::Value =
-        serde_json::from_str(&delivered.stdout).map_err(|_| no_support())?;
+    // POSIX `sh`: 127 = "command not found" — and a missing program prints nothing on stdout.
+    const SHELL_COMMAND_NOT_FOUND: i32 = 127;
+    let response: serde_json::Value = match serde_json::from_str(&delivered.stdout) {
+        Ok(response) => response,
+        Err(_)
+            if delivered.code == SHELL_COMMAND_NOT_FOUND && delivered.stdout.trim().is_empty() =>
+        {
+            return Err(CrossMachineError::RemoteCommandNotFound {
+                machine: discovered.machine.label.clone(),
+                command: deps
+                    .remote_command
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or_default()
+                    .to_string(),
+            });
+        }
+        Err(_) => return Err(no_support()),
+    };
     // `!isRecord(response) || typeof response.ok !== "boolean" || ("version" in response &&
     // response.version !== 1)` (`:104`) — a `version` key that is present and not 1 is an
     // incompatible relay, while an ABSENT one is the v0.16.0 shape and fine.

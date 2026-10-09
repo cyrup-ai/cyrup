@@ -209,8 +209,12 @@ mod tests {
             .iter()
             .filter_map(|v| v.as_str().map(str::to_string))
             .collect();
+        // `list-cwd` is deliberately absent: upstream's skill never exercises it
+        // (`git log -S'list-cwd' -- skills/` at v0.16.1 is empty), and the cyrup-only Pattern 6
+        // example that once did was removed so the skill matches `v0.16.1:skills/pi-intercom/
+        // SKILL.md:160-161` there.
         for action in [
-            "send", "ask", "handover", "reply", "pending", "list", "status", "list-cwd",
+            "send", "ask", "handover", "reply", "pending", "list", "status",
         ] {
             assert!(
                 body.contains(&format!("\"{action}\"")),
@@ -264,5 +268,42 @@ editor before it is sent. `/handover` alone opens a picker for the target.
             pattern_6 < at && at + PATTERN_6B.len() == pattern_7,
             "6b sits after Pattern 6 and immediately before Pattern 7"
         );
+    }
+
+    /// ICOM-079 — v0.13.0 `90e6ad4` taught `/alias` where the skill said `/name`, unchanged through
+    /// v0.16.1 (`skills/pi-intercom/SKILL.md:36-37,:331-337`). And every slash command the skill
+    /// tells a human to run is one this extension registers — `/handover` became true with
+    /// ICOM-078.
+    #[test]
+    fn the_skill_names_sessions_with_alias_and_only_advertises_registered_commands() {
+        const SETUP: &str =
+            "```\n/alias planner   # Terminal 1\n/alias worker    # Terminal 2\n```";
+        const NAMING: &str =
+            "Use `/alias` so others can target you easily. It names the current session and
+is shown in intercom lists, send/reply results, overlays, and incoming headers:
+
+```
+/alias api-worker
+/alias frontend-dev
+/alias planner
+```";
+        let files = bundled_skill_files();
+        let text = std::fs::read_to_string(&files[0]).expect("the bundled skill is readable");
+        let body = text.split_once("\n---\n").map(|(_, b)| b).unwrap_or(&text);
+        assert!(body.contains(SETUP), "Pattern 1's setup uses /alias");
+        assert!(
+            body.contains(NAMING),
+            "\"Name sessions meaningfully\" is upstream's"
+        );
+        assert!(!body.contains("/name "), "no `/name` advice remains");
+        for command in [
+            crate::extension::ALIAS_COMMAND,
+            crate::extension::HANDOVER_COMMAND,
+        ] {
+            assert!(
+                body.contains(&format!("/{command}")),
+                "the skill teaches /{command}"
+            );
+        }
     }
 }

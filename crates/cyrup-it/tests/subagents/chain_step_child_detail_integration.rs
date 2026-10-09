@@ -108,6 +108,7 @@ fn reporter_persona() -> ResolvedAgentPersona {
 
 fn step(output_path: Option<&str>) -> SingleStepSpec {
     SingleStepSpec {
+        worktree: cyrup_ext_subagents::spawn::worktree::WorktreeRequest::Shared,
         machine: None,
         skills: None,
         session_dir: None,

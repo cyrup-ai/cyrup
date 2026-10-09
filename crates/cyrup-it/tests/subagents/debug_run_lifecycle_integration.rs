@@ -74,6 +74,7 @@ impl HostServices for FixedSessionHost {
 
 fn worker_step() -> RunnerStep {
     RunnerStep::SingleStep(SingleStepSpec {
+        worktree: cyrup_ext_subagents::spawn::worktree::WorktreeRequest::Shared,
         machine: None,
         skills: None,
         session_dir: None,

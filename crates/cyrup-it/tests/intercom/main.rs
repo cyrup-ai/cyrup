@@ -63,6 +63,9 @@ mod compose_send_leg;
 mod dismiss_incoming_ask;
 // ICOM-077: `intercom({ action: "handover" })` through the tool, over a real broker and peer.
 mod handover_action;
+// ICOM-078 / ICOM-085: `/handover`, the handover picker, and the live `/intercom` list with `h` and
+// `alt+m`, through the production command/shortcut entry points and a driven overlay host.
+mod handover_command;
 // ICOM-065: the broker-side Herdr location join, against a fake Herdr socket.
 mod herdr_location;
 mod human_surface;

@@ -836,6 +836,64 @@ pub trait HostServices: Send + Sync {
         self.inject_message(content, custom_type, display, details, false)
     }
 
+    /// Wake an IDLE session with a user prompt that runs the NORMAL prompt lifecycle (pi
+    /// `pi.sendUserMessage(text)` → `prompt(text, { expandPromptTemplates: false, source:
+    /// "extension" })`, `agent-session.ts:2030-2035` @v0.87.1): the `input` event, then
+    /// `before_agent_start`, then `agent_start` — everything a turn started by
+    /// [`Self::inject_message`]`(…, trigger_turn = true)` skips, because that turn runs the injected
+    /// message straight through the agent (pi `_runAgentPrompt`, pi#5581).
+    ///
+    /// pi-intercom relies on exactly this split (`index.ts:1297-1302` @v0.16.1, `104b83c` #154):
+    /// the peer's card goes in through `sendMessage` with no `triggerTurn`, and an idle session is
+    /// then woken with `sendUserMessage("New intercom message above.")`, so permission shaping,
+    /// prompt sanitization and every other `before_agent_start` handler see the woken turn.
+    ///
+    /// Fire-and-forget, like pi's `void`-ed call. The prompt is delivered AFTER everything this
+    /// backend has already been handed through the injection seams (FIFO), so a card injected
+    /// just before is in the transcript when the woken run starts. A wake that finds a run already
+    /// active is dropped rather than queued: that run is already carrying the card the wake was
+    /// for, and pi's `sendUserMessage` on a streaming session without `deliverAs` is refused too
+    /// (`agent-session.ts:1655-1659`).
+    ///
+    /// # Errors
+    ///
+    /// The default host owns no live prompt path, so it denies.
+    fn wake_user_prompt(&self, _text: &str) -> Result<(), String> {
+        Err("user-prompt wake not available".into())
+    }
+
+    /// pi `pi.sendUserMessage(text, { deliverAs })` for a NATIVE extension that sends from outside
+    /// any handler (a poll timer, a watcher): `prompt(text, { expandPromptTemplates: false,
+    /// streamingBehavior: deliverAs, source: "extension" })` (`agent-session.ts:2365-2389`
+    /// @v1.1.0). So the `input` handlers always see it, and on an IDLE session it starts a run
+    /// through the full lifecycle (`before_agent_start`, `agent_start`); on a STREAMING one it is
+    /// queued onto the live run as a steer / follow-up after `input` has run (pi `_queueSteer` /
+    /// `_queueFollowUp`).
+    ///
+    /// This is what [`Self::inject_message`]`(…, custom_type: None, trigger_turn: true)` is NOT:
+    /// that turn hands the message straight to the agent at the next idle edge, skipping `input`
+    /// and `before_agent_start` (pi `_runAgentPrompt`, pi#5581), and never steers a busy run. A
+    /// guest's `sendUserMessage` reaches the same body through `ControlOp::SendUserMessage`, but
+    /// that op is drained only at the command / event tiers, which a timer-driven send never hits.
+    ///
+    /// `deliver_as: None` on a streaming session is where cyrup departs from pi, which throws
+    /// "Agent is already processing" (`agent-session.ts:1655-1659`) into a promise every caller
+    /// `void`s. A fire-and-forget producer cannot observe that refusal, so the send is held and
+    /// run as a fresh prompt at the next idle edge instead of vanishing.
+    ///
+    /// Fire-and-forget and FIFO with the injection seams, like [`Self::wake_user_prompt`].
+    ///
+    /// # Errors
+    ///
+    /// The default host owns no live prompt path, so it denies.
+    fn send_user_message(
+        &self,
+        _text: &str,
+        _deliver_as: Option<crate::event::InputStreamingBehavior>,
+    ) -> Result<(), String> {
+        Err("sendUserMessage not available".into())
+    }
+
     // --- models ---
     fn models(&self) -> Value {
         json!([])

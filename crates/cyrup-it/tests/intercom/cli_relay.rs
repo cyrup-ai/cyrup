@@ -52,6 +52,14 @@ fn path_with(front: &Path) -> String {
     format!("{}:{inherited}", front.display())
 }
 
+/// The "remote" host's install: the directory of the `cyrup` binary at `cyrup` (the default
+/// `remoteCommand`, `cyrup intercom`), then the CLI's (one and the same unless `CYRUP_IT_BIN_DIR`
+/// splits them).
+fn remote_path_dirs(cyrup: &Path) -> PathBuf {
+    let cyrup_dir = cyrup.parent().expect("the cyrup binary has a directory");
+    PathBuf::from(format!("{}:{}", cyrup_dir.display(), bin_dir().display()))
+}
+
 /// Run the CLI with `args`, `stdin` on its standard input, at `agent_dir`, plus `env`.
 async fn run_cli(
     scratch: &Scratch,
@@ -569,8 +577,9 @@ async fn relay_usage_errors_exit_1_with_the_usage_text() {
 
 /// A [`CommandRunner`] that answers Herdr's two discovery calls from fixtures and, where
 /// `send_cross_machine` would run `ssh`, EXECS THE REAL CLI instead: the remote command string
-/// goes to `sh -c` exactly as sshd would run it, with `PATH` set so the default
-/// `cyrup-intercom-cli` resolves, and the broker the "remote" host owns.
+/// goes to `sh -c` exactly as sshd would run it, with `PATH` set so the default `cyrup intercom`
+/// (the `cyrup` binary) and the standalone `cyrup-intercom-cli` both resolve, and the broker the
+/// "remote" host owns.
 struct ExecInsteadOfSsh {
     remote_agent_dir: PathBuf,
     scratch_home: PathBuf,
@@ -609,9 +618,11 @@ impl CommandRunner for ExecInsteadOfSsh {
         ));
         let remote_command = args.get(1).copied().unwrap_or_default();
         let mut cmd = crate::support::env::hermetic("sh", &self.scratch_home);
+        // `cyrup` only lends `PATH` its directory: the child is the hermetic `sh` above.
+        let cyrup = crate::support::bins::cyrup();
         cmd.arg("-c")
             .arg(remote_command)
-            .env("PATH", path_with(&bin_dir()))
+            .env("PATH", path_with(&remote_path_dirs(&cyrup)))
             .env("CYRUP_CODING_AGENT_DIR", &self.remote_agent_dir)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -661,9 +672,11 @@ fn sender_origin() -> CrossMachineOrigin {
 const REVIEWER: &str = r#"{"result":{"agents":[{"agent":"cyrup","name":"reviewer"}]}}"#;
 
 /// ICOM-074 proved against ICOM-075: the sender's `send_cross_machine`, with the DEFAULT
-/// `remoteCommand` (`cyrup-intercom-cli`), delivers to a real recipient through the real binary.
-/// Before the `relay` subcommand existed this ended in `NoRelaySupport` ("needs upgrading"),
-/// because the remote answered `unknown command: relay` and printed no JSON.
+/// `remoteCommand` (`cyrup intercom`), delivers to a real recipient through the real `cyrup`
+/// binary — the one every install has. Before the `relay` subcommand existed this ended in
+/// `NoRelaySupport` ("needs upgrading"), because the remote answered `unknown command: relay` and
+/// printed no JSON; and while the default named the standalone `cyrup-intercom-cli`, a host
+/// installed the documented way (`cargo install … cyrup`) answered `sh: not found` (exit 127).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_senders_default_remote_command_delivers_through_the_real_binary() {
     let remote = Broker::start().await;
@@ -709,7 +722,7 @@ async fn the_senders_default_remote_command_delivers_through_the_real_binary() {
         argv,
         vec![
             "user@ws".to_string(),
-            "cyrup-intercom-cli relay --envelope-stdin --json".to_string()
+            "cyrup intercom relay --envelope-stdin --json".to_string()
         ]
     );
     assert!(stdin.ends_with('\n'));
@@ -776,6 +789,27 @@ async fn a_remote_command_with_no_relay_subcommand_still_says_needs_upgrading() 
         error,
         CrossMachineError::NoRelaySupport {
             machine: "workstation".to_string()
+        }
+    );
+}
+
+/// A `remoteCommand` the remote SHELL cannot find — the shape of a host where `cyrup` is not on
+/// the non-interactive ssh `PATH` — is named as such through a real `sh -c` (exit 127, nothing on
+/// stdout), not reported as a relay that "needs upgrading".
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_remote_command_the_shell_cannot_find_is_named_not_upgrade() {
+    let remote = Broker::start().await;
+    let scratch = Scratch::new();
+    let runner = exec_runner(&remote, &scratch, REVIEWER);
+    let deps = CrossMachineDeps::new(&runner, "herdr", "cyrup-not-installed-here intercom");
+    let error = send_cross_machine("reviewer@workstation", "hi", sender_origin(), &deps)
+        .await
+        .expect_err("nothing to run");
+    assert_eq!(
+        error,
+        CrossMachineError::RemoteCommandNotFound {
+            machine: "workstation".to_string(),
+            command: "cyrup-not-installed-here".to_string(),
         }
     );
 }

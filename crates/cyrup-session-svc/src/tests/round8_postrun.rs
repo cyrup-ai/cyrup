@@ -474,6 +474,37 @@ async fn set_session_name_emits_session_info_changed() {
     assert_eq!(session.session_name().await.as_deref(), Some("my session"));
 }
 
+/// A HOST-side rename (`/name`, `--name`, RPC `set_session_name` all reach
+/// `AgentSession::set_session_name`) is what an extension reads back through
+/// `HostServices::session_name` — pi's `getSessionName()` reads the session manager live
+/// (`agent-session.ts:865`). RED before the fix: only a GUEST's own `set_session_name` refreshed the
+/// host-services snapshot, so pi-intercom kept registering a `--name`d session under its unnamed
+/// `subagent-chat-<id>` alias and no peer could address it by name.
+#[tokio::test]
+async fn a_host_side_rename_is_what_extensions_read_back() {
+    use cyrup_ext::host::HostServices as _;
+    let fx = fixture();
+    let faux: Arc<dyn Provider> = Arc::new(FauxProvider::new());
+    let session = SessionBuilder::new(faux, base_config(&fx))
+        .build()
+        .await
+        .expect("build")
+        .into_shared();
+    assert_eq!(session.services().host_services.session_name(), None);
+
+    session
+        .set_session_name("beta-worker")
+        .await
+        .expect("set name");
+    assert_eq!(
+        session.services().host_services.session_name().as_deref(),
+        Some("beta-worker")
+    );
+
+    session.set_session_name("   ").await.expect("clear name");
+    assert_eq!(session.services().host_services.session_name(), None);
+}
+
 /// A native extension that records every `session_info_changed` payload it is handed.
 struct InfoChangedRecorder(Arc<std::sync::Mutex<Vec<Option<String>>>>);
 

@@ -77,6 +77,7 @@ mod round8_postrun;
 mod round9_l5res;
 mod same_path_mutation_order;
 mod seam131_settle_order;
+mod send_user_message;
 mod session_branch_dir;
 mod session_compact_failed;
 mod session_dag;
@@ -101,6 +102,7 @@ mod virtual_model_extension;
 mod virtual_model_limits;
 mod virtual_model_restore;
 mod virtual_model_routing;
+mod wake_user_prompt;
 
 /// The system prompt a request carries, as the provider renders it: the replay of the transcript's
 /// system messages (`getCurrentSystemPrompt` over `normalizeContext`). The agent holds no prompt of

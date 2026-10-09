@@ -226,7 +226,7 @@ a six-column table is an empty `Dedup`, which is what "not a duplicate" means.
 > | `pi/` | v0.87.1 | **v1.0.0** (2026-10-01) | 180 |
 > | `pi-subagents/` | v0.71.0 | **v0.74.0** | 88 |
 > | `pi-mcp-adapter/` | v2.38.0 | **v5.0.0** — a major bump, three `feat!` | 99 |
-> | `pi-intercom/` | v0.14.0 | **v0.16.0** | 25 |
+> | `pi-intercom/` | v0.14.0 | **v0.16.0** (area 11 re-pinned to **v0.16.1** on 2026-10-08: +3 commits, `d5a8fd1` #153, `104b83c` #154, release; see its pin block) | 25 |
 > | `pi-acp/` | v0.0.34 | **v0.0.34**, unchanged | 0 |
 > | `pi-permission-system/` | v0.8.0 | **v0.8.0**, unchanged | 0 |
 >
@@ -277,7 +277,7 @@ a six-column table is an empty `Dedup`, which is what "not a duplicate" means.
 > `SEAM-147`, `SUBA-164`…`SUBA-173`, `MCP-609`…`MCP-611`, `HERDR-007`, `HERDR-008`, and `DUR-005` (closed).
 > **Next free ids now:** `PROV-134`, `CFG-103`, `EXT-108`, `TUI-147`, `SEAM-148`, `SUBA-174`, `MCP-612`,
 > `HERDR-009`, `DUR-006` (`HARN-005`, `CODE-014`, `AGENT-048`, `SESS-070`, `TOOL-057`, `ICOM-082`, `DRIFT-061`
-> unchanged). The 2026-10-02 table further down quotes the
+> unchanged; `ICOM-082` has since been used, and area 11's counter reads `ICOM-086` after the 2026-10-08 v0.16.1 pass, and `ICOM-087` after the 2026-10-09 E2E run filed and closed `ICOM-086`). The 2026-10-02 table further down quotes the
 > counters as they were that day.
 >
 > **ADR-0012 does not exist.** Several rows and `MCP-PORT-METHODOLOGY.md` cited it; no such file was ever
@@ -335,7 +335,7 @@ file; it only says how old each one is.
 > | `05` | cyrup `fe875569` × pi **v1.0.0** | `CFG-096`…`CFG-101` (next id `CFG-102`); `CFG-098` and `CFG-100` are `duplicate-of` area 07 and are not counted |
 > | `07` | cyrup `fe875569` × pi **v1.0.0** | `TUI-130`…`TUI-144` (next id `TUI-145`; later filings are in the file's *Next free id* line, which reads `TUI-171` after the 2026-10-08 `PROV-120` pass closed `TUI-145` and filed and closed `TUI-167`…`TUI-170`); `TUI-135` is `duplicate-of` `CFG-096` and is not counted |
 > | `09b` | cyrup `fe875569` × pi-subagents **v0.74.0** (window is now `v0.57.0..v0.74.0`) | `SUBA-150`…`SUBA-163` (next id `SUBA-164`) |
-> | `11` | cyrup `fe875569` × pi-intercom **v0.16.0** | `ICOM-071`…`ICOM-081` (next id `ICOM-082`) |
+> | `11` | cyrup `fe875569` × pi-intercom **v0.16.0** (**re-pinned to pi-intercom v0.16.1, 2026-10-08**: `v0.16.0..v0.16.1` read in full) | `ICOM-071`…`ICOM-081` (next id `ICOM-082`; `ICOM-082` filed and closed 2026-10-04, next id `ICOM-083`; 2026-10-08: every open row closed — `ICOM-071`, `073`, `075` were already closed by #187/#178 and only stale — and `ICOM-083`…`ICOM-085` filed and closed (#153, #154, `PARITY-GAPS.md` `UW-10`), next id `ICOM-086`; area 11 now has **0 open**; 2026-10-09 E2E run: `ICOM-086` filed and closed, next id `ICOM-087`) |
 > | `13` · `13a`–`13i` · `13-cyrup-mcp-STATUS.md` | cyrup `fe875569` × pi-mcp-adapter **v5.0.0** (× pi **v1.0.0** for the two new in-monorepo MCP surfaces) | `MCP-587`…`MCP-608` (next id `MCP-609`); census 523 → 545 units. Still counted in its own file |
 > | `17` | cyrup `fe875569` × pi **v1.0.0** | `HARN-003`, `HARN-004`, `DUR-001`…`DUR-004` (next ids `HARN-005`, `DUR-005`) |
 > | `18` (**new**) | cyrup `fe875569` × pi **v1.0.0** (**re-pinned to pi v1.0.4, 2026-10-07**: `v1.0.1..v1.0.4` triaged) | `CODE-001`…`CODE-013` (next id `CODE-014`; `CODE-014`…`CODE-017` filed and `CODE-014` closed 2026-10-06, next id `CODE-018`; `CODE-018`…`CODE-020` filed and closed 2026-10-07, next id `CODE-021`); added to `STANDARD_AREAS` in `scripts/count_open_items.py` in the same change |

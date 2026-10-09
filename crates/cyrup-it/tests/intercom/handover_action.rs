@@ -63,30 +63,6 @@ fn result_text(result: &ToolResult) -> String {
         .join("")
 }
 
-fn session(id: &str, cwd: &str) -> SessionInfo {
-    SessionInfo {
-        endpoint_epoch: None,
-        runtime_fallback_alias: None,
-        id: id.to_string(),
-        name: Some(id.to_string()),
-        cwd: cwd.to_string(),
-        model: "m".to_string(),
-        pid: 1u32.into(),
-        started_at: now_ms().into(),
-        last_activity: now_ms().into(),
-        status: None,
-        peer_uid: None,
-        trusted_local: None,
-        context_pct: None,
-        context_tokens: None,
-        context_window: None,
-        tmux_pane: None,
-        herdr_pane_id: None,
-        herdr_location: None,
-        extra: Default::default(),
-    }
-}
-
 fn user(text: &str) -> LlmMessage {
     LlmMessage::User {
         content: vec![Content::text(text)],
@@ -285,9 +261,10 @@ impl Rig {
     async fn peer_receives(&mut self) -> (SessionInfo, Message) {
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
-                match self.peer_events.recv().await.expect("the channel delivers") {
-                    InboundEvent::Message { from, message } => return (from, *message),
-                    _ => {}
+                if let InboundEvent::Message { from, message } =
+                    self.peer_events.recv().await.expect("the channel delivers")
+                {
+                    return (from, *message);
                 }
             }
         })

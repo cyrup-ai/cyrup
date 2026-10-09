@@ -371,3 +371,36 @@ fn bad_mode_is_an_error_not_a_silent_drop() {
     assert!(diags.is_empty(), "{diags:?}");
     assert_eq!(cli.mode, Some(Mode::Acp));
 }
+
+/// `cyrup intercom …` reaches `cyrup_intercom::cli` with its argv verbatim: a `--text`/`--to`/
+/// `--name` VALUE spelled like a pi multi-letter alias (`-nc`, `-na`) is message text, not a flag,
+/// so the process pre-pass must not rewrite it. Every other argv is still normalized.
+#[test]
+fn intercom_subcommand_argv_skips_short_alias_normalization() {
+    let intercom = [
+        "cyrup", "intercom", "send", "--to", "-na", "--text", "-nc", "--name", "-nt",
+    ]
+    .map(String::from);
+    assert_eq!(
+        crate::cli::normalize_process_argv(intercom.clone()),
+        intercom.to_vec()
+    );
+    // Presence before absence: the same tokens outside `intercom` are still rewritten…
+    assert_eq!(
+        crate::cli::normalize_process_argv(["cyrup", "-nc", "intercom"].map(String::from)),
+        vec![
+            "cyrup".to_string(),
+            "--no-context-files".to_string(),
+            "intercom".to_string()
+        ]
+    );
+    // …and a non-intercom subcommand keeps the pre-pass (`install -na` ⇒ `--no-approve`).
+    assert_eq!(
+        crate::cli::normalize_process_argv(["cyrup", "install", "-na"].map(String::from)),
+        vec![
+            "cyrup".to_string(),
+            "install".to_string(),
+            "--no-approve".to_string()
+        ]
+    );
+}

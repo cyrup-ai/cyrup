@@ -188,14 +188,22 @@ pub fn format_steer_message(request: &crate::background::control::SteerRequest) 
 /// as much ("Delivery requires a live Cyrup child session that supports mid-run steering"); there
 /// was no such session, because nothing had been written to make one.
 ///
-/// The capability to finish it was never missing. `cyrup_ext::host::HostServices::inject_message`
-/// (`cyrup-ext/src/host/services.rs:311`) is the seam, live-implemented at
-/// `cyrup-session-svc/src/host_services.rs:735` and routed to `AgentSession::send_user_message`,
-/// which — see `session.rs:3671-3677` — STEERS the running turn while streaming and starts a fresh
-/// prompt when idle. That is `pi.sendUserMessage(text, { deliverAs: "steer" })`, exactly. This very
-/// crate already calls it from two other places (`background/watch.rs`'s completion sink and
-/// `native_supervisor.rs`'s channel poller), and `NativeExtension::set_host_services`
+/// The seam is `cyrup_ext::host::HostServices::send_user_message` — pi
+/// `pi.sendUserMessage(text, { deliverAs })` itself, live-implemented in
+/// `cyrup-session-svc/src/host_services.rs` as an item on the session's injection pump
+/// (`session/mod.rs` `drive_injections` → `run_user_messages` → `AgentSession::prompt_with`). So
+/// the `input` handlers see every steer; an IDLE child starts a run through the full lifecycle
+/// (`before_agent_start` included, so the child's permission shaping and prompt rewrite apply to
+/// the steered turn); a BUSY child has a steer queued onto its live run (mid-run) and a follow-up
+/// onto the session's follow-up queue. `NativeExtension::set_host_services`
 /// (`cyrup-ext/src/native.rs:449`) is how a native extension is handed the backend.
+///
+/// It used to be `HostServices::inject_message(…, custom_type: None, …, trigger_turn: true)`,
+/// which is NOT that: the pump runs such a message as a turn of its own at the next idle edge
+/// through `AgentSession::run_injection`, skipping `input` and `before_agent_start` (pi's own
+/// `_runAgentPrompt` bypass, pi#5581 — the ICOM-084 defect class), and never steers a busy run; the
+/// follow-up release went with `trigger_turn: false`, which appended the guidance with no turn, so
+/// the model never answered it.
 ///
 /// # Lifecycle (pi `:199-258`)
 ///
@@ -224,7 +232,7 @@ pub struct SteeringInbox {
     child_index: usize,
     /// The late-bound capability backend (`NativeExtension::set_host_services`). `None` until the
     /// host binds it, and on a headless/default host it is bound to a backend whose
-    /// `inject_message` denies — both of which degrade to "no steering", never to a panic.
+    /// `send_user_message` denies — both of which degrade to "no steering", never to a panic.
     services: std::sync::Mutex<Option<Arc<dyn cyrup_ext::host::HostServices>>>,
     state: std::sync::Mutex<SteeringInboxState>,
 }
@@ -439,12 +447,14 @@ impl SteeringInbox {
         self.flush().await;
     }
 
-    /// SUBA-049 / pi's `turn_start` handler (`subagent-prompt-runtime.ts:449-457`): a turn is now in
-    /// flight, and exactly ONE ready follow-up is released into it.
+    /// SUBA-049 / pi's `turn_start` handler (`subagent-prompt-runtime.ts:447-454` @v0.43.0): a turn
+    /// is now in flight, and exactly ONE ready follow-up is acknowledged `delivered` by it.
     ///
-    /// One, not all: upstream splices a single entry (`queued.splice(next, 1)`), so a burst of
-    /// queued follow-ups is spread across turn boundaries rather than dumped into one turn. That is
-    /// the difference between "follow-up" and "steer" surviving the queue.
+    /// Acknowledged, not sent: the message itself went to the session at [`Self::flush`] time as
+    /// `sendUserMessage(text, { deliverAs: "followUp" })` (pi `:386`), so the SESSION's follow-up
+    /// queue is what holds it until the run would otherwise stop. This handler is upstream's
+    /// bookkeeping for when that delivery happened, one entry per boundary (`queued.splice(next,
+    /// 1)`).
     pub async fn on_turn_start(self: &Arc<Self>) {
         let released = {
             let mut state = self
@@ -462,44 +472,13 @@ impl SteeringInbox {
                 .map(|at| state.queued.remove(at))
         };
         if let Some(entry) = released {
-            let delivered = self
-                .services
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone()
-                .is_some_and(|services| {
-                    services
-                        .inject_message(
-                            &format_steer_message(&entry.request),
-                            None,
-                            true,
-                            None,
-                            false,
-                        )
-                        .is_ok()
-                });
-            if delivered {
-                self.acknowledge(
-                    &entry.request,
-                    crate::background::control::SteerAckState::Delivered,
-                    "Cyrup delivered the queued follow-up at a turn boundary.",
-                    Some(crate::background::control::SteerDeliveryStatus::Delivered),
-                )
-                .await;
-            } else {
-                // Not upstream's branch, because upstream cannot reach it: `sendUserMessage` is
-                // resolved once at registration and cannot start failing later. cyrup's host CAN
-                // (the session may be tearing down), and a follow-up that was acknowledged `queued`
-                // and then silently evaporated is precisely the fire-and-forget failure this item
-                // exists to remove — so the terminal outcome is reported.
-                self.acknowledge(
-                    &entry.request,
-                    crate::background::control::SteerAckState::Failed,
-                    "Run ended before queued follow-up delivery.",
-                    Some(crate::background::control::SteerDeliveryStatus::Queued),
-                )
-                .await;
-            }
+            self.acknowledge(
+                &entry.request,
+                crate::background::control::SteerAckState::Delivered,
+                "Cyrup delivered the queued follow-up at a turn boundary.",
+                Some(crate::background::control::SteerDeliveryStatus::Delivered),
+            )
+            .await;
         }
         self.activate().await;
     }
@@ -609,8 +588,8 @@ impl SteeringInbox {
                 continue;
             };
 
-            // pi `:374-375`: `follow_up` always parks; `auto` parks only when a turn is already in
-            // flight; `steer` (and an absent mode) always interrupts.
+            // pi `:374-375` @v0.43.0: `follow_up` always goes as a follow-up; `auto` does only
+            // when a turn is already in flight; `steer` (and an absent mode) always steers.
             let requested_mode = request
                 .mode
                 .unwrap_or(crate::background::control::SteerDeliveryMode::Steer);
@@ -627,36 +606,18 @@ impl SteeringInbox {
                 crate::background::control::SteerDeliveryMode::Auto
             ) && in_turn);
 
-            if park {
+            let delivery = if park {
                 // pi `:376-380`: the cap is enforced BEFORE the message is accepted, and a request
                 // over it is acknowledged `failed` with this exact sentence rather than silently
                 // discarded. This is the item's own Verify.
-                let accepted = {
-                    let mut state = self
-                        .state
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    if state.queued.len() >= crate::background::control::MAX_STEER_QUEUE_SIZE {
-                        false
-                    } else {
-                        // Queued DURING a turn -> not eligible until that turn ends.
-                        let ready = !state.in_turn;
-                        state.queued.push(QueuedFollowUp {
-                            request: request.clone(),
-                            ready,
-                        });
-                        true
-                    }
-                };
-                if accepted {
-                    self.acknowledge(
-                        request,
-                        crate::background::control::SteerAckState::Queued,
-                        "Cyrup queued the correlated follow-up input.",
-                        Some(crate::background::control::SteerDeliveryStatus::Queued),
-                    )
-                    .await;
-                } else {
+                let full = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .queued
+                    .len()
+                    >= crate::background::control::MAX_STEER_QUEUE_SIZE;
+                if full {
                     self.acknowledge(
                         request,
                         crate::background::control::SteerAckState::Failed,
@@ -667,21 +628,31 @@ impl SteeringInbox {
                         None,
                     )
                     .await;
+                    continue;
                 }
-                continue;
-            }
+                cyrup_ext::InputStreamingBehavior::FollowUp
+            } else {
+                cyrup_ext::InputStreamingBehavior::Steer
+            };
 
-            // `custom_type: None` is the load-bearing argument: it routes to
-            // `AgentSession::send_user_message`, i.e. a real USER message the model must
-            // answer, which is what `deliverAs: "steer"` means. A `Some(kind)` would make it a
-            // custom (non-LLM) message the model never sees. `display: true` so the operator
-            // watching the child's transcript sees the guidance arrive; `trigger_turn: true`
-            // so an IDLE child (between turns) actually acts on it instead of parking it.
-            match services.inject_message(&format_steer_message(request), None, true, None, true) {
+            // pi `:386`: `sendUserMessage(formatted, { deliverAs: delivery })` — i.e. `prompt`,
+            // through `HostServices::send_user_message`: the `input` handlers see it; an IDLE child
+            // starts a run through the full lifecycle (`before_agent_start` included, so the
+            // child's permission shaping and prompt rewrite apply to the steered turn); a BUSY
+            // child has it queued onto the live run — mid-run for a steer, after the run's work for
+            // a follow-up (the session's own follow-up queue, which is what keeps a follow-up out
+            // of the turn already in flight).
+            //
+            // NOT `inject_message(…, None, …, trigger_turn)`: that runs the message as a turn of
+            // its own at the next idle edge via `run_injection`, skipping `input` and
+            // `before_agent_start` (pi `_runAgentPrompt`, pi#5581) and never steering a busy run;
+            // and with `trigger_turn: false` (the old follow-up release) it appended the guidance
+            // with no turn at all, so the model never answered it.
+            match services.send_user_message(&format_steer_message(request), Some(delivery)) {
                 Ok(()) => {
-                    // SUBA-049 / pi `:413`. Upstream can only report this once its own `input`
+                    // SUBA-049 / pi `:405-411`. Upstream can only report this once its own `input`
                     // event correlates the injected text back to the request; cyrup's
-                    // `inject_message` reports acceptance synchronously at the call, so the
+                    // `send_user_message` reports acceptance synchronously at the call, so the
                     // acknowledgment is written here.
                     //
                     // [CYRUP-DELTA: no `input`-event round trip. Upstream needs the correlation
@@ -689,17 +660,40 @@ impl SteeringInbox {
                     // `HostServices` seam does not, so the two-phase `pending` map has no work to
                     // do and would only introduce a window in which an accepted steer is
                     // unacknowledged.]
-                    self.acknowledge(
-                        request,
-                        crate::background::control::SteerAckState::Delivered,
-                        "Cyrup accepted the correlated steering input.",
-                        Some(crate::background::control::SteerDeliveryStatus::Delivered),
-                    )
-                    .await;
+                    if park {
+                        {
+                            let mut state = self
+                                .state
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            // Queued DURING a turn -> not eligible until that turn ends (pi
+                            // `ready: !inTurn`, `:404`).
+                            let ready = !state.in_turn;
+                            state.queued.push(QueuedFollowUp {
+                                request: request.clone(),
+                                ready,
+                            });
+                        }
+                        self.acknowledge(
+                            request,
+                            crate::background::control::SteerAckState::Queued,
+                            "Cyrup queued the correlated follow-up input.",
+                            Some(crate::background::control::SteerDeliveryStatus::Queued),
+                        )
+                        .await;
+                    } else {
+                        self.acknowledge(
+                            request,
+                            crate::background::control::SteerAckState::Delivered,
+                            "Cyrup accepted the correlated steering input.",
+                            Some(crate::background::control::SteerDeliveryStatus::Delivered),
+                        )
+                        .await;
+                    }
                 }
                 Err(error) => {
-                    // pi `:389-392`: report the failure with the host's own message, put the
-                    // UNDELIVERED remainder back (including this one), and stop the drain.
+                    // pi `:387-392`: report the failure with the host's own message, put the
+                    // UNDELIVERED remainder back, and stop the drain.
                     self.acknowledge(
                         request,
                         crate::background::control::SteerAckState::Failed,
@@ -2494,8 +2488,9 @@ impl NativeExtension for SubagentPromptRuntime {
 
     /// G90: the late-bound capability backend, forwarded to the steering inbox — this is the whole
     /// mechanism by which a steered message reaches the child's model
-    /// (`HostServices::inject_message` → `AgentSession::send_user_message` → `steer` while
-    /// streaming). Without it the inbox drains into nothing.
+    /// (`HostServices::send_user_message` → the session's injection pump →
+    /// `AgentSession::prompt_with`, which steers while streaming). Without it the inbox drains into
+    /// nothing.
     fn set_host_services(&self, services: Arc<dyn cyrup_ext::host::HostServices>) {
         if let Some(steering) = &self.steering {
             steering.bind_services(Arc::clone(&services));

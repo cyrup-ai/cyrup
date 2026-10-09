@@ -103,6 +103,41 @@ fn resolve_lexical(path: &Path) -> PathBuf {
     }
 }
 
+/// `expandHomePath(path)` (`pi-intercom v0.16.1 index.ts:612-614`):
+///
+/// ```text
+/// return path === "~" ? homedir() : path.startsWith("~/") ? joinPath(homedir(), path.slice(2)) : path;
+/// ```
+///
+/// Only a bare `~` and a leading `~/` expand; `~user` and an embedded `~` are left alone, exactly as
+/// upstream leaves them. `/handover` uses it on a project-path target and on the path the picker's
+/// "New session in a project path…" row asks for.
+#[must_use]
+pub fn expand_home_path(path: &str) -> String {
+    expand_home_path_with(path, std::env::home_dir)
+}
+
+/// [`expand_home_path`] over an injected `homedir()`, for tests that must not read the process
+/// environment. With no home directory at all the path is returned unchanged.
+#[must_use]
+pub fn expand_home_path_with(path: &str, home_dir: impl Fn() -> Option<PathBuf>) -> String {
+    let rest = if path == "~" {
+        ""
+    } else if let Some(rest) = path.strip_prefix("~/") {
+        rest
+    } else {
+        return path.to_string();
+    };
+    let Some(home) = home_dir() else {
+        return path.to_string();
+    };
+    if rest.is_empty() {
+        home.to_string_lossy().into_owned()
+    } else {
+        home.join(rest).to_string_lossy().into_owned()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
@@ -161,5 +196,19 @@ mod tests {
             resolve_path(Path::new("/w/project"), "/abs"),
             PathBuf::from("/abs")
         );
+    }
+
+    #[test]
+    fn expand_home_path_expands_only_a_bare_tilde_and_a_leading_tilde_slash() {
+        let home = || Some(PathBuf::from("/home/me"));
+        assert_eq!(expand_home_path_with("~", home), "/home/me");
+        assert_eq!(
+            expand_home_path_with("~/dev/project", home),
+            "/home/me/dev/project"
+        );
+        assert_eq!(expand_home_path_with("~other/x", home), "~other/x");
+        assert_eq!(expand_home_path_with("./a/~/b", home), "./a/~/b");
+        assert_eq!(expand_home_path_with("/abs", home), "/abs");
+        assert_eq!(expand_home_path_with("~/x", || None), "~/x");
     }
 }

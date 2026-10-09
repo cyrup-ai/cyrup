@@ -25,6 +25,21 @@ pub(crate) fn text_result(text: impl Into<String>) -> ToolResult {
     detailed_result(text, serde_json::json!({}))
 }
 
+/// `firstTextContent(result)` (`pi-intercom v0.16.1 index.ts:615-617`): the first text part of a
+/// result with markdown bold markers (`**`) stripped, or `""` — how `/handover` turns the shared
+/// delivery's result into a notification.
+#[must_use]
+pub(crate) fn first_text_content(result: &ToolResult) -> String {
+    result
+        .content
+        .iter()
+        .find_map(|content| match content {
+            Content::Text { text, .. } => Some(text.replace("**", "")),
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
 /// Build a plain-text [`ToolResult`] carrying the structured `details` pi attaches to the arms that
 /// have something to report — `messageId`, `delivered`, `reason`, `replyTo`, `structuredReply`.
 ///

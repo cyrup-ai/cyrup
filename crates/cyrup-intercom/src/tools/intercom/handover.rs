@@ -16,6 +16,7 @@ use crate::handover::{
     generate_handover_body, read_git_state,
 };
 use crate::identity::short_session_id;
+use crate::session_state::SharedIntercomState;
 use crate::transport::client::IntercomClient;
 
 use super::deliver::{DeliveryKind, DeliveryRequest};
@@ -69,16 +70,6 @@ impl IntercomTool {
         .await
     }
 
-    /// `buildHandoverText(connectedClient, ctx, { goal, crossMachine }, signal)`
-    /// (`v0.16.0 index.ts:1814-1835`).
-    ///
-    /// Generation and the git read run together (`Promise.all`), and the first failure wins without
-    /// waiting for the other — `try_join!` short-circuits exactly as `Promise.all` rejects. The
-    /// cancel check AFTER both is its own refusal even when generation itself succeeded: a result
-    /// that arrived under a fired signal is an abort, not a handover.
-    ///
-    /// `crossMachine` drops the session-file line, because the path names a file the receiver
-    /// cannot open.
     async fn build_handover_text(
         &self,
         client: &Arc<IntercomClient>,
@@ -86,44 +77,105 @@ impl IntercomTool {
         cross_machine: bool,
         cancel: &CancelToken,
     ) -> Result<String, HandoverError> {
-        let services = self.state.host_services();
-        let (body, git) = tokio::try_join!(
-            generate_handover_body(services.as_deref(), goal, cancel),
-            async { Ok::<Option<GitState>, HandoverError>(read_git_state(&self.state.cwd).await) },
-        )?;
-        if cancel.is_cancelled() {
-            return Err(HandoverError::Aborted);
-        }
-        // `connectedClient.sessionId ?? ctx.sessionManager.getSessionId()` (`:1827`).
-        let session_id = client
-            .session_id()
-            .or_else(|| services.as_ref().and_then(|services| services.session_id()))
-            .unwrap_or_default();
-        // `pi.getSessionName()?.trim() || sessionId.slice(0, 8)` (`:1829`) — JS `||`, so a blank
-        // name falls through to the id prefix.
-        let session_name = services
-            .as_ref()
-            .and_then(|services| services.session_name())
-            .map(|name| name.trim().to_string())
-            .filter(|name| !name.is_empty());
-        let sender_name = session_name.unwrap_or_else(|| short_session_id(&session_id));
-        let sender_cwd = self.state.cwd.to_string_lossy();
-        let session_file = if cross_machine {
-            None
-        } else {
-            services
-                .as_ref()
-                .and_then(|services| services.session_file())
-                .map(|path| path.to_string_lossy().into_owned())
-        };
-        Ok(format_handover_message(
-            &HandoverHeader {
-                sender_name: &sender_name,
-                sender_cwd: &sender_cwd,
-                session_file: session_file.as_deref(),
-                git: git.as_ref(),
-            },
-            &body,
-        ))
+        build_handover_text(&self.state, client, goal, cross_machine, cancel).await
     }
+}
+
+/// Where a `/handover` goes — pi's `Pick<DeliveryRequest, "to" | "cwd" | "openProjectPaneIfMissing">`
+/// (`v0.16.1 index.ts:3100`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct HandoverRoute {
+    /// A session name, id, id prefix or `name@machine`.
+    pub(crate) to: Option<String>,
+    /// A project path (relative paths resolve against this session's cwd, as for the tool).
+    pub(crate) cwd: Option<String>,
+    /// Launch a Herdr project pane when no session is live in `cwd`.
+    pub(crate) open_project_pane_if_missing: bool,
+}
+
+/// `deliverMessage(handoverClient, ctx, undefined, { ...request, message: edited, handover: true })`
+/// (`v0.16.1 index.ts:3144`) — `/handover`'s send, through the SAME delivery the tool's `send` and
+/// `handover` arms use ("Shared by send, handover, and /handover", `index.ts:1656`). There is no
+/// caller signal (`undefined`), so the cancel token is a fresh one that never fires.
+pub(crate) async fn deliver_handover(
+    state: &Arc<SharedIntercomState>,
+    client: &Arc<IntercomClient>,
+    route: &HandoverRoute,
+    message: &str,
+) -> Result<ToolResult, ToolError> {
+    let tool = IntercomTool::new(state.clone());
+    tool.deliver_message(
+        client,
+        &CancelToken::new(),
+        DeliveryRequest {
+            to: route.to.as_deref().filter(|v| !v.trim().is_empty()),
+            cwd: route.cwd.as_deref().filter(|v| !v.trim().is_empty()),
+            open_project_pane_if_missing: route.open_project_pane_if_missing,
+            // `focus` is unset on `/handover`'s request; the tool's own default applies.
+            focus: true,
+            message,
+            kind: DeliveryKind::Handover,
+        },
+    )
+    .await
+}
+
+/// `buildHandoverText(connectedClient, ctx, { goal, crossMachine }, signal)`
+/// (`v0.16.0 index.ts:1814-1835`).
+///
+/// Generation and the git read run together (`Promise.all`), and the first failure wins without
+/// waiting for the other — `try_join!` short-circuits exactly as `Promise.all` rejects. The
+/// cancel check AFTER both is its own refusal even when generation itself succeeded: a result
+/// that arrived under a fired signal is an abort, not a handover.
+///
+/// `crossMachine` drops the session-file line, because the path names a file the receiver
+/// cannot open.
+///
+/// Shared by the tool's `handover` arm and `/handover`'s loader (`v0.16.1 index.ts:3115`).
+pub(crate) async fn build_handover_text(
+    state: &Arc<SharedIntercomState>,
+    client: &Arc<IntercomClient>,
+    goal: Option<&str>,
+    cross_machine: bool,
+    cancel: &CancelToken,
+) -> Result<String, HandoverError> {
+    let services = state.host_services();
+    let (body, git) = tokio::try_join!(
+        generate_handover_body(services.as_deref(), goal, cancel),
+        async { Ok::<Option<GitState>, HandoverError>(read_git_state(&state.cwd).await) },
+    )?;
+    if cancel.is_cancelled() {
+        return Err(HandoverError::Aborted);
+    }
+    // `connectedClient.sessionId ?? ctx.sessionManager.getSessionId()` (`:1827`).
+    let session_id = client
+        .session_id()
+        .or_else(|| services.as_ref().and_then(|services| services.session_id()))
+        .unwrap_or_default();
+    // `pi.getSessionName()?.trim() || sessionId.slice(0, 8)` (`:1829`) — JS `||`, so a blank
+    // name falls through to the id prefix.
+    let session_name = services
+        .as_ref()
+        .and_then(|services| services.session_name())
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty());
+    let sender_name = session_name.unwrap_or_else(|| short_session_id(&session_id));
+    let sender_cwd = state.cwd.to_string_lossy();
+    let session_file = if cross_machine {
+        None
+    } else {
+        services
+            .as_ref()
+            .and_then(|services| services.session_file())
+            .map(|path| path.to_string_lossy().into_owned())
+    };
+    Ok(format_handover_message(
+        &HandoverHeader {
+            sender_name: &sender_name,
+            sender_cwd: &sender_cwd,
+            session_file: session_file.as_deref(),
+            git: git.as_ref(),
+        },
+        &body,
+    ))
 }

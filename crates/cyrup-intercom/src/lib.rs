@@ -25,6 +25,7 @@
 #![forbid(unsafe_code)]
 
 pub mod broker;
+pub mod cli;
 pub mod config;
 pub mod connect;
 pub mod cross_machine;

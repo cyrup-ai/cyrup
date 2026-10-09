@@ -26,6 +26,7 @@ mod cancel;
 mod cross_machine;
 mod deliver;
 mod handover;
+pub(crate) use handover::{HandoverRoute, build_handover_text, deliver_handover};
 mod list;
 mod list_cwd;
 mod pending;

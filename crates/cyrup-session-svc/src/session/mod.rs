@@ -413,6 +413,12 @@ pub struct AgentSession {
     /// `agent_settled` emit and the second only after the deferred settled actions (SEAM-129), so
     /// [`Self::is_run_active`] reads `driver_tx` through this.
     run_released: AtomicBool,
+    /// ICOM-084 test signal: how many pending wake prompts the injection pump has dropped because a
+    /// run held the session (the `wakes.clear()` in `drive_injections`' not-idle loop). Tests wait
+    /// on it instead of sleeping, so "the pump saw the wake while the run was busy" is a condition,
+    /// not a guess about scheduling.
+    #[cfg(test)]
+    pub(crate) wakes_dropped_on_active_run: std::sync::atomic::AtomicUsize,
     /// Pi `_isEmittingAgentSettled` (`agent-session.ts:378` @v0.87.1): set for the length of the
     /// `agent_settled` emit, during which a prompt or a trigger-turn message is deferred.
     emitting_settled: AtomicBool,
@@ -548,6 +554,8 @@ impl AgentSession {
             _settled_drain_keepalive: settled_drain_keepalive,
             _driver_keepalive: driver_keepalive,
             run_released: AtomicBool::new(false),
+            #[cfg(test)]
+            wakes_dropped_on_active_run: std::sync::atomic::AtomicUsize::new(0),
             emitting_settled: AtomicBool::new(false),
             deferred_settled: Mutex::new(Vec::new()),
             compaction_settled: tokio::sync::watch::channel(0).0,
@@ -900,21 +908,49 @@ impl Drop for AgentSession {
 /// (`LiveHostServices::inject_message_steer`), because a steer from a `turn_end` handler must reach
 /// the loop's next poll and this task cannot be scheduled in between. It still arrives here, as
 /// [`InjectItem::Steered`], so its fate is owned by this task exactly like one it steered itself.
+///
+/// # A wake prompt runs the real prompt lifecycle, last (ICOM-084)
+///
+/// [`InjectItem::WakePrompt`] is pi's `sendUserMessage(text)` for an idle session
+/// (pi-intercom `index.ts:1297-1302` @v0.16.1, `104b83c` #154). It is held in `wakes` and run only
+/// once everything received before it has been settled — the durable append first, then any
+/// injected turn — so the card it announces is in the transcript when the woken run starts. It runs
+/// through [`AgentSession::prompt_with`], NOT [`AgentSession::run_injection`]: the latter hands the
+/// messages straight to the agent and skips `before_agent_start` (pi's own `_runAgentPrompt`
+/// bypass, pi#5581), which is the whole defect the wake exists to avoid. Any run that holds the
+/// latch first — a user prompt, an injected turn, a run the pump waited out — already carries the
+/// card, so every wake received up to that point is dropped rather than starting a second run.
+///
+/// # A native `sendUserMessage` runs the real prompt lifecycle too
+///
+/// [`InjectItem::UserMessage`] ([`cyrup_ext::host::HostServices::send_user_message`]) is pi's
+/// `sendUserMessage(text, { deliverAs })` from a native extension's own task — the subagent
+/// steering inbox and the watchdog's auto-follow. It goes through [`AgentSession::prompt_with`]
+/// as well (see [`run_user_messages`]): onto a live run the moment one holds the session when it
+/// names a delivery, otherwise at the idle edge, ahead of any wake.
 async fn drive_injections(
     session: Weak<AgentSession>,
     mut rx: tokio::sync::mpsc::UnboundedReceiver<InjectItem>,
 ) {
     let mut inbox: Vec<InjectRequest> = Vec::new();
     let mut steered: Vec<SteeredInjection> = Vec::new();
+    let mut wakes: Vec<String> = Vec::new();
+    let mut user_messages: Vec<PendingUserMessage> = Vec::new();
     // `false` once every producer is gone; what is already owned is still delivered.
     let mut open = true;
     loop {
-        if inbox.is_empty() && steered.is_empty() {
+        if inbox.is_empty() && steered.is_empty() && wakes.is_empty() && user_messages.is_empty() {
             if !open {
                 return;
             }
             match rx.recv().await {
-                Some(item) => route_injection(item, &mut inbox, &mut steered),
+                Some(item) => route_injection(
+                    item,
+                    &mut inbox,
+                    &mut steered,
+                    &mut wakes,
+                    &mut user_messages,
+                ),
                 // Every producer is gone (the host services backend dropped): nothing more can
                 // ever arrive, and nothing is owned, so there is nothing to answer for.
                 None => return,
@@ -926,7 +962,13 @@ async fn drive_injections(
         // notifications is upstream's own shape — and it is what lets an orchestrator answer about
         // a whole fan-out in a single turn instead of three sequential ones.
         if open {
-            open = drain_ready(&mut rx, &mut inbox, &mut steered);
+            open = drain_ready(
+                &mut rx,
+                &mut inbox,
+                &mut steered,
+                &mut wakes,
+                &mut user_messages,
+            );
         }
         let Some(session) = session.upgrade() else {
             for req in inbox.drain(..) {
@@ -943,15 +985,43 @@ async fn drive_injections(
         // check-then-act — and it returns at once when the session is already idle.
         loop {
             session.steer_injections_onto_live_run(&mut inbox, &mut steered);
+            // A `sendUserMessage` that names a delivery is queued onto the live run NOW (pi
+            // `prompt` → `_queueSteer` / `_queueFollowUp`), after its `input` handlers ran.
+            if session.is_run_active() {
+                run_user_messages(&session, &mut user_messages, true).await;
+            }
             if session.is_idle() {
                 break;
+            }
+            // ICOM-084 — a run holds the session, so it carries every card a pending wake was
+            // for (steered onto it above, or appended before it started). Waking after it would
+            // start a second run nobody asked for. A compaction alone is busy without being a run
+            // (see `is_idle`): it carries nothing, so the wake survives it.
+            if session.is_run_active() && !wakes.is_empty() {
+                #[cfg(test)]
+                session
+                    .wakes_dropped_on_active_run
+                    .fetch_add(wakes.len(), Ordering::SeqCst);
+                wakes.clear();
             }
             tokio::select! {
                 () = session.wait_for_idle() => {}
                 next = rx.recv(), if open => match next {
                     Some(item) => {
-                        route_injection(item, &mut inbox, &mut steered);
-                        open = drain_ready(&mut rx, &mut inbox, &mut steered);
+                        route_injection(
+                            item,
+                            &mut inbox,
+                            &mut steered,
+                            &mut wakes,
+                            &mut user_messages,
+                        );
+                        open = drain_ready(
+                            &mut rx,
+                            &mut inbox,
+                            &mut steered,
+                            &mut wakes,
+                            &mut user_messages,
+                        );
                     }
                     None => open = false,
                 },
@@ -964,7 +1034,13 @@ async fn drive_injections(
         // it only takes what is already queued. It helps every producer (completions, steers,
         // watchdog warnings, intercom), which is why it lives here and not in the completion batcher.
         if open {
-            open = drain_ready(&mut rx, &mut inbox, &mut steered);
+            open = drain_ready(
+                &mut rx,
+                &mut inbox,
+                &mut steered,
+                &mut wakes,
+                &mut user_messages,
+            );
         }
         let (durable, turn) = split_by_group_trigger(std::mem::take(&mut inbox));
         // The no-turn half first: it is independent of the turn, and answering it before a possible
@@ -1006,8 +1082,17 @@ async fn drive_injections(
             }
         }
         if turn.is_empty() {
+            // A held `sendUserMessage` runs first: it IS a message, where a wake is only a nudge
+            // for cards already in the transcript — and a run it starts carries those cards, so
+            // `run_wake_prompt` then finds the session busy and drops the wake.
+            run_user_messages(&session, &mut user_messages, false).await;
+            if !wakes.is_empty() {
+                run_wake_prompt(&session, std::mem::take(&mut wakes)).await;
+            }
             continue;
         }
+        // The injected turn is the run that carries the cards; a wake on top would be a second.
+        wakes.clear();
         let plan = merge_injection_batch(&turn);
         // Exhaustive on purpose, with NO catch-all arm: the three outcomes demand three different
         // responses, and folding the last two together (as "any error means try again") turns a
@@ -1022,6 +1107,10 @@ async fn drive_injections(
                 for req in turn {
                     req.ack.answer(InjectOutcome::Accepted);
                 }
+                // The injected turn is live now: a held `sendUserMessage` that names a delivery
+                // joins it (pi queues onto a streaming session); one that does not waits for the
+                // next idle edge.
+                run_user_messages(&session, &mut user_messages, false).await;
             }
             // A user prompt claimed the latch in the gap after `wait_for_idle` returned. The inbox
             // holds every turn message again and the next pass parks until that run settles.
@@ -1045,10 +1134,12 @@ fn drain_ready(
     rx: &mut tokio::sync::mpsc::UnboundedReceiver<InjectItem>,
     inbox: &mut Vec<InjectRequest>,
     steered: &mut Vec<SteeredInjection>,
+    wakes: &mut Vec<String>,
+    user_messages: &mut Vec<PendingUserMessage>,
 ) -> bool {
     loop {
         match rx.try_recv() {
-            Ok(item) => route_injection(item, inbox, steered),
+            Ok(item) => route_injection(item, inbox, steered, wakes, user_messages),
             Err(tokio::sync::mpsc::error::TryRecvError::Empty) => return true,
             Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => return false,
         }
@@ -1057,11 +1148,15 @@ fn drain_ready(
 
 /// File one queue item with the pump: a request joins the inbox to be scheduled; a message its
 /// producer already steered onto a live run (ICOM-063) joins `steered`, whose fate the idle edge
-/// settles exactly as for a steer the pump made itself.
+/// settles exactly as for a steer the pump made itself; a wake prompt (ICOM-084) waits in `wakes`
+/// until everything before it is settled; a `sendUserMessage` waits in `user_messages` until a live
+/// run can take it or the session is idle.
 fn route_injection(
     item: InjectItem,
     inbox: &mut Vec<InjectRequest>,
     steered: &mut Vec<SteeredInjection>,
+    wakes: &mut Vec<String>,
+    user_messages: &mut Vec<PendingUserMessage>,
 ) {
     match item {
         InjectItem::Request(req) => inbox.push(req),
@@ -1069,6 +1164,102 @@ fn route_injection(
             message,
             ack: InjectAck::detached(),
         }),
+        InjectItem::WakePrompt(text) => wakes.push(text),
+        InjectItem::UserMessage { text, deliver_as } => {
+            user_messages.push(PendingUserMessage { text, deliver_as });
+        }
+    }
+}
+
+/// One [`InjectItem::UserMessage`] the pump has not yet handed to the prompt path.
+#[derive(Debug)]
+struct PendingUserMessage {
+    text: String,
+    deliver_as: Option<crate::event::StreamingBehavior>,
+}
+
+/// [`cyrup_ext::host::HostServices::send_user_message`]'s body: pi `sendUserMessage(text, {
+/// deliverAs })` = `prompt(text, { expandPromptTemplates: false, streamingBehavior: deliverAs,
+/// source: "extension" })` (`agent-session.ts:2365-2389` @v1.1.0), which is
+/// [`AgentSession::prompt_with`] — the same call [`AgentSession::apply_pending_control`]'s
+/// `SendUserMessage` arm makes for a guest. So the `input` handlers always run; on an idle session
+/// `before_agent_start` and `agent_start` run too; on a streaming one the text is queued onto the run
+/// (`_queueSteer` / `_queueFollowUp`). Never [`AgentSession::run_injection`], which skips all of it.
+///
+/// In order, oldest first. `deliverable_only` (the busy phase) hands over only messages that name a
+/// delivery — those are the ones pi queues onto a live run — and leaves the rest. A message the
+/// session refuses with [`crate::error::SessionServiceError::StreamingNeedsBehavior`] (no delivery
+/// named, and a run claimed the session) is kept for the next idle edge: the producer is
+/// fire-and-forget and cannot see pi's throw, so refusing would silently lose it. Any other fault is
+/// logged and the message dropped, as pi's `void`-ed promise would drop it.
+async fn run_user_messages(
+    session: &Arc<AgentSession>,
+    pending: &mut Vec<PendingUserMessage>,
+    deliverable_only: bool,
+) {
+    let mut kept = Vec::new();
+    for message in std::mem::take(pending) {
+        if deliverable_only && message.deliver_as.is_none() {
+            kept.push(message);
+            continue;
+        }
+        let input = crate::event::UserInput {
+            text: message.text.clone(),
+            images: Vec::new(),
+            source: crate::event::InputSource::Sdk,
+            expand_templates: false,
+        };
+        let options = crate::event::PromptOptions {
+            streaming_behavior: message.deliver_as,
+        };
+        // Boxed for the same reason as `run_wake_prompt`'s `prompt_with` (EXT-087).
+        match Box::pin(session.prompt_with(input, options)).await {
+            Ok(_) => {}
+            Err(crate::error::SessionServiceError::StreamingNeedsBehavior) => kept.push(message),
+            Err(fault) => {
+                tracing::warn!(error = %fault, "extension sendUserMessage could not be delivered");
+            }
+        }
+    }
+    *pending = kept;
+}
+
+/// ICOM-084 — run the pending wake prompts as ONE user prompt through the real prompt path.
+///
+/// pi's `sendUserMessage(text)` is `prompt(text, { expandPromptTemplates: false, source:
+/// "extension" })` (`agent-session.ts:2030-2035` @v0.87.1) — the body
+/// [`AgentSession::apply_pending_control`]'s `SendUserMessage` arm runs for a guest, and the one this
+/// runs: `input` handlers, then `before_agent_start` (`assemble_run_inputs`), then the run and its
+/// `agent_start`. `expand_templates: false` keeps a wake text that happens to start with `/` from
+/// dispatching a command. Several wakes settled in one pass are coalesced to the LAST: they are
+/// fire-and-forget nudges for cards that are all already in the transcript, and one run answers
+/// them all — two would be the second run this seam exists to prevent.
+///
+/// A run that claimed the session in the gap since the idle edge refuses the prompt
+/// ([`SessionServiceError::StreamingNeedsBehavior`], pi's "Agent is already processing" throw) and
+/// the wake is dropped: that run carries the cards. Nothing is owed to the producer either way —
+/// pi `void`s the call, and pi-intercom's reservation expires on its own if no run starts.
+async fn run_wake_prompt(session: &Arc<AgentSession>, mut wakes: Vec<String>) {
+    let Some(text) = wakes.pop() else {
+        return;
+    };
+    if session.is_run_active() {
+        return;
+    }
+    let input = crate::event::UserInput {
+        text,
+        images: Vec::new(),
+        source: crate::event::InputSource::Sdk,
+        expand_templates: false,
+    };
+    // Boxed for the same reason `apply_send_op` boxes its `prompt_with`: the prompt path re-enters
+    // the run driver, and an unboxed edge here would put this task's future inside the opaque-type
+    // cycle that `drive_run`'s signature cuts (E0733 / the `Send` inference cycle, EXT-087).
+    match Box::pin(session.prompt_with(input, crate::event::PromptOptions::default())).await {
+        Ok(_) | Err(crate::error::SessionServiceError::StreamingNeedsBehavior) => {}
+        Err(fault) => {
+            tracing::warn!(error = %fault, "intercom wake prompt could not start a run");
+        }
     }
 }
 

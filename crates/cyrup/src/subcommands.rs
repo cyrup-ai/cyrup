@@ -31,9 +31,9 @@ use cyrup_tui::{
 };
 
 /// The recognized subcommand verbs (Pi: `install`/`remove`/`update`/`list` + `uninstall` alias +
-/// `config`, plus cyrup's `mcp`). `config` and `mcp` are both dispatched specially — neither takes
-/// `PackageCommand`'s flag grammar.
-const SUBCOMMANDS: [&str; 7] = [
+/// `config`, plus cyrup's `mcp` and `intercom`). `config`, `mcp` and `intercom` are dispatched
+/// specially — none takes `PackageCommand`'s flag grammar.
+const SUBCOMMANDS: [&str; 8] = [
     "install",
     "remove",
     "uninstall",
@@ -41,6 +41,7 @@ const SUBCOMMANDS: [&str; 7] = [
     "list",
     "config",
     "mcp",
+    "intercom",
 ];
 
 /// Whether `argv` (program name already stripped) begins with a package/config subcommand.
@@ -472,6 +473,26 @@ pub async fn dispatch(
             argv.get(1..).unwrap_or_default(),
             dirs,
         )));
+    }
+
+    // `intercom` — the intercom scripting client (pi-intercom's `pi-intercom` bin, `cli.ts`),
+    // `cyrup_intercom::cli`, run from THIS binary so every cyrup install has it. That is what makes
+    // the default `crossMachine.remoteCommand` (`cyrup intercom`, which the sending host runs over
+    // `ssh` as `cyrup intercom relay --envelope-stdin --json`) answer on any cyrup host, with no
+    // second package to install. Its verbs (`list`/`send`/`ask`/`relay`) and flags are the CLI's
+    // own, so it is dispatched before any package-flag handling, like `mcp`.
+    //
+    // [CYRUP-DELTA] pi ships the client as a separate `pi-intercom` bin of the pi-intercom
+    // package (`v0.16.0 config.ts:84` defaults `remoteCommand` to it). cyrup's extension is
+    // compiled into `cyrup`, so its client is too; the standalone `cyrup-intercom-cli` binary of
+    // the `cyrup-intercom` package runs the same code.
+    if argv.first().map(String::as_str) == Some("intercom") {
+        let code = cyrup_intercom::cli::run_status(
+            argv.get(1..).unwrap_or_default(),
+            cyrup_intercom::cli::SUBCOMMAND_PROGRAM,
+        )
+        .await;
+        return Ok(Some(i32::from(code)));
     }
 
     // `config` is handled specially (Pi `handleConfigCommand`).
@@ -1295,6 +1316,10 @@ mod tests {
         assert_eq!(first_subcommand(&v(&["install", "x"])), Some("install"));
         assert_eq!(first_subcommand(&v(&["list"])), Some("list"));
         assert_eq!(first_subcommand(&v(&["config"])), Some("config"));
+        assert_eq!(
+            first_subcommand(&v(&["intercom", "relay"])),
+            Some("intercom")
+        );
         assert_eq!(first_subcommand(&v(&["hello world"])), None);
         assert_eq!(first_subcommand(&v(&["--print", "hi"])), None);
         assert_eq!(first_subcommand(&v(&["@file.md"])), None);
