@@ -684,6 +684,17 @@ pub struct AgentOverrideConfig {
     /// description intact rather than blanking the text agent selection depends on.
     #[serde(skip_serializing_if = "OverrideField::is_unset")]
     pub description: OverrideField<String>,
+    /// SUBA-157 — pi `advertise?: boolean` (`src/agents/agents.ts:91` @ad11b7ab; parsed `:1047-1050`,
+    /// applied `:1500` as `next.advertise = override.advertise`). Lets settings opt a builtin or
+    /// custom agent into (or out of) the parent prompt's `<advertised_subagents>` catalog without
+    /// editing its file. Lands in [`AgentDefinition::advertise`]. A plain boolean with no clear
+    /// form, so a JSON `false` is a real `Value(false)`; a non-boolean is refused by
+    /// [`crate::discovery::parse_subagent_settings`] with pi's own message. Runtime-registered
+    /// agents never see it: `merge.rs`'s `runtime_agent_overrides` narrows it away (pi
+    /// `runtimeAgentOverrides`, `:1637-1647`) and the catalog builder excludes runtime agents
+    /// regardless (`advertised-agent-prompt.ts:43`).
+    #[serde(skip_serializing_if = "OverrideField::is_unset")]
+    pub advertise: OverrideField<bool>,
     /// pi `output?: string | false` (`agents.ts:82`) — the default output PATH. Lands in
     /// [`AgentDefinition::output`]'s [`OutputSpec::path`]; a clear drops the whole spec. Carried as
     /// a `String` (not a `PathBuf`) because that is the on-disk JSON shape; `merge.rs` converts.
@@ -881,6 +892,7 @@ impl AgentOverrideConfig {
     /// turned out to say nothing (distinct from the entry being entirely absent from settings).
     pub fn is_empty(&self) -> bool {
         !(self.description.is_present()
+            || self.advertise.is_present()
             || self.output.is_present()
             || self.default_reads.is_present()
             || self.model.is_present()
@@ -1761,8 +1773,10 @@ mod tests {
     /// or listing a modeled key as unported.
     #[test]
     fn agent_override_config_models_every_v0_68_0_key_or_names_it_unported() {
-        const UPSTREAM: [&str; 26] = [
+        const UPSTREAM: [&str; 27] = [
             "description",
+            // SUBA-157 — `agents.ts:91` @ad11b7ab (`8dc90dca`, #2534).
+            "advertise",
             "machine",
             "output",
             "outputMode",
@@ -1812,8 +1826,8 @@ mod tests {
         // 23 upstream keys + `fallbackModels` before the `1aecfca` contract; that contract added
         // `machine`, `inheritGlobalContext` and `mutationTools` as serde fields. SUBA-107 then
         // removed `completionGuard` and SUBA-111 added `allowedAgents`, so all 26 surviving
-        // upstream keys plus `fallbackModels` are struct fields.
-        assert_eq!(modeled.len(), 27);
+        // upstream keys plus `fallbackModels` are struct fields. SUBA-157 added `advertise`.
+        assert_eq!(modeled.len(), 28);
     }
 
     #[test]

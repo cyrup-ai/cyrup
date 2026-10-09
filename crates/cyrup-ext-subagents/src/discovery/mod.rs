@@ -899,6 +899,7 @@ pub fn parse_subagent_settings(
     validate_override_suba096_keys(value)?;
     validate_override_context_and_mutation_keys(value)?;
     validate_override_machine_key(value)?;
+    validate_override_advertise_key(value)?;
     let mut settings: SubagentSettings = serde_json::from_value(value.clone())
         .map_err(|e| SubagentError::MalformedSettings(e.to_string()))?;
     settings.warnings = subagent_settings_warnings(value);
@@ -1258,6 +1259,27 @@ fn validate_override_suba096_keys(subagents: &serde_json::Value) -> Result<(), S
         {
             return Err(SubagentError::MalformedSettings(format!(
                 "Builtin override '{name}' has invalid 'acceptanceRole'; expected 'read-only', 'writer', or false."
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// SUBA-157 — pi `parseBuiltinOverrideEntry`'s `advertise` arm (`src/agents/agents.ts:1047-1050`
+/// @ad11b7ab): a boolean, else THROW with
+/// `Builtin override '<name>' in '<file>' has invalid 'advertise'; expected a boolean.` Checked
+/// against the RAW object before serde, like its siblings; the file half of the message is the
+/// `settings file '<path>': ` prefix [`read_subagent_settings_file`] adds to every refusal.
+fn validate_override_advertise_key(subagents: &serde_json::Value) -> Result<(), SubagentError> {
+    let Some(entries) = subagents.get("agentOverrides").and_then(|v| v.as_object()) else {
+        return Ok(());
+    };
+    for (name, entry) in entries {
+        if let Some(raw) = entry.get("advertise")
+            && !raw.is_boolean()
+        {
+            return Err(SubagentError::MalformedSettings(format!(
+                "Builtin override '{name}' has invalid 'advertise'; expected a boolean."
             )));
         }
     }
@@ -3104,6 +3126,50 @@ mod tests {
         let worker = settings.overrides.get("worker").expect("worker");
         assert_eq!(worker.acceptance_role, OverrideField::ExplicitClear);
         assert_eq!(worker.fast, OverrideField::Value(false));
+    }
+
+    /// SUBA-157 — `agentOverrides.<name>.advertise` is read (pi `agents.ts:1047-1050`
+    /// @ad11b7ab): a boolean in either polarity is admitted with no "not an override key"
+    /// warning, and anything else is refused with pi's own text. Mutation killed: dropping the
+    /// field (the key is reported as ignored) or the raw check (serde's message names no field).
+    #[test]
+    fn override_advertise_is_read_and_a_non_boolean_is_refused_with_pis_text() {
+        let raw = serde_json::json!({"agentOverrides": {
+            "reviewer": {"advertise": true},
+            "scout": {"advertise": false},
+        }});
+        let settings = parse_subagent_settings(Some(&raw)).expect("booleans are admitted");
+        assert_eq!(
+            settings
+                .overrides
+                .get("reviewer")
+                .expect("reviewer")
+                .advertise,
+            OverrideField::Value(true)
+        );
+        assert_eq!(
+            settings.overrides.get("scout").expect("scout").advertise,
+            OverrideField::Value(false)
+        );
+        assert!(settings.warnings.is_empty(), "{:?}", settings.warnings);
+
+        for bad in [
+            serde_json::json!("yes"),
+            serde_json::json!(1),
+            serde_json::json!(null),
+        ] {
+            let raw = serde_json::json!({"agentOverrides": {"reviewer": {"advertise": bad}}});
+            let err = parse_subagent_settings(Some(&raw)).expect_err("refused");
+            assert_eq!(
+                err.to_string(),
+                SubagentError::MalformedSettings(
+                    "Builtin override 'reviewer' has invalid 'advertise'; expected a boolean."
+                        .to_string()
+                )
+                .to_string(),
+                "{bad}"
+            );
+        }
     }
 
     /// SUBA-096 §1.5 — a key that is not an override key is REPORTED rather than dropped, and the

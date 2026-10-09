@@ -694,6 +694,8 @@ fn builtin_applied_keys(delta: &AgentOverrideConfig) -> BTreeSet<String> {
         // SUBA-100.
         ("machine", delta.machine.is_present()),
         ("acceptanceRole", delta.acceptance_role.is_present()),
+        // SUBA-157.
+        ("advertise", delta.advertise.is_present()),
     ] {
         if present {
             keys.insert(key.to_string());
@@ -787,6 +789,10 @@ fn apply_builtin_override(
     if let OverrideField::Value(v) = &delta.description {
         agent.description = v.clone();
     }
+    // SUBA-157 / pi `agents.ts:1500` @ad11b7ab: `next.advertise = override.advertise` (no clear
+    // form). Applies to builtin and custom agents alike; runtime agents never reach it with this
+    // key (see `runtime_agent_overrides`).
+    apply_field_full_replace(&mut agent.advertise, &delta.advertise, None, |v| Some(*v));
     apply_output_override(agent, &delta.output);
     // pi `defaultReads`/`false` -> `delete next.defaultReads` (agents.ts:1261), i.e. `None` ("the
     // agent declared no default reads"), NOT an empty list.
@@ -2304,6 +2310,62 @@ mod tests {
         assert_eq!(worker.fast, Some(true));
     }
 
+    /// SUBA-157 — `agentOverrides.<name>.advertise` (pi `agents.ts:1500` @ad11b7ab) opts a BUNDLED
+    /// agent into the parent's `<advertised_subagents>` catalog without editing its file, and a
+    /// `false` opts a custom agent whose frontmatter said `advertise: true` back out. Mutation
+    /// killed: dropping the apply arm (the builtin stays unlisted, the custom one stays listed) or
+    /// the provenance key (`fields` lacks `advertise`).
+    #[test]
+    fn advertise_override_opts_a_builtin_in_and_a_custom_agent_out() {
+        let mut merged = HashMap::new();
+        merged.insert(
+            "reviewer".to_string(),
+            agent("reviewer", AgentSource::Builtin, "/b/reviewer.md"),
+        );
+        let mut custom = agent("scout", AgentSource::Project, "/p/scout.md");
+        custom.advertise = Some(true);
+        merged.insert("scout".to_string(), custom);
+        let mut overrides = BTreeMap::new();
+        overrides.insert(
+            "reviewer".to_string(),
+            AgentOverrideConfig {
+                advertise: OverrideField::Value(true),
+                ..Default::default()
+            },
+        );
+        overrides.insert(
+            "scout".to_string(),
+            AgentOverrideConfig {
+                advertise: OverrideField::Value(false),
+                ..Default::default()
+            },
+        );
+        let settings = user_scope(SubagentSettings {
+            overrides,
+            ..SubagentSettings::default()
+        });
+        apply_overrides(&mut merged, &settings).expect("apply succeeds");
+
+        let reviewer = merged.get("reviewer").expect("present");
+        assert_eq!(reviewer.advertise, Some(true));
+        assert!(
+            reviewer
+                .override_info
+                .as_ref()
+                .expect("override recorded")
+                .fields
+                .contains("advertise")
+        );
+        assert_eq!(merged.get("scout").expect("present").advertise, Some(false));
+
+        let agents: Vec<AgentDefinition> = merged.into_values().collect();
+        let block = crate::discovery::advertised::build_advertised_agent_prompt(&agents, None)
+            .expect("the overridden builtin is advertised");
+        assert!(block.contains("<advertised_subagents>"), "{block}");
+        assert!(block.contains("reviewer"), "{block}");
+        assert!(!block.contains("scout"), "{block}");
+    }
+
     #[test]
     fn custom_agent_project_scope_flips_disabled_set_by_user_scope() {
         let mut merged = HashMap::new();
@@ -2451,6 +2513,8 @@ mod tests {
                     "./tools/child-review.ts".to_string(),
                 ]),
                 description: OverrideField::Value("overridden description".to_string()),
+                // SUBA-157.
+                advertise: OverrideField::Value(true),
                 output: OverrideField::Value("./out/review.md".to_string()),
                 default_reads: OverrideField::Value(vec!["./AGENTS.md".to_string()]),
                 extensions: OverrideField::Value(vec!["./ext/review.ts".to_string()]),
@@ -2512,9 +2576,10 @@ mod tests {
             Some(crate::exec::acceptance::model::AcceptanceRole::Writer)
         );
         let fields = &updated.override_info.as_ref().expect("recorded").fields;
-        for key in ["outputMode", "fast", "acceptanceRole"] {
+        for key in ["outputMode", "fast", "acceptanceRole", "advertise"] {
             assert!(fields.contains(key), "{key} is recorded as applied");
         }
+        assert_eq!(updated.advertise, Some(true));
         assert_eq!(
             updated.default_reads,
             Some(vec![PathBuf::from("./AGENTS.md")])
@@ -3535,6 +3600,35 @@ mod tests {
         assert_eq!(
             agents[0].model_source,
             Some(AgentModelSourceInfo::SettingsDefault)
+        );
+    }
+
+    /// SUBA-157 — a runtime-registered agent is still never advertised: pi's
+    /// `runtimeAgentOverrides` (`agents.ts:1637-1647` @ad11b7ab) keeps only `model`,
+    /// `defaultProvider`, `fast` and `thinking`, so `advertise` never reaches it, and the catalog
+    /// builder drops runtime agents anyway (`advertised-agent-prompt.ts:43`). Mutation killed:
+    /// carrying `advertise` through the narrowing.
+    #[test]
+    fn an_advertise_override_does_not_reach_a_runtime_agent() {
+        let mut agents = vec![runtime_agent("rscout")];
+        let mut overrides = BTreeMap::new();
+        overrides.insert(
+            "rscout".to_string(),
+            AgentOverrideConfig {
+                advertise: OverrideField::Value(true),
+                ..Default::default()
+            },
+        );
+        let settings = user_scope(SubagentSettings {
+            overrides,
+            ..Default::default()
+        });
+        apply_runtime_agent_settings(&mut agents, &settings);
+        assert_eq!(agents[0].advertise, None);
+        assert!(agents[0].override_info.is_none());
+        assert_eq!(
+            crate::discovery::advertised::build_advertised_agent_prompt(&agents, None),
+            None
         );
     }
 

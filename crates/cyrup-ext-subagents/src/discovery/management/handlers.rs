@@ -124,6 +124,12 @@ fn default_inherit_project_context(local_name: &str) -> bool {
 /// settings override so an update writes the agent's own base values, never the override-applied
 /// ones. Settings overrides are inert today (C2), so `override_info` is always `None` and this is a
 /// clone — kept forward-compatible for the moment C2 lands.
+///
+/// SUBA-157 **[CYRUP-DELTA, deliberate]**: `advertise` is restored from the base like every other
+/// field, because `base_snapshot` is the whole pre-override definition. Upstream's
+/// `editableAgentConfig` neither strips nor restores `advertise` (`agent-management.ts:254-333`
+/// @ad11b7ab), so its `update` writes a settings-override `advertise` into the agent file; cyrup
+/// does not, so a value that lives in settings never leaks into the `.md`.
 pub(crate) fn editable_base(target: &AgentDefinition) -> AgentDefinition {
     let mut base = match &target.override_info {
         Some(info) => (*info.base_snapshot).clone(),
