@@ -211,8 +211,54 @@ pub fn list_profiles(profiles_dir: &Path) -> Result<Vec<String>, SubagentError> 
 pub fn load_profile(profiles_dir: &Path, name: &str) -> Result<NamedProfile, SubagentError> {
     let path = profile_path(profiles_dir, name)?;
     let text = std::fs::read_to_string(&path).map_err(SubagentError::Spawn)?;
-    serde_json::from_str(&text)
+    let mut raw: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|e| SubagentError::MalformedSettings(format!("profile {name:?}: {e}")))?;
+    validate_profile_machines(&path, &mut raw)?;
+    serde_json::from_value(raw)
         .map_err(|e| SubagentError::MalformedSettings(format!("profile {name:?}: {e}")))
+}
+
+/// SUBA-173 — the `machine` half of pi `validateSubagentProfile` (`src/profiles/profiles.ts:148-150`
+/// @ad11b7ab): every override's stated `machine` (anything but absent or `false`) goes through
+/// `validateOptionalMachine` (`src/agents/agents.ts:1012-1019`), labelled
+/// `Profile '<file>' has invalid machine for '<name>'`, and the trimmed value replaces the raw one.
+/// It runs inside [`load_profile`], which both `/subagents-load-profile` and
+/// `/subagents-check-profile` call before anything else, so a bad value is refused when the
+/// profile is loaded or checked, before any settings are written; `machine: false` (clear the pin)
+/// passes untouched.
+fn validate_profile_machines(
+    path: &Path,
+    raw: &mut serde_json::Value,
+) -> Result<(), SubagentError> {
+    let Some(overrides) = raw
+        .get_mut("subagents")
+        .and_then(|subagents| subagents.get_mut("agentOverrides"))
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return Ok(());
+    };
+    for (agent, value) in overrides.iter_mut() {
+        let Some(entry) = value.as_object_mut() else {
+            continue;
+        };
+        let Some(machine) = entry.get_mut("machine") else {
+            continue;
+        };
+        if *machine == serde_json::Value::Bool(false) {
+            continue;
+        }
+        let label = format!(
+            "Profile '{}' has invalid machine for '{agent}'",
+            path.display()
+        );
+        if let Some(trimmed) =
+            crate::placement::resolve::validate_optional_machine(Some(machine), &label)
+                .map_err(SubagentError::MalformedSettings)?
+        {
+            *machine = serde_json::Value::String(trimmed);
+        }
+    }
+    Ok(())
 }
 
 // =================================================================================================
@@ -1649,6 +1695,119 @@ mod tests {
         std::fs::write(&settings_path, "[1, 2, 3]").expect("seed array settings");
         let result = apply_profile_to_settings_file(&settings_path, &NamedProfile::default());
         assert!(matches!(result, Err(SubagentError::MalformedSettings(_))));
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // SUBA-173: a profile's `machine` is validated on load (pi validateSubagentProfile)
+    // -----------------------------------------------------------------------------------------
+
+    /// `/subagents-load-profile`'s order (`extension/host/profiles.rs::load_profile_into_settings`):
+    /// load, and apply only a profile that loaded.
+    fn load_then_apply(
+        profiles_dir: &Path,
+        name: &str,
+        settings_path: &Path,
+    ) -> Result<(), SubagentError> {
+        let profile = load_profile(profiles_dir, name)?;
+        apply_profile_to_settings_file(settings_path, &profile)
+    }
+
+    fn machine_profile(dir: &Path, name: &str, machine: &serde_json::Value) {
+        let body = serde_json::json!({
+            "subagents": { "agentOverrides": { "worker": { "model": "m", "machine": machine } } }
+        });
+        std::fs::write(dir.join(format!("{name}.json")), body.to_string()).expect("write profile");
+    }
+
+    const SEEDED_SETTINGS: &str =
+        r#"{ "subagents": { "agentOverrides": { "worker": { "machine": "old-box" } } } }"#;
+
+    /// pi `validateSubagentProfile` (`src/profiles/profiles.ts:148-150` @ad11b7ab): a blank,
+    /// oversized or control-character `machine` refuses the profile with upstream's label and the
+    /// settings file is left byte-for-byte as it was. Red before: `load_profile` only serde-parsed,
+    /// so each of these was written into settings.
+    #[test]
+    fn an_invalid_profile_machine_is_refused_before_settings_are_written() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let settings_path = tmp.path().join("settings.json");
+        std::fs::write(&settings_path, SEEDED_SETTINGS).expect("seed settings");
+        let cases = [
+            (
+                serde_json::json!("   "),
+                "must be a non-empty string or false.",
+            ),
+            (
+                serde_json::json!("x".repeat(129)),
+                "must be 128 characters or fewer.",
+            ),
+            (
+                serde_json::json!("gpu\u{7}box"),
+                "contains control characters.",
+            ),
+            (
+                serde_json::json!(true),
+                "must be a non-empty string or false.",
+            ),
+        ];
+        for (index, (machine, tail)) in cases.iter().enumerate() {
+            let name = format!("bad{index}");
+            machine_profile(tmp.path(), &name, machine);
+            let err = load_then_apply(tmp.path(), &name, &settings_path)
+                .expect_err("an invalid machine must refuse the profile");
+            assert!(
+                matches!(err, SubagentError::MalformedSettings(_)),
+                "expected MalformedSettings, got {err:?}"
+            );
+            let expected = format!(
+                "malformed subagents settings: Profile '{}' has invalid machine for 'worker' {tail}",
+                tmp.path().join(format!("{name}.json")).display()
+            );
+            assert_eq!(err.to_string(), expected, "machine {machine}");
+            assert_eq!(
+                std::fs::read_to_string(&settings_path).expect("read"),
+                SEEDED_SETTINGS,
+                "settings must be untouched for machine {machine}"
+            );
+        }
+    }
+
+    /// `machine: false` still clears the pin: it passes validation untouched and replaces the
+    /// on-disk string machine, which the SUBA-100 carry would otherwise keep.
+    #[test]
+    fn a_false_profile_machine_still_clears_the_pin() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let settings_path = tmp.path().join("settings.json");
+        std::fs::write(&settings_path, SEEDED_SETTINGS).expect("seed settings");
+        machine_profile(tmp.path(), "unpin", &serde_json::json!(false));
+
+        load_then_apply(tmp.path(), "unpin", &settings_path).expect("false is valid");
+
+        let written: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings_path).expect("read"))
+                .expect("parse");
+        assert_eq!(
+            written["subagents"]["agentOverrides"]["worker"]["machine"],
+            serde_json::json!(false)
+        );
+    }
+
+    /// A valid name is applied, trimmed as `validateOptionalMachine` returns it.
+    #[test]
+    fn a_valid_profile_machine_is_applied_trimmed() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let settings_path = tmp.path().join("settings.json");
+        std::fs::write(&settings_path, SEEDED_SETTINGS).expect("seed settings");
+        machine_profile(tmp.path(), "gpu", &serde_json::json!("  gpu-box  "));
+
+        load_then_apply(tmp.path(), "gpu", &settings_path).expect("a valid machine applies");
+
+        let written: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings_path).expect("read"))
+                .expect("parse");
+        assert_eq!(
+            written["subagents"]["agentOverrides"]["worker"]["machine"],
+            serde_json::json!("gpu-box")
+        );
     }
 
     // -----------------------------------------------------------------------------------------
