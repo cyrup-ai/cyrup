@@ -4334,3 +4334,194 @@ async fn an_empty_agent_name_in_a_tasks_item_is_refused_by_the_dispatcher() {
         );
     }
 }
+
+/// SUBA-160 — pi `resumeAsyncRun` refuses an oversized `timeoutMs` right after its
+/// `requires message` check (`runs/foreground/subagent-executor.ts:1917-1933` @ad11b7ab), before
+/// the run is looked up; the bound itself passes through to the lookup.
+#[tokio::test]
+async fn resume_refuses_a_timeout_above_the_timer_delay_cap() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let tool = scoped_tool(dir.path()).await;
+    let resume = |extra: serde_json::Value| {
+        let tool = &tool;
+        async move {
+            let mut params = serde_json::json!({ "action": "resume", "id": "run00000000" });
+            for (key, value) in extra.as_object().expect("object") {
+                params[key] = value.clone();
+            }
+            dispatch_tool(tool, params)
+                .await
+                .expect_err("no such run, so every call here is refused")
+                .to_string()
+        }
+    };
+
+    assert_eq!(
+        resume(serde_json::json!({ "message": "go on", "timeoutMs": 2_147_483_648_u64 })).await,
+        "timeoutMs must be a positive integer no larger than 2147483647."
+    );
+    // Upstream's message check comes first.
+    assert_eq!(
+        resume(serde_json::json!({ "timeoutMs": 2_147_483_648_u64 })).await,
+        "action='resume' requires message."
+    );
+    // ...and the overflow check precedes the attach-chain acceptance check (`:1926` vs `:1940`).
+    assert_eq!(
+        resume(serde_json::json!({
+            "timeoutMs": 2_147_483_648_u64,
+            "chain": [{ "agent": "worker", "task": "t", "acceptance": { "bogus": 1 } }]
+        }))
+        .await,
+        "timeoutMs must be a positive integer no larger than 2147483647."
+    );
+    let at_the_bound =
+        resume(serde_json::json!({ "message": "go on", "timeoutMs": 2_147_483_647_u64 })).await;
+    assert!(
+        !at_the_bound.contains("no larger than"),
+        "the bound itself is accepted: {at_the_bound}"
+    );
+}
+
+/// SUBA-160 — an agent's frontmatter `timeoutMs` above `MAX_TIMER_DELAY_MS` refuses a SINGLE
+/// launch. Upstream's `applySingleAgentLaunchDefaults` (`runs/foreground/subagent-executor.ts:
+/// 2949-2951` @ad11b7ab, applied at `:7423`) copies the agent's `defaultTimeoutMs` into
+/// `params.timeoutMs` when the call set neither alias, so `resolveForegroundTimeout`'s overflow
+/// check (`:3028`) refuses it under the name `timeoutMs`. A call-site value still outranks the
+/// agent's, exactly as the copy is skipped when either alias is set.
+#[tokio::test]
+async fn an_agent_frontmatter_timeout_above_the_timer_delay_cap_refuses_a_single_launch() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let project_agents = dir.path().join(".cyrup").join("agents");
+    std::fs::create_dir_all(&project_agents).expect("mkdir");
+    std::fs::write(
+        project_agents.join("slowpoke.md"),
+        "---\nname: slowpoke\ndescription: d\ntimeoutMs: 2147483648\n---\n\nBody\n",
+    )
+    .expect("write slowpoke");
+    let tool = scoped_tool(dir.path()).await;
+
+    for extra in [
+        serde_json::json!({}),
+        serde_json::json!({ "async": true }),
+        serde_json::json!({ "async": false }),
+    ] {
+        let mut params = serde_json::json!({ "agent": "slowpoke", "task": "do it" });
+        for (key, value) in extra.as_object().expect("object") {
+            params[key] = value.clone();
+        }
+        let refused = dispatch_tool(&tool, params)
+            .await
+            .expect_err("the agent's oversized timeoutMs must refuse the launch")
+            .to_string();
+        assert_eq!(
+            refused, "timeoutMs must be a positive integer no larger than 2147483647.",
+            "extra params: {extra}"
+        );
+    }
+}
+
+/// SUBA-163 — a foreground workflow that THROWS after one `runs.run` returns upstream's failure
+/// details, `{ mode: "workflow", runId, results: workflowDetailsResults(partial.children) }`
+/// (`runs/foreground/subagent-executor.ts:6657` @ad11b7ab), carried in cyrup's own `children`
+/// shape, so `/subagent-cost` still counts the child that ran before the throw. Before SUBA-163 the
+/// failure arm folded its settlement onto `{}`, which `collect_subagent_cost` reads as no details at
+/// all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_foreground_workflow_keeps_its_partial_children_for_subagent_cost() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    // A child that settles cleanly with one assistant turn carrying real usage.
+    let script = dir.path().join("usage-child.sh");
+    std::fs::write(
+        &script,
+        "#!/bin/sh\n\
+printf '%s\\n' '{\"type\":\"agent_start\"}'\n\
+printf '%s\\n' '{\"type\":\"message_end\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"done\"}],\"usage\":{\"input\":10,\"output\":20,\"cacheRead\":0,\"cacheWrite\":0,\"totalTokens\":30,\"cost\":{\"input\":0.1,\"output\":0.2,\"cacheRead\":0,\"cacheWrite\":0,\"total\":0.3}},\"stopReason\":\"stop\",\"timestamp\":0}}'\n\
+printf '%s\\n' '{\"type\":\"agent_settled\"}'\n\
+exit 0\n",
+    )
+    .expect("write the usage child");
+    std::fs::set_permissions(
+        &script,
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+    )
+    .expect("make the usage child executable");
+
+    let executor = Arc::new(SubagentExecutor::new());
+    arm_scoped_missions(&executor, dir.path()).await;
+    {
+        let mut cfg = executor.config_cell().lock().await;
+        cfg.spawn_command = Some(crate::spawn::SpawnCommand {
+            binary: script,
+            base_args: Vec::new(),
+        });
+    }
+    let tool = SubagentTool::new(executor.clone(), dir.path().to_path_buf());
+
+    let error = dispatch_tool(
+        &tool,
+        serde_json::json!({
+            "workflow": workflow_script_path(
+                "await runs.run(\"a\", { agent: \"worker\", task: \"T\", model: \"sonnet\" });\n\
+                 throw new Error(\"boom after one run\");"
+            )
+        }),
+    )
+    .await
+    .expect_err("a script that throws must fail the call");
+    assert!(error.to_string().contains("boom after one run"), "{error}");
+
+    let details = error
+        .details
+        .clone()
+        .expect("the failure arm returns its settlement details");
+    assert_eq!(details["mode"], "workflow", "{details}");
+    let children = details["children"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the partial children ride on the details: {details}"));
+    assert_eq!(children.len(), 1, "{details}");
+    assert_eq!(children[0]["key"], "a", "{details}");
+    let results = children[0]["results"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the child keeps its per-round results: {details}"));
+    assert_eq!(results.len(), 1, "{details}");
+    assert_eq!(results[0]["agent"], "worker", "{details}");
+
+    // The persisted tool result, exactly as the session would hold it, through the real collector.
+    let entry: cyrup_session::Entry = serde_json::from_value(serde_json::json!({
+        "type": "message",
+        "id": "w0000001",
+        "parentId": null,
+        "timestamp": "2026-01-01T00:00:00.000Z",
+        "message": {
+            "role": "toolResult",
+            "toolCallId": "call-w0000001",
+            "toolName": "subagent",
+            "content": [{ "type": "text", "text": error.to_string() }],
+            "details": details,
+            "isError": true,
+            "timestamp": 2,
+        },
+    }))
+    .expect("a valid session entry");
+    let async_root = dir.path().join("async");
+    let report = crate::registration::cost::collect_subagent_cost(
+        [&entry],
+        &crate::registration::cost::SubagentCostSources {
+            session_file: None,
+            cwd: dir.path(),
+            base_cwd: dir.path(),
+            artifact_dir_preference: crate::artifacts::ArtifactDirPreference::Project,
+            async_root: &async_root,
+        },
+    )
+    .await;
+    assert_eq!(report.children.len(), 1, "{report:?}");
+    assert_eq!(
+        report.children[0].agent.as_deref(),
+        Some("worker"),
+        "{report:?}"
+    );
+    assert_eq!(report.child_total.input, 10, "{report:?}");
+    assert_eq!(report.child_total.output, 20, "{report:?}");
+    assert_eq!(report.unresolved_async_children, 0, "{report:?}");
+}

@@ -114,26 +114,42 @@ fn token_usage(value: Option<&Value>) -> Option<u64> {
         .then(|| total.unsigned_abs())
 }
 
-/// pi `readLinkedRun` (`goal-driver.ts:30-49`): re-read a linked run's `status.json` and project
-/// its `state` (plus a `completedAt` stamp and any token total) back onto the run link.
+/// pi `readLinkedRun` (`goal-driver.ts:30-55` @ad11b7ab): re-read a linked run's `status.json`
+/// and project its `state` (plus a `completedAt` stamp and any token total) back onto the run link.
 ///
-/// Upstream THROWS when the file exists but is missing `state`; that propagates out of
-/// `collectGoalContinuationNotices` to `extension/index.ts:598`'s catch, which logs and abandons
-/// the whole scan. This reproduces that (an `Err` from here aborts the scan), because the
-/// alternative — silently treating a malformed status as "no change" — would let a live run look
-/// idle and generate a spurious continuation notice.
+/// A missing `status.json` leaves the link unchanged (`:33`). One that exists but cannot be read,
+/// or does not parse, is an `Err` naming its path (`Failed to read linked run status '<path>': …`,
+/// `:34-39`), as is a non-object (`:40`) or a missing `state` (`:42`) — never a silent "no change",
+/// which would let a live run look idle and generate a spurious continuation notice. The error is
+/// scoped to its own mission: [`collect_goal_continuation_notices`] reports it and moves on to the
+/// next goal mission (`goal-driver.ts:141-173`).
 fn read_linked_run(run: &MissionRunLink) -> MissionResult<MissionRunLink> {
     let Some(async_dir) = run.async_dir.as_deref() else {
         return Ok(run.clone());
     };
     let status_path = Path::new(async_dir).join("status.json");
+    // pi `fs.existsSync` (`:33`): a status that cannot be found — absent, or not even stat-able —
+    // leaves the link as it is. `Path::exists` is the same test (`false` on any stat error).
     if !status_path.exists() {
         return Ok(run.clone());
     }
-    let raw = std::fs::read_to_string(&status_path)
-        .map_err(|err| super::MissionError::io(&status_path, err))?;
-    let status: Value =
-        serde_json::from_str(&raw).map_err(|err| super::MissionError::invalid(err.to_string()))?;
+    // pi `:34-39`: ONE `try` covers both the read and the parse, so a status that exists but
+    // cannot be read (a directory, a permission error) gets the same wrapper as one that does not
+    // parse.
+    let wrap = |err: &dyn std::fmt::Display| {
+        super::MissionError::invalid(format!(
+            "Failed to read linked run status '{}': {err}",
+            status_path.display()
+        ))
+    };
+    let raw = std::fs::read_to_string(&status_path).map_err(|err| wrap(&err))?;
+    let status: Value = serde_json::from_str(&raw).map_err(|err| wrap(&err))?;
+    if !status.is_object() {
+        return Err(super::MissionError::invalid(format!(
+            "Linked run status '{}' must be an object",
+            status_path.display()
+        )));
+    }
     let state = status
         .get("state")
         .and_then(Value::as_str)
@@ -468,7 +484,11 @@ fn next_ready_action(
     })
 }
 
-/// pi `collectGoalContinuationNotices` (`goal-driver.ts:118-162`) — the turn-end scan.
+/// pi `collectGoalContinuationNotices`'s `onError(missionId, error)` (`goal-driver.ts:133`
+/// @ad11b7ab): told about each goal mission the scan could not evaluate.
+pub type OnGoalMissionError<'a> = &'a mut dyn FnMut(&str, &super::MissionError);
+
+/// pi `collectGoalContinuationNotices` (`goal-driver.ts:127-175` @ad11b7ab) — the turn-end scan.
 ///
 /// A mission produces a notice only if ALL of the following hold: it is owned by
 /// `owner_session_id`, it has a `goal`, its status is not terminal, its goal status is `active`
@@ -479,17 +499,26 @@ fn next_ready_action(
 /// turn, so a mission that stays idle across turns raises a fresh, non-deduplicated notice each
 /// time rather than being suppressed after the first.
 ///
-/// # Errors
-///
-/// Propagates any failure from reading/refreshing a mission or its linked run statuses. Upstream's
-/// caller (`extension/index.ts:597-599`) catches and logs; so does this port's call site.
+/// Each mission is evaluated on its own (`try { … } catch (error) { onError(listed.id, error) }`,
+/// `:141-173`): a mission whose record, linked run status or state file cannot be read is handed
+/// to `on_error` with its id, and the scan continues with the next one, so one damaged mission
+/// never silences the notices of the healthy ones. `None` takes upstream's default `onError`
+/// (`:137`), which logs `Failed to evaluate goal mission <id>`.
 pub fn collect_goal_continuation_notices(
     location: &MissionStoreLocation,
     owner_session_id: &str,
     retained_children: &[RetainedChild],
     turn_id: u64,
     now: Option<i64>,
-) -> MissionResult<Vec<GoalContinuationNotice>> {
+    on_error: Option<OnGoalMissionError<'_>>,
+) -> Vec<GoalContinuationNotice> {
+    let mut default_on_error = |mission_id: &str, err: &super::MissionError| {
+        tracing::warn!("Failed to evaluate goal mission {mission_id}: {err}");
+    };
+    let on_error: OnGoalMissionError<'_> = match on_error {
+        Some(on_error) => on_error,
+        None => &mut default_on_error,
+    };
     let mut notices = Vec::new();
     let mut seen = std::collections::BTreeSet::new();
     for listed in list_missions(location).records {
@@ -499,86 +528,112 @@ pub fn collect_goal_continuation_notices(
         {
             continue;
         }
-        let mut record = refresh_goal_mission(location, read_mission(location, &listed.id)?)?;
-        let Some(goal) = record.goal else { continue };
-        if goal.status != MissionGoalStatus::Active {
-            continue;
+        match evaluate_goal_mission(
+            location,
+            &listed.id,
+            retained_children,
+            turn_id,
+            now,
+            &mut seen,
+        ) {
+            Ok(Some(notice)) => notices.push(notice),
+            Ok(None) => {}
+            Err(err) => on_error(&listed.id, &err),
         }
-        let Some(budget) = record.budget else {
-            continue;
-        };
-        if record.usage.map_or(0, |u| u.tokens) >= budget.tokens {
-            // A no-op update whose sole purpose is to re-run `updateMission`'s budget-exhaustion
-            // transition and persist it (`goal-driver.ts:132`).
-            record = update_mission(
-                location,
-                &record.id,
-                &MissionUpdateInput {
-                    usage: Some(record.usage.unwrap_or(MissionTokenUsage { tokens: 0 })),
-                    ..Default::default()
-                },
-                crate::time::now_epoch_millis(),
-                None,
-            )?;
-            if record.goal.map(|g| g.status) == Some(MissionGoalStatus::BudgetExhausted) {
-                continue;
-            }
-        }
-        if record.runs.iter().any(|run| {
-            run.status
-                .as_deref()
-                .is_some_and(|s| ACTIVE_RUN_STATUSES.contains(&s))
-        }) {
-            continue;
-        }
-        let Some(budget) = record.budget else {
-            continue;
-        };
-        if !seen.insert(record.id.clone()) {
-            continue;
-        }
-        let budget_tokens = budget.tokens;
-        let used = record.usage.map_or(0, |u| u.tokens);
-        let remaining = budget_tokens.saturating_sub(used);
-        let message = [
-            format!(
-                "Goal mission needs attention: {}",
-                truncate_display(&record.title)
-            ),
-            format!("Mission: {}", record.id),
-            format!("Remaining budget: {remaining} tokens ({used}/{budget_tokens} used)"),
-            format!(
-                "Next ready action: {}",
-                next_ready_action(location, &record, retained_children)?
-            ),
-        ]
-        .join("\n");
-        notices.push(GoalContinuationNotice {
-            mission_id: record.id.clone(),
-            event: crate::exec::control::ControlEvent {
-                event_type: crate::registration::ControlEventType::NeedsAttention,
-                from: None,
-                to: crate::background::ActivityState::NeedsAttention,
-                ts: now.unwrap_or_else(crate::time::now_epoch_millis),
-                run_id: format!("goal-{}-turn-{turn_id}", record.id),
-                agent: "goal mission".to_string(),
-                index: None,
-                message: message.clone(),
-                reason: Some(crate::exec::control::ControlEventReason::Idle),
-                turns: None,
-                tokens: None,
-                tool_count: None,
-                current_tool: None,
-                tool_call_id: None,
-                current_tool_duration_ms: None,
-                current_path: None,
-                elapsed_ms: None,
-                recent_failure_summary: None,
-            },
-            message,
-        });
     }
-    Ok(notices)
+    notices
+}
+
+/// The body of upstream's per-mission `try` block (`goal-driver.ts:142-170` @ad11b7ab): `Ok(None)`
+/// for each `continue`, `Err` for whatever the caller hands to `onError`.
+fn evaluate_goal_mission(
+    location: &MissionStoreLocation,
+    mission_id: &str,
+    retained_children: &[RetainedChild],
+    turn_id: u64,
+    now: Option<i64>,
+    seen: &mut std::collections::BTreeSet<String>,
+) -> MissionResult<Option<GoalContinuationNotice>> {
+    let mut record = refresh_goal_mission(location, read_mission(location, mission_id)?)?;
+    let Some(goal) = record.goal else {
+        return Ok(None);
+    };
+    if goal.status != MissionGoalStatus::Active {
+        return Ok(None);
+    }
+    let Some(budget) = record.budget else {
+        return Ok(None);
+    };
+    if record.usage.map_or(0, |u| u.tokens) >= budget.tokens {
+        // A no-op update whose sole purpose is to re-run `updateMission`'s budget-exhaustion
+        // transition and persist it (`goal-driver.ts:145`).
+        record = update_mission(
+            location,
+            &record.id,
+            &MissionUpdateInput {
+                usage: Some(record.usage.unwrap_or(MissionTokenUsage { tokens: 0 })),
+                ..Default::default()
+            },
+            crate::time::now_epoch_millis(),
+            None,
+        )?;
+        if record.goal.map(|g| g.status) == Some(MissionGoalStatus::BudgetExhausted) {
+            return Ok(None);
+        }
+    }
+    if record.runs.iter().any(|run| {
+        run.status
+            .as_deref()
+            .is_some_and(|s| ACTIVE_RUN_STATUSES.contains(&s))
+    }) {
+        return Ok(None);
+    }
+    let Some(budget) = record.budget else {
+        return Ok(None);
+    };
+    if !seen.insert(record.id.clone()) {
+        return Ok(None);
+    }
+    let budget_tokens = budget.tokens;
+    let used = record.usage.map_or(0, |u| u.tokens);
+    let remaining = budget_tokens.saturating_sub(used);
+    let message = [
+        format!(
+            "Goal mission needs attention: {}",
+            truncate_display(&record.title)
+        ),
+        format!("Mission: {}", record.id),
+        format!("Remaining budget: {remaining} tokens ({used}/{budget_tokens} used)"),
+        format!(
+            "Next ready action: {}",
+            next_ready_action(location, &record, retained_children)?
+        ),
+    ]
+    .join("\n");
+    Ok(Some(GoalContinuationNotice {
+        mission_id: record.id.clone(),
+        event: crate::exec::control::ControlEvent {
+            event_type: crate::registration::ControlEventType::NeedsAttention,
+            from: None,
+            to: crate::background::ActivityState::NeedsAttention,
+            ts: now.unwrap_or_else(crate::time::now_epoch_millis),
+            run_id: format!("goal-{}-turn-{turn_id}", record.id),
+            agent: "goal mission".to_string(),
+            index: None,
+            message: message.clone(),
+            reason: Some(crate::exec::control::ControlEventReason::Idle),
+            turns: None,
+            tokens: None,
+            tool_count: None,
+            current_tool: None,
+            tool_call_id: None,
+            current_tool_duration_ms: None,
+            current_path: None,
+            elapsed_ms: None,
+            recent_failure_summary: None,
+        },
+        message,
+    }))
 }
 
 #[cfg(test)]
@@ -630,8 +685,7 @@ mod tests {
         let loc = location(tmp.path());
         let record = goal_mission(&loc, "Ship the parser", 1000, "sess-1");
 
-        let notices =
-            collect_goal_continuation_notices(&loc, "sess-1", &[], 7, Some(12_345)).unwrap();
+        let notices = collect_goal_continuation_notices(&loc, "sess-1", &[], 7, Some(12_345), None);
         assert_eq!(notices.len(), 1);
         let notice = &notices[0];
         assert_eq!(notice.mission_id, record.id);
@@ -667,8 +721,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let loc = location(tmp.path());
         let record = goal_mission(&loc, "Repeat", 1000, "sess-1");
-        let first = collect_goal_continuation_notices(&loc, "sess-1", &[], 1, Some(0)).unwrap();
-        let second = collect_goal_continuation_notices(&loc, "sess-1", &[], 2, Some(0)).unwrap();
+        let first = collect_goal_continuation_notices(&loc, "sess-1", &[], 1, Some(0), None);
+        let second = collect_goal_continuation_notices(&loc, "sess-1", &[], 2, Some(0), None);
         assert_eq!(first[0].event.run_id, format!("goal-{}-turn-1", record.id));
         assert_eq!(second[0].event.run_id, format!("goal-{}-turn-2", record.id));
         assert_ne!(first[0].event.run_id, second[0].event.run_id);
@@ -706,9 +760,7 @@ mod tests {
         .unwrap();
 
         assert!(
-            collect_goal_continuation_notices(&loc, "sess-1", &[], 1, Some(0))
-                .unwrap()
-                .is_empty()
+            collect_goal_continuation_notices(&loc, "sess-1", &[], 1, Some(0), None).is_empty()
         );
     }
 
@@ -733,9 +785,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            collect_goal_continuation_notices(&loc, "sess-1", &[], 1, Some(0))
-                .unwrap()
-                .is_empty()
+            collect_goal_continuation_notices(&loc, "sess-1", &[], 1, Some(0), None).is_empty()
         );
     }
 
@@ -766,9 +816,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            collect_goal_continuation_notices(&loc, "sess-1", &[], 1, Some(0))
-                .unwrap()
-                .is_empty()
+            collect_goal_continuation_notices(&loc, "sess-1", &[], 1, Some(0), None).is_empty()
         );
         let after = read_mission(&loc, &record.id).unwrap();
         assert_eq!(
@@ -804,9 +852,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            collect_goal_continuation_notices(&loc, "sess-1", &[], 1, Some(0))
-                .unwrap()
-                .is_empty()
+            collect_goal_continuation_notices(&loc, "sess-1", &[], 1, Some(0), None).is_empty()
         );
     }
 
@@ -841,9 +887,7 @@ mod tests {
         // While the status file says running, nothing is raised…
         std::fs::write(async_dir.join("status.json"), r#"{"state":"running"}"#).unwrap();
         assert!(
-            collect_goal_continuation_notices(&loc, "sess-1", &[], 1, Some(0))
-                .unwrap()
-                .is_empty()
+            collect_goal_continuation_notices(&loc, "sess-1", &[], 1, Some(0), None).is_empty()
         );
         // …and once it settles, the refresh picks it up (and folds in the token total).
         std::fs::write(
@@ -851,7 +895,7 @@ mod tests {
             r#"{"state":"complete","totalTokens":{"total":42}}"#,
         )
         .unwrap();
-        let notices = collect_goal_continuation_notices(&loc, "sess-1", &[], 3, Some(0)).unwrap();
+        let notices = collect_goal_continuation_notices(&loc, "sess-1", &[], 3, Some(0), None);
         assert_eq!(notices.len(), 1);
         assert!(
             notices[0]
@@ -894,7 +938,7 @@ mod tests {
             None,
         )
         .unwrap();
-        let notices = collect_goal_continuation_notices(&loc, "sess-1", &[], 1, Some(0)).unwrap();
+        let notices = collect_goal_continuation_notices(&loc, "sess-1", &[], 1, Some(0), None);
         assert!(
             notices[0]
                 .message
@@ -923,7 +967,7 @@ mod tests {
             None,
         )
         .unwrap();
-        let notices = collect_goal_continuation_notices(&loc, "sess-1", &[], 1, Some(0)).unwrap();
+        let notices = collect_goal_continuation_notices(&loc, "sess-1", &[], 1, Some(0), None);
         assert!(
             notices[0]
                 .message
@@ -958,7 +1002,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(gated.status, MissionStatus::NeedsDecision);
-        let before = collect_goal_continuation_notices(&loc, "sess-1", &[], 1, Some(0)).unwrap();
+        let before = collect_goal_continuation_notices(&loc, "sess-1", &[], 1, Some(0), None);
         assert!(
             before[0]
                 .message
@@ -982,7 +1026,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(resolved.status, MissionStatus::Active);
-        let after = collect_goal_continuation_notices(&loc, "sess-1", &[], 2, Some(0)).unwrap();
+        let after = collect_goal_continuation_notices(&loc, "sess-1", &[], 2, Some(0), None);
         assert!(
             after[0]
                 .message
@@ -1009,7 +1053,7 @@ mod tests {
                 serde_json::json!({"phases": [{"status": "done"}, {"status": "ready", "task": "  write   the   docs  "}]}),
             )
             .unwrap();
-        let notices = collect_goal_continuation_notices(&loc, "sess-1", &[], 1, Some(0)).unwrap();
+        let notices = collect_goal_continuation_notices(&loc, "sess-1", &[], 1, Some(0), None);
         assert!(
             notices[0]
                 .message
@@ -1157,7 +1201,7 @@ mod tests {
             agent: "scout".to_string(),
         }];
         let notices =
-            collect_goal_continuation_notices(&loc, "sess-1", &retained, 1, Some(0)).unwrap();
+            collect_goal_continuation_notices(&loc, "sess-1", &retained, 1, Some(0), None);
         assert!(
             notices[0].message.contains(
                 "Next ready action: Resume retained child child-9 (scout) for: Continue \
@@ -1166,5 +1210,165 @@ mod tests {
             "{}",
             notices[0].message
         );
+    }
+
+    /// Link one run whose `status.json` lives in `<tmp>/async/<run_id>`, and return that file's path.
+    fn link_status_file(
+        tmp: &Path,
+        loc: &MissionStoreLocation,
+        mission_id: &str,
+        run_id: &str,
+        body: &str,
+    ) -> std::path::PathBuf {
+        let async_dir = tmp.join("async").join(run_id);
+        std::fs::create_dir_all(&async_dir).unwrap();
+        update_mission(
+            loc,
+            mission_id,
+            &MissionUpdateInput {
+                add_runs: vec![MissionRunLink {
+                    run_id: run_id.to_string(),
+                    mode: MissionRunMode::Single,
+                    async_dir: Some(async_dir.to_string_lossy().into_owned()),
+                    child_index: None,
+                    agent: None,
+                    status: Some("complete".to_string()),
+                    started_at: None,
+                    completed_at: None,
+                    usage: None,
+                }],
+                ..Default::default()
+            },
+            1,
+            None,
+        )
+        .unwrap();
+        let status_path = async_dir.join("status.json");
+        std::fs::write(&status_path, body).unwrap();
+        status_path
+    }
+
+    /// Run the scan with a recording `on_error`, returning the notices and `(mission id, message)`
+    /// for each reported failure.
+    fn scan_recording_errors(
+        loc: &MissionStoreLocation,
+    ) -> (Vec<GoalContinuationNotice>, Vec<(String, String)>) {
+        let mut errors = Vec::new();
+        let mut record = |mission_id: &str, err: &crate::missions::MissionError| {
+            errors.push((mission_id.to_string(), err.to_string()));
+        };
+        let notices =
+            collect_goal_continuation_notices(loc, "sess-1", &[], 1, Some(0), Some(&mut record));
+        (notices, errors)
+    }
+
+    /// SUBA-169 — pi `collectGoalContinuationNotices` wraps each mission in `try`/`catch` with
+    /// `onError(listed.id, error)` (`goal-driver.ts:141-173` @ad11b7ab): a mission whose linked run
+    /// `status.json` is malformed is reported once, by id, and a healthy goal mission in the SAME
+    /// store still raises its notice. The old port's `?` returned `Err` for the whole scan, so the
+    /// healthy mission was silenced too.
+    #[test]
+    fn a_damaged_goal_mission_is_reported_and_a_healthy_one_still_notifies() {
+        let tmp = tempfile::tempdir().unwrap();
+        let loc = location(tmp.path());
+        let healthy = goal_mission(&loc, "Healthy", 1000, "sess-1");
+        let damaged = goal_mission(&loc, "Damaged", 1000, "sess-1");
+        let status_path = link_status_file(tmp.path(), &loc, &damaged.id, "bad", "{not json");
+
+        let (notices, errors) = scan_recording_errors(&loc);
+
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert_eq!(notices[0].mission_id, healthy.id);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert_eq!(errors[0].0, damaged.id);
+        // pi `readLinkedRun` (`:35-39`) names the file it could not parse.
+        assert!(
+            errors[0].1.contains(&format!(
+                "Failed to read linked run status '{}': ",
+                status_path.display()
+            )),
+            "{}",
+            errors[0].1
+        );
+    }
+
+    /// pi `readLinkedRun` (`goal-driver.ts:33-39` @ad11b7ab) treats a missing `status.json` and an
+    /// unreadable one differently: `existsSync` false leaves the link as it is, while a file that
+    /// exists but fails `readFileSync` lands in the same `try` as a parse failure and gets the same
+    /// `Failed to read linked run status '<path>': ` wrapper. A directory in the file's place fails
+    /// the read even as root.
+    #[test]
+    fn an_unreadable_linked_run_status_is_wrapped_and_a_missing_one_is_not_an_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let loc = location(tmp.path());
+        let missing = goal_mission(&loc, "Missing status", 1000, "sess-1");
+        let unreadable = goal_mission(&loc, "Unreadable status", 1000, "sess-1");
+        let missing_path = link_status_file(tmp.path(), &loc, &missing.id, "gone", "{}");
+        std::fs::remove_file(&missing_path).unwrap();
+        let status_path = link_status_file(tmp.path(), &loc, &unreadable.id, "dir", "{}");
+        std::fs::remove_file(&status_path).unwrap();
+        std::fs::create_dir(&status_path).unwrap();
+
+        let (notices, errors) = scan_recording_errors(&loc);
+
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert_eq!(notices[0].mission_id, missing.id);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert_eq!(errors[0].0, unreadable.id);
+        assert!(
+            errors[0].1.starts_with(&format!(
+                "Failed to read linked run status '{}': ",
+                status_path.display()
+            )),
+            "{}",
+            errors[0].1
+        );
+    }
+
+    /// pi `readLinkedRun` (`goal-driver.ts:40` @ad11b7ab) refuses a status that parses but is not
+    /// an object, naming the path, and that too is scoped to its own mission.
+    #[test]
+    fn a_non_object_linked_run_status_is_reported_with_its_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let loc = location(tmp.path());
+        let healthy = goal_mission(&loc, "Healthy", 1000, "sess-1");
+        let damaged = goal_mission(&loc, "Array status", 1000, "sess-1");
+        let status_path = link_status_file(tmp.path(), &loc, &damaged.id, "arr", "[1]");
+
+        let (notices, errors) = scan_recording_errors(&loc);
+
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert_eq!(notices[0].mission_id, healthy.id);
+        assert_eq!(
+            errors,
+            vec![(
+                damaged.id.clone(),
+                format!(
+                    "Linked run status '{}' must be an object",
+                    status_path.display()
+                )
+            )]
+        );
+    }
+
+    /// A failure AFTER the refresh — here an unreadable `state.json` while building the next ready
+    /// action — is inside upstream's `try` too (`goal-driver.ts:142-170` @ad11b7ab), so it is
+    /// reported and the healthy mission's notice survives.
+    #[test]
+    fn an_unreadable_mission_state_is_scoped_to_its_own_mission() {
+        let tmp = tempfile::tempdir().unwrap();
+        let loc = location(tmp.path());
+        let healthy = goal_mission(&loc, "Healthy", 1000, "sess-1");
+        let damaged = goal_mission(&loc, "Bad state", 1000, "sess-1");
+        let state_path = mission_state_path(&loc, &damaged.id).unwrap();
+        std::fs::create_dir_all(state_path.parent().unwrap()).unwrap();
+        std::fs::write(&state_path, "{").unwrap();
+
+        let (notices, errors) = scan_recording_errors(&loc);
+
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert_eq!(notices[0].mission_id, healthy.id);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert_eq!(errors[0].0, damaged.id);
     }
 }

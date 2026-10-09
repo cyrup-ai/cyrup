@@ -24,7 +24,7 @@ use crate::extension::tool::lane_actions;
 use crate::extension::tool::params::{
     SubagentToolParams, WATCHDOG_MUTATING_ACTION, foreground_timeout_default,
     format_failed_single_run_output, lower_launch_thinking, resolve_execution_agent_scope,
-    resolve_foreground_timeout, validate_execution_acceptance,
+    resolve_foreground_timeout, timer_delay_overflow_error, validate_execution_acceptance,
 };
 use crate::extension::tool::task_items::{
     expand_top_level_task_counts, find_duplicate_parallel_output, normalize_skill_input,
@@ -698,6 +698,19 @@ impl SubagentTool {
         // `extension/executor/background.rs`'s `timeout_ms.unwrap_or(…)`; handing that `unwrap_or`
         // a `Some` on every run would silently retire it — harmless while the two constants agree,
         // a trap the moment either moves.
+        //
+        // SUBA-160 — upstream's `applySingleAgentLaunchDefaults` (`subagent-executor.ts:2949-2951`
+        // @ad11b7ab, applied at `:7423`) copies the agent's `defaultTimeoutMs` INTO
+        // `params.timeoutMs` when the call set neither alias, so `resolveForegroundTimeout`'s
+        // overflow check (`:3028`) sees it and refuses it under the name `timeoutMs`. This port
+        // keeps the agent rung out of `p`, so it is checked here under that same name, ahead of the
+        // ladder, exactly when upstream's copy would have happened.
+        if p.timeout_ms.is_none()
+            && p.max_runtime_ms.is_none()
+            && let Some(error) = timer_delay_overflow_error("timeoutMs", launch_defaults.1)
+        {
+            return Err(ToolError::new(error));
+        }
         let timeout_ms = resolve_foreground_timeout(
             p,
             foreground_timeout_default(background, launch_defaults.1, cfg.timeout_ms.as_ref()),
@@ -2950,6 +2963,23 @@ impl SubagentTool {
                 self.executor.control_dismiss(cwd, target).await
             }
             "resume" => {
+                // SUBA-160 — pi `resumeAsyncRun` refuses an oversized `timeoutMs`
+                // (`subagent-executor.ts:1926-1933` @ad11b7ab) after its `requires message` check
+                // (`:1917-1925`) and BEFORE its model (`:1933`) and acceptance (`:1940`) checks, so
+                // it runs first in this arm: a call with neither message nor chain is left to
+                // `control_resume`'s own `requires message` refusal, and an oversized timeout
+                // outranks a malformed attach-chain acceptance.
+                let has_follow_up = p
+                    .message
+                    .as_deref()
+                    .or(p.task.as_deref())
+                    .is_some_and(|text| !text.trim().is_empty())
+                    || p.chain.as_ref().is_some_and(|chain| !chain.is_empty());
+                if has_follow_up
+                    && let Some(error) = timer_delay_overflow_error("timeoutMs", p.timeout_ms)
+                {
+                    return Err(ToolError::new(error));
+                }
                 // pi `resumeAsyncRun` (`subagent-executor.ts:1456-1469`): a resume may carry an
                 // attach-chain, whose steps' `acceptance` is validated with pi's own prefix before
                 // anything is enqueued (SUBA-N04 — those policies are now really honoured).

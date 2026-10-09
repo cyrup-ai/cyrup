@@ -577,7 +577,15 @@ pub(crate) async fn drive_workflow_run(
                 )
             };
             match settle_foreground_workflow(
-                serde_json::json!({}),
+                // SUBA-163 — upstream's failure details are `{ mode: "workflow", runId,
+                // results: workflowDetailsResults(partial.children) }`
+                // (`src/runs/foreground/subagent-executor.ts:6657` @ad11b7ab), so a failed
+                // workflow's children still reach `/subagent-cost`. Carried as `children`, the
+                // success arm's own shape, which `registration/cost.rs` flattens the same way.
+                serde_json::json!({
+                    "mode": "workflow",
+                    "children": error.partial.children.clone(),
+                }),
                 &status,
                 terminal,
                 &run_dir,

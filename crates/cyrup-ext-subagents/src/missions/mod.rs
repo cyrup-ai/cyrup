@@ -57,7 +57,9 @@ pub use actions::{
     MISSION_ACTIONS, MissionAction, MissionActionContext, MissionActionOutcome,
     MissionActionParams, MissionLaunchInput, handle_mission_action, validate_mission_launch,
 };
-pub use goal_driver::{GoalContinuationNotice, RetainedChild, collect_goal_continuation_notices};
+pub use goal_driver::{
+    GoalContinuationNotice, OnGoalMissionError, RetainedChild, collect_goal_continuation_notices,
+};
 pub use lifecycle::{
     LaunchOutcome, MISSION_BINDING_FILE, MissionLaunchBinding, MissionLaunchParams,
     attach_mission_to_launch_result, prepare_mission_launch, read_mission_binding,

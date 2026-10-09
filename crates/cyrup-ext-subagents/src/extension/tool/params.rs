@@ -557,7 +557,18 @@ pub(crate) fn foreground_timeout_default(
         .or(Some(crate::exec::DEFAULT_FOREGROUND_TIMEOUT_MS))
 }
 
-/// pi `resolveForegroundTimeout` (`runs/foreground/subagent-executor.ts:2689` @v0.57.0).
+/// SUBA-160 — pi `timerDelayOverflowError` (`runs/foreground/subagent-executor.ts:2999-3003`
+/// @ad11b7ab): `Some(<name> must be a positive integer no larger than 2147483647.)` for a value
+/// above [`crate::exec::tool_timeout::MAX_TIMER_DELAY_MS`], else `None`. Upstream applies it in
+/// `resolveForegroundTimeout` (`:3028`), at the workflow launch (`:5459-5463`) and to
+/// `action: "resume"`'s own `timeoutMs` (`:1926-1933`).
+pub(crate) fn timer_delay_overflow_error(name: &str, value: Option<u64>) -> Option<String> {
+    value
+        .is_some_and(|ms| ms > crate::exec::tool_timeout::MAX_TIMER_DELAY_MS)
+        .then(|| crate::exec::tool_timeout::invalid_tool_timeout_message(name))
+}
+
+/// pi `resolveForegroundTimeout` (`runs/foreground/subagent-executor.ts:3017-3036` @ad11b7ab).
 ///
 /// `default_timeout_ms` is applied LAST, so it is reached only when the call supplied neither
 /// `timeoutMs` nor `maxRuntimeMs` — exactly upstream's `rawTimeout === undefined && rawMaxRuntime
@@ -573,6 +584,13 @@ pub(crate) fn resolve_foreground_timeout(
     ] {
         if value == Some(0) {
             return Err(format!("{name} must be a positive integer."));
+        }
+        // SUBA-160 — pi `:3028-3029`, checked per name before the alias clash. Every launch
+        // shape (single, parallel, chain, workflow) resolves its CALL-SITE deadline here; an
+        // agent's frontmatter `timeoutMs` reaches this function only as `default_timeout_ms`, so
+        // single launches check it themselves (`route_single`, `/run`).
+        if let Some(error) = timer_delay_overflow_error(name, value) {
+            return Err(error);
         }
     }
     if let (Some(a), Some(b)) = (p.timeout_ms, p.max_runtime_ms)
@@ -1216,6 +1234,46 @@ mod tests {
                  value for both."
                     .to_string()
             )
+        );
+    }
+
+    /// SUBA-160 — pi `resolveForegroundTimeout` refuses a value above `MAX_TIMER_DELAY_MS` with
+    /// `timerDelayOverflowError`'s sentence (`runs/foreground/subagent-executor.ts:3028-3029`
+    /// @ad11b7ab), per name, before the alias clash; the bound itself is accepted.
+    #[test]
+    fn an_explicit_timeout_above_the_timer_delay_cap_is_refused() {
+        let default = foreground_timeout_default(false, Option::None, Option::None);
+        for name in ["timeoutMs", "maxRuntimeMs"] {
+            assert_eq!(
+                resolve_foreground_timeout(
+                    &params(serde_json::json!({ name: 2_147_483_648_u64 })),
+                    default
+                ),
+                Err(format!(
+                    "{name} must be a positive integer no larger than 2147483647."
+                ))
+            );
+            assert_eq!(
+                resolve_foreground_timeout(&params(serde_json::json!({ name: u64::MAX })), default),
+                Err(format!(
+                    "{name} must be a positive integer no larger than 2147483647."
+                ))
+            );
+            assert_eq!(
+                resolve_foreground_timeout(
+                    &params(serde_json::json!({ name: 2_147_483_647_u64 })),
+                    default
+                ),
+                Ok(Some(2_147_483_647))
+            );
+        }
+        // Checked per name before the alias clash, as upstream's loop is.
+        assert_eq!(
+            resolve_foreground_timeout(
+                &params(serde_json::json!({"timeoutMs": 10, "maxRuntimeMs": 2_147_483_648_u64})),
+                default
+            ),
+            Err("maxRuntimeMs must be a positive integer no larger than 2147483647.".to_string())
         );
     }
 

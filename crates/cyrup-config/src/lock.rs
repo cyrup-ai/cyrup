@@ -335,6 +335,36 @@ pub fn ensure_dir(dir: &Path) -> Result<(), ConfigError> {
 /// Atomically write `bytes` to `path` via temp-file + rename. When `secret`, the file is created
 /// with 0600 permissions and its parent dir as 0700 (R-07-014).
 pub fn write_atomic(path: &Path, bytes: &[u8], secret: bool) -> Result<(), ConfigError> {
+    let mode = secret.then_some(0o600);
+    write_atomic_inner(path, bytes, mode, mode)
+}
+
+/// [`write_atomic`] for a file whose EXISTING mode must survive the rename (SUBA-171): the temp is
+/// created with `mode | 0o200` (so the writer can fill it) and is then set to exactly `mode`
+/// before it is renamed over `path`. `None` behaves like `write_atomic(path, bytes, false)` (the
+/// umask default).
+///
+/// Port of pi-subagents' settings writer (`src/agents/agents.ts:961-972` @ad11b7ab), which passes
+/// `existingMode | 0o200` to the atomic writer's `writeFileSync` and `chmodSync`s the temp to
+/// `existingMode` inside its `renameSync`. The caller stats the old file and resolves symlinks:
+/// this function renames over `path` itself, so `path` must already be the physical target.
+pub fn write_atomic_with_mode(
+    path: &Path,
+    bytes: &[u8],
+    mode: Option<u32>,
+) -> Result<(), ConfigError> {
+    write_atomic_inner(path, bytes, mode.map(|m| m | 0o200), mode)
+}
+
+/// Shared body of [`write_atomic`] and [`write_atomic_with_mode`]: `create_mode` is the temp's
+/// `open(2)` mode (the umask applies), and `final_mode` is set on the temp, exactly, before the
+/// rename.
+fn write_atomic_inner(
+    path: &Path,
+    bytes: &[u8],
+    create_mode: Option<u32>,
+    final_mode: Option<u32>,
+) -> Result<(), ConfigError> {
     let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
     if let Some(parent) = parent {
         ensure_dir(parent)?;
@@ -355,19 +385,19 @@ pub fn write_atomic(path: &Path, bytes: &[u8], secret: bool) -> Result<(), Confi
         opts.create(true).write(true).truncate(true);
         // File modes are a unix concept; elsewhere the file inherits its directory's ACL.
         #[cfg(not(unix))]
-        let _ = secret;
+        let _ = (create_mode, final_mode);
         #[cfg(unix)]
-        if secret {
+        if let Some(mode) = create_mode {
             use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
+            opts.mode(mode);
         }
         let mut f = opts.open(&tmp_path).map_err(|e| io_err(&tmp_path, e))?;
         f.write_all(bytes).map_err(|e| io_err(&tmp_path, e))?;
         f.sync_all().map_err(|e| io_err(&tmp_path, e))?;
         #[cfg(unix)]
-        if secret {
+        if let Some(mode) = final_mode {
             use std::os::unix::fs::PermissionsExt;
-            f.set_permissions(std::fs::Permissions::from_mode(0o600))
+            f.set_permissions(std::fs::Permissions::from_mode(mode))
                 .map_err(|e| io_err(&tmp_path, e))?;
         }
     }
@@ -417,5 +447,44 @@ fn join_failed(target: &Path, join: &tokio::task::JoinError) -> ConfigError {
     ConfigError::LockTaskFailed {
         path: target.to_path_buf(),
         message: join.to_string(),
+    }
+}
+
+#[cfg(all(test, unix))]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn mode_of(path: &Path) -> u32 {
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o7777
+    }
+
+    /// SUBA-171: the stated mode is the file's exact mode after the rename, including a mode with
+    /// no owner-write bit (the temp is created writable, then narrowed).
+    #[test]
+    fn write_atomic_with_mode_gives_the_renamed_file_exactly_that_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        for mode in [0o600, 0o640, 0o444] {
+            let path = dir.path().join(format!("f{mode:o}.json"));
+            write_atomic_with_mode(&path, b"{}\n", Some(mode)).unwrap();
+            assert_eq!(mode_of(&path), mode, "mode {mode:o}");
+            assert_eq!(std::fs::read(&path).unwrap(), b"{}\n");
+        }
+    }
+
+    /// `None` keeps `write_atomic(.., false)`'s umask default, and `write_atomic(.., true)` is
+    /// still 0600: sharing the body changed neither default.
+    #[test]
+    fn write_atomic_defaults_are_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let plain = dir.path().join("plain");
+        let none = dir.path().join("none");
+        let secret = dir.path().join("secret");
+        write_atomic(&plain, b"x", false).unwrap();
+        write_atomic_with_mode(&none, b"x", None).unwrap();
+        write_atomic(&secret, b"x", true).unwrap();
+        assert_eq!(mode_of(&plain), mode_of(&none));
+        assert_eq!(mode_of(&secret), 0o600);
     }
 }

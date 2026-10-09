@@ -449,10 +449,6 @@ impl SubagentsExtension {
                 max: depth.max_depth,
             });
         }
-        self.executor
-            .reserve_subagent_spawns(1, run_cfg.max_subagent_spawns_per_session)
-            .map_err(SubagentError::SpawnLimitExceeded)?;
-
         // G98 / pi `applySingleAgentLaunchDefaults` (`subagent-executor.ts:1930-1947`,
         // applied at `:4927` @v0.43.0). `/run` is pi's SINGLE shape, and upstream reaches it through the SAME
         // `executor.execute` the tool does, so the agent's own `async:`/`timeoutMs:`
@@ -479,6 +475,22 @@ impl SubagentsExtension {
                 &parsed.agent,
                 &self.executor.config_snapshot().await.roots,
             );
+        // SUBA-160 — upstream copies the agent's `defaultTimeoutMs` into `params.timeoutMs`
+        // (`applySingleAgentLaunchDefaults`, `subagent-executor.ts:2949-2951` @ad11b7ab) and
+        // `resolveSingleAgentLaunchTimeout` (`:7558`) then refuses a value above
+        // `MAX_TIMER_DELAY_MS` under that name — after the depth guard (`:7371`) and before the
+        // spawn reservation (`:7719`). `/run` parses no timeout token, so the agent's value is
+        // always the one checked, and the defaults are resolved ahead of the charge for that.
+        if let Some(error) = crate::extension::tool::params::timer_delay_overflow_error(
+            "timeoutMs",
+            default_timeout_ms,
+        ) {
+            return Err(SubagentError::Management(error));
+        }
+        self.executor
+            .reserve_subagent_spawns(1, run_cfg.max_subagent_spawns_per_session)
+            .map_err(SubagentError::SpawnLimitExceeded)?;
+
         let background = parsed.flags.background || default_async.unwrap_or(false);
         if background {
             let run_id = self
