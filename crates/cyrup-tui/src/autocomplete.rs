@@ -162,6 +162,10 @@ pub struct LoginProviderArgument {
     pub id: String,
     pub name: String,
     pub auth_types: Vec<cyrup_config::login::AuthType>,
+    /// `LoginProviderCompletionOption.subscription` (`interactive-mode.ts:368`, set from the
+    /// provider's first row at `:403` @f1b2e77f5) — picks `account` over `subscription` for an OAuth
+    /// sign-in that is not one.
+    pub subscription: Option<bool>,
 }
 
 /// Which completion context produced the active popup.
@@ -505,7 +509,7 @@ fn login_provider_rows(
                 text.push_str(&format!(
                     " {} {}",
                     auth.as_str(),
-                    crate::auth_select::format_auth_selector_provider_type(*auth)
+                    crate::auth_select::format_auth_selector_provider_type(*auth, p.subscription)
                 ));
             }
             text
@@ -524,7 +528,9 @@ fn login_provider_rows(
         let labels: Vec<&str> = provider
             .auth_types
             .iter()
-            .map(|a| crate::auth_select::format_auth_selector_provider_type(*a))
+            .map(|a| {
+                crate::auth_select::format_auth_selector_provider_type(*a, provider.subscription)
+            })
             .collect();
         let joined = labels.join("/");
         // `provider.name === provider.id ? authTypes : `${provider.name} · ${authTypes}`` (`:330`).

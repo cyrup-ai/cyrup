@@ -49,6 +49,7 @@ fn option(
         login_label: None,
         supports_login: true,
         status,
+        subscription: None,
     }
 }
 
@@ -114,8 +115,8 @@ fn login_selector_renders_providers_status_and_borders() {
         "env-var sources render as `env: …`:\n{text}"
     );
     assert!(
-        text.contains("• unconfigured"),
-        "missing unconfigured:\n{text}"
+        text.contains("• not configured"),
+        "missing not configured:\n{text}"
     );
 }
 
@@ -283,8 +284,8 @@ fn mixed_status_options() -> Vec<LoginProviderOption> {
 /// **S21.** `formatStatusIndicator` returns *styled runs*, not one string:
 /// `theme.fg("success", " ✓ configured")` (`oauth-selector.ts:175`),
 /// `theme.fg("muted", " • ") + theme.fg("warning", label)` (`:168`), and
-/// `theme.fg("muted", " • unconfigured")` (`:165`). Routing `/login` through `ListSelector` painted
-/// all three uniformly `muted` (or the whole row `accent` when highlighted).
+/// `theme.fg("muted", " • not configured")` (`:37` @f1b2e77f5). Routing `/login` through
+/// `ListSelector` painted all three uniformly `muted` (or the whole row `accent` when highlighted).
 #[test]
 fn login_status_runs_keep_their_own_colours() {
     let mut app = App::new(TestBackend::new(78, 22), UiTheme::dark()).unwrap();
@@ -309,11 +310,11 @@ fn login_status_runs_keep_their_own_colours() {
         theme.muted_style().fg.unwrap(),
         "the bullet before it stays `muted` (`:168`): {row:?}"
     );
-    let (y, row) = row_with(&app, "• unconfigured");
+    let (y, row) = row_with(&app, "• not configured");
     assert_eq!(
-        fg_at(&app, y, &row, "• unconfigured"),
+        fg_at(&app, y, &row, "• not configured"),
         theme.muted_style().fg.unwrap(),
-        "`• unconfigured` is `muted` (`:165`): {row:?}"
+        "`• not configured` is `muted` (`:37` @f1b2e77f5): {row:?}"
     );
     assert_ne!(
         theme.success_style().fg,
@@ -336,7 +337,7 @@ fn login_row_is_a_single_concatenation_not_a_padded_column() {
     let (_, row) = row_with(&app, "Groq");
     assert_eq!(
         row.trim_end(),
-        "   Groq [API key] • unconfigured",
+        "   Groq [API key] • not configured",
         "one inset column + `\"  \"` prefix + name + badge + status, no padding between them"
     );
     let (_, selected) = row_with(&app, "→ Anthropic");
@@ -503,4 +504,138 @@ fn login_navigation_clamps_at_both_ends_instead_of_wrapping() {
         }
         other => panic!("expected ConfirmSelection, got {other:?}"),
     }
+}
+
+// ================================================================ TUI-141
+
+/// An option carrying pi's `subscription?: boolean` (`oauth-selector.ts:20-24` @f1b2e77f5).
+fn option_sub(
+    id: &str,
+    name: &str,
+    auth_type: AuthType,
+    status: Option<AuthCheck>,
+    subscription: Option<bool>,
+) -> LoginProviderOption {
+    LoginProviderOption {
+        subscription,
+        ..option(id, name, auth_type, status)
+    }
+}
+
+/// TUI-141 — `formatAuthSelectorProviderType(authType, subscription)` (`oauth-selector.ts:27-33`
+/// @f1b2e77f5): `API key` for an API-key row whatever the flag, `account` only for an OAuth row
+/// whose flag is `false`, and `subscription` when it is `true` or unset.
+#[test]
+fn provider_type_label_is_three_way() {
+    use crate::format_auth_selector_provider_type as label;
+    assert_eq!(label(AuthType::ApiKey, None), "API key");
+    assert_eq!(label(AuthType::ApiKey, Some(false)), "API key");
+    assert_eq!(label(AuthType::ApiKey, Some(true)), "API key");
+    assert_eq!(label(AuthType::Oauth, Some(false)), "account");
+    assert_eq!(label(AuthType::Oauth, Some(true)), "subscription");
+    assert_eq!(label(AuthType::Oauth, None), "subscription");
+}
+
+/// TUI-141 — `if (!provider.status) return theme.fg("muted", " • not configured")`
+/// (`oauth-selector.ts:37` @f1b2e77f5; renamed from `unconfigured` by `0f8740bb6`), on every
+/// path that prints it.
+#[test]
+fn no_status_reads_not_configured() {
+    let bare = option("groq", "Groq", AuthType::ApiKey, None);
+    assert_eq!(format_status_indicator(&bare), "• not configured");
+    assert_eq!(
+        crate::status_indicator_runs(&bare),
+        vec![(crate::StatusTone::Muted, " • not configured".to_string())]
+    );
+    assert_eq!(AuthState::Unconfigured.status_text(), "• not configured");
+}
+
+/// TUI-141 — the mismatch label is
+/// `` `${formatAuthSelectorProviderType(provider.status.type, provider.subscription)} configured` ``
+/// (`oauth-selector.ts:39` @f1b2e77f5): an API-key row on an account-backed provider whose stored
+/// credential is OAuth reads `account configured`, an unset flag keeps `subscription configured`,
+/// and an OAuth row over an API-key credential reads `API key configured` whatever the flag.
+#[test]
+fn mismatch_label_is_built_from_the_type_label() {
+    let oauth_stored = || {
+        Some(AuthCheck {
+            auth_type: AuthType::Oauth,
+            source: Some("stored credential".to_string()),
+        })
+    };
+    let account = option_sub(
+        "radius",
+        "Radius",
+        AuthType::ApiKey,
+        oauth_stored(),
+        Some(false),
+    );
+    assert_eq!(format_status_indicator(&account), "• account configured");
+    assert_eq!(
+        crate::status_indicator_runs(&account),
+        vec![
+            (crate::StatusTone::Muted, " • ".to_string()),
+            (crate::StatusTone::Warning, "account configured".to_string()),
+        ]
+    );
+    let unset = option_sub(
+        "anthropic",
+        "Anthropic",
+        AuthType::ApiKey,
+        oauth_stored(),
+        None,
+    );
+    assert_eq!(format_status_indicator(&unset), "• subscription configured");
+    let api_key_stored = option_sub(
+        "radius",
+        "Radius",
+        AuthType::Oauth,
+        Some(AuthCheck {
+            auth_type: AuthType::ApiKey,
+            source: Some("stored credential".to_string()),
+        }),
+        Some(false),
+    );
+    assert_eq!(
+        format_status_indicator(&api_key_stored),
+        "• API key configured"
+    );
+}
+
+/// TUI-141 — the `[…]` badge passes the flag too (`oauth-selector.ts:161` @f1b2e77f5), in the
+/// drawn selector and in the row builder: `[account]` for `Some(false)`, `[subscription]` for
+/// `None`, `[API key]` for an API-key row.
+#[test]
+fn login_selector_badges_an_account_backed_provider_as_account() {
+    let options = vec![
+        option_sub("anthropic", "Anthropic", AuthType::Oauth, None, None),
+        option_sub("radius", "Radius", AuthType::Oauth, None, Some(false)),
+        option_sub("radius", "Radius", AuthType::ApiKey, None, Some(false)),
+    ];
+    let mut app = App::new(TestBackend::new(78, 22), UiTheme::dark()).unwrap();
+    open_oauth(&mut app, OAuthMode::Login, &options);
+    app.draw().unwrap();
+    let text = buf_text(&app);
+    assert!(
+        text.contains("Anthropic [subscription] • not configured"),
+        "an unset flag keeps `[subscription]`:\n{text}"
+    );
+    assert!(
+        text.contains("Radius [account] • not configured"),
+        "`subscription: false` labels the OAuth row `[account]`:\n{text}"
+    );
+    assert!(
+        text.contains("Radius [API key] • not configured"),
+        "an API-key row is `[API key]` whatever the flag:\n{text}"
+    );
+    let rows = login_selector_rows(&options);
+    let labels: Vec<&str> = rows.iter().map(|r| r.1.as_str()).collect();
+    assert_eq!(
+        labels,
+        [
+            "Anthropic [subscription]",
+            "Radius [account]",
+            "Radius [API key]"
+        ]
+    );
 }

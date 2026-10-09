@@ -279,6 +279,13 @@ impl<B: Backend> App<B> {
                         name: crate::provider_display_name(&id),
                         id,
                         auth_types,
+                        // `provider.auth.oauth?.isSubscription === true`
+                        // (`interactive-mode.ts:5798` @f1b2e77f5).
+                        subscription: Some(
+                            auth.oauth
+                                .as_ref()
+                                .is_some_and(|oauth| oauth.is_subscription()),
+                        ),
                     })
                 })
                 .collect();

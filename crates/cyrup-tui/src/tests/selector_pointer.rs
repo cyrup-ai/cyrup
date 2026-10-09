@@ -765,6 +765,7 @@ fn provider(id: &str, name: &str) -> LoginProviderOption {
         login_label: None,
         supports_login: true,
         status: None,
+        subscription: None,
     }
 }
 

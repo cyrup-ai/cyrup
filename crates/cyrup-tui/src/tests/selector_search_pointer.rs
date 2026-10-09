@@ -296,6 +296,7 @@ fn a_press_in_the_provider_search_box_places_the_caret() {
             login_label: None,
             supports_login: true,
             status: None,
+            subscription: None,
         });
     app.open_boxed_selector(
         SelectorKind::Login,
