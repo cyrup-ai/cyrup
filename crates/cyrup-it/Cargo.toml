@@ -79,6 +79,10 @@ cyrup-test-support      = { path = "../cyrup-test-support" }
 # `cyrup-llama`'s fake. Test data with no `[workspace.dependencies]` entry, so a path dep, matching
 # `cyrup-test-support` above.
 cyrup-llama-cpp-wire    = { path = "../cyrup-llama-cpp-wire" }
+# `tests/llama_live/` (EXT-100) drives the REAL `cyrup_llama::client::LlamaClient` and
+# `cyrup_llama::provider::LlamaController` against a real `llama-server`. A dev edge only: the
+# `cyrup` binary already takes it as a normal dependency, so this widens nothing.
+cyrup-llama             = { workspace = true }
 cyrup-core              = { workspace = true }
 # `features = ["faux"]` is REQUIRED, not decorative: `tests/bin/{embedder_seams,embedding,
 # lifecycle,runtime}.rs` build real sessions over `cyrup_provider::faux::FauxProvider`, and the
@@ -142,6 +146,10 @@ async-trait = { workspace = true }
 # is not this crate's call.
 ratatui    = "0.30.2"
 serde_json = { workspace = true }
+# `tests/llama_live/` reads the real `llama-server`'s raw answers (status and bytes, before any
+# cyrup type parses them) to compare them with `cyrup-llama-cpp-wire`'s definitions, and tails its
+# `GET /models/sse` stream. The same client every cyrup HTTP path already links.
+reqwest    = { workspace = true }
 # `tests/subagents/background_cascade_integration.rs` has a generic
 # `read_json<T: serde::de::DeserializeOwned>` helper, so it names the `serde` trait directly rather
 # than going through `serde_json`'s re-exports. It resolved in the source crate because
@@ -243,4 +251,14 @@ required-features = ["it"]
 # report down with them.
 name              = "llama"
 path              = "tests/llama/main.rs"
+required-features = ["it"]
+
+[[test]]
+# EXT-100: the LIVE llama.cpp conformance target. Starts a REAL `llama-server` in router mode
+# (`LLAMA_SERVER_BIN`) over a model directory holding the two test GGUFs (`CYRUP_LLAMA_MODELS_DIR`)
+# and drives cyrup's own client and provider against it. Without both variables every test in it
+# reports SKIPPED on stderr and returns; see the target's module doc for the exact run. Its own
+# target, not a module of `llama`, so the fake-server seam suite never waits on a real model load.
+name              = "llama_live"
+path              = "tests/llama_live/main.rs"
 required-features = ["it"]
