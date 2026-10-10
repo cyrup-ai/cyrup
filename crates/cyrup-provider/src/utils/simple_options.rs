@@ -7,10 +7,10 @@
 //! `simple-options.ts:12-77`.
 
 use crate::context::Context;
-use crate::model::Model;
+use crate::model::{Model, SamplingParams};
 use crate::stream::StreamOptions;
 use crate::utils::estimate::estimate_context_tokens;
-use cyrup_core::ThinkingLevel;
+use cyrup_core::{ModelThinkingLevel, ThinkingLevel};
 
 /// Tokens reserved as headroom when clamping `max_tokens` to the context window (Pi
 /// `CONTEXT_SAFETY_TOKENS`, simple-options.ts:12).
@@ -54,23 +54,46 @@ pub fn clamp_max_tokens_to_context(model: &Model, context: &Context, max_tokens:
     (max_tokens as i64).min(available.max(MIN_MAX_TOKENS)) as u64
 }
 
-/// Merge the model's default sampling parameters with the per-request ones, per key (Pi
-/// `{ ...model.samplingParams, ...options?.samplingParams }`, simple-options.ts:27-33 @v0.84.1).
+/// Resolve the sampling parameters a request at `thinking_level` sends (Pi
+/// `resolveSamplingParams`, `packages/ai/src/api/simple-options.ts:24-34` @f1b2e77f5):
 ///
-/// Returns `None` when both sides are absent — pi's ternary yields `undefined` there, and the three
-/// OpenAI-compatible adapters gate on `if (options?.samplingParams)`, so an empty map is NOT the
-/// same thing as no map. A present-but-empty map on either side is kept (JS spreads it and produces
-/// a truthy `{}`), so that distinction is upstream's, not ours to smooth over.
-fn merge_sampling_params(
-    model: Option<&serde_json::Map<String, serde_json::Value>>,
-    request: Option<&serde_json::Map<String, serde_json::Value>>,
-) -> Option<serde_json::Map<String, serde_json::Value>> {
-    if model.is_none() && request.is_none() {
+/// ```text
+/// { ...model.samplingParams, ...model.samplingParamsByThinkingLevel?.[clampThinkingLevel(model, level)], ...requestParams }
+/// ```
+///
+/// per key, each layer over the one before. The level is CLAMPED to one the model supports first
+/// ([`clamp_thinking_level`]), so a request at a rung the model lacks picks up the entry of the rung
+/// it actually runs at; a non-reasoning model always resolves to `off`'s entry.
+///
+/// Returns `None` when all three layers are absent — pi's ternary yields `undefined` there, and the
+/// three OpenAI-compatible adapters gate on that, so an empty map is NOT the same thing as no map.
+/// A present-but-empty map on any layer is kept (JS spreads it and produces a truthy `{}`), so that
+/// distinction is upstream's, not ours to smooth over.
+///
+/// Called from [`build_base_options`] AND from the three OpenAI-compatible adapters' body builders,
+/// as pi calls it from `buildBaseOptions` and each `buildParams`
+/// (`openai-completions.ts:1003-1007`, `openai-responses.ts:382-386`,
+/// `azure-openai-responses.ts:242-246`). Resolving twice is idempotent: the second pass spreads the
+/// first pass's result (which already holds every model and level key) last. CFG-104 / PROV-146.
+///
+/// [`clamp_thinking_level`]: crate::collection::clamp_thinking_level
+#[must_use]
+pub fn resolve_sampling_params(
+    model: &Model,
+    thinking_level: ModelThinkingLevel,
+    request: Option<&SamplingParams>,
+) -> Option<SamplingParams> {
+    let effective = crate::collection::clamp_thinking_level(model, thinking_level);
+    let flat = model.flat_sampling_params();
+    let level = model
+        .sampling_params_by_thinking_level()
+        .and_then(|by_level| by_level.get(effective));
+    if flat.is_none() && level.is_none() && request.is_none() {
         return None;
     }
-    let mut merged = model.cloned().unwrap_or_default();
-    if let Some(request) = request {
-        for (k, v) in request {
+    let mut merged = flat.cloned().unwrap_or_default();
+    for layer in [level, request].into_iter().flatten() {
+        for (k, v) in layer {
             merged.insert(k.clone(), v.clone());
         }
     }
@@ -100,8 +123,15 @@ pub fn build_base_options(
         // (not an empty map) when neither side has any. `None` is preserved exactly, because an
         // empty-but-present map would make the adapters take their `if (options?.samplingParams)`
         // branch where pi does not.
-        sampling_params: merge_sampling_params(
-            model.sampling_params.as_ref(),
+        //
+        // CFG-104 — pi now resolves through `resolveSamplingParams(model, options?.reasoning ??
+        // "off", options?.samplingParams)` (`simple-options.ts:42` @f1b2e77f5), which adds the
+        // effective level's `samplingParamsByThinkingLevel` entry between the two.
+        sampling_params: resolve_sampling_params(
+            model,
+            options
+                .reasoning
+                .map_or(ModelThinkingLevel::Off, Into::into),
             options.base.sampling_params.as_ref(),
         ),
         max_tokens: Some(clamp_max_tokens_to_context(model, context, requested)),

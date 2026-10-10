@@ -26,6 +26,9 @@ thiserror = { workspace = true }
 tokio.workspace = true
 
 [dev-dependencies]
+# `src/tests/config_schemas.rs` validates documents against the published `schemas/*.schema.json`
+# (CFG-106). Already locked through cyrup-mcp / cyrup-ext-subagents.
+jsonschema = { workspace = true }
 # `src/tests/models_json_provider.rs` writes a real `models.json` into a tempdir and streams a request
 # through the provider composed from it.
 tempfile = { workspace = true }

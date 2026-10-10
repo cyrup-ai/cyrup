@@ -18,6 +18,7 @@
 #![forbid(unsafe_code)]
 
 pub mod auth;
+pub mod config_schemas;
 pub mod config_value;
 pub mod defaults;
 pub mod env;

@@ -322,8 +322,13 @@ fn model_from_json(
         // `samplingParams: definition.samplingParams` (provider-composer.ts:158 @v0.84.1) — copied
         // verbatim, with NO fallback to `providerConfig` or `defaults`: the provider block has no
         // `samplingParams` key in `ProviderConfigSchema`, and a same-id built-in's defaults are
-        // deliberately not inherited here. CFG-039.
-        sampling_params: definition.sampling_params.clone(),
+        // deliberately not inherited here. CFG-039. `samplingParamsByThinkingLevel:
+        // definition.samplingParamsByThinkingLevel` (provider-composer.ts:245 @f1b2e77f5) is copied
+        // the same way. CFG-104.
+        sampling_params: cyrup_provider::ModelSamplingParams::new(
+            definition.sampling_params.clone(),
+            definition.sampling_params_by_thinking_level.clone(),
+        ),
         thinking_level_map: definition.thinking_level_map.clone(),
         // Pi sets `headers: undefined` on the composed model — `models.json` headers are REQUEST
         // config resolved separately through `resolveConfiguredModelHeaders` (:156, :501-511), so
@@ -464,6 +469,28 @@ fn validate_input_limits(
     Ok(())
 }
 
+/// Pi `mergeSamplingParamsByThinkingLevel` (`core/provider-composer.ts:164-175` @f1b2e77f5):
+/// no override keeps the composed map as is; otherwise every level the override names becomes
+/// `{ ...base?.[level], ...override[level] }` and every other level is kept. CFG-104.
+fn merge_sampling_params_by_thinking_level(
+    base: Option<&cyrup_provider::SamplingParamsByThinkingLevel>,
+    over: Option<&cyrup_provider::SamplingParamsByThinkingLevel>,
+) -> Option<cyrup_provider::SamplingParamsByThinkingLevel> {
+    let Some(over) = over else {
+        return base.cloned();
+    };
+    let mut merged = base.cloned().unwrap_or_default();
+    for level in cyrup_provider::SamplingParamsByThinkingLevel::LEVELS {
+        if let Some(params) = over.get(level) {
+            let slot = merged.slot_mut(level).get_or_insert_with(Default::default);
+            for (key, value) in params {
+                slot.insert(key.clone(), value.clone());
+            }
+        }
+    }
+    Some(merged)
+}
+
 fn apply_model_override(model: &mut Model, ov: &ModelOverride) {
     if let Some(name) = &ov.name {
         model.name = name.clone();
@@ -488,13 +515,13 @@ fn apply_model_override(model: &mut Model, ov: &ModelOverride) {
     }
     // Pi `inputLimits: mergeInputLimits(model.inputLimits, override.inputLimits)` (`:186`).
     merge_input_limits(&mut model.input_limits, ov.input_limits.as_ref());
-    // `contextWindow: override.contextWindow ?? model.contextWindow` (provider-composer.ts:118-119
-    // @v0.83.0) — the override path has NO positivity check, unlike `modelFromJson`'s.
-    //
-    // [CYRUP-DELTA] pi stores a negative override verbatim (JS `number`); `Model::context_window`
-    // is `u64`, so a negative value saturates to 0 here rather than wrapping. Upstream's own
-    // behaviour on a negative override is an unguarded hole (a negative window reaches the request
-    // builder), and reproducing the wrap would be strictly worse than reproducing the intent.
+    // `contextWindow: override.contextWindow ?? model.contextWindow`
+    // (`core/provider-composer.ts:197-198` @f1b2e77f5) — the composer itself has no positivity
+    // check on the override path. A `models.json` file never reaches here with `<= 0`: the schema
+    // types both fields as `PositiveTokenCountSchema` on the override too (`core/model-config.ts:30`,
+    // `:59-60`), so `validate_models_config` rejects the whole file first (CFG-105). The saturation
+    // below only guards a programmatically built `ModelFile` (`Model::context_window` is `u64`, so
+    // a negative `i64` must not wrap).
     if let Some(cw) = ov.context_window {
         model.context_window = cw.max(0) as u64;
     }
@@ -519,13 +546,19 @@ fn apply_model_override(model: &mut Model, ov: &ModelOverride) {
         }
         model.prompt_cache = Some(merged);
     }
+    let mut flat = model.flat_sampling_params().cloned();
     if let Some(params) = &ov.sampling_params {
-        let mut merged = model.sampling_params.clone().unwrap_or_default();
+        let mut merged = flat.unwrap_or_default();
         for (key, value) in params {
             merged.insert(key.clone(), value.clone());
         }
-        model.sampling_params = Some(merged);
+        flat = Some(merged);
     }
+    let by_level = merge_sampling_params_by_thinking_level(
+        model.sampling_params_by_thinking_level(),
+        ov.sampling_params_by_thinking_level.as_ref(),
+    );
+    model.sampling_params = cyrup_provider::ModelSamplingParams::new(flat, by_level);
     if let Some(cost) = &ov.cost {
         if let Some(v) = cost.input {
             model.cost.input = v;
@@ -711,6 +744,68 @@ mod tests {
         );
     }
 
+    // ---- samplingParamsByThinkingLevel (CFG-104) ---------------------------------------------
+
+    /// Port of pi's "custom models and model overrides carry sampling params"
+    /// (`coding-agent/test/model-registry.test.ts:757-806` @f1b2e77f5): a definition's per-level
+    /// map is copied (`provider-composer.ts:245`), an override merges per level AND per key
+    /// (`mergeSamplingParamsByThinkingLevel`, `:164-175`), an override can add a level the
+    /// definition lacks, an override-only built-in gets both maps, and an untouched model keeps
+    /// neither. This asserts on the composed `Model` only; the wire half of the same clauses (the
+    /// per-key merge into `high` and `low`, an override-only `max` on a custom definition, an
+    /// override-only level on a built-in) is
+    /// `tests::models_json_provider::cfg104_sampling_params_by_thinking_level_reach_the_openai_completions_request`.
+    #[test]
+    fn cfg104_definitions_and_overrides_carry_sampling_params_by_thinking_level() {
+        let base = vec![
+            oai("openrouter", "anthropic/claude-sonnet-4"),
+            oai("openrouter", "anthropic/claude-opus-4.1"),
+        ];
+        let out = composed(
+            &base,
+            r#"{"providers":{"openrouter":{
+                 "baseUrl":"https://my-proxy.example.com/v1","api":"openai-completions",
+                 "models":[{"id":"custom/sampling-model",
+                   "samplingParams":{"temperature":1,"top_p":0.95,"top_k":0},
+                   "samplingParamsByThinkingLevel":{
+                     "low":{"temperature":0.6,"top_p":0.95},"high":{"temperature":0.8}}}],
+                 "modelOverrides":{
+                   "custom/sampling-model":{"samplingParamsByThinkingLevel":{
+                     "low":{"temperature":0.5,"top_k":20},"max":{"temperature":1}}},
+                   "anthropic/claude-sonnet-4":{"samplingParams":{"top_p":0.9},
+                     "samplingParamsByThinkingLevel":{"high":{"temperature":0.8}}}}
+               }}}"#,
+        );
+        let to_json = |m: &Model| serde_json::to_value(m).unwrap();
+
+        let custom = to_json(by_id(&out, "custom/sampling-model"));
+        assert_eq!(
+            custom["samplingParams"],
+            serde_json::json!({"temperature": 1, "top_p": 0.95, "top_k": 0})
+        );
+        assert_eq!(
+            custom["samplingParamsByThinkingLevel"],
+            serde_json::json!({
+                "low": {"temperature": 0.5, "top_p": 0.95, "top_k": 20},
+                "high": {"temperature": 0.8},
+                "max": {"temperature": 1},
+            })
+        );
+
+        let sonnet = to_json(by_id(&out, "anthropic/claude-sonnet-4"));
+        assert_eq!(sonnet["samplingParams"], serde_json::json!({"top_p": 0.9}));
+        assert_eq!(
+            sonnet["samplingParamsByThinkingLevel"],
+            serde_json::json!({"high": {"temperature": 0.8}})
+        );
+
+        let opus = by_id(&out, "anthropic/claude-opus-4.1");
+        assert_eq!(
+            opus.sampling_params, None,
+            "models without sampling config keep it unset"
+        );
+    }
+
     // ---- models.json composition (CFG-002) --------------------------------------------------
 
     #[test]
@@ -789,9 +884,12 @@ mod tests {
     }
 
     /// CFG-046, composition half: `definition.contextWindow <= 0` — not `=== 0` —
-    /// (provider-composer.ts:138-143 @v0.83.0), rejecting ONLY that provider block. A custom model
-    /// with an empty inherited `baseUrl` must still hit pi's
-    /// `"baseUrl" is required when defining custom models.`
+    /// (`core/provider-composer.ts:224-229` @f1b2e77f5), rejecting ONLY that provider block.
+    ///
+    /// This drives `compose` directly on a deserialized `ModelFile`, NOT `load`: since CFG-105 a
+    /// FILE with `contextWindow <= 0` is a whole-file schema failure (`core/model-config.ts:30`,
+    /// `:148-155`; see `load.rs`'s `cfg105_*` test), so this per-provider check is reachable only
+    /// for programmatically built configs — which is exactly what pi keeps it for.
     #[test]
     fn a_non_positive_context_window_rejects_only_its_own_provider_block() {
         let base = vec![model("anthropic", "claude-opus-4-8", "Claude Opus")];

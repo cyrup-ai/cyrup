@@ -237,13 +237,14 @@ pub(crate) fn build_body_with_env(
         }
     }
 
-    // Last so custom keys override the named request fields (Pi's own comment,
-    // `openai-completions.ts:884-887` @v0.84.1: `if (options?.samplingParams)
-    // Object.assign(params, options.samplingParams)`). AGENT-026. The merge with
-    // `Model.sampling_params` already happened in `build_base_options`
-    // (`simple-options.ts:27-33`), so what arrives here is the resolved map — and being LAST is the
-    // whole point: an operator's `top_p` must beat the named `temperature`/`max_tokens` block above.
-    apply_sampling_params(&mut obj, opts);
+    // Last so model and request sampling parameters override named request fields (Pi's own
+    // comment, `openai-completions.ts:1003-1007` @f1b2e77f5: `resolveSamplingParams(model,
+    // options?.reasoningEffort ?? "off", options?.samplingParams)` then `Object.assign`). AGENT-026
+    // / CFG-104. The adapter resolves the model's flat AND per-level defaults itself, as pi's
+    // `buildParams` does, so they reach the wire on the plain `stream` path too — not only through
+    // `build_base_options` on the simple path. Being LAST is the whole point: an operator's
+    // `top_p` must beat the named `temperature`/`max_tokens` block above.
+    apply_sampling_params(&mut obj, model, opts.reasoning, opts);
 
     Ok(Value::Object(obj))
 }
@@ -275,15 +276,27 @@ pub(super) fn clamped_thinking_budget(
     (budget > 0).then_some(budget)
 }
 
-/// `Object.assign(params, options.samplingParams)` — the identical three-line tail of all three
-/// OpenAI-compatible `buildParams` (`openai-completions.ts:884-887`, `openai-responses.ts:330-333`,
-/// `azure-openai-responses.ts:324-327` @v0.84.1). Shared here rather than triplicated so the three
-/// cannot drift apart; the absent-map case is a no-op exactly as pi's `if` guard is. AGENT-026.
-pub(crate) fn apply_sampling_params(obj: &mut Map<String, Value>, opts: &StreamOptions) {
-    let Some(params) = &opts.sampling_params else {
+/// `const samplingParams = resolveSamplingParams(model, level, options?.samplingParams); if
+/// (samplingParams) Object.assign(params, samplingParams)` — the identical tail of all three
+/// OpenAI-compatible `buildParams` (`openai-completions.ts:1003-1007`,
+/// `openai-responses.ts:382-386`, `azure-openai-responses.ts:242-246` @f1b2e77f5). Shared here
+/// rather than triplicated so the three cannot drift apart; `level` is the caller's
+/// `reasoningEffort ?? "off"` (which differs for the two responses adapters' summary-only case).
+/// The all-absent case is a no-op exactly as pi's `if` guard is. AGENT-026 / CFG-104.
+pub(crate) fn apply_sampling_params(
+    obj: &mut Map<String, Value>,
+    model: &Model,
+    level: cyrup_core::ModelThinkingLevel,
+    opts: &StreamOptions,
+) {
+    let Some(params) = crate::utils::simple_options::resolve_sampling_params(
+        model,
+        level,
+        opts.sampling_params.as_ref(),
+    ) else {
         return;
     };
     for (k, v) in params {
-        obj.insert(k.clone(), v.clone());
+        obj.insert(k, v);
     }
 }

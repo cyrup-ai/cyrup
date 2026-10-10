@@ -26,6 +26,18 @@ mod schema_msg {
     pub const UNION: &str = "Expected union value";
     /// `Type.String({ minLength: 1 })` — the check CFG-046 exists for.
     pub const MIN_LENGTH_1: &str = "Expected string length greater or equal to 1";
+    /// `Type.Number({ exclusiveMinimum: 0 })` — pi's `PositiveTokenCountSchema`
+    /// (`core/model-config.ts:30` @f1b2e77f5). Rendered in the text of the TypeBox pi pins at that
+    /// rev (`typebox` 1.3.27, `packages/coding-agent/package.json:72`): `locale/en_US.mjs`
+    /// `exclusiveMinimum` → `` `must be ${comparison} ${limit}` `` with `comparison: '>'`
+    /// (`schema/engine/exclusiveMinimum.mjs`). The other constants here are the older TypeBox 0.x
+    /// texts and are left as they are; the findings CFG-104/CFG-105 add use the 1.x text. CFG-105.
+    pub const GT_0: &str = "must be > 0";
+    /// `type: object` in the same TypeBox 1.3.27 text (`locale/en_US.mjs` `type` →
+    /// `` `must be ${type}` ``). Used only by the CFG-104 sampling checks, which are new at 1.x.
+    pub const OBJECT_1X: &str = "must be object";
+    /// `type: string` in TypeBox 1.3.27 text; used only by the CFG-105 `$schema` check.
+    pub const STRING_1X: &str = "must be string";
 }
 
 /// Render a JSON-pointer-ish path segment list the way `formatValidationPath` does
@@ -69,16 +81,22 @@ fn check_opt_string_min1(
     }
 }
 
-fn check_opt_number(
+/// `Type.Optional(PositiveTokenCountSchema)` — `contextWindow` / `maxTokens` on both
+/// `ModelDefinitionSchema` (`core/model-config.ts:43-44` @f1b2e77f5) and `ModelOverrideSchema`
+/// (`:59-60`), where `PositiveTokenCountSchema = Type.Number({ exclusiveMinimum: 0 })` (`:30`).
+/// A wrong type keeps the plain number message; `0` or a negative value is `must be > 0`, and like
+/// every finding here it rejects the whole file (`:148-155`). CFG-105.
+fn check_opt_positive_number(
     obj: &serde_json::Map<String, serde_json::Value>,
     key: &str,
     at: &[String],
     errs: &mut Vec<ModelsSchemaError>,
 ) {
-    if let Some(v) = obj.get(key)
-        && !v.is_number()
-    {
-        push_err(errs, &child(at, key), schema_msg::NUMBER);
+    let Some(v) = obj.get(key) else { return };
+    match v.as_f64() {
+        None => push_err(errs, &child(at, key), schema_msg::NUMBER),
+        Some(n) if n <= 0.0 => push_err(errs, &child(at, key), schema_msg::GT_0),
+        Some(_) => {}
     }
 }
 
@@ -112,6 +130,43 @@ fn check_opt_string_record(
         if !hv.is_string() {
             push_err(errs, &child(&here, k), schema_msg::STRING);
         }
+    }
+}
+
+/// `Type.Optional(SamplingParamsSchema)` where `SamplingParamsSchema = Type.Record(Type.String(),
+/// Type.Unknown())` (`core/model-config.ts:19` @f1b2e77f5) — any object; its values are free-form.
+/// Carried by `samplingParams` (`:45` / `:61`). CFG-104.
+fn check_opt_sampling_params(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    at: &[String],
+    errs: &mut Vec<ModelsSchemaError>,
+) {
+    if let Some(v) = obj.get(key)
+        && !v.is_object()
+    {
+        push_err(errs, &child(at, key), schema_msg::OBJECT_1X);
+    }
+}
+
+/// `Type.Optional(SamplingParamsByThinkingLevelSchema)` (`core/model-config.ts:20-28` @f1b2e77f5,
+/// used at `:46` / `:62`): an object whose seven optional keys `off`…`max` are each a
+/// `SamplingParamsSchema` object. It is a plain `Type.Object`, so an unknown key is tolerated, not
+/// rejected. CFG-104.
+fn check_opt_sampling_params_by_thinking_level(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    at: &[String],
+    errs: &mut Vec<ModelsSchemaError>,
+) {
+    const KEY: &str = "samplingParamsByThinkingLevel";
+    let Some(v) = obj.get(KEY) else { return };
+    let here = child(at, KEY);
+    let Some(levels) = v.as_object() else {
+        push_err(errs, &here, schema_msg::OBJECT_1X);
+        return;
+    };
+    for level in ["off", "minimal", "low", "medium", "high", "xhigh", "max"] {
+        check_opt_sampling_params(levels, level, &here, errs);
     }
 }
 
@@ -214,8 +269,10 @@ fn check_model_definition(
     check_opt_bool(obj, "reasoning", at, errs);
     check_opt_modalities(obj, at, errs);
     check_cost(obj, at, true, errs);
-    check_opt_number(obj, "contextWindow", at, errs);
-    check_opt_number(obj, "maxTokens", at, errs);
+    check_opt_positive_number(obj, "contextWindow", at, errs);
+    check_opt_positive_number(obj, "maxTokens", at, errs);
+    check_opt_sampling_params(obj, "samplingParams", at, errs);
+    check_opt_sampling_params_by_thinking_level(obj, at, errs);
     check_opt_string_record(obj, "headers", at, errs);
 }
 
@@ -234,8 +291,10 @@ fn check_model_override(
     check_opt_bool(obj, "reasoning", at, errs);
     check_opt_modalities(obj, at, errs);
     check_cost(obj, at, false, errs);
-    check_opt_number(obj, "contextWindow", at, errs);
-    check_opt_number(obj, "maxTokens", at, errs);
+    check_opt_positive_number(obj, "contextWindow", at, errs);
+    check_opt_positive_number(obj, "maxTokens", at, errs);
+    check_opt_sampling_params(obj, "samplingParams", at, errs);
+    check_opt_sampling_params_by_thinking_level(obj, at, errs);
     check_opt_string_record(obj, "headers", at, errs);
 }
 
@@ -255,6 +314,13 @@ pub fn validate_models_config(value: &serde_json::Value) -> Vec<ModelsSchemaErro
         push_err(&mut errs, &root, schema_msg::OBJECT);
         return errs;
     };
+    // `$schema: Type.Optional(Type.String())` (`core/model-config.ts:84-87` @f1b2e77f5): an editor
+    // hint, carried but never read; any other type is a schema failure naming `$schema`. CFG-105.
+    if let Some(schema) = obj.get("$schema")
+        && !schema.is_string()
+    {
+        push_err(&mut errs, &["$schema".to_string()], schema_msg::STRING_1X);
+    }
     // `providers: Type.Record(...)` is NOT optional (model-config.ts:201-203).
     let Some(providers) = obj.get("providers") else {
         push_err(&mut errs, &["providers".to_string()], schema_msg::REQUIRED);

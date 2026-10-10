@@ -4,10 +4,12 @@
 use cyrup_provider::Model;
 
 /// Curated default model id per known provider (Pi `defaultModelPerProvider`,
-/// `model-resolver.ts:20-59` @v0.87.1). Returns `None` for an unknown provider.
+/// `model-resolver.ts:21-62` @f1b2e77f5, v1.1.0-11). Returns `None` for an unknown provider.
 ///
-/// CFG-084 — every row is pi's v0.87.1 value except `meta` (`muse-spark-1.3`), a provider cyrup
-/// does not ship, pinned by name in the test below.
+/// CFG-102 — every row is pi's f1b2e77f5 value except three, each pinned by name in the test below:
+/// `meta` (`muse-spark-1.3`), a provider cyrup does not ship (PROV-080); `openai-codex`, still
+/// `gpt-5.5` because the embedded catalog does not carry pi's `gpt-6.1-sol` yet; and pi's `azure`
+/// key, which cyrup still spells `azure-openai-responses` (the rename is PROV-145).
 pub fn default_model_per_provider(provider: &str) -> Option<&'static str> {
     let id = match provider {
         "amazon-bedrock" => "us.anthropic.claude-opus-4-6-v1",
@@ -15,10 +17,14 @@ pub fn default_model_per_provider(provider: &str) -> Option<&'static str> {
         "anthropic" => "claude-opus-4-8",
         "openai" => "gpt-5.5",
         "azure-openai-responses" => "gpt-5.4",
+        // DEFERRED (CFG-102 remainder): pi is `gpt-6.1-sol` (`model-resolver.ts:26`), which the
+        // embedded `catalog/openai-codex.json` does not carry yet; naming it here would make
+        // `first_default_or_first` skip codex entirely.
         "openai-codex" => "gpt-5.5",
         // Resolved against the gateway's runtime catalog (`radius.rs`), so no embedded row gates it.
         "radius" => "balanced",
-        "nvidia" => "nvidia/nemotron-3-super-120b-a12b",
+        // v1.0.1 (`49b9df489`): "NVIDIA no longer serves nvidia/nemotron-3-super-120b-a12b".
+        "nvidia" => "nvidia/nemotron-3-ultra-550b-a55b",
         "deepseek" => "deepseek-v4-pro",
         "google" => "gemini-3.1-pro-preview",
         "google-vertex" => "gemini-3.1-pro-preview",
@@ -43,11 +49,12 @@ pub fn default_model_per_provider(provider: &str) -> Option<&'static str> {
         "moonshotai" => "kimi-k2.6",
         "moonshotai-cn" => "kimi-k2.6",
         "huggingface" => "moonshotai/Kimi-K2.6",
-        "fireworks" => "accounts/fireworks/models/kimi-k2p6",
-        "together" => "moonshotai/Kimi-K2.6",
+        // v1.0.0 moved these three from Kimi K2.6 to Kimi K3 (`model-resolver.ts:46,47,50`).
+        "fireworks" => "accounts/fireworks/models/kimi-k3",
+        "together" => "moonshotai/Kimi-K3",
         "baseten" => "zai-org/GLM-5.2",
         "opencode" => "kimi-k2.6",
-        "opencode-go" => "kimi-k2.6",
+        "opencode-go" => "kimi-k3",
         "kimi-coding" => "kimi-for-coding",
         "cloudflare-workers-ai" => "@cf/moonshotai/kimi-k2.6",
         "cloudflare-ai-gateway" => "workers-ai/@cf/moonshotai/kimi-k2.6",
@@ -261,24 +268,27 @@ mod tests {
     /// (`model-resolver.ts:683-692` @v0.84.1), so a missing or misplaced key changes which model a
     /// user launches on.
     ///
-    /// **Pinned at v0.87.1 (CFG-084) with NAMED exceptions, not silently mixed.** `DEFERRED` lists
-    /// every row cyrup does not carry at pi's value, what it carries instead, and why. The last loop
-    /// is the one that matters now that catalogs are live: a curated default naming an id the
-    /// catalog no longer carries is NOT inert — `first_default_or_first` finds no match, skips the
-    /// provider entirely, and the user silently lands on `available.first()` instead. That must be
-    /// loud.
+    /// **Pinned at f1b2e77f5 (v1.1.0-11, CFG-102) with NAMED exceptions, not silently mixed.**
+    /// `KEY_RENAMED` maps the one key pi renamed after v1.0.1; `DEFERRED` lists every row cyrup does
+    /// not carry at pi's value, what it carries instead, and why. The last loop is the one that
+    /// matters now that catalogs are live: a curated default naming an id the catalog no longer
+    /// carries is NOT inert — `first_default_or_first` finds no match, skips the provider entirely,
+    /// and the user silently lands on `available.first()` instead. That must be loud.
     #[test]
     fn default_model_per_provider_matches_pi_and_every_default_resolves() {
-        // `git show v0.87.1:packages/coding-agent/src/core/model-resolver.ts`, `:20-59`.
+        // `git -C tmp/pi show f1b2e77f5:packages/coding-agent/src/core/model-resolver.ts`, `:21-62`,
+        // verbatim. CFG-102's Verify names v1.0.1: that tag's table (same file, `:21-62`) is this
+        // one with `KEY_RENAMED` undone (`azure` read `"azure-openai-responses"` until `a37306d43`,
+        // first tagged v1.0.3), so passing here passes against v1.0.1 too.
         const PI: &[(&str, &str)] = &[
             ("amazon-bedrock", "us.anthropic.claude-opus-4-6-v1"),
             ("ant-ling", "Ring-2.6-1T"),
             ("anthropic", "claude-opus-4-8"),
             ("openai", "gpt-5.5"),
-            ("azure-openai-responses", "gpt-5.4"),
-            ("openai-codex", "gpt-5.5"),
+            ("azure", "gpt-5.4"),
+            ("openai-codex", "gpt-6.1-sol"),
             ("radius", "balanced"),
-            ("nvidia", "nvidia/nemotron-3-super-120b-a12b"),
+            ("nvidia", "nvidia/nemotron-3-ultra-550b-a55b"),
             ("deepseek", "deepseek-v4-pro"),
             ("google", "gemini-3.1-pro-preview"),
             ("google-vertex", "gemini-3.1-pro-preview"),
@@ -296,11 +306,11 @@ mod tests {
             ("moonshotai", "kimi-k2.6"),
             ("moonshotai-cn", "kimi-k2.6"),
             ("huggingface", "moonshotai/Kimi-K2.6"),
-            ("fireworks", "accounts/fireworks/models/kimi-k2p6"),
-            ("together", "moonshotai/Kimi-K2.6"),
+            ("fireworks", "accounts/fireworks/models/kimi-k3"),
+            ("together", "moonshotai/Kimi-K3"),
             ("baseten", "zai-org/GLM-5.2"),
             ("opencode", "kimi-k2.6"),
-            ("opencode-go", "kimi-k2.6"),
+            ("opencode-go", "kimi-k3"),
             ("kimi-coding", "kimi-for-coding"),
             ("meta", "muse-spark-1.3"),
             ("cloudflare-workers-ai", "@cf/moonshotai/kimi-k2.6"),
@@ -317,34 +327,56 @@ mod tests {
             ("xiaomi-token-plan-sgp", "mimo-v2.5-pro"),
         ];
 
-        /// Rows where PI'S OWN curated default names an id pi's own catalog no longer serves.
+        // `STALE_UPSTREAM` (CFG-084: pi's own fireworks/opencode-go defaults named ids pi's own
+        // catalogs no longer served, so the guard below skipped them by name) is gone. pi v1.0.0
+        // moved both defaults to `kimi-k3`, which both embedded catalogs carry, so the guard now
+        // resolves every row with no skip.
+
+        /// `(pi's key, cyrup's key)`: provider ids pi renamed that cyrup has not. `azure`: pi
+        /// renamed `azure-openai-responses` -> `azure` in `a37306d43` (v1.0.3, "Breaking: auth.json
+        /// and models.json entries keyed on azure-openai-responses must move to azure"). That rename
+        /// is an owner decision ledgered as PROV-145 (area 01); this table follows the provider id,
+        /// it does not lead it.
+        const KEY_RENAMED: &[(&str, &str)] = &[("azure", "azure-openai-responses")];
+        /// Rows cyrup does NOT carry at pi's value: `(provider, what cyrup carries)`, where `None`
+        /// means no row at all.
+        /// - `meta`: the Meta Muse provider (pi v0.86.1) is not shipped — area 01 (PROV-080).
+        /// - `openai-codex`: pi's `gpt-6.1-sol` (v1.0.0, `12c416e1a`) is not in the embedded
+        ///   `catalog/openai-codex.json`, so moving the arm now would make `first_default_or_first`
+        ///   skip codex entirely (the guard below would fire). The regen
+        ///   (`cargo run -p xtask -- gen-catalogs --only openai-codex`) adds a
+        ///   `supportsToolSearch` row that the exact list in
+        ///   `cyrup-provider/src/api/anthropic_messages/tests/catalog.rs`
+        ///   (`tool_search_is_confined_to_the_openai_responses_catalog`) must also gain, and that
+        ///   file is in flight on another branch. CFG-102 remainder.
         ///
-        /// This is not a cyrup gap and must not be "fixed" into one. `defaultModelPerProvider`
-        /// @v0.87.1 (`model-resolver.ts:46,50`) still reads
-        /// `fireworks: "accounts/fireworks/models/kimi-k2p6"` and `"opencode-go": "kimi-k2.6"`,
-        /// while the catalogs pi generates and publishes for those two providers carry
-        /// `accounts/fireworks/models/kimi-k3` and no `kimi-k2.6` at all. pi therefore falls through
-        /// its own curated default for these providers exactly as cyrup does, and picking a
-        /// "better" successor here would be cyrup inventing upstream behaviour — the one thing the
-        /// table is not allowed to do. The rows are listed so the guard below can skip them BY
-        /// NAME, with this reason attached, rather than being weakened for everybody.
-        const STALE_UPSTREAM: &[(&str, &str)] = &[
-            ("fireworks", "accounts/fireworks/models/kimi-k2p6"),
-            ("opencode-go", "kimi-k2.6"),
-        ];
-        /// v0.87.1 rows cyrup does NOT carry at pi's value: `(provider, what cyrup carries)`, where
-        /// `None` means no row at all. `meta`: the Meta Muse provider (pi v0.86.1) is not shipped —
-        /// area 01 (PROV-080). Every other row, `radius`/`xai`/`cerebras`/`zai`/`zai-coding-cn`
-        /// included, is pi's own value now that PROV-071's live catalogs carry the ids.
-        const DEFERRED: &[(&str, Option<&str>)] = &[("meta", None)];
+        /// Every other row is pi's own value.
+        const DEFERRED: &[(&str, Option<&str>)] =
+            &[("meta", None), ("openai-codex", Some("gpt-5.5"))];
 
         let expected: Vec<(&str, &str)> = PI
             .iter()
-            .filter_map(|(k, v)| match DEFERRED.iter().find(|(dk, _)| dk == k) {
-                Some((_, carried)) => carried.map(|c| (*k, c)),
-                None => Some((*k, *v)),
+            .map(|(k, v)| {
+                let key = KEY_RENAMED
+                    .iter()
+                    .find(|(pi_key, _)| pi_key == k)
+                    .map_or(*k, |(_, ours)| *ours);
+                (key, *v)
+            })
+            .filter_map(|(k, v)| match DEFERRED.iter().find(|(dk, _)| *dk == k) {
+                Some((_, carried)) => carried.map(|c| (k, c)),
+                None => Some((k, v)),
             })
             .collect();
+        // A renamed key must still be unknown to cyrup under pi's new name: landing PROV-145
+        // without updating `KEY_RENAMED` fails here rather than silently scanning both keys.
+        for (pi_key, _) in KEY_RENAMED {
+            assert_eq!(
+                default_model_per_provider(pi_key),
+                None,
+                "{pi_key} is now a cyrup key — drop it from KEY_RENAMED"
+            );
+        }
         let ours: Vec<(&str, &str)> = KNOWN_PROVIDERS
             .iter()
             .map(|p| (*p, default_model_per_provider(p).unwrap_or("<missing>")))
@@ -388,18 +420,6 @@ mod tests {
                     !MEANINGFUL_NOW.contains(&id),
                     "{id} ships no embedded rows, so its curated default `{default_id}` is \
                      unchecked again — DRIFT-009 embedded this catalog precisely so it would be"
-                );
-                continue;
-            }
-            if let Some((_, stale)) = STALE_UPSTREAM.iter().find(|(k, _)| *k == id) {
-                // The skip is itself asserted: it applies only while cyrup's value is still pi's.
-                // If somebody edits the table to a successor id, this fires instead of quietly
-                // letting the edit through as an upstream-faithful value.
-                assert_eq!(
-                    default_model_per_provider(id),
-                    Some(*stale),
-                    "{id} is listed as stale-upstream, so cyrup must carry pi's own value \
-                     verbatim; if you changed it, you changed behaviour pi does not have"
                 );
                 continue;
             }

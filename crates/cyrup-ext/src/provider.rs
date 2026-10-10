@@ -186,6 +186,19 @@ pub struct ProviderModelConfig {
     /// Max output tokens (Pi `maxTokens`, types.ts:1426).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u64>,
+    /// Default sampling parameters applied at every thinking level (Pi
+    /// `ProviderChatModelConfig.samplingParams?: Model<Api>["samplingParams"]`,
+    /// `core/provider-composer.ts:71` @f1b2e77f5). Typed, so a non-object value fails the
+    /// registration rather than vanishing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sampling_params: Option<cyrup_provider::SamplingParams>,
+    /// Per-thinking-level sampling overrides spread over [`Self::sampling_params`] for the
+    /// request's effective level (Pi `ProviderChatModelConfig.samplingParamsByThinkingLevel?`,
+    /// `core/provider-composer.ts:72` @f1b2e77f5, added `76dfb88f6`). CFG-104, extension path:
+    /// without this field serde dropped the key with no diagnostic, so an extension provider's
+    /// per-level sampling silently did nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sampling_params_by_thinking_level: Option<cyrup_provider::SamplingParamsByThinkingLevel>,
     /// Per-model custom headers (Pi `headers`, types.ts:1428).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub headers: BTreeMap<String, String>,
@@ -339,13 +352,14 @@ impl ProviderRegistration {
                 },
                 context_window: m.context_window.unwrap_or(128_000),
                 max_tokens: m.max_tokens.unwrap_or(16_384),
-                // AGENT-026 — `Model.samplingParams` has NO counterpart in pi's config/extension
-                // model schema: at v0.84.1 `samplingParams` appears only in `packages/ai/src`
-                // (types + the three OpenAI-compatible adapters + `simple-options.ts`) and
-                // `packages/agent/src/proxy.ts`, never in `packages/coding-agent`'s config
-                // plumbing. An extension-declared model therefore carries no defaults upstream
-                // either, so `None` is the port, not a stub.
-                sampling_params: None,
+                // AGENT-026 / CFG-104 — pi's `extensionModelFromDefinition` spreads the whole
+                // definition onto the model (`{ ...definition, api, provider, baseUrl, headers:
+                // undefined }`, `core/provider-composer.ts:297` @f1b2e77f5), so both sampling keys
+                // reach `Model` unchanged; `resolve_sampling_params` merges them per request.
+                sampling_params: cyrup_provider::ModelSamplingParams::new(
+                    m.sampling_params.clone(),
+                    m.sampling_params_by_thinking_level.clone(),
+                ),
                 prompt_cache: m.prompt_cache.clone(),
                 thinking_level_map,
                 compat,
