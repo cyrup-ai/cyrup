@@ -61,6 +61,7 @@ fn context() -> ClassifierContext {
     );
     ClassifierContext {
         state,
+        images: None,
         questions: vec![
             (
                 "category",
@@ -542,6 +543,45 @@ async fn cloudflare_rejects_models_for_other_classifier_apis() {
         result.error_message.as_deref(),
         Some("Unsupported classifier API: typesafe-system-one")
     );
+}
+
+/// pi `system-one-shared.ts:116`: a context carrying images is refused before any request, by
+/// both transports, with the transport's own label. `ClassifierContext.images` arrived with
+/// PROV-148 after PROV-104 ported these apis, so this guard is what keeps an image-judging classify
+/// from silently dropping its images here.
+#[tokio::test]
+async fn both_system_one_transports_refuse_image_input_before_sending() {
+    let server = FakeServer::start().await;
+    let with_images = ClassifierContext {
+        images: Some(vec![cyrup_core::Content::Image {
+            data: "iVBORw0KGgo=".to_string(),
+            mime_type: "image/png".to_string(),
+        }]),
+        ..context()
+    };
+    for (expected, result) in [
+        (
+            "System One API does not support image input",
+            typesafe_system_one_api()
+                .classify(&model(TYPESAFE, &server.base_url), &with_images, &keyed())
+                .await,
+        ),
+        (
+            "Cloudflare Workers AI does not support image input",
+            cloudflare_workers_ai_system_one_api()
+                .classify(&model(CLOUDFLARE, &server.base_url), &with_images, &keyed())
+                .await,
+        ),
+    ] {
+        assert_eq!(
+            result.stop_reason,
+            ClassifierStopReason::Error,
+            "{expected}"
+        );
+        assert_eq!(result.error_message.as_deref(), Some(expected));
+        assert!(result.answers.is_empty(), "{expected}");
+    }
+    assert!(server.requests().is_empty(), "nothing may reach the server");
 }
 
 // ------------------------------------------------------------------------------ provider entries --

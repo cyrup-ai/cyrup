@@ -733,6 +733,7 @@ mod decision_models {
         state.insert("message".to_string(), json!("I was charged twice."));
         let context = ClassifierContext {
             state,
+            images: None,
             questions: [(
                 "angry",
                 ClassifierQuestion::Bool {

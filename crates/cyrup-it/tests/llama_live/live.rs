@@ -664,6 +664,7 @@ async fn a_real_llama_server_agrees_with_the_wire_definitions_and_cyrups_llama_p
             &chat_classifier,
             &ClassifierContext {
                 state: state(STATE_TEXT),
+                images: None,
                 questions: OrderedMap::from_iter([(
                     "category",
                     ClassifierQuestion::Choice {
@@ -702,6 +703,7 @@ async fn a_real_llama_server_agrees_with_the_wire_definitions_and_cyrups_llama_p
             &decision_classifier,
             &ClassifierContext {
                 state: state(STATE_TEXT),
+                images: None,
                 questions: three_questions(),
             },
             &options,

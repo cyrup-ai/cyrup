@@ -17,9 +17,9 @@
 //! @b11436) and answers a noul with `{"type": "noul", "noul": <p(true)>}` (`format_answer`,
 //! `:764-779`).
 //!
-//! `[CYRUP-DELTA, shape]` pi rejects a context carrying images before sending
-//! (`if (context.images?.length) throw "<label> does not support image input"`). cyrup's
-//! [`ClassifierContext`] has no `images` member yet, so there is nothing to reject.
+//! A context carrying images is rejected before anything is sent, as pi does
+//! (`if (context.images?.length) throw "<label> does not support image input"`,
+//! `system-one-shared.ts:116` @f1b2e77f5): neither System One transport takes image input.
 
 use serde_json::{Map, Value};
 
@@ -194,6 +194,12 @@ pub(crate) async fn classify_system_one(
             return Err(ClassifyError::plain(format!(
                 "Unsupported classifier API: {}",
                 model.api
+            )));
+        }
+        if context.has_images() {
+            return Err(ClassifyError::plain(format!(
+                "{} does not support image input",
+                transport.label
             )));
         }
         let url = (transport.url)(model)?;
