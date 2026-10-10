@@ -259,6 +259,106 @@ impl Drop for FileLock {
     }
 }
 
+/// Poll interval of [`BlockingFileLock::acquire`]: pi's `waitForFileSystemRetry(Math.min(10,
+/// remaining))` (`src/shared/file-lease.ts:70` @ad11b7ab, pi-subagents).
+const BLOCKING_RETRY: Duration = Duration::from_millis(10);
+
+/// A SYNCHRONOUS, bounded hold of [`FileLock`]'s layer 2 — the `flock` on the same `<path>.lock`
+/// sidecar ([`lock_path_for`] is the one place that name is built) — for a short read-modify-write
+/// whose caller is not async (SUBA-184: the subagent watchdog's settings writers).
+///
+/// Ports the WAIT of pi-subagents' `withFileLease` (`src/shared/file-lease.ts:61-73` @ad11b7ab):
+///
+/// ```text
+/// export function withFileLease<T>(filePath: string, action: () => T, waitMs = 200): T {
+///     const requested = path.resolve(filePath);
+///     const absolute = path.join(fs.realpathSync.native(path.dirname(requested)), path.basename(requested));
+///     const lockPath = `${absolute}.write-lock`;
+///     const deadline = performance.now() + waitMs;
+///     let release = tryLease(lockPath);
+///     while (!release) {
+///         const remaining = deadline - performance.now();
+///         if (remaining <= 0) throw new Error(`Timed out waiting for another process to finish updating ${absolute}.`);
+///         waitForFileSystemRetry(Math.min(10, remaining));
+///         release = tryLease(lockPath);
+///     }
+///     try { return action(); } finally { release(); }
+/// }
+/// ```
+///
+/// `[CYRUP-DELTA]` the PRIMITIVE, not the wait: pi's lease is a `mkdir`'d `<file>.write-lock`
+/// directory with an `owner.json` (node has no advisory lock); this is `flock` on the sidecar every
+/// [`FileLock`] takes, so a sync writer and an async [`FileLock`] holder of one file exclude each
+/// other. `flock` belongs to the open file DESCRIPTION, and each acquire opens its own, so it
+/// excludes a holder in this very process (another thread, or an async [`FileLock`]) as well as one
+/// in another process; the kernel releases it when its owner dies, so there is no stale-owner
+/// recovery to port.
+///
+/// Layer 1 (the in-process async queue) is NOT taken — it cannot be from sync code — and is not
+/// needed for exclusion: it only spares a process a second kernel waiter. The cost is that an
+/// in-process async holder is waited out by polling rather than queued behind. Because this blocks
+/// the calling thread for up to `wait`, keep `wait` short (pi: 200 ms); called on a
+/// current-thread runtime while a task of THAT runtime holds the lock, it cannot be released in
+/// time and this times out, as pi's synchronous lease would against a stalled owner.
+pub struct BlockingFileLock {
+    file: File,
+}
+
+impl BlockingFileLock {
+    /// Take the `<target>.lock` sidecar's `flock`, retrying every ~10 ms for at most `wait`.
+    ///
+    /// # Errors
+    ///
+    /// [`ConfigError::LockTimeout`] — pi's sentence, naming `target` made absolute as pi builds
+    /// it (`realpath(dirname)/basename`) — when a peer still holds the lock at the deadline;
+    /// [`ConfigError::Io`] / [`ConfigError::Lock`] as [`FileLock::acquire`] for a sidecar that
+    /// cannot be opened or locked.
+    pub fn acquire(target: &Path, wait: Duration) -> Result<Self, ConfigError> {
+        let lock_path = lock_path_for(target);
+        let deadline = std::time::Instant::now() + wait;
+        let (mut file, mut held) = open_and_try_lock(target, &lock_path)?;
+        while !held {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(ConfigError::LockTimeout {
+                    path: lease_absolute(target),
+                });
+            }
+            std::thread::sleep(remaining.min(BLOCKING_RETRY));
+            (file, held) = try_lock(file, target)?;
+        }
+        Ok(Self { file })
+    }
+}
+
+impl Drop for BlockingFileLock {
+    fn drop(&mut self) {
+        // As `FileLock`: release explicitly, never unlink the sidecar; the fd's close is only the
+        // backstop.
+        let _ = FileExt::unlock(&self.file);
+    }
+}
+
+/// pi `withFileLease`'s `absolute`: `path.join(realpathSync(dirname(resolve(file))),
+/// basename(file))`. Falls back to the lexically absolute spelling when the parent cannot be
+/// resolved, so the timeout sentence always names an absolute path.
+fn lease_absolute(target: &Path) -> PathBuf {
+    let requested = if target.is_absolute() {
+        crate::paths::lexically_normalize(target)
+    } else {
+        match std::env::current_dir() {
+            Ok(cwd) => crate::paths::lexically_normalize(&cwd.join(target)),
+            Err(_) => target.to_path_buf(),
+        }
+    };
+    match (requested.parent(), requested.file_name()) {
+        (Some(parent), Some(name)) => std::fs::canonicalize(parent)
+            .map(|p| p.join(name))
+            .unwrap_or(requested),
+        _ => requested,
+    }
+}
+
 fn lock_path_for(target: &Path) -> PathBuf {
     let mut name = target
         .file_name()
@@ -451,7 +551,12 @@ fn join_failed(target: &Path, join: &tokio::task::JoinError) -> ConfigError {
 }
 
 #[cfg(all(test, unix))]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
@@ -486,5 +591,98 @@ mod tests {
         write_atomic(&secret, b"x", true).unwrap();
         assert_eq!(mode_of(&plain), mode_of(&none));
         assert_eq!(mode_of(&secret), 0o600);
+    }
+
+    /// A raw `flock` on `<target>.lock` from an fd of the test's own — the "another process"
+    /// seam: it is a different open file description from anything the code under test opens.
+    fn hold_raw(target: &Path) -> File {
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(lock_path_for(target))
+            .unwrap();
+        FileExt::try_lock(&file).unwrap();
+        file
+    }
+
+    /// SUBA-184: a held sidecar times out after the bound with pi's sentence naming the absolute
+    /// target (`src/shared/file-lease.ts:69` @ad11b7ab), and the bound is honoured.
+    #[test]
+    fn blocking_acquire_times_out_with_pis_sentence() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("settings.json");
+        let _peer = hold_raw(&target);
+        let started = std::time::Instant::now();
+        let err = BlockingFileLock::acquire(&target, Duration::from_millis(60))
+            .err()
+            .expect("a held lock must time out");
+        assert!(started.elapsed() >= Duration::from_millis(60));
+        let absolute = std::fs::canonicalize(dir.path())
+            .unwrap()
+            .join("settings.json");
+        assert!(matches!(err, ConfigError::LockTimeout { ref path } if *path == absolute));
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "Timed out waiting for another process to finish updating {}.",
+                absolute.display()
+            )
+        );
+    }
+
+    /// SUBA-184: the poll picks the lock up once the peer lets go, well inside the bound.
+    #[test]
+    fn blocking_acquire_succeeds_after_the_peer_releases() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("settings.json");
+        let peer = hold_raw(&target);
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(40));
+            drop(peer);
+        });
+        let guard = BlockingFileLock::acquire(&target, Duration::from_secs(10)).unwrap();
+        releaser.join().unwrap();
+        // Held now: a second blocking acquire cannot get it.
+        assert!(matches!(
+            BlockingFileLock::acquire(&target, Duration::from_millis(20)),
+            Err(ConfigError::LockTimeout { .. })
+        ));
+        drop(guard);
+        BlockingFileLock::acquire(&target, Duration::from_millis(20)).unwrap();
+    }
+
+    /// SUBA-184: the sync lock and an async [`FileLock`] in THIS process exclude each other in
+    /// both directions — `flock` is per open file description, and each acquire opens its own —
+    /// so a watchdog write and an agent-override save share one lock.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn blocking_acquire_and_an_async_file_lock_exclude_each_other() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("settings.json");
+
+        let async_guard = FileLock::acquire(&target, None).await.unwrap();
+        let t = target.clone();
+        let blocked = tokio::task::spawn_blocking(move || {
+            BlockingFileLock::acquire(&t, Duration::from_millis(60)).map(drop)
+        })
+        .await
+        .unwrap();
+        assert!(matches!(blocked, Err(ConfigError::LockTimeout { .. })));
+        drop(async_guard);
+
+        let sync_guard = BlockingFileLock::acquire(&target, Duration::from_millis(60)).unwrap();
+        let waited =
+            tokio::time::timeout(Duration::from_millis(150), FileLock::acquire(&target, None))
+                .await;
+        assert!(
+            waited.is_err(),
+            "async FileLock must wait for the sync holder"
+        );
+        drop(sync_guard);
+        tokio::time::timeout(Duration::from_secs(10), FileLock::acquire(&target, None))
+            .await
+            .unwrap()
+            .unwrap();
     }
 }

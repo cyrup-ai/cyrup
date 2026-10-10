@@ -44,9 +44,10 @@
 //! - **The `/subagents-profiles`/`/subagents-load-profile` slash-command descriptors themselves**
 //!   (argument parsing, `ctx.ui.notify` progress reporting) live in
 //!   `registration/slash_commands.rs`, a sibling file not owned by this task — this module
-//!   exposes the plain, synchronous functions ([`validate_profile_name`], [`list_profiles`],
-//!   [`load_profile`], [`apply_profile_to_settings_file`]) that command dispatch calls into, per R-SA-130's
-//!   single-execution-code-path rule, rather than embedding any command-parsing logic here.
+//!   exposes the plain functions ([`validate_profile_name`], [`list_profiles`], [`load_profile`],
+//!   [`apply_profile_to_settings_file`] — the last `async` since SUBA-184, because it holds the
+//!   settings lock) that command dispatch calls into, per R-SA-130's single-execution-code-path
+//!   rule, rather than embedding any command-parsing logic here.
 //! - **Named-profile persistence format for *writing* new profiles** (i.e. a `save_profile`-style
 //!   authoring path) is not required by R-SA-140/141/142's text, which is scoped to *loading* and
 //!   *applying* an already-authored profile; this file therefore does not implement profile
@@ -596,11 +597,42 @@ pub fn generate_provider_profiles(
 ///
 /// - [`SubagentError::MalformedSettings`] if the existing settings file is not valid JSON or is not
 ///   a JSON object, or if `profile.subagents` cannot be serialized.
-/// - [`SubagentError::Spawn`] on a filesystem I/O failure.
-pub fn apply_profile_to_settings_file(
+/// - [`SubagentError::Spawn`] when the existing settings file cannot be read;
+///   [`SubagentError::MalformedSettings`] when the lock cannot be taken or the save fails.
+///
+/// # Locking (SUBA-184)
+///
+/// The read, merge and save all happen under the settings lock — pi `applySubagentProfile`
+/// (`src/profiles/profiles.ts` @ad11b7ab, `2d3f6471`):
+///
+/// ```text
+/// const settingsPath = getUserSettingsPath();
+/// withSettingsFileLease(settingsPath, () => {
+///     const settings = readSettingsFile(settingsPath);
+///     ...
+///     writeJsonFile(settingsPath, settings);
+/// });
+/// ```
+///
+/// Here that is the SUBA-029/171 agent-override discipline verbatim: resolve the physical target
+/// (`settings_write_target`, so a symlinked `settings.json` is locked on its target's sidecar),
+/// hold `lock_settings_file` on it, and save through the override writer's `write_settings_file`.
+/// So a profile load, an agent-override save and a watchdog toggle on one file serialize instead
+/// of the later save dropping the earlier one's change. `[CYRUP-DELTA]` pi's lease is a `mkdir`
+/// `<file>.write-lock` directory; this is `flock` on `<file>.lock`, the lock the other cyrup
+/// writers of this file already hold. `[CYRUP-DELTA]` the save is temp-then-rename, where pi keeps
+/// `writeJsonFile`'s direct write ("Profile and Watchdog keep their direct write", `2d3f6471`): a
+/// crash mid-save leaves the previous file readable, the existing mode is kept, and the bytes
+/// (two-space indent, trailing newline) are unchanged.
+pub async fn apply_profile_to_settings_file(
     settings_path: &Path,
     profile: &NamedProfile,
 ) -> Result<(), SubagentError> {
+    use crate::discovery::settings_write::{
+        lock_settings_file, settings_write_target, write_settings_file,
+    };
+    let target = settings_write_target(settings_path)?;
+    let _lock = lock_settings_file(&target).await?;
     let mut root: serde_json::Map<String, serde_json::Value> =
         match std::fs::read_to_string(settings_path) {
             Ok(raw) => match serde_json::from_str::<serde_json::Value>(&raw) {
@@ -676,15 +708,7 @@ pub fn apply_profile_to_settings_file(
 
     root.insert("subagents".to_string(), serde_json::Value::Object(merged));
 
-    if let Some(parent) = settings_path.parent() {
-        std::fs::create_dir_all(parent).map_err(SubagentError::Spawn)?;
-    }
-    let mut text = serde_json::to_string_pretty(&serde_json::Value::Object(root)).map_err(|e| {
-        SubagentError::MalformedSettings(format!("could not serialize settings: {e}"))
-    })?;
-    text.push('\n');
-    std::fs::write(settings_path, text).map_err(SubagentError::Spawn)?;
-    Ok(())
+    write_settings_file(settings_path, &target, &root)
 }
 
 // =================================================================================================
@@ -816,7 +840,12 @@ pub fn write_provider_catalog(
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )]
 
     use std::cell::RefCell;
 
@@ -1403,8 +1432,8 @@ mod tests {
     // apply_profile_to_settings_file: file-based, replaces ONLY subagents (pi applySubagentProfile)
     // -----------------------------------------------------------------------------------------
 
-    #[test]
-    fn apply_profile_to_settings_file_replaces_only_subagents_key() {
+    #[tokio::test]
+    async fn apply_profile_to_settings_file_replaces_only_subagents_key() {
         // Mirrors pi profiles.test.ts "applies a saved profile by replacing only settings.subagents".
         let tmp = tempfile::tempdir().expect("create tempdir");
         let settings_path = tmp.path().join("agent").join("settings.json");
@@ -1420,7 +1449,9 @@ mod tests {
             medium: "openai-codex/gpt-5.4-mini".to_string(),
             strong: "openai-codex/gpt-5.5".to_string(),
         });
-        apply_profile_to_settings_file(&settings_path, &profile).expect("apply");
+        apply_profile_to_settings_file(&settings_path, &profile)
+            .await
+            .expect("apply");
 
         let written: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&settings_path).expect("read"))
@@ -1440,8 +1471,8 @@ mod tests {
         assert_eq!(scout, Some("openai-codex/gpt-5.3-codex-spark"));
     }
 
-    #[test]
-    fn apply_profile_to_settings_file_creates_file_when_absent() {
+    #[tokio::test]
+    async fn apply_profile_to_settings_file_creates_file_when_absent() {
         let tmp = tempfile::tempdir().expect("create tempdir");
         let settings_path = tmp.path().join("nested").join("settings.json");
         let profile = NamedProfile {
@@ -1450,7 +1481,9 @@ mod tests {
                 ..Default::default()
             },
         };
-        apply_profile_to_settings_file(&settings_path, &profile).expect("apply");
+        apply_profile_to_settings_file(&settings_path, &profile)
+            .await
+            .expect("apply");
         let written: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&settings_path).expect("read"))
                 .expect("parse");
@@ -1470,8 +1503,8 @@ mod tests {
     /// `/subagents-load-profile` must not be a settings eraser. Unrelated `subagents.*` keys the
     /// profile says nothing about — the ones a user set once and never thinks about again — have
     /// to survive a profile switch.
-    #[test]
-    fn loading_a_profile_preserves_unrelated_subagent_settings() {
+    #[tokio::test]
+    async fn loading_a_profile_preserves_unrelated_subagent_settings() {
         let tmp = tempfile::tempdir().expect("create tempdir");
         let settings_path = tmp.path().join("agent").join("settings.json");
         std::fs::create_dir_all(settings_path.parent().unwrap()).expect("mkdir");
@@ -1494,7 +1527,9 @@ mod tests {
             medium: "openai-codex/gpt-5.4-mini".to_string(),
             strong: "openai-codex/gpt-5.5".to_string(),
         });
-        apply_profile_to_settings_file(&settings_path, &profile).expect("apply");
+        apply_profile_to_settings_file(&settings_path, &profile)
+            .await
+            .expect("apply");
 
         let written: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&settings_path).expect("read"))
@@ -1539,8 +1574,8 @@ mod tests {
     /// Both a scalar (`defaultModel`) and a structured value (`modelScope`) are contested here, so
     /// the assertion also covers the case where the profile's value must REPLACE the on-disk one
     /// wholesale rather than being merged into it.
-    #[test]
-    fn a_profile_key_overrides_the_value_already_on_disk() {
+    #[tokio::test]
+    async fn a_profile_key_overrides_the_value_already_on_disk() {
         let tmp = tempfile::tempdir().expect("create tempdir");
         let settings_path = tmp.path().join("settings.json");
         std::fs::write(
@@ -1567,7 +1602,9 @@ mod tests {
                 ..Default::default()
             },
         };
-        apply_profile_to_settings_file(&settings_path, &profile).expect("apply");
+        apply_profile_to_settings_file(&settings_path, &profile)
+            .await
+            .expect("apply");
 
         let written: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&settings_path).expect("read"))
@@ -1609,8 +1646,8 @@ mod tests {
     /// Layer 3 in isolation: an agent the OLD profile pinned and the NEW profile does not mention
     /// must be unpinned. A key-by-key merge of `agentOverrides` could never do this, which is why
     /// pi assigns it unconditionally.
-    #[test]
-    fn a_profile_switch_drops_the_previous_profiles_agent_overrides() {
+    #[tokio::test]
+    async fn a_profile_switch_drops_the_previous_profiles_agent_overrides() {
         let tmp = tempfile::tempdir().expect("create tempdir");
         let settings_path = tmp.path().join("settings.json");
         std::fs::write(
@@ -1633,7 +1670,9 @@ mod tests {
                 ..Default::default()
             },
         };
-        apply_profile_to_settings_file(&settings_path, &profile).expect("apply");
+        apply_profile_to_settings_file(&settings_path, &profile)
+            .await
+            .expect("apply");
 
         let written: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&settings_path).expect("read"))
@@ -1654,8 +1693,8 @@ mod tests {
     /// empty map to no key at all, so layer 2 contributes nothing here — only the unconditional
     /// `agentOverrides` assignment (pi's `agentOverrides: profile.subagents.agentOverrides`, which
     /// for a validated-but-empty profile is `{}`) clears the previous profile's pins.
-    #[test]
-    fn a_profile_with_no_agent_overrides_clears_the_previous_ones() {
+    #[tokio::test]
+    async fn a_profile_with_no_agent_overrides_clears_the_previous_ones() {
         let tmp = tempfile::tempdir().expect("create tempdir");
         let settings_path = tmp.path().join("settings.json");
         std::fs::write(
@@ -1670,7 +1709,9 @@ mod tests {
                 ..Default::default()
             },
         };
-        apply_profile_to_settings_file(&settings_path, &profile).expect("apply");
+        apply_profile_to_settings_file(&settings_path, &profile)
+            .await
+            .expect("apply");
 
         let written: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&settings_path).expect("read"))
@@ -1688,12 +1729,12 @@ mod tests {
         );
     }
 
-    #[test]
-    fn apply_profile_to_settings_file_rejects_non_object_settings() {
+    #[tokio::test]
+    async fn apply_profile_to_settings_file_rejects_non_object_settings() {
         let tmp = tempfile::tempdir().expect("create tempdir");
         let settings_path = tmp.path().join("settings.json");
         std::fs::write(&settings_path, "[1, 2, 3]").expect("seed array settings");
-        let result = apply_profile_to_settings_file(&settings_path, &NamedProfile::default());
+        let result = apply_profile_to_settings_file(&settings_path, &NamedProfile::default()).await;
         assert!(matches!(result, Err(SubagentError::MalformedSettings(_))));
     }
 
@@ -1703,13 +1744,13 @@ mod tests {
 
     /// `/subagents-load-profile`'s order (`extension/host/profiles.rs::load_profile_into_settings`):
     /// load, and apply only a profile that loaded.
-    fn load_then_apply(
+    async fn load_then_apply(
         profiles_dir: &Path,
         name: &str,
         settings_path: &Path,
     ) -> Result<(), SubagentError> {
         let profile = load_profile(profiles_dir, name)?;
-        apply_profile_to_settings_file(settings_path, &profile)
+        apply_profile_to_settings_file(settings_path, &profile).await
     }
 
     fn machine_profile(dir: &Path, name: &str, machine: &serde_json::Value) {
@@ -1726,8 +1767,8 @@ mod tests {
     /// oversized or control-character `machine` refuses the profile with upstream's label and the
     /// settings file is left byte-for-byte as it was. Red before: `load_profile` only serde-parsed,
     /// so each of these was written into settings.
-    #[test]
-    fn an_invalid_profile_machine_is_refused_before_settings_are_written() {
+    #[tokio::test]
+    async fn an_invalid_profile_machine_is_refused_before_settings_are_written() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let settings_path = tmp.path().join("settings.json");
         std::fs::write(&settings_path, SEEDED_SETTINGS).expect("seed settings");
@@ -1753,6 +1794,7 @@ mod tests {
             let name = format!("bad{index}");
             machine_profile(tmp.path(), &name, machine);
             let err = load_then_apply(tmp.path(), &name, &settings_path)
+                .await
                 .expect_err("an invalid machine must refuse the profile");
             assert!(
                 matches!(err, SubagentError::MalformedSettings(_)),
@@ -1773,14 +1815,16 @@ mod tests {
 
     /// `machine: false` still clears the pin: it passes validation untouched and replaces the
     /// on-disk string machine, which the SUBA-100 carry would otherwise keep.
-    #[test]
-    fn a_false_profile_machine_still_clears_the_pin() {
+    #[tokio::test]
+    async fn a_false_profile_machine_still_clears_the_pin() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let settings_path = tmp.path().join("settings.json");
         std::fs::write(&settings_path, SEEDED_SETTINGS).expect("seed settings");
         machine_profile(tmp.path(), "unpin", &serde_json::json!(false));
 
-        load_then_apply(tmp.path(), "unpin", &settings_path).expect("false is valid");
+        load_then_apply(tmp.path(), "unpin", &settings_path)
+            .await
+            .expect("false is valid");
 
         let written: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&settings_path).expect("read"))
@@ -1792,14 +1836,16 @@ mod tests {
     }
 
     /// A valid name is applied, trimmed as `validateOptionalMachine` returns it.
-    #[test]
-    fn a_valid_profile_machine_is_applied_trimmed() {
+    #[tokio::test]
+    async fn a_valid_profile_machine_is_applied_trimmed() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let settings_path = tmp.path().join("settings.json");
         std::fs::write(&settings_path, SEEDED_SETTINGS).expect("seed settings");
         machine_profile(tmp.path(), "gpu", &serde_json::json!("  gpu-box  "));
 
-        load_then_apply(tmp.path(), "gpu", &settings_path).expect("a valid machine applies");
+        load_then_apply(tmp.path(), "gpu", &settings_path)
+            .await
+            .expect("a valid machine applies");
 
         let written: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&settings_path).expect("read"))
@@ -1881,5 +1927,101 @@ mod tests {
             provider_models_path(tmp.path(), "../escape"),
             Err(SubagentError::UnsafePathToken(_))
         ));
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // SUBA-184: a profile load holds the agent-override writers' settings lock
+    // -----------------------------------------------------------------------------------------
+
+    /// (d) A profile load waits for a held settings lock, and both the change the holder made
+    /// under it (a sibling top-level key) and the profile survive. The test plays a concurrent
+    /// writer: it holds the lock the override writers take (`lock_settings_file` on the physical
+    /// target) and READS, then starts the load, checks it is still pending after 300 ms, writes
+    /// its read + the sibling key, and releases.
+    ///
+    /// Red at HEAD: the load is not blocked, so it saves first and the holder's save (from its
+    /// earlier read) then drops the profile. The only possible flake is a FALSE PASS at HEAD (a
+    /// load that takes over 300 ms to start and then lands after the holder's save); after the fix
+    /// the load cannot read before the release.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_profile_load_waits_for_a_held_settings_lock_and_both_changes_survive() {
+        use crate::discovery::settings_write::{
+            lock_settings_file, settings_write_target, write_settings_file,
+        };
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let settings_path = tmp.path().join("settings.json");
+        std::fs::write(&settings_path, r#"{ "theme": "dark" }"#).expect("seed");
+        let target = settings_write_target(&settings_path).expect("target");
+        let held = lock_settings_file(&target).await.expect("hold lock");
+        let mut sibling: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(&std::fs::read_to_string(&settings_path).expect("read"))
+                .expect("parse");
+
+        let profile = NamedProfile {
+            subagents: SubagentSettings {
+                default_model: Some("from-profile".to_string()),
+                ..Default::default()
+            },
+        };
+        let load_path = settings_path.clone();
+        let mut load =
+            tokio::spawn(async move { apply_profile_to_settings_file(&load_path, &profile).await });
+        let early = tokio::time::timeout(std::time::Duration::from_millis(300), &mut load).await;
+
+        sibling.insert("sibling".to_string(), serde_json::json!(1));
+        write_settings_file(&settings_path, &target, &sibling).expect("write under lock");
+        drop(held);
+
+        let blocked = early.is_err();
+        // A load that already finished must not be awaited again (its handle is spent).
+        match early {
+            Ok(joined) => joined,
+            Err(_) => load.await,
+        }
+        .expect("load task")
+        .expect("apply");
+        let written: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings_path).expect("read"))
+                .expect("parse");
+        assert_eq!(written["theme"], serde_json::json!("dark"));
+        assert_eq!(written["sibling"], serde_json::json!(1), "{written}");
+        assert_eq!(
+            written["subagents"]["defaultModel"],
+            serde_json::json!("from-profile"),
+            "{written}"
+        );
+        assert!(blocked, "the profile load must wait for the held lock");
+    }
+
+    /// A profile load through a symlinked `settings.json` lands on the link's target and keeps
+    /// the link, as the override writers do (SUBA-171).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_profile_load_through_a_symlink_updates_the_target_and_keeps_the_link() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let target = tmp.path().join("real.json");
+        let link = tmp.path().join("settings.json");
+        std::fs::write(&target, r#"{ "theme": "dark" }"#).expect("seed");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink");
+        let profile = NamedProfile {
+            subagents: SubagentSettings {
+                default_model: Some("p".to_string()),
+                ..Default::default()
+            },
+        };
+        apply_profile_to_settings_file(&link, &profile)
+            .await
+            .expect("apply");
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .expect("meta")
+                .file_type()
+                .is_symlink()
+        );
+        assert!(!tmp.path().join("settings.json.lock").exists());
+        let written: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&target).expect("read")).expect("parse");
+        assert_eq!(written["theme"], serde_json::json!("dark"));
+        assert_eq!(written["subagents"]["defaultModel"], serde_json::json!("p"));
     }
 }

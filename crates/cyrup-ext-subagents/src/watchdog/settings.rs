@@ -42,6 +42,11 @@
 //! `JSON.stringify(settings, null, 2)` preserves key insertion order, while `serde_json`'s `Map` is
 //! a `BTreeMap` (the `preserve_order` feature is not enabled workspace-wide), so a rewritten file
 //! comes back with its keys sorted. The bytes differ; the settings do not.
+//!
+//! SUBA-184: both writers hold the settings lock from the read through the write (pi
+//! `withSettingsFileLease`, `2d3f6471`) — the same `flock` on the physical target's `<file>.lock`
+//! the agent-override writers take — and save atomically (`[CYRUP-DELTA]`: pi keeps a direct
+//! write here). See `edit_watchdog_settings`.
 
 use std::path::{Path, PathBuf};
 
@@ -1006,33 +1011,77 @@ fn settings_path_for_write(scope: WatchdogSettingsWriteScope, cwd: Option<&Path>
     }
 }
 
-/// `writeSettingsFile` (`settings.ts:508-512`) — 2-space JSON plus a trailing newline.
+/// `writeSettingsFile` (`settings.ts:508-512`) — 2-space JSON plus a trailing newline, now
+/// delivered through the agent-override writer's `write_settings_file`
+/// (`crate::discovery::settings_write`) onto the PHYSICAL `target`.
+///
+/// `[CYRUP-DELTA]` (SUBA-184) atomic, where pi writes in place. pi @ad11b7ab:
+///
+/// ```text
+/// function writeSettingsFile(settingsPath: string, settings: Record<string, unknown>): string {
+///     fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
+///     fs.writeFileSync(settingsPath, `${JSON.stringify(settings, null, 2)}\n`, "utf-8");
+///     return settingsPath;
+/// }
+/// ```
+///
+/// and `2d3f6471` keeps that on purpose ("Profile and Watchdog keep their direct write"). cyrup
+/// takes the SUBA-029/171 temp-then-rename instead (the SUBA-184 row's Fix), so a crash mid-save
+/// leaves the previous `settings.json` readable rather than truncated; it also keeps an existing
+/// file's mode, refuses a read-only file (pi `accessSync(W_OK)` in the override writer), and lands
+/// on a symlink's target with the link left in place — all as the override writer already does for
+/// the same file. The bytes are unchanged: the same two-space indent and trailing newline.
 ///
 /// # Errors
 /// Any filesystem failure, as the message the slash command renders.
-fn write_settings_file(settings_path: &Path, settings: &Value) -> Result<PathBuf, String> {
-    if let Some(parent) = settings_path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| {
-            format!(
-                "Failed to create settings directory '{}': {e}",
-                parent.display()
-            )
-        })?;
-    }
-    let body = serde_json::to_string_pretty(settings)
-        .map_err(|e| format!("Failed to serialize settings: {e}"))?;
-    std::fs::write(settings_path, format!("{body}\n")).map_err(|e| {
+fn write_settings_file(
+    settings_path: &Path,
+    target: &Path,
+    settings: &Value,
+) -> Result<PathBuf, String> {
+    let root = settings.as_object().ok_or_else(|| {
         format!(
-            "Failed to write settings file '{}': {e}",
+            "Settings file '{}' must contain a JSON object.",
             settings_path.display()
         )
     })?;
+    crate::discovery::settings_write::write_settings_file(settings_path, target, root)
+        .map_err(settings_error_text)?;
     Ok(settings_path.to_path_buf())
+}
+
+/// The text a `SubagentError` from the shared settings writer renders as here: the watchdog
+/// writers return bare messages (pi's thrown `error.message`), so `MalformedSettings`' payload is
+/// used as-is rather than under its "malformed subagents settings: " prefix.
+fn settings_error_text(error: crate::error::SubagentError) -> String {
+    match error {
+        crate::error::SubagentError::MalformedSettings(message) => message,
+        other => other.to_string(),
+    }
 }
 
 /// The read-modify-write body shared by both writers: read strictly, dig/create
 /// `subagents.watchdog` (`ensureWatchdogSettings`, `settings.ts:490-493`), let `edit` mutate it,
 /// write back.
+///
+/// SUBA-184: the whole read-edit-write holds the settings lock — pi `withSettingsFileLease`
+/// around each writer's body (`2d3f6471`, `src/watchdog/settings.ts` @ad11b7ab):
+///
+/// ```text
+/// return withSettingsFileLease(settingsPath, () => {
+///     const settings = readSettingsFileStrict(settingsPath);
+///     const watchdog = ensureWatchdogSettings(settings, meta);
+///     ...
+///     return writeSettingsFile(settingsPath, settings);
+/// });
+/// ```
+///
+/// The lock is the SAME one the agent-override writers hold (`flock` on the physical target's
+/// `<file>.lock`, `discovery::settings_write::lock_settings_file`), taken synchronously with pi's
+/// 200 ms bound because these writers are sync, as pi's are. So a watchdog toggle and a
+/// concurrent override save or profile load on one `settings.json` serialize, and a symlinked file
+/// is locked on its target's sidecar. `[CYRUP-DELTA]` `flock`, not pi's `mkdir` lease — see
+/// `lock_settings_file_blocking`.
 fn edit_watchdog_settings<F>(
     settings_path: &Path,
     meta: &ParseMeta,
@@ -1041,6 +1090,12 @@ fn edit_watchdog_settings<F>(
 where
     F: FnOnce(&mut Map<String, Value>, &ParseMeta) -> Result<(), String>,
 {
+    use crate::discovery::settings_write::{
+        SETTINGS_LEASE_WAIT, lock_settings_file_blocking, settings_write_target,
+    };
+    let target = settings_write_target(settings_path).map_err(settings_error_text)?;
+    let _lock =
+        lock_settings_file_blocking(&target, SETTINGS_LEASE_WAIT).map_err(settings_error_text)?;
     let mut settings = read_settings_file_strict(settings_path)?;
     let root = settings
         .as_object_mut()
@@ -1050,7 +1105,7 @@ where
         let watchdog = ensure_object_field(subagents, "watchdog", "subagents.watchdog", meta)?;
         edit(watchdog, meta)?;
     }
-    write_settings_file(settings_path, &settings)
+    write_settings_file(settings_path, &target, &settings)
 }
 
 /// `targetSettingsObject` (`settings.ts:499-506`).
@@ -1096,16 +1151,32 @@ fn target_settings_object<'a>(
 /// # Errors
 /// An unreadable/unparseable settings file, or a write failure.
 pub fn write_user_watchdog_enabled(enabled: bool) -> Result<PathBuf, String> {
-    let settings_path = user_settings_path();
+    write_watchdog_enabled_at(&user_settings_path(), enabled)
+}
+
+/// [`write_user_watchdog_enabled`] against an explicit settings file — the same read-modify-write
+/// under the same lock, so tests need not touch the real user settings path.
+fn write_watchdog_enabled_at(settings_path: &Path, enabled: bool) -> Result<PathBuf, String> {
     let meta = ParseMeta {
         path: Some(settings_path.display().to_string()),
     };
-    edit_watchdog_settings(&settings_path, &meta, |watchdog, meta| {
-        watchdog.insert("enabled".to_string(), Value::Bool(enabled));
-        target_settings_object(watchdog, &WatchdogModelSettingsTarget::Main, meta)?
-            .insert("enabled".to_string(), Value::Bool(enabled));
-        Ok(())
+    edit_watchdog_settings(settings_path, &meta, |watchdog, meta| {
+        set_watchdog_enabled(watchdog, meta, enabled)
     })
+}
+
+/// The edit `writeUserWatchdogEnabled` makes inside its lease (`settings.ts` @ad11b7ab):
+/// `watchdog.enabled = enabled; targetSettingsObject(watchdog, { kind: "main" }, meta).enabled =
+/// enabled;`.
+fn set_watchdog_enabled(
+    watchdog: &mut Map<String, Value>,
+    meta: &ParseMeta,
+    enabled: bool,
+) -> Result<(), String> {
+    watchdog.insert("enabled".to_string(), Value::Bool(enabled));
+    target_settings_object(watchdog, &WatchdogModelSettingsTarget::Main, meta)?
+        .insert("enabled".to_string(), Value::Bool(enabled));
+    Ok(())
 }
 
 /// `writeWatchdogModelSettings(input)` (`settings.ts:524-535`).
@@ -1814,5 +1885,206 @@ mod tests {
         assert_eq!(result.errors.len(), 1);
         assert_eq!(result.errors[0].scope, WatchdogSettingsScope::Session);
         assert!(!result.config.enabled);
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // SUBA-184: the watchdog writers hold the agent-override writers' settings lock
+    // ---------------------------------------------------------------------------------------------
+
+    fn path_meta(path: &Path) -> ParseMeta {
+        ParseMeta {
+            path: Some(path.display().to_string()),
+        }
+    }
+
+    /// A probe on `<file>.lock` from the test's own fd — a different open file description from
+    /// the writer's, so `flock` excludes it exactly as it would another process. `true` = held by
+    /// someone else.
+    fn sidecar_is_held(sidecar: &Path) -> bool {
+        let probe = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(sidecar)
+            .expect("open sidecar probe");
+        match probe.try_lock() {
+            Ok(()) => false,
+            Err(std::fs::TryLockError::WouldBlock) => true,
+            Err(std::fs::TryLockError::Error(e)) => panic!("flock probe failed: {e}"),
+        }
+    }
+
+    /// (a) The lock spans read → write: inside the edit (after the read, before the write) the
+    /// physical target's `<file>.lock` is held. Red at HEAD: nothing locked, the probe wins.
+    #[test]
+    fn a_watchdog_edit_holds_the_settings_lock_between_read_and_write() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("settings.json");
+        std::fs::write(&path, r#"{"theme":"dark"}"#).expect("seed");
+        let sidecar = std::fs::canonicalize(tmp.path())
+            .expect("canonical dir")
+            .join("settings.json.lock");
+        let mut held_during_edit = None;
+        edit_watchdog_settings(&path, &path_meta(&path), |watchdog, meta| {
+            held_during_edit = Some(sidecar_is_held(&sidecar));
+            set_watchdog_enabled(watchdog, meta, true)
+        })
+        .expect("edit");
+        assert_eq!(
+            held_during_edit,
+            Some(true),
+            "lock must be held inside the edit"
+        );
+        assert!(!sidecar_is_held(&sidecar), "and released after it");
+        let written: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("read")).expect("parse");
+        assert_eq!(written["theme"], json!("dark"));
+        assert_eq!(written["subagents"]["watchdog"]["enabled"], json!(true));
+    }
+
+    /// (b) The row's Verify: a watchdog toggle (`write_user_watchdog_enabled`'s edit) and an agent
+    /// override save (`merge_builtin_agent_override`) on one file both survive. Deterministic
+    /// interleaving: the override save is started from INSIDE the watchdog edit — after its read,
+    /// before its write — on another thread with its own runtime, and must still be waiting when
+    /// 300 ms have passed; then the edit writes, releases, and the save goes through on top.
+    ///
+    /// Red at HEAD: the save is not blocked, writes first, and the watchdog's stale snapshot then
+    /// overwrites it. The only possible flake is a FALSE PASS at HEAD (a save that takes over
+    /// 300 ms to start would look blocked and land after the toggle); after the fix the save
+    /// cannot finish before the edit releases, so this cannot fail spuriously.
+    #[test]
+    fn a_watchdog_toggle_and_an_override_save_on_one_file_both_survive() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("settings.json");
+        std::fs::write(&path, r#"{"theme":"dark"}"#).expect("seed");
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let mut saver = None;
+        let mut blocked = None;
+        edit_watchdog_settings(&path, &path_meta(&path), |watchdog, meta| {
+            let save_path = path.clone();
+            saver = Some(std::thread::spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("runtime");
+                let mut fields = Map::new();
+                fields.insert("disabled".to_string(), json!(true));
+                let result = runtime.block_on(
+                    crate::discovery::settings_write::merge_builtin_agent_override(
+                        &save_path, "scout", &fields,
+                    ),
+                );
+                let _ = done_tx.send(());
+                result
+            }));
+            blocked = Some(
+                done_rx
+                    .recv_timeout(std::time::Duration::from_millis(300))
+                    .is_err(),
+            );
+            set_watchdog_enabled(watchdog, meta, true)
+        })
+        .expect("watchdog edit");
+        saver
+            .expect("saver started")
+            .join()
+            .expect("saver thread")
+            .expect("override save");
+        let written: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("read")).expect("parse");
+        assert_eq!(written["theme"], json!("dark"));
+        assert_eq!(written["subagents"]["watchdog"]["enabled"], json!(true));
+        assert_eq!(
+            written["subagents"]["watchdog"]["main"]["enabled"],
+            json!(true)
+        );
+        assert_eq!(
+            written["subagents"]["agentOverrides"]["scout"]["disabled"],
+            json!(true),
+            "the override save survives the toggle: {written}"
+        );
+        assert_eq!(
+            blocked,
+            Some(true),
+            "the override save must wait for the edit"
+        );
+    }
+
+    /// (c) The row's Verify, second half: a symlinked `settings.json` is locked on its TARGET's
+    /// sidecar (none appears beside the link), the link survives the atomic save, and the target
+    /// holds the edit. Red at HEAD: no lock anywhere, so the target's sidecar probe wins.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_settings_file_is_locked_on_its_targets_sidecar() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let real_dir = tmp.path().join("real");
+        let link_dir = tmp.path().join("link");
+        std::fs::create_dir_all(&real_dir).expect("real dir");
+        std::fs::create_dir_all(&link_dir).expect("link dir");
+        let target = real_dir.join("settings.json");
+        let link = link_dir.join("settings.json");
+        std::fs::write(&target, r#"{"theme":"dark"}"#).expect("seed");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink");
+        let target_sidecar = std::fs::canonicalize(&real_dir)
+            .expect("canonical real dir")
+            .join("settings.json.lock");
+        let link_sidecar = link_dir.join("settings.json.lock");
+
+        let mut observed = None;
+        let returned = edit_watchdog_settings(&link, &path_meta(&link), |watchdog, meta| {
+            observed = Some((sidecar_is_held(&target_sidecar), link_sidecar.exists()));
+            set_watchdog_enabled(watchdog, meta, true)
+        })
+        .expect("edit through link");
+
+        assert_eq!(
+            observed,
+            Some((true, false)),
+            "(target sidecar held, sidecar beside the link)"
+        );
+        assert!(!link_sidecar.exists(), "no sidecar beside the link");
+        assert_eq!(returned, link, "the path named back is the one written to");
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .expect("link meta")
+                .file_type()
+                .is_symlink(),
+            "the link survives the save"
+        );
+        let written: Value =
+            serde_json::from_str(&std::fs::read_to_string(&target).expect("read")).expect("parse");
+        assert_eq!(written["theme"], json!("dark"));
+        assert_eq!(written["subagents"]["watchdog"]["enabled"], json!(true));
+    }
+
+    /// `write_watchdog_enabled_at` — the body of `write_user_watchdog_enabled` — is the same
+    /// locked edit, and a held lock makes it fail with pi's timeout sentence after the bound.
+    #[test]
+    fn a_watchdog_toggle_times_out_with_pis_sentence_while_the_lock_is_held() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("settings.json");
+        std::fs::write(&path, "{}").expect("seed");
+        let absolute = std::fs::canonicalize(tmp.path())
+            .expect("canonical dir")
+            .join("settings.json");
+        let peer = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(absolute.with_file_name("settings.json.lock"))
+            .expect("peer sidecar");
+        peer.lock().expect("peer flock");
+        let error = write_watchdog_enabled_at(&path, true).expect_err("held lock");
+        assert_eq!(
+            error,
+            format!(
+                "Timed out waiting for another process to finish updating {}.",
+                absolute.display()
+            )
+        );
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), "{}");
+        drop(peer);
+        write_watchdog_enabled_at(&path, true).expect("free lock");
     }
 }
