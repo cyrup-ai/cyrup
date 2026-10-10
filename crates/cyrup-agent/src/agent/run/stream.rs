@@ -60,9 +60,12 @@ impl RunCtx {
             // Same bare await for `convertToLlm` (agent-loop.ts:295) → same `handleRunFailure` text.
             Err(e) => return Err(RunFailure(e.to_string())),
         };
-        // The declarations the transcript records are not repeated in the message list: the
-        // request declares its tools through `Context::tools`, below.
-        let llm = declare::without_tool_declarations(llm);
+        // AGENT-039 — the declarations STAY in the message list; only the HIDDEN ones are
+        // projected out (pi `_installHiddenDeclarationsProjection`). Clearing them all, as this
+        // did before, made the native mid-conversation tool-change wire shapes unreachable for
+        // every adapter that can express them (PROV-133), because their gate reads the initial
+        // system message's `toolsAdded`.
+        let llm = declare::project_hidden_declarations(llm, self.tools.hidden_declarations());
 
         // Dynamic key wins; fall back to the run's static key (Pi `... || config.apiKey`,
         // agent-loop.ts:301-302).

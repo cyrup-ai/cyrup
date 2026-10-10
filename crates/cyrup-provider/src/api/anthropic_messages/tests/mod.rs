@@ -11,6 +11,7 @@ mod convert;
 mod decode;
 mod deferred_tools;
 mod headers;
+mod inline_tools;
 mod mid_convo;
 mod mid_convo_effort;
 mod params;

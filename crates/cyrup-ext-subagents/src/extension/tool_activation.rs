@@ -102,10 +102,13 @@ pub(crate) fn compat_adds_tools_without_checkpoint(model: Option<&Value>) -> boo
 
 /// The gate `auto` actually uses `[CYRUP-DELTA]`: upstream's
 /// [`compat_adds_tools_without_checkpoint`] AND cyrup's adapter for that api really sending the
-/// change natively ([`cyrup_provider::api::emits_native_tool_additions`], `false` for every api
-/// until PROV-133 / "PROV-083b" land). Without the second half, `auto` would pick the loader for
-/// models whose catalog flags promise a cache-safe enable that cyrup's request builders do not yet
-/// deliver, and the first `subagents_enable` would resend the whole conversation uncached.
+/// change natively ([`cyrup_provider::api::emits_native_tool_additions`] — `true` for
+/// `anthropic-messages` since PROV-133, still `false` for the rest). Without the second half, `auto`
+/// would pick the loader for models whose catalog flags promise a cache-safe enable that cyrup's
+/// request builders do not deliver, and the first `subagents_enable` would resend the whole
+/// conversation uncached. Now that the Anthropic adapter emits the change natively, `auto` DOES
+/// choose the lazy loader for a mid-convo-capable Anthropic model — the behaviour change PROV-133
+/// was meant to buy, and the reason that row's closure had to flip the predicate too.
 pub(crate) fn adds_tools_without_checkpoint(model: Option<&Value>) -> bool {
     compat_adds_tools_without_checkpoint(model)
         && model

@@ -3,7 +3,8 @@
 use super::cache::get_cache_control;
 use super::claude_code::to_claude_code_name;
 use super::compat::{
-    force_adaptive_thinking, get_anthropic_compat, off_is_not_null, supports_mid_convo_effort,
+    force_adaptive_thinking, get_anthropic_compat, initial_tools, off_is_not_null,
+    supports_mid_convo_effort, uses_native_tool_changes,
 };
 use super::messages::{convert_messages, insert_thinking_level_messages};
 use super::options::AnthropicThinkingDisplay;
@@ -110,6 +111,10 @@ pub(crate) fn build_params(
     } else {
         &|name: &str| name.to_string()
     };
+    // PROV-133 — the native mid-conversation tool-change shape. Computed from the SAME predicate
+    // the header builder uses, so the `inline-tools` beta and the body cannot disagree.
+    let initial_tools = initial_tools(&transformed);
+    let native_tool_changes = uses_native_tool_changes(model, &transformed);
     let placement = split_deferred_tools(
         &transformed,
         &ctx.tools,
@@ -157,6 +162,20 @@ pub(crate) fn build_params(
 
     let mut obj = Map::new();
     obj.insert("model".to_string(), json!(model.id.as_str()));
+    // `convertToolDefinitions` (pi `:1345-1352`): one definition per added tool, the same shape
+    // `convert_tools` emits for the request-level list, minus any cache breakpoint — a definition
+    // carried by value in a message is not part of the cached tool prefix.
+    let convert_definitions = |tools: &[crate::ToolDef]| -> Vec<Value> {
+        convert_tools(
+            tools,
+            is_oauth,
+            compat.supports_eager_tool_input_streaming,
+            compat.supports_strict_tools,
+            None,
+            false,
+        )
+        .unwrap_or_default()
+    };
     let converted = convert_messages(
         &transformed,
         is_oauth,
@@ -167,6 +186,10 @@ pub(crate) fn build_params(
         // Pi `model.compat?.supportsMidConvoEffort === true ? model.provider : undefined` (`:1061`):
         // only a turn produced by the SAME provider on this api can have its effort replayed.
         managed_effort.as_ref().map(|_| &model.provider),
+        // PROV-133 — `Some` only under the native shape, so a model that cannot express the blocks
+        // keeps today's behaviour exactly.
+        native_tool_changes
+            .then_some(&convert_definitions as &dyn Fn(&[crate::ToolDef]) -> Vec<Value>),
     );
     obj.insert(
         "messages".to_string(),
@@ -219,12 +242,30 @@ pub(crate) fn build_params(
     // `cache_control` marks the last IMMEDIATE tool only — Pi passes `undefined` for the deferred
     // call, so the cache breakpoint never lands on a definition that is not part of the stable
     // prefix.
-    if !immediate_tools.is_empty() || !deferred_tools.is_empty() {
-        let tool_cc = if compat.supports_cache_control_on_tools {
-            cache_control.as_ref()
-        } else {
-            None
-        };
+    let tool_cc = if compat.supports_cache_control_on_tools {
+        cache_control.as_ref()
+    } else {
+        None
+    };
+    if native_tool_changes {
+        // PROV-133, pi `:1204-1213`: *"Initial tools stay active with the cache breakpoint on the
+        // last one, followed by the placeholder. The list never changes afterwards: later tools are
+        // defined by value in `tool_addition` blocks and withdrawn by `tool_removal`, so the cached
+        // prefix survives every tool change."*
+        //
+        // The deferred split is deliberately NOT consulted here: the request-level list is fixed by
+        // construction, so there is nothing to place.
+        let mut tools = convert_tools(
+            &initial_tools,
+            is_oauth,
+            compat.supports_eager_tool_input_streaming,
+            compat.supports_strict_tools,
+            tool_cc,
+            false,
+        )?;
+        tools.push(deferred_tool_placeholder());
+        obj.insert("tools".to_string(), Value::Array(tools));
+    } else if !immediate_tools.is_empty() || !deferred_tools.is_empty() {
         let mut tools = convert_tools(
             &immediate_tools,
             is_oauth,
@@ -377,4 +418,26 @@ pub(super) fn normalize_tool_call_id(id: &str) -> String {
         })
         .take(64)
         .collect()
+}
+
+/// PROV-133 — pi `DEFERRED_TOOL_PLACEHOLDER` (`anthropic-messages.ts:199-210` @v1.1.0), declared
+/// whenever native tool changes are in use.
+///
+/// pi's reason, verbatim: *"Anthropic adds hidden prompt scaffolding for mid-conversation tool
+/// changes; declaring this placeholder from the first request keeps that scaffolding in the cached
+/// prefix, so the first tool change does not invalidate the cache (measured: full miss without
+/// it). It is never activated and the model cannot see it."*
+///
+/// CYRUP-DELTA on the NAME only: pi's is `__pi_deferred_placeholder__`. This is cyrup's own
+/// scaffolding, never user-visible and never callable, and the only property the wire depends on is
+/// that it is byte-stable across requests — which it is, being a constant. The name is renamed for
+/// the same reason cyrup renames pi's other public strings, and nothing about the behaviour or the
+/// cache prefix changes.
+fn deferred_tool_placeholder() -> Value {
+    serde_json::json!({
+        "name": "__cyrup_deferred_placeholder__",
+        "description": "Reserved placeholder. Never available. Never call this.",
+        "input_schema": { "type": "object", "properties": {}, "required": [] },
+        "defer_loading": true,
+    })
 }

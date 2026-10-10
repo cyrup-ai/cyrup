@@ -307,28 +307,64 @@ fn upstreams_predicate_matches_its_fourteen_row_table() {
     }
 }
 
-/// `[CYRUP-DELTA]` — the gate `auto` uses also needs the adapter to send the change natively,
-/// which no cyrup adapter does yet (PROV-133), so even the table's qualifying rows do not qualify.
+/// `[CYRUP-DELTA]` — the gate `auto` uses is upstream's predicate AND the adapter for that api
+/// really sending the change natively. Since PROV-133 that is true for `anthropic-messages` and
+/// still false everywhere else, so a row qualifies only if it does both.
+///
+/// This replaces `the_cyrup_gate_refuses_every_row_until_an_adapter_emits_native_tool_additions`,
+/// which asserted that NO row qualified — the pin PROV-133 was required to break.
 #[test]
-fn the_cyrup_gate_refuses_every_row_until_an_adapter_emits_native_tool_additions() {
-    for (case, _) in upstream_predicate_table() {
-        assert!(!adds_tools_without_checkpoint(case.as_ref()), "{case:?}");
+fn the_cyrup_gate_needs_upstreams_flags_and_a_native_emitter() {
+    for (case, upstream) in upstream_predicate_table() {
+        let native = case
+            .as_ref()
+            .and_then(|m| m.get("api"))
+            .and_then(Value::as_str)
+            .is_some_and(cyrup_provider::api::emits_native_tool_additions);
+        assert_eq!(
+            adds_tools_without_checkpoint(case.as_ref()),
+            upstream && native,
+            "{case:?}"
+        );
     }
 }
 
-/// With the gate, a fresh `auto` session is eager on every row of the table: `subagent` active,
-/// no loader. When PROV-133 flips `emits_native_tool_additions` for an api, this test must change
-/// for that api's rows, which is the point.
+/// A fresh `auto` session is eager — `subagent` active, no loader — on every row EXCEPT one whose
+/// api emits tool additions natively and whose compat flags qualify. That exception is what
+/// PROV-133 bought: on a mid-convo-capable Anthropic model the session starts lazy, with the
+/// loader and without the eager `subagent` in the prompt.
+///
+/// This replaces `auto_starts_every_fresh_session_eager_while_no_adapter_emits_tool_additions`,
+/// whose own doc comment said it "must change for that api's rows, which is the point".
 #[tokio::test]
-async fn auto_starts_every_fresh_session_eager_while_no_adapter_emits_tool_additions() {
-    for (case, _) in upstream_predicate_table() {
+async fn auto_starts_lazy_only_where_the_adapter_emits_tool_additions_natively() {
+    for (case, upstream) in upstream_predicate_table() {
+        let native = case
+            .as_ref()
+            .and_then(|m| m.get("api"))
+            .and_then(Value::as_str)
+            .is_some_and(cyrup_provider::api::emits_native_tool_additions);
+        let lazy = upstream && native;
+
         let host = FakeHost::new(Vec::new(), &[]).with_model(case.clone());
         let state = registered(ToolActivationMode::Auto);
         state.on_session_start_or_tree(host.services()).await;
         let selected = start_agent(&state, &host);
-        assert!(selected.iter().any(|n| n == "subagent"), "{case:?}");
-        assert!(!selected.iter().any(|n| n == LOADER_NAME), "{case:?}");
-        assert!(!host.has(LOADER_NAME), "{case:?}");
+
+        if lazy {
+            assert!(
+                selected.iter().any(|n| n == LOADER_NAME),
+                "a native-emitter row must start with the loader: {case:?}"
+            );
+            assert!(
+                !selected.iter().any(|n| n == "subagent"),
+                "a native-emitter row must not start eager: {case:?}"
+            );
+        } else {
+            assert!(selected.iter().any(|n| n == "subagent"), "{case:?}");
+            assert!(!selected.iter().any(|n| n == LOADER_NAME), "{case:?}");
+            assert!(!host.has(LOADER_NAME), "{case:?}");
+        }
     }
 }
 

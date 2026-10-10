@@ -181,6 +181,19 @@ impl AgentSession {
         Self::lock(&self.base_prompt).sections().clone()
     }
 
+    /// The tool names whose declarations requests leave out (pi `this._hiddenDeclarations`,
+    /// `core/agent-session.ts:476` @v1.1.0), read from the live loadout.
+    ///
+    /// AGENT-039: this is what `PolicyHooks::transform_context` projects out of the transcript's
+    /// system messages. Everything NOT in this set stays declared in the message list, which is
+    /// what makes the native mid-conversation tool-change wire shapes reachable (PROV-133).
+    pub fn hidden_declarations(&self) -> std::collections::BTreeSet<String> {
+        Self::lock(&self.dynamic_tools)
+            .hidden_names()
+            .into_iter()
+            .collect()
+    }
+
     /// The prompt a `before_agent_start` handler FORCED for the CURRENT run, if any (pi
     /// `this._runSystemPromptOptions?.forceSystemPrompt`, `core/agent-session.ts:1791` @v1.1.0).
     /// `None` between runs and whenever no handler returned a prompt.

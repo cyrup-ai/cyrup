@@ -99,6 +99,48 @@ has to travel as `Authorization: Bearer`, so cyrup skips past it when picking a 
 falls through to `ANTHROPIC_OAUTH_TOKEN` or `ANTHROPIC_API_KEY`. Setting it alone still makes the
 provider report as configured.
 
+## Workload identity federation (no API key at all)
+
+On a production workload that already has a platform-issued identity — an EKS or GKE projected
+service-account token, a GitHub Actions JWT, a Kubernetes service account, a SPIFFE SVID — cyrup can
+authenticate to `anthropic` by exchanging that identity token for a short-lived Anthropic access
+token. Nothing long-lived is stored anywhere, and there is no `sk-ant-api...` key to rotate.
+
+Set four variables, and `ANTHROPIC_WORKSPACE_ID` as a fifth when the federation rule covers more
+than one workspace:
+
+```bash
+export ANTHROPIC_FEDERATION_RULE_ID=fdrl_...          # the rule to evaluate
+export ANTHROPIC_ORGANIZATION_ID=00000000-0000-...    # your Anthropic organization
+export ANTHROPIC_SERVICE_ACCOUNT_ID=svac_...          # the identity the token acts as
+export ANTHROPIC_IDENTITY_TOKEN_FILE=/var/run/secrets/anthropic.com/token
+# export ANTHROPIC_WORKSPACE_ID=wrkspc_...            # only if the rule spans workspaces
+```
+
+Where your platform hands you the JWT as a variable rather than a file, set
+`ANTHROPIC_IDENTITY_TOKEN` to the token itself instead of `ANTHROPIC_IDENTITY_TOKEN_FILE`. When both
+are set the file wins, because a projected file is re-read on every exchange and so is always
+current.
+
+Three things are worth knowing:
+
+- **Federation is last in line.** `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_OAUTH_TOKEN`,
+  `ANTHROPIC_API_KEY` and a credential stored by `/login` all win over it. If federation seems to be
+  ignored, one of those is set — and note that an *empty* `ANTHROPIC_API_KEY=""` counts as absent in
+  cyrup, so that particular trap does not apply here.
+- **All four variables are required.** Three of four does not half-activate: cyrup reports the
+  provider as unconfigured rather than attempting an exchange that would be rejected.
+- **A rejected exchange tells you very little, by design.** Anthropic answers every denial with the
+  same opaque `401 Authentication failed`, whatever actually failed — a mismatched issuer, an
+  expired token, claims that do not satisfy the rule, a rule spanning several workspaces with no
+  `ANTHROPIC_WORKSPACE_ID`. The real reason is recorded against the attempt in the Claude Console's
+  Workload Identity Federation authentication history, which is where cyrup's error message points
+  you.
+
+Set-up of the Console side (the service account, the federation issuer and the rule) is Anthropic's
+own documentation: see
+[Workload Identity Federation](https://platform.claude.com/docs/en/manage-claude/workload-identity-federation).
+
 `amazon-bedrock` and `google-vertex` have no key variable of their own — they use whatever cloud
 credentials are already ambient in your shell, an AWS profile or access keys for Bedrock and
 Application Default Credentials for Vertex. The exact set of variables each one accepts is in

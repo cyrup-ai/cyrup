@@ -17,6 +17,7 @@ use crate::event::AgentMessage;
 use cyrup_core::{Message, SystemMessage, ToolDef};
 use cyrup_provider::utils::transcript::ToolStateChanges;
 use cyrup_provider::{get_current_tools, get_tool_state_changes};
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 /// Pi `declareToolChanges` (`agent-loop.ts:333-363` @v1.0.1): the `pending` messages with the tool
@@ -114,28 +115,51 @@ fn with_tool_changes(message: &SystemMessage, changes: ToolStateChanges) -> Syst
     }
 }
 
-/// The request's view of a transcript: system messages without their tool declarations.
+/// The request's view of a transcript: every tool declaration kept EXCEPT the hidden ones.
 ///
-/// pi derives a request's tools from the transcript replay, minus the declarations a
-/// `prepareLoadout` hook hides (`_installHiddenDeclarationsProjection`, `agent-session.ts:1721-1738`
-/// @v1.0.1). cyrup's request carries those tools as `Context::tools` — the loadout's ADVERTISED set,
-/// which is that same replay minus the same hidden names, by construction of
-/// [`declare_tool_changes`] — so the declarations inside the transcript are not repeated in the
-/// message list: a provider that replays them would declare every tool twice, and a hidden one
-/// once. A system message left with nothing in it is dropped (pi keeps it as an empty message,
-/// which no provider renders as anything).
-pub(crate) fn without_tool_declarations(messages: Vec<Message>) -> Vec<Message> {
+/// Port of pi `_installHiddenDeclarationsProjection`
+/// (`coding-agent/src/core/agent-session.ts:1767-1785` @v1.1.0): each system message's
+/// `toolsAdded`/`toolsRemoved` with the hidden names filtered out, every other field and every
+/// other message untouched.
+///
+/// **Why this lives in the agent and not the session, where pi's does.** pi's hidden set is the
+/// session's (`AgentSession._hiddenDeclarations`, fed by `prepareLoadout` hooks), so pi installs
+/// the projection as a session-level `transformContext` decorator. cyrup's loadout is the AGENT's
+/// — `Agent::builder().loadout(..)`, with `hiding(..)` resolved through
+/// [`cyrup_core::ToolLoadout::hidden_declarations`] — so the same rule puts the projection where
+/// the hidden set is known. The principle is pi's; the location follows the loadout.
+///
+/// This REPLACED a cyrup-original projection that cleared the declarations outright and let
+/// `Context::tools` carry them instead. pi's invariant runs the other way and states itself at
+/// `packages/agent/src/agent-loop.ts:326-330`: *"`context.tools` is what the runtime can execute;
+/// the transcript's system messages declare what the model may call … so replay always yields
+/// exactly `context.tools`."* The blanket strip was defended as preventing a double declaration,
+/// but that only followed because cyrup's adapters ALSO send `ctx.tools` at request level; it also
+/// made the native mid-conversation `tool_addition`/`tool_removal` wire shapes unreachable, since
+/// their gate reads the initial system message's `toolsAdded` (PROV-133).
+///
+/// A message whose declarations were ALL hidden is kept, empty — pi keeps it, and it renders as
+/// nothing.
+pub(crate) fn project_hidden_declarations(
+    messages: Vec<Message>,
+    hidden: &BTreeSet<String>,
+) -> Vec<Message> {
+    if hidden.is_empty() {
+        return messages;
+    }
     messages
         .into_iter()
-        .filter_map(|message| match message {
+        .map(|message| match message {
             Message::System(mut system) => {
-                system.tools_added.clear();
-                system.tools_removed.clear();
-                let empty = system.content.is_empty()
-                    && system.sections.as_ref().is_none_or(|s| s.is_empty());
-                (!empty).then_some(Message::System(system))
+                system
+                    .tools_added
+                    .retain(|tool| !hidden.contains(tool.name.as_str()));
+                system
+                    .tools_removed
+                    .retain(|tool| !hidden.contains(tool.name.as_str()));
+                Message::System(system)
             }
-            other => Some(other),
+            other => other,
         })
         .collect()
 }
