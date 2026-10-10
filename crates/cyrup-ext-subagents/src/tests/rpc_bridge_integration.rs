@@ -2158,6 +2158,58 @@ async fn interactive_mode_publishes_the_human_async_widget() {
     );
 }
 
+/// SUBA-162 — pi `asyncWidgetCollapsed: true` (`extension/index.ts:294` → `buildWidgetComponent`'s
+/// `initiallyCollapsed`, `tui/render.ts:2919,2984-2986` @ad11b7ab): the interactive slot is the
+/// one-line card. Mutation killed: the key left unread (the slot is the full run block, which names
+/// `pb8worker` and has no `subagents (` card).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn async_widget_collapsed_publishes_the_one_line_card() {
+    use crate::background::async_status_snapshot::ASYNC_STATUS_SNAPSHOT_WIDGET_KEY;
+    let harness = Harness::start_with(RegistrationMode::Full, |config| {
+        config.async_widget_collapsed = Some(serde_json::Value::Bool(true));
+    })
+    .await;
+    harness.track_a_live_run("suba162collapse").await;
+    repaint(&harness, ExtMode::Tui).await;
+    let published = harness
+        .last_widget(ASYNC_STATUS_SNAPSHOT_WIDGET_KEY)
+        .expect("the interactive session publishes the async slot")
+        .expect("as content");
+    assert_eq!(published.len(), 1, "one line: {published:?}");
+    assert!(
+        published[0].ends_with(" subagents (1/1 running)"),
+        "the one-line card: {published:?}"
+    );
+}
+
+/// SUBA-162 — pi `asyncWidgetLayout: "rows"` (`extension/index.ts:295`, `tui/render.ts:2798`
+/// @ad11b7ab, `588d2cfd`/#2738): the slot skips the full tier and publishes the progressive card,
+/// whose header counts leaf agents. Mutation killed: the key left unread (the adaptive full block,
+/// which has no `Async agents` header).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn async_widget_rows_layout_publishes_the_progressive_header() {
+    use crate::background::async_status_snapshot::ASYNC_STATUS_SNAPSHOT_WIDGET_KEY;
+    let harness = Harness::start_with(RegistrationMode::Full, |config| {
+        config.async_widget_layout = Some(serde_json::Value::String("rows".to_string()));
+    })
+    .await;
+    harness.track_a_live_run("suba162rowsrun1").await;
+    repaint(&harness, ExtMode::Tui).await;
+    let published = harness
+        .last_widget(ASYNC_STATUS_SNAPSHOT_WIDGET_KEY)
+        .expect("the interactive session publishes the async slot")
+        .expect("as content");
+    assert_eq!(published.len(), 2, "header + one job line: {published:?}");
+    assert!(
+        published[0].ends_with(" Async agents · 1 agent running"),
+        "the progressive header: {published:?}"
+    );
+    assert!(
+        published[1].contains("pb8worker · running"),
+        "the job line: {published:?}"
+    );
+}
+
 /// SUBA-152 — the RPC path is gated by the SAME check as the model-facing tool, because it is the
 /// same seam.
 ///

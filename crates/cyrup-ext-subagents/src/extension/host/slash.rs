@@ -142,6 +142,7 @@ impl SubagentsExtension {
         // `async-job-tracker.ts:112-114,797`). So a refresh edge with nothing tracked writes
         // NOTHING — not even a clear — unless the slot still holds what an earlier edge published.
         if tracked.is_empty() {
+            self.reset_async_widget_session();
             if self
                 .async_slot_occupied
                 .swap(false, std::sync::atomic::Ordering::AcqRel)
@@ -157,11 +158,13 @@ impl SubagentsExtension {
             Vec::new()
         };
         // `:2992-2997` — an empty roster REMOVES the widget rather than publishing an empty
-        // document, so a machine reader is not handed a snapshot that says nothing. `:2993-2994`'s
-        // `resetWidgetLayoutSession()` / `asyncWidgetUpdates.delete(ctx.ui)` have no analogue:
-        // both belong to upstream's mounted-component update path (`:3005-3007`), which
+        // document, so a machine reader is not handed a snapshot that says nothing.
+        // SUBA-162 — `resetWidgetLayoutSession()` (`render.ts:3093` @ad11b7ab) drops the
+        // extension's own layout session here. `asyncWidgetUpdates.delete(ctx.ui)` still has no
+        // analogue: it belongs to upstream's mounted-component update path (`:3104-3107`), which
         // [`cyrup_ext::host::HostServices::set_widget`]'s fire-and-forget payload does not have.
         if jobs.is_empty() {
+            self.reset_async_widget_session();
             // `:2995` — the clear itself, and only the clear, is behind `ctx.hasUI`.
             if has_ui {
                 services.set_widget(ASYNC_STATUS_SNAPSHOT_WIDGET_KEY, None, placement);
@@ -191,28 +194,41 @@ impl SubagentsExtension {
         // `:3003-3007` — the human widget.
         let rows: Vec<crate::tui::events::AsyncJobSnapshot> = jobs
             .iter()
-            .map(|job| {
-                let agent = job
-                    .status
-                    .current_step
-                    .and_then(|index| job.status.steps.get(index))
-                    .or_else(|| job.status.steps.first())
-                    .map(|step| step.agent.clone());
-                crate::tui::events::AsyncJobSnapshot::from_run_status(
-                    &job.status,
-                    agent,
-                    job.context.unwrap_or_default(),
-                )
-            })
+            .map(|job| crate::tui::events::AsyncJobSnapshot::from_run_view(job))
             .collect();
         // The spinner frame, from the wall clock (upstream's own widget animates on a timer).
         let tick = usize::try_from(crate::time::now_epoch_millis() / 120).unwrap_or(0);
-        let lines = crate::tui::render::lines_to_plain_text(
-            &crate::tui::events::render_async_jobs_widget(&rows, tick),
-        );
+        // SUBA-162 — pi's mounted widget reads `process.stdout.rows`/`columns` and
+        // `ui.getToolsExpanded()` (`render.ts:2541-2547,2950` @ad11b7ab). The host exposes no
+        // terminal size to an extension, so upstream's own `|| 30` / `|| 120` fallbacks stand in.
+        let view = crate::tui::events::AsyncWidgetRender {
+            viewport: crate::tui::render::AsyncWidgetViewport {
+                rows: crate::tui::render::ASYNC_WIDGET_FALLBACK_ROWS,
+                columns: crate::tui::render::ASYNC_WIDGET_FALLBACK_COLUMNS,
+                expanded: services.tools_expanded(),
+            },
+            layout: self.async_widget_layout,
+            collapsed: self.async_widget_collapsed,
+        };
+        let rendered = match self.async_widget_session.lock() {
+            Ok(mut session) => {
+                crate::tui::events::render_async_jobs_widget(&rows, &view, &mut session, tick)
+            }
+            // A poisoned session is treated as no lock at all: render this pass unlocked.
+            Err(_) => crate::tui::events::render_async_jobs_widget(&rows, &view, &mut None, tick),
+        };
+        let lines = crate::tui::render::lines_to_plain_text(&rendered);
         services.set_widget(ASYNC_STATUS_SNAPSHOT_WIDGET_KEY, Some(&lines), placement);
         self.async_slot_occupied
             .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// SUBA-162 — pi `resetWidgetLayoutSession()` (`tui/render.ts:2532` @ad11b7ab), called by
+    /// `renderWidget` whenever the job list empties (`:3093`): the next card locks afresh.
+    fn reset_async_widget_session(&self) {
+        if let Ok(mut session) = self.async_widget_session.lock() {
+            *session = None;
+        }
     }
 
     /// PB-8 — pi `rpcBridge.emitReady(ctx)` (`extension/rpc.ts:841-843`, called from

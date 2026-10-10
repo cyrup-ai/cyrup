@@ -58,11 +58,15 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use serde::{Deserialize, Serialize};
 
-use crate::background::{ActivityState, RunId, RunMode, RunState, RunStatus};
+use crate::background::{ActivityState, RunId, RunMode, RunState, RunStatus, StepState};
 use crate::exec::SingleResult;
 use crate::exec::ndjson::{SubagentEvent, parse_line};
 use crate::fork_context::ContextMode;
-use crate::tui::render::{render_background_region, render_run_header_line};
+use crate::tui::render::{
+    AsyncWidgetLayout, AsyncWidgetViewport, WidgetJobTree, WidgetLayoutSession,
+    build_single_line_widget_lines, fit_adaptive_widget_lines, render_background_region,
+    render_run_header_line,
+};
 use crate::tui::{RunSource, SubagentProgressSnapshot};
 
 /// Bounded cap on a live progress fold's `recent_output` ring (pi slices `recentOutput` to a recent
@@ -787,6 +791,76 @@ pub struct AsyncJobSnapshot {
     /// A bounded tail of the run's most recent output lines, when carried.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub recent_output: Vec<String>,
+    /// SUBA-162 — pi `AsyncJobState.steps[].status` (`shared/types.ts`), one per
+    /// `status.json` step in order: the input of the widget header's leaf-agent count
+    /// ([`crate::tui::render::running_leaf_agent_count`], `render.ts:2637-2648` @ad11b7ab).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub step_states: Vec<StepState>,
+    /// SUBA-162 — pi `AsyncJobState.activeParallelGroup`: a chain with a live parallel group
+    /// counts every active step, not only the current one (`render.ts:2640`). Derived exactly as
+    /// the fleet derives it ([`crate::tui::fleet_status::status_has_active_parallel_group`]).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub active_parallel_group: bool,
+    /// SUBA-162 — pi `AsyncJobState.agents`: the launch roster the leaf count synthesises steps
+    /// from when a running job has no step detail (`render.ts:2642-2644`).
+    ///
+    /// \[CYRUP-DELTA] No producer yet: [`RunStatus`] carries no launch roster, so
+    /// [`Self::from_run_status`] leaves it empty and a step-less running job counts 1 — the same
+    /// number cyrup's fleet reports for it (`fleet_status.rs`'s run-level entry).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub agents: Vec<String>,
+    /// SUBA-162 — pi `AsyncJobState.parentWorkflowRunId`: the workflow run this job is a lane of.
+    /// [`crate::tui::render::WidgetJobTree`] attaches such a job under its loaded workflow parent
+    /// (`widgetJobTree`, `render.ts:2869-2884`).
+    ///
+    /// \[CYRUP-DELTA] No producer yet: [`RunStatus`] has no `parent_workflow_run_id`
+    /// (`background/async_retention/policy.rs`'s note on pi `:296`) and the background runner
+    /// never emits [`RunMode::Workflow`], so in production every job is a root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_workflow_run_id: Option<RunId>,
+    /// SUBA-162 — pi `compactWorkflowLaneRows(job, checklist)` (`render.ts:1466-1490`): one row
+    /// per declared lane of a workflow job, which the progressive card shows in the rows left
+    /// after its job lines (#2583).
+    ///
+    /// \[CYRUP-DELTA] No producer yet, for [`Self::parent_workflow_run_id`]'s reason: the
+    /// workflow checklist projection and preflight lanes are not on the async `RunStatus`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub workflow_lanes: Vec<WorkflowLaneRow>,
+}
+
+/// SUBA-162 — pi `WorkflowChecklistState` (`workflows/workflow-checklist.ts:6` @ad11b7ab), the
+/// state a compact workflow lane row renders with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WorkflowLaneState {
+    /// `complete`.
+    Complete,
+    /// `running`.
+    Running,
+    /// `queued`.
+    Queued,
+    /// `blocked`.
+    Blocked,
+    /// `failed`.
+    Failed,
+    /// `paused`.
+    Paused,
+    /// `stopped`.
+    Stopped,
+}
+
+/// SUBA-162 — the subset of pi `CompactWorkflowLaneRow` (`render.ts:1432-1450` @ad11b7ab) the
+/// lane line renders: `key`, the owning agent and the state (`compactWorkflowLaneLine`, `:1506`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkflowLaneRow {
+    /// pi `key` — the lane's declared key.
+    pub key: String,
+    /// pi `agent` — the lane's owner, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    /// pi `state`.
+    pub state: WorkflowLaneState,
 }
 
 impl AsyncJobSnapshot {
@@ -821,7 +895,28 @@ impl AsyncJobSnapshot {
                 .map(|t| t.total)
                 .unwrap_or(0),
             recent_output: Vec::new(),
+            step_states: status.steps.iter().map(|step| step.status).collect(),
+            active_parallel_group: crate::tui::fleet_status::status_has_active_parallel_group(
+                status,
+            ),
+            agents: Vec::new(),
+            parent_workflow_run_id: None,
+            workflow_lanes: Vec::new(),
         }
+    }
+
+    /// Build one async-jobs row from the fleet's view of a tracked run — the publisher's single
+    /// way to build rows (`SubagentsExtension::publish_async_status_snapshot_widget`). The agent is
+    /// the current step's, else the first step's; the context is the run's resolved one.
+    #[must_use]
+    pub fn from_run_view(view: &crate::tui::fleet_state::AsyncRunView) -> Self {
+        let agent = view
+            .status
+            .current_step
+            .and_then(|index| view.status.steps.get(index))
+            .or_else(|| view.status.steps.first())
+            .map(|step| step.agent.clone());
+        Self::from_run_status(&view.status, agent, view.context.unwrap_or_default())
     }
 
     /// Bridge this row to a [`SubagentProgressSnapshot`] — the input the pure
@@ -866,17 +961,71 @@ pub struct AsyncJobsPayload {
     pub jobs: Vec<AsyncJobSnapshot>,
 }
 
-/// Render the persistent async-jobs widget (C21) for a set of tracked background runs, reusing the
-/// pure [`render_background_region`] primitive (bounded detail + fold-to-summary overflow,
-/// R-SA-107/108). See the module doc for the remaining `cyrup-tui`-side feed-subscription +
-/// painting step.
+/// How the async-jobs widget is drawn this pass: the terminal facts, pi's `asyncWidgetLayout`
+/// (`588d2cfd`/#2738) and pi's mounted `collapsed` flag (`render.ts:2919` @ad11b7ab, initialised
+/// from `asyncWidgetCollapsed`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AsyncWidgetRender {
+    /// The terminal the widget is drawn into.
+    pub viewport: AsyncWidgetViewport,
+    /// pi `asyncWidgetLayout`.
+    pub layout: AsyncWidgetLayout,
+    /// pi `collapsed` — the one-line card.
+    ///
+    /// \[CYRUP-DELTA] Upstream toggles this on a click on the widget's header row (`handleMouse`,
+    /// `render.ts:2937-2943`, `93d47c0c`/#2235). cyrup's widget seam carries lines only
+    /// (`cyrup_ext::host::HostServices::set_widget`) and the TUI hands a press on an extension
+    /// widget to text selection, so the value is the config's for the widget's whole life.
+    pub collapsed: bool,
+}
+
+/// Render the persistent async-jobs widget (C21) for a set of tracked background runs: pi's
+/// mounted widget's `render` (`render.ts:2945-2989` @ad11b7ab) over the roots of
+/// [`WidgetJobTree`].
+///
+/// - No jobs: the layout session is dropped (pi `resetWidgetLayoutSession()` in `renderWidget`,
+///   `:3093`) and nothing renders.
+/// - Collapsed: the one-line card over EVERY job, not the roots (`:2984-2986`), leaving the
+///   session alone.
+/// - Otherwise [`fit_adaptive_widget_lines`], whose full tier is the pure
+///   [`render_background_region`] primitive (bounded detail + fold-to-summary overflow,
+///   R-SA-107/108) and whose progressive tier is SUBA-162's locked card.
+///
+/// `session` is the caller-owned layout session that pi keeps in module state (`:2530`); the
+/// caller threads the same one through every pass.
 #[must_use]
-pub fn render_async_jobs_widget(jobs: &[AsyncJobSnapshot], tick: usize) -> Vec<Line<'static>> {
-    let snapshots: Vec<SubagentProgressSnapshot> = jobs
-        .iter()
-        .map(AsyncJobSnapshot::to_progress_snapshot)
-        .collect();
-    render_background_region(&snapshots, tick)
+pub fn render_async_jobs_widget(
+    jobs: &[AsyncJobSnapshot],
+    view: &AsyncWidgetRender,
+    session: &mut Option<WidgetLayoutSession>,
+    tick: usize,
+) -> Vec<Line<'static>> {
+    if jobs.is_empty() {
+        *session = None;
+        return Vec::new();
+    }
+    if view.collapsed {
+        let all: Vec<&AsyncJobSnapshot> = jobs.iter().collect();
+        return build_single_line_widget_lines(&all, tick);
+    }
+    let tree = WidgetJobTree::build(jobs);
+    let full_lines = || {
+        let snapshots: Vec<SubagentProgressSnapshot> = tree
+            .roots
+            .iter()
+            .map(|job| job.to_progress_snapshot())
+            .collect();
+        render_background_region(&snapshots, tick)
+    };
+    fit_adaptive_widget_lines(
+        &tree.roots,
+        &tree,
+        full_lines,
+        &view.viewport,
+        view.layout,
+        session,
+        tick,
+    )
 }
 
 #[cfg(test)]
@@ -1080,7 +1229,12 @@ mod tests {
         );
         assert_eq!(job.mode, RunMode::Chain);
         assert_eq!(job.agent.as_deref(), Some("planner"));
-        let lines = render_async_jobs_widget(std::slice::from_ref(&job), 0);
+        let lines = render_async_jobs_widget(
+            std::slice::from_ref(&job),
+            &AsyncWidgetRender::default(),
+            &mut None,
+            0,
+        );
         let plain = lines_to_plain_text(&lines);
         assert!(
             plain.iter().any(|l| l.contains("planner")),

@@ -25,6 +25,7 @@ use std::path::{Path, PathBuf};
 
 use tokio::io::AsyncWriteExt;
 
+use super::activity::{ExternalActivityTracker, FingerprintRead, TickAction, read_git_fingerprint};
 use super::adapters::AdapterParser;
 use super::framing::{
     BoundedLog, ByteTail, LineEvent, LineSplitter, MAX_ERROR_TAIL_BYTES, MAX_OUTPUT_TAIL_BYTES,
@@ -177,9 +178,22 @@ fn pre_spawn_outcome(
 /// on the pre-spawn error path below, which is the one upstream's `cleanupTemporaryPaths` is
 /// easiest to forget on.
 pub async fn run_external_cli_process(
+    plan: ExternalCliProcessPlan,
+    prompt: &PreparedPrompt,
+    input: &ExternalCliRunInput<'_>,
+) -> ExternalCliRunOutcome {
+    run_external_cli_process_tracked(plan, prompt, input, None).await
+}
+
+/// [`run_external_cli_process`] with SUBA-131's activity evidence: every non-empty chunk on either
+/// stream is fed to `activity` (pi `onExternalOutput`, `subagent-runner.ts:925-928` @ad11b7ab), and
+/// while control is on a 1s tick re-derives the idle state through the tracker's git-probe gate
+/// (pi's `activityTimer`, `:3240-3246`, driving `updateRunnerActivityState`, `:3156-3238`).
+pub(crate) async fn run_external_cli_process_tracked(
     mut plan: ExternalCliProcessPlan,
     prompt: &PreparedPrompt,
     input: &ExternalCliRunInput<'_>,
+    mut activity: Option<&mut ExternalActivityTracker>,
 ) -> ExternalCliRunOutcome {
     let started_at = crate::time::now_epoch_millis();
     let (stdout_path, stderr_path) = external_log_paths(&input.log_dir, input.step_index);
@@ -296,6 +310,22 @@ pub async fn run_external_cli_process(
     // child with no status is still reaped, and re-enabling the arms on it is the bug, not the fix.
     let mut reaped = false;
     let mut drain_deadline: Option<tokio::time::Instant> = None;
+    // SUBA-131 — the activity tick, only while control is on (`if (controlConfig.enabled)
+    // activityTimer = setInterval(..., 1000)`, `subagent-runner.ts:3240-3246` @ad11b7ab).
+    // `interval_at`, not `interval`, for the same reason as `exec::drive_attempt`: tokio's first
+    // `interval` tick completes immediately.
+    let mut activity_tick = activity
+        .as_deref()
+        .is_some_and(ExternalActivityTracker::enabled)
+        .then(|| {
+            let period = std::time::Duration::from_millis(crate::exec::control::ACTIVITY_TICK_MS);
+            tokio::time::interval_at(tokio::time::Instant::now() + period, period)
+        });
+    // The single in-flight git fingerprint probe, and the token that ends it. A child of the run's
+    // stop token (pi probes under `runStopSignal`), cancelled on its own after the loop: dropping
+    // a live `run_bounded_argv` would kill only the git leader (`kill_on_drop`), not its group.
+    let probe_token = input.stop.child_token();
+    let mut probe: Option<ProbeFuture> = None;
 
     // ARM ORDER AND LOOP CONDITION ARE BOTH LOAD-BEARING (SUBA-095). Upstream's two run-ending
     // verbs are event-loop callbacks — `input.registerTimeout?.(() => terminate("timeout"))` and
@@ -327,6 +357,11 @@ pub async fn run_external_cli_process(
     //   is bounded rather than merely quiet — a grandchild that inherited the pipes keeps them open
     //   for as long as it likes, and upstream's `close` (`:377`), which waits for exactly that, is
     //   the one place upstream itself can hang. cyrup does not follow it there.
+    // * SUBA-131's two activity arms sit BELOW the verbs and ABOVE the chunk arm, both gated on
+    //   `!reaped`: the tick is ready at most once a second and a probe completes at most once per
+    //   probe, so neither can starve the stream, and a chatty child cannot starve the tick. A probe
+    //   that completes after the reap is dropped (upstream's `status !== "running"` return,
+    //   `subagent-runner.ts:3187` @ad11b7ab).
     while streaming || !reaped {
         let deadline = input.deadline;
         tokio::select! {
@@ -356,11 +391,29 @@ pub async fn run_external_cli_process(
                 // what makes sure it can never be the thing that hangs the orchestrator.
                 break;
             }
+            () = tick_once(&mut activity_tick), if !reaped && activity_tick.is_some() => {
+                if let Some(tracker) = activity.as_deref_mut()
+                    && let TickAction::StartProbe { cwd } =
+                        tracker.on_tick(crate::time::now_epoch_millis())
+                {
+                    probe = Some(Box::pin(read_git_fingerprint(cwd, probe_token.clone(), None)));
+                }
+            }
+            read = poll_probe(&mut probe), if !reaped && probe.is_some() => {
+                if let Some(tracker) = activity.as_deref_mut() {
+                    tracker.on_probe_result(crate::time::now_epoch_millis(), read);
+                }
+            }
             chunk = rx.recv(), if streaming => {
                 let Some((is_stdout, bytes)) = chunk else {
                     streaming = false;
                     continue;
                 };
+                // SUBA-131 — `if (chunk.length > 0) ctx.onExternalStreamActivity?.()`, for BOTH
+                // streams (`subagent-runner.ts:925-928,947-948` @ad11b7ab).
+                if let Some(tracker) = activity.as_deref_mut() {
+                    tracker.on_chunk(bytes.len(), crate::time::now_epoch_millis());
+                }
                 if is_stdout {
                     if plan.parser.is_some() && parser_error.is_none() {
                         feed_parser(&mut splitter, plan.parser.as_mut(), &bytes, &mut parser_error);
@@ -394,6 +447,12 @@ pub async fn run_external_cli_process(
                 }
             }
         }
+    }
+
+    if let Some(in_flight) = probe.take() {
+        // Settled: the result no longer matters, but the git group must be confirm-reaped.
+        probe_token.cancel();
+        let _ = in_flight.await;
     }
 
     if exit.is_none() {
@@ -575,6 +634,30 @@ async fn deliver_prompt(stdin: Option<tokio::process::ChildStdin>, payload: Opti
         let _ = stdin.write_all(payload.as_bytes()).await;
     }
     let _ = stdin.shutdown().await;
+}
+
+/// The run loop's in-flight git probe (SUBA-131).
+type ProbeFuture = std::pin::Pin<Box<dyn std::future::Future<Output = FingerprintRead> + Send>>;
+
+/// One activity tick, or never when there is no tick.
+async fn tick_once(tick: &mut Option<tokio::time::Interval>) {
+    match tick.as_mut() {
+        Some(tick) => {
+            tick.tick().await;
+        }
+        None => std::future::pending().await,
+    }
+}
+
+/// Await the in-flight probe and empty its slot; pends forever when there is none (the `select!`
+/// guard never polls it then).
+async fn poll_probe(slot: &mut Option<ProbeFuture>) -> FingerprintRead {
+    let read = match slot.as_mut() {
+        Some(probe) => probe.await,
+        None => std::future::pending().await,
+    };
+    *slot = None;
+    read
 }
 
 /// A future that resolves at `deadline`, or never when there is none.
