@@ -167,12 +167,57 @@ fn a_click_below_the_last_visible_line_moves_nothing() {
 #[test]
 fn the_right_half_of_a_wide_glyph_lands_on_its_start() {
     // 'a' is column 0, each ideograph two columns, 'b' column 5.
+    //
+    // Each measured click is preceded by a click on a column with no word under it, which resets
+    // the multi-click state (`selection.rs`'s `click_count` stores `None` there). Without that
+    // reset this loop is not seven single clicks: `click_count` counts consecutive clicks by WORD
+    // RANGE, not by cell (`tui-alt-screen.ts:867-881`), and `世界` is ONE word to ICU, so the
+    // clicks at columns 1-4 would land inside the same word within `DOUBLE_CLICK_INTERVAL` and the
+    // later ones would be double clicks — which select the word instead of placing the caret. That
+    // is pi's behaviour too; it only failed to show up here while the word segmenter was UAX#29
+    // alone and split `世界` into two words (TUI-048).
     let mut app = app_with("a世界b");
     for (column, expected) in [(0, 0), (1, 1), (2, 1), (3, 2), (4, 2), (5, 3), (30, 4)] {
+        let (bx, by) = editor_cell(&app, 0, 30);
+        click(&mut app, bx, by);
         let (x, y) = editor_cell(&app, 0, column);
         click(&mut app, x, y);
         assert_eq!(cursor(&app), (0, expected), "click at column {column}");
     }
+}
+
+#[test]
+fn two_quick_clicks_inside_one_cjk_word_select_that_word() {
+    // The flip side of the reset above, and the behaviour TUI-048 brought here. `世界` is ONE word
+    // under ICU, so a second click anywhere inside it within `DOUBLE_CLICK_INTERVAL` is a double
+    // click on that word: `click_count` compares WORD RANGES, not cells (`selection.rs`, pi's
+    // `tui-alt-screen.ts:867-881`). The release then selects and copies the word instead of being
+    // offered to the editor, so the caret does not move.
+    //
+    // Under UAX#29 the two ideographs were separate words, so the same two clicks were two single
+    // clicks: the caret moved to `界` and a double click could only ever select ONE ideograph. That
+    // is the defect `TUI-183` filed.
+    let mut app = app_with("a世界b");
+    let (x1, y1) = editor_cell(&app, 0, 1);
+    assert_eq!(
+        click(&mut app, x1, y1),
+        AppAction::Redraw,
+        "the first click is a caret placement, not a selection"
+    );
+    assert_eq!(cursor(&app), (0, 1), "the caret is at the start of `世界`");
+
+    // Column 3 is the other ideograph of the same word.
+    let (x2, y2) = editor_cell(&app, 0, 3);
+    assert_eq!(
+        click(&mut app, x2, y2),
+        AppAction::CopySelection("世界".to_string()),
+        "the double click selects the whole dictionary word"
+    );
+    assert_eq!(
+        cursor(&app),
+        (0, 1),
+        "a double click selects; it does not re-place the caret"
+    );
 }
 
 #[test]
