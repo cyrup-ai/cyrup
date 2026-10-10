@@ -170,9 +170,11 @@ pub(crate) fn region_constraints(state: &mut AppState, width: u16, avail: u16) -
     //
     // That also retires the idle reservation: `clearStatusIndicator` adds the 2-blank-row
     // `IdleStatus` only when `!clearedIndicatorWasEmbedded` (`interactive-mode.ts:2336-2342`), so
-    // `clearOnShrink` / `CYRUP_CLEAR_ON_SHRINK` ([`AppState::reserve_status_rows`]) no longer has a
-    // band to reserve. The flag stays — `/settings` still carries it and it is still pi's setting —
-    // it simply has nothing to do here now that the editor never reflows around a vanishing band.
+    // pi's `clearOnShrink` has no band to reserve here either (`interactive-mode.ts:2075-2078`
+    // @v1.1.0 clears the idle container only when the setting is OFF, so `true` kept the rows).
+    // TUI-182 therefore deleted cyrup's `reserve_status_rows` flag and its `/settings` toggle; see
+    // the [CYRUP-DELTA] in `app/draw.rs` for why the setting's OTHER upstream role — the
+    // shrink repaint — needs no flag in cyrup either.
     let band = 0u16;
     let images = want_images.min(remaining);
     remaining = remaining.saturating_sub(images);

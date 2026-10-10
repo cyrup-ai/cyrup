@@ -288,9 +288,12 @@ fn an_embedded_working_status_takes_the_editor_border_colour() {
 
 /// `clearStatusIndicator` adds the 2-blank-row `IdleStatus` only when
 /// `!clearedIndicatorWasEmbedded` (`interactive-mode.ts:2336-2342`). cyrup's editor always embeds,
-/// so the idle reservation — `clearOnShrink` / `CYRUP_CLEAR_ON_SHRINK`, cyrup's
-/// `reserve_status_rows` — has no band left to reserve, and an idle indicator composes nothing
-/// (pi's `statusWidth === 0` arm, `custom-editor.ts:43`).
+/// so there is no band to reserve and an idle indicator composes nothing (pi's `statusWidth === 0`
+/// arm, `custom-editor.ts:43`).
+///
+/// `TUI-182` removed this test's `reserve_status_rows` half. It used to flip the flag on and assert
+/// the editor did not move — i.e. it asserted the flag had no effect, which is a dead flag's
+/// epitaph, not a rule. The flag is gone; what is live is that the idle band costs zero rows.
 #[test]
 fn the_idle_band_rows_are_gone() {
     assert!(
@@ -299,21 +302,10 @@ fn the_idle_band_rows_are_gone() {
     );
 
     let mut idle = App::new(TestBackend::new(80, 16), UiTheme::dark()).unwrap();
-    idle.set_reserve_status_rows(true);
     idle.draw().unwrap();
     assert_eq!(
         idle.state().regions.band.height,
         0,
-        "the idle band is still reserved"
-    );
-    let idle_slot_y = idle.state().regions.slot.y;
-
-    // The editor sits exactly where it does with the reservation off — the flag no longer moves it.
-    let mut off = App::new(TestBackend::new(80, 16), UiTheme::dark()).unwrap();
-    off.draw().unwrap();
-    assert_eq!(
-        idle_slot_y,
-        off.state().regions.slot.y,
-        "`reserve_status_rows` still reflows the editor"
+        "the idle band must cost no rows"
     );
 }

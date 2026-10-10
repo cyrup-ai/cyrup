@@ -312,14 +312,6 @@ impl<B: Backend> App<B> {
         self.render_debug = debug;
     }
 
-    /// Whether the idle 2-row status band is reserved (kept present) to avoid an editor/footer reflow
-    /// when a spinner appears (item #9). Plumbed from Pi's `terminal.clearOnShrink` setting
-    /// (interactive-mode.ts:1638-1642: an idle status container is cleared only when clearOnShrink is
-    /// off — so `reserve_status_rows == clearOnShrink`). Default `false` matches Pi's default.
-    pub fn set_reserve_status_rows(&mut self, reserve: bool) {
-        self.state.reserve_status_rows = reserve;
-    }
-
     /// Load a user `keybindings.json` document and merge it into every live keymap (R-10-018; Pi
     /// `KeybindingsManager.create`, keybindings.ts:348-352). Each map's `merge_json` applies only the
     /// ids in its own namespace (`app.*` / `tui.editor.*` / `tui.select.*` / `app.tree.*`) and ignores the

@@ -368,16 +368,6 @@ pub async fn run_interactive(
         .autocomplete_max_visible();
     app.set_autocomplete_max_visible(max_visible.clamp(3, 20) as u16);
 
-    // Reserve the idle status band to avoid reflow (feature #9; Pi `terminal.clearOnShrink`,
-    // interactive-mode.ts:1638-1642 — an idle status container is cleared only when clearOnShrink is
-    // off, so `reserve_status_rows == clearOnShrink`).
-    let env_vars = cyrup_session_svc::EnvVars::from_process();
-    let reserve = session
-        .services()
-        .settings
-        .effective()
-        .clear_on_shrink(&env_vars);
-    app.set_reserve_status_rows(reserve);
     // CFG-063 — pi's two render-debug instruments (`PI_TUI_DEBUG`, `PI_TUI_DEBUG_REDRAW`,
     // `tui-main-screen.ts:321`, `:569` @v0.87.1) under their `CYRUP_` names, with the agent
     // directory as the redraw log's home — pi hands the renderer `logDirectory: getAgentDir()`
