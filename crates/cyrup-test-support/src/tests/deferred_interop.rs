@@ -239,3 +239,52 @@ fn a_turn_without_a_provider_thinking_level_does_not_gain_one() {
         "invented a providerThinkingLevel key:\n{exported}"
     );
 }
+
+/// PROV-127 — `thinkingLevel` (`packages/ai/src/types.ts:576` @ f1b2e77f5) survives import and
+/// re-export, as `rawStopReason` does above.
+///
+/// The line is spelled the way pi actually writes it, not in the type's declaration order: pi's
+/// only producer is the agent loop's `Object.assign(await response.result(), { thinkingLevel:
+/// config.reasoning ?? "off" })` (`packages/agent/src/agent-loop.ts:409`), which appends the key
+/// after every key the adapter and the event stream already set — so it follows `timestamp` and
+/// `durationMs`. The round-trip is value-level, so cyrup re-emitting it in the declared slot is
+/// still equal; what must not happen is the value being dropped.
+#[test]
+fn thinking_level_survives_import_and_re_export() {
+    let pi_line = concat!(
+        r#"{"type":"message","id":"fffffff2","parentId":"fffffff1","timestamp":"2026-08-08T00:00:00.000Z","#,
+        r#""message":{"role":"assistant","content":[],"api":"anthropic-messages","provider":"anthropic","#,
+        r#""model":"claude-sonnet-4-5","providerThinkingLevel":"max","#,
+        r#""usage":{"input":10,"output":5,"cacheRead":0,"cacheWrite":0,"totalTokens":15,"#,
+        r#""cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},"#,
+        r#""stopReason":"stop","rawStopReason":"end_turn","timestamp":1754611200000,"#,
+        r#""durationMs":1834,"thinkingLevel":"max"}}"#
+    );
+    let input = jsonl(&[user("fffffff1", None, "hello"), pi_line.to_string()]);
+
+    let exported = assert_jsonl_roundtrip(&input).expect("pi turn must round-trip");
+    assert!(
+        exported.contains(r#""providerThinkingLevel":"max","thinkingLevel":"max","usage":"#),
+        "thinkingLevel must survive re-export, in the declared slot, got:\n{exported}"
+    );
+}
+
+/// The negative half: a turn pi wrote outside the agent loop (or before v1.0.0) has no
+/// `thinkingLevel`, and re-export must not invent one — not even the `"off"` the loop would stamp.
+#[test]
+fn a_turn_without_a_thinking_level_does_not_gain_one() {
+    let input = jsonl(&[
+        user("ggggggg1", None, "hello"),
+        assistant(
+            "ggggggg2",
+            "ggggggg1",
+            r#""providerThinkingLevel":"high","stopReason":"stop""#,
+        ),
+    ]);
+
+    let exported = assert_jsonl_roundtrip(&input).expect("pi turn must round-trip");
+    assert!(
+        !exported.contains(r#""thinkingLevel""#),
+        "invented a thinkingLevel key:\n{exported}"
+    );
+}

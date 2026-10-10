@@ -372,6 +372,76 @@ async fn gap3_turn_update_thinking_level_overrides_next_request() {
     );
 }
 
+/// PROV-127 — the loop records the level each request was MADE with on its settled assistant
+/// message: pi `Object.assign(await response.result(), { thinkingLevel: config.reasoning ?? "off"
+/// })` (`packages/agent/src/agent-loop.ts:409` @ f1b2e77f5). The stamp must be on the
+/// `message_end` payload (what the session persists), follow a `TurnUpdate` override per request,
+/// and say `off` — not nothing — when reasoning is off.
+#[tokio::test]
+async fn settled_assistant_messages_record_the_requested_thinking_level() {
+    let (sf, _captured) = recording_stream_fn(vec![
+        faux_assistant_message(vec![faux_tool_call("echo", json!({}))], StopReason::ToolUse),
+        faux_assistant_message(vec![faux_text("done")], StopReason::Stop),
+    ]);
+    let tool = Arc::new(DescribedTool {
+        name: "echo".into(),
+        params: obj_schema(),
+        inject: false,
+        seen: Arc::new(Mutex::new(None)),
+        calls: Arc::new(AtomicUsize::new(0)),
+    });
+    let agent = Agent::builder(model_ref(), sf)
+        .thinking_level(ModelThinkingLevel::Low)
+        .tools(vec![tool])
+        .hooks(Arc::new(BumpThinkingHook {
+            bumped: Arc::new(AtomicUsize::new(0)),
+        }))
+        .build();
+    let rec = Arc::new(EventRecorder::default());
+    agent.subscribe(rec.clone());
+    let new = agent.prompt("go").await.unwrap().finished().await;
+
+    let recorded: Vec<Option<ModelThinkingLevel>> = new
+        .iter()
+        .filter_map(|m| match m {
+            AgentMessage::Assistant(a) => Some(a.thinking_level),
+            _ => None,
+        })
+        .collect();
+    let want = vec![
+        Some(ModelThinkingLevel::Low),
+        Some(ModelThinkingLevel::High),
+    ];
+    assert_eq!(recorded, want, "each turn records the level it requested");
+    let ended: Vec<Option<ModelThinkingLevel>> = rec
+        .snapshot()
+        .into_iter()
+        .filter_map(|ev| match ev {
+            AgentEvent::MessageEnd {
+                message: AgentMessage::Assistant(a),
+            } => Some(a.thinking_level),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(ended, want, "message_end carries the stamp");
+
+    // Reasoning off: pi stamps `config.reasoning ?? "off"`, so the key says `off`.
+    let (sf, _captured) = recording_stream_fn(vec![faux_assistant_message(
+        vec![faux_text("hi")],
+        StopReason::Stop,
+    )]);
+    let agent = Agent::builder(model_ref(), sf).build();
+    let new = agent.prompt("go").await.unwrap().finished().await;
+    let off: Vec<Option<ModelThinkingLevel>> = new
+        .iter()
+        .filter_map(|m| match m {
+            AgentMessage::Assistant(a) => Some(a.thinking_level),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(off, vec![Some(ModelThinkingLevel::Off)]);
+}
+
 // ----------------------------------------------------------------------------
 // Gap #9/#10/#11/#29: structured streaming partial — distinct thinking/text/toolCall blocks.
 // ----------------------------------------------------------------------------

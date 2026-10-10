@@ -10,7 +10,7 @@
 //! |---|---|
 //! | `resolveCodexUrl` (`:637-643`) | [`resolve_codex_url`](url::resolve_codex_url) |
 //! | `extractAccountId` (`:1564-1575`) | [`extract_account_id`](headers::extract_account_id) |
-//! | `buildBaseCodexHeaders`/`buildSSEHeaders` (`:1577-1617`) | [`build_sse_headers`](headers::build_sse_headers) |
+//! | `buildBaseCodexHeaders`/`buildSSEHeaders` (`:1640-1681` @f1b2e77f5) | [`build_sse_headers`](headers::build_sse_headers) |
 //! | `buildRequestBody` (`:529-596`) | [`build_request_body`](request::build_request_body) |
 //! | `mapCodexEvents`/`normalizeCodexStatus` (`:721-757`) | [`map_codex_event`](events::map_codex_event) + `map_codex_frames` |
 //! | `resolveCodexServiceTier` (`:627-635`) | [`resolve_codex_service_tier`](events::resolve_codex_service_tier) |

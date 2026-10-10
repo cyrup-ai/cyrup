@@ -23,12 +23,12 @@ fn opencode_responses_rows_never_emit_a_session_id_header() {
         .into_iter()
         .filter(|m| m.api.as_str() == "openai-responses")
         .collect();
-    // 29 since PROV-071's live refresh; 19 while the catalog was frozen at `b0c2a90e`. Asserted
-    // so the loop below cannot go vacuous on an empty or mis-parsed catalog — the scope is the
-    // whole api, never a fixed id list.
+    // 30 since PROV-149's refresh added `gpt-6.1-sol`; 29 after PROV-071's live refresh; 19 while
+    // the catalog was frozen at `b0c2a90e`. Asserted so the loop below cannot go vacuous on an
+    // empty or mis-parsed catalog — the scope is the whole api, never a fixed id list.
     assert_eq!(
         rows.len(),
-        29,
+        30,
         "scope must be the whole api, not a fixed id list"
     );
 

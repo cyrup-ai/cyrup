@@ -381,8 +381,8 @@ mod tests {
         // `pi.dev/api/models/providers/anthropic` since PROV-071. 14 while the catalog was frozen
         // at `b0c2a90e`; the refresh added Opus 5, Opus 5.5, Sonnet 5.5 and Fable 5.1 and retired
         // the two Opus 4.1 rows, which is two months of Anthropic releases the frozen floor could
-        // not show.
-        assert_eq!(models.len(), 16);
+        // not show. 17 since PROV-149's refresh added Claude Haiku 5.5 (pi `f76c1db66`).
+        assert_eq!(models.len(), 17);
         assert!(models.iter().all(|m| m.api.as_str() == ANTHROPIC_MESSAGES));
         assert!(models.iter().all(|m| m.provider.as_str() == "anthropic"));
         assert!(models.iter().all(|m| m.base_url == ANTHROPIC_BASE_URL));
@@ -433,9 +433,9 @@ mod tests {
         assert_eq!(opus45.context_window, 200_000);
         assert_eq!(opus45.max_tokens, 64_000);
 
-        // Sonnet 4.5 carries the full 1M context window (pi anthropic.models.ts:185 @91585d9a,
-        // raised in `cc2db980`); the old snapshot capped it at 200k.
-        assert_eq!(find("claude-sonnet-4-5").context_window, 1_000_000);
+        // Sonnet 4.5: 1M from `cc2db980` (pi anthropic.models.ts:185 @91585d9a) until models.dev
+        // moved it back to 200k, which PROV-149's refresh picked up from pi.dev.
+        assert_eq!(find("claude-sonnet-4-5").context_window, 200_000);
 
         // After `cc2db980` retired the Claude 3.x entries, every remaining Anthropic model is a
         // reasoning model — there is no non-reasoning Claude left to pin.
@@ -447,7 +447,7 @@ mod tests {
         let p = anthropic_provider();
         assert_eq!(p.id().as_str(), "anthropic");
         assert!(p.get_model("claude-opus-4-5").is_some());
-        assert_eq!(p.models().len(), 16);
+        assert_eq!(p.models().len(), 17);
     }
 
     #[test]
@@ -456,7 +456,7 @@ mod tests {
             ("kimi-coding", 4usize),
             ("minimax", 3),
             ("minimax-cn", 3),
-            ("vercel-ai-gateway", 248),
+            ("vercel-ai-gateway", 252),
         ];
         for (id, count) in expected {
             let spec = anthropic_fleet_spec(id).unwrap_or_else(|| panic!("no spec for {id}"));

@@ -80,13 +80,16 @@ mod tests {
         // Every entry in pi's `opencode-go.models.ts`, live since PROV-071 (29 models; 15 while
         // the catalog was frozen at `b0c2a90e`). The mix gained a THIRD api in that window —
         // `openai-responses`, for the Grok and Muse Spark rows — which is why the assertions below
-        // enumerate the split instead of asserting "at least two are present".
-        assert_eq!(models.len(), 29);
+        // enumerate the split instead of asserting "at least two are present". PROV-149's refresh
+        // made it 31: Claude Haiku 5.5 (Messages), `space-bunny` replacing `space-bunny-free`,
+        // `step-5-preview-free`, and `qwen3.7-plus`/`qwen3.8-max` moved from Completions to
+        // Messages on `https://opencode.ai/zen/go` — so Completions 21 -> 20, Messages 2 -> 5.
+        assert_eq!(models.len(), 31);
         assert!(models.iter().all(|m| m.provider.as_str() == "opencode-go"));
         let count = |api: &str| models.iter().filter(|m| m.api.as_str() == api).count();
-        assert_eq!(count(OPENAI_COMPLETIONS), 21);
+        assert_eq!(count(OPENAI_COMPLETIONS), 20);
         assert_eq!(count(crate::known_api::OPENAI_RESPONSES), 6);
-        assert_eq!(count(ANTHROPIC_MESSAGES), 2);
+        assert_eq!(count(ANTHROPIC_MESSAGES), 5);
     }
 
     #[test]

@@ -844,14 +844,15 @@ mod tests {
 
     // ------------------------------------------------------------------ catalog
 
-    /// The catalog is pi's `GITHUB_COPILOT_MODELS` verbatim, live since PROV-071 — 32 models
+    /// The catalog is pi's `GITHUB_COPILOT_MODELS` verbatim, live since PROV-071 — 35 models
     /// across the three wire APIs pi declares at `github-copilot.ts:27-31`. It was 28 while the
     /// catalog was frozen at `b0c2a90e`, and the split moved as well as the total: Copilot put its
-    /// `gpt-*` rows on Responses and its Claude rows on Messages.
+    /// `gpt-*` rows on Responses and its Claude rows on Messages. 32 until PROV-149's refresh added
+    /// `claude-haiku-5.5`, `claude-sonnet-5.5` and `gpt-6.1-sol`.
     #[test]
     fn catalog_parses_verbatim_with_expected_count() {
         let models = github_copilot_models();
-        assert_eq!(models.len(), 32);
+        assert_eq!(models.len(), 35);
         assert!(
             models
                 .iter()
@@ -860,9 +861,10 @@ mod tests {
         assert!(models.iter().all(|m| m.base_url == GITHUB_COPILOT_BASE_URL));
 
         let count = |api: &str| models.iter().filter(|m| m.api.as_str() == api).count();
-        assert_eq!(count("anthropic-messages"), 9);
+        // PROV-149 added the two Claude 5.5 rows to Messages and `gpt-6.1-sol` to Responses.
+        assert_eq!(count("anthropic-messages"), 11);
         assert_eq!(count("openai-completions"), 6);
-        assert_eq!(count("openai-responses"), 17);
+        assert_eq!(count("openai-responses"), 18);
         // Nothing outside the three APIs Pi's `createProvider` maps.
         assert_eq!(
             count("anthropic-messages") + count("openai-completions") + count("openai-responses"),

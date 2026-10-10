@@ -444,6 +444,59 @@ mod tests {
         assert!(bytes.ends_with(r#""timestamp":1700000000000}"#), "{bytes}");
     }
 
+    /// PROV-127 — pi `thinkingLevel?: ModelThinkingLevel` (`packages/ai/src/types.ts:575-576` @
+    /// f1b2e77f5, declared between `providerThinkingLevel` and `diagnostics`). `None` adds no key,
+    /// so a message without it serializes to exactly the bytes it did before the field existed;
+    /// `Some(Max)` emits `"thinkingLevel":"max"` in the declared slot.
+    #[test]
+    fn thinking_level_serializes_in_its_slot_and_is_absent_when_unset() {
+        use crate::diagnostics::create_assistant_message_diagnostic_from;
+        let unset = AssistantMessage {
+            content: Vec::new(),
+            provider: "anthropic".into(),
+            model: "m".into(),
+            api: "anthropic-messages".into(),
+            response_model: None,
+            response_id: None,
+            provider_thinking_level: Some("max".into()),
+            thinking_level: None,
+            diagnostics: None,
+            usage: Usage::default(),
+            stop_reason: StopReason::Stop,
+            deferred: None,
+            error_message: None,
+            raw_stop_reason: None,
+            end_turn: None,
+            timestamp: 1,
+            duration_ms: None,
+        };
+        // The pre-PROV-127 bytes, pinned literally.
+        let today = concat!(
+            r#"{"role":"assistant","content":[],"api":"anthropic-messages","provider":"anthropic","#,
+            r#""model":"m","providerThinkingLevel":"max","#,
+            r#""usage":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"totalTokens":0,"#,
+            r#""cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},"#,
+            r#""stopReason":"stop","timestamp":1}"#
+        );
+        assert_eq!(serde_json::to_string(&unset).expect("serialize"), today);
+
+        let mut set = unset;
+        set.thinking_level = Some(crate::ModelThinkingLevel::Max);
+        set.append_diagnostic(create_assistant_message_diagnostic_from(
+            "retry", None, None,
+        ));
+        let bytes = serde_json::to_string(&set).expect("serialize");
+        assert!(
+            bytes
+                .contains(r#""providerThinkingLevel":"max","thinkingLevel":"max","diagnostics":["#),
+            "thinkingLevel between providerThinkingLevel and diagnostics: {bytes}"
+        );
+        assert_eq!(bytes.matches("\"thinkingLevel\"").count(), 1, "{bytes}");
+        let back: AssistantMessage = serde_json::from_str(&bytes).expect("deserialize");
+        assert_eq!(back.thinking_level, Some(crate::ModelThinkingLevel::Max));
+        assert_eq!(back, set);
+    }
+
     #[test]
     fn assistant_message_api_is_required_on_the_wire() {
         // gap 7: Pi declares api: Api as required — it always serializes and must be present on read.
