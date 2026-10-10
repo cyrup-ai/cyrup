@@ -35,8 +35,8 @@ use crate::ui::{
     Binding, Clock, ConnectionChoice, LlamaKeys, LlamaManagerAction, LlamaUi, LlamaUiOutcome,
     LlamaView, ProgressOptions, ProgressOutcome, ProgressState, SearchFn, TextInput, compact_count,
     context_label, fuzzy_filter, fuzzy_match, llama_overlay, locale_compare, model_description,
-    progress_bar, run_with_progress, search_fn, show_llama_ui, to_fixed, truncate_to_width,
-    visible_width, wrap_ranges,
+    progress_bar, root_collator_loads, run_with_progress, search_fn, show_llama_ui, to_fixed,
+    truncate_to_width, visible_width, wrap_ranges,
 };
 
 // ------------------------------------------------------------------------------------- helpers --
@@ -507,8 +507,155 @@ async fn models_sorted_loaded_first_then_alphabetical() {
     );
 }
 
-/// `localeCompare` (`ui.ts:324`) approximation: case-insensitive primary order, punctuation before
-/// digits before letters, lowercase before uppercase on a tie.
+/// `localeCompare` (`ui.ts:324`): the expected order is node 22.22.0 (ICU 77.1, CLDR 47)
+/// `[...ids].sort((a, b) => a.localeCompare(b))` of this exact list, which mixes case, accents,
+/// ligatures, `ß`, digits, punctuation, Hangul, kana, Bopomofo and Han from the URO, Extension A,
+/// Extension B and the compatibility block. ICU root orders Han radical-stroke (`一 𠀀 㐀 丽 中 乙`),
+/// not by code point.
+#[test]
+fn locale_compare_sorts_accented_and_cjk_ids_as_node_does() {
+    assert!(
+        root_collator_loads(),
+        "the embedded root collation data loads"
+    );
+    let mut ids = vec![
+        "zeta",
+        "Zeta",
+        "éclair",
+        "eclair",
+        "Eclair",
+        "ÉCLAIR",
+        "ecl",
+        "model-2",
+        "model-10",
+        "model_2",
+        "model.2",
+        "Model-2",
+        "qwen3:8b",
+        "Qwen3-8B",
+        "ünicode",
+        "unicode",
+        "Ångström",
+        "angstrom",
+        "straße",
+        "strasse",
+        "한국어",
+        "ひらがな",
+        "カタカナ",
+        "ㄅㄆ",
+        "1abc",
+        "_abc",
+        "-abc",
+        "~abc",
+        "abc",
+        "ABC",
+        "aBc",
+        "ø",
+        "o",
+        "z",
+        "œuvre",
+        "oe",
+        "ﬁle",
+        "file",
+        "½",
+        "2",
+        "10",
+        "中",
+        "𠀀",
+        "㐀",
+        "一",
+        "日本語",
+        "中文",
+        "Qwen-中文",
+        "汉字",
+        "丽",
+        "乙",
+        "漢字",
+        "模型",
+        "千问",
+        "通义千问",
+        "Qwen2.5-中文",
+        "豈",
+        "々",
+    ];
+    ids.sort_by(|a, b| locale_compare(a, b));
+    assert_eq!(
+        ids,
+        vec![
+            "_abc",
+            "-abc",
+            "~abc",
+            "々",
+            "½",
+            "10",
+            "1abc",
+            "2",
+            "abc",
+            "aBc",
+            "ABC",
+            "angstrom",
+            "Ångström",
+            "ecl",
+            "eclair",
+            "Eclair",
+            "éclair",
+            "ÉCLAIR",
+            "file",
+            "ﬁle",
+            "model_2",
+            "model-10",
+            "model-2",
+            "Model-2",
+            "model.2",
+            "o",
+            "ø",
+            "oe",
+            "œuvre",
+            "Qwen-中文",
+            "Qwen2.5-中文",
+            "Qwen3-8B",
+            "qwen3:8b",
+            "strasse",
+            "straße",
+            "unicode",
+            "ünicode",
+            "z",
+            "zeta",
+            "Zeta",
+            "한국어",
+            "カタカナ",
+            "ひらがな",
+            "ㄅㄆ",
+            "一",
+            "𠀀",
+            "㐀",
+            "丽",
+            "中",
+            "中文",
+            "乙",
+            "千问",
+            "日本語",
+            "模型",
+            "汉字",
+            "漢字",
+            "豈",
+            "通义千问"
+        ]
+    );
+    // node: `"é".localeCompare("é")`, `"x".localeCompare("x­")` and
+    // `"ab".localeCompare("a​b")` are all 0; the stable sort keeps such ids in input order.
+    assert_eq!(
+        locale_compare("\u{e9}", "e\u{301}"),
+        std::cmp::Ordering::Equal
+    );
+    assert_eq!(locale_compare("x", "x\u{ad}"), std::cmp::Ordering::Equal);
+    assert_eq!(
+        locale_compare("ab", "a\u{200b}b"),
+        std::cmp::Ordering::Equal
+    );
+}
+
+/// The hand-checked orders the approximation this replaced was written against still hold.
 #[test]
 fn locale_compare_orders_like_icu_for_model_ids() {
     use std::cmp::Ordering::{Greater, Less};
@@ -1564,6 +1711,64 @@ fn wrap_ranges_follow_wrap_text_with_ansi() {
         vec!["日本", "語日", "本語"],
         "each CJK character is a break point"
     );
+}
+
+/// `cjkBreakRegex` (`utils.ts:54-55`) is `Script_Extensions`, tested against the whole cluster.
+/// Every expectation is pi-tui's own `wrapTextWithAnsi` at f1b2e77f5, run under node 22.22.0
+/// (ICU 77.1, Unicode 16): `、`/`。` (scx Han/Hira/Kana/…), half-width kana, `々`, `・` and a
+/// combining voicing mark after a Latin letter are break tokens; no fixed block list has them all.
+#[test]
+fn wrap_ranges_break_cjk_by_script_extensions_as_pi_does() {
+    let wrap = |text: &str, width: usize| -> Vec<String> {
+        wrap_ranges(text, width)
+            .into_iter()
+            .map(|(s, e)| text[s..e].to_string())
+            .collect()
+    };
+    let ids = "Qwen3、日本語。ｶﾀｶﾅ-8B café 한국어ㄅㄆ";
+    assert_eq!(
+        wrap(ids, 4),
+        vec![
+            "Qwen",
+            "3、",
+            "日本",
+            "語。",
+            "ｶﾀｶﾅ",
+            "-8B",
+            "café",
+            "한국",
+            "어ㄅ",
+            "ㄆ"
+        ]
+    );
+    assert_eq!(
+        wrap(ids, 6),
+        vec![
+            "Qwen3",
+            "、日本",
+            "語。ｶﾀ",
+            "ｶﾅ-8B",
+            "café",
+            "한국어",
+            "ㄅㄆ"
+        ]
+    );
+    assert_eq!(
+        wrap(ids, 9),
+        vec!["Qwen3、日", "本語。ｶﾀｶ", "ﾅ-8B café", "한국어ㄅ", "ㄆ"]
+    );
+    assert_eq!(
+        wrap(ids, 12),
+        vec!["Qwen3、日本", "語。ｶﾀｶﾅ-8B", "café 한국어", "ㄅㄆ"]
+    );
+    assert_eq!(wrap("model、gguf。ok", 8), vec!["model、", "gguf。ok"]);
+    assert_eq!(wrap("abc々def", 4), vec!["abc", "々", "def"]);
+    assert_eq!(wrap("ｶﾀｶﾅabc", 5), vec!["ｶﾀｶﾅ", "abc"]);
+    assert_eq!(wrap("ab\u{3099}cd", 3), vec!["ab\u{3099}", "cd"]);
+    assert_eq!(wrap("x・y", 2), vec!["x", "・", "y"]);
+    assert_eq!(wrap("中文模型 日本語", 6), vec!["中文模", "型 日", "本語"]);
+    assert_eq!(wrap("llama ㄅㄆㄇ", 7), vec!["llama", "ㄅㄆㄇ"]);
+    assert_eq!(wrap("qwen〆x", 5), vec!["qwen", "〆x"]);
 }
 
 // =================================================================================================

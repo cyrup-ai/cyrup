@@ -172,9 +172,14 @@ fn js_truthy_number(text: &str) -> Option<f64> {
     (number != 0.0 && !number.is_nan()).then_some(number)
 }
 
-/// `${number}` for the delay in the rate-limit message (`huggingface.ts:92`): integers print
-/// without a fraction, the infinities print as JavaScript spells them.
-fn js_number_text(number: f64) -> String {
+/// `${number}` for the delay in the rate-limit message (`huggingface.ts:92`): ECMAScript
+/// `Number::toString(10)` (ECMA-262 §6.1.6.1.20). The shortest round-trip digits are the ones
+/// Rust's `{:e}` prints; the layout is JavaScript's, plain digits for a decimal exponent `n` up to
+/// 21 and down to -5, else `d.ddde±x` (so `1e21` prints `1e+21` and `1e-7` prints `1e-7`).
+pub(crate) fn js_number_text(number: f64) -> String {
+    if number.is_nan() {
+        return "NaN".to_string();
+    }
     if number.is_infinite() {
         return if number > 0.0 {
             "Infinity"
@@ -183,7 +188,43 @@ fn js_number_text(number: f64) -> String {
         }
         .to_string();
     }
-    number.to_string()
+    if number == 0.0 {
+        return "0".to_string();
+    }
+    let sign = if number < 0.0 { "-" } else { "" };
+    let scientific = format!("{:e}", number.abs());
+    let Some((mantissa, exponent)) = scientific.split_once('e') else {
+        return number.to_string();
+    };
+    let Ok(exponent) = exponent.parse::<i32>() else {
+        return number.to_string();
+    };
+    let digits: String = mantissa.chars().filter(char::is_ascii_digit).collect();
+    let k = digits.len();
+    let n = exponent + 1;
+    let body = match usize::try_from(n) {
+        Ok(n) if (1..=21).contains(&n) => match (digits.get(..n), digits.get(n..)) {
+            (Some(integer), Some(fraction)) if !fraction.is_empty() => {
+                format!("{integer}.{fraction}")
+            }
+            _ => format!("{digits}{}", "0".repeat(n.saturating_sub(k))),
+        },
+        _ if n > -6 && n <= 0 => {
+            format!("0.{}{digits}", "0".repeat(n.unsigned_abs() as usize))
+        }
+        _ => {
+            let (first, rest) = digits.split_at(1.min(k));
+            let fraction = if rest.is_empty() {
+                String::new()
+            } else {
+                format!(".{rest}")
+            };
+            let e = n - 1;
+            let e_sign = if e > 0 { "+" } else { "-" };
+            format!("{first}{fraction}e{e_sign}{}", e.unsigned_abs())
+        }
+    };
+    format!("{sign}{body}")
 }
 
 /// `parseRateLimitDelay` (`huggingface.ts:32-35`): the first `t=<digits>` of an IETF `RateLimit`
@@ -335,25 +376,6 @@ pub fn quantization_of_file(rfilename: &str) -> Option<String> {
     quantization_of_stem(filename)
 }
 
-/// ICU root-collation weight of a character of a quantization name, for
-/// `left.name.localeCompare(right.name)` (`huggingface.ts:149`). Names are upper-case ASCII
-/// letters, digits, `_` and `-`; the collation puts `_` before `-` before digits before letters,
-/// where code-point order would put `_` after the letters.
-fn collation_weight(c: char) -> (u8, char) {
-    match c {
-        '_' => (0, c),
-        '-' => (1, c),
-        c if c.is_ascii_digit() => (2, c),
-        c => (3, c),
-    }
-}
-
-fn locale_compare(left: &str, right: &str) -> std::cmp::Ordering {
-    left.chars()
-        .map(collation_weight)
-        .cmp(right.chars().map(collation_weight))
-}
-
 /// The comparator of `huggingface.ts:144-151`.
 fn compare_quantizations(
     left: &HuggingFaceQuantization,
@@ -374,7 +396,7 @@ fn compare_quantizations(
     } else if difference > 0.0 {
         Ordering::Greater
     } else {
-        locale_compare(&left.name, &right.name)
+        crate::ui::locale_compare(&left.name, &right.name)
     }
 }
 
