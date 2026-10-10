@@ -140,6 +140,81 @@ async fn a_structured_only_answer_is_saved_and_delivered_as_pretty_json() {
     assert_eq!(result.saved_output_path, Some(out.display().to_string()));
 }
 
+/// SUBA-197 Verify — pi `8983754b` / #2672 (`execution.ts:1582` @ad11b7ab): a child that calls
+/// `structured_output({ok:true})` and then says "Done." writes the pretty JSON to its bound output
+/// file, not the prose. RED at HEAD: the file held `Done.` (the structured value replaced the prose
+/// only when the prose was blank, SUBA-126). The reply follows upstream's post-save assignment
+/// (`fullOutput = stripAcceptanceReport(resolvedOutput.fullOutput)`, `:1583`), which is the saved
+/// JSON; upstream's own tests for the change (`single-execution.part-2`, `async-execution.part-2`
+/// / `part-3`) assert only the file, so the reply assertion here is pinned to that code line.
+#[tokio::test]
+async fn a_bound_output_file_receives_the_structured_result_not_the_closing_prose() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let script = child(
+        dir.path(),
+        &[
+            tool_start("so-1", "structured_output"),
+            Step::Capture(json!({ "ok": true })),
+            tool_end(
+                "so-1",
+                "structured_output",
+                "Structured output captured.",
+                false,
+            ),
+            assistant("Done."),
+            settled(),
+        ],
+        0,
+    );
+    let out = dir.path().join("r.json");
+    let result = run(dir.path(), script, |_, opts| {
+        opts.structured_output_schema = Some(schema());
+        opts.output_path = Some(out.clone());
+    })
+    .await;
+
+    assert_eq!(result.exit_code, 0, "{result:?}");
+    assert_eq!(
+        std::fs::read_to_string(&out).expect("the output file is written"),
+        "{\n  \"ok\": true\n}"
+    );
+    let reply = result.final_output.as_deref().unwrap_or_default();
+    assert!(reply.starts_with("{\n  \"ok\": true\n}"), "{reply}");
+    assert!(!reply.contains("Done."), "{reply}");
+}
+
+/// SUBA-197 — with no bound output file nothing is saved, so the reply keeps the child's prose
+/// (upstream's `structuredText ?? fullOutput` is only the SAVE input). Passes at HEAD: the
+/// NON-REGRESSION GUARD for the `output_path` half of the gate — dropping it turns this red.
+#[tokio::test]
+async fn without_a_bound_output_file_the_reply_keeps_the_childs_prose() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let script = child(
+        dir.path(),
+        &[
+            tool_start("so-1", "structured_output"),
+            Step::Capture(json!({ "ok": true })),
+            tool_end(
+                "so-1",
+                "structured_output",
+                "Structured output captured.",
+                false,
+            ),
+            assistant("Done."),
+            settled(),
+        ],
+        0,
+    );
+    let result = run(dir.path(), script, |_, opts| {
+        opts.structured_output_schema = Some(schema());
+    })
+    .await;
+
+    assert_eq!(result.exit_code, 0, "{result:?}");
+    assert_eq!(result.final_output.as_deref(), Some("Done."));
+    assert_eq!(result.structured_output, Some(json!({ "ok": true })));
+}
+
 /// SUBA-126 — upstream measures "blank" after `stripAcceptanceReport` (`execution.ts:1514-1515`,
 /// `subagent-runner.ts:1373-1374`): prose that is nothing but an acceptance-report block still
 /// saves and delivers the structured value, not the machine report.

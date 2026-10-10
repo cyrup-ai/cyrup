@@ -830,6 +830,20 @@ async fn run_sync_unnamed(agent: &AgentConfig, task: &str, opts: &RunOptions) ->
             .map(|summary| summary.message.as_str()),
     );
 
+    // SUBA-197 — pi `resolveSingleOutput(options.outputPath, structuredText ?? fullOutput, …)`
+    // (`execution.ts:1582` @ad11b7ab; the runner's `:1386`, `8983754b` / #2672): "the schema is the
+    // caller's contract: a bound output file holds the structured result, not closing prose". The
+    // reply follows upstream's post-save `fullOutput = stripAcceptanceReport(resolvedOutput
+    // .fullOutput)` (`:1583`): `resolveSingleOutput` hands back exactly the text it was given (or
+    // what the child itself wrote to the file), so once a structured value is saved, the reply IS
+    // that value too. Gated as the save itself is (`resolve_saved_output`: a bound path and a clean
+    // exit), so an unsaved run keeps its prose.
+    let structured_text = structured_output
+        .as_ref()
+        .and_then(|value| serde_json::to_string_pretty(value).ok())
+        .filter(|_| opts.output_path.is_some() && gates.exit_code == 0);
+    let structured_saved = structured_text.is_some();
+    let final_output = structured_text.or(final_output);
     let (final_output, full_output_for_reference, saved_output_path) = resolve_saved_output(
         opts,
         gates.exit_code,
@@ -845,7 +859,9 @@ async fn run_sync_unnamed(agent: &AgentConfig, task: &str, opts: &RunOptions) ->
             opts,
             // SUBA-195 — upstream's acceptance reads the COMPLETED prose (`acceptanceOutput =
             // getFinalOutput(messages)`, `execution.ts:1540`), never the streamed partial.
-            if structured_substituted || output_partial {
+            // SUBA-197 — likewise once the saved structured value became the reply: acceptance
+            // still reads the child's own prose.
+            if structured_substituted || output_partial || structured_saved {
                 acceptance_prose.as_deref()
             } else {
                 final_output.as_deref()
