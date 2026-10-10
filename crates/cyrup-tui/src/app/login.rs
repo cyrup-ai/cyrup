@@ -421,6 +421,13 @@ impl<B: Backend> App<B> {
                 // `dialog.signal` — the dialog's own AbortController (`login-dialog.ts:73-75`).
                 let cancel = CancelToken::new();
                 self.state.login_cancel = Some(cancel.clone());
+                // TUI-171 — pi's `loginProvider` opens the `blocked`/`auth` report here and closes
+                // it in a `finally` (`interactive-mode.ts:6321`, `:6334`). cyrup's window is
+                // exactly `login_cancel.is_some()`: set here, cleared in `finish_login` and in the
+                // cancel path, which are the only two exits. The report itself is reconciled from
+                // that pair every frame ([`App::sync_blocked_dialog_status`]), so there is no exit
+                // path that can strand a `blocked` status for the rest of the session.
+                self.state.login_provider_name = Some(name.clone());
                 let auth_type = option.auth_type;
                 // **TUI-105.** `const previousModel = this.session.model` (`:6059`, `:6195`) —
                 // captured HERE, at the call site, before the dialog runs. `finish_login` must not
@@ -553,6 +560,7 @@ impl<B: Backend> App<B> {
             let _ = reply.send(Err(OAuthError::Cancelled));
         }
         self.state.login_cancel = None;
+        self.state.login_provider_name = None;
         let name = &finished.provider_name;
         match &finished.result {
             Ok(()) => {
@@ -642,6 +650,7 @@ impl<B: Backend> App<B> {
         if let Some(reply) = self.state.pending_login_prompt.take() {
             let _ = reply.send(Err(OAuthError::Cancelled));
         }
+        self.state.login_provider_name = None;
         if let Some(cancel) = self.state.login_cancel.take() {
             cancel.cancel();
         }

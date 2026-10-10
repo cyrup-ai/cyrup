@@ -401,6 +401,11 @@ pub struct AppState {
     /// same reason as [`AppState::terminal_title`] directly above: the session-event fold records
     /// the transition and the crossterm run loop is what writes the escape sequence.
     pub terminal_progress: crate::TerminalProgress,
+    /// TUI-171 — the OSC 7501 program-status reporter (pi's `programStatusReporter`,
+    /// `interactive-mode.ts:551-554`). Session-scoped, like upstream's; the support bit and the
+    /// last-written status are process-global in [`crate::program_status`] because the exit clear
+    /// has to work from the panic hook.
+    pub program_status: crate::program_status_reporter::ProgramStatusReporter,
     /// Pi `this.streamingComponent` (`interactive-mode.ts:435`): the assistant message currently
     /// streaming, as a plain "is one open?" bit — cyrup's transcript owns the buffers, so only the
     /// lifetime matters here.
@@ -470,6 +475,10 @@ pub struct AppState {
     /// screen: `cancel()` fires it so a flow blocked on something other than a prompt (a callback
     /// server, a device-code poll) also unwinds. `None` whenever no login is in flight.
     pub(super) login_cancel: Option<CancelToken>,
+    /// TUI-171 — the provider name the `blocked`/`auth` report names while a login runs
+    /// (`` `Log in to ${providerName}` ``, `interactive-mode.ts:6321`). Set beside
+    /// [`Self::login_cancel`], which is the exact window pi's `try`/`finally` covers.
+    pub(super) login_provider_name: Option<String>,
     /// **TUI-105.** Pi's `previousModel` — `const previousModel = this.session.model` captured at the
     /// `/login` CALL SITE, before the dialog runs (`interactive-mode.ts:6004`, `:6135`), and passed
     /// into `completeProviderAuthentication` (`:5883`).
@@ -663,6 +672,7 @@ impl AppState {
             // Off until a session binds and `terminal.showTerminalProgress` is read ([`App::run`]).
             // Pi has no seed at all — it re-reads the setting at each of its five call sites.
             terminal_progress: crate::TerminalProgress::default(),
+            program_status: crate::program_status_reporter::ProgramStatusReporter::new(),
             streaming_assistant: false,
             // Pi reads `sessionManager.getCwd()` at title time; the process cwd is the same value
             // until a session with a recorded cwd is bound, which re-points it ([`App::run`]).
@@ -680,6 +690,7 @@ impl AppState {
             login_auth_type_options: None,
             pending_login_prompt: None,
             login_cancel: None,
+            login_provider_name: None,
             login_previous_model: None,
             login_refresh_epoch: 0,
             login_refresh_cancel: None,
@@ -829,6 +840,13 @@ pub struct ActiveSelector {
 /// at the call site.
 pub(crate) struct PendingUiReply {
     pub(crate) kind: UiKind,
+    /// TUI-171 — what to report over OSC 7501 while this dialog is up. `question` for select /
+    /// input / editor, `permission` for a confirm, and in BOTH cases the message is the dialog's
+    /// bare TITLE, never its body: `showExtensionConfirm` passes `{kind: "permission", message:
+    /// title}` while handing the joined `` `${title}\n${message}` `` to the selector for display
+    /// (`interactive-mode.ts:2750-2760`), and `showExtensionSelector`'s default is
+    /// `{kind: "question", message: title}` (`:2694`).
+    pub(crate) blocked: crate::program_status_reporter::BlockedStatus,
     pub(crate) reply: tokio::sync::oneshot::Sender<UiReply>,
     /// The dialog's title WITHOUT any countdown suffix, so each tick recomputes `"{base_title}
     /// ({s}s)"` fresh off the current remaining time rather than accumulating appended text.

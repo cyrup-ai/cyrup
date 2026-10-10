@@ -87,6 +87,8 @@ mod osc;
 mod overlay;
 mod panic_hook;
 mod pending_messages;
+mod program_status;
+mod program_status_reporter;
 mod resume_hint;
 mod select_list;
 mod selector;
