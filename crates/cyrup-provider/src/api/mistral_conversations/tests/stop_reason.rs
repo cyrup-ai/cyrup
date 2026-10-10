@@ -1,4 +1,4 @@
-//! The `finishReason` table.
+//! The `finish_reason` table.
 
 use super::*;
 
@@ -57,7 +57,7 @@ async fn prov141_a_mistral_error_finish_reason_is_retryable_and_an_unknown_one_i
     use crate::utils::retry::is_retryable_assistant_error;
     let m = model_with("mistral-large-latest", false);
 
-    let raw = "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finishReason\":\"error\"}]}\n\ndata: [DONE]\n\n";
+    let raw = "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"error\"}]}\n\ndata: [DONE]\n\n";
     let events = collect(raw.as_bytes().to_vec(), &m).await;
     let Some(StreamEvent::Error { error, .. }) = events.last() else {
         panic!("expected an error terminal, got {:?}", events.last());
@@ -74,7 +74,7 @@ async fn prov141_a_mistral_error_finish_reason_is_retryable_and_an_unknown_one_i
     );
 
     // upstream's negative case: an unknown reason stays non-retryable.
-    let raw = "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finishReason\":\"unmapped_error\"}]}\n\ndata: [DONE]\n\n";
+    let raw = "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"unmapped_error\"}]}\n\ndata: [DONE]\n\n";
     let events = collect(raw.as_bytes().to_vec(), &m).await;
     let Some(StreamEvent::Error { error, .. }) = events.last() else {
         panic!("expected an error terminal, got {:?}", events.last());

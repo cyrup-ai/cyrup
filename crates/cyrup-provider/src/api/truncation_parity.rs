@@ -177,7 +177,7 @@ impl Wire {
             }
             Wire::Mistral => concat!(
                 "data: {\"id\":\"resp_1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"}}]}\n\n",
-                "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finishReason\":\"stop\"}]}\n\n",
+                "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
                 "data: [DONE]\n\n",
             ),
             Wire::OpenAiCompletions => concat!(
@@ -343,21 +343,22 @@ async fn complete_stream_still_reports_stop() {
     }
 }
 
-/// Mistral's second form of the same defect. Pi guards with `if (choice.finishReason)` — a JS
-/// TRUTHINESS test (`mistral-conversations.ts:355`) — so an explicit `"finishReason": null` (or
-/// `""`) leaves `output.stopReason` at its `"pending"` seed and the stream ends truncated. cyrup
+/// Mistral's second form of the same defect. Pi guards with `if (choice.finish_reason)` — a JS
+/// TRUTHINESS test (`mistral-conversations.ts:633` @f1b2e77f5; `choice.finishReason` at `:355` in
+/// the SDK era) — so an explicit `"finish_reason": null` (or `""`; Mistral's wire key, PROV-152)
+/// leaves `output.stopReason` at its `"pending"` seed and the stream ends truncated. cyrup
 /// had an extra `else if is_null` branch that mapped it to a clean `Stop`.
 #[tokio::test]
 async fn mistral_null_or_empty_finish_reason_is_truncation_not_stop() {
     for raw in [
         concat!(
             "data: {\"id\":\"resp_1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"}}]}\n\n",
-            "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finishReason\":null}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":null}]}\n\n",
             "data: [DONE]\n\n",
         ),
         concat!(
             "data: {\"id\":\"resp_1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"}}]}\n\n",
-            "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finishReason\":\"\"}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"\"}]}\n\n",
             "data: [DONE]\n\n",
         ),
     ] {
@@ -370,7 +371,7 @@ async fn mistral_null_or_empty_finish_reason_is_truncation_not_stop() {
                     Some(Wire::Mistral.truncated_diagnostic())
                 );
             }
-            other => panic!("falsy finishReason must not settle the turn, got {other:?}"),
+            other => panic!("falsy finish_reason must not settle the turn, got {other:?}"),
         }
     }
 }

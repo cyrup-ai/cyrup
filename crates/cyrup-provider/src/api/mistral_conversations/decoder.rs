@@ -45,14 +45,13 @@ pub(super) struct Decoder {
     /// The settled stop reason, or `None` while none has been delivered — cyrup's spelling of Pi's
     /// `output.stopReason = "pending"` seed (mistral-conversations.ts:153), which is where the
     /// derived `Default` now starts. It previously seeded `Stop`, so a Mistral stream that ended
-    /// without a truthy `finishReason` was transcribed as a cleanly completed turn (PROV-010).
+    /// without a truthy `finish_reason` was transcribed as a cleanly completed turn (PROV-010).
     pub(super) stop_reason: Option<StopReason>,
-    /// The choice's own `finishReason`, kept verbatim beside the narrowed [`StopReason`] (pi
-    /// `output.rawStopReason = choice.finishReason`,
-    /// `v0.84.1 ai/src/api/mistral-conversations.ts:356`). PORT BUG, not version lag: the write is
-    /// present at v0.83.0 too, at the same line (`v0.83.0
-    /// ai/src/api/mistral-conversations.ts:356`), and cyrup never ported it. Written under the same
-    /// truthiness guard pi uses (`:355`), so a `null`/`""` `finishReason` leaves it unset.
+    /// The choice's own `finish_reason`, kept verbatim beside the narrowed [`StopReason`] (pi
+    /// `output.rawStopReason = choice.finish_reason`, `mistral-conversations.ts:634` @f1b2e77f5;
+    /// `choice.finishReason` at `:356` in the SDK-era v0.83.0/v0.84.1). PORT BUG, not version lag:
+    /// the write is present at v0.83.0 too, and cyrup never ported it. Written under the same
+    /// truthiness guard pi uses (`:633`), so a `null`/`""` `finish_reason` leaves it unset.
     pub(super) raw_stop_reason: Option<String>,
     pub(super) error_message: Option<String>,
 }

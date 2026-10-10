@@ -34,8 +34,8 @@ fn a_mapped_model_outside_the_old_id_set_uses_reasoning_effort() {
             ..Default::default()
         };
         let body = build_body(&m, &user_ctx("x"), &opts);
-        assert_eq!(body["reasoningEffort"], expected, "{level:?}");
-        assert!(body.get("promptMode").is_none(), "{level:?}");
+        assert_eq!(body["reasoning_effort"], expected, "{level:?}");
+        assert!(body.get("prompt_mode").is_none(), "{level:?}");
     }
 }
 
@@ -48,21 +48,21 @@ fn reasoning_off_sends_the_maps_off_value_and_nothing_without_one() {
     // `mistral-medium-latest` maps `off -> "none"`: pi sends it, the pinned-id code sent nothing.
     let m = catalog_model("mistral-medium-latest");
     let body = build_body(&m, &user_ctx("x"), &Default::default());
-    assert_eq!(body["reasoningEffort"], "none");
-    assert!(body.get("promptMode").is_none());
+    assert_eq!(body["reasoning_effort"], "none");
+    assert!(body.get("prompt_mode").is_none());
 
     // `zai-glm-5-3` maps `off -> null`, which is `?? undefined` with no fallback: nothing at all.
     let m = catalog_model("zai-glm-5-3");
     let body = build_body(&m, &user_ctx("x"), &Default::default());
-    assert!(body.get("reasoningEffort").is_none());
-    assert!(body.get("promptMode").is_none());
+    assert!(body.get("reasoning_effort").is_none());
+    assert!(body.get("prompt_mode").is_none());
 
     // A reasoning model with no map has no `off` value to send either.
     let m = catalog_model("magistral-medium-latest");
     assert!(m.thinking_level_map.is_none());
     let body = build_body(&m, &user_ctx("x"), &Default::default());
-    assert!(body.get("reasoningEffort").is_none());
-    assert!(body.get("promptMode").is_none());
+    assert!(body.get("reasoning_effort").is_none());
+    assert!(body.get("prompt_mode").is_none());
 
     // A non-reasoning model is `effortMap = undefined` by the `model.reasoning ? …` guard even if a
     // map were present, so it stays bare.
@@ -73,8 +73,8 @@ fn reasoning_off_sends_the_maps_off_value_and_nothing_without_one() {
         Some("none".to_string()),
     )]));
     let body = build_body(&m, &user_ctx("x"), &Default::default());
-    assert!(body.get("reasoningEffort").is_none());
-    assert!(body.get("promptMode").is_none());
+    assert!(body.get("reasoning_effort").is_none());
+    assert!(body.get("prompt_mode").is_none());
 }
 
 /// PROV-114 — `MistralReasoningEffort` widened from `"none" | "high"` to
@@ -101,7 +101,7 @@ fn the_reasoning_effort_override_spans_all_five_upstream_values() {
             ..Default::default()
         };
         let body = build_body(&m, &user_ctx("x"), &opts);
-        assert_eq!(body["reasoningEffort"], wire, "{value:?}");
+        assert_eq!(body["reasoning_effort"], wire, "{value:?}");
     }
 }
 
@@ -113,8 +113,8 @@ fn reasoning_effort_models_emit_effort() {
         ..Default::default()
     };
     let body = build_body(&m, &user_ctx("x"), &opts);
-    assert_eq!(body["reasoningEffort"], "high");
-    assert!(body.get("promptMode").is_none());
+    assert_eq!(body["reasoning_effort"], "high");
+    assert!(body.get("prompt_mode").is_none());
 }
 
 #[test]
@@ -127,8 +127,8 @@ fn prompt_mode_reasoning_for_other_reasoning_models() {
         ..Default::default()
     };
     let body = build_body(&m, &user_ctx("x"), &opts);
-    assert_eq!(body["promptMode"], "reasoning");
-    assert!(body.get("reasoningEffort").is_none());
+    assert_eq!(body["prompt_mode"], "reasoning");
+    assert!(body.get("reasoning_effort").is_none());
 }
 
 /// Byte-diff vs Pi `buildChatPayload` (mistral-conversations.ts:256): a direct
@@ -149,9 +149,9 @@ fn mistral_prompt_mode_override_threads_to_payload() {
         ..Default::default()
     };
     let body = build_body(&m, &user_ctx("x"), &opts);
-    assert_eq!(body["promptMode"], "reasoning");
+    assert_eq!(body["prompt_mode"], "reasoning");
     // The lowering contributed nothing here, so reasoningEffort stays absent.
-    assert!(body.get("reasoningEffort").is_none());
+    assert!(body.get("reasoning_effort").is_none());
 
     // (b) A reasoning-effort model at High would lower to `reasoningEffort:"high"` with no
     //     promptMode; the override adds `promptMode:"reasoning"` on top (Pi reads both fields
@@ -166,8 +166,8 @@ fn mistral_prompt_mode_override_threads_to_payload() {
         ..Default::default()
     };
     let body = build_body(&m, &user_ctx("x"), &opts);
-    assert_eq!(body["promptMode"], "reasoning");
-    assert_eq!(body["reasoningEffort"], "high");
+    assert_eq!(body["prompt_mode"], "reasoning");
+    assert_eq!(body["reasoning_effort"], "high");
 
     // Control: without the override the same request omits promptMode (proving the override drove
     // the bytes above, not the lowering).
@@ -176,8 +176,8 @@ fn mistral_prompt_mode_override_threads_to_payload() {
         ..Default::default()
     };
     let body = build_body(&m, &user_ctx("x"), &opts);
-    assert!(body.get("promptMode").is_none());
-    assert_eq!(body["reasoningEffort"], "high");
+    assert!(body.get("prompt_mode").is_none());
+    assert_eq!(body["reasoning_effort"], "high");
 }
 
 /// Byte-diff vs Pi `buildChatPayload` (mistral-conversations.ts:257): a direct
@@ -197,8 +197,8 @@ fn mistral_reasoning_effort_override_threads_to_payload() {
         ..Default::default()
     };
     let body = build_body(&m, &user_ctx("x"), &opts);
-    assert_eq!(body["reasoningEffort"], "high");
-    assert!(body.get("promptMode").is_none());
+    assert_eq!(body["reasoning_effort"], "high");
+    assert!(body.get("prompt_mode").is_none());
 
     // (b) `"none"` is also written verbatim (Pi's `if (options?.reasoningEffort)` is truthy for
     //     the non-empty string `"none"`).
@@ -210,7 +210,7 @@ fn mistral_reasoning_effort_override_threads_to_payload() {
         ..Default::default()
     };
     let body = build_body(&m, &user_ctx("x"), &opts);
-    assert_eq!(body["reasoningEffort"], "none");
+    assert_eq!(body["reasoning_effort"], "none");
 
     // (c) The override REPLACES the value the lowering would otherwise compute. A reasoning-effort
     //     model at High lowers to `reasoningEffort:"high"`; overriding with `"none"` wins.
@@ -224,7 +224,7 @@ fn mistral_reasoning_effort_override_threads_to_payload() {
         ..Default::default()
     };
     let body = build_body(&m, &user_ctx("x"), &opts);
-    assert_eq!(body["reasoningEffort"], "none");
+    assert_eq!(body["reasoning_effort"], "none");
     // Control: without the override the same request lowers to "high" (proving the override drove
     // the bytes above).
     let opts = StreamOptions {
@@ -232,7 +232,7 @@ fn mistral_reasoning_effort_override_threads_to_payload() {
         ..Default::default()
     };
     let body = build_body(&m, &user_ctx("x"), &opts);
-    assert_eq!(body["reasoningEffort"], "high");
+    assert_eq!(body["reasoning_effort"], "high");
 }
 
 /// `PROV-088`'s rows still take `reasoningEffort` rather than `promptMode` under `PROV-114`'s new
@@ -252,8 +252,8 @@ fn mapped_models_use_reasoning_effort_not_prompt_mode() {
             ..Default::default()
         };
         let body = build_body(&m, &user_ctx("x"), &opts);
-        assert_eq!(body["reasoningEffort"], "high", "{id}");
-        assert!(body.get("promptMode").is_none(), "{id}");
+        assert_eq!(body["reasoning_effort"], "high", "{id}");
+        assert!(body.get("prompt_mode").is_none(), "{id}");
     }
 }
 

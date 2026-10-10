@@ -1,5 +1,6 @@
 //! Request encoding — the `/v1/chat/completions` request body (Pi `buildChatPayload`,
-//! mistral-conversations.ts:230-270).
+//! `mistral-conversations.ts:527-549` @f1b2e77f5), in pi's SDK-style camelCase; `wire.rs` converts
+//! it to Mistral's snake_case after the payload hook (PROV-152).
 
 use super::endpoint::should_use_prompt_caching;
 use super::messages::to_chat_messages;
@@ -14,13 +15,17 @@ use crate::stream::StreamOptions;
 use crate::utils::constrained_sampling::ConstrainedSamplingError;
 use serde_json::{Map, Value, json};
 
-/// Test-only convenience wrapper for [`build_chat_payload`].
+/// Test-only convenience wrapper: the body as it goes on the wire — [`build_chat_payload`]'s
+/// SDK-style payload through [`super::wire::to_mistral_wire_payload`] (PROV-152), with no
+/// `before_provider_request` hook in between.
 #[cfg(test)]
 // Test-only fixture wrapper: the deny-list allowance the crate's `mod tests` blocks carry.
 #[allow(clippy::expect_used)]
 pub(super) fn build_body(model: &Model, ctx: &Context, opts: &StreamOptions) -> Value {
-    build_chat_payload(model, ctx, opts)
-        .expect("fixture declares no unsatisfiable constrained sampling")
+    super::wire::to_mistral_wire_payload(
+        build_chat_payload(model, ctx, opts)
+            .expect("fixture declares no unsatisfiable constrained sampling"),
+    )
 }
 
 /// Build the `chat/completions` request body (1:1 port of Pi `buildChatPayload` + the `streamSimple`

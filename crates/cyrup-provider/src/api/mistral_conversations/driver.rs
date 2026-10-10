@@ -86,7 +86,7 @@ where
         return;
     }
 
-    // No chunk carried a truthy `finishReason` → TRUNCATED. Pi throws
+    // No chunk carried a truthy `finish_reason` → TRUNCATED. Pi throws
     // "Mistral stream ended without a finish reason" (mistral-conversations.ts:88-90).
     sink.send(StreamEvent::end_of_stream(
         dec.snapshot_owned(model, api),

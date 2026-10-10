@@ -1,5 +1,6 @@
 //! Response decoding — one `CompletionChunk`: the `delta.content` walk over string / `text` /
-//! `thinking` chunks (Pi mistral-conversations.ts:325-416).
+//! `thinking` chunks, read in Mistral's wire keys (Pi `consumeChatStream`,
+//! `mistral-conversations.ts:576-757` @f1b2e77f5; PROV-152).
 
 use super::blocks::{close_current, process_tool_call};
 use super::decoder::{CurrentKind, Decoder};
@@ -35,17 +36,22 @@ pub(super) async fn process_chunk(
         None => return true,
     };
 
-    // Pi guards with `if (choice.finishReason)` (mistral-conversations.ts:355) — a JS TRUTHINESS
-    // test, so `null`, `undefined` and `""` all leave `output.stopReason` at its `"pending"` seed
-    // and end the stream as truncated. The previous `else if is_null → map(None)` branch settled
-    // such a stream on a clean `Stop`, which is the PROV-010 defect in its second form: a Mistral
-    // stream whose final chunk carries `"finishReason": null` was transcribed as a completed turn.
+    // Pi guards with `if (choice.finish_reason)` (`mistral-conversations.ts:633` @f1b2e77f5) — a
+    // JS TRUTHINESS test, so `null`, `undefined` and `""` all leave `output.stopReason` at its
+    // `"pending"` seed and end the stream as truncated. The previous `else if is_null → map(None)`
+    // branch settled such a stream on a clean `Stop`, which is the PROV-010 defect in its second
+    // form: a Mistral stream whose final chunk carries `"finish_reason": null` was transcribed as a
+    // completed turn.
+    //
+    // PROV-152: the key is Mistral's wire `finish_reason`. This read `finishReason` — the old SDK's
+    // TypeScript name, which its zod schema remapped from the wire — so against the real API no
+    // finish reason was ever seen and every turn ended "without a finish reason".
     if let Some(reason) = choice
-        .get("finishReason")
+        .get("finish_reason")
         .and_then(Value::as_str)
         .filter(|r| !r.is_empty())
     {
-        // pi records the raw reason first (`v0.84.1 ai/src/api/mistral-conversations.ts:356`), so a
+        // pi records the raw reason first (`mistral-conversations.ts:634` @f1b2e77f5), so a
         // `content_filter` / future reason names itself on the turn even after the narrowing map.
         dec.raw_stop_reason = Some(reason.to_string());
         let (stop, err) = map_chat_stop_reason(Some(reason));
@@ -67,8 +73,9 @@ pub(super) async fn process_chunk(
         return false;
     }
 
-    // Tool calls.
-    if let Some(tool_calls) = delta.get("toolCalls").and_then(Value::as_array) {
+    // Tool calls — Pi `const toolCalls = delta.tool_calls || []` (`:710` @f1b2e77f5). PROV-152:
+    // this read the SDK's `toolCalls`, so streamed tool calls were dropped against the real API.
+    if let Some(tool_calls) = delta.get("tool_calls").and_then(Value::as_array) {
         for tool_call in tool_calls {
             if !process_tool_call(tool_call, dec, model, api, sink).await {
                 return false;

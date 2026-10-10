@@ -11,7 +11,7 @@ use super::*;
 async fn a_finish_reason_is_recorded_raw_beside_the_narrowed_one() {
     let m = model_with("codestral-latest", false);
 
-    let raw = "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finishReason\":\"content_filter\"}]}\n\ndata: [DONE]\n\n";
+    let raw = "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"content_filter\"}]}\n\ndata: [DONE]\n\n";
     let events = collect(raw.as_bytes().to_vec(), &m).await;
     let Some(StreamEvent::Error { error, .. }) = events.last() else {
         panic!("expected an error terminal, got {:?}", events.last());
@@ -19,7 +19,7 @@ async fn a_finish_reason_is_recorded_raw_beside_the_narrowed_one() {
     assert_eq!(error.raw_stop_reason.as_deref(), Some("content_filter"));
 
     // MIRROR 1: a clean `stop` keeps its raw word on the `done` terminal.
-    let raw = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finishReason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+    let raw = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
     let events = collect(raw.as_bytes().to_vec(), &m).await;
     let Some(StreamEvent::Done { message, .. }) = events.last() else {
         panic!("expected a done terminal, got {:?}", events.last());
@@ -29,7 +29,7 @@ async fn a_finish_reason_is_recorded_raw_beside_the_narrowed_one() {
 
     // MIRROR 2: pi's guard is `if (choice.finishReason)` (`:355`), so a null one assigns
     // nothing — the field stays absent on the truncation terminal.
-    let raw = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finishReason\":null}]}\n\ndata: [DONE]\n\n";
+    let raw = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\ndata: [DONE]\n\n";
     let events = collect(raw.as_bytes().to_vec(), &m).await;
     let last = events.last().expect("a terminal");
     assert_eq!(
@@ -43,8 +43,8 @@ async fn a_finish_reason_is_recorded_raw_beside_the_narrowed_one() {
 async fn decodes_text_and_tool_stream() {
     let raw = concat!(
         "data: {\"id\":\"resp_1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"}}]}\n\n",
-        "data: {\"choices\":[{\"index\":0,\"delta\":{\"toolCalls\":[{\"id\":\"abcdefghi\",\"index\":0,\"function\":{\"name\":\"read\",\"arguments\":\"{\\\"path\\\":\\\"a\\\"}\"}}]}}]}\n\n",
-        "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finishReason\":\"tool_calls\"}],\"usage\":{\"promptTokens\":10,\"completionTokens\":4,\"totalTokens\":14}}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"id\":\"abcdefghi\",\"index\":0,\"function\":{\"name\":\"read\",\"arguments\":\"{\\\"path\\\":\\\"a\\\"}\"}}]}}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":4,\"total_tokens\":14}}\n\n",
         "data: [DONE]\n\n",
     );
     let m = model_with("codestral-latest", false);
@@ -88,7 +88,7 @@ async fn decodes_text_and_tool_stream() {
 async fn decodes_thinking_chunks() {
     let raw = concat!(
         "data: {\"id\":\"r\",\"choices\":[{\"index\":0,\"delta\":{\"content\":[{\"type\":\"thinking\",\"thinking\":[{\"type\":\"text\",\"text\":\"ponder\"}]}]}}]}\n\n",
-        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":[{\"type\":\"text\",\"text\":\"answer\"}]},\"finishReason\":\"stop\"}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":[{\"type\":\"text\",\"text\":\"answer\"}]},\"finish_reason\":\"stop\"}]}\n\n",
         "data: [DONE]\n\n",
     );
     let m = model_with("magistral-small", true);
@@ -126,9 +126,9 @@ async fn prov073_an_id_less_continuation_chunk_appends_to_the_indexed_block() {
     let m = model_with("codestral-latest", false);
 
     let raw = concat!(
-        "data: {\"id\":\"r\",\"choices\":[{\"index\":0,\"delta\":{\"toolCalls\":[{\"id\":\"abcdefghi\",\"index\":0,\"function\":{\"name\":\"read\",\"arguments\":\"{\\\"a\\\"\"}}]}}]}\n\n",
-        "data: {\"choices\":[{\"index\":0,\"delta\":{\"toolCalls\":[{\"index\":0,\"function\":{\"arguments\":\":1}\"}}]}}]}\n\n",
-        "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finishReason\":\"tool_calls\"}]}\n\n",
+        "data: {\"id\":\"r\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"id\":\"abcdefghi\",\"index\":0,\"function\":{\"name\":\"read\",\"arguments\":\"{\\\"a\\\"\"}}]}}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\":1}\"}}]}}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
         "data: [DONE]\n\n",
     );
     let events = collect(raw.as_bytes().to_vec(), &m).await;
@@ -163,9 +163,9 @@ async fn prov073_an_id_less_continuation_chunk_appends_to_the_indexed_block() {
     // still open two blocks. This pins the `None => call_id` arm — it would fail if the fix keyed
     // unconditionally on the collapsed index.
     let raw = concat!(
-        "data: {\"id\":\"r\",\"choices\":[{\"index\":0,\"delta\":{\"toolCalls\":[{\"id\":\"aaaaaaaaa\",\"function\":{\"name\":\"read\",\"arguments\":\"{}\"}}]}}]}\n\n",
-        "data: {\"choices\":[{\"index\":0,\"delta\":{\"toolCalls\":[{\"id\":\"bbbbbbbbb\",\"function\":{\"name\":\"write\",\"arguments\":\"{}\"}}]}}]}\n\n",
-        "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finishReason\":\"tool_calls\"}]}\n\n",
+        "data: {\"id\":\"r\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"id\":\"aaaaaaaaa\",\"function\":{\"name\":\"read\",\"arguments\":\"{}\"}}]}}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"id\":\"bbbbbbbbb\",\"function\":{\"name\":\"write\",\"arguments\":\"{}\"}}]}}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
         "data: [DONE]\n\n",
     );
     let events = collect(raw.as_bytes().to_vec(), &m).await;
@@ -192,16 +192,16 @@ async fn prov073_an_id_less_continuation_chunk_appends_to_the_indexed_block() {
 /// after the `done` break — `if (done) break;` (`mistral-conversations.ts:468` @v0.87.1) then
 /// `if (buffer.trim()) { const event = parseMistralEvent(buffer); if (event !== MISTRAL_STREAM_DONE
 /// && event) yield event; }` (`:471-474`). So a transcript cut right after the chunk that carries
-/// `finishReason`, with no terminating blank line and no `data: [DONE]`, still finishes upstream.
+/// `finish_reason`, with no terminating blank line and no `data: [DONE]`, still finishes upstream.
 /// cyrup had `flush_at_eof: false` here on the false premise that pi frames Mistral with an SDK
-/// helper, so that last chunk was dropped, no chunk carried a `finishReason`, and `driver.rs:87-91`
+/// helper, so that last chunk was dropped, no chunk carried a `finish_reason`, and `driver.rs:87-91`
 /// ended the turn on "Mistral stream ended without a finish reason".
 #[tokio::test]
 async fn prov084_a_transcript_cut_after_the_finish_reason_chunk_still_finishes() {
     let raw = concat!(
         "data: {\"id\":\"resp_9\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"}}]}\n\n",
         // The stream ends HERE — no blank line after the last data line, and no `[DONE]`.
-        "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finishReason\":\"stop\"}],\"usage\":{\"promptTokens\":3,\"completionTokens\":4,\"totalTokens\":7}}\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":4,\"total_tokens\":7}}\n",
     );
     let m = model_with("codestral-latest", false);
     let events = collect(raw.as_bytes().to_vec(), &m).await;
@@ -226,19 +226,19 @@ async fn prov084_a_transcript_cut_after_the_finish_reason_chunk_still_finishes()
 /// `if (done) break;` (`mistral-conversations.ts:468` @v0.87.1) is followed by
 /// `if (buffer.trim()) { const event = parseMistralEvent(buffer); if (event !== MISTRAL_STREAM_DONE
 /// && event) yield event; }` (`:471-474`), so a socket closed right after the chunk that carries
-/// `finishReason` — no blank line, no `data: [DONE]` — still finishes the turn upstream.
+/// `finish_reason` — no blank line, no `data: [DONE]` — still finishes the turn upstream.
 ///
 /// The replay-path sibling (`prov084_a_transcript_cut_after_the_finish_reason_chunk_still_finishes`)
 /// pins the decoder, but it reads through `decode_sse_bytes_flushing_at_eof`, whose flag is
 /// hard-coded in the test harness: it stays green if the live gate regresses to `false`. This test is
 /// the one that goes red — without the flag the last chunk is dropped, no chunk carries a
-/// `finishReason`, and `driver.rs` ends the turn on "Mistral stream ended without a finish reason".
+/// `finish_reason`, and `driver.rs` ends the turn on "Mistral stream ended without a finish reason".
 #[tokio::test]
 async fn prov084_the_live_run_path_flushes_a_reply_cut_after_the_finish_reason_chunk() {
     let base = serve_once(concat!(
         "data: {\"id\":\"resp_eof\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"}}]}\n\n",
         // The response body ends HERE: one `\n` after the last data line, no blank line.
-        "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finishReason\":\"stop\"}],\"usage\":{\"promptTokens\":3,\"completionTokens\":4,\"totalTokens\":7}}\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":4,\"total_tokens\":7}}\n",
     ))
     .await;
     let m = model_with("codestral-latest", false);
@@ -277,7 +277,7 @@ async fn prov115_an_empty_text_delta_does_not_split_thinking_into_two_blocks() {
         "data: {\"id\":\"r\",\"choices\":[{\"index\":0,\"delta\":{\"content\":[{\"type\":\"thinking\",\"thinking\":[{\"type\":\"text\",\"text\":\"a\"}]}]}}]}\n\n",
         "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\"}}]}\n\n",
         "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":[{\"type\":\"thinking\",\"thinking\":[{\"type\":\"text\",\"text\":\"b\"}]}]}}]}\n\n",
-        "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finishReason\":\"stop\"}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
         "data: [DONE]\n\n",
     );
     let events = collect(raw.as_bytes().to_vec(), &m).await;
@@ -314,7 +314,7 @@ async fn prov115_an_empty_text_delta_does_not_split_thinking_into_two_blocks() {
         "data: {\"id\":\"r\",\"choices\":[{\"index\":0,\"delta\":{\"content\":[{\"type\":\"thinking\",\"thinking\":[{\"type\":\"text\",\"text\":\"a\"}]}]}}]}\n\n",
         "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":[{\"type\":\"text\",\"text\":\"\"}]}}]}\n\n",
         "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":[{\"type\":\"thinking\",\"thinking\":[{\"type\":\"text\",\"text\":\"b\"}]}]}}]}\n\n",
-        "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finishReason\":\"stop\"}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
         "data: [DONE]\n\n",
     );
     let events = collect(raw.as_bytes().to_vec(), &m).await;
@@ -338,7 +338,7 @@ async fn prov115_an_empty_text_delta_does_not_split_thinking_into_two_blocks() {
         "data: {\"id\":\"r\",\"choices\":[{\"index\":0,\"delta\":{\"content\":[{\"type\":\"thinking\",\"thinking\":[{\"type\":\"text\",\"text\":\"a\"}]}]}}]}\n\n",
         "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":[\"\"]}}]}\n\n",
         "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":[{\"type\":\"thinking\",\"thinking\":[{\"type\":\"text\",\"text\":\"b\"}]}]}}]}\n\n",
-        "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finishReason\":\"stop\"}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
         "data: [DONE]\n\n",
     );
     let events = collect(raw.as_bytes().to_vec(), &m).await;
@@ -363,7 +363,7 @@ async fn prov115_an_empty_text_delta_does_not_split_thinking_into_two_blocks() {
         "data: {\"id\":\"r\",\"choices\":[{\"index\":0,\"delta\":{\"content\":[{\"type\":\"thinking\",\"thinking\":[{\"type\":\"text\",\"text\":\"a\"}]}]}}]}\n\n",
         "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"mid\"}}]}\n\n",
         "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":[{\"type\":\"thinking\",\"thinking\":[{\"type\":\"text\",\"text\":\"b\"}]}]}}]}\n\n",
-        "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finishReason\":\"stop\"}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
         "data: [DONE]\n\n",
     );
     let events = collect(raw.as_bytes().to_vec(), &m).await;
@@ -396,7 +396,7 @@ async fn prov115_a_glm_turn_replays_as_one_assistant_thinking_entry() {
         "data: {\"id\":\"r\",\"choices\":[{\"index\":0,\"delta\":{\"content\":[{\"type\":\"thinking\",\"thinking\":[{\"type\":\"text\",\"text\":\"step one \"}]}]}}]}\n\n",
         "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\"}}]}\n\n",
         "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":[{\"type\":\"thinking\",\"thinking\":[{\"type\":\"text\",\"text\":\"step two\"}]}]}}]}\n\n",
-        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":[{\"type\":\"text\",\"text\":\"done\"}]},\"finishReason\":\"stop\"}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":[{\"type\":\"text\",\"text\":\"done\"}]},\"finish_reason\":\"stop\"}]}\n\n",
         "data: [DONE]\n\n",
     );
     let events = collect(raw.as_bytes().to_vec(), &m).await;

@@ -69,21 +69,30 @@ pub(super) fn to_chat_messages(messages: &[Message], supports_images: bool) -> V
                         Content::ToolCall(tc) => {
                             let args = serde_json::to_string(&tc.arguments)
                                 .unwrap_or_else(|_| "{}".to_string());
+                            // `index: 0` is pi's (`mistral-conversations.ts:860-865` @f1b2e77f5),
+                            // added with the native transport (`9dd90a497`): Mistral's `ToolCall`
+                            // schema defaults it to 0, and the SDK used to fill it in.
                             tool_calls.push(json!({
                                 "id": tc.id.as_str(),
                                 "type": "function",
                                 "function": { "name": tc.name, "arguments": args },
+                                "index": 0,
                             }));
                         }
                         _ => {}
                     }
                 }
                 if !content_parts.is_empty() || !tool_calls.is_empty() {
+                    // Pi `{ role: "assistant", prefix: false }` (`:868` @f1b2e77f5), the SDK
+                    // default the native transport now writes itself.
                     let mut o = Map::new();
                     o.insert("role".to_string(), json!("assistant"));
+                    o.insert("prefix".to_string(), json!(false));
                     if !content_parts.is_empty() {
                         o.insert("content".to_string(), Value::Array(content_parts));
                     }
+                    // SDK-style `toolCalls`; `wire::to_mistral_wire_payload` sends it as
+                    // `tool_calls` (PROV-152).
                     if !tool_calls.is_empty() {
                         o.insert("toolCalls".to_string(), Value::Array(tool_calls));
                     }
