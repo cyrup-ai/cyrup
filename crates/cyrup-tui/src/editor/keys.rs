@@ -110,18 +110,63 @@ impl InputEditor {
                 Some(EditorOutcome::Edited)
             }
             A::AcceptSubmit => {
-                // Which accepted items fall through to submit. Upstream tests the PREFIX —
-                // `if (this.autocompletePrefix.startsWith("/"))` (`components/editor.ts:713-720`
-                // @v0.84.3) — and cyrup tests the CONTEXT; on the slash surface the two agree by
-                // construction, because the command-name popup's prefix is the whole `/…` token
-                // (`autocomplete.rs`'s `command_name_context`, pi `:340`) while an argument
-                // popup's prefix is the bare argument text with the `/name ` already stripped
-                // (pi `:345`, `:362`). So Enter on `/mod`→`/model` submits in both, and Enter on
-                // `/model gpt` accepts the model without submitting in both.
+                // Which accepted items fall through to submit. Upstream branches on ONE thing,
+                // the OPEN POPUP'S PREFIX STRING (`components/editor.ts:806-813` @v1.1.0+11,
+                // inside the `tui.select.confirm` arm at `:790-816`):
                 //
-                // Residual, out of scope here: an ABSOLUTE-path popup carries a prefix like
-                // `/usr/lo`, which satisfies pi's string test and not cyrup's context test — pi
-                // submits the line, cyrup keeps editing.
+                // ```ts
+                // if (this.autocompletePrefix.startsWith("/")) {
+                //     this.cancelAutocomplete();
+                //     // Fall through to submit
+                // } else {
+                //     this.cancelAutocomplete();
+                //     if (this.onChange) this.onChange(this.getText());
+                //     return;
+                // }
+                // ```
+                //
+                // "Fall through" is mechanical, not figurative: `tui.select.confirm` and
+                // `tui.input.submit` are BOTH bound to `enter` by default
+                // (`keybindings.ts:154,144`), so the one key event that confirms also matches the
+                // submit arm at `:909`, which calls `submitValue()` at `:921`. Note also that the
+                // `if (selected && this.autocompleteProvider)` guard at `:792` does NOT return
+                // when it fails, so Enter on a popup with no selected item submits upstream —
+                // which cyrup matches, because a no-match popup's prefix is unchanged and
+                // `accept_completion` is a no-op without a selection.
+                //
+                // TUI-057 — [CYRUP-DELTA]: cyrup tests the CONTEXT, not the prefix string, and
+                // this is DELIBERATE. The comment that used to sit here claimed the two "agree by
+                // construction on the slash surface"; that was wrong, and the correction does not
+                // go the way it looks. They agree on the command-NAME popup — its prefix is the
+                // whole `/…` token (`slash_context`'s `prefix: before.to_string()`, where `before`
+                // is the `trim_start`ed command text, matching pi `autocomplete.ts:338,375`) and
+                // `slash_context` returns `None` unless that text starts with `/`, so a `Slash`
+                // popup's prefix ALWAYS starts with `/`. Porting pi's string test would therefore
+                // not change this surface at all. What it WOULD change is every other popup whose
+                // prefix can begin with `/` without being a command:
+                //   - an ABSOLUTE-path popup (`cat /usr/lo<Tab>`, prefix `/usr/lo`, pi
+                //     `autocomplete.ts:411`), and
+                //   - a slash-ARGUMENT popup whose argument text itself starts with `/` (prefix is
+                //     the bare argument, `/name ` already stripped — pi `:380,397`).
+                // On both, pi fires the whole line at the agent on one Enter. That is upstream
+                // being loose rather than upstream deciding: pi's OWN `applyCompletion` discriminates
+                // the two cases properly, 120 lines away in the same file, with a three-part test
+                // (`autocomplete.ts:433`):
+                //
+                // ```ts
+                // const isSlashCommand = prefix.startsWith("/") && beforePrefix.trim() === "" && !prefix.slice(1).includes("/");
+                // ```
+                //
+                // So pi has a precise "is a command name" predicate and simply does not use it at
+                // `:806`. cyrup cannot adopt `:433` either: `!prefix.slice(1).includes("/")` is
+                // false for cyrup's NAMESPACED command names (`/flux/aug`, a real registered shape
+                // — `editor/tests/command_highlight.rs`'s `dynamic_commands_participate_in_both_rules`),
+                // so it would stop `/flux/aug<Enter>` from submitting. `context == Slash` IS the
+                // command-name popup, which is the set both upstream tests are reaching for, and it
+                // is the only one of the three that is right about namespaced names. Keeping it
+                // means an absolute-path popup needs a second Enter here and one upstream; that is
+                // a deliberate narrowing of an accidental-submission hazard, pinned by
+                // `enter_on_an_absolute_path_popup_does_not_submit`.
                 let is_slash = self
                     .autocomplete
                     .as_ref()
@@ -129,16 +174,27 @@ impl InputEditor {
                 self.accept_completion();
                 self.autocomplete = None;
                 if is_slash {
-                    // Accepting a slash item with Enter submits (spec/tui/04 §5, edge 15). The accept
-                    // appended a trailing space; submit trims it (Pi trims in the submit handler).
-                    let text = self.text().trim().to_string();
+                    // Accepting a slash item with Enter submits (spec/tui/04 §5, edge 15).
+                    // TUI-057 — this is the fall-through into `submitValue()`, and upstream has
+                    // exactly ONE submit path whose first act on the text is
+                    // `expandPasteMarkers(this.state.lines.join("\n")).trim()`
+                    // (`components/editor.ts:1366`). This arm called `self.text()` — the raw
+                    // buffer join — so Enter on an open slash popup sent a literal
+                    // `[paste #N …]` marker to the agent instead of the pasted content (reachable
+                    // on one line: `/comp[paste #1 …]` with the cursor at col 5). The `.trim()`
+                    // is the same `:1366` trim, and it is load-bearing beyond cosmetics: the
+                    // accept rewrites the buffer to `/<name> ` WITH a trailing space (pi
+                    // `autocomplete.ts:436`), and `CommandRegistry::dispatch` trims before
+                    // `match_command`, so TUI-074's arity rule and this path stay coupled through
+                    // "the submitted string is trimmed before dispatch". Do not drop this trim.
+                    let text = self.expanded_text().trim().to_string();
                     self.add_to_history(&text);
                     self.clear();
-                    self.undo.clear(); // `this.undoStack.clear()` (`editor.ts:1268`)
+                    self.undo.clear(); // `this.undoStack.clear()` (`editor.ts:1373`)
                     Some(EditorOutcome::Submit(text))
                 } else {
                     // No recompute, unlike Tab's `Accept`: pi cancels and returns
-                    // (`components/editor.ts:806-809` @v0.86.0), so the next Enter submits.
+                    // (`components/editor.ts:809-813` @v1.1.0+11), so the next Enter submits.
                     // Recomputing reopened the popup for a fully typed argument
                     // (`/login anthropic`), and every Enter re-accepted it without submitting.
                     Some(EditorOutcome::Edited)
@@ -331,13 +387,23 @@ impl InputEditor {
                 }
                 // Expand large-paste markers back to their full content before the agent sees the text
                 // (`expandPasteMarkers`, spec/tui/03 §5.5).
-                let text = self.expanded_text();
-                if text.trim().is_empty() {
+                //
+                // TUI-057 — the `.trim()` is upstream's, applied in the SAME expression as the
+                // expansion: `const result = this.expandPasteMarkers(this.state.lines.join("\n")).trim();`
+                // (`components/editor.ts:1366`), and `result` is what reaches BOTH `onSubmit` and
+                // `addToHistory`. cyrup expanded but did not trim, while the `AcceptSubmit`
+                // fall-through above DID — an asymmetry with a visible consequence in history:
+                // `add_to_history`'s consecutive-dup check compares raw strings
+                // (`editor/history.rs`), so submitting `/compact` and then `/compact ` left two
+                // entries where pi leaves one. Command matching was never affected, because
+                // `CommandRegistry::dispatch` trims before `match_command`.
+                let text = self.expanded_text().trim().to_string();
+                if text.is_empty() {
                     return EditorOutcome::Edited;
                 }
                 self.add_to_history(&text);
                 self.clear();
-                // `submitValue` empties the undo stack with the buffer (`editor.ts:1268`), so
+                // `submitValue` empties the undo stack with the buffer (`editor.ts:1373`), so
                 // Ctrl+- after a send cannot resurrect the prompt that was just submitted.
                 self.undo.clear();
                 EditorOutcome::Submit(text)
