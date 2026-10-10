@@ -95,16 +95,20 @@ pub(super) fn thinking_lines(
 /// two components spell the pair out by hand and only the key label shares `dim` with it. `lead`
 /// carries the trailing `(` so the compaction variant can interpolate its token count
 /// (`Compacted from 12,345 tokens (`).
+///
+/// TUI-175 — the `Box`'s paddingX is `outputPad` (`super(outputPad, 1, …)`,
+/// `compaction-summary-message.ts:15-16`, `branch-summary-message.ts:15-16` @f1b2e77f5).
 pub(super) fn collapsed_summary_lines(
     label: &str,
     lead: &str,
     expand_key: &str,
     theme: &UiTheme,
     width: usize,
+    output_pad: usize,
 ) -> Vec<Line<'static>> {
     let block = theme.custom_message_bg_style();
     let text = theme.custom_message_text_style();
-    let content_width = width.saturating_sub(2).max(1);
+    let content_width = width.saturating_sub(output_pad * 2).max(1);
     let row = Line::from(vec![
         Span::styled(lead.to_string(), text),
         Span::styled(expand_key.to_string(), theme.dim_style()),
@@ -122,7 +126,7 @@ pub(super) fn collapsed_summary_lines(
         Some(bg) => Style::default().bg(bg),
         None => Style::default(),
     };
-    let mut out = box_lines(children, width, 1, 1, fill);
+    let mut out = box_lines(children, width, output_pad, 1, fill);
     // `interactive-mode.ts:3484`/`:3491` — the leading `Spacer(1)` is unconditional for both.
     if !out.is_empty() {
         out.insert(0, Line::default());
@@ -137,15 +141,17 @@ pub(super) fn collapsed_summary_lines(
 /// Unlike the summaries there is no `Spacer(1)` after the label — label, name and hint share one
 /// row. The `Box(1, 1, customMessageBg)` shell and the gated leading `Spacer(1)`
 /// (`interactive-mode.ts:3500`) are the expanded form's, so `lead_spacer` means what it means there.
+/// TUI-175 — that `Box`'s paddingX is `outputPad` (`skill-invocation-message.ts:16-17` @f1b2e77f5).
 pub(super) fn collapsed_skill_lines(
     name: &str,
     expand_key: &str,
     lead_spacer: bool,
     theme: &UiTheme,
     width: usize,
+    output_pad: usize,
 ) -> Vec<Line<'static>> {
     let block = theme.custom_message_bg_style();
-    let content_width = width.saturating_sub(2).max(1);
+    let content_width = width.saturating_sub(output_pad * 2).max(1);
     let row = Line::from(vec![
         // One bold `customMessageLabel` run in pi (`[skill] `, the space inside the SGR pair); two
         // spans of one style here, so the bracket is a span of its own as in the expanded form.
@@ -159,15 +165,20 @@ pub(super) fn collapsed_skill_lines(
         Some(bg) => Style::default().bg(bg),
         None => Style::default(),
     };
-    let mut out = box_lines(children, width, 1, 1, fill);
+    let mut out = box_lines(children, width, output_pad, 1, fill);
     if lead_spacer && !out.is_empty() {
         out.insert(0, Line::default());
     }
     out
 }
 
-// Eight because the markdown link context rides beside the block's six presentation inputs; they
-// are all per-call and none of them groups with another.
+// Nine because the markdown link context and the `outputPad` ride beside the block's six
+// presentation inputs; they are all per-call and none of them groups with another.
+//
+// TUI-175 — the `Box`'s paddingX is `outputPad` in all four components at f1b2e77f5:
+// `super(outputPad, 1, …)` in `compaction-summary-message.ts:15-16`, `branch-summary-message.ts:15-16`
+// and `skill-invocation-message.ts:16-17`, and `this.box.setPaddingX(this.outputPad)` on the default
+// path of `custom-message.ts:90`.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn labeled_message_lines(
     label: &str,
@@ -177,11 +188,13 @@ pub(super) fn labeled_message_lines(
     lead_spacer: bool,
     theme: &UiTheme,
     width: usize,
+    output_pad: usize,
     links: crate::markdown::MdLinks<'_>,
 ) -> Vec<Line<'static>> {
     let block = theme.custom_message_bg_style();
-    // `Box(1, 1)` renders its children at `contentWidth = width - 2` (`box.ts:79`).
-    let content_width = width.saturating_sub(2).max(1);
+    // `Box(outputPad, 1)` renders its children at `contentWidth = width - 2 * outputPad`
+    // (`box.ts:79`).
+    let content_width = width.saturating_sub(output_pad * 2).max(1);
     let mut children = vec![Line::styled(
         format!("[{label}]"),
         theme.custom_message_label_style(),
@@ -214,7 +227,7 @@ pub(super) fn labeled_message_lines(
         Some(bg) => Style::default().bg(bg),
         None => Style::default(),
     };
-    let mut out = box_lines(children, width, 1, 1, fill);
+    let mut out = box_lines(children, width, output_pad, 1, fill);
     // The leading `Spacer(1)` — see `lead_spacer` above. Skipped when the `Box` produced no rows at
     // all (`box.ts:75-77`/`:91-93`), so a contentless block cannot leave an orphan blank behind.
     if lead_spacer && !out.is_empty() {

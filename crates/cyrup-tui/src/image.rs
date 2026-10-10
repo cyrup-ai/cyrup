@@ -918,6 +918,16 @@ pub fn detect_capabilities_on_platform(
             hyperlinks: false,
         };
     }
+    // Pi `b2363841a` (#10573), terminal-image.ts:89-93 @f1b2e77f5: "Herdr forwards OSC 8
+    // hyperlinks. It runs inside another terminal whose variables, such as KITTY_WINDOW_ID, may
+    // leak into its panes, so check it first and leave image protocols off." TUI-176.
+    if term_program == "herdr" {
+        return TerminalCapabilities {
+            images: None,
+            true_color: has_true_color,
+            hyperlinks: true,
+        };
+    }
     // Positively-identified terminals (terminal-image.ts:83-118).
     if has("KITTY_WINDOW_ID") || term_program == "kitty" {
         return identified(Some(ImageProtocol::Kitty), true);

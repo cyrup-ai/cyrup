@@ -6,7 +6,10 @@
 //! `registerSignalHandlers` (`interactive-mode.ts:4252-4261` @v0.87.1) installs one
 //! `terminalErrorHandler` on BOTH `process.stdout` and `process.stderr`. An error whose `code` is
 //! `EIO`, `EPIPE` or `ENOTCONN` (`isDeadTerminalError`, `:264-272`) — the terminal hung up, its
-//! pane was killed, the SSH link dropped — goes to `emergencyTerminalExit` (`:4179-4186`):
+//! pane was killed, the SSH link dropped — goes to `emergencyTerminalExit` (`:4179-4186`). At
+//! f1b2e77f5 (`4c6b724ea`) the set also holds `ENOTTY`, a revoked macOS tty (`:293-294`), and the
+//! handler is on `process.stdin` too (`:4415-4421`); cyrup ports the set (TUI-180), and a stdin
+//! read error here ends the reader instead, so the restore writes are what reach this handler:
 //!
 //! ```ts
 //! this.isShuttingDown = true;
@@ -65,23 +68,26 @@ pub(crate) fn is_armed() -> bool {
     ARMED.load(Ordering::SeqCst)
 }
 
-/// pi `isDeadTerminalError` (`interactive-mode.ts:264-272`) over `DEAD_TERMINAL_ERROR_CODES =
-/// ["EIO", "EPIPE", "ENOTCONN"]`. std names two of the three as kinds on every platform; `EIO` has
-/// no kind and is read off the raw errno.
+/// pi `isDeadTerminalError` (`interactive-mode.ts:296-302` @f1b2e77f5) over
+/// `DEAD_TERMINAL_ERROR_CODES = ["EIO", "EPIPE", "ENOTCONN", "ENOTTY"]` (`:294`; `ENOTTY` joined in
+/// `4c6b724ea` for a revoked macOS tty, TUI-180). std names `EPIPE` and `ENOTCONN` as kinds on every
+/// platform; `EIO` and `ENOTTY` have no stable kind and are read off the raw errno.
 pub(crate) fn is_dead_terminal_error(e: &io::Error) -> bool {
     matches!(
         e.kind(),
         io::ErrorKind::BrokenPipe | io::ErrorKind::NotConnected
-    ) || is_eio(e)
+    ) || is_eio_or_enotty(e)
 }
 
 #[cfg(unix)]
-fn is_eio(e: &io::Error) -> bool {
-    e.raw_os_error() == Some(rustix::io::Errno::IO.raw_os_error())
+fn is_eio_or_enotty(e: &io::Error) -> bool {
+    use rustix::io::Errno;
+    e.raw_os_error()
+        .is_some_and(|code| code == Errno::IO.raw_os_error() || code == Errno::NOTTY.raw_os_error())
 }
 
 #[cfg(not(unix))]
-fn is_eio(_: &io::Error) -> bool {
+fn is_eio_or_enotty(_: &io::Error) -> bool {
     false
 }
 
@@ -170,6 +176,68 @@ mod tests {
         fn flush(&mut self) -> io::Result<()> {
             Err(io::Error::from(self.0))
         }
+    }
+
+    /// TUI-180 — pi's set at f1b2e77f5 is `["EIO", "EPIPE", "ENOTCONN", "ENOTTY"]`
+    /// (`interactive-mode.ts:294`). Each is checked off a raw errno, as a real failed write reports
+    /// it; `EAGAIN` (a would-block write, the terminal still alive) is not one.
+    #[cfg(unix)]
+    #[test]
+    fn the_four_dead_terminal_errnos_including_enotty() {
+        use rustix::io::Errno;
+        let raw = |errno: Errno| io::Error::from_raw_os_error(errno.raw_os_error());
+        assert!(
+            is_dead_terminal_error(&raw(Errno::NOTTY)),
+            "ENOTTY (revoked tty)"
+        );
+        assert!(is_dead_terminal_error(&raw(Errno::IO)), "EIO");
+        assert!(is_dead_terminal_error(&raw(Errno::PIPE)), "EPIPE");
+        assert!(is_dead_terminal_error(&raw(Errno::NOTCONN)), "ENOTCONN");
+        assert!(!is_dead_terminal_error(&raw(Errno::AGAIN)), "EAGAIN");
+    }
+
+    /// TUI-180 through the armed writer: a restore write that fails with `ENOTTY` takes the
+    /// emergency exit. Re-executes this test binary as a child that arms and writes through a
+    /// [`TerminalWriter`] whose inner writer fails with raw `ENOTTY`; the child must exit 129
+    /// before reaching its fallthrough status 3.
+    #[cfg(unix)]
+    #[test]
+    fn an_armed_restore_write_failing_with_enotty_exits_129() {
+        const ENOTTY_CHILD_ENV: &str = "CYRUP_TUI_DEAD_TERMINAL_ENOTTY_CHILD";
+        struct NotTty;
+        impl Write for NotTty {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                Err(io::Error::from_raw_os_error(
+                    rustix::io::Errno::NOTTY.raw_os_error(),
+                ))
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        if std::env::var_os(ENOTTY_CHILD_ENV).is_some() {
+            arm();
+            let _ = TerminalWriter(NotTty).write_all(b"\x1b[?25h");
+            std::process::exit(3);
+        }
+        let out = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "dead_terminal::tests::an_armed_restore_write_failing_with_enotty_exits_129",
+                "--nocapture",
+            ])
+            .env(ENOTTY_CHILD_ENV, "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .output()
+            .unwrap();
+        assert_eq!(
+            out.status.code(),
+            Some(DEAD_TERMINAL_EXIT_CODE),
+            "stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 
     #[test]

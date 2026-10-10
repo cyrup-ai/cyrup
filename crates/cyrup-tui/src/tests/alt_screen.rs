@@ -1252,7 +1252,7 @@ fn no_jump_label_at_the_tail() {
     let (mut alt, _) = scrolled_up();
     assert!(last_row(&mut alt).contains("Jump"));
     let keys = AltScreenKeymap::default();
-    let end = KeyEvent::new(KeyCode::End, KeyModifiers::NONE);
+    let end = KeyEvent::new(KeyCode::End, KeyModifiers::CONTROL);
     assert!(alt.handle_key(&end, &keys, &[]));
     alt.draw(None).unwrap();
     assert!(alt.is_following_output());
@@ -1557,7 +1557,7 @@ fn a_rebound_bottom_key_updates_the_label() {
     }
     app.draw().unwrap();
     let label = |app: &mut crate::App<TestBackend>| label_text(app.altscreen_for_test().unwrap());
-    assert_eq!(label(&mut app), "↓ Jump to latest message · End");
+    assert_eq!(label(&mut app), "↓ Jump to latest message · Ctrl+End");
 
     let issues = app
         .load_keybindings_json(r#"{"tui.altScreen.bottom": "ctrl+g"}"#)
@@ -1580,7 +1580,7 @@ fn a_rebound_bottom_key_updates_the_label() {
     std::fs::remove_file(dir.path().join("keybindings.json")).unwrap();
     app.reload_keybindings_from(dir.path()).unwrap();
     app.draw().unwrap();
-    assert_eq!(label(&mut app), "↓ Jump to latest message · End");
+    assert_eq!(label(&mut app), "↓ Jump to latest message · Ctrl+End");
 }
 
 /// A renderer adopted AFTER the bindings changed starts with the current key, not the default.

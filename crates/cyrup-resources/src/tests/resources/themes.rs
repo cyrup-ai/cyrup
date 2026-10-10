@@ -48,7 +48,7 @@ async fn a09_3_theme_hot_reload_and_runtime_switch() {
     let active = tmp.path().join("active.json");
     write(
         &active,
-        &full_theme_json("mine", &[("bg", "#000000")], &[("background", "$bg")]),
+        &full_theme_json("mine", &[("bg", "#000000")], &[("accent", "$bg")]),
     );
 
     let theme = Theme::load(&active, ResourceScope::Cli, crate::ResourceOrigin::Builtin).unwrap();
@@ -65,7 +65,7 @@ async fn a09_3_theme_hot_reload_and_runtime_switch() {
     tokio::time::sleep(Duration::from_millis(120)).await;
     write(
         &active,
-        &full_theme_json("mine", &[("bg", "#ffffff")], &[("background", "$bg")]),
+        &full_theme_json("mine", &[("bg", "#ffffff")], &[("accent", "$bg")]),
     );
 
     tokio::time::timeout(Duration::from_secs(5), rx.changed())
@@ -81,7 +81,7 @@ async fn a09_3_theme_hot_reload_and_runtime_switch() {
     let other = tmp.path().join("other.json");
     write(
         &other,
-        &full_theme_json("other", &[], &[("foreground", "#abcdef")]),
+        &full_theme_json("other", &[], &[("border", "#abcdef")]),
     );
     watcher
         .retarget(other)
@@ -99,7 +99,7 @@ fn theme_resolve_var_indirection_and_empty_value() {
         &full_theme_json(
             "t",
             &[("bg", "#112233")],
-            &[("background", "$bg"), ("blank", "")],
+            &[("accent", "$bg"), ("text", "")],
         ),
         None,
         ResourceScope::Builtin,
@@ -108,7 +108,7 @@ fn theme_resolve_var_indirection_and_empty_value() {
     .unwrap();
     let resolved = theme.resolve();
     assert_eq!(
-        resolved.roles.get("background"),
+        resolved.roles.get("accent"),
         Some(&crate::ColorSpec::Rgb {
             r: 0x11,
             g: 0x22,
@@ -116,10 +116,7 @@ fn theme_resolve_var_indirection_and_empty_value() {
         })
     );
     // `""` is the terminal default, and the only value that resolves to `Inherit`.
-    assert_eq!(
-        resolved.roles.get("blank"),
-        Some(&crate::ColorSpec::Inherit)
-    );
+    assert_eq!(resolved.roles.get("text"), Some(&crate::ColorSpec::Inherit));
 }
 
 /// TUI-131 — a `colors` value that is neither a known variable nor a colour is a LOAD error, as it
@@ -131,14 +128,14 @@ fn theme_resolve_var_indirection_and_empty_value() {
 fn an_unresolvable_color_value_fails_the_theme_load_with_pis_message() {
     for (colors, expected) in [
         // Not a variable and not a colour.
-        (("bad", "nothex"), "Variable reference not found: nothex"),
+        (("accent", "nothex"), "Variable reference not found: nothex"),
         // A `#` value is parsed as written; this is neither `#RGB` nor `#RRGGBB`.
-        (("bad", "#12345"), "Invalid color value: #12345"),
-        (("bad", "#zzz"), "Invalid color value: #zzz"),
+        (("accent", "#12345"), "Invalid color value: #12345"),
+        (("accent", "#zzz"), "Invalid color value: #zzz"),
         // `parseColor` trims nothing.
-        (("bad", "#abc "), "Invalid color value: #abc "),
+        (("accent", "#abc "), "Invalid color value: #abc "),
         // A bare `rrggbb` is a variable name, not a colour.
-        (("bad", "abcdef"), "Variable reference not found: abcdef"),
+        (("accent", "abcdef"), "Variable reference not found: abcdef"),
     ] {
         let err = Theme::parse(
             &full_theme_json("t", &[], &[colors]),
@@ -444,6 +441,122 @@ fn theme_valid_int_and_string_colors_still_accepted() {
         .is_ok(),
         "valid int + string color values accepted"
     );
+}
+
+// ===========================================================================
+// TUI-178 — pi 1.1 closes the theme document: unknown keys at the top level, in `colors` and in
+// `export` are load errors (`additionalProperties: false`, `theme-schema.ts:44-90` @f1b2e77f5)
+// ===========================================================================
+
+/// The `theme_error` reason for `json`, which must fail to parse.
+fn theme_error_reason(json: &str) -> String {
+    match Theme::parse(
+        json,
+        None,
+        ResourceScope::Builtin,
+        crate::ResourceOrigin::Builtin,
+    ) {
+        Err(crate::ResourceError::Theme { reason, .. }) => reason,
+        Err(other) => panic!("expected ResourceError::Theme, got {other:?}"),
+        Ok(theme) => panic!("theme with an unknown key loaded: {:?}", theme.data.name),
+    }
+}
+
+#[test]
+fn an_unknown_colors_key_is_rejected_naming_colors_and_the_key() {
+    // A complete theme plus a misspelled `success`.
+    let reason = theme_error_reason(&full_theme_json("typo", &[], &[("sucess", "#00ff00")]));
+    assert!(reason.contains("Other errors:"), "{reason}");
+    assert!(
+        reason.contains("  - /colors/sucess: schema is false"),
+        "{reason}"
+    );
+    assert!(
+        reason.contains("  - /colors: must not have additional properties"),
+        "{reason}"
+    );
+    assert!(
+        !reason.contains("Missing required color tokens"),
+        "{reason}"
+    );
+}
+
+#[test]
+fn an_unknown_export_key_is_rejected_naming_export_and_the_key() {
+    let json = full_theme_json("exp", &[], &[]).replacen(
+        "\"colors\":",
+        "\"export\":{\"pageBg\":\"#000000\",\"foo\":\"#111111\"},\"colors\":",
+        1,
+    );
+    let reason = theme_error_reason(&json);
+    assert!(
+        reason.contains("  - /export/foo: schema is false"),
+        "{reason}"
+    );
+    assert!(
+        reason.contains("  - /export: must not have additional properties"),
+        "{reason}"
+    );
+    assert!(
+        !reason.contains("pageBg"),
+        "a known export key is fine: {reason}"
+    );
+}
+
+#[test]
+fn an_unknown_top_level_key_is_rejected_naming_the_key() {
+    let json = full_theme_json("meta", &[], &[]).replacen('{', "{\"author\":\"someone\",", 1);
+    let reason = theme_error_reason(&json);
+    assert!(reason.contains("  - /author: schema is false"), "{reason}");
+    assert!(
+        reason.contains("  - /: must not have additional properties"),
+        "{reason}"
+    );
+}
+
+/// Every key pi's schema declares still loads: `$schema`, `appearance`, every optional `colors`
+/// token and all three `export` keys.
+#[test]
+fn every_declared_key_still_loads() {
+    let json = full_theme_json(
+        "all",
+        &[],
+        &[
+            ("scrollbarTrack", "#010101"),
+            ("scrollbarThumb", "#020202"),
+            ("thinkingMax", "#030303"),
+            ("searchMatchBg", "#040404"),
+            ("searchMatchText", "#050505"),
+        ],
+    )
+    .replacen(
+        '{',
+        "{\"$schema\":\"https://example.invalid/theme-schema.json\",\"appearance\":\"dark\",\
+         \"export\":{\"pageBg\":\"#000000\",\"cardBg\":\"#111111\",\"infoBg\":\"#222222\"},",
+        1,
+    );
+    Theme::parse(
+        &json,
+        None,
+        ResourceScope::Builtin,
+        crate::ResourceOrigin::Builtin,
+    )
+    .expect("every key the schema declares loads");
+}
+
+/// The bundled themes carry no key outside the schema (`builtin_themes` drops a theme that fails
+/// to parse, so parse them directly).
+#[test]
+fn the_bundled_themes_still_parse_under_the_strict_check() {
+    for json in [crate::BUILTIN_DARK_JSON, crate::BUILTIN_LIGHT_JSON] {
+        Theme::parse(
+            json,
+            None,
+            ResourceScope::Builtin,
+            crate::ResourceOrigin::Builtin,
+        )
+        .expect("bundled theme parses");
+    }
 }
 
 // ===========================================================================

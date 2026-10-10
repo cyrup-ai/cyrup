@@ -272,6 +272,7 @@ impl TranscriptView {
                 run,
                 expanded,
                 width,
+                self.output_pad,
                 theme,
                 ImageOpts {
                     show: self.show_images,
@@ -308,6 +309,7 @@ impl TranscriptView {
         if let Some(b) = &self.bash {
             lines.extend(b.render_lines(
                 width,
+                self.output_pad,
                 theme,
                 self.bash_cancel_hint.as_deref(),
                 self.bash_expand_hint.as_deref(),

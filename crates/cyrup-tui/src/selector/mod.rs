@@ -243,6 +243,23 @@ pub(crate) fn caret_cell(buf: &ratatui::buffer::Buffer, area: Rect) -> Option<(u
     None
 }
 
+/// [`caret_cell`], then drop the drawn caret it found (TUI-172), for use when the hardware cursor is
+/// shown on that cell.
+///
+/// Pi 1.1 (`1cedd3272`) has `Input` wrap its drawn caret in `renderFakeCursor` (`input.ts:433,491`
+/// @f1b2e77f5), and `TUI.resolveFakeCursors` (`tui.ts:1478-1484`) removes the fake cursor directly
+/// after `CURSOR_MARKER` when `showHardwareCursor` is on, so only the terminal cursor shows. The
+/// reversed cell is cyrup's marker AND its fake cursor at once, so the scan finds it first and only
+/// then clears `REVERSED` from that one cell. A wide grapheme needs nothing more: ratatui resets the
+/// cells it covers past the first (`Buffer::set_stringn`), so they never carry the modifier.
+pub(crate) fn take_caret_cell(buf: &mut ratatui::buffer::Buffer, area: Rect) -> Option<(u16, u16)> {
+    let pos = caret_cell(buf, area)?;
+    if let Some(cell) = buf.cell_mut(pos) {
+        cell.modifier.remove(ratatui::style::Modifier::REVERSED);
+    }
+    Some(pos)
+}
+
 /// Split a dialog title/message string on literal `\n` (Pi's `${title}\n${message}` confirm join,
 /// `interactive-mode.ts:2177`) into per-paragraph [`Line`]s, each carrying the same one-space left
 /// pad the single-line title used to (`" {title}"`). Word-wrap of any resulting long paragraph is

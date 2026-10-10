@@ -1198,6 +1198,39 @@ async fn a_renderer_receives_the_display_options_and_the_theme() {
     );
 }
 
+/// TUI-175 — a tool renderer's context carries the REAL `outputPad`: pi's `getRenderContext` sets
+/// `outputPad: this.outputPad` (`components/tool-execution.ts:138` @f1b2e77f5), the field
+/// `ToolRenderContext.outputPad` documents as what a `renderShell: "self"` renderer applies itself
+/// (`core/extensions/types.ts:497-498`). At `outputPad = 0` the renderer is told 0 on the first render,
+/// and a `/settings` move re-invokes it with the new value.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_tool_renderer_receives_output_pad_zero() {
+    let host = host_with(Arc::new(OptionsAwareExt)).await;
+    let mut app = app();
+    app.transcript_mut().set_output_pad(0);
+    let start = AgentSessionEvent::ToolExecutionStart {
+        tool_call_id: ToolCallId::from("call-pad"),
+        tool_name: "bash".into(),
+        args: json!({ "command": "echo hi" }),
+    };
+    app.ingest_event_with_extensions(&start, &host).await;
+    app.draw().unwrap();
+    let live = buffer_text(&app);
+    assert!(
+        live.contains("EXTCALL[bash] expanded=false theme=dark pad=0"),
+        "the tool renderer was not told outputPad 0:\n{live}"
+    );
+
+    app.transcript_mut().set_output_pad(1);
+    app.refresh_extension_renders(&host).await;
+    app.draw().unwrap();
+    let live = buffer_text(&app);
+    assert!(
+        live.contains("EXTCALL[bash] expanded=false theme=dark pad=1"),
+        "the outputPad move did not re-invoke the tool renderer:\n{live}"
+    );
+}
+
 /// THE REGRESSION, expansion half. `Ctrl+O` moves `toolOutputExpanded`; upstream re-broadcasts it
 /// to every child (`interactive-mode.ts:4032-4048`) and every renderer is called again from the
 /// draw path. The extension's row must move with it, not stay frozen at `expanded=false`.

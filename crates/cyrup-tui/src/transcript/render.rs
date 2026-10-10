@@ -36,7 +36,7 @@ pub(crate) fn entry_block(
     }
     if let Entry::Tool(run) = entry {
         let images = effective_opts(entry, expansion, images);
-        let block = tool_block(run, images.tools_expanded, width, theme, images);
+        let block = tool_block(run, images.tools_expanded, width, output_pad, theme, images);
         return EntryBlock {
             lines: block.lines,
             toggle: block.hit,
@@ -44,12 +44,13 @@ pub(crate) fn entry_block(
     }
     let lines = render_entry(entry, expansion, theme, width, output_pad, images);
     let rows = lines.len();
-    let inner_cols = 1..width.saturating_sub(1);
+    // The content box of a `Box(outputPad, 1)` (TUI-175): `outputPad` columns in from either edge.
+    let inner_cols = output_pad..width.saturating_sub(output_pad);
     let toggle = match entry {
         // `MouseRegion(thinkingComponent)` sits in a bare container: the whole row, but not the
         // leading `Spacer(1)` that precedes it.
         Entry::Thinking { .. } => (rows >= 2).then(|| ToggleRegion::new(1..rows, 0..width)),
-        // Spacer, then a `Box(1, 1)` whose content (label, spacer, body) is the region.
+        // Spacer, then a `Box(outputPad, 1)` whose content (label, spacer, body) is the region.
         Entry::BranchSummary { .. } | Entry::CompactionSummary { .. } => {
             (rows >= 4).then(|| ToggleRegion::new(2..rows - 1, inner_cols))
         }
@@ -233,7 +234,7 @@ fn render_entry(
             // of it — inside the full-width `toolSuccessBg` box, so one `read` of a 500-line file
             // painted 500 rows of solid tool tint (Indexed(22), a vivid `#005f00`, once a
             // 256-colour terminal quantises `#283228`) straight over the conversation.
-            tool_lines(run, images.tools_expanded, width, theme, images)
+            tool_lines(run, images.tools_expanded, width, output_pad, theme, images)
         }
         Entry::Bash(b) => {
             // Same rule for the `!`/`!!` block: `BashExecutionComponent` is `isExpandable` and takes
@@ -241,7 +242,7 @@ fn render_entry(
             // the live flag rather than force-expanded.
             let mut full = b.clone();
             full.set_expanded(images.tools_expanded);
-            full.render_lines(width, theme, None, None)
+            full.render_lines(width, output_pad, theme, None, None)
         }
         Entry::SkillInvocation {
             name,
@@ -252,7 +253,14 @@ fn render_entry(
             // `interactive-mode.ts:3864` seeds it from the live `toolOutputExpanded`, so — like the
             // two summaries — it reads that flag here and `Ctrl+O` opens it.
             if !images.tools_expanded {
-                return collapsed_skill_lines(name, images.expand_key, *lead_spacer, theme, width);
+                return collapsed_skill_lines(
+                    name,
+                    images.expand_key,
+                    *lead_spacer,
+                    theme,
+                    width,
+                    output_pad,
+                );
             }
             // `[skill]` label + bold name header, full content as markdown (the expanded branch).
             // The leading spacer is the gated `interactive-mode.ts:3500` one (see
@@ -265,6 +273,7 @@ fn render_entry(
                 *lead_spacer,
                 theme,
                 width,
+                output_pad,
                 md_links,
             )
         }
@@ -287,6 +296,9 @@ fn render_entry(
             //
             // — a `customMessageBg` box holding ONE `error`-coloured line, and then `:59-60`'s
             // `Spacer(1)` + the box, the same leading blank the success arm gets.
+            //
+            // TUI-175 — at f1b2e77f5 that box is `new Box(this.outputPad, 1, …)`
+            // (`custom-entry.ts:56`).
             Rendered::Failed(message) => {
                 let block = theme.custom_message_bg_style();
                 let fill = match block.bg {
@@ -294,15 +306,15 @@ fn render_entry(
                     None => Style::default(),
                 };
                 let text = format!("[{label}] renderer failed: {message}");
-                // `new Text(…, 0, 0)` inside a `Box(1, 1)`: paddingX 0, so the row wraps at the
-                // box's own content width (`box.ts:79`) with no further margin.
+                // `new Text(…, 0, 0)` inside a `Box(outputPad, 1)`: paddingX 0, so the row wraps at
+                // the box's own content width (`box.ts:79`) with no further margin.
                 let children = text_lines(
                     &text,
-                    width.saturating_sub(2).max(1),
+                    width.saturating_sub(output_pad * 2).max(1),
                     0,
                     theme.error_style(),
                 );
-                let mut out = box_lines(children, width, 1, 1, fill);
+                let mut out = box_lines(children, width, output_pad, 1, fill);
                 if !out.is_empty() {
                     out.insert(0, Line::default());
                 }
@@ -348,9 +360,9 @@ fn render_entry(
             // `custom-message.ts:33`'s constructor `Spacer(1)` — unconditional.
             // A tool-surface outcome never reaches a custom message or entry; if one did it has no
             // custom-message framing to draw, so the default box stands.
-            Rendered::None | Rendered::Tree(_) => {
-                labeled_message_lines(label, "", body, true, true, theme, width, md_links)
-            }
+            Rendered::None | Rendered::Tree(_) => labeled_message_lines(
+                label, "", body, true, true, theme, width, output_pad, md_links,
+            ),
         },
         Entry::BranchSummary { summary } => {
             // X14 — `BranchSummaryMessageComponent` is a `Box(1, 1, customMessageBg)` whose body
@@ -377,6 +389,7 @@ fn render_entry(
                     true,
                     theme,
                     width,
+                    output_pad,
                     md_links,
                 )
             } else {
@@ -386,6 +399,7 @@ fn render_entry(
                     images.expand_key,
                     theme,
                     width,
+                    output_pad,
                 )
             }
         }
@@ -407,6 +421,7 @@ fn render_entry(
                     images.expand_key,
                     theme,
                     width,
+                    output_pad,
                 );
             }
             let header = format!(
@@ -422,6 +437,7 @@ fn render_entry(
                 true,
                 theme,
                 width,
+                output_pad,
                 md_links,
             )
         }

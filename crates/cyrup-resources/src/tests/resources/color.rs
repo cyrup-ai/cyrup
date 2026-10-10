@@ -149,7 +149,7 @@ fn a_pi_1_0_theme_written_in_okhsl_resolves_every_role() {
                 ("sky", "oklch(0.7 0.1 230)"),
             ],
             &[
-                ("foreground", "text"),
+                ("text", "text"),
                 ("accent", "$violet"),
                 ("border", "oklch(0.7 0.1 230)"),
                 ("borderAccent", "sky"),
@@ -164,7 +164,7 @@ fn a_pi_1_0_theme_written_in_okhsl_resolves_every_role() {
 
     // Through `vars`, pi's bare-name form.
     assert_eq!(
-        resolved.roles.get("foreground"),
+        resolved.roles.get("text"),
         Some(&ColorSpec::Rgb {
             r: 222,
             g: 224,

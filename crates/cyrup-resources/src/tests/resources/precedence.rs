@@ -56,7 +56,7 @@ async fn a09_9_theme_precedence_global_overrides_builtin() {
     // A loose global theme named `dark` overrides the built-in `dark`.
     write(
         &root.join("global/themes/dark.json"),
-        &full_theme_json("dark", &[("bg", "#010101")], &[("background", "$bg")]),
+        &full_theme_json("dark", &[("bg", "#010101")], &[("accent", "$bg")]),
     );
     let c = cfg(root);
     let report = run_discover(&c).await;

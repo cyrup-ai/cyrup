@@ -1099,6 +1099,13 @@ impl UiTheme {
         }
     }
 
+    /// Code inside a string interpolation (Ruby's `"a #{foo} b"`) — highlight.js's `subst` class,
+    /// which pi paints `subst: (s) => t.fg("text", s)` (`theme/theme.ts:895` @f1b2e77f5). The
+    /// fallback pair is the `text` token of v1.0.0's `dark.json` / `light.json`.
+    pub fn syntax_subst_style(&self) -> Style {
+        self.role_style("text", "#dee0e1", "#3b3f41")
+    }
+
     /// Resolve a `syntect` scope to a syntax-highlight style, the prefix table mirroring Pi's
     /// `buildCliHighlightTheme` (v0.84.1 `theme.ts:1119-1145`). Unknown scopes return `None`, and the
     /// caller then emits the run **unstyled** — Pi pushes cli-highlight's output verbatim
