@@ -48,10 +48,11 @@ pub const MODELS_DECISION_KEV_LOADED_LAYA_UNLOADED: &str = concat!(
     r#""source":"models_dir","can_remove":false}],"object":"list"}"#,
 );
 
-/// [`crate::router::router_props`]`(true)` (`server-models.cpp:1992-2011`).
+/// [`crate::router::router_props`]`(true)` (`server-models.cpp:1992-2011`): `params` is `null`,
+/// as a live b11436 router sends it.
 pub const ROUTER_PROPS_AUTOLOAD: &str = concat!(
     r#"{"role":"router","max_instances":1,"models_autoload":true,"model_alias":"llama-server","#,
-    r#""model_path":"none","default_generation_settings":{"params":{},"n_ctx":0},"#,
+    r#""model_path":"none","default_generation_settings":{"params":null,"n_ctx":0},"#,
     r#""ui_settings":{},"build_info":"b11436","cors_proxy_enabled":false}"#,
 );
 

@@ -52,8 +52,12 @@
 //! # What this is not
 //!
 //! A shape BOTH this definition and its citations read the same wrong way passes every guard. Only
-//! a live `llama-server` can catch that; the opt-in `LLAMA_SERVER_BIN` conformance target EXT-108
-//! names is the check for it.
+//! a live `llama-server` can catch that, and `cyrup-it`'s opt-in `llama_live` target is the check
+//! for it (EXT-100): it starts a real router (`LLAMA_SERVER_BIN`, `CYRUP_LLAMA_MODELS_DIR`) and
+//! requires every key each definition here claims to be present in the real answer with the same
+//! JSON type. Its first run against `b11436` found two definitions wrong that every guard had
+//! passed: [`router::router_props`]' `params` (`null`, not `{}`) and [`router::not_found`] (a
+//! handler's 404 body is replaced by the `File Not Found` literal).
 
 pub mod classify;
 pub mod golden;
@@ -143,6 +147,19 @@ mod tests {
         assert_eq!(
             classify::tokenize_with_pieces(&[(65, "A")]).to_string(),
             golden::TOKENIZE_WITH_PIECES_65_A
+        );
+    }
+
+    /// A handler's 404 reaches the wire as httplib's `File Not Found` literal, not as the
+    /// `format_error_response` body the handler built (`server-http.cpp:199-212` @b11436). Found
+    /// by the live EXT-100 run: a real b11436 router answered `POST /models/load` of an unknown
+    /// model with exactly [`golden::FILE_NOT_FOUND`].
+    #[test]
+    fn a_handlers_not_found_is_the_file_not_found_literal() {
+        let (status, body) = router::not_found("model is not found");
+        assert_eq!(
+            (status, body.to_string().as_str()),
+            (404, golden::FILE_NOT_FOUND)
         );
     }
 

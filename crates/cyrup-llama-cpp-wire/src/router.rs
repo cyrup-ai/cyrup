@@ -41,10 +41,23 @@ pub fn invalid_request(message: &str) -> (u16, Value) {
     (400, error_body(400, message, "invalid_request_error"))
 }
 
-/// `ERROR_TYPE_NOT_FOUND` → `404 not_found_error` (`server-common.cpp:48-51`). `POST /models/load`
-/// answers it for a model that is not in the catalog (`server-models.cpp:2069-2072`).
-pub fn not_found(message: &str) -> (u16, Value) {
-    (404, error_body(404, message, "not_found_error"))
+/// What a handler's `ERROR_TYPE_NOT_FOUND` actually puts on the wire — which is NOT the
+/// `format_error_response` body the handler builds.
+///
+/// `POST /models/load` answers `res_err(format_error_response(message, ERROR_TYPE_NOT_FOUND))` for
+/// a model that is not in the catalog (`server-models.cpp:2069-2072` @b11436), a 404 with
+/// `{"error":{"code":404,"message":"model is not found","type":"not_found_error"}}`. But httplib
+/// runs the server's error handler on EVERY response with a status of 400 or more
+/// (`vendor/cpp-httplib/httplib.cpp:8728-8729` @b11436), and that handler REPLACES the body of
+/// every 404 with its own `File Not Found` literal (`server-http.cpp:199-212`). So the message is
+/// lost and the client sees [`file_not_found`], byte for byte, whatever the handler wrote.
+///
+/// **This definition was wrong until the live EXT-100 run.** It answered the handler's
+/// `format_error_response` body, read from `server-models.cpp` alone; a real b11436 router answered
+/// `POST /models/load {"model":"no-such-model"}` with the `File Not Found` literal. The message
+/// argument is kept so a call site still says which 404 it means.
+pub fn not_found(_message: &str) -> (u16, Value) {
+    file_not_found()
 }
 
 /// The answer to a route the server does not have, which is NOT `format_error_response` but the
@@ -284,6 +297,12 @@ pub const THE_CATALOG_CARRIES_NO_DOWNLOAD_PROGRESS: &str = concat!(
 /// `GET /props` with NO `model` parameter: the router's own props
 /// (`get_router_props`, `server-models.cpp:1992-2015` @b11436). `models_autoload` is the one field
 /// `cyrup_llama::provider::router_autoload_enabled` reads; the rest is sent too and must not disturb it.
+///
+/// `default_generation_settings.params` is **`null`**, not `{}`: the source writes
+/// `{"params", json{}}` (`:2006`), and a value-initialised nlohmann `json` is `null`
+/// (`json::object()` would be `{}`). This definition said `{}` until the live EXT-100 run, where
+/// a real b11436 router answered `"params":null`; nothing in cyrup reads it, but a fake must not
+/// teach a client that it is an object.
 pub fn router_props(models_autoload: bool) -> Value {
     json!({
         "role": "router",
@@ -291,7 +310,7 @@ pub fn router_props(models_autoload: bool) -> Value {
         "models_autoload": models_autoload,
         "model_alias": "llama-server",
         "model_path": "none",
-        "default_generation_settings": { "params": {}, "n_ctx": 0 },
+        "default_generation_settings": { "params": null, "n_ctx": 0 },
         "ui_settings": {},
         "build_info": "b11436",
         "cors_proxy_enabled": false,
