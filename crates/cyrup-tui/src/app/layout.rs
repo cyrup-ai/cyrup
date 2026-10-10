@@ -209,8 +209,10 @@ pub(crate) fn region_constraints(state: &mut AppState, width: u16, avail: u16) -
             crate::chrome::compact_hint_height(
                 &state.theme,
                 &state.keymap,
+                state.editor.keymap_ref(),
                 width,
                 state.startup_header.details(),
+                state.verbose_startup || state.transcript.tool_expanded(),
             )
         } else {
             0

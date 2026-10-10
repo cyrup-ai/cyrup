@@ -255,7 +255,13 @@ async fn quiet_startup_hides_the_fullscreen_startup_header_unless_verbose() {
     app.push_session_loaded_resources(&quiet);
     assert_eq!(app.state().startup_header, StartupHeader::Shown);
     let _captured = app.enter_fullscreen_captured().expect("renderer builds");
-    assert!(has(&screen(&mut app), "interrupt"));
+    // TUI-018 — `--verbose` is ALSO `getStartupExpansionState()`'s only boot-true term
+    // (`interactive-mode.ts:1418-1420`), so the header that comes back is the EXPANDED body: pi's
+    // nineteen `expandedInstructions` (`:1024-1048`) rather than the five-item bar. At this
+    // terminal's height the document scrolls, and `to interrupt` — the FIRST hint (`:1026`) — is
+    // above the viewport, so the needle is taken from the body's tail instead. Upstream grows the
+    // header the same way: `Text` wraps and never drops (`tui/src/components/text.ts:64-76`).
+    assert!(has(&screen(&mut app), "drop files to attach"));
 
     // Not quiet: shown. And decided once — a later swap onto a quiet session does not hide it.
     let loud = session_with(dir.path(), "false").await;
@@ -312,8 +318,16 @@ async fn the_fullscreen_header_follows_each_quiet_startup_value() {
     }
 }
 
-/// `--verbose` overrides `"header"` too: the details come back, and so does the onboarding's
-/// promise of them.
+/// `--verbose` overrides `"header"` too: the decision becomes `Shown`, so the details come back.
+///
+/// TUI-018 — what it can no longer assert is the onboarding line's PROMISE of them. `--verbose` is
+/// also the only boot-true term of `getStartupExpansionState()` (`interactive-mode.ts:1418-1420`),
+/// so the header opens EXPANDED, and the expanded body (`:1066`) carries no `compactOnboarding()`
+/// at all — the line whose whole job is to advertise an expansion that has already happened. That
+/// is upstream's own asymmetry, not a cyrup loss: the `"header"`-vs-`false` WORDING of that line is
+/// still pinned, on the non-verbose paths where it exists, by
+/// `the_fullscreen_header_follows_each_quiet_startup_value` and
+/// `the_inline_header_band_follows_each_quiet_startup_value`.
 #[tokio::test]
 async fn verbose_overrides_the_header_value() {
     let dir = tempfile::tempdir().unwrap();
@@ -323,10 +337,15 @@ async fn verbose_overrides_the_header_value() {
     app.push_session_loaded_resources(&session);
     assert_eq!(app.state().startup_header, StartupHeader::Shown);
     let _captured = app.enter_fullscreen_captured().expect("renderer builds");
-    assert!(has(
-        &screen(&mut app),
-        "show full startup help and loaded resources."
-    ));
+    let rows = screen(&mut app);
+    assert!(
+        has(&rows, "drop files to attach"),
+        "the expanded body is on screen: {rows:#?}"
+    );
+    assert!(
+        !has(&rows, "show full startup help"),
+        "…and `compactOnboarding` is absent from it (`:1066`): {rows:#?}"
+    );
 }
 
 /// The inline renderer paints the same header in a band of its own, and pi builds it from the same

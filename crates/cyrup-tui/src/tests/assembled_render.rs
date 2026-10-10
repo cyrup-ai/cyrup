@@ -72,17 +72,20 @@ fn assembled_no_model_empty_is_usable_not_a_void_at_100x30() {
     app.draw().unwrap();
 
     // (#1) The live region is content-sized and small — NOT the ~26-blank-row void the audit found.
-    // Empty turn: 6 startup-hint rows + 3 editor rows + 2 footer rows = 11 rows, pinned at the
-    // bottom. The hint block is 6 rows at this width because pi frames its startup `ExpandableText`
-    // with a `Spacer(1)` on each side (v0.84.1 `interactive-mode.ts:960-962`) and the collapsed body
-    // is FIVE parts — `${logo}\n${compactInstructions}\n${compactOnboarding}\n\n${onboarding}`
-    // (`:952`) — of which cyrup draws the last four: 1 + (1 + 1 + 1 + 1) + 1.
+    // Empty turn: 7 startup-hint rows + 3 editor rows + 2 footer rows = 12 rows, pinned at the
+    // bottom. The hint block is 7 rows at this width because pi frames its startup header with a
+    // `Spacer(1)` on each side (`interactive-mode.ts:1075-1077`) and the collapsed body is FIVE
+    // parts — `${withLogo(compactInstructions())}\n${compactOnboarding()}\n\n${onboarding()}`
+    // (`:1065`), where `withLogo` (`:1015-1020`) is itself two lines: 1 + 5 + 1.
+    //
+    // TUI-018 raised this from 11: cyrup used to draw only the last four parts, dropping the logo
+    // line, and now draws all five.
     //
     // Longest row is `onboarding` at 91 columns; the block's content width is `width - paddingX * 2`
     // = 98 (`text.ts:64`), so nothing wraps here. See the sibling test for the widths where it does.
     assert_eq!(
         app.viewport_height(),
-        11,
+        12,
         "live region not content-sized:\n{}",
         buf_text(&app)
     );
@@ -136,14 +139,15 @@ fn assembled_no_model_empty_is_usable_not_a_void_at_100x30() {
 fn assembled_no_model_empty_is_usable_at_other_sizes() {
     // The expected height is `hint block + 3 editor + 2 footer`, and the hint block GROWS as the
     // terminal narrows because pi's `Text.render` wraps at `contentWidth = width - paddingX * 2`
-    // (`tui/src/components/text.ts:64-67`) instead of clipping. The three text rows are 79
-    // (`compactInstructions`), 60 (`compactOnboarding`) and 91 (`onboarding`) columns wide, plus
-    // three blanks that never wrap:
+    // (`tui/src/components/text.ts:64-67`) instead of clipping. The four text rows are TUI-018's
+    // logo/version line at 13, then 79 (`compactInstructions`), 60 (`compactOnboarding`) and 91
+    // (`onboarding`) columns, plus three blanks that never wrap. The logo row is short enough that
+    // it never wraps at any width here, so every count is exactly one more than before TUI-018:
     //
-    //   w=120 → content 118: 1 + 1 + 1 rows + 3 blanks =  6 → 11
-    //   w=80  → content  78: 2 + 1 + 2 rows + 3 blanks =  8 → 13   (79 > 78, 91 > 78)
-    //   w=60  → content  58: 2 + 2 + 2 rows + 3 blanks =  9 → 14   (60 > 58 as well)
-    for (w, h, want) in [(60u16, 20u16, 14u16), (120, 40, 11), (80, 24, 13)] {
+    //   w=120 → content 118: 1 + 1 + 1 + 1 rows + 3 blanks =  7 → 12
+    //   w=80  → content  78: 1 + 2 + 1 + 2 rows + 3 blanks =  9 → 14   (79 > 78, 91 > 78)
+    //   w=60  → content  58: 1 + 2 + 2 + 2 rows + 3 blanks = 10 → 15   (60 > 58 as well)
+    for (w, h, want) in [(60u16, 20u16, 15u16), (120, 40, 12), (80, 24, 14)] {
         let mut app = App::new(TestBackend::new(w, h), UiTheme::dark()).unwrap();
         app.draw().unwrap();
         assert_eq!(

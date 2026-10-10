@@ -87,8 +87,13 @@ fn document_header(state: &AppState, width: usize) -> Vec<Line<'static>> {
         None if builtin => crate::chrome::compact_hint_lines(
             &state.theme,
             &state.keymap,
+            state.editor.keymap_ref(),
             u16::try_from(width).unwrap_or(u16::MAX),
             state.startup_header.details(),
+            // The same `getStartupExpansionState()` disjunction the pinned-viewport renderer uses
+            // (`interactive-mode.ts:1418-1420`), so the scrolling-document path cannot disagree
+            // with it about how tall the header is.
+            state.verbose_startup || state.transcript.tool_expanded(),
         ),
         None => Vec::new(),
     };

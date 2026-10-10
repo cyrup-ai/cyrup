@@ -148,9 +148,10 @@ pub use autocomplete::{
 };
 pub use bash::{BashExecution, BashStatus, PREVIEW_LINES};
 pub use chrome::{
-    BorderedLoader, COMPACT_HINT_ROWS, STARTUP_ONBOARDING, StartupDetails, VisualTruncate,
-    compact_hint_height, compact_hints, compact_onboarding, format_key_text, key_hint_line,
-    key_hint_spans, render_compact_hints, truncate_to_visual_lines,
+    APP_WORDMARK, BorderedLoader, COMPACT_HINT_ROWS, STARTUP_ONBOARDING, StartupDetails,
+    VisualTruncate, compact_hint_height, compact_hint_lines, compact_hints, compact_onboarding,
+    expanded_hints, format_key_text, key_hint_line, key_hint_spans, logo_line,
+    render_compact_hints, truncate_to_visual_lines,
 };
 pub use commands::{
     ArgumentCompleter, BUILTIN_SLASH_COMMANDS, CommandRegistry, CommandSource, Dispatch,

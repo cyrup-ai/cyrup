@@ -46,11 +46,23 @@ pub(crate) fn paint_startup_hints(frame: &mut Frame, state: &AppState, msg_area:
         && !state.transcript.has_active()
         && msg_area.height >= 1
     {
+        // `getStartupExpansionState()` (`interactive-mode.ts:1418-1420`) is
+        // `this.options.verbose || this.toolOutputExpanded` — BOTH terms. The `verbose` disjunct is
+        // the only one ever true at boot (`toolOutputExpanded` is `false` at construction), so
+        // dropping it would make `--verbose` boot collapsed.
+        //
+        // [CYRUP-DELTA] upstream reads this ONCE, as the `BuiltInHeader` constructor seed (`:1067`),
+        // and thereafter `setToolsExpanded` drives the header directly (`:4561-4577`). cyrup
+        // re-reads it per frame, which is the same observable state machine without a second copy
+        // of the flag to keep in sync.
+        let expanded = state.verbose_startup || state.transcript.tool_expanded();
         let rows = crate::chrome::compact_hint_height(
             &state.theme,
             &state.keymap,
+            state.editor.keymap_ref(),
             msg_area.width,
             state.startup_header.details(),
+            expanded,
         )
         .min(msg_area.height);
         let hint_row = Rect {
@@ -64,7 +76,9 @@ pub(crate) fn paint_startup_hints(frame: &mut Frame, state: &AppState, msg_area:
             hint_row,
             &state.theme,
             &state.keymap,
+            state.editor.keymap_ref(),
             state.startup_header.details(),
+            expanded,
         );
     }
 }
