@@ -147,6 +147,7 @@ fn spawn_env_child_role_entry() {
 /// the persona name all come out of the same assembly a real `subagent` tool call performs.
 fn production_child_env(cwd: &Path, parent_id: &str) -> std::collections::HashMap<String, String> {
     let agent = AgentConfig {
+        launcher: None,
         model_is_settings_default: false,
         machine: None,
         acceptance_role: None, // SUBA-082: no declared role, the name decides

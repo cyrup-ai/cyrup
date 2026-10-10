@@ -678,8 +678,19 @@ impl ResultsWatcher {
         // The result can never be re-scanned, so its retry bookkeeping is dead weight. Clearing it
         // here rather than at TTL keeps the map bounded by "currently-failing results" rather than
         // "every result that ever failed once".
-        let mut retry = self.retry_attempts.lock().await;
-        retry.retain(|key, _| {
+        {
+            let mut retry = self.retry_attempts.lock().await;
+            retry.retain(|key, _| {
+                key.run_id != run_id.as_str() || key.mtime_epoch_secs != mtime_epoch_secs
+            });
+        }
+        // The retired payload's own dedup key goes too. It cannot suppress the file it was built
+        // from (that file is gone), only a LATER payload of the same run that happens to share
+        // its `(run_id, agent, whole-second mtime)` — and such a payload exists: a paused run
+        // whose paused result this watcher delivered is sealed stopped by `stop` under the same
+        // run id and agent label (SUBA-177), and a seal landing in the same second as the pause
+        // write would otherwise be held back for the whole `DEDUP_TTL`.
+        self.seen.lock().await.retain(|key, _| {
             key.run_id != run_id.as_str() || key.mtime_epoch_secs != mtime_epoch_secs
         });
     }
@@ -976,6 +987,53 @@ mod tests {
             "a tracked run id is always a candidate, and is OBSERVED: it carries no entitlement, \
              so nothing about it can be consumed"
         );
+    }
+
+    /// SUBA-177 follow-up: a later payload of the SAME run, carrying the same agent label and the
+    /// same whole-second mtime as one this watcher already delivered and consumed (a paused run's
+    /// stopped seal written in the same second as its pause), must be surfaced by the SAME
+    /// watcher instance, not held back by the consumed payload's dedup key for `DEDUP_TTL`.
+    #[tokio::test]
+    async fn a_later_payload_sharing_a_consumed_payloads_dedup_key_is_surfaced_again() {
+        let (_dir, results_dir) = temp_results_dir();
+        tokio::fs::create_dir_all(&results_dir)
+            .await
+            .expect("mkdir");
+        let paused = sample_result("run00179", RunState::Paused, false);
+        publish_result(&results_dir, &paused).await;
+        let path = owned_path(&results_dir, "run00179");
+        let first_mtime = std::fs::metadata(&path)
+            .expect("stat the paused payload")
+            .modified()
+            .expect("mtime");
+
+        let watcher = ResultsWatcher::new(results_dir.clone());
+        let mut found = scan_own(&watcher).await;
+        assert_eq!(
+            found.len(),
+            1,
+            "precondition: the paused result is delivered"
+        );
+        consume_delivered(&watcher, found.remove(0)).await;
+
+        // The stopped seal: same run id, same agent, and — pinned rather than left to the clock —
+        // the same mtime as the payload just consumed.
+        let stopped = sample_result("run00179", RunState::Stopped, false);
+        publish_result(&results_dir, &stopped).await;
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .expect("open the stopped payload")
+            .set_modified(first_mtime)
+            .expect("pin the mtime to the consumed payload's");
+
+        let rescanned = scan_own(&watcher).await;
+        assert_eq!(
+            rescanned.len(),
+            1,
+            "the consumed payload's dedup key must not suppress a later payload of the same run"
+        );
+        assert_eq!(rescanned[0].result.state, RunState::Stopped);
     }
 
     #[tokio::test]

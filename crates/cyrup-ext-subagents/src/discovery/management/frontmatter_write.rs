@@ -283,6 +283,13 @@ pub(crate) fn serialize_agent(
     if def.machine.is_some() || preserve(&["machine"]) {
         lines.push(format!("machine: {}", def.machine.as_deref().unwrap_or("")));
     }
+    // SUBA-178 — pi `if (config.launcher) lines.push(`launcher: ${config.launcher}`)`
+    // (`agent-serializer.ts:139` @ad11b7ab), after `machine`, before `output`; no `preserve` arm
+    // upstream. Load-bearing: `launcher` is a KNOWN field, so the extra-fields loop skips it, and
+    // without this line an update or eject would silently drop the wrapper.
+    if let Some(launcher) = &def.launcher {
+        lines.push(format!("launcher: {launcher}"));
+    }
 
     if let Some(output) = &def.output
         && let Some(path) = &output.path
@@ -644,6 +651,54 @@ mod tests {
         );
         assert!(!reparsed.extra_fields.contains_key("memory"));
         assert!(!reparsed.extra_fields.contains_key("toolBudget"));
+    }
+
+    /// SUBA-178 — the same silent-deletion trap for `launcher` (pi `agent-serializer.ts:139`
+    /// @ad11b7ab): once `launcher` is a KNOWN field the extra-fields loop skips it, so a
+    /// serializer that never emits it would drop the wrapper on the first management rewrite and
+    /// the agent would run unwrapped. The line sits after `machine:` and before `output:`.
+    /// Management's own `config.launcher` is refused with upstream's sentence
+    /// (`agent-management.ts:457`).
+    ///
+    /// Mutation killed: deleting the serializer push (the re-parse yields `None`); deleting the
+    /// `config_parse` refusal.
+    #[test]
+    fn an_update_keeps_the_launcher_line() {
+        use crate::discovery::frontmatter::parse_agent_file;
+
+        let mut def = sample_agent(AgentSource::Project, PathBuf::from("/w.md"));
+        def.local_name = "boxed".to_string();
+        def.name = "boxed".to_string();
+        def.description = "Boxed".to_string();
+        def.system_prompt_body = "Do work".to_string();
+        def.launcher = Some("net".to_string());
+        def.output = Some(crate::discovery::types::OutputSpec {
+            path: Some(PathBuf::from("out.md")),
+            mode: None,
+        });
+        let serialized = serialize_agent(&def, None);
+        let launcher_at = serialized
+            .find("\nlauncher: net\n")
+            .expect("launcher emitted");
+        let output_at = serialized.find("\noutput: ").expect("output emitted");
+        assert!(
+            launcher_at < output_at,
+            "launcher precedes output:\n{serialized}"
+        );
+        let reparsed = parse_agent_file(&serialized, AgentSource::Project, Path::new("/w.md"))
+            .expect("round-trips back through the parser");
+        assert_eq!(reparsed.launcher.as_deref(), Some("net"));
+
+        let mut fields = super::super::agent_crud::AgentFields::default();
+        let cfg = serde_json::json!({ "launcher": "x" });
+        assert_eq!(
+            super::super::config_parse::apply_agent_config(
+                &mut fields,
+                cfg.as_object().unwrap(),
+                "boxed"
+            ),
+            Err("config.launcher is not supported by agent management; edit the agent file's 'launcher' frontmatter directly.".to_string())
+        );
     }
 
     /// SUBA-008 — the same silent-deletion trap for `turnBudget`, and the parse half with it.

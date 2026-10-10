@@ -40,9 +40,15 @@ fn sj_output_mode() -> serde_json::Value {
 ///
 /// Upstream is a FOUR-branch `anyOf`, and the split between the first two branches is the whole
 /// point. The requestable enum is exactly `["auto", "attested", "checked"]` (`schemas.ts:82`);
-/// `"reviewed"` lives alone in a second branch marked `deprecated` whose description says
-/// "Recognized only so preflight can explain that reviewed is an achieved status"
-/// (`schemas.ts:83-88`).
+/// `"reviewed"` lives alone in a second branch whose description says "Recognized only so
+/// preflight can explain that reviewed is an achieved status" (`schemas.ts:83-88`). That branch is
+/// identified by its sole enum value, not by a flag.
+///
+/// SUBA-176 — the branch no longer carries a `deprecated` keyword. Upstream dropped it in
+/// `50c280f1` (#2721, for #2713; `schemas.ts:61-77` @ad11b7ab): "Strict tool-schema validators
+/// reject the deprecated keyword with HTTP 400, so the subagent tool failed to register for those
+/// providers. Keep the reviewed branch so preflight can still explain it." The keyword walk in
+/// `schema_portability_tests.rs` (upstream's `schemas.test.ts:512-555` @ad11b7ab) pins its absence.
 ///
 /// This crate previously advertised ONE wide enum that also offered `"none"` and `"verified"`.
 /// Both are hard-rejected by [`crate::exec::acceptance::lower_acceptance_input`]
@@ -60,7 +66,6 @@ pub(crate) fn sj_acceptance_override() -> serde_json::Value {
         {
             "type": "string",
             "enum": ["reviewed"],
-            "deprecated": true,
             "description": "Invalid as an explicit policy. Recognized only so preflight can explain that reviewed is an achieved status."
         },
         { "type": "boolean", "enum": [false] },
@@ -482,10 +487,12 @@ pub(crate) fn subagent_tool_parameters() -> serde_json::Value {
     // into launches at all; cyrup does, so the schema says so.
     props.insert("thinking".to_string(), serde_json::json!({ "anyOf": [{ "type": "string" }, { "type": "boolean", "enum": [false] }], "description": "Reasoning level for the single-agent child (off/minimal/low/medium/high/xhigh/max, or false for off), like model. Omit it: the child inherits this session's level, which keeps model and effort aligned so the shared prompt prefix stays cacheable. Set it only to deliberately spend more or less reasoning than the parent; a model ':level' suffix wins over this parameter. Also configures action='watchdog.configure'." }));
     props.insert("id".to_string(), serde_json::json!({ "type": "string", "description": "Run id or prefix for action='status', action='interrupt', action='stop', action='resume', action='steer', or action='append-step'." }));
-    // SCOPE_19/B [CYRUP-DELTA] — `runId` defers to `id` and now says so structurally: it carries
-    // `deprecated: true` and one pointer line instead of a description longer than the property it
-    // defers to. Dispatch still accepts it everywhere `id` is accepted.
-    props.insert("runId".to_string(), serde_json::json!({ "type": "string", "deprecated": true, "description": "Deprecated alias of id for action='interrupt', action='stop', action='resume', action='steer', or action='append-step'; still accepted. Prefer id." }));
+    // SCOPE_19/B [CYRUP-DELTA] — `runId` defers to `id` with one pointer line instead of a
+    // description longer than the property it defers to. Dispatch still accepts it everywhere `id`
+    // is accepted. SUBA-176: the deferral is carried by the description alone — it no longer
+    // carries a `deprecated` keyword, which strict tool-schema validators reject with HTTP 400
+    // (upstream `50c280f1`, #2721).
+    props.insert("runId".to_string(), serde_json::json!({ "type": "string", "description": "Deprecated alias of id for action='interrupt', action='stop', action='resume', action='steer', or action='append-step'; still accepted. Prefer id." }));
     props.insert("dir".to_string(), serde_json::json!({ "type": "string", "description": "Async run directory for action='status', action='stop', action='resume', or action='steer'." }));
     props.insert("index".to_string(), serde_json::json!({ "type": "integer", "minimum": 0, "description": "Zero-based child index for actions that target a specific child or transcript." }));
     // VL-S6 — pi `extension/schemas.ts:318` @v0.68.0, description VERBATIM. Advertised in the
@@ -651,10 +658,12 @@ pub(crate) fn subagent_tool_parameters() -> serde_json::Value {
     // "…Alias of maxRuntimeMs." / "Alias of timeoutMs…" — mutually circular, answering neither of
     // the caller's questions (which one to use; what omitting does).
     // SCOPE_19/B [CYRUP-DELTA] — `timeoutMs` is the advertised spelling and states its omitted
-    // behaviour; `maxRuntimeMs` carries `deprecated: true` and defers. Dispatch still accepts both
-    // and still cross-validates them (`resolve_foreground_timeout`).
+    // behaviour; `maxRuntimeMs` defers to it in its description alone (SUBA-176: no `deprecated`
+    // keyword, which strict tool-schema validators reject with HTTP 400 — upstream `50c280f1`,
+    // #2721). Dispatch still accepts both and still cross-validates them
+    // (`resolve_foreground_timeout`).
     props.insert("timeoutMs".to_string(), serde_json::json!({ "type": "integer", "minimum": 1, "description": "Optional run-level timeout in ms for foreground and async/background runs. Omitted: the agent's or configured default for foreground runs; async runs use the async default. Prefer this over maxRuntimeMs; the two are aliases and must agree." }));
-    props.insert("maxRuntimeMs".to_string(), serde_json::json!({ "type": "integer", "minimum": 1, "deprecated": true, "description": "Deprecated alias of timeoutMs; still accepted, and must agree with it." }));
+    props.insert("maxRuntimeMs".to_string(), serde_json::json!({ "type": "integer", "minimum": 1, "description": "Deprecated alias of timeoutMs; still accepted, and must agree with it." }));
     // SUBA-128 — pi `checkpointBeforeDeadlineMs` (`extension/schemas.ts:363` @v0.71.0), in
     // upstream's position and with its own bounds and description.
     props.insert("checkpointBeforeDeadlineMs".to_string(), serde_json::json!({ "type": "integer", "minimum": 1, "maximum": crate::registration::MAX_CHECKPOINT_BEFORE_DEADLINE_MS, "description": "Async single-agent runs only: the runner requests that the child checkpoint and stop this many ms before the run deadline (best-effort; the deadline kill still applies)." }));
@@ -1011,6 +1020,12 @@ pub(crate) fn subagent_tool_parameters_for(surface: &DisabledFeatureSurface) -> 
     }
     schema
 }
+
+/// SUBA-176 — upstream's provider-rejected keyword walk (`schemas.test.ts:512-555` @ad11b7ab), a
+/// `#[path]` sibling so its keyword list can spell the rejected keyword without this file doing so.
+#[cfg(test)]
+#[path = "schema_portability_tests.rs"]
+mod schema_portability_tests;
 
 #[cfg(test)]
 mod tests {
@@ -2290,6 +2305,20 @@ mod tests {
 
     /// The DEFAULT advertised schema's measured bytes.
     ///
+    /// # SUBA-176 RE-BASELINED THIS ON PURPOSE
+    ///
+    /// Before: `b0e48cee326485971c71662ff9c01192ebc54036ea2fc5715e66fc1784cc402f` (the SUBA-152
+    /// pin below). After: `a13ac86608b0debc9471646cf0010d2f07e4c925e63bc5df55267b5afad6a5dd`.
+    ///
+    /// What moved it: three `deprecated` keywords removed and nothing added — on the `"reviewed"`
+    /// branch of [`sj_acceptance_override`] (upstream `50c280f1`, #2721) and on the two
+    /// SCOPE_19/B CYRUP-DELTA aliases `runId` and `maxRuntimeMs`. Strict tool-schema validators
+    /// reject that keyword with HTTP 400, so the whole request carrying this tool failed on those
+    /// providers. Every property, description and constraint is otherwise unchanged; dispatch
+    /// still accepts both aliases and still refuses `"reviewed"` with its explanatory sentence.
+    /// Re-measured from this test's own `assert_eq!` failure, and proved by round trip: restoring
+    /// all three keywords reads exactly `b0e48cee…` again (observed GREEN against the old pin).
+    ///
     /// # SUBA-152 RE-BASELINED THIS ON PURPOSE
     ///
     /// Before: `beaab01c62a7139e965803c0b7ec617b1ca6249eb18692c8395021e41bd09798` — the value
@@ -2340,8 +2369,8 @@ mod tests {
     /// say here what moved it and why, as this block does. **A silently re-pinned digest is worse
     /// than no pin at all**: it converts the one automatic signal that the whole fleet's tool
     /// surface shifted into a line of noise in a diff.
-    const DEFAULT_SCHEMA_DIGEST_AT_SUBA_152: &str =
-        "b0e48cee326485971c71662ff9c01192ebc54036ea2fc5715e66fc1784cc402f";
+    const DEFAULT_SCHEMA_DIGEST_AT_SUBA_176: &str =
+        "a13ac86608b0debc9471646cf0010d2f07e4c925e63bc5df55267b5afad6a5dd";
 
     /// MUTATION: drop the trailing `.` from [`ACTION_VALIDATE_CLAUSE`] — the digest reads
     /// `62dc0d2e…` against the digest pinned at the time (`beaab01c…`). Observed RED.
@@ -2350,14 +2379,18 @@ mod tests {
     /// `"minLength": 1` from [`sj_task_item`]'s `agent` and it reads `027b9076…`. Three distinct
     /// digests, so this pin discriminates between the three narrowings rather than merely noticing
     /// that something moved.
+    /// MUTATION (SUBA-176), each observed RED against the pinned `a13ac866…`: restore the
+    /// `deprecated` keyword on the `"reviewed"` acceptance branch and the digest reads
+    /// `2d7fb0b6…`; on `runId`, `20937ed2…`; on `maxRuntimeMs`, `ecf9bcbc…`; all three together,
+    /// exactly the SUBA-152 `b0e48cee…`.
     #[test]
     fn the_default_schema_matches_its_deliberately_rebaselined_digest() {
         let full = subagent_tool_parameters();
         assert_eq!(
             schema_digest(&full),
-            DEFAULT_SCHEMA_DIGEST_AT_SUBA_152,
+            DEFAULT_SCHEMA_DIGEST_AT_SUBA_176,
             "the no-disabled-features schema moved; re-measure it and record WHY on \
-             DEFAULT_SCHEMA_DIGEST_AT_SUBA_152, never silently re-pin it"
+             DEFAULT_SCHEMA_DIGEST_AT_SUBA_176, never silently re-pin it"
         );
 
         // Both of pi's two "return the full schema" doors: no surface at all, and a surface that
@@ -2373,8 +2406,8 @@ mod tests {
     }
 
     /// SUBA-152 — the three narrowings that moved
-    /// [`DEFAULT_SCHEMA_DIGEST_AT_SUBA_152`], each named, so the digest is not the only thing
-    /// holding them.
+    /// the SUBA-152 pin (since re-baselined as [`DEFAULT_SCHEMA_DIGEST_AT_SUBA_176`]), each named,
+    /// so the digest is not the only thing holding them.
     ///
     /// The digest pins "the default schema is exactly these bytes" and nothing about INTENT: it
     /// would go equally red if one of these constraints were deleted and equally green if someone

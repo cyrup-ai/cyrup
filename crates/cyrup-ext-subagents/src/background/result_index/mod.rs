@@ -110,14 +110,18 @@ pub use exists::indexed_result_exists;
 pub use locate::{
     ConsumablePayload, PayloadResolution, PayloadState, ResultPayloadLocation,
     fallback_result_payload_path_for_session_run, owned_payload_path, resolve_payload,
-    result_payload_path_for_indexed_run, result_payload_path_for_mission_observer_run,
-    result_payload_path_for_session_run,
+    result_payload_file_for_session_run, result_payload_path_for_indexed_run,
+    result_payload_path_for_mission_observer_run, result_payload_path_for_session_run,
 };
 // `paths` itself stays private; this ONE address escapes it, for the same reason `errno` is
 // `pub(crate)`: [`crate::background::async_retention`]'s `mission-reference` guard is pi's
 // `missionObserverIndexExists` (`async-retention.ts:209-211`), a READ of this index, and it must
 // not re-spell `result-index/observers/mission/<enc(runId)>.json` to ask the question.
 pub(crate) use paths::mission_observer_path;
+// Test-only: the staged address, so the paused-seal tests (SUBA-177) can plant an unindexed
+// staged payload without re-spelling `result-pending/<enc(session)>/<enc(run)>.json`.
+#[cfg(test)]
+pub(crate) use paths::result_pending_path;
 pub use promote::PromotionState;
 pub use remove::{remove_mission_observer_index, remove_result_index};
 pub use retention::{DEFAULT_MAX_AGE_MS, cleanup_result_indexes};

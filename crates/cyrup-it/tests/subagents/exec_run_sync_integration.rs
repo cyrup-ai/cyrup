@@ -52,6 +52,7 @@ fn write_script(dir: &std::path::Path, name: &str, script_json: &serde_json::Val
 
 fn base_agent_config(model: &str) -> AgentConfig {
     AgentConfig {
+        launcher: None,
         model_is_settings_default: false,
         machine: None,
         acceptance_role: None, // SUBA-082: no declared role, the name decides

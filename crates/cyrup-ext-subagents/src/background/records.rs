@@ -529,6 +529,12 @@ pub struct RunStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_acknowledged_extensions:
         Option<crate::exec::run_result::RuntimeAcknowledgedChildExtensions>,
+    /// SUBA-178 — pi `AsyncStatus.launcher?: RunnerLauncher` (`shared/types.ts:1935-1936`
+    /// @ad11b7ab, "argv only, never environment"): the runner launcher this run's runner was
+    /// started under. Stamped by the runner from its `RunnerConfig` on every write it builds
+    /// (`subagent-runner.ts:2077`); later writes mutate the held status, so it survives.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launcher: Option<crate::runner_launcher::RunnerLauncher>,
 }
 
 impl RunStatus {
@@ -575,6 +581,8 @@ impl RunStatus {
             telemetry: RunTelemetry::default(),
             // SUBA-063: no child has run, so nothing has been acknowledged.
             runtime_acknowledged_extensions: None,
+            // SUBA-178: stamped by the runner from its `RunnerConfig`, not here.
+            launcher: None,
         }
     }
 
@@ -700,6 +708,25 @@ impl RunStatus {
     /// enum value itself is unchanged.
     pub fn touch(&mut self) {
         self.last_update = crate::time::now_epoch_millis();
+    }
+
+    /// The run-level `agent` label a [`ResultFile`] built from this status carries — pi
+    /// `subagent-runner.ts:4757`'s `agentName`: one step is named for its agent, a `Parallel` run
+    /// is `parallel:a+b`, anything else `chain:a->b`, and a run with no steps falls back to its
+    /// run id.
+    ///
+    /// One rule, shared by the runner's terminal write (`runner_main/finish.rs`) and the paused
+    /// seal's status-sourced result (`background/control.rs`, SUBA-177), so the two can never
+    /// announce the same run under different names.
+    #[must_use]
+    pub(crate) fn result_agent_label(&self) -> String {
+        let flat_agents: Vec<&str> = self.steps.iter().map(|s| s.agent.as_str()).collect();
+        match flat_agents.as_slice() {
+            [] => self.run_id.as_str().to_string(),
+            [only] => (*only).to_string(),
+            many if self.mode == RunMode::Parallel => format!("parallel:{}", many.join("+")),
+            many => format!("chain:{}", many.join("->")),
+        }
     }
 }
 

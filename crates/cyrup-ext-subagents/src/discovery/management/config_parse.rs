@@ -167,6 +167,14 @@ pub(crate) fn apply_agent_config(
             return Err("config.systemPrompt must be a string or false when provided.".to_string());
         }
     }
+    // SUBA-178 — pi `agent-management.ts:457` @ad11b7ab, after the `runner` branch (which cyrup's
+    // management does not port) and before `model`: a launcher names a user-config argv, so it is
+    // edited only in the agent file. Upstream's next line (`config.runner type '…' cannot be
+    // combined with this agent's 'launcher' frontmatter.`, `:458-460`) is unreachable here: this
+    // port's management never sets `runner`.
+    if cfg.contains_key("launcher") {
+        return Err("config.launcher is not supported by agent management; edit the agent file's 'launcher' frontmatter directly.".to_string());
+    }
     if let Some(v) = cfg.get("model") {
         if v == &Value::Bool(false) || v.as_str() == Some("") {
             fields.model = Some(None);

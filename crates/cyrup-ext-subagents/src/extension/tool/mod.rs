@@ -90,6 +90,62 @@ pub struct SubagentTool {
     watchdog: Option<Arc<crate::watchdog::runtime::MainWatchdogRuntime>>,
 }
 impl SubagentTool {
+    /// SUBA-178 — pi's `selectedAgents` (`subagent-executor.ts:7524-7528` @ad11b7ab): the single
+    /// `agent`, every `tasks[].agent`, or every `chain` step's agents (`getStepAgents`: a static
+    /// `parallel[]`'s agents, a dynamic step's template agent, else the step's own), resolved
+    /// through discovery. Empty unless exactly one of those three modes is selected (a workflow
+    /// script or an invalid mode keeps its own error), and an agent that does not resolve is
+    /// skipped here: the mode arm reports it.
+    fn launcher_selected_agents(
+        &self,
+        parsed: &SubagentToolParams,
+        cwd: &std::path::Path,
+        roots: &crate::paths::Roots,
+    ) -> Vec<crate::discovery::types::AgentDefinition> {
+        let has_workflow = parsed
+            .workflow_script
+            .as_ref()
+            .is_some_and(|s| !s.trim().is_empty());
+        let chain = parsed.chain.as_ref().filter(|c| !c.is_empty());
+        let tasks = parsed.tasks.as_ref().filter(|t| !t.is_empty());
+        let names: Vec<String> = match (has_workflow, chain, tasks, parsed.agent.as_deref()) {
+            (false, Some(chain), None, _) => chain
+                .iter()
+                .flat_map(|step| match step.get("parallel") {
+                    Some(serde_json::Value::Array(items)) => items
+                        .iter()
+                        .filter_map(|item| item.get("agent").and_then(serde_json::Value::as_str))
+                        .map(str::to_string)
+                        .collect::<Vec<_>>(),
+                    Some(template @ serde_json::Value::Object(_)) => template
+                        .get("agent")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string)
+                        .into_iter()
+                        .collect(),
+                    _ => step
+                        .get("agent")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string)
+                        .into_iter()
+                        .collect(),
+                })
+                .collect(),
+            (false, None, Some(tasks), _) => tasks
+                .iter()
+                .filter_map(|task| task.get("agent").and_then(serde_json::Value::as_str))
+                .map(str::to_string)
+                .collect(),
+            (false, None, None, Some(agent)) => vec![agent.to_string()],
+            _ => Vec::new(),
+        };
+        let scope = resolve_execution_agent_scope(parsed.agent_scope.as_deref());
+        names
+            .iter()
+            .filter_map(|name| self.executor.resolve_agent(cwd, name, scope, roots).ok())
+            .collect()
+    }
+
     #[must_use]
     pub(crate) fn new(executor: Arc<SubagentExecutor>, cwd: PathBuf) -> Self {
         Self {
@@ -438,6 +494,22 @@ impl Tool for SubagentTool {
         // the depth-exceeded check below — still true, unchanged by the hoist.]
         let depth = resolve_effective_depth(cfg.max_subagent_depth);
 
+        // SUBA-178 — pi `subagent-executor.ts:7524-7549` @ad11b7ab: the agents this call selects
+        // (`agent`, `tasks[].agent`, every `chain` step's agents), resolved once. A launcher agent
+        // goes to the background whenever the caller OMITTED `async`, even over the agent's own
+        // `async: false` and `asyncByDefault: false` — decided HERE, before `is_background`, so a
+        // forced-background launch takes no foreground dispatch token. The refusals themselves run
+        // below, after acceptance and before the depth guard and the spawn charge.
+        let requested_async = parsed.r#async;
+        let launcher_selection = self.launcher_selected_agents(&parsed, &effective_cwd, &roots);
+        let launcher_agent = launcher_selection
+            .iter()
+            .find(|agent| agent.launcher.is_some())
+            .cloned();
+        if launcher_agent.is_some() && requested_async.is_none() {
+            parsed.r#async = Some(true);
+        }
+
         // R-SA-069 single-dispatch guard (pi `executeWithSingleDispatchGuard`): pi checks
         // `subagentInProgress` ONLY when `runsForeground` is true (`!(dispatchParams.async ??
         // deps.asyncByDefault)` — i.e. an effectively async dispatch is exempt, exactly like the
@@ -492,6 +564,34 @@ impl Tool for SubagentTool {
         let acceptance_errors = validate_execution_acceptance(&parsed);
         if !acceptance_errors.is_empty() {
             return Err(ToolError::new(acceptance_errors.join(" ")));
+        }
+
+        // SUBA-178 — pi `subagent-executor.ts:7541-7549` @ad11b7ab, "before fan-out admission or
+        // a session directory exists": a launcher wraps the BACKGROUND runner only, so an explicit
+        // `async: false` is refused (checked on the RAW request, so `forceTopLevelAsync` cannot
+        // hide it, exactly as upstream checks `normalizedParams.async`), and every selected agent's
+        // launcher must resolve from the user config and not combine with a machine or an external
+        // runner. Ahead of the depth guard and `reserve_subagent_spawns`, so a refused launch
+        // spends no session spawn budget, takes no capacity slot and creates no run directory.
+        if let Some(agent) = &launcher_agent {
+            if requested_async == Some(false) {
+                return Err(ToolError::new(
+                    crate::runner_launcher::foreground_launcher_error(
+                        &agent.name,
+                        agent.launcher.as_deref().unwrap_or_default(),
+                    ),
+                ));
+            }
+            for agent in &launcher_selection {
+                crate::runner_launcher::resolve_agent_runner_launcher(
+                    &agent.name,
+                    agent.launcher.as_deref(),
+                    agent.runner.as_ref(),
+                    cfg.runner_launchers.as_ref(),
+                    parsed.machine.as_deref().or(agent.machine.as_deref()),
+                )
+                .map_err(ToolError::new)?;
+            }
         }
 
         // pi `reserveSubagentSpawns` (`subagent-executor.ts:266-282`, called at `:3434-3441` right

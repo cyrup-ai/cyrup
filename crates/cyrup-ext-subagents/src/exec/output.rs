@@ -2591,6 +2591,7 @@ mod tests {
 
     fn capability_agent(tools: Option<Vec<crate::discovery::types::ToolRef>>) -> AgentDefinition {
         AgentDefinition {
+            launcher: None,
             default_tool_timeout_ms: None,
             inherit_global_context: false,
             machine: None,

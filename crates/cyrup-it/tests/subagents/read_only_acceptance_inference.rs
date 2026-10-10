@@ -96,6 +96,7 @@ fn message_end_line(text: &str) -> String {
 
 fn agent_config(name: &str) -> AgentConfig {
     AgentConfig {
+        launcher: None,
         model_is_settings_default: false,
         machine: None,
         acceptance_role: None, // SUBA-082: no declared role, the name decides

@@ -65,6 +65,7 @@ async fn write_descriptor_with_the_production_writer(
         )
         .expect("the builtin persona resolves");
     let runner_config = RunnerConfig {
+        launcher: None,
         tool_timeout: Default::default(),
         model_response_aliases: None,
         runner_process_instance_id: None,

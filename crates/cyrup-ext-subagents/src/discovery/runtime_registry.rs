@@ -1035,6 +1035,10 @@ fn to_agent_definition(
         // SUBA-100 — pi `...(definition.machine !== undefined ? { machine } : {})` (`:357`
         // @v0.68.0): validated by `validate_optional_string`; the catalog check is at launch.
         machine: definition.machine,
+        // SUBA-178 — upstream's runtime definition has no `launcher` key (it is not one of
+        // `RUNTIME_AGENT_FIELDS`), so a runtime agent is never wrapped; naming one is refused as
+        // an unknown field.
+        launcher: None,
         // SUBA-133 — runtime agents are never advertised (`advertised-agent-prompt.ts:34`
         // @v0.71.0 filters `source !== "runtime"`), and a runtime definition has no such key.
         advertise: None,

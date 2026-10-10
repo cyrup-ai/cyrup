@@ -454,6 +454,7 @@ mod tests {
             agents: None,
         };
         let config = crate::background::runner_main::RunnerConfig {
+            launcher: None,
             tool_timeout: Default::default(),
             model_response_aliases: None,
             runner_process_instance_id: None,
@@ -509,6 +510,7 @@ mod tests {
     /// A minimal `RunnerConfig`, mirroring the fixture above.
     fn minimal_runner_config() -> crate::background::runner_main::RunnerConfig {
         crate::background::runner_main::RunnerConfig {
+            launcher: None,
             tool_timeout: Default::default(),
             model_response_aliases: None,
             runner_process_instance_id: None,

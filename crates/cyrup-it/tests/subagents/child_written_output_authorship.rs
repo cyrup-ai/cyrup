@@ -70,6 +70,7 @@ fn fixture_binary_path() -> PathBuf {
 
 fn agent_config(name: &str) -> AgentConfig {
     AgentConfig {
+        launcher: None,
         model_is_settings_default: false,
         machine: None,
         name: name.to_string(),

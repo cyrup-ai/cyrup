@@ -115,6 +115,7 @@ pub(crate) mod tests {
     /// persona-map lookup and reach the spawn.
     pub(crate) fn resolved_persona(name: &str) -> crate::exec::ResolvedAgentPersona {
         crate::exec::ResolvedAgentPersona {
+            launcher: None,
             model_is_settings_default: false,
             default_tool_timeout_ms: None,
             inherit_global_context: false,
@@ -322,6 +323,7 @@ pub(crate) mod tests {
             .expect("mkdir results_dir");
 
         let config = RunnerConfig {
+            launcher: None,
             tool_timeout: Default::default(),
             model_response_aliases: None,
             runner_process_instance_id: None,
@@ -429,6 +431,111 @@ pub(crate) mod tests {
         assert_eq!(
             rows[0]["taskHash"],
             crate::exec::mcp_direct_tools::hex_sha256("chain").as_str()
+        );
+    }
+
+    /// SUBA-178 — THE row's Verify, clause 2 (`status.json` records `launcher`): the runner
+    /// stamps its `RunnerConfig::launcher` on the status it builds, and it is still there on the TERMINAL
+    /// write (later writes mutate the held status; pi keeps it on every write,
+    /// `subagent-runner.ts:2077` @ad11b7ab). The step's agent names a DIFFERENT launcher, so the
+    /// in-runner backstop refuses it with the foreground sentence instead of running it under
+    /// the wrong wrapper (or none).
+    ///
+    /// Mutations killed: not stamping `status.launcher` in `publish_initial_status`; clearing the
+    /// child's launcher whenever the runner has ANY launcher (the step would run, and fail on its
+    /// model instead); removing the `run_sync` backstop (likewise).
+    #[tokio::test]
+    async fn the_runner_records_its_launcher_and_refuses_a_step_naming_another() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let run_id = RunId::from_token("launched-run");
+        let run_paths = run_paths_in(dir.path(), &run_id);
+        tokio::fs::create_dir_all(&run_paths.run_dir)
+            .await
+            .expect("mkdir run_dir");
+        tokio::fs::create_dir_all(dir.path().join("results"))
+            .await
+            .expect("mkdir results_dir");
+        let net = crate::runner_launcher::RunnerLauncher {
+            name: "net".to_string(),
+            argv: vec!["env".to_string(), "--".to_string(), "X=1".to_string()],
+        };
+        let mut persona = resolved_persona("boxed");
+        persona.launcher = Some("other".to_string());
+        let config = RunnerConfig {
+            launcher: Some(net.clone()),
+            tool_timeout: Default::default(),
+            model_response_aliases: None,
+            runner_process_instance_id: None,
+            revival_lease: None,
+            // SUBA-021: unbudgeted on this path (see the field doc).
+            usage_budget: None,
+            turn_budget: None,
+            permission_rules: None,
+            // SUBA-N03: this fixture exercises neither the run-level timeout nor `share`/artifacts, so it
+            // carries the same values an older on-disk config deserializes to (`#[serde(default)]`).
+            timeout_ms: None,
+            deadline_at_ms: None,
+            checkpoint_before_deadline_ms: None,
+            share: None,
+            artifacts_dir: None,
+            artifact_config: crate::artifacts::ArtifactConfig::default(),
+            run_id: run_id.clone(),
+            mode: RunMode::Single,
+            steps: vec![RunnerStep::SingleStep(single_step("boxed", "t"))],
+            cwd: dir.path().to_path_buf(),
+            session_file: None,
+            session_id: Some("test-session".to_string()),
+            completion_owner_id: None,
+            global_concurrency_limit: 20,
+            worktree_base_dir: None,
+            max_subagent_depth: 2,
+            async_root: dir.path().join("async"),
+            results_dir: dir.path().join("results"),
+            resolved_agents: BTreeMap::from([("boxed".to_string(), persona)]),
+            original_task: String::new(),
+            chain_dir: None,
+            orchestrator_intercom_target: None,
+            inherited_session_model: None,
+            inherited_session_thinking: None,
+            model_scope: None,
+            nested_route: None,
+            nested_self: None,
+            dynamic_fanout_max_items: None,
+            control: None,
+            include_progress: None,
+        };
+        let cfg_path = run_paths.run_dir.join("runner-config.json");
+        write_atomic_json(&cfg_path, &config)
+            .await
+            .expect("write config");
+
+        let outcome = run(&cfg_path, &run_paths).await;
+        assert!(outcome.is_ok(), "{outcome:?}");
+
+        let raw = tokio::fs::read(&run_paths.status)
+            .await
+            .expect("status.json");
+        let status: RunStatus = serde_json::from_slice(&raw).expect("valid status");
+        assert_eq!(
+            status.launcher.as_ref(),
+            Some(&net),
+            "terminal status keeps the launcher"
+        );
+        let json: serde_json::Value = serde_json::from_slice(&raw).expect("json");
+        assert_eq!(
+            json.get("launcher"),
+            Some(&serde_json::json!({"name": "net", "argv": ["env", "--", "X=1"]}))
+        );
+        let step_error = status
+            .steps
+            .first()
+            .and_then(|step| step.error.clone())
+            .unwrap_or_default();
+        assert!(
+            step_error.contains(
+                "Agent 'boxed' uses launcher 'other', which wraps the background runner only."
+            ),
+            "{status:?}"
         );
     }
 }

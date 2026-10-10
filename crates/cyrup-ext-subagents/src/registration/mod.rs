@@ -610,6 +610,18 @@ pub struct SubagentExtensionConfig {
     /// deserialization. Read through [`Self::checkpoint_before_deadline_ms`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checkpoint_before_deadline_ms: Option<serde_json::Value>,
+    /// SUBA-178 — pi `ExtensionConfig.runnerLaunchers?: Record<string, string[]>`
+    /// (`shared/types.ts:2700-2701` @ad11b7ab): "Named argv prefixes for background runners;
+    /// agents select one with `launcher: <name>`. User config only."
+    ///
+    /// User config only holds here because the loader (`crates/cyrup/src/subagent_config.rs`)
+    /// reads this struct from the user agent dir alone; no settings or override tier carries the
+    /// key. Validated at load by [`Self::validate_runner_launchers`] and one of
+    /// [`FAIL_CLOSED_CONFIG_KEYS`], so a malformed map refuses the whole file rather than being
+    /// dropped, which would turn every agent that names a launcher into a launch failure with no
+    /// clue why (and, before SUBA-178, into an unwrapped run).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runner_launchers: Option<crate::runner_launcher::RunnerLaunchers>,
 }
 
 /// The `config.json` keys pi declares on `ExtensionConfig` at v0.68.0 (`shared/types.ts:2596-2690`)
@@ -655,9 +667,11 @@ pub enum ToolActivationMode {
 /// checkpoint and tool-surface policies "must not be silently discarded and replaced by the
 /// built-in defaults after validation fails".
 ///
-/// `9f1c2552` (#2624) widened the list from eight keys to these eleven by adding `authorityPolicy`,
+/// `9f1c2552` (#2624) widened the list from eight keys to eleven by adding `authorityPolicy`,
 /// `permissions` and `toolBudget`, for the failure its changelog names: an invalid value for ANY
-/// key "silently drops `authorityPolicy`, `permissions`, or `toolBudget`".
+/// key "silently drops `authorityPolicy`, `permissions`, or `toolBudget`". SUBA-178: `e4b52b4b`
+/// (#2720) appended `runnerLaunchers` as the twelfth (`config.ts:17` @ad11b7ab), since a dropped
+/// launcher map would leave every agent that names a launcher unable to launch.
 ///
 /// A closed set that lives with the schema, not with the loader — the keys are a property of what
 /// `config.json` may declare, and some of them were listed before this port had a field for them
@@ -668,7 +682,7 @@ pub enum ToolActivationMode {
 ///
 /// Order is upstream's, so [`SubagentExtensionConfig::invalid_config_disposition`] reports the keys
 /// in the order pi declares them.
-pub const FAIL_CLOSED_CONFIG_KEYS: [&str; 11] = [
+pub const FAIL_CLOSED_CONFIG_KEYS: [&str; 12] = [
     "worktreeProvider",
     "worktreeBranchPrefix",
     "modelResponseAliases",
@@ -680,6 +694,7 @@ pub const FAIL_CLOSED_CONFIG_KEYS: [&str; 11] = [
     "authorityPolicy",
     "permissions",
     "toolBudget",
+    "runnerLaunchers",
 ];
 
 /// SUBA-166 — what a `config.json` that EXISTS but failed validation must do, as a named outcome
@@ -797,6 +812,8 @@ impl Default for SubagentExtensionConfig {
             model_response_aliases: None,
             // SUBA-128 — upstream has no built-in default: absent means no checkpoint request.
             checkpoint_before_deadline_ms: None,
+            // SUBA-178 — no launchers unless the user config declares them.
+            runner_launchers: None,
             // VL-S11 R3 — upstream's own default: `if (options.foregroundDetachShortcut)`
             // (`slash-commands.ts:1007`) registers NOTHING with the key absent. Opt-in, and
             // deliberately so; see the field's doc for why a default-on chord was rejected.
@@ -1081,7 +1098,24 @@ impl SubagentExtensionConfig {
         // (`extension/config.ts:176`), which upstream runs AFTER `validateArtifactConfig` (`:173`),
         // so a file with both problems reports the one pi would.
         Self::validate_model_response_aliases(raw)?;
+        // SUBA-178 — `validateRunnerLaunchersConfig(config.runnerLaunchers)` is the LAST call in
+        // upstream's `validateConfig` (`extension/config.ts:211` @ad11b7ab), after
+        // `validateModelResponseAliases`; `validateMainWindowRenderer` and
+        // `validateOrcaProgressTabs` sit between them upstream and are not ported.
+        Self::validate_runner_launchers(raw)?;
         Ok(())
+    }
+
+    /// SUBA-178 — pi `validateRunnerLaunchersConfig` (`extension/config.ts:106-116` @ad11b7ab) on
+    /// the RAW config JSON, so a wrong-shaped map is refused (the key is fail-closed) instead of
+    /// being dropped by serde.
+    ///
+    /// # Errors
+    ///
+    /// Upstream's own message, from
+    /// [`crate::runner_launcher::validate_runner_launchers_config`].
+    pub fn validate_runner_launchers(raw: &serde_json::Value) -> Result<(), String> {
+        crate::runner_launcher::validate_runner_launchers_config(raw.get("runnerLaunchers"))
     }
 
     /// SUBA-166 — what to do with a `config.json` that exists but failed
@@ -2839,8 +2873,8 @@ mod tests {
 
     // ---- SUBA-166: `FAIL_CLOSED_CONFIG_KEYS` ----
 
-    /// SUBA-166 — the fail-closed list is upstream's eleven keys, in upstream's order
-    /// (`extension/config.ts:17` @v0.75.0), and the disposition reports every one a bad file
+    /// SUBA-166 — the fail-closed list is upstream's twelve keys (eleven at v0.75.0; SUBA-178
+    /// added `runnerLaunchers`), in upstream's order (`extension/config.ts:17` @ad11b7ab), and the disposition reports every one a bad file
     /// declares.
     ///
     /// Mutation killed: dropping any key from [`FAIL_CLOSED_CONFIG_KEYS`] — the per-key loop then
@@ -2861,6 +2895,8 @@ mod tests {
                 "authorityPolicy",
                 "permissions",
                 "toolBudget",
+                // SUBA-178 — `e4b52b4b` (#2720), `config.ts:17` @ad11b7ab.
+                "runnerLaunchers",
             ],
             "pi FAIL_CLOSED_CONFIG_KEYS, in pi's own order"
         );

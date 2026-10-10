@@ -120,6 +120,7 @@ fn write_sigkill_child(dir: &Path, name: &str, line: &str) -> PathBuf {
 
 fn base_agent_config(model: &str) -> AgentConfig {
     AgentConfig {
+        launcher: None,
         model_is_settings_default: false,
         machine: None,
         acceptance_role: None, // SUBA-082: no declared role, the name decides
@@ -590,6 +591,7 @@ async fn stopping_a_nested_run_gets_pis_own_scope_refusal_not_the_not_found_text
 /// `background_runner_main_integration.rs`'s own `fixture_persona`).
 fn fixture_persona(name: &str) -> ResolvedAgentPersona {
     ResolvedAgentPersona {
+        launcher: None,
         model_is_settings_default: false,
         default_tool_timeout_ms: None,
         machine: None,
@@ -695,6 +697,7 @@ async fn a_stop_landing_with_a_timeout_ends_the_run_stopped_not_failed() {
         .expect("mkdir run dir");
 
     let config = RunnerConfig {
+        launcher: None,
         tool_timeout: Default::default(),
         // SUBA-119 — no operator-declared response-id alias for this fixture run.
         model_response_aliases: None,

@@ -123,6 +123,10 @@ pub(crate) fn record_writer_process_observation(
 }
 
 pub(crate) struct ExecSingleStepExecutor {
+    /// SUBA-178 — the launcher NAME this runner was started under (`RunnerConfig::launcher`).
+    /// A step whose agent names exactly this launcher runs; any other named launcher is left on
+    /// the child's `AgentConfig`, where `exec::run_sync` refuses it rather than run it unwrapped.
+    pub(crate) runner_launcher: Option<String>,
     pub(crate) depth: DepthEnvelope,
     pub(crate) interrupted: Arc<std::sync::atomic::AtomicBool>,
     /// The run-wide SHARED soft-interrupt token (R-SA-084). Cloned into every dispatched step's
@@ -409,6 +413,8 @@ impl ExecSingleStepExecutor {
         spawn_command: Option<crate::spawn::SpawnCommand>,
     ) -> Self {
         Self {
+            // SUBA-178 — a foreground caller is never inside a launcher-wrapped runner.
+            runner_launcher: None,
             depth,
             spawn_command,
             // A foreground executor's child env comes from its own `RunOptions`, not from here.
@@ -617,6 +623,13 @@ impl ExecSingleStepExecutor {
         // Reconstitute the execution-ready config from the persona, stamping THIS process's own
         // live depth envelope (a per-process runtime value the persona deliberately does not carry).
         let mut agent: AgentConfig = persona.to_agent_config(self.depth);
+        // SUBA-178 — this child runs inside a runner wrapped by its agent's launcher, so the
+        // launcher is satisfied and cleared; a different (or absent) runner launcher keeps it, and
+        // `exec::run_sync` refuses the child (pi refuses the mix before launch,
+        // `async-execution.ts:992-999`; this is the in-runner backstop).
+        if agent.launcher.is_some() && agent.launcher == self.runner_launcher {
+            agent.launcher = None;
+        }
         // SCOPE_19/A1 — session-thinking inheritance, the effort half of the model inheritance
         // resolved below: a persona with no `thinking:` of its own reasons at the level the
         // launching session was reasoning at (which is also what keeps the child's request prefix
@@ -1514,6 +1527,7 @@ mod tests {
             crate::background::session_lease::WriterUpdate,
         >();
         let executor = ExecSingleStepExecutor {
+            runner_launcher: None,
             tool_timeouts: Arc::new(BTreeMap::new()),
             model_response_aliases: None,
             writer_ledgers: None,
@@ -1598,6 +1612,7 @@ mod tests {
         // The executor carries an EMPTY persona map — exactly the state that must NOT dispatch a
         // placeholder.
         let executor = ExecSingleStepExecutor {
+            runner_launcher: None,
             tool_timeouts: Arc::new(BTreeMap::new()),
             model_response_aliases: None,
             writer_ledgers: None,
@@ -1833,6 +1848,34 @@ mod tests {
         }
     }
 
+    /// SUBA-178 — a step's launcher is satisfied (cleared off the child's config) only inside a
+    /// runner started under that SAME launcher; otherwise it stays, and `exec::run_sync` refuses
+    /// the child. Mutation killed: clearing unconditionally, or never clearing (a wrapped runner
+    /// could then run none of its own steps).
+    #[test]
+    fn a_step_runs_under_its_launcher_only_inside_a_runner_started_with_it() {
+        let mut persona = super::super::tests::resolved_persona("boxed");
+        persona.launcher = Some("net".to_string());
+        let mut executor = runner_shaped(None, crate::artifacts::ArtifactConfig::default());
+        executor.resolved_agents = Arc::new(BTreeMap::from([("boxed".to_string(), persona)]));
+        let step = single_step("boxed", "t");
+        for (runner, expected) in [
+            (Some("net"), None),
+            (None, Some("net")),
+            (Some("other"), Some("net")),
+        ] {
+            executor.runner_launcher = runner.map(str::to_string);
+            let Ok(setup) = executor.build_step_agent_config(&step) else {
+                panic!("the persona resolves");
+            };
+            assert_eq!(
+                setup.agent.launcher.as_deref(),
+                expected,
+                "runner {runner:?}"
+            );
+        }
+    }
+
     /// An executor shaped as `turn_loop` builds it for the detached runner, with the given
     /// artifact config.
     fn runner_shaped(
@@ -1840,6 +1883,7 @@ mod tests {
         artifact_config: crate::artifacts::ArtifactConfig,
     ) -> ExecSingleStepExecutor {
         ExecSingleStepExecutor {
+            runner_launcher: None,
             tool_timeouts: Arc::new(BTreeMap::new()),
             model_response_aliases: None,
             writer_ledgers: None,

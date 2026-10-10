@@ -167,6 +167,10 @@ const KNOWN_FIELDS: &[&str] = &[
     // parsed `agents.ts:2168` @v0.68.0). Until it was typed here, a `machine:` line round-tripped
     // into `extra_fields` and the agent ran locally. Emitted by `management::serialize_agent`.
     "machine",
+    // SUBA-178 — the runner launcher (`agent-serializer.ts:36`, parsed `agents.ts:2283-2289`
+    // @ad11b7ab). Typed so a `launcher:` line is VALIDATED and honoured instead of round-tripping
+    // into `extra_fields` while the runner spawns unwrapped. Emitted by `management::serialize_agent`.
+    "launcher",
     // SUBA-133 — the advertised-catalog opt-in (`agent-serializer.ts:9`, parsed `agents.ts:2107`
     // @v0.71.0). Emitted by `management::serialize_agent`.
     "advertise",
@@ -1398,6 +1402,37 @@ pub fn parse_agent_file_checked(
         Err(message) => return Err(fail(message)),
     };
 
+    // SUBA-178 — pi `agents.ts:2283-2289` @ad11b7ab: a present `launcher` must match the name
+    // rule, and cannot combine with `machine` or an external runner (machine named first, as
+    // upstream's ternary does). Both THROW upstream; here the same per-file skip + warn as every
+    // other malformed frontmatter value. An empty `launcher:` is `""` and fails the rule.
+    let launcher = parsed.get("launcher").map(str::to_string);
+    if let Some(launcher) = launcher.as_deref() {
+        if !crate::runner_launcher::is_runner_launcher_name(launcher) {
+            return Err(fail(format!(
+                "Agent '{runtime_name}' frontmatter 'launcher' {} is invalid; launcher names {}.",
+                serde_json::Value::String(launcher.to_string()),
+                crate::runner_launcher::RUNNER_LAUNCHER_NAME_RULE
+            )));
+        }
+        let external = match runner.as_ref() {
+            Some(
+                r @ (crate::runner::AgentRunnerConfig::ExternalCli(_)
+                | crate::runner::AgentRunnerConfig::ExternalJob(_)),
+            ) => Some(r.type_str()),
+            _ => None,
+        };
+        if machine.is_some() || external.is_some() {
+            let with = match (machine.is_some(), external) {
+                (true, _) | (false, None) => "'machine'".to_string(),
+                (false, Some(runner_type)) => format!("runner.type='{runner_type}'"),
+            };
+            return Err(fail(format!(
+                "Agent '{runtime_name}' sets 'launcher', which wraps the local Pi background runner, so it cannot be combined with {with}."
+            )));
+        }
+    }
+
     // SUBA-133 — pi `agents.ts:2107-2111` @v0.71.0: exactly `true` or `false`, else THROW — here
     // the same per-file skip + warn as every other malformed frontmatter value above. Upstream
     // names the LOCAL name in this sentence, not the package-qualified one.
@@ -1423,6 +1458,7 @@ pub fn parse_agent_file_checked(
     Ok(Some(AgentDefinition {
         inherit_global_context,
         machine,
+        launcher,
         advertise,
         mutation_tools,
         name: runtime_name,
@@ -1806,6 +1842,62 @@ mod tests {
         assert!(
             parse_agent_file(block, AgentSource::Project, Path::new("/w.md")).is_none(),
             "a block-style runner must be refused loudly, never absorbed into extra_fields"
+        );
+    }
+
+    /// SUBA-178 — pi `agents.ts:2283-2289` @ad11b7ab: `launcher:` is a typed field (never demoted
+    /// to `extra_fields`), a bad name or a launcher beside `machine` / an external runner skips the
+    /// file with upstream's sentence (machine named first).
+    ///
+    /// Mutations killed: removing `"launcher"` from `KNOWN_FIELDS` (it lands in `extra_fields`);
+    /// removing the name check or the combination check. Base tree: red (no `launcher` field).
+    #[test]
+    fn launcher_frontmatter_is_typed_validated_and_refuses_placement() {
+        let ok = "---\nname: worker\ndescription: W\nlauncher: net\n---\n\nbody\n";
+        let def = parse_agent_file(ok, AgentSource::Project, Path::new("/w.md")).expect("parses");
+        assert_eq!(def.launcher.as_deref(), Some("net"));
+        assert!(!def.extra_fields.contains_key("launcher"));
+        let bare = "---\nname: worker\ndescription: W\n---\n\nbody\n";
+        let def = parse_agent_file(bare, AgentSource::Project, Path::new("/w.md")).expect("parses");
+        assert_eq!(def.launcher, None);
+
+        let rule = "launcher names must start with a letter or digit and use only letters, digits, '.', '_' or '-' (at most 128 characters).";
+        for (line, shown) in [
+            ("launcher: a b", r#""a b""#),
+            ("launcher: _net", r#""_net""#),
+            ("launcher:", r#""""#),
+        ] {
+            let content = format!("---\nname: worker\ndescription: W\n{line}\n---\n\nbody\n");
+            let err = parse_agent_file_checked(&content, AgentSource::Project, Path::new("/w.md"))
+                .expect_err("an invalid launcher skips the file");
+            assert_eq!(
+                err.error,
+                format!("Agent 'worker' frontmatter 'launcher' {shown} is invalid; {rule}"),
+                "{line}"
+            );
+        }
+
+        let machine = "---\nname: worker\ndescription: W\nmachine: m\nlauncher: net\n---\n\nbody\n";
+        let err = parse_agent_file_checked(machine, AgentSource::Project, Path::new("/w.md"))
+            .expect_err("launcher + machine skips the file");
+        assert_eq!(
+            err.error,
+            "Agent 'worker' sets 'launcher', which wraps the local Pi background runner, so it cannot be combined with 'machine'."
+        );
+        let cli = "---\nname: worker\ndescription: W\nlauncher: net\nrunner: {\"type\": \"external-cli\", \"command\": \"claude\"}\n---\n\nbody\n";
+        let err = parse_agent_file_checked(cli, AgentSource::Project, Path::new("/w.md"))
+            .expect_err("launcher + external runner skips the file");
+        assert_eq!(
+            err.error,
+            "Agent 'worker' sets 'launcher', which wraps the local Pi background runner, so it cannot be combined with runner.type='external-cli'."
+        );
+        let pi = "---\nname: worker\ndescription: W\nlauncher: net\nrunner: {\"type\": \"pi\"}\n---\n\nbody\n";
+        assert_eq!(
+            parse_agent_file(pi, AgentSource::Project, Path::new("/w.md"))
+                .expect("a pi runner is the local runner")
+                .launcher
+                .as_deref(),
+            Some("net")
         );
     }
 

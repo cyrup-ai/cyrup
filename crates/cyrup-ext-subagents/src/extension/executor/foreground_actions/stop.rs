@@ -459,6 +459,73 @@ mod tests {
         );
     }
 
+    /// SUBA-177 at the USER surface — pi `15757b00` / #2701 (`async-stop-action.ts:40-59`,
+    /// `:205` @ad11b7ab): `subagent({action:"stop", id})` on a paused run whose paused result was
+    /// already delivered (consumed — no payload anywhere) and whose runner close is observed.
+    ///
+    /// Before SUBA-177 this input answered `isError` with `"Stop request persisted for paused
+    /// async run pausedstop02, but terminal proof is not ready (paused result is missing). …"` and
+    /// the run held its capacity slot for ever; upstream now seals it from `status.json`.
+    #[tokio::test]
+    async fn control_stop_seals_a_paused_run_whose_result_was_already_delivered() {
+        use crate::background::process_terminal::{
+            ProcessInstanceExit, ProcessTerminal, ProcessTerminalBase, RunnerProcessInstanceId,
+        };
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = seed_orphaned_run(
+            dir.path(),
+            "pausedstop02",
+            Some("session-OWNER"),
+            Some(std::process::id()),
+        );
+        let run_id = crate::background::RunId::from_token("pausedstop02");
+        let instance = RunnerProcessInstanceId::from_token("runner-inst-177");
+        let observed = ProcessTerminal::Observed {
+            base: ProcessTerminalBase::new(run_id.clone(), instance.clone()),
+            observed_at: 1_700_000_000_000,
+            instances: vec![ProcessInstanceExit::Runner {
+                process_instance_id: instance,
+                close_observed_at: 1_700_000_000_000,
+                exit_code: Some(0),
+                signal: None,
+            }],
+            canonical_session: None,
+        };
+        let mut status: crate::background::RunStatus =
+            serde_json::from_slice(&std::fs::read(&paths.status).expect("read status"))
+                .expect("status parses");
+        status.process_terminal = Some(observed.clone());
+        status
+            .advance_state(crate::background::RunState::Paused)
+            .expect("Running -> Paused");
+        std::fs::write(
+            &paths.status,
+            serde_json::to_string(&status).expect("serialize"),
+        )
+        .expect("write paused status");
+        std::fs::write(
+            crate::background::RunDir::for_existing(&paths.run_dir).process_terminal(),
+            serde_json::to_string(&observed).expect("serialize proof"),
+        )
+        .expect("write observed proof");
+
+        let executor = SubagentExecutor::new();
+        executor.set_host_services(Arc::new(FixedSessionHost("session-OWNER")));
+        let message = executor
+            .control_stop(dir.path(), Some("pausedstop02"), None, None)
+            .await
+            .expect("a delivered paused result must not block the seal");
+        assert_eq!(
+            message, "Stopped paused async run pausedstop02.",
+            "pi `async-stop-action.ts:205`'s exact sentence"
+        );
+        let after: crate::background::RunStatus =
+            serde_json::from_slice(&std::fs::read(&paths.status).expect("reread status"))
+                .expect("status parses");
+        assert_eq!(after.state, crate::background::RunState::Stopped);
+    }
+
     /// The PERMISSIVE half of the class (pi `state.currentSessionId && ...`): a headless host has
     /// no session identity and must still be able to control its own runs. A strict-ified gate
     /// would lock SDK embedders out entirely.

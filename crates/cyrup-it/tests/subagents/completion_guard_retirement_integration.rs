@@ -52,6 +52,7 @@ fn write_script(dir: &Path, name: &str, script_json: &serde_json::Value) -> Path
 /// never applied. The persona also does NOT opt out — the `completionGuard` key no longer exists.
 fn write_capable_agent(model: &str) -> AgentConfig {
     AgentConfig {
+        launcher: None,
         model_is_settings_default: false,
         machine: None,
         acceptance_role: None,

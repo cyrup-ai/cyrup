@@ -22,6 +22,7 @@ use std::path::{Path, PathBuf};
 
 pub(crate) fn sample_agent_config(model: &str, fallback: &[&str]) -> AgentConfig {
     AgentConfig {
+        launcher: None,
         model_is_settings_default: false,
         inherit_global_context: false,
         machine: None,

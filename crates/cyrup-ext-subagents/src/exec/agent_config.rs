@@ -89,6 +89,10 @@ pub struct AgentConfig {
     pub mutation_tools: Option<Vec<String>>,
     /// SUBA-100 — the Herdr saved machine this child is placed on (pi `machine`).
     pub machine: Option<String>,
+    /// SUBA-178 — the runner launcher this agent names (pi `AgentConfig.launcher`). Cleared by the
+    /// background runner once it verified it runs under that launcher; a `Some` reaching
+    /// [`crate::exec::run_sync`] means nobody wrapped this child, and it is refused there.
+    pub launcher: Option<String>,
     /// Whether the child inherits skills discovery: when `false`, the child is spawned with
     /// `--no-skills` and `CYRUP_SUBAGENT_INHERIT_SKILLS=0` (pi `runs/shared/pi-args.ts:156,216` @v0.34.0).
     pub inherit_skills: bool,
@@ -153,6 +157,7 @@ impl AgentConfig {
             inherit_global_context: agent.inherit_global_context,
             // SUBA-100 — the agent rung of `s.machine ?? params.machine ?? a.machine`.
             machine: agent.machine.clone(),
+            launcher: agent.launcher.clone(),
             mutation_tools: agent.mutation_tools.clone(),
             name: agent.local_name.clone(),
             model: agent.model.clone(),
@@ -290,6 +295,11 @@ pub struct ResolvedAgentPersona {
     /// SUBA-100 — carried so every step is placed on the same Herdr machine.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub machine: Option<String>,
+    /// SUBA-178 — the agent's runner launcher name (pi `launcher`), carried so the runner can
+    /// check every step runs under the launcher it was started with, and so a revive's recorded
+    /// launcher can overlay it ([`crate::background::recovery_descriptor::RecoveryDescriptor`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launcher: Option<String>,
     /// The agent's own skills inheritance flag, carried so a chain/parallel/background step threads
     /// `--no-skills`/`CYRUP_SUBAGENT_INHERIT_SKILLS` identically to the single-run path.
     /// `#[serde(default)]` keeps the runner-config hand-off backward compatible.
@@ -403,6 +413,7 @@ impl ResolvedAgentPersona {
         Self {
             inherit_global_context: agent.inherit_global_context,
             machine: agent.machine.clone(),
+            launcher: agent.launcher.clone(),
             mutation_tools: agent.mutation_tools.clone(),
             name: agent.local_name.clone(),
             model: agent.model.clone(),
@@ -445,6 +456,7 @@ impl ResolvedAgentPersona {
         AgentConfig {
             inherit_global_context: self.inherit_global_context,
             machine: self.machine.clone(),
+            launcher: self.launcher.clone(),
             mutation_tools: self.mutation_tools.clone(),
             name: self.name.clone(),
             model: self.model.clone(),
@@ -1165,6 +1177,7 @@ mod tests {
     #[test]
     fn resolved_agent_persona_round_trips_through_json_preserving_every_field() {
         let persona = ResolvedAgentPersona {
+            launcher: None,
             model_is_settings_default: false,
             default_tool_timeout_ms: None,
             inherit_global_context: true,
@@ -1261,6 +1274,7 @@ mod tests {
     #[test]
     fn to_agent_config_stamps_the_live_depth_and_reproduces_the_persona() {
         let persona = ResolvedAgentPersona {
+            launcher: None,
             model_is_settings_default: false,
             default_tool_timeout_ms: None,
             inherit_global_context: true,
