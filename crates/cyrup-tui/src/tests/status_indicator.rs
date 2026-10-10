@@ -12,43 +12,54 @@ use super::harness::*;
 use crate::{App, IndicatorKind, SPINNER_FRAMES, StatusIndicator, UiTheme};
 use cyrup_session_svc::AgentSessionEvent;
 use ratatui::backend::TestBackend;
-use ratatui::text::Line;
 
-fn line_text(line: &Line<'_>) -> String {
-    line.spans.iter().map(|s| s.content.as_ref()).collect()
+/// The LIVE path's rendered text: `border_spans` joined, which is what the editor's top border
+/// actually paints (`editor/render.rs:330`). `TUI-181` migrated this file off the retired band's
+/// `lines_at`, so these assertions now fail on a border-layout regression rather than on a shape
+/// nothing draws.
+///
+/// Width 200 so nothing truncates — the wrap-then-truncate rule has its own coverage in
+/// `tests::embedded_status_border`. Note the border carries NO `paddingX` margins: `renderInBorder`
+/// strips the leading space and trims the end (`status-indicator.ts:24-27`), so a message reads
+/// `⠋ Working`, not ` ⠋ Working `.
+fn border_text(
+    ind: &StatusIndicator,
+    elapsed: Duration,
+    theme: &UiTheme,
+    hint: Option<&str>,
+) -> String {
+    ind.border_spans(elapsed, theme, hint, 200, None)
+        .iter()
+        .map(|s| s.content.as_ref())
+        .collect()
 }
 
 #[test]
-fn idle_band_is_two_blank_lines() {
+fn an_idle_indicator_contributes_nothing_to_the_border() {
     let theme = UiTheme::dark();
     let ind = StatusIndicator::new();
     assert_eq!(ind.kind(), IndicatorKind::Idle);
     assert!(!ind.is_active());
-    let lines = ind.lines_at(Duration::ZERO, &theme, Some("esc"));
-    assert_eq!(lines.len(), 2, "idle band must reserve two rows");
+    // The band reserved two blank rows; the border reserves nothing at all, which is pi's
+    // `statusWidth === 0` arm (`custom-editor.ts:43`).
     assert!(
-        lines.iter().all(|l| line_text(l).trim().is_empty()),
-        "idle band not blank"
+        ind.border_spans(Duration::ZERO, &theme, Some("esc"), 200, None)
+            .is_empty(),
+        "an idle indicator must put no spans in the rule"
     );
 }
 
 #[test]
-fn working_band_shows_spinner_message_and_cancel_hint() {
+fn working_status_shows_spinner_message_and_cancel_hint() {
     let theme = UiTheme::dark();
     let mut ind = StatusIndicator::new();
     ind.working();
     assert!(ind.is_active());
-    let lines = ind.lines_at(Duration::ZERO, &theme, Some("esc"));
-    assert_eq!(lines.len(), 2);
-    assert!(
-        line_text(&lines[0]).trim().is_empty(),
-        "first band line should be blank (loader spacer)"
-    );
-    let msg = line_text(&lines[1]);
+    let msg = border_text(&ind, Duration::ZERO, &theme, Some("esc"));
     // `defaultWorkingMessage = "Working"` — no trailing dots since v0.85.0 (#8799),
-    // `interactive-mode.ts:451` @v0.87.1.
+    // `interactive-mode.ts:451` @v0.87.1. No trailing space either: the border trims it.
     assert!(
-        msg.ends_with(" Working "),
+        msg.ends_with(" Working"),
         "working message missing: [{msg}]"
     );
     // `WorkingStatusIndicator` passes the message straight through and appends NOTHING
@@ -58,13 +69,11 @@ fn working_band_shows_spinner_message_and_cancel_hint() {
         !msg.contains("to cancel"),
         "Working must carry no cancel suffix: [{msg}]"
     );
-    // The line is inset one column — `Loader extends Text` with `paddingX 1` (`loader.ts:35`,
-    // `text.ts:70,76`) — and the glyph after it is one of the Braille spinner frames.
-    assert!(msg.starts_with(' '), "band not inset one column: [{msg}]");
+    // The band's own `paddingX 1` inset is NOT asserted here any more: `renderInBorder` strips it
+    // (`status-indicator.ts:24-27`), and the inset the user sees is now the rule's, covered by
+    // `tests::embedded_status_border`'s `starts_with("── ")`. What stays live is the glyph.
     assert!(
-        SPINNER_FRAMES
-            .iter()
-            .any(|f| msg.trim_start().starts_with(f)),
+        SPINNER_FRAMES.iter().any(|f| msg.starts_with(f)),
         "spinner glyph missing: [{msg}]"
     );
 }
@@ -95,15 +104,14 @@ fn retry_uses_warning_spinner_color() {
     let theme = UiTheme::dark();
     let mut ind = StatusIndicator::new();
     ind.set(IndicatorKind::Retry, Some("Retrying (1/3)...".to_string()));
-    let lines = ind.lines_at(Duration::ZERO, &theme, Some("esc"));
-    let spinner_span = &lines[1].spans[0];
+    let spans = ind.border_spans(Duration::ZERO, &theme, Some("esc"), 200, None);
     assert_eq!(
-        spinner_span.style.fg,
+        spans[0].style.fg,
         theme.warning_style().fg,
         "retry spinner not warning-colored"
     );
     assert!(
-        line_text(&lines[1]).contains("Retrying (1/3)..."),
+        border_text(&ind, Duration::ZERO, &theme, Some("esc")).contains("Retrying (1/3)..."),
         "retry message missing"
     );
 }
@@ -425,9 +433,8 @@ fn working_indicator_options_resolve_exactly_as_pis_loader_does() {
     use serde_json::json;
 
     let theme = UiTheme::dark();
-    let text = |ind: &StatusIndicator, ms: u64| -> String {
-        line_text(&ind.lines_at(Duration::from_millis(ms), &theme, None)[1])
-    };
+    let text =
+        |ind: &StatusIndicator, ms: u64| border_text(ind, Duration::from_millis(ms), &theme, None);
 
     // `frames` absent ⇒ DEFAULT_FRAMES, but `intervalMs` still honoured (`:66-67`).
     let mut ind = StatusIndicator::new();
@@ -469,24 +476,25 @@ fn working_indicator_options_resolve_exactly_as_pis_loader_does() {
     ind.set_working_indicator(Some(WorkingIndicator::from_json(
         &json!({"frames": ["A", "B"]}),
     )));
-    assert!(text(&ind, 0).contains(" A "), "frame 0");
+    assert!(text(&ind, 0).starts_with("A "), "frame 0");
     assert!(
-        text(&ind, 80).contains(" B "),
+        text(&ind, 80).starts_with("B "),
         "frame 1 at the default interval"
     );
     ind.set_working_indicator(Some(WorkingIndicator::from_json(&json!({"frames": ["S"]}))));
     assert!(
-        text(&ind, 0).contains(" S ") && text(&ind, 4_000).contains(" S "),
+        text(&ind, 0).starts_with("S ") && text(&ind, 4_000).starts_with("S "),
         "static frame"
     );
 
-    // `frames: []` ⇒ no glyph AND no glyph-trailing space; the message keeps the paddingX inset.
+    // `frames: []` ⇒ no glyph AND no glyph-trailing space. In the border there is no paddingX
+    // inset either, so the rule carries the bare message.
     let mut ind = StatusIndicator::new();
     ind.working();
     ind.set_working_indicator(Some(WorkingIndicator::from_json(&json!({"frames": []}))));
     assert_eq!(
         text(&ind, 0),
-        " Working ",
+        "Working",
         "`frames: []` hides the indicator entirely"
     );
 
@@ -495,7 +503,7 @@ fn working_indicator_options_resolve_exactly_as_pis_loader_does() {
     ind.set_working_indicator(Some(WorkingIndicator::from_json(&json!({"frames": ["A"]}))));
     ind.set(IndicatorKind::Compaction, None);
     assert!(
-        !text(&ind, 0).contains(" A "),
+        !text(&ind, 0).starts_with("A "),
         "compaction keeps the built-in spinner: [{}]",
         text(&ind, 0)
     );
@@ -524,12 +532,12 @@ fn reset_extension_working_state_restores_the_defaults_and_pis_interrupt_suffix(
     // Reset with the band DOWN: defaults come back and the next turn mounts a plain band.
     ind.reset_extension_working_state(Some("escape"));
     ind.working();
-    let msg = line_text(&ind.lines_at(Duration::ZERO, &theme, None)[1]);
+    let msg = border_text(&ind, Duration::ZERO, &theme, None);
     assert!(
-        msg.ends_with(" Working "),
+        msg.ends_with(" Working"),
         "visibility + message restored: [{msg}]"
     );
-    assert!(!msg.contains(" A "), "the custom frame is gone: [{msg}]");
+    assert!(!msg.starts_with("A "), "the custom frame is gone: [{msg}]");
     assert!(
         msg.contains(SPINNER_FRAMES[0]),
         "the built-in spinner is back: [{msg}]"
@@ -539,9 +547,9 @@ fn reset_extension_working_state_restores_the_defaults_and_pis_interrupt_suffix(
     let mut live = StatusIndicator::new();
     live.working();
     live.reset_extension_working_state(Some("escape"));
-    let msg = line_text(&live.lines_at(Duration::ZERO, &theme, None)[1]);
+    let msg = border_text(&live, Duration::ZERO, &theme, None);
     assert!(
-        msg.ends_with(" Working (escape to interrupt) "),
+        msg.ends_with(" Working (escape to interrupt)"),
         "pi's `:2382` copy, and it is `to interrupt`, not `to cancel`: [{msg}]"
     );
 }
