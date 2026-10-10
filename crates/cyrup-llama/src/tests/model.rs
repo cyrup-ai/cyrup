@@ -446,7 +446,7 @@ fn the_classifier_twin_sits_on_the_server_root() {
         "architecture": { "input_modalities": ["text", "image"] },
         "meta": { "n_ctx": 32768 },
     }));
-    let twin = to_classifier_model(&model, "http://localhost:8080", None);
+    let twin = to_classifier_model(&model, "http://localhost:8080", None).unwrap();
     assert_eq!(
         serde_json::to_value(&twin).unwrap(),
         json!({
@@ -464,6 +464,43 @@ fn the_classifier_twin_sits_on_the_server_root() {
     );
 }
 
+/// EXT-110 (`toPiClassifierModel`, `provider.ts:102-117` @f1b2e77f5): a decision-only model's
+/// twin answers natively through `typesafe-system-one` on `<server>/v1`, the base the api resolves
+/// `systemone` against; a model reporting `text` beside `decisions` is a decision model too.
+#[test]
+fn a_decision_model_twin_is_typesafe_system_one_on_the_v1_base() {
+    for modalities in [json!(["decisions"]), json!(["text", "decisions"])] {
+        let model = info(json!({
+            "id": "kev",
+            "status": { "value": "sleeping" },
+            "architecture": { "input_modalities": ["text"], "output_modalities": modalities },
+            "meta": { "n_ctx": 8192 },
+        }));
+        let twin = to_classifier_model(&model, "http://localhost:8080/", None).unwrap();
+        assert_eq!(
+            serde_json::to_value(&twin).unwrap(),
+            json!({
+                "type": "classifier",
+                "id": "kev",
+                "name": "kev",
+                "api": "typesafe-system-one",
+                "provider": "llama.cpp",
+                "baseUrl": "http://localhost:8080/v1",
+                "input": ["text"],
+                "cost": { "input": 0.0, "output": 0.0, "cacheRead": 0.0, "cacheWrite": 0.0 },
+                "contextWindow": 8192,
+            })
+        );
+    }
+    // A decision model's base must be a URL, as a chat model's must (`llamaInferenceUrl`).
+    let model = info(json!({
+        "id": "kev",
+        "status": { "value": "loaded" },
+        "architecture": { "output_modalities": ["decisions"] },
+    }));
+    assert!(to_classifier_model(&model, "not a url", None).is_err());
+}
+
 #[test]
 fn the_classifier_twin_uses_the_cached_window_like_the_chat_model() {
     let model = info(json!({
@@ -472,11 +509,15 @@ fn the_classifier_twin_uses_the_cached_window_like_the_chat_model() {
         "meta": { "n_ctx_train": 128000 },
     }));
     assert_eq!(
-        to_classifier_model(&model, "http://h:1", Some(65536)).context_window,
+        to_classifier_model(&model, "http://h:1", Some(65536))
+            .unwrap()
+            .context_window,
         65536
     );
     assert_eq!(
-        to_classifier_model(&model, "http://h:1", None).context_window,
+        to_classifier_model(&model, "http://h:1", None)
+            .unwrap()
+            .context_window,
         128000
     );
 }

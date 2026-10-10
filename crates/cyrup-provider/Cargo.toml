@@ -71,6 +71,10 @@ base64 = { workspace = true }
 ring = { workspace = true }
 
 [dev-dependencies]
+# EXT-108: the one llama.cpp wire definition the classifier fake
+# (`src/tests/llama_cpp_classify_fake_server.rs`) answers from. A TEST-ONLY leaf crate (serde_json
+# only), so this dev edge adds no cycle and nothing to the shipping graph.
+cyrup-llama-cpp-wire = { path = "../cyrup-llama-cpp-wire" }
 # `net` is dev-only: the remote-catalog tests serve their fixtures off a raw loopback
 # `TcpListener` so nothing in this crate's test suite can reach a real network host.
 tokio = { workspace = true, features = ["net"] }

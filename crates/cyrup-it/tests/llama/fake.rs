@@ -10,13 +10,22 @@
 //!
 //! | request                      | answer                                                                |
 //! |------------------------------|-----------------------------------------------------------------------|
-//! | `GET /models`                | `{"object":"list","data":[<catalog>]}`                                |
-//! | `GET /props[?model=<id>]`    | that model's props object, else the default one                       |
+//! | `GET /models`                | `router::models_envelope` over the catalog                            |
+//! | `GET /props`                 | `router::router_props` (autoload on): the ROUTER's own props          |
+//! | `GET /props?model=<id>`      | `router::child_props` with that model's chat template                 |
 //! | `POST /v1/chat/completions`  | an SSE stream: the scripted reply in two deltas, a usage chunk, DONE  |
-//! | `POST /tokenize`             | one token per character (the character code)                          |
-//! | `POST /apply-template`       | `<|role|>\ncontent\n` per message, then `<|assistant|>\n`             |
-//! | `POST /completion`           | the scripted next-token log-probabilities                             |
-//! | anything else                | `404 {"error":{"message":"not found"}}`                               |
+//! | `POST /tokenize`             | `classify::tokenize`, one token per character (the character code)   |
+//! | `POST /apply-template`       | `classify::apply_template` of `<|role|>\ncontent\n` per message, then `<|assistant|>\n` |
+//! | `POST /completion`           | `classify::completion` over the scripted next-token log-probabilities |
+//! | anything else                | `router::file_not_found`, llama.cpp's own unknown-route 404           |
+//!
+//! Every answer but the chat stream is built by `cyrup_llama_cpp_wire` (`router`, `classify`): ONE
+//! definition of the llama.cpp wire, each shape cited into llama.cpp's server source at `b11436`,
+//! shared with `cyrup-llama`'s fake (EXT-108). What the fake decides is only the CONTENT — which
+//! models, which template, which tokens rank where; the shapes are not its own. The unknown-route
+//! 404 was `{"error":{"message":"not found"}}` here until EXT-108, a shape no llama.cpp sends.
+//! [`drift_guard`] fails if what this fake writes on the socket stops being that crate's pinned
+//! bytes.
 //!
 //! Every connection is `connection: close`. Every request is recorded (method, target, lower-cased
 //! headers, body) so a test asserts on what the client actually put on the wire, which is the only
@@ -32,6 +41,8 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
+use cyrup_llama_cpp_wire::classify::{self, TokenLogprob};
+use cyrup_llama_cpp_wire::router;
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -102,8 +113,9 @@ impl Recorded {
 
 struct State {
     models: Vec<Value>,
-    default_props: Value,
-    props_by_model: BTreeMap<String, Value>,
+    /// The `chat_template` each model's (proxied, child) `GET /props?model=` reports;
+    /// [`PLAIN_TEMPLATE`] for any model not in here.
+    templates: BTreeMap<String, String>,
     reply: String,
     /// Next-token `(token, log-probability)` pairs `POST /completion` answers, in rank order.
     next_tokens: Vec<(String, f64)>,
@@ -143,8 +155,7 @@ impl FakeLlama {
         let inner = Arc::new(Inner {
             state: Mutex::new(State {
                 models,
-                default_props: json!({ "models_autoload": true, "chat_template": PLAIN_TEMPLATE }),
-                props_by_model: BTreeMap::new(),
+                templates: BTreeMap::new(),
                 reply: "Hello from llama.cpp".to_string(),
                 next_tokens: vec![("B".to_string(), -0.3), ("A".to_string(), -1.5)],
                 requests: Vec::new(),
@@ -168,12 +179,12 @@ impl FakeLlama {
         &self.url
     }
 
-    /// `GET /props?model=<id>` answers `{"chat_template": template, "models_autoload": true}`.
+    /// `GET /props?model=<id>` answers the child's props with this `chat_template`.
     pub fn set_chat_template(&self, id: &str, template: &str) {
-        self.inner.state().props_by_model.insert(
-            id.to_string(),
-            json!({ "models_autoload": true, "chat_template": template }),
-        );
+        self.inner
+            .state()
+            .templates
+            .insert(id.to_string(), template.to_string());
     }
 
     /// The text the chat stream answers with.
@@ -280,17 +291,27 @@ async fn handle_connection(inner: Arc<Inner>, mut socket: TcpStream) {
             write_json(
                 &mut socket,
                 200,
-                &json!({ "object": "list", "data": models }).to_string(),
+                &router::models_envelope(models).to_string(),
             )
             .await;
         }
         ("GET", "/props") => {
-            let requested = request.query_param("model").map(str::to_string);
-            let props = {
-                let state = inner.state();
-                requested
-                    .and_then(|id| state.props_by_model.get(&id).cloned())
-                    .unwrap_or_else(|| state.default_props.clone())
+            // No `model`: the ROUTER answers its own props, which carry `models_autoload` and no
+            // `chat_template`. A `model`: the router proxies to that child, whose props carry
+            // `chat_template` and no `models_autoload` (`router::child_props`). A real router
+            // refuses `?autoload=false` for a model that is not running; this fake answers for
+            // any, because the provider only asks about `loaded` ones.
+            let props = match request.query_param("model") {
+                None => router::router_props(true),
+                Some(id) => {
+                    let template = inner
+                        .state()
+                        .templates
+                        .get(id)
+                        .cloned()
+                        .unwrap_or_else(|| PLAIN_TEMPLATE.to_string());
+                    router::child_props(&template)
+                }
             };
             write_json(&mut socket, 200, &props.to_string()).await;
         }
@@ -300,8 +321,8 @@ async fn handle_connection(inner: Arc<Inner>, mut socket: TcpStream) {
         }
         ("POST", "/tokenize") => {
             let content = body["content"].as_str().unwrap_or_default();
-            let tokens: Vec<Value> = content.chars().map(|c| json!(u32::from(c))).collect();
-            write_json(&mut socket, 200, &json!({ "tokens": tokens }).to_string()).await;
+            let tokens: Vec<i64> = content.chars().map(|c| i64::from(u32::from(c))).collect();
+            write_json(&mut socket, 200, &classify::tokenize(&tokens).to_string()).await;
         }
         ("POST", "/apply-template") => {
             let rendered: String = body["messages"]
@@ -322,41 +343,38 @@ async fn handle_connection(inner: Arc<Inner>, mut socket: TcpStream) {
             write_json(
                 &mut socket,
                 200,
-                &json!({ "prompt": format!("{rendered}<|assistant|>\n") }).to_string(),
+                &classify::apply_template(&format!("{rendered}<|assistant|>\n")).to_string(),
             )
             .await;
         }
         ("POST", "/completion") => {
             let next = inner.state().next_tokens.clone();
-            let top: Vec<Value> = next
+            // A token's id is its first character's code, the same vocabulary `/tokenize` uses.
+            let top: Vec<TokenLogprob<'_>> = next
                 .iter()
-                .map(|(token, logprob)| {
-                    json!({
-                        "id": token.chars().next().map(u32::from),
-                        "token": token,
-                        "bytes": [],
-                        "logprob": logprob,
-                    })
+                .map(|(token, logprob)| TokenLogprob {
+                    id: token.chars().next().map_or(0, |c| i64::from(u32::from(c))),
+                    token,
+                    logprob: *logprob,
                 })
                 .collect();
-            write_json(
-                &mut socket,
-                200,
-                &json!({
-                    "content": "A",
-                    "completion_probabilities": [{ "id": 65, "token": "A", "top_logprobs": top }],
-                })
-                .to_string(),
-            )
-            .await;
+            let prompt = body["prompt"].as_str().unwrap_or_default();
+            // At `temperature: 0` the sampled token is the top candidate.
+            let answer = match top.first() {
+                Some(sampled) => classify::completion(
+                    body["model"].as_str().unwrap_or_default(),
+                    prompt,
+                    prompt.chars().count() as u64,
+                    *sampled,
+                    &top,
+                ),
+                None => json!({}),
+            };
+            write_json(&mut socket, 200, &answer.to_string()).await;
         }
         _ => {
-            write_json(
-                &mut socket,
-                404,
-                &json!({ "error": { "message": "not found" } }).to_string(),
-            )
-            .await;
+            let (status, body) = router::file_not_found();
+            write_json(&mut socket, status, &body.to_string()).await;
         }
     }
 }
@@ -387,4 +405,94 @@ async fn serve_chat_stream(socket: &mut TcpStream, reply: &str) {
     out.push_str("data: [DONE]\n\n");
     let _ = socket.write_all(out.as_bytes()).await;
     let _ = socket.shutdown().await;
+}
+
+/// EXT-108's DRIFT GUARD for this fake: what [`FakeLlama`] writes on a real socket is, byte for
+/// byte, the pinned llama.cpp answer in `cyrup_llama_cpp_wire::golden`. The fake answers from
+/// `cyrup_llama_cpp_wire::{router, classify}`, so a change to any definition it serves fails this
+/// until the golden moves with it.
+mod drift_guard {
+    use cyrup_llama_cpp_wire::golden;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    use super::FakeLlama;
+
+    /// One raw HTTP/1.1 exchange; the fake closes every connection, so the close ends the body.
+    async fn raw(url: &str, method: &str, path: &str, body: &str) -> (u16, String) {
+        let addr = url.trim_start_matches("http://");
+        let mut socket = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let request = format!(
+            "{method} {path} HTTP/1.1\r\nhost: {addr}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        socket.write_all(request.as_bytes()).await.unwrap();
+        let mut answer = String::new();
+        socket.read_to_string(&mut answer).await.unwrap();
+        let (head, body) = answer.split_once("\r\n\r\n").unwrap();
+        (
+            head.split(' ').nth(1).unwrap().parse().unwrap(),
+            body.to_string(),
+        )
+    }
+
+    #[tokio::test]
+    async fn the_fake_writes_the_golden_bytes() {
+        let fake = FakeLlama::start(Vec::new()).await;
+        let url = fake.url().to_string();
+        let answer = |status: u16, body: &str| (status, body.to_string());
+
+        assert_eq!(
+            raw(&url, "GET", "/no-such-route", "").await,
+            answer(404, golden::FILE_NOT_FOUND),
+            "an unknown route is llama.cpp's own 404 literal (server-http.cpp:199-212 @b11436)"
+        );
+        assert_eq!(
+            raw(&url, "GET", "/models", "").await,
+            answer(200, golden::EMPTY_MODELS)
+        );
+        assert_eq!(
+            raw(&url, "GET", "/props", "").await,
+            answer(200, golden::ROUTER_PROPS_AUTOLOAD),
+            "the router's own props"
+        );
+        assert_eq!(
+            raw(&url, "GET", "/props?model=qwen&autoload=false", "").await,
+            answer(200, golden::CHILD_PROPS_PLAIN),
+            "a model's props are the child's, proxied (no template set: PLAIN_TEMPLATE)"
+        );
+        assert_eq!(
+            raw(
+                &url,
+                "POST",
+                "/tokenize",
+                r#"{"model":"qwen","content":"AB"}"#
+            )
+            .await,
+            answer(200, golden::TOKENIZE_65_66)
+        );
+        assert_eq!(
+            raw(
+                &url,
+                "POST",
+                "/apply-template",
+                r#"{"model":"qwen","messages":[{"role":"user","content":"hi"}]}"#
+            )
+            .await,
+            answer(200, golden::APPLY_TEMPLATE_USER_HI)
+        );
+
+        // The default script ranks `B` (-0.3) over `A` (-1.5). EVERY byte of the answer is pinned,
+        // not only its key order, so a mutated value (`stop`, `stop_type`, `tokens_cached`, ...)
+        // fails here too.
+        assert_eq!(
+            raw(
+                &url,
+                "POST",
+                "/completion",
+                r#"{"model":"qwen","prompt":"p","n_predict":1,"n_probs":2,"post_sampling_probs":false}"#,
+            )
+            .await,
+            answer(200, golden::COMPLETION_QWEN_P_B_OVER_A)
+        );
+    }
 }

@@ -2046,6 +2046,27 @@ impl ExtensionRegistry {
         Ok(self.lock_read()?.tools.get(name).cloned())
     }
 
+    /// Take every executable tool handle `owner` holds out of the registry and hand them back,
+    /// leaving its descriptors, claims and every other registration in place. For host teardown
+    /// only ([`crate::ExtensionHost`]'s `Drop`): a guest's materialized `WasmTool` holds that
+    /// guest's `LiveExtension`, whose store's `GuestState` holds THIS registry, so while the handle
+    /// sits here the guest — its store, and the Wasmtime `Engine` the store keeps alive — can
+    /// never be freed. The handles are returned rather than dropped so the caller drops them with
+    /// the registry lock released: freeing a store runs arbitrary host-side drops.
+    pub(crate) fn take_tool_handles(
+        &self,
+        owner: &ExtensionId,
+    ) -> Result<Vec<Arc<dyn Tool>>, ExtError> {
+        let mut g = self.lock_write()?;
+        let names: Vec<String> = g
+            .tool_owner
+            .iter()
+            .filter(|(_, o)| *o == owner)
+            .map(|(n, _)| n.clone())
+            .collect();
+        Ok(names.iter().filter_map(|n| g.tools.remove(n)).collect())
+    }
+
     pub fn has_command(&self, name: &str) -> Result<bool, ExtError> {
         Ok(self.lock_read()?.commands.contains_key(name))
     }

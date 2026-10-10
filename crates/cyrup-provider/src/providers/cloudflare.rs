@@ -315,6 +315,22 @@ pub fn cloudflare_workers_ai_provider_with(
         store,
         registry,
     )
+    .with_classifiers(Arc::new(cloudflare_workers_ai_classifiers_registry()))
+}
+
+/// The Workers AI provider's `classifiers` dispatch map (pi `classifiers: {
+/// "cloudflare-workers-ai-system-one": cloudflareClassifier(cloudflareWorkersAISystemOneApi()) }`,
+/// `providers/cloudflare-workers-ai.ts:21-23`). pi's `cloudflareClassifier` wrapper substitutes
+/// `{CLOUDFLARE_ACCOUNT_ID}` into the model's base URL from the resolved env; here
+/// [`cloudflare_workers_ai_auth`]'s `resolve` already returns the substituted base URL, which
+/// `Models::classify` applies before dispatch (`apply_classifier_auth`), so the api is registered
+/// bare. The live catalog's `cloudflare-workers-ai` classifier rows (`@cf/cloudflare/clef`, ...)
+/// arrive through the remote catalog overlay; the embedded catalog holds none. PROV-104.
+pub fn cloudflare_workers_ai_classifiers_registry() -> crate::classifier::ClassifierApiRegistry {
+    let kind = crate::classifier::KnownClassifierApi::CloudflareWorkersAiSystemOne;
+    let mut registry = crate::classifier::ClassifierApiRegistry::new();
+    registry.register(kind, kind.implementation());
+    registry
 }
 
 /// Convenience constructor: an in-memory credential store + the built-in api registry.

@@ -32,12 +32,24 @@ pub struct ToolSearchExtension {
     /// session a factory builds, and each load binds before it initialises, so `init` takes what
     /// this holds at that moment and a later session's bind does not reach an earlier tool.
     session: Mutex<Option<Arc<dyn HostServices>>>,
+    /// Named on the command line by `-e builtin:tool-search` (EXT-094); see
+    /// [`ToolSearchExtension::loaded_explicitly`].
+    explicit: bool,
 }
 
 impl ToolSearchExtension {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The extension as `-e builtin:tool-search` loads it (EXT-094): an explicit `-e` path, which pi
+    /// keeps under `--no-extensions` (`noExtensions ? cliEnabledExtensions : …`,
+    /// `core/resource-loader.ts`), so it is not [ambient](NativeExtension::is_ambient).
+    #[must_use]
+    pub fn loaded_explicitly(mut self) -> Self {
+        self.explicit = true;
+        self
     }
 }
 
@@ -68,10 +80,13 @@ impl NativeExtension for ToolSearchExtension {
         HookOutcome::Noop
     }
 
-    /// Ambient: pi's `builtin:tool-search` is a path in the tier `--no-extensions` collapses
-    /// (`package-manager.ts:972-974`, `resource-loader.ts:706-730` @v1.0.1), as `codemode`'s is.
+    /// Ambient: pi's `builtin:tool-search` is a settings-resolved path, the tier `--no-extensions`
+    /// collapses (the built-in loop in `resolve()`, `core/package-manager.ts:971-985`;
+    /// `noExtensions ? cliEnabledExtensions : …`, `core/resource-loader.ts:578` @f1b2e77f5), as
+    /// `codemode`'s is — unless `-e builtin:tool-search` named it, which puts it in
+    /// `cliEnabledExtensions` ([`ToolSearchExtension::loaded_explicitly`]).
     fn is_ambient(&self) -> bool {
-        true
+        !self.explicit
     }
 
     /// Hidden from the startup `[Extensions]` listing, as pi marks every `builtin:` extension

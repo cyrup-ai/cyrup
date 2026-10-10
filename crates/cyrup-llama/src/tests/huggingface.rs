@@ -25,7 +25,8 @@ use tokio_util::sync::CancellationToken;
 use crate::error::LlamaError;
 use crate::huggingface::{
     HuggingFaceClient, HuggingFaceGated, HuggingFaceModel, HuggingFaceModelDetails,
-    HuggingFaceQuantization, find_huggingface_token_with_home, quantization_of_file,
+    HuggingFaceQuantization, find_huggingface_token_with_home, js_number_text,
+    quantization_of_file,
 };
 
 // ------------------------------------------------------------------------------ loopback server --
@@ -660,6 +661,15 @@ async fn rate_limit_message_reads_retry_after_then_the_ratelimit_header() {
             vec![("ratelimit", "\"pages\";r=1;t=3;x=1")],
             "Hugging Face rate limit reached; retry in 3s",
         ),
+        // The delay prints as JavaScript's `${delay}` does (node 22: `String(Number("1e21"))`).
+        (
+            vec![("retry-after", "1e21")],
+            "Hugging Face rate limit reached; retry in 1e+21s",
+        ),
+        (
+            vec![("retry-after", "0.0000001")],
+            "Hugging Face rate limit reached; retry in 1e-7s",
+        ),
         // retry-after wins over ratelimit.
         (
             vec![("retry-after", "5"), ("ratelimit", "\"api\";r=0;t=45")],
@@ -712,6 +722,35 @@ async fn rate_limit_message_reads_retry_after_then_the_ratelimit_header() {
             .unwrap_err();
         assert_eq!(error_text(details), *expected, "details {headers:?}");
     }
+}
+
+/// `${delay}` (`huggingface.ts:92`) is `Number::toString`: every expected text below is node 22's
+/// `String(Number(input))`, including both sides of the 1e21 and 1e-6 layout switches.
+#[test]
+fn delay_text_is_javascript_number_to_string() {
+    let cases: &[(&str, &str)] = &[
+        ("1e21", "1e+21"),
+        ("999999999999999999999", "1e+21"),
+        ("100000000000000000000", "100000000000000000000"),
+        ("123456789012345678901234", "1.2345678901234569e+23"),
+        ("1e300", "1e+300"),
+        ("1.7976931348623157e308", "1.7976931348623157e+308"),
+        ("0.0000001", "1e-7"),
+        ("0.000001", "0.000001"),
+        ("2.5e-7", "2.5e-7"),
+        ("123e-20", "1.23e-18"),
+        ("5e-324", "5e-324"),
+        ("0.1", "0.1"),
+        ("1.5", "1.5"),
+        ("30", "30"),
+        ("-5", "-5"),
+    ];
+    for (input, expected) in cases {
+        let number: f64 = input.parse().unwrap();
+        assert_eq!(js_number_text(number), *expected, "Number({input:?})");
+    }
+    assert_eq!(js_number_text(f64::INFINITY), "Infinity");
+    assert_eq!(js_number_text(f64::NEG_INFINITY), "-Infinity");
 }
 
 /// `huggingface.ts:75`: the request is bounded by a timeout.

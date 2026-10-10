@@ -333,8 +333,8 @@ See [Tools and permissions](../guides/tools-and-permissions.md).
 
 | Flag | Argument | Meaning |
 |---|---|---|
-| `-e`, `--extension` | `<path>` | Load an extension file or directory; repeatable |
-| `-ne`, `--no-extensions` | — | Disable extension discovery; explicit `-e` paths still load |
+| `-e`, `--extension` | `<path>` | Load an extension file or directory, or a built-in extension such as `builtin:llama.cpp`; repeatable |
+| `-ne`, `--no-extensions` | — | Disable extension discovery and the built-in extensions; explicit `-e` paths still load, so `cyrup -ne -e builtin:llama.cpp` keeps only llama.cpp |
 | `--skill` | `<path>` | Load a skill file or directory; repeatable |
 | `-ns`, `--no-skills` | — | Disable skill discovery and loading |
 | `--prompt-template` | `<path>` | Load a prompt template file or directory; repeatable |

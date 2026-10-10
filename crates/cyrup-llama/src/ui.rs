@@ -76,6 +76,11 @@ use cyrup_ext::host::{
     ThemeRole, key_ids, read_user_bindings,
 };
 use futures::future::BoxFuture;
+use icu_collator::options::CollatorOptions;
+use icu_collator::{Collator, CollatorPreferences};
+use icu_properties::props::Script;
+use icu_properties::script::{ScriptWithExtensions, ScriptWithExtensionsBorrowed};
+use icu_provider_blob::BlobDataProvider;
 use tokio::runtime::Handle;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
@@ -775,23 +780,30 @@ fn clip_line(line: OverlayLine, width: usize) -> OverlayLine {
     OverlayLine::new(spans)
 }
 
-/// `cjkBreakRegex` (`utils.ts:54`): Han, Hiragana, Katakana, Hangul and Bopomofo clusters are their
-/// own wrap tokens.
+/// The scripts of `cjkBreakRegex` (`utils.ts:54-55`), each matched by `Script_Extensions`.
+const CJK_BREAK_SCRIPTS: [Script; 5] = [
+    Script::Han,
+    Script::Hiragana,
+    Script::Katakana,
+    Script::Hangul,
+    Script::Bopomofo,
+];
+
+/// The `Script_Extensions` property, looked up once rather than per grapheme.
+static SCRIPT_EXTENSIONS: LazyLock<ScriptWithExtensionsBorrowed<'static>> =
+    LazyLock::new(ScriptWithExtensions::new);
+
+/// `cjkBreakRegex.test(segment)` (`utils.ts:54-55`, `:836`): a cluster with any code point whose
+/// `Script_Extensions` include Han, Hiragana, Katakana, Hangul or Bopomofo is its own wrap token.
+/// `test` searches the whole cluster, so a combining kana voicing mark after a Latin letter counts,
+/// and `Script_Extensions` takes in the shared CJK punctuation (`、`, `。`) and the half-width
+/// kana that no fixed block list does.
 fn is_cjk_break(grapheme: &str) -> bool {
-    grapheme.chars().next().is_some_and(|c| {
-        matches!(
-            u32::from(c),
-            0x1100..=0x11FF
-                | 0x3040..=0x30FF
-                | 0x3100..=0x312F
-                | 0x3130..=0x318F
-                | 0x31F0..=0x31FF
-                | 0x3400..=0x4DBF
-                | 0x4E00..=0x9FFF
-                | 0xAC00..=0xD7AF
-                | 0xF900..=0xFAFF
-                | 0x20000..=0x2FA1F
-        )
+    let scripts = *SCRIPT_EXTENSIONS;
+    grapheme.chars().any(|c| {
+        CJK_BREAK_SCRIPTS
+            .into_iter()
+            .any(|script| scripts.has_script(c, script))
     })
 }
 
@@ -2064,40 +2076,50 @@ pub(crate) fn model_description(model: &LlamaModelInfo) -> String {
     details.join(" · ")
 }
 
-/// The collation class of one character in `String.prototype.localeCompare`'s default (ICU root)
-/// order: whitespace and punctuation, then digits, then letters.
-fn collation_primary(c: char) -> (u8, u32) {
-    const PUNCTUATION_ORDER: &str = " _-,;:!?.'\"()[]{}@*/\\&#%`^+<=>|~$";
-    let folded = c.to_lowercase().next().unwrap_or(c);
-    if c.is_alphabetic() {
-        (2, u32::from(folded))
-    } else if c.is_numeric() {
-        (1, u32::from(c))
-    } else {
-        let rank = PUNCTUATION_ORDER
-            .chars()
-            .position(|p| p == c)
-            .and_then(|p| u32::try_from(p).ok())
-            .unwrap_or_else(|| 1_000 + u32::from(c));
-        (0, rank)
-    }
+/// ICU4X collation data for the root locale with Han in radical-stroke order, generated from ICU
+/// 77.1 (the ICU of Node 22) by `icu4x-datagen` 2.3.0:
+///
+/// ```text
+/// icu4x-datagen --format blob --locales und --collation-root-han unihan \
+///   --markers CollationRootV1 CollationTailoringV1 CollationDiacriticsV1 CollationJamoV1 \
+///     CollationMetadataV1 CollationReorderingV1 CollationSpecialPrimariesV1 \
+///     NormalizerNfdDataV1 NormalizerNfdTablesV1 \
+///   --icuexport-root icuexportdata_release-77-1.zip --cldr-root cldr-47.0.0-json-full.zip \
+///   -o collation-root-unihan.postcard
+/// ```
+///
+/// ICU4X's own compiled data is built with `--collation-root-han implicit`, which (like `feruca`)
+/// orders Han by code point: `一 中 丽 乙 㐀 𠀀` where Node's `localeCompare` gives
+/// `一 𠀀 㐀 丽 中 乙`.
+static ROOT_COLLATION_DATA: &[u8] = include_bytes!("../data/collation-root-unihan.postcard");
+
+/// The root collator, built once (`None` only if the embedded data fails to load, which
+/// `root_collator_loads` rules out).
+static ROOT_COLLATOR: LazyLock<Option<Collator>> = LazyLock::new(|| {
+    let provider = BlobDataProvider::try_new_from_static_blob(ROOT_COLLATION_DATA).ok()?;
+    Collator::try_new_with_buffer_provider(
+        &provider,
+        CollatorPreferences::default(),
+        CollatorOptions::default(),
+    )
+    .ok()
+});
+
+/// Whether the embedded root collation data loaded.
+#[cfg(test)]
+pub(crate) fn root_collator_loads() -> bool {
+    ROOT_COLLATOR.is_some()
 }
 
-/// `left.localeCompare(right)` (`ui.ts:324`), approximated: primary order by class and
-/// case-folded character, then lowercase before uppercase, then code points.
+/// `left.localeCompare(right)` (`ui.ts:324`, `huggingface.ts:149`): ICU root collation at its
+/// default tertiary strength, punctuation non-ignorable, Han in radical-stroke order. Strings ICU
+/// holds equal (`é` and `e` + U+0301, or a soft hyphen) compare `Equal`, as `localeCompare` returns
+/// `0`, and a stable sort keeps their order as `Array.prototype.sort` does.
 pub(crate) fn locale_compare(left: &str, right: &str) -> Ordering {
-    let primary = left
-        .chars()
-        .map(collation_primary)
-        .cmp(right.chars().map(collation_primary));
-    if primary != Ordering::Equal {
-        return primary;
+    match ROOT_COLLATOR.as_ref() {
+        Some(collator) => collator.as_borrowed().compare(left, right),
+        None => left.cmp(right),
     }
-    let tertiary = left
-        .chars()
-        .map(char::is_uppercase)
-        .cmp(right.chars().map(char::is_uppercase));
-    tertiary.then_with(|| left.cmp(right))
 }
 
 /// The sort of `showModels` (`ui.ts:322-325`): loaded first, then by id.

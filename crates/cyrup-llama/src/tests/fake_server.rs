@@ -16,8 +16,10 @@
 //!
 //! Every one of those answers, and the SSE framing, comes from [`wire`] — ONE definition of the
 //! llama.cpp router wire, each shape carrying a `file:line` citation into llama.cpp's own server
-//! source at a recorded pin (EXT-100). This file holds no transcription of its own, so it cannot
-//! drift from the real server without that module changing.
+//! source at a recorded pin (EXT-100), shared since EXT-108 with the workspace's other
+//! llama-server fakes through the test-only `cyrup-llama-cpp-wire` crate. This file holds no
+//! transcription of its own, and `llama_cpp_wire.rs`'s drift guard fails if what it writes on the
+//! socket stops being that crate's pinned bytes.
 //!
 //! State is whatever the test makes it: the catalog is a list of JSON objects ([`model`] builds
 //! one), and the lifecycle transitions are *scripted*, not simulated. A script is a list of
@@ -36,11 +38,11 @@
 //!
 //! Every connection is `connection: close`; the SSE stream is delimited by the close.
 //!
-//! [`wire`]: super::llama_cpp_wire
-//! [`wire::models_envelope`]: super::llama_cpp_wire::models_envelope
-//! [`wire::router_props`]: super::llama_cpp_wire::router_props
-//! [`wire::success`]: super::llama_cpp_wire::success
-//! [`wire::file_not_found`]: super::llama_cpp_wire::file_not_found
+//! [`wire`]: cyrup_llama_cpp_wire::router
+//! [`wire::models_envelope`]: cyrup_llama_cpp_wire::router::models_envelope
+//! [`wire::router_props`]: cyrup_llama_cpp_wire::router::router_props
+//! [`wire::success`]: cyrup_llama_cpp_wire::router::success
+//! [`wire::file_not_found`]: cyrup_llama_cpp_wire::router::file_not_found
 //! [`on_load`]: FakeLlamaServer::on_load
 //! [`on_unload`]: FakeLlamaServer::on_unload
 //! [`on_download`]: FakeLlamaServer::on_download
@@ -69,7 +71,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Notify, mpsc};
 use tokio::task::JoinHandle;
 
-use super::llama_cpp_wire as wire;
+use cyrup_llama_cpp_wire::router as wire;
 
 // ------------------------------------------------------------------------------------- builders --
 
@@ -450,7 +452,7 @@ impl FakeLlamaServer {
     /// Send one SSE event to every open stream, framed as llama.cpp frames it
     /// ([`wire::sse_frame`]).
     ///
-    /// [`wire::sse_frame`]: super::llama_cpp_wire::sse_frame
+    /// [`wire::sse_frame`]: cyrup_llama_cpp_wire::router::sse_frame
     pub fn broadcast(&self, event: Value) {
         self.inner.broadcast(wire::sse_frame(&event).into_bytes());
     }

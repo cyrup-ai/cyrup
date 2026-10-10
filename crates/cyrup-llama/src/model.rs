@@ -38,6 +38,33 @@ pub fn model_is_selectable(model: &LlamaModelInfo, router_autoload: bool) -> boo
     }
 }
 
+/// Whether llama.cpp reports a native decision model (`isDecisionModel`, `provider.ts:88-90`
+/// @f1b2e77f5): `architecture.output_modalities` includes `"decisions"`. llama.cpp writes
+/// `["decisions"]` for a GGUF whose decision type is set and `["text"]` otherwise
+/// (`server_model_output_modalities`, `tools/server/server-common.cpp:150-163` @b11436), and the
+/// router reads it from the GGUF metadata even for a model that is not running
+/// (`server-models.cpp:567-571`), so unloaded and sleeping entries carry it too. An older server
+/// sends `["text"]` or no `architecture`, and its models are chat models.
+#[must_use]
+pub fn is_decision_model(model: &LlamaModelInfo) -> bool {
+    output_modalities_include(model, "decisions")
+}
+
+/// Whether a catalog entry is offered as a chat model (`isChatModel`, `provider.ts:93-95`
+/// @f1b2e77f5): a decision-ONLY model cannot generate text, so it is a classifier and nothing else.
+#[must_use]
+pub fn is_chat_model(model: &LlamaModelInfo) -> bool {
+    !is_decision_model(model) || output_modalities_include(model, "text")
+}
+
+fn output_modalities_include(model: &LlamaModelInfo, modality: &str) -> bool {
+    model
+        .architecture
+        .as_ref()
+        .and_then(|architecture| architecture.output_modalities.as_ref())
+        .is_some_and(|modalities| modalities.iter().any(|entry| entry == modality))
+}
+
 /// `Number(text)` for the strings `configuredContextWindow` feeds it: surrounding whitespace is
 /// ignored, an empty string is `0`, `0x`/`0o`/`0b` read as radix literals and everything else as a
 /// decimal float. `NaN` stands for "not a number".
@@ -120,29 +147,56 @@ pub fn context_window_of(model: &LlamaModelInfo, cached: Option<u64>) -> u64 {
         .unwrap_or(DEFAULT_CONTEXT_WINDOW)
 }
 
-/// The same llama.cpp model used as a classifier: answers are read from next-token label
-/// probabilities (`toPiClassifierModel`, `provider.ts:79-96`).
+/// The same llama.cpp model used as a classifier (`toPiClassifierModel`, `provider.ts:102-117`
+/// @f1b2e77f5, EXT-110).
 ///
-/// `server_url` is the server ROOT, with no `/v1` (`baseUrl: serverUrl`, `:91`): the
-/// `llama-cpp-classify` api calls `/tokenize`, `/apply-template` and `/completion` there.
-#[must_use]
+/// A DECISION model ([`is_decision_model`]) answers natively through llama.cpp's System One
+/// endpoint: its api is `typesafe-system-one` and its base URL is `<server>/v1`
+/// (`baseUrl: decision ? llamaInferenceUrl(serverUrl) : serverUrl`, `:114`), so the api posts to
+/// `<server>/v1/systemone` (`tools/server/server.cpp:289` @b11436). Every other model falls back
+/// to `llama-cpp-classify`, which reads answers from next-token label probabilities through
+/// `/tokenize`, `/apply-template` and `/completion` on the server ROOT, with no `/v1` (`:112`,
+/// `:114`).
+///
+/// # Errors
+///
+/// The URL errors of [`llama_inference_url`] when a decision model's `server_url` is not an
+/// http(s) URL, as [`to_model`] has.
 pub fn to_classifier_model(
     model: &LlamaModelInfo,
     server_url: &str,
     cached_context_window: Option<u64>,
-) -> ClassifierModel {
-    ClassifierModel {
+) -> Result<ClassifierModel, LlamaError> {
+    let decision = is_decision_model(model);
+    let (api, base_url) = if decision {
+        (
+            KnownClassifierApi::TypesafeSystemOne,
+            llama_inference_url(server_url)?,
+        )
+    } else {
+        (KnownClassifierApi::LlamaCppClassify, server_url.to_string())
+    };
+    Ok(ClassifierModel {
         id: model.id.as_str().into(),
         name: model.id.clone(),
-        api: KnownClassifierApi::LlamaCppClassify.into(),
+        api: api.into(),
         provider: LLAMA_PROVIDER_ID.into(),
-        base_url: server_url.to_string(),
+        base_url,
         input: vec![Modality::Text],
         input_limits: None,
         cost: ModelCost::default(),
         headers: None,
         context_window: context_window_of(model, cached_context_window),
-    }
+    })
+}
+
+/// Whether a stored classifier model is one of this provider's (`isLlamaClassifierModel`,
+/// `provider.ts:121-124` @f1b2e77f5): a classifier on either api [`to_classifier_model`] produces,
+/// `llama-cpp-classify` or `typesafe-system-one`.
+#[must_use]
+pub fn is_llama_classifier_api(api: &str) -> bool {
+    api == KnownClassifierApi::LlamaCppClassify.as_str()
+        || api == KnownClassifierApi::TypesafeSystemOne.as_str()
 }
 
 /// A router catalog entry as an `openai-completions` chat [`Model`] (`toPiModel`,

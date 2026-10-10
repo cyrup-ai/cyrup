@@ -27,8 +27,9 @@
 //! (`b9a5a00b86fd285a445916086a0b1dc35bee6d66`, 2026-10-06), read as
 //! `git -C tmp/llama.cpp show b11436:tools/server/<file>`. The wire shapes that pin grounds, and
 //! the floor release the router management API arrived in (`b9688`, #23976), are recorded ONCE in
-//! `tests/llama_cpp_wire.rs` (EXT-100); the fake server in `tests/fake_server.rs` answers from
-//! that module rather than from a transcription of its own.
+//! the test-only crate `cyrup-llama-cpp-wire` (EXT-100, lifted there by EXT-108); the fake server
+//! in `tests/fake_server.rs` answers from it rather than from a transcription of its own, and
+//! `tests/llama_cpp_wire.rs` holds the conformance tests and that fake's drift guard.
 #![deny(
     clippy::unwrap_used,
     clippy::expect_used,

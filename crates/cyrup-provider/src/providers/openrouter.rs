@@ -21,13 +21,14 @@
 //! [`super::fleet::FleetSpec::provider_with`] calls, so the fleet-built `openrouter` provider comes
 //! out of `builtin_providers_with` already carrying its image rows and its `images` map.
 //!
-//! Not ported: `classifiers: { "typesafe-system-one": … }` (`:35`). `PROV-104` owns the two System
-//! One classifier apis, and `KnownClassifierApi` names only `llama-cpp-classify`
-//! ([`crate::classifier::KnownClassifierApi`]). The live catalog's ten `openrouter` classifier rows
-//! therefore parse, persist and list as [`crate::AnyModel::Classifier`] — which is what PROV-128
-//! is responsible for — and `classify()` on one answers
-//! `Provider openrouter has no classifier implementation for "typesafe-system-one"`, pi's own
-//! message for a model whose api has no entry (`models.ts:1168`).
+//! The classifier leg is the same kind of exception: `classifiers: { "typesafe-system-one": … }`
+//! (`:34`, "OpenRouter serves TypeSafe's System One protocol at /api/v1/systemone"). PROV-104
+//! ported the api ([`crate::api::typesafe_system_one`]) and [`with_builtin_images`] installs it as
+//! [`openrouter_classifiers_registry`], so the live catalog's `openrouter` classifier rows, which
+//! the remote catalog overlays onto this provider, classify through
+//! `https://openrouter.ai/api/v1/systemone`. The embedded catalog holds no classifier rows (pi's
+//! `OPENROUTER_CLASSIFIER_MODELS` is generated data, gitignored at the pin); the overlay is where
+//! they come from.
 
 use crate::classifier::ImageModel;
 use crate::images::ImageApiRegistry;
@@ -98,7 +99,16 @@ pub fn openrouter_images_registry() -> ImageApiRegistry {
     registry
 }
 
-/// Attach the built-in image leg to the provider `id`, if it has one — the per-id hook
+/// The provider's `classifiers` dispatch map (pi `classifiers: { "typesafe-system-one":
+/// typesafeSystemOneApi() }`, `providers/openrouter.ts:34`). PROV-104.
+pub fn openrouter_classifiers_registry() -> crate::classifier::ClassifierApiRegistry {
+    let kind = crate::classifier::KnownClassifierApi::TypesafeSystemOne;
+    let mut registry = crate::classifier::ClassifierApiRegistry::new();
+    registry.register(kind, kind.implementation());
+    registry
+}
+
+/// Attach the built-in image and classifier legs to the provider `id`, if it has them — the per-id hook
 /// [`super::fleet::FleetSpec::provider_with`] applies, shaped exactly like
 /// [`super::builtin_oauth::builtin_provider_oauth`].
 ///
@@ -112,6 +122,7 @@ pub fn with_builtin_images(id: &str, provider: WireProvider) -> WireProvider {
     provider
         .with_image_models(openrouter_image_models())
         .with_images(Arc::new(openrouter_images_registry()))
+        .with_classifiers(Arc::new(openrouter_classifiers_registry()))
 }
 
 #[cfg(test)]

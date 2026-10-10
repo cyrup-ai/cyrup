@@ -20,6 +20,18 @@ cyrup-provider = { workspace = true }
 async-trait = { workspace = true }
 bytes = { workspace = true }
 futures = { workspace = true }
+# `localeCompare` (`ui.ts:324`, `huggingface.ts:149`) is ICU root collation, which orders Han
+# radical-stroke. ICU4X's compiled data (and `feruca`) give Han implicit code-point weights, so the
+# collator runs on `data/collation-root-unihan.postcard`, generated with `--collation-root-han unihan`
+# from ICU 77.1 (Node 22's ICU); see `ui::locale_compare`.
+icu_collator = { version = "2.2.1", default-features = false, features = ["serde"] }
+icu_provider_blob = { version = "2.3.0", default-features = false }
+# `sync` makes the collator's data payloads `Arc`-backed, so the collator can live in a `static`.
+# Without it the build only links where another crate in the graph happens to enable it.
+icu_provider = { version = "2.3.1", default-features = false, features = ["sync"] }
+# `cjkBreakRegex` (`utils.ts:54`) matches `Script_Extensions`; the features are the ones
+# `idna_adapter` already builds `icu_properties` with.
+icu_properties = { version = "2.2", default-features = false, features = ["compiled_data"] }
 regex = "1.12.4"
 reqwest = { workspace = true }
 serde = { workspace = true }
@@ -36,3 +48,6 @@ url = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# The llama.cpp wire every fake server in `src/tests/` answers from (EXT-108). A dev edge only, and
+# a path dep with no `[workspace.dependencies]` entry, matching `cyrup-test-support`.
+cyrup-llama-cpp-wire = { path = "../cyrup-llama-cpp-wire" }

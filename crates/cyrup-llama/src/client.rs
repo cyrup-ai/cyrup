@@ -274,7 +274,7 @@ pub struct LlamaModelStatusInfo {
     ///
     /// The field stays because pi declares it (`client.ts:11` @v0.99.2-17) and this crate ports pi; a
     /// real server reports download progress over SSE instead
-    /// (`crate::tests::llama_cpp_wire::download_progress_event`). What a test feeding
+    /// (`cyrup_llama_cpp_wire::router::download_progress_event`). What a test feeding
     /// `status.progress` proves is that the port is faithful to pi, NOT that any server does this.
     #[serde(
         default,

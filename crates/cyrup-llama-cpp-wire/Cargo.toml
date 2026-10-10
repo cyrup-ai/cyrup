@@ -1,0 +1,18 @@
+[package]
+name = "cyrup-llama-cpp-wire"
+description = "TEST-ONLY: the llama.cpp llama-server wire (router management + classifier endpoints) as one cited definition the workspace's fake servers answer from (EXT-100, EXT-108)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+# Test data, depended on only through `[dev-dependencies]` (`cyrup-llama`, `cyrup-it`, `cyrup-provider`). Never a
+# normal dependency of anything, so it can never reach the shipping binary.
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+serde_json = { workspace = true }

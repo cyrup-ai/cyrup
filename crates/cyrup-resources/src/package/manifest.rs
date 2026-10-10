@@ -484,6 +484,44 @@ pub(crate) fn autoload_delta_verdicts(
     verdicts
 }
 
+/// The prefix that names a built-in extension as an extension resource, `builtin:<name>` (Pi
+/// `BUILTIN_PATH_PREFIX`, `core/source-info.ts`).
+pub const BUILTIN_PATH_PREFIX: &str = "builtin:";
+
+/// Whether the built-in extension `name` is enabled by the `extensions` settings arrays (EXT-094).
+///
+/// Pi's built-in loop in `DefaultPackageManager.resolve` (`core/package-manager.ts`): a built-in is
+/// enabled unless the user array excludes `builtin:<name>` (`isEnabledByOverrides` over the user
+/// entries, against the agent dir), and a `+`, `-` or `!` entry in the PROJECT array naming it
+/// overrides that (`applyAutoloadDisabledPatterns` over `getOverridePatterns(project)`, the last
+/// matching entry winning). Plain entries never decide a built-in, in either array.
+///
+/// `builtin:<name>` names no file, so it is matched as its own path: an exact entry must spell it
+/// (`-builtin:llama.cpp`, or `-./builtin:llama.cpp`), and a `!` glob matches it as a basename
+/// (`!builtin:*`, `!*`).
+pub fn builtin_extension_enabled(
+    name: &str,
+    user_entries: &[String],
+    user_base: &Path,
+    project_entries: &[String],
+    project_base: &Path,
+) -> bool {
+    let path = PathBuf::from(format!("{BUILTIN_PATH_PREFIX}{name}"));
+    let project_overrides: Vec<String> = project_entries
+        .iter()
+        .filter(|e| e.starts_with(['!', '+', '-']))
+        .cloned()
+        .collect();
+    let project_verdict = autoload_delta_verdicts(
+        project_base,
+        std::slice::from_ref(&path),
+        &project_overrides,
+    )
+    .into_iter()
+    .find_map(|(p, enabled)| (p == path).then_some(enabled));
+    project_verdict.unwrap_or_else(|| is_enabled_by_overrides(user_base, &path, user_entries))
+}
+
 fn apply_patterns_full(base: &Path, all: &[PathBuf], patterns: &[String]) -> Vec<PathBuf> {
     let mut includes: Vec<String> = Vec::new();
     let mut excludes: Vec<String> = Vec::new();
@@ -740,5 +778,76 @@ mod ext063_tests {
 
         let resolved = resolve_manifest(dir.path()).expect("resolve");
         assert_eq!(resolved.agents, vec![dir.path().join("a/b.md")]);
+    }
+}
+
+#[cfg(test)]
+mod ext094_tests {
+    use super::*;
+
+    fn entries(list: &[&str]) -> Vec<String> {
+        list.iter().map(ToString::to_string).collect()
+    }
+
+    /// `builtin_extension_enabled(name, user, project)` against fixed agent / project dirs.
+    fn enabled(name: &str, user: &[&str], project: &[&str]) -> bool {
+        builtin_extension_enabled(
+            name,
+            &entries(user),
+            Path::new("/home/u/.cyrup/agent"),
+            &entries(project),
+            Path::new("/w/.cyrup"),
+        )
+    }
+
+    /// EXT-094 — pi's built-in loop (`core/package-manager.ts`, `resolve()`): every built-in loads
+    /// by default, a `-builtin:<name>` user entry disables exactly that one, and plain entries never
+    /// decide a built-in.
+    #[test]
+    fn a_user_entry_disables_only_the_built_in_it_names() {
+        assert!(enabled("llama.cpp", &[], &[]));
+        assert!(enabled("llama.cpp", &["builtin:llama.cpp"], &[]));
+        assert!(!enabled("llama.cpp", &["-builtin:llama.cpp"], &[]));
+        assert!(!enabled("llama.cpp", &["-./builtin:llama.cpp"], &[]));
+        assert!(enabled("mcp", &["-builtin:llama.cpp"], &[]));
+        assert!(enabled("llama.cpp", &["-builtin:llama"], &[]));
+    }
+
+    /// `isEnabledByOverrides`' order: a `!` glob excludes, a `+` exact entry re-enables over it, and
+    /// a `-` exact entry wins last.
+    #[test]
+    fn user_overrides_apply_in_pi_order() {
+        assert!(!enabled("mcp", &["!builtin:*"], &[]));
+        assert!(!enabled("mcp", &["!*"], &[]));
+        assert!(enabled("mcp", &["!builtin:*", "+builtin:mcp"], &[]));
+        assert!(!enabled("mcp", &["+builtin:mcp", "-builtin:mcp"], &[]));
+    }
+
+    /// A `+`, `-` or `!` project entry naming the built-in overrides the user setting, the last
+    /// matching one winning (`applyAutoloadDisabledPatterns`); a plain project entry does not.
+    #[test]
+    fn a_project_override_decides_over_the_user_setting() {
+        assert!(enabled(
+            "llama.cpp",
+            &["-builtin:llama.cpp"],
+            &["+builtin:llama.cpp"]
+        ));
+        assert!(!enabled("llama.cpp", &[], &["-builtin:llama.cpp"]));
+        assert!(!enabled("llama.cpp", &[], &["!builtin:*"]));
+        assert!(enabled(
+            "llama.cpp",
+            &[],
+            &["-builtin:llama.cpp", "+builtin:llama.cpp"]
+        ));
+        assert!(!enabled(
+            "llama.cpp",
+            &["-builtin:llama.cpp"],
+            &["builtin:llama.cpp"]
+        ));
+        assert!(!enabled(
+            "llama.cpp",
+            &["-builtin:llama.cpp"],
+            &["+builtin:mcp"]
+        ));
     }
 }

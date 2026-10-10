@@ -21,10 +21,9 @@
 //! Dispatch itself lives where pi keeps it: [`crate::provider::Provider::classify`] and
 //! [`crate::collection::Models::classify`].
 //!
-//! Not ported from the 0.99 multi-type surface (see the EXT-027 ledger rows): the
-//! `typesafe-system-one` and `cloudflare-workers-ai-system-one` classifier apis,
-//! `Provider.filterAllModels` and `Models.getAllAvailable`, and the array-based
-//! `models.all.json` shape.
+//! Not ported from the 0.99 multi-type surface (see the EXT-027 ledger rows): the array-based
+//! `models.all.json` shape. PROV-104 ported the two System One classifier apis,
+//! `typesafe-system-one` and `cloudflare-workers-ai-system-one` ([`KnownClassifierApi`]).
 //!
 //! PROV-128 is CLOSED. Step (1) is the type work here: [`ModelType::Image`], [`AnyModel::Image`]
 //! and [`ImageModel`] in upstream's v1.0.0 shape. Step (2) hung an `images` dispatch map on
@@ -82,23 +81,37 @@ impl std::fmt::Display for ModelType {
     }
 }
 
-/// The classifier wire-protocol ids this build knows (pi `KnownClassifierApi`, types.ts:35).
-/// pi's other two, `typesafe-system-one` and `cloudflare-workers-ai-system-one`, are not ported.
-/// Like pi's `ClassifierApi = KnownClassifierApi | (string & {})` (types.ts:37), a
-/// [`ClassifierModel::api`] may carry any string; this enum names the ones with an implementation.
+/// The classifier wire-protocol ids this build knows (pi `KnownClassifierApi`, types.ts:78-82
+/// @f1b2e77f5). pi's fourth, `openai-decisions`, is not ported (filed separately). Like pi's
+/// `ClassifierApi = KnownClassifierApi | (string & {})`, a [`ClassifierModel::api`] may carry any
+/// string; this enum names the ones with an implementation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum KnownClassifierApi {
+    /// TypeSafe's native System One protocol, served by TypeSafe, OpenRouter and llama.cpp's
+    /// decision models (`typesafe-system-one`, `ai/src/api/typesafe-system-one.ts`; PROV-104).
+    TypesafeSystemOne,
+    /// System One models on Cloudflare's Workers AI REST endpoint
+    /// (`cloudflare-workers-ai-system-one`, `ai/src/api/cloudflare-workers-ai-system-one.ts`;
+    /// PROV-104).
+    CloudflareWorkersAiSystemOne,
     /// Classification with a chat model served by llama.cpp's `llama-server`
     /// (`llama-cpp-classify`, `ai/src/api/llama-cpp-classify.ts`).
     LlamaCppClassify,
 }
 
 impl KnownClassifierApi {
-    pub const ALL: [KnownClassifierApi; 1] = [KnownClassifierApi::LlamaCppClassify];
+    /// pi's declaration order (types.ts:78-82), without `openai-decisions`.
+    pub const ALL: [KnownClassifierApi; 3] = [
+        KnownClassifierApi::TypesafeSystemOne,
+        KnownClassifierApi::CloudflareWorkersAiSystemOne,
+        KnownClassifierApi::LlamaCppClassify,
+    ];
 
     /// The api id as it appears in [`ClassifierModel::api`].
     pub const fn as_str(self) -> &'static str {
         match self {
+            KnownClassifierApi::TypesafeSystemOne => "typesafe-system-one",
+            KnownClassifierApi::CloudflareWorkersAiSystemOne => "cloudflare-workers-ai-system-one",
             KnownClassifierApi::LlamaCppClassify => "llama-cpp-classify",
         }
     }
@@ -106,6 +119,21 @@ impl KnownClassifierApi {
     /// The known api an id names, if any.
     pub fn from_api(api: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|known| known.as_str() == api)
+    }
+
+    /// The implementation of this api (pi's `*Api()` factories in `api/*.lazy.ts`).
+    pub fn implementation(self) -> Arc<dyn ProviderClassifier> {
+        match self {
+            KnownClassifierApi::TypesafeSystemOne => {
+                crate::api::typesafe_system_one::typesafe_system_one_api()
+            }
+            KnownClassifierApi::CloudflareWorkersAiSystemOne => {
+                crate::api::cloudflare_workers_ai_system_one::cloudflare_workers_ai_system_one_api()
+            }
+            KnownClassifierApi::LlamaCppClassify => {
+                crate::api::llama_cpp_classify::llama_cpp_classify_api()
+            }
+        }
     }
 }
 
