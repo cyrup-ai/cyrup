@@ -77,6 +77,12 @@ pub enum ProviderError {
     /// Unknown provider id. Code `provider`.
     #[error("unknown provider: {0}")]
     UnknownProvider(ProviderId),
+    /// The provider's auth strategy resolved to nothing for this request (PROV-108). pi
+    /// `applyAuth` (`packages/ai/src/models.ts:843-875` @f1b2e77f5), `:859-861`:
+    /// ``if (!resolution) { throw new ModelsError("auth", `Provider is not configured: ${model.provider}`); }``
+    /// — the same text the classifier and image entry points already report. Code `auth`.
+    #[error("Provider is not configured: {0}")]
+    NotConfigured(ProviderId),
     /// No API implementation registered for `model.api`. Code `stream`.
     #[error("no API implementation for {0}")]
     NoApiImpl(ApiId),
@@ -125,6 +131,7 @@ impl ProviderError {
     pub fn code(&self) -> &'static str {
         match self {
             ProviderError::UnknownProvider(_) => "provider",
+            ProviderError::NotConfigured(_) => "auth",
             ProviderError::NoApiImpl(_) => "stream",
             ProviderError::ModelSource(_) => "model_source",
             ProviderError::Http { .. } | ProviderError::RetryDelay(_) => "http",
@@ -154,6 +161,7 @@ impl ProviderError {
     pub fn reproduce(&self) -> ProviderError {
         match self {
             ProviderError::UnknownProvider(p) => ProviderError::UnknownProvider(p.clone()),
+            ProviderError::NotConfigured(p) => ProviderError::NotConfigured(p.clone()),
             ProviderError::NoApiImpl(a) => ProviderError::NoApiImpl(a.clone()),
             ProviderError::ModelSource(e) => ProviderError::ModelSource(e.to_string().into()),
             ProviderError::Http { status, message } => ProviderError::Http {

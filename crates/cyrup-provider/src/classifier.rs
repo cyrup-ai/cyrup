@@ -39,7 +39,7 @@ use crate::HeaderMap;
 use crate::auth::ProviderEnv;
 use crate::model::{Modality, Model, ModelCost, ModelInputLimits};
 use crate::stream::{ProviderResponse, TransformHeadersFn};
-use cyrup_core::{ApiId, CancelToken, ModelId, ProviderId, Usage};
+use cyrup_core::{ApiId, CancelToken, Content, ModelId, ProviderId, Usage};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -670,13 +670,53 @@ impl ClassifierQuestion {
     }
 }
 
-/// A classification request: the state to judge and the questions to ask about it (pi
-/// `ClassifierContext`, types.ts:653-656). The questions are answered in map order.
+/// A classification request: the state to judge, optional images, and the questions to ask about
+/// it (pi `ClassifierContext`, `types.ts:682-690` @f1b2e77f5). The questions are answered in map
+/// order.
 #[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ClassifierContext {
     /// pi `JsonObject`; key order is preserved (the workspace enables `serde_json/preserve_order`).
     pub state: serde_json::Map<String, serde_json::Value>,
+    /// pi `ClassifierContext.images?: ImageContent[]` (`packages/ai/src/types.ts:682-690`
+    /// @f1b2e77f5): "Images judged together with `state`. Only models whose `input` includes
+    /// `"image"` accept them; other models return an error result." cyrup has no standalone
+    /// `ImageContent`, so this carries [`Content::Image`] blocks (the same `{ type: "image",
+    /// data, mimeType }` wire shape); [`assert_classifier_input_supported`] is the model check.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub images: Option<Vec<Content>>,
     pub questions: OrderedMap<ClassifierQuestion>,
+}
+
+impl ClassifierContext {
+    /// pi `context.images?.length` — true when the request carries at least one image.
+    pub fn has_images(&self) -> bool {
+        self.images
+            .as_ref()
+            .is_some_and(|images| !images.is_empty())
+    }
+}
+
+/// Rejects classifier images for models whose catalog entry does not accept image input (pi
+/// `assertClassifierInputSupported`, `packages/ai/src/utils/model-operations.ts:46-53` @f1b2e77f5):
+///
+/// ```ts
+/// if (context.images?.length && !model.input.includes("image")) {
+///     throw new ModelsError("provider", `Model ${model.provider}/${model.id} does not accept image input`);
+/// }
+/// ```
+///
+/// The `Err` string is the error result's message.
+pub fn assert_classifier_input_supported(
+    model: &ClassifierModel,
+    context: &ClassifierContext,
+) -> Result<(), String> {
+    if context.has_images() && !model.input.contains(&Modality::Image) {
+        return Err(format!(
+            "Model {}/{} does not accept image input",
+            model.provider, model.id
+        ));
+    }
+    Ok(())
 }
 
 // ------------------------------------------------------------------------------------- options --

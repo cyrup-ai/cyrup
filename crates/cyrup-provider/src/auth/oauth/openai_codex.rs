@@ -569,7 +569,15 @@ impl OpenAiCodexOAuthFlow {
 
     /// `createAuthorizationFlow` (`openai-codex.ts:276-295`). Parameter order is upstream's
     /// insertion order, which `URLSearchParams.toString()` preserves.
-    pub fn create_authorization_flow(&self) -> Result<AuthorizationFlow, OAuthError> {
+    ///
+    /// PROV-144 — at f1b2e77f5 it is `createAuthorizationFlow(originator: string = "pi")`
+    /// (`openai-codex.ts:289-306`), called as `createAuthorizationFlow(options?.agentName)`
+    /// (`:363`); `None` is the `undefined` that takes the default ([`ORIGINATOR`]).
+    pub fn create_authorization_flow(
+        &self,
+        originator: Option<&str>,
+    ) -> Result<AuthorizationFlow, OAuthError> {
+        let originator = originator.unwrap_or(self.originator.as_str());
         // `:279-280`
         let pkce = generate_pkce()?;
         let state = create_state()?;
@@ -585,7 +593,7 @@ impl OpenAiCodexOAuthFlow {
             ("state", state.as_str()),
             ("id_token_add_organizations", "true"),
             ("codex_cli_simplified_flow", "true"),
-            ("originator", self.originator.as_str()),
+            ("originator", originator),
         ]);
 
         Ok(AuthorizationFlow {
@@ -973,12 +981,16 @@ impl OpenAiCodexOAuthFlow {
     }
 
     /// `loginOpenAICodex` (`openai-codex.ts:426-486`), including its `finally`.
+    ///
+    /// PROV-144 — `loginOpenAICodex(interaction, options?: LoginOptions)` (`openai-codex.ts:359-363`
+    /// @f1b2e77f5) threads `options?.agentName` into `createAuthorizationFlow`.
     async fn login_browser(
         &self,
         interaction: &dyn AuthInteraction,
+        options: &LoginOptions,
     ) -> Result<Credential, OAuthError> {
-        // `:427`
-        let auth = self.create_authorization_flow()?;
+        // `:427` (`:363` @f1b2e77f5)
+        let auth = self.create_authorization_flow(options.agent_name.as_deref())?;
         // `:428`
         let server = self
             .start_local_oauth_server(&auth.state, interaction)
@@ -1048,7 +1060,7 @@ impl OAuthAuth for OpenAiCodexOAuthFlow {
     async fn login(
         &self,
         interaction: &dyn AuthInteraction,
-        _options: &LoginOptions,
+        options: &LoginOptions,
     ) -> Result<Credential, OAuthError> {
         // `:496-506`
         let method = interaction
@@ -1078,7 +1090,7 @@ impl OAuthAuth for OpenAiCodexOAuthFlow {
                 "Unknown OpenAI Codex login method: {method}"
             )));
         }
-        self.login_browser(interaction).await
+        self.login_browser(interaction, options).await
     }
 
     /// `openai-codex.ts:534` — `refresh: (credential) => refreshOpenAICodexToken(credential.refresh)`.
@@ -1161,7 +1173,7 @@ mod tests {
     #[test]
     fn authorization_url_matches_url_search_params() {
         let flow = OpenAiCodexOAuthFlow::new();
-        let auth = flow.create_authorization_flow().unwrap();
+        let auth = flow.create_authorization_flow(None).unwrap();
         let (base, query) = auth.url.split_once('?').unwrap();
         assert_eq!(base, AUTHORIZE_URL);
         assert_eq!(
@@ -1189,7 +1201,7 @@ mod tests {
         assert!(auth.state.chars().all(|c| !c.is_ascii_uppercase()));
         assert_ne!(
             auth.state,
-            flow.create_authorization_flow().unwrap().state,
+            flow.create_authorization_flow(None).unwrap().state,
             "state must not repeat between logins"
         );
     }
@@ -1844,7 +1856,7 @@ mod tests {
         });
 
         let interaction = Arc::new(ScriptedInteraction::new(Vec::new()).blocking_when_empty());
-        let auth = flow.create_authorization_flow().unwrap();
+        let auth = flow.create_authorization_flow(None).unwrap();
         let server = flow
             .start_local_oauth_server(&auth.state, interaction.as_ref())
             .await
@@ -1978,6 +1990,61 @@ mod tests {
         assert_eq!(server.wait().await.unwrap(), Some("ok-code".to_string()));
     }
 
+    /// PROV-144 — upstream's `"uses the app's agent name as the browser login originator"`
+    /// (`test/openai-codex-oauth.test.ts`, `9ad083102`): `login(interaction, { agentName: "my-app" })`
+    /// with the `browser` method sends `originator=my-app` (`openai-codex.ts:359-363` @f1b2e77f5,
+    /// `createAuthorizationFlow(options?.agentName)`); without it the default `pi` stays. A bare
+    /// pasted code completes the login (`:464` checks state only when one is present).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn prov144_uses_the_apps_agent_name_as_the_browser_login_originator() {
+        async fn originator_of(options: &LoginOptions) -> Option<String> {
+            let token = FakeEndpoint::one(
+                200,
+                &serde_json::json!({
+                    "access_token": jwt_for_account("acct"),
+                    "refresh_token": "refresh",
+                    "expires_in": 3600,
+                })
+                .to_string(),
+            );
+            let flow = OpenAiCodexOAuthFlow::with_endpoints(OpenAiCodexEndpoints {
+                token_url: token.url("/oauth/token"),
+                callback_host: Some("127.0.0.1".to_string()),
+                callback_port: 0,
+                ..Default::default()
+            });
+            let interaction = ScriptedInteraction::new(vec![
+                Ok(BROWSER_LOGIN_METHOD.to_string()),
+                Ok("pasted-code".to_string()),
+            ]);
+            flow.login(&interaction, options).await.unwrap();
+            let url = interaction
+                .events()
+                .into_iter()
+                .find_map(|event| match event {
+                    AuthEvent::AuthUrl { url, .. } => Some(url),
+                    _ => None,
+                })
+                .expect("auth_url emitted");
+            reqwest::Url::parse(&url)
+                .unwrap()
+                .query_pairs()
+                .find(|(k, _)| k == "originator")
+                .map(|(_, v)| v.into_owned())
+        }
+
+        assert_eq!(
+            originator_of(&LoginOptions::default().with_agent_name("my-app"))
+                .await
+                .as_deref(),
+            Some("my-app")
+        );
+        assert_eq!(
+            originator_of(&LoginOptions::default()).await.as_deref(),
+            Some("pi")
+        );
+    }
+
     /// `:459-476` — the manual paste path. With no listener bound (`:371`), `waitForCode()`
     /// resolves `null` at once and the pasted redirect URL supplies the code.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1993,7 +2060,7 @@ mod tests {
             .to_string(),
         );
         let flow = flow_with_token_url(&token.url("/oauth/token"));
-        let auth = flow.create_authorization_flow().unwrap();
+        let auth = flow.create_authorization_flow(None).unwrap();
         let pasted = format!("{REDIRECT_URI}?code=pasted-code&state={}", auth.state);
         let interaction = ScriptedInteraction::new(vec![Ok(pasted)]);
         let manual_abort = CancelToken::new();
@@ -2027,7 +2094,7 @@ mod tests {
         // transport error, online on an auth error.
         let token = FakeEndpoint::start(vec![(400, "{\"error\":\"invalid_grant\"}".to_string())]);
         let flow = flow_with_token_url(&token.url("/oauth/token"));
-        let auth = flow.create_authorization_flow().unwrap();
+        let auth = flow.create_authorization_flow(None).unwrap();
         let interaction = ScriptedInteraction::new(vec![Ok(format!(
             "{REDIRECT_URI}?code=c&state=someone-elses-state"
         ))]);
@@ -2051,7 +2118,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn empty_paste_reports_missing_authorization_code() {
         let flow = OpenAiCodexOAuthFlow::new();
-        let auth = flow.create_authorization_flow().unwrap();
+        let auth = flow.create_authorization_flow(None).unwrap();
         let interaction = ScriptedInteraction::new(vec![Ok("   ".to_string())]);
         let err = flow
             .run_login_browser(&interaction, &auth, None, &CancelToken::new())
@@ -2089,7 +2156,7 @@ mod tests {
             callback_port: 0,
             ..Default::default()
         }));
-        let auth = flow.create_authorization_flow().unwrap();
+        let auth = flow.create_authorization_flow(None).unwrap();
         let server = flow
             .start_local_oauth_server(&auth.state, interaction.as_ref())
             .await

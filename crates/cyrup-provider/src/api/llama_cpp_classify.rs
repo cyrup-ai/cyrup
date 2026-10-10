@@ -1198,6 +1198,13 @@ async fn run(
             model.api
         )));
     }
+    // `if (context.images?.length) throw new Error(`${LABEL} classification does not support image
+    // input`);` (llama-cpp-classify.ts:437 @f1b2e77f5).
+    if context.has_images() {
+        return Err(ClassifyError::plain(format!(
+            "{LABEL} classification does not support image input"
+        )));
+    }
     let temperature = options.temperature;
     if !temperature.is_finite() || temperature <= 0.0 {
         return Err(ClassifyError::plain(format!(

@@ -42,6 +42,15 @@ pub struct LoginOptions {
     /// `getDeviceId?: () => string`. A flow that needs an installation id calls it; a flow that
     /// does not never does, which is why the app may create the id lazily.
     pub get_device_id: Option<GetDeviceIdFn>,
+    /// PROV-144 — pi `LoginOptions.agentName?: string` (`ai/src/auth/types.ts:209-213`
+    /// @f1b2e77f5, added by `9ad083102`):
+    ///
+    /// > Name this app introduces itself with during login, e.g. OpenAI's agent name hint and
+    /// > Codex originator. Defaults to pi's own name.
+    ///
+    /// Read by the Sign in with ChatGPT authorize URL (`agent_name_hint`, `openai_chatgpt.rs`) and
+    /// the Codex browser login (`originator`, `openai_codex.rs`); `None` keeps their defaults.
+    pub agent_name: Option<String>,
 }
 
 /// `getDeviceId: () => string` (pi `LoginOptions.getDeviceId`, `ai/src/auth/types.ts:211-213`).
@@ -57,7 +66,15 @@ impl LoginOptions {
     {
         Self {
             get_device_id: Some(Arc::new(get_device_id)),
+            agent_name: None,
         }
+    }
+
+    /// The same options naming the app (pi `agentName`, PROV-144).
+    #[must_use]
+    pub fn with_agent_name(mut self, agent_name: impl Into<String>) -> Self {
+        self.agent_name = Some(agent_name.into());
+        self
     }
 
     /// `options?.getDeviceId?.()` — the installation id, if the app supplied a way to get one.
@@ -70,6 +87,7 @@ impl std::fmt::Debug for LoginOptions {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LoginOptions")
             .field("get_device_id", &self.get_device_id.is_some())
+            .field("agent_name", &self.agent_name)
             .finish()
     }
 }

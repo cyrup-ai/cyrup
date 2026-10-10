@@ -661,6 +661,12 @@ impl Models {
         context: &ClassifierContext,
         options: &ClassifierOptions,
     ) -> ClassifierResult {
+        // pi `Models.classify` (`models.ts:972-989` @f1b2e77f5) runs
+        // `assertClassifierInputSupported(model, context)` before `requireProvider`, inside the
+        // `try` whose `catch` is `classifierErrorResult(model, error, options?.signal?.aborted)`.
+        if let Err(message) = crate::classifier::assert_classifier_input_supported(model, context) {
+            return ClassifierResult::errored(model, message, options.is_aborted());
+        }
         let Some(provider) = self.providers.get(model.provider.as_str()) else {
             return ClassifierResult::errored(
                 model,
@@ -1190,8 +1196,15 @@ impl AuthHelper {
             },
         )
         .await?;
+        // PROV-108 — pi `applyAuth` (`models.ts:843-875` @f1b2e77f5), shared by `stream`,
+        // `streamSimple`, `streamDeferred`, `generateImages` and `classify` (`:885`, `:905`, `:928`,
+        // `:965`, `:984`), `:859-861`:
+        // ``if (!resolution) { throw new ModelsError("auth", `Provider is not configured: ${model.provider}`); }``
+        // The chat path refuses exactly as
+        // `classify` does. (A provider with no strategy at all still delegates above: pi requires
+        // `auth` on every provider, so it has no such case; cyrup's `faux` is one.)
         let Some(resolution) = resolution else {
-            return Ok((model.clone(), options.clone()));
+            return Err(ProviderError::NotConfigured(model.provider.clone()));
         };
         let auth = &resolution.auth;
         let mut request_model = model.clone();

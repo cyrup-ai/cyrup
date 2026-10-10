@@ -472,6 +472,7 @@ pub(super) fn boolean(instructions: &str, when_true: &str, when_false: &str) -> 
 pub(super) fn context_of(questions: Vec<(&str, ClassifierQuestion)>) -> ClassifierContext {
     ClassifierContext {
         state: serde_json::Map::new(),
+        images: None,
         questions: questions.into_iter().collect(),
     }
 }
@@ -490,6 +491,7 @@ pub(super) fn ticket_context() -> ClassifierContext {
     );
     ClassifierContext {
         state,
+        images: None,
         questions: vec![
             (
                 "team",
