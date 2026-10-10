@@ -1882,6 +1882,71 @@ mod tests {
         );
     }
 
+    /// SUBA-183 — pi `writeRun` (`:421-423` @ `ad11b7ab`): "An earlier update may have timed out;
+    /// a run's own receipt is newer than a "running" entry." Run R is recorded `running`; its
+    /// `completed` update then times out on a held lock (receipt written, history untouched). The
+    /// NEXT history write — for another run S — must carry R as its receipt says (`completed`),
+    /// not the stale `running` entry. Without the receipt preference the index keeps reading R as
+    /// in flight forever.
+    #[tokio::test]
+    async fn a_history_write_heals_a_running_entry_from_its_newer_receipt() {
+        let project = tempfile::tempdir().expect("real tempdir");
+        let store = project_store(project.path())
+            .with_history_lease_wait(std::time::Duration::from_millis(50));
+        let schedule = full_record("healing", project.path());
+        store.write(&schedule).await.expect("writes");
+        let mut r = run_record(
+            &schedule.id,
+            ScheduleRunId::mint(),
+            ScheduleRunState::Running,
+        );
+        store
+            .write_run(&schedule, &r, "schedule.run.started")
+            .await
+            .expect("R running");
+        let dir = store.directory(&schedule.id, false).await.expect("dir");
+
+        r.state = ScheduleRunState::Completed;
+        {
+            let _held = hold_history_lock(&dir);
+            let error = store
+                .write_run(&schedule, &r, "schedule.run.completed")
+                .await
+                .expect_err("the completion's history update times out");
+            assert!(
+                matches!(error, ScheduleStoreError::LeaseTimeout { .. }),
+                "{error}"
+            );
+        }
+        assert_eq!(
+            store.history(&schedule.id).await.expect("history")[0].state,
+            ScheduleRunState::Running,
+            "precondition: history.json still says running"
+        );
+
+        let s = run_record(
+            &schedule.id,
+            ScheduleRunId::mint(),
+            ScheduleRunState::Missed,
+        );
+        store
+            .write_run(&schedule, &s, "schedule.missed")
+            .await
+            .expect("S");
+        let history = store.history(&schedule.id).await.expect("history");
+        assert_eq!(
+            history
+                .iter()
+                .map(|run| (&run.id, run.state))
+                .collect::<Vec<_>>(),
+            vec![
+                (&s.id, ScheduleRunState::Missed),
+                (&r.id, ScheduleRunState::Completed)
+            ],
+            "R's newer receipt replaces its stale running entry"
+        );
+    }
+
     /// SUBA-183 (b) — two writers appending DIFFERENT runs keep both.
     ///
     /// Deterministic interleaving: the test holds the raw lock, starts `store_b.write_run(B)`

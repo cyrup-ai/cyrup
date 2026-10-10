@@ -2108,9 +2108,17 @@ mod tests {
         );
     }
 
-    /// A caller already cancelled never acts — pi re-checks `deps.signal?.aborted` after the
-    /// lease is granted, so even an UNCONTENDED lock answers the cancellation sentence. Also pins
-    /// the action name and the ` child {index}` label on the close path.
+    /// A caller already cancelled never acts, even on an UNCONTENDED target: the cancellation
+    /// sentence, and the plugin's `open` never called. Also pins the action name and the
+    /// ` child {index}` label on the close path.
+    ///
+    /// What answers here is `FileLock::acquire`'s own already-cancelled pre-check (layer 1's
+    /// `is_cancelled()` before any wait), mapped to pi's sentence — NOT the post-acquire re-check
+    /// in `handle_inspector_action`. That re-check is pi's "the wait may end with the lease in the
+    /// same tick the caller cancelled" guard: it only matters for a cancel landing while a layer-2
+    /// attempt is in flight, a window no test can open deterministically without a seam inside
+    /// `cyrup_config::lock`. Mutation-checked: deleting it leaves this suite green, so it is
+    /// covered by review against pi `actions.ts:158-159` @ad11b7ab, not by a test.
     #[tokio::test]
     async fn a_pre_cancelled_caller_never_reaches_the_plugin() {
         let fixture = fixture();

@@ -1011,8 +1011,8 @@ fn settings_path_for_write(scope: WatchdogSettingsWriteScope, cwd: Option<&Path>
     }
 }
 
-/// `writeSettingsFile` (`settings.ts:508-512`) — 2-space JSON plus a trailing newline, now
-/// delivered through the agent-override writer's `write_settings_file`
+/// `writeSettingsFile` (`settings.ts:508-512`; `:456-460` @ad11b7ab) — 2-space JSON plus a
+/// trailing newline, now delivered through the agent-override writer's `write_settings_file`
 /// (`crate::discovery::settings_write`) onto the PHYSICAL `target`.
 ///
 /// `[CYRUP-DELTA]` (SUBA-184) atomic, where pi writes in place. pi @ad11b7ab:

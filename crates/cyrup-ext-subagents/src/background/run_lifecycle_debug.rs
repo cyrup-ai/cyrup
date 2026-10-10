@@ -198,6 +198,12 @@ pub fn format_capacity_owner(inspect: &ActiveAsyncCapacityInspection) -> Vec<Str
     if let Some(pid) = owner.runner_pid {
         lines.push(format!("Capacity runner pid: {pid}"));
     }
+    // [CYRUP-DELTA] SUBA-194 — the PID namespace that pid was bound in. The release verdict's
+    // owner-pid rung refuses to probe a pid from another namespace, so an operator asking why a
+    // slot whose runner "looks dead" is retained needs the scope that rung compared.
+    if let Some(scope) = owner.runner_pid_namespace_scope.as_deref() {
+        lines.push(format!("Capacity runner pid namespace: {scope}"));
+    }
     if let Some(started_at) = owner.runner_started_at {
         lines.push(format!(
             "Capacity runner started: {}",
@@ -329,6 +335,61 @@ mod tests {
                 reason: "no active-capacity slot records this run".to_string(),
             },
         }
+    }
+
+    /// SUBA-194 — the owner dump lists the bind fields, so it names the namespace the runner pid
+    /// was bound in beside the pid itself (the scope the owner-pid rung compares), in upstream's
+    /// line order with cyrup's pid lines after `Capacity runner:`.
+    #[test]
+    fn the_capacity_owner_dump_names_the_runner_pid_namespace() {
+        use crate::background::active_async_capacity::{
+            ActiveAsyncCapacityKind, ActiveAsyncCapacityOwner, CapacityOwnerVersion,
+        };
+        let session = crate::identity::SessionId::parse("sess-1").expect("session");
+        let owner = ActiveAsyncCapacityOwner {
+            version: CapacityOwnerVersion,
+            reservation_token: "token-1".to_string(),
+            owner_session_key: crate::identity::IndexSegment::encode(session.as_str()).to_string(),
+            owner_session_id: session,
+            slot: 0,
+            run_id: RunId::from_token("run-x".to_string()),
+            source_run_id: None,
+            generation: 0,
+            kind: ActiveAsyncCapacityKind::Runner,
+            async_dir: Path::new("/async/run-x").to_path_buf(),
+            reserved_at: 0,
+            runner_process_instance_id: Some(instance()),
+            runner_pid: Some(4242),
+            runner_process_start_identity: None,
+            runner_pid_namespace_scope: Some("pid:[4026531836]".to_string()),
+            runner_started_at: None,
+        };
+        let mut inspection = not_owned();
+        inspection.owner = Some(owner.clone());
+        inspection.relation = CapacityRelation::Current;
+        let lines = format_capacity_owner(&inspection);
+        let tail: Vec<&str> = lines.iter().skip(3).map(String::as_str).collect();
+        assert_eq!(
+            tail,
+            [
+                "Capacity async dir: /async/run-x",
+                "Capacity runner: inst-1",
+                "Capacity runner pid: 4242",
+                "Capacity runner pid namespace: pid:[4026531836]",
+            ],
+            "{lines:?}"
+        );
+
+        // An owner written by an older build (or off Linux) has no scope, and no line is invented.
+        inspection.owner = Some(ActiveAsyncCapacityOwner {
+            runner_pid_namespace_scope: None,
+            ..owner
+        });
+        assert!(
+            !format_capacity_owner(&inspection)
+                .iter()
+                .any(|line| line.starts_with("Capacity runner pid namespace")),
+        );
     }
 
     fn render(

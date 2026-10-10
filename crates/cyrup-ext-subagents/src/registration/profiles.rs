@@ -2018,7 +2018,14 @@ mod tests {
                 .file_type()
                 .is_symlink()
         );
+        // SUBA-184: the lock is the TARGET's sidecar (`<physical target>.lock`, which `FileLock`
+        // creates and never unlinks), never one beside the link. Red at the unlocked HEAD: no
+        // sidecar exists anywhere.
         assert!(!tmp.path().join("settings.json.lock").exists());
+        assert!(
+            tmp.path().join("real.json.lock").exists(),
+            "the load locked the link's target"
+        );
         let written: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&target).expect("read")).expect("parse");
         assert_eq!(written["theme"], serde_json::json!("dark"));

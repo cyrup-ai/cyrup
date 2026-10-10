@@ -643,10 +643,20 @@ async fn transfer_locked(
         kind: ActiveAsyncCapacityKind::Runner,
         async_dir: input.async_dir.to_path_buf(),
         reserved_at: options.now(),
-        // pi `delete next.runnerProcessInstanceId; delete next.runnerStartedAt` (`:506-507`): the
-        // new run has not started, so the slot is a rollbackable reservation again.
+        // SUBA-223 — pi `transferActiveAsyncCapacity` (`active-async-capacity.ts:539-540` @ad11b7ab):
+        //
+        //     delete next.runnerProcessInstanceId;
+        //     delete next.runnerStartedAt;
+        //
+        // The new run has not started, so the slot is a rollbackable reservation again: EVERY bind
+        // field goes, or `is_started()` (pi's `runnerProcessInstanceId || runnerStartedAt`) stays
+        // true, `rollback` refuses to restore the source, and the release verdict matches the NEW
+        // run against the SOURCE runner's instance id and proof. `runner_pid`, its start identity
+        // and its namespace scope are cyrup's own bind fields (`key.rs`) and qualify the same
+        // runner, so they go with it.
+        runner_process_instance_id: None,
         runner_pid: None,
-        // The scope qualifies the pid cleared above; it goes with it.
+        runner_process_start_identity: None,
         runner_pid_namespace_scope: None,
         runner_started_at: None,
         ..current.clone()

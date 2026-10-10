@@ -310,17 +310,41 @@ impl ProcessTerminalAnnouncingCompletionObserver {
     /// [`PROCESS_TERMINAL_SETTLE_BUDGET`]), and only
     /// [`Liveness::Dead`](crate::background::reconcile::Liveness::Dead) — a real `ESRCH` — ends
     /// the wait. `Unknown` (an `EPERM`-class probe under sandboxing) is NOT death, per R-SA-089.
+    ///
+    /// Nor is a pid recorded in ANOTHER PID namespace probed at all (SUBA-222, the SUBA-194
+    /// family): from there `kill(pid, 0)`'s `ESRCH` says nothing about the runner, and reading it
+    /// as `Dead` would end the wait early and drop a proof the live runner is about to write. pi's
+    /// own "the runner is gone" short-circuit on a wait, `runnerExitedWithoutResult`
+    /// (`src/runs/background/await-async-run.ts:21-22` @ad11b7ab), refuses the same way:
+    ///
+    /// ```text
+    /// const observedScope = currentPidNamespaceScope();
+    /// if (status.pidNamespaceScope !== undefined && status.pidNamespaceScope !== observedScope) return false;
+    /// ```
+    ///
+    /// An unrecorded scope (an older runner) probes as before; an observer with no scope of its
+    /// own mismatches every recorded one, as upstream's `undefined !== scope` does.
     async fn runner_may_still_be_writing(run_dir: &crate::background::RunDir) -> bool {
-        use crate::background::reconcile::{Liveness, check_pid_liveness};
+        use crate::background::reconcile::{
+            Liveness, check_pid_liveness, current_pid_namespace_scope,
+        };
 
         let Ok(Some(status)) =
             crate::background::control::read_status_file(&run_dir.status()).await
         else {
             return true;
         };
-        status
-            .pid
-            .is_none_or(|pid| check_pid_liveness(pid) != Liveness::Dead)
+        let Some(pid) = status.pid else {
+            return true;
+        };
+        if status
+            .pid_namespace_scope
+            .as_deref()
+            .is_some_and(|recorded| current_pid_namespace_scope().as_deref() != Some(recorded))
+        {
+            return true;
+        }
+        check_pid_liveness(pid) != Liveness::Dead
     }
 
     /// Announce proofs found under `async_root` onto whatever backend `host_services` resolves to
@@ -627,6 +651,68 @@ mod tests {
              not dropped: the runner writes its ResultFile before its proof",
         );
         assert_eq!(proof.state(), ProcessTerminalState::Observed);
+    }
+
+    /// SUBA-222 — the crash short-circuit never trusts a pid from another PID namespace. The run's
+    /// status records a genuinely reaped pid (so `kill(pid, 0)` answers `ESRCH` here) under a
+    /// FOREIGN namespace scope: from that observer the runner's liveness is unknown, so the wait
+    /// must go on (pi `runnerExitedWithoutResult`, `await-async-run.ts:21-22` @ad11b7ab). Red
+    /// before the fix: the bare probe reads `Dead` and the wait ends, dropping a proof a live
+    /// runner in that namespace is about to write. The counter-case — the SAME pid under this
+    /// process's own scope, or with no scope recorded — still short-circuits, so a guard that
+    /// never short-circuited would fail here too.
+    #[tokio::test]
+    async fn a_runner_pid_from_another_namespace_never_ends_the_settle_wait() {
+        use crate::background::reconcile::current_pid_namespace_scope;
+        use crate::background::{RunDir, RunId, RunMode, RunStatus};
+
+        let reaped = {
+            let mut child = std::process::Command::new("true")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("`true` spawns");
+            let pid = child.id();
+            let _ = child.wait();
+            pid
+        };
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let run_id = RunId::from_token("run-ns-1");
+        let run_dir = RunDir::new(tmp.path(), &run_id);
+        tokio::fs::create_dir_all(run_dir.as_path())
+            .await
+            .expect("run dir");
+        let write = |scope: Option<String>| {
+            let mut status = RunStatus::queued(run_id.clone(), RunMode::Single, Some(reaped));
+            status.pid_namespace_scope = scope;
+            let path = run_dir.status();
+            async move {
+                crate::background::atomic::write_atomic_json(&path, &status)
+                    .await
+                    .expect("status");
+            }
+        };
+
+        write(Some("pid:[foreign-namespace]".to_string())).await;
+        assert!(
+            ProcessTerminalAnnouncingCompletionObserver::runner_may_still_be_writing(&run_dir)
+                .await,
+            "a pid recorded in another namespace is not probed, so the runner may still write"
+        );
+
+        write(current_pid_namespace_scope()).await;
+        assert!(
+            !ProcessTerminalAnnouncingCompletionObserver::runner_may_still_be_writing(&run_dir)
+                .await,
+            "the same dead pid in this observer's own namespace (or unscoped) still ends the wait"
+        );
+        write(None).await;
+        assert!(
+            !ProcessTerminalAnnouncingCompletionObserver::runner_may_still_be_writing(&run_dir)
+                .await,
+            "an unrecorded scope probes as before"
+        );
     }
 
     /// Publishing with nobody listening is a no-op, not an error: `wait` only subscribes while a

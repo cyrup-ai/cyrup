@@ -1211,6 +1211,86 @@ async fn a_transfer_moves_one_slot_and_bumps_its_generation() {
     );
 }
 
+/// SUBA-223 — pi `transferActiveAsyncCapacity` (`active-async-capacity.ts:539-540` @ad11b7ab):
+/// `delete next.runnerProcessInstanceId; delete next.runnerStartedAt;` — a transferred slot is an
+/// UNSTARTED reservation. The source was bound (instance id, pid, start identity, scope), so a
+/// transfer that clears only the pid and start time leaves the source runner's instance id on the
+/// new owner: `is_started()` stays true, and `rollback` (pi `:450`, `owner.runnerProcessInstanceId
+/// || owner.runnerStartedAt` → `false`) refuses to hand the slot back to the source when the
+/// resumed run fails to launch. Red before the fix: `is_started()` is true and `rollback` is
+/// `false`.
+#[tokio::test]
+async fn a_transferred_slot_is_unstarted_and_its_rollback_restores_the_source() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let options = options(tmp.path());
+    let s = session("s");
+    let source = RunId::from_token("source");
+    let resumed = RunId::from_token("resumed");
+    let source_dir = write_run(tmp.path(), &source, &s, RunState::Complete, Some(1)).await;
+    let resumed_dir = write_run(tmp.path(), &resumed, &s, RunState::Running, Some(2)).await;
+
+    let mut handle = acquire(
+        AcquireInput {
+            session_id: &s,
+            limit: Some(1),
+            run_id: &source,
+            kind: ActiveAsyncCapacityKind::Runner,
+            async_dir: &source_dir,
+        },
+        &options,
+    )
+    .await
+    .expect("admitted")
+    .expect("a slot");
+    handle
+        .mark_started(
+            4242,
+            crate::background::process_terminal::RunnerProcessInstanceId::new(),
+        )
+        .await
+        .expect("bind");
+    let slot = slot_dir(&session_pool_dir(options.root_dir(), &s), 0);
+    let bound = read_owner(&slot).await.expect("owner");
+    assert!(
+        bound.runner_process_instance_id.is_some() && bound.is_started(),
+        "precondition: the source is bound"
+    );
+
+    let mut moved = transfer(
+        TransferInput {
+            session_id: &s,
+            limit: Some(1),
+            source_run_id: &source,
+            run_id: &resumed,
+            async_dir: &resumed_dir,
+        },
+        &options,
+    )
+    .await
+    .expect("transferable")
+    .expect("a handle");
+    let on_disk = read_owner(&slot).await.expect("owner");
+    for owner in [moved.owner(), &on_disk] {
+        assert_eq!(owner.run_id, resumed);
+        assert_eq!(
+            owner.runner_process_instance_id, None,
+            "the source runner's identity does not follow the slot"
+        );
+        assert_eq!(owner.runner_pid, None);
+        assert_eq!(owner.runner_process_start_identity, None);
+        assert_eq!(owner.runner_pid_namespace_scope, None);
+        assert_eq!(owner.runner_started_at, None);
+        assert!(!owner.is_started(), "a transferred slot is unstarted");
+    }
+
+    assert!(
+        moved.rollback().await,
+        "the resumed run never launched, so its reservation goes back to the source"
+    );
+    assert_eq!(read_owner(&slot).await.expect("owner"), bound);
+    assert_eq!(pool_slot_count(&options, &s).await, 1);
+}
+
 #[tokio::test]
 async fn a_transfer_with_no_source_slot_is_an_ordinary_admission() {
     // pi `:513`.

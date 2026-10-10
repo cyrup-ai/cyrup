@@ -183,7 +183,7 @@ pub struct ActiveAsyncCapacityOwner {
     /// spawned runner and means nothing in another namespace.
     ///
     /// cyrup's own, like the pid it qualifies: upstream's owner carries no pid
-    /// (`active-async-capacity.ts:16-31` @ad11b7ab), so it has no owner-pid rung to guard. It is
+    /// (`active-async-capacity.ts:17-31` @ad11b7ab), so it has no owner-pid rung to guard. It is
     /// the owner-side twin of `RunStatus::pid_namespace_scope`, and the release verdict's
     /// owner-pid rung refuses to probe [`Self::runner_pid`] when it differs from the observer's,
     /// exactly as upstream refuses to probe `status.pid` (`:255-256`). `None` on a slot written by
