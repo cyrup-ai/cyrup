@@ -61,7 +61,7 @@ use crate::client::{
     LlamaClient, LlamaModelInfo, LlamaModelStatus, llama_inference_url, normalize_llama_server_url,
 };
 use crate::error::LlamaError;
-use crate::model::{model_is_selectable, to_classifier_model, to_model};
+use crate::model::{is_chat_model, model_is_selectable, to_classifier_model, to_model};
 
 pub use crate::LLAMA_PROVIDER_ID;
 
@@ -575,14 +575,19 @@ impl LlamaProvider {
             .iter()
             .filter(|model| model_is_selectable(model, router_autoload))
             .collect();
-        let refreshed = try_join_all(selectable.iter().map(|model| async {
-            let cached = cached_context_windows.get(&model.id).copied();
-            if model.status.value != LlamaModelStatus::Loaded {
-                return to_model(model, &server_url, None, cached);
-            }
-            let props = client.props(Some(&model.id), ctx.cancel).await?;
-            to_model(model, &server_url, Some(&props), cached)
-        }))
+        // `selectable.filter(isChatModel)` (`provider.ts:269` @f1b2e77f5, EXT-110): a decision-only
+        // model is never a chat model, so its `/props` is not read either; it still gets its
+        // classifier twin below.
+        let refreshed = try_join_all(selectable.iter().filter(|model| is_chat_model(model)).map(
+            |model| async {
+                let cached = cached_context_windows.get(&model.id).copied();
+                if model.status.value != LlamaModelStatus::Loaded {
+                    return to_model(model, &server_url, None, cached);
+                }
+                let props = client.props(Some(&model.id), ctx.cancel).await?;
+                to_model(model, &server_url, Some(&props), cached)
+            },
+        ))
         .await?;
         let refreshed_classifiers: Vec<ClassifierModel> = selectable
             .iter()
@@ -946,8 +951,10 @@ impl LlamaController {
             .iter()
             .filter(|model| model_is_selectable(model, options.router_autoload))
             .collect();
+        // `selectable.filter(isChatModel)` (`provider.ts:178` @f1b2e77f5, EXT-110).
         let models = selectable
             .iter()
+            .filter(|model| is_chat_model(model))
             .map(|model| to_model(model, server_url, None, None))
             .collect::<Result<Vec<_>, _>>()?;
         let classifiers = selectable

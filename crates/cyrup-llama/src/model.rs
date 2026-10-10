@@ -38,6 +38,33 @@ pub fn model_is_selectable(model: &LlamaModelInfo, router_autoload: bool) -> boo
     }
 }
 
+/// Whether llama.cpp reports a native decision model (`isDecisionModel`, `provider.ts:88-90`
+/// @f1b2e77f5): `architecture.output_modalities` includes `"decisions"`. llama.cpp writes
+/// `["decisions"]` for a GGUF whose decision type is set and `["text"]` otherwise
+/// (`server_model_output_modalities`, `tools/server/server-common.cpp:150-163` @b11436), and the
+/// router reads it from the GGUF metadata even for a model that is not running
+/// (`server-models.cpp:567-571`), so unloaded and sleeping entries carry it too. An older server
+/// sends `["text"]` or no `architecture`, and its models are chat models.
+#[must_use]
+pub fn is_decision_model(model: &LlamaModelInfo) -> bool {
+    output_modalities_include(model, "decisions")
+}
+
+/// Whether a catalog entry is offered as a chat model (`isChatModel`, `provider.ts:93-95`
+/// @f1b2e77f5): a decision-ONLY model cannot generate text, so it is a classifier and nothing else.
+#[must_use]
+pub fn is_chat_model(model: &LlamaModelInfo) -> bool {
+    !is_decision_model(model) || output_modalities_include(model, "text")
+}
+
+fn output_modalities_include(model: &LlamaModelInfo, modality: &str) -> bool {
+    model
+        .architecture
+        .as_ref()
+        .and_then(|architecture| architecture.output_modalities.as_ref())
+        .is_some_and(|modalities| modalities.iter().any(|entry| entry == modality))
+}
+
 /// `Number(text)` for the strings `configuredContextWindow` feeds it: surrounding whitespace is
 /// ignored, an empty string is `0`, `0x`/`0o`/`0b` read as radix literals and everything else as a
 /// decimal float. `NaN` stands for "not a number".

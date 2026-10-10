@@ -201,6 +201,48 @@ pub fn loaded_entry(id: &str, args: &[&str]) -> Value {
     })
 }
 
+/// A DECISION model's entry (EXT-110): a GGUF whose decision type is set (OpenJev, lev, Kev,
+/// Nimble, Laya, Clef) reports `architecture.output_modalities: ["decisions"]` — exactly that one
+/// value, never `"text"` beside it (`server_model_output_modalities`,
+/// `server-common.cpp:150-163` @b11436). The router reads it from the GGUF metadata while
+/// discovering the model (`server-models.cpp:567-571`), so a `sleeping` or `unloaded` entry
+/// carries it as well as a `loaded` one; a running child's own `architecture`
+/// (`get_res_model_info`, `server-context.cpp:4894-4919`) replaces both arrays in full
+/// (`server-models.cpp:1330-1345`) with the same value. `meta` is merged only when the entry is
+/// running (`:2128-2135`), so `status` other than `loaded`/`loading`/`sleeping` gets none.
+pub fn decision_entry(id: &str, status: &str) -> Value {
+    let mut entry = json!({
+        "id": id,
+        "aliases": [],
+        "tags": [],
+        "object": "model",
+        "owned_by": "llamacpp",
+        "created": 1_759_000_000_i64,
+        "status": { "value": status, "args": [] },
+        "architecture": { "input_modalities": ["text"], "output_modalities": ["decisions"] },
+        "source": "models_dir",
+        "can_remove": false,
+    });
+    if matches!(status, "loaded" | "loading" | "sleeping")
+        && let Some(object) = entry.as_object_mut()
+    {
+        object.insert(
+            "meta".to_string(),
+            json!({
+                "vocab_type": 2,
+                "n_vocab": 151_936,
+                "n_ctx": 8192,
+                "n_ctx_train": 32_768,
+                "n_embd": 1024,
+                "n_params": 600_000_000_i64,
+                "size": 400_000_000_i64,
+                "ftype": "Q8_0",
+            }),
+        );
+    }
+    entry
+}
+
 /// An `unloaded` preset entry, the autoload candidate `model_is_selectable` accepts
 /// (`server-models.cpp:2095-2126`): `source: "preset"`, `status.preset` holding the rendered ini
 /// (`:2099-2107`) and NO `meta`, because the `loaded_info` merge is gated on `is_running()`.
@@ -803,5 +845,187 @@ mod conformance {
             models_envelope(vec![serde_json::json!({ "id": "x" })]),
             serde_json::json!({ "data": [{ "id": "x" }], "object": "list" })
         );
+    }
+}
+
+// ================================================================================================
+// EXT-110: decision models, through the real controller.
+// ================================================================================================
+
+#[cfg(test)]
+mod decision_models {
+    use std::sync::{Arc, Mutex};
+
+    use serde_json::json;
+
+    use cyrup_core::CancelToken;
+    use cyrup_provider::auth::{Credential, InMemoryCredentialStore, ProviderEnv};
+    use cyrup_provider::{AnyModel, Provider};
+
+    use super::{decision_entry, loaded_entry};
+    use crate::client::LlamaModelInfo;
+    use crate::error::LlamaError;
+    use crate::provider::{
+        CatalogEntry, CatalogPublication, CatalogPublisher, LlamaController,
+        LlamaControllerOptions, LlamaRefreshContext, RegisterProviderFn, SetCatalogOptions,
+    };
+    use crate::tests::fake_server::FakeLlamaServer;
+
+    /// Persist, then update, then answer `true` — pi's test `publish`.
+    #[derive(Default)]
+    struct Publisher(Mutex<Option<CatalogEntry>>);
+
+    #[async_trait::async_trait]
+    impl CatalogPublisher for Publisher {
+        async fn publish(&self, publication: CatalogPublication) -> Result<bool, LlamaError> {
+            if let Some(entry) = publication.persist {
+                *self.0.lock().unwrap() = Some(entry);
+            }
+            if let Some(update) = publication.update {
+                update();
+            }
+            Ok(true)
+        }
+    }
+
+    fn controller() -> LlamaController {
+        let register: RegisterProviderFn = Arc::new(|_: Arc<dyn Provider>| Ok(()));
+        LlamaController::new(LlamaControllerOptions::new(
+            Arc::new(InMemoryCredentialStore::new()),
+            register,
+        ))
+    }
+
+    fn chat_ids(controller: &LlamaController) -> Vec<String> {
+        controller
+            .provider()
+            .models()
+            .iter()
+            .map(|model| model.id.as_str().to_string())
+            .collect()
+    }
+
+    fn classifier_ids(controller: &LlamaController) -> Vec<String> {
+        controller
+            .provider()
+            .get_all_models()
+            .iter()
+            .filter(|model| matches!(model, AnyModel::Classifier(_)))
+            .map(|model| model.id().to_string())
+            .collect()
+    }
+
+    /// pi `exposes decision models reported by the catalog as native System One classifiers`
+    /// (`llama-extension.test.ts`, f6127a1bf), its catalog half: a real router catalog with a
+    /// text model, a loaded and a sleeping decision model and a pre-0.6.0 entry with no
+    /// `architecture`. The decision models are not chat models, their `/props` is never asked
+    /// for, and they stay classifiers.
+    #[tokio::test]
+    async fn a_refresh_lists_decision_models_as_classifiers_only_and_never_reads_their_props() {
+        let server = FakeLlamaServer::start().await;
+        let mut legacy = loaded_entry("legacy", &[]);
+        legacy.as_object_mut().unwrap().remove("architecture");
+        server.set_models(vec![
+            loaded_entry("qwen", &[]),
+            decision_entry("kev", "loaded"),
+            decision_entry("laya", "sleeping"),
+            legacy,
+        ]);
+        server.set_props(json!({}));
+        let mut env = ProviderEnv::new();
+        env.insert("LLAMA_BASE_URL".to_string(), server.url().to_string());
+        let credential = Credential::ApiKey {
+            key: Some("local".to_string()),
+            env: Some(env),
+        };
+        let publisher = Publisher::default();
+        let controller = controller();
+        let cancel = CancelToken::new();
+        controller
+            .provider()
+            .refresh(&LlamaRefreshContext {
+                credential: Some(&credential),
+                stored: None,
+                publisher: &publisher,
+                allow_network: true,
+                cancel: &cancel,
+            })
+            .await
+            .unwrap();
+
+        let mut props: Vec<String> = server
+            .requests_to("GET", "/props")
+            .iter()
+            .map(|request| request.query().unwrap_or_default().to_string())
+            .collect();
+        props.sort();
+        assert_eq!(
+            props,
+            [
+                "model=legacy&autoload=false".to_string(),
+                "model=qwen&autoload=false".to_string()
+            ],
+            "only the chat models' props are read; `kev` is loaded and still not asked"
+        );
+        assert_eq!(chat_ids(&controller), ["qwen", "legacy"]);
+        assert_eq!(
+            classifier_ids(&controller),
+            ["qwen", "kev", "laya", "legacy"]
+        );
+        let persisted: Vec<(String, &'static str)> = publisher
+            .0
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .models
+            .iter()
+            .map(|model| {
+                let kind = match model {
+                    AnyModel::Chat(_) => "chat",
+                    AnyModel::Classifier(_) => "classifier",
+                    AnyModel::Image(_) => "image",
+                };
+                (model.id().to_string(), kind)
+            })
+            .collect();
+        assert_eq!(
+            persisted,
+            [
+                ("qwen".to_string(), "chat"),
+                ("legacy".to_string(), "chat"),
+                ("qwen".to_string(), "classifier"),
+                ("kev".to_string(), "classifier"),
+                ("laya".to_string(), "classifier"),
+                ("legacy".to_string(), "classifier"),
+            ]
+        );
+    }
+
+    /// pi `lists decision models that also output text for chat` (`llama-extension.test.ts`,
+    /// f6127a1bf): `isChatModel` keeps a model that reports `"text"` beside `"decisions"`. No
+    /// llama.cpp release emits that pair (`server-common.cpp:150-163` @b11436 answers one or the
+    /// other), so this pins pi's predicate rather than a router shape.
+    #[test]
+    fn set_catalog_keeps_a_text_and_decisions_model_in_both_lists() {
+        let catalog: Vec<LlamaModelInfo> = [
+            json!({ "id": "decide", "status": { "value": "sleeping" },
+                    "architecture": { "output_modalities": ["decisions"] } }),
+            json!({ "id": "hybrid", "status": { "value": "loaded" },
+                    "architecture": { "output_modalities": ["text", "decisions"] } }),
+        ]
+        .into_iter()
+        .map(|entry| serde_json::from_value(entry).unwrap())
+        .collect();
+        let controller = controller();
+        controller
+            .set_catalog(
+                &catalog,
+                "http://localhost:8080",
+                SetCatalogOptions::default(),
+            )
+            .unwrap();
+        assert_eq!(chat_ids(&controller), ["hybrid"]);
+        assert_eq!(classifier_ids(&controller), ["decide", "hybrid"]);
     }
 }
