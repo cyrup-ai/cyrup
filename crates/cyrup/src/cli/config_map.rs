@@ -185,9 +185,8 @@ impl Cli {
         prompt_diagnostics.extend(append_diags);
         config.append_system_prompt = append;
         config.no_tools = self.no_tools_mode();
-        if !self.tools.is_empty() {
-            config.tools = Some(self.tools.clone());
-        }
+        // `--tools ""` is `Some([])`: pi's empty allowlist, a session with no tools.
+        config.tools = self.tools.clone();
         config.exclude_tools = self.exclude_tools.clone();
         // Thread the captured extension flags (Pi `extensionFlagValues: parsed.unknownFlags`,
         // main.ts:634) onto the config so they reach the session services; a loaded extension reads
@@ -220,16 +219,25 @@ impl Cli {
     /// parsed CLI before any consumer reads these Vecs so every downstream site sees Pi-normalized names.
     ///
     /// The per-flag semantics are 1:1 with Pi:
-    /// - `--models` (`args.ts:115`): `.split(",").map((s) => s.trim())` — trim only, empties KEPT (Pi
-    ///   does not `.filter`; an empty pattern resolves to nothing, and keeping `[""]` for `--models ""`
-    ///   preserves Pi's non-empty `parsed.models` so the `--api-key`-requires-a-model gate matches).
-    /// - `--tools` / `--exclude-tools` (`args.ts:120-129`): `.split(",").map(trim).filter(len > 0)` —
-    ///   trim AND drop empty segments.
+    /// - `--models` (`args.ts:141-145` @v1.0.1, `9b3c19da5` fixing #10334; unchanged @f1b2e77f5):
+    ///   `.split(",").map((s) => s.trim()).filter((pattern) => pattern.length > 0)` — trim AND drop
+    ///   empty entries (SEAM-147). The flag stays SUPPLIED: `--models ""` is `Some([])`, pi's truthy
+    ///   `[]`, which skips both the `enabledModels` fallback and scoping
+    ///   (`parsed.models ?? settingsManager.getEnabledModels()`, `main.ts:812-815` @f1b2e77f5) — the
+    ///   only pi gate that reads `--models` supplied-ness. The `--api-key` check and the
+    ///   fresh-session default launch read the RESOLVED scope instead, as pi's do
+    ///   (`session_launch::api_key_target`, [`crate::bootstrap::resolve_default_launch_model`]).
+    /// - `--tools` / `--exclude-tools` (`args.ts:151-165` @f1b2e77f5): `.split(",").map(trim)
+    ///   .filter(len > 0)` — trim AND drop empty segments. `--tools` stays SUPPLIED when every
+    ///   entry is dropped (`Some([])`, pi's `result.tools = []`), which pi's `sdk.ts:280-293`
+    ///   turns into an empty selection and allowlist.
     pub fn normalize_list_flags(&mut self) {
-        for pattern in &mut self.models {
-            *pattern = pattern.trim().to_string();
-        }
-        for list in [&mut self.tools, &mut self.exclude_tools] {
+        for list in self
+            .models
+            .iter_mut()
+            .chain(self.tools.iter_mut())
+            .chain([&mut self.exclude_tools])
+        {
             list.iter_mut()
                 .for_each(|name| *name = name.trim().to_string());
             list.retain(|name| !name.is_empty());

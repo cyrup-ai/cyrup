@@ -2656,3 +2656,389 @@ async fn a_static_late_provider_begins_nothing_and_a_re_registered_removed_id_re
     assert_eq!(phases(&seen), vec![false]);
     assert_eq!(ids(&registry.models()), vec!["cached".to_string()]);
 }
+
+// -------------------------------------------------------------------------------------------------
+// SEAM-145: a publication superseded between `publish_queued`'s check and its update's registry
+// write does not win
+// -------------------------------------------------------------------------------------------------
+
+/// What a provider's `publish` returned (`Err` as its `Display`); `None` until it returned.
+type PublishResult = Mutex<Option<Result<bool, String>>>;
+
+/// A provider whose refresh publishes one update that, from INSIDE the update (so after
+/// `publish_queued`'s last `is_current` check and before the update's own registry write), lets
+/// `competitor` run on another thread to completion, and then re-registers `id` with a STALE
+/// catalog, as a provider's `update` does.
+///
+/// The competitor runs on a scoped thread: `PUBLISHING` is a thread-local, so it is a genuine
+/// outside writer, placed exactly in the window with no sleep and no test hook.
+///
+/// The returned cell holds what the provider's `publish` returned for that update (`Err` as its
+/// `Display`).
+fn stale_after(
+    registry: &Arc<GuestProviderRegistry>,
+    competitor: Arc<dyn Fn(&GuestProviderRegistry) + Send + Sync>,
+) -> (Script, Arc<PublishResult>) {
+    let registry = Arc::clone(registry);
+    let published = Arc::new(Mutex::new(None));
+    let record = Arc::clone(&published);
+    let script = script(move |ctx| {
+        let registry = Arc::clone(&registry);
+        let competitor = Arc::clone(&competitor);
+        let record = Arc::clone(&record);
+        Box::pin(async move {
+            let landed = ctx
+                .publish(ModelsPublication {
+                    persist: None,
+                    update: Some(Box::new(move || {
+                        std::thread::scope(|s| {
+                            s.spawn(|| competitor(&registry)).join().unwrap();
+                        });
+                        registry.upsert_live_provider(LLAMA, plain_provider(LLAMA, &["stale"]));
+                    })),
+                })
+                .await
+                .map_err(|e| e.to_string());
+            *record.lock().unwrap() = Some(landed);
+            Ok(())
+        })
+    });
+    (script, published)
+}
+
+/// The provider of a publication superseded inside its own `update` is never told it landed: the
+/// bump that superseded it cancelled the phase signal, so `publish` answers `Aborted`.
+fn assert_superseded_publish_aborted(published: &PublishResult) {
+    let result = published.lock().unwrap().clone();
+    let aborted = ProviderError::Aborted.to_string();
+    assert_eq!(
+        result,
+        Some(Err(aborted)),
+        "the provider of a dropped stale publication must not be told it landed"
+    );
+}
+
+/// SEAM-145's Verify: "a test that re-registers an id between the check and the update and asserts
+/// the stale update does not win". pi runs its re-check and `update` in one synchronous turn
+/// (`packages/ai/src/models.ts:521-522` @f1b2e77f5), so the newer registration always wins there.
+#[tokio::test]
+async fn a_re_registration_between_the_publication_check_and_its_update_beats_the_stale_update() {
+    let registry = registry_over(Arc::new(InMemoryModelsStore::new()));
+    let (stale, published) = stale_after(
+        &registry,
+        Arc::new(|r: &GuestProviderRegistry| {
+            r.upsert_live_provider(LLAMA, plain_provider(LLAMA, &["newer"]));
+        }),
+    );
+    let (provider, _) = scripted(LLAMA, &["boot"], None, stale);
+    register(&registry, provider);
+    let swap = Arc::new(crate::ProviderSwap::new(
+        registry.provider(LLAMA).unwrap(),
+        None,
+    ));
+    registry.follow_installed(&swap);
+
+    let _ = registry.refresh(request(Some(&[LLAMA]), Some(false))).await;
+    settle(&registry).await;
+
+    assert_eq!(
+        ids(&registry.models()),
+        vec!["newer".to_string()],
+        "the stale update overwrote the newer registration"
+    );
+    assert_eq!(
+        ids(swap.current().models()),
+        vec!["newer".to_string()],
+        "the installed slot holds the newer provider"
+    );
+    assert_superseded_publish_aborted(&published);
+}
+
+/// The same window with a REMOVAL as the newer writer: the stale update must not resurrect it.
+#[tokio::test]
+async fn a_removal_between_the_publication_check_and_its_update_is_not_undone_by_the_stale_update()
+{
+    let registry = registry_over(Arc::new(InMemoryModelsStore::new()));
+    let (stale, published) = stale_after(
+        &registry,
+        Arc::new(|r: &GuestProviderRegistry| r.remove_provider(LLAMA)),
+    );
+    let (provider, _) = scripted(LLAMA, &["boot"], None, stale);
+    register(&registry, provider);
+
+    let _ = registry.refresh(request(Some(&[LLAMA]), Some(false))).await;
+    settle(&registry).await;
+
+    assert!(
+        !registry.has_provider(LLAMA),
+        "the stale update resurrected a removed provider: {:?}",
+        ids(&registry.models())
+    );
+    assert_superseded_publish_aborted(&published);
+}
+
+/// Control for the `publish` result: an update nothing supersedes reports `true`.
+#[tokio::test]
+async fn an_unsuperseded_publication_reports_that_it_landed() {
+    let registry = registry_over(Arc::new(InMemoryModelsStore::new()));
+    let (stale, published) = stale_after(&registry, Arc::new(|_: &GuestProviderRegistry| {}));
+    let (provider, _) = scripted(LLAMA, &["boot"], None, stale);
+    register(&registry, provider);
+
+    let _ = registry.refresh(request(Some(&[LLAMA]), Some(false))).await;
+    settle(&registry).await;
+
+    assert_eq!(ids(&registry.models()), vec!["stale".to_string()]);
+    assert_eq!(*published.lock().unwrap(), Some(Ok(true)));
+}
+
+// -------------------------------------------------------------------------------------------------
+// SEAM-146: a registration from a thread with no tokio runtime still restores
+// -------------------------------------------------------------------------------------------------
+
+/// SEAM-146's Verify: "a registration from outside a runtime either restores or reports". It
+/// restores: the late restore runs on the runtime the startup restore recorded. pi has one event
+/// loop, so its `void this.refresh({ allowNetwork: false })` (`core/model-runtime.ts:895`, `:941`
+/// @f1b2e77f5) is always scheduled.
+#[tokio::test]
+async fn a_provider_registered_from_a_thread_without_a_runtime_still_restores_its_cached_models() {
+    let registry = registry_over(store_with(LLAMA, &["cached"]).await);
+    registry.restore_cached(CancelToken::new()).await;
+    let (provider, seen) = scripted(
+        LLAMA,
+        &["boot"],
+        Some(url_auth()),
+        restore_stored_catalog(&registry, LLAMA),
+    );
+
+    let r = Arc::clone(&registry);
+    std::thread::spawn(move || {
+        assert!(tokio::runtime::Handle::try_current().is_err());
+        register(&r, provider);
+    })
+    .join()
+    .unwrap();
+    settle(&registry).await;
+
+    assert_eq!(ids(&registry.models()), vec!["cached".to_string()]);
+    assert_eq!(
+        phases(&seen),
+        vec![false],
+        "one cache-only phase, no network"
+    );
+}
+
+/// A provider whose cache-only phase does what llama's does (the stored catalog becomes the live
+/// one) AND stays refreshable afterwards: its update re-registers another of itself. A removal or
+/// a virtual-model change re-restores only providers that are still refreshable, so the plain
+/// replacement [`restore_stored_catalog`] installs would hide a second restore.
+fn self_restoring(
+    registry: &Arc<GuestProviderRegistry>,
+    id: &'static str,
+    ids_now: &[&str],
+) -> (Arc<Scripted>, Arc<Mutex<Vec<Seen>>>) {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let cell: Arc<std::sync::OnceLock<Script>> = Arc::new(std::sync::OnceLock::new());
+    let weak = Arc::downgrade(registry);
+    let script_cell = Arc::clone(&cell);
+    let script_seen = Arc::clone(&seen);
+    let the_script = script(move |ctx| {
+        let weak = weak.clone();
+        let cell = Arc::clone(&script_cell);
+        let seen = Arc::clone(&script_seen);
+        Box::pin(async move {
+            let Some(stored) = ctx.stored.clone() else {
+                return Ok(());
+            };
+            let stored_ids = ids(&stored.models);
+            ctx.publish(ModelsPublication {
+                persist: None,
+                update: Some(Box::new(move || {
+                    let Some(registry) = weak.upgrade() else {
+                        return;
+                    };
+                    let refs: Vec<&str> = stored_ids.iter().map(String::as_str).collect();
+                    let next = Arc::new(Scripted {
+                        id: id.into(),
+                        inner: plain_provider(id, &refs),
+                        auth: None,
+                        script: Arc::clone(cell.get().unwrap()),
+                        seen,
+                    });
+                    registry.upsert_live_provider(id, next);
+                })),
+            })
+            .await?;
+            Ok(())
+        })
+    });
+    let _ = cell.set(Arc::clone(&the_script));
+    let provider = Arc::new(Scripted {
+        id: id.into(),
+        inner: plain_provider(id, ids_now),
+        auth: None,
+        script: the_script,
+        seen: Arc::clone(&seen),
+    });
+    (provider, seen)
+}
+
+/// The store `self_restoring` providers read, with `id`'s entry rewritten to `models`.
+async fn rewrite(store: &InMemoryModelsStore, id: &str, models: &[&str]) {
+    store
+        .write(
+            id,
+            ModelsStoreEntry {
+                models: catalog(id, models),
+                checked_at: Some(6),
+                ..ModelsStoreEntry::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+}
+
+const OTHER: &str = "other";
+
+/// A registry whose startup restore has run over `OTHER` (a `self_restoring` provider) with the
+/// stored `v1`, so `OTHER` lists `v1`.
+async fn restored_other() -> (
+    Arc<GuestProviderRegistry>,
+    Arc<InMemoryModelsStore>,
+    Arc<Mutex<Vec<Seen>>>,
+) {
+    let store = store_with(OTHER, &["v1"]).await;
+    let registry = registry_over(store.clone());
+    let (provider, seen) = self_restoring(&registry, OTHER, &["boot"]);
+    register(&registry, provider);
+    registry.restore_cached(CancelToken::new()).await;
+    settle(&registry).await;
+    assert_eq!(ids(&registry.models()), vec!["v1".to_string()]);
+    assert_eq!(phases(&seen), vec![false]);
+    (registry, store, seen)
+}
+
+/// A router that is never asked to route here.
+struct NoRoute;
+
+#[async_trait::async_trait]
+impl cyrup_provider::ModelRouter for NoRoute {
+    async fn route(
+        &self,
+        _request: cyrup_provider::ModelRouteRequest<'_>,
+    ) -> Result<cyrup_provider::ModelRoute, cyrup_provider::ModelRouteError> {
+        Err(cyrup_provider::ModelRouteError::new(
+            "not routed in this test",
+        ))
+    }
+}
+
+fn router_definition() -> cyrup_provider::VirtualModelDefinition {
+    cyrup_provider::VirtualModelDefinition::new(
+        cyrup_provider::VirtualModelSpec {
+            provider: "router".into(),
+            id: "auto".into(),
+            name: "Auto".to_string(),
+            thinking_levels: None,
+            context_window: None,
+            max_tokens: None,
+            input: None,
+        },
+        Arc::new(NoRoute),
+    )
+}
+
+/// The session's virtual-model registry with the builder's listener installed (`builder.rs`'s
+/// `set_listener(CachedRestoreOnVirtualChange::new(..))`).
+fn virtual_registry_over(
+    registry: &Arc<GuestProviderRegistry>,
+) -> Arc<cyrup_provider::VirtualModelRegistry> {
+    let virtuals = Arc::new(cyrup_provider::VirtualModelRegistry::new());
+    virtuals.set_listener(Arc::new(
+        crate::virtual_models::CachedRestoreOnVirtualChange::new(registry, CancelToken::new()),
+    ));
+    virtuals
+}
+
+/// SEAM-146 for the virtual-model listener (it had the same `Handle::try_current()` guard): a
+/// virtual model registered from a thread with no runtime still fires pi's cache-only refresh
+/// (`core/model-runtime.ts:975` @f1b2e77f5).
+#[tokio::test]
+async fn a_virtual_model_registered_from_a_thread_without_a_runtime_still_restores_the_catalogs() {
+    let (registry, store, seen) = restored_other().await;
+    rewrite(&store, OTHER, &["v2"]).await;
+    let virtuals = virtual_registry_over(&registry);
+
+    std::thread::spawn(move || {
+        assert!(tokio::runtime::Handle::try_current().is_err());
+        virtuals
+            .register(router_definition(), &cyrup_provider::NoCatalog)
+            .unwrap();
+    })
+    .join()
+    .unwrap();
+    settle(&registry).await;
+
+    assert_eq!(ids(&registry.models()), vec!["v2".to_string()]);
+    assert_eq!(phases(&seen), vec![false, false], "cache-only, no network");
+}
+
+// -------------------------------------------------------------------------------------------------
+// SEAM-144: removing a provider, and registering or unregistering a virtual model, re-restores the
+// other providers' cached catalogs
+// -------------------------------------------------------------------------------------------------
+
+/// SEAM-144's Verify: "removing a provider restores the others' cached catalogs as pi does". pi's
+/// `unregisterProvider` ends in `void this.refresh({ allowNetwork: false })`
+/// (`core/model-runtime.ts:949` @f1b2e77f5), a whole-registry cache-only refresh
+/// (`packages/ai/src/models.ts:558-565`, `:577`). The store is rewritten between the startup restore
+/// and the removal, so "restored again" is visible as a catalog change.
+#[tokio::test]
+async fn removing_a_provider_restores_the_others_cached_catalogs() {
+    let (registry, store, seen) = restored_other().await;
+    rewrite(&store, OTHER, &["v2"]).await;
+    registry.upsert_live_provider("gone", plain_provider("gone", &["g"]));
+    assert_eq!(registry.refresh_tasks_in_flight(), 0);
+
+    registry.remove_provider("gone");
+    settle(&registry).await;
+
+    assert_eq!(ids(&registry.models()), vec!["v2".to_string()]);
+    assert_eq!(phases(&seen), vec![false, false], "cache-only, no network");
+}
+
+/// The virtual half of SEAM-144, already wired before this row closed
+/// (`CachedRestoreOnVirtualChange`, installed by the builder): registering and unregistering a
+/// virtual model each re-restore the cached catalogs, as pi's `registerVirtualModel` /
+/// `unregisterVirtualModel` do (`core/model-runtime.ts:975`, `:984` @f1b2e77f5). It proves
+/// `spawn_restore_cached`'s ticket: RED with the listener's base spawn restored (an uncounted
+/// `Handle::try_current()` task, so `settle` returned before it ran): `["v1"]` for `["v2"]`.
+#[tokio::test]
+async fn registering_and_unregistering_a_virtual_model_restores_the_cached_catalogs() {
+    let (registry, store, seen) = restored_other().await;
+    let virtuals = virtual_registry_over(&registry);
+
+    rewrite(&store, OTHER, &["v2"]).await;
+    virtuals
+        .register(router_definition(), &cyrup_provider::NoCatalog)
+        .unwrap();
+    settle(&registry).await;
+    assert_eq!(ids(&registry.models()), vec!["v2".to_string()]);
+
+    rewrite(&store, OTHER, &["v3"]).await;
+    assert!(virtuals.unregister("router", "auto"));
+    settle(&registry).await;
+    assert_eq!(ids(&registry.models()), vec!["v3".to_string()]);
+
+    // pi's no-op arm (`:980`): an absent pair fires no refresh.
+    rewrite(&store, OTHER, &["v4"]).await;
+    assert!(!virtuals.unregister("router", "auto"));
+    settle(&registry).await;
+    assert_eq!(ids(&registry.models()), vec!["v3".to_string()]);
+    assert_eq!(
+        phases(&seen),
+        vec![false, false, false],
+        "cache-only, no network"
+    );
+}

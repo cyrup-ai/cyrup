@@ -31,8 +31,28 @@ where
     // never see a post-`--` token. Without this latch `cyrup -p -- -nc` delivered the message
     // `--no-context-files`, i.e. silently different text, where pi delivers `-nc` verbatim.
     let mut end_of_options = false;
-    for arg in args.into_iter().map(Into::into) {
+    // SEAM-152 — the token after one of pi's unconditional value flags is that flag's VALUE: pi's
+    // arm takes it with `args[++i]` before any alias arm can see it (`cli/args.ts:115-131`,
+    // `:134-176`, `:184-201` @f1b2e77f5), so `--name -nc` names the session `-nc` and `-xt -nt`
+    // excludes a tool named `-nt`. Checked BEFORE the `--` latch: `--name --` takes `--` as the name.
+    let mut value_next = false;
+    let args: Vec<String> = args.into_iter().map(Into::into).collect();
+    let last = args.len().saturating_sub(1);
+    for (idx, arg) in args.into_iter().enumerate() {
         if end_of_options {
+            out.push(arg);
+            continue;
+        }
+        if value_next {
+            value_next = false;
+            out.push(arg);
+            continue;
+        }
+        value_next = UNCONDITIONAL_VALUE_FLAGS.contains(&arg.as_str());
+        // A trailing `-xt` has no value, so pi's `-xt` arm (guarded by `i + 1 < args.length`) does not
+        // match and the token is `Unknown option: -xt` (`args.ts:263-264`). Left as typed, so
+        // `apply_arg_leniency` reports it under that spelling.
+        if arg == "-xt" && idx == last {
             out.push(arg);
             continue;
         }
@@ -77,6 +97,44 @@ where
     normalize_short_aliases(raw)
 }
 
+/// pi's value-taking flags whose arm consumes the next token whatever it looks like (`args[++i]`,
+/// guarded only by `i + 1 < args.length`): `cli/args.ts:115-131` (`--provider`, `--model`,
+/// `--api-key`, `--system-prompt`, `--append-system-prompt`, `--name`/`-n`), `:134-176` (`--session`,
+/// `--session-id`, `--fork`, `--session-dir`, `--models`, `--tools`/`-t`, `--exclude-tools`/`-xt`,
+/// `--thinking`) and `:184-201` (`--export`, `--extension`/`-e`, `--skill`, `--prompt-template`,
+/// `--theme`) @f1b2e77f5. SEAM-152. The exceptions inspect the token and are NOT here: `--mode`
+/// (`:96-110`), `--use-theme`, `--tui-mode` (`apply_arg_leniency`'s own arms), `--list-models` and
+/// `-p` (which take it only when it does not start with `-`).
+pub(crate) const UNCONDITIONAL_VALUE_FLAGS: &[&str] = &[
+    "--provider",
+    "--model",
+    "--api-key",
+    "--system-prompt",
+    "--append-system-prompt",
+    "--name",
+    "-n",
+    "--session",
+    "--session-id",
+    "--fork",
+    "--session-dir",
+    "--models",
+    "--tools",
+    "-t",
+    "--exclude-tools",
+    "-xt",
+    "--thinking",
+    "--export",
+    "--extension",
+    "-e",
+    "--skill",
+    "--prompt-template",
+    "--theme",
+];
+
+/// The single-dash members of [`UNCONDITIONAL_VALUE_FLAGS`] clap knows (`-xt` is rewritten to its
+/// long form before this point).
+const SHORT_VALUE_FLAGS: &[&str] = &["-n", "-t", "-e"];
+
 /// Partition `argv` (program name already stripped, short-aliases already normalized) into the args
 /// clap should parse and the captured unknown `--flag[=val]` extension flags — a 1:1 port of Pi's
 /// hand-rolled unknown-flag arm (args.ts:188-201). A `--flag=val` captures `(flag,val)`; a bare
@@ -114,6 +172,20 @@ pub fn partition_extension_flags(argv: &[String]) -> (Vec<String>, Vec<Extension
                     i += 2;
                     continue;
                 }
+                // SEAM-152 — one of pi's unconditional value flags with NOTHING after it: pi's own arm
+                // is guarded by `i + 1 < args.length`, so the flag falls into `unknownFlags` as
+                // `true` (`args.ts:250-262` @f1b2e77f5) and is reported at runtime as `Unknown
+                // option: --<name>` unless an extension owns it (`agent-session-services.ts:120-123`).
+                if !arg.contains('=')
+                    && argv.get(i + 1).is_none()
+                    && UNCONDITIONAL_VALUE_FLAGS.contains(&arg.as_str())
+                {
+                    clean.pop();
+                    flags.push(ExtensionFlag {
+                        name: stripped.to_string(),
+                        value: ExtFlagValue::Bool(true),
+                    });
+                }
                 i += 1;
                 continue;
             }
@@ -142,6 +214,16 @@ pub fn partition_extension_flags(argv: &[String]) -> (Vec<String>, Vec<Extension
                     i += 1;
                 }
             }
+            continue;
+        }
+        // SEAM-152 — a short value flag takes its next token verbatim (pi `args[++i]`), so a
+        // `--`-leading value is not captured as an extension flag.
+        if SHORT_VALUE_FLAGS.contains(&arg.as_str())
+            && let Some(next) = argv.get(i + 1)
+        {
+            clean.push(arg.clone());
+            clean.push(next.clone());
+            i += 2;
             continue;
         }
         clean.push(arg.clone());

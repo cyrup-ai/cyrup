@@ -79,8 +79,8 @@ pub use settings::{
     DEVICE_ID_KEY, DefaultProjectTrust, DeviceIdDecision, EffectiveSettings, FileSettingsStore,
     InMemorySettingsStore, InstallationId, InstallationIdParseError, InstallationIdSupplier,
     MermaidRenderingMode, PackageSource, RetrySettings, Settings, SettingsManager, SettingsScope,
-    SettingsStore, deep_merge, deep_merge_settings, migrate_settings, parse_http_idle_timeout_ms,
-    resolve_default_tools,
+    SettingsStore, apply_tool_modifiers, deep_merge, deep_merge_settings, get_tool_list_error,
+    is_tool_modifier, migrate_settings, parse_http_idle_timeout_ms, resolve_default_tools,
 };
 pub use text::strip_bom;
 pub use trust::{

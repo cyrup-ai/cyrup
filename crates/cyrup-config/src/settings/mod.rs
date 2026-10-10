@@ -30,7 +30,8 @@ mod types;
 mod tests;
 
 pub use default_tools::{
-    DEFAULT_TOOL_NAMES, is_tool_modifier, merge_default_tools, resolve_default_tools,
+    DEFAULT_TOOL_NAMES, apply_tool_modifiers, get_tool_list_error, is_tool_modifier,
+    merge_default_tools, resolve_default_tools,
 };
 pub use effective::{DEFAULT_HTTP_IDLE_TIMEOUT_MS, EffectiveSettings, parse_http_idle_timeout_ms};
 pub use installation::{

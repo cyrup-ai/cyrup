@@ -36,7 +36,11 @@ fn tool_flags_map_to_no_tools_modes_and_lists() {
     let cli = parse(&["--tools", "read,grep,find", "--exclude-tools", "bash"]);
     assert_eq!(
         cli.tools,
-        vec!["read".to_string(), "grep".to_string(), "find".to_string()]
+        Some(vec![
+            "read".to_string(),
+            "grep".to_string(),
+            "find".to_string()
+        ])
     );
     assert_eq!(cli.exclude_tools, vec!["bash".to_string()]);
 }

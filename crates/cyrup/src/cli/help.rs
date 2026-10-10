@@ -94,6 +94,7 @@ Options:
   --no-builtin-tools, -nbt       Disable built-in tools by default but keep extension/custom tools enabled
   --tools, -t <tools>            Comma-separated allowlist of tool names to enable
                                  Applies to built-in, extension, and custom tools
+                                 Only +name/-name entries add to or remove from the defaults
   --exclude-tools, -xt <tools>   Comma-separated denylist of tool names to disable
                                  Applies to built-in, extension, and custom tools
   --thinking <level>             Set thinking level: off, minimal, low, medium, high, xhigh, max
@@ -174,6 +175,9 @@ Examples:
 
   # Read-only mode (no file modifications possible)
   {APP} --tools read,grep,find,ls -p \"Review the code in src/\"
+
+  # Add codemode to the default tools
+  {APP} --tools +codemode
 
   # Disable one tool while keeping the rest available
   {APP} --exclude-tools ask_question

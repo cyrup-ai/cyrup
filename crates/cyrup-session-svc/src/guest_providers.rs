@@ -83,6 +83,12 @@ pub struct GuestProviderRegistry {
     /// (`model-runtime.ts:179`); the catalog is the two reads pi's `registerVirtualModel` takes off
     /// `this` (`:957`, `:962-968`).
     virtual_models: Mutex<Option<VirtualModelSink>>,
+    /// SEAM-146 — the runtime the startup restore ran on, recorded by
+    /// [`GuestProviderRegistry::restore_cached`] BEFORE it sets `restore_started`, so "the startup
+    /// restore has begun" implies "there is a runtime to spawn a restore on". A registration made
+    /// from a thread with no tokio runtime current spawns its restore here (see
+    /// [`GuestProviderRegistry::runtime_handle`]).
+    restore_runtime: Mutex<Option<tokio::runtime::Handle>>,
 }
 
 /// What [`GuestProviderRegistry::attach_virtual_models`] binds: the registry a registration lands
@@ -235,15 +241,24 @@ thread_local! {
     /// `models.ts:399-402`). The refresh that is PUBLISHING that update must not be superseded by
     /// it, or the second publish of a restore-then-network refresh could never land. The update
     /// closure is synchronous, so a thread-local names it exactly.
-    static PUBLISHING: RefCell<Option<String>> = const { RefCell::new(None) };
+    ///
+    /// It carries the publication's refresh GENERATION as well (SEAM-145), so the registry write the
+    /// update makes can re-check, under the provider-map lock, that the publication is still the
+    /// current one (see [`GuestProviderRegistry::stale_publication`]).
+    static PUBLISHING: RefCell<Option<(String, u64)>> = const { RefCell::new(None) };
+}
+
+/// Whether the update running on this thread is publishing for `id` (any generation).
+fn publishing_id_is(id: &str) -> bool {
+    PUBLISHING.with(|slot| slot.borrow().as_ref().is_some_and(|(p, _)| p == id))
 }
 
 /// Restores [`PUBLISHING`] to what it was, even if the update unwinds.
-struct PublishingGuard(Option<String>);
+struct PublishingGuard(Option<(String, u64)>);
 
 impl PublishingGuard {
-    fn enter(id: &str) -> Self {
-        Self(PUBLISHING.with(|slot| slot.borrow_mut().replace(id.to_string())))
+    fn enter(id: &str, generation: u64) -> Self {
+        Self(PUBLISHING.with(|slot| slot.borrow_mut().replace((id.to_string(), generation))))
     }
 }
 
@@ -450,13 +465,24 @@ impl RefreshInner {
             None => {}
         }
 
+        // pi re-checks here and runs `update` in the same synchronous turn (`models.ts:521-522`
+        // @f1b2e77f5), so nothing can supersede in between. Here another thread can, so this check
+        // is only the cheap early-out: the DECISIVE one is made again by the registry write the
+        // update performs, under the provider-map lock that every registry writer bumps the
+        // generation under ([`GuestProviderRegistry::stale_publication`], SEAM-145).
         if signal.is_cancelled() || !self.is_current(id, generation) {
             return Ok(false);
         }
         if let Some(update) = publication.update {
-            let _publishing = PublishingGuard::enter(id);
+            let _publishing = PublishingGuard::enter(id, generation);
             update();
         }
+        // This `Ok(true)` does NOT reach a provider whose update was superseded mid-call: every
+        // generation bump (`RefreshInner::supersede` / `begin`) cancels the superseded refresh's
+        // controller in the same `slots` critical section, so by the time `stale_publication`
+        // can see a stale generation the phase signal is already cancelled, and
+        // `PhasePublisher::publish`'s `biased` select answers `Err(ProviderError::Aborted)`
+        // (pinned by the SEAM-145 tests).
         Ok(true)
     }
 
@@ -742,41 +768,74 @@ impl ModelsPublisher for PhasePublisher {
     }
 }
 
-/// A cache-only refresh of a provider registered after startup, begun but not yet running.
-struct LateRestore {
+/// Cache-only refreshes, BEGUN (generation bumped, controller installed, ticket taken) but not yet
+/// running: a provider registered after startup (SEAM-141), or every provider left after a removal
+/// (SEAM-144). Begun synchronously on the registering thread and spawned afterwards, so whatever
+/// begins later supersedes these, never the other way round.
+struct CachedRestore {
     inner: Arc<RefreshInner>,
+    drives: Vec<CachedDrive>,
+    runtime: tokio::runtime::Handle,
+}
+
+/// One provider's begun cache-only refresh inside a [`CachedRestore`].
+struct CachedDrive {
     id: String,
     provider: Arc<dyn Provider>,
     begun: (u64, CancelToken),
     ticket: TaskTicket,
-    runtime: tokio::runtime::Handle,
 }
 
-impl LateRestore {
-    /// Run it detached, as pi's `void this.refresh({ allowNetwork: false })` does
-    /// (`core/model-runtime.ts:893`, `:939`): its outcome is nobody's to read, and a failing
-    /// restore leaves the provider as it registered.
+impl CachedRestore {
+    /// Run them detached, as pi's `void this.refresh({ allowNetwork: false })` does
+    /// (`core/model-runtime.ts:895`, `:941`, `:949` @f1b2e77f5): the outcome is nobody's to read,
+    /// and a failing restore leaves the provider as it was.
     fn spawn(self) {
         let Self {
             inner,
+            drives,
+            runtime,
+        } = self;
+        for CachedDrive {
             id,
             provider,
             begun,
             ticket,
-            runtime,
-        } = self;
-        runtime.spawn(async move {
-            let _ticket = ticket;
-            let _ = inner.drive(id, provider, begun, false, false).await;
-        });
+        } in drives
+        {
+            let inner = Arc::clone(&inner);
+            runtime.spawn(async move {
+                let _ticket = ticket;
+                let _ = inner.drive(id, provider, begun, false, false).await;
+            });
+        }
     }
 }
 
 impl GuestProviderRegistry {
+    /// SEAM-146 — the runtime a registration's detached restore is spawned on: the caller's own
+    /// when it has one, else the one the startup restore ran on.
+    ///
+    /// pi has one event loop, so its `void this.refresh(...)` (`core/model-runtime.ts:895`, `:941`,
+    /// `:949`, `:975`, `:984` @f1b2e77f5) is always scheduled. Here a guest can register from any
+    /// thread (`ExtensionRegistry::register_provider` / `register_virtual_model` are synchronous),
+    /// and `Handle::try_current()` alone silently skipped the restore for a thread with no runtime.
+    /// `None` only when neither exists, which no restore path reaches after the startup restore has
+    /// begun (it records its runtime first); the callers report that case rather than drop it.
+    ///
+    /// One corner stays: a recorded handle whose runtime has since shut down accepts the spawn and
+    /// drops the task (its [`TaskTicket`] is released on drop). There is then no session left to
+    /// list the catalog in.
+    pub(crate) fn runtime_handle(&self) -> Option<tokio::runtime::Handle> {
+        tokio::runtime::Handle::try_current()
+            .ok()
+            .or_else(|| poison_safe(&self.restore_runtime).clone())
+    }
+
     /// pi's registration-time restore (SEAM-141): `registerNativeProvider` / `registerProvider`
-    /// end in `void this.refresh({ allowNetwork: false })` (`core/model-runtime.ts:893`, `:939`
-    /// @v0.99.2-17, same lines at v1.0.0-25), so a provider that registers after startup lists its
-    /// cached catalog at once. `None` when nothing is to be restored.
+    /// end in `void this.refresh({ allowNetwork: false })` (`core/model-runtime.ts:895`, `:941`
+    /// @f1b2e77f5), so a provider that registers after startup lists its cached catalog at once.
+    /// `None` when nothing is to be restored.
     ///
     /// `[CYRUP-DELTA]` pi restores on EVERY registration, because a pi provider changes its own
     /// catalog in place and no re-registration is involved. Here a catalog change IS a
@@ -789,39 +848,158 @@ impl GuestProviderRegistry {
     /// functionality is the same: a provider registered late with a stored catalog lists it.
     ///
     /// Also skipped before the startup restore has begun (it covers everything registered until
-    /// then), for a static provider (pi's `refreshModels === undefined` filter), and when there is
-    /// no tokio runtime to run it on (a registration made from outside one has nothing to spawn on;
-    /// such a provider is covered by the startup restore if it registered before it).
-    fn begin_late_restore(&self, id: &str, provider: &Arc<dyn Provider>) -> Option<LateRestore> {
+    /// then) and for a static provider (pi's `refreshModels === undefined` filter). A registration
+    /// from a thread with no tokio runtime runs on the startup restore's runtime (SEAM-146, see
+    /// [`Self::runtime_handle`]).
+    fn begin_late_restore(&self, id: &str, provider: &Arc<dyn Provider>) -> Option<CachedRestore> {
         if !self.restore_started.load(Ordering::SeqCst)
             || !provider.has_refresh_models()
-            || PUBLISHING.with(|slot| slot.borrow().as_deref() == Some(id))
+            || publishing_id_is(id)
         {
             return None;
         }
-        let runtime = tokio::runtime::Handle::try_current().ok()?;
+        let Some(runtime) = self.runtime_handle() else {
+            // SEAM-146's "reports" arm: unreachable once `restore_started` is set (the startup
+            // restore recorded its runtime first), kept so a skip can never again be silent.
+            tracing::warn!(
+                provider = id,
+                "no tokio runtime to restore the cached catalog of a late-registered provider on"
+            );
+            return None;
+        };
         let inner = Arc::clone(&self.refresh);
         // The caller token is one nobody cancels: there is no caller to abort it.
         let begun = inner.begin(id, &CancelToken::new());
         let ticket = TaskTicket::new(&inner);
-        Some(LateRestore {
+        Some(CachedRestore {
             inner,
-            id: id.to_string(),
-            provider: Arc::clone(provider),
-            begun,
-            ticket,
+            drives: vec![CachedDrive {
+                id: id.to_string(),
+                provider: Arc::clone(provider),
+                begun,
+                ticket,
+            }],
             runtime,
         })
     }
 
+    /// SEAM-144 — pi's `unregisterProvider` ends in `void this.refresh({ allowNetwork: false })`
+    /// (`core/model-runtime.ts:944-950`, the call at `:949` @f1b2e77f5), a WHOLE-registry refresh:
+    /// `models.refresh` with no `providers` begins a cache-only refresh of every refreshable
+    /// provider (`packages/ai/src/models.ts:558-565`, `:577`). This begins the same over `remaining`
+    /// (the map after the removal, still locked by the caller), so a removal re-publishes the other
+    /// providers' cached catalogs.
+    ///
+    /// pi-parity, stated: like pi's `beginProviderRefresh` (`models.ts:565`) this supersedes each
+    /// other provider's in-flight refresh and republishes its STORED catalog — the clobber
+    /// SEAM-141 refused for a same-id RE-registration. It is accepted here because it is what pi
+    /// does on a removal and what the virtual-model listener
+    /// ([`crate::virtual_models::CachedRestoreOnVirtualChange`]) already does on
+    /// `registerVirtualModel` / `unregisterVirtualModel` (`:975`, `:984`).
+    ///
+    /// `[CYRUP-DELTA]` skipped before the startup restore has begun (pi fires it regardless): the
+    /// startup restore, which runs over every provider still registered, covers that case. The id
+    /// an update is publishing on this thread is skipped, so a removal made from inside an `update`
+    /// does not supersede the refresh publishing it.
+    fn begin_removal_restore(
+        &self,
+        remaining: &BTreeMap<String, Arc<dyn Provider>>,
+    ) -> Option<CachedRestore> {
+        if !self.restore_started.load(Ordering::SeqCst) {
+            return None;
+        }
+        let targets: Vec<(&String, &Arc<dyn Provider>)> = remaining
+            .iter()
+            .filter(|(id, provider)| provider.has_refresh_models() && !publishing_id_is(id))
+            .collect();
+        if targets.is_empty() {
+            return None;
+        }
+        let Some(runtime) = self.runtime_handle() else {
+            tracing::warn!(
+                providers = targets.len(),
+                "no tokio runtime to restore the cached catalogs on after a provider removal"
+            );
+            return None;
+        };
+        let inner = Arc::clone(&self.refresh);
+        let drives = targets
+            .into_iter()
+            .map(|(id, provider)| CachedDrive {
+                id: id.clone(),
+                provider: Arc::clone(provider),
+                begun: inner.begin(id, &CancelToken::new()),
+                ticket: TaskTicket::new(&inner),
+            })
+            .collect();
+        Some(CachedRestore {
+            inner,
+            drives,
+            runtime,
+        })
+    }
+
+    /// Spawn the whole-registry cache-only restore ([`Self::restore_cached`]) detached — the
+    /// virtual-model listener's `void this.refresh({ allowNetwork: false })`
+    /// (`core/model-runtime.ts:975`, `:984` @f1b2e77f5). Its [`TaskTicket`] is taken here, on the
+    /// calling thread, so [`Self::refresh_tasks_in_flight`] counts it before it starts. SEAM-146:
+    /// spawned on [`Self::runtime_handle`], and reported when there is none.
+    pub(crate) fn spawn_restore_cached(self: &Arc<Self>, cancel: CancelToken) {
+        let Some(runtime) = self.runtime_handle() else {
+            tracing::warn!(
+                "no tokio runtime to restore the cached catalogs on after a virtual-model change"
+            );
+            return;
+        };
+        let ticket = TaskTicket::new(&self.refresh);
+        let registry = Arc::clone(self);
+        runtime.spawn(async move {
+            let _ticket = ticket;
+            registry.restore_cached(cancel).await;
+        });
+    }
+
     /// Invalidate the in-flight refresh of `id` (pi `setProvider` / `deleteProvider`, which both
-    /// start with `supersedeProviderRefresh`, `models.ts:399-407`) — unless this IS the update a
-    /// refresh is publishing for `id`, see [`PUBLISHING`].
+    /// start with `supersedeProviderRefresh`, `models.ts:405-413`) — unless this IS the update a
+    /// refresh is publishing for `id`, see [`PUBLISHING`]. Every caller holds the provider-map lock
+    /// (SEAM-145).
     fn supersede_refresh(&self, id: &str) {
-        if PUBLISHING.with(|slot| slot.borrow().as_deref() == Some(id)) {
+        if publishing_id_is(id) {
             return;
         }
         self.refresh.supersede(id);
+    }
+
+    /// SEAM-145 — whether the registry write about to be made for `id` is a STALE publication's:
+    /// an `update` running on this thread for `(id, generation)` whose refresh has been superseded
+    /// since `publish_queued`'s last `is_current` check.
+    ///
+    /// THE WINDOW THIS CLOSES: from that check (`publish_queued`) to the update's registry write.
+    /// pi has none — its re-check and `publication.update?.()` are back to back in one synchronous
+    /// turn (`packages/ai/src/models.ts:521-522` @f1b2e77f5). Here another thread could re-register
+    /// (or remove) the id in between, and the stale update then overwrote the newer provider (or
+    /// resurrected the removed one), because its own write does not supersede. The caller makes
+    /// this check while HOLDING the provider-map lock, and every registry write of an id
+    /// (`upsert_provider`, `upsert_live_provider`, `remove_provider`), and every `begin` made from
+    /// one (a late or removal restore), bumps the refresh generation under that same lock. So
+    /// either the newer writer's bump came first and the stale write is dropped here, or the stale
+    /// write fully precedes the newer writer, which then overwrites it: the newer writer always
+    /// wins. A plain refresh's own `begin` (`RefreshInner::refresh_one`, used by `refresh`,
+    /// `refresh_all` and `restore_cached`) bumps the generation OUTSIDE the lock; that is harmless,
+    /// because that `begin` writes nothing to the map: if it lands before this locked check the
+    /// stale write is dropped, and if after, the newer refresh publishes later and overwrites it.
+    /// No lock is held across the provider's `update` code.
+    ///
+    /// NOT closed by this: the update's side effects other than this registry's write (a
+    /// provider's own state, an extension host's map) still run — they live outside this crate.
+    /// The provider IS told: a superseded refresh's signal is cancelled with the bump, so its
+    /// `publish` returns `Err(ProviderError::Aborted)`, never `Ok(true)`.
+    fn stale_publication(&self, id: &str) -> bool {
+        PUBLISHING.with(|slot| {
+            slot.borrow()
+                .as_ref()
+                .is_some_and(|(p, generation)| p == id && !self.refresh.is_current(id, *generation))
+        })
     }
 
     /// Back catalog persistence with `store` — the session's `<agent_dir>/models-store.json`
@@ -948,6 +1126,12 @@ impl GuestProviderRegistry {
     /// no network (pi `modelRuntime.refresh({ allowNetwork: false })` after the extensions'
     /// providers are registered, `core/agent-session-services.ts:190-206` @v0.99.2-17).
     pub async fn restore_cached(&self, cancel: CancelToken) -> ModelsRefreshResult {
+        // SEAM-146: record the runtime BEFORE `restore_started`, so a restore that sees the flag
+        // always has a runtime to spawn on, even when its registration comes from a thread with
+        // none. (This is an `async fn`, polled on a tokio runtime.)
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            *poison_safe(&self.restore_runtime) = Some(runtime);
+        }
         // Set BEFORE the targets are snapshotted: a provider registered from here on either is in
         // the snapshot or restores itself, and one registered a moment earlier is in the snapshot.
         self.restore_started.store(true, Ordering::SeqCst);
@@ -972,8 +1156,14 @@ impl ModelRegistrySink for GuestProviderRegistry {
     fn upsert_provider(&self, reg: &ProviderRegistration) {
         // Full replacement for this provider id (Pi "replaces all models", model-registry.ts:919).
         let provider = reg.build_provider();
+        // One hold of the map for the stale check, the supersede, the insert, the installed slot
+        // and the bump (SEAM-145, see `stale_publication`).
+        let mut providers = self.lock();
+        if self.stale_publication(&reg.id) {
+            return;
+        }
         self.supersede_refresh(&reg.id);
-        self.lock().insert(reg.id.clone(), Arc::clone(&provider));
+        providers.insert(reg.id.clone(), Arc::clone(&provider));
         self.replace_installed(&reg.id, &provider);
         self.generation.fetch_add(1, Ordering::Relaxed);
     }
@@ -983,21 +1173,28 @@ impl ModelRegistrySink for GuestProviderRegistry {
         // id swaps the `Arc` (Pi "replaces all models", model-registry.ts:919), and the bump is what
         // makes `full_model_registry()` recompose so the replacement's catalog is what `/model` lists.
         let late_restore = {
-            // Supersede, replace and (for a new id) begin the restore under ONE hold of the map, so
-            // two concurrent registrations of an id cannot interleave the three.
+            // The stale check, supersede, replace, (for a new id) the restore's begin, the
+            // installed slot and the bump under ONE hold of the map, so two concurrent
+            // registrations of an id cannot interleave them, and a publication superseded after
+            // `publish_queued`'s check cannot land over the newer provider (SEAM-145, see
+            // `stale_publication`). Lock order: providers -> refresh slots -> installed -> swap.
             let mut providers = self.lock();
+            if self.stale_publication(id) {
+                return;
+            }
             self.supersede_refresh(id);
             let is_new = providers
                 .insert(id.to_string(), Arc::clone(&provider))
                 .is_none();
-            if is_new {
+            let late_restore = if is_new {
                 self.begin_late_restore(id, &provider)
             } else {
                 None
-            }
+            };
+            self.replace_installed(id, &provider);
+            self.generation.fetch_add(1, Ordering::Relaxed);
+            late_restore
         };
-        self.replace_installed(id, &provider);
-        self.generation.fetch_add(1, Ordering::Relaxed);
         // Spawned LAST: the restore's own `update` re-registers the provider, and must land after
         // this registration has finished installing, not before it.
         if let Some(restore) = late_restore {
@@ -1006,9 +1203,24 @@ impl ModelRegistrySink for GuestProviderRegistry {
     }
 
     fn remove_provider(&self, id: &str) {
-        self.supersede_refresh(id);
-        self.lock().remove(id);
-        self.generation.fetch_add(1, Ordering::Relaxed);
+        let restore = {
+            // Same single hold as the upserts (SEAM-145): a stale publication's removal is
+            // dropped, and the supersede happens under the lock its check reads under.
+            let mut providers = self.lock();
+            if self.stale_publication(id) {
+                return;
+            }
+            self.supersede_refresh(id);
+            providers.remove(id);
+            // SEAM-144: begun under the same hold, so a registration that follows supersedes
+            // this restore, never the reverse.
+            let restore = self.begin_removal_restore(&providers);
+            self.generation.fetch_add(1, Ordering::Relaxed);
+            restore
+        };
+        if let Some(restore) = restore {
+            restore.spawn();
+        }
     }
 
     fn upsert_virtual_model(

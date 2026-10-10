@@ -866,7 +866,11 @@ impl AgentSessionRuntime {
         // before `session_start{reload}`, as pi's `_buildRuntime` does with `addedDefaultTools`.
         let previous_default_tools = current.reload_default_tools();
         drop(current);
-        let next = self.factory.build(target, Some(cwd)).await?.into_shared();
+        let next = self
+            .factory
+            .build_for_reload(target, Some(cwd))
+            .await?
+            .into_shared();
         next.activate_added_default_tools(&previous_default_tools)
             .await;
         self.install_inner(next, "reload", previous, before_start)

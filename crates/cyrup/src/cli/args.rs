@@ -57,27 +57,31 @@ pub struct Cli {
 
     // ---- provider / model (args.ts:87-92,130) ----
     /// Provider name (e.g. `openai`, `anthropic`); combines with `--model`.
-    #[arg(long = "provider")]
+    #[arg(long = "provider", allow_hyphen_values = true)]
     pub provider: Option<String>,
     /// Model selection pattern (`provider/id[:level]`).
-    #[arg(long = "model")]
+    #[arg(long = "model", allow_hyphen_values = true)]
     pub model: Option<String>,
     /// Runtime API key for the selected provider (defaults to env vars).
-    #[arg(long = "api-key")]
+    #[arg(long = "api-key", allow_hyphen_values = true)]
     pub api_key: Option<String>,
     /// Thinking level: off, minimal, low, medium, high, xhigh, max.
     #[arg(long = "thinking", value_enum)]
     pub thinking: Option<ThinkingArg>,
     /// Comma-separated model patterns for Ctrl+P cycling (globs/fuzzy/`:level`).
-    #[arg(long = "models", value_delimiter = ',')]
-    pub models: Vec<String>,
+    ///
+    /// `None` when the flag is absent; `Some` — possibly empty — when it was supplied, which is
+    /// pi's `parsed.models ?? settingsManager.getEnabledModels()` distinction (`main.ts:812-815`
+    /// @f1b2e77f5). SEAM-147: empty entries are dropped by `normalize_list_flags`.
+    #[arg(long = "models", value_delimiter = ',', allow_hyphen_values = true)]
+    pub models: Option<Vec<String>>,
 
     // ---- prompt assembly (args.ts:93-97) ----
     /// Replace the assembled system prompt entirely.
-    #[arg(long = "system-prompt")]
+    #[arg(long = "system-prompt", allow_hyphen_values = true)]
     pub system_prompt: Option<String>,
     /// Append text after the assembled system prompt (repeatable).
-    #[arg(long = "append-system-prompt")]
+    #[arg(long = "append-system-prompt", allow_hyphen_values = true)]
     pub append_system_prompt: Vec<String>,
 
     // ---- tools (args.ts:116-129) ----
@@ -87,34 +91,52 @@ pub struct Cli {
     /// Disable built-in tools by default but keep extension/custom tools enabled.
     #[arg(long = "no-builtin-tools")]
     pub no_builtin_tools: bool,
-    /// Comma-separated allowlist of tool names to enable.
-    #[arg(short = 't', long = "tools", value_delimiter = ',')]
-    pub tools: Vec<String>,
+    /// Comma-separated tool allowlist, or `+name`/`-name` entries that change the default tools.
+    ///
+    /// SEAM-148 — pi v1.1.0 (`ddaa0a034`; `cli/args.ts:151-161`, help `:320-322` @f1b2e77f5). A list of
+    /// only modifiers is applied to the default selection by the session builder; a mixed or
+    /// patterned modifier list is refused in `apply_arg_leniency`. `allow_hyphen_values` lets
+    /// `-t -bash` take `-bash` as the value, as pi's unconditional `args[++i]` does.
+    ///
+    /// `Option` keeps a SUPPLIED-but-empty list (`--tools ""`, `--tools ","`) apart from an absent
+    /// flag: pi assigns the filtered `[]` (`args.ts:151-160`), and `sdk.ts:280-293` then makes it
+    /// both the selection and the allowlist, so the session starts with no tools.
+    #[arg(
+        short = 't',
+        long = "tools",
+        value_delimiter = ',',
+        allow_hyphen_values = true
+    )]
+    pub tools: Option<Vec<String>>,
     /// Comma-separated denylist of tool names to disable.
-    #[arg(long = "exclude-tools", value_delimiter = ',')]
+    #[arg(
+        long = "exclude-tools",
+        value_delimiter = ',',
+        allow_hyphen_values = true
+    )]
     pub exclude_tools: Vec<String>,
 
     // ---- resources (args.ts:149-170) ----
     /// Load an extension file (repeatable).
-    #[arg(short = 'e', long = "extension")]
+    #[arg(short = 'e', long = "extension", allow_hyphen_values = true)]
     pub extension: Vec<PathBuf>,
     /// Disable extension discovery (explicit `-e` paths still work).
     #[arg(long = "no-extensions")]
     pub no_extensions: bool,
     /// Load a skill file or directory (repeatable).
-    #[arg(long = "skill")]
+    #[arg(long = "skill", allow_hyphen_values = true)]
     pub skill: Vec<PathBuf>,
     /// Disable skills discovery and loading.
     #[arg(long = "no-skills")]
     pub no_skills: bool,
     /// Load a prompt template file or directory (repeatable).
-    #[arg(long = "prompt-template")]
+    #[arg(long = "prompt-template", allow_hyphen_values = true)]
     pub prompt_template: Vec<PathBuf>,
     /// Disable prompt template discovery and loading.
     #[arg(long = "no-prompt-templates")]
     pub no_prompt_templates: bool,
     /// Load a theme file or directory (repeatable).
-    #[arg(long = "theme")]
+    #[arg(long = "theme", allow_hyphen_values = true)]
     pub theme: Vec<PathBuf>,
     /// The initial interactive theme for this run, a name or a `light/dark` pair (pi
     /// `--use-theme <name[/name]>`, `cli/args.ts:190-197` @v0.87.1, added v0.84.4). A one-run
@@ -145,27 +167,31 @@ pub struct Cli {
     #[arg(short = 'r', long = "resume")]
     pub resume: bool,
     /// Use a specific session file or partial UUID.
-    #[arg(long = "session")]
+    #[arg(long = "session", allow_hyphen_values = true)]
     pub session: Option<String>,
     /// Use the exact project session ID, creating it if missing.
-    #[arg(long = "session-id")]
+    #[arg(long = "session-id", allow_hyphen_values = true)]
     pub session_id: Option<String>,
     /// Fork a specific session file or partial UUID into a new session.
-    #[arg(long = "fork")]
+    #[arg(long = "fork", allow_hyphen_values = true)]
     pub fork: Option<String>,
     /// Directory for session storage and lookup.
-    #[arg(long = "session-dir")]
+    #[arg(long = "session-dir", allow_hyphen_values = true)]
     pub session_dir: Option<PathBuf>,
     /// Don't save the session (ephemeral).
     #[arg(long = "no-session")]
     pub no_session: bool,
     /// Set the session display name.
-    #[arg(short = 'n', long = "name")]
+    ///
+    /// SEAM-152 — `allow_hyphen_values` here and on every other flag pi reads with an unconditional
+    /// `args[++i]` (`crate::cli::UNCONDITIONAL_VALUE_FLAGS`): `--name -nc` names the session `-nc`,
+    /// as in pi. The pre-clap passes leave that token alone and report a value-less flag pi's way.
+    #[arg(short = 'n', long = "name", allow_hyphen_values = true)]
     pub name: Option<String>,
 
     // ---- standalone actions (args.ts:147,171) ----
     /// Export a session file to HTML and exit (optional output path positional).
-    #[arg(long = "export")]
+    #[arg(long = "export", allow_hyphen_values = true)]
     pub export: Option<PathBuf>,
     /// List available models (with optional fuzzy search) and exit.
     #[arg(long = "list-models", num_args = 0..=1, default_missing_value = "")]

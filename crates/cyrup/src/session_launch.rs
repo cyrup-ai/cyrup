@@ -499,7 +499,32 @@ pub async fn launch(
     // (main.ts:843-850).
     timings::time("createAgentSession", timings::TimingLabel::Main);
     let session = runtime.session().await;
-    apply_post_build(&session, post.session_name, post.cli, post.fresh).await;
+    // SEAM-147 — pi resolves the scope and the CLI model BEFORE deciding `--api-key`
+    // (`main.ts:812-838` @f1b2e77f5): the key needs `sessionOptions.model`, which only `--model` or
+    // a fresh session's scope pick sets, and it goes to THAT model's provider. The `--model` /
+    // `--provider` key is installed by `main.rs` before the build; the scope pick's is installed
+    // here, before the pick is applied, because `set_model_resolved` runs pi's `hasConfiguredAuth`
+    // precheck. pi raises the missing-model case as an error diagnostic, reported with the
+    // runtime's and fatal (`:902-908`), so it sits here, after the `--help` / `--list-models` exits.
+    let scope = resolve_launch_scope(&session, post.cli, post.fresh);
+    if let Some(key) = post.cli.api_key.as_deref() {
+        match api_key_target(post.cli, &scope) {
+            ApiKeyTarget::FromCli => {}
+            ApiKeyTarget::Scoped(provider) => {
+                session
+                    .services()
+                    .auth
+                    .set_runtime_api_key(provider, key.to_string());
+            }
+            ApiKeyTarget::Missing => {
+                diagnostics::report(&[Diagnostic::error(API_KEY_REQUIRES_MODEL)]);
+                runtime.dispose().await;
+                crate::output_guard::restore_stdout();
+                return Ok(ControlFlow::Break(1));
+            }
+        }
+    }
+    apply_post_build(&session, post.session_name, post.cli, scope).await;
 
     // Pi main.ts:852-855 — the modelless hard stop, gated on the MODE:
     //   `if (appMode !== "interactive" && !session.model) {`
@@ -524,69 +549,130 @@ pub async fn launch(
     }))
 }
 
+/// pi's `--api-key` error text (`main.ts:833` @f1b2e77f5).
+pub const API_KEY_REQUIRES_MODEL: &str =
+    "--api-key requires a model to be specified via --model, --provider/--model, or --models";
+
+/// The `--models` / `enabledModels` scope a launch resolved, and the model it picks for a fresh
+/// session (pi `scopedModels` and `buildSessionOptions`' scope arm, `main.ts:812-815`, `:499-519`
+/// @f1b2e77f5).
+pub(crate) struct LaunchScope {
+    scoped: Vec<ScopedModel>,
+    /// pi `options.model` from the scope: set only with no `--model`, a non-empty scope and no
+    /// existing session.
+    pick: Option<ScopedModel>,
+}
+
+/// Resolve the launch scope, printing pi's scope warnings.
+///
+/// The patterns follow pi's precedence `parsed.models ?? settingsManager.getEnabledModels()`: an
+/// explicit `--models` wins, even empty, otherwise the persisted `enabledModels` setting. They
+/// resolve against [`AgentSession::available_model_catalog`] — pi's `resolveModelScope` runs over
+/// `modelRuntime.getAvailable()` (`core/model-resolver.ts:364-370`), every provider with configured
+/// auth — not against the installed provider's own catalog: SEAM-147 found that a `--models` naming
+/// any provider other than the installed one (and, with the zero-model placeholder installed, any
+/// provider at all) matched nothing. Matching itself is `cyrup-config`'s `minimatch`-faithful
+/// resolver (see [`resolve_scoped_models_reporting`]).
+///
+/// `fresh` is pi's `!hasExistingSession`: a resumed session keeps its own restored model, so the
+/// saved-default-in-scope pick fires only for a fresh one.
+pub(crate) fn resolve_launch_scope(session: &AgentSession, cli: &Cli, fresh: bool) -> LaunchScope {
+    let patterns = scope_patterns(cli.models.as_deref(), || {
+        session.services().settings.effective().enabled_models()
+    });
+    if patterns.is_empty() {
+        return LaunchScope {
+            scoped: Vec::new(),
+            pick: None,
+        };
+    }
+    let catalog = session.available_model_catalog();
+    // Pi `resolveModelScope` prints EVERY diagnostic its `WithDiagnostics` sibling collected —
+    // `console.warn(chalk.yellow(`Warning: ${diagnostic.message}`))`, model-resolver.ts:378-380 —
+    // before returning the (possibly empty) scope. Without this a typo'd
+    // `--models "anthropc/*"` scoped nothing with no output at all.
+    let (scoped, diags) = resolve_scoped_models_reporting(&catalog, &patterns);
+    diagnostics::report(&diags);
+    let pick = if cli.model.is_none() && fresh {
+        let eff = session.services().settings.effective();
+        pick_scoped_active_model(
+            &scoped,
+            eff.default_provider().as_deref(),
+            eff.default_model().as_deref(),
+        )
+        .cloned()
+    } else {
+        None
+    };
+    LaunchScope { scoped, pick }
+}
+
+/// Where a launch's `--api-key` goes (pi `main.ts:830-838` @f1b2e77f5).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ApiKeyTarget {
+    /// `--model` / `--provider` named the model; `main.rs` installed the key on its provider.
+    FromCli,
+    /// The scope picked the model; the key goes to its provider.
+    Scoped(cyrup_sdk::core::ProviderId),
+    /// No model was resolved: pi's error diagnostic, exit 1.
+    Missing,
+}
+
+/// pi tests the RESOLVED `sessionOptions.model`, not which flags were typed: `--api-key k --models
+/// ""`, a scope matching nothing, and a scope on a resumed session all leave it unset and error,
+/// while an `enabledModels` scope picking a model on a fresh session satisfies it with no
+/// `--models` at all. cyrup resolves a model from `--provider` alone, so `--provider` counts as
+/// naming one (pi refuses a bare `--provider` outright, `main.ts:468-473`).
+pub(crate) fn api_key_target(cli: &Cli, scope: &LaunchScope) -> ApiKeyTarget {
+    if cli.model.is_some() || cli.provider.is_some() {
+        return ApiKeyTarget::FromCli;
+    }
+    match &scope.pick {
+        Some(pick) => ApiKeyTarget::Scoped(pick.model.provider.clone()),
+        None => ApiKeyTarget::Missing,
+    }
+}
+
 /// Apply the per-run, post-build session knobs that have no `SessionConfig` slot: the trimmed
-/// `--name` display name (Pi `appendSessionInfo`, main.ts:586) and the `--models` Ctrl+P scope (Pi
-/// `resolveModelScope`/`scopedModels`, main.ts:685).
-///
-/// The scope patterns follow Pi's precedence `parsed.models ?? settingsManager.getEnabledModels()`
-/// (main.ts:685): an explicit `--models` wins, otherwise the persisted `enabledModels` setting is the
-/// fallback scope source. Matching itself is delegated to `cyrup-config`'s `minimatch`-faithful
-/// resolver (see [`resolve_scoped_models_reporting`]), not a bespoke matcher.
-///
-/// `fresh` is whether this is a brand-new session (Pi `!hasExistingSession`, main.ts:394): a resumed
-/// session keeps its own restored model, so the saved-default-in-scope active-model pick only fires
-/// for a fresh session.
-async fn apply_post_build(session: &AgentSession, name: Option<&str>, cli: &Cli, fresh: bool) {
+/// `--name` display name (Pi `appendSessionInfo`, main.ts:586) and the resolved scope — the
+/// fresh-session active-model pick (Pi `buildSessionOptions`, `main.ts:499-519` @f1b2e77f5) and the
+/// Ctrl+P cycle set.
+async fn apply_post_build(
+    session: &AgentSession,
+    name: Option<&str>,
+    cli: &Cli,
+    scope: LaunchScope,
+) {
     if let Some(name) = name {
         let _ = session.set_session_name(name).await;
     }
-    // Pi `modelPatterns = parsed.models ?? settingsManager.getEnabledModels()` (main.ts:685): an
-    // explicit `--models` wins; otherwise fall back to the persisted `enabledModels` setting.
-    let patterns: Vec<String> = if cli.models.is_empty() {
-        session
-            .services()
-            .settings
-            .effective()
-            .enabled_models()
-            .unwrap_or_default()
-    } else {
-        cli.models.clone()
-    };
-    if !patterns.is_empty() {
-        let catalog = session.model_catalog();
-        // Pi `resolveModelScope` prints EVERY diagnostic its `WithDiagnostics` sibling collected —
-        // `console.warn(chalk.yellow(`Warning: ${diagnostic.message}`))`, model-resolver.ts:355-361 —
-        // before returning the (possibly empty) scope, and does so on the live path at main.ts:741-743
-        // for both `--models` and the `enabledModels` fallback. Without this a typo'd
-        // `--models "anthropc/*"` scoped nothing with no output at all.
-        let (scoped, diags) = resolve_scoped_models_reporting(&catalog, &patterns);
-        diagnostics::report(&diags);
-        if !scoped.is_empty() {
-            // The saved-default-in-scope active-model pick (Pi `buildSessionOptions`, main.ts:394-414):
-            // when `--models` scopes the set and `--model` is omitted, the active model is the saved
-            // default if it is in scope, else the first scoped model. Apply only on a fresh session.
-            if cli.model.is_none() && fresh {
-                let eff = session.services().settings.effective();
-                if let Some(chosen) = pick_scoped_active_model(
-                    &scoped,
-                    eff.default_provider().as_deref(),
-                    eff.default_model().as_deref(),
-                ) {
-                    let model = chosen.model.clone();
-                    let thinking = chosen.thinking_level;
-                    if session.set_model_resolved(model).await.is_ok() {
-                        // Use the scoped model's thinking level only when `--thinking` was omitted
-                        // (explicit `--thinking` takes precedence and is applied by the builder).
-                        if cli.thinking.is_none()
-                            && let Some(level) = thinking
-                        {
-                            let _ = session.set_thinking_level(level).await;
-                        }
-                    }
-                }
-            }
-            session.set_scoped_models(scoped);
-        }
+    let LaunchScope { scoped, pick } = scope;
+    if scoped.is_empty() {
+        return;
+    }
+    if let Some(chosen) = pick
+        && session.set_model_resolved(chosen.model).await.is_ok()
+        // Use the scoped model's thinking level only when `--thinking` was omitted (explicit
+        // `--thinking` takes precedence and is applied by the builder).
+        && cli.thinking.is_none()
+        && let Some(level) = chosen.thinking_level
+    {
+        let _ = session.set_thinking_level(level).await;
+    }
+    session.set_scoped_models(scoped);
+}
+
+/// Pi `modelPatterns = parsed.models ?? settingsManager.getEnabledModels()` (`main.ts:812-815`
+/// @f1b2e77f5): a SUPPLIED `--models` wins even when it is empty (`--models ""` is pi's truthy
+/// `[]`, which then skips scoping); the `enabledModels` setting is read only when the flag is
+/// absent. SEAM-147.
+fn scope_patterns(
+    cli_models: Option<&[String]>,
+    enabled_models: impl FnOnce() -> Option<Vec<String>>,
+) -> Vec<String> {
+    match cli_models {
+        Some(patterns) => patterns.to_vec(),
+        None => enabled_models().unwrap_or_default(),
     }
 }
 
@@ -807,6 +893,57 @@ mod tests {
                 .all(|d| matches!(d.level, DiagnosticLevel::Warning)),
             "Pi renders every scope diagnostic through `console.warn` (model-resolver.ts:355-361)"
         );
+    }
+
+    /// SEAM-147 Verify — `--models "faux/*,"` resolves and warns exactly as `--models "faux/*"`,
+    /// and `--models ""` still counts as a supplied flag and resolves no scope. pi `9b3c19da5`
+    /// (`cli/args.ts:141-145` @v1.0.1) drops empty entries; `main.ts:812-815` @f1b2e77f5 reads
+    /// `parsed.models ?? settingsManager.getEnabledModels()` and scopes only a non-empty list. The
+    /// patterns go through the real clap parse and `normalize_list_flags`, then the same
+    /// [`super::scope_patterns`] → [`resolve_scoped_models_reporting`] pair
+    /// [`super::resolve_launch_scope`] runs. RED before the fix: the trailing comma added `No models match pattern ""`, and
+    /// `--models ""` resolved the pattern `""` with that same warning. `anthropic/*` stands in for
+    /// the Verify line's `faux/*`: `faux` is not in the bundled catalog this resolves against
+    /// (`provider::tests::all_available_models_span_the_full_registry` asserts it absent), so
+    /// `faux/*` would scope nothing on either side. What a supplied-but-empty scope does to the
+    /// launch model and to `--api-key` is covered by `tests::api_key_models_scope`.
+    #[test]
+    fn a_trailing_comma_in_models_resolves_and_warns_like_the_bare_pattern() {
+        use clap::Parser;
+        let catalog = crate::provider::all_available_models(&cyrup_config::ModelFile::default());
+        let patterns_for = |args: &[&str]| -> Vec<String> {
+            let mut argv = vec!["cyrup"];
+            argv.extend_from_slice(args);
+            let mut cli = crate::cli::Cli::try_parse_from(argv).expect("parses");
+            cli.normalize_list_flags();
+            super::scope_patterns(cli.models.as_deref(), || Some(vec!["openai/*".to_string()]))
+        };
+        let messages = |patterns: &[String]| -> (Vec<String>, Vec<String>) {
+            let (scoped, diags) = resolve_scoped_models_reporting(&catalog, patterns);
+            (
+                scoped
+                    .iter()
+                    .map(|s| format!("{}/{}", s.model.provider.as_str(), s.model.id.as_str()))
+                    .collect(),
+                diags.into_iter().map(|d| d.message).collect(),
+            )
+        };
+
+        let bare = messages(&patterns_for(&["--models", "anthropic/*"]));
+        assert!(!bare.0.is_empty(), "`anthropic/*` scopes something");
+        assert!(bare.1.is_empty(), "{:?}", bare.1);
+        assert_eq!(messages(&patterns_for(&["--models", "anthropic/*,"])), bare);
+        assert_eq!(
+            messages(&patterns_for(&["--models", " anthropic/* , ,"])),
+            bare
+        );
+
+        // `--models ""`: supplied, so no `enabledModels` fallback, and nothing to scope or warn.
+        let empty = patterns_for(&["--models", ""]);
+        assert!(empty.is_empty(), "{empty:?}");
+        assert_eq!(messages(&empty), (Vec::new(), Vec::new()));
+        // Absent: the `enabledModels` setting is the scope source.
+        assert_eq!(patterns_for(&[]), vec!["openai/*".to_string()]);
     }
 
     /// The live `--models`/`enabledModels` scope resolution must go through `cyrup-config`'s

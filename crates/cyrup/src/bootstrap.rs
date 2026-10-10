@@ -77,7 +77,10 @@ pub fn resolve_dirs(cli: &Cli, env: &EnvVars) -> anyhow::Result<(CliConfigOverri
         offline: cli.offline || env.offline,
         trust_override: cli.trust_override(),
         model: cli.model.clone(),
-        models: cli.models.clone(),
+        // Flattened: `--models ""` and no `--models` both become `[]` here. Nothing reads
+        // `CliConfigOverrides.models` today; every gate that needs pi's `parsed.models ??`
+        // supplied-ness (SEAM-147) reads `cli.models` directly.
+        models: cli.models.clone().unwrap_or_default(),
         api_key: cli.api_key.clone(),
         ..Default::default()
     };
@@ -212,7 +215,7 @@ pub fn maybe_spawn_catalog_refresh(
 }
 
 /// Default-launch model (Pi `findInitialModel`, model-resolver.ts:527-607): when NEITHER
-/// `--provider` nor `--model` (nor a `--models` scope) is given, cyrup must launch on a REAL
+/// `--provider` nor `--model` is given, cyrup must launch on a REAL
 /// configured provider — the saved settings default, else a configured provider's curated default —
 /// instead of stopping at the zero-model `UnconfiguredProvider` that `select_provider` yields for
 /// the no-flag case (there is no provider prefix to key off).
@@ -223,6 +226,11 @@ pub fn maybe_spawn_catalog_refresh(
 /// banner and the non-interactive modes turn into pi's `main.ts:852-855` exit.
 ///
 /// Only for a FRESH session — a resumed/continued session keeps its own restored model.
+///
+/// A `--models` (or `enabledModels`) scope does not gate it (SEAM-147): pi reaches
+/// `findInitialModel` whenever `options.model` is unset (`core/sdk.ts:234-243` @f1b2e77f5), which a
+/// supplied `--models` leaves unset when it resolves nothing (`main.ts:499`). When the scope does
+/// pick, `session_launch`'s post-build pick replaces this model, as pi's `options.model` would.
 ///
 /// Pi `hasConfiguredAuth`: the model's provider has a stored credential / known env var (e.g.
 /// `TOGETHER_API_KEY`) — the same `auth.json`-backed `AuthStore` the session builds — **or** a
@@ -238,11 +246,7 @@ pub fn resolve_default_launch_model(
     models_json: &Arc<ModelFile>,
     settings_store: &Arc<dyn SettingsStore>,
 ) -> Option<(String, String)> {
-    if cli.provider.is_some()
-        || cli.model.is_some()
-        || !cli.models.is_empty()
-        || !is_fresh_target(&config.target)
-    {
+    if cli.provider.is_some() || cli.model.is_some() || !is_fresh_target(&config.target) {
         return None;
     }
     let auth = AuthStore::at(dirs.agent_dir.join("auth.json"));

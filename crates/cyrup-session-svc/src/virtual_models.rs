@@ -77,7 +77,7 @@ impl VirtualModelCatalog for StartupVirtualCatalog {
 }
 
 /// SEAM-144 — the cache-only whole-registry refresh pi fires from `registerVirtualModel` and
-/// `unregisterVirtualModel` (`core/model-runtime.ts:973`, `:982`: `void this.refresh({ allowNetwork:
+/// `unregisterVirtualModel` (`core/model-runtime.ts:975`, `:984` @f1b2e77f5: `void this.refresh({ allowNetwork:
 /// false })`), plus the one `createAgentSessionServices` fires after draining the pending queue
 /// (`agent-session-services.ts:194`).
 ///
@@ -90,10 +90,11 @@ impl VirtualModelCatalog for StartupVirtualCatalog {
 /// nothing until a refresh publishes its persisted catalog. Firing it is also what makes a router
 /// registered at startup able to route to a model only a cached catalog names.
 ///
-/// **SEAM-146 is inherited here, not introduced**: the refresh is spawned, so at a registration made
-/// with no Tokio runtime current — which `ExtensionRegistry::register_virtual_model` can be called
-/// from — nothing restores. The guard below makes that a no-op rather than a panic, which is what
-/// the existing late-restore path does too.
+/// **SEAM-146**: the refresh is spawned, and a registration can be made with no Tokio runtime
+/// current (`ExtensionRegistry::register_virtual_model` is synchronous). It is spawned through
+/// [`GuestProviderRegistry::spawn_restore_cached`], which falls back to the runtime the startup
+/// restore ran on and reports (a `tracing` warning) when there is none, instead of silently doing
+/// nothing.
 pub(crate) struct CachedRestoreOnVirtualChange {
     /// Weak: the registry holds the listener, and the session holds the registry.
     guest_providers: Weak<GuestProviderRegistry>,
@@ -118,10 +119,8 @@ impl VirtualModelListener for CachedRestoreOnVirtualChange {
         let cancel = self.cancel.child_token();
         // `void` — upstream does not await it, and this listener runs inside the registry's
         // mutator, which must not block (and from which an `await` is not even available).
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            handle.spawn(async move {
-                guest_providers.restore_cached(cancel).await;
-            });
-        }
+        // SEAM-146: spawned on the caller's runtime or, from a thread with none, on the one the
+        // startup restore ran on; reported when neither exists.
+        guest_providers.spawn_restore_cached(cancel);
     }
 }

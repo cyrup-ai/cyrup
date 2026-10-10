@@ -509,6 +509,93 @@ fn activate_default_extension_tools(
     active
 }
 
+/// A `tools` list resolved against pi v1.1.0's `+name`/`-name` modifier form (SEAM-148).
+///
+/// pi interprets the modifiers in the SDK `tools` option itself (`core/sdk.ts:280-294`
+/// @f1b2e77f5): a modifier-only list is applied, in order, to the default selection —
+/// `options.noTools ? [] : (settings.getDefaultTools() ?? DEFAULT_TOOL_NAMES)` — instead of being
+/// an allowlist, and `allowedToolNames` stays `undefined` unless `noTools === "all"`, where it is
+/// the post-modifier set. `cfg` is the selection the three helpers below then see:
+///
+/// * no modifiers — the caller's config untouched, `default_tools` the `defaultTools` setting;
+/// * modifiers with `NoTools::All` — an explicit allowlist of the selected names, which is pi's
+///   `allowedToolNames = selectedToolNames` AND `initialActiveToolNames = selectedToolNames`;
+/// * otherwise — neither `tools` nor `noTools`, with `default_tools` the selected names. Under
+///   `NoTools::Builtin` the base is empty (`defaultToolNames = []`), so only the `+name` built-ins
+///   are selected and extension tools keep the `!ALL_BUILTIN_TOOLS` leg, exactly the
+///   `noTools: "builtin"` arm plus pi's `initialActiveToolNames`.
+///
+/// `modifiers` is pi's `defaultToolModifiers` (`sdk.ts:473`), reapplied on `/reload`.
+struct ToolSelection<'a> {
+    cfg: std::borrow::Cow<'a, SessionConfig>,
+    default_tools: Option<Vec<String>>,
+    modifiers: Vec<String>,
+}
+
+impl ToolSelection<'_> {
+    /// pi `usesDefaultTools` (`sdk.ts:472` @f1b2e77f5):
+    /// `(options.tools === undefined || toolModifiers !== undefined) && !options.noTools`.
+    fn uses_default_tools(&self, original: &SessionConfig) -> bool {
+        original.no_tools.is_none() && (original.tools.is_none() || !self.modifiers.is_empty())
+    }
+}
+
+/// pi `getToolListError` on the SDK `tools` option (`core/sdk.ts:280-281` @f1b2e77f5):
+/// `throw new Error(`Invalid tools option: ${toolListError}`)` (a template literal).
+fn check_tool_list(cfg: &SessionConfig) -> Result<(), SessionServiceError> {
+    match cfg
+        .tools
+        .as_deref()
+        .and_then(cyrup_config::get_tool_list_error)
+    {
+        Some(err) => Err(SessionServiceError::InvalidToolsOption(err)),
+        None => Ok(()),
+    }
+}
+
+/// Resolve `cfg.tools` per [`ToolSelection`]. `configured` is the resolved `defaultTools` setting.
+fn resolve_tool_selection(
+    cfg: &SessionConfig,
+    configured: Option<Vec<String>>,
+) -> ToolSelection<'_> {
+    let modifiers: Vec<String> = match &cfg.tools {
+        Some(tools) if tools.iter().any(|t| cyrup_config::is_tool_modifier(t)) => tools.clone(),
+        _ => Vec::new(),
+    };
+    if modifiers.is_empty() {
+        return ToolSelection {
+            cfg: std::borrow::Cow::Borrowed(cfg),
+            default_tools: configured,
+            modifiers,
+        };
+    }
+    let base: Vec<String> = if cfg.no_tools.is_some() {
+        Vec::new()
+    } else {
+        configured.unwrap_or_else(|| {
+            DEFAULT_BUILTIN_TOOLS
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect()
+        })
+    };
+    let selected = cyrup_config::apply_tool_modifiers(&base, &modifiers);
+    let mut effective = cfg.clone();
+    let default_tools = if cfg.no_tools == Some(NoTools::All) {
+        effective.tools = Some(selected);
+        None
+    } else {
+        effective.tools = None;
+        effective.no_tools = None;
+        Some(selected)
+    };
+    ToolSelection {
+        cfg: std::borrow::Cow::Owned(effective),
+        default_tools,
+        modifiers,
+    }
+}
+
 /// pi `sdk.ts:258`'s `allowedToolNames` —
 /// `options.tools ?? (options.noTools === "all" ? [] : undefined)` — the SESSION-level allowlist.
 ///
@@ -599,6 +686,11 @@ pub struct SessionBuilder {
     /// `createAgentSessionServices` before `createAgentSession` restores the selection
     /// (`agent-session-services.ts:182-194`).
     virtual_models: Option<Arc<cyrup_provider::VirtualModelRegistry>>,
+    /// This build is the in-process `/reload` rebuild ([`crate::AgentSessionRuntime::reload`]),
+    /// which stands in for pi's `reload` keeping `getActiveToolNames()` (`agent-session.ts:3682-
+    /// 3686` @f1b2e77f5). Only then does a `+name`/`-name` `tools` session resume its transcript's
+    /// loadout; every other start applies the modifiers, as pi's `sdk.ts:294` does (SEAM-148).
+    reload_rebuild: bool,
     /// The interactive project-trust prompt (pi `selectProjectTrustOption` → `ctx.ui.select`,
     /// `project-trust.ts:28-44`, `:90-94`). Invoked **only** when the tiered decision comes back
     /// [`TrustOutcome::NeedsPrompt`], i.e. after `pre_trust_extension_verdict` and the store —
@@ -678,9 +770,17 @@ impl SessionBuilder {
             trust_prompt: None,
             model_catalog_service: None,
             virtual_models: None,
+            reload_rebuild: false,
             #[cfg(test)]
             force_pre_trust_wasm_failure: false,
         }
+    }
+
+    /// Mark this build as the `/reload` rebuild (see the `reload_rebuild` field).
+    #[must_use]
+    pub(crate) fn reload_rebuild(mut self) -> Self {
+        self.reload_rebuild = true;
+        self
     }
 
     /// Wire the shared [`cyrup_provider::ModelCatalogService`] this session refreshes through and
@@ -876,6 +976,9 @@ impl SessionBuilder {
     /// extension `init` run here.
     pub async fn build(self) -> Result<AgentSession, SessionServiceError> {
         let cfg = self.config;
+        // SEAM-148: pi rejects a mixed or patterned modifier list before building anything
+        // (`core/sdk.ts:280-281` @f1b2e77f5).
+        check_tool_list(&cfg)?;
         // Embedder-supplied seams pulled out before the rest of `self` is consumed piecewise below.
         let custom_stream_fn = self.stream_fn;
         let custom_key_resolver = self.key_resolver;
@@ -1318,14 +1421,22 @@ impl SessionBuilder {
         // every `+name`/`-name` has been applied (`EffectiveSettings::default_tools`, pi
         // `getDefaultTools` → `resolveDefaultTools`). `select_active_tools` therefore still sees a
         // literal list of tool names, which is what upstream's `sdk.ts:261-263` sees too.
-        let configured_default_tools = settings.effective().default_tools();
-        let base_tools = select_active_tools(&visible, &cfg, configured_default_tools.as_deref());
+        //
+        // SEAM-148: a `+name`/`-name`-only `tools` list is applied to that selection rather than
+        // read as an allowlist (pi `sdk.ts:280-294` @f1b2e77f5); see [`ToolSelection`].
+        let tool_selection = resolve_tool_selection(&cfg, settings.effective().default_tools());
+        let configured_default_tools = tool_selection.default_tools.clone();
+        let base_tools = select_active_tools(
+            &visible,
+            &tool_selection.cfg,
+            configured_default_tools.as_deref(),
+        );
         // pi `AgentSession._allowedToolNames` / `_excludedToolNames` (`sdk.ts:258-259` →
         // `agent-session.ts:395-396`). Resolved HERE, next to the built-in selection they are
         // derived from and ahead of BOTH consumers — `ext_host.active_tools_filtered` below and the
         // `AgentSessionServices` literal that carries them to `refresh_extension_tools` — so one
         // binding serves both and the two paths cannot drift.
-        let allowed_tool_names = resolve_allowed_tool_names(&cfg);
+        let allowed_tool_names = resolve_allowed_tool_names(&tool_selection.cfg);
         let excluded_tool_names: std::collections::HashSet<String> =
             cfg.exclude_tools.iter().cloned().collect();
 
@@ -1725,7 +1836,7 @@ impl SessionBuilder {
         host_services.attach_flag_source(Arc::downgrade(&ext_host));
         host_services.attach_provider_auth(auth.clone(), guest_providers.clone());
         // SEAM-144 — the cache-only whole-registry refresh pi fires from BOTH virtual-model
-        // mutators (`model-runtime.ts:973`, `:982`). Installed before the flush below, so the
+        // mutators (`model-runtime.ts:975`, `:984` @f1b2e77f5). Installed before the flush below, so the
         // extensions' own registrations fire it too, exactly as upstream's do.
         virtual_models.set_listener(Arc::new(
             crate::virtual_models::CachedRestoreOnVirtualChange::new(
@@ -2065,7 +2176,7 @@ impl SessionBuilder {
         let active_tools = activate_default_extension_tools(
             active_tools,
             &registered_tools,
-            &cfg,
+            &tool_selection.cfg,
             configured_default_tools.as_deref(),
         );
         // The dynamic-tool registry (Pi `_toolRegistry`): every Availability-visible tool, the caller's
@@ -2114,8 +2225,23 @@ impl SessionBuilder {
         // load, a `setActiveTools` call or an extension registration recorded survives the
         // process. A transcript with no system message declares nothing, and the selection above
         // stands. The names the session may not expose are dropped (`_isAllowedTool`).
-        let restored_loadout: Option<Vec<String>> = if cfg.tools.is_none() && cfg.no_tools.is_none()
-        {
+        //
+        // `[CYRUP-DELTA]` this construction-time restore is cyrup's own rule, not pi's: pi's
+        // `createAgentSession` always passes `initialActiveToolNames` (`sdk.ts:294` @f1b2e77f5), so
+        // `agent-session.ts:525`'s `=== undefined` restore never runs for an SDK-built session.
+        //
+        // SEAM-148: a `+name`/`-name` `tools` list is applied on every start, so a `--continue` or
+        // `--resume` launch with `--tools -bash` starts without `bash` whatever the transcript
+        // saved (pi `sdk.ts:294` sets `initialActiveToolNames` from `applyToolModifiers`, and
+        // `agent-session.ts:525` restores only when it is `undefined`). The one exception is the
+        // `/reload` rebuild: pi's `reload` keeps the live active set (`:3682-3686`), which this
+        // Resume rebuild reproduces by restoring the transcript's loadout, so a tool turned off
+        // stays off and a `tool_search` load survives.
+        let uses_default_tools = tool_selection.uses_default_tools(&cfg);
+        let default_tool_modifiers = tool_selection.modifiers.clone();
+        let restores_loadout =
+            uses_default_tools && (default_tool_modifiers.is_empty() || self.reload_rebuild);
+        let restored_loadout: Option<Vec<String>> = if restores_loadout {
             crate::tools::declared_tool_names(&existing_raw).map(|names| {
                 names
                     .into_iter()
@@ -2727,7 +2853,8 @@ impl SessionBuilder {
             ext_host,
             allowed_tool_names,
             excluded_tool_names,
-            uses_default_tools: cfg.tools.is_none() && cfg.no_tools.is_none(),
+            uses_default_tools,
+            default_tool_modifiers,
             guest_providers,
             virtual_models,
             model: resolved_model,

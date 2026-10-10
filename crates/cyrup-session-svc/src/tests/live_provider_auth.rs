@@ -39,6 +39,7 @@ use cyrup_provider::{
 };
 use tempfile::TempDir;
 
+use crate::session::LIVE_AUTH_CHECK_TIMEOUT;
 use crate::{AgentSession, SessionBuilder, SessionConfig};
 
 pub(super) const LLAMA: &str = "llama.cpp";
@@ -580,4 +581,207 @@ async fn provider_credentials_cannot_touch_another_providers_credential() {
 #[tokio::test]
 async fn provider_credentials_is_none_when_unattached() {
     assert!(bare_host().provider_credentials(LLAMA).is_none());
+}
+
+// ============================================================================ availability error
+
+/// A strategy whose `check` the test scripts: it FAILS while `fail` is set, PANICS while `panic` is
+/// set, and otherwise answers "configured". When `hold` is armed, the next check samples `fail`,
+/// meets the test at `entered`, and waits at `release` before answering — which is how
+/// [`a_late_failing_check_cannot_overwrite_a_newer_success`] interleaves two checks without a sleep.
+pub(super) struct ScriptedCheck {
+    fail: std::sync::atomic::AtomicBool,
+    panic: std::sync::atomic::AtomicBool,
+    hold: std::sync::atomic::AtomicBool,
+    entered: std::sync::Barrier,
+    release: std::sync::Barrier,
+}
+
+impl ScriptedCheck {
+    fn failing() -> Arc<Self> {
+        Arc::new(Self {
+            fail: std::sync::atomic::AtomicBool::new(true),
+            panic: std::sync::atomic::AtomicBool::new(false),
+            hold: std::sync::atomic::AtomicBool::new(false),
+            entered: std::sync::Barrier::new(2),
+            release: std::sync::Barrier::new(2),
+        })
+    }
+    fn set(flag: &std::sync::atomic::AtomicBool, on: bool) {
+        flag.store(on, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[async_trait::async_trait]
+impl ApiKeyAuth for ScriptedCheck {
+    fn name(&self) -> &str {
+        "scripted"
+    }
+    fn supports_check(&self) -> bool {
+        true
+    }
+    async fn check(
+        &self,
+        _ctx: &dyn AuthContext,
+        _cred: Option<&Credential>,
+    ) -> Result<Option<AuthCheck>, AuthError> {
+        use std::sync::atomic::Ordering::SeqCst;
+        assert!(!self.panic.load(SeqCst), "scripted strategy panicked");
+        let fail = self.fail.load(SeqCst);
+        if self.hold.swap(false, SeqCst) {
+            // On the check's own thread (`live_provider_is_configured`), so blocking is fine.
+            self.entered.wait();
+            self.release.wait();
+        }
+        if fail {
+            Err(AuthError::api_key(
+                ProviderId::from(LLAMA),
+                "server probe refused",
+            ))
+        } else {
+            Ok(Some(AuthCheck {
+                auth_type: AuthType::ApiKey,
+                source: Some("scripted".to_string()),
+            }))
+        }
+    }
+    async fn resolve(
+        &self,
+        _model: &Model,
+        _ctx: &dyn AuthContext,
+        _cred: Option<&Credential>,
+    ) -> Result<Option<AuthResult>, AuthError> {
+        Ok(None)
+    }
+}
+
+fn scripted(check: &Arc<ScriptedCheck>) -> Arc<dyn Provider> {
+    Arc::new(LiveProvider {
+        id: ProviderId::from(LLAMA),
+        auth: Some(ProviderAuth::with_api_key(
+            Arc::clone(check) as Arc<dyn ApiKeyAuth>
+        )),
+        models: models_of(LLAMA, &["tiny"]),
+    })
+}
+
+/// SEAM-139 Verify: "a strategy whose check errors yields a visible diagnostic". The failing check
+/// still reads as unavailable, and the reason — the strategy's own message, with the provider — is
+/// now on pi's `getError()` channel as `Availability refresh: …` (`core/model-runtime.ts:510`
+/// @v1.1.0), both alone and inside the `getError()` port.
+#[tokio::test]
+async fn a_failing_live_auth_check_yields_a_visible_diagnostic() {
+    let check = ScriptedCheck::failing();
+    let fx = fixture(&[], vec![scripted(&check)]).await;
+    assert_eq!(fx.session.availability_error(), None, "nothing checked yet");
+
+    assert!(available_ids(&fx.session, LLAMA).is_empty());
+
+    let error = fx
+        .session
+        .availability_error()
+        .expect("the failing check is recorded");
+    assert!(error.starts_with("Availability refresh: "), "{error}");
+    assert!(error.contains(LLAMA), "{error}");
+    assert!(error.contains("server probe refused"), "{error}");
+    let runtime_error = fx
+        .session
+        .model_runtime_error()
+        .expect("getError() carries it");
+    assert!(runtime_error.contains(&error), "{runtime_error}");
+}
+
+/// pi clears `availabilityError` when a later pass succeeds (`core/model-runtime.ts:363`, `:421`
+/// @v1.1.0): once the strategy answers again the diagnostic is gone and the provider is available.
+#[tokio::test]
+async fn a_recovered_live_auth_check_clears_the_diagnostic() {
+    let check = ScriptedCheck::failing();
+    let fx = fixture(&[], vec![scripted(&check)]).await;
+    assert!(available_ids(&fx.session, LLAMA).is_empty());
+    assert!(fx.session.availability_error().is_some());
+
+    ScriptedCheck::set(&check.fail, false);
+
+    assert_eq!(available_ids(&fx.session, LLAMA), vec!["tiny"]);
+    assert_eq!(fx.session.availability_error(), None);
+    assert_eq!(fx.session.model_runtime_error(), None);
+}
+
+/// A check that PANICS is recorded too — it used to read as a silent "unavailable".
+#[tokio::test]
+async fn a_panicking_live_auth_check_yields_a_visible_diagnostic() {
+    let check = ScriptedCheck::failing();
+    ScriptedCheck::set(&check.panic, true);
+    let fx = fixture(&[], vec![scripted(&check)]).await;
+
+    assert!(available_ids(&fx.session, LLAMA).is_empty());
+
+    let error = fx.session.availability_error().expect("recorded");
+    assert_eq!(
+        error,
+        format!("Availability refresh: auth check for {LLAMA} panicked")
+    );
+}
+
+/// pi's `availabilityErrorSeq` guard (`core/model-runtime.ts:363`, `:373` @v1.1.0): only the
+/// LATEST started check may write. Check A starts while the strategy fails and is held; check B
+/// starts after it, succeeds and clears; A is then released and fails. A finished last but started
+/// first, so its failure must NOT resurrect the diagnostic. Interleaved with barriers, no sleeps.
+///
+/// Red-proof precondition: A's CALLER must receive the scripted failure, not give up first. If it
+/// hit [`LIVE_AUTH_CHECK_TIMEOUT`] while B ran, it would record its timeout BEFORE B cleared, and
+/// the final `None` would hold even with the seq guard removed. A's caller starts its wait after
+/// `a_started`, so a join inside that window proves it did not time out; past it (only under
+/// extreme load) the test fails loudly instead of passing without exercising the guard.
+#[tokio::test]
+async fn a_late_failing_check_cannot_overwrite_a_newer_success() {
+    let check = ScriptedCheck::failing();
+    let fx = fixture(&[], vec![scripted(&check)]).await;
+    let session = &fx.session;
+    ScriptedCheck::set(&check.hold, true);
+
+    std::thread::scope(|scope| {
+        let a_started = std::time::Instant::now();
+        let a = scope.spawn(|| available_ids(session, LLAMA));
+        // A is inside its check, having sampled `fail == true`.
+        check.entered.wait();
+        ScriptedCheck::set(&check.fail, false);
+        assert_eq!(available_ids(session, LLAMA), vec!["tiny"], "B succeeds");
+        assert_eq!(session.availability_error(), None, "B cleared");
+        check.release.wait();
+        assert!(a.join().unwrap().is_empty(), "A failed");
+        let a_took = a_started.elapsed();
+        assert!(
+            a_took < LIVE_AUTH_CHECK_TIMEOUT,
+            "A's caller may have timed out ({a_took:?}) before B cleared, so this run could not \
+             tell a missing seq guard from a present one; re-run without build load"
+        );
+    });
+
+    assert_eq!(
+        session.availability_error(),
+        None,
+        "the older check's late failure was dropped"
+    );
+}
+
+/// A failing provider's record does not outlive the provider: pi's `unregisterProvider` ends in a
+/// `refresh({ allowNetwork: false })` whose successful availability pass clears
+/// `availabilityError` (`core/model-runtime.ts:944-950`, `:363` @f1b2e77f5). Nothing in cyrup
+/// checks a removed id again, so the record is dropped when its provider is no longer live. RED
+/// with the prune disabled: `Some("Availability refresh: api key auth failed for llama.cpp: server
+/// probe refused")` for `None` after the removal.
+#[tokio::test]
+async fn an_unregistered_providers_failure_is_no_longer_reported() {
+    use cyrup_ext::provider::ModelRegistrySink;
+
+    let check = ScriptedCheck::failing();
+    let fx = fixture(&[], vec![scripted(&check)]).await;
+    assert!(available_ids(&fx.session, LLAMA).is_empty());
+    assert!(fx.session.availability_error().is_some(), "recorded first");
+
+    fx.session.services().guest_providers.remove_provider(LLAMA);
+
+    assert_eq!(fx.session.availability_error(), None);
+    assert_eq!(fx.session.model_runtime_error(), None);
 }

@@ -168,6 +168,27 @@ impl SessionFactory {
         cwd: Option<PathBuf>,
         parent_session: Option<String>,
     ) -> Result<AgentSession, SessionServiceError> {
+        self.build_target(target, cwd, parent_session, false).await
+    }
+
+    /// The `/reload` rebuild ([`crate::AgentSessionRuntime::reload`]): a [`Self::build`] that
+    /// resumes the transcript's tool loadout even for a `+name`/`-name` `tools` session, standing in
+    /// for pi's `reload` keeping the live active set (SEAM-148).
+    pub(crate) async fn build_for_reload(
+        &self,
+        target: SessionTarget,
+        cwd: Option<PathBuf>,
+    ) -> Result<AgentSession, SessionServiceError> {
+        self.build_target(target, cwd, None, true).await
+    }
+
+    async fn build_target(
+        &self,
+        target: SessionTarget,
+        cwd: Option<PathBuf>,
+        parent_session: Option<String>,
+        reload_rebuild: bool,
+    ) -> Result<AgentSession, SessionServiceError> {
         let mut cfg = self.base_config.clone();
         cfg.target = target;
         cfg.parent_session = parent_session;
@@ -203,6 +224,9 @@ impl SessionFactory {
         }
         if let Some(slot) = &self.codemode_host_slot {
             builder = builder.codemode_host_slot(slot.clone());
+        }
+        if reload_rebuild {
+            builder = builder.reload_rebuild();
         }
         builder.build().await
     }

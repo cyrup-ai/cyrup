@@ -118,6 +118,24 @@ fn api_key_without_a_model_still_lists() {
     );
 }
 
+/// SEAM-147 — the same diagnostic, outside a listing, reads the RESOLVED model (pi `main.ts:830-834`
+/// @f1b2e77f5): `--models ""` resolves no scope, so `--api-key` has no model and the run exits 1
+/// with pi's error, not with the no-models guidance it reached when only the flag's presence was
+/// checked.
+#[test]
+fn api_key_with_an_empty_models_scope_is_refused() {
+    let fx = fixture(&["groq"]);
+    let out = run(&fx, &["--api-key", "k", "--models", "", "-p", "hi"]);
+    assert_eq!(out.status.code(), Some(1), "stderr:\n{}", stderr(&out));
+    assert!(
+        stderr(&out).contains(
+            "Error: --api-key requires a model to be specified via --model, --provider/--model, or --models"
+        ),
+        "stderr:\n{}",
+        stderr(&out)
+    );
+}
+
 /// The in-memory session (`main.ts:363`): a missing `--session` neither fails the run nor writes a
 /// session file.
 #[test]
