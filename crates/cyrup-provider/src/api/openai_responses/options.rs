@@ -14,8 +14,9 @@ pub enum ReasoningSummary {
 }
 
 impl ReasoningSummary {
-    /// The wire string for the `reasoning.summary` field, or `None` for `null`.
-    fn as_wire(self) -> Option<&'static str> {
+    /// The wire string for the `reasoning.summary` field, or `None` for `null`. Crate-visible
+    /// because the Azure adapter's options carry the same type (PROV-150).
+    pub(crate) fn as_wire(self) -> Option<&'static str> {
         match self {
             ReasoningSummary::Auto => Some("auto"),
             ReasoningSummary::Detailed => Some("detailed"),

@@ -1027,6 +1027,21 @@ mod tests {
     }
 
     #[test]
+    fn no_model_with_codex_configured_launches_gpt_6_1_sol() {
+        // CFG-102: the same launch path for a ChatGPT-OAuth-only user. Pi
+        // `defaultModelPerProvider["openai-codex"]` is `"gpt-6.1-sol"`
+        // (packages/coding-agent/src/core/model-resolver.ts:26 @f1b2e77f5, `12c416e1a`). This needs
+        // BOTH the curated arm and the embedded catalog row: with the arm moved but the row absent,
+        // `first_default_or_first` cannot find the default and falls back to another codex row.
+        let codex_configured = |m: &cyrup_provider::Model| m.provider.as_str() == "openai-codex";
+        let (provider, pattern) =
+            default_launch_model(None, None, &codex_configured, &ModelFile::default())
+                .expect("a configured provider yields a real launch model");
+        assert_eq!(provider, "openai-codex");
+        assert_eq!(pattern, "openai-codex/gpt-6.1-sol");
+    }
+
+    #[test]
     fn no_model_and_nothing_configured_yields_no_launch_model() {
         // Nothing configured ⇒ `None` ⇒ the caller keeps the zero-model `UnconfiguredProvider`, the
         // session builds modelless with pi's `modelFallbackMessage`, and the non-interactive modes

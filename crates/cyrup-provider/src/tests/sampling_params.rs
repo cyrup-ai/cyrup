@@ -1,16 +1,22 @@
 //! AGENT-026 — `samplingParams`: a 1:1 port of pi's own `packages/ai/test/sampling-options.test.ts`
 //! @v0.84.1, case for case, plus the two adapters that file does not exercise.
 //!
-//! Upstream shape: `Model.samplingParams` (`types.ts:801-802`) and
-//! `StreamOptions.samplingParams` (`types.ts:183-189`) are merged per key by `buildBaseOptions`
-//! (`{ ...model.samplingParams, ...options?.samplingParams }`, `simple-options.ts:27-33`), and the
-//! three OpenAI-compatible adapters `Object.assign` the result onto the request body **last**, so
-//! custom keys override the named request fields (`openai-completions.ts:884-887`,
-//! `openai-responses.ts:330-333`, `azure-openai-responses.ts:324-327`). Every other api ignores it.
+//! Upstream shape @v0.84.1 (the shape AGENT-026 ported): `Model.samplingParams`
+//! (`types.ts:801-802`) and `StreamOptions.samplingParams` (`types.ts:183-189`) were merged per key
+//! by `buildBaseOptions` ONLY (`{ ...model.samplingParams, ...options?.samplingParams }`,
+//! `simple-options.ts:27-33`), and the three OpenAI-compatible adapters `Object.assign` the result
+//! onto the request body **last**, so custom keys override the named request fields
+//! (`openai-completions.ts:884-887`, `openai-responses.ts:330-333`,
+//! `azure-openai-responses.ts:324-327`). Every other api ignores it.
 //!
-//! CFG-104 (pi @f1b2e77f5) adds `Model.samplingParamsByThinkingLevel` between the two layers and
-//! moves the merge into `resolveSamplingParams`, which the adapters call too — see the `cfg104_`
-//! cases at the bottom.
+//! Shape @f1b2e77f5 (PROV-123 / PROV-146 / CFG-104): pi `c01f687e5` (#9506) made the adapters apply
+//! the model's defaults themselves, so a direct `stream()` / `complete()` keeps them, and
+//! `76dfb88f6` (#9776) put both sites behind `resolveSamplingParams` (`api/simple-options.ts:24-34`),
+//! which spreads `model.samplingParams`, then `model.samplingParamsByThinkingLevel[clamp(level)]`,
+//! then the request map. It is called from `buildBaseOptions` (`simple-options.ts:42`) AND from each
+//! adapter's tail (`openai-completions.ts:1004-1007`, `openai-responses.ts:383-386`,
+//! `azure-openai-responses.ts:243-246`); resolving twice is idempotent. See the `prov123_` and
+//! `cfg104_` cases at the bottom.
 //!
 //! pi captures the body with `onPayload` and throws out of the callback; cyrup's `build_body` /
 //! `build_params` are the same function pi's payload comes from, called directly — no live socket,
@@ -156,8 +162,15 @@ fn agent026_omits_sampling_params_when_neither_side_sets_them() {
     assert_eq!(body.get("top_p"), None);
 }
 
-/// pi: "applies model-level sampling params" — the half that needs `Model.sampling_params` to exist
-/// at all, and the reason the merge lives in `build_base_options` rather than in each adapter.
+/// pi @v0.84.1: "applies model-level sampling params" — the half that needs `Model.sampling_params`
+/// to exist at all. When AGENT-026 ported it, this was the reason the merge lived in
+/// `build_base_options` rather than in each adapter: pi merged the model's defaults only in
+/// `buildBaseOptions` (`simple-options.ts:27-33` @v0.84.1), so only `streamSimple` saw them.
+/// Upstream reversed that in `c01f687e5` (#9506: "Direct stream()/complete() calls ... dropped
+/// them"), and since `76dfb88f6` both `buildBaseOptions` (`simple-options.ts:42` @f1b2e77f5) and
+/// each adapter (`openai-completions.ts:1004` @f1b2e77f5) call `resolveSamplingParams`. This case
+/// still pins the `streamSimple` path; the direct path is
+/// `prov123_each_openai_compatible_adapter_applies_model_level_params_on_a_direct_stream`.
 #[test]
 fn agent026_applies_model_level_sampling_params() {
     let model = completions_model(Some(sampling(&[
@@ -443,8 +456,8 @@ fn cfg104_each_openai_compatible_adapter_applies_level_params_without_build_base
 
 /// pi: "uses medium sampling params for summary-only openai-responses requests" — the level is
 /// `reasoningEffort ?? (reasoningSummary ? "medium" : undefined)` (`openai-responses.ts:363`).
-/// The azure half of pi's `it.each` is not portable: cyrup's azure options carry no
-/// `reasoningSummary` (see `azure_openai_responses::build_params`).
+/// The azure half of pi's `it.each` is
+/// [`prov150_summary_only_azure_request_uses_medium_effort_and_the_medium_entry`].
 #[test]
 fn cfg104_summary_only_responses_request_uses_the_medium_entry() {
     let model = leveled_model(
@@ -468,6 +481,72 @@ fn cfg104_summary_only_responses_request_uses_the_medium_entry() {
     let payload = direct_payload(&model, &opts);
     assert_eq!(payload["reasoning"]["effort"], json!("medium"));
     assert_eq!(payload.get("temperature"), Some(&json!(0.8)));
+}
+
+/// PROV-150 — the azure half of pi's "uses medium sampling params for summary-only %s requests"
+/// (`test/sampling-options.test.ts:198-215` @f1b2e77f5). pi `azure-openai-responses.ts:224`:
+/// `reasoningEffort = options?.reasoningEffort ?? (options?.reasoningSummary ? "medium" :
+/// undefined)`, which opens the reasoning arm with the unmapped effort `"medium"`, sends
+/// `summary: options?.reasoningSummary || "auto"` plus `include` (`:226-234`), and resolves
+/// sampling at `reasoningEffort ?? "off"` (`:243`). The extra clauses are the row's Verify: with no
+/// summary (or an explicit `null`, which is falsy) the `off` entry is sent and no
+/// `reasoning.summary`, and a typed `Detailed` reaches the wire.
+#[test]
+fn prov150_summary_only_azure_request_uses_medium_effort_and_the_medium_entry() {
+    use crate::api::azure_openai_responses::AzureOpenAiResponsesOptions;
+    use crate::api::openai_responses::ReasoningSummary;
+    let model = leveled_model(
+        "azure-openai-responses",
+        None,
+        crate::model::SamplingParamsByThinkingLevel {
+            off: Some(sampling(&[("temperature", json!(0.7))])),
+            medium: Some(sampling(&[("temperature", json!(0.8))])),
+            ..Default::default()
+        },
+    );
+    let with_summary = |summary: Option<ReasoningSummary>| StreamOptions {
+        api_options: Some(crate::stream::ApiStreamOptions::AzureOpenAiResponses(
+            AzureOpenAiResponsesOptions {
+                reasoning_summary: summary,
+                ..Default::default()
+            },
+        )),
+        ..Default::default()
+    };
+
+    // pi's case: summary only, reasoning off.
+    let payload = direct_payload(&model, &with_summary(Some(ReasoningSummary::Auto)));
+    assert_eq!(payload["reasoning"]["effort"], json!("medium"));
+    assert_eq!(payload["reasoning"]["summary"], json!("auto"));
+    assert_eq!(payload["include"], json!(["reasoning.encrypted_content"]));
+    assert_eq!(payload.get("temperature"), Some(&json!(0.8)));
+
+    // No summary, and an explicit `null` (falsy in pi's `?:` and `||`): the `off` entry, and the
+    // off arm's `{effort: "none"}` with no summary and no `include`.
+    for summary in [None, Some(ReasoningSummary::Null)] {
+        let payload = direct_payload(&model, &with_summary(summary));
+        assert_eq!(payload.get("temperature"), Some(&json!(0.7)), "{summary:?}");
+        assert_eq!(
+            payload["reasoning"],
+            json!({ "effort": "none" }),
+            "{summary:?}"
+        );
+        assert!(payload.get("include").is_none(), "{summary:?}");
+    }
+
+    // A typed summary reaches `reasoning.summary`, on the summary-only path and with an effort.
+    let payload = direct_payload(&model, &with_summary(Some(ReasoningSummary::Detailed)));
+    assert_eq!(
+        payload["reasoning"],
+        json!({ "effort": "medium", "summary": "detailed" })
+    );
+    let mut opts = with_summary(Some(ReasoningSummary::Concise));
+    opts.reasoning = cyrup_core::ModelThinkingLevel::High;
+    let payload = direct_payload(&model, &opts);
+    assert_eq!(
+        payload["reasoning"],
+        json!({ "effort": "high", "summary": "concise" })
+    );
 }
 
 /// pi: "is ignored by non-OpenAI-compatible APIs", for the per-level map too.
@@ -520,4 +599,90 @@ fn cfg104_model_json_keeps_pis_two_sibling_keys_and_round_trips() {
     assert!(bare.get("samplingParamsByThinkingLevel").is_none());
     let back: Model = serde_json::from_value(bare).unwrap();
     assert_eq!(back.sampling_params, None, "absent keys are the outer None");
+}
+
+// ---------------------------------------------------------------------------------------------
+// PROV-123 — the model's defaults on a DIRECT stream (no `build_base_options` in front).
+// ---------------------------------------------------------------------------------------------
+
+/// pi `it.each([...three apis])`: "applies model-level sampling params with request keys taking
+/// precedence for %s" (`test/sampling-options.test.ts:114-125` @f1b2e77f5, #9506), preceded by
+/// PROV-123's own Verify case: a model carrying only a FLAT `{top_p: 0.5}` and a
+/// `StreamOptions::default()` must still put `top_p` on the wire. `cfg104_each_*` above cannot catch
+/// a flat-only regression, because both of its flat keys are overwritten by the level or request
+/// layer.
+#[test]
+fn prov123_each_openai_compatible_adapter_applies_model_level_params_on_a_direct_stream() {
+    for api in [
+        "openai-completions",
+        "openai-responses",
+        "azure-openai-responses",
+    ] {
+        let mut model = completions_model(Some(sampling(&[("top_p", json!(0.5))])));
+        model.api = api.into();
+        let payload = direct_payload(&model, &StreamOptions::default());
+        assert_eq!(
+            payload.get("top_p"),
+            Some(&json!(0.5)),
+            "{api}: a flat model default must reach a direct request with no request map"
+        );
+
+        let mut model = completions_model(Some(sampling(&[
+            ("top_p", json!(0.95)),
+            ("min_p", json!(0.05)),
+        ])));
+        model.api = api.into();
+        let opts = StreamOptions {
+            sampling_params: Some(sampling(&[("top_p", json!(0.5))])),
+            ..Default::default()
+        };
+        let payload = direct_payload(&model, &opts);
+        assert_eq!(
+            payload.get("top_p"),
+            Some(&json!(0.5)),
+            "{api}: request key wins"
+        );
+        assert_eq!(
+            payload.get("min_p"),
+            Some(&json!(0.05)),
+            "{api}: the model key the request does not mention survives"
+        );
+    }
+}
+
+/// PROV-146 "no params at all yields `None`", the tighter case: the model HAS a per-level map, but
+/// no entry for the effective level (a non-reasoning model clamps every request to `off`), and
+/// neither a flat nor a request map. pi's guard is
+/// `model.samplingParams || thinkingLevelParams || requestParams` (`simple-options.ts:31`
+/// @f1b2e77f5), so the result is `undefined` and nothing is assigned to the body.
+#[test]
+fn prov146_resolve_yields_none_when_no_layer_applies() {
+    let mut model = leveled_model(
+        "openai-completions",
+        None,
+        crate::model::SamplingParamsByThinkingLevel {
+            high: Some(sampling(&[
+                ("temperature", json!(0.6)),
+                ("top_p", json!(0.9)),
+            ])),
+            ..Default::default()
+        },
+    );
+    model.reasoning = false;
+    assert!(
+        crate::utils::simple_options::resolve_sampling_params(
+            &model,
+            cyrup_core::ModelThinkingLevel::High,
+            None,
+        )
+        .is_none(),
+        "`high` clamps to `off` on a non-reasoning model, which has no entry"
+    );
+    let opts = StreamOptions {
+        reasoning: cyrup_core::ModelThinkingLevel::High,
+        ..Default::default()
+    };
+    let payload = direct_payload(&model, &opts);
+    assert_eq!(payload.get("temperature"), None);
+    assert_eq!(payload.get("top_p"), None);
 }

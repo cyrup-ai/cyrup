@@ -136,14 +136,14 @@
 		"openai": {
 			"source": "https://pi.dev/api/models/providers/openai",
 			"module": "packages/ai/src/providers/openai.models.ts",
-			"fetchedAt": "2026-09-28T18:48:42Z",
-			"revision": "sha256-6ffe40ba88d306a8412c9cc415b71210b5bf34573fc2e6544564eed74c029dfc"
+			"fetchedAt": "2026-10-09T12:42:07Z",
+			"revision": "sha256-3ff185d61544e1bbe1daf233d8af4b9d19a01311153d67acc4a91a1ca6f1c214"
 		},
 		"openai-codex": {
 			"source": "https://pi.dev/api/models/providers/openai-codex",
 			"module": "packages/ai/src/providers/openai-codex.models.ts",
-			"fetchedAt": "2026-09-28T18:48:45Z",
-			"revision": "sha256-6ffe40ba88d306a8412c9cc415b71210b5bf34573fc2e6544564eed74c029dfc"
+			"fetchedAt": "2026-10-09T12:42:09Z",
+			"revision": "sha256-3ff185d61544e1bbe1daf233d8af4b9d19a01311153d67acc4a91a1ca6f1c214"
 		},
 		"opencode": {
 			"source": "https://pi.dev/api/models/providers/opencode",

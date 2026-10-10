@@ -166,6 +166,12 @@ fn tool_search_is_confined_to_the_openai_responses_catalog() {
             // the GPT-6 trio joined it on both providers. Both facts arrived with PROV-071's live
             // refresh, and the invariant this test exists for — tool search never reaches an
             // `anthropic-messages` row — is asserted above and unaffected by either.
+            // `openai-codex/gpt-6.1-sol` joined with CFG-102's scoped
+            // `gen-catalogs --only openai-codex` (pi `12c416e1a`; `generate-models.ts:367-379`
+            // @f1b2e77f5 puts it in `OPENAI_TOOL_SEARCH_MODEL_IDS`, applied to Codex at `:901-913`).
+            // `openai/gpt-6.1-sol` carries the same flag (`applyOpenAIToolSearchMetadata`
+            // `:900-912` covers `openai`/`openai-responses` too) and joined with PROV-151's scoped
+            // `gen-catalogs --only openai`.
             "openai-codex/gpt-5.5",
             "openai-codex/gpt-5.6-luna",
             "openai-codex/gpt-5.6-sol",
@@ -173,6 +179,7 @@ fn tool_search_is_confined_to_the_openai_responses_catalog() {
             "openai-codex/gpt-6-astra",
             "openai-codex/gpt-6-luna",
             "openai-codex/gpt-6-sol",
+            "openai-codex/gpt-6.1-sol",
             "openai/gpt-5.4",
             "openai/gpt-5.4-mini",
             "openai/gpt-5.4-pro",
@@ -183,6 +190,7 @@ fn tool_search_is_confined_to_the_openai_responses_catalog() {
             "openai/gpt-6-astra",
             "openai/gpt-6-luna",
             "openai/gpt-6-sol",
+            "openai/gpt-6.1-sol",
         ],
         "the tool-search blast radius changed"
     );

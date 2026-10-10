@@ -520,10 +520,12 @@ fn tool_search_is_off_for_every_openai_responses_model_but_the_seven() {
     // cyrup carries the same data as `compat.supportsToolSearch` in
     // `providers/catalog/openai.json`. `openai-codex` contributes nothing — cyrup does not port
     // `openai-codex-responses`.
-    // Ten since PROV-071's live refresh: `OPENAI_TOOL_SEARCH_MODEL_IDS` gained the GPT-6 trio.
+    // Eleven since PROV-151 added `gpt-6.1-sol` (pi `12c416e1a`; `OPENAI_TOOL_SEARCH_MODEL_IDS`,
+    // `generate-models.ts:367-379` @f1b2e77f5). Ten after PROV-071's live refresh: the set gained
+    // the GPT-6 trio.
     // Seven while the catalog was frozen at `b0c2a90e`, which is why this constant was named for
     // the count; the name is kept because the count is still the claim.
-    const ENABLED: [&str; 10] = [
+    const ENABLED: [&str; 11] = [
         "gpt-5.4",
         "gpt-5.4-mini",
         "gpt-5.4-pro",
@@ -534,6 +536,7 @@ fn tool_search_is_off_for_every_openai_responses_model_but_the_seven() {
         "gpt-6-astra",
         "gpt-6-luna",
         "gpt-6-sol",
+        "gpt-6.1-sol",
     ];
 
     let mut on: Vec<(String, String)> = Vec::new();
