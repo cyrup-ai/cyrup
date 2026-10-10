@@ -26,6 +26,9 @@ futures = { workspace = true }
 # from ICU 77.1 (Node 22's ICU); see `ui::locale_compare`.
 icu_collator = { version = "2.2.1", default-features = false, features = ["serde"] }
 icu_provider_blob = { version = "2.3.0", default-features = false }
+# `sync` makes the collator's data payloads `Arc`-backed, so the collator can live in a `static`.
+# Without it the build only links where another crate in the graph happens to enable it.
+icu_provider = { version = "2.3.1", default-features = false, features = ["sync"] }
 # `cjkBreakRegex` (`utils.ts:54`) matches `Script_Extensions`; the features are the ones
 # `idna_adapter` already builds `icu_properties` with.
 icu_properties = { version = "2.2", default-features = false, features = ["compiled_data"] }
