@@ -117,7 +117,7 @@ pub struct Cli {
     pub exclude_tools: Vec<String>,
 
     // ---- resources (args.ts:149-170) ----
-    /// Load an extension file (repeatable).
+    /// Load an extension file or `builtin:<name>` (repeatable).
     #[arg(short = 'e', long = "extension", allow_hyphen_values = true)]
     pub extension: Vec<PathBuf>,
     /// Disable extension discovery (explicit `-e` paths still work).

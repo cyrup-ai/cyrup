@@ -314,17 +314,12 @@ pub fn resolve_prompt_input(
     }
 }
 
-/// Is `value` a local filesystem path (vs a package-source spec)? Port of Pi `isLocalPath`
-/// (paths.ts): `npm:`/`git:`/`github:`/`http:`/`https:`/`ssh:`-prefixed specs are NOT local.
-pub fn is_local_path(value: &str) -> bool {
-    let t = value.trim();
-    !(t.starts_with("npm:")
-        || t.starts_with("git:")
-        || t.starts_with("github:")
-        || t.starts_with("http:")
-        || t.starts_with("https:")
-        || t.starts_with("ssh:"))
-}
+/// Is `value` a local filesystem path (vs a package-source spec)? Pi has ONE `isLocalPath`
+/// (`utils/paths.ts` @f1b2e77f5), so this is cyrup-resources' port of it: `npm:`/`git:`/`github:`/
+/// `http:`/`https:`/`ssh:`-prefixed specs are NOT local, and neither is a `builtin:<name>` built-in
+/// extension (EXT-094), so `-e builtin:llama.cpp` reaches the session as written instead of joined
+/// onto the cwd.
+pub use cyrup_resources::package::source::is_local_path;
 
 /// Resolve relative CLI resource paths to absolute against `cwd`, leaving package-source specs alone
 /// (Pi `resolveCliPaths`, main.ts:450-451). An already-absolute local path is kept verbatim.

@@ -31,8 +31,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Context;
-use cyrup_config::{AuthStore, ConfigDirs, ModelFile, SettingsStore};
+use cyrup_config::{AuthStore, ConfigDirs, ModelFile, SettingsManager, SettingsStore};
 use cyrup_provider::Provider;
+use cyrup_resources::package::manifest::BUILTIN_PATH_PREFIX;
 use cyrup_session_svc::{
     AgentSession, AgentSessionRuntime, ScopedModel, SessionConfig, SessionFactory, SessionTarget,
     TrustPromptFn,
@@ -50,8 +51,9 @@ use crate::timings;
 /// 0. **llama.cpp** (EXT-027) goes FIRST, because pi loads its `builtInExtensions` ahead of
 ///    everything else: `extensionFactories = [...builtInExtensions, ...(options?.extensionFactories
 ///    ?? [])]` (`main.ts:569`) with `llama.cpp` the head of `builtInExtensions`
-///    (`extensions/index.ts:7-8`). Attached unconditionally, in every mode and inside a subagent
-///    child, exactly as upstream has it in every session: `llama_extension_for_env` never gates.
+///    (`extensions/index.ts:7-8`). Attached in every mode and inside a subagent child, exactly as
+///    upstream has it in every session — `llama_extension_for_env` never gates — unless the
+///    `extensions` setting disables `builtin:llama.cpp` ([`BuiltinSelection`], EXT-094).
 ///    `--no-extensions` switches it off through `NativeExtension::is_ambient() -> true` (a child
 ///    is NOT among the natives its launcher re-injects, so it loses it too), and it stays out of
 ///    the startup `[Extensions]` list through `is_hidden` (`resource-loader.ts:729`,
@@ -110,14 +112,37 @@ use crate::timings;
 ///    child re-execs this binary in Print/Json mode, and contributing 15 templates plus a skill to
 ///    every child would put the skill into every child's system prompt for a pipeline the child is
 ///    not running.
+///
+/// The four natives pi ships as `builtin:<name>` extension resources — llama.cpp, codemode,
+/// tool-search and mcp — attach only when `builtins` selects them (EXT-094): see
+/// [`BuiltinSelection`].
 fn attach_native_extensions(
     mut builder: SessionFactory,
     dirs: &ConfigDirs,
     session_cwd: PathBuf,
+    builtins: &BuiltinSelection,
 ) -> anyhow::Result<SessionFactory> {
     let agent_dir: &Path = &dirs.agent_dir;
-    if let Some(ext) = cyrup_llama::llama_extension_for_env(agent_dir) {
-        builder = builder.with_native_extension(ext);
+    // `-e builtin:<name>` naming no built-in: pi's loader records `Unknown built-in extension:
+    // builtin:<name>` against that path (`loadExtensionPaths`, `core/resource-loader.ts`). An
+    // explicit `-e` path survives `--no-extensions`, so the placeholder is inline-tier.
+    for name in &builtins.unknown {
+        let path = format!("{BUILTIN_PATH_PREFIX}{name}");
+        builder = quarantine(
+            builder,
+            &path,
+            cyrup_ext::QuarantinedTier::Inline,
+            &format!("Unknown built-in extension: {path}"),
+        );
+    }
+    if builtins.attaches(cyrup_llama::LLAMA_PROVIDER_ID) {
+        if builtins.is_explicit(cyrup_llama::LLAMA_PROVIDER_ID) {
+            builder = builder.with_native_extension(Arc::new(
+                cyrup_llama::LlamaExtension::new(agent_dir.to_path_buf()).loaded_explicitly(),
+            ));
+        } else if let Some(ext) = cyrup_llama::llama_extension_for_env(agent_dir) {
+            builder = builder.with_native_extension(ext);
+        }
     }
     // The bundled worked virtual-model router ([`crate::router_example`]), behind
     // `CYRUP_ROUTER_EXAMPLE`. Gated OFF by default and attached the same way `llama` is, so an
@@ -131,14 +156,27 @@ fn attach_native_extensions(
     // `codemode` is the next entry of pi's `builtInExtensions` (`extensions/index.ts:9-14`
     // @v1.0.1), registered inactive and replaceable. Its scripts run in V8 isolates
     // ([`cyrup_codemode_runtime::tool::EngineSandboxFactory`], ADR-0031).
-    builder = builder.with_codemode(cyrup_codemode_runtime::CodemodeExtension::new(
-        cyrup_codemode_runtime::tool::CodemodeHostSlot::new(),
-        Arc::new(cyrup_codemode_runtime::tool::EngineSandboxFactory),
-    ));
+    //
+    // `-e builtin:codemode` attaches it but cannot keep it under `--no-extensions`: its ambient
+    // tier is fixed in `cyrup-codemode-runtime`, which has no explicit-load constructor.
+    if builtins.attaches(cyrup_codemode_runtime::EXTENSION_ID) {
+        builder = builder.with_codemode(cyrup_codemode_runtime::CodemodeExtension::new(
+            cyrup_codemode_runtime::tool::CodemodeHostSlot::new(),
+            Arc::new(cyrup_codemode_runtime::tool::EngineSandboxFactory),
+        ));
+    }
     // `tool_search` follows it (`extensions/index.ts:12` @v1.0.1): registered inactive and
     // replaceable, it loads `codemode` and `deferred` tools into the active set on request.
-    builder =
-        builder.with_native_extension(Arc::new(cyrup_tool_search::ToolSearchExtension::new()));
+    if builtins.attaches(cyrup_tool_search::EXTENSION_ID) {
+        let ext = cyrup_tool_search::ToolSearchExtension::new();
+        builder = builder.with_native_extension(Arc::new(
+            if builtins.is_explicit(cyrup_tool_search::EXTENSION_ID) {
+                ext.loaded_explicitly()
+            } else {
+                ext
+            },
+        ));
+    }
     // A malformed `intercom/config.json`, or an unusable `PI_INTERCOM_ASK_TIMEOUT_MS`, REFUSES
     // this extension. Both of upstream's equivalents throw from the first two lines of the
     // extension factory itself — `loadConfig()` (`pi-intercom/index.ts:648` @v0.16.0, throwing from
@@ -233,8 +271,20 @@ fn attach_native_extensions(
     if let Some(ic) = intercom_ext {
         builder = builder.with_native_extension(ic);
     }
-    if let Some(ext) = cyrup_mcp::mcp_extension_for_env(agent_dir, None, session_cwd.clone()) {
-        builder = builder.with_native_extension(ext);
+    if builtins.attaches(cyrup_mcp::EXTENSION_ID) {
+        if builtins.is_explicit(cyrup_mcp::EXTENSION_ID) {
+            let mcp_dirs =
+                cyrup_mcp::dirs::McpDirs::new(agent_dir.to_path_buf(), session_cwd.clone());
+            builder = builder.with_native_extension(
+                cyrup_mcp::McpExtension::new(mcp_dirs)
+                    .loaded_explicitly()
+                    .into_arc(),
+            );
+        } else if let Some(ext) =
+            cyrup_mcp::mcp_extension_for_env(agent_dir, None, session_cwd.clone())
+        {
+            builder = builder.with_native_extension(ext);
+        }
     }
     if let Some(ext) =
         cyrup_permission_system::permission_extension_for_env(agent_dir.to_path_buf(), session_cwd)
@@ -348,7 +398,7 @@ fn subagent_attachment(
 /// pi's `resolveProjectTrusted` reads it at project-trust.ts:72-75 for every host.
 pub fn build_factory(
     provider: Arc<dyn Provider>,
-    config: SessionConfig,
+    mut config: SessionConfig,
     settings_store: Arc<dyn SettingsStore>,
     auth_store: Arc<AuthStore>,
     dirs: &ConfigDirs,
@@ -356,6 +406,7 @@ pub fn build_factory(
     trust_prompt: Option<TrustPromptFn>,
 ) -> anyhow::Result<Arc<SessionFactory>> {
     let session_cwd = config.cwd.clone();
+    let builtins = BuiltinSelection::resolve(&mut config, &settings_store, dirs);
     // The resolver's providers read the SAME store `/login` writes through (`.auth` below).
     let credentials = cyrup_config::login::runtime_credentials(auth_store.clone());
     let mut builder = SessionFactory::new(provider, config)
@@ -373,7 +424,96 @@ pub fn build_factory(
         builder,
         dirs,
         session_cwd,
+        &builtins,
     )?))
+}
+
+/// The names pi's `builtInExtensions` gives its built-in extensions (`extensions/index.ts`), each
+/// an extension resource `builtin:<name>`. cyrup's natives for them load under the same ids.
+pub const BUILTIN_EXTENSIONS: [&str; 4] = [
+    cyrup_llama::LLAMA_PROVIDER_ID,
+    cyrup_codemode_runtime::EXTENSION_ID,
+    cyrup_tool_search::EXTENSION_ID,
+    cyrup_mcp::EXTENSION_ID,
+];
+
+/// Which built-in extensions this launch attaches (EXT-094).
+///
+/// pi resolves each built-in as an extension resource (`DefaultPackageManager.resolve` and
+/// `resolveExtensionSources`, `core/package-manager.ts`): it loads by default, a `-builtin:<name>`
+/// (or `!` glob) in the `extensions` setting disables it, and `-e builtin:<name>` loads it
+/// explicitly — into `cliEnabledExtensions`, which wins over the setting and which
+/// `--no-extensions` keeps (`core/resource-loader.ts`). cyrup decides the first two here, at
+/// attach; `--no-extensions` stays the builder's `is_ambient` gate, so an explicit built-in is
+/// attached as a non-ambient one.
+///
+/// Only the USER `extensions` array is read, once per factory. pi lets a project `+`/`-`/`!` entry
+/// override it and re-resolves on every `resolve()` (so `/reload` sees a changed setting), but
+/// project settings exist only once project trust is resolved, and cyrup resolves that inside the
+/// session build, after the natives are attached.
+#[derive(Debug, Default)]
+struct BuiltinSelection {
+    /// Built-ins `-e builtin:<name>` named.
+    explicit: Vec<String>,
+    /// `-e builtin:<name>` names that are no built-in.
+    unknown: Vec<String>,
+    /// Built-ins the user `extensions` setting disables.
+    disabled: Vec<&'static str>,
+}
+
+impl BuiltinSelection {
+    /// Take the `builtin:` entries out of `config.extra_extension_paths` — they name no file for
+    /// the discovery the builder runs over that list — and read the user `extensions` setting.
+    fn resolve(
+        config: &mut SessionConfig,
+        settings_store: &Arc<dyn SettingsStore>,
+        dirs: &ConfigDirs,
+    ) -> Self {
+        let mut selection = Self::default();
+        config.extra_extension_paths.retain(|path| {
+            let Some(name) = path
+                .to_str()
+                .and_then(|p| p.strip_prefix(BUILTIN_PATH_PREFIX))
+            else {
+                return true;
+            };
+            let bucket = if BUILTIN_EXTENSIONS.contains(&name) {
+                &mut selection.explicit
+            } else {
+                &mut selection.unknown
+            };
+            if !bucket.iter().any(|n| n == name) {
+                bucket.push(name.to_string());
+            }
+            false
+        });
+        let user = SettingsManager::load(Arc::clone(settings_store), false)
+            .global()
+            .extension_paths();
+        selection.disabled = BUILTIN_EXTENSIONS
+            .into_iter()
+            .filter(|name| {
+                !cyrup_resources::package::manifest::builtin_extension_enabled(
+                    name,
+                    &user,
+                    &dirs.agent_dir,
+                    &[],
+                    &dirs.cwd,
+                )
+            })
+            .collect();
+        selection
+    }
+
+    /// Whether the built-in `name` is attached: named by `-e`, or not disabled by the setting.
+    fn attaches(&self, name: &str) -> bool {
+        self.is_explicit(name) || !self.disabled.contains(&name)
+    }
+
+    /// Whether `-e builtin:<name>` named it, which keeps it under `--no-extensions`.
+    fn is_explicit(&self, name: &str) -> bool {
+        self.explicit.iter().any(|n| n == name)
+    }
 }
 
 /// The per-run, post-build session knobs, and whether pi's modelless hard stop applies to this
@@ -1061,7 +1201,7 @@ mod tests {
         TrustPromptFn,
     };
 
-    use super::build_factory;
+    use super::{BUILTIN_EXTENSIONS, build_factory};
 
     /// The id both [`cyrup_llama::LlamaExtension`] and the provider it registers carry
     /// (`provider.ts` `LLAMA_PROVIDER_ID`).
@@ -1129,6 +1269,19 @@ mod tests {
         interactive: bool,
         no_extensions: bool,
     ) -> (Arc<SessionFactory>, cyrup_session_svc::SessionTarget) {
+        factory_with(provider, agent_dir, cwd, interactive, |config| {
+            config.no_extensions = no_extensions;
+        })
+    }
+
+    /// [`factory_over`] with the per-run [`SessionConfig`] knobs set by `configure`.
+    fn factory_with(
+        provider: Arc<dyn Provider>,
+        agent_dir: &Path,
+        cwd: &Path,
+        interactive: bool,
+        configure: impl FnOnce(&mut SessionConfig),
+    ) -> (Arc<SessionFactory>, cyrup_session_svc::SessionTarget) {
         let env = cyrup_config::EnvVars {
             home: Some(agent_dir.to_path_buf()),
             ..cyrup_config::EnvVars::default()
@@ -1143,7 +1296,7 @@ mod tests {
         let mut config = SessionConfig::new(cwd.to_path_buf(), agent_dir.to_path_buf());
         config.persist = false;
         config.trust_override = Some(true);
-        config.no_extensions = no_extensions;
+        configure(&mut config);
         let target = config.target.clone();
 
         let factory = build_factory(
@@ -2232,5 +2385,175 @@ mod tests {
         );
         assert_eq!(only.source.as_deref(), Some("extension"));
         println!("tool-budget-quarantine-ok");
+    }
+
+    // ============================================================================================
+    // EXT-094 — the built-ins are extension resources named `builtin:<name>`: the user
+    // `extensions` setting disables one by name, and `-e builtin:<name>` loads one explicitly,
+    // also under `--no-extensions` (pi `core/package-manager.ts` `resolve()` /
+    // `resolveExtensionSources`, `core/resource-loader.ts` `noExtensions ? cliEnabledExtensions`).
+    // ============================================================================================
+
+    /// What [`launch_with_builtins`] observed: the loaded ids, the runtime diagnostics, and every
+    /// entry of the `[Extension issues]` panel (`startup_diagnostics.extensions`, as
+    /// `<path>: <error>`), which also holds the non-fatal ones `diagnostics` leaves out — a `-e`
+    /// path that does not exist among them.
+    struct BuiltinLaunch {
+        loaded: Vec<String>,
+        diagnostics: Vec<RuntimeDiagnostic>,
+        issues: Vec<String>,
+    }
+
+    /// A hermetic launch through `build_factory` + `AgentSessionRuntime::create`, with the global
+    /// `settings.json` holding `settings` (when given), `--no-extensions` set by `no_extensions`,
+    /// and `extensions` passed as `-e`.
+    async fn launch_with_builtins(
+        settings: Option<&str>,
+        no_extensions: bool,
+        extensions: &[&str],
+    ) -> BuiltinLaunch {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path().join("project");
+        let agent_dir = tmp.path().join("agent");
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        if let Some(json) = settings {
+            std::fs::write(agent_dir.join("settings.json"), json).unwrap();
+        }
+        let (factory, target) = factory_with(
+            Arc::new(FauxProvider::new()),
+            &agent_dir,
+            &cwd,
+            false,
+            |config| {
+                config.no_extensions = no_extensions;
+                config.extra_extension_paths =
+                    extensions.iter().map(std::path::PathBuf::from).collect();
+            },
+        );
+        let runtime = AgentSessionRuntime::create(factory, target).await.unwrap();
+        let diagnostics = runtime.diagnostics().await;
+        let session = runtime.session().await;
+        let services = session.services();
+        let loaded = services
+            .ext_host
+            .loaded_ids()
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        let issues = services
+            .startup_diagnostics
+            .extensions
+            .iter()
+            .map(|d| format!("{}: {}", d.path.display(), d.error))
+            .collect();
+        BuiltinLaunch {
+            loaded,
+            diagnostics,
+            issues,
+        }
+    }
+
+    /// `ids` without `id`.
+    fn without(ids: &[String], id: &str) -> Vec<String> {
+        ids.iter().filter(|i| i.as_str() != id).cloned().collect()
+    }
+
+    /// Verify, first clause: a settings entry removes ONLY llama.cpp. The loaded set is exactly the
+    /// default launch's minus `llama.cpp`, so every other built-in (mcp, tool-search, codemode's
+    /// absence-or-presence included) is untouched; `-builtin:mcp` shows the name is what decides.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_settings_entry_disables_only_the_built_in_it_names() {
+        let default = launch_with_builtins(None, false, &[]).await.loaded;
+        assert!(
+            default.iter().any(|i| i == LLAMA_ID) && default.iter().any(|i| i == MCP_ID),
+            "the control launch loads both built-ins; got {default:?}"
+        );
+        for id in [LLAMA_ID, MCP_ID] {
+            let settings = format!(r#"{{"extensions": ["-builtin:{id}"]}}"#);
+            let run = launch_with_builtins(Some(&settings), false, &[]).await;
+            assert_eq!(
+                run.loaded,
+                without(&default, id),
+                "`-builtin:{id}` disables {id} and nothing else"
+            );
+            assert!(
+                run.diagnostics.is_empty() && run.issues.is_empty(),
+                "no diagnostic for a setting: {:?} {:?}",
+                run.diagnostics,
+                run.issues
+            );
+        }
+    }
+
+    /// Verify, second clause: `--no-extensions -e builtin:llama.cpp` keeps only it. The loaded set
+    /// is exactly the bare `--no-extensions` launch's plus `llama.cpp`, so no other built-in comes
+    /// back with it — and the `builtin:` entry never reaches the file discovery, which would report
+    /// it as a missing path.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn no_extensions_with_an_explicit_built_in_keeps_only_that_built_in() {
+        let bare = launch_with_builtins(None, true, &[]).await.loaded;
+        for id in BUILTIN_EXTENSIONS {
+            assert!(
+                !bare.iter().any(|i| i == id),
+                "--no-extensions drops {id}; got {bare:?}"
+            );
+        }
+        for id in [LLAMA_ID, cyrup_tool_search::EXTENSION_ID, MCP_ID] {
+            let path = format!("builtin:{id}");
+            let run = launch_with_builtins(None, true, &[&path]).await;
+            let loaded = &run.loaded;
+            assert!(
+                loaded.iter().any(|i| i == id),
+                "-ne -e {path} loads {id}; got {loaded:?}"
+            );
+            assert_eq!(
+                without(loaded, id),
+                bare,
+                "-ne -e {path} adds {id} and nothing else"
+            );
+            assert!(
+                run.diagnostics.is_empty() && run.issues.is_empty(),
+                "-ne -e {path} reports nothing, and is never looked up as a file: {:?} {:?}",
+                run.diagnostics,
+                run.issues
+            );
+        }
+    }
+
+    /// `-e builtin:<name>` is in pi's `cliEnabledExtensions`, merged ahead of the settings-resolved
+    /// set, so the command line loads a built-in the setting disabled.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_explicit_built_in_loads_over_a_settings_entry() {
+        let settings = r#"{"extensions": ["-builtin:llama.cpp"]}"#;
+        let loaded = launch_with_builtins(Some(settings), false, &["builtin:llama.cpp"])
+            .await
+            .loaded;
+        assert!(
+            loaded.iter().any(|i| i == LLAMA_ID),
+            "-e builtin:llama.cpp wins over -builtin:llama.cpp; got {loaded:?}"
+        );
+    }
+
+    /// A name that is no built-in is pi's `Unknown built-in extension: builtin:<name>` load error,
+    /// reported against that path — under `--no-extensions` too, since it is an explicit `-e` path.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unknown_built_in_is_a_load_error() {
+        for no_extensions in [false, true] {
+            let diags = launch_with_builtins(None, no_extensions, &["builtin:nope"])
+                .await
+                .diagnostics;
+            let errors: Vec<&RuntimeDiagnostic> =
+                diags.iter().filter(|d| d.severity == "error").collect();
+            assert_eq!(errors.len(), 1, "-ne={no_extensions}: {diags:?}");
+            assert_eq!(
+                errors.first().map(|d| d.message.as_str()),
+                Some(
+                    "Failed to load extension \"builtin:nope\": \
+                     Unknown built-in extension: builtin:nope"
+                ),
+                "-ne={no_extensions}"
+            );
+        }
     }
 }

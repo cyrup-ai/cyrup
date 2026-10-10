@@ -54,8 +54,11 @@ impl PinRef {
 }
 
 /// True if `value` is a local path rather than a package source / remote URL (1:1 with Pi
-/// `isLocalPath`, utils/paths.ts:41-55): `npm:`/`git:`/`github:`/`http:`/`https:`/`ssh:` prefixes are
-/// non-local; bare names, relative paths, and `file:` URLs are local.
+/// `isLocalPath`, `utils/paths.ts` @f1b2e77f5): `npm:`/`git:`/`github:`/`http:`/`https:`/`ssh:`
+/// prefixes are non-local, and so is a `builtin:<name>` built-in extension (EXT-094); bare names,
+/// relative paths, and `file:` URLs are local.
+///
+/// The one copy: the CLI's `-e`/`--skill` path resolution (`cyrup::cli::is_local_path`) re-exports it.
 pub fn is_local_path(value: &str) -> bool {
     let trimmed = value.trim();
     !(trimmed.starts_with("npm:")
@@ -63,7 +66,8 @@ pub fn is_local_path(value: &str) -> bool {
         || trimmed.starts_with("github:")
         || trimmed.starts_with("http:")
         || trimmed.starts_with("https:")
-        || trimmed.starts_with("ssh:"))
+        || trimmed.starts_with("ssh:")
+        || trimmed.starts_with(super::manifest::BUILTIN_PATH_PREFIX))
 }
 
 impl PackageSource {
@@ -199,6 +203,23 @@ pub fn id_dir_name(id: &PackageId) -> String {
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod local_path_tests {
+    use super::is_local_path;
+
+    /// Pi `isLocalPath` (`utils/paths.ts` @f1b2e77f5) lists `builtin:` with the package-source
+    /// prefixes: `builtin:llama.cpp` names a built-in extension, not a file (EXT-094).
+    #[test]
+    fn a_builtin_extension_is_not_a_local_path() {
+        assert!(!is_local_path("builtin:llama.cpp"));
+        assert!(!is_local_path("  builtin:mcp"));
+        assert!(is_local_path("./builtin:llama.cpp"));
+        assert!(is_local_path("ext/builtin.ts"));
+        assert!(!is_local_path("npm:x"));
+        assert!(is_local_path("file:///w/ext.ts"));
+    }
 }
 
 #[cfg(test)]

@@ -218,6 +218,22 @@ fn extension_flags_thread_into_config() {
     assert!(bare.extra_extension_paths.is_empty());
 }
 
+/// EXT-094 — `-e builtin:<name>` names a built-in extension, not a file: pi's `isLocalPath` is
+/// false for it (`utils/paths.ts`), so `resolveCliPaths` leaves it as written. Joined onto the cwd it
+/// would reach the session as `/work/builtin:llama.cpp`, which no `builtin:` lookup recognises.
+#[test]
+fn a_builtin_extension_is_not_resolved_against_the_cwd() {
+    let config = parse(&["-e", "builtin:llama.cpp", "-e", "ext-a.ts"])
+        .to_session_config(&dirs(), AppMode::Print);
+    assert_eq!(
+        config.extra_extension_paths,
+        vec![
+            PathBuf::from("builtin:llama.cpp"),
+            PathBuf::from("/work/ext-a.ts")
+        ]
+    );
+}
+
 #[test]
 fn captured_extension_flag_values_thread_into_config() {
     // Pi `extensionFlagValues: parsed.unknownFlags` (main.ts:634): the unknown `--flag[=val]`

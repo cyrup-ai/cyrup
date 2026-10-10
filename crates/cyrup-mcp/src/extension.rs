@@ -192,6 +192,9 @@ pub struct McpExtension {
     /// defaults to `OpenerLauncher` and no caller ever set the field. This is the seam that was
     /// missing, not the launcher.
     browser_launcher: Option<Arc<dyn crate::oauth::BrowserLauncher>>,
+    /// Named on the command line by `-e builtin:mcp` (EXT-094); see
+    /// [`Self::loaded_explicitly`].
+    explicit: bool,
 }
 
 impl McpExtension {
@@ -562,7 +565,18 @@ impl McpExtension {
             home: None,
             auth_store: None,
             browser_launcher: None,
+            explicit: false,
         }
+    }
+
+    /// The adapter as `-e builtin:mcp` loads it (EXT-094): pi names its MCP support
+    /// `builtin:mcp`, and an explicit `-e` path is kept under `--no-extensions`
+    /// (`noExtensions ? cliEnabledExtensions : …`, `core/resource-loader.ts`), so it is not
+    /// [ambient](NativeExtension::is_ambient).
+    #[must_use]
+    pub fn loaded_explicitly(mut self) -> Self {
+        self.explicit = true;
+        self
     }
 
     /// Wrap into the `Arc` an extension is used as, binding the self-handle in the same step.
@@ -2239,9 +2253,10 @@ impl NativeExtension for McpExtension {
     /// installs, and `native_survives_no_extensions` consults exactly this method to implement
     /// `--no-extensions`. Returning `false` — the default, meaning "the embedder named me
     /// explicitly", which is pi's INLINE factory tier — would make `--no-extensions` mean something
-    /// different in the two products.
+    /// different in the two products. The one exception is an adapter `-e builtin:mcp` named
+    /// ([`Self::loaded_explicitly`]): that path is in `cliEnabledExtensions`, which the flag keeps.
     fn is_ambient(&self) -> bool {
-        true
+        !self.explicit
     }
 
     // `decides_project_trust` is deliberately NOT overridden, and the default `false` is the whole
