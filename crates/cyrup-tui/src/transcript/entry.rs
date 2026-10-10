@@ -397,6 +397,18 @@ pub struct ToolRun {
     /// The raw tool-call arguments (`renderCall(args)`) — the path/command/pattern/offset/limit/…
     /// each tool's header is built from. `Value::Null` when a start was missed.
     pub args: Value,
+    /// `ToolExecutionComponent.argsComplete` (`tool-execution.ts:56`), reaching renderers through
+    /// the render context (`:132`; declared `core/extensions/types.ts:483`).
+    ///
+    /// `false` while the model is still streaming this call's argument JSON, `true` from the
+    /// `toolcall_end` that completes it — pi's `setArgsComplete()` (`:181-185`). Upstream renderers
+    /// branch on it rather than merely displaying it: `renderers/edit.ts:186` computes its diff
+    /// preview only once the arguments are final, and `renderers/write.ts:153` keys its cache on it.
+    ///
+    /// A run created by `ToolExecutionStart` is born `true`: cyrup emits that event with the
+    /// complete arguments, so a call the TUI first learns about there has nothing left to stream
+    /// (TUI-165).
+    pub args_complete: bool,
     /// The raw tool result (`{content, details, terminate}`; `renderResult(result)`) — carries the
     /// per-tool `details` (edit `diff`, bash/read/grep/find/ls `truncation`, …). `None` while running.
     pub result: Option<Value>,

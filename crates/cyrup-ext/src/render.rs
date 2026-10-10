@@ -53,6 +53,18 @@ pub struct RenderOptions {
     /// `ToolRenderResultOptions.isPartial` (`types.ts:417` @v0.84.4) — whether the result being
     /// rendered is a partial/streaming one. `false` on the surfaces whose bag does not carry it.
     pub is_partial: bool,
+    /// `ToolRenderContext.argsComplete` (`core/extensions/types.ts:483` @v1.1.0) — whether the
+    /// model has finished writing this call's argument JSON. `ToolExecutionComponent` holds it
+    /// (`tool-execution.ts:56`), hands it to the renderer (`:132`) and flips it in
+    /// `setArgsComplete()` (`:181-185`).
+    ///
+    /// Renderers BRANCH on it rather than merely displaying it: `renderers/edit.ts:186` computes
+    /// its diff preview only once the arguments are final, and `renderers/write.ts:153` keys its
+    /// cache on it — so a renderer invoked mid-stream must be told, or it caches a truncated call.
+    /// `true` on every surface that is not a streaming tool call, which is the shape-preserving
+    /// value: a row the host first learns about at `ToolExecutionStart` has complete arguments by
+    /// construction (TUI-165).
+    pub args_complete: bool,
     /// `ToolRenderContext.isError` (`extensions/types.ts`) — whether the tool call being rendered
     /// failed. Pi hands it to `renderResult` next to the options bag, not inside it; it rides here
     /// because this struct is the one value the host re-invokes a renderer under, and it is a
@@ -79,6 +91,9 @@ impl RenderOptions {
             output_pad,
             is_partial: false,
             is_error: false,
+            // Complete unless a caller says otherwise: every surface but a streaming tool CALL
+            // either has the finished arguments or has no arguments at all.
+            args_complete: true,
             duration_ms: None,
             theme,
         }
@@ -89,6 +104,14 @@ impl RenderOptions {
     #[must_use]
     pub fn partial(mut self, is_partial: bool) -> Self {
         self.is_partial = is_partial;
+        self
+    }
+
+    /// [`Self::partial`]'s sibling for `ToolRenderContext.argsComplete`: `false` while the model is
+    /// still streaming this call's argument JSON (pi's pre-`setArgsComplete` state).
+    #[must_use]
+    pub fn args_complete(mut self, args_complete: bool) -> Self {
+        self.args_complete = args_complete;
         self
     }
 
@@ -134,12 +157,17 @@ mod tests {
     fn the_wire_spelling_is_upstreams() {
         let opts = RenderOptions::new(true, 2, Some("dark".into()))
             .partial(true)
-            .errored(true);
+            .errored(true)
+            .args_complete(false);
         let json = opts.to_json();
         assert!(json.contains("\"expanded\":true"), "{json}");
         assert!(json.contains("\"outputPad\":2"), "{json}");
         assert!(json.contains("\"isPartial\":true"), "{json}");
         assert!(json.contains("\"isError\":true"), "{json}");
+        // TUI-165: `argsComplete` rides the same bag, in upstream's spelling. It is a NEW key in
+        // `opts-json` and NOT a WIT signature change — the bag is a JSON string, so a guest built
+        // against an older SDK still links and simply does not read it.
+        assert!(json.contains("\"argsComplete\":false"), "{json}");
         assert!(json.contains("\"theme\":\"dark\""), "{json}");
         assert_eq!(RenderOptions::from_json(&json), opts);
     }
