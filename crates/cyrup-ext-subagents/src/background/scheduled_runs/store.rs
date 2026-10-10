@@ -65,7 +65,7 @@ use crate::jsonl::BoundedJsonlWriter;
 
 use super::schedule::{
     ScheduleEvent, ScheduleHistory, ScheduleId, ScheduleRecord, ScheduleRunId, ScheduleRunRecord,
-    ScheduleVersion, parse_schedule, parse_schedule_history,
+    ScheduleRunState, ScheduleVersion, parse_schedule, parse_schedule_history,
 };
 use super::{MAX_HISTORY, SCHEDULES_SUBDIR};
 
@@ -79,6 +79,11 @@ pub const EVENTS_FILE: &str = "events.jsonl";
 pub const RUNS_SUBDIR: &str = "runs";
 /// `active.lock` — the overlap primitive (`:856`).
 pub const ACTIVE_LOCK_FILE: &str = "active.lock";
+
+/// SUBA-183 — how long [`ScheduleStore::write_run`] waits for another writer's `history.json`
+/// lock: pi `withFileLease(filePath, action, waitMs = 200)` (`src/shared/file-lease.ts:61`
+/// @ `ad11b7ab`).
+pub const DEFAULT_HISTORY_LEASE_WAIT: std::time::Duration = std::time::Duration::from_millis(200);
 
 /// The mode every schedule directory is created with — pi's `{ mode: 0o700 }` (`:234`, `:255`,
 /// `:269`).
@@ -198,6 +203,15 @@ pub enum ScheduleStoreError {
     /// A containment refusal — `assertScheduleRoot` (`:250`, `:256`) or `scheduleDir` (`:263`,
     /// `:272`). `String` carries upstream's verbatim sentence.
     Refused(String),
+    /// SUBA-183 — the `history.json` lock was still held by another writer when
+    /// [`ScheduleStore::write_run`]'s bound ran out. `file` is the ABSOLUTE `history.json` path
+    /// (`realpath(dirname)/basename`, as pi `withFileLease` builds it), and the display is pi's
+    /// sentence verbatim (`src/shared/file-lease.ts:69` @ `ad11b7ab`):
+    /// `` throw new Error(`Timed out waiting for another process to finish updating ${absolute}.`) ``
+    LeaseTimeout {
+        /// The file whose update could not be serialized in time.
+        file: PathBuf,
+    },
 }
 
 impl std::fmt::Display for ScheduleStoreError {
@@ -206,6 +220,11 @@ impl std::fmt::Display for ScheduleStoreError {
             Self::Io(error) => write!(f, "{error}"),
             Self::Invalid { reason, .. } | Self::Refused(reason) => f.write_str(reason),
             Self::NotFound { id } => write!(f, "Schedule '{id}' not found."),
+            Self::LeaseTimeout { file } => write!(
+                f,
+                "Timed out waiting for another process to finish updating {}.",
+                file.display()
+            ),
         }
     }
 }
@@ -240,6 +259,9 @@ impl From<io::Error> for ScheduleStoreError {
 pub struct ScheduleStore {
     root: PathBuf,
     project_cwd: Option<PathBuf>,
+    /// SUBA-183 — [`DEFAULT_HISTORY_LEASE_WAIT`] everywhere but the tests that shorten (or, for
+    /// the "really blocked" row, lengthen) it.
+    history_lease_wait: std::time::Duration,
 }
 
 impl ScheduleStore {
@@ -253,7 +275,17 @@ impl ScheduleStore {
         Self {
             root,
             project_cwd: project_cwd.as_deref().map(resolve_path),
+            history_lease_wait: DEFAULT_HISTORY_LEASE_WAIT,
         }
+    }
+
+    /// The same store with a different `history.json` lock bound — the test seam pi exposes as
+    /// `withFileLease`'s `waitMs` parameter.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_history_lease_wait(mut self, wait: std::time::Duration) -> Self {
+        self.history_lease_wait = wait;
+        self
     }
 
     /// The store root this instance addresses.
@@ -513,16 +545,126 @@ impl ScheduleStore {
             .map_err(|reason| ScheduleStoreError::Invalid { file, reason })
     }
 
-    /// pi `ScheduleStore.writeRun` (`:369-376`) — the run file, the rewritten capped history, and
-    /// one event line, in that order.
+    /// pi `ScheduleStore.getRun` (`src/runs/background/scheduled-runs.ts:406-414` @ `ad11b7ab`,
+    /// from `650244c3`) — the run's own receipt, `runs/<run_id>.json`:
+    ///
+    /// ```text
+    /// /** The run's own receipt; it is written before history.json and is never trimmed. */
+    /// getRun(id: string, runId: string): ScheduleRunRecord | undefined {
+    ///     if (!SCHEDULE_ID.test(runId)) throw new Error(`Invalid schedule run id '${runId}'.`);
+    ///     const file = path.join(scheduleDir(this.root, id, false, this.projectCwd), "runs", `${runId}.json`);
+    ///     if (!fs.existsSync(file)) return undefined;
+    ///     const run = readJson(file, "schedule run") as ScheduleRunRecord;
+    ///     if (run?.id !== runId || run.scheduleId !== id) throw new Error(`Schedule run '${file}' has invalid fields.`);
+    ///     return run;
+    /// }
+    /// ```
+    ///
+    /// The run-id grammar check is the [`ScheduleRunId`] type itself. `Ok(None)` on ENOENT.
+    ///
+    /// # Errors
+    ///
+    /// [`ScheduleStoreError::Invalid`] with pi's `Schedule run '<file>' has invalid fields.` for a
+    /// receipt naming another run or schedule (or `readJson`'s own message for one that is not a
+    /// run record at all), a containment refusal, or an I/O failure.
+    pub async fn get_run(
+        &self,
+        id: &ScheduleId,
+        run_id: &ScheduleRunId,
+    ) -> Result<Option<ScheduleRunRecord>, ScheduleStoreError> {
+        let file = self
+            .directory(id, false)
+            .await?
+            .join(RUNS_SUBDIR)
+            .join(format!("{}.json", run_id.as_str()));
+        let bytes = match tokio::fs::read(&file).await {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let run: ScheduleRunRecord =
+            serde_json::from_slice(&bytes).map_err(|error| ScheduleStoreError::Invalid {
+                file: file.clone(),
+                reason: format!("Failed to read schedule run '{}': {error}", file.display()),
+            })?;
+        if &run.id != run_id || &run.schedule_id != id {
+            return Err(ScheduleStoreError::Invalid {
+                reason: format!("Schedule run '{}' has invalid fields.", file.display()),
+                file,
+            });
+        }
+        Ok(Some(run))
+    }
+
+    /// pi `ScheduledRunManager.activeRun` (`scheduled-runs.ts:1134-1137` @ `ad11b7ab`):
+    ///
+    /// ```text
+    /// if (!schedule.activeRunId) return undefined;
+    /// return store.getRun(schedule.id, schedule.activeRunId) ?? store.history(schedule.id).find((run) => run.id === schedule.activeRunId);
+    /// ```
+    ///
+    /// The receipt first because it is written BEFORE `history.json` and is never trimmed, so a
+    /// history update that timed out (or was lost to a concurrent writer at an older build) cannot
+    /// make a live claim look absent.
+    ///
+    /// # Errors
+    ///
+    /// As [`ScheduleStore::get_run`] and [`ScheduleStore::history`].
+    pub async fn active_run(
+        &self,
+        schedule: &ScheduleRecord,
+    ) -> Result<Option<ScheduleRunRecord>, ScheduleStoreError> {
+        let Some(active) = schedule.active_run_id.as_ref() else {
+            return Ok(None);
+        };
+        if let Some(run) = self.get_run(&schedule.id, active).await? {
+            return Ok(Some(run));
+        }
+        Ok(self
+            .history(&schedule.id)
+            .await?
+            .into_iter()
+            .find(|run| &run.id == active))
+    }
+
+    /// pi `ScheduleStore.writeRun` (`src/runs/background/scheduled-runs.ts:416-428` @ `ad11b7ab`,
+    /// SUBA-183 / `650244c3`) — the receipt, then the capped history and one event line UNDER A
+    /// LOCK:
+    ///
+    /// ```text
+    /// writePrivateAtomicJson(path.join(dir, "runs", `${run.id}.json`), run);
+    /// // Sessions sharing this project update history.json from their own snapshots.
+    /// withFileLease(path.join(dir, "history.json"), () => {
+    ///     // An earlier update may have timed out; a run's own receipt is newer than a "running" entry.
+    ///     const earlier = this.history(schedule.id).filter((item) => item.id !== run.id)
+    ///         .map((item) => item.state === "running" ? this.getRun(schedule.id, item.id) ?? item : item);
+    ///     const runs = [run, ...earlier].slice(0, MAX_HISTORY);
+    ///     writePrivateAtomicJson(path.join(dir, "history.json"), { schemaVersion: 1, runs });
+    ///     fs.appendFileSync(path.join(dir, "events.jsonl"), ...);
+    /// });
+    /// ```
     ///
     /// History is newest-first, de-duplicated by run id (a run written twice as it moves
     /// `running` -> `completed` occupies ONE slot, carrying its latest state) and truncated to
     /// [`MAX_HISTORY`].
     ///
+    /// # `[CYRUP-DELTA]` — `flock` on `history.json.lock`, not pi's `mkdir` lease
+    ///
+    /// The lock is [`cyrup_config::lock::FileLock`] on the sidecar `<realpath dir>/history.json.lock`
+    /// — the same primitive (and the same `<file>.lock` naming) the SUBA-029 agent-override writers
+    /// hold (`discovery/settings_write.rs` `lock_settings_file`). pi uses a `mkdir` lease with an
+    /// `owner.json` (`src/shared/file-lease.ts`) because node has no advisory lock; `flock` is
+    /// released by the kernel when its owner dies (no pid-reuse window, no unreadable-owner wedge)
+    /// and excludes in-process callers too. The BOUND is pi's: [`DEFAULT_HISTORY_LEASE_WAIT`]
+    /// (200 ms) around the acquire, and a timeout is pi's sentence
+    /// ([`ScheduleStoreError::LeaseTimeout`]). Residue: `flock` on some network filesystems
+    /// (sshfs, CIFS `nobrl`) is local-only, where pi's `mkdir` lease is NFS-atomic.
+    ///
     /// # Errors
     ///
-    /// A containment refusal, an unreadable existing history, or an I/O failure.
+    /// [`ScheduleStoreError::LeaseTimeout`] when another writer held the lock for the whole bound
+    /// (the receipt is then already on disk and `history.json` untouched), a containment refusal,
+    /// an unreadable existing history or receipt, or an I/O failure.
     pub async fn write_run(
         &self,
         schedule: &ScheduleRecord,
@@ -535,16 +677,40 @@ impl ScheduleStore {
             .join(format!("{}.json", run.id.as_str()));
         crate::background::atomic::write_private_atomic_json(&run_file, run).await?;
 
+        // pi `withFileLease` (`file-lease.ts:62-64`): `path.join(realpathSync.native(dirname),
+        // basename)` — the lock and the timeout sentence both name the PHYSICAL file.
+        let history_file = tokio::fs::canonicalize(&dir).await?.join(HISTORY_FILE);
+        let _lock = match tokio::time::timeout(
+            self.history_lease_wait,
+            cyrup_config::lock::FileLock::acquire(&history_file, None),
+        )
+        .await
+        {
+            Ok(Ok(lock)) => lock,
+            Ok(Err(error)) => return Err(io::Error::other(error.to_string()).into()),
+            Err(_elapsed) => {
+                return Err(ScheduleStoreError::LeaseTimeout { file: history_file });
+            }
+        };
+
         let mut runs = vec![run.clone()];
-        runs.extend(
-            self.history(&schedule.id)
-                .await?
-                .into_iter()
-                .filter(|item| item.id != run.id),
-        );
+        for item in self.history(&schedule.id).await? {
+            if item.id == run.id {
+                continue;
+            }
+            // `:421-423` — an earlier update may have timed out; a run's own receipt is newer
+            // than a "running" entry.
+            if item.state == ScheduleRunState::Running
+                && let Some(receipt) = self.get_run(&schedule.id, &item.id).await?
+            {
+                runs.push(receipt);
+            } else {
+                runs.push(item);
+            }
+        }
         runs.truncate(MAX_HISTORY);
         crate::background::atomic::write_private_atomic_json(
-            &dir.join(HISTORY_FILE),
+            &history_file,
             &ScheduleHistory {
                 schema_version: ScheduleVersion,
                 runs,
@@ -612,6 +778,10 @@ impl ScheduleStore {
     /// another run holds it. What to DO about that — skip, steal, or recover a stale claim after
     /// `STALE_LAUNCH_CLAIM_MS` — is part B's policy and is deliberately not decided here.
     ///
+    /// A failure to write the run id into a lock this call CREATED removes that lock again (if it
+    /// is still this call's file) before the error is returned — see
+    /// [`ScheduleStore::acquire_active_lock_with`].
+    ///
     /// # Errors
     ///
     /// A containment refusal or an I/O failure other than "already exists".
@@ -620,20 +790,130 @@ impl ScheduleStore {
         id: &ScheduleId,
         run_id: &ScheduleRunId,
     ) -> Result<bool, ScheduleStoreError> {
+        self.acquire_active_lock_with(id, run_id, |mut file, bytes| async move {
+            use tokio::io::AsyncWriteExt as _;
+            let written = async {
+                file.write_all(&bytes).await?;
+                file.flush().await
+            }
+            .await;
+            (file, written)
+        })
+        .await
+    }
+
+    /// [`ScheduleStore::acquire_active_lock`] with the post-create write as a seam — the
+    /// fault-injection point SUBA-182's rows drive. `write` receives the freshly created handle
+    /// and the run id's bytes, and must hand the handle BACK with its result: the handle has to
+    /// stay open until the cleanup below has compared it with the path.
+    ///
+    /// # SUBA-182 — a claim whose write fails removes its own empty lock, and only its own
+    ///
+    /// pi `launch` (`src/runs/background/scheduled-runs.ts:942-958` @ `ad11b7ab`, from `cccba0cf`
+    /// with `1edc2b20`'s exact id compare):
+    ///
+    /// ```text
+    /// lock = fs.openSync(lockPath, "wx", 0o600);
+    /// fs.writeFileSync(lock, run.id, "utf-8");
+    /// fs.closeSync(lock);
+    /// } catch (error) {
+    ///     if (lock !== undefined) {
+    ///         // An empty or partial claim would make every later launch skip. Keep the
+    ///         // descriptor open until the inode check so a replacement owner's lock survives.
+    ///         try {
+    ///             // Bigint stats: Windows file ids exceed 2^53, so number inodes of nearby files can compare equal.
+    ///             const owned = fs.fstatSync(lock, { bigint: true });
+    ///             const current = fs.lstatSync(lockPath, { bigint: true });
+    ///             if (owned.ino !== 0n && owned.dev === current.dev && owned.ino === current.ino) fs.rmSync(lockPath);
+    ///         } catch { /* Preserve the original error. */ }
+    ///         try { fs.closeSync(lock); } catch { /* Preserve the original error. */ }
+    ///         throw error;
+    ///     }
+    /// ```
+    ///
+    /// Before this, a `write_all`/`flush` failure (ENOSPC) returned through `?` and left an EMPTY
+    /// `active.lock` with no `active_run_id` on the record — and `restore_one`'s stale-claim
+    /// recovery only runs when `active_run_id` is set, so every later fire skipped forever.
+    ///
+    /// The descriptor is held open across the compare for the reason pi gives: while it is open
+    /// the inode cannot be recycled, so a REPLACEMENT owner that unlinked and re-created the path
+    /// in the meantime necessarily has a different `(dev, ino)` and its lock survives. Cleanup
+    /// failures are swallowed and the ORIGINAL error returned, as upstream.
+    ///
+    /// `[CYRUP-DELTA]` off unix, Rust's stable std exposes no file id for an open handle
+    /// (`MetadataExt::file_index`/`volume_serial_number` are unstable), so the compare cannot be
+    /// made and the lock is NOT removed: failing closed keeps a replacement owner's lock safe at
+    /// the cost of leaving the pre-fix wedge on that platform.
+    ///
+    /// # Errors
+    ///
+    /// As [`ScheduleStore::acquire_active_lock`], plus `write`'s own error.
+    pub async fn acquire_active_lock_with<W, Fut>(
+        &self,
+        id: &ScheduleId,
+        run_id: &ScheduleRunId,
+        write: W,
+    ) -> Result<bool, ScheduleStoreError>
+    where
+        W: FnOnce(tokio::fs::File, Vec<u8>) -> Fut,
+        Fut: std::future::Future<Output = (tokio::fs::File, io::Result<()>)>,
+    {
         let path = self.directory(id, true).await?.join(ACTIVE_LOCK_FILE);
         let mut options = tokio::fs::OpenOptions::new();
         options.create_new(true).write(true);
         #[cfg(unix)]
         // `tokio::fs::OpenOptions::mode` is inherent under `cfg(unix)` — no extension trait.
         options.mode(FILE_MODE);
-        match options.open(&path).await {
-            Ok(mut file) => {
-                use tokio::io::AsyncWriteExt as _;
-                file.write_all(run_id.as_str().as_bytes()).await?;
-                file.flush().await?;
-                Ok(true)
+        let file = match options.open(&path).await {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
+        let (file, written) = write(file, run_id.as_str().as_bytes().to_vec()).await;
+        let Err(error) = written else {
+            return Ok(true);
+        };
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            if let Ok(owned) = file.metadata().await
+                && let Ok(current) = tokio::fs::symlink_metadata(&path).await
+                && owned.ino() != 0
+                && owned.dev() == current.dev()
+                && owned.ino() == current.ino()
+            {
+                // `catch { /* Preserve the original error. */ }`
+                let _ = tokio::fs::remove_file(&path).await;
             }
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(false),
+        }
+        drop(file);
+        Err(error.into())
+    }
+
+    /// pi `launch`'s unlaunched-claim release, the lock half
+    /// (`scheduled-runs.ts:999` @ `ad11b7ab`, from `650244c3`):
+    /// `if (fs.readFileSync(lockPath, "utf-8") === run.id) fs.rmSync(lockPath);` — remove
+    /// `active.lock` only while it still names `run_id`, so a claim another session recovered and
+    /// re-took in the meantime survives. `Ok(false)` when the lock is gone or names someone else.
+    ///
+    /// # Errors
+    ///
+    /// A containment refusal or an I/O failure other than "not there".
+    pub async fn release_active_lock_held_by(
+        &self,
+        id: &ScheduleId,
+        run_id: &ScheduleRunId,
+    ) -> Result<bool, ScheduleStoreError> {
+        let path = self.directory(id, false).await?.join(ACTIVE_LOCK_FILE);
+        match tokio::fs::read_to_string(&path).await {
+            Ok(contents) if contents == run_id.as_str() => {}
+            Ok(_) => return Ok(false),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error.into()),
+        }
+        match tokio::fs::remove_file(&path).await {
+            Ok(()) => Ok(true),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
             Err(error) => Err(error.into()),
         }
     }
@@ -1408,6 +1688,289 @@ mod tests {
         assert!(
             !empty_store.root().exists(),
             "a read must not create the root"
+        );
+    }
+
+    /// Hold the raw kernel lock a `history.json` writer takes — the deterministic fault seam
+    /// SUBA-183's rows use. `std::fs::File::lock` is `flock(2)` on unix, the same lock
+    /// `cyrup_config::lock::FileLock` takes, and per open file description, so it excludes this
+    /// process's own `FileLock` too.
+    fn hold_history_lock(dir: &Path) -> std::fs::File {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(dir.join(format!("{HISTORY_FILE}.lock")))
+            .expect("sidecar");
+        file.lock().expect("uncontended raw flock");
+        file
+    }
+
+    /// SUBA-182 (a), store half — pi `cccba0cf`: a claim whose run-id write fails after the
+    /// `O_EXCL` create removes its own EMPTY lock and returns the original error, so the next
+    /// claim succeeds instead of reading `EEXIST` forever.
+    #[tokio::test]
+    async fn a_claim_whose_lock_write_fails_removes_its_own_empty_lock() {
+        let project = tempfile::tempdir().expect("real tempdir");
+        let store = project_store(project.path());
+        let schedule = full_record("wedge", project.path());
+        store.write(&schedule).await.expect("writes");
+        let lock = store.root().join("wedge").join(ACTIVE_LOCK_FILE);
+
+        let error = store
+            .acquire_active_lock_with(&schedule.id, &ScheduleRunId::mint(), |file, _| async {
+                (
+                    file,
+                    Err(io::Error::other("ENOSPC: no space left on device")),
+                )
+            })
+            .await
+            .expect_err("the write failure propagates");
+        assert_eq!(
+            error.to_string(),
+            "ENOSPC: no space left on device",
+            "the ORIGINAL error, not a cleanup one"
+        );
+        assert!(
+            !lock.exists(),
+            "an empty claim left behind makes every later fire skip"
+        );
+        let next = ScheduleRunId::mint();
+        assert!(
+            store
+                .acquire_active_lock(&schedule.id, &next)
+                .await
+                .expect("acquires"),
+            "the next claim is not wedged"
+        );
+        assert_eq!(
+            store.active_lock_holder(&schedule.id).await.expect("reads"),
+            Some(next)
+        );
+    }
+
+    /// SUBA-182 (b) — `cccba0cf`/`1edc2b20`'s `(dev, ino)` check: the cleanup removes the lock
+    /// only while it is still the file THIS claim created. Here the write hook stands in for a
+    /// replacement owner that unlinked and re-created `active.lock` before our write failed; the
+    /// open handle pins our inode, so the replacement's cannot match and must survive.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_failed_claim_never_removes_a_replacement_owners_lock() {
+        let project = tempfile::tempdir().expect("real tempdir");
+        let store = project_store(project.path());
+        let schedule = full_record("replaced", project.path());
+        store.write(&schedule).await.expect("writes");
+        let lock = store.root().join("replaced").join(ACTIVE_LOCK_FILE);
+
+        let hook_lock = lock.clone();
+        let error = store
+            .acquire_active_lock_with(&schedule.id, &ScheduleRunId::mint(), |file, _| async move {
+                std::fs::remove_file(&hook_lock).expect("unlink ours");
+                std::fs::write(&hook_lock, "replacement-owner").expect("re-create");
+                (
+                    file,
+                    Err(io::Error::other("ENOSPC: no space left on device")),
+                )
+            })
+            .await
+            .expect_err("the write failure propagates");
+        assert_eq!(error.to_string(), "ENOSPC: no space left on device");
+        assert_eq!(
+            std::fs::read_to_string(&lock).expect("the replacement's lock survives"),
+            "replacement-owner"
+        );
+    }
+
+    /// SUBA-183 — pi `getRun` (`:406-414` @ `ad11b7ab`): `None` on ENOENT, the record when it
+    /// names this run and schedule, and pi's sentence when it does not.
+    #[tokio::test]
+    async fn get_run_reads_the_receipt_and_refuses_a_mismatched_one() {
+        let project = tempfile::tempdir().expect("real tempdir");
+        let store = project_store(project.path());
+        let schedule = full_record("receipts", project.path());
+        store.write(&schedule).await.expect("writes");
+        let run = run_record(
+            &schedule.id,
+            ScheduleRunId::mint(),
+            ScheduleRunState::Running,
+        );
+
+        assert_eq!(
+            store.get_run(&schedule.id, &run.id).await.expect("reads"),
+            None
+        );
+        store
+            .write_run(&schedule, &run, "schedule.run.started")
+            .await
+            .expect("writes run");
+        assert_eq!(
+            store.get_run(&schedule.id, &run.id).await.expect("reads"),
+            Some(run.clone())
+        );
+
+        let other = ScheduleRunId::mint();
+        let file = store
+            .root()
+            .join("receipts")
+            .join(RUNS_SUBDIR)
+            .join(format!("{other}.json"));
+        std::fs::write(&file, serde_json::to_vec(&run).expect("json")).expect("writes");
+        assert_eq!(
+            store
+                .get_run(&schedule.id, &other)
+                .await
+                .expect_err("a receipt naming another run is refused")
+                .to_string(),
+            format!("Schedule run '{}' has invalid fields.", file.display())
+        );
+    }
+
+    /// SUBA-183 (a) — `write_run` holds the `history.json` lock for its read-modify-write and
+    /// gives up after its bound with pi's sentence (`file-lease.ts:69`). The receipt is already
+    /// written (it is outside the lock) and `history.json` is left byte-identical.
+    #[tokio::test]
+    async fn a_held_history_lock_times_out_with_pis_sentence_and_leaves_history_untouched() {
+        let project = tempfile::tempdir().expect("real tempdir");
+        let store = project_store(project.path());
+        let schedule = full_record("contended", project.path());
+        store.write(&schedule).await.expect("writes");
+        let first = run_record(
+            &schedule.id,
+            ScheduleRunId::mint(),
+            ScheduleRunState::Missed,
+        );
+        store
+            .write_run(&schedule, &first, "schedule.missed")
+            .await
+            .expect("writes run");
+        let dir = store.directory(&schedule.id, false).await.expect("dir");
+        let before = std::fs::read(dir.join(HISTORY_FILE)).expect("history");
+
+        let _held = hold_history_lock(&dir);
+        let second = run_record(
+            &schedule.id,
+            ScheduleRunId::mint(),
+            ScheduleRunState::Missed,
+        );
+        let error = store
+            .write_run(&schedule, &second, "schedule.missed")
+            .await
+            .expect_err("another writer holds history.json");
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "Timed out waiting for another process to finish updating {}.",
+                std::fs::canonicalize(&dir)
+                    .expect("realpath")
+                    .join(HISTORY_FILE)
+                    .display()
+            )
+        );
+        assert_eq!(
+            std::fs::read(dir.join(HISTORY_FILE)).expect("history"),
+            before,
+            "history.json is byte-identical"
+        );
+        assert_eq!(
+            store
+                .get_run(&schedule.id, &second.id)
+                .await
+                .expect("reads"),
+            Some(second),
+            "the receipt is written before the lock"
+        );
+    }
+
+    /// SUBA-183 (b) — two writers appending DIFFERENT runs keep both.
+    ///
+    /// Deterministic interleaving: the test holds the raw lock, starts `store_b.write_run(B)`
+    /// (30 s bound), waits until B's receipt exists (B is past the receipt and at the lock), shows
+    /// B is blocked, then acts as the other writer — records `[A]` — and releases. B must read
+    /// `[A]` only after that, so the result is `[B, A]`.
+    ///
+    /// The only possible flakiness is a FALSE PASS at HEAD (no lock): if B happened to take longer
+    /// than the 300 ms "is it blocked" window it could read `[A]` anyway. After the fix B cannot
+    /// pass the lock while it is held, so the row cannot fail spuriously.
+    #[tokio::test]
+    async fn two_writers_appending_different_runs_keep_both() {
+        let project = tempfile::tempdir().expect("real tempdir");
+        let store_a = project_store(project.path());
+        let store_b = project_store(project.path())
+            .with_history_lease_wait(std::time::Duration::from_secs(30));
+        let schedule = full_record("shared", project.path());
+        store_a.write(&schedule).await.expect("writes");
+        let dir = store_a.directory(&schedule.id, true).await.expect("dir");
+        let run_a = run_record(
+            &schedule.id,
+            ScheduleRunId::mint(),
+            ScheduleRunState::Missed,
+        );
+        let run_b = run_record(
+            &schedule.id,
+            ScheduleRunId::mint(),
+            ScheduleRunState::Missed,
+        );
+
+        let held = hold_history_lock(&dir);
+        let mut writer_b = tokio::spawn({
+            let schedule = schedule.clone();
+            let run_b = run_b.clone();
+            async move {
+                store_b
+                    .write_run(&schedule, &run_b, "schedule.missed")
+                    .await
+            }
+        });
+        let receipt_b = dir.join(RUNS_SUBDIR).join(format!("{}.json", run_b.id));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !receipt_b.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "B never wrote its receipt"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(300), &mut writer_b)
+                .await
+                .is_err(),
+            "B must be blocked on the history lock while another writer holds it"
+        );
+
+        // The other writer's read-modify-write, under the lock it holds.
+        crate::background::atomic::write_private_atomic_json(
+            &dir.join(RUNS_SUBDIR).join(format!("{}.json", run_a.id)),
+            &run_a,
+        )
+        .await
+        .expect("receipt A");
+        crate::background::atomic::write_private_atomic_json(
+            &dir.join(HISTORY_FILE),
+            &ScheduleHistory {
+                schema_version: ScheduleVersion,
+                runs: vec![run_a.clone()],
+            },
+        )
+        .await
+        .expect("history [A]");
+        drop(held);
+
+        writer_b
+            .await
+            .expect("joins")
+            .expect("B writes once the lock is free");
+        let ids: Vec<_> = store_a
+            .history(&schedule.id)
+            .await
+            .expect("history")
+            .into_iter()
+            .map(|run| run.id)
+            .collect();
+        assert_eq!(
+            ids,
+            vec![run_b.id, run_a.id],
+            "both runs survive, newest first"
         );
     }
 }

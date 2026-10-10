@@ -146,7 +146,7 @@ impl ScheduledRunManager {
 
     /// One pass of the tick. Separated from the task so a test can drive it without a timer.
     async fn tick(&self) {
-        match super::trigger::tick_due_schedules(
+        match super::trigger::tick_timer_due_schedules(
             &self.deps.store,
             &self.deps.fire,
             crate::time::now_epoch_millis(),

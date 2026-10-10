@@ -327,6 +327,7 @@ impl SubagentExecutor {
                     executor: Arc::downgrade(self),
                     max_spawns: cfg.max_subagent_spawns_per_session,
                 }),
+                backoff: crate::background::scheduled_runs::ScheduleBackoff::default(),
             },
             cwd: cwd.to_path_buf(),
             max_pending: cfg.scheduled_runs_max_pending(),
