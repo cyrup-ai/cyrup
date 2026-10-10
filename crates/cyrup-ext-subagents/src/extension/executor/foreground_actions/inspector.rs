@@ -116,6 +116,9 @@ impl SubagentExecutor {
             // both backends' `available()` gates are a lookup in the map this fills, not a read of
             // the ambient process.
             env: crate::inspectors::actions::process_env(),
+            // SUBA-201 — pi `deps.leaseWaitMs ?? INSPECTOR_LEASE_WAIT_MS`; production never
+            // passes `leaseWaitMs`, so this is always the 30 s default.
+            lease_wait: crate::inspectors::actions::INSPECTOR_LEASE_WAIT,
         }
     }
 
@@ -152,7 +155,9 @@ impl SubagentExecutor {
             focus: Some(focus),
             pane_id: None,
         };
-        match handle_inspector_action(InspectorAction::Open, &request, &deps).await {
+        // SUBA-201 — `None`: a key press carries no cancel token. The wait is still bounded by
+        // `lease_wait`, so a held target ends in pi's timeout sentence, never a hang.
+        match handle_inspector_action(InspectorAction::Open, &request, &deps, None).await {
             Ok(result) => Ok(result
                 .content
                 .iter()

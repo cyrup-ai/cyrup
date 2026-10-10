@@ -2023,7 +2023,15 @@ impl SubagentTool {
                     // already holds a pane can reuse it, and the tool edge leaves it unset.
                     pane_id: None,
                 };
-                crate::inspectors::actions::handle_inspector_action(verb, &request, &deps).await
+                // SUBA-201 — the turn's token is upstream's `deps.signal`: it ends a wait on another
+                // open/close of the same target with pi's cancellation sentence.
+                crate::inspectors::actions::handle_inspector_action(
+                    verb,
+                    &request,
+                    &deps,
+                    Some(cancel),
+                )
+                .await
             }
             // VL-S13 — the three `refine*` verbs. ONE guard arm through
             // `RefinementAction::from_wire`, the same shape the `lane.*` and `schedule.*` arms use.

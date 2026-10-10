@@ -32,7 +32,7 @@
 
 use std::path::{Path, PathBuf};
 
-use cyrup_core::{Content, ToolError, ToolResult};
+use cyrup_core::{CancelToken, Content, ToolError, ToolResult};
 
 use super::plugins::InspectorPlugin;
 use super::session_roots_codec::encode_session_roots;
@@ -50,6 +50,14 @@ use crate::registration::authority::{
 /// pi `actions.ts:136`, verbatim — the only sentence `inspector.open` can answer with when no
 /// backend is available, and the most-read string in this subsystem on a stock Linux box.
 pub const NO_INSPECTOR_PLUGIN_AVAILABLE: &str = "No inspector plugin is available. Start a supported inspector host, or use inspector.command for a standalone command.";
+
+/// pi `INSPECTOR_LEASE_WAIT_MS` (`actions.ts:21-22` @ad11b7ab, SUBA-201):
+///
+/// ```text
+/// // Covers a provider's slowest normal open (a 15 s split or launch plus its follow-up commands).
+/// const INSPECTOR_LEASE_WAIT_MS = 30_000;
+/// ```
+pub const INSPECTOR_LEASE_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 
 // =================================================================================================
 // Inputs
@@ -121,8 +129,10 @@ pub struct LiveInspectorJob {
 /// [`Self::current_session`] (which cyrup's `resolve_async_run_id` takes where pi's
 /// `resolveSubagentRunId` reads it off `state`).
 ///
-/// `signal`/`now` are absent: cyrup's cancellation is `tokio` task-scoped and the clock a plugin
-/// needs is the plugin's own (the contract's [`InspectorContext`] carries neither).
+/// `now` is absent: the clock a plugin needs is the plugin's own (the contract's
+/// [`InspectorContext`] carries none). Upstream's `deps.signal` is not a field either: it is
+/// [`handle_inspector_action`]'s `cancel` parameter, because the token belongs to the CALL (the
+/// tool edge's turn), not to the deps a surface assembles once (SUBA-201).
 pub struct InspectorDispatcherDeps {
     /// The project root the verb was invoked in — pi `deps.cwd` (`actions.ts:113`).
     pub cwd: PathBuf,
@@ -158,6 +168,17 @@ pub struct InspectorDispatcherDeps {
     /// not-installed path — and the installed one — through this dispatcher rather than through a
     /// backend's own private field.
     pub env: std::collections::BTreeMap<String, String>,
+    /// How long `inspector.open` / `inspector.close` wait for another open or close of the same
+    /// target — pi `leaseWaitMs` (`actions.ts` @ad11b7ab):
+    ///
+    /// ```text
+    /// /** How long open and close wait for another open or close of the same target. */
+    /// leaseWaitMs?: number;
+    /// ```
+    ///
+    /// Production passes [`INSPECTOR_LEASE_WAIT`]; a test passes a short bound to reach the
+    /// timeout sentence (SUBA-201).
+    pub lease_wait: std::time::Duration,
 }
 
 /// The real process environment, as [`InspectorDispatcherDeps::env`] wants it — pi's
@@ -590,6 +611,15 @@ fn build_context(
 ///    both methods and ghostty's `owns` is always false — but a third-party backend could reach
 ///    it, and it is the meaning of the contract's `Option<..>` return.
 ///
+/// 6. **`inspector.open` and `inspector.close` are serialized per target** (SUBA-201, pi
+///    `5096985c` / #2728). `status` and `command` stay unlocked, as upstream. See
+///    [`acquire_inspector_lease`] for the lock, the wait bound and the two sentences a waiter can
+///    end with; the guard is held across `plugin.open` / `owner.close` and — for close — across
+///    the `owns()` lookup too, so a close racing an open finds the binding that open wrote.
+///
+/// `cancel` is upstream's `deps.signal`: `Some` from the tool edge (the turn's token), `None`
+/// from a surface that has no token to give (the fleet overlay's `Enter`/`H` key).
+///
 /// # Errors
 ///
 /// Every upstream `isError: true` reply, as a [`ToolError`] whose message IS upstream's sentence.
@@ -597,6 +627,7 @@ pub async fn handle_inspector_action(
     action: InspectorAction,
     request: &InspectorRequest,
     deps: &InspectorDispatcherDeps,
+    cancel: Option<&CancelToken>,
 ) -> Result<ToolResult, ToolError> {
     let resolved = resolve_target(request, deps)
         .await
@@ -608,6 +639,43 @@ pub async fn handle_inspector_action(
         return Ok(management_text(
             launch_for(&resolved.target, deps).display_command,
         ));
+    }
+
+    if action == InspectorAction::Status {
+        let context = build_context(&resolved, None, deps);
+        let Some(owner) = deps.plugins.iter().find(|plugin| plugin.owns(&context)) else {
+            return Ok(no_owner(&run_id));
+        };
+        return match owner.status(&context).await {
+            Some(result) => result,
+            None => Err(ToolError::new(format!(
+                "Inspector plugin '{}' does not support status for async run {run_id}.",
+                owner.name()
+            ))),
+        };
+    }
+
+    // pi `actions.ts` @ad11b7ab, after the status branch:
+    //
+    //     // Open and close read, create and delete the target's binding. Two callers at once, including another Pi
+    //     // process sharing the run directory, would each open a pane and one binding would overwrite the other.
+    //     ...
+    //     try {
+    //         // The wait may end with the lease in the same tick the caller cancelled; never act for a cancelled caller.
+    //         if (deps.signal?.aborted) return result(`Inspector ${action} for async run ${target.runId}${label} was cancelled while waiting for another inspector open or close to finish.`, true);
+    //         ...
+    //     } finally {
+    //         release();
+    //     }
+    //
+    // `_lease` is the `finally { release() }`: dropped on every exit below, including an `Err`
+    // from the plugin (pi's "releases the target after a failed open").
+    let _lease = acquire_inspector_lease(action, &resolved.target, deps.lease_wait, cancel).await?;
+    if cancel.is_some_and(CancelToken::is_cancelled) {
+        return Err(ToolError::new(lease_cancelled_sentence(
+            action,
+            &resolved.target,
+        )));
     }
 
     if action == InspectorAction::Open {
@@ -627,27 +695,124 @@ pub async fn handle_inspector_action(
 
     let context = build_context(&resolved, None, deps);
     let Some(owner) = deps.plugins.iter().find(|plugin| plugin.owns(&context)) else {
-        return Ok(management_text(format!(
-            "No inspector plugin owns this binding for async run {run_id}."
-        )));
+        return Ok(no_owner(&run_id));
     };
-
-    if action == InspectorAction::Status {
-        return match owner.status(&context).await {
-            Some(result) => result,
-            None => Err(ToolError::new(format!(
-                "Inspector plugin '{}' does not support status for async run {run_id}.",
-                owner.name()
-            ))),
-        };
-    }
-
     match owner.close(&context).await {
         Some(result) => result,
         None => Err(ToolError::new(format!(
             "Inspector plugin '{}' does not support close for async run {run_id}.",
             owner.name()
         ))),
+    }
+}
+
+/// `actions.ts:139`'s not-an-error answer when no backend holds a binding.
+fn no_owner(run_id: &str) -> ToolResult {
+    management_text(format!(
+        "No inspector plugin owns this binding for async run {run_id}."
+    ))
+}
+
+/// pi's `label` (`actions.ts` @ad11b7ab): empty for the run root, `" child {index}"` for a child.
+///
+/// ```text
+/// const label = target.index === undefined ? "" : ` child ${target.index}`;
+/// ```
+fn lease_label(target: &InspectorTarget) -> String {
+    target
+        .child_index
+        .map_or_else(String::new, |index| format!(" child {index}"))
+}
+
+/// pi's abort sentence, verbatim (`actions.ts` @ad11b7ab):
+/// `Inspector ${action} for async run ${target.runId}${label} was cancelled while waiting for
+/// another inspector open or close to finish.`
+fn lease_cancelled_sentence(action: InspectorAction, target: &InspectorTarget) -> String {
+    format!(
+        "Inspector {} for async run {}{} was cancelled while waiting for another inspector open or close to finish.",
+        action.as_str(),
+        target.run_id,
+        lease_label(target)
+    )
+}
+
+/// pi's timeout sentence, verbatim (`actions.ts` @ad11b7ab):
+/// `Another inspector open or close for async run ${target.runId}${label} is still in progress.
+/// Try again when it finishes.`
+fn lease_timeout_sentence(target: &InspectorTarget) -> String {
+    format!(
+        "Another inspector open or close for async run {}{} is still in progress. Try again when it finishes.",
+        target.run_id,
+        lease_label(target)
+    )
+}
+
+/// The per-target open/close lock (SUBA-201) — pi `actions.ts` @ad11b7ab:
+///
+/// ```text
+/// const label = target.index === undefined ? "" : ` child ${target.index}`;
+/// const lockPath = path.join(fs.realpathSync.native(target.asyncDir), `inspector-${target.index ?? "root"}.lock`);
+/// const deadline = Date.now() + (deps.leaseWaitMs ?? INSPECTOR_LEASE_WAIT_MS);
+/// let release = tryLease(lockPath);
+/// while (!release) {
+///     if (deps.signal?.aborted) return result(`Inspector ${action} for async run ${target.runId}${label} was cancelled while waiting for another inspector open or close to finish.`, true);
+///     if (Date.now() >= deadline) return result(`Another inspector open or close for async run ${target.runId}${label} is still in progress. Try again when it finishes.`, true);
+///     await new Promise((resolve) => setTimeout(resolve, 50));
+///     release = tryLease(lockPath);
+/// }
+/// ```
+///
+/// The lock path is the same: [`FileLock`](cyrup_config::lock::FileLock) appends `.lock` to
+/// `<realpath asyncDir>/inspector-<index|root>`, so the file is pi's
+/// `inspector-<index|root>.lock`. Per TARGET, not per run: another child's open is not held up
+/// (pi's "without holding up other targets").
+///
+/// `[CYRUP-DELTA]` the mechanism. pi's `tryLease` (`src/shared/file-lease.ts`) is a `mkdir` lease
+/// with an `owner.json` (`{token, pid, hostname, processStart}`) and dead-owner reclaim, because
+/// node has no advisory lock. cyrup takes `flock` on the sidecar through
+/// `cyrup_config::lock::FileLock` — the one lock discipline SUBA-183/184 use: the kernel releases
+/// it when the owner dies (no pid-reuse window, no unreadable-owner wedge, nothing to reclaim),
+/// and it excludes in-process callers too (layer 1 is a per-path async mutex, layer 2 `flock` on
+/// an open file description). Consequences: the sidecar FILE persists after release (pi removes
+/// its lease directory), it is created with the default umask rather than pi's `0o700`, and on
+/// network filesystems where `flock` is local-only (sshfs, CIFS `nobrl`) two HOSTS are not
+/// excluded, where pi's `mkdir` is NFS-atomic. The wait is not pi's 50 ms poll: layer 1 wakes on
+/// release, layer 2 polls with backoff capped at 50 ms. The bound and the two sentences are pi's.
+///
+/// A cancel ends the wait with pi's abort sentence (`FileLock::acquire` returns
+/// `ConfigError::Cancelled`, pre-checked before any wait); the caller re-checks after a GRANTED
+/// lock, because a cancel during an in-flight attempt still yields the lock.
+async fn acquire_inspector_lease(
+    action: InspectorAction,
+    target: &InspectorTarget,
+    wait: std::time::Duration,
+    cancel: Option<&CancelToken>,
+) -> Result<cyrup_config::lock::FileLock, ToolError> {
+    // pi `fs.realpathSync.native(target.asyncDir)` — throws on failure, which rejects the call.
+    let physical = tokio::fs::canonicalize(&target.async_dir)
+        .await
+        .map_err(|error| {
+            ToolError::new(format!(
+                "Cannot resolve async run directory '{}': {error}",
+                target.async_dir.display()
+            ))
+        })?;
+    let slot = target
+        .child_index
+        .map_or_else(|| "root".to_string(), |index| index.to_string());
+    let lock_target = physical.join(format!("inspector-{slot}"));
+    match tokio::time::timeout(
+        wait,
+        cyrup_config::lock::FileLock::acquire(&lock_target, cancel),
+    )
+    .await
+    {
+        Ok(Ok(lock)) => Ok(lock),
+        Ok(Err(cyrup_config::ConfigError::Cancelled)) => {
+            Err(ToolError::new(lease_cancelled_sentence(action, target)))
+        }
+        Ok(Err(error)) => Err(ToolError::new(error.to_string())),
+        Err(_elapsed) => Err(ToolError::new(lease_timeout_sentence(target))),
     }
 }
 
@@ -720,6 +885,7 @@ mod tests {
                 agent_dir_override: Some(self.root.path().join("agent")),
                 authority_policy: None,
                 plugins: Vec::new(),
+                lease_wait: INSPECTOR_LEASE_WAIT,
             }
         }
 
@@ -1072,10 +1238,14 @@ mod tests {
         let deps = fixture.deps();
         fixture.write_run("eeee1111", 1);
 
-        let result =
-            handle_inspector_action(InspectorAction::Command, &request_for("eeee1111"), &deps)
-                .await
-                .expect("command never fails for a resolvable run");
+        let result = handle_inspector_action(
+            InspectorAction::Command,
+            &request_for("eeee1111"),
+            &deps,
+            None,
+        )
+        .await
+        .expect("command never fails for a resolvable run");
 
         let text = text_of(&result);
         assert!(
@@ -1299,9 +1469,10 @@ mod tests {
         let deps = fixture.deps();
         let dir = fixture.write_run("5555aaaa", 1);
 
-        let err = handle_inspector_action(InspectorAction::Open, &request_for("5555aaaa"), &deps)
-            .await
-            .expect_err("no backend is an error");
+        let err =
+            handle_inspector_action(InspectorAction::Open, &request_for("5555aaaa"), &deps, None)
+                .await
+                .expect_err("no backend is an error");
         assert_eq!(err.message, NO_INSPECTOR_PLUGIN_AVAILABLE);
         assert_eq!(
             err.message,
@@ -1351,9 +1522,10 @@ mod tests {
         // 1 — nothing installed.
         let mut deps = fixture.deps();
         deps.plugins = super::super::plugins::builtin_inspector_plugins();
-        let err = handle_inspector_action(InspectorAction::Open, &request_for("8888bbbb"), &deps)
-            .await
-            .expect_err("no backend is an error");
+        let err =
+            handle_inspector_action(InspectorAction::Open, &request_for("8888bbbb"), &deps, None)
+                .await
+                .expect_err("no backend is an error");
         assert_eq!(err.message, NO_INSPECTOR_PLUGIN_AVAILABLE);
         assert!(
             !dir.join("inspectors").exists(),
@@ -1378,7 +1550,8 @@ mod tests {
             ),
         ]);
         let answer =
-            handle_inspector_action(InspectorAction::Open, &request_for("8888bbbb"), &deps).await;
+            handle_inspector_action(InspectorAction::Open, &request_for("8888bbbb"), &deps, None)
+                .await;
         let text = match &answer {
             Ok(result) => text_of(result),
             Err(error) => error.message.clone(),
@@ -1397,9 +1570,10 @@ mod tests {
         deps.plugins = super::super::plugins::builtin_inspector_plugins();
         deps.env =
             std::collections::BTreeMap::from([("TERM_PROGRAM".to_owned(), "Ghostty".to_owned())]);
-        let err = handle_inspector_action(InspectorAction::Open, &request_for("8888bbbb"), &deps)
-            .await
-            .expect_err("ghostty needs darwin too");
+        let err =
+            handle_inspector_action(InspectorAction::Open, &request_for("8888bbbb"), &deps, None)
+                .await
+                .expect_err("ghostty needs darwin too");
         assert_eq!(err.message, NO_INSPECTOR_PLUGIN_AVAILABLE);
     }
 
@@ -1425,6 +1599,7 @@ mod tests {
                 ..InspectorRequest::default()
             },
             &deps,
+            None,
         )
         .await
         .expect("the available plugin opens");
@@ -1461,6 +1636,7 @@ mod tests {
                 ..InspectorRequest::default()
             },
             &deps,
+            None,
         )
         .await
         .expect("opens");
@@ -1496,7 +1672,7 @@ mod tests {
         fixture.write_run("8888aaaa", 1);
 
         for action in [InspectorAction::Status, InspectorAction::Close] {
-            let result = handle_inspector_action(action, &request_for("8888aaaa"), &deps)
+            let result = handle_inspector_action(action, &request_for("8888aaaa"), &deps, None)
                 .await
                 .unwrap_or_else(|err| panic!("{} must not be an error: {err:?}", action.as_str()));
             assert_eq!(
@@ -1534,20 +1710,28 @@ mod tests {
             ..RecordingPlugin::default()
         }));
 
-        let status =
-            handle_inspector_action(InspectorAction::Status, &request_for("9999aaaa"), &deps)
-                .await
-                .expect("owner answers");
+        let status = handle_inspector_action(
+            InspectorAction::Status,
+            &request_for("9999aaaa"),
+            &deps,
+            None,
+        )
+        .await
+        .expect("owner answers");
         assert_eq!(
             text_of(&status),
             "plugin status:the-owner",
             "the OWNER answers, not merely the first plugin in the list"
         );
 
-        let close =
-            handle_inspector_action(InspectorAction::Close, &request_for("9999aaaa"), &deps)
-                .await
-                .expect("owner answers");
+        let close = handle_inspector_action(
+            InspectorAction::Close,
+            &request_for("9999aaaa"),
+            &deps,
+            None,
+        )
+        .await
+        .expect("owner answers");
         assert_eq!(
             text_of(&close),
             "plugin close:the-owner",
@@ -1570,17 +1754,27 @@ mod tests {
             ..RecordingPlugin::default()
         }));
 
-        let err = handle_inspector_action(InspectorAction::Status, &request_for("aaaa9999"), &deps)
-            .await
-            .expect_err("unsupported is an error");
+        let err = handle_inspector_action(
+            InspectorAction::Status,
+            &request_for("aaaa9999"),
+            &deps,
+            None,
+        )
+        .await
+        .expect_err("unsupported is an error");
         assert_eq!(
             err.message,
             "Inspector plugin 'recorder' does not support status for async run aaaa9999."
         );
 
-        let err = handle_inspector_action(InspectorAction::Close, &request_for("aaaa9999"), &deps)
-            .await
-            .expect_err("unsupported is an error");
+        let err = handle_inspector_action(
+            InspectorAction::Close,
+            &request_for("aaaa9999"),
+            &deps,
+            None,
+        )
+        .await
+        .expect_err("unsupported is an error");
         assert_eq!(
             err.message,
             "Inspector plugin 'recorder' does not support close for async run aaaa9999."
@@ -1599,10 +1793,505 @@ mod tests {
             InspectorAction::Status,
             InspectorAction::Close,
         ] {
-            let err = handle_inspector_action(action, &request_for("nope"), &deps)
+            let err = handle_inspector_action(action, &request_for("nope"), &deps, None)
                 .await
                 .expect_err("unresolvable");
             assert_eq!(err.message, "No subagent run found for 'nope'.");
         }
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // SUBA-201 — open and close are serialized per target (pi `5096985c` / #2728)
+    // ---------------------------------------------------------------------------------------
+
+    /// pi's `bindingProvider` (`test/unit/inspector-registration.test.ts` @5096985c): "A provider
+    /// that reuses a saved binding and takes a moment between reading and writing it, like a real
+    /// pane split." The moment is a gate the test releases, and `entered` counts how many opens
+    /// have READ the binding — the signal that a second open got past the dispatcher.
+    #[derive(Clone)]
+    struct BindingHost {
+        bindings: std::sync::Arc<Mutex<std::collections::BTreeMap<String, String>>>,
+        panes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        entered: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        entered_signal: std::sync::Arc<tokio::sync::Notify>,
+        gate: std::sync::Arc<tokio::sync::Semaphore>,
+    }
+
+    impl BindingHost {
+        fn new() -> Self {
+            Self {
+                bindings: std::sync::Arc::default(),
+                panes: std::sync::Arc::default(),
+                entered: std::sync::Arc::default(),
+                entered_signal: std::sync::Arc::default(),
+                gate: std::sync::Arc::new(tokio::sync::Semaphore::new(0)),
+            }
+        }
+
+        fn key(ctx: &InspectorContext) -> String {
+            ctx.target
+                .child_index
+                .map_or_else(|| "root".to_string(), |index| index.to_string())
+        }
+
+        fn entered(&self) -> usize {
+            self.entered.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        /// Wait (bounded) until `count` opens have entered the plugin.
+        async fn wait_entered(&self, count: usize) {
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                while self.entered() < count {
+                    self.entered_signal.notified().await;
+                }
+            })
+            .await
+            .expect("the open must reach the plugin");
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl InspectorPlugin for BindingHost {
+        fn name(&self) -> &'static str {
+            "binding-host"
+        }
+
+        async fn available(&self, _ctx: &InspectorContext) -> bool {
+            true
+        }
+
+        fn owns(&self, ctx: &InspectorContext) -> bool {
+            self.bindings
+                .lock()
+                .is_ok_and(|bindings| bindings.contains_key(&Self::key(ctx)))
+        }
+
+        async fn open(
+            &self,
+            ctx: &InspectorContext,
+            _launch: &InspectorLaunch,
+            _params: &InspectorParams,
+        ) -> Result<ToolResult, ToolError> {
+            let key = Self::key(ctx);
+            let existing = self.bindings.lock().expect("bindings").get(&key).cloned();
+            self.entered
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.entered_signal.notify_one();
+            self.gate.acquire().await.expect("gate").forget();
+            if let Some(pane) = existing {
+                return Ok(management_text(format!("reused {pane}")));
+            }
+            let pane = format!(
+                "pane-{}",
+                self.panes.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1
+            );
+            self.bindings
+                .lock()
+                .expect("bindings")
+                .insert(key, pane.clone());
+            Ok(management_text(format!("opened {pane}")))
+        }
+
+        async fn status(&self, _ctx: &InspectorContext) -> Option<Result<ToolResult, ToolError>> {
+            Some(Ok(management_text("status")))
+        }
+
+        async fn close(&self, ctx: &InspectorContext) -> Option<Result<ToolResult, ToolError>> {
+            self.bindings
+                .lock()
+                .expect("bindings")
+                .remove(&Self::key(ctx));
+            Some(Ok(management_text("closed")))
+        }
+    }
+
+    fn child_request(id: &str, index: Option<i64>) -> InspectorRequest {
+        InspectorRequest {
+            id: Some(id.to_string()),
+            index,
+            ..InspectorRequest::default()
+        }
+    }
+
+    /// How long a "did it get past the lock?" probe waits. The ONLY flakiness these probes admit is
+    /// a FALSE PASS at the unlocked HEAD (a starved runtime not getting the racing call into the
+    /// plugin within this window); after the fix the racing call cannot get there at all.
+    const NOT_ENTERED_WITHIN: std::time::Duration = std::time::Duration::from_millis(300);
+
+    /// SUBA-201 row: "Two concurrent `inspector.open` calls on one target open one pane". pi's
+    /// "runs concurrent opens of one target one at a time and opens one pane, without holding up
+    /// other targets". The first open is parked inside the plugin; the second open of the SAME
+    /// target must not enter the plugin while it is, and an open of ANOTHER child must. Without
+    /// the lease both same-target opens read "no binding" and each creates a pane.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_opens_of_one_target_open_one_pane() {
+        let fixture = fixture();
+        let mut deps = fixture.deps();
+        fixture.write_run("201aaaa1", 2);
+        let host = BindingHost::new();
+        deps.plugins.push(Box::new(host.clone()));
+        let deps = std::sync::Arc::new(deps);
+        let open = |index: Option<i64>| {
+            let deps = std::sync::Arc::clone(&deps);
+            tokio::spawn(async move {
+                handle_inspector_action(
+                    InspectorAction::Open,
+                    &child_request("201aaaa1", index),
+                    &deps,
+                    None,
+                )
+                .await
+            })
+        };
+
+        let first = open(Some(0));
+        host.wait_entered(1).await;
+        let second = open(Some(0));
+        tokio::time::sleep(NOT_ENTERED_WITHIN).await;
+        assert_eq!(
+            host.entered(),
+            1,
+            "a second open of the same target entered the plugin while the first held it"
+        );
+        // Another child is another lock: it must not wait behind child 0.
+        let other = open(Some(1));
+        host.wait_entered(2).await;
+
+        host.gate.add_permits(3);
+        let first = text_of(&first.await.expect("join").expect("first open"));
+        let second = text_of(&second.await.expect("join").expect("second open"));
+        let other = text_of(&other.await.expect("join").expect("other open"));
+        // The two targets' opens are released together, so WHICH of them numbers its pane first
+        // is a race; compare per target, never the pane numbers across targets.
+        let bindings = host.bindings.lock().expect("bindings").clone();
+        let child0 = bindings.get("0").cloned().expect("child 0 bound");
+        let child1 = bindings.get("1").cloned().expect("child 1 bound");
+        assert_ne!(child0, child1);
+        assert_eq!(first, format!("opened {child0}"));
+        assert_eq!(second, format!("reused {child0}"));
+        assert_eq!(other, format!("opened {child1}"));
+        assert_eq!(
+            host.panes.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "one pane per target"
+        );
+    }
+
+    /// SUBA-201 row: "a racing close finds the binding the open wrote". pi's "waits for an
+    /// in-flight open before closing the same target". Unlocked, the close runs while the open is
+    /// still splitting, finds no owner, answers "No inspector plugin owns this binding" — and the
+    /// pane the open then writes is orphaned.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_racing_close_finds_the_binding_the_open_wrote() {
+        let fixture = fixture();
+        let mut deps = fixture.deps();
+        fixture.write_run("201bbbb1", 1);
+        let host = BindingHost::new();
+        deps.plugins.push(Box::new(host.clone()));
+        let deps = std::sync::Arc::new(deps);
+
+        let opening = {
+            let deps = std::sync::Arc::clone(&deps);
+            tokio::spawn(async move {
+                handle_inspector_action(
+                    InspectorAction::Open,
+                    &request_for("201bbbb1"),
+                    &deps,
+                    None,
+                )
+                .await
+            })
+        };
+        host.wait_entered(1).await;
+        let mut closing = {
+            let deps = std::sync::Arc::clone(&deps);
+            tokio::spawn(async move {
+                handle_inspector_action(
+                    InspectorAction::Close,
+                    &request_for("201bbbb1"),
+                    &deps,
+                    None,
+                )
+                .await
+            })
+        };
+        let early = tokio::time::timeout(NOT_ENTERED_WITHIN, &mut closing).await;
+        assert!(
+            early.is_err(),
+            "the close must wait for the in-flight open, it answered: {:?}",
+            early.map(|joined| joined.map(|result| result.map(|ok| text_of(&ok))))
+        );
+
+        host.gate.add_permits(1);
+        assert_eq!(
+            text_of(&opening.await.expect("join").expect("open")),
+            "opened pane-1"
+        );
+        let closed = closing.await.expect("join").expect("close");
+        assert_eq!(text_of(&closed), "closed", "the plugin's close must answer");
+        assert!(
+            host.bindings.lock().expect("bindings").is_empty(),
+            "the close must remove the binding the open wrote"
+        );
+    }
+
+    /// Hold the target's lock the way ANOTHER process would: a raw `flock` on pi's
+    /// `<realpath asyncDir>/inspector-<index|root>.lock`. `std::fs::File::lock` is `flock(2)` on
+    /// unix, the lock `FileLock`'s layer 2 takes.
+    fn hold_inspector_lock(run_dir: &Path, slot: &str) -> std::fs::File {
+        let physical = std::fs::canonicalize(run_dir).expect("canonical run dir");
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(physical.join(format!("inspector-{slot}.lock")))
+            .expect("open lock file");
+        file.lock().expect("flock");
+        file
+    }
+
+    /// SUBA-201 row: "an aborted waiter returns the cancellation sentence" — pi's exact sentence,
+    /// `isError`, and the plugin's `open` never called. Unlocked, the open goes straight to the
+    /// plugin and answers "opened".
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_aborted_waiter_returns_the_cancellation_sentence() {
+        let fixture = fixture();
+        let mut deps = fixture.deps();
+        let dir = fixture.write_run("201cccc1", 1);
+        let calls: CallLog = CallLog::default();
+        deps.plugins.push(Box::new(RecordingPlugin {
+            available: true,
+            calls: std::sync::Arc::clone(&calls),
+            ..RecordingPlugin::default()
+        }));
+        let deps = std::sync::Arc::new(deps);
+        let _held = hold_inspector_lock(&dir, "root");
+
+        let cancel = CancelToken::new();
+        let mut waiting = {
+            let deps = std::sync::Arc::clone(&deps);
+            let cancel = cancel.clone();
+            tokio::spawn(async move {
+                handle_inspector_action(
+                    InspectorAction::Open,
+                    &request_for("201cccc1"),
+                    &deps,
+                    Some(&cancel),
+                )
+                .await
+            })
+        };
+        let early = tokio::time::timeout(NOT_ENTERED_WITHIN, &mut waiting).await;
+        assert!(
+            early.is_err(),
+            "the open must wait for the held lock, it answered: {:?}",
+            early.map(|joined| joined.map(|result| result.map(|ok| text_of(&ok))))
+        );
+        cancel.cancel();
+        let err = tokio::time::timeout(std::time::Duration::from_secs(10), waiting)
+            .await
+            .expect("a cancel ends the wait")
+            .expect("join")
+            .expect_err("a cancelled waiter is an error");
+        assert_eq!(
+            err.message,
+            "Inspector inspector.open for async run 201cccc1 was cancelled while waiting for another inspector open or close to finish."
+        );
+        assert!(
+            !calls
+                .lock()
+                .expect("calls")
+                .iter()
+                .any(|call| call.starts_with("open:")),
+            "a cancelled waiter must never reach the plugin's open"
+        );
+    }
+
+    /// A caller already cancelled never acts — pi re-checks `deps.signal?.aborted` after the
+    /// lease is granted, so even an UNCONTENDED lock answers the cancellation sentence. Also pins
+    /// the action name and the ` child {index}` label on the close path.
+    #[tokio::test]
+    async fn a_pre_cancelled_caller_never_reaches_the_plugin() {
+        let fixture = fixture();
+        let mut deps = fixture.deps();
+        fixture.write_run("201dddd1", 2);
+        let calls: CallLog = CallLog::default();
+        deps.plugins.push(Box::new(RecordingPlugin {
+            available: true,
+            owns: true,
+            has_close: true,
+            calls: std::sync::Arc::clone(&calls),
+            tag: "pre",
+            ..RecordingPlugin::default()
+        }));
+        let cancel = CancelToken::new();
+        cancel.cancel();
+
+        let err = handle_inspector_action(
+            InspectorAction::Close,
+            &child_request("201dddd1", Some(1)),
+            &deps,
+            Some(&cancel),
+        )
+        .await
+        .expect_err("a cancelled close is an error");
+        assert_eq!(
+            err.message,
+            "Inspector inspector.close for async run 201dddd1 child 1 was cancelled while waiting for another inspector open or close to finish."
+        );
+        let err = handle_inspector_action(
+            InspectorAction::Open,
+            &request_for("201dddd1"),
+            &deps,
+            Some(&cancel),
+        )
+        .await
+        .expect_err("a cancelled open is an error");
+        assert_eq!(
+            err.message,
+            "Inspector inspector.open for async run 201dddd1 was cancelled while waiting for another inspector open or close to finish."
+        );
+        assert!(
+            !calls
+                .lock()
+                .expect("calls")
+                .iter()
+                .any(|call| call.starts_with("open:")),
+            "a cancelled caller must never reach the plugin's open"
+        );
+
+        // `status` and `command` stay unlocked AND unaffected by the token, as upstream.
+        let status = handle_inspector_action(
+            InspectorAction::Status,
+            &request_for("201dddd1"),
+            &deps,
+            Some(&cancel),
+        )
+        .await;
+        assert!(status.is_err(), "the recorder has no status method");
+    }
+
+    /// pi's "refuses to open while another open holds the target past the wait": a held lock and
+    /// a short `lease_wait` end in upstream's timeout sentence, `isError`, plugin untouched. And
+    /// `inspector.status` is NOT behind the lock.
+    #[tokio::test]
+    async fn a_held_target_past_the_wait_answers_the_timeout_sentence() {
+        let fixture = fixture();
+        let mut deps = fixture.deps();
+        deps.lease_wait = std::time::Duration::from_millis(50);
+        let dir = fixture.write_run("201eeee1", 2);
+        let calls: CallLog = CallLog::default();
+        deps.plugins.push(Box::new(RecordingPlugin {
+            available: true,
+            owns: true,
+            has_status: true,
+            calls: std::sync::Arc::clone(&calls),
+            tag: "held",
+            ..RecordingPlugin::default()
+        }));
+        let _root = hold_inspector_lock(&dir, "root");
+        let _child = hold_inspector_lock(&dir, "1");
+
+        let err =
+            handle_inspector_action(InspectorAction::Open, &request_for("201eeee1"), &deps, None)
+                .await
+                .expect_err("a held target past the wait is an error");
+        assert_eq!(
+            err.message,
+            "Another inspector open or close for async run 201eeee1 is still in progress. Try again when it finishes."
+        );
+        let err = handle_inspector_action(
+            InspectorAction::Close,
+            &child_request("201eeee1", Some(1)),
+            &deps,
+            None,
+        )
+        .await
+        .expect_err("a held child past the wait is an error");
+        assert_eq!(
+            err.message,
+            "Another inspector open or close for async run 201eeee1 child 1 is still in progress. Try again when it finishes."
+        );
+        assert!(
+            !calls
+                .lock()
+                .expect("calls")
+                .iter()
+                .any(|call| call.starts_with("open:")),
+            "a timed-out waiter must never reach the plugin's open"
+        );
+
+        let status = handle_inspector_action(
+            InspectorAction::Status,
+            &request_for("201eeee1"),
+            &deps,
+            None,
+        )
+        .await
+        .expect("status is not behind the lock");
+        assert_eq!(text_of(&status), "plugin status:held");
+    }
+
+    /// pi's "releases the target after a failed open": the guard is the `finally { release() }`,
+    /// so an `Err` from the plugin leaves the target free for the next open.
+    #[tokio::test]
+    async fn a_failed_open_releases_the_target() {
+        struct FailingOnce {
+            failed: std::sync::atomic::AtomicBool,
+        }
+        #[async_trait::async_trait]
+        impl InspectorPlugin for FailingOnce {
+            fn name(&self) -> &'static str {
+                "failing-once"
+            }
+            async fn available(&self, _ctx: &InspectorContext) -> bool {
+                true
+            }
+            fn owns(&self, _ctx: &InspectorContext) -> bool {
+                false
+            }
+            async fn open(
+                &self,
+                _ctx: &InspectorContext,
+                _launch: &InspectorLaunch,
+                _params: &InspectorParams,
+            ) -> Result<ToolResult, ToolError> {
+                if self.failed.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    Ok(management_text("opened"))
+                } else {
+                    Err(ToolError::new("host failed"))
+                }
+            }
+            async fn status(
+                &self,
+                _ctx: &InspectorContext,
+            ) -> Option<Result<ToolResult, ToolError>> {
+                None
+            }
+            async fn close(
+                &self,
+                _ctx: &InspectorContext,
+            ) -> Option<Result<ToolResult, ToolError>> {
+                None
+            }
+        }
+
+        let fixture = fixture();
+        let mut deps = fixture.deps();
+        fixture.write_run("201ffff1", 1);
+        deps.plugins.push(Box::new(FailingOnce {
+            failed: std::sync::atomic::AtomicBool::new(false),
+        }));
+        let err =
+            handle_inspector_action(InspectorAction::Open, &request_for("201ffff1"), &deps, None)
+                .await
+                .expect_err("the host fails");
+        assert_eq!(err.message, "host failed");
+        let ok =
+            handle_inspector_action(InspectorAction::Open, &request_for("201ffff1"), &deps, None)
+                .await
+                .expect("the target was released");
+        assert_eq!(text_of(&ok), "opened");
     }
 }
