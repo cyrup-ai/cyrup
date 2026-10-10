@@ -507,24 +507,34 @@ fn c3_mirror_short_status_row_has_no_ellipsis() {
 /// the change that embedded the indicator). The other three kinds keep their ASCII `...`.
 ///
 /// FAILS before the fix on all three: `⠋ Working… (esc to cancel)` at column 0.
+/// The LIVE path's rendered text — see `tests::status_indicator::border_text`, which this mirrors.
+/// `TUI-181` moved this file's five band reads onto `border_spans`.
+fn border_text(
+    ind: &StatusIndicator,
+    elapsed: Duration,
+    theme: &UiTheme,
+    hint: Option<&str>,
+) -> String {
+    ind.border_spans(elapsed, theme, hint, 200, None)
+        .iter()
+        .map(|s| s.content.as_ref())
+        .collect()
+}
+
 #[test]
-fn c4_c5_c12_working_band_is_inset_ascii_and_carries_no_cancel_suffix() {
+fn c4_c5_c12_working_status_is_ascii_and_carries_no_cancel_suffix() {
     let theme = UiTheme::dark();
     let mut ind = StatusIndicator::new();
     ind.working();
-    let lines = ind.lines_at(Duration::ZERO, &theme, Some("escape"));
-    let msg: String = lines[1].spans.iter().map(|s| s.content.as_ref()).collect();
+    let msg = border_text(&ind, Duration::ZERO, &theme, Some("escape"));
 
+    // C4's `paddingX 1` margins are NOT asserted here any more. They were the retired band's;
+    // `renderInBorder` strips the leading space and trims the end (`status-indicator.ts:24-27`), so
+    // the live text is `⠋ Working`. The inset the user actually sees belongs to the rule and is
+    // covered by `tests::embedded_status_border` (`starts_with("── ")`). C5 and C12 below are the
+    // live rules and move onto the border path intact.
     assert!(
-        msg.starts_with(' '),
-        "paddingX 1 left inset missing: [{msg}]"
-    );
-    assert!(
-        msg.ends_with(' '),
-        "paddingX 1 right margin missing: [{msg}]"
-    );
-    assert!(
-        msg.ends_with(" Working "),
+        msg.ends_with(" Working"),
         "`Working` with neither `...` nor U+2026 after it: [{msg}]"
     );
     assert!(
@@ -549,8 +559,7 @@ fn c5_mirror_the_other_three_states_still_carry_the_cancel_suffix() {
     ] {
         let mut ind = StatusIndicator::new();
         ind.set(kind, None);
-        let lines = ind.lines_at(Duration::ZERO, &theme, Some("escape"));
-        let msg: String = lines[1].spans.iter().map(|s| s.content.as_ref()).collect();
+        let msg = border_text(&ind, Duration::ZERO, &theme, Some("escape"));
         assert!(
             msg.contains("(escape to cancel)"),
             "{kind:?} must keep its hint: [{msg}]"
@@ -572,12 +581,8 @@ fn c8_retry_message_counts_down_once_per_second() {
     let mut ind = StatusIndicator::new();
     ind.set_retry(1, 3, 30_000);
 
-    let at = |ind: &StatusIndicator, secs: u64| -> String {
-        ind.lines_at(Duration::from_secs(secs), &theme, Some("escape"))[1]
-            .spans
-            .iter()
-            .map(|s| s.content.as_ref())
-            .collect()
+    let at = |ind: &StatusIndicator, secs: u64| {
+        border_text(ind, Duration::from_secs(secs), &theme, Some("escape"))
     };
     assert!(
         at(&ind, 0).contains("Retrying (1/3) in 30s..."),
@@ -637,14 +642,10 @@ fn c8_a_second_retry_restarts_the_countdown_from_the_top() {
         Some("Retrying (2/3) in 20s..."),
         "a fresh `RetryStatusIndicator` starts at `Math.ceil(delayMs / 1000)`, not mid-way"
     );
-    let rendered: String = ind.lines(&theme, Some("escape"))[1]
-        .spans
-        .iter()
-        .map(|s| s.content.as_ref())
-        .collect();
+    let rendered = border_text(&ind, ind.elapsed(), &theme, Some("escape"));
     assert!(
         rendered.contains("in 20s..."),
-        "…and the band renders the same number: [{rendered}]"
+        "…and the rule renders the same number: [{rendered}]"
     );
 }
 
@@ -657,11 +658,13 @@ fn c8_mirror_a_plain_message_is_not_rewritten_over_time() {
         IndicatorKind::Compaction,
         Some("Auto-compacting...".to_string()),
     );
-    // Span 0 is the spinner (which DOES advance); span 1 is the message.
+    // The spinner span DOES advance; the message is the last span, so take that one rather than a
+    // fixed index (a spinner-less custom indicator contributes no span 0 at all).
     let msg = |secs: u64| -> String {
-        ind.lines_at(Duration::from_secs(secs), &theme, None)[1].spans[1]
-            .content
-            .to_string()
+        ind.border_spans(Duration::from_secs(secs), &theme, None, 200, None)
+            .last()
+            .map(|s| s.content.to_string())
+            .unwrap_or_default()
     };
     assert_eq!(
         msg(0),

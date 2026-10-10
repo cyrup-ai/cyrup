@@ -925,14 +925,6 @@ impl<B: Backend> App<B> {
                 if id == "showHardwareCursor" {
                     self.state.editor.set_show_hardware_cursor(value == "true");
                 }
-                // TUI-041 — `terminal.clearOnShrink` was in neither the live-apply list nor the
-                // grid's resolved read, so it did not take effect until the next launch. Pi's
-                // `onClearOnShrinkChange` calls `this.ui.setClearOnShrink(clearOnShrink)`
-                // immediately (`interactive-mode.ts`, and `handleReloadCommand` re-applies it at
-                // `:5401-5405`). cyrup's counterpart is the reserved idle status band.
-                if id == "terminal.clearOnShrink" {
-                    self.state.reserve_status_rows = value == "true";
-                }
                 // TUI-009 — the Escape chain reads the cached copy, so the row has to push into it
                 // or a flip would not take effect until the next session bind. Pi re-reads
                 // `getDoubleEscapeAction()` inside `onEscape` itself (`:2580`), which is the same

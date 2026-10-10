@@ -116,8 +116,13 @@ pub(crate) fn settings_rows(
         SettingRow::toggle("showHardwareCursor", "Show hardware cursor", eff.show_hardware_cursor(env))
             // TUI-172: pi 1.1's text (`settings-selector.ts:812` @f1b2e77f5), "Pi's" → "cyrup's".
             .with_description("Use the terminal cursor instead of cyrup's drawn cursor"),
-        SettingRow::toggle("terminal.clearOnShrink", "Clear on shrink", eff.clear_on_shrink(env))
-            .with_description("Clear empty rows when content shrinks (may cause flicker)"),
+        // `terminal.clearOnShrink` has NO row. [CYRUP-DELTA, TUI-182] cyrup content-sizes the inline
+        // viewport every frame and `resize_viewport` repaints the live region on any height change
+        // (`app/draw.rs`), so cyrup is permanently in pi's `clearOnShrink = true` mode and the
+        // setting cannot be honoured as `false`. The key is still parsed (`cyrup-config`'s
+        // `clear_on_shrink`, so a pi `settings.json` loads and the schema dump still carries it);
+        // only the toggle is gone, because offering a switch that does nothing is worse than
+        // offering none.
         SettingRow::choice(
             "editorPaddingX",
             "Editor padding",

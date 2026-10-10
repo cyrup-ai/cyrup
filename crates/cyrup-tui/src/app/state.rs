@@ -184,9 +184,6 @@ pub struct AppState {
     /// a message typed mid-compaction was dispatched as a fresh turn assembled from a context the
     /// compaction was in the middle of rewriting. TUI-031.
     pub compaction_queue: Vec<CompactionQueued>,
-    /// Reserve the 2-row status band even when idle (spec/tui/01 §6.3). Default `false` (Pi's
-    /// non-`clearOnShrink` behavior) so the editor/footer never reflow on idle viewports.
-    pub reserve_status_rows: bool,
     /// The host TERMINAL's row count — Pi's `this.tui.terminal.rows` (`editor.ts:500`). Refreshed
     /// every [`App::draw`] from the backend; `24` until the first draw, matching the `?? 24` default
     /// pi itself uses when a terminal height is unavailable (`config-selector.ts:264-266`).
@@ -624,7 +621,6 @@ impl AppState {
             compaction_flush_pending: false,
             compacting: false,
             compaction_queue: Vec::new(),
-            reserve_status_rows: false,
             term_rows: 24,
             term_cols: 80,
             regions: super::Regions::default(),

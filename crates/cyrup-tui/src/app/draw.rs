@@ -362,6 +362,29 @@ impl<B: Backend> App<B> {
     /// Rebuild the terminal with a new inline-viewport `height` over a fresh handle to the same
     /// backend (ratatui's inline height is immutable after construction; audit #1). The cursor anchor
     /// is preserved by [`RebuildBackend::rebuild`], so the re-placed viewport stays where it was.
+    /// Rebuild the inline viewport at `height`.
+    ///
+    /// # `[CYRUP-DELTA]` this is pi's `clearOnShrink`, unconditionally (TUI-182)
+    ///
+    /// pi's renderer diffs into a fixed-height screen and keeps a high-water mark of rendered rows;
+    /// `terminal.clearOnShrink` makes a shrink below that mark take `fullRender(true)` instead of the
+    /// incremental path, which is what re-pins the editor and footer to the bottom
+    /// (`tui-main-screen.ts:356` @v1.1.0). pi defaults it OFF, because its `fullRender` repaints the
+    /// whole visible screen — the changelog's "may cause some flicker due to redraws".
+    ///
+    /// cyrup needs no setting for it. [`App::draw`] content-sizes the live region every frame, so any
+    /// shrink changes `desired` and lands here, and this function erases the region and constructs a
+    /// new `Terminal` — a full repaint that re-pins by construction. cyrup is therefore permanently
+    /// in pi's `clearOnShrink = true` mode, and it is the CHEAP end of that trade: committed
+    /// transcript entries have already gone to native scrollback through `insert_before`
+    /// ([`Self::flush_committed`]), so what repaints is the live region, never the document pi would
+    /// redraw. Honouring `false` would mean not resizing on shrink, i.e. abandoning the
+    /// content-sized viewport (ADR-0001 #1) to reintroduce a defect pi offers a switch to escape.
+    ///
+    /// The setting's other upstream role — reserving the idle status container
+    /// (`interactive-mode.ts:2075-2078`) — died with the 2-row band in `TUI-103`. `cyrup-config`
+    /// still parses the key so a pi `settings.json` loads and the schema dump still carries it;
+    /// nothing in the TUI reads it.
     fn resize_viewport(&mut self, height: u16) -> Result<(), TuiError>
     where
         B: RebuildBackend,
