@@ -1,64 +1,14 @@
-//! The llama.cpp router wire, ONE definition, grounded in llama.cpp's own server source
-//! (EXT-100).
+//! Conformance: the llama.cpp router wire, through the real client (EXT-100), and this crate's
+//! fake server's drift guard (EXT-108).
 //!
-//! # Why this file exists
+//! The wire itself is no longer defined here. EXT-108 lifted it, unchanged in shape and with every
+//! citation re-derived against llama.cpp `b11436`, into the test-only crate `cyrup-llama-cpp-wire`
+//! (`crates/cyrup-llama-cpp-wire/src/router.rs`), so the OTHER fakes in this workspace — the seam
+//! suite's (`cyrup-it/tests/llama/fake.rs`) and the classifier api's — can answer from the same
+//! definition instead of keeping copies. Read that crate's docs for the pin, the floor and why it
+//! is a crate of its own.
 //!
-//! Every llama.cpp test in this workspace runs against a FAKE server, and so does pi's
-//! (`packages/coding-agent/test/llama-extension.test.ts:16`, an in-process `node:http`
-//! `createServer`). A fake is written from a reading of the client, so a wire shape the fake and
-//! the client agree on passes every test even when the real server does something else. This
-//! module is the fix available without a live server: the shapes llama.cpp's own handlers build,
-//! transcribed with a file:line citation each, in ONE place, so
-//! [`super::fake_server::FakeLlamaServer`] cannot drift from them and an auditor can re-derive
-//! every one of them from the pin below.
-//!
-//! # Upstream pin
-//!
-//! Every `llama.cpp@b11436` citation in this file means tag `b11436`
-//! (`b9a5a00b86fd285a445916086a0b1dc35bee6d66`, 2026-10-06), the current llama.cpp release at the
-//! time of writing. That is the version this repo targets: `docs/guide/llama-cpp.md:16-19` tells
-//! the operator to "use a current llama.cpp build with router support", and cyrup pins no other
-//! llama.cpp version anywhere. Read it the way the other upstream pins in this workspace are read,
-//! never from a working tree:
-//!
-//! ```text
-//! git -C tmp/llama.cpp show b11436:tools/server/server-models.cpp
-//! ```
-//!
-//! **Floor.** The router's management API arrived in `b9688`, "server: (router) add model
-//! management API (#23976)" (2026-06-17) — the first release whose `GET /models` carries the
-//! `source`, `architecture` and merged child-`meta` fields [`crate::model`] reads. `b9000`'s
-//! router answered `id`/`aliases`/`tags`/`status` only, so no release before `b9688` can drive
-//! this client. Every shape below was re-checked unchanged at `b10000`, `b10700` and `b11000`.
-//!
-//! # Scope
-//!
-//! This covers the ROUTER MANAGEMENT API, the only part of the wire `crate::client` speaks:
-//! `GET /models`, `GET /props`, `POST /models/load`, `POST /models/unload`, `POST /models` and
-//! `GET /models/sse` (registered at `tools/server/server.cpp:256-269` @b11436). The classifier
-//! wire (`/tokenize`, `/apply-template`, `/completion` + `n_probs`) belongs to
-//! `cyrup-provider`'s `llama-cpp-classify` api and has its own fake there, which this crate cannot
-//! share a definition with: `cyrup-llama` depends on `cyrup-provider` (`Cargo.toml:19`), so the
-//! definition cannot live here and be used there.
-//!
-//! That classifier wire WAS audited against the same pin, and the result is a clean bill:
-//!
-//! * `POST /tokenize` answers `{"tokens": [<int>, ...]}` (`server-context.cpp:5440-5479`, the
-//!   `with_pieces: false` branch at `:5472-5473` and `res->ok` at `:5476`), which is what
-//!   `cyrup_provider::api::llama_cpp_classify` reads (`llama_cpp_classify.rs:926`);
-//! * `POST /apply-template` answers `{"prompt": <string>}` (`server-context.cpp:5416-5425`), read
-//!   at `llama_cpp_classify.rs:1088`;
-//! * `POST /completion` with `post_sampling_probs: false` answers
-//!   `completion_probabilities: [{id, token, bytes, logprob, top_logprobs: [{id, token, bytes,
-//!   logprob}]}]` (`server-task.cpp:282-301`, attached to the non-streamed final result at
-//!   `:359-360`), and the api reads `completion_probabilities[0].top_logprobs[].{id, logprob}`
-//!   (`llama_cpp_classify.rs:1123-1140`) having sent `post_sampling_probs: false` itself
-//!   (`:1116`), which is the switch between `logprob`/`top_logprobs` and `prob`/`top_probs`.
-//!
-//! Both classifier fakes (`cyrup-provider/src/tests/llama_cpp_classify_fake_server.rs:383-398`
-//! and `cyrup-it/tests/llama/fake.rs:329-351`, byte-identical in shape) are faithful on every
-//! field the api reads. They omit the outer entry's own `bytes` and `logprob`, which a real server
-//! always sends and nothing reads.
+//! The glob re-export keeps the names this module and [`super::fake_server`] have always used.
 
 #![allow(
     dead_code,
@@ -68,401 +18,7 @@
     clippy::indexing_slicing
 )]
 
-use serde_json::{Value, json};
-
-// ------------------------------------------------------------------------------------ envelopes --
-
-/// `GET /models` and `GET /models?reload=1` (`server-models.cpp:2138-2141` @b11436,
-/// `res_ok(res, {{"data", models_json}, {"object", "list"}})`). `?reload=<anything non-empty>`
-/// rescans the model directory first and answers the same shape (`:2083-2086`).
-pub fn models_envelope(entries: Vec<Value>) -> Value {
-    json!({ "data": entries, "object": "list" })
-}
-
-/// The body of every router mutation that succeeds: `POST /models/load`
-/// (`server-models.cpp:2078`), `POST /models/unload` (`:2159`), `POST /models`, the Hugging Face
-/// download (`:2225`) and `DELETE /models` (`:2239`) all answer exactly
-/// `res_ok(res, {{"success", true}})` with status 200.
-pub fn success() -> Value {
-    json!({ "success": true })
-}
-
-/// `format_error_response` + `res_err` (`server-common.cpp:36-78`, `server-models.cpp:1915-1918`
-/// @b11436): the body is `{"error": {"code", "message", "type"}}` and the HTTP status IS that
-/// `code`. [`crate::client::LlamaClient`] reads `error.message` and ignores the rest
-/// (`client.rs:183` upstream).
-pub fn error_body(code: u16, message: &str, kind: &str) -> Value {
-    json!({ "error": { "code": code, "message": message, "type": kind } })
-}
-
-/// `ERROR_TYPE_INVALID_REQUEST` → `400 invalid_request_error` (`server-common.cpp:40-43`). The
-/// router answers this for an unknown model on `/models/unload` (`server-models.cpp:2152`), for a
-/// model that is not running (`:2156`) and for `/props?model=<not loaded>` (`:1952-1956`, through
-/// `router_validate_model`).
-pub fn invalid_request(message: &str) -> (u16, Value) {
-    (400, error_body(400, message, "invalid_request_error"))
-}
-
-/// `ERROR_TYPE_NOT_FOUND` → `404 not_found_error` (`server-common.cpp:48-51`). `POST /models/load`
-/// answers it for a model that is not in the catalog (`server-models.cpp:2070-2073`).
-pub fn not_found(message: &str) -> (u16, Value) {
-    (404, error_body(404, message, "not_found_error"))
-}
-
-/// The answer to a route the server does not have, which is NOT `format_error_response` but the
-/// httplib error handler's own literal (`server-http.cpp:199-211` @b11436):
-/// `404 {"error":{"message":"File Not Found","type":"not_found_error","code":404}}`.
-///
-/// **Both of this workspace's llama-server fakes had this wrong, identically** — they answered
-/// `{"error":{"message":"not found"}}` (`cyrup-llama/src/tests/fake_server.rs` before EXT-100 and
-/// `cyrup-it/tests/llama/fake.rs:357` still). Nothing asserts on the text today, so no test was
-/// lying, but it is exactly the drift two fakes written from one reading of the client produce:
-/// one wrong reading, two wrong fakes, every test green.
-pub fn file_not_found() -> (u16, Value) {
-    (
-        404,
-        json!({ "error": {
-            "message": "File Not Found",
-            "type": "not_found_error",
-            "code": 404,
-        }}),
-    )
-}
-
-/// The API-key rejection, which is NOT `format_error_response` but a literal written in the HTTP
-/// middleware (`server-http.cpp:290-300` @b11436): status 401 with
-/// `{"error":{"message":"Invalid API Key","type":"authentication_error","code":401}}`.
-pub fn invalid_api_key() -> (u16, Value) {
-    (
-        401,
-        json!({ "error": {
-            "message": "Invalid API Key",
-            "type": "authentication_error",
-            "code": 401,
-        }}),
-    )
-}
-
-// --------------------------------------------------------------------------------------- catalog --
-
-/// Every `status.value` a router can report (`server_model_status_to_string`,
-/// `server-models.h:52-62` @b11436).
-///
-/// `"downloaded"` is NOT in pi's TypeScript union (`client.ts:1`: `unloaded | loading | loaded |
-/// downloading | sleeping`) but the router does emit it: `update_download_progress` sets
-/// `SERVER_MODEL_STATUS_DOWNLOADED` when a download finishes, before the next `load_models()`
-/// rescan erases the transient entry (`server-models.cpp:1385-1388`).
-pub const STATUS_VALUES: [&str; 6] = [
-    "downloading",
-    "downloaded",
-    "unloaded",
-    "loading",
-    "loaded",
-    "sleeping",
-];
-
-/// Every `source` a router can report (`server_model_source_to_string`, `server-models.h:64-71`
-/// @b11436). `crate::model::model_is_selectable` offers an `unloaded` model only when this is
-/// `"preset"`.
-pub const SOURCE_VALUES: [&str; 4] = ["preset", "models_dir", "cache", "unknown"];
-
-/// One catalog entry as `get_router_models` builds it for a LOADED model
-/// (`server-models.cpp:2095-2136` @b11436), with every field the real router sends — including the
-/// ones this client ignores (`tags`, `object`, `owned_by`, `created`, `can_remove`,
-/// `status.preset`) and the child's `meta`/`architecture`, which reach the catalog through the
-/// `loaded_info` merge at `:2128-2135` (`get_res_model_info`, `server-context.cpp:4894-4919`).
-///
-/// The merge happens only when `meta.is_running()` — `loaded`, `loading` or `sleeping`
-/// (`server-models.h:94-96`) — so an `unloaded` or `downloading` entry carries NO `meta` and no
-/// child `architecture`.
-pub fn loaded_entry(id: &str, args: &[&str]) -> Value {
-    json!({
-        "id": id,
-        "aliases": [],
-        "tags": [],
-        "object": "model",
-        "owned_by": "llamacpp",
-        "created": 1_759_000_000_i64,
-        "status": { "value": "loaded", "args": args },
-        "architecture": { "input_modalities": ["text"], "output_modalities": ["text"] },
-        "source": "models_dir",
-        "can_remove": false,
-        // ---- merged from the child's `get_res_model_info` (`server-context.cpp:4908-4918`) ----
-        "meta": {
-            "vocab_type": 2,
-            "n_vocab": 151_936,
-            "n_ctx": 32_768,
-            "n_ctx_train": 262_144,
-            "n_embd": 2048,
-            "n_params": 1_721_000_000_i64,
-            "size": 1_070_000_000_i64,
-            "ftype": "Q4_K_M",
-        },
-    })
-}
-
-/// A DECISION model's entry (EXT-110): a GGUF whose decision type is set (OpenJev, lev, Kev,
-/// Nimble, Laya, Clef) reports `architecture.output_modalities: ["decisions"]` — exactly that one
-/// value, never `"text"` beside it (`server_model_output_modalities`,
-/// `server-common.cpp:150-163` @b11436). The router reads it from the GGUF metadata while
-/// discovering the model (`server-models.cpp:567-571`), so a `sleeping` or `unloaded` entry
-/// carries it as well as a `loaded` one; a running child's own `architecture`
-/// (`get_res_model_info`, `server-context.cpp:4894-4919`) replaces both arrays in full
-/// (`server-models.cpp:1330-1345`) with the same value. `meta` is merged only when the entry is
-/// running (`:2128-2135`), so `status` other than `loaded`/`loading`/`sleeping` gets none.
-pub fn decision_entry(id: &str, status: &str) -> Value {
-    let mut entry = json!({
-        "id": id,
-        "aliases": [],
-        "tags": [],
-        "object": "model",
-        "owned_by": "llamacpp",
-        "created": 1_759_000_000_i64,
-        "status": { "value": status, "args": [] },
-        "architecture": { "input_modalities": ["text"], "output_modalities": ["decisions"] },
-        "source": "models_dir",
-        "can_remove": false,
-    });
-    if matches!(status, "loaded" | "loading" | "sleeping")
-        && let Some(object) = entry.as_object_mut()
-    {
-        object.insert(
-            "meta".to_string(),
-            json!({
-                "vocab_type": 2,
-                "n_vocab": 151_936,
-                "n_ctx": 8192,
-                "n_ctx_train": 32_768,
-                "n_embd": 1024,
-                "n_params": 600_000_000_i64,
-                "size": 400_000_000_i64,
-                "ftype": "Q8_0",
-            }),
-        );
-    }
-    entry
-}
-
-/// An `unloaded` preset entry, the autoload candidate `model_is_selectable` accepts
-/// (`server-models.cpp:2095-2126`): `source: "preset"`, `status.preset` holding the rendered ini
-/// (`:2099-2107`) and NO `meta`, because the `loaded_info` merge is gated on `is_running()`.
-pub fn unloaded_preset_entry(id: &str, args: &[&str]) -> Value {
-    json!({
-        "id": id,
-        "aliases": [],
-        "tags": [],
-        "object": "model",
-        "owned_by": "llamacpp",
-        "created": 1_759_000_000_i64,
-        "status": {
-            "value": "unloaded",
-            "args": args,
-            "preset": format!("[{id}]\nmodel = /models/{id}.gguf\n"),
-        },
-        "architecture": { "input_modalities": ["text"], "output_modalities": ["text"] },
-        "source": "preset",
-        "can_remove": false,
-    })
-}
-
-/// A failed entry: `status.failed` and `status.exit_code` appear together and ONLY when
-/// `meta.is_failed()`, which is `status == UNLOADED && exit_code != 0`
-/// (`server-models.cpp:2108-2111`, `server-models.h:102-104` @b11436).
-pub fn failed_entry(id: &str, exit_code: i64) -> Value {
-    json!({
-        "id": id,
-        "aliases": [],
-        "tags": [],
-        "object": "model",
-        "owned_by": "llamacpp",
-        "created": 1_759_000_000_i64,
-        "status": { "value": "unloaded", "args": [], "failed": true, "exit_code": exit_code },
-        "architecture": { "input_modalities": ["text"], "output_modalities": ["text"] },
-        "source": "models_dir",
-        "can_remove": false,
-    })
-}
-
-/// A `downloading` entry. **It carries no progress anywhere** — see
-/// [`THE_CATALOG_CARRIES_NO_DOWNLOAD_PROGRESS`].
-pub fn downloading_entry(id: &str) -> Value {
-    json!({
-        "id": id,
-        "aliases": [],
-        "tags": [],
-        "object": "model",
-        "owned_by": "llamacpp",
-        "created": 1_759_000_000_i64,
-        "status": { "value": "downloading", "args": [] },
-        "architecture": { "input_modalities": ["text"], "output_modalities": ["text"] },
-        "source": "cache",
-        "can_remove": true,
-    })
-}
-
-/// **A shape upstream pi declares and no llama.cpp release emits.**
-///
-/// `LlamaModelInfo.status.progress?: Record<string, { done, total }>` (pi `client.ts:11` @v0.99.2-17)
-/// says a catalog entry's `status` can carry per-file download progress, and
-/// `downloadAndWait`/[`crate::client::LlamaClient::download_and_wait`] read it
-/// (`client.ts:334-338`, `client.rs:1345-1352`). The router never puts it there:
-///
-/// * `get_router_models` builds `status` out of `value` and `args`, plus `preset` for a preset
-///   entry and `exit_code`/`failed` for a failed one, and nothing else
-///   (`server-models.cpp:2095-2111` @b11436);
-/// * the per-file progress exists server-side as `server_model_meta::progress` /
-///   `loaded_info["progress"]` (`server-models.h:83-84`, written at
-///   `server-models.cpp:1389-1397`), but the only path from `loaded_info` into the catalog is the
-///   merge at `:2128-2135`, which is gated on `meta.is_running()` — `LOADED`, `LOADING` or
-///   `SLEEPING` (`server-models.h:94-96`), never `DOWNLOADING` — and lands keys at the entry's TOP
-///   level, not inside `status`;
-/// * checked unchanged at `b9000`, `b10000`, `b10700`, `b11000` and `b11436`.
-///
-/// Download progress reaches a real client ONLY through the SSE stream, as
-/// [`download_progress_event`]. The code is kept: it is a faithful port of pi, and pi is the
-/// contract this crate ports. What is NOT true is that a test feeding `status.progress` exercises
-/// anything a real llama.cpp can produce.
-pub const THE_CATALOG_CARRIES_NO_DOWNLOAD_PROGRESS: &str = concat!(
-    "llama.cpp@b11436 server-models.cpp:2095-2111 builds `status` from ",
-    "value/args/preset/exit_code/failed only",
-);
-
-// ----------------------------------------------------------------------------------------- props --
-
-/// `GET /props` with NO `model` parameter: the router's own props
-/// (`get_router_props`, `server-models.cpp:1992-2015` @b11436). `models_autoload` is the one field
-/// `crate::provider::router_autoload_enabled` reads; the rest is sent too and must not disturb it.
-pub fn router_props(models_autoload: bool) -> Value {
-    json!({
-        "role": "router",
-        "max_instances": 1,
-        "models_autoload": models_autoload,
-        "model_alias": "llama-server",
-        "model_path": "none",
-        "default_generation_settings": { "params": {}, "n_ctx": 0 },
-        "ui_settings": {},
-        "build_info": "b11436",
-        "cors_proxy_enabled": false,
-    })
-}
-
-/// `GET /props?model=<id>&autoload=false`: a non-empty `model` makes the router PROXY the request
-/// to that child (`server-models.cpp:2013-2014` → `proxy_get`, `:2017-2030`), so the answer is the
-/// CHILD's props (`get_res_props`, `server-context.cpp:4955-4998` @b11436).
-///
-/// Two consequences for [`crate::client::LlamaClient::props`], which reads `models_autoload` and
-/// `chat_template` from whichever of the two it gets:
-///
-/// * a child's props carry **no `models_autoload`** — it is a router-only field — so
-///   `props(Some(id))` always yields `models_autoload: None`;
-/// * `chat_template` is a child field only, which is why `to_model`'s `reasoning` test
-///   (`model.rs:166-169`) is fed the per-model props and not the router's.
-///
-/// `autoload=false` is read by `is_autoload` (`server-models.cpp:2005-2012`) and makes
-/// `router_validate_model` refuse a model that is not running rather than start it
-/// (`:1947-1962`) — which is why the provider asks only for `loaded` models
-/// (`provider.rs:578-584`).
-pub fn child_props(chat_template: &str) -> Value {
-    json!({
-        "default_generation_settings": { "params": {}, "n_ctx": 32_768 },
-        "total_slots": 1,
-        "model_alias": "qwen",
-        "model_ftype": "Q4_K_M",
-        "model_path": "/models/qwen.gguf",
-        "modalities": { "vision": false, "video": false, "audio": false },
-        "media_marker": "<__media__>",
-        "endpoint_slots": false,
-        "endpoint_props": false,
-        "endpoint_metrics": false,
-        "ui": true,
-        "ui_settings": {},
-        "chat_template": chat_template,
-        "chat_template_caps": {},
-        "bos_token": "<|im_start|>",
-        "eos_token": "<|im_end|>",
-        "build_info": "b11436",
-        "is_sleeping": false,
-        "cors_proxy_enabled": false,
-    })
-}
-
-// ------------------------------------------------------------------------------------------- SSE --
-
-/// One `GET /models/sse` frame on the wire: `"data: " + json + "\n\n"`
-/// (`server-models.cpp:2175` @b11436, inside the `res->next` generator at `:2167-2178`). The
-/// response head is `200` with `content-type: text/event-stream`, and the stream ends when the
-/// client disconnects or the router stops (`:2169-2174`).
-pub fn sse_frame(event: &Value) -> String {
-    format!("data: {event}\n\n")
-}
-
-/// The payload of every event: `{"model": <id>, "event": <name>}` plus `"data"` when the notifier
-/// was given any (`notify_sse`, `server-models.cpp:686-697` @b11436). A catalog rescan broadcasts
-/// `models_reload` for the pseudo-model `"*"` with no `data` at all (`:1026`).
-pub fn sse_event(model: &str, event: &str, data: Option<Value>) -> Value {
-    match data {
-        Some(data) => json!({ "model": model, "event": event, "data": data }),
-        None => json!({ "model": model, "event": event }),
-    }
-}
-
-/// `status_change`, the event `update_status` broadcasts (`server-models.cpp:1358-1375` @b11436):
-/// `data.status` always, `data.exit_code` when the new status is `unloaded`, `data.info` when the
-/// child sent `loaded_info`, and `data.progress` when the child sent progress.
-pub fn status_change_event(model: &str, status: &str, progress: Option<Value>) -> Value {
-    let mut data = json!({ "status": status });
-    if let (Some(progress), Some(object)) = (progress, data.as_object_mut()) {
-        object.insert("progress".to_string(), progress);
-    }
-    sse_event(model, "status_change", Some(data))
-}
-
-/// The LOAD progress a child reports while it is loading its weights
-/// (`server-context.cpp:1095-1101` @b11436, the `load_progress_callback`): `stages` (every stage
-/// it will run), `current` (the one running) and `value` (that stage's 0..1 ratio). It reaches the
-/// client as `status_change`'s `data.progress` (`server-models.cpp:1371-1373`).
-pub fn load_progress(stages: &[&str], current: &str, value: f64) -> Value {
-    json!({ "stages": stages, "current": current, "value": value })
-}
-
-/// The OTHER load-progress payload, and the reason
-/// [`crate::client::parse_load_progress`] falls back from `current` to `stage`: starting the
-/// multimodal projector reports `{"stage": "mmproj_model"}` and NOTHING else — no `stages`, no
-/// `value` (`server-context.cpp:1270-1272` @b11436).
-pub fn mmproj_load_progress() -> Value {
-    json!({ "stage": "mmproj_model" })
-}
-
-/// `download_progress` (`update_download_progress`, `server-models.cpp:1380-1404` @b11436): the
-/// event's `data` is the whole `loaded_info` copy, so the per-file map sits NESTED under
-/// `progress`, keyed by download URL, each `{done, total}` in bytes (`:1389-1396`).
-pub fn download_progress_event(model: &str, files: &[(&str, u64, u64)]) -> Value {
-    let mut progress = serde_json::Map::new();
-    for (url, done, total) in files {
-        progress.insert((*url).to_string(), json!({ "done": done, "total": total }));
-    }
-    sse_event(
-        model,
-        "download_progress",
-        Some(json!({ "progress": Value::Object(progress) })),
-    )
-}
-
-/// `download_finished` / `download_failed` (`server-models.cpp:1400-1402` @b11436): `notify_sse`
-/// is called with `{}`, which is not null, so the event carries an EMPTY `data` object — no
-/// message, which is why `download_and_wait` composes its own `"Download failed"`
-/// (`client.rs:1289`).
-pub fn download_settled_event(model: &str, ok: bool) -> Value {
-    sse_event(
-        model,
-        if ok {
-            "download_finished"
-        } else {
-            "download_failed"
-        },
-        Some(json!({})),
-    )
-}
+pub use cyrup_llama_cpp_wire::router::*;
 
 // ================================================================================================
 // Conformance: the real shapes above, through the real client.
@@ -477,8 +33,8 @@ mod conformance {
 
     use super::{
         child_props, download_settled_event, downloading_entry, failed_entry, invalid_request,
-        load_progress, loaded_entry, mmproj_load_progress, models_envelope, router_props,
-        sse_event, sse_frame, status_change_event, success, unloaded_preset_entry,
+        load_progress, loaded_entry, mmproj_load_progress, router_props, sse_event,
+        status_change_event, unloaded_preset_entry,
     };
     use crate::client::{
         LlamaClient, LlamaModelStatus, ProgressField, parse_download_progress, parse_load_progress,
@@ -806,44 +362,119 @@ mod conformance {
         );
     }
 
-    /// The fake this crate's tests run against ANSWERS with the definitions above rather than its
-    /// own transcription of them, so the fake cannot drift from llama.cpp without this module
-    /// changing. Driving the real client through every router mutation and reading the fake's
-    /// answers back is the proof of that wiring.
+    /// Send one raw HTTP/1.1 request and read the whole answer: the fake closes every connection,
+    /// so the close delimits the body. Raw, not through `LlamaClient` or `reqwest`, because the
+    /// guard below is about the exact BYTES the fake writes.
+    async fn raw(url: &str, method: &str, path: &str, extra: &str, body: &str) -> (u16, String) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let addr = url.trim_start_matches("http://");
+        let mut socket = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        let request = format!(
+            "{method} {path} HTTP/1.1\r\nhost: {addr}\r\n{extra}content-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        socket.write_all(request.as_bytes()).await.expect("write");
+        let mut answer = String::new();
+        socket.read_to_string(&mut answer).await.expect("read");
+        let (head, body) = answer.split_once("\r\n\r\n").expect("a head");
+        let status = head
+            .split(' ')
+            .nth(1)
+            .and_then(|status| status.parse().ok())
+            .expect("a status");
+        (status, body.to_string())
+    }
+
+    /// EXT-108's DRIFT GUARD for this crate's fake: what [`FakeLlamaServer`] writes on a real
+    /// socket is, byte for byte, the pinned llama.cpp answer in `cyrup_llama_cpp_wire::golden`.
+    /// The fake answers from `cyrup_llama_cpp_wire::router`, so a change to any definition it
+    /// serves — the unknown-route 404, the 401, `{"success":true}`, the catalog envelope (empty,
+    /// and over EXT-110's decision entries), the router props, the SSE framing — fails this test until the golden moves with it.
+    ///
+    /// It replaces EXT-100's `the_fake_server_answers_with_these_definitions`, which drove the
+    /// real client and so could only see what the client parses, and which asserted the
+    /// definitions against literals rather than the fake against anything.
     #[tokio::test]
-    async fn the_fake_server_answers_with_these_definitions() {
+    async fn drift_guard_the_fake_writes_the_golden_bytes() {
+        use cyrup_llama_cpp_wire::golden;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
         let server = FakeLlamaServer::start().await;
-        server.set_models(vec![loaded_entry("qwen", &[])]);
-        server.set_props(router_props(true));
-        let client = client(&server).await;
+        let url = server.url().to_string();
+        let answer = |status: u16, body: &str| (status, body.to_string());
 
-        // `GET /models`: the `{data, object: "list"}` envelope of `models_envelope`. A different
-        // envelope fails the parse with `llama.cpp returned an invalid model catalog`.
-        let listed = client.list(false, &never()).await.unwrap();
-        assert_eq!(listed.len(), 1, "{listed:?}");
-
-        // The three mutations: `{"success": true}`, status 200, or these would be errors.
-        client.load("qwen", &never()).await.unwrap();
-        client.unload("qwen", &never()).await.unwrap();
-        client.download("owner/repo", &never()).await.unwrap();
-        assert_eq!(success(), serde_json::json!({ "success": true }));
-
-        // An unknown route: `format_error_response`'s shape, with the status equal to its `code`,
-        // so the client reports the router's own message.
-        let error = client
-            .props(Some("nope"), &never())
-            .await
-            .expect("the fake answers /props for any model");
-        assert_eq!(error.models_autoload, Some(true), "{error:?}");
-
-        // The SSE framing is `sse_frame`'s: `data: <json>\n\n`.
         assert_eq!(
-            sse_frame(&sse_event("*", "models_reload", None)),
-            "data: {\"model\":\"*\",\"event\":\"models_reload\"}\n\n"
+            raw(&url, "GET", "/no-such-route", "", "").await,
+            answer(404, golden::FILE_NOT_FOUND),
+            "an unknown route is llama.cpp's own 404 literal"
         );
         assert_eq!(
-            models_envelope(vec![serde_json::json!({ "id": "x" })]),
-            serde_json::json!({ "data": [{ "id": "x" }], "object": "list" })
+            raw(&url, "GET", "/models", "", "").await,
+            answer(200, golden::EMPTY_MODELS)
+        );
+        assert_eq!(
+            raw(&url, "GET", "/props", "", "").await,
+            answer(200, golden::ROUTER_PROPS_AUTOLOAD)
+        );
+        // EXT-110's decision-model fixture, as the catalog the fake serves.
+        server.set_models(vec![
+            super::decision_entry("kev", "loaded"),
+            super::decision_entry("laya", "unloaded"),
+        ]);
+        assert_eq!(
+            raw(&url, "GET", "/models", "", "").await,
+            answer(200, golden::MODELS_DECISION_KEV_LOADED_LAYA_UNLOADED)
+        );
+        server.set_models(Vec::new());
+        for path in ["/models/load", "/models/unload", "/models"] {
+            assert_eq!(
+                raw(&url, "POST", path, "", r#"{"model":"qwen"}"#).await,
+                answer(200, golden::SUCCESS),
+                "POST {path}"
+            );
+        }
+
+        // One SSE frame, read off an open `GET /models/sse`.
+        let addr = url.trim_start_matches("http://").to_string();
+        let mut stream = tokio::net::TcpStream::connect(&addr)
+            .await
+            .expect("connect");
+        stream
+            .write_all(format!("GET /models/sse HTTP/1.1\r\nhost: {addr}\r\n\r\n").as_bytes())
+            .await
+            .expect("write");
+        server.wait_for_sse(1).await;
+        server.broadcast(sse_event("*", "models_reload", None));
+        let mut seen = String::new();
+        loop {
+            if let Some((_, frame)) = seen.split_once("\r\n\r\n")
+                && frame.ends_with("\n\n")
+            {
+                assert_eq!(frame, golden::SSE_MODELS_RELOAD_FRAME);
+                break;
+            }
+            let mut chunk = [0_u8; 1024];
+            let read = stream.read(&mut chunk).await.expect("read");
+            assert!(read > 0, "the stream closed before a frame: {seen:?}");
+            seen.push_str(&String::from_utf8_lossy(&chunk[..read]));
+        }
+
+        server.require_bearer("sk-guard");
+        assert_eq!(
+            raw(&url, "GET", "/models", "", "").await,
+            answer(401, golden::INVALID_API_KEY),
+            "a missing key is the middleware's 401 literal"
+        );
+        assert_eq!(
+            raw(
+                &url,
+                "GET",
+                "/models",
+                "authorization: Bearer sk-guard\r\n",
+                ""
+            )
+            .await,
+            answer(200, golden::EMPTY_MODELS)
         );
     }
 }

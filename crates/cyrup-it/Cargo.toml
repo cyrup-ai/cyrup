@@ -75,6 +75,10 @@ wasm-host = ["cyrup-ext/wasm-host", "cyrup-session-svc/wasm-host"]
 # `cyrup-test-support` has no `[workspace.dependencies]` entry (it is deliberately not a normal
 # dependency of anything); the two crates that dev-depend on it today use a path, so this matches.
 cyrup-test-support      = { path = "../cyrup-test-support" }
+# The llama.cpp wire `tests/llama/fake.rs` answers from (EXT-108): ONE cited definition shared with
+# `cyrup-llama`'s fake. Test data with no `[workspace.dependencies]` entry, so a path dep, matching
+# `cyrup-test-support` above.
+cyrup-llama-cpp-wire    = { path = "../cyrup-llama-cpp-wire" }
 cyrup-core              = { workspace = true }
 # `features = ["faux"]` is REQUIRED, not decorative: `tests/bin/{embedder_seams,embedding,
 # lifecycle,runtime}.rs` build real sessions over `cyrup_provider::faux::FauxProvider`, and the

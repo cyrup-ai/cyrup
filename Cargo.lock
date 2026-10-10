@@ -1718,6 +1718,7 @@ dependencies = [
  "cyrup-ext-sdk",
  "cyrup-ext-subagents",
  "cyrup-intercom",
+ "cyrup-llama-cpp-wire",
  "cyrup-mcp",
  "cyrup-modes",
  "cyrup-permission-system",
@@ -1746,6 +1747,7 @@ dependencies = [
  "bytes",
  "cyrup-core",
  "cyrup-ext",
+ "cyrup-llama-cpp-wire",
  "cyrup-provider",
  "futures",
  "regex",
@@ -1759,6 +1761,13 @@ dependencies = [
  "unicode-segmentation",
  "unicode-width",
  "url",
+]
+
+[[package]]
+name = "cyrup-llama-cpp-wire"
+version = "0.0.0"
+dependencies = [
+ "serde_json",
 ]
 
 [[package]]

@@ -27,6 +27,10 @@ members = [
     "crates/cyrup-mcp",
     "crates/cyrup-acp",
     "crates/cyrup-llama",
+    # EXT-108: the llama.cpp wire as ONE cited definition, which every llama-server fake answers
+    # from. Test data only (a `[dev-dependencies]` edge of `cyrup-llama` and `cyrup-it`, never a
+    # normal one), a leaf over `serde_json`, so it is in default-members too.
+    "crates/cyrup-llama-cpp-wire",
     "crates/cyrup-codemode",
     "crates/cyrup-codemode-runtime",
     "crates/cyrup-tool-search",
@@ -123,6 +127,7 @@ default-members = [
     "crates/cyrup-mcp",
     "crates/cyrup-acp",
     "crates/cyrup-llama",
+    "crates/cyrup-llama-cpp-wire",
     "crates/cyrup-codemode",
     "crates/cyrup-codemode-runtime",
     "crates/cyrup-tool-search",

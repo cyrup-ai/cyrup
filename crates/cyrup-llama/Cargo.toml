@@ -36,3 +36,6 @@ url = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# The llama.cpp wire every fake server in `src/tests/` answers from (EXT-108). A dev edge only, and
+# a path dep with no `[workspace.dependencies]` entry, matching `cyrup-test-support`.
+cyrup-llama-cpp-wire = { path = "../cyrup-llama-cpp-wire" }
