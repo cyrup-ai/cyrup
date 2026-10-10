@@ -113,6 +113,10 @@ mod tests {
             golden::ROUTER_PROPS_AUTOLOAD
         );
         assert_eq!(
+            router::child_props("{{ messages }}").to_string(),
+            golden::CHILD_PROPS_PLAIN
+        );
+        assert_eq!(
             router::sse_frame(&router::sse_event("*", "models_reload", None)),
             golden::SSE_MODELS_RELOAD_FRAME
         );

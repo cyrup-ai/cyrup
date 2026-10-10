@@ -55,6 +55,18 @@ pub const ROUTER_PROPS_AUTOLOAD: &str = concat!(
     r#""ui_settings":{},"build_info":"b11436","cors_proxy_enabled":false}"#,
 );
 
+/// [`crate::router::child_props`]`("{{ messages }}")`: the CHILD's own props, which the router
+/// proxies back for `GET /props?model=<id>` (`get_res_props`, `server-context.cpp:4955-4998`).
+pub const CHILD_PROPS_PLAIN: &str = concat!(
+    r#"{"default_generation_settings":{"params":{},"n_ctx":32768},"total_slots":1,"#,
+    r#""model_alias":"qwen","model_ftype":"Q4_K_M","model_path":"/models/qwen.gguf","#,
+    r#""modalities":{"vision":false,"video":false,"audio":false},"media_marker":"<__media__>","#,
+    r#""endpoint_slots":false,"endpoint_props":false,"endpoint_metrics":false,"ui":true,"#,
+    r#""ui_settings":{},"chat_template":"{{ messages }}","chat_template_caps":{},"#,
+    r#""bos_token":"<|im_start|>","eos_token":"<|im_end|>","build_info":"b11436","#,
+    r#""is_sleeping":false,"cors_proxy_enabled":false}"#,
+);
+
 /// [`crate::router::sse_frame`] over [`crate::router::sse_event`]`("*", "models_reload", None)`
 /// (`server-models.cpp:2175`, `:686-697`, `:1026`).
 pub const SSE_MODELS_RELOAD_FRAME: &str = "data: {\"model\":\"*\",\"event\":\"models_reload\"}\n\n";

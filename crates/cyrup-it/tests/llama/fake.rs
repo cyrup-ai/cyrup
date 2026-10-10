@@ -457,6 +457,11 @@ mod drift_guard {
             "the router's own props"
         );
         assert_eq!(
+            raw(&url, "GET", "/props?model=qwen&autoload=false", "").await,
+            answer(200, golden::CHILD_PROPS_PLAIN),
+            "a model's props are the child's, proxied (no template set: PLAIN_TEMPLATE)"
+        );
+        assert_eq!(
             raw(
                 &url,
                 "POST",
