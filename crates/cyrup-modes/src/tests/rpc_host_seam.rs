@@ -3,10 +3,11 @@
 //! * **SEAM-021** — `run_rpc` must RETURN when stdin reaches EOF. Pi's RPC host wires
 //!   `process.stdin.on("end", () => void shutdown())` unconditionally (`rpc-mode.ts:799-802`), and
 //!   its `steer`/`follow_up` arms (`rpc-mode.ts:417-425`) hold no in-flight state at all. cyrup
-//!   defers the EOF exit until a run settles, which is only sound if the "a run is in flight" latch
-//!   is set exclusively when a run was actually STARTED — `AgentSession::steer`/`follow_up` only
-//!   push onto the pending queues (`session.rs` `_queueSteer`/`_queueFollowUp` port), so a steer on
-//!   an idle session produces no `agent_settled` and latching there wedges the loop forever.
+//!   aborts a run in flight at EOF and waits only for what that abort settles (SEAM-154,
+//!   `rpc_eof_shutdown.rs`), which is only sound if the "a run is in flight" latch is set
+//!   exclusively when a run was actually STARTED — `AgentSession::steer`/`follow_up` only push onto
+//!   the pending queues (`session.rs` `_queueSteer`/`_queueFollowUp` port), so a steer on an idle
+//!   session produces no `agent_settled` and latching there would hold the loop until its bound.
 //!
 //! * **SEAM-022** — the host must re-acquire the active session whenever the runtime REPLACES it,
 //!   from any path. Pi hands the runtime a `rebindSession` callback (`rpc-mode.ts:312-314`,
@@ -64,6 +65,11 @@ async fn build_runtime_with(
     create_runtime(factory, SessionTarget::New).await
 }
 
+/// How long a loop with nothing in flight may take to leave after EOF. Inside the 5 s the loop
+/// waits for work it has aborted at most (`EOF_SETTLE_TIMEOUT`, SEAM-154), so a loop that left only
+/// because that bound ran out — a latch that never clears — fails the test instead of passing it.
+const PROMPT_EXIT: Duration = Duration::from_secs(3);
+
 /// Feed `lines` to `run_rpc` over a REAL async pipe whose write half is then DROPPED (a genuine
 /// stdin EOF, not a pre-filled cursor), and require the whole loop to finish inside `budget`.
 async fn drive_rpc_to_eof(
@@ -92,7 +98,7 @@ async fn drive_rpc_to_eof(
     )
     .await;
     feeder.await.expect("feeder task");
-    ran.expect("run_rpc must RETURN at stdin EOF (SEAM-021 — it hung instead)")
+    ran.expect("run_rpc must RETURN at stdin EOF, not wait for a run that is not there (SEAM-021)")
         .expect("run_rpc completes without error");
     parse_lines(&out)
 }
@@ -112,7 +118,7 @@ async fn steer_on_an_idle_session_does_not_wedge_the_eof_exit() {
     let runtime = build_runtime(&fx).await;
 
     let lines = concat!(r#"{"type":"steer","message":"hello","id":"s"}"#, "\n");
-    let out = drive_rpc_to_eof(&runtime, lines, Duration::from_secs(10)).await;
+    let out = drive_rpc_to_eof(&runtime, lines, PROMPT_EXIT).await;
 
     let steer = out
         .iter()
@@ -131,7 +137,7 @@ async fn follow_up_on_an_idle_session_does_not_wedge_the_eof_exit() {
     let runtime = build_runtime(&fx).await;
 
     let lines = concat!(r#"{"type":"follow_up","message":"later","id":"f"}"#, "\n");
-    let out = drive_rpc_to_eof(&runtime, lines, Duration::from_secs(10)).await;
+    let out = drive_rpc_to_eof(&runtime, lines, PROMPT_EXIT).await;
 
     let fu = out
         .iter()
@@ -152,7 +158,7 @@ async fn a_rejected_steer_does_not_wedge_the_eof_exit() {
     let runtime = build_runtime_with(&fx, ext).await;
 
     let lines = concat!(r#"{"type":"steer","message":"/swap","id":"s"}"#, "\n");
-    let out = drive_rpc_to_eof(&runtime, lines, Duration::from_secs(10)).await;
+    let out = drive_rpc_to_eof(&runtime, lines, PROMPT_EXIT).await;
 
     let steer = out
         .iter()

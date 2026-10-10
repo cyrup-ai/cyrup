@@ -14,10 +14,9 @@
 //! The two `throw` branches pi's projector has are pinned on the helper directly, because no
 //! provider stream can reach them.
 
-use std::io::Cursor;
 use std::sync::Arc;
 
-use crate::{run_json, run_rpc, to_json_event};
+use crate::{run_json, to_json_event};
 use cyrup_core::{StopReason, Usage};
 use cyrup_provider::Provider;
 use cyrup_provider::faux::{
@@ -29,7 +28,10 @@ use cyrup_session_svc::{
 };
 use serde_json::Value;
 
-use super::support::{Fixture, base_config, create_runtime, fixture, kind, parse_lines};
+use super::support::{
+    Fixture, base_config, create_runtime, fixture, has_response, has_settled, kind, parse_lines,
+    run_rpc_until_bytes,
+};
 
 /// The plain runtime: no provider resolver and no native extension, because nothing here drives a
 /// model command or an extension — just the two one-shot adapters over a scripted provider.
@@ -336,10 +338,12 @@ async fn rpc_stdout_projects_events_and_leaves_responses_alone() {
         r#"{"type":"get_state","id":"2"}"#,
         "\n",
     );
-    let mut out: Vec<u8> = Vec::new();
-    run_rpc(&runtime, Cursor::new(input.as_bytes().to_vec()), &mut out)
-        .await
-        .expect("rpc mode runs");
+    // SEAM-154: closing the input aborts the run, so the client waits for `agent_settled` and for
+    // the answer to the second command before it closes it.
+    let out = run_rpc_until_bytes(&runtime, input, |lines| {
+        has_settled(lines) && has_response(lines, "2")
+    })
+    .await;
 
     let raw: Vec<String> = String::from_utf8(out)
         .expect("utf8")

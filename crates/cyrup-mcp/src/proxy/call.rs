@@ -881,6 +881,8 @@ pub async fn execute_call(
         &recovery,
         &latch,
         &owned,
+        // A direct tool is a codemode tool too, and its script receives the server's whole result.
+        resolved_origin == ApprovalOrigin::Direct,
     )
     .await
 }
@@ -925,6 +927,19 @@ impl Drop for InFlightScope<'_> {
     }
 }
 
+/// The `CallToolResult` a codemode script receives for a call the server answered: the result
+/// exactly as the server sent it, without `_meta` — `content` blocks as sent (images and
+/// resources included), `structuredContent` and `isError` (`convertMcpResult`,
+/// `extensions/mcp/tools.ts` @v1.0.4: `const { _meta: _ignored, ...scriptResult } = result`).
+///
+/// It is the untruncated result: the output guard shortens what the model reads, not what a script
+/// processes. `None` when the call carried no raw result (a resource read).
+fn script_call_tool_result(raw: Option<&Value>) -> Option<Value> {
+    let mut result = raw?.as_object()?.clone();
+    result.remove("_meta");
+    Some(Value::Object(result))
+}
+
 /// The body of [`execute_call`]'s `try` — the three result paths and the three catch arms.
 ///
 /// **Three result paths** after the MCP Apps cut (upstream had four; the UI-enabled-tool path is
@@ -941,6 +956,7 @@ async fn invoke(
     recovery: &AuthRecovery<'_>,
     latch: &AutoAuthLatch,
     owned: &CancelToken,
+    script_result: bool,
 ) -> McpResult<ToolResult> {
     // Path 1 — a resource tool. Note the read is NOT wrapped in `abortable`: upstream's asymmetry,
     // reproduced rather than "fixed" (13d §10). Cancellation reaches it only through the request
@@ -1022,6 +1038,9 @@ async fn invoke(
             } else {
                 result.content
             };
+            let structured_content = script_result
+                .then(|| script_call_tool_result(result.raw.as_ref()))
+                .flatten();
             let guarded = ctx
                 .env
                 .guard_mcp_output(
@@ -1040,6 +1059,7 @@ async fn invoke(
             Ok(ToolResult {
                 content: guarded.content,
                 details: Some(Value::Object(map)),
+                structured_content,
                 ..Default::default()
             })
         }
@@ -1053,6 +1073,9 @@ async fn invoke(
             } else {
                 result.content
             };
+            let structured_content = script_result
+                .then(|| script_call_tool_result(result.raw.as_ref()))
+                .flatten();
             let guarded = ctx
                 .env
                 .guard_mcp_output(
@@ -1069,6 +1092,7 @@ async fn invoke(
             Ok(ToolResult {
                 content: guarded.content,
                 details: Some(Value::Object(map)),
+                structured_content,
                 ..Default::default()
             })
         }
@@ -1177,6 +1201,7 @@ async fn catch_arm(
 )]
 mod tests {
     use super::*;
+    use crate::proxy::CallToolOutcome;
     use crate::proxy::testsupport::{FakeEnv, config_with, ctx_with, stdio, text_of};
     use serde_json::json;
 
@@ -1494,6 +1519,110 @@ mod tests {
                 "{outcome:?}: `touch` runs on the way in and again in the `finally`"
             );
         }
+    }
+
+    // ---- every MCP tool resolves to a CallToolResult for a script -------------------------------------------
+
+    /// `convertMcpResult` (`extensions/mcp/tools.ts` @v1.0.4): a script gets the server's whole
+    /// result without `_meta` — image blocks, `structuredContent`, `isError` — never what the
+    /// output guard made of it. Only a registered direct tool is a codemode tool; the `mcp`
+    /// gateway's result is the model's alone.
+    #[tokio::test]
+    async fn a_direct_call_carries_the_servers_whole_result_for_a_script() {
+        let raw = json!({
+            "content": [
+                { "type": "text", "text": "a picture" },
+                { "type": "image", "data": "iVBORw0KGgo=", "mimeType": "image/png" }
+            ],
+            "structuredContent": { "rows": 2 },
+            "isError": false,
+            "_meta": { "trace": "x" }
+        });
+        let outcome = CallToolOutcome {
+            content: vec![Content::text("a picture")],
+            is_error: false,
+            raw: Some(raw),
+        };
+        let build = || {
+            let config = config_with(&[("srv", stdio("a"))]);
+            let env = FakeEnv::default()
+                .with_connection("srv", ConnectionStatus::Connected)
+                .with_call_outcome(outcome.clone());
+            ctx_with(
+                config,
+                &[("srv", vec![ToolMetadata::new("srv_run", "run", "")])],
+                &[],
+                env,
+            )
+            .0
+        };
+
+        let direct = execute_call(
+            &build(),
+            "srv_run",
+            None,
+            None,
+            &CancelToken::new(),
+            Some(ApprovalOrigin::Direct),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            direct.structured_content,
+            Some(json!({
+                "content": [
+                    { "type": "text", "text": "a picture" },
+                    { "type": "image", "data": "iVBORw0KGgo=", "mimeType": "image/png" }
+                ],
+                "structuredContent": { "rows": 2 },
+                "isError": false
+            })),
+            "the raw result minus `_meta`"
+        );
+
+        let gateway = execute_call(&build(), "srv_run", None, None, &CancelToken::new(), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            gateway.structured_content, None,
+            "a gateway call has no script to hand the result to"
+        );
+    }
+
+    /// A server `isError` result keeps its blocks and its flag for the script, and is still the
+    /// `tool_error` the model is told about.
+    #[tokio::test]
+    async fn a_direct_call_the_server_failed_keeps_its_result_for_a_script() {
+        let raw = json!({
+            "content": [{ "type": "text", "text": "it broke" }],
+            "isError": true
+        });
+        let config = config_with(&[("srv", stdio("a"))]);
+        let env = FakeEnv::default()
+            .with_connection("srv", ConnectionStatus::Connected)
+            .with_call_outcome(CallToolOutcome {
+                content: vec![Content::text("it broke")],
+                is_error: true,
+                raw: Some(raw.clone()),
+            });
+        let (ctx, _) = ctx_with(
+            config,
+            &[("srv", vec![ToolMetadata::new("srv_run", "run", "")])],
+            &[],
+            env,
+        );
+        let result = execute_call(
+            &ctx,
+            "srv_run",
+            None,
+            None,
+            &CancelToken::new(),
+            Some(ApprovalOrigin::Direct),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.details.unwrap()["error"], json!("tool_error"));
+        assert_eq!(result.structured_content, Some(raw));
     }
 
     // ---- MCP-164 · result shaping --------------------------------------------------------------------------

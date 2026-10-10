@@ -74,12 +74,24 @@ fn await_rpc_ready(stdin: &mut ChildStdin, stdout: ChildStdout) {
         .expect("write get_state");
     stdin.flush().expect("flush");
     let mut reader = BufReader::new(stdout);
-    let mut line = String::new();
-    reader.read_line(&mut line).expect("read a response line");
-    assert!(
-        line.contains("\"ready\""),
-        "expected the get_state response, got: {line}"
-    );
+    // The response is not necessarily the first line: a fresh agent directory makes the first
+    // session install the bundled Flux resources and say so, and a notice said before the mode
+    // attaches its effect drain is delivered when it does (SEAM-157), so an
+    // `extension_ui_request` can come first. Skip lines until the answer to OUR request.
+    loop {
+        let mut line = String::new();
+        let n = reader.read_line(&mut line).expect("read a response line");
+        assert!(n > 0, "stdout closed before the get_state response arrived");
+        let frame: serde_json::Value = serde_json::from_str(line.trim_end())
+            .unwrap_or_else(|e| panic!("stdout carried a non-JSON line ({e}): {line}"));
+        if frame["id"] == "ready" {
+            assert_eq!(
+                frame["type"], "response",
+                "expected the get_state response, got: {line}"
+            );
+            return;
+        }
+    }
 }
 
 /// Wait up to `limit` for the child to exit; `None` means it was still running at the deadline.

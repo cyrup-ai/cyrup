@@ -846,3 +846,17 @@ fn reasoning_off_sends_no_openai_reasoning_field() {
         );
     }
 }
+
+/// PROMPT-001 — the prompt a transcript replays to reaches the Converse `system` blocks.
+#[test]
+fn the_transcripts_prompt_reaches_the_request_body() {
+    use crate::api::prompt_fixture::{agent_context, assert_wire_carries_prompt};
+    let model = model_with("global.anthropic.claude-sonnet-5", "Claude Sonnet 5");
+    let body = payload(
+        &model,
+        &agent_context(Vec::new()),
+        &StreamOptions::default(),
+        &BedrockOptions::default(),
+    );
+    assert_wire_carries_prompt(&body["system"].to_string());
+}

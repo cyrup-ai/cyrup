@@ -336,3 +336,15 @@ fn prov090_allowed_fallback_models_emit_fallbacks_and_the_beta() {
     );
     assert!(!beta_of(&empty).contains(SERVER_SIDE_FALLBACK_BETA));
 }
+
+/// PROMPT-001 — the prompt a transcript replays to reaches the Messages body.
+#[test]
+fn the_transcripts_prompt_reaches_the_request_body() {
+    use crate::api::prompt_fixture::{agent_context, assert_wire_carries_prompt};
+    let body = build_body(
+        &model(),
+        &agent_context(Vec::new()),
+        &StreamOptions::default(),
+    );
+    assert_wire_carries_prompt(&body["system"].to_string());
+}

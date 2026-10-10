@@ -321,7 +321,11 @@ fn approval_argument_preview(args: &Value) -> String {
 ///   supply (`DialogOptions::signal_id` is the host's own route and nothing wires it), so the token
 ///   is checked on **both** sides of the dialog instead: a cancelled call denies without asking,
 ///   and an answer that arrives after a cancellation is discarded rather than cached. The dialog
-///   itself stays on screen until the human dismisses it. Stated rather than silently changed.
+///   itself stays on screen until the human dismisses it. What a caller does get is its own
+///   cancellation: [`crate::owner::McpDialog`] awaits the dialog on the blocking pool rather than blocking the
+///   task, so this future parks at the dialog and whoever polls it (a `codemode` script's
+///   supervisor, which ends the script at its `timeout_ms` or on an abort) is not held until a
+///   person answers. Stated rather than silently changed.
 ///
 /// **Parameter order note.** Upstream's is `(state, serverName, toolMeta, args, signal, origin,
 /// approvalMetadata)`; here `origin` precedes `cancel` so the signature matches

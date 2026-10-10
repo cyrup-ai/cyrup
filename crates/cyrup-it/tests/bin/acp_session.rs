@@ -286,6 +286,18 @@ impl Acp {
         })
     }
 
+    /// The position of the `kind` update whose text content is exactly `text`. A first run in a
+    /// fresh agent directory installs the bundled Flux resources and says so as an
+    /// `agent_message_chunk`, and a notice said before the mode attaches its effect drain is
+    /// delivered when it does (SEAM-157), so the first chunk of a kind on the wire is not
+    /// necessarily the transcript's.
+    fn position_of_text_update(&self, kind: &str, text: &str) -> usize {
+        self.position(&format!("a `{kind}` update saying {text:?}"), |f| {
+            f["params"]["update"]["sessionUpdate"] == kind
+                && f["params"]["update"]["content"]["text"] == text
+        })
+    }
+
     fn dump(&self) -> String {
         self.seen
             .iter()
@@ -1201,8 +1213,8 @@ fn session_load_replays_before_its_response_and_advertises_after_it() {
     acp.update("available_commands_update");
 
     // ACP-214 — the transcript, in order, before the response.
-    let user = acp.position_of_update("user_message_chunk");
-    let agent = acp.position_of_update("agent_message_chunk");
+    let user = acp.position_of_text_update("user_message_chunk", "what is 2+2");
+    let agent = acp.position_of_text_update("agent_message_chunk", "4");
     let settled = acp.position_of_response(3);
     let commands = acp.position_of_update("available_commands_update");
     assert!(

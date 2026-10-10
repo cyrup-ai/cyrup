@@ -1,4 +1,4 @@
-;; AGENT-027 fixture: the smallest component that instantiates against the `cyrup:ext@0.19.0`
+;; AGENT-027 fixture: the smallest component that instantiates against the `cyrup:ext@0.20.0`
 ;; `extension` world and whose `init` succeeds, so the host reaches its `${path} factory` timing mark.
 ;; It imports nothing and exports every `events` function plus `init`. Each export returns a
 ;; pointer to zeroed memory, which the canonical ABI reads as the first case / empty value
@@ -24,6 +24,7 @@
     (func (export "with-session") (param i32 i32) (result i32) i32.const 16)
     (func (export "execute-tool") (param i32 i32 i32 i32 i32 i32) (result i32) i32.const 16)
     (func (export "prepare-arguments") (param i32 i32 i32 i32) (result i32) i32.const 16)
+    (func (export "prepare-loadout") (param i32 i32 i32 i32) (result i32) i32.const 16)
     (func (export "execute-command") (param i32 i32 i32 i32) (result i32) i32.const 16)
     (func (export "get-argument-completions") (param i32 i32 i32 i32) (result i32) i32.const 16)
     (func (export "execute-shortcut") (param i32 i32) (result i32) i32.const 16)
@@ -83,7 +84,7 @@
   (export $block-result "block-result" (type $block-result'))
   (type $hook-outcome' (variant (case "noop") (case "block" $block-result) (case "mutate" string) (case "handled" string)))
   (export $hook-outcome "hook-outcome" (type $hook-outcome'))
-  (type $tool-output' (record (field "content-json" string) (field "details-json" (option string)) (field "is-error" bool) (field "terminate" bool)))
+  (type $tool-output' (record (field "content-json" string) (field "details-json" (option string)) (field "is-error" bool) (field "terminate" bool) (field "structured-content-json" (option string))))
   (export $tool-output "tool-output" (type $tool-output'))
   (type $terminal-input-result' (record (field "consume" (option bool)) (field "data" (option string))))
   (export $terminal-input-result "terminal-input-result" (type $terminal-input-result'))
@@ -107,6 +108,8 @@
     (canon lift (core func $i "execute-tool") (memory $mem) (realloc $realloc)))
   (func $prepare-arguments (param "name" string) (param "args-json" string) (result (option string))
     (canon lift (core func $i "prepare-arguments") (memory $mem) (realloc $realloc)))
+  (func $prepare-loadout (param "name" string) (param "loadout-json" string) (result (result (option string) (error string)))
+    (canon lift (core func $i "prepare-loadout") (memory $mem) (realloc $realloc)))
   (func $execute-command (param "name" string) (param "args" string) (result (result (option string) (error string)))
     (canon lift (core func $i "execute-command") (memory $mem) (realloc $realloc)))
   (func $get-argument-completions (param "name" string) (param "prefix" string) (result (list string))
@@ -217,6 +220,7 @@
     (export "with-session" (func $with-session))
     (export "execute-tool" (func $execute-tool))
     (export "prepare-arguments" (func $prepare-arguments))
+    (export "prepare-loadout" (func $prepare-loadout))
     (export "execute-command" (func $execute-command))
     (export "get-argument-completions" (func $get-argument-completions))
     (export "execute-shortcut" (func $execute-shortcut))
@@ -268,6 +272,6 @@
     (export "on-session-tree" (func $on-session-tree))
     (export "bus-deliver" (func $bus-deliver))
   )
-  (export "cyrup:ext/events@0.19.0" (instance $events))
+  (export "cyrup:ext/events@0.20.0" (instance $events))
   (export "init" (func $init))
 )

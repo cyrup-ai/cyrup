@@ -87,6 +87,11 @@ mod acp_session;
 /// made in-process.
 mod acp_transport;
 mod auth_credential_print;
+/// The codemode tool on the wire: the request a provider receives and the tool result the next
+/// request carries, from the real binary against an in-process fake OpenAI server. Unix only: it
+/// signals and inspects real processes (`/proc`, `kill`).
+#[cfg(unix)]
+mod codemode_wire;
 mod extension_load_failure_exit;
 /// CFG-088 / SEAM-020: `--help` after the runtime — extension flags plus the startup settings
 /// diagnostics, both only visible on the real binary's stdio.

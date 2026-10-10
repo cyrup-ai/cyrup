@@ -15,6 +15,7 @@ use crate::descriptor::{
     VirtualModelSpec,
 };
 use crate::events::*;
+use crate::loadout::{ToolLoadout, ToolLoadoutChanges};
 use crate::provider::{OAuthCallbacks, OAuthCredentials, ProviderHandlers, ProviderStream};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -428,6 +429,12 @@ pub struct ToolOutput {
     pub is_error: bool,
     /// End the agent loop after this result (Pi `terminate`, R-08-015).
     pub terminate: bool,
+    /// The machine-readable result, matching the tool's declared
+    /// [`ToolDescriptor::output_schema`] (Pi `AgentToolResult.structuredContent`,
+    /// `packages/agent/src/types.ts:433` @v1.0.4). NOT sent to the model — [`Self::content`] stays
+    /// the model-facing result — but a codemode script receives it instead of the text for a tool
+    /// that declares a schema. Set with [`Self::with_structured_content`].
+    pub structured_content: Option<Value>,
 }
 
 impl ToolOutput {
@@ -451,6 +458,13 @@ impl ToolOutput {
     #[must_use]
     pub fn with_details(mut self, d: impl Serialize) -> Self {
         self.details = serde_json::to_value(d).ok();
+        self
+    }
+    /// Attach the machine-readable [`ToolOutput::structured_content`]. A value that fails to
+    /// serialize leaves it unset rather than failing the tool.
+    #[must_use]
+    pub fn with_structured_content(mut self, v: impl Serialize) -> Self {
+        self.structured_content = serde_json::to_value(v).ok();
         self
     }
     /// Set [`ToolOutput::terminate`]: end the agent loop after this result (Pi `terminate`,
@@ -480,6 +494,21 @@ pub trait ToolExec: 'static {
     /// flag is what tells the host to call the export at all; the descriptor field used to be
     /// accepted, documented and silently discarded at the boundary.
     fn prepare_arguments(&self, _args: &Value) -> Option<Value> {
+        None
+    }
+
+    /// Adjust how the loadout is presented to the model while this tool is active — pi
+    /// `ToolDefinition.prepareLoadout` (`extensions/types.ts:617` @v1.0.4). Called whenever the
+    /// session applies its active tools, with the tools as the host sees them; tools that
+    /// orchestrate other tools use it, for example to list the callable tools in their own
+    /// description. CODE-015.
+    ///
+    /// `None` (the default) is pi's `undefined`: no changes. A tool that overrides this must ALSO
+    /// set `ToolDescriptor::prepare_loadout`, because that flag is what tells the host to call the
+    /// export at all. The hook runs while the host is applying the active tools and is not given a
+    /// [`ToolCall`], so it cannot call tools; a long computation here delays that application, and
+    /// when this extension is busy with another call the host reuses the previous answer.
+    fn prepare_loadout(&self, _loadout: &ToolLoadout) -> Option<ToolLoadoutChanges> {
         None
     }
 }
@@ -2193,6 +2222,19 @@ impl ExtensionApi {
             .iter()
             .find(|t| t.descriptor.name == name)
             .and_then(|t| t.exec.prepare_arguments(args))
+    }
+
+    /// Run a registered tool's `prepareLoadout` hook (CODE-015). `None` when the tool does not
+    /// exist or declares no hook — pi's `undefined`, no changes.
+    pub fn prepare_tool_loadout(
+        &self,
+        name: &str,
+        loadout: &ToolLoadout,
+    ) -> Option<ToolLoadoutChanges> {
+        self.tools
+            .iter()
+            .find(|t| t.descriptor.name == name)
+            .and_then(|t| t.exec.prepare_loadout(loadout))
     }
 
     /// Execute a guest-registered slash command by name (R-08-016). Runs the handler with a

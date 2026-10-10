@@ -10,6 +10,7 @@ mod chatgpt_sign_in;
 mod convert;
 mod decode;
 mod errors;
+mod grammar;
 mod headers;
 mod params;
 mod tools;

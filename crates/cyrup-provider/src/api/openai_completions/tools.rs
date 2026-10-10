@@ -3,7 +3,8 @@
 use crate::api::compat::ResolvedCompat;
 use crate::context::ToolDef;
 use crate::utils::constrained_sampling::{
-    ConstrainedSamplingError, json_schema_tool_parameters, resolve_json_schema_strict_sampling,
+    ConstrainedSamplingError, json_schema_tool_parameters, resolve_grammar_constrained_sampling,
+    resolve_json_schema_strict_sampling,
 };
 use cyrup_core::{Content, Message};
 use serde_json::{Map, Value, json};
@@ -67,6 +68,29 @@ pub(crate) fn convert_tools(
     tools
         .iter()
         .map(|t| {
+            // Pi `resolveGrammarConstrainedSampling` first (`openai-completions.ts:1487-1503`
+            // @v1.0.4): a grammar tool is a Chat Completions `custom` tool — note the grammar sits
+            // one level deeper than on the Responses wire, under `format.grammar`. A provider
+            // without `supportsOpenAIGrammarTools` (the default) resolves to `None` and gets the
+            // JSON function tool below.
+            if let Some(grammar) =
+                resolve_grammar_constrained_sampling(t, compat.supports_openai_grammar_tools)?
+            {
+                return Ok(json!({
+                    "type": "custom",
+                    "custom": {
+                        "name": t.name,
+                        "description": t.description,
+                        "format": {
+                            "type": "grammar",
+                            "grammar": {
+                                "syntax": grammar.format.as_str(),
+                                "definition": grammar.definition,
+                            },
+                        },
+                    },
+                }));
+            }
             let strict = resolve_json_schema_strict_sampling(t, compat.supports_strict_mode, None)?;
             let mut function = Map::new();
             function.insert("name".to_string(), json!(t.name));

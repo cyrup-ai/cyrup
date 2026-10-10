@@ -4,10 +4,10 @@
 //! flux: everything else ports as a prompt template, but a mid-turn structured question needs a
 //! real tool call.
 
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use cyrup_core::{CancelToken, Content, Tool, ToolCallId, ToolError, ToolResult, ToolUpdateSink};
-use cyrup_ext::host::{DialogOptions, HostServices};
+use cyrup_ext::host::{DialogOptions, HostServices, HostServicesSlot};
 use serde::Deserialize;
 
 /// One `options[]` entry (schema: `{label: string, description?: string}`, `label` required).
@@ -34,15 +34,15 @@ const DONE_ROW: &str = "\u{2714} Done";
 
 /// The `ask_user_question` native tool.
 pub struct AskUserQuestionTool {
-    host: Arc<OnceLock<Arc<dyn HostServices>>>,
+    host: Arc<HostServicesSlot>,
     params: serde_json::Value,
 }
 
 impl AskUserQuestionTool {
-    /// `host` is the SAME `OnceLock` [`crate::extension::FluxExtension`] holds — cloned in here so
+    /// `host` is the SAME slot [`crate::extension::FluxExtension`] holds — cloned in here so
     /// `set_host_services` (`native.rs:683`) binds both the extension and this tool at once.
     #[must_use]
-    pub fn new(host: Arc<OnceLock<Arc<dyn HostServices>>>) -> Self {
+    pub fn new(host: Arc<HostServicesSlot>) -> Self {
         let params = serde_json::json!({
             "type": "object",
             "properties": {
@@ -161,7 +161,7 @@ impl Tool for AskUserQuestionTool {
         cancel: CancelToken,
         _on_update: ToolUpdateSink,
     ) -> Result<ToolResult, ToolError> {
-        let Some(host) = self.host.get().cloned() else {
+        let Some(host) = self.host.get() else {
             return Err(ToolError::new("ask_user_question: no interactive host"));
         };
 

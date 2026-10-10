@@ -14,6 +14,16 @@ use crate::utils::deferred_tools::split_deferred_tools;
 use cyrup_core::ModelThinkingLevel;
 use serde_json::{Map, Value, json};
 
+/// Pi `model.compat?.supportsOpenAIGrammarTools ?? false` (`openai-codex-responses.ts:538`
+/// @v1.0.4): grammar tools are opt-in on this route.
+pub(super) fn supports_openai_grammar_tools(model: &Model) -> bool {
+    model
+        .compat
+        .as_ref()
+        .and_then(|c| c.supports_openai_grammar_tools)
+        .unwrap_or(false)
+}
+
 /// 1:1 port of pi `buildRequestBody` (`openai-codex-responses.ts:529-596`).
 ///
 /// Differences from `openai-responses`' `buildParams` that are easy to "fix" wrongly:
@@ -65,6 +75,7 @@ pub(super) fn build_request_body(
             .and_then(|c| c.supports_strict_mode)
             .unwrap_or(true),
         default_strict: None,
+        supports_openai_grammar_tools: supports_openai_grammar_tools(model),
     };
     let messages = convert_responses_messages(
         model,

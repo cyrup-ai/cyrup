@@ -2255,6 +2255,65 @@ mod tests {
         );
     }
 
+    /// A subagent whose agent pins `extensions:` always gets `--no-extensions`, and `codemode` is an
+    /// ambient built-in. The child keeps it across that flag only when the `--tools` list it is
+    /// handed names it, so the plan must put the name there; and a ceiling that denies extensions
+    /// must take it out again. (The child-side half is `cyrup-session-svc`'s `child_keeps_codemode`.)
+    ///
+    /// **[CYRUP-DELTA]** see `exec::tool_surface` and `child_keeps_codemode` for the pi-subagents
+    /// source of the rule.
+    #[test]
+    fn codemode_named_in_an_agents_tools_reaches_the_child_unless_extensions_are_denied() {
+        use crate::exec::capability_ceiling as cc;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let session = "spawn-plan-codemode-session";
+        let mut opts = base_opts(dir.path(), &["m1"]);
+        opts.parent_session_id = Some(session.to_string());
+        let depth = DepthEnvelope {
+            current_depth: 0,
+            max_depth: 5,
+        };
+        let mut agent = sample_agent_config("m1", &[]);
+        agent.extensions = Some(vec!["./agent-ext.ts".to_string()]);
+        agent.tools = Some(vec![
+            ToolRef::Builtin("read".to_string()),
+            ToolRef::Builtin("codemode".to_string()),
+        ]);
+        let tools_arg = |agent: &AgentConfig| {
+            let plan = build_attempt_spawn_plan(
+                agent,
+                &ModelId::from("m1"),
+                "task",
+                &opts,
+                depth,
+                dir.path(),
+                None,
+            )
+            .expect("plan builds");
+            let argv = plan.spec.build_argv();
+            assert!(
+                argv.contains(&"--no-extensions".to_string()),
+                "argv {argv:?}"
+            );
+            let idx = argv.iter().position(|a| a == "--tools").expect("--tools");
+            argv.get(idx + 1).cloned()
+        };
+        assert_eq!(tools_arg(&agent).as_deref(), Some("read,codemode"));
+
+        let _handle = cc::register_capability_ceiling(
+            session,
+            "org-policy",
+            &serde_json::json!({ "denyExtensions": true }),
+        )
+        .expect("registers");
+        assert_eq!(
+            tools_arg(&agent).as_deref(),
+            Some("read"),
+            "a ceiling that denies extensions keeps codemode out of the child's --tools"
+        );
+    }
+
     /// SUBA-072(d) — pi `pi-args.ts:439-441`: a ceiling that excludes `read` while lazy skill
     /// loading requires it must fail the launch outright, independent of whether the agent itself
     /// declared any `tools:` — this is `SUBA-014`'s companion throw, sharing the same branch.

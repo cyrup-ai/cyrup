@@ -106,6 +106,23 @@ impl McpToolAnnotations {
         self == &Self::default()
     }
 
+    /// The four boolean hints as the host's [`cyrup_core::ToolAnnotations`] (pi `ToolAnnotations`,
+    /// `core/extensions/types.ts:512-523` @v1.0.4), without `title`: pi-mcp-adapter drops it
+    /// (`const { title: _title, ...annotations } = tool?.annotations`, `deferredToolFields`,
+    /// `index.ts:441` @v5.0.0) and the built-in MCP extension keeps only the booleans
+    /// (`toToolAnnotations`, `extensions/mcp/tools.ts` @v1.0.4). `None` when none is set, which is
+    /// pi's omitted field.
+    #[must_use]
+    pub fn to_tool_annotations(&self) -> Option<cyrup_core::ToolAnnotations> {
+        let annotations = cyrup_core::ToolAnnotations {
+            read_only_hint: self.read_only_hint,
+            destructive_hint: self.destructive_hint,
+            idempotent_hint: self.idempotent_hint,
+            open_world_hint: self.open_world_hint,
+        };
+        (!annotations.is_empty()).then_some(annotations)
+    }
+
     /// `Object.keys(kept).length > 0 ? kept : undefined`.
     #[must_use]
     pub fn non_empty(self) -> Option<Self> {
@@ -239,6 +256,259 @@ pub fn find_tool_by_name<'a>(
         .find(|tool| tool.name.replace('-', "_") == normalized)
 }
 
+// ==================================================================================================
+// 3 · `formatSchema` (MCP-211)
+// ==================================================================================================
+
+/// JavaScript truthiness of a JSON value: what `if (schema.type)` asks.
+fn js_truthy(value: &Value) -> bool {
+    match value {
+        Value::Null => false,
+        Value::Bool(flag) => *flag,
+        Value::Number(number) => number.as_f64().is_some_and(|n| n != 0.0 && !n.is_nan()),
+        Value::String(text) => !text.is_empty(),
+        Value::Array(_) | Value::Object(_) => true,
+    }
+}
+
+/// `String(value)` for a JSON value: an array joins its members with `,` (a `null` member is
+/// empty), an object is `[object Object]`.
+fn js_string(value: &Value) -> String {
+    match value {
+        Value::Null => "null".to_owned(),
+        Value::Bool(flag) => flag.to_string(),
+        Value::Number(number) => number
+            .as_f64()
+            .map_or_else(|| number.to_string(), cyrup_codemode::js::number_to_string),
+        Value::String(text) => text.clone(),
+        Value::Array(items) => items
+            .iter()
+            .map(|item| {
+                if item.is_null() {
+                    String::new()
+                } else {
+                    js_string(item)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(","),
+        Value::Object(_) => "[object Object]".to_owned(),
+    }
+}
+
+/// The strings of `schema.required`, which is ignored unless it is an array.
+fn required_names(schema: &serde_json::Map<String, Value>) -> Vec<&str> {
+    schema
+        .get("required")
+        .and_then(Value::as_array)
+        .map(|names| names.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default()
+}
+
+/// `tool-metadata.ts:168` `formatSchema(schema, indent = "  ")` (MCP-211): a JSON Schema as the
+/// indented parameter list `mcp({ describe })` and `mcp({ search })` show a model and a failed call
+/// ends with (`Expected parameters:`). Model-facing text the model uses to correct a bad call, so it
+/// is upstream's byte for byte, including the cases a JavaScript reader takes for granted: members
+/// come in `Object.entries` order, a value shown with `JSON.stringify` is shown as that writes it
+/// (`1.0` is `1`), and `schema.type` is tested for truthiness (`""` is no type).
+///
+/// A schema that is not an object is `(no schema)`; an object schema without properties is
+/// `(no parameters)`; a schema with nothing to list is its type, or `(complex schema)`.
+#[must_use]
+pub fn format_schema(schema: &Value, indent: &str) -> String {
+    let Some(schema) = schema.as_object() else {
+        return format!("{indent}(no schema)");
+    };
+
+    if schema.get("type").and_then(Value::as_str) == Some("object")
+        && let Some(properties) = schema.get("properties").and_then(Value::as_object)
+    {
+        if properties.is_empty() {
+            return format!("{indent}(no parameters)");
+        }
+        let required = required_names(schema);
+        let mut lines = Vec::new();
+        for name in cyrup_codemode::js::own_keys(properties) {
+            if let Some(property) = properties.get(name) {
+                lines.extend(format_property(
+                    name,
+                    property,
+                    required.contains(&name),
+                    indent,
+                ));
+            }
+        }
+        return lines.join("\n");
+    }
+
+    let lines = format_nested_schema(schema, indent);
+    if !lines.is_empty() {
+        return lines.join("\n");
+    }
+
+    let type_str = format_type(schema);
+    if !type_str.is_empty() {
+        return format!("{indent}({type_str})");
+    }
+
+    format!("{indent}(complex schema)")
+}
+
+/// `formatProperty(name, schema, required, indent)`: the property's own line, then whatever nests
+/// under it two columns further in.
+fn format_property(name: &str, schema: &Value, required: bool, indent: &str) -> Vec<String> {
+    let Some(schema) = schema.as_object() else {
+        let marker = if required { " *required*" } else { "" };
+        return vec![format!("{indent}{name}{marker}")];
+    };
+
+    let mut parts = vec![format!("{indent}{name}")];
+    let type_str = format_type(schema);
+    if !type_str.is_empty() {
+        parts.push(format!("({type_str})"));
+    }
+    if required {
+        parts.push("*required*".to_owned());
+    }
+    append_schema_annotations(&mut parts, schema);
+
+    let mut lines = vec![parts.join(" ")];
+    lines.extend(format_nested_schema(schema, &format!("{indent}  ")));
+    lines
+}
+
+/// `formatNestedSchema(schema, indent)`: `anyOf`, `oneOf`, `items`, then `properties`, each only
+/// when the schema has it.
+fn format_nested_schema(schema: &serde_json::Map<String, Value>, indent: &str) -> Vec<String> {
+    let mut lines = Vec::new();
+
+    if let Some(variants) = schema.get("anyOf").and_then(Value::as_array) {
+        lines.extend(format_variants("anyOf", variants, indent));
+    }
+    if let Some(variants) = schema.get("oneOf").and_then(Value::as_array) {
+        lines.extend(format_variants("oneOf", variants, indent));
+    }
+    // `schema.items !== undefined`: a present `null` counts, and is listed as a bare `items`.
+    if let Some(items) = schema.get("items") {
+        lines.extend(format_property("items", items, false, indent));
+    }
+    if let Some(properties) = schema.get("properties").and_then(Value::as_object) {
+        let required = required_names(schema);
+        for name in cyrup_codemode::js::own_keys(properties) {
+            if let Some(property) = properties.get(name) {
+                lines.extend(format_property(
+                    name,
+                    property,
+                    required.contains(&name),
+                    indent,
+                ));
+            }
+        }
+    }
+
+    lines
+}
+
+/// `formatVariants(keyword, variants, indent)`: the keyword, then one `- type [annotations]` line
+/// per variant with the variant's own nested lines four columns in. A variant that is not an object
+/// is shown as its JSON.
+fn format_variants(keyword: &str, variants: &[Value], indent: &str) -> Vec<String> {
+    let mut lines = vec![format!("{indent}{keyword}:")];
+
+    for variant in variants {
+        let Some(schema) = variant.as_object() else {
+            lines.push(format!(
+                "{indent}  - {}",
+                cyrup_codemode::js::json_stringify(variant)
+            ));
+            continue;
+        };
+        let type_str = format_type(schema);
+        let type_str = if type_str.is_empty() {
+            "schema"
+        } else {
+            &type_str
+        };
+        let mut parts = vec![format!("{indent}  - {type_str}")];
+        append_schema_annotations(&mut parts, schema);
+        lines.push(parts.join(" "));
+        lines.extend(format_nested_schema(schema, &format!("{indent}    ")));
+    }
+
+    lines
+}
+
+/// `formatType(schema)`: the first of `const`, `enum`, `type` (an array joins with ` | `), an
+/// implied `object` and an implied `array` that the schema has; empty when none applies.
+fn format_type(schema: &serde_json::Map<String, Value>) -> String {
+    // `Object.hasOwn(schema, "const")`: `const: null` is a constant, an absent `const` is not.
+    if let Some(constant) = schema.get("const") {
+        return format!("const {}", cyrup_codemode::js::json_stringify(constant));
+    }
+
+    if let Some(values) = schema.get("enum").and_then(Value::as_array) {
+        let values: Vec<String> = values
+            .iter()
+            .map(cyrup_codemode::js::json_stringify)
+            .collect();
+        return format!("enum: {}", values.join(", "));
+    }
+
+    match schema.get("type") {
+        Some(Value::Array(types)) => {
+            let types: Vec<String> = types.iter().map(js_string).collect();
+            return types.join(" | ");
+        }
+        Some(declared) if js_truthy(declared) => return js_string(declared),
+        _ => {}
+    }
+
+    if schema.get("properties").is_some_and(Value::is_object) {
+        return "object".to_owned();
+    }
+
+    if schema.contains_key("items") {
+        return "array".to_owned();
+    }
+
+    String::new()
+}
+
+/// `appendSchemaAnnotations(parts, schema)`: ` - description`, then `[key: value]` for each bound
+/// the schema sets, in upstream's fixed order, then `[default: value]`.
+fn append_schema_annotations(parts: &mut Vec<String>, schema: &serde_json::Map<String, Value>) {
+    if let Some(description) = schema.get("description").and_then(Value::as_str)
+        && !description.is_empty()
+    {
+        parts.push(format!("- {description}"));
+    }
+
+    for key in [
+        "minLength",
+        "maxLength",
+        "minimum",
+        "maximum",
+        "minItems",
+        "maxItems",
+        "format",
+        "pattern",
+    ] {
+        if let Some(value) = schema.get(key) {
+            parts.push(format!(
+                "[{key}: {}]",
+                cyrup_codemode::js::json_stringify(value)
+            ));
+        }
+    }
+
+    if let Some(default) = schema.get("default") {
+        parts.push(format!(
+            "[default: {}]",
+            cyrup_codemode::js::json_stringify(default)
+        ));
+    }
+}
+
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
@@ -354,5 +624,77 @@ mod tests {
                 ..McpToolAnnotations::default()
             })
         );
+    }
+    // ---- MCP-211 · `formatSchema` ---------------------------------------------------------------
+
+    /// One row of `testdata/format_schema_upstream.json`.
+    #[derive(serde::Deserialize)]
+    struct GoldenCase {
+        name: String,
+        /// The schema as JSON text, so `1.0` and `1e21` reach the formatter as written.
+        schema: String,
+        indent: Option<String>,
+        expected: String,
+    }
+
+    /// `expected` of every row is what upstream's own `formatSchema` returned for the schema
+    /// (`tool-metadata.ts:168` of `pi-mcp-adapter` v5.0.0, the function's text run under bun, not
+    /// transcribed), so this is a comparison against the original and not against this port's idea
+    /// of it. The rows cover a nested `anyOf` + `items` + `enum` + `const: null` schema in both
+    /// indents, every `typeof`/truthiness fork the TypeScript has (`type: ""`, `type: 0`, a `type`
+    /// list of mixed values, `required` that is not a list of strings, a `null` item schema),
+    /// `Object.entries` order for integer-like names, and the way `JSON.stringify` writes numbers,
+    /// escapes and object members.
+    #[test]
+    fn format_schema_matches_upstreams_output_byte_for_byte() {
+        let table: Vec<GoldenCase> =
+            serde_json::from_str(include_str!("../../testdata/format_schema_upstream.json"))
+                .unwrap();
+        assert!(
+            table.len() >= 30,
+            "the table was cut short: {}",
+            table.len()
+        );
+        for case in &table {
+            let schema: Value = serde_json::from_str(&case.schema).unwrap();
+            let indent = case.indent.as_deref().unwrap_or("  ");
+            assert_eq!(
+                format_schema(&schema, indent),
+                case.expected,
+                "{}: {}",
+                case.name,
+                case.schema
+            );
+        }
+    }
+
+    /// The case the ledger asks for by name, spelled out so a reader sees the shape rather than
+    /// trusting a table.
+    #[test]
+    fn a_nested_schema_reads_as_an_indented_parameter_list() {
+        let schema = json!({
+            "type": "object",
+            "required": ["target"],
+            "properties": {
+                "target": {
+                    "anyOf": [
+                        { "type": "string", "description": "a name" },
+                        { "const": null }
+                    ]
+                },
+                "mode": { "enum": ["fast", null], "default": "fast" },
+                "tags": { "type": "array", "items": { "type": "string" }, "minItems": 1 }
+            }
+        });
+        assert_eq!(
+            format_schema(&schema, "  "),
+            "  target *required*\n    anyOf:\n      - string - a name\n      - const null\n  mode (enum: \"fast\", null) [default: \"fast\"]\n  tags (array) [minItems: 1]\n    items (string)"
+        );
+        assert_eq!(format_schema(&json!(null), "  "), "  (no schema)");
+        assert_eq!(
+            format_schema(&json!({ "type": "object", "properties": {} }), "  "),
+            "  (no parameters)"
+        );
+        assert_eq!(format_schema(&json!({}), "  "), "  (complex schema)");
     }
 }

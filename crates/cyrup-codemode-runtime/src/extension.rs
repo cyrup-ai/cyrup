@@ -66,6 +66,23 @@ impl CodemodeExtension {
         self
     }
 
+    /// Point the model at a copy of the script reference under `agent_dir`, written from the page
+    /// embedded in this binary ([`crate::tool::docs::materialise_codemode_docs`]). When the copy
+    /// cannot be written the tool keeps the path of the docs shipped next to the install, if any.
+    #[must_use]
+    pub fn with_agent_dir(mut self, agent_dir: &std::path::Path) -> Self {
+        if let Ok(path) = crate::tool::docs::materialise_codemode_docs(agent_dir) {
+            self.options.docs_path = path.to_string_lossy().into_owned();
+        }
+        self
+    }
+
+    /// The docs the tool's description and `models` errors point the model to.
+    #[must_use]
+    pub fn docs_path(&self) -> &str {
+        &self.options.docs_path
+    }
+
     /// Where the session this extension's tool runs in is bound.
     #[must_use]
     pub fn host(&self) -> &CodemodeHostSlot {

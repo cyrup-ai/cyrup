@@ -3,14 +3,14 @@
 //! [`execute`] starts an isolate thread, then supervises it on the caller's runtime: it relays the
 //! script's tool calls to the registered callbacks, collects output, and ends the execution on
 //! the first of the script settling, the deadline, the caller's cancel token, or the sandbox
-//! closing. Whatever the reason, the same teardown follows ([`Execution::finish`] upstream): the
+//! closing. Whatever the reason, the same teardown follows (`Execution.finish` upstream): the
 //! still-pending calls are recorded `cancelled` and their tool tokens fire, and the isolate is
 //! stopped.
 //!
 //! The supervisor is a plain future with no task of its own, so dropping the `execute` future
 //! cancels the execution: a guard stops the isolate and fires the tool tokens on the way out.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -25,17 +25,20 @@ use tokio::sync::mpsc;
 use super::isolate;
 use super::lifecycle::{KillSwitch, Running};
 use super::protocol::{
-    CallTarget, HostReply, IsolateInit, ReplyPayload, ScriptSettled, WorkerMessage,
-    effective_memory_limit, globals_json, script_error, store_json, store_writes, tools_json,
+    CallTarget, HostReply, IsolateInit, ReplyPayload, ScriptSettled, UnobservedReport,
+    WorkerMessage, effective_memory_limit, globals_json, out_of_memory_json, return_value,
+    script_error, store_json, store_writes, tools_json,
 };
+use super::{Isolation, MAX_UNOBSERVED_CHARS, MAX_UNOBSERVED_SHOWN, process};
 use crate::types::{
     CallStatus, CodemodeCall, CodemodeError, CodemodeResult, CodemodeStoreWrites, CodemodeTool,
-    CodemodeToolContext, Deadline, ErrorKind, ToolResult,
+    CodemodeToolContext, Deadline, ErrorKind, ReturnValue, ToolResult, UnobservedError,
+    UnobservedErrors,
 };
 
 /// Stack of an isolate thread. V8 limits script recursion well below this (so deep recursion is a
 /// catchable `RangeError`); the rest is for the engine's own frames.
-const ISOLATE_THREAD_STACK_BYTES: usize = 8 * 1024 * 1024;
+pub(super) const ISOLATE_THREAD_STACK_BYTES: usize = 8 * 1024 * 1024;
 
 /// What an execution shares with its sandbox.
 pub(super) struct Hub {
@@ -47,10 +50,12 @@ pub(super) struct Hub {
 /// Everything one execution needs, captured when it starts: later `register_tool` calls do not
 /// reach it (`host.ts:343` `new Map(this.toolsByName)`).
 pub(super) struct Plan {
+    pub isolation: Isolation,
     pub code: String,
     pub tools: Vec<CodemodeTool>,
     pub globals: Vec<CodemodeTool>,
     pub deadline: Deadline,
+    pub active_limit: Option<Duration>,
     pub memory_limit: Option<u64>,
     pub store: Map<String, Value>,
     pub cancel: Option<CancelToken>,
@@ -77,7 +82,23 @@ struct PendingCall {
     /// Index into the recorded calls; `None` for a global, which is not recorded.
     record: Option<usize>,
     started: Instant,
+    /// The tool or global called.
+    name: String,
 }
+
+/// [CYRUP-DELTA] A call that failed, kept until the script ends in case it never heard of it: the
+/// reply is queued for the isolate, which stops listening the moment the script returns, so a call
+/// that failed while the script was still on the line that made it (`tools.read(missing); return 1`)
+/// is answered to nobody. See [`unobserved_errors`].
+struct FailedCall {
+    name: String,
+    message: String,
+}
+
+/// How many failed calls a run remembers, the newest. A call the isolate had not heard of when the
+/// script ended is one of the last it started, at most [`MAX_PENDING_CALLS`](super::MAX_PENDING_CALLS)
+/// of them; a loop of failing calls it did hear of must not grow the host.
+const MAX_REMEMBERED_FAILURES: usize = 4096;
 
 type CallOutcome = (u32, ToolResult);
 
@@ -108,21 +129,26 @@ pub(super) async fn execute(hub: &Hub, plan: Plan) -> CodemodeResult {
         globals_json: globals_json(&plan.globals),
         store_json: store_json(&plan.store),
         memory_limit: plan.memory_limit.map(effective_memory_limit),
+        active_limit_ms: plan.active_limit.map(millis),
     };
     let thread_guard = hub.running.enter();
-    let spawned = std::thread::Builder::new()
-        .name(String::from("codemode-isolate"))
-        .stack_size(ISOLATE_THREAD_STACK_BYTES)
-        .spawn({
-            let kill = Arc::clone(&kill);
-            move || isolate::run_thread(init, to_host, from_host, kill, thread_guard)
-        });
-    if let Err(error) = spawned {
-        return failed(
-            sandbox_error(format!("Failed to start worker: {error}")),
-            Vec::new(),
-            Vec::new(),
-        );
+    let started = match &plan.isolation {
+        Isolation::InProcess => std::thread::Builder::new()
+            .name(String::from("codemode-isolate"))
+            .stack_size(ISOLATE_THREAD_STACK_BYTES)
+            .spawn({
+                let kill = Arc::clone(&kill);
+                move || isolate::run_thread(init, to_host, from_host, kill, thread_guard)
+            })
+            .map(drop)
+            .map_err(|error| format!("Failed to start worker: {error}")),
+        Isolation::Process(command) => {
+            process::start(command, init, to_host, from_host, &kill, thread_guard)
+                .map_err(|error| format!("Failed to start the sandbox process: {error}"))
+        }
+    };
+    if let Err(message) = started {
+        return failed(sandbox_error(message), Vec::new(), Vec::new());
     }
 
     let (calls_tx, mut calls_rx) = mpsc::unbounded_channel::<CallOutcome>();
@@ -132,9 +158,11 @@ pub(super) async fn execute(hub: &Hub, plan: Plan) -> CodemodeResult {
         tool_cancel,
         reply: reply_tx,
         calls_tx,
+        active_limit: plan.active_limit,
         output: Vec::new(),
         calls: Vec::new(),
         pending: HashMap::new(),
+        failures: BTreeMap::new(),
     };
 
     let deadline = async {
@@ -196,6 +224,20 @@ fn timed_out(deadline: Deadline) -> CodemodeError {
     }
 }
 
+/// [CYRUP-DELTA] The failure of a script that used up its running time. `Timeout`, like the
+/// deadline, because it is the same remedy: the script needs more time than it was given.
+fn active_limit_exceeded(limit: Option<Duration>) -> CodemodeError {
+    let millis = limit.map_or(0, millis);
+    CodemodeError {
+        kind: ErrorKind::Timeout,
+        name: None,
+        message: format!(
+            "Script ran for its limit of {millis} ms of its own time (waiting for tool calls does not count)"
+        ),
+        stack: None,
+    }
+}
+
 fn sandbox_error(message: String) -> CodemodeError {
     CodemodeError {
         kind: ErrorKind::Sandbox,
@@ -226,8 +268,9 @@ fn by_name(tools: Vec<CodemodeTool>) -> HashMap<String, CodemodeTool> {
 
 /// A script that ran to its end, before the output and calls are attached.
 struct Completed {
-    value: Option<Value>,
+    value: Option<ReturnValue>,
     store_writes: CodemodeStoreWrites,
+    unobserved: UnobservedErrors,
 }
 
 type Finish = Result<Completed, CodemodeError>;
@@ -239,9 +282,13 @@ struct Run {
     tool_cancel: CancelToken,
     reply: mpsc::UnboundedSender<HostReply>,
     calls_tx: mpsc::UnboundedSender<CallOutcome>,
+    /// What the isolate was told to stop at; names the limit in the failure it reports.
+    active_limit: Option<Duration>,
     output: Vec<OutputItem>,
     calls: Vec<CodemodeCall>,
     pending: HashMap<u32, PendingCall>,
+    /// By call id, oldest first.
+    failures: BTreeMap<u32, FailedCall>,
 }
 
 impl Run {
@@ -261,8 +308,13 @@ impl Run {
                 self.start_call(id, target, name, args);
                 None
             }
-            WorkerMessage::Done(settled) => Some(settle(settled)),
+            WorkerMessage::Done(settled) => Some(settle(settled, &self.failures)),
             WorkerMessage::Crash(message) => Some(Err(sandbox_error(message))),
+            WorkerMessage::OutOfMemory => Some(settle(
+                ScriptSettled::Threw(out_of_memory_json()),
+                &self.failures,
+            )),
+            WorkerMessage::ActiveLimit => Some(Err(active_limit_exceeded(self.active_limit))),
         }
     }
 
@@ -282,6 +334,7 @@ impl Run {
             PendingCall {
                 record,
                 started: Instant::now(),
+                name: name.clone(),
             },
         );
         let table = match target {
@@ -351,6 +404,18 @@ impl Run {
             },
             Err(message) => (CallStatus::Error, ReplyPayload::Failure(message)),
         };
+        if let ReplyPayload::Failure(message) = &payload {
+            self.failures.insert(
+                id,
+                FailedCall {
+                    name: pending.name.clone(),
+                    message: one_line(message),
+                },
+            );
+            while self.failures.len() > MAX_REMEMBERED_FAILURES {
+                self.failures.pop_first();
+            }
+        }
         if let Some(record) = pending.record.and_then(|index| self.calls.get_mut(index)) {
             record.status = status;
             record.duration_ms = millis(pending.started.elapsed());
@@ -380,11 +445,13 @@ impl Run {
             Ok(Completed {
                 value,
                 store_writes,
+                unobserved,
             }) => CodemodeResult::Completed {
                 value,
                 output,
                 calls,
                 store_writes,
+                unobserved,
             },
             Err(error) => failed(error, output, calls),
         }
@@ -397,36 +464,92 @@ fn millis(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
+/// `message` on one line and no longer than [`MAX_UNOBSERVED_CHARS`] characters.
+fn one_line(message: &str) -> String {
+    let flat = message.split_whitespace().collect::<Vec<_>>().join(" ");
+    match flat.char_indices().nth(MAX_UNOBSERVED_CHARS) {
+        Some((end, _)) => format!("{}\u{2026}", flat.get(..end).unwrap_or_default()),
+        None => flat,
+    }
+}
+
+/// [CYRUP-DELTA] The errors a script that succeeded never looked at: the rejections the isolate says
+/// nobody handled, and the calls that failed and that the script never heard of, because it ended
+/// first (the isolate lists the calls it started and never saw settle; the host knows which of them
+/// failed). Disjoint by construction: a reply the isolate received is not unsettled there.
+///
+/// The isolate lists those calls in two groups. A call nothing was waiting on is an error the script
+/// lost (`total`, `shown`). A call something was waiting on (a `try`/`await` or a `Promise.all` that
+/// had already rejected on a sibling, but also an `await` inside an `async` function nobody awaited,
+/// or a `.then()` without a `.catch()`) is a failure the script did not see either, and whether it
+/// minded is not something the engine can tell from outside: it is kept apart (`late_total`,
+/// `late_shown`) for a note that claims nothing about what the script should have done.
+fn unobserved_errors(
+    report: UnobservedReport,
+    failures: &BTreeMap<u32, FailedCall>,
+) -> UnobservedErrors {
+    let mut total = report.total;
+    let mut shown: Vec<UnobservedError> = Vec::new();
+    for rejection in report.unhandled {
+        if shown.len() < MAX_UNOBSERVED_SHOWN {
+            shown.push(UnobservedError {
+                call: rejection.call,
+                message: one_line(&rejection.message),
+            });
+        }
+    }
+    for failure in report.unsettled.iter().filter_map(|id| failures.get(id)) {
+        total += 1;
+        if shown.len() < MAX_UNOBSERVED_SHOWN {
+            shown.push(failed_call_error(failure));
+        }
+    }
+    let mut late_total = 0;
+    let mut late_shown: Vec<UnobservedError> = Vec::new();
+    for failure in report.waited.iter().filter_map(|id| failures.get(id)) {
+        late_total += 1;
+        if late_shown.len() < MAX_UNOBSERVED_SHOWN {
+            late_shown.push(failed_call_error(failure));
+        }
+    }
+    UnobservedErrors {
+        total,
+        shown,
+        late_total,
+        late_shown,
+    }
+}
+
+fn failed_call_error(failure: &FailedCall) -> UnobservedError {
+    UnobservedError {
+        call: Some(failure.name.clone()),
+        message: failure.message.clone(),
+    }
+}
+
 /// `host.ts:201-208` `handleDone`.
-fn settle(settled: ScriptSettled) -> Finish {
+fn settle(settled: ScriptSettled, failures: &BTreeMap<u32, FailedCall>) -> Finish {
     match settled {
         ScriptSettled::Threw(error_json) => {
             Err(script_error(&error_json).unwrap_or_else(|error| sandbox_error(error.to_string())))
         }
-        ScriptSettled::Returned { value, writes } => {
+        ScriptSettled::Returned {
+            value,
+            writes,
+            report,
+        } => {
             let value = value
-                .as_deref()
-                .map(serde_json::from_str::<Value>)
+                .map(return_value)
                 .transpose()
-                .map_err(|error| unreadable("return value", &error.to_string()))?;
+                .map_err(|error| sandbox_error(error.to_string()))?;
             let store_writes =
                 store_writes(&writes).map_err(|error| sandbox_error(error.to_string()))?;
             Ok(Completed {
                 value,
                 store_writes,
+                unobserved: unobserved_errors(report, failures),
             })
         }
-    }
-}
-
-/// A value the script produced that the host cannot hold, such as JSON nested deeper than
-/// `serde_json` reads. Upstream's `JSON.parse` has no such bound.
-fn unreadable(what: &str, reason: &str) -> CodemodeError {
-    CodemodeError {
-        kind: ErrorKind::Script,
-        name: Some(String::from("RangeError")),
-        message: format!("The script's {what} could not be read by the host: {reason}"),
-        stack: None,
     }
 }
 
@@ -454,9 +577,11 @@ mod tests {
             tool_cancel: CancelToken::new(),
             reply,
             calls_tx,
+            active_limit: None,
             output: Vec::new(),
             calls: Vec::new(),
             pending: HashMap::new(),
+            failures: BTreeMap::new(),
         };
         (run, replies)
     }
@@ -467,7 +592,7 @@ mod tests {
     /// empty message or a store write that is silently dropped.
     #[test]
     fn a_settlement_that_does_not_decode_is_a_sandbox_error_naming_the_reason() {
-        let sandbox_message = |settled: ScriptSettled| match settle(settled) {
+        let sandbox_message = |settled: ScriptSettled| match settle(settled, &BTreeMap::new()) {
             Ok(_) => panic!("a malformed settlement was accepted"),
             Err(error) => {
                 assert_eq!(error.kind, ErrorKind::Sandbox, "{error:?}");
@@ -477,6 +602,7 @@ mod tests {
         let returned = |writes: &str| ScriptSettled::Returned {
             value: Some(String::from("1")),
             writes: writes.to_owned(),
+            report: UnobservedReport::default(),
         };
         for (settled, reason) in [
             (returned("null"), "store writes are not an array"),
@@ -484,6 +610,14 @@ mod tests {
             (
                 returned(r#"[["k","{"]]"#),
                 "store value for \"k\" is not valid JSON",
+            ),
+            (
+                ScriptSettled::Returned {
+                    value: Some(String::from("{")),
+                    writes: String::from("[]"),
+                    report: UnobservedReport::default(),
+                },
+                "return value is not valid JSON",
             ),
             (
                 ScriptSettled::Threw(String::from("5")),

@@ -10,6 +10,15 @@ use crate::forwarding;
 
 use super::{PermissionSystemExtension, guard};
 
+/// The `no-ui` marker state last settled for one session id
+/// ([`PermissionSystemExtension::sync_unattended_marker`]).
+pub(super) struct UnattendedSync {
+    session_id: String,
+    /// Whether a marker is in place for `session_id`: written by this process, or one a process with a
+    /// UI could not remove.
+    marked: bool,
+}
+
 impl PermissionSystemExtension {
     /// pi `startForwardedPermissionPolling` (`index.ts:1983-2031`): in the PARENT role
     /// (`install_watcher`), on a session WITH a UI and a captured live backend, ensure the forwarding
@@ -42,6 +51,10 @@ impl PermissionSystemExtension {
         // carries a ctx, so this is the exact set of moments upstream reassigns `runtimeContext`.
         self.has_ui
             .store(ctx.has_ui, std::sync::atomic::Ordering::Relaxed);
+        // \[CYRUP-DELTA] The same four hooks carry `ctx.isProjectTrusted`, which decides whether the
+        // project's own policy layers may relax anything ([`crate::types::AgentPermissions::tightened`]).
+        guard(&self.manager).set_project_trusted(ctx.is_project_trusted());
+        self.sync_unattended_marker(ctx.has_ui);
         if !self.install_watcher || !ctx.has_ui {
             // pi `:1985`: a non-parent / headless context tears the watcher DOWN, it does not merely
             // decline to start one.
@@ -63,6 +76,59 @@ impl PermissionSystemExtension {
             Arc::clone(&self.logger),
             Arc::clone(&self.has_ui),
         ));
+    }
+
+    /// \[CYRUP-DELTA] Keep the root session's `no-ui` marker in the forwarding spool in step with
+    /// `has_ui`: present while this process has the session and no UI, withdrawn when it has one.
+    /// PARENT role only; a child answers for nobody, and a session id the host cannot name has no
+    /// spool to mark.
+    ///
+    /// Called from every event arm that carries a ctx (it rides on
+    /// [`Self::maybe_start_forwarding_watcher`]), so the file system is touched only when the state
+    /// changes: the session id and the state last synced are remembered. The FIRST sync for a session
+    /// id settles the file whatever it holds, because a session id outlives the process that marked
+    /// it (`-c`, `--session <file>`): a UI that resumes a session a `-p` run marked has to withdraw
+    /// that run's marker, not only one of its own. A marker whose writer has died is ignored by the
+    /// child's side anyway ([`forwarding::session_is_unattended`]); this is what removes one whose
+    /// writer is still there, and the file of one that is not.
+    ///
+    /// A marker is not withdrawn at `SessionShutdown`: it is stamped with the process that wrote it,
+    /// so it stops meaning anything when that process exits, and it is swept up by the next headless
+    /// start.
+    fn sync_unattended_marker(&self, has_ui: bool) {
+        if !self.install_watcher {
+            return;
+        }
+        let Some(session_id) = self
+            .host_services
+            .get()
+            .and_then(|services| services.session_id())
+            .and_then(|id| forwarding::normalize_session_id(&id))
+        else {
+            return;
+        };
+        let mut synced = guard(&self.unattended_marker);
+        if synced
+            .as_ref()
+            .is_some_and(|last| last.session_id == session_id && last.marked != has_ui)
+        {
+            return;
+        }
+        let marked = if has_ui {
+            // A marker that could not be removed counts as in place, so the next sync tries again.
+            !forwarding::clear_session_unattended(
+                &self.agent_dir,
+                &session_id,
+                Some(self.logger.as_ref()),
+            )
+        } else {
+            forwarding::mark_session_unattended(
+                &self.agent_dir,
+                &session_id,
+                Some(self.logger.as_ref()),
+            )
+        };
+        *synced = Some(UnattendedSync { session_id, marked });
     }
 
     /// pi `stopForwardedPermissionPolling` (`index.ts:1970-1981`, called from `session_shutdown`

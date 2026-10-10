@@ -76,6 +76,11 @@ impl PermissionSystemExtension {
             "target": details.target,
             "toolInput": details.tool_input,
         });
+        // **[CYRUP-DELTA]** a call another tool made names the call that made it. Only present then,
+        // so a direct call's entry keeps exactly pi's shape.
+        if let (Value::Object(base), Some(parent)) = (&mut record, &details.parent_tool_call_id) {
+            base.insert("parentToolCallId".to_string(), json!(parent));
+        }
         // pi spreads `...details` then the per-call-site resolution/persistence keys; the tail
         // overwrites, matching JS object-literal ordering.
         if let (Value::Object(base), Value::Object(extra)) = (&mut record, &tail) {

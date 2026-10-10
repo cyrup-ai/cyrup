@@ -18,7 +18,9 @@ mod pi_tool_semantics;
 mod read_access_errno;
 #[cfg(feature = "inline-images")]
 mod read_image_resize_profile;
+mod read_limits;
 mod read_model_vision;
+mod structured_output;
 mod tools;
 mod walk_error_text;
 mod write_semantics;

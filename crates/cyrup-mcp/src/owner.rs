@@ -598,14 +598,18 @@ impl OwnedServices {
 /// half that is load-bearing now. Both are taken because the alternative — deciding per call site
 /// which primitive "matters" — is how a gate ends up holding neither.
 ///
-/// # Why the dialog is called on this thread rather than through `spawn_blocking`
+/// # Why the dialog is called on the blocking pool
 ///
-/// `HostServices::{confirm,select}` are the SYNC blocking bridges: the live backend's
-/// `LiveHostServices::ui_roundtrip` already does `block_in_place` + `block_on` internally, so the
-/// worker thread is released for the human's latency without the caller arranging anything. This
-/// is the same call shape `cyrup-permission-system`'s `LocalAskChannel` uses, and matching it
-/// matters more than the alternative would gain: the two must serialize, and they now do it the
-/// same way.
+/// [CYRUP-DELTA] Upstream awaits a promise. `HostServices::{confirm,select,input}` are the SYNC
+/// blocking bridges: the live backend's `LiveHostServices::ui_roundtrip` does `block_in_place` +
+/// `block_on`, which hands the worker's OTHER tasks to another thread but keeps THIS task blocked.
+/// Called inline, an approval dialog therefore never returned `Pending` while it was open, and
+/// whoever polled the call could not preempt it: a `codemode` script's supervisor polls a nested
+/// call's first step itself, so a nested MCP call that needed approval kept the script alive past
+/// its `timeout_ms`, and past an abort, until a person answered. Each verb now awaits a
+/// blocking-pool task instead, which parks the caller at the dialog, as `cyrup-permission-system`'s
+/// `LocalAskChannel` and `ask_user_question` do. The two must still serialize, and they do it the
+/// same way: the interaction lock is taken before the hop and held across it.
 pub struct McpDialog {
     /// The services handle the dialog is drawn through — normally the **fenced**
     /// [`OwnedServices`] from [`crate::state::McpState::ui`], so a stale generation's dialog is
@@ -667,11 +671,27 @@ impl McpDialog {
         (human, wait)
     }
 
+    /// One call of the services backend, on the blocking pool (see the type's doc). `None` is a dialog
+    /// that panicked or a runtime that went away: no answer, so every caller's refusal.
+    async fn on_blocking_pool<T: Send + 'static>(
+        &self,
+        dialog: impl FnOnce(&dyn cyrup_ext::HostServices) -> T + Send + 'static,
+    ) -> Option<T> {
+        let services = Arc::clone(&self.services);
+        tokio::task::spawn_blocking(move || dialog(services.as_ref()))
+            .await
+            .ok()
+    }
+
     /// `ui.confirm(title, message)` — upstream passes no options bag, so neither does this.
     pub async fn confirm(&self, prompt: &str, message: &str) -> bool {
         let _guards = self.enter().await;
-        self.services
-            .confirm(prompt, message, &cyrup_ext::DialogOptions::default())
+        let (prompt, message) = (prompt.to_string(), message.to_string());
+        self.on_blocking_pool(move |services| {
+            services.confirm(&prompt, &message, &cyrup_ext::DialogOptions::default())
+        })
+        .await
+        .unwrap_or(false)
     }
 
     /// `ui.select(prompt, options)` — the chosen label, or `None` for a dismissal, a timeout, or
@@ -684,8 +704,12 @@ impl McpDialog {
                 .map(|option| serde_json::Value::String((*option).to_string()))
                 .collect(),
         );
-        self.services
-            .select(prompt, &rendered, &cyrup_ext::DialogOptions::default())
+        let prompt = prompt.to_string();
+        self.on_blocking_pool(move |services| {
+            services.select(&prompt, &rendered, &cyrup_ext::DialogOptions::default())
+        })
+        .await
+        .flatten()
     }
 
     /// `ui.input(title, placeholder)` — the typed value, or `None` for a dismissal.
@@ -694,8 +718,16 @@ impl McpDialog {
     /// re-prompt after a validation failure does not lose what the user typed.
     pub async fn input(&self, prompt: &str, placeholder: Option<&str>) -> Option<String> {
         let _guards = self.enter().await;
-        self.services
-            .input(prompt, placeholder, &cyrup_ext::DialogOptions::default())
+        let (prompt, placeholder) = (prompt.to_string(), placeholder.map(str::to_string));
+        self.on_blocking_pool(move |services| {
+            services.input(
+                &prompt,
+                placeholder.as_deref(),
+                &cyrup_ext::DialogOptions::default(),
+            )
+        })
+        .await
+        .flatten()
     }
 
     /// `ui.notify(message, kind)` — fire-and-forget, and deliberately NOT under [`Self::enter`].
@@ -1162,6 +1194,15 @@ mod tests {
             self.observe();
             self.answer.then(|| "Allow once".to_string())
         }
+        fn input(
+            &self,
+            _prompt: &str,
+            _placeholder: Option<&str>,
+            _opts: &cyrup_ext::DialogOptions,
+        ) -> Option<String> {
+            self.observe();
+            self.answer.then(|| "typed".to_string())
+        }
     }
 
     fn probe_ctx() -> cyrup_ext::HostCtx {
@@ -1230,6 +1271,37 @@ mod tests {
             ui.max_depth.load(Ordering::SeqCst),
             1,
             "an MCP dialog and any other companion's prompt must never be on screen together"
+        );
+    }
+
+    /// An open dialog parks its caller instead of holding it. `LiveHostServices` blocks the calling
+    /// TASK for a dialog, so a verb that called it inline never returned `Pending`: nothing polling
+    /// it, not even the supervisor of a `codemode` script whose nested call needs an approval, could
+    /// run its deadline or its abort until the person answered. The runtime is current-thread,
+    /// where the difference is exact: the timer can only fire if the verb yields to it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_open_dialog_yields_to_its_caller() {
+        let ui = ProbeUi::new(probe_ctx().human_wait_gate(), 1500, true);
+        let dialog = McpDialog::new(Arc::clone(&ui) as Arc<dyn cyrup_ext::HostServices>);
+
+        let timeout = std::time::Duration::from_millis(300);
+        assert!(
+            tokio::time::timeout(timeout, dialog.confirm("t", "m"))
+                .await
+                .is_err(),
+            "`confirm` resolved while its dialog was still open: it blocked its caller"
+        );
+        assert!(
+            tokio::time::timeout(timeout, dialog.select("p", &["Allow once"]))
+                .await
+                .is_err(),
+            "`select` resolved while its dialog was still open: it blocked its caller"
+        );
+        assert!(
+            tokio::time::timeout(timeout, dialog.input("p", None))
+                .await
+                .is_err(),
+            "`input` resolved while its dialog was still open: it blocked its caller"
         );
     }
 

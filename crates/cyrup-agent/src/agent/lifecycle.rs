@@ -139,7 +139,11 @@ impl Agent {
                     .collect();
                 cyrup_provider::utils::transcript::get_current_system_message(&system_only)
             };
-            st.messages = baseline.map(AgentMessage::System).into_iter().collect();
+            st.messages = baseline
+                .map(AgentMessage::System)
+                .into_iter()
+                .collect::<Vec<_>>()
+                .into();
             st.streaming_message = None;
             st.pending_tool_calls.clear();
             st.error_message = None;

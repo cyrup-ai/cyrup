@@ -28,6 +28,19 @@ pub struct DiscoverableTool<'a> {
     pub description: &'a str,
     pub parameters: &'a Value,
     pub namespace: Option<&'a ToolNamespace>,
+    /// [CYRUP-DELTA] The identifier from the session's
+    /// [`IdentifierTable`](crate::identifier::IdentifierTable); `None` derives it from the name.
+    pub identifier: Option<&'a CodemodeIdentifier>,
+}
+
+impl DiscoverableTool<'_> {
+    /// The identifier scripts call this tool by.
+    #[must_use]
+    pub fn script_identifier(&self) -> CodemodeIdentifier {
+        self.identifier
+            .cloned()
+            .unwrap_or_else(|| to_codemode_identifier(self.name))
+    }
 }
 
 /// Whether `query` names the namespace: its name, its script identifier (`mcp__dev-radius` is
@@ -88,7 +101,7 @@ pub fn find_tool<'a, 'b>(
 ) -> Option<&'b DiscoverableTool<'a>> {
     tools
         .iter()
-        .find(|tool| tool.name == name || to_codemode_identifier(tool.name).as_str() == name)
+        .find(|tool| tool.name == name || tool.script_identifier().as_str() == name)
 }
 
 /// What `describeNamespace(name)` returns to the script (`execute.ts:508-513`): `name`,
@@ -122,7 +135,7 @@ pub fn describe_namespace(
             continue;
         }
         namespace.get_or_insert(tool_namespace);
-        names.push(to_codemode_identifier(tool.name));
+        names.push(tool.script_identifier());
     }
     let namespace = namespace?;
     Some(NamespaceDescription {

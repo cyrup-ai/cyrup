@@ -341,7 +341,16 @@ impl Capabilities {
 ///   a `hook-outcome` and carries the persisted entry ids and the boundary state),
 ///   `events.on-agent-before-settle` is an EXPORT ADDITION (`AgentBeforeSettleEvent`, `:999-1002`),
 ///   and `ctx-state.preview-boundary` an IMPORT ADDITION (pi `_buildBoundaryContext`).
-pub const HOST_WORLD: &str = "cyrup:ext@0.19";
+/// - 0.19 -> 0.20: IMPORT and EXPORT RE-SIGNING, the guest-tool-surface batch. `types.tool-descriptor`
+///   gained `output-schema-json`, `annotations` and `prepare-loadout` (pi `ToolDefinition.
+///   outputSchema` / `annotations` / `prepareLoadout`, `core/extensions/types.ts:592`, `:603`,
+///   `:617` @v1.0.4), re-signing `registration.register-tool`; `host-tool.execute-tool` took the
+///   `execute-options` record in place of its `collect-updates` bool (pi `ExecuteToolOptions`,
+///   `:368-373`); `types.tool-output` gained `structured-content-json` (pi `AgentToolResult.
+///   structuredContent`), re-signing `events.execute-tool`'s return; and `events.prepare-loadout`
+///   is NEW. A 0.19 guest calls the imports at the old signature and exports no `prepare-loadout`,
+///   so it fails to link and takes the bump.
+pub const HOST_WORLD: &str = "cyrup:ext@0.20";
 
 impl ExtensionManifest {
     /// Parse from JSON bytes.

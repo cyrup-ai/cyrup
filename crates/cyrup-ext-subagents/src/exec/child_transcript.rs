@@ -658,6 +658,13 @@ impl ChildTranscriptWriter {
     /// the regression `tui/fleet_transcript.rs`'s `rewrite_cyrup_record` already corrects for
     /// the raw event stream.
     pub async fn write_child_event(&mut self, event: &SubagentEvent) {
+        // [CYRUP-DELTA] Pi keeps a nested call out of the transcript ("these ids do not appear as
+        // tool calls or tool results in the transcript", `docs/extensions.md` @v1.0.4): its result
+        // reaches only the calling tool. A row per `tools.*` call would also list a script's calls
+        // as the child's own steps. The calling `codemode` call's row carries the script's output.
+        if event.is_nested() {
+            return;
+        }
         match event {
             SubagentEvent::MessageEnd { message } => {
                 let record = ChildTranscriptRecord::message(
@@ -671,6 +678,7 @@ impl ChildTranscriptWriter {
                 tool_call_id,
                 tool_name,
                 args,
+                ..
             } => {
                 if tool_name.is_empty() {
                     return;
@@ -688,6 +696,7 @@ impl ChildTranscriptWriter {
                 tool_name,
                 result,
                 is_error,
+                ..
             } => {
                 let end = ChildTranscriptRecord::tool_end(
                     &self.identity,
@@ -1336,6 +1345,33 @@ mod tests {
         assert_eq!(
             MessageRole::from_wire("tool_result"),
             MessageRole::ToolResult
+        );
+    }
+
+    /// Pi keeps a nested call out of the transcript; a row per `tools.*` call of a script would
+    /// list them as the child's own steps.
+    #[tokio::test]
+    async fn nested_tool_calls_are_not_written_as_transcript_rows() {
+        let dir = tempfile::tempdir().expect("real tempdir");
+        let path = dir.path().join("t.jsonl");
+        let mut writer = ChildTranscriptWriter::create(&path, identity(Some(0))).await;
+        for line in [
+            serde_json::json!({"type": "tool_execution_start", "toolCallId": "c1", "toolName": "codemode", "args": {}}),
+            serde_json::json!({"type": "tool_execution_start", "toolCallId": "c1/1", "toolName": "bash", "args": {"command": "ls"}, "parentToolCallId": "c1"}),
+            serde_json::json!({"type": "tool_execution_end", "toolCallId": "c1/1", "toolName": "bash", "isError": false, "result": {"content": [{"type": "text", "text": "x"}]}, "parentToolCallId": "c1"}),
+            serde_json::json!({"type": "tool_execution_end", "toolCallId": "c1", "toolName": "codemode", "isError": false, "result": {"content": [{"type": "text", "text": "done"}]}}),
+        ] {
+            writer.write_child_event(&event(line)).await;
+        }
+        let records = records(&path);
+        assert!(
+            records.iter().all(|r| r["toolName"] != "bash"),
+            "a nested call leaked into the transcript: {records:#?}"
+        );
+        assert_eq!(
+            records.len(),
+            3,
+            "start, end and result of the codemode call: {records:#?}"
         );
     }
 }

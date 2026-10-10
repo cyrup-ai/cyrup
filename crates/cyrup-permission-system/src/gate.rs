@@ -745,6 +745,35 @@ pub fn format_ask_unavailable_reason(result: &PermissionCheckResult) -> String {
     )
 }
 
+/// The origin label of a gated call another tool made while it ran (`ctx.executeTool`): appended to
+/// the ask prompt and the headless block reason so a person (or a script reading the error) can tell
+/// the call is not one the model issued directly. `parent_tool` is the tool whose call made it, when
+/// the gate saw that call; a `codemode` script is the one producer a person meets in practice.
+///
+/// **[CYRUP-DELTA]** pi-permission-system v0.8.0 (the pin) predates nested calls and has no such
+/// label; its prompts read identically for a direct and a nested call.
+#[must_use]
+pub fn format_nested_origin_label(parent_tool: Option<&str>) -> String {
+    match parent_tool {
+        Some("codemode") => "(from codemode script)".to_string(),
+        Some(tool) => format!("(from a nested call of tool '{tool}')"),
+        None => "(from a nested tool call)".to_string(),
+    }
+}
+
+/// [`format_ask_unavailable_reason`] for a call another tool made: the same sentence, the origin
+/// `label`, and what a script (which cannot answer a prompt) can do about it. This is the error text
+/// the calling script receives in print/json mode, where an `ask` has no human to reach.
+///
+/// **[CYRUP-DELTA]** see [`format_nested_origin_label`].
+#[must_use]
+pub fn format_nested_ask_unavailable_reason(base: &str, label: &str) -> String {
+    format!(
+        "{} {label}. A script cannot answer an approval prompt without a UI: allow this call in the permission policy, or run interactively to be asked.",
+        base.trim_end_matches('.')
+    )
+}
+
 /// pi `formatMissingToolNameReason` (v0.8.0 `permission-prompts.ts:32-34`; v0.7.1
 /// `index.ts:336-338`).
 ///

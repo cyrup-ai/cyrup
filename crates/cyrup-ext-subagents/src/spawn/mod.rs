@@ -1240,6 +1240,9 @@ impl SpawnedChild {
 ///   SIGKILL)` is not catchable and not maskable. Dropping the `tokio::process::Child` afterwards
 ///   hands the pid to tokio's orphan queue, which reaps it on the next `SIGCHLD` — so this leaves
 ///   no zombie either.
+/// * The group kill does not reach a descendant that left the group: the child's `bash` tool starts
+///   every command in a session of its own. Those are listed before the child is signalled and
+///   killed with it ([`signal::send_sigkill_to_tree`], SUBA-217), as the escalation ladder does.
 impl Drop for SpawnedChild {
     fn drop(&mut self) {
         cleanup_temp_files(&self.temp_files);
@@ -1259,7 +1262,9 @@ impl Drop for SpawnedChild {
             "subagent child dropped without terminate()/finish(); SIGKILLing its process group \
              (SUBA-039) so the detached subtree is not orphaned"
         );
-        signal::send_sigkill(&mut child);
+        // SUBA-217 — the group kill reaches what stayed in the child's group; what the child's
+        // `bash` tool started in sessions of its own is listed first and killed with it.
+        signal::send_sigkill_to_tree(&mut child);
     }
 }
 
@@ -2679,6 +2684,175 @@ mod tests {
             "the child's own descendant (pid {grandchild_pid}) must be terminated by the \
              escalation ladder too, not left running as an orphan after the direct child \
              (pid {child_pid}) was signalled"
+        );
+    }
+
+    /// A descendant that left the child's process group dies with it when the run was CANCELLED.
+    ///
+    /// The child's `bash` tool starts every command in a session of its own, and a cancelled run
+    /// leaves no time for the child's signal handler to kill those groups: with the token already
+    /// cancelled the ladder sends SIGINT, SIGTERM and SIGKILL back to back. The group kill then
+    /// reached the child and left its tool's command running (`sleep 61` after an abort, parent
+    /// pid 1, a group of its own), through the foreground `subagent` tool and through a codemode
+    /// script that called it alike. `setsid` here is what the tool does to its command.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn terminate_on_a_cancelled_run_reaches_a_descendant_that_left_the_childs_group() {
+        let dir = tempfile::tempdir().expect("real tempdir");
+        let pid_path = dir.path().join("detached.pid");
+        // Foreground `setsid`, so the descendant is synchronous (not SIGINT-ignoring as an `&` job
+        // would be) and the outer shell stays resident (the trailing `; :`): see the sibling test.
+        let script = format!(
+            "setsid sh -c 'echo $$ > \"{path}.tmp\"; mv \"{path}.tmp\" \"{path}\"; exec sleep 300' ; :",
+            path = pid_path.display()
+        );
+        let spec = ChildSpawnSpec {
+            command: sh_command(&script),
+            args: Vec::new(),
+            task_arg: String::new(),
+            env_overlay: HashMap::new(),
+            cwd: dir.path().to_path_buf(),
+            temp_files: Vec::new(),
+        };
+        let child = SpawnedChild::spawn(spec, &dir.path().join("detached.jsonl"))
+            .await
+            .expect("scripted sh child spawns");
+        let child_pid = child.id().expect("live child has a pid");
+        let detached_pid = read_published_pid(&pid_path, Duration::from_secs(10))
+            .await
+            .expect("the child script publishes its descendant's pid");
+        let group_of = |pid: u32| {
+            nix::unistd::getpgid(Some(nix::unistd::Pid::from_raw(pid as nix::libc::pid_t)))
+                .map(nix::unistd::Pid::as_raw)
+        };
+        assert_eq!(
+            group_of(child_pid).ok(),
+            i32::try_from(child_pid).ok(),
+            "the child leads its own group"
+        );
+        assert_ne!(
+            group_of(detached_pid).ok(),
+            i32::try_from(child_pid).ok(),
+            "the fixture's descendant must really have left the child's group"
+        );
+
+        let cancel = CancelToken::new();
+        cancel.cancel();
+        let _outcome = child
+            .terminate(&cancel)
+            .await
+            .expect("terminate confirms real exit");
+
+        assert!(
+            pid_is_terminated(detached_pid, Duration::from_secs(10)).await,
+            "the descendant that left the child's group (pid {detached_pid}) outlived the abort of \
+             the child (pid {child_pid})"
+        );
+    }
+
+    /// The script of the fixtures below: a foreground `setsid` descendant, the way the child's
+    /// `bash` tool starts a command (see the abort test above for why it is foreground and why the
+    /// outer shell stays resident). It publishes its own pid at `pid_path`.
+    #[cfg(target_os = "linux")]
+    fn detached_descendant_script(pid_path: &Path) -> String {
+        format!(
+            "setsid sh -c 'echo $$ > \"{path}.tmp\"; mv \"{path}.tmp\" \"{path}\"; exec sleep 300' ; :",
+            path = pid_path.display()
+        )
+    }
+
+    /// Asserts the fixture's premise: the child leads its own group and the descendant is in
+    /// another one, so no group signal sent to the child can reach it.
+    #[cfg(target_os = "linux")]
+    fn assert_descendant_left_the_group(child_pid: u32, detached_pid: u32) {
+        let group_of = |pid: u32| {
+            nix::unistd::getpgid(Some(nix::unistd::Pid::from_raw(pid as nix::libc::pid_t)))
+                .map(nix::unistd::Pid::as_raw)
+        };
+        assert_eq!(
+            group_of(child_pid).ok(),
+            i32::try_from(child_pid).ok(),
+            "the child leads its own group"
+        );
+        assert_ne!(
+            group_of(detached_pid).ok(),
+            i32::try_from(child_pid).ok(),
+            "the fixture's descendant must really have left the child's group"
+        );
+    }
+
+    /// SUBA-217 — the same, when the child is stopped because its TIMEOUT ran out.
+    ///
+    /// `terminate_on_timeout` is the ladder of the external CLI runs, the acceptance `verify`
+    /// commands and the bounded argv runs; it signalled the child, or its group when it leads one,
+    /// and nothing else, so a descendant that moved to a session of its own survived the stop of
+    /// the child it belonged to, re-parented to init. The fixture is led by `process_group(0)`
+    /// as those callers' children are.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn terminate_on_timeout_reaches_a_descendant_that_left_the_childs_group() {
+        let dir = tempfile::tempdir().expect("real tempdir");
+        let pid_path = dir.path().join("detached.pid");
+        let spawn = sh_command(&detached_descendant_script(&pid_path));
+        let mut command = tokio::process::Command::new(&spawn.binary);
+        command
+            .args(&spawn.base_args)
+            .process_group(0)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        let mut child = command.spawn().expect("scripted sh child spawns");
+        let child_pid = child.id().expect("live child has a pid");
+        let detached_pid = read_published_pid(&pid_path, Duration::from_secs(10))
+            .await
+            .expect("the child script publishes its descendant's pid");
+        assert_descendant_left_the_group(child_pid, detached_pid);
+
+        signal::terminate_on_timeout_with_grace(&mut child, Duration::from_millis(200))
+            .await
+            .expect("the timeout ladder confirms the child's exit");
+
+        assert!(
+            pid_is_terminated(detached_pid, Duration::from_secs(10)).await,
+            "the descendant that left the child's group (pid {detached_pid}) outlived the timeout \
+             stop of the child (pid {child_pid})"
+        );
+    }
+
+    /// SUBA-217 — the same, when the child is ABANDONED: its handle is dropped with no
+    /// `terminate`, so the `Drop` guard's group kill is all that runs.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropping_a_spawned_child_reaches_a_descendant_that_left_the_childs_group() {
+        let dir = tempfile::tempdir().expect("real tempdir");
+        let pid_path = dir.path().join("detached.pid");
+        let spec = ChildSpawnSpec {
+            command: sh_command(&detached_descendant_script(&pid_path)),
+            args: Vec::new(),
+            task_arg: String::new(),
+            env_overlay: HashMap::new(),
+            cwd: dir.path().to_path_buf(),
+            temp_files: Vec::new(),
+        };
+        let child = SpawnedChild::spawn(spec, &dir.path().join("detached.jsonl"))
+            .await
+            .expect("scripted sh child spawns");
+        let child_pid = child.id().expect("live child has a pid");
+        let detached_pid = read_published_pid(&pid_path, Duration::from_secs(10))
+            .await
+            .expect("the child script publishes its descendant's pid");
+        assert_descendant_left_the_group(child_pid, detached_pid);
+        assert!(
+            !pid_is_terminated(detached_pid, Duration::from_millis(0)).await,
+            "precondition: the descendant must be running before the handle is dropped"
+        );
+
+        drop(child);
+
+        assert!(
+            pid_is_terminated(detached_pid, Duration::from_secs(10)).await,
+            "the descendant that left the child's group (pid {detached_pid}) outlived the drop of \
+             the child (pid {child_pid})"
         );
     }
 

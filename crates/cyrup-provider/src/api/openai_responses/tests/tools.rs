@@ -595,6 +595,7 @@ fn a_disabled_model_emits_a_byte_identical_body_to_the_pre_drift_shape() {
                     defer_loading: false,
                     supports_strict_mode: get_responses_compat(&model()).supports_strict_mode,
                     default_strict: Some(false),
+                    supports_openai_grammar_tools: false,
                 },
             )
             .unwrap()

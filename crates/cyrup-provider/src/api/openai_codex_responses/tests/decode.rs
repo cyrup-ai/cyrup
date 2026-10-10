@@ -9,6 +9,7 @@ async fn drain(sse: &'static str, request_tier: Option<&str>) -> Vec<StreamEvent
     decode_codex_stream(
         decode_sse_bytes_flushing_at_eof(sse.as_bytes().to_vec()),
         request_tier.map(str::to_string),
+        std::collections::HashMap::new(),
         &model,
         &api,
         &sink,
@@ -350,4 +351,117 @@ async fn the_terminal_end_turn_is_recorded_on_the_message() {
         assert_eq!(msg.end_turn, None);
         assert!(!serde_json::to_string(&msg).unwrap().contains("endTurn"));
     }
+}
+
+/// PROV-101: the Codex frame mapper forwards the `custom_tool_call_input` events untouched and the
+/// shared decoder turns them into a tool call holding the raw text (pi
+/// `openai-codex-stream.test.ts` "sends only response input deltas in websocket-cached mode",
+/// first turn).
+#[tokio::test]
+async fn a_custom_tool_call_streams_through_the_codex_mapper() {
+    let sse = concat!(
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\"}}\n\n",
+        "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"custom_tool_call\",\"id\":\"ctc_1\",\"call_id\":\"call_1\",\"name\":\"sample_tool\",\"input\":\"\"}}\n\n",
+        "data: {\"type\":\"response.custom_tool_call_input.delta\",\"item_id\":\"ctc_1\",\"delta\":\"abc\"}\n\n",
+        "data: {\"type\":\"response.custom_tool_call_input.done\",\"item_id\":\"ctc_1\",\"input\":\"abc\"}\n\n",
+        "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"custom_tool_call\",\"id\":\"ctc_1\",\"call_id\":\"call_1\",\"name\":\"sample_tool\",\"input\":\"abc\"}}\n\n",
+        "data: {\"type\":\"response.done\",\"response\":{\"id\":\"resp_1\",\"status\":\"completed\",\"usage\":{\"input_tokens\":5,\"output_tokens\":3,\"total_tokens\":8}}}\n\n",
+    );
+    let model = codex_model("gpt-5.1-codex");
+    let api = ApiId::from(API_ID);
+    let (sink, mut rx) = channel(64);
+    let inputs =
+        std::collections::HashMap::from([("sample_tool".to_string(), "payload".to_string())]);
+    decode_codex_stream(
+        decode_sse_bytes_flushing_at_eof(sse.as_bytes().to_vec()),
+        None,
+        inputs,
+        &model,
+        &api,
+        &sink,
+    )
+    .await;
+    drop(sink);
+    let mut last = None;
+    while let Some(ev) = rx.recv().await {
+        last = Some(ev);
+    }
+    let Some(StreamEvent::Done { reason: _, message }) = last else {
+        panic!("no done terminal: {last:?}")
+    };
+    assert_eq!(message.stop_reason, StopReason::ToolUse);
+    assert_eq!(
+        serde_json::to_value(&message.content).unwrap(),
+        json!([{
+            "type": "toolCall",
+            "id": "call_1|ctc_1",
+            "name": "sample_tool",
+            "arguments": { "payload": "abc" },
+        }])
+    );
+}
+
+/// PROV-101, driver level: the request `run` posts declares the grammar tool as `custom`, and the
+/// `custom_tool_call` the server streams back (through `response.done`, Codex's terminal) decodes
+/// to a tool call holding the raw text. This is what proves the Codex driver hands the grammar map
+/// to its decoder.
+#[tokio::test]
+async fn run_posts_a_custom_tool_and_decodes_the_custom_call() {
+    use crate::api::test_server::{custom_tool_call_sse, grammar_tool_def, serve_sse};
+
+    let (origin, seen) = serve_sse(custom_tool_call_sse("response.done")).await;
+    let mut model = codex_model("gpt-5.1-codex");
+    model.base_url = origin;
+    model.compat = Some(crate::api::compat::ModelCompat {
+        supports_openai_grammar_tools: Some(true),
+        ..Default::default()
+    });
+    let token = fake_jwt(&json!({
+        "https://api.openai.com/auth": { "chatgpt_account_id": "acct_grammar" },
+    }));
+    let ctx = Context {
+        system_prompt: None,
+        messages: vec![cyrup_core::Message::User {
+            content: vec![cyrup_core::Content::text("go")],
+            timestamp: 0,
+        }],
+        tools: vec![grammar_tool_def()],
+    };
+    let (sink, mut rx) = channel(64);
+    CodexResponsesApi::new()
+        .run(
+            &model,
+            &ctx,
+            &AuthResult::from_key(&token, "test"),
+            &StreamOptions {
+                api_key: Some(token.clone()),
+                max_retries: Some(0),
+                ..Default::default()
+            },
+            CancelToken::new(),
+            sink,
+        )
+        .await;
+    let mut last = None;
+    while let Some(ev) = rx.recv().await {
+        last = Some(ev);
+    }
+    let Some(StreamEvent::Done { message, .. }) = last else {
+        panic!("no done terminal: {last:?}")
+    };
+    assert_eq!(
+        serde_json::to_value(&message.content).unwrap(),
+        json!([{
+            "type": "toolCall",
+            "id": "call_1|ctc_1",
+            "name": "sample_tool",
+            "arguments": { "payload": "abc" },
+        }])
+    );
+    let body: Value = {
+        let seen = seen.lock().unwrap();
+        serde_json::from_str(&seen.first().expect("a request").1).unwrap()
+    };
+    assert_eq!(body["tools"][0]["type"], "custom");
+    assert_eq!(body["tools"][0]["format"]["syntax"], "lark");
 }

@@ -13,6 +13,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use cyrup_codemode::declarations::render_tool_sample;
+use cyrup_codemode::identifier::IdentifierTable;
 use cyrup_core::{CancelToken, Tool};
 use serde_json::{Value, json};
 
@@ -27,17 +28,21 @@ struct Globals {
 
 impl Globals {
     fn new(tools: Vec<Arc<dyn Tool>>) -> Self {
+        let identifiers = IdentifierTable::assign(tools.iter().map(|tool| tool.name()));
         let samples: BTreeMap<String, String> = tools
             .iter()
             .map(|tool| {
                 (
                     tool.name().to_owned(),
-                    render_tool_sample(&to_codemode_declaration(tool.as_ref(), &[]), None),
+                    render_tool_sample(
+                        &to_codemode_declaration(tool.as_ref(), &[], &identifiers),
+                        None,
+                    ),
                 )
             })
             .collect();
         Self {
-            globals: discovery_globals(Arc::new(tools), Arc::new(samples)),
+            globals: discovery_globals(Arc::new(tools), Arc::new(samples), Arc::new(identifiers)),
         }
     }
 
@@ -335,4 +340,84 @@ async fn namespace_instructions_are_returned_when_present() {
         described,
         json!({ "name": "mcp__x", "instructions": "Long usage guide.", "tools": ["mcp__x__run"] })
     );
+}
+
+async fn described(globals: &Globals, name: &str) -> Option<String> {
+    globals
+        .call("describeTool", vec![json!(name)])
+        .await
+        .unwrap()
+        .map(|value| value.as_str().unwrap().to_owned())
+}
+
+/// Two MCP servers `a-b` and `a_b` each with a tool `search` normalise to one identifier. Upstream
+/// registers the first and the second is unreachable; here each has its own, in `searchTools()`
+/// entries and `describeTool()` alike.
+#[tokio::test]
+async fn tools_whose_names_normalise_to_one_identifier_are_each_found() {
+    let globals = Globals::new(vec![
+        StubTool::new("gh-search", "Search GitHub the dashed way.").arc(),
+        StubTool::new("gh_search", "Search GitHub the plain way.").arc(),
+    ]);
+    let found = globals.call("searchTools", vec![json!("search")]).await;
+    let mut ranked = names(&found);
+    ranked.sort();
+    assert_eq!(ranked, ["gh_search", "gh_search_2"]);
+    let entries = found.unwrap().unwrap();
+    let description_of = |name: &str| {
+        entries
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["name"] == name)
+            .unwrap()["description"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    // The entry named `gh_search_2` is the dashed tool, declared under that very identifier.
+    assert!(description_of("gh_search_2").starts_with("Search GitHub the dashed way."));
+    assert!(description_of("gh_search_2").contains("gh_search_2(args:"));
+    assert!(description_of("gh_search").starts_with("Search GitHub the plain way."));
+
+    for (name, expected) in [
+        ("gh_search_2", "dashed"),
+        ("gh-search", "dashed"),
+        ("gh_search", "plain"),
+    ] {
+        let text = described(&globals, name).await.unwrap();
+        assert!(
+            text.contains(&format!("the {expected} way")),
+            "{name}: {text}"
+        );
+    }
+}
+
+/// A tool that resolves to an MCP `CallToolResult` is declared as `CallToolResult<T>`, a type the
+/// description defines only for the tools it lists; `describeTool()` brings the types with it.
+#[tokio::test]
+async fn describe_tool_defines_the_mcp_result_types_the_declaration_uses() {
+    let mcp_result = json!({
+        "type": "object",
+        "properties": {
+            "content": { "type": "array", "items": { "type": "object" } },
+            "isError": { "type": "boolean" },
+            "_meta": { "type": "object" }
+        }
+    });
+    let globals = Globals::new(vec![
+        StubTool::new("mcp__docs__search", "Search docs.")
+            .output_schema(mcp_result)
+            .arc(),
+        StubTool::new("plain", "A plain tool.").arc(),
+    ]);
+    let mcp = described(&globals, "mcp__docs__search").await.unwrap();
+    assert!(mcp.contains("Promise<CallToolResult"), "{mcp}");
+    assert!(
+        mcp.contains("Shared MCP Types:\n```ts\ntype Role = "),
+        "{mcp}"
+    );
+    assert!(mcp.contains("type CallToolResult<"), "{mcp}");
+    let plain = described(&globals, "plain").await.unwrap();
+    assert!(!plain.contains("Shared MCP Types"), "{plain}");
 }

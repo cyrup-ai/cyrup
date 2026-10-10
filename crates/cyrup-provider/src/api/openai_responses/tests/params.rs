@@ -390,3 +390,16 @@ fn reasoning_summary_alone_and_the_xai_include() {
     let body = build_params(&m, &ctx, &StreamOptions::default(), None);
     assert!(body.get("include").is_none());
 }
+
+/// PROMPT-001 — the prompt a transcript replays to reaches the Responses body.
+#[test]
+fn the_transcripts_prompt_reaches_the_request_body() {
+    use crate::api::prompt_fixture::{agent_context, assert_wire_carries_prompt};
+    let body = build_params(
+        &model(),
+        &agent_context(Vec::new()),
+        &StreamOptions::default(),
+        None,
+    );
+    assert_wire_carries_prompt(&body.to_string());
+}

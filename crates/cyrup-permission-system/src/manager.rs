@@ -4,6 +4,12 @@
 //! relax a trusted `deny`), wildcard + per-action/per-resource + bash-command + mcp-target
 //! matching, and mtime-stamped resolution caching.
 //!
+//! \[CYRUP-DELTA] Those two layers are "untrusted" only in that floor's sense (upstream's project
+//! layer can still turn an `ask` into an `allow`). cyrup adds the project's own trust: while the host
+//! says the project is not trusted ([`PermissionManager::set_project_trusted`]) the two project
+//! layers contribute their `deny` and `ask` rules and none of their `allow`s
+//! ([`crate::types::AgentPermissions::tightened`]).
+//!
 //! The primary wired entry point is [`PermissionManager::check_permission`], called by the gate
 //! (`gate.rs`) on every tool call. The **two** tool-shaping query methods
 //! [`PermissionManager::get_tool_permission`] / [`PermissionManager::has_allowed_skills`] drive the
@@ -145,6 +151,11 @@ pub struct PermissionManager {
     paths: ManagerPaths,
     resolved_cache: HashMap<String, (String, Arc<ResolvedPermissions>)>,
     mcp_names_cache: Option<(String, Vec<String>)>,
+    /// \[CYRUP-DELTA] Whether the project the session runs in is trusted (`ctx.isProjectTrusted`).
+    /// While it is not, the two project layers may only tighten: [`AgentPermissions::tightened`].
+    /// `true` until the host says otherwise, which is what a manager used without a session has
+    /// always done.
+    project_trusted: bool,
     /// pi `onWarning` ctor option (`permission-manager.ts:620,631,643`): notified with a human-
     /// readable message whenever a policy file exists but fails to load/parse (NOT when it is
     /// simply absent — see `notify_config_load_warning`).
@@ -158,8 +169,22 @@ impl PermissionManager {
             paths,
             resolved_cache: HashMap::new(),
             mcp_names_cache: None,
+            project_trusted: true,
             on_warning: None,
         }
+    }
+
+    /// \[CYRUP-DELTA] Tell the manager whether the project is trusted (see the field). A change is
+    /// part of [`Self::policy_cache_stamp`], so every cache keyed on the stamp drops what it computed
+    /// under the other answer.
+    pub fn set_project_trusted(&mut self, trusted: bool) {
+        self.project_trusted = trusted;
+    }
+
+    /// What [`Self::set_project_trusted`] last said.
+    #[must_use]
+    pub fn project_trusted(&self) -> bool {
+        self.project_trusted
     }
 
     /// Register a warning callback (pi ctor's `onWarning` option, `permission-manager.ts:631,643`),
@@ -499,9 +524,13 @@ impl PermissionManager {
         }
 
         let global = self.load_global_config();
-        let project = self.load_project_global_config();
+        let mut project = self.load_project_global_config();
         let agent = self.load_agent_permissions(agent_name);
-        let project_agent = self.load_project_agent_permissions(agent_name);
+        let mut project_agent = self.load_project_agent_permissions(agent_name);
+        if !self.project_trusted {
+            project = project.tightened();
+            project_agent = project_agent.tightened();
+        }
 
         // Shallow merged record view (pi `mergePermissions`, only `merged.mcp` is read at runtime).
         let mut merged = global.permissions.clone();
@@ -553,7 +582,12 @@ impl PermissionManager {
             Some(p) => file_stamp(&p),
             None => "none".to_string(),
         };
-        format!("{global}|{project}|{agent}|{project_agent}")
+        let trust = if self.project_trusted {
+            ""
+        } else {
+            "|project-untrusted"
+        };
+        format!("{global}|{project}|{agent}|{project_agent}{trust}")
     }
 
     /// pi `loadGlobalConfig` (`permission-manager.ts:650-685`): on a read/parse failure of an
@@ -1467,6 +1501,131 @@ mod tests {
                 .state,
             PermissionState::Deny
         );
+    }
+
+    /// A manager over a global policy, a project policy and one project agent's `permission:`
+    /// block, all in `dir`.
+    fn manager_with_project(
+        dir: &Path,
+        global: &str,
+        project: &str,
+        agent: &str,
+    ) -> PermissionManager {
+        let global_path = dir.join("cyrup-permissions.jsonc");
+        write(&global_path, global);
+        let project_path = dir.join("proj.jsonc");
+        write(&project_path, project);
+        write(
+            &dir.join("proj-agents").join("scout.md"),
+            &format!("---\npermission:\n{agent}---\n"),
+        );
+        PermissionManager::new(ManagerPaths {
+            global_config_path: global_path,
+            agents_dir: dir.join("agents"),
+            project_global_config_path: Some(project_path),
+            project_agents_dir: Some(dir.join("proj-agents")),
+            legacy_global_settings_path: dir.join("settings.json"),
+            global_mcp_config_path: dir.join("mcp.json"),
+            mcp_server_names_override: Some(Vec::new()),
+        })
+    }
+
+    fn state_of(m: &mut PermissionManager, command: &str, agent: Option<&str>) -> PermissionState {
+        m.check_permission("bash", &serde_json::json!({ "command": command }), agent)
+            .state
+    }
+
+    /// [CYRUP-DELTA] While the project is not trusted its policy may tighten and nothing else: the
+    /// user's `ask` stays an `ask` however the repository's own file words an `allow`.
+    #[test]
+    fn an_untrusted_project_policy_cannot_turn_the_users_ask_into_an_allow() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut m = manager_with_project(
+            dir.path(),
+            r#"{ "bash": { "*": "ask" } }"#,
+            r#"{ "bash": { "echo *": "allow" } }"#,
+            "",
+        );
+        // Trusted, as a manager with no session has always been: the project's allow applies.
+        assert!(m.project_trusted());
+        assert_eq!(state_of(&mut m, "echo hi", None), PermissionState::Allow);
+
+        m.set_project_trusted(false);
+        assert_eq!(state_of(&mut m, "echo hi", None), PermissionState::Ask);
+
+        // And back: the answer is not cached across the change.
+        m.set_project_trusted(true);
+        assert_eq!(state_of(&mut m, "echo hi", None), PermissionState::Allow);
+    }
+
+    #[test]
+    fn an_untrusted_project_policy_with_no_global_rule_cannot_allow_either() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut m = manager_with_project(
+            dir.path(),
+            "{}",
+            r#"{ "defaultPolicy": { "bash": "allow" }, "bash": { "echo *": "allow" } }"#,
+            "",
+        );
+        assert_eq!(state_of(&mut m, "ls", None), PermissionState::Allow);
+        m.set_project_trusted(false);
+        // Neither the rule nor the project's default of `allow`: the built-in default asks.
+        assert_eq!(state_of(&mut m, "echo hi", None), PermissionState::Ask);
+        assert_eq!(state_of(&mut m, "ls", None), PermissionState::Ask);
+    }
+
+    #[test]
+    fn an_untrusted_project_policy_may_still_tighten() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut m = manager_with_project(
+            dir.path(),
+            r#"{ "bash": { "*": "allow" } }"#,
+            r#"{ "bash": { "rm *": "deny", "git push*": "ask", "echo *": "allow" } }"#,
+            "",
+        );
+        m.set_project_trusted(false);
+        assert_eq!(state_of(&mut m, "rm -rf x", None), PermissionState::Deny);
+        assert_eq!(
+            state_of(&mut m, "git push origin", None),
+            PermissionState::Ask
+        );
+        // Its allow was dropped, so the user's own rule decides.
+        assert_eq!(state_of(&mut m, "echo hi", None), PermissionState::Allow);
+    }
+
+    #[test]
+    fn an_untrusted_project_agent_layer_is_tightened_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut m = manager_with_project(
+            dir.path(),
+            r#"{ "bash": { "*": "ask" } }"#,
+            "{}",
+            "  bash:\n    \"echo *\": allow\n    \"rm *\": deny\n",
+        );
+        assert_eq!(
+            state_of(&mut m, "echo hi", Some("scout")),
+            PermissionState::Allow
+        );
+        m.set_project_trusted(false);
+        assert_eq!(
+            state_of(&mut m, "echo hi", Some("scout")),
+            PermissionState::Ask
+        );
+        assert_eq!(
+            state_of(&mut m, "rm x", Some("scout")),
+            PermissionState::Deny
+        );
+    }
+
+    #[test]
+    fn the_cache_stamp_changes_with_the_trust_the_policy_was_resolved_under() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut m = manager_with_project(dir.path(), "{}", "{}", "");
+        let trusted = m.policy_cache_stamp(None);
+        m.set_project_trusted(false);
+        assert_ne!(m.policy_cache_stamp(None), trusted);
+        m.set_project_trusted(true);
+        assert_eq!(m.policy_cache_stamp(None), trusted);
     }
 
     #[test]

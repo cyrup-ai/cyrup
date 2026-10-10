@@ -23,6 +23,7 @@ mod builder;
 pub mod cache_warmer;
 mod command;
 mod compact;
+mod default_tools;
 mod error;
 mod event;
 pub mod export;

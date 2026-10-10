@@ -24,6 +24,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use cyrup_session_svc::{
     AgentSession, AgentSessionEvent, AgentSessionRuntime, BashOptions, Content, EntryId,
@@ -252,6 +253,36 @@ fn default_ui_reply(kind: UiKind) -> UiReply {
     }
 }
 
+/// SEAM-154 — how long, once stdin has reached EOF, the loop lets the work it has just aborted report
+/// before it stops waiting for it.
+///
+/// **[CYRUP-DELTA]** pi's `shutdown()` (`rpc-mode.ts:726-743`, run by `process.stdin.on("end")`,
+/// `:802-805` @v1.0.4) disposes the runtime and calls `process.exit` without waiting for anything:
+/// the session is unsubscribed first, so nothing the aborted work still emits reaches stdout. Here
+/// the work is aborted the same way (see [`abort_at_eof`]) and the loop keeps forwarding for at
+/// most this long, so that the response of a command that was read before EOF and finishes when
+/// aborted (a `bash` command, a `compact`) and the aborted turn's closing events are written, not
+/// lost. It is a bound on a wedge, never a wait for a healthy run: a run that is not wedged settles
+/// in milliseconds once aborted, and the caller's dispose settles it again afterwards.
+const EOF_SETTLE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// SEAM-154 — what pi's `shutdown()` does to work in flight when stdin ends: `runtimeHost.dispose()`
+/// → `AgentSession.dispose()`, which aborts the retry backoff, the compaction, the branch summary,
+/// the bash command and the agent run (`agent-session.ts` `dispose` @v1.0.4). Every dialog still
+/// open is answered as cancelled as well: with stdin closed nobody can answer it, and a call parked
+/// on one (a permission prompt of a nested tool call, a hook asking the user) would otherwise wait
+/// for a reply that cannot come. Pi leaves them unanswered because it exits at once.
+///
+/// Synchronous on purpose, and the dialogs go first: asking the runtime for the session could wait
+/// behind a session replacement that is itself parked on one of those dialogs.
+fn abort_at_eof(session: &AgentSession, pending: &mut HashMap<String, PendingUi>) {
+    for (_, dialog) in pending.drain() {
+        let _ = dialog.reply.send(default_ui_reply(dialog.kind));
+    }
+    session.abort();
+    session.abort_bash();
+}
+
 /// Map an `extension_ui_response` body onto the guest's expected [`UiReply`] for `pending` (Pi
 /// `parseResponse`, rpc-mode.ts:137-149,257-264). A `{cancelled:true}` yields the per-kind default; a
 /// `{confirmed}` a confirm; a `{value}` maps straight to text (input/editor/select) — Pi's
@@ -335,9 +366,16 @@ struct LoopSinks {
 /// Reads strict-LF JSONL requests, drives the active session, and streams every
 /// [`AgentSessionEvent`] (agent + session-level) back as it occurs. A session-replacing command
 /// rebinds: the active session + its event subscription are re-acquired from the runtime (Pi
-/// `rebindSession`). Returns once the reader reaches EOF *and* no run is in flight *and* no
-/// concurrently-dispatched command is still running. A dedicated reader task keeps line parsing
-/// cancel-safe against the concurrent event stream.
+/// `rebindSession`). A dedicated reader task keeps line parsing cancel-safe against the concurrent
+/// event stream.
+///
+/// ## End of input (Pi `process.stdin.on("end", …)`, rpc-mode.ts:802-805; SEAM-154)
+/// Closing the input is how a client asks for the shutdown, as in pi ("Close the child's stdin to
+/// request an orderly shutdown", `docs/rpc.md` @v1.0.4): the run in flight, a running `bash`, a
+/// compaction and every open dialog are aborted at once ([`abort_at_eof`]), not waited for, so a
+/// client that wants a run's output keeps the input open until it has seen `agent_settled`. Returns
+/// once what was aborted has settled and been written, or [`EOF_SETTLE_TIMEOUT`] after EOF. The
+/// caller disposes the runtime afterwards (pi's `shutdown()` does that itself).
 ///
 /// ## Command concurrency (Pi `void handleInputLine`, rpc-mode.ts:782; G1)
 /// Blocking commands (`bash`/`compact`/`export_html`) and session-replacing ones
@@ -536,6 +574,10 @@ where
     // (`examples/extensions/shutdown-command.ts`) is a `/quit` COMMAND that exits with no agent run
     // ever having happened, so gating on a settle alone would make that command silently do nothing.
     let mut shutdown_checkpoint = false;
+    // SEAM-154: the instant at which the loop stops waiting for the work it aborted at stdin EOF,
+    // and whether that instant has passed. See [`EOF_SETTLE_TIMEOUT`].
+    let mut eof_deadline: Option<tokio::time::Instant> = None;
+    let mut eof_expired = false;
 
     // In-flight dispatches of the potentially-BLOCKING and session-replacing commands, driven
     // CONCURRENTLY with continued input reading so an `abort`/`abort_bash` line arriving mid-command
@@ -606,6 +648,11 @@ where
                         // read error) is read from the join handle at the shutdown break below.
                         reader_open = false;
                         reader_ended = true;
+                        // SEAM-154: pi's `process.stdin.on("end", () => void shutdown())`
+                        // (`rpc-mode.ts:802-805` @v1.0.4). Nobody can send another command, answer a
+                        // dialog or abort, so the work in flight is aborted now, not waited for.
+                        abort_at_eof(&session, &mut pending);
+                        eof_deadline = Some(tokio::time::Instant::now() + EOF_SETTLE_TIMEOUT);
                     }
                 }
             }
@@ -626,6 +673,16 @@ where
                 // as for an RPC verb, and is what keeps the loop from servicing later commands (and
                 // reading later events) through the disposed session.
                 rebind_session(runtime, &mut session, &mut events, &sinks, &mut in_flight).await;
+            }
+            () = async {
+                match eof_deadline {
+                    Some(at) => tokio::time::sleep_until(at).await,
+                    None => std::future::pending().await,
+                }
+            }, if eof_deadline.is_some() && !eof_expired => {
+                // SEAM-154: whatever is still running did not settle after being aborted; the
+                // caller's dispose deals with it (and bounds its own wait).
+                eof_expired = true;
             }
             Some(wire) = error_rx.recv() => {
                 // A dispatcher-contained extension fault: surface it as an `extension_error` line
@@ -667,6 +724,13 @@ where
                     if matches!(ev, AgentSessionEvent::AgentSettled { .. }) {
                         in_flight = false;
                     }
+                    // SEAM-154: a run that started at the very edge of EOF (a `prompt` and the
+                    // close in one write) may not have registered its abort token when
+                    // [`abort_at_eof`] ran. Its `agent_start` says it has, so it is aborted again;
+                    // aborting is idempotent.
+                    if reader_ended && matches!(ev, AgentSessionEvent::AgentStart) {
+                        session.abort();
+                    }
                     // SEAM-005 + EXT-005: a loaded extension's `ctx.shutdown()` is honoured at the
                     // SETTLE point, never mid-run — Pi checks `shutdownRequested` in exactly this
                     // arm (`if (event.type === "agent_settled") void checkShutdownRequested()`,
@@ -696,11 +760,11 @@ where
             reader_open = false;
         }
 
-        if !reader_open && !in_flight && dispatches.is_empty() {
-            // The reader is at EOF, no agent run is in flight, and every concurrently-dispatched
-            // command has completed (a still-running `bash` at EOF is awaited here, not cut off).
-            // Flush any events already buffered on the channel + any extension_error queued during
-            // shutdown, then shut down cleanly.
+        if !reader_open && ((!in_flight && dispatches.is_empty()) || eof_expired) {
+            // The reader is at EOF and either everything it started has settled (aborted at EOF,
+            // SEAM-154: a run in flight and a running `bash` are cut, not waited for) or the
+            // [`EOF_SETTLE_TIMEOUT`] for it ran out. Flush any events already buffered on the
+            // channel + any extension_error queued during shutdown, then shut down cleanly.
             while let Some(Some(ev)) = events.next().now_or_never() {
                 // Same rule as the live arm above (SEAM-080/SEAM-081).
                 if crate::is_upstream_wire_event(&ev) {

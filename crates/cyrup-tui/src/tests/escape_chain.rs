@@ -288,3 +288,52 @@ async fn escape_during_a_compaction_aborts_the_compaction() {
         "the rebind must be undone at compaction_end"
     );
 }
+
+/// Escape on a running tool of the turn (not a `!` child). The key handler committed the live tool
+/// rows where they stood, so the row stayed in the scrollback as it was drawn, running for good, and
+/// the tool's end, which the session emits after an abort as after any other end, found no row to
+/// finish and drew a second block with no command: `$ sleep 33`, then a bare `Command aborted`.
+/// Pi's handler only aborts; `tool_execution_end` and `agent_end` finish what was running.
+#[test]
+fn escape_during_a_tool_leaves_one_block_that_the_end_of_the_tool_finishes() {
+    use cyrup_core::ToolCallId;
+    use cyrup_session_svc::AgentSessionEvent;
+    use serde_json::json;
+
+    let mut app = new_app();
+    app.ingest_event(&AgentSessionEvent::AgentStart);
+    app.ingest_event(&AgentSessionEvent::ToolExecutionStart {
+        tool_call_id: ToolCallId::from("call-bash"),
+        tool_name: "bash".to_string(),
+        args: json!({ "command": "sleep 33" }),
+    });
+    assert_eq!(app.handle_input(&esc()), AppAction::InterruptRestoreQueued);
+
+    app.ingest_event(&AgentSessionEvent::ToolExecutionEnd {
+        tool_call_id: ToolCallId::from("call-bash"),
+        tool_name: "bash".to_string(),
+        result: json!({ "content": [{ "type": "text", "text": "\n\nCommand aborted" }] }),
+        is_error: true,
+        duration_ms: None,
+    });
+    app.ingest_event(&AgentSessionEvent::AgentEnd {
+        messages: Vec::new(),
+        will_retry: false,
+    });
+    app.draw().unwrap();
+
+    let text = app.scrollback_text();
+    let headers = text
+        .lines()
+        .filter(|line| line.trim_start().starts_with('$'))
+        .count();
+    assert_eq!(
+        headers, 1,
+        "one block for one tool call, not a second with no command:\n{text}"
+    );
+    let (command, aborted) = (text.find("$ sleep 33"), text.find("Command aborted"));
+    assert!(
+        command.is_some() && aborted.is_some() && command < aborted,
+        "the aborted text belongs to the block that has the command:\n{text}"
+    );
+}

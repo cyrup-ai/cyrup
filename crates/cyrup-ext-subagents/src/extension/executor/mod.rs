@@ -35,7 +35,7 @@ pub(crate) mod workflow_steering;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use tokio::sync::Mutex as AsyncMutex;
 
@@ -120,7 +120,7 @@ pub struct SubagentExecutor {
     /// / the fork-context resolver can reach the live session id/file + `inject_message` OUTSIDE any
     /// `HostCtx`. `None` (default host / SDK-embedder / headless) ⇒ every consumer degrades to its
     /// documented no-host fallback (heuristic fork-context, stderr logging sink, empty anchor).
-    host_services: Arc<OnceLock<Arc<dyn cyrup_ext::host::HostServices>>>,
+    host_services: Arc<cyrup_ext::host::HostServicesSlot>,
     /// The canonical parent-session anchor (`CYRUP_SUBAGENT_PARENT_SESSION`, proposed R-SA-P1),
     /// captured ONCE from [`cyrup_ext::host::HostServices::session_id`] at the root orchestrator's
     /// `SessionStart` (depth 0). Injected into every child's spawn env overlay so the permission
@@ -323,7 +323,7 @@ impl SubagentExecutor {
             wait_subscriptions: Arc::new(std::sync::Mutex::new(None)),
             scheduled_runs: Arc::new(std::sync::Mutex::new(None)),
             inline_answers: crate::background::watch::InlineAnswerLedger::default(),
-            host_services: Arc::new(OnceLock::new()),
+            host_services: Arc::new(cyrup_ext::host::HostServicesSlot::new()),
             root_parent_session: Arc::new(std::sync::Mutex::new(None)),
             root_parent_session_name: Arc::new(std::sync::Mutex::new(None)),
             steer: Arc::new(crate::tui::intercom::NoTransportSteerChannel),
@@ -447,15 +447,18 @@ impl SubagentExecutor {
     /// [`cyrup_ext::native::NativeExtension::set_host_services`] (which the builder invokes via
     /// `load_native_with_services` BEFORE `init`) so the `SessionStart` handler, the fork-context
     /// resolver, and the completion watcher reach the live session id/file + `inject_message`.
-    /// Idempotent (`OnceLock::set` ignores a second bind of the same session rebuild).
+    /// The last bind wins: a session replacement (`/new`, RPC `new_session`, a second ACP
+    /// `session/new`) builds the replacement's `LiveHostServices` and binds it to this same executor,
+    /// and the `SessionStart` that follows installs the completion watcher on it. A slot that kept the
+    /// first backend injected every later completion into the session that had been replaced.
     pub fn set_host_services(&self, services: Arc<dyn cyrup_ext::host::HostServices>) {
-        let _ = self.host_services.set(services);
+        self.host_services.bind(services);
     }
 
     /// The captured live capability backend, if the P-1 slot has been bound.
     #[must_use]
     pub fn host_services(&self) -> Option<Arc<dyn cyrup_ext::host::HostServices>> {
-        self.host_services.get().cloned()
+        self.host_services.get()
     }
 
     /// SUBA-158 — this launching session's project trust, as every child launch must carry it:

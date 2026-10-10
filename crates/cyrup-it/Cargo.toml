@@ -97,6 +97,10 @@ cyrup-session           = { workspace = true }
 cyrup-config            = { workspace = true }
 cyrup-resources         = { workspace = true }
 cyrup-ext               = { workspace = true }
+# `tests/session_svc/wasm_guest_tool_surface.rs` runs a codemode script (a scripted sandbox) against
+# the tools of a REAL guest component loaded into a real session.
+cyrup-codemode          = { workspace = true }
+cyrup-codemode-runtime  = { workspace = true, features = ["testkit"] }
 cyrup-session-svc       = { workspace = true }
 cyrup-modes             = { workspace = true }
 cyrup-sdk               = { workspace = true }

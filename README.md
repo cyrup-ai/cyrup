@@ -22,7 +22,7 @@ backbone.
 | line coverage | **86.3%** (368,184 of 426,789 executable lines) |
 | function coverage | 84.0% (37,304 of 44,404) |
 | region coverage | 86.2% |
-| gated integration suite (`cyrup-it`) | ~590 more test functions across nine binaries |
+| gated integration suite (`cyrup-it`) | ~840 more test functions across ten binaries |
 | upstream citations in source | 28,706, naming 16,976 distinct `.ts` locations |
 
 Tests: `cargo nextest run --workspace --features test-fixtures`. `test-fixtures` is required, or the
@@ -105,6 +105,11 @@ the command palette.
   Google, Bedrock, Vertex, Copilot, OpenRouter, Groq, Together, Mistral, Fireworks and more.
 - **The built-in tool set**: `read`, `bash`, `powershell`, `edit`, `write`, `grep`, `find`, `ls`, over
   an `FsOps`/`ProcOps` interface that tests substitute.
+- **Codemode**, an optional tool (off by default) with which the model writes one JavaScript script that
+  calls the other tools, in parallel if it likes, and only the script's output comes back. Each script
+  runs in a V8 sandbox in a process of its own, and every call it makes passes the same permission gate
+  as any other. Turn it on with `"defaultTools": ["+codemode"]` or
+  `--tools read,bash,edit,write,codemode`; see [Codemode](docs/guide/guides/codemode.md).
 - **A session tree on disk** as JSONL, with compaction, forking, import and export.
 - **Five run modes.** The terminal interface, plus `--mode print`, `--mode json` and `--mode rpc`
   for scripting and embedding, and `--mode acp` to run as an
@@ -134,7 +139,7 @@ it is unavailable and does nothing else.
 ## Extensions are WebAssembly components
 
 Pi loads TypeScript at runtime. cyrup runs extensions as WASM components under Wasmtime, against a
-versioned WIT world (`cyrup:ext@0.19.0`). That buys three things a dynamic-import model cannot.
+versioned WIT world (`cyrup:ext@0.20.0`). That buys three things a dynamic-import model cannot.
 
 **A real sandbox.** An extension declares what it needs in its manifest: filesystem roots, process
 execution, network, UI. The host enforces it. A component that declares nothing gets nothing, and
@@ -274,7 +279,7 @@ mdbook serve   # http://localhost:3000, live-reloads on save
 ```
 
 - [Install](docs/guide/getting-started/install.md) · [Connect a provider](docs/guide/getting-started/authenticate.md) · [Your first session](docs/guide/getting-started/first-session.md)
-- [The terminal interface](docs/guide/guides/tui.md) · [sessions](docs/guide/guides/sessions.md) · [models and thinking](docs/guide/guides/models.md) · [tools and permissions](docs/guide/guides/tools-and-permissions.md)
+- [The terminal interface](docs/guide/guides/tui.md) · [sessions](docs/guide/guides/sessions.md) · [models and thinking](docs/guide/guides/models.md) · [tools and permissions](docs/guide/guides/tools-and-permissions.md) · [codemode](docs/guide/guides/codemode.md)
 - [Scripting and automation](docs/guide/guides/scripting.md) · [Zed and other ACP editors](docs/guide/guides/zed-acp.md)
 - [How extensions work](docs/guide/extensions/overview.md) · [subagents](docs/guide/extensions/subagents.md) · [permissions](docs/guide/extensions/permissions.md) · [intercom](docs/guide/extensions/intercom.md) · [Flux](docs/guide/extensions/flux.md)
 - [CLI reference](docs/guide/reference/cli.md) · [`settings.json`](docs/guide/reference/settings.md) · [environment variables](docs/guide/reference/environment.md) · [keybindings](docs/guide/reference/keybindings.md) · [troubleshooting](docs/guide/reference/troubleshooting.md)
@@ -339,20 +344,40 @@ process, live in one gated crate:
 
 ```sh
 cargo build -p cyrup-ext-sdk --target wasm32-wasip2
-cargo nextest run -p cyrup-it --features it        # ~590 test functions across 9 binaries
+cargo nextest run -p cyrup-it --features it        # ~860 test functions across 11 binaries
 ```
 
 `cyrup-it` is behind `required-features = ["it"]`, so the everyday gate never builds it. Its
-`build.rs` resolves the fixture binaries and the WASM component once. It carries nine targets, one
+`build.rs` resolves the fixture binaries and the WASM component once. It carries eleven targets, one
 per subsystem (`subagents`, `verify_redaction`, `intercom`, `ext`, `permission`, `mcp`,
-`session_svc`, `bin`, `misc`), so a `process::exit`, an abort or a segfault in one cannot take the
-others down with no report.
+`session_svc`, `bin`, `misc`, `llama`, `llama_live`), so a `process::exit`, an abort or a segfault in
+one cannot take the others down with no report. `llama_live` drives a real `llama-server` and
+reports each of its tests as skipped, on stderr, unless `LLAMA_SERVER_BIN` and
+`CYRUP_LLAMA_MODELS_DIR` are both set.
 
 Set `CYRUP_IT_BIN_DIR` to a directory of pre-built binaries and `build.rs` skips its nested second
 link. On a constrained disk that is the difference between the suite running and the nested build
-failing on disk space; pointed at an empty directory it skips the link entirely, which is enough to
-type-check the crate. Type-checking does not exercise it; run it before trusting a change to one of
-those subsystems.
+failing on disk space (the nested build is a second full debug build of the `cyrup` graph, about
+9 GB); pointed at an empty directory it skips the link entirely, which is enough to type-check the
+crate. Type-checking does not exercise it; run it before trusting a change to one of those
+subsystems. The directory must hold the binaries built with the features the tests need, so not a
+bare `cargo build --workspace --bins`:
+
+```sh
+cargo build -p cyrup --features faux --bin cyrup                 # `faux` is what --model faux/faux-1 reaches
+cargo build -p cyrup-intercom --features test-fixtures --bins    # broker, child fixture, scripting client
+cargo build -p cyrup-ext-subagents --features test-fixtures --bins
+cargo build -p cyrup-ext-sdk --target wasm32-wasip2
+export CYRUP_IT_BIN_DIR="$PWD/target/debug"
+export CYRUP_EXT_FIXTURE_COMPONENT="$PWD/target/wasm32-wasip2/debug/cyrup_ext_sdk.wasm"
+cargo run -p xtask -- it                       # nextest, in a credential-free environment
+cargo run -p xtask -- it --test bin            # one target (`--test <name>` is passed to nextest)
+cargo clippy -p cyrup-it --features it,wasm-host --all-targets -- -D warnings
+```
+
+Run it through `cargo run -p xtask -- it` rather than raw: the suite refuses to start in a shell that
+exports provider credentials (`AWS_ACCESS_KEY_ID`, `ANTHROPIC_API_KEY`, ...), and the wrapper clears
+them.
 
 Eighteen integration binaries remain in-crate under `crates/*/tests/`, each because it needs a process
 of its own: it mutates the process environment, spawns the shipped `cyrup` binary, or pins a

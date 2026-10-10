@@ -45,6 +45,35 @@ fn tool_flags_map_to_no_tools_modes_and_lists() {
     assert_eq!(cli.exclude_tools, vec!["bash".to_string()]);
 }
 
+/// `--no-mcp` (pi `cli/args.ts` @v1.0.4) switches the built-in MCP extension off for the run:
+/// `disabledBuiltinExtensions: parsed.noMcp ? ["mcp"] : undefined` (`main.ts`). It reaches the
+/// session config as the extension's own id, and without the flag nothing is disabled.
+#[test]
+fn no_mcp_disables_the_mcp_builtin_for_the_run() {
+    let d = dirs();
+    assert!(
+        parse_like_main(&[])
+            .to_session_config(&d, AppMode::Print)
+            .disabled_builtin_extensions
+            .is_empty()
+    );
+    let cli = parse_like_main(&["--no-mcp", "-p", "hi"]);
+    assert!(cli.no_mcp);
+    assert!(
+        cli.extension_flags.is_empty(),
+        "a known flag, not captured as an extension flag: {:?}",
+        cli.extension_flags
+    );
+    assert_eq!(
+        cli.to_session_config(&d, AppMode::Print)
+            .disabled_builtin_extensions,
+        vec![cyrup_mcp::EXTENSION_ID.to_string()]
+    );
+    // It is the MCP extension and no other: `--no-extensions` is a different switch.
+    let config = parse_like_main(&["--no-extensions"]).to_session_config(&d, AppMode::Print);
+    assert!(config.disabled_builtin_extensions.is_empty());
+}
+
 #[test]
 fn name_is_trimmed_and_empty_is_rejected() {
     assert_eq!(

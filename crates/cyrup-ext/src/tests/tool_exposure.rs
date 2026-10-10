@@ -509,6 +509,9 @@ mod guest {
             exposure: exposure.map(str::to_string),
             namespace,
             default_active,
+            output_schema_json: None,
+            annotations: None,
+            prepare_loadout: false,
         }
     }
 
@@ -642,13 +645,13 @@ mod guest {
             .collect()
     }
 
-    /// The canonical-ABI `tool-descriptor` record (136 bytes) with the exposure members set.
+    /// The canonical-ABI `tool-descriptor` record (160 bytes) with the exposure members set.
     /// Offsets: `name` 0, `label` 8, `description` 16, `parameters-json` 24, `exec-mode` 32,
     /// `prompt-snippet` 36, `prompt-guidelines` 48, the two bools 56-57, `render-shell` 60,
     /// `constrained-sampling` 72, `exposure` 84, `namespace` 96 (its `name` 100, `description`
     /// 108, `instructions` 120), `default-active` 132.
     fn record(exposure_ptr: u32, exposure_len: u32) -> String {
-        let mut bytes = [0u32; 34];
+        let mut bytes = [0u32; 40];
         let mut put = |offset: usize, v: u32| bytes[offset / 4] = v;
         put(0, 17200);
         put(4, 13); // name -> "exposed_guest"
@@ -772,13 +775,17 @@ mod guest {
 /// `tool-descriptor` record at its current shape.
 #[cfg(feature = "wasm-host")]
 pub(super) fn guest_registration_tool_import() -> String {
-    r#"  (import "cyrup:ext/types@0.19.0" (instance $types
+    r#"  (import "cyrup:ext/types@0.20.0" (instance $types
     (type $em (enum "parallel" "sequential"))
     (export "exec-mode" (type $em-x (eq $em)))
     (type $tn (record
       (field "name" string) (field "description" (option string))
       (field "instructions" (option string))))
     (export "tool-namespace" (type $tn-x (eq $tn)))
+    (type $ta (record
+      (field "read-only-hint" (option bool)) (field "destructive-hint" (option bool))
+      (field "idempotent-hint" (option bool)) (field "open-world-hint" (option bool))))
+    (export "tool-annotations" (type $ta-x (eq $ta)))
     (type $td (record
       (field "name" string) (field "label" string) (field "description" string)
       (field "parameters-json" string) (field "exec-mode" (option $em-x))
@@ -786,10 +793,11 @@ pub(super) fn guest_registration_tool_import() -> String {
       (field "has-renderer" bool) (field "prepare-arguments" bool)
       (field "render-shell" (option string)) (field "constrained-sampling" (option string))
       (field "exposure" (option string)) (field "namespace" (option $tn-x))
-      (field "default-active" (option bool))))
+      (field "default-active" (option bool)) (field "output-schema-json" (option string))
+      (field "annotations" (option $ta-x)) (field "prepare-loadout" bool)))
     (export "tool-descriptor" (type $td-x (eq $td)))))
   (alias export $types "tool-descriptor" (type $tool-descriptor))
-  (import "cyrup:ext/registration@0.19.0" (instance $reg
+  (import "cyrup:ext/registration@0.20.0" (instance $reg
     (alias outer 1 $tool-descriptor (type $td))
     (export "tool-descriptor" (type $td-x (eq $td)))
     (export "register-tool" (func (param "t" $td-x) (result (result (error string)))))))

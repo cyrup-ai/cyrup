@@ -91,7 +91,7 @@ fn the_tool_registers_inactive_model_only_with_a_grammar_and_a_prompt_contributi
         tool.parameters(),
         &json!({
             "type": "object",
-            "properties": { "code": { "type": "string", "description": "Raw JavaScript source." } },
+            "properties": { "code": { "type": "string", "description": "JavaScript source (no code fence)." } },
             "required": ["code"]
         })
     );
@@ -170,6 +170,23 @@ fn on_mode_describes_declared_tools_and_lists_only_the_non_direct_callables() {
             && advertised.contains("echo")
             && advertised.contains("codemode")
     );
+}
+
+/// A declared tool's note names the identifier the sandbox registers it under, also when another
+/// tool has the identifier its name normalises to (`gh-search` and `gh_search`).
+#[test]
+fn a_declared_tool_names_its_assigned_identifier_when_names_collide() {
+    let slot = host_slot(CodemodeMode::On);
+    let loadout = ToolLoadout::resolve(
+        &names(&["gh-search", "gh_search", "codemode"]),
+        &[
+            StubTool::new("gh-search", "Dashed.").arc(),
+            StubTool::new("gh_search", "Plain.").arc(),
+            codemode(&slot),
+        ],
+    );
+    assert!(description_of(&loadout, "gh-search").contains("`tools.gh_search_2(args)`"));
+    assert!(description_of(&loadout, "gh_search").contains("`tools.gh_search(args)`"));
 }
 
 /// `only`: codemode lists echo, which stays active but is left out of requests.

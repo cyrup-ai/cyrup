@@ -104,6 +104,49 @@ pub fn normalize_context(context: &Context) -> TranscriptContext {
     TranscriptContext { messages }
 }
 
+/// The request [`Context`] for a transcript: the prompt its system messages replay to, in
+/// [`Context::system_prompt`], and the transcript without them.
+///
+/// `system_prompt` is the shorthand [`normalize_context`] folds into a leading system message, so
+/// the replayed prompt is that text followed by every later system message's `content` and
+/// `sections`, exactly [`get_current_system_prompt`] over the normalized transcript. Later system
+/// messages are DROPPED from `messages`: their text is already in the prompt, which is what
+/// [`collapse_system_messages`] yields for a transport without mid-conversation system messages.
+/// An empty replay is `None`, never `Some("")`.
+///
+/// [CYRUP-DELTA] pi's adapters each call `resolveTranscript`/`collapseSystemMessages` on the
+/// normalized context and read the prompt out of the result (`openai-completions.ts:310` and the
+/// other `api/*.ts` call sites). cyrup's adapters read [`Context::system_prompt`] and ignore
+/// [`Message::System`] (PROV-083b is the per-adapter wiring), so the replay happens HERE, once, at
+/// the point a request context is built. Tool declarations are not folded: they travel in `tools`,
+/// which the caller resolves (the agent loop sends its advertised set), and a system message's
+/// `tools_added`/`tools_removed` play no part in the prompt text.
+pub fn request_context(
+    system_prompt: Option<&str>,
+    messages: Vec<Message>,
+    tools: Vec<ToolDef>,
+) -> Context {
+    let rows: Vec<Message> = create_initial_system_message(system_prompt, &[])
+        .map(Message::System)
+        .into_iter()
+        .chain(
+            messages
+                .iter()
+                .filter(|m| as_system_message(m).is_some())
+                .cloned(),
+        )
+        .collect();
+    let prompt = get_current_system_prompt(&rows);
+    Context {
+        system_prompt: (!prompt.is_empty()).then_some(prompt),
+        messages: messages
+            .into_iter()
+            .filter(|m| as_system_message(m).is_none())
+            .collect(),
+        tools,
+    }
+}
+
 /// `isSystemMessage` (`transcript.ts:46-48`) as a narrowing borrow: `Some` exactly when the message
 /// is a [`Message::System`].
 pub fn as_system_message(message: &Message) -> Option<&SystemMessage> {

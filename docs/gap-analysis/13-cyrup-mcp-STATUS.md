@@ -19,7 +19,7 @@
 > dependency on pi's in-monorepo `packages/mcp`, and every citation in `13-cyrup-mcp.md` and
 > `13a`–`13i` resolves at that tag. `MCP-587` records the rule.
 >
-> Numbering resumes from **`MCP-616`** (table F, *Fourth pass*, took `MCP-587`–`MCP-608`; table G,
+> Numbering resumes from **`MCP-633`** (it read `MCP-616` when written; `MCP-616` was filed 2026-10-07, `MCP-618`…`MCP-621` on 2026-10-09 and `MCP-622`…`MCP-633` on 2026-10-10; table F, *Fourth pass*, took `MCP-587`–`MCP-608`; table G,
 > *Post-pin triage 2026-10-03*, took `MCP-609`–`MCP-611`; `MCP-586` was never allocated and is still free).
 > **2026-10-09:** numbering now resumes from **`MCP-618`** (`MCP-612`–`MCP-616` were filed 2026-10-06 and 2026-10-07;
 > `MCP-617` by the pi v1.1.0 drift triage, §*Additions — 2026-10-09*). The `pi-mcp-adapter` pin is now **`2ccf648`**
@@ -543,6 +543,44 @@ registration body, and cyrup's loopback redirect (`oauth.rs:2715`) makes `"nativ
 extension (`f10993bc7`, `2db5e359b`) stays secondary (`MCP-587`): `f10993bc7`'s shutdown cancellation is present
 (`oauth.rs:2035` `shutdown_oauth`) and its request timeout duplicates `MCP-569`; its Esc cancel and
 `mcp login --timeout`, and `2db5e359b`'s manager-before-connections change, are leads only if the adapter adopts them.
+
+### Closures and additions — 2026-10-09 (the codemode end-to-end repair)
+
+Rows moved to `implemented` in the tables above (the table rows are left as filed, per this file's rule):
+
+| id | § | what closed it |
+|---|---|---|
+| `MCP-211` | 13e | `formatSchema` and its helpers are ported from `pi-mcp-adapter` `tool-metadata.ts` (`crates/cyrup-mcp/src/proxy/tool_metadata.rs::format_schema`, wired into `RuntimeEnv::format_schema` in `live.rs`; `6c869417b`), keeping the JavaScript behaviour a reader takes for granted: `Object.entries` order for property names, `JSON.stringify`'s number and member order (through `cyrup-codemode`'s one reproduction of both) and the truthiness test on `type`. The test table is upstream's own `formatSchema` output for 35 schemas, run under bun from the function's text at v5.0.0 and compared byte for byte (`format_schema_matches_upstreams_output_byte_for_byte`). `mcp({ describe })`, `mcp({ search })` and the 'Expected parameters:' end of a failed call now carry parameters; they had answered the literal `(schema rendering is not wired - MCP-211)`, so a model never saw what a tool takes, and a script reaches default-mode MCP servers only through that gateway. The placeholder is gone from the tree outside this directory (the lane's grep). |
+| `MCP-616` | 13e | `*` patterns in `--tools` and `--exclude-tools`, MCP tools kept registered under an allowlist without an `mcp__` entry, and `--no-mcp` (`843a4c123`); evidence, the `[CYRUP-DELTA]` `Tool::is_mcp_tool` and the known limit are in the row. |
+
+Four rows filed in `13e` and closed on filing (`implemented`): `MCP-618` (a script that names a server, and `tool_search`, wait for the build), `MCP-619` (every MCP tool resolves to the server's `CallToolResult`), `MCP-620` (the first prompt waits for starting servers, 10 s, declared) and `MCP-621` (the MCP approval dialog is awaited on the blocking pool). `MCP-612` and `MCP-614` carry dated NARROWED notes and stay `missing`.
+
+Arithmetic on the census above (554: `implemented` 349, `partial` 70, `missing` 101, `not-applicable` 34, after `main`'s pi v1.1.0 drift triage added `MCP-617`; the branch's own base was 553 with `missing` 100): +4 rows = **558**; `implemented` 349 + 2 (`MCP-211`, `MCP-616`) + 4 (`MCP-618`…`MCP-621`) = **355**; `missing` 101 − 2 = **99**; `partial` 70; `not-applicable` 34. 355 + 70 + 99 + 34 = 558. Severity of the four new rows: 4 medium. Next free id: `MCP-622`. (The branch had numbered these four `MCP-617`…`MCP-620`; the rebase onto `main`, which had filed `MCP-617`, moved them up one.)
+
+Two residuals the docs lane recorded as parity gaps were read on both sides and are **not gaps**: the adapter ignores pi's `autoEnableCodemode` (`config.ts:1148` @v5.0.0), and pi's own `_getCallableTools` makes a `direct` tool callable only while it is active (see the 2026-10-09 record in `18-pi-codemode.md`). `MCP-620` is a `[CYRUP-DELTA]` against the adapter: the first-prompt wait is pi's built-in extension's 10 s, the adapter's `input` handler waits 30 s.
+
+### Closures and additions — 2026-10-10 (the codemode follow-up)
+
+Twelve rows filed in `13e`, six closed on filing (`implemented`) and six open. Closure record: *Follow-up, 2026-10-10* in `18-pi-codemode.md`. No existing area-13 row changed status; `MCP-618` and `MCP-620` carry dated UPDATED notes (their waits are narrowed by `MCP-622` and `MCP-623`).
+
+| id | sev | § | kind | status | eff | title |
+|---|---|---|---|---|---|---|
+| `MCP-622` | medium | 13e | `parity-bug` | **implemented** *(CLOSED 2026-10-10)* | S | the first prompt waits only for servers that declare tools, once (`5a2eef9ea`) |
+| `MCP-623` | medium | 13e | `cyrup-original` | **implemented** *(CLOSED 2026-10-10)* | S | a stalled MCP build is waited for once; a script's `timeout_ms` bounds its wait (`5a2eef9ea`) |
+| `MCP-624` | medium | 13e | `cyrup-original` | **implemented** *(CLOSED 2026-10-10)* | S | a config file that does not parse is announced, summarised and logged once (`81492ec08`) |
+| `MCP-625` | medium | 13e | `parity-bug` | **implemented** *(CLOSED 2026-10-10)* | S | a call that lands while MCP is building waits for the build (`f50d8be91`) |
+| `MCP-626` | medium | 13e | `parity-bug` | **implemented** *(CLOSED 2026-10-10)* | M | a request with no `requestTimeoutMs` runs under the SDK's 60 s default (`c3fa141a2`) |
+| `MCP-627` | medium | 13e | `parity-bug` | **implemented** *(CLOSED 2026-10-10)* | S | a deduped connect returns only once the connection is registered (`a25dc01e9`) |
+| `MCP-628` | low | 13e | `cyrup-original` | **partial** | S | a script's `timeout_ms` is not subtracted from its deadline after the MCP wait; nothing tells the model under `-p` |
+| `MCP-629` | low | 13e | `parity-bug` | **partial** | M | the first-prompt wait is on the whole connect pass (`[CYRUP-DELTA]`) |
+| `MCP-630` | low | 13e | `port-divergence` | **partial** | M | a message nested more than 128 levels is dropped and ends at 60 s (`[CYRUP-DELTA]`) |
+| `MCP-631` | low | 13e | `port-divergence` | **partial** | S | a direct call during the build waits at most 30 s (`[CYRUP-DELTA]`) |
+| `MCP-632` | low | 13e | `cyrup-original` | **partial** | S | `log_diagnostic` logs an identical config error once per process |
+| `MCP-633` | low | 13e | `test-defect` | **missing** | S | the 60 s default and the deduped connect are pinned more weakly than they look |
+
+Arithmetic on the census above (558: `implemented` 355, `partial` 70, `missing` 99, `not-applicable` 34): +12 rows = **570**; `implemented` 355 + 6 (`MCP-622`…`MCP-627`) = **361**; `partial` 70 + 5 (`MCP-628`…`MCP-632`) = **75**; `missing` 99 + 1 (`MCP-633`) = **100**; `not-applicable` 34. 361 + 75 + 100 + 34 = 570. Severity of the new rows: 6 medium, 6 low. Next free id: `MCP-634`.
+
+Upstream for these rows: `pi-mcp-adapter` **`v5.2.0`** for `MCP-625`, `MCP-626` and `MCP-631` (the area's pin is `v5.0.0`; **the window `v5.0.0..v5.2.0` was not triaged by this pass**) and pi's built-in MCP extension at `v1.0.4` for `MCP-622` and `MCP-629`.
 
 ### Additions — 2026-10-07 (area 18's pi `v1.0.1..v1.0.4` triage)
 

@@ -32,9 +32,9 @@
 //! overlay branches on, and the overlay re-reads.
 
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 
-use cyrup_ext::host::HostServices;
+use cyrup_ext::host::HostServicesSlot;
 use cyrup_ext::host::overlay::{
     InteractiveOverlay, OverlayColor, OverlayKey, OverlayKeyCode, OverlayLine, OverlayOutcome,
     OverlaySpan,
@@ -126,7 +126,7 @@ pub struct ConfigController {
     /// pi `lastConfigWarning` (`index.ts:1572`) — cleared by a successful write.
     last_config_warning: Arc<Mutex<Option<String>>>,
     /// The late-bound capability backend, for the status pill and the failure toast.
-    host_services: Arc<OnceLock<Arc<dyn HostServices>>>,
+    host_services: Arc<HostServicesSlot>,
     /// pi's module-scope `extensionLogger` (`index.ts:148-150`) — `config.saved` lands here.
     logger: Arc<crate::logging::AuditTrail>,
     /// The cause of the most recent REFUSED write, retained until someone takes it.
@@ -146,7 +146,7 @@ impl ConfigController {
         config: SharedExtensionConfig,
         agent_dir: PathBuf,
         last_config_warning: Arc<Mutex<Option<String>>>,
-        host_services: Arc<OnceLock<Arc<dyn HostServices>>>,
+        host_services: Arc<HostServicesSlot>,
         logger: Arc<crate::logging::AuditTrail>,
     ) -> Self {
         Self {
@@ -208,7 +208,7 @@ impl ConfigController {
         *crate::extension::guard(&self.config) = normalized.clone();
         // pi `syncPermissionSystemStatusWhenPossible(normalized, ctx)` (`:1413`).
         if let Some(services) = self.host_services.get() {
-            crate::status::sync_status(services, &normalized);
+            crate::status::sync_status(&services, &normalized);
         }
         // pi `lastConfigWarning = null` (`:1414`): the file on disk is now this extension's own
         // output, so whatever the last load complained about is resolved.
@@ -589,7 +589,7 @@ mod tests {
             Arc::new(Mutex::new(ExtensionConfig::default())),
             dir.to_path_buf(),
             Arc::new(Mutex::new(None)),
-            Arc::new(OnceLock::new()),
+            Arc::new(HostServicesSlot::new()),
             Arc::new(crate::logging::AuditTrail::detached(dir.to_path_buf())),
         ))
     }

@@ -37,7 +37,20 @@ tokio = { workspace = true }
 # alone (no `deno_runtime`): ECMAScript intrinsics and this crate's ops, nothing else.
 deno_core = { workspace = true }
 
+# The sandbox process lowers its own `RLIMIT_DATA` and `RLIMIT_CORE` (`sandbox/child.rs`); nix's
+# `setrlimit` is the safe spelling, which this crate's `forbid(unsafe_code)` needs. Compiles to an
+# empty crate on Windows (ADR-0007), so the dependency is gated rather than the code.
+[target.'cfg(unix)'.dependencies]
+nix = { workspace = true, features = ["resource"] }
+
 [dev-dependencies]
 tempfile = { workspace = true }
+# `Agent` and `ProviderStreamFn`: the grammar-sampling round trip drives a real agent turn through
+# the real `openai-responses` adapter against a loopback server (`tool::grammar_tests`).
+cyrup-agent = { workspace = true }
+# A loopback `TcpListener` for that server; nothing here can reach a real network host.
+tokio = { workspace = true, features = ["net"] }
+# `BUILTIN_NAMES`, which `tool::description::BUILT_IN_TOOL_NAMES` restates (a drift test).
+cyrup-tools = { workspace = true }
 # Decodes the image a test finds in a saved file, to compare it with the one the script showed.
 base64 = { workspace = true }

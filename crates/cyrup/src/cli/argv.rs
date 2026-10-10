@@ -255,6 +255,7 @@ const KNOWN_LONG_FLAGS: &[&str] = &[
     "--exclude-tools",
     "--extension",
     "--no-extensions",
+    "--no-mcp",
     "--skill",
     "--no-skills",
     "--prompt-template",

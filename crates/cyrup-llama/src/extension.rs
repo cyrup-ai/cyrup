@@ -52,8 +52,8 @@ use cyrup_core::ProviderId;
 use cyrup_ext::host::services::{HostProviderAuth, ModelsPersist, ModelsPublication};
 use cyrup_ext::registry::CommandDescriptor;
 use cyrup_ext::{
-    ExtError, ExtMode, HookOutcome, HostCtx, HostEvent, HostServices, InitApi, LateRegistrar,
-    NativeExtension, NotifyKind,
+    ExtError, ExtMode, HookOutcome, HostCtx, HostEvent, HostServices, HostServicesSlot, InitApi,
+    LateRegistrar, NativeExtension, NotifyKind,
 };
 use cyrup_provider::auth::{
     Credential, CredentialInfo, CredentialStore, InMemoryCredentialStore, ModifyFn,
@@ -788,13 +788,13 @@ impl Flow {
 /// A host with no credential store gets a process-local one, so the provider is registered and
 /// simply has no credential until the host has one.
 pub(crate) struct HostCredentials {
-    services: Arc<OnceLock<Arc<dyn HostServices>>>,
+    services: Arc<HostServicesSlot>,
     fallback: InMemoryCredentialStore,
 }
 
 impl HostCredentials {
     /// The store over the services cell the extension fills in `set_host_services`.
-    pub(crate) fn new(services: Arc<OnceLock<Arc<dyn HostServices>>>) -> Self {
+    pub(crate) fn new(services: Arc<HostServicesSlot>) -> Self {
         Self {
             services,
             fallback: InMemoryCredentialStore::new(),
@@ -852,7 +852,7 @@ pub struct LlamaExtension {
     sync_timeout: Duration,
     /// Late-bound by the host before `init` (`NativeExtension::set_host_services`), shared with the
     /// refresh host and the registration callback so they see it whenever it arrives.
-    host_services: Arc<OnceLock<Arc<dyn HostServices>>>,
+    host_services: Arc<HostServicesSlot>,
     /// Late-bound by the host before `init` (`NativeExtension::set_late_registrar`).
     registrar: Arc<OnceLock<Arc<dyn LateRegistrar>>>,
     controller: OnceLock<LlamaController>,
@@ -871,7 +871,7 @@ impl LlamaExtension {
             agent_dir,
             endpoints: Endpoints::default(),
             sync_timeout: SYNC_TIMEOUT,
-            host_services: Arc::new(OnceLock::new()),
+            host_services: Arc::new(HostServicesSlot::new()),
             registrar: Arc::new(OnceLock::new()),
             controller: OnceLock::new(),
             explicit: false,
@@ -1004,7 +1004,9 @@ impl NativeExtension for LlamaExtension {
     // second pass only (`resource-loader.ts:378-399`, `:706-730`).
 
     fn set_host_services(&self, services: Arc<dyn HostServices>) {
-        let _ = self.host_services.set(services);
+        // The last bind wins: a session replacement binds the replacement's backend to this same
+        // extension.
+        self.host_services.bind(services);
     }
 
     fn set_late_registrar(&self, registrar: Arc<dyn LateRegistrar>) {
@@ -1024,7 +1026,7 @@ impl NativeExtension for LlamaExtension {
             )));
         }
         ctx.require_command_tier()?;
-        let Some(host) = self.host_services.get().cloned() else {
+        let Some(host) = self.host_services.get() else {
             return Err(ExtError::Component(
                 "the llama.cpp extension was given no host services".to_string(),
             ));

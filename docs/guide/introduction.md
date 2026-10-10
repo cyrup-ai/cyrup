@@ -17,10 +17,13 @@ Thirty-five model providers are built in — Anthropic, OpenAI, Google, Bedrock,
 Copilot and more — behind one set of flags. You authenticate once and switch between them with a
 keystroke.
 
-Seven built-in tools (`read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`) that you can narrow to
-an allowlist, or turn off entirely for a read-only review session. Four of the seven — `read`,
-`bash`, `edit`, `write` — are active in a default session; `grep`, `find` and `ls` are registered but
-off until you name them.
+Eight built-in tools (`read`, `write`, `edit`, `bash`, `powershell`, `grep`, `find`, `ls`) that you can
+narrow to an allowlist, or turn off entirely for a read-only review session. Four of the eight —
+`read`, `bash`, `edit`, `write` — are active in a default session; the rest are registered but off
+until you name them. A ninth tool, `codemode`, is also off until you turn it on: it lets the model
+write one script that calls the other tools in parallel and filters their output before it comes
+back — see [Codemode](guides/codemode.md). (An armed permission system overrides these defaults: it
+activates every tool its policy does not deny.)
 
 Extensions as WebAssembly components, sandboxed by a capability manifest the host enforces. An
 extension gets filesystem, process, network or UI access only if it declared that it needs it.

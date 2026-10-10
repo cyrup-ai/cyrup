@@ -11,6 +11,7 @@ use crate::error::ProviderError;
 use crate::model::Model;
 use crate::stream::StreamEvent;
 use crate::stream::sse::SseFrame;
+use crate::utils::constrained_sampling::ConstrainedSamplingError;
 use cyrup_core::{ApiId, AssistantMessage, StopReason, Usage};
 use futures::{Stream, StreamExt};
 use serde_json::Value;
@@ -22,6 +23,17 @@ use std::sync::{Arc, OnceLock};
 /// fills (`openai-codex-responses.ts:748-752` @v0.87.1). The shared Responses path itself never
 /// reads the key, so only the Codex adapter hands the decoder a cell (DRIFT-059).
 pub(crate) type EndTurnCell = Arc<OnceLock<bool>>;
+
+/// What a route hands the shared decoder beyond the SSE frames.
+#[derive(Default)]
+pub(crate) struct DecodeOptions {
+    /// The Codex `end_turn` cell (see [`EndTurnCell`]); `None` on the plain Responses and Azure routes.
+    pub end_turn: Option<EndTurnCell>,
+    /// Pi `OpenAIResponsesStreamOptions.grammarToolInputProperties` (`openai-responses-shared.ts:
+    /// 113`): tool name → the argument property a `custom_tool_call`'s raw text is stored under
+    /// (PROV-101).
+    pub grammar_inputs: HashMap<String, String>,
+}
 
 pub(super) struct RDecoder {
     /// Wall-clock start of this response — the `timestamp` of every message it produces (pi seeds
@@ -51,6 +63,8 @@ pub(super) struct RDecoder {
     /// The Codex `end_turn` cell, read into every snapshot — `None` on the plain Responses and Azure
     /// routes, which never record one.
     end_turn: Option<EndTurnCell>,
+    /// See [`DecodeOptions::grammar_inputs`].
+    pub(super) grammar_inputs: HashMap<String, String>,
 }
 
 impl Default for RDecoder {
@@ -70,6 +84,7 @@ impl Default for RDecoder {
             raw_stop_reason: None,
             saw_terminal: false,
             end_turn: None,
+            grammar_inputs: HashMap::new(),
         }
     }
 }
@@ -152,6 +167,54 @@ impl RDecoder {
         })
     }
 
+    /// The content index of the open `function_call` at `output_index`: a tool slot whose block is
+    /// NOT a custom call (pi's `slot.block.partialJson !== undefined`).
+    pub(super) fn function_call_slot(&self, output_index: i64) -> Option<usize> {
+        self.slot(output_index, SlotKind::Tool)
+            .filter(|ci| !self.is_custom_call(*ci))
+    }
+
+    /// The content index of the open `custom_tool_call` at `output_index` (pi's
+    /// `slot.block.customInput` is set).
+    pub(super) fn custom_call_slot(&self, output_index: i64) -> Option<usize> {
+        self.slot(output_index, SlotKind::Tool)
+            .filter(|ci| self.is_custom_call(*ci))
+    }
+
+    pub(super) fn is_custom_call(&self, pos: usize) -> bool {
+        matches!(
+            self.blocks.get(pos),
+            Some(RBlock::Tool {
+                custom: Some(_),
+                ..
+            })
+        )
+    }
+
+    /// The raw grammar text a custom call holds so far; `None` when the block is not a custom call.
+    pub(super) fn custom_input(&self, pos: usize) -> Option<String> {
+        match self.blocks.get(pos) {
+            Some(RBlock::Tool {
+                custom: Some(custom),
+                ..
+            }) => Some(custom.input().to_string()),
+            _ => None,
+        }
+    }
+
+    /// [`RBlock::append_custom_input`] on the block at `pos`, invalidating its memo.
+    pub(super) fn append_custom_input(
+        &mut self,
+        pos: usize,
+        next_input: &str,
+        close: bool,
+    ) -> Result<Option<String>, ConstrainedSamplingError> {
+        match self.block_mut(pos) {
+            Some(block) => block.append_custom_input(next_input, close),
+            None => Ok(None),
+        }
+    }
+
     pub(super) fn slot(&self, output_index: i64, kind: SlotKind) -> Option<usize> {
         self.slots
             .get(&output_index)
@@ -161,22 +224,25 @@ impl RDecoder {
 }
 
 /// Drive the Responses SSE frame stream into ordered [`StreamEvent`]s (1:1 with Pi's stream loop).
+/// Every route now supplies its [`DecodeOptions`]; this is the no-options form the fixtures use.
+#[cfg(test)]
 pub(crate) async fn decode_stream<S>(frames: S, model: &Model, api: &ApiId, sink: &EventSink)
 where
     S: Stream<Item = Result<SseFrame, ProviderError>> + Unpin,
 {
-    decode_stream_with_end_turn(frames, model, api, sink, None).await;
+    decode_stream_with_options(frames, model, api, sink, DecodeOptions::default()).await;
 }
 
-/// [`decode_stream`] with the Codex `end_turn` cell: whatever the Codex event mapper records in it
-/// before yielding the terminal frame appears on every later snapshot, the terminal message
-/// included, exactly as pi's shared `output` object carries it (DRIFT-059).
-pub(crate) async fn decode_stream_with_end_turn<S>(
+/// [`decode_stream`] with the route's [`DecodeOptions`]. The Codex `end_turn` cell: whatever the
+/// Codex event mapper records in it before yielding the terminal frame appears on every later
+/// snapshot, the terminal message included, exactly as pi's shared `output` object carries it
+/// (DRIFT-059).
+pub(crate) async fn decode_stream_with_options<S>(
     mut frames: S,
     model: &Model,
     api: &ApiId,
     sink: &EventSink,
-    end_turn: Option<EndTurnCell>,
+    options: DecodeOptions,
 ) where
     S: Stream<Item = Result<SseFrame, ProviderError>> + Unpin,
 {
@@ -185,7 +251,8 @@ pub(crate) async fn decode_stream_with_end_turn<S>(
 
     let mut dec = RDecoder {
         started_at: sink.started_at(),
-        end_turn,
+        end_turn: options.end_turn,
+        grammar_inputs: options.grammar_inputs,
         ..RDecoder::default()
     };
     if !sink

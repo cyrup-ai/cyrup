@@ -26,7 +26,10 @@ use cyrup_provider::faux::{FauxProvider, faux_assistant_message, faux_text};
 use cyrup_session_svc::{AgentSessionRuntime, SessionFactory};
 use tokio::io::{AsyncWriteExt, BufReader};
 
-use super::support::{Fixture, base_config_no_ext, create_runtime, fixture, parse_lines, type_of};
+use super::support::{
+    Fixture, base_config_no_ext, create_runtime, fixture, has_settled, parse_lines, run_rpc_until,
+    type_of,
+};
 
 /// A native built-in exposing `/quitnow`, which calls the base-context `ctx.shutdown()` (Pi
 /// `ctx.shutdown()`, extensions/types.ts:344 → `runner.shutdown()`, runner.ts:656-662).
@@ -133,13 +136,8 @@ async fn rpc_emits_agent_settled_after_the_run() {
     let runtime = runtime_with(&fx, None).await;
 
     let input = concat!(r#"{"type":"prompt","id":"1","message":"hello"}"#, "\n");
-    let reader = std::io::Cursor::new(input.as_bytes().to_vec());
-    let mut out: Vec<u8> = Vec::new();
-    run_rpc(&runtime, reader, &mut out)
-        .await
-        .expect("rpc mode runs");
-
-    let lines = parse_lines(&out);
+    // SEAM-154: closing the input aborts the run, so the client waits for `agent_settled` itself.
+    let lines = run_rpc_until(&runtime, input, has_settled).await;
     let types: Vec<&str> = lines.iter().map(type_of).collect();
     let settled: Vec<usize> = types
         .iter()

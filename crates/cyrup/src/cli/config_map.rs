@@ -166,6 +166,13 @@ impl Cli {
         // `--no-extensions`/`-ne` disables extension discovery; explicit `--extension`/`-e` paths still
         // load (Pi `resourceLoaderOptions.noExtensions`/`additionalExtensionPaths`, main.ts:660,664).
         config.no_extensions = self.no_extensions;
+        // `--no-mcp` turns the built-in MCP extension off for this run (pi `main.ts` @v1.0.4:
+        // `disabledBuiltinExtensions: parsed.noMcp ? ["mcp"] : undefined`).
+        if self.no_mcp {
+            config
+                .disabled_builtin_extensions
+                .push(cyrup_mcp::EXTENSION_ID.to_string());
+        }
         config.extra_extension_paths = resolve_cli_paths(&dirs.cwd, &self.extension);
         // Relative resource paths are resolved to absolute vs the cwd before threading (Pi
         // `resolveCliPaths`, main.ts:450-451,605-608); package-source specs (npm:/git:/…) are kept.

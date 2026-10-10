@@ -100,14 +100,25 @@ impl<R: std::io::Read> std::io::Read for CancelReader<R> {
 /// this module abort on the same beat.
 const CHUNK: usize = 64 * 1024;
 
-/// Drain `reader` into a `Vec`, observing `cancel` every [`CHUNK`] bytes.
+/// Drain `reader` into a `Vec`, observing `cancel` every [`CHUNK`] bytes and refusing to hold more
+/// than `limit` bytes.
 ///
 /// Returns an `Err` carrying `Cancelled` (test it with `Cancelled::is`) when the token fires
 /// mid-transfer; the partial buffer is dropped, exactly as Pi discards a partially-read file when
 /// the promise rejects.
+///
+/// [CYRUP-DELTA] The `limit` has no Pi counterpart on the drain itself: Node's `readFile` sizes its
+/// buffer from `fstat` and stops at that size (and refuses a regular file over 2 GiB with
+/// `ERR_FS_FILE_TOO_LARGE`), so a file is bounded by what `stat` reported. A reader whose length is
+/// not known up front (a pipe, `/dev/zero`, a `/proc` file, a file another process keeps appending
+/// to) has no such bound, and this loop would otherwise grow the `Vec` until the host runs out of
+/// memory while only the tool's own wall clock stops it. The loop therefore fails with
+/// [`std::io::ErrorKind::FileTooLarge`] as soon as one more byte than `limit` has arrived. A reader
+/// that delivers exactly `limit` bytes and then ends is accepted.
 pub(crate) fn read_to_end_cancellable<R: std::io::Read>(
     reader: R,
     cancel: &CancelToken,
+    limit: usize,
 ) -> std::io::Result<Vec<u8>> {
     use std::io::Read as _;
 
@@ -121,7 +132,16 @@ pub(crate) fn read_to_end_cancellable<R: std::io::Read>(
             // buffer holds. `get` refuses to index blindly (crate-wide `clippy::indexing_slicing`)
             // and turns that contract violation into an error instead of a panic.
             Ok(n) => match buf.get(..n) {
-                Some(chunk) => out.extend_from_slice(chunk),
+                Some(chunk) => {
+                    // Checked BEFORE the copy, so the buffer never holds more than `limit`.
+                    if out.len().saturating_add(chunk.len()) > limit {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::FileTooLarge,
+                            format!("more than {limit} bytes"),
+                        ));
+                    }
+                    out.extend_from_slice(chunk);
+                }
                 None => {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
@@ -134,5 +154,58 @@ pub(crate) fn read_to_end_cancellable<R: std::io::Read>(
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(e) => return Err(e),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    use super::*;
+    use std::io::Read as _;
+
+    /// A reader far longer than any `limit` below. Finite on purpose: it stands in for `/dev/zero`,
+    /// and a test that really was endless would take the machine down with it when the check it
+    /// pins is the thing that broke.
+    fn endless() -> impl std::io::Read {
+        std::io::repeat(0).take(64 * CHUNK as u64)
+    }
+
+    #[test]
+    fn a_reader_that_never_ends_stops_at_the_limit() {
+        let err = read_to_end_cancellable(endless(), &CancelToken::new(), 3 * CHUNK + 5)
+            .expect_err("a reader past the limit must not be drained");
+        assert_eq!(err.kind(), std::io::ErrorKind::FileTooLarge, "{err}");
+    }
+
+    #[test]
+    fn a_reader_of_exactly_the_limit_is_accepted() {
+        let limit = 2 * CHUNK + 7;
+        let bytes = read_to_end_cancellable(
+            std::io::repeat(0).take(limit as u64),
+            &CancelToken::new(),
+            limit,
+        )
+        .unwrap();
+        assert_eq!(bytes.len(), limit);
+    }
+
+    #[test]
+    fn one_byte_over_the_limit_is_refused() {
+        let limit = 2 * CHUNK + 7;
+        let err = read_to_end_cancellable(
+            std::io::repeat(0).take(limit as u64 + 1),
+            &CancelToken::new(),
+            limit,
+        )
+        .expect_err("limit + 1 bytes must be refused");
+        assert_eq!(err.kind(), std::io::ErrorKind::FileTooLarge, "{err}");
+    }
+
+    #[test]
+    fn a_fired_token_still_reports_cancelled_rather_than_too_large() {
+        let cancel = CancelToken::new();
+        cancel.cancel();
+        let err = read_to_end_cancellable(endless(), &cancel, 10).expect_err("cancelled");
+        assert!(Cancelled::is(&err), "{err}");
     }
 }

@@ -18,6 +18,12 @@ use crate::types::{
 /// the process's exit slow enough for the runner to call the test leaky.
 pub struct TestSandbox(CodemodeSandbox);
 
+impl TestSandbox {
+    pub fn new(sandbox: CodemodeSandbox) -> Self {
+        Self(sandbox)
+    }
+}
+
 impl std::ops::Deref for TestSandbox {
     type Target = CodemodeSandbox;
 
@@ -104,7 +110,9 @@ pub fn deadline_ms(ms: u64) -> ExecuteOptions {
 /// result otherwise.
 pub fn value(result: &CodemodeResult) -> Option<Value> {
     match result {
-        CodemodeResult::Completed { value, .. } => value.clone(),
+        CodemodeResult::Completed { value, .. } => {
+            value.as_ref().map(|value| value.to_value().unwrap())
+        }
         CodemodeResult::Failed { .. } => panic!("expected a completed execution: {result:#?}"),
     }
 }
@@ -126,6 +134,38 @@ pub fn output(result: &CodemodeResult) -> &[OutputItem] {
 pub fn calls(result: &CodemodeResult) -> &[CodemodeCall] {
     match result {
         CodemodeResult::Completed { calls, .. } | CodemodeResult::Failed { calls, .. } => calls,
+    }
+}
+
+/// The errors a completed execution never looked at, as `(call, message)` and their total; panics
+/// with the whole result for a failed one.
+pub fn unobserved(result: &CodemodeResult) -> (usize, Vec<(Option<String>, String)>) {
+    match result {
+        CodemodeResult::Completed { unobserved, .. } => (
+            unobserved.total,
+            unobserved
+                .shown
+                .iter()
+                .map(|error| (error.call.clone(), error.message.clone()))
+                .collect(),
+        ),
+        CodemodeResult::Failed { .. } => panic!("expected a completed execution: {result:#?}"),
+    }
+}
+
+/// The calls a completed execution had started and that failed after it ended, with something waiting
+/// on them, as `(call, message)` and their total; panics with the whole result for a failed one.
+pub fn late_failures(result: &CodemodeResult) -> (usize, Vec<(Option<String>, String)>) {
+    match result {
+        CodemodeResult::Completed { unobserved, .. } => (
+            unobserved.late_total,
+            unobserved
+                .late_shown
+                .iter()
+                .map(|error| (error.call.clone(), error.message.clone()))
+                .collect(),
+        ),
+        CodemodeResult::Failed { .. } => panic!("expected a completed execution: {result:#?}"),
     }
 }
 

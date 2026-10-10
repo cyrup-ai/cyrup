@@ -41,7 +41,7 @@ pub use proxy::{
     stream_proxy,
 };
 pub use queue::{PendingQueue, QueueMode, ToolExecution};
-pub use state::{AgentStateSnapshot, GenerationConfig};
+pub use state::{AgentStateSnapshot, GenerationConfig, NestedContext};
 pub use stream_fn::{ApiKeyResolver, ProviderStreamFn, StreamFn};
 pub use subscriber::EventSubscriber;
 

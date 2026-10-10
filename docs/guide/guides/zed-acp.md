@@ -109,10 +109,16 @@ alongside them — a project with Flux installed also lists `flux/status`, `flux
 
 Everything the terminal interface gives you, inside the editor:
 
-- **The full tool set** — `read`, `write`, `edit`, `bash`, `grep`, `find`, `ls` — with each call
-  shown as it runs, and file edits rendered as diffs in the editor's own review UI.
+- **The built-in tools** — `read`, `write`, `edit`, `bash`, `powershell`, `grep`, `find`, `ls` — with
+  the defaults of every other mode (`read`, `bash`, `edit` and `write` are on, see
+  [Tools and permissions](tools-and-permissions.md#the-built-in-tools)), each call shown as it runs,
+  and file edits rendered as diffs in the editor's own review UI.
 - **Permission prompts** raised through `session/request_permission`, so you approve a command in
   the editor rather than in a terminal you cannot see.
+- **Codemode scripts as one tool call.** With the [`codemode`](codemode.md#what-you-see) tool on, a
+  script is a single tool call in the editor: the calls it makes are not listed, its progress is
+  shown as raw JSON, and a call that needs approval arrives as a permission request ending
+  `(from codemode script)`.
 - **The same session tree.** Sessions created here are the JSONL sessions the TUI reads. Start in
   Zed, pick it up later with `cyrup --continue`.
 - **Session management** — `session/list`, `session/load` and `session/delete` — so the editor can

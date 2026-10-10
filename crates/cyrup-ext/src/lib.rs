@@ -272,12 +272,12 @@ pub use wrapper::{
 pub use host::{
     CannedResponses, ControlOp, CustomOption, CustomSpec, DENIED_EXEC, DENIED_MODEL_CALLS,
     DENIED_NET, DENIED_UI, DenyServices, DialogOptions, EpochDriver, ExecOutput, FsCaps,
-    GuestState, HostServices, HttpRequest, HttpResponse, HttpStreamResponse, HumanInteractionGuard,
-    HumanInteractionLock, InteractiveOverlay, LiveExtension, ModelCall, ModelCallOptions,
-    ModelCallVerb, ModelStreams, NotifyKind, OAuthEvent, OverlayColor, OverlayKey, OverlayKeyCode,
-    OverlayLine, OverlayMouse, OverlayMouseOutcome, OverlayOptions, OverlayOutcome, OverlaySpan,
-    ProcSpawnSpec, RecordingServices, SpecOverlay, StandaloneCompletion,
-    StandaloneCompletionRefusal, StoreLimits, ThemeRole, UiChrome, WasmTool,
+    GuestState, HostServices, HostServicesSlot, HttpRequest, HttpResponse, HttpStreamResponse,
+    HumanInteractionGuard, HumanInteractionLock, InteractiveOverlay, LiveExtension, ModelCall,
+    ModelCallOptions, ModelCallVerb, ModelStreams, NotifyKind, OAuthEvent, OverlayColor,
+    OverlayKey, OverlayKeyCode, OverlayLine, OverlayMouse, OverlayMouseOutcome, OverlayOptions,
+    OverlayOutcome, OverlaySpan, ProcSpawnSpec, RecordingServices, SpecOverlay,
+    StandaloneCompletion, StandaloneCompletionRefusal, StoreLimits, ThemeRole, UiChrome, WasmTool,
 };
 #[cfg(feature = "wasm-host")]
 pub use host_runtime::WasmRuntime;

@@ -2639,8 +2639,30 @@ mod tests {
         write_atomic_test_json(&path, &status).await;
     }
 
-    /// Writes one artifact `_meta.json` under the project artifacts dir of `root`.
+    /// Writes one artifact `_meta.json` under the project artifacts dir of `root`. The usage has no
+    /// `turns`: it is the shape a runner wrote before SUBA-175.
     fn write_meta(root: &Path, run_id: &str, agent: &str, index: Option<usize>, input: u64) {
+        write_meta_value(
+            root,
+            run_id,
+            agent,
+            index,
+            &serde_json::json!({
+                "runId": run_id,
+                "agent": agent,
+                "usage": usage_json(input, 1, 0, 0, 0.001),
+            }),
+        );
+    }
+
+    /// Writes `metadata` as the artifact `_meta.json` of one run step under `root`.
+    fn write_meta_value(
+        root: &Path,
+        run_id: &str,
+        agent: &str,
+        index: Option<usize>,
+        metadata: &serde_json::Value,
+    ) {
         let artifacts = crate::artifacts::resolve_artifacts_dir(
             None,
             Some(root),
@@ -2650,12 +2672,7 @@ mod tests {
         std::fs::create_dir_all(&artifacts).unwrap();
         std::fs::write(
             crate::artifacts::artifact_paths(&artifacts, run_id, agent, index).metadata_path,
-            serde_json::to_vec(&serde_json::json!({
-                "runId": run_id,
-                "agent": agent,
-                "usage": usage_json(input, 1, 0, 0, 0.001),
-            }))
-            .unwrap(),
+            serde_json::to_vec(metadata).unwrap(),
         )
         .unwrap();
     }
@@ -2720,6 +2737,7 @@ mod tests {
         assert_eq!(report.children[0].usage.input, 30, "{report:?}");
         assert_eq!(report.children[0].usage.turns, 3, "{report:?}");
         assert_eq!(report.child_total.turns, 3, "{report:?}");
+        assert_eq!(report.total.turns, 3, "{report:?}");
 
         // A pre-SUBA-175 file: the same usage with no `turns` key.
         let legacy = tempfile::tempdir().unwrap();

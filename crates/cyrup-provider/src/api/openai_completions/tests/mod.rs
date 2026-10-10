@@ -9,6 +9,7 @@
 mod cache;
 mod decode;
 mod finalize;
+mod grammar;
 mod headers;
 mod params;
 mod reasoning_details;

@@ -33,4 +33,8 @@ mod forwarding_has_ui_guard;
 mod forwarding_persist;
 mod forwarding_preserve_location;
 mod forwarding_response_path_containment;
+mod nested_origin;
 mod prompt_dedup;
+mod shipped_reference_read;
+mod unattended_parent;
+mod untrusted_project_policy;

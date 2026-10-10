@@ -1,6 +1,6 @@
 //! The `openai-completions` [`ApiImpl`]: request assembly and the hand-off to the SSE decoder.
 
-use super::decode::decode_stream;
+use super::decode::decode_stream_with_grammar_inputs;
 use super::headers::{build_headers, resolve_url};
 use super::params::build_body_with_env;
 use crate::api::compat::get_compat;
@@ -11,6 +11,7 @@ use crate::error::ProviderError;
 use crate::model::Model;
 use crate::stream::sse::SseRequest;
 use crate::stream::{CacheRetention, StreamOptions};
+use crate::utils::constrained_sampling::grammar_tool_input_properties;
 use crate::utils::provider_plumbing::{EnvSource, connect_sse, resolve_cache_retention};
 use cyrup_core::{ApiId, CancelToken};
 use std::sync::Arc;
@@ -83,7 +84,13 @@ impl ApiImpl for OpenAiCompletionsApi {
 
         // PROV-011: an unsatisfiable `constrainedSampling` fails the turn before any HTTP, with
         // pi's own message — upstream `buildParams` throws into `stream`'s catch.
-        let params = match build_body_with_env(model, ctx, opts, env) {
+        // PROV-101: the same resolution yields the grammar tools whose `custom` tool calls the
+        // decoder below must read.
+        let built = grammar_tool_input_properties(ctx, compat.supports_openai_grammar_tools)
+            .and_then(|inputs| {
+                build_body_with_env(model, ctx, opts, env).map(|params| (params, inputs))
+            });
+        let (params, grammar_inputs) = match built {
             Ok(p) => p,
             Err(e) => {
                 let e = ProviderError::from(e);
@@ -114,6 +121,6 @@ impl ApiImpl for OpenAiCompletionsApi {
             return;
         };
 
-        decode_stream(frames, model, &self.api, &sink).await;
+        decode_stream_with_grammar_inputs(frames, model, &self.api, &sink, grammar_inputs).await;
     }
 }

@@ -20,6 +20,8 @@ mod branch_change;
 mod cache_warming_decision;
 mod capability_handle_ownership;
 mod command_dispatch;
+#[cfg(feature = "wasm-host")]
+mod engine_address_space;
 mod entry_renderer;
 mod env_surface_records;
 mod event_kind_lockstep;
@@ -28,6 +30,7 @@ mod extension_flag_diagnostics;
 mod extension_name_conflicts;
 mod failed_load_is_transactional;
 #[cfg(feature = "wasm-host")]
+mod guest_tool_surface;
 mod guest_virtual_model;
 #[cfg(feature = "wasm-host")]
 mod host_drop_frees_guests;

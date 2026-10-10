@@ -6,6 +6,8 @@ use cyrup_provider::{
     CacheRetention, OnPayload, OnResponseHook, ThinkingBudgets, TransformHeadersFn, Transport,
 };
 use std::collections::HashSet;
+use std::ops::{Deref, DerefMut};
+use std::sync::Arc;
 
 /// The per-run model-call configuration the agent forwards into `cyrup_provider::StreamOptions`
 /// (Pi `AgentOptions`/`AgentLoopConfig` generation params, agent.ts:96-116). All fields are
@@ -93,10 +95,67 @@ pub struct GenerationConfig {
     pub timeout_ms: Option<u64>,
 }
 
+/// The agent's transcript, plus the shared copy a nested tool call reads it from.
+///
+/// It reads and writes as the `Vec` it wraps. Every mutable access drops the shared copy, so a copy
+/// that exists is always of the transcript as it stands; a read leaves it alone.
+#[derive(Default)]
+pub(crate) struct Transcript {
+    messages: Vec<AgentMessage>,
+    shared: Option<Arc<[Arc<AgentMessage>]>>,
+}
+
+impl Transcript {
+    /// The transcript as shared handles, copied once and handed out again until the transcript
+    /// changes. pi's nested call reads the live `agent.state.messages` array by reference; this is
+    /// the same thing without copying every message for every call.
+    fn shared(&mut self) -> Arc<[Arc<AgentMessage>]> {
+        let messages = &self.messages;
+        Arc::clone(
+            self.shared
+                .get_or_insert_with(|| messages.iter().cloned().map(Arc::new).collect()),
+        )
+    }
+}
+
+impl From<Vec<AgentMessage>> for Transcript {
+    fn from(messages: Vec<AgentMessage>) -> Self {
+        Self {
+            messages,
+            shared: None,
+        }
+    }
+}
+
+impl Deref for Transcript {
+    type Target = Vec<AgentMessage>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.messages
+    }
+}
+
+impl DerefMut for Transcript {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.shared = None;
+        &mut self.messages
+    }
+}
+
+/// What a nested tool call is shown of the agent: its system prompt and transcript, shared with
+/// every other call made against the same state ([`Agent::nested_context`](crate::Agent)).
+#[derive(Clone, Debug)]
+pub struct NestedContext {
+    pub system_prompt: Arc<str>,
+    pub messages: Arc<[Arc<AgentMessage>]>,
+}
+
 /// Live agent state (arch-02 §4.1). Mutated only by the loop's reducer ([`reduce`]) and the
 /// `Agent` setters; the state lock is never held across a subscriber `await`.
 pub(crate) struct StateInner {
     pub system_prompt: String,
+    /// The `system_prompt` a [`NestedContext`] last shared, kept while the prompt is unchanged.
+    pub shared_system_prompt: Option<Arc<str>>,
     /// `None` is pi's `Model | undefined` — a credential-less session's agent has NO model until
     /// `/model` selects one (agent-session.ts:890-892). Resolved to a `ModelRef` or
     /// `AgentError::NoModelSelected` at run start; never a sentinel address.
@@ -106,7 +165,7 @@ pub(crate) struct StateInner {
     /// request declares ([`ToolLoadout::advertised`]). Pi `agent.state.tools` plus the
     /// `_hiddenDeclarations` projection of it.
     pub tools: ToolLoadout,
-    pub messages: Vec<AgentMessage>,
+    pub messages: Transcript,
     pub streaming_message: Option<AgentMessage>,
     pub pending_tool_calls: HashSet<ToolCallId>,
     pub error_message: Option<String>,
@@ -129,6 +188,22 @@ pub(crate) struct StateInner {
 }
 
 impl StateInner {
+    /// The system prompt and transcript as shared handles; see [`Transcript::shared`].
+    pub(crate) fn nested_context(&mut self) -> NestedContext {
+        let prompt = match &self.shared_system_prompt {
+            Some(prompt) if **prompt == *self.system_prompt => Arc::clone(prompt),
+            _ => {
+                let prompt: Arc<str> = Arc::from(self.system_prompt.as_str());
+                self.shared_system_prompt = Some(Arc::clone(&prompt));
+                prompt
+            }
+        };
+        NestedContext {
+            system_prompt: prompt,
+            messages: self.messages.shared(),
+        }
+    }
+
     /// `is_streaming` is the run latch — the ONE run-in-flight fact (pi `AgentState.isStreaming`,
     /// set/cleared around `runWithLifecycle`, agent.ts:498/:530) — read by the caller from
     /// `running_rx`, because the latch lives on `Agent`, not here.
@@ -137,7 +212,7 @@ impl StateInner {
             system_prompt: self.system_prompt.clone(),
             model: self.model.clone(),
             thinking_level: self.thinking_level,
-            messages: self.messages.clone(),
+            messages: self.messages.to_vec(),
             tool_count: self.tools.executable().len(),
             is_streaming,
             streaming_message: self.streaming_message.clone(),

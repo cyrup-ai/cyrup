@@ -16,6 +16,7 @@
 
 mod dialog_options_timeout;
 mod ergonomic;
+mod guest_tool_surface;
 mod nested_calls;
 mod payload_fidelity;
 mod prelude_export_parity;

@@ -112,6 +112,17 @@ fn lower_tool_descriptor(d: &crate::descriptor::ToolDescriptor) -> types::ToolDe
             instructions: n.instructions.clone(),
         }),
         default_active: d.wire_default_active(),
+        // pi `ToolDefinition.outputSchema` / `annotations` / `prepareLoadout`
+        // (`extensions/types.ts:592`, `:603`, `:617` @v1.0.4); each omitted field lowers to `none`
+        // or `false`.
+        output_schema_json: d.output_schema.as_ref().map(Value::to_string),
+        annotations: d.annotations.map(|a| types::ToolAnnotations {
+            read_only_hint: a.read_only_hint,
+            destructive_hint: a.destructive_hint,
+            idempotent_hint: a.idempotent_hint,
+            open_world_hint: a.open_world_hint,
+        }),
+        prepare_loadout: d.prepare_loadout,
     }
 }
 
@@ -139,6 +150,9 @@ fn _lower_tool_descriptor_is_exhaustive(d: crate::descriptor::ToolDescriptor) {
         exposure: _,
         namespace: _,
         default_active: _,
+        output_schema: _,
+        annotations: _,
+        prepare_loadout: _,
     } = d;
 }
 
@@ -349,6 +363,32 @@ pub fn prepare_arguments(name: String, args_json: String) -> Option<String> {
     .map(|v| v.to_string())
 }
 
+/// `prepare-loadout` export body (CODE-015; pi `ToolDefinition.prepareLoadout`,
+/// `extensions/types.ts:617` @v1.0.4).
+///
+/// Called by the host ONLY for a tool whose descriptor set `prepare_loadout`. `None` is pi's
+/// `undefined`: no changes. A loadout the host sent that does not parse is `err`, which the host
+/// reports and discards, as it does a hook that throws.
+pub fn prepare_loadout(name: String, loadout_json: String) -> Result<Option<String>, String> {
+    let loadout: crate::loadout::ToolLoadout = serde_json::from_str(&loadout_json)
+        .map_err(|e| format!("the loadout is not what world.wit promises: {e}"))?;
+    let late = LATE_TOOLS.with(|c| {
+        c.borrow()
+            .iter()
+            .find(|t| t.descriptor.name == name)
+            .and_then(|t| t.exec.prepare_loadout(&loadout))
+    });
+    let changes = match late {
+        Some(changes) => Some(changes),
+        None => API.with(|c| {
+            c.borrow()
+                .as_ref()
+                .and_then(|api| api.prepare_tool_loadout(&name, &loadout))
+        }),
+    };
+    Ok(changes.and_then(|c| serde_json::to_string(&c).ok()))
+}
+
 /// `execute-tool` export body (R-08-015).
 pub fn run_tool(
     name: String,
@@ -377,6 +417,7 @@ pub fn run_tool(
         details_json: out.details.map(|d| d.to_string()),
         is_error: out.is_error,
         terminate: out.terminate,
+        structured_content_json: out.structured_content.map(|v| v.to_string()),
     })
 }
 

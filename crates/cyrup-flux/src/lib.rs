@@ -46,7 +46,7 @@ pub mod state;
 
 use std::ffi::OsString;
 use std::path::Path;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 /// The subagent-child signal, mirroring
 /// `cyrup_ext_subagents::spawn::nested_events::CHILD_ENV` (`nested_events.rs:35`). Declared
@@ -71,7 +71,7 @@ pub fn flux_extension(agent_dir: &Path) -> Arc<extension::FluxExtension> {
 pub fn flux_extension_with_root(root: resources::BundledRoot) -> Arc<extension::FluxExtension> {
     Arc::new(extension::FluxExtension {
         id: cyrup_core::ExtensionId::from("cyrup-flux"),
-        host_services: Arc::new(OnceLock::new()),
+        host_services: Arc::new(cyrup_ext::host::HostServicesSlot::new()),
         root,
     })
 }

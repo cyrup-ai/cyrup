@@ -218,6 +218,12 @@ pub fn apply_child_event_to_step(
     now: i64,
 ) {
     use crate::exec::ndjson::SubagentEvent;
+    // [CYRUP-DELTA] A nested `codemode` call only counts as activity (below the match arms); it is
+    // not one of the model's tool calls. See `SubagentEvent::is_nested`.
+    if event.is_nested() {
+        step.telemetry.last_activity_at = Some(now);
+        return;
+    }
     match event {
         SubagentEvent::ToolExecutionStart {
             tool_name, args, ..
@@ -395,5 +401,49 @@ fn extract_event_text(value: &serde_json::Value) -> String {
             out
         }
         _ => String::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+
+    fn parse(line: &str) -> crate::exec::ndjson::SubagentEvent {
+        crate::exec::ndjson::parse_line(line).expect("fixture line parses")
+    }
+
+    /// A background step's telemetry describes the model's own tool calls: a nested call is
+    /// activity (it bumps `lastActivityAt`) but is not counted and does not displace the running
+    /// call.
+    #[test]
+    fn a_nested_call_bumps_activity_but_not_the_step_tool_telemetry() {
+        let mut step = StepStatus::pending("worker");
+        apply_child_event_to_step(
+            &mut step,
+            &parse(
+                r#"{"type":"tool_execution_start","toolCallId":"c1","toolName":"codemode","args":{}}"#,
+            ),
+            10,
+        );
+        apply_child_event_to_step(
+            &mut step,
+            &parse(
+                r#"{"type":"tool_execution_start","toolCallId":"c1/1","toolName":"bash","args":{},"parentToolCallId":"c1"}"#,
+            ),
+            20,
+        );
+        apply_child_event_to_step(
+            &mut step,
+            &parse(
+                r#"{"type":"tool_execution_end","toolCallId":"c1/1","toolName":"bash","result":"x","isError":false,"parentToolCallId":"c1"}"#,
+            ),
+            30,
+        );
+        assert_eq!(step.telemetry.tool_count, Some(1));
+        assert_eq!(step.telemetry.current_tool.as_deref(), Some("codemode"));
+        assert!(step.telemetry.recent_tools.is_empty());
+        assert_eq!(step.telemetry.last_activity_at, Some(30));
     }
 }

@@ -432,6 +432,11 @@ impl LiveProgressFold {
         let Some(event) = parse_line(raw) else {
             return false;
         };
+        // [CYRUP-DELTA] A nested `codemode` call is not progress of the model's own; see
+        // `SubagentEvent::is_nested`.
+        if event.is_nested() {
+            return false;
+        }
         match &event {
             SubagentEvent::ToolExecutionStart {
                 tool_name, args, ..
@@ -1240,5 +1245,29 @@ mod tests {
             plain.iter().any(|l| l.contains("planner")),
             "widget row must name the agent: {plain:?}"
         );
+    }
+
+    #[test]
+    fn a_nested_call_is_not_progress_of_the_fold() {
+        let mut fold = LiveProgressFold::new(Some("worker".to_string()));
+        assert!(fold.record_line(&tool_start("c1", "codemode")));
+        let nested_start = serde_json::json!({
+            "type": "tool_execution_start", "toolCallId": "c1/1", "toolName": "bash",
+            "args": {}, "parentToolCallId": "c1"
+        })
+        .to_string();
+        let nested_end = serde_json::json!({
+            "type": "tool_execution_end", "toolCallId": "c1/1", "toolName": "bash",
+            "result": "x", "isError": false, "parentToolCallId": "c1"
+        })
+        .to_string();
+        assert!(
+            !fold.record_line(&nested_start),
+            "a nested start repaints nothing"
+        );
+        assert!(!fold.record_line(&nested_end));
+        let snap = fold.snapshot(LiveProgressStatus::Running);
+        assert_eq!(snap.tool_count, 1);
+        assert_eq!(snap.current_tool.as_deref(), Some("codemode"));
     }
 }

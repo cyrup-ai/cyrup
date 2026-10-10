@@ -435,7 +435,7 @@ fn a_guest_built_before_the_cache_warming_export_is_refused() {
          typed `ExtError::WorldVersion` — which is only possible because HOST_WORLD moved with the \
          WIT package line: {err:?}"
     );
-    assert_eq!(crate::HOST_WORLD, "cyrup:ext@0.19");
+    assert_eq!(crate::HOST_WORLD, "cyrup:ext@0.20");
 }
 
 // ---------------------------------------------------------------------------

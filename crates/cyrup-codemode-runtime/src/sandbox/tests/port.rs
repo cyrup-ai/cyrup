@@ -310,7 +310,10 @@ mod script_execution {
     #[tokio::test]
     async fn reports_a_non_serializable_return_value_as_a_script_error() {
         let sandbox = sandbox(vec![]);
-        let result = run(&sandbox, "return 10n").await;
+        // [CYRUP-DELTA] Upstream's case returns `10n`, which `JSON.stringify` refuses; here a BigInt
+        // is returned as its decimal digits (see `contract`), so the value that cannot be
+        // serialized is a cycle. It is still the script's TypeError, as upstream's.
+        let result = run(&sandbox, "const a = {}; a.self = a; return a").await;
         let error = error(&result);
         assert_eq!(error.kind, ErrorKind::Script);
         assert_eq!(error.name.as_deref(), Some("TypeError"));
@@ -512,7 +515,9 @@ mod tools {
             async move {
                 let result = run(sandbox, &format!("return {expression};")).await;
                 match &result {
-                    CodemodeResult::Completed { value, .. } => value.clone().unwrap(),
+                    CodemodeResult::Completed { value, .. } => {
+                        value.as_ref().unwrap().to_value().unwrap()
+                    }
                     CodemodeResult::Failed { error, .. } => json!(error.message),
                 }
             }
@@ -592,16 +597,11 @@ mod store_and_load {
             },
         )
         .await;
-        let CodemodeResult::Completed {
-            value,
-            store_writes,
-            ..
-        } = &result
-        else {
+        let CodemodeResult::Completed { store_writes, .. } = &result else {
             panic!("{result:#?}");
         };
         // undefined array elements become null in the JSON round trip of the return value.
-        assert_eq!(*value, Some(json!([41, 42, null, null])));
+        assert_eq!(value(&result), Some(json!([41, 42, null, null])));
         assert_eq!(store_writes.set.get("counter"), Some(&json!(42)));
         assert_eq!(store_writes.set.get("list"), Some(&json!([1, {"a": null}])));
         assert_eq!(store_writes.set.len(), 2);
@@ -623,15 +623,10 @@ mod store_and_load {
             },
         )
         .await;
-        let CodemodeResult::Completed {
-            value,
-            store_writes,
-            ..
-        } = &result
-        else {
+        let CodemodeResult::Completed { store_writes, .. } = &result else {
             panic!("{result:#?}");
         };
-        assert_eq!(*value, Some(json!([1, 1])));
+        assert_eq!(value(&result), Some(json!([1, 1])));
         assert_eq!(store_writes.set.get("kept"), Some(&json!({"b": 1})));
     }
 

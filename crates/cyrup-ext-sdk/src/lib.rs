@@ -16,6 +16,8 @@
 //!   `ui_prompt_end` — and `agent_start` carries none).
 //! - [`ctx`] — [`Ctx`]/[`CommandCtx`]/[`Ui`]/[`Session`]/[`Models`] capability wrappers.
 //! - [`descriptor`] — tool/command/flag/provider descriptors.
+//! - [`loadout`] — the [`ToolLoadout`] a tool's `prepare_loadout` hook reads and the
+//!   [`ToolLoadoutChanges`] it answers with.
 //! - [`tool_factory`] — [`define_tool`], plus the `bash`/`read`/`write` descriptor builders
 //!   ([`tool_factory::bash_descriptor`]/[`read_descriptor`](tool_factory::read_descriptor)/[`write_descriptor`](tool_factory::write_descriptor)),
 //!   which are NOT re-exported at the crate root.
@@ -54,6 +56,7 @@ pub mod ctx;
 pub mod descriptor;
 pub mod events;
 pub mod example;
+pub mod loadout;
 pub mod macros;
 pub mod provider;
 pub mod tool_factory;
@@ -86,10 +89,11 @@ pub use descriptor::{
     DialogOptions, ExecMode, ExecOptions, FailedRequest, FlagSpec, ForkOptions, ForkPosition,
     GrammarVariants, ModelCost, ModelCostTier, ModelRoute, ModelRouteRequest, NavigateOptions,
     NewSessionOptions, ProviderConfig, ProviderModelConfig, RenderShell, RoutedModel,
-    SendUserMessageOptions, StrictSampling, SwitchSessionOptions, ToolDescriptor, ToolExposure,
-    ToolNamespace, VirtualModelSpec,
+    SendUserMessageOptions, StrictSampling, SwitchSessionOptions, ToolAnnotations, ToolDescriptor,
+    ToolExposure, ToolNamespace, VirtualModelSpec,
 };
 pub use events::*;
+pub use loadout::{LoadoutTool, ToolLoadout, ToolLoadoutChanges};
 pub use provider::{
     OAuthCallbacks, OAuthCredentials, OAuthProvider, ProviderHandlers, ProviderStream, StreamSimple,
 };
@@ -125,10 +129,11 @@ pub mod prelude {
         DeliverAs, DialogOptions, ExecMode, ExecOptions, FailedRequest, FlagSpec, ForkOptions,
         ForkPosition, GrammarVariants, ModelCost, ModelCostTier, ModelRoute, ModelRouteRequest,
         NavigateOptions, NewSessionOptions, ProviderConfig, ProviderModelConfig, RenderShell,
-        RoutedModel, SendUserMessageOptions, StrictSampling, SwitchSessionOptions, ToolDescriptor,
-        ToolExposure, ToolNamespace, VirtualModelSpec,
+        RoutedModel, SendUserMessageOptions, StrictSampling, SwitchSessionOptions, ToolAnnotations,
+        ToolDescriptor, ToolExposure, ToolNamespace, VirtualModelSpec,
     };
     pub use crate::events::*;
+    pub use crate::loadout::{LoadoutTool, ToolLoadout, ToolLoadoutChanges};
     pub use crate::provider::{
         OAuthCallbacks, OAuthCredentials, OAuthProvider, ProviderHandlers, ProviderStream,
         StreamSimple,

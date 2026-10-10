@@ -23,6 +23,28 @@ struct ReadInput {
     limit: Option<f64>,
 }
 
+/// The largest file `read` takes into memory: V8's maximum string length, `0x1fffffe8` (536,870,888)
+/// UTF-16 code units.
+///
+/// Pi's text branch is `buffer.toString("utf-8")` (read.ts, `const textContent` @v1.0.4), and Node
+/// 22 refuses to build a string past that length with `ERR_STRING_TOO_LONG` ("Cannot create a
+/// string longer than 0x1fffffe8 characters"; checked against Node 22.22.2 with a 600 MB file), so
+/// no larger ASCII text file has ever been readable through Pi's `read`. cyrup keeps the whole file as bytes while it windows it
+/// and has no such ceiling of its own, so one `read` of a multi-gigabyte file, or of a device that
+/// never ends, grew the host until it ran out of memory (the sandbox's limits bound the script, not
+/// the host work its tool calls trigger). Judged in bytes, because the size is known before the
+/// text is decoded.
+///
+/// [CYRUP-DELTA] Pi's image branch has no string to build and reads a file of up to 2 GiB; here an
+/// image over this limit is refused as well. A 512 MiB image is not a screenshot or a photo any
+/// model accepts, and the decision between text and image is made on the bytes, after the read.
+pub(crate) const MAX_READ_BYTES: u64 = 0x1fff_ffe8;
+
+/// Node's `kIoMaxLength` (`2 ** 31 - 1`): `fs.readFile` rejects a regular file over this size with
+/// `ERR_FS_FILE_TOO_LARGE`, whose message is `File size (<bytes>) is greater than 2 GiB` (checked
+/// against Node 22: a 2 GiB sparse file is refused, one byte less is read).
+const NODE_IO_MAX_LENGTH: u64 = i32::MAX as u64;
+
 pub struct ReadTool {
     fs: Arc<dyn FsOps>,
     cwd: PathBuf,
@@ -30,6 +52,33 @@ pub struct ReadTool {
     params: serde_json::Value,
     /// Pi's `readOutputSchema` (`read.ts:33-36` @v1.1.0).
     output_schema: serde_json::Value,
+    /// The byte ceiling [`MAX_READ_BYTES`], a field so a test can pin the check with a small file.
+    max_read_bytes: u64,
+}
+
+/// Pi's `toReadOutput` (`read.ts:72-77` @v1.1.0): the first text block's text, or `""`; with an
+/// image block, that block and the text as its `note`.
+fn to_read_output(content: &[Content]) -> serde_json::Value {
+    let text = content
+        .iter()
+        .find_map(|block| match block {
+            Content::Text { text, .. } => Some(text.to_string()),
+            _ => None,
+        })
+        .unwrap_or_default();
+    let image = content.iter().find_map(|block| match block {
+        Content::Image { data, mime_type } => Some((data, mime_type)),
+        _ => None,
+    });
+    match image {
+        Some((data, mime_type)) => serde_json::json!({
+            "type": "image",
+            "data": data,
+            "mimeType": mime_type,
+            "note": text,
+        }),
+        None => serde_json::Value::String(text),
+    }
 }
 
 impl ReadTool {
@@ -73,32 +122,15 @@ impl ReadTool {
             opts,
             params,
             output_schema,
+            max_read_bytes: MAX_READ_BYTES,
         }
     }
-}
 
-/// Pi's `toReadOutput` (`read.ts:72-77` @v1.1.0): the first text block's text, or `""`; with an
-/// image block, that block and the text as its `note`.
-fn to_read_output(content: &[Content]) -> serde_json::Value {
-    let text = content
-        .iter()
-        .find_map(|block| match block {
-            Content::Text { text, .. } => Some(text.to_string()),
-            _ => None,
-        })
-        .unwrap_or_default();
-    let image = content.iter().find_map(|block| match block {
-        Content::Image { data, mime_type } => Some((data, mime_type)),
-        _ => None,
-    });
-    match image {
-        Some((data, mime_type)) => serde_json::json!({
-            "type": "image",
-            "data": data,
-            "mimeType": mime_type,
-            "note": text,
-        }),
-        None => serde_json::Value::String(text),
+    /// A tool that refuses files over `max_read_bytes` instead of [`MAX_READ_BYTES`].
+    #[cfg(test)]
+    pub(crate) fn with_max_read_bytes(mut self, max_read_bytes: u64) -> Self {
+        self.max_read_bytes = max_read_bytes;
+        self
     }
 }
 
@@ -153,9 +185,6 @@ impl Tool for ReadTool {
         crate::tools::prefer_strict_tool_sampling()
     }
 
-    /// TOOL-058 — pi's `.then((result) => ({ ...result, structuredContent: toReadOutput(result.content) }))`
-    /// (`read.ts:216` @v1.1.0): EVERY resolved read carries the structured half, whichever branch
-    /// produced it, and a failure rejects before it exists.
     async fn execute(
         &self,
         _call_id: ToolCallId,
@@ -163,6 +192,9 @@ impl Tool for ReadTool {
         cancel: CancelToken,
         _on_update: ToolUpdateSink,
     ) -> Result<ToolResult, ToolError> {
+        // TOOL-058 — pi's `.then((result) => ({ ...result, structuredContent: toReadOutput(result.content) }))`
+        // (`read.ts:216` @v1.1.0): EVERY resolved read carries the structured half, whichever branch
+        // produced it, and a failure rejects before it exists.
         let mut result = self.read_file(params, cancel).await?;
         result.structured_content = Some(to_read_output(&result.content));
         Ok(result)
@@ -237,6 +269,9 @@ impl ReadTool {
             return Err(error::aborted());
         }
 
+        // What `ops.readFile` would refuse or never finish, refused before a byte is read.
+        self.check_readable(&abs, &cancel).await?;
+
         // Read through the (remote-aware) seam, then decide text-vs-image by MAGIC BYTES — Pi
         // sniffs the file header (read.ts:243 → mime.ts), not the extension.
         let bytes = self.read_cancellable(&abs, &cancel).await?;
@@ -259,13 +294,18 @@ impl ReadTool {
             return Ok(result);
         }
 
-        // Text branch (R-03-011).
-        let text = String::from_utf8_lossy(&bytes).into_owned();
+        // Text branch (R-03-011). The bytes become the string without a copy when they are valid
+        // UTF-8, so a file near [`MAX_READ_BYTES`] is held once here, not twice.
+        let text = match String::from_utf8(bytes) {
+            Ok(text) => text,
+            Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
+        };
         // Pi's basis is `allLines.length` — the raw `split("\n")` count, which INCLUDES the empty
         // phantom element after a trailing newline (read.ts:268-269). Do not pop it: the offset
         // bound, the `of N` continuation count, and the out-of-bounds error all key off this count.
-        let lines: Vec<&str> = text.split('\n').collect();
-        let total = lines.len();
+        // Counted rather than collected: a `Vec<&str>` of every line costs 16 bytes per line, which
+        // for a file of blank lines is sixteen times the file.
+        let total = text.bytes().filter(|&b| b == b'\n').count() + 1;
 
         // Pi: `const startLine = offset ? Math.max(0, offset - 1) : 0` (read.ts:271). `offset` is a
         // JS float: a falsy `0` and a negative both land on `0` via the `Math.max`, and `NaN`
@@ -297,14 +337,11 @@ impl ReadTool {
             Some(l) => crate::jsnum::to_count(start as f64 + l).clamp(start, total),
             None => total,
         };
-        let window: Vec<&str> = lines
-            .get(start..end)
-            .map(<[&str]>::to_vec)
-            .unwrap_or_default();
-        let window_text = window.join("\n");
+        // `allLines.slice(start, end).join("\n")`, as the slice of `text` it is.
+        let window_text = lines_window(&text, start, end, total);
 
         let t = truncate_head(
-            &window_text,
+            window_text,
             TruncOpts::new(self.opts.max_lines, self.opts.max_bytes),
         );
 
@@ -313,7 +350,7 @@ impl ReadTool {
             // truncation is attached as `details`, so the model gets an actionable result, not an
             // `isError` failure. `firstLineSize` is the byte length of the first selected line.
             let line_no = start + 1;
-            let first_line_bytes = window.first().map_or(0, |l| l.len());
+            let first_line_bytes = window_text.split('\n').next().map_or(0, str::len);
             // Pi hardcodes `formatSize(DEFAULT_MAX_BYTES)` and `head -c ${DEFAULT_MAX_BYTES}` here
             // (read.ts:293), independent of any configured limit. Use the fixed constant.
             let out = format!(
@@ -381,7 +418,7 @@ impl ReadTool {
             None
         };
         // Pi's `if (aborted) return;` immediately before `resolve` (read.ts:325). The `split('\n')`,
-        // the window `join`, `truncate_head` and the continuation-notice formatting above are all
+        // the window slice, `truncate_head` and the continuation-notice formatting above are all
         // CPU work over a file that may be tens of megabytes, so this is a real window, not a
         // formality.
         if cancel.is_cancelled() {
@@ -392,6 +429,66 @@ impl ReadTool {
             details,
             ..Default::default()
         })
+    }
+}
+
+impl ReadTool {
+    /// Refuse, before a byte is read, what `ops.readFile` would refuse or never finish.
+    ///
+    /// **Regular files over [`Self::max_read_bytes`].** The size comes from the backend's
+    /// `metadata`. Over 2 GiB the message is Node's own, `File size (<bytes>) is greater than
+    /// 2 GiB`, which `fs.readFile` raises as `ERR_FS_FILE_TOO_LARGE`.
+    ///
+    /// **Anything that is neither a regular file nor a directory** (a character or block device, a
+    /// FIFO, a socket). [CYRUP-DELTA] Node's `readFile` opens `/dev/zero` and reads until the
+    /// process runs out of memory, and opens a FIFO and waits for a writer; here the model gets a
+    /// one-line error instead of a host that grows by gigabytes a second (the memory limits of a
+    /// codemode sandbox bound the script, not the host work its `tools.read` calls trigger). A
+    /// directory is let through so it still fails the way it always has, at the read.
+    ///
+    /// A backend that cannot answer `metadata` (an RPC filesystem without it) is not an error
+    /// here: `ops.access` already vouched for the path, and the drain in
+    /// [`Self::read_cancellable`] enforces the same byte limit on whatever arrives.
+    async fn check_readable(
+        &self,
+        abs: &std::path::Path,
+        cancel: &CancelToken,
+    ) -> Result<(), ToolError> {
+        let Some(stat) = cancel.run_until_cancelled(self.fs.metadata(abs)).await else {
+            return Err(error::aborted());
+        };
+        let Ok(meta) = stat else {
+            return Ok(());
+        };
+        if !meta.is_file && !meta.is_dir {
+            return Err(error::invalid(format!(
+                "Cannot read {}: it is not a regular file (a device, pipe or socket)",
+                error::show(abs)
+            )));
+        }
+        if meta.is_file && meta.len > self.max_read_bytes {
+            return Err(self.too_large(Some(meta.len)));
+        }
+        Ok(())
+    }
+
+    /// The error for a file past the limit: `len` is its size when `stat` said, `None` when the
+    /// stream outran the limit without ever announcing a size.
+    fn too_large(&self, len: Option<u64>) -> ToolError {
+        match len {
+            // `ERR_FS_FILE_TOO_LARGE`, verbatim (`File size (%s) is greater than 2 GiB`).
+            Some(len) if len > NODE_IO_MAX_LENGTH => {
+                error::invalid(format!("File size ({len}) is greater than 2 GiB"))
+            }
+            _ => {
+                let limit = format_size(usize::try_from(self.max_read_bytes).unwrap_or(usize::MAX));
+                let size = len.map_or_else(String::new, |len| format!(" ({len})"));
+                error::invalid(format!(
+                    "File size{size} is greater than the {limit} limit for read. \
+                     Use bash (head, tail, sed -n or grep) to look at part of it."
+                ))
+            }
+        }
     }
 
     /// Faithful port of Pi's image read path (read.ts:247-263). The model-facing note is
@@ -441,7 +538,11 @@ impl ReadTool {
         let reader = opened?;
 
         let token = cancel.clone();
-        let drain = tokio::task::spawn_blocking(move || read_to_end_cancellable(reader, &token));
+        // A limit that does not fit `usize` (a 32-bit host) is no limit the address space could
+        // reach anyway.
+        let limit = usize::try_from(self.max_read_bytes).unwrap_or(usize::MAX);
+        let drain =
+            tokio::task::spawn_blocking(move || read_to_end_cancellable(reader, &token, limit));
 
         // Dropping `drain` here DETACHES the blocking task rather than killing it; that is
         // acceptable only because the closure holds the same token and returns within one buffer
@@ -454,6 +555,9 @@ impl ReadTool {
             Ok(Ok(bytes)) => Ok(bytes),
             // The token fired between two buffer fills: report Pi's abort, not a raw I/O error.
             Ok(Err(e)) if Cancelled::is(&e) => Err(error::aborted()),
+            // A stream that was longer than `stat` said, or whose length `stat` never knew. The
+            // buffer stopped at the limit; the rest of the file was not read.
+            Ok(Err(e)) if e.kind() == std::io::ErrorKind::FileTooLarge => Err(self.too_large(None)),
             // A genuine backend failure keeps the shape `LocalFs::read` produced before this
             // change: `"{resolved path}: {io error}"`.
             Ok(Err(e)) => Err(error::io(&error::show(abs), &e)),
@@ -582,9 +686,40 @@ impl ReadTool {
     }
 }
 
+/// `text.split('\n').collect::<Vec<_>>()[start..end].join("\n")` (Pi's
+/// `allLines.slice(startLine, endLine).join("\n")`, read.ts), as the slice of `text` it is, so the
+/// window costs no allocation however many lines `text` has. `total` is the number of `split('\n')`
+/// items, and `start <= end <= total`.
+///
+/// The join of consecutive `split('\n')` items is exactly the bytes between the newline that opens
+/// line `start` and the newline that closes line `end - 1`; both are ASCII, so both offsets fall on
+/// character boundaries.
+fn lines_window(text: &str, start: usize, end: usize, total: usize) -> &str {
+    if end <= start {
+        return "";
+    }
+    // Where line `n` begins: just past the `n`-th newline.
+    let line_start = |n: usize| match n.checked_sub(1) {
+        None => 0,
+        Some(newlines_before) => text
+            .match_indices('\n')
+            .nth(newlines_before)
+            .map_or(text.len(), |(at, _)| at + 1),
+    };
+    let from = line_start(start);
+    // The window runs to the end of the text when it takes the last line, else up to (not
+    // including) the newline that precedes line `end`.
+    let to = if end >= total {
+        text.len()
+    } else {
+        line_start(end).saturating_sub(1)
+    };
+    text.get(from..to).unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::ReadTool;
+    use super::{ReadTool, lines_window};
     use crate::config::ReadOpts;
     use crate::ops::local::LocalFs;
     use cyrup_core::{ConstrainedSampling, ConstrainedSamplingConfig, StrictSampling, Tool};
@@ -605,5 +740,39 @@ mod tests {
                 }
             ))
         );
+    }
+
+    /// The text window is the slice of the file `split('\n')` + `slice` + `join('\n')` produces,
+    /// for every window of every shape of text: leading, trailing and doubled newlines, an empty
+    /// text, a multibyte character next to a newline.
+    #[test]
+    fn the_window_is_what_split_slice_join_would_give() {
+        let texts = [
+            "",
+            "\n",
+            "\n\n\n",
+            "a",
+            "a\n",
+            "\na",
+            "a\nb",
+            "a\nb\n",
+            "a\n\nb",
+            "\u{e9}\n\u{fc}\n",
+            "one\ntwo\nthree\nfour",
+        ];
+        for text in texts {
+            let lines: Vec<&str> = text.split('\n').collect();
+            let total = lines.len();
+            for start in 0..total {
+                for end in start..=total {
+                    let expected = lines.get(start..end).unwrap_or_default().join("\n");
+                    assert_eq!(
+                        lines_window(text, start, end, total),
+                        expected,
+                        "text {text:?} window {start}..{end} of {total}"
+                    );
+                }
+            }
+        }
     }
 }

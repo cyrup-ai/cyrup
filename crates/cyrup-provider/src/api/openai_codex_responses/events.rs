@@ -2,13 +2,14 @@
 
 use super::{CODEX_RESPONSE_STATUSES, FrameStream};
 use crate::api::EventSink;
-use crate::api::openai_responses::{EndTurnCell, decode_stream_with_end_turn};
+use crate::api::openai_responses::{DecodeOptions, EndTurnCell, decode_stream_with_options};
 use crate::error::ProviderError;
 use crate::model::Model;
 use crate::stream::sse::SseFrame;
 use cyrup_core::ApiId;
 use futures::StreamExt;
 use serde_json::{Value, json};
+use std::collections::HashMap;
 
 /// The outcome of mapping one Codex SSE event (pi `mapCodexEvents`, `:721-752`).
 #[derive(Debug, PartialEq, Eq)]
@@ -146,13 +147,18 @@ struct MapState {
 pub(super) async fn decode_codex_stream(
     frames: FrameStream,
     request_service_tier: Option<String>,
+    grammar_inputs: HashMap<String, String>,
     model: &Model,
     api: &ApiId,
     sink: &EventSink,
 ) {
     let end_turn = EndTurnCell::default();
     let mapped = map_codex_frames(frames, request_service_tier, end_turn.clone());
-    decode_stream_with_end_turn(mapped, model, api, sink, Some(end_turn)).await;
+    let options = DecodeOptions {
+        end_turn: Some(end_turn),
+        grammar_inputs,
+    };
+    decode_stream_with_options(mapped, model, api, sink, options).await;
 }
 
 /// Apply [`map_codex_event`] across an SSE frame stream (pi's `mapCodexEvents` generator wrapped
