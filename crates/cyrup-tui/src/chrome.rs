@@ -169,15 +169,37 @@ pub const APP_WORDMARK: &str = "Cyrup";
 /// `theme.bold(theme.fg("accent", APP_NAME)) + theme.fg("dim", " v{version}")`, which is also the
 /// form `TUI-018`'s **Fix** asks for.
 pub fn logo_line(theme: &UiTheme) -> Line<'static> {
-    Line::from(vec![
-        Span::styled(
-            APP_WORDMARK,
-            theme.accent_style().add_modifier(Modifier::BOLD),
-        ),
+    let mut spans = vec![Span::styled(
+        APP_WORDMARK,
+        theme.accent_style().add_modifier(Modifier::BOLD),
+    )];
+    // [CYRUP-DELTA] — pi always renders its version beside the wordmark, because pi HAS a version.
+    // cyrup's workspace version is still the cargo placeholder `0.0.0` (root `Cargo.toml`), and
+    // `Cyrup v0.0.0` as the first thing a user sees reads as a broken build rather than as an
+    // unreleased one. The version span is therefore omitted while the version is that placeholder,
+    // and appears by itself the moment the workspace carries a real one — no further change needed.
+    //
+    // This is the same `0.0.0` that `TUI-011` is held OPEN on (its "What's New" notice has no
+    // version to compare against), so the two rows now agree about it instead of one shipping what
+    // the other calls a blocker.
+    if !is_placeholder_version(APP_VERSION) {
         // Unstyled, per `:1016` — the space sits between the two spans, not inside the dim one.
-        Span::raw(" "),
-        Span::styled(concat!("v", env!("CARGO_PKG_VERSION")), theme.dim_style()),
-    ])
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(format!("v{APP_VERSION}"), theme.dim_style()));
+    }
+    Line::from(spans)
+}
+
+/// The crate version the header would show, as a value rather than a macro, so a test can assert
+/// BOTH branches of [`logo_line`] instead of deriving its expectation from the same `env!` the code
+/// reads — which is how the version half of an assertion becomes unfailable.
+pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// `true` for cargo's unset-version placeholder. Kept a named predicate so the reason is greppable
+/// from both the header and the ledger row that cites it.
+#[must_use]
+pub fn is_placeholder_version(version: &str) -> bool {
+    version == "0.0.0"
 }
 
 /// pi's `expandedInstructions` — the nineteen hints the header carries when it is EXPANDED

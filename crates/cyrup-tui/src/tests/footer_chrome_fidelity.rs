@@ -73,6 +73,17 @@ const MUTED_DARK: Color = Color::Rgb(0x9d, 0xa5, 0xa9);
 /// (the only one that turns yellow/red) never rendered.
 ///
 /// FAILS before the fix: a fresh footer drew no `%/` at all.
+/// The logo line's text as it actually renders. [CYRUP-DELTA] the version span is omitted while
+/// the workspace version is cargo's `0.0.0` placeholder (`chrome::logo_line`), so asserting
+/// `Cyrup v0.0.0` here would pin text no user should ever see.
+fn logo_label() -> String {
+    if crate::chrome::is_placeholder_version(crate::chrome::APP_VERSION) {
+        "Cyrup".to_string()
+    } else {
+        format!("Cyrup v{}", crate::chrome::APP_VERSION)
+    }
+}
+
 #[test]
 fn c1_context_segment_renders_even_when_nothing_ever_set_it() {
     let mut app = app(100, 12);
@@ -966,7 +977,7 @@ fn c10_c13_startup_hint_block_is_framed_inset_and_names_the_expand_key() {
     let logo = row_text(&app, hints - 1);
     assert_eq!(
         logo.trim_end(),
-        format!(" Cyrup v{}", env!("CARGO_PKG_VERSION")),
+        format!(" {}", logo_label()),
         "the logo line opens the body, inset by paddingX 1 like every row"
     );
 
@@ -1031,10 +1042,16 @@ fn c13_short_terminal_gives_up_the_edges_and_keeps_the_hint_bar() {
 
     // TUI-018 put the logo/version row at `drop_rank` 1 — second-to-last to go, behind only the
     // bar — because the version is the one thing a bug report always asks for. So from two rows up
-    // it is the bar plus the version, and the prose lines come back only above that.
+    // it is the bar plus the logo row, and the prose lines come back only above that.
+    //
+    // [CYRUP-DELTA] two things about that rank are cyrup's judgement, not pi's, and are recorded on
+    // the TUI-018 row: (1) the rank ORDER itself, which means a two-row budget shows the logo
+    // rather than the actionable `Press ctrl+o…` hint; (2) while the workspace version is the
+    // `0.0.0` placeholder the row carries only the wordmark, so the "a bug report asks for the
+    // version" rationale does not apply yet — it starts applying the day the workspace is versioned.
     let two = render(2);
     assert!(
-        two[0].contains(&format!("Cyrup v{}", env!("CARGO_PKG_VERSION"))),
+        two[0].contains(&logo_label()),
         "the logo/version row outranks both onboarding lines: {two:?}"
     );
     assert!(
@@ -1043,7 +1060,7 @@ fn c13_short_terminal_gives_up_the_edges_and_keeps_the_hint_bar() {
     );
 
     let three = render(3);
-    assert!(three[0].contains("Cyrup v"), "three rows: {three:?}");
+    assert!(three[0].contains(&logo_label()), "three rows: {three:?}");
     assert!(
         three[1].contains("escape interrupt"),
         "three rows: {three:?}"
@@ -1057,7 +1074,7 @@ fn c13_short_terminal_gives_up_the_edges_and_keeps_the_hint_bar() {
     // `onboarding` — the two outermost rows go before any text does.
     let five = render(5);
     assert!(
-        five[0].contains("Cyrup v"),
+        five[0].contains(&logo_label()),
         "both Spacers go before any text at five rows: {five:?}"
     );
     assert!(
@@ -1071,11 +1088,11 @@ fn c13_short_terminal_gives_up_the_edges_and_keeps_the_hint_bar() {
         six[0].trim().is_empty(),
         "leading Spacer survives at six rows: {six:?}"
     );
-    assert!(six[1].contains("Cyrup v"), "six rows: {six:?}");
+    assert!(six[1].contains(&logo_label()), "six rows: {six:?}");
 
     // Four gives up `onboarding` as well, leaving the body's inner blank as the tail.
     let four = render(4);
-    assert!(four[0].contains("Cyrup v"), "four rows: {four:?}");
+    assert!(four[0].contains(&logo_label()), "four rows: {four:?}");
     assert!(four[1].contains("escape interrupt"), "four rows: {four:?}");
     assert!(
         four[3].trim().is_empty(),

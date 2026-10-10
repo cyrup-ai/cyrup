@@ -183,9 +183,17 @@ fn truncate_word_wraps_and_measures_in_columns_not_chars() {
 // of its branches. cyrup drew neither the logo line nor an expanded body, and said so in
 // `chrome.rs`'s own words.
 
-/// The version string as the logo line spells it, so a bump cannot silently stale the tests.
+/// The logo line's text as it actually renders, so a version bump cannot silently stale the tests
+/// AND a placeholder version is not asserted as shipped text.
+///
+/// [CYRUP-DELTA] while the workspace version is cargo's `0.0.0` placeholder the version span is
+/// omitted entirely (`chrome::logo_line`), so the label is the bare wordmark.
 fn version_label() -> String {
-    format!("Cyrup v{}", env!("CARGO_PKG_VERSION"))
+    if crate::chrome::is_placeholder_version(crate::chrome::APP_VERSION) {
+        "Cyrup".to_string()
+    } else {
+        format!("Cyrup v{}", crate::chrome::APP_VERSION)
+    }
 }
 
 fn hint_lines(width: u16, expanded: bool) -> Vec<String> {
@@ -257,21 +265,7 @@ fn the_startup_header_opens_with_the_wordmark_and_the_crate_version() {
     // The dim span covers `v{version}` and NOT the space before it (`:1016`).
     let logo = crate::logo_line(&theme);
     let texts: Vec<&str> = logo.spans.iter().map(|s| s.content.as_ref()).collect();
-    assert_eq!(
-        texts,
-        vec!["Cyrup", " ", concat!("v", env!("CARGO_PKG_VERSION"))],
-        "three spans: mark, plain space, dim version"
-    );
-    assert_eq!(
-        logo.spans[2].style,
-        theme.dim_style(),
-        "`theme.fg(\"dim\", `v${{version}}`)` (`:1016`)"
-    );
-    assert_ne!(
-        logo.spans[1].style,
-        theme.dim_style(),
-        "the space is OUTSIDE the dim span (`:1016`), so it must not carry dim"
-    );
+    assert_eq!(texts[0], "Cyrup", "the wordmark is always the first span");
     assert_eq!(
         logo.spans[0].style,
         theme
@@ -279,6 +273,48 @@ fn the_startup_header_opens_with_the_wordmark_and_the_crate_version() {
             .add_modifier(ratatui::style::Modifier::BOLD),
         "[CYRUP-DELTA] bold accent stands in for pi's fixed brand RGB (`pi-logo.ts:4-6`, :37-39)"
     );
+
+    // [CYRUP-DELTA] the version span is omitted while the workspace version is cargo's `0.0.0`
+    // placeholder, because `Cyrup v0.0.0` reads as a broken build to the user who sees it first.
+    // Which branch is live depends on the workspace version, so BOTH are asserted here — deriving
+    // the expectation from the same `env!` the code reads would make this half unfailable.
+    if crate::chrome::is_placeholder_version(crate::chrome::APP_VERSION) {
+        assert_eq!(
+            texts.len(),
+            1,
+            "a placeholder version shows the wordmark ALONE, no `v0.0.0`: {texts:?}"
+        );
+    } else {
+        assert_eq!(texts.len(), 3, "mark, plain space, dim version: {texts:?}");
+        assert_eq!(texts[1], " ");
+        assert!(
+            texts[2].starts_with('v') && texts[2].len() > 1,
+            "the version span is `v` plus a real version: {:?}",
+            texts[2]
+        );
+        assert_eq!(
+            logo.spans[2].style,
+            theme.dim_style(),
+            "`theme.fg(\"dim\", `v${{version}}`)` (`:1016`)"
+        );
+        assert_ne!(
+            logo.spans[1].style,
+            theme.dim_style(),
+            "the space is OUTSIDE the dim span (`:1016`), so it must not carry dim"
+        );
+    }
+}
+
+/// The placeholder predicate itself, both ways — the gate above is only as good as this.
+#[test]
+fn the_placeholder_version_predicate_matches_only_cargos_unset_default() {
+    assert!(crate::chrome::is_placeholder_version("0.0.0"));
+    for real in ["0.1.0", "1.0.0", "0.0.1", "0.0.0-rc1", "10.2.3"] {
+        assert!(
+            !crate::chrome::is_placeholder_version(real),
+            "{real} is a real version and its span must render"
+        );
+    }
 }
 
 /// **The row arithmetic.** `withLogo` makes the collapsed body FIVE logical lines, framed by a
@@ -415,9 +451,12 @@ fn the_expanded_body_keeps_the_closing_onboarding_line_and_drops_the_compact_onb
 fn the_startup_header_wraps_rather_than_truncating_the_version_row() {
     let rows = hint_lines(12, false);
     let joined: String = rows.concat();
+    // With a real version this asserts the wrap; with the `0.0.0` placeholder there is no version
+    // span to wrap, so what must survive the narrow width is the wordmark. Either way the header
+    // must not CLIP, which is what the row below checks.
     assert!(
-        joined.contains(concat!("v", env!("CARGO_PKG_VERSION"))),
-        "the version wraps but is never clipped: {rows:?}"
+        joined.contains(version_label().trim()),
+        "the logo line wraps but is never clipped: {rows:?}"
     );
     for row in &rows {
         assert!(
