@@ -376,19 +376,42 @@ type NativeMap = RwLock<std::collections::HashMap<ExtensionId, Arc<dyn NativeExt
 #[cfg(feature = "wasm-host")]
 pub type LiveMap = RwLock<std::collections::HashMap<ExtensionId, Arc<crate::host::LiveExtension>>>;
 
-/// The host going away closes every model stream its guests left open (EXT-086).
+/// The host going away closes every model stream its guests left open (EXT-086), and then breaks
+/// the one reference cycle that would otherwise keep every loaded guest alive.
 ///
-/// It cannot be left to the instances' own drops: a loaded guest is NOT freed with its host. Its
-/// `GuestState` holds the shared registry, the registry holds the guest's `WasmTool`s, and each
-/// `WasmTool` holds the `LiveExtension` whose store holds that same `GuestState` — a cycle that
-/// predates model calls. A stream table that waited for that drop would keep paying for a provider
-/// request until the abandonment window ran out, so the host closes them itself.
+/// The streams are closed explicitly rather than left to the instances' own drops, because a
+/// stream table that waited for a drop would keep paying for a provider request for as long as
+/// anything else still holds the instance (a `WasmTool` a session kept, an in-flight call).
+///
+/// The cycle: a guest's `GuestState` holds the host's registry, the registry holds the guest's
+/// materialized `WasmTool`s, and each `WasmTool` holds the `LiveExtension` whose store holds that
+/// same `GuestState`. Left in place, dropping the host freed NONE of its guests — not the store,
+/// not its pooling-allocator instance slot, and not the Wasmtime `Engine` the store keeps a clone
+/// of, with its pooling reservations and async-stack guard pages: about 2,000 memory mappings per
+/// host, so a process that built and dropped ~30 hosts (the `cyrup-it` `ext` suite run in one
+/// process) ran into `vm.max_map_count` and aborted with "failed to set up alternative stack guard
+/// page" / "failed to protect stack guard page". The registry is private to this host, so taking
+/// the guests' tool handles out of it here strands nothing a caller could still reach; a
+/// `WasmTool` a caller DID keep still holds its instance, and frees it when that caller lets go.
+/// The provider-reduction edge back to the dispatcher is weak for the same reason (see
+/// [`DispatcherProviderReduction`]).
 #[cfg(feature = "wasm-host")]
 impl Drop for ExtensionHost {
     fn drop(&mut self) {
-        if let Ok(live) = self.live.read() {
-            for ext in live.values() {
-                ext.guest().model_streams().close_all();
+        let live: Vec<_> = match self.live.write() {
+            Ok(mut g) => g.drain().collect(),
+            Err(poisoned) => poisoned.into_inner().drain().collect(),
+        };
+        for (id, ext) in &live {
+            ext.guest().model_streams().close_all();
+            match self.registry.take_tool_handles(id) {
+                // Dropped here, with the registry lock already released.
+                Ok(handles) => drop(handles),
+                Err(e) => tracing::warn!(
+                    extension = %id,
+                    error = %e,
+                    "could not release a guest's tool handles at host teardown; its instance leaks"
+                ),
             }
         }
     }
@@ -2649,7 +2672,7 @@ impl ExtensionHost {
                 // @v0.84.1). Installed before `init` so a provider registered during `init` is
                 // never the one route whose requests are invisible.
                 .with_provider_reduction(Arc::new(DispatcherProviderReduction {
-                    dispatcher: self.dispatcher.clone(),
+                    dispatcher: Arc::downgrade(&self.dispatcher),
                 })),
         );
         let component = crate::host::LiveExtension::compile(wasm.engine(), bytes)?;
@@ -3322,20 +3345,28 @@ fn native_panic_msg(payload: Box<dyn std::any::Any + Send>) -> String {
 /// requests stop being invisible to every other extension — and, critically, so
 /// `before_provider_request`'s payload REPLACEMENT applies on that route, which is what keeps a
 /// redaction extension from leaking the moment the user switches model.
+///
+/// The dispatcher is held WEAKLY. Every guest's `GuestState` owns this reduction, and the dispatcher
+/// owns every guest's `Arc<LiveExtension>` (whose store owns that `GuestState`), so a strong edge
+/// here closed the cycle dispatcher -> `LiveExtension` -> store -> `GuestState` -> reduction ->
+/// dispatcher. That cycle kept every loaded guest's store, and through it the whole Wasmtime
+/// `Engine` and its pooling-allocator reservations (~2,000 mappings per host), alive after its
+/// host was dropped. Once the host is gone there is nobody left to reduce over, so a dead
+/// dispatcher answers as an empty one would: no replacement payload, no notification.
 #[cfg(feature = "wasm-host")]
 struct DispatcherProviderReduction {
-    dispatcher: Arc<Dispatcher>,
+    dispatcher: std::sync::Weak<Dispatcher>,
 }
 
 #[cfg(feature = "wasm-host")]
 #[async_trait::async_trait]
 impl crate::host::ProviderReduction for DispatcherProviderReduction {
     async fn before_provider_request(&self, from: &ExtensionId, payload: Value) -> Option<Value> {
+        let dispatcher = self.dispatcher.upgrade()?;
         let original = payload.clone();
         // The calling guest is suspended inside its own store; excluding it is the forced
         // divergence documented on `Dispatcher::dispatch_block_mutate_excluding`.
-        let reduced = self
-            .dispatcher
+        let reduced = dispatcher
             .dispatch_block_mutate_excluding(
                 crate::event::HostEvent::BeforeProviderRequest { payload },
                 &CancelToken::new(),
@@ -3360,7 +3391,10 @@ impl crate::host::ProviderReduction for DispatcherProviderReduction {
     }
 
     async fn after_provider_response(&self, from: &ExtensionId, status: u32, headers: Value) {
-        self.dispatcher
+        let Some(dispatcher) = self.dispatcher.upgrade() else {
+            return;
+        };
+        dispatcher
             .dispatch_notify_excluding(
                 &crate::event::HostEvent::AfterProviderResponse { status, headers },
                 &CancelToken::new(),

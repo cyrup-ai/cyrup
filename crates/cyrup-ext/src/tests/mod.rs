@@ -29,6 +29,8 @@ mod extension_name_conflicts;
 mod failed_load_is_transactional;
 #[cfg(feature = "wasm-host")]
 mod guest_virtual_model;
+#[cfg(feature = "wasm-host")]
+mod host_drop_frees_guests;
 mod live_provider;
 mod loader;
 mod loader_direct_file;
