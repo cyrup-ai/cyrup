@@ -1335,6 +1335,35 @@ mod tests {
         Loaded { loaded, listed }
     }
 
+    /// [`session_through_build_factory`] (no `--no-extensions`) with `extensions` passed as `-e`.
+    async fn session_with_extensions(interactive: bool, extensions: &[String]) -> Loaded {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path().join("project");
+        let agent_dir = tmp.path().join("agent");
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        let (factory, target) = factory_with(
+            Arc::new(FauxProvider::new()),
+            &agent_dir,
+            &cwd,
+            interactive,
+            |config| {
+                config.extra_extension_paths =
+                    extensions.iter().map(std::path::PathBuf::from).collect();
+            },
+        );
+        let session: AgentSession = factory.build(target, None).await.unwrap();
+        let loaded = session
+            .services()
+            .ext_host
+            .loaded_ids()
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        let listed = cyrup_tui::StartupReport::from_session(&session, false).extensions;
+        Loaded { loaded, listed }
+    }
+
     /// The position of `id` in `ids`, failing loudly (with the whole list) when absent.
     fn position(ids: &[String], id: &str) -> usize {
         ids.iter()
@@ -1364,8 +1393,8 @@ mod tests {
 
     /// Hidden at startup, loaded regardless: pi lists `extensions.filter((e) => !e.hidden)`
     /// (`interactive-mode.ts:1778`) and marks every `builtin:` extension hidden
-    /// (`resource-loader.ts:729`). The MCP adapter in the same breath proves the list is not simply
-    /// empty.
+    /// (`resource-loader.ts:741` @f1b2e77f5). `cyrup-flux`, which is no pi built-in, in the same
+    /// breath proves the list is not simply empty.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn llama_is_loaded_but_absent_from_the_startup_extensions_list() {
         let Loaded { loaded, listed } = session_through_build_factory(true, false).await;
@@ -1378,79 +1407,54 @@ mod tests {
             "llama.cpp is hidden from the startup [Extensions] list; got {listed:?}"
         );
         assert!(
-            listed.iter().any(|i| i == MCP_ID),
+            listed.iter().any(|i| i == "cyrup-flux"),
             "a non-hidden native IS listed, so the list is not trivially empty; got {listed:?}"
         );
     }
 
-    /// EXT-092 — every native `attach_native_extensions` loads has a DECIDED hidden state, and it
-    /// is the one pi's load path gives its counterpart.
+    /// EXT-092 — hidden follows the load path, as pi infers it: a native is hidden exactly when it
+    /// was attached as a `builtin:<name>`, by default or by `-e builtin:<name>`.
     ///
-    /// pi infers hidden from the load path: `extension.hidden = true` only in the `builtin:<name>`
-    /// branch of `loadExtensionPaths` (`core/resource-loader.ts:741` @f1b2e77f5), and the four
-    /// `builtin: true` entries are `llama.cpp`, `codemode`, `tool-search` and `mcp`
-    /// (`extensions/index.ts:7-13`). Everything else reaches pi as a file or package path and is
-    /// listed. cyrup has no `builtin:<name>` path tier — every compiled-in native, built-in
-    /// stand-in or package port alike, goes through the one `with_native_extension` door — so the
-    /// native declares `NativeExtension::is_hidden` and THIS table is what holds the declaration
-    /// to pi. A native added to `attach_native_extensions` without a row here fails the test, which
-    /// forces the decision; a stand-in for a pi built-in that forgets the override is listed and
-    /// fails it too.
+    /// pi sets `extension.hidden = true` only in the `builtin:<name>` branch of
+    /// `loadExtensionPaths` (`core/resource-loader.ts:741` @f1b2e77f5), which every `builtin:`
+    /// path reaches — settings-resolved and `-e` (`cliEnabledExtensions`) alike, merged into one
+    /// `extensionPaths` before `loadFinalExtensionSet` — and its `builtin: true` entries are
+    /// `llama.cpp`, `codemode`, `tool-search` and `mcp` (`extensions/index.ts`). Everything else
+    /// reaches pi as a file or package path and is listed. cyrup's `builtin:<name>` path is
+    /// [`super::BuiltinSelection`] (EXT-094), the only way those four natives are attached, so the
+    /// expected state of every loaded native is derived from [`BUILTIN_EXTENSIONS`] — no per-native
+    /// table — and the host's answer (`NativeExtension::is_hidden`, read through the startup
+    /// `[Extensions]` list) must agree with it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn every_attached_native_is_hidden_exactly_when_pi_loads_its_counterpart_as_a_builtin() {
-        // (id, hidden, pi counterpart). `true` only for a stand-in for a `builtin: true` entry.
-        let decided: &[(&str, bool, &str)] = &[
-            (LLAMA_ID, true, "builtin:llama.cpp"),
+        assert_eq!(
+            BUILTIN_EXTENSIONS,
+            ["llama.cpp", "codemode", "tool-search", "mcp"],
+            "cyrup's builtin: names are pi's `builtInExtensions` (extensions/index.ts @f1b2e77f5)"
+        );
+        let explicit: Vec<String> = BUILTIN_EXTENSIONS
+            .iter()
+            .map(|id| format!("builtin:{id}"))
+            .collect();
+        for (form, Loaded { loaded, listed }) in [
+            ("default", session_through_build_factory(true, false).await),
             (
-                cyrup_codemode_runtime::EXTENSION_ID,
-                true,
-                "builtin:codemode",
+                "-e builtin:<name>",
+                session_with_extensions(true, &explicit).await,
             ),
-            (cyrup_tool_search::EXTENSION_ID, true, "builtin:tool-search"),
-            // A port of the `pi-mcp-adapter` package (MCP-587), loaded by package path and listed;
-            // pi's own `builtin:mcp` is not what this is.
-            (MCP_ID, false, "package pi-mcp-adapter"),
-            ("cyrup-flux", false, "cyrup's flux pipeline; no pi built-in"),
-            (cyrup_intercom::EXTENSION_ID, false, "package pi-intercom"),
-            (
-                cyrup_ext_subagents::extension::EXTENSION_ID,
-                false,
-                "package pi-subagents",
-            ),
-            (
-                cyrup_ext_subagents::prompt_runtime::PROMPT_RUNTIME_EXTENSION_ID,
-                false,
-                "pi-subagents' subagent-prompt-runtime.ts, loaded by path",
-            ),
-            (
-                cyrup_permission_system::extension::EXTENSION_ID,
-                false,
-                "package pi-permission-system",
-            ),
-            (
-                crate::router_example::EXTENSION_ID,
-                false,
-                "examples/extensions/jev-router.ts, loaded by path",
-            ),
-        ];
-        let Loaded { loaded, listed } = session_through_build_factory(true, false).await;
-        for id in &loaded {
-            let Some((_, hidden, pi)) = decided.iter().find(|(d, ..)| d == id) else {
-                panic!(
-                    "native {id:?} is attached but has no hidden decision here: decide whether pi \
-                     loads its counterpart as a `builtin:` (hidden) and add a row; loaded {loaded:?}"
-                );
-            };
-            assert_eq!(
-                !listed.contains(id),
-                *hidden,
-                "{id} (pi: {pi}) must be {} the startup [Extensions] list; listed {listed:?}",
-                if *hidden { "absent from" } else { "in" }
-            );
-        }
-        for (id, hidden, _) in decided {
-            if *hidden {
+        ] {
+            for id in BUILTIN_EXTENSIONS {
                 position(&loaded, id);
+            }
+            for id in &loaded {
+                let builtin = BUILTIN_EXTENSIONS.contains(&id.as_str());
+                assert_eq!(
+                    !listed.contains(id),
+                    builtin,
+                    "{form}: {id} {} a builtin:<name> load, so pi {} it; listed {listed:?}",
+                    if builtin { "is" } else { "is not" },
+                    if builtin { "hides" } else { "lists" }
+                );
             }
         }
     }

@@ -2259,6 +2259,15 @@ impl NativeExtension for McpExtension {
         !self.explicit
     }
 
+    /// Hidden from the startup `[Extensions]` listing, explicit or not (EXT-092): cyrup attaches
+    /// this adapter only as `builtin:mcp` (`session_launch::BuiltinSelection`, EXT-094), and pi
+    /// sets `extension.hidden = true` on every extension its `builtin:<name>` branch loads,
+    /// default and `-e builtin:mcp` alike (`loadExtensionPaths`, `core/resource-loader.ts:741`
+    /// @f1b2e77f5; `mcp` is a `builtin: true` entry, `extensions/index.ts`).
+    fn is_hidden(&self) -> bool {
+        true
+    }
+
     // `decides_project_trust` is deliberately NOT overridden, and the default `false` is the whole
     // point (MCP-001). A native that opts into the pre-trust bootstrap pass has its `init` run
     // **twice on the very same object** — cyrup has no re-instantiation for a native, unlike pi,

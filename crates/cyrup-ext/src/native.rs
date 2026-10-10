@@ -893,18 +893,20 @@ pub trait NativeExtension: Send + Sync {
     /// loaded, still in [`crate::ExtensionHost::loaded_ids`], and still dispatched; only the list
     /// the user is shown leaves it out.
     ///
-    /// pi marks every `builtin:<name>` extension `hidden` when it loads it
-    /// (`extension.hidden = true`, `core/resource-loader.ts:729` @v0.99.2-17) and the interactive
-    /// startup panel lists only `!extension.hidden`
-    /// (`modes/interactive/interactive-mode.ts:1778`) — the `builtin` flag's own doc says it "is
-    /// hidden from the startup Extensions list" (`core/extensions/types.ts:2015`). Hidden is a
-    /// property of HOW the extension was loaded upstream; a compiled-in cyrup native has one load
-    /// path, so the native declares it. Default `false`: an embedder-supplied inline factory is
-    /// listed (`<inline>`), as in pi. EXT-092: a native standing in for one of pi's `builtin: true`
-    /// entries MUST return `true`; the binary's test
+    /// pi marks every extension its `builtin:<name>` branch loads `hidden` — the default and the
+    /// `-e builtin:<name>` form alike (`extension.hidden = true` in `loadExtensionPaths`,
+    /// `core/resource-loader.ts:741` @f1b2e77f5) — and the interactive startup panel lists only
+    /// `!extension.hidden` (`modes/interactive/interactive-mode.ts`). Hidden is a property of HOW
+    /// the extension was loaded upstream. cyrup has that load path too (EXT-094: the binary's
+    /// `session_launch::BuiltinSelection` attaches `llama.cpp`, `codemode`, `tool-search` and `mcp`
+    /// only as `builtin:<name>`), but the host reads hidden from the native, so each of those four
+    /// natives declares it. Default `false`: anything else, an embedder-supplied inline factory
+    /// included, is listed, as in pi (whose named inline factory may still declare `hidden`,
+    /// `resource-loader.ts:1148`). EXT-092: the binary's test
     /// `every_attached_native_is_hidden_exactly_when_pi_loads_its_counterpart_as_a_builtin`
-    /// (`crates/cyrup/src/session_launch.rs`) holds every native `attach_native_extensions` loads
-    /// to that rule and fails on a native it has no decision for.
+    /// (`crates/cyrup/src/session_launch.rs`) derives each attached native's expected state from
+    /// that load path — hidden iff attached as a `builtin:<name>`, default or `-e` — and fails on a
+    /// native that disagrees.
     fn is_hidden(&self) -> bool {
         false
     }
