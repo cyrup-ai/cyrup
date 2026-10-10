@@ -260,6 +260,7 @@ pub(crate) mod tests {
         exit_code: i32,
     ) -> SingleResult {
         SingleResult {
+            output_partial: false,
             execution: None,
             native_machine: None,
             runtime_acknowledged_extensions: None,

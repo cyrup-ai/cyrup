@@ -398,6 +398,7 @@ pub(super) async fn finish_run(
 
     if !error.is_empty() && results.is_empty() {
         results.push(SingleResult {
+            output_partial: false,
             execution: None,
             native_machine: None,
             runtime_acknowledged_extensions: None,
@@ -978,6 +979,7 @@ mod tests {
             status.clone(),
             RunState::Complete,
             vec![SingleResult {
+                output_partial: false,
                 execution: None,
                 native_machine: None,
                 runtime_acknowledged_extensions: None,

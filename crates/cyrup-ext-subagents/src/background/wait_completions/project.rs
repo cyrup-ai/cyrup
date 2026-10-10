@@ -92,6 +92,10 @@ pub struct WaitCompletionChild {
     pub session_file: Option<std::path::PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_state: Option<crate::exec::output_state::SubagentOutputState>,
+    /// SUBA-195 — pi `...(child.outputPartial === true ? { outputPartial: true } : {})`
+    /// (`wait-completions.ts:109` @ad11b7ab): written only when `true`.
+    #[serde(default, skip_serializing_if = "crate::exec::is_false")]
+    pub output_partial: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub structured_output_path: Option<std::path::PathBuf>,
     /// pi writes the key only when `true` (`:92`); `false` is the common case and must be
@@ -227,6 +231,10 @@ fn project_child(child: &serde_json::Value) -> WaitCompletionChild {
             .get("outputState")
             .cloned()
             .and_then(|value| serde_json::from_value(value).ok()),
+        output_partial: child
+            .get("outputPartial")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true),
         structured_output_path: non_empty(child.get("structuredOutputPath"))
             .map(std::path::PathBuf::from),
         context_overflow: child
@@ -399,6 +407,21 @@ mod tests {
             "workflowState": "completed",
             "children": [],
         })
+    }
+
+    /// SUBA-195 — pi `test/unit/partial-output.test.ts` "wait completion projection" (`9bc8f2d1`):
+    /// the flag is carried, and omitted when the output is complete. RED at HEAD (no such field).
+    #[test]
+    fn the_partial_flag_is_carried_and_omitted_when_complete() {
+        let partial = json!({"results": [{"agent": "worker", "outputState": "present", "outputPartial": true}]});
+        let projected = to_wait_completion(&partial, &run("run-1")).expect("projects");
+        assert!(projected.results[0].output_partial);
+
+        let complete = json!({"results": [{"agent": "worker", "outputState": "present"}]});
+        let projected = to_wait_completion(&complete, &run("run-1")).expect("projects");
+        assert!(!projected.results[0].output_partial);
+        let wire = serde_json::to_value(&projected.results[0]).expect("serializes");
+        assert!(wire.get("outputPartial").is_none(), "{wire}");
     }
 
     /// pi `:107`. The projected identity is the run the WAIT asked about, never `data.runId` —
@@ -702,6 +725,7 @@ mod tests {
             run_id: None,
             session_file: None,
             output_state: None,
+            output_partial: false,
             structured_output_path: None,
             context_overflow: false,
             artifact_paths: None,

@@ -78,6 +78,10 @@ pub struct AgentProgress {
     /// the child spawns and read back at `execution.ts:744`). `None` in a `Default`-constructed
     /// fold, which reports a zero duration.
     pub started_at: Option<std::time::Instant>,
+    /// SUBA-195 — pi `createPartialOutputTracker()` (`execution.ts:566` @ad11b7ab), one per
+    /// attempt and fed every event, as upstream's `partialOutput.observe(evt)` is the first line of
+    /// `processEvent` (`:976`). Read only when the attempt ended abnormally.
+    pub partial_output: crate::exec::partial_output::PartialOutputTracker,
 }
 
 impl AgentProgress {
@@ -94,6 +98,7 @@ impl AgentProgress {
     /// same payload on `ToolExecutionEnd.result` — the delta [`crate::exec::ndjson::SubagentEvent`]
     /// already documents, and the same one [`crate::tui::events::LiveProgressFold`] makes.
     pub fn record_event(&mut self, event: SubagentEvent) {
+        self.partial_output.observe(&event);
         if let Some(usage) = event.assistant_usage() {
             crate::exec::fallback::add_usage(&mut self.usage, &usage);
         }

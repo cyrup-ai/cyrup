@@ -140,6 +140,7 @@ mod tests {
     /// A `SingleResult` that was terminated by an explicit stop.
     fn stopped_child() -> crate::exec::SingleResult {
         crate::exec::SingleResult {
+            output_partial: false,
             execution: None,
             native_machine: None,
             runtime_acknowledged_extensions: None,

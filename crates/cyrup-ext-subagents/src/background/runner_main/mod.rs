@@ -256,6 +256,7 @@ pub(crate) mod tests {
             session_id: crate::identity::SessionId::parse("test-session"),
             completion_owner_id: None,
             results: vec![SingleResult {
+                output_partial: false,
                 execution: None,
                 native_machine: None,
                 runtime_acknowledged_extensions: None,

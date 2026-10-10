@@ -1383,6 +1383,7 @@ mod tests {
     #[test]
     fn promoting_stopped_children_leaves_already_settled_ones_alone() {
         let settled = |agent: &str, interrupted: bool, output: Option<&str>| SingleResult {
+            output_partial: false,
             execution: None,
             native_machine: None,
             runtime_acknowledged_extensions: None,

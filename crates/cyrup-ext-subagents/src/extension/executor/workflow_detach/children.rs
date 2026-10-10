@@ -305,6 +305,7 @@ pub(crate) fn workflow_result_children(
 /// through [`crate::workflows::workflow_output_path_mapping_summary`].
 fn step_child(step: &StepStatus, output: &str) -> SingleResult {
     SingleResult {
+        output_partial: false,
         execution: None,
         native_machine: None,
         runtime_acknowledged_extensions: None,

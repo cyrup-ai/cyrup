@@ -818,6 +818,7 @@ pub(super) async fn run_import_async_root(
     .await?;
 
     let step_result = StepResult {
+        output_partial: false,
         execution: None,
         tool_budget_blocked: false,
         session_name: None,

@@ -372,6 +372,7 @@ impl SubagentExecutor {
 #[cfg(test)]
 pub(crate) fn test_single_result(agent: &str, exit_code: i32) -> SingleResult {
     SingleResult {
+        output_partial: false,
         execution: None,
         native_machine: None,
         runtime_acknowledged_extensions: None,

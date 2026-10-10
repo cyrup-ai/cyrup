@@ -355,6 +355,7 @@ pub(super) async fn skip_child_stopped_step(
 /// (no child ever ran) and nothing timed out.
 pub(super) fn child_stopped_step_result() -> StepResult {
     StepResult {
+        output_partial: false,
         execution: None,
         tool_budget_blocked: false,
         session_name: None,
@@ -401,6 +402,7 @@ pub(super) fn stopped_single_result(step: &RunnerStep) -> SingleResult {
     let mut single = step_result_to_single_result(
         step,
         &StepResult {
+            output_partial: false,
             execution: None,
             tool_budget_blocked: false,
             session_name: None,
@@ -681,6 +683,7 @@ pub(super) fn step_result_to_single_result_with(
         child_run_id: None,
         session_file: result.session_file.clone(),
         output_state: result.output_state,
+        output_partial: result.output_partial,
         structured_output_path: result.structured_output_path.clone(),
         artifact_paths: result.artifact_paths.clone(),
         // pi `transcriptPath` / `transcriptError` on the runner's results copy
@@ -752,6 +755,7 @@ pub(super) fn imported_root_to_single_result(
     imported: &control::ImportedAsyncRootResult,
 ) -> SingleResult {
     SingleResult {
+        output_partial: false,
         execution: None,
         native_machine: None,
         runtime_acknowledged_extensions: None,

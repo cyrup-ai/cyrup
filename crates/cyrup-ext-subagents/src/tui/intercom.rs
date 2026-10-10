@@ -1204,6 +1204,7 @@ mod tests {
 
     fn sample_single_result(agent: &str, output: &str) -> crate::exec::SingleResult {
         crate::exec::SingleResult {
+            output_partial: false,
             execution: None,
             native_machine: None,
             runtime_acknowledged_extensions: None,
