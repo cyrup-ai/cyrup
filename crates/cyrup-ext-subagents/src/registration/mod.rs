@@ -542,6 +542,20 @@ pub struct SubagentExtensionConfig {
     /// config fail the ENTIRE parse. Keeping it raw lets the owning feature resolve it with
     /// upstream's own per-key diagnostic while every other key still loads.
     pub async_widget: Option<serde_json::Value>,
+    /// SUBA-162 — pi `asyncWidgetCollapsed` (`shared/types.ts:2693`, validated
+    /// `extension/config.ts:187-188` @ad11b7ab, `53aee6d8`/#2621): start the async-jobs widget as
+    /// its one-line card. Resolved by [`Self::async_widget_collapsed`].
+    ///
+    /// Held RAW for [`Self::async_widget`]'s reason; [`Self::validate_async_widget_collapsed`]
+    /// refuses a non-boolean with upstream's sentence.
+    pub async_widget_collapsed: Option<serde_json::Value>,
+    /// SUBA-162 — pi `asyncWidgetLayout` (`shared/types.ts:2695`, validated
+    /// `extension/config.ts:190-191` @ad11b7ab, `588d2cfd`/#2738): `"adaptive"` (default) or
+    /// `"rows"`. Resolved by [`Self::async_widget_layout`].
+    ///
+    /// Held RAW for [`Self::async_widget`]'s reason; [`Self::validate_async_widget_layout`]
+    /// refuses anything else with upstream's sentence.
+    pub async_widget_layout: Option<serde_json::Value>,
     /// pi `inlineToolDisplay` — how a finished subagent result renders inline. SUBA-061.
     ///
     /// Held as the RAW JSON value rather than a typed field, deliberately: `SubagentExtensionConfig`
@@ -789,6 +803,8 @@ impl Default for SubagentExtensionConfig {
             foreground_detach_shortcut: None,
             completion_batch: None,
             async_widget: None,
+            async_widget_collapsed: None,
+            async_widget_layout: None,
             inline_tool_display: None,
             fleet_keybindings: None,
         }
@@ -908,6 +924,37 @@ impl SubagentExtensionConfig {
         crate::artifacts::ArtifactDirPreference::parse(text).map(|_| ())
     }
 
+    /// SUBA-162 — pi `validateConfig`'s `asyncWidgetCollapsed` clause (`extension/config.ts:187-188`
+    /// @ad11b7ab): `if (config.asyncWidgetCollapsed !== undefined && typeof
+    /// config.asyncWidgetCollapsed !== "boolean") throw ...`. An explicit `null` is refused too: it
+    /// is not `undefined`.
+    ///
+    /// # Errors
+    ///
+    /// `config.asyncWidgetCollapsed must be a boolean`.
+    pub fn validate_async_widget_collapsed(raw: &serde_json::Value) -> Result<(), String> {
+        match raw.get("asyncWidgetCollapsed") {
+            None | Some(serde_json::Value::Bool(_)) => Ok(()),
+            Some(_) => Err("config.asyncWidgetCollapsed must be a boolean".to_string()),
+        }
+    }
+
+    /// SUBA-162 — pi `validateConfig`'s `asyncWidgetLayout` clause (`extension/config.ts:190-191`
+    /// @ad11b7ab): anything but `"adaptive"` or `"rows"` throws.
+    ///
+    /// # Errors
+    ///
+    /// `config.asyncWidgetLayout must be "adaptive" or "rows"`.
+    pub fn validate_async_widget_layout(raw: &serde_json::Value) -> Result<(), String> {
+        let Some(value) = raw.get("asyncWidgetLayout") else {
+            return Ok(());
+        };
+        match value.as_str() {
+            Some("adaptive" | "rows") => Ok(()),
+            _ => Err(r#"config.asyncWidgetLayout must be "adaptive" or "rows""#.to_string()),
+        }
+    }
+
     /// SUBA-153 — pi `validateConfig`'s `toolActivation` clause (`extension/config.ts:178-180`
     /// @v0.76.1): `if (config.toolActivation !== undefined && config.toolActivation !== "auto" &&
     /// config.toolActivation !== "dynamic" && config.toolActivation !== "eager") throw ...`.
@@ -1011,6 +1058,11 @@ impl SubagentExtensionConfig {
         // ahead of `artifactDir` (`:155`).
         Self::validate_checkpoint_before_deadline_ms(raw)?;
         Self::validate_artifact_dir(raw)?;
+        // SUBA-162 — upstream checks `asyncWidgetCollapsed` (`extension/config.ts:187`) and
+        // `asyncWidgetLayout` (`:190`) @ad11b7ab after `artifactDir` (`:174`) and before
+        // `toolActivation` (`:196`); the checks between them upstream are not ported.
+        Self::validate_async_widget_collapsed(raw)?;
+        Self::validate_async_widget_layout(raw)?;
         // SUBA-153 — upstream checks `toolActivation` (`extension/config.ts:178-180` @v0.76.1)
         // after `artifactDir` (`:162`) and before `validateMissionStoreConfig` (`:181`); the
         // checks between them upstream are not ported.
@@ -1187,6 +1239,25 @@ impl SubagentExtensionConfig {
     #[must_use]
     pub fn async_widget_enabled(&self) -> bool {
         self.async_widget != Some(serde_json::Value::Bool(false))
+    }
+
+    /// SUBA-162 — pi `const asyncWidgetCollapsed = config.asyncWidgetCollapsed === true`
+    /// (`extension/index.ts:294` @ad11b7ab).
+    #[must_use]
+    pub fn async_widget_collapsed(&self) -> bool {
+        self.async_widget_collapsed == Some(serde_json::Value::Bool(true))
+    }
+
+    /// SUBA-162 — pi `const asyncWidgetLayout = config.asyncWidgetLayout ?? "adaptive"`
+    /// (`extension/index.ts:295` @ad11b7ab). Only the literal `"rows"` selects
+    /// [`crate::tui::render::AsyncWidgetLayout::Rows`]; a value
+    /// [`Self::validate_async_widget_layout`] would refuse never gets this far on the load path.
+    #[must_use]
+    pub fn async_widget_layout(&self) -> crate::tui::render::AsyncWidgetLayout {
+        match self.async_widget_layout.as_ref().and_then(|v| v.as_str()) {
+            Some("rows") => crate::tui::render::AsyncWidgetLayout::Rows,
+            _ => crate::tui::render::AsyncWidgetLayout::Adaptive,
+        }
     }
 
     /// SUBA-061 — pi `summaryInlineToolDisplay = config.inlineToolDisplay === "summary"`
@@ -1884,6 +1955,70 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
     use super::*;
+
+    /// SUBA-162 — pi `validateConfig`'s `asyncWidgetCollapsed`/`asyncWidgetLayout` clauses
+    /// (`extension/config.ts:187-191` @ad11b7ab) and their resolutions (`extension/index.ts:294-295`).
+    /// Before the port both keys passed validation and drew `unknown key ... (ignored)`. Mutations
+    /// killed: either validator dropped from `validate_raw_config`, the order swapped with
+    /// `artifactDir`, and the accessors as `!= false` / `!= "adaptive"`.
+    #[test]
+    fn async_widget_collapsed_and_layout_are_parsed_validated_and_censused() {
+        let validate = SubagentExtensionConfig::validate_raw_config;
+        assert_eq!(
+            validate(&serde_json::json!({"asyncWidgetCollapsed": "yes"})),
+            Err("config.asyncWidgetCollapsed must be a boolean".to_string())
+        );
+        assert_eq!(
+            validate(&serde_json::json!({"asyncWidgetCollapsed": null})),
+            Err("config.asyncWidgetCollapsed must be a boolean".to_string())
+        );
+        assert_eq!(
+            validate(&serde_json::json!({"asyncWidgetLayout": "grid"})),
+            Err(r#"config.asyncWidgetLayout must be "adaptive" or "rows""#.to_string())
+        );
+        // Upstream's order: `artifactDir` (`:174`) before `asyncWidgetCollapsed` (`:187`), and
+        // `asyncWidgetLayout` (`:190`) before `toolActivation` (`:196`).
+        assert!(
+            validate(&serde_json::json!({"artifactDir": "bad", "asyncWidgetCollapsed": 1}))
+                .is_err_and(|e| e.starts_with("config.artifactDir"))
+        );
+        assert!(
+            validate(&serde_json::json!({"asyncWidgetLayout": 1, "toolActivation": "lazy"}))
+                .is_err_and(|e| e.starts_with("config.asyncWidgetLayout"))
+        );
+
+        let raw = serde_json::json!({"asyncWidgetCollapsed": true, "asyncWidgetLayout": "rows"});
+        assert_eq!(validate(&raw), Ok(()));
+        assert!(
+            SubagentExtensionConfig::config_warnings(&raw)
+                .iter()
+                .all(|w| !w.contains("unknown key")),
+            "{:?}",
+            SubagentExtensionConfig::config_warnings(&raw)
+        );
+        let config: SubagentExtensionConfig = serde_json::from_value(raw).expect("parses");
+        assert!(config.async_widget_collapsed());
+        assert_eq!(
+            config.async_widget_layout(),
+            crate::tui::render::AsyncWidgetLayout::Rows
+        );
+
+        let defaults = SubagentExtensionConfig::default();
+        assert!(!defaults.async_widget_collapsed());
+        assert_eq!(
+            defaults.async_widget_layout(),
+            crate::tui::render::AsyncWidgetLayout::Adaptive
+        );
+        let explicit: SubagentExtensionConfig = serde_json::from_value(
+            serde_json::json!({"asyncWidgetCollapsed": false, "asyncWidgetLayout": "adaptive"}),
+        )
+        .expect("parses");
+        assert!(!explicit.async_widget_collapsed());
+        assert_eq!(
+            explicit.async_widget_layout(),
+            crate::tui::render::AsyncWidgetLayout::Adaptive
+        );
+    }
 
     /// SUBA-061 — each raw-held key resolves on its own, with its own diagnostic, and a bad value
     /// never takes the rest of the config with it. Mutations killed: `async_widget_enabled` as

@@ -211,6 +211,23 @@ pub struct FleetStatusEntry {
     pub project_pane: Option<Box<crate::inspectors::types::HerdrProjectPaneSnapshot>>,
     /// pi `nestedChildren`.
     pub nested_children: Vec<NestedRunView>,
+    /// pi `workflowWrapper` (`fleet-status.ts:446` @ad11b7ab) — the one row a workflow run
+    /// contributes. Its lanes are runs of their own and count themselves, so the wrapper is not a
+    /// leaf agent ([`active_leaf_agent_count`]) and its tokens are not native spend (`:797`).
+    /// SUBA-162.
+    pub workflow_wrapper: bool,
+}
+
+/// pi `activeLeafAgentCount(entries)` (`fleet-status.ts:346-348` @ad11b7ab) — the number behind
+/// the collapsed line's `N active agents` (`:806-808`): every entry that is neither a workflow
+/// wrapper nor a non-agent surface. The async-jobs widget header counts the same leaves
+/// ([`crate::tui::render::running_leaf_agent_count`], SUBA-162).
+#[must_use]
+pub fn active_leaf_agent_count(entries: &[FleetStatusEntry]) -> usize {
+    entries
+        .iter()
+        .filter(|entry| !entry.workflow_wrapper && entry.surface.is_none())
+        .count()
 }
 
 /// pi `FleetNestedRow` (`fleet-status.ts:28-35`).
@@ -523,6 +540,7 @@ pub fn project_pane_entries(state: &FleetState) -> Vec<FleetStatusEntry> {
                 pane.agent_status.clone()
             },
             surface: Some(FleetStatusSurface::ProjectPane),
+            workflow_wrapper: false,
             project_pane: Some(Box::new(pane.clone())),
             nested_children: Vec::new(),
         })
@@ -572,6 +590,7 @@ pub fn collect_fleet_status_entries(state: &FleetState, now: i64) -> Vec<FleetSt
                     tokens: child.tokens.unwrap_or(0),
                     state: "running".to_string(),
                     surface: None,
+                    workflow_wrapper: false,
                     project_pane: None,
                     nested_children,
                 });
@@ -597,6 +616,7 @@ pub fn collect_fleet_status_entries(state: &FleetState, now: i64) -> Vec<FleetSt
             tokens: control.tokens.unwrap_or(0),
             state: "running".to_string(),
             surface: None,
+            workflow_wrapper: false,
             project_pane: None,
             nested_children: control.nested_children.clone(),
         });
@@ -617,6 +637,27 @@ pub fn collect_fleet_status_entries(state: &FleetState, now: i64) -> Vec<FleetSt
             .total_tokens
             .as_ref()
             .map_or(0, |t| t.total);
+        // SUBA-162 — pi `:439-464` @ad11b7ab: a workflow run contributes ONE wrapper row, never
+        // a row per step; its lanes are runs of their own and count themselves. The wrapper's
+        // `workflowRows`/`workflowChecklist` projections are not ported, and the arm is not yet
+        // reachable from the async feed (the background runner never emits `RunMode::Workflow`,
+        // `background/state.rs`).
+        if status.mode == RunMode::Workflow {
+            entries.push(FleetStatusEntry {
+                key: format!("async:{}", status.run_id.as_str()),
+                agent: "workflow".to_string(),
+                model_thinking: None,
+                description: job.description.clone(),
+                started_at,
+                tokens: total_tokens,
+                state: job.state_label().to_string(),
+                surface: None,
+                workflow_wrapper: true,
+                project_pane: None,
+                nested_children: job.nested_children.clone(),
+            });
+            continue;
+        }
         // pi `:197-215`: no steps at all → one run-level entry.
         if status.steps.is_empty() {
             entries.push(FleetStatusEntry {
@@ -628,6 +669,7 @@ pub fn collect_fleet_status_entries(state: &FleetState, now: i64) -> Vec<FleetSt
                 tokens: total_tokens,
                 state: job.state_label().to_string(),
                 surface: None,
+                workflow_wrapper: false,
                 project_pane: None,
                 nested_children: job.nested_children.clone(),
             });
@@ -672,6 +714,7 @@ pub fn collect_fleet_status_entries(state: &FleetState, now: i64) -> Vec<FleetSt
                     .map_or_else(|| if single_step { total_tokens } else { 0 }, |t| t.total),
                 state: label.to_string(),
                 surface: None,
+                workflow_wrapper: false,
                 project_pane: None,
                 nested_children,
             });
@@ -695,7 +738,14 @@ pub fn collect_fleet_status_entries(state: &FleetState, now: i64) -> Vec<FleetSt
 /// flag; the equivalent observable is "this run has a parallel group with a child still running or
 /// pending", which is exactly the condition the flag exists to express.
 fn has_active_parallel_group(job: &AsyncRunView) -> bool {
-    job.status.parallel_groups.as_ref().is_some_and(|groups| {
+    status_has_active_parallel_group(&job.status)
+}
+
+/// [`has_active_parallel_group`] over the bare [`RunStatus`](crate::background::RunStatus), so the
+/// async-jobs widget row ([`crate::tui::events::AsyncJobSnapshot::active_parallel_group`],
+/// SUBA-162) derives pi's `activeParallelGroup` the same way this fleet does.
+pub(crate) fn status_has_active_parallel_group(status: &crate::background::RunStatus) -> bool {
+    status.parallel_groups.as_ref().is_some_and(|groups| {
         groups.iter().any(|group| {
             group
                 .children
@@ -1015,16 +1065,24 @@ impl SubagentFleetStatus {
                 .iter()
                 .filter(|entry| entry.surface == Some(FleetStatusSurface::ProjectPane))
                 .collect();
+            // SUBA-162 — pi `:797`: a workflow wrapper's tokens are not native spend.
             let tokens: u64 = work
                 .iter()
+                .filter(|entry| !entry.workflow_wrapper)
                 .fold(0u64, |total, entry| total.saturating_add(entry.tokens));
 
             let mut label_parts: Vec<String> = Vec::new();
-            if !work.is_empty() {
+            // SUBA-162 — pi `activeLeafAgentCount(workEntries)` (`:806-808` @ad11b7ab): workflow
+            // wrappers are not leaves, and with none left the part is omitted.
+            let active_agents = active_leaf_agent_count(&self.entries);
+            if active_agents > 0 {
                 label_parts.push(format!(
-                    "{} active {}",
-                    work.len(),
-                    if work.len() == 1 { "agent" } else { "agents" }
+                    "{active_agents} active {}",
+                    if active_agents == 1 {
+                        "agent"
+                    } else {
+                        "agents"
+                    }
                 ));
             }
             if !panes.is_empty() {
@@ -1050,18 +1108,29 @@ impl SubagentFleetStatus {
                 ));
             }
             let label = label_parts.join(" · ");
-            return vec![th::clip(
-                &Line::from(vec![
-                    th::raw("  "),
-                    th::fg(Role::Muted, label),
-                    th::raw(" · "),
-                    th::fg(
-                        Role::Dim,
-                        format!("{} · ↓/← to inspect", format_fleet_tokens(tokens)),
-                    ),
-                ]),
-                width,
-            )];
+            // SUBA-162 — pi `:812-815` @ad11b7ab: with a workflow wrapper present, wrapper
+            // totals can overlap their children's usage, so the spend reads off the child rows.
+            let has_workflow = work.iter().any(|entry| entry.workflow_wrapper);
+            let native_entries = work.iter().filter(|entry| !entry.workflow_wrapper).count();
+            let usage = if has_workflow {
+                if native_entries > 0 {
+                    format!(
+                        "standalone: {} · workflow usage on child rows",
+                        format_fleet_tokens(tokens)
+                    )
+                } else {
+                    "usage on child rows".to_string()
+                }
+            } else {
+                format_fleet_tokens(tokens)
+            };
+            let mut spans = vec![th::raw("  "), th::fg(Role::Muted, label.clone())];
+            // pi `:817`: the separator only when there is a label before it.
+            if !label.is_empty() {
+                spans.push(th::raw(" · "));
+            }
+            spans.push(th::fg(Role::Dim, format!("{usage} · ↓/← to inspect")));
+            return vec![th::clip(&Line::from(spans), width)];
         }
 
         let roster = self.roster_keys();
@@ -1895,6 +1964,196 @@ mod tests {
         };
         let mut widget = armed_widget(&busy);
         assert!(!widget.refresh(&busy, 10_500));
+    }
+
+    /// SUBA-162 — the widget header's `N agents running` and this fleet's `N active agents` are
+    /// the same number for the same runs (pi `runningLeafAgentCount`, `render.ts:2634-2648`
+    /// @ad11b7ab, `7e07a22d`/#2584), read through the production row builder
+    /// (`AsyncJobSnapshot::from_run_view`) and the published `Rows` layout.
+    fn widget_header(views: &[AsyncRunView]) -> String {
+        widget_header_attached(views, None)
+    }
+
+    /// [`widget_header`], with every run other than `workflow` and `"one"` attached under
+    /// `workflow` as a loaded child run (`parent_workflow_run_id`). No production feed sets that
+    /// field yet (see its doc), so a test that wants the widget's recursive workflow count has to.
+    fn widget_header_attached(views: &[AsyncRunView], workflow: Option<&str>) -> String {
+        use crate::tui::events::{AsyncJobSnapshot, AsyncWidgetRender, render_async_jobs_widget};
+        use crate::tui::render::{AsyncWidgetLayout, lines_to_plain_text};
+        let rows: Vec<AsyncJobSnapshot> = views
+            .iter()
+            .map(|view| {
+                let mut row = AsyncJobSnapshot::from_run_view(view);
+                if let Some(parent) = workflow
+                    && view.status.run_id.as_str() != parent
+                    && view.status.run_id.as_str() != "one"
+                {
+                    row.parent_workflow_run_id = Some(RunId::from_token(parent.to_string()));
+                }
+                row
+            })
+            .collect();
+        let view = AsyncWidgetRender {
+            layout: AsyncWidgetLayout::Rows,
+            ..AsyncWidgetRender::default()
+        };
+        lines_to_plain_text(&render_async_jobs_widget(&rows, &view, &mut None, 0))
+            .into_iter()
+            .next()
+            .unwrap_or_default()
+    }
+
+    fn mode_view(run_id: &str, mode: RunMode, steps: Vec<StepStatus>) -> AsyncRunView {
+        let mut view = async_view(run_id, RunState::Running, steps);
+        view.status.mode = mode;
+        view
+    }
+
+    /// A four-step parallel beside one single: `5 active agents` here and `5 agents running` in
+    /// the widget. Mutation killed: the widget header's pre-#2584 rule (running root jobs reads
+    /// `2 agents running`).
+    #[test]
+    fn widget_header_and_fleet_report_the_same_agent_count() {
+        let views = vec![
+            mode_view(
+                "par",
+                RunMode::Parallel,
+                (0..4)
+                    .map(|i| step(&format!("w{i}"), StepState::Running))
+                    .collect(),
+            ),
+            mode_view(
+                "one",
+                RunMode::Single,
+                vec![step("solo", StepState::Running)],
+            ),
+        ];
+        let state = FleetState {
+            tracked_jobs: views.clone(),
+            ..FleetState::default()
+        };
+        let text = th::lines_text(&armed_widget(&state).render(120, 10_000));
+        assert!(text.contains("5 active agents"), "{text}");
+        let header = widget_header(&views);
+        assert!(
+            header.ends_with(" Async agents · 5 agents running"),
+            "{header}"
+        );
+    }
+
+    /// The Verify's four-lane workflow beside one single run: the workflow contributes one
+    /// wrapper row that is not a leaf (pi `fleet-status.ts:439-464`, `:346-348` @ad11b7ab), its
+    /// four lanes and the single are, so both surfaces read 5. Mutations killed: the workflow
+    /// wrapper arm removed (the workflow's own four steps count: `9 active agents`), the wrapper
+    /// left in the count (`6`), and the widget's pre-#2584 rule (`6 agents running`).
+    #[test]
+    fn a_four_lane_workflow_beside_one_run_reads_the_same_count_in_fleet_and_widget() {
+        let mut views = vec![mode_view(
+            "wf",
+            RunMode::Workflow,
+            (0..4)
+                .map(|i| step(&format!("lane{i}"), StepState::Running))
+                .collect(),
+        )];
+        for i in 0..4 {
+            views.push(mode_view(
+                &format!("lane{i}"),
+                RunMode::Single,
+                vec![step(&format!("lane{i}"), StepState::Running)],
+            ));
+        }
+        views.push(mode_view(
+            "one",
+            RunMode::Single,
+            vec![step("solo", StepState::Running)],
+        ));
+        let state = FleetState {
+            tracked_jobs: views.clone(),
+            ..FleetState::default()
+        };
+        let entries = collect_fleet_status_entries(&state, 10_000);
+        assert_eq!(entries.iter().filter(|e| e.workflow_wrapper).count(), 1);
+        assert_eq!(active_leaf_agent_count(&entries), 5);
+        let text = th::lines_text(&armed_widget(&state).render(120, 10_000));
+        assert!(text.contains("5 active agents"), "{text}");
+        let header = widget_header(&views);
+        assert!(
+            header.ends_with(" Async agents · 5 agents running"),
+            "{header}"
+        );
+        // The same runs with the lanes loaded UNDER the workflow, so the widget reaches 5 through
+        // `WidgetJobTree`'s attachment and the workflow's recursive child count (pi
+        // `render.ts:2639-2640` @ad11b7ab) rather than through four root lanes.
+        let attached = widget_header_attached(&views, Some("wf"));
+        assert!(
+            attached.ends_with(" Async agents · 5 agents running"),
+            "{attached}"
+        );
+    }
+
+    /// pi `fleet-status.ts:812-817` @ad11b7ab: a workflow wrapper with no active lane leaves the
+    /// collapsed label empty, so the line drops the leading separator, and the spend is read off
+    /// the child rows rather than summed over wrapper totals. Mutations killed: the separator
+    /// pushed unconditionally (`   · `), and the wrapper usage text dropped (a token total).
+    #[test]
+    fn a_collapsed_fleet_of_only_a_workflow_wrapper_reads_usage_on_child_rows() {
+        let views = vec![mode_view("wf", RunMode::Workflow, Vec::new())];
+        let state = FleetState {
+            tracked_jobs: views.clone(),
+            ..FleetState::default()
+        };
+        let text = th::lines_text(&armed_widget(&state).render(120, 10_000));
+        assert!(
+            text.contains("  usage on child rows · ↓/← to inspect"),
+            "{text}"
+        );
+        assert!(!text.contains(" · usage"), "{text}");
+        assert!(!text.contains("tokens"), "{text}");
+
+        let views = vec![
+            mode_view("wf", RunMode::Workflow, Vec::new()),
+            mode_view(
+                "one",
+                RunMode::Single,
+                vec![step("solo", StepState::Running)],
+            ),
+        ];
+        let state = FleetState {
+            tracked_jobs: views,
+            ..FleetState::default()
+        };
+        let text = th::lines_text(&armed_widget(&state).render(120, 10_000));
+        assert!(
+            text.contains("1 active agent · standalone: ")
+                && text.contains(" · workflow usage on child rows"),
+            "{text}"
+        );
+    }
+
+    /// The Verify's "a sequential chain counts one", on both surfaces.
+    #[test]
+    fn a_sequential_chain_counts_one_in_fleet_and_widget() {
+        let mut chain = async_view(
+            "chain",
+            RunState::Running,
+            vec![
+                step("a", StepState::Complete),
+                step("b", StepState::Running),
+                step("c", StepState::Pending),
+                step("d", StepState::Pending),
+            ],
+        );
+        chain.status.current_step = Some(1);
+        let state = FleetState {
+            tracked_jobs: vec![chain.clone()],
+            ..FleetState::default()
+        };
+        assert_eq!(collect_fleet_status_entries(&state, 10_000).len(), 1);
+        let header = widget_header(&[chain]);
+        assert!(
+            header.ends_with(" Async agents · 1 agent running"),
+            "{header}"
+        );
     }
 
     #[test]

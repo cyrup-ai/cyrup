@@ -13,6 +13,7 @@
 //! whole `external-job` protocol stay REFUSED, loudly, by [`crate::runner::dispatch`] — see that
 //! module for each deferral's reason.
 
+mod activity;
 pub mod adapters;
 pub mod env;
 pub mod framing;
@@ -338,6 +339,66 @@ pub async fn run_external_cli(
         &agent.system_prompt_body,
         &crate::exec::acceptance::inject_acceptance_contract(task, contract),
     );
+    // The run deadline, fixed BEFORE the activity baseline below: upstream's `timeoutSignal` is
+    // already armed when `prepareExternalActivity` runs (`subagent-runner.ts:869-871` @ad11b7ab).
+    let deadline = opts
+        .deadline_at
+        .map(tokio::time::Instant::from_std)
+        .or_else(|| {
+            opts.timeout_ms
+                .map(|ms| tokio::time::Instant::now() + std::time::Duration::from_millis(ms))
+        });
+    // SUBA-131 — `if (!step.machine && externalAbortSignal) await
+    // ctx.prepareExternalActivity?.(externalCwd, externalAbortSignal)` (`subagent-runner.ts:871`
+    // @ad11b7ab): the step's control monitor, built exactly as the native attempt builds its own
+    // (`exec::attempt_runner`), plus the git baseline when control is on — before launch,
+    // preflight and spawn.
+    let mut activity = if opts.machine.is_none() {
+        let monitor = crate::exec::control::ControlMonitor::new(
+            opts.control_config.clone().unwrap_or_default(),
+            opts.run_id
+                .as_ref()
+                .map(|id| id.as_str().to_string())
+                .unwrap_or_else(|| agent.name.clone()),
+            agent.name.clone(),
+            opts.child_index.and_then(|index| u32::try_from(index).ok()),
+            opts.on_control_event.clone(),
+            crate::time::now_epoch_millis(),
+        );
+        Some(
+            activity::ExternalActivityTracker::prepare(
+                monitor,
+                &opts.cwd,
+                &opts.cancel,
+                deadline.map(tokio::time::Instant::into_std),
+                crate::time::now_epoch_millis(),
+            )
+            .await,
+        )
+    } else {
+        None
+    };
+    // `if (externalAbortSignal?.aborted) return { output: message, error: message, exitCode: 1,
+    // stopped | timedOut }` (`subagent-runner.ts:872-876` @ad11b7ab) — for a placed step too, and
+    // whether or not the baseline ran: a stop or a timeout that is already in force never spawns.
+    let stopped = opts.cancel.is_cancelled();
+    if stopped || deadline.is_some_and(|at| tokio::time::Instant::now() >= at) {
+        let message = if stopped {
+            "Subagent stopped by user.".to_string()
+        } else {
+            opts.timeout_ms.map_or_else(
+                || "Subagent timed out.".to_string(),
+                crate::exec::format_timeout_message,
+            )
+        };
+        // No `runner` descriptor: upstream's early return carries none (only `agent`, `context`,
+        // `output`, `error`, `exitCode`, `stopped`/`timedOut`).
+        let mut result = crate::exec::pre_spawn_failure(agent, task, message.clone());
+        result.final_output = Some(message);
+        result.stopped = stopped;
+        result.timed_out = !stopped;
+        return result;
+    }
     // SUBA-100 — a resolved machine sends an OWNED profile to a Herdr pane on that machine
     // (`subagent-runner.ts:900-944` @v0.68.0). Its prompt goes through Herdr's `agent.prompt`, so
     // the local delivery, environment and preflight below are not used. A generic command never
@@ -403,13 +464,6 @@ pub async fn run_external_cli(
         }
     }
 
-    let deadline = opts
-        .deadline_at
-        .map(tokio::time::Instant::from_std)
-        .or_else(|| {
-            opts.timeout_ms
-                .map(|ms| tokio::time::Instant::now() + std::time::Duration::from_millis(ms))
-        });
     // SUBA-141 — pi `onProcess: ctx.onExternalProcess` (`subagent-runner.ts:936` @v0.71.0): each
     // process report goes to the live sink with this launch's runner descriptor, typed.
     let report_process = |process: &crate::runner::status::ExternalProcessStatus| {
@@ -420,7 +474,7 @@ pub async fn run_external_cli(
             });
         }
     };
-    let outcome = run::run_external_cli_process(
+    let outcome = run::run_external_cli_process_tracked(
         run::ExternalCliProcessPlan {
             program,
             args,
@@ -443,6 +497,7 @@ pub async fn run_external_cli(
             stop_message: "Subagent stopped by user.".to_string(),
             on_process: Some(run::ProcessHook(&report_process)),
         },
+        activity.as_mut(),
     )
     .await;
 
@@ -543,7 +598,10 @@ pub async fn run_external_cli(
         // the pre-spawn claim gate is a no-op for external runners by construction.
         tool_surface: crate::exec::tool_surface::ResolvedToolSurface::default(),
         output_truncated,
-        control_events: Vec::new(),
+        // SUBA-131 — what the step's monitor raised (pi `result.controlEvents`).
+        control_events: activity
+            .map(activity::ExternalActivityTracker::into_events)
+            .unwrap_or_default(),
         progress: None,
         runner: Some(status),
         external_process: Some(outcome.external_process),
@@ -724,5 +782,223 @@ mod tests {
             let published = &launch.status().args;
             assert_eq!(&published[published.len() - 4..], tail, "{adapter:?}");
         }
+    }
+
+    // ---- SUBA-131: idle detection for an external-CLI step, end to end through `run_sync` ----
+
+    /// The fixture for the SUBA-131 end-to-end tests: a generic external-cli agent running `body`
+    /// in `cwd`, with control on at `needs_attention_after_ms`, and a sink that records every
+    /// raised event and (when `stop_on_event`) stops the run on the first one, so a red/green
+    /// verdict never waits on a sleeping script.
+    struct ActivityFixture {
+        _scripts: tempfile::TempDir,
+        _logs: tempfile::TempDir,
+        agent: AgentConfig,
+        opts: RunOptions,
+        seen: std::sync::Arc<std::sync::Mutex<Vec<crate::exec::control::ControlEvent>>>,
+    }
+
+    fn activity_fixture(
+        cwd: &std::path::Path,
+        body: &str,
+        needs_attention_after_ms: i64,
+        stop_on_event: bool,
+    ) -> ActivityFixture {
+        use crate::runner::{AgentRunnerConfig, ExternalCliRunner};
+
+        let scripts = tempfile::tempdir().unwrap();
+        let script = scripts.path().join("fake-cli.sh");
+        std::fs::write(&script, format!("#!/bin/sh\n{body}\n")).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let logs = tempfile::tempdir().unwrap();
+        let mut agent = crate::exec::testsupport::sample_agent_config("m1", &[]);
+        agent.runner = Some(AgentRunnerConfig::ExternalCli(ExternalCliRunner {
+            adapter: None,
+            command: script.display().to_string(),
+            args: Vec::new(),
+            prompt_delivery_stdin: false,
+            capabilities: None,
+        }));
+        let mut opts = crate::exec::testsupport::base_opts(cwd, &["m1"]);
+        opts.external_log_dir = Some(logs.path().to_path_buf());
+        // A red run ends here rather than at the outer timeout.
+        opts.timeout_ms = Some(20_000);
+        opts.control_config = Some(crate::exec::control::ResolvedControlConfig {
+            needs_attention_after_ms,
+            ..crate::exec::control::ResolvedControlConfig::default()
+        });
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink_seen = std::sync::Arc::clone(&seen);
+        let stop = opts.cancel.clone();
+        opts.on_control_event = Some(crate::exec::control::ControlEventSink::new(move |event| {
+            sink_seen.lock().unwrap().push(event.clone());
+            if stop_on_event {
+                stop.cancel();
+            }
+        }));
+        ActivityFixture {
+            _scripts: scripts,
+            _logs: logs,
+            agent,
+            opts,
+            seen,
+        }
+    }
+
+    async fn run_fixture(fixture: &ActivityFixture) -> SingleResult {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(45),
+            crate::exec::run_sync(&fixture.agent, "work", &fixture.opts),
+        )
+        .await
+        .expect("the run settles well inside the outer timeout")
+    }
+
+    fn idle_raises(events: &[crate::exec::control::ControlEvent]) -> usize {
+        events
+            .iter()
+            .filter(|event| {
+                event.event_type == crate::registration::ControlEventType::NeedsAttention
+                    && event.reason == Some(crate::exec::control::ControlEventReason::Idle)
+            })
+            .count()
+    }
+
+    fn git(dir: &std::path::Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .current_dir(dir)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "git {args:?}: {output:?}");
+    }
+
+    fn git_repo() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        git(dir.path(), &["init", "-q"]);
+        std::fs::write(dir.path().join("tracked.txt"), "one\n").unwrap();
+        git(dir.path(), &["add", "tracked.txt"]);
+        git(dir.path(), &["commit", "-q", "-m", "init"]);
+        dir
+    }
+
+    /// SUBA-131 Verify, first half (upstream `test/integration/external-cli-runner.test.ts`
+    /// @ad11b7ab): an external script that sleeps with no output past `needsAttentionAfterMs`
+    /// raises `needs_attention` — onto the result AND through the live sink. The cwd is not a git
+    /// repository, so there is no probe and the plain idle rule decides.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_sync_flags_a_silent_external_cli_needs_attention() {
+        let cwd = tempfile::tempdir().unwrap();
+        let fixture = activity_fixture(cwd.path(), "sleep 30", 1_500, true);
+        let result = run_fixture(&fixture).await;
+        assert_eq!(idle_raises(&result.control_events), 1, "{result:?}");
+        assert_eq!(idle_raises(&fixture.seen.lock().unwrap()), 1);
+        assert!(result.stopped, "the sink stopped the run: {result:?}");
+        assert!(!result.timed_out, "{result:?}");
+    }
+
+    /// SUBA-131 Verify, second half: a script that writes to stderr (and, upstream's loop over
+    /// both streams, to stdout) more often than the idle window never raises.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_sync_does_not_flag_an_external_cli_that_writes_stderr_periodically() {
+        for redirect in [" >&2", ""] {
+            let cwd = tempfile::tempdir().unwrap();
+            let body = format!(
+                "i=0; while [ $i -lt 25 ]; do echo tick{redirect}; sleep 0.2; i=$((i+1)); done"
+            );
+            let fixture = activity_fixture(cwd.path(), &body, 2_100, true);
+            let result = run_fixture(&fixture).await;
+            assert_eq!(result.exit_code, 0, "{redirect:?}: {result:?}");
+            assert_eq!(
+                idle_raises(&result.control_events),
+                0,
+                "{redirect:?}: {result:?}"
+            );
+            assert!(fixture.seen.lock().unwrap().is_empty(), "{redirect:?}");
+        }
+    }
+
+    /// SUBA-131 — a silent script that keeps changing the git worktree is working: each NEW
+    /// porcelain answer is credited as activity (upstream "credits … Git worktree change").
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_sync_credits_new_git_worktree_changes_as_external_activity() {
+        let repo = git_repo();
+        let body = "i=0; while [ $i -lt 14 ]; do touch f$i; sleep 0.5; i=$((i+1)); done";
+        let fixture = activity_fixture(repo.path(), body, 2_100, true);
+        let result = run_fixture(&fixture).await;
+        assert_eq!(result.exit_code, 0, "{result:?}");
+        assert_eq!(idle_raises(&result.control_events), 0, "{result:?}");
+    }
+
+    /// SUBA-131 — dirtiness that predates the launch is in the baseline, so it is never credited:
+    /// a silent script in a dirty repo still raises (upstream "does not credit unchanged
+    /// pre-existing Git dirtiness").
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_sync_does_not_credit_unchanged_preexisting_git_dirtiness() {
+        let repo = git_repo();
+        std::fs::write(repo.path().join("tracked.txt"), "dirty\n").unwrap();
+        std::fs::write(repo.path().join("untracked.txt"), "x").unwrap();
+        let fixture = activity_fixture(repo.path(), "sleep 30", 2_100, true);
+        let result = run_fixture(&fixture).await;
+        assert_eq!(idle_raises(&result.control_events), 1, "{result:?}");
+        assert!(result.stopped, "{result:?}");
+    }
+
+    /// SUBA-131 — control off: a silent script past the window raises nothing.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_sync_raises_nothing_for_a_silent_external_cli_with_control_disabled() {
+        let cwd = tempfile::tempdir().unwrap();
+        let mut fixture = activity_fixture(cwd.path(), "sleep 3", 1_000, true);
+        if let Some(config) = fixture.opts.control_config.as_mut() {
+            config.enabled = false;
+        }
+        let result = run_fixture(&fixture).await;
+        assert_eq!(result.exit_code, 0, "{result:?}");
+        assert!(result.control_events.is_empty(), "{result:?}");
+        assert!(fixture.seen.lock().unwrap().is_empty());
+    }
+
+    /// SUBA-131 — upstream `subagent-runner.ts:872-876` @ad11b7ab: a stop already in force when the
+    /// baseline settles returns stopped WITHOUT spawning the foreign process.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_sync_never_spawns_an_external_cli_stopped_before_launch() {
+        let cwd = tempfile::tempdir().unwrap();
+        let fixture = activity_fixture(cwd.path(), "sleep 30", 60_000, false);
+        fixture.opts.cancel.cancel();
+        let result = run_fixture(&fixture).await;
+        assert!(result.stopped, "{result:?}");
+        assert_eq!(result.exit_code, 1, "{result:?}");
+        assert_eq!(result.error.as_deref(), Some("Subagent stopped by user."));
+        // Upstream's early return carries no `runner` descriptor.
+        assert!(result.runner.is_none(), "{result:?}");
+        assert!(
+            result
+                .external_process
+                .as_ref()
+                .is_none_or(|process| process.pid.is_none()),
+            "nothing may be spawned: {:?}",
+            result.external_process
+        );
     }
 }

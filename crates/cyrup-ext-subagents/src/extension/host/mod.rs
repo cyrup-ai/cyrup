@@ -94,6 +94,18 @@ pub struct SubagentsExtension {
     /// construction for [`Self::fleet_view_enabled`]'s reason. Gates the async-jobs widget slot in
     /// BOTH modes, and is independent of the fleet view.
     async_widget_enabled: bool,
+    /// SUBA-162 — pi `asyncWidgetCollapsed` (`extension/index.ts:294` @ad11b7ab), captured at
+    /// construction for [`Self::fleet_view_enabled`]'s reason: the async-jobs widget starts (and,
+    /// with no click route to fold it, stays) as its one-line card.
+    async_widget_collapsed: bool,
+    /// SUBA-162 — pi `asyncWidgetLayout` (`extension/index.ts:295` @ad11b7ab), captured likewise.
+    async_widget_layout: crate::tui::render::AsyncWidgetLayout,
+    /// SUBA-162 — the async-jobs widget's layout session: the locked progressive height and
+    /// sticky visible jobs pi keeps in module state (`let widgetLayoutSession`,
+    /// `tui/render.ts:2530` @ad11b7ab). One per extension instance, threaded through
+    /// [`crate::tui::events::render_async_jobs_widget`] on every publish and dropped whenever the
+    /// job list empties (`renderWidget`'s `resetWidgetLayoutSession()`, `:3093`).
+    async_widget_session: Arc<std::sync::Mutex<Option<crate::tui::render::WidgetLayoutSession>>>,
     /// Whether this extension's last write to the async-jobs widget slot left content in it —
     /// pi's tracker only renders that slot while it tracks async jobs (`if
     /// (state.asyncJobs.size > 0) refreshWidget(ctx)`, `extension/index.ts:916-918` @v0.68.0) and
@@ -256,6 +268,9 @@ impl SubagentsExtension {
         let env_overrides = config.env_overrides.clone();
         let fleet_view_enabled = config.fleet_view;
         let async_widget_enabled = config.async_widget_enabled();
+        // SUBA-162 — pi `extension/index.ts:294-295` @ad11b7ab.
+        let async_widget_collapsed = config.async_widget_collapsed();
+        let async_widget_layout = config.async_widget_layout();
         let inline_tool_display_summary = config.inline_tool_display_summary();
         let fleet_keybindings = config.fleet_keybindings();
         // pi `foregroundDetachShortcut: config.foregroundDetachShortcut` (`extension/index.ts:856`).
@@ -327,6 +342,9 @@ impl SubagentsExtension {
             fleet_inspector_open: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             fleet_view_enabled,
             async_widget_enabled,
+            async_widget_collapsed,
+            async_widget_layout,
+            async_widget_session: Arc::new(std::sync::Mutex::new(None)),
             async_slot_occupied: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             inline_tool_display_summary,
             fleet_keybindings,

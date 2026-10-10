@@ -2171,6 +2171,32 @@ impl ControlMonitor {
         self.update_activity_state(now);
     }
 
+    /// SUBA-131 — pi `recordExternalStreamActivity` (`subagent-runner.ts:2635-2639` @ad11b7ab):
+    /// stamp fresh activity WITHOUT re-deriving. Unlike [`Self::note_activity`] this never raises;
+    /// the external-CLI tick ([`crate::exec::external_cli`]'s activity tracker) re-derives through
+    /// its own git-probe gate, which a re-derive here would bypass.
+    pub fn touch_activity(&mut self, now: i64) {
+        self.last_activity_at = Some(now);
+    }
+
+    /// SUBA-131 — the gate test `idleState === "needs_attention"` (`subagent-runner.ts:3169-3178`
+    /// @ad11b7ab) with no side effects: is the idle window past at `now`?
+    ///
+    /// Upstream passes `turnCount: 1` for an external-cli step (`:3173`) so `deriveActivityState`'s
+    /// `turnCount === 0` exemption (`subagent-control.ts:99`) never applies to it. cyrup's
+    /// [`derive_activity_state`] has no turn guard at all, which is that same answer for this
+    /// caller; a future port of the guard must keep treating an external step as one turn.
+    #[must_use]
+    pub fn idle_due(&self, now: i64) -> bool {
+        derive_activity_state(
+            &self.config,
+            self.started_at,
+            self.last_activity_at,
+            self.current_tool.as_deref(),
+            now,
+        ) == Some(ActivityState::NeedsAttention)
+    }
+
     /// The per-event fold (`execution.ts:775-890`), restricted to the fields control actually
     /// consumes. Call once per parsed NDJSON event, with `now` the observation time.
     ///

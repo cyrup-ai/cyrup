@@ -44,8 +44,11 @@
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
-use crate::background::RunState;
+use std::collections::HashMap;
+
+use crate::background::{RunId, RunMode, RunState, StepState};
 use crate::fork_context::ContextMode;
+use crate::tui::events::{AsyncJobSnapshot, WorkflowLaneRow, WorkflowLaneState};
 use crate::tui::{NestedRunSummary, SubagentProgressSnapshot};
 
 // =================================================================================================
@@ -430,6 +433,825 @@ pub fn lines_to_plain_text(lines: &[Line<'static>]) -> Vec<String> {
                 .collect::<String>()
         })
         .collect()
+}
+
+// =================================================================================================
+// Progressive async-jobs widget tier (SUBA-162 — pi `src/tui/render.ts:2516-2820` @ad11b7ab)
+// =================================================================================================
+//
+// pi's mounted async widget picks one of three tiers per render (`fitAdaptiveWidgetLines`,
+// `:2765-2820`): the FULL block when it fits, a one-line card when the terminal is too short, and
+// otherwise a PROGRESSIVE card — a summary header plus one line per visible job — whose height is
+// LOCKED so the editor below it does not jump on every progress tick. Upstream holds the lock in
+// module state (`let widgetLayoutSession`, `:2530`). Here it is a `&mut Option<WidgetLayoutSession>`
+// the caller owns and threads through every call, so this module stays `data in -> lines out`:
+// state in, state out, no `static`.
+
+/// pi `RESERVED_NON_WIDGET_ROWS` (`render.ts:2528` @ad11b7ab): the terminal rows the editor, footer
+/// and transcript keep for themselves before the widget may claim any.
+pub const RESERVED_NON_WIDGET_ROWS: usize = 19;
+
+/// pi `process.stdout.rows || 30` (`render.ts:2537,2542` @ad11b7ab). \[CYRUP-DELTA] The extension
+/// has no terminal-size accessor (`cyrup_ext::host::HostServices` carries none), so the publisher
+/// always passes upstream's own fallback.
+pub const ASYNC_WIDGET_FALLBACK_ROWS: usize = 30;
+
+/// pi `process.stdout.columns || 120` (`render.ts:2546` @ad11b7ab); see
+/// [`ASYNC_WIDGET_FALLBACK_ROWS`].
+pub const ASYNC_WIDGET_FALLBACK_COLUMNS: usize = 120;
+
+/// pi `estimateAvailableWidgetRows()` (`render.ts:2536-2539` @ad11b7ab):
+/// `max(1, rows - RESERVED_NON_WIDGET_ROWS)`.
+#[must_use]
+pub fn estimate_available_widget_rows(rows: usize) -> usize {
+    rows.saturating_sub(RESERVED_NON_WIDGET_ROWS).max(1)
+}
+
+/// pi `collapsedWidgetLineBudget(rows)` (`render.ts:2741-2743` @ad11b7ab):
+/// `max(10, min(14, floor(rows * 0.35)))` — the progressive card's cap.
+#[must_use]
+pub fn collapsed_widget_line_budget(rows: usize) -> usize {
+    (rows.saturating_mul(35) / 100).clamp(10, 14)
+}
+
+/// pi `AsyncWidgetLayout` (`shared/types.ts:2695` @ad11b7ab, `588d2cfd`/#2738), the
+/// `asyncWidgetLayout` config key.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AsyncWidgetLayout {
+    /// `"adaptive"` (the default): the full block while it fits, the progressive card otherwise.
+    #[default]
+    Adaptive,
+    /// `"rows"`: never the full block — always the progressive card (or the one-line card on a
+    /// terminal too short for it), `render.ts:2798`.
+    Rows,
+}
+
+/// pi `WidgetRenderTier` (`render.ts:2516` @ad11b7ab).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WidgetRenderTier {
+    /// The full per-run block ([`render_background_region`]).
+    Full,
+    /// The one-line card ([`build_single_line_widget_lines`]).
+    SingleLine,
+    /// The header-plus-job-lines card with a locked height.
+    Progressive,
+}
+
+/// pi `WidgetLayoutSession` (`render.ts:2518-2526` @ad11b7ab): the tier chosen at lock time and,
+/// for the progressive tier, the locked height, the root-job count it was locked against
+/// (`8d804895`/#2662) and the sticky visible-job keys.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WidgetLayoutSession {
+    /// pi `expanded`.
+    pub expanded: bool,
+    /// pi `rows` — the terminal height the session was taken at.
+    pub rows: usize,
+    /// pi `columns`.
+    pub columns: usize,
+    /// pi `tier`.
+    pub tier: WidgetRenderTier,
+    /// pi `lockedRows`.
+    pub locked_rows: Option<usize>,
+    /// pi `rootJobCount`.
+    pub root_job_count: Option<usize>,
+    /// pi `visibleJobKeys`.
+    pub visible_job_keys: Vec<RunId>,
+}
+
+/// The terminal facts pi's widget reads from `process.stdout` and `ui.getToolsExpanded()`
+/// (`render.ts:2541-2553,2950` @ad11b7ab), passed in rather than read so this module stays pure.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AsyncWidgetViewport {
+    /// Terminal rows.
+    pub rows: usize,
+    /// Terminal columns.
+    pub columns: usize,
+    /// pi `ui.getToolsExpanded()`.
+    pub expanded: bool,
+}
+
+impl Default for AsyncWidgetViewport {
+    fn default() -> Self {
+        Self {
+            rows: ASYNC_WIDGET_FALLBACK_ROWS,
+            columns: ASYNC_WIDGET_FALLBACK_COLUMNS,
+            expanded: false,
+        }
+    }
+}
+
+impl WidgetLayoutSession {
+    /// pi `widgetSessionMatches(expanded)` (`render.ts:2549-2553` @ad11b7ab).
+    fn matches(&self, viewport: &AsyncWidgetViewport) -> bool {
+        self.expanded == viewport.expanded
+            && self.rows == viewport.rows
+            && self.columns == viewport.columns
+    }
+}
+
+/// pi `widgetJobTree(jobs, now)` (`render.ts:2869-2884` @ad11b7ab): attach each job to its loaded
+/// workflow parent, so a workflow's lanes count and render under it; orphans stay top-level, and
+/// so does a live job whose parent is not running (`keepLiveRoot`, `:2876`).
+///
+/// \[CYRUP-DELTA] Degenerate in production today: nothing fills
+/// [`AsyncJobSnapshot::parent_workflow_run_id`], so every job is a root.
+#[derive(Clone, Debug, Default)]
+pub struct WidgetJobTree<'a> {
+    /// pi `roots`, in input order.
+    pub roots: Vec<&'a AsyncJobSnapshot>,
+    children: HashMap<RunId, Vec<&'a AsyncJobSnapshot>>,
+    size: usize,
+}
+
+impl<'a> WidgetJobTree<'a> {
+    /// Build the tree over `jobs`.
+    #[must_use]
+    pub fn build(jobs: &'a [AsyncJobSnapshot]) -> Self {
+        let parents: HashMap<&RunId, &AsyncJobSnapshot> = jobs
+            .iter()
+            .filter(|job| job.mode == RunMode::Workflow)
+            .map(|job| (&job.run_id, job))
+            .collect();
+        let mut tree = Self {
+            roots: Vec::new(),
+            children: HashMap::new(),
+            size: jobs.len(),
+        };
+        for job in jobs {
+            let parent = job
+                .parent_workflow_run_id
+                .as_ref()
+                .and_then(|id| parents.get(id).copied());
+            let keep_live_root = is_progressive_active_job(job)
+                && parent.is_none_or(|parent| parent.state != RunState::Running);
+            match parent {
+                Some(parent) if parent.run_id != job.run_id && !keep_live_root => tree
+                    .children
+                    .entry(parent.run_id.clone())
+                    .or_default()
+                    .push(job),
+                _ => tree.roots.push(job),
+            }
+        }
+        tree
+    }
+
+    /// pi `projectionFor(job).children` — the jobs attached under `job`.
+    #[must_use]
+    pub fn children_of(&self, job: &AsyncJobSnapshot) -> &[&'a AsyncJobSnapshot] {
+        self.children.get(&job.run_id).map_or(&[], Vec::as_slice)
+    }
+}
+
+/// pi `formatAgentRunningLabel(count)` (`shared/status-format.ts:39-41` @ad11b7ab).
+#[must_use]
+pub fn format_agent_running_label(count: usize) -> String {
+    if count == 1 {
+        "1 agent running".to_string()
+    } else {
+        format!("{count} agents running")
+    }
+}
+
+/// pi `runningLeafAgentCount(job, projectionFor)` (`render.ts:2634-2648` @ad11b7ab,
+/// `7e07a22d`/#2584): the leaf entries the fleet's roster makes for this job, so the widget
+/// header agrees with the fleet's `N active agents`
+/// ([`crate::tui::fleet_status::active_leaf_agent_count`]).
+///
+/// - A workflow counts only its loaded child runs, recursively, whatever its own state.
+/// - Any other job counts 0 unless it is running.
+/// - A running job counts its active steps, synthesised from [`AsyncJobSnapshot::agents`] when it
+///   has no step detail; a sequential chain (no live parallel group) excludes every pending step
+///   but the current one. With neither steps nor agents it counts 1.
+///
+/// \[CYRUP-DELTA] cyrup's [`StepState`] has no `queued`, so the active step set is
+/// `running | pending`.
+#[must_use]
+pub fn running_leaf_agent_count(job: &AsyncJobSnapshot, tree: &WidgetJobTree<'_>) -> usize {
+    running_leaf_agent_count_within(job, tree, tree.size)
+}
+
+/// [`running_leaf_agent_count`] with a recursion budget: a parent link can only form a tree from a
+/// root, but this is public, so a cycle handed in directly must still terminate.
+fn running_leaf_agent_count_within(
+    job: &AsyncJobSnapshot,
+    tree: &WidgetJobTree<'_>,
+    budget: usize,
+) -> usize {
+    if job.mode == RunMode::Workflow {
+        let Some(budget) = budget.checked_sub(1) else {
+            return 0;
+        };
+        return tree
+            .children_of(job)
+            .iter()
+            .map(|child| running_leaf_agent_count_within(child, tree, budget))
+            .sum();
+    }
+    if job.state != RunState::Running {
+        return 0;
+    }
+    let sequential = job.mode == RunMode::Chain && !job.active_parallel_group;
+    let current = job.current_step_index.map_or(0, |index| index as usize);
+    let synthesised: Vec<StepState>;
+    let steps: &[StepState] = if job.step_states.is_empty() {
+        synthesised = (0..job.agents.len())
+            .map(|index| {
+                if sequential && index != current {
+                    StepState::Pending
+                } else {
+                    StepState::Running
+                }
+            })
+            .collect();
+        &synthesised
+    } else {
+        &job.step_states
+    };
+    if steps.is_empty() {
+        return 1;
+    }
+    steps
+        .iter()
+        .enumerate()
+        .filter(|(offset, step)| {
+            matches!(step, StepState::Running | StepState::Pending)
+                && !(**step == StepState::Pending && sequential && *offset != current)
+        })
+        .count()
+}
+
+/// pi `widgetHeaderCounts(jobs)` (`render.ts:2555-2564` @ad11b7ab).
+#[derive(Default)]
+struct WidgetHeaderCounts {
+    running: usize,
+    queued: usize,
+    complete: usize,
+    failed: usize,
+    paused: usize,
+    stopped: usize,
+    partial: usize,
+}
+
+impl WidgetHeaderCounts {
+    fn of(jobs: &[&AsyncJobSnapshot]) -> Self {
+        let mut counts = Self::default();
+        for job in jobs {
+            let slot = match job.state {
+                RunState::Running => &mut counts.running,
+                RunState::Queued => &mut counts.queued,
+                RunState::Complete => &mut counts.complete,
+                RunState::Failed => &mut counts.failed,
+                RunState::Paused => &mut counts.paused,
+                RunState::Stopped => &mut counts.stopped,
+                RunState::Partial => &mut counts.partial,
+            };
+            *slot = slot.saturating_add(1);
+        }
+        counts
+    }
+
+    fn has_active(&self) -> bool {
+        self.running > 0 || self.queued > 0
+    }
+
+    /// The header glyph: the spinner while anything runs, `●` while anything is queued, else `○`.
+    fn glyph(&self, tick: usize) -> &'static str {
+        if self.running > 0 {
+            activity_glyph(RunState::Running, tick)
+        } else if self.has_active() {
+            "●"
+        } else {
+            "○"
+        }
+    }
+}
+
+/// pi `activeHeaderTone(theme, hasActive)` (`render.ts:1264-1266` @ad11b7ab).
+fn header_tone(has_active: bool) -> Style {
+    if has_active {
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        dim()
+    }
+}
+
+fn dim() -> Style {
+    Style::default().add_modifier(Modifier::DIM)
+}
+
+/// pi `buildSingleLineWidgetLines(jobs)` (`render.ts:2566-2583` @ad11b7ab): the one-line card —
+/// `{glyph} subagents ({running}/{total} running, …)`. Used for `asyncWidgetCollapsed`, for a
+/// terminal too short for anything else, and for a one-row lock.
+#[must_use]
+pub fn build_single_line_widget_lines(
+    jobs: &[&AsyncJobSnapshot],
+    tick: usize,
+) -> Vec<Line<'static>> {
+    let counts = WidgetHeaderCounts::of(jobs);
+    let total = jobs.len();
+    let mut parts: Vec<String> = Vec::new();
+    if counts.running > 0 {
+        parts.push(format!("{}/{total} running", counts.running));
+    }
+    for (count, word) in [
+        (counts.queued, "queued"),
+        (counts.failed, "failed"),
+        (counts.stopped, "stopped"),
+        (counts.paused, "paused"),
+        (counts.partial, "partial"),
+    ] {
+        if count > 0 {
+            parts.push(format!("{count} {word}"));
+        }
+    }
+    if !counts.has_active() && counts.complete > 0 {
+        parts.push(format!("{}/{total} done", counts.complete));
+    }
+    let summary = if parts.is_empty() {
+        format!("{total} total")
+    } else {
+        parts.join(", ")
+    };
+    let tone = header_tone(counts.has_active());
+    vec![Line::from(vec![
+        Span::styled(counts.glyph(tick).to_string(), tone),
+        Span::raw(" "),
+        Span::styled("subagents", tone),
+        Span::raw(format!(" ({summary})")),
+    ])]
+}
+
+/// pi `progressiveHeaderLine(jobs, …)` (`render.ts:2650-2666` @ad11b7ab):
+/// `{glyph} Async agents · {N agents running}, {M queued}` — or, once nothing is active, the
+/// failed/stopped/paused/`done` parts, or `{n} total`. The running part is the LEAF-agent count
+/// ([`running_leaf_agent_count`]), not the number of running jobs (`7e07a22d`/#2584).
+#[must_use]
+pub fn progressive_header_line(
+    jobs: &[&AsyncJobSnapshot],
+    tree: &WidgetJobTree<'_>,
+    tick: usize,
+) -> Line<'static> {
+    let counts = WidgetHeaderCounts::of(jobs);
+    let mut parts: Vec<String> = Vec::new();
+    let running_agents: usize = jobs
+        .iter()
+        .map(|job| running_leaf_agent_count(job, tree))
+        .sum();
+    if running_agents > 0 {
+        parts.push(format_agent_running_label(running_agents));
+    }
+    if counts.queued > 0 {
+        parts.push(format!("{} queued", counts.queued));
+    }
+    if !counts.has_active() {
+        for (count, word) in [
+            (counts.failed, "failed"),
+            (counts.stopped, "stopped"),
+            (counts.paused, "paused"),
+        ] {
+            if count > 0 {
+                parts.push(format!("{count} {word}"));
+            }
+        }
+        if counts.complete > 0 {
+            parts.push(format!("{}/{} done", counts.complete, jobs.len()));
+        }
+    }
+    let summary = if parts.is_empty() {
+        format!("{} total", jobs.len())
+    } else {
+        parts.join(", ")
+    };
+    let tone = header_tone(counts.has_active());
+    Line::from(vec![
+        Span::styled(counts.glyph(tick).to_string(), tone),
+        Span::raw(" "),
+        Span::styled("Async agents", tone),
+        Span::styled(" · ".to_string(), dim()),
+        Span::styled(summary, dim()),
+    ])
+}
+
+/// pi `isProgressiveActiveJob(job)` (`render.ts:2597-2599` @ad11b7ab).
+fn is_progressive_active_job(job: &AsyncJobSnapshot) -> bool {
+    matches!(job.state, RunState::Running | RunState::Queued)
+}
+
+/// pi `orderedWidgetJobs(jobs)` (`render.ts:2585-2591` @ad11b7ab): running, then queued, then the
+/// rest, each in input order.
+fn ordered_widget_jobs<'a>(jobs: &[&'a AsyncJobSnapshot]) -> Vec<&'a AsyncJobSnapshot> {
+    let rank = |job: &AsyncJobSnapshot| match job.state {
+        RunState::Running => 0u8,
+        RunState::Queued => 1,
+        _ => 2,
+    };
+    let mut ordered = jobs.to_vec();
+    ordered.sort_by_key(|job| rank(job));
+    ordered
+}
+
+/// pi `selectProgressiveJobKeys(jobs, previousKeys, bodyRows)` (`render.ts:2601-2632` @ad11b7ab):
+/// sticky slot filling — previously visible active jobs, then other active jobs, then previously
+/// visible finished jobs, then everything else.
+fn select_progressive_job_keys(
+    jobs: &[&AsyncJobSnapshot],
+    previous: &[RunId],
+    body_rows: usize,
+) -> Vec<RunId> {
+    if body_rows == 0 {
+        return Vec::new();
+    }
+    let by_key: HashMap<&RunId, &AsyncJobSnapshot> =
+        jobs.iter().map(|job| (&job.run_id, *job)).collect();
+    let ordered = ordered_widget_jobs(jobs);
+    let active = |key: &RunId| {
+        by_key
+            .get(key)
+            .is_some_and(|job| is_progressive_active_job(job))
+    };
+    let mut selected: Vec<RunId> = Vec::new();
+    let append = |key: &RunId, selected: &mut Vec<RunId>| {
+        if !selected.contains(key) && by_key.contains_key(key) {
+            selected.push(key.clone());
+        }
+    };
+    for key in previous.iter().filter(|key| active(key)) {
+        append(key, &mut selected);
+        if selected.len() >= body_rows {
+            return selected;
+        }
+    }
+    for job in ordered.iter().filter(|job| is_progressive_active_job(job)) {
+        append(&job.run_id, &mut selected);
+        if selected.len() >= body_rows {
+            return selected;
+        }
+    }
+    for key in previous.iter().filter(|key| !active(key)) {
+        append(key, &mut selected);
+        if selected.len() >= body_rows {
+            return selected;
+        }
+    }
+    for job in &ordered {
+        append(&job.run_id, &mut selected);
+        if selected.len() >= body_rows {
+            break;
+        }
+    }
+    selected
+}
+
+/// pi `widgetStatusGlyph(job)` (`render.ts:1268-1275` @ad11b7ab).
+fn widget_status_glyph(state: RunState, tick: usize) -> Span<'static> {
+    let (glyph, style) = match state {
+        RunState::Running => (activity_glyph(state, tick), activity_glyph_style(state)),
+        RunState::Queued => ("◦", dim()),
+        RunState::Complete => ("✓", Style::default().fg(Color::Green)),
+        RunState::Paused | RunState::Stopped => ("■", Style::default().fg(Color::Yellow)),
+        RunState::Failed | RunState::Partial => ("✗", Style::default().fg(Color::Red)),
+    };
+    Span::styled(glyph.to_string(), style)
+}
+
+/// pi `widgetJobName(job)` (`render.ts:1139-1145` @ad11b7ab), over the fields cyrup's row has:
+/// `parallel`/`chain` by mode, else the agent, else the mode word.
+fn widget_job_name(job: &AsyncJobSnapshot) -> String {
+    match job.mode {
+        RunMode::Parallel => "parallel".to_string(),
+        RunMode::Chain => "chain".to_string(),
+        RunMode::Single | RunMode::Workflow => job
+            .agent
+            .clone()
+            .unwrap_or_else(|| crate::formatters::run_mode_label(job.mode).to_string()),
+    }
+}
+
+/// pi `widgetActivity(job)` (`render.ts:1206-1222` @ad11b7ab): the current tool, `N turns`,
+/// `N tools`, else a per-state fallback.
+///
+/// \[CYRUP-DELTA] The row cannot tell an absent turn/tool count from zero (both are `0`), so a
+/// count is shown only once it is non-zero; no current path, tool duration or live status line is
+/// carried.
+fn widget_activity(job: &AsyncJobSnapshot) -> String {
+    let mut facts: Vec<String> = Vec::new();
+    if let Some(tool) = job.current_tool.as_deref() {
+        facts.push(tool.to_string());
+    }
+    if job.turn_count > 0 {
+        facts.push(format!("{} turns", job.turn_count));
+    }
+    if job.tool_count > 0 {
+        facts.push(format!("{} tools", job.tool_count));
+    }
+    if !facts.is_empty() {
+        return facts.join(" · ");
+    }
+    match job.state {
+        RunState::Running => "thinking…",
+        RunState::Queued => "queued…",
+        RunState::Paused => "Paused",
+        RunState::Stopped => "Stopped",
+        RunState::Partial => "Partial",
+        RunState::Failed => "Failed",
+        RunState::Complete => "Done",
+    }
+    .to_string()
+}
+
+/// pi `progressiveJobLine(job, …)` (`render.ts:2668-2694` @ad11b7ab), non-workflow branch:
+/// `  {glyph} {name}{fork badge} · {status} · {activity}`, with `complete` shown as `done` and the
+/// activity dropped when it only repeats the status.
+///
+/// \[CYRUP-DELTA] No lane signals, lane summary or stats (their projections are not ported), and a
+/// workflow job renders through this same line rather than `compactWorkflowHeaderLine`.
+fn progressive_job_line(job: &AsyncJobSnapshot, tick: usize) -> Line<'static> {
+    let status = match job.state {
+        RunState::Complete => "done",
+        state => crate::background::run_status::run_state_label(state),
+    };
+    let activity = widget_activity(job);
+    let mut spans = vec![
+        Span::raw("  "),
+        widget_status_glyph(job.state, tick),
+        Span::raw(" "),
+        Span::styled(
+            widget_job_name(job),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+    ];
+    if let Some(badge) = fork_badge_span(job.context) {
+        spans.push(badge);
+    }
+    spans.push(Span::styled(" · ".to_string(), dim()));
+    spans.push(Span::styled(status.to_string(), dim()));
+    if activity.to_lowercase() != status {
+        spans.push(Span::styled(" · ".to_string(), dim()));
+        spans.push(Span::styled(activity, dim()));
+    }
+    Line::from(spans)
+}
+
+/// pi `compactWorkflowLaneLine(row, theme, "    ")` (`render.ts:1506-1516` @ad11b7ab), with
+/// `workflowChecklistGlyph` (`:1302-1309`): `    {glyph} {key} · {agent} · {state}`, where a
+/// complete lane shows no state and a running one shows `active`.
+fn workflow_lane_line(row: &WorkflowLaneRow, tick: usize) -> Line<'static> {
+    let (glyph, style) = match row.state {
+        WorkflowLaneState::Running => (
+            activity_glyph(RunState::Running, tick),
+            activity_glyph_style(RunState::Running),
+        ),
+        WorkflowLaneState::Complete => ("✓", Style::default().fg(Color::Green)),
+        WorkflowLaneState::Blocked => ("!", Style::default().fg(Color::Red)),
+        WorkflowLaneState::Failed => ("✗", Style::default().fg(Color::Red)),
+        WorkflowLaneState::Paused | WorkflowLaneState::Stopped => {
+            ("■", Style::default().fg(Color::Yellow))
+        }
+        WorkflowLaneState::Queued => ("◦", dim()),
+    };
+    let state = match row.state {
+        WorkflowLaneState::Complete => None,
+        WorkflowLaneState::Running => Some("active"),
+        WorkflowLaneState::Queued => Some("queued"),
+        WorkflowLaneState::Blocked => Some("blocked"),
+        WorkflowLaneState::Failed => Some("failed"),
+        WorkflowLaneState::Paused => Some("paused"),
+        WorkflowLaneState::Stopped => Some("stopped"),
+    };
+    let mut spans = vec![
+        Span::raw("    "),
+        Span::styled(glyph.to_string(), style),
+        Span::raw(" "),
+        Span::styled(
+            row.key.clone(),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+    ];
+    if let Some(agent) = row.agent.as_deref() {
+        spans.push(Span::styled(format!(" · {agent}"), dim()));
+    }
+    if let Some(state) = state {
+        spans.push(Span::styled(format!(" · {state}"), dim()));
+    }
+    Line::from(spans)
+}
+
+/// pi `progressiveHiddenLine(hiddenJobs)` (`render.ts:2696-2704` @ad11b7ab):
+/// `  +N more (R running, Q queued, F finished)`, where finished is complete + failed + paused +
+/// stopped (partial is not, as upstream).
+fn progressive_hidden_line(hidden: &[&AsyncJobSnapshot]) -> Line<'static> {
+    let counts = WidgetHeaderCounts::of(hidden);
+    let mut parts: Vec<String> = Vec::new();
+    if counts.running > 0 {
+        parts.push(format!("{} running", counts.running));
+    }
+    if counts.queued > 0 {
+        parts.push(format!("{} queued", counts.queued));
+    }
+    let finished = counts
+        .complete
+        .saturating_add(counts.failed)
+        .saturating_add(counts.paused)
+        .saturating_add(counts.stopped);
+    if finished > 0 {
+        parts.push(format!("{finished} finished"));
+    }
+    let suffix = if parts.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", parts.join(", "))
+    };
+    Line::from(vec![Span::styled(
+        format!("  +{} more{suffix}", hidden.len()),
+        dim(),
+    )])
+}
+
+/// One progressive render: pi `buildProgressiveWidgetLines`' return (`render.ts:2706` @ad11b7ab).
+struct ProgressiveRender {
+    lines: Vec<Line<'static>>,
+    visible_job_keys: Vec<RunId>,
+    content_rows: usize,
+}
+
+/// pi `buildProgressiveWidgetLines(jobs, …, lockedRows, previousKeys, …)` (`render.ts:2706-2739`
+/// @ad11b7ab): the header, the sticky visible job lines, the visible workflows' lane rows in the
+/// rows left over (`9a5a2d5e`/#2583), then the `+N more` line — padded with `" "` rows to
+/// `locked_rows`, with `content_rows` the rows the content itself fills.
+fn build_progressive_widget_lines(
+    jobs: &[&AsyncJobSnapshot],
+    tree: &WidgetJobTree<'_>,
+    locked_rows: usize,
+    previous_keys: &[RunId],
+    tick: usize,
+) -> ProgressiveRender {
+    let row_count = locked_rows.max(1);
+    if row_count == 1 {
+        return ProgressiveRender {
+            lines: build_single_line_widget_lines(jobs, tick),
+            visible_job_keys: Vec::new(),
+            content_rows: 1,
+        };
+    }
+    let body_rows = row_count - 1;
+    let mut visible_job_keys = select_progressive_job_keys(jobs, previous_keys, body_rows);
+    let hidden_of = |keys: &[RunId]| -> Vec<&AsyncJobSnapshot> {
+        jobs.iter()
+            .copied()
+            .filter(|job| !keys.contains(&job.run_id))
+            .collect()
+    };
+    let mut hidden = hidden_of(&visible_job_keys);
+    if !hidden.is_empty() && visible_job_keys.len() >= body_rows {
+        visible_job_keys.truncate(body_rows - 1);
+        hidden = hidden_of(&visible_job_keys);
+    }
+    let visible: Vec<&AsyncJobSnapshot> = visible_job_keys
+        .iter()
+        .filter_map(|key| jobs.iter().copied().find(|job| &job.run_id == key))
+        .collect();
+    // Rows left after every visible job line show the visible workflows' lanes (#2583).
+    let mut spare_rows = row_count
+        .saturating_sub(1)
+        .saturating_sub(visible.len())
+        .saturating_sub(usize::from(!hidden.is_empty()));
+    let mut lines = vec![progressive_header_line(jobs, tree, tick)];
+    for job in &visible {
+        lines.push(progressive_job_line(job, tick));
+        if job.mode != RunMode::Workflow {
+            continue;
+        }
+        let shown = job.workflow_lanes.len().min(spare_rows);
+        lines.extend(
+            job.workflow_lanes
+                .iter()
+                .take(shown)
+                .map(|row| workflow_lane_line(row, tick)),
+        );
+        spare_rows -= shown;
+    }
+    if !hidden.is_empty() && lines.len() < row_count {
+        lines.push(progressive_hidden_line(&hidden));
+    }
+    let content_rows = lines.len().min(row_count);
+    lines.resize_with(row_count, || Line::from(" "));
+    ProgressiveRender {
+        lines,
+        visible_job_keys,
+        content_rows,
+    }
+}
+
+/// The lines of `rendered`, cut to `rows`.
+fn first_rows(mut lines: Vec<Line<'static>>, rows: usize) -> Vec<Line<'static>> {
+    lines.truncate(rows);
+    lines
+}
+
+/// pi `fitAdaptiveWidgetLines(jobs, buildLines, …, expanded, frame, projectionFor, layout)`
+/// (`render.ts:2765-2820` @ad11b7ab), with the layout session as a parameter instead of module
+/// state.
+///
+/// 1. Expanded: drop the session and return the full lines.
+/// 2. A matching one-line session stays one line.
+/// 3. A matching progressive session keeps its LOCKED height across content-only updates (#186);
+///    it GROWS, up to the compact cap, when a job would otherwise be hidden; and it SHRINKS to
+///    content only when root jobs leave (`8d804895`/#2662), so a finished job that is still listed
+///    keeps its row.
+/// 4. [`AsyncWidgetLayout::Adaptive`]: the full lines while they fit the available rows.
+/// 5. Two or fewer available rows: the one-line card.
+/// 6. Otherwise lock a fresh progressive card to the rows its content fills at the cap.
+///
+/// `jobs` are the tree's roots. \[CYRUP-DELTA] The full tier is returned as built: pi's
+/// `fitWidgetLineBudget` truncation is not ported (cyrup's full block is at most
+/// [`MAX_DETAILED_RUNS`] + 1 lines, under every budget it could apply), nor is the single-job
+/// `stageProgress` exception (no stage projection is carried).
+pub fn fit_adaptive_widget_lines(
+    jobs: &[&AsyncJobSnapshot],
+    tree: &WidgetJobTree<'_>,
+    full_lines: impl FnOnce() -> Vec<Line<'static>>,
+    viewport: &AsyncWidgetViewport,
+    layout: AsyncWidgetLayout,
+    session: &mut Option<WidgetLayoutSession>,
+    tick: usize,
+) -> Vec<Line<'static>> {
+    if viewport.expanded {
+        *session = None;
+        return full_lines();
+    }
+    let available_rows = estimate_available_widget_rows(viewport.rows);
+    let cap_rows = available_rows.min(collapsed_widget_line_budget(viewport.rows));
+    let fresh = |tier: WidgetRenderTier| WidgetLayoutSession {
+        expanded: viewport.expanded,
+        rows: viewport.rows,
+        columns: viewport.columns,
+        tier,
+        locked_rows: None,
+        root_job_count: None,
+        visible_job_keys: Vec::new(),
+    };
+
+    if let Some(current) = session.as_mut().filter(|current| current.matches(viewport)) {
+        match (current.tier, current.locked_rows) {
+            (WidgetRenderTier::SingleLine, _) => {
+                return build_single_line_widget_lines(jobs, tick);
+            }
+            (WidgetRenderTier::Progressive, Some(locked_rows)) => {
+                let mut rendered = build_progressive_widget_lines(
+                    jobs,
+                    tree,
+                    locked_rows,
+                    &current.visible_job_keys,
+                    tick,
+                );
+                let mut next_locked = locked_rows;
+                if rendered.visible_job_keys.len() < jobs.len() && locked_rows < cap_rows {
+                    rendered = build_progressive_widget_lines(
+                        jobs,
+                        tree,
+                        cap_rows,
+                        &current.visible_job_keys,
+                        tick,
+                    );
+                    next_locked = locked_rows.max(rendered.content_rows);
+                } else if jobs.len() < current.root_job_count.unwrap_or(0) {
+                    next_locked = rendered.content_rows;
+                }
+                current.locked_rows = Some(next_locked);
+                current.root_job_count = Some(jobs.len());
+                current.visible_job_keys = rendered.visible_job_keys;
+                return first_rows(rendered.lines, next_locked);
+            }
+            _ => {}
+        }
+    }
+
+    if layout == AsyncWidgetLayout::Adaptive {
+        let lines = full_lines();
+        if lines.len() <= available_rows {
+            *session = Some(fresh(WidgetRenderTier::Full));
+            return lines;
+        }
+    }
+
+    if available_rows <= 2 {
+        *session = Some(fresh(WidgetRenderTier::SingleLine));
+        return build_single_line_widget_lines(jobs, tick);
+    }
+
+    // Lock to the rows the content fills so the fixed-height card has no blank padding.
+    let rendered = build_progressive_widget_lines(jobs, tree, cap_rows, &[], tick);
+    let locked_rows = rendered.content_rows;
+    *session = Some(WidgetLayoutSession {
+        locked_rows: Some(locked_rows),
+        root_job_count: Some(jobs.len()),
+        visible_job_keys: rendered.visible_job_keys,
+        ..fresh(WidgetRenderTier::Progressive)
+    });
+    first_rows(rendered.lines, locked_rows)
 }
 
 #[cfg(test)]
@@ -837,5 +1659,335 @@ mod tests {
             !grid.contains("fork"),
             "fresh context must never paint a fork badge:\n{grid}"
         );
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // SUBA-162 — the progressive async-widget tier (pi `render.ts:2516-2820` @ad11b7ab)
+    // -----------------------------------------------------------------------------------------
+
+    use crate::tui::events::{AsyncJobSnapshot, AsyncWidgetRender, render_async_jobs_widget};
+
+    fn job(id: &str, mode: RunMode, state: RunState, steps: &[StepState]) -> AsyncJobSnapshot {
+        let status = RunStatus::queued(RunId::from_token(id.to_string()), mode, None);
+        let mut job =
+            AsyncJobSnapshot::from_run_status(&status, Some(id.to_string()), ContextMode::Fresh);
+        job.state = state;
+        job.step_states = steps.to_vec();
+        job
+    }
+
+    fn running(id: &str) -> AsyncJobSnapshot {
+        job(
+            id,
+            RunMode::Single,
+            RunState::Running,
+            &[StepState::Running],
+        )
+    }
+
+    fn rows_view() -> AsyncWidgetRender {
+        AsyncWidgetRender {
+            layout: AsyncWidgetLayout::Rows,
+            ..AsyncWidgetRender::default()
+        }
+    }
+
+    fn paint(jobs: &[AsyncJobSnapshot], session: &mut Option<WidgetLayoutSession>) -> Vec<String> {
+        lines_to_plain_text(&render_async_jobs_widget(jobs, &rows_view(), session, 0))
+    }
+
+    fn header_count(jobs: &[AsyncJobSnapshot]) -> usize {
+        let tree = WidgetJobTree::build(jobs);
+        tree.roots
+            .iter()
+            .map(|job| running_leaf_agent_count(job, &tree))
+            .sum()
+    }
+
+    /// The Verify's first clause in widget terms: a four-lane workflow beside one single run reads
+    /// `5 agents running` — four lanes plus the single — and the workflow's OWN steps are not
+    /// counted. Mutations killed: the pre-#2584 rule (running root jobs: `2 agents running`), and
+    /// the workflow arm removed (the workflow counts its own two steps: 3).
+    #[test]
+    fn a_workflow_counts_its_loaded_children_not_itself() {
+        let workflow = job(
+            "wf",
+            RunMode::Workflow,
+            RunState::Running,
+            &[StepState::Running, StepState::Running],
+        );
+        let mut jobs = vec![workflow];
+        for lane in ["l1", "l2", "l3", "l4"] {
+            let mut child = running(lane);
+            child.parent_workflow_run_id = Some(RunId::from_token("wf"));
+            jobs.push(child);
+        }
+        jobs.push(running("solo"));
+
+        let tree = WidgetJobTree::build(&jobs);
+        assert_eq!(tree.roots.len(), 2, "the lanes hang under the workflow");
+        assert_eq!(running_leaf_agent_count(&jobs[0], &tree), 4);
+        let mut session = None;
+        let lines = paint(&jobs, &mut session);
+        assert!(
+            lines[0].ends_with(" Async agents · 5 agents running"),
+            "{lines:?}"
+        );
+    }
+
+    /// pi `:2640-2647`: a sequential chain counts only its current step; a live parallel group
+    /// lifts the exclusion. Mutation killed: dropping the `sequential && offset != current`
+    /// exclusion (3 instead of 1).
+    #[test]
+    fn a_sequential_chain_counts_only_its_current_step() {
+        let mut chain = job(
+            "chain",
+            RunMode::Chain,
+            RunState::Running,
+            &[
+                StepState::Complete,
+                StepState::Running,
+                StepState::Pending,
+                StepState::Pending,
+            ],
+        );
+        chain.current_step_index = Some(1);
+        assert_eq!(header_count(std::slice::from_ref(&chain)), 1);
+        let mut session = None;
+        let lines = paint(std::slice::from_ref(&chain), &mut session);
+        assert!(lines[0].ends_with(" · 1 agent running"), "{lines:?}");
+
+        let mut grouped = job(
+            "grouped",
+            RunMode::Chain,
+            RunState::Running,
+            &[StepState::Running, StepState::Pending, StepState::Pending],
+        );
+        grouped.current_step_index = Some(0);
+        grouped.active_parallel_group = true;
+        assert_eq!(header_count(std::slice::from_ref(&grouped)), 3);
+    }
+
+    /// pi `:2641-2645`: a running job with no step detail counts its `agents` (a sequential chain
+    /// only its current one), and with no agents either counts 1; a queued job counts 0 and shows
+    /// as `N queued`. Mutations killed: the pre-#2584 rule (the three-agent parallel counts 1),
+    /// the empty-steps arm returning 0, and the `state != Running` guard removed (the queued job
+    /// counts 1).
+    #[test]
+    fn a_job_with_no_step_detail_counts_its_agents() {
+        let mut parallel = job("par", RunMode::Parallel, RunState::Running, &[]);
+        parallel.agents = vec!["a".into(), "b".into(), "c".into()];
+        assert_eq!(header_count(std::slice::from_ref(&parallel)), 3);
+
+        let mut chain = job("ch", RunMode::Chain, RunState::Running, &[]);
+        chain.agents = vec!["a".into(), "b".into(), "c".into()];
+        chain.current_step_index = Some(2);
+        assert_eq!(header_count(std::slice::from_ref(&chain)), 1);
+
+        let bare = job("bare", RunMode::Single, RunState::Running, &[]);
+        assert_eq!(header_count(std::slice::from_ref(&bare)), 1);
+
+        let queued = job(
+            "q",
+            RunMode::Single,
+            RunState::Queued,
+            &[StepState::Pending],
+        );
+        assert_eq!(header_count(std::slice::from_ref(&queued)), 0);
+
+        let mut session = None;
+        let lines = paint(&[parallel, queued], &mut session);
+        assert!(
+            lines[0].ends_with(" Async agents · 3 agents running, 1 queued"),
+            "{lines:?}"
+        );
+    }
+
+    /// pi `:2659-2664`: with nothing active the header reports outcomes; with none of those
+    /// either, `N total`.
+    #[test]
+    fn the_progressive_header_reports_outcomes_once_nothing_is_active() {
+        let jobs = [
+            job("a", RunMode::Single, RunState::Complete, &[]),
+            job("b", RunMode::Single, RunState::Failed, &[]),
+        ];
+        let refs: Vec<&AsyncJobSnapshot> = jobs.iter().collect();
+        let tree = WidgetJobTree::build(&jobs);
+        let header = lines_to_plain_text(&[progressive_header_line(&refs, &tree, 0)]);
+        assert_eq!(header[0], "○ Async agents · 1 failed, 1/2 done");
+        let partial = [job("p", RunMode::Single, RunState::Partial, &[])];
+        let refs: Vec<&AsyncJobSnapshot> = partial.iter().collect();
+        let tree = WidgetJobTree::build(&partial);
+        let header = lines_to_plain_text(&[progressive_header_line(&refs, &tree, 0)]);
+        assert_eq!(header[0], "○ Async agents · 1 total");
+    }
+
+    /// #2583: the card locks to the rows its content fills, with no blank padding. Mutation
+    /// killed: locking at the cap (10 rows, 6 of them blank).
+    #[test]
+    fn the_progressive_card_locks_to_its_content_rows() {
+        let jobs = [running("a"), running("b"), running("c")];
+        let mut session = None;
+        let lines = paint(&jobs, &mut session);
+        assert_eq!(lines.len(), 4, "{lines:?}");
+        assert!(lines.iter().all(|l| !l.trim().is_empty()), "{lines:?}");
+        assert_eq!(session.as_ref().and_then(|s| s.locked_rows), Some(4));
+    }
+
+    /// The Verify's "the locked card keeps its height as jobs finish": a finished job keeps a row
+    /// (listed after the active ones, as `done`), so the card neither shrinks nor goes blank.
+    /// Mutation killed: dropping `select_progressive_job_keys`' passes for inactive jobs (the
+    /// finished jobs vanish and the card is padded with blank rows).
+    #[test]
+    fn the_locked_card_keeps_its_height_as_jobs_finish() {
+        let mut jobs = vec![running("a"), running("b"), running("c")];
+        let mut session = None;
+        assert_eq!(paint(&jobs, &mut session).len(), 4);
+
+        jobs[0].state = RunState::Complete;
+        jobs[1].state = RunState::Complete;
+        let lines = paint(&jobs, &mut session);
+        assert_eq!(lines.len(), 4, "{lines:?}");
+        assert!(lines[1].contains("c · running"), "{lines:?}");
+        assert!(lines[2].ends_with("a · done"), "{lines:?}");
+        assert!(lines[3].ends_with("b · done"), "{lines:?}");
+
+        jobs[2].state = RunState::Complete;
+        let lines = paint(&jobs, &mut session);
+        assert_eq!(lines.len(), 4, "{lines:?}");
+        assert!(lines.iter().all(|l| !l.trim().is_empty()), "{lines:?}");
+        assert!(lines[0].ends_with(" Async agents · 3/3 done"), "{lines:?}");
+    }
+
+    /// #186: the height holds across a content-only update. A workflow's lane rows fill the rows
+    /// left after the job lines (#2583); when a lane drops out of the projection the card keeps
+    /// its locked height (padded) rather than jumping. Mutations killed: no lane fill (the first
+    /// card is 2 rows), and sizing every pass to its content (the second card is 3 rows).
+    #[test]
+    fn workflow_lanes_fill_spare_rows_and_the_lock_holds_across_content_only_updates() {
+        use crate::tui::events::{WorkflowLaneRow, WorkflowLaneState};
+        let lane = |key: &str, agent: &str, state| WorkflowLaneRow {
+            key: key.to_string(),
+            agent: Some(agent.to_string()),
+            state,
+        };
+        let mut workflow = job("wf", RunMode::Workflow, RunState::Running, &[]);
+        workflow.workflow_lanes = vec![
+            lane("plan", "planner", WorkflowLaneState::Complete),
+            lane("build", "coder", WorkflowLaneState::Running),
+            lane("review", "reviewer", WorkflowLaneState::Queued),
+        ];
+        let mut session = None;
+        let lines = paint(std::slice::from_ref(&workflow), &mut session);
+        assert_eq!(lines.len(), 5, "{lines:?}");
+        assert_eq!(lines[2], "    ✓ plan · planner");
+        assert!(lines[3].ends_with(" build · coder · active"), "{lines:?}");
+        assert_eq!(lines[4], "    ◦ review · reviewer · queued");
+
+        workflow.workflow_lanes.truncate(1);
+        let lines = paint(std::slice::from_ref(&workflow), &mut session);
+        assert_eq!(lines.len(), 5, "the locked height holds: {lines:?}");
+        assert_eq!(lines[2], "    ✓ plan · planner");
+    }
+
+    /// The Verify's "grows, up to the cap, when a job starts while jobs are hidden". Mutations
+    /// killed: deleting the grow branch (the two-job card stays 2 rows, `+2 more`), and growing
+    /// past the cap (12 jobs at the 11 available rows).
+    #[test]
+    fn the_locked_card_grows_up_to_the_cap_when_a_job_starts_while_jobs_are_hidden() {
+        let mut jobs = vec![running("j00")];
+        let mut session = None;
+        assert_eq!(paint(&jobs, &mut session).len(), 2);
+
+        jobs.push(running("j01"));
+        let lines = paint(&jobs, &mut session);
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        assert!(
+            lines[1].contains("j00") && lines[2].contains("j01"),
+            "{lines:?}"
+        );
+
+        for index in 2..12 {
+            jobs.push(running(&format!("j{index:02}")));
+        }
+        let lines = paint(&jobs, &mut session);
+        assert_eq!(
+            lines.len(),
+            collapsed_widget_line_budget(ASYNC_WIDGET_FALLBACK_ROWS),
+            "{lines:?}"
+        );
+        assert_eq!(lines.len(), 10);
+        assert_eq!(lines[9], "  +4 more (4 running)");
+        assert!(lines.iter().all(|l| !l.trim().is_empty()), "{lines:?}");
+    }
+
+    /// `8d804895`/#2662: the lock shrinks to content when root jobs leave, so a departed job leaves
+    /// no blank rows. Mutation killed: deleting the `jobs.len() < root_job_count` branch (7 rows,
+    /// 5 of them blank).
+    #[test]
+    fn the_card_shrinks_when_root_jobs_leave() {
+        let jobs: Vec<AsyncJobSnapshot> = (0..6).map(|i| running(&format!("s{i}"))).collect();
+        let mut session = None;
+        assert_eq!(paint(&jobs, &mut session).len(), 7);
+        for _ in 0..2 {
+            let lines = paint(&jobs[..1], &mut session);
+            assert_eq!(lines.len(), 2, "{lines:?}");
+            assert!(lines.iter().all(|l| !l.trim().is_empty()), "{lines:?}");
+        }
+    }
+
+    /// pi `renderWidget`'s `resetWidgetLayoutSession()` on an empty list (`render.ts:3093`).
+    /// Mutation killed: skipping the reset.
+    #[test]
+    fn an_empty_job_list_resets_the_session() {
+        let mut session = None;
+        assert_eq!(
+            paint(&[running("a"), running("b"), running("c")], &mut session).len(),
+            4
+        );
+        assert!(session.is_some());
+        assert!(paint(&[], &mut session).is_empty());
+        assert!(session.is_none());
+    }
+
+    /// pi `:2798` (#2738): the adaptive layout keeps the full tier while it fits, byte for byte
+    /// the pre-SUBA-162 widget. Mutation killed: treating `Adaptive` as `Rows` (the output gains
+    /// the `Async agents` header).
+    #[test]
+    fn the_adaptive_layout_keeps_the_full_tier_when_it_fits() {
+        let jobs = [running("a"), running("b"), running("c")];
+        let mut session = None;
+        let lines = render_async_jobs_widget(&jobs, &AsyncWidgetRender::default(), &mut session, 3);
+        let snapshots: Vec<SubagentProgressSnapshot> = jobs
+            .iter()
+            .map(AsyncJobSnapshot::to_progress_snapshot)
+            .collect();
+        assert_eq!(
+            lines_to_plain_text(&lines),
+            lines_to_plain_text(&render_background_region(&snapshots, 3))
+        );
+        assert_eq!(session.map(|s| s.tier), Some(WidgetRenderTier::Full));
+    }
+
+    /// pi `:2984-2986`: the collapsed card counts EVERY job, and leaves the session alone.
+    #[test]
+    fn the_collapsed_widget_is_one_line_over_every_job() {
+        let jobs = [
+            running("a"),
+            job("b", RunMode::Single, RunState::Queued, &[]),
+            job("c", RunMode::Single, RunState::Failed, &[]),
+        ];
+        let view = AsyncWidgetRender {
+            collapsed: true,
+            ..rows_view()
+        };
+        let mut session = None;
+        let lines = lines_to_plain_text(&render_async_jobs_widget(&jobs, &view, &mut session, 0));
+        assert_eq!(lines.len(), 1);
+        assert!(
+            lines[0].ends_with(" subagents (1/3 running, 1 queued, 1 failed)"),
+            "{lines:?}"
+        );
+        assert!(session.is_none());
     }
 }
