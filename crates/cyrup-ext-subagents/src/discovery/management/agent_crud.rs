@@ -257,6 +257,9 @@ fn build_definition(
         inherit_global_context: fields.inherit_global_context.unwrap_or(false),
         // SUBA-100 — `config.machine`; absent means the agent runs locally.
         machine: fields.machine.clone().unwrap_or(None),
+        // SUBA-178 — management never sets a launcher (`config.launcher` is refused by
+        // `config_parse`, upstream `agent-management.ts:457`); edit the file's frontmatter.
+        launcher: None,
         // SUBA-133 — `config.advertise`; absent means not advertised.
         advertise: fields.advertise.unwrap_or(None),
         // SUBA-102 — pi `config.mutationTools` (`:514-518`); absent means none declared.
@@ -352,6 +355,9 @@ fn merge_fields(
             .machine
             .clone()
             .unwrap_or_else(|| existing.machine.clone()),
+        // SUBA-178 — upstream's `editableAgentConfig` spread carries `launcher` through an update,
+        // and the serializer writes it back (`agent-serializer.ts:139`).
+        launcher: existing.launcher.clone(),
         // SUBA-133 — `Some(None)` is pi's `delete target.advertise`; an unstated key keeps the
         // base's value (the `editableAgentConfig` spread).
         advertise: fields.advertise.unwrap_or(existing.advertise),
@@ -825,6 +831,45 @@ mod tests {
             !content.contains("systemPromptMode:"),
             "must not add absent default fields:\n{content}"
         );
+    }
+
+    #[test]
+    fn an_update_of_another_field_keeps_the_launcher_on_disk() {
+        // SUBA-178 — upstream's `editableAgentConfig` spread carries `launcher` through an update
+        // and `agent-serializer.ts:139` writes it back. Dropping it here would make the next run of
+        // this agent go unwrapped with no error, so drive the real update path and re-read the file.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("researcher.md");
+        std::fs::write(
+            &path,
+            "---\nname: researcher\ndescription: Research\nlauncher: net\n---\n\nResearch things\n",
+        )
+        .expect("write");
+        let existing = crate::discovery::frontmatter::parse_agent_file(
+            &std::fs::read_to_string(&path).expect("read"),
+            AgentSource::User,
+            &path,
+        )
+        .expect("parses");
+        assert_eq!(existing.launcher.as_deref(), Some("net"));
+
+        let fields = AgentFields {
+            description: Some("Research v2".to_string()),
+            ..AgentFields::default()
+        };
+        let outcome = update_agent(&existing, &fields)
+            .expect("no error")
+            .expect("not skipped");
+        assert_eq!(outcome.definition.description, "Research v2");
+        assert_eq!(outcome.definition.launcher.as_deref(), Some("net"));
+
+        let reparsed = crate::discovery::frontmatter::parse_agent_file(
+            &std::fs::read_to_string(&path).expect("read back"),
+            AgentSource::User,
+            &path,
+        )
+        .expect("re-parses");
+        assert_eq!(reparsed.launcher.as_deref(), Some("net"));
     }
 
     #[test]

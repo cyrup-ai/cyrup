@@ -549,6 +549,57 @@ mod tests {
         }
     }
 
+    /// SUBA-178 — `runnerLaunchers` is read only from this user file, validated by upstream's
+    /// `validateRunnerLaunchersConfig` (`extension/config.ts:106-116` @ad11b7ab) and fail-closed
+    /// (`:17`): an invalid value refuses the WHOLE file, so a `maxSubagentDepth` beside it is not
+    /// applied either. A valid map loads typed and without the "unknown key" warning.
+    ///
+    /// Mutations killed: dropping `runnerLaunchers` from `FAIL_CLOSED_CONFIG_KEYS` (the load
+    /// returns the defaults); dropping the validator call (`[]` parses typed and loads); dropping
+    /// the struct field (the valid case yields no launchers). Base tree: the bad file loaded with a
+    /// warning.
+    #[test]
+    fn an_invalid_runner_launchers_value_refuses_the_whole_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let subagents_dir = dir.path().join("subagents");
+        std::fs::create_dir_all(&subagents_dir).expect("mkdir");
+        std::fs::write(
+            subagents_dir.join("config.json"),
+            r#"{"runnerLaunchers": {"net": []}, "maxSubagentDepth": 3}"#,
+        )
+        .expect("write");
+        let Err(refused) = load_subagent_extension_config(&dirs_at(dir.path())) else {
+            panic!("an invalid runnerLaunchers value must refuse the whole file");
+        };
+        assert_eq!(refused.keys(), ["runnerLaunchers"]);
+        assert!(
+            refused.to_string().contains(
+                r#"config.runnerLaunchers["net"] must be a non-empty argv array of non-blank strings without NUL characters"#
+            ),
+            "{refused}"
+        );
+
+        std::fs::write(
+            subagents_dir.join("config.json"),
+            r#"{"runnerLaunchers": {"net": ["env", "--", "X=1"]}, "maxSubagentDepth": 3}"#,
+        )
+        .expect("write");
+        let cfg = load_subagent_extension_config(&dirs_at(dir.path())).expect("valid map loads");
+        assert_eq!(cfg.max_subagent_depth, 3);
+        let launchers = cfg.runner_launchers.expect("runnerLaunchers is typed");
+        assert_eq!(
+            launchers.get("net").map(Vec::as_slice),
+            Some(["env".to_owned(), "--".to_owned(), "X=1".to_owned()].as_slice())
+        );
+        assert!(
+            SubagentExtensionConfig::config_warnings(&serde_json::json!({
+                "runnerLaunchers": {"net": ["env"]}
+            }))
+            .is_empty(),
+            "a typed key must not warn as unknown"
+        );
+    }
+
     /// SUBA-166 — the typed-parse arm fails closed on the same list. `maxSubagentDepth: "five"`
     /// passes every RAW validator (none of them looks at it) and dies in serde, which is the other
     /// `return rooted()` the row names (`subagent_config.rs:91-97` before this change).

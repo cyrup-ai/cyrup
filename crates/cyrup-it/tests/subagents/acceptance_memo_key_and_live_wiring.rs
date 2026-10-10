@@ -780,6 +780,7 @@ async fn artifacts_false_disarms_verify_memoization_along_with_the_quadruple() {
 
 fn fixture_persona(name: &str) -> ResolvedAgentPersona {
     ResolvedAgentPersona {
+        launcher: None,
         model_is_settings_default: false,
         default_tool_timeout_ms: None,
         machine: None,
@@ -849,6 +850,7 @@ fn runner_config(
     step: SingleStepSpec,
 ) -> RunnerConfig {
     RunnerConfig {
+        launcher: None,
         tool_timeout: Default::default(),
         // SUBA-119 — no operator-declared response-id alias for this fixture run.
         model_response_aliases: None,

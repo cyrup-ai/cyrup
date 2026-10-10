@@ -347,6 +347,21 @@ async fn run_sync_unnamed(agent: &AgentConfig, task: &str, opts: &RunOptions) ->
     if let Some(failure) = depth_guard_failure(agent, task) {
         return failure;
     }
+    // SUBA-178 — the hop-2 backstop. An agent that names a runner launcher runs only inside a
+    // background runner started under that launcher, which clears the field on the child's
+    // config (`background/runner_main/executor.rs`). A `Some` reaching here means nobody wrapped
+    // this child — a foreground call, a workflow-script child, a slash/RPC path that bypassed the
+    // tool gate, or a runner started under another launcher — so it is refused with upstream's
+    // foreground sentence (`subagent-executor.ts:7541-7544` @ad11b7ab) rather than run as if
+    // nothing had been asked. `[CYRUP-DELTA]` no upstream analogue: upstream refuses at each
+    // entry point instead of at the chokepoint every child passes.
+    if let Some(launcher) = agent.launcher.as_deref() {
+        return pre_spawn_failure(
+            agent,
+            task,
+            crate::runner_launcher::foreground_launcher_error(&agent.name, launcher),
+        );
+    }
     // SUBA-135 — pi `preflightLaunchCwd` at the head of the run (`execution.ts:1604` @v0.71.0; the
     // runner's per-step `subagent-runner.ts:1061`): a missing or non-directory cwd is refused by
     // name before anything is prepared or spawned. `run_sync` is handed the resolved cwd only, so
@@ -2177,6 +2192,7 @@ pub(crate) fn output_capability_projection(agent: &AgentConfig) -> AgentDefiniti
     AgentDefinition {
         inherit_global_context: false,
         machine: None,
+        launcher: agent.launcher.clone(),
         advertise: None,
         // SUBA-102 — the agent's extra mutating tool names, read by
         // [`crate::exec::control::is_mutating_tool`] on the live control path.
@@ -2934,6 +2950,42 @@ mod tests {
         assert_eq!(
             result.final_output.as_deref(),
             Some("argv:--no-chrome --effort medium")
+        );
+    }
+
+    /// SUBA-178 — the hop-2 backstop: an agent that still names a launcher when it reaches
+    /// `run_sync` was not wrapped by anyone (a foreground call, a workflow-script child, a path
+    /// that bypassed the tool gate), so it is refused with upstream's foreground sentence before
+    /// anything spawns. Control: the same agent with no launcher really spawns.
+    ///
+    /// Mutation killed: removing the backstop (the fake child runs and writes its marker).
+    #[tokio::test]
+    async fn run_sync_refuses_a_launcher_agent_outside_its_runner() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (script, marker) = crate::exec::testsupport::write_fake_claude(dir.path());
+        let mut agent = sample_agent_config("m1", &[]);
+        agent.model = None;
+        agent.name = "boxed".to_string();
+        agent.runner = Some(crate::exec::testsupport::claude_code_runner(&script));
+        agent.launcher = Some("net".to_string());
+
+        let result = run_sync(&agent, "review", &base_opts(dir.path(), &["m1"])).await;
+        assert_eq!(result.exit_code, 1, "{result:?}");
+        assert_eq!(
+            result.error.as_deref(),
+            Some(
+                "Agent 'boxed' uses launcher 'net', which wraps the background runner only. \
+                 Foreground children run inside the parent process, so a launcher cannot wrap \
+                 them. Omit async or pass async:true; clarify and foregroundOnly are unsupported."
+            )
+        );
+        assert!(!marker.exists(), "nothing may run unwrapped");
+
+        agent.launcher = None;
+        let _ = run_sync(&agent, "review", &base_opts(dir.path(), &["m1"])).await;
+        assert!(
+            marker.exists(),
+            "control: the unwrapped-by-design agent does spawn"
         );
     }
 

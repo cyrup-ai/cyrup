@@ -421,6 +421,7 @@ mod tests {
         artifact_config: crate::artifacts::ArtifactConfig,
     ) -> RunnerConfig {
         RunnerConfig {
+            launcher: None,
             tool_timeout: Default::default(),
             model_response_aliases: None,
             runner_process_instance_id: None,

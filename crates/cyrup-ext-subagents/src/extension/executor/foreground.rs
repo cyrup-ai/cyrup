@@ -2229,6 +2229,7 @@ mod tests {
     /// never quietly make these assertions pass for the wrong reason.
     fn gate_agent(model: Option<&str>, fallbacks: &[&str]) -> AgentDefinition {
         AgentDefinition {
+            launcher: None,
             default_tool_timeout_ms: None,
             inherit_global_context: false,
             machine: None,

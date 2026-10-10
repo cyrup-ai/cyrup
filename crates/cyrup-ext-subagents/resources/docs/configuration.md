@@ -45,11 +45,58 @@ Three stores shape the extension, and they are separate on purpose.
 | `authorityPolicy` | object | *unset* | Per-action authority decisions |
 | `turnBudget` | object | *unset* | `{maxTurns, graceTurns}` fallback |
 | `toolDescriptionMode` | string | `full` | `full`, `compact`, or a path to a custom description |
+| `runnerLaunchers` | object | *unset* | Named argv prefixes that wrap background runners; see below |
 
 A missing file means all defaults. A malformed file warns on stderr —
 `cyrup: warning: ... is not valid subagents config JSON ...; using defaults` — and cyrup carries on
 with defaults. Two exceptions fail the whole load instead: an unknown key inside `missions`, and an
-invalid `artifactDir` or `authorityPolicy`.
+invalid `artifactDir` or `authorityPolicy`. A file that declares any fail-closed key
+(`runnerLaunchers` among them) is refused as a whole when any part of it is invalid, rather than
+replaced by the defaults.
+
+## `runnerLaunchers`
+
+```json
+{ "runnerLaunchers": { "net": ["env", "SUBAGENT_SANDBOX=1"] } }
+```
+
+Each entry names an argv prefix. An agent selects one with `launcher: net` frontmatter, and its
+background runner is then started as that argv followed by the runner command, passed to the
+operating system as an argument list, never through a shell. The key is read only from this user
+config file; settings, agent overrides, agent management and tool calls cannot define or set a
+launcher. An agent file, including a project agent from a cloned repository, can only name a
+launcher this file already defines, but a project agent with the same name as one of your agents
+still shadows it, so your own agent files and their names are the trust boundary. Names start with
+a letter or digit and use only letters, digits, `.`, `_` and `-` (at most 128 characters); every
+argv is a non-empty list of non-blank strings without NUL characters. An invalid value refuses the
+whole file.
+
+A launcher wraps the background runner only, so a launcher agent always runs in the background, and
+an explicit `async: false`, a `machine`, an external `runner`, or a chain mixing launchers is refused.
+An agent naming a launcher this file does not define fails before anything launches. `status.json`
+records `launcher: {name, argv}`, and a resumed run reuses the launcher it was started with, reading
+its argv from this file again. Wrappers that `exec` the runner (`env`, most sandbox tools) or keep it
+as a child are supported; cyrup has no runner identity handshake, so a broker that starts the runner
+outside the wrapper's process tree is not.
+
+A launcher command must:
+
+- run the runner command it receives, either by replacing itself with it (`exec`) or by staying
+  attached until it exits;
+- give the runner read and write access, at the same absolute paths, to the subagent temp root
+  (`async-subagent-runs/`, `async-subagent-results/` and `supervisor-channels/`; the root is
+  `CYRUP_SUBAGENTS_TEMP_ROOT` when set, else `cyrup-subagents` under the OS temp directory), the
+  child session and artifact directories, the agent directory (`~/.cyrup/agent`, which holds
+  auth), and the working directory, plus read access to the cyrup install;
+- allow network access to your model provider;
+- if it filters the environment, pass through at least `HOME`, `PATH`, `TMPDIR`, every `CYRUP_*`
+  variable, and the API keys your provider needs.
+
+Steering, stop and supervisor requests and replies travel through files in those directories, not
+through signals, so they work as long as the paths are shared. A sandbox such as `bwrap` therefore
+needs a `--bind` for each of those directories; a read-only root with no writable binds, or a
+network namespace with no route to the provider, starts a runner that fails on its first write or
+model call.
 
 ## `authorityPolicy`
 

@@ -53,6 +53,8 @@ pub mod placement;
 pub mod prompt_runtime;
 pub mod registration;
 pub mod runner;
+/// SUBA-178 — `runnerLaunchers` / agent `launcher:` (pi `runs/shared/runner-launcher.ts`).
+pub mod runner_launcher;
 pub mod spawn;
 pub mod time;
 pub mod tui;

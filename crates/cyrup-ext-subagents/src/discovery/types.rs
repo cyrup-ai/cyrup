@@ -1357,6 +1357,11 @@ pub struct AgentDefinition {
     /// SUBA-100 — pi `machine?: string` (`agents.ts:56,180` @v0.68.0): the Herdr saved machine
     /// (id or label) this agent's child is placed on. `None` = run locally.
     pub machine: Option<String>,
+    /// SUBA-178 — pi `launcher?: string` (`agents/agents.ts:186-187`, parsed `:2283-2289`
+    /// @ad11b7ab): the `runnerLaunchers` user-config entry whose argv wraps this agent's
+    /// background runner. Already validated against the name rule and refused alongside
+    /// `machine` / an external runner at parse time. `None` = unwrapped.
+    pub launcher: Option<String>,
     /// SUBA-133 — pi `advertise?: boolean` (`agents.ts:140`, parsed `:2107-2111` @v0.71.0): the
     /// author opted this file-defined agent into the `<advertised_subagents>` catalog the parent's
     /// system prompt carries ([`crate::discovery::advertised::build_advertised_agent_prompt`]).
@@ -1847,6 +1852,7 @@ mod tests {
 
     fn sample_agent(tools: Option<Vec<ToolRef>>) -> AgentDefinition {
         AgentDefinition {
+            launcher: None,
             inherit_global_context: false,
             machine: None,
             advertise: None,

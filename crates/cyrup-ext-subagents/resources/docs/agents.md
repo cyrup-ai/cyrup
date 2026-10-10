@@ -55,6 +55,7 @@ supported for multi-line values.
 | `memory` | Persistent-memory scope folded into the child's prompt |
 | `async` | Run in the background by default when the call site does not say |
 | `timeoutMs` | Default run timeout when the call site does not say |
+| `launcher` | Name of a `runnerLaunchers` entry in the user `config.json` whose argv wraps this agent's background runner (see `configuration.md`). The agent always runs in the background; `async: false`, a `machine`, an external `runner`, or a name the config does not define is refused, never run unwrapped |
 
 **Unrecognised keys are preserved, not dropped.** They round-trip through cyrup's own agent editing
 intact. That is how a `permission:` block rides along in an agent file and gets enforced by the

@@ -73,6 +73,7 @@ fn message_end_line(text: &str) -> String {
 /// is decided by the child's own exit code and nothing else.
 fn reporter_persona() -> ResolvedAgentPersona {
     ResolvedAgentPersona {
+        launcher: None,
         model_is_settings_default: false,
         default_tool_timeout_ms: None,
         machine: None,

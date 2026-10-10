@@ -199,6 +199,7 @@ async fn run_foreground_through_the_executor(
 
 fn base_agent_config(model: &str) -> AgentConfig {
     AgentConfig {
+        launcher: None,
         model_is_settings_default: false,
         machine: None,
         acceptance_role: None,
@@ -304,6 +305,7 @@ fn base_run_options(cwd: &Path, model: &str) -> RunOptions {
 
 fn fixture_persona(name: &str) -> ResolvedAgentPersona {
     ResolvedAgentPersona {
+        launcher: None,
         model_is_settings_default: false,
         default_tool_timeout_ms: None,
         machine: None,
@@ -394,6 +396,7 @@ async fn prepare_background_run(
         .expect("mkdir run_dir");
 
     let config = RunnerConfig {
+        launcher: None,
         tool_timeout: Default::default(),
         // SUBA-119 — no operator-declared response-id alias for this fixture run.
         model_response_aliases: None,

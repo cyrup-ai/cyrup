@@ -545,6 +545,28 @@ impl SubagentExecutor {
         // behind; the spawn-time refusal in `exec::external_cli` stays as the backstop for the
         // foreground path.
         refuse_external_runner_fast(&steps, &resolved_agents)?;
+        // Hoisted above the run directory for SUBA-178's `/proc/self/exe` refusal below; read
+        // again unchanged at the spawn.
+        let resolved_command = cfg
+            .spawn_command
+            .clone()
+            .unwrap_or_else(crate::spawn::resolve_spawn_command);
+        // SUBA-178 — the runner launcher every step of this one runner shares, resolved from the
+        // USER config and refused BEFORE the async dir, the run dir, the capacity claim or any
+        // process exists (pi `async-execution.ts:1501-1504`, `:992-999`, `:1078-1079`, `:1898-1900`
+        // @ad11b7ab). Never falls back to an unwrapped runner.
+        let launcher = resolve_steps_runner_launcher(
+            &steps,
+            &resolved_agents,
+            mode,
+            cfg.runner_launchers.as_ref(),
+        )?;
+        if let Some(launcher) = &launcher
+            && let Some(refusal) =
+                crate::runner_launcher::refuse_bare_self_exe(&resolved_command, launcher)
+        {
+            return Err(SubagentError::Management(refusal));
+        }
 
         // SUBA-N03: the run id is the CALLER'S (`BackgroundStepsSpec::run_id`), never minted here.
         // pi hoists it the same way and for the same reason — `const id = randomUUID()` at
@@ -746,6 +768,8 @@ impl SubagentExecutor {
         let runner_process_instance_id =
             crate::background::process_terminal::RunnerProcessInstanceId::new();
         let runner_config = crate::background::runner_main::RunnerConfig {
+            // SUBA-178 — pi `launcher` in the runner config (`async-execution.ts:1661`/`:2302`).
+            launcher: launcher.clone(),
             // SUBA-021 — the run-level usage budget the orchestrator validated, carried verbatim
             // onto hop 2 (pi `spawnRunner({ …, usageBudget })`, `async-execution.ts:1471`).
             usage_budget,
@@ -945,10 +969,6 @@ impl SubagentExecutor {
         // `Command` — and ONLY when the roots are a sandbox the child could not derive itself.
         // Neither is set on this process. With both unset this is byte-for-byte the previous
         // `spawn_detached_runner` behaviour.
-        let resolved_command = cfg
-            .spawn_command
-            .clone()
-            .unwrap_or_else(crate::spawn::resolve_spawn_command);
         // A REVIVE re-applies the source run's persisted ceilings to its runner through the same
         // two env vars the runner already reads (pi `thinkingCeiling`/`capabilityCeiling` on the
         // revived launch, `subagent-executor.ts:2151,2183` @v0.68.0). Inserted ONLY when the caller
@@ -1029,18 +1049,26 @@ impl SubagentExecutor {
         // SUBA-141 — pi `proc.once("close", …)` (`async-execution.ts:759-770` @v0.71.0): this
         // process also watches the runner and finalizes its proof from the exit it observes, so a
         // runner that dies without reaching its own tail leaves its exit code and signal behind.
-        let pid = match crate::background::spawn_detached::spawn_detached_runner_observed(
+        //
+        // SUBA-178 — under a launcher the wrapper is spawned with the runner command as its
+        // arguments (pi `async-execution.ts:785`). [CYRUP-DELTA] cyrup has no broker identity
+        // handshake (`runner-startup.json` / `launcher-close.json`, filed as SUBA-214): the
+        // observed process and `mark_started`'s pid are the WRAPPER's. For an exec wrapper (`env`,
+        // most sandbox launchers) that IS the runner; for an attached wrapper its exit follows the
+        // runner's. The runner stamps its own pid into `status.json` either way.
+        let pid = match crate::background::spawn_detached::spawn_detached_runner_launched(
             &resolved_command,
             &cfg_path,
             &run_paths.runner_stdout_log,
             &run_paths.runner_stderr_log,
             &env_overlay,
-            crate::background::spawn_detached::RunnerCloseObserver {
+            launcher.as_ref(),
+            Some(crate::background::spawn_detached::RunnerCloseObserver {
                 run_dir: run_paths.run_dir.clone(),
                 run_id: run_id.clone(),
                 process_instance_id: runner_process_instance_id.clone(),
                 lease_root: crate::background::session_leases_root_in(&cfg.roots),
-            },
+            }),
         ) {
             Ok(pid) => pid,
             Err(error) => {
@@ -1212,6 +1240,117 @@ fn refuse_external_runner_fast(
     Ok(())
 }
 
+/// SUBA-178 — the one launcher a background runner is started under, or the reason it cannot
+/// start. One runner hosts every step, so every agent shares one launcher or none (pi
+/// `buildAsyncRunnerSteps`, `async-execution.ts:992-999` @ad11b7ab); a launcher cannot combine
+/// with a step's machine or an external runner (`:1078-1079`); and an undefined name refuses the
+/// launch, never runs it unwrapped. A single run speaks `executeAsyncSingle`'s sentences
+/// (`resolveAgentRunnerLauncher`, `:1898-1900`); a chain or parallel run checks the undefined
+/// name first with `executeAsyncChain`'s (`:1501-1504`), then the shared set, then placement.
+///
+/// Agent names are the step names (the `resolved_agents` keys), deduplicated in first-seen order.
+fn resolve_steps_runner_launcher(
+    steps: &[RunnerStep],
+    resolved_agents: &BTreeMap<String, ResolvedAgentPersona>,
+    mode: RunMode,
+    runner_launchers: Option<&crate::runner_launcher::RunnerLaunchers>,
+) -> Result<Option<crate::runner_launcher::RunnerLauncher>, SubagentError> {
+    let mut specs: Vec<&SingleStepSpec> = Vec::new();
+    for step in steps {
+        match step {
+            RunnerStep::SingleStep(spec) => specs.push(spec),
+            RunnerStep::ParallelGroup(group) => specs.extend(group.steps.iter()),
+            RunnerStep::DynamicGroup(dynamic) => specs.push(&dynamic.template),
+            RunnerStep::ImportAsyncRoot(_) => {}
+        }
+    }
+    let launcher_of = |name: &str| {
+        resolved_agents
+            .get(name)
+            .and_then(|persona| persona.launcher.clone())
+    };
+    let requested_machine = |spec: &SingleStepSpec| -> Option<String> {
+        spec.machine
+            .as_ref()
+            .map(|placement| placement.requested.clone())
+            .or_else(|| {
+                resolved_agents
+                    .get(&spec.agent)
+                    .and_then(|persona| persona.machine.clone())
+            })
+    };
+    if mode == RunMode::Single {
+        let Some(spec) = specs.first() else {
+            return Ok(None);
+        };
+        let persona = resolved_agents.get(&spec.agent);
+        return crate::runner_launcher::resolve_agent_runner_launcher(
+            &spec.agent,
+            persona.and_then(|p| p.launcher.as_deref()),
+            persona.and_then(|p| p.runner.as_ref()),
+            runner_launchers,
+            requested_machine(spec).as_deref(),
+        )
+        .map_err(SubagentError::Management);
+    }
+    let mut names: Vec<&str> = Vec::new();
+    for spec in &specs {
+        if !names.contains(&spec.agent.as_str()) {
+            names.push(spec.agent.as_str());
+        }
+    }
+    let result_mode = match mode {
+        RunMode::Parallel => "parallel",
+        _ => "chain",
+    };
+    if let Some(undefined) = names
+        .iter()
+        .filter_map(|name| launcher_of(name))
+        .find(|launcher| {
+            crate::runner_launcher::lookup_runner_launcher(runner_launchers, launcher).is_none()
+        })
+    {
+        return Err(SubagentError::Management(format!(
+            "Launcher '{undefined}' used by this {result_mode} is not defined in runnerLaunchers in the user subagent config."
+        )));
+    }
+    let step_launchers: Vec<(&str, Option<String>)> = names
+        .iter()
+        .map(|name| (*name, launcher_of(name)))
+        .collect();
+    let mut distinct: Vec<&Option<String>> = Vec::new();
+    for (_, launcher) in &step_launchers {
+        if !distinct.contains(&launcher) {
+            distinct.push(launcher);
+        }
+    }
+    if distinct.len() > 1 {
+        let listed: Vec<String> = step_launchers
+            .iter()
+            .map(|(name, launcher)| format!("{name} ({})", launcher.as_deref().unwrap_or("none")))
+            .collect();
+        return Err(SubagentError::Management(format!(
+            "Every agent in one background runner must use the same launcher or none: {}.",
+            listed.join(", ")
+        )));
+    }
+    for spec in &specs {
+        let persona = resolved_agents.get(&spec.agent);
+        if let Some(error) = crate::runner_launcher::runner_launcher_placement_error(
+            &spec.agent,
+            persona.and_then(|p| p.launcher.as_deref()),
+            persona.and_then(|p| p.runner.as_ref()),
+            requested_machine(spec).as_deref(),
+        ) {
+            return Err(SubagentError::Management(error));
+        }
+    }
+    Ok(distinct
+        .first()
+        .and_then(|launcher| launcher.as_deref())
+        .and_then(|name| crate::runner_launcher::lookup_runner_launcher(runner_launchers, name)))
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(
@@ -1331,6 +1470,353 @@ runner: {\"type\": \"external-cli\", \"command\": \"true\"}\n---\n\nbody\n";
             assert!(
                 !entries(&default_async_root_in(&roots, dir.path())).is_empty(),
                 "the unrefused launch creates its run directory: {text}"
+            );
+        }
+    }
+
+    /// SUBA-178 — runner launchers, driven through the REAL tool entry (`subagent`) and the
+    /// production background launch: an undefined launcher is refused before any run directory,
+    /// capacity slot or session spawn charge exists; a launcher forces background; a foreground
+    /// request, machine placement and mixed launchers are refused; a defined launcher is recorded
+    /// in the runner config and the recovery descriptor.
+    mod runner_launcher_launch {
+        use super::*;
+        use crate::extension::executor::paths::{default_async_root_in, default_results_dir_in};
+        use crate::paths::Roots;
+        use crate::spawn::SpawnCommand;
+
+        const SESSION: &str = "launcher-session";
+
+        fn entries(dir: &Path) -> Vec<PathBuf> {
+            match std::fs::read_dir(dir) {
+                Ok(read) => read.filter_map(|e| e.ok().map(|e| e.path())).collect(),
+                Err(_) => Vec::new(),
+            }
+        }
+
+        fn agent_md(name: &str, extra: &str) -> String {
+            format!("---\nname: {name}\ndescription: D\n{extra}---\n\nbody\n")
+        }
+
+        /// A sandboxed executor whose runner is `true(1)` (spawned and confirmed, writes nothing),
+        /// bound to a session with a `maxActiveAsyncRunsPerSession: 1` pool.
+        async fn harness(
+            dir: &Path,
+            agents: &[(&str, String)],
+            configure: impl FnOnce(&mut crate::registration::SubagentExtensionConfig),
+        ) -> (Arc<SubagentExecutor>, crate::extension::tool::SubagentTool) {
+            let agents_dir = dir.join(".cyrup").join("agents");
+            std::fs::create_dir_all(&agents_dir).expect("mkdir agents");
+            for (name, body) in agents {
+                std::fs::write(agents_dir.join(format!("{name}.md")), body).expect("write agent");
+            }
+            let executor = Arc::new(SubagentExecutor::new());
+            executor.set_host_services(Arc::new(crate::extension::testsupport::FixedSessionHost(
+                SESSION,
+            )));
+            crate::extension::testsupport::arm_scoped_missions(&executor, dir).await;
+            {
+                let mut cfg = executor.config_cell().lock().await;
+                cfg.roots = Roots::sandboxed(dir);
+                cfg.max_active_async_runs_per_session = Some(1);
+                cfg.spawn_command = Some(SpawnCommand {
+                    binary: PathBuf::from("true"),
+                    base_args: Vec::new(),
+                });
+                configure(&mut cfg);
+            }
+            let tool =
+                crate::extension::tool::SubagentTool::new(Arc::clone(&executor), dir.to_path_buf());
+            (executor, tool)
+        }
+
+        async fn launch_text(
+            tool: &crate::extension::tool::SubagentTool,
+            params: serde_json::Value,
+        ) -> String {
+            match crate::extension::testsupport::dispatch_tool(tool, params).await {
+                Ok(result) => crate::extension::testsupport::tool_text(&result),
+                Err(error) => error.to_string(),
+            }
+        }
+
+        fn net() -> crate::runner_launcher::RunnerLaunchers {
+            crate::runner_launcher::RunnerLaunchers::from([(
+                "net".to_string(),
+                vec!["env".to_string(), "--".to_string(), "X=1".to_string()],
+            )])
+        }
+
+        fn run_dirs(dir: &Path) -> Vec<PathBuf> {
+            entries(&default_async_root_in(&Roots::sandboxed(dir), dir))
+        }
+
+        /// Nothing at all was created or charged: no run directory, no result, no capacity slot,
+        /// no session spawn charge.
+        async fn assert_nothing_launched(dir: &Path, executor: &SubagentExecutor, what: &str) {
+            let roots = Roots::sandboxed(dir);
+            assert!(run_dirs(dir).is_empty(), "{what}: no run directory");
+            assert!(
+                entries(&default_results_dir_in(&roots, dir)).is_empty(),
+                "{what}: no result"
+            );
+            assert_eq!(
+                capacity_slots(dir, SESSION).await,
+                0,
+                "{what}: no capacity slot"
+            );
+            assert_eq!(
+                executor.spawn_budget_snapshot(40).used,
+                0,
+                "{what}: no session spawn charge"
+            );
+        }
+
+        fn runner_config_launcher(dir: &Path) -> serde_json::Value {
+            let runs = run_dirs(dir);
+            assert_eq!(runs.len(), 1, "exactly one run: {runs:?}");
+            let raw = std::fs::read(runs[0].join("runner-config.json")).expect("runner config");
+            let config: serde_json::Value = serde_json::from_slice(&raw).expect("json");
+            config
+                .get("launcher")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null)
+        }
+
+        /// THE row's Verify, clause 1: an agent with `launcher: nope` and no config entry fails
+        /// before any run dir or fan-out slot is created — for a single, an explicit async single,
+        /// a parallel and a chain launch — and spends no session spawn budget. Control: the same
+        /// agent naming a DEFINED launcher creates its run.
+        ///
+        /// Mutations killed: removing the tool gate (the launch then creates its run and charges
+        /// the budget, and the hop-2 child would fail); moving the gate after
+        /// `reserve_subagent_spawns` (the budget assertion). Base tree: red, the launch "silently
+        /// runs unwrapped" and creates the run.
+        #[tokio::test]
+        async fn an_undefined_launcher_is_refused_before_any_run_dir_spawn_charge_or_slot() {
+            const UNDEFINED: &str = "Agent 'sandboxed' uses launcher 'nope', which is not defined in runnerLaunchers in the user subagent config.";
+            for params in [
+                serde_json::json!({"agent": "sandboxed", "task": "t"}),
+                serde_json::json!({"agent": "sandboxed", "task": "t", "async": true}),
+                serde_json::json!({"tasks": [{"agent": "sandboxed", "task": "t"}]}),
+                serde_json::json!({"chain": [{"agent": "sandboxed", "task": "t"}]}),
+            ] {
+                let dir = tempfile::tempdir().expect("tempdir");
+                let (executor, tool) = harness(
+                    dir.path(),
+                    &[("sandboxed", agent_md("sandboxed", "launcher: nope\n"))],
+                    |_| {},
+                )
+                .await;
+                let text = launch_text(&tool, params.clone()).await;
+                assert!(text.contains(UNDEFINED), "{params}: {text}");
+                assert_nothing_launched(dir.path(), &executor, &params.to_string()).await;
+            }
+
+            let dir = tempfile::tempdir().expect("tempdir");
+            let (executor, tool) = harness(
+                dir.path(),
+                &[("sandboxed", agent_md("sandboxed", "launcher: net\n"))],
+                |cfg| cfg.runner_launchers = Some(net()),
+            )
+            .await;
+            let text = launch_text(
+                &tool,
+                serde_json::json!({"agent": "sandboxed", "task": "t"}),
+            )
+            .await;
+            assert_eq!(
+                run_dirs(dir.path()).len(),
+                1,
+                "the defined launcher launches: {text}"
+            );
+            assert_eq!(capacity_slots(dir.path(), SESSION).await, 1);
+            assert_eq!(executor.spawn_budget_snapshot(40).used, 1);
+            assert_eq!(
+                runner_config_launcher(dir.path()),
+                serde_json::json!({"name": "net", "argv": ["env", "--", "X=1"]})
+            );
+            // pi `launcher: launcher.name` in the recovery descriptor (`async-execution.ts:2170`).
+            let descriptor: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(run_dirs(dir.path())[0].join("recovery-descriptor.json"))
+                    .expect("descriptor"),
+            )
+            .expect("json");
+            assert_eq!(descriptor.get("launcher"), Some(&serde_json::json!("net")));
+        }
+
+        /// The background-launch check on its own (pi `executeAsyncSingle`,
+        /// `async-execution.ts:1898-1900`): a launch that never passed the tool gate (here
+        /// `spawn_background`, which slash commands and RPC reach directly) is refused before the
+        /// run directory and the capacity slot exist. Mutation killed: removing the
+        /// `resolve_steps_runner_launcher` call, or moving it below the run-dir creation.
+        #[tokio::test]
+        async fn the_background_launch_refuses_an_undefined_launcher_on_its_own() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let (executor, _tool) = harness(
+                dir.path(),
+                &[("worker", agent_md("worker", "launcher: nope\n"))],
+                |_| {},
+            )
+            .await;
+            let refused = executor
+                .spawn_background(bare_background_request(dir.path()))
+                .await
+                .expect_err("an undefined launcher never launches");
+            assert_eq!(
+                refused.to_string(),
+                "Agent 'worker' uses launcher 'nope', which is not defined in runnerLaunchers in the user subagent config."
+            );
+            assert!(run_dirs(dir.path()).is_empty());
+            assert_eq!(capacity_slots(dir.path(), SESSION).await, 0);
+        }
+
+        /// pi `subagent-executor.ts:7531-7544` @ad11b7ab: a launcher agent goes to the background
+        /// whenever the caller omitted `async`, over the agent's `async: false` and
+        /// `asyncByDefault: false`; an explicit `async: false` is refused with upstream's sentence,
+        /// even when `forceTopLevelAsync` would have rewritten it.
+        ///
+        /// Mutations killed: dropping the `Some(true)` rewrite (the omitted-async launch runs in
+        /// the foreground, creating no run); checking `is_background` instead of the raw request
+        /// (the `forceTopLevelAsync` case launches).
+        #[tokio::test]
+        async fn a_launcher_agent_is_forced_to_background_and_never_runs_foreground() {
+            const FOREGROUND: &str = "Agent 'boxed' uses launcher 'net', which wraps the background runner only. Foreground children run inside the parent process, so a launcher cannot wrap them. Omit async or pass async:true; clarify and foregroundOnly are unsupported.";
+            let boxed = agent_md("boxed", "launcher: net\nasync: false\n");
+
+            let dir = tempfile::tempdir().expect("tempdir");
+            let (_executor, tool) = harness(dir.path(), &[("boxed", boxed.clone())], |cfg| {
+                cfg.runner_launchers = Some(net());
+                cfg.async_by_default = false;
+            })
+            .await;
+            let text = launch_text(&tool, serde_json::json!({"agent": "boxed", "task": "t"})).await;
+            assert_eq!(
+                run_dirs(dir.path()).len(),
+                1,
+                "forced to background: {text}"
+            );
+            assert_eq!(
+                runner_config_launcher(dir.path()),
+                serde_json::json!({"name": "net", "argv": ["env", "--", "X=1"]})
+            );
+
+            for force_top_level_async in [false, true] {
+                let dir = tempfile::tempdir().expect("tempdir");
+                let (executor, tool) = harness(dir.path(), &[("boxed", boxed.clone())], |cfg| {
+                    cfg.runner_launchers = Some(net());
+                    cfg.force_top_level_async = force_top_level_async;
+                })
+                .await;
+                let text = launch_text(
+                    &tool,
+                    serde_json::json!({"agent": "boxed", "task": "t", "async": false}),
+                )
+                .await;
+                assert!(
+                    text.contains(FOREGROUND),
+                    "force={force_top_level_async}: {text}"
+                );
+                assert_nothing_launched(dir.path(), &executor, "async:false").await;
+            }
+        }
+
+        /// One runner hosts every step, so a chain mixing a launcher agent and an unwrapped one is
+        /// refused (pi `async-execution.ts:992-999`), and a launcher cannot run on a machine
+        /// (`runner-launcher.ts:11-16`). Neither leaves a run behind.
+        ///
+        /// Mutations killed: removing the shared-launcher check (the mixed chain launches under
+        /// `net`); removing the placement check from the tool gate.
+        #[tokio::test]
+        async fn mixed_launchers_in_one_runner_are_refused_and_placement_too() {
+            let agents = [
+                ("a", agent_md("a", "launcher: net\n")),
+                ("b", agent_md("b", "")),
+            ];
+            let dir = tempfile::tempdir().expect("tempdir");
+            let (_executor, tool) = harness(dir.path(), &agents, |cfg| {
+                cfg.runner_launchers = Some(net());
+            })
+            .await;
+            let text = launch_text(
+                &tool,
+                serde_json::json!({"chain": [{"agent": "a", "task": "t"}, {"agent": "b", "task": "t"}]}),
+            )
+            .await;
+            assert!(
+                text.contains("Every agent in one background runner must use the same launcher or none: a (net), b (none)."),
+                "{text}"
+            );
+            assert!(run_dirs(dir.path()).is_empty());
+            assert_eq!(capacity_slots(dir.path(), SESSION).await, 0);
+
+            let dir = tempfile::tempdir().expect("tempdir");
+            let (executor, tool) = harness(dir.path(), &agents, |cfg| {
+                cfg.runner_launchers = Some(net());
+            })
+            .await;
+            let text = launch_text(
+                &tool,
+                serde_json::json!({"agent": "a", "task": "t", "machine": "m"}),
+            )
+            .await;
+            assert!(
+                text.contains("Agent 'a' uses launcher 'net', which wraps the local Pi background runner, so it cannot run on machine 'm'."),
+                "{text}"
+            );
+            assert_nothing_launched(dir.path(), &executor, "machine").await;
+        }
+
+        fn step(agent: &str) -> SingleStepSpec {
+            serde_json::from_value(serde_json::json!({"agent": agent, "task": "t"}))
+                .expect("a bare step spec")
+        }
+
+        fn persona(launcher: Option<&str>) -> ResolvedAgentPersona {
+            let content = match launcher {
+                Some(launcher) => agent_md("x", &format!("launcher: {launcher}\n")),
+                None => agent_md("x", ""),
+            };
+            let def = crate::discovery::frontmatter::parse_agent_file(
+                &content,
+                crate::discovery::types::AgentSource::Project,
+                Path::new("/x.md"),
+            )
+            .expect("parses");
+            ResolvedAgentPersona::from_agent_definition(&def)
+        }
+
+        /// `executeAsyncChain`'s undefined-name sentence names the run's result mode
+        /// (`async-execution.ts:1501-1504`), and is checked before the shared-launcher rule.
+        #[test]
+        fn a_chain_or_parallel_names_its_mode_in_the_undefined_sentence() {
+            let agents = BTreeMap::from([
+                ("a".to_string(), persona(Some("nope"))),
+                ("b".to_string(), persona(None)),
+            ]);
+            let steps = vec![
+                RunnerStep::SingleStep(step("a")),
+                RunnerStep::SingleStep(step("b")),
+            ];
+            for (mode, word) in [(RunMode::Chain, "chain"), (RunMode::Parallel, "parallel")] {
+                let error = resolve_steps_runner_launcher(&steps, &agents, mode, Some(&net()))
+                    .expect_err("undefined");
+                assert_eq!(
+                    error.to_string(),
+                    format!(
+                        "Launcher 'nope' used by this {word} is not defined in runnerLaunchers in the user subagent config."
+                    )
+                );
+            }
+            let agents = BTreeMap::from([
+                ("a".to_string(), persona(Some("net"))),
+                ("b".to_string(), persona(Some("net"))),
+            ]);
+            assert_eq!(
+                resolve_steps_runner_launcher(&steps, &agents, RunMode::Chain, Some(&net()))
+                    .expect("one shared launcher")
+                    .map(|l| l.name),
+                Some("net".to_string())
             );
         }
     }
@@ -2044,6 +2530,174 @@ runner: {\"type\": \"external-cli\", \"command\": \"true\"}\n---\n\nbody\n";
             after.reservation_token, before.reservation_token,
             "a transfer rewrites the owner in place; it does not re-reserve"
         );
+    }
+
+    /// SUBA-178 — a revive reuses the RECORDED launcher (pi `async-resume.ts:640-641` @ad11b7ab)
+    /// and re-reads its argv from the CURRENT user config; a name that is no longer defined
+    /// refuses the resume with upstream's sentence (`subagent-executor.ts:2213-2216`) BEFORE the
+    /// source run's capacity slot moves and before a new run exists. A run launched WITHOUT a
+    /// launcher revives unwrapped even after its agent file gained one (recorded absence wins).
+    ///
+    /// Mutations killed: removing the resume refusal (the background launch then refuses with the
+    /// generic "not defined" sentence instead of upstream's resume sentence); dropping the
+    /// `apply_to_persona` launcher line (the third case revives under `net`).
+    #[tokio::test]
+    async fn a_revive_reuses_the_recorded_launcher_or_refuses_before_capacity_moves() {
+        const SESSION: &str = "revive-launcher";
+        async fn launch_and_settle(
+            dir: &Path,
+            agent_file: &str,
+            launchers: Option<crate::runner_launcher::RunnerLaunchers>,
+        ) -> (SubagentExecutor, RunId) {
+            let agents_dir = dir.join(".cyrup").join("agents");
+            std::fs::create_dir_all(&agents_dir).expect("mkdir agents dir");
+            std::fs::write(agents_dir.join("worker.md"), agent_file).expect("write worker");
+            let executor = SubagentExecutor::new();
+            executor.set_host_services(Arc::new(crate::extension::testsupport::FixedSessionHost(
+                SESSION,
+            )));
+            {
+                let mut cfg = executor.config_cell().lock().await;
+                cfg.roots = crate::paths::Roots::sandboxed(dir);
+                cfg.max_active_async_runs_per_session = Some(1);
+                cfg.runner_launchers = launchers;
+                cfg.spawn_command = Some(crate::spawn::SpawnCommand {
+                    binary: PathBuf::from("true"),
+                    base_args: Vec::new(),
+                });
+            }
+            let source = executor
+                .spawn_background(bare_background_request(dir))
+                .await
+                .expect("the source run launches");
+            let roots = crate::paths::Roots::sandboxed(dir);
+            let paths = RunPaths::for_run(
+                &crate::extension::executor::paths::default_async_root_in(&roots, dir),
+                &crate::extension::executor::paths::default_results_dir_in(&roots, dir),
+                &source,
+            );
+            let session_file = dir.join("source-session.jsonl");
+            std::fs::write(&session_file, "").expect("write dummy transcript");
+            let mut status =
+                crate::background::RunStatus::queued(source.clone(), RunMode::Single, Some(4242));
+            status
+                .advance_state(crate::background::RunState::Running)
+                .expect("Queued -> Running");
+            let mut step = crate::background::StepStatus::pending("worker");
+            step.status = crate::background::StepState::Complete;
+            step.session_file = Some(session_file);
+            status.steps = vec![step];
+            status
+                .advance_state(crate::background::RunState::Complete)
+                .expect("Running -> Complete");
+            status.cwd = Some(dir.to_path_buf());
+            status.session_id = crate::identity::SessionId::parse(SESSION);
+            write_atomic_json(&paths.status, &status)
+                .await
+                .expect("write terminal status fixture");
+            (executor, source)
+        }
+        fn runner_launcher_of(dir: &Path, run: &str) -> Option<serde_json::Value> {
+            let roots = crate::paths::Roots::sandboxed(dir);
+            let async_root = crate::extension::executor::paths::default_async_root_in(&roots, dir);
+            let raw = std::fs::read(async_root.join(run).join("runner-config.json"))
+                .expect("runner config");
+            serde_json::from_slice::<serde_json::Value>(&raw)
+                .expect("json")
+                .get("launcher")
+                .cloned()
+        }
+        let net = || {
+            crate::runner_launcher::RunnerLaunchers::from([(
+                "net".to_string(),
+                vec!["env".to_string(), "--".to_string(), "X=1".to_string()],
+            )])
+        };
+        let boxed = "---\nname: worker\ndescription: W\nlauncher: net\n---\nBody.\n";
+        let plain = "---\nname: worker\ndescription: W\n---\nBody.\n";
+
+        // The recorded launcher is no longer defined: refused before the slot moves.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (executor, source) = launch_and_settle(dir.path(), boxed, Some(net())).await;
+        executor.config_cell().lock().await.runner_launchers = None;
+        let refused = executor
+            .control_resume(
+                dir.path(),
+                Some(source.as_str()),
+                Some("carry on"),
+                None,
+                None,
+            )
+            .await
+            .expect_err("an undefined recorded launcher refuses the resume");
+        assert!(
+            refused.to_string().contains(&format!(
+                "Cannot resume: run '{}' was launched with launcher 'net', which is no longer defined in runnerLaunchers in the user subagent config.",
+                source.as_str()
+            )),
+            "{refused}"
+        );
+        let owner = only_capacity_owner(dir.path(), SESSION).await;
+        assert_eq!(owner.run_id, source, "the source run still holds its slot");
+        assert_eq!(owner.generation, 0, "nothing was transferred");
+        let roots = crate::paths::Roots::sandboxed(dir.path());
+        assert_eq!(
+            std::fs::read_dir(crate::extension::executor::paths::default_async_root_in(
+                &roots,
+                dir.path()
+            ))
+            .expect("async root")
+            .count(),
+            1,
+            "no revived run directory"
+        );
+
+        // Defined again: the revived runner is wrapped by the recorded launcher.
+        executor.config_cell().lock().await.runner_launchers = Some(net());
+        let confirmation = executor
+            .control_resume(
+                dir.path(),
+                Some(source.as_str()),
+                Some("carry on"),
+                None,
+                None,
+            )
+            .await
+            .expect("the revive launches under the recorded launcher");
+        let revived = confirmation
+            .lines()
+            .find_map(|line| line.strip_prefix("Revived run: "))
+            .expect("the confirmation names the revived run")
+            .to_string();
+        assert_eq!(
+            runner_launcher_of(dir.path(), &revived),
+            Some(serde_json::json!({"name": "net", "argv": ["env", "--", "X=1"]}))
+        );
+
+        // Launched unwrapped; the agent file has since gained a launcher. Recorded absence wins.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (executor, source) = launch_and_settle(dir.path(), plain, Some(net())).await;
+        std::fs::write(
+            dir.path().join(".cyrup").join("agents").join("worker.md"),
+            boxed,
+        )
+        .expect("rewrite worker");
+        let confirmation = executor
+            .control_resume(
+                dir.path(),
+                Some(source.as_str()),
+                Some("carry on"),
+                None,
+                None,
+            )
+            .await
+            .expect("an unwrapped run revives unwrapped");
+        let revived = confirmation
+            .lines()
+            .find_map(|line| line.strip_prefix("Revived run: "))
+            .expect("the confirmation names the revived run")
+            .to_string();
+        assert_eq!(runner_launcher_of(dir.path(), &revived), None);
     }
 
     /// SUBA-N03, the load-bearing half: the six formerly-refused SINGLE-mode overrides are not
@@ -3461,6 +4115,7 @@ memory: {scope: user, path: other.md}\n---\nRewritten body.\n";
             );
             let artifacts_dir = crate::artifacts::project_artifacts_dir(launch.cwd());
             let expected = RecoveryDescriptor {
+                launcher: None,
                 fast: None,
                 model_response_aliases: None,
                 // SUBA-101: always recorded (pi `async-execution.ts:2024`); NARROW_MD declares

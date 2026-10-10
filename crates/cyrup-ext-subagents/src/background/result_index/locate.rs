@@ -405,6 +405,31 @@ pub async fn fallback_result_payload_path_for_session_run(
         .map(|location| location.path)
 }
 
+/// Any staged, owned or legacy-root payload file for the run, WITHOUT validating its contents.
+///
+/// pi `resultPayloadFileForSessionRun` (`result-files.ts:416-419` @ad11b7ab, added by `15757b00`
+/// / #2701): *"Any pending or public result file for the run, without validating its contents."*
+/// Upstream probes `[...resultPendingPaths, resultFilePath]` through `firstExistingResultFile`;
+/// cyrup's "public" location is two places — the session-partitioned owned directory every
+/// promoted payload lands in, then the legacy root — so the candidate list is staged → owned →
+/// legacy root, keeping upstream's staged-first order.
+///
+/// This is the paused seal's guard against overwriting a payload it could not validate
+/// (`async-stop-action.ts:40`, *"The validated lookup skips unreadable or foreign files; those
+/// must be refused below, not replaced."*), so it promotes nothing and returns a plain READ
+/// address, never a [`ConsumablePayload`].
+#[must_use = "the probed path decides whether the seal may synthesize a result"]
+pub async fn result_payload_file_for_session_run(
+    results_dir: &Path,
+    session_id: &SessionId,
+    run_id: &RunId,
+) -> Option<PathBuf> {
+    let mut candidates = paths::result_pending_paths(results_dir, session_id, run_id);
+    candidates.extend(paths::result_owned_paths(results_dir, session_id, run_id));
+    candidates.push(ResultFileName::for_run(run_id).resolve_in(results_dir));
+    exists::first_existing(&candidates).await
+}
+
 /// The payload path for a run known only by id, via the run index.
 ///
 /// pi `resultPayloadPathForIndexedRun` (`result-files.ts:352-372`), including its self-healing

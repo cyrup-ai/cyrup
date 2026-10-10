@@ -1256,6 +1256,7 @@ mod tests {
 
     fn agent(name: &str, source: AgentSource, file_path: &str) -> AgentDefinition {
         AgentDefinition {
+            launcher: None,
             default_tool_timeout_ms: None,
             inherit_global_context: false,
             machine: None,

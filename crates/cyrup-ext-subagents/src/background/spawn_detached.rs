@@ -288,6 +288,7 @@ pub fn spawn_detached_runner_with_command(
         stderr_log_path,
         env_overlay,
         None,
+        None,
     )
 }
 
@@ -313,7 +314,44 @@ pub fn spawn_detached_runner_observed(
         stdout_log_path,
         stderr_log_path,
         env_overlay,
+        None,
         Some(observer),
+    )
+}
+
+/// SUBA-178 — [`spawn_detached_runner_observed`] under an optional runner launcher: pi
+/// `[spawnCommand, ...spawnArgs] = launcher ? [...launcher.argv, command, ...args] : [command,
+/// ...args]` (`async-execution.ts:785` @ad11b7ab). The launcher's argv is the program and its
+/// leading arguments; the runner command (binary, base args, `__subagent-runner --config <path>`)
+/// follows it as plain arguments, passed as an argument list and never through a shell. The
+/// process group, the git-env scrub, the env overlay and the stdio files apply to the wrapper and
+/// reach the runner through it.
+///
+/// `launcher: None` is exactly [`spawn_detached_runner_observed`]. The caller has already refused
+/// a `/proc/self/exe` runner binary under a launcher
+/// ([`crate::runner_launcher::refuse_bare_self_exe`]).
+///
+/// # Errors
+///
+/// See [`spawn_detached_runner`]; also [`SubagentError::Spawn`] for a launcher with an empty argv
+/// (config validation already refuses one; it is never treated as "unwrapped").
+pub fn spawn_detached_runner_launched(
+    spawn_command: &SpawnCommand,
+    cfg_path: &Path,
+    stdout_log_path: &Path,
+    stderr_log_path: &Path,
+    env_overlay: &BTreeMap<String, String>,
+    launcher: Option<&crate::runner_launcher::RunnerLauncher>,
+    observer: Option<RunnerCloseObserver>,
+) -> Result<u32, SubagentError> {
+    spawn_detached(
+        spawn_command,
+        cfg_path,
+        stdout_log_path,
+        stderr_log_path,
+        env_overlay,
+        launcher,
+        observer,
     )
 }
 
@@ -323,12 +361,30 @@ fn spawn_detached(
     stdout_log_path: &Path,
     stderr_log_path: &Path,
     env_overlay: &BTreeMap<String, String>,
+    launcher: Option<&crate::runner_launcher::RunnerLauncher>,
     observer: Option<RunnerCloseObserver>,
 ) -> Result<u32, SubagentError> {
+    // SUBA-178 — under a launcher the wrapper is the program and the runner binary its argument.
+    let (program, wrapper_args): (&std::ffi::OsStr, &[String]) = match launcher {
+        Some(launcher) => {
+            let Some((program, rest)) = launcher.argv.split_first() else {
+                return Err(SubagentError::Spawn(std::io::Error::other(format!(
+                    "runner launcher '{}' has an empty argv",
+                    launcher.name
+                ))));
+            };
+            (std::ffi::OsStr::new(program.as_str()), rest)
+        }
+        None => (spawn_command.binary.as_os_str(), &[]),
+    };
     let stdout_file = std::fs::File::create(stdout_log_path).map_err(SubagentError::Spawn)?;
     let stderr_file = std::fs::File::create(stderr_log_path).map_err(SubagentError::Spawn)?;
 
-    let mut command = tokio::process::Command::new(&spawn_command.binary);
+    let mut command = tokio::process::Command::new(program);
+    command.args(wrapper_args);
+    if launcher.is_some() {
+        command.arg(&spawn_command.binary);
+    }
     // SUBA-110: drop inherited git routing variables BEFORE the overlay (pi
     // `async-execution.ts:729` @v0.71.0 spreads `omitGitRoutingEnv(process.env)` first). This
     // removes named keys only, so the crate's "never `env_clear`" rule below still holds.
@@ -354,7 +410,11 @@ fn spawn_detached(
         // this process, valid even after a rebuild replaced the file). Present the real program
         // name as `argv[0]` so a detached runner reads as `cyrup` in `ps` rather than as the magic
         // link; this changes only `argv[0]`, never which inode is executed.
-        if let Some(arg0) = spawn_command.arg0() {
+        // SUBA-178 — never under a launcher: `arg0` would rename the WRAPPER, and a
+        // `/proc/self/exe` runner binary is refused before a launcher can wrap it.
+        if launcher.is_none()
+            && let Some(arg0) = spawn_command.arg0()
+        {
             command.arg0(arg0);
         }
 
@@ -546,6 +606,144 @@ mod tests {
             "argv must be [subcommand, config flag, config path] after base_args, and the \
              env overlay must reach the detached process (PERM-001)"
         );
+    }
+
+    /// SUBA-178 — THE row's Verify, clause 2 (process tree): under a runner launcher the spawned
+    /// process is the WRAPPER and the runner runs beneath it. The launcher is
+    /// `env -- X=1 sh -c <wrapper> wrap`: `env` sets `X=1` and execs an attached `sh` wrapper that
+    /// logs its arguments and runs them as a child. Asserted: the wrapper received exactly the
+    /// runner command (binary, base args, `__subagent-runner --config <path>`); the runner's
+    /// parent is the pid `spawn_detached_runner_launched` returned and its cmdline is the
+    /// wrapper's; the runner sees the launcher's `X=1`.
+    ///
+    /// The Verify line's literal argv `["env","X=1","--"]` cannot launch on GNU coreutils env
+    /// (after the first `NAME=VALUE`, `--` is taken as the COMMAND: `env: '--': No such file or
+    /// directory`), so the working spelling `env -- X=1` is used.
+    ///
+    /// Mutation killed: dropping the argv prefix (the runner then runs directly: no LOG, `X`
+    /// unset, its parent is not the returned pid). Base tree: red (no launcher parameter).
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_launcher_prefixes_the_runner_argv_and_stays_in_the_tree() {
+        let dir = tempfile::tempdir().expect("real tempdir");
+        let d = dir.path().display().to_string();
+        let cfg_path = dir.path().join("runner-config.json");
+        std::fs::write(&cfg_path, "{}").expect("write placeholder config");
+        let stdout_log = dir.path().join("runner.stdout.log");
+        let stderr_log = dir.path().join("runner.stderr.log");
+
+        let runner_script = format!(
+            "printf '%s' \"$X\" > {d}/env.tmp && mv {d}/env.tmp {d}/env; \
+             echo $PPID > {d}/ppid; tr '\\000' ' ' < /proc/$PPID/cmdline > {d}/pcmd; \
+             echo DONE > {d}/done"
+        );
+        let command = SpawnCommand {
+            binary: PathBuf::from("/bin/sh"),
+            base_args: vec![
+                "-c".to_string(),
+                runner_script.clone(),
+                "runner".to_string(),
+            ],
+        };
+        let wrapper_script =
+            format!("printf '%s\\n' \"$@\" > {d}/log; \"$@\"; status=$?; exit $status");
+        let launcher = crate::runner_launcher::RunnerLauncher {
+            name: "net".to_string(),
+            argv: vec![
+                "env".to_string(),
+                "--".to_string(),
+                "X=1".to_string(),
+                "sh".to_string(),
+                "-c".to_string(),
+                wrapper_script,
+                "wrap".to_string(),
+            ],
+        };
+
+        let pid = spawn_detached_runner_launched(
+            &command,
+            &cfg_path,
+            &stdout_log,
+            &stderr_log,
+            &BTreeMap::new(),
+            Some(&launcher),
+            None,
+        )
+        .expect("the wrapped runner spawns");
+
+        for _ in 0..200 {
+            if dir.path().join("done").exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        let log = std::fs::read_to_string(dir.path().join("log")).expect("the wrapper ran");
+        let cfg = cfg_path.display().to_string();
+        assert_eq!(
+            log.lines().collect::<Vec<_>>(),
+            vec![
+                "/bin/sh",
+                "-c",
+                runner_script.as_str(),
+                "runner",
+                SUBAGENT_RUNNER_SUBCOMMAND,
+                CONFIG_FLAG,
+                cfg.as_str(),
+            ],
+            "the wrapper receives the whole runner command as its arguments"
+        );
+        let ppid = std::fs::read_to_string(dir.path().join("ppid")).expect("runner ran");
+        assert_eq!(
+            ppid.trim(),
+            pid.to_string(),
+            "the runner's parent is the spawned wrapper"
+        );
+        let pcmd = std::fs::read_to_string(dir.path().join("pcmd")).expect("parent cmdline");
+        assert!(
+            pcmd.starts_with("sh -c ") && pcmd.contains(" wrap /bin/sh -c "),
+            "the process tree shows the wrapper above the runner: {pcmd}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("env")).expect("env probe"),
+            "1",
+            "the launcher's environment reaches the runner"
+        );
+    }
+
+    /// SUBA-178 — an empty launcher argv is a spawn error, never an unwrapped runner.
+    #[tokio::test]
+    async fn an_empty_launcher_argv_never_runs_the_runner_unwrapped() {
+        let dir = tempfile::tempdir().expect("real tempdir");
+        let launcher = crate::runner_launcher::RunnerLauncher {
+            name: "net".to_string(),
+            argv: Vec::new(),
+        };
+        let marker = dir.path().join("ran");
+        let command = SpawnCommand {
+            binary: PathBuf::from("/bin/sh"),
+            base_args: vec![
+                "-c".to_string(),
+                format!("touch {}", marker.display()),
+                "runner".to_string(),
+            ],
+        };
+        let error = spawn_detached_runner_launched(
+            &command,
+            &dir.path().join("cfg.json"),
+            &dir.path().join("out.log"),
+            &dir.path().join("err.log"),
+            &BTreeMap::new(),
+            Some(&launcher),
+            None,
+        )
+        .expect_err("an empty argv is refused");
+        assert!(
+            error
+                .to_string()
+                .contains("runner launcher 'net' has an empty argv"),
+            "{error}"
+        );
+        assert!(!marker.exists());
     }
 
     /// PERM-001 regression, the negative direction: an EMPTY overlay must leave the child's

@@ -409,6 +409,9 @@ async fn refuse_run(
     // SUBA-159 — pi stamps `pidNamespaceScope: currentPidNamespaceScope()` wherever it stamps the
     // runner pid (`async-execution.ts:875`, `stale-run-reconciler.ts:215-216` @ad11b7ab).
     status.pid_namespace_scope = crate::background::reconcile::current_pid_namespace_scope();
+    // SUBA-178 — pi keeps `launcher` on every runner status write (`subagent-runner.ts:2077`
+    // @ad11b7ab); later writes mutate this held status, so it rides along.
+    status.launcher = config.launcher.clone();
     // pi `:634` — the run-level message, which is what an operator and a delegating agent read.
     status.error = Some(error.to_string());
     // pi `:636-640`.
@@ -673,6 +676,9 @@ pub(super) async fn publish_initial_status(
     // SUBA-159 — pi stamps `pidNamespaceScope: currentPidNamespaceScope()` wherever it stamps the
     // runner pid (`async-execution.ts:875`, `stale-run-reconciler.ts:215-216` @ad11b7ab).
     status.pid_namespace_scope = crate::background::reconcile::current_pid_namespace_scope();
+    // SUBA-178 — pi keeps `launcher` on every runner status write (`subagent-runner.ts:2077`
+    // @ad11b7ab); later writes mutate this held status, so it rides along.
+    status.launcher = config.launcher.clone();
     // pi `...(config.sessionId ? { sessionId: config.sessionId } : {})` (`subagent-runner.ts:2088`):
     // stamp the ORCHESTRATOR session onto the run's own `status.json`, so a later reader can scope
     // the async root to one session (`async-status.ts:432`).

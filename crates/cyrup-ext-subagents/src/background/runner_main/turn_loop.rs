@@ -394,6 +394,11 @@ fn build_chain_context(
         .map_err(SubagentError::MalformedSettings)?,
     );
     let executor = Arc::new(ExecSingleStepExecutor {
+        // SUBA-178 — the launcher this runner was started under.
+        runner_launcher: config
+            .launcher
+            .as_ref()
+            .map(|launcher| launcher.name.clone()),
         tool_timeouts: Arc::clone(&tool_timeouts),
         // `None` on the REAL detached hop-2 runner: it reaches its steps through a `RunnerConfig`
         // written to disk as JSON, so nothing in-process can be handed down and these steps resolve

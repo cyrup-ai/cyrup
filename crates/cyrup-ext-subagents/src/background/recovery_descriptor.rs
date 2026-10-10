@@ -449,6 +449,13 @@ pub struct RecoveryDescriptor {
     /// hand-edited descriptor cannot smuggle in a shape `config.json` would have refused.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_response_aliases: Option<crate::exec::model_verification::ModelResponseAliases>,
+    /// SUBA-178 — pi `SteeringRecoveryDescriptor.launcher?: string` (`shared/types.ts:841-842`
+    /// @ad11b7ab): the launcher NAME the run was started under; a revive re-reads its argv from
+    /// the CURRENT user config ("Absence means unwrapped"). Kept out of the launch-contract digest,
+    /// as upstream's `launch-contract.ts` has no launcher. Validated by [`Self::validate`]
+    /// (`async-resume.ts:342`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launcher: Option<String>,
 }
 
 /// pi writes `tools` as a `string[]` (`"read"`, `"mcp:server.tool"`); [`ToolRef`]'s own derive
@@ -664,6 +671,8 @@ impl RecoveryDescriptor {
             // at revival time. This is what makes the verification error's own promise — "resumed
             // native runs retain their launch-time declaration" — true.
             model_response_aliases: config.model_response_aliases.clone(),
+            // SUBA-178 — pi `launcher: launcher.name` (`async-execution.ts:2170` @ad11b7ab).
+            launcher: config.launcher.as_ref().map(|l| l.name.clone()),
         })
     }
 
@@ -733,6 +742,12 @@ impl RecoveryDescriptor {
         };
         if self.agent.trim().is_empty() {
             return Err(invalid("agent must be a non-empty string.".to_string()));
+        }
+        // SUBA-178 — pi `async-resume.ts:342` @ad11b7ab.
+        if let Some(launcher) = &self.launcher
+            && !crate::runner_launcher::is_runner_launcher_name(launcher)
+        {
+            return Err(invalid("launcher must be a launcher name.".to_string()));
         }
         if self.cwd.as_os_str().is_empty() {
             return Err(invalid("cwd must be a non-empty string.".to_string()));
@@ -936,6 +951,9 @@ impl RecoveryDescriptor {
         persona.memory = self.memory.clone();
         persona.tool_budget = self.initial_tool_budget.clone();
         persona.max_subagent_depth = Some(self.max_subagent_depth);
+        // SUBA-178 — pi `launcher: descriptor.launcher` (`async-resume.ts:640-641` @ad11b7ab):
+        // "The recorded launcher wins over the current agent file, including recorded absence."
+        persona.launcher = self.launcher.clone();
     }
 
     /// SUBA-101 — pi `readAsyncRecoveryDescriptor`'s legacy default (`async-resume.ts:368`
@@ -962,6 +980,7 @@ impl RecoveryDescriptor {
                 .join("recovery-agent")
         });
         let mut persona = ResolvedAgentPersona {
+            launcher: None,
             // pi `:1900`: `inheritGlobalContext: recoveryDescriptor.inheritGlobalContext`.
             inherit_global_context: self.effective_inherit_global_context(),
             machine: None,
@@ -1177,6 +1196,7 @@ mod tests {
     /// than a matching default.
     fn distinctive_persona() -> ResolvedAgentPersona {
         ResolvedAgentPersona {
+            launcher: None,
             model_is_settings_default: false,
             default_tool_timeout_ms: None,
             // SUBA-101: `true` against `inherit_project_context: false`, so the legacy default
@@ -1253,6 +1273,7 @@ mod tests {
 
     fn runner_config(step: SingleStepSpec, persona: ResolvedAgentPersona) -> RunnerConfig {
         RunnerConfig {
+            launcher: None,
             tool_timeout: Default::default(),
             model_response_aliases: None,
             runner_process_instance_id: None,
@@ -1918,6 +1939,7 @@ mod tests {
         let config = runner_config(distinctive_step(), distinctive_persona());
         let d = RecoveryDescriptor::for_single_launch(&config, LaunchInputs::default()).unwrap();
         let mut widened = ResolvedAgentPersona {
+            launcher: None,
             model_is_settings_default: false,
             default_tool_timeout_ms: None,
             inherit_global_context: false,
@@ -2093,6 +2115,66 @@ mod tests {
                 "modelResponseAliases key \"nomodel\" must be a non-empty provider/model ID"
             ),
             "{err}"
+        );
+    }
+
+    /// SUBA-178 — the descriptor records the launcher NAME the run was started under (pi
+    /// `launcher: launcher.name`, `async-execution.ts:2170` @ad11b7ab) and leaves it out of the
+    /// launch-contract digest (upstream's `launch-contract.ts` has no launcher); a malformed name
+    /// is refused on read with upstream's sentence (`async-resume.ts:342`); and the overlay makes
+    /// the RECORDED value win over the current agent file, recorded absence included
+    /// (`async-resume.ts:640-641`).
+    ///
+    /// Mutations killed: not recording it; folding it into the digest; dropping the `validate`
+    /// rule; skipping the overlay line (absence would no longer clear a launcher the file gained).
+    #[test]
+    fn the_descriptor_records_the_launcher_outside_the_digest_and_the_record_wins() {
+        let launcher = crate::runner_launcher::RunnerLauncher {
+            name: "net".to_string(),
+            argv: vec!["env".to_string(), "--".to_string(), "X=1".to_string()],
+        };
+        let plain = runner_config(distinctive_step(), distinctive_persona());
+        let mut wrapped = plain.clone();
+        wrapped.launcher = Some(launcher);
+        let bare = RecoveryDescriptor::for_single_launch(&plain, LaunchInputs::default())
+            .expect("descriptor");
+        let recorded = RecoveryDescriptor::for_single_launch(&wrapped, LaunchInputs::default())
+            .expect("descriptor");
+        assert_eq!(bare.launcher, None);
+        assert_eq!(recorded.launcher.as_deref(), Some("net"));
+        assert_eq!(
+            bare.launch_contract_digest, recorded.launch_contract_digest,
+            "the launcher is not part of the launch contract"
+        );
+        let json = serde_json::to_value(&recorded).expect("serializes");
+        assert_eq!(json.get("launcher"), Some(&serde_json::json!("net")));
+        assert!(
+            serde_json::to_value(&bare)
+                .expect("serializes")
+                .get("launcher")
+                .is_none()
+        );
+
+        let mut malformed = recorded.clone();
+        malformed.launcher = Some("a b".to_string());
+        let err = malformed
+            .validate(Path::new("/runs/r1/recovery-descriptor.json"))
+            .expect_err("a malformed launcher name is refused");
+        assert_eq!(
+            err.to_string(),
+            "Invalid async recovery descriptor '/runs/r1/recovery-descriptor.json': launcher must be a launcher name."
+        );
+
+        let mut gained = distinctive_persona();
+        gained.launcher = Some("net".to_string());
+        bare.apply_to_persona(&mut gained);
+        assert_eq!(gained.launcher, None, "recorded absence wins over the file");
+        let mut lost = distinctive_persona();
+        recorded.apply_to_persona(&mut lost);
+        assert_eq!(
+            lost.launcher.as_deref(),
+            Some("net"),
+            "the recorded launcher wins"
         );
     }
 }

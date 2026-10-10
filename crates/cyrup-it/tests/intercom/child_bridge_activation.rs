@@ -97,6 +97,7 @@ async fn next_message(
 
 fn base_agent_config(model: &str) -> AgentConfig {
     AgentConfig {
+        launcher: None,
         model_is_settings_default: false,
         machine: None,
         name: "worker".to_string(),

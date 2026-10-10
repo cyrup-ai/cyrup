@@ -57,6 +57,7 @@ use cyrup_ext_subagents::spawn::nested_events::{
 
 fn persona(name: &str) -> ResolvedAgentPersona {
     ResolvedAgentPersona {
+        launcher: None,
         model_is_settings_default: false,
         default_tool_timeout_ms: None,
         machine: None,
@@ -211,6 +212,7 @@ async fn build_run(dir: &Path, roots: &Roots, run_token: &str, child_id: &str) -
     tokio::fs::create_dir_all(&run_paths.run_dir).await.unwrap();
 
     let config = RunnerConfig {
+        launcher: None,
         tool_timeout: Default::default(),
         // SUBA-119 — no operator-declared response-id alias for this fixture run.
         model_response_aliases: None,

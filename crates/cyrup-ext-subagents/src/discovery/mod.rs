@@ -895,6 +895,7 @@ pub fn parse_subagent_settings(
     validate_default_provider(value)?;
     validate_default_extensions(value)?;
     validate_agent_dir_lists(value)?;
+    validate_override_launcher_key(value)?;
     validate_override_default_providers(value)?;
     validate_override_suba096_keys(value)?;
     validate_override_context_and_mutation_keys(value)?;
@@ -1232,6 +1233,25 @@ fn validate_override_default_providers(subagents: &serde_json::Value) -> Result<
 /// Presence-gated like every sibling: only an absent key is silent. The file path upstream
 /// interpolates is not in scope here and is dropped exactly as the siblings drop it; the reader
 /// ([`read_subagent_settings_file`]) prefixes it.
+/// SUBA-178 — pi `parseBuiltinOverrideEntry` (`src/agents/agents.ts:1034-1036` @ad11b7ab),
+/// checked at the top of every entry: a settings override cannot name a launcher, because a
+/// launcher is an argv from the USER config and must be chosen by a user agent file. Without this
+/// refusal the key would be dropped as "not an override key" and the builtin would run unwrapped.
+/// House convention drops upstream's ` in '<file>'` (the settings-file prefix carries it).
+fn validate_override_launcher_key(subagents: &serde_json::Value) -> Result<(), SubagentError> {
+    let Some(entries) = subagents.get("agentOverrides").and_then(|v| v.as_object()) else {
+        return Ok(());
+    };
+    for (name, entry) in entries {
+        if entry.get("launcher").is_some() {
+            return Err(SubagentError::MalformedSettings(format!(
+                "Builtin override '{name}' sets 'launcher', which settings overrides do not support; set 'launcher' in a user agent file instead."
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn validate_override_suba096_keys(subagents: &serde_json::Value) -> Result<(), SubagentError> {
     let Some(entries) = subagents.get("agentOverrides").and_then(|v| v.as_object()) else {
         return Ok(());
@@ -3168,6 +3188,26 @@ mod tests {
                 )
                 .to_string(),
                 "{bad}"
+            );
+        }
+    }
+
+    /// SUBA-178 — `agentOverrides.<name>.launcher` is refused with pi's own text
+    /// (`agents.ts:1034-1036` @ad11b7ab), whatever its value: a settings override cannot select a
+    /// user-config argv. Mutation killed: removing the check (the key becomes a "not an override
+    /// key" warning and the builtin runs unwrapped). Base tree: red (warning only).
+    #[test]
+    fn an_override_naming_a_launcher_is_refused() {
+        for value in [serde_json::json!("net"), serde_json::json!(null)] {
+            let raw = serde_json::json!({"agentOverrides": {"scout": {"launcher": value}}});
+            let err = parse_subagent_settings(Some(&raw)).expect_err("refused");
+            assert_eq!(
+                err.to_string(),
+                SubagentError::MalformedSettings(
+                    "Builtin override 'scout' sets 'launcher', which settings overrides do not support; set 'launcher' in a user agent file instead."
+                        .to_string()
+                )
+                .to_string()
             );
         }
     }

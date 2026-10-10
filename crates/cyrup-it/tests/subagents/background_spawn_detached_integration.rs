@@ -482,6 +482,7 @@ fn orchestrator_sim_binary_path() -> PathBuf {
 /// mode. Every step's agent must now have a plan-time persona in `resolved_agents`.
 fn fixture_persona(name: &str) -> ResolvedAgentPersona {
     ResolvedAgentPersona {
+        launcher: None,
         model_is_settings_default: false,
         default_tool_timeout_ms: None,
         machine: None,
@@ -584,6 +585,7 @@ async fn detached_runner_survives_orchestrator_death_and_writes_terminal_files()
     // fragile against this type's own serde shape) — one SingleStep, matching
     // `background_runner_main_integration.rs`'s own identical `single_step` helper shape.
     let runner_config = RunnerConfig {
+        launcher: None,
         tool_timeout: Default::default(),
         // SUBA-119 — no operator-declared response-id alias for this fixture run.
         model_response_aliases: None,
@@ -830,6 +832,7 @@ async fn interrupting_a_running_step_pauses_rather_than_fails_the_run() {
     // has real remaining work to cut short (R-SA-084 marks the NOT-yet-dispatched step(s) Paused
     // too — see `mark_remaining_paused`'s own doc).
     let runner_config = RunnerConfig {
+        launcher: None,
         tool_timeout: Default::default(),
         // SUBA-119 — no operator-declared response-id alias for this fixture run.
         model_response_aliases: None,

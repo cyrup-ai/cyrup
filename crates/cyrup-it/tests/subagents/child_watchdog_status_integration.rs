@@ -61,6 +61,7 @@ fn message_end_line(text: &str) -> String {
 
 fn agent_config() -> AgentConfig {
     AgentConfig {
+        launcher: None,
         model_is_settings_default: false,
         machine: None,
         acceptance_role: None,

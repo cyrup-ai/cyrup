@@ -15,6 +15,7 @@ use super::super::types::{AgentDefinition, AgentSource, ChainDefinition, SystemP
 
 pub(crate) fn sample_agent(source: AgentSource, file_path: PathBuf) -> AgentDefinition {
     AgentDefinition {
+        launcher: None,
         default_tool_timeout_ms: None,
         inherit_global_context: false,
         machine: None,

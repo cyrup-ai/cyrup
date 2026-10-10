@@ -98,6 +98,7 @@ fn config(dir: &Path, run_id: &RunId, deadline_at_ms: u64) -> RunnerConfig {
         crate::exec::resolve_step_agent_config(&helper),
     );
     RunnerConfig {
+        launcher: None,
         model_response_aliases: None,
         runner_process_instance_id: None,
         revival_lease: None,

@@ -420,6 +420,23 @@ impl SubagentExecutor {
         if let Some(persona) = resolved_agents.get_mut(&agent) {
             descriptor.apply_to_persona(persona);
         }
+        // SUBA-178 — pi `subagent-executor.ts:2213-2216` @ad11b7ab: the RECORDED launcher (the
+        // overlay above, recorded absence included) is re-read from the CURRENT user config, and a
+        // name that is no longer defined refuses the resume BEFORE capacity moves (the transfer
+        // happens inside `spawn_background_steps`). Never revived unwrapped.
+        if let Some(launcher) = resolved_agents
+            .get(&agent)
+            .and_then(|persona| persona.launcher.as_deref())
+            && crate::runner_launcher::lookup_runner_launcher(
+                self.config_snapshot().await.runner_launchers.as_ref(),
+                launcher,
+            )
+            .is_none()
+        {
+            return Err(SubagentError::Management(format!(
+                "Cannot resume: run '{source_run_id}' was launched with launcher '{launcher}', which is no longer defined in runnerLaunchers in the user subagent config."
+            )));
+        }
         let revived_task =
             Self::build_revived_async_task(source_run_id, &agent, session_file, follow_up);
         // Every per-call field comes back off the descriptor (pi `subagent-executor.ts:2111-2185`:
@@ -713,6 +730,36 @@ impl SubagentExecutor {
         let agent_def = self
             .resolve_agent(cwd, agent, AgentReadScope::Both, &roots)
             .map_err(|e| format!("Cannot append step to run '{run_id}': {e}"))?;
+        // SUBA-178 — pi `subagent-executor.ts:1408-1416` @ad11b7ab: an appended step runs inside
+        // the ALREADY-RUNNING runner, so its agent must use that runner's launcher (or none, if
+        // the runner has none), checked before anything is built or enqueued. Upstream compares
+        // against a status it has already read, so an unsafe id or an unreadable `status.json` is
+        // reported here rather than read as "no launcher". An ABSENT status is not an error at
+        // this layer: the primitive's reconciliation synthesizes the provisional record
+        // (R-SA-090), which carries no launcher.
+        let runner_launcher = {
+            let paths = control::resolve_run_paths(
+                &default_async_root_in(&roots, cwd),
+                &default_results_dir_in(&roots, cwd),
+                run_id,
+            )
+            .map_err(|e| e.to_string())?;
+            control::read_status_file(&paths.status)
+                .await
+                .map_err(|e| e.to_string())?
+                .and_then(|status| status.launcher)
+                .map(|launcher| launcher.name)
+        };
+        if agent_def.launcher != runner_launcher {
+            let uses = |launcher: Option<&str>| {
+                launcher.map_or_else(|| "no launcher".to_string(), |l| format!("launcher '{l}'"))
+            };
+            return Err(format!(
+                "Cannot append step to run '{run_id}': its runner uses {}, but the appended agents use {}.",
+                uses(runner_launcher.as_deref()),
+                uses(agent_def.launcher.as_deref())
+            ));
+        }
         // SUBA-103 — pi builds the appended step through `buildAsyncRunnerSteps`
         // (`subagent-executor.ts:1370` @v0.68.0), whose per-step fast is `s.fast ?? params.fast
         // ?? a.fast` (`async-execution.ts:1118`); the append call carries no call-level `fast`,
@@ -745,6 +792,16 @@ impl SubagentExecutor {
         let step_machine = step_val.get("machine").and_then(serde_json::Value::as_str);
         if let Some(machine) = step_machine {
             crate::placement::resolve::validate_machine_name(machine)?;
+        }
+        // SUBA-178 — `buildAsyncRunnerSteps`' per-step `runnerLauncherPlacementError`
+        // (`async-execution.ts:1078-1079` @ad11b7ab): a launcher agent cannot be placed.
+        if let Some(error) = crate::runner_launcher::runner_launcher_placement_error(
+            &agent_def.name,
+            agent_def.launcher.as_deref(),
+            agent_def.runner.as_ref(),
+            step_machine.or(agent_def.machine.as_deref()),
+        ) {
+            return Err(error);
         }
         let placed = step_machine.is_some() || agent_def.machine.is_some();
         let mut step = SingleStepSpec {
@@ -1202,6 +1259,134 @@ mod tests {
                 Some("plain: Lane B".to_string()),
                 Some("plain: audit the queue".to_string()),
             ]
+        );
+    }
+
+    /// SUBA-178 — pi `subagent-executor.ts:1408-1416` @ad11b7ab: an appended step runs inside the
+    /// ALREADY-RUNNING runner, so its agent must use that runner's launcher, or none if it has
+    /// none. Both mismatches are refused with upstream's sentence and nothing is enqueued; a
+    /// matching launcher enqueues. A launcher agent naming a machine is refused too
+    /// (`runner-launcher.ts:11-16`).
+    ///
+    /// Mutation killed: removing the mismatch check (both refused appends enqueue).
+    #[tokio::test]
+    async fn append_step_refuses_a_launcher_mismatch() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let agents = dir.path().join(".cyrup").join("agents");
+        std::fs::create_dir_all(&agents).expect("mkdir");
+        std::fs::write(
+            agents.join("plain.md"),
+            "---\nname: plain\ndescription: d\n---\n\nbody\n",
+        )
+        .expect("write persona");
+        std::fs::write(
+            agents.join("boxed.md"),
+            "---\nname: boxed\ndescription: d\nlauncher: net\n---\n\nbody\n",
+        )
+        .expect("write persona");
+        let executor = SubagentExecutor::new();
+        let roots = crate::paths::Roots::sandboxed(dir.path());
+        executor.config_cell().lock().await.roots = roots.clone();
+
+        let net = crate::runner_launcher::RunnerLauncher {
+            name: "net".to_string(),
+            argv: vec!["env".to_string()],
+        };
+        let enqueued = |paths: &RunPaths| {
+            std::fs::read_dir(&paths.append_dir)
+                .map(|read| {
+                    read.filter_map(Result::ok)
+                        .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("json"))
+                        .count()
+                })
+                .unwrap_or(0)
+        };
+        for (run, runner_launcher, agent, refusal) in [
+            (
+                "chainrunL001",
+                Some(net.clone()),
+                "plain",
+                Some(
+                    "Cannot append step to run 'chainrunL001': its runner uses launcher 'net', but the appended agents use no launcher.",
+                ),
+            ),
+            (
+                "chainrunL002",
+                None,
+                "boxed",
+                Some(
+                    "Cannot append step to run 'chainrunL002': its runner uses no launcher, but the appended agents use launcher 'net'.",
+                ),
+            ),
+            ("chainrunL003", Some(net.clone()), "boxed", None),
+        ] {
+            let paths = RunPaths::for_run(
+                &default_async_root_in(&roots, dir.path()),
+                &default_results_dir_in(&roots, dir.path()),
+                &RunId::from_token(run.to_string()),
+            );
+            std::fs::create_dir_all(&paths.run_dir).expect("mkdir run dir");
+            let mut status = crate::background::RunStatus::queued(
+                RunId::from_token(run.to_string()),
+                RunMode::Chain,
+                Some(std::process::id()),
+            );
+            status.state = RunState::Running;
+            status.current_step = Some(0);
+            status.steps = vec![crate::background::StepStatus::pending(agent)];
+            status.launcher = runner_launcher;
+            std::fs::write(&paths.status, serde_json::to_string(&status).expect("json"))
+                .expect("write status");
+            let step = serde_json::json!({"agent": agent, "task": "more"});
+            let outcome = executor
+                .control_append_step(dir.path(), Some(run), std::slice::from_ref(&step))
+                .await;
+            match refusal {
+                Some(sentence) => {
+                    assert_eq!(outcome.err().as_deref(), Some(sentence), "{run}");
+                    assert_eq!(enqueued(&paths), 0, "{run}: nothing enqueued");
+                }
+                None => {
+                    assert!(outcome.is_ok(), "{run}: {outcome:?}");
+                    assert_eq!(enqueued(&paths), 1, "{run}: the matching launcher enqueues");
+                }
+            }
+        }
+
+        // An unreadable status.json is reported, never read as "its runner uses no launcher".
+        // Mutation killed: `.ok().flatten()` on the status read (the refusal names no launcher).
+        let corrupt = RunPaths::for_run(
+            &default_async_root_in(&roots, dir.path()),
+            &default_results_dir_in(&roots, dir.path()),
+            &RunId::from_token("chainrunL004".to_string()),
+        );
+        std::fs::create_dir_all(&corrupt.run_dir).expect("mkdir run dir");
+        std::fs::write(&corrupt.status, "{not json").expect("write corrupt status");
+        let boxed = serde_json::json!({"agent": "boxed", "task": "more"});
+        let error = executor
+            .control_append_step(
+                dir.path(),
+                Some("chainrunL004"),
+                std::slice::from_ref(&boxed),
+            )
+            .await
+            .expect_err("a corrupt status refuses the append");
+        assert!(!error.contains("launcher"), "{error}");
+        assert_eq!(enqueued(&corrupt), 0, "nothing enqueued");
+
+        let placed = serde_json::json!({"agent": "boxed", "task": "more", "machine": "m"});
+        let outcome = executor
+            .control_append_step(
+                dir.path(),
+                Some("chainrunL003"),
+                std::slice::from_ref(&placed),
+            )
+            .await;
+        assert_eq!(
+            outcome.err().as_deref(),
+            Some(
+                "Agent 'boxed' uses launcher 'net', which wraps the local Pi background runner, so it cannot run on machine 'm'."
+            )
         );
     }
 

@@ -563,7 +563,7 @@ mod tests {
     }
 
     /// The advertise-vs-dispatch invariant: upstream v0.43.0 deliberately KEEPS `"reviewed"` in the
-    /// advertised `AcceptanceOverride` enum (`schemas.ts:83-88`, marked `deprecated`) precisely so
+    /// advertised `AcceptanceOverride` enum (`schemas.ts:83-88`, in its own branch) precisely so
     /// this preflight message can explain itself. A schema that stopped advertising it would leave
     /// the model guessing; a dispatch that accepted it would reinstate the deleted level.
     #[test]
@@ -579,8 +579,20 @@ mod tests {
     /// The advertise-vs-dispatch invariant, driven over the SCHEMA rather than a hand-written list:
     /// every string value `sj_acceptance_override` offers the model must be one `lower_acceptance_input`
     /// actually accepts — with exactly one upstream-sanctioned exception, `"reviewed"`, which is
-    /// advertised in its own `deprecated` branch solely so the refusal can explain itself
+    /// advertised in its own branch solely so the refusal can explain itself
     /// (`schemas.ts:83-88` @v0.43.0).
+    ///
+    /// SUBA-176 — that branch is identified by its sole enum value, as upstream's
+    /// `reviewedRecoveryBranch` lookup does (`test/unit/schemas.test.ts:585` @ad11b7ab), not by a
+    /// `deprecated` flag: upstream `50c280f1` (#2721) dropped the flag because strict tool-schema
+    /// validators reject it with HTTP 400, and this test now asserts no branch carries it.
+    ///
+    /// MUTATION: restore the flag on the `"reviewed"` branch — the `is_none` assertion is RED.
+    /// MUTATION: delete the `"reviewed"` branch — the exactly-once count is RED.
+    /// MUTATION: change the refusal text at `validate_input.rs:101` (the `format!` that prefixes
+    /// `EXPLICIT_REVIEWED_UNAVAILABLE`) — the `assert_eq!` against `acceptance <EXPLICIT_REVIEWED_UNAVAILABLE>`
+    /// is RED. (Making `"reviewed"` lower successfully is not a usable mutation: it reaches the
+    /// unreachable `Reviewed` lowering arm.)
     ///
     /// G78 narrowed the dispatch (bare `"none"` and `"verified"` became hard errors,
     /// `acceptance.ts:183-184`) without narrowing the schema, so the tool advertised two values it
@@ -595,28 +607,37 @@ mod tests {
             .expect("AcceptanceOverride is an anyOf");
 
         let mut advertised: Vec<String> = Vec::new();
+        let mut recovery_branches = 0_usize;
         for branch in branches {
             if branch.get("type").and_then(serde_json::Value::as_str) != Some("string") {
                 continue;
             }
-            let deprecated = branch
-                .get("deprecated")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false);
+            assert!(
+                branch.get("deprecated").is_none(),
+                "strict tool-schema validators reject `deprecated` with HTTP 400 (#2713): {branch}"
+            );
+            let recovery_branch = branch.get("enum") == Some(&serde_json::json!(["reviewed"]));
+            if recovery_branch {
+                recovery_branches += 1;
+            }
             for value in branch
                 .get("enum")
                 .and_then(serde_json::Value::as_array)
                 .expect("a string branch carries an enum")
             {
                 let value = value.as_str().expect("enum entries are strings");
-                if deprecated {
+                if recovery_branch {
                     // The sanctioned exception: advertised, refused, and the refusal EXPLAINS.
                     let err = lower_acceptance_input(&serde_json::json!(value)).expect_err(
-                        "a deprecated advertised level must still be refused by the dispatch",
+                        "the advertised recovery level must still be refused by the dispatch",
                     );
-                    assert!(
-                        err.contains(crate::exec::acceptance::model::EXPLICIT_REVIEWED_UNAVAILABLE),
-                        "the deprecated `{value}` must be refused with the explanatory text, got {err}"
+                    assert_eq!(
+                        err,
+                        format!(
+                            "acceptance {}",
+                            crate::exec::acceptance::model::EXPLICIT_REVIEWED_UNAVAILABLE
+                        ),
+                        "the recovery-branch `{value}` must be refused with the explanatory text"
                     );
                 } else {
                     advertised.push(value.to_string());
@@ -624,6 +645,10 @@ mod tests {
             }
         }
 
+        assert_eq!(
+            recovery_branches, 1,
+            "exactly one `[\"reviewed\"]` recovery branch is advertised so preflight can explain it"
+        );
         assert_eq!(
             advertised,
             ["auto", "attested", "checked"],

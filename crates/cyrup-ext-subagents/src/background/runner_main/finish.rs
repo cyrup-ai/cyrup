@@ -8,7 +8,7 @@ use super::events::append_event;
 use super::turn_loop::LoopOutcome;
 use crate::background::atomic::write_atomic_json;
 use crate::background::result_index::{self, ResultWrite};
-use crate::background::{ResultFile, RunMode, RunPaths, RunState, RunStatus};
+use crate::background::{ResultFile, RunPaths, RunState, RunStatus};
 use crate::error::SubagentError;
 use crate::exec::SingleResult;
 use crate::jsonl::RunEventLog;
@@ -575,13 +575,10 @@ pub(super) async fn finish_run(
     //
     // `status.mode` is the whole of pi's `resultMode` (`:4757`, `config.resultMode ??
     // statusPayload.mode`): cyrup's `RunnerConfig` carries no result-mode override.
-    let flat_agents: Vec<&str> = status.steps.iter().map(|s| s.agent.as_str()).collect();
-    let agent = match flat_agents.as_slice() {
-        [] => status.run_id.as_str().to_string(),
-        [only] => (*only).to_string(),
-        many if status.mode == RunMode::Parallel => format!("parallel:{}", many.join("+")),
-        many => format!("chain:{}", many.join("->")),
-    };
+    //
+    // The rule itself lives on `RunStatus::result_agent_label` (SUBA-177), shared with the paused
+    // seal's status-sourced result so both name a run the same way.
+    let agent = status.result_agent_label();
 
     let result_file = ResultFile {
         id: status.run_id.clone(),
@@ -870,6 +867,7 @@ mod tests {
             .expect("pre-create a blocking file where the control dir needs to go");
 
         let config = RunnerConfig {
+            launcher: None,
             tool_timeout: Default::default(),
             model_response_aliases: None,
             runner_process_instance_id: None,

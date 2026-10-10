@@ -276,6 +276,14 @@ pub struct RunnerConfig {
     /// an older on-disk config still deserialize, leaving the run on upstream's no-alias behaviour.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_response_aliases: Option<crate::exec::model_verification::ModelResponseAliases>,
+    /// SUBA-178 — pi `RunnerConfig.launcher` (`async-execution.ts:1661`/`:2302` @ad11b7ab): the
+    /// runner launcher whose argv prefixed THIS runner's command, resolved by the orchestrator
+    /// from the user config before the run directory existed. The runner copies it into every
+    /// `status.json` it builds and checks every step's agent names the same launcher; a child
+    /// whose agent names a launcher this runner was not started under is refused.
+    /// `None` = an unwrapped runner (and every config written before this field).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launcher: Option<crate::runner_launcher::RunnerLauncher>,
     /// The inherited nested-event route (pi `config.nestedRoute`, `async-execution.ts:727,989` @v0.34.0) —
     /// resolved ONCE by the orchestrator from its own inherited env
     /// ([`crate::spawn::nested_events::resolve_inherited_nested_route_from_env`]) and carried here
@@ -605,6 +613,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("real tempdir");
         let cfg_path = dir.path().join("runner-config.json");
         let config = RunnerConfig {
+            launcher: None,
             tool_timeout: Default::default(),
             model_response_aliases: None,
             runner_process_instance_id: None,
@@ -674,6 +683,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("real tempdir");
         let cfg_path = dir.path().join("runner-config.json");
         let config = RunnerConfig {
+            launcher: None,
             tool_timeout: Default::default(),
             model_response_aliases: None,
             runner_process_instance_id: None,

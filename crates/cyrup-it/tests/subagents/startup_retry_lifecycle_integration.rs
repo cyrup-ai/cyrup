@@ -91,6 +91,7 @@ fn message_end_with_error(text: &str, error: &str) -> String {
 
 fn base_agent_config(model: &str) -> AgentConfig {
     AgentConfig {
+        launcher: None,
         model_is_settings_default: false,
         machine: None,
         acceptance_role: None, // SUBA-082: no declared role, the name decides

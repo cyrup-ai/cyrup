@@ -53,6 +53,7 @@ use cyrup_ext_subagents::spawn::chain_graph::{RunnerStep, SingleStepSpec};
 
 fn fixture_persona(name: &str) -> ResolvedAgentPersona {
     ResolvedAgentPersona {
+        launcher: None,
         model_is_settings_default: false,
         default_tool_timeout_ms: None,
         machine: None,
@@ -144,6 +145,7 @@ fn single_step(agent: &str, task: &str) -> SingleStepSpec {
 
 fn base_config(run_id: RunId, steps: Vec<RunnerStep>, dir: &Path) -> RunnerConfig {
     RunnerConfig {
+        launcher: None,
         tool_timeout: Default::default(),
         // SUBA-119 — no operator-declared response-id alias for this fixture run.
         model_response_aliases: None,
