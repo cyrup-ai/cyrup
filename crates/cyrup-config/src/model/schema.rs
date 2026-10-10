@@ -153,6 +153,13 @@ pub struct ModelDefinition {
     /// twin. CFG-039.
     #[serde(default)]
     pub sampling_params: Option<serde_json::Map<String, serde_json::Value>>,
+    /// `samplingParamsByThinkingLevel: Type.Optional(SamplingParamsByThinkingLevelSchema)`
+    /// (`core/model-config.ts:46`, schema `:20-28` @f1b2e77f5) — per-thinking-level sampling
+    /// overrides spread over [`Self::sampling_params`] for the request's effective level.
+    /// `modelFromJson` copies it verbatim (`provider-composer.ts:245`), with no provider or
+    /// built-in fallback, exactly like `samplingParams`. CFG-104.
+    #[serde(default)]
+    pub sampling_params_by_thinking_level: Option<cyrup_provider::SamplingParamsByThinkingLevel>,
     /// Prompt-cache lifetimes, in SECONDS, per retention tier — Pi
     /// `promptCache: Type.Optional(ModelPromptCacheSchema)` (`model-config.ts:209` for a
     /// definition, `:233` for an override). Copied verbatim onto the composed model
@@ -209,6 +216,12 @@ pub struct ModelOverride {
     /// model.samplingParams` (`provider-composer.ts:123-125`). CFG-039.
     #[serde(default)]
     pub sampling_params: Option<serde_json::Map<String, serde_json::Value>>,
+    /// `samplingParamsByThinkingLevel` (`core/model-config.ts:62` @f1b2e77f5). MERGES per level
+    /// AND per key: `mergeSamplingParamsByThinkingLevel` (`provider-composer.ts:164-175`) sets
+    /// `merged[level] = { ...base?.[level], ...override[level] }` for each level the override
+    /// names, and leaves every other level as composed. CFG-104.
+    #[serde(default)]
+    pub sampling_params_by_thinking_level: Option<cyrup_provider::SamplingParamsByThinkingLevel>,
     /// Pi `:233`. Unlike most override fields this MERGES per tier:
     /// `override.promptCache ? { ...model.promptCache, ...override.promptCache } :
     /// model.promptCache` (`provider-composer.ts:196`), the same shape as `samplingParams` above —

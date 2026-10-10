@@ -837,6 +837,16 @@ pub struct ProviderModelConfig {
     /// Max output tokens (Pi `maxTokens`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u64>,
+    /// Default sampling parameters sent at every thinking level (Pi `samplingParams`,
+    /// `core/provider-composer.ts:71` @f1b2e77f5), e.g. `{"top_p": 0.9}`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sampling_params: Option<serde_json::Map<String, Value>>,
+    /// Per-thinking-level sampling overrides spread over [`Self::sampling_params`] for the
+    /// request's effective level (Pi `samplingParamsByThinkingLevel`,
+    /// `core/provider-composer.ts:72` @f1b2e77f5), e.g. `{"high": {"temperature": 0.6}}`. Crosses
+    /// as raw [`Value`]; the host checks its shape when the provider registers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sampling_params_by_thinking_level: Option<Value>,
     /// Per-model HTTP headers, alongside the provider's [`ProviderConfig::headers`].
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub headers: std::collections::BTreeMap<String, String>,

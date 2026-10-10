@@ -298,10 +298,19 @@ pub(super) fn try_build_params(
         }
     }
 
-    // Last so custom keys override the named request fields (Pi's own comment,
-    // `openai-responses.ts:330-333` @v0.84.1). AGENT-026 — the merge with `Model.sampling_params`
-    // happened in `build_base_options` (`simple-options.ts:27-33`); this is the assign.
-    crate::api::openai_completions::apply_sampling_params(&mut obj, opts);
+    // Last so model and request sampling parameters override named request fields (Pi's own
+    // comment, `openai-responses.ts:382-386` @f1b2e77f5). AGENT-026 / CFG-104 — the level is pi's
+    // `reasoningEffort ?? "off"` where `reasoningEffort = options?.reasoningEffort ??
+    // (options?.reasoningSummary ? "medium" : undefined)` (`:363`), computed OUTSIDE the
+    // `model.reasoning` gate: a summary-only request resolves the `medium` entry.
+    let sampling_level = if opts.reasoning == ModelThinkingLevel::Off
+        && reasoning_summary_wire(opts.openai_responses_options()).is_some()
+    {
+        ModelThinkingLevel::Medium
+    } else {
+        opts.reasoning
+    };
+    crate::api::openai_completions::apply_sampling_params(&mut obj, model, sampling_level, opts);
 
     Ok(Value::Object(obj))
 }

@@ -66,6 +66,10 @@ cyrup-provider = { workspace = true, features = ["faux"] }
 # discovered-file path, which compiles with `Component::from_binary` and so needs the binary form.
 # Adds no crate: `wat` 1.252.0 is already in the lockfile through wasmtime's own `wat` feature.
 wat = "1.252.0"
+# CFG-104: `tests/provider.rs::sdk_provider_model_config_sampling_keys_reach_the_request` serializes
+# the GUEST sdk's `ProviderConfig` and registers it here, so a serde rename drift between the two
+# `ProviderModelConfig`s fails a test. Host-target rlib only (serde + serde_json; no new crate).
+cyrup-ext-sdk = { path = "../cyrup-ext-sdk" }
 
 # `tempfile` was here for `tests/build_tier1.rs`, which drives a REAL `cargo build --target
 # wasm32-wasip2` and must tie that build's ~213 MB artifact cache to a `TempDir` (it once wrote to a

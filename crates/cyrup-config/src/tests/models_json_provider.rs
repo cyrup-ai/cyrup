@@ -85,7 +85,7 @@ impl ApiImpl for RecordingApi {
                 context_window: model.context_window,
                 compat: model.compat.clone(),
                 thinking_level_map: model.thinking_level_map.clone(),
-                sampling_params: model.sampling_params.clone(),
+                sampling_params: model.flat_sampling_params().cloned(),
             });
         }
         let message = AssistantMessage {
@@ -683,4 +683,218 @@ async fn a_definitions_sampling_params_are_copied_verbatim_with_no_inheritance()
         None,
         "a model that declares none must get none — there is no provider-level tier to inherit"
     );
+}
+
+/// Compose over the REAL `openai-completions` wire impl (not [`RecordingApi`]), so a test can read
+/// the finished request body through `StreamOptions::on_payload` — the driver hands it over after
+/// `build_body` and before any HTTP (`api/openai_completions/driver.rs`). The models below point at
+/// a refused local port, so nothing leaves the machine; the transport error that follows the
+/// capture is expected.
+fn composed_real(file: &ModelFile) -> (Models, Vec<String>) {
+    let registry = ApiRegistry::new();
+    registry.register_impl(cyrup_provider::api::openai_completions::factory());
+    let store = Arc::new(InMemoryCredentialStore::new()) as Arc<dyn CredentialStore>;
+    let ctx: Arc<dyn AuthContext> = Arc::new(MapEnv(BTreeMap::new()));
+    let mut models = create_models(CreateModelsOptions {
+        credentials: Some(store.clone()),
+        auth_context: Some(ctx.clone()),
+        catalog_overlay: None,
+    });
+    let errors = file.compose_providers(&mut models, store, Arc::new(registry), Some(ctx));
+    (models, errors)
+}
+
+/// The outgoing `openai-completions` request body for one `Models::complete` call — the plain
+/// (non-simple) path, which is the shape the interactive agent uses: it sets
+/// `StreamOptions::reasoning` and nothing else sampling-related, with no `build_base_options` in
+/// front of the adapter.
+async fn request_body(
+    models: &Models,
+    model: &Model,
+    reasoning: cyrup_core::ModelThinkingLevel,
+    sampling_params: Option<serde_json::Map<String, serde_json::Value>>,
+) -> serde_json::Value {
+    let captured: Arc<Mutex<Option<serde_json::Value>>> = Arc::new(Mutex::new(None));
+    let sink = captured.clone();
+    let opts = StreamOptions {
+        reasoning,
+        sampling_params,
+        timeout_ms: Some(5_000),
+        max_retries: Some(0),
+        on_payload: Some(Arc::new(
+            move |body: serde_json::Value,
+                  _model: Model|
+                  -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = Option<serde_json::Value>> + Send>,
+            > {
+                *sink.lock().unwrap() = Some(body);
+                Box::pin(async { None })
+            },
+        )),
+        ..Default::default()
+    };
+    models.complete(model, &Context::default(), &opts).await;
+    captured
+        .lock()
+        .unwrap()
+        .take()
+        .expect("the adapter must have built a request body")
+}
+
+/// CFG-104 Verify, end to end from the `models.json` text to the outgoing request body:
+///
+/// > With a model defining `samplingParams: {top_p: 0.9}` and `samplingParamsByThinkingLevel:
+/// > {high: {temperature: 0.6}}`, an openai-completions request at `high` carries both keys and the
+/// > same request at `off` carries only `top_p`; a request `samplingParams: {temperature: 1}` wins
+/// > over the level value; an override `{high: {top_k: 20}}` keeps the definition's `temperature`
+/// > for `high`.
+///
+/// Upstream: `core/model-config.ts:46`/`:62` (schema), `core/provider-composer.ts:245` (copy) and
+/// `:164-175` (override merge), `api/simple-options.ts:24-34` + `api/openai-completions.ts:1003-1007`
+/// (resolve at the adapter) @f1b2e77f5. The file goes through `load_models_file_reporting`, so the
+/// schema pass runs too. Before CFG-104 the per-level key was dropped by serde with no diagnostic,
+/// and this plain `Models::complete` path (no `build_base_options`) applied none of the model's
+/// sampling defaults at all, not even the flat `top_p`; the test red-proves on both counts.
+///
+/// The last clause composes over the REAL built-in registry: a `modelOverrides` entry on a
+/// built-in catalog row that declares no sampling defaults adds a level the row lacks, and that
+/// level must reach the wire too (red-proven by making the override merge return `None` for a
+/// base with no map).
+#[tokio::test]
+async fn cfg104_sampling_params_by_thinking_level_reach_the_openai_completions_request() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("models.json");
+    std::fs::write(
+        &path,
+        r#"{"providers":{"local":{
+             "baseUrl":"http://127.0.0.1:9/v1","api":"openai-completions","apiKey":"sk-static",
+             "models":[
+               {"id":"plain","reasoning":true,
+                "samplingParams":{"top_p":0.9},
+                "samplingParamsByThinkingLevel":{"high":{"temperature":0.6}}},
+               {"id":"patched","reasoning":true,"thinkingLevelMap":{"max":"max"},
+                "samplingParams":{"top_p":0.9},
+                "samplingParamsByThinkingLevel":{
+                  "high":{"temperature":0.6},"low":{"temperature":0.4,"top_p":0.95}}}
+             ],
+             "modelOverrides":{"patched":{"samplingParamsByThinkingLevel":{
+               "high":{"top_k":20},"low":{"temperature":0.5},"max":{"temperature":1}}}}
+           }}}"#,
+    )
+    .unwrap();
+    let (file, err) = crate::load_models_file_reporting(&path);
+    assert_eq!(err, None, "the per-level key is valid models.json");
+    let (models, errors) = composed_real(&file);
+    assert!(errors.is_empty(), "{errors:?}");
+    let plain = models.get_model("local", "plain").unwrap();
+    let patched = models.get_model("local", "patched").unwrap();
+    use cyrup_core::ModelThinkingLevel::{High, Off};
+    use serde_json::json;
+
+    let body = request_body(&models, &plain, High, None).await;
+    assert_eq!(body.get("top_p"), Some(&json!(0.9)), "{body}");
+    assert_eq!(
+        body.get("temperature"),
+        Some(&json!(0.6)),
+        "the `high` entry must reach the wire: {body}"
+    );
+
+    let body = request_body(&models, &plain, Off, None).await;
+    assert_eq!(body.get("top_p"), Some(&json!(0.9)), "{body}");
+    assert_eq!(
+        body.get("temperature"),
+        None,
+        "`off` has no entry, so only the flat params go out: {body}"
+    );
+
+    let request = serde_json::Map::from_iter([("temperature".to_string(), json!(1))]);
+    let body = request_body(&models, &plain, High, Some(request)).await;
+    assert_eq!(
+        body.get("temperature"),
+        Some(&json!(1)),
+        "the request's own samplingParams win over the level value: {body}"
+    );
+    assert_eq!(body.get("top_p"), Some(&json!(0.9)), "{body}");
+
+    let body = request_body(&models, &patched, High, None).await;
+    assert_eq!(
+        body.get("top_k"),
+        Some(&json!(20)),
+        "the override's level key arrives: {body}"
+    );
+    assert_eq!(
+        body.get("temperature"),
+        Some(&json!(0.6)),
+        "the override MERGES into `high`, keeping the definition's temperature: {body}"
+    );
+    assert_eq!(body.get("top_p"), Some(&json!(0.9)), "{body}");
+
+    // The same per-key merge into a second level (`low`), and a level (`max`) that only the
+    // override declares on a custom definition — the two clauses of pi's model-registry case
+    // (`test/model-registry.test.ts:757-806`) that `compose.rs`'s port checks on the composed
+    // `Model` alone, carried here to the wire.
+    use cyrup_core::ModelThinkingLevel::{Low, Max};
+    let body = request_body(&models, &patched, Low, None).await;
+    assert_eq!(
+        body.get("temperature"),
+        Some(&json!(0.5)),
+        "the override's `low.temperature` wins per key: {body}"
+    );
+    assert_eq!(
+        body.get("top_p"),
+        Some(&json!(0.95)),
+        "the definition's `low.top_p` survives the override and beats the flat 0.9: {body}"
+    );
+    assert_eq!(
+        body.get("top_k"),
+        None,
+        "`high`'s key stays in `high`: {body}"
+    );
+    let body = request_body(&models, &patched, Max, None).await;
+    assert_eq!(
+        body.get("temperature"),
+        Some(&json!(1)),
+        "an override-only level on a custom definition reaches the wire: {body}"
+    );
+    assert_eq!(body.get("top_p"), Some(&json!(0.9)), "{body}");
+
+    // An override-only BUILT-IN: the catalog row declares no sampling defaults at all, and the
+    // override adds a level the row lacks (pi `applyModelOverride` →
+    // `mergeSamplingParamsByThinkingLevel(undefined, override)`, `provider-composer.ts:164-175`).
+    // Composed over the REAL built-in registry (embedded catalogs + real wire impls); the
+    // override points the provider at a refused local port, so nothing leaves the machine.
+    let file = crate::load_models_file(&{
+        let path = dir.path().join("builtin-models.json");
+        std::fs::write(
+            &path,
+            r#"{"providers":{"huggingface":{
+                 "baseUrl":"http://127.0.0.1:9/v1","apiKey":"sk-static",
+                 "modelOverrides":{"deepseek-ai/DeepSeek-R1":{
+                   "samplingParamsByThinkingLevel":{"high":{"top_k":7}}}}
+               }}}"#,
+        )
+        .unwrap();
+        path
+    })
+    .unwrap();
+    let (models, errors) = crate::compose_provider_registry(
+        &file,
+        CreateModelsOptions {
+            credentials: None,
+            auth_context: Some(Arc::new(MapEnv(BTreeMap::new()))),
+            catalog_overlay: None,
+        },
+    );
+    assert!(errors.is_empty(), "{errors:?}");
+    let builtin = models
+        .get_model("huggingface", "deepseek-ai/DeepSeek-R1")
+        .unwrap();
+    let body = request_body(&models, &builtin, High, None).await;
+    assert_eq!(
+        body.get("top_k"),
+        Some(&json!(7)),
+        "a built-in's override-only level must reach the wire: {body}"
+    );
+    let body = request_body(&models, &builtin, Off, None).await;
+    assert_eq!(body.get("top_k"), None, "only `high` was declared: {body}");
 }

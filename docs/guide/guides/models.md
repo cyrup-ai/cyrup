@@ -252,9 +252,10 @@ trimmed stdout becomes the key, and `$VAR` / `${VAR}` interpolate from the envir
 
 Alongside `models`, a provider block accepts `headers`, `compat` for protocol quirks, and
 `modelOverrides` for patching individual models — including the built-in ones — with a different
-`contextWindow`, `maxTokens`, `reasoning` flag, `thinkingLevelMap`, `samplingParams`, `promptCache`
-lifetimes, or [`inputLimits`](#how-big-an-image-gets-sent). A provider declared here is selectable
-with `--provider` and appears in `--list-models` once its key resolves.
+`contextWindow`, `maxTokens`, `reasoning` flag, `thinkingLevelMap`, `samplingParams`,
+`samplingParamsByThinkingLevel`, `promptCache` lifetimes, or
+[`inputLimits`](#how-big-an-image-gets-sent). A provider declared here is selectable with
+`--provider` and appears in `--list-models` once its key resolves.
 
 `samplingParams` is the escape hatch for parameters cyrup does not model — `top_p`, `top_k`,
 `min_p`, `repetition_penalty`, anything your server accepts:
@@ -268,6 +269,29 @@ The map is written onto the request body **last**, so a key here beats the `temp
 replacing it, so a `top_p`-only patch leaves `min_p` alone. Only the three OpenAI-compatible wire
 protocols apply it (`openai-completions`, `openai-responses`, `azure-openai-responses`); every other
 api — including `openai-codex-responses` — ignores it silently.
+
+`samplingParamsByThinkingLevel` overrides those defaults per thinking level. Its keys are cyrup's
+thinking levels (`off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`), not the provider values
+from `thinkingLevelMap`, and each value is a sampling map like `samplingParams`:
+
+```json
+{
+  "id": "qwen-thinking-model",
+  "reasoning": true,
+  "samplingParams": { "temperature": 1.0, "top_p": 0.95 },
+  "samplingParamsByThinkingLevel": {
+    "off": { "temperature": 0.7, "top_p": 0.8 },
+    "high": { "top_k": 20 }
+  }
+}
+```
+
+cyrup first clamps the requested level to one the model supports, then merges the model's
+`samplingParams`, that level's entry, and the request's own sampling params, in that order; a later
+key wins. A level with no entry gets the model defaults alone. A `modelOverrides` entry merges into
+each level per key rather than replacing it. Like `samplingParams`, it applies only to the three
+OpenAI-compatible protocols, and a wrong shape (a level that is not an object) makes the whole
+`models.json` invalid rather than being ignored.
 
 ## How big an image gets sent
 

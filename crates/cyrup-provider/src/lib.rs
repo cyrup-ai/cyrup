@@ -103,7 +103,8 @@ pub use images::{
 };
 pub use model::{
     Modality, Model, ModelCost, ModelCostTier, ModelImageInputLimits, ModelImageResizeOptions,
-    ModelInputLimits, ModelPromptCache, prompt_cache_ttl_ms,
+    ModelInputLimits, ModelPromptCache, ModelSamplingParams, SamplingParams,
+    SamplingParamsByThinkingLevel, prompt_cache_ttl_ms,
 };
 pub use models_store::{
     InMemoryModelsStore, ModelsStore, ModelsStoreEntry, ModelsStoreOperationOptions,

@@ -219,8 +219,10 @@ pub struct StreamOptions {
     /// why it sits here). Lets custom OpenAI-compatible servers (llama.cpp, vLLM, SGLang, …) receive
     /// parameters cyrup does not model — `top_p`, `top_k`, `min_p`, `repetition_penalty`.
     ///
-    /// Merged over [`crate::Model::sampling_params`] per key by
-    /// [`crate::utils::simple_options::build_base_options`] (`simple-options.ts:27-33`). **Only
+    /// Merged per key over the model's flat and effective-level defaults
+    /// ([`crate::Model::sampling_params`]) by
+    /// [`crate::utils::simple_options::resolve_sampling_params`] (`simple-options.ts:24-34`
+    /// @f1b2e77f5), which both `build_base_options` and each OpenAI-compatible adapter call. **Only
     /// applied by the OpenAI-compatible adapters** — completions, responses, Azure responses
     /// (`openai-completions.ts:885-887`, `openai-responses.ts:331-333`,
     /// `azure-openai-responses.ts:325-327` @v0.84.1) — every other api ignores it, including

@@ -1020,9 +1020,10 @@ mod tests {
                 .expect("a configured provider yields a real launch model");
         assert_eq!(provider, "together");
         assert_ne!(provider, "unconfigured");
-        // Pi `defaultModelPerProvider.together` — `together: "moonshotai/Kimi-K2.6"`,
-        // packages/coding-agent/src/core/model-resolver.ts:41 @v0.83.0.
-        assert_eq!(pattern, "together/moonshotai/Kimi-K2.6");
+        // Pi `defaultModelPerProvider.together` — `together: "moonshotai/Kimi-K3"`,
+        // packages/coding-agent/src/core/model-resolver.ts:47 @f1b2e77f5 (moved from Kimi-K2.6 at
+        // v1.0.0; CFG-102).
+        assert_eq!(pattern, "together/moonshotai/Kimi-K3");
     }
 
     #[test]

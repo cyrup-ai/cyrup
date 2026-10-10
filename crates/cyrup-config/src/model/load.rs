@@ -284,6 +284,184 @@ mod tests {
         );
     }
 
+    /// CFG-104: `samplingParamsByThinkingLevel` is `Type.Optional(SamplingParamsByThinkingLevelSchema)`
+    /// (`core/model-config.ts:20-28`, `:46`, `:62` @f1b2e77f5) — an object whose `off`…`max`
+    /// entries are each an object. A wrong shape is a whole-file schema failure naming the path,
+    /// on a definition and on an override alike; an unknown level key is tolerated, as a plain
+    /// `Type.Object` tolerates it.
+    #[test]
+    fn cfg104_sampling_params_by_thinking_level_is_schema_checked_per_level() {
+        let dir = crate::test_util::temp_dir();
+
+        let path = dir.join("level-not-object.json");
+        std::fs::write(
+            &path,
+            r#"{"providers":{"x":{"baseUrl":"http://h/v1","api":"openai-completions",
+                 "models":[{"id":"m","samplingParamsByThinkingLevel":{"high":0.6}}],
+                 "modelOverrides":{"o":{"samplingParamsByThinkingLevel":[]}}}}}"#,
+        )
+        .unwrap();
+        let (file, err) = load_models_file_reporting(&path);
+        assert!(file.providers.is_empty());
+        let err = err.expect("a non-object level entry must be a schema failure");
+        assert!(err.starts_with("Invalid models.json schema:"), "{err}");
+        assert!(
+            err.contains(
+                "  - providers.x.models.0.samplingParamsByThinkingLevel.high: must be object"
+            ),
+            "{err}"
+        );
+        assert!(
+            err.contains(
+                "  - providers.x.modelOverrides.o.samplingParamsByThinkingLevel: must be object"
+            ),
+            "{err}"
+        );
+
+        let path = dir.join("level-ok.json");
+        std::fs::write(
+            &path,
+            r#"{"providers":{"x":{"baseUrl":"http://h/v1","api":"openai-completions",
+                 "models":[{"id":"m","samplingParamsByThinkingLevel":
+                   {"off":{"temperature":0.7},"high":{"temperature":0.6},"turbo":42}}]}}}"#,
+        )
+        .unwrap();
+        let (file, err) = load_models_file_reporting(&path);
+        assert_eq!(err, None);
+        assert_eq!(file.providers.len(), 1);
+    }
+
+    /// CFG-105: `contextWindow` / `maxTokens` are `Type.Optional(PositiveTokenCountSchema)` —
+    /// `Type.Number({ exclusiveMinimum: 0 })` — on the definition AND the override
+    /// (`core/model-config.ts:30`, `:43-44`, `:59-60` @f1b2e77f5). A failing value fails
+    /// `validateModelsConfig.Check`, which returns `Invalid models.json schema:` with an EMPTY
+    /// provider map (`:148-155`): a sibling provider that is fine does not survive either. Ported
+    /// from `test/config-schemas.test.ts` `rejects non-positive model token limits` (`:142-167`).
+    #[test]
+    fn cfg105_non_positive_token_limits_reject_the_whole_file() {
+        let dir = crate::test_util::temp_dir();
+        let good =
+            r#""ok":{"baseUrl":"http://ok/v1","api":"openai-completions","models":[{"id":"g"}]}"#;
+
+        // The Verify cases, literally: one `contextWindow: 0` model; one override `maxTokens: -1`.
+        let path = dir.join("cw0.json");
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"providers":{{{good},"x":{{"baseUrl":"http://h/v1","api":"openai-completions",
+                     "models":[{{"id":"m","contextWindow":0}}]}}}}}}"#
+            ),
+        )
+        .unwrap();
+        let (file, err) = load_models_file_reporting(&path);
+        assert!(file.providers.is_empty(), "{:?}", file.providers.keys());
+        let err = err.expect("contextWindow: 0 must be a schema failure");
+        assert!(err.starts_with("Invalid models.json schema:"), "{err}");
+        assert!(
+            err.contains("  - providers.x.models.0.contextWindow: must be > 0"),
+            "{err}"
+        );
+
+        let path = dir.join("ov-mt-neg.json");
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"providers":{{{good},"anthropic":{{"modelOverrides":{{"claude-x":{{"maxTokens":-1}}}}}}}}}}"#
+            ),
+        )
+        .unwrap();
+        let (file, err) = load_models_file_reporting(&path);
+        assert!(file.providers.is_empty(), "{:?}", file.providers.keys());
+        let err = err.expect("an override maxTokens: -1 must be a schema failure");
+        assert!(err.starts_with("Invalid models.json schema:"), "{err}");
+        assert!(
+            err.contains("  - providers.anthropic.modelOverrides.claude-x.maxTokens: must be > 0"),
+            "{err}"
+        );
+
+        // pi's loop: both fields, both shapes, 0 and -1.
+        for field in ["contextWindow", "maxTokens"] {
+            for value in ["0", "-1"] {
+                for (shape, body, at) in [
+                    (
+                        "models",
+                        format!(r#""models":[{{"id":"model","{field}":{value}}}]"#),
+                        format!("providers.local.models.0.{field}"),
+                    ),
+                    (
+                        "modelOverrides",
+                        format!(r#""modelOverrides":{{"model":{{"{field}":{value}}}}}"#),
+                        format!("providers.local.modelOverrides.model.{field}"),
+                    ),
+                ] {
+                    let path = dir.join(format!("{shape}-{field}-{value}.json"));
+                    std::fs::write(
+                        &path,
+                        format!(
+                            r#"{{"providers":{{"local":{{"baseUrl":"http://h/v1","api":"openai-completions",{body}}}}}}}"#
+                        ),
+                    )
+                    .unwrap();
+                    let (file, err) = load_models_file_reporting(&path);
+                    assert!(file.providers.is_empty(), "{shape}.{field}={value}");
+                    let err = err.unwrap_or_default();
+                    assert!(
+                        err.contains(&format!("  - {at}: must be > 0")),
+                        "{shape}.{field}={value}: {err}"
+                    );
+                }
+            }
+        }
+
+        // ...and `1` on both shapes is accepted.
+        let path = dir.join("ones.json");
+        std::fs::write(
+            &path,
+            r#"{"providers":{"local":{"baseUrl":"http://h/v1","api":"openai-completions",
+                 "models":[{"id":"model","contextWindow":1,"maxTokens":1}],
+                 "modelOverrides":{"model":{"contextWindow":1,"maxTokens":1}}}}}"#,
+        )
+        .unwrap();
+        let (file, err) = load_models_file_reporting(&path);
+        assert_eq!(err, None);
+        assert_eq!(file.providers.len(), 1);
+    }
+
+    /// CFG-105: `ModelsConfigSchema` declares `$schema: Type.Optional(Type.String())`
+    /// (`core/model-config.ts:84-87` @f1b2e77f5). Ported from `test/config-schemas.test.ts`
+    /// `validates $schema in models.json at runtime` (`:248-270`): a string loads with its
+    /// providers; `$schema: 42` is an error naming `$schema`.
+    #[test]
+    fn cfg105_dollar_schema_must_be_a_string() {
+        let dir = crate::test_util::temp_dir();
+
+        let path = dir.join("schema-ok.json");
+        std::fs::write(
+            &path,
+            r#"{"$schema":"https://example.invalid/models.schema.json",
+                "providers":{"demo":{"baseUrl":"http://localhost:8080/v1","api":"openai-completions",
+                                     "models":[{"id":"demo"}]}}}"#,
+        )
+        .unwrap();
+        let (file, err) = load_models_file_reporting(&path);
+        assert_eq!(err, None);
+        assert_eq!(
+            file.providers
+                .get("demo")
+                .and_then(|p| p.models.first())
+                .map(|m| m.id.as_str()),
+            Some("demo")
+        );
+
+        let path = dir.join("schema-42.json");
+        std::fs::write(&path, r#"{"$schema":42,"providers":{}}"#).unwrap();
+        let (file, err) = load_models_file_reporting(&path);
+        assert!(file.providers.is_empty());
+        let err = err.expect("$schema: 42 must be a schema failure");
+        assert!(err.starts_with("Invalid models.json schema:"), "{err}");
+        assert!(err.contains("  - $schema: must be string"), "{err}");
+    }
+
     /// CFG-046 + CFG-043: pi types `name`/`baseUrl`/`apiKey`/`api` as
     /// `Type.Optional(Type.String({ minLength: 1 }))` (model-config.ts:188-198 @v0.83.0), so an
     /// empty string FAILS `validateModelsConfig.Check` and `ModelConfig.load` returns an empty

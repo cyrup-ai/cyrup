@@ -195,6 +195,159 @@ fn registered_model_carries_long_context_pricing_tiers_across_the_seam() {
     );
 }
 
+/// The outgoing request body of one `stream` call through an extension-registered provider, read
+/// at `on_payload` (the endpoint is a closed port, so nothing leaves the box).
+async fn registered_request_body(
+    provider: &Arc<dyn cyrup_provider::Provider>,
+    model: &cyrup_provider::Model,
+    reasoning: cyrup_core::ModelThinkingLevel,
+) -> serde_json::Value {
+    let captured: Arc<Mutex<Option<serde_json::Value>>> = Arc::new(Mutex::new(None));
+    let sink = captured.clone();
+    let opts = cyrup_provider::StreamOptions {
+        reasoning,
+        timeout_ms: Some(5_000),
+        max_retries: Some(0),
+        on_payload: Some(Arc::new(
+            move |body: serde_json::Value,
+                  _model: cyrup_provider::Model|
+                  -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = Option<serde_json::Value>> + Send>,
+            > {
+                *sink.lock().unwrap() = Some(body);
+                Box::pin(async { None })
+            },
+        )),
+        ..Default::default()
+    };
+    let stream = provider.stream(model, &cyrup_provider::Context::default(), &opts);
+    cyrup_provider::collect_message(stream).await;
+    captured
+        .lock()
+        .unwrap()
+        .take()
+        .expect("the adapter must have built a request body")
+}
+
+/// CFG-104, extension path: pi's `ProviderChatModelConfig` declares `samplingParams` and
+/// `samplingParamsByThinkingLevel` (`core/provider-composer.ts:71-72` @f1b2e77f5) and
+/// `extensionModelFromDefinition` spreads the definition onto the model (`:297`), so an
+/// extension provider's per-level sampling reaches the request. Before the fix serde dropped both
+/// keys at `ProviderModelConfig` and `build_models` hard-coded `sampling_params: None`, so the
+/// `high` request carried neither `top_p` nor `temperature`.
+#[tokio::test]
+async fn registered_model_sampling_params_by_thinking_level_reach_the_request() {
+    let mut hub = ProviderHub::new();
+    let cfg = json!({
+        "name": "Acme",
+        "apiKey": "sk-x",
+        "api": "openai-completions",
+        "baseUrl": "http://127.0.0.1:9/v1",
+        "models": [{
+            "id": "acme-think",
+            "reasoning": true,
+            "samplingParams": {"top_p": 0.9},
+            "samplingParamsByThinkingLevel": {"high": {"temperature": 0.6}},
+            "cost": {"input": 0.0, "output": 0.0, "cacheRead": 0.0, "cacheWrite": 0.0}
+        }]
+    });
+    hub.register("acme".into(), &cfg).unwrap();
+    let reg = hub.get("acme").expect("registration stored");
+    let provider = reg.build_provider();
+    let model = provider
+        .get_model("acme-think")
+        .cloned()
+        .expect("model registered");
+
+    let body =
+        registered_request_body(&provider, &model, cyrup_core::ModelThinkingLevel::High).await;
+    assert_eq!(body.get("top_p"), Some(&json!(0.9)), "{body}");
+    assert_eq!(
+        body.get("temperature"),
+        Some(&json!(0.6)),
+        "the `high` entry must reach the wire: {body}"
+    );
+
+    let body =
+        registered_request_body(&provider, &model, cyrup_core::ModelThinkingLevel::Off).await;
+    assert_eq!(body.get("top_p"), Some(&json!(0.9)), "{body}");
+    assert_eq!(
+        body.get("temperature"),
+        None,
+        "`off` has no entry, so only the flat params go out: {body}"
+    );
+}
+
+/// CFG-104, guest side of the seam: the SDK's `ProviderModelConfig` (what a Rust guest builds)
+/// must serialize both sampling keys under the names the host's `ProviderModelConfig` reads, and
+/// the registered model must put them on the wire. The wire test above starts from a raw `json!`
+/// literal, so it cannot catch a rename mismatch on the SDK side; this one starts from the SDK
+/// struct and goes through the same `on_payload` capture.
+#[tokio::test]
+async fn sdk_provider_model_config_sampling_keys_reach_the_request() {
+    let mut sampling = serde_json::Map::new();
+    sampling.insert("top_p".into(), json!(0.9));
+    let sdk_cfg = cyrup_ext_sdk::ProviderConfig {
+        name: "Acme".into(),
+        api_key: Some("sk-x".into()),
+        api: Some("openai-completions".into()),
+        base_url: Some("http://127.0.0.1:9/v1".into()),
+        models: vec![cyrup_ext_sdk::ProviderModelConfig {
+            id: "acme-think".into(),
+            reasoning: true,
+            sampling_params: Some(sampling),
+            sampling_params_by_thinking_level: Some(json!({"high": {"temperature": 0.6}})),
+            ..Default::default()
+        }],
+        auth_header: None,
+        headers: std::collections::BTreeMap::new(),
+        oauth: None,
+        has_stream_simple: false,
+    };
+    let wire = serde_json::to_value(&sdk_cfg).unwrap();
+
+    let host: crate::provider::ProviderConfig = serde_json::from_value(wire.clone()).unwrap();
+    assert!(host.models[0].sampling_params.is_some(), "{wire}");
+    assert!(
+        host.models[0].sampling_params_by_thinking_level.is_some(),
+        "{wire}"
+    );
+
+    let mut hub = ProviderHub::new();
+    hub.register("acme".into(), &wire).unwrap();
+    let provider = hub
+        .get("acme")
+        .expect("registration stored")
+        .build_provider();
+    let model = provider
+        .get_model("acme-think")
+        .cloned()
+        .expect("model registered");
+    let body =
+        registered_request_body(&provider, &model, cyrup_core::ModelThinkingLevel::High).await;
+    assert_eq!(body.get("top_p"), Some(&json!(0.9)), "{body}");
+    assert_eq!(body.get("temperature"), Some(&json!(0.6)), "{body}");
+}
+
+/// [CYRUP-DELTA] A per-level value that is not an object fails registration here, where pi accepts
+/// it. pi never schema-checks an extension model: `ProviderChatModelConfig.samplingParamsByThinkingLevel`
+/// (`core/provider-composer.ts:72` @f1b2e77f5) is only a TypeScript type, and
+/// `extensionModelFromDefinition` (`:281-297`) spreads the definition onto the model unchecked, so
+/// `{high: 0.6}` registers and `resolveSamplingParams` spreads nothing for it (`{...0.6}` is `{}`).
+/// `SamplingParamsSchema` (`core/model-config.ts:19`) applies to `models.json` only. cyrup's field
+/// is typed, so the bad shape is a registration error rather than a silently ignored entry.
+#[test]
+fn registered_model_rejects_a_non_object_thinking_level_entry() {
+    let mut hub = ProviderHub::new();
+    let cfg = json!({
+        "name": "Acme",
+        "api": "openai-completions",
+        "baseUrl": "http://127.0.0.1:9/v1",
+        "models": [{"id": "m", "samplingParamsByThinkingLevel": {"high": 0.6}}]
+    });
+    assert!(hub.register("acme".into(), &cfg).is_err());
+}
+
 #[test]
 fn provider_hub_defers_until_bind_then_flushes() {
     let mut hub = ProviderHub::new();
