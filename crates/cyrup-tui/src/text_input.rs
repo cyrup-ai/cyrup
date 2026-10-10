@@ -812,6 +812,20 @@ mod tests {
         }
     }
 
+    /// TUI-048's single-line half: the selector search field segments with the SAME ICU segmenter
+    /// as the editor, so Alt+B inside `你好世界` stops one dictionary WORD back — byte offset 6,
+    /// since each ideograph is three UTF-8 bytes. A bare UAX#29 iterator stopped at 9.
+    #[test]
+    fn search_field_cjk_word_motion_matches_the_editor() {
+        let mut input = Input::default();
+        for c in "你好世界".chars() {
+            input.handle_key(&key(KeyCode::Char(c)));
+        }
+        assert_eq!(input.value(), "你好世界");
+        input.handle_key(&KeyEvent::new(KeyCode::Left, KeyModifiers::ALT));
+        assert_eq!(input.cursor(), 6, "Alt+B must land on the word boundary");
+    }
+
     /// Render at its natural height and hand back the ratatui `Buffer`, so assertions can read
     /// STYLE (the caret's `REVERSED`, the title's `BOLD`) and not only glyphs.
     fn buffer_of(sel: &mut TextInputSelector, w: u16) -> ratatui::buffer::Buffer {

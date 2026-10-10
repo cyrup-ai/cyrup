@@ -46,11 +46,23 @@ pub(crate) fn paint_startup_hints(frame: &mut Frame, state: &AppState, msg_area:
         && !state.transcript.has_active()
         && msg_area.height >= 1
     {
+        // `getStartupExpansionState()` (`interactive-mode.ts:1418-1420`) is
+        // `this.options.verbose || this.toolOutputExpanded` — BOTH terms. The `verbose` disjunct is
+        // the only one ever true at boot (`toolOutputExpanded` is `false` at construction), so
+        // dropping it would make `--verbose` boot collapsed.
+        //
+        // [CYRUP-DELTA] upstream reads this ONCE, as the `BuiltInHeader` constructor seed (`:1067`),
+        // and thereafter `setToolsExpanded` drives the header directly (`:4561-4577`). cyrup
+        // re-reads it per frame, which is the same observable state machine without a second copy
+        // of the flag to keep in sync.
+        let expanded = state.verbose_startup || state.transcript.tool_expanded();
         let rows = crate::chrome::compact_hint_height(
             &state.theme,
             &state.keymap,
+            state.editor.keymap_ref(),
             msg_area.width,
             state.startup_header.details(),
+            expanded,
         )
         .min(msg_area.height);
         let hint_row = Rect {
@@ -64,7 +76,9 @@ pub(crate) fn paint_startup_hints(frame: &mut Frame, state: &AppState, msg_area:
             hint_row,
             &state.theme,
             &state.keymap,
+            state.editor.keymap_ref(),
             state.startup_header.details(),
+            expanded,
         );
     }
 }
@@ -115,14 +129,20 @@ fn paint_dock_inner(frame: &mut Frame, state: &mut AppState, regions: &Regions, 
     if images && images_area.height > 0 {
         render_images(frame, images_area, state);
     }
-    if band_area.height > 0 {
-        // `(${keyText("app.interrupt")} to cancel)` (`status-indicator.ts:47,78,100`) — `keyText`,
-        // so ALL bound keys joined with `/` (`keybinding-hints.ts:29-36`), not just the first.
-        let cancel = state.keymap.keys_label(Action::Interrupt);
-        state
-            .indicator
-            .render(frame, band_area, &state.theme, cancel.as_deref());
-    }
+    // TUI-103 — there is NO status band any more. Pi's default chat editor is constructed
+    // `embedWorkingStatus: true` (`interactive-mode.ts:647-652`), so `showStatusIndicator`
+    // (`:2312-2323`) hands the indicator to the editor via `setEditorWorkingStatusIndicator` and
+    // only falls back to `statusContainer.addChild(indicator)` when that returns false — which it
+    // does exactly when the editor is not a working-status editor (`:222-229`). cyrup has ONE
+    // editor and it is always that editor (`setEditorComponent` is unported — 07-cyrup-tui.md:846),
+    // so `statusContainer` is always empty upstream and `Regions::band` is always zero rows here.
+    // The spinner is drawn by [`crate::editor::InputEditor::render_in_slot`], into the top rule.
+    debug_assert_eq!(band_area.height, 0, "TUI-103: the status band is gone");
+
+    // `(${keyText("app.interrupt")} to cancel)` (`status-indicator.ts:47,78,100`) — `keyText`, so
+    // ALL bound keys joined with `/` (`keybinding-hints.ts:29-36`), not just the first. Read before
+    // the `state.editor` borrow below.
+    let cancel = state.keymap.keys_label(Action::Interrupt);
     // Pi gates the hardware cursor globally — `showHardwareCursor` (`tui.ts:344,389-397`), fed from
     // the setting at `interactive-mode.ts:1721-1732` — and cyrup parks that flag on the editor
     // (`editor.rs:277`, "the ONLY component that asks for a cursor position is this editor"), which
@@ -158,9 +178,26 @@ fn paint_dock_inner(frame: &mut Frame, state: &mut AppState, regions: &Regions, 
     } else {
         // TUI-172: under an overlay the editor is not the focused component, so it keeps its drawn
         // caret and places no hardware cursor (Pi: no `CURSOR_MARKER` ⇒ no dropped fake cursor).
-        state
-            .editor
-            .render_in_slot(frame, slot_area, &state.theme, state.overlays.is_empty());
+        // TUI-103 — the embedded status. [CYRUP-DELTA] none: this is pi's behaviour exactly,
+        // including the loss it implies. While a SELECTOR or a `BorderedLoader` owns the slot
+        // (the two branches above) NO spinner is shown at all, because pi's
+        // `showExtensionSelector` / `showExtensionInput` / `showExtensionEditor` clear
+        // `editorContainer` and add the dialog without ever reassigning `this.editor`
+        // (`interactive-mode.ts:2726-2730`, `:2808-2811`, `:2852-2855`) — so
+        // `isWorkingStatusEditor(this.editor)` is still true, the indicator is still embedded into
+        // the default editor, and that editor is no longer in the container. cyrup's band used to
+        // survive over a selector; faithfully porting the embed takes that signal away. Recorded on
+        // TUI-103's closure so a later pass does not read it as a regression to fix.
+        state.editor.render_in_slot(
+            frame,
+            slot_area,
+            &state.theme,
+            state.overlays.is_empty(),
+            Some(crate::editor::EmbeddedStatus {
+                indicator: &state.indicator,
+                cancel_hint: cancel.as_deref(),
+            }),
+        );
         if let Some(ac) = state.editor.autocomplete() {
             // E14: the popup lives INSIDE the editor's padding frame. Pi renders it at
             // `contentWidth` (= `width - paddingX * 2`) and prefixes the same `leftPadding` every

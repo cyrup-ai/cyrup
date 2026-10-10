@@ -73,6 +73,17 @@ const MUTED_DARK: Color = Color::Rgb(0x9d, 0xa5, 0xa9);
 /// (the only one that turns yellow/red) never rendered.
 ///
 /// FAILS before the fix: a fresh footer drew no `%/` at all.
+/// The logo line's text as it actually renders. [CYRUP-DELTA] the version span is omitted while
+/// the workspace version is cargo's `0.0.0` placeholder (`chrome::logo_line`), so asserting
+/// `Cyrup v0.0.0` here would pin text no user should ever see.
+fn logo_label() -> String {
+    if crate::chrome::is_placeholder_version(crate::chrome::APP_VERSION) {
+        "Cyrup".to_string()
+    } else {
+        format!("Cyrup v{}", crate::chrome::APP_VERSION)
+    }
+}
+
 #[test]
 fn c1_context_segment_renders_even_when_nothing_ever_set_it() {
     let mut app = app(100, 12);
@@ -961,9 +972,18 @@ fn c10_c13_startup_hint_block_is_framed_inset_and_names_the_expand_key() {
         "…inset by paddingX 1 like every row"
     );
 
-    // `Spacer(1)` on each side of the block (`:960-962`).
+    // TUI-018 — `withLogo` (`interactive-mode.ts:1015-1020`) puts the logo/version line directly
+    // ABOVE the hints, inside the same body, so the framing blank is now two rows up.
+    let logo = row_text(&app, hints - 1);
+    assert_eq!(
+        logo.trim_end(),
+        format!(" {}", logo_label()),
+        "the logo line opens the body, inset by paddingX 1 like every row"
+    );
+
+    // `Spacer(1)` on each side of the block (`:1075-1077`).
     assert!(
-        row_text(&app, hints - 1).trim().is_empty(),
+        row_text(&app, hints - 2).trim().is_empty(),
         "no framing blank above the block"
     );
     assert!(
@@ -971,8 +991,8 @@ fn c10_c13_startup_hint_block_is_framed_inset_and_names_the_expand_key() {
         "no framing blank below the block"
     );
     assert_eq!(
-        COMPACT_HINT_ROWS, 6,
-        "Spacer + compactInstructions + compactOnboarding + blank + onboarding + Spacer"
+        COMPACT_HINT_ROWS, 7,
+        "Spacer + logo + compactInstructions + compactOnboarding + blank + onboarding + Spacer"
     );
 }
 
@@ -986,6 +1006,7 @@ fn c10_c13_startup_hint_block_is_framed_inset_and_names_the_expand_key() {
 fn c13_short_terminal_gives_up_the_edges_and_keeps_the_hint_bar() {
     let theme = UiTheme::dark();
     let keymap = Keymap::default();
+    let editor_keymap = crate::keymap::EditorKeymap::default();
     // 100 columns so each logical row is exactly one screen row and the budget is unambiguous.
     let render = |rows: u16| -> Vec<String> {
         let mut terminal = Terminal::new(TestBackend::new(100, rows)).unwrap();
@@ -996,7 +1017,9 @@ fn c13_short_terminal_gives_up_the_edges_and_keeps_the_hint_bar() {
                     Rect::new(0, 0, 100, rows),
                     &theme,
                     &keymap,
+                    &editor_keymap,
                     StartupDetails::Shown,
+                    false,
                 )
             })
             .unwrap();
@@ -1017,43 +1040,64 @@ fn c13_short_terminal_gives_up_the_edges_and_keeps_the_hint_bar() {
         "one row must BE the hint bar: {one:?}"
     );
 
+    // TUI-018 put the logo/version row at `drop_rank` 1 — second-to-last to go, behind only the
+    // bar — because the version is the one thing a bug report always asks for. So from two rows up
+    // it is the bar plus the logo row, and the prose lines come back only above that.
+    //
+    // [CYRUP-DELTA] two things about that rank are cyrup's judgement, not pi's, and are recorded on
+    // the TUI-018 row: (1) the rank ORDER itself, which means a two-row budget shows the logo
+    // rather than the actionable `Press ctrl+o…` hint; (2) while the workspace version is the
+    // `0.0.0` placeholder the row carries only the wordmark, so the "a bug report asks for the
+    // version" rationale does not apply yet — it starts applying the day the workspace is versioned.
     let two = render(2);
     assert!(
-        two[0].contains("escape interrupt"),
-        "the bar comes first at two rows: {two:?}"
+        two[0].contains(&logo_label()),
+        "the logo/version row outranks both onboarding lines: {two:?}"
     );
     assert!(
-        two[1].contains("Press ctrl+o"),
-        "…then compactOnboarding: {two:?}"
+        two[1].contains("escape interrupt"),
+        "…and the bar is never dropped: {two:?}"
     );
 
     let three = render(3);
+    assert!(three[0].contains(&logo_label()), "three rows: {three:?}");
     assert!(
-        three[0].contains("escape interrupt"),
+        three[1].contains("escape interrupt"),
         "three rows: {three:?}"
     );
-    assert!(three[1].contains("Press ctrl+o"), "three rows: {three:?}");
     assert!(
-        three[2].trim().is_empty(),
-        "the body's inner blank outlives `onboarding`: {three:?}"
+        three[2].contains("Press ctrl+o"),
+        "…then compactOnboarding: {three:?}"
     );
 
-    // Five rows gives up only the TRAILING blank; the leading one is still there.
+    // Five rows gives up both framing blanks, so the block opens on the logo and still ends on
+    // `onboarding` — the two outermost rows go before any text does.
     let five = render(5);
     assert!(
-        five[0].trim().is_empty(),
-        "leading Spacer survives at five rows: {five:?}"
+        five[0].contains(&logo_label()),
+        "both Spacers go before any text at five rows: {five:?}"
     );
     assert!(
         five[4].contains("Cyrup can explain"),
         "…and the block ends on `onboarding`: {five:?}"
     );
 
-    // Four gives up the leading blank too, so the bar is on row 0 and the block still ends on
-    // `onboarding` — the two outermost rows go before any text does.
+    // Six keeps the leading blank; seven is the full block (`COMPACT_HINT_ROWS`).
+    let six = render(6);
+    assert!(
+        six[0].trim().is_empty(),
+        "leading Spacer survives at six rows: {six:?}"
+    );
+    assert!(six[1].contains(&logo_label()), "six rows: {six:?}");
+
+    // Four gives up `onboarding` as well, leaving the body's inner blank as the tail.
     let four = render(4);
-    assert!(four[0].contains("escape interrupt"), "four rows: {four:?}");
-    assert!(four[3].contains("Cyrup can explain"), "four rows: {four:?}");
+    assert!(four[0].contains(&logo_label()), "four rows: {four:?}");
+    assert!(four[1].contains("escape interrupt"), "four rows: {four:?}");
+    assert!(
+        four[3].trim().is_empty(),
+        "the body's inner blank outlives `onboarding`: {four:?}"
+    );
 }
 
 /// **C13 — wrapping.** `Text.render` wraps at `contentWidth = Math.max(1, width - paddingX * 2)`
@@ -1066,22 +1110,27 @@ fn c13_short_terminal_gives_up_the_edges_and_keeps_the_hint_bar() {
 fn c13_narrow_terminal_wraps_the_block_instead_of_clipping_it() {
     let theme = UiTheme::dark();
     let keymap = Keymap::default();
-    // `compactInstructions` is 79 columns, `compactOnboarding` 60, `onboarding` 91.
+    let editor_keymap = crate::keymap::EditorKeymap::default();
+    let height = |width: u16| {
+        crate::compact_hint_height(
+            &theme,
+            &keymap,
+            &editor_keymap,
+            width,
+            StartupDetails::Shown,
+            false,
+        )
+    };
+    // `compactInstructions` is 79 columns, `compactOnboarding` 60, `onboarding` 91, and TUI-018's
+    // logo/version row is 13 — short enough that it never wraps at any width tested here, so each
+    // count is simply one more than before that row existed.
+    assert_eq!(height(100), 7, "content 98 ≥ 91: nothing wraps");
     assert_eq!(
-        crate::compact_hint_height(&theme, &keymap, 100, StartupDetails::Shown),
-        6,
-        "content 98 ≥ 91: nothing wraps"
-    );
-    assert_eq!(
-        crate::compact_hint_height(&theme, &keymap, 80, StartupDetails::Shown),
-        8,
+        height(80),
+        9,
         "content 78: the 79-column bar and the 91-column onboarding each take 2 rows"
     );
-    assert_eq!(
-        crate::compact_hint_height(&theme, &keymap, 60, StartupDetails::Shown),
-        9,
-        "content 58: all three text rows take 2"
-    );
+    assert_eq!(height(60), 10, "content 58: all three prose rows take 2");
 
     let mut app = app(80, 24);
     app.draw().unwrap();

@@ -119,6 +119,12 @@ impl App<InlineBackend<TuiStdout>> {
         // EVERY run-loop arm that can have changed the state. Draining makes it once-per-transition
         // rather than once-per-frame.
         self.flush_terminal_progress();
+        // TUI-171 — the two `blocked` sources are reconciled from the UI state immediately before
+        // the report is written, so a dialog that opened or closed in this run-loop arm is already
+        // reflected. See [`App::sync_blocked_dialog_status`] for why it is a reconciliation rather
+        // than pi's five hand-placed calls.
+        self.sync_blocked_dialog_status();
+        self.flush_program_status();
         // pi's markers are part of the frame buffer it hands `terminal.write`, so they are logged
         // with it (TUI-040).
         let mut out = crate::write_log::tui_stdout();
@@ -163,6 +169,13 @@ impl App<InlineBackend<TuiStdout>> {
         // `ui.start()` after the resume (`interactive-mode.ts:4371`): the mode `restore` took down
         // comes back if the theme still follows the terminal's appearance.
         crate::color_scheme::terminal_started(&mut out);
+        // TUI-171 — `restore()` above wrote `state=clear` and disarmed the OSC 7501 reports, which
+        // is pi's `terminal.stop()` leg (`tui/src/terminal.ts:464-476`). This is the matching
+        // `ui.start()` leg: re-arm and re-send the remembered status, so a turn that is still
+        // running keeps reporting after the `fg`. See
+        // [`crate::program_status::resume_program_status`] for why it restores the startup answer
+        // rather than re-querying (same reason the flags above are re-pushed, not re-negotiated).
+        crate::program_status::resume_program_status();
         self.reset_render_state();
         self.draw_synchronized()
     }
@@ -261,6 +274,8 @@ impl App<InlineBackend<TuiStdout>> {
         let _ = crate::keyboard_protocol::push_flags(&mut out);
         // `ui.start()` after the editor (`interactive-mode.ts:4522`), as in `suspend`.
         crate::color_scheme::terminal_started(&mut out);
+        // TUI-171 — and the OSC 7501 re-arm, as in `suspend`: `restore()` cleared it.
+        crate::program_status::resume_program_status();
         self.reset_render_state();
         Ok(result)
     }

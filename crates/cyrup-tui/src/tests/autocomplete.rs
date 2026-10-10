@@ -206,6 +206,156 @@ fn enter_on_argument_popup_accepts_then_next_enter_submits() {
     assert!(ed.is_empty());
 }
 
+/// TUI-057 — the one-Enter slash submit is pi's FALL-THROUGH into `submitValue()`, whose first act
+/// on the text is `expandPasteMarkers(this.state.lines.join("\n")).trim()`
+/// (`components/editor.ts:1366` @v1.1.0+11). There is exactly one submit path upstream and it always
+/// expands, so a `[paste #N …]` marker elsewhere on the line must reach the agent as its CONTENT.
+/// This arm used to call the raw `self.text()`, which submitted the literal marker.
+#[test]
+fn one_enter_slash_submit_expands_paste_markers() {
+    let mut ed = InputEditor::new();
+    let big: String = std::iter::repeat_n('z', 1500).collect();
+    // Paste first (the marker lands at the cursor), then walk back and type the command in front
+    // of it, so one line holds both the open slash popup and an unexpanded marker.
+    ed.handle_paste(&big);
+    assert_eq!(ed.text(), "[paste #1 1500 chars]");
+    ed.handle_key(&key(KeyCode::Home));
+    type_str(&mut ed, "/comp");
+    let ac = ed
+        .autocomplete()
+        .expect("the slash popup must be open at col 5");
+    assert_eq!(ac.context, crate::CompletionContext::Slash);
+
+    match ed.handle_key(&key(KeyCode::Enter)) {
+        EditorOutcome::Submit(text) => {
+            assert!(
+                !text.contains("[paste #1"),
+                "the marker must not survive into the submitted text: {text:?}"
+            );
+            assert_eq!(text, format!("/compact {big}"));
+        }
+        other => panic!("Enter on a slash popup must submit, got {other:?}"),
+    }
+}
+
+/// TUI-057 — the row claims "a trailing space suppresses submission". It does not, and there is no
+/// suppression mechanism in the code: `/compact ` contains a space, so the slash branch takes the
+/// ARGUMENT arm, `/compact` owns no argument completer, and the popup never opens — Enter is a
+/// plain submit. What WAS wrong is that the plain path did not trim. Upstream trims in the same
+/// expression as the expansion (`components/editor.ts:1366`) and that one string feeds both
+/// `onSubmit` and `addToHistory`, so `/compact` and `/compact ` collapse to ONE history entry.
+#[test]
+fn a_trailing_space_submission_is_trimmed_like_upstream() {
+    let mut ed = InputEditor::new();
+    // A distinct older entry, so a duplicate `/compact` would be visible on the second Up.
+    ed.push_history("/tree");
+
+    ed.set_text("/compact");
+    assert!(!ed.autocomplete_open());
+    assert_eq!(
+        ed.handle_key(&key(KeyCode::Enter)),
+        EditorOutcome::Submit("/compact".to_string())
+    );
+
+    ed.set_text("/compact ");
+    assert!(
+        !ed.autocomplete_open(),
+        "the trailing space takes the argument arm, which has no completer: no popup"
+    );
+    assert_eq!(
+        ed.handle_key(&key(KeyCode::Enter)),
+        EditorOutcome::Submit("/compact".to_string()),
+        "the submitted string is trimmed, so dispatch and history see one spelling"
+    );
+
+    ed.handle_key(&key(KeyCode::Up));
+    assert_eq!(ed.text(), "/compact");
+    ed.handle_key(&key(KeyCode::Up));
+    assert_eq!(
+        ed.text(),
+        "/tree",
+        "a second, untrimmed `/compact ` entry would surface here"
+    );
+}
+
+/// TUI-057 — pins the [CYRUP-DELTA] on the submit predicate. pi branches on the bare prefix string
+/// (`if (this.autocompletePrefix.startsWith("/"))`, `components/editor.ts:806`), which an
+/// ABSOLUTE-path popup satisfies (`prefix: pathMatch`, `autocomplete.ts:411`), so upstream fires the
+/// whole line at the agent on one Enter. cyrup tests the CONTEXT and keeps editing instead. pi's own
+/// `applyCompletion` discriminates these cases properly 120 lines away (`autocomplete.ts:433`), so
+/// `:806` is upstream being loose rather than upstream deciding, and matching it would widen
+/// submission on a surface a user reaches by accident. Must stay GREEN: it fails if the submission
+/// rule is ever made unconditional.
+#[test]
+fn enter_on_an_absolute_path_popup_does_not_submit() {
+    let dir = tempfile::tempdir().unwrap();
+    // Two siblings sharing the `on` prefix: a lone forced match would auto-apply without a popup.
+    std::fs::create_dir_all(dir.path().join("one")).unwrap();
+    std::fs::create_dir_all(dir.path().join("only")).unwrap();
+    let line = format!("cat {}/on", dir.path().display());
+
+    let mut ed = InputEditor::new();
+    ed.set_cwd(dir.path().to_path_buf());
+    ed.set_text(&line);
+    ed.handle_key(&key(KeyCode::Tab));
+    let ac = ed
+        .autocomplete()
+        .expect("Tab opens the absolute-path list on a non-slash line");
+    assert_eq!(ac.context, crate::CompletionContext::Path);
+    assert!(
+        ac.prefix.starts_with('/'),
+        "pi's `:806` string test would fire on this prefix: {:?}",
+        ac.prefix
+    );
+
+    assert_eq!(
+        ed.handle_key(&key(KeyCode::Enter)),
+        EditorOutcome::Edited,
+        "accepting a path keeps editing; upstream would submit the line here"
+    );
+    assert!(!ed.autocomplete_open());
+    assert!(!ed.is_empty());
+    // The accepted line is still submittable — the next Enter sends it.
+    assert!(matches!(
+        ed.handle_key(&key(KeyCode::Enter)),
+        EditorOutcome::Submit(_)
+    ));
+}
+
+/// TUI-057 — the other half of the predicate delta. pi's precise command-name discriminator is
+/// `prefix.startsWith("/") && beforePrefix.trim() === "" && !prefix.slice(1).includes("/")`
+/// (`autocomplete.ts:433`), whose third clause is FALSE for cyrup's namespaced command names, which
+/// upstream does not have. Adopting `:433` as the submit predicate would stop `/flux/aug` from
+/// submitting; `context == Slash` is the only one of the three candidate predicates that is right
+/// about namespaced names. Must stay GREEN.
+#[test]
+fn enter_on_a_namespaced_slash_popup_submits() {
+    let mut ed = InputEditor::new();
+    ed.set_registry(CommandRegistry::with_dynamic(vec![SlashCommand {
+        name: std::borrow::Cow::Borrowed("flux/aug"),
+        description: std::borrow::Cow::Borrowed("test command"),
+        argument_hint: None,
+        source: CommandSource::Prompt,
+        arg_completion: crate::commands::ArgumentCompleter::None,
+    }]));
+    type_str(&mut ed, "/flux/au");
+    let ac = ed
+        .autocomplete()
+        .expect("the namespaced command-name popup must be open");
+    assert_eq!(ac.context, crate::CompletionContext::Slash);
+    assert_eq!(ac.prefix, "/flux/au");
+    assert!(
+        ac.prefix.get(1..).is_some_and(|rest| rest.contains('/')),
+        "this is the prefix shape pi's `:433` discriminator rejects"
+    );
+
+    assert_eq!(
+        ed.handle_key(&key(KeyCode::Enter)),
+        EditorOutcome::Submit("/flux/aug".to_string())
+    );
+    assert!(ed.is_empty());
+}
+
 #[test]
 fn esc_cancels_popup_keeps_text() {
     let mut ed = InputEditor::new();

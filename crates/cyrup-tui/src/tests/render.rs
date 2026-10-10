@@ -374,7 +374,16 @@ fn theme_colors_reach_rendered_cells() {
     // live subject is the thing under removal proves nothing about themes.
     let accent = Color::Rgb(0xa7, 0x98, 0xd7);
     let mut app = App::new(TestBackend::new(40, 12), UiTheme::dark()).unwrap();
-    app.state_mut().indicator.working();
+    // TUI-103 — `Compaction`, not `Working`: the status is now EMBEDDED in the editor's top rule,
+    // and an embedded `working` status takes the EDITOR'S BORDER COLOUR for spinner and message
+    // alike, because `showWorkingStatusIndicator` passes the one `colorFn` to both
+    // (`interactive-mode.ts:2346-2359` → `status-indicator.ts:38-47`). Compaction / branch-summary
+    // / retry build their own colours in their own constructors (`status-indicator.ts:84-99` etc.)
+    // and keep the accent spinner when embedded, so the compaction band is the accent-styled
+    // live-region surface this assertion needs.
+    app.state_mut()
+        .indicator
+        .set(crate::status_indicator::IndicatorKind::Compaction, None);
     app.transcript_mut().push_assistant_delta("colored");
     app.draw().unwrap();
     assert!(
@@ -385,7 +394,10 @@ fn theme_colors_reach_rendered_cells() {
     // A different theme yields a different accent on the cells (Pi v1.0.0 light `accent` = violet #7459b4).
     let light_accent = Color::Rgb(0x74, 0x59, 0xb4);
     let mut light = App::new(TestBackend::new(40, 12), UiTheme::light()).unwrap();
-    light.state_mut().indicator.working();
+    light
+        .state_mut()
+        .indicator
+        .set(crate::status_indicator::IndicatorKind::Compaction, None);
     light.transcript_mut().push_assistant_delta("colored");
     light.draw().unwrap();
     assert!(

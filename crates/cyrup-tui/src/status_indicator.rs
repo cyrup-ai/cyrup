@@ -35,9 +35,13 @@
 
 use std::time::{Duration, Instant};
 
+#[cfg(test)]
 use ratatui::Frame;
+#[cfg(test)]
 use ratatui::layout::Rect;
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
+#[cfg(test)]
 use ratatui::widgets::Paragraph;
 
 use crate::theme::UiTheme;
@@ -191,6 +195,17 @@ impl Default for StatusIndicator {
             working_indicator: None,
         }
     }
+}
+
+/// The per-frame derivation shared by the band and border forms — see [`StatusIndicator::derive`].
+struct Derived {
+    /// The spinner glyph for this frame, or `""` when an extension passed `frames: []`.
+    spinner: String,
+    /// Whether the glyph came from an extension, and so is drawn **unstyled**
+    /// (`renderIndicatorVerbatim`, `loader.ts:88-91`).
+    custom: bool,
+    /// The message, with the `(<key> to cancel)` suffix already appended where it belongs.
+    msg: String,
 }
 
 impl StatusIndicator {
@@ -392,38 +407,37 @@ impl StatusIndicator {
     /// constructors bake `(${keyText("app.interrupt")} to cancel)` into the message
     /// (`status-indicator.ts:47,78,100`), and **never** for `Working`, whose constructor appends
     /// nothing (`:29-40`, `interactive-mode.ts:2074-2080`).
+    // TUI-103 RESIDUAL — this wrapper and the two below are TEST-ONLY since the band was retired.
+    //
+    // `border_spans` is the live path; nothing in production calls `lines_at`, `lines` or `render`
+    // any more (`rg` over non-test code finds only `lines` -> `lines_at` here). They are kept
+    // behind `cfg(test)` rather than deleted because ~11 assertions in
+    // `tests::{status_indicator, footer_chrome_fidelity}` reach the message wording, the elapsed
+    // ladder and the accent colour THROUGH them — and those rules are live: both this wrapper and
+    // `border_spans` go through the same `derive`/`content_spans`. Deleting the wrapper would drop
+    // real coverage; keeping it compiled into the binary would ship dead code, which is the
+    // pattern this repo keeps rows open for (see TUI-064's image strip).
+    //
+    // The residual is that those assertions still exercise the retired band's SHAPE
+    // (`lines[1].spans[1]`) instead of the live border's spans, so a border-only regression in
+    // layout would not fail them. Migrating them to `border_spans`/`content_spans` is per-site
+    // index work and is filed, not silently deferred.
+    #[cfg(test)]
     pub fn lines_at(
         &self,
         elapsed: Duration,
         theme: &UiTheme,
         cancel_hint: Option<&str>,
     ) -> Vec<Line<'static>> {
-        if !self.kind.is_active() {
+        let Some(Derived {
+            spinner,
+            custom,
+            msg,
+        }) = self.derive(elapsed, cancel_hint)
+        else {
             return vec![Line::default(), Line::default()];
-        }
-        // An extension's `setWorkingIndicator` frames apply to the WORKING band only: upstream
-        // passes `workingIndicatorOptions` to `new WorkingStatusIndicator` alone
-        // (`interactive-mode.ts:3116-3120`) and re-applies it only when the live band's kind is
-        // `"working"` (`:2112`). Retry / compaction / branch-summary keep the built-in spinner.
-        let custom = self
-            .working_indicator
-            .as_ref()
-            .filter(|_| self.kind == IndicatorKind::Working);
-        let spinner = custom.map_or_else(|| Self::spinner_at(elapsed), |i| i.frame_at(elapsed));
-        let spinner_style = match self.kind {
-            IndicatorKind::Retry => theme.warning_style(),
-            _ => theme.accent_style(),
         };
-        let mut msg = match (self.retry, &self.message) {
-            (Some(retry), _) => retry.message_at(elapsed),
-            (None, Some(m)) => m.clone(),
-            (None, None) => self.default_message().to_string(),
-        };
-        if let Some(hint) = cancel_hint
-            && self.kind != IndicatorKind::Working
-        {
-            msg.push_str(&format!(" ({hint} to cancel)"));
-        }
+        let spinner_style = self.spinner_style(theme, None);
         // `Loader extends Text` with `paddingX = 1` (`loader.ts:35`), so `Text.render` emits
         // `leftMargin + line + rightMargin` (`text.ts:70,76`). The band was starting at column 0,
         // one column out of alignment with every other component.
@@ -437,7 +451,7 @@ impl StatusIndicator {
         let spans = vec![
             if spinner.is_empty() {
                 Span::raw(" ")
-            } else if custom.is_some() {
+            } else if custom {
                 Span::raw(format!(" {spinner} "))
             } else {
                 Span::styled(format!(" {spinner} "), spinner_style)
@@ -448,13 +462,177 @@ impl StatusIndicator {
         vec![Line::default(), Line::from(spans)]
     }
 
+    /// The spinner colour. `override_style` is the EMBEDDED working case: pi's
+    /// `showWorkingStatusIndicator` passes ONE `colorFn` — `this.editor.borderColor ??
+    /// theme.getThinkingBorderColor(...)` — to `new WorkingStatusIndicator`, which hands the same
+    /// fn to both `spinnerColorFn` and `messageColorFn` (`interactive-mode.ts:2346-2359`,
+    /// `status-indicator.ts:38-47`), so an embedded `working` status takes the editor's rule colour
+    /// for glyph and message alike. Retry / compaction / branch-summary build their own colours in
+    /// their own constructors (`status-indicator.ts:52-77`, `:84-99`, `:102-111`) and keep them
+    /// when embedded.
+    fn spinner_style(&self, theme: &UiTheme, override_style: Option<Style>) -> Style {
+        if let Some(st) = override_style.filter(|_| self.kind == IndicatorKind::Working) {
+            return st;
+        }
+        match self.kind {
+            IndicatorKind::Retry => theme.warning_style(),
+            _ => theme.accent_style(),
+        }
+    }
+
+    /// The message colour, under the same rule as [`Self::spinner_style`].
+    fn message_style(&self, theme: &UiTheme, override_style: Option<Style>) -> Style {
+        override_style
+            .filter(|_| self.kind == IndicatorKind::Working)
+            .unwrap_or_else(|| theme.muted_style())
+    }
+
+    /// The **un-margined** content of the active row — pi's `Loader.updateDisplay` text, which is
+    /// `${frame.length > 0 ? `${frame} ` : ""}${messageColorFn(message)}` (`loader.ts:93-96`)
+    /// *before* `Text.render` adds its `paddingX = 1` margins. [`Self::lines_at`] adds the margins;
+    /// [`Self::border_spans`] does not, because `renderInBorder` strips them again
+    /// (`status-indicator.ts:24-27`).
+    fn content_spans(
+        &self,
+        elapsed: Duration,
+        theme: &UiTheme,
+        cancel_hint: Option<&str>,
+        override_style: Option<Style>,
+    ) -> Vec<Span<'static>> {
+        let Some(Derived {
+            spinner,
+            custom,
+            msg,
+        }) = self.derive(elapsed, cancel_hint)
+        else {
+            return Vec::new();
+        };
+        let mut spans = Vec::with_capacity(2);
+        if !spinner.is_empty() {
+            spans.push(if custom {
+                Span::raw(format!("{spinner} "))
+            } else {
+                Span::styled(
+                    format!("{spinner} "),
+                    self.spinner_style(theme, override_style),
+                )
+            });
+        }
+        spans.push(Span::styled(msg, self.message_style(theme, override_style)));
+        spans
+    }
+
+    /// `StatusIndicator.renderInBorder(width)` — `status-indicator.ts:24-27`:
+    ///
+    /// ```ts
+    /// const line = super.render(width + 2)[1] ?? "";
+    /// return truncateToWidth(line.startsWith(" ") ? line.slice(1).trimEnd() : line.trimEnd(), width, "");
+    /// ```
+    ///
+    /// `super` is `Loader`, whose `render` is `["", ...Text.render(width)]` (`loader.ts:43-45`), so
+    /// index 1 is `Text.render(width + 2)[0]`: the **first wrapped row** of the content, wrapped at
+    /// `contentWidth = (width + 2) - 2 * paddingX = width` (`text.ts:67-73`, `paddingX = 1`), with
+    /// the two margins and the right-pad around it. Stripping the one leading space and trimming the
+    /// end removes exactly those, leaving the first wrapped row — which is then hard-cut to `width`
+    /// with an **empty** ellipsis, so no `…` ever appears in the rule.
+    ///
+    /// Wrapping first and truncating second is not interchangeable with truncating alone: a message
+    /// too long for the border is cut at pi's word boundary, not mid-word.
+    ///
+    /// Returns an empty vector when the indicator is idle, which is pi's `statusWidth === 0` arm
+    /// (`custom-editor.ts:43`).
+    pub fn border_spans(
+        &self,
+        elapsed: Duration,
+        theme: &UiTheme,
+        cancel_hint: Option<&str>,
+        width: usize,
+        override_style: Option<Style>,
+    ) -> Vec<Span<'static>> {
+        let content = self.content_spans(elapsed, theme, cancel_hint, override_style);
+        if content.is_empty() {
+            return Vec::new();
+        }
+        let wrapped = crate::transcript::layout::wrap_line(&Line::from(content), width);
+        let first = wrapped.into_iter().next().unwrap_or_default();
+        crate::text_width::truncate_spans_to_width(first.spans, width, "")
+    }
+
+    /// `StatusIndicator.renderSpinnerInBorder(width)` — `status-indicator.ts:29-31`:
+    /// `truncateToWidth(this.getRenderedIndicator(), width, "")`. `getRenderedIndicator` is the
+    /// coloured frame **alone** (`loader.ts:88-91`) — no trailing space, unlike the `${frame} ` the
+    /// full content carries.
+    pub fn border_spinner_spans(
+        &self,
+        elapsed: Duration,
+        theme: &UiTheme,
+        width: usize,
+        override_style: Option<Style>,
+    ) -> Vec<Span<'static>> {
+        let Some(Derived {
+            spinner, custom, ..
+        }) = self.derive(elapsed, None)
+        else {
+            return Vec::new();
+        };
+        if spinner.is_empty() {
+            return Vec::new();
+        }
+        let span = if custom {
+            Span::raw(spinner)
+        } else {
+            Span::styled(spinner, self.spinner_style(theme, override_style))
+        };
+        crate::text_width::truncate_spans_to_width(vec![span], width, "")
+    }
+
+    /// The spinner glyph, the extension-verbatim flag and the message for `elapsed` — the one
+    /// derivation the band form ([`Self::lines_at`]) and the border forms ([`Self::border_spans`])
+    /// share, so they cannot drift.
+    fn derive(&self, elapsed: Duration, cancel_hint: Option<&str>) -> Option<Derived> {
+        if !self.kind.is_active() {
+            return None;
+        }
+        // An extension's `setWorkingIndicator` frames apply to the WORKING band only: upstream
+        // passes `workingIndicatorOptions` to `new WorkingStatusIndicator` alone
+        // (`interactive-mode.ts:3116-3120`) and re-applies it only when the live band's kind is
+        // `"working"` (`:2112`). Retry / compaction / branch-summary keep the built-in spinner.
+        let custom = self
+            .working_indicator
+            .as_ref()
+            .filter(|_| self.kind == IndicatorKind::Working);
+        let spinner = custom.map_or_else(|| Self::spinner_at(elapsed), |i| i.frame_at(elapsed));
+        let mut msg = match (self.retry, &self.message) {
+            (Some(retry), _) => retry.message_at(elapsed),
+            (None, Some(m)) => m.clone(),
+            (None, None) => self.default_message().to_string(),
+        };
+        if let Some(hint) = cancel_hint
+            && self.kind != IndicatorKind::Working
+        {
+            msg.push_str(&format!(" ({hint} to cancel)"));
+        }
+        Some(Derived {
+            spinner: spinner.to_string(),
+            custom: custom.is_some(),
+            msg,
+        })
+    }
+
+    /// How long the current indicator has been running — the spinner's phase. Zero when nothing
+    /// started it, which keeps the render-time forms pure functions of this one value.
+    pub fn elapsed(&self) -> Duration {
+        self.started.map(|s| s.elapsed()).unwrap_or_default()
+    }
+
     /// The two band lines at the current wall-clock phase (the render-time form).
+    #[cfg(test)]
     pub fn lines(&self, theme: &UiTheme, cancel_hint: Option<&str>) -> Vec<Line<'static>> {
-        let elapsed = self.started.map(|s| s.elapsed()).unwrap_or_default();
-        self.lines_at(elapsed, theme, cancel_hint)
+        self.lines_at(self.elapsed(), theme, cancel_hint)
     }
 
     /// Render the band into `area` (the live region's 2-row status slot).
+    #[cfg(test)]
     pub fn render(
         &self,
         frame: &mut Frame,

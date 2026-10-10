@@ -18,13 +18,7 @@
 pub(crate) struct WordSeg {
     pub(crate) start: usize,
     pub(crate) len: usize,
-    /// `Intl.SegmentData.isWordLike`.
-    ///
-    /// [CYRUP-DELTA] ICU marks a segment word-like when it is made of letters, digits, kana or
-    /// ideographs; `unicode-segmentation` (UAX#29, the same algorithm without ICU's flag) exposes no
-    /// such bit, so it is recomputed as "contains an alphanumeric character". The two agree on every
-    /// segment UAX#29 can produce: a word-bound segment is either a run of letters/digits (with
-    /// MidLetter/MidNumLet joiners), a run of punctuation/symbols, or whitespace.
+    /// `Intl.SegmentData.isWordLike` — ICU's own flag, via [`icu_word_segments`].
     pub(crate) word_like: bool,
     /// `isAtomicSegment(segment)` — a whole `[paste #N …]` marker (`isPasteMarker`, `editor.ts:27`).
     /// Always `false` for a single-line field, which carries no markers.
@@ -188,15 +182,56 @@ pub(crate) fn is_punctuation(c: char) -> bool {
 /// The editor's marker-aware twin is `InputEditor::word_segments` (`editor/motion.rs`), which is
 /// char-indexed and merges `[paste #N …]` runs; a search field has neither concern.
 pub(crate) fn byte_word_segments(text: &str) -> Vec<WordSeg> {
-    use unicode_segmentation::UnicodeSegmentation;
-    text.split_word_bound_indices()
-        .map(|(start, seg)| WordSeg {
+    icu_word_segments(text)
+        .into_iter()
+        .map(|(start, len, word_like)| WordSeg {
             start,
-            len: seg.len(),
-            word_like: seg.chars().any(char::is_alphanumeric),
+            len,
+            word_like,
             atomic: false,
         })
         .collect()
+}
+
+/// pi's `wordSegmenter` (`word-navigation.ts:3`), i.e.
+/// `new Intl.Segmenter(undefined, { granularity: "word" })` (`utils.ts:5`): `(byte_start,
+/// byte_len, is_word_like)` per segment of `text`, in order and covering it exactly.
+///
+/// `Intl.Segmenter` *is* ICU, so this is `icu_segmenter`'s `WordSegmenter` — UAX#29's word-boundary
+/// rules **plus** the pass ICU runs for scripts that do not space their words, which UAX#29 alone
+/// has no data for. `new_auto` picks that pass the way a browser does: the dictionary for
+/// Chinese/Japanese, the LSTM for Thai/Burmese/Khmer/Lao. Hence `你好世界` is two segments here and
+/// four under a bare UAX#29 iterator (TUI-048).
+///
+/// `is_word_like` is ICU's own [`WordType::is_word_like`](icu_segmenter::options::WordType), which
+/// is `Intl.SegmentData.isWordLike` itself rather than a re-derivation of it.
+///
+/// `new_auto` returns a `WordSegmenterBorrowed<'static>` — a handle over baked data, so it neither
+/// allocates nor parses — but it does resolve five payloads out of the baked provider (the CJ
+/// dictionary and the four LSTMs), so it is built once in a `OnceLock` rather than per word motion.
+pub(crate) fn icu_word_segments(text: &str) -> Vec<(usize, usize, bool)> {
+    use icu_segmenter::WordSegmenter;
+    use icu_segmenter::options::WordBreakInvariantOptions;
+    use std::sync::OnceLock;
+
+    static SEGMENTER: OnceLock<icu_segmenter::WordSegmenterBorrowed<'static>> = OnceLock::new();
+    let segmenter =
+        SEGMENTER.get_or_init(|| WordSegmenter::new_auto(WordBreakInvariantOptions::default()));
+    let mut out: Vec<(usize, usize, bool)> = Vec::new();
+    // Each boundary classifies the segment BEFORE it, so the leading `0` opens the first segment
+    // without closing one.
+    let mut open: Option<usize> = None;
+    for (boundary, word_type) in segmenter.segment_str(text).iter_with_word_type() {
+        if let Some(start) = open {
+            out.push((
+                start,
+                boundary.saturating_sub(start),
+                word_type.is_word_like(),
+            ));
+        }
+        open = Some(boundary);
+    }
+    out
 }
 
 /// `isWhitespaceChar(segment)` = `/\s/.test(segment)` (`utils.ts:826-829`) over a byte-indexed

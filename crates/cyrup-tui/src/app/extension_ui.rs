@@ -36,6 +36,9 @@ impl<B: Backend> App<B> {
             opts,
             reply,
         } = req;
+        // The dialog's bare TITLE — pi's `title` parameter, before the confirm arm joins the
+        // message onto it. The OSC 7501 report names this and not the join (TUI-171).
+        let dialog_title = prompt.clone();
         let (selector_kind, base_title, mut inner): (SelectorKind, String, Box<dyn Selector>) =
             match kind {
                 UiKind::Confirm => {
@@ -133,8 +136,24 @@ impl<B: Backend> App<B> {
             inner.set_title(countdown_title(&base_title, deadline, opened_at));
         }
         self.open_boxed_selector(selector_kind, inner);
+        // TUI-171 — `setBlocked("extension-dialog", …)`. Note the MESSAGE: a confirm reports the
+        // bare title even though the selector shows `` `${title}\n${message}` ``
+        // (`interactive-mode.ts:2750-2760` vs `:2694`), and the kind is `permission` for a confirm
+        // and `question` for the other three. Carried on the pending reply rather than pushed here,
+        // because the clear is reconciled from that same field every frame — see
+        // [`App::sync_blocked_dialog_status`].
+        let blocked = crate::program_status_reporter::BlockedStatus {
+            kind: match kind {
+                UiKind::Confirm => crate::program_status::BlockedKind::Permission,
+                UiKind::Select | UiKind::Input | UiKind::Editor => {
+                    crate::program_status::BlockedKind::Question
+                }
+            },
+            message: dialog_title.clone(),
+        };
         self.state.pending_ui_reply = Some(PendingUiReply {
             kind,
+            blocked,
             reply,
             base_title,
             deadline,

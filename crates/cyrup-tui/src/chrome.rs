@@ -15,10 +15,11 @@
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 
-use crate::keymap::{Action, Keymap};
+use crate::keymap::{Action, EditorAction, EditorKeymap, Keymap};
 use crate::selector::border_rule;
 use crate::status_indicator::SPINNER_FRAMES;
 use crate::theme::UiTheme;
@@ -129,6 +130,137 @@ pub fn compact_onboarding(keymap: &Keymap, details: StartupDetails) -> String {
     format!("Press {expand} to show full startup help{resources}.")
 }
 
+/// The product wordmark that opens the startup header — pi's `piWordmark()`
+/// (`components/pi-logo.ts:37-39`), rebranded pi→cyrup.
+///
+/// CAPITALIZED deliberately, and not to be "fixed" to lowercase. `piWordmark` is coral `"P"` plus
+/// yellow `"i"` — the capitalized `"Pi"` (`pi-logo.ts:38`), NOT the lowercase `APP_NAME` (`"pi"`)
+/// that the resume hint and the terminal title use. So the literal port is `"Cyrup"`, matching
+/// [`STARTUP_ONBOARDING`]'s prose rather than `resume_hint::APP_NAME` (`resume_hint.rs:46`, which is
+/// lowercase `"cyrup"`).
+pub const APP_WORDMARK: &str = "Cyrup";
+
+/// The startup header's FIRST logical line — pi's `withLogo` on its text-wordmark branch:
+/// `` `${piWordmark()} ${theme.fg("dim", `v${this.version}`)}\n${hints}` ``
+/// (`interactive-mode.ts:1016`).
+///
+/// The structure is reproduced exactly: the mark, then a PLAIN (unstyled) space, then a dim
+/// `v{version}` with the `v` INSIDE the dim span. Upstream puts that space OUTSIDE the dim span on
+/// BOTH `withLogo` branches (`:1016` and `:1018`), so it carries no style here either.
+///
+/// The version is this crate's `CARGO_PKG_VERSION`, which is `version.workspace = true`
+/// (`crates/cyrup-tui/Cargo.toml:4`) and therefore the same string the `cyrup` binary reports —
+/// upstream's `this.version` is likewise the app package's `VERSION` (field `:477`, assigned
+/// `:621`).
+///
+/// [CYRUP-DELTA] **Only the wordmark branch is ported, and it is ported unconditionally.** Upstream
+/// has TWO `withLogo` branches, chosen by `showLogo = supportsPiLogo()` (`:1014`;
+/// `pi-logo.ts:32-33` = `!isAppleTerminalSession()`). The DEFAULT branch (`:1018-1019`) draws
+/// `piLogoLines()` (`pi-logo.ts:19-25`) — a 4-column × 2-row half-block GRAPHIC in pi's FIXED brand
+/// RGB (coral `228,138,122`, blue `79,142,179`, yellow `234,182,93`, `pi-logo.ts:4-6`) — and the
+/// wordmark is merely its Apple-Terminal fallback. cyrup takes the fallback for every terminal
+/// because the graphic is pi's own brand mark and cyrup has no mark of its own to substitute. Both
+/// branches emit the SAME two logical lines, so the block's row arithmetic
+/// ([`COMPACT_HINT_ROWS`]) is unaffected by which one is taken.
+///
+/// [CYRUP-DELTA] The colours are the theme's `accent` plus bold, not pi's fixed brand RGB — for the
+/// same reason, and because a hard-coded triplet would fight every theme. This is an upstream rule
+/// rather than an invention: pi v0.85.1's `logo` was
+/// `theme.bold(theme.fg("accent", APP_NAME)) + theme.fg("dim", " v{version}")`, which is also the
+/// form `TUI-018`'s **Fix** asks for.
+pub fn logo_line(theme: &UiTheme) -> Line<'static> {
+    let mut spans = vec![Span::styled(
+        APP_WORDMARK,
+        theme.accent_style().add_modifier(Modifier::BOLD),
+    )];
+    // [CYRUP-DELTA] — pi always renders its version beside the wordmark, because pi HAS a version.
+    // cyrup's workspace version is still the cargo placeholder `0.0.0` (root `Cargo.toml`), and
+    // `Cyrup v0.0.0` as the first thing a user sees reads as a broken build rather than as an
+    // unreleased one. The version span is therefore omitted while the version is that placeholder,
+    // and appears by itself the moment the workspace carries a real one — no further change needed.
+    //
+    // This is the same `0.0.0` that `TUI-011` is held OPEN on (its "What's New" notice has no
+    // version to compare against), so the two rows now agree about it instead of one shipping what
+    // the other calls a blocker.
+    if !is_placeholder_version(APP_VERSION) {
+        // Unstyled, per `:1016` — the space sits between the two spans, not inside the dim one.
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(format!("v{APP_VERSION}"), theme.dim_style()));
+    }
+    Line::from(spans)
+}
+
+/// The crate version the header would show, as a value rather than a macro, so a test can assert
+/// BOTH branches of [`logo_line`] instead of deriving its expectation from the same `env!` the code
+/// reads — which is how the version half of an assertion becomes unfailable.
+pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// `true` for cargo's unset-version placeholder. Kept a named predicate so the reason is greppable
+/// from both the header and the ledger row that cites it.
+#[must_use]
+pub fn is_placeholder_version(version: &str) -> bool {
+    version == "0.0.0"
+}
+
+/// pi's `expandedInstructions` — the nineteen hints the header carries when it is EXPANDED
+/// (`interactive-mode.ts:1024-1048`), in upstream order, one per line (`:1048` `join("\n")`).
+///
+/// Four details of the upstream list are load-bearing and are reproduced rather than smoothed over:
+///
+/// - SIX entries are `rawKeyHint` — a literal affordance, not a binding: `` `{clear} twice` ``
+///   (`:1028`), the `cycleForward/cycleBackward` pair (`:1033-1036`), `/` (`:1041`), `!` (`:1042`),
+///   `!!` (`:1043`) and `drop files` (`:1047`). Both `keyHint` and `rawKeyHint` emit
+///   `fg("dim", key) + fg("muted", " " + description)` (`keybinding-hints.ts:42-48`), which is
+///   exactly [`key_hint_spans`], so the two kinds differ only in how the key string is sourced.
+/// - `keyHint("tui.editor.deleteToLineEnd", "to delete to end")` (`:1031`) resolves through the
+///   EDITOR keymap, not the app keymap — hence the second map parameter.
+/// - `clear` appears TWICE, as `app.clear` "to clear" (`:1027`) and as `{clear} twice` "to exit"
+///   (`:1028`); `app.exit` is separately "to exit (empty)" (`:1029`).
+/// - An unbound action yields an EMPTY key string, because upstream's `formatKeys` returns `""`
+///   for no keys (`keybinding-hints.ts:29-31`) — so these use `unwrap_or_default` rather than
+///   inventing a fallback binding.
+pub fn expanded_hints(
+    theme: &UiTheme,
+    keymap: &Keymap,
+    editor_keymap: &EditorKeymap,
+) -> Vec<Line<'static>> {
+    // `keyText(kb)` — ALL bound keys joined with `/` (`keybinding-hints.ts:29-36`), `""` if none.
+    let k = |action: Action| keymap.keys_label(action).unwrap_or_default();
+    let clear = k(Action::Clear);
+    let fwd = k(Action::ModelCycleForward);
+    let back = k(Action::ModelCycleBackward);
+    let del_to_end = editor_keymap
+        .keys_label(EditorAction::DeleteToLineEnd)
+        .unwrap_or_default();
+    [
+        (k(Action::Interrupt), "to interrupt"),
+        (clear.clone(), "to clear"),
+        (format!("{clear} twice"), "to exit"),
+        (k(Action::Quit), "to exit (empty)"),
+        (k(Action::Suspend), "to suspend"),
+        (del_to_end, "to delete to end"),
+        (k(Action::ThinkingCycle), "to cycle thinking level"),
+        (format!("{fwd}/{back}"), "to cycle models"),
+        (k(Action::ModelSelect), "to select model"),
+        (k(Action::ToolsExpand), "to expand tools"),
+        (k(Action::ThinkingToggle), "to expand thinking"),
+        (k(Action::ExternalEditor), "for external editor"),
+        ("/".to_string(), "for commands"),
+        ("!".to_string(), "to run bash"),
+        ("!!".to_string(), "to run bash (no context)"),
+        (k(Action::FollowUp), "to queue follow-up"),
+        (k(Action::Dequeue), "to edit all queued messages"),
+        (
+            k(Action::ClipboardPasteImage),
+            "to paste files on macOS, images, or text",
+        ),
+        ("drop files".to_string(), "to attach"),
+    ]
+    .into_iter()
+    .map(|(key, desc)| key_hint_line(&key, desc, theme))
+    .collect()
+}
+
 /// The block's closing sentence — `onboarding`, `interactive-mode.ts:947-950`:
 /// `theme.fg("dim", \`Pi can explain its own features and look up its docs. Ask it how to use or
 /// extend Pi.\`)`.
@@ -146,17 +278,24 @@ pub const STARTUP_ONBOARDING: &str =
 /// EVERY wrapped row and wraps at `contentWidth = max(1, width - paddingX * 2)` (`text.ts:64-76`).
 const HINT_PADDING_X: u16 = 1;
 
-/// Rows the block occupies when nothing wraps: a framing blank, the hint bar, the compact
-/// onboarding line, the body's own blank, the closing onboarding line, and a second framing blank.
+/// Rows the COLLAPSED block occupies when nothing wraps: a framing blank, the logo/version line,
+/// the hint bar, the compact onboarding line, the body's own blank, the closing onboarding line,
+/// and a second framing blank.
 ///
-/// The block is upstream's startup `ExpandableText` — body
-/// `${logo}\n${compactInstructions}\n${compactOnboarding}\n\n${onboarding}`
-/// (`interactive-mode.ts:936-957`) — framed by a `Spacer(1)` on each side (`:960-962`). cyrup does
-/// not draw the `logo` part, so 1 + 4 + 1 = **6**.
+/// The block is upstream's startup `BuiltInHeader`, whose collapsed body is
+/// `${withLogo(compactInstructions())}\n${compactOnboarding()}\n\n${onboarding()}`
+/// (`interactive-mode.ts:1065`), framed by a `Spacer(1)` on each side (`:1075-1077`). `withLogo`
+/// (`:1015-1020`) prepends the logo line and puts the hints on the line BELOW it — on BOTH of its
+/// branches — so the body is 5 logical lines and 1 + 5 + 1 = **7**.
 ///
-/// This is the UNWRAPPED count. On a narrow terminal the text rows wrap and the block grows, which
-/// is why the layout must ask [`compact_hint_height`] rather than use this constant directly.
-pub const COMPACT_HINT_ROWS: u16 = 6;
+/// This replaces an earlier `6`, which encoded cyrup not drawing the `logo` part at all; it now
+/// draws it ([`logo_line`]).
+///
+/// This is the UNWRAPPED count, and it is the COLLAPSED one: the expanded body swaps the one-line
+/// hint bar for [`expanded_hints`]' nineteen lines and drops `compactOnboarding`, so it is taller.
+/// On a narrow terminal the text rows wrap and the block grows either way, which is why the layout
+/// must ask [`compact_hint_height`] rather than use this constant directly.
+pub const COMPACT_HINT_ROWS: u16 = 7;
 
 /// One row group of the startup hint block: its logical lines, its WRAPPED height at the block's
 /// content width, and the order in which it is given up when the area is too short.
@@ -174,18 +313,27 @@ fn hint_content_width(width: u16) -> u16 {
         .max(1)
 }
 
-/// The six entries, each already measured against `width`'s wrapping.
+/// The block's row groups, each already measured against `width`'s wrapping.
 ///
-/// The drop ranks degrade the block from its EDGES INWARD, so the hint bar — the only row carrying
-/// information the user cannot get anywhere else — is the last thing standing: trailing blank,
-/// leading blank, closing onboarding, the body's inner blank, the compact onboarding line, and only
-/// then the bar itself. A previous revision put the framing blank FIRST in a fixed-height,
-/// top-aligned `Paragraph`, so a one-row budget drew the blank and the bar vanished entirely.
+/// `expanded` selects which of pi's two `BuiltInHeader` bodies is built (`:1065` collapsed,
+/// `:1066` expanded). Both open with [`logo_line`] via `withLogo` (`:1015-1020`) and both END with
+/// `onboarding()` — upstream keeps that line in BOTH bodies — but the expanded body swaps the
+/// one-line hint bar for [`expanded_hints`]' nineteen lines and carries NO `compactOnboarding`,
+/// whose whole job is to advertise the expansion that has already happened.
+///
+/// The drop ranks degrade the block from its EDGES INWARD, so the hints — the only rows carrying
+/// information the user cannot get anywhere else — are the last thing standing: trailing blank,
+/// leading blank, closing onboarding, the body's inner blank, the compact onboarding line, the
+/// logo/version line, and only then the hints themselves. A previous revision put the framing blank
+/// FIRST in a fixed-height, top-aligned `Paragraph`, so a one-row budget drew the blank and the bar
+/// vanished entirely.
 fn compact_hint_entries(
     theme: &UiTheme,
     keymap: &Keymap,
+    editor_keymap: &EditorKeymap,
     width: u16,
     details: StartupDetails,
+    expanded: bool,
 ) -> Vec<HintEntry> {
     let content = hint_content_width(width);
     let blank = |rank: u8| HintEntry {
@@ -209,25 +357,45 @@ fn compact_hint_entries(
         bar.extend(key_hint_spans(&key, &desc, theme));
     }
 
+    // The closing `onboarding()` line, kept in BOTH bodies (`:1065` and `:1066`).
+    let closing = |rank: u8| {
+        text(
+            vec![Line::styled(
+                STARTUP_ONBOARDING.to_string(),
+                theme.dim_style(),
+            )],
+            rank,
+        )
+    };
+
+    if expanded {
+        // `${withLogo(expandedInstructions())}\n\n${onboarding()}` (`:1066`): the logo line, the
+        // nineteen hints, the body's `\n\n` blank, the closing line — and NO `compactOnboarding`.
+        return vec![
+            blank(5),
+            text(vec![logo_line(theme)], 1),
+            text(expanded_hints(theme, keymap, editor_keymap), 0),
+            blank(3),
+            closing(4),
+            blank(6),
+        ];
+    }
+
+    // `${withLogo(compactInstructions())}\n${compactOnboarding()}\n\n${onboarding()}` (`:1065`).
     vec![
-        blank(4),
+        blank(5),
+        text(vec![logo_line(theme)], 1),
         text(vec![Line::from(bar)], 0),
         text(
             vec![Line::styled(
                 compact_onboarding(keymap, details),
                 theme.dim_style(),
             )],
-            1,
+            2,
         ),
-        blank(2),
-        text(
-            vec![Line::styled(
-                STARTUP_ONBOARDING.to_string(),
-                theme.dim_style(),
-            )],
-            3,
-        ),
-        blank(5),
+        blank(3),
+        closing(4),
+        blank(6),
     ]
 }
 
@@ -239,10 +407,12 @@ fn compact_hint_entries(
 pub fn compact_hint_height(
     theme: &UiTheme,
     keymap: &Keymap,
+    editor_keymap: &EditorKeymap,
     width: u16,
     details: StartupDetails,
+    expanded: bool,
 ) -> u16 {
-    compact_hint_entries(theme, keymap, width, details)
+    compact_hint_entries(theme, keymap, editor_keymap, width, details, expanded)
         .iter()
         .map(|e| e.rows)
         .fold(0u16, u16::saturating_add)
@@ -253,20 +423,22 @@ pub fn compact_hint_height(
 /// `interactive-mode.ts:1061-1065` @v1.0.0), for the renderer that scrolls it with the
 /// conversation.
 ///
-/// The same six row groups [`render_compact_hints`] paints, each wrapped at the block's content
+/// The same row groups [`render_compact_hints`] paints, each wrapped at the block's content
 /// width and inset by its `paddingX`, one [`Line`] per display row at `width`. Nothing is dropped
 /// from the edges inward here: that degradation exists to keep the bar visible in a fixed-height
 /// slot, and a scrolled document has no slot to overflow.
 pub fn compact_hint_lines(
     theme: &UiTheme,
     keymap: &Keymap,
+    editor_keymap: &EditorKeymap,
     width: u16,
     details: StartupDetails,
+    expanded: bool,
 ) -> Vec<Line<'static>> {
     let content = usize::from(hint_content_width(width));
     let pad = width >= 3;
     let base = theme.base_style();
-    compact_hint_entries(theme, keymap, width, details)
+    compact_hint_entries(theme, keymap, editor_keymap, width, details, expanded)
         .into_iter()
         .flat_map(|entry| entry.lines)
         .flat_map(|line| crate::transcript::wrap_line(&line, content))
@@ -292,12 +464,15 @@ pub fn render_compact_hints(
     area: Rect,
     theme: &UiTheme,
     keymap: &Keymap,
+    editor_keymap: &EditorKeymap,
     details: StartupDetails,
+    expanded: bool,
 ) {
     if area.width == 0 || area.height == 0 {
         return;
     }
-    let mut entries = compact_hint_entries(theme, keymap, area.width, details);
+    let mut entries =
+        compact_hint_entries(theme, keymap, editor_keymap, area.width, details, expanded);
     let total = |es: &[HintEntry]| es.iter().map(|e| e.rows).fold(0u16, u16::saturating_add);
     while total(&entries) > area.height {
         // Give up the outermost droppable group; `drop_rank == 0` (the bar) is never a candidate.

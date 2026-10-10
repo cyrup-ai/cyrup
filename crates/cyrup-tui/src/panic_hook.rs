@@ -85,6 +85,14 @@ fn restore_into(out: &mut impl Write) {
     if crate::terminal_progress::progress_is_armed() {
         crate::terminal_progress::write_terminal_progress(false);
     }
+    // TUI-171 — the OSC 7501 status is the SECOND piece of state here that outlives the process,
+    // and the case that most needs this hook: under the release profile's `panic = "abort"` nothing
+    // else runs at all, and a terminal left showing `working` for a dead cyrup is worse than one
+    // that never showed anything. Pi's `stop()` writes the clear in the same place, right after the
+    // OSC 9;4 clear (`tui/src/terminal.ts:464-476`). Gated on
+    // [`crate::program_status::program_status_is_armed`] so a session whose terminal never
+    // confirmed support, or which never reported a status, emits nothing.
+    crate::program_status::stop_program_status();
     let _ = out.execute(PopKeyboardEnhancementFlags);
     let _ = out.execute(DisableBracketedPaste);
     let _ = disable_raw_mode();

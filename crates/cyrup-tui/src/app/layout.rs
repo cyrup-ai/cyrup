@@ -106,7 +106,6 @@ pub(crate) fn region_constraints(state: &mut AppState, width: u16, avail: u16) -
         None if state.status.has_extension_statuses() => 3,
         None => 2,
     };
-    let want_status = state.indicator.is_active() || state.reserve_status_rows;
     let want_images: u16 =
         if state.selector.is_some() || state.loader.is_some() || state.pending_images.is_empty() {
             0
@@ -160,8 +159,21 @@ pub(crate) fn region_constraints(state: &mut AppState, width: u16, avail: u16) -
     remaining = remaining.saturating_sub(slot_extra);
     let popup = want_popup.min(remaining);
     remaining = remaining.saturating_sub(popup);
-    let band = if want_status { 2u16.min(remaining) } else { 0 };
-    remaining = remaining.saturating_sub(band);
+    // TUI-103 — the status band is permanently zero rows. Pi embeds the working / compaction /
+    // branch-summary / retry spinner in the DEFAULT EDITOR'S TOP BORDER
+    // (`custom-editor.ts:36-79`, reached because the chat editor is built `embedWorkingStatus:
+    // true`, `interactive-mode.ts:647-652`), and `showStatusIndicator` adds to `statusContainer`
+    // only when the editor cannot embed (`:2312-2323` → `:222-229`). cyrup has exactly one editor
+    // and `setEditorComponent` is unported (07-cyrup-tui.md:846), so the non-embeddable branch
+    // cannot arise and `statusContainer` is always empty — pi spends ZERO rows on status, working
+    // or idle.
+    //
+    // That also retires the idle reservation: `clearStatusIndicator` adds the 2-blank-row
+    // `IdleStatus` only when `!clearedIndicatorWasEmbedded` (`interactive-mode.ts:2336-2342`), so
+    // `clearOnShrink` / `CYRUP_CLEAR_ON_SHRINK` ([`AppState::reserve_status_rows`]) no longer has a
+    // band to reserve. The flag stays — `/settings` still carries it and it is still pi's setting —
+    // it simply has nothing to do here now that the editor never reflows around a vanishing band.
+    let band = 0u16;
     let images = want_images.min(remaining);
     remaining = remaining.saturating_sub(images);
     // TUI-016 — Pi's `pendingMessagesContainer`, docked immediately after `chatContainer` and
@@ -197,8 +209,10 @@ pub(crate) fn region_constraints(state: &mut AppState, width: u16, avail: u16) -
             crate::chrome::compact_hint_height(
                 &state.theme,
                 &state.keymap,
+                state.editor.keymap_ref(),
                 width,
                 state.startup_header.details(),
+                state.verbose_startup || state.transcript.tool_expanded(),
             )
         } else {
             0

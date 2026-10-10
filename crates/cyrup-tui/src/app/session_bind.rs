@@ -38,6 +38,13 @@ impl<B: Backend> App<B> {
         self.state.selector = None;
         self.state.overlays.clear();
         self.state.status.set_streaming(false);
+        // TUI-171 — pi's `rebindCurrentSession` calls `programStatusReporter.reset()`
+        // (`interactive-mode.ts:2095`): the OUTGOING session's run outcome must not be reported as
+        // the incoming one's. `reset` reports immediately, so the terminal goes back to `idle`
+        // rather than keeping the previous session's `done`/`error`. Open dialogs are deliberately
+        // not cleared, as upstream (`program-status-reporter.ts:87-93`).
+        let session_name = self.state.status.session_name.clone();
+        self.state.program_status.reset(session_name.as_deref());
         // The queue belongs to the OUTGOING session: its steering/follow-up lists were emitted by a
         // `queue_update` from a session that is gone, and its compaction queue would be delivered
         // into the new one. Clearing them clears the rendered region, which is the whole point —

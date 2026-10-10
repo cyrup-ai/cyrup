@@ -175,12 +175,18 @@ async fn auto_on_the_faux_model_starts_with_subagent_and_no_loader() {
     assert!(has(&first, "subagent") && !has(&first, LOADER), "{first:?}");
 }
 
-/// SUBA-153's `[CYRUP-DELTA]`, pinned on a real session: an `anthropic-messages` model whose
-/// compat flags satisfy upstream's predicate still starts eager, because no cyrup adapter emits
-/// native mid-conversation tool additions yet (`cyrup_provider::api::emits_native_tool_additions`,
-/// PROV-133). Upstream would offer the loader here; when PROV-133 lands this test flips.
+/// The flip SUBA-153's `[CYRUP-DELTA]` promised, now that PROV-133 has landed: an
+/// `anthropic-messages` model whose compat flags satisfy upstream's predicate goes LAZY, because
+/// the adapter now does emit native mid-conversation tool additions
+/// (`cyrup_provider::api::emits_native_tool_additions`). So the first request offers the loader and
+/// withholds `subagent`, which is upstream's own `toolActivation: "auto"` behaviour
+/// (`src/extension/tool-activation.ts`) rather than cyrup's former divergence from it.
+///
+/// Until PROV-133 this test asserted the opposite — `subagent` present, loader absent — and its
+/// doc said "when PROV-133 lands this test flips". It did not flip with that change, so the
+/// integration suite went red on `main`; this is that flip.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn auto_on_a_capable_anthropic_model_stays_eager_until_the_adapter_emits_tool_additions() {
+async fn auto_on_a_capable_anthropic_model_goes_lazy_now_the_adapter_emits_tool_additions() {
     let mut model = cyrup_test_support::response::faux_model();
     model.api = cyrup_provider::known_api::ANTHROPIC_MESSAGES.into();
     model.compat = Some(cyrup_provider::api::compat::ModelCompat {
@@ -199,7 +205,18 @@ async fn auto_on_a_capable_anthropic_model_stays_eager_until_the_adapter_emits_t
     .await;
     run.harness.run("hi").await.expect("run");
     let first = request_tools(&run.harness, 0);
-    assert!(has(&first, "subagent") && !has(&first, LOADER), "{first:?}");
+    assert!(
+        has(&first, LOADER),
+        "a capable model offers the loader: {first:?}"
+    );
+    assert!(
+        !has(&first, "subagent"),
+        "and withholds subagent until it is loaded: {first:?}"
+    );
+    assert!(
+        has(&first, "bg_wait"),
+        "support tools stay active: {first:?}"
+    );
 }
 
 /// `eager`: no loader is registered at all (upstream `:86-87`, test `:268-277`).

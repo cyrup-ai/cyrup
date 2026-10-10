@@ -23,6 +23,17 @@ impl<B: Backend> App<B> {
         rendered: crate::transcript::Rendered,
         entry_rendered: crate::transcript::Rendered,
     ) {
+        // TUI-171 — the OSC 7501 reporter sees the event FIRST, which is pi's own placement: the
+        // `programStatusReporter.handleEvent(event)` call is the top of `handleEvent`, right after
+        // `footer.invalidate()` (`interactive-mode.ts:3412`). It owns its own six-arm match
+        // (`agent_start`, `message_end`, `compaction_start`, `compaction_end`, `agent_settled`,
+        // `session_info_changed`) and ignores everything else, so it is one call here rather than a
+        // statement scattered through six arms of the fold — and it cannot be reordered into them
+        // without changing which state an arm's own mutations are read against.
+        let session_name = self.state.status.session_name.clone();
+        self.state
+            .program_status
+            .handle_event(&ev, session_name.as_deref());
         // The arms that need the WHOLE event again (the serde projections in `event_extract.rs`)
         // bind nothing, so `ev` is still fully initialised inside them and `&ev` is legal there;
         // the arms that consume a payload move exactly the fields they consume. Fold ORDER is

@@ -120,6 +120,13 @@ impl<B: Backend> App<B> {
         // still armed. Both are idempotent; this one additionally drops the session's own armed bit
         // so the keepalive cannot re-arm on the way out.
         self.clear_terminal_progress_on_exit();
+        // TUI-171 — and the OSC 7501 status, for the same reason and in the same two-level shape:
+        // pi's `ProcessTerminal.stop()` writes `state=clear` right after the OSC 9;4 clear
+        // (`tui/src/terminal.ts:464-476`) and then drops `programStatusSupported`, so nothing is
+        // written again until a new `start()` re-queries. A status left set after cyrup quits is
+        // worse than never setting one: the user's terminal keeps claiming a dead process is
+        // working.
+        self.clear_program_status_on_exit();
         let _ = crate::drain::drain_stdin_before_exit();
         self.restore()
     }
@@ -130,6 +137,76 @@ impl<B: Backend> App<B> {
         if let Some(active) = self.state.terminal_progress.take_pending() {
             crate::write_terminal_progress(active);
         }
+    }
+
+    /// Reconcile the two `blocked` OSC 7501 sources against the UI state (TUI-171).
+    ///
+    /// **[CYRUP-DELTA] — mechanism, not behaviour.** Pi hand-places five `setBlocked` calls, paired
+    /// open/close: `extension-dialog` at `interactive-mode.ts:2729`/`:2742` (selector),
+    /// `:2810`/`:2823` (input), `:2854`/`:2866` (editor), and `login` at `:6321`/`:6334` (a
+    /// `finally`). cyrup derives both from the state that defines the window instead —
+    /// [`AppState::pending_ui_reply`] is `Some` for exactly as long as an extension dialog owns the
+    /// editor slot, and `login_cancel` is `Some` for exactly the span pi's `try`/`finally` covers.
+    ///
+    /// The reason is the failure mode, not taste: a MISSED clear strands a `blocked` status for the
+    /// rest of the session, telling the user's terminal that cyrup is waiting on a dialog that
+    /// closed minutes ago — and cyrup's extension dialog resolves at FOUR separate
+    /// `pending_ui_reply.take()` sites (`app/selectors.rs:634`, `:869`, `:877`,
+    /// `app/extension_ui.rs:500`) plus the timeout and `reset_extension_ui`, where pi has one
+    /// `hideExtensionSelector`. Reconciling once per frame cannot strand. It is free: the reporter
+    /// dedups on the whole status (`program-status-reporter.ts:97-99`), so an unchanged frame
+    /// writes nothing.
+    ///
+    /// Reported value is pi's, source for source: the dialog's bare title with
+    /// `permission`/`question` (`PendingUiReply::blocked`), and `` `Log in to {provider}` `` with
+    /// `auth`. The dialog is reconciled LAST so that, when both are open, it is the most recently
+    /// opened one — pi's `[...blocked.values()].at(-1)` precedence (`:104`) — which matches the
+    /// order they can actually open in: a login dialog owns the slot, so an extension dialog cannot
+    /// open under it, while `/login` while an extension dialog is up is refused by
+    /// `open_extension_dialog`'s own guard.
+    pub fn sync_blocked_dialog_status(&mut self) {
+        let name = self.state.status.session_name.clone();
+        let login = self.state.login_cancel.is_some().then(|| {
+            crate::program_status_reporter::BlockedStatus {
+                kind: crate::program_status::BlockedKind::Auth,
+                message: format!(
+                    "Log in to {}",
+                    self.state
+                        .login_provider_name
+                        .as_deref()
+                        .unwrap_or_default()
+                ),
+            }
+        });
+        self.state
+            .program_status
+            .set_blocked("login", login, name.as_deref());
+        let dialog = self
+            .state
+            .pending_ui_reply
+            .as_ref()
+            .map(|p| p.blocked.clone());
+        self.state
+            .program_status
+            .set_blocked("extension-dialog", dialog, name.as_deref());
+    }
+
+    /// Write the parked OSC 7501 report, if any — the deferred half of pi's
+    /// `terminal.setProgramStatus` (`tui/src/terminal.ts:576-579`). Same split, and for the same
+    /// reason, as [`Self::flush_terminal_progress`]: the fold records a transition, the run loop
+    /// turns it into terminal output one step later.
+    pub fn flush_program_status(&mut self) {
+        if let Some(status) = self.state.program_status.take_pending() {
+            crate::program_status::write_program_status(&status);
+        }
+    }
+
+    /// The exit clear — pi's `ProcessTerminal.stop()` program-status leg
+    /// (`tui/src/terminal.ts:464-476`). Answers from the PROCESS-GLOBAL armed bit, so a status this
+    /// process set is always taken back down; forgets the remembered status too, because this is a
+    /// real exit and not the suspend half (see [`App::suspend_program_status`]).
+    pub fn clear_program_status_on_exit(&mut self) {
+        crate::program_status::clear_program_status_on_exit();
     }
 
     /// Re-send the active sequence — Pi's `setInterval(..., TERMINAL_PROGRESS_KEEPALIVE_MS)`

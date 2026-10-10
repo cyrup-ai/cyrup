@@ -334,14 +334,34 @@ pub fn set_current(protocol: KeyboardProtocol) {
 /// reader thread exists; see the module docs. Returns the decision and stores it in [`current`].
 /// Costs at most [`NEGOTIATION_TIMEOUT`] and consumes no byte the terminal did not send in reply.
 pub fn negotiate() -> KeyboardProtocol {
-    let decision = negotiate_with(
+    let outcome = negotiate_with(
         crate::dead_terminal::terminal_stdout(),
         &mut crate::terminal_query::StdinSource,
         crate::terminal_query::stdin_is_queryable,
         &crate::terminal_query::GlobalHub,
+        crate::program_status::resolve_program_status_override(
+            std::env::var(crate::program_status::PROGRAM_STATUS_ENV)
+                .ok()
+                .as_deref(),
+        ),
     );
-    set_current(decision);
-    decision
+    set_current(outcome.protocol);
+    // TUI-171 — recording support is what arms the OSC 7501 writes, and on a confirmation it
+    // re-sends whatever status is remembered, which is pi's `writeProgramStatus()` immediately
+    // after the query write (`terminal.ts:300`) and in the reply handler (`:239-245`).
+    crate::program_status::set_program_status_supported(outcome.program_status_supported);
+    outcome.protocol
+}
+
+/// Everything one negotiation window settles. Both answers come out of the SAME exchange because
+/// pi asks both questions in one `process.stdout.write` (`terminal.ts:298`), and the DA1 sentinel
+/// that closes the window is shared.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Negotiation {
+    /// The keyboard protocol in effect.
+    pub(crate) protocol: KeyboardProtocol,
+    /// Whether the terminal echoed the OSC 7501 query, i.e. supports the Program Status Protocol.
+    pub(crate) program_status_supported: bool,
 }
 
 /// [`negotiate`] over any terminal and any [`Hub`](crate::terminal_query::Hub), without recording
@@ -352,21 +372,49 @@ pub fn negotiate() -> KeyboardProtocol {
 /// `terminal.ts:262`). The reply that settles it is the first DA1 the terminal sends; a LATER one
 /// belongs to whoever queued behind — the colour query's sentinel — and is not this negotiation's
 /// to swallow (`terminal.ts:271-273`: with none owed the DA1 is forwarded, not consumed).
+///
+/// **TUI-171 — the OSC 7501 query rides in the SAME request.** Pi writes
+/// `${KITTY_KEYBOARD_PROTOCOL_QUERY}${programStatusQuery}${DEVICE_ATTRIBUTES_QUERY}` in ONE
+/// `process.stdout.write` (`terminal.ts:292-298`), so the program-status query sits between the
+/// kitty query and the DA1 sentinel; `exchange_with` appends that sentinel itself, so the request
+/// here is the first two. `override_` is pi's `PI_PROGRAM_STATUS`: `1` or `0` skips the query
+/// entirely and forces the answer.
+///
+/// Support counts only when the echo arrives before DA1. In cyrup that needs no counter: the
+/// exchange breaks its read loop ON its own sentinel, so anything in the returned string arrived
+/// strictly before it — see [`crate::program_status::contains_program_status_reply`].
 pub(crate) fn negotiate_with(
     out: impl std::io::Write,
     source: &mut dyn crate::terminal_query::ReplySource,
     queryable: impl FnOnce() -> bool,
     hub: &impl crate::terminal_query::HubAccess,
-) -> KeyboardProtocol {
+    override_: crate::program_status::ProgramStatusOverride,
+) -> Negotiation {
+    use crate::program_status::ProgramStatusOverride as O;
+    let request = match override_ {
+        O::Query => format!(
+            "{KITTY_FLAGS_QUERY}{}",
+            crate::program_status::PROGRAM_STATUS_QUERY
+        ),
+        O::ForceOn | O::ForceOff => KITTY_FLAGS_QUERY.to_string(),
+    };
     let reply = crate::terminal_query::exchange_with(
-        out,
-        KITTY_FLAGS_QUERY,
+        &mut { out },
+        &request,
         source,
         NEGOTIATION_TIMEOUT,
         queryable,
         hub,
     );
-    decide(reply.as_deref().unwrap_or_default())
+    let forwarded = reply.as_deref().unwrap_or_default();
+    Negotiation {
+        protocol: decide(forwarded),
+        program_status_supported: match override_ {
+            O::ForceOn => true,
+            O::ForceOff => false,
+            O::Query => crate::program_status::contains_program_status_reply(forwarded),
+        },
+    }
 }
 
 #[cfg(test)]
@@ -650,6 +698,111 @@ mod tests {
 
     const DA1: &str = "\x1b[?62;1;2;6;9;15;22c";
 
+    // ----------------------------------------- TUI-171: the OSC 7501 program-status query ----
+
+    /// **TUI-171's own Verify line**, and the test that pins the negotiation seam.
+    ///
+    /// Pi's rule is "support counts only if the echo arrives before the DA1 sentinel"
+    /// (`terminal.ts:239-245` sets it only while `programStatusQueryPending`, and `:305-313` closes
+    /// that window on the last owed DA1). In cyrup that needs no counter, because
+    /// [`crate::terminal_query::exchange_with`] breaks its read loop ON its own sentinel — so
+    /// anything in the string it returns arrived strictly before DA1, and a late reply never
+    /// reaches the decision at all (once the reader thread exists, `crate::input::decode` frames
+    /// the OSC and swallows it as `Decoded::Reply`). This drives all three cases over a scripted
+    /// terminal.
+    #[test]
+    fn a_reply_before_da1_enables_reports_and_da1_alone_does_not() {
+        const ECHO: &str = "\x1b]7501;?\x1b\\";
+
+        // (a) echo, then DA1 ⇒ supported.
+        let hub = Arc::new(Mutex::new(Hub::default()));
+        let outcome = negotiate_with(
+            std::io::sink(),
+            &mut Terminal::new(&["\x1b[?1u", ECHO, DA1]),
+            || true,
+            &*hub,
+            crate::program_status::ProgramStatusOverride::Query,
+        );
+        assert!(
+            outcome.program_status_supported,
+            "the echo arrived inside the window"
+        );
+        assert_eq!(outcome.protocol, KeyboardProtocol::Kitty);
+
+        // (b) DA1 alone ⇒ not supported, and an echo fed AFTERWARDS changes nothing, because the
+        // exchange already returned on the sentinel.
+        let hub = Arc::new(Mutex::new(Hub::default()));
+        let outcome = negotiate_with(
+            std::io::sink(),
+            &mut Terminal::new(&["\x1b[?1u", DA1, ECHO]),
+            || true,
+            &*hub,
+            crate::program_status::ProgramStatusOverride::Query,
+        );
+        assert!(
+            !outcome.program_status_supported,
+            "a reply after the sentinel is too late (terminal.ts:305-313)"
+        );
+
+        // (c) the written request, in pi's order: the kitty query, the 7501 query, then the DA1
+        // sentinel `exchange_with` appends. Pi's own `terminal.test.ts:135` asserts the same string
+        // with its flags-push prefix in front.
+        let mut written: Vec<u8> = Vec::new();
+        let hub = Arc::new(Mutex::new(Hub::default()));
+        let _ = negotiate_with(
+            &mut written,
+            &mut Terminal::new(&[DA1]),
+            || true,
+            &*hub,
+            crate::program_status::ProgramStatusOverride::Query,
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&written),
+            "\x1b[?u\x1b]7501;?\x1b\\\x1b[c",
+            "the 7501 query rides BETWEEN the kitty query and the DA1 sentinel, in ONE write \
+             (terminal.ts:292-298)"
+        );
+    }
+
+    /// Pi's `PI_PROGRAM_STATUS` case (`terminal.ts:288-296`): `1` forces support ON and SKIPS the
+    /// query; `0` forces it off and also skips the query; unset sends it. Driven through the
+    /// resolved override rather than the process environment, because this crate is
+    /// `#![forbid(unsafe_code)]` and `std::env::set_var` is unsafe — see
+    /// [`crate::program_status::resolve_program_status_override`].
+    #[test]
+    fn the_env_override_forces_support_on_or_off_and_skips_the_query() {
+        use crate::program_status::ProgramStatusOverride as O;
+        for (override_, want_supported) in [(O::ForceOn, true), (O::ForceOff, false)] {
+            let mut written: Vec<u8> = Vec::new();
+            let hub = Arc::new(Mutex::new(Hub::default()));
+            let outcome = negotiate_with(
+                &mut written,
+                &mut Terminal::new(&[DA1]),
+                || true,
+                &*hub,
+                override_,
+            );
+            assert_eq!(outcome.program_status_supported, want_supported);
+            assert_eq!(
+                String::from_utf8_lossy(&written),
+                "\x1b[?u\x1b[c",
+                "{override_:?} must not send the 7501 query at all"
+            );
+        }
+        // Unset: the query is sent, and a silent terminal leaves support off.
+        let mut written: Vec<u8> = Vec::new();
+        let hub = Arc::new(Mutex::new(Hub::default()));
+        let outcome = negotiate_with(
+            &mut written,
+            &mut Terminal::new(&[]),
+            || true,
+            &*hub,
+            O::Query,
+        );
+        assert!(String::from_utf8_lossy(&written).contains("\x1b]7501;?\x1b\\"));
+        assert!(!outcome.program_status_supported);
+    }
+
     /// The row's verify line: "With the keyboard-protocol query in flight, the first DA1 reply ends
     /// negotiation and the second reaches the colour query."
     ///
@@ -667,7 +820,14 @@ mod tests {
             move || *colours.lock().unwrap() = Some(hub.lock().unwrap().begin_colors())
         }));
 
-        let decision = negotiate_with(std::io::sink(), &mut terminal, || true, &*hub);
+        let decision = negotiate_with(
+            std::io::sink(),
+            &mut terminal,
+            || true,
+            &*hub,
+            crate::program_status::ProgramStatusOverride::Query,
+        )
+        .protocol;
 
         assert_eq!(
             decision,
@@ -711,7 +871,14 @@ mod tests {
     #[test]
     fn a_slow_negotiations_late_da1_is_not_taken_by_the_next_query() {
         let hub = Mutex::new(Hub::default());
-        let decision = negotiate_with(std::io::sink(), &mut Terminal::new(&[]), || true, &hub);
+        let decision = negotiate_with(
+            std::io::sink(),
+            &mut Terminal::new(&[]),
+            || true,
+            &hub,
+            crate::program_status::ProgramStatusOverride::Query,
+        )
+        .protocol;
         assert_eq!(
             decision,
             KeyboardProtocol::Unknown,

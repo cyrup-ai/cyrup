@@ -54,6 +54,12 @@ mod motion;
 mod paste;
 mod pointer;
 mod render;
+pub(crate) use render::EmbeddedStatus;
+/// The top-border composer, reached directly by `tests::embedded_status_border` so the whole
+/// degradation ladder and the exactly-`width` invariant can be pinned at every width without
+/// building an `App` per case. Production reaches it through [`InputEditor::render_in_slot`].
+#[cfg(test)]
+pub(crate) use render::top_border_with_status;
 pub(crate) mod undo;
 pub(crate) mod word_nav;
 mod wrap;
