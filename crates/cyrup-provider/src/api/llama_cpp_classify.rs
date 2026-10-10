@@ -37,16 +37,17 @@
 //! (PROV-067). Owner: EXT-027.
 
 use std::collections::BTreeMap;
-use std::future::Future;
 use std::sync::{Arc, LazyLock};
-use std::time::Duration;
 
-use cyrup_core::CancelToken;
 use dashmap::DashMap;
-use reqwest::header::HeaderMap as ResponseHeaders;
 use serde_json::{Value, json};
 use tokio::sync::OnceCell;
 
+#[cfg(test)]
+pub(crate) use super::classifier_shared::MAX_RESPONSE_BYTES;
+use super::classifier_shared::{
+    ClassifyError, format_error, headers_to_record, retry_request, send_once,
+};
 use crate::HeaderMap;
 use crate::classifier::{
     ClassifierAnswer, ClassifierContext, ClassifierModel, ClassifierOptions, ClassifierQuestion,
@@ -55,9 +56,8 @@ use crate::classifier::{
 };
 use crate::stream::ProviderResponse;
 use crate::stream::sse::build_client_for_target;
-use crate::utils::error_body::{MAX_PROVIDER_ERROR_BODY_CHARS, truncate_error_text};
 use crate::utils::headers::provider_headers_to_record;
-use crate::utils::provider_retry::{ProviderRetry, is_retryable_provider_error, retry_delay_ms};
+use crate::utils::provider_retry::ProviderRetry;
 
 /// Provider label in error text (`const LABEL = "llama.cpp"`, llama-cpp-classify.ts:37).
 const LABEL: &str = "llama.cpp";
@@ -101,91 +101,6 @@ pub struct LabeledQuestion {
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 #[error("{0}")]
 pub struct QuestionError(pub String);
-
-// ------------------------------------------------------------------------------------- errors --
-
-/// The `status` / `headers` / `body` pi's request errors carry (`HttpError`,
-/// llama-cpp-classify.ts:67-71). Only errors that carry these properties take part in the retry
-/// policy: pi's `isProviderError` (provider-retry.ts:15-20) rejects every other `Error`.
-#[derive(Clone, Debug)]
-struct ProviderFields {
-    status: Option<u16>,
-    headers: Option<ResponseHeaders>,
-    body: String,
-}
-
-/// Every failure of a classification before it is flattened into `error_message`.
-#[derive(Clone, Debug)]
-struct ClassifyError {
-    message: String,
-    /// `Some` for [`http_error`] and [`timeout_error`]; `None` for a plain `Error`.
-    provider: Option<Box<ProviderFields>>,
-}
-
-impl ClassifyError {
-    fn plain(message: impl Into<String>) -> Self {
-        Self {
-            message: message.into(),
-            provider: None,
-        }
-    }
-}
-
-/// `httpError` (llama-cpp-classify.ts:73-79): a non-2xx response with its status, headers and body.
-fn http_error(status: u16, headers: ResponseHeaders, body: String) -> ClassifyError {
-    ClassifyError {
-        message: format!("{LABEL} returned {status}"),
-        provider: Some(Box::new(ProviderFields {
-            status: Some(status),
-            headers: Some(headers),
-            body,
-        })),
-    }
-}
-
-/// `timeoutError` (llama-cpp-classify.ts:81-88): no status and no headers, which makes it retryable.
-fn timeout_error(timeout_ms: u64) -> ClassifyError {
-    ClassifyError {
-        message: format!("Request timed out after {timeout_ms}ms"),
-        provider: Some(Box::new(ProviderFields {
-            status: None,
-            headers: None,
-            body: String::new(),
-        })),
-    }
-}
-
-/// `createAbortError` (provider-retry.ts:68-72).
-fn aborted_error() -> ClassifyError {
-    ClassifyError::plain("Request aborted")
-}
-
-/// The display string pi composes for `output.errorMessage`:
-/// `formatProviderError(normalizeProviderError(error), "llama.cpp error")`
-/// (llama-cpp-classify.ts:455; error-body.ts:33-45, :122-130).
-///
-/// An error with a status and a body that its message does not already carry renders as
-/// `llama.cpp error (400): <body>`; with a status only, as `llama.cpp error (500): <message>`; with
-/// no status, as the message alone. The body is trimmed, dropped when empty and capped at
-/// [`MAX_PROVIDER_ERROR_BODY_CHARS`] (error-body.ts:76-82).
-fn format_error(error: &ClassifyError) -> String {
-    let (status, body) = match &error.provider {
-        Some(fields) => {
-            let trimmed = fields.body.trim();
-            let body = (!trimmed.is_empty())
-                .then(|| truncate_error_text(trimmed, MAX_PROVIDER_ERROR_BODY_CHARS));
-            (fields.status, body)
-        }
-        None => (None, None),
-    };
-    match (status, body) {
-        (Some(status), Some(body)) if !error.message.contains(&body) => {
-            format!("{LABEL} error ({status}): {body}")
-        }
-        (Some(status), _) => format!("{LABEL} error ({status}): {}", error.message),
-        (None, _) => error.message.clone(),
-    }
-}
 
 // ----------------------------------------------------------------------------- JS number text --
 
@@ -659,190 +574,6 @@ struct RequestContext<'a> {
     client: reqwest::Client,
 }
 
-/// `headersToRecord` (utils/headers.ts:3-9): a `Headers` object read as a name to value record.
-fn headers_to_record(headers: &ResponseHeaders) -> BTreeMap<String, String> {
-    let mut record: BTreeMap<String, String> = BTreeMap::new();
-    for (name, value) in headers {
-        let Ok(value) = value.to_str() else { continue };
-        record
-            .entry(name.as_str().to_string())
-            .and_modify(|existing| {
-                existing.push_str(", ");
-                existing.push_str(value);
-            })
-            .or_insert_with(|| value.to_string());
-    }
-    record
-}
-
-/// A `reqwest` failure with its source chain, since reqwest's own `Display` carries only the
-/// outermost description.
-fn transport_error(error: &reqwest::Error) -> ClassifyError {
-    let mut message = error.to_string();
-    let mut source = std::error::Error::source(error);
-    while let Some(cause) = source {
-        let text = cause.to_string();
-        if !text.is_empty() && !message.contains(&text) {
-            message.push_str(": ");
-            message.push_str(&text);
-        }
-        source = cause.source();
-    }
-    ClassifyError::plain(message)
-}
-
-/// The most a successful reply may carry. A readout of `n_probs` = 32768 is a few megabytes, so this
-/// is generous; the cap keeps a misbehaving or hostile server (the base URL is user configured)
-/// from growing memory for the length of the timeout. Upstream reads the body unbounded
-/// (llama-cpp-classify.ts:248-257).
-pub(crate) const MAX_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
-/// How much of a failed reply's body is read: its text is cut to
-/// [`MAX_PROVIDER_ERROR_BODY_CHARS`] before it is shown.
-const MAX_ERROR_BODY_BYTES: usize = 1024 * 1024;
-
-/// Read `response`'s body up to `limit` bytes. Past the limit the read stops: with `truncate` the
-/// prefix read so far is the result, without it the reply is refused.
-async fn read_body(
-    response: reqwest::Response,
-    limit: usize,
-    truncate: bool,
-) -> Result<Vec<u8>, ClassifyError> {
-    use futures::StreamExt as _;
-    let too_large = || ClassifyError::plain(format!("{LABEL} response exceeds {limit} bytes"));
-    if !truncate
-        && response
-            .content_length()
-            .is_some_and(|length| usize::try_from(length).map_or(true, |length| length > limit))
-    {
-        return Err(too_large());
-    }
-    let mut stream = response.bytes_stream();
-    let mut body: Vec<u8> = Vec::new();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|error| transport_error(&error))?;
-        let room = limit.saturating_sub(body.len());
-        if chunk.len() > room {
-            if truncate {
-                body.extend_from_slice(chunk.get(..room).unwrap_or_default());
-                return Ok(body);
-            }
-            return Err(too_large());
-        }
-        body.extend_from_slice(&chunk);
-    }
-    Ok(body)
-}
-
-/// One attempt of a request: POST, then read the body (llama-cpp-classify.ts:244-264). The whole
-/// attempt, body read included, is bound by `timeoutMs` (`AbortSignal.timeout`), and cancellation
-/// wins over a timeout that fires at the same time (llama-cpp-classify.ts:261).
-async fn send_once(
-    request: &RequestContext<'_>,
-    url: &str,
-    headers: &[(String, String)],
-    payload: &Value,
-) -> Result<(u16, ResponseHeaders, Value), ClassifyError> {
-    let options = request.options;
-    let work = async {
-        let body =
-            serde_json::to_vec(payload).map_err(|error| ClassifyError::plain(error.to_string()))?;
-        let mut builder = request.client.post(url).body(body);
-        for (name, value) in headers {
-            builder = builder.header(name.as_str(), value.as_str());
-        }
-        let response = builder
-            .send()
-            .await
-            .map_err(|error| transport_error(&error))?;
-        let status = response.status();
-        let response_headers = response.headers().clone();
-        if !status.is_success() {
-            // An error body is only ever shown truncated, so a long one is cut here, not refused.
-            let bytes = read_body(response, MAX_ERROR_BODY_BYTES, true).await?;
-            let body = String::from_utf8_lossy(&bytes).into_owned();
-            return Err(http_error(status.as_u16(), response_headers, body));
-        }
-        let bytes = read_body(response, MAX_RESPONSE_BYTES, false).await?;
-        let json: Value = serde_json::from_slice(&bytes)
-            .map_err(|error| ClassifyError::plain(error.to_string()))?;
-        Ok((status.as_u16(), response_headers, json))
-    };
-    let timed = async {
-        match options.timeout_ms {
-            Some(timeout_ms) => {
-                match tokio::time::timeout(Duration::from_millis(timeout_ms), work).await {
-                    Ok(outcome) => outcome,
-                    Err(_elapsed) => Err(timeout_error(timeout_ms)),
-                }
-            }
-            None => work.await,
-        }
-    };
-    tokio::select! {
-        biased;
-        () = cancelled(options.cancel.as_ref()) => Err(aborted_error()),
-        outcome = timed => outcome,
-    }
-}
-
-/// Resolves when `cancel` fires; never for no token (pi's absent `signal`).
-async fn cancelled(cancel: Option<&CancelToken>) {
-    match cancel {
-        Some(token) => token.cancelled().await,
-        None => std::future::pending().await,
-    }
-}
-
-/// `retryProviderRequest` (provider-retry.ts:104-125), over the shared decisions in
-/// [`crate::utils::provider_retry`].
-///
-/// A failed attempt is retried only when it is a provider error (see [`ProviderFields`]), is
-/// retryable by status or `x-should-retry`, and a retry is left. The delay is the server's
-/// `retry-after-ms` / `retry-after` or a jittered exponential backoff; a server delay above
-/// `max_retry_delay_ms` fails the request at once. Cancellation is checked first and the sleep is
-/// interruptible; both end in `Request aborted`.
-async fn retry_request<T, F, Fut>(
-    mut request: F,
-    retry: ProviderRetry,
-    cancel: Option<&CancelToken>,
-) -> Result<T, ClassifyError>
-where
-    F: FnMut() -> Fut,
-    Fut: Future<Output = Result<T, ClassifyError>>,
-{
-    let max_retries = retry.max_retries;
-    let mut retries_remaining = max_retries;
-    loop {
-        let error = match request().await {
-            Ok(value) => return Ok(value),
-            Err(error) => error,
-        };
-        if cancel.is_some_and(CancelToken::is_cancelled) {
-            return Err(aborted_error());
-        }
-        let Some(fields) = &error.provider else {
-            return Err(error);
-        };
-        if retries_remaining == 0
-            || !is_retryable_provider_error(fields.status, fields.headers.as_ref())
-        {
-            return Err(error);
-        }
-        let retry_index = max_retries - retries_remaining;
-        retries_remaining -= 1;
-        let delay = retry_delay_ms(fields.headers.as_ref(), &error.message, retry_index, retry)
-            .map_err(|failure| ClassifyError::plain(failure.to_string()))?;
-        let slept = tokio::select! {
-            biased;
-            () = cancelled(cancel) => false,
-            () = tokio::time::sleep(Duration::from_millis(delay)) => true,
-        };
-        if !slept {
-            return Err(aborted_error());
-        }
-    }
-}
-
 /// POST `body` to `{root}{path}` and return the response JSON (llama-cpp-classify.ts:227-271).
 ///
 /// `observe` marks the `/completion` request: only it runs the `on_payload` / `on_response` hooks
@@ -878,7 +609,16 @@ async fn post(
         max_retry_delay_ms: options.max_retry_delay_ms,
     };
     let (status, response_headers, json) = retry_request(
-        || send_once(request, &url, &headers, &payload),
+        || {
+            send_once(
+                LABEL,
+                &request.client,
+                request.options,
+                &url,
+                &headers,
+                &payload,
+            )
+        },
         retry,
         options.cancel.as_ref(),
     )
@@ -1263,7 +1003,7 @@ impl ProviderClassifier for LlamaCppClassify {
                 } else {
                     ClassifierStopReason::Error
                 };
-                output.error_message = Some(format_error(&error));
+                output.error_message = Some(format_error(LABEL, &error));
             }
         }
         output

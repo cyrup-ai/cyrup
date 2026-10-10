@@ -18,8 +18,9 @@
 //!   [`router`].
 //! * `cyrup-it/tests/llama/fake.rs` — both halves behind one port, for the seam tests. Answers from
 //!   [`router`] and [`classify`].
-//! * `cyrup-provider/src/tests/llama_cpp_classify_fake_server.rs` — the classifier api. Answers
-//!   from [`classify`] and [`router::file_not_found`].
+//! * `cyrup-provider/src/tests/llama_cpp_classify_fake_server.rs` — the classifier apis. Answers
+//!   from [`classify`], [`systemone`] (`POST /v1/systemone`, PROV-104) and
+//!   [`router::file_not_found`].
 //!
 //! Each fake carries a drift guard comparing what it puts on a real socket with [`golden`].
 //!
@@ -57,6 +58,7 @@
 pub mod classify;
 pub mod golden;
 pub mod router;
+pub mod systemone;
 
 #[cfg(test)]
 mod tests {
@@ -65,7 +67,7 @@ mod tests {
     use serde_json::Value;
 
     use crate::classify::{self, TokenLogprob};
-    use crate::{golden, router};
+    use crate::{golden, router, systemone};
 
     const B: TokenLogprob<'static> = TokenLogprob {
         id: 66,
@@ -164,6 +166,45 @@ mod tests {
             Some(golden::COMPLETION_PROBABILITIES_B_OVER_A)
         );
         assert_eq!(answer.get("content"), Some(&Value::from("B")));
+    }
+
+    /// The System One definitions, fed the numbers the live b11436 router answered with, serialize
+    /// to that live answer byte for byte; the 501 for a text model likewise.
+    #[test]
+    fn systemone_definitions_reproduce_the_live_answer() {
+        let answer = systemone::response(
+            "tinylaya-for-testing-Q8_0",
+            &[
+                (
+                    "category",
+                    systemone::choice_answer(
+                        "failure",
+                        &[
+                            ("success", 0.4996767927733331),
+                            ("failure", 0.5003232072266669),
+                        ],
+                        0.000646414453333799,
+                    ),
+                ),
+                (
+                    "satisfaction",
+                    systemone::score_answer(
+                        1.0014472175540505,
+                        &["low", "neutral", "high"],
+                        &[0.3335314403923897, 0.3314899016611701, 0.33497865794644016],
+                        0.0,
+                    ),
+                ),
+                ("approved", systemone::noul_answer(0.500289248081911)),
+            ],
+            103,
+        );
+        assert_eq!(answer.to_string(), golden::SYSTEMONE_TINYLAYA_LIVE);
+        let (status, body) = systemone::not_a_decision_model();
+        assert_eq!(
+            (status, body.to_string().as_str()),
+            (501, golden::SYSTEMONE_NOT_A_DECISION_MODEL)
+        );
     }
 
     /// `with_pieces: true` yields `{id, piece}` objects, the one object-token form a real server

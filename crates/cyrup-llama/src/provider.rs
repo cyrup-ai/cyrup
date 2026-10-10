@@ -4,8 +4,9 @@
 //! the pure model mapping that lives in [`crate::model`]. [`LlamaProvider`] is pi's
 //! `Provider<"openai-completions">` object (`createLlamaProvider`, `:137-266`): `llama.cpp`, one
 //! provider with chat models that stream through the `openai-completions` api against
-//! `<server>/v1` and a classifier twin of each that answers through `llama-cpp-classify`
-//! against the server root.
+//! `<server>/v1` and a classifier twin of each model: a decision model answers through
+//! `typesafe-system-one` against `<server>/v1/systemone`, every other model through
+//! `llama-cpp-classify` against the server root (EXT-110).
 //!
 //! # Catalog state
 //!
@@ -39,6 +40,7 @@ use std::sync::{Arc, Mutex, RwLock, Weak};
 use cyrup_core::{CancelToken, EventStream, ProviderId};
 use cyrup_provider::Provider;
 use cyrup_provider::api::llama_cpp_classify::llama_cpp_classify_api;
+use cyrup_provider::api::typesafe_system_one::typesafe_system_one_api;
 use cyrup_provider::api::{ApiRegistry, builtin_registry};
 use cyrup_provider::auth::oauth::{AuthInteraction, AuthPrompt, OAuthError};
 use cyrup_provider::auth::{
@@ -61,7 +63,9 @@ use crate::client::{
     LlamaClient, LlamaModelInfo, LlamaModelStatus, llama_inference_url, normalize_llama_server_url,
 };
 use crate::error::LlamaError;
-use crate::model::{is_chat_model, model_is_selectable, to_classifier_model, to_model};
+use crate::model::{
+    is_chat_model, is_llama_classifier_api, model_is_selectable, to_classifier_model, to_model,
+};
 
 pub use crate::LLAMA_PROVIDER_ID;
 
@@ -417,15 +421,19 @@ struct Parts {
 /// The llama.cpp provider (`createLlamaProvider().provider`, `provider.ts:152-263`).
 ///
 /// Streaming and auth resolution are a [`WireProvider`] over the `openai-completions` api;
-/// `classify` is the `llama-cpp-classify` api (`classifier.classify`, `:262`). Every [`Provider`]
-/// surface method is delegated by name rather than left to a trait default.
+/// `classify` dispatches on the model's api, `typesafe-system-one` for a decision model and
+/// `llama-cpp-classify` for everything else (`provider.ts:290-296` @f1b2e77f5, EXT-110). Every
+/// [`Provider`] surface method is delegated by name rather than left to a trait default.
 pub struct LlamaProvider {
     id: ProviderId,
     base_url: String,
     models: Vec<Model>,
     classifiers: Vec<ClassifierModel>,
     inner: WireProvider,
-    classifier: Arc<dyn ProviderClassifier>,
+    /// `fallbackClassifier = llamaCppClassifyApi()` (`provider.ts:169`).
+    fallback_classifier: Arc<dyn ProviderClassifier>,
+    /// `decisionClassifier = typesafeSystemOneApi()` (`provider.ts:170`).
+    decision_classifier: Arc<dyn ProviderClassifier>,
     parts: Parts,
     controller: Weak<ControllerShared>,
 }
@@ -453,7 +461,8 @@ impl LlamaProvider {
             models,
             classifiers,
             inner,
-            classifier: llama_cpp_classify_api(),
+            fallback_classifier: llama_cpp_classify_api(),
+            decision_classifier: typesafe_system_one_api(),
             parts: parts.clone(),
             controller,
         }
@@ -517,9 +526,10 @@ impl LlamaProvider {
                     AnyModel::Chat(chat) if chat.api.as_str() == OPENAI_COMPLETIONS => {
                         restored.push(chat.clone());
                     }
+                    // `stored.filter(isLlamaClassifierModel)` (`provider.ts:239` @f1b2e77f5): both
+                    // apis `to_classifier_model` produces survive the restore (EXT-110).
                     AnyModel::Classifier(classifier)
-                        if classifier.api.as_str()
-                            == KnownClassifierApi::LlamaCppClassify.as_str() =>
+                        if is_llama_classifier_api(classifier.api.as_str()) =>
                     {
                         restored_classifiers.push(classifier.clone());
                     }
@@ -598,7 +608,7 @@ impl LlamaProvider {
                     cached_context_windows.get(&model.id).copied(),
                 )
             })
-            .collect();
+            .collect::<Result<_, _>>()?;
         // `if (signal.aborted) return` (`provider.ts:251`), after the props fan-out and before the
         // final publish.
         //
@@ -717,14 +727,21 @@ impl Provider for LlamaProvider {
         true
     }
 
-    /// `classify` (`provider.ts:262`): the `llama-cpp-classify` api.
+    /// `classify` (`provider.ts:290-296` @f1b2e77f5): `typesafe-system-one` goes to the native
+    /// System One api, everything else to `llama-cpp-classify`, whose own api check refuses a
+    /// model that is neither (EXT-110).
     async fn classify(
         &self,
         model: &ClassifierModel,
         context: &ClassifierContext,
         options: &ClassifierOptions,
     ) -> ClassifierResult {
-        self.classifier.classify(model, context, options).await
+        let classifier = if model.api.as_str() == KnownClassifierApi::TypesafeSystemOne.as_str() {
+            &self.decision_classifier
+        } else {
+            &self.fallback_classifier
+        };
+        classifier.classify(model, context, options).await
     }
 
     /// `stream` (`provider.ts:260`).
@@ -960,7 +977,7 @@ impl LlamaController {
         let classifiers = selectable
             .iter()
             .map(|model| to_classifier_model(model, server_url, None))
-            .collect();
+            .collect::<Result<Vec<_>, _>>()?;
         self.shared.try_install(models, classifiers)
     }
 

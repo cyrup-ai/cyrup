@@ -634,6 +634,187 @@ mod decision_models {
         );
     }
 
+    /// pi `exposes decision models reported by the catalog as native System One classifiers`
+    /// (`llama-extension.test.ts:385-528` @f1b2e77f5), its classifier half (EXT-110 half 2, after
+    /// PROV-104): a decision model's classifier twin is `typesafe-system-one` on `<server>/v1`,
+    /// classifies through llama.cpp's `POST /v1/systemone` (answered here from
+    /// `cyrup_llama_cpp_wire::systemone`, whose definitions reproduce a live b11436 answer byte for
+    /// byte) with the bool question sent as `noul`, and a cache-only restore keeps both apis.
+    #[tokio::test]
+    async fn a_decision_classifier_answers_through_system_one_and_survives_a_cache_only_restore() {
+        use cyrup_llama_cpp_wire::systemone;
+        use cyrup_provider::{
+            BoolCriteria, ClassifierAnswer, ClassifierContext, ClassifierOptions,
+            ClassifierQuestion, ClassifierStopReason,
+        };
+
+        use crate::tests::fake_server::Reply;
+
+        let server = FakeLlamaServer::start().await;
+        let mut legacy = loaded_entry("legacy", &[]);
+        legacy.as_object_mut().unwrap().remove("architecture");
+        server.set_models(vec![
+            loaded_entry("qwen", &[]),
+            decision_entry("kev", "loaded"),
+            decision_entry("laya", "sleeping"),
+            legacy,
+        ]);
+        server.set_props(json!({}));
+        server.respond(
+            "POST",
+            "/v1/systemone",
+            Reply::Json(
+                200,
+                systemone::response("kev", &[("angry", systemone::noul_answer(0.82))], 42),
+            ),
+        );
+        let url = server.url().to_string();
+        let mut env = ProviderEnv::new();
+        env.insert("LLAMA_BASE_URL".to_string(), url.clone());
+        let credential = Credential::ApiKey {
+            key: Some("local".to_string()),
+            env: Some(env),
+        };
+        let publisher = Publisher::default();
+        let refreshed = controller();
+        let cancel = CancelToken::new();
+        refreshed
+            .provider()
+            .refresh(&LlamaRefreshContext {
+                credential: Some(&credential),
+                stored: None,
+                publisher: &publisher,
+                allow_network: true,
+                cancel: &cancel,
+            })
+            .await
+            .unwrap();
+
+        // The catalog identifies decision models, so a refresh never probes them.
+        assert!(server.requests_to("POST", "/v1/systemone").is_empty());
+        let cached = publisher.0.lock().unwrap().clone().unwrap();
+        let table: Vec<(String, String, String)> = cached
+            .models
+            .iter()
+            .map(|model| {
+                let base_url = match model {
+                    AnyModel::Chat(chat) => chat.base_url.clone(),
+                    AnyModel::Classifier(classifier) => classifier.base_url.clone(),
+                    AnyModel::Image(image) => image.base_url.clone(),
+                };
+                (model.id().to_string(), model.api().to_string(), base_url)
+            })
+            .collect();
+        let row = |id: &str, api: &str, base: String| (id.to_string(), api.to_string(), base);
+        assert_eq!(
+            table,
+            [
+                row("qwen", "openai-completions", format!("{url}/v1")),
+                row("legacy", "openai-completions", format!("{url}/v1")),
+                row("qwen", "llama-cpp-classify", url.clone()),
+                row("kev", "typesafe-system-one", format!("{url}/v1")),
+                row("laya", "typesafe-system-one", format!("{url}/v1")),
+                row("legacy", "llama-cpp-classify", url.clone()),
+            ]
+        );
+
+        let kev = refreshed
+            .provider()
+            .get_all_models()
+            .into_iter()
+            .find_map(|model| {
+                model
+                    .into_classifier()
+                    .filter(|model| model.id.as_str() == "kev")
+            })
+            .expect("the decision classifier");
+        assert_eq!(kev.context_window, 8192);
+        let mut state = serde_json::Map::new();
+        state.insert("message".to_string(), json!("I was charged twice."));
+        let context = ClassifierContext {
+            state,
+            questions: [(
+                "angry",
+                ClassifierQuestion::Bool {
+                    instructions: "Is the customer angry?".to_string(),
+                    criteria: BoolCriteria {
+                        when_true: "angry".to_string(),
+                        when_false: "calm".to_string(),
+                    },
+                },
+            )]
+            .into_iter()
+            .collect(),
+        };
+        let mut options_env = ProviderEnv::new();
+        options_env.insert("no_proxy".to_string(), "*".to_string());
+        let options = ClassifierOptions {
+            api_key: Some("local".to_string()),
+            env: Some(options_env),
+            ..ClassifierOptions::default()
+        };
+        let result = refreshed
+            .provider()
+            .classify(&kev, &context, &options)
+            .await;
+        assert_eq!(result.error_message, None);
+        assert_eq!(result.stop_reason, ClassifierStopReason::Stop);
+        assert_eq!(
+            result.answers.get("angry"),
+            Some(&ClassifierAnswer::Bool { probability: 0.82 })
+        );
+        let usage = result.usage.expect("usage");
+        assert_eq!((usage.input, usage.output), (42, 0));
+        let requests = server.requests_to("POST", "/v1/systemone");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].json(),
+            json!({
+                "model": "kev",
+                "state": { "message": "I was charged twice." },
+                "questions": {
+                    "angry": {
+                        "type": "noul",
+                        "instructions": "Is the customer angry?",
+                        "criteria": { "true": "angry", "false": "calm" },
+                    },
+                },
+            })
+        );
+
+        // A cache-only startup restores decision models with their native api.
+        let restored = controller();
+        restored
+            .provider()
+            .refresh(&LlamaRefreshContext {
+                credential: Some(&credential),
+                stored: Some(&cached),
+                publisher: &publisher,
+                allow_network: false,
+                cancel: &cancel,
+            })
+            .await
+            .unwrap();
+        assert_eq!(chat_ids(&restored), ["qwen", "legacy"]);
+        let classifiers: Vec<(String, String)> = restored
+            .provider()
+            .get_all_models()
+            .iter()
+            .filter(|model| matches!(model, AnyModel::Classifier(_)))
+            .map(|model| (model.id().to_string(), model.api().to_string()))
+            .collect();
+        let pair = |id: &str, api: &str| (id.to_string(), api.to_string());
+        assert_eq!(
+            classifiers,
+            [
+                pair("qwen", "llama-cpp-classify"),
+                pair("kev", "typesafe-system-one"),
+                pair("laya", "typesafe-system-one"),
+                pair("legacy", "llama-cpp-classify"),
+            ]
+        );
+    }
+
     /// pi `lists decision models that also output text for chat` (`llama-extension.test.ts`,
     /// f6127a1bf): `isChatModel` keeps a model that reports `"text"` beside `"decisions"`. No
     /// llama.cpp release emits that pair (`server-common.cpp:150-163` @b11436 answers one or the

@@ -418,7 +418,7 @@ async fn the_stored_catalog_is_the_chat_models_then_the_classifiers() {
     ))
     .unwrap();
     let chat = to_model(&info, "http://127.0.0.1:8080", None, None).unwrap();
-    let classifier = to_classifier_model(&info, "http://127.0.0.1:8080", None);
+    let classifier = to_classifier_model(&info, "http://127.0.0.1:8080", None).unwrap();
     let stored = |checked_at| {
         refresh_context(
             None,

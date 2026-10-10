@@ -126,3 +126,31 @@ pub const COMPLETION_KEYS: [&str; 17] = [
     "timings",
     "completion_probabilities",
 ];
+
+/// The answer a LIVE b11436 router (`llama-server --models-dir`, `-t 1`) gave on 2026-10-10 to
+/// `POST /v1/systemone` with `model: "tinylaya-for-testing-Q8_0"` (a decision-only GGUF,
+/// `output_modalities: ["decisions"]`), the state `{"text": "The deployment succeeded, thank
+/// you."}` and pi's own three test questions (`test/typesafe-system-one.test.ts` @f1b2e77f5): a
+/// choice `category` over `success`/`failure`, a score `satisfaction` over three levels and a
+/// noul `approved` (pi's `bool`, sent as `noul`). Captured verbatim, BYTE FOR BYTE: what
+/// [`crate::systemone::response`] over [`crate::systemone::choice_answer`],
+/// [`crate::systemone::score_answer`] and [`crate::systemone::noul_answer`] with these values
+/// must serialize to (`post_systemone`, `server-context.cpp:5583-5667`; `format_answer`,
+/// `server-decision.cpp:731-804`). The test model is a random-weight test fixture, so the
+/// probabilities are near-uniform; the numbers are the server's, not chosen.
+pub const SYSTEMONE_TINYLAYA_LIVE: &str = concat!(
+    r#"{"model":"tinylaya-for-testing-Q8_0","answers":{"#,
+    r#""category":{"type":"choice","choice":"failure","probabilities":"#,
+    r#"{"success":0.4996767927733331,"failure":0.5003232072266669},"#,
+    r#""confidence":0.000646414453333799},"#,
+    r#""satisfaction":{"type":"score","score":1.0014472175540505,"#,
+    r#""legend":{"0":"low","1":"neutral","2":"high"},"#,
+    r#""probabilities":{"0":0.3335314403923897,"1":0.3314899016611701,"2":0.33497865794644016},"#,
+    r#""confidence":0.0},"#,
+    r#""approved":{"type":"noul","noul":0.500289248081911}},"#,
+    r#""usage":{"input_tokens":103,"output_tokens":0}}"#,
+);
+
+/// [`crate::systemone::not_a_decision_model`]: what the live b11436 router answered (HTTP 501) to
+/// the same request with `model: "stories260K"`, a text model (`server-context.cpp:5586-5588`).
+pub const SYSTEMONE_NOT_A_DECISION_MODEL: &str = r#"{"error":{"code":501,"message":"This model is not a decision model","type":"not_supported_error"}}"#;

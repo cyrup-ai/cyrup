@@ -32,6 +32,7 @@ mod overflow_estimate_parity;
 mod prompt_cache;
 mod remote_catalog;
 mod sampling_params;
+mod system_one;
 mod thinking_max;
 mod transform_headers_on_the_wire;
 mod virtual_models;

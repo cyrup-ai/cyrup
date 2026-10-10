@@ -15,7 +15,10 @@ use crate::auth::{
     AuthContext, AuthOverrides, CredentialStore, EnvAuthContext, ProviderAuth,
     resolve_provider_auth,
 };
-use crate::classifier::{AnyModel, ImageModel};
+use crate::classifier::{
+    AnyModel, ClassifierApiRegistry, ClassifierContext, ClassifierModel, ClassifierOptions,
+    ClassifierResult, ImageModel, ProviderClassifier,
+};
 use crate::context::Context;
 use crate::error::ProviderError;
 use crate::images::{
@@ -61,6 +64,14 @@ pub struct WireProvider {
     /// per-api image-generation map, dispatched on `model.api` at `:1146-1160`. `None` is pi's
     /// absent option, which is what makes `provider.generateImages` absent. PROV-128.
     images: Option<Arc<ImageApiRegistry>>,
+    /// The provider's `type: "classifier"` catalog rows, held apart from [`WireProvider::models`]
+    /// for the reason [`WireProvider::image_models`] is (`CreateProviderOptions.models`,
+    /// `models.ts:997`). PROV-104.
+    classifier_models: Vec<ClassifierModel>,
+    /// Pi `createProvider({ classifiers })` (`CreateProviderOptions.classifiers`) — the per-api
+    /// classifier map, dispatched on `model.api` (`models.ts:1161-1171`). `None` is pi's absent
+    /// option, which is what makes `provider.classify` absent. PROV-104.
+    classifiers: Option<Arc<ClassifierApiRegistry>>,
 }
 
 /// A provider's credential-scoped availability policy (Pi `Provider.filterModels?`,
@@ -92,6 +103,8 @@ impl WireProvider {
             filter_models: None,
             image_models: Vec::new(),
             images: None,
+            classifier_models: Vec::new(),
+            classifiers: None,
         }
     }
 
@@ -137,6 +150,27 @@ impl WireProvider {
         self
     }
 
+    /// Add the provider's classifier catalog rows (pi's
+    /// `...Object.values(<PROVIDER>_CLASSIFIER_MODELS)` inside the one `models` array,
+    /// `providers/openrouter.ts:26`). They appear in [`Provider::get_all_models`] and NOT in
+    /// [`Provider::models`]. PROV-104.
+    #[must_use]
+    pub fn with_classifier_models(mut self, models: Vec<ClassifierModel>) -> Self {
+        self.classifier_models = models;
+        self
+    }
+
+    /// Install the per-api classifier map (pi `createProvider({ classifiers })`,
+    /// `providers/openrouter.ts:34`, `providers/cloudflare-workers-ai.ts:21-23`). Installing it is
+    /// what makes [`Provider::supports_classification`] true, exactly as pi attaches `classify`
+    /// only when `classifiers` carries an implementation; an EMPTY registry is ignored, as
+    /// [`WireProvider::with_images`] ignores an empty image map. PROV-104.
+    #[must_use]
+    pub fn with_classifiers(mut self, classifiers: Arc<ClassifierApiRegistry>) -> Self {
+        self.classifiers = (!classifiers.is_empty()).then_some(classifiers);
+        self
+    }
+
     /// Override the ambient auth context (for tests / custom env sources).
     #[must_use]
     pub fn with_auth_context(mut self, ctx: Arc<dyn AuthContext>) -> Self {
@@ -175,10 +209,17 @@ impl Provider for WireProvider {
     /// first, then image rows, in the order `createProvider({ models })` was given them
     /// (`providers/openrouter.ts:23-27`). PROV-128.
     fn get_all_models(&self) -> Vec<AnyModel> {
-        let mut all: Vec<AnyModel> =
-            Vec::with_capacity(self.models.len() + self.image_models.len());
+        let mut all: Vec<AnyModel> = Vec::with_capacity(
+            self.models.len() + self.image_models.len() + self.classifier_models.len(),
+        );
         all.extend(self.models.iter().cloned().map(AnyModel::Chat));
         all.extend(self.image_models.iter().cloned().map(AnyModel::Image));
+        all.extend(
+            self.classifier_models
+                .iter()
+                .cloned()
+                .map(AnyModel::Classifier),
+        );
         all
     }
 
@@ -211,6 +252,35 @@ impl Provider for WireProvider {
     /// auth and then failing on dispatch. PROV-128.
     fn supports_image_generation(&self) -> bool {
         self.images.is_some()
+    }
+
+    /// Pi dispatches `classifiers[model.api]` and answers `classifierErrorResult` when there is no
+    /// entry (`models.ts:1161-1171`); [`ClassifierApiRegistry`] is that map and that message. With
+    /// no `classifiers` option at all, the absent member's message. PROV-104.
+    async fn classify(
+        &self,
+        model: &ClassifierModel,
+        context: &ClassifierContext,
+        options: &ClassifierOptions,
+    ) -> ClassifierResult {
+        match &self.classifiers {
+            Some(classifiers) => classifiers.classify(model, context, options).await,
+            None => ClassifierResult::errored(
+                model,
+                format!(
+                    "Provider {} does not support classification",
+                    model.provider
+                ),
+                options.is_aborted(),
+            ),
+        }
+    }
+
+    /// Pi attaches `classify` exactly when `createProvider` was given a non-empty `classifiers`
+    /// map, not when the catalog holds a classifier row — the twin of
+    /// [`WireProvider::supports_image_generation`]. PROV-104.
+    fn supports_classification(&self) -> bool {
+        self.classifiers.is_some()
     }
 
     fn filter_models(

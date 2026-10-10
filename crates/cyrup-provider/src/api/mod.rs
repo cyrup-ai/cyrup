@@ -51,6 +51,9 @@ mod content_cache;
 pub mod anthropic_messages;
 pub mod azure_openai_responses;
 pub mod bedrock_converse_stream;
+/// The transport and usage reading every HTTP classifier api shares (pi `classifier-shared.ts`).
+pub(crate) mod classifier_shared;
+pub mod cloudflare_workers_ai_system_one;
 pub mod github_copilot_headers;
 pub mod google_generative_ai;
 pub mod google_vertex;
@@ -61,6 +64,9 @@ pub mod openai_completions;
 pub mod openai_responses;
 pub mod openrouter_images;
 pub mod pi_messages;
+/// What the two System One classifier apis share (pi `system-one-shared.ts`).
+pub(crate) mod system_one_shared;
+pub mod typesafe_system_one;
 
 /// Cross-converter regression suite: a truncated stream must never be reported as a completed turn
 /// (PROV-010 / AGENT-014 / DRIFT-012). Lives beside the decoders so it can drive all five directly.
