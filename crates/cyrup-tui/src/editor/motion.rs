@@ -78,20 +78,19 @@ impl InputEditor {
     /// segment — pi's `this.segment(text, "word")` (`editor.ts:361-363`), i.e. `segmentWithMarkers`
     /// (`:37-90`) over `Intl.Segmenter(undefined, { granularity: "word" })` (`utils.ts:5`).
     ///
-    /// [CYRUP-DELTA] The base segmenter is `unicode_segmentation`'s UAX#29 word-boundary iterator
-    /// rather than ICU's. They agree on Latin/Cyrillic/Greek prose, identifiers, `foo.bar`, `don't`
-    /// and `3.14`; they differ on **unspaced scripts**, where ICU adds a dictionary/LSTM pass that
-    /// UAX#29 alone has no data for — `你好世界` is two segments to ICU and four to UAX#29. Closing
-    /// that needs an ICU-class word segmenter (`icu_segmenter` + its CJK/Thai data), which is a new
-    /// workspace dependency and not this change's to take. See TUI-048.
+    /// The base segmenter is [`word_nav::icu_word_segments`] — the same ICU word segmenter
+    /// `Intl.Segmenter` is, so unspaced scripts break where they do upstream. Its byte offsets are
+    /// converted to **char columns** here, which is the unit the editor is indexed in.
     fn word_segments(&self, text: &[char]) -> Vec<WordSeg> {
         let markers = self.marker_spans(text);
         let joined: String = text.iter().collect();
         let mut out: Vec<WordSeg> = Vec::new();
         let mut col = 0usize;
         let mut mi = 0usize;
-        for seg in joined.split_word_bounds() {
-            let len = seg.chars().count();
+        for (byte_start, byte_len, word_like) in word_nav::icu_word_segments(&joined) {
+            let len = joined
+                .get(byte_start..byte_start.saturating_add(byte_len))
+                .map_or(0, |seg| seg.chars().count());
             let start = col;
             col += len;
             // "Skip past markers that are entirely before this segment" (`editor.ts:67-69`).
@@ -114,7 +113,7 @@ impl InputEditor {
                 _ => out.push(WordSeg {
                     start,
                     len,
-                    word_like: seg.chars().any(char::is_alphanumeric),
+                    word_like,
                     atomic: false,
                 }),
             }

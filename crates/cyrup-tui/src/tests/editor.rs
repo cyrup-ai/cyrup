@@ -944,22 +944,76 @@ fn word_motion_keeps_pis_ascii_boundaries_after_the_segmenter_swap() {
 }
 
 #[test]
-fn cjk_word_motion_no_longer_swallows_the_whole_run() {
-    // TUI-048's headline case. The old class-run motion treated `你好世界` as ONE alphanumeric run
-    // and jumped to column 0. UAX#29 segments it per ideograph, so the caret now stops inside the
-    // run. **This is not yet parity**: ICU's `Intl.Segmenter` adds a dictionary pass that lands pi at
-    // column 2 (`你好` / `世界`), and `unicode-segmentation` carries no such data — hence the range
-    // assertion rather than a fixed column, and hence TUI-048 stays open. See the CYRUP-DELTA on
-    // `InputEditor::word_segments`.
+fn cjk_word_motion_matches_pis_icu_segmentation() {
+    // TUI-048's headline case, and its Verify line's exact demand. `你好世界` is two WORDS, not four
+    // ideographs: ICU's dictionary pass segments it `你好` / `世界`, so pi's Alt+B from column 4
+    // lands at 2. A bare UAX#29 iterator has no dictionary and breaks per ideograph, which landed
+    // the caret at 3 — this test asserted only the range `0 < col < 4` for exactly that reason until
+    // `icu_word_segments` replaced it.
     let mut ed = InputEditor::new();
     type_str(&mut ed, "你好世界");
     assert_eq!(ed.cursor(), (0, 4));
     ed.handle_key(&alt(KeyCode::Left));
-    let (_, col) = ed.cursor();
-    assert!(
-        col > 0 && col < 4,
-        "word-left jumped the whole ideograph run: col {col}"
+    assert_eq!(
+        ed.cursor(),
+        (0, 2),
+        "Alt+B must stop at the word, not the ideograph"
     );
+    // And again, to the start of the first word.
+    ed.handle_key(&alt(KeyCode::Left));
+    assert_eq!(ed.cursor(), (0, 0));
+}
+
+#[test]
+fn cjk_word_motion_forward_matches_pis_icu_segmentation() {
+    // The forward mirror: Alt+F from column 0 ends the FIRST dictionary word, column 2. UAX#29 alone
+    // ended the first ideograph, column 1.
+    let mut ed = InputEditor::new();
+    type_str(&mut ed, "你好世界");
+    ed.handle_key(&KeyCode::Home.into());
+    ed.handle_key(&alt(KeyCode::Right));
+    assert_eq!(ed.cursor(), (0, 2));
+    ed.handle_key(&alt(KeyCode::Right));
+    assert_eq!(ed.cursor(), (0, 4));
+}
+
+#[test]
+fn ctrl_w_in_cjk_kills_one_dictionary_word() {
+    // The destructive consequence of the same segmentation: Ctrl+W must take the word `世界`, not
+    // the single ideograph `界` that UAX#29 would have left behind.
+    let mut ed = InputEditor::new();
+    type_str(&mut ed, "你好世界");
+    ed.handle_key(&ctrl('w'));
+    assert_eq!(ed.text(), "你好");
+    assert_eq!(ed.kill_ring_top(), Some("世界"));
+}
+
+#[test]
+fn thai_word_motion_uses_icus_lstm_pass() {
+    // Unspaced scripts other than CJK go through ICU's LSTM rather than its dictionary, and
+    // `new_auto` selects it: `ทุกสองสัปดาห์` ("every two weeks") is `ทุก` / `สอง` / `สัปดาห์`, so the
+    // last word starts at char column 6. A bare UAX#29 iterator does break this string — it is not
+    // one segment — but it breaks it on Thai's own vowel and tone marks instead of on words, which
+    // is why this asserts the column and not merely "somewhere inside".
+    let mut ed = InputEditor::new();
+    type_str(&mut ed, "ทุกสองสัปดาห์");
+    assert_eq!(ed.cursor(), (0, 13));
+    ed.handle_key(&alt(KeyCode::Left));
+    assert_eq!(ed.cursor(), (0, 6), "Alt+B must land on the last LSTM word");
+}
+
+#[test]
+fn a_zwj_emoji_family_is_one_non_word_segment_under_icu() {
+    // A NON-REGRESSION GUARD, not a proof of the swap: this passes at HEAD too. The 7-char ZWJ
+    // family cluster was one non-word-like segment under the old `any(char::is_alphanumeric)`
+    // recompute, and it must stay one under ICU's own `isWordLike` — otherwise word motion would
+    // start entering emoji. Kept because that equivalence is the swap's main risk, not its payoff.
+    let mut ed = InputEditor::new();
+    type_str(&mut ed, "a👨\u{200d}👩\u{200d}👧\u{200d}👦b");
+    let end = ed.cursor().1;
+    ed.handle_key(&alt(KeyCode::Left));
+    // `b` is its own word-like segment, so Alt+B stops just before it, not inside the cluster.
+    assert_eq!(ed.cursor(), (0, end - 1));
 }
 
 #[test]

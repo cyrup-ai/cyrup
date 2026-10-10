@@ -290,6 +290,13 @@ grep-searcher        = { version = "0.1.16" }
 similar              = { version = "3.1.1" }
 dashmap              = { version = "6.2.1" }
 unicode-segmentation = { version = "1.13.3" }
+# ICU word segmentation for CJK and other unspaced scripts (TUI-048). `unicode-segmentation` above
+# is UAX#29 ONLY, which has no dictionary data, so `你好世界` breaks into four segments where pi's
+# `Intl.Segmenter` (ICU) gives two — costing the exact column TUI-048's Verify line names. ICU4X is
+# already compiled into this workspace transitively (11 `icu_*` crates via `idna_adapter`); this
+# promotes a segmenter from that same stack to a direct dependency, and its dictionary payload is
+# the only genuinely new weight.
+icu_segmenter = { version = "2.3.0" }
 unicode-normalization = { version = "0.1.24" }   # tools NFKC/NFD normalization (arch-03)
 feruca               = { version = "0.12.0" }    # pure-Rust UCA collation for `ls` localeCompare parity (arch-03, ls.ts:150)
 image                = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }

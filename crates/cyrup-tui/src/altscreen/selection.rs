@@ -1113,10 +1113,11 @@ struct WordSegment {
 /// The word range under `point`, or `None` when the column has no segment — pi's
 /// `getWordSelection` (`tui-alt-screen.ts:836-871`).
 ///
-/// Upstream segments with `Intl.Segmenter`'s word iterator and asks each segment for `isWordLike`;
-/// `unicode_segmentation`'s `split_word_bounds` is the same UAX #29 word-boundary algorithm, and
-/// "word-like" is a segment carrying an alphanumeric — the crate already depends on it for
-/// grapheme-cluster editor motion, so no new dependency appears here.
+/// Upstream segments with `Intl.Segmenter`'s word iterator and asks each segment for `isWordLike`,
+/// so this uses the editor's [`icu_word_segments`](crate::editor::word_nav::icu_word_segments) —
+/// the same ICU segmenter, reporting ICU's own `isWordLike`. A bare UAX #29 iterator would also
+/// break here on unspaced scripts, where double-clicking a Chinese word would select one character
+/// of it rather than the word (TUI-048).
 ///
 /// The joiner walk is what keeps `src/main.rs` and `kebab-case-token` whole: two selectable
 /// segments merge when either is a joiner (`:851-869`), so a run of word/joiner/word extends in
@@ -1124,13 +1125,18 @@ struct WordSegment {
 fn word_selection(text: &str, point: Point) -> Option<Range> {
     let mut segments: Vec<WordSegment> = Vec::new();
     let mut start = 0usize;
-    for segment in text.split_word_bounds() {
+    // Columns here are DISPLAY WIDTHS, not the segmenter's byte offsets, so each segment's span is
+    // re-measured as it is walked.
+    for (byte_start, byte_len, word_like) in crate::editor::word_nav::icu_word_segments(text) {
+        let segment = text
+            .get(byte_start..byte_start.saturating_add(byte_len))
+            .unwrap_or_default();
         let end = start.saturating_add(str_width(segment));
         let joiner = WORD_JOINERS.contains(&segment);
         segments.push(WordSegment {
             start,
             end,
-            selectable: joiner || segment.chars().any(char::is_alphanumeric),
+            selectable: joiner || word_like,
             joiner,
         });
         start = end;
@@ -1394,4 +1400,56 @@ fn run_at_column(text: &str, column: usize) -> Option<String> {
         current = end;
     }
     hit.then_some(run)
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
+mod word_selection_tests {
+    use super::*;
+
+    fn at(col: usize) -> Point {
+        Point {
+            row: 0,
+            col,
+            boundary: false,
+        }
+    }
+
+    /// `TUI-183`'s Verify line: a double-click inside `你好世界` selects `你好`, not the whole run
+    /// and not a single ideograph. Columns here are display widths, so each ideograph is two.
+    #[test]
+    fn a_double_click_in_cjk_selects_one_dictionary_word() {
+        let range = word_selection("你好世界", at(0)).expect("a segment under column 0");
+        assert_eq!(
+            (range.start.col, range.end.col),
+            (0, 4),
+            "`你好` spans display columns 0..4"
+        );
+        // And clicking the second word picks that one, not the first and not the pair.
+        let range = word_selection("你好世界", at(4)).expect("a segment under column 4");
+        assert_eq!((range.start.col, range.end.col), (4, 8));
+    }
+
+    /// A NON-REGRESSION GUARD, not a proof of the swap: this passes at HEAD too. The joiner walk
+    /// that keeps `src/main.rs` and `kebab-case-token` whole must still do so
+    /// (`tui-alt-screen.ts:851-869`), and `word punctuation word` must still not merge — ICU's own
+    /// `isWordLike` replaces a recompute here, and this is what pins the two to the same answer on
+    /// ASCII.
+    #[test]
+    fn the_joiner_walk_survives_the_icu_swap() {
+        let range = word_selection("src/main.rs", at(5)).expect("a segment under column 5");
+        assert_eq!((range.start.col, range.end.col), (0, 11), "the whole path");
+
+        let range = word_selection("alpha, beta", at(1)).expect("a segment under column 1");
+        assert_eq!(
+            (range.start.col, range.end.col),
+            (0, 5),
+            "a comma is not a joiner, so `alpha` stands alone"
+        );
+    }
 }

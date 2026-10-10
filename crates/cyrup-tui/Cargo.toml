@@ -124,6 +124,10 @@ arboard = { workspace = true }
 uuid = { workspace = true }
 # Grapheme-cluster cursor motion (spec/tui/03 §4; editor-component.ts grapheme stepping) — user-approved.
 unicode-segmentation = { workspace = true }
+# ICU word segmentation (TUI-048) — pi segments with `Intl.Segmenter`, which runs UAX#29 PLUS a
+# dictionary/LSTM pass for unspaced scripts; `unicode-segmentation` above cannot reach pi's CJK
+# boundaries. Promoted from the ICU4X stack already present transitively via `idna_adapter`.
+icu_segmenter = { workspace = true }
 # JSON keybindings loader (spec/tui/07 §3.9; core/keybindings.ts:14-262) + theme-data hot-reload.
 serde_json = { workspace = true }
 # Already a transitive dep (via cyrup-session-svc) and previously a dev-dep only; promoted to a
