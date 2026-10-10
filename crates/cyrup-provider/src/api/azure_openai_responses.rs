@@ -14,8 +14,9 @@
 //! `AZURE_OPENAI_BASE_URL`, `AZURE_OPENAI_RESOURCE_NAME`, `AZURE_OPENAI_DEPLOYMENT_NAME_MAP`) — the
 //! `streamSimple` lowering path the [`crate::wire::WireProvider`] drives. The typed per-request
 //! `azureApiVersion`/`azureResourceName`/`azureBaseUrl`/`azureDeploymentName`/`reasoningSummary`
-//! overrides (Pi `AzureOpenAIResponsesOptions`) are part of the typed per-API options downcast
-//! surface (gap #11) and are not reachable through the unified `StreamOptions`.
+//! overrides (Pi `AzureOpenAIResponsesOptions`) travel as [`AzureOpenAiResponsesOptions`] in
+//! [`StreamOptions::api_options`](crate::StreamOptions::api_options), as the openai-responses
+//! adapter's typed options do (gap #11).
 
 use crate::HeaderMap;
 use crate::api::compat::{
@@ -23,8 +24,8 @@ use crate::api::compat::{
     thinking_level_key,
 };
 use crate::api::openai_responses::{
-    ConvertResponsesToolsOptions, convert_responses_messages, convert_responses_tools,
-    decode_stream,
+    ConvertResponsesToolsOptions, ReasoningSummary, convert_responses_messages,
+    convert_responses_tools, decode_stream,
 };
 use crate::api::{ApiImpl, EventSink};
 use crate::auth::AuthResult;
@@ -55,8 +56,9 @@ const DEFAULT_AZURE_API_VERSION: &str = "v1";
 const OPENAI_RESPONSES_MIN_OUTPUT_TOKENS: u64 = 16;
 
 /// Per-API typed options for the `azure-openai-responses` wire protocol (Pi
-/// `AzureOpenAIResponsesOptions`, azure-openai-responses.ts:52-59). Each per-request override wins
-/// over the corresponding `AZURE_OPENAI_*` provider-env value. Carried via
+/// `AzureOpenAIResponsesOptions`, `azure-openai-responses.ts:26-30` @f1b2e77f5, with the endpoint
+/// fields from `AzureEndpointOptions`). Each per-request endpoint override wins over the
+/// corresponding `AZURE_OPENAI_*` provider-env value. Carried via
 /// [`StreamOptions::api_options`](crate::StreamOptions::api_options); all fields default to `None`
 /// (env-only resolution, unchanged behavior).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -69,6 +71,11 @@ pub struct AzureOpenAiResponsesOptions {
     pub azure_base_url: Option<String>,
     /// Pi `azureDeploymentName` (azure-openai-responses.ts:58) — wins over the deployment-name map.
     pub azure_deployment_name: Option<String>,
+    /// PROV-150. Pi `reasoningSummary` (`azure-openai-responses.ts:29` @f1b2e77f5), the same type
+    /// as the openai-responses option. `None` and `Some(Null)` send `"auto"` when a reasoning
+    /// request is built (`summary: options?.reasoningSummary || "auto"`, `:232`); a non-null value
+    /// alone opens the reasoning arm at effort `"medium"` (`:224`).
+    pub reasoning_summary: Option<ReasoningSummary>,
 }
 
 /// Providers whose tool-call ids carry the `call_id|item_id` Responses shape (Pi
@@ -408,17 +415,31 @@ pub(crate) fn build_params(
         );
     }
 
+    // PROV-150. Pi `options?.reasoningSummary` as a truthy wire value: `None` and an explicit
+    // `null` are both falsy (`azure-openai-responses.ts:224`, `:232` @f1b2e77f5).
+    let summary_wire = opts
+        .azure_openai_responses_options()
+        .and_then(|o| o.reasoning_summary)
+        .and_then(ReasoningSummary::as_wire);
     if model.reasoning {
         // The unified reasoning level maps to Pi's `reasoningEffort` (clamped; `off` => the
-        // thinkingLevelMap.off branch). `reasoningSummary` is typed-options-only (gap #11), so the
-        // summary defaults to "auto" on the simple/env path.
+        // thinkingLevelMap.off branch). PROV-150: pi's `reasoningEffort = options?.reasoningEffort
+        // ?? (options?.reasoningSummary ? "medium" : undefined)` (`:224`), so a summary-only
+        // request opens this arm too, with the unmapped effort `"medium"` (`:227-229`), exactly
+        // as the openai-responses builder does since PROV-045.
         let clamped = clamp_thinking_level(model, opts.reasoning);
-        if clamped != ModelThinkingLevel::Off {
-            let key = thinking_level_key(clamped);
-            let effort = mapped_effort_or(model.thinking_level_map.as_ref(), clamped, key);
+        if clamped != ModelThinkingLevel::Off || summary_wire.is_some() {
+            let effort = if clamped == ModelThinkingLevel::Off {
+                "medium".to_string()
+            } else {
+                let key = thinking_level_key(clamped);
+                mapped_effort_or(model.thinking_level_map.as_ref(), clamped, key)
+            };
+            // Pi `summary: options?.reasoningSummary || "auto"` (`:232`).
+            let summary = summary_wire.unwrap_or("auto");
             obj.insert(
                 "reasoning".to_string(),
-                json!({ "effort": effort, "summary": "auto" }),
+                json!({ "effort": effort, "summary": summary }),
             );
             obj.insert(
                 "include".to_string(),
@@ -431,11 +452,15 @@ pub(crate) fn build_params(
     }
 
     // Last so model and request sampling parameters override named request fields (Pi's own
-    // comment, `azure-openai-responses.ts:242-246` @f1b2e77f5). AGENT-026 / CFG-104 — pi's level
-    // is `reasoningEffort ?? "off"` with the same summary-only `"medium"` fallback as
-    // openai-responses (`:224`); `reasoningSummary` is not reachable on this adapter's options
-    // here (see the reasoning block above), so the level is the unified one.
-    crate::api::openai_completions::apply_sampling_params(&mut obj, model, opts.reasoning, opts);
+    // comment, `azure-openai-responses.ts:242-246` @f1b2e77f5). AGENT-026 / CFG-104 / PROV-150 —
+    // pi's level is `reasoningEffort ?? "off"` (`:243`), with `reasoningEffort` computed OUTSIDE
+    // the `model.reasoning` gate (`:224`): a summary-only request resolves the `medium` entry.
+    let sampling_level = if opts.reasoning == ModelThinkingLevel::Off && summary_wire.is_some() {
+        ModelThinkingLevel::Medium
+    } else {
+        opts.reasoning
+    };
+    crate::api::openai_completions::apply_sampling_params(&mut obj, model, sampling_level, opts);
 
     Ok(Value::Object(obj))
 }

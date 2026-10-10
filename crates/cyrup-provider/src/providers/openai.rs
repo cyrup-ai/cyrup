@@ -105,7 +105,10 @@ mod tests {
         // since PROV-071 (43 models). It was 46 while the catalog was frozen at `b0c2a90e`: the
         // refresh added the three GPT-6 rows (astra/sol/luna) and retired six older ones, so the
         // count fell while the catalog got newer — which is why a count alone is never the claim.
-        assert_eq!(models.len(), 43);
+        // 44 since PROV-151's `gen-catalogs --only openai` added `gpt-6.1-sol` (pi `12c416e1a`,
+        // `missingOpenAiModels` in `generate-models.ts:2872-2883` @f1b2e77f5, appended at
+        // `:2974-2978`).
+        assert_eq!(models.len(), 44);
         assert!(models.iter().all(|m| m.api.as_str() == OPENAI_RESPONSES));
         assert!(models.iter().all(|m| m.provider.as_str() == "openai"));
         assert!(models.iter().all(|m| m.base_url == OPENAI_BASE_URL));
@@ -133,6 +136,10 @@ mod tests {
             "gpt-6-astra",
             "gpt-6-luna",
             "gpt-6-sol",
+            // PROV-151: pi `12c416e1a` puts it in `OPENAI_LONG_CONTEXT_PRICING_MODEL_IDS`
+            // (`generate-models.ts:403-415` @f1b2e77f5) and its row is built with
+            // `withOpenAiLongContextPricing` (`:2880`).
+            "gpt-6.1-sol",
         ];
         for id in long_context {
             let m = models
@@ -221,6 +228,77 @@ mod tests {
         assert_eq!(sol.cost.output, 20.0);
         assert_eq!(sol.cost.cache_read, 0.4);
         assert_eq!(sol.cost.cache_write, 5.0);
+    }
+
+    /// PROV-151: `gpt-6.1-sol` (pi `12c416e1a`). Every value is re-derived from the f1b2e77f5
+    /// generator rules, not from the JSON:
+    /// - `missingOpenAiModels` (`generate-models.ts:2872-2883`): `openai-responses`,
+    ///   `https://api.openai.com/v1`, text+image, `contextWindow` =
+    ///   `OPENAI_LONG_CONTEXT_INPUT_THRESHOLD` (272000, `:391`), `maxTokens` 128000;
+    /// - `OPENAI_STANDARD_COSTS` (`:452`) `{2, 10, 0.1, 2.5}` through
+    ///   `withOpenAiLongContextPricing` (`:427-439`): one tier above 272000 at 2x
+    ///   input/cacheRead/cacheWrite, 1.5x output;
+    /// - `applyThinkingLevelMetadata` (`:1038`, GPT-6 block `:1045-1064`): `off: null` (it rejects
+    ///   `reasoning.effort` `"none"`) and `minimal: null`; the `off: "none"` override at
+    ///   `:1068-1074` does not apply because `OPENAI_RESPONSES_NONE_REASONING_MODELS` (`:455-468`)
+    ///   does not list it;
+    /// - compat: `supportsStrictMode` (`:864-873`), `supportsOpenAIGrammarTools` (`gpt-<n>`,
+    ///   n >= 5, `:893-898`), `supportsToolSearch` + `supportsAdditionalTools`
+    ///   (`OPENAI_TOOL_SEARCH_MODEL_IDS` `:367-379`, applied at `:900-912`),
+    ///   `supportsMidConvoSystemMessages` (`:949-965`, same id set) and
+    ///   `supportsExplicitPromptCacheMode` (`cacheWrite > 0`, `:970-977`).
+    #[test]
+    fn gpt_6_1_sol_matches_the_upstream_rules() {
+        let models = openai_models();
+        let m = models
+            .iter()
+            .find(|m| m.id.as_str() == "gpt-6.1-sol")
+            .expect("gpt-6.1-sol");
+        assert_eq!(m.name, "GPT-6.1 Sol");
+        assert!(m.reasoning);
+        assert_eq!(
+            m.input,
+            vec![crate::model::Modality::Text, crate::model::Modality::Image]
+        );
+        assert_eq!(m.context_window, 272_000);
+        assert_eq!(m.max_tokens, 128_000);
+        assert_eq!(
+            (
+                m.cost.input,
+                m.cost.output,
+                m.cost.cache_read,
+                m.cost.cache_write
+            ),
+            (2.0, 10.0, 0.1, 2.5)
+        );
+        let tiers = m.cost.tiers.as_ref().expect("gpt-6.1-sol tiers");
+        assert_eq!(tiers.len(), 1);
+        let t = &tiers[0];
+        assert_eq!(t.input_tokens_above, 272_000);
+        assert_eq!(
+            (t.input, t.output, t.cache_read, t.cache_write),
+            (4.0, 15.0, 0.2, 5.0)
+        );
+
+        let map = m.thinking_level_map.as_ref().expect("thinkingLevelMap");
+        assert_eq!(
+            map.get("off"),
+            Some(&None),
+            "off is unsupported, not unmapped"
+        );
+        assert_eq!(map.get("minimal"), Some(&None));
+        for level in ["low", "medium", "high", "xhigh", "max"] {
+            assert_eq!(map.get(level), Some(&Some(level.to_string())), "{level}");
+        }
+        assert_eq!(map.len(), 7);
+
+        let c = m.compat.as_ref().expect("compat");
+        assert_eq!(c.supports_strict_mode, Some(true));
+        assert_eq!(c.supports_openai_grammar_tools, Some(true));
+        assert_eq!(c.supports_tool_search, Some(true));
+        assert_eq!(c.supports_additional_tools, Some(true));
+        assert_eq!(c.supports_mid_convo_system_messages, Some(true));
+        assert_eq!(c.supports_explicit_prompt_cache_mode, Some(true));
     }
 
     /// End-to-end: the catalog rate + the pricing function together bill a real long-context

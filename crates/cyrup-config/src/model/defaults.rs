@@ -6,10 +6,9 @@ use cyrup_provider::Model;
 /// Curated default model id per known provider (Pi `defaultModelPerProvider`,
 /// `model-resolver.ts:21-62` @f1b2e77f5, v1.1.0-11). Returns `None` for an unknown provider.
 ///
-/// CFG-102 — every row is pi's f1b2e77f5 value except three, each pinned by name in the test below:
-/// `meta` (`muse-spark-1.3`), a provider cyrup does not ship (PROV-080); `openai-codex`, still
-/// `gpt-5.5` because the embedded catalog does not carry pi's `gpt-6.1-sol` yet; and pi's `azure`
-/// key, which cyrup still spells `azure-openai-responses` (the rename is PROV-145).
+/// CFG-102 — every row is pi's f1b2e77f5 value except two, each pinned by name in the test below:
+/// `meta` (`muse-spark-1.3`), a provider cyrup does not ship (PROV-080); and pi's `azure` key,
+/// which cyrup still spells `azure-openai-responses` (the rename is PROV-145).
 pub fn default_model_per_provider(provider: &str) -> Option<&'static str> {
     let id = match provider {
         "amazon-bedrock" => "us.anthropic.claude-opus-4-6-v1",
@@ -17,10 +16,10 @@ pub fn default_model_per_provider(provider: &str) -> Option<&'static str> {
         "anthropic" => "claude-opus-4-8",
         "openai" => "gpt-5.5",
         "azure-openai-responses" => "gpt-5.4",
-        // DEFERRED (CFG-102 remainder): pi is `gpt-6.1-sol` (`model-resolver.ts:26`), which the
-        // embedded `catalog/openai-codex.json` does not carry yet; naming it here would make
-        // `first_default_or_first` skip codex entirely.
-        "openai-codex" => "gpt-5.5",
+        // pi `model-resolver.ts:26` @f1b2e77f5 (`12c416e1a`, v0.99.1: "add GPT-6.1 Sol and make it
+        // the Codex default"). The row is in `catalog/openai-codex.json` since CFG-102's
+        // `gen-catalogs --only openai-codex`.
+        "openai-codex" => "gpt-6.1-sol",
         // Resolved against the gateway's runtime catalog (`radius.rs`), so no embedded row gates it.
         "radius" => "balanced",
         // v1.0.1 (`49b9df489`): "NVIDIA no longer serves nvidia/nemotron-3-super-120b-a12b".
@@ -175,6 +174,11 @@ mod tests {
             Some("claude-opus-4-8")
         );
         assert_eq!(default_model_per_provider("openai"), Some("gpt-5.5"));
+        // CFG-102: pi `model-resolver.ts:26` @f1b2e77f5 (`12c416e1a`).
+        assert_eq!(
+            default_model_per_provider("openai-codex"),
+            Some("gpt-6.1-sol")
+        );
         assert_eq!(
             default_model_per_provider("amazon-bedrock"),
             Some("us.anthropic.claude-opus-4-6-v1")
@@ -341,18 +345,11 @@ mod tests {
         /// Rows cyrup does NOT carry at pi's value: `(provider, what cyrup carries)`, where `None`
         /// means no row at all.
         /// - `meta`: the Meta Muse provider (pi v0.86.1) is not shipped — area 01 (PROV-080).
-        /// - `openai-codex`: pi's `gpt-6.1-sol` (v1.0.0, `12c416e1a`) is not in the embedded
-        ///   `catalog/openai-codex.json`, so moving the arm now would make `first_default_or_first`
-        ///   skip codex entirely (the guard below would fire). The regen
-        ///   (`cargo run -p xtask -- gen-catalogs --only openai-codex`) adds a
-        ///   `supportsToolSearch` row that the exact list in
-        ///   `cyrup-provider/src/api/anthropic_messages/tests/catalog.rs`
-        ///   (`tool_search_is_confined_to_the_openai_responses_catalog`) must also gain, and that
-        ///   file is in flight on another branch. CFG-102 remainder.
         ///
-        /// Every other row is pi's own value.
-        const DEFERRED: &[(&str, Option<&str>)] =
-            &[("meta", None), ("openai-codex", Some("gpt-5.5"))];
+        /// Every other row is pi's own value. (`openai-codex` left this list in CFG-102: the scoped
+        /// `gen-catalogs --only openai-codex` put pi's `gpt-6.1-sol` in the embedded catalog, so
+        /// the guard below resolves it.)
+        const DEFERRED: &[(&str, Option<&str>)] = &[("meta", None)];
 
         let expected: Vec<(&str, &str)> = PI
             .iter()

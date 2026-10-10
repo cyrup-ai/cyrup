@@ -1225,6 +1225,49 @@
 		"type": "chat"
 	},
 	{
+		"id": "gpt-6.1-sol",
+		"name": "GPT-6.1 Sol",
+		"api": "azure-openai-responses",
+		"provider": "azure-openai-responses",
+		"baseUrl": "",
+		"reasoning": true,
+		"input": [
+			"text",
+			"image"
+		],
+		"cost": {
+			"input": 2,
+			"output": 10,
+			"cacheRead": 0.1,
+			"cacheWrite": 2.5
+		},
+		"contextWindow": 272000,
+		"maxTokens": 128000,
+		"thinkingLevelMap": {
+			"off": null,
+			"minimal": null,
+			"low": "low",
+			"medium": "medium",
+			"high": "high",
+			"xhigh": "xhigh",
+			"max": "max"
+		},
+		"compat": {
+			"supportsOpenAIGrammarTools": true
+		},
+		"inputLimits": {
+			"images": {
+				"resize": {
+					"maxWidth": 2000,
+					"maxHeight": 2000,
+					"maxBytes": 4718592,
+					"jpegQuality": 80
+				}
+			}
+		},
+		"type": "chat"
+	},
+	{
 		"id": "gpt-daybreak-blue-latest",
 		"name": "Daybreak Blue",
 		"api": "azure-openai-responses",

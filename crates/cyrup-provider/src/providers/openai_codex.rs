@@ -586,12 +586,13 @@ mod tests {
 
     // ------------------------------------------------------------------ catalog
 
-    /// pi `OPENAI_CODEX_MODELS` at `b0c2a90e`: 7 models, all on the `openai-codex-responses` wire
-    /// api and the ChatGPT backend base URL.
+    /// pi `OPENAI_CODEX_MODELS`: 9 models since CFG-102's `gen-catalogs --only openai-codex`
+    /// (pi.dev, `codexModels` in `generate-models.ts:3116ff` @f1b2e77f5), all on the
+    /// `openai-codex-responses` wire api and the ChatGPT backend base URL.
     #[test]
     fn catalog_parses_verbatim_with_expected_count() {
         let models = openai_codex_models();
-        assert_eq!(models.len(), 8);
+        assert_eq!(models.len(), 9);
         assert!(
             models
                 .iter()
@@ -612,6 +613,8 @@ mod tests {
             // v0.86.0 REMOVED `gpt-5.4` and `gpt-5.4-mini` from Codex (`packages/ai/CHANGELOG.md`)
             // and v0.87.1 added the GPT-6 trio. Both were invisible while the catalog was frozen at
             // `b0c2a90e` (PROV-071), so cyrup was offering two Codex models OpenAI had withdrawn.
+            // `gpt-6.1-sol` (pi `12c416e1a`, v0.99.1) arrived with CFG-102; pi.dev serves it last
+            // although `codexModels` lists it first, and the live generator keeps upstream order.
             vec![
                 "gpt-5.3-codex-spark",
                 "gpt-5.5",
@@ -621,6 +624,7 @@ mod tests {
                 "gpt-6-astra",
                 "gpt-6-luna",
                 "gpt-6-sol",
+                "gpt-6.1-sol",
             ]
         );
     }
@@ -764,6 +768,74 @@ mod tests {
         }
     }
 
+    /// CFG-102: pi's Codex default (`model-resolver.ts:26` @f1b2e77f5), added by `12c416e1a`
+    /// (v0.99.1). Every value is re-derived from the f1b2e77f5 generator rules, not the JSON:
+    /// - `codexModels` (`generate-models.ts:3116-3128`): `CODEX_CONTEXT` 272000,
+    ///   `CODEX_MAX_TOKENS` 128000, text+image, cost
+    ///   `withOpenAiLongContextPricing(OPENAI_STANDARD_COSTS["gpt-6.1-sol"])`;
+    /// - `OPENAI_STANDARD_COSTS` (`:452`) `{2, 10, 0.1, 2.5}`, and the tier (`:427-439`) doubles
+    ///   input/cacheRead/cacheWrite and multiplies output by 1.5 above 272000;
+    /// - `applyThinkingLevelMetadata` (function `:1038`, GPT-6 merge block `:1045-1065`):
+    ///   `off: null` — GPT-6.1 Sol rejects `reasoning.effort` `"none"` — and `minimal: null`,
+    ///   which the Codex `supportsOpenAiXhigh` merge (`:1146`, matcher `:578-586`) then turns
+    ///   into `"low"`;
+    /// - `applyOpenAIToolSearchMetadata` (`:901-913`) with `OPENAI_TOOL_SEARCH_MODEL_IDS`
+    ///   (`:367-379`, also the mid-conversation set) and `OPENAI_CODEX_ADDITIONAL_TOOLS_MODEL_IDS`
+    ///   (`:382-390`); `applyOpenAIGrammarToolCompatMetadata` for `gpt-<n>` with n >= 5.
+    #[test]
+    fn gpt_6_1_sol_matches_the_upstream_rules() {
+        let models = openai_codex_models();
+        let m = models
+            .iter()
+            .find(|m| m.id.as_str() == "gpt-6.1-sol")
+            .expect("gpt-6.1-sol");
+        assert_eq!(m.name, "GPT-6.1 Sol");
+        assert_eq!(m.input, vec![Modality::Text, Modality::Image]);
+        assert_eq!(m.context_window, 272_000);
+        assert_eq!(m.max_tokens, 128_000);
+        assert_eq!(
+            (
+                m.cost.input,
+                m.cost.output,
+                m.cost.cache_read,
+                m.cost.cache_write
+            ),
+            (2.0, 10.0, 0.1, 2.5)
+        );
+        let tiers = m.cost.tiers.as_ref().expect("gpt-6.1-sol tiers");
+        assert_eq!(tiers.len(), 1);
+        let t = &tiers[0];
+        assert_eq!(t.input_tokens_above, 272_000);
+        assert_eq!(
+            (t.input, t.output, t.cache_read, t.cache_write),
+            (4.0, 15.0, 0.2, 5.0)
+        );
+
+        let map = m.thinking_level_map.as_ref().expect("thinkingLevelMap");
+        assert_eq!(
+            map.get("off"),
+            Some(&None),
+            "off is unsupported, not unmapped"
+        );
+        for (level, effort) in [
+            ("minimal", "low"),
+            ("low", "low"),
+            ("medium", "medium"),
+            ("high", "high"),
+            ("xhigh", "xhigh"),
+            ("max", "max"),
+        ] {
+            assert_eq!(map.get(level), Some(&Some(effort.to_string())), "{level}");
+        }
+        assert_eq!(map.len(), 7);
+
+        let c = m.compat.as_ref().expect("compat");
+        assert_eq!(c.supports_openai_grammar_tools, Some(true));
+        assert_eq!(c.supports_tool_search, Some(true));
+        assert_eq!(c.supports_additional_tools, Some(true));
+        assert_eq!(c.supports_mid_convo_system_messages, Some(true));
+    }
+
     /// `gpt-5.3-codex-spark` is the MIRROR row: the ONLY model without `supportsToolSearch`, the
     /// only text-only one, and the only one with neither a pricing tier nor the 372k window. So the
     /// assertions above pin real per-row data rather than a uniform catalog.
@@ -780,7 +852,7 @@ mod tests {
         assert_eq!(spark.context_window, 128_000);
         // It used to be the row with NO compat block at all. It has one now —
         // `{"supportsOpenAIGrammarTools": true}` — and that is the whole of it: the flags the other
-        // seven rows carry (`supportsToolSearch`, `supportsAdditionalTools`,
+        // eight rows carry (`supportsToolSearch`, `supportsAdditionalTools`,
         // `supportsMidConvoSystemMessages`) are still absent here, which is what made it the odd
         // row out and still does.
         let compat = spark
@@ -793,7 +865,8 @@ mod tests {
         assert_eq!(compat.supports_mid_convo_system_messages, None);
 
         // SUBA-153: the catalog's `supportsAdditionalTools` survives the load (serde dropped the key
-        // before the field existed). Six rows carry it; `gpt-5.5` and the spark row do not.
+        // before the field existed). Seven rows carry it; `gpt-5.5` and the spark row do not
+        // (`OPENAI_CODEX_ADDITIONAL_TOOLS_MODEL_IDS`, `generate-models.ts:382-390` @f1b2e77f5).
         let mut additional: Vec<&str> = models
             .iter()
             .filter(|m| m.compat.as_ref().and_then(|c| c.supports_additional_tools) == Some(true))
@@ -808,7 +881,8 @@ mod tests {
                 "gpt-5.6-terra",
                 "gpt-6-astra",
                 "gpt-6-luna",
-                "gpt-6-sol"
+                "gpt-6-sol",
+                "gpt-6.1-sol"
             ]
         );
 
@@ -872,7 +946,7 @@ mod tests {
         // PROV-118 (e) — `"OpenAI Codex (legacy)"` as of v1.0.0 (`openai-codex.ts:10`); this
         // asserted `"OpenAI Codex"`, the v0.87.1 name.
         assert_eq!(provider.name(), "OpenAI Codex (legacy)");
-        assert_eq!(provider.models().len(), 8);
+        assert_eq!(provider.models().len(), 9);
 
         let auth = provider.provider_auth().expect("codex declares auth");
         assert!(auth.oauth.is_some());

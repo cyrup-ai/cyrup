@@ -90,8 +90,9 @@ mod tests {
         let models = azure_openai_responses_models();
         // pi `azure-openai-responses.models.ts`, live since PROV-071 (43). It is a DERIVED clone
         // of the `openai` catalog (`ai/scripts/generate-models.ts` copies the four scalar rates and
-        // drops `tiers`), so it tracks that catalog's 46 -> 43 row for row.
-        assert_eq!(models.len(), 43);
+        // drops `tiers`), so it tracks that catalog's 46 -> 43 row for row. 44 since PROV-151 added
+        // the `gpt-6.1-sol` clone by hand: pi.dev no longer serves this stem (`PROV-145`).
+        assert_eq!(models.len(), 44);
         assert!(
             models
                 .iter()
@@ -166,6 +167,57 @@ mod tests {
         }
     }
 
+    /// PROV-151: the `gpt-6.1-sol` clone, added by hand because pi.dev serves this catalog as
+    /// `azure` now (`PROV-145`). Re-derived from the f1b2e77f5 generator, not from the JSON: the
+    /// Azure map (`generate-models.ts:3308-3323`) clones the `openai` row (`:2872-2883`) with the
+    /// four scalar rates of `OPENAI_STANDARD_COSTS["gpt-6.1-sol"]` (`:452`) and no `tiers`,
+    /// `baseUrl` `""`, and `contextWindow` 272000 (no `AZURE_CONTEXT_WINDOW_OVERRIDES` entry,
+    /// `:3301-3307`). `applyThinkingLevelMetadata` (`:1045-1064`) gives it `off: null`. Of the
+    /// compat passes only `applyOpenAIGrammarToolCompatMetadata` (`:893-898`, `azure` is in
+    /// `OPENAI_GRAMMAR_TOOL_PROVIDERS`) applies: tool search, strict mode, mid-conversation system
+    /// messages and explicit prompt-cache mode are all scoped to `provider === "openai"` (or
+    /// Codex).
+    #[test]
+    fn the_gpt_6_1_sol_clone_matches_the_upstream_rules() {
+        let models = azure_openai_responses_models();
+        let m = models
+            .iter()
+            .find(|m| m.id.as_str() == "gpt-6.1-sol")
+            .expect("gpt-6.1-sol");
+        assert_eq!(m.name, "GPT-6.1 Sol");
+        assert!(m.reasoning);
+        assert_eq!(m.base_url, "");
+        assert_eq!(m.context_window, 272_000);
+        assert_eq!(m.max_tokens, 128_000);
+        assert_eq!(
+            (
+                m.cost.input,
+                m.cost.output,
+                m.cost.cache_read,
+                m.cost.cache_write
+            ),
+            (2.0, 10.0, 0.1, 2.5)
+        );
+        assert!(m.cost.tiers.is_none(), "the Azure clone drops tiers");
+        let map = m.thinking_level_map.as_ref().expect("thinkingLevelMap");
+        assert_eq!(
+            map.get("off"),
+            Some(&None),
+            "off is unsupported, not unmapped"
+        );
+        assert_eq!(map.get("minimal"), Some(&None));
+        for level in ["low", "medium", "high", "xhigh", "max"] {
+            assert_eq!(map.get(level), Some(&Some(level.to_string())), "{level}");
+        }
+        assert_eq!(map.len(), 7);
+        let c = m.compat.as_ref().expect("compat");
+        assert_eq!(c.supports_openai_grammar_tools, Some(true));
+        assert_eq!(c.supports_tool_search, None);
+        assert_eq!(c.supports_strict_mode, None);
+        assert_eq!(c.supports_mid_convo_system_messages, None);
+        assert_eq!(c.supports_explicit_prompt_cache_mode, None);
+    }
+
     #[test]
     fn env_mapping_present() {
         let vars =
@@ -178,7 +230,7 @@ mod tests {
         let p = azure_openai_responses_provider();
         assert_eq!(p.id(), &ProviderId::from("azure-openai-responses"));
         assert_eq!(p.name(), "Azure OpenAI");
-        assert_eq!(p.models().len(), 43);
+        assert_eq!(p.models().len(), 44);
     }
 
     #[tokio::test]
