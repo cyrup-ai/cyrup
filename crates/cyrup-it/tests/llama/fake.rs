@@ -413,7 +413,6 @@ async fn serve_chat_stream(socket: &mut TcpStream, reply: &str) {
 /// until the golden moves with it.
 mod drift_guard {
     use cyrup_llama_cpp_wire::golden;
-    use serde_json::Value;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use super::FakeLlama;
@@ -482,30 +481,18 @@ mod drift_guard {
             answer(200, golden::APPLY_TEMPLATE_USER_HI)
         );
 
-        // The default script ranks `B` (-0.3) over `A` (-1.5).
-        let (status, body) = raw(
-            &url,
-            "POST",
-            "/completion",
-            r#"{"model":"qwen","prompt":"p","n_predict":1,"n_probs":2,"post_sampling_probs":false}"#,
-        )
-        .await;
-        assert_eq!(status, 200, "{body}");
-        let body: Value = serde_json::from_str(&body).unwrap();
-        let keys: Vec<&str> = body
-            .as_object()
-            .unwrap()
-            .keys()
-            .map(String::as_str)
-            .collect();
+        // The default script ranks `B` (-0.3) over `A` (-1.5). EVERY byte of the answer is pinned,
+        // not only its key order, so a mutated value (`stop`, `stop_type`, `tokens_cached`, ...)
+        // fails here too.
         assert_eq!(
-            keys,
-            golden::COMPLETION_KEYS,
-            "every top-level key, in order"
-        );
-        assert_eq!(
-            body["completion_probabilities"].to_string(),
-            golden::COMPLETION_PROBABILITIES_B_OVER_A
+            raw(
+                &url,
+                "POST",
+                "/completion",
+                r#"{"model":"qwen","prompt":"p","n_predict":1,"n_probs":2,"post_sampling_probs":false}"#,
+            )
+            .await,
+            answer(200, golden::COMPLETION_QWEN_P_B_OVER_A)
         );
     }
 }

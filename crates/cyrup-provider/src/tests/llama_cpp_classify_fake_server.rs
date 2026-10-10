@@ -5,6 +5,10 @@
 //! endpoints the api uses (`/tokenize`, `/apply-template`, `/completion`) over a raw loopback
 //! `TcpListener` on `127.0.0.1:0`, records every request, and lets a test intercept any request to
 //! answer it differently (an error status, a malformed body, a hang).
+//!
+//! Its normal answers come from the workspace's one llama.cpp wire definition,
+//! `cyrup_llama_cpp_wire` (EXT-108), which the other two llama-server fakes answer from too; the
+//! `drift_guard` module below pins the bytes it writes.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -15,6 +19,8 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use cyrup_llama_cpp_wire::classify::{self, TokenLogprob};
+use cyrup_llama_cpp_wire::router;
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -326,26 +332,39 @@ async fn read_request(stream: &mut TcpStream) -> Option<Recorded> {
     })
 }
 
-/// The normal answer of each endpoint (test:54-76).
+/// The normal answer of each endpoint (test:54-76), built from the one llama.cpp wire definition,
+/// `cyrup_llama_cpp_wire::classify` (EXT-108), so this fake sends what a real `llama-server` sends
+/// and cannot drift from the other two fakes; [`drift_guard`] pins its bytes.
 fn respond(behavior: &Behavior, request: &Recorded) -> Reply {
     match request.path.as_str() {
         "/tokenize" => {
             let content = request.body["content"].as_str().unwrap_or_default();
-            let ids = match &behavior.tokenize {
-                Some(tokenize) => tokenize(content),
-                None => char_tokens(content),
-            };
-            let tokens: Vec<Value> = ids
+            let ids: Vec<i64> = tokens_of(behavior, content)
                 .into_iter()
-                .map(|id| {
-                    if behavior.token_objects {
-                        json!({ "id": id })
-                    } else {
-                        json!(id)
-                    }
-                })
+                .map(i64::from)
                 .collect();
-            Reply::Json(json!({ "tokens": tokens }))
+            if behavior.token_objects {
+                // The object form a real server sends (`with_pieces: true`): `{id, piece}`. This
+                // vocabulary has no text per id, so the piece is the id's character.
+                let pieces: Vec<(i64, String)> = ids
+                    .iter()
+                    .map(|id| {
+                        let piece = u32::try_from(*id)
+                            .ok()
+                            .and_then(char::from_u32)
+                            .map(String::from)
+                            .unwrap_or_default();
+                        (*id, piece)
+                    })
+                    .collect();
+                let pieces: Vec<(i64, &str)> = pieces
+                    .iter()
+                    .map(|(id, piece)| (*id, piece.as_str()))
+                    .collect();
+                Reply::Json(classify::tokenize_with_pieces(&pieces))
+            } else {
+                Reply::Json(classify::tokenize(&ids))
+            }
         }
         "/apply-template" => {
             let messages: Vec<(String, String)> = request.body["messages"]
@@ -372,7 +391,7 @@ fn respond(behavior: &Behavior, request: &Recorded) -> Reply {
                     format!("{rendered}<|assistant|>\n")
                 }
             };
-            Reply::Json(json!({ "prompt": prompt }))
+            Reply::Json(classify::apply_template(&prompt))
         }
         "/completion" => {
             let prompt = request.body["prompt"].as_str().unwrap_or_default();
@@ -381,23 +400,40 @@ fn respond(behavior: &Behavior, request: &Recorded) -> Reply {
                 Some(next) => next(prompt, depth),
                 None => vec![("A".to_string(), -0.1), ("B".to_string(), -2.5)],
             };
-            let top_logprobs: Vec<Value> = next
+            // A token's id is its first character's code, the vocabulary `/tokenize` uses.
+            let top: Vec<TokenLogprob<'_>> = next
                 .iter()
-                .map(|(token, logprob)| {
-                    json!({
-                        "id": token.chars().next().map(u32::from),
-                        "token": token,
-                        "bytes": [],
-                        "logprob": logprob,
-                    })
+                .map(|(token, logprob)| TokenLogprob {
+                    id: token.chars().next().map_or(0, |c| i64::from(u32::from(c))),
+                    token,
+                    logprob: *logprob,
                 })
                 .collect();
-            Reply::Json(json!({
-                "content": "A",
-                "completion_probabilities": [{ "id": 65, "token": "A", "top_logprobs": top_logprobs }],
-            }))
+            // At `temperature: 0` (the api sends it) the sampled token is the top candidate; a real
+            // server always samples one, so a script with no candidates is a broken test.
+            let sampled = *top
+                .first()
+                .expect("a `next` script names at least one candidate");
+            Reply::Json(classify::completion(
+                request.body["model"].as_str().unwrap_or_default(),
+                prompt,
+                tokens_of(behavior, prompt).len() as u64,
+                sampled,
+                &top,
+            ))
         }
-        _ => Reply::status(404, "not found"),
+        _ => {
+            let (status, body) = router::file_not_found();
+            Reply::status(status, &body.to_string())
+        }
+    }
+}
+
+/// The token ids of `content` under this server's tokenizer.
+fn tokens_of(behavior: &Behavior, content: &str) -> Vec<u32> {
+    match &behavior.tokenize {
+        Some(tokenize) => tokenize(content),
+        None => char_tokens(content),
     }
 }
 
@@ -519,5 +555,100 @@ pub(super) fn ticket_context() -> ClassifierContext {
         ]
         .into_iter()
         .collect(),
+    }
+}
+
+// -------------------------------------------------------------------------------- drift guard --
+
+/// EXT-108's DRIFT GUARD for this fake: what [`FakeServer`] writes on a real socket is, byte for
+/// byte, the pinned llama.cpp answer in `cyrup_llama_cpp_wire::golden`. The fake answers from
+/// `cyrup_llama_cpp_wire::{classify, router}`, so a change to any definition it serves — both
+/// `/tokenize` forms, `/apply-template`, every value of `/completion`, the unknown-route 404 —
+/// fails this test until the golden moves with it, on purpose.
+mod drift_guard {
+    use cyrup_llama_cpp_wire::golden;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    use super::{Behavior, FakeServer};
+
+    /// One raw HTTP/1.1 exchange; the fake closes every connection, so the close ends the body.
+    async fn raw(server: &FakeServer, method: &str, path: &str, body: &str) -> (u16, String) {
+        let addr = server
+            .base_url
+            .trim_start_matches("http://")
+            .trim_end_matches("/v1");
+        let mut socket = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let request = format!(
+            "{method} {path} HTTP/1.1\r\nhost: {addr}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        socket.write_all(request.as_bytes()).await.unwrap();
+        let mut answer = String::new();
+        socket.read_to_string(&mut answer).await.unwrap();
+        let (head, body) = answer.split_once("\r\n\r\n").unwrap();
+        (
+            head.split(' ').nth(1).unwrap().parse().unwrap(),
+            body.to_string(),
+        )
+    }
+
+    #[tokio::test]
+    async fn the_fake_writes_the_golden_bytes() {
+        let answer = |status: u16, body: &str| (status, body.to_string());
+        let server = FakeServer::start().await;
+        assert_eq!(
+            raw(&server, "GET", "/no-such-route", "").await,
+            answer(404, golden::FILE_NOT_FOUND),
+            "an unknown route is llama.cpp's own 404 literal (server-http.cpp:199-212 @b11436)"
+        );
+        assert_eq!(
+            raw(
+                &server,
+                "POST",
+                "/tokenize",
+                r#"{"model":"qwen","content":"AB","add_special":false,"parse_special":false}"#
+            )
+            .await,
+            answer(200, golden::TOKENIZE_65_66)
+        );
+        assert_eq!(
+            raw(
+                &server,
+                "POST",
+                "/apply-template",
+                r#"{"model":"qwen","messages":[{"role":"user","content":"hi"}]}"#
+            )
+            .await,
+            answer(200, golden::APPLY_TEMPLATE_USER_HI)
+        );
+
+        let objects = FakeServer::with(Behavior::default().token_objects()).await;
+        assert_eq!(
+            raw(
+                &objects,
+                "POST",
+                "/tokenize",
+                r#"{"model":"qwen","content":"A"}"#
+            )
+            .await,
+            answer(200, golden::TOKENIZE_WITH_PIECES_65_A),
+            "the object-token form is the real `with_pieces` shape"
+        );
+
+        let ranked = FakeServer::with(
+            Behavior::default().next(|_, _| vec![("B".to_string(), -0.3), ("A".to_string(), -1.5)]),
+        )
+        .await;
+        assert_eq!(
+            raw(
+                &ranked,
+                "POST",
+                "/completion",
+                r#"{"model":"qwen","prompt":"p","n_predict":1,"n_probs":2,"post_sampling_probs":false,"cache_prompt":true,"temperature":0}"#
+            )
+            .await,
+            answer(200, golden::COMPLETION_QWEN_P_B_OVER_A),
+            "every byte of the /completion answer"
+        );
     }
 }

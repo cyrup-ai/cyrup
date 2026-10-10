@@ -1922,6 +1922,7 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "cyrup-core",
+ "cyrup-llama-cpp-wire",
  "dashmap",
  "futures",
  "futures-core",

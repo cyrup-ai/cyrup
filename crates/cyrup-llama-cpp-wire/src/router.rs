@@ -53,9 +53,9 @@ pub fn not_found(message: &str) -> (u16, Value) {
 ///
 /// **Every llama-server fake in this workspace had this wrong.** Two answered
 /// `{"error":{"message":"not found"}}` (`cyrup-llama/src/tests/fake_server.rs`, fixed by EXT-100;
-/// `cyrup-it/tests/llama/fake.rs`, fixed by EXT-108) and the third answers a plain-text
-/// `not found` (`cyrup-provider/src/tests/llama_cpp_classify_fake_server.rs`, not yet moved onto
-/// this crate). Nothing asserted on the text, so no test was lying, but it is exactly the drift
+/// `cyrup-it/tests/llama/fake.rs`, fixed by EXT-108) and the third answered a plain-text
+/// `not found` (`cyrup-provider/src/tests/llama_cpp_classify_fake_server.rs`, fixed by EXT-108).
+/// Nothing asserted on the text, so no test was lying, but it is exactly the drift
 /// fakes written from one reading of the client produce: one wrong reading, every fake wrong,
 /// every test green.
 pub fn file_not_found() -> (u16, Value) {

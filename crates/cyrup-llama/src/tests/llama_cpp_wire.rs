@@ -4,8 +4,9 @@
 //! The wire itself is no longer defined here. EXT-108 lifted it, unchanged in shape and with every
 //! citation re-derived against llama.cpp `b11436`, into the test-only crate `cyrup-llama-cpp-wire`
 //! (`crates/cyrup-llama-cpp-wire/src/router.rs`), so the OTHER fakes in this workspace — the seam
-//! suite's (`cyrup-it/tests/llama/fake.rs`) and the classifier api's — can answer from the same
-//! definition instead of keeping copies. Read that crate's docs for the pin, the floor and why it
+//! suite's (`cyrup-it/tests/llama/fake.rs`) and the classifier api's
+//! (`cyrup-provider/src/tests/llama_cpp_classify_fake_server.rs`) — answer from the same definition
+//! instead of keeping copies. Read that crate's docs for the pin, the floor and why it
 //! is a crate of its own.
 //!
 //! The glob re-export keeps the names this module and [`super::fake_server`] have always used.

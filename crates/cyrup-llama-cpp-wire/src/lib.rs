@@ -18,19 +18,21 @@
 //!   [`router`].
 //! * `cyrup-it/tests/llama/fake.rs` — both halves behind one port, for the seam tests. Answers from
 //!   [`router`] and [`classify`].
-//! * `cyrup-provider/src/tests/llama_cpp_classify_fake_server.rs` — the classifier api. NOT yet
-//!   moved onto this crate (EXT-108 is PARTIAL on it; see the ledger).
+//! * `cyrup-provider/src/tests/llama_cpp_classify_fake_server.rs` — the classifier api. Answers
+//!   from [`classify`] and [`router::file_not_found`].
 //!
-//! Each fake that answers from here carries a drift guard comparing what it puts on a real socket
-//! with [`golden`].
+//! Each fake carries a drift guard comparing what it puts on a real socket with [`golden`].
 //!
 //! # Why a crate of its own
 //!
 //! The definition has to be reachable from all three fakes. `cyrup-llama` depends on
-//! `cyrup-provider` (so the definition cannot live in `cyrup-llama` and serve the provider's fake
-//! without a dev-dependency cycle), and `cyrup-it` has no `[dependencies]` at all. A leaf crate with
-//! one dependency (`serde_json`) is reachable from every one of them with no cycle and puts no test
-//! data into any shipping crate, not even behind a feature.
+//! `cyrup-provider`, so a definition in `cyrup-llama` could serve the provider's fake only through
+//! a dev-dependency back-edge, which Cargo accepts but which builds a second copy of
+//! `cyrup-provider` for the provider's tests. `cyrup-it` has no `[dependencies]` at all. EXT-108
+//! first proposed `cyrup-provider` behind a test-only feature; that works too, but puts test data
+//! and a feature switch into a shipping crate. A leaf crate with one dependency (`serde_json`),
+//! taken only through `[dev-dependencies]`, is reachable from every fake with no back-edge and
+//! keeps the data out of every shipping crate.
 //!
 //! # Upstream pin
 //!
@@ -132,6 +134,14 @@ mod tests {
             classify::completion_probabilities(B, &[B, A]).to_string(),
             golden::COMPLETION_PROBABILITIES_B_OVER_A
         );
+        assert_eq!(
+            classify::completion("qwen", "p", 1, B, &[B, A]).to_string(),
+            golden::COMPLETION_QWEN_P_B_OVER_A
+        );
+        assert_eq!(
+            classify::tokenize_with_pieces(&[(65, "A")]).to_string(),
+            golden::TOKENIZE_WITH_PIECES_65_A
+        );
     }
 
     /// The whole `/completion` answer carries llama.cpp's top-level keys in llama.cpp's order, and
@@ -162,7 +172,7 @@ mod tests {
     fn tokenize_with_pieces_is_id_and_piece() {
         assert_eq!(
             classify::tokenize_with_pieces(&[(65, "A")]).to_string(),
-            r#"{"tokens":[{"id":65,"piece":"A"}]}"#
+            golden::TOKENIZE_WITH_PIECES_65_A
         );
     }
 }

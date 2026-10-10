@@ -86,6 +86,25 @@ pub const COMPLETION_PROBABILITIES_B_OVER_A: &str = concat!(
     r#"{"id":65,"token":"A","bytes":[65],"logprob":-1.5}]}]"#,
 );
 
+/// [`crate::classify::completion`]`("qwen", "p", 1, B, &[B, A])` with `B` and `A` as in
+/// [`COMPLETION_PROBABILITIES_B_OVER_A`]: EVERY byte of the `/completion` answer, so a change to any
+/// value it serves (`stop`, `stop_type`, `has_new_line`, `tokens_cached`, ...) fails, not only a
+/// change of key order (`to_json_non_oaicompat`, `server-task.cpp:340-363` @b11436).
+pub const COMPLETION_QWEN_P_B_OVER_A: &str = concat!(
+    r#"{"index":0,"content":"B","tokens":[],"id_slot":0,"stop":true,"model":"qwen","#,
+    r#""tokens_predicted":1,"tokens_evaluated":1,"generation_settings":{},"prompt":"p","#,
+    r#""has_new_line":false,"truncated":false,"stop_type":"limit","stopping_word":"","#,
+    r#""tokens_cached":1,"timings":{},"completion_probabilities":"#,
+    r#"[{"id":66,"token":"B","bytes":[66],"logprob":-0.3,"top_logprobs":["#,
+    r#"{"id":66,"token":"B","bytes":[66],"logprob":-0.3},"#,
+    r#"{"id":65,"token":"A","bytes":[65],"logprob":-1.5}]}]}"#,
+);
+
+/// [`crate::classify::tokenize_with_pieces`]`(&[(65, "A")])`, the `with_pieces: true` form
+/// (`server-context.cpp:5451-5470` @b11436; a live b11436 child answered
+/// `{"tokens":[{"id":447,"piece":"A"},...]}` in this key order).
+pub const TOKENIZE_WITH_PIECES_65_A: &str = r#"{"tokens":[{"id":65,"piece":"A"}]}"#;
+
 /// The top-level keys of [`crate::classify::completion`], in llama.cpp's order
 /// (`to_json_non_oaicompat`, `server-task.cpp:340-361`).
 pub const COMPLETION_KEYS: [&str; 17] = [

@@ -1,8 +1,8 @@
 //! The CLASSIFIER wire: the three endpoints `cyrup_provider::api::llama_cpp_classify` drives,
 //! `POST /tokenize`, `POST /apply-template` and `POST /completion` with `n_probs` (registered at
-//! `tools/server/server.cpp:270`, `:290` and `:292` @b11436; in router mode all three are
-//! `proxy_post` to the child named by the body's `model`, `:240-244`, so the child's answer
-//! reaches the client verbatim).
+//! `tools/server/server.cpp:290`, `:292` and `:270` respectively @b11436; in router mode all three
+//! are `proxy_post` to the child named by the body's `model`, `:242`, `:244` and `:229`, so the
+//! child's answer reaches the client verbatim).
 //!
 //! What the api reads, and what these shapes therefore have to get right: `tokens[]` as bare ids
 //! or `{id}` objects (`llama_cpp_classify.rs` `token_ids`), `prompt` (`render_prompt`), and
@@ -98,7 +98,17 @@ pub fn completion_probabilities(sampled: TokenLogprob<'_>, top: &[TokenLogprob<'
 ///
 /// At `temperature: 0` (which the api sends) the sampled token is the top candidate, so `content`
 /// is `sampled.token`; one predicted token stops on the `n_predict` limit, so `stop_type` is
-/// `"limit"` (`stop_type_to_str`, `:251-258`).
+/// `"limit"` (`stop_type_to_str`, `:251-258`). `tokens` is `generated_tokens`, empty unless the
+/// request set `return_tokens` (`server-context.cpp:2238-2241`). `tokens_evaluated` is the
+/// prompt's token count (`n_prompt_tokens = slot.task->n_tokens()`, `:2249`) and `tokens_cached`
+/// is the slot's cached prompt (`slot.prompt.n_tokens()`, `:2251`), which after a one-token
+/// prediction holds exactly the prompt, so the two are equal. `prompt` is the prompt's tokens
+/// detokenized with special tokens (`:2244`): a fake has no tokenizer and echoes the text, which
+/// differs only by a BOS the model adds. A live b11436 child (stories260K, `n_predict: 1`,
+/// `n_probs: 2`, `post_sampling_probs: false`) answered these keys in this order, with
+/// `tokens: []`, `stop: true`, `has_new_line: false`, `truncated: false`, `stop_type: "limit"`,
+/// `stopping_word: ""` and `tokens_cached == tokens_evaluated`. Pinned in full by
+/// [`crate::golden::COMPLETION_QWEN_P_B_OVER_A`].
 pub fn completion(
     model: &str,
     prompt: &str,
@@ -121,7 +131,7 @@ pub fn completion(
         "truncated": false,
         "stop_type": "limit",
         "stopping_word": "",
-        "tokens_cached": 0,
+        "tokens_cached": prompt_tokens,
         "timings": {},
         "completion_probabilities": completion_probabilities(sampled, top),
     })
