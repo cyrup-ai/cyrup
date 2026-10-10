@@ -1383,6 +1383,78 @@ mod tests {
         );
     }
 
+    /// EXT-092 — every native `attach_native_extensions` loads has a DECIDED hidden state, and it
+    /// is the one pi's load path gives its counterpart.
+    ///
+    /// pi infers hidden from the load path: `extension.hidden = true` only in the `builtin:<name>`
+    /// branch of `loadExtensionPaths` (`core/resource-loader.ts:741` @f1b2e77f5), and the four
+    /// `builtin: true` entries are `llama.cpp`, `codemode`, `tool-search` and `mcp`
+    /// (`extensions/index.ts:7-13`). Everything else reaches pi as a file or package path and is
+    /// listed. cyrup has no `builtin:<name>` path tier — every compiled-in native, built-in
+    /// stand-in or package port alike, goes through the one `with_native_extension` door — so the
+    /// native declares `NativeExtension::is_hidden` and THIS table is what holds the declaration
+    /// to pi. A native added to `attach_native_extensions` without a row here fails the test, which
+    /// forces the decision; a stand-in for a pi built-in that forgets the override is listed and
+    /// fails it too.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn every_attached_native_is_hidden_exactly_when_pi_loads_its_counterpart_as_a_builtin() {
+        // (id, hidden, pi counterpart). `true` only for a stand-in for a `builtin: true` entry.
+        let decided: &[(&str, bool, &str)] = &[
+            (LLAMA_ID, true, "builtin:llama.cpp"),
+            (
+                cyrup_codemode_runtime::EXTENSION_ID,
+                true,
+                "builtin:codemode",
+            ),
+            (cyrup_tool_search::EXTENSION_ID, true, "builtin:tool-search"),
+            // A port of the `pi-mcp-adapter` package (MCP-587), loaded by package path and listed;
+            // pi's own `builtin:mcp` is not what this is.
+            (MCP_ID, false, "package pi-mcp-adapter"),
+            ("cyrup-flux", false, "cyrup's flux pipeline; no pi built-in"),
+            (cyrup_intercom::EXTENSION_ID, false, "package pi-intercom"),
+            (
+                cyrup_ext_subagents::extension::EXTENSION_ID,
+                false,
+                "package pi-subagents",
+            ),
+            (
+                cyrup_ext_subagents::prompt_runtime::PROMPT_RUNTIME_EXTENSION_ID,
+                false,
+                "pi-subagents' subagent-prompt-runtime.ts, loaded by path",
+            ),
+            (
+                cyrup_permission_system::extension::EXTENSION_ID,
+                false,
+                "package pi-permission-system",
+            ),
+            (
+                crate::router_example::EXTENSION_ID,
+                false,
+                "examples/extensions/jev-router.ts, loaded by path",
+            ),
+        ];
+        let Loaded { loaded, listed } = session_through_build_factory(true, false).await;
+        for id in &loaded {
+            let Some((_, hidden, pi)) = decided.iter().find(|(d, ..)| d == id) else {
+                panic!(
+                    "native {id:?} is attached but has no hidden decision here: decide whether pi \
+                     loads its counterpart as a `builtin:` (hidden) and add a row; loaded {loaded:?}"
+                );
+            };
+            assert_eq!(
+                !listed.contains(id),
+                *hidden,
+                "{id} (pi: {pi}) must be {} the startup [Extensions] list; listed {listed:?}",
+                if *hidden { "absent from" } else { "in" }
+            );
+        }
+        for (id, hidden, _) in decided {
+            if *hidden {
+                position(&loaded, id);
+            }
+        }
+    }
+
     /// `--no-extensions` drops it: pi's `builtin:llama.cpp` is a path in the tier the flag collapses
     /// (`package-manager.ts:972-974`, `resource-loader.ts:569-571`), which cyrup spells
     /// `is_ambient() -> true` (builder.rs:2647-2657). The same flag-off session keeps it, so this

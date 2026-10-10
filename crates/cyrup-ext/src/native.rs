@@ -900,7 +900,11 @@ pub trait NativeExtension: Send + Sync {
     /// hidden from the startup Extensions list" (`core/extensions/types.ts:2015`). Hidden is a
     /// property of HOW the extension was loaded upstream; a compiled-in cyrup native has one load
     /// path, so the native declares it. Default `false`: an embedder-supplied inline factory is
-    /// listed (`<inline>`), as in pi.
+    /// listed (`<inline>`), as in pi. EXT-092: a native standing in for one of pi's `builtin: true`
+    /// entries MUST return `true`; the binary's test
+    /// `every_attached_native_is_hidden_exactly_when_pi_loads_its_counterpart_as_a_builtin`
+    /// (`crates/cyrup/src/session_launch.rs`) holds every native `attach_native_extensions` loads
+    /// to that rule and fails on a native it has no decision for.
     fn is_hidden(&self) -> bool {
         false
     }
