@@ -11,8 +11,14 @@
 //! and the `CompletionChunk` streaming decoder (string / `text` / `thinking` content chunks +
 //! incremental tool calls).
 //!
-//! Wire JSON uses Mistral's own field names (camelCase: `maxTokens`, `toolChoice`, `promptMode`,
-//! `reasoningEffort`, `toolCalls`, `toolCallId`).
+//! Wire keys (PROV-152). Mistral's wire is snake_case. The payload is BUILT in the old
+//! `@mistralai/mistralai` SDK's camelCase (`maxTokens`, `toolChoice`, `promptMode`,
+//! `reasoningEffort`, `promptCacheKey`, `toolCalls`, `toolCallId`, `imageUrl`), which is the shape
+//! pi's `onPayload` — cyrup's `before_provider_request` hook — sees, and [`wire`] converts it to
+//! `max_tokens`, `tool_choice`, `prompt_mode`, … just before it is sent (Pi `toMistralWirePayload`,
+//! `mistral-conversations.ts:318,386-451` @f1b2e77f5). The stream is read in Mistral's own keys:
+//! `choice.finish_reason`, `delta.tool_calls`, `usage.prompt_tokens` / `completion_tokens` /
+//! `total_tokens` (`:616-633`, `:710`).
 
 mod blocks;
 mod content;
@@ -26,6 +32,7 @@ mod payload;
 mod reasoning;
 mod tool_call_id;
 mod tools;
+mod wire;
 
 #[cfg(test)]
 mod tests;
@@ -129,6 +136,10 @@ impl ApiImpl for MistralConversationsApi {
         };
         // gap-08 #2: `before_provider_request` may inspect/replace the outbound body.
         let body = crate::stream::apply_on_payload(opts, model, params).await;
+        // PROV-152: the hook sees pi's SDK-style payload; the wire gets Mistral's snake_case (Pi
+        // `body: JSON.stringify(toMistralWirePayload(payload))`, `mistral-conversations.ts:318`
+        // @f1b2e77f5, applied after `onPayload` at `:148-151`).
+        let body = wire::to_mistral_wire_payload(body);
         // PROV-042: `transformHeaders` runs LAST over the fully-assembled set (pi
         // `models.ts:657` @v0.84.4); its return value is what goes on the wire.
         let headers =

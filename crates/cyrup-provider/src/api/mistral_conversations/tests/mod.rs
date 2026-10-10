@@ -13,6 +13,7 @@ mod reasoning;
 mod stop_reason;
 mod tool_call_id;
 mod tools;
+mod wire_keys;
 
 use super::driver::*;
 use super::endpoint::*;
@@ -21,6 +22,7 @@ use super::messages::*;
 use super::options::*;
 use super::payload::*;
 use super::tool_call_id::*;
+use super::wire::*;
 use super::*;
 use crate::api::channel;
 use crate::context::{Context, ToolDef};

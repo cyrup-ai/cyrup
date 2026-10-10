@@ -1775,6 +1775,7 @@ async fn the_classifier_twin_classifies_through_llama_server() {
     classifier.base_url = format!("{}/v1", fake.url);
 
     let context = ClassifierContext {
+        images: None,
         state: serde_json::Map::from_iter([(
             "message".to_string(),
             json!("The build is red again."),

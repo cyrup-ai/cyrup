@@ -20,7 +20,7 @@ fn tools_encode_function_shape() {
     assert_eq!(body["tools"][0]["type"], "function");
     assert_eq!(body["tools"][0]["function"]["name"], "read");
     assert_eq!(body["tools"][0]["function"]["strict"], false);
-    assert_eq!(body["toolChoice"], "required");
+    assert_eq!(body["tool_choice"], "required");
 }
 
 #[test]
@@ -37,9 +37,12 @@ fn tool_result_message_shape() {
         added_tool_names: Vec::new(),
         nested_calls: None,
     }];
-    let out = to_chat_messages(&messages, false);
+    // As it goes on the wire (PROV-152): pi's SDK-style `toolCallId` becomes `tool_call_id`.
+    let wire = to_mistral_wire_payload(json!({ "messages": to_chat_messages(&messages, false) }));
+    let out = &wire["messages"];
     assert_eq!(out[0]["role"], "tool");
-    assert_eq!(out[0]["toolCallId"], "call12345");
+    assert_eq!(out[0]["tool_call_id"], "call12345");
+    assert!(out[0].get("toolCallId").is_none());
     assert_eq!(out[0]["name"], "read");
     assert_eq!(out[0]["content"][0]["text"], "file body");
 }

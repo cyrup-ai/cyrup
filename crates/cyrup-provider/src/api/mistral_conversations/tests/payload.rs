@@ -13,15 +13,15 @@ fn build_payload_basic_shape() {
     let body = build_body(&m, &user_ctx("hello"), &opts);
     assert_eq!(body["model"], "codestral-latest");
     assert_eq!(body["stream"], true);
-    assert_eq!(body["maxTokens"], 1000);
+    assert_eq!(body["max_tokens"], 1000);
     // system prompt prepended.
     assert_eq!(body["messages"][0]["role"], "system");
     assert_eq!(body["messages"][0]["content"], "be brief");
     assert_eq!(body["messages"][1]["role"], "user");
     assert_eq!(body["messages"][1]["content"][0]["text"], "hello");
-    // non-reasoning: no promptMode / reasoningEffort.
-    assert!(body.get("promptMode").is_none());
-    assert!(body.get("reasoningEffort").is_none());
+    // non-reasoning: no prompt_mode / reasoning_effort.
+    assert!(body.get("prompt_mode").is_none());
+    assert!(body.get("reasoning_effort").is_none());
 }
 
 #[test]
@@ -32,5 +32,5 @@ fn prompt_cache_key_set_with_session() {
         ..Default::default()
     };
     let body = build_body(&m, &user_ctx("x"), &opts);
-    assert_eq!(body["promptCacheKey"], "s9");
+    assert_eq!(body["prompt_cache_key"], "s9");
 }

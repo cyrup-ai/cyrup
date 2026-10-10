@@ -1,4 +1,4 @@
-//! Response decoding — usage folding, the prefix-cache accounting, the `finishReason` table
+//! Response decoding — usage folding, the prefix-cache accounting, the `finish_reason` table
 //! and the terminal error (Pi mistral-conversations.ts:92-101,333-345,662-677).
 
 use super::decoder::Decoder;
@@ -8,26 +8,35 @@ use crate::stream::StreamEvent;
 use cyrup_core::{ApiId, StopReason, Usage};
 use serde_json::Value;
 
-/// Apply Mistral `usage` (Pi mistral-conversations.ts:333-345).
+/// Apply Mistral `usage` (Pi `consumeChatStream`, `mistral-conversations.ts:616-628` @f1b2e77f5).
+///
+/// PROV-152: the keys are Mistral's wire `prompt_tokens` / `completion_tokens` / `total_tokens`
+/// (`:617`, `:621`, `:625`). These read the old SDK's `promptTokens` / `completionTokens` /
+/// `totalTokens`, which never occur on the wire, so every Mistral turn reported zero usage.
 pub(super) fn apply_usage(usage: &mut Usage, raw: &Value) {
-    let prompt = raw.get("promptTokens").and_then(Value::as_u64).unwrap_or(0);
+    let prompt = raw
+        .get("prompt_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
     let cached = mistral_cached_prompt_tokens(raw, prompt);
     usage.input = prompt.saturating_sub(cached);
     usage.output = raw
-        .get("completionTokens")
+        .get("completion_tokens")
         .and_then(Value::as_u64)
         .unwrap_or(0);
     usage.cache_read = cached;
     usage.cache_write = 0;
     usage.total_tokens = raw
-        .get("totalTokens")
+        .get("total_tokens")
         .and_then(Value::as_u64)
         .filter(|t| *t > 0)
         .unwrap_or(usage.input + usage.output + usage.cache_read + usage.cache_write);
 }
 
 /// Extract the cached prompt tokens across Mistral's several spellings (Pi
-/// `getMistralCachedPromptTokens`, mistral-conversations.ts:274-293), clamped to `[0, promptTokens]`.
+/// `getMistralCachedPromptTokens`, `mistral-conversations.ts:555-574` @f1b2e77f5), clamped to
+/// `[0, prompt_tokens]`. Unlike the counters above, upstream still probes the camelCase spellings
+/// here alongside the snake_case ones, so this keeps all six in upstream's order.
 fn mistral_cached_prompt_tokens(raw: &Value, prompt_tokens: u64) -> u64 {
     let candidates = [
         raw.get("promptTokensDetails")
@@ -49,15 +58,14 @@ fn mistral_cached_prompt_tokens(raw: &Value, prompt_tokens: u64) -> u64 {
     cached.min(prompt_tokens)
 }
 
-/// Map a Mistral `finishReason` to a cyrup [`StopReason`] (Pi `mapChatStopReason`,
+/// Map a Mistral `finish_reason` to a cyrup [`StopReason`] (Pi `mapChatStopReason`,
 /// `mistral-conversations.ts:936-952` @f1b2e77f5).
 ///
 /// The `Option` mirrors Pi's `reason: string | null` signature; the `None` arm is unreachable from
 /// the streaming decoder, because Pi guards the call with the truthiness test
-/// `if (choice.finish_reason)` (`:633` @f1b2e77f5). cyrup keeps the same truthiness guard, but reads
-/// the key as the old SDK's camelCase `finishReason` where pi reads Mistral's wire `finish_reason`
-/// (`PROV-152`) — a null/empty `finishReason` leaves the turn unsettled rather than mapping it to
-/// `Stop`.
+/// `if (choice.finish_reason)` (`:633` @f1b2e77f5). cyrup keeps the same truthiness guard on the
+/// same wire key (`PROV-152`) — a null/empty `finish_reason` leaves the turn unsettled rather than
+/// mapping it to `Stop`.
 ///
 /// Returns `(stop_reason, error_message)`, mirroring pi's `{ stopReason, errorMessage? }` tuple —
 /// the same shape [`crate::api::anthropic_messages`]'s `map_stop_reason` already uses.

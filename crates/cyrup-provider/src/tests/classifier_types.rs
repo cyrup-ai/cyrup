@@ -702,3 +702,37 @@ async fn registry_consults_its_entries_before_the_fallback() {
     assert_eq!(base.seen().calls, 1);
     assert_eq!(extension.seen().calls, 1);
 }
+
+/// PROV-148 — pi `ClassifierContext.images?: ImageContent[]` (`types.ts:682-690` @f1b2e77f5): the
+/// wire key is `images`, each entry pi's `{ type: "image", data, mimeType }`, between `state` and
+/// `questions`; an absent field stays absent on the way out.
+#[test]
+fn prov148_classifier_context_carries_images_on_the_wire() {
+    let wire = json!({
+        "state": { "a": 1 },
+        "images": [{ "type": "image", "data": "iVBORw0KGgo=", "mimeType": "image/png" }],
+        "questions": {}
+    });
+    let context: ClassifierContext = serde_json::from_value(wire.clone()).unwrap();
+    assert_eq!(
+        context.images,
+        Some(vec![cyrup_core::Content::Image {
+            data: "iVBORw0KGgo=".to_string(),
+            mime_type: "image/png".to_string(),
+        }])
+    );
+    assert!(context.has_images());
+    assert_eq!(
+        serde_json::to_string(&context).unwrap(),
+        serde_json::to_string(&wire).unwrap()
+    );
+
+    let plain: ClassifierContext =
+        serde_json::from_value(json!({ "state": {}, "questions": {} })).unwrap();
+    assert_eq!(plain.images, None);
+    assert!(!plain.has_images());
+    assert_eq!(
+        serde_json::to_value(&plain).unwrap(),
+        json!({ "state": {}, "questions": {} })
+    );
+}

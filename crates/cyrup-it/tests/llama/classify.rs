@@ -150,6 +150,7 @@ async fn classify_answers_from_the_routers_next_token_probabilities() {
     );
     let context = ClassifierContext {
         state,
+        images: None,
         questions: [(
             "team",
             ClassifierQuestion::Choice {

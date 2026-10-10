@@ -87,6 +87,9 @@
 //!   [`super::xai::REFERRER`] and [`super::openai_codex::ORIGINATOR`] are: it is a value OpenAI's
 //!   authorization server reads, paired with [`DYNAMIC_CLIENT_ID`], not a cyrup-facing brand
 //!   string. Rebranding it would change what the consent screen is told it is approving.
+//!   It is the default only: an embedding app that sets `LoginOptions::agent_name` is named
+//!   instead, as `options?.agentName ?? AGENT_NAME_HINT` does upstream (`:253` @f1b2e77f5,
+//!   PROV-144).
 //! * **Endpoint override.** Upstream's tests stub the ambient `fetch`; Rust has none, so every
 //!   endpoint is a field of [`OpenAiChatGptEndpoints`], defaulting to the upstream constants.
 //!   Production callers use [`OpenAiChatGptOAuth::new`].
@@ -704,6 +707,7 @@ impl OpenAiChatGptOAuth {
     /// `URLSearchParams.toString()` preserves.
     fn authorization_url(
         &self,
+        agent_name_hint: &str,
         host_id: &str,
         challenge: &str,
         state: &str,
@@ -711,7 +715,7 @@ impl OpenAiChatGptOAuth {
     ) -> String {
         let params = encode_query([
             ("client_id", DYNAMIC_CLIENT_ID),
-            ("agent_name_hint", self.agent_name_hint.as_str()),
+            ("agent_name_hint", agent_name_hint),
             ("ext_agent_host_id", host_id),
             ("response_type", "code"),
             ("redirect_uri", self.endpoints.redirect_uri.as_str()),
@@ -857,7 +861,13 @@ impl OAuthAuth for OpenAiChatGptOAuth {
         let nonce = random_value()?;
         // `:243-248` — hard-fail; see this module's collision note.
         let server = self.start_callback_server(&state, interaction).await?;
-        let authorization_url = self.authorization_url(&host_id, &pkce.challenge, &state, &nonce);
+        // `:253` @f1b2e77f5 — `agent_name_hint: options?.agentName ?? AGENT_NAME_HINT` (PROV-144).
+        let agent_name_hint = options
+            .agent_name
+            .as_deref()
+            .unwrap_or(self.agent_name_hint.as_str());
+        let authorization_url =
+            self.authorization_url(agent_name_hint, &host_id, &pkce.challenge, &state, &nonce);
 
         let manual_abort = CancelToken::new();
         let result = self
@@ -991,6 +1001,7 @@ mod tests {
     fn authorize_url_carries_the_dynamic_client_and_the_host_id() {
         let flow = OpenAiChatGptOAuth::new();
         let url = flow.authorization_url(
+            AGENT_NAME_HINT,
             &format!("urn:uuid:{DEVICE_ID}"),
             "challenge-value",
             "state-value",
@@ -1521,6 +1532,43 @@ mod tests {
                 .and_then(serde_json::Value::as_str),
             Some(DIRECT_TOKEN_SCOPE)
         );
+    }
+
+    /// PROV-144 — upstream's `"uses the app's agent name as the name hint"`
+    /// (`test/openai-chatgpt-oauth.test.ts`, `9ad083102`): `login(…, { getDeviceId, agentName:
+    /// "my-app" })` sends `agent_name_hint=my-app` (`openai-chatgpt.ts:253` @f1b2e77f5,
+    /// `options?.agentName ?? AGENT_NAME_HINT`); without it the hint stays `Pi`.
+    #[tokio::test]
+    async fn prov144_uses_the_apps_agent_name_as_the_name_hint() {
+        let hint_of = |interaction: &PasteInteraction| {
+            let url = reqwest::Url::parse(&interaction.authorize_url().expect("auth_url emitted"))
+                .expect("url");
+            url.query_pairs()
+                .find(|(k, _)| k == "agent_name_hint")
+                .map(|(_, v)| v.into_owned())
+        };
+
+        let (token_url, _seen) = serve_token("HTTP/1.1 200 OK", TOKEN_BODY).await;
+        let interaction = PasteInteraction::new(Some("oaiapp_issued"));
+        flow_against(&token_url)
+            .login(
+                &interaction,
+                &LoginOptions::with_device_id(|| DEVICE_ID.to_string()).with_agent_name("my-app"),
+            )
+            .await
+            .expect("login");
+        assert_eq!(hint_of(&interaction).as_deref(), Some("my-app"));
+
+        let (token_url, _seen) = serve_token("HTTP/1.1 200 OK", TOKEN_BODY).await;
+        let interaction = PasteInteraction::new(Some("oaiapp_issued"));
+        flow_against(&token_url)
+            .login(
+                &interaction,
+                &LoginOptions::with_device_id(|| DEVICE_ID.to_string()),
+            )
+            .await
+            .expect("login");
+        assert_eq!(hint_of(&interaction).as_deref(), Some("Pi"));
     }
 
     /// Upstream's `"rejects registration without an issued client ID"`: the callback carried no

@@ -557,3 +557,26 @@ fn computes_typesafes_confidence_and_expected_scores() {
         }
     );
 }
+
+/// PROV-148 — `llama-cpp-classify.ts:437` @f1b2e77f5: `if (context.images?.length) throw new
+/// Error(`${LABEL} classification does not support image input`)`, caught into an error result;
+/// the server is never asked.
+#[tokio::test]
+async fn prov148_rejects_image_input() {
+    let server = FakeServer::start().await;
+    let mut context = ticket_context();
+    context.images = Some(vec![cyrup_core::Content::Image {
+        data: "iVBORw0KGgo=".to_string(),
+        mime_type: "image/png".to_string(),
+    }]);
+
+    let result = classify(&model(&server.base_url), &context, &options()).await;
+
+    assert_eq!(result.stop_reason, ClassifierStopReason::Error);
+    assert_eq!(
+        result.error_message.as_deref(),
+        Some("llama.cpp classification does not support image input")
+    );
+    assert!(result.answers.is_empty());
+    assert!(server.requests().is_empty());
+}

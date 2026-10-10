@@ -746,3 +746,163 @@ fn single_model_lookups_are_scoped_to_the_named_provider() {
     assert_eq!(direct.api.as_str(), LLAMA_API);
     assert_eq!(models.get_classifier_models(None).len(), 2);
 }
+
+// -------------------------------------------------------------- PROV-148: classifier images --
+
+/// One base64 PNG pixel's worth of image block (pi `ImageContent`).
+fn prov148_image() -> cyrup_core::Content {
+    cyrup_core::Content::Image {
+        data: "iVBORw0KGgo=".to_string(),
+        mime_type: "image/png".to_string(),
+    }
+}
+
+fn prov148_context_with_images(images: Vec<cyrup_core::Content>) -> crate::ClassifierContext {
+    crate::ClassifierContext {
+        images: Some(images),
+        ..empty_context()
+    }
+}
+
+/// PROV-148 — pi `Models.classify` (`models.ts:972-989` @f1b2e77f5) calls
+/// `assertClassifierInputSupported(model, context)` (`utils/model-operations.ts:46-53`): images on
+/// a model whose `input` lacks `"image"` are an error result naming the model, and the api is never
+/// reached.
+#[tokio::test]
+async fn prov148_models_classify_rejects_images_on_a_text_only_classifier_model() {
+    let recorder = RecordingClassifier::new("x");
+    let models = models_with(vec![Arc::new(ClassifyingProvider::new(
+        "p",
+        vec![],
+        vec![classifier_model("p", "c", LLAMA_API)],
+        None,
+        registry_of(&recorder),
+    ))]);
+
+    let result = models
+        .classify(
+            &classifier_model("p", "c", LLAMA_API),
+            &prov148_context_with_images(vec![prov148_image()]),
+            &ClassifierOptions::default(),
+        )
+        .await;
+
+    assert_eq!(result.stop_reason, ClassifierStopReason::Error);
+    assert_eq!(
+        result.error_message.as_deref(),
+        Some("Model p/c does not accept image input")
+    );
+    assert!(result.answers.is_empty());
+    assert_eq!(recorder.seen().calls, 0);
+}
+
+/// PROV-148 — the assert precedes `requireProvider` (`models.ts:978-980`), so even an unknown
+/// provider reports the image check first.
+#[tokio::test]
+async fn prov148_the_image_check_runs_before_the_provider_lookup() {
+    let models = models_with(vec![]);
+
+    let result = models
+        .classify(
+            &classifier_model("ghost", "c", LLAMA_API),
+            &prov148_context_with_images(vec![prov148_image()]),
+            &ClassifierOptions::default(),
+        )
+        .await;
+
+    assert_eq!(
+        result.error_message.as_deref(),
+        Some("Model ghost/c does not accept image input")
+    );
+}
+
+/// PROV-148 — an image-capable model passes the check and the images reach the api; an empty
+/// `images` list (`context.images?.length` is 0) and no list at all pass on a text-only model.
+#[tokio::test]
+async fn prov148_images_reach_an_image_capable_model_and_empty_or_absent_images_pass() {
+    let recorder = RecordingClassifier::new("x");
+    let mut vision = classifier_model("p", "v", LLAMA_API);
+    vision.input.push(crate::Modality::Image);
+    let text_only = classifier_model("p", "c", LLAMA_API);
+    let models = models_with(vec![Arc::new(ClassifyingProvider::new(
+        "p",
+        vec![],
+        vec![vision.clone(), text_only.clone()],
+        None,
+        registry_of(&recorder),
+    ))]);
+
+    let with_images = models
+        .classify(
+            &vision,
+            &prov148_context_with_images(vec![prov148_image()]),
+            &ClassifierOptions::default(),
+        )
+        .await;
+    assert_eq!(with_images.stop_reason, ClassifierStopReason::Stop);
+    assert_eq!(recorder.seen().calls, 1);
+
+    let empty = models
+        .classify(
+            &text_only,
+            &prov148_context_with_images(vec![]),
+            &ClassifierOptions::default(),
+        )
+        .await;
+    assert_eq!(empty.stop_reason, ClassifierStopReason::Stop);
+    let absent = models
+        .classify(&text_only, &empty_context(), &ClassifierOptions::default())
+        .await;
+    assert_eq!(absent.stop_reason, ClassifierStopReason::Stop);
+    assert_eq!(recorder.seen().calls, 3);
+}
+
+// ------------------------------------- PROV-108: chat and classify agree on an unconfigured provider --
+
+/// The provider of `models_classify_requires_a_configured_provider`, with one chat model too.
+fn prov108_unconfigured_models() -> Models {
+    models_with(vec![Arc::new(ClassifyingProvider::new(
+        "p",
+        vec![chat_model("p", "m")],
+        vec![classifier_model("p", "c", LLAMA_API)],
+        Some(ProviderAuth::with_api_key(Arc::new(UnconfiguredAuth))),
+        registry_of(&RecordingClassifier::new("x")),
+    ))])
+}
+
+/// PROV-108 — pi `stream` reaches `applyAuth` (`models.ts:877-891` @f1b2e77f5), which throws
+/// ``ModelsError("auth", `Provider is not configured: ${model.provider}`)`` when `getAuth` resolves
+/// to nothing (`:859-861`); `lazyStream` turns that into the stream's error terminal. The same state
+/// that `classify` reports (`models_classify_requires_a_configured_provider`).
+#[tokio::test]
+async fn prov108_models_stream_requires_a_configured_provider() {
+    let models = prov108_unconfigured_models();
+    let message = crate::stream::collect_message(models.stream(
+        &chat_model("p", "m"),
+        &crate::context::Context::default(),
+        &crate::stream::StreamOptions::default(),
+    ))
+    .await;
+    assert_eq!(message.stop_reason, cyrup_core::StopReason::Error);
+    assert_eq!(
+        message.error_message.as_deref(),
+        Some("Provider is not configured: p")
+    );
+}
+
+/// PROV-108 — `streamSimple` shares `applyAuth` (`models.ts:901-908` @f1b2e77f5).
+#[tokio::test]
+async fn prov108_models_stream_simple_requires_a_configured_provider() {
+    let models = prov108_unconfigured_models();
+    let message = crate::stream::collect_message(models.stream_simple(
+        &chat_model("p", "m"),
+        &crate::context::Context::default(),
+        &crate::SimpleStreamOptions::default(),
+    ))
+    .await;
+    assert_eq!(message.stop_reason, cyrup_core::StopReason::Error);
+    assert_eq!(
+        message.error_message.as_deref(),
+        Some("Provider is not configured: p")
+    );
+}

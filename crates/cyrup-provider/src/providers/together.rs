@@ -105,7 +105,8 @@ fn model(
 /// The full Together chat catalog — a verbatim 1:1 port of Pi's `together.models.ts` at
 /// `b0c2a90e` (every model id, name, cost, context window, max tokens, reasoning flag, modalities,
 /// the per-model `compat` block, and `thinkingLevelMap`), plus the one row pi's served Together
-/// catalog adds after it, `moonshotai/Kimi-K3`.
+/// catalog adds after it, `moonshotai/Kimi-K3`, with DeepSeek V4 Pro carried under its pi 1.0.1
+/// id `deepseek-ai/DeepSeek-V4-Pro-0813` (PROV-132).
 pub fn together_models() -> Vec<Model> {
     // The default reasoning map shared by most Together reasoning models.
     let m = || level_map(&[("minimal", None), ("low", None), ("medium", None)]);
@@ -204,13 +205,21 @@ pub fn together_models() -> Vec<Model> {
             None,
             together_compat(false, Some(ThinkingFormat::Together)),
         ),
+        // PROV-132 — pi 1.0.1 `28eaccb8e` renamed this row's id to `deepseek-ai/DeepSeek-V4-Pro-0813`
+        // so it keeps its thinking-level controls: `scripts/generate-models.ts` @f1b2e77f5
+        // `TOGETHER_TOGGLE_REASONING_EFFORT_MODELS = new Set(["deepseek-ai/DeepSeek-V4-Pro-0813"])`,
+        // which selects `TOGETHER_DEEPSEEK_V4_THINKING_LEVEL_MAP` (only `high: "high"`) and
+        // `TOGETHER_TOGGLE_REASONING_EFFORT_COMPAT` (`supportsReasoningEffort: true`,
+        // `thinkingFormat: "together"`). pi carries no alias for the old id; its served catalog
+        // (`pi.dev/api/models/providers/together?types=chat`, fetched 2026-10-10) lists only the
+        // `-0813` id, and this row's name, cost, context window and max tokens are that row's.
         model(
-            "deepseek-ai/DeepSeek-V4-Pro",
-            "DeepSeek V4 Pro",
+            "deepseek-ai/DeepSeek-V4-Pro-0813",
+            "DeepSeek V4 Pro 0813",
             true,
             false,
-            cost(1.74, 3.48, 0.2),
-            512_000,
+            cost(1.32, 3.96, 0.13),
+            1_048_576,
             384_000,
             Some(level_map(&[
                 ("minimal", None),
@@ -437,7 +446,8 @@ mod tests {
     #[test]
     fn full_catalog_ported_from_pi() {
         let models = together_models();
-        // `together.models.ts`'s 20 rows at `b0c2a90e` plus Kimi K3 from pi's served catalog —
+        // `together.models.ts`'s 20 rows at `b0c2a90e` (DeepSeek V4 Pro under its renamed id) plus
+        // Kimi K3 from pi's served catalog —
         // every row is pi's, so an extra row of any kind fails here.
         assert_eq!(models.len(), 21);
         let find = |id: &str| {
@@ -456,15 +466,35 @@ mod tests {
         assert_eq!(gpt.cost.input, 0.15);
 
         // DeepSeek: together format but reasoning_effort supported, high->"high" map.
-        let ds = find("deepseek-ai/DeepSeek-V4-Pro");
+        // PROV-132: pi 1.0.1 renamed the id (`28eaccb8e`); the pre-rename id is gone, no alias.
+        assert!(
+            !models
+                .iter()
+                .any(|m| m.id.as_str() == "deepseek-ai/DeepSeek-V4-Pro"),
+            "pi has no row or alias for the pre-rename id"
+        );
+        let ds = find("deepseek-ai/DeepSeek-V4-Pro-0813");
         let dc = ds.compat.as_ref().unwrap();
         assert_eq!(dc.thinking_format, Some(ThinkingFormat::Together));
         assert_eq!(dc.supports_reasoning_effort, Some(true));
+        // pi `together-models.test.ts` "models Together reasoning controls…": the map is exactly
+        // `{ minimal: null, low: null, medium: null, high: "high", xhigh: null }`.
         assert_eq!(
-            ds.thinking_level_map.as_ref().unwrap().get("high"),
-            Some(&Some("high".to_string()))
+            ds.thinking_level_map.as_ref().unwrap(),
+            &level_map(&[
+                ("minimal", None),
+                ("low", None),
+                ("medium", None),
+                ("high", Some("high")),
+                ("xhigh", None),
+            ])
         );
-        assert_eq!(ds.context_window, 512_000);
+        assert_eq!(ds.name, "DeepSeek V4 Pro 0813");
+        assert_eq!(
+            (ds.cost.input, ds.cost.output, ds.cost.cache_read),
+            (1.32, 3.96, 0.13)
+        );
+        assert_eq!(ds.context_window, 1_048_576);
         assert_eq!(ds.max_tokens, 384_000);
 
         // MiniMax-M2.7 omits thinkingFormat (=> detected "together").
@@ -568,7 +598,7 @@ mod tests {
         // reasoning_effort mapped via thinkingLevelMap (high -> "high").
         let ds = models
             .iter()
-            .find(|m| m.id.as_str() == "deepseek-ai/DeepSeek-V4-Pro")
+            .find(|m| m.id.as_str() == "deepseek-ai/DeepSeek-V4-Pro-0813")
             .unwrap();
         let body = build_body(ds, &Context::default(), &opts);
         assert_eq!(body["reasoning"], serde_json::json!({ "enabled": true }));
