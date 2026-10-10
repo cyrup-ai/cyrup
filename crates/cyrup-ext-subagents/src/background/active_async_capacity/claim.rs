@@ -367,6 +367,10 @@ impl ActiveAsyncCapacityHandle {
             runner_process_start_identity: crate::background::session_lease::process_start_identity(
                 pid,
             ),
+            // SUBA-194 — the namespace this pid was read in, read at the same moment for the same
+            // reason: `pid` is this process's view of the runner, and an observer in another PID
+            // namespace must not probe it (see `inspect::runner_release_verdict`'s owner-pid rung).
+            runner_pid_namespace_scope: self.options.pid_namespace_scope(),
             runner_started_at: Some(self.options.now()),
             ..current
         };
@@ -507,6 +511,7 @@ pub async fn acquire(
             runner_process_instance_id: None,
             runner_pid: None,
             runner_process_start_identity: None,
+            runner_pid_namespace_scope: None,
             runner_started_at: None,
         };
         if create_slot(&pool_dir, &owner)
@@ -641,6 +646,8 @@ async fn transfer_locked(
         // pi `delete next.runnerProcessInstanceId; delete next.runnerStartedAt` (`:506-507`): the
         // new run has not started, so the slot is a rollbackable reservation again.
         runner_pid: None,
+        // The scope qualifies the pid cleared above; it goes with it.
+        runner_pid_namespace_scope: None,
         runner_started_at: None,
         ..current.clone()
     };
