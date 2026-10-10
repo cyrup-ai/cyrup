@@ -35,10 +35,13 @@
 
 use std::time::{Duration, Instant};
 
+#[cfg(test)]
 use ratatui::Frame;
+#[cfg(test)]
 use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
+#[cfg(test)]
 use ratatui::widgets::Paragraph;
 
 use crate::theme::UiTheme;
@@ -404,6 +407,22 @@ impl StatusIndicator {
     /// constructors bake `(${keyText("app.interrupt")} to cancel)` into the message
     /// (`status-indicator.ts:47,78,100`), and **never** for `Working`, whose constructor appends
     /// nothing (`:29-40`, `interactive-mode.ts:2074-2080`).
+    // TUI-103 RESIDUAL — this wrapper and the two below are TEST-ONLY since the band was retired.
+    //
+    // `border_spans` is the live path; nothing in production calls `lines_at`, `lines` or `render`
+    // any more (`rg` over non-test code finds only `lines` -> `lines_at` here). They are kept
+    // behind `cfg(test)` rather than deleted because ~11 assertions in
+    // `tests::{status_indicator, footer_chrome_fidelity}` reach the message wording, the elapsed
+    // ladder and the accent colour THROUGH them — and those rules are live: both this wrapper and
+    // `border_spans` go through the same `derive`/`content_spans`. Deleting the wrapper would drop
+    // real coverage; keeping it compiled into the binary would ship dead code, which is the
+    // pattern this repo keeps rows open for (see TUI-064's image strip).
+    //
+    // The residual is that those assertions still exercise the retired band's SHAPE
+    // (`lines[1].spans[1]`) instead of the live border's spans, so a border-only regression in
+    // layout would not fail them. Migrating them to `border_spans`/`content_spans` is per-site
+    // index work and is filed, not silently deferred.
+    #[cfg(test)]
     pub fn lines_at(
         &self,
         elapsed: Duration,
@@ -607,11 +626,13 @@ impl StatusIndicator {
     }
 
     /// The two band lines at the current wall-clock phase (the render-time form).
+    #[cfg(test)]
     pub fn lines(&self, theme: &UiTheme, cancel_hint: Option<&str>) -> Vec<Line<'static>> {
         self.lines_at(self.elapsed(), theme, cancel_hint)
     }
 
     /// Render the band into `area` (the live region's 2-row status slot).
+    #[cfg(test)]
     pub fn render(
         &self,
         frame: &mut Frame,
