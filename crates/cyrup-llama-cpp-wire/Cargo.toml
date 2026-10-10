@@ -7,7 +7,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-# Test data, depended on only through `[dev-dependencies]` (`cyrup-llama`, `cyrup-it`). Never a
+# Test data, depended on only through `[dev-dependencies]` (`cyrup-llama`, `cyrup-it`, `cyrup-provider`). Never a
 # normal dependency of anything, so it can never reach the shipping binary.
 publish = false
 
