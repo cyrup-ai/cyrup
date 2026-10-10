@@ -27,6 +27,7 @@ mod session_target;
 mod tests;
 
 pub use args::Cli;
+pub(crate) use argv::UNCONDITIONAL_VALUE_FLAGS;
 pub use argv::{
     ExtFlagValue, ExtensionFlag, normalize_process_argv, normalize_short_aliases,
     partition_extension_flags,

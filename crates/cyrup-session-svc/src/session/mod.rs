@@ -33,6 +33,8 @@ mod forking;
 mod inject;
 mod lifecycle;
 mod model;
+#[cfg(test)]
+pub(crate) use model::LIVE_AUTH_CHECK_TIMEOUT;
 mod model_calls;
 pub(crate) mod model_runtime;
 mod nested;
@@ -264,6 +266,12 @@ pub struct AgentSession {
     /// [`model_runtime`] for the keys, why they are exhaustive, and why a
     /// stale hit is not reachable.
     model_registry: RwLock<Option<model_runtime::RegistrySnapshot>>,
+    /// The last failing auth check of each LIVE extension provider — pi's
+    /// `ModelRuntime.availabilityError` (`core/model-runtime.ts:193-195` @v1.1.0), surfaced by
+    /// [`Self::availability_error`] and [`Self::model_runtime_error`]. SEAM-139; see
+    /// [`model::LiveAuthErrors`]. Its own mutex, held only to record or clear, never across a check
+    /// and never together with `model_registry` or the virtual-model lock.
+    live_auth_errors: Mutex<model::LiveAuthErrors>,
     /// Models available for `cycle_model` (Pi `_scopedModels`, agent-session.ts:870).
     scoped_models: Mutex<Vec<ScopedModel>>,
     /// Facade mirror of the agent's steering-queue mode (the agent exposes only a setter; Pi reads
@@ -519,6 +527,7 @@ impl AgentSession {
             pending_next_turn: Mutex::new(Vec::new()),
             pending_custom_messages: Mutex::new(Vec::new()),
             model_registry: RwLock::new(None),
+            live_auth_errors: Mutex::new(model::LiveAuthErrors::default()),
             scoped_models: Mutex::new(Vec::new()),
             steering_mode: Mutex::new(steering_mode),
             follow_up_mode: Mutex::new(follow_up_mode),

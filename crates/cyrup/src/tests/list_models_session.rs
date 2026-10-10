@@ -151,3 +151,136 @@ async fn the_installed_providers_catalog_is_not_listed_without_auth() {
         format!("{}\n", crate::format_no_models_available_message())
     );
 }
+
+// ============================================================ SEAM-139: the availability warning
+
+/// A live provider whose auth strategy's `check` always errors.
+struct FailingCheck;
+
+#[async_trait::async_trait]
+impl cyrup_provider::auth::ApiKeyAuth for FailingCheck {
+    fn name(&self) -> &str {
+        "failing"
+    }
+    fn supports_check(&self) -> bool {
+        true
+    }
+    async fn check(
+        &self,
+        _ctx: &dyn cyrup_provider::AuthContext,
+        _cred: Option<&cyrup_provider::Credential>,
+    ) -> Result<Option<cyrup_provider::collection::AuthCheck>, cyrup_provider::AuthError> {
+        Err(cyrup_provider::AuthError::api_key(
+            cyrup_sdk::core::ProviderId::from("probe-llm"),
+            "server probe refused",
+        ))
+    }
+    async fn resolve(
+        &self,
+        _model: &cyrup_provider::Model,
+        _ctx: &dyn cyrup_provider::AuthContext,
+        _cred: Option<&cyrup_provider::Credential>,
+    ) -> Result<Option<cyrup_provider::AuthResult>, cyrup_provider::AuthError> {
+        Ok(None)
+    }
+}
+
+struct ProbeProvider {
+    id: cyrup_sdk::core::ProviderId,
+    auth: cyrup_provider::auth::ProviderAuth,
+    models: Vec<cyrup_provider::Model>,
+}
+
+#[async_trait::async_trait]
+impl Provider for ProbeProvider {
+    fn id(&self) -> &cyrup_sdk::core::ProviderId {
+        &self.id
+    }
+    fn models(&self) -> &[cyrup_provider::Model] {
+        &self.models
+    }
+    fn provider_auth(&self) -> Option<&cyrup_provider::auth::ProviderAuth> {
+        Some(&self.auth)
+    }
+    fn stream(
+        &self,
+        _model: &cyrup_provider::Model,
+        _context: &cyrup_provider::Context,
+        _options: &cyrup_provider::StreamOptions,
+    ) -> cyrup_sdk::core::EventStream<cyrup_provider::StreamEvent> {
+        Box::pin(futures::stream::empty())
+    }
+}
+
+struct ProbeExt(Arc<dyn Provider>);
+
+#[async_trait::async_trait]
+impl cyrup_ext::NativeExtension for ProbeExt {
+    fn id(&self) -> ExtensionId {
+        ExtensionId::from("probe-ext")
+    }
+    async fn init(&self, api: &mut cyrup_ext::InitApi) -> Result<(), cyrup_ext::ExtError> {
+        api.register_provider_live("probe-llm", Arc::clone(&self.0));
+        Ok(())
+    }
+    async fn on_event(
+        &self,
+        _ev: &cyrup_ext::HostEvent,
+        _ctx: &cyrup_ext::HostCtx,
+    ) -> cyrup_ext::HookOutcome {
+        cyrup_ext::HookOutcome::Noop
+    }
+}
+
+/// SEAM-139 Verify, on the bin's one visible surface for it: pi's `--list-models` opens with
+/// `getError()` on stderr (`cli/list-models.ts:34-37` @v1.1.0), so a live provider whose strategy
+/// errors yields `Warning: errors loading models.json:\nAvailability refresh: …` naming the
+/// provider and the strategy's reason — where it used to vanish from the listing in silence.
+#[tokio::test]
+async fn list_models_warns_about_a_failing_live_auth_check() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path().join("project");
+    let agent_dir = tmp.path().join("agent");
+    std::fs::create_dir_all(&cwd).unwrap();
+    std::fs::create_dir_all(&agent_dir).unwrap();
+    let auth =
+        Arc::new(AuthStore::at(agent_dir.join("auth.json")).with_ambient_env(HashMap::new()));
+    let mut config = SessionConfig::new(cwd, agent_dir);
+    config.trust_override = Some(true);
+    config.no_extensions = true;
+    let reg = cyrup_ext::provider::ProviderRegistration {
+        id: "probe-llm".to_string(),
+        config: serde_json::from_value(serde_json::json!({
+            "name": "probe-llm",
+            "baseUrl": "http://127.0.0.1:9/v1",
+            "api": "openai-completions",
+            "models": [{ "id": "tiny", "name": "tiny" }],
+        }))
+        .unwrap(),
+        resolved_api_key: None,
+    };
+    let live: Arc<dyn Provider> = Arc::new(ProbeProvider {
+        id: cyrup_sdk::core::ProviderId::from("probe-llm"),
+        auth: cyrup_provider::auth::ProviderAuth::with_api_key(Arc::new(FailingCheck)),
+        models: reg.build_models(),
+    });
+    let session = SessionBuilder::new(Arc::new(FauxProvider::new()) as Arc<dyn Provider>, config)
+        .auth(auth)
+        .with_native_extension(Arc::new(ProbeExt(live)) as Arc<dyn cyrup_ext::NativeExtension>)
+        .build()
+        .await
+        .unwrap();
+
+    let models = session.configured_model_catalog();
+    assert!(
+        !models.iter().any(|m| m.provider.as_str() == "probe-llm"),
+        "the failing provider is not listed"
+    );
+    let warning = crate::actions::list_models_warning(&session).expect("the failure is shown");
+    assert!(
+        warning.starts_with("Warning: errors loading models.json:\nAvailability refresh: "),
+        "{warning}"
+    );
+    assert!(warning.contains("probe-llm"), "{warning}");
+    assert!(warning.contains("server probe refused"), "{warning}");
+}

@@ -91,7 +91,7 @@ pub fn resolve_default_tools(entries: &[String]) -> Vec<String> {
         .filter(|e| !is_tool_modifier(e))
         .cloned()
         .collect();
-    let mut tools = if !plain.is_empty() || entries.is_empty() {
+    let tools = if !plain.is_empty() || entries.is_empty() {
         plain
     } else {
         DEFAULT_TOOL_NAMES
@@ -99,6 +99,33 @@ pub fn resolve_default_tools(entries: &[String]) -> Vec<String> {
             .map(|s| (*s).to_string())
             .collect()
     };
+    apply_tool_modifiers(&tools, entries)
+}
+
+/// `getToolListError(entries)` (Pi `core/settings-manager.ts:95-102` @f1b2e77f5, v1.1.0
+/// `ddaa0a034`): a tool list from `--tools` or the SDK `tools` option is either an allowlist of
+/// plain names and patterns, or a list of ONLY `+name`/`-name` entries with exact names. Returns
+/// the problem (pi's text verbatim), or `None` when the list is valid.
+///
+/// A plain-name allowlist containing `*` is legal here; matching it is `MCP-616`'s business.
+pub fn get_tool_list_error(entries: &[String]) -> Option<String> {
+    let modifiers: Vec<&String> = entries.iter().filter(|e| is_tool_modifier(e)).collect();
+    if modifiers.is_empty() {
+        return None;
+    }
+    if modifiers.len() < entries.len() {
+        return Some("tool names cannot be mixed with +name or -name entries".to_string());
+    }
+    modifiers.iter().find(|e| e.contains('*')).map(|pattern| {
+        format!("+name and -name entries take exact tool names, not patterns: {pattern}")
+    })
+}
+
+/// `applyToolModifiers(base, entries)` (Pi `core/settings-manager.ts:108-119` @f1b2e77f5): apply
+/// the `+name` and `-name` entries of `entries` to `base` IN ORDER. `+name` appends when the name
+/// is absent and non-empty; `-name` removes the first match. Other entries are ignored.
+pub fn apply_tool_modifiers(base: &[String], entries: &[String]) -> Vec<String> {
+    let mut tools = base.to_vec();
     for entry in entries {
         if !is_tool_modifier(entry) {
             continue;

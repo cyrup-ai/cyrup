@@ -36,7 +36,7 @@ fn provider_api_key_thinking_and_models_parse() {
     assert_eq!(cli.thinking, Some(ThinkingArg::High));
     assert_eq!(
         cli.models,
-        vec!["claude-sonnet".to_string(), "gpt-4o:low".to_string()]
+        Some(vec!["claude-sonnet".to_string(), "gpt-4o:low".to_string()])
     );
 }
 

@@ -52,6 +52,12 @@ pub enum SessionServiceError {
     #[error("invalid system prompt options: {0}")]
     SystemPromptOptions(String),
 
+    /// A `tools` list that mixes plain names with `+name`/`-name` entries, or puts a `*` pattern
+    /// in a modifier (SEAM-148). pi `core/sdk.ts:281` @f1b2e77f5 throws
+    /// `Invalid tools option: ${getToolListError(tools)}`; the payload is that error text.
+    #[error("Invalid tools option: {0}")]
+    InvalidToolsOption(String),
+
     #[error("model not found: {0}")]
     ModelNotFound(String),
 

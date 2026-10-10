@@ -10,20 +10,20 @@ fn repeated_list_flags_resolve_to_the_last_occurrence() {
     // Presence before absence: the comma form keeps both, under both spellings.
     assert_eq!(
         parse_like_main(&["--tools", "read,bash"]).tools,
-        vec!["read".to_string(), "bash".to_string()]
+        Some(vec!["read".to_string(), "bash".to_string()])
     );
     assert_eq!(
         parse_like_main(&["-t", "read,bash"]).tools,
-        vec!["read".to_string(), "bash".to_string()]
+        Some(vec!["read".to_string(), "bash".to_string()])
     );
     // …and the repeated form keeps only the last.
     assert_eq!(
         parse_like_main(&["--tools", "read", "--tools", "bash"]).tools,
-        vec!["bash".to_string()]
+        Some(vec!["bash".to_string()])
     );
     assert_eq!(
         parse_like_main(&["--models", "a", "--models", "b"]).models,
-        vec!["b".to_string()]
+        Some(vec!["b".to_string()])
     );
     assert_eq!(
         parse_like_main(&["--exclude-tools", "x", "-xt", "y"]).exclude_tools,
@@ -197,7 +197,11 @@ fn list_flags_trim_each_comma_split_segment_and_drop_empties() {
     cli.normalize_list_flags();
     assert_eq!(
         cli.tools,
-        vec!["read".to_string(), "grep".to_string(), "find".to_string()],
+        Some(vec![
+            "read".to_string(),
+            "grep".to_string(),
+            "find".to_string()
+        ]),
         "each tool trimmed; empty segments dropped"
     );
     assert_eq!(
@@ -218,20 +222,34 @@ fn list_flags_trim_each_comma_split_segment_and_drop_empties() {
     );
     assert_eq!(config.exclude_tools, vec!["bash".to_string()]);
 
-    // `--models` (`args.ts:115`): trim only, empties KEPT (Pi does not `.filter`).
-    let mut m = parse(&["--models", " claude-sonnet , gpt-4o:low "]);
+    // `--models` (`args.ts:141-145` @v1.0.1): trim AND drop empty entries (SEAM-147).
+    let mut m = parse(&["--models", " claude-sonnet , , gpt-4o:low ,"]);
     m.normalize_list_flags();
     assert_eq!(
         m.models,
-        vec!["claude-sonnet".to_string(), "gpt-4o:low".to_string()]
+        Some(vec!["claude-sonnet".to_string(), "gpt-4o:low".to_string()])
     );
-    let mut empty = parse(&["--models", ""]);
-    empty.normalize_list_flags();
+}
+
+/// SEAM-147 — pi `9b3c19da5` (fixes #10334), `cli/args.ts:141-145` @v1.0.1 (unchanged
+/// @f1b2e77f5): `--models` drops empty entries, and pi's own test is
+/// `parseArgs(["--models", "gpt-4o, ,claude-sonnet,"])` → `["gpt-4o", "claude-sonnet"]`. The flag
+/// stays SUPPLIED when every entry is empty: `--models ""` is pi's truthy `[]`, so
+/// `parsed.models ?? getEnabledModels()` (`main.ts:812`) does not fall back. RED before the fix:
+/// the trailing comma kept `""` and `--models ""` stayed `[""]`.
+#[test]
+fn models_drops_empty_entries_but_stays_supplied() {
     assert_eq!(
-        empty.models,
-        vec![String::new()],
-        "an empty --models value stays a single empty pattern, matching Pi's unfiltered split"
+        parse_like_main(&["--models", "gpt-4o, ,claude-sonnet,"]).models,
+        Some(vec!["gpt-4o".to_string(), "claude-sonnet".to_string()])
     );
+    assert_eq!(
+        parse_like_main(&["--models", "faux/*,"]).models,
+        parse_like_main(&["--models", "faux/*"]).models
+    );
+    assert_eq!(parse_like_main(&["--models", ""]).models, Some(Vec::new()));
+    assert_eq!(parse_like_main(&["--models", ","]).models, Some(Vec::new()));
+    assert_eq!(parse_like_main(&[]).models, None);
 }
 
 /// The full pre-clap → clap pipeline with the diagnostics kept, for the rows below.
@@ -403,4 +421,130 @@ fn intercom_subcommand_argv_skips_short_alias_normalization() {
             "--no-approve".to_string()
         ]
     );
+}
+
+/// The whole pre-clap pipeline, keeping clap's verdict instead of panicking on it.
+fn pipeline_outcome(args: &[&str]) -> (Result<Cli, String>, Vec<crate::diagnostics::Diagnostic>) {
+    let norm = normalize_short_aliases(args.iter().map(|s| s.to_string()));
+    let (lenient, diags) = crate::diagnostics::apply_arg_leniency(&norm);
+    let (clean, ext) = partition_extension_flags(&lenient);
+    let mut full = vec!["cyrup".to_string()];
+    full.extend(clean);
+    let cli = Cli::try_parse_from(full).map(|mut cli| {
+        cli.extension_flags = ext;
+        cli.normalize_list_flags();
+        cli.restore_escaped_positionals();
+        cli
+    });
+    (cli.map_err(|e| e.to_string()), diags)
+}
+
+/// SEAM-152 — pi's value-taking flags take the next token as their value whatever it looks like
+/// (`args[++i]`, `cli/args.ts:115-131`, `:134-176`, `:184-201` @f1b2e77f5): only `--mode`,
+/// `--use-theme`, `--tui-mode`, `--list-models` and `-p` inspect it. RED before the fix: the alias
+/// pre-pass rewrote `-nc` to `--no-context-files` and clap then refused it (`a value is required for
+/// '--name <NAME>'`); `-x`-style values were refused by clap or flagged `Unknown option`, and a
+/// `--`-leading value after a short flag was captured as an extension flag.
+#[test]
+fn a_flag_shaped_value_is_the_value_as_in_pi() {
+    let ok = |args: &[&str]| -> Cli {
+        let (cli, diags) = pipeline_outcome(args);
+        assert!(diags.is_empty(), "{args:?}: {diags:?}");
+        let cli = cli.unwrap_or_else(|e| panic!("{args:?}: {e}"));
+        assert!(
+            cli.extension_flags.is_empty(),
+            "{args:?}: {:?}",
+            cli.extension_flags
+        );
+        cli
+    };
+    let cli = ok(&["--name", "-nc"]);
+    assert_eq!(cli.name.as_deref(), Some("-nc"));
+    assert!(!cli.no_context_files);
+    assert_eq!(ok(&["-n", "-na"]).name.as_deref(), Some("-na"));
+    assert!(!ok(&["-n", "-na"]).no_approve);
+    assert_eq!(ok(&["-n", "--offline"]).name.as_deref(), Some("--offline"));
+    assert_eq!(
+        ok(&["-n", "--no-such-flag"]).name.as_deref(),
+        Some("--no-such-flag")
+    );
+    assert_eq!(ok(&["--model", "-x"]).model.as_deref(), Some("-x"));
+    assert_eq!(ok(&["--provider", "-x"]).provider.as_deref(), Some("-x"));
+    assert_eq!(
+        ok(&["--api-key", "-secret"]).api_key.as_deref(),
+        Some("-secret")
+    );
+    assert_eq!(
+        ok(&["--append-system-prompt", "-be terse"]).append_system_prompt,
+        vec!["-be terse".to_string()]
+    );
+    assert_eq!(
+        ok(&["--system-prompt", "--x"]).system_prompt.as_deref(),
+        Some("--x")
+    );
+    assert_eq!(
+        ok(&["-e", "-ext.wasm"]).extension,
+        vec![std::path::PathBuf::from("-ext.wasm")]
+    );
+    assert_eq!(ok(&["--session", "-s"]).session.as_deref(), Some("-s"));
+    assert_eq!(ok(&["--models", "-m"]).models, Some(vec!["-m".to_string()]));
+    assert_eq!(ok(&["-xt", "-nt"]).exclude_tools, vec!["-nt".to_string()]);
+    assert!(!ok(&["-xt", "-nt"]).no_tools);
+    // Still modifiers / aliases where pi has them.
+    assert_eq!(
+        ok(&["--tools", "-bash"]).tools,
+        Some(vec!["-bash".to_string()])
+    );
+    assert_eq!(ok(&["-t", "-bash"]).tools, Some(vec!["-bash".to_string()]));
+    assert!(ok(&["-nc", "--name", "x"]).no_context_files);
+    // A value is consumed once: the token after it is a flag again.
+    let cli = ok(&["--name", "--model", "-nc"]);
+    assert_eq!(cli.name.as_deref(), Some("--model"));
+    assert!(cli.no_context_files);
+    assert_eq!(cli.model, None);
+}
+
+/// SEAM-152 — a value-taking flag with nothing after it, as pi reports it. pi's guarded arms
+/// (`… && i + 1 < args.length`) do not match, so a long flag falls into `unknownFlags`
+/// (`args.ts:250-262`), reported at runtime as `Unknown option: --model`
+/// (`agent-session-services.ts:120-123`), and a short one into `Unknown option: -t` (`:263-264`);
+/// `--name`/`-n` has its own `--name requires a value` (`:126-131`).
+#[test]
+fn a_value_flag_at_the_end_of_argv_is_reported_as_pi_reports_it() {
+    for flag in ["--name", "-n"] {
+        let (_, diags) = pipeline_outcome(&[flag]);
+        assert_eq!(
+            diags.iter().map(|d| d.message.as_str()).collect::<Vec<_>>(),
+            vec!["--name requires a value"],
+            "{flag}"
+        );
+    }
+    for flag in ["-t", "-e", "-xt"] {
+        let (_, diags) = pipeline_outcome(&[flag]);
+        assert_eq!(
+            diags.iter().map(|d| d.message.as_str()).collect::<Vec<_>>(),
+            vec![format!("Unknown option: {flag}")],
+            "{flag}"
+        );
+    }
+    for flag in [
+        "--model",
+        "--provider",
+        "--models",
+        "--tools",
+        "--thinking",
+        "--session",
+    ] {
+        let (cli, diags) = pipeline_outcome(&["-p", "hi", flag]);
+        assert!(diags.is_empty(), "{flag}: {diags:?}");
+        let cli = cli.unwrap_or_else(|e| panic!("{flag}: {e}"));
+        assert_eq!(
+            cli.extension_flags,
+            vec![ExtensionFlag {
+                name: flag.trim_start_matches('-').to_string(),
+                value: ExtFlagValue::Bool(true),
+            }],
+            "{flag}"
+        );
+    }
 }

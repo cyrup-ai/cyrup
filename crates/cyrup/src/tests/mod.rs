@@ -18,8 +18,10 @@
 //! Assertions are unchanged from the integration-test originals; only the crate self-reference
 //! moved (`cyrup::X` -> `crate::X`).
 
+mod api_key_models_scope;
 mod boot_transcript_order;
 mod catalog_refresh_modes;
+mod cli_tool_modifiers;
 mod dispatch;
 mod extension_provider_launch;
 mod footer_provider_count;

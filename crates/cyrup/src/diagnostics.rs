@@ -109,6 +109,13 @@ const VALUE_LONG_FLAGS: [&str; 14] = [
 /// it is the most common; it is handled with the same verbatim pass-through.
 const MODEL_FLAG: &str = "--model";
 
+/// The short value flags [`apply_arg_leniency`] passes through with their value (`-t` is the
+/// `--tools` family's, handled by the SEAM-105 arm). SEAM-152.
+const SHORT_VALUE_FLAGS: [&str; 2] = ["-n", "-e"];
+
+/// pi's `--name` error for a missing value (`cli/args.ts:130` @f1b2e77f5). SEAM-152.
+const NAME_REQUIRES: &str = "--name requires a value";
+
 /// The three value-taking flags pi **ASSIGNS** rather than accumulates — `result.models = …`
 /// (args.ts:114), `result.tools = …` (`:121-124`) and `result.excludeTools = …` (`:125-129`) — with
 /// every spelling cyrup accepts for each. SEAM-105.
@@ -124,6 +131,9 @@ const MODEL_FLAG: &str = "--model";
 /// and pi's arm is `(arg === "--tools" || arg === "-t")`, so it belongs to the same family and takes
 /// its value the same way.
 const ASSIGNING_FLAGS: [&[&str]; 3] = [&["--models"], &["--tools", "-t"], &["--exclude-tools"]];
+
+/// The [`ASSIGNING_FLAGS`] index of the `--tools`/`-t` family (SEAM-148).
+const TOOLS_FAMILY: usize = 1;
 
 /// The [`ASSIGNING_FLAGS`] family `arg` belongs to, if any. The `--tools=read` form is matched on the
 /// name part: pi has no `=` form at all (it would land in `unknownFlags`, args.ts:190-192), but cyrup
@@ -156,6 +166,24 @@ pub fn apply_arg_leniency(argv: &[String]) -> (Vec<String>, Vec<Diagnostic>) {
         if arg == "--" {
             clean.extend(argv.iter().skip(i).cloned());
             break;
+        }
+        // SEAM-152 — one of pi's unconditional value flags as the LAST token. pi's arm is guarded by
+        // `i + 1 < args.length`, so it does not match: `--name`/`-n` has its own error
+        // (`cli/args.ts:126-131` @f1b2e77f5), a single-dash flag reaches `Unknown option: <arg>`
+        // (`:263-264`), and a long one falls into `unknownFlags` (`:250-262`), which
+        // `partition_extension_flags` reproduces.
+        if argv.get(i + 1).is_none()
+            && crate::cli::UNCONDITIONAL_VALUE_FLAGS.contains(&arg.as_str())
+        {
+            if arg == "--name" || arg == "-n" {
+                diagnostics.push(Diagnostic::error(NAME_REQUIRES));
+            } else if !arg.starts_with("--") {
+                diagnostics.push(Diagnostic::error(format!("Unknown option: {arg}")));
+            } else {
+                clean.push(arg.clone());
+            }
+            i += 1;
+            continue;
         }
         // `--mode <value>` (space form) — pi args.ts:95-110 @v0.87.1, branch for branch:
         //   * missing value, or a `-`-leading next token → error `--mode requires text, json, or
@@ -291,6 +319,33 @@ pub fn apply_arg_leniency(argv: &[String]) -> (Vec<String>, Vec<Diagnostic>) {
         // `clean`; the post-pass below keeps only the last one per family. The value token is passed
         // through verbatim, exactly as the generic value-flag arm below does. SEAM-105.
         if let Some(family) = assigning_family(arg) {
+            // SEAM-148 — pi args.ts:151-161 @f1b2e77f5: the `--tools`/`-t` value is split on `,`,
+            // trimmed and stripped of empty entries, then `getToolListError` (settings-manager.ts:95-
+            // 102) rejects a list mixing plain names with `+name`/`-name` entries, or a modifier
+            // holding a `*`, as the error `${arg}: ${error}` — `arg` being the literal spelling the
+            // user typed (`--tools` or `-t`) — and `result.tools` is left unset. pi consumes the value
+            // token unconditionally (`args[++i]`), so `-t -bash` takes `-bash` as the value. The
+            // occurrence is dropped from the cleaned argv: an error exits 1 in `main.rs` before
+            // clap's result matters.
+            if family == TOOLS_FAMILY {
+                let (flag, inline) = match arg.split_once('=') {
+                    Some((flag, value)) => (flag, Some(value.to_string())),
+                    None => (arg.as_str(), None),
+                };
+                let value = inline.clone().or_else(|| argv.get(i + 1).cloned());
+                let entries: Vec<String> = value
+                    .as_deref()
+                    .unwrap_or_default()
+                    .split(',')
+                    .map(|entry| entry.trim().to_string())
+                    .filter(|entry| !entry.is_empty())
+                    .collect();
+                if let Some(error) = cyrup_config::get_tool_list_error(&entries) {
+                    diagnostics.push(Diagnostic::error(format!("{flag}: {error}")));
+                    i += if inline.is_none() { 2 } else { 1 };
+                    continue;
+                }
+            }
             let start = clean.len();
             clean.push(arg.clone());
             if !arg.contains('=')
@@ -353,7 +408,10 @@ pub fn apply_arg_leniency(argv: &[String]) -> (Vec<String>, Vec<Diagnostic>) {
         // A known value-taking long flag (space form): pass the flag AND its next token through
         // verbatim, so a value that looks like a flag (`--model -5`) is not re-interpreted (Pi
         // consumes `args[++i]` unconditionally).
-        if (arg == MODEL_FLAG || VALUE_LONG_FLAGS.contains(&arg.as_str()))
+        // SEAM-152: `-n` and `-e` too — pi's short spellings consume `args[++i]` the same way.
+        if (arg == MODEL_FLAG
+            || VALUE_LONG_FLAGS.contains(&arg.as_str())
+            || SHORT_VALUE_FLAGS.contains(&arg.as_str()))
             && !arg.contains('=')
             && let Some(value) = argv.get(i + 1)
         {

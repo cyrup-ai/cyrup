@@ -5,7 +5,7 @@
 //! [`crate::ProviderSwap`], the configured-auth checks that gate a candidate, attribution headers,
 //! and the `cycle_model` rotation over the scoped or available set.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use cyrup_core::{ModelId, ModelRef, ModelThinkingLevel, ProviderId};
@@ -22,7 +22,94 @@ use super::types::{ModelCycleResult, ScopedModel};
 /// The longest a live provider's own auth check may take to answer the synchronous availability
 /// predicate before the provider reads as unavailable (see
 /// [`AgentSession::live_provider_is_configured`]).
-const LIVE_AUTH_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+pub(crate) const LIVE_AUTH_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The last failing auth check of each live extension provider, with the ordering that decides
+/// which check may write it — pi's `availabilityError` + `availabilityErrorSeq`
+/// (`core/model-runtime.ts:193-195` @v1.1.0). SEAM-139.
+///
+/// pi stamps every availability pass with `++this.availabilityErrorSeq` and lets a pass record its
+/// failure (`:373-375`, `errorSeq === this.availabilityErrorSeq`) or clear it on success (`:363`,
+/// same guard) only while it is still the LATEST pass, so a slow failing pass that finishes after
+/// a newer successful one cannot resurrect a stale error. cyrup checks per provider per call
+/// ([`AgentSession::live_provider_is_configured`]), so the stamp is per provider: a check takes
+/// its stamp when it STARTS and writes only if no later check of the same provider has started
+/// since.
+#[derive(Default)]
+pub(crate) struct LiveAuthErrors {
+    /// The stamp source; every check takes the next value.
+    next_seq: u64,
+    /// The stamp of the latest check STARTED for each provider id.
+    latest: HashMap<String, u64>,
+    /// The recorded failure of each provider id whose latest finished check failed, keyed in id
+    /// order so the rendered diagnostic is stable.
+    errors: BTreeMap<String, String>,
+}
+
+impl LiveAuthErrors {
+    /// Stamp a check of `provider` that is about to start.
+    fn begin(&mut self, provider: &str) -> u64 {
+        self.next_seq = self.next_seq.wrapping_add(1);
+        self.latest.insert(provider.to_string(), self.next_seq);
+        self.next_seq
+    }
+
+    /// Record (`Some`) or clear (`None`) `provider`'s failure for the check stamped `seq` — a no-op
+    /// once a later check of `provider` has started (pi's `errorSeq === this.availabilityErrorSeq`).
+    fn finish(&mut self, provider: &str, seq: u64, failure: Option<String>) {
+        if self.latest.get(provider) != Some(&seq) {
+            return;
+        }
+        match failure {
+            Some(message) => {
+                self.errors.insert(provider.to_string(), message);
+            }
+            None => {
+                self.errors.remove(provider);
+            }
+        }
+    }
+
+    /// The ids with a recorded failure, each with the stamp of its latest started check.
+    fn recorded(&self) -> Vec<(String, Option<u64>)> {
+        self.errors
+            .keys()
+            .map(|id| (id.clone(), self.latest.get(id).copied()))
+            .collect()
+    }
+
+    /// Drop `provider`'s record — its provider is gone, so no later check will ever clear it —
+    /// unless a check of it has started since `seq` was read (a re-registration being checked
+    /// again owns the record now).
+    fn forget(&mut self, provider: &str, seq: Option<u64>) {
+        if self.latest.get(provider).copied() != seq {
+            return;
+        }
+        self.errors.remove(provider);
+        self.latest.remove(provider);
+    }
+}
+
+/// `error` with its whole `source()` chain, `: `-joined, skipping a link that repeats the one
+/// before it.
+///
+/// `[CYRUP-DELTA]` pi stores the TOP message only (`error instanceof Error ? error.message`,
+/// `core/model-runtime.ts:374` @v1.1.0), which is `API key auth check failed for provider <id>`
+/// (`ai/src/models.ts:666-668`) — the strategy's own reason rides on `cause` and is never shown.
+/// cyrup's top message is `ProviderError::Auth`'s transparent `api key auth failed for <id>`
+/// (`cyrup-provider/src/error.rs`), and the chain is kept so the diagnostic says WHY.
+fn error_chain(error: &dyn std::error::Error) -> String {
+    let mut parts: Vec<String> = vec![error.to_string()];
+    let mut next = error.source();
+    while let Some(cause) = next {
+        let text = cause.to_string();
+        if parts.last() != Some(&text) {
+            parts.push(text);
+        }
+        next = cause.source();
+    }
+    parts.join(": ")
+}
 
 impl AgentSession {
     /// Switch the active model by pattern (`provider/id[:level]`), updating the agent, the
@@ -262,11 +349,24 @@ impl AgentSession {
     /// (a deadlock on a current-thread runtime, where nothing is left to drive what the check
     /// awaits). So it runs on its own short-lived thread, entered into the caller's runtime so a
     /// timer or a task the check awaits is driven by the runtime's other threads, and the caller
-    /// waits for it for at most [`LIVE_AUTH_CHECK_TIMEOUT`]. A check that panics, fails or does not
-    /// answer in time reads as unavailable: pi records a failing check on `getError()` and leaves
-    /// the provider out of `configuredProviders` (`model-runtime.ts:373-374`, surfaced by
-    /// `getError`, `:510`).
+    /// waits for it for at most [`LIVE_AUTH_CHECK_TIMEOUT`].
+    ///
+    /// A check that fails, panics, does not answer in time or cannot be started reads as
+    /// unavailable AND is recorded (SEAM-139): pi's failing pass lands on `availabilityError`
+    /// (`core/model-runtime.ts:371-377` @v1.1.0) and `getError()` shows it as
+    /// `Availability refresh: …` (`:504-512`) — here [`Self::availability_error`] /
+    /// [`Self::model_runtime_error`]. A check that answers (configured or not) clears the record,
+    /// as pi's successful pass does (`:363`). The record is written on THIS thread after the wait,
+    /// under the [`LiveAuthErrors`] stamp, so an answer that arrives after the timeout is dropped
+    /// and an older check finishing late cannot overwrite a newer one's outcome.
+    ///
+    /// `[CYRUP-DELTA]` two further shape differences: (a) pi's failing check rejects the whole pass
+    /// and KEEPS the previous snapshot, so a provider configured earlier stays configured; cyrup has
+    /// no snapshot to keep and reads the failure as unavailable; (b) the record is per provider and
+    /// carries the error's cause chain ([`error_chain`]) where pi keeps one top-level message.
     fn live_provider_is_configured(&self, provider: &Arc<dyn Provider>) -> bool {
+        let id = provider.id().as_str().to_string();
+        let seq = Self::lock(&self.live_auth_errors).begin(&id);
         let auth = Arc::clone(&self.services.auth);
         let provider = Arc::clone(provider);
         let runtime = tokio::runtime::Handle::try_current().ok();
@@ -278,12 +378,83 @@ impl AgentSession {
                 let outcome = futures::executor::block_on(
                     cyrup_config::login::live_provider_auth_check(&auth, &provider),
                 );
-                let _ = answer.send(matches!(outcome, Ok(Some(_))));
+                let _ = answer.send(
+                    outcome
+                        .map(|check| check.is_some())
+                        .map_err(|e| error_chain(&e)),
+                );
             });
-        spawned.is_ok()
-            && answered
-                .recv_timeout(LIVE_AUTH_CHECK_TIMEOUT)
-                .unwrap_or(false)
+        let (configured, failure) = match spawned {
+            Err(e) => (
+                false,
+                Some(format!("auth check for {id} could not start: {e}")),
+            ),
+            Ok(_) => match answered.recv_timeout(LIVE_AUTH_CHECK_TIMEOUT) {
+                Ok(Ok(configured)) => (configured, None),
+                Ok(Err(message)) => (false, Some(message)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => (
+                    false,
+                    Some(format!(
+                        "auth check for {id} did not answer within {}s",
+                        LIVE_AUTH_CHECK_TIMEOUT.as_secs()
+                    )),
+                ),
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    (false, Some(format!("auth check for {id} panicked")))
+                }
+            },
+        };
+        Self::lock(&self.live_auth_errors).finish(&id, seq, failure);
+        configured
+    }
+
+    /// The recorded live-provider auth-check failures, as pi's `getError()` renders its
+    /// availability part: `Availability refresh: <message>` (`core/model-runtime.ts:510` @v1.1.0),
+    /// one per failing provider, `\n\n`-joined; `None` when no live provider's latest check failed.
+    /// SEAM-139.
+    ///
+    /// The checks run lazily inside the availability predicate, so this reflects the last
+    /// [`Self::available_model_catalog`] / [`Self::configured_model_catalog`] /
+    /// [`Self::has_configured_auth`] read — read it AFTER one (pi reads `getError()` after its
+    /// startup refresh has run).
+    ///
+    /// A record whose provider is no longer a live provider with an auth strategy is dropped
+    /// here: nothing will ever check that id again to clear it, where pi's `unregisterProvider`
+    /// ends in a `refresh` whose successful availability pass clears `availabilityError`
+    /// (`core/model-runtime.ts:944-950`, cleared at `:363` @f1b2e77f5). The liveness reads take
+    /// the extension and guest registries' locks, so they run with the record lock released.
+    pub fn availability_error(&self) -> Option<String> {
+        let recorded = Self::lock(&self.live_auth_errors).recorded();
+        for (id, seq) in recorded {
+            let checked = self
+                .live_extension_provider(&ProviderId::from(id.as_str()))
+                .is_some_and(|live| live.provider_auth().is_some());
+            if !checked {
+                Self::lock(&self.live_auth_errors).forget(&id, seq);
+            }
+        }
+        let records = Self::lock(&self.live_auth_errors);
+        if records.errors.is_empty() {
+            return None;
+        }
+        Some(
+            records
+                .errors
+                .values()
+                .map(|message| format!("Availability refresh: {message}"))
+                .collect::<Vec<_>>()
+                .join("\n\n"),
+        )
+    }
+
+    /// pi `ModelRuntime.getError()` (`core/model-runtime.ts:504-512` @v1.1.0): the `models.json`
+    /// problems (its `config.getError()` + per-provider `compositionErrors`, which cyrup keeps
+    /// together in `startup_diagnostics.models`) followed by [`Self::availability_error`],
+    /// `\n\n`-joined; `None` when there is neither. SEAM-139.
+    pub fn model_runtime_error(&self) -> Option<String> {
+        let mut errors: Vec<String> = self.services.startup_diagnostics.models.clone();
+        errors.extend(self.availability_error());
+        (!errors.is_empty()).then(|| errors.join("\n\n"))
     }
 
     /// Whether `provider` has configured auth in the Pi sense — a stored credential / runtime

@@ -88,12 +88,41 @@ fn format_token_count(count: u64) -> String {
 /// selector's `available_model_catalog` is deliberately NOT used because it also keeps the installed
 /// provider's own catalog selectable, which would make `--provider anthropic --list-models` list
 /// anthropic without a credential.
+///
+/// SEAM-139 — pi opens the listing with `getError()` on stderr (`cli/list-models.ts:34-37`
+/// @v1.1.0), which carries a live provider's failing auth check as `Availability refresh: …`
+/// ([`list_models_warning`]).
 pub fn list_models_for_session(session: &cyrup_session_svc::AgentSession, search: &str) -> i32 {
-    crate::output_guard::emit_stray(&render_model_listing(
-        &session.configured_model_catalog(),
-        search,
-    ));
+    let models = session.configured_model_catalog();
+    if let Some(warning) = list_models_warning(session) {
+        eprintln!("{warning}");
+    }
+    crate::output_guard::emit_stray(&render_model_listing(&models, search));
     0
+}
+
+/// The stderr warning `--list-models` opens with — pi `listModels`:
+///
+/// ```ts
+/// const loadError = modelRuntime.getError();
+/// if (loadError) {
+///     console.error(chalk.yellow(`Warning: errors loading models.json:\n${loadError}`));
+/// }
+/// ```
+///
+/// (`cli/list-models.ts:34-37` @v1.1.0). Only the AVAILABILITY half of `getError()`
+/// ([`cyrup_session_svc::AgentSession::availability_error`]): the `models.json` half is already
+/// reported once at startup (`main.rs`, `bootstrap::load_models_json`), and printing it again
+/// would duplicate it.
+///
+/// `[CYRUP-DELTA]` ordering: pi reads `getError()` BEFORE `getAvailable()` because its startup
+/// refresh has already run the checks; cyrup runs them lazily inside the catalog read, so this must
+/// be called AFTER [`cyrup_session_svc::AgentSession::configured_model_catalog`]. The warning is
+/// still printed before the listing, as in pi.
+pub(crate) fn list_models_warning(session: &cyrup_session_svc::AgentSession) -> Option<String> {
+    session
+        .availability_error()
+        .map(|error| format!("Warning: errors loading models.json:\n{error}"))
 }
 
 /// `--list-models [search]` (Pi `listModels`, list-models.ts:29-110): render the provider catalog as

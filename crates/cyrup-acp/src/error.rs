@@ -148,6 +148,10 @@ impl AcpFailure {
             // (an invalid custom section name, or options of the wrong shape). An extension
             // fault, not the client's: the request was well-formed and no credential is involved.
             | E::SystemPromptSection(_)
+            // SEAM-148: a mixed or patterned `+name`/`-name` `tools` list (pi `core/sdk.ts:281`
+            // @f1b2e77f5). The list comes from this agent's own launch flags, never from an ACP
+            // request, so it is neither a credential problem nor the client's to fix.
+            | E::InvalidToolsOption(_)
             | E::SystemPromptOptions(_)
             | E::SessionNotSaved
             | E::Io(_)

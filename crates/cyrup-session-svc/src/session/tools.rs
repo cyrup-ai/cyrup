@@ -190,12 +190,15 @@ impl AgentSession {
 
     /// pi `reload`'s `getDefaultTools()` (`agent-session.ts:3665-3671` @v1.1.0): the resolved
     /// `defaultTools` setting, or pi's four defaults when it is unset, for a session whose initial
-    /// tools came from it; nothing for one started with `tools` or `noTools`.
+    /// tools came from it; nothing for one started with `tools` or `noTools`. A `+name`/`-name`
+    /// `tools` list is reapplied on top (`applyToolModifiers(…, this._defaultToolModifiers)`,
+    /// `:3666-3669` @f1b2e77f5; SEAM-148), so a `-bash` session never gets `bash` back on reload.
     pub(crate) fn reload_default_tools(&self) -> Vec<String> {
         if !self.services.uses_default_tools {
             return Vec::new();
         }
-        self.services
+        let base = self
+            .services
             .settings
             .effective()
             .default_tools()
@@ -204,7 +207,8 @@ impl AgentSession {
                     .iter()
                     .map(|name| (*name).to_owned())
                     .collect()
-            })
+            });
+        cyrup_config::apply_tool_modifiers(&base, &self.services.default_tool_modifiers)
     }
 
     /// pi `reload`'s activation of the tools newly added to `defaultTools`

@@ -1161,3 +1161,45 @@ fn codemode_settings_validate_like_the_extension_reads_them() {
         serde_json::json!({"mode": "on", "inlineBudget": 10.0})
     );
 }
+
+fn strs(entries: &[&str]) -> Vec<String> {
+    entries.iter().map(|e| (*e).to_string()).collect()
+}
+
+/// SEAM-148 — `getToolListError` (Pi `core/settings-manager.ts:95-102` @f1b2e77f5), pi's text
+/// verbatim: a mixed list and a patterned modifier are refused; an allowlist (patterns included),
+/// a modifier-only list and an empty list are valid.
+#[test]
+fn tool_list_error_matches_pi() {
+    assert_eq!(
+        get_tool_list_error(&strs(&["read", "+grep"])).as_deref(),
+        Some("tool names cannot be mixed with +name or -name entries")
+    );
+    assert_eq!(
+        get_tool_list_error(&strs(&["+grep", "-mcp__*"])).as_deref(),
+        Some("+name and -name entries take exact tool names, not patterns: -mcp__*")
+    );
+    for valid in [&["+grep", "-bash"][..], &["read"], &["mcp__*"], &[]] {
+        assert_eq!(get_tool_list_error(&strs(valid)), None, "{valid:?}");
+    }
+}
+
+/// SEAM-148 — `applyToolModifiers` (Pi `core/settings-manager.ts:108-119` @f1b2e77f5): in order,
+/// `+` appends an absent non-empty name, `-` removes the first match, plain names are ignored.
+#[test]
+fn apply_tool_modifiers_matches_pi() {
+    let base = strs(&["read", "bash"]);
+    assert_eq!(
+        apply_tool_modifiers(&base, &strs(&["+grep", "-bash"])),
+        strs(&["read", "grep"])
+    );
+    assert_eq!(apply_tool_modifiers(&base, &strs(&["+x", "-x"])), base);
+    assert_eq!(
+        apply_tool_modifiers(&base, &strs(&["-x", "+x"])),
+        strs(&["read", "bash", "x"])
+    );
+    assert_eq!(
+        apply_tool_modifiers(&base, &strs(&["+", "-", "+read", "plain"])),
+        base
+    );
+}

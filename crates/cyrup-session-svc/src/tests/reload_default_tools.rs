@@ -162,3 +162,183 @@ async fn reload_keeps_explicit_tool_options() {
         sorted(&["bash", "edit", "codemode", "read", "write"])
     );
 }
+
+// ---- SEAM-148: a `+name`/`-name`-only `tools` list -------------------------------------------
+//
+// pi v1.1.0 (`ddaa0a034`) applies such a list to the default selection instead of reading it as an
+// allowlist: `core/sdk.ts:280-294` @f1b2e77f5 (`applyToolModifiers(defaultToolNames, tools)`,
+// `allowedToolNames` `undefined` unless `noTools === "all"`), `usesDefaultTools` stays true with
+// `defaultToolModifiers` kept (`:472-473`), and `reload` reapplies them (`agent-session.ts:3666-
+// 3669`). RED before the fix: every case below started with NO tools, because `select_active_tools`
+// matched the literal name `"+codemode"`, and `resolve_allowed_tool_names` pinned an allowlist of it.
+
+fn allowed(names: Option<&std::collections::HashSet<String>>) -> Option<Vec<String>> {
+    names.map(|set| {
+        let mut v: Vec<String> = set.iter().cloned().collect();
+        v.sort();
+        v
+    })
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_modifier_tools_list_adjusts_the_default_selection() {
+    let added = rig("{}", |cfg| cfg.tools = Some(vec!["+codemode".to_owned()])).await;
+    assert_eq!(
+        added.active().await,
+        sorted(&["read", "bash", "edit", "write", "codemode"])
+    );
+    let session = added.runtime.session().await;
+    assert_eq!(
+        allowed(session.services().allowed_tool_names.as_ref()),
+        None
+    );
+    assert!(session.services().uses_default_tools);
+
+    let grep = rig("{}", |cfg| cfg.tools = Some(vec!["+grep".to_owned()])).await;
+    assert_eq!(
+        grep.active().await,
+        sorted(&["read", "bash", "edit", "write", "grep"])
+    );
+
+    // The modifiers apply to the `defaultTools` setting when it is configured.
+    let over_setting = rig(r#"{ "defaultTools": ["read"] }"#, |cfg| {
+        cfg.tools = Some(vec!["+grep".to_owned()]);
+    })
+    .await;
+    assert_eq!(over_setting.active().await, sorted(&["read", "grep"]));
+
+    // `noTools: "all"` makes the post-modifier set the allowlist (`sdk.ts:287-288`).
+    let all = rig("{}", |cfg| {
+        cfg.no_tools = Some(NoTools::All);
+        cfg.tools = Some(vec!["+read".to_owned()]);
+    })
+    .await;
+    assert_eq!(all.active().await, sorted(&["read"]));
+    let session = all.runtime.session().await;
+    assert_eq!(
+        allowed(session.services().allowed_tool_names.as_ref()),
+        Some(sorted(&["read"]))
+    );
+    assert!(!session.services().uses_default_tools);
+
+    // `noTools: "builtin"` starts the modifiers from an empty base and pins nothing.
+    let builtin = rig("{}", |cfg| {
+        cfg.no_tools = Some(NoTools::Builtin);
+        cfg.tools = Some(vec!["+read".to_owned(), "+codemode".to_owned()]);
+    })
+    .await;
+    assert_eq!(builtin.active().await, sorted(&["read", "codemode"]));
+    let session = builtin.runtime.session().await;
+    assert_eq!(
+        allowed(session.services().allowed_tool_names.as_ref()),
+        None
+    );
+}
+
+/// `-bash` stays removed across `/reload`, while a name the setting newly adds is activated
+/// (`agent-session.ts:3666-3677` @f1b2e77f5). A tool the user turned off stays off too: the
+/// `/reload` rebuild restores a modifier session's transcript loadout, as pi's `reload` keeps the
+/// live active set (`:3682-3686`). RED with that restore gated off: `write` came back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_removed_tool_stays_removed_across_reload() {
+    let minus = rig("{}", |cfg| cfg.tools = Some(vec!["-bash".to_owned()])).await;
+    assert_eq!(minus.active().await, sorted(&["read", "edit", "write"]));
+    minus.turn().await;
+
+    minus.reload_with(r#"{ "defaultTools": ["+grep"] }"#).await;
+    assert_eq!(
+        minus.active().await,
+        sorted(&["read", "edit", "write", "grep"])
+    );
+
+    // Turn `write` off, then reload with an unchanged setting: nothing comes back.
+    minus.set_active(&["read", "edit", "grep"]).await;
+    minus.turn().await;
+    minus.reload_with(r#"{ "defaultTools": ["+grep"] }"#).await;
+    assert_eq!(minus.active().await, sorted(&["read", "edit", "grep"]));
+
+    // The reapply itself: a setting that newly names `bash` does not bring it back, because the
+    // `-bash` modifier is applied to both sides of the comparison (pi `getDefaultTools()` before
+    // and after `settingsManager.reload()`). Without it, `bash` reads as newly added.
+    let narrowed = rig(r#"{ "defaultTools": ["read"] }"#, |cfg| {
+        cfg.tools = Some(vec!["-bash".to_owned()]);
+    })
+    .await;
+    assert_eq!(narrowed.active().await, sorted(&["read"]));
+    narrowed.turn().await;
+    narrowed
+        .reload_with(r#"{ "defaultTools": ["read", "bash", "grep"] }"#)
+        .await;
+    assert_eq!(narrowed.active().await, sorted(&["read", "grep"]));
+}
+
+/// A list mixing plain names with modifiers, or a modifier with a `*`, is refused before the build
+/// (pi `core/sdk.ts:280-281` @f1b2e77f5: `Invalid tools option: ${getToolListError(tools)}`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_mixed_or_patterned_modifier_list_refuses_the_build() {
+    for (tools, expected) in [
+        (
+            vec!["read", "+grep"],
+            "Invalid tools option: tool names cannot be mixed with +name or -name entries",
+        ),
+        (
+            vec!["+mcp__*"],
+            "Invalid tools option: +name and -name entries take exact tool names, not patterns: +mcp__*",
+        ),
+    ] {
+        let tmp = TempDir::new().unwrap();
+        let mut cfg = SessionConfig::new(tmp.path().join("p"), tmp.path().join("a"));
+        cfg.trust_override = Some(true);
+        cfg.tools = Some(tools.iter().map(|t| (*t).to_owned()).collect());
+        let factory = Arc::new(SessionFactory::new(
+            Arc::new(FauxProvider::new()) as Arc<dyn Provider>,
+            cfg,
+        ));
+        let err = AgentSessionRuntime::create(factory, SessionTarget::New)
+            .await
+            .err()
+            .expect("the build is refused");
+        assert_eq!(err.to_string(), expected);
+    }
+}
+
+/// A `--continue`/`--resume` launch applies the modifiers over whatever loadout the transcript
+/// saved: pi `sdk.ts:294` @f1b2e77f5 always passes `initialActiveToolNames`, and
+/// `agent-session.ts:525` restores from the transcript only when it is `undefined`. `/reload` is the
+/// one rebuild that keeps the saved loadout (`a_removed_tool_stays_removed_across_reload`). RED
+/// while every modifier build restored the transcript: `--tools -bash` resumed WITH `bash`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_resumed_launch_applies_the_modifiers_over_the_saved_loadout() {
+    // The first run saves the full default loadout, `bash` included.
+    let first = rig("{}", |_| {}).await;
+    first.turn().await;
+    assert_eq!(
+        first.active().await,
+        sorted(&["read", "bash", "edit", "write"])
+    );
+    let file = first.runtime.session().await.session_file().await.unwrap();
+    let root = first._tmp.path().to_path_buf();
+
+    for (tools, expected) in [
+        (vec!["-bash"], sorted(&["read", "edit", "write"])),
+        (
+            vec!["+grep"],
+            sorted(&["read", "bash", "edit", "write", "grep"]),
+        ),
+    ] {
+        let mut cfg = SessionConfig::new(root.join("project"), root.join("agent"));
+        cfg.trust_override = Some(true);
+        cfg.persist = true;
+        cfg.tools = Some(tools.iter().map(|t| (*t).to_owned()).collect());
+        let factory = Arc::new(SessionFactory::new(
+            Arc::new(FauxProvider::new()) as Arc<dyn Provider>,
+            cfg,
+        ));
+        let resumed = AgentSessionRuntime::create(factory, SessionTarget::Resume(file.clone()))
+            .await
+            .unwrap();
+        let mut active = resumed.session().await.active_tool_names();
+        active.sort();
+        assert_eq!(active, expected, "--tools {tools:?} on a resumed launch");
+    }
+}

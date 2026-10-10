@@ -466,23 +466,12 @@ async fn run() -> anyhow::Result<i32> {
     // `--name` must be non-empty after trim (Pi main.ts:586-592).
     let session_name = cli.validated_name().map_err(|m| anyhow::anyhow!("{m}"))?;
 
-    // `--api-key` requires a resolvable model spec (Pi main.ts:701-710): without any of
-    // `--model`/`--provider`/`--models` there is no provider to attach the key to.
-    //
-    // `!exits_after_runtime`: pi raises this as a runtime diagnostic inside `createRuntime`
-    // (`main.ts:810-818` @v0.87.1), which is only reported after the `--help` / `--list-models`
-    // exits (`:857`, `:866`), so `--api-key k --help` prints the help and `--api-key k
+    // `--api-key` without a resolved model is refused in `session_launch::launch`, not here: pi
+    // tests the RESOLVED `sessionOptions.model` (`main.ts:830-834` @f1b2e77f5), which a `--models`
+    // or `enabledModels` scope sets only once it has resolved against the available models on a
+    // fresh session (SEAM-147). It is a runtime diagnostic there, reported after the `--help` /
+    // `--list-models` exits, so `--api-key k --help` prints the help and `--api-key k
     // --list-models` lists.
-    if !cli.exits_after_runtime()
-        && cli.api_key.is_some()
-        && cli.model.is_none()
-        && cli.provider.is_none()
-        && cli.models.is_empty()
-    {
-        anyhow::bail!(
-            "--api-key requires a model to be specified via --model, --provider/--model, or --models"
-        );
-    }
 
     // (`--export` is the other standalone run-and-exit action; it dispatches far above, at pi's own
     // position immediately after the `--version` exit — SEAM-106.)
@@ -634,11 +623,14 @@ async fn run() -> anyhow::Result<i32> {
     let cancel = CancelToken::new();
 
     // Default-launch model (Pi `findInitialModel`, model-resolver.ts:527-607): with NEITHER
-    // `--provider` nor `--model` (nor a `--models` scope) on a FRESH session, upgrade the zero-model
-    // `UnconfiguredProvider` that `select_provider` yielded to the resolved default, and set the
-    // matching `model_pattern` so the builder launches on that exact model. A no-op when nothing is
-    // configured — the empty catalog then stands and `resolve_model` yields `model: None` +
-    // `modelFallbackMessage` (SEAM-075).
+    // `--provider` nor `--model` on a FRESH session, upgrade the zero-model `UnconfiguredProvider`
+    // that `select_provider` yielded to the resolved default, and set the matching `model_pattern`
+    // so the builder launches on that exact model. A `--models` / `enabledModels` scope does not
+    // gate it (SEAM-147): pi falls through to `findInitialModel` whenever the scope picks nothing
+    // (`main.ts:499` → `core/sdk.ts:234-243` @f1b2e77f5), and when it does pick, the post-build
+    // pick in `session_launch` replaces this model exactly as pi's `options.model` wins. A no-op
+    // when nothing is configured — the empty catalog then stands and `resolve_model` yields
+    // `model: None` + `modelFallbackMessage` (SEAM-075).
     if let Some((launch_provider, launch_pattern)) =
         bootstrap::resolve_default_launch_model(&cli, &dirs, &config, &models_json, &settings_store)
     {
@@ -659,10 +651,15 @@ async fn run() -> anyhow::Result<i32> {
     // `/logout`'s `listCredentials()` — never saw it. Building the store in `main` (above, instead of
     // letting `SessionBuilder` default it) is what lets the key be installed on it.
     //
-    // The default-launch block above cannot have swapped `provider` out from under this: `--api-key`
-    // is rejected earlier unless one of `--model`/`--provider`/`--models` is present, and that block
-    // runs only when all three are absent.
-    if let Some(api_key) = cli.api_key.as_deref() {
+    // Only the key a `--model` / `--provider` names is installed here, on that model's provider
+    // (pi `setRuntimeApiKey(sessionOptions.model.provider, …)`, `main.ts:836-837` @f1b2e77f5); the
+    // default-launch block above runs only when both are absent, so it cannot have swapped
+    // `provider` out from under this. A key whose model a `--models` / `enabledModels` scope picks
+    // goes to the picked model's provider in `session_launch::launch`, which also refuses a key
+    // with no resolved model at all (SEAM-147).
+    if let Some(api_key) = cli.api_key.as_deref()
+        && (cli.model.is_some() || cli.provider.is_some())
+    {
         // The provider a deferred launch names, not the placeholder standing in for it.
         let key_provider = match cyrup::provider::requested_provider_id(
             cli.provider.as_deref(),
@@ -882,6 +879,13 @@ async fn run() -> anyhow::Result<i32> {
     // A `--help` / `--list-models` run takes the shared launch below instead: pi has those exits
     // after the runtime exists, and the ACP arm never builds one here.
     if mode == AppMode::Acp && !cli.exits_after_runtime() {
+        // SEAM-147 — the ACP host builds its sessions lazily and applies no launch-time scope
+        // pick, so only `--model` / `--provider` can resolve the model a `--api-key` needs (pi
+        // `main.ts:830-834` @f1b2e77f5 tests the resolved model; `launch` does it for the hosts
+        // below).
+        if cli.api_key.is_some() && cli.model.is_none() && cli.provider.is_none() {
+            anyhow::bail!("{}", session_launch::API_KEY_REQUIRES_MODEL);
+        }
         diagnostics::report(&settings_diagnostics);
         let sessions_root = cyrup_acp::SessionsRoot(dirs.session_dir.clone());
         let factory = session_launch::build_factory(
