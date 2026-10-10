@@ -40,12 +40,15 @@ fn header_set(headers: &mut HeaderMap, name: &str, value: Option<String>) {
 }
 
 /// 1:1 port of pi `buildBaseCodexHeaders` + `buildSSEHeaders`
-/// (`openai-codex-responses.ts:1577-1617`).
+/// (`openai-codex-responses.ts:1640-1661` + `:1663-1681` @f1b2e77f5).
 ///
-/// Order is load-bearing: the caller's overlays are applied FIRST and the Codex identity headers
-/// last, so `Authorization` / `chatgpt-account-id` / `originator` / `User-Agent` cannot be
-/// overridden by `model.headers` or `options.headers` (unlike `openai-responses`, where the overlays
-/// come last and do win). A `None` overlay value is pi's `headers.delete(key)`.
+/// Order is load-bearing, in three steps. (1) The defaults `originator: "pi"` and the `pi (...)`
+/// User-Agent are seeded FIRST (`new Headers({ originator: "pi", "User-Agent": getPiUserAgent() })`,
+/// `:1646-1647`, pi `0cf65d2bf` / #10429), so (2) the caller's overlays — `model.headers`, the
+/// per-credential `auth.auth.headers`, then `options.headers` — can override or delete them, as
+/// every other adapter allows. (3) Only `Authorization` and `chatgpt-account-id` are set LAST
+/// (`:1658-1659`) and cannot be overridden. A `None` overlay value is pi's `headers.delete(key)`,
+/// so a `None` on `originator` or `User-Agent` removes the default.
 ///
 /// `originator: "pi"` and the `pi (...)` User-Agent are sent verbatim, NOT rebranded: the ChatGPT
 /// backend gates on this client identity, which makes it protocol, not branding — the same reason
@@ -60,9 +63,14 @@ pub(super) fn build_sse_headers(
     token: &str,
     session_id: Option<&str>,
 ) -> HeaderMap {
-    // `new Headers(initHeaders)` where initHeaders is `model.headers` (:1583). cyrup splits pi's
-    // single `model.headers` into the catalog map plus the per-credential overlay.
+    // `new Headers({ originator: "pi", "User-Agent": getPiUserAgent() })` (:1646-1647): the
+    // defaults go in first so every overlay below can override them.
     let mut headers = HeaderMap::new();
+    header_set(&mut headers, "originator", Some("pi".to_string()));
+    header_set(&mut headers, "User-Agent", Some(codex_user_agent()));
+    // `headers.set(key, value)` for each of `initHeaders`, i.e. `model.headers` (:1648-1650).
+    // cyrup splits pi's single `model.headers` into the catalog map plus the per-credential
+    // overlay.
     if let Some(overlay) = &model.headers {
         for (name, value) in overlay {
             header_set(&mut headers, name, value.clone());
@@ -73,13 +81,14 @@ pub(super) fn build_sse_headers(
             header_set(&mut headers, name, value.clone());
         }
     }
-    // `for (const [key, value] of Object.entries(additionalHeaders || {}))` (:1584-1590).
+    // `for (const [key, value] of Object.entries(additionalHeaders || {}))` (:1651-1657).
     if let Some(overlay) = &opts.headers {
         for (name, value) in overlay {
             header_set(&mut headers, name, value.clone());
         }
     }
 
+    // Only these two are set last (:1658-1659), so no overlay can replace the credential.
     header_set(
         &mut headers,
         "Authorization",
@@ -90,9 +99,8 @@ pub(super) fn build_sse_headers(
         "chatgpt-account-id",
         Some(account_id.to_string()),
     );
-    header_set(&mut headers, "originator", Some("pi".to_string()));
-    header_set(&mut headers, "User-Agent", Some(codex_user_agent()));
 
+    // `buildSSEHeaders` (:1670-1678).
     header_set(
         &mut headers,
         "OpenAI-Beta",
@@ -117,7 +125,7 @@ pub(super) fn build_sse_headers(
     headers
 }
 
-/// pi `headers.set("User-Agent", getPiUserAgent())` (`openai-codex-responses.ts:1626` @v0.87.1).
+/// pi `"User-Agent": getPiUserAgent()` (`openai-codex-responses.ts:1647` @f1b2e77f5).
 fn codex_user_agent() -> String {
     crate::utils::user_agent::platform_user_agent("pi")
 }

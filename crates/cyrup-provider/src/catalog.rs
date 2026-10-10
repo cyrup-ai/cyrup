@@ -325,8 +325,9 @@ mod tests {
             .expect("anthropic claude-sonnet-4-5 present");
         assert_eq!(sonnet.api.as_str(), known_api::ANTHROPIC_MESSAGES);
         assert!(sonnet.reasoning);
+        // 200000 since PROV-149: models.dev (and so pi.dev) moved Sonnet 4.5 back from 1M.
         assert_eq!(
-            sonnet.context_window, 1_000_000,
+            sonnet.context_window, 200_000,
             "metadata comes from the live embedded catalog"
         );
         // A `baseUrl` is an ORIGIN, never a full endpoint path (the seed stub stored

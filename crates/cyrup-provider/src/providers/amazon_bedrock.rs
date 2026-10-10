@@ -517,7 +517,7 @@ mod tests {
 
     // ------------------------------------------------------------------ catalog
 
-    /// pi `AMAZON_BEDROCK_MODELS`: 183 rows, every one on the `bedrock-converse-stream` wire api
+    /// pi `AMAZON_BEDROCK_MODELS`: 193 rows, every one on the `bedrock-converse-stream` wire api
     /// and owned by `amazon-bedrock`.
     ///
     /// 109 until PROV-071, which is the same statement with a different date on it: the catalog was
@@ -526,11 +526,13 @@ mod tests {
     /// with a decision here. 174 until PROV-131's refresh added nine rows AWS has since published:
     /// `anthropic.claude-sonnet-5-5`, the `in.` (Mumbai) profiles for Haiku 4.5, Opus 5 and
     /// Sonnet 5, `grok-4.7` on `global.`/`us.`, and `gpt-6.1-sol` on `openai.`/`us.`/`global.`.
-    /// Nothing was retired.
+    /// Nothing was retired. 183 until PROV-149's refresh added ten: the six Claude Haiku 5.5
+    /// profiles (bare, `global.`, `us.`, `eu.`, `jp.`, `au.`; pi `f76c1db66`), Sonnet 5.5 on `us.`
+    /// and `eu.`, and `zai.glm-5.3` on `global.`/`us.`. Nothing was retired.
     #[test]
     fn catalog_parses_verbatim_with_expected_count() {
         let models = amazon_bedrock_models();
-        assert_eq!(models.len(), 183);
+        assert_eq!(models.len(), 193);
         assert!(
             models
                 .iter()
@@ -549,7 +551,7 @@ mod tests {
             u.dedup();
             u.len()
         };
-        assert_eq!(unique, 183, "duplicate model id in the Bedrock catalog");
+        assert_eq!(unique, 193, "duplicate model id in the Bedrock catalog");
         assert!(models.iter().all(|m| m.context_window > 0));
         assert!(models.iter().all(|m| m.max_tokens > 0));
         assert!(models.iter().all(|m| !m.base_url.is_empty()));
@@ -567,7 +569,8 @@ mod tests {
             .filter(|m| m.base_url == BEDROCK_EU_CENTRAL_1_BASE_URL)
             .map(|m| m.id.as_str())
             .collect();
-        // Nine at `b0c2a90e`, seventeen now, and the shape of the growth is the point: the EU
+        // Nine at `b0c2a90e`, seventeen after PROV-071, nineteen since PROV-149 added the `eu.`
+        // Haiku 5.5 and Sonnet 5.5 profiles, and the shape of the growth is the point: the EU
         // region gained four Nova profiles and a Pixtral one, so "the eu.* profiles are the Claude
         // ones" — true of the frozen catalog — was never a rule, only that catalog's contents.
         assert_eq!(
@@ -579,6 +582,7 @@ mod tests {
                 "eu.amazon.nova-pro-v1:0",
                 "eu.anthropic.claude-fable-5",
                 "eu.anthropic.claude-haiku-4-5-20251001-v1:0",
+                "eu.anthropic.claude-haiku-5-5",
                 "eu.anthropic.claude-opus-4-5-20251101-v1:0",
                 "eu.anthropic.claude-opus-4-6-v1",
                 "eu.anthropic.claude-opus-4-7",
@@ -589,6 +593,7 @@ mod tests {
                 "eu.anthropic.claude-sonnet-4-5-20250929-v1:0",
                 "eu.anthropic.claude-sonnet-4-6",
                 "eu.anthropic.claude-sonnet-5",
+                "eu.anthropic.claude-sonnet-5-5",
                 "eu.mistral.pixtral-large-2502-v1:0",
             ]
         );
@@ -605,7 +610,7 @@ mod tests {
                 .iter()
                 .filter(|m| m.base_url == BEDROCK_US_EAST_1_BASE_URL)
                 .count(),
-            166
+            174
         );
     }
 
@@ -670,21 +675,22 @@ mod tests {
         assert_eq!(m.context_window, 163_840);
         assert_eq!(m.max_tokens, 81_920);
 
-        // 42 of the 183 rows are non-reasoning and 43 are text-only — the catalog is genuinely
+        // 42 of the 193 rows are non-reasoning and 45 are text-only — the catalog is genuinely
         // heterogeneous, which is what makes the single-row assertions above worth making.
         // PROV-131's nine new rows are all reasoning-capable and all accept images, so only the
-        // image-input total moved.
+        // image-input total moved. PROV-149's ten are all reasoning-capable: the eight Claude rows
+        // accept images (140 -> 148) and the two `zai.glm-5.3` rows are text-only (43 -> 45).
         assert_eq!(models.iter().filter(|m| !m.reasoning).count(), 42);
         assert_eq!(
             models
                 .iter()
                 .filter(|m| m.input == vec![Modality::Text])
                 .count(),
-            43
+            45
         );
         assert_eq!(
             models.iter().filter(|m| m.supports_image_input()).count(),
-            140
+            148
         );
     }
 
@@ -699,20 +705,25 @@ mod tests {
         let tiered: Vec<&Model> = models.iter().filter(|m| m.cost.tiers.is_some()).collect();
         assert_eq!(
             tiered.len(),
-            23,
+            29,
             "models.dev tiers the GPT-5.6/6/6.1 families across the bare, us., in. and global. \
-             inference profiles; zero of these survived before PROV-131"
+             inference profiles (23; zero of these survived before PROV-131) and the six Claude \
+             Haiku 5.5 profiles (PROV-149)"
         );
         for m in &tiered {
-            // Every tier on this catalog is OpenAI's one long-context rung.
-            assert!(
-                m.id.as_str().contains("openai."),
-                "{}: an unexpected provider gained a tier",
-                m.id.as_str()
-            );
+            // Two rungs exist on this catalog: OpenAI's long-context one above 272k, and Claude
+            // Haiku 5.5's above 100k (pi `f76c1db66`).
+            let id = m.id.as_str();
+            let threshold = if id.contains("openai.") {
+                272_000
+            } else if id.contains("anthropic.claude-haiku-5-5") {
+                100_000
+            } else {
+                panic!("{id}: an unexpected provider gained a tier");
+            };
             let tiers = m.cost.tiers.as_ref().expect("filtered above");
             assert_eq!(tiers.len(), 1, "{}", m.id.as_str());
-            assert_eq!(tiers[0].input_tokens_above, 272_000, "{}", m.id.as_str());
+            assert_eq!(tiers[0].input_tokens_above, threshold, "{}", m.id.as_str());
             // The tier is strictly dearer than the base rate, which is the whole point of it.
             assert!(
                 tiers[0].input > m.cost.input,
@@ -729,12 +740,66 @@ mod tests {
         assert!(opus.cost.tiers.is_none());
     }
 
+    /// PROV-149 — the six Claude Haiku 5.5 inference profiles pi.dev serves since pi `f76c1db66`.
+    /// The `global.` row is priced like the direct API (0.1/0.5/0.01/0.125 with the >100k tier at
+    /// 0.5/2.5/0.05/0.625) and the regional ones 10% over it; a 150k-input turn on either is
+    /// billed at the tier rate by `compute_cost`, which is what `blocks.rs` prices Bedrock usage
+    /// with.
+    #[test]
+    fn haiku_55_profiles_ship_with_their_long_context_tier() {
+        let models = amazon_bedrock_models();
+        let find = |id: &str| {
+            models
+                .iter()
+                .find(|m| m.id.as_str() == id)
+                .unwrap_or_else(|| panic!("the Bedrock catalog has no {id}"))
+        };
+        let usage = cyrup_core::Usage {
+            input: 150_000,
+            output: 2_000,
+            ..Default::default()
+        };
+        for (id, base_input, tier_input, tier_output) in [
+            ("global.anthropic.claude-haiku-5-5", 0.1, 0.5, 2.5),
+            ("anthropic.claude-haiku-5-5", 0.1, 0.5, 2.5),
+            ("us.anthropic.claude-haiku-5-5", 0.11, 0.55, 2.75),
+            ("eu.anthropic.claude-haiku-5-5", 0.11, 0.55, 2.75),
+            ("jp.anthropic.claude-haiku-5-5", 0.11, 0.55, 2.75),
+            ("au.anthropic.claude-haiku-5-5", 0.11, 0.55, 2.75),
+        ] {
+            let m = find(id);
+            assert_eq!(m.context_window, 1_000_000, "{id}");
+            assert_eq!(m.max_tokens, 128_000, "{id}");
+            assert_eq!(m.cost.input, base_input, "{id}");
+            let map = m.thinking_level_map.as_ref().expect("thinkingLevelMap");
+            assert_eq!(map.get("xhigh"), Some(&Some("xhigh".to_string())), "{id}");
+            assert_eq!(map.get("max"), Some(&Some("max".to_string())), "{id}");
+            let tiers = m.cost.tiers.as_ref().expect("Haiku 5.5 carries a tier");
+            assert_eq!(tiers.len(), 1, "{id}");
+            assert_eq!(tiers[0].input_tokens_above, 100_000, "{id}");
+            let cost = crate::usage::compute_cost(&m.cost, &usage);
+            let expected_input = 150_000.0 * tier_input / 1e6;
+            let expected_output = 2_000.0 * tier_output / 1e6;
+            assert!(
+                (cost.input - expected_input).abs() < 1e-12,
+                "{id}: 150k input priced at {}, expected {expected_input}",
+                cost.input
+            );
+            assert!(
+                (cost.output - expected_output).abs() < 1e-12,
+                "{id}: output priced at {}, expected {expected_output}",
+                cost.output
+            );
+        }
+    }
+
     /// No Bedrock row may enable a wire-payload compat flag, which is what kept it out of the
     /// blast radius pinned by
     /// `api/anthropic_messages.rs::tool_search_is_confined_to_the_openai_responses_catalog`.
     ///
-    /// It used to say "no `compat` block anywhere" and that is no longer true — 93 of the 183 rows
-    /// carry one (88 of 174 before PROV-131's refresh added five structured-output rows). The block is `{"supportsStrictMode": true}` on every single one of them, which is
+    /// It used to say "no `compat` block anywhere" and that is no longer true — 95 of the 193 rows
+    /// carry one (88 of 174 before PROV-131's refresh added five structured-output rows; 93 of 183
+    /// before PROV-149's added the two `zai.glm-5.3` rows). The block is `{"supportsStrictMode": true}` on every single one of them, which is
     /// PROV-078's change: upstream stopped INFERRING strict-tool support from the provider and
     /// started writing it into the catalog. That is metadata about the tool schema, not a flag that
     /// adds anything to a request, so the invariant this test exists for is intact — and it is now
@@ -759,7 +824,7 @@ mod tests {
         }
         assert_eq!(
             models.iter().filter(|m| m.compat.is_some()).count(),
-            93,
+            95,
             "every Bedrock compat block is PROV-078's `supportsStrictMode`; a different count \
              means a different flag arrived and has to be read"
         );
@@ -782,7 +847,8 @@ mod tests {
             .iter()
             .filter(|m| m.thinking_level_map.is_some())
             .collect();
-        assert_eq!(with_map.len(), 76);
+        // 84 since PROV-149's eight new Claude rows (Haiku 5.5 x6, Sonnet 5.5 `us.`/`eu.`).
+        assert_eq!(with_map.len(), 84);
         for m in &with_map {
             let map = m.thinking_level_map.as_ref().expect("checked above");
             assert_ne!(
@@ -823,7 +889,7 @@ mod tests {
         let provider = amazon_bedrock_provider();
         assert_eq!(provider.id().as_str(), "amazon-bedrock");
         assert_eq!(provider.name(), "Amazon Bedrock");
-        assert_eq!(provider.models().len(), 183);
+        assert_eq!(provider.models().len(), 193);
 
         let auth = provider.provider_auth().expect("bedrock declares auth");
         assert!(auth.api_key.is_some());

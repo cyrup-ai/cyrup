@@ -445,19 +445,29 @@ fn pick(models: &Models, provider: &str, id: &str) -> Model {
 
 // ------------------------------------------------------------------------------ the headline case --
 
-/// **The headline PROV-004 case.** Anthropic shipped a 1M-token context for Sonnet 4.5; pi picked it
-/// up in `cc2db980` (`anthropic.models.ts:185-201` and `:202-218` @ `91585d9a` both read
-/// `contextWindow: 1000000`). cyrup's snapshot still capped it at 200k, so compaction triggered ~5x
-/// too early and the user could not use four fifths of the window they were paying for.
-/// `maxTokens` was already correct at 64000 and must not move.
+/// **The headline PROV-004 case, reversed by PROV-149.** pi picked up a 1M-token context for
+/// Sonnet 4.5 in `cc2db980` (`anthropic.models.ts:185-201` and `:202-218` @ `91585d9a` both read
+/// `contextWindow: 1000000`), and PROV-004 raised cyrup's 200k to match. models.dev has since
+/// moved both rows back to `contextWindow: 200000` with `inputLimits.images.maxPerRequest: 100`
+/// (no upstream commit; pi.dev serves it, measured 2026-10-09). The window is what compaction and
+/// overflow budgeting read, so a 1M floor lets a session budget past what the provider accepts.
+/// `maxTokens` stays at 64000.
 #[test]
-fn sonnet_4_5_offers_the_full_1m_context_window() {
+fn sonnet_4_5_resolves_at_a_200k_window_and_100_images_per_request() {
     let models = selection();
     for id in ["claude-sonnet-4-5", "claude-sonnet-4-5-20250929"] {
         let m = pick(&models, "anthropic", id);
         assert_eq!(
-            m.context_window, 1_000_000,
-            "{id}: pi anthropic.models.ts @91585d9a says contextWindow 1000000 (cc2db980)"
+            m.context_window, 200_000,
+            "{id}: pi.dev serves contextWindow 200000 (PROV-149)"
+        );
+        assert_eq!(
+            m.input_limits
+                .as_ref()
+                .and_then(|l| l.images.as_ref())
+                .and_then(|i| i.max_per_request),
+            Some(100),
+            "{id}: pi.dev serves inputLimits.images.maxPerRequest 100 (PROV-149)"
         );
         assert_eq!(
             m.max_tokens, 64_000,
@@ -500,10 +510,10 @@ fn retired_claude_models_are_gone() {
             "{id} was retired upstream in cc2db980 but is still selectable"
         );
     }
-    // …and the surviving set is exactly pi's 16 (14 while the catalog was frozen at `b0c2a90e`;
+    // …and the surviving set is exactly pi's 17 (14 while the catalog was frozen at `b0c2a90e`;
     // PROV-071's refresh added Opus 5, Opus 5.5, Sonnet 5.5 and Fable 5.1 and retired the two
-    // Opus 4.1 rows).
-    assert_eq!(models.get_models(Some("anthropic")).len(), 16);
+    // Opus 4.1 rows; PROV-149's added Haiku 5.5).
+    assert_eq!(models.get_models(Some("anthropic")).len(), 17);
     // Every remaining Claude model is a reasoning model.
     assert!(
         models
@@ -649,12 +659,12 @@ fn openrouter_context_windows_come_from_the_serving_provider() {
     // `deepseek/deepseek-v4-flash` is the row that shows why a catalog assertion must name its
     // source. models.dev re-reads OpenRouter's top serving provider on every refresh, and this row
     // has moved three times: `65536/1048576` at `91585d9a`, `4096/1048575` at `b0c2a90e`, and
-    // `131072/1048576` at the live endpoint PROV-071 now generates from. Each value was right for
-    // its source; none of them is right for another, which is exactly why the catalogs come from
-    // ONE source and the manifest records which. `scout` and `r1` above/below are the stable
-    // evidence for `46145bef` itself.
+    // `131072/1048576` at the live endpoint PROV-071 generated from, and `943718/1048576` at
+    // PROV-149's refresh of that endpoint. Each value was right for its source; none of them is
+    // right for another, which is exactly why the catalogs come from ONE source and the manifest
+    // records which. `scout` and `r1` above/below are the stable evidence for `46145bef` itself.
     let flash = pick(&models, "openrouter", "deepseek/deepseek-v4-flash");
-    assert_eq!(flash.max_tokens, 131_072);
+    assert_eq!(flash.max_tokens, 943_718);
     assert_eq!(flash.context_window, 1_048_576);
 
     let r1 = pick(&models, "openrouter", "deepseek/deepseek-r1");
@@ -875,10 +885,10 @@ fn every_opencode_responses_row_suppresses_the_session_id_header() {
 
     assert_eq!(
         rows.len(),
-        29,
-        "opencode ships 29 openai-responses rows since PROV-071's live refresh (19 while the \
-         catalog was frozen at b0c2a90e); if that moved, re-derive the scope against pi's \
-         opencode catalog rather than loosening this test"
+        30,
+        "opencode ships 30 openai-responses rows since PROV-149's refresh added gpt-6.1-sol (29 \
+         after PROV-071's live refresh, 19 while the catalog was frozen at b0c2a90e); if that \
+         moved, re-derive the scope against pi's opencode catalog rather than loosening this test"
     );
 
     for m in &rows {

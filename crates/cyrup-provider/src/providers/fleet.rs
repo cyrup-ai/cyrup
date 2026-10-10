@@ -367,7 +367,7 @@ mod tests {
         ("moonshotai", 4),
         ("moonshotai-cn", 4),
         ("nvidia", 19),
-        ("openrouter", 393),
+        ("openrouter", 403),
         ("qwen-token-plan", 20),
         ("qwen-token-plan-cn", 20),
         ("qwen-token-plan-individual", 9),

@@ -2,10 +2,11 @@
 
 use super::capabilities::{
     is_anthropic_claude_model, is_gov_cloud_bedrock_target, map_thinking_level_to_effort,
-    supports_adaptive_thinking, supports_thinking_block_binding,
+    model_match_candidates, supports_adaptive_thinking, supports_thinking_block_binding,
 };
 use super::convert::{build_system_prompt, convert_messages, convert_tool_config};
 use super::options::{BedrockOptions, BedrockThinkingDisplay};
+use crate::api::compat::mapped_effort_or;
 use crate::context::Context;
 use crate::model::Model;
 use crate::stream::{CacheRetention, StreamOptions};
@@ -124,7 +125,8 @@ pub(super) fn resolve_cache_retention(
     resolve_cache_retention_with(cache_retention, |name| env.get(name))
 }
 
-/// pi `buildAdditionalModelRequestFields` (`bedrock-converse-stream.ts:1039-1087`).
+/// pi `buildAdditionalModelRequestFields` (`bedrock-converse-stream.ts:1262-1333` @f1b2e77f5):
+/// the Claude thinking payload, or, for OpenAI models, the reasoning effort (PROV-140).
 fn build_additional_model_request_fields(
     model: &Model,
     opts: &StreamOptions,
@@ -135,10 +137,10 @@ fn build_additional_model_request_fields(
     if !opts.reasoning.is_on() || !model.reasoning {
         return None;
     }
-    if !is_anthropic_claude_model(model) {
-        return None;
-    }
     let level = opts.reasoning.level().unwrap_or(ThinkingLevel::High);
+    if !is_anthropic_claude_model(model) {
+        return build_openai_reasoning_fields(model, opts, level);
+    }
 
     let is_gov_cloud = is_gov_cloud_bedrock_target(model, bedrock, env);
     // pi `:1048-1050`: GovCloud's Converse schema rejects `thinking.display`.
@@ -203,6 +205,57 @@ fn build_additional_model_request_fields(
         }
     }
     Some(Value::Object(result))
+}
+
+/// pi's non-Claude branches of `buildAdditionalModelRequestFields`
+/// (`bedrock-converse-stream.ts:1318-1330` @f1b2e77f5, `2989eb581`, PROV-140).
+///
+/// `gpt-oss` is tested first because every `gpt-oss` id also contains `gpt-`. It takes a flat
+/// `reasoning_effort` from its own table and ignores `thinkingLevelMap`. Other `gpt-` models
+/// (GPT-5.x, GPT-6) take a nested `reasoning.effort`, where a string `thinkingLevelMap` entry
+/// wins over the table. Every other non-Claude model gets no field.
+fn build_openai_reasoning_fields(
+    model: &Model,
+    opts: &StreamOptions,
+    level: ThinkingLevel,
+) -> Option<Value> {
+    let candidates = model_match_candidates(model);
+    if candidates.iter().any(|s| s.contains("gpt-oss")) {
+        return Some(json!({ "reasoning_effort": openai_gpt_oss_effort(level) }));
+    }
+    if candidates.iter().any(|s| s.contains("gpt-")) {
+        // `typeof mapped === "string" ? mapped : OPENAI_GPT_EFFORT[level]`: an absent key and a
+        // `null` entry both fall back to the table.
+        let effort = mapped_effort_or(
+            model.thinking_level_map.as_ref(),
+            opts.reasoning,
+            openai_gpt_effort(level),
+        );
+        return Some(json!({ "reasoning": { "effort": effort } }));
+    }
+    None
+}
+
+/// pi `OPENAI_GPT_EFFORT` (`bedrock-converse-stream.ts:1339-1346` @f1b2e77f5): GPT-5.x and GPT-6
+/// reject `minimal`, so it is sent as `low`.
+fn openai_gpt_effort(level: ThinkingLevel) -> &'static str {
+    match level {
+        ThinkingLevel::Minimal | ThinkingLevel::Low => "low",
+        ThinkingLevel::Medium => "medium",
+        ThinkingLevel::High => "high",
+        ThinkingLevel::Xhigh => "xhigh",
+        ThinkingLevel::Max => "max",
+    }
+}
+
+/// pi `OPENAI_GPT_OSS_EFFORT` (`bedrock-converse-stream.ts:1349-1356` @f1b2e77f5): gpt-oss only
+/// accepts low, medium and high.
+fn openai_gpt_oss_effort(level: ThinkingLevel) -> &'static str {
+    match level {
+        ThinkingLevel::Minimal | ThinkingLevel::Low => "low",
+        ThinkingLevel::Medium => "medium",
+        ThinkingLevel::High | ThinkingLevel::Xhigh | ThinkingLevel::Max => "high",
+    }
 }
 
 /// pi's inline `defaultBudgets` table plus the custom-budget lookup

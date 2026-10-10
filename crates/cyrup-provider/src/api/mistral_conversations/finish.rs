@@ -50,12 +50,14 @@ fn mistral_cached_prompt_tokens(raw: &Value, prompt_tokens: u64) -> u64 {
 }
 
 /// Map a Mistral `finishReason` to a cyrup [`StopReason`] (Pi `mapChatStopReason`,
-/// mistral-conversations.ts:662-677).
+/// `mistral-conversations.ts:936-952` @f1b2e77f5).
 ///
 /// The `Option` mirrors Pi's `reason: string | null` signature; the `None` arm is unreachable from
 /// the streaming decoder, because Pi guards the call with the truthiness test
-/// `if (choice.finishReason)` (`:355`) and cyrup matches that — a null/empty `finishReason` leaves
-/// the turn unsettled rather than mapping it to `Stop`.
+/// `if (choice.finish_reason)` (`:633` @f1b2e77f5). cyrup keeps the same truthiness guard, but reads
+/// the key as the old SDK's camelCase `finishReason` where pi reads Mistral's wire `finish_reason`
+/// (`PROV-152`) — a null/empty `finishReason` leaves the turn unsettled rather than mapping it to
+/// `Stop`.
 ///
 /// Returns `(stop_reason, error_message)`, mirroring pi's `{ stopReason, errorMessage? }` tuple —
 /// the same shape [`crate::api::anthropic_messages`]'s `map_stop_reason` already uses.
@@ -65,17 +67,23 @@ fn mistral_cached_prompt_tokens(raw: &Value, prompt_tokens: u64) -> u64 {
 /// or anything Mistral adds later — was transcribed as a clean, successful turn: the agent loop saw
 /// `Stop`, emitted `turn_end` with no tool calls, and ended the run with no error banner and no
 /// retry, carrying only whatever partial text arrived before the cutoff. pi's `default` arm returns
-/// `{ stopReason: "error", errorMessage: `Provider stopped with: ${reason}` }` (`:674-675`), and its
-/// `"error"` arm likewise carries `"Provider stopped with: error"` (`:672-673`) rather than letting
-/// the call site fall back to the generic `"An unknown error occurred"`.
+/// `{ stopReason: "error", errorMessage: `Provider stopped with: ${reason}` }` (`:949-950`
+/// @f1b2e77f5), and its `"error"` arm carries `"Provider stopped with: error (server error)"`
+/// (`:946-948`) rather than letting the call site fall back to the generic
+/// `"An unknown error occurred"`. The `(server error)` suffix is upstream's (`7fb59f995`, #10487):
+/// Mistral reports transient server failures as `finish_reason: "error"`, and the suffix is what
+/// makes [`crate::utils::retry::is_retryable_assistant_error`]'s `server.?error` pattern match, so
+/// the agent auto-retries the turn instead of ending it with an error banner.
 pub(super) fn map_chat_stop_reason(reason: Option<&str>) -> (StopReason, Option<String>) {
     match reason {
         None | Some("stop") => (StopReason::Stop, None),
         Some("length") | Some("model_length") => (StopReason::Length, None),
         Some("tool_calls") => (StopReason::ToolUse, None),
+        // Mistral reports transient server failures this way; "server error" makes the message
+        // retryable.
         Some("error") => (
             StopReason::Error,
-            Some("Provider stopped with: error".to_string()),
+            Some("Provider stopped with: error (server error)".to_string()),
         ),
         Some(other) => (
             StopReason::Error,

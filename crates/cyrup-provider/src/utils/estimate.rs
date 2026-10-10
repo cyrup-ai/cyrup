@@ -24,7 +24,14 @@ pub struct ContextUsageEstimate {
     pub last_usage_index: Option<usize>,
 }
 
-const CHARS_PER_TOKEN: u64 = 4;
+/// Pi `CHARS_PER_TOKEN = 3.5` (`estimate.ts:15` @f1b2e77f5, raised from 4 by `27075fe07` /
+/// #10497 so the output-token clamp leaves enough room for large new inputs). Held as the exact
+/// fraction `CHARS_PER_TOKEN_NUM / CHARS_PER_TOKEN_DEN` = 7/2 so [`ceil_div`] stays integer-exact.
+///
+/// PROV-142. This is the *request* estimate only: cyrup-session's compaction estimator
+/// (`compaction/tokens.rs`) stays at `/ 4`, as pi's coding-agent `compaction.ts` does.
+const CHARS_PER_TOKEN_NUM: u64 = 7;
+const CHARS_PER_TOKEN_DEN: u64 = 2;
 const ESTIMATED_IMAGE_CHARS: u64 = 4800;
 
 /// JS `String.length` (UTF-16 code units).
@@ -32,9 +39,12 @@ fn js_len(s: &str) -> u64 {
     s.encode_utf16().count() as u64
 }
 
-/// `Math.ceil(chars / CHARS_PER_TOKEN)` in integer arithmetic.
+/// `Math.ceil(chars / CHARS_PER_TOKEN)` in integer arithmetic: `ceil(chars / 3.5)` is
+/// `ceil(2 * chars / 7)`, so no float rounding can move the result.
 fn ceil_div(chars: u64) -> u64 {
-    chars.div_ceil(CHARS_PER_TOKEN)
+    chars
+        .saturating_mul(CHARS_PER_TOKEN_DEN)
+        .div_ceil(CHARS_PER_TOKEN_NUM)
 }
 
 /// Total context tokens for a usage block (Pi `calculateContextTokens`, estimate.ts:17-19):
@@ -325,11 +335,16 @@ mod tests {
         assert_eq!(calculate_context_tokens(&no_total), 40);
     }
 
+    /// PROV-142 — pi `CHARS_PER_TOKEN = 3.5` (`estimate.ts:15` @f1b2e77f5). Every value below
+    /// except the exact `7 / 3.5` differs from the old `/ 4` result, so the test bites on the divisor.
     #[test]
-    fn text_tokens_ceil_divide_by_four() {
+    fn text_tokens_ceil_divide_by_three_and_a_half() {
         assert_eq!(estimate_text_tokens(""), 0);
-        assert_eq!(estimate_text_tokens("abcd"), 1);
-        assert_eq!(estimate_text_tokens("abcde"), 2); // ceil(5/4)
+        assert_eq!(estimate_text_tokens("abcd"), 2); // ceil(4/3.5); /4 gave 1
+        assert_eq!(estimate_text_tokens("abcdefg"), 2); // exactly 7/3.5, no round-up
+        assert_eq!(estimate_text_tokens("abcdefgh"), 3); // ceil(8/3.5); /4 gave 2
+        assert_eq!(estimate_text_tokens(&"x".repeat(3_500)), 1_000); // /4 gave 875
+        assert_eq!(estimate_text_tokens(&"x".repeat(4_000)), 1_143); // /4 gave 1000
     }
 
     #[test]
@@ -338,8 +353,9 @@ mod tests {
             data: "x".into(),
             mime_type: "image/png".into(),
         }];
-        // ceil(4800/4) = 1200
-        assert_eq!(estimate_text_and_image_content_tokens(&content), 1200);
+        // PROV-142 — ceil(ESTIMATED_IMAGE_CHARS / 3.5) = ceil(4800/3.5) = 1372 (`estimate.ts:15-16`
+        // @f1b2e77f5; pi's test file has no image case, so this one is derived); /4 gave 1200.
+        assert_eq!(estimate_text_and_image_content_tokens(&content), 1372);
     }
 
     #[test]
@@ -379,7 +395,7 @@ mod tests {
         let est = estimate_context_tokens(&ctx);
         assert_eq!(est.last_usage_index, Some(1));
         assert_eq!(est.usage_tokens, 500);
-        // trailing = estimate of the final "again" user message = ceil(5/4) = 2
+        // trailing = estimate of the final "again" user message = ceil(5/3.5) = 2
         assert_eq!(est.trailing_tokens, estimate_text_tokens("again"));
         assert_eq!(est.tokens, 500 + est.trailing_tokens);
     }
@@ -489,7 +505,7 @@ mod tests {
     /// `estimateTextTokens(getSystemMessageText(m)) + estimateToolsTokens(m.toolsAdded) +
     /// estimateToolsTokens(m.toolsRemoved)`.
     ///
-    /// The three sub-totals are rounded up INDEPENDENTLY, so the result is NOT `ceil(total_chars/4)`;
+    /// The three sub-totals are rounded up INDEPENDENTLY, so the result is NOT `ceil(total_chars/3.5)`;
     /// this test pins that, and pins that BOTH tool lists are charged (the coding-agent's own
     /// `compaction.ts:324-334` estimator charges only `toolsAdded` — two upstream functions, two
     /// formulas). Red before the arm existed: a system message estimated as 0 tokens.
@@ -521,7 +537,8 @@ mod tests {
         assert!(expected > 0, "a system message is not free");
 
         // Each term is independently non-zero and independently rounded.
-        assert_eq!(estimate_text_tokens(prompt), 5, "20 chars / 4");
+        // PROV-142 — ceil(20/3.5) = 6 since pi 1.1.0 (`27075fe07`); it was 5 at `/ 4`.
+        assert_eq!(estimate_text_tokens(prompt), 6, "20 chars / 3.5");
         assert!(
             estimate_tools_tokens(&removed) > 0,
             "`toolsRemoved` is charged too"

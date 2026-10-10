@@ -10,8 +10,8 @@
 		"amazon-bedrock": {
 			"source": "https://pi.dev/api/models/providers/amazon-bedrock",
 			"module": "packages/ai/src/providers/amazon-bedrock.models.ts",
-			"fetchedAt": "2026-10-03T16:16:34Z",
-			"revision": "sha256-88878e8f90eaebcdfe53f7d219e69bd7bf1748e88190ae19498530362aa1aa53"
+			"fetchedAt": "2026-10-09T12:41:12Z",
+			"revision": "sha256-3ff185d61544e1bbe1daf233d8af4b9d19a01311153d67acc4a91a1ca6f1c214"
 		},
 		"ant-ling": {
 			"source": "https://pi.dev/api/models/providers/ant-ling",
@@ -22,8 +22,8 @@
 		"anthropic": {
 			"source": "https://pi.dev/api/models/providers/anthropic",
 			"module": "packages/ai/src/providers/anthropic.models.ts",
-			"fetchedAt": "2026-09-28T18:47:52Z",
-			"revision": "sha256-6ffe40ba88d306a8412c9cc415b71210b5bf34573fc2e6544564eed74c029dfc"
+			"fetchedAt": "2026-10-09T12:41:16Z",
+			"revision": "sha256-3ff185d61544e1bbe1daf233d8af4b9d19a01311153d67acc4a91a1ca6f1c214"
 		},
 		"azure-openai-responses": {
 			"source": "https://pi.dev/api/models/providers/azure-openai-responses",
@@ -64,14 +64,14 @@
 		"github-copilot": {
 			"source": "https://pi.dev/api/models/providers/github-copilot",
 			"module": "packages/ai/src/providers/github-copilot.models.ts",
-			"fetchedAt": "2026-09-28T18:48:11Z",
-			"revision": "sha256-6ffe40ba88d306a8412c9cc415b71210b5bf34573fc2e6544564eed74c029dfc"
+			"fetchedAt": "2026-10-09T12:41:35Z",
+			"revision": "sha256-3ff185d61544e1bbe1daf233d8af4b9d19a01311153d67acc4a91a1ca6f1c214"
 		},
 		"google": {
 			"source": "https://pi.dev/api/models/providers/google",
 			"module": "packages/ai/src/providers/google.models.ts",
-			"fetchedAt": "2026-09-28T18:48:14Z",
-			"revision": "sha256-6ffe40ba88d306a8412c9cc415b71210b5bf34573fc2e6544564eed74c029dfc"
+			"fetchedAt": "2026-10-09T12:41:37Z",
+			"revision": "sha256-3ff185d61544e1bbe1daf233d8af4b9d19a01311153d67acc4a91a1ca6f1c214"
 		},
 		"google-vertex": {
 			"source": "https://pi.dev/api/models/providers/google-vertex",
@@ -100,8 +100,8 @@
 		"minimax": {
 			"source": "https://pi.dev/api/models/providers/minimax",
 			"module": "packages/ai/src/providers/minimax.models.ts",
-			"fetchedAt": "2026-09-28T18:48:29Z",
-			"revision": "sha256-6ffe40ba88d306a8412c9cc415b71210b5bf34573fc2e6544564eed74c029dfc"
+			"fetchedAt": "2026-10-09T12:41:52Z",
+			"revision": "sha256-3ff185d61544e1bbe1daf233d8af4b9d19a01311153d67acc4a91a1ca6f1c214"
 		},
 		"minimax-cn": {
 			"source": "https://pi.dev/api/models/providers/minimax-cn",
@@ -148,26 +148,26 @@
 		"opencode": {
 			"source": "https://pi.dev/api/models/providers/opencode",
 			"module": "packages/ai/src/providers/opencode.models.ts",
-			"fetchedAt": "2026-09-28T18:48:47Z",
-			"revision": "sha256-6ffe40ba88d306a8412c9cc415b71210b5bf34573fc2e6544564eed74c029dfc"
+			"fetchedAt": "2026-10-09T12:42:12Z",
+			"revision": "sha256-3ff185d61544e1bbe1daf233d8af4b9d19a01311153d67acc4a91a1ca6f1c214"
 		},
 		"opencode-go": {
 			"source": "https://pi.dev/api/models/providers/opencode-go",
 			"module": "packages/ai/src/providers/opencode-go.models.ts",
-			"fetchedAt": "2026-09-28T18:48:49Z",
-			"revision": "sha256-6ffe40ba88d306a8412c9cc415b71210b5bf34573fc2e6544564eed74c029dfc"
+			"fetchedAt": "2026-10-09T12:42:14Z",
+			"revision": "sha256-3ff185d61544e1bbe1daf233d8af4b9d19a01311153d67acc4a91a1ca6f1c214"
 		},
 		"openrouter": {
 			"source": "https://pi.dev/api/models/providers/openrouter",
 			"module": "packages/ai/src/providers/openrouter.models.ts",
-			"fetchedAt": "2026-09-28T18:48:52Z",
-			"revision": "sha256-6ffe40ba88d306a8412c9cc415b71210b5bf34573fc2e6544564eed74c029dfc"
+			"fetchedAt": "2026-10-09T12:42:17Z",
+			"revision": "sha256-3ff185d61544e1bbe1daf233d8af4b9d19a01311153d67acc4a91a1ca6f1c214"
 		},
 		"vercel-ai-gateway": {
 			"source": "https://pi.dev/api/models/providers/vercel-ai-gateway",
 			"module": "packages/ai/src/providers/vercel-ai-gateway.models.ts",
-			"fetchedAt": "2026-09-28T18:49:08Z",
-			"revision": "sha256-6ffe40ba88d306a8412c9cc415b71210b5bf34573fc2e6544564eed74c029dfc"
+			"fetchedAt": "2026-10-09T12:42:34Z",
+			"revision": "sha256-3ff185d61544e1bbe1daf233d8af4b9d19a01311153d67acc4a91a1ca6f1c214"
 		},
 		"xiaomi": {
 			"source": "https://pi.dev/api/models/providers/xiaomi",
