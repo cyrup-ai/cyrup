@@ -67,6 +67,7 @@ mod editor_fidelity;
 mod editor_min_height;
 mod editor_page_actions;
 mod editor_pointer;
+mod embedded_status_border;
 mod escalation;
 mod escape_chain;
 mod escape_restores_queue;

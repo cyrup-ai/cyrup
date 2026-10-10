@@ -211,7 +211,16 @@ fn hot_reload_theme_data_repaints_the_assembled_app() {
     // (`status_indicator.rs:216-218`, Pi `status-indicator.ts:55-64`). Until E1 the only accent
     // foreground in an idle assembled frame was the editor's `› ` prompt glyph — a cyrup invention
     // `editor.ts:482-601` never emits — so this assertion was riding on the very thing E1 removes.
-    app.state_mut().indicator.working();
+    // TUI-103 — `Compaction`, not `Working`: the status is now EMBEDDED in the editor's top rule,
+    // and an embedded `working` status takes the EDITOR'S BORDER COLOUR for spinner and message
+    // alike, because `showWorkingStatusIndicator` passes the one `colorFn` to both
+    // (`interactive-mode.ts:2346-2359` → `status-indicator.ts:38-47`). Compaction / branch-summary
+    // / retry build their own colours in their own constructors (`status-indicator.ts:84-99` etc.)
+    // and keep the accent spinner when embedded, so the compaction band is the accent-styled
+    // live-region surface this assertion needs.
+    app.state_mut()
+        .indicator
+        .set(crate::status_indicator::IndicatorKind::Compaction, None);
     app.draw().unwrap();
 
     // A bright-magenta accent no dark/light builtin uses, so its presence is unambiguous.

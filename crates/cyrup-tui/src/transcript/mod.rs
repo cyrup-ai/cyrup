@@ -54,7 +54,7 @@ mod content;
 mod entry;
 mod expansion;
 mod images;
-mod layout;
+pub(crate) mod layout;
 mod message;
 mod notices;
 mod render;

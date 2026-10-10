@@ -271,6 +271,139 @@ pub(super) fn scroll_border(direction: char, hidden: usize, width: u16) -> Strin
     out
 }
 
+/// The working / compaction / branch-summary / retry status handed to the editor for ONE frame, so
+/// it can be drawn into the top rule (TUI-103).
+///
+/// Passed per frame rather than stored on the editor: cyrup's TUI is immediate-mode and
+/// [`crate::app::AppState::indicator`] already owns this state, so a second copy on [`InputEditor`]
+/// would be a cache that can go stale — exactly what `status_indicator.rs`'s re-derive-every-frame
+/// design exists to avoid. Pi stores a reference instead (`CustomEditor.setWorkingStatusIndicator`,
+/// `custom-editor.ts:32-34`) because its `StatusIndicator` is a live `Loader` driven by a
+/// `setInterval`, which cyrup has no equivalent of.
+pub(crate) struct EmbeddedStatus<'a> {
+    /// The live indicator. Idle is a no-op: [`StatusIndicator::border_spans`] returns no spans,
+    /// which is pi's `statusWidth === 0` fall-through (`custom-editor.ts:43`).
+    pub(crate) indicator: &'a crate::status_indicator::StatusIndicator,
+    /// The live-keymap label for `app.interrupt`, as the band form takes it.
+    pub(crate) cancel_hint: Option<&'a str>,
+}
+
+/// `CustomEditor.renderTopBorder(width, hiddenLineCount)` — `custom-editor.ts:36-79`, the whole
+/// degradation ladder, in order:
+///
+/// 1. No indicator / zero width / an idle indicator ⇒ `None`, and the caller falls back to the
+///    plain rule or [`scroll_border`] (`:37-39`, `:43`).
+/// 2. The status is rendered at `max(1, width - 5)` (`:41`) — five columns held back for the
+///    `── ` prefix, the space after the status and one trailing `─`.
+/// 3. With an `↑ N more` label that still fits beside the status, both are emitted and the label
+///    keeps the column [`scroll_border`] would have put it at (`:56-65`).
+/// 4. With a label that does NOT fit beside the full status, the **message is dropped** so the
+///    label survives, and the fit is re-tested against the spinner alone (`:51-54`, and
+///    `canFitOverflow` is a closure over the mutable `statusWidth` — hence the re-test).
+/// 5. Otherwise, if `width >= statusWidth + 5`, `── <status> ───…` (`:67-69`).
+/// 6. Otherwise the spinner alone, with up to three leading `─` and whatever is left trailing
+///    (`:71-78`).
+///
+/// **The result is always exactly `width` display columns**, and that is load-bearing rather than
+/// cosmetic: cyrup paints this row OVER the `Block`'s already-drawn rule, so a short row would leak
+/// the `─`s underneath (the same invariant [`scroll_border`]'s doc records). Each branch is checked:
+/// 3 is `3 + sw + 1 + (start - sw - 4) + label + (width - start - label)`, 5 is
+/// `3 + sw + 1 + (width - sw - 4)`, 6 is `prefix + sw + (width - prefix - sw)`.
+///
+/// Pi's JS lets `overflowStart - (3 + statusWidth + 1)` and `width - statusWidth - 4` go negative
+/// and relies on the guards never to reach `"─".repeat(negative)` (which would throw). The guards
+/// are reproduced exactly, and the arithmetic is done in `isize` with `div_euclid` so the
+/// intermediate `Math.floor` matches on the values the guards reject as well.
+pub(crate) fn top_border_with_status(
+    status: &EmbeddedStatus<'_>,
+    hidden: usize,
+    width: u16,
+    rule_style: Style,
+    theme: &UiTheme,
+) -> Option<Vec<Span<'static>>> {
+    let w = usize::from(width);
+    if w == 0 {
+        return None;
+    }
+    let elapsed = status.indicator.elapsed();
+    // `renderInBorder(Math.max(1, width - 5))` (`custom-editor.ts:41`).
+    let full = status.indicator.border_spans(
+        elapsed,
+        theme,
+        status.cancel_hint,
+        w.saturating_sub(5).max(1),
+        Some(rule_style),
+    );
+    // `renderSpinnerInBorder(width)` (`:52`, `:71`) — the same width at both call sites, so one
+    // value serves both.
+    let spinner = || {
+        status
+            .indicator
+            .border_spinner_spans(elapsed, theme, w, Some(rule_style))
+    };
+
+    let mut spans = full;
+    let mut sw = crate::text_width::spans_width(&spans);
+    // `if (statusWidth === 0) return super.renderTopBorder(...)` (`:43`).
+    if sw == 0 {
+        return None;
+    }
+
+    let label = (hidden > 0).then(|| format!(" ↑ {hidden} more "));
+    let label_w = label.as_deref().map_or(0, crate::text_width::str_width);
+    let start = (w as isize - label_w as isize).div_euclid(2);
+    let can_fit = |sw: usize| -> bool {
+        label.is_some() && label_w.saturating_add(2) <= w && start - (3 + sw as isize + 1) >= 1
+    };
+
+    if label.is_some() && !can_fit(sw) {
+        spans = spinner();
+        sw = crate::text_width::spans_width(&spans);
+    }
+
+    if can_fit(sw) {
+        // Both guards above hold here, so every subtraction below is non-negative.
+        let left_dashes = usize::try_from(start - (3 + sw as isize + 1)).unwrap_or(0);
+        let start_u = usize::try_from(start).unwrap_or(0);
+        let right_dashes = w.saturating_sub(start_u).saturating_sub(label_w);
+        let label = label.unwrap_or_default();
+        let mut out = vec![Span::styled("── ".to_string(), rule_style)];
+        out.extend(spans);
+        out.push(Span::styled(
+            format!(
+                " {}{label}{}",
+                "─".repeat(left_dashes),
+                "─".repeat(right_dashes)
+            ),
+            rule_style,
+        ));
+        return Some(out);
+    }
+
+    if w >= sw.saturating_add(5) {
+        let mut out = vec![Span::styled("── ".to_string(), rule_style)];
+        out.extend(spans);
+        out.push(Span::styled(
+            format!(" {}", "─".repeat(w - sw - 4)),
+            rule_style,
+        ));
+        return Some(out);
+    }
+
+    // The narrow fallback (`:71-78`). `renderSpinnerInBorder` truncated to `w`, so `sw <= w` and
+    // `prefix + sw <= w`.
+    let spans = spinner();
+    let sw = crate::text_width::spans_width(&spans);
+    let prefix = 3.min(w.saturating_sub(sw));
+    let mut out = vec![Span::styled("─".repeat(prefix), rule_style)];
+    out.extend(spans);
+    out.push(Span::styled(
+        "─".repeat(w.saturating_sub(prefix).saturating_sub(sw)),
+        rule_style,
+    ));
+    Some(out)
+}
+
 impl Component for InputEditor {
     /// Render the editor with **top + bottom rules only** (no side bars, no title) — Pi
     /// `editor.ts:476,517,575` (spec/tui/03 §3.1). The rule color flips to bash-green while the buffer
@@ -279,7 +412,7 @@ impl Component for InputEditor {
     /// A bare `render` assumes the editor owns the input; the app's chrome calls
     /// [`InputEditor::render_in_slot`] instead so a floating overlay can withdraw the hardware cursor.
     fn render(&mut self, frame: &mut Frame, area: Rect, theme: &UiTheme) {
-        self.render_in_slot(frame, area, theme, true);
+        self.render_in_slot(frame, area, theme, true, None);
     }
 }
 
@@ -295,12 +428,13 @@ impl InputEditor {
     /// cursor still resolves to reverse video. `CURSOR_MARKER` is emitted only while focused
     /// (`editor.ts:570`), so an unfocused editor keeps its drawn caret (E13 below). Here the marker is
     /// the `set_cursor_position` call, and both decisions hang off the one `hardware_caret` flag.
-    pub fn render_in_slot(
+    pub(crate) fn render_in_slot(
         &mut self,
         frame: &mut Frame,
         area: Rect,
         theme: &UiTheme,
         owns_input: bool,
+        status: Option<EmbeddedStatus<'_>>,
     ) {
         // Record the layout width so vertical (visual-line) motion wraps the same way it is drawn.
         // The editor has no side borders; one column is reserved for the end-of-line cursor cell
@@ -444,18 +578,35 @@ impl InputEditor {
         // content remains below (`:514`). The `Block` above already painted a plain rule on both edges;
         // these overwrite it in place, which is byte-identical to pi choosing one string or the other
         // (both are exactly `width` columns).
-        if self.scroll_offset > 0 && area.height >= 1 {
-            let text = scroll_border('↑', self.scroll_offset, area.width);
-            let row = Rect {
-                x: area.x,
-                y: area.y,
-                width: area.width,
-                height: 1,
+        //
+        // TUI-103 — and the top rule carries the WORKING STATUS as well. Pi's default chat editor is
+        // built `embedWorkingStatus: true` (`interactive-mode.ts:647-652`) and `CustomEditor`
+        // overrides `renderTopBorder` to compose the spinner, the message and the `↑ N more` label
+        // into the one row (`custom-editor.ts:36-79`); see [`top_border_with_status`] for the ladder.
+        // When there is no status — or the indicator is idle — the composer returns `None` and the
+        // plain `createScrollBorder` row below is what pi's `super.renderTopBorder` draws
+        // (`editor.ts:511-514`).
+        if area.height >= 1 {
+            let embedded = status.as_ref().and_then(|st| {
+                top_border_with_status(st, self.scroll_offset, area.width, rule_style, theme)
+            });
+            let spans = match embedded {
+                Some(spans) => Some(spans),
+                None if self.scroll_offset > 0 => Some(vec![Span::styled(
+                    scroll_border('↑', self.scroll_offset, area.width),
+                    rule_style,
+                )]),
+                None => None,
             };
-            frame.render_widget(
-                Paragraph::new(Line::from(Span::styled(text, rule_style))),
-                row,
-            );
+            if let Some(spans) = spans {
+                let row = Rect {
+                    x: area.x,
+                    y: area.y,
+                    width: area.width,
+                    height: 1,
+                };
+                frame.render_widget(Paragraph::new(Line::from(spans)), row);
+            }
         }
         let below = map
             .len()
