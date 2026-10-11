@@ -53,6 +53,13 @@
 //!   `fixture_echo` and the transcript carries `echoed:pong`, off the running child.
 //! * [`a_model_issued_gateway_call_returns_the_servers_own_result`] — the same result through the
 //!   `mcp({tool: …})` gateway, which is the route a server gets with no `directTools` opt-in.
+//! * [`a_direct_tool_call_tells_the_server_the_models_tool_call_id`] and
+//!   [`a_gateway_call_tells_the_server_the_models_tool_call_id`] — MCP-609: the `tools/call` the
+//!   child READ carries `_meta["pi-mcp-adapter/toolCallId"]`, the id the model issued, on both
+//!   routes; [`a_call_with_no_id_sends_the_server_no_tool_call_id_key`] — and no key for a call
+//!   that has no id.
+//! * [`a_live_search_loads_the_tool_for_the_next_request`] — MCP-614: `mcp({ search })` against
+//!   the live server loads a search-mode tool into the next request, where the model calls it.
 //!
 //! **The catalog name is the prefixed name.** A tool the server calls `echo` is `fixture_echo`
 //! everywhere the model can see it, because the default `toolPrefix` is `server`
@@ -79,11 +86,11 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use cyrup_core::{Message, StopReason};
+use cyrup_core::{Message, StopReason, ToolCallId};
 use cyrup_mcp::McpExtension;
 use cyrup_provider::Provider;
 use cyrup_provider::faux::{
-    FauxProvider, FauxResponseStep, faux_assistant_message, faux_text, faux_tool_call,
+    FauxProvider, FauxResponseStep, faux_assistant_message, faux_text, faux_tool_call_with_id,
 };
 use cyrup_session_svc::{AgentSession, SessionBuilder, SessionConfig};
 use serde_json::Value;
@@ -118,7 +125,7 @@ const SERVER_ANSWER: &str = "echoed:pong";
 /// and `server_manager.rs`'s child-process tests already use, so it adds no host dependency to this
 /// suite.
 ///
-/// Two marker files, and the pair is the point:
+/// Two marker files, and the pair is the point (a third file, `$3`, records requests — below):
 ///
 /// * `$1` is truncated on the script's **first line**, before it reads a byte of JSON-RPC, so its
 ///   existence proves a child process really ran and nothing more.
@@ -132,6 +139,9 @@ const SERVER_ANSWER: &str = "echoed:pong";
 /// It **echoes back the protocol version the client asked for** rather than naming one. That keeps
 /// this file free of an `rmcp` dependency (`cyrup-it` has none, by design) *and* makes the fixture
 /// behave like a real server, which negotiates rather than dictates.
+///
+/// `$3` collects every `tools/call` line the server READ, one per line, so a test can assert on the
+/// bytes that crossed the pipe rather than on any value the client side built (MCP-609's `_meta`).
 ///
 /// Deliberately free of `${`, `$env:` and `{env:`: `args` are passed through the adapter's
 /// `interpolateEnvVars`, and any of those three would let the interpolator rewrite the script
@@ -150,6 +160,7 @@ while IFS= read -r line; do
       printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"echo","description":"echo back","inputSchema":{"type":"object","properties":{"text":{"type":"string"}}}}]}}\n' "$id"
       ;;
     *'"method":"tools/call"'*)
+      printf '%s\n' "$line" >> "$3"
       text=$(printf '%s' "$line" | sed -n 's/.*"text":"\([^"]*\)".*/\1/p')
       printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"echoed:%s"}],"isError":false}}\n' "$id" "$text"
       ;;
@@ -170,6 +181,8 @@ struct Fixture {
     /// `$2` — truncated when the client sends `notifications/initialized`. The MCP handshake really
     /// completed, from the server's side of the pipe.
     handshook: PathBuf,
+    /// `$3` — every `tools/call` request line the server read, in order.
+    calls: PathBuf,
 }
 
 /// A temp `<agent_dir>` carrying an `mcp.json` at the USER rung (`McpDirs::user_config`) that names
@@ -192,8 +205,9 @@ fn fixture() -> Fixture {
     fixture_with(true)
 }
 
-/// [`fixture`], with `"directTools"` under the caller's control.
-fn fixture_with(direct_tools: bool) -> Fixture {
+/// [`fixture`], with `"directTools"` under the caller's control: `true`, `false`, or `"search"`.
+fn fixture_with(direct_tools: impl Into<Value>) -> Fixture {
+    let direct_tools: Value = direct_tools.into();
     let tmp = TempDir::new().unwrap();
     let cwd = tmp.path().join("project");
     let agent_dir = tmp.path().join("agent");
@@ -201,6 +215,7 @@ fn fixture_with(direct_tools: bool) -> Fixture {
     std::fs::create_dir_all(&agent_dir).unwrap();
     let started = tmp.path().join("fixture-started");
     let handshook = tmp.path().join("fixture-handshook");
+    let calls = tmp.path().join("fixture-calls.jsonl");
 
     let config = serde_json::json!({
         "mcpServers": {
@@ -212,6 +227,7 @@ fn fixture_with(direct_tools: bool) -> Fixture {
                     "sh",
                     started.to_string_lossy(),
                     handshook.to_string_lossy(),
+                    calls.to_string_lossy(),
                 ],
                 "directTools": direct_tools,
                 // MCP-598 — `149fdf1` closes a server that is not RESIDENT the moment its
@@ -237,6 +253,18 @@ fn fixture_with(direct_tools: bool) -> Fixture {
         agent_dir,
         started,
         handshook,
+        calls,
+    }
+}
+
+/// Every `tools/call` request the fixture server read, parsed — `$3`, one JSON-RPC line each.
+fn calls_received(fx: &Fixture) -> Vec<Value> {
+    match std::fs::read_to_string(&fx.calls) {
+        Ok(text) => text
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("the server recorded a JSON-RPC line"))
+            .collect(),
+        Err(_) => Vec::new(),
     }
 }
 
@@ -367,7 +395,18 @@ async fn call_gateway(fx: &Fixture, args: Value) -> (Arc<McpExtension>, GatewayA
 /// `ProxyTool` and `DirectTool` through the same sink, over the same `ToolDispatch` slot, and both
 /// reach `McpDispatch`. The only difference is which arm of `McpToolDispatch` the call lands in.
 async fn call_tool(fx: &Fixture, tool: &str, args: Value) -> (Arc<McpExtension>, GatewayAnswer) {
-    let (ext, answer) = drive_tool_call(fx, tool, args, true).await;
+    call_tool_as(fx, tool, args, None).await
+}
+
+/// [`call_tool`] with the tool call's id pinned to `id` (`None` lets the faux provider mint one) —
+/// the id the model issued, which MCP-609 sends on to the server.
+async fn call_tool_as(
+    fx: &Fixture,
+    tool: &str,
+    args: Value,
+    id: Option<&str>,
+) -> (Arc<McpExtension>, GatewayAnswer) {
+    let (ext, answer) = drive_tool_call(fx, tool, args, true, id).await;
 
     // THE DISCRIMINATOR, asserted for every LIVE call this helper makes. `not_initialized` is what
     // `ProxyTool::execute` answers from its empty-slot arm and what `McpDispatch`'s gate answers
@@ -395,6 +434,7 @@ async fn drive_tool_call(
     tool: &str,
     args: Value,
     bind: bool,
+    id: Option<&str>,
 ) -> (Arc<McpExtension>, GatewayAnswer) {
     // A factory step rather than a static message, for one reason: it records `ctx.tools` — the
     // tool array the AGENT handed the model on that turn, read off the provider request itself.
@@ -411,6 +451,7 @@ async fn drive_tool_call(
     let offered: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
     let tool = tool.to_string();
     let scripted = tool.clone();
+    let id = id.map(str::to_string);
 
     let faux = Arc::new(FauxProvider::new());
     faux.set_response_steps(vec![
@@ -422,7 +463,7 @@ async fn drive_tool_call(
                     .unwrap()
                     .push(ctx.tools.iter().map(|t| t.name.clone()).collect());
                 faux_assistant_message(
-                    vec![faux_tool_call(&scripted, args.clone())],
+                    vec![faux_tool_call_with_id(&scripted, args.clone(), id.clone())],
                     StopReason::ToolUse,
                 )
             })
@@ -470,12 +511,14 @@ async fn drive_tool_call(
         .into_iter()
         .find_map(|message| match message {
             Message::ToolResult {
+                tool_call_id,
                 tool_name,
                 content,
                 is_error,
                 details,
                 ..
             } if tool_name == tool => Some(GatewayAnswer {
+                tool_call_id,
                 text: content
                     .iter()
                     .filter_map(|block| match block {
@@ -501,6 +544,8 @@ async fn drive_tool_call(
 /// model on each turn of the run that produced it.
 #[derive(Debug)]
 struct GatewayAnswer {
+    /// The id the transcript pairs this result with — the id of the call the model issued.
+    tool_call_id: ToolCallId,
     text: String,
     is_error: bool,
     details: Option<Value>,
@@ -700,7 +745,7 @@ async fn a_model_issued_mcp_call_is_answered_by_the_live_runtime() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_gateway_answers_its_stub_without_a_session_start() {
     let fx = fixture();
-    let (ext, answer) = drive_tool_call(&fx, PROXY_TOOL, serde_json::json!({}), false).await;
+    let (ext, answer) = drive_tool_call(&fx, PROXY_TOOL, serde_json::json!({}), false, None).await;
 
     assert_eq!(
         answer.detail("error").and_then(Value::as_str),
@@ -1068,4 +1113,272 @@ async fn the_gateway_is_the_route_without_the_direct_tools_opt_in() {
     );
     assert!(!answer.is_error, "{answer:?}");
     assert_eq!(answer.detail("error"), None, "{answer:?}");
+}
+
+// ================================================================================================
+// 6 · MCP-609. The server is told which tool call it is serving.
+// ================================================================================================
+
+/// `TOOL_CALL_ID_REQUEST_META_KEY` (`pi-mcp-adapter` `utils.ts:350` @v5.0.0), spelled out here
+/// rather than imported, so a rename on the crate side cannot make this file agree with itself.
+const TOOL_CALL_ID_META_KEY: &str = "pi-mcp-adapter/toolCallId";
+
+/// The one `tools/call` the fixture read during a run, with the `_meta` it carried.
+fn the_one_call(fx: &Fixture) -> Value {
+    let calls = calls_received(fx);
+    assert_eq!(
+        calls.len(),
+        1,
+        "the run sent exactly one `tools/call` to the server: {calls:?}"
+    );
+    calls.into_iter().next().unwrap()
+}
+
+/// **MCP-609, direct route.** The model calls `fixture_echo`, and the `tools/call` the child READ
+/// carries `_meta["pi-mcp-adapter/toolCallId"]` equal to the id the model issued — the same id the
+/// transcript pairs the result with (`direct-tools.ts:321` @v5.0.0).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_direct_tool_call_tells_the_server_the_models_tool_call_id() {
+    let fx = fixture();
+    let (_ext, answer) = call_tool_as(
+        &fx,
+        DIRECT_TOOL,
+        serde_json::json!({ "text": "pong" }),
+        Some("call_direct_609"),
+    )
+    .await;
+
+    assert!(answer.text.contains(SERVER_ANSWER), "{answer:?}");
+    assert_eq!(answer.tool_call_id.as_str(), "call_direct_609");
+    let call = the_one_call(&fx);
+    assert_eq!(call["params"]["name"], serde_json::json!(REMOTE_TOOL));
+    assert_eq!(
+        call["params"]["_meta"][TOOL_CALL_ID_META_KEY],
+        serde_json::json!(answer.tool_call_id.as_str()),
+        "the server was told the model's own tool call id: {call}"
+    );
+}
+
+/// **MCP-609, gateway route.** Through `mcp({tool: …})` the id the server is told is the id of the
+/// `mcp` call itself — the gateway's `toolCallId`, handed to `executeCall` (`index.ts:2218` →
+/// `proxy-modes.ts:1658` @v5.0.0).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_gateway_call_tells_the_server_the_models_tool_call_id() {
+    let fx = fixture();
+    let (_ext, answer) = call_tool_as(
+        &fx,
+        PROXY_TOOL,
+        serde_json::json!({ "tool": DIRECT_TOOL, "server": SERVER, "args": { "text": "pong" } }),
+        Some("call_gateway_609"),
+    )
+    .await;
+
+    assert!(answer.text.contains(SERVER_ANSWER), "{answer:?}");
+    assert_eq!(answer.tool_call_id.as_str(), "call_gateway_609");
+    let call = the_one_call(&fx);
+    assert_eq!(call["params"]["name"], serde_json::json!(REMOTE_TOOL));
+    assert_eq!(
+        call["params"]["_meta"][TOOL_CALL_ID_META_KEY],
+        serde_json::json!(answer.tool_call_id.as_str()),
+        "the server was told the `mcp` call's own id: {call}"
+    );
+}
+
+/// **MCP-609, no id.** A tool call the provider streamed without an id is recorded with the empty
+/// id (`openai_completions` `id.unwrap_or("")`), and the server is sent NO key for it — not an
+/// empty one: `if (!toolCallId) return meta;` (`utils.ts:356` @v5.0.0). The call itself still
+/// reaches the server and answers.
+///
+/// A non-regression guard: the base sent no key for any call, so this is green there; the
+/// mutation that forwards an empty id turns it red.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_call_with_no_id_sends_the_server_no_tool_call_id_key() {
+    let fx = fixture();
+    let (_ext, answer) = call_tool_as(
+        &fx,
+        DIRECT_TOOL,
+        serde_json::json!({ "text": "pong" }),
+        Some(""),
+    )
+    .await;
+
+    assert!(answer.text.contains(SERVER_ANSWER), "{answer:?}");
+    assert_eq!(answer.tool_call_id.as_str(), "");
+    let call = the_one_call(&fx);
+    assert_eq!(call["params"]["name"], serde_json::json!(REMOTE_TOOL));
+    assert_eq!(
+        call["params"]["_meta"].get(TOOL_CALL_ID_META_KEY),
+        None,
+        "no id, no key: {call}"
+    );
+}
+
+// ================================================================================================
+// 7 · MCP-614. `mcp({ search })` against the LIVE server loads the tool for the next request.
+// ================================================================================================
+
+/// **MCP-614's Verify, against a real stdio server.** With `"directTools": "search"` the connect
+/// discovers `fixture_echo` and holds it out of the request (`registration.rs`, deferred exposure);
+/// the model's `mcp({ search: "echo" })` loads it (`announce_search_activations` →
+/// `activate_search_matches` → `set_active_tools`); the NEXT request offers it; and the model's
+/// call to it is answered by the child — carrying, per MCP-609, that call's own id.
+///
+/// The session is bound (`into_shared`), as production's always is: only a bound session folds a
+/// mid-run activation into the next request (`prepare_next_turn`, `hooks.rs`), which is the
+/// behaviour asked for. `session_launch.rs`'s `mcp_search_loads_a_search_mode_tool_for_the_next_request`
+/// asserts the same over a cached world with no server; this is the live half.
+///
+/// A non-regression guard: the search-mode load was already correct at the base, and this test is
+/// green there. The mutation that makes the load report nothing turns it red.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_live_search_loads_the_tool_for_the_next_request() {
+    let fx = fixture_with("search");
+
+    let offered: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
+    let record = |offered: &Arc<Mutex<Vec<Vec<String>>>>, ctx: &cyrup_provider::Context| {
+        offered
+            .lock()
+            .unwrap()
+            .push(ctx.tools.iter().map(|t| t.name.clone()).collect());
+    };
+    let faux = Arc::new(FauxProvider::new());
+    faux.set_response_steps(vec![
+        {
+            let offered = Arc::clone(&offered);
+            FauxResponseStep::factory(move |ctx, _opts, _state, _model| {
+                record(&offered, ctx);
+                faux_assistant_message(
+                    vec![faux_tool_call_with_id(
+                        PROXY_TOOL,
+                        serde_json::json!({ "search": "echo" }),
+                        Some("call_search_614".to_string()),
+                    )],
+                    StopReason::ToolUse,
+                )
+            })
+        },
+        {
+            let offered = Arc::clone(&offered);
+            FauxResponseStep::factory(move |ctx, _opts, _state, _model| {
+                record(&offered, ctx);
+                faux_assistant_message(
+                    vec![faux_tool_call_with_id(
+                        DIRECT_TOOL,
+                        serde_json::json!({ "text": "pong" }),
+                        Some("call_loaded_614".to_string()),
+                    )],
+                    StopReason::ToolUse,
+                )
+            })
+        },
+        {
+            let offered = Arc::clone(&offered);
+            FauxResponseStep::factory(move |ctx, _opts, _state, _model| {
+                record(&offered, ctx);
+                faux_assistant_message(vec![faux_text("done")], StopReason::Stop)
+            })
+        },
+    ]);
+
+    let ext = adapter(&fx);
+    let session = SessionBuilder::new(faux as Arc<dyn Provider>, config(&fx))
+        .with_native_extension(Arc::clone(&ext) as Arc<dyn cyrup_ext::NativeExtension>)
+        .build()
+        .await
+        .unwrap()
+        .into_shared();
+    session.bind_extensions().await;
+    let state = await_live_connection(&ext).await;
+    assert_eq!(
+        state
+            .tool_metadata
+            .lock()
+            .unwrap()
+            .get(SERVER)
+            .map(Vec::len),
+        Some(1),
+        "the live server's catalog was discovered"
+    );
+
+    let _stream = session
+        .prompt("find the echo tool and use it")
+        .await
+        .expect("prompt accepted");
+    session.wait_for_idle().await;
+
+    let offered = offered.lock().unwrap().clone();
+    assert_eq!(
+        offered.len(),
+        3,
+        "three requests reached the model: {offered:?}"
+    );
+    assert!(
+        offered[0].iter().any(|tool| tool == PROXY_TOOL),
+        "the gateway is offered: {:?}",
+        offered[0]
+    );
+    assert!(
+        !offered[0].iter().any(|tool| tool == DIRECT_TOOL),
+        "a search-mode tool is held out of the request until something loads it: {:?}",
+        offered[0]
+    );
+    assert!(
+        offered[1].iter().any(|tool| tool == DIRECT_TOOL),
+        "the search loaded `{DIRECT_TOOL}` for the NEXT request: {:?}",
+        offered[1]
+    );
+
+    let messages = session.messages().await;
+    let result_of = |name: &str| {
+        messages
+            .iter()
+            .find_map(|message| match message {
+                Message::ToolResult {
+                    tool_name,
+                    content,
+                    is_error,
+                    details,
+                    ..
+                } if tool_name == name => Some((
+                    content
+                        .iter()
+                        .filter_map(|block| match block {
+                            cyrup_core::Content::Text { text, .. } => Some(text.to_string()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                    *is_error,
+                    details.clone(),
+                )),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("a `{name}` result is in the transcript"))
+    };
+
+    let (search_text, search_error, search_details) = result_of(PROXY_TOOL);
+    assert!(!search_error, "{search_text}");
+    assert!(
+        search_text.starts_with(&format!("Activated as direct tools: {DIRECT_TOOL}.")),
+        "the search said what it loaded: {search_text}"
+    );
+    assert_eq!(
+        search_details.as_ref().and_then(|d| d.get("activated")),
+        Some(&serde_json::json!([DIRECT_TOOL])),
+        "{search_details:?}"
+    );
+
+    let (echo_text, echo_error, _) = result_of(DIRECT_TOOL);
+    assert!(!echo_error, "{echo_text}");
+    assert!(
+        echo_text.contains(SERVER_ANSWER),
+        "the loaded tool was answered by the live child: {echo_text}"
+    );
+    let call = the_one_call(&fx);
+    assert_eq!(call["params"]["name"], serde_json::json!(REMOTE_TOOL));
+    assert_eq!(
+        call["params"]["_meta"][TOOL_CALL_ID_META_KEY],
+        serde_json::json!("call_loaded_614"),
+        "the loaded tool's call carried its own id: {call}"
+    );
 }

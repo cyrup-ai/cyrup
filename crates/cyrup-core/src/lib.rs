@@ -107,6 +107,26 @@ macro_rules! str_id {
 str_id!(SessionId);
 str_id!(EntryId);
 str_id!(ToolCallId);
+
+impl ToolCallId {
+    /// The id of the `number`th call a running tool makes on behalf of `caller` — pi's
+    /// `` `${callerId}/${scope.nextId++}` `` (`core/nested-tool-calls.ts:189` @f1b2e77f5). The one
+    /// place the nested form is spelled, so [`ToolCallId::is_anonymous`] reads the form it writes.
+    #[must_use]
+    pub fn nested(caller: &ToolCallId, number: u32) -> Self {
+        Self::from(format!("{caller}/{number}"))
+    }
+
+    /// Whether this call has no id to be told apart by: the empty id a provider records for a tool
+    /// call its stream named no id for (`openai_completions` `id.unwrap_or("")`, and the Anthropic
+    /// and pi-messages streams likewise), or a [`nested`](ToolCallId::nested) id under one — `/1`,
+    /// `/1/2`, the same few strings in every turn that has such a call.
+    #[must_use]
+    pub fn is_anonymous(&self) -> bool {
+        self.0.is_empty() || self.0.starts_with('/')
+    }
+}
+
 str_id!(ProviderId);
 str_id!(ModelId);
 str_id!(ExtensionId);

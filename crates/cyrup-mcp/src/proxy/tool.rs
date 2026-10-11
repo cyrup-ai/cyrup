@@ -27,6 +27,7 @@ use crate::proxy::discovery::{
 use crate::proxy::env::ProxyCtx;
 use crate::proxy::error_vocab::McpErrorCode;
 use crate::proxy::results::{details_err, text_result};
+use crate::proxy::tool_call_meta::OriginatingCall;
 
 // ==================================================================================================
 // 14 · The registered tool (MCP-151, MCP-153, MCP-192, MCP-194, MCP-197, MCP-199)
@@ -346,9 +347,13 @@ impl Tool for McpTool {
     }
 
     /// `index.ts:849` `execute` — the dispatch preamble and the nine-arm router (MCP-153).
+    ///
+    /// `call_id` is pi's `toolCallId`, read by the `tool` arm alone: `index.ts:2218` @v5.0.0 hands
+    /// it to `executeCall`, which sends it to the server as `_meta["pi-mcp-adapter/toolCallId"]`
+    /// ([`OriginatingCall`], MCP-609). No other arm sends a `tools/call`.
     async fn execute(
         &self,
-        _call_id: ToolCallId,
+        call_id: ToolCallId,
         params: Value,
         cancel: CancelToken,
         _on_update: ToolUpdateSink,
@@ -488,6 +493,7 @@ impl Tool for McpTool {
                 params.server.as_deref().filter(|value| !value.is_empty()),
                 &cancel,
                 None,
+                OriginatingCall::of(&call_id).as_ref(),
             )
             .await
             .map(|result| announce_call_activation(&ctx, result))
@@ -1138,6 +1144,29 @@ mod tests {
         assert_eq!(
             env.activations_asked.lock().unwrap().clone(),
             vec![vec![("srv".to_string(), "srv_report_0".to_string())]]
+        );
+    }
+
+    /// MCP-609 — `index.ts:2218` @v5.0.0 hands the gateway's own `toolCallId` to `executeCall`: the
+    /// `tools/call` the `tool` arm sends carries the id of the `mcp(...)` call the model made, and
+    /// it is the server-side name that goes with it.
+    #[tokio::test]
+    async fn the_tool_arm_sends_the_gateway_calls_own_id() {
+        let env = FakeEnv::default()
+            .with_connection("srv", crate::proxy::env::ConnectionStatus::Connected);
+        let (result, env) = gateway_call(env, json!({ "tool": "srv_report_0" })).await;
+
+        assert!(
+            result.details.as_ref().unwrap().get("error").is_none(),
+            "{:?}",
+            result.details
+        );
+        assert_eq!(
+            env.calls_made.lock().unwrap().clone(),
+            vec![(
+                "report_0".to_string(),
+                OriginatingCall::of(&ToolCallId::from("call-1"))
+            )]
         );
     }
 

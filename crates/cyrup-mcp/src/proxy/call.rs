@@ -24,6 +24,7 @@ use crate::proxy::results::{
     get_auth_required_message, get_enabled_tool_matches, get_single_tool_match, get_tool_matches,
     text_result,
 };
+use crate::proxy::tool_call_meta::OriginatingCall;
 use crate::proxy::tool_metadata::{ToolMetadata, find_tool_by_name, server_prefix};
 
 // ==================================================================================================
@@ -205,7 +206,9 @@ fn suggestion_text(suggestions: &[String]) -> String {
 }
 
 /// `proxy-modes.ts:806` `executeCall(state, toolName, args?, serverOverride?, getPiTools?, signal?,
-/// origin?)`.
+/// origin?)`, with the `toolCallId` v3.0.0 added as its ninth parameter (`proxy-modes.ts:1209`
+/// @v5.0.0) carried as `call`: the tool call the request serves, sent to the server as
+/// `_meta["pi-mcp-adapter/toolCallId"]` ([`OriginatingCall`], MCP-609). `None` sends no key.
 ///
 /// Eight phases; see the module docs for why this is the section's only `critical`. The short
 /// version: [`get_single_tool_match`] and [`get_enabled_tool_matches`] exist to **refuse rather than
@@ -220,6 +223,7 @@ pub async fn execute_call(
     server_override: Option<&str>,
     cancel: &CancelToken,
     origin: Option<ApprovalOrigin>,
+    call: Option<&OriginatingCall>,
 ) -> McpResult<ToolResult> {
     let owned = ctx.owned_signal(cancel);
     throw_if_aborted(
@@ -883,6 +887,7 @@ pub async fn execute_call(
         &owned,
         // A direct tool is a codemode tool too, and its script receives the server's whole result.
         resolved_origin == ApprovalOrigin::Direct,
+        call,
     )
     .await
 }
@@ -957,6 +962,7 @@ async fn invoke(
     latch: &AutoAuthLatch,
     owned: &CancelToken,
     script_result: bool,
+    call: Option<&OriginatingCall>,
 ) -> McpResult<ToolResult> {
     // Path 1 — a resource tool. Note the read is NOT wrapped in `abortable`: upstream's asymmetry,
     // reproduced rather than "fixed" (13d §10). Cancellation reaches it only through the request
@@ -1011,6 +1017,7 @@ async fn invoke(
             server_name,
             &tool_meta.original_name,
             arguments,
+            call,
             recovery,
             owned,
         )
@@ -1225,9 +1232,17 @@ mod tests {
             &[],
             FakeEnv::default(),
         );
-        let result = execute_call(&ctx, "create_issue", None, None, &CancelToken::new(), None)
-            .await
-            .unwrap();
+        let result = execute_call(
+            &ctx,
+            "create_issue",
+            None,
+            None,
+            &CancelToken::new(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
         let details = result.details.clone().unwrap();
         assert_eq!(details["error"], json!("ambiguous_tool"));
         assert_eq!(details["mode"], json!("call"));
@@ -1251,7 +1266,7 @@ mod tests {
             &[],
             FakeEnv::default(),
         );
-        let result = execute_call(&ctx, "do-it", None, None, &CancelToken::new(), None)
+        let result = execute_call(&ctx, "do-it", None, None, &CancelToken::new(), None, None)
             .await
             .unwrap();
         let details = result.details.clone().unwrap();
@@ -1265,11 +1280,19 @@ mod tests {
     async fn an_unknown_server_hint_is_server_not_found() {
         let config = config_with(&[("srv", stdio("a"))]);
         let (ctx, _) = ctx_with(config, &[], &[], FakeEnv::default());
-        let details = execute_call(&ctx, "t", None, Some("nope"), &CancelToken::new(), None)
-            .await
-            .unwrap()
-            .details
-            .unwrap();
+        let details = execute_call(
+            &ctx,
+            "t",
+            None,
+            Some("nope"),
+            &CancelToken::new(),
+            None,
+            None,
+        )
+        .await
+        .unwrap()
+        .details
+        .unwrap();
         assert_eq!(details["error"], json!("server_not_found"));
         assert_eq!(details["requestedTool"], json!("t"));
     }
@@ -1285,7 +1308,7 @@ mod tests {
             &[],
             FakeEnv::default().with_all_tools(&["read", "mcp"]),
         );
-        let result = execute_call(&ctx, "read", None, None, &CancelToken::new(), None)
+        let result = execute_call(&ctx, "read", None, None, &CancelToken::new(), None, None)
             .await
             .unwrap();
         assert_eq!(
@@ -1299,7 +1322,7 @@ mod tests {
 
         // `all_tool_names() == None` is upstream's `getPiTools === undefined` branch.
         let (ctx, _) = ctx_with(config, &[], &[], FakeEnv::default());
-        let details = execute_call(&ctx, "read", None, None, &CancelToken::new(), None)
+        let details = execute_call(&ctx, "read", None, None, &CancelToken::new(), None, None)
             .await
             .unwrap()
             .details
@@ -1315,9 +1338,17 @@ mod tests {
         let config = config_with(&[("srv", stdio("a"))]);
         let env = FakeEnv::default().with_failure("srv", 7);
         let (ctx, _) = ctx_with(config, &[], &[], env);
-        let result = execute_call(&ctx, "thing", None, Some("srv"), &CancelToken::new(), None)
-            .await
-            .unwrap();
+        let result = execute_call(
+            &ctx,
+            "thing",
+            None,
+            Some("srv"),
+            &CancelToken::new(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             result.details.clone().unwrap()["error"],
             json!("server_backoff")
@@ -1336,9 +1367,17 @@ mod tests {
         let config = config_with(&[("srv", stdio("a"))]);
         let env = FakeEnv::default().with_failure_message("srv", 7, "spawn npx ENOENT");
         let (ctx, _) = ctx_with(config, &[], &[], env);
-        let result = execute_call(&ctx, "thing", None, Some("srv"), &CancelToken::new(), None)
-            .await
-            .unwrap();
+        let result = execute_call(
+            &ctx,
+            "thing",
+            None,
+            Some("srv"),
+            &CancelToken::new(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             result.details.clone().unwrap()["error"],
             json!("server_backoff")
@@ -1365,6 +1404,7 @@ mod tests {
             None,
             Some("srv"),
             &CancelToken::new(),
+            None,
             None,
         )
         .await
@@ -1395,6 +1435,7 @@ mod tests {
             None,
             &CancelToken::new(),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -1420,7 +1461,7 @@ mod tests {
             &[],
             env,
         );
-        let result = execute_call(&ctx, "srv_run", None, None, &CancelToken::new(), None)
+        let result = execute_call(&ctx, "srv_run", None, None, &CancelToken::new(), None, None)
             .await
             .unwrap();
         assert_eq!(
@@ -1453,7 +1494,7 @@ mod tests {
             &[],
             env,
         );
-        let result = execute_call(&ctx, "srv_run", None, None, &CancelToken::new(), None)
+        let result = execute_call(&ctx, "srv_run", None, None, &CancelToken::new(), None, None)
             .await
             .unwrap();
         assert!(
@@ -1496,7 +1537,7 @@ mod tests {
                 &[],
                 env,
             );
-            let result = execute_call(&ctx, "srv_run", None, None, &CancelToken::new(), None)
+            let result = execute_call(&ctx, "srv_run", None, None, &CancelToken::new(), None, None)
                 .await
                 .unwrap();
             assert!(
@@ -1564,6 +1605,7 @@ mod tests {
             None,
             &CancelToken::new(),
             Some(ApprovalOrigin::Direct),
+            None,
         )
         .await
         .unwrap();
@@ -1580,9 +1622,17 @@ mod tests {
             "the raw result minus `_meta`"
         );
 
-        let gateway = execute_call(&build(), "srv_run", None, None, &CancelToken::new(), None)
-            .await
-            .unwrap();
+        let gateway = execute_call(
+            &build(),
+            "srv_run",
+            None,
+            None,
+            &CancelToken::new(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             gateway.structured_content, None,
             "a gateway call has no script to hand the result to"
@@ -1618,6 +1668,7 @@ mod tests {
             None,
             &CancelToken::new(),
             Some(ApprovalOrigin::Direct),
+            None,
         )
         .await
         .unwrap();
@@ -1637,7 +1688,7 @@ mod tests {
             &[],
             env,
         );
-        let result = execute_call(&ctx, "srv_run", None, None, &CancelToken::new(), None)
+        let result = execute_call(&ctx, "srv_run", None, None, &CancelToken::new(), None, None)
             .await
             .unwrap();
         assert_eq!(text_of(&result), "(empty result)");
@@ -1668,7 +1719,7 @@ mod tests {
             &[],
             env,
         );
-        let tool = execute_call(&ctx, "srv_run", None, None, &CancelToken::new(), None)
+        let tool = execute_call(&ctx, "srv_run", None, None, &CancelToken::new(), None, None)
             .await
             .unwrap()
             .details
@@ -1681,6 +1732,7 @@ mod tests {
             None,
             None,
             &CancelToken::new(),
+            None,
             None,
         )
         .await

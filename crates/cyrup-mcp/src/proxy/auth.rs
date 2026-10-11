@@ -576,6 +576,7 @@ mod tests {
             Some("linear"),
             &CancelToken::new(),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -616,6 +617,7 @@ mod tests {
             Some("linear"),
             &CancelToken::new(),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -641,6 +643,7 @@ mod tests {
             None,
             Some("linear"),
             &CancelToken::new(),
+            None,
             None,
         )
         .await
@@ -673,9 +676,17 @@ mod tests {
             .with_connection("foo_bar", ConnectionStatus::NeedsAuth)
             .with_oauth("foo.example");
         let (ctx, env) = ctx_with(config, &[], &[], env);
-        let result = execute_call(&ctx, "foo_bar_thing", None, None, &CancelToken::new(), None)
-            .await
-            .unwrap();
+        let result = execute_call(
+            &ctx,
+            "foo_bar_thing",
+            None,
+            None,
+            &CancelToken::new(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
         // Neither candidate ever connects, so the call ends unresolved…
         assert_eq!(
             result.details.clone().unwrap()["error"],
@@ -703,6 +714,7 @@ mod tests {
             None,
             Some("linear"),
             &CancelToken::new(),
+            None,
             None,
         )
         .await

@@ -16,6 +16,7 @@ use crate::owner::McpRuntimeOwner;
 use crate::proxy::approval::{ensure_tool_call_approved, is_tool_call_approval_required};
 use crate::proxy::call::AuthRecovery;
 use crate::proxy::ranking::rank_suggestions;
+use crate::proxy::tool_call_meta::OriginatingCall;
 use crate::proxy::tool_metadata::ToolMetadata;
 use crate::state::McpState;
 
@@ -257,7 +258,13 @@ pub trait ProxyEnv: Send + Sync {
     fn increment_in_flight(&self, server: &str);
     /// `state.manager.decrementInFlight(server)`.
     fn decrement_in_flight(&self, server: &str);
-    /// `withSessionRecovery(..., conn => abortable(conn.client.callTool({name, arguments}), signal))`.
+    /// `withSessionRecovery(..., conn => abortable(conn.client.callTool({name, arguments, _meta}),
+    /// signal))`, with `_meta` being `withToolCallIdMeta(undefined, toolCallId)` built once before the
+    /// recovery wrapper (`proxy-modes.ts:1658`, `:1679-1683` @v5.0.0).
+    ///
+    /// `call` is the tool call the request serves. An implementor that sends a request stamps it
+    /// with [`OriginatingCall::stamp`] on **every** attempt, the retries [`AuthRecovery`] drives
+    /// included, and sends no key when it is `None` (MCP-609).
     ///
     /// The cancellation wrapper belongs on **this** side: rmcp's shape is
     /// `Peer::send_request_with_option(...)` → `RequestHandle`, with a task calling
@@ -271,6 +278,7 @@ pub trait ProxyEnv: Send + Sync {
         server: &str,
         tool: &str,
         arguments: JsonMap<String, Value>,
+        call: Option<&OriginatingCall>,
         recovery: &AuthRecovery<'_>,
         cancel: &CancelToken,
     ) -> Result<CallToolOutcome, ProxyCallError>;

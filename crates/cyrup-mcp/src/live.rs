@@ -37,8 +37,8 @@ use crate::errors::{McpError, McpResult};
 use crate::lifecycle::ConnectionStatus as LinkStatus;
 use crate::proxy::{
     ApprovalOrigin, ApprovalOutcome, AuthRecovery, CallToolOutcome, ConnectOutcome,
-    ConnectionStatus, GuardedOutput, OutputGuardOptions, ProxyCallError, ProxyEnv, ToolMetadata,
-    UrlElicitationAction,
+    ConnectionStatus, GuardedOutput, OriginatingCall, OutputGuardOptions, ProxyCallError, ProxyEnv,
+    ToolMetadata, UrlElicitationAction,
 };
 use crate::state::{
     MCP_STATUS_SNAPSHOT_VERSION, McpServerRuntimeStatus, McpServerStatusSnapshot, McpState,
@@ -1580,13 +1580,19 @@ impl ProxyEnv for RuntimeEnv {
         server: &str,
         tool: &str,
         arguments: JsonMap<String, Value>,
+        call: Option<&OriginatingCall>,
         recovery: &AuthRecovery<'_>,
         cancel: &CancelToken,
     ) -> Result<CallToolOutcome, ProxyCallError> {
         let result = self
             .with_session_recovery(server, recovery, cancel, |peer| {
-                let params =
+                let mut params =
                     CallToolRequestParams::new(tool.to_string()).with_arguments(arguments.clone());
+                // MCP-609 — inside the closure, so a recovery retry sends the same key, as upstream's
+                // `requestMeta` (built once, before `withSessionRecovery`) is resent on every attempt.
+                if let Some(call) = call {
+                    call.stamp(&mut params);
+                }
                 let options = self.request_options(server);
                 // MCP-606 — the ONE call upstream makes pausable. The budget is
                 // `options?.timeout ?? DEFAULT_REQUEST_TIMEOUT_MSEC` (`elicitation-handler.ts:84`):
@@ -2083,6 +2089,10 @@ while IFS= read -r line; do
           ;;
         *'"name":"structured"'*)
           printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[],"structuredContent":{"ok":true}}}\n' "$id"
+          ;;
+        *'"name":"request"'*)
+          req=$(printf '%s' "$line" | sed 's/\\/\\\\/g; s/"/\\"/g')
+          printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"%s"}],"isError":false}}\n' "$id" "$req"
           ;;
         *)
           text=$(printf '%s' "$line" | sed -n 's/.*"text":"\([^"]*\)".*/\1/p')
@@ -2972,6 +2982,7 @@ done
             None,
             &CancelToken::new(),
             None,
+            None,
         )
         .await
         .expect("the call completes");
@@ -2997,6 +3008,79 @@ done
             details["mcpResult"]["content"][0]["text"],
             serde_json::json!("echoed:pong"),
             "`rawMcpResult` rode out with it: {details}"
+        );
+    }
+
+    /// **MCP-609 on the wire.** The tool call a `tools/call` serves reaches the server as
+    /// `_meta["pi-mcp-adapter/toolCallId"]` (`utils.ts:350-358` @v5.0.0), beside the
+    /// `progressToken` rmcp adds rather than in its place; a call with no origin sends no such key.
+    ///
+    /// [`LIVE_ECHO`]'s `request` tool answers with the JSON-RPC line it READ, so both assertions
+    /// are on the bytes the child received, not on any value this side built.
+    #[tokio::test]
+    async fn the_originating_call_rides_the_request_meta_and_no_origin_sends_no_key() {
+        async fn received(
+            ctx: &crate::proxy::ProxyCtx,
+            call: Option<&crate::proxy::OriginatingCall>,
+        ) -> serde_json::Value {
+            let result = crate::proxy::execute_call(
+                ctx,
+                "fixture_request",
+                Some(&serde_json::json!({})),
+                None,
+                &CancelToken::new(),
+                None,
+                call,
+            )
+            .await
+            .expect("the call completes");
+            serde_json::from_str(&text_of(&result.content))
+                .expect("the server answers with the JSON-RPC line it read")
+        }
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let (state, dirs) = connected_state(temp.path(), &live_entry()).await;
+        state.tool_metadata.lock().unwrap().insert(
+            "fixture".to_string(),
+            vec![ToolMetadata::new(
+                "fixture_request",
+                "request",
+                "answers with the request it read",
+            )],
+        );
+        let ctx = crate::proxy::ProxyCtx::new(
+            Arc::clone(&state),
+            Arc::new(RuntimeEnv::new(
+                Arc::clone(&state),
+                dirs,
+                std::sync::Weak::new(),
+            )),
+        );
+
+        let call = crate::proxy::OriginatingCall::of(&cyrup_core::ToolCallId::from("call_live_1"))
+            .expect("a model-issued id is an origin");
+        let with = received(&ctx, Some(&call)).await;
+        assert_eq!(with["method"], serde_json::json!("tools/call"), "{with}");
+        assert_eq!(
+            with["params"]["_meta"]["pi-mcp-adapter/toolCallId"],
+            serde_json::json!("call_live_1"),
+            "the call's own id, under upstream's key: {with}"
+        );
+        assert!(
+            with["params"]["_meta"].get("progressToken").is_some(),
+            "rmcp's progress token is still beside it: {with}"
+        );
+
+        let without = received(&ctx, None).await;
+        assert_eq!(
+            without["method"],
+            serde_json::json!("tools/call"),
+            "{without}"
+        );
+        assert_eq!(
+            without["params"]["_meta"].get("pi-mcp-adapter/toolCallId"),
+            None,
+            "no origin, no key — not an empty one: {without}"
         );
     }
 
@@ -3061,6 +3145,7 @@ done
             Some(&serde_json::json!({})),
             None,
             &CancelToken::new(),
+            None,
             None,
         )
         .await

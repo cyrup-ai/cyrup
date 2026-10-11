@@ -33,6 +33,7 @@ use crate::proxy::env::{
     ApprovalOrigin, ApprovalOutcome, CallToolOutcome, ConnectOutcome, ConnectionStatus,
     GuardedOutput, OutputGuardOptions, ProxyCallError, ProxyCtx, ProxyEnv, UrlElicitationAction,
 };
+use crate::proxy::tool_call_meta::OriginatingCall;
 use crate::proxy::tool_metadata::ToolMetadata;
 use crate::state::{McpServerManager, McpStateParts};
 
@@ -78,6 +79,9 @@ pub(crate) struct FakeEnv {
     pub(crate) activations_asked: Mutex<Vec<Vec<(String, String)>>>,
     /// The tools `activate_search_matches` has loaded, so a second match is not reported again.
     pub(crate) activated: Mutex<BTreeSet<String>>,
+    /// Every `tools/call` the env was asked to send: the server-side tool name and the
+    /// [`OriginatingCall`] it would be stamped with (MCP-609), in call order.
+    pub(crate) calls_made: Mutex<Vec<(String, Option<OriginatingCall>)>>,
     /// What `call_tool` answers; the empty outcome when unset.
     pub(crate) call_outcome: Mutex<Option<CallToolOutcome>>,
 }
@@ -202,11 +206,16 @@ impl ProxyEnv for FakeEnv {
     async fn call_tool(
         &self,
         _server: &str,
-        _tool: &str,
+        tool: &str,
         _arguments: JsonMap<String, Value>,
+        call: Option<&OriginatingCall>,
         _recovery: &AuthRecovery<'_>,
         _cancel: &CancelToken,
     ) -> Result<CallToolOutcome, ProxyCallError> {
+        self.calls_made
+            .lock()
+            .unwrap()
+            .push((tool.to_string(), call.cloned()));
         Ok(self
             .call_outcome
             .lock()

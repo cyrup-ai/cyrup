@@ -214,7 +214,7 @@ impl NestedToolCallRunner {
             other => (serde_json::Map::new(), Some(json_type_name(&other))),
         };
         let call = ToolCall {
-            id: ToolCallId::from(format!("{caller}/{number}")),
+            id: ToolCallId::nested(caller, number),
             name: name.to_string(),
             arguments: arguments.into(),
             thought_signature: None,
