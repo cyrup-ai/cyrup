@@ -25,6 +25,8 @@
 //! the same. A byte-indexed field with no markers can call [`byte_find_word_backward`] /
 //! [`byte_find_word_forward`], which are pi's two functions whole.
 
+mod icu4c;
+
 /// One segment of a line for word navigation — pi's `Intl.SegmentData` after `segmentWithMarkers`
 /// has merged the paste markers (`editor.ts:37-90`). `start`/`len` are in whatever index unit the
 /// caller segmented with: **char columns** for `cyrup-tui`'s `InputEditor`, **byte offsets** for
@@ -225,13 +227,17 @@ pub fn byte_word_segments(text: &str) -> Vec<WordSeg> {
 /// allocates nor parses — but it does resolve five payloads out of the baked provider (the CJ
 /// dictionary and the four LSTMs), so it is built once in a `OnceLock` rather than per word motion.
 ///
-/// [CYRUP-DELTA] (recorded, not chosen — a downward residue, EXT-113): ICU4X is not byte-identical
-/// to the ICU4C inside node. For a lone `々`/`〻` (Han, not Ideographic) ICU4X reports word-like
-/// where ICU4C reports not (ICU4X tags every dictionary-pass segment `Letter`; ICU4C takes the
-/// rule pass's status, and `word.txt` gives one non-Ideographic Han character none), `〆` is the
-/// reverse, and `々々` is one segment here and two in node. Pinned as a known divergence by
-/// `tests::word_nav::a_lone_iteration_mark_is_word_like_under_icu4x_unlike_node`; every other
-/// string pinned against node 22.22.0 / ICU 77.1 there agrees.
+/// [CYRUP-DELTA] relative to ICU4X, upward: ICU4X alone is not the ICU4C inside node for unspaced
+/// Chinese/Japanese (greedy dictionary matching, and every dictionary segment tagged word-like),
+/// so its output goes through [`icu4c::reconcile`], which rebuilds ICU4C's `CjkBreakEngine`
+/// programme and `word.txt` rule statuses over ICU4X's own `cjdict` data (EXT-113). Pinned
+/// against node 22.22.0 / ICU 77.1 by `tests::word_nav`, including a sweep of the CJK symbol,
+/// kana and fullwidth blocks.
+///
+/// [CYRUP-DELTA] upward, record-only (EXT-119): `Word_Break` property data is ICU4X 2.3.0's
+/// (ICU 78 / Unicode 17), newer than node 22.22.0's ICU 77.1 (Unicode 16), so a code point Unicode
+/// 17 reclassified — U+00B8 CEDILLA is now `ALetter` — segments by the newer standard here. A node
+/// built on ICU 78 agrees with cyrup; pinning Unicode 16 data would move cyrup backwards.
 pub fn icu_word_segments(text: &str) -> Vec<(usize, usize, bool)> {
     use icu_segmenter::WordSegmenter;
     use icu_segmenter::options::WordBreakInvariantOptions;
@@ -254,7 +260,7 @@ pub fn icu_word_segments(text: &str) -> Vec<(usize, usize, bool)> {
         }
         open = Some(boundary);
     }
-    out
+    icu4c::reconcile(text, out)
 }
 
 /// `isWhitespaceChar(segment)` = `/\s/.test(segment)` (`utils.ts:826-829`) over a byte-indexed

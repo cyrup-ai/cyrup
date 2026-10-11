@@ -50,6 +50,13 @@ regex = "1.12.4"
 # depend on this crate, and nothing below it needs word navigation. Moved from `cyrup-tui`, which no
 # longer names it directly; not behind `wasm-host` because it is pure text.
 icu_segmenter = { workspace = true }
+# EXT-113: ICU4C's CJ dictionary programme and `word.txt` statuses rebuilt over ICU4X's data
+# (`word_nav/icu4c.rs`). All four are already in the build: `icu_segmenter` and `idna_adapter`
+# pull them transitively at these versions; named here because `word_nav` reads them directly.
+icu_collections = { version = "2.3.0" }
+icu_normalizer = { version = "2.3.0" }
+icu_properties = { version = "2.3.0" }
+icu_provider = { version = "2.3.1" }
 # The `http-client` capability grant (arch-08 §3.2 draft; pi-mcp-adapter-port.md §3.2), backing
 # `caps::http::HttpCaps` — a real `reqwest`-based engine. Optional (bundled into `wasm-host`) so a
 # `--no-default-features` build of the native-only foundation pulls neither wasmtime nor reqwest.

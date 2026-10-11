@@ -7,10 +7,11 @@
 //! [`node_to_bytes`] converts explicitly rather than trusting the two to coincide (they do not
 //! for any non-ASCII text).
 //!
-//! **Non-regression guards.** These tests pass against the segmenter as it stood in `cyrup-tui`
-//! before the move (TUI-048 had already made it ICU): they guard the move and the helper itself.
-//! The red-proof for EXT-113 is in `cyrup-llama`'s `tests::ui::search_input_*`, which drive the
-//! `/llama` search box that did NOT use this helper before.
+//! **Which tests are red-proofs.** [`the_iteration_mark_class_matches_node`],
+//! [`the_node_sweep_matches`] and the `々` row of [`segments_and_is_word_like_match_node`] FAIL
+//! against bare ICU4X (the helper before `word_nav::icu4c` existed); everything else here passes
+//! there and is a non-regression guard for the shared helper and its move out of `cyrup-tui`. The
+//! `/llama` red-proof is `cyrup-llama`'s `tests::ui::search_input_*`.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -55,6 +56,7 @@ const NODE: &[(&str, &[NodeSeg])] = &[
         &[("日本語", 0, true), ("の", 3, true), ("モデル", 4, true)],
     ),
     ("½", &[("½", 0, false)]),
+    ("々", &[("々", 0, false)]),
     ("²", &[("²", 0, false)]),
     ("①", &[("①", 0, false)]),
     ("__", &[("__", 0, true)]),
@@ -81,9 +83,8 @@ const NODE: &[(&str, &[NodeSeg])] = &[
 
 /// Boundaries AND `isWordLike` for every pinned string match node: `日本語のモデル` is the three
 /// dictionary words `日本語` / `の` / `モデル`, all word-like; `½`, `²` and `①` are not word-like;
-/// `__` and `‿‿` are. `々` is the one pinned string that does NOT match — see
-/// [`a_lone_iteration_mark_is_word_like_under_icu4x_unlike_node`]. Non-regression guard (see the
-/// module doc).
+/// `__` and `‿‿` are; `々` is not. RED against the part-1 helper (bare ICU4X) on `々` only — the
+/// rest pass there and are non-regression guards.
 #[test]
 fn segments_and_is_word_like_match_node() {
     let mut wrong = Vec::new();
@@ -161,27 +162,96 @@ fn byte_word_walks_tolerate_bad_cursors() {
     assert_eq!(byte_find_word_backward("", 0), 0);
 }
 
-/// **KNOWN DIVERGENCE, not pi's answer.** node 22.22.0 / ICU 77.1 says a lone `々` (U+3005
-/// IDEOGRAPHIC ITERATION MARK) is one segment with `isWordLike == false`; ICU4X 2.3.0's
-/// `WordSegmenter::new_auto` says `true`. This test pins ICU4X's CURRENT answer so that a change
-/// (an `icu_segmenter` upgrade, or a fix) turns it red and forces the ledger to be looked at; when
-/// it is fixed, flip the assertion to node's `false` and fold the string back into
-/// [`segments_and_is_word_like_match_node`].
-///
-/// The cause, read in both sources: ICU4C (`icu4c/source/data/brkitr/rules/word.txt` at
-/// `release-77-1`) gives a dictionary range the rule status of the RULE pass over that range —
-/// `$KanaKanji $KanaKanji {400}` for a run of two or more, and for one character only
-/// `$Katakana`/`$Hiragana`/`$Ideographic {400}`; `々` is `Script=Han` but `Ideographic=No`, so alone
-/// it matches no status rule and is 0 (not word-like). ICU4X tags every segment its dictionary pass
-/// produces `WordType::Letter` unconditionally (`ComplexWord::BREAK_STATUS`,
-/// `icu_segmenter-2.3.0/src/word.rs`). Probed further against node: `〻` (also `Script=Han`,
-/// `Ideographic=No`) diverges the same way (true here, node false); `〆` diverges the OTHER way
-/// (false here, node true — it is `Script=Common`, `Ideographic=Yes`, so not dictionary text in
-/// either, and ICU4C's `$Ideographic {400}` rule tags it where ICU4X's rule table does not); `々々`
-/// is one segment here where node gives two; `人々`, `日々`, `ゝ` and `ー` agree. The difference is in the segmenter, so it is the
-/// same in the main editor (TUI-048) as in the overlay search boxes — EXT-113's one-segmenter
-/// change neither introduced nor fixed it.
+/// The iteration-mark class, against node 22.22.0 / ICU 77.1: a lone `々` or `〻` (`Script=Han`,
+/// `Ideographic=No`) is NOT word-like (no `word.txt` status rule matches one alone); `〆`
+/// (`Ideographic=Yes`, not Han) IS (`$Ideographic $ExFm* {400}`); `々々` is TWO words (ICU4C's
+/// dictionary programme prices each unknown character at 255) and both are word-like (the
+/// `$KanaKanji $KanaKanji {400}` chain); `人々`, `日々`, `ゝ` and `ー` are one word-like segment
+/// each. RED against bare ICU4X: `々`, `〻` and `々々` word-like and `々々` one segment, `〆` not
+/// word-like.
 #[test]
-fn a_lone_iteration_mark_is_word_like_under_icu4x_unlike_node() {
-    assert_eq!(icu_word_segments("々"), vec![(0, 3, true)]);
+fn the_iteration_mark_class_matches_node() {
+    let mut wrong = Vec::new();
+    for (text, node) in [
+        ("々", vec![(0, 3, false)]),
+        ("〻", vec![(0, 3, false)]),
+        ("〆", vec![(0, 3, true)]),
+        ("々々", vec![(0, 3, true), (3, 3, true)]),
+        ("x々y", vec![(0, 1, true), (1, 3, false), (4, 1, true)]),
+        ("人々", vec![(0, 6, true)]),
+        ("日々", vec![(0, 6, true)]),
+        ("ゝ", vec![(0, 3, true)]),
+        ("ー", vec![(0, 3, true)]),
+    ] {
+        let got = icu_word_segments(text);
+        if got != node {
+            wrong.push(format!("{text:?}: got {got:?}, node {node:?}"));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "{} strings disagree with node:\n{}",
+        wrong.len(),
+        wrong.join("\n")
+    );
+}
+
+/// node 22.22.0 / ICU 77.1's `Intl.Segmenter(undefined, { granularity: "word" })` over 11,882
+/// strings, from `word_nav_node_sweep.tsv` (one string per line: the text as a JSON string, a
+/// tab, then each segment's UTF-8 byte length with `*` when `isWordLike`). The strings: every
+/// code point of U+3000–U+303F, U+3040–U+30FF and U+FF00–U+FFEF, and of printable ASCII and
+/// Latin-1, alone, doubled, tripled and beside `日`/`あ`/`カ`/`a`/`1`/space; every pair of the
+/// iteration, prolongation and sound marks (`々 〻 ゝ ゞ ヽ ヾ 〆 〇 ー 〃 ｰ ゛ ゜`) alone and beside
+/// `日`/`あ`/`カ`/`人`/`時`; and a corpus of Japanese, Chinese and Korean sentences. Produced with
+/// `[...seg.segment(t)].map(s => [Buffer.byteLength(t.slice(0, s.index)),
+/// Buffer.byteLength(s.segment), s.isWordLike])` on node 22.22.0.
+///
+/// Excluded as accepted upward drift (`EXT-119`, record-only `[CYRUP-DELTA]`): strings containing U+00B8 CEDILLA, which
+/// ICU 77.1 (Unicode 16) segments as `Word_Break=Other` and ICU4X 2.3.0's data (ICU 78 / Unicode
+/// 17) as `ALetter` — a Unicode-version difference, not an algorithm one.
+///
+/// RED against bare ICU4X: 1,223 of the 11,876 strings differed — in boundaries (ICU4X's greedy
+/// dictionary match against ICU4C's cost programme: `います` is `いま`/`す` there and `い`/`ます` in
+/// node; `々々` one segment against two; `人゛゛` split where node keeps it whole) and in
+/// `isWordLike` (`々`, `〻`, `〆`, a lone `＿`).
+#[test]
+fn the_node_sweep_matches() {
+    let data = include_str!("word_nav_node_sweep.tsv");
+    let mut checked = 0usize;
+    let mut wrong = Vec::new();
+    for line in data.lines() {
+        let (text, segments) = line.split_once('\t').expect("a tab");
+        let text: String = serde_json::from_str(text).expect("a JSON string");
+        if text.contains('\u{b8}') {
+            continue;
+        }
+        let mut node = Vec::new();
+        let mut start = 0usize;
+        for segment in segments.split(' ') {
+            let (len, word_like) = match segment.strip_suffix('*') {
+                Some(len) => (len, true),
+                None => (segment, false),
+            };
+            let len: usize = len.parse().expect("a length");
+            node.push((start, len, word_like));
+            start += len;
+        }
+        checked += 1;
+        let got = icu_word_segments(&text);
+        if got != node {
+            wrong.push(format!("{text:?}: got {got:?}, node {node:?}"));
+        }
+    }
+    assert_eq!(checked, 11_876, "the fixture changed size");
+    assert!(
+        wrong.is_empty(),
+        "{} of {checked} strings disagree with node, first 40:\n{}",
+        wrong.len(),
+        wrong
+            .iter()
+            .take(40)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
 }

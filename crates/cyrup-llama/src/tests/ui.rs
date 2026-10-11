@@ -2061,6 +2061,20 @@ fn search_input_ctrl_arrows_stop_at_the_three_dictionary_boundaries() {
         vec![9, 12, 21],
         "ctrl+right over {text}"
     );
+    // A sentence where ICU4X's greedy dictionary match and ICU4C's cost programme disagree
+    // (`いま`/`す` against node's `い`/`ます`); RED against the shared helper before its `icu4c`
+    // reconciliation, which this pass added.
+    let text = "東京都に住んでいます";
+    assert_eq!(
+        word_stops(text, &ctrl_arrow(OverlayKeyCode::Left), false),
+        vec![24, 21, 15, 12, 9, 6, 0],
+        "ctrl+left over {text}"
+    );
+    assert_eq!(
+        word_stops(text, &ctrl_arrow(OverlayKeyCode::Right), true),
+        vec![6, 9, 12, 15, 21, 24, 30],
+        "ctrl+right over {text}"
+    );
 }
 
 /// EXT-113: word deletion walks the same dictionary words — Ctrl+W from the end kills `モデル`,
@@ -2095,6 +2109,9 @@ fn search_input_word_deletion_kills_one_dictionary_word_at_a_time() {
 /// at 4 (each `①` a word-like segment of its own), `a.__` skipped 2 (`__` was punctuation and
 /// joined `.` in one run), and `x½½` / `a々` likewise. The `a ‿‿` row agreed at HEAD (both
 /// predicates send a lone `‿‿` to a one-segment stop) and is a non-regression guard row.
+/// The `a.々` and `々々` rows were added with the ICU4C reconciliation (`cyrup_ext::word_nav`'s
+/// `icu4c` module): node says a lone `々` is not word-like (so `.々` is one punctuation run) and
+/// `々々` is two words; both rows were RED against the shared helper before it (bare ICU4X).
 #[test]
 fn search_input_word_motion_uses_icus_is_word_like() {
     let left = ctrl_arrow(OverlayKeyCode::Left);
@@ -2106,6 +2123,8 @@ fn search_input_word_motion_uses_icus_is_word_like() {
         ("a.__", vec![2, 1, 0], vec![1, 2, 4]),
         ("a ‿‿", vec![2, 0], vec![1, 8]),
         ("a々", vec![1, 0], vec![1, 4]),
+        ("a.々", vec![1, 0], vec![1, 5]),
+        ("々々", vec![3, 0], vec![3, 6]),
     ] {
         let got = word_stops(text, &left, false);
         if got != back {
