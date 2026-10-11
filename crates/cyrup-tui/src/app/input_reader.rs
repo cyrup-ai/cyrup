@@ -489,9 +489,14 @@ pub fn crossterm_input_stream(cancel: CancelToken) -> EventStream<InputEvent> {
     Box::pin(tokio_stream::wrappers::UnboundedReceiverStream::new(rx))
 }
 
-/// Windows: a terminal input stream backed by a blocking `event::read()` reader thread (the async crossterm
-/// `EventStream` feature is not enabled in this build; arch-10 §5 fallback). Maps `crossterm::Event`
-/// to [`InputEvent`] and forwards over an unbounded channel; stops when `cancel` fires.
+/// Windows: the console read as bytes ([`console_input_stream`], TUI-163) wherever the console
+/// accepts virtual-terminal input. Otherwise — and only then — a terminal input stream backed by a
+/// blocking `event::read()` reader thread (the async crossterm `EventStream` feature is not enabled
+/// in this build; arch-10 §5 fallback), on which the colour-scheme report is never asked for. Maps
+/// `crossterm::Event` to [`InputEvent`] and forwards over an unbounded channel; stops when `cancel`
+/// fires.
+///
+/// What follows describes that fallback.
 ///
 /// Every event passes through two machines, in this order.
 ///
@@ -514,8 +519,14 @@ pub fn crossterm_input_stream(cancel: CancelToken) -> EventStream<InputEvent> {
 /// once in `ProcessTerminal.start`), not one per machine.
 #[cfg(not(unix))]
 pub fn crossterm_input_stream(cancel: CancelToken) -> EventStream<InputEvent> {
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<InputEvent>();
     let escape_timeout = resolve_escape_timeout(|k| std::env::var(k).ok());
+    // TUI-163 — the console read as bytes, like the unix reader, wherever the console accepts
+    // virtual-terminal input; crossterm's reader below only where it does not.
+    #[cfg(windows)]
+    if let Ok(reader) = crate::input::console_win::ConsoleReader::open(escape_timeout) {
+        return console_input_stream(reader, cancel);
+    }
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<InputEvent>();
     std::thread::spawn(move || {
         let mut reassembler = EscapeReassembler::new();
         let mut filter = StrayReplyFilter::new();
@@ -575,6 +586,46 @@ pub fn crossterm_input_stream(cancel: CancelToken) -> EventStream<InputEvent> {
                 {
                     break 'reader;
                 }
+            }
+        }
+    });
+    Box::pin(tokio_stream::wrappers::UnboundedReceiverStream::new(rx))
+}
+
+/// TUI-163 — the Windows input stream over [`crate::input::console_win::ConsoleReader`]: the unix
+/// reader thread above, record for record. The console's virtual-terminal input hands over the
+/// terminal's bytes, so the escape-sequence framing, the stray-reply interception and the mode-2031
+/// colour-scheme report all go through the one [`crate::input::bytes::ByteDecoder`] — the report to
+/// [`crate::color_scheme::offer_report`], then the run loop's listener, then
+/// `App::apply_color_scheme_report`, the path every other platform takes. Neither
+/// [`EscapeReassembler`] nor [`StrayReplyFilter`] is needed here: both exist to repair what
+/// crossterm's console reader makes of a byte stream, and this reader never hands one to crossterm.
+#[cfg(windows)]
+fn console_input_stream(
+    mut reader: crate::input::console_win::ConsoleReader,
+    cancel: CancelToken,
+) -> EventStream<InputEvent> {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<InputEvent>();
+    std::thread::spawn(move || {
+        let mut events: Vec<Event> = Vec::new();
+        let mut escalation = Escalation::Idle;
+        let may_read = || !terminal_released();
+        // TUI-092 — the unix reader's loop condition, for the unix reader's reasons (see there).
+        'reader: while !tx.is_closed() && (!cancel.is_cancelled() || escalation.holds_open()) {
+            let open = reader.pump(INPUT_POLL_INTERVAL, &may_read, &mut events);
+            for ev in events.drain(..) {
+                if is_escalate_chord(&ev) {
+                    escalation = escalation.on_press(&cancel);
+                }
+                if let Some(mapped) = map_event(ev)
+                    && tx.send(mapped).is_err()
+                {
+                    break 'reader;
+                }
+            }
+            escalation = escalation.tick();
+            if !matches!(open, Ok(true)) {
+                break;
             }
         }
     });
@@ -737,8 +788,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn only_a_lone_held_escape_waits_the_escape_timeout() {
+        use crate::input::bytes::ByteDecoder;
         use crate::input::frame::DEFAULT_SEQUENCE_TIMEOUT;
-        use crate::input::reader::ByteDecoder;
         let timeout = SSH_ESCAPE_TIMEOUT;
         let mut d = ByteDecoder::new(timeout);
         let mut out = Vec::new();

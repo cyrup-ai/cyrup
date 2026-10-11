@@ -21,7 +21,7 @@ use ratatui::crossterm::event::{Event, KeyCode};
 use super::*;
 use crate::AltScreen;
 use crate::altscreen::captured_text;
-use crate::input::reader::ByteDecoder;
+use crate::input::bytes::ByteDecoder;
 use crate::theme::UiTheme;
 
 fn heard() -> (Arc<Mutex<Vec<TerminalTheme>>>, Listener) {
@@ -53,13 +53,21 @@ fn keys(events: &[Event]) -> Vec<KeyCode> {
 // The lifecycle value
 // ---------------------------------------------------------------------------------------------
 
+/// A lifecycle whose reader can take the report out of the stream — every unix reader, and the
+/// Windows VT console reader once it runs — so the pi lifecycle below holds on every host.
+fn receivable() -> Notifications {
+    let mut n = Notifications::new();
+    n.set_receivable(true);
+    n
+}
+
 /// `start()` writes the enable only when the notifications are wanted (`tui.ts:925-927`).
 #[test]
 fn start_writes_the_mode_only_when_it_is_wanted() {
-    let mut n = Notifications::new();
+    let mut n = receivable();
     assert_eq!(n.start(), None, "nothing asked for it yet");
     assert_eq!(n.set_wanted(true), Some(ENABLE), "running and now wanted");
-    let mut n = Notifications::new();
+    let mut n = receivable();
     n.set_wanted(true);
     assert_eq!(
         n.start(),
@@ -72,7 +80,7 @@ fn start_writes_the_mode_only_when_it_is_wanted() {
 /// (`tui.ts:954`); the next `start()` honours it.
 #[test]
 fn a_wish_made_while_stopped_waits_for_the_next_start() {
-    let mut n = Notifications::new();
+    let mut n = receivable();
     n.start();
     n.stop();
     assert_eq!(n.set_wanted(true), None, "stopped: nothing is written");
@@ -83,7 +91,7 @@ fn a_wish_made_while_stopped_waits_for_the_next_start() {
 /// Ctrl+Z or `$EDITOR` brings it back.
 #[test]
 fn stop_and_start_bracket_a_suspend() {
-    let mut n = Notifications::new();
+    let mut n = receivable();
     n.start();
     n.set_wanted(true);
     assert_eq!(n.stop(), Some(DISABLE));
@@ -96,7 +104,7 @@ fn stop_and_start_bracket_a_suspend() {
 /// Switching the theme to a fixed one turns the mode off, and back to `system` on again.
 #[test]
 fn auto_sync_toggles_the_mode_while_running() {
-    let mut n = Notifications::new();
+    let mut n = receivable();
     n.start();
     assert_eq!(n.set_wanted(true), Some(ENABLE));
     assert_eq!(n.set_wanted(true), None, "already on");
@@ -107,11 +115,41 @@ fn auto_sync_toggles_the_mode_while_running() {
 /// A screen swap is `stop()` of the old TUI then `start()` of the new one: off, then on.
 #[test]
 fn a_screen_swap_cycles_the_mode_off_then_on() {
-    let mut n = Notifications::new();
+    let mut n = receivable();
     n.start();
     n.set_wanted(true);
     assert_eq!(n.stop(), Some(DISABLE));
     assert_eq!(n.start(), Some(ENABLE));
+}
+
+/// TUI-163 — the mode is on the wire only while the reader can receive the report: a reader that
+/// stops (or yields the console to `$EDITOR`) takes it down with the wish kept, and one that starts
+/// puts it back. No pi counterpart: pi's input is always a byte stream.
+#[test]
+fn the_mode_follows_whether_the_reader_can_receive_it() {
+    let mut n = receivable();
+    n.start();
+    n.set_wanted(true);
+    assert_eq!(n.set_receivable(false), Some(DISABLE), "the reader stopped");
+    assert!(n.wanted(), "the wish survives");
+    assert_eq!(n.set_wanted(true), None, "wished again: still unreceivable");
+    assert_eq!(n.set_receivable(true), Some(ENABLE), "the reader is back");
+    assert_eq!(n.set_receivable(true), None, "already on");
+}
+
+/// Before any reader says otherwise, unix receives the report and Windows does not — crossterm's
+/// console reader would type it into the prompt. A NON-REGRESSION GUARD for the unix default and
+/// for the Windows fallback (a console that refuses virtual-terminal input).
+#[test]
+fn the_report_is_requested_by_default_only_where_the_reader_sees_bytes() {
+    let mut n = Notifications::new();
+    n.start();
+    let written = n.set_wanted(true);
+    if cfg!(unix) {
+        assert_eq!(written, Some(ENABLE));
+    } else {
+        assert_eq!(written, None);
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -194,12 +232,12 @@ fn an_unheard_or_split_report_never_reaches_the_editor() {
 // ---------------------------------------------------------------------------------------------
 
 /// `terminal_started` / `terminal_stopped` write through the sink they are given.
-#[cfg(unix)]
 #[test]
 fn the_terminal_start_and_stop_write_the_mode() {
     let _guard = lock_for_test();
     reset_for_test();
     with_state(|s| {
+        s.set_receivable(true);
         s.start();
         s.set_wanted(true);
     });
@@ -217,12 +255,12 @@ fn the_terminal_start_and_stop_write_the_mode() {
 /// Entering the alternate screen is pi's `stop()` of the old TUI then `start()` of the new one
 /// (`tui.ts:972-975`, `:923-927`), and leaving it takes the mode down before the screen is left.
 /// FAILS without the `TerminalSetup` hooks: no `2031` sequence is written around the screen.
-#[cfg(unix)]
 #[test]
 fn the_alternate_screen_cycles_the_mode_around_enter_and_leave() {
     let _guard = lock_for_test();
     reset_for_test();
     with_state(|s| {
+        s.set_receivable(true);
         s.start();
         s.set_wanted(true);
     });

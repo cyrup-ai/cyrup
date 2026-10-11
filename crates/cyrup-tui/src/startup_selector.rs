@@ -155,8 +155,9 @@ async fn run_on_terminal(
 }
 
 /// Ask the terminal for its colours and return at once; the answer — whenever it comes — is sent on
-/// `tx`. Asked of the terminal in raw mode with the reader running, which is what routes the reply.
-#[cfg(unix)]
+/// `tx`. Asked of the terminal in raw mode with the reader running, which is what routes the reply;
+/// on a Windows console not read as bytes (TUI-163) nothing is asked, the wait for colours times out
+/// and the system theme settles on what the environment says.
 fn ask_for_colors(tx: tokio::sync::mpsc::UnboundedSender<crate::terminal_query::TerminalColors>) {
     crate::terminal_query::request_terminal_colors_async(
         tui_stdout(),
@@ -165,11 +166,6 @@ fn ask_for_colors(tx: tokio::sync::mpsc::UnboundedSender<crate::terminal_query::
         }),
     );
 }
-
-/// Windows has no byte reader to route a reply through, so there is nothing to ask: the wait for
-/// colours times out and the system theme settles on what the environment says.
-#[cfg(not(unix))]
-fn ask_for_colors(_tx: tokio::sync::mpsc::UnboundedSender<crate::terminal_query::TerminalColors>) {}
 
 /// The selector's key source.
 #[cfg(unix)]
@@ -194,14 +190,29 @@ impl StartupEvents for Input {
     }
 }
 
-/// The selector's key source.
+/// The selector's key source: the console read as bytes (TUI-163,
+/// [`crate::input::console_win`]), so a colour-scheme report that arrives while the selector is up
+/// is taken out of the stream instead of typed into its search — or crossterm's reader on a console
+/// that refuses virtual-terminal input, where the report is never asked for.
 #[cfg(not(unix))]
-struct Input;
+enum Input {
+    #[cfg(windows)]
+    Console(Box<crate::input::console_win::ConsoleReader>),
+    Crossterm,
+}
 
 #[cfg(not(unix))]
 impl Input {
+    #[allow(clippy::unnecessary_wraps)]
     fn open() -> Result<Self, TuiError> {
-        Ok(Self)
+        #[cfg(windows)]
+        {
+            let timeout = crate::app::resolve_escape_timeout(|k| std::env::var(k).ok());
+            if let Ok(reader) = crate::input::console_win::ConsoleReader::open(timeout) {
+                return Ok(Self::Console(Box::new(reader)));
+            }
+        }
+        Ok(Self::Crossterm)
     }
 }
 
@@ -209,9 +220,15 @@ impl Input {
 impl StartupEvents for Input {
     fn next(&mut self, wait: Duration) -> Result<Option<Event>, TuiError> {
         let backend = |e: io::Error| TuiError::Backend(e.to_string());
-        if !ratatui::crossterm::event::poll(wait).map_err(backend)? {
-            return Ok(None);
+        match self {
+            #[cfg(windows)]
+            Self::Console(reader) => reader.next_event_timeout(wait).map_err(backend),
+            Self::Crossterm => {
+                if !ratatui::crossterm::event::poll(wait).map_err(backend)? {
+                    return Ok(None);
+                }
+                ratatui::crossterm::event::read().map(Some).map_err(backend)
+            }
         }
-        ratatui::crossterm::event::read().map(Some).map_err(backend)
     }
 }

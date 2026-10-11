@@ -24,8 +24,8 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use crate::InputEvent;
 use crate::UiTheme;
 use crate::app::{App, map_event};
+use crate::input::bytes::ByteDecoder;
 use crate::input::frame::DEFAULT_ESCAPE_TIMEOUT;
-use crate::input::reader::ByteDecoder;
 
 /// Feed `(gap_ms, bytes)` chunks — each read arriving `gap_ms` after the previous one — with the
 /// local 10 ms escape timeout, then let the input go idle.

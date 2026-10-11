@@ -126,6 +126,7 @@ mod write_log;
 #[cfg(test)]
 mod tests;
 
+// TUI-163 — the child half of `tests/windows_conpty.rs`; not API.
 pub use altscreen::{
     AltScreen, FullscreenExitOutput, PointerOutcome, ScrollbarMode, TuiRenderMode, ViewportRenderer,
 };
@@ -187,6 +188,9 @@ pub use image::{
     reset_capabilities_cache, seed_capabilities, seed_hyperlink_support, set_capabilities,
     set_capability_overrides,
 };
+#[cfg(windows)]
+#[doc(hidden)]
+pub use input::console_win::conpty_probe;
 pub use keyboard_protocol::{
     DESIRED_FLAGS as KITTY_DESIRED_FLAGS, KITTY_FLAGS_QUERY, KeyboardProtocol,
     MODIFY_OTHER_KEYS_DISABLE, MODIFY_OTHER_KEYS_ENABLE, NEGOTIATION_TIMEOUT, NegotiationSequence,

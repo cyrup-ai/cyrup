@@ -15,16 +15,26 @@
 //!   until the next read completes it or its timeout expires. Time is injected.
 //! - [`decode`] — one [`frame::Frame`] to one crossterm [`Event`], a swallowed terminal reply, or
 //!   nothing. crossterm's `parse_event` rules, so every consumer keeps seeing the events it saw.
+//! - [`bytes`] — [`bytes::ByteDecoder`], the framer and the decoder together, with the two
+//!   interceptions every reader needs: the mode-2031 colour-scheme report
+//!   ([`crate::color_scheme::offer_report`]) and the replies to cyrup's own terminal queries.
 //! - `reader` (unix only) — the fd loop: `poll(2)` + `read(2)` on the tty, `SIGWINCH` as
 //!   [`Event::Resize`], and a pause while `$EDITOR` or a suspend owns the terminal.
 //!
-//! On Windows crossterm's console-event reader stays in place (`crossterm_input_stream`'s
-//! `cfg(not(unix))` arm): the console does not deliver VT bytes unless asked to, and asking is out
-//! of scope.
+//! On Windows (TUI-163) the console delivers the terminal's bytes only when asked to, with
+//! `ENABLE_VIRTUAL_TERMINAL_INPUT`. `console_win` asks, reads the console's records, and
+//! [`console`] turns them back into the bytes the terminal sent and feeds the same
+//! [`bytes::ByteDecoder`] — so the colour-scheme report is received there too. A console that
+//! refuses virtual-terminal input keeps crossterm's console-event reader
+//! (`crossterm_input_stream`'s fallback), and the report is never asked for there.
 //!
 //! [`Event`]: ratatui::crossterm::event::Event
 //! [`Event::Resize`]: ratatui::crossterm::event::Event::Resize
 
+pub(crate) mod bytes;
+pub(crate) mod console;
+#[cfg(windows)]
+pub(crate) mod console_win;
 pub(crate) mod decode;
 pub(crate) mod frame;
 #[cfg(unix)]

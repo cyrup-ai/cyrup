@@ -468,9 +468,8 @@ impl<B: Backend> App<B> {
     /// Ask the terminal for its colours again without waiting — the `queryTerminalColors()` pi's
     /// `applyFromSettings` ends with (`theme-controller.ts:108`). The input reader thread owns
     /// stdin by now, so the answer is routed to the pending query by the reader and delivered on
-    /// the channel [`Self::set_terminal_colors_channel`] installed. A no-op off a real terminal
-    /// and when no channel was installed.
-    #[cfg(unix)]
+    /// the channel [`Self::set_terminal_colors_channel`] installed. A no-op off a real terminal,
+    /// on a Windows console not read as bytes (TUI-163), and when no channel was installed.
     pub(crate) fn requery_terminal_colors(&self) {
         #[cfg(test)]
         REQUERIES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -483,10 +482,6 @@ impl<B: Backend> App<B> {
             );
         }
     }
-
-    /// Windows has no byte reader to route a reply through, so there is nothing to ask.
-    #[cfg(not(unix))]
-    pub(crate) fn requery_terminal_colors(&self) {}
 
     /// Re-check the git refs and republish the branch when it moved — Pi's watch-driven
     /// `refreshGitBranchAsync` → `notifyBranchChange` (`footer-data-provider.ts`), driven here by

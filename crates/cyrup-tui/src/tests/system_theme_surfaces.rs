@@ -57,6 +57,7 @@ pub(super) fn mocha() -> TerminalColors {
 }
 
 /// What a terminal answers to the colour batch: OSC 10, OSC 11, sixteen OSC 4 and the DA1.
+#[cfg(unix)]
 pub(super) fn terminal_reply(colors: &TerminalColors) -> Vec<u8> {
     let osc = |rgb: Rgb| {
         format!(
@@ -354,7 +355,7 @@ mod notifications {
 
     use super::*;
     use crate::color_scheme::{lock_for_test, reset_for_test, set_listener};
-    use crate::input::reader::ByteDecoder;
+    use crate::input::bytes::ByteDecoder;
     use crate::terminal_query::{GlobalHub, request_terminal_colors_async_with};
 
     fn feed(decoder: &mut ByteDecoder, bytes: &[u8]) {
@@ -945,6 +946,110 @@ mod settings_submenu {
         press(&mut app, KeyCode::Down);
         assert_eq!(app.state().theme.name, "quiet");
         assert_eq!(app.state().theme.accent, Some(Color::Rgb(0x44, 0x55, 0x66)));
+        reset_for_test();
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// TUI-163 — the same report, read from the Windows console
+// ---------------------------------------------------------------------------------------------
+
+/// The Windows console's half of TUI-163, on every host: what the console reader does with the
+/// records a virtual-terminal-input console delivers (`crate::input::console::ConsolePump`). The OS
+/// half — the mode, the wait, `ReadConsoleInputW` — is exercised only by the ConPTY test in
+/// `tests/windows_conpty.rs`, which runs on Windows alone.
+mod windows_console {
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use ratatui::crossterm::event::Event;
+
+    use super::*;
+    use crate::color_scheme::{lock_for_test, reset_for_test, set_listener};
+    use crate::input::console::{ConsolePump, ConsoleRecord};
+
+    /// The records a virtual-terminal-input console delivers for `bytes`: each byte the character
+    /// of a key-down record, followed by its key-up record (which carries the same character and
+    /// must not double it).
+    fn records_for(bytes: &[u8]) -> Vec<ConsoleRecord> {
+        bytes
+            .iter()
+            .flat_map(|&b| {
+                [true, false].map(|key_down| ConsoleRecord::Key {
+                    key_down,
+                    unit: u16::from(b),
+                    repeat: 1,
+                })
+            })
+            .collect()
+    }
+
+    fn pump_records(pump: &mut ConsolePump, records: &[ConsoleRecord]) -> Vec<Event> {
+        let mut out = Vec::new();
+        pump.push(records, Instant::now(), &|| Ok((80, 24)), &mut out);
+        out
+    }
+
+    /// A Windows session whose terminal turns light re-resolves the `system` theme with no user
+    /// action: the report, read from the console as key records, reaches the run loop's listener,
+    /// and `App::apply_color_scheme_report` re-themes the app — the same route the unix test above
+    /// drives from `read(2)` bytes.
+    ///
+    /// Before TUI-163 the Windows reader handed these records to crossterm, which takes each
+    /// character as a typed key: nothing reached the listener and the theme stayed dark. The pump
+    /// did not exist at HEAD, so the red-proof is that behaviour restored in its place — every
+    /// record's character emitted as `KeyCode::Char` instead of fed to the decoder: this test then
+    /// fails on its first assertion (the report comes out as nine keys). It also fails with
+    /// `ByteDecoder`'s `offer_report` interception removed (the listener hears nothing).
+    #[test]
+    fn a_report_read_from_the_windows_console_re_themes_the_system_theme() {
+        let _guard = lock_for_test();
+        reset_for_test();
+        let resources = registry();
+        let (mut app, _svc, _rx) = wired();
+        assert_eq!(app.state().theme.appearance(), Appearance::Dark);
+        let (scheme_tx, mut scheme_rx) = tokio::sync::mpsc::unbounded_channel();
+        set_listener(Some(Arc::new(move |scheme| {
+            let _ = scheme_tx.send(scheme);
+        })));
+        let mut pump = ConsolePump::new(Duration::from_millis(10));
+
+        let events = pump_records(&mut pump, &records_for(b"\x1b[?997;2n"));
+
+        assert!(events.is_empty(), "the report is not input: {events:?}");
+        let scheme = scheme_rx
+            .try_recv()
+            .expect("the report reaches the run loop");
+        assert_eq!(scheme, TerminalTheme::Light);
+        app.apply_color_scheme_report(scheme, &resources);
+        assert_eq!(app.state().theme.appearance(), Appearance::Light);
+        reset_for_test();
+    }
+
+    /// The same records never reach the editor: they are decoded as a terminal reply and taken out
+    /// of the stream, while a key typed right after them in the same read still is input.
+    ///
+    /// Red-proved with HEAD's behaviour restored in the pump (each character a typed key): the
+    /// editor then holds `"\u{1b}[?997;1nx"`. Removing only `offer_report` does NOT turn it red —
+    /// the framer still takes the report as one sequence that decodes to no key — so this test pins
+    /// the framing, and the test above pins the delivery.
+    #[test]
+    fn the_report_read_from_the_windows_console_never_reaches_the_editor() {
+        let _guard = lock_for_test();
+        reset_for_test();
+        let (mut app, _svc, _rx) = wired();
+        let mut pump = ConsolePump::new(Duration::from_millis(10));
+
+        let mut records = records_for(b"\x1b[?997;1n");
+        records.extend(records_for(b"x"));
+        let events = pump_records(&mut pump, &records);
+        for event in &events {
+            if let Some(input) = crate::app::map_event(event.clone()) {
+                app.handle_input(&input);
+            }
+        }
+
+        assert_eq!(app.state().editor.text(), "x", "{events:?}");
         reset_for_test();
     }
 }

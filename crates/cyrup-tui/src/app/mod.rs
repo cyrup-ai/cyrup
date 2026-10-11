@@ -111,12 +111,10 @@ pub use extension_render_impl::{
 pub(crate) use input_reader::{
     ACTIVE_ARM, Escalation, PANIC_MIN_GAP, input_serviced, is_escalate_chord, map_event_on,
 };
-// Unix-only consumers: the byte-level pipeline tests drive bytes through `map_event`, and the
-// startup selector's own reader reads the escape timeout (the non-unix reader calls both inside
-// `input_reader` directly).
-#[cfg(all(test, unix))]
+// The byte-level pipeline tests drive bytes through `map_event`, and the startup selector's own
+// reader reads the escape timeout.
+#[cfg(test)]
 pub(crate) use input_reader::map_event;
-#[cfg(unix)]
 pub(crate) use input_reader::resolve_escape_timeout;
 pub(crate) use input_reader::{
     ARM_BUDGET, ArmGuard, OVER_BUDGET_ARM, TerminalReleased, mark_input_serviced,

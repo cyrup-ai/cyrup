@@ -2112,6 +2112,7 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "chrono",
+ "crossterm_winapi",
  "cyrup-agent",
  "cyrup-codemode-runtime",
  "cyrup-config",
@@ -2140,6 +2141,7 @@ dependencies = [
  "tokio-stream",
  "unicode-segmentation",
  "uuid",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

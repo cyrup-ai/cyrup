@@ -146,6 +146,13 @@ cyrup-tools = { workspace = true }
 # this crate's `#![forbid(unsafe_code)]`.
 regex = "1.12.4"
 
+[target.'cfg(windows)'.dependencies]
+# TUI-163 — the Windows console reader (`src/input/console_win.rs`) turns on virtual-terminal input
+# and reads the console's records itself, so the mode-2031 colour-scheme report arrives as bytes.
+# The crate crossterm itself reads the console with: its safe wrappers keep `#![forbid(unsafe_code)]`,
+# and `Cargo.lock` already pins it (`crossterm_winapi 0.9.1`, via crossterm).
+crossterm_winapi = "0.9.1"
+
 [dev-dependencies]
 # CODE-011: the renderer test drives the REAL `codemode` extension's component through the tool row.
 cyrup-codemode-runtime = { workspace = true }
@@ -175,3 +182,16 @@ rustix = { workspace = true, features = ["pty", "termios"] }
 # `async-trait` was listed here for EXT-006 (the renderer-routing test declares a `NativeExtension`)
 # and for `tests/login_flow.rs`'s stub `OAuthAuth`/`ApiKeyAuth`; it is now a REGULAR dependency
 # above (the `AuthInteraction` impl needs it in `src/`), which covers dev builds too.
+
+[target.'cfg(windows)'.dev-dependencies]
+# TUI-163 — `tests/windows_conpty.rs` runs `conpty_probe` on a real pseudo-console (ConPTY), the
+# Windows counterpart of the `openpty` tests; creating one has no safe wrapper, so the test (its own
+# crate, outside this library's `#![forbid(unsafe_code)]`) calls the API directly. TEST-only, and
+# lock-neutral: `Cargo.lock` already pins `windows-sys 0.61.2`.
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Console",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+] }
