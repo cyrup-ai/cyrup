@@ -1291,7 +1291,7 @@ Keeps its ID and its body; proposes no schedulable work today.
 > fetched at runtime; cyrup's `apply_image_input_metadata` runs at every chat and image catalog PARSE
 > site, including the remote overlay (`catalog::apply_overlay_metadata`, `[CYRUP-DELTA, intentional]`).
 > Classifier rows are never stamped, on either path, because the generator never stamps them
-> (`generate-models.ts:3379-3392` @f1b2e77f5; PROV-158). Against pi.dev the overlay stamp is a no-op:
+> (`generate-models.ts:3381-3392` @f1b2e77f5; PROV-158). Against pi.dev the overlay stamp is a no-op:
 > every image-capable chat and image row it serves already carries `inputLimits`. It acts only on a
 > row served WITHOUT the field. There `DEFAULT_IMAGE_RESIZE` is byte-for-byte the resizer's own
 > `DEFAULT_OPTIONS`, so with no embedder fallback an absent profile resolves to the same four numbers
