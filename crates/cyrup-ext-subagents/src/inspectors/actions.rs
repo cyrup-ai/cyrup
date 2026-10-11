@@ -629,6 +629,22 @@ pub async fn handle_inspector_action(
     deps: &InspectorDispatcherDeps,
     cancel: Option<&CancelToken>,
 ) -> Result<ToolResult, ToolError> {
+    dispatch_inspector_action(action, request, deps, cancel, &|| {}).await
+}
+
+/// [`handle_inspector_action`]'s body, with one test seam: `after_lease` runs once, after the
+/// open/close lease is acquired and BEFORE the post-acquire cancellation re-check (pi
+/// `actions.ts:158-159`). Production passes a no-op; a test passes a closure that cancels the
+/// token, which is the only deterministic way to open pi's "the wait may end with the lease in
+/// the same tick the caller cancelled" window (SUBA-224). Private, so no caller outside this
+/// module can reach it.
+async fn dispatch_inspector_action(
+    action: InspectorAction,
+    request: &InspectorRequest,
+    deps: &InspectorDispatcherDeps,
+    cancel: Option<&CancelToken>,
+    after_lease: &(dyn Fn() + Sync),
+) -> Result<ToolResult, ToolError> {
     let resolved = resolve_target(request, deps)
         .await
         .map_err(ToolError::new)?;
@@ -671,6 +687,7 @@ pub async fn handle_inspector_action(
     // `_lease` is the `finally { release() }`: dropped on every exit below, including an `Err`
     // from the plugin (pi's "releases the target after a failed open").
     let _lease = acquire_inspector_lease(action, &resolved.target, deps.lease_wait, cancel).await?;
+    after_lease();
     if cancel.is_some_and(CancelToken::is_cancelled) {
         return Err(ToolError::new(lease_cancelled_sentence(
             action,
@@ -988,6 +1005,9 @@ mod tests {
         }
 
         async fn close(&self, _ctx: &InspectorContext) -> Option<Result<ToolResult, ToolError>> {
+            if let Ok(mut calls) = self.calls.lock() {
+                calls.push("close".to_string());
+            }
             self.has_close
                 .then(|| Ok(management_text(format!("plugin close:{}", self.tag))))
         }
@@ -2115,10 +2135,9 @@ mod tests {
     /// What answers here is `FileLock::acquire`'s own already-cancelled pre-check (layer 1's
     /// `is_cancelled()` before any wait), mapped to pi's sentence — NOT the post-acquire re-check
     /// in `handle_inspector_action`. That re-check is pi's "the wait may end with the lease in the
-    /// same tick the caller cancelled" guard: it only matters for a cancel landing while a layer-2
-    /// attempt is in flight, a window no test can open deterministically without a seam inside
-    /// `cyrup_config::lock`. Mutation-checked: deleting it leaves this suite green, so it is
-    /// covered by review against pi `actions.ts:158-159` @ad11b7ab, not by a test.
+    /// same tick the caller cancelled" guard, which
+    /// `a_cancel_landing_with_the_lease_never_reaches_the_plugin` proves through the
+    /// `dispatch_inspector_action` seam.
     #[tokio::test]
     async fn a_pre_cancelled_caller_never_reaches_the_plugin() {
         let fixture = fixture();
@@ -2301,5 +2320,78 @@ mod tests {
                 .await
                 .expect("the target was released");
         assert_eq!(text_of(&ok), "opened");
+    }
+
+    /// SUBA-224 (SUBA-201's untested clause): pi `actions.ts:158-159` @ad11b7ab —
+    ///
+    /// ```text
+    /// // The wait may end with the lease in the same tick the caller cancelled; never act for a cancelled caller.
+    /// if (deps.signal?.aborted) return result(`Inspector ${action} for async run ${target.runId}${label} was cancelled while waiting for another inspector open or close to finish.`, true);
+    /// ```
+    ///
+    /// The seam cancels the token AFTER the lease is held and before the re-check, which is the
+    /// window a cancel racing a successful layer-2 attempt lands in. Both verbs must answer pi's
+    /// exact sentence, `isError`, and never call the plugin's `open` or `close`. Delete the
+    /// re-check in `dispatch_inspector_action` and the open answers "opened" — RED.
+    #[tokio::test]
+    async fn a_cancel_landing_with_the_lease_never_reaches_the_plugin() {
+        let fixture = fixture();
+        let mut deps = fixture.deps();
+        fixture.write_run("224aaaa1", 2);
+        let calls: CallLog = CallLog::default();
+        deps.plugins.push(Box::new(RecordingPlugin {
+            available: true,
+            owns: true,
+            has_close: true,
+            calls: std::sync::Arc::clone(&calls),
+            tag: "late",
+            ..RecordingPlugin::default()
+        }));
+
+        let cancel = CancelToken::new();
+        let hook = {
+            let cancel = cancel.clone();
+            move || cancel.cancel()
+        };
+        let err = dispatch_inspector_action(
+            InspectorAction::Open,
+            &request_for("224aaaa1"),
+            &deps,
+            Some(&cancel),
+            &hook,
+        )
+        .await
+        .expect_err("a caller cancelled while the lease was won is an error");
+        assert_eq!(
+            err.message,
+            "Inspector inspector.open for async run 224aaaa1 was cancelled while waiting for another inspector open or close to finish."
+        );
+
+        let cancel = CancelToken::new();
+        let hook = {
+            let cancel = cancel.clone();
+            move || cancel.cancel()
+        };
+        let err = dispatch_inspector_action(
+            InspectorAction::Close,
+            &child_request("224aaaa1", Some(1)),
+            &deps,
+            Some(&cancel),
+            &hook,
+        )
+        .await
+        .expect_err("a caller cancelled while the lease was won is an error");
+        assert_eq!(
+            err.message,
+            "Inspector inspector.close for async run 224aaaa1 child 1 was cancelled while waiting for another inspector open or close to finish."
+        );
+
+        let calls = calls.lock().expect("calls").clone();
+        assert!(
+            !calls
+                .iter()
+                .any(|call| call.starts_with("open:") || call == "close"),
+            "a cancelled caller must never reach the plugin's open or close: {calls:?}"
+        );
     }
 }

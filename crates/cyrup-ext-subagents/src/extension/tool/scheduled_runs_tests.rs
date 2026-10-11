@@ -1505,3 +1505,102 @@ async fn a_run_a_schedule_references_is_protected_from_retention() {
          {referenced:?}"
     );
 }
+
+/// SUBA-226 `[CYRUP-DELTA]`: a claim whose `history.json` update TIMED OUT after its receipt was
+/// written (SUBA-183's write order) references its async run only through the receipt, and the
+/// retention sweep must still protect that run — otherwise, once the settle is missed and the
+/// run ages out, reaping its directory wedges the schedule: `restore_one` keeps the `Running`
+/// claim (it has an `async_id`) and `schedule.delete`'s guard can never read a terminal status.
+///
+/// Red at HEAD: `referenced_async_run_ids` read `history.json` only, which never got the entry.
+#[tokio::test]
+async fn an_active_run_known_only_by_its_receipt_is_protected_from_retention() {
+    use crate::background::scheduled_runs::{
+        HISTORY_FILE, ScheduleDueReason, ScheduleId, ScheduleRunId, ScheduleRunRecord,
+        ScheduleStoreError, ScheduleVersion,
+    };
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (executor, _host, manager) = armed(dir.path(), "session-a").await;
+    let tool = SubagentTool::new(Arc::clone(&executor), dir.path().to_path_buf());
+    dispatch(
+        &tool,
+        serde_json::json!({
+            "action": "schedule.create", "id": "nightly", "at": "+1h",
+            "workflow": workflow_script_path(TRIVIAL_SCRIPT),
+        }),
+    )
+    .await
+    .expect("create");
+    let id = ScheduleId::parse("nightly").expect("id");
+    let store = manager.store();
+
+    // The claim, as `launch` leaves it: the record names the active run, whose receipt carries
+    // the launched async run.
+    let run_id = ScheduleRunId::mint();
+    let async_id = "226aaaa1".to_string();
+    let mut schedule = store.get(&id).await.expect("schedule");
+    schedule.active_run_id = Some(run_id.clone());
+    store.write(&schedule).await.expect("claim");
+    let run = ScheduleRunRecord {
+        schema_version: ScheduleVersion,
+        id: run_id.clone(),
+        schedule_id: id.clone(),
+        planned_at: schedule_timestamp(0),
+        due_reason: ScheduleDueReason::Manual,
+        state: ScheduleRunState::Running,
+        started_at: Some(schedule_timestamp(0)),
+        completed_at: None,
+        async_id: Some(async_id.clone()),
+        async_dir: Some(dir.path().join("async").join(&async_id)),
+        error: None,
+    };
+
+    // Another writer holds `history.json`'s lock past the 200 ms bound: the receipt lands, the
+    // history update times out — the exact state SUBA-183's write order can leave.
+    let history_lock = std::fs::canonicalize(store.directory(&id, false).await.expect("dir"))
+        .expect("canonical dir")
+        .join(format!("{HISTORY_FILE}.lock"));
+    let peer = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&history_lock)
+        .expect("peer sidecar");
+    peer.lock().expect("peer flock");
+    let timed_out = store
+        .write_run(&schedule, &run, "schedule.run.started")
+        .await
+        .expect_err("the history update must time out behind the held lock");
+    assert!(
+        matches!(timed_out, ScheduleStoreError::LeaseTimeout { .. }),
+        "{timed_out}"
+    );
+    drop(peer);
+    assert!(
+        store
+            .history(&id)
+            .await
+            .expect("history")
+            .iter()
+            .all(|item| item.async_id.as_deref() != Some(async_id.as_str())),
+        "precondition: history.json never got the run"
+    );
+    assert_eq!(
+        store
+            .active_run(&schedule)
+            .await
+            .expect("active run")
+            .and_then(|active| active.async_id),
+        Some(async_id.clone()),
+        "precondition: the receipt names the run"
+    );
+
+    let referenced = manager.referenced_async_run_ids().await;
+    assert!(
+        referenced.contains(&crate::background::RunId::from_token(async_id.clone())),
+        "the schedule's active claim still points at {async_id} through its receipt, so the \
+         sweep must protect it: {referenced:?}"
+    );
+}

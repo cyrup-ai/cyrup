@@ -864,7 +864,7 @@ pub enum WatchdogCommandOutcome {
 /// Every arm's text is upstream's verbatim, including the failure texts: a model/thinking write that
 /// throws reports the message AND "No settings files were changed.", because it does not reach
 /// `writeSettingsFile`.
-pub fn handle_watchdog_command(
+pub async fn handle_watchdog_command(
     runtime: &MainWatchdogRuntime,
     args: &str,
     ctx: &WatchdogCommandContext<'_>,
@@ -892,7 +892,7 @@ pub fn handle_watchdog_command(
     }
     if input == "on" || input == "off" {
         let enabled = input == "on";
-        return text(match write_user_watchdog_enabled(enabled) {
+        return text(match write_user_watchdog_enabled(enabled).await {
             Ok(settings_path) => {
                 let snapshot = runtime.get_snapshot(Some(&ctx.cwd));
                 [
@@ -958,16 +958,20 @@ pub fn handle_watchdog_command(
     }
     if let Some(raw_model) = input.strip_prefix("model ") {
         return text(
-            match resolve_model_command_value(ctx, raw_model).and_then(|value| {
+            match async {
+                let value = resolve_model_command_value(ctx, raw_model)?;
                 let settings_path = write_watchdog_model_settings(&WatchdogModelSettingsWrite {
                     scope: WatchdogSettingsWriteScope::User,
                     cwd: None,
                     target: WatchdogModelSettingsTarget::Main,
                     model: Some(value.model.clone()),
                     thinking: Some(value.thinking.clone()),
-                })?;
-                Ok((value, settings_path))
-            }) {
+                })
+                .await?;
+                Ok::<_, String>((value, settings_path))
+            }
+            .await
+            {
                 Ok((value, settings_path)) => {
                     runtime.refresh_config(&ctx.cwd);
                     let snapshot = runtime.get_snapshot(Some(&ctx.cwd));
@@ -994,16 +998,20 @@ pub fn handle_watchdog_command(
     }
     if let Some(raw_thinking) = input.strip_prefix("thinking ") {
         return text(
-            match parse_thinking_command(raw_thinking).and_then(|thinking| {
+            match async {
+                let thinking = parse_thinking_command(raw_thinking)?;
                 let settings_path = write_watchdog_model_settings(&WatchdogModelSettingsWrite {
                     scope: WatchdogSettingsWriteScope::User,
                     cwd: None,
                     target: WatchdogModelSettingsTarget::Main,
                     model: None,
                     thinking: Some(thinking.clone()),
-                })?;
-                Ok((thinking, settings_path))
-            }) {
+                })
+                .await?;
+                Ok::<_, String>((thinking, settings_path))
+            }
+            .await
+            {
                 Ok((thinking, settings_path)) => {
                     runtime.refresh_config(&ctx.cwd);
                     [
@@ -1434,10 +1442,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn an_unknown_subcommand_returns_the_usage_error_naming_every_thinking_level() {
+    #[tokio::test]
+    async fn an_unknown_subcommand_returns_the_usage_error_naming_every_thinking_level() {
         let runtime = MainWatchdogRuntime::default();
-        let (outcome, details) = handle_watchdog_command(&runtime, "wat", &ctx());
+        let (outcome, details) = handle_watchdog_command(&runtime, "wat", &ctx()).await;
         assert!(details.is_none());
         match outcome {
             WatchdogCommandOutcome::UsageError(message) => {
@@ -1454,11 +1462,12 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_test_command_records_a_displayed_warning_for_the_caller_to_send() {
+    #[tokio::test]
+    async fn a_test_command_records_a_displayed_warning_for_the_caller_to_send() {
         let runtime = MainWatchdogRuntime::default();
         let (outcome, details) =
-            handle_watchdog_command(&runtime, "test blocker high the renderer is broken", &ctx());
+            handle_watchdog_command(&runtime, "test blocker high the renderer is broken", &ctx())
+                .await;
         assert_eq!(outcome, WatchdogCommandOutcome::Text(String::new()));
         let details = details.expect("a warning to send");
         assert_eq!(details.severity, WatchdogSeverity::Blocker);
@@ -1476,8 +1485,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_test_command_with_no_text_falls_through_to_the_general_usage_error() {
+    #[tokio::test]
+    async fn a_test_command_with_no_text_falls_through_to_the_general_usage_error() {
         // `handleWatchdogCommand` trims its argument FIRST (`:252`), so by the time
         // `parseTestCommand`'s `\s+([\s\S]+)$` runs there is no trailing whitespace left for the
         // capture to match — `test blocker   ` simply does not parse as a test command, and
@@ -1485,7 +1494,7 @@ mod tests {
         // `!test.text` branch at `:365-368` is defensive and unreachable through this entry point;
         // it is still ported, and [`parse_test_command`]'s own test pins the grammar directly.
         let runtime = MainWatchdogRuntime::default();
-        let (outcome, warning) = handle_watchdog_command(&runtime, "test blocker   ", &ctx());
+        let (outcome, warning) = handle_watchdog_command(&runtime, "test blocker   ", &ctx()).await;
         assert!(warning.is_none(), "nothing was recorded");
         match outcome {
             WatchdogCommandOutcome::UsageError(message) => assert!(
@@ -1496,8 +1505,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn the_defensive_empty_text_branch_is_ported_but_unreachable_through_the_command() {
+    #[tokio::test]
+    async fn the_defensive_empty_text_branch_is_ported_but_unreachable_through_the_command() {
         // `parseTestCommand` DOES capture a whitespace-only tail (upstream's `([\s\S]+)` matches a
         // non-breaking space, and its `.trim()` then empties it) —
         assert_eq!(
@@ -1516,7 +1525,7 @@ mod tests {
         // [`a_test_command_with_no_text_falls_through_to_the_general_usage_error`] pins.
         let runtime = MainWatchdogRuntime::default();
         let (outcome, warning) =
-            handle_watchdog_command(&runtime, "test blocker high \u{a0}", &ctx());
+            handle_watchdog_command(&runtime, "test blocker high \u{a0}", &ctx()).await;
         assert!(warning.is_none());
         match outcome {
             WatchdogCommandOutcome::UsageError(message) => assert!(
@@ -1527,10 +1536,10 @@ mod tests {
         }
     }
 
-    #[test]
-    fn session_on_flips_the_override_and_reprints_the_status() {
+    #[tokio::test]
+    async fn session_on_flips_the_override_and_reprints_the_status() {
         let runtime = MainWatchdogRuntime::default();
-        let (outcome, _) = handle_watchdog_command(&runtime, "session on", &ctx());
+        let (outcome, _) = handle_watchdog_command(&runtime, "session on", &ctx()).await;
         match outcome {
             WatchdogCommandOutcome::Text(text) => {
                 assert!(text.starts_with("Subagent watchdog session override: on.\nNo settings files were changed.\n\nSubagent watchdog\n"), "{text}");
@@ -1541,10 +1550,11 @@ mod tests {
         assert_eq!(runtime.get_snapshot(None).session_override, Some(true));
     }
 
-    #[test]
-    fn a_bad_session_model_reports_the_error_and_changes_nothing() {
+    #[tokio::test]
+    async fn a_bad_session_model_reports_the_error_and_changes_nothing() {
         let runtime = MainWatchdogRuntime::default();
-        let (outcome, _) = handle_watchdog_command(&runtime, "session model not-a-model", &ctx());
+        let (outcome, _) =
+            handle_watchdog_command(&runtime, "session model not-a-model", &ctx()).await;
         match outcome {
             WatchdogCommandOutcome::Text(text) => assert!(
                 text.starts_with("Subagent watchdog session model\n\nWatchdog model 'not-a-model' did not resolve to provider/model."),
@@ -1555,11 +1565,11 @@ mod tests {
         assert!(runtime.get_snapshot(None).session_model_override.is_none());
     }
 
-    #[test]
-    fn status_is_the_empty_argument_default() {
+    #[tokio::test]
+    async fn status_is_the_empty_argument_default() {
         let runtime = MainWatchdogRuntime::default();
-        let (empty, _) = handle_watchdog_command(&runtime, "   ", &ctx());
-        let (named, _) = handle_watchdog_command(&runtime, "status", &ctx());
+        let (empty, _) = handle_watchdog_command(&runtime, "   ", &ctx()).await;
+        let (named, _) = handle_watchdog_command(&runtime, "status", &ctx()).await;
         assert_eq!(empty, named);
     }
 

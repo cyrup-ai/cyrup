@@ -1158,7 +1158,7 @@ impl NativeExtension for SubagentsExtension {
         // pi `register-main.ts:403-409` registers `/subagents-watchdog` as its OWN command, separate
         // from this crate's eighteen `SLASH_COMMANDS`, so it routes before the table lookup.
         if name == crate::watchdog::register_main::WATCHDOG_COMMAND_NAME {
-            return Ok(self.execute_watchdog_command(args, ctx));
+            return Ok(self.execute_watchdog_command(args, ctx).await);
         }
 
         let Some(command) = SlashCommandName::from_str_exact(name) else {

@@ -99,18 +99,18 @@ pub(crate) async fn lock_settings_file(
         })
 }
 
-/// SUBA-184 — how long a SYNCHRONOUS settings writer waits for another writer's lock: pi
+/// SUBA-184 — how long a BOUNDED settings writer waits for another writer's lock: pi
 /// `withFileLease(filePath, action, waitMs = 200)` (`src/shared/file-lease.ts:61` @ad11b7ab),
 /// which `withSettingsFileLease` calls with the default.
 pub(crate) const SETTINGS_LEASE_WAIT: std::time::Duration = std::time::Duration::from_millis(200);
 
-/// SUBA-184 — [`lock_settings_file`] for a writer that is not async (the watchdog settings
-/// writers, whose upstream twins are sync as well): the SAME `flock` on the SAME
-/// `<physical target>.lock` sidecar, so it excludes every [`lock_settings_file`] holder of that
-/// file (agent-override saves, profile loads) in this process or another, waited for at most
-/// `wait` (pi's 200 ms, [`SETTINGS_LEASE_WAIT`]). `target` must already be the physical target
-/// ([`settings_write_target`]), as pi `withSettingsFileLease` resolves it before
-/// `withFileLease` (`src/shared/settings-file-lease.ts:33-36` @ad11b7ab):
+/// SUBA-184 — [`lock_settings_file`] bounded by `wait` (pi's 200 ms, [`SETTINGS_LEASE_WAIT`]), for
+/// the watchdog settings writers, whose upstream twins bound their wait: the SAME two-layer
+/// `FileLock` on the SAME `<physical target>.lock` sidecar, so it excludes every
+/// [`lock_settings_file`] holder of that file (agent-override saves, profile loads) in this process
+/// or another. `target` must already be the physical target ([`settings_write_target`]), as pi
+/// `withSettingsFileLease` resolves it before `withFileLease`
+/// (`src/shared/settings-file-lease.ts:33-36` @ad11b7ab):
 ///
 /// ```text
 /// export function withSettingsFileLease<T>(filePath: string, action: () => T): T {
@@ -119,23 +119,26 @@ pub(crate) const SETTINGS_LEASE_WAIT: std::time::Duration = std::time::Duration:
 /// }
 /// ```
 ///
-/// `[CYRUP-DELTA]` pi's lease is a `mkdir` `<file>.write-lock` directory; this is the `flock`
-/// sidecar SUBA-029/171 already hold — see `cyrup_config::lock::BlockingFileLock`. A timeout
-/// carries pi's sentence verbatim (`Timed out waiting for another process to finish updating
-/// <abs>.`); any other lock failure reads as [`lock_settings_file`]'s.
-pub(crate) fn lock_settings_file_blocking(
+/// `[CYRUP-DELTA]` pi's lease is a synchronous `mkdir` `<file>.write-lock` directory; this is the
+/// `flock` sidecar SUBA-029/171 already hold, awaited rather than polled on a parked thread
+/// (SUBA-225) — see `cyrup_config::lock::FileLock::acquire_within`. A timeout carries pi's
+/// sentence verbatim (`Timed out waiting for another process to finish updating <abs>.`); any
+/// other lock failure reads as [`lock_settings_file`]'s.
+pub(crate) async fn lock_settings_file_within(
     target: &Path,
     wait: std::time::Duration,
-) -> Result<cyrup_config::lock::BlockingFileLock, SubagentError> {
-    cyrup_config::lock::BlockingFileLock::acquire(target, wait).map_err(|e| match e {
-        cyrup_config::ConfigError::LockTimeout { .. } => {
-            SubagentError::MalformedSettings(e.to_string())
-        }
-        other => SubagentError::MalformedSettings(format!(
-            "Failed to lock settings file '{}': {other}",
-            target.display()
-        )),
-    })
+) -> Result<cyrup_config::lock::FileLock, SubagentError> {
+    cyrup_config::lock::FileLock::acquire_within(target, wait)
+        .await
+        .map_err(|e| match e {
+            cyrup_config::ConfigError::LockTimeout { .. } => {
+                SubagentError::MalformedSettings(e.to_string())
+            }
+            other => SubagentError::MalformedSettings(format!(
+                "Failed to lock settings file '{}': {other}",
+                target.display()
+            )),
+        })
 }
 
 /// SUBA-171 — pi `resolveSettingsWriteTarget` (`src/shared/settings-file-lease.ts:6-30`

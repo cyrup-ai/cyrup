@@ -230,6 +230,40 @@ impl ScheduledRunManager {
     /// captured a minute ago protects the runs that were live then and leaves every run fired
     /// since unprotected, which is exactly the reap this must never perform.
     ///
+    /// # `[CYRUP-DELTA]` — the active run's RECEIPT is a reference too (SUBA-226)
+    ///
+    /// Upstream reads `history.json` only (`scheduled-runs.ts` @ad11b7ab):
+    ///
+    /// ```text
+    /// referencedAsyncRunIds(): Set<string> {
+    ///     const runIds = new Set(this.observedAsyncIds);
+    ///     for (const store of this.stores.values()) {
+    ///         for (const scheduleId of store.ids()) {
+    ///             for (const run of store.history(scheduleId)) {
+    ///                 if (run.asyncId) runIds.add(run.asyncId);
+    ///             }
+    ///         }
+    ///     }
+    ///     return runIds;
+    /// }
+    /// ```
+    ///
+    /// But the same commit (`650244c3`, SUBA-183) made the run's receipt `runs/<id>.json` the
+    /// record of truth for a live claim — written BEFORE `history.json`, whose update can now time
+    /// out after 200 ms — and made `restoreOne`, `remove` and the completion handler read
+    /// `activeRun` receipt-first for exactly that reason. A claim whose `history.json` update
+    /// timed out has an `async_id` ONLY in its receipt. If its settle is then missed (the owning
+    /// session died; a `sessionOnly` schedule no other session restores), the sweep would reap the
+    /// terminal run directory once it ages out, and the claim could never clear: `restore_one`
+    /// swallows the ENOENT and keeps a `Running` claim that has an `async_id`, and
+    /// `schedule.delete`'s guard reads no terminal status and refuses forever. So each schedule's
+    /// ACTIVE run is read receipt-first ([`super::ScheduleStore::active_run`], the same reader
+    /// those three use) and its `async_id` joins the set. Only the active run: receipts are never
+    /// trimmed, so protecting every receipt would exempt every scheduled run from retention for
+    /// good, while the history's [`super::MAX_HISTORY`] cap keeps upstream's set bounded.
+    /// `observedAsyncIds` has no analogue here (see `finish_run`'s note): a run this process
+    /// launched is live, and a live run is already protected by its status and active marker.
+    ///
     /// An unreadable schedule contributes nothing rather than failing the sweep — the pass's
     /// fail-closed guard is the WAIT-subscription set, which is fail-closed because an unreadable
     /// subscription might protect any run in the root; a schedule's references are bounded to its
@@ -258,6 +292,19 @@ impl ScheduledRunManager {
                     schedule_id = %record.id,
                     %error,
                     "could not read a schedule's history while collecting retention-protected run ids"
+                ),
+            }
+            match self.deps.store.active_run(&record).await {
+                Ok(Some(run)) => {
+                    if let Some(async_id) = run.async_id {
+                        ids.insert(crate::background::RunId::from_token(async_id));
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => tracing::warn!(
+                    schedule_id = %record.id,
+                    %error,
+                    "could not read a schedule's active run while collecting retention-protected run ids"
                 ),
             }
         }

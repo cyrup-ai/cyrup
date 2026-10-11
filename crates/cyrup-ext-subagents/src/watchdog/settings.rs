@@ -1076,13 +1076,15 @@ fn settings_error_text(error: crate::error::SubagentError) -> String {
 /// });
 /// ```
 ///
-/// The lock is the SAME one the agent-override writers hold (`flock` on the physical target's
-/// `<file>.lock`, `discovery::settings_write::lock_settings_file`), taken synchronously with pi's
-/// 200 ms bound because these writers are sync, as pi's are. So a watchdog toggle and a
-/// concurrent override save or profile load on one `settings.json` serialize, and a symlinked file
-/// is locked on its target's sidecar. `[CYRUP-DELTA]` `flock`, not pi's `mkdir` lease — see
-/// `lock_settings_file_blocking`.
-fn edit_watchdog_settings<F>(
+/// The lock is the SAME one the agent-override writers hold (the two-layer `FileLock` on the
+/// physical target's `<file>.lock`, `discovery::settings_write::lock_settings_file`), with pi's
+/// 200 ms bound. So a watchdog toggle and a concurrent override save or profile load on one
+/// `settings.json` serialize, and a symlinked file is locked on its target's sidecar.
+/// `[CYRUP-DELTA]` `flock`, not pi's `mkdir` lease, and AWAITED where pi's writers are sync
+/// (SUBA-225): pi's synchronous wait parks its thread, so on a current-thread runtime a holder
+/// that is another task of the same runtime could never release inside the bound — see
+/// `lock_settings_file_within`.
+async fn edit_watchdog_settings<F>(
     settings_path: &Path,
     meta: &ParseMeta,
     edit: F,
@@ -1091,11 +1093,12 @@ where
     F: FnOnce(&mut Map<String, Value>, &ParseMeta) -> Result<(), String>,
 {
     use crate::discovery::settings_write::{
-        SETTINGS_LEASE_WAIT, lock_settings_file_blocking, settings_write_target,
+        SETTINGS_LEASE_WAIT, lock_settings_file_within, settings_write_target,
     };
     let target = settings_write_target(settings_path).map_err(settings_error_text)?;
-    let _lock =
-        lock_settings_file_blocking(&target, SETTINGS_LEASE_WAIT).map_err(settings_error_text)?;
+    let _lock = lock_settings_file_within(&target, SETTINGS_LEASE_WAIT)
+        .await
+        .map_err(settings_error_text)?;
     let mut settings = read_settings_file_strict(settings_path)?;
     let root = settings
         .as_object_mut()
@@ -1150,19 +1153,20 @@ fn target_settings_object<'a>(
 ///
 /// # Errors
 /// An unreadable/unparseable settings file, or a write failure.
-pub fn write_user_watchdog_enabled(enabled: bool) -> Result<PathBuf, String> {
-    write_watchdog_enabled_at(&user_settings_path(), enabled)
+pub async fn write_user_watchdog_enabled(enabled: bool) -> Result<PathBuf, String> {
+    write_watchdog_enabled_at(&user_settings_path(), enabled).await
 }
 
 /// [`write_user_watchdog_enabled`] against an explicit settings file — the same read-modify-write
 /// under the same lock, so tests need not touch the real user settings path.
-fn write_watchdog_enabled_at(settings_path: &Path, enabled: bool) -> Result<PathBuf, String> {
+async fn write_watchdog_enabled_at(settings_path: &Path, enabled: bool) -> Result<PathBuf, String> {
     let meta = ParseMeta {
         path: Some(settings_path.display().to_string()),
     };
     edit_watchdog_settings(settings_path, &meta, |watchdog, meta| {
         set_watchdog_enabled(watchdog, meta, enabled)
     })
+    .await
 }
 
 /// The edit `writeUserWatchdogEnabled` makes inside its lease (`settings.ts` @ad11b7ab):
@@ -1183,7 +1187,7 @@ fn set_watchdog_enabled(
 ///
 /// # Errors
 /// An unreadable/unparseable settings file, an empty agent name, or a write failure.
-pub fn write_watchdog_model_settings(
+pub async fn write_watchdog_model_settings(
     input: &WatchdogModelSettingsWrite,
 ) -> Result<PathBuf, String> {
     let settings_path = settings_path_for_write(input.scope, input.cwd.as_deref());
@@ -1214,6 +1218,7 @@ pub fn write_watchdog_model_settings(
         }
         Ok(())
     })
+    .await
 }
 
 #[cfg(test)]
@@ -1674,8 +1679,8 @@ mod tests {
         assert_eq!(value, json!({}));
     }
 
-    #[test]
-    fn a_model_write_creates_the_nested_blocks_and_preserves_the_rest_of_the_file() {
+    #[tokio::test]
+    async fn a_model_write_creates_the_nested_blocks_and_preserves_the_rest_of_the_file() {
         let root = tempfile::tempdir().expect("tempdir");
         let path = root.path().join("settings.json");
         std::fs::write(&path, r#"{"theme":"dark","subagents":{"maxDepth":3}}"#).expect("write");
@@ -1688,6 +1693,7 @@ mod tests {
             target.insert("model".to_string(), json!("anthropic/opus"));
             Ok(())
         })
+        .await
         .expect("write");
         let written: Value =
             serde_json::from_str(&std::fs::read_to_string(&path).expect("read")).expect("json");
@@ -1705,8 +1711,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_null_model_deletes_the_key_and_leaves_the_sibling() {
+    #[tokio::test]
+    async fn a_null_model_deletes_the_key_and_leaves_the_sibling() {
         let root = tempfile::tempdir().expect("tempdir");
         let path = root.path().join("settings.json");
         std::fs::write(
@@ -1723,6 +1729,7 @@ mod tests {
             target.remove("model");
             Ok(())
         })
+        .await
         .expect("write");
         let written: Value =
             serde_json::from_str(&std::fs::read_to_string(&path).expect("read")).expect("json");
@@ -1733,15 +1740,17 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_write_refuses_a_settings_file_it_cannot_parse() {
+    #[tokio::test]
+    async fn a_write_refuses_a_settings_file_it_cannot_parse() {
         let root = tempfile::tempdir().expect("tempdir");
         let path = root.path().join("settings.json");
         std::fs::write(&path, "{oops").expect("write");
         let meta = ParseMeta {
             path: Some(path.display().to_string()),
         };
-        let error = edit_watchdog_settings(&path, &meta, |_, _| Ok(())).unwrap_err();
+        let error = edit_watchdog_settings(&path, &meta, |_, _| Ok(()))
+            .await
+            .unwrap_err();
         assert!(
             error.starts_with("Failed to parse settings file '"),
             "{error}"
@@ -1753,23 +1762,25 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_non_object_watchdog_key_is_an_error_not_an_overwrite() {
+    #[tokio::test]
+    async fn a_non_object_watchdog_key_is_an_error_not_an_overwrite() {
         let root = tempfile::tempdir().expect("tempdir");
         let path = root.path().join("settings.json");
         std::fs::write(&path, r#"{"subagents":{"watchdog":"on"}}"#).expect("write");
         let meta = ParseMeta {
             path: Some(path.display().to_string()),
         };
-        let error = edit_watchdog_settings(&path, &meta, |_, _| Ok(())).unwrap_err();
+        let error = edit_watchdog_settings(&path, &meta, |_, _| Ok(()))
+            .await
+            .unwrap_err();
         assert!(
             error.contains("invalid 'subagents.watchdog'; expected an object."),
             "{error}"
         );
     }
 
-    #[test]
-    fn an_agent_override_target_creates_the_overrides_chain() {
+    #[tokio::test]
+    async fn an_agent_override_target_creates_the_overrides_chain() {
         let root = tempfile::tempdir().expect("tempdir");
         let path = root.path().join("settings.json");
         let meta = ParseMeta {
@@ -1784,6 +1795,7 @@ mod tests {
             target.insert("model".to_string(), json!("openai/gpt"));
             Ok(())
         })
+        .await
         .expect("write");
         let written: Value =
             serde_json::from_str(&std::fs::read_to_string(&path).expect("read")).expect("json");
@@ -1794,8 +1806,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn an_empty_agent_override_target_is_rejected() {
+    #[tokio::test]
+    async fn an_empty_agent_override_target_is_rejected() {
         let root = tempfile::tempdir().expect("tempdir");
         let path = root.path().join("settings.json");
         let meta = ParseMeta {
@@ -1809,6 +1821,7 @@ mod tests {
             )?;
             Ok(())
         })
+        .await
         .unwrap_err();
         assert!(error.contains("a non-empty agent name"), "{error}");
         assert!(!path.exists(), "nothing was written");
@@ -1917,8 +1930,8 @@ mod tests {
 
     /// (a) The lock spans read → write: inside the edit (after the read, before the write) the
     /// physical target's `<file>.lock` is held. Red at HEAD: nothing locked, the probe wins.
-    #[test]
-    fn a_watchdog_edit_holds_the_settings_lock_between_read_and_write() {
+    #[tokio::test]
+    async fn a_watchdog_edit_holds_the_settings_lock_between_read_and_write() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let path = tmp.path().join("settings.json");
         std::fs::write(&path, r#"{"theme":"dark"}"#).expect("seed");
@@ -1930,6 +1943,7 @@ mod tests {
             held_during_edit = Some(sidecar_is_held(&sidecar));
             set_watchdog_enabled(watchdog, meta, true)
         })
+        .await
         .expect("edit");
         assert_eq!(
             held_during_edit,
@@ -1953,8 +1967,8 @@ mod tests {
     /// overwrites it. The only possible flake is a FALSE PASS at HEAD (a save that takes over
     /// 300 ms to start would look blocked and land after the toggle); after the fix the save
     /// cannot finish before the edit releases, so this cannot fail spuriously.
-    #[test]
-    fn a_watchdog_toggle_and_an_override_save_on_one_file_both_survive() {
+    #[tokio::test]
+    async fn a_watchdog_toggle_and_an_override_save_on_one_file_both_survive() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let path = tmp.path().join("settings.json");
         std::fs::write(&path, r#"{"theme":"dark"}"#).expect("seed");
@@ -1985,6 +1999,7 @@ mod tests {
             );
             set_watchdog_enabled(watchdog, meta, true)
         })
+        .await
         .expect("watchdog edit");
         saver
             .expect("saver started")
@@ -2015,8 +2030,8 @@ mod tests {
     /// sidecar (none appears beside the link), the link survives the atomic save, and the target
     /// holds the edit. Red at HEAD: no lock anywhere, so the target's sidecar probe wins.
     #[cfg(unix)]
-    #[test]
-    fn a_symlinked_settings_file_is_locked_on_its_targets_sidecar() {
+    #[tokio::test]
+    async fn a_symlinked_settings_file_is_locked_on_its_targets_sidecar() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let real_dir = tmp.path().join("real");
         let link_dir = tmp.path().join("link");
@@ -2036,6 +2051,7 @@ mod tests {
             observed = Some((sidecar_is_held(&target_sidecar), link_sidecar.exists()));
             set_watchdog_enabled(watchdog, meta, true)
         })
+        .await
         .expect("edit through link");
 
         assert_eq!(
@@ -2060,8 +2076,8 @@ mod tests {
 
     /// `write_watchdog_enabled_at` — the body of `write_user_watchdog_enabled` — is the same
     /// locked edit, and a held lock makes it fail with pi's timeout sentence after the bound.
-    #[test]
-    fn a_watchdog_toggle_times_out_with_pis_sentence_while_the_lock_is_held() {
+    #[tokio::test]
+    async fn a_watchdog_toggle_times_out_with_pis_sentence_while_the_lock_is_held() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let path = tmp.path().join("settings.json");
         std::fs::write(&path, "{}").expect("seed");
@@ -2075,7 +2091,9 @@ mod tests {
             .open(absolute.with_file_name("settings.json.lock"))
             .expect("peer sidecar");
         peer.lock().expect("peer flock");
-        let error = write_watchdog_enabled_at(&path, true).expect_err("held lock");
+        let error = write_watchdog_enabled_at(&path, true)
+            .await
+            .expect_err("held lock");
         assert_eq!(
             error,
             format!(
@@ -2085,6 +2103,40 @@ mod tests {
         );
         assert_eq!(std::fs::read_to_string(&path).expect("read"), "{}");
         drop(peer);
-        write_watchdog_enabled_at(&path, true).expect("free lock");
+        write_watchdog_enabled_at(&path, true)
+            .await
+            .expect("free lock");
+    }
+
+    /// SUBA-225: a watchdog toggle invoked on a CURRENT-THREAD runtime while another task of that
+    /// same runtime holds the settings file's async `FileLock` (an agent-override save, a profile
+    /// load) waits for that task to release and then writes — it does not time out. At HEAD the
+    /// writer took `BlockingFileLock`, which parked the runtime's only thread in 10 ms
+    /// `std::thread::sleep` polls for the whole 200 ms bound, so the holder task never ran to
+    /// release and the toggle always failed with pi's timeout sentence.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_watchdog_toggle_waits_out_a_same_runtime_holder_on_a_current_thread_runtime() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("settings.json");
+        std::fs::write(&path, r#"{"theme":"dark"}"#).expect("seed");
+        let target = crate::discovery::settings_write::settings_write_target(&path)
+            .expect("physical target");
+        let held = crate::discovery::settings_write::lock_settings_file(&target)
+            .await
+            .expect("holder locks");
+        let holder = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+            drop(held);
+        });
+
+        write_watchdog_enabled_at(&path, true)
+            .await
+            .expect("the same-runtime holder releases inside pi's 200 ms bound");
+        holder.await.expect("holder task");
+
+        let written: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("read")).expect("parse");
+        assert_eq!(written["theme"], json!("dark"));
+        assert_eq!(written["subagents"]["watchdog"]["enabled"], json!(true));
     }
 }
