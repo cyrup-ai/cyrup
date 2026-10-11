@@ -944,7 +944,9 @@ async fn dispatch(
         Ok((cmd, raw_id)) => Dispatched {
             response: handle(runtime, session, cmd, raw_id, in_flight).await,
         },
-        Err(response) => Dispatched { response },
+        Err(response) => Dispatched {
+            response: *response,
+        },
     }
 }
 
@@ -966,23 +968,23 @@ async fn dispatch_run_control(session: Arc<AgentSession>, line: String) -> (Disp
                 }
             }
         }
-        Err(response) => response,
+        Err(response) => *response,
     };
     (Dispatched { response }, started_run)
 }
 
 /// Steps (1)-(3) of [`dispatch`]: parse, recover the id, deserialize. `Err` is the error response
-/// Pi writes for a line that is not a command it can handle.
-fn parse_command(line: &str) -> Result<(SessionCommand, Option<Value>), RpcResponse> {
+/// Pi writes for a line that is not a command it can handle (boxed: it is far larger than the `Ok`).
+fn parse_command(line: &str) -> Result<(SessionCommand, Option<Value>), Box<RpcResponse>> {
     // (1) Parse the raw line. A malformed line is Pi's `"parse"` error with NO id.
     let value: Value = match serde_json::from_str(line) {
         Ok(v) => v,
         Err(e) => {
-            return Err(RpcResponse::err(
+            return Err(Box::new(RpcResponse::err(
                 "parse",
                 None,
                 format!("Failed to parse command: {e}"),
-            ));
+            )));
         }
     };
 
@@ -997,17 +999,17 @@ fn parse_command(line: &str) -> Result<(SessionCommand, Option<Value>), RpcRespo
         Ok(SessionCommand::Unknown) => {
             let name = type_str.unwrap_or_default();
             let message = format!("Unknown command: {name}");
-            Err(RpcResponse::err(name, raw_id, message))
+            Err(Box::new(RpcResponse::err(name, raw_id, message)))
         }
         Ok(cmd) => Ok((cmd, raw_id)),
         // A known `type` whose payload failed validation (missing/wrong-typed required field): echo
         // the real command name + the runtime error, NOT `"unknown"`. A missing/`null` `type` tag
         // (serde: "missing field `type`") has no command name to echo — fall back to Pi's default
         // `Unknown command` shaping so it still correlates.
-        Err(e) => Err(match type_str {
+        Err(e) => Err(Box::new(match type_str {
             Some(name) => RpcResponse::err(name, raw_id, e.to_string()),
             None => RpcResponse::err(String::new(), raw_id, "Unknown command: undefined"),
-        }),
+        })),
     }
 }
 
