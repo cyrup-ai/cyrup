@@ -75,6 +75,7 @@ use cyrup_ext::host::{
     OverlayKeyCode, OverlayLine, OverlayMouse, OverlayMouseOutcome, OverlayOutcome, OverlaySpan,
     ThemeRole, key_ids, read_user_bindings,
 };
+use cyrup_ext::word_nav::{byte_find_word_backward, byte_find_word_forward};
 use futures::future::BoxFuture;
 use icu_collator::options::CollatorOptions;
 use icu_collator::{Collator, CollatorPreferences};
@@ -1514,129 +1515,6 @@ enum LastAction {
     TypeWord,
 }
 
-/// `PUNCTUATION_REGEX` (`utils.ts:821`).
-fn is_punctuation(c: char) -> bool {
-    matches!(
-        c,
-        '(' | ')'
-            | '{'
-            | '}'
-            | '['
-            | ']'
-            | '<'
-            | '>'
-            | '.'
-            | ','
-            | ';'
-            | ':'
-            | '\''
-            | '"'
-            | '!'
-            | '?'
-            | '+'
-            | '-'
-            | '='
-            | '*'
-            | '/'
-            | '\\'
-            | '|'
-            | '&'
-            | '%'
-            | '^'
-            | '$'
-            | '#'
-            | '@'
-            | '~'
-            | '`'
-    )
-}
-
-/// `Intl.SegmentData.isWordLike`, recomputed as "contains an alphanumeric" (UAX#29 exposes no such
-/// bit; the two agree on every segment the algorithm can produce).
-fn is_word_like(segment: &str) -> bool {
-    segment.chars().any(char::is_alphanumeric)
-}
-
-fn is_whitespace_segment(segment: &str) -> bool {
-    segment.chars().any(char::is_whitespace)
-}
-
-/// `findWordBackward` (`word-navigation.ts:22`).
-fn find_word_backward(text: &str, cursor: usize) -> usize {
-    if cursor == 0 {
-        return 0;
-    }
-    let Some(before) = text.get(..cursor) else {
-        return cursor;
-    };
-    let mut segments: Vec<&str> = before.split_word_bounds().collect();
-    let mut new_cursor = cursor;
-    while let Some(last) = segments.last() {
-        if !is_whitespace_segment(last) {
-            break;
-        }
-        new_cursor = new_cursor.saturating_sub(last.len());
-        segments.pop();
-    }
-    let Some(last) = segments.last() else {
-        return new_cursor;
-    };
-    if is_word_like(last) {
-        let keep = last
-            .char_indices()
-            .rev()
-            .find(|(_, c)| is_punctuation(*c))
-            .map_or(0, |(i, c)| i + c.len_utf8());
-        new_cursor = new_cursor.saturating_sub(last.len().saturating_sub(keep));
-    } else {
-        while let Some(last) = segments.last() {
-            if is_word_like(last) || is_whitespace_segment(last) {
-                break;
-            }
-            new_cursor = new_cursor.saturating_sub(last.len());
-            segments.pop();
-        }
-    }
-    new_cursor
-}
-
-/// `findWordForward` (`word-navigation.ts:76`).
-fn find_word_forward(text: &str, cursor: usize) -> usize {
-    if cursor >= text.len() {
-        return text.len();
-    }
-    let Some(after) = text.get(cursor..) else {
-        return cursor;
-    };
-    let mut segments = after.split_word_bounds().peekable();
-    let mut new_cursor = cursor;
-    while let Some(next) = segments.peek() {
-        if !is_whitespace_segment(next) {
-            break;
-        }
-        new_cursor += next.len();
-        segments.next();
-    }
-    let Some(next) = segments.peek() else {
-        return new_cursor;
-    };
-    if is_word_like(next) {
-        new_cursor += next
-            .char_indices()
-            .find(|(_, c)| is_punctuation(*c))
-            .map_or(next.len(), |(i, _)| i);
-    } else {
-        while let Some(next) = segments.peek() {
-            if is_word_like(next) || is_whitespace_segment(next) {
-                break;
-            }
-            new_cursor += next.len();
-            segments.next();
-        }
-    }
-    new_cursor
-}
-
 /// `Input` (`input.ts:30-376`): the single-line editor of the search box, with horizontal
 /// scrolling, the Emacs kill ring, yank-pop and undo with word coalescing.
 ///
@@ -1841,20 +1719,26 @@ impl TextInput {
         self.last_action = LastAction::Yank;
     }
 
+    /// `moveWordBackwards` (`input.ts:391`): `findWordBackward` (`word-navigation.ts:22`) through the
+    /// workspace's ONE word segmenter, `cyrup_ext::word_nav` — ICU's `Intl.Segmenter` word
+    /// granularity with its dictionary pass and its own `isWordLike`, the same walk the main editor
+    /// and every `cyrup-tui` search field run (EXT-113). Word deletion goes through here too.
     fn move_word_backwards(&mut self) {
         if self.cursor == 0 {
             return;
         }
         self.last_action = LastAction::None;
-        self.cursor = find_word_backward(&self.value, self.cursor);
+        self.cursor = byte_find_word_backward(&self.value, self.cursor);
     }
 
+    /// `moveWordForwards` (`input.ts:397`): `findWordForward` (`word-navigation.ts:76`) through the
+    /// shared segmenter, as [`Self::move_word_backwards`].
     fn move_word_forwards(&mut self) {
         if self.cursor >= self.value.len() {
             return;
         }
         self.last_action = LastAction::None;
-        self.cursor = find_word_forward(&self.value, self.cursor);
+        self.cursor = byte_find_word_forward(&self.value, self.cursor);
     }
 
     /// `handlePaste` (`input.ts:396-406`): the pasted text with every line break dropped and every
