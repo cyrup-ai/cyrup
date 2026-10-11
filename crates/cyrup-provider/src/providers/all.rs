@@ -168,6 +168,14 @@ pub fn builtin_model_data_generated_at() -> Option<i64> {
 /// [`load_overlay`] then falls back to the global floor for that provider, exactly as it did
 /// before this function existed.
 ///
+/// The map is looked up by PROVIDER id, and a manifest key is not always one: a classifier catalog
+/// is keyed `<provider>-classifiers` (PROV-147, PROV-153). Such an entry is folded onto its
+/// provider, and a provider with two catalogs takes the newer stamp — the floor is the newest data
+/// the binary embeds for that provider, because one pi.dev overlay replaces rows of every type
+/// (`?types=chat,image,classifier`). Without the fold `typesafe`, whose only catalog is
+/// `typesafe-classifiers`, fell back to the 2026-07-17 global floor and an older persisted overlay
+/// could shadow its 2026-10-09 rows.
+///
 /// [`RemoteCatalog`]: crate::remote_catalog::RemoteCatalog
 /// [`load_overlay`]: crate::remote_catalog::RemoteCatalog::load_overlay
 pub fn builtin_model_data_generated_at_by_provider() -> BTreeMap<String, i64> {
@@ -189,19 +197,28 @@ pub fn builtin_model_data_generated_at_by_provider() -> BTreeMap<String, i64> {
         return BTreeMap::new();
     };
     let global = parse_iso8601_utc_ms(&manifest.generated_at);
-    manifest
-        .catalogs
-        .into_iter()
-        .filter_map(|(provider, entry)| {
-            let fetched_at = entry.fetched_at.as_deref().and_then(parse_iso8601_utc_ms)?;
-            let floor = match global {
-                Some(g) => fetched_at.max(g),
-                None => fetched_at,
-            };
-            Some((provider, floor))
-        })
-        .collect()
+    let mut floors: BTreeMap<String, i64> = BTreeMap::new();
+    for (key, entry) in manifest.catalogs {
+        let Some(fetched_at) = entry.fetched_at.as_deref().and_then(parse_iso8601_utc_ms) else {
+            continue;
+        };
+        let floor = match global {
+            Some(g) => fetched_at.max(g),
+            None => fetched_at,
+        };
+        let provider = key
+            .strip_suffix(CLASSIFIER_CATALOG_SUFFIX)
+            .map_or_else(|| key.clone(), str::to_string);
+        floors
+            .entry(provider)
+            .and_modify(|existing| *existing = (*existing).max(floor))
+            .or_insert(floor);
+    }
+    floors
 }
+
+/// The manifest-key suffix of a provider's classifier catalog (`xtask`'s `LiveCatalogKind`).
+const CLASSIFIER_CATALOG_SUFFIX: &str = "-classifiers";
 
 /// Every built-in provider that is implemented in this crate, freshly constructed over a shared
 /// credential store + the built-in api registry (Pi `builtinProviders()`, `all.ts:70-108`).
@@ -356,14 +373,11 @@ fn builtin_providers_with(
     )));
 
     // together (Pi `all.ts:98`).
-    providers.push(Arc::new(together_provider_with(
-        store.clone(),
-        registry.clone(),
-    )));
+    providers.push(Arc::new(together_provider_with(store.clone(), registry)));
 
     // typesafe (Pi `all.ts:171` @f1b2e77f5) — PROV-153. Classifier rows only: it lists no chat
-    // model and serves only `classify`.
-    providers.push(Arc::new(typesafe_provider_with(store, registry)));
+    // model, has no chat api (so it takes no api registry) and serves only `classify`.
+    providers.push(Arc::new(typesafe_provider_with(store)));
 
     providers
 }
@@ -661,6 +675,23 @@ mod tests {
             .map(|m| format!("{}:{}", m.model_type(), m.id()))
             .collect();
         assert_eq!(ids, ["classifier:jev-latest"]);
+    }
+
+    /// PROV-153 / PROV-147 — the per-provider overlay floor is looked up by PROVIDER id, so a
+    /// classifier catalog's manifest key (`<provider>-classifiers`) is folded onto its provider: the
+    /// classifier-only `typesafe` gets its own fetch stamp instead of the 2026-07-17 global floor,
+    /// and `openai`, which embeds two catalogs, gets the newer of the two. Red before the fold:
+    /// `typesafe` had no entry and `typesafe-classifiers` had one nothing looked up.
+    #[test]
+    fn a_classifier_catalog_raises_its_providers_overlay_floor() {
+        let floors = builtin_model_data_generated_at_by_provider();
+        let at = |stamp: &str| parse_iso8601_utc_ms(stamp).expect("stamp parses");
+        assert!(!floors.contains_key("typesafe-classifiers"));
+        assert!(!floors.contains_key("openai-classifiers"));
+        assert_eq!(floors.get("typesafe"), Some(&at("2026-10-09T12:42:32Z")));
+        // openai: chat 12:42:07, classifiers 12:42:08 — the newer one.
+        assert_eq!(floors.get("openai"), Some(&at("2026-10-09T12:42:08Z")));
+        assert_eq!(floors.get("meta"), Some(&at("2026-10-09T12:41:49Z")));
     }
 
     /// PROV-128 — the built-in `openrouter` provider is where image models live now, reached

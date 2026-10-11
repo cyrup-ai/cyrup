@@ -655,6 +655,120 @@ async fn the_workers_ai_provider_classifies_with_the_account_id_resolved() {
     assert_eq!(request.header("authorization"), Some("Bearer cf-key"));
 }
 
+/// PROV-153's Verify: the BUILT-IN `typesafe` provider (pi `typesafeProvider()`,
+/// `providers/typesafe.ts` @f1b2e77f5) lists `jev-latest` as its only model — a classifier, never a
+/// chat model (pi `classifier-models.test.ts:115-129`) — classifies, and `Models::classify` through
+/// it reaches TypeSafe's own System One endpoint with `Bearer <TYPESAFE_API_KEY>`. Without the key
+/// the provider is not configured. Red at the base: there was no `typesafe` provider.
+#[tokio::test]
+async fn the_builtin_typesafe_provider_classifies_against_its_own_system_one_endpoint() {
+    use crate::auth::AuthContext;
+    use crate::classifier::AnyModel;
+    use crate::collection::CreateModelsOptions;
+
+    struct TypesafeEnv(Option<&'static str>);
+    #[async_trait::async_trait]
+    impl AuthContext for TypesafeEnv {
+        async fn env(&self, name: &str) -> Option<String> {
+            match name {
+                "TYPESAFE_API_KEY" => self.0.map(str::to_string),
+                // Pin proxy resolution off for the loopback request.
+                "no_proxy" | "NO_PROXY" => Some("*".to_string()),
+                _ => None,
+            }
+        }
+        async fn file_exists(&self, _path: &str) -> bool {
+            false
+        }
+    }
+    let models_with = |key: Option<&'static str>| {
+        crate::providers::all::default_models(CreateModelsOptions {
+            credentials: None,
+            auth_context: Some(Arc::new(TypesafeEnv(key))),
+            catalog_overlay: None,
+        })
+    };
+
+    let models = models_with(Some("ts-key"));
+    let all = models.get_all_models(Some("typesafe"));
+    assert_eq!(all.len(), 1, "{all:?}");
+    let Some(AnyModel::Classifier(jev)) = all.first().cloned() else {
+        panic!("typesafe's one model is a classifier: {all:?}");
+    };
+    assert_eq!(jev.id.as_str(), "jev-latest");
+    assert_eq!(jev.api.as_str(), TYPESAFE);
+    assert_eq!(jev.base_url, "https://api.typesafe.ai/v1/");
+    assert_eq!(jev.context_window, 64000);
+    assert!(models.get_model("typesafe", "jev-latest").is_none());
+    assert!(models.get_models(Some("typesafe")).is_empty());
+    assert_eq!(models.get_classifier_model("typesafe", "jev-latest"), Some(jev.clone()));
+    assert!(
+        models
+            .get_provider("typesafe")
+            .expect("registered")
+            .supports_classification()
+    );
+
+    let server = FakeServer::start().await;
+    let mut jev = jev;
+    // The catalog's trailing slash is kept: `endpoint_url` collapses it as pi's `new URL` does.
+    jev.base_url = format!("{}/", server.base_url);
+    let result = models.classify(&jev, &context(), &options()).await;
+    assert_eq!(result.error_message, None);
+    assert_eq!(result.answers, expected_answers());
+    let request = &server.requests()[0];
+    assert_eq!(request.path, "/v1/systemone");
+    assert_eq!(request.header("authorization"), Some("Bearer ts-key"));
+    assert_eq!(request.body["model"], json!("jev-latest"));
+    // "price them at zero" (generate-models.ts:2605-2606): counted, not charged.
+    let usage = result.usage.expect("usage");
+    assert_eq!(usage.input, SYSTEM_ONE_INPUT_TOKENS);
+    assert_eq!(usage.cost.total, 0.0);
+
+    let unconfigured = models_with(None)
+        .classify(&jev, &context(), &options())
+        .await;
+    assert_eq!(
+        unconfigured.error_message.as_deref(),
+        Some("Provider is not configured: typesafe")
+    );
+}
+
+/// pi's `typesafeProvider()` passes no `api`, so `createProvider` answers any chat stream with
+/// `Provider typesafe has no API implementation for "<api>"` (`models.ts:1076-1080`). The built-in
+/// carries an EMPTY api registry, so a chat model handed to it fails rather than being streamed
+/// through the shared registry under TypeSafe's key.
+#[tokio::test]
+async fn the_typesafe_provider_streams_nothing() {
+    use crate::context::Context;
+    use crate::stream::{StreamOptions, collect_message};
+
+    let provider = crate::providers::typesafe::typesafe_provider();
+    let chat = crate::providers::openai::openai_models()
+        .into_iter()
+        .next()
+        .expect("an openai chat row");
+    let mut chat = chat;
+    chat.provider = "typesafe".into();
+    let message = collect_message(provider.stream(
+        &chat,
+        &Context::default(),
+        &StreamOptions {
+            api_key: Some("ts-key".to_string()),
+            ..StreamOptions::default()
+        },
+    ))
+    .await;
+    assert_eq!(message.stop_reason, cyrup_core::StopReason::Error);
+    assert!(
+        message
+            .error_message
+            .as_deref()
+            .is_some_and(|m| m.contains("no API implementation for openai-responses")),
+        "{message:?}"
+    );
+}
+
 /// PROV-110 corner (1) on the System One wire. pi posts `JSON.stringify({model, state, questions})`
 /// built from JS objects, so the state's integer-like keys reach the server hoisted ahead of the
 /// others, ascending, at every depth (`OrdinaryOwnPropertyKeys`); a decision model is shown the
@@ -675,6 +789,32 @@ async fn the_state_reaches_the_wire_in_js_key_order() {
     };
     assert_eq!(keys(&body["state"]), ["2", "10", "b", "a"]);
     assert_eq!(keys(&body["state"]["2"]), ["1", "y"]);
+}
+
+/// PROV-110 corner (1), the hook's view: pi's payload is built from the caller's JS object, so the
+/// `onPayload` hook already sees `state` in own-key order (`system-one-shared.ts:88`,
+/// `classifier-shared.ts:71`). Hoisting only while serializing the body would hand the hook the
+/// insertion order instead. Red when the state is hoisted at serialization alone.
+#[tokio::test]
+async fn the_on_payload_hook_sees_the_state_in_js_key_order() {
+    let server = FakeServer::start().await;
+    let seen: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+    let mut opts = keyed();
+    let sink = Arc::clone(&seen);
+    opts.on_payload = Some(Arc::new(move |payload: Value, _model| {
+        let keys: Vec<String> = payload["state"]
+            .as_object()
+            .map(|state| state.keys().cloned().collect())
+            .unwrap_or_default();
+        *sink.lock().unwrap() = keys;
+        Box::pin(async { None })
+    }));
+    let mut ctx = context();
+    ctx.state = serde_json::from_str(r#"{"b":1,"10":2,"2":3}"#).unwrap();
+    typesafe_system_one_api()
+        .classify(&model(TYPESAFE, &server.base_url), &ctx, &opts)
+        .await;
+    assert_eq!(*seen.lock().unwrap(), ["2", "10", "b"]);
 }
 
 /// PROV-110 corner (2) on the System One wire. The body is pi's `JSON.stringify(payload)`, so a

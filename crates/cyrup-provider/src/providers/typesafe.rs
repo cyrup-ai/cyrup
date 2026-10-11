@@ -24,7 +24,7 @@
 //! [`crate::api::typesafe_system_one`], the api OpenRouter's TypeSafe rows already use (PROV-104).
 //! pi sets no provider `baseUrl`; each row carries its own.
 
-use crate::api::{ApiRegistry, builtin_registry};
+use crate::api::ApiRegistry;
 use crate::auth::{CredentialStore, InMemoryCredentialStore, ProviderAuth, env_key};
 use crate::classifier::{ClassifierApiRegistry, ClassifierModel, KnownClassifierApi};
 use crate::wire::WireProvider;
@@ -64,29 +64,27 @@ pub fn typesafe_classifiers_registry() -> ClassifierApiRegistry {
     registry
 }
 
-/// Construct the TypeSafe provider over the given credential store + shared api registry. It has
-/// no chat rows, so the registry is never consulted for a stream; it is taken for the same
-/// signature every built-in constructor has.
-pub fn typesafe_provider_with(
-    store: Arc<dyn CredentialStore>,
-    registry: Arc<ApiRegistry>,
-) -> WireProvider {
+/// Construct the TypeSafe provider over the given credential store.
+///
+/// It takes no api registry because pi's `typesafeProvider()` passes no `api`: an EMPTY registry
+/// makes any chat stream through it fail (`no API implementation for <api>`), as pi's
+/// `createProvider` answers `Provider typesafe has no API implementation for "<api>"`
+/// (`models.ts:1076-1080`), instead of dispatching a chat model it was handed through the shared
+/// built-in registry under TypeSafe's key.
+pub fn typesafe_provider_with(store: Arc<dyn CredentialStore>) -> WireProvider {
     WireProvider::new(
         TYPESAFE_PROVIDER_ID,
         "TypeSafe",
         Vec::new(),
         typesafe_auth(),
         store,
-        registry,
+        Arc::new(ApiRegistry::new()),
     )
     .with_classifier_models(typesafe_classifier_models())
     .with_classifiers(Arc::new(typesafe_classifiers_registry()))
 }
 
-/// Convenience constructor: an in-memory credential store + the built-in api registry.
+/// Convenience constructor: an in-memory credential store.
 pub fn typesafe_provider() -> WireProvider {
-    typesafe_provider_with(
-        Arc::new(InMemoryCredentialStore::new()),
-        Arc::new(builtin_registry()),
-    )
+    typesafe_provider_with(Arc::new(InMemoryCredentialStore::new()))
 }

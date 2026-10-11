@@ -652,3 +652,176 @@ async fn predicate_instructions_carry_only_the_meanings_given() {
     );
     assert_eq!(server.requests()[0].body["input"], json!("{}"));
 }
+
+// ------------------------------------------------------------------ the built-in openai provider
+
+/// An env with the given vars, and proxy resolution pinned off for the loopback request.
+struct Env(Vec<(&'static str, &'static str)>);
+
+#[async_trait::async_trait]
+impl crate::auth::AuthContext for Env {
+    async fn env(&self, name: &str) -> Option<String> {
+        if name.eq_ignore_ascii_case("no_proxy") {
+            return Some("*".to_string());
+        }
+        self.0
+            .iter()
+            .find(|(key, _)| *key == name)
+            .map(|(_, value)| (*value).to_string())
+    }
+    async fn file_exists(&self, _path: &str) -> bool {
+        false
+    }
+}
+
+fn builtin_models(
+    credentials: Option<std::sync::Arc<dyn crate::auth::CredentialStore>>,
+    overlay: Option<std::sync::Arc<crate::remote_catalog::CatalogOverlay>>,
+) -> crate::Models {
+    crate::providers::all::default_models(crate::CreateModelsOptions {
+        credentials,
+        auth_context: Some(std::sync::Arc::new(Env(vec![("OPENAI_API_KEY", "secret")]))),
+        catalog_overlay: overlay,
+    })
+}
+
+/// pi `classifier-models.test.ts:200-224`, "routes OpenAI GPT-6 Luna through the Decisions API with
+/// images": the built-in `openai` provider lists `gpt-6-luna` as a CLASSIFIER on
+/// `openai-decisions` beside the chat row of the same id on `openai-responses`, and
+/// `Models::classify` dispatches it — images included — to `<base>/decisions`. Red at the base,
+/// where `openai` had no classifier rows and no `classifiers` map (`Models::classify` answered
+/// `Provider openai does not support classification`).
+#[tokio::test]
+async fn the_builtin_openai_provider_routes_gpt_6_luna_through_the_decisions_api() {
+    let models = builtin_models(None, None);
+    let luna = models
+        .get_classifier_model("openai", "gpt-6-luna")
+        .expect("the openai classifier catalog carries gpt-6-luna");
+    assert_eq!(luna.api.as_str(), "openai-decisions");
+    assert_eq!(luna.input, [Modality::Text, Modality::Image]);
+    assert_eq!(luna.context_window, 922_000);
+    assert_eq!(luna.base_url, "https://api.openai.com/v1");
+    // `withOpenAiLongContextPricing` (generate-models.ts:2705): one 272k tier at 2x input.
+    assert_eq!(luna.cost.input, 0.1);
+    assert_eq!(
+        luna.cost.tiers.as_deref().map(|tiers| tiers
+            .iter()
+            .map(|t| (t.input_tokens_above, t.input))
+            .collect::<Vec<_>>()),
+        Some(vec![(272_000, 0.2)])
+    );
+    // The chat entry with the same id stays separate.
+    assert_eq!(
+        models
+            .get_model("openai", "gpt-6-luna")
+            .map(|m| m.api.as_str().to_string())
+            .as_deref(),
+        Some("openai-responses")
+    );
+    assert!(models.get_provider("openai").unwrap().supports_classification());
+
+    let server = decisions(|_, _| {
+        Reply::Json(json!({
+            "answers": [{ "type": "predicate", "name": "approved", "probability": 0.8 }],
+        }))
+    })
+    .await;
+    let mut luna = luna;
+    luna.base_url = server.base_url.clone();
+    let ctx = ClassifierContext {
+        state: context().state,
+        images: Some(vec![image("image/png")]),
+        questions: vec![("approved", boolean("Approved?", "", ""))]
+            .into_iter()
+            .collect(),
+    };
+    let result = models.classify(&luna, &ctx, &options()).await;
+
+    assert_eq!(result.stop_reason, ClassifierStopReason::Stop, "{result:?}");
+    assert_eq!(
+        result.answers.get("approved"),
+        Some(&ClassifierAnswer::Bool { probability: 0.8 })
+    );
+    let requests = server.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].path, "/v1/decisions");
+    // The provider's `OPENAI_API_KEY` strategy supplied the bearer.
+    assert_eq!(requests[0].header("authorization"), Some("Bearer secret"));
+}
+
+/// pi `classifier-models.test.ts:226-246`, "lists OpenAI Decisions models only for API key
+/// credentials": the openai provider's `filterAllModels` (`providers/openai.ts:27-29`) hides the
+/// classifier rows from a Sign in with ChatGPT credential, which the Decisions API rejects, and
+/// keeps every chat row — including the chat `gpt-6-luna`. Red at the base (no classifier rows and
+/// no `filter_all_models` seam on `WireProvider`).
+#[tokio::test]
+async fn openai_decisions_models_are_listed_only_for_api_key_credentials() {
+    for overlay in [None, Some(openai_overlay())] {
+        let label = if overlay.is_some() { "overlaid" } else { "embedded" };
+        let with_api_key = builtin_models(
+            Some(store(crate::Credential::api_key("secret"))),
+            overlay.clone(),
+        );
+        let with_oauth = builtin_models(
+            Some(store(crate::auth::oauth::oauth_credential(
+                "access",
+                "refresh",
+                crate::auth::oauth::now_ms() + 3_600_000,
+            ))),
+            overlay,
+        );
+        let classifier_ids = |models: Vec<crate::AnyModel>| -> Vec<String> {
+            models.iter().map(|m| m.id().to_string()).collect()
+        };
+        assert_eq!(
+            classifier_ids(
+                with_api_key
+                    .get_available_of_type(crate::ModelType::Classifier, Some("openai"))
+                    .await
+                    .unwrap()
+            ),
+            ["gpt-6-luna"],
+            "{label}"
+        );
+        assert!(
+            with_oauth
+                .get_available_of_type(crate::ModelType::Classifier, Some("openai"))
+                .await
+                .unwrap()
+                .is_empty(),
+            "{label}: an OAuth credential must not list the Decisions model"
+        );
+        // Chat models stay available with ChatGPT OAuth.
+        assert!(
+            with_oauth
+                .get_available(Some("openai"))
+                .await
+                .unwrap()
+                .iter()
+                .any(|m| m.id.as_str() == "gpt-6-luna"),
+            "{label}: the chat gpt-6-luna stays available"
+        );
+    }
+}
+
+/// A credential store holding one `openai` credential.
+fn store(credential: crate::Credential) -> std::sync::Arc<dyn crate::auth::CredentialStore> {
+    std::sync::Arc::new(
+        crate::auth::InMemoryCredentialStore::new().with_credential("openai".into(), credential),
+    )
+}
+
+/// A non-empty pi.dev overlay for `openai`, so `default_models` wraps the built-in in
+/// `RemoteCatalogProvider` — every built-in is wrapped once a catalog is cached. The decorator must
+/// carry `filterAllModels` through (`remote-catalog-provider.ts` spreads `...provider`); the trait
+/// default is the ABSENT member, which would list the Decisions row to an OAuth credential.
+fn openai_overlay() -> std::sync::Arc<crate::remote_catalog::CatalogOverlay> {
+    let row = crate::providers::openai::openai_models()
+        .into_iter()
+        .next()
+        .expect("an openai chat row");
+    std::sync::Arc::new(crate::remote_catalog::CatalogOverlay::from_entries([(
+        "openai".to_string(),
+        vec![row],
+    )]))
+}
