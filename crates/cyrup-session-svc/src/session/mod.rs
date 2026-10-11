@@ -1021,7 +1021,9 @@ async fn drive_injections(
                 wakes.clear();
             }
             tokio::select! {
-                () = session.wait_for_idle() => {}
+                // The latch-only wait: the public `wait_for_idle` also waits for the turn-triggering
+                // injections this very loop is holding, so awaiting it here would wait on itself.
+                () = session.wait_for_latches_idle() => {}
                 next = rx.recv(), if open => match next {
                     Some(item) => {
                         route_injection(

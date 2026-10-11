@@ -32,6 +32,34 @@ pub struct CompletionWatcherHandle {
     _poll_watcher: notify::PollWatcher,
     /// The background drain task; aborted on drop.
     task: tokio::task::JoinHandle<()>,
+    /// SUBA-187 — requests for [`Self::deliver_pending_results`], answered by the drain task.
+    pending_requests: tokio::sync::mpsc::UnboundedSender<tokio::sync::oneshot::Sender<()>>,
+}
+
+impl CompletionWatcherHandle {
+    /// SUBA-187 — pi `resultWatcher.deliverPendingResults` (`result-watcher.ts`, `3bb9b203` /
+    /// #2666): hand every finished result on disk to the sink NOW — the sink's held completions
+    /// are flushed, the results are rescanned without waiting for the next poll tick, and each
+    /// newly found completion is sent without its batch delay.
+    ///
+    /// Resolves once every one of those messages has been HANDED to the sink, not once the sink
+    /// acknowledged it. [CYRUP-DELTA] upstream awaits its in-flight handlers, whose
+    /// `notifier.deliver` resolves when Pi queues the message; cyrup's host acknowledges an
+    /// injection only once the session goes idle (`cyrup-session-svc` injection pump), and this is
+    /// called from inside `agent_end`, before the run settles — awaiting the ack there would wait on
+    /// the very turn that has to finish first. What upstream needs from the await, that the
+    /// message is with the session before the headless host can exit, is the hand-off.
+    ///
+    /// Returns at once if the drain task is gone (a torn-down watcher has nothing to deliver).
+    pub fn deliver_pending_results(&self) -> impl std::future::Future<Output = ()> + use<> {
+        let (reply, done) = tokio::sync::oneshot::channel();
+        let sent = self.pending_requests.send(reply).is_ok();
+        async move {
+            if sent {
+                let _ = done.await;
+            }
+        }
+    }
 }
 
 impl Drop for CompletionWatcherHandle {
@@ -75,12 +103,14 @@ pub fn install_completion_watcher_with_observer(
 ) -> Result<CompletionWatcherHandle, SubagentError> {
     let watcher = ResultsWatcher::new(results_dir);
     let (poll_watcher, rx) = watcher.install()?;
+    let (pending_requests, requests) = tokio::sync::mpsc::unbounded_channel();
     let task = tokio::spawn(drive_completion_watcher(
-        watcher, rx, sink, observer, ownership,
+        watcher, rx, requests, sink, observer, ownership,
     ));
     Ok(CompletionWatcherHandle {
         _poll_watcher: poll_watcher,
         task,
+        pending_requests,
     })
 }
 
@@ -206,6 +236,7 @@ async fn settle_delivery(watcher: &ResultsWatcher, outcome: DeliveryOutcome) {
 async fn drive_completion_watcher(
     watcher: ResultsWatcher,
     mut rx: tokio::sync::mpsc::UnboundedReceiver<()>,
+    mut requests: tokio::sync::mpsc::UnboundedReceiver<tokio::sync::oneshot::Sender<()>>,
     sink: Arc<dyn CompletionSink>,
     observer: Option<Arc<dyn CompletionObserver>>,
     ownership: ResultDeliveryOwnership,
@@ -214,7 +245,15 @@ async fn drive_completion_watcher(
         tasks: tokio::task::JoinSet::new(),
         in_flight: Arc::new(Mutex::new(HashSet::new())),
     };
-    deliver_pending_completions(&watcher, &sink, observer.as_ref(), &ownership, &mut fleet).await;
+    deliver_pending_completions(
+        &watcher,
+        &sink,
+        observer.as_ref(),
+        &ownership,
+        &mut fleet,
+        None,
+    )
+    .await;
     reap_finished_deliveries(&watcher, &mut fleet).await;
     // A filesystem wake-up OR a fixed tick, whichever comes first.
     //
@@ -235,6 +274,14 @@ async fn drive_completion_watcher(
                 }
             }
             _ = tick.tick() => {}
+            // SUBA-187 — a pending-results request (see
+            // [`CompletionWatcherHandle::deliver_pending_results`]). Answered here, on the one task
+            // that owns the fleet, so its rescan cannot race a scan this loop is running.
+            Some(reply) = requests.recv() => {
+                deliver_pending_now(&watcher, &sink, observer.as_ref(), &ownership, &mut fleet)
+                    .await;
+                let _ = reply.send(());
+            }
             // An ack that resolves between ticks is settled ON THE SPOT instead of up to a poll
             // interval later. The `if` guard is load-bearing: `join_next()` on an EMPTY `JoinSet`
             // returns `None` immediately, which would resolve this arm on every iteration and
@@ -249,9 +296,65 @@ async fn drive_completion_watcher(
             }
         }
         reap_finished_deliveries(&watcher, &mut fleet).await;
-        deliver_pending_completions(&watcher, &sink, observer.as_ref(), &ownership, &mut fleet)
-            .await;
+        deliver_pending_completions(
+            &watcher,
+            &sink,
+            observer.as_ref(),
+            &ownership,
+            &mut fleet,
+            None,
+        )
+        .await;
         reap_finished_deliveries(&watcher, &mut fleet).await;
+    }
+}
+
+/// SUBA-187 — pi `deliverPendingResults` (`result-watcher.ts`, `3bb9b203`), in its order: mark the
+/// sink as delivering pending results, flush what it already holds, then schedule every eligible
+/// result on disk and wait until each has been handed to the sink (see
+/// [`CompletionWatcherHandle::deliver_pending_results`] for why the hand-off, not the ack).
+async fn deliver_pending_now(
+    watcher: &ResultsWatcher,
+    sink: &Arc<dyn CompletionSink>,
+    observer: Option<&Arc<dyn CompletionObserver>>,
+    ownership: &ResultDeliveryOwnership,
+    fleet: &mut DeliveryFleet,
+) {
+    sink.begin_pending_delivery();
+    sink.flush_now();
+    reap_finished_deliveries(watcher, fleet).await;
+    let mut handed_off = Vec::new();
+    deliver_pending_completions(
+        watcher,
+        sink,
+        observer,
+        ownership,
+        fleet,
+        Some(&mut handed_off),
+    )
+    .await;
+    for handoff in handed_off {
+        let _ = handoff.await;
+    }
+    sink.end_pending_delivery();
+}
+
+/// Drive `delivery` to its first `Pending` (or to completion), report that through `handed_off`,
+/// then finish it. A sink does its hand-off synchronously on the first poll — the batching sink
+/// pushes (and, while delivering pending results, emits) before it awaits the ack — so the signal
+/// means the message is with the sink.
+async fn deliver_with_handoff(
+    delivery: impl std::future::Future<Output = CompletionDelivery>,
+    handed_off: Option<tokio::sync::oneshot::Sender<()>>,
+) -> CompletionDelivery {
+    let mut delivery = std::pin::pin!(delivery);
+    let first = std::future::poll_fn(|cx| std::task::Poll::Ready(delivery.as_mut().poll(cx))).await;
+    if let Some(handed_off) = handed_off {
+        let _ = handed_off.send(());
+    }
+    match first {
+        std::task::Poll::Ready(outcome) => outcome,
+        std::task::Poll::Pending => delivery.await,
     }
 }
 
@@ -305,6 +408,9 @@ async fn deliver_pending_completions(
     observer: Option<&Arc<dyn CompletionObserver>>,
     ownership: &ResultDeliveryOwnership,
     fleet: &mut DeliveryFleet,
+    // SUBA-187 — `Some` on a pending-results pass: one receiver per delivery spawned, resolved when
+    // the sink has the message.
+    mut handed_off: Option<&mut Vec<tokio::sync::oneshot::Receiver<()>>>,
 ) {
     let snapshot = ownership.snapshot();
     let sessions = snapshot.readable_sessions();
@@ -413,9 +519,15 @@ async fn deliver_pending_completions(
                     set: Arc::clone(&fleet.in_flight),
                     run_id: run_id.clone(),
                 };
+                let handoff = handed_off.as_deref_mut().map(|receivers| {
+                    let (tx, rx) = tokio::sync::oneshot::channel();
+                    receivers.push(rx);
+                    tx
+                });
                 fleet.tasks.spawn(async move {
                     let _guard = guard;
-                    let delivery = sink.deliver(&run_id, message).await;
+                    let delivery =
+                        deliver_with_handoff(sink.deliver(&run_id, message), handoff).await;
                     DeliveryOutcome {
                         run_id,
                         payload: Some(payload),
@@ -451,9 +563,14 @@ async fn deliver_pending_completions(
             set: Arc::clone(&fleet.in_flight),
             run_id: run_id.clone(),
         };
+        let handoff = handed_off.as_deref_mut().map(|receivers| {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            receivers.push(rx);
+            tx
+        });
         fleet.tasks.spawn(async move {
             let _guard = guard;
-            let delivery = sink.deliver(&run_id, message).await;
+            let delivery = deliver_with_handoff(sink.deliver(&run_id, message), handoff).await;
             DeliveryOutcome {
                 run_id,
                 payload: None,

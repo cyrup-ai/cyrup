@@ -1030,6 +1030,7 @@ mod tests {
 
     fn result(process_signal: Option<&str>) -> SingleResult {
         SingleResult {
+            output_partial: false,
             execution: None,
             native_machine: None,
             runtime_acknowledged_extensions: None,

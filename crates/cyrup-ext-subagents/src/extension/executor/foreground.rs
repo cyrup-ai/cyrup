@@ -1876,6 +1876,7 @@ pub(crate) fn detach_receipt(
     DetachReceipt {
         output_save_error: output_path_configured.then(|| reason.output_save_error().to_string()),
         result: SingleResult {
+            output_partial: false,
             execution: None,
             native_machine: None,
             runtime_acknowledged_extensions: None,

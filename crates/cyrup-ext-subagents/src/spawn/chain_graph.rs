@@ -1361,6 +1361,10 @@ pub struct StepResult {
     /// Whether the child produced substantive output
     /// ([`crate::exec::SingleResult::output_state`]).
     pub output_state: crate::exec::output_state::SubagentOutputState,
+    /// SUBA-195 — the child's output is unfinished streamed text
+    /// ([`crate::exec::SingleResult::output_partial`]; pi `StepResult.outputPartial`,
+    /// `subagent-runner.ts:248` @ad11b7ab).
+    pub output_partial: bool,
     /// Where the child's structured output was written, when it survives
     /// ([`crate::exec::SingleResult::structured_output_path`]).
     pub structured_output_path: Option<std::path::PathBuf>,
@@ -1443,6 +1447,7 @@ impl StepResult {
             attempted_models: Vec::new(),
             session_file: None,
             output_state: crate::exec::output_state::SubagentOutputState::Unknown,
+            output_partial: false,
             structured_output_path: None,
             timeout_recovery: None,
             transcript_path: None,
@@ -1480,6 +1485,7 @@ impl StepResult {
             attempted_models: Vec::new(),
             session_file: None,
             output_state: crate::exec::output_state::SubagentOutputState::Unknown,
+            output_partial: false,
             structured_output_path: None,
             timeout_recovery: None,
             transcript_path: None,
@@ -2903,6 +2909,7 @@ fn collapse_fan_out(fan_out: FanOutResult<StepResult, SubagentError>) -> GroupSt
 
     GroupStepResult {
         aggregate: StepResult {
+            output_partial: false,
             execution: None,
             tool_budget_blocked: false,
             session_name: None,

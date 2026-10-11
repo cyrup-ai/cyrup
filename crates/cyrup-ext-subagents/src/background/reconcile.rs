@@ -965,6 +965,7 @@ fn synthesize_step_results(status: &RunStatus, diagnostic: &str) -> Vec<crate::e
         .steps
         .iter()
         .map(|step| crate::exec::SingleResult {
+            output_partial: false,
             execution: None,
             native_machine: None,
             runtime_acknowledged_extensions: None,
@@ -1049,6 +1050,7 @@ pub(crate) fn placeholder_result(
 ) -> crate::exec::SingleResult {
     let _ = mode;
     crate::exec::SingleResult {
+        output_partial: false,
         execution: None,
         native_machine: None,
         runtime_acknowledged_extensions: None,

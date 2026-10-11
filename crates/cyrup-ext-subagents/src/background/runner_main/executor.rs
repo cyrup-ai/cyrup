@@ -1375,6 +1375,7 @@ fn build_step_result(
         structured_output,
         session_file,
         output_state,
+        output_partial,
         structured_output_path,
         error,
         interrupted,
@@ -1477,6 +1478,7 @@ fn build_step_result(
     step_result.attempted_models = attempted_models;
     step_result.session_file = session_file;
     step_result.output_state = output_state;
+    step_result.output_partial = output_partial;
     step_result.structured_output_path = structured_output_path;
     step_result
 }

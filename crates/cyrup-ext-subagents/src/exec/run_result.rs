@@ -345,6 +345,13 @@ pub struct SingleResult {
     /// stopped/timeout sentinel would get a different answer than the producer did.
     #[serde(default)]
     pub output_state: crate::exec::output_state::SubagentOutputState,
+    /// SUBA-195 — pi `SingleResult.outputPartial` (`shared/types.ts` @ad11b7ab, `9bc8f2d1`):
+    /// [`Self::final_output`] carries text the child was still streaming when it timed out or
+    /// ended on an error, rather than a completed reply. The run still fails; that text never
+    /// stands in for acceptance or a bound output file. Omitted when `false`, as upstream omits
+    /// `undefined`.
+    #[serde(default, skip_serializing_if = "crate::exec::is_false")]
+    pub output_partial: bool,
     /// Where this child's structured output was written, when it survives the run — pi
     /// `SingleResult.structuredOutputPath` (`subagent-runner.ts:1588`).
     ///

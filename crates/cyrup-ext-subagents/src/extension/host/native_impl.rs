@@ -724,9 +724,16 @@ impl NativeExtension for SubagentsExtension {
                             &roots,
                         )
                         .with_completion_bus(Some(self.executor.completion_bus()))
-                        // ASYNC_NOTIFY_BUG_REPORT F3.5 — the same ledger the wait tool shares,
-                        // so headless drains dedup identically.
-                        .with_inline_answers(Some(self.executor.inline_answers()))
+                        // SUBA-224 — NO inline-answer ledger here, unlike the `wait` tool. That
+                        // ledger (`ASYNC_NOTIFY_BUG_REPORT` F3.5) records a run as already answered
+                        // so the watcher does not inject its value a second time — true for the
+                        // tool, whose response is a tool result in the transcript. The drain's
+                        // response goes nowhere (`drain_outstanding_work` reads only its error
+                        // flags), so recording its runs answered made the watcher consume each
+                        // completion WITHOUT injecting it: every result a headless drain waited on
+                        // was lost. Upstream's drain suppresses no notification (`auto-drain.ts`
+                        // @ad11b7ab), and it hands those results to Pi right after (SUBA-187,
+                        // below).
                         // The drain's literal flags (`auto-drain.ts:61-63`); see
                         // [`crate::background::wait::WaitDeps::stop_on_attention`] for why the
                         // first one is what keeps this loop from spinning.
@@ -737,17 +744,26 @@ impl NativeExtension for SubagentsExtension {
                     // Under a declared auto-drain wait: the dispatcher's 5 s handler budget would
                     // otherwise drop the drain (and every completion it is holding the process open
                     // for) mid-flight, where upstream awaits it to its own `timeoutMs`.
-                    if let Err(message) =
-                        crate::background::auto_drain::drain_outstanding_work_in_handler(
-                            ctx,
-                            &session_id,
-                            crate::background::auto_drain::DEFAULT_AUTO_DRAIN_TIMEOUT_MS,
-                            &crate::time::now_epoch_millis,
-                            &probe,
-                            &waiter,
-                        )
-                        .await
-                    {
+                    let drained = crate::background::auto_drain::drain_outstanding_work_in_handler(
+                        ctx,
+                        &session_id,
+                        crate::background::auto_drain::DEFAULT_AUTO_DRAIN_TIMEOUT_MS,
+                        &crate::time::now_epoch_millis,
+                        &probe,
+                        &waiter,
+                    )
+                    .await;
+                    // SUBA-187 — pi `drainOutstandingWork(...).then(resultWatcher
+                    // .deliverPendingResults)` (`extension/index.ts:728` @ad11b7ab, `3bb9b203` /
+                    // #2666): "a headless host may dispose the session as soon as this turn
+                    // settles, so hand finished results to Pi now". Only after a drain that
+                    // resolved — upstream's `.then` skips it on a rejection, "so its deadline stays
+                    // exact". Without it a result that landed during the drain still waited out the
+                    // watcher's poll and the batcher's debounce, and `cyrup -p` returned first.
+                    if drained.is_ok() {
+                        self.executor.deliver_pending_results().await;
+                    }
+                    if let Err(message) = drained {
                         // [CYRUP-DELTA in mechanism, not in behaviour] upstream THROWS out of the
                         // handler (`auto-drain.ts:53,66`) — but that throw is not control flow: pi's
                         // runner catches every handler error (`runner.ts:869-878`) and emits it to

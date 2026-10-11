@@ -1336,6 +1336,7 @@ fn paused_result_from_status(
         .steps
         .iter()
         .map(|step| SingleResult {
+            output_partial: false,
             execution: None,
             native_machine: None,
             runtime_acknowledged_extensions: None,
@@ -4414,6 +4415,7 @@ mod tests {
     /// not stopped, no error — exactly what the seal has to rewrite.
     fn suba116_interrupted_child() -> crate::exec::SingleResult {
         crate::exec::SingleResult {
+            output_partial: false,
             execution: None,
             native_machine: None,
             runtime_acknowledged_extensions: None,
@@ -5364,6 +5366,7 @@ mod tests {
         }
         fn child(exit_code: i32, stopped: bool) -> crate::exec::SingleResult {
             crate::exec::SingleResult {
+                output_partial: false,
                 execution: None,
                 native_machine: None,
                 runtime_acknowledged_extensions: None,
@@ -6325,6 +6328,7 @@ mod tests {
         error: Option<&str>,
     ) -> SingleResult {
         SingleResult {
+            output_partial: false,
             execution: None,
             native_machine: None,
             runtime_acknowledged_extensions: None,

@@ -169,6 +169,7 @@ fn detached_step(agent: &str, lane: &str, run_id: Option<&str>) -> StepStatus {
 
 fn child_result(child_run_id: &str) -> SingleResult {
     SingleResult {
+        output_partial: false,
         execution: None,
         native_machine: None,
         runtime_acknowledged_extensions: None,

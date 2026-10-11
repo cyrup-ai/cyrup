@@ -369,6 +369,9 @@ struct Shared {
     config: CompletionBatchConfig,
     ownership: ResultDeliveryOwnership,
     groups: Mutex<HashMap<String, Group>>,
+    /// SUBA-187 — pi `deliveringPending` (`result-watcher.ts`, `3bb9b203`): non-zero while a
+    /// pending-results delivery runs, during which a held completion is emitted as it is pushed.
+    delivering_pending: std::sync::atomic::AtomicUsize,
 }
 
 impl Shared {
@@ -478,6 +481,7 @@ impl BatchingHostServicesCompletionSink {
                 config,
                 ownership,
                 groups: Mutex::new(HashMap::new()),
+                delivering_pending: std::sync::atomic::AtomicUsize::new(0),
             }),
         }
     }
@@ -593,7 +597,23 @@ impl CompletionSink for BatchingHostServicesCompletionSink {
                 Instant::now(),
                 &config,
             );
-            if group.flusher {
+            if self
+                .shared
+                .delivering_pending
+                .load(std::sync::atomic::Ordering::SeqCst)
+                > 0
+            {
+                // SUBA-187 — pi `if (deliveringPending > 0) notifier.flush?.()` right after the
+                // push: the group (this member and anything held beside it) goes out now. An
+                // emptied group is reaped by its flusher, if one is alive, on its next wake.
+                let members = group.state.flush(Instant::now());
+                if !members.is_empty() {
+                    self.shared.inject_group(members);
+                }
+                if group.flusher {
+                    group.wake.notify_one();
+                }
+            } else if group.flusher {
                 group.wake.notify_one();
             } else {
                 group.flusher = true;
@@ -603,6 +623,34 @@ impl CompletionSink for BatchingHostServicesCompletionSink {
         // A dropped sender (the sink torn down with this member still held) is a deferral: the
         // payload stays on disk for the next watcher.
         receiver.await.unwrap_or(CompletionDelivery::Deferred)
+    }
+
+    /// pi `flush() { for (const batcher of batchers.values()) batcher.flush(); }`.
+    fn flush_now(&self) {
+        let mut groups = self.shared.lock();
+        let now = Instant::now();
+        let flushed: Vec<Vec<Member>> = groups
+            .values_mut()
+            .map(|group| group.state.flush(now))
+            .filter(|members| !members.is_empty())
+            .collect();
+        for members in flushed {
+            self.shared.inject_group(members);
+        }
+    }
+
+    fn begin_pending_delivery(&self) {
+        self.shared
+            .delivering_pending
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn end_pending_delivery(&self) {
+        let _ = self.shared.delivering_pending.fetch_update(
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+            |count| count.checked_sub(1),
+        );
     }
 }
 

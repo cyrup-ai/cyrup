@@ -153,6 +153,21 @@ pub(crate) struct AttemptRecord {
     /// [`SpawnedChildAttemptRunner::resolve_attempt_exit`]'s step (d.1) for why the position is the
     /// whole content of the field.
     pub(crate) structured_output_failed: bool,
+    /// SUBA-196 — pi `timeoutCause` (`execution.ts:525`, assigned `:1267` @ad11b7ab) for the one
+    /// timer whose message differs from the run deadline's: the per-tool deadline that fired, with
+    /// its own message (`terminateForToolTimeout`). `None` when no tool deadline fired — then a
+    /// timed-out attempt was ended by the run deadline, whose message `run_sync` builds from the
+    /// run's nominal budget, as upstream's `attemptTimeout.message` is (`:178-185`).
+    pub(crate) tool_timeout_cause: Option<String>,
+    /// SUBA-195 — pi `childPromptFailed` (`execution.ts:1306`): the child ended on an error of its
+    /// own. Upstream's child is an in-process session whose `prompt()` threw; a cyrup child is a
+    /// process whose json mode exits 0 on every settled run, failed turns included, and exits
+    /// non-zero only when the mode itself errored (`crates/cyrup/src/run.rs`,
+    /// `run_json_dispatch`) — so a non-zero exit CODE is that same thrown error. A signal death is
+    /// not one: `resolveSubagentResultStatus` reads an unexplained signal as `stopped`
+    /// (`result-intercom.ts:35`), and upstream's gate excludes `stopped`. Neither is a run the
+    /// parent cancelled (upstream's `abortedBySignal`) or detached.
+    pub(crate) child_error: bool,
 }
 
 #[async_trait::async_trait]
@@ -368,6 +383,10 @@ impl AttemptRunner for SpawnedChildAttemptRunner<'_> {
                 after_compaction_settlement: outcome.after_compaction_settlement,
                 tool_budget_blocked: outcome.tool_budget_blocked,
                 structured_output_failed,
+                tool_timeout_cause: None,
+                child_error: raw_exit_code.is_some_and(|code| code != 0)
+                    && !outcome.detached
+                    && !self.opts.cancel.is_cancelled(),
             },
         )
     }
@@ -1095,6 +1114,8 @@ fn attempt_setup_failure(
             after_compaction_settlement: false,
             tool_budget_blocked: false,
             structured_output_failed: false,
+            tool_timeout_cause: None,
+            child_error: false,
         },
     )
 }
@@ -1146,6 +1167,8 @@ fn interrupted_attempt(
             // pi returns from `runSingleAttempt` on an interrupt BEFORE its structured-output block
             // runs at all (`:1391` vs `:1449`), so this attempt has no structured verdict.
             structured_output_failed: false,
+            tool_timeout_cause: None,
+            child_error: false,
         },
     )
 }
@@ -1187,10 +1210,13 @@ fn timed_out_attempt(
             // (`execution.ts:1241`), but the state is still published.
             turn_budget: outcome.turn_budget.clone(),
             progress,
-            // CFG-067 — `result.finalOutput = message` on the same line (`execution.ts:1252`): the
-            // operator reads WHY the run stopped where its answer would have been, rather than the
-            // half-sentence a child signalled mid-tool-call happens to have flushed.
-            final_output: outcome.tool_timeout_error.clone().or(final_output),
+            // SUBA-196 — the child's own completed output, never the tool-timeout message. Upstream
+            // also assigns `result.finalOutput = message` when the tool deadline fires
+            // (`execution.ts:1265` @ad11b7ab), but only for the live progress view: the terminal
+            // composition rebuilds `fullOutput` from the completed messages (`:1543`) and leads it
+            // with `timeoutCause` (`:1557-1578`). Carrying the message here instead is what put it
+            // under "Partial output before timeout:" behind the run deadline's sentence.
+            final_output,
             interrupted: false,
             control,
             // As on the interrupt path: a child launched, so its surface is real.
@@ -1206,6 +1232,11 @@ fn timed_out_attempt(
             tool_budget_blocked: outcome.tool_budget_blocked,
             // The timeout early-return likewise precedes upstream's structured-output block.
             structured_output_failed: false,
+            tool_timeout_cause: outcome.tool_timeout_error.clone(),
+            // `childPromptFailed` is set in `settle` for any thrown prompt (`:1306`), but the
+            // partial-output gate tests `result.timedOut` first (`:1547`), so a timed-out attempt's
+            // cause is always `timeout`.
+            child_error: false,
         },
     )
 }

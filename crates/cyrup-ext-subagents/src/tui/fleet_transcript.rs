@@ -1622,6 +1622,7 @@ mod tests {
     #[test]
     fn the_writers_own_output_renders_as_conversation_and_tool_rows() {
         let result = crate::exec::SingleResult {
+            output_partial: false,
             execution: None,
             native_machine: None,
             runtime_acknowledged_extensions: None,

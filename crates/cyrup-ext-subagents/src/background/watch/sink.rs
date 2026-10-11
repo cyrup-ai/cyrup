@@ -29,6 +29,20 @@ use std::time::{Duration, Instant};
 pub trait CompletionSink: Send + Sync {
     /// Deliver one completion notification for `run_id`. See the trait doc for the contract.
     async fn deliver(&self, run_id: &RunId, message: CompletionMessage) -> CompletionDelivery;
+
+    /// SUBA-187 — pi `CompletionNotifier.flush()` (`notify.ts`, `3bb9b203` / #2666): send every
+    /// held completion now instead of waiting for its batch timer. A sink that holds nothing has
+    /// nothing to do.
+    fn flush_now(&self) {}
+
+    /// SUBA-187 — pi's `deliveringPending` counter (`result-watcher.ts`): while at least one
+    /// pending-results delivery is running, a completion the sink would hold is sent at once
+    /// (upstream flushes right after each `notifier.deliver`). Paired with
+    /// [`Self::end_pending_delivery`]. A sink that holds nothing has nothing to do.
+    fn begin_pending_delivery(&self) {}
+
+    /// The other half of [`Self::begin_pending_delivery`].
+    fn end_pending_delivery(&self) {}
 }
 
 /// The graceful-degradation default sink: emits the formatted notification to stderr and reports it
@@ -363,6 +377,18 @@ impl CompletionSink for InlineAnsweredSink {
             return CompletionDelivery::delivered(run_id.clone());
         }
         self.inner.deliver(run_id, message).await
+    }
+
+    fn flush_now(&self) {
+        self.inner.flush_now();
+    }
+
+    fn begin_pending_delivery(&self) {
+        self.inner.begin_pending_delivery();
+    }
+
+    fn end_pending_delivery(&self) {
+        self.inner.end_pending_delivery();
     }
 }
 

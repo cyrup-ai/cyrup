@@ -533,6 +533,7 @@ pub async fn run_external_cli(
     );
 
     SingleResult {
+        output_partial: false,
         execution: None,
         native_machine: None,
         runtime_acknowledged_extensions: None,
