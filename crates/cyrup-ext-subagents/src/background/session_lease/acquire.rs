@@ -282,6 +282,8 @@ async fn create_private_dir_all(dir: &Path) -> std::io::Result<()> {
 async fn create_private_dir(dir: &Path) -> std::io::Result<()> {
     let dir = dir.to_path_buf();
     tokio::task::spawn_blocking(move || {
+        // Only unix sets a mode on it.
+        #[cfg_attr(not(unix), allow(unused_mut))]
         let mut builder = std::fs::DirBuilder::new();
         #[cfg(unix)]
         {

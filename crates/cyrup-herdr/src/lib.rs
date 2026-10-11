@@ -143,9 +143,7 @@ pub mod error;
 pub mod machine;
 pub mod probe;
 pub mod reconnect;
-#[cfg(unix)]
 pub mod relay;
-#[cfg(unix)]
 pub mod remote;
 pub mod schema;
 pub mod stream;
