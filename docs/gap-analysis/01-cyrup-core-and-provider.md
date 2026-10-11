@@ -132,7 +132,7 @@ This area covers `cyrup/crates/cyrup-core` (message/type model, JSONL serializat
 >   `ClassifierModelWire` copy, the `ImageModelWire` copy, and the chat `Model`'s serde each failed it
 >   on that leg alone while the other two assertions still passed.
 > - *overlay* — `::the_live_overlay_body_keeps_its_profile_on_chat_and_image_rows_alike` and
->   `::an_overlay_row_served_without_the_field_is_stamped_on_all_three_variants`.
+>   `::an_overlay_row_served_without_the_field_is_stamped_on_chat_and_image_rows_only` (renamed by PROV-158, which left classifier rows verbatim).
 > - *an image request honours `images.resize`* — the consumers, which are the paths by which images
 >   ENTER a provider request: `cyrup-session-svc tests::prompt_image_normalization::*` (9) and
 >   `tests::read_model_resize::*` (2). **This clause does NOT mean `generate_images`** — see the

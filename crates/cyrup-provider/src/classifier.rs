@@ -172,8 +172,9 @@ pub struct ClassifierModel {
     pub input: Vec<Modality>,
     /// Provider input limits and cache-safe image preprocessing metadata (pi
     /// `BaseModel.inputLimits`, `types.ts:1105` @v1.0.4, declared between `input` and `cost`).
-    /// Declared on `BaseModel`, which this type extends, so an classifier row carries it exactly as a
-    /// chat [`Model`] does.
+    /// Declared on `BaseModel`, which this type extends, so a classifier row carries it exactly as a
+    /// chat [`Model`] does. It holds what the catalog row declared and nothing more: no catalog pass
+    /// stamps a classifier row, embedded or overlaid, because pi's generator never does (PROV-158).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_limits: Option<ModelInputLimits>,
     pub cost: ModelCost,

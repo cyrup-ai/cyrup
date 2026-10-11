@@ -1552,3 +1552,45 @@ fn a_providers_catalogs_share_one_pi_dev_revision() {
         );
     }
 }
+
+/// PROV-158 — every embedded `<provider>-classifiers.json` is a pi.dev shard, so the live overlay
+/// must read it exactly as the floor does: `remote_catalog::parse_catalog` (pi's runtime
+/// `parseCatalog`, verbatim, `remote-catalog-provider.ts:37-50` @f1b2e77f5) and
+/// `catalog::load_classifier_catalog` must produce identical rows. A per-type pass added to one
+/// reader and not the other shows up here as an overlay row that contradicts its own floor. Red at
+/// the base, whose overlay stamped image input limits onto `gpt-6-luna` and OpenRouter's
+/// image-capable classifiers.
+#[test]
+fn every_classifier_catalog_reads_identically_through_the_overlay_parser() {
+    use crate::classifier::AnyModel;
+    use crate::model::Modality;
+
+    let mut image_capable = 0;
+    let mut files = 0;
+    for (name, blob) in catalogs() {
+        let Some(owner) = classifier_catalog_owner(&name) else {
+            continue;
+        };
+        files += 1;
+        let floor = crate::catalog::load_classifier_catalog(&blob).expect("floor parses");
+        let body: serde_json::Value = serde_json::from_str(&blob).expect("json");
+        let overlay: Vec<_> = crate::remote_catalog::parse_catalog(owner, &body)
+            .expect("overlay parses")
+            .into_iter()
+            .filter_map(AnyModel::into_classifier)
+            .collect();
+        assert_eq!(overlay, floor, "{name}");
+        image_capable += floor
+            .iter()
+            .filter(|m| m.input.contains(&Modality::Image))
+            .count();
+    }
+    assert_eq!(
+        files,
+        crate::providers::classifiers::BUILTIN_CLASSIFIER_LEGS.len()
+    );
+    assert!(
+        image_capable > 0,
+        "non-vacuity: some floor row is image-capable"
+    );
+}

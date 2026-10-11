@@ -169,8 +169,8 @@ pub fn merge_models(baseline: &[Model], dynamic: &[Model]) -> Vec<Model> {
     merged
 }
 
-/// Parse a remote catalog body (1:1 port of Pi `parseCatalog`, `remote-catalog-provider.ts:37-51`
-/// @v1.0.1).
+/// Parse a remote catalog body (Pi `parseCatalog`, `coding-agent/src/core/remote-catalog-provider.ts:37-50`
+/// @f1b2e77f5).
 ///
 /// Three shapes are accepted, exactly as upstream: a JSON array, `{"models": [...]}`, or a plain
 /// object whose VALUES are models. All three are live: pi.dev serves the **model-id-keyed object**
@@ -185,7 +185,7 @@ pub fn merge_models(baseline: &[Model], dynamic: &[Model]) -> Vec<Model> {
 /// failed chat parse; the distinction only became observable once the rows started arriving.
 ///
 /// A row whose `type` this build does not know is DROPPED, not an error — pi's
-/// `.filter(isSupportedModelType)` (`:49`, defined `:24-30`), which also keeps a row with no
+/// `.filter(isSupportedModelType)` (`:48`, defined `:24-29`), which also keeps a row with no
 /// `type` at all (a legacy chat row). The drop has to happen before deserialization because
 /// [`AnyModel`]'s own deserializer rejects an unknown `type` outright; upstream's filter sits in
 /// the same position for the same reason.
@@ -194,6 +194,10 @@ pub fn merge_models(baseline: &[Model], dynamic: &[Model]) -> Vec<Model> {
 /// models are structural. cyrup's are nominal, so an entry that carries an `id` but does not
 /// deserialize is DROPPED rather than fabricated with invented defaults. Dropping is the
 /// floor-preserving choice: the baseline entry for that id simply survives unmerged.
+///
+/// **[CYRUP-DELTA, intentional]** pi's `parseCatalog` returns the rows as served; cyrup replays the
+/// generator's chat and image passes on them and passes classifier rows through verbatim
+/// ([`crate::catalog::apply_overlay_metadata`] says why, and why classifiers differ, PROV-158).
 pub fn parse_catalog(
     provider_id: &str,
     value: &serde_json::Value,
@@ -224,40 +228,12 @@ pub fn parse_catalog(
                 "provider".to_string(),
                 serde_json::Value::String(provider_id.to_string()),
             );
-            let parsed =
+            let mut parsed =
                 serde_json::from_value::<AnyModel>(serde_json::Value::Object(owned)).ok()?;
-            // SEAM-131 — the same load-time fill the EMBEDDED catalogs get
-            // (`catalog::load_catalog`). An overlay row never passes through that function:
-            // `merge_models` replaces a baseline entry wholesale by id, so a refreshed
-            // `anthropic` row that omits `promptCache` would arrive with `prompt_cache: None`,
-            // `prompt_cache_ttl_ms` would answer `None`, and every session on that model would
-            // report `Inactive (cache lifetime unavailable)` — the whole feature off, with no
-            // other symptom. The pass only ever fills a key the row left unset, so an overlay
-            // that does carry `promptCache` is untouched, and it is gated on direct Anthropic
-            // exactly as the embedded pass is, so no gateway row gains an invented lifetime.
-            //
-            // PROV-134 — `apply_image_input_metadata` is applied here for the same reason, and on
-            // all THREE variants rather than just chat, because upstream's `inputLimits` is on
-            // `BaseModel` and its generator stamps `AnyModel` (`generate-models.ts:3487` and
-            // `:3505`). The live pi.dev body is already stamped — measured on
-            // `tests/fixtures/pi-dev-openrouter-all-types.json`, every image-capable row carries
-            // `inputLimits` (270/270 chat, 57/57 image) and no text-only row does — so this is a
-            // fill-only no-op against today's endpoint and a floor if a future shard regresses.
-            Some(match parsed {
-                AnyModel::Chat(mut model) => {
-                    crate::catalog::apply_prompt_cache_metadata(&mut model);
-                    crate::catalog::apply_image_input_metadata(&mut model);
-                    AnyModel::Chat(model)
-                }
-                AnyModel::Image(mut model) => {
-                    crate::catalog::apply_image_input_metadata_to_image(&mut model);
-                    AnyModel::Image(model)
-                }
-                AnyModel::Classifier(mut model) => {
-                    crate::catalog::apply_image_input_metadata_to_classifier(&mut model);
-                    AnyModel::Classifier(model)
-                }
-            })
+            // SEAM-131 / PROV-134 / PROV-158 — the generator's chat and image passes, replayed
+            // fill-only; classifier rows verbatim.
+            crate::catalog::apply_overlay_metadata(&mut parsed);
+            Some(parsed)
         })
         .collect())
 }

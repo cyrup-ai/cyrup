@@ -69,7 +69,7 @@ pub fn openrouter_image_models() -> Vec<ImageModel> {
             // 54 image-capable ones carry no resize profile (measured at HEAD), while the live
             // pi.dev body carries one on 57 of its 59 image rows. Upstream's generator stamps the
             // image catalog with the identical pass it stamps the chat catalog with
-            // (`applyImageInputMetadata`, `generate-models.ts:3505`), so without this an image
+            // (`applyImageInputMetadata`, `generate-models.ts:3377` @f1b2e77f5), so without this an image
             // model would resolve no profile at all. Same `[CYRUP-DELTA]` mechanism note as
             // `catalog::load_catalog` carries: parse time instead of generation time, because the
             // generator analogue is unreachable at this pin (PROV-071).

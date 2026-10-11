@@ -2,13 +2,14 @@
 //! surfaces, the serde round-trip through both hand-written wire mirrors, and the generator-time
 //! stamp.
 //!
-//! Upstream, read at **v1.0.4** through git objects (`git -C tmp/pi show v1.0.4:<path>`):
+//! Upstream, read through git objects (`git -C tmp/pi show <rev>:<path>`); the stamp rows at
+//! **f1b2e77f5** (re-read by PROV-158), the type row at **v1.0.4**:
 //!
 //! | what | where |
 //! |---|---|
-//! | the three interfaces, and `inputLimits` on `BaseModel` between `input` and `cost` | `packages/ai/src/types.ts:1075-1096`, `:1105` |
-//! | `applyImageInputMetadata` + `DEFAULT_IMAGE_RESIZE` | `packages/ai/scripts/generate-models.ts:994-1020`, `:424-430` |
-//! | its two call sites (chat+classifier, then openrouter images) | `generate-models.ts:3487`, `:3505` |
+//! | the three interfaces, and `inputLimits` on `BaseModel` between `input` and `cost` (v1.0.4) | `packages/ai/src/types.ts:1075-1096`, `:1105` |
+//! | `applyImageInputMetadata` + `DEFAULT_IMAGE_RESIZE` | `packages/ai/scripts/generate-models.ts:994-1020`, `:420-425` |
+//! | its two call sites (chat, then OpenRouter images); classifier rows assembled after, unstamped | `generate-models.ts:3359`, `:3377`; `:3379-3392` |
 //! | the oracle for the stamp's numbers | `packages/ai/test/providers.test.ts:111-136` |
 //! | `maxRequestBytes` / `maxPerMessage` / `maxPerRequest` are DESCRIPTIVE | `packages/coding-agent/docs/models.md:89` |
 //!
@@ -169,18 +170,22 @@ fn the_live_overlay_body_keeps_its_profile_on_chat_and_image_rows_alike() {
     );
 }
 
-/// The remote overlay gets the stamp too, on all THREE variants — the SEAM-131 precedent in
-/// `parse_catalog`, for the same reason: `merge_models` replaces a baseline entry wholesale by id,
-/// so a refreshed row served without `inputLimits` would land with no profile at all and the
-/// resizer would silently see nothing where the embedded row had something.
+/// The remote overlay gets the stamp on the two row kinds pi's generator stamps — chat and image
+/// (`generate-models.ts:3359`, `:3377` @f1b2e77f5) — the SEAM-131 precedent in `parse_catalog`, for
+/// the same reason: `merge_models` replaces a baseline entry wholesale by id, so a refreshed row
+/// served without `inputLimits` would land with no profile at all and the resizer would silently
+/// see nothing where the embedded row had something. A CLASSIFIER row is never stamped: the
+/// generator assembles those after its stamp loops (`:3379-3392`) and pi.dev serves them bare, so
+/// the overlay passes one through verbatim, exactly as the embedded floor does (PROV-158).
 ///
 /// It is a FLOOR, not a mechanism: today's pi.dev body is already stamped on every image-capable
-/// row, so deleting this call leaves
+/// chat and image row, so deleting either call leaves
 /// [`the_live_overlay_body_keeps_its_profile_on_chat_and_image_rows_alike`] green. This test is
-/// what makes it load-bearing — the body here deliberately carries NO `inputLimits`, which the
-/// live one never does, so only the stamp can produce the profile.
+/// what makes them load-bearing — the body here deliberately carries NO `inputLimits`, which the
+/// live one never does, so only the stamp can produce the profile. Red at the base on the
+/// classifier half, which the base stamped.
 #[test]
-fn an_overlay_row_served_without_the_field_is_stamped_on_all_three_variants() {
+fn an_overlay_row_served_without_the_field_is_stamped_on_chat_and_image_rows_only() {
     let body: serde_json::Value = serde_json::from_str(
         r#"[
         {"id":"c","name":"C","api":"openai-completions","provider":"x","baseUrl":"https://x",
@@ -200,17 +205,74 @@ fn an_overlay_row_served_without_the_field_is_stamped_on_all_three_variants() {
     let rows = crate::remote_catalog::parse_catalog("x", &body).unwrap();
     assert_eq!(rows.len(), 3, "one row of each type");
     for row in &rows {
-        let got = match row {
-            AnyModel::Chat(m) => m.input_limits.clone(),
-            AnyModel::Image(m) => m.input_limits.clone(),
-            AnyModel::Classifier(m) => m.input_limits.clone(),
-        };
-        assert_eq!(
-            got.and_then(|l| l.images).and_then(|i| i.resize),
-            Some(DEFAULT_IMAGE_RESIZE),
-            "an overlay row of this type was not stamped"
-        );
+        match row {
+            AnyModel::Chat(m) => assert_eq!(resize(m), DEFAULT_IMAGE_RESIZE, "chat"),
+            AnyModel::Image(m) => assert_eq!(
+                m.input_limits
+                    .clone()
+                    .and_then(|l| l.images)
+                    .and_then(|i| i.resize),
+                Some(DEFAULT_IMAGE_RESIZE),
+                "image"
+            ),
+            AnyModel::Classifier(m) => assert_eq!(m.input_limits, None, "classifier"),
+        }
     }
+}
+
+/// PROV-158 — an overlaid classifier row keeps exactly what pi.dev served, as pi's runtime
+/// `parseCatalog` does (`remote-catalog-provider.ts:37-50` @f1b2e77f5, no stamp). Three shapes the
+/// base's classifier stamp each rewrote: pi.dev's own image-capable `gpt-6-luna` (served with no
+/// `inputLimits`), an Anthropic image-capable classifier on the 200k window the chat branch keys
+/// on, and a row that declares only `maxRequestBytes`. Red at the base on all three.
+#[test]
+fn an_overlaid_image_capable_classifier_row_keeps_input_limits_none() {
+    let classifier = |provider: &str, body: serde_json::Value| -> ClassifierModel {
+        crate::remote_catalog::parse_catalog(provider, &body)
+            .unwrap()
+            .into_iter()
+            .find_map(AnyModel::into_classifier)
+            .expect("one classifier row")
+    };
+
+    // (1) pi.dev's served openai classifier shard, the file `xtask gen-catalogs` writes.
+    let served: serde_json::Value =
+        serde_json::from_str(include_str!("../providers/catalog/openai-classifiers.json")).unwrap();
+    let luna = classifier("openai", served);
+    assert_eq!(luna.id.as_str(), "gpt-6-luna");
+    assert!(luna.input.contains(&Modality::Image), "the premise");
+    assert_eq!(
+        luna.input_limits, None,
+        "if pi.dev starts serving inputLimits on classifier rows, re-check whether pi's generator \
+         stamps them now — do not just delete this assertion"
+    );
+
+    // (2) Anthropic's `type !== "image" && contextWindow === 200000` branch has no say here.
+    let anthropic = classifier(
+        "anthropic",
+        serde_json::json!([{"type":"classifier","id":"a","name":"A","api":"llama-cpp-classify",
+            "provider":"anthropic","baseUrl":"https://x","input":["text","image"],
+            "cost":{"input":0.0,"output":0.0,"cacheRead":0.0,"cacheWrite":0.0},
+            "contextWindow":200000}]),
+    );
+    assert_eq!(anthropic.input_limits, None);
+
+    // (3) A declared block is kept as declared, with nothing filled in beside it.
+    let declared = classifier(
+        "openai",
+        serde_json::json!([{"type":"classifier","id":"d","name":"D","api":"openai-decisions",
+            "provider":"openai","baseUrl":"https://x","input":["text","image"],
+            "inputLimits":{"maxRequestBytes":7},
+            "cost":{"input":0.0,"output":0.0,"cacheRead":0.0,"cacheWrite":0.0},
+            "contextWindow":4096}]),
+    );
+    assert_eq!(
+        declared.input_limits,
+        Some(crate::model::ModelInputLimits {
+            max_request_bytes: Some(7),
+            images: None,
+        })
+    );
 }
 
 /// `ImageModel` and `ClassifierModel` read through hand-written `*Wire` mirrors that copy field by
@@ -385,7 +447,7 @@ fn an_unknown_provider_gets_the_cache_safe_resize_default_and_nothing_else() {
             max_bytes: Some(4_718_592),
             jpeg_quality: Some(80),
         },
-        "DEFAULT_IMAGE_RESIZE, generate-models.ts:424-430; 4_718_592 == 4.5 * 1024 * 1024"
+        "DEFAULT_IMAGE_RESIZE, generate-models.ts:420-425 @f1b2e77f5; 4_718_592 == 4.5 * 1024 * 1024"
     );
 }
 
@@ -443,7 +505,7 @@ fn a_row_wins_over_the_provider_table_at_both_levels() {
 /// The one place the stamp is NOT already a no-op. `catalog/openrouter-images.json` was frozen at
 /// v0.87.1, before `inputLimits` existed on any model shape, so **0 of its 54 image-capable rows
 /// carry one** — a measurement, not an estimate. Upstream stamps the image catalog with the same
-/// pass (`generate-models.ts:3505`). This assertion cannot pass accidentally: the value is absent
+/// pass (`generate-models.ts:3377` @f1b2e77f5). This assertion cannot pass accidentally: the value is absent
 /// from the data, so only the stamp can produce it.
 #[test]
 fn the_frozen_image_catalog_is_stamped_because_its_rows_carry_nothing() {
@@ -480,26 +542,6 @@ fn the_frozen_image_catalog_is_stamped_because_its_rows_carry_nothing() {
             .filter(|m| !m.input.contains(&Modality::Image))
             .all(|m| m.input_limits.is_none())
     );
-}
-
-/// A classifier row goes through upstream's FIRST call site, with the chat models
-/// (`generate-models.ts:3487`), so `type !== "image"` is true for it and its own `contextWindow`
-/// decides 100 vs 600.
-#[test]
-fn an_image_capable_classifier_row_is_stamped_like_a_chat_row() {
-    let mut m: ClassifierModel = serde_json::from_str(
-        r#"{"type":"classifier","id":"c","name":"C","api":"llama-cpp-classify",
-            "provider":"anthropic","baseUrl":"https://x","input":["text","image"],
-            "cost":{"input":0.0,"output":0.0,"cacheRead":0.0,"cacheWrite":0.0},
-            "contextWindow":200000}"#,
-    )
-    .unwrap();
-    crate::catalog::apply_image_input_metadata_to_classifier(&mut m);
-    let limits = m.input_limits.expect("stamped");
-    assert_eq!(limits.max_request_bytes, Some(33_554_432));
-    let images = limits.images.expect("images");
-    assert_eq!(images.max_per_request, Some(100));
-    assert_eq!(images.resize, Some(DEFAULT_IMAGE_RESIZE));
 }
 
 /// An IMAGE row short-circuits Anthropic's `type !== "image"` to the 600 side even at a 200k-shaped

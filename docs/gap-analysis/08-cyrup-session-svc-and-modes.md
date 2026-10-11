@@ -1288,13 +1288,18 @@ Keeps its ID and its body; proposes no schedulable work today.
 >
 > **The stamp's call sites are BROADER than upstream's, and that is safe.** `applyImageInputMetadata`
 > lives in `packages/ai/scripts/generate-models.ts`, a build script, so nothing stamps a catalog
-> fetched at runtime; cyrup's `apply_image_input_metadata` runs at every catalog PARSE site,
-> including the remote overlay. Nothing changes on the wire either way: `DEFAULT_IMAGE_RESIZE` is
-> byte-for-byte the resizer's own `DEFAULT_OPTIONS`, so an absent profile resolves to the same four
-> numbers a stamp would have written, and `maxRequestBytes`/`maxPerMessage`/`maxPerRequest` have no
-> runtime reader at v1.0.4. The one observable difference is persistence — a served row round-tripped
-> through the models store carries an `inputLimits` block pi's row for the same model would not have.
-> Described here rather than changed, because the stamp cannot alter resolution.
+> fetched at runtime; cyrup's `apply_image_input_metadata` runs at every chat and image catalog PARSE
+> site, including the remote overlay (`catalog::apply_overlay_metadata`, `[CYRUP-DELTA, intentional]`).
+> Classifier rows are never stamped, on either path, because the generator never stamps them
+> (`generate-models.ts:3379-3392` @f1b2e77f5; PROV-158). Against pi.dev the overlay stamp is a no-op:
+> every image-capable chat and image row it serves already carries `inputLimits`. It acts only on a
+> row served WITHOUT the field. There `DEFAULT_IMAGE_RESIZE` is byte-for-byte the resizer's own
+> `DEFAULT_OPTIONS`, so with no embedder fallback an absent profile resolves to the same four numbers
+> a stamp would have written, and `maxRequestBytes`/`maxPerMessage`/`maxPerRequest` have no runtime
+> reader at v1.0.4. Two differences remain observable for such a row: persistence (a row
+> round-tripped through the models store carries an `inputLimits` block pi's row would not have) and
+> an embedder's static read fallback (`ReadOpts::resize_profile_now`; pi `read.ts:91`), which pi's
+> bare row would leave in charge and the stamped row overrides. Described here rather than changed.
 
 
 **Kind** upstream-drift · **Severity** low · **Effort** M · **Confidence** confirmed (both sides read 2026-09-24; not run)
