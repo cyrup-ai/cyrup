@@ -235,6 +235,16 @@ const LIVE_CATALOGS: &[live_catalog::LiveCatalogSpec] = &[
     live("qwen-token-plan-individual", "DRIFT-009"),
     // XAI_1 — the first catalog to take this path, and the proof the other 37 could.
     live("xai", "XAI_1"),
+    // PROV-080 — `providers/meta.ts` (registered `all.ts:154` @f1b2e77f5): the provider is ported,
+    // so its catalog leaves `UNPORTED`.
+    live("meta", "PROV-080"),
+    // PROV-147 — `OPENAI_CLASSIFIER_MODELS` (`gpt-6-luna` on `openai-decisions`,
+    // `generate-models.ts:2696-2708` @f1b2e77f5), a classifier catalog beside `openai`'s chat one.
+    live("openai-classifiers", "PROV-147"),
+    // PROV-153 — `TYPESAFE_CLASSIFIER_MODELS` (`jev-latest`, `loadModelsDevClassifierModels`,
+    // `generate-models.ts:2586-2617` @f1b2e77f5). `typesafe` has no chat rows at all, so this is
+    // its only catalog.
+    live("typesafe-classifiers", "PROV-153"),
 ];
 
 /// One [`LIVE_CATALOGS`] entry. Everything but the ledger id is derived from the stem
@@ -301,10 +311,10 @@ struct Unported {
 enum UnportedReason {
     /// cyrup carries the rows as Rust literals somewhere else, so this generator cannot own them.
     HandPorted,
-    /// cyrup does not implement the provider at all, so there is nothing for a catalog to feed.
-    /// The absence is a PROVIDER gap owned by its own ledger item, not a catalog one — filing it
-    /// here is how the roster stays total without this generator pretending to fix it.
-    NoProvider,
+    // `NoProvider` — "cyrup does not implement the provider at all, so there is nothing for a
+    // catalog to feed" — was held by `meta` alone and went with it when PROV-080 ported the
+    // provider. It is deleted rather than left unconstructed; the next provider pi adds before
+    // cyrup ports it brings it back, with its owning ledger item.
     /// cyrup implements the provider, but its catalog reaches it by a mechanism other than
     /// `providers/catalog/*.json`, and closing the difference is owned elsewhere.
     CatalogElsewhere,
@@ -325,18 +335,10 @@ enum UnportedReason {
 /// change: `gen-catalogs --roster v0.87.1` failed with "pi ships 2 provider module(s) this
 /// generator has never heard of". That failure is the audit working — it is the exact shape of the
 /// failure DRIFT-009 was filed for — and the fix is to name them and their owners, not to widen a
-/// positive table over providers cyrup does not have.
+/// positive table over providers cyrup does not have. `meta` left this table when PROV-080 ported
+/// the provider: its catalog is a [`LIVE_CATALOGS`] entry now, and the `NoProvider` reason it held
+/// went with it (see [`UnportedReason`]).
 const UNPORTED: &[Unported] = &[
-    Unported {
-        stem: "meta",
-        reason: UnportedReason::NoProvider,
-        item: "PROV-080",
-        why: "cyrup has no provider id `meta` at all (`providers/meta.ts` @v0.87.1 — base URL \
-              `https://api.meta.ai/v1`, `envApiKeyAuth(\"Meta Model API key\", [\"META_API_KEY\"])`, \
-              a Muse-subscription lazy OAuth, registered `all.ts:108`), so a catalog would have \
-              nothing to attach to; PROV-080 owns porting the provider and its catalog arrives in \
-              that change",
-    },
     Unported {
         stem: "radius",
         reason: UnportedReason::CatalogElsewhere,
@@ -1036,7 +1038,9 @@ fn account_for_roster(upstream_stems: &[String]) -> Result<Roster, String> {
             .find(|c| c.images_provider.is_none() && c.file == stem)
         {
             embedded.push(spec);
-        } else if let Some(l) = LIVE_CATALOGS.iter().find(|l| l.file == stem) {
+        } else if let Some(l) = LIVE_CATALOGS.iter().find(|l| l.provider() == stem) {
+            // A provider with a chat AND a classifier catalog (`openai`) is one module upstream;
+            // the first spec naming it accounts for the stem.
             live.push(l);
         } else if let Some(u) = UNPORTED.iter().find(|u| u.stem == stem) {
             unported_present.push(u);
@@ -1060,7 +1064,7 @@ fn account_for_roster(upstream_stems: &[String]) -> Result<Roster, String> {
         .iter()
         .filter(|c| c.images_provider.is_none())
         .map(|c| c.file)
-        .chain(LIVE_CATALOGS.iter().map(|l| l.file))
+        .chain(LIVE_CATALOGS.iter().map(|l| l.provider()))
         .filter(|file| !upstream_stems.iter().any(|s| s == file))
         .collect();
     if !retired.is_empty() {
@@ -1140,7 +1144,6 @@ fn run_roster(args: &Args, rev: &str) -> Result<(), String> {
     for u in &roster.unported_present {
         let reason = match u.reason {
             UnportedReason::HandPorted => "hand-ported",
-            UnportedReason::NoProvider => "no such provider in cyrup",
             UnportedReason::CatalogElsewhere => "catalog supplied elsewhere",
         };
         println!("  unported {} — {reason}, {} — {}", u.stem, u.item, u.why);
@@ -1329,6 +1332,13 @@ fn manifest_json(
     let endpoint = live_catalog::LIVE_CATALOG_ENDPOINT;
     let pinned_count = CATALOGS.len();
     let live_count = LIVE_CATALOGS.len();
+    let classifier_files: Vec<&str> = LIVE_CATALOGS
+        .iter()
+        .filter(|l| l.kind() == live_catalog::LiveCatalogKind::Classifier)
+        .map(|l| l.file)
+        .collect();
+    let classifier_count = classifier_files.len();
+    let classifier_files = classifier_files.join(", ");
     let catalog_count = pinned_count + live_count; // D5 — 39, one file per catalog on disk
     let generated_at = if args.rev == DEFAULT_REV {
         DEFAULT_REV_TIMESTAMP.to_string()
@@ -1370,7 +1380,10 @@ fn manifest_json(
          `cargo run -p xtask -- gen-catalogs`. {live_count} of them — every provider catalog — are \
          fetched LIVE from {endpoint}<id>, the same endpoint the runtime overlay reads \
          (cyrup-provider/src/remote_catalog.rs), and each carries its own fetchedAt/revision under \
-         `catalogs` below. {pinned_count} (openrouter-images) is read at its OWN pinned revision, \
+         `catalogs` below. {classifier_count} of those ({classifier_files}) hold a provider's \
+         CLASSIFIER rows: they are fetched from {endpoint}<id>?types=classifier, keep only the \
+         `type: \"classifier\"` rows of that array, and are read as ClassifierModel rows, never as \
+         chat models (PROV-147, PROV-153). {pinned_count} (openrouter-images) is read at its OWN pinned revision, \
          pi@{IMAGES_REV}, named by its `catalogs` entry (PROV-089), and neither `generatedAt` nor \
          any `fetchedAt` is a floor for it because the pi.dev overlay never serves image rows. \
          Top-level `generatedAt` and `source` ({source}, {generated_at}) therefore describe no \
@@ -1392,8 +1405,7 @@ fn manifest_json(
          are include_str!-ed, a maintainer runs gen-catalogs and reviews the diff, and the \
          offline or first-run user this floor exists for has no network by definition. \
          EXCEPTIONS: providers/together.rs hand-ports Together's rows as Rust literals and has no \
-         file here (PROV-060); `meta` has no cyrup provider to attach a catalog to (PROV-080); \
-         `radius` learns its rows from its gateway and has no embedded floor, where pi gained one \
+         file here (PROV-060); `radius` learns its rows from its gateway and has no embedded floor, where pi gained one \
          at v0.86.0 (PROV-014). SIGNED-OFF ROW DIVERGENCES: {delta_count} — {delta_summary}. Every \
          one of the twelve this generator used to impose against b0c2a90e has CONVERGED: upstream \
          now serves the pinned value itself, or retired the row, and the generator's CONVERGED \
@@ -1718,8 +1730,11 @@ mod tests {
     /// remaining 33 provider catalogs across the same way, leaving `CATALOGS` with the ONE file
     /// that is not a provider module. Both halves are asserted because the interesting failure is a
     /// file moving between the tables, which a total alone cannot see.
+    ///
+    /// PROV-080 / PROV-147 / PROV-153 grew it to 42: `meta`'s chat catalog, and the first two
+    /// classifier catalogs (`openai-classifiers`, `typesafe-classifiers`).
     #[test]
-    fn the_catalog_roster_is_the_39_embedded_files() {
+    fn the_catalog_roster_is_the_42_embedded_files() {
         assert_eq!(
             CATALOGS.len(),
             1,
@@ -1728,30 +1743,58 @@ mod tests {
         );
         assert_eq!(
             LIVE_CATALOGS.len(),
-            38,
+            41,
             "every `packages/ai/src/providers/<p>.models.ts` pi ships except `together` (hand-\
-             ported), `meta` (no cyrup provider) and `radius` (catalog from its gateway)"
+             ported), `radius` (catalog from its gateway) and `azure` (PROV-145), plus two \
+             classifier catalogs"
         );
         assert_eq!(
             CATALOGS.len() + LIVE_CATALOGS.len(),
-            39,
-            "the roster is 39 embedded catalog files across the two tables"
+            42,
+            "the roster is 42 embedded catalog files across the two tables"
         );
         // Every live spec derives its endpoint and module from its stem, so a mismatched pair is
         // unspellable rather than merely detected — the reason `LiveCatalogSpec` collapsed three
-        // hand-written fields into one.
+        // hand-written fields into one. A classifier catalog derives them from the stem minus its
+        // `-classifiers` suffix.
         for l in LIVE_CATALOGS {
-            assert_eq!(l.provider(), l.file);
-            assert_eq!(
-                l.url(),
-                format!("https://pi.dev/api/models/providers/{}", l.file)
-            );
+            match l.kind() {
+                live_catalog::LiveCatalogKind::Chat => {
+                    assert_eq!(l.provider(), l.file);
+                    assert_eq!(
+                        l.url(),
+                        format!("https://pi.dev/api/models/providers/{}", l.file)
+                    );
+                }
+                live_catalog::LiveCatalogKind::Classifier => {
+                    assert_eq!(format!("{}-classifiers", l.provider()), l.file);
+                    assert_eq!(
+                        l.url(),
+                        format!(
+                            "https://pi.dev/api/models/providers/{}?types=classifier",
+                            l.provider()
+                        )
+                    );
+                }
+            }
             assert_eq!(
                 l.module(),
-                format!("packages/ai/src/providers/{}.models.ts", l.file)
+                format!("packages/ai/src/providers/{}.models.ts", l.provider())
             );
             assert!(!l.item.is_empty(), "{}: no ledger item", l.file);
         }
+        let classifiers: Vec<(&str, &str)> = LIVE_CATALOGS
+            .iter()
+            .filter(|l| l.kind() == live_catalog::LiveCatalogKind::Classifier)
+            .map(|l| (l.file, l.item))
+            .collect();
+        assert_eq!(
+            classifiers,
+            [
+                ("openai-classifiers", "PROV-147"),
+                ("typesafe-classifiers", "PROV-153"),
+            ]
+        );
         // Every name is a real file on disk. This is what catches a table entry whose catalog was
         // never generated — the failure mode DRIFT-009's four spent nine sweeps in.
         let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -1980,20 +2023,24 @@ mod tests {
         );
     }
 
-    /// Every `packages/ai/src/providers/*.models.ts` pi ships at `v0.87.1`, from
-    /// `git -C tmp/pi ls-tree v0.87.1 --name-only packages/ai/src/providers/`. Hard-coded rather
+    /// Every `packages/ai/src/providers/*.models.ts` pi ships at the parity pin `f1b2e77f5`, from
+    /// `git -C tmp/pi ls-tree --name-only f1b2e77f5 packages/ai/src/providers/`. Hard-coded rather
     /// than shelled out for so the accounting is testable with no pi checkout — the checkout is
     /// `--roster`'s job, this is the decision's.
     ///
-    /// It was `v0.84.4`'s 39 stems until PROV-071. The tag moved with the audit because two of the
-    /// three UNPORTED entries — `meta` and `radius` — do not EXIST at v0.84.4, so an accounting
-    /// pinned there could not exercise the rows that made the live `--roster v0.87.1` run fail.
-    fn upstream_stems_at_v0_87_1() -> Vec<String> {
+    /// It was `v0.84.4`'s 39 stems until PROV-071 and `v0.87.1`'s 41 until PROV-080 / PROV-153
+    /// moved it to the pin: `typesafe` does not exist at v0.87.1, so once its classifier catalog
+    /// joined [`LIVE_CATALOGS`] an accounting pinned there reported it as a retired provider. The
+    /// pin differs from v0.87.1 in exactly two stems — `typesafe` added, and
+    /// `azure-openai-responses` renamed `azure` (pi 1.0.3). The rename is `PROV-145`'s, which is
+    /// decision-gated, so the pin's roster is NOT fully accounted for and the tests below say so
+    /// rather than substituting the name; see [`PROV_145_AZURE`].
+    fn upstream_stems_at_pin() -> Vec<String> {
         [
             "amazon-bedrock",
             "ant-ling",
             "anthropic",
-            "azure-openai-responses",
+            "azure",
             "baseten",
             "cerebras",
             "cloudflare-ai-gateway",
@@ -2023,6 +2070,7 @@ mod tests {
             "qwen-token-plan",
             "radius",
             "together",
+            "typesafe",
             "vercel-ai-gateway",
             "xai",
             "xiaomi-token-plan-ams",
@@ -2037,31 +2085,78 @@ mod tests {
         .collect()
     }
 
-    /// PROV-071's shortfall, stated as an assertion instead of prose: pi ships 41 provider modules
-    /// at `v0.87.1`, and every one is accounted for by exactly one of the three tables.
+    /// pi 1.0.3 renamed `azure-openai-responses` to `azure` (`providers/azure.ts` @f1b2e77f5);
+    /// cyrup still registers and live-fetches the old id because `PROV-145` — the rename plus
+    /// Foundry Chat Completions — is decision-gated and needs an owner decision first. Until it
+    /// lands, `gen-catalogs --roster f1b2e77f5` fails on this ONE stem, and the tests below pin
+    /// exactly that instead of hiding it.
+    const PROV_145_AZURE: &str = "azure";
+
+    /// The pin's stems with `azure` spelled the way cyrup still spells it — the accounting
+    /// PROV-145 would leave behind if its decision were "keep the id". A NAMED substitution for the
+    /// tests that exercise the rest of the roster, never a claim about upstream.
+    fn upstream_stems_at_pin_with_cyrups_azure_id() -> Vec<String> {
+        upstream_stems_at_pin()
+            .into_iter()
+            .map(|stem| {
+                if stem == PROV_145_AZURE {
+                    "azure-openai-responses".to_string()
+                } else {
+                    stem
+                }
+            })
+            .collect()
+    }
+
+    /// PROV-071's shortfall, stated as an assertion instead of prose — re-pinned to `f1b2e77f5` by
+    /// PROV-080 / PROV-153. pi ships 42 provider modules at the pin, and the accounting FAILS on
+    /// exactly one of them: `azure`, PROV-145's decision-gated rename. Asserted as the precise
+    /// failure, so the day PROV-145 lands this test goes red and has to be rewritten into the
+    /// all-green form below instead of the gap closing unnoticed.
     ///
-    /// The shape of the accounting is what changed. DRIFT-009 made it 33 embedded + 5 live + 1
-    /// unported. It is now **0 embedded + 38 live + 3 unported**: every provider module is
-    /// live-fetched, because `git show` can recover none of them at any revision, and the three
-    /// left over are the ones cyrup does not embed a catalog for at all — `together` (rows are Rust
-    /// literals), `meta` (no cyrup provider) and `radius` (rows come from its gateway).
-    ///
-    /// `meta` and `radius` are the substance here, not bookkeeping: before this change
-    /// `gen-catalogs --roster v0.87.1` FAILED with "pi ships 2 provider module(s) this generator
-    /// has never heard of". That is the audit doing its job, and it had been failing unnoticed
-    /// because nobody had run it at a tag newer than the ones both providers post-date.
+    /// History, kept because it is why the audit is trusted: `meta` and `radius` once made
+    /// `gen-catalogs --roster v0.87.1` fail with "pi ships 2 provider module(s) this generator has
+    /// never heard of"; and at HEAD before PROV-153 the same command at the pin failed on
+    /// `azure, typesafe`. `typesafe` is accounted for now (a classifier catalog); `azure` is not.
     #[test]
-    fn the_v0_87_1_provider_roster_is_fully_accounted_for() {
-        let stems = upstream_stems_at_v0_87_1();
-        assert_eq!(stems.len(), 41);
+    fn the_pin_roster_fails_only_on_prov_145s_azure() {
+        let stems = upstream_stems_at_pin();
+        assert_eq!(stems.len(), 42);
+        let err = account_for_roster(&stems).unwrap_err();
+        assert!(
+            err.contains("pi ships 1 provider module(s) this generator has never heard of: azure."),
+            "{err}"
+        );
+    }
+
+    /// Everything at the pin but PROV-145's rename IS accounted for: **0 embedded + 40 live + 2
+    /// unported**. `meta` (PROV-080) moved from `UNPORTED` to [`LIVE_CATALOGS`] when its provider
+    /// was ported; `typesafe` (PROV-153) is accounted for by its classifier catalog alone, because
+    /// it has no chat rows; `openai` is ONE module with two live catalogs (chat, and PROV-147's
+    /// classifiers), and counts once.
+    #[test]
+    fn the_pin_roster_is_otherwise_fully_accounted_for() {
+        let stems = upstream_stems_at_pin_with_cyrups_azure_id();
         let roster = account_for_roster(&stems).unwrap();
         assert_eq!(
             roster.embedded.len(),
             0,
             "no provider module is on the pinned path any more (PROV-071)"
         );
-        assert_eq!(roster.live.len(), 38);
+        assert_eq!(roster.live.len(), 40);
         assert!(roster.unported_absent.is_empty());
+        let typesafe = roster
+            .live
+            .iter()
+            .find(|l| l.provider() == "typesafe")
+            .expect("typesafe is accounted for");
+        assert_eq!(typesafe.file, "typesafe-classifiers");
+        let openai: Vec<&str> = LIVE_CATALOGS
+            .iter()
+            .filter(|l| l.provider() == "openai")
+            .map(|l| l.file)
+            .collect();
+        assert_eq!(openai, ["openai", "openai-classifiers"]);
 
         // Asserted as the whole unported set, in upstream stem order, with each one's owner: a
         // provider quietly moving in or out of this list is the failure the audit exists for.
@@ -2070,31 +2165,19 @@ mod tests {
             .iter()
             .map(|u| (u.stem, u.item))
             .collect();
-        assert_eq!(
-            unported,
-            [
-                ("meta", "PROV-080"),
-                ("radius", "PROV-014"),
-                ("together", "PROV-060"),
-            ]
-        );
+        assert_eq!(unported, [("radius", "PROV-014"), ("together", "PROV-060")]);
         assert!(
             roster
                 .unported_present
                 .iter()
                 .all(|u| !u.why.is_empty() && !u.item.is_empty())
         );
-        // Each absence has its OWN reason; collapsing them onto one would hide that `meta` is a
-        // missing provider while `radius` is a present provider with another catalog source.
+        // Each absence has its OWN reason.
         let reasons: Vec<&UnportedReason> =
             roster.unported_present.iter().map(|u| &u.reason).collect();
         assert_eq!(
             reasons,
-            [
-                &UnportedReason::NoProvider,
-                &UnportedReason::CatalogElsewhere,
-                &UnportedReason::HandPorted,
-            ]
+            [&UnportedReason::CatalogElsewhere, &UnportedReason::HandPorted]
         );
     }
 
@@ -2138,8 +2221,9 @@ mod tests {
         }
         assert_eq!(
             LIVE_CATALOGS.len(),
-            38,
-            "the four, plus xai (XAI_1), plus the 33 PROV-071 moved across"
+            41,
+            "the four, plus xai (XAI_1), plus the 33 PROV-071 moved across, plus meta (PROV-080) \
+             and the openai (PROV-147) and typesafe (PROV-153) classifier catalogs"
         );
         assert_eq!(
             LIVE_CATALOGS
@@ -2261,6 +2345,56 @@ mod tests {
         }
     }
 
+    /// PROV-147 / PROV-153 — a classifier catalog keeps exactly the `type: "classifier"` rows of the
+    /// `?types=` array, which ALSO carries the provider's chat rows (measured on
+    /// `openai?types=classifier`: 44 chat rows plus `gpt-6-luna`). Every refusal the chat path
+    /// makes still holds: no rows, a foreign provider tag, and now an untyped row and a non-array
+    /// body.
+    #[test]
+    fn a_classifier_catalog_keeps_only_the_classifier_rows() {
+        let spec = LIVE_CATALOGS
+            .iter()
+            .find(|l| l.file == "openai-classifiers")
+            .expect("PROV-147's spec");
+        let body = r#"[
+            {"type":"chat","id":"gpt-6-luna","provider":"openai","api":"openai-responses"},
+            {"type":"classifier","id":"gpt-6-luna","provider":"openai","api":"openai-decisions"},
+            {"type":"image","id":"img","provider":"openai","api":"x"}
+        ]"#;
+        let rows = live_catalog::rows_from_body(spec, body).expect("one classifier row");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].get("api").and_then(Val::as_str),
+            Some("openai-decisions")
+        );
+
+        let only_chat =
+            r#"[{"type":"chat","id":"gpt-5","provider":"openai","api":"openai-responses"}]"#;
+        let err = live_catalog::rows_from_body(spec, only_chat).unwrap_err();
+        assert!(err.contains("zero rows"), "{err}");
+
+        let foreign = r#"[{"type":"classifier","id":"j","provider":"typesafe","api":"t"}]"#;
+        let err = live_catalog::rows_from_body(spec, foreign).unwrap_err();
+        assert!(err.contains("expected \"openai\""), "{err}");
+
+        let untyped = r#"[{"id":"gpt-5","provider":"openai","api":"openai-responses"}]"#;
+        let err = live_catalog::rows_from_body(spec, untyped).unwrap_err();
+        assert!(err.contains("no string `type`"), "{err}");
+
+        let keyed = r#"{"gpt-6-luna":{"type":"classifier","id":"gpt-6-luna","provider":"openai"}}"#;
+        let err = live_catalog::rows_from_body(spec, keyed).unwrap_err();
+        assert!(err.contains("expected an array"), "{err}");
+
+        // The chat path is unchanged: an id-keyed object, every row kept.
+        let chat = LIVE_CATALOGS.iter().find(|l| l.file == "meta").unwrap();
+        let rows = live_catalog::rows_from_body(
+            chat,
+            r#"{"m":{"type":"chat","id":"m","provider":"meta","api":"openai-responses"}}"#,
+        )
+        .expect("chat rows");
+        assert_eq!(rows.len(), 1);
+    }
+
     /// PROV-131 — a `--only` typo must be FATAL. A narrowed run that selected nothing would print
     /// "wrote 0 of 1 files" and read as a clean no-op refresh, which is exactly the silent skip
     /// this generator's module docs forbid.
@@ -2288,7 +2422,7 @@ mod tests {
     /// for it. Silence here is how DRIFT-009 stayed four catalogs stale across nine sweeps.
     #[test]
     fn an_unaccounted_upstream_module_is_a_hard_error() {
-        let mut stems = upstream_stems_at_v0_87_1();
+        let mut stems = upstream_stems_at_pin_with_cyrups_azure_id();
         stems.push("brand-new-provider".to_string());
         let err = account_for_roster(&stems).unwrap_err();
         assert!(err.contains("brand-new-provider"), "{err}");
@@ -2298,7 +2432,7 @@ mod tests {
     /// The mirror failure: cyrup keeps embedding a catalog upstream has retired.
     #[test]
     fn an_embedded_catalog_pi_no_longer_ships_is_a_hard_error() {
-        let stems: Vec<String> = upstream_stems_at_v0_87_1()
+        let stems: Vec<String> = upstream_stems_at_pin_with_cyrups_azure_id()
             .into_iter()
             .filter(|s| s != "zai")
             .collect();
@@ -2317,13 +2451,22 @@ mod tests {
     /// somebody remembered to run `--roster`.
     #[test]
     fn every_upstream_stem_is_in_exactly_one_roster_table() {
-        for stem in upstream_stems_at_v0_87_1() {
-            let n = usize::from(
+        let tables = |stem: &str| {
+            usize::from(
                 CATALOGS
                     .iter()
                     .any(|c| c.images_provider.is_none() && c.file == stem),
-            ) + usize::from(LIVE_CATALOGS.iter().any(|l| l.file == stem))
-                + usize::from(UNPORTED.iter().any(|u| u.stem == stem));
+            ) + usize::from(LIVE_CATALOGS.iter().any(|l| l.provider() == stem))
+                + usize::from(UNPORTED.iter().any(|u| u.stem == stem))
+        };
+        for stem in upstream_stems_at_pin() {
+            let n = tables(&stem);
+            if stem == PROV_145_AZURE {
+                // In NO table until PROV-145 decides the rename; asserted, so the skip cannot
+                // outlive the gap it names.
+                assert_eq!(n, 0, "PROV-145 landed: drop this branch and its constant");
+                continue;
+            }
             assert_eq!(
                 n, 1,
                 "{stem} is in {n} roster tables; every upstream module must be in exactly one"
@@ -2342,7 +2485,7 @@ mod tests {
                 u.stem
             );
             assert!(
-                !LIVE_CATALOGS.iter().any(|l| l.file == u.stem),
+                !LIVE_CATALOGS.iter().any(|l| l.provider() == u.stem),
                 "{} is in both LIVE_CATALOGS and UNPORTED",
                 u.stem
             );
@@ -2351,7 +2494,7 @@ mod tests {
             assert!(
                 !CATALOGS
                     .iter()
-                    .any(|c| c.images_provider.is_none() && c.file == l.file),
+                    .any(|c| c.images_provider.is_none() && c.file == l.provider()),
                 "{} is in both CATALOGS and LIVE_CATALOGS",
                 l.file
             );

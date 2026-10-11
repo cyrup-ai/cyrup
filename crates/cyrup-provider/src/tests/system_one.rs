@@ -655,14 +655,56 @@ async fn the_workers_ai_provider_classifies_with_the_account_id_resolved() {
     assert_eq!(request.header("authorization"), Some("Bearer cf-key"));
 }
 
+/// PROV-110 corner (1) on the System One wire. pi posts `JSON.stringify({model, state, questions})`
+/// built from JS objects, so the state's integer-like keys reach the server hoisted ahead of the
+/// others, ascending, at every depth (`OrdinaryOwnPropertyKeys`); a decision model is shown the
+/// state in that order. The fake records the body as parsed with `preserve_order`, so the order
+/// asserted here is the wire's. Red at the base, where the body was the state's insertion order.
+#[tokio::test]
+async fn the_state_reaches_the_wire_in_js_key_order() {
+    let server = FakeServer::start().await;
+    let mut ctx = context();
+    ctx.state = serde_json::from_str(r#"{"b":1,"10":2,"2":{"y":0,"1":0},"a":3}"#).unwrap();
+    let result = typesafe_system_one_api()
+        .classify(&model(TYPESAFE, &server.base_url), &ctx, &keyed())
+        .await;
+    assert_eq!(result.stop_reason, ClassifierStopReason::Stop, "{result:?}");
+    let body = &server.requests_to("/v1/systemone")[0].body;
+    let keys = |value: &Value| -> Vec<String> {
+        value.as_object().unwrap().keys().cloned().collect()
+    };
+    assert_eq!(keys(&body["state"]), ["2", "10", "b", "a"]);
+    assert_eq!(keys(&body["state"]["2"]), ["1", "y"]);
+}
+
+/// PROV-110 corner (2) on the System One wire. The body is pi's `JSON.stringify(payload)`, so a
+/// number is spelled as JS spells it and an integer past 2^53 is the nearest double — the value
+/// pi's server receives, and the value the llama.cpp prompt and the Decisions `input` already
+/// carried for the same state. Asserted on the raw bytes, which a parsed `Value` cannot show. Red
+/// at the base, which sent serde's text (`9007199254740993`, `1.0`, `1e21`).
+#[tokio::test]
+async fn the_system_one_body_spells_numbers_as_json_stringify_does() {
+    let server = FakeServer::start().await;
+    let mut ctx = context();
+    ctx.state = serde_json::from_str(r#"{"id":9007199254740993,"f":1.0,"e":1e21,"s":0.000001}"#)
+        .unwrap();
+    typesafe_system_one_api()
+        .classify(&model(TYPESAFE, &server.base_url), &ctx, &keyed())
+        .await;
+    let raw = &server.requests_to("/v1/systemone")[0].raw_body;
+    assert!(
+        raw.contains(r#""state":{"id":9007199254740992,"f":1,"e":1e+21,"s":0.000001}"#),
+        "{raw}"
+    );
+}
+
 /// Every known classifier api names its own implementation, and each is the api it says it is.
 #[tokio::test]
 async fn every_known_classifier_api_has_its_implementation() {
     let server = FakeServer::start().await;
-    for api in [
-        KnownClassifierApi::TypesafeSystemOne,
-        KnownClassifierApi::CloudflareWorkersAiSystemOne,
-    ] {
+    // All four since PROV-147 added `openai-decisions` (and llama.cpp's api, which this used to
+    // leave out, refuses a foreign api the same way).
+    for api in KnownClassifierApi::ALL {
         // A model of a DIFFERENT api is refused by name, which identifies the implementation.
         let other = if api == KnownClassifierApi::TypesafeSystemOne {
             CLOUDFLARE

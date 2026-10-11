@@ -57,6 +57,15 @@
 //! NO embedded catalog by design — `radius`, the three `qwen-token-plan*` members and `baseten` —
 //! and `catalog_data.rs`'s `DYNAMIC_ONLY_PROVIDERS` pins that set in both directions.
 //!
+//! **PROV-080 / PROV-153, 2026-10-11 — the pin moved past this table.** It is v0.84.4's listing.
+//! At the parity pin `f1b2e77f5` `builtinProviders()` is FORTY-TWO entries (`all.ts:137-180`): the
+//! forty above plus `meta` (`:154`, added v0.86.1) and `typesafe` (`:171`), and `azure` in place
+//! of `azure-openai-responses` (pi 1.0.3's rename, `PROV-145`, decision-gated). `meta` is a
+//! [`super::fleet`] member on `openai-responses` with the Muse-subscription OAuth beside its key
+//! ([`crate::auth::oauth::meta`]); `typesafe` is [`super::typesafe`], the one built-in with no chat
+//! model, whose catalog is classifier rows only. `all_of_pis_builtins_at_the_pin_are_registered`
+//! below asserts the whole set at the pin.
+//!
 //! **DRIFT-009, 2026-09-05.** `baseten` (`all.ts:95` @v0.84.4, added upstream at `c1019d920`) was
 //! the last unregistered built-in and the fourth of that item's four missing catalogs. It joins the
 //! Qwen plans as a [`super::fleet`] member with a [`super::fleet::FleetCatalog::Dynamic`] catalog —
@@ -115,7 +124,7 @@ use crate::providers::{
     fireworks_provider_with, github_copilot_provider_with, google_provider_with,
     google_vertex_provider_with, mistral_provider_with, openai_codex_provider_with,
     openai_provider_with, opencode_go_provider_with, opencode_provider_with,
-    together_provider_with,
+    together_provider_with, typesafe_provider_with,
 };
 use crate::remote_catalog::CatalogOverlay;
 use crate::utils::http_date::parse_iso8601_utc_ms;
@@ -347,7 +356,14 @@ fn builtin_providers_with(
     )));
 
     // together (Pi `all.ts:98`).
-    providers.push(Arc::new(together_provider_with(store, registry)));
+    providers.push(Arc::new(together_provider_with(
+        store.clone(),
+        registry.clone(),
+    )));
+
+    // typesafe (Pi `all.ts:171` @f1b2e77f5) — PROV-153. Classifier rows only: it lists no chat
+    // model and serves only `classify`.
+    providers.push(Arc::new(typesafe_provider_with(store, registry)));
 
     providers
 }
@@ -457,6 +473,9 @@ mod tests {
             "radius",
             // DRIFT-009 (2026-09-05): the last unregistered built-in, `all.ts:95` @v0.84.4.
             "baseten",
+            // PROV-080 / PROV-153 (2026-10-11): the two built-ins the pin f1b2e77f5 added.
+            "meta",
+            "typesafe",
         ] {
             assert!(
                 ids.iter().any(|id| id == expected),
@@ -487,29 +506,35 @@ mod tests {
     /// This is the lesson DRIFT-009 was filed for, applied to registrations instead of catalogs:
     /// the previous guard was a hand-kept NOT-YET array plus a prose table, and both went stale
     /// (`PROV-062` deleted the array while three providers were missing; the header claimed 39 of
-    /// 40 while it listed one). Forty ids, transcribed from `providers/all.ts:91-130` @v0.84.4 in
-    /// upstream's own order.
+    /// 40 while it listed one).
+    ///
+    /// **Re-pinned to f1b2e77f5 by PROV-080 / PROV-153.** It was v0.84.4's forty ids, and it could
+    /// not see a provider pi added later — `meta` (v0.86.1) and `typesafe` (f1b2e77f5) were in
+    /// neither list and the comparison stayed green while both were unported. Registering them made
+    /// it red ("an id only cyrup has is an invention") against the stale pin, which is the guard
+    /// working; the fix is to move the pin, not to exempt the ids. Forty-two ids, transcribed from
+    /// `providers/all.ts:137-180` @f1b2e77f5 in upstream's own order.
+    ///
+    /// **One known difference, named rather than hidden:** pi 1.0.3 renamed
+    /// `azure-openai-responses` to `azure` (`providers/azure.ts`). `PROV-145` owns that rename and
+    /// it is decision-gated, so cyrup still registers the old id; the comparison substitutes it
+    /// explicitly below, and the day PROV-145 lands the substitution has to go.
     ///
     /// **What this guard does and does not reach.** `PI_BUILTINS` is a hand transcription of the
-    /// PINNED parity target, not a live read of upstream, so it catches exactly two things: a
-    /// provider cyrup DROPS relative to v0.84.4, and a provider cyrup INVENTS that v0.84.4 does not
-    /// ship (the direction the old prose table could not see at all). It CANNOT see a provider pi
-    /// adds after v0.84.4 — such an id is in neither list and the comparison stays green — so it is
-    /// exactly as hand-kept as the array it sits beside, and it must be refreshed when ADR-0006
-    /// moves the parity target. `xtask gen-catalogs --roster <rev>` is the check that reads
-    /// upstream live; this one pins the registry against the target that check names.
+    /// PINNED parity target, not a live read of upstream, so it catches a provider cyrup DROPS
+    /// relative to the pin and one cyrup INVENTS that the pin does not ship. It CANNOT see a
+    /// provider pi adds after the pin; `xtask gen-catalogs --roster <rev>` is the check that reads
+    /// upstream live.
     ///
     /// It composes with `NOT_YET` rather than contradicting it: a parked id is subtracted from the
-    /// expected set here and asserted absent there, so parking a half-ported provider keeps both
-    /// guards green while it is parked and fails both the moment it is registered without leaving
-    /// the array (or leaves the array without being registered).
+    /// expected set here and asserted absent there.
     #[test]
-    fn all_of_pis_v0_84_4_builtins_are_registered() {
+    fn all_of_pis_builtins_at_the_pin_are_registered() {
         const PI_BUILTINS: &[&str] = &[
             "amazon-bedrock",
             "ant-ling",
             "anthropic",
-            "azure-openai-responses",
+            "azure",
             "baseten",
             "cerebras",
             "cloudflare-ai-gateway",
@@ -522,6 +547,7 @@ mod tests {
             "groq",
             "huggingface",
             "kimi-coding",
+            "meta",
             "minimax",
             "minimax-cn",
             "mistral",
@@ -538,6 +564,7 @@ mod tests {
             "qwen-token-plan-individual",
             "radius",
             "together",
+            "typesafe",
             "vercel-ai-gateway",
             "xai",
             "xiaomi",
@@ -549,9 +576,11 @@ mod tests {
         ];
         assert_eq!(
             PI_BUILTINS.len(),
-            40,
-            "all.ts:91-130 @v0.84.4 is 40 entries"
+            42,
+            "all.ts:137-180 @f1b2e77f5 is 42 entries"
         );
+        /// PROV-145: pi's `azure`, still registered under its pre-1.0.3 id.
+        const PROV_145: (&str, &str) = ("azure", "azure-openai-responses");
 
         let mut registered: Vec<String> = all_providers()
             .iter()
@@ -564,17 +593,74 @@ mod tests {
         let mut expected: Vec<String> = PI_BUILTINS
             .iter()
             .filter(|id| !NOT_YET.contains(*id))
-            .map(|s| (*s).to_string())
+            .map(|id| {
+                if *id == PROV_145.0 {
+                    PROV_145.1.to_string()
+                } else {
+                    (*id).to_string()
+                }
+            })
             .collect();
         expected.sort();
         assert_eq!(
             registered, expected,
-            "the registry and pi's builtinProviders() @v0.84.4 (minus anything parked in NOT_YET) \
-             must name the same set — an id only pi has is an unported provider that belongs in \
-             NOT_YET, an id only cyrup has is an invention. This list is pinned to v0.84.4: it \
-             cannot see a provider pi adds later, and must be re-transcribed when the parity \
-             target moves."
+            "the registry and pi's builtinProviders() @f1b2e77f5 (minus anything parked in \
+             NOT_YET, with PROV-145's azure rename substituted) must name the same set — an id \
+             only pi has is an unported provider that belongs in NOT_YET, an id only cyrup has is \
+             an invention. This list is pinned to f1b2e77f5: it cannot see a provider pi adds \
+             later, and must be re-transcribed when the parity target moves."
         );
+    }
+
+    /// PROV-080 / PROV-153 — the two providers this pin added are registered with the auth pi
+    /// gives them: `meta` with BOTH strategies (`envApiKeyAuth` + the Muse-subscription
+    /// `lazyOAuth`, `providers/meta.ts:12-20`), and `typesafe` with an api key only
+    /// (`providers/typesafe.ts:10-12`), classifier rows and no chat model.
+    #[test]
+    fn meta_and_typesafe_register_with_upstreams_auth() {
+        let providers = all_providers();
+        let find = |id: &str| {
+            providers
+                .iter()
+                .find(|p| p.id().as_str() == id)
+                .unwrap_or_else(|| panic!("{id} registered"))
+        };
+
+        let meta = find("meta");
+        assert_eq!(meta.name(), "Meta");
+        assert_eq!(meta.base_url(), Some("https://api.meta.ai/v1"));
+        let auth = meta.provider_auth().expect("auth clause");
+        assert_eq!(
+            auth.api_key.as_ref().expect("api key strategy").name(),
+            "Meta Model API key"
+        );
+        let oauth = auth.oauth.as_ref().expect("oauth strategy");
+        assert_eq!(oauth.name(), "Meta (Muse subscription)");
+        assert!(oauth.is_subscription());
+        assert!(!meta.models().is_empty());
+        assert!(
+            meta.models()
+                .iter()
+                .all(|m| m.api.as_str() == crate::known_api::OPENAI_RESPONSES)
+        );
+
+        let typesafe = find("typesafe");
+        assert_eq!(typesafe.name(), "TypeSafe");
+        assert_eq!(typesafe.base_url(), None, "typesafe.ts passes no baseUrl");
+        let auth = typesafe.provider_auth().expect("auth clause");
+        assert_eq!(
+            auth.api_key.as_ref().expect("api key strategy").name(),
+            "TypeSafe API key"
+        );
+        assert!(auth.oauth.is_none());
+        assert!(typesafe.models().is_empty(), "no chat model");
+        assert!(typesafe.supports_classification());
+        let ids: Vec<String> = typesafe
+            .get_all_models()
+            .iter()
+            .map(|m| format!("{}:{}", m.model_type(), m.id()))
+            .collect();
+        assert_eq!(ids, ["classifier:jev-latest"]);
     }
 
     /// PROV-128 — the built-in `openrouter` provider is where image models live now, reached

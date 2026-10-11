@@ -103,10 +103,11 @@ pub enum FleetCatalog {
 /// it survives every future xAI release unchanged.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FleetWire {
-    /// `openai-completions` — eighteen of the twenty members, including all four
+    /// `openai-completions` — eighteen of the twenty-one members, including all four
     /// [`FleetCatalog::Dynamic`] ones, whose overlay rows are `openai-completions` upstream.
     Completions,
-    /// `openai-responses` — `xai` alone (`ai/scripts/generate-models.ts:1877` @v0.85.1).
+    /// `openai-responses` — `xai` (`ai/scripts/generate-models.ts:1877` @v0.85.1) and `meta`
+    /// (PROV-080, `providers/meta.ts:22` @f1b2e77f5).
     Responses,
     /// `anthropic-messages` **and** `openai-completions` — `openrouter` alone.
     ///
@@ -210,6 +211,14 @@ fleet! {
     "deepseek"              => (DEEPSEEK, "DeepSeek", "DEEPSEEK_API_KEY", "DeepSeek API key", Completions, "deepseek"),
     "groq"                  => (GROQ, "Groq", "GROQ_API_KEY", "Groq API key", Completions, "groq"),
     "huggingface"           => (HUGGINGFACE, "Hugging Face", "HF_TOKEN", "Hugging Face token", Completions, "huggingface"),
+    // PROV-080 — `providers/meta.ts` @f1b2e77f5 (added v0.86.1, registered `all.ts:154` between
+    // `kimiCodingProvider()` and `minimaxProvider()`): `openai-responses` at
+    // `https://api.meta.ai/v1`, which `createProvider({ baseUrl })` passes explicitly (`:11`) and
+    // so is kept as the provider's `baseUrl`; `envApiKeyAuth("Meta Model API key",
+    // ["META_API_KEY"])` (`:13`) beside the Muse-subscription `lazyOAuth`
+    // (`builtin_oauth::builtin_provider_oauth`). Rows from `generate-models.ts:2013-2033` via the
+    // live catalog.
+    "meta"                  => (META, "Meta", "META_API_KEY", "Meta Model API key", Responses, embedded("meta", "https://api.meta.ai/v1")),
     "moonshotai"            => (MOONSHOTAI, "Moonshot AI", "MOONSHOT_API_KEY", "Moonshot AI API key", Completions, "moonshotai"),
     "moonshotai-cn"         => (MOONSHOTAI_CN, "Moonshot AI CN", "MOONSHOT_API_KEY", "Moonshot AI API key", Completions, "moonshotai-cn"),
     "nvidia"                => (NVIDIA, "NVIDIA", "NVIDIA_API_KEY", "NVIDIA API key", Completions, "nvidia"),
@@ -264,8 +273,9 @@ impl FleetSpec {
     }
 
     /// The provider's [`ProviderAuth`]: an API key from its env var (Pi `envApiKeyAuth`), plus the
-    /// `lazyOAuth` clause for the two fleet members that have one — `xai`
-    /// (`providers/xai.ts:15-20`) and `openrouter` (`providers/openrouter.ts:14-18`). See
+    /// `lazyOAuth` clause for the three fleet members that have one — `xai`
+    /// (`providers/xai.ts:15-20`), `openrouter` (`providers/openrouter.ts:14-18`) and `meta`
+    /// (`providers/meta.ts:14-19` @f1b2e77f5, PROV-080). See
     /// [`super::builtin_oauth::builtin_provider_oauth`].
     pub fn auth(&self) -> ProviderAuth {
         ProviderAuth {
@@ -364,6 +374,8 @@ mod tests {
         ("deepseek", 2),
         ("groq", 7),
         ("huggingface", 76),
+        // PROV-080 — `gen-catalogs --only meta`, 2026-10-11 (pi.dev `last-modified` 2026-10-09).
+        ("meta", 5),
         ("moonshotai", 4),
         ("moonshotai-cn", 4),
         ("nvidia", 19),
@@ -475,20 +487,22 @@ mod tests {
             );
         }
 
-        // The declaration is checkable in BOTH directions: exactly one member is on Responses
-        // today, and it is xai. A second one arriving without a ledger entry is the signal that this
+        // The declaration is checkable in BOTH directions: exactly two members are on Responses
+        // today — xai, and meta since PROV-080 (`providers/meta.ts:22`, `api: openAIResponsesApi()`
+        // @f1b2e77f5). A third one arriving without a ledger entry is the signal that this
         // module's framing needs revisiting again.
         let responses: Vec<&str> = FLEET
             .iter()
             .filter(|s| s.wire == FleetWire::Responses)
             .map(|s| s.id)
             .collect();
-        assert_eq!(responses, ["xai"]);
+        assert_eq!(responses, ["meta", "xai"]);
     }
 
     #[test]
-    fn fleet_has_twenty_providers() {
-        assert_eq!(FLEET.len(), 20);
+    fn fleet_has_twenty_one_providers() {
+        // Twenty-one since PROV-080 added `meta`.
+        assert_eq!(FLEET.len(), 21);
         // Every fleet provider has an env-key mapping in env-api-keys.
         for spec in FLEET {
             let vars = crate::env_api_keys::api_key_env_vars(spec.id)
@@ -591,9 +605,13 @@ mod tests {
             dynamic.is_empty(),
             "DRIFT-009 embedded the last four; {dynamic:?} is still Dynamic"
         );
-        // The four DRIFT-009 members are the ONLY embedded members carrying a provider-level
-        // `baseUrl`: upstream passes one to `createProvider` for exactly these four, and every other
-        // member's rows carry their own.
+        // The members carrying a provider-level `baseUrl`: the four DRIFT-009 members, and `meta`
+        // (PROV-080), whose `createProvider` passes `baseUrl: "https://api.meta.ai/v1"`
+        // (`providers/meta.ts:11` @f1b2e77f5). Every other member's rows carry their own.
+        //
+        // NOT the whole upstream set at the pin: `xai.ts`, `groq.ts`, `cerebras.ts`, `deepseek.ts`,
+        // `huggingface.ts`, `openrouter.ts` and `zai.ts` (sampled) also pass one at f1b2e77f5, and
+        // these members still carry `None` — PROV-154, filed by PROV-080, not widened here.
         let with_base_url: Vec<&str> = FLEET
             .iter()
             .filter(|s| s.base_url.is_some())
@@ -603,6 +621,7 @@ mod tests {
             with_base_url,
             [
                 "baseten",
+                "meta",
                 "qwen-token-plan",
                 "qwen-token-plan-cn",
                 "qwen-token-plan-individual"

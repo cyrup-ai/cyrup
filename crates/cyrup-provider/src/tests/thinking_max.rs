@@ -227,15 +227,19 @@ fn token_budget_providers_clamp_max_to_high() {
 
 /// Every embedded catalog is `include_str!` + `serde_json::from_str(...).unwrap_or_default()`, so a
 /// malformed edit yields an EMPTY provider instead of an error. Nothing asserted that before; this
-/// makes a bad catalog edit fail loudly. The providers that ship no embedded catalog BY DESIGN
-/// (`catalog_data::DYNAMIC_ONLY_PROVIDERS`, PROV-014) are skipped here and pinned in both
+/// makes a bad catalog edit fail loudly. The providers that ship no embedded CHAT catalog BY
+/// DESIGN — `catalog_data::DYNAMIC_ONLY_PROVIDERS` (PROV-014) and the classifier-only
+/// `catalog_data::CLASSIFIER_ONLY_PROVIDERS` (PROV-153) — are skipped here and pinned in both
 /// directions by `catalog_data::every_registered_provider_has_a_non_empty_catalog`.
 #[test]
 fn every_embedded_catalog_parses_non_empty() {
     let providers = crate::all_providers();
     assert!(providers.len() >= 31, "got {} providers", providers.len());
     for p in providers {
-        if super::catalog_data::DYNAMIC_ONLY_PROVIDERS.contains(&p.id().as_str()) {
+        let id = p.id().as_str();
+        if super::catalog_data::DYNAMIC_ONLY_PROVIDERS.contains(&id)
+            || super::catalog_data::CLASSIFIER_ONLY_PROVIDERS.contains(&id)
+        {
             continue;
         }
         assert!(

@@ -52,6 +52,11 @@ pub struct WireProvider {
     /// Pi `createProvider({ filterModels })` — the option `models.ts:545`/`:618` transports onto
     /// the constructed provider, applied by `Models.getAvailable()` at `:407`. PROV-032.
     filter_models: Option<FilterModelsFn>,
+    /// Pi `createProvider({ filterAllModels })` (`CreateProviderOptions.filterAllModels`,
+    /// `models.ts:1016-1020`, carried onto the provider at `:1122` @f1b2e77f5), applied by
+    /// `Models.getAllAvailable()` (`:730`) in place of the chat-only default. PROV-147: the
+    /// `openai` provider installs one so an OAuth credential does not list its Decisions rows.
+    filter_all_models: Option<FilterAllModelsFn>,
     /// The provider's `type: "image"` catalog rows (pi's ONE `models` array holds every type;
     /// `CreateProviderOptions.models: readonly ProviderModel<TApi>[]`, `models.ts:997`). Held
     /// apart from [`WireProvider::models`] rather than in one `Vec<AnyModel>` so that
@@ -86,6 +91,12 @@ pub struct WireProvider {
 /// stateless pure function of `(models, credential)`.
 pub type FilterModelsFn = fn(&[Model], Option<&crate::auth::Credential>) -> Vec<Model>;
 
+/// A provider's credential-scoped availability policy across every model type (Pi
+/// `Provider.filterAllModels?`, `models.ts:196-206` @f1b2e77f5). A plain fn pointer for the reason
+/// [`FilterModelsFn`] is one. PROV-147.
+pub type FilterAllModelsFn =
+    fn(&[AnyModel], Option<&crate::auth::Credential>) -> Vec<AnyModel>;
+
 impl WireProvider {
     /// Construct a provider. `auth_ctx` defaults to the real-env [`EnvAuthContext`] via
     /// [`WireProvider::new`]; use [`WireProvider::with_auth_context`] to inject a test context.
@@ -108,6 +119,7 @@ impl WireProvider {
             base_url: None,
             headers: None,
             filter_models: None,
+            filter_all_models: None,
             image_models: Vec::new(),
             images: None,
             classifier_models: Vec::new(),
@@ -135,6 +147,17 @@ impl WireProvider {
     #[must_use]
     pub fn with_filter_models(mut self, filter: FilterModelsFn) -> Self {
         self.filter_models = Some(filter);
+        self
+    }
+
+    /// Install the credential-scoped availability policy across every model type (Pi
+    /// `createProvider({ filterAllModels })`) — PROV-147. Applied only by
+    /// `Models::get_all_available` / `get_available_of_type`, where it REPLACES the default
+    /// (`filter_models` over the chat rows, every other row kept), as pi's
+    /// `if (provider.filterAllModels) return provider.filterAllModels(models, credential)` does.
+    #[must_use]
+    pub fn with_filter_all_models(mut self, filter: FilterAllModelsFn) -> Self {
+        self.filter_all_models = Some(filter);
         self
     }
 
@@ -186,6 +209,12 @@ impl WireProvider {
     /// can do. Whether the operations exist at all is `base`'s answer too
     /// ([`Provider::supports_image_generation`], [`Provider::supports_classification`]), as pi
     /// attaches the members only `if (base?.generateImages)` / `if (base?.classify)`.
+    ///
+    /// The same composition carries `base`'s availability filters through: `filterModels:
+    /// base?.filterModels ? (models, credential) => base.filterModels!(models, credential) :
+    /// undefined` and the same for `filterAllModels` (`provider-composer.ts:636-641` @f1b2e77f5),
+    /// so [`Provider::filter_models`] and [`Provider::filter_all_models`] answer with `base`'s
+    /// (PROV-147; `CFG-112` for the chat filter, which the composer dropped before).
     #[must_use]
     pub fn with_operations_from(mut self, base: Arc<dyn Provider>) -> Self {
         self.operations_base = Some(base);
@@ -324,10 +353,28 @@ impl Provider for WireProvider {
         models: &[Model],
         credential: Option<&crate::auth::Credential>,
     ) -> Vec<Model> {
+        // A composed provider filters with its base's policy (provider-composer.ts:636-638).
+        if let Some(base) = &self.operations_base {
+            return base.filter_models(models, credential);
+        }
         match self.filter_models {
             Some(f) => f(models, credential),
             None => models.to_vec(),
         }
+    }
+
+    /// Pi `provider.filterAllModels` (`models.ts:202`, applied at `:730` @f1b2e77f5): `None` is the
+    /// member being absent. A composed provider answers with its base's (provider-composer.ts:
+    /// 639-641). PROV-147.
+    fn filter_all_models(
+        &self,
+        models: &[AnyModel],
+        credential: Option<&crate::auth::Credential>,
+    ) -> Option<Vec<AnyModel>> {
+        if let Some(base) = &self.operations_base {
+            return base.filter_all_models(models, credential);
+        }
+        self.filter_all_models.map(|f| f(models, credential))
     }
 
     fn provider_auth(&self) -> Option<&ProviderAuth> {
