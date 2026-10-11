@@ -865,12 +865,16 @@ impl AgentSessionRuntime {
         // the setting itself), so the names the reloaded setting newly adds are activated on it
         // before `session_start{reload}`, as pi's `_buildRuntime` does with `addedDefaultTools`.
         let previous_default_tools = current.reload_default_tools();
+        // SEAM-159 — and pi's `getActiveToolNames()` (`:3682-3684`), the live set: a tool switched
+        // on or off since the last run is not in the transcript the rebuild resumes.
+        let live_active_tools = current.active_tool_names();
         drop(current);
         let next = self
             .factory
             .build_for_reload(target, Some(cwd))
             .await?
             .into_shared();
+        next.restore_live_tools(&live_active_tools).await;
         next.activate_added_default_tools(&previous_default_tools)
             .await;
         self.install_inner(next, "reload", previous, before_start)
