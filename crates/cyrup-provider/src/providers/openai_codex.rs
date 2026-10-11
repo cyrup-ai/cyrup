@@ -62,10 +62,11 @@ use cyrup_core::ProviderId;
 use serde_json::{Map, Value};
 use std::sync::Arc;
 
-/// The provider id (pi `openai-codex.ts:10`).
+/// The provider id (pi `openai-codex.ts:9` @f1b2e77f5).
 pub const OPENAI_CODEX_PROVIDER_ID: &str = "openai-codex";
 
-/// The ChatGPT backend base URL (pi `openai-codex.ts:12`).
+/// The ChatGPT backend base URL, and pi's provider-level `createProvider({ baseUrl })`
+/// (`providers/openai-codex.ts:11` @f1b2e77f5, PROV-154).
 pub const OPENAI_CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api";
 
 /// The wire-protocol id every catalog row declares (pi `Provider<"openai-codex-responses">`,
@@ -163,6 +164,7 @@ pub fn openai_codex_provider_with(
         store,
         registry,
     )
+    .with_base_url(OPENAI_CODEX_BASE_URL)
 }
 
 /// Convenience constructor: an in-memory credential store + the built-in api registry.

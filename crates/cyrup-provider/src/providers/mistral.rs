@@ -13,6 +13,8 @@ use crate::wire::WireProvider;
 use std::sync::Arc;
 
 /// Mistral's API base URL (the chat-completions path is appended by the wire impl).
+/// Also pi's provider-level `createProvider({ baseUrl })` (`providers/mistral.ts:10` @f1b2e77f5,
+/// PROV-154).
 pub const MISTRAL_BASE_URL: &str = "https://api.mistral.ai";
 
 /// The provider id.
@@ -46,6 +48,7 @@ pub fn mistral_provider_with(
         store,
         registry,
     )
+    .with_base_url(MISTRAL_BASE_URL)
 }
 
 /// Convenience constructor: an in-memory credential store + the built-in api registry.

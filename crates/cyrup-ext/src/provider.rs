@@ -275,12 +275,17 @@ impl ProviderRegistration {
         } else {
             self.config.name.clone()
         };
-        cyrup_provider::ConfigProvider::new(
+        let provider = cyrup_provider::ConfigProvider::new(
             self.id.clone(),
             name,
             self.resolved_api_key.clone(),
             self.build_models(),
-        )
+        );
+        // Pi `baseUrl: extension?.baseUrl ?? …` (provider-composer.ts:608 @f1b2e77f5; PROV-154).
+        match &self.config.base_url {
+            Some(base_url) => provider.with_base_url(base_url.clone()),
+            None => provider,
+        }
         .into_arc()
     }
 

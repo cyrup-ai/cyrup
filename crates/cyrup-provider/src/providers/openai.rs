@@ -9,7 +9,8 @@ use crate::model::Model;
 use crate::wire::WireProvider;
 use std::sync::Arc;
 
-/// OpenAI's API base URL (the `/responses` path is appended by the wire impl).
+/// OpenAI's API base URL (the `/responses` path is appended by the wire impl), and pi's
+/// provider-level `createProvider({ baseUrl })` (`providers/openai.ts:13` @f1b2e77f5, PROV-154).
 pub const OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
 
 /// The provider id.
@@ -107,6 +108,7 @@ pub fn openai_provider_with(
         store,
         registry,
     )
+    .with_base_url(OPENAI_BASE_URL)
     .with_classifier_models(openai_classifier_models())
     .with_classifiers(Arc::new(openai_classifiers_registry()))
     .with_filter_all_models(filter_openai_all_models)

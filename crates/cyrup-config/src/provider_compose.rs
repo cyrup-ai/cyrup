@@ -25,9 +25,10 @@
 //! cyrup's analog of `getApiProvider(model.api)` is [`WireProvider`], which holds a catalog + a
 //! [`ProviderAuth`] and dispatches each request through the shared [`ApiRegistry`] keyed on
 //! `model.api`. Every built-in text provider in `cyrup-provider`'s `providers/all.rs` **is** a
-//! `WireProvider` (they differ only in id/name/catalog/auth), so building the composed provider the
-//! same way reproduces the built-in's behavior exactly when there is nothing to compose, and adds
-//! the overlay when there is.
+//! `WireProvider` (they differ only in id/name/baseUrl/catalog/auth), so building the composed
+//! provider the same way — carrying the base's name and baseUrl unless the block sets its own
+//! (provider-composer.ts:607-608, CFG-113) — reproduces the built-in's behavior exactly when there
+//! is nothing to compose, and adds the overlay when there is.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -44,7 +45,7 @@ use cyrup_provider::{
 use crate::config_value::{
     config_value_env_var_names, resolve_config_value_or_throw_async, resolve_headers_or_throw,
 };
-use crate::model::{ModelFile, ProviderConfig, apply_models_json, provider_base_url};
+use crate::model::{ModelFile, ProviderConfig, apply_models_json, model_base_url_override};
 
 /// Pi `configContextEnv` (provider-composer.ts:279-291): resolve, **through the injected auth
 /// context** rather than the ambient process env, every environment variable named by a
@@ -441,7 +442,7 @@ impl ModelFile {
                     continue;
                 }
             };
-            if let Some(base_url) = provider_base_url(config) {
+            if let Some(base_url) = model_base_url_override(config) {
                 for model in &mut base_images {
                     model.base_url = base_url.to_string();
                 }
@@ -456,7 +457,22 @@ impl ModelFile {
                     continue;
                 }
             };
-            let name = config.name.clone().unwrap_or_else(|| provider_id.clone());
+            // Pi `name: extension?.name ?? config?.name ?? base?.name ?? extension?.oauth?.name ??
+            // providerId` and `baseUrl: extension?.baseUrl ?? config?.baseUrl ?? base?.baseUrl`
+            // (provider-composer.ts:607-608 @f1b2e77f5). No extension layer composes here (a guest
+            // registration is its own provider). The URL is the block's `baseUrl` even under
+            // `oauth` — deliberately NOT `model_base_url_override`, which drops it for the ROWS
+            // (:326, the block's URL is then the auth gateway); the provider's own `baseUrl` takes
+            // it either way. CFG-113.
+            let name = config
+                .name
+                .clone()
+                .or_else(|| base.as_ref().map(|b| b.name().to_string()))
+                .unwrap_or_else(|| provider_id.clone());
+            let base_url = config
+                .base_url
+                .clone()
+                .or_else(|| base.as_ref().and_then(|b| b.base_url().map(str::to_string)));
             let mut provider = WireProvider::new(
                 provider_id.as_str(),
                 name,
@@ -467,6 +483,9 @@ impl ModelFile {
             )
             .with_image_models(base_images)
             .with_classifier_models(base_classifiers);
+            if let Some(base_url) = base_url {
+                provider = provider.with_base_url(base_url);
+            }
             if let Some(ctx) = &auth_context {
                 provider = provider.with_auth_context(ctx.clone());
             }

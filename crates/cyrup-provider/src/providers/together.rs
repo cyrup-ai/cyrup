@@ -11,6 +11,8 @@ use crate::wire::WireProvider;
 use std::sync::Arc;
 
 /// Together's OpenAI-compatible base URL (the `/chat/completions` path is appended by the wire impl).
+/// Also pi's provider-level `createProvider({ baseUrl })` (`providers/together.ts:10` @f1b2e77f5,
+/// PROV-154).
 pub const TOGETHER_BASE_URL: &str = "https://api.together.ai/v1";
 
 /// The provider id.
@@ -390,6 +392,7 @@ pub fn together_provider_with(
         store,
         registry,
     )
+    .with_base_url(TOGETHER_BASE_URL)
 }
 
 /// Convenience constructor: an in-memory credential store + the built-in api registry. Resolves

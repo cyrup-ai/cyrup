@@ -55,6 +55,15 @@ impl ConfigProvider {
         Self { inner }
     }
 
+    /// The registration's provider-level `baseUrl` (pi `extension?.baseUrl`, the first layer of
+    /// `provider-composer.ts:608` @f1b2e77f5; PROV-154). Metadata: each row already carries its own
+    /// (`model.baseUrl ?? config.baseUrl`), which is where a request goes.
+    #[must_use]
+    pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
+        self.inner = self.inner.with_base_url(base_url);
+        self
+    }
+
     /// Erase to a shared `Arc<dyn Provider>` (the form the model registry / provider swap install).
     pub fn into_arc(self) -> Arc<dyn Provider> {
         Arc::new(self)

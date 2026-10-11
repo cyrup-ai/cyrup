@@ -437,7 +437,7 @@ mod tests {
     ///
     /// It is EMPTY today. Both guards below read it, and they read it in opposite directions:
     /// `registry_contains_implemented_provider_ids` asserts every id here is NOT registered, and
-    /// `all_of_pis_v0_84_4_builtins_are_registered` SUBTRACTS it from the expected set so the two
+    /// `all_of_pis_builtins_at_the_pin_are_registered` SUBTRACTS it from the expected set so the two
     /// compose instead of contradicting each other. Parking an id therefore stays a one-line edit.
     const NOT_YET: &[&str] = &[];
 
@@ -498,7 +498,7 @@ mod tests {
         }
 
         // `NOT_YET` is declared at the top of this module, because
-        // `all_of_pis_v0_84_4_builtins_are_registered` subtracts the same array from its expected
+        // `all_of_pis_builtins_at_the_pin_are_registered` subtracts the same array from its expected
         // set. Keep the loop: the day a provider is genuinely half-ported, this is where it is
         // parked, and parking it satisfies both guards at once.
         for not_yet in NOT_YET {
@@ -512,6 +512,131 @@ mod tests {
 
         // The count matches what `all_providers()` returns and has no duplicate ids.
         assert_eq!(ids.len(), all_providers().len());
+    }
+
+    /// pi's `builtinProviders()` at the pin, in upstream's own order (`providers/all.ts:137-180`
+    /// @f1b2e77f5), each with the `baseUrl` its module passes to `createProvider` — `None` where
+    /// the module passes none. The parity target for both the registration guard and PROV-154's
+    /// base-URL table, transcribed once. Each `Some` is the literal at the cited line of
+    /// `packages/ai/src/providers/<id>.ts`; each `None` was read as a `createProvider` call (or,
+    /// for `radius`, the object literal at `radius.ts:35-89`) with no `baseUrl` member.
+    const PI_BUILTINS: &[(&str, Option<&str>)] = &[
+        ("amazon-bedrock", None),
+        ("ant-ling", Some("https://api.ant-ling.com/v1")), // :10
+        ("anthropic", Some("https://api.anthropic.com")),  // :78
+        ("azure", None),
+        ("baseten", Some("https://inference.baseten.co/v1")), // :10
+        ("cerebras", Some("https://api.cerebras.ai/v1")),     // :10
+        ("cloudflare-ai-gateway", None),
+        ("cloudflare-workers-ai", None),
+        ("deepseek", Some("https://api.deepseek.com")), // :10
+        ("fireworks", Some("https://api.fireworks.ai/inference")), // :11
+        (
+            "github-copilot",
+            Some("https://api.individual.githubcopilot.com"),
+        ), // :13
+        (
+            "google",
+            Some("https://generativelanguage.googleapis.com/v1beta"),
+        ), // :10
+        ("google-vertex", None),
+        ("groq", Some("https://api.groq.com/openai/v1")), // :10
+        ("huggingface", Some("https://router.huggingface.co/v1")), // :10
+        ("kimi-coding", Some("https://api.kimi.com/coding")), // :11
+        ("meta", Some("https://api.meta.ai/v1")),         // :11
+        ("minimax", Some("https://api.minimax.io/anthropic")), // :10
+        ("minimax-cn", Some("https://api.minimaxi.com/anthropic")), // :10
+        ("mistral", Some("https://api.mistral.ai")),      // :10
+        ("moonshotai", Some("https://api.moonshot.ai/v1")), // :10
+        ("moonshotai-cn", Some("https://api.moonshot.cn/v1")), // :10
+        ("nvidia", Some("https://integrate.api.nvidia.com/v1")), // :10
+        ("openai", Some("https://api.openai.com/v1")),    // :13
+        ("openai-codex", Some("https://chatgpt.com/backend-api")), // :11
+        ("opencode", None),
+        ("opencode-go", None),
+        ("openrouter", Some("https://openrouter.ai/api/v1")), // :14
+        (
+            "qwen-token-plan",
+            Some("https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1"), // :10
+        ),
+        (
+            "qwen-token-plan-cn",
+            Some("https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1"), // :10
+        ),
+        (
+            "qwen-token-plan-individual",
+            Some("https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1"), // :10
+        ),
+        ("radius", None),
+        ("together", Some("https://api.together.ai/v1")), // :10
+        ("typesafe", None),
+        ("vercel-ai-gateway", Some("https://ai-gateway.vercel.sh")), // :11
+        ("xai", Some("https://api.x.ai/v1")),                        // :11
+        ("xiaomi", Some("https://api.xiaomimimo.com/v1")),           // :10
+        (
+            "xiaomi-token-plan-ams",
+            Some("https://token-plan-ams.xiaomimimo.com/v1"),
+        ), // :10
+        (
+            "xiaomi-token-plan-cn",
+            Some("https://token-plan-cn.xiaomimimo.com/v1"),
+        ), // :10
+        (
+            "xiaomi-token-plan-sgp",
+            Some("https://token-plan-sgp.xiaomimimo.com/v1"),
+        ), // :10
+        ("zai", Some("https://api.z.ai/api/coding/paas/v4")),        // :10
+        (
+            "zai-coding-cn",
+            Some("https://open.bigmodel.cn/api/coding/paas/v4"),
+        ), // :10
+    ];
+
+    /// PROV-145: pi's `azure`, still registered under its pre-1.0.3 id.
+    const PROV_145: (&str, &str) = ("azure", "azure-openai-responses");
+
+    /// The id cyrup registers pi's builtin under: its own, except PROV-145's rename.
+    fn registered_id(pi_id: &str) -> &str {
+        if pi_id == PROV_145.0 {
+            PROV_145.1
+        } else {
+            pi_id
+        }
+    }
+
+    /// PROV-154 — every builtin answers [`Provider::base_url`] with the `baseUrl` its pi module
+    /// passes to `createProvider` (`Provider.baseUrl`, `models.ts:154`, set at `:1088`
+    /// @f1b2e77f5), and `None` where the module passes none. It is metadata — no request reads it,
+    /// each row carries its own `baseUrl` — but it is public on every pi provider, and pi reads it
+    /// in its bug report (`coding-agent/src/core/bug-report.ts:118`) and as a `models.json`
+    /// composition's URL (`provider-composer.ts:608`). Every mismatch is collected, so one run
+    /// names them all.
+    #[test]
+    fn every_builtin_answers_its_upstream_provider_base_url() {
+        let providers = all_providers();
+        let mismatches: Vec<String> = PI_BUILTINS
+            .iter()
+            .filter(|(id, _)| !NOT_YET.contains(id))
+            .filter_map(|(pi_id, want)| {
+                let id = registered_id(pi_id);
+                let got = providers
+                    .iter()
+                    .find(|p| p.id().as_str() == id)
+                    .map(|p| p.base_url().map(str::to_string));
+                match got {
+                    Some(got) if got.as_deref() == *want => None,
+                    Some(got) => Some(format!("{id}: {got:?}, pi passes {want:?}")),
+                    None => Some(format!("{id}: not registered")),
+                }
+            })
+            .collect();
+        assert!(
+            mismatches.is_empty(),
+            "Provider::base_url() differs from pi's createProvider({{ baseUrl }}) @f1b2e77f5 for \
+             {} builtin(s):\n{}",
+            mismatches.len(),
+            mismatches.join("\n")
+        );
     }
 
     /// DRIFT-009 — pi's `builtinProviders()` list in full, so the registry cannot disagree with
@@ -544,57 +669,11 @@ mod tests {
     /// expected set here and asserted absent there.
     #[test]
     fn all_of_pis_builtins_at_the_pin_are_registered() {
-        const PI_BUILTINS: &[&str] = &[
-            "amazon-bedrock",
-            "ant-ling",
-            "anthropic",
-            "azure",
-            "baseten",
-            "cerebras",
-            "cloudflare-ai-gateway",
-            "cloudflare-workers-ai",
-            "deepseek",
-            "fireworks",
-            "github-copilot",
-            "google",
-            "google-vertex",
-            "groq",
-            "huggingface",
-            "kimi-coding",
-            "meta",
-            "minimax",
-            "minimax-cn",
-            "mistral",
-            "moonshotai",
-            "moonshotai-cn",
-            "nvidia",
-            "openai",
-            "openai-codex",
-            "opencode",
-            "opencode-go",
-            "openrouter",
-            "qwen-token-plan",
-            "qwen-token-plan-cn",
-            "qwen-token-plan-individual",
-            "radius",
-            "together",
-            "typesafe",
-            "vercel-ai-gateway",
-            "xai",
-            "xiaomi",
-            "xiaomi-token-plan-ams",
-            "xiaomi-token-plan-cn",
-            "xiaomi-token-plan-sgp",
-            "zai",
-            "zai-coding-cn",
-        ];
         assert_eq!(
             PI_BUILTINS.len(),
             42,
             "all.ts:137-180 @f1b2e77f5 is 42 entries"
         );
-        /// PROV-145: pi's `azure`, still registered under its pre-1.0.3 id.
-        const PROV_145: (&str, &str) = ("azure", "azure-openai-responses");
 
         let mut registered: Vec<String> = all_providers()
             .iter()
@@ -606,14 +685,8 @@ mod tests {
         // the two contradict each other and leave `NOT_YET` unusable.
         let mut expected: Vec<String> = PI_BUILTINS
             .iter()
-            .filter(|id| !NOT_YET.contains(*id))
-            .map(|id| {
-                if *id == PROV_145.0 {
-                    PROV_145.1.to_string()
-                } else {
-                    (*id).to_string()
-                }
-            })
+            .filter(|(id, _)| !NOT_YET.contains(id))
+            .map(|(id, _)| registered_id(id).to_string())
             .collect();
         expected.sort();
         assert_eq!(

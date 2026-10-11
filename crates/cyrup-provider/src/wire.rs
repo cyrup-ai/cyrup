@@ -43,8 +43,8 @@ pub struct WireProvider {
     store: Arc<dyn CredentialStore>,
     auth_ctx: Arc<dyn AuthContext>,
     registry: Arc<ApiRegistry>,
-    /// Pi `createProvider({ baseUrl })` (`CreateProviderOptions.baseUrl`, `models.ts:537` @v0.83.0;
-    /// the `Provider.baseUrl` it feeds is `:79`) — PROV-017.
+    /// Pi `createProvider({ baseUrl })` (`CreateProviderOptions.baseUrl`, `models.ts:1000`, carried
+    /// onto `Provider.baseUrl` at `:1088` @f1b2e77f5) — PROV-017, PROV-154.
     base_url: Option<String>,
     /// Pi `createProvider({ headers })` (`CreateProviderOptions.headers`, `models.ts:538` @v0.83.0;
     /// the `Provider.headers` it feeds is `:80`) — PROV-017.

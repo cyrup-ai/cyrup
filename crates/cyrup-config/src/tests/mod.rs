@@ -2,6 +2,7 @@
 //! into ONE binary instead of one process per file. Assertions are unchanged.
 
 mod composed_filters;
+mod composed_identity;
 mod composed_non_chat_models;
 mod config_schemas;
 mod installation_id;

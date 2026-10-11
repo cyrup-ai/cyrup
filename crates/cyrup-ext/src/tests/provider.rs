@@ -440,3 +440,29 @@ fn ext051_oauth_is_subscription_is_readable_on_a_guest_provider() {
         "no oauth block at all is not a subscription"
     );
 }
+
+/// PROV-154, extension layer: pi composes an extension's provider with `baseUrl:
+/// extension?.baseUrl ?? config?.baseUrl ?? base?.baseUrl` (`core/provider-composer.ts:608`
+/// @f1b2e77f5), so a registration's `baseUrl` is the provider's `baseUrl`, not only each row's.
+/// Before the fix `build_provider` folded it into the rows alone and the provider answered `None`.
+#[test]
+fn a_registered_provider_answers_its_registrations_base_url() {
+    let mut hub = ProviderHub::new();
+    let cfg = json!({
+        "name": "Acme",
+        "apiKey": "sk-x",
+        "api": "openai-completions",
+        "baseUrl": "http://127.0.0.1:9/v1",
+        "models": [{
+            "id": "acme-large",
+            "cost": {"input": 0.0, "output": 0.0, "cacheRead": 0.0, "cacheWrite": 0.0}
+        }]
+    });
+    hub.register("acme".into(), &cfg).unwrap();
+    let provider = hub
+        .get("acme")
+        .expect("registration stored")
+        .build_provider();
+    assert_eq!(provider.base_url(), Some("http://127.0.0.1:9/v1"));
+    assert_eq!(provider.name(), "Acme");
+}

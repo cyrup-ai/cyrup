@@ -190,8 +190,10 @@ pub trait Provider: Send + Sync {
         self.id().as_str()
     }
 
-    /// Provider-level default base URL (Pi `Provider.baseUrl?`, `models.ts:79` @v0.83.0).
-    /// `None` = the provider has none and every model carries its own (PROV-017).
+    /// Provider-level default base URL (Pi `Provider.baseUrl?`, `models.ts:154` @f1b2e77f5, set from
+    /// `createProvider({ baseUrl })` at `:1088`; PROV-017). Every built-in answers its pi module's
+    /// literal or `None` (PROV-154). Metadata: no request reads it — `WireProvider::stream` sends a
+    /// request to its row's `base_url`, or to an auth `base_url` override (`Models`).
     fn base_url(&self) -> Option<&str> {
         None
     }
