@@ -36,15 +36,15 @@ use cyrup_core::ProviderId;
 use cyrup_provider::auth::oauth::{AuthInteraction, AuthPrompt, OAuthError};
 use cyrup_provider::wire::WireProvider;
 use cyrup_provider::{
-    ApiKeyAuth, ApiRegistry, AuthContext, AuthError, AuthResult, CreateModelsOptions, Credential,
-    CredentialStore, InMemoryCredentialStore, Model, ModelAuth, Models, ProviderAuth,
-    all_providers_with_overlay, builtin_registry, create_models,
+    AnyModel, ApiKeyAuth, ApiRegistry, AuthContext, AuthError, AuthResult, ClassifierModel,
+    CreateModelsOptions, Credential, CredentialStore, ImageModel, InMemoryCredentialStore, Model,
+    ModelAuth, Models, ProviderAuth, all_providers_with_overlay, builtin_registry, create_models,
 };
 
 use crate::config_value::{
     config_value_env_var_names, resolve_config_value_or_throw_async, resolve_headers_or_throw,
 };
-use crate::model::{ModelFile, ProviderConfig, apply_models_json};
+use crate::model::{ModelFile, ProviderConfig, apply_models_json, provider_base_url};
 
 /// Pi `configContextEnv` (provider-composer.ts:279-291): resolve, **through the injected auth
 /// context** rather than the ambient process env, every environment variable named by a
@@ -418,10 +418,21 @@ impl ModelFile {
         let mut errors: Vec<String> = Vec::new();
         for (provider_id, config) in &self.providers {
             let base = models.get_provider(provider_id);
-            let base_models: Vec<Model> = base
-                .as_ref()
-                .map(|p| p.models().to_vec())
-                .unwrap_or_default();
+            // Pi `getAllProviderModels(base)` (`provider.getAllModels?.() ?? provider.getModels()`,
+            // provider-composer.ts:538, :558 @v1.0.4): the base's catalog of EVERY type. The chat rows
+            // go through the `models.json` block; the image and classifier rows are not what a
+            // block's `models`/`modelOverrides` are about (chat-only upstream) but they are still
+            // the provider's models, and the block's `baseUrl` still reaches them (:326).
+            let mut base_models: Vec<Model> = Vec::new();
+            let mut base_images: Vec<ImageModel> = Vec::new();
+            let mut base_classifiers: Vec<ClassifierModel> = Vec::new();
+            for row in base.iter().flat_map(|p| p.get_all_models()) {
+                match row {
+                    AnyModel::Chat(model) => base_models.push(model),
+                    AnyModel::Image(model) => base_images.push(model),
+                    AnyModel::Classifier(model) => base_classifiers.push(model),
+                }
+            }
             let base_auth = base.as_ref().and_then(|p| p.provider_auth());
             let composed = match apply_models_json(provider_id, &base_models, config) {
                 Ok(models) => models,
@@ -430,6 +441,14 @@ impl ModelFile {
                     continue;
                 }
             };
+            if let Some(base_url) = provider_base_url(config) {
+                for model in &mut base_images {
+                    model.base_url = base_url.to_string();
+                }
+                for model in &mut base_classifiers {
+                    model.base_url = base_url.to_string();
+                }
+            }
             let auth = match compose_provider_auth(provider_id, base_auth, config) {
                 Ok(auth) => auth,
                 Err(message) => {
@@ -445,9 +464,17 @@ impl ModelFile {
                 auth,
                 store.clone(),
                 registry.clone(),
-            );
+            )
+            .with_image_models(base_images)
+            .with_classifier_models(base_classifiers);
             if let Some(ctx) = &auth_context {
                 provider = provider.with_auth_context(ctx.clone());
+            }
+            // Pi's composed provider calls `base.generateImages` / `base.classify` when the base
+            // has them (provider-composer.ts:657, :669 @v1.0.4): the block changes the catalog and
+            // the auth, never what the provider can do.
+            if let Some(base) = &base {
+                provider = provider.with_operations_from(base.clone());
             }
             // Release the base handle (and `base_auth`, which borrows it) before the upsert that
             // replaces it — Pi `models.setProvider(...)`, model-runtime.ts:215.

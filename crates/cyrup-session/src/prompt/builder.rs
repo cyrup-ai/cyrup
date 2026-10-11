@@ -146,11 +146,14 @@ static DEFAULT_TEMPLATE: PromptTemplate = PromptTemplate {
     docs_header: "cyrup documentation (read only when the user asks about cyrup itself, its SDK, \
          extensions, themes, skills, or TUI):",
     // [CYRUP-DELTA] product name only; the instructions are Pi's `:157`, `:159`, `:160` verbatim.
-    // Pi's `:158` ("When asked about: extensions (docs/extensions.md, …)") is left out: it lists
-    // documentation files cyrup does not ship at those paths.
+    // Pi's `:158` ("When asked about: extensions (docs/extensions.md, …)") is cut down to the one
+    // entry cyrup ships at that path: the other documentation files it lists are not at those paths.
+    // The entry is pi's own wording for it (`system-prompt.ts:158` @v1.0.4).
     docs_guidance: &[
         "When reading cyrup docs or examples, resolve docs/... under Additional docs and \
          examples/... under Examples, not the current working directory",
+        "When asked about: codemode scripts and non-LLM models such as classifiers and image \
+         models (docs/codemode.md)",
         "When working on cyrup topics, read the docs and examples, and follow .md \
          cross-references before implementing",
         "Always read cyrup .md files completely and follow links to related docs (e.g., tui.md \

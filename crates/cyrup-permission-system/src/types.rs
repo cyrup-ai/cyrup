@@ -87,6 +87,34 @@ pub struct AgentPermissions {
 }
 
 impl AgentPermissions {
+    /// \[CYRUP-DELTA] This layer as a project the user has not trusted may contribute it: every
+    /// `allow` (a rule, or a default of `allow`) is dropped, so the layers below decide that call,
+    /// and every `ask` and `deny` stands. pi-permission-system has no notion of a trusted project
+    /// (its project layer can add denies, and can also turn an `ask` into an `allow`; only a
+    /// trusted layer's `deny` is a floor, [`crate::manager`]), because pi's trust gate and its
+    /// extensions are separate things. Here the permission system is part of the binary, and a
+    /// repository that cyrup has been told not to trust must not be able to approve its own tool
+    /// calls on behalf of the person who opened it.
+    #[must_use]
+    pub fn tightened(&self) -> Self {
+        let without_allow =
+            |state: Option<PermissionState>| state.filter(|state| *state != PermissionState::Allow);
+        Self {
+            default_policy: PartialDefaultPolicy {
+                tools: without_allow(self.default_policy.tools),
+                bash: without_allow(self.default_policy.bash),
+                mcp: without_allow(self.default_policy.mcp),
+                skills: without_allow(self.default_policy.skills),
+                special: without_allow(self.default_policy.special),
+            },
+            tools: self.tools.without_allow(),
+            bash: self.bash.without_allow(),
+            mcp: self.mcp.without_allow(),
+            skills: self.skills.without_allow(),
+            special: self.special.without_allow(),
+        }
+    }
+
     /// The rules for one category (pi `layer.permissions[category]`).
     #[must_use]
     pub fn category(&self, category: Category) -> &OrderedRules {
@@ -172,6 +200,20 @@ impl OrderedRules {
     #[must_use]
     pub fn get(&self, key: &str) -> Option<PermissionState> {
         self.entries.iter().find(|(p, _)| p == key).map(|(_, s)| *s)
+    }
+
+    /// \[CYRUP-DELTA] These rules without the `allow` ones, in the same order. What an untrusted
+    /// layer is left with when it may only tighten: see [`AgentPermissions::tightened`].
+    #[must_use]
+    pub fn without_allow(&self) -> Self {
+        Self {
+            entries: self
+                .entries
+                .iter()
+                .filter(|(_, state)| *state != PermissionState::Allow)
+                .cloned()
+                .collect(),
+        }
     }
 
     /// True when any entry's state is `allow` (pi `Object.values(...).some(state => state === "allow")`).

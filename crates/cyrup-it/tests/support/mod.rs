@@ -25,4 +25,5 @@
 
 pub mod bins;
 pub mod env;
+pub mod fake_openai;
 pub mod scratch;

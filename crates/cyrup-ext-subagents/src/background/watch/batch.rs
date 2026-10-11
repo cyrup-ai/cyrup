@@ -1537,6 +1537,63 @@ mod tests {
         }
     }
 
+    /// [CYRUP-DELTA] A session replacement (`/new`, RPC `new_session`, a second ACP `session/new`)
+    /// binds the replacement's backend to the SAME executor, and the `SessionStart` that follows
+    /// installs the completion watcher again. The executor kept the first backend it was given (a
+    /// set-once slot), so a background task's completion was injected into the session that had been
+    /// replaced: the active session never heard of it, and the replaced one ran a model turn nobody
+    /// could see. Killing mutation: `HostServicesSlot::bind` ignoring a second bind.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_completion_after_a_session_replacement_is_injected_into_the_new_session() {
+        let home = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let config = crate::registration::SubagentExtensionConfig {
+            roots: crate::paths::Roots::sandboxed(home.path()),
+            ..crate::registration::SubagentExtensionConfig::default()
+        };
+        let executor = crate::extension::SubagentExecutor::with_config(config.clone());
+        let first = Recorder::auto_accepting();
+        executor.set_host_services(Arc::new(SessionRecorder {
+            recorder: Arc::clone(&first),
+        }));
+        executor.install_completion_watcher(cwd.path()).await;
+
+        // The replacement: its backend is bound first, then its `SessionStart` installs the watcher.
+        let second = Recorder::auto_accepting();
+        executor.set_host_services(Arc::new(SessionRecorder {
+            recorder: Arc::clone(&second),
+        }));
+        executor.install_completion_watcher(cwd.path()).await;
+
+        let results_dir =
+            crate::background::run_artifact_roots_in(&config.roots, cwd.path()).results_dir;
+        let mut result = result_with_children(
+            "replaced-1",
+            RunState::Complete,
+            true,
+            None,
+            vec![child_result("worker", Some("done"), 0)],
+        );
+        result.session_id = SessionId::parse("wiring-session");
+        result.completion_owner_id = Some(crate::identity::current_completion_owner_id());
+        super::super::tests::publish_result(&results_dir, &result).await;
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(12);
+        while second.injected().is_empty() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the completion never reached the new session (the replaced one got {:?})",
+                first.injected()
+            );
+            tokio::time::sleep(ms(50)).await;
+        }
+        assert!(
+            first.injected().is_empty(),
+            "the replaced session must not be told: {:?}",
+            first.injected()
+        );
+    }
+
     /// #11, at the WIRING: the production `SubagentExecutor::install_completion_watcher`, with a
     /// live host bound, resolves `completionBatch` from the extension config and batches a burst of
     /// two real published completions into ONE injected message. Killing mutations: the host arm

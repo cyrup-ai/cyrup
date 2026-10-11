@@ -7,6 +7,8 @@ use std::sync::Arc;
 
 use serde_json::json;
 
+use cyrup_ext::HostCtx;
+
 use crate::agent_start_cache::AgentStartCache;
 use crate::ext_config::ExtensionConfig;
 use crate::status;
@@ -52,14 +54,19 @@ impl PermissionSystemExtension {
     /// Also surfaces the extension-config load warning (pi `refreshExtensionConfig`,
     /// `index.ts:1600-1618`) — this is the one place a malformed `config.json` becomes visible,
     /// since construction happens before any host backend is attached.
-    pub(super) fn refresh_config_and_manager(&self, cwd: &Path) {
+    pub(super) fn refresh_config_and_manager(&self, ctx: &HostCtx) {
         // pi order (`refreshSessionRuntimeState`, v0.8.0 `index.ts:1819-1826`): config first,
         // manager second, agent-start cache invalidated third.
         self.refresh_extension_config();
-        *guard(&self.manager) = manager_with_warnings(
-            Self::manager_paths_for(&self.agent_dir, cwd),
+        let mut manager = manager_with_warnings(
+            Self::manager_paths_for(&self.agent_dir, &ctx.cwd),
             &self.warnings,
         );
+        // \[CYRUP-DELTA] The rebuilt manager is told what the project's trust is, here and not only
+        // at the next event: a manager must not decide for even one call under a default it was
+        // given for lack of an answer.
+        manager.set_project_trusted(ctx.is_project_trusted());
+        *guard(&self.manager) = manager;
         self.invalidate_agent_start_cache();
     }
 
@@ -166,7 +173,7 @@ impl PermissionSystemExtension {
     /// render one. This is the same test the `SessionStart` / `BeforeAgentStart` arms already use.
     pub(super) fn sync_status_when_possible(&self, config: &ExtensionConfig) {
         if let Some(services) = self.host_services.get() {
-            status::sync_status(services, config);
+            status::sync_status(&services, config);
         }
     }
 

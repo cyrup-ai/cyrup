@@ -56,6 +56,7 @@ impl Fixture {
                 description,
                 parameters: &self.parameters,
                 namespace: namespace.as_ref(),
+                identifier: None,
             })
             .collect()
     }
@@ -192,12 +193,14 @@ fn describe_tool_takes_the_first_of_two_tools_with_one_identifier() {
             description: "dash",
             parameters: &parameters,
             namespace: None,
+            identifier: None,
         },
         DiscoverableTool {
             name: "a_b",
             description: "underscore",
             parameters: &parameters,
             namespace: None,
+            identifier: None,
         },
     ];
     assert_eq!(find_tool(&tools, "a_b").unwrap().description, "dash");
@@ -256,15 +259,57 @@ fn describe_namespace_is_described_by_the_first_tool_that_names_it() {
             description: "",
             parameters: &parameters,
             namespace: Some(&first),
+            identifier: None,
         },
         DiscoverableTool {
             name: "mcp__x__b",
             description: "",
             parameters: &parameters,
             namespace: Some(&second),
+            identifier: None,
         },
     ];
     let description = describe_namespace(&tools, "x").unwrap();
     assert_eq!(description.description.as_deref(), Some("first"));
     assert_eq!(description.tools.len(), 2);
+}
+
+/// With a table identifier, `describeTool` finds a tool by its own identifier, and by its raw name,
+/// and `describeNamespace` lists the identifiers scripts call the tools by.
+#[test]
+fn discovery_follows_the_identifier_table() {
+    let parameters = json!({});
+    let namespace = ToolNamespace {
+        name: "x".into(),
+        description: None,
+        instructions: None,
+    };
+    let dash = to_codemode_identifier("a_b_2");
+    let tools = [
+        DiscoverableTool {
+            name: "a-b",
+            description: "dash",
+            parameters: &parameters,
+            namespace: Some(&namespace),
+            identifier: Some(&dash),
+        },
+        DiscoverableTool {
+            name: "a_b",
+            description: "underscore",
+            parameters: &parameters,
+            namespace: Some(&namespace),
+            identifier: None,
+        },
+    ];
+    assert_eq!(find_tool(&tools, "a_b").unwrap().description, "underscore");
+    assert_eq!(find_tool(&tools, "a_b_2").unwrap().description, "dash");
+    assert_eq!(find_tool(&tools, "a-b").unwrap().description, "dash");
+    let listed = describe_namespace(&tools, "x").unwrap().tools;
+    assert_eq!(
+        listed
+            .iter()
+            .map(CodemodeIdentifier::as_str)
+            .collect::<Vec<_>>(),
+        ["a_b_2", "a_b"]
+    );
 }

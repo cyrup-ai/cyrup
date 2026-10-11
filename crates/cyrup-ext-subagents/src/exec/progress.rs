@@ -102,6 +102,16 @@ impl AgentProgress {
         if let Some(usage) = event.assistant_usage() {
             crate::exec::fallback::add_usage(&mut self.usage, &usage);
         }
+        // [CYRUP-DELTA] A NESTED call (one a `codemode` script made through `tools.*`) is not a
+        // tool call the MODEL made: it must not count toward `tool_count`, take over
+        // `current_tool`, or be folded as a recent tool / recent output (see
+        // `SubagentEvent::is_nested`). It is still retained in `all_events`, which the
+        // mutation guard reads, so a child that mutated only from inside a script still counts
+        // as having mutated.
+        if event.is_nested() {
+            self.all_events.push(event);
+            return;
+        }
         match &event {
             SubagentEvent::ToolExecutionStart {
                 tool_name, args, ..
@@ -211,10 +221,17 @@ impl AgentProgress {
     /// preview renders the arguments the model requested, and includes a call that started but
     /// never completed, exactly like pi's message-part walk. Repeats of the same tool are preserved
     /// (one entry per real call).
+    ///
+    /// **[CYRUP-DELTA]** A NESTED call (one a `codemode` script made through `tools.*`) is not a
+    /// `toolCall` part of any assistant message, so pi's walk never lists it; `all_events` keeps it
+    /// for the mutation guard, so it is skipped here (see [`SubagentEvent::is_nested`]). The list's
+    /// length is what every settled surface reports as the child's tool count, and it must agree
+    /// with the live [`Self::tool_count`], which skips the same events.
     #[must_use]
     pub fn summarized_tool_calls(&self) -> Vec<ToolCallSummary> {
         self.all_events
             .iter()
+            .filter(|event| !event.is_nested())
             .filter_map(|event| match event {
                 SubagentEvent::ToolExecutionStart {
                     tool_name, args, ..
@@ -356,11 +373,13 @@ mod tests {
             tool_call_id: "c1".into(),
             tool_name: "bash".to_string(),
             args: serde_json::Value::Null,
+            parent_tool_call_id: None,
         });
         progress.record_event(SubagentEvent::ToolExecutionStart {
             tool_call_id: "c2".into(),
             tool_name: "edit".to_string(),
             args: serde_json::Value::Null,
+            parent_tool_call_id: None,
         });
         assert_eq!(progress.tool_count, 2);
         assert_eq!(progress.current_tool.as_deref(), Some("edit"));
@@ -471,6 +490,7 @@ mod tests {
             tool_name: "bash".to_string(),
             result: serde_json::json!("tool said ok"),
             is_error: false,
+            parent_tool_call_id: None,
         });
         // A non-assistant `message_end` contributes nothing (pi guards on `role === "assistant"`).
         progress.record_event(SubagentEvent::MessageEnd {
@@ -505,11 +525,13 @@ mod tests {
             tool_call_id: "c1".into(),
             tool_name: "bash".to_string(),
             args: serde_json::json!({ "command": "ls -la" }),
+            parent_tool_call_id: None,
         });
         progress.record_event(SubagentEvent::ToolExecutionStart {
             tool_call_id: "c2".into(),
             tool_name: "edit".to_string(),
             args: serde_json::json!({ "path": "/tmp/out.rs" }),
+            parent_tool_call_id: None,
         });
         assert_eq!(
             progress.summarized_tool_calls(),
@@ -523,6 +545,111 @@ mod tests {
                     expanded_text: "edit /tmp/out.rs".to_string(),
                 },
             ]
+        );
+    }
+
+    fn wire(line: &str) -> SubagentEvent {
+        crate::exec::ndjson::parse_line(line).expect("fixture line parses")
+    }
+
+    /// A `codemode` call that makes nested `tools.bash(...)` calls is ONE tool call of the model's:
+    /// the nested calls must not count, take over `current_tool` or enter the recent-tool ring
+    /// (they carry the call's `parentToolCallId`), yet the mutation guard must still see the nested
+    /// write, because a child that mutated only from inside a script did mutate.
+    #[test]
+    fn nested_calls_do_not_count_as_top_level_tool_calls_but_still_feed_the_mutation_guard() {
+        let mut progress = AgentProgress::default();
+        progress.record_event(wire(
+            r#"{"type":"tool_execution_start","toolCallId":"c1","toolName":"codemode","args":{"code":"x"}}"#,
+        ));
+        progress.record_event(wire(
+            r#"{"type":"tool_execution_start","toolCallId":"c1/1","toolName":"bash","args":{"command":"echo hi > out.txt"},"parentToolCallId":"c1"}"#,
+        ));
+        assert_eq!(
+            progress.tool_count, 1,
+            "the nested start is not a tool call of the model's"
+        );
+        assert_eq!(
+            progress.current_tool.as_deref(),
+            Some("codemode"),
+            "the script's call stays the current tool while its nested calls run"
+        );
+        progress.record_event(wire(
+            r#"{"type":"tool_execution_end","toolCallId":"c1/1","toolName":"bash","result":{"content":[{"type":"text","text":"nested output"}]},"isError":false,"parentToolCallId":"c1"}"#,
+        ));
+        assert_eq!(
+            progress.current_tool.as_deref(),
+            Some("codemode"),
+            "a nested end must not close the enclosing call"
+        );
+        assert!(progress.recent_tools.is_empty());
+        assert!(progress.tool_end_events.is_empty());
+        assert!(
+            progress.recent_output.is_empty(),
+            "a nested result is not the child's own output: {:?}",
+            progress.recent_output
+        );
+        progress.record_event(wire(
+            r#"{"type":"tool_execution_end","toolCallId":"c1","toolName":"codemode","result":{"content":[{"type":"text","text":"done"}]},"isError":false}"#,
+        ));
+        assert_eq!(progress.tool_count, 1);
+        assert_eq!(progress.current_tool, None);
+        assert_eq!(progress.recent_tools.len(), 1);
+        assert_eq!(
+            progress.recent_tools.front().map(|t| t.tool.as_str()),
+            Some("codemode")
+        );
+        assert_eq!(progress.tool_end_events.len(), 1);
+        assert!(
+            crate::exec::control::has_mutation_tool_call(&progress.all_events, None),
+            "a mutation made only from inside a script still counts as a mutation attempt"
+        );
+    }
+
+    /// The settled `tool_calls` list is what every surface reports as the child's tool count
+    /// (`toolCount` in the run's meta artifact, the slash completion line, the history record, the
+    /// settled progress row), so a script's nested calls stay out of it exactly as they stay out of
+    /// the live `tool_count`: a child whose script made three calls is one tool call at both ends.
+    #[test]
+    fn nested_calls_are_not_in_the_settled_tool_call_list() {
+        let mut progress = AgentProgress::default();
+        for line in [
+            r#"{"type":"tool_execution_start","toolCallId":"c1","toolName":"codemode","args":{"code":"x"}}"#,
+            r#"{"type":"tool_execution_start","toolCallId":"c1/1","toolName":"write","args":{"path":"out.txt","content":"hi"},"parentToolCallId":"c1"}"#,
+            r#"{"type":"tool_execution_end","toolCallId":"c1/1","toolName":"write","result":"ok","isError":false,"parentToolCallId":"c1"}"#,
+            r#"{"type":"tool_execution_start","toolCallId":"c1/2","toolName":"read","args":{"path":"a.txt"},"parentToolCallId":"c1"}"#,
+            r#"{"type":"tool_execution_end","toolCallId":"c1/2","toolName":"read","result":"ok","isError":false,"parentToolCallId":"c1"}"#,
+            r#"{"type":"tool_execution_end","toolCallId":"c1","toolName":"codemode","result":"done","isError":false}"#,
+            r#"{"type":"tool_execution_start","toolCallId":"c2","toolName":"read","args":{"path":"b.txt"}}"#,
+            r#"{"type":"tool_execution_end","toolCallId":"c2","toolName":"read","result":"ok","isError":false}"#,
+        ] {
+            progress.record_event(wire(line));
+        }
+        let texts: Vec<String> = progress
+            .summarized_tool_calls()
+            .into_iter()
+            .map(|call| call.text)
+            .collect();
+        assert_eq!(
+            texts.len(),
+            2,
+            "only the model's own calls are listed, got {texts:?}"
+        );
+        assert!(
+            texts
+                .first()
+                .is_some_and(|text| text.starts_with("codemode")),
+            "the script's call is listed once, as the call the model made: {texts:?}"
+        );
+        assert_eq!(texts.get(1).map(String::as_str), Some("read b.txt"));
+        assert_eq!(
+            usize::try_from(progress.tool_count).ok(),
+            Some(texts.len()),
+            "the live count and the settled list count the same calls"
+        );
+        assert!(
+            crate::exec::control::has_mutation_tool_call(&progress.all_events, None),
+            "the nested write is still in `all_events` for the mutation guard"
         );
     }
 }

@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use cyrup_core::ExtensionId;
-use cyrup_ext::HostServices;
+use cyrup_ext::HostServicesSlot;
 
 use crate::agent_start_cache::AgentStartCache;
 use crate::ask::{AskChannel, ForwardingAskChannel, NoOpAskChannel};
@@ -49,7 +49,7 @@ impl PermissionSystemExtension {
             |_| Arc::new(NoOpAskChannel),
             agent_dir,
             false,
-            Arc::new(OnceLock::new()),
+            Arc::new(HostServicesSlot::new()),
         )
     }
 
@@ -77,7 +77,7 @@ impl PermissionSystemExtension {
             |_| Arc::new(NoOpAskChannel),
             agent_dir,
             true,
-            Arc::new(OnceLock::new()),
+            Arc::new(HostServicesSlot::new()),
         )
     }
 
@@ -101,7 +101,7 @@ impl PermissionSystemExtension {
         config: ExtensionConfig,
     ) -> Self {
         let paths = Self::manager_paths_for(&agent_dir, &cwd);
-        let host_services: Arc<OnceLock<Arc<dyn HostServices>>> = Arc::new(OnceLock::new());
+        let host_services: Arc<HostServicesSlot> = Arc::new(HostServicesSlot::new());
         let channel_agent_dir = agent_dir.clone();
         let channel_services = Arc::clone(&host_services);
         Self::from_parts_full(
@@ -140,7 +140,7 @@ impl PermissionSystemExtension {
             |_| ask_channel,
             agent_dir,
             false,
-            Arc::new(OnceLock::new()),
+            Arc::new(HostServicesSlot::new()),
         )
     }
 
@@ -155,10 +155,10 @@ impl PermissionSystemExtension {
         ask_channel: impl FnOnce(&Arc<crate::logging::AuditTrail>) -> Arc<dyn AskChannel>,
         agent_dir: PathBuf,
         install_watcher: bool,
-        host_services: Arc<OnceLock<Arc<dyn HostServices>>>,
+        host_services: Arc<HostServicesSlot>,
     ) -> Self {
         // Built BEFORE the struct literal: `host_services` is moved into the literal below, and the
-        // sink needs its own handle on the same `OnceLock` so the manager's `onWarning` binding
+        // sink needs its own handle on the same slot so the manager's `onWarning` binding
         // observes the backend the host attaches LATER (`set_host_services` runs after
         // construction).
         let warnings = Arc::new(WarningSink::new(Arc::clone(&host_services)));
@@ -174,7 +174,7 @@ impl PermissionSystemExtension {
         ));
         // pi `setLoggingWarningReporter(...)` (`index.ts:170-172`): the reporter is the SAME
         // `notifyWarning` sink every other warning uses. Installed here rather than at
-        // `set_host_services` because `WarningSink` is itself late-bound on the `OnceLock`.
+        // `set_host_services` because `WarningSink` is itself late-bound on the slot.
         {
             let sink = Arc::clone(&warnings);
             logger.set_reporter(Arc::new(move |message: &str| sink.notify(message)));
@@ -202,10 +202,13 @@ impl PermissionSystemExtension {
             agent_dir,
             install_watcher,
             watcher: Mutex::new(None),
+            unattended_marker: Mutex::new(None),
             agent_name: resolve_agent_name_from_env(),
             active_skill_entries: Mutex::new(Vec::new()),
             agent_start_cache: Mutex::new(AgentStartCache::default()),
             explicitly_requested_skill_names: Mutex::new(HashSet::new()),
+            recent_calls: Mutex::new(std::collections::VecDeque::new()),
+            rejected_scripts: Mutex::new(std::collections::VecDeque::new()),
             warnings,
             last_config_warning,
             controller,

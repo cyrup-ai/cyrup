@@ -2388,10 +2388,10 @@ async fn bash_returns_up_to_one_mib_of_output_in_structured_content() {
 
 // TOOL-054 — `outputSchema: bashOutputSchema` sits on the shared `createShellToolDefinition`
 // (bash.ts:259 @v1.1.0), so `powershell` declares it too. The JSON is what TypeBox 1.3.27 emits for
-// `bashOutputSchema` (bash.ts:52-62).
+// `bashOutputSchema` (bash.ts:52-62), plus the one [CYRUP-DELTA] below.
 #[test]
 fn both_shell_tools_declare_pi_bash_output_schema() {
-    let expected = serde_json::json!({
+    let mut expected = serde_json::json!({
         "type": "object",
         "required": ["output", "truncated", "exit_code", "wall_time_seconds"],
         "properties": {
@@ -2402,6 +2402,11 @@ fn both_shell_tools_declare_pi_bash_output_schema() {
             "wall_time_seconds": { "type": "number" }
         }
     });
+    // [CYRUP-DELTA] `exit_code` carries a description upstream states only in a JSDoc comment, so a
+    // codemode declaration tells a script author that a non-zero exit resolves (see `ShellTool::new`).
+    expected["properties"]["exit_code"]["description"] = serde_json::json!(
+        "Exit code. A non-zero code is an error for the model, but the call still resolves to this result; a timeout rejects"
+    );
     let bash = bash_tool(PathBuf::from("."), BashOpts::default());
     let powershell = ShellTool::powershell(proc(), PathBuf::from("."), PowerShellOpts::default());
     assert_eq!(bash.output_schema(), Some(&expected));

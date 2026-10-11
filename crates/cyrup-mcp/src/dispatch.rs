@@ -8,8 +8,9 @@
 //! one [`crate::registration::ProxyTool`] for the `mcp` gateway. Both hold the pass's shared
 //! [`crate::registration::ToolDispatch`] slot and both answer `MCP not initialized` for as long as
 //! that slot is empty. This module supplies the one implementor of
-//! [`crate::registration::McpToolDispatch`] that fills it; the commit tail of `startInitialization`
-//! installs it once [`crate::state::McpState`] exists.
+//! [`crate::registration::McpToolDispatch`] that fills it; `startInitialization` installs it as the
+//! build starts, so a call that lands before [`crate::state::McpState`] exists joins the build
+//! through [`McpDispatch::gate`] instead of finding an empty slot.
 //!
 //! Upstream has no counterpart type. `pi-mcp-adapter` registers closures that read `index.ts`'s
 //! module-scoped `state` / `initPromise` / `currentOwner` slots directly (`index.ts:906`, and
@@ -314,6 +315,11 @@ impl McpToolDispatch for McpDispatch {
         cancel: CancelToken,
         _on_update: ToolUpdateSink,
     ) -> Result<ToolResult, ToolError> {
+        // [CYRUP-DELTA] `direct-tools.ts:137` @v5.2.0 awaits `initPromise` with no bound
+        // (`state = await initPromise`), where only the gateway is bounded by
+        // `awaitWithTimeout(initPromise, INIT_WAIT_TIMEOUT_MS)`. A direct call shares the gateway's
+        // gate and so its 30 s bound and `init_timeout` envelope: a build that never settles ends
+        // the call with a result the model can act on instead of holding the turn.
         let gate = self.gate().await;
         let ctx = match gate.outcome {
             GateOutcome::Ready(ctx) => ctx,

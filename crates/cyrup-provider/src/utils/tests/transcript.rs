@@ -7,8 +7,8 @@ use crate::utils::transcript::{
     collapse_system_messages, create_initial_system_message, declarations_equal,
     get_current_system_message, get_current_system_prompt, get_current_tools, get_declared_tools,
     get_initial_system_message, get_tool_state_changes, has_non_additive_tool_changes,
-    has_tool_redefinitions, normalize_context, resolve_transcript, resolve_transcript_tools,
-    without_initial_system_message,
+    has_tool_redefinitions, normalize_context, request_context, resolve_transcript,
+    resolve_transcript_tools, without_initial_system_message,
 };
 use cyrup_core::{Content, Message, Sections, SystemMessage};
 
@@ -393,4 +393,55 @@ fn resolve_transcript_tools_anchors_only_a_purely_additive_transcript() {
     // No leading system message at all ⇒ `?? []` (`:241`).
     let headless = resolve_transcript_tools(&[user("hi", 0)], true);
     assert!(headless.anchors_additions && headless.request_tools.is_empty());
+}
+
+/// PROMPT-001 — `request_context` is what the agent loop sends: the replayed prompt in
+/// `system_prompt`, the transcript without its system rows, and the caller's tools untouched.
+#[test]
+fn request_context_replays_the_transcript_into_the_prompt_and_drops_the_rows() {
+    let mut base = Sections::new();
+    base.set("preamble", Some("BASE".to_string()));
+    base.set("rules", Some("RULES-1".to_string()));
+    let mut patch = Sections::new();
+    patch.set("rules", Some("RULES-2".to_string()));
+    let messages = vec![
+        delta("", Some(base), vec![plain("declared")], vec![], 1),
+        user("hi", 2),
+        delta("LATER", Some(patch), vec![], vec![], 3),
+    ];
+    let ctx = request_context(Some("SHORTHAND"), messages, vec![plain("advertised")]);
+
+    // Shorthand leads (as `normalizeContext` folds it); then `getCurrentSystemMessage`'s replay:
+    // every row's `content` joined, followed by the patched sections (`getSystemMessageText`).
+    assert_eq!(
+        ctx.system_prompt.as_deref(),
+        Some("SHORTHAND\n\nLATER\n\nBASE\n\nRULES-2")
+    );
+    assert_eq!(
+        ctx.messages.len(),
+        1,
+        "only the user turn remains: {:?}",
+        ctx.messages
+    );
+    assert!(matches!(ctx.messages.first(), Some(Message::User { .. })));
+    assert_eq!(
+        names(&ctx.tools),
+        ["advertised"],
+        "tools are the caller's, not the rows'"
+    );
+}
+
+/// No prompt anywhere is `None`, never `Some("")`: an adapter given `Some("")` renders an empty
+/// system message (the regression this function exists for was exactly that).
+#[test]
+fn request_context_with_no_prompt_has_none() {
+    let ctx = request_context(Some(""), vec![user("hi", 1)], Vec::new());
+    assert_eq!(ctx.system_prompt, None);
+    let ctx = request_context(
+        None,
+        vec![delta("", None, vec![plain("a")], vec![], 1)],
+        Vec::new(),
+    );
+    assert_eq!(ctx.system_prompt, None);
+    assert!(ctx.messages.is_empty());
 }

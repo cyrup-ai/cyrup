@@ -12,10 +12,10 @@
 //! of styled [`OverlaySpan`]s instead of one padded `String`.
 
 use std::path::PathBuf;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use cyrup_ext::host::{
-    HostServices, InteractiveOverlay, NotifyKind, OverlayColor, OverlayKey, OverlayKeyCode,
+    HostServicesSlot, InteractiveOverlay, NotifyKind, OverlayColor, OverlayKey, OverlayKeyCode,
     OverlayLine, OverlayOutcome, OverlaySpan,
 };
 
@@ -385,9 +385,9 @@ impl InteractiveOverlay for FluxStatusOverlay {
 
 /// Open the status overlay ([`crate::extension::STATUS_OVERLAY_SHORTCUT`]), or fall back to the
 /// plain-text table when no interactive surface is
-/// attached. `host_services` is the `OnceLock` slot [`crate::extension::FluxExtension`] binds
+/// attached. `host_services` is the late-bound slot [`crate::extension::FluxExtension`] binds
 /// through `set_host_services` (`native.rs:683`).
-pub fn open_status_overlay(host_services: &Arc<OnceLock<Arc<dyn HostServices>>>) {
+pub fn open_status_overlay(host_services: &Arc<HostServicesSlot>) {
     let Some(host) = host_services.get() else {
         // No host bound at all (headless print/json, default host, or `set_host_services` never
         // called): `notify` is unavailable too, so there is nowhere to hand the plain table. This

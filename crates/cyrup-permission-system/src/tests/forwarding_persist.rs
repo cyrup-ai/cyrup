@@ -60,6 +60,7 @@ impl AskChannel for AlwaysChannel {
             approved: true,
             state: PermissionDecisionState::Always,
             denial_reason: None,
+            reject_script: false,
         })
     }
 }

@@ -297,9 +297,17 @@ cargo nextest run -p cyrup-it --features it,wasm-host
 # one seam
 cargo nextest run -p cyrup-it --features it -E 'binary(broker)'
 
-# skip the second link of the workspace binaries by pointing at an existing build
-cargo build --workspace --bins
-CYRUP_IT_BIN_DIR="$PWD/target/debug" cargo nextest run -p cyrup-it --features it
+# skip the second link of the workspace binaries by pointing at an existing build. NOT a bare
+# `cargo build --workspace --bins`: `cyrup` needs `faux` and the broker, the intercom client and the
+# two subagent fixtures need `test-fixtures` (crates/cyrup-it/build.rs `BINS`), none of which a
+# workspace build turns on. README "The integration suite" lists the exact builds.
+cargo build -p cyrup --features faux --bin cyrup
+cargo build -p cyrup-intercom --features test-fixtures --bins
+cargo build -p cyrup-ext-subagents --features test-fixtures --bins
+cargo build -p cyrup-ext-sdk --target wasm32-wasip2
+CYRUP_IT_BIN_DIR="$PWD/target/debug" \
+  CYRUP_EXT_FIXTURE_COMPONENT="$PWD/target/wasm32-wasip2/debug/cyrup_ext_sdk.wasm" \
+  cargo nextest run -p cyrup-it --features it,wasm-host
 
 # plain cargo still works — nothing about correctness depends on nextest
 cargo test -p cyrup-it --features it

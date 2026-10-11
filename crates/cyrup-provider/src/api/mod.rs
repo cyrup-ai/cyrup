@@ -73,6 +73,14 @@ pub mod typesafe_system_one;
 #[cfg(test)]
 mod truncation_parity;
 
+/// A loopback SSE server the driver-level grammar tests post to (PROV-101).
+#[cfg(test)]
+pub(crate) mod test_server;
+
+/// The transcript every adapter's "the prompt reaches the request body" test sends (PROMPT-001).
+#[cfg(test)]
+pub(crate) mod prompt_fixture;
+
 /// Producer side of the provider stream channel. `ApiImpl::run` pushes the EXISTING
 /// `cyrup_provider::StreamEvent` here; the receiver is wrapped as the returned `EventStream`.
 ///

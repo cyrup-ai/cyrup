@@ -6,7 +6,9 @@ use crate::api::compat::{get_responses_compat, sanitize_surrogates};
 use crate::api::openai_completions::transform_messages_with_source;
 use crate::context::{Context, ToolDef};
 use crate::model::Model;
-use crate::utils::constrained_sampling::ConstrainedSamplingError;
+use crate::utils::constrained_sampling::{
+    ConstrainedSamplingError, get_grammar_tool_input, grammar_tool_input_properties,
+};
 use crate::utils::hash::short_hash;
 use cyrup_core::{AssistantMessage, Content, Message, TextPhase, TextSignatureV1};
 use serde_json::{Map, Value, json};
@@ -32,6 +34,10 @@ pub(crate) fn convert_responses_messages(
     let api = model.api.clone();
     let model_id = model.id.as_str().to_string();
     let allow = allowed_tool_call_providers.contains(&provider.as_str());
+    // Pi's `options.grammarToolInputProperties` (`openai-responses-shared.ts:126`): which calls
+    // replay as `custom_tool_call` and which results as `custom_tool_call_output` (PROV-101).
+    let grammar_inputs =
+        grammar_tool_input_properties(ctx, tool_options.supports_openai_grammar_tools)?;
 
     let normalize = |id: &str, source: &AssistantMessage| -> String {
         if !allow {
@@ -170,26 +176,53 @@ pub(crate) fn convert_responses_messages(
                             let parts: Vec<&str> = id.split('|').collect();
                             let call_id = parts.first().copied().unwrap_or("");
                             let mut item_id = parts.get(1).copied().map(|s| s.to_string());
-                            // Drop a different-model `fc_*` item id to avoid pairing validation.
+                            let custom_input_property = grammar_inputs.get(&tc.name);
+                            // Drop item ids that do not match the replayed item type: a
+                            // `function_call` id must be `fc_*` and a `custom_tool_call` id must
+                            // be `ctc_*`; a different model's ids are dropped to avoid pairing
+                            // validation. A call can switch between the two types when grammar
+                            // tool support differs between turns (`openai-responses-shared.ts:
+                            // 298-306` @v1.0.4).
+                            let prefix = if custom_input_property.is_some() {
+                                "ctc_"
+                            } else {
+                                "fc_"
+                            };
                             if is_different_model
-                                && item_id
-                                    .as_deref()
-                                    .map(|s| s.starts_with("fc_"))
-                                    .unwrap_or(false)
+                                || !item_id.as_deref().is_some_and(|s| s.starts_with(prefix))
                             {
                                 item_id = None;
                             }
                             let mut item = Map::new();
-                            item.insert("type".to_string(), json!("function_call"));
+                            item.insert(
+                                "type".to_string(),
+                                json!(if custom_input_property.is_some() {
+                                    "custom_tool_call"
+                                } else {
+                                    "function_call"
+                                }),
+                            );
                             if let Some(iid) = item_id {
                                 item.insert("id".to_string(), json!(iid));
                             }
                             item.insert("call_id".to_string(), json!(call_id));
                             item.insert("name".to_string(), json!(tc.name));
-                            item.insert(
-                                "arguments".to_string(),
-                                json!(serde_json::to_string(&tc.arguments).unwrap_or_default()),
-                            );
+                            // A grammar call replays the raw text the model produced
+                            // (`input`), not the JSON object it is stored as.
+                            match custom_input_property {
+                                Some(property) => item.insert(
+                                    "input".to_string(),
+                                    json!(sanitize_surrogates(&get_grammar_tool_input(
+                                        &tc.name,
+                                        &tc.arguments,
+                                        property,
+                                    )?)),
+                                ),
+                                None => item.insert(
+                                    "arguments".to_string(),
+                                    json!(serde_json::to_string(&tc.arguments).unwrap_or_default()),
+                                ),
+                            };
                             // `...(isSameModel && toolCall.namespace !== undefined ? { namespace } : {})`
                             // (`openai-responses-shared.ts:324`).
                             if let (true, Some(ns)) = (is_same_model, &tc.namespace) {
@@ -207,6 +240,7 @@ pub(crate) fn convert_responses_messages(
             }
             Message::ToolResult {
                 tool_call_id,
+                tool_name,
                 content,
                 added_tool_names,
                 ..
@@ -253,8 +287,16 @@ pub(crate) fn convert_responses_messages(
                     }))
                 };
 
+                // `options?.grammarToolInputProperties?.has(msg.toolName)` — keyed by the tool NAME
+                // (`openai-responses-shared.ts:336`), so a result answers with the item type the
+                // call was replayed as.
+                let output_type = if grammar_inputs.contains_key(tool_name) {
+                    "custom_tool_call_output"
+                } else {
+                    "function_call_output"
+                };
                 messages.push(json!({
-                    "type": "function_call_output",
+                    "type": output_type,
                     "call_id": call_id,
                     "output": output,
                 }));

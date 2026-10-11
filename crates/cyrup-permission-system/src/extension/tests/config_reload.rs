@@ -472,3 +472,50 @@ async fn a_config_warning_re_arms_after_a_clean_load_clears_the_memo_body() {
     );
 }
 // ------------------------------------------------------------ PERM-001: subagent env hints
+
+/// [CYRUP-DELTA] A session start and a reload rebuild the manager, and the rebuilt manager is told
+/// what the host says about the project's trust straight away, in both directions: it must not
+/// decide a call under the default it was built with, which is "trusted".
+#[test]
+fn a_rebuilt_manager_is_told_whether_the_project_is_trusted() {
+    block_on(a_rebuilt_manager_is_told_whether_the_project_is_trusted_body());
+}
+
+async fn a_rebuilt_manager_is_told_whether_the_project_is_trusted_body() {
+    use cyrup_ext::{ExtMode, HostCtx, HostCtxRich};
+
+    let dir = tempfile::tempdir().unwrap();
+    let agent_dir = dir.path().to_path_buf();
+    let ext = PermissionSystemExtension::new(agent_dir.clone(), agent_dir.clone());
+    init_ext(&ext).await;
+    let ctx = |trusted: bool| {
+        HostCtx::event(ExtMode::Print, false, agent_dir.clone()).with_rich(HostCtxRich {
+            is_project_trusted: trusted,
+            ..HostCtxRich::default()
+        })
+    };
+    let reload = HostEvent::ResourcesDiscover {
+        cwd: agent_dir.display().to_string(),
+        reason: "reload".to_string(),
+    };
+    let start = HostEvent::SessionStart {
+        reason: "startup".to_string(),
+        previous_session_file: None,
+    };
+
+    for (event, name) in [
+        (&reload, "resources_discover reload"),
+        (&start, "session_start"),
+    ] {
+        let _ = ext.on_event(event, &ctx(false)).await;
+        assert!(
+            !guard(&ext.manager).project_trusted(),
+            "{name} with an untrusted project"
+        );
+        let _ = ext.on_event(event, &ctx(true)).await;
+        assert!(
+            guard(&ext.manager).project_trusted(),
+            "{name} with a trusted project"
+        );
+    }
+}

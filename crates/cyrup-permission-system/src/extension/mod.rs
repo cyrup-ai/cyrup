@@ -63,7 +63,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use cyrup_core::ExtensionId;
-use cyrup_ext::HostServices;
+use cyrup_ext::HostServicesSlot;
 
 use crate::agent_start_cache::AgentStartCache;
 use crate::ask::AskChannel;
@@ -143,13 +143,14 @@ pub struct PermissionSystemExtension {
     /// dialog goes through [`LocalAskChannel`] over [`Self::host_services`] instead.
     ask_channel: Arc<dyn AskChannel>,
     /// The late-bound live capability backend (P-1), captured by [`Self::set_host_services`] BEFORE
-    /// `init` (the builder threads its `LiveHostServices` via `load_native_with_services`). `Some` in
+    /// `init` (the builder threads its `LiveHostServices` via `load_native_with_services`; a session
+    /// replacement binds the replacement's, and the last bind wins). `Some` in
     /// an assembled interactive session; the in-session `ask` dialog uses it (guarded by `ctx.has_ui`)
     /// to reach `HostServices::select`/`input`, and the PARENT forwarding watcher uses it (outside any
     /// `HostCtx`) to reach `session_id`/`select`/`input`/`human_interaction_lock`. This is the SAME
-    /// `OnceLock` a child's [`ForwardingAskChannel`] shares (so it observes the child's own session id
+    /// [`HostServicesSlot`] a child's [`ForwardingAskChannel`] shares (so it observes the child's own session id
     /// for the requester metadata). `None` (default host / headless) ⇒ fail-closed / no watcher.
-    host_services: Arc<OnceLock<Arc<dyn HostServices>>>,
+    host_services: Arc<HostServicesSlot>,
     /// The agent dir whose `sessions/permission-forwarding/…` subtree is the shared forwarding spool
     /// root (pi `PI_AGENT_DIR`). The parent watcher resolves its inbox under this.
     agent_dir: PathBuf,
@@ -160,6 +161,11 @@ pub struct PermissionSystemExtension {
     /// The live forwarding-watcher task handle (parent role), so `SessionShutdown` can `abort()` it
     /// (pi teardown, `index.ts:2131`) and a session rebuild does not double-spawn.
     watcher: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// What this PARENT last did about the `no-ui` marker of the session it holds
+    /// ([`crate::forwarding::mark_session_unattended`]), so a child's ask is refused at once instead
+    /// of waiting on an answer that cannot come, and so the spool is touched only when the session or
+    /// its UI changes. `None`: no session has been synced yet.
+    unattended_marker: Mutex<Option<watcher::UnattendedSync>>,
     /// The resolved persona/agent name this process runs as (pi `resolveAgentName`, `index.ts:
     /// 2033-2047`), captured ONCE from the `CYRUP_SUBAGENT_AGENT_NAME` env var at construction (the
     /// child IS its persona for its whole lifetime). `Some` threads the agent + projectAgent policy
@@ -180,6 +186,15 @@ pub struct PermissionSystemExtension {
     /// `explicitlyRequestedSkillNames`, `index.ts:1559` / `index.ts:2192-2206`): a direct user action,
     /// so its skill-file reads bypass the skill-read ask/deny even under a hiding agent (`index.ts:2243`).
     explicitly_requested_skill_names: Mutex<HashSet<String>>,
+    /// The `(call id, tool name)` of the last `decide::RECENT_CALLS_CAP` calls the model issued, newest
+    /// last: how a call another tool made (`parentToolCallId`) is traced to the tool that made it,
+    /// so its prompt can say "from codemode script". Only model-issued calls are recorded, so a
+    /// script that makes thousands of nested calls cannot push its own parent out.
+    recent_calls: Mutex<std::collections::VecDeque<(String, String)>>,
+    /// [CYRUP-DELTA] The calls of the scripts the user refused as a whole
+    /// ([`crate::ask::REJECT_SCRIPT_OPTION`]), by the id of the model-issued call that runs the script,
+    /// the oldest first. A nested call whose parent is in here is refused without a dialog.
+    rejected_scripts: Mutex<std::collections::VecDeque<String>>,
     /// pi's `notifyWarning` closure (`index.ts:1586-1592`), shared by value with every
     /// [`PermissionManager`] this extension builds (`onWarning`) and used directly for the
     /// extension-config load warning.

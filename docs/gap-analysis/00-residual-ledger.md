@@ -5,6 +5,136 @@ next work item**.
 
 ---
 
+# UPDATE 2026-10-10 (the codemode follow-up) — `PERM-038` and eleven more rows closed, thirty-eight rows filed, two rows struck as false, and the fresh-eyes review did not converge
+
+> Upstream read at pi `v1.0.4` through git objects only (plus `pi-permission-system` v0.8.0, `pi-subagents` v0.74.0 and v0.34.0, `pi-acp` v0.0.33, and `pi-mcp-adapter` v5.2.0 for the MCP rows; area 13's pin stays v5.0.0 and the window `v5.0.0..v5.2.0` was not triaged). The count is whatever
+> `python3 -I docs/gap-analysis/scripts/count_open_items.py` prints, measured on this branch (`claude/eloquent-lovelace-vivq3h`, code HEAD `998ae8a53`): **before — docs unedited since the merge with `main`: 99 open (0 above low; 1 medium, 98 low; 17 trackers; 1021 closed); after the ledger commit 100 open (0 critical, 0 high, 0 medium, 100 low; 17 trackers; 1046 closed; 0 duplicates)**. The 142 in the block below was measured before `main` was merged and is not comparable; this is the first measurement on the merged tree. By area: `04` 2 → 3, `08` 8 → 9, `09b` 18 → 15, `10` 2 → 4, `11` 1 → 0, `18` 5 → 6; the rest unchanged. Gap class: Port bug 58 → 57, Test defect 6 → 3, Invented surface 6 → 11; Version lag, Reverse lag and Tooling unchanged. Area 13 is counted in its own file (`13-cyrup-mcp-STATUS.md`): 557 → 569 rows, `implemented` 355 → 361, `partial` 70 → 75, `missing` 98 → 99, `not-applicable` 34 (361 + 75 + 99 + 34 = 569). **Arithmetic:** 12 open rows closed (`PERM-038`, `SEAM-154`, `SEAM-155`, `SEAM-156`, `CODE-042`, `CODE-043`, `CODE-045`, `SUBA-175`, `SUBA-217`, `SUBA-219`, and `SUBA-218`, `ICOM-087` struck as stale), 13 rows filed open, 13 filed and closed on filing: 99 − 12 + 13 = 100 and 1021 + 12 + 13 = 1046. Area 13: 12 rows filed (6 closed on filing, 6 open). 38 rows were filed in all (the 26 counted here and `MCP-622`…`MCP-633`).
+>
+> **Re-measured after the squash and the rebase onto `origin/main` (`c9efa3c11`, 2026-10-10), on the merged tree:** `count_open_items.py` prints **123 open (0 critical, 0 high, 0 medium, 123 low; 17 trackers; 1112 closed; 0 duplicates)**, against 112 open and 1053 closed on `main` alone, 92 and 984 at the merge-base `6b145755e`, and 100 and 1046 on this branch before the rebase; so the branch adds 11 open rows and 59 closed to `main` (8 and 62 to the merge-base). The 3 closed rows fewer than the sum of the two sides are `TOOL-054`, `TOOL-058` and `SUBA-175`, which `main` and this branch each closed and which count once. By area against `main`: `01` 16 → 15 (`PROV-101` closed), `04` 1 → 2 (`TOOL-063`), `08` 2 → 6 (`SEAM-158`…`SEAM-161`), `09b` 44 → 45 (`SUBA-221`), `10` 1 → 4 (`PERM-044`…`PERM-046`), `18` 4 → 7 (`CODE-015` and `CODE-017` closed; `CODE-044` and `CODE-052`…`CODE-055` open); the rest are unchanged (net +11). Gap class (open, non-tracker): Port bug 61, Version lag 44, Reverse lag 1, Test defect 3, Invented surface 11, Tooling 2 (122). Area 13 (own file): 554 rows on `main` (its `MCP-617`) and **570** with this branch's `MCP-618`…`MCP-633`: `implemented` 361, `partial` 75, `missing` 100, `not-applicable` 34. The figures above in this block and in the block below were measured before the rebase and are kept as written. **Re-measured once more after the second rebase, onto `origin/main` `0fa9c89fe` (2026-10-10, the llama.cpp cluster and the System One port; `main` alone now reads 110 open and 1060 closed):** `count_open_items.py` prints **121 open (0 critical, 0 high, 0 medium, 121 low; 17 trackers; 1119 closed; 0 duplicates)**, so the branch still adds 11 open rows and 59 closed to `main`. Gap class (open, non-tracker): Port bug 61, Version lag 43, Reverse lag 1, Test defect 2, Invented surface 11, Tooling 2 (120), plus `PERM-032`, which the script lists as unclassified. This branch's `EXT-111`…`EXT-114` are `EXT-115`…`EXT-118` there (`main` filed its own `EXT-111`…`EXT-114`); area 13 is unchanged.
+>
+> ## What this is
+>
+> Four residual lanes (`PERM-038`, the `cyrup-it` suite, the sandbox's memory residuals, the headless and subagent residuals), four fresh-eyes review rounds each followed by a fix lane, and two live acceptance runs of sixteen scenarios (29 commits, `34ed0e2d9..998ae8a53`; the last run at the HEAD) took the open rows of the 2026-10-09 repair to the end. This pass recorded it, edited documentation only and ran no cargo command. The full record, per lane and per measurement, is *Follow-up, 2026-10-10* in `18-pi-codemode.md`.
+>
+> ## Closed
+>
+> `PERM-038` (the one medium: a `-p` run's `no-ui` marker no longer makes a later UI session refuse its subagent children's questions; the marker names its writer's process, a UI withdraws it, a headless start sweeps dead ones), `SEAM-154` (`--mode rpc` aborts the work in flight at stdin EOF: 46 s and an unanswerable dialog became 0.03-0.4 s), `SEAM-155` (for `/reload`), `SEAM-156`, `CODE-042` and `CODE-043` (an argument weight limit; a returned value kept as text: 3236 MB and 830 MB became 137 MB and 214 MB), `CODE-045`, `SUBA-175`, `SUBA-217`, `SUBA-219`. Filed and closed: `TOOL-062` (`read` of `/dev/zero` took the host to 4 GB), `PERM-041`…`PERM-043`, `EXT-117` (cyrup did not start under `ulimit -v`), `EXT-118` (extensions kept talking to the replaced session), `SEAM-157`, `CODE-046`…`CODE-051` (a failed call the script never awaited was invisible, and the first two fixes of that lied both ways), and in area 13 `MCP-622`…`MCP-627` (a call during MCP start-up answered 'MCP not initialized'; no default request timeout; parallel first calls to a lazy server failed in up to 11 of 30 trials).
+>
+> ## Struck as false
+>
+> **`SUBA-218` and `ICOM-087`** were filed as failing `cyrup-it` targets against `4f649ab66` and were fixed on `main` by `cc1fcd627` before this branch merged it; the previous record listed them among the failing gates without re-reading them after the merge. At HEAD 0 of 30 `SingleStepSpec` and `ForegroundRunRequest` literals lack `worktree` (29 of 30 did at the base) and both `ICOM-087` anchors are gone. The full real-binary suite ran once: 840 of 840 at `1a037e1c9`.
+>
+> ## Open, and what is new
+>
+> Thirteen rows filed open, all low: `CODE-052`…`CODE-055` (limits of the unobserved-error report; the nested-call pipeline's copies; unbounded results; ACP's doubled image data), `PERM-044`…`PERM-046`, `TOOL-063`, `SEAM-158`…`SEAM-161` (**`SEAM-158` is a new parity bug: an extension dialog in `before_agent_start` stalls the rpc command loop for as long as it is open, where pi's loop keeps reading**), `SUBA-221`, and in area 13 `MCP-628`…`MCP-633`. `CODE-044` stays open (nothing ran on macOS or Windows). **The counted set has no medium left.**
+>
+> ## Did the fresh-eyes review converge?
+>
+> **No.** Four rounds confirmed 4, 6, 5 and 5 findings (twenty, one more dropped), every one was fixed and every fix lane passed, and **the fourth round was not dry**. A fix of round 2 left a test failing in another crate for five commits; a fix of round 3 introduced a regression (`CODE-049`) that the next lane found although the round's own fix verdict had been a pass. Nobody can say the review would find nothing more, and this block does not say it.
+>
+> ## Not done, and said so
+>
+> **Squash and rebase were done after this block was written (2026-10-10), onto `origin/main` at `c9efa3c11` (38 commits past the merge-base); push was not.** The rebase met conflicts in 39 files (20 source, test and `docs/codemode.md`, 19 in `docs/gap-analysis/*`); how they were resolved is the *Squash and rebase onto `main`* subsection of the follow-up record in `18-pi-codemode.md`. The workspace-wide `nextest` was not run; the full `cyrup-it` suite ran once, before 27 of the 29 commits; the MCP integration target (`--test mcp`) was not run (no disk). macOS, Windows, a real OpenAI-family endpoint, a placed Herdr child, a wasm guest under a limited address space, the TUI by hand beyond three tmux runs, and ACP against a real Zed were not exercised. The red-proof outputs and live transcripts are in the session scratchpad, **not in the repository**.
+
+---
+
+# UPDATE 2026-10-09 (the codemode end-to-end repair) — the system prompt reaches the provider again, scripts run in a sandbox process, and a regression of 2026-10-06 is recorded
+
+> Upstream read at pi `v1.0.4` through git objects only (plus `pi-mcp-adapter` v5.0.0, `pi-permission-system`
+> v0.8.0, `pi-subagents` v0.74.0 and `pi-acp` v0.0.34 where a row says so). The count is whatever
+> `python3 -I docs/gap-analysis/scripts/count_open_items.py` prints, measured on this branch
+> (`claude/eloquent-lovelace-vivq3h`; the local `origin/main` is `4f649ab66`, an ancestor of the branch, and was not fetched): **before — code HEAD
+> `bd58662ee`, docs unedited, the same figures as the block below reports for its own "after" — 135 open (0
+> above low; 17 trackers; 927 closed); after the ledger commit 142 open (0 critical, 0 high, 1 medium, 141 low;
+> 17 trackers; 964 closed; 0 duplicates)**. By area: `01` 27 → 26, `04` 4 → 2, `08` 7 → 10, `09b` 22 → 25, `10` 1 →
+> 2, `11` 8 → 9, `18` 3 → 5; the rest unchanged. Gap class: Port bug 70 → 72, Version lag 54 → 51, Test defect 2 → 6,
+> Invented surface 2 → 6. Area 13 is counted in its own file (`13-cyrup-mcp-STATUS.md`): 553 → 557 rows, `implemented`
+> 349 → 355, `missing` 100 → 98. **Arithmetic:** 5 open rows closed (`CODE-015`, `CODE-017`, `TOOL-054`, `TOOL-058`,
+> `PROV-101`), 12 rows filed open, 32 filed and closed on filing: 135 − 5 + 12 = 142 and 927 + 5 + 32 = 964. 48 rows
+> were filed in all (the 44 above and `MCP-618`…`MCP-621`).
+>
+> *(Both counter figures above were measured before the rebase onto `main`; the 2026-10-10 block above re-measures on the rebased tree.)*
+>
+> ## What this is
+>
+> Sixteen lanes (thirteen feature lanes and three fresh-eyes review-and-fix lanes, each with an independent
+> verifier) drove the real binary against a scripted OpenAI-compatible server and fixed what they found (38 commits,
+> `1ea706526..bd58662ee`); two live acceptance runs of sixteen scenarios each then passed, the last one at the
+> final HEAD. This pass recorded all of it. It edited documentation only and ran no cargo command. The full record, per lane and per
+> measurement, is at the top of the closure records in `18-pi-codemode.md` ("Closure record, 2026-10-09 — the
+> codemode end-to-end repair").
+>
+> ## The regression, stated plainly
+>
+> **The `CODE-014` closure of 2026-10-06 shipped a regression that sent no system prompt to any provider.** It was
+> found on 2026-10-07 by running the real binary, not by a test: every request carried one system message whose
+> content was empty, so `--system-prompt`, `--append-system-prompt`, `<tools>`, `<rules>`, `AGENTS.md` and the
+> `codemode` section never reached the model. The closure's tests had not looked at the provider request: they
+> replayed the transcript's `sections` rows themselves, so they proved the rows and not what an adapter sends. The
+> closure record's statement that the model reads the replay was false for cyrup. Fixed and pinned at the request
+> by `CODE-024` (`1ea706526`, and the request-level `cyrup-it` suite `637fc636a`). The same correction applies to
+> `SESS-054` and `EXT-084`, which had claimed the layout and the forced-prompt projection reached the request.
+>
+> ## Closed
+>
+> `CODE-015`, `CODE-017`, `TOOL-054` (`bash`'s structured result; a non-zero exit resolves for a script),
+> `TOOL-058` (`read` of an image), `PROV-101` (grammar-constrained `custom` tools on the Responses family and chat
+> completions; **fixtures and loopback only, no real endpoint called**, with a falsification condition on the row),
+> and in area 13 `MCP-211` (the gateway shows parameters) and `MCP-616` (`--tools` patterns, MCP tools stay
+> registered, `--no-mcp`). Filed and closed: `CODE-024`…`CODE-041`, `CFG-110` (`defaultTools` names of extension
+> tools now activate; `CFG-097`'s closure had over-claimed), `CFG-111` (a `models.json` block deleted a provider's
+> image models: 0 → 55), `EXT-116`, `EXT-115` (`cyrup:ext` 0.17), `TUI-184` (Escape on a running tool), `SEAM-153`
+> (`--tools` and `--exclude-tools` now bound the registry), `SUBA-215`, `SUBA-216`, `SUBA-220`, `PERM-035`, `PERM-036`,
+> `PERM-037`, `PERM-039`, `PERM-040`, `MCP-618`…`MCP-621`. Model-visible and user-visible effect, in brief: one
+> allocation can no longer kill cyrup; a script has a default limit and a bounded memory cost for thousands of
+> calls; `+codemode` and `--tools` do what they say; an open approval dialog no longer freezes the deadline, abort
+> and `new_session`; a repository's own permission policy can no longer relax the user's `ask` without trust.
+>
+> ## Open, and what is new
+>
+> **`PERM-038` (medium): the fix for "a subagent child under a headless root waits 10 minutes and then says
+> 'User denied'" works, and has a regression.** The root's `no-ui` marker is withdrawn only by the process that
+> wrote it, so `cyrup -p ...` followed by `cyrup -c` with a UI leaves the stale marker and every ask from that
+> session's children is refused at once although a UI is attached. The fresh-eyes-3 verifier reproduced it as a unit
+> test and live; it is unfixed at HEAD, and **the fresh-eyes-3 lane's verdict was fail**. The 10-minute-wait half
+> is therefore recorded inside that open row and not as a closure. Also new and open: `CODE-042`…`CODE-045`
+> (argument bytes of pending calls; the returned value's host-side amplification, 16.4 MB → 800 MB; the sandbox
+> process off Linux; a test gap on the nested-context wiring), `SEAM-154` (RPC waits at stdin EOF where pi shuts
+> down), `SEAM-155` (the reload baseline stand-in), `SEAM-156`, `SUBA-218`, `ICOM-087` (three `cyrup-it` tests and
+> targets that do not pass their gates; none is caused by this work), `SUBA-217`, `SUBA-219`. `CODE-016` is narrowed to three gaps
+> that follow from the single-instance WASM store, not closed; `PROV-133`, `MCP-612` and `MCP-614` carry NARROWED
+> notes.
+>
+> **CORRECTED 2026-10-10.** `PERM-038` is closed, and `CODE-042`…`CODE-045`, `SEAM-154`…`SEAM-156`, `SUBA-217` and `SUBA-219` with it; `SUBA-218` and `ICOM-087` were stale (fixed on `main` by `cc1fcd627`), so the sentence about three `cyrup-it` targets that do not pass their gates is false. The 142 open rows counted above were measured before `main` was merged; the counter reads 99 on the merged tree before the 2026-10-10 block above, and 123 after the rebase onto `main` (re-measured in that block). See that block.
+>
+> ## Corrections made in place
+>
+> `CODE-014`, `CODE-007` (its "grammar-constrained sampling" shipped a declaration, not a request), `CODE-002` (the
+> in-process isolate is now a process), the 2026-10-07 closure record (`TOOL-058` and `MCP-616` open, the 8-10 ms
+> cost), the area-18 opening paragraph and `CODE-003`, `CFG-097`, `SESS-054`, `EXT-084`, `SEAM-005` (its closure
+> covered the extension-requested shutdown, not EOF). **Checked on both sides and not gaps:** pi's
+> `autoEnableCodemode` belongs to pi's built-in MCP extension and the adapter ignores it (`config.ts:1148`
+> @v5.0.0); pi's `_getCallableTools` makes a direct tool callable only while active, as cyrup does; the armed
+> permission system's per-turn activation of every registered tool is `pi-permission-system`'s own
+> (`index.ts:1880-1896` @v0.8.0); `max_output_tokens: 0` and the ACP JSON fallback match upstream.
+>
+> ## Not done, and said so
+>
+> The grammar path was never run against a real OpenAI, Azure or Codex endpoint. macOS and Windows were not
+> compiled or run for any of it. The interactive TUI was driven only through `TestBackend` and one pty run. No
+> lane ran the whole workspace `nextest`. A second sighting of a child that exits with no output under load
+> (`proc_spawn_defaults_omitted_cwd_to_the_session_cwd`) is recorded in the closure record with the earlier,
+> still-unexplained one. The red-proof outputs and live transcripts are in the session scratchpad, **not in the
+> repository**; the tests and commit messages carry the measured numbers.
+
+---
+
+> **Merged with `main` (`3cbd8588e`) on 2026-10-09, by the gates stage.** The figures in the block above were measured on the branch
+> before `main` was merged into it and are NOT re-measured here. Four ids this branch had filed collided with ids `main` filed meanwhile and
+> were renumbered here and in every area file: `EXT-109` -> `EXT-116`, `ICOM-083` -> `ICOM-087`, `SUBA-175` -> `SUBA-220`,
+> `TUI-167` -> `TUI-184` (`main` keeps `EXT-109`, `ICOM-083`, `SUBA-175` and `TUI-167`). `cyrup:ext` is **0.20**: this branch's 0.17 (the guest
+> tool surface) landed on top of `main`'s 0.19. The ledger stage owns the recount.
+
 # UPDATE 2026-10-09 (pi v1.1.0 structured tool results + HTML export, rebased onto #210) — `TOOL-054`, `TOOL-056`, `TOOL-058`, `SESS-069`, `CODE-021` and `CODE-022` closed; `SEAM-149` closed as a duplicate; `TOOL-059`…`TOOL-061`, `SESS-071`, `SESS-072`, `CFG-108` and `CFG-109` filed and closed
 
 > **Rebased onto `77daee4` (#210, the pi v1.1.0 drift triage) and then onto `7599bf4` (#212, the pi-subagents v0.76.1 drift, the next UPDATE below; it touched no row this pass changed).** The

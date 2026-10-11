@@ -161,6 +161,7 @@ pub(super) fn try_build_params(
             defer_loading: false,
             supports_strict_mode: compat.supports_strict_mode,
             default_strict: Some(false),
+            supports_openai_grammar_tools: compat.supports_openai_grammar_tools,
         },
     )?;
     let cache = resolve_cache_retention(opts.cache_retention, EnvSource::new(env));
@@ -242,6 +243,7 @@ pub(super) fn try_build_params(
                     defer_loading: false,
                     supports_strict_mode: compat.supports_strict_mode,
                     default_strict: Some(false),
+                    supports_openai_grammar_tools: compat.supports_openai_grammar_tools,
                 },
             )?),
         );

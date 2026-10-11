@@ -106,10 +106,12 @@ others. They apply to providers that take a token budget rather than an effort s
 | Key | Type | Default | Meaning |
 |---|---|---|---|
 | `defaultTools` | string[] | `["read", "bash", "edit", "write"]` | Tools active at startup. Plain names replace the default; `+name` adds a tool and `-name` removes one, applied in order. A project list made only of `+`/`-` entries is appended to the user list instead of replacing it. |
-| `codemode.mode` | `on`\|`only` | `"on"` | How the `codemode` tool (`docs/codemode.md` in the install) presents tools while it is active. `on` leaves declared tools declared; `only` hides them from the model and lists them in the `codemode` description. |
-| `codemode.inlineBudget` | number | `3000` | Estimated tokens (characters / 4) the `codemode` description may spend on tool declarations. |
+| `codemode.mode` | `on`\|`only` | `"on"` | How the [`codemode`](../guides/codemode.md) tool presents tools while it is active. `on` leaves declared tools declared; `only` hides them from the model and lists them in the `codemode` description. Read when a session is built; `/reload` applies a change. |
+| `codemode.inlineBudget` | number | `3000` | Estimated tokens (characters / 4) the `codemode` description may spend on tool declarations. Read when a session is built, like `codemode.mode`. |
 
-`"defaultTools": ["+codemode"]` activates `codemode` next to the four default tools.
+`"defaultTools": ["+codemode"]` activates `codemode` next to the four default tools; the same line in a project's `.cyrup/settings.json` counts only when the project is trusted, and `--no-extensions` removes the tool (see [Enable codemode](../guides/codemode.md#enable-codemode)). `defaultTools` names any registered tool, including extension and MCP tools that start inactive (`codemode`, `tool_search`, tools registered as inactive, `deferred` or `codemode` exposure). A name that no tool answers to is reported once as a startup warning; an MCP tool name whose server connects after startup activates when it registers, provided that is before the first prompt. An explicit `--tools` list, `--no-tools` or `--no-builtin-tools` replaces `defaultTools`, and `--exclude-tools` removes names from it. An armed [permission system](../guides/tools-and-permissions.md#the-permission-system) overrides the setting: it activates every tool its policy does not deny, so `defaultTools` does not narrow that set.
+
+`/reload` activates names newly added to `defaultTools`, that is, names the setting had no entry for when the session was last loaded (built or reloaded). It does not deactivate names removed from it, and does not re-enable a tool you turned off during the session while the setting is unchanged; a name you turned off, then removed from the setting and later added again, is activated by that reload. A session resumed in a new process has no earlier load to compare with, so there the names the session's first system prompt declared stand in for it.
 
 ## Network, transport and retry
 

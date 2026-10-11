@@ -1164,7 +1164,9 @@ impl Drop for RegisteredDeadline<'_> {
 /// # The two timeout arms
 ///
 /// Without a `pause`, the timeout arm is `await_response`'s own `(Some(timeout), None, false)`
-/// branch, reproduced: `max_total_timeout` has no upstream analogue and stays at its default.
+/// branch, reproduced: `max_total_timeout` has no upstream analogue and stays at its default. There
+/// is no arm without a timeout: options that carry none run under
+/// [`crate::runtime::DEFAULT_REQUEST_TIMEOUT`], as the SDK's `Protocol.request` does.
 ///
 /// With one — `callToolPausingForElicitation` (`elicitation-handler.ts:89-121`, MCP-606/MCP-607) —
 /// the budget is driven by a [`crate::call_deadline::CallDeadline`] instead, which an open
@@ -1182,7 +1184,11 @@ async fn request_on_peer(
     if cancel.is_cancelled() {
         return Err(Box::new(RequestFailure::aborted()));
     }
-    let timeout = options.timeout;
+    // `options?.timeout ?? DEFAULT_REQUEST_TIMEOUT_MSEC`: every request is bounded, and the only
+    // way to get here without a configured budget is an options object built by hand.
+    let limit = options
+        .timeout
+        .unwrap_or(crate::runtime::DEFAULT_REQUEST_TIMEOUT);
     let mut handle = peer
         .send_request_with_option(request, options)
         .await
@@ -1207,10 +1213,10 @@ async fn request_on_peer(
     // the earliest moment the token exists. `_registered`'s `Drop` is upstream's
     // `finally { state.deadlines.delete(deadline); deadline.pause(); }`.
     let registered = pause.and_then(|pause| pause.index(&handle.progress_token));
-    let settled = match (registered.as_ref(), timeout) {
+    let settled = match registered.as_ref() {
         // The pausable path. The loop re-polls `handle.rx` after every pause, resume and restart,
         // which is the point: how long is left changes under it.
-        (Some(registered), _) => {
+        Some(registered) => {
             // `CallDeadline::expired` is the loop: it re-reads how long is left after every pause,
             // resume and restart and only resolves on a real expiry, so this `select!` settles
             // exactly once, like the two below it.
@@ -1226,21 +1232,13 @@ async fn request_on_peer(
                 () = deadline.expired(&mut generation) => Settled::TimedOut(deadline.budget()),
             }
         }
-        (None, Some(limit)) => tokio::select! {
+        None => tokio::select! {
             biased;
             () = cancel.cancelled() => Settled::Cancelled,
             settled = tokio::time::timeout(limit, &mut handle.rx) => match settled {
                 Ok(Ok(response)) => Settled::Response(Box::new(response)),
                 Ok(Err(_closed)) => Settled::Closed,
                 Err(_elapsed) => Settled::TimedOut(limit),
-            },
-        },
-        (None, None) => tokio::select! {
-            biased;
-            () = cancel.cancelled() => Settled::Cancelled,
-            settled = &mut handle.rx => match settled {
-                Ok(response) => Settled::Response(Box::new(response)),
-                Err(_closed) => Settled::Closed,
             },
         },
     };
@@ -1491,10 +1489,7 @@ impl RuntimeEnv {
     /// `state.config` is this generation's committed snapshot and the manager's global default is
     /// set once at build.
     fn request_options(&self, server: &str) -> PeerRequestOptions {
-        self.state
-            .manager
-            .get_request_options(server)
-            .unwrap_or_else(PeerRequestOptions::no_options)
+        self.state.manager.get_request_options(server)
     }
 }
 
@@ -1593,20 +1588,22 @@ impl ProxyEnv for RuntimeEnv {
                 let params =
                     CallToolRequestParams::new(tool.to_string()).with_arguments(arguments.clone());
                 let options = self.request_options(server);
-                // MCP-606 — the ONE call upstream makes pausable. A `None` budget is upstream's
-                // "no timeout", which has no deadline to pause.
-                let pause = options.timeout.map(|budget| PausableDeadline {
+                // MCP-606 — the ONE call upstream makes pausable. The budget is
+                // `options?.timeout ?? DEFAULT_REQUEST_TIMEOUT_MSEC` (`elicitation-handler.ts:84`):
+                // an unset `requestTimeoutMs` is the SDK's 60 s, restarted on every progress
+                // notification, and never a call with no deadline.
+                let pause = PausableDeadline {
                     deadlines: self.state.manager.call_deadlines(),
                     server,
-                    budget,
-                });
+                    budget: options.timeout.unwrap_or(crate::runtime::DEFAULT_REQUEST_TIMEOUT),
+                };
                 async move {
                     let response = request_on_peer(
                         &peer,
                         CallToolRequest::new(params).into(),
                         options,
                         cancel,
-                        pause.as_ref(),
+                        Some(&pause),
                     )
                     .await
                     .map_err(|failure| *failure)?;
@@ -1827,11 +1824,10 @@ impl ProxyEnv for RuntimeEnv {
 
     // --- tool-metadata.ts / ts-shape.ts -----------------------------------------------------------
 
-    /// **MCP-211, unscheduled and out of this group.** `formatSchema` is model-facing text and must
-    /// not be improvised, so this answers a marker naming the unit rather than a plausible-looking
-    /// rendering of a schema nobody ported a renderer for. The single place to fill is this body.
-    fn format_schema(&self, _schema: &Value, _indent: &str) -> String {
-        "(schema rendering is not wired — MCP-211)".to_string()
+    /// MCP-211 — `formatSchema`, the parameter list of `mcp({ describe })`, `mcp({ search })` and the
+    /// `Expected parameters:` end of a failed call.
+    fn format_schema(&self, schema: &Value, indent: &str) -> String {
+        crate::proxy::format_schema(schema, indent)
     }
 
     /// `None` is upstream's own real branch — the caller forks to `Parameters:` plus
@@ -2078,6 +2074,9 @@ while IFS= read -r line; do
             i=$((i+1))
           done
           printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"progressive:done"}],"isError":false}}\n' "$id"
+          ;;
+        *'"name":"hang"'*)
+          sleep 600
           ;;
         *'"name":"boom"'*)
           printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"it went wrong"}],"isError":true}}\n' "$id"
@@ -2337,7 +2336,7 @@ done
                 attempt: attempt.clone(),
                 request: CancelToken::new(),
                 credentials_invalidated: false,
-                request_options: None,
+                request_options: crate::runtime::build_request_options(None, None),
             })
             .await
             .expect("the fixture connects");
@@ -2569,7 +2568,7 @@ done
                 attempt: attempt.clone(),
                 request: CancelToken::new(),
                 credentials_invalidated: false,
-                request_options: None,
+                request_options: crate::runtime::build_request_options(None, None),
             })
             .await
             .expect("the fixture connects");
@@ -2802,6 +2801,77 @@ done
         ));
     }
 
+    /// MCP-211 — `mcp({ describe })` over the one production [`ProxyEnv`] lists a tool's parameters.
+    /// The env answered the literal `(schema rendering is not wired — MCP-211)` for every schema, so
+    /// a model on the default gateway surface was never shown what a tool takes (and a failed call's
+    /// `Expected parameters:` ended in the same marker).
+    #[test]
+    fn describe_over_the_runtime_env_shows_the_tools_parameters() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let manager = Arc::new(crate::server_manager::McpServerManager::with_factory(
+            None,
+            Arc::new(crate::runtime::ConnectionBuilder::new(None)),
+        ));
+        let lifecycle = Arc::new(crate::lifecycle::McpLifecycleManager::new(
+            Arc::clone(&manager),
+            Arc::new(|_: &str| false),
+        ));
+        let state = Arc::new(McpState::new(crate::state::McpStateParts {
+            owner: Arc::new(crate::owner::McpRuntimeOwner::new()),
+            manager,
+            lifecycle,
+            config: crate::proxy::testsupport::config_with(&[("fixture", live_entry())]),
+            programmatic_config: None,
+            oauth_runtime: crate::oauth::create_oauth_runtime(None),
+            auth_storage_options: crate::state::AuthStorageOptions::default(),
+            ui: None,
+            open_browser: Arc::new(|_| Box::pin(async { Ok(()) })),
+            send_message: Arc::new(|_| {}),
+            blocked_project_servers: indexmap::IndexMap::new(),
+        }));
+        let mut tool = ToolMetadata::new("fixture_search", "search", "Search the index");
+        tool.input_schema = Some(serde_json::json!({
+            "type": "object",
+            "required": ["query"],
+            "properties": {
+                "query": { "type": "string", "description": "What to look for" },
+                "limit": { "type": "integer", "default": 10 }
+            }
+        }));
+        state
+            .tool_metadata
+            .lock()
+            .unwrap()
+            .insert("fixture".to_string(), vec![tool]);
+        let dirs = McpDirs::new(temp.path().to_path_buf(), temp.path().to_path_buf());
+        let ctx = crate::proxy::ProxyCtx::new(
+            Arc::clone(&state),
+            Arc::new(RuntimeEnv::new(
+                Arc::clone(&state),
+                dirs,
+                std::sync::Weak::new(),
+            )),
+        );
+
+        let described = crate::proxy::execute_describe(&ctx, "fixture_search");
+        let text = described
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                cyrup_core::Content::Text { text, .. } => Some(text.to_string()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            text.ends_with(
+                "\nParameters:\n  query (string) *required* - What to look for\n  limit (integer) [default: 10]"
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("MCP-211"), "{text}");
+    }
+
     /// rmcp's `Display` for `StreamableHttpError::SessionExpired` is read off the type, not copied,
     /// so a change to that text cannot silently stop [`session_expired_status`] from matching.
     #[test]
@@ -2927,6 +2997,90 @@ done
             details["mcpResult"]["content"][0]["text"],
             serde_json::json!("echoed:pong"),
             "`rawMcpResult` rode out with it: {details}"
+        );
+    }
+
+    /// A call to a server that never answers ends at the SDK's 60 s default when no
+    /// `requestTimeoutMs` is configured anywhere (`options?.timeout ?? DEFAULT_REQUEST_TIMEOUT_MSEC`,
+    /// `elicitation-handler.ts:84`). The first port read the unset value as "no timeout", so the call
+    /// — and the model turn waiting on it — lasted as long as the server stayed up: MEASURED, a
+    /// `tools/call` that was still hung after 80 s under `cyrup -p`, where `requestTimeoutMs: 3000`
+    /// returned at 4 s.
+    ///
+    /// The clock is paused once the child is connected, so the minute passes the moment the runtime
+    /// has nothing left to do — which, with a child asleep in `sleep 600`, is at once.
+    #[tokio::test]
+    async fn a_tool_call_the_server_never_answers_ends_at_the_sdk_default_timeout() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let entry = live_entry();
+        let manager = Arc::new(crate::server_manager::McpServerManager::with_factory(
+            None,
+            Arc::new(crate::runtime::ConnectionBuilder::new(None)),
+        ));
+        let lifecycle = Arc::new(crate::lifecycle::McpLifecycleManager::new(
+            Arc::clone(&manager),
+            Arc::new(|_: &str| false),
+        ));
+        let state = Arc::new(McpState::new(crate::state::McpStateParts {
+            owner: Arc::new(crate::owner::McpRuntimeOwner::new()),
+            manager,
+            lifecycle,
+            config: crate::proxy::testsupport::config_with(&[("fixture", entry.clone())]),
+            programmatic_config: None,
+            oauth_runtime: crate::oauth::create_oauth_runtime(None),
+            auth_storage_options: crate::state::AuthStorageOptions::default(),
+            ui: None,
+            open_browser: Arc::new(|_| Box::pin(async { Ok(()) })),
+            send_message: Arc::new(|_| {}),
+            blocked_project_servers: indexmap::IndexMap::new(),
+        }));
+        state
+            .manager
+            .connect("fixture", &entry, None)
+            .await
+            .expect("the fixture connects");
+        state.tool_metadata.lock().unwrap().insert(
+            "fixture".to_string(),
+            vec![ToolMetadata::new("fixture_hang", "hang", "hang")],
+        );
+        let dirs = McpDirs::new(temp.path().to_path_buf(), temp.path().to_path_buf());
+        let ctx = crate::proxy::ProxyCtx::new(
+            Arc::clone(&state),
+            Arc::new(RuntimeEnv::new(
+                Arc::clone(&state),
+                dirs,
+                std::sync::Weak::new(),
+            )),
+        );
+
+        tokio::time::pause();
+        let started = tokio::time::Instant::now();
+        let result = crate::proxy::execute_call(
+            &ctx,
+            "fixture_hang",
+            Some(&serde_json::json!({})),
+            None,
+            &CancelToken::new(),
+            None,
+        )
+        .await
+        .expect("a timed-out call reports through its result");
+
+        let details = result.details.clone().expect("details");
+        assert_eq!(
+            details["error"],
+            serde_json::json!("call_failed"),
+            "the call failed rather than hanging: {details}"
+        );
+        assert!(
+            text_of(&result.content).contains("MCP request timed out after 60000 ms"),
+            "the SDK default, named in the message: {}",
+            text_of(&result.content)
+        );
+        assert!(
+            started.elapsed() >= crate::runtime::DEFAULT_REQUEST_TIMEOUT,
+            "the minute really passed before the call gave up: {:?}",
+            started.elapsed()
         );
     }
 }

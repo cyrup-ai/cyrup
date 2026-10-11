@@ -467,3 +467,115 @@ fn the_builtin_tier_answers_the_shell_for_a_legacy_push() {
     assert_eq!(col, 1);
     assert!(bgs.iter().all(|bg| *bg == pending_bg()));
 }
+
+// ====================================================== TUI-166 — renderer output before images ====
+//
+// `TUI-166` was filed as a POSSIBLE ordering difference, unmeasured, for a tool result carrying both
+// a renderer's output and images. Measured at pi v1.1.0 it is NOT a divergence — both sides emit a
+// leading blank, then the renderer's content, then the images:
+//
+// ```ts
+// // tool-execution.ts:234-245 — render(width), renderer definition + renderShell "self"
+// const lines: string[] = [];
+// if (contentLines.length > 0) { lines.push(""); lines.push(...contentLines); }
+// for (let i = 0; i < this.imageComponents.length; i++) { /* spacer + image */ }
+// ```
+//
+// against `transcript/tool_render.rs::self_rendered_block`'s `out.push(Line::default())` +
+// `out.extend(content)` then `out.extend(image_raster_lines(..))`. The empty-and-no-images early
+// return matches too: pi's `contentLines.length === 0 && this.imageComponents.length === 0` and
+// cyrup's `content.is_empty() && !inline` reach the same answer, because zero images emit zero rows.
+//
+// The row is struck on that measurement, and this test exists so the order cannot drift back
+// silently — which is what its **Verify** line asked for ("a row-order test").
+
+/// A small solid PNG, base64 as a tool result carries it. Local rather than shared with
+/// `tests::tool_result_images`: that module's fixture is private to it, and one 8x8 image is
+/// cheaper than making it `pub(crate)` for one caller.
+///
+/// The colour is deliberately NOT asserted on. A half-block cell blends two pixel ROWS and the
+/// raster is resampled to the cell grid, so a solid `rgb(220,30,30)` source lands as
+/// `Rgb(189,26,26)` here — matching the source colour would be asserting the resampler, not the
+/// ordering. The rows are identified by the half-block glyph instead, which is what upstream's own
+/// `isImageLine` guard keys on (`tui.ts:1163`).
+fn image_png_b64() -> String {
+    use base64::Engine as _;
+    let mut img = image::RgbaImage::new(8, 8);
+    for px in img.pixels_mut() {
+        *px = image::Rgba([220, 30, 30, 255]);
+    }
+    let mut bytes: Vec<u8> = Vec::new();
+    image::DynamicImage::ImageRgba8(img)
+        .write_to(
+            &mut std::io::Cursor::new(&mut bytes),
+            image::ImageFormat::Png,
+        )
+        .unwrap();
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+/// The first row index carrying `needle`, and the first row index that is an IMAGE row — one
+/// holding the `▀` half-block the raster is drawn with (`ImageBlock::halfblock_lines`), which is
+/// the same signal upstream's `isImageLine` uses (`tui.ts:1163`).
+fn text_and_raster_rows(
+    view: &mut TranscriptView,
+    w: u16,
+    h: u16,
+    needle: &str,
+) -> (Option<usize>, Option<usize>) {
+    let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+    let theme = UiTheme::dark();
+    term.draw(|f| view.render(f, Rect::new(0, 0, w, h), &theme))
+        .unwrap();
+    let buf = term.backend().buffer().clone();
+    let mut text_row = None;
+    let mut raster_row = None;
+    for y in 0..h {
+        let mut line = String::new();
+        for x in 0..w {
+            line.push_str(buf.cell((x, y)).unwrap().symbol());
+        }
+        if text_row.is_none() && line.contains(needle) {
+            text_row = Some(usize::from(y));
+        }
+        if raster_row.is_none() && line.contains('\u{2580}') {
+            raster_row = Some(usize::from(y));
+        }
+    }
+    (text_row, raster_row)
+}
+
+/// `tool-execution.ts:234-245`: the renderer's own output, THEN the result images. A self-rendered
+/// tool whose result carries an image must not draw the picture above its renderer's text.
+#[test]
+fn a_self_rendered_result_draws_its_renderer_output_above_the_images() {
+    let mut view = TranscriptView::new();
+    view.push_tool_start_defined(
+        "shot_tool",
+        Some("c1".into()),
+        json!({}),
+        Some(crate::transcript::RenderedText::frozen("CALL-RENDER")),
+        Some(ToolRenderKind::SelfRendered),
+    );
+    // The RESULT's renderer output is the half this row is about, so it carries its own marker.
+    view.push_tool_end_rendered(
+        "shot_tool",
+        Some("c1"),
+        false,
+        Some(json!({
+            "content": [
+                { "type": "image", "data": image_png_b64(), "mimeType": "image/png" },
+            ]
+        })),
+        Some(crate::transcript::RenderedText::frozen("RESULT-RENDER")),
+        None,
+    );
+
+    let (text_row, raster_row) = text_and_raster_rows(&mut view, 60, 14, "RESULT-RENDER");
+    let text_row = text_row.expect("the result renderer's output must be drawn");
+    let raster_row = raster_row.expect("the result image must rasterize into half-block rows");
+    assert!(
+        text_row < raster_row,
+        "result renderer output (row {text_row}) must precede the image raster (row {raster_row})"
+    );
+}

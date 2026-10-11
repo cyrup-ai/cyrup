@@ -341,6 +341,13 @@ impl TranscriptView {
     /// upstream's `ToolRenderResultOptions.isPartial` (`types.ts:417`) is a property of the row,
     /// not of the frame — and `live.is_error` from the run's own `is_error`, for the same reason
     /// (`ToolRenderContext.isError`).
+    ///
+    /// `live.args_complete` is overridden per tool row from the run's own flag, for that same
+    /// reason, and it is what makes a streaming call RE-RENDER: pi re-invokes the renderer on every
+    /// `updateArgs` and again on `setArgsComplete` (`tool-execution.ts:170-173`, `:181-185`), and
+    /// here each of those moves either the args or the flag, so the recorded `source.under` stops
+    /// matching and the row is re-invoked (TUI-165). A custom message has no arguments and takes
+    /// the shape-preserving `true`.
     pub(crate) fn stale_extension_renders(
         &self,
         live: &cyrup_ext::RenderOptions,
@@ -350,28 +357,30 @@ impl TranscriptView {
         // click override when it has one (`setExpanded` on a single component), and `isPartial`
         // taken from the run for a tool RESULT. Built only for a row that carries an extension
         // render, so a long retained document costs one match per entry, not one clone.
-        let want = |expansion: Option<Expansion>, result: Option<ResultState>| {
-            let mut options = live.clone();
-            if let Some(e) = expansion {
-                options.expanded = e.is_open();
-            }
-            match result {
-                Some(state) => options
-                    .partial(state.partial)
-                    .errored(state.error)
-                    .recorded(state.recorded_ms),
-                None => options,
-            }
-        };
+        let want =
+            |expansion: Option<Expansion>, result: Option<ResultState>, args_complete: bool| {
+                let mut options = live.clone().args_complete(args_complete);
+                if let Some(e) = expansion {
+                    options.expanded = e.is_open();
+                }
+                match result {
+                    Some(state) => options
+                        .partial(state.partial)
+                        .errored(state.error)
+                        .recorded(state.recorded_ms),
+                    None => options,
+                }
+            };
         let consider = |slot: RenderSlot,
                         rendered: Option<&RenderedText>,
                         expansion: Option<Expansion>,
                         result: Option<ResultState>,
+                        args_complete: bool,
                         out: &mut Vec<StaleRender>| {
             let Some(source) = rendered.and_then(RenderedText::source) else {
                 return;
             };
-            let want = want(expansion, result);
+            let want = want(expansion, result, args_complete);
             if source.under == want {
                 return;
             }
@@ -399,7 +408,7 @@ impl TranscriptView {
                         } else {
                             RenderSlot::PendingCustom(i)
                         };
-                        consider(slot, text, None, None, &mut out);
+                        consider(slot, text, None, None, true, &mut out);
                     }
                     Entry::Tool(run) => {
                         let (call, result, expansion) = if retained {
@@ -415,12 +424,20 @@ impl TranscriptView {
                                 self.pending_expansion(i),
                             )
                         };
-                        consider(call, run.rendered_call.as_ref(), expansion, None, &mut out);
+                        consider(
+                            call,
+                            run.rendered_call.as_ref(),
+                            expansion,
+                            None,
+                            run.args_complete,
+                            &mut out,
+                        );
                         consider(
                             result,
                             run.rendered_result.as_ref(),
                             expansion,
                             Some(ResultState::of(run)),
+                            run.args_complete,
                             &mut out,
                         );
                     }
@@ -434,6 +451,7 @@ impl TranscriptView {
                 run.rendered_call.as_ref(),
                 run.live_expansion,
                 None,
+                run.args_complete,
                 &mut out,
             );
             consider(
@@ -441,6 +459,7 @@ impl TranscriptView {
                 run.rendered_result.as_ref(),
                 run.live_expansion,
                 Some(ResultState::of(run)),
+                run.args_complete,
                 &mut out,
             );
         }

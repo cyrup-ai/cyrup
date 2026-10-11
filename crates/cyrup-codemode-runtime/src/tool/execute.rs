@@ -18,6 +18,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use cyrup_codemode::declarations::render_tool_sample;
+use cyrup_codemode::identifier::IdentifierTable;
 use cyrup_codemode::js::json_stringify;
 use cyrup_codemode::output::{
     DEFAULT_MAX_OUTPUT_TOKENS, format_output, join_adjacent_text, label_images, save_image_output,
@@ -28,6 +29,7 @@ use cyrup_codemode::types::{OutputItem, ToolDeclaration};
 use cyrup_core::{CancelToken, Content, Tool, ToolCallId, ToolError, ToolResult, ToolUpdateSink};
 use futures::future::BoxFuture;
 use serde_json::Value;
+use tokio::sync::Semaphore;
 
 use super::description::{callable_tools, to_codemode_declaration};
 use super::discovery::discovery_globals;
@@ -37,13 +39,28 @@ use super::recorder::{ARGS_PREVIEW_CHARS, ERROR_PREVIEW_CHARS, Recorder, truncat
 use super::store::{CodemodeStoreEntryData, read_codemode_store};
 use super::{CodemodeNestedCall, CodemodeNestedCallStatus, CodemodeToolOptions};
 use crate::types::{
-    CodemodeError, CodemodeResult, CodemodeTool, CodemodeToolContext, Deadline, ErrorKind,
-    ExecuteOptions, SandboxOptions, ToolCallback,
+    CallStatus, CodemodeCall, CodemodeError, CodemodeResult, CodemodeTool, CodemodeToolContext,
+    DEFAULT_ACTIVE_LIMIT, DEFAULT_TOOL_WALL_TIMEOUT, Deadline, ErrorKind, ExecuteOptions,
+    SandboxOptions, ToolCallback, UnobservedErrors,
 };
 
 /// Heap limit for the script's isolate: a runaway script must not grow until it takes the session
 /// down (`CODEMODE_MEMORY_LIMIT_BYTES`, `execute.ts:55`). An overrun fails inside the script.
 pub const CODEMODE_MEMORY_LIMIT_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Nested tool calls one script may have running at once; the rest of a `Promise.all` over
+/// thousands of items queue for a slot (the same shape as `MAX_CONCURRENT_MODEL_CALLS`, which
+/// upstream caps at 4 for `models.*` and leaves out for tools).
+///
+/// [CYRUP-DELTA] Upstream runs every nested call at once, which a JavaScript runtime with a
+/// garbage collector and shared references survives. Here each running call is a task with its own
+/// copy of the session's context, and 3000 parallel `read`s held the process at 3.4 GB. Sixteen is
+/// above what a model's own parallel tool calls ever reach and far below what costs memory. A call
+/// that is waiting for a slot has no row yet and is cancelled with the script.
+pub const MAX_CONCURRENT_NESTED_CALLS: usize = 16;
+
+/// What a script is told when it ended while one of its calls was still waiting for a slot.
+const CANCELLED_WHILE_QUEUED: &str = "The tool call was cancelled before it started";
 
 /// The message of the `DOMException` an ordinary `AbortController.abort()` carries as its reason
 /// (`signal.reason.message`), which upstream renders as `Script aborted: <reason>`
@@ -93,15 +110,6 @@ fn preview_args(args: Option<&Value>) -> String {
     })
 }
 
-/// Like the script's `text()`: strings as is, other values as compact JSON (`valueText`,
-/// `execute.ts:236-239`).
-fn value_text(value: &Value) -> String {
-    match value {
-        Value::String(text) => text.clone(),
-        other => json_stringify(other),
-    }
-}
-
 /// `Tool calls made before the failure …` (`formatCallSummary`, `execute.ts:241-245`).
 fn format_call_summary(calls: &[CodemodeNestedCall]) -> String {
     if calls.is_empty() {
@@ -125,9 +133,140 @@ fn format_call_summary(calls: &[CodemodeNestedCall]) -> String {
     )
 }
 
+/// [CYRUP-DELTA] The note a script that succeeded gets when it ended with tool calls still running,
+/// which were cancelled: `main();` without an `await`, `forEach(async ...)`, a missing `await`.
+/// Upstream marks them `cancelled` in the details and says nothing in the text, so the result read
+/// as a plain success, with the read that never came back as "(no output)", or with some of the
+/// files a `forEach(async ...)` write loop was meant to make and some not, depending on timing. The
+/// model reads only the text. `None` when every call settled.
+fn format_unfinished_calls_note(calls: &[CodemodeCall]) -> Option<String> {
+    let mut counts: Vec<(&str, usize)> = Vec::new();
+    for call in calls
+        .iter()
+        .filter(|call| call.status == CallStatus::Cancelled)
+    {
+        match counts.iter_mut().find(|(name, _)| *name == call.name) {
+            Some((_, count)) => *count += 1,
+            None => counts.push((&call.name, 1)),
+        }
+    }
+    let total: usize = counts.iter().map(|(_, count)| count).sum();
+    if total == 0 {
+        return None;
+    }
+    let names: Vec<String> = counts
+        .iter()
+        .map(|(name, count)| {
+            if *count == 1 {
+                (*name).to_owned()
+            } else {
+                format!("{name} x{count}")
+            }
+        })
+        .collect();
+    let (calls, were) = if total == 1 {
+        ("call", "was")
+    } else {
+        ("calls", "were")
+    };
+    Some(format!(
+        "Note: {total} tool {calls} {were} still running when the script ended and {were} cancelled: {}. Await every call before the script ends (await Promise.all([...]), await main()).",
+        names.join(", ")
+    ))
+}
+
+/// [CYRUP-DELTA] The note a script that succeeded gets when an error in it was never handled: a
+/// tool call that failed and was not awaited, an `async` function that threw and was not awaited. A
+/// call that is awaited rejects into the script, which fails or catches it; one that is not has no
+/// one to tell, and upstream ends the script as a plain success, so a `tools.write(...)` that was
+/// not awaited and failed read as a file that was written. `None` when every error was handled.
+fn format_unobserved_errors_note(errors: &UnobservedErrors) -> Option<String> {
+    if errors.total == 0 {
+        return None;
+    }
+    let listed: Vec<String> = errors
+        .shown
+        .iter()
+        .map(|error| match &error.call {
+            Some(call) => format!("{call}: {}", error.message),
+            None => error.message.clone(),
+        })
+        .collect();
+    let more = errors.total.saturating_sub(listed.len());
+    let (errors_, was) = if errors.total == 1 {
+        ("error", "was")
+    } else {
+        ("errors", "were")
+    };
+    let rest = if more > 0 {
+        format!(" (and {more} more)")
+    } else {
+        String::new()
+    };
+    Some(format!(
+        "Note: {} {errors_} {was} never handled and did not fail the script: {}{rest}. A tool call or async function that is not awaited loses its error. Await every call before the script ends (await Promise.all([...]), await main()) and catch the errors you expect.",
+        errors.total,
+        listed.join("; "),
+    ))
+}
+
+/// [CYRUP-DELTA] The note a script that succeeded gets when calls it had started failed after it
+/// ended, and something was waiting on them: the siblings a `Promise.all` had already given up on, a
+/// call with a `.catch()`, a call an `async` function awaited that nobody awaited (`main();`,
+/// `forEach(async ...)`), a `.then(f)` with no `.catch()`. The engine cannot tell the first two,
+/// which the script dealt with, from the last two, which lost the error, so the note says what
+/// happened and gives no advice: the "never handled" note's ("await every call") is wrong for a
+/// script that did. Without it, `main();` and a failed `write` read as a plain success. `None` when
+/// no such call failed.
+fn format_late_failures_note(errors: &UnobservedErrors) -> Option<String> {
+    if errors.late_total == 0 {
+        return None;
+    }
+    let listed: Vec<String> = errors
+        .late_shown
+        .iter()
+        .map(|error| match &error.call {
+            Some(call) => format!("{call}: {}", error.message),
+            None => error.message.clone(),
+        })
+        .collect();
+    let more = errors.late_total.saturating_sub(listed.len());
+    let (calls, errors_) = if errors.late_total == 1 {
+        ("call", "error")
+    } else {
+        ("calls", "errors")
+    };
+    let rest = if more > 0 {
+        format!(" (and {more} more)")
+    } else {
+        String::new()
+    };
+    Some(format!(
+        "Note: {} {calls} failed after the script ended, so the script did not see the {errors_}: {}{rest}.",
+        errors.late_total,
+        listed.join("; "),
+    ))
+}
+
+/// [CYRUP-DELTA] What a script that ran into one of the default limits is told: how to raise them.
+/// An explicit `timeout_ms` is the model's own choice and needs no advice.
+fn default_limits_hint() -> String {
+    format!(
+        " Default limits: {} s of the script's own running time and {} min in all. To allow more, make the first line of the script `// @options: {{\"timeout_ms\": 3600000}}` (milliseconds); an explicit timeout_ms replaces both limits.",
+        DEFAULT_ACTIVE_LIMIT.as_secs(),
+        DEFAULT_TOOL_WALL_TIMEOUT.as_secs() / 60,
+    )
+}
+
 /// The failure text after `Script error:` (`formatError`, `execute.ts:247-258`): the script's own
 /// stack (or `Name: message`), a timeout, abort or sandbox failure, then the call summary.
-fn format_error(error: &CodemodeError, calls: &[CodemodeNestedCall]) -> String {
+/// `default_limits` is whether the script ran under the default limits, not a `timeout_ms` of its
+/// own.
+fn format_error(
+    error: &CodemodeError,
+    calls: &[CodemodeNestedCall],
+    default_limits: bool,
+) -> String {
     let head = match error.kind {
         ErrorKind::Script => error.stack.clone().unwrap_or_else(|| {
             format!(
@@ -136,6 +275,13 @@ fn format_error(error: &CodemodeError, calls: &[CodemodeNestedCall]) -> String {
                 error.message
             )
         }),
+        ErrorKind::Timeout if default_limits => {
+            format!(
+                "Script timed out: {}.{}",
+                error.message,
+                default_limits_hint()
+            )
+        }
         ErrorKind::Timeout => format!("Script timed out: {}", error.message),
         ErrorKind::Aborted => format!("Script aborted: {}", error.message),
         ErrorKind::Sandbox => format!("Script sandbox failed: {}", error.message),
@@ -162,15 +308,40 @@ fn to_fixed_1(seconds: f64) -> String {
 fn nested_tool(
     tool: &Arc<dyn Tool>,
     sample: &str,
+    identifiers: &IdentifierTable,
     host: Option<&Arc<dyn CodemodeHost>>,
     recorder: &Arc<Recorder>,
+    slots: &Arc<Semaphore>,
 ) -> CodemodeTool {
-    let (tool, host, recorder) = (Arc::clone(tool), host.cloned(), Arc::clone(recorder));
-    let declaration = ToolDeclaration::new(tool.name()).with_description(sample);
+    let (tool, host, recorder, slots) = (
+        Arc::clone(tool),
+        host.cloned(),
+        Arc::clone(recorder),
+        Arc::clone(slots),
+    );
+    let declaration = ToolDeclaration::new(tool.name())
+        .with_identifier(identifiers.get(tool.name()))
+        .with_description(sample);
     let execute: ToolCallback =
         Arc::new(move |args: Option<Value>, context: CodemodeToolContext| {
-            let (tool, host, recorder) = (Arc::clone(&tool), host.clone(), Arc::clone(&recorder));
+            let (tool, host, recorder, slots) = (
+                Arc::clone(&tool),
+                host.clone(),
+                Arc::clone(&recorder),
+                Arc::clone(&slots),
+            );
             let call: BoxFuture<'static, crate::types::ToolResult> = Box::pin(async move {
+                // Held until the call ends. The script ending fires the call's token, so a queued
+                // call does not keep waiting for a slot whose result nobody will read. A free slot
+                // wins over a token that is already fired: such a call still runs, as upstream's
+                // does, and the pipeline answers it as aborted.
+                let _slot = tokio::select! {
+                    biased;
+                    slot = slots.acquire() => slot.map_err(|error| error.to_string())?,
+                    () = context.cancel.cancelled() => {
+                        return Err(CANCELLED_WHILE_QUEUED.to_owned());
+                    }
+                };
                 let row = recorder.begin(CodemodeNestedCall {
                     id: format!("{}/?", recorder.tool_call_id()),
                     name: tool.name().to_owned(),
@@ -224,6 +395,9 @@ fn nested_tool(
     }
 }
 
+/// What the result says when the script produced no output.
+const NO_OUTPUT: &str = "(no output)";
+
 fn content_of(item: OutputItem) -> Content {
     match item {
         OutputItem::Text(text) | OutputItem::Console(text) => Content::text(text),
@@ -251,6 +425,7 @@ pub async fn execute_codemode(
 ) -> Result<ToolResult, ToolError> {
     let started = Instant::now();
     let parsed = parse_codemode_source(code).map_err(|error| ToolError::new(error.to_string()))?;
+    let explicit_timeout = parsed.options.timeout_ms.is_some();
     let host = options.host.current();
     let recorder = Arc::new(Recorder::new(tool_call_id.clone(), on_update));
 
@@ -258,6 +433,9 @@ pub async fn execute_codemode(
         .as_ref()
         .map(|host| callable_tools(&host.callable_tools()))
         .unwrap_or_default();
+    // [CYRUP-DELTA] One identifier per tool, shared by the declarations, `ALL_TOOLS`, the discovery
+    // globals and `tools.<id>`; upstream registers only the first of two tools with one identifier.
+    let identifiers = IdentifierTable::assign(callable.iter().map(|tool| tool.name()));
     // ALL_TOOLS entries carry the declaration.
     let samples: BTreeMap<String, String> = callable
         .iter()
@@ -268,21 +446,24 @@ pub async fn execute_codemode(
                     &to_codemode_declaration(
                         tool.as_ref(),
                         &cyrup_core::normalized_prompt_guidelines(tool.as_ref()),
+                        &identifiers,
                     ),
                     None,
                 ),
             )
         })
         .collect();
+    let slots = Arc::new(Semaphore::new(MAX_CONCURRENT_NESTED_CALLS));
     let tools: Vec<CodemodeTool> = callable
         .iter()
         .map(|tool| {
             let sample = samples.get(tool.name()).map_or("", String::as_str);
-            nested_tool(tool, sample, host.as_ref(), &recorder)
+            nested_tool(tool, sample, &identifiers, host.as_ref(), &recorder, &slots)
         })
         .collect();
 
-    let mut globals = discovery_globals(Arc::new(callable), Arc::new(samples));
+    let mut globals =
+        discovery_globals(Arc::new(callable), Arc::new(samples), Arc::new(identifiers));
     if options.models
         && let Some(models) = host.as_ref().and_then(|host| host.models())
     {
@@ -298,9 +479,15 @@ pub async fn execute_codemode(
         .create(SandboxOptions {
             tools,
             globals,
-            deadline: parsed.options.timeout_ms.map_or(Deadline::Never, |ms| {
-                Deadline::After(Duration::from_millis(ms))
-            }),
+            // [CYRUP-DELTA] Upstream runs a script without `timeout_ms` for ever. Here it gets the
+            // default limits, which an explicit `timeout_ms` replaces.
+            deadline: parsed
+                .options
+                .timeout_ms
+                .map_or(Deadline::After(DEFAULT_TOOL_WALL_TIMEOUT), |ms| {
+                    Deadline::After(Duration::from_millis(ms))
+                }),
+            active_limit: (!explicit_timeout).then_some(DEFAULT_ACTIVE_LIMIT),
             memory_limit_bytes: Some(CODEMODE_MEMORY_LIMIT_BYTES),
         })
         .map_err(|error| ToolError::new(error.to_string()))?;
@@ -309,8 +496,11 @@ pub async fn execute_codemode(
         Some(host) => read_codemode_store(&host.branch_custom_entries().await),
         None => serde_json::Map::new(),
     };
-    let settled = sandbox
-        .execute(
+    // Snapshots of the calls go out at most once per interval; this publishes the ones an interval
+    // held back, for as long as the script runs.
+    let settled = tokio::select! {
+        biased;
+        settled = sandbox.execute(
             &parsed.code,
             ExecuteOptions {
                 cancel: Some(cancel),
@@ -318,8 +508,9 @@ pub async fn execute_codemode(
                 deadline: None,
                 store,
             },
-        )
-        .await;
+        ) => settled,
+        never = recorder.publish_until_dropped() => match never {},
+    };
     sandbox.close().await;
     let result = settled.unwrap_or_else(|closed| CodemodeResult::Failed {
         error: CodemodeError {
@@ -333,17 +524,20 @@ pub async fn execute_codemode(
     });
     // Calls still marked running were cut off by the script ending, a timeout, or an abort.
     let calls = recorder.finish();
+    // The last state reaches the subscribers even when no interval was left to carry it.
+    recorder.flush();
 
     let ok = matches!(result, CodemodeResult::Completed { .. });
-    // The returned value is laid out with the script's own output; the error and the note below
+    // The returned value is laid out with the script's own output; the error and the notes below
     // are not script output, so they get no `==> text N/M <==` line (`execute.ts:502-512` @v1.1.0).
     let mut items: Vec<OutputItem>;
     match result {
         CodemodeResult::Completed {
             value,
             mut output,
+            calls: ran,
             store_writes,
-            ..
+            unobserved,
         } => {
             if let (Some(host), Some(entry)) =
                 (&host, CodemodeStoreEntryData::from_writes(store_writes))
@@ -354,17 +548,27 @@ pub async fn execute_codemode(
                     ))
                 })?;
             }
-            // pi extension: a returned value is appended like text().
+            // pi extension: a returned value is appended like text() (`valueText`,
+            // `execute.ts:236-239`): a string as it is, anything else as compact JSON.
             if let Some(value) = value {
-                output.push(OutputItem::Text(value_text(&value)));
+                output.push(OutputItem::Text(value.into_text()));
             }
             items = format_output(output);
+            if let Some(note) = format_unfinished_calls_note(&ran) {
+                items.push(OutputItem::Text(note));
+            }
+            if let Some(note) = format_unobserved_errors_note(&unobserved) {
+                items.push(OutputItem::Text(note));
+            }
+            if let Some(note) = format_late_failures_note(&unobserved) {
+                items.push(OutputItem::Text(note));
+            }
         }
         CodemodeResult::Failed { error, output, .. } => {
             items = format_output(output);
             items.push(OutputItem::Text(format!(
                 "Script error:\n{}",
-                format_error(&error, &calls)
+                format_error(&error, &calls, !explicit_timeout)
             )));
         }
     }
@@ -413,6 +617,11 @@ pub async fn execute_codemode(
         .as_ref()
         .map(|path| path.display().to_string());
     let mut content = vec![Content::text(header)];
+    // [CYRUP-DELTA] A script that printed nothing and returned nothing used to leave a bare
+    // "Output:", which reads like a result that was cut off.
+    if output.is_empty() {
+        content.push(Content::text(NO_OUTPUT));
+    }
     content.extend(output.into_iter().map(content_of));
     Ok(ToolResult {
         content,

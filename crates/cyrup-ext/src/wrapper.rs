@@ -145,6 +145,9 @@ impl Tool for RegisteredTool {
     fn output_schema(&self) -> Option<&Value> {
         self.inner.output_schema()
     }
+    fn is_mcp_tool(&self) -> bool {
+        self.inner.is_mcp_tool()
+    }
     fn prompt_snippet(&self) -> Option<&str> {
         self.inner.prompt_snippet()
     }
@@ -193,6 +196,9 @@ impl Tool for RegisteredTool {
     }
     fn namespace(&self) -> Option<&cyrup_core::ToolNamespace> {
         self.inner.namespace()
+    }
+    fn annotations(&self) -> Option<&cyrup_core::ToolAnnotations> {
+        self.inner.annotations()
     }
     fn default_active(&self) -> bool {
         self.inner.default_active()

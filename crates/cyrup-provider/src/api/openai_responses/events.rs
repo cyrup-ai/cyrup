@@ -105,7 +105,8 @@ pub(super) async fn process_event(
         }
         "response.function_call_arguments.delta" => {
             let delta = event.get("delta").and_then(Value::as_str).unwrap_or("");
-            if let Some(ci) = dec.slot(oi, SlotKind::Tool) {
+            // `slot.block.partialJson === undefined` skips a custom call (`:672` @v1.0.4).
+            if let Some(ci) = dec.function_call_slot(oi) {
                 if let Some(RBlock::Tool { partial_json, .. }) = dec.block_mut(ci) {
                     // O(delta): the append is amortised and no parse happens here at all — see
                     // [`SharedStr`] and [`LazyArgs`](cyrup_core::LazyArgs) (PERF-001).
@@ -120,7 +121,7 @@ pub(super) async fn process_event(
         }
         "response.function_call_arguments.done" => {
             let arguments = event.get("arguments").and_then(Value::as_str).unwrap_or("");
-            if let Some(ci) = dec.slot(oi, SlotKind::Tool) {
+            if let Some(ci) = dec.function_call_slot(oi) {
                 let mut maybe_delta: Option<String> = None;
                 if let Some(RBlock::Tool { partial_json, .. }) = dec.block_mut(ci) {
                     // REPLACES the buffer rather than appending to it. The buffer is the block's
@@ -141,6 +142,31 @@ pub(super) async fn process_event(
                         delta,
                         partial: dec.snapshot(model, api),
                     });
+                }
+            }
+        }
+        // Pi `response.custom_tool_call_input.delta` / `.done` (`openai-responses-shared.ts:
+        // 672-684` @v1.0.4): the raw grammar text streams in, and each step becomes an
+        // append-only JSON delta of the call's `{ [property]: text }` arguments.
+        "response.custom_tool_call_input.delta" | "response.custom_tool_call_input.done" => {
+            let done = etype.ends_with(".done");
+            if let Some(ci) = dec.custom_call_slot(oi) {
+                let accumulated;
+                let next_input = if done {
+                    event.get("input").and_then(Value::as_str).unwrap_or("")
+                } else {
+                    let delta = event.get("delta").and_then(Value::as_str).unwrap_or("");
+                    accumulated = format!("{}{delta}", dec.custom_input(ci).unwrap_or_default());
+                    accumulated.as_str()
+                };
+                match dec.append_custom_input(ci, next_input, done) {
+                    Ok(Some(delta)) => emit!(StreamEvent::ToolCallDelta {
+                        content_index: ci,
+                        delta,
+                        partial: dec.snapshot(model, api),
+                    }),
+                    Ok(None) => {}
+                    Err(e) => return ProcessResult::Error(e.0),
                 }
             }
         }
@@ -200,7 +226,51 @@ pub(super) async fn process_event(
                         partial: dec.snapshot(model, api),
                     });
                 }
-                ("function_call", SlotKind::Tool) => {
+                ("custom_tool_call", SlotKind::Tool) if dec.is_custom_call(ci) => {
+                    // `appendCustomToolCallInput(block, item.input ?? getCustomToolCallInput(block),
+                    // true)` (`:728-731`).
+                    let final_input = match item.get("input").and_then(Value::as_str) {
+                        Some(input) => input.to_string(),
+                        None => dec.custom_input(ci).unwrap_or_default(),
+                    };
+                    match dec.append_custom_input(ci, &final_input, true) {
+                        Ok(Some(delta)) => emit!(StreamEvent::ToolCallDelta {
+                            content_index: ci,
+                            delta,
+                            partial: dec.snapshot(model, api),
+                        }),
+                        Ok(None) => {}
+                        Err(e) => return ProcessResult::Error(e.0),
+                    }
+                    if let Some(RBlock::Tool {
+                        namespace,
+                        finished,
+                        ..
+                    }) = dec.block_mut(ci)
+                    {
+                        *finished = true;
+                        if let Some(ns) = item.get("namespace").and_then(Value::as_str) {
+                            *namespace = Some(ns.to_string());
+                        }
+                    }
+                    let tool_call = match dec.blocks.get(ci).map(project_block) {
+                        Some(Content::ToolCall(tc)) => tc.clone(),
+                        _ => ToolCall {
+                            id: ToolCallId::from(""),
+                            name: String::new(),
+                            arguments: Map::new().into(),
+                            thought_signature: None,
+                            namespace: None,
+                        },
+                    };
+                    dec.slots.remove(&oi);
+                    emit!(StreamEvent::ToolCallEnd {
+                        content_index: ci,
+                        tool_call,
+                        partial: dec.snapshot(model, api),
+                    });
+                }
+                ("function_call", SlotKind::Tool) if !dec.is_custom_call(ci) => {
                     let raw = item.get("arguments").and_then(Value::as_str).unwrap_or("");
                     if let Some(RBlock::Tool {
                         partial_json,

@@ -192,6 +192,51 @@ async fn a_failing_native_init_is_contained_and_recorded_not_fatal() {
     );
 }
 
+/// A Wasmtime runtime that cannot be built at all must not end session start, because the native
+/// built-ins (`codemode`, `mcp`, `flux`, the permission system) never need it. Measured on the real
+/// binary before the fix: with the address space limited by `ulimit -v`, `cyrup -p` exited 1 with
+/// `building agent session runtime: extension host: wasm engine init failed`, whatever extensions
+/// were installed. The pre-trust pass already degraded this way (EXT-003); the session's own host
+/// did `ExtensionHost::with_wasm(..)?`.
+///
+/// The failure is staged with `SessionBuilder::force_runtime_wasm_failure` (`cfg(test)` only): it is
+/// a property of the machine that a test process cannot lower on itself. The unit tests in
+/// `cyrup-ext` cover the on-demand retry that makes this second line rare.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dead_wasm_runtime_leaves_the_native_extensions_running() {
+    let fx = fixture();
+    let inited = Arc::new(AtomicBool::new(false));
+    let session = SessionBuilder::new(faux(), base_config(&fx))
+        .with_native_extension(Arc::new(MarkerExt {
+            id: "marker",
+            inited: inited.clone(),
+        }) as Arc<dyn NativeExtension>)
+        .force_runtime_wasm_failure()
+        .build()
+        .await
+        .expect("a wasm runtime that cannot be built must not fail the build");
+
+    assert!(
+        inited.load(Ordering::SeqCst),
+        "the native extension was never initialised"
+    );
+    let loaded: Vec<String> = session
+        .services()
+        .ext_host
+        .loaded_ids()
+        .iter()
+        .map(|i| i.to_string())
+        .collect();
+    assert!(
+        loaded.contains(&"marker".to_string()),
+        "loaded ids: {loaded:?}"
+    );
+    assert!(
+        session.services().ext_host.wasm().is_none(),
+        "the fallback host has no wasm runtime"
+    );
+}
+
 /// EVERY failing native is recorded, not just the first — the pre-fix `?` could only ever produce
 /// one error, because the build died on it.
 #[tokio::test]

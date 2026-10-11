@@ -2208,11 +2208,19 @@ impl ControlMonitor {
     /// (clear `currentTool`) and the `tool_result_end` half (mutating-failure accounting).
     pub fn observe_event(&mut self, event: &SubagentEvent, now: i64) {
         self.note_activity(now);
+        // [CYRUP-DELTA] A nested call (a `codemode` script's `tools.*`) is activity, noted above,
+        // but not a tool call of the model's: folding it would count it, open a second entry in
+        // the active-call set, and replace the single `pending_tool_result` slot the enclosing
+        // call's own end needs. See `SubagentEvent::is_nested`.
+        if event.is_nested() {
+            return;
+        }
         match event {
             SubagentEvent::ToolExecutionStart {
                 tool_call_id,
                 tool_name,
                 args,
+                ..
             } => {
                 self.tool_count = self.tool_count.saturating_add(1);
                 // SUBA-164 — register the call, then let `refresh_current_tool` derive the three
@@ -2246,6 +2254,7 @@ impl ControlMonitor {
                 tool_name,
                 result,
                 is_error,
+                ..
             } => {
                 // pi `tool_execution_end` half (`execution.ts:1021-1031` @v0.75.0, and
                 // `subagent-runner.ts:3052-3057`): the call leaves the open set, which is also
@@ -2520,6 +2529,7 @@ mod tests {
             tool_call_id: cyrup_core::ToolCallId::from(call_id),
             tool_name: tool.to_string(),
             args: serde_json::json!({ "command": "sleep 600" }),
+            parent_tool_call_id: None,
         }
     }
 
@@ -2529,6 +2539,7 @@ mod tests {
             tool_name: tool.to_string(),
             result: serde_json::json!("done"),
             is_error: false,
+            parent_tool_call_id: None,
         }
     }
 
@@ -3088,6 +3099,7 @@ mod tests {
                 tool_call_id: cyrup_core::ToolCallId::from("t1"),
                 tool_name: "bash".to_string(),
                 args: serde_json::json!({ "command": "sleep 600" }),
+                parent_tool_call_id: None,
             },
             0,
         );
@@ -3130,6 +3142,7 @@ mod tests {
                     tool_call_id: cyrup_core::ToolCallId::from("t"),
                     tool_name: "edit".to_string(),
                     args: serde_json::json!({ "path": "a.rs" }),
+                    parent_tool_call_id: None,
                 },
                 ts,
             );
@@ -3139,6 +3152,7 @@ mod tests {
                     tool_name: "edit".to_string(),
                     result: serde_json::json!("Error: no exact match for the old string"),
                     is_error: false,
+                    parent_tool_call_id: None,
                 },
                 ts + 1,
             );
@@ -3171,6 +3185,7 @@ mod tests {
             tool_call_id: cyrup_core::ToolCallId::from("t"),
             tool_name: "edit".to_string(),
             args: serde_json::json!({ "path": "a.rs" }),
+            parent_tool_call_id: None,
         };
         m.observe_event(&start, 0);
         m.observe_event(
@@ -3179,6 +3194,7 @@ mod tests {
                 tool_name: "edit".to_string(),
                 result: serde_json::json!("failed to apply"),
                 is_error: false,
+                parent_tool_call_id: None,
             },
             1,
         );
@@ -3189,6 +3205,7 @@ mod tests {
                 tool_name: "edit".to_string(),
                 result: serde_json::json!("wrote 12 lines"),
                 is_error: false,
+                parent_tool_call_id: None,
             },
             3,
         );
@@ -3199,6 +3216,7 @@ mod tests {
                 tool_name: "edit".to_string(),
                 result: serde_json::json!("failed to apply"),
                 is_error: false,
+                parent_tool_call_id: None,
             },
             5,
         );
@@ -3268,5 +3286,43 @@ mod tests {
         m.update_activity_state(2_000);
         assert_eq!(m.events().len(), 1);
         assert_eq!(m.events()[0].event_type, ControlEventType::NeedsAttention);
+    }
+
+    /// The monitor's fold keeps ONE pending-result slot, so a nested call's start would replace the
+    /// enclosing call's and a nested failed edit would be charged to the failure streak. Nested
+    /// calls are activity only.
+    #[test]
+    fn nested_calls_are_activity_but_not_tool_calls_of_the_monitor() {
+        let mut m = monitor(ResolvedControlConfig {
+            failed_tool_attempts_before_attention: 1,
+            needs_attention_after_ms: 10_000_000,
+            active_notice_after_ms: 10_000_000,
+            ..ResolvedControlConfig::default()
+        });
+        let parse = |line: &str| crate::exec::ndjson::parse_line(line).expect("fixture parses");
+        m.observe_event(
+            &parse(r#"{"type":"tool_execution_start","toolCallId":"c1","toolName":"codemode","args":{}}"#),
+            0,
+        );
+        m.observe_event(
+            &parse(r#"{"type":"tool_execution_start","toolCallId":"c1/1","toolName":"edit","args":{"path":"a.rs"},"parentToolCallId":"c1"}"#),
+            1,
+        );
+        m.observe_event(
+            &parse(r#"{"type":"tool_execution_end","toolCallId":"c1/1","toolName":"edit","result":"failed to apply","isError":true,"parentToolCallId":"c1"}"#),
+            2,
+        );
+        assert_eq!(m.tool_count, 1, "the nested start is not a tool call");
+        assert_eq!(m.current_tool.as_deref(), Some("codemode"));
+        assert!(
+            m.events().is_empty(),
+            "a nested failed edit is the script's to handle, not a mutating failure of the child: {:?}",
+            m.events()
+        );
+        assert_eq!(
+            m.last_activity_at,
+            Some(2),
+            "a nested event is still activity"
+        );
     }
 }

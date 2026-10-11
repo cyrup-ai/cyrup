@@ -9,6 +9,8 @@
 //! holds what only this implementation has to prove: the caller's runtime, concurrency, dropping
 //! and closing, the heap limit, the global surface.
 
+mod contract;
 mod port;
+mod process;
 mod runtime;
 mod support;

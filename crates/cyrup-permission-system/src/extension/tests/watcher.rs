@@ -451,3 +451,215 @@ async fn the_running_watcher_shares_the_extensions_live_config() {
 }
 
 // ==================================================================== PERM-011 (both halves)
+
+/// A root session without a UI says so in its spool, so a subagent child that would ask it refuses
+/// at once instead of waiting 10 minutes for an answer that cannot come; a UI that attaches
+/// withdraws the statement, and one that detaches again restores it. The marker is for the session
+/// that holds the UI, nothing else.
+#[tokio::test]
+async fn a_root_without_a_ui_marks_its_spool_and_a_ui_withdraws_the_mark() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_anchor_guard, ext) = parent_ext(dir.path(), "perm-unattended-root").await;
+    let agent_dir = dir.path().join("agent");
+    let hook = || HostEvent::BeforeAgentStart {
+        prompt: String::new(),
+        images: json!(null),
+        system_prompt: String::new(),
+        options: json!(null),
+        injected: Vec::new(),
+    };
+    let marked = || crate::forwarding::session_is_unattended(&agent_dir, "perm-unattended-root");
+
+    assert!(!marked(), "nothing has run");
+    let _ = ext
+        .on_event(
+            &HostEvent::SessionStart {
+                reason: "startup".into(),
+                previous_session_file: None,
+            },
+            &headless_ctx(dir.path()),
+        )
+        .await;
+    assert!(marked(), "a headless SessionStart marks the session");
+
+    // Every turn runs the hook again; the mark stays and nothing else appears next to it.
+    let _ = ext.on_event(&hook(), &headless_ctx(dir.path())).await;
+    assert!(marked());
+
+    let _ = ext.on_event(&hook(), &ui_ctx(dir.path())).await;
+    assert!(!marked(), "a UI that attaches withdraws the mark");
+
+    let _ = ext.on_event(&hook(), &headless_ctx(dir.path())).await;
+    assert!(marked(), "and one that detaches restores it");
+
+    // The mark is not withdrawn at shutdown: it names this process, so it lapses with the process
+    // (`forwarding::session_is_unattended`) and is swept up by the next headless start, and a
+    // background child that outlives a clean exit is no better served by a file that vanished.
+    let _ = ext
+        .on_event(
+            &HostEvent::SessionShutdown {
+                reason: "exit".to_string(),
+                target_session_file: None,
+            },
+            &headless_ctx(dir.path()),
+        )
+        .await;
+    assert!(
+        marked(),
+        "shutdown leaves the statement of a process that is still there"
+    );
+    ext.stop_forwarding_watcher();
+}
+
+/// Session ids survive resume, so `cyrup -p ...` and then `cyrup -c` with a UI is one session in two
+/// processes. The marker the first wrote is not this process's to have left, and it still has to go:
+/// the UI withdraws it on its first turn, whoever wrote it and whether or not that writer is still
+/// running (the marker here is stamped with this very process, which is alive).
+#[tokio::test]
+async fn a_ui_withdraws_the_marker_another_process_left_for_the_session_it_resumed() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_anchor_guard, ext) = parent_ext(dir.path(), "perm-resumed-root").await;
+    let agent_dir = dir.path().join("agent");
+    assert!(crate::forwarding::mark_session_unattended(
+        &agent_dir,
+        "perm-resumed-root",
+        None
+    ));
+    let marked = || crate::forwarding::session_is_unattended(&agent_dir, "perm-resumed-root");
+    assert!(marked(), "the headless run's marker is in place");
+
+    let _ = ext
+        .on_event(
+            &HostEvent::SessionStart {
+                reason: "resume".into(),
+                previous_session_file: None,
+            },
+            &ui_ctx(dir.path()),
+        )
+        .await;
+
+    assert!(
+        !marked(),
+        "a session that now has a UI still says it has none"
+    );
+    let location = crate::forwarding::forwarding_location(&agent_dir, "perm-resumed-root").unwrap();
+    assert!(
+        !location.session_root.join("no-ui").exists(),
+        "the file is withdrawn, not only ignored"
+    );
+    ext.stop_forwarding_watcher();
+}
+
+/// A `HostServices` whose session can change under a running process (`/new`, `/resume`, a fork).
+struct SwitchingHost(std::sync::Mutex<String>);
+impl HostServices for SwitchingHost {
+    fn session_id(&self) -> Option<String> {
+        Some(self.0.lock().unwrap().clone())
+    }
+}
+
+/// The first sync for each session id settles its marker: a UI that moves to another session in the
+/// same process withdraws that session's stale marker too, and the one it left is not touched again.
+#[tokio::test]
+async fn a_ui_that_moves_to_another_session_withdraws_that_sessions_marker_too() {
+    let dir = tempfile::tempdir().unwrap();
+    let _anchor_guard = ANCHOR_REGISTER_LOCK.lock().await;
+    let agent_dir = dir.path().join("agent");
+    std::fs::create_dir_all(&agent_dir).unwrap();
+    let ext = PermissionSystemExtension::new_forwarding_parent(
+        agent_dir.clone(),
+        dir.path().to_path_buf(),
+    );
+    let host = Arc::new(SwitchingHost(std::sync::Mutex::new(
+        "perm-first".to_owned(),
+    )));
+    ext.set_host_services(host.clone());
+    let marked = |id: &str| crate::forwarding::session_is_unattended(&agent_dir, id);
+    let hook = || HostEvent::BeforeAgentStart {
+        prompt: String::new(),
+        images: json!(null),
+        system_prompt: String::new(),
+        options: json!(null),
+        injected: Vec::new(),
+    };
+    assert!(crate::forwarding::mark_session_unattended(
+        &agent_dir,
+        "perm-first",
+        None
+    ));
+    assert!(crate::forwarding::mark_session_unattended(
+        &agent_dir,
+        "perm-second",
+        None
+    ));
+
+    let _ = ext.on_event(&hook(), &ui_ctx(dir.path())).await;
+    assert!(!marked("perm-first"));
+    assert!(marked("perm-second"), "not this process's session yet");
+
+    *host.0.lock().unwrap() = "perm-second".to_owned();
+    let _ = ext.on_event(&hook(), &ui_ctx(dir.path())).await;
+    assert!(!marked("perm-second"), "the new session has a UI as well");
+    ext.stop_forwarding_watcher();
+}
+
+/// A subagent child is no one's root: it never writes the mark, whatever its `has_ui`.
+#[tokio::test]
+async fn a_subagent_child_never_marks_a_spool() {
+    let dir = tempfile::tempdir().unwrap();
+    let agent_dir = dir.path().join("agent");
+    std::fs::create_dir_all(&agent_dir).unwrap();
+    let _anchor_guard = ANCHOR_REGISTER_LOCK.lock().await;
+    let child = PermissionSystemExtension::new_forwarding_child(
+        agent_dir.clone(),
+        dir.path().to_path_buf(),
+    );
+    child.set_host_services(Arc::new(WatcherHost("perm-unattended-child".to_string())));
+    let _ = child
+        .on_event(
+            &HostEvent::SessionStart {
+                reason: "startup".into(),
+                previous_session_file: None,
+            },
+            &headless_ctx(dir.path()),
+        )
+        .await;
+    assert!(!crate::forwarding::session_is_unattended(
+        &agent_dir,
+        "perm-unattended-child"
+    ));
+}
+
+/// A marker a UI could not remove is tried again at the next turn rather than taken for gone.
+#[tokio::test]
+async fn a_marker_a_ui_could_not_remove_is_withdrawn_at_the_next_turn() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_anchor_guard, ext) = parent_ext(dir.path(), "perm-stuck-root").await;
+    let agent_dir = dir.path().join("agent");
+    let location = crate::forwarding::forwarding_location(&agent_dir, "perm-stuck-root").unwrap();
+    let marker_path = location.session_root.join("no-ui");
+    let hook = || HostEvent::BeforeAgentStart {
+        prompt: String::new(),
+        images: json!(null),
+        system_prompt: String::new(),
+        options: json!(null),
+        injected: Vec::new(),
+    };
+    // A directory where the file belongs, which `remove_file` cannot take.
+    std::fs::create_dir_all(marker_path.join("inside")).unwrap();
+    let _ = ext.on_event(&hook(), &ui_ctx(dir.path())).await;
+    assert!(marker_path.exists(), "the obstruction is still in the way");
+
+    std::fs::remove_dir_all(&marker_path).unwrap();
+    assert!(crate::forwarding::mark_session_unattended(
+        &agent_dir,
+        "perm-stuck-root",
+        None
+    ));
+    let _ = ext.on_event(&hook(), &ui_ctx(dir.path())).await;
+    assert!(
+        !crate::forwarding::session_is_unattended(&agent_dir, "perm-stuck-root"),
+        "the next turn tried again"
+    );
+    ext.stop_forwarding_watcher();
+}

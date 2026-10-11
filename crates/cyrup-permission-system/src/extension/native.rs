@@ -43,10 +43,13 @@ impl NativeExtension for PermissionSystemExtension {
 
     /// P-1 (reconciliation §2 item 1): capture the late-bound live capability backend BEFORE `init`
     /// (the builder threads its `LiveHostServices` via `load_native_with_services`). The in-session
-    /// `ask` dialog (`resolve_ask`) prompts through it via [`LocalAskChannel`]. Set-once; a second
-    /// bind is ignored (the session's backend is stable).
+    /// `ask` dialog (`resolve_ask`) prompts through it via [`LocalAskChannel`]. The last bind wins: a session
+    /// replacement (`/new`, RPC `new_session`, a second ACP `session/new`) runs this again on the same
+    /// extension object with the replacement's backend, and everything the extension reaches outside a
+    /// `HostCtx` (the tool set it shapes at `before_agent_start`, the status pill, the ask dialog) must go
+    /// to the session that is live.
     fn set_host_services(&self, services: Arc<dyn HostServices>) {
-        let _ = self.host_services.set(services);
+        self.host_services.bind(services);
     }
 
     async fn init(&self, api: &mut InitApi) -> Result<(), ExtError> {
@@ -196,7 +199,7 @@ impl NativeExtension for PermissionSystemExtension {
                 // process's original cwd) — a session can start in a different working directory than
                 // the one the extension was constructed with. Also invalidates the agent-start cache
                 // (clears `active_skill_entries`), superseding the plain clear this arm did before.
-                self.refresh_config_and_manager(&ctx.cwd);
+                self.refresh_config_and_manager(ctx);
                 // PERM-001 / pi `process.env[SUBAGENT_PARENT_SESSION_ENV] = sessionId`
                 // (`pi-subagents/src/extension/index.ts:599` @v0.34.0): publish this parent session's id as
                 // the process-wide anchor a subagent child's forwarded ask addresses, BEFORE the
@@ -250,7 +253,7 @@ impl NativeExtension for PermissionSystemExtension {
                 guard(&self.dedup).clear();
                 // pi `refreshExtensionConfig` + `createPermissionManagerForCwd` +
                 // `invalidateAgentStartCache` (`:1848-1852`).
-                self.refresh_config_and_manager(&ctx.cwd);
+                self.refresh_config_and_manager(ctx);
                 // PERM-027 / pi `writeDebugEntry("lifecycle.reload", …)` (`:1853-1857`). pi's `cwd`
                 // is `runtimeContext?.cwd ?? null`; cyrup's `ctx` is always live at dispatch, so
                 // the null arm is unreachable rather than dropped.
@@ -268,7 +271,7 @@ impl NativeExtension for PermissionSystemExtension {
                 // pi `index.ts:2122,2123,2128,2130,2131`: clear the status pill + stores + dedup + skill
                 // state; tear down watcher.
                 if let Some(s) = self.host_services.get() {
-                    status::clear_status(s);
+                    status::clear_status(&s);
                 }
                 guard(&self.session_approvals).clear();
                 guard(&self.dedup).clear();

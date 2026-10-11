@@ -389,7 +389,7 @@ mod wasm {
     const EXECUTE_TOOL: Lowered = Lowered {
         core_name: "execute_tool",
         component_func: "$execute-tool-import",
-        core_sig: "(param i32 i32 i32 i32 i32 i32 i32 i32)",
+        core_sig: "(param i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32)",
         needs_realloc: true,
     };
     const CALLABLE_TOOLS: Lowered = Lowered {
@@ -412,8 +412,10 @@ mod wasm {
     };
 
     /// The `host-tool` import, declaring the two functions this change adds.
-    const HOST_TOOL_IMPORT: &str = r#"  (import "cyrup:ext/host-tool@0.19.0" (instance $ht
-    (export "execute-tool" (func (param "call-id" string) (param "name" string) (param "args-json" string) (param "collect-updates" bool) (result (result (tuple string (list string)) (error string)))))
+    const HOST_TOOL_IMPORT: &str = r#"  (import "cyrup:ext/host-tool@0.20.0" (instance $ht
+    (type $eo (record (field "collect-updates" bool) (field "signal-id" (option string)) (field "timeout-ms" (option u32))))
+    (export "execute-options" (type $eo-x (eq $eo)))
+    (export "execute-tool" (func (param "call-id" string) (param "name" string) (param "args-json" string) (param "options" $eo-x) (result (result (tuple string (list string)) (error string)))))
     (export "callable-tools" (func (param "call-id" string) (result (result string (error string)))))))
   (alias export $ht "execute-tool" (func $execute-tool-import))
   (alias export $ht "callable-tools" (func $callable-tools-import))
@@ -442,10 +444,10 @@ mod wasm {
             .collect()
     }
 
-    /// The canonical-ABI `tool-descriptor` (136 bytes) for a tool named `name` with `{}` parameters
+    /// The canonical-ABI `tool-descriptor` (160 bytes) for a tool named `name` with `{}` parameters
     /// and every optional member absent.
     fn descriptor(name_len: u32) -> String {
-        let mut words = [0u32; 34];
+        let mut words = [0u32; 40];
         words[0] = 17200; // name ptr
         words[1] = name_len;
         words[6] = 17220; // parameters-json ptr
@@ -477,7 +479,8 @@ mod wasm {
         format!(
             "    (func (export \"execute-tool\") (param i32 i32 i32 i32 i32 i32) (result i32) \
              (call $execute_tool {call_id} (i32.const 17400) (i32.const 4) (i32.const 17410) \
-             (i32.const 16) (i32.const 1) (i32.const 18000)) \
+             (i32.const 16) (i32.const 1) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) \
+             (i32.const 0) (i32.const 18000)) \
              (i32.store (i32.const 18100) (i32.load (i32.const 18000))) \
              (i32.store (i32.const 18104) (i32.load (i32.const 18004))) \
              (i32.store (i32.const 18108) (i32.load (i32.const 18008))) \

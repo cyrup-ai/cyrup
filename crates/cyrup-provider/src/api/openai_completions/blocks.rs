@@ -3,6 +3,7 @@
 use crate::api::content_cache::ContentCache;
 use crate::model::Model;
 use crate::usage::apply_cost;
+use crate::utils::constrained_sampling::{ConstrainedSamplingError, CustomToolInput};
 use cyrup_core::{
     ApiId, AssistantMessage, Content, LazyArgs, SharedStr, StopReason, ToolCall, ToolCallId, Usage,
 };
@@ -25,6 +26,10 @@ pub(super) enum Block {
         /// first read, so a snapshot nobody reads never parses it at all (PERF-001).
         args: SharedStr,
         thought_signature: Option<String>,
+        /// `Some` for a grammar-constrained (`custom`) call (PROV-101). Its `args` is then the JSON
+        /// form of `{ [property]: input }`, kept in step by [`Decoder::append_custom_input`], and
+        /// `function.arguments` fragments no longer apply to it.
+        custom: Option<CustomToolInput>,
     },
 }
 
@@ -65,6 +70,9 @@ pub(super) struct Decoder {
     /// Whether any chunk carried a `finish_reason` (Pi `hasFinishReason`). A stream that ends
     /// without one is a protocol error (Pi openai-completions.ts:452-454).
     pub(super) saw_finish_reason: bool,
+    /// Pi `grammarToolInputProperties` (`openai-completions.ts:162`): tool name → the argument
+    /// property a `custom` tool call's raw text is stored under (PROV-101).
+    pub(super) grammar_inputs: HashMap<String, String>,
 }
 
 impl Decoder {
@@ -78,6 +86,37 @@ impl Decoder {
     pub(super) fn block_mut(&mut self, pos: usize) -> Option<&mut Block> {
         self.cache.invalidate(pos);
         self.blocks.get_mut(pos)
+    }
+
+    /// Pi `appendCustomToolCallInput` on the block at `pos` (`openai-completions.ts:414-430`):
+    /// record `next_input` as the call's raw text and return the JSON delta it adds. `Ok(None)`
+    /// for a block that is not a custom call.
+    pub(super) fn append_custom_input(
+        &mut self,
+        pos: usize,
+        next_input: &str,
+        close: bool,
+    ) -> Result<Option<String>, ConstrainedSamplingError> {
+        match self.block_mut(pos) {
+            Some(Block::Tool {
+                args,
+                custom: Some(custom),
+                ..
+            }) => custom.append_into(args, next_input, close),
+            _ => Ok(None),
+        }
+    }
+
+    /// The raw text a custom call holds so far (pi `getCustomToolCallInput`); `None` when the block
+    /// at `pos` is not a custom call.
+    pub(super) fn custom_input(&self, pos: usize) -> Option<String> {
+        match self.blocks.get(pos) {
+            Some(Block::Tool {
+                custom: Some(custom),
+                ..
+            }) => Some(custom.input().to_string()),
+            _ => None,
+        }
     }
 
     /// The content projection, recomputing only the blocks whose memo was invalidated.
@@ -147,6 +186,7 @@ pub(super) fn project_block(block: &Block) -> Content {
                 name,
                 args,
                 thought_signature,
+                custom: _,
             } => Content::ToolCall(ToolCall {
                 id: ToolCallId::from(id.as_str()),
                 name: name.clone(),

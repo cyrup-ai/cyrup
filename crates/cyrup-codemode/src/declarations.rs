@@ -30,7 +30,7 @@
 
 use serde_json::{Map, Value};
 
-use crate::identifier::{is_identifier, to_codemode_identifier};
+use crate::identifier::is_identifier;
 use crate::js::{
     decode_uri_component, js_string_cmp, js_trim, json_stringify, split_lines, utf16_len,
 };
@@ -189,7 +189,7 @@ pub fn render_tool_signature(tool: &ToolDeclaration, input_max_chars: Option<usi
     );
     format!(
         "{}(args: {input}): Promise<{}>;",
-        to_codemode_identifier(&tool.name),
+        tool.script_identifier(),
         render_tool_output_type(tool.output_schema.as_ref())
     )
 }

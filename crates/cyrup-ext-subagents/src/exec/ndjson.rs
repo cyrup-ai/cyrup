@@ -124,11 +124,17 @@ pub enum SubagentEvent {
     /// A tool call started executing (R-SA-027: increments `tool_count`, sets `current_tool` in
     /// the caller's `AgentProgress` — that fold itself lives in a later phase's `exec/mod.rs`
     /// `run_sync`, not here).
+    ///
+    /// `parent_tool_call_id` is `Some` for a NESTED call: one a tool made through
+    /// `ctx.executeTool()` while it ran (a `codemode` script's `tools.bash(...)`). See
+    /// [`SubagentEvent::is_nested`] for who must and must not count such an event.
     ToolExecutionStart {
         tool_call_id: ToolCallId,
         tool_name: String,
         #[serde(default)]
         args: serde_json::Value,
+        #[serde(default)]
+        parent_tool_call_id: Option<ToolCallId>,
     },
     /// A tool call reported incremental progress before finishing.
     ToolExecutionUpdate {
@@ -138,6 +144,8 @@ pub enum SubagentEvent {
         args: serde_json::Value,
         #[serde(default)]
         partial_result: serde_json::Value,
+        #[serde(default)]
+        parent_tool_call_id: Option<ToolCallId>,
     },
     /// A tool call finished executing. Note this is the wire's actual terminal tool-call event —
     /// func-SA §4.3's illustrative `ToolResultEnd{call_id,is_error}` data-model entry names a
@@ -153,6 +161,8 @@ pub enum SubagentEvent {
         result: serde_json::Value,
         #[serde(default)]
         is_error: bool,
+        #[serde(default)]
+        parent_tool_call_id: Option<ToolCallId>,
     },
     /// A turn (assistant message + its tool calls/results) completed.
     ///
@@ -271,6 +281,39 @@ impl SubagentEvent {
             SubagentEvent::ModelChanged { .. } => "model_changed",
             SubagentEvent::Unknown => "unknown",
         }
+    }
+
+    /// True for a `tool_execution_*` event of a NESTED call: one a tool made through
+    /// `ctx.executeTool()` while it ran, which carries the `parentToolCallId` of the model-issued
+    /// call that made it (cyrup-session-svc `AgentSessionEvent::NestedToolExecution*`; Pi
+    /// `WithParentToolCallId<ToolExecution…Event>`, `agent-session.ts:182-190` @v1.0.4).
+    ///
+    /// **[CYRUP-DELTA]** pi-subagents has no such notion — its folds
+    /// (`runs/foreground/execution.ts`, `evt.type === "tool_execution_start"`) never look at
+    /// `parentToolCallId`, so a `codemode` script's calls are counted as the child's own tool
+    /// calls there. cyrup splits the two on purpose:
+    /// - the PROGRESS surfaces ([`crate::exec::progress::AgentProgress`], the control telemetry,
+    ///   the live fleet fold) describe what the MODEL did, so they skip a nested event: one
+    ///   `codemode` call that makes forty `tools.read(...)` calls is one tool call, and the
+    ///   `codemode` call stays the `current_tool` until it ends (nested calls share the child's
+    ///   `pendingToolResult` slot in those folds, so folding them would clobber the parent's);
+    /// - the MUTATION guard ([`crate::exec::control::has_mutation_tool_call`]) keeps them, because
+    ///   a child whose only write was `tools.write(...)` inside a script DID mutate the workspace.
+    #[must_use]
+    pub fn is_nested(&self) -> bool {
+        matches!(
+            self,
+            SubagentEvent::ToolExecutionStart {
+                parent_tool_call_id: Some(_),
+                ..
+            } | SubagentEvent::ToolExecutionUpdate {
+                parent_tool_call_id: Some(_),
+                ..
+            } | SubagentEvent::ToolExecutionEnd {
+                parent_tool_call_id: Some(_),
+                ..
+            }
+        )
     }
 
     /// Extract the per-turn [`Usage`] out of a [`SubagentEvent::MessageEnd`]'s embedded assistant
@@ -521,6 +564,7 @@ mod tests {
                 tool_call_id: "c1".into(),
                 tool_name: "bash".to_string(),
                 args: serde_json::json!({"cmd": "ls"}),
+                parent_tool_call_id: None,
             }
         );
     }
@@ -606,6 +650,7 @@ mod tests {
                 tool_name: "bash".to_string(),
                 result: serde_json::json!("ok"),
                 is_error: false,
+                parent_tool_call_id: None,
             }
         );
         assert_eq!(ev.kind(), "tool_execution_end");
@@ -734,12 +779,14 @@ mod tests {
                 tool_call_id: "c1".into(),
                 tool_name: "bash".to_string(),
                 args: serde_json::Value::Null,
+                parent_tool_call_id: None,
             },
             SubagentEvent::ToolExecutionEnd {
                 tool_call_id: "c1".into(),
                 tool_name: "bash".to_string(),
                 result: serde_json::Value::Null,
                 is_error: true,
+                parent_tool_call_id: None,
             },
         ];
         let outcomes = correlate_tool_outcomes(&events);
@@ -1030,5 +1077,42 @@ mod tests {
             vec!["agent_start", "tool_execution_start", "agent_end"],
             "the malformed line is skipped; the final unterminated line still parses"
         );
+    }
+
+    /// The wire a `codemode` script's nested calls take: `cyrup-session-svc`'s
+    /// `NestedToolExecution*` events serialize with the SAME `type` tag as the loop's and the extra
+    /// `parentToolCallId` key written last (`event.rs`). Parsed here exactly as the emitter writes it.
+    #[test]
+    fn a_nested_tool_execution_line_carries_its_parent_and_reads_as_nested() {
+        let top = parse_line(
+            r#"{"type":"tool_execution_start","toolCallId":"c1","toolName":"codemode","args":{}}"#,
+        )
+        .expect("top-level start parses");
+        assert!(!top.is_nested());
+        let lines = [
+            r#"{"type":"tool_execution_start","toolCallId":"c1/1","toolName":"bash","args":{"command":"ls"},"parentToolCallId":"c1"}"#,
+            r#"{"type":"tool_execution_update","toolCallId":"c1/1","toolName":"bash","args":{},"partialResult":{},"parentToolCallId":"c1"}"#,
+            r#"{"type":"tool_execution_end","toolCallId":"c1/1","toolName":"bash","result":{},"isError":false,"parentToolCallId":"c1"}"#,
+        ];
+        for line in lines {
+            let event = parse_line(line).expect("nested line parses");
+            assert!(event.is_nested(), "{line} must read as nested: {event:?}");
+        }
+        let start = parse_line(lines[0]).expect("parses");
+        assert!(
+            matches!(
+                &start,
+                SubagentEvent::ToolExecutionStart {
+                    parent_tool_call_id: Some(parent),
+                    ..
+                } if parent.as_str() == "c1"
+            ),
+            "a nested start is still the start variant, carrying its parent: {start:?}"
+        );
+        let top_end = parse_line(
+            r#"{"type":"tool_execution_end","toolCallId":"c1","toolName":"codemode","result":{},"isError":false}"#,
+        )
+        .expect("top-level end parses");
+        assert!(!top_end.is_nested());
     }
 }

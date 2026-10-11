@@ -6,7 +6,7 @@ use super::{Agent, AgentBuilder, HeaderFn};
 use crate::error::{AgentError, BusyEntry};
 use crate::event::AgentMessage;
 use crate::queue::{QueueMode, ToolExecution};
-use crate::state::AgentStateSnapshot;
+use crate::state::{AgentStateSnapshot, NestedContext};
 use crate::stream_fn::StreamFn;
 use crate::subscriber::EventSubscriber;
 use cyrup_core::{AssistantMessage, CancelToken, ModelRef, ModelThinkingLevel, Tool, ToolLoadout};
@@ -71,6 +71,15 @@ impl Agent {
         // Read the latch, then take the lock — never hold the lock while touching the channel.
         let running = self.is_running();
         lock(&self.state).snapshot(running)
+    }
+
+    /// What a nested tool call is shown of this agent: the system prompt and the transcript as
+    /// shared handles. Calls made while the transcript is unchanged get the same handles, so a
+    /// script that makes thousands of calls does not copy the transcript thousands of times (pi
+    /// passes the live array by reference). The handles are a snapshot: a later change to the
+    /// transcript is seen by the next call, never by one that already has them.
+    pub async fn nested_context(&self) -> NestedContext {
+        lock(&self.state).nested_context()
     }
 
     /// The live `(model, messages)` pair, read SYNCHRONOUSLY — pi's `agent.state.model` /
@@ -155,7 +164,7 @@ impl Agent {
 
     /// Copies the top-level Vec (the caller's array is decoupled, R-02-038).
     pub async fn set_messages(&self, msgs: Vec<AgentMessage>) {
-        lock(&self.state).messages = msgs;
+        lock(&self.state).messages = msgs.into();
     }
 
     /// Atomic transcript edit under the state lock — the replacement for every

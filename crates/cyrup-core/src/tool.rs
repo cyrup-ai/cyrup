@@ -20,7 +20,9 @@
 
 use crate::ToolCallId;
 use crate::cancel::CancelToken;
-use crate::exposure::{LoadoutView, ToolExposure, ToolLoadoutChanges, ToolNamespace};
+use crate::exposure::{
+    LoadoutView, ToolAnnotations, ToolExposure, ToolLoadoutChanges, ToolNamespace,
+};
 use crate::message::Content;
 
 /// Per-tool execution mode (func-02 R-02-014).
@@ -264,6 +266,18 @@ pub trait Tool: Send + Sync {
         None
     }
 
+    /// Whether this is an MCP tool, for the session's `--tools` / `--exclude-tools` handling: an
+    /// allowlist that does not name MCP tools leaves them registered for `codemode` and
+    /// `tool_search` ([`crate::is_allowed_tool`], pi `_isAllowedTool`, `core/agent-session.ts`
+    /// @v1.0.4).
+    ///
+    /// The default is pi's rule, which reads the name (`isMcpToolName`: `mcp__<server>__<tool>` or
+    /// a resource tool). [CYRUP-DELTA] A tool says so itself here because an MCP extension names
+    /// its tools by its own `toolPrefix` setting, and `docs_find` says nothing by its name.
+    fn is_mcp_tool(&self) -> bool {
+        crate::is_mcp_tool_name(self.name())
+    }
+
     /// One-line snippet for the "Available tools" section of the default system prompt (Pi
     /// `ToolDefinition.promptSnippet`, extensions/types.ts:442-443). Default `None` omits the tool
     /// from that section (today's behavior).
@@ -416,6 +430,14 @@ pub trait Tool: Send + Sync {
     /// The group this tool belongs to, such as an MCP server (pi `ToolDefinition.namespace`).
     /// Default `None`.
     fn namespace(&self) -> Option<&ToolNamespace> {
+        None
+    }
+
+    /// Hints about what the tool does, such as an MCP server's tool annotations (pi
+    /// `ToolDefinition.annotations`, `extensions/types.ts:603` @v1.0.4; the type is
+    /// [`ToolAnnotations`]). Reported on the tool's `getAllTools` row so a permission extension can
+    /// decide which calls to confirm. Default `None`, pi's omitted field.
+    fn annotations(&self) -> Option<&ToolAnnotations> {
         None
     }
 

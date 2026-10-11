@@ -22,8 +22,10 @@
 //!    connection. The tempdir has no `mcp-cache.json`, so its cold-cache arm sets `bootstrap_all`
 //!    and the startup pass connects every enabled server once.
 //! 4. The commit tail publishes the state, installs the runtime env (the generation's
-//!    `ProxyCtx`), installs MCP-214's dispatcher into the `ToolDispatch` slot every tool registered
-//!    at `init` closed over, installs the surface-sync listener and re-syncs the surface.
+//!    `ProxyCtx`), installs the surface-sync listener and re-syncs the surface. MCP-214's
+//!    dispatcher went into the `ToolDispatch` slot every tool registered at `init` closed over when
+//!    the build started (step 2), so a call that landed mid-build joined it; the tail's install is
+//!    the idempotent backstop.
 //! 5. A model-issued `mcp({...})` reaches `ProxyTool::execute`, which finds a **non-empty** dispatch
 //!    slot, calls `McpDispatch::call_proxy`, which reads the committed `ProxyCtx` live and routes
 //!    into the nine modes against the real `McpState`.

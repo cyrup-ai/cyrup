@@ -21,10 +21,10 @@
 )]
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 
-use cyrup_ext::host::HostServices;
 use cyrup_ext::host::services::{ModelsPublication, ModelsPublisher};
+use cyrup_ext::host::{HostServices, HostServicesSlot};
 use cyrup_provider::auth::{Credential, CredentialStore, InMemoryCredentialStore};
 use cyrup_provider::{Provider, ProviderError, RefreshModelsContext};
 use serde_json::json;
@@ -84,9 +84,9 @@ fn key_of(credential: Option<Credential>) -> Option<String> {
 
 /// The store the extension hands its provider, over a services cell the host fills in.
 fn credentials_over(host: Option<Arc<LateStoreHost>>) -> HostCredentials {
-    let cell: Arc<OnceLock<Arc<dyn HostServices>>> = Arc::new(OnceLock::new());
+    let cell = Arc::new(HostServicesSlot::new());
     if let Some(host) = host {
-        let _ = cell.set(host as Arc<dyn HostServices>);
+        cell.bind(host as Arc<dyn HostServices>);
     }
     HostCredentials::new(cell)
 }

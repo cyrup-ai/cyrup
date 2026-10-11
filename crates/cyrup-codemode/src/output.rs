@@ -84,9 +84,11 @@ impl TruncationPlan {
     #[must_use]
     pub fn finish(self, spilled: Result<PathBuf, SpillError>) -> TruncatedOutput {
         let (footer, full_output_path) = match spilled {
+            // [CYRUP-DELTA] Upstream says "read with offset/limit". In `codemode.mode = only` the
+            // model has no `read` tool of its own, only `tools.read` in a script.
             Ok(path) => (
                 format!(
-                    "\n\n[Full output: {} (read with offset/limit)]",
+                    "\n\n[Full output: {} (read or tools.read with offset/limit)]",
                     path.display()
                 ),
                 Some(path),
@@ -262,6 +264,11 @@ const OUTPUT_FILE_MODE: u32 = 0o600;
 
 /// A new output file: created exclusively, so a path someone else placed there (a link, say) is an
 /// error and is never followed (pi's `flag: "wx"`), and readable only by the user.
+///
+/// [CYRUP-DELTA] The path is also recorded with [`cyrup_core::spilled_files`]. The result names it
+/// (`Full output: <path>`, `Image saved to <path>`) and tells the model to read it, and pi has no
+/// permission policy that could refuse that read; cyrup's guards reads outside the project, and
+/// must be able to tell this file from any other one in the temp directory.
 fn create_output_file(path: &Path) -> io::Result<std::fs::File> {
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
@@ -270,7 +277,9 @@ fn create_output_file(path: &Path) -> io::Result<std::fs::File> {
         use std::os::unix::fs::OpenOptionsExt as _;
         options.mode(OUTPUT_FILE_MODE);
     }
-    options.open(path)
+    let file = options.open(path)?;
+    cyrup_core::spilled_files::record(path);
+    Ok(file)
 }
 
 /// `writeOutputFile` (`utils/output-files.ts:22-28` @v1.0.3): write `bytes` to a new output file

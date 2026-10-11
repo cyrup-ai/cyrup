@@ -1,4 +1,4 @@
-// cyrup:ext@0.19.0 — the versioned WIT world (arch-08 §4.1).
+// cyrup:ext@0.20.0 — the versioned WIT world (arch-08 §4.1).
 //
 // Single source of truth, shared verbatim by the host (`wasmtime::component::bindgen!`)
 // and the guest (`wit-bindgen` in cyrup-ext-sdk). Open-shaped values (tool params, message
@@ -189,7 +189,19 @@
 // RE-SIGNED to pi's boundary event (it returns a `hook-outcome` and gains `message-entry-id`,
 // `tool-result-entry-ids-json` and `boundary-json`) and `events.on-agent-before-settle` is new
 // (EXT-078; pi `TurnEndEvent` / `AgentBeforeSettleEvent`, `core/extensions/types.ts:987-1044`).
-package cyrup:ext@0.19.0;
+//
+// 0.19 -> 0.20 is the guest-tool-surface batch (CODE-015, CODE-016, CODE-017 and the structured
+// result of a guest tool), and it is both an IMPORT and an EXPORT re-signing. IMPORTS:
+// `types.tool-descriptor` gained `output-schema-json` (pi `ToolDefinition.outputSchema`,
+// `extensions/types.ts:592` @v1.0.4), `annotations` (`:603`, the new `tool-annotations` record) and
+// `prepare-loadout` (`:617`), which re-signs `registration.register-tool`; and
+// `host-tool.execute-tool` replaced its `collect-updates: bool` with the `execute-options` record
+// (pi `ExecuteToolOptions`, `:368-373`), so that a nested call can carry the guest's own `signal`.
+// EXPORTS: `types.tool-output` gained `structured-content-json` (pi `AgentToolResult.
+// structuredContent`, `packages/agent/src/types.ts:433` @v1.0.4), which re-signs `events.
+// execute-tool`'s return, and `events.prepare-loadout` is NEW. A 0.19 guest calls the imports at
+// the old signature and exports no `prepare-loadout`, so it takes the bump.
+package cyrup:ext@0.20.0;
 
 // ---------------------------------------------------------------------------
 // Serializable mirrors of cyrup-core. JSON-as-string at the seam (arch-08 §4.1).
@@ -261,6 +273,28 @@ interface types {
     // keeps a direct / model-only tool registered but inactive until something names it. `none`
     // = the omitted field = `true`.
     default-active: option<bool>,
+    // pi `ToolDefinition.outputSchema?: TSchema` (extensions/types.ts:592 @v1.0.4): the JSON Schema
+    // of the `structured-content-json` this tool's successful results carry. "Tools that declare
+    // it should always set `structuredContent`; codemode scripts then receive it instead of the
+    // text content." `none` = the omitted field. An unparseable value is REFUSED by `register-tool`.
+    output-schema-json: option<string>,
+    // pi `ToolDefinition.annotations?: ToolAnnotations` (extensions/types.ts:603 @v1.0.4). `none` =
+    // the omitted field.
+    annotations: option<tool-annotations>,
+    // pi `ToolDefinition.prepareLoadout` (extensions/types.ts:617 @v1.0.4). A function value cannot
+    // cross a component boundary, so the descriptor carries a FLAG and the host calls the
+    // `prepare-loadout` export when it is set (CODE-015). `false` = the omitted field.
+    prepare-loadout: bool,
+  }
+
+  // pi `ToolAnnotations` (extensions/types.ts:512-523 @v1.0.4): hints about what a tool does, with
+  // the meaning of MCP tool annotations. They come from the tool's author and are not verified.
+  // Each hint stays OPTIONAL because pi reports only the hints a tool set.
+  record tool-annotations {
+    read-only-hint: option<bool>,
+    destructive-hint: option<bool>,
+    idempotent-hint: option<bool>,
+    open-world-hint: option<bool>,
   }
 
   // pi `ToolNamespace` (extensions/types.ts:527 @v1.0.1): a group of related tools, such as the
@@ -306,11 +340,18 @@ interface types {
   // same delta, invention converges them on one plausible-looking number.
   // `content-json` is a serde_json array of (text|image) content blocks; `terminate` ends the
   // agent loop after this result.
+  //
+  // `structured-content-json` is pi's `AgentToolResult.structuredContent` (`packages/agent/src/
+  // types.ts:433` @v1.0.4): the machine-readable result matching the tool's `output-schema-json`,
+  // "not sent to the model; `content` remains the model-facing result". `none` = the tool returned
+  // none. `is-error` is pi's `AgentToolResult.isError` (`:440`): the model sees `content` as an
+  // error result while `details` and the structured content are kept.
   record tool-output {
     content-json: string,
     details-json: option<string>,
     is-error: bool,
     terminate: bool,
+    structured-content-json: option<string>,
   }
 
   // A single autocomplete suggestion (Pi `AutocompleteItem`, tui/autocomplete.ts:219).
@@ -392,6 +433,24 @@ interface events {
   // `packages/agent/src/agent-loop.ts`, so the coerced value is what gets validated. `none` (or a
   // guest fault) leaves the arguments untouched, which is upstream's identity default.
   prepare-arguments: func(name: string, args-json: string) -> option<string>;
+
+  // --- guest tool loadout preparation (CODE-015; pi `ToolDefinition.prepareLoadout`,
+  // extensions/types.ts:617 @v1.0.4) ---
+  // Called ONLY for a tool whose descriptor sets `prepare-loadout`, whenever the session applies
+  // the active tool set (pi `_applyToolLoadout`). `loadout-json` is pi's `ToolLoadout`
+  // (`:540-551`) as `{declared, callable, registered}`: three ordered arrays of rows
+  // `{name, label?, description, parameters, outputSchema?, exposure, namespace?,
+  // promptGuidelines}`, which also answer `getExposure`, `getNamespace` and `getPromptGuidelines`
+  // by name. The answer is pi's `ToolLoadoutChanges` (`:553-563`) as `{descriptions?: {name:
+  // string}, hiddenDeclarations?: [name]}`; `none` is pi's `undefined` (no changes). `err` is a
+  // throw: the host reports it on the extension error channel and the tool contributes nothing.
+  //
+  // [CYRUP-DELTA] pi's hook is a synchronous call on the session's own thread; a guest export is a
+  // call into a single-instance store that another call of this extension may be holding (a
+  // `set-active-tools` made by a running tool re-applies the loadout from inside that very call).
+  // The host therefore asks the instance only when it is free and otherwise reuses this tool's
+  // last answer, so the answer can lag the loadout by one application while the extension is busy.
+  prepare-loadout: func(name: string, loadout-json: string) -> result<option<string>, string>;
 
   // --- guest slash-command execution (R-08-016) ---
   // The host invokes a guest-registered command at COMMAND tier (session ops legal). `args` is the
@@ -1348,13 +1407,34 @@ interface host-tool {
   // (epoch/`CancelToken`) or a named signal for this `call-id` was aborted (`ui.abort-signal`).
   is-cancelled: func(call-id: string) -> bool;
 
+  // pi `ExecuteToolOptions` (`extensions/types.ts:368-373` @v1.0.4), as a record. `execute-tool`
+  // takes it in place of the `collect-updates: bool` it had through 0.16.
+  record execute-options {
+    // pi `onUpdate`. A closure cannot cross the boundary and the guest is suspended inside the
+    // call, so it inverts the way `emit-update` does: when true, the partial results the nested
+    // tool streamed come back, in order, as `partial-results-json` (one `AgentToolResult` JSON
+    // each) when the call settles.
+    collect-updates: bool,
+    // pi `signal`: the nested call is cancelled when this named signal is aborted. The id is in the
+    // namespace `ui.abort-signal` writes, so a signal the guest aborted BEFORE the call (or one it
+    // names that is already aborted) cancels the call before it starts. `none` = pi's default, the
+    // calling tool's own signal, which always also applies.
+    signal-id: option<string>,
+    // [CYRUP-DELTA] No counterpart in pi, which passes `AbortSignal.timeout(ms)` as `signal`. A
+    // suspended guest has no timer, and nothing else can abort its signals while it is suspended,
+    // so a deadline is the one mid-call abort it can ask for: the host cancels the nested call
+    // this many milliseconds after it starts. `none` = no deadline of its own.
+    timeout-ms: option<u32>,
+  }
+
   // pi `ExtensionToolContext.executeTool(name, args, options?)` (`extensions/types.ts:394`
-  // @v1.0.1): run another tool from inside this tool's `execute`, through the same validation,
+  // @v1.0.4): run another tool from inside this tool's `execute`, through the same validation,
   // hooks and permission checks as a model-issued call. `call-id` is the id the host passed to
   // `execute-tool`: the call gets the id `<call-id>/<n>`, its events carry `call-id` as
   // `parent-tool-call-id`, it never enters the transcript, and a bounded record of it lands as
   // `nestedCalls` on this call's result message. Cancellation is the calling tool's own
-  // (`signal`'s default; see `is-cancelled`).
+  // (`signal`'s default; see `is-cancelled`) and, when `options` names them, also the signal and
+  // the deadline.
   //
   // The `ok` value is `(outcome-json, partial-results-json)`: `outcome-json` is pi's
   // `AgentToolCallOutcome` — `{toolCall, result: {content, details?, usage?, structuredContent?,
@@ -1362,18 +1442,17 @@ interface host-tool {
   // It NEVER reports a tool failure as `err`: an unknown tool, a tool that is not callable, a
   // validation error, a blocked call and a failing tool all come back as `ok` with `isError` set.
   // `err` means the call itself could not be made: `call-id` is not the call in flight on this
-  // instance, no session is attached, the nested call re-enters this same instance, or
-  // `args-json` is not JSON.
+  // instance, no session is attached, or `args-json` is not JSON.
   //
-  // Two of pi's options do not cross as pi has them, and this import does not pretend otherwise.
-  // `options.onUpdate` is a closure and the guest is suspended inside this call, so it inverts
-  // the way `emit-update` does: when `collect-updates` is true the partial results the nested tool
-  // streamed come back, in order, as `partial-results-json` (one `AgentToolResult` JSON each) when
-  // the call settles — BATCHED, not live; the same results ARE delivered live as
-  // `tool_execution_update` events, as in pi. `options.signal` is NOT carried: the nested call's
-  // cancellation is always the calling tool's, because a suspended guest has no abort handle it
-  // could fire on a signal of its own.
-  execute-tool: func(call-id: string, name: string, args-json: string, collect-updates: bool) -> result<tuple<string, list<string>>, string>;
+  // Three things differ from pi because the guest is suspended inside this call, and this import
+  // does not pretend otherwise. (1) `options.onUpdate` is BATCHED: its partial results arrive when
+  // the call settles, not as they happen; the same results ARE delivered live as
+  // `tool_execution_update` events, as in pi. (2) The instance whose own tool makes the call does
+  // not receive that call's events (see `on-tool-call`). (3) A call to a tool of this same
+  // instance is refused by name (a "same extension" `ok` outcome with `isError`), because the
+  // instance runs one call at a time and the calling tool holds it. All three are the single-
+  // instance store, not a missing feature; none can be lifted without making the guest reentrant.
+  execute-tool: func(call-id: string, name: string, args-json: string, options: execute-options) -> result<tuple<string, list<string>>, string>;
 
   // pi `ExtensionToolContext.tools` (`extensions/types.ts:385`): what `execute-tool` can call, as a
   // JSON array of `{name, label?, description, parameters, outputSchema?, exposure, namespace?}`.

@@ -20,6 +20,12 @@ use cyrup_session_svc::ExtensionFlagDeclaration;
 ///   `-l` is parsed at `subcommands.rs`'s config arm and Tab switches write scope in the picker. The
 ///   two least guessable parts of `config` were invisible from the top-level help and — until
 ///   SEAM-079 — from `config --help` as well.
+///
+/// [CYRUP-DELTA] The Examples block carries a `codemode` line, so the tool can be found from
+/// `--help`. Upstream's (`args.ts:398` @v1.0.4) is `--tools read,bash,codemode,'mcp__radius__*'`,
+/// "codemode with only the tools of one MCP server"; this build's MCP extension names a server's
+/// tools `<server>_<tool>` unless `toolPrefix` says otherwise, and an allowlist entry of that form
+/// does not narrow the MCP tools, so the example here only enables the tool.
 pub fn render_help(extension_flags: &[ExtensionFlagDeclaration]) -> String {
     const APP: &str = "cyrup";
     const CFG: &str = ".cyrup";
@@ -92,14 +98,15 @@ Options:
                                  Supports globs (anthropic/*, *sonnet*) and fuzzy matching
   --no-tools, -nt                Disable all tools by default (built-in and extension)
   --no-builtin-tools, -nbt       Disable built-in tools by default but keep extension/custom tools enabled
-  --tools, -t <tools>            Comma-separated allowlist of tool names to enable
-                                 Applies to built-in, extension, and custom tools
+  --tools, -t <tools>            Comma-separated allowlist of tool names or patterns (*) to enable
+                                 Keeps MCP tools unless an entry starts with mcp__
                                  Only +name/-name entries add to or remove from the defaults
-  --exclude-tools, -xt <tools>   Comma-separated denylist of tool names to disable
-                                 Applies to built-in, extension, and custom tools
+  --exclude-tools, -xt <tools>   Comma-separated denylist of tool names or patterns (*) to disable
+                                 Applies to all tools, MCP tools included
   --thinking <level>             Set thinking level: off, minimal, low, medium, high, xhigh, max
   --extension, -e <path>         Load an extension file or builtin:<name> (can be used multiple times)
   --no-extensions, -ne           Disable extension discovery and built-in extensions (explicit -e paths still work)
+  --no-mcp                       Disable built-in MCP support: no servers connect and no MCP tools
   --skill <path>                 Load a skill file or directory (can be used multiple times)
   --no-skills, -ns               Disable skills discovery and loading
   --prompt-template <path>       Load a prompt template file or directory (can be used multiple times)
@@ -178,6 +185,10 @@ Examples:
 
   # Add codemode to the default tools
   {APP} --tools +codemode
+
+  # Codemode: the model writes one script that calls the other tools
+  # (it is off by default; \"defaultTools\": [\"+codemode\"] in settings.json keeps it on)
+  {APP} --tools read,bash,edit,write,codemode
 
   # Disable one tool while keeping the rest available
   {APP} --exclude-tools ask_question

@@ -2828,6 +2828,111 @@ mod tests {
         assert_eq!(result.skills_warning, None);
     }
 
+    /// [CYRUP-DELTA] A `codemode` script's nested calls (their `tool_execution_*` lines carry the
+    /// enclosing call's `parentToolCallId`) are not tool calls of the child's. The settled
+    /// `tool_calls` list, whose length `toolCount`, the slash completion line and the history
+    /// record all report, lists the script's call once and agrees with the settled progress row's
+    /// own counter, which counted it that way all along. The child is a real process replaying the
+    /// NDJSON a `cyrup --mode json` child emits for a script that made three calls (live acceptance,
+    /// scenario "subagent": the list held four entries and the artifact said `toolCount: 4` while
+    /// the live progress said 1). Mutation killed: dropping the `is_nested` filter in
+    /// `AgentProgress::summarized_tool_calls`.
+    #[tokio::test]
+    async fn run_sync_lists_a_scripts_nested_calls_as_one_tool_call() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let nested = |event: &str, id: &str, tool: &str, args: serde_json::Value| {
+            serde_json::json!({
+                "type": event, "toolCallId": id, "toolName": tool, "args": args,
+                "result": "ok", "isError": false, "parentToolCallId": "c1"
+            })
+            .to_string()
+        };
+        let lines = [
+            r#"{"type":"agent_start"}"#.to_string(),
+            serde_json::json!({
+                "type": "tool_execution_start", "toolCallId": "c1", "toolName": "codemode",
+                "args": {"code": "await tools.write(...); await tools.read(...); await tools.read(...)"}
+            })
+            .to_string(),
+            nested("tool_execution_start", "c1/1", "write", serde_json::json!({"path": "out.txt", "content": "x"})),
+            nested("tool_execution_end", "c1/1", "write", serde_json::json!({})),
+            nested("tool_execution_start", "c1/2", "read", serde_json::json!({"path": "out.txt"})),
+            nested("tool_execution_end", "c1/2", "read", serde_json::json!({})),
+            nested("tool_execution_start", "c1/3", "read", serde_json::json!({"path": "a.txt"})),
+            nested("tool_execution_end", "c1/3", "read", serde_json::json!({})),
+            serde_json::json!({
+                "type": "tool_execution_end", "toolCallId": "c1", "toolName": "codemode",
+                "result": "ok", "isError": false
+            })
+            .to_string(),
+            serde_json::json!({
+                "type": "message_end",
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "script done"}],
+                    "usage": {
+                        "input": 3, "output": 2, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 5,
+                        "cost": {"input": 0.0, "output": 0.0, "cacheRead": 0.0, "cacheWrite": 0.0, "total": 0.0}
+                    },
+                    "stopReason": "stop"
+                }
+            })
+            .to_string(),
+            r#"{"type":"agent_end"}"#.to_string(),
+        ];
+        std::fs::write(dir.path().join("child.ndjson"), lines.join("\n") + "\n")
+            .expect("write the child's output");
+        let script = dir.path().join("child.sh");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\ncat \"$(dirname \"$0\")/child.ndjson\"\n",
+        )
+        .expect("write script");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod");
+        }
+
+        let agent = sample_agent_config("m1", &[]);
+        let mut opts = base_opts(dir.path(), &["m1"]);
+        opts.spawn_command = Some(crate::spawn::SpawnCommand {
+            binary: script,
+            base_args: Vec::new(),
+        });
+        opts.include_progress = Some(true);
+
+        let result = run_sync(&agent, "run the script", &opts).await;
+
+        assert_eq!(result.exit_code, 0, "{result:?}");
+        let listed: Vec<&str> = result
+            .tool_calls
+            .iter()
+            .map(|call| call.text.as_str())
+            .collect();
+        assert_eq!(
+            listed.len(),
+            1,
+            "the script's three nested calls are not the child's tool calls: {listed:?}"
+        );
+        assert!(
+            listed
+                .first()
+                .is_some_and(|text| text.starts_with("codemode")),
+            "the one listed call is the script's own: {listed:?}"
+        );
+        let progress = result
+            .progress
+            .as_ref()
+            .expect("includeProgress: true must populate SingleResult::progress");
+        assert_eq!(
+            usize::try_from(progress.tool_count).ok(),
+            Some(result.tool_calls.len()),
+            "the settled progress row and the settled call list count the same calls"
+        );
+    }
+
     /// SUBA-096 — pi refuses fast mode for a foreign runner before anything launches
     /// (`subagent-executor.ts:3353-3355` @v0.68.0). The script leaves a marker behind, which is
     /// what proves nothing spawned. Mutation killed: deleting the `opts.fast` refusal in

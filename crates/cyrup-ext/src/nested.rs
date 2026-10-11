@@ -199,33 +199,65 @@ pub fn tool_update_json(update: &ToolUpdate) -> Value {
     Value::Object(o)
 }
 
-/// The callable tools as the JSON a WASM guest reads from `host-tool.callable-tools`: one object
-/// per tool carrying what pi's `AgentTool` does that a sandbox needs to describe it — `name`,
-/// `label`, `description`, `parameters`, `outputSchema`, `exposure` and `namespace`.
+/// One tool as the JSON a WASM guest reads it by: `name`, `label`, `description`, `parameters`,
+/// `outputSchema`, `exposure` and `namespace` — what pi's `AgentTool` carries that a sandbox needs
+/// to describe it.
+fn tool_row(t: &dyn Tool) -> serde_json::Map<String, Value> {
+    let mut o = serde_json::Map::new();
+    o.insert("name".into(), json!(t.name()));
+    if let Some(label) = t.label() {
+        o.insert("label".into(), json!(label));
+    }
+    o.insert("description".into(), json!(t.description()));
+    o.insert("parameters".into(), t.parameters().clone());
+    if let Some(schema) = t.output_schema() {
+        o.insert("outputSchema".into(), schema.clone());
+    }
+    o.insert("exposure".into(), json!(t.exposure().as_str()));
+    if let Some(ns) = t.namespace() {
+        o.insert(
+            "namespace".into(),
+            serde_json::to_value(ns).unwrap_or(Value::Null),
+        );
+    }
+    o
+}
+
+/// The callable tools as the JSON a WASM guest reads from `host-tool.callable-tools`: one
+/// [`tool_row`] per tool.
 pub fn callable_tools_json(tools: &[Arc<dyn Tool>]) -> Value {
     Value::Array(
         tools
             .iter()
-            .map(|t| {
-                let mut o = serde_json::Map::new();
-                o.insert("name".into(), json!(t.name()));
-                if let Some(label) = t.label() {
-                    o.insert("label".into(), json!(label));
-                }
-                o.insert("description".into(), json!(t.description()));
-                o.insert("parameters".into(), t.parameters().clone());
-                if let Some(schema) = t.output_schema() {
-                    o.insert("outputSchema".into(), schema.clone());
-                }
-                o.insert("exposure".into(), json!(t.exposure().as_str()));
-                if let Some(ns) = t.namespace() {
-                    o.insert(
-                        "namespace".into(),
-                        serde_json::to_value(ns).unwrap_or(Value::Null),
-                    );
-                }
-                Value::Object(o)
-            })
+            .map(|t| Value::Object(tool_row(t.as_ref())))
             .collect(),
     )
+}
+
+/// The loadout a guest's `prepare-loadout` export is handed (pi `ToolLoadout`,
+/// `core/extensions/types.ts:540-551` @v1.0.4): `{declared, callable, registered}`, each an array
+/// of [`tool_row`]s plus the tool's normalized `promptGuidelines`. The rows also answer pi's
+/// `getExposure(name)`, `getNamespace(name)` and `getPromptGuidelines(name)`, which a closure on
+/// the object could not cross the boundary as.
+pub fn loadout_json(view: &cyrup_core::LoadoutView<'_>) -> Value {
+    let rows = |tools: &[Arc<dyn Tool>]| {
+        Value::Array(
+            tools
+                .iter()
+                .map(|t| {
+                    let mut row = tool_row(t.as_ref());
+                    row.insert(
+                        "promptGuidelines".into(),
+                        json!(cyrup_core::normalized_prompt_guidelines(t.as_ref())),
+                    );
+                    Value::Object(row)
+                })
+                .collect(),
+        )
+    };
+    json!({
+        "declared": rows(view.declared()),
+        "callable": rows(view.callable()),
+        "registered": rows(view.registered()),
+    })
 }

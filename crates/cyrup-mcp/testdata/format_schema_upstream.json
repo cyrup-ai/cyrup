@@ -1,0 +1,212 @@
+[
+ {
+  "name": "nested_golden",
+  "schema": "{\"type\": \"object\", \"required\": [\"query\", \"mode\"], \"properties\": {\"query\": {\"type\": \"string\", \"description\": \"What to find\", \"minLength\": 1, \"maxLength\": 200, \"pattern\": \"^[a-z]+$\"}, \"mode\": {\"enum\": [\"fast\", \"slow\", null, 3], \"description\": \"Search mode\", \"default\": \"fast\"}, \"limit\": {\"type\": \"integer\", \"minimum\": 0, \"maximum\": 100.0, \"default\": 10.0}, \"tags\": {\"type\": \"array\", \"items\": {\"type\": \"string\", \"format\": \"uri\"}, \"minItems\": 1}, \"target\": {\"anyOf\": [{\"type\": \"string\", \"description\": \"a name\"}, {\"type\": \"object\", \"required\": [\"id\"], \"properties\": {\"id\": {\"type\": \"number\"}, \"kind\": {\"const\": null}}}, {\"const\": \"all\"}, {}]}, \"choice\": {\"oneOf\": [{\"type\": \"boolean\"}, \"plain\", null, [1, 2.5], 5.0]}, \"matrix\": {\"type\": \"array\", \"items\": {\"type\": \"array\", \"items\": {\"type\": \"number\", \"default\": 0}}}, \"nothing\": null, \"flag\": true, \"text\": \"str\", \"list\": [1]}}",
+  "indent": null,
+  "expected": "  query (string) *required* - What to find [minLength: 1] [maxLength: 200] [pattern: \"^[a-z]+$\"]\n  mode (enum: \"fast\", \"slow\", null, 3) *required* - Search mode [default: \"fast\"]\n  limit (integer) [minimum: 0] [maximum: 100] [default: 10]\n  tags (array) [minItems: 1]\n    items (string) [format: \"uri\"]\n  target\n    anyOf:\n      - string - a name\n      - object\n        id (number) *required*\n        kind (const null)\n      - const \"all\"\n      - schema\n  choice\n    oneOf:\n      - boolean\n      - \"plain\"\n      - null\n      - [1,2.5]\n      - 5\n  matrix (array)\n    items (array)\n      items (number) [default: 0]\n  nothing\n  flag\n  text\n  list"
+ },
+ {
+  "name": "nested_golden_search_indent",
+  "schema": "{\"type\": \"object\", \"required\": [\"query\", \"mode\"], \"properties\": {\"query\": {\"type\": \"string\", \"description\": \"What to find\", \"minLength\": 1, \"maxLength\": 200, \"pattern\": \"^[a-z]+$\"}, \"mode\": {\"enum\": [\"fast\", \"slow\", null, 3], \"description\": \"Search mode\", \"default\": \"fast\"}, \"limit\": {\"type\": \"integer\", \"minimum\": 0, \"maximum\": 100.0, \"default\": 10.0}, \"tags\": {\"type\": \"array\", \"items\": {\"type\": \"string\", \"format\": \"uri\"}, \"minItems\": 1}, \"target\": {\"anyOf\": [{\"type\": \"string\", \"description\": \"a name\"}, {\"type\": \"object\", \"required\": [\"id\"], \"properties\": {\"id\": {\"type\": \"number\"}, \"kind\": {\"const\": null}}}, {\"const\": \"all\"}, {}]}, \"choice\": {\"oneOf\": [{\"type\": \"boolean\"}, \"plain\", null, [1, 2.5], 5.0]}, \"matrix\": {\"type\": \"array\", \"items\": {\"type\": \"array\", \"items\": {\"type\": \"number\", \"default\": 0}}}, \"nothing\": null, \"flag\": true, \"text\": \"str\", \"list\": [1]}}",
+  "indent": "    ",
+  "expected": "    query (string) *required* - What to find [minLength: 1] [maxLength: 200] [pattern: \"^[a-z]+$\"]\n    mode (enum: \"fast\", \"slow\", null, 3) *required* - Search mode [default: \"fast\"]\n    limit (integer) [minimum: 0] [maximum: 100] [default: 10]\n    tags (array) [minItems: 1]\n      items (string) [format: \"uri\"]\n    target\n      anyOf:\n        - string - a name\n        - object\n          id (number) *required*\n          kind (const null)\n        - const \"all\"\n        - schema\n    choice\n      oneOf:\n        - boolean\n        - \"plain\"\n        - null\n        - [1,2.5]\n        - 5\n    matrix (array)\n      items (array)\n        items (number) [default: 0]\n    nothing\n    flag\n    text\n    list"
+ },
+ {
+  "name": "empty_properties",
+  "schema": "{\"type\": \"object\", \"properties\": {}}",
+  "indent": null,
+  "expected": "  (no parameters)"
+ },
+ {
+  "name": "object_without_properties",
+  "schema": "{\"type\": \"object\"}",
+  "indent": null,
+  "expected": "  (object)"
+ },
+ {
+  "name": "array_schema",
+  "schema": "[1, 2]",
+  "indent": null,
+  "expected": "  (no schema)"
+ },
+ {
+  "name": "string_schema",
+  "schema": "\"x\"",
+  "indent": null,
+  "expected": "  (no schema)"
+ },
+ {
+  "name": "null_schema",
+  "schema": "null",
+  "indent": null,
+  "expected": "  (no schema)"
+ },
+ {
+  "name": "zero_schema",
+  "schema": "0",
+  "indent": null,
+  "expected": "  (no schema)"
+ },
+ {
+  "name": "true_schema",
+  "schema": "true",
+  "indent": null,
+  "expected": "  (no schema)"
+ },
+ {
+  "name": "empty_object_schema",
+  "schema": "{}",
+  "indent": null,
+  "expected": "  (complex schema)"
+ },
+ {
+  "name": "typed_scalar",
+  "schema": "{\"type\": \"string\"}",
+  "indent": null,
+  "expected": "  (string)"
+ },
+ {
+  "name": "typed_array_list",
+  "schema": "{\"type\": [\"string\", \"null\"]}",
+  "indent": null,
+  "expected": "  (string | null)"
+ },
+ {
+  "name": "top_enum",
+  "schema": "{\"enum\": [\"a\", \"b\"]}",
+  "indent": null,
+  "expected": "  (enum: \"a\", \"b\")"
+ },
+ {
+  "name": "top_const",
+  "schema": "{\"const\": {\"b\": 1, \"a\": 2, \"1\": 3}}",
+  "indent": null,
+  "expected": "  (const {\"1\":3,\"b\":1,\"a\":2})"
+ },
+ {
+  "name": "top_anyof",
+  "schema": "{\"anyOf\": [{\"type\": \"string\"}, {\"type\": \"number\", \"minimum\": 1.5}]}",
+  "indent": null,
+  "expected": "  anyOf:\n    - string\n    - number [minimum: 1.5]"
+ },
+ {
+  "name": "top_items_only",
+  "schema": "{\"items\": {\"type\": \"string\"}}",
+  "indent": null,
+  "expected": "  items (string)"
+ },
+ {
+  "name": "top_properties_no_type",
+  "schema": "{\"properties\": {\"a\": {\"type\": \"string\"}}, \"required\": [\"a\"]}",
+  "indent": null,
+  "expected": "  a (string) *required*"
+ },
+ {
+  "name": "type_empty_string",
+  "schema": "{\"type\": \"\", \"properties\": {\"a\": {\"type\": \"\"}}}",
+  "indent": null,
+  "expected": "  a"
+ },
+ {
+  "name": "type_zero",
+  "schema": "{\"properties\": {\"a\": {\"type\": 0}, \"b\": {\"type\": 2}, \"c\": {\"type\": false}, \"d\": {\"type\": true}}}",
+  "indent": null,
+  "expected": "  a\n  b (2)\n  c\n  d (true)"
+ },
+ {
+  "name": "type_mixed_list",
+  "schema": "{\"properties\": {\"a\": {\"type\": [\"string\", 5, null, [\"a\", null, 1.0], {\"x\": 1}, true]}}}",
+  "indent": null,
+  "expected": "  a (string | 5 | null | a,,1 | [object Object] | true)"
+ },
+ {
+  "name": "type_object_value",
+  "schema": "{\"properties\": {\"a\": {\"type\": {\"x\": 1}}}}",
+  "indent": null,
+  "expected": "  a ([object Object])"
+ },
+ {
+  "name": "properties_array",
+  "schema": "{\"type\": \"object\", \"properties\": [1]}",
+  "indent": null,
+  "expected": "  (object)"
+ },
+ {
+  "name": "required_non_array",
+  "schema": "{\"type\": \"object\", \"required\": \"a\", \"properties\": {\"a\": {\"type\": \"string\"}}}",
+  "indent": null,
+  "expected": "  a (string)"
+ },
+ {
+  "name": "required_mixed",
+  "schema": "{\"type\": \"object\", \"required\": [1, \"a\", null, \"b\"], \"properties\": {\"a\": {}, \"b\": {\"type\": \"string\"}, \"c\": {}}}",
+  "indent": null,
+  "expected": "  a *required*\n  b (string) *required*\n  c"
+ },
+ {
+  "name": "integer_like_keys",
+  "schema": "{\"type\": \"object\", \"properties\": {\"b\": {}, \"2\": {}, \"a\": {}, \"1\": {}, \"10\": {}, \"01\": {}}}",
+  "indent": null,
+  "expected": "  1\n  2\n  10\n  b\n  a\n  01"
+ },
+ {
+  "name": "items_null",
+  "schema": "{\"type\": \"array\", \"items\": null}",
+  "indent": null,
+  "expected": "  items"
+ },
+ {
+  "name": "items_with_properties",
+  "schema": "{\"type\": \"array\", \"items\": {\"properties\": {\"x\": {\"type\": \"string\"}}, \"required\": [\"x\"]}}",
+  "indent": null,
+  "expected": "  items (object)\n    x (string) *required*"
+ },
+ {
+  "name": "annotations_all",
+  "schema": "{\"properties\": {\"a\": {\"type\": \"string\", \"description\": \"d\", \"minLength\": null, \"maxLength\": 3, \"minimum\": -0.5, \"maximum\": 1e+21, \"minItems\": 0, \"maxItems\": 1e-07, \"format\": \"date\", \"pattern\": \"a\\\"b\\\\c\\n\", \"default\": [1.0, {\"k\": null}]}}}",
+  "indent": null,
+  "expected": "  a (string) - d [minLength: null] [maxLength: 3] [minimum: -0.5] [maximum: 1e+21] [minItems: 0] [maxItems: 1e-7] [format: \"date\"] [pattern: \"a\\\"b\\\\c\\n\"] [default: [1,{\"k\":null}]]"
+ },
+ {
+  "name": "description_empty_and_nonstring",
+  "schema": "{\"properties\": {\"a\": {\"description\": \"\"}, \"b\": {\"description\": 5}}}",
+  "indent": null,
+  "expected": "  a\n  b"
+ },
+ {
+  "name": "number_formats",
+  "schema": "{\"properties\": {\"a\": {\"default\": 1.0}, \"b\": {\"default\": 100}, \"c\": {\"default\": 1.5e+300}, \"d\": {\"default\": 123456789012345680000}, \"e\": {\"default\": 1e-06}, \"f\": {\"default\": 1e-07}, \"g\": {\"default\": -0.0}}}",
+  "indent": null,
+  "expected": "  a [default: 1]\n  b [default: 100]\n  c [default: 1.5e+300]\n  d [default: 123456789012345680000]\n  e [default: 0.000001]\n  f [default: 1e-7]\n  g [default: 0]"
+ },
+ {
+  "name": "unicode_and_control",
+  "schema": "{\"properties\": {\"a\": {\"default\": \"é \\u0001😀\"}}}",
+  "indent": null,
+  "expected": "  a [default: \"é \\u0001😀\"]"
+ },
+ {
+  "name": "enum_not_array",
+  "schema": "{\"properties\": {\"a\": {\"enum\": \"x\", \"type\": \"string\"}}}",
+  "indent": null,
+  "expected": "  a (string)"
+ },
+ {
+  "name": "variants_nested",
+  "schema": "{\"anyOf\": [{\"anyOf\": [{\"type\": \"string\"}], \"properties\": {\"z\": {\"type\": \"number\"}}}, {\"oneOf\": [{\"const\": 1}]}]}",
+  "indent": null,
+  "expected": "  anyOf:\n    - object\n      anyOf:\n        - string\n      z (number)\n    - schema\n      oneOf:\n        - const 1"
+ },
+ {
+  "name": "empty_anyof",
+  "schema": "{\"anyOf\": []}",
+  "indent": null,
+  "expected": "  anyOf:"
+ },
+ {
+  "name": "indent_tab",
+  "schema": "{\"type\": \"object\", \"properties\": {\"a\": {\"properties\": {\"b\": {\"type\": \"string\"}}}}}",
+  "indent": "\t",
+  "expected": "\ta (object)\n\t  b (string)"
+ }
+]

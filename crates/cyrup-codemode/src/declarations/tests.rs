@@ -8,6 +8,7 @@
 use serde_json::{Value, json};
 
 use super::*;
+use crate::identifier::to_codemode_identifier;
 
 fn mcp_result_schema(structured_content: Option<Value>) -> Value {
     let mut properties = json!({
@@ -737,6 +738,7 @@ fn declaration_from(value: &Value) -> ToolDeclaration {
     let text = |key: &str| value.get(key).and_then(Value::as_str).map(str::to_owned);
     ToolDeclaration {
         name: text("name").unwrap(),
+        identifier: None,
         description: text("description"),
         input_schema: value.get("inputSchema").cloned(),
         output_schema: value.get("outputSchema").cloned(),
@@ -782,4 +784,15 @@ fn render_declarations_and_samples_agree_with_upstream_on_the_corpus() {
         }
     }
     assert!(rendered > 80 && samples > 50, "{rendered} {samples}");
+}
+
+/// A tool declares the identifier the session assigned it, which is not the derived one when
+/// another tool has that.
+#[test]
+fn a_tool_is_declared_under_its_assigned_identifier() {
+    let derived = ToolDeclaration::new("a-b");
+    let assigned = ToolDeclaration::new("a-b").with_identifier(to_codemode_identifier("a_b_2"));
+    assert!(render_tool_signature(&derived, None).starts_with("a_b(args: "));
+    assert!(render_tool_signature(&assigned, None).starts_with("a_b_2(args: "));
+    assert!(render_tool_sample(&assigned, None).contains("a_b_2(args: "));
 }

@@ -50,10 +50,12 @@
 //! initPromise, spec)` — a closure over slots that are still empty at registration time, because
 //! `initializeMcp` has not run yet. cyrup registers `Arc<dyn Tool>` values instead of object
 //! literals, so the same late binding is a [`ToolDispatch`] slot every registered tool shares: the
-//! runtime installs an [`McpToolDispatch`] into it once [`crate::state::McpState`] exists (MCP-214
-//! for direct tools, 13d for the nine proxy modes). Until it is installed a call answers upstream's
-//! own step-3 result — `MCP not initialized` with `details.error = "not_initialized"` — which is
-//! exactly what upstream returns for a call that lands before init resolves.
+//! runtime installs an [`McpToolDispatch`] into it when the session's build starts (MCP-214 for
+//! direct tools, 13d for the nine proxy modes), so a call that lands while the build runs joins it,
+//! bounded, as upstream's `awaitWithTimeout(initPromise, …)` does. Until it is installed — no
+//! session has started, or the extension was built without a self handle — a call answers
+//! upstream's own step-3 result, `MCP not initialized` with `details.error = "not_initialized"`,
+//! which upstream returns only when there is neither a state nor an init promise to wait for.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
@@ -100,7 +102,7 @@ pub const MCP_COMMAND: &str = "mcp";
 /// `/mcp-auth` — the OAuth flow's interactive entry point.
 pub const MCP_AUTH_COMMAND: &str = "mcp-auth";
 
-/// The four seams the extension subscribes to.
+/// The five seams the extension subscribes to.
 ///
 /// * [`EventKind::SessionStart`] — the generation bump and the runtime build (MCP-008).
 /// * [`EventKind::Input`] — `index.ts:489-511`'s pre-turn keep-alive convergence: the *turn* is
@@ -110,6 +112,10 @@ pub const MCP_AUTH_COMMAND: &str = "mcp-auth";
 ///   lives (MCP-009, MCP-014).
 /// * [`EventKind::ToolResult`] — `error-signal.ts`'s `toolErrorOverride`, which re-flags a returned
 ///   MCP failure as an error (MCP-045).
+/// * [`EventKind::ToolCall`] — the wait before a `codemode` script or a `tool_search` runs, so the
+///   servers it needs have connected and registered their tools
+///   ([`McpExtension::on_tool_call`][crate::extension::McpExtension]; the built-in MCP extension's
+///   `pi.on("tool_call")` @v1.0.4, not part of the adapter this crate ports).
 ///
 /// The `input` seam is **not** in 13a: the plan was written against v2.25.0, whose `index.ts` had
 /// only the other three `pi.on` registrations. Upstream `48799fa` ("converge stale keep-alive tool
@@ -122,6 +128,7 @@ pub const SUBSCRIBED_EVENTS: &[EventKind] = &[
     EventKind::Input,
     EventKind::SessionShutdown,
     EventKind::ToolResult,
+    EventKind::ToolCall,
 ];
 
 /// `direct-tools.ts`'s `BUILTIN_NAMES` — the eight names a formatted MCP tool name may never take
@@ -1349,6 +1356,26 @@ fn resolve_tool_selection(
     }
 }
 
+/// Whether some enabled server declares tools to the model in its first request (`hasDirectTools`,
+/// `extensions/mcp/index.ts` @v1.0.4): `directTools: true` or a list, not `"search"`, whose tools are
+/// registered held back and loaded by a search. The first prompt waits for the servers that are
+/// still connecting only if this is true; a server whose tools a script or a search reaches is
+/// waited for by that script or search (`McpExtension::on_tool_call`).
+///
+/// [CYRUP-DELTA] The build here connects every server as one, so the wait is on the whole build and
+/// not on the server that declares tools: it is held for a slow server that declares none whenever
+/// another one does.
+#[must_use]
+pub fn declares_direct_tools(config: &McpConfig, env_override: Option<&[String]>) -> bool {
+    let env_selection = env_override.map(parse_direct_tool_selectors);
+    let settings = config.settings.as_ref();
+    config.enabled_servers().any(|(server_name, definition)| {
+        let selection =
+            resolve_tool_selection(server_name, definition, settings, env_selection.as_ref());
+        selection.wants_direct_tools() && !selection.lazy
+    })
+}
+
 /// `metadata-cache.ts` `getMissingConfiguredDirectToolServers` — every enabled server that *wants*
 /// direct tools but has no valid cache entry. Feeds [`should_register_proxy_tool`] (MCP-218).
 #[must_use]
@@ -2478,7 +2505,8 @@ pub trait McpToolDispatch: Send + Sync + 'static {
 /// precisely how it went wrong.
 ///
 /// [`RegisteredSurface::dispatch`] echoes the same `Arc` back, and whoever owns the generation
-/// installs the real dispatch into it once [`crate::state::McpState`] exists.
+/// installs the real dispatch into it when the generation's build starts, before
+/// [`crate::state::McpState`] exists.
 #[derive(Default)]
 pub struct ToolDispatch {
     slot: OnceLock<Arc<dyn McpToolDispatch>>,
@@ -2557,13 +2585,15 @@ pub fn tool_render_kind(settings: Option<&McpSettings>) -> ToolRenderKind {
 /// with"): the `deferred` exposure, the server's namespace, and the result schema codemode renders
 /// as `CallToolResult<T>`.
 ///
-/// Upstream also attaches the tool's MCP `annotations`, which Pi's `getAllTools()` reports to
-/// permission extensions. cyrup's `Tool` carries no annotations (the exposure model was ported
-/// without `ToolDefinition.annotations`, `types.ts:601` @v1.0.1), so they are not attached here.
+/// It also carries the tool's MCP `annotations` (CODE-017), which Pi's `getAllTools()` reports to
+/// permission extensions: the four boolean hints, without `title`, as upstream spreads them
+/// (`index.ts:441-455` @v5.0.0), and absent when the server declared none.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DeferredFields {
     pub namespace: ToolNamespace,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub annotations: Option<cyrup_core::ToolAnnotations>,
     pub output_schema: Value,
 }
 
@@ -2585,18 +2615,23 @@ pub fn deferred_tool_fields(
         return None;
     }
     let server_cache = cache.and_then(|cache| cache.servers.get(&spec.server_name));
-    let output_schema = if spec.resource_uri.is_some() {
+    // `serverCache?.tools?.find((candidate) => candidate.name === spec.originalName)`, unless the
+    // tool is a resource tool, which is the adapter's own: it has neither an output schema nor
+    // annotations.
+    let cached_tool = if spec.resource_uri.is_some() {
         None
     } else {
-        server_cache
-            .and_then(|entry| {
-                entry
-                    .tools()
-                    .iter()
-                    .find(|candidate| candidate.name == spec.original_name)
-            })
-            .and_then(|tool| tool.output_schema.clone())
+        server_cache.and_then(|entry| {
+            entry
+                .tools()
+                .iter()
+                .find(|candidate| candidate.name == spec.original_name)
+        })
     };
+    let output_schema = cached_tool.and_then(|tool| tool.output_schema.clone());
+    let annotations = cached_tool
+        .and_then(|tool| crate::proxy::extract_tool_annotations(tool.annotations.as_ref()))
+        .and_then(|annotations| annotations.to_tool_annotations());
     let description = config
         .mcp_servers
         .get(&spec.server_name)
@@ -2605,52 +2640,88 @@ pub fn deferred_tool_fields(
     let instructions = server_cache
         .and_then(|entry| entry.instructions.clone())
         .filter(|instructions| !instructions.is_empty());
-    // `createMcpResultSchema`'s shape, with `structuredContent` only when the server declared a
-    // schema. (`serde_json::Map` is sorted under this workspace's features, so the serialised key
-    // order — and with it the re-registration fingerprint — is deterministic, not upstream's.)
-    let mut properties = serde_json::Map::new();
-    properties.insert(
-        "content".to_string(),
-        json!({ "type": "array", "items": { "type": "object" } }),
-    );
-    if let Some(schema) = output_schema {
-        properties.insert("structuredContent".to_string(), schema);
-    }
-    properties.insert("isError".to_string(), json!({ "type": "boolean" }));
-    properties.insert("_meta".to_string(), json!({ "type": "object" }));
     Some(DeferredFields {
         namespace: ToolNamespace {
             name: format!("mcp__{}", spec.server_name.replace('-', "_")),
             description,
             instructions,
         },
-        output_schema: json!({
-            "type": "object",
-            "properties": Value::Object(properties),
-            "required": ["content"]
-        }),
+        annotations,
+        output_schema: call_tool_result_schema_over(output_schema),
     })
 }
 
-/// `toCallToolResult` (`index.ts:68-77`): the `CallToolResult` a codemode script gets from a
-/// search-mode tool, as the result's `structured_content`: its output-guarded content, the
-/// server's `structuredContent`, and `isError` on any failure (`details.error`). The model-facing
-/// `content` is untouched.
+/// The output schema of every MCP tool: the `CallToolResult` a script receives, which codemode
+/// renders as `CallToolResult<T>` (`createMcpResultSchema`, `extensions/mcp/tools.ts` @v1.0.4:
+/// "Output schema of every MCP tool").
+///
+/// Without `structuredContent`: this is the shape of a tool that declared no output schema, and of
+/// a direct tool that is registered eagerly, which reads no metadata cache.
+/// [`call_tool_result_schema_over`] nests the schema a search-mode tool's server declared.
+#[must_use]
+pub fn call_tool_result_schema() -> Value {
+    call_tool_result_schema_over(None)
+}
+
+/// `createMcpResultSchema(structuredContentSchema)`, with `structuredContent` only when the server
+/// declared a schema. (`serde_json::Map` is sorted under this workspace's features, so the
+/// serialised key order — and with it the re-registration fingerprint — is deterministic, not
+/// upstream's.)
+#[must_use]
+pub fn call_tool_result_schema_over(structured_content: Option<Value>) -> Value {
+    let mut properties = serde_json::Map::new();
+    properties.insert(
+        "content".to_string(),
+        json!({ "type": "array", "items": { "type": "object" } }),
+    );
+    if let Some(schema) = structured_content {
+        properties.insert("structuredContent".to_string(), schema);
+    }
+    properties.insert("isError".to_string(), json!({ "type": "boolean" }));
+    properties.insert("_meta".to_string(), json!({ "type": "object" }));
+    json!({
+        "type": "object",
+        "properties": Value::Object(properties),
+        "required": ["content"]
+    })
+}
+
+/// What a codemode script receives from an MCP tool, as the result's `structured_content`: the
+/// tool's `CallToolResult` (`convertMcpResult`, `extensions/mcp/tools.ts` @v1.0.4 — "Codemode
+/// scripts receive the whole `CallToolResult` without `_meta` … never truncated … MCP errors
+/// (`isError`) are error results for the model, but scripts still resolve to the result").
+///
+/// * A call the server answered carries that result already ([`crate::proxy::execute_call`] puts it
+///   there for a direct tool): content blocks as the server sent them, images included, its
+///   `structuredContent`, and its `isError`. It is left as it is, so an `isError` result resolves.
+/// * A call the server never answered (`call_failed`, `aborted`) has none. Upstream's `callTool`
+///   throws there and the script's call rejects with the message, so the result is flagged as an
+///   error and the script sees the text.
+/// * Any other failure (`auth_required`, a denied approval, a tool that is not there) is a prompt
+///   for the model rather than a failed call (`error-signal.ts`), and a resource read has no raw
+///   result. Both resolve to a `CallToolResult` over the model-facing content, `isError` set on a
+///   failure, so the value always has the shape the output schema declares.
+///   [CYRUP-DELTA] Upstream has no such results: its adapter's failures are thrown.
 fn with_call_tool_result(mut result: ToolResult) -> ToolResult {
+    if result.structured_content.is_some() {
+        return result;
+    }
+    let failure = result
+        .details
+        .as_ref()
+        .and_then(|details| details.get("error"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    if matches!(failure.as_deref(), Some("call_failed" | "aborted")) {
+        result.is_error = true;
+        return result;
+    }
     let mut call_tool_result = serde_json::Map::new();
     call_tool_result.insert(
         "content".to_string(),
         serde_json::to_value(&result.content).unwrap_or_else(|_| Value::Array(Vec::new())),
     );
-    if let Some(structured) = result.structured_content.take() {
-        call_tool_result.insert("structuredContent".to_string(), structured);
-    }
-    if result
-        .details
-        .as_ref()
-        .and_then(|details| details.get("error"))
-        .is_some()
-    {
+    if failure.is_some() {
         call_tool_result.insert("isError".to_string(), Value::Bool(true));
     }
     result.structured_content = Some(Value::Object(call_tool_result));
@@ -2667,6 +2738,8 @@ pub struct DirectTool {
     description: String,
     prompt_snippet: String,
     parameters: Value,
+    /// The `CallToolResult` every MCP tool resolves to for a script ([`call_tool_result_schema`]).
+    output_schema: Value,
     render_kind: ToolRenderKind,
     dispatch: Arc<ToolDispatch>,
     /// Present for a search-mode tool: it registers at the `deferred` exposure.
@@ -2697,12 +2770,18 @@ impl DirectTool {
             snippet
         };
         let parameters = normalize_direct_tool_input_schema(spec.input_schema.as_ref());
+        let output_schema = deferred
+            .as_ref()
+            .map_or_else(call_tool_result_schema, |fields| {
+                fields.output_schema.clone()
+            });
         Self {
             spec,
             label,
             description,
             prompt_snippet,
             parameters,
+            output_schema,
             render_kind,
             dispatch,
             deferred,
@@ -2764,8 +2843,25 @@ impl Tool for DirectTool {
         self.deferred.as_ref().map(|fields| &fields.namespace)
     }
 
+    /// The server's tool annotations, reported on the tool's `getAllTools` row (`annotations`,
+    /// `deferredToolFields`, `index.ts:441` @v5.0.0).
+    fn annotations(&self) -> Option<&cyrup_core::ToolAnnotations> {
+        self.deferred
+            .as_ref()
+            .and_then(|fields| fields.annotations.as_ref())
+    }
+
+    /// Whatever `toolPrefix` names it by: `--tools` leaves it registered for `codemode` and
+    /// `tool_search` (`isMcpToolName`, `core/mcp-servers.ts` @v1.0.4).
+    fn is_mcp_tool(&self) -> bool {
+        true
+    }
+
+    /// Every MCP tool declares the `CallToolResult` its scripts receive, not only a search-mode one
+    /// (`outputSchema: createMcpResultSchema(tool.outputSchema)`, `createMcpToolDefinition`,
+    /// `extensions/mcp/tools.ts` @v1.0.4).
     fn output_schema(&self) -> Option<&Value> {
-        self.deferred.as_ref().map(|fields| &fields.output_schema)
+        Some(&self.output_schema)
     }
 
     async fn execute(
@@ -2783,13 +2879,10 @@ impl Tool for DirectTool {
             }
             None => not_initialized_result(),
         };
-        // `definition.execute = async (...args) => toCallToolResult(await run(...args))`, applied
-        // to search-mode tools only (`index.ts:511-514`).
-        Ok(if self.deferred.is_some() {
-            with_call_tool_result(result)
-        } else {
-            result
-        })
+        // Every tool resolves to a `CallToolResult` for a script, as every MCP tool declares one.
+        // The adapter's `toCallToolResult` wrapped search-mode tools only (`index.ts:511-514`
+        // @v5.0.0); the built-in MCP extension's `convertMcpResult` does it for all of them.
+        Ok(with_call_tool_result(result))
     }
 }
 
@@ -5238,6 +5331,83 @@ mod tests {
         ));
     }
 
+    /// CODE-017 (`deferredToolFields`, `index.ts:441-455` @v5.0.0): a search-mode tool carries the
+    /// boolean hints of its MCP annotations, which `getAllTools` reports to permission extensions.
+    /// `title` is not one, a malformed hint costs only itself, and a tool with none reports none.
+    #[test]
+    fn a_search_mode_tool_carries_the_boolean_hints_of_its_mcp_annotations() {
+        let config = config_of(&[("srv", search_entry())]);
+        let mut one = cached_tool("one");
+        one.annotations = Some(json!({
+            "title": "One",
+            "readOnlyHint": true,
+            "destructiveHint": "yes",
+            "openWorldHint": false,
+        }));
+        let mut titled = cached_tool("titled");
+        titled.annotations = Some(json!({ "title": "Only a title" }));
+        let cache = cache_of(
+            &config,
+            &[("srv", cache_entry(vec![one, titled, cached_tool("plain")]))],
+        );
+        let spec = |name: &str| DirectToolSpec {
+            server_name: "srv".to_string(),
+            original_name: name.to_string(),
+            prefixed_name: format!("srv_{name}"),
+            description: String::new(),
+            input_schema: None,
+            resource_uri: None,
+            lazy: true,
+        };
+
+        let fields = deferred_tool_fields(&spec("one"), &McpConfig::default(), Some(&cache))
+            .expect("a lazy spec");
+        assert_eq!(
+            fields.annotations,
+            Some(cyrup_core::ToolAnnotations {
+                read_only_hint: Some(true),
+                destructive_hint: None,
+                idempotent_hint: None,
+                open_world_hint: Some(false),
+            })
+        );
+        let tool = DirectTool::new(
+            spec("one"),
+            ToolRenderKind::SelfRendered,
+            Arc::new(ToolDispatch::default()),
+            Some(fields),
+        );
+        assert_eq!(
+            tool.annotations().and_then(|a| a.read_only_hint),
+            Some(true),
+            "the registered tool reports them"
+        );
+        assert_eq!(
+            deferred_tool_fields(&spec("titled"), &McpConfig::default(), Some(&cache))
+                .unwrap()
+                .annotations,
+            None,
+            "a title alone is no annotation"
+        );
+        assert_eq!(
+            deferred_tool_fields(&spec("plain"), &McpConfig::default(), Some(&cache))
+                .unwrap()
+                .annotations,
+            None
+        );
+        let resource = DirectToolSpec {
+            resource_uri: Some("file:///x".to_string()),
+            ..spec("one")
+        };
+        assert_eq!(
+            deferred_tool_fields(&resource, &McpConfig::default(), Some(&cache))
+                .unwrap()
+                .annotations,
+            None,
+            "a resource tool is the adapter's own and has none"
+        );
+    }
+
     /// `deferredToolFields` (`index.ts:436-463`): the `deferred` exposure, the server's namespace
     /// with its cached instructions, and the result schema.
     #[test]
@@ -5318,7 +5488,11 @@ mod tests {
         );
         assert_eq!(eager.exposure(), ToolExposure::Direct);
         assert_eq!(eager.namespace(), None);
-        assert_eq!(eager.output_schema(), None);
+        assert_eq!(
+            eager.output_schema(),
+            Some(&call_tool_result_schema()),
+            "an eager tool declares the CallToolResult too"
+        );
     }
 
     /// `MCP-612` — `deferredToolFields` @ pi-mcp-adapter `2ccf648` (`index.ts:438-464`): the
@@ -5419,10 +5593,11 @@ mod tests {
         );
     }
 
-    /// The registered tool's `execute` is the eager tool's; a search-mode one adds the
-    /// `CallToolResult` codemode scripts read (`toCallToolResult`, `index.ts:68-77`).
+    /// Every MCP tool, eager or search-mode, resolves to a `CallToolResult` for a script and
+    /// declares the matching output schema (`createMcpToolDefinition`, `extensions/mcp/tools.ts`
+    /// @v1.0.4). An eager tool used to resolve to its text.
     #[tokio::test]
-    async fn a_search_mode_tool_hands_scripts_a_call_tool_result() {
+    async fn every_mcp_tool_hands_scripts_a_call_tool_result() {
         struct Fixed(ToolResult);
         #[async_trait::async_trait]
         impl McpToolDispatch for Fixed {
@@ -5481,43 +5656,79 @@ mod tests {
             details: Some(json!({ "mode": "call" })),
             ..ToolResult::default()
         };
-        let lazy = run(build(ok.clone(), true)).await;
-        assert_eq!(
-            lazy.content, ok.content,
-            "the model-facing content is untouched"
-        );
-        assert_eq!(lazy.details, ok.details);
-        assert_eq!(
-            lazy.structured_content,
-            Some(json!({ "content": [{ "type": "text", "text": "hello" }] }))
-        );
+        for lazy in [true, false] {
+            let tool = build(ok.clone(), lazy);
+            assert_eq!(
+                tool.output_schema(),
+                Some(&call_tool_result_schema()),
+                "lazy={lazy}: every MCP tool declares the CallToolResult"
+            );
+            let result = run(tool).await;
+            assert_eq!(
+                result.content, ok.content,
+                "lazy={lazy}: the model-facing content is untouched"
+            );
+            assert_eq!(result.details, ok.details);
+            assert_eq!(
+                result.structured_content,
+                Some(json!({ "content": [{ "type": "text", "text": "hello" }] })),
+                "lazy={lazy}: a result with no raw server result still has the declared shape"
+            );
+            assert!(!result.is_error);
+        }
 
-        let failed = ToolResult {
-            content: vec![Content::text("boom")],
-            details: Some(json!({ "error": "tool_error" })),
+        // The server's own result is what a script gets: image blocks, `structuredContent` and
+        // `isError` as sent, however the dispatch put it there.
+        let server_result = json!({
+            "content": [
+                { "type": "text", "text": "a picture" },
+                { "type": "image", "data": "iVBORw0KGgo=", "mimeType": "image/png" }
+            ],
+            "structuredContent": { "rows": 2 },
+            "isError": true
+        });
+        for lazy in [true, false] {
+            let answered = ToolResult {
+                content: vec![Content::text("Error: a picture")],
+                details: Some(json!({ "error": "tool_error" })),
+                structured_content: Some(server_result.clone()),
+                ..ToolResult::default()
+            };
+            let result = run(build(answered, lazy)).await;
+            assert_eq!(
+                result.structured_content,
+                Some(server_result.clone()),
+                "lazy={lazy}: a server `isError` result resolves, with its blocks"
+            );
+        }
+
+        // A call the server never answered rejects: no structured result, flagged as an error.
+        for code in ["call_failed", "aborted"] {
+            let failed = ToolResult {
+                content: vec![Content::text("Failed to call tool: boom")],
+                details: Some(json!({ "error": code })),
+                ..ToolResult::default()
+            };
+            let result = run(build(failed, false)).await;
+            assert!(result.is_error, "{code}: the script's call rejects");
+            assert_eq!(result.structured_content, None, "{code}");
+        }
+
+        // Any other failure is a prompt for the model: it resolves, flagged `isError`.
+        let prompt = ToolResult {
+            content: vec![Content::text("Run /mcp-auth srv")],
+            details: Some(json!({ "error": "auth_required" })),
             ..ToolResult::default()
         };
-        let lazy = run(build(failed.clone(), true)).await;
+        let result = run(build(prompt, false)).await;
+        assert!(!result.is_error, "the model is not told to retry");
         assert_eq!(
-            lazy.structured_content.as_ref().unwrap()["isError"],
-            json!(true),
-            "any `details.error` is an error to a script"
+            result.structured_content,
+            Some(json!({
+                "content": [{ "type": "text", "text": "Run /mcp-auth srv" }],
+                "isError": true
+            }))
         );
-
-        let with_structured = ToolResult {
-            structured_content: Some(json!({ "rows": 2 })),
-            ..ok.clone()
-        };
-        let lazy = run(build(with_structured, true)).await;
-        assert_eq!(
-            lazy.structured_content.as_ref().unwrap()["structuredContent"],
-            json!({ "rows": 2 })
-        );
-
-        // Eager: the result is exactly the dispatch's.
-        let eager = run(build(ok.clone(), false)).await;
-        assert_eq!(eager.structured_content, None);
-        assert_eq!(eager.content, ok.content);
     }
 
     /// A sink that keeps every tool a pass registers, so a test can read their exposures.

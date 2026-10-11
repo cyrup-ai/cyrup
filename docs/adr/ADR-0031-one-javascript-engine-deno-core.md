@@ -74,6 +74,29 @@ owner decision was framed on that premise.
 - **Version coupling.** `deno_core` moves fast; the pin in `Cargo.toml` is the one place to bump.
 - **No behaviour changes today.** This is a decision of record plus two documentation corrections.
 
+## Update 2026-10-07 — the isolate of `codemode` runs in its own process
+
+The "stronger posture" above is now taken for the `codemode` tool, for a reason measured rather than
+feared. Under the 256 MiB heap limit, `new Array(2 ** 27).fill(0)` aborted the whole `cyrup` process
+with SIGTRAP after eight seconds: V8 answers one allocation the heap cannot satisfy with a fatal
+out-of-memory, the near-heap-limit callback can only raise the limit by a margin, and nothing in
+the process can catch an abort. Allocation guards in the prelude cannot cover every primitive that
+allocates (the family measured also includes `Array.from({length: 2 ** 28})`, and typed-array
+copies that resolve their constructor through `SpeciesConstructor` bypassed the guards on the
+constructors), so the guards stay as defence in depth and the isolate moves out of the host:
+
+- `codemode` scripts run in `current_exe() __codemode-sandbox` (`cyrup_codemode_runtime::sandbox`,
+  `IsolatedSandboxFactory`), one process per script, so the isolate-per-execution model is unchanged;
+- the process has a cleared environment (only `LD_LIBRARY_PATH`, `DYLD_LIBRARY_PATH` and `SYSTEMROOT` are
+  passed on), no core file and an `RLIMIT_DATA` ceiling sized from the
+  script's memory budget; a deadline, cancel or `close()` kills it, which also stops a native
+  built-in that ignores `terminate_execution`;
+- a process that dies is a failed script (`InternalError: out of memory` when V8's handler got to
+  report it, a `sandbox` error naming the signal otherwise), never a failed host;
+- the in-process sandbox (`EngineSandboxFactory`) remains for tests and embedders, with the abort
+  residual documented on `sandbox::Isolation::InProcess`; `workflowScript` is not moved by this
+  update.
+
 ## Alternatives rejected
 
 - **QuickJS in `wasmtime`** — closest to upstream's isolation; adds a second engine and a host-function

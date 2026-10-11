@@ -22,7 +22,7 @@ use cyrup_codemode::declarations::{
     MCP_TYPESCRIPT_PREAMBLE, mcp_structured_content_schema, render_tool_output_type,
     render_tool_sample,
 };
-use cyrup_codemode::identifier::to_codemode_identifier;
+use cyrup_codemode::identifier::IdentifierTable;
 use cyrup_codemode::js::{js_trim, utf16_len};
 use cyrup_codemode::types::ToolDeclaration;
 use cyrup_core::{Tool, ToolNamespace};
@@ -33,10 +33,39 @@ use super::CODEMODE_TOOL_NAME;
 /// Characters per token when estimating the cost of a tool section (`tool.ts:156`).
 const CHARS_PER_TOKEN: usize = 4;
 
+/// The names of cyrup's built-in tools, which the catalog budget never spends on another tool
+/// first. `cyrup_tools::BUILTIN_NAMES` states the same list; the test
+/// `built_in_names_match_the_tool_registry` fails when they drift apart.
+const BUILT_IN_TOOL_NAMES: [&str; 8] = [
+    "bash",
+    "powershell",
+    "read",
+    "write",
+    "edit",
+    "grep",
+    "find",
+    "ls",
+];
+
 // [CYRUP-DELTA] "a V8 sandbox" where upstream says "a QuickJS sandbox" (`tool.ts:119`): the engine
 // differs (ADR-0031), everything the sentence promises — top-level `await` and `return`, no Node,
-// file system, network or timers — is what the sandbox provides. Everything else is verbatim.
-const DESCRIPTION_INTRO: &str = "Run JavaScript that calls other tools. The input is raw JavaScript (not JSON, no code fence), run as an async function body in a V8 sandbox: top-level `await` and `return` work. No Node, file system, network, or timers.\n- `await tools.<name>({ ...args })` resolves to a string, or an object if the tool's declaration says so, and rejects with an Error on failure. Calls still running when the script ends are cancelled.\n- Optional first line: `// @options: {\"max_output_tokens\": 10000, \"timeout_ms\": 60000}`";
+// file system, network or timers — is what the sandbox provides. The two bullets after the options
+// line are [CYRUP-DELTA]s: the default limits (upstream's tool has none) and the globals a script
+// must not shadow. Everything else is verbatim.
+//
+// [CYRUP-DELTA, PROV-101] upstream says "The input is raw JavaScript (not JSON, no code fence)"
+// (`tool.ts:137`). That is only true on a route that sends the tool as a grammar-constrained
+// `custom` tool; everywhere else the tool is a JSON function tool, whose input is `{"code": "..."}`
+// and whose script is a JSON string. A model that read "not JSON" there would send bare
+// JavaScript as the argument object, so the sentence names the `code` argument and the raw-text
+// form both, and the schema's own property description stops claiming a raw channel too.
+//
+// [CYRUP-DELTA] The two sentences after "rejects with an Error on failure" (`tool.ts:138`) say what
+// upstream only writes in a source comment on `bashOutputSchema` (`bash.ts`): a non-zero exit is an
+// error result for the model, but a script still gets the structured result, while a timeout
+// rejects. Without them "rejects on failure" reads as if `exit 3` threw. See also the `exit_code`
+// description of `bash`'s output schema, which the declaration renders.
+const DESCRIPTION_INTRO: &str = "Run JavaScript that calls other tools. The script is plain JavaScript source, never wrapped in a code fence: it is the `code` argument, or the whole input where this tool takes raw text instead of JSON. It runs as an async function body in a V8 sandbox: top-level `await` and `return` work. No Node, file system, network, or timers.\n- `await tools.<name>({ ...args })` resolves to a string, or an object if the tool's declaration says so, and rejects with an Error on failure. A `bash` command that exits non-zero is not a failure: the call resolves to its result, so check `exit_code`. A timeout still rejects. Calls still running when the script ends are cancelled.\n- Optional first line: `// @options: {\"max_output_tokens\": 10000, \"timeout_ms\": 60000}`\n- Without `timeout_ms` a script stops after 120 s of its own running time (waiting for tool calls does not count) or 30 min in all; `timeout_ms` replaces both limits.\n- `text`, `image`, `store`, `load`, `exit` and the other globals below are plain variables: do not declare your own with those names (`const text = await tools.read(...)` makes the next `text(...)` call your string). `tools` and `console` may be redeclared.";
 
 /// One line per global; the details live in the docs (`tool.ts:122-135` `describeGlobals`).
 fn describe_globals(models: bool, docs_path: &str) -> String {
@@ -47,8 +76,10 @@ fn describe_globals(models: bool, docs_path: &str) -> String {
         "- `ALL_TOOLS`, `await searchTools(query, { limit?, namespace? })`, `await describeTool(name)`, `await describeNamespace(name)`: find unlisted tools, such as MCP tools.".to_owned(),
     ];
     if models {
+        // [CYRUP-DELTA] "with read, or tools.read": in `only` mode the model has no `read` tool of
+        // its own, and the docs path is where cyrup materialises the page (`docs::materialise`).
         lines.push(format!(
-            "- `models`: classifiers and image generation. Read {docs_path} first."
+            "- `models`: classifiers and image generation. Read {docs_path} first (with read, or tools.read in a script)."
         ));
     }
     lines.join("\n")
@@ -62,9 +93,13 @@ fn text_output_schema() -> Value {
 /// What a script sees of a tool (`toCodemodeDeclaration`, `tool.ts:159-166` @v1.0.1,
 /// `tool.ts:160-176` @v1.0.4): its description followed by its prompt `guidelines` as bullets, which
 /// the system prompt only has for declared tools (CODE-020). Tools without an output schema resolve
-/// to their text output.
+/// to their text output. `identifiers` is the table over every tool the script can call.
 #[must_use]
-pub fn to_codemode_declaration(tool: &dyn Tool, guidelines: &[String]) -> ToolDeclaration {
+pub fn to_codemode_declaration(
+    tool: &dyn Tool,
+    guidelines: &[String],
+    identifiers: &IdentifierTable,
+) -> ToolDeclaration {
     let bullets: Vec<String> = guidelines
         .iter()
         .map(|guideline| guideline.trim())
@@ -78,6 +113,9 @@ pub fn to_codemode_declaration(tool: &dyn Tool, guidelines: &[String]) -> ToolDe
     };
     ToolDeclaration {
         name: tool.name().to_owned(),
+        // [CYRUP-DELTA] The identifier the session assigned, which differs from the derived one
+        // only when another tool would have the same.
+        identifier: Some(identifiers.get(tool.name())),
         description: Some(description),
         input_schema: Some(tool.parameters().clone()),
         output_schema: Some(
@@ -118,12 +156,15 @@ pub struct DescriptionOptions<'a> {
     pub inline_budget: Option<f64>,
     /// The docs the `models` line points the model to (`CODEMODE_DOCS_PATH`).
     pub docs_path: &'a str,
+    /// [CYRUP-DELTA] The identifier of every tool a script can call, listed or not, so a heading
+    /// names the identifier the sandbox registers the tool under.
+    pub identifiers: &'a IdentifierTable,
 }
 
 /// `### \`id\` (\`raw name\`)` followed by the tool's description and declaration
 /// (`renderToolSection`, `tool.ts:187-191`).
 fn render_tool_section(declaration: &ToolDeclaration) -> String {
-    let id = to_codemode_identifier(&declaration.name);
+    let id = declaration.script_identifier();
     let heading = if id.as_str() == declaration.name {
         format!("### `{id}`")
     } else {
@@ -139,6 +180,8 @@ struct CatalogEntry {
     name: String,
     section: String,
     cost: f64,
+    /// A built-in tool of the coding agent, which [`select_catalog`] places before anything else.
+    built_in: bool,
 }
 
 struct CatalogGroup {
@@ -150,6 +193,11 @@ struct CatalogGroup {
 /// `tool.ts:206-226`): in each round every group (tools without a namespace first, then namespaces
 /// by name) places its cheapest remaining tool; a group whose next tool does not fit drops out
 /// while the others continue. Every namespace is represented before any namespace is complete.
+///
+/// [CYRUP-DELTA] The built-in tools are placed first, cheapest first, before the rounds start. In
+/// `codemode.mode = only` they are hidden from the model, which then learns that `tools.edit` exists
+/// from this listing alone, and a round-robin over many extension tools spent the budget on cheaper
+/// ones first. Anything the budget cannot take is still counted as not listed in the description.
 fn select_catalog(
     groups: &[CatalogGroup],
     budget: Option<f64>,
@@ -160,16 +208,32 @@ fn select_catalog(
             .flat_map(|group| group.entries.iter().map(|entry| entry.name.clone()))
             .collect();
     };
+    let mut shown = std::collections::BTreeSet::new();
+    let mut built_ins: Vec<&CatalogEntry> = groups
+        .iter()
+        .flat_map(|group| group.entries.iter())
+        .filter(|entry| entry.built_in)
+        .collect();
+    built_ins.sort_by(|a, b| a.cost.total_cmp(&b.cost));
+    for entry in built_ins {
+        if entry.cost <= remaining {
+            remaining -= entry.cost;
+            shown.insert(entry.name.clone());
+        }
+    }
     let mut queues: Vec<VecDeque<&CatalogEntry>> = groups
         .iter()
         .map(|group| {
-            let mut sorted: Vec<&CatalogEntry> = group.entries.iter().collect();
+            let mut sorted: Vec<&CatalogEntry> = group
+                .entries
+                .iter()
+                .filter(|entry| !entry.built_in)
+                .collect();
             // `Array.prototype.sort` is stable; so is this.
             sorted.sort_by(|a, b| a.cost.total_cmp(&b.cost));
             sorted.into()
         })
         .collect();
-    let mut shown = std::collections::BTreeSet::new();
     queues.retain(|queue| !queue.is_empty());
     while !queues.is_empty() {
         queues.retain_mut(|queue| {
@@ -206,7 +270,7 @@ pub fn create_codemode_description(
                 .guidelines
                 .get(tool.name())
                 .map_or(&[][..], Vec::as_slice);
-            to_codemode_declaration(tool.as_ref(), guidelines)
+            to_codemode_declaration(tool.as_ref(), guidelines, options.identifiers)
         })
         .collect();
 
@@ -241,6 +305,8 @@ pub fn create_codemode_description(
                 name: declaration.name.clone(),
                 section,
                 cost,
+                built_in: namespace.is_none()
+                    && BUILT_IN_TOOL_NAMES.contains(&declaration.name.as_str()),
             });
         }
     }
@@ -292,7 +358,18 @@ pub fn create_codemode_description(
                 None => format!("## {}{listing}", namespace.name),
             });
         }
+        let listed = visible.len();
         tool_sections.extend(visible.into_iter().map(|entry| entry.section.clone()));
+        // [CYRUP-DELTA] Tools without a namespace have no heading to carry the "not listed" note, so
+        // the note is a line of its own. Without it a budget that cut them left no trace, and with
+        // nothing listed at all the section was a bare "Nested tools:".
+        if group.namespace.is_none() && listed < group.entries.len() {
+            let hidden = group.entries.len() - listed;
+            tool_sections.push(format!(
+                "{hidden} {} not listed; use ALL_TOOLS / searchTools",
+                if hidden == 1 { "tool" } else { "tools" }
+            ));
+        }
     }
     sections.push(tool_sections.join("\n\n"));
     sections.join("\n\n")
@@ -349,14 +426,14 @@ fn describe_output(schema: Option<&Value>) -> String {
 /// (`describeScriptCall`, `tool.ts:318-322`). The arguments are the tool's declared parameters, so
 /// they are not repeated.
 #[must_use]
-pub fn describe_script_call(tool: &dyn Tool) -> String {
+pub fn describe_script_call(tool: &dyn Tool, identifiers: &IdentifierTable) -> String {
     // No guidelines: a declared tool's are rules of the system prompt (`describeScriptCall` is
     // unchanged at v1.0.4).
-    let declaration = to_codemode_declaration(tool, &[]);
+    let declaration = to_codemode_declaration(tool, &[], identifiers);
     format!(
         "{}\n\nCodemode: `tools.{}(args)` resolves to {}.",
         js_trim(tool.description()),
-        to_codemode_identifier(tool.name()),
+        declaration.script_identifier(),
         describe_output(declaration.output_schema.as_ref())
     )
 }

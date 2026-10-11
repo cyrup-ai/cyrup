@@ -17,5 +17,6 @@ mod json_event;
 mod modes;
 mod rpc_agent_settled;
 mod rpc_client;
+mod rpc_eof_shutdown;
 mod rpc_host_seam;
 mod rpc_output_decoupling;

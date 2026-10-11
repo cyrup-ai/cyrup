@@ -126,15 +126,13 @@ pub struct BusAnnouncingCompletionObserver {
     /// than copied: `set_host_services` runs before `init`, but the completion watcher is
     /// installed later still, and a REINSTALL on a subsequent `SessionStart` must see whatever the
     /// slot holds then.
-    host_services: Arc<std::sync::OnceLock<Arc<dyn cyrup_ext::host::HostServices>>>,
+    host_services: Arc<cyrup_ext::host::HostServicesSlot>,
 }
 
 impl BusAnnouncingCompletionObserver {
     /// Announce onto whatever backend `host_services` resolves to at observation time.
     #[must_use]
-    pub fn new(
-        host_services: Arc<std::sync::OnceLock<Arc<dyn cyrup_ext::host::HostServices>>>,
-    ) -> Self {
+    pub fn new(host_services: Arc<cyrup_ext::host::HostServicesSlot>) -> Self {
         Self { host_services }
     }
 }
@@ -263,7 +261,7 @@ pub struct ProcessTerminalAnnouncingCompletionObserver {
     async_root: std::path::PathBuf,
     /// The executor's own late-bound host-services slot, shared rather than copied, for the
     /// reason [`BusAnnouncingCompletionObserver`]'s field doc gives.
-    host_services: Arc<std::sync::OnceLock<Arc<dyn cyrup_ext::host::HostServices>>>,
+    host_services: Arc<cyrup_ext::host::HostServicesSlot>,
 }
 
 impl ProcessTerminalAnnouncingCompletionObserver {
@@ -330,7 +328,7 @@ impl ProcessTerminalAnnouncingCompletionObserver {
     #[must_use]
     pub fn new(
         async_root: std::path::PathBuf,
-        host_services: Arc<std::sync::OnceLock<Arc<dyn cyrup_ext::host::HostServices>>>,
+        host_services: Arc<cyrup_ext::host::HostServicesSlot>,
     ) -> Self {
         Self {
             async_root,
@@ -342,7 +340,7 @@ impl ProcessTerminalAnnouncingCompletionObserver {
 #[async_trait::async_trait]
 impl CompletionObserver for ProcessTerminalAnnouncingCompletionObserver {
     async fn observe(&self, notification: &CompletionNotification) -> bool {
-        let Some(services) = self.host_services.get().map(Arc::clone) else {
+        let Some(services) = self.host_services.get() else {
             return true;
         };
         // The run is known; the runner instance is not, because the result file does not carry

@@ -10,6 +10,7 @@
 //! <agentDir>/sessions/permission-forwarding/sessions/<urlencode(sessionId)>/
 //!     requests/<requestId>.json      (child writes; parent reads+deletes)
 //!     responses/<requestId>.json     (parent writes; child reads+deletes)
+//!     no-ui                          (CYRUP-DELTA: a root without a UI says so; see below)
 //! ```
 //!
 //! Both sides resolve the SAME path from the SAME `agentDir` and the PARENT's session id (the child
@@ -42,6 +43,11 @@ use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 
 use cyrup_ext::{HostServices, NotifyKind};
+use cyrup_ext_subagents::background::async_retention::machine_hostname;
+use cyrup_ext_subagents::background::reconcile::{Liveness, check_pid_liveness_probing_zombie};
+use cyrup_ext_subagents::background::session_lease::{
+    ProcessStartIdentity, process_demonstrably_gone, process_start_identity, runtime_start_identity,
+};
 use cyrup_ext_subagents::{
     CONTROL_INBOX_POLL_INTERVAL, validate_contains_root, validate_safe_token,
 };
@@ -239,11 +245,16 @@ pub fn forwarding_location(
         .join(&encoded);
     validate_contains_root(&root, &session_root)
         .map_err(|e| PermissionError::UnsafeToken(e.to_string()))?;
-    Ok(ForwardingLocation {
+    Ok(location_at(session_root))
+}
+
+/// The `{requests,responses}` dirs of the spool session root `session_root`.
+fn location_at(session_root: PathBuf) -> ForwardingLocation {
+    ForwardingLocation {
         requests_dir: session_root.join(SESSION_FORWARDING_REQUESTS_DIRECTORY_NAME),
         responses_dir: session_root.join(SESSION_FORWARDING_RESPONSES_DIRECTORY_NAME),
         session_root,
-    })
+    }
 }
 
 // ---------------------------------------------------------------------------- filesystem helpers
@@ -675,6 +686,7 @@ fn denied() -> PermissionPromptDecision {
         approved: false,
         state: PermissionDecisionState::Denied,
         denial_reason: None,
+        reject_script: false,
     }
 }
 
@@ -687,6 +699,263 @@ pub fn resolve_child_wait_timeout() -> Duration {
         .filter(|ms| *ms > 0)
         .map_or(PERMISSION_FORWARDING_TIMEOUT, Duration::from_millis)
 }
+
+// ---------------------------------------------------------------------------- unattended parents
+
+/// The file a root session without a UI leaves in its spool root (`session_root`), next to the
+/// `requests` and `responses` directories. See [`mark_session_unattended`].
+const UNATTENDED_MARKER_FILE_NAME: &str = "no-ui";
+
+/// How many entries of the spool's `sessions` directory one [`mark_session_unattended`] sweep looks
+/// at when it removes the markers of roots that are gone. A bound, not a quota: the sweep runs on
+/// every headless start, so a spool that outgrew it is worked down a bound at a time.
+const UNATTENDED_SWEEP_LIMIT: usize = 256;
+
+/// What a `no-ui` marker says: this root process, and no other, has the session and no UI.
+///
+/// A session id outlives its process (`-c`, `--session <file>`), so the statement has to name the
+/// process it was true of, or it would be read as a fact about the session for ever. `pid`,
+/// `process_start_identity` and `hostname` are the owner stamp the session lease carries
+/// (`cyrup_ext_subagents::background::session_lease`), judged by the same ladder.
+///
+/// `pid` and `hostname` are required: a marker without them was written by a build that did not
+/// stamp its writer and never withdrew the statement, which is the defect this type exists for, so
+/// it fails to parse and reads as no marker at all.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UnattendedMarker {
+    session_id: String,
+    created_at: i64,
+    pid: u32,
+    #[serde(default)]
+    process_start_identity: Option<ProcessStartIdentity>,
+    hostname: String,
+}
+
+impl UnattendedMarker {
+    /// The marker the calling process writes for `session_id`.
+    fn for_this_process(session_id: &str) -> Self {
+        let pid = std::process::id();
+        Self {
+            session_id: session_id.to_string(),
+            created_at: now_millis(),
+            pid,
+            // The lease's three rungs, minus the injected one: the real probe, then the runtime
+            // fallback for this process, so a platform that cannot read `/proc` still records one.
+            process_start_identity: process_start_identity(pid)
+                .or_else(|| Some(runtime_start_identity())),
+            hostname: machine_hostname(),
+        }
+    }
+
+    /// Whether the process that wrote this is demonstrably gone, so that the statement no longer
+    /// describes anything. Positive evidence only, as for a lease (`demonstrably_stale`): another
+    /// machine's pid table says nothing about this one's, and an inconclusive probe is not death.
+    /// A wrong "alive" costs a refusal that the UI which resumes the session withdraws; a wrong
+    /// "gone" costs the child a wait it was spared.
+    ///
+    /// Both probes are injected, as in the lease, so a test can present a recycled pid.
+    fn writer_is_gone(
+        &self,
+        hostname: &str,
+        liveness: fn(u32) -> Liveness,
+        start_identity_of: fn(u32) -> Option<ProcessStartIdentity>,
+    ) -> bool {
+        if self.hostname != hostname {
+            return false;
+        }
+        // `kill(2)` reads 0 and a negative number as a process group, which is always there: not a
+        // pid a root of ours ever had, so not a writer that is alive.
+        if !i32::try_from(self.pid).is_ok_and(|pid| pid > 0) {
+            return true;
+        }
+        process_demonstrably_gone(
+            self.pid,
+            self.process_start_identity.as_ref(),
+            liveness,
+            start_identity_of,
+        )
+    }
+}
+
+/// The liveness probe for a root's pid: `kill(pid, 0)`, and a zombie reads as dead. A root that was
+/// killed and never reaped (a container whose PID 1 reaps nothing) still answers the signal, and
+/// will never answer a question. Safe to ask of every marker because [`UnattendedMarker::writer_is_gone`]
+/// asks it only of a pid written on this machine.
+fn root_liveness(pid: u32) -> Liveness {
+    check_pid_liveness_probing_zombie(pid, true)
+}
+
+/// The marker at `path`, or `None` when there is none or it is not one this build wrote.
+fn read_unattended_marker(path: &Path) -> Option<UnattendedMarker> {
+    serde_json::from_slice(&std::fs::read(path).ok()?).ok()
+}
+
+/// \[CYRUP-DELTA] Record that the calling process is the root of session `session_id` and has no
+/// UI, so it will never answer a forwarded permission request. Returns whether the marker is in
+/// place.
+///
+/// Upstream's headless root simply does not service its spool ([`process_forwarded_requests`] returns
+/// at once, pi `index.ts:1113-1116`) and does not say so, so a subagent child whose `ask` rule fired
+/// wrote its request and waited the whole [`PERMISSION_FORWARDING_TIMEOUT`] (10 minutes) for an
+/// answer nobody was going to give, then reported "User denied ...", a denial by a user who was never
+/// asked. That is the case of every `-p` and `--mode json` run that starts a subagent under a policy
+/// with an `ask` rule, and of a `codemode` script that calls a tool in such a child.
+///
+/// The child already addresses the root's spool by the parent-session anchor, at every hop
+/// (foreground, background, nested), so a file there needs no new channel between the processes:
+/// [`session_is_unattended`] is the child's side.
+///
+/// The marker belongs to the PROCESS that wrote it ([`UnattendedMarker`]), not to the session: a
+/// session id survives resume, so a marker read as a fact about the session refused every question
+/// of a session that a later process resumed with a UI. It stands while that process lives, a
+/// process that is killed or crashes leaves nothing that outlasts it, and one with a UI withdraws any
+/// marker of its session ([`clear_session_unattended`]) whoever wrote it. Markers of roots that are
+/// gone are swept up here, a bounded number at a time.
+#[must_use]
+pub fn mark_session_unattended(
+    default_agent_dir: &Path,
+    session_id: &str,
+    audit: Option<&AuditTrail>,
+) -> bool {
+    write_unattended_marker(
+        default_agent_dir,
+        session_id,
+        &UnattendedMarker::for_this_process(session_id),
+        audit,
+    )
+}
+
+/// [`mark_session_unattended`] with the writer named, which a test needs to present a root that is
+/// gone.
+fn write_unattended_marker(
+    default_agent_dir: &Path,
+    session_id: &str,
+    marker: &UnattendedMarker,
+    audit: Option<&AuditTrail>,
+) -> bool {
+    let Ok(location) = forwarding_location(default_agent_dir, session_id) else {
+        return false;
+    };
+    prune_unattended_markers(
+        default_agent_dir,
+        UNATTENDED_SWEEP_LIMIT,
+        &machine_hostname(),
+        root_liveness,
+        process_start_identity,
+        audit,
+    );
+    if !ensure_directory_exists(
+        &location.session_root,
+        "permission forwarding session root",
+        audit,
+    ) {
+        return false;
+    }
+    write_json_atomic(
+        &location.session_root.join(UNATTENDED_MARKER_FILE_NAME),
+        marker,
+        audit,
+    )
+    .is_ok()
+}
+
+/// Remove the `no-ui` markers of roots that are gone from the spool's session roots, and the roots
+/// they leave empty (a root holding a request keeps its directories). Looks at no more than `limit`
+/// entries of the `sessions` directory; one that is not a directory, holds no marker or holds the
+/// marker of a live root is left as it is.
+///
+/// Best effort, like every cleanup in this file: a marker that cannot be removed is warned about
+/// and judged again by the next sweep, and one that another process replaces between the read and
+/// the removal costs that root's children one wait, never a wrong answer to a question.
+fn prune_unattended_markers(
+    default_agent_dir: &Path,
+    limit: usize,
+    hostname: &str,
+    liveness: fn(u32) -> Liveness,
+    start_identity_of: fn(u32) -> Option<ProcessStartIdentity>,
+    audit: Option<&AuditTrail>,
+) {
+    let sessions_dir =
+        forwarding_root_dir(default_agent_dir).join(SESSION_FORWARDING_ROOT_DIRECTORY_NAME);
+    let Ok(entries) = std::fs::read_dir(&sessions_dir) else {
+        return;
+    };
+    for entry in entries.flatten().take(limit) {
+        if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            continue;
+        }
+        let location = location_at(entry.path());
+        let marker_path = location.session_root.join(UNATTENDED_MARKER_FILE_NAME);
+        let gone = match read_unattended_marker(&marker_path) {
+            Some(marker) => marker.writer_is_gone(hostname, liveness, start_identity_of),
+            // Present but not one of ours (an earlier build's, which never stamped a writer): the
+            // defect itself, so it goes too. Absent: nothing to prune.
+            None => marker_path.is_file(),
+        };
+        if gone {
+            safe_delete_file(
+                &marker_path,
+                "permission forwarding unattended marker",
+                audit,
+            );
+            cleanup_location_if_empty(&location, audit);
+        }
+    }
+}
+
+/// Withdraw [`mark_session_unattended`]'s marker, for a session that has a UI after all, whichever
+/// process wrote it. Silent when there is none; removes the spool root again when the marker was
+/// all it held. Returns whether no marker is left.
+pub fn clear_session_unattended(
+    default_agent_dir: &Path,
+    session_id: &str,
+    audit: Option<&AuditTrail>,
+) -> bool {
+    let Ok(location) = forwarding_location(default_agent_dir, session_id) else {
+        return true;
+    };
+    let marker_path = location.session_root.join(UNATTENDED_MARKER_FILE_NAME);
+    safe_delete_file(
+        &marker_path,
+        "permission forwarding unattended marker",
+        audit,
+    );
+    cleanup_location_if_empty(&location, audit);
+    !marker_path.exists()
+}
+
+/// Whether the root session `session_id` said, by [`mark_session_unattended`], that it has no UI, and
+/// the process that said it is still there to be asked. A subagent child asks this before it waits on
+/// that session for an answer.
+#[must_use]
+pub fn session_is_unattended(default_agent_dir: &Path, session_id: &str) -> bool {
+    session_is_unattended_with(
+        default_agent_dir,
+        session_id,
+        &machine_hostname(),
+        root_liveness,
+        process_start_identity,
+    )
+}
+
+/// [`session_is_unattended`] with the host and both probes named.
+fn session_is_unattended_with(
+    default_agent_dir: &Path,
+    session_id: &str,
+    hostname: &str,
+    liveness: fn(u32) -> Liveness,
+    start_identity_of: fn(u32) -> Option<ProcessStartIdentity>,
+) -> bool {
+    let Ok(location) = forwarding_location(default_agent_dir, session_id) else {
+        return false;
+    };
+    read_unattended_marker(&location.session_root.join(UNATTENDED_MARKER_FILE_NAME))
+        .is_some_and(|marker| !marker.writer_is_gone(hostname, liveness, start_identity_of))
+}
+
+#[cfg(test)]
+mod unattended_tests;
 
 // ---------------------------------------------------------------------------- child (requester)
 
@@ -827,6 +1096,7 @@ pub async fn wait_for_forwarded_approval(
                     approved: resp.approved,
                     state: resp.state,
                     denial_reason: resp.denial_reason,
+                    reject_script: false,
                 };
             }
             // Unbound (forged / stale) response: ignore and keep waiting (pi `:1334-1336`).
@@ -1173,6 +1443,7 @@ async fn resolve_forwarded_decision(
                 "permission_timeout: forwarded permission request expired before it could be displayed."
                     .to_string(),
             ),
+            reject_script: false,
         };
     }
 
@@ -1186,6 +1457,7 @@ async fn resolve_forwarded_decision(
             approved: true,
             state: PermissionDecisionState::Approved,
             denial_reason: None,
+            reject_script: false,
         };
     }
 
@@ -1250,6 +1522,7 @@ async fn resolve_forwarded_decision(
             "Permission Required (Subagent)",
             &body,
             PromptOpts {
+                offer_script_reject: false,
                 timeout,
                 timeout_denial_reason,
             },
@@ -1390,6 +1663,19 @@ pub fn spawn_forwarding_watcher(
                 None => {
                     ticker.tick().await;
                 }
+            }
+            // [CYRUP-DELTA] Put the inbox back if it is gone. The requester removes the spool
+            // directories that are empty once it has its answer (pi
+            // `cleanupPermissionForwardingLocationIfEmpty`, run on the child's side too:
+            // `index.ts:1072,1087`), and the directory it removes is this watcher's own. pi's
+            // polling is re-entered by four hooks, each of which calls
+            // `ensurePermissionForwardingLocation` first (`index.ts:1725-1731`), so the inbox is
+            // back before the next scan. This loop is cyrup's only re-entry. Left alone, the
+            // `notify::PollWatcher` attached to the vanished path reports a walk error every poll
+            // for the rest of the session, a stderr line every 250 ms that a terminal UI shares.
+            // A `stat` per wake; nothing is created while the directory is there.
+            if !location.requests_dir.is_dir() {
+                let _ = ensure_location(&location, Some(&*audit));
             }
             // Re-read the LIVE config every iteration (pi reads the reassigned module binding on
             // every scan), so a mid-session yolo / prompt-timeout change takes effect here.
@@ -1658,6 +1944,50 @@ mod tests {
             "the watcher must retry its attach and eventually service the spool; pre-fix it \
              returned on the first blank session id and the request at {} was never read",
             request_path.display()
+        );
+    }
+
+    /// The requester removes the spool directories that are empty once it has its answer, and the
+    /// directory it removes is the one this watcher watches. Measured on the real binary before
+    /// the fix: after the first forwarded approval was answered, the parent wrote a
+    /// `walkdir error scanning ... NotFound` warning to stderr every 250 ms for the rest of the
+    /// session, which a terminal UI shares. The watcher must put its inbox back.
+    #[tokio::test]
+    async fn watcher_puts_back_the_inbox_a_requester_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent_dir = dir.path().to_path_buf();
+        let parent = "perm-inbox-removed";
+        let services: Arc<dyn HostServices> = Arc::new(NoDialogHost {
+            id: parent.to_string(),
+            selects: Arc::new(AtomicUsize::new(0)),
+        });
+        let watcher = spawn_forwarding_watcher(
+            agent_dir.clone(),
+            services,
+            Arc::new(Mutex::new(ExtensionConfig::default())),
+            Arc::new(AuditTrail::detached(agent_dir.join("logs"))),
+            Arc::new(AtomicBool::new(true)),
+        );
+        let loc = forwarding_location(&agent_dir, parent).unwrap();
+        let attached = eventually(Duration::from_secs(10), || loc.requests_dir.is_dir()).await;
+        assert!(
+            attached,
+            "the watcher must create its inbox when it attaches"
+        );
+
+        // What the requesting child does after the answer (`wait_for_forwarded_approval`).
+        cleanup_location_if_empty(&loc, None);
+        assert!(
+            !loc.requests_dir.exists(),
+            "the requester's cleanup removes the empty inbox"
+        );
+
+        let restored = eventually(Duration::from_secs(10), || loc.requests_dir.is_dir()).await;
+        watcher.abort();
+        assert!(
+            restored,
+            "the watcher must put its inbox back, or its directory watch reports a missing path \
+             on every poll for the rest of the session"
         );
     }
 

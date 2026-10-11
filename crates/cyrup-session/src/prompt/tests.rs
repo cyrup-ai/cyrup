@@ -588,6 +588,17 @@ fn sess035_docs_section_emits_pi_resolution_and_cross_reference_rules() {
         ),
         "system-prompt.ts:157; got:\n{out}"
     );
+    // `:158` @v1.0.4 names the codemode page among the topics; it is the one entry cyrup ships at
+    // its path, and it comes between the resolution rule and the cross-reference rules.
+    let resolve = out.find("resolve docs/... under Additional docs").unwrap();
+    let codemode = out
+        .find(
+            "- When asked about: codemode scripts and non-LLM models such as classifiers and \
+             image models (docs/codemode.md)",
+        )
+        .unwrap_or_else(|| panic!("no codemode pointer:\n{out}"));
+    let cross_reference = out.find("follow .md cross-references").unwrap();
+    assert!(resolve < codemode && codemode < cross_reference, "{out}");
     assert!(
         out.contains("follow .md cross-references before implementing"),
         "system-prompt.ts:159"

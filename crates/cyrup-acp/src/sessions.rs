@@ -87,7 +87,7 @@ use agent_client_protocol::schema::v1::{
     ListSessionsResponse, LoadSessionRequest, LoadSessionResponse, Meta, NewSessionRequest,
     NewSessionResponse, PromptRequest, PromptResponse, SessionId, SessionInfo as AcpSessionInfo,
     SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
-    SetSessionConfigOptionResponse, SetSessionModeRequest, SetSessionModeResponse, ToolCallContent,
+    SetSessionConfigOptionResponse, SetSessionModeRequest, SetSessionModeResponse,
     ToolCallId as AcpToolCallId, UsageUpdate,
 };
 use agent_client_protocol::{BoxFuture, Client, ConnectionTo, Responder};
@@ -732,12 +732,11 @@ fn replay_tool_result(
     } else {
         // The generic arm uses the full `toolResultToText` ladder (`ACP-136`), whose first rung is
         // `details.diff` — so a replayed `edit` shows its diff exactly as the live one does.
-        let rendered = crate::translate::tool_result_to_text(&envelope);
         ledger.finish(
             id,
             is_error,
             UpdatePatch {
-                content: (!rendered.is_empty()).then(|| vec![ToolCallContent::from(rendered)]),
+                content: crate::translate::tool_result_content(&envelope),
                 raw_output: Some(envelope.clone()),
                 ..UpdatePatch::default()
             },
@@ -4156,6 +4155,37 @@ mod tests {
         // Stable across two loads: no `crypto.randomUUID()` fallback exists here.
         let second_json: Vec<Value> = second.iter().map(json_of).collect();
         assert_eq!(json, second_json);
+    }
+
+    /// [CYRUP-DELTA] A replayed result reads as the live one does: one text block per line, and the
+    /// images as image content. (`session/load` of a `codemode` call printed `printedhello|nested`.)
+    #[test]
+    fn a_replayed_result_with_several_blocks_reads_one_per_line_with_its_images() {
+        let cwd = AbsCwd::parse("/proj/a").unwrap();
+        let item = ReplayItem::Message(Box::new(AgentMessage::Core(Message::ToolResult {
+            duration_ms: None,
+            tool_call_id: CoreToolCallId::from("cm"),
+            tool_name: "codemode".to_string(),
+            content: vec![
+                text("printed"),
+                text("hello"),
+                Content::Image {
+                    data: "iVBORw0KGgo=".into(),
+                    mime_type: "image/png".into(),
+                },
+            ],
+            is_error: false,
+            details: None,
+            usage: None,
+            added_tool_names: Vec::new(),
+            timestamp: 0,
+            nested_calls: None,
+        })));
+        let out = replay_updates(&[item], &cwd);
+        let update = json_of(&out[1]);
+        assert_eq!(update["content"][0]["content"]["text"], "printed\nhello");
+        assert_eq!(update["content"][1]["content"]["type"], "image");
+        assert_eq!(update["content"][1]["content"]["data"], "iVBORw0KGgo=");
     }
 
     /// ACP-Q34, decided — the replay `kind` mapping is `ToolClass::of`, the SAME classifier the

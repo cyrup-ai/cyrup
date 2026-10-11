@@ -29,7 +29,8 @@
 //! `Result` and each caller maps the error into its own `ProviderError`. The **message text** is
 //! reproduced verbatim, because it reaches `AssistantMessage.error_message` on both sides.
 
-use crate::context::{ConstrainedSamplingConfig, StrictSampling, ToolDef};
+use crate::context::{ConstrainedSamplingConfig, Context, StrictSampling, ToolDef};
+use cyrup_core::SharedStr;
 use serde_json::{Map, Value, json};
 use std::collections::HashMap;
 use std::fmt;
@@ -301,6 +302,78 @@ pub struct GrammarToolInputJsonBuffer {
     pub closed: bool,
 }
 
+/// Pi `StreamingToolCall.customInput` (`openai-responses-shared.ts:399-402`,
+/// `openai-completions.ts:381-384` @v1.0.4): the decoder state of a streamed grammar-constrained
+/// call (PROV-101) whose arguments are `{ [property]: <raw text> }`. Shared by the Responses
+/// (`custom_tool_call`) and Chat Completions (`custom` tool call) decoders.
+pub struct CustomToolInput {
+    /// The argument property the raw text is stored under (the tool's grammar input property, or
+    /// pi's `"input"` fallback for a tool the request never declared).
+    property: String,
+    /// Decoder-side state that turns the cumulative raw text into append-only JSON deltas.
+    pub buffer: GrammarToolInputJsonBuffer,
+    /// The raw text so far (pi `block.arguments[property]`).
+    input: String,
+}
+
+impl CustomToolInput {
+    #[must_use]
+    pub fn new(property: &str, input: &str) -> Self {
+        Self {
+            property: property.to_string(),
+            buffer: GrammarToolInputJsonBuffer::default(),
+            input: input.to_string(),
+        }
+    }
+
+    /// The JSON prefix of `{ [property]: input }` with its string left open: what the block's
+    /// argument buffer holds before any delta, and what the lenient parse reads as
+    /// `{ [property]: input }` (pi `arguments: { [inputProperty]: input }`, `:493`).
+    pub fn open_json(&self) -> String {
+        let key = serde_json::Value::String(self.property.clone()).to_string();
+        let body = serde_json::Value::String(self.input.clone()).to_string();
+        format!("{{{key}:{}", body.strip_suffix('"').unwrap_or(&body))
+    }
+
+    /// Pi `getCustomToolCallInput`.
+    pub fn input(&self) -> &str {
+        &self.input
+    }
+
+    /// Pi `appendCustomToolCallInput` (`:419-424`): record `next_input`, return the JSON delta.
+    /// The delta stream always starts from an empty object, so the first delta carries the whole
+    /// opening (and any initial input).
+    pub fn append(&mut self, next_input: &str, close: bool) -> Result<Option<String>> {
+        let delta = append_grammar_tool_input_json_delta(
+            &mut self.buffer,
+            &self.property,
+            next_input,
+            close,
+        )?;
+        self.input = next_input.to_string();
+        Ok(delta)
+    }
+
+    /// [`Self::append`], also keeping `json` — the block's argument buffer, seeded with
+    /// [`Self::open_json`] — equal to the JSON object the emitted deltas add up to. The first delta
+    /// restates everything from `{`, so it replaces the seeded opening; later ones extend it.
+    pub fn append_into(
+        &mut self,
+        json: &mut SharedStr,
+        next_input: &str,
+        close: bool,
+    ) -> Result<Option<String>> {
+        let first = !self.buffer.started;
+        let delta = self.append(next_input, close)?;
+        match &delta {
+            Some(d) if first => *json = SharedStr::from(d.as_str()),
+            Some(d) => json.push_str(d),
+            None => {}
+        }
+        Ok(delta)
+    }
+}
+
 /// Pi `getGrammarToolInput` (`constrained-sampling.ts:21-31`) — read the single grammar-generated
 /// string out of an already-parsed argument object.
 pub fn get_grammar_tool_input(
@@ -525,6 +598,26 @@ pub fn create_grammar_tool_input_properties(
         }
     }
     Ok(properties)
+}
+
+/// Pi `createGrammarToolInputProperties(getDeclaredTools(context.messages), supportsOpenAIGrammarTools)`
+/// (`openai-responses.ts:161-164` @v1.0.4): tool name → the argument property its raw grammar text
+/// is stored under, for every declared tool that resolves to a grammar on this route.
+///
+/// This one map drives all three sides of a grammar call on the Responses and Chat Completions
+/// wires: the `custom` tool declaration, the replay of the call (and, on Responses, its result) and
+/// the decoding of the streamed custom call.
+///
+/// [CYRUP-DELTA, mechanism only] pi reads the declarations out of the transcript's system messages
+/// (`getDeclaredTools`); cyrup's agent hands the adapters `Context.tools` as well, so both are
+/// consulted. A tool that is declared by neither cannot have been sent as a `custom` tool.
+pub fn grammar_tool_input_properties(
+    ctx: &Context,
+    supports_openai_grammar_tools: bool,
+) -> Result<HashMap<String, String>> {
+    let mut declared = crate::utils::transcript::get_declared_tools(&ctx.messages);
+    declared.extend(ctx.tools.iter().cloned());
+    create_grammar_tool_input_properties(&declared, supports_openai_grammar_tools)
 }
 
 #[cfg(test)]

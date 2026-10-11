@@ -128,6 +128,41 @@ impl NestedToolRunner for SessionNested {
     }
 }
 
+#[cfg(test)]
+impl SessionNested {
+    /// This host with `hooks` in place of the session's own, for a test that looks at what a nested
+    /// call is handed. Everything else, the agent included, is the session's.
+    fn through(&self, hooks: Arc<dyn Hooks>) -> Self {
+        Self {
+            agent: Arc::clone(&self.agent),
+            runner: Arc::clone(&self.runner),
+            hooks,
+            dynamic_tools: Arc::clone(&self.dynamic_tools),
+            ext_host: Arc::clone(&self.ext_host),
+            fanout: Arc::clone(&self.fanout),
+            session_cancel: self.session_cancel.clone(),
+        }
+    }
+}
+
+#[cfg(test)]
+impl AgentSession {
+    /// [`Self::execute_nested_tool`] with `hooks` in place of the session's own.
+    pub(crate) async fn execute_nested_tool_through(
+        &self,
+        hooks: Arc<dyn Hooks>,
+        caller_call_id: &ToolCallId,
+        name: &str,
+        args: Value,
+        options: NestedToolCallOptions,
+    ) -> ToolCallOutcome {
+        self.nested
+            .through(hooks)
+            .execute(caller_call_id, name, args, options)
+            .await
+    }
+}
+
 impl AgentSession {
     /// Run a tool call on behalf of the tool call `caller_call_id` — pi `_executeNestedToolCall`
     /// (`agent-session.ts:699-740` @v1.0.1), the session API behind an extension tool's
@@ -210,17 +245,19 @@ impl NestedToolCallHost for SessionNestedHost<'_> {
         cancel: Option<CancelToken>,
         on_update: ToolUpdateSink,
     ) -> ToolCallOutcome {
-        let state = self.nested.agent.snapshot().await;
+        // Shared with every other call made against this transcript (pi hands each nested call the
+        // live array by reference): a script that makes thousands of calls does not copy the
+        // transcript and the system prompt thousands of times.
+        let context = self.nested.agent.nested_context().await;
         // pi `_findLastAssistantMessage()`: the most recent assistant message in the transcript,
         // which the `message_end` barrier has put there before any tool of its calls runs.
-        let Some(assistant) = state.messages.iter().rev().find_map(|m| match m {
+        let Some(assistant) = context.messages.iter().rev().find_map(|m| match &**m {
             AgentMessage::Assistant(a) => Some(Arc::clone(a)),
             _ => None,
         }) else {
             return refusal(call, NO_ASSISTANT_MESSAGE);
         };
         let tools = self.tools();
-        let messages: Vec<Arc<AgentMessage>> = state.messages.into_iter().map(Arc::new).collect();
         let agent_tools = self.nested.agent.tools().await;
         run_tool_call(
             call,
@@ -228,8 +265,8 @@ impl NestedToolCallHost for SessionNestedHost<'_> {
                 tools: &tools,
                 assistant_message: &assistant,
                 context: AgentContextView {
-                    system_prompt: &state.system_prompt,
-                    messages: &messages,
+                    system_prompt: &context.system_prompt,
+                    messages: &context.messages,
                     // `context.tools` is the agent's own set, not the callable one: it is what the
                     // hooks are shown (pi `{ messages, tools: this.agent.state.tools }`).
                     tools: &agent_tools,

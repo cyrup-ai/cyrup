@@ -267,14 +267,257 @@ pub fn resolve_default_launch_model(
     )
 }
 
+/// The default `tracing` filter: `warn` and up, `debug` under `--verbose`. A directory watch whose
+/// path is briefly missing reports a `walkdir error` at `warn` on every poll (`notify`), which is
+/// noise rather than a fault: the owners of those paths already surface the failures that matter,
+/// so the crate is held to `error`. `RUST_LOG`, when set, replaces all of this.
+fn default_trace_filter(verbose: bool) -> &'static str {
+    if verbose {
+        "debug"
+    } else {
+        "warn,notify=error"
+    }
+}
+
+/// Where `tracing` output goes. It starts on stderr, as it always has, and
+/// [`redirect_tracing_to_log`] can move it once the process knows a terminal UI is about to own the
+/// screen.
+enum TraceSink {
+    Stderr,
+    File(std::fs::File),
+    /// The log file could not be opened. Output is dropped: falling back to stderr is the very
+    /// thing the redirect exists to prevent.
+    Discard,
+}
+
+/// The writer `tracing` is given: one shared [`TraceSink`] that can be swapped after the subscriber
+/// is installed (a subscriber cannot be installed twice).
+#[derive(Clone)]
+struct TraceWriter(Arc<std::sync::Mutex<TraceSink>>);
+
+impl TraceWriter {
+    fn new() -> Self {
+        Self(Arc::new(std::sync::Mutex::new(TraceSink::Stderr)))
+    }
+
+    fn set(&self, sink: TraceSink) {
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = sink;
+    }
+
+    /// Append to the log at `path` from now on, creating its directory; if that is not possible,
+    /// drop the output instead.
+    fn redirect_to(&self, path: &std::path::Path) {
+        self.set(match open_trace_log(path) {
+            Ok(file) => TraceSink::File(file),
+            Err(_) => TraceSink::Discard,
+        });
+    }
+}
+
+impl std::io::Write for TraceWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let mut sink = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match &mut *sink {
+            TraceSink::Stderr => std::io::stderr().write(buf),
+            // The subscriber colours every line (it cannot know where the sink will end up), and a
+            // file full of escape sequences is hard to read. `write_all` is given the whole line
+            // in one call, so the sequences are never split across writes.
+            TraceSink::File(file) => file.write_all(&strip_ansi(buf)).map(|()| buf.len()),
+            TraceSink::Discard => Ok(buf.len()),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        let mut sink = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match &mut *sink {
+            TraceSink::Stderr => std::io::stderr().flush(),
+            TraceSink::File(file) => file.flush(),
+            TraceSink::Discard => Ok(()),
+        }
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for TraceWriter {
+    type Writer = TraceWriter;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+/// `bytes` without its ANSI escape sequences (`ESC [ ... <final byte>`), which is all the
+/// subscriber emits: colours and dimming.
+fn strip_ansi(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut at = 0;
+    while let Some(&byte) = bytes.get(at) {
+        if byte == 0x1b && bytes.get(at + 1) == Some(&b'[') {
+            at += 2;
+            while let Some(&next) = bytes.get(at) {
+                at += 1;
+                if (0x40..=0x7e).contains(&next) {
+                    break;
+                }
+            }
+        } else {
+            out.push(byte);
+            at += 1;
+        }
+    }
+    out
+}
+
+/// A log that grows without bound is its own problem: past this size it is started over.
+const TRACE_LOG_RESTART_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Open `path` for appending, readable only by its owner (a trace can carry a path or a command
+/// line), after creating its directory.
+fn open_trace_log(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    if std::fs::metadata(path).is_ok_and(|meta| meta.len() > TRACE_LOG_RESTART_BYTES) {
+        let _ = std::fs::remove_file(path);
+    }
+    options.open(path)
+}
+
+static TRACE_WRITER: std::sync::OnceLock<TraceWriter> = std::sync::OnceLock::new();
+
 /// Initialise `tracing` to **stderr**, honouring `RUST_LOG`. Off by default; `--verbose` raises the
 /// floor to `debug`. Idempotent and never fatal.
 pub fn init_tracing(verbose: bool) {
     use tracing_subscriber::{EnvFilter, fmt};
-    let default = if verbose { "debug" } else { "warn" };
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default));
-    let _ = fmt()
-        .with_env_filter(filter)
-        .with_writer(std::io::stderr)
-        .try_init();
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new(default_trace_filter(verbose)));
+    let writer = TRACE_WRITER.get_or_init(TraceWriter::new).clone();
+    let _ = fmt().with_env_filter(filter).with_writer(writer).try_init();
+}
+
+/// Whether `tracing` must stop writing to stderr: the interactive UI draws on the terminal, and
+/// stderr is the same terminal when it is not redirected, so a warning written to it lands in the
+/// middle of the screen (a `WARN` line every 250 ms, in one measured session, and an `ERROR` for an
+/// MCP server that would not start). A redirected stderr is somewhere the user chose, and the
+/// non-interactive modes keep it as their diagnostics channel.
+pub fn should_redirect_tracing(mode: AppMode, stderr_is_terminal: bool) -> bool {
+    mode == AppMode::Interactive && stderr_is_terminal
+}
+
+/// Where the interactive UI's `tracing` output goes instead of the terminal.
+pub fn trace_log_path(dirs: &ConfigDirs) -> std::path::PathBuf {
+    dirs.agent_dir.join("logs").join("cyrup.log")
+}
+
+/// Send `tracing` output to [`trace_log_path`] from now on. Events from before the call, written
+/// while the process was still starting up, have already gone to stderr.
+pub fn redirect_tracing_to_log(dirs: &ConfigDirs) {
+    if let Some(writer) = TRACE_WRITER.get() {
+        writer.redirect_to(&trace_log_path(dirs));
+    }
+}
+
+#[cfg(test)]
+mod trace_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    use super::*;
+    use std::io::Write as _;
+
+    #[test]
+    fn only_the_interactive_ui_on_a_shared_terminal_loses_stderr() {
+        assert!(should_redirect_tracing(AppMode::Interactive, true));
+        // stderr sent to a file or a pipe is the user's own choice.
+        assert!(!should_redirect_tracing(AppMode::Interactive, false));
+        // The other modes keep stderr as the channel their caller reads.
+        for mode in [AppMode::Print, AppMode::Json, AppMode::Rpc, AppMode::Acp] {
+            assert!(!should_redirect_tracing(mode, true), "{mode:?}");
+        }
+    }
+
+    #[test]
+    fn output_goes_to_the_log_once_redirected_and_the_log_is_private() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("logs").join("cyrup.log");
+        let writer = TraceWriter::new();
+        writer.redirect_to(&log);
+        let mut sink = writer.clone();
+        sink.write_all(b"WARN something\n").unwrap();
+        sink.flush().unwrap();
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), "WARN something\n");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&log).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+    }
+
+    /// A log that cannot be opened must not send the output back to the terminal.
+    /// The subscriber colours every line; the log must not carry the escape sequences.
+    #[test]
+    fn the_log_carries_no_colour_escapes() {
+        assert_eq!(
+            strip_ansi(b"\x1b[2m2026-10-10T03:41:24Z\x1b[0m \x1b[31m ERROR\x1b[0m cyrup_mcp: x\n"),
+            b"2026-10-10T03:41:24Z  ERROR cyrup_mcp: x\n"
+        );
+        // Not a sequence: a lone ESC at the end, and text without any.
+        assert_eq!(strip_ansi(b"plain \xc3\xa9"), b"plain \xc3\xa9");
+        assert_eq!(strip_ansi(b"cut\x1b"), b"cut\x1b");
+
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("cyrup.log");
+        let writer = TraceWriter::new();
+        writer.redirect_to(&log);
+        let mut sink = writer.clone();
+        sink.write_all(b"\x1b[33m WARN\x1b[0m something\n").unwrap();
+        sink.flush().unwrap();
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), " WARN something\n");
+    }
+
+    #[test]
+    fn an_unwritable_log_drops_the_output_instead_of_falling_back_to_stderr() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocker = dir.path().join("not-a-directory");
+        std::fs::write(&blocker, "x").unwrap();
+        let writer = TraceWriter::new();
+        writer.redirect_to(&blocker.join("logs").join("cyrup.log"));
+        assert!(matches!(*writer.0.lock().unwrap(), TraceSink::Discard));
+    }
+
+    #[test]
+    fn a_log_past_the_size_limit_is_started_over() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("cyrup.log");
+        let file = std::fs::File::create(&log).unwrap();
+        file.set_len(TRACE_LOG_RESTART_BYTES + 1).unwrap();
+        drop(file);
+        let writer = TraceWriter::new();
+        writer.redirect_to(&log);
+        let mut sink = writer.clone();
+        sink.write_all(b"fresh\n").unwrap();
+        sink.flush().unwrap();
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), "fresh\n");
+    }
+
+    #[test]
+    fn the_notify_crate_is_held_to_error_unless_verbose() {
+        assert_eq!(default_trace_filter(false), "warn,notify=error");
+        assert_eq!(default_trace_filter(true), "debug");
+        assert!(tracing_subscriber::EnvFilter::try_new(default_trace_filter(false)).is_ok());
+    }
 }

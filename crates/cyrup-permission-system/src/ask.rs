@@ -18,11 +18,11 @@
 //!   [`crate::forwarding`]; this channel is the thin `AskChannel` adapter the gate installs on a child.
 
 use std::path::PathBuf;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use cyrup_ext::{DialogOptions, HostServices};
+use cyrup_ext::{DialogOptions, HostServices, HostServicesSlot};
 
 /// pi `permission-dialog.ts:1` — SIX decision states. The dialog emits `Once`/`Always`/`Reject`;
 /// other paths (yolo auto-approve, forwarding) emit the rest. The `serde` `snake_case` rename
@@ -47,12 +47,19 @@ pub struct PermissionPromptDecision {
     pub approved: bool,
     pub state: PermissionDecisionState,
     pub denial_reason: Option<String>,
+    /// [CYRUP-DELTA] The human also refused every call the same script has still to make
+    /// ([`REJECT_SCRIPT_OPTION`]). pi has no nested calls, so no such answer.
+    pub reject_script: bool,
 }
 
 /// Options for a prompt (pi `requestPermissionDecisionFromUi` opts): an optional timeout after which
 /// the dialog auto-rejects. Phase 0 carries it for shape parity; `NoOpAskChannel` ignores it.
 #[derive(Debug, Clone, Default)]
 pub struct PromptOpts {
+    /// [CYRUP-DELTA] Offer [`REJECT_SCRIPT_OPTION`] after the four of pi's dialog. Set for a call
+    /// another tool made (a `codemode` script's `tools.bash(...)`), which can be one of hundreds the
+    /// script makes: without it the only way out of a script that asks for each is to answer each.
+    pub offer_script_reject: bool,
     pub timeout: Option<std::time::Duration>,
     /// pi `PermissionDecisionRequestOptions.timeoutDenialReason` (`permission-dialog.ts:19`): the
     /// denial reason attached to the decision when the dialog resolves via the fallback branch —
@@ -111,6 +118,25 @@ pub const PERMISSION_DIALOG_OPTIONS: [&str; 4] = [
     REJECT_WITH_REASON_OPTION,
 ];
 
+/// [CYRUP-DELTA] The fifth option of the dialog for a call another tool made: refuse this call and
+/// every call the same script has still to make, without a dialog for each. The script's calls
+/// reject at once with the user's refusal; the script itself is not aborted, so it can handle
+/// them as it handles any other failed call.
+pub const REJECT_SCRIPT_OPTION: &str = "Reject All From This Script";
+
+/// [`PERMISSION_DIALOG_OPTIONS`] with [`REJECT_SCRIPT_OPTION`] after them: the dialog of a call another
+/// tool made. `pub` for the reason [`PERMISSION_DIALOG_OPTIONS`] is.
+pub const PERMISSION_DIALOG_SCRIPT_OPTIONS: [&str; 5] = [
+    APPROVE_ONCE_OPTION,
+    APPROVE_ALWAYS_OPTION,
+    REJECT_OPTION,
+    REJECT_WITH_REASON_OPTION,
+    REJECT_SCRIPT_OPTION,
+];
+
+/// What the script is told by a call that was refused because the user refused its script.
+pub(crate) const SCRIPT_REJECTED_REASON: &str = "the user rejected this script's tool calls";
+
 const APPROVE_ONCE_OPTION: &str = "Allow Once";
 const APPROVE_ALWAYS_OPTION: &str = "Allow Always";
 const REJECT_OPTION: &str = "Reject";
@@ -124,10 +150,11 @@ const PERMISSION_DIALOG_MAX_VISIBLE_CHARACTERS: usize = 2_200;
 /// then on "Reject with Reason" a second `input(...)`. Maps to `HostServices::select` +
 /// `HostServices::input` (NOT `confirm` — port doc §7.3). `HostServices::{select,input}` are the SYNC
 /// blocking bridges (`cyrup-session-svc::LiveHostServices::ui_roundtrip` → `block_in_place`); they run
-/// on the dispatch worker thread while the caller (the permission gate) holds a P-3
-/// [`cyrup_ext::HumanWaitGuard`] so the dispatcher's invocation budget is suspended for the human
-/// latency instead of failing OPEN. `REJECT_OPTION`, ESC/`None`, and a timeout all resolve to `reject`
-/// (`permission-dialog.ts:155-158`), so the gate always fail-CLOSES on anything but an explicit allow.
+/// on the blocking pool (see [`LocalAskChannel::confirm`]) while the caller (the permission gate)
+/// holds a P-3 [`cyrup_ext::HumanWaitGuard`] so the dispatcher's invocation budget is suspended for the
+/// human latency instead of failing OPEN. `REJECT_OPTION`, ESC/`None`, and a timeout all resolve to
+/// `reject` (`permission-dialog.ts:155-158`), so the gate always fail-CLOSES on anything but an
+/// explicit allow.
 pub struct LocalAskChannel {
     services: Arc<dyn HostServices>,
 }
@@ -137,39 +164,46 @@ impl LocalAskChannel {
     pub fn new(services: Arc<dyn HostServices>) -> Self {
         Self { services }
     }
-}
 
-#[async_trait]
-impl AskChannel for LocalAskChannel {
-    async fn confirm(&self, title: &str, message: &str, opts: PromptOpts) -> AskOutcome {
-        let prompt = compact_permission_prompt_for_select(&format!("{title}\n{message}"));
-        let options = serde_json::json!(PERMISSION_DIALOG_OPTIONS);
-        // pi passes `{timeout}` only when a positive, finite timeout is set (`permission-dialog.ts:122`);
-        // otherwise the select blocks until the human answers.
-        let dialog_opts = DialogOptions {
-            timeout_ms: opts
-                .timeout
-                .and_then(|d| u64::try_from(d.as_millis()).ok())
-                .filter(|ms| *ms > 0),
-            signal_id: None,
+    /// The dialog itself, synchronous end to end: `select`, and for "Reject with Reason" the
+    /// follow-up `input`. Runs on the blocking pool; see [`AskChannel::confirm`] below.
+    fn ask_blocking(
+        services: &dyn HostServices,
+        title: &str,
+        prompt: &str,
+        dialog_opts: &DialogOptions,
+        timeout_denial_reason: Option<String>,
+        offer_script_reject: bool,
+    ) -> PermissionPromptDecision {
+        let options = if offer_script_reject {
+            serde_json::json!(PERMISSION_DIALOG_SCRIPT_OPTIONS)
+        } else {
+            serde_json::json!(PERMISSION_DIALOG_OPTIONS)
         };
-        let selected = self.services.select(&prompt, &options, &dialog_opts);
+        let selected = services.select(prompt, &options, dialog_opts);
 
-        let decision = match selected.as_deref() {
+        match selected.as_deref() {
+            Some(REJECT_SCRIPT_OPTION) if offer_script_reject => PermissionPromptDecision {
+                approved: false,
+                state: PermissionDecisionState::Reject,
+                denial_reason: Some(SCRIPT_REJECTED_REASON.to_string()),
+                reject_script: true,
+            },
             Some(APPROVE_ONCE_OPTION) => PermissionPromptDecision {
                 approved: true,
                 state: PermissionDecisionState::Once,
                 denial_reason: None,
+                reject_script: false,
             },
             Some(APPROVE_ALWAYS_OPTION) => PermissionPromptDecision {
                 approved: true,
                 state: PermissionDecisionState::Always,
                 denial_reason: None,
+                reject_script: false,
             },
             Some(REJECT_WITH_REASON_OPTION) => {
                 // pi `permission-dialog.ts:141-153`: a second `input` for the (optional) reason.
-                let reason = self
-                    .services
+                let reason = services
                     .input(
                         &format!("{title}\nShare why this request was denied (optional)."),
                         Some("Reason shown back to the agent"),
@@ -181,6 +215,7 @@ impl AskChannel for LocalAskChannel {
                     approved: false,
                     state: PermissionDecisionState::Reject,
                     denial_reason: reason,
+                    reject_script: false,
                 }
             }
             // Plain "Reject", ESC/`None`, or a timeout → reject (pi `permission-dialog.ts:155-158`),
@@ -189,9 +224,63 @@ impl AskChannel for LocalAskChannel {
             _ => PermissionPromptDecision {
                 approved: false,
                 state: PermissionDecisionState::Reject,
-                denial_reason: opts.timeout_denial_reason.clone(),
+                denial_reason: timeout_denial_reason,
+                reject_script: false,
             },
+        }
+    }
+}
+
+#[async_trait]
+impl AskChannel for LocalAskChannel {
+    /// [CYRUP-DELTA] The dialog runs on the blocking pool; pi awaits a promise.
+    ///
+    /// `LiveHostServices::ui_roundtrip` is `block_in_place` + `block_on`, which hands the worker's
+    /// OTHER tasks to another thread but keeps THIS task blocked. Called inline, this future never
+    /// returned `Pending` while the dialog was open, so nothing that polls it could get a word in: not
+    /// `NativeHandle::invoke_in`'s race against the call's cancel token, and not the supervisor of a
+    /// `codemode` script, which polls a nested call's future once itself
+    /// (`sandbox/execution.rs`'s `start_call`) and so sat inside the dialog with its `timeout_ms`
+    /// deadline, its abort and its session close all unserved until a human answered. Awaiting a
+    /// blocking-pool task parks the future at the dialog instead, as pi's awaited `ui.select` does
+    /// and as `ask_user_question` does. A cancelled call then drops the handler (`invoke_in`),
+    /// which drops this future, and the agent reports "Operation aborted"; the answer, when it
+    /// comes, is discarded. The dialog itself stays on the client until it is answered, because
+    /// `HostServices::select` takes no cancellation of its own.
+    async fn confirm(&self, title: &str, message: &str, opts: PromptOpts) -> AskOutcome {
+        let prompt = compact_permission_prompt_for_select(&format!("{title}\n{message}"));
+        // pi passes `{timeout}` only when a positive, finite timeout is set (`permission-dialog.ts:122`);
+        // otherwise the select blocks until the human answers.
+        let dialog_opts = DialogOptions {
+            timeout_ms: opts
+                .timeout
+                .and_then(|d| u64::try_from(d.as_millis()).ok())
+                .filter(|ms| *ms > 0),
+            signal_id: None,
         };
+        let services = Arc::clone(&self.services);
+        let title_owned = title.to_string();
+        let timeout_denial_reason = opts.timeout_denial_reason.clone();
+        let offer_script_reject = opts.offer_script_reject;
+        let asked = tokio::task::spawn_blocking(move || {
+            Self::ask_blocking(
+                services.as_ref(),
+                &title_owned,
+                &prompt,
+                &dialog_opts,
+                timeout_denial_reason,
+                offer_script_reject,
+            )
+        })
+        .await;
+        // A dialog that panicked or whose runtime went away is no answer: fail CLOSED, with the
+        // caller's configured reason as every other non-allow outcome carries.
+        let decision = asked.unwrap_or(PermissionPromptDecision {
+            approved: false,
+            state: PermissionDecisionState::Reject,
+            denial_reason: opts.timeout_denial_reason,
+            reject_script: false,
+        });
         AskOutcome::Decided(decision)
     }
 }
@@ -342,12 +431,12 @@ pub struct ForwardingAskChannel {
     agent_dir: PathBuf,
     /// The child's blocking-wait bound (pi `PERMISSION_FORWARDING_TIMEOUT_MS`, `index.ts:1314`).
     timeout: Duration,
-    /// The SHARED late-bound capability slot (the SAME `OnceLock` the owning extension's
+    /// The SHARED late-bound capability slot (the SAME [`HostServicesSlot`] the owning extension's
     /// `set_host_services` fills). Read only for the requester session id metadata
     /// (`ctx.sessionManager.getSessionId()`, pi `index.ts:1259`); the forward never REQUIRES it (a
     /// child with no live backend forwards with a `"unknown"` requester id — binding keys on the
     /// PARENT id + nonce, not the requester).
-    host_services: Arc<OnceLock<Arc<dyn HostServices>>>,
+    host_services: Arc<HostServicesSlot>,
     /// PERM-008 — the SAME shared audit trail the owning extension writes its gate entries into
     /// (pi's module-scope `extensionLogger`/`reportedLoggingWarnings` pair). The child's forwarding
     /// path writes four of upstream's eleven forwarding entries through it.
@@ -359,7 +448,7 @@ impl ForwardingAskChannel {
     pub fn new(
         agent_dir: PathBuf,
         timeout: Duration,
-        host_services: Arc<OnceLock<Arc<dyn HostServices>>>,
+        host_services: Arc<HostServicesSlot>,
         audit: Arc<crate::logging::AuditTrail>,
     ) -> Self {
         Self {
@@ -500,6 +589,80 @@ mod tests {
         }
     }
 
+    /// A person who picks `answer` from whatever the dialog offers, and remembers what it offered.
+    struct PicksHostServices {
+        answer: &'static str,
+        offered: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl HostServices for PicksHostServices {
+        fn select(
+            &self,
+            _title: &str,
+            options: &serde_json::Value,
+            _opts: &DialogOptions,
+        ) -> Option<String> {
+            let mut offered = self.offered.lock().unwrap();
+            *offered = options
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|option| option.as_str().unwrap().to_string())
+                .collect();
+            Some(self.answer.to_string())
+        }
+    }
+
+    async fn pick(
+        answer: &'static str,
+        offer_script_reject: bool,
+    ) -> (Vec<String>, PermissionPromptDecision) {
+        let services = Arc::new(PicksHostServices {
+            answer,
+            offered: std::sync::Mutex::new(Vec::new()),
+        });
+        let channel = LocalAskChannel::new(services.clone());
+        let opts = PromptOpts {
+            offer_script_reject,
+            ..PromptOpts::default()
+        };
+        let AskOutcome::Decided(decision) = channel.confirm("t", "m", opts).await else {
+            panic!("a local dialog always decides");
+        };
+        let offered = services.offered.lock().unwrap().clone();
+        (offered, decision)
+    }
+
+    /// [CYRUP-DELTA] The dialog of a call another tool made adds "Reject All From This Script" to
+    /// pi's four, and choosing it refuses the call and the script; a direct call's dialog is exactly
+    /// pi's four, and a client that answers with the fifth anyway refuses that call only.
+    #[tokio::test]
+    async fn the_fifth_option_rejects_the_script_only_where_it_was_offered() {
+        let (offered, decision) = pick(REJECT_SCRIPT_OPTION, true).await;
+        assert_eq!(offered, PERMISSION_DIALOG_SCRIPT_OPTIONS);
+        assert!(!decision.approved);
+        assert!(decision.reject_script);
+        assert_eq!(decision.state, PermissionDecisionState::Reject);
+        assert_eq!(
+            decision.denial_reason.as_deref(),
+            Some(SCRIPT_REJECTED_REASON)
+        );
+
+        let (offered, decision) = pick(REJECT_OPTION, true).await;
+        assert_eq!(offered, PERMISSION_DIALOG_SCRIPT_OPTIONS);
+        assert!(
+            !decision.approved && !decision.reject_script,
+            "plain Reject refuses one call"
+        );
+
+        let (offered, decision) = pick(REJECT_SCRIPT_OPTION, false).await;
+        assert_eq!(offered, PERMISSION_DIALOG_OPTIONS);
+        assert!(
+            !decision.approved && !decision.reject_script,
+            "the fifth answer to a dialog that did not offer it is a plain refusal"
+        );
+    }
+
     #[tokio::test]
     async fn local_channel_carries_timeout_denial_reason_on_fallback() {
         // pi `requestPermissionDecisionFromUi`'s fallback branch (`permission-dialog.ts:155-158`)
@@ -513,6 +676,7 @@ mod tests {
         let opts = PromptOpts {
             timeout: None,
             timeout_denial_reason: Some(reason.to_string()),
+            ..PromptOpts::default()
         };
         let out = ch
             .confirm(
@@ -553,6 +717,115 @@ mod tests {
         }
     }
 
+    /// A [`HostServices`] whose dialog stays open: `select` blocks its thread until `release` is
+    /// signalled, answering "Allow Once" then. The wait is bounded so that a regression fails the
+    /// assertion instead of hanging the suite.
+    struct OpenDialog {
+        release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+        shown: std::sync::atomic::AtomicBool,
+    }
+
+    impl HostServices for OpenDialog {
+        fn select(
+            &self,
+            _title: &str,
+            _options: &serde_json::Value,
+            _opts: &DialogOptions,
+        ) -> Option<String> {
+            self.shown.store(true, std::sync::atomic::Ordering::SeqCst);
+            let release = self.release.lock().unwrap_or_else(|e| e.into_inner());
+            let _ = release.recv_timeout(Duration::from_secs(3));
+            Some("Allow Once".to_string())
+        }
+    }
+
+    /// The permission prompt parks its caller while the dialog is open. `LiveHostServices` blocks
+    /// the calling TASK for a dialog (`block_in_place` frees only the worker's other tasks), so a
+    /// `confirm` that called it inline never returned `Pending`: nothing polling it could cancel it,
+    /// and a `codemode` script whose nested call was waiting on the dialog ignored its own
+    /// `timeout_ms` and its abort until a human answered. The runtime here is current-thread, where
+    /// the difference is exact: the timer can only fire if `confirm` yields to it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn confirm_yields_to_its_caller_while_the_dialog_is_open() {
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let dialog = Arc::new(OpenDialog {
+            release: std::sync::Mutex::new(release_rx),
+            shown: std::sync::atomic::AtomicBool::new(false),
+        });
+        let ch = LocalAskChannel::new(dialog.clone());
+
+        let raced = tokio::time::timeout(
+            Duration::from_millis(300),
+            ch.confirm(
+                "Permission Required",
+                "run bash 'ls'?",
+                PromptOpts::default(),
+            ),
+        )
+        .await;
+        // Let the dialog's thread go whatever the verdict, so it does not outlive the test.
+        let _ = release_tx.send(());
+
+        assert!(
+            raced.is_err(),
+            "confirm resolved while the dialog was still open: it blocked its caller"
+        );
+        assert!(
+            dialog.shown.load(std::sync::atomic::Ordering::SeqCst),
+            "the dialog was never opened, so the race above proved nothing"
+        );
+    }
+
+    /// The answer still decides, now that it comes back from the blocking pool, and "Reject with
+    /// Reason" still reaches its second dialog for the reason.
+    #[tokio::test]
+    async fn confirm_returns_the_answer_and_the_reason_from_the_dialog() {
+        struct Answers {
+            select: &'static str,
+            reason: &'static str,
+        }
+        impl HostServices for Answers {
+            fn select(
+                &self,
+                _title: &str,
+                _options: &serde_json::Value,
+                _opts: &DialogOptions,
+            ) -> Option<String> {
+                Some(self.select.to_string())
+            }
+            fn input(
+                &self,
+                _title: &str,
+                _placeholder: Option<&str>,
+                _opts: &DialogOptions,
+            ) -> Option<String> {
+                Some(self.reason.to_string())
+            }
+        }
+        let decide = |select, reason| async move {
+            let ch = LocalAskChannel::new(Arc::new(Answers { select, reason }));
+            match ch.confirm("t", "m", PromptOpts::default()).await {
+                AskOutcome::Decided(d) => d,
+                AskOutcome::NoLiveChannel => {
+                    panic!("LocalAskChannel always resolves to a decision")
+                }
+            }
+        };
+
+        let once = decide("Allow Once", "").await;
+        assert!(once.approved);
+        assert_eq!(once.state, PermissionDecisionState::Once);
+
+        let always = decide("Allow Always", "").await;
+        assert!(always.approved);
+        assert_eq!(always.state, PermissionDecisionState::Always);
+
+        let rejected = decide("Reject with Reason", "  too risky  ").await;
+        assert!(!rejected.approved);
+        assert_eq!(rejected.state, PermissionDecisionState::Reject);
+        assert_eq!(rejected.denial_reason.as_deref(), Some("too risky"));
+    }
+
     /// `CYRUP_SUBAGENT_PARENT_SESSION` pinned UNSET ⇒ null target ⇒ fail-closed deny
     /// (pi `index.ts:1000-1005` @v0.8.0), never a hang, never an allow.
     ///
@@ -576,7 +849,7 @@ mod tests {
         let ch = ForwardingAskChannel::new(
             dir.path().to_path_buf(),
             Duration::from_millis(200),
-            Arc::new(OnceLock::new()),
+            Arc::new(HostServicesSlot::new()),
             Arc::new(crate::logging::AuditTrail::detached(
                 dir.path().join("logs"),
             )),

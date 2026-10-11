@@ -99,6 +99,7 @@ mod tests {
             SUBCOMMAND,
             crate::subagent_runner_cmd::SUBCOMMAND,
             crate::mcp_keyring_helper_cmd::SUBCOMMAND,
+            crate::codemode_sandbox_cmd::SUBCOMMAND,
         ] {
             assert!(!help.contains(token), "`{token}` must not appear in --help");
             assert!(
@@ -122,6 +123,11 @@ mod tests {
                 "mcp_keyring_helper_cmd",
                 include_str!("mcp_keyring_helper_cmd.rs"),
                 "mcp-keyring-helper.cjs",
+            ),
+            (
+                "codemode_sandbox_cmd",
+                include_str!("codemode_sandbox_cmd.rs"),
+                "runtime/worker.ts",
             ),
         ] {
             let delta = src

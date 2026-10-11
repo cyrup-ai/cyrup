@@ -17,6 +17,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use cyrup_codemode::identifier::IdentifierTable;
 use cyrup_config::CodemodeMode;
 use cyrup_core::{LoadoutView, ToolExposure, ToolLoadoutChanges};
 
@@ -35,12 +36,18 @@ pub fn prepare_codemode_loadout(
     let is_direct = |name: &str| view.exposure(name) == ToolExposure::Direct;
     let callable = callable_tools(view.callable());
     let callable_names: BTreeSet<&str> = callable.iter().map(|tool| tool.name()).collect();
+    // The identifiers over every callable tool, as the sandbox assigns them for a script
+    // (`execute_codemode`), so the text names the identifier a script has to use.
+    let identifiers = IdentifierTable::assign(callable_names.iter().copied());
 
     let mut descriptions: BTreeMap<String, String> = BTreeMap::new();
     if mode == CodemodeMode::On {
         for tool in view.declared() {
             if callable_names.contains(tool.name()) {
-                descriptions.insert(tool.name().to_owned(), describe_script_call(tool.as_ref()));
+                descriptions.insert(
+                    tool.name().to_owned(),
+                    describe_script_call(tool.as_ref(), &identifiers),
+                );
             }
         }
     }
@@ -83,6 +90,7 @@ pub fn prepare_codemode_loadout(
                 guidelines: &guidelines,
                 inline_budget: Some(options.effective_inline_budget()),
                 docs_path: &options.docs_path,
+                identifiers: &identifiers,
             },
         ),
     );

@@ -610,14 +610,26 @@ impl PolicyHooks {
             }
         }
         // 2. Extension mutating seam (may further block / rewrite the — possibly mutated — args).
-        match parent {
+        let outcome = match parent {
             Some(parent) => {
                 self.inner
                     .before_nested_tool_call(parent, ctx, cancel)
                     .await
             }
             None => self.inner.before_tool_call(ctx, cancel).await,
+        };
+        // 3. A `tool_call` handler may have registered tools while it held the call: the MCP
+        //    extension waits here for a server that is still starting, and the tools it registers
+        //    when it connects are what the `codemode` script or `tool_search` about to run looks
+        //    for. pi registers them into the session at once (`pi.registerTool` → `refreshTools`);
+        //    here they reach the session's registry at a turn boundary, which is after this call.
+        //    A no-op unless something registered (a relaxed atomic load).
+        if !matches!(outcome, BeforeOutcome::Block { .. })
+            && let Some(session) = self.session.get()
+        {
+            session.refresh_extension_tools().await;
         }
+        outcome
     }
 }
 

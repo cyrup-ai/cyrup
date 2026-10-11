@@ -320,6 +320,51 @@ async fn a_registrar_cannot_unregister_another_extensions_provider() {
     assert!(sink.live("llama.cpp").is_none());
 }
 
+/// EXT-090 — the GUEST door applies the same owner rule as the native registrar above: pi's
+/// `unregisterProvider(name)` removes by name for anyone (`model-runtime.ts:944-950` @f1b2e77f5),
+/// cyrup narrows BOTH doors to the id's current owner (a recorded `[CYRUP-DELTA]`).
+#[tokio::test]
+async fn a_guest_cannot_unregister_another_extensions_provider() {
+    use crate::host::live::bindings::cyrup::ext::registration::Host as RegistrationHost;
+    use crate::host::{GuestState, HostState, StoreLimits};
+
+    let registry = Arc::new(ExtensionRegistry::new());
+    let sink = Arc::new(Sink::default());
+    registry.bind_model_registry(sink.clone()).unwrap();
+    let guest_state = |id: &str| {
+        HostState::with_guest(
+            StoreLimits::default(),
+            Arc::new(GuestState::new(ExtensionId::from(id), registry.clone())),
+        )
+    };
+    let mut owner = guest_state("guest-owner");
+    let mut intruder = guest_state("guest-intruder");
+
+    owner
+        .register_provider("acme".into(), json_config().to_string())
+        .await;
+    assert_eq!(registry.provider_ids().unwrap(), vec!["acme".to_string()]);
+
+    intruder.unregister_provider("acme".into()).await;
+    assert_eq!(
+        registry.provider_ids().unwrap(),
+        vec!["acme".to_string()],
+        "a guest may not retract a provider another extension owns"
+    );
+    assert_eq!(
+        sink.events(),
+        vec!["upsert:acme".to_string()],
+        "nothing reached the sink"
+    );
+
+    owner.unregister_provider("acme".into()).await;
+    assert!(
+        registry.provider_ids().unwrap().is_empty(),
+        "its own provider still unregisters"
+    );
+    assert_eq!(sink.events().last().unwrap(), "remove:acme");
+}
+
 // ---------------------------------------------------------------------------
 // failed load / ownership
 // ---------------------------------------------------------------------------

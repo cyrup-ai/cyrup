@@ -11,8 +11,8 @@ use cyrup_core::CancelToken;
 use serde_json::{Value, json};
 
 use super::support::*;
-use crate::sandbox::isolate;
 use crate::sandbox::protocol::{MIN_MEMORY_LIMIT_BYTES, effective_memory_limit};
+use crate::sandbox::{CodemodeSandbox, isolate};
 use crate::types::{
     CallStatus, CodemodeResult, CodemodeToolContext, Deadline, ErrorKind, ExecuteOptions,
     SandboxClosed, SandboxOptions,
@@ -44,6 +44,260 @@ fn hang(
         called.notify_one();
         Box::pin(std::future::pending())
     })
+}
+
+// ------------------------------------------------------------------------------------------------
+// Errors the script never looked at
+// ------------------------------------------------------------------------------------------------
+
+/// A tool that fails with `kaboom`, and one that succeeds.
+fn failing_and_fine() -> Vec<crate::types::CodemodeTool> {
+    vec![
+        sync_tool("boom", |_| Err("kaboom".to_owned())),
+        sync_tool("fine", |_| Ok(Some(json!("fine")))),
+    ]
+}
+
+/// [CYRUP-DELTA] The result of a script that succeeded names the rejections nobody handled: a failed
+/// call the isolate was told of while it ran, and nothing handled; and a call that failed in the host
+/// before the script had returned from the line that made it, which the isolate is never told of.
+#[tokio::test]
+async fn a_failed_call_nobody_handled_is_reported_with_the_result() {
+    let sandbox = sandbox(failing_and_fine());
+
+    let heard = run(
+        &sandbox,
+        "tools.boom({});\nawait tools.fine({});\nreturn 1;",
+    )
+    .await;
+    assert_eq!(value(&heard), Some(json!(1)));
+    let (total, shown) = unobserved(&heard);
+    assert_eq!(total, 1);
+    assert_eq!(shown.len(), 1);
+    assert_eq!(shown[0].0.as_deref(), Some("boom"));
+    assert!(
+        shown[0].1.starts_with("kaboom (codemode.js:1:"),
+        "{shown:?}"
+    );
+
+    // Nothing waits after the call, so the reply is queued for an isolate that has ended.
+    let unheard = run(&sandbox, "tools.boom({}); return 2;").await;
+    assert_eq!(value(&unheard), Some(json!(2)));
+    assert_eq!(
+        unobserved(&unheard),
+        (1, vec![(Some("boom".to_owned()), "kaboom".to_owned())])
+    );
+}
+
+/// The rejections a script handles, however late, are not reported; a call that succeeded and was not
+/// awaited has nothing to report.
+#[tokio::test]
+async fn rejections_the_script_handled_are_not_reported() {
+    let sandbox = sandbox(failing_and_fine());
+    let result = run(
+        &sandbox,
+        r#"
+        await tools.boom({}).catch(() => text("caught"));
+        const [settled] = await Promise.allSettled([tools.boom({})]);
+        const kept = tools.boom({});
+        tools.fine({});
+        await tools.fine({});
+        // The call has failed by now and the script ends in the turn that handles it.
+        try { await kept; } catch (error) { text(error.message); }
+        return settled.status;
+    "#,
+    )
+    .await;
+    assert_eq!(value(&result), Some(json!("rejected")));
+    assert_eq!(output(&result), [text("caught"), text("kaboom")]);
+    assert_eq!(unobserved(&result), (0, Vec::new()));
+}
+
+/// [CYRUP-DELTA] A call that failed after the script had ended and that something was waiting on is
+/// not an error the script lost: it is named apart, as a fact. The script below ends on the first
+/// failure its `Promise.all` hands it, with the other two replies still queued for an isolate that has
+/// ended; `Promise.all` handles them, as it would have had the replies come in time. Naming them as
+/// "never handled" told a script that awaited every call that it had not.
+#[tokio::test]
+async fn calls_a_promise_all_took_in_are_not_unhandled_when_they_fail_after_the_script_ends() {
+    let sandbox = sandbox(failing_and_fine());
+    let result = run(
+        &sandbox,
+        r#"
+        try { await Promise.all([tools.boom({}), tools.boom({}), tools.boom({})]); }
+        catch (error) { text("caught " + error.message); }
+        return 1;
+    "#,
+    )
+    .await;
+    assert_eq!(value(&result), Some(json!(1)));
+    assert_eq!(output(&result), [text("caught kaboom")]);
+    assert_eq!(unobserved(&result), (0, Vec::new()));
+    assert_eq!(
+        late_failures(&result),
+        (
+            2,
+            vec![
+                (Some("boom".to_owned()), "kaboom".to_owned()),
+                (Some("boom".to_owned()), "kaboom".to_owned())
+            ]
+        )
+    );
+}
+
+/// A call with a `.catch()` on it is not an error the script lost whenever it fails, even when its
+/// reply is not read before the script ends; the call beside it that nothing waits on is.
+#[tokio::test]
+async fn a_call_with_a_catch_is_not_unhandled_when_it_fails_after_the_script_ends() {
+    let sandbox = sandbox(failing_and_fine());
+    let kaboom = || (Some("boom".to_owned()), "kaboom".to_owned());
+
+    let caught = run(&sandbox, "tools.boom({}).catch(() => {}); return 2;").await;
+    assert_eq!(value(&caught), Some(json!(2)));
+    assert_eq!(unobserved(&caught), (0, Vec::new()));
+    assert_eq!(late_failures(&caught), (1, vec![kaboom()]));
+
+    let beside = run(
+        &sandbox,
+        "tools.boom({}).catch(() => {});\ntools.boom({});\nreturn 3;",
+    )
+    .await;
+    assert_eq!(value(&beside), Some(json!(3)));
+    assert_eq!(unobserved(&beside), (1, vec![kaboom()]));
+    assert_eq!(late_failures(&beside), (1, vec![kaboom()]));
+}
+
+/// [CYRUP-DELTA] The commonest forgotten `await` is not an error the script handled, though a
+/// reaction is attached to the call it made: an `async` function whose `await` nobody awaited
+/// (`main();`), a `forEach(async ...)` callback, a `.then(f)` with no `.catch()`. The call has a
+/// handler, so it is not "unhandled", and it failed after the script ended, so the script never
+/// heard. The result must still say so, or a `write` that failed reads as a write that happened.
+#[tokio::test]
+async fn a_call_inside_an_unawaited_async_function_is_named_when_it_fails_after_the_script_ends() {
+    let sandbox = sandbox(failing_and_fine());
+    let kaboom = || (Some("boom".to_owned()), "kaboom".to_owned());
+
+    let main = run(
+        &sandbox,
+        "async function main() { await tools.boom({}); }\nmain();\nreturn 1;",
+    )
+    .await;
+    assert_eq!(value(&main), Some(json!(1)));
+    assert_eq!(unobserved(&main), (0, Vec::new()));
+    assert_eq!(late_failures(&main), (1, vec![kaboom()]));
+
+    let for_each = run(
+        &sandbox,
+        "[1, 2].forEach(async () => { await tools.boom({}); });\nreturn 2;",
+    )
+    .await;
+    assert_eq!(value(&for_each), Some(json!(2)));
+    assert_eq!(unobserved(&for_each), (0, Vec::new()));
+    assert_eq!(late_failures(&for_each), (2, vec![kaboom(), kaboom()]));
+
+    let chained = run(&sandbox, "tools.boom({}).then((x) => x);\nreturn 3;").await;
+    assert_eq!(value(&chained), Some(json!(3)));
+    assert_eq!(unobserved(&chained), (0, Vec::new()));
+    assert_eq!(late_failures(&chained), (1, vec![kaboom()]));
+}
+
+/// A call that succeeded names nothing: only failures are late failures.
+#[tokio::test]
+async fn calls_that_did_not_fail_are_not_late_failures() {
+    let sandbox = sandbox(failing_and_fine());
+    let result = run(
+        &sandbox,
+        "async function main() { await tools.fine({}); }\nmain();\nreturn 4;",
+    )
+    .await;
+    assert_eq!(value(&result), Some(json!(4)));
+    assert_eq!(unobserved(&result), (0, Vec::new()));
+    assert_eq!(late_failures(&result), (0, Vec::new()));
+}
+
+/// A rejection that is not a call's, raised on the last line the script runs, is reported: the
+/// engine has not looked at it when the script returns, so the result waits for it.
+#[tokio::test]
+async fn a_rejection_on_the_last_line_is_reported() {
+    let sandbox = sandbox(Vec::new());
+    let result = run(&sandbox, "Promise.reject(new TypeError('late')); return 3;").await;
+    assert_eq!(value(&result), Some(json!(3)));
+    let (total, shown) = unobserved(&result);
+    assert_eq!(total, 1);
+    assert_eq!(shown[0].0, None);
+    assert!(
+        shown[0].1.starts_with("TypeError: late (codemode.js:1:"),
+        "{shown:?}"
+    );
+}
+
+/// `exit()` ends the script on the spot, with no event loop turn after it: the rejections the engine
+/// has not reported yet are taken from it, and the report is made as it stands.
+#[tokio::test]
+async fn a_rejection_before_exit_is_reported() {
+    let sandbox = sandbox(Vec::new());
+    let result = run(
+        &sandbox,
+        "Promise.reject(new RangeError('before exit')); text('bye'); exit();",
+    )
+    .await;
+    assert_eq!(value(&result), None);
+    assert_eq!(output(&result), [text("bye")]);
+    let (total, shown) = unobserved(&result);
+    assert_eq!(total, 1);
+    assert!(
+        shown[0]
+            .1
+            .starts_with("RangeError: before exit (codemode.js:1:"),
+        "{shown:?}"
+    );
+}
+
+/// A script that returned and left a continuation that never stops is reported as it stood at the
+/// return, not held for the continuation: the end of a script waits for the engine to look at what
+/// the script left behind, which takes one turn of the event loop, and that turn never comes while a
+/// microtask loop spins. Before the wait existed the script's result left at the return.
+#[tokio::test]
+async fn a_microtask_loop_left_running_does_not_hold_the_result_of_a_script_that_returned() {
+    let sandbox = sandbox(Vec::new());
+    let started = Instant::now();
+    let result = run(
+        &sandbox,
+        "(async function spin() { while (true) await null; })(); text('before'); return 'returned';",
+    )
+    .await;
+    assert_eq!(value(&result), Some(json!("returned")));
+    assert_eq!(output(&result), [text("before")]);
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "the result waited {:?} for a loop that never ends",
+        started.elapsed()
+    );
+}
+
+/// What a leftover continuation of a script that has returned starts or prints is not run, as it was
+/// not when the host stopped listening at the return.
+#[tokio::test]
+async fn a_continuation_that_outlives_the_return_runs_no_calls_and_prints_nothing() {
+    let calls = Arc::new(Mutex::new(0_usize));
+    let counted = Arc::clone(&calls);
+    let sandbox = sandbox(vec![sync_tool("count", move |_| {
+        *counted.lock().unwrap() += 1;
+        Ok(None)
+    })]);
+    let result = run(
+        &sandbox,
+        r#"
+        (async () => { await null; await null; text("after"); tools.count({}); })();
+        text("before");
+        return 4;
+    "#,
+    )
+    .await;
+    assert_eq!(value(&result), Some(json!(4)));
+    assert_eq!(output(&result), [text("before")]);
+    assert_eq!(call_summary(&result), []);
+    assert_eq!(*calls.lock().unwrap(), 0);
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -327,22 +581,25 @@ async fn hostile_thrown_values_are_still_reported() {
     }
 }
 
+/// `serde_json` stopped a tree at 128 levels, and a returned value used to fail past it; the host
+/// keeps the text now (`ReturnValue`), as upstream's `JSON.parse` has no bound.
 #[tokio::test]
-async fn a_result_nested_deeper_than_the_host_reads_is_a_script_error() {
-    // `serde_json` stops at depth 128; JavaScript's `JSON.parse` does not. Recorded as a
-    // difference in the module documentation.
+async fn a_result_nested_deeper_than_serde_json_reads_is_returned_as_it_is() {
     let sandbox = sandbox(vec![]);
     let result = run(
         &sandbox,
         "let v = 1; for (let i = 0; i < 400; i++) v = [v]; return v;",
     )
     .await;
-    let failure = error(&result);
-    assert_eq!(failure.kind, ErrorKind::Script);
-    assert_eq!(failure.name.as_deref(), Some("RangeError"));
-    assert!(
-        failure.message.contains("could not be read by the host"),
-        "{failure:?}"
+    let CodemodeResult::Completed {
+        value: Some(value), ..
+    } = &result
+    else {
+        panic!("{result:#?}");
+    };
+    assert_eq!(
+        value.as_json(),
+        format!("{}1{}", "[".repeat(400), "]".repeat(400))
     );
 }
 
@@ -487,6 +744,33 @@ async fn dropping_the_execute_future_cancels_the_execution_and_frees_the_thread(
     assert!(handle.await.unwrap_err().is_cancelled());
     wait_until_idle(&sandbox).await;
     assert!(tokens.lock().unwrap()[0].cancel.is_cancelled());
+}
+
+/// An isolate thread stuck in a native built-in never looks at `terminate_execution` and cannot be
+/// killed. `close()` used to wait for it without end, so the `codemode` tool call that closed its
+/// sandbox after the script had settled hung with it, past the script's own timeout.
+#[tokio::test]
+async fn close_gives_up_on_a_thread_that_cannot_be_stopped_and_returns() {
+    let mut sandbox = CodemodeSandbox::new(SandboxOptions::default()).unwrap();
+    sandbox.close_timeout = Duration::from_millis(300);
+    // A thread inside a built-in is a guard that has not dropped.
+    let stuck = sandbox.hub.running.enter();
+    let started = Instant::now();
+    tokio::time::timeout(Duration::from_secs(20), sandbox.close())
+        .await
+        .expect("close() waited for a thread that never ends");
+    assert!(started.elapsed() >= Duration::from_millis(300));
+    assert!(started.elapsed() < Duration::from_secs(10));
+    // Detached, not gone: still counted, and the sandbox refuses new scripts.
+    assert_eq!(sandbox.live(), 1);
+    assert!(
+        sandbox
+            .execute("return 1", ExecuteOptions::default())
+            .await
+            .is_err()
+    );
+    drop(stuck);
+    assert_eq!(sandbox.live(), 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -760,6 +1044,110 @@ async fn a_runaway_array_buffer_allocation_is_bounded_by_the_same_limit_and_is_c
     .await;
     assert_eq!(value(&sticky), Some(json!([true, true])));
     wait_until_idle(&sandbox).await;
+}
+
+/// The measured species bypass: with `constructor` set to `undefined` on one buffer, `slice`,
+/// `map` and `filter` resolved the engine's intrinsic constructor, which the prelude does not
+/// guard, and a loop of `seed.slice()` grew the process to 943 MB under a 256 MiB limit with no
+/// error (3.6 GB when the harness let it run). The methods now report what they return, whatever
+/// constructor made it.
+#[tokio::test]
+async fn a_buffer_whose_constructor_is_gone_cannot_be_copied_past_the_limit() {
+    let sandbox = limited(64 * 1024 * 1024);
+    let has_base64 = value(
+        &run(
+            &sandbox,
+            "return typeof Uint8Array.fromBase64 === 'function'",
+        )
+        .await,
+    ) == Some(json!(true));
+    let mut cases = vec![
+        ("slice", "a.push(seed.slice());"),
+        ("map", "a.push(seed.map((x) => x));"),
+        ("filter", "a.push(seed.filter(() => true));"),
+        ("buffer slice", "a.push(buffer.slice(0));"),
+        ("species replaced by undefined", "a.push(species.slice());"),
+    ];
+    if has_base64 {
+        cases.push(("fromBase64", "a.push(Uint8Array.fromBase64(base64));"));
+    }
+    for (label, body) in cases {
+        let code = format!(
+            r#"
+            const seed = new Uint8Array(1 << 22).fill(3);
+            Object.defineProperty(seed, "constructor", {{ value: undefined }});
+            const buffer = new ArrayBuffer(1 << 22);
+            Object.defineProperty(buffer, "constructor", {{ value: undefined }});
+            const species = new Uint8Array(1 << 22).fill(3);
+            Object.defineProperty(species, "constructor", {{ value: {{ [Symbol.species]: undefined }} }});
+            const base64 = "A".repeat(1 << 22);
+            const a = [];
+            try {{ for (let i = 0; i < 300; i++) {{ {body} }} return ["no error", a.length]; }} catch (error) {{ return [error.name, error.message, error instanceof Error, a.length > 0]; }}
+        "#
+        );
+        let started = Instant::now();
+        let result = run_with(&sandbox, &code, deadline_ms(20_000)).await;
+        assert_eq!(
+            value(&result),
+            Some(json!(["InternalError", "out of memory", true, true])),
+            "{label}: {result:?}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(15), "{label}");
+    }
+    wait_until_idle(&sandbox).await;
+}
+
+/// Once the limit is exceeded every allocation is checked again, however many follow, and the
+/// first one after the buffers are released goes through. The check is a regular op: it collects
+/// garbage inside the call, which a fast call may not do, and it is called enough times here for
+/// the engine to compile the loop and take the fast path if the op had one.
+#[tokio::test]
+async fn an_exceeded_limit_stays_exceeded_for_thousands_of_allocations_until_the_buffers_go() {
+    let sandbox = limited(MIN_MEMORY_LIMIT_BYTES as u64);
+    let result = run_with(
+        &sandbox,
+        r#"
+        // 31 MiB is checked and fine; 1.5 MiB more is under the stride between checks, so it is
+        // let through and the live buffers are over the 32 MiB limit; the next one is refused.
+        let held = [new Uint8Array(31 << 20), new Uint8Array(3 << 19)];
+        try { new Uint8Array(1 << 20); throw new Error("not refused"); }
+        catch (error) { if (error.message !== "out of memory") throw error; }
+        let refused = 0;
+        for (let i = 0; i < 4000; i++) {
+            try { new Uint8Array(8); } catch (error) { if (error.message === "out of memory") refused++; }
+        }
+        const heldAtEnd = held.length;
+        held = null;
+        const after = new Uint8Array(8).length;
+        return { heldAtEnd, refused, after };
+    "#,
+        deadline_ms(60_000),
+    )
+    .await;
+    assert_eq!(
+        value(&result),
+        Some(json!({ "heldAtEnd": 2, "refused": 4000, "after": 8 })),
+        "{result:?}"
+    );
+}
+
+/// The memory check collects garbage inside the call. V8's fast-call contract forbids that, so the
+/// op is declared without a fast path (the sticky-limit test above calls it often enough for the
+/// engine to use one if it had one, and does not notice the difference, which is why this checks
+/// the declaration).
+#[test]
+fn the_memory_check_is_a_regular_op_because_it_collects_garbage() {
+    let ops = isolate::declared_ops();
+    let has_fast_path = |name: &str| {
+        let op = ops.iter().find(|op| op.name == name).unwrap();
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| op.fast_fn())).is_ok()
+    };
+    assert!(
+        !has_fast_path("op_codemode_memory_exceeded"),
+        "op_codemode_memory_exceeded collects garbage and must not be a fast op"
+    );
+    // The probe does see fast paths: the ops that only post a message have one.
+    assert!(has_fast_path("op_codemode_output"));
 }
 
 #[tokio::test]

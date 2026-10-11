@@ -5,7 +5,7 @@
 use crate::error::ExtError;
 use crate::provider::{ModelRegistrySink, ProviderHub, ProviderRegistration};
 use crate::replaceable::{ClaimKind, Judgement, OmittedExtension, Replaceables, judge};
-use cyrup_core::{ExecMode, ExtensionId, Tool};
+use cyrup_core::{ExecMode, ExtensionId, Tool, is_allowed_tool, tool_name_matches};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
@@ -70,6 +70,22 @@ pub struct ToolDescriptor {
     /// `agent-session.ts:3554`) — which is also the serde default.
     #[serde(default = "default_active_true", skip_serializing_if = "is_true")]
     pub default_active: bool,
+    /// pi `ToolDefinition.outputSchema?: TSchema` (`extensions/types.ts:592` @v1.0.4): the JSON
+    /// Schema of the `structuredContent` the tool's successful results carry. A tool that declares
+    /// it should always set `structuredContent`; codemode scripts then receive that instead of the
+    /// text content. `None` = the omitted field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_schema: Option<Value>,
+    /// pi `ToolDefinition.annotations?: ToolAnnotations` (`extensions/types.ts:603` @v1.0.4).
+    /// `None` = the omitted field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub annotations: Option<cyrup_core::ToolAnnotations>,
+    /// pi `ToolDefinition.prepareLoadout` (`extensions/types.ts:617` @v1.0.4). A function cannot
+    /// cross the component boundary, so the descriptor carries the flag and the host calls the
+    /// guest's `prepare-loadout` export when it is set (CODE-015), as it does for
+    /// [`Self::prepare_arguments`].
+    #[serde(default)]
+    pub prepare_loadout: bool,
 }
 
 fn is_direct(exposure: &cyrup_core::ToolExposure) -> bool {
@@ -1094,7 +1110,7 @@ impl ExtensionRegistry {
                     "sourceInfo": tool_source_info(g.tool_owner.get(n)),
                 }));
                 if let Some(row) = out.last_mut() {
-                    insert_exposure_keys(row, t.exposure(), t.namespace());
+                    insert_exposure_keys(row, t.exposure(), t.namespace(), t.annotations());
                 }
             }
         }
@@ -1111,7 +1127,12 @@ impl ExtensionRegistry {
                     "sourceInfo": tool_source_info(Some(owner)),
                 }));
                 if let Some(row) = out.last_mut() {
-                    insert_exposure_keys(row, d.exposure, d.namespace.as_ref());
+                    insert_exposure_keys(
+                        row,
+                        d.exposure,
+                        d.namespace.as_ref(),
+                        d.annotations.as_ref(),
+                    );
                 }
             }
         }
@@ -2131,10 +2152,11 @@ impl ExtensionRegistry {
     ///   `codemode`, `deferred` or `hidden` tool, or a `direct` one registered with
     ///   `defaultActive: false`, stays registered but inactive
     ///   (`_refreshToolRegistry`, `agent-session.ts:3510-3545` @v1.0.1);
-    /// * `allow` is `Some(set)`: it is named by the set and its exposure is declarable — naming a
-    ///   `direct` or `model-only` tool activates it even with `defaultActive: false`
-    ///   (`agent-session.ts:3510-3516` @v1.0.1), while naming a `codemode`, `deferred` or `hidden`
-    ///   tool does not make it a default-active one.
+    /// * `allow` is `Some(set)`: it is named by the set (or matches one of its `*` patterns) and
+    ///   its exposure is declarable — naming a `direct` or `model-only` tool activates it even with
+    ///   `defaultActive: false` (`agent-session.ts:3510-3516` @v1.0.1), while naming a `codemode`,
+    ///   `deferred` or `hidden` tool does not make it a default-active one. An MCP tool the set
+    ///   leaves registered without matching it stays inactive (`is_allowed_tool`).
     ///
     /// Base tools keep the caller's build-time selection; an extension override of a base tool
     /// replaces it by name and stays in the list.
@@ -2153,7 +2175,10 @@ impl ExtensionRegistry {
             let exposure = t.exposure();
             match allow {
                 None => exposure.activated_on_registration(t.default_active()),
-                Some(_) => exposure.declarable(),
+                // Naming or matching a tool activates it; an MCP tool the allowlist only leaves
+                // registered stays inactive (`_refreshToolRegistry`, `agent-session.ts` @v1.0.4:
+                // "MCP tools kept registered without being named stay inactive").
+                Some(allow) => exposure.declarable() && tool_name_matches(allow, t.name()),
             }
         })
     }
@@ -2182,8 +2207,6 @@ impl ExtensionRegistry {
         exclude: &HashSet<String>,
         include: impl Fn(&dyn Tool) -> bool,
     ) -> Result<Vec<Arc<dyn Tool>>, ExtError> {
-        let is_allowed =
-            |name: &str| allow.is_none_or(|a| a.contains(name)) && !exclude.contains(name);
         let g = self.lock_read()?;
         let mut out: Vec<Arc<dyn Tool>> = Vec::new();
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -2198,8 +2221,8 @@ impl ExtensionRegistry {
         }
         for n in &g.tool_order {
             if !seen.contains(n)
-                && is_allowed(n)
                 && let Some(t) = g.tools.get(n)
+                && is_allowed_tool(allow, exclude, n, t.is_mcp_tool())
                 && include(t.as_ref())
             {
                 out.push(t.clone());
@@ -2296,13 +2319,14 @@ pub fn build_builtin_keybindings(
 /// EXT-038: cyrup's registry knows the owning extension id and nothing else — a discovered
 /// extension's on-disk path is held by the loader, not here — so the id fills both `path` and
 /// `source`. That is still strictly more than the field being absent, which is what a guest saw.
-/// Add pi's `ToolInfo.exposure` and `ToolInfo.namespace` to a `tool_info` row
-/// (`core/extensions/types.ts` `ToolInfo` @v1.0.1): `exposure` is always present, spelled as pi
-/// spells it, and `namespace` only when the tool has one.
+/// Add pi's `ToolInfo.exposure`, `ToolInfo.namespace` and `ToolInfo.annotations` to a `tool_info`
+/// row (`core/extensions/types.ts` `ToolInfo` @v1.0.4): `exposure` is always present, spelled as pi
+/// spells it, and `namespace` and `annotations` only when the tool has them.
 fn insert_exposure_keys(
     row: &mut Value,
     exposure: cyrup_core::ToolExposure,
     namespace: Option<&cyrup_core::ToolNamespace>,
+    annotations: Option<&cyrup_core::ToolAnnotations>,
 ) {
     let Some(obj) = row.as_object_mut() else {
         return;
@@ -2312,6 +2336,11 @@ fn insert_exposure_keys(
         && let Ok(v) = serde_json::to_value(ns)
     {
         obj.insert("namespace".to_string(), v);
+    }
+    if let Some(a) = annotations
+        && let Ok(v) = serde_json::to_value(a)
+    {
+        obj.insert("annotations".to_string(), v);
     }
 }
 

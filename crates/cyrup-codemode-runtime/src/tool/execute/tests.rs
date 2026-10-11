@@ -19,16 +19,20 @@ use cyrup_codemode::types::OutputItem;
 use cyrup_core::{CancelToken, Content, Tool, ToolCallId, ToolError, ToolResult, ToolUpdate};
 use serde_json::{Value, json};
 
-use super::{format_call_summary, format_error, preview_args, to_fixed_1, value_text};
+use super::{
+    MAX_CONCURRENT_NESTED_CALLS, format_call_summary, format_error, preview_args, to_fixed_1,
+};
 use crate::testkit::{
     RecordingHost, Script, ScriptEnv, ScriptedSandboxFactory, StubTool, completed, failed,
 };
-use crate::tool::recorder::truncate_text;
+use crate::tool::recorder::{MAX_LIVE_ROWS, truncate_text};
 use crate::tool::{
     CodemodeHostSlot, CodemodeNestedCall, CodemodeNestedCallStatus, CodemodeTool,
     CodemodeToolDetails, CodemodeToolOptions, UnavailableSandboxFactory,
 };
-use crate::types::{CodemodeError, CodemodeResult, CodemodeStoreWrites, Deadline, ErrorKind};
+use crate::types::{
+    CodemodeError, CodemodeResult, CodemodeStoreWrites, Deadline, ErrorKind, UnobservedErrors,
+};
 
 const TINY_PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg==";
 
@@ -410,30 +414,35 @@ fn error_heads_follow_the_failure_kind() {
     };
     let none: &[CodemodeNestedCall] = &[];
     assert_eq!(
-        format_error(&error(ErrorKind::Script, Some("TypeError"), None), none),
+        format_error(
+            &error(ErrorKind::Script, Some("TypeError"), None),
+            none,
+            false
+        ),
         "TypeError: msg\n\nNo tool calls were made."
     );
     assert_eq!(
-        format_error(&error(ErrorKind::Script, None, None), none),
+        format_error(&error(ErrorKind::Script, None, None), none, false),
         "Error: msg\n\nNo tool calls were made."
     );
     assert_eq!(
         format_error(
             &error(ErrorKind::Script, Some("X"), Some("X: msg\n  at a")),
-            none
+            none,
+            false
         ),
         "X: msg\n  at a\n\nNo tool calls were made."
     );
     assert_eq!(
-        format_error(&error(ErrorKind::Timeout, None, None), none),
+        format_error(&error(ErrorKind::Timeout, None, None), none, false),
         "Script timed out: msg\n\nNo tool calls were made."
     );
     assert_eq!(
-        format_error(&error(ErrorKind::Aborted, None, None), none),
+        format_error(&error(ErrorKind::Aborted, None, None), none, false),
         "Script aborted: msg\n\nNo tool calls were made."
     );
     assert_eq!(
-        format_error(&error(ErrorKind::Sandbox, None, None), none),
+        format_error(&error(ErrorKind::Sandbox, None, None), none, false),
         "Script sandbox failed: msg\n\nNo tool calls were made."
     );
 }
@@ -465,7 +474,7 @@ async fn timeouts_aborts_and_sandbox_failures_are_failed_results() {
     for (kind, expected) in [
         (
             ErrorKind::Timeout,
-            "Script error:\nScript timed out: out of time\n\nNo tool calls were made.",
+            "Script error:\nScript timed out: out of time. Default limits: 120 s of the script's own running time and 30 min in all. To allow more, make the first line of the script `// @options: {\"timeout_ms\": 3600000}` (milliseconds); an explicit timeout_ms replaces both limits.\n\nNo tool calls were made.",
         ),
         (
             ErrorKind::Aborted,
@@ -589,10 +598,16 @@ async fn calls_still_running_when_the_script_ends_are_marked_cancelled() {
 async fn a_returned_value_is_appended_like_text() {
     for (value, expected) in [
         (Some(json!("plain")), "plain"),
+        // A string is shown unescaped, not as its JSON.
+        (
+            Some(json!("two\nlines, \"quoted\" \u{e9}")),
+            "two\nlines, \"quoted\" \u{e9}",
+        ),
         (Some(json!({ "a": [1, 2.5, null] })), "{\"a\":[1,2.5,null]}"),
         (Some(json!(null)), "null"),
         (Some(json!(7)), "7"),
-        (None, ""),
+        // [CYRUP-DELTA] Nothing at all says so, instead of a bare `Output:`.
+        (None, "(no output)"),
     ] {
         let rig = rig(Vec::new(), {
             let value = value.clone();
@@ -604,7 +619,6 @@ async fn a_returned_value_is_appended_like_text() {
         let result = rig.run("return value").await.unwrap();
         assert_eq!(result_text(&result), expected, "{value:?}");
     }
-    assert_eq!(value_text(&json!("s")), "s");
 }
 
 /// Upstream `attaches only the images the script passes to image(), in output order, each after its
@@ -718,7 +732,9 @@ async fn truncates_output_to_the_token_budget_and_spills_the_full_text() {
     assert!(body.contains("tokens truncated"));
     assert!(body.contains("row 99\n"));
     assert!(!body.contains("row 50\n"));
-    assert!(body.contains(&format!("[Full output: {path} (read with offset/limit)]")));
+    assert!(body.contains(&format!(
+        "[Full output: {path} (read or tools.read with offset/limit)]"
+    )));
     // Images follow the truncated text, each after the path it was saved to; the spill file is
     // readable only by its owner.
     assert_private_file(std::path::Path::new(&path));
@@ -749,6 +765,67 @@ async fn truncates_output_to_the_token_budget_and_spills_the_full_text() {
 
 // ------------------------------------------------------------------------------------ options --
 
+/// [CYRUP-DELTA] What the model sends is parsed the way the contract says: a fence around the whole
+/// script and blank lines before the options line are tolerated, a late options line is refused,
+/// and the sandbox sees the script as written, line numbers intact.
+#[tokio::test]
+async fn fences_and_blank_lines_around_the_options_line_are_tolerated_and_a_late_one_is_refused() {
+    let rig = rig(
+        Vec::new(),
+        script(|_c, _e| async { completed(Vec::new(), None) }),
+    );
+    rig.run("\n\n// @options: {\"timeout_ms\": 300}\nwhile (true) {}")
+        .await
+        .unwrap();
+    rig.run("```js\n// @options: {\"timeout_ms\": 400}\nwhile (true) {}\n```")
+        .await
+        .unwrap();
+    let runs = rig.factory.runs();
+    assert_eq!(
+        runs[0].deadline,
+        Deadline::After(Duration::from_millis(300))
+    );
+    assert_eq!(runs[0].code, "\n\n\nwhile (true) {}");
+    assert_eq!(
+        runs[1].deadline,
+        Deadline::After(Duration::from_millis(400))
+    );
+    assert_eq!(
+        runs[1].code, "\n\nwhile (true) {}\n",
+        "the fence line and the options line become empty lines, the closing fence goes"
+    );
+
+    let late = rig
+        .run("text(1)\n// @options: {\"timeout_ms\": 5}")
+        .await
+        .unwrap_err();
+    assert!(
+        late.message.contains("must be the first non-blank line")
+            && late.message.contains("line 2"),
+        "{}",
+        late.message
+    );
+    let unclosed = rig.run("```js\ntext(1)").await.unwrap_err();
+    assert!(
+        unclosed.message.contains("never closed"),
+        "{}",
+        unclosed.message
+    );
+    assert_eq!(rig.factory.runs().len(), 2, "no sandbox for either");
+}
+
+/// [CYRUP-DELTA] A script that prints and returns nothing is told so, instead of a bare `Output:`.
+#[tokio::test]
+async fn a_script_without_output_says_so() {
+    let rig = rig(
+        Vec::new(),
+        script(|_c, _e| async { completed(Vec::new(), None) }),
+    );
+    let result = rig.run("const x = 1").await.unwrap();
+    assert_eq!(result_text(&result), "(no output)");
+    assert!(!result.is_error);
+}
+
 /// Upstream `applies the timeout_ms option and rejects invalid options`: the options line sets the
 /// deadline, is replaced by an empty line, and an invalid one is the tool's error text.
 #[tokio::test]
@@ -771,7 +848,21 @@ async fn the_options_line_sets_the_deadline_and_invalid_options_are_the_error_te
         runs[0].code, "\nwhile (true) {}",
         "the options line becomes an empty line"
     );
-    assert_eq!(runs[1].deadline, Deadline::Never, "unset by default");
+    assert_eq!(
+        runs[0].active_limit, None,
+        "an explicit timeout_ms replaces the default running-time limit"
+    );
+    // [CYRUP-DELTA] Upstream runs a script without timeout_ms for ever.
+    assert_eq!(
+        runs[1].deadline,
+        Deadline::After(Duration::from_secs(30 * 60)),
+        "a script without timeout_ms still has a finite deadline"
+    );
+    assert_eq!(
+        runs[1].active_limit,
+        Some(Duration::from_secs(120)),
+        "and a limit on its own running time"
+    );
     assert_eq!(runs[0].memory_limit_bytes, Some(256 * 1024 * 1024));
     assert!(
         runs.iter().all(|run| run.closed),
@@ -939,6 +1030,7 @@ async fn successful_scripts_append_their_store_writes_and_failed_or_silent_ones_
                 output: Vec::new(),
                 calls: Vec::new(),
                 store_writes: writes(json!({ "count": 1 }), &[]),
+                unobserved: UnobservedErrors::default(),
             },
             vec![json!({ "set": { "count": 1 }, "delete": [] })],
         ),
@@ -948,6 +1040,7 @@ async fn successful_scripts_append_their_store_writes_and_failed_or_silent_ones_
                 output: Vec::new(),
                 calls: Vec::new(),
                 store_writes: writes(json!({}), &["count"]),
+                unobserved: UnobservedErrors::default(),
             },
             vec![json!({ "set": {}, "delete": ["count"] })],
         ),
@@ -1019,6 +1112,7 @@ async fn a_failed_store_append_fails_the_call() {
                 output: Vec::new(),
                 calls: Vec::new(),
                 store_writes: writes(json!({ "k": 1 }), &[]),
+                unobserved: UnobservedErrors::default(),
             }
         }),
     );
@@ -1075,6 +1169,194 @@ async fn nested_calls_are_streamed_as_partial_results() {
     assert_eq!(
         updates[1].details.as_ref().unwrap()["calls"][0]["id"],
         "call-1/1"
+    );
+}
+
+/// Waits (bounded) until `condition` holds.
+async fn eventually(condition: impl Fn() -> bool) {
+    let give_up = std::time::Instant::now() + Duration::from_secs(10);
+    while !condition() {
+        assert!(
+            std::time::Instant::now() < give_up,
+            "the condition never held"
+        );
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+}
+
+/// Lets everything that can run, run.
+async fn settle() {
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
+}
+
+// ------------------------------------------------------------------------------ concurrency --
+
+/// A `Promise.all` over many items must not start every call at once: each running call costs
+/// memory, and 3000 parallel reads once held the process at 3.4 GB. The rest queue for a slot.
+#[tokio::test]
+async fn nested_calls_run_at_most_the_cap_at_once_and_the_rest_queue() {
+    let total = MAX_CONCURRENT_NESTED_CALLS * 4;
+    let rig = rig(
+        tools(),
+        script(move |_code, env| async move {
+            let calls = (0..total).map(|i| env.tool("echo", json!({ "i": i })));
+            let results = futures::future::join_all(calls).await;
+            completed(
+                Vec::new(),
+                Some(json!(
+                    results.iter().filter(|result| result.is_ok()).count()
+                )),
+            )
+        }),
+    );
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    *rig.host.gate.lock().unwrap() = Some(Arc::clone(&gate));
+    let running = || rig.host.running.load(std::sync::atomic::Ordering::SeqCst);
+
+    let controller = async {
+        eventually(|| running() >= MAX_CONCURRENT_NESTED_CALLS).await;
+        // The calls that did not get a slot have every chance to start anyway.
+        settle().await;
+        assert_eq!(
+            running(),
+            MAX_CONCURRENT_NESTED_CALLS,
+            "calls past the cap started"
+        );
+        gate.add_permits(total);
+    };
+    let (result, ()) = tokio::join!(rig.run("x"), controller);
+
+    let result = result.unwrap();
+    assert_eq!(result_text(&result), total.to_string(), "{result:?}");
+    assert_eq!(
+        rig.host
+            .peak_running
+            .load(std::sync::atomic::Ordering::SeqCst),
+        MAX_CONCURRENT_NESTED_CALLS
+    );
+    assert_eq!(rig.host.nested.lock().unwrap().len(), total);
+}
+
+/// A call that is still waiting for a slot when the script ends is cancelled; it does not start
+/// once a slot frees up, with nobody left to read its result.
+#[tokio::test]
+async fn queued_nested_calls_are_cancelled_with_the_script() {
+    let total = MAX_CONCURRENT_NESTED_CALLS * 3;
+    let rig = rig(
+        tools(),
+        script(move |_code, env| async move {
+            let calls = (0..total)
+                .map(|i| env.tool_with_cancel("echo", json!({ "i": i }), env.cancel.clone()));
+            let results = futures::future::join_all(calls).await;
+            let refused: Vec<String> = results.into_iter().filter_map(Result::err).collect();
+            completed(Vec::new(), Some(json!(refused)))
+        }),
+    );
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    *rig.host.gate.lock().unwrap() = Some(Arc::clone(&gate));
+    let cancel = CancelToken::new();
+
+    let controller = async {
+        eventually(|| {
+            rig.host.running.load(std::sync::atomic::Ordering::SeqCst)
+                == MAX_CONCURRENT_NESTED_CALLS
+        })
+        .await;
+        cancel.cancel();
+        settle().await;
+        // The calls in the host finish only now.
+        gate.add_permits(total);
+    };
+    let (result, ()) = tokio::join!(rig.run_with("x", cancel.clone()), controller);
+
+    let result = result.unwrap();
+    let refused: Vec<String> = serde_json::from_str(&result_text(&result)).unwrap();
+    assert_eq!(
+        refused.len(),
+        total - MAX_CONCURRENT_NESTED_CALLS,
+        "{refused:?}"
+    );
+    assert!(
+        refused
+            .iter()
+            .all(|message| message == "The tool call was cancelled before it started")
+    );
+    assert_eq!(
+        rig.host.nested.lock().unwrap().len(),
+        MAX_CONCURRENT_NESTED_CALLS,
+        "no queued call reached the host"
+    );
+}
+
+/// Snapshots of the calls are published at most once per interval, however many calls the script
+/// makes, and the last one has every call in its final state.
+#[tokio::test]
+async fn many_nested_calls_publish_few_snapshots_and_the_last_has_every_call() {
+    let calls = 300;
+    let rig = rig(
+        tools(),
+        script(move |_code, env| async move {
+            for i in 0..calls {
+                env.tool("echo", json!({ "i": i })).await.unwrap();
+            }
+            completed(Vec::new(), None)
+        }),
+    );
+    let started = std::time::Instant::now();
+    rig.run("x").await.unwrap();
+    let elapsed = started.elapsed();
+
+    let updates = rig.updates.lock().unwrap();
+    // One per interval that passed, plus the first change and the final one. Publishing every
+    // change would be 600.
+    let allowed = 3 + elapsed.as_millis() / crate::tool::recorder::PUBLISH_INTERVAL.as_millis();
+    assert!(
+        (updates.len() as u128) <= allowed,
+        "{} snapshots in {elapsed:?}",
+        updates.len()
+    );
+    let last: CodemodeToolDetails =
+        serde_json::from_value(updates.last().unwrap().details.clone().unwrap()).unwrap();
+    assert_eq!(last.calls.len(), calls);
+    assert!(
+        last.calls
+            .iter()
+            .all(|call| call.status == CodemodeNestedCallStatus::Ok),
+        "every call's end was reported"
+    );
+}
+
+/// The details of a script with more calls than the live list keeps say how many came before.
+#[tokio::test]
+async fn the_details_of_a_script_with_very_many_calls_summarise_the_oldest() {
+    let calls = MAX_LIVE_ROWS + 100;
+    let rig = rig(
+        tools(),
+        script(move |_code, env| async move {
+            for i in 0..calls {
+                env.tool("echo", json!({ "i": i })).await.unwrap();
+            }
+            completed(Vec::new(), None)
+        }),
+    );
+    let result = rig.run("x").await.unwrap();
+
+    let details = details(&result);
+    assert_eq!(details.calls.len(), MAX_LIVE_ROWS + 1);
+    assert_eq!(details.calls[0].name, "... 100 earlier calls");
+    assert_eq!(details.calls[0].status, CodemodeNestedCallStatus::Ok);
+    assert_eq!(
+        details.calls[MAX_LIVE_ROWS].args,
+        format!("{{\"i\":{}}}", calls - 1),
+        "the latest call is the last row"
+    );
+    assert_eq!(
+        rig.host.nested.lock().unwrap().len(),
+        calls,
+        "every call still ran"
     );
 }
 

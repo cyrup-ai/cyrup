@@ -724,7 +724,7 @@ impl NativeExtension for SubagentsExtension {
                             &roots,
                         )
                         .with_completion_bus(Some(self.executor.completion_bus()))
-                        // SUBA-215 — NO inline-answer ledger here, unlike the `wait` tool. That
+                        // SUBA-222 — NO inline-answer ledger here, unlike the `wait` tool. That
                         // ledger (`ASYNC_NOTIFY_BUG_REPORT` F3.5) records a run as already answered
                         // so the watcher does not inject its value a second time — true for the
                         // tool, whose response is a tool result in the transcript. The drain's

@@ -91,21 +91,23 @@ fn key_spec_aliases_and_case() {
     assert!(KeySpec::parse("cmd+k").is_none());
 }
 
-/// `shift` is compared only when the spec asks, and a printable character arrives already
-/// shift-resolved by the host.
+/// A printable character arrives already shift-resolved by the host, and an uppercase letter is
+/// shift+letter whether or not the shift bit is reported (pi: `data === key.toUpperCase()` under
+/// `MODIFIERS.shift`). EXT-106 made the unshifted spec exact; the full per-class table is
+/// [`key_spec_modifiers_are_exact_for_every_key_class`].
 #[test]
 fn key_spec_shift_handling_for_characters() {
-    // Unshifted spec: case-insensitive on an unshifted keystroke, exact once shift is reported.
+    // Unshifted spec: the lowercase letter only.
     assert!(spec("k").matches(&chr('k')));
-    assert!(spec("k").matches(&chr('K')));
+    assert!(!spec("k").matches(&chr('K')));
     assert!(!spec("k").matches(&with_shift(OverlayKeyCode::Char('K'))));
     // Shifted spec: needs the shift bit or an uppercase character.
     assert!(spec("shift+k").matches(&chr('K')));
     assert!(spec("shift+k").matches(&with_shift(OverlayKeyCode::Char('k'))));
     assert!(!spec("shift+k").matches(&chr('k')));
-    // Non-character keys compare shift only when the spec asks.
+    // Non-character keys compare shift exactly too.
     assert!(spec("up").matches(&press(OverlayKeyCode::Up)));
-    assert!(spec("up").matches(&with_shift(OverlayKeyCode::Up)));
+    assert!(!spec("up").matches(&with_shift(OverlayKeyCode::Up)));
     assert!(spec("shift+up").matches(&with_shift(OverlayKeyCode::Up)));
     assert!(!spec("shift+up").matches(&press(OverlayKeyCode::Up)));
     // Alt must agree exactly.
@@ -114,6 +116,124 @@ fn key_spec_shift_handling_for_characters() {
         alt: true,
         ..chr('b')
     }));
+}
+
+/// EXT-106 — every key class compares modifiers EXACTLY, as pi's `matchesKey` does
+/// (`packages/tui/src/keys.ts` @f1b2e77f5): each named-key arm tests `modifier === 0`,
+/// `MODIFIERS.shift`, `MODIFIERS.alt`, `MODIFIERS.ctrl` or the exact sum, so a bare `up` is not
+/// Shift+Up. The per-key special cases pi has are pinned too: `escape` and `f1`..`f12` match only
+/// with no modifier at all (`if (modifier !== 0) return false`); a raw uppercase letter IS
+/// shift+letter (`if (isLetter && data === key.toUpperCase()) return true`); a produced symbol
+/// consumes the shift that made it (the "logical match" of `matchesKittySequence` /
+/// `matchesPrintableModifyOtherKeys`), so `?` matches whether or not Shift is reported, while
+/// `shift+?` still needs the shift; and a character outside a-z, 0-9 and pi's `SYMBOL_KEYS` never
+/// matches (the fall-through `return false`).
+///
+/// Every row is checked and all mismatches reported together, so a red run names each class.
+#[test]
+fn key_spec_modifiers_are_exact_for_every_key_class() {
+    let shifted = with_shift;
+    let alted = |code| OverlayKey {
+        alt: true,
+        ..press(code)
+    };
+    let ctrled = OverlayKey::ctrl;
+    let up = OverlayKeyCode::Up;
+    let rows: Vec<(&str, OverlayKey, bool)> = vec![
+        // Arrows and the other named keys: shift is part of the identity.
+        ("up", press(up), true),
+        ("up", shifted(up), false),
+        ("shift+up", shifted(up), true),
+        ("shift+up", press(up), false),
+        ("down", shifted(OverlayKeyCode::Down), false),
+        ("left", shifted(OverlayKeyCode::Left), false),
+        ("right", shifted(OverlayKeyCode::Right), false),
+        ("home", shifted(OverlayKeyCode::Home), false),
+        ("end", shifted(OverlayKeyCode::End), false),
+        ("pageUp", shifted(OverlayKeyCode::PageUp), false),
+        ("pageDown", shifted(OverlayKeyCode::PageDown), false),
+        ("insert", shifted(OverlayKeyCode::Insert), false),
+        ("delete", shifted(OverlayKeyCode::Delete), false),
+        ("backspace", shifted(OverlayKeyCode::Backspace), false),
+        ("enter", shifted(OverlayKeyCode::Enter), false),
+        ("shift+enter", shifted(OverlayKeyCode::Enter), true),
+        ("shift+enter", press(OverlayKeyCode::Enter), false),
+        ("space", shifted(OverlayKeyCode::Char(' ')), false),
+        ("shift+space", shifted(OverlayKeyCode::Char(' ')), true),
+        ("ctrl+left", ctrled(OverlayKeyCode::Left), true),
+        (
+            "ctrl+left",
+            OverlayKey {
+                shift: true,
+                ..ctrled(OverlayKeyCode::Left)
+            },
+            false,
+        ),
+        ("alt+up", alted(up), true),
+        // `escape` and the function keys: no modifier, on either side.
+        ("escape", press(OverlayKeyCode::Escape), true),
+        ("escape", shifted(OverlayKeyCode::Escape), false),
+        ("shift+escape", shifted(OverlayKeyCode::Escape), false),
+        ("alt+escape", alted(OverlayKeyCode::Escape), false),
+        ("f5", press(OverlayKeyCode::F(5)), true),
+        ("f5", shifted(OverlayKeyCode::F(5)), false),
+        ("shift+f5", shifted(OverlayKeyCode::F(5)), false),
+        ("ctrl+f5", ctrled(OverlayKeyCode::F(5)), false),
+        // Letters: an uppercase character is shift+letter, reported shift or not.
+        ("k", chr('k'), true),
+        ("k", chr('K'), false),
+        ("k", shifted(OverlayKeyCode::Char('K')), false),
+        ("shift+k", chr('K'), true),
+        ("shift+k", shifted(OverlayKeyCode::Char('k')), true),
+        ("shift+k", chr('k'), false),
+        (
+            "ctrl+k",
+            OverlayKey {
+                shift: true,
+                ..ctrl('k')
+            },
+            false,
+        ),
+        (
+            "ctrl+shift+k",
+            OverlayKey {
+                shift: true,
+                ..ctrl('k')
+            },
+            true,
+        ),
+        // Digits: exact.
+        ("1", chr('1'), true),
+        ("1", shifted(OverlayKeyCode::Char('1')), false),
+        ("shift+1", shifted(OverlayKeyCode::Char('1')), true),
+        // Symbols: the produced symbol consumes its own shift; the shifted spec still needs it.
+        ("?", chr('?'), true),
+        ("?", shifted(OverlayKeyCode::Char('?')), true),
+        ("shift+?", shifted(OverlayKeyCode::Char('?')), true),
+        ("shift+?", chr('?'), false),
+        (
+            "ctrl+-",
+            OverlayKey {
+                shift: true,
+                ..ctrl('-')
+            },
+            true,
+        ),
+        ("alt+?", shifted(OverlayKeyCode::Char('?')), false),
+        // Outside a-z, 0-9 and `SYMBOL_KEYS`: pi's fall-through `return false`.
+        ("\u{e9}", chr('\u{e9}'), false),
+    ];
+    let wrong: Vec<String> = rows
+        .iter()
+        .filter(|(text, key, want)| spec(text).matches(key) != *want)
+        .map(|(text, key, want)| format!("{text:?} vs {key:?}: expected {want}"))
+        .collect();
+    assert!(
+        wrong.is_empty(),
+        "{} rows disagree with pi:\n{}",
+        wrong.len(),
+        wrong.join("\n")
+    );
 }
 
 /// A `BackTab` keystroke is `Tab` + shift (pi: `matchesKey(data, "shift+tab")` is `"\x1b[Z"`).

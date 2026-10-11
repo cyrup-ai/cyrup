@@ -8,7 +8,7 @@ use super::{RunCtx, RunFailure};
 use crate::event::{AgentEvent, AgentMessage};
 use cyrup_core::AssistantMessage;
 use cyrup_provider::timing::ResponseTimer;
-use cyrup_provider::{Context, StreamOptions};
+use cyrup_provider::{StreamOptions, request_context};
 use futures::StreamExt;
 use std::sync::Arc;
 
@@ -133,11 +133,13 @@ impl RunCtx {
             websocket_connect_timeout_ms: self.gen_config.websocket_connect_timeout_ms,
             ..Default::default()
         };
-        let ctx = Context {
-            system_prompt: Some(self.system_prompt.clone()),
-            messages: llm,
-            tools: tool_defs,
-        };
+        // The prompt the transcript replays to is what the model is told. A session builds its
+        // agent with no prompt of its own (`sdk.ts:389`), so `self.system_prompt` is empty and the
+        // transcript's system rows (`sections` diffs, a `before_agent_start` projection) ARE the
+        // prompt; a direct `Agent` user's prompt leads them, as `normalizeContext` folds it. The
+        // adapters read `Context::system_prompt` only, so it is resolved here, once, and the rows
+        // leave the message list so nothing can render them a second time.
+        let ctx = request_context(Some(&self.system_prompt), llm, tool_defs);
 
         // The response's clock (pi `AssistantMessageEventStream`, `utils/event-stream.ts` @v1.1.0),
         // started as the request is made. Whatever stream function answers, the settled message

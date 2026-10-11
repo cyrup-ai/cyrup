@@ -216,6 +216,14 @@ impl TrustStore {
 /// client, so listing it would make any repository carrying one prompt for cyrup trust), and
 /// pi-mcp-adapter's `mcp-adapter.json` (MCP-588; the adapter gates its own project servers on
 /// `ctx.isProjectTrusted()`, `project-server-trust.ts:183-207` @2ccf648, and never feeds this list).
+///
+/// \[CYRUP-DELTA] Also the project's permission policy, `.cyrup/agent/cyrup-permissions.jsonc`, and
+/// its `.cyrup/agent/agents` directory of per-agent `permission:` blocks. Pi's list is what pi's own
+/// loader reads; its permission system is a separate extension that applies the project's policy
+/// whether or not the project is trusted. cyrup's is built in, a policy file changes what a model's
+/// tool calls are allowed to do, and a repository whose only `.cyrup` content is such a file was
+/// "nothing to gate", so it was trusted without a question. Not counted when `cwd` is `home`, where
+/// that path is the user's own global policy.
 pub fn has_trust_requiring_resources(cwd: &Path, home: &Path) -> bool {
     const CYRUP_MARKERS: &[&str] = &[
         "settings.json",
@@ -227,8 +235,12 @@ pub fn has_trust_requiring_resources(cwd: &Path, home: &Path) -> bool {
         "SYSTEM.md",
         "APPEND_SYSTEM.md",
     ];
+    const POLICY_MARKERS: &[&str] = &["agent/cyrup-permissions.jsonc", "agent/agents"];
     let cyrup_dir = cwd.join(".cyrup");
     if CYRUP_MARKERS.iter().any(|m| cyrup_dir.join(m).exists()) {
+        return true;
+    }
+    if cwd != home && POLICY_MARKERS.iter().any(|m| cyrup_dir.join(m).exists()) {
         return true;
     }
     // .agents/skills walk cwd → root, excluding the home directory's own ~/.agents/skills.
@@ -871,6 +883,41 @@ mod tests {
         std::fs::create_dir_all(cwd.join(".cyrup")).unwrap();
         std::fs::write(cwd.join(".cyrup").join("settings.json"), "{}").unwrap();
         assert!(has_trust_requiring_resources(&cwd, &home));
+    }
+
+    /// [CYRUP-DELTA] A project policy is a trust-requiring resource, so a repository that ships
+    /// only one is asked about (interactive) or treated as untrusted (`-p`) instead of being
+    /// trusted as "nothing to gate". The user's own global policy is not a project's.
+    #[test]
+    fn a_project_permission_policy_requires_trust_but_the_global_one_does_not() {
+        let home = tmp();
+        let proj = home.join("proj");
+        for (marker, label) in [
+            ("agent/cyrup-permissions.jsonc", "the policy file"),
+            ("agent/agents", "the per-agent permission directory"),
+        ] {
+            let cwd = proj.join(label.replace(' ', "-"));
+            let path = cwd.join(".cyrup").join(marker);
+            assert!(
+                !has_trust_requiring_resources(&cwd, &home),
+                "{label}: empty"
+            );
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            // A `.cyrup/agent` that holds neither is not a resource to gate.
+            assert!(!has_trust_requiring_resources(&cwd, &home), "{label}: bare");
+            if marker.ends_with("agents") {
+                std::fs::create_dir_all(&path).unwrap();
+            } else {
+                std::fs::write(&path, "{}").unwrap();
+            }
+            assert!(has_trust_requiring_resources(&cwd, &home), "{label}");
+        }
+
+        // In `$HOME` the same path is the user's own global policy, which is theirs to trust.
+        let global = home.join(".cyrup").join("agent");
+        std::fs::create_dir_all(global.join("agents")).unwrap();
+        std::fs::write(global.join("cyrup-permissions.jsonc"), "{}").unwrap();
+        assert!(!has_trust_requiring_resources(&home, &home));
     }
 
     #[test]

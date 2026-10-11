@@ -6,6 +6,7 @@ use super::decoder::RDecoder;
 use crate::api::EventSink;
 use crate::model::Model;
 use crate::stream::StreamEvent;
+use crate::utils::constrained_sampling::CustomToolInput;
 use cyrup_core::{ApiId, SharedStr};
 use serde_json::Value;
 
@@ -78,6 +79,52 @@ pub(super) fn create_slot(
                     // Upstream opens the block WITH `partialJson` set
                     // (`openai-responses-shared.ts:493`), i.e. unfinished.
                     finished: false,
+                    custom: None,
+                },
+                SlotKind::Tool,
+            )
+        }
+        // Pi `createSlot`'s `custom_tool_call` arm (`openai-responses-shared.ts:505-528` @v1.0.4):
+        // a grammar-constrained call. Its arguments are `{ [property]: item.input }`, where the
+        // property is the tool's grammar input property; pi's `"input"` fallback only stashes a
+        // call to a tool the request never declared.
+        "custom_tool_call" => {
+            let call_id = item
+                .get("call_id")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let item_id = item
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let name = item
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let property = dec
+                .grammar_inputs
+                .get(&name)
+                .map_or("input", String::as_str);
+            let custom = CustomToolInput::new(
+                property,
+                item.get("input").and_then(Value::as_str).unwrap_or(""),
+            );
+            let namespace = item
+                .get("namespace")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            (
+                RBlock::Tool {
+                    call_id,
+                    item_id,
+                    name,
+                    partial_json: custom.open_json().as_str().into(),
+                    namespace,
+                    finished: false,
+                    custom: Some(custom),
                 },
                 SlotKind::Tool,
             )

@@ -270,10 +270,11 @@ impl AgentBuilder {
         let (running_tx, running_rx) = watch::channel(false);
         let state = StateInner {
             system_prompt: self.system_prompt,
+            shared_system_prompt: None,
             model: self.model,
             thinking_level: self.thinking_level,
             tools: self.tools,
-            messages: self.messages,
+            messages: self.messages.into(),
             streaming_message: None,
             pending_tool_calls: HashSet::new(),
             error_message: None,

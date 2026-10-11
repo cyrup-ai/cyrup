@@ -164,6 +164,42 @@ pub struct ToolNamespace {
     pub instructions: Option<String>,
 }
 
+/// Hints about what a tool does, with the meaning of MCP tool annotations (pi `ToolAnnotations`,
+/// `core/extensions/types.ts:512-523` @v1.0.4). They come from the tool's author and are not
+/// verified; permission extensions can use them to decide which calls to confirm.
+///
+/// Every hint is optional, and an absent one is not `false`: pi's `ToolInfo` reports only the hints
+/// a tool set (`annotations: { ...definition.annotations }`, `agent-session.ts:1489`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolAnnotations {
+    /// The tool does not modify its environment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_only_hint: Option<bool>,
+    /// The tool may delete or overwrite data, rather than only add to it. Meaningful when not
+    /// read-only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub destructive_hint: Option<bool>,
+    /// Repeating a call with the same arguments has no further effect. Meaningful when not
+    /// read-only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotent_hint: Option<bool>,
+    /// The tool reaches an open world of external entities, such as the web, rather than a closed
+    /// domain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub open_world_hint: Option<bool>,
+}
+
+impl ToolAnnotations {
+    /// Whether no hint is set. Pi reports a tool with no hints as having no `annotations` at all.
+    pub const fn is_empty(&self) -> bool {
+        self.read_only_hint.is_none()
+            && self.destructive_hint.is_none()
+            && self.idempotent_hint.is_none()
+            && self.open_world_hint.is_none()
+    }
+}
+
 /// What a [`Tool::prepare_loadout`] hook may change (pi `ToolLoadoutChanges`, `types.ts:552`
 /// @v1.0.1).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -466,6 +502,9 @@ impl Tool for DescribedTool {
     fn output_schema(&self) -> Option<&serde_json::Value> {
         self.inner.output_schema()
     }
+    fn is_mcp_tool(&self) -> bool {
+        self.inner.is_mcp_tool()
+    }
     fn prompt_snippet(&self) -> Option<&str> {
         self.inner.prompt_snippet()
     }
@@ -483,6 +522,9 @@ impl Tool for DescribedTool {
     }
     fn namespace(&self) -> Option<&ToolNamespace> {
         self.inner.namespace()
+    }
+    fn annotations(&self) -> Option<&ToolAnnotations> {
+        self.inner.annotations()
     }
     fn default_active(&self) -> bool {
         self.inner.default_active()

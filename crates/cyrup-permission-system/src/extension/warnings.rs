@@ -2,9 +2,9 @@
 //! it, so no construction site can silently drop a policy-load warning.
 
 use std::collections::HashSet;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 
-use cyrup_ext::{HostServices, NotifyKind};
+use cyrup_ext::{HostServicesSlot, NotifyKind};
 
 use crate::manager::{ManagerPaths, PermissionManager};
 
@@ -18,18 +18,18 @@ use super::guard;
 /// in production a malformed `cyrup-permissions.jsonc` fell back to `ask`-everything **in total
 /// silence** — indistinguishable from a policy that genuinely says `ask`.
 ///
-/// Holds the SAME late-bound `Arc<OnceLock<Arc<dyn HostServices>>>` the extension does, so a
+/// Holds the SAME late-bound `Arc<HostServicesSlot>` the extension does, so a
 /// manager built during construction (before the host attaches its backend) still delivers once
 /// the backend lands — that late binding is why this is a shared handle and not a captured
 /// `Arc<dyn HostServices>`.
 pub(super) struct WarningSink {
-    host_services: Arc<OnceLock<Arc<dyn HostServices>>>,
+    host_services: Arc<HostServicesSlot>,
     /// pi `shownWarnings` (`index.ts:1573`).
     shown: Mutex<HashSet<String>>,
 }
 
 impl WarningSink {
-    pub(super) fn new(host_services: Arc<OnceLock<Arc<dyn HostServices>>>) -> Self {
+    pub(super) fn new(host_services: Arc<HostServicesSlot>) -> Self {
         Self {
             host_services,
             shown: Mutex::new(HashSet::new()),

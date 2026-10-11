@@ -30,6 +30,19 @@ pub const PERMISSION_SYSTEM_COMMAND: &str = "permission-system";
 /// is exactly the kind of constant a name-level parity diff scores as "present on both sides".
 pub const PERMISSION_REQUEST_EVENT_CHANNEL: &str = "cyrup-permission-system:permission-request";
 
+/// [CYRUP-DELTA] Pages cyrup writes under the agent directory for the model to `read`, relative to
+/// it. The `codemode` tool description sends the model to the first (`cyrup-codemode-runtime`'s
+/// `materialise_codemode_docs`, which writes `<agent dir>/docs/codemode.md` because an installed
+/// binary has no `docs/` next to it). The agent directory is outside the project, so with the
+/// external-directory guard armed the model was told to read a file that the same policy then asked
+/// about, or refused outright (`Hard stop: ... do not retry this path`). pi has no permission
+/// system, so it never had both. A `read` of exactly one of these pages skips that guard
+/// (`PermissionSystemExtension::is_shipped_reference_read`); the `read` tool's own policy still
+/// applies. Keep the entries equal to what the codemode extension writes: the wire test
+/// `the_codemode_docs_the_description_points_at_are_readable_under_an_armed_policy` reads the path
+/// the binary advertises.
+pub(super) const SHIPPED_REFERENCE_PAGES: [&str; 1] = ["docs/codemode.md"];
+
 /// The `error` recorded on a `permission_request.event_emit_failed` entry when no host backend is
 /// attached to emit through. See [`PermissionSystemExtension::emit_permission_request_event`] for
 /// why this stands in for upstream's thrown-exception message.

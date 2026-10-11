@@ -9,9 +9,12 @@ use super::transform::transform_messages;
 use crate::api::compat::{DeferredToolsMode, ResolvedCompat, sanitize_surrogates};
 use crate::context::Context;
 use crate::model::Model;
-use crate::utils::constrained_sampling::ConstrainedSamplingError;
+use crate::utils::constrained_sampling::{
+    ConstrainedSamplingError, get_grammar_tool_input, grammar_tool_input_properties,
+};
 use cyrup_core::{AssistantMessage, Content, Message, SharedStr, ToolCall};
 use serde_json::{Map, Value, json};
+use std::collections::HashMap;
 
 /// Map cyrup [`Message`]s to OpenAI chat messages (Pi `convertMessages`, applying the compat flags).
 pub(crate) fn convert_messages(
@@ -21,6 +24,9 @@ pub(crate) fn convert_messages(
 ) -> Result<Vec<Value>, ConstrainedSamplingError> {
     let transformed = transform_messages(&ctx.messages, model);
     let mut params: Vec<Value> = Vec::new();
+    // Pi's `options.grammarToolInputProperties` (`openai-completions.ts:1360`): which assistant
+    // tool calls replay as `custom` calls carrying their raw text (PROV-101).
+    let grammar_inputs = grammar_tool_input_properties(ctx, compat.supports_openai_grammar_tools)?;
 
     if let Some(system) = &ctx.system_prompt {
         let role = if model.reasoning && compat.supports_developer_role {
@@ -67,7 +73,7 @@ pub(crate) fn convert_messages(
                 params.push(json!({ "role": "user", "content": uc }));
                 last_role = Some("user");
             }
-            Message::Assistant(am) => match build_assistant(am, model, compat) {
+            Message::Assistant(am) => match build_assistant(am, model, compat, &grammar_inputs)? {
                 Some(value) => {
                     params.push(value);
                     last_role = Some("assistant");
@@ -190,8 +196,14 @@ pub(crate) fn convert_messages(
 }
 
 /// Build an assistant chat message (Pi `convertMessages` assistant branch, L913-1013); `None` when
-/// it has neither content nor tool calls.
-fn build_assistant(am: &AssistantMessage, model: &Model, compat: &ResolvedCompat) -> Option<Value> {
+/// it has neither content nor tool calls. A call to a grammar tool (`grammar_inputs`, PROV-101)
+/// replays as a `custom` tool call carrying the raw text (`openai-completions.ts:1360-1371`).
+fn build_assistant(
+    am: &AssistantMessage,
+    model: &Model,
+    compat: &ResolvedCompat,
+    grammar_inputs: &HashMap<String, String>,
+) -> Result<Option<Value>, ConstrainedSamplingError> {
     let mut obj = Map::new();
     obj.insert("role".to_string(), json!("assistant"));
 
@@ -310,6 +322,21 @@ fn build_assistant(am: &AssistantMessage, model: &Model, compat: &ResolvedCompat
     if has_tool_calls {
         let mut tc_values: Vec<Value> = Vec::new();
         for tc in &tool_calls {
+            if let Some(property) = grammar_inputs.get(&tc.name) {
+                tc_values.push(json!({
+                    "id": tc.id.as_str(),
+                    "type": "custom",
+                    "custom": {
+                        "name": tc.name,
+                        "input": sanitize_surrogates(&get_grammar_tool_input(
+                            &tc.name,
+                            &tc.arguments,
+                            property,
+                        )?),
+                    },
+                }));
+                continue;
+            }
             tc_values.push(json!({
                 "id": tc.id.as_str(),
                 "type": "function",
@@ -342,11 +369,11 @@ fn build_assistant(am: &AssistantMessage, model: &Model, compat: &ResolvedCompat
         _ => true,
     };
     if !has_content && !has_tool_calls {
-        return None;
+        return Ok(None);
     }
 
     obj.insert("content".to_string(), content_val);
-    Some(Value::Object(obj))
+    Ok(Some(Value::Object(obj)))
 }
 
 /// User content: a plain string when text-only, else an array of `text`/`image_url` parts.

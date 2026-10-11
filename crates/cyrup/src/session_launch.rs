@@ -43,6 +43,21 @@ use crate::cli::Cli;
 use crate::diagnostics::{self, Diagnostic};
 use crate::timings;
 
+/// Where `codemode` scripts run: a `__codemode-sandbox` process of this executable each
+/// ([`crate::codemode_sandbox_cmd`]).
+#[cfg(not(test))]
+fn codemode_sandbox_factory() -> Arc<dyn cyrup_codemode_runtime::tool::SandboxFactory> {
+    Arc::new(cyrup_codemode_runtime::tool::IsolatedSandboxFactory::current_exe())
+}
+
+/// The unit-test binary is not the `cyrup` binary: re-executed with `__codemode-sandbox` it would
+/// read the argument as a test filter and exit without a word. Its scripts run in-process; the hop
+/// itself is covered by `tests/codemode_sandbox_hop.rs`, which spawns the real binary.
+#[cfg(test)]
+fn codemode_sandbox_factory() -> Arc<dyn cyrup_codemode_runtime::tool::SandboxFactory> {
+    Arc::new(cyrup_codemode_runtime::tool::EngineSandboxFactory)
+}
+
 /// Attach the native built-in extensions to `builder`, in pi's load order.
 ///
 /// This is the ONE copy of a sequence that used to exist verbatim in all three mode arms. The
@@ -154,16 +169,23 @@ fn attach_native_extensions(
         builder = builder.with_native_extension(ext);
     }
     // `codemode` is the next entry of pi's `builtInExtensions` (`extensions/index.ts:9-14`
-    // @v1.0.1), registered inactive and replaceable. Its scripts run in V8 isolates
-    // ([`cyrup_codemode_runtime::tool::EngineSandboxFactory`], ADR-0031).
+    // @v1.0.1), registered inactive and replaceable. Its scripts run in V8 isolates (ADR-0031),
+    // each in a `__codemode-sandbox` process of its own ([`crate::codemode_sandbox_cmd`]): V8 aborts
+    // the whole process on an allocation the heap cannot satisfy, which a script can ask for.
+    //
+    // The script reference the description points at is embedded in the binary and written under
+    // the agent directory, because an installed binary has no `docs/` next to it.
     //
     // `-e builtin:codemode` attaches it but cannot keep it under `--no-extensions`: its ambient
     // tier is fixed in `cyrup-codemode-runtime`, which has no explicit-load constructor.
     if builtins.attaches(cyrup_codemode_runtime::EXTENSION_ID) {
-        builder = builder.with_codemode(cyrup_codemode_runtime::CodemodeExtension::new(
-            cyrup_codemode_runtime::tool::CodemodeHostSlot::new(),
-            Arc::new(cyrup_codemode_runtime::tool::EngineSandboxFactory),
-        ));
+        builder = builder.with_codemode(
+            cyrup_codemode_runtime::CodemodeExtension::new(
+                cyrup_codemode_runtime::tool::CodemodeHostSlot::new(),
+                codemode_sandbox_factory(),
+            )
+            .with_agent_dir(agent_dir),
+        );
     }
     // `tool_search` follows it (`extensions/index.ts:12` @v1.0.1): registered inactive and
     // replaceable, it loads `codemode` and `deferred` tools into the active set on request.
@@ -887,8 +909,25 @@ fn resolve_scoped_models_reporting(
     (scoped, diagnostics)
 }
 
+/// The MCP surface of a launched session: the wait for servers, the result a script receives,
+/// `--tools` patterns, `--no-mcp` and `codemode.mode: only`, over a real stdio server.
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#[path = "session_launch/mcp_tests.rs"]
+mod mcp_tests;
+
+/// A session replacement over the launch wiring: the extensions are rebound to the replacement's
+/// backend, and the tool set the permission policy shapes is the same after it.
+#[cfg(test)]
+#[path = "session_launch/replacement_tests.rs"]
+mod replacement_tests;
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 mod tests {
     use crate::diagnostics::DiagnosticLevel;
 
@@ -1274,8 +1313,9 @@ mod tests {
         })
     }
 
-    /// [`factory_over`] with the per-run [`SessionConfig`] knobs set by `configure`.
-    fn factory_with(
+    /// [`factory_over`] with the per-run [`SessionConfig`] knobs set by `configure` (`--tools`,
+    /// `--exclude-tools`, ...).
+    pub(super) fn factory_with(
         provider: Arc<dyn Provider>,
         agent_dir: &Path,
         cwd: &Path,
@@ -1335,6 +1375,35 @@ mod tests {
         Loaded { loaded, listed }
     }
 
+    /// [`session_through_build_factory`] (no `--no-extensions`) with `extensions` passed as `-e`.
+    async fn session_with_extensions(interactive: bool, extensions: &[String]) -> Loaded {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path().join("project");
+        let agent_dir = tmp.path().join("agent");
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        let (factory, target) = factory_with(
+            Arc::new(FauxProvider::new()),
+            &agent_dir,
+            &cwd,
+            interactive,
+            |config| {
+                config.extra_extension_paths =
+                    extensions.iter().map(std::path::PathBuf::from).collect();
+            },
+        );
+        let session: AgentSession = factory.build(target, None).await.unwrap();
+        let loaded = session
+            .services()
+            .ext_host
+            .loaded_ids()
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        let listed = cyrup_tui::StartupReport::from_session(&session, false).extensions;
+        Loaded { loaded, listed }
+    }
+
     /// The position of `id` in `ids`, failing loudly (with the whole list) when absent.
     fn position(ids: &[String], id: &str) -> usize {
         ids.iter()
@@ -1364,8 +1433,8 @@ mod tests {
 
     /// Hidden at startup, loaded regardless: pi lists `extensions.filter((e) => !e.hidden)`
     /// (`interactive-mode.ts:1778`) and marks every `builtin:` extension hidden
-    /// (`resource-loader.ts:729`). The MCP adapter in the same breath proves the list is not simply
-    /// empty.
+    /// (`resource-loader.ts:741` @f1b2e77f5). `cyrup-flux`, which is no pi built-in, in the same
+    /// breath proves the list is not simply empty.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn llama_is_loaded_but_absent_from_the_startup_extensions_list() {
         let Loaded { loaded, listed } = session_through_build_factory(true, false).await;
@@ -1378,9 +1447,56 @@ mod tests {
             "llama.cpp is hidden from the startup [Extensions] list; got {listed:?}"
         );
         assert!(
-            listed.iter().any(|i| i == MCP_ID),
+            listed.iter().any(|i| i == "cyrup-flux"),
             "a non-hidden native IS listed, so the list is not trivially empty; got {listed:?}"
         );
+    }
+
+    /// EXT-092 — hidden follows the load path, as pi infers it: a native is hidden exactly when it
+    /// was attached as a `builtin:<name>`, by default or by `-e builtin:<name>`.
+    ///
+    /// pi sets `extension.hidden = true` only in the `builtin:<name>` branch of
+    /// `loadExtensionPaths` (`core/resource-loader.ts:741` @f1b2e77f5), which every `builtin:`
+    /// path reaches — settings-resolved and `-e` (`cliEnabledExtensions`) alike, merged into one
+    /// `extensionPaths` before `loadFinalExtensionSet` — and its `builtin: true` entries are
+    /// `llama.cpp`, `codemode`, `tool-search` and `mcp` (`extensions/index.ts`). Everything else
+    /// reaches pi as a file or package path and is listed. cyrup's `builtin:<name>` path is
+    /// [`super::BuiltinSelection`] (EXT-094), the only way those four natives are attached, so the
+    /// expected state of every loaded native is derived from [`BUILTIN_EXTENSIONS`] — no per-native
+    /// table — and the host's answer (`NativeExtension::is_hidden`, read through the startup
+    /// `[Extensions]` list) must agree with it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn every_attached_native_is_hidden_exactly_when_pi_loads_its_counterpart_as_a_builtin() {
+        assert_eq!(
+            BUILTIN_EXTENSIONS,
+            ["llama.cpp", "codemode", "tool-search", "mcp"],
+            "cyrup's builtin: names are pi's `builtInExtensions` (extensions/index.ts @f1b2e77f5)"
+        );
+        let explicit: Vec<String> = BUILTIN_EXTENSIONS
+            .iter()
+            .map(|id| format!("builtin:{id}"))
+            .collect();
+        for (form, Loaded { loaded, listed }) in [
+            ("default", session_through_build_factory(true, false).await),
+            (
+                "-e builtin:<name>",
+                session_with_extensions(true, &explicit).await,
+            ),
+        ] {
+            for id in BUILTIN_EXTENSIONS {
+                position(&loaded, id);
+            }
+            for id in &loaded {
+                let builtin = BUILTIN_EXTENSIONS.contains(&id.as_str());
+                assert_eq!(
+                    !listed.contains(id),
+                    builtin,
+                    "{form}: {id} {} a builtin:<name> load, so pi {} it; listed {listed:?}",
+                    if builtin { "is" } else { "is not" },
+                    if builtin { "hides" } else { "lists" }
+                );
+            }
+        }
     }
 
     /// `--no-extensions` drops it: pi's `builtin:llama.cpp` is a path in the tier the flag collapses
@@ -1663,7 +1779,7 @@ mod tests {
         let session = runtime.session().await;
 
         // The MCP runtime builds in the background after `session_start`; a call that lands first
-        // answers `not_initialized`. Ask for the gateway's status until it is up.
+        // waits for the build. Ask for the gateway's status until it answers as a mode.
         let mut ready = false;
         for _ in 0..200 {
             provider.set_response_steps(scripted_steps(
@@ -1736,7 +1852,7 @@ mod tests {
     }
 
     /// The newest `tool_name` tool result of `session`: its content and details.
-    async fn last_tool_result(
+    pub(super) async fn last_tool_result(
         session: &AgentSession,
         tool_name: &str,
     ) -> (Vec<cyrup_core::Content>, Option<serde_json::Value>) {
@@ -2555,5 +2671,404 @@ mod tests {
                 "-ne={no_extensions}"
             );
         }
+    }
+
+    // ============================================================================================
+    // `--tools` / `--exclude-tools` — the allowlist bounds the REGISTRY, not only the initial
+    // selection (pi `_isAllowedTool`, `agent-session.ts` `_refreshToolRegistry` @v1.0.4 drops a
+    // disallowed built-in before the registry is built, so `setActiveToolsByName` and a codemode
+    // script's `tools.*` can only ever reach what the flags allow).
+    //
+    // Driven over the real launch wiring: `build_factory` attaches the permission system (policy file
+    // present, so it installs), `codemode` and `tool_search`; the permission extension's
+    // `before_agent_start` runs on every turn and names every registry tool it exposes.
+    // ============================================================================================
+
+    /// A hermetic world whose `cyrup-permissions.jsonc` makes the permission system install.
+    fn permission_world() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+        permission_world_with(
+            r#"{ "defaultPolicy": { "tools": "allow", "bash": "allow", "mcp": "allow", "skills": "allow" } }"#,
+        )
+    }
+
+    /// [`permission_world`] over the given policy file.
+    fn permission_world_with(
+        policy: &str,
+    ) -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path().join("project");
+        let agent_dir = tmp.path().join("agent");
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        // Everything allowed: the permission system exposes every registry tool it is asked about,
+        // which is the case that matters here (a policy that denied `bash` would hide the defect).
+        std::fs::write(agent_dir.join("cyrup-permissions.jsonc"), policy).unwrap();
+        (tmp, agent_dir, cwd)
+    }
+
+    /// The built-in tool names a session may not expose when the flags allow only `read`, `grep` and
+    /// `codemode`.
+    const NARROWED_OUT: [&str; 5] = ["bash", "edit", "write", "find", "ls"];
+
+    /// The script every allowlist test runs: which built-ins `tools` offers, and what calling
+    /// `tools.bash` does.
+    const PROBE_SCRIPT: &str = r#"
+        const offered = {};
+        for (const name of ["read", "bash", "edit", "write", "grep", "find", "ls"]) {
+            offered[name] = name in tools;
+        }
+        let bash = "not attempted";
+        if (offered.bash) {
+            try { bash = JSON.stringify(await tools.bash({ command: "echo reached-bash" })); }
+            catch (e) { bash = "threw: " + String(e); }
+        }
+        return JSON.stringify({ offered, bash });
+    "#;
+
+    /// Run [`PROBE_SCRIPT`] through the `codemode` tool of a session launched with `configure`,
+    /// after the permission system's `before_agent_start` has run on the turn that calls it.
+    /// Returns the session, the tool names every request declared, and the script's answer.
+    async fn probe_allowlist(
+        configure: impl FnOnce(&mut SessionConfig),
+    ) -> (
+        Arc<AgentSessionRuntime>,
+        Vec<Vec<String>>,
+        serde_json::Value,
+        tempfile::TempDir,
+    ) {
+        let world = permission_world();
+        probe_script(world, PROBE_SCRIPT, configure).await
+    }
+
+    /// [`probe_allowlist`] over any world and any script that returns `JSON.stringify(answer)`.
+    async fn probe_script(
+        world: (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf),
+        script: &str,
+        configure: impl FnOnce(&mut SessionConfig),
+    ) -> (
+        Arc<AgentSessionRuntime>,
+        Vec<Vec<String>>,
+        serde_json::Value,
+        tempfile::TempDir,
+    ) {
+        let (tmp, agent_dir, cwd) = world;
+        let declared: Declared = Arc::default();
+        let provider = scripted(
+            &declared,
+            vec![
+                Some(("codemode", serde_json::json!({ "code": script }))),
+                None,
+            ],
+        );
+        let (factory, target) = factory_with(provider, &agent_dir, &cwd, false, configure);
+        let runtime = AgentSessionRuntime::create(factory, target).await.unwrap();
+        let session = runtime.session().await;
+        let _ = session.prompt("probe").await.unwrap();
+        session.wait_for_idle().await;
+        let (content, _details) = last_tool_result(&session, "codemode").await;
+        let text = content
+            .iter()
+            .filter_map(|c| match c {
+                cyrup_core::Content::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let start = text
+            .find('{')
+            .unwrap_or_else(|| panic!("no JSON answer in {text:?}"));
+        let end = text
+            .rfind('}')
+            .unwrap_or_else(|| panic!("no JSON answer in {text:?}"));
+        let answer: serde_json::Value = serde_json::from_str(&text[start..=end])
+            .unwrap_or_else(|e| panic!("script answer is not JSON ({e}): {text:?}"));
+        let requests = declared.lock().unwrap().clone();
+        (runtime, requests, answer, tmp)
+    }
+
+    /// `--tools read,grep,codemode`: a disallowed built-in is not in the registry, so neither the
+    /// permission extension's per-turn `set_active_tools` nor a codemode script can reach it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tools_allowlist_bounds_the_registry_the_permission_gate_and_codemode_reach() {
+        let (runtime, requests, answer, _tmp) = probe_allowlist(|cfg| {
+            cfg.tools = Some(vec!["read".into(), "grep".into(), "codemode".into()]);
+        })
+        .await;
+        let session = runtime.session().await;
+
+        for request in &requests {
+            for name in NARROWED_OUT {
+                assert!(
+                    !request.iter().any(|declared| declared == name),
+                    "`{name}` was declared to the model under --tools read,grep,codemode: {request:?}"
+                );
+            }
+        }
+        let registered: Vec<String> = session
+            .all_tools()
+            .into_iter()
+            .map(|row| row.name)
+            .collect();
+        let active = session.active_tool_names();
+        for name in NARROWED_OUT {
+            assert!(
+                !registered.iter().any(|n| n == name),
+                "`{name}` is in the registry: {registered:?}"
+            );
+            assert!(
+                !active.iter().any(|n| n == name),
+                "`{name}` is active: {active:?}"
+            );
+            assert_eq!(
+                answer["offered"][name],
+                serde_json::json!(false),
+                "`tools.{name}` is callable from a codemode script: {answer}"
+            );
+        }
+        assert_eq!(
+            answer["offered"]["read"],
+            serde_json::json!(true),
+            "{answer}"
+        );
+        assert_eq!(
+            answer["offered"]["grep"],
+            serde_json::json!(true),
+            "{answer}"
+        );
+    }
+
+    /// The script the permission tests run: call `tools.bash` and report what happened.
+    const BASH_PROBE: &str = r#"
+        const offered = "bash" in tools;
+        let outcome = "not attempted";
+        if (offered) {
+            try { outcome = "ran: " + JSON.stringify(await tools.bash({ command: "echo reached-bash" })); }
+            catch (e) { outcome = "threw: " + String(e && e.message || e); }
+        }
+        return JSON.stringify({ offered, outcome });
+    "#;
+
+    /// A policy that denies the whole `bash` tool: through the real permission extension and the
+    /// real session builder, a `codemode` script cannot reach it. The tool is not in the script's
+    /// `tools` at all (the gate hides what it denies), and nothing runs.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_deny_rule_for_bash_keeps_tools_bash_out_of_a_codemode_script() {
+        let world = permission_world_with(
+            r#"{ "defaultPolicy": { "tools": "allow", "bash": "allow", "mcp": "allow", "skills": "allow" },
+                 "tools": { "bash": "deny" } }"#,
+        );
+        let (_runtime, _requests, answer, _tmp) = probe_script(world, BASH_PROBE, |_| {}).await;
+        assert_eq!(answer["offered"], serde_json::json!(false), "{answer}");
+        assert_eq!(answer["outcome"], "not attempted", "{answer}");
+    }
+
+    /// A command-level deny reaches the gate through the nested call: the script's call rejects with
+    /// the policy's text, and the command never runs.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_deny_rule_for_one_bash_command_rejects_that_nested_call() {
+        let world = permission_world_with(
+            r#"{ "defaultPolicy": { "tools": "allow", "bash": "allow", "mcp": "allow", "skills": "allow" },
+                 "bash": { "echo *": "deny" } }"#,
+        );
+        let (_runtime, _requests, answer, _tmp) = probe_script(world, BASH_PROBE, |_| {}).await;
+        let outcome = answer["outcome"].as_str().unwrap();
+        assert!(
+            outcome.starts_with("threw: ") && outcome.contains("policy-enforced"),
+            "{answer}"
+        );
+        assert!(!outcome.starts_with("ran: "), "the command ran: {answer}");
+    }
+
+    /// An `ask` with no UI to answer it (this session is headless, like `-p` and `--mode json`)
+    /// becomes a block, and the script reads why: the call, that it came from a script, and what to
+    /// do about it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_headless_ask_rejects_the_nested_call_with_a_message_the_script_can_read() {
+        let world = permission_world_with(
+            r#"{ "defaultPolicy": { "tools": "allow", "bash": "ask", "mcp": "allow", "skills": "allow" } }"#,
+        );
+        let (_runtime, _requests, answer, _tmp) = probe_script(world, BASH_PROBE, |_| {}).await;
+        assert_eq!(
+            answer["outcome"],
+            "threw: Running bash command 'echo reached-bash' requires approval, but no interactive UI is available (from codemode script). A script cannot answer an approval prompt without a UI: allow this call in the permission policy, or run interactively to be asked.",
+            "{answer}"
+        );
+    }
+
+    /// `--exclude-tools bash`: the denylist bounds the registry the same way, with the rest of the
+    /// allowlist intact.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn exclude_tools_bounds_the_registry_the_permission_gate_and_codemode_reach() {
+        let (runtime, requests, answer, _tmp) = probe_allowlist(|cfg| {
+            cfg.exclude_tools = vec!["bash".into()];
+            // `--tools` names `bash` too: the denylist wins over the allowlist (pi `_isAllowedTool`).
+            cfg.tools = Some(vec![
+                "read".into(),
+                "bash".into(),
+                "edit".into(),
+                "codemode".into(),
+            ]);
+        })
+        .await;
+        let session = runtime.session().await;
+
+        for request in &requests {
+            assert!(
+                !request.iter().any(|declared| declared == "bash"),
+                "`bash` was declared under --exclude-tools bash: {request:?}"
+            );
+        }
+        assert!(
+            !session.all_tools().iter().any(|row| row.name == "bash"),
+            "`bash` is in the registry"
+        );
+        assert_eq!(
+            answer["offered"]["bash"],
+            serde_json::json!(false),
+            "`tools.bash` is callable from a codemode script: {answer}"
+        );
+        assert_eq!(
+            answer["offered"]["edit"],
+            serde_json::json!(true),
+            "{answer}"
+        );
+    }
+
+    /// The tool names and the system prompt of every request, in request order.
+    type Requests = Arc<std::sync::Mutex<Vec<(Vec<String>, String)>>>;
+
+    /// A provider that answers with text and records what each request declared and said.
+    fn recording(requests: &Requests) -> Arc<FauxProvider> {
+        use cyrup_core::StopReason;
+        use cyrup_provider::faux::{FauxResponseStep, faux_assistant_message, faux_text};
+        let faux = Arc::new(FauxProvider::new());
+        let seen = Arc::clone(requests);
+        faux.set_response_steps(vec![FauxResponseStep::factory(
+            move |ctx, _opts, _state, _model| {
+                seen.lock().unwrap().push((
+                    ctx.tools.iter().map(|tool| tool.name.clone()).collect(),
+                    ctx.system_prompt.clone().unwrap_or_default(),
+                ));
+                faux_assistant_message(vec![faux_text("done")], StopReason::Stop)
+            },
+        )]);
+        faux
+    }
+
+    /// What the first request of a session over `policy` (and, when given, `settings.json`)
+    /// declared, and the system prompt it carried.
+    async fn first_request(policy: &str, settings: Option<&str>) -> (Vec<String>, String) {
+        let (tmp, agent_dir, cwd) = permission_world_with(policy);
+        if let Some(settings) = settings {
+            std::fs::write(agent_dir.join("settings.json"), settings).unwrap();
+        }
+        let requests: Requests = Arc::default();
+        let (factory, target) = factory_with(recording(&requests), &agent_dir, &cwd, false, |_| {});
+        let runtime = AgentSessionRuntime::create(factory, target).await.unwrap();
+        let session = runtime.session().await;
+        let _ = session.prompt("go").await.unwrap();
+        session.wait_for_idle().await;
+        let first = requests.lock().unwrap().first().cloned().unwrap();
+        drop(tmp);
+        first
+    }
+
+    /// The tool names the `<tools>` section of a system prompt lists, in order.
+    fn listed_tools(prompt: &str) -> Vec<String> {
+        let section = prompt
+            .split("<tools>")
+            .nth(1)
+            .and_then(|rest| rest.split("</tools>").next())
+            .unwrap_or_else(|| panic!("no <tools> section in {prompt:?}"));
+        section
+            .lines()
+            .filter_map(|line| line.strip_prefix("- "))
+            .filter_map(|line| line.split(':').next())
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// A policy that leaves `skills` at its default (`ask`), which the permission system answers by
+    /// hiding the skills from the prompt: the case in which it returns a prompt of its own.
+    const POLICY_SKILLS_ASK: &str = r#"{ "defaultPolicy": { "tools": "allow", "bash": "allow" } }"#;
+
+    /// The first prompt of a session with an armed permission system is the prompt of the tools the
+    /// first request declares. The system prompt the model was sent listed six tools and the rules
+    /// for them (`Use bash for file operations like ls, rg, find`) while the request declared twelve,
+    /// including `codemode`, because the permission system returned a sanitized copy of the prompt
+    /// it was handed, built before it changed the active tools.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_first_prompt_lists_the_tools_the_first_request_declares() {
+        let (mut declared, prompt) = first_request(POLICY_SKILLS_ASK, None).await;
+        declared.sort();
+        let mut listed = listed_tools(&prompt);
+        listed.sort();
+        assert_eq!(listed, declared, "the <tools> section of:\n{prompt}");
+        assert!(
+            declared.iter().any(|name| name == "codemode"),
+            "codemode is active under this policy: {declared:?}"
+        );
+        assert!(
+            prompt.contains("Use codemode to batch independent tool calls"),
+            "the codemode rule is missing from:\n{prompt}"
+        );
+        assert!(
+            !prompt.contains("Use bash for file operations like ls, rg, find"),
+            "a rule for a tool that grep, find and ls replace is stale in:\n{prompt}"
+        );
+    }
+
+    /// The same under `codemode.mode: only`, where the request declares `codemode` and
+    /// `tool_search` alone: the prompt described `read`, `bash`, `edit` and `write` to a model that
+    /// was not given them, and never mentioned `codemode`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_first_prompt_under_codemode_only_lists_only_what_the_request_declares() {
+        let (mut declared, prompt) = first_request(
+            POLICY_SKILLS_ASK,
+            Some(r#"{ "codemode": { "mode": "only" } }"#),
+        )
+        .await;
+        declared.sort();
+        assert_eq!(declared, ["codemode", "tool_search"], "{prompt}");
+        let mut listed = listed_tools(&prompt);
+        listed.sort();
+        assert_eq!(listed, declared, "the <tools> section of:\n{prompt}");
+        for stale in [
+            "Use read to examine",
+            "Use bash for",
+            "Use edit for",
+            "Use write only",
+        ] {
+            assert!(!prompt.contains(stale), "`{stale}` is stale in:\n{prompt}");
+        }
+        assert!(
+            prompt.contains("Use codemode to batch independent tool calls"),
+            "the codemode rule is missing from:\n{prompt}"
+        );
+    }
+
+    /// A caller that names a disallowed built-in to `set_active_tools_by_name` (the CLI/host path
+    /// the permission extension's `set_active_tools` shares) activates nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn set_active_tools_by_name_cannot_reactivate_a_disallowed_builtin() {
+        let (tmp, agent_dir, cwd) = permission_world();
+        let (factory, target) = factory_with(
+            Arc::new(FauxProvider::new()),
+            &agent_dir,
+            &cwd,
+            false,
+            |cfg| cfg.tools = Some(vec!["read".into(), "grep".into()]),
+        );
+        let runtime = AgentSessionRuntime::create(factory, target).await.unwrap();
+        let session = runtime.session().await;
+        let everything: Vec<String> = ["read", "bash", "edit", "write", "grep", "find", "ls"]
+            .iter()
+            .map(|n| (*n).to_string())
+            .collect();
+        session.set_active_tools_by_name(&everything).await;
+        let mut active = session.active_tool_names();
+        active.sort();
+        assert_eq!(active, vec!["grep".to_string(), "read".to_string()]);
+        drop(tmp);
     }
 }

@@ -1,6 +1,7 @@
 //! Stream decoding (Pi processResponsesStream, openai-responses-shared.ts:295-531):
 //! the in-flight content blocks.
 
+use crate::utils::constrained_sampling::{ConstrainedSamplingError, CustomToolInput};
 use cyrup_core::{Content, LazyArgs, SharedStr, ToolCall, ToolCallId};
 
 pub(super) enum RBlock {
@@ -41,7 +42,32 @@ pub(super) enum RBlock {
         /// a server that omits `output_index`, where two parallel calls share one slot key, so
         /// removing the slot finishes at most one of them.
         finished: bool,
+        /// `Some` for a `custom_tool_call`. Its `partial_json` is the JSON form of
+        /// `{ [property]: input }` (kept in step by [`RBlock::append_custom_input`]) rather than
+        /// provider-sent argument JSON, and the `function_call_arguments` events do not apply to it.
+        custom: Option<CustomToolInput>,
     },
+}
+
+impl RBlock {
+    /// Pi `appendCustomToolCallInput` on a block: `Ok(None)` for a block that is not a custom call.
+    /// Keeps `partial_json` equal to the JSON the emitted deltas add up to, so the next snapshot
+    /// projects the same arguments pi's `block.arguments = { [property]: nextInput }` holds.
+    pub(super) fn append_custom_input(
+        &mut self,
+        next_input: &str,
+        close: bool,
+    ) -> Result<Option<String>, ConstrainedSamplingError> {
+        let RBlock::Tool {
+            partial_json,
+            custom: Some(custom),
+            ..
+        } = self
+        else {
+            return Ok(None);
+        };
+        custom.append_into(partial_json, next_input, close)
+    }
 }
 
 /// Project ONE block to its `Content`, split out per block so [`crate::api::content_cache::
@@ -68,6 +94,7 @@ pub(super) fn project_block(b: &RBlock) -> Content {
                 partial_json,
                 namespace,
                 finished: _,
+                custom: _,
             } => Content::ToolCall(ToolCall {
                 id: ToolCallId::from(format!("{call_id}|{item_id}").as_str()),
                 name: name.clone(),

@@ -15,20 +15,38 @@ use crate::stream::sse::SseFrame;
 use cyrup_core::{ApiId, Content, StopReason, ToolCall, ToolCallId};
 use futures::{Stream, StreamExt};
 use serde_json::Value;
+use std::collections::HashMap;
 
 /// Reasoning delta field names emitted by OpenAI-compatible endpoints (first non-empty wins).
 pub(super) const REASONING_FIELDS: [&str; 3] = ["reasoning_content", "reasoning", "reasoning_text"];
 
 /// Drive the SSE frame stream into ordered [`StreamEvent`]s pushed to `sink`. Emits `Start` first,
 /// then per-block `*Start/*Delta/*End`, then exactly one terminal (`Done`/`Error`).
-pub(crate) async fn decode_stream<S>(mut frames: S, model: &Model, api: &ApiId, sink: &EventSink)
+#[cfg(test)]
+pub(crate) async fn decode_stream<S>(frames: S, model: &Model, api: &ApiId, sink: &EventSink)
 where
+    S: Stream<Item = Result<SseFrame, ProviderError>> + Unpin,
+{
+    decode_stream_with_grammar_inputs(frames, model, api, sink, HashMap::new()).await;
+}
+
+/// [`decode_stream`] for a request that declared grammar tools: `grammar_inputs` is pi's
+/// `grammarToolInputProperties` (tool name → the argument property its raw text is stored under),
+/// which decides where a streamed `custom` tool call's text goes (PROV-101).
+pub(crate) async fn decode_stream_with_grammar_inputs<S>(
+    mut frames: S,
+    model: &Model,
+    api: &ApiId,
+    sink: &EventSink,
+    grammar_inputs: HashMap<String, String>,
+) where
     S: Stream<Item = Result<SseFrame, ProviderError>> + Unpin,
 {
     let provider = model.provider.clone();
     let model_id = model.id.as_str().to_string();
 
     let mut dec = Decoder::default();
+    dec.grammar_inputs = grammar_inputs;
     dec.started_at = sink.started_at();
 
     if !sink
@@ -81,6 +99,30 @@ where
             && let Some(Block::Thinking { signature, .. }) = dec.block_mut(idx)
         {
             *signature = Some(serialized);
+        }
+        // Pi `finishBlock` closes a custom call's JSON (`openai-completions.ts:420-432`): the
+        // closing delta, if any, is pushed before `toolcall_end`.
+        if let Some(raw) = dec.custom_input(idx) {
+            match dec.append_custom_input(idx, &raw, true) {
+                Ok(Some(delta)) => {
+                    let partial = dec.snapshot(model, api);
+                    if !sink
+                        .send(StreamEvent::ToolCallDelta {
+                            content_index: idx,
+                            delta,
+                            partial,
+                        })
+                        .await
+                    {
+                        return;
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    dec.stop_reason = Some(StopReason::Error);
+                    dec.error_message = Some(e.0);
+                }
+            }
         }
         let partial = dec.snapshot(model, api);
         let ev = match dec.blocks.get(idx) {

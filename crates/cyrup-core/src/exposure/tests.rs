@@ -13,6 +13,7 @@ struct Fixture {
     exposure: ToolExposure,
     default_active: bool,
     namespace: Option<ToolNamespace>,
+    annotations: Option<ToolAnnotations>,
     hook: Option<Hook>,
     guidelines: Vec<&'static str>,
 }
@@ -26,6 +27,7 @@ impl Fixture {
             exposure,
             default_active: true,
             namespace: None,
+            annotations: None,
             hook: None,
             guidelines: Vec::new(),
         }
@@ -65,6 +67,9 @@ impl Tool for Fixture {
     }
     fn namespace(&self) -> Option<&ToolNamespace> {
         self.namespace.as_ref()
+    }
+    fn annotations(&self) -> Option<&ToolAnnotations> {
+        self.annotations.as_ref()
     }
     fn default_active(&self) -> bool {
         self.default_active
@@ -439,4 +444,62 @@ fn a_loadout_hook_reads_the_prompt_guidelines_of_a_registered_tool() {
             ("unknown".to_owned(), Vec::new()),
         ]
     );
+}
+
+/// CODE-017: annotations are the tool's own and a description-replacing hook does not lose them.
+/// `DescribedTool` is the executable the dispatcher and the hooks see for a described tool, so a
+/// dropped delegation would make `getAllTools`-style readers see a described tool without hints.
+#[test]
+fn a_described_tool_keeps_its_annotations() {
+    let hints = ToolAnnotations {
+        read_only_hint: Some(true),
+        open_world_hint: Some(false),
+        ..ToolAnnotations::default()
+    };
+    let mut annotated = Fixture::new("annotated", ToolExposure::Direct);
+    annotated.annotations = Some(hints);
+    let describer = Fixture::new("describer", ToolExposure::Direct).hook(|_view| {
+        let mut changes = ToolLoadoutChanges::default();
+        changes
+            .descriptions
+            .insert("annotated".to_string(), "rewritten".to_string());
+        Ok(changes)
+    });
+    let registry = vec![annotated.arc(), describer.arc()];
+
+    let l = ToolLoadout::resolve(&names(&["annotated", "describer"]), &registry);
+
+    let described = l
+        .executable()
+        .iter()
+        .find(|t| t.name() == "annotated")
+        .unwrap();
+    assert_eq!(described.description(), "rewritten");
+    assert_eq!(described.annotations().copied(), Some(hints));
+    let plain = l
+        .executable()
+        .iter()
+        .find(|t| t.name() == "describer")
+        .unwrap();
+    assert_eq!(
+        plain.annotations(),
+        None,
+        "the default is pi's omitted field"
+    );
+}
+
+#[test]
+fn annotations_serialize_as_pis_camel_case_and_only_the_hints_that_are_set() {
+    let hints = ToolAnnotations {
+        read_only_hint: Some(true),
+        destructive_hint: None,
+        idempotent_hint: Some(false),
+        open_world_hint: None,
+    };
+    assert_eq!(
+        serde_json::to_value(hints).unwrap(),
+        json!({ "readOnlyHint": true, "idempotentHint": false })
+    );
+    assert!(ToolAnnotations::default().is_empty());
+    assert!(!hints.is_empty());
 }

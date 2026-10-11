@@ -23,7 +23,9 @@ use cyrup_codemode::types::OutputItem;
 use cyrup_codemode_runtime::CodemodeExtension;
 use cyrup_codemode_runtime::testkit::{ScriptEnv, ScriptedSandboxFactory, completed, failed};
 use cyrup_codemode_runtime::tool::CodemodeToolDetails;
-use cyrup_codemode_runtime::types::{CodemodeResult, CodemodeStoreWrites, ErrorKind};
+use cyrup_codemode_runtime::types::{
+    CodemodeResult, CodemodeStoreWrites, ErrorKind, UnobservedErrors,
+};
 use cyrup_config::{InMemorySettingsStore, SettingsScope};
 use cyrup_core::{
     CancelToken, Content, ExtensionId, Message, StopReason, Tool, ToolCallId, ToolError,
@@ -1275,10 +1277,11 @@ fn counting_script() -> Script {
             writes.delete.push("count".to_owned());
             let was_unset = env.store.get("count").is_none();
             return CodemodeResult::Completed {
-                value: Some(json!(was_unset)),
+                value: Some(json!(was_unset).into()),
                 output: Vec::new(),
                 calls: Vec::new(),
                 store_writes: writes,
+                unobserved: UnobservedErrors::default(),
             };
         }
         if code.contains("read-only") {
@@ -1291,10 +1294,11 @@ fn counting_script() -> Script {
         let mut writes = CodemodeStoreWrites::default();
         writes.set.insert("count".to_owned(), json!(next));
         CodemodeResult::Completed {
-            value: Some(json!(next)),
+            value: Some(json!(next).into()),
             output: Vec::new(),
             calls: Vec::new(),
             store_writes: writes,
+            unobserved: UnobservedErrors::default(),
         }
     })
 }
@@ -1432,7 +1436,9 @@ async fn truncates_output_to_the_token_budget_and_spills_the_full_text() {
         body.contains("row 0\n") && body.contains("tokens truncated") && body.contains("row 99\n")
     );
     assert!(!body.contains("row 50\n"));
-    assert!(body.contains(&format!("[Full output: {path} (read with offset/limit)]")));
+    assert!(body.contains(&format!(
+        "[Full output: {path} (read or tools.read with offset/limit)]"
+    )));
     let Message::ToolResult { content, .. } = &result else {
         panic!()
     };
@@ -1561,6 +1567,50 @@ async fn no_extensions_drops_the_builtin_codemode_extension() {
             .all_tools()
             .iter()
             .all(|tool| tool.name != "codemode")
+    );
+}
+
+/// `--no-extensions --tools codemode` names a tool the flag has just removed. The session still
+/// starts, but says so on the startup diagnostics (non-fatal) instead of leaving the model to find
+/// out from "Tool codemode not found".
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn no_extensions_with_tools_naming_codemode_leaves_a_startup_diagnostic() {
+    let build = |names_codemode: bool| {
+        let fx = fixture();
+        let mut cfg = SessionConfig::new(fx.cwd.clone(), fx.agent_dir.clone());
+        cfg.trust_override = Some(true);
+        cfg.no_extensions = true;
+        if names_codemode {
+            cfg.tools = Some(vec!["read".to_string(), "codemode".to_string()]);
+        }
+        let ext = CodemodeExtension::new(
+            Default::default(),
+            Arc::new(ScriptedSandboxFactory::new(no_script())),
+        );
+        let faux = Arc::new(FauxProvider::new());
+        async move {
+            let session = SessionBuilder::new(faux as Arc<dyn Provider>, cfg)
+                .with_codemode(ext)
+                .build()
+                .await
+                .unwrap();
+            (session, fx)
+        }
+    };
+    let (named, _fx) = build(true).await;
+    let diagnostics = &named.services().startup_diagnostics.extensions;
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+    assert_eq!(diagnostics[0].path, std::path::PathBuf::from("codemode"));
+    assert!(!diagnostics[0].fatal, "the session is usable without it");
+    assert!(
+        diagnostics[0].error.contains("--no-extensions"),
+        "{diagnostics:?}"
+    );
+
+    let (unnamed, _fx) = build(false).await;
+    assert!(
+        unnamed.services().startup_diagnostics.extensions.is_empty(),
+        "a session that never asked for codemode hears nothing"
     );
 }
 
@@ -1756,7 +1806,9 @@ async fn resolves_read_calls_to_text_for_text_files_and_to_image_blocks_that_ima
 /// on one line. Listed (`only`), the codemode description carries `renderToolSignature`'s
 /// `Promise<…>` (`packages/codemode/src/declarations.ts:138-188`), whose object members are sorted
 /// and keep their descriptions as comments. The expected strings are what pi's own
-/// `declarations.ts` and `describeOutput` print for these two schemas.
+/// `declarations.ts` and `describeOutput` print for these two schemas, except `exit_code`, whose
+/// description comment is this port's [CYRUP-DELTA] (`bash.rs`'s `output_schema`: a non-zero exit
+/// code is an error for the model, but the call resolves to the result).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_bash_and_read_declarations_render_their_output_schemas() {
     let rig = rig(no_script(), Options::default()).await;
@@ -1786,8 +1838,9 @@ async fn the_bash_and_read_declarations_render_their_output_schemas() {
     let codemode = description(&rig.request_tools(0), "codemode");
     assert!(
         codemode.contains(
-            "): Promise<{\n  exit_code: number;\n  // Full output, when truncated\n  \
-             full_output_path?: string;\n  // Combined stdout and stderr, possibly truncated\n  \
+            "): Promise<{\n  // Exit code. A non-zero code is an error for the model, but the call still \
+             resolves to this result; a timeout rejects\n  exit_code: number;\n  \
+             // Full output, when truncated\n  full_output_path?: string;\n  // Combined stdout and stderr, possibly truncated\n  \
              output: string;\n  truncated: boolean;\n  wall_time_seconds: number;\n}>; };"
         ),
         "{codemode}"
@@ -1809,6 +1862,97 @@ async fn rig_only() -> Rig {
         },
     )
     .await
+}
+
+/// A session with the V8 sandbox and the built-in tools, running one real script in `fx.cwd`.
+async fn run_real_script(fx: &Fixture, code: &str) -> Message {
+    let mut cfg = SessionConfig::new(fx.cwd.clone(), fx.agent_dir.clone());
+    cfg.trust_override = Some(true);
+    cfg.no_extensions = false;
+    let faux = Arc::new(FauxProvider::new());
+    let session = SessionBuilder::new(faux.clone() as Arc<dyn Provider>, cfg)
+        .with_codemode(CodemodeExtension::new(
+            Default::default(),
+            Arc::new(cyrup_codemode_runtime::tool::EngineSandboxFactory),
+        ))
+        .build()
+        .await
+        .unwrap()
+        .into_shared();
+    session
+        .set_active_tools_by_name(&["codemode".to_owned(), "read".to_owned(), "bash".to_owned()])
+        .await;
+    let requests: Requests = Arc::new(Mutex::new(Vec::new()));
+    faux.set_response_steps(steps(&requests, vec![Some(json!({ "code": code })), None]));
+    let _ = session.prompt("go").await.unwrap();
+    session.wait_for_idle().await;
+    session
+        .messages()
+        .await
+        .into_iter()
+        .rev()
+        .find(|m| matches!(m, Message::ToolResult { tool_name, .. } if tool_name == "codemode"))
+        .expect("a codemode tool result")
+}
+
+/// TOOL-058 (pi `021eae60a` @v1.0.4): `tools.read` on an image resolves to the image block, so
+/// `image(await tools.read(...))` shows the picture, saved to a file the result names. It used to
+/// resolve to the note text, which `image()` cannot show.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_script_shows_the_image_tools_read_resolves_to() {
+    use base64::Engine as _;
+    let fx = fixture();
+    std::fs::write(
+        fx.cwd.join("x.png"),
+        base64::engine::general_purpose::STANDARD
+            .decode(TINY_PNG)
+            .unwrap(),
+    )
+    .unwrap();
+    let result = run_real_script(
+        &fx,
+        "const r = await tools.read({ path: 'x.png' });\nimage(r);\nreturn [r.type, r.mimeType];",
+    )
+    .await;
+    assert!(!is_error(&result), "{result:?}");
+    let Message::ToolResult { content, .. } = &result else {
+        panic!()
+    };
+    assert!(
+        content.iter().any(
+            |block| matches!(block, Content::Image { mime_type, .. } if mime_type == "image/png")
+        ),
+        "the script's image reaches the result: {content:?}"
+    );
+    let body = result_text(&result);
+    assert!(body.contains("[\"image\",\"image/png\"]"), "{body}");
+    assert!(body.contains("[Image saved to "), "{body}");
+    let _ = check_saved_images(
+        body.lines()
+            .find(|l| l.starts_with("[Image saved to "))
+            .unwrap(),
+        match content.iter().find_map(|block| match block {
+            Content::Image { data, .. } => Some(data.as_str()),
+            _ => None,
+        }) {
+            Some(data) => data,
+            None => panic!("no image"),
+        },
+    );
+}
+
+/// TOOL-054 (pi `bash.ts:389-395` @v1.0.4): a non-zero exit resolves to the structured result
+/// instead of rejecting the script, so the script can branch on `exit_code`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_script_gets_the_structured_result_of_a_bash_command_that_exits_non_zero() {
+    let fx = fixture();
+    let result = run_real_script(
+        &fx,
+        "const r = await tools.bash({ command: 'echo out; exit 3' });\nreturn [r.output, r.exit_code, typeof r.wall_time_seconds, r.truncated];",
+    )
+    .await;
+    assert!(!is_error(&result), "{result:?}");
+    assert_eq!(result_text(&result), "[\"out\\n\",3,\"number\",false]");
 }
 
 /// CODE-020. The prompt a session is BUILT with follows the declared tools as well, not only the
@@ -2155,7 +2299,9 @@ async fn the_description_names_a_readable_absolute_path_of_the_shipped_reference
         .lines()
         .find_map(|line| {
             line.strip_prefix("- `models`: classifiers and image generation. Read ")
-                .and_then(|rest| rest.strip_suffix(" first."))
+                .and_then(|rest| {
+                    rest.strip_suffix(" first (with read, or tools.read in a script).")
+                })
         })
         .expect("the models line names the docs");
     let path = std::path::Path::new(path);

@@ -112,6 +112,12 @@ pub enum SanctionedWaitKind {
     /// Cutting it at the dispatch budget loses exactly the completions the drain exists to deliver.
     /// Always declared with a ceiling derived from that `timeoutMs`.
     AutoDrain,
+    /// A `tool_call` handler holding the call until the servers it needs have connected — the MCP
+    /// extension's wait before a `codemode` script or a `tool_search` runs, so the tools of a server
+    /// that is still starting are registered when it looks (`pi.on("tool_call")` in
+    /// `extensions/mcp/index.ts` @v1.0.4, which awaits the servers' `ready` promises). Always
+    /// declared with a ceiling; the handler gives up and lets the call run before it passes.
+    ServerConnect,
 }
 
 /// One live sanctioned wait.
@@ -893,14 +899,20 @@ pub trait NativeExtension: Send + Sync {
     /// loaded, still in [`crate::ExtensionHost::loaded_ids`], and still dispatched; only the list
     /// the user is shown leaves it out.
     ///
-    /// pi marks every `builtin:<name>` extension `hidden` when it loads it
-    /// (`extension.hidden = true`, `core/resource-loader.ts:729` @v0.99.2-17) and the interactive
-    /// startup panel lists only `!extension.hidden`
-    /// (`modes/interactive/interactive-mode.ts:1778`) — the `builtin` flag's own doc says it "is
-    /// hidden from the startup Extensions list" (`core/extensions/types.ts:2015`). Hidden is a
-    /// property of HOW the extension was loaded upstream; a compiled-in cyrup native has one load
-    /// path, so the native declares it. Default `false`: an embedder-supplied inline factory is
-    /// listed (`<inline>`), as in pi.
+    /// pi marks every extension its `builtin:<name>` branch loads `hidden` — the default and the
+    /// `-e builtin:<name>` form alike (`extension.hidden = true` in `loadExtensionPaths`,
+    /// `core/resource-loader.ts:741` @f1b2e77f5) — and the interactive startup panel lists only
+    /// `!extension.hidden` (`modes/interactive/interactive-mode.ts`). Hidden is a property of HOW
+    /// the extension was loaded upstream. cyrup has that load path too (EXT-094: the binary's
+    /// `session_launch::BuiltinSelection` attaches `llama.cpp`, `codemode`, `tool-search` and `mcp`
+    /// only as `builtin:<name>`), but the host reads hidden from the native, so each of those four
+    /// natives declares it. Default `false`: anything else, an embedder-supplied inline factory
+    /// included, is listed, as in pi (whose named inline factory may still declare `hidden`,
+    /// `resource-loader.ts:1148`). EXT-092: the binary's test
+    /// `every_attached_native_is_hidden_exactly_when_pi_loads_its_counterpart_as_a_builtin`
+    /// (`crates/cyrup/src/session_launch.rs`) derives each attached native's expected state from
+    /// that load path — hidden iff attached as a `builtin:<name>`, default or `-e` — and fails on a
+    /// native that disagrees.
     fn is_hidden(&self) -> bool {
         false
     }
@@ -1229,7 +1241,10 @@ pub trait NativeExtension: Send + Sync {
     /// The default is a no-op — a built-in that needs none simply ignores it. A built-in that DOES
     /// need late, out-of-`HostCtx` reach (a background tokio task that must resolve the live session
     /// id/file, open a dialog, or inject a turn-triggering message) overrides this to STASH the `Arc`
-    /// in its own interior-mutable slot (`OnceLock`/`Mutex`). The captured `Arc` is a shared handle to
+    /// in a [`crate::host::HostServicesSlot`] (or a `Mutex` of its own) and NOT in a `OnceLock`: a
+    /// session replacement (`/new`, RPC `new_session`, a second ACP `session/new`) builds the
+    /// replacement's `LiveHostServices` and calls this again on the SAME extension object, and a
+    /// set-once slot keeps serving the session that was replaced. The captured `Arc` is a shared handle to
     /// the one `LiveHostServices` the session late-attaches its manager / ui sink / inject sink to, so
     /// capturing it early (before those attachments) is correct: the built-in observes them through
     /// the `Arc`'s interior mutability when the background task actually runs. Gated on `wasm-host`
