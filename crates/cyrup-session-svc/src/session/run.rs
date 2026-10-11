@@ -1259,7 +1259,34 @@ impl AgentSession {
     /// `agent-session.ts:2386-2388` @v0.87.1). A `print`/SDK caller that triggered `/compact`, an
     /// extension's `ctx.waitForIdle()`, and the injection pump therefore all wait a manual
     /// compaction out instead of starting work that races it.
+    ///
+    /// SUBA-187 — and of every TURN-TRIGGERING injection already queued for this session
+    /// ([`crate::host_services::PendingTurnInjections`]): pi runs such a message as a queued turn
+    /// before `prompt()` resolves, so a headless host cannot exit ahead of it, while cyrup's pump
+    /// starts its turn only at the idle edge. Without this a `cyrup -p` parent saw the session idle
+    /// in that gap and exited with a background completion queued but never run. The pump itself
+    /// waits on [`Self::wait_for_latches_idle`] instead, because it is the one that answers those
+    /// injections.
     pub async fn wait_for_idle(&self) {
+        let mut pending = self
+            .services
+            .host_services
+            .pending_turn_injections()
+            .subscribe();
+        loop {
+            self.wait_for_latches_idle().await;
+            if *pending.borrow_and_update() == 0 {
+                return;
+            }
+            if pending.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+
+    /// [`Self::wait_for_idle`] without the queued-injection half: the run latches and any
+    /// compaction only. The injection pump's own idle wait.
+    pub(crate) async fn wait_for_latches_idle(&self) {
         loop {
             // Subscribe BEFORE reading the slots: a clear that lands between the read and the await
             // is then still observed as a change, so the wait cannot miss its own wake-up.

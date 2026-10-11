@@ -754,14 +754,26 @@ pub struct InjectMessage {
 /// therefore not a reachable state, and no caller's handling of a dropped channel is load-bearing.
 ///
 /// [`Self::answer`] takes `self` by value, so an obligation cannot be discharged twice.
-pub struct InjectAck(Option<tokio::sync::oneshot::Sender<InjectOutcome>>);
+pub struct InjectAck(
+    Option<tokio::sync::oneshot::Sender<InjectOutcome>>,
+    /// SUBA-187 — set on a turn-triggering request: counts it as a queued turn until this
+    /// obligation is answered or dropped (see [`PendingTurnInjections`]).
+    Option<PendingTurnGuard>,
+);
 
 impl InjectAck {
     /// A live obligation and the receiver that observes it.
     #[must_use]
     pub(crate) fn channel() -> (Self, tokio::sync::oneshot::Receiver<InjectOutcome>) {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        (Self(Some(tx)), rx)
+        (Self(Some(tx), None), rx)
+    }
+
+    /// SUBA-187 — count this request as a queued turn until it is answered.
+    #[must_use]
+    pub(crate) fn counting_turn(mut self, pending: &PendingTurnInjections) -> Self {
+        self.1 = Some(pending.guard());
+        self
     }
 
     /// An obligation nobody is listening for — the fire-and-forget producers (a WASM guest is
@@ -772,7 +784,7 @@ impl InjectAck {
     /// forget.
     #[must_use]
     pub(crate) fn detached() -> Self {
-        Self(None)
+        Self(None, None)
     }
 
     /// Discharge the obligation. Consumes it, so it cannot be answered again.
@@ -800,6 +812,51 @@ impl std::fmt::Debug for InjectAck {
         f.debug_struct("InjectAck")
             .field("outstanding", &self.0.is_some())
             .finish()
+    }
+}
+
+/// SUBA-187 — the number of TURN-TRIGGERING injections queued for the session and not yet
+/// answered by its pump.
+///
+/// pi delivers a `sendMessage(…, { triggerTurn })` made while the agent is still running as a
+/// queued message the agent loop runs before `prompt()` resolves, so a headless host's
+/// `waitForIdle` cannot return ahead of it (the completion turn upstream's `agent_end` hands
+/// finished background results to, `pi-subagents` `extension/index.ts:724-728` @ad11b7ab: "Pi
+/// runs the queued completion turn after agent_end"). cyrup's pump instead holds such a message
+/// until the session goes idle and then starts its turn, so the session is briefly idle with the
+/// turn still owed — and `cyrup -p` returned in that gap. [`crate::AgentSession::wait_for_idle`]
+/// reads this count to wait it out. A request stops counting when its [`InjectAck`] is answered or
+/// dropped: on `Accepted` that is after `run_injection` has claimed the run latch, so the turn it
+/// started is then covered by the ordinary run wait.
+#[derive(Clone, Debug)]
+pub struct PendingTurnInjections(Arc<tokio::sync::watch::Sender<usize>>);
+
+impl Default for PendingTurnInjections {
+    fn default() -> Self {
+        Self(Arc::new(tokio::sync::watch::Sender::new(0)))
+    }
+}
+
+impl PendingTurnInjections {
+    fn guard(&self) -> PendingTurnGuard {
+        self.0.send_modify(|count| *count = count.saturating_add(1));
+        PendingTurnGuard(Arc::clone(&self.0))
+    }
+
+    /// Observe the count; `0` means no turn-triggering injection is owed.
+    #[must_use]
+    pub fn subscribe(&self) -> tokio::sync::watch::Receiver<usize> {
+        self.0.subscribe()
+    }
+}
+
+/// One queued turn-triggering injection; releases its count when dropped.
+#[derive(Debug)]
+pub(crate) struct PendingTurnGuard(Arc<tokio::sync::watch::Sender<usize>>);
+
+impl Drop for PendingTurnGuard {
+    fn drop(&mut self) {
+        self.0.send_modify(|count| *count = count.saturating_sub(1));
     }
 }
 
@@ -950,6 +1007,8 @@ pub struct LiveHostServices {
     /// (bound by `AgentSession::into_shared`). `None` until bound (default host / headless-by-value
     /// session): the ui-style sync→async bridge is inert and `inject_message` reports it unavailable.
     inject_sink: Mutex<Option<InjectSink>>,
+    /// SUBA-187 — turn-triggering injections queued and not yet answered.
+    pending_turn_injections: PendingTurnInjections,
     /// The ONE session-scoped human-interaction lock (C3, reconciliation §1 / §4 step 6). Created
     /// eagerly at construction (immutable for the session's life) and handed to BOTH companion
     /// extensions through [`HostServices::human_interaction_lock`], so the permission gate's `ask`
@@ -1157,6 +1216,7 @@ impl LiveHostServices {
             pending_active_tools: Mutex::new(None),
             exec_timeout: DEFAULT_EXEC_TIMEOUT,
             inject_sink: Mutex::new(None),
+            pending_turn_injections: PendingTurnInjections::default(),
             human_interaction: Arc::new(HumanInteractionLock::new()),
             activity: Mutex::new(None),
             boundary_preview: Mutex::new(None),
@@ -1557,6 +1617,12 @@ impl LiveHostServices {
         *Self::lock(&self.inject_sink) = Some(sink);
     }
 
+    /// SUBA-187 — see [`PendingTurnInjections`].
+    #[must_use]
+    pub fn pending_turn_injections(&self) -> &PendingTurnInjections {
+        &self.pending_turn_injections
+    }
+
     /// The one place an [`InjectRequest`] is put on the wire, shared by the fire-and-forget and
     /// acknowledged capability methods so the two cannot drift into different delivery routes.
     ///
@@ -1565,6 +1631,11 @@ impl LiveHostServices {
     /// No sink bound (default host / headless-by-value session), or the pump has exited — in both
     /// cases nothing was queued and the caller still owns whatever the message announced.
     fn enqueue_injection(&self, message: InjectMessage, ack: InjectAck) -> Result<(), String> {
+        let ack = if message.trigger_turn {
+            ack.counting_turn(&self.pending_turn_injections)
+        } else {
+            ack
+        };
         Self::send_injection(
             &self.injection_sink()?,
             InjectItem::Request(InjectRequest { message, ack }),

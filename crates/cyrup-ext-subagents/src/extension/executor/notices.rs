@@ -779,6 +779,23 @@ impl SubagentExecutor {
         delivered
     }
 
+    /// SUBA-187 — pi `resultWatcher.deliverPendingResults` (`extension/index.ts:728` @ad11b7ab):
+    /// hand every finished result on disk to the session now, without the poll or batch delay. See
+    /// [`crate::background::watch::CompletionWatcherHandle::deliver_pending_results`]. A no-op when
+    /// no watcher is installed. The watcher lock is released before the wait, so a session switch
+    /// is never held up by it.
+    pub async fn deliver_pending_results(&self) {
+        let delivery = self
+            .completion_watcher
+            .lock()
+            .await
+            .as_ref()
+            .map(crate::background::watch::CompletionWatcherHandle::deliver_pending_results);
+        if let Some(delivery) = delivery {
+            delivery.await;
+        }
+    }
+
     /// Tear down this session's completion watcher (pi `session_shutdown`'s `stopResultWatcher()`,
     /// `extension/index.ts:656`): drop the held [`crate::background::watch::CompletionWatcherHandle`],
     /// whose `Drop` impl aborts the drain task and releases the filesystem watch. A no-op if no

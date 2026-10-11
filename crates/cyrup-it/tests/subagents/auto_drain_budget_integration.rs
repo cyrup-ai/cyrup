@@ -211,3 +211,164 @@ async fn an_unarmed_childs_auto_drain_runs_and_is_not_cut_by_the_dispatch_budget
     let _ = std::fs::remove_dir_all(&artifact_roots.results_dir);
     assert_drained(elapsed);
 }
+
+/// SUBA-187 Verify — pi `3bb9b203` / #2666 (`extension/index.ts:728` @ad11b7ab): after the
+/// headless `agent_end` drain, `resultWatcher.deliverPendingResults` hands every finished result
+/// to the session at once, so the queued completion turn runs before the headless host returns.
+///
+/// Driven through print mode itself — `cyrup_modes::run_print` over an `AgentSessionRuntime`
+/// carrying the real extension, which is what `cyrup -p` runs. (The test-support `Harness` cannot
+/// show this: it holds its session by value, and only a shared session gets the injection pump a
+/// completion is delivered through, `AgentSession::into_shared`.) A `Running` background run owned
+/// by the session lands its terminal, INDEXED result (stage → index → promote, as `finish_run`
+/// writes it) while the turn's `agent_end` drain is waiting on it. When `run_print` returns, the
+/// session must already hold the `subagent-notify` message and have run the completion turn.
+///
+/// RED at HEAD: the drain returned as soon as the run was terminal, the completion still had the
+/// results watcher's 500 ms poll and the batcher's 650 ms debounce ahead of it, and `run_print`
+/// returned without it — the result stayed on disk and the provider was called once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_result_that_lands_during_the_headless_drain_is_delivered_before_print_mode_returns() {
+    use cyrup_provider::faux::{FauxProvider, faux_assistant_message, faux_text};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path().join("project");
+    let agent_dir = tmp.path().join("agent");
+    std::fs::create_dir_all(&cwd).unwrap();
+    std::fs::create_dir_all(&agent_dir).unwrap();
+    let roots = Roots::sandboxed(&tmp.path().join("home"));
+    let extension = Arc::new(SubagentsExtension::with_config_and_cwd(
+        SubagentExtensionConfig {
+            async_by_default: false,
+            roots: roots.clone(),
+            ..SubagentExtensionConfig::default()
+        },
+        cwd.clone(),
+    ));
+    let faux = Arc::new(FauxProvider::new());
+    faux.set_responses(vec![
+        faux_assistant_message(vec![faux_text("done")], cyrup_sdk::core::StopReason::Stop),
+        faux_assistant_message(
+            vec![faux_text("noted the result")],
+            cyrup_sdk::core::StopReason::Stop,
+        ),
+    ]);
+    let mut config = cyrup_sdk::SessionConfig::new(cwd.clone(), agent_dir);
+    config.trust_override = Some(true);
+    let target = config.target.clone();
+    let provider: Arc<dyn cyrup_provider::Provider> = faux.clone();
+    let factory = Arc::new(
+        cyrup_sdk::SessionFactory::new(provider, config)
+            .with_native_extension(extension.clone() as Arc<dyn NativeExtension>),
+    );
+    let runtime = cyrup_sdk::AgentSessionRuntime::create(factory, target)
+        .await
+        .expect("a real print-mode runtime with the real SubagentsExtension");
+    let session = extension
+        .executor()
+        .current_session_id()
+        .expect("the runtime binds a live session id");
+    let roots_here = run_artifact_roots_in(&roots, &cwd);
+    let (async_root, results_dir) = (roots_here.async_root, roots_here.results_dir);
+    std::fs::create_dir_all(&results_dir).expect("results dir");
+
+    let run_id = RunId::from_token("drainlands000001");
+    seed_running(&async_root, &results_dir, &run_id, &session);
+    let lander = tokio::spawn({
+        let (async_root, results_dir, run_id, session) = (
+            async_root.clone(),
+            results_dir.clone(),
+            run_id.clone(),
+            session.clone(),
+        );
+        async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            land_indexed(&async_root, &results_dir, &run_id, &session).await;
+        }
+    });
+
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    cyrup_sdk::run_print(
+        &runtime,
+        std::iter::once(cyrup_sdk::UserInput::text(
+            "finish up",
+            cyrup_sdk::InputSource::Cli,
+        )),
+        &mut out,
+        &mut err,
+        cyrup_sdk::PrintOptions::default(),
+    )
+    .await
+    .expect("print mode completes");
+    lander.await.expect("the lander ran");
+
+    // The session's model context: the `subagent-notify` custom message reaches it as the
+    // completion notice's text (`format_completion_message`).
+    let notified = runtime
+        .session()
+        .await
+        .messages()
+        .await
+        .iter()
+        .filter_map(|message| serde_json::to_string(message).ok())
+        .any(|line| line.contains("Background task completed: **worker**"));
+    assert!(
+        notified,
+        "the completion that landed during the drain must reach the session before print mode \
+         returns"
+    );
+    assert_eq!(
+        faux.call_count(),
+        2,
+        "and the completion turn it triggers has run before print mode returns"
+    );
+}
+
+/// What a detached runner does last for a successful run: flip `status.json` terminal and write
+/// the session-owned result through the index.
+async fn land_indexed(async_root: &Path, results_dir: &Path, run_id: &RunId, session: &str) {
+    let paths = RunPaths::for_run(async_root, results_dir, run_id);
+    let mut status = RunStatus::queued(run_id.clone(), RunMode::Single, Some(std::process::id()));
+    status.state = RunState::Complete;
+    status.session_id = SessionId::parse_opt(Some(session));
+    std::fs::write(&paths.status, serde_json::to_string(&status).unwrap()).expect("status.json");
+    let session_id = SessionId::parse(session).expect("session id");
+    let result = ResultFile {
+        schedule_origin: None,
+        id: run_id.clone(),
+        run_id: run_id.clone(),
+        agent: "worker".to_string(),
+        mode: RunMode::Single,
+        state: RunState::Complete,
+        success: true,
+        cwd: PathBuf::from("/tmp"),
+        session_file: None,
+        session_id: Some(session_id.clone()),
+        // A run this process launched records this process's owner id; only that makes the
+        // completion this instance's to deliver (`Attribution::Ours`).
+        completion_owner_id: Some(cyrup_ext_subagents::identity::current_completion_owner_id()),
+        results: Vec::new(),
+        workflow_children: None,
+        workflow_receipt: None,
+    };
+    let written_at = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis(),
+    )
+    .unwrap();
+    cyrup_ext_subagents::background::result_index::write_async_result_file(
+        &cyrup_ext_subagents::background::result_index::ResultWrite {
+            results_dir,
+            session_id: &session_id,
+            run_id,
+            written_at,
+            async_dir: None,
+            tool_call_id: None,
+        },
+        &result,
+    )
+    .await
+    .expect("indexed result");
+}
