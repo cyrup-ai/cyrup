@@ -4033,13 +4033,23 @@ done
             .await
             .expect("a direct call reports through its result");
 
-        let received: serde_json::Value = serde_json::from_str(&result_text(&result))
-            .unwrap_or_else(|_| panic!("the server answered: {}", result_text(&result)));
-        assert_eq!(received["method"], serde_json::json!("tools/call"));
-        assert_eq!(received["params"]["name"], serde_json::json!("request"));
+        let text = result_text(&result);
+        let received = serde_json::from_str::<serde_json::Value>(&text);
+        assert!(received.is_ok(), "the server answered with a line: {text}");
+        let received = received.unwrap();
         assert_eq!(
-            received["params"]["_meta"]["pi-mcp-adapter/toolCallId"],
-            serde_json::json!("call_direct_unit"),
+            received.pointer("/method"),
+            Some(&serde_json::json!("tools/call")),
+            "{received}"
+        );
+        assert_eq!(
+            received.pointer("/params/name"),
+            Some(&serde_json::json!("request")),
+            "{received}"
+        );
+        assert_eq!(
+            received.pointer("/params/_meta/pi-mcp-adapter~1toolCallId"),
+            Some(&serde_json::json!("call_direct_unit")),
             "the direct tool's own call id reached the server: {received}"
         );
     }
