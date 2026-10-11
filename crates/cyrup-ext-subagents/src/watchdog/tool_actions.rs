@@ -323,13 +323,13 @@ pub fn build_check_text(
 /// error RESULT carrying `Subagent watchdog action failed: <message>`, so a mistyped model id does
 /// not abort the caller's turn.
 #[must_use]
-pub fn handle_watchdog_tool_action(
+pub async fn handle_watchdog_tool_action(
     action: &str,
     params: &WatchdogToolParams,
     ctx: &WatchdogCommandContext<'_>,
     runtime: Option<&MainWatchdogRuntime>,
 ) -> WatchdogToolActionResult {
-    match handle_inner(action, params, ctx, runtime) {
+    match handle_inner(action, params, ctx, runtime).await {
         Ok(result) => result,
         Err(error) => {
             WatchdogToolActionResult::error(format!("Subagent watchdog action failed: {error}"))
@@ -337,7 +337,7 @@ pub fn handle_watchdog_tool_action(
     }
 }
 
-fn handle_inner(
+async fn handle_inner(
     action: &str,
     params: &WatchdogToolParams,
     ctx: &WatchdogCommandContext<'_>,
@@ -409,7 +409,8 @@ fn handle_inner(
         target: target.clone(),
         model: value.model,
         thinking: value.thinking,
-    })?;
+    })
+    .await?;
     if let Some(runtime) = runtime {
         runtime.refresh_config(&ctx.cwd);
     }
@@ -628,8 +629,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_session_scoped_configure_writes_no_file_and_says_so() {
+    #[tokio::test]
+    async fn a_session_scoped_configure_writes_no_file_and_says_so() {
         let tmp = TempDir::new().unwrap();
         let registry = registry();
         let ctx = cmd_ctx(&registry, tmp.path());
@@ -639,7 +640,8 @@ mod tests {
             &params(Some("anthropic/claude-opus-4-8"), Some("high")),
             &ctx,
             Some(&runtime),
-        );
+        )
+        .await;
         assert!(!result.is_error, "{}", result.text);
         assert!(result.text.starts_with(
             "Subagent watchdog session model configured: anthropic/claude-opus-4-8:high."
@@ -650,8 +652,8 @@ mod tests {
         assert!(result.text.contains("(session override)"));
     }
 
-    #[test]
-    fn a_session_scoped_configure_refuses_a_non_main_target() {
+    #[tokio::test]
+    async fn a_session_scoped_configure_refuses_a_non_main_target() {
         let tmp = TempDir::new().unwrap();
         let registry = registry();
         let ctx = cmd_ctx(&registry, tmp.path());
@@ -665,7 +667,8 @@ mod tests {
             },
             &ctx,
             Some(&runtime),
-        );
+        )
+        .await;
         assert!(result.is_error);
         assert_eq!(
             result.text,
@@ -673,8 +676,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_project_scoped_configure_writes_the_settings_file() {
+    #[tokio::test]
+    async fn a_project_scoped_configure_writes_the_settings_file() {
         let tmp = TempDir::new().unwrap();
         let registry = registry();
         let ctx = cmd_ctx(&registry, tmp.path());
@@ -689,7 +692,8 @@ mod tests {
             },
             &ctx,
             Some(&runtime),
-        );
+        )
+        .await;
         assert!(!result.is_error, "{}", result.text);
         assert!(result.text.starts_with(
             "Subagent watchdog children model configured: anthropic/claude-opus-4-8."
@@ -704,8 +708,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn an_unknown_action_is_an_error_result_not_a_panic() {
+    #[tokio::test]
+    async fn an_unknown_action_is_an_error_result_not_a_panic() {
         let tmp = TempDir::new().unwrap();
         let registry = registry();
         let ctx = cmd_ctx(&registry, tmp.path());
@@ -714,13 +718,14 @@ mod tests {
             &WatchdogToolParams::default(),
             &ctx,
             None,
-        );
+        )
+        .await;
         assert!(result.is_error);
         assert_eq!(result.text, "Unknown watchdog action: watchdog.nope");
     }
 
-    #[test]
-    fn a_bad_model_id_comes_back_as_an_action_failure() {
+    #[tokio::test]
+    async fn a_bad_model_id_comes_back_as_an_action_failure() {
         let tmp = TempDir::new().unwrap();
         let registry = registry();
         let ctx = cmd_ctx(&registry, tmp.path());
@@ -730,7 +735,8 @@ mod tests {
             &params(Some("anthropic/does-not-exist"), None),
             &ctx,
             Some(&runtime),
-        );
+        )
+        .await;
         assert!(result.is_error);
         assert!(
             result
@@ -739,8 +745,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn status_and_check_report_an_absent_runtime_rather_than_failing() {
+    #[tokio::test]
+    async fn status_and_check_report_an_absent_runtime_rather_than_failing() {
         let tmp = TempDir::new().unwrap();
         let registry = registry();
         let ctx = cmd_ctx(&registry, tmp.path());
@@ -749,7 +755,8 @@ mod tests {
             &WatchdogToolParams::default(),
             &ctx,
             None,
-        );
+        )
+        .await;
         assert!(status.is_error);
         assert_eq!(status.text, "Subagent watchdog runtime is unavailable.");
         let check = handle_watchdog_tool_action(
@@ -757,7 +764,8 @@ mod tests {
             &WatchdogToolParams::default(),
             &ctx,
             None,
-        );
+        )
+        .await;
         assert!(
             !check.is_error,
             "check reports the absence as content, not an error"
@@ -786,8 +794,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn recommend_model_reports_the_unavailable_case_as_an_action_failure() {
+    #[tokio::test]
+    async fn recommend_model_reports_the_unavailable_case_as_an_action_failure() {
         let tmp = TempDir::new().unwrap();
         let registry = Registry(Vec::new());
         let ctx = cmd_ctx(&registry, tmp.path());
@@ -796,7 +804,8 @@ mod tests {
             &WatchdogToolParams::default(),
             &ctx,
             None,
-        );
+        )
+        .await;
         assert!(result.is_error);
         assert!(result.text.starts_with(
             "Subagent watchdog action failed: No authenticated strong complementary watchdog model"
