@@ -74,6 +74,12 @@ pub enum ConfigError {
     /// panic payload when there is one.
     #[error("lock acquisition for {path} failed to run to completion: {message}")]
     LockTaskFailed { path: PathBuf, message: String },
+    /// [`crate::lock::BlockingFileLock::acquire`]'s bound ran out with a peer still holding the
+    /// lock. pi-subagents' sentence verbatim (`src/shared/file-lease.ts:69` @ad11b7ab):
+    /// `` throw new Error(`Timed out waiting for another process to finish updating ${absolute}.`) ``
+    /// — `path` is that `absolute`.
+    #[error("Timed out waiting for another process to finish updating {}.", path.display())]
+    LockTimeout { path: PathBuf },
     #[error("cancelled")]
     Cancelled,
     #[error(transparent)]

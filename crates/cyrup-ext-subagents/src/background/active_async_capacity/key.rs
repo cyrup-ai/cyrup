@@ -177,6 +177,20 @@ pub struct ActiveAsyncCapacityOwner {
     /// field. Absent, the ladder degrades to bare liveness — never to a wrong `Dead`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runner_process_start_identity: Option<ProcessStartIdentity>,
+    /// SUBA-194 — the PID-namespace scope
+    /// ([`crate::background::reconcile::current_pid_namespace_scope`]) of the process that bound
+    /// [`Self::runner_pid`], read at the bind, because that pid is the BINDER's view of the
+    /// spawned runner and means nothing in another namespace.
+    ///
+    /// cyrup's own, like the pid it qualifies: upstream's owner carries no pid
+    /// (`active-async-capacity.ts:17-31` @ad11b7ab), so it has no owner-pid rung to guard. It is
+    /// the owner-side twin of `RunStatus::pid_namespace_scope`, and the release verdict's
+    /// owner-pid rung refuses to probe [`Self::runner_pid`] when it differs from the observer's,
+    /// exactly as upstream refuses to probe `status.pid` (`:255-256`). `None` on a slot written by
+    /// an older build or off Linux; absent, the rung probes as before, which is upstream's own
+    /// `status.pidNamespaceScope !== undefined` reading of an unrecorded scope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runner_pid_namespace_scope: Option<String>,
     /// pi `runnerStartedAt` (`:28`), unchanged — epoch milliseconds of the bind above.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runner_started_at: Option<i64>,

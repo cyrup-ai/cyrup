@@ -322,7 +322,8 @@ impl SubagentsExtension {
         let profile = crate::registration::profiles::load_profile(&profiles_dir, name)?;
         let worker_model = crate::registration::profiles::profile_worker_model(&profile);
         let settings_path = self.user_settings_path();
-        crate::registration::profiles::apply_profile_to_settings_file(&settings_path, &profile)?;
+        crate::registration::profiles::apply_profile_to_settings_file(&settings_path, &profile)
+            .await?;
 
         let profile_path = crate::registration::profiles::profile_path(&profiles_dir, name)?;
         let mut lines = vec![

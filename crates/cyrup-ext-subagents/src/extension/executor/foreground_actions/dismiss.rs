@@ -131,7 +131,20 @@ impl SubagentExecutor {
         let live_controller = self.has_workflow_controller(&status.run_id)
             || self.has_workflow_controller(&RunId::from_token(target.to_string()))
             || status.pid.is_some_and(|pid| {
-                crate::background::reconcile::check_pid_liveness(pid).is_possibly_alive()
+                // SUBA-222 (the SUBA-194 family) — a pid recorded in ANOTHER PID namespace is not
+                // probed: from here its `ESRCH` is not death, so its liveness is unknown and
+                // `Unknown` is "possibly alive" exactly as the probe's own `Unknown` is. pi's
+                // readers of `status.pid` refuse the same way (`await-async-run.ts:21-22`,
+                // `active-async-capacity.ts:255-256` @ad11b7ab); this probe is cyrup's own (the
+                // `[CYRUP-DELTA]` above), so the guard is too.
+                status
+                    .pid_namespace_scope
+                    .as_deref()
+                    .is_some_and(|recorded| {
+                        crate::background::reconcile::current_pid_namespace_scope().as_deref()
+                            != Some(recorded)
+                    })
+                    || crate::background::reconcile::check_pid_liveness(pid).is_possibly_alive()
             });
         if live_controller {
             return Err(format!(

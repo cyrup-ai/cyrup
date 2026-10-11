@@ -141,8 +141,8 @@ pub use schedule::{
     parse_schedule_timestamp, parse_scheduled_run_time, schedule_timestamp,
 };
 pub use store::{
-    ACTIVE_LOCK_FILE, EVENTS_FILE, HISTORY_FILE, RUNS_SUBDIR, SCHEDULE_FILE, ScheduleStore,
-    ScheduleStoreError, project_key, scheduled_run_store_path,
+    ACTIVE_LOCK_FILE, DEFAULT_HISTORY_LEASE_WAIT, EVENTS_FILE, HISTORY_FILE, RUNS_SUBDIR,
+    SCHEDULE_FILE, ScheduleStore, ScheduleStoreError, project_key, scheduled_run_store_path,
 };
 pub use tool::{
     SCHEDULED_RUN_ACTIONS, SCHEDULED_RUNS_DISABLED, ScheduledRunAction, ScheduledRunActionContext,
@@ -151,8 +151,9 @@ pub use tool::{
 };
 pub use trigger::{
     DEFAULT_MAX_PENDING, SCHEDULE_TICK, STALE_LAUNCH_CLAIM_ERROR, STALE_LAUNCH_CLAIM_MS,
-    ScheduleFireContext, ScheduleLaunchOutcome, ScheduleLaunchRequest, ScheduleLauncher,
-    ScheduleRunCompletion, ScheduleSessionSnapshot, due_planned_at, finish_run,
+    ScheduleBackoff, ScheduleFireContext, ScheduleLaunchOutcome, ScheduleLaunchRequest,
+    ScheduleLauncher, ScheduleRunCompletion, ScheduleSessionSnapshot, due_planned_at, finish_run,
     has_pending_schedule_work, launch, next_after, next_run_at, normalized_session_file,
     record_missed, restore, restore_one, schedule_belongs_to_session, tick_due_schedules,
+    tick_timer_due_schedules,
 };

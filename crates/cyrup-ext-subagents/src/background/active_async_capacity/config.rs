@@ -122,6 +122,7 @@ pub struct CapacityOptions {
     now: Arc<dyn Fn() -> i64 + Send + Sync>,
     pid_liveness: Arc<dyn Fn(u32) -> Liveness + Send + Sync>,
     pid_start_identity: Arc<dyn Fn(u32) -> Option<ProcessStartIdentity> + Send + Sync>,
+    pid_namespace_scope: Arc<dyn Fn() -> Option<String> + Send + Sync>,
 }
 
 impl std::fmt::Debug for CapacityOptions {
@@ -150,6 +151,9 @@ impl CapacityOptions {
             now: Arc::new(crate::time::now_epoch_millis),
             pid_liveness: Arc::new(crate::background::reconcile::check_pid_liveness),
             pid_start_identity: Arc::new(crate::background::session_lease::process_start_identity),
+            pid_namespace_scope: Arc::new(
+                crate::background::reconcile::current_pid_namespace_scope,
+            ),
         }
     }
 
@@ -205,6 +209,23 @@ impl CapacityOptions {
         self
     }
 
+    /// Overrides the observer's PID-namespace scope (pi `options.pidNamespaceScope`, `:48`
+    /// @ad11b7ab — `pidNamespaceScope?: () => string | undefined;`), which defaults to
+    /// [`crate::background::reconcile::current_pid_namespace_scope`] exactly as upstream's
+    /// `(options.pidNamespaceScope ?? currentPidNamespaceScope)()` does (`:256`).
+    ///
+    /// SUBA-194: injected for the same reason the liveness probe is — a test cannot move itself
+    /// into another PID namespace, and the cross-namespace rung is only distinguishable from the
+    /// `Dead` rung beneath it when the observer's scope can be chosen.
+    #[must_use]
+    pub fn with_pid_namespace_scope(
+        mut self,
+        scope: Arc<dyn Fn() -> Option<String> + Send + Sync>,
+    ) -> Self {
+        self.pid_namespace_scope = scope;
+        self
+    }
+
     /// The capacity root every pool hangs off — pi `options.rootDir ?? ACTIVE_ASYNC_CAPACITY_DIR`.
     #[must_use]
     pub fn root_dir(&self) -> &Path {
@@ -233,6 +254,15 @@ impl CapacityOptions {
     #[must_use]
     pub fn pid_start_identity(&self, pid: u32) -> Option<ProcessStartIdentity> {
         (self.pid_start_identity)(pid)
+    }
+
+    /// This observer's PID-namespace scope — `None` off Linux or when `/proc/self/ns/pid` cannot
+    /// be read. A pid recorded under a different scope (or under any scope, when this is `None`)
+    /// cannot be probed from here; see
+    /// [`super::inspect::abandoned_runner_release_verdict`]'s namespace rung.
+    #[must_use]
+    pub fn pid_namespace_scope(&self) -> Option<String> {
+        (self.pid_namespace_scope)()
     }
 
     /// Classifies `pid` — **[`Liveness::Unknown`] is never death**, see
