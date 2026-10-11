@@ -142,6 +142,8 @@ impl Drop for PreparedPrompt {
 /// so an already-existing directory is an ERROR, not a silent reuse. That is load-bearing: the
 /// handoff directory must be one this run created, never one that was lying around.
 fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+    // Only unix sets a mode on it.
+    #[cfg_attr(not(unix), allow(unused_mut))]
     let mut builder = std::fs::DirBuilder::new();
     #[cfg(unix)]
     {

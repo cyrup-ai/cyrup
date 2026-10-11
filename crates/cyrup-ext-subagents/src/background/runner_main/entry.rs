@@ -4,9 +4,10 @@
 //! `background/runner_main.rs`; ports pi `runs/background/subagent-runner.ts`.
 
 use super::config::{RunnerConfig, effective_run_paths, load_runner_config};
+#[cfg(unix)]
+use super::control_watcher::install_ignored_sigusr2_handler;
 use super::control_watcher::{
-    init_control_flags, install_ignored_sigusr2_handler, spawn_control_watcher,
-    spawn_deadline_checkpoint,
+    init_control_flags, spawn_control_watcher, spawn_deadline_checkpoint,
 };
 use super::events::open_run_events;
 use super::finish::{WorkflowResultFields, finish_run, settle_loop_outcome};

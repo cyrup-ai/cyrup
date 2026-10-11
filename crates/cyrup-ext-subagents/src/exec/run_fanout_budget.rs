@@ -984,9 +984,26 @@ fn read_admission_lock_owner(lock_path: &Path) -> Option<AdmissionLockOwner> {
 /// file is unreadable and the directory's mtime is older than [`ADMISSION_LOCK_STALE_MS`]) may the
 /// lock be reclaimed. `EPERM` from the liveness probe means a live process owned by another user,
 /// so it counts as alive.
+///
+/// `[CYRUP-DELTA]` (SUBA-230) — where the owner's pid cannot be probed (off unix: see
+/// [`process_is_alive`]), the lock is judged by the rule upstream applies to an unreadable owner,
+/// its age. Upstream holds the lock for one synchronous critical section, so a lock older than
+/// [`ADMISSION_LOCK_STALE_MS`] has outlived its owner. Calling the owner alive instead would wedge
+/// the lock for good after a crash, and calling it dead would let two admissions in at once.
 fn admission_lock_is_stale(lock_path: &Path) -> Result<bool, RunFanoutError> {
-    if let Some(owner) = read_admission_lock_owner(lock_path) {
-        return Ok(!process_is_alive(owner.pid));
+    admission_lock_is_stale_with(lock_path, process_is_alive)
+}
+
+/// [`admission_lock_is_stale`] with the liveness probe passed in, so the rule for an owner that
+/// cannot be probed is testable on a host that can probe.
+fn admission_lock_is_stale_with(
+    lock_path: &Path,
+    probe: impl Fn(i32) -> Option<bool>,
+) -> Result<bool, RunFanoutError> {
+    if let Some(owner) = read_admission_lock_owner(lock_path)
+        && let Some(alive) = probe(owner.pid)
+    {
+        return Ok(!alive);
     }
     match std::fs::metadata(lock_path).and_then(|meta| meta.modified()) {
         Ok(modified) => Ok(modified
@@ -1005,11 +1022,25 @@ fn admission_lock_is_stale(lock_path: &Path) -> Result<bool, RunFanoutError> {
 /// `[CYRUP-DELTA]` — `nix::sys::signal::kill(pid, None)`, because this crate is
 /// `#![forbid(unsafe_code)]`. `EPERM` is "alive but not ours", exactly as upstream's
 /// `code !== "EPERM"` test decides.
-fn process_is_alive(pid: i32) -> bool {
-    match nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None) {
-        Ok(()) => true,
-        Err(nix::errno::Errno::EPERM) => true,
-        Err(_) => false,
+///
+/// `None` off unix (SUBA-230): there is no safe probe there (`nix` has none, and node's
+/// `process.kill(pid, 0)` opens the process through the Win32 API), so the caller decides without
+/// one — see [`admission_lock_is_stale`].
+fn process_is_alive(pid: i32) -> Option<bool> {
+    #[cfg(unix)]
+    {
+        Some(
+            match nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None) {
+                Ok(()) => true,
+                Err(nix::errno::Errno::EPERM) => true,
+                Err(_) => false,
+            },
+        )
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        None
     }
 }
 
@@ -1133,6 +1164,8 @@ fn create_dir_all_private(dir: &Path) -> std::io::Result<()> {
 /// `fs.mkdirSync(path, { mode: 0o700 })` — NOT recursive, so an existing directory is `EEXIST`.
 /// That is the lock primitive itself, so the non-recursive form is load-bearing.
 fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+    // Only unix sets a mode on it.
+    #[cfg_attr(not(unix), allow(unused_mut))]
     let mut builder = std::fs::DirBuilder::new();
     #[cfg(unix)]
     {
@@ -1502,6 +1535,9 @@ mod tests {
         assert!(lock_path.exists());
     }
 
+    /// Needs a pid probe to call the owner dead; off unix the lock is judged by its age instead
+    /// (the two tests after this one).
+    #[cfg(unix)]
     #[test]
     fn a_dead_owners_lock_is_stale_and_is_reclaimed() {
         let root = tempfile::tempdir().unwrap();
@@ -1523,6 +1559,48 @@ mod tests {
         assert_eq!(snapshot.used, 1);
         // The reclaiming holder released its own lock on the way out.
         assert!(!lock_path.exists());
+    }
+
+    /// A lock owned by `pid`, last modified `age` ago.
+    fn owned_lock_aged(age: Duration) -> (tempfile::TempDir, PathBuf) {
+        let root = tempfile::tempdir().unwrap();
+        let descriptor = create_run_fanout_budget_in(root.path(), "run-1", 2).unwrap();
+        let lock_path = descriptor.directory.join("admission.lock");
+        create_private_dir(&lock_path).unwrap();
+        write_private_file(
+            &lock_path.join("owner.json"),
+            &serde_json::to_string(&AdmissionLockOwner {
+                pid: 4242,
+                token: "unprobeable".to_string(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::File::open(&lock_path)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - age)
+            .unwrap();
+        (root, lock_path)
+    }
+
+    /// SUBA-230 — where the owner's pid cannot be probed (Windows), a lock taken moments ago is
+    /// held: the owner is mid-admission, and calling it dead would let two admissions in at once.
+    /// Red with the unprobeable owner taken as dead.
+    #[test]
+    fn an_unprobeable_owners_fresh_lock_is_held() {
+        let (_root, lock_path) = owned_lock_aged(Duration::ZERO);
+        assert!(!admission_lock_is_stale_with(&lock_path, |_| None).unwrap());
+    }
+
+    /// SUBA-230 — and a lock that has outlived [`ADMISSION_LOCK_STALE_MS`] is reclaimed, as upstream
+    /// reclaims one whose owner it cannot read: upstream holds the lock for one synchronous critical
+    /// section, so the owner is gone. Red with the unprobeable owner taken as alive — the lock a
+    /// crashed owner leaves would then wedge every later admission.
+    #[test]
+    fn an_unprobeable_owners_old_lock_is_stale() {
+        let (_root, lock_path) =
+            owned_lock_aged(Duration::from_millis(ADMISSION_LOCK_STALE_MS + 5_000));
+        assert!(admission_lock_is_stale_with(&lock_path, |_| None).unwrap());
     }
 
     /// Upstream releases the admission lock in a `finally` (`run-fanout-budget.ts:201-204`), so an
