@@ -443,17 +443,20 @@ Its *cyrup at HEAD* paragraph describes the base, where no `tools/call` carried 
     still forwarded.
   - These call the new API and so do not compile at the base. Each is proved by the mutations
     below.
-- **Mutation-proved.** Each mutation restores byte-identical, sha256-checked, and each turns a
-  named test red:
-  - drop the stamp;
-  - drop the id at `call_direct`;
-  - drop the id at `McpTool::execute`;
-  - treat an empty id as an origin;
+- **Mutation-proved.** 21 runs, each restored byte-identical (sha256-checked), and each turned a
+  named test red. Unit tests and `cyrup-it` tests were run separately for each mutation:
+  - drop the stamp (the wire test, the ungated direct test, and the three `cyrup-it` id tests);
+  - drop the id at `call_direct` (the ungated direct test, `cyrup-it` direct and search);
+  - drop the id at `McpTool::execute` (the gateway unit test, `cyrup-it` gateway);
+  - treat an empty id as an origin (the unit test, `cyrup-it` no-id);
   - treat `/1` as an origin;
+  - restore the reviewed over-match, treating every `/`-prefixed id as anonymous (the `/calls/42`
+    cases);
   - replace the existing `_meta` instead of merging;
-  - misspell the key;
+  - misspell the key (every key assertion, unit and `cyrup-it`);
   - change the nested form;
-  - and, for `MCP-614`, report a search load without applying it.
+  - and, for `MCP-614`, report a search load without applying it to the active set (the
+    next-request assertion).
 
 Filed 2026-10-03 from the post-pin triage (pi v1.0.1 / pi-mcp-adapter v5.0.0). The 2026-10-02 pass
 ruled `4b7e310` "Already ported; verified on both sides" on the evidence that
