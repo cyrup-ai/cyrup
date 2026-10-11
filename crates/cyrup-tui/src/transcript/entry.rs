@@ -94,6 +94,18 @@ pub enum Entry {
     /// a bold-accent `title`, a blank, the `markdown` body, then a bottom `DynamicBorder`
     /// (interactive-mode.ts:5502-5507).
     Block { title: String, markdown: String },
+    /// The "What's New" STARTUP notice (`interactive-mode.ts:849-870`), which is NOT
+    /// [`Self::Block`] even though both are border sandwiches — TUI-011.
+    ///
+    /// Two differences, both upstream's: the notice's markdown takes `paddingY = 0` where
+    /// `/changelog`'s takes `1` (`:866` against `:6790`) and it is followed by its own `Spacer(1)`
+    /// (`:868`); and under `collapseChangelog` it collapses to ONE line —
+    /// `Updated to v{latest}. Use /changelog to view full changelog.` (`:858-860`) — with
+    /// `/changelog` BOLD (`theme.bold`), which a markdown body cannot express as a span.
+    ///
+    /// `condensed` carries that choice at push time because the setting is read when the notice is
+    /// built (`:857`), not when it is drawn.
+    ChangelogNotice { markdown: String, condensed: bool },
     /// A finished `!`/`!!` bash execution (`bash-execution.ts`): the command header + output block,
     /// committed to scrollback when the process exits.
     Bash(BashExecution),

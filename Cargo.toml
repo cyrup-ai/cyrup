@@ -138,7 +138,7 @@ default-members = [
 ]
 
 [workspace.package]
-version = "0.0.0"
+version = "0.1.0"
 edition = "2024"
 rust-version = "1.96"          # track installed stable (edition 2024 needs >=1.85)
 license = "MIT"
@@ -169,62 +169,62 @@ private_intra_doc_links = "allow"
 
 [workspace.dependencies]
 # --- in-workspace crates (lockstep version) ---
-cyrup-core         = { path = "crates/cyrup-core",         version = "0.0.0" }
-cyrup-provider     = { path = "crates/cyrup-provider",     version = "0.0.0" }
-cyrup-agent        = { path = "crates/cyrup-agent",        version = "0.0.0" }
-cyrup-tools        = { path = "crates/cyrup-tools",        version = "0.0.0" }
-cyrup-session      = { path = "crates/cyrup-session",      version = "0.0.0" }
-cyrup-config       = { path = "crates/cyrup-config",       version = "0.0.0" }
-cyrup-ext          = { path = "crates/cyrup-ext",          version = "0.0.0" }
-cyrup-resources    = { path = "crates/cyrup-resources",    version = "0.0.0" }
-cyrup-tui          = { path = "crates/cyrup-tui",          version = "0.0.0" }
-cyrup-modes        = { path = "crates/cyrup-modes",        version = "0.0.0" }
-cyrup-sdk          = { path = "crates/cyrup-sdk",          version = "0.0.0" }
-cyrup-session-svc  = { path = "crates/cyrup-session-svc",  version = "0.0.0" }
-cyrup-ext-subagents = { path = "crates/cyrup-ext-subagents", version = "0.0.0" }
+cyrup-core         = { path = "crates/cyrup-core",         version = "0.1.0" }
+cyrup-provider     = { path = "crates/cyrup-provider",     version = "0.1.0" }
+cyrup-agent        = { path = "crates/cyrup-agent",        version = "0.1.0" }
+cyrup-tools        = { path = "crates/cyrup-tools",        version = "0.1.0" }
+cyrup-session      = { path = "crates/cyrup-session",      version = "0.1.0" }
+cyrup-config       = { path = "crates/cyrup-config",       version = "0.1.0" }
+cyrup-ext          = { path = "crates/cyrup-ext",          version = "0.1.0" }
+cyrup-resources    = { path = "crates/cyrup-resources",    version = "0.1.0" }
+cyrup-tui          = { path = "crates/cyrup-tui",          version = "0.1.0" }
+cyrup-modes        = { path = "crates/cyrup-modes",        version = "0.1.0" }
+cyrup-sdk          = { path = "crates/cyrup-sdk",          version = "0.1.0" }
+cyrup-session-svc  = { path = "crates/cyrup-session-svc",  version = "0.1.0" }
+cyrup-ext-subagents = { path = "crates/cyrup-ext-subagents", version = "0.1.0" }
 # WORKFLOW_1 §7: the workflowScript deno_core extension (ops + prelude.js), split out of
 # `cyrup-ext-subagents` so a build script can snapshot it — a build.rs can never import from the
 # crate whose build it is running. See `crates/cyrup-workflow-runtime/src/lib.rs`'s module doc.
-cyrup-workflow-runtime = { path = "crates/cyrup-workflow-runtime", version = "0.0.0" }
-cyrup-permission-system = { path = "crates/cyrup-permission-system", version = "0.0.0" }
-cyrup-intercom     = { path = "crates/cyrup-intercom",     version = "0.0.0" }
+cyrup-workflow-runtime = { path = "crates/cyrup-workflow-runtime", version = "0.1.0" }
+cyrup-permission-system = { path = "crates/cyrup-permission-system", version = "0.1.0" }
+cyrup-intercom     = { path = "crates/cyrup-intercom",     version = "0.1.0" }
 # The workspace's ONE herdr client (HERDR_NATIVE_CLIENT.md §5). A leaf: it depends on no cyrup
 # crate, so it stays buildable for Windows, where `cyrup-ext-subagents` — which carries `nix` and
 # `libc` ungated — today is not. That target argument is the whole reason; the graph argument that
 # stood here ("either consumer can take it without taking the other") was false, because
 # `crates/cyrup-intercom/Cargo.toml` already depends on `cyrup-ext-subagents`.
-cyrup-herdr        = { path = "crates/cyrup-herdr",        version = "0.0.0" }
-cyrup-flux         = { path = "crates/cyrup-flux",         version = "0.0.0" }
-cyrup-mcp          = { path = "crates/cyrup-mcp",          version = "0.0.0" }
-cyrup-acp          = { path = "crates/cyrup-acp",          version = "0.0.0" }
-cyrup-llama        = { path = "crates/cyrup-llama",        version = "0.0.0" }
+cyrup-herdr        = { path = "crates/cyrup-herdr",        version = "0.1.0" }
+cyrup-flux         = { path = "crates/cyrup-flux",         version = "0.1.0" }
+cyrup-mcp          = { path = "crates/cyrup-mcp",          version = "0.1.0" }
+cyrup-acp          = { path = "crates/cyrup-acp",          version = "0.1.0" }
+cyrup-llama        = { path = "crates/cyrup-llama",        version = "0.1.0" }
 # pi 1.0 `codemode`, engine-independent half: the script source format, the TypeScript declaration
 # renderer, the BM25 tool ranker and the output budget (gap-analysis 18, CODE-003/004/010/012).
-cyrup-codemode     = { path = "crates/cyrup-codemode",     version = "0.0.0" }
-cyrup-codemode-runtime = { path = "crates/cyrup-codemode-runtime", version = "0.0.0" }
+cyrup-codemode     = { path = "crates/cyrup-codemode",     version = "0.1.0" }
+cyrup-codemode-runtime = { path = "crates/cyrup-codemode-runtime", version = "0.1.0" }
 # pi `extensions/tool-search`: the `tool_search` tool and its built-in extension (TOOL-052).
-cyrup-tool-search  = { path = "crates/cyrup-tool-search",  version = "0.0.0" }
+cyrup-tool-search  = { path = "crates/cyrup-tool-search",  version = "0.1.0" }
 # The Pico5 durability kernel's storage layer (ADR-0030 §8). NOTE for every future consumer: this
 # crate exports `EntryId` as `Id<Entry>`, a minted number, while `cyrup_core::EntryId` is an
 # `Arc<str>` session token. Importing both unqualified is E0252; alias at the import rather than
 # widening either type (ADR-0030 open question 8, resolved in `crates/cyrup-pico-store/src/lib.rs`,
 # which is also why this crate must never take an edge to `cyrup-core`).
-cyrup-pico-store   = { path = "crates/cyrup-pico-store",   version = "0.0.0" }
+cyrup-pico-store   = { path = "crates/cyrup-pico-store",   version = "0.1.0" }
 # The Pico5 durability kernel's FUNCTIONAL CORE (ADR-0030 §8): `DocValue`, the operation applier,
 # the replay planner, checkpoint selection, version classification. No `tokio`, no storage, no
 # `Session`, no `async`. The edge runs store -> doc and never the reverse, which is why `DefVersion`
 # lives in this crate and `cyrup-pico-store` re-exports it (see that crate's `lib.rs`).
-cyrup-pico-doc     = { path = "crates/cyrup-pico-doc",     version = "0.0.0" }
+cyrup-pico-doc     = { path = "crates/cyrup-pico-doc",     version = "0.1.0" }
 # The Pico5 durability kernel's JSONL backend (ADR-0030 §8, §9; PICO5-PLAN S7). Declared here so the
 # kernel (S4) and the fault-injection and fork slices (S8, S9) take it the way every other in-workspace
 # crate is taken. Its only non-workspace dependency is `fs4` -- never `cyrup-session`, whose private
 # `SESSION_SYNCER` and `durable_rename` it lifts rather than imports (see that crate's `Cargo.toml`).
-cyrup-pico-store-jsonl = { path = "crates/cyrup-pico-store-jsonl", version = "0.0.0" }
+cyrup-pico-store-jsonl = { path = "crates/cyrup-pico-store-jsonl", version = "0.1.0" }
 # The Pico5 durability kernel's IMPERATIVE SHELL (ADR-0030 §8): `Session`, `SessionMut`, `Committer`,
 # `Tx<S>`, `Draft`, the `Durable`/`Publication` witnesses, adoption and publication. Its eventual
 # consumer is `cyrup-session-svc`, which is NOT extended in place: that crate is the `AgentSession`
 # facade and this kernel's home is its own crate (ADR-0030 §8).
-cyrup-pico         = { path = "crates/cyrup-pico",         version = "0.0.0" }
+cyrup-pico         = { path = "crates/cyrup-pico",         version = "0.1.0" }
 
 # --- standardized external deps (arch-00 §7). Versions are inert until a crate
 #     references them via `dep.workspace = true`; verify/bump on first use. ---

@@ -140,16 +140,31 @@ fn changelog_block_mirrors_the_hotkeys_envelope() {
         rows[top + 3].trim().is_empty(),
         "Markdown paddingY blank:\n{text}"
     );
-    assert_eq!(
-        rows[top + 4],
-        " No changelog entries found.",
-        "body inset by Markdown's paddingX 1:\n{text}"
+    // TUI-011 — this asserted the literal `" No changelog entries found."`, which was the stub's
+    // output and is what the row warned would break "the moment a real CHANGELOG.md exists, because
+    // `rows[top+4]` is then a rendered markdown heading". It is. The row said to DELETE this test;
+    // only its BODY expectation was stub-derived, and the envelope assertions around it are real
+    // coverage of `Entry::Block`'s stack, so the envelope stays and the body now reads reality.
+    assert!(
+        rows[top + 4].starts_with(' ') && rows[top + 4].contains("0.1.0"),
+        "body inset by Markdown's paddingX 1, carrying the newest entry:\n{text}"
+    );
+    // The body is MULTI-LINE now that a real changelog is rendered, so the tail is located rather
+    // than assumed at a fixed offset — which is what the one-line stub allowed.
+    let close = rows
+        .iter()
+        .skip(top + 1)
+        .position(|r| r.trim_end() == rule)
+        .map(|i| i + top + 1)
+        .expect("closing rule");
+    assert!(
+        rows[close - 1].trim().is_empty(),
+        "trailing paddingY blank before the closing rule:\n{text}"
     );
     assert!(
-        rows[top + 5].trim().is_empty(),
-        "trailing paddingY blank:\n{text}"
+        close > top + 5,
+        "the body must occupy real rows between the rules:\n{text}"
     );
-    assert_eq!(rows[top + 6].trim_end(), rule, "closing rule:\n{text}");
 }
 
 #[test]

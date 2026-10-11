@@ -127,10 +127,15 @@ impl<B: Backend> App<B> {
                 self.state.transcript.push_block("Keyboard Shortcuts", body);
                 AppAction::Redraw
             }
+            // `handleChangelogCommand` (`interactive-mode.ts:6774-6793`): every entry, reversed out
+            // of file order, links normalized, in the same border/title/markdown stack
+            // [`Entry::Block`] already ports — and pi's exact `"No changelog entries found."` when
+            // the file carries none (TUI-011; this arm was that literal, unconditionally).
             "changelog" => {
-                self.state
-                    .transcript
-                    .push_block("What's New", "No changelog entries found.");
+                self.state.transcript.push_block(
+                    "What's New",
+                    crate::changelog::command_markdown(crate::changelog::EMBEDDED),
+                );
                 AppAction::Redraw
             }
             "debug" => {
