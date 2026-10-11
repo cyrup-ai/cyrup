@@ -169,6 +169,21 @@ pub struct OverlaySpan {
     /// Reverse video.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub reversed: bool,
+    /// The terminal's real cursor belongs at the FIRST column of this run — pi's `CURSOR_MARKER`
+    /// (`packages/tui/src/tui.ts:196`, `"\x1b_pi:c\x07"`), which a focused component emits inline at
+    /// its cursor position (`components/input.ts:425`, `:481`). TUI-123.
+    ///
+    /// A flag on a span rather than a `cursor() -> Option<(row, col)>` on the trait, because that is
+    /// what upstream's marker IS: the component marks a POSITION IN ITS OWN OUTPUT and the host
+    /// measures the column (`extractCursorPosition`, `tui.ts:1442-1459`, takes
+    /// `visibleWidth(textBeforeMarker)`). An overlay therefore never has to know its own layout,
+    /// which is the property that makes the marker survive whatever width the host painted it at.
+    /// It also crosses the guest boundary, which a trait method could not.
+    ///
+    /// Several spans may carry it; the host takes the LAST one it painted, matching upstream's
+    /// bottom-up scan (`:1444-1446`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cursor: bool,
 }
 
 impl OverlaySpan {
@@ -179,6 +194,18 @@ impl OverlaySpan {
             text: text.into(),
             ..Self::default()
         }
+    }
+
+    /// Mark this run as the one the terminal cursor sits at the start of — see [`Self::cursor`].
+    ///
+    /// A text field emits its cursor cell as its own span so the host can place the real cursor
+    /// there: upstream emits the marker AND a reverse-video cell at the same column
+    /// (`input.ts:425-427`), the block being what the user sees and the hardware cursor being what
+    /// IME composition and assistive tech follow.
+    #[must_use]
+    pub fn with_cursor(mut self) -> Self {
+        self.cursor = true;
+        self
     }
 }
 

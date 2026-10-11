@@ -1056,12 +1056,9 @@ impl NativeExtension for LlamaExtension {
         .with_sync_timeout(self.sync_timeout);
         // `showLlamaUi` (`index.ts:192`). With no interactive surface the flow never starts, which
         // is what `ctx.ui.custom` does without a UI.
-        let _ = show_llama_ui(
-            host,
-            LlamaKeys::from_agent_dir(&self.agent_dir),
-            |ui| async move { flow.run(ui).await },
-        )
-        .await;
+        // TUI-126 — resolved before `host` is moved into the call below.
+        let keys = LlamaKeys::from_host(host.as_ref(), &self.agent_dir);
+        let _ = show_llama_ui(host, keys, |ui| async move { flow.run(ui).await }).await;
         Ok(None)
     }
 }

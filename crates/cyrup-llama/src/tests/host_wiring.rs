@@ -454,3 +454,83 @@ async fn the_stored_catalog_is_the_chat_models_then_the_classifiers() {
         .expect("a snapshot was taken");
     assert_eq!(unchecked.checked_at, 0, "no check time reads as 0");
 }
+
+// --------------------------------------------------------- the host's effective keybinding table
+
+/// A host that answers one keybinding table, recording which namespace it was asked for.
+#[derive(Default)]
+struct KeyTableHost {
+    table: serde_json::Map<String, serde_json::Value>,
+    asked: Mutex<Vec<String>>,
+}
+
+impl HostServices for KeyTableHost {
+    fn effective_keybindings(&self, namespace: &str) -> serde_json::Value {
+        self.asked.lock().unwrap().push(namespace.to_string());
+        // The host filters by id PREFIX (`KeybindingMirror::bindings`), so the stub does too —
+        // answering the whole table regardless of the namespace would hide the bug this pins.
+        let mut prefix = namespace.to_string();
+        prefix.push('.');
+        let filtered: serde_json::Map<String, serde_json::Value> = self
+            .table
+            .iter()
+            .filter(|(id, _)| id.starts_with(&prefix))
+            .map(|(id, keys)| (id.clone(), keys.clone()))
+            .collect();
+        serde_json::Value::Object(filtered)
+    }
+}
+
+/// TUI-126 — `/llama` resolves its keys from the HOST's live table, and the read must cover every
+/// namespace its own ids live in.
+///
+/// `Binding::InputSubmit` is `tui.input.submit`, which the host binds in its EDITOR keymap. A
+/// read that named `tui.editor` and `tui.select` would therefore drop it: the id is not under the
+/// `tui.editor.` prefix. One read of `tui` covers all three groups.
+#[test]
+fn llama_keys_read_every_namespace_its_own_ids_live_in() {
+    let mut table = serde_json::Map::new();
+    table.insert("tui.input.submit".into(), json!(["ctrl+s"]));
+    table.insert("tui.editor.undo".into(), json!(["alt+z"]));
+    table.insert("tui.select.cancel".into(), json!(["ctrl+q"]));
+    // An id this overlay does not know, which must be dropped rather than fail the parse.
+    table.insert("tui.altScreen.bottom".into(), json!(["end"]));
+    let host = KeyTableHost {
+        table,
+        asked: Mutex::default(),
+    };
+
+    let keys = crate::ui::LlamaKeys::from_host(&host, std::path::Path::new("/nonexistent"));
+
+    assert_eq!(
+        keys.key_text(crate::ui::Binding::InputSubmit),
+        "ctrl+s",
+        "the `tui.input.*` rebind reached the overlay"
+    );
+    assert_eq!(keys.key_text(crate::ui::Binding::EditorUndo), "alt+z");
+    assert_eq!(keys.key_text(crate::ui::Binding::SelectCancel), "ctrl+q");
+}
+
+/// A host that answers nothing — the trait default, which is every non-TUI embedder — falls back to
+/// the user's file, so the overlay keeps working outside the interactive app.
+#[test]
+fn an_empty_host_table_falls_back_to_the_agent_dir() {
+    #[derive(Default)]
+    struct SilentHost;
+    impl HostServices for SilentHost {}
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("keybindings.json"),
+        r#"{ "tui.input.submit": ["ctrl+j"] }"#,
+    )
+    .unwrap();
+
+    let keys = crate::ui::LlamaKeys::from_host(&SilentHost, dir.path());
+
+    assert_eq!(
+        keys.key_text(crate::ui::Binding::InputSubmit),
+        "ctrl+j",
+        "the file read is still the fallback"
+    );
+}

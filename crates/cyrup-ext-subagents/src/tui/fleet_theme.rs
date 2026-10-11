@@ -520,6 +520,10 @@ pub fn to_overlay_span(span: &Span<'_>) -> OverlaySpan {
         italic: m.contains(Modifier::ITALIC),
         underlined: m.contains(Modifier::UNDERLINED),
         reversed: m.contains(Modifier::REVERSED),
+        // A ratatui `Span` has no cursor concept to convert, so a converted span never claims the
+        // cursor (TUI-123); an overlay that wants one sets it with `OverlaySpan::with_cursor`.
+        // The rest comes from `Default` because that struct's fields are additive by contract.
+        ..OverlaySpan::default()
     }
 }
 

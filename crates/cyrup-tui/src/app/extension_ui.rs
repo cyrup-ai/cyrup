@@ -225,6 +225,9 @@ impl<B: Backend> App<B> {
         // omission — pi constructs its one `FooterDataProvider` in `interactive-mode.ts:611`
         // @v0.87.1 and in no other mode.
         services.attach_footer_data_mirror(self.state.footer_data_mirror.clone());
+        // TUI-126 — the keymap member of this seam. Attached here, with the others, so it is
+        // re-attached against every swapped-in session.
+        services.attach_keybinding_mirror(self.state.keybinding_mirror.clone());
         let access = Arc::new(crate::theme_access::TuiThemeAccess::new(
             resources,
             &self.state.theme.name,
@@ -259,6 +262,32 @@ impl<B: Backend> App<B> {
         // [`App::editor_has_keyboard_focus`].
         let has_focus = self.editor_has_keyboard_focus();
         self.state.editor_focus_mirror.publish(has_focus);
+        // TUI-126 — the four namespaces `HostServices::effective_keybindings` answers. Republished
+        // per frame like the buffer above, because a `/keybindings` reload or a `merge_json` mutates
+        // these in place and an extension must not be left holding the pre-rebind table.
+        // TUI-126 — the whole effective table, flat, keyed by full action id. Every namespace the app
+        // owns is published, not just the two `/llama` reads, so an extension asking for any of them
+        // gets the live answer; `KeybindingMirror::bindings` filters by id prefix.
+        // `AutocompleteKeymap` is absent deliberately: the popup has no upstream ids (see
+        // `app/shell.rs`'s note on it), so it contributes none.
+        let mut table = serde_json::Map::new();
+        for map in [
+            self.state.keymap.bindings_json(),
+            self.state.editor.keymap_ref().bindings_json(),
+            self.state.select_keymap.bindings_json(),
+            self.state.tree_keymap.bindings_json(),
+            self.state.models_keymap.bindings_json(),
+            self.state.session_keymap.bindings_json(),
+            self.state.thinking_keymap.bindings_json(),
+            self.alt_keymap.bindings_json(),
+        ] {
+            if let serde_json::Value::Object(entries) = map {
+                table.extend(entries);
+            }
+        }
+        self.state
+            .keybinding_mirror
+            .publish(serde_json::Value::Object(table));
         if let Some(access) = self.state.theme_access.as_ref() {
             access.publish_active(&self.state.theme.name);
             if let Some(controller) = self.state.theme_controller.as_ref() {

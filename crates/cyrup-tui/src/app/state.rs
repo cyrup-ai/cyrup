@@ -83,6 +83,10 @@ pub struct AppState {
     /// the terminal (`ColorMode::detect` / the `ThemeController`); a live `/theme` switch re-projects
     /// the new theme through it so 256-color terminals keep indexed colors after a switch.
     pub color_mode: ColorMode,
+    /// The extension-visible keybinding tables, republished each frame — TUI-126. Attached to
+    /// `LiveHostServices` at bind time so `HostServices::effective_keybindings` reads the live
+    /// table rather than whatever was on disk when an extension opened.
+    pub keybinding_mirror: cyrup_session_svc::KeybindingMirror,
     pub keymap: Keymap,
     /// The selector binding table (`tui.select.*`, spec/tui/05 §10) consulted while a selector owns
     /// the input slot.
@@ -595,6 +599,7 @@ impl AppState {
             color_mode: theme.color_mode,
             theme,
             keymap: Keymap::default(),
+            keybinding_mirror: cyrup_session_svc::KeybindingMirror::new(),
             select_keymap: SelectKeymap::default(),
             tree_keymap: TreeKeymap::default(),
             session_keymap: SessionKeymap::default(),

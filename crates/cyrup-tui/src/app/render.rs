@@ -243,8 +243,32 @@ fn paint_dock_inner(frame: &mut Frame, state: &mut AppState, regions: &Regions, 
 /// Floating overlays draw last, on top of everything, bottom→top (spec/tui/05 §2; arch-10 §6.4):
 /// each clears its own `Rect` then renders its box.
 pub(crate) fn paint_overlays(frame: &mut Frame, state: &mut AppState, area: Rect) {
+    // TUI-123 — the TOPMOST overlay that asks for a cursor gets it. The editor's own call is
+    // already suppressed while any overlay is open (`show_hardware_cursor && overlays.is_empty()`
+    // above), so the seam for this was in place and unfilled: a text-field overlay drew a
+    // reverse-video cell and the terminal's real cursor stayed wherever the editor left it, which
+    // is what IME composition and assistive tech follow.
+    //
+    // `[CYRUP-DELTA]` upstream POSITIONS the cursor at the marker on every frame and only SHOWS it
+    // when `showHardwareCursor` is on (`positionHardwareCursor`, `tui-main-screen.ts:623-653`:
+    // it always writes the move, then `showCursor()` or `hideCursor()`). ratatui cannot express
+    // "positioned but hidden" — `Frame::set_cursor_position` both places and shows it, and not
+    // calling it hides it, which is the whole gate the editor relies on
+    // (`editor/render.rs:627-633`). So cyrup gates the PLACEMENT on the same flag. The residual:
+    // with the hardware cursor off, IME composition does not follow an extension's text field,
+    // where upstream's would. Closing that needs a backend-level cursor move outside the frame
+    // abstraction, which is a bigger change than this row.
+    let mut cursor = None;
     for overlay in state.overlays.iter_mut() {
         overlay.render(frame, area, &state.theme);
+        if let Some(cell) = overlay.cursor_cell() {
+            cursor = Some(cell);
+        }
+    }
+    if state.editor.show_hardware_cursor()
+        && let Some((x, y)) = cursor
+    {
+        frame.set_cursor_position((x, y));
     }
 }
 
