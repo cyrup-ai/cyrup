@@ -27,8 +27,7 @@ use ratatui::crossterm::event::Event;
 use rustix::event::{PollFd, PollFlags, Timespec};
 use rustix::io::Errno;
 
-use super::decode::{Decoded, decode};
-use super::frame::{Frame, StdinBuffer};
+use super::bytes::ByteDecoder;
 
 /// The read size — crossterm's `TTY_BUFFER_SIZE`, and more than any one keystroke.
 const CHUNK: usize = 1024;
@@ -252,75 +251,6 @@ impl TtyReader {
             if let Some(ev) = self.next_event_timeout(Duration::from_secs(3600))? {
                 return Ok(ev);
             }
-        }
-    }
-}
-
-/// The pure half of the reader: bytes and the clock in, events out. [`TtyReader`] drives it from
-/// the fd; tests drive it directly with injected time.
-#[derive(Debug)]
-pub(crate) struct ByteDecoder {
-    buffer: StdinBuffer,
-    frames: Vec<Frame>,
-}
-
-impl ByteDecoder {
-    /// A decoder holding a lone `ESC` for `escape_timeout`.
-    pub(crate) fn new(escape_timeout: Duration) -> Self {
-        Self {
-            buffer: StdinBuffer::new(escape_timeout),
-            frames: Vec::new(),
-        }
-    }
-
-    /// When a held sequence falls due, if one is held.
-    pub(crate) fn deadline(&self) -> Option<Instant> {
-        self.buffer.deadline()
-    }
-
-    /// One `read(2)` chunk, received at `now`.
-    pub(crate) fn feed(&mut self, bytes: &[u8], now: Instant, out: &mut Vec<Event>) {
-        self.buffer.push(bytes, now, &mut self.frames);
-        self.decode_frames(out);
-    }
-
-    /// Flush the held sequence if its timeout has passed by `now`.
-    pub(crate) fn flush_due(&mut self, now: Instant, out: &mut Vec<Event>) {
-        if self.buffer.deadline().is_some_and(|due| due <= now) {
-            self.buffer.flush(&mut self.frames);
-            self.decode_frames(out);
-        }
-    }
-
-    fn decode_frames(&mut self, out: &mut Vec<Event>) {
-        // The last colour-scheme report of this read. Pi hands a back-to-back burst of them to the
-        // listener as one report whose scheme is the final frame's (`parseTerminalColorScheme
-        // Report`, `terminal-colors.ts:85-91`), so the listener hears it once.
-        let mut reported_scheme = None;
-        for frame in self.frames.drain(..) {
-            // `CSI ? 997 ; N n`, the mode-2031 notification: consumed ahead of every input listener
-            // and every query, exactly like a colour reply (`tui.ts:1048`), and never typing.
-            if let Frame::Seq(bytes) = &frame
-                && let Some(scheme) = crate::color_scheme::offer_report(bytes)
-            {
-                reported_scheme = Some(scheme);
-                continue;
-            }
-            // A colour or DA1 reply that a query still waiting on the terminal owns — one that
-            // arrived after the boot probe's deadline — completes that query here (pi's
-            // `consumeTerminalColorResponse` runs ahead of every input listener, `tui.ts:1045`).
-            // Nothing else is touched: anything the queries do not own is decoded as before.
-            if let Frame::Seq(bytes) = &frame
-                && crate::terminal_query::offer_reply(bytes)
-            {
-                continue;
-            }
-            if let Decoded::Event(ev) = decode(frame) {
-                out.push(ev);
-            }
-        }
-        if let Some(scheme) = reported_scheme {
-            crate::color_scheme::deliver(scheme);
         }
     }
 }

@@ -752,7 +752,6 @@ fn with_hub<T>(f: impl FnOnce(&mut Hub) -> T) -> T {
 }
 
 /// Dispatch one escape sequence on the process-wide hub and make any late delivery.
-#[cfg(unix)]
 fn dispatch_global(frame: &str) -> Dispatch {
     let (outcome, delivery) = with_hub(|hub| hub.dispatch(frame));
     if let Some((late, colors)) = delivery {
@@ -764,7 +763,6 @@ fn dispatch_global(frame: &str) -> Dispatch {
 /// The input reader's hook: offer a framed escape sequence to the queries still waiting on the
 /// terminal. `true` ⇒ it was one of their replies and must not be decoded. Costs one atomic load
 /// when no query is in flight.
-#[cfg(unix)]
 pub(crate) fn offer_reply(sequence: &[u8]) -> bool {
     if !HUB_BUSY.load(Ordering::Acquire) {
         return false;
@@ -1108,13 +1106,22 @@ pub(crate) fn exchange_with(
 /// moments the input reader thread already owns stdin: the reader offers every reply to the hub
 /// ([`offer_reply`]), which absorbs this query's replies and calls `on_colors`.
 ///
-/// A no-op unless stdin and stdout are a terminal in raw mode.
-#[cfg(unix)]
+/// A no-op unless stdin and stdout are a terminal in raw mode — and, on Windows, unless the console
+/// is read as bytes (TUI-163, `crate::input::console_win`): crossterm's console reader cannot route
+/// a reply, and would type it into the prompt.
 pub(crate) fn request_terminal_colors_async(out: impl std::io::Write, on_colors: LateColors) {
-    request_terminal_colors_async_with(out, on_colors, stdin_is_queryable, &GlobalHub);
+    request_terminal_colors_async_with(out, on_colors, replies_are_routed, &GlobalHub);
 }
 
-#[cfg(unix)]
+/// Whether a reply to a query written now reaches the hub through the input reader.
+fn replies_are_routed() -> bool {
+    #[cfg(windows)]
+    if !crate::input::console_win::receives_bytes() {
+        return false;
+    }
+    stdin_is_queryable()
+}
+
 pub(crate) fn request_terminal_colors_async_with(
     mut out: impl std::io::Write,
     on_colors: LateColors,
