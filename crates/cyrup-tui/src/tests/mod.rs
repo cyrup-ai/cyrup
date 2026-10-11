@@ -164,6 +164,7 @@ mod startup_selector_pty;
 mod startup_session_selector;
 mod status_indicator;
 mod stop_reason;
+mod streaming_tool_args;
 mod system_theme_surfaces;
 mod terminal_capability_overrides;
 mod terminal_progress;

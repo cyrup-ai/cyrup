@@ -212,15 +212,29 @@ impl<B: Backend> App<B> {
                 // or as `formatToolExecution`'s full argument dump; the second whether the block
                 // gets the tinted `Box(1, 1)` shell or the tool's own framing (EXT-024).
                 let definition = self.state.known_tool_definitions.get(&tool_name).copied();
-                self.state.transcript.push_tool_start_defined(
-                    tool_name,
-                    Some(tool_call_id.as_str().to_string()),
-                    args,
-                    // The text tier: a `Rendered::Text` is flattened here. A renderer's COMPONENT
-                    // (`Rendered::Tree`) has no flattened form and is attached below.
+                // TUI-165 — the streaming `toolcall*` frames may already have created this row and
+                // been filling its arguments in; pi's `markExecutionStarted` updates the component
+                // it built when the call began streaming rather than building a second one
+                // (`tool-execution.ts:175-178`). Adopt that row when it exists, so one call never
+                // draws two, and only push when this event is the first the TUI heard of the call
+                // (no streaming frames: a replayed `/resume` history, an embedder, a test).
+                let adopted = self.state.transcript.adopt_streamed_run(
+                    tool_call_id.as_str(),
+                    args.clone(),
                     rendered.clone().into_text(),
                     definition,
                 );
+                if !adopted {
+                    self.state.transcript.push_tool_start_defined(
+                        tool_name,
+                        Some(tool_call_id.as_str().to_string()),
+                        args,
+                        // The text tier: a `Rendered::Text` is flattened here. A renderer's COMPONENT
+                        // (`Rendered::Tree`) has no flattened form and is attached below.
+                        rendered.clone().into_text(),
+                        definition,
+                    );
+                }
                 // A tool whose renderer returned a COMPONENT (pi `renderCall` → `Component`) keeps it on
                 // the row; it is laid out on every frame, so the expand toggle and a theme switch
                 // reach it without a re-invocation.
@@ -656,10 +670,18 @@ impl<B: Backend> App<B> {
     /// `ThinkingDelta { delta, .. }` (provider `stream.rs:413`) grows the separate live *reasoning*
     /// block via [`TranscriptView::push_thinking_delta`]; the terminal event commits the message's
     /// authoritative `thinking` blocks ([`thinking_text`]) ahead of the answer text, matching Pi's
-    /// in-order content walk (`assistant-message.ts:115-166`). The remaining non-text frames
-    /// (start/text-start/text-end/thinking-start/thinking-end/toolcall*) carry only the running
-    /// `partial`, whose content already reaches us via the deltas + the terminal, so nothing is
-    /// rendered for them.
+    /// in-order content walk (`assistant-message.ts:115-166`).
+    ///
+    /// The three `toolcall*` frames grow the LIVE TOOL ROW as the model writes the call's argument
+    /// JSON — pi's `updateArgs` per delta and `setArgsComplete` at the end
+    /// (`tool-execution.ts:170-173`, `:181-185`, driven from `interactive-mode.ts:3551`/`:3590`).
+    /// They carry no tool-call id of their own, only a `content_index` into `partial`, so the id and
+    /// name are read out of that block (TUI-165). Before this they fell to the `_` arm and the call
+    /// tree appeared whole at `ToolExecutionStart` instead of filling in.
+    ///
+    /// The remaining non-text frames (start/text-start/text-end/thinking-start/thinking-end) carry
+    /// only the running `partial`, whose content already reaches us via the deltas + the terminal,
+    /// so nothing is rendered for them.
     ///
     /// A terminal whose `stop_reason` is not a clean stop also appends Pi's error-styled
     /// incomplete/failed-turn notice ([`stop_reason_notice`], `assistant-message.ts:175-201`).
@@ -678,6 +700,40 @@ impl<B: Backend> App<B> {
                 if !delta.is_empty() {
                     self.state.transcript.push_thinking_delta(delta);
                 }
+            }
+            // The streaming call's arguments, frame by frame. `ToolCallStart` opens the block and
+            // `ToolCallDelta` extends it; both carry the structured `partial`, whose block at
+            // `content_index` is the `Content::ToolCall` holding the id, the name and the
+            // argument buffer so far (`LazyArgs` yields `{}` for JSON that is still truncated,
+            // which is the right "nothing to show yet" value rather than an error).
+            StreamEvent::ToolCallStart {
+                content_index,
+                partial,
+            }
+            | StreamEvent::ToolCallDelta {
+                content_index,
+                partial,
+                ..
+            } => {
+                if let Some(cyrup_core::Content::ToolCall(tc)) = partial.content.get(*content_index)
+                {
+                    self.state.transcript.push_tool_call_args(
+                        tc.id.as_str(),
+                        &tc.name,
+                        serde_json::Value::Object((*tc.arguments).clone()),
+                        false,
+                    );
+                }
+            }
+            // `setArgsComplete()` (`tool-execution.ts:181-185`): this frame carries the finished
+            // `ToolCall`, so the arguments are authoritative and the flag flips.
+            StreamEvent::ToolCallEnd { tool_call, .. } => {
+                self.state.transcript.push_tool_call_args(
+                    tool_call.id.as_str(),
+                    &tool_call.name,
+                    serde_json::Value::Object((*tool_call.arguments).clone()),
+                    true,
+                );
             }
             // DEFENSIVE, not the live path. `cyrup-agent` `break 'consume`s the moment the stream
             // yields its terminal (`agent.rs:813-820`), so a terminal event is never re-emitted as

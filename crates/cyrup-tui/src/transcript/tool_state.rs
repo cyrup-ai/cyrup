@@ -51,6 +51,10 @@ impl TranscriptView {
             name: name.into(),
             call_id,
             args,
+            // A `ToolExecutionStart`-born run has complete arguments by construction; a run the
+            // streaming frames created already set this and is reused rather than re-pushed (see
+            // [`Self::push_tool_call_args`]).
+            args_complete: true,
             result: None,
             is_error: false,
             done: false,
@@ -66,6 +70,86 @@ impl TranscriptView {
             images: Vec::new(),
             live_expansion: None,
         });
+    }
+
+    /// Fold one streaming tool-call frame onto the live row for `call_id`, creating the row if this
+    /// is the first frame for it — pi's `updateArgs` / `setArgsComplete` pair
+    /// (`tool-execution.ts:170-173`, `:181-185`), driven from the streaming `tool_call` content
+    /// arm (`interactive-mode.ts:3551`, `:3590`).
+    ///
+    /// Upstream creates the `ToolExecutionComponent` the moment the streaming message carries a
+    /// `tool_call` block and only later marks execution started (`markExecutionStarted`, `:175-178`).
+    /// cyrup used to create the row at `ToolExecutionStart`, i.e. once the arguments were already
+    /// complete, so the call tree appeared whole instead of filling in — for codemode that meant the
+    /// script never appeared as it was generated (TUI-165).
+    ///
+    /// Reconciling the two is why this is keyed by `call_id`: the `ToolExecutionStart` that follows
+    /// must find THIS row rather than push a second one for the same call
+    /// ([`Self::adopt_streamed_run`]).
+    pub fn push_tool_call_args(&mut self, call_id: &str, name: &str, args: Value, complete: bool) {
+        self.bump_render_generation();
+        if let Some(run) = self
+            .active_tools
+            .iter_mut()
+            .find(|r| !r.done && r.call_id.as_deref() == Some(call_id))
+        {
+            run.args = args;
+            run.args_complete = complete;
+            // A later frame may name the tool the first one could not (the id and name arrive in
+            // the same partial block, but a provider may open the block before either is known).
+            if run.name.is_empty() && !name.is_empty() {
+                run.name = name.to_string();
+            }
+            return;
+        }
+        self.active_tools.push(ToolRun {
+            name: name.to_string(),
+            call_id: Some(call_id.to_string()),
+            args,
+            args_complete: complete,
+            result: None,
+            is_error: false,
+            done: false,
+            started_at: Some(std::time::Instant::now()),
+            duration_ms: None,
+            recorded_ms: None,
+            rendered_call: None,
+            rendered_result: None,
+            live_call: None,
+            live_result: None,
+            definition: None,
+            preview: None,
+            images: Vec::new(),
+            live_expansion: None,
+        });
+    }
+
+    /// Whether a live row for `call_id` already exists from the streaming frames — the test
+    /// `ToolExecutionStart` uses to adopt it instead of pushing a duplicate. Returns `false` for
+    /// the id-less legacy paths, which have no key to match on.
+    pub(crate) fn adopt_streamed_run(
+        &mut self,
+        call_id: &str,
+        args: Value,
+        rendered: Option<RenderedText>,
+        definition: Option<ToolRenderKind>,
+    ) -> bool {
+        let Some(run) = self
+            .active_tools
+            .iter_mut()
+            .find(|r| !r.done && r.call_id.as_deref() == Some(call_id))
+        else {
+            return false;
+        };
+        // `ToolExecutionStart` carries the authoritative, complete arguments; the streamed partial
+        // it replaces may have been a truncated-JSON `{}`.
+        run.args = args;
+        run.args_complete = true;
+        run.rendered_call = rendered;
+        run.definition = definition;
+        // pi's `markExecutionStarted` restarts nothing: the component was constructed when the call
+        // began streaming, and its elapsed clock runs from there.
+        true
     }
 
     /// Update a running tool's partial result (`ToolExecutionUpdate`): the raw partial result value,
@@ -230,6 +314,7 @@ impl TranscriptView {
                 name,
                 call_id: call_id.map(str::to_string),
                 args: Value::Null,
+                args_complete: true,
                 result,
                 is_error,
                 done: true,
