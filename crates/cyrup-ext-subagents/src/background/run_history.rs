@@ -320,6 +320,8 @@ fn sanitize_history_lines(raw: &str) -> (Vec<String>, bool) {
 /// Open `path` for writing with the private file mode applied on CREATE (pi's `{ mode:
 /// PRIVATE_FILE_MODE }` / the `openSync` mode argument).
 fn private_open_options() -> std::fs::OpenOptions {
+    // Only unix sets a mode on it.
+    #[cfg_attr(not(unix), allow(unused_mut))]
     let mut options = std::fs::OpenOptions::new();
     #[cfg(unix)]
     {

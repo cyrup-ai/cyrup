@@ -1464,10 +1464,12 @@ mod tests {
 /// group that is empty 8ms later was never "not torn down" in any sense a reader cares about. Long
 /// enough to absorb that, short enough that a genuinely surviving subtree is reported promptly —
 /// and it is only ever spent when the answer is going to be negative.
+#[cfg(unix)]
 const PROCESS_GROUP_VERIFY_BUDGET: Duration = Duration::from_millis(250);
 
 /// How often the budget above is re-probed. `kill(-pgid, 0)` is a single syscall with no side
 /// effects, so the interval is chosen for latency rather than cost.
+#[cfg(unix)]
 const PROCESS_GROUP_VERIFY_INTERVAL: Duration = Duration::from_millis(10);
 
 /// What [`verify_process_group_terminated`] could establish about one process group.

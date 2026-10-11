@@ -426,7 +426,7 @@ fn spawn_detached(
     }
     #[cfg(windows)]
     {
-        use std::os::windows::process::CommandExt;
+        // `tokio::process::Command::creation_flags` is inherent; no `CommandExt` is needed.
         command.creation_flags(
             windows_flags::DETACHED_PROCESS | windows_flags::CREATE_NEW_PROCESS_GROUP,
         );

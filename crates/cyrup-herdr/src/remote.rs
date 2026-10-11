@@ -28,18 +28,24 @@
 //! OpenSSH outside `/usr/bin` (Homebrew's, say) needs; a bare name is still resolved through the
 //! hardened `PATH` only.
 //!
-//! Unix-only, like upstream: `connectHerdrMachine` refuses Windows outright (`:120`), because
-//! StreamLocal forwarding is the transport.
+//! Unix-only at run time, like upstream: `connectHerdrMachine` refuses Windows outright (`:120`),
+//! because StreamLocal forwarding is the transport, and [`SshTransport::connect`] does the same
+//! with upstream's message ([`WINDOWS_UNSUPPORTED`]). The module itself builds everywhere, as
+//! upstream's does, so its callers need no platform gate of their own (SUBA-230): the forward's
+//! socket and private-directory helpers are the only unix-specific code, and Windows never reaches
+//! them.
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::client::HerdrClient;
 use crate::env::EnvSource;
+
+/// `connectHerdrMachine`'s refusal on Windows (`herdr-connection.ts:120`), verbatim.
+pub const WINDOWS_UNSUPPORTED: &str = "Pane-native Herdr placement requires OpenSSH StreamLocal forwarding and is not supported on Windows.";
 
 /// `HERDR_REMOTE_PATH` (`herdr-connection.ts:14`) — the `PATH` every remote command runs under.
 pub const HERDR_REMOTE_PATH: &str =
@@ -505,6 +511,9 @@ impl SshTransport {
         target: &str,
         session: Option<&str>,
     ) -> Result<MachineConnection, RemoteError> {
+        if !cfg!(unix) {
+            return Err(RemoteError(WINDOWS_UNSUPPORTED.to_string()));
+        }
         let endpoint = self.discover_endpoint(target, session).await?;
         let dir = private_temp_dir().map_err(|error| {
             RemoteError(format!(
@@ -572,6 +581,7 @@ impl SshTransport {
 /// `metadata` (following a link) rather than upstream's `lstat`: the directory is this process's
 /// own 0700 one, so only this uid could have placed a link there, and a link to a socket is as good
 /// as the socket for `connect(2)`.
+#[cfg(unix)]
 async fn wait_for_socket(
     path: &Path,
     child: &mut tokio::process::Child,
@@ -601,10 +611,22 @@ async fn wait_for_socket(
     ))
 }
 
+/// Off unix a StreamLocal forward cannot exist, and [`SshTransport::connect`] refuses before one is
+/// asked for.
+#[cfg(not(unix))]
+async fn wait_for_socket(
+    _path: &Path,
+    _child: &mut tokio::process::Child,
+) -> Result<(), RemoteError> {
+    Err(RemoteError(WINDOWS_UNSUPPORTED.to_string()))
+}
+
 /// A fresh mode-0700 directory under the system temp dir (`fs.mkdtempSync(…, "pi-subagents-herdr-")`
 /// then `chmodSync(dir, 0o700)`, `herdr-connection.ts:121`).
+#[cfg(unix)]
 fn private_temp_dir() -> std::io::Result<PathBuf> {
     use std::os::unix::fs::DirBuilderExt;
+    use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let base = std::env::temp_dir();
     for _ in 0..16 {
@@ -626,6 +648,12 @@ fn private_temp_dir() -> std::io::Result<PathBuf> {
     Err(std::io::Error::other(
         "could not pick an unused private directory name",
     ))
+}
+
+/// Off unix there is no forward to keep private, and [`SshTransport::connect`] refuses first.
+#[cfg(not(unix))]
+fn private_temp_dir() -> std::io::Result<PathBuf> {
+    Err(std::io::Error::other(WINDOWS_UNSUPPORTED))
 }
 
 /// A live connection to one saved machine's herdr (`HerdrForwardedConnection`, `:22`).
