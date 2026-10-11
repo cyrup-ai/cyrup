@@ -46,13 +46,13 @@ use tokio::sync::OnceCell;
 #[cfg(test)]
 pub(crate) use super::classifier_shared::MAX_RESPONSE_BYTES;
 use super::classifier_shared::{
-    ClassifyError, format_error, headers_to_record, retry_request, send_once,
+    ClassifyError, format_error, headers_to_record, js_number_string, json_stringify_indented,
+    retry_request, send_once,
 };
 use crate::HeaderMap;
 use crate::classifier::{
     ClassifierAnswer, ClassifierContext, ClassifierModel, ClassifierOptions, ClassifierQuestion,
     ClassifierResult, ClassifierStopReason, KnownClassifierApi, OrderedMap, ProviderClassifier,
-    js_array_index,
 };
 use crate::stream::ProviderResponse;
 use crate::stream::sse::build_client_for_target;
@@ -102,174 +102,6 @@ pub struct LabeledQuestion {
 #[error("{0}")]
 pub struct QuestionError(pub String);
 
-// ----------------------------------------------------------------------------- JS number text --
-
-/// `String(number)` for a finite or non-finite `f64` (ECMA-262 `Number::toString`, radix 10). Used
-/// where pi interpolates a JS number into text: `JSON.stringify` of the state and the
-/// `Temperature must be a positive number, got ${temperature}` message.
-fn js_number_string(value: f64) -> String {
-    if value.is_nan() {
-        return "NaN".to_string();
-    }
-    if value == 0.0 {
-        return "0".to_string();
-    }
-    if value.is_infinite() {
-        return if value > 0.0 { "Infinity" } else { "-Infinity" }.to_string();
-    }
-    let sign = if value < 0.0 { "-" } else { "" };
-    // `{:e}` yields the shortest digits that round-trip, `d.ddde<exp>`: the `k` digits and the
-    // exponent `n - 1` of ECMA-262 Number::toString steps 5-12.
-    let scientific = format!("{:e}", value.abs());
-    let (mantissa, exponent) = scientific
-        .split_once('e')
-        .unwrap_or((scientific.as_str(), "0"));
-    let exponent: i32 = exponent.parse().unwrap_or(0);
-    let digits: String = mantissa.chars().filter(|c| *c != '.').collect();
-    let k = i32::try_from(digits.len()).unwrap_or(i32::MAX);
-    let n = exponent.saturating_add(1);
-    let body = if k <= n && n <= 21 {
-        let zeros = usize::try_from(n - k).unwrap_or(0);
-        format!("{digits}{}", "0".repeat(zeros))
-    } else if 0 < n && n <= 21 {
-        let split = usize::try_from(n).unwrap_or(0);
-        let whole: String = digits.chars().take(split).collect();
-        let fraction: String = digits.chars().skip(split).collect();
-        format!("{whole}.{fraction}")
-    } else if -6 < n && n <= 0 {
-        let zeros = usize::try_from(-n).unwrap_or(0);
-        format!("0.{}{digits}", "0".repeat(zeros))
-    } else {
-        let power = n - 1;
-        let power_sign = if power >= 0 { '+' } else { '-' };
-        let first: String = digits.chars().take(1).collect();
-        let rest: String = digits.chars().skip(1).collect();
-        if rest.is_empty() {
-            format!("{first}e{power_sign}{}", power.unsigned_abs())
-        } else {
-            format!("{first}.{rest}e{power_sign}{}", power.unsigned_abs())
-        }
-    };
-    format!("{sign}{body}")
-}
-
-/// An integer as JS prints it: every JS number is a double, so an integer beyond 2^53 prints as the
-/// nearest double (`9007199254740993` -> `9007199254740992`, `18446744073709551615` ->
-/// `18446744073709552000`), where serde would write the exact digits. `digits` is the integer's
-/// decimal text; parsing it as `f64` rounds to nearest exactly as `JSON.parse` does.
-fn js_integer_string(digits: &str) -> String {
-    match digits.parse::<f64>() {
-        Ok(value) => js_number_string(value),
-        Err(_) => digits.to_string(),
-    }
-}
-
-/// serde_json's pretty formatter with one-space indent and JS number text: what
-/// `JSON.stringify(value, null, 1)` produces. serde writes `1.0` for the float `1`, where JS writes
-/// `1`, and switches to exponent notation at different magnitudes; it also writes integers beyond
-/// 2^53 exactly, where JS prints the nearest double.
-struct JsonStringifyFormatter(serde_json::ser::PrettyFormatter<'static>);
-
-impl serde_json::ser::Formatter for JsonStringifyFormatter {
-    fn write_f64<W>(&mut self, writer: &mut W, value: f64) -> std::io::Result<()>
-    where
-        W: ?Sized + std::io::Write,
-    {
-        writer.write_all(js_number_string(value).as_bytes())
-    }
-
-    fn write_i64<W>(&mut self, writer: &mut W, value: i64) -> std::io::Result<()>
-    where
-        W: ?Sized + std::io::Write,
-    {
-        writer.write_all(js_integer_string(&value.to_string()).as_bytes())
-    }
-
-    fn write_u64<W>(&mut self, writer: &mut W, value: u64) -> std::io::Result<()>
-    where
-        W: ?Sized + std::io::Write,
-    {
-        writer.write_all(js_integer_string(&value.to_string()).as_bytes())
-    }
-
-    fn write_i128<W>(&mut self, writer: &mut W, value: i128) -> std::io::Result<()>
-    where
-        W: ?Sized + std::io::Write,
-    {
-        writer.write_all(js_integer_string(&value.to_string()).as_bytes())
-    }
-
-    fn write_u128<W>(&mut self, writer: &mut W, value: u128) -> std::io::Result<()>
-    where
-        W: ?Sized + std::io::Write,
-    {
-        writer.write_all(js_integer_string(&value.to_string()).as_bytes())
-    }
-
-    fn begin_array<W>(&mut self, writer: &mut W) -> std::io::Result<()>
-    where
-        W: ?Sized + std::io::Write,
-    {
-        self.0.begin_array(writer)
-    }
-
-    fn end_array<W>(&mut self, writer: &mut W) -> std::io::Result<()>
-    where
-        W: ?Sized + std::io::Write,
-    {
-        self.0.end_array(writer)
-    }
-
-    fn begin_array_value<W>(&mut self, writer: &mut W, first: bool) -> std::io::Result<()>
-    where
-        W: ?Sized + std::io::Write,
-    {
-        self.0.begin_array_value(writer, first)
-    }
-
-    fn end_array_value<W>(&mut self, writer: &mut W) -> std::io::Result<()>
-    where
-        W: ?Sized + std::io::Write,
-    {
-        self.0.end_array_value(writer)
-    }
-
-    fn begin_object<W>(&mut self, writer: &mut W) -> std::io::Result<()>
-    where
-        W: ?Sized + std::io::Write,
-    {
-        self.0.begin_object(writer)
-    }
-
-    fn end_object<W>(&mut self, writer: &mut W) -> std::io::Result<()>
-    where
-        W: ?Sized + std::io::Write,
-    {
-        self.0.end_object(writer)
-    }
-
-    fn begin_object_key<W>(&mut self, writer: &mut W, first: bool) -> std::io::Result<()>
-    where
-        W: ?Sized + std::io::Write,
-    {
-        self.0.begin_object_key(writer, first)
-    }
-
-    fn begin_object_value<W>(&mut self, writer: &mut W) -> std::io::Result<()>
-    where
-        W: ?Sized + std::io::Write,
-    {
-        self.0.begin_object_value(writer)
-    }
-
-    fn end_object_value<W>(&mut self, writer: &mut W) -> std::io::Result<()>
-    where
-        W: ?Sized + std::io::Write,
-    {
-        self.0.end_object_value(writer)
-    }
-}
-
 // ---------------------------------------------------------------------------------- rendering --
 
 /// The server root: pi's llama.cpp models use the OpenAI-compatible `/v1` URL as their base URL
@@ -279,46 +111,13 @@ pub fn llama_server_root(base_url: &str) -> String {
     trimmed.strip_suffix("/v1").unwrap_or(trimmed).to_string()
 }
 
-/// `State:\n` plus the state as `JSON.stringify(state, null, 1)` (llama-cpp-classify.ts:99-101).
+/// `State:\n` plus the state as `JSON.stringify(state, null, 1)` (llama-cpp-classify.ts:99-101):
+/// JS own-key order and JS number text, both reproduced (PROV-110 corners (1) and (2); see the
+/// `JSON.stringify` section of [`super::classifier_shared`]).
 fn render_state(state: &serde_json::Map<String, Value>) -> Result<String, QuestionError> {
-    use serde::Serialize as _;
-    let mut buffer = Vec::new();
-    let formatter = JsonStringifyFormatter(serde_json::ser::PrettyFormatter::with_indent(b" "));
-    let mut serializer = serde_json::Serializer::with_formatter(&mut buffer, formatter);
-    js_key_order_map(state)
-        .serialize(&mut serializer)
-        .map_err(|error| QuestionError(error.to_string()))?;
-    let json = String::from_utf8(buffer).map_err(|error| QuestionError(error.to_string()))?;
+    let json = json_stringify_indented(&Value::Object(state.clone()), b" ")
+        .map_err(|error| QuestionError(error.message().to_string()))?;
     Ok(format!("State:\n{json}"))
-}
-
-/// `object` with its keys, and those of every object nested in it, in JS own-key order: array-index
-/// keys first and ascending, then the others in their given order (`OrdinaryOwnPropertyKeys`; the
-/// same rule [`OrderedMap`] applies). `JSON.stringify` of a JS state object prints in that order.
-fn js_key_order_map(object: &serde_json::Map<String, Value>) -> serde_json::Map<String, Value> {
-    let mut indexed: Vec<(u32, &String, &Value)> = Vec::new();
-    let mut named: Vec<(&String, &Value)> = Vec::new();
-    for (key, value) in object {
-        match js_array_index(key) {
-            Some(index) => indexed.push((index, key, value)),
-            None => named.push((key, value)),
-        }
-    }
-    indexed.sort_by_key(|(index, _, _)| *index);
-    indexed
-        .into_iter()
-        .map(|(_, key, value)| (key, value))
-        .chain(named)
-        .map(|(key, value)| (key.clone(), js_key_order(value)))
-        .collect()
-}
-
-fn js_key_order(value: &Value) -> Value {
-    match value {
-        Value::Object(object) => Value::Object(js_key_order_map(object)),
-        Value::Array(items) => Value::Array(items.iter().map(js_key_order).collect()),
-        other => other.clone(),
-    }
 }
 
 /// The answer labels of a question and the keys they stand for. Errors for unsupported option
@@ -520,31 +319,48 @@ pub fn peak_confidence(probabilities: &[f64]) -> f64 {
 ///
 /// `keys` and `probabilities` come from one label set, so a bool question always has a `true` key
 /// and a choice always has a key at its best index; pi reads them with `!` assertions
-/// (`probabilities[keys.indexOf("true")]!`, `keys[best]!`), where JS would yield `undefined`. Here a
-/// mismatch yields `NaN` / an empty key rather than an index panic.
+/// (`probabilities[keys.indexOf("true")]!`, `keys[best]!`, `probabilities[index]!`), which JS does
+/// not check.
+///
+/// `[CYRUP-DELTA, intentional]` PROV-110 corner (3). Where one of those assertions would be wrong
+/// — a bool with no `true` key or no probability at its index, a choice whose best index has no key,
+/// or a choice with more keys than probabilities — pi answers with `undefined` in the field
+/// (`{type: "bool", probability: undefined}`, which `JSON.stringify` then drops), and this returns
+/// an error instead, which [`classify_question`] turns into an error result. A number-typed
+/// `probability` cannot be `undefined` in Rust, and the `NaN` / empty key it used to substitute
+/// would have reached the caller as a successful answer. Unreachable from `classify`: both slices
+/// come from [`render_question`]'s one label set.
 pub fn answer_from_probabilities(
     question: &ClassifierQuestion,
     keys: &[String],
     probabilities: &[f64],
-) -> ClassifierAnswer {
+) -> Result<ClassifierAnswer, String> {
+    let mismatch = || {
+        format!(
+            "{LABEL} answer keys and label probabilities do not match ({} keys, {} probabilities)",
+            keys.len(),
+            probabilities.len()
+        )
+    };
     if matches!(question, ClassifierQuestion::Bool { .. }) {
         let probability = keys
             .iter()
             .position(|key| key == "true")
             .and_then(|index| probabilities.get(index))
             .copied()
-            .unwrap_or(f64::NAN);
-        return ClassifierAnswer::Bool { probability };
+            .ok_or_else(mismatch)?;
+        return Ok(ClassifierAnswer::Bool { probability });
     }
     let confidence = peak_confidence(probabilities);
     if matches!(question, ClassifierQuestion::Score { .. }) {
+        // pi reads no key here, so a mismatch cannot surface as `undefined`.
         let score = probabilities
             .iter()
             .enumerate()
             .fold(0.0, |sum, (index, probability)| {
                 sum + index as f64 * probability
             });
-        return ClassifierAnswer::Score { score, confidence };
+        return Ok(ClassifierAnswer::Score { score, confidence });
     }
     let mut best = 0;
     let mut best_probability = probabilities.first().copied();
@@ -554,15 +370,19 @@ pub fn answer_from_probabilities(
             best_probability = Some(*probability);
         }
     }
-    ClassifierAnswer::Choice {
-        choice: keys.get(best).cloned().unwrap_or_default(),
+    let choice = keys.get(best).cloned().ok_or_else(mismatch)?;
+    if keys.len() > probabilities.len() {
+        return Err(mismatch());
+    }
+    Ok(ClassifierAnswer::Choice {
+        choice,
         probabilities: keys
             .iter()
             .zip(probabilities)
             .map(|(key, probability)| (key.clone(), *probability))
             .collect::<OrderedMap<f64>>(),
         confidence,
-    }
+    })
 }
 
 // ------------------------------------------------------------------------------------- requests --
@@ -607,6 +427,7 @@ async fn post(
     let retry = ProviderRetry {
         max_retries: options.max_retries,
         max_retry_delay_ms: options.max_retry_delay_ms,
+        no_retry_statuses: &[],
     };
     let (status, response_headers, json) = retry_request(
         || {
@@ -689,7 +510,7 @@ async fn tokenize(
 /// Each key holds a [`OnceCell`] instead: the first caller to arrive runs the lookup, concurrent
 /// callers wait for it, and when it fails or its caller is dropped the next caller runs it with its
 /// own options. The same outcomes, except that a waiter does not inherit another caller's error
-/// or cancellation. Owner: EXT-027.
+/// or cancellation. Owners: EXT-027, PROV-110 corner (4).
 static LABEL_TOKENS: LazyLock<DashMap<String, Arc<OnceCell<Option<TokenId>>>>> =
     LazyLock::new(DashMap::new);
 
@@ -699,6 +520,16 @@ static LABEL_TOKENS: LazyLock<DashMap<String, Arc<OnceCell<Option<TokenId>>>>> =
 /// unreachable or cancelled (server, model, label) would leave an empty cell in the process-global
 /// map for good. The cell is compared by identity so a newer cell for the same key is never removed,
 /// and a cell another caller has since resolved is kept.
+///
+/// Only the LAST caller holding the cell evicts it (the map's handle plus this guard's are then the
+/// only two). pi deletes an entry when its shared promise rejects, never because one of its
+/// waiters went away; before PROV-110 a waiter dropped mid-lookup (a cancelled `classify`) removed
+/// the entry while another caller was still resolving it, so the token that lookup then resolved
+/// went into an orphaned cell and the next caller sent the `/tokenize` requests again.
+///
+/// Every holder's handle is cloned out of the map and released back under the same shard write
+/// lock (see `drop`), so the count each check reads is exact: two holders dropped at the same
+/// moment on two threads cannot both read the other's handle and both keep an empty cell.
 struct EvictUnresolved {
     key: String,
     cell: Arc<OnceCell<Option<TokenId>>>,
@@ -706,8 +537,18 @@ struct EvictUnresolved {
 
 impl Drop for EvictUnresolved {
     fn drop(&mut self) {
-        LABEL_TOKENS.remove_if(&self.key, |_, current| {
-            Arc::ptr_eq(current, &self.cell) && !self.cell.initialized()
+        // Under the map shard's write lock, so a caller cloning the cell out of the map is ordered
+        // before or after this check, never across it. This guard's own handle is released INSIDE
+        // the closure, under that lock too: released after `remove_if` returned, two guards dropped
+        // at once could each check while the other still held its handle (a count of 3 for both),
+        // and the empty cell would stay in the map. The placeholder `take` leaves in the field is
+        // never shared.
+        let cell = std::mem::take(&mut self.cell);
+        LABEL_TOKENS.remove_if(&self.key, move |_, current| {
+            let evict =
+                Arc::ptr_eq(current, &cell) && !cell.initialized() && Arc::strong_count(&cell) == 2;
+            drop(cell);
+            evict
         });
     }
 }
@@ -726,6 +567,10 @@ pub(crate) fn label_cache_entries_for(root: &str) -> usize {
 /// the rendered template, so the label is tokenized after one: tokenizers that add a leading-space
 /// marker at the start of a text would otherwise return a different token than the model emits
 /// there (llama-cpp-classify.ts:300-313).
+///
+/// `[CYRUP-DELTA, mechanism]` pi runs the two `/tokenize` requests with `Promise.all`
+/// (llama-cpp-classify.ts:307), so when one rejects the other keeps running; `try_join!` drops it
+/// instead, for the reason [`classify_question`] gives. Owners: EXT-027, PROV-110 corner (4).
 async fn resolve_label_token(
     request: &RequestContext<'_>,
     label: &str,
@@ -750,18 +595,26 @@ async fn resolve_label_token(
 
 /// The single token of each label, from the cache or `/tokenize`. Errors when a label is not one
 /// token or two labels share a token (llama-cpp-classify.ts:315-335).
+///
+/// `[CYRUP-DELTA, mechanism]` pi looks the labels up with `Promise.all` (`:316`): when one label's
+/// lookup rejects, its siblings keep running and still fill the cache. `try_join_all` drops them
+/// instead, and a dropped sibling that was the only caller of its lookup leaves nothing cached
+/// ([`EvictUnresolved`]), so a later call repeats that `/tokenize`; the answer is the same error
+/// either way. Owners: EXT-027, PROV-110 corner (4).
 async fn label_tokens(
     request: &RequestContext<'_>,
     labels: &[String],
 ) -> Result<Vec<TokenId>, ClassifyError> {
     let ids = futures::future::try_join_all(labels.iter().map(|label| async move {
         let key = format!("{}\u{0}{}\u{0}{label}", request.root, request.model.id);
-        let cell = Arc::clone(LABEL_TOKENS.entry(key.clone()).or_default().value());
-        let _evict = EvictUnresolved {
+        // The guard holds this caller's ONLY handle on the cell (see `EvictUnresolved`).
+        let guard = EvictUnresolved {
+            cell: Arc::clone(LABEL_TOKENS.entry(key.clone()).or_default().value()),
             key,
-            cell: Arc::clone(&cell),
         };
-        cell.get_or_try_init(|| resolve_label_token(request, label))
+        guard
+            .cell
+            .get_or_try_init(|| resolve_label_token(request, label))
             .await
             .copied()
     }))
@@ -918,11 +771,12 @@ async fn classify_question(
             request.model.id
         )));
     }
-    Ok(answer_from_probabilities(
+    answer_from_probabilities(
         question,
         &rendered.keys,
         &label_probabilities(&values, temperature),
-    ))
+    )
+    .map_err(ClassifyError::plain)
 }
 
 /// The classification body of [`LlamaCppClassify::classify`]: everything pi puts inside its `try`

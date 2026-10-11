@@ -1,13 +1,14 @@
 //! The `auth: { oauth: … }` clause of pi's built-in provider definitions.
 //!
-//! Ports the `lazyOAuth({ … })` expressions that pi puts on seven built-in providers
-//! (v0.83.0/v0.84.4, plus `openai` at v1.0.0 — PROV-118):
+//! Ports the `lazyOAuth({ … })` expressions that pi puts on eight built-in providers
+//! (v0.83.0/v0.84.4, plus `openai` at v1.0.0 — PROV-118 — and `meta` at v0.86.1 — PROV-080):
 //!
 //! | provider | pi v0.84.4 source | `isSubscription` |
 //! |---|---|---|
 //! | `anthropic` | `ai/src/providers/anthropic.ts:50-54` | **true** (`:52`) |
 //! | `openai` | `ai/src/providers/openai.ts:14-19` @v1.0.1 | **true** (`:16`) |
 //! | `kimi-coding` | `ai/src/providers/kimi-coding.ts:14-19` | **true** (`:16`) |
+//! | `meta` | `ai/src/providers/meta.ts:14-19` @f1b2e77f5 | **true** (`:16`) — PROV-080 |
 //! | `xai` | `ai/src/providers/xai.ts:15-20` | **true** (`:17`) |
 //! | `openrouter` | `ai/src/providers/openrouter.ts:14-18` | absent — metered, not a plan |
 //! | `openrouter` (images) | `ai/src/providers/openrouter-images.ts:13-17` | absent |
@@ -30,9 +31,10 @@
 //! fully bundled — the standalone Bun binary, whose `registerBunOAuthFlows`
 //! (`ai/src/bun-oauth.ts:12-23`) registers every flow as a constant, `anthropic: () =>
 //! anthropicOAuth`. A Rust binary is always that build: every flow is linked in, so this match —
-//! with the two self-wired flows above — IS `bun-oauth.ts`'s table (less `meta`, which PROV-080
-//! has not ported), and `load.ts` has nothing left to do: it is not ported. Every flow
-//! constructor here is a field assignment with no I/O, and the eager value additionally makes
+//! with the two self-wired flows above — IS `bun-oauth.ts`'s table (`meta` included since
+//! PROV-080, `bun-oauth.ts:21` @f1b2e77f5), and `load.ts` has nothing left to do: it is not
+//! ported. Every flow constructor here is a field assignment with no I/O, and the eager value
+//! additionally makes
 //! `name`/`login_label`/`is_subscription` readable without a fallible load, which is exactly what
 //! upstream's eager `name`/`isSubscription`/`loginLabel` copy on the lazy wrapper
 //! (`ai/src/auth/helpers.ts:52-54`) exists to provide.
@@ -40,6 +42,7 @@
 use crate::auth::OAuthAuth;
 use crate::auth::oauth::anthropic::AnthropicOAuth;
 use crate::auth::oauth::kimi_coding::KimiCodingOAuth;
+use crate::auth::oauth::meta::MetaOAuth;
 use crate::auth::oauth::openai_chatgpt::OpenAiChatGptOAuth;
 use crate::auth::oauth::openrouter::OpenRouterOAuth;
 use crate::auth::oauth::radius::{RadiusOAuth, RadiusOptions};
@@ -56,6 +59,10 @@ pub fn builtin_provider_oauth(provider_id: &str) -> Option<Arc<dyn OAuthAuth>> {
         // `lazyOAuth({ name: "Kimi Code (subscription)", isSubscription: true, loginLabel: … })`
         // (`providers/kimi-coding.ts:14-19`).
         "kimi-coding" => Some(Arc::new(KimiCodingOAuth::new())),
+        // PROV-080 — `lazyOAuth({ name: "Meta (Muse subscription)", isSubscription: true,
+        // loginLabel: "Sign in with Meta", load: loadMetaOAuth })` (`providers/meta.ts:14-19`
+        // @f1b2e77f5), beside the provider's `META_API_KEY` strategy.
+        "meta" => Some(Arc::new(MetaOAuth::new())),
         // PROV-118 — `lazyOAuth({ name: "OpenAI (ChatGPT subscription)", isSubscription: true,
         // loginLabel: "Sign in with ChatGPT", load: loadOpenAIChatGPTOAuth })`
         // (`providers/openai.ts:14-19` @v1.0.1). This sits BESIDE openai's api key, so the
@@ -92,10 +99,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_the_six_built_ins_carry_oauth() {
+    fn only_the_seven_built_ins_carry_oauth() {
         for id in [
             "anthropic",
             "kimi-coding",
+            "meta",
             "openai",
             "xai",
             "openrouter",
@@ -127,10 +135,14 @@ mod tests {
     /// subscriptions", asserted through the provider clause that actually reaches a user.
     #[test]
     fn subscription_split_matches_upstream() {
-        for id in ["anthropic", "kimi-coding", "openai", "xai"] {
+        for id in ["anthropic", "kimi-coding", "meta", "openai", "xai"] {
             let oauth = builtin_provider_oauth(id).expect("oauth");
             assert!(oauth.is_subscription(), "{id} is subscription-backed");
         }
+        // PROV-080 — `providers/meta.ts:15-18` @f1b2e77f5.
+        let meta = builtin_provider_oauth("meta").expect("oauth");
+        assert_eq!(meta.name(), "Meta (Muse subscription)");
+        assert_eq!(meta.login_label(), Some("Sign in with Meta"));
         let openrouter = builtin_provider_oauth("openrouter").expect("oauth");
         assert!(
             !openrouter.is_subscription(),

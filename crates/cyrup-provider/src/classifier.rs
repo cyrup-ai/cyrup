@@ -23,7 +23,8 @@
 //!
 //! Not ported from the 0.99 multi-type surface (see the EXT-027 ledger rows): the array-based
 //! `models.all.json` shape. PROV-104 ported the two System One classifier apis,
-//! `typesafe-system-one` and `cloudflare-workers-ai-system-one` ([`KnownClassifierApi`]).
+//! `typesafe-system-one` and `cloudflare-workers-ai-system-one`, and PROV-147 the fourth,
+//! `openai-decisions` ([`KnownClassifierApi`]).
 //!
 //! PROV-128 is CLOSED. Step (1) is the type work here: [`ModelType::Image`], [`AnyModel::Image`]
 //! and [`ImageModel`] in upstream's v1.0.0 shape. Step (2) hung an `images` dispatch map on
@@ -81,10 +82,9 @@ impl std::fmt::Display for ModelType {
     }
 }
 
-/// The classifier wire-protocol ids this build knows (pi `KnownClassifierApi`, types.ts:78-82
-/// @f1b2e77f5). pi's fourth, `openai-decisions`, is not ported (filed separately). Like pi's
-/// `ClassifierApi = KnownClassifierApi | (string & {})`, a [`ClassifierModel::api`] may carry any
-/// string; this enum names the ones with an implementation.
+/// The classifier wire-protocol ids this build knows (pi `KnownClassifierApi`, `types.ts:78-83`
+/// @f1b2e77f5) — all four. Like pi's `ClassifierApi = KnownClassifierApi | (string & {})`, a
+/// [`ClassifierModel::api`] may carry any string; this enum names the ones with an implementation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum KnownClassifierApi {
     /// TypeSafe's native System One protocol, served by TypeSafe, OpenRouter and llama.cpp's
@@ -97,14 +97,18 @@ pub enum KnownClassifierApi {
     /// Classification with a chat model served by llama.cpp's `llama-server`
     /// (`llama-cpp-classify`, `ai/src/api/llama-cpp-classify.ts`).
     LlamaCppClassify,
+    /// OpenAI's Decisions API, `POST /v1/decisions` (`openai-decisions`,
+    /// `ai/src/api/openai-decisions.ts`; PROV-147).
+    OpenAiDecisions,
 }
 
 impl KnownClassifierApi {
-    /// pi's declaration order (types.ts:78-82), without `openai-decisions`.
-    pub const ALL: [KnownClassifierApi; 3] = [
+    /// pi's declaration order (`types.ts:78-83` @f1b2e77f5).
+    pub const ALL: [KnownClassifierApi; 4] = [
         KnownClassifierApi::TypesafeSystemOne,
         KnownClassifierApi::CloudflareWorkersAiSystemOne,
         KnownClassifierApi::LlamaCppClassify,
+        KnownClassifierApi::OpenAiDecisions,
     ];
 
     /// The api id as it appears in [`ClassifierModel::api`].
@@ -113,6 +117,7 @@ impl KnownClassifierApi {
             KnownClassifierApi::TypesafeSystemOne => "typesafe-system-one",
             KnownClassifierApi::CloudflareWorkersAiSystemOne => "cloudflare-workers-ai-system-one",
             KnownClassifierApi::LlamaCppClassify => "llama-cpp-classify",
+            KnownClassifierApi::OpenAiDecisions => "openai-decisions",
         }
     }
 
@@ -132,6 +137,9 @@ impl KnownClassifierApi {
             }
             KnownClassifierApi::LlamaCppClassify => {
                 crate::api::llama_cpp_classify::llama_cpp_classify_api()
+            }
+            KnownClassifierApi::OpenAiDecisions => {
+                crate::api::openai_decisions::openai_decisions_api()
             }
         }
     }

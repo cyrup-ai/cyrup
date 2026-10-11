@@ -66,6 +66,9 @@ pub fn api_key_env_vars(provider: &str) -> Option<&'static [&'static str]> {
         "groq" => Some(&["GROQ_API_KEY"]),
         "cerebras" => Some(&["CEREBRAS_API_KEY"]),
         "xai" => Some(&["XAI_API_KEY"]),
+        // PROV-153. `typesafe: "TYPESAFE_API_KEY"` (env-api-keys.ts:98 @f1b2e77f5), between `xai`
+        // and `radius` upstream.
+        "typesafe" => Some(&["TYPESAFE_API_KEY"]),
         // PROV-014. `radius: "RADIUS_API_KEY"` (env-api-keys.ts:91 @v0.83.0), between `xai` and
         // `openrouter` upstream.
         "radius" => Some(&["RADIUS_API_KEY"]),
@@ -88,6 +91,9 @@ pub fn api_key_env_vars(provider: &str) -> Option<&'static [&'static str]> {
         "opencode" => Some(&["OPENCODE_API_KEY"]),
         "opencode-go" => Some(&["OPENCODE_API_KEY"]),
         "kimi-coding" => Some(&["KIMI_API_KEY"]),
+        // PROV-080. `meta: "META_API_KEY"` (env-api-keys.ts:116 @f1b2e77f5), between `kimi-coding`
+        // and `cloudflare-workers-ai` upstream.
+        "meta" => Some(&["META_API_KEY"]),
         "cloudflare-workers-ai" => Some(&["CLOUDFLARE_API_KEY"]),
         "cloudflare-ai-gateway" => Some(&["CLOUDFLARE_API_KEY"]),
         "xiaomi" => Some(&["XIAOMI_API_KEY"]),
@@ -176,6 +182,7 @@ pub const CREDENTIAL_ENV_VARS: &[&str] = &[
     "GROQ_API_KEY",
     "CEREBRAS_API_KEY",
     "XAI_API_KEY",
+    "TYPESAFE_API_KEY",
     "RADIUS_API_KEY",
     "OPENROUTER_API_KEY",
     "AI_GATEWAY_API_KEY",
@@ -191,6 +198,7 @@ pub const CREDENTIAL_ENV_VARS: &[&str] = &[
     "BASETEN_API_KEY",
     "OPENCODE_API_KEY",
     "KIMI_API_KEY",
+    "META_API_KEY",
     "CLOUDFLARE_API_KEY",
     "XIAOMI_API_KEY",
     "XIAOMI_TOKEN_PLAN_CN_API_KEY",
@@ -574,6 +582,7 @@ mod tests {
             "groq",
             "cerebras",
             "xai",
+            "typesafe",
             "radius",
             "openrouter",
             "vercel-ai-gateway",
@@ -591,6 +600,7 @@ mod tests {
             "opencode",
             "opencode-go",
             "kimi-coding",
+            "meta",
             "cloudflare-workers-ai",
             "cloudflare-ai-gateway",
             "xiaomi",

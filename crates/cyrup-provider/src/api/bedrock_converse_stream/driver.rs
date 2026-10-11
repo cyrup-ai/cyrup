@@ -130,6 +130,7 @@ pub(super) async fn run_inner(
     let retry = ProviderRetry {
         max_retries: BEDROCK_STANDARD_MODE_RETRIES,
         max_retry_delay_ms: opts.max_retry_delay_ms,
+        no_retry_statuses: &[],
     };
     let max_retries = retry.max_retries;
     let mut retries_remaining = max_retries;

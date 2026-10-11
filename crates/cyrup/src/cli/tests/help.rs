@@ -220,6 +220,10 @@ fn the_env_help_block_and_the_read_set_are_the_same_set() {
         // DRIFT-009: pi's block carries this row too (`args.ts:406` @v0.84.4), between
         // TOGETHER_API_KEY and OPENROUTER_API_KEY, which is where cyrup's now sits.
         ("baseten", "BASETEN_API_KEY"),
+        // PROV-080: pi's block lists it between KIMI_API_KEY and CLOUDFLARE_API_KEY
+        // (`args.ts:447` @f1b2e77f5). `TYPESAFE_API_KEY` (PROV-153) is read but, like
+        // `RADIUS_API_KEY`, absent from pi's block, so it is not asserted here.
+        ("meta", "META_API_KEY"),
     ] {
         assert!(
             cyrup_provider::env_api_keys::api_key_env_vars(provider)

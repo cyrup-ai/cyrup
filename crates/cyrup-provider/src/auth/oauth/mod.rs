@@ -31,6 +31,8 @@ pub mod device_code;
 pub mod github_copilot;
 pub mod interaction;
 pub mod kimi_coding;
+/// PROV-080 — the Meta Model API (Muse subscription) device-code flow.
+pub mod meta;
 pub mod openai_chatgpt;
 pub mod openai_codex;
 pub mod openrouter;

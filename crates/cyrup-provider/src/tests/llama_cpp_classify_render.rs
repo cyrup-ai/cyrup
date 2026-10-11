@@ -401,12 +401,12 @@ fn a_bool_answer_reads_the_true_key() {
     let question = boolean("Q?", "", "");
     let keys = ["true".to_string(), "false".to_string()];
     assert_eq!(
-        answer_from_probabilities(&question, &keys, &[0.8, 0.2]),
+        answer_from_probabilities(&question, &keys, &[0.8, 0.2]).unwrap(),
         ClassifierAnswer::Bool { probability: 0.8 }
     );
     let swapped = ["false".to_string(), "true".to_string()];
     assert_eq!(
-        answer_from_probabilities(&question, &swapped, &[0.8, 0.2]),
+        answer_from_probabilities(&question, &swapped, &[0.8, 0.2]).unwrap(),
         ClassifierAnswer::Bool { probability: 0.2 }
     );
 }
@@ -418,7 +418,7 @@ fn a_choice_answer_takes_the_first_most_probable_key() {
     let question = choice("Pick", &[("x", ""), ("y", ""), ("z", "")]);
     let keys = ["x".to_string(), "y".to_string(), "z".to_string()];
 
-    let answer = answer_from_probabilities(&question, &keys, &[0.2, 0.4, 0.4]);
+    let answer = answer_from_probabilities(&question, &keys, &[0.2, 0.4, 0.4]).unwrap();
     match answer {
         ClassifierAnswer::Choice {
             choice,
@@ -442,12 +442,76 @@ fn a_choice_answer_takes_the_first_most_probable_key() {
         other => panic!("{other:?}"),
     }
 
-    match answer_from_probabilities(&question, &keys, &[0.6, 0.2, 0.2]) {
+    match answer_from_probabilities(&question, &keys, &[0.6, 0.2, 0.2]).unwrap() {
         ClassifierAnswer::Choice { choice, .. } => assert_eq!(choice, "x"),
         other => panic!("{other:?}"),
     }
-    match answer_from_probabilities(&question, &keys, &[0.1, 0.1, 0.8]) {
+    match answer_from_probabilities(&question, &keys, &[0.1, 0.1, 0.8]).unwrap() {
         ClassifierAnswer::Choice { choice, .. } => assert_eq!(choice, "z"),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// PROV-110 corner (3), a `[CYRUP-DELTA]`: where pi's `!` assertions in `answerFromProbabilities`
+/// (llama-cpp-classify.ts:195-219 @f1b2e77f5) would read `undefined`, the answer is an ERROR rather
+/// than a `NaN` probability or an empty choice reported as a successful answer. Before this change
+/// the function returned `ClassifierAnswer` directly (so this test cannot compile at the base); it
+/// was red-proved by restoring that `NaN` / `unwrap_or_default` body behind the new signature,
+/// which fails the first `unwrap_err`.
+#[test]
+fn a_key_probability_mismatch_is_an_error_not_a_nan_answer() {
+    let mismatch = |error: String, keys: usize, probabilities: usize| {
+        assert_eq!(
+            error,
+            format!(
+                "llama.cpp answer keys and label probabilities do not match ({keys} keys, \
+                 {probabilities} probabilities)"
+            )
+        );
+    };
+    let keys = |names: &[&str]| names.iter().map(|n| n.to_string()).collect::<Vec<_>>();
+    let question = boolean("Q?", "", "");
+    // pi: `probabilities[keys.indexOf("true")]` is `probabilities[-1]`.
+    mismatch(
+        answer_from_probabilities(&question, &keys(&["false", "no"]), &[0.5, 0.5]).unwrap_err(),
+        2,
+        2,
+    );
+    // pi: the `true` key's index is past the probabilities.
+    mismatch(
+        answer_from_probabilities(&question, &keys(&["false", "true"]), &[0.5]).unwrap_err(),
+        2,
+        1,
+    );
+    let question = choice("Pick", &[("x", ""), ("y", "")]);
+    // pi: `keys[best]` with `best` past the keys.
+    mismatch(
+        answer_from_probabilities(&question, &keys(&["x"]), &[0.1, 0.9]).unwrap_err(),
+        1,
+        2,
+    );
+    // pi: a key with no probability, `probabilities[index]` past the end.
+    mismatch(
+        answer_from_probabilities(&question, &keys(&["x", "y"]), &[0.9]).unwrap_err(),
+        2,
+        1,
+    );
+    mismatch(
+        answer_from_probabilities(&question, &keys(&["x", "y"]), &[]).unwrap_err(),
+        2,
+        0,
+    );
+    // Not a mismatch pi can see: an extra probability past the keys, with the best on a key, reads
+    // no `undefined` (pi maps over the keys), so it is answered as pi answers it.
+    match answer_from_probabilities(&question, &keys(&["x"]), &[0.9, 0.1]).unwrap() {
+        ClassifierAnswer::Choice {
+            choice,
+            probabilities,
+            ..
+        } => {
+            assert_eq!(choice, "x");
+            assert_eq!(probabilities.len(), 1);
+        }
         other => panic!("{other:?}"),
     }
 }
@@ -457,14 +521,14 @@ fn a_choice_answer_takes_the_first_most_probable_key() {
 fn a_score_answer_is_the_expected_level() {
     let question = score("Rate", &["a", "b", "c"]);
     let keys = ["0".to_string(), "1".to_string(), "2".to_string()];
-    match answer_from_probabilities(&question, &keys, &[0.0, 0.0, 1.0]) {
+    match answer_from_probabilities(&question, &keys, &[0.0, 0.0, 1.0]).unwrap() {
         ClassifierAnswer::Score { score, confidence } => {
             assert_eq!(score, 2.0);
             assert_eq!(confidence, 1.0);
         }
         other => panic!("{other:?}"),
     }
-    match answer_from_probabilities(&question, &keys, &[1.0, 0.0, 0.0]) {
+    match answer_from_probabilities(&question, &keys, &[1.0, 0.0, 0.0]).unwrap() {
         ClassifierAnswer::Score { score, .. } => assert_eq!(score, 0.0),
         other => panic!("{other:?}"),
     }

@@ -44,6 +44,12 @@ pub struct ProviderRetry {
     /// disables the ceiling (Pi `maxRetryDelayMs ?? DEFAULT_MAX_RETRY_DELAY_MS`, `maxDelayMs > 0`,
     /// provider-retry.ts:40-41).
     pub max_retry_delay_ms: Option<u64>,
+    /// HTTP statuses that fail at once although the default policy would retry them (Pi
+    /// `ProviderRetryOptions.noRetryStatuses`, `utils/provider-retry.ts:7-8` @f1b2e77f5). Empty for
+    /// every caller but `openai-decisions`, which refuses to retry a gateway `504`
+    /// (`NO_RETRY_STATUSES`, `api/openai-decisions.ts:151`; PROV-147). No stream option sets it
+    /// upstream either, so the stream funnel always carries an empty list.
+    pub no_retry_statuses: &'static [u16],
 }
 
 impl ProviderRetry {
@@ -52,6 +58,7 @@ impl ProviderRetry {
     pub const NONE: Self = Self {
         max_retries: 0,
         max_retry_delay_ms: None,
+        no_retry_statuses: &[],
     };
 
     /// Read the budget off a request's [`crate::stream::StreamOptions`].
@@ -59,7 +66,17 @@ impl ProviderRetry {
         Self {
             max_retries: options.max_retries.unwrap_or(0),
             max_retry_delay_ms: options.max_retry_delay_ms,
+            no_retry_statuses: &[],
         }
+    }
+
+    /// Whether a retryable failure must nevertheless fail at once because its status is in
+    /// [`ProviderRetry::no_retry_statuses`]: `if (error.status !== undefined &&
+    /// options.noRetryStatuses?.includes(error.status)) throw error` (`provider-retry.ts:121`
+    /// @f1b2e77f5), checked after the retry budget and the retryable test. A failure with no
+    /// status (a transport error or timeout) is never refused this way.
+    pub fn refuses_status(&self, status: Option<u16>) -> bool {
+        status.is_some_and(|status| self.no_retry_statuses.contains(&status))
     }
 
     /// The effective server-delay ceiling in ms (`0` = no ceiling).
@@ -397,6 +414,7 @@ mod tests {
         let retry = ProviderRetry {
             max_retries: 1,
             max_retry_delay_ms: Some(0),
+            no_retry_statuses: &[],
         };
         assert_eq!(
             retry_delay_ms(Some(&h), "boom", 0, retry).unwrap(),
@@ -410,6 +428,7 @@ mod tests {
         let retry = ProviderRetry {
             max_retries: 5,
             max_retry_delay_ms: Some(1),
+            no_retry_statuses: &[],
         };
         let d = retry_delay_ms(None, "boom", 4, retry).unwrap();
         assert!((6_000..=8_000).contains(&d));
@@ -495,7 +514,8 @@ mod tests {
             ProviderRetry::from_options(&opts),
             ProviderRetry {
                 max_retries: 3,
-                max_retry_delay_ms: Some(1234)
+                max_retry_delay_ms: Some(1234),
+                no_retry_statuses: &[],
             }
         );
         assert_eq!(

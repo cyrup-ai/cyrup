@@ -450,7 +450,10 @@ pub async fn open_sse(
                     break resp;
                 }
                 let retryable = is_retryable_provider_error(Some(code), Some(resp.headers()));
-                if retries_remaining == 0 || !retryable {
+                // `provider-retry.ts:121` @f1b2e77f5. No stream caller sets a no-retry list
+                // (see `ProviderRetry::no_retry_statuses`), so this is the shared policy kept in
+                // one shape rather than a live branch here.
+                if retries_remaining == 0 || !retryable || retry.refuses_status(Some(code)) {
                     // Terminal: observe the response that is actually returned, then surface its
                     // (bounded) body.
                     if let Some(cb) = &on_response {
@@ -1080,6 +1083,7 @@ mod tests {
             ProviderRetry {
                 max_retries: 2,
                 max_retry_delay_ms: None,
+                no_retry_statuses: &[],
             },
         )
         .await
@@ -1112,6 +1116,7 @@ mod tests {
                 ProviderRetry {
                     max_retries: 3,
                     max_retry_delay_ms: None,
+                    no_retry_statuses: &[],
                 },
             )
             .await,
@@ -1149,6 +1154,7 @@ mod tests {
                 ProviderRetry {
                     max_retries: 3,
                     max_retry_delay_ms: None,
+                    no_retry_statuses: &[],
                 },
             )
             .await,
@@ -1222,6 +1228,7 @@ mod tests {
                     ProviderRetry {
                         max_retries: 3,
                         max_retry_delay_ms: None,
+                        no_retry_statuses: &[],
                     },
                 ),
             )
@@ -1263,6 +1270,7 @@ mod tests {
             ProviderRetry {
                 max_retries: 2,
                 max_retry_delay_ms: None,
+                no_retry_statuses: &[],
             },
         )
         .await
