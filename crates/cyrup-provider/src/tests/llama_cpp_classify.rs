@@ -400,7 +400,11 @@ async fn a_dropped_waiter_does_not_evict_an_in_flight_label_lookup() {
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    assert_eq!(label_a(&server), 1, "the first call's lookup of `A` is in flight");
+    assert_eq!(
+        label_a(&server),
+        1,
+        "the first call's lookup of `A` is in flight"
+    );
 
     // A second call joins the lookup and is dropped while it waits.
     let waiter = tokio::time::timeout(
@@ -614,7 +618,8 @@ fn computes_typesafes_confidence_and_expected_scores() {
             },
             &["0".to_string(), "1".to_string(), "2".to_string()],
             &[0.2, 0.3, 0.5],
-        ).unwrap(),
+        )
+        .unwrap(),
         ClassifierAnswer::Score {
             score: 1.3,
             confidence: peak_confidence(&[0.2, 0.3, 0.5]),

@@ -73,9 +73,10 @@ pub struct FleetSpec {
     /// Where this member's rows come from — see [`FleetCatalog`].
     pub catalog: FleetCatalog,
     /// Upstream's `createProvider({ baseUrl })` (`Provider.baseUrl`, PROV-017) for the members
-    /// whose catalog cannot carry it because they have none ([`FleetCatalog::Dynamic`]). `None` for
-    /// every embedded-catalog member: each of their rows carries its own `baseUrl`, which is what
-    /// the request path reads.
+    /// whose provider file passes one and that cyrup carries (`baseten`, the three
+    /// `qwen-token-plan*`, `meta`); `None` otherwise — including members whose upstream file does
+    /// pass one (PROV-154). Each row carries its own `baseUrl`, which is what the request path
+    /// reads.
     pub base_url: Option<&'static str>,
 }
 
@@ -103,8 +104,7 @@ pub enum FleetCatalog {
 /// it survives every future xAI release unchanged.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FleetWire {
-    /// `openai-completions` — eighteen of the twenty-one members, including all four
-    /// [`FleetCatalog::Dynamic`] ones, whose overlay rows are `openai-completions` upstream.
+    /// `openai-completions` — eighteen of the twenty-one members.
     Completions,
     /// `openai-responses` — `xai` (`ai/scripts/generate-models.ts:1877` @v0.85.1) and `meta`
     /// (PROV-080, `providers/meta.ts:22` @f1b2e77f5).
@@ -244,8 +244,8 @@ fleet! {
     // "QWEN_TOKEN_PLAN_API_KEY"`), narrowed to the eight-model personal allowlist
     // (`generate-models.ts:324-336`; `qwen-token-plan-models.test.ts:60-69`).
     "qwen-token-plan-individual" => (QWEN_TOKEN_PLAN_INDIVIDUAL, "Qwen Token Plan Individual", "QWEN_TOKEN_PLAN_API_KEY", "Qwen Token Plan Individual API key", Completions, embedded("qwen-token-plan-individual", "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1")),
-    // XAI_2 — the one Responses member, and the one whose catalog is LIVE-FETCHED (XAI_1). The
-    // declaration is what a freshly downloaded file gets checked against.
+    // XAI_2 — a Responses member (with `meta`, PROV-080). The declaration is what a freshly
+    // downloaded file gets checked against.
     "xai"                   => (XAI, "xAI", "XAI_API_KEY", "xAI API key", Responses, "xai"),
     "xiaomi"                => (XIAOMI, "Xiaomi", "XIAOMI_API_KEY", "Xiaomi API key", Completions, "xiaomi"),
     "xiaomi-token-plan-ams" => (XIAOMI_TP_AMS, "Xiaomi Token Plan AMS", "XIAOMI_TOKEN_PLAN_AMS_API_KEY", "Xiaomi Token Plan AMS API key", Completions, "xiaomi-token-plan-ams"),

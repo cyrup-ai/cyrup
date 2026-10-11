@@ -86,7 +86,10 @@ impl LiveCatalogSpec {
         match self.kind() {
             LiveCatalogKind::Chat => format!("{LIVE_CATALOG_ENDPOINT}{}", self.provider()),
             LiveCatalogKind::Classifier => {
-                format!("{LIVE_CATALOG_ENDPOINT}{}?types=classifier", self.provider())
+                format!(
+                    "{LIVE_CATALOG_ENDPOINT}{}?types=classifier",
+                    self.provider()
+                )
             }
         }
     }

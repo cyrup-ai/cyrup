@@ -701,7 +701,10 @@ async fn the_builtin_typesafe_provider_classifies_against_its_own_system_one_end
     assert_eq!(jev.context_window, 64000);
     assert!(models.get_model("typesafe", "jev-latest").is_none());
     assert!(models.get_models(Some("typesafe")).is_empty());
-    assert_eq!(models.get_classifier_model("typesafe", "jev-latest"), Some(jev.clone()));
+    assert_eq!(
+        models.get_classifier_model("typesafe", "jev-latest"),
+        Some(jev.clone())
+    );
     assert!(
         models
             .get_provider("typesafe")
@@ -737,7 +740,8 @@ async fn the_builtin_typesafe_provider_classifies_against_its_own_system_one_end
 /// pi's `typesafeProvider()` passes no `api`, so `createProvider` answers any chat stream with
 /// `Provider typesafe has no API implementation for "<api>"` (`models.ts:1076-1080`). The built-in
 /// carries an EMPTY api registry, so a chat model handed to it fails rather than being streamed
-/// through the shared registry under TypeSafe's key.
+/// through the shared registry under TypeSafe's key. The assertion is cyrup's wording
+/// (`ProviderError::NoApiImpl`), which differs from pi's and carries no provider id: PROV-157.
 #[tokio::test]
 async fn the_typesafe_provider_streams_nothing() {
     use crate::context::Context;
@@ -784,9 +788,8 @@ async fn the_state_reaches_the_wire_in_js_key_order() {
         .await;
     assert_eq!(result.stop_reason, ClassifierStopReason::Stop, "{result:?}");
     let body = &server.requests_to("/v1/systemone")[0].body;
-    let keys = |value: &Value| -> Vec<String> {
-        value.as_object().unwrap().keys().cloned().collect()
-    };
+    let keys =
+        |value: &Value| -> Vec<String> { value.as_object().unwrap().keys().cloned().collect() };
     assert_eq!(keys(&body["state"]), ["2", "10", "b", "a"]);
     assert_eq!(keys(&body["state"]["2"]), ["1", "y"]);
 }
@@ -826,8 +829,8 @@ async fn the_on_payload_hook_sees_the_state_in_js_key_order() {
 async fn the_system_one_body_spells_numbers_as_json_stringify_does() {
     let server = FakeServer::start().await;
     let mut ctx = context();
-    ctx.state = serde_json::from_str(r#"{"id":9007199254740993,"f":1.0,"e":1e21,"s":0.000001}"#)
-        .unwrap();
+    ctx.state =
+        serde_json::from_str(r#"{"id":9007199254740993,"f":1.0,"e":1e21,"s":0.000001}"#).unwrap();
     typesafe_system_one_api()
         .classify(&model(TYPESAFE, &server.base_url), &ctx, &keyed())
         .await;

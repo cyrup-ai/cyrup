@@ -67,7 +67,8 @@ fn oauth(ext: serde_json::Value) -> Credential {
 /// Decisions classifier, and an API key still does (`providers/openai.ts:27-29`).
 #[tokio::test]
 async fn a_composed_openai_keeps_its_filter_all_models() {
-    let file = model_file(r#"{ "providers": { "openai": { "baseUrl": "https://gateway.example/v1" } } }"#);
+    let file =
+        model_file(r#"{ "providers": { "openai": { "baseUrl": "https://gateway.example/v1" } } }"#);
     let classifiers = |models: Vec<cyrup_provider::AnyModel>| -> Vec<String> {
         models.iter().map(|m| m.id().to_string()).collect()
     };

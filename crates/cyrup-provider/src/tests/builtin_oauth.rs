@@ -120,7 +120,14 @@ fn no_other_builtin_provider_claims_a_subscription() {
 /// key row `/login` offers, nor the ambient resolution path.
 #[test]
 fn wiring_oauth_keeps_the_api_key_strategy() {
-    for id in ["anthropic", "kimi-coding", "meta", "openai", "xai", "openrouter"] {
+    for id in [
+        "anthropic",
+        "kimi-coding",
+        "meta",
+        "openai",
+        "xai",
+        "openrouter",
+    ] {
         let provider = all_providers()
             .into_iter()
             .find(|p| p.id().as_str() == id)

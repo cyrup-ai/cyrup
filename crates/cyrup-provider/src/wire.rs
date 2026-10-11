@@ -94,8 +94,7 @@ pub type FilterModelsFn = fn(&[Model], Option<&crate::auth::Credential>) -> Vec<
 /// A provider's credential-scoped availability policy across every model type (Pi
 /// `Provider.filterAllModels?`, `models.ts:196-206` @f1b2e77f5). A plain fn pointer for the reason
 /// [`FilterModelsFn`] is one. PROV-147.
-pub type FilterAllModelsFn =
-    fn(&[AnyModel], Option<&crate::auth::Credential>) -> Vec<AnyModel>;
+pub type FilterAllModelsFn = fn(&[AnyModel], Option<&crate::auth::Credential>) -> Vec<AnyModel>;
 
 impl WireProvider {
     /// Construct a provider. `auth_ctx` defaults to the real-env [`EnvAuthContext`] via

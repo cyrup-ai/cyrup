@@ -135,7 +135,8 @@ struct NoProxyEnv;
 impl AuthContext for NoProxyEnv {
     async fn env(&self, name: &str) -> Option<String> {
         // Pin proxy resolution off, so an ambient `HTTP_PROXY` cannot send loopback traffic away.
-        name.eq_ignore_ascii_case("no_proxy").then(|| "*".to_string())
+        name.eq_ignore_ascii_case("no_proxy")
+            .then(|| "*".to_string())
     }
     async fn file_exists(&self, _path: &str) -> bool {
         false
@@ -276,7 +277,10 @@ async fn re_mints_the_api_key_from_the_stored_identity_token_on_refresh() {
     let log = log.lock().unwrap().clone();
     assert_eq!(log.len(), 1);
     assert_eq!(log[0].path, MINT_PATH);
-    assert_eq!(log[0].header("authorization"), Some("Bearer identity-token"));
+    assert_eq!(
+        log[0].header("authorization"),
+        Some("Bearer identity-token")
+    );
 }
 
 /// pi `meta-oauth.test.ts:131-142`, "reports the setup URL when Meta issues no key".
@@ -348,7 +352,10 @@ fn error_detail_takes_the_first_non_blank_string_in_upstream_order() {
         detail(json!({ "error": "e", "message": "m", "detail": "d", "error_description": "ed" })),
         ": ed"
     );
-    assert_eq!(detail(json!({ "error": "e", "message": "m", "detail": "d" })), ": d");
+    assert_eq!(
+        detail(json!({ "error": "e", "message": "m", "detail": "d" })),
+        ": d"
+    );
     assert_eq!(detail(json!({ "error": "e", "message": "  m  " })), ": m");
     // Blank and non-string values are skipped, not reported.
     assert_eq!(
@@ -363,7 +370,8 @@ fn error_detail_takes_the_first_non_blank_string_in_upstream_order() {
 /// Every outcome of one device-token reply (`meta.ts:120-140`).
 #[test]
 fn every_token_reply_maps_as_upstream_does() {
-    let reply = |ok: bool, status: u16, value: Value| classify_token_reply(ok, status, Some(&value));
+    let reply =
+        |ok: bool, status: u16, value: Value| classify_token_reply(ok, status, Some(&value));
     assert_eq!(
         reply(true, 200, json!({ "access_token": "id" })),
         DeviceCodePollResult::Complete("id".to_string())
@@ -398,7 +406,11 @@ fn every_token_reply_maps_as_upstream_does() {
         }
     );
     assert_eq!(
-        reply(false, 500, json!({ "error": "server_error", "error_description": "down" })),
+        reply(
+            false,
+            500,
+            json!({ "error": "server_error", "error_description": "down" })
+        ),
         DeviceCodePollResult::Failed {
             message: "Meta device token request failed with status 500: down".to_string()
         }
@@ -448,18 +460,39 @@ fn device_authorization_parse_follows_upstream() {
         "http://x.test/"
     );
 
-    let error = parse(json!({ "device_code": "d", "user_code": "u", "verification_uri": "file:///x" }))
-        .unwrap_err();
+    let error =
+        parse(json!({ "device_code": "d", "user_code": "u", "verification_uri": "file:///x" }))
+            .unwrap_err();
     assert_eq!(
         error.to_string(),
         r#"Invalid Meta device authorization response: {"device_code":"d","user_code":"u","verification_uri":"file:///x"}"#
     );
-    let error = parse(json!({ "device_code": "", "user_code": "u", "verification_uri": "https://x" }))
-        .unwrap_err();
-    assert!(error.to_string().starts_with("Invalid Meta device authorization response: "));
+    let error =
+        parse(json!({ "device_code": "", "user_code": "u", "verification_uri": "https://x" }))
+            .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .starts_with("Invalid Meta device authorization response: ")
+    );
     assert_eq!(
         parse_device_authorization(None).unwrap_err().to_string(),
         "Invalid Meta device authorization response: null"
+    );
+}
+
+/// `meta.ts:91`: the invalid-response message is `JSON.stringify(json)` of what `response.json()`
+/// parsed, so it prints as JS prints: integer-like keys first and ascending, an integer past 2^53
+/// as the nearest double, and a float with no fraction without one. The body goes through
+/// [`read_json`] as the real reply does.
+#[test]
+fn the_invalid_response_message_prints_the_body_as_json_stringify_does() {
+    let body = r#"{"b":1,"1":2,"n":9007199254740993,"f":1.0,"device_code":""}"#;
+    assert_eq!(
+        parse_device_authorization(read_json(body).as_ref())
+            .unwrap_err()
+            .to_string(),
+        r#"Invalid Meta device authorization response: {"1":2,"b":1,"n":9007199254740992,"f":1,"device_code":""}"#
     );
 }
 
@@ -496,7 +529,10 @@ async fn mint_failures_follow_upstream() {
             403,
             "Meta session expired (status 403). Run `/login meta` to sign in again.: token revoked",
         ),
-        (500, "Meta API key mint failed with status 500: token revoked"),
+        (
+            500,
+            "Meta API key mint failed with status 500: token revoked",
+        ),
     ] {
         let (origin, _) = spawn(Arc::new(move |_: &str, _| {
             (status, json!({ "detail": "token revoked" }).to_string())
@@ -510,7 +546,10 @@ async fn mint_failures_follow_upstream() {
     }
     // No key and no trusted setup URL: the sentence alone.
     let (origin, _) = spawn(Arc::new(|_: &str, _| {
-        (200, json!({ "action_url": "javascript:void(0)" }).to_string())
+        (
+            200,
+            json!({ "action_url": "javascript:void(0)" }).to_string(),
+        )
     }))
     .await;
     let error = flow_at(&origin)
@@ -520,8 +559,15 @@ async fn mint_failures_follow_upstream() {
     assert_eq!(error.to_string(), "Meta did not issue an API key.");
 }
 
-/// `meta.ts:189-192`: once the login is cancelled, whatever failed is `Login cancelled`. The
-/// stub answers `authorization_pending` forever; the cancel lands during the first wait.
+/// A cancel during the poll wait ends the login as `Login cancelled`: the token reaches
+/// `poll_oauth_device_code_flow`'s `abortable_sleep`, and the mint is never called. The stub answers
+/// `authorization_pending` forever; the cancel lands during the first wait.
+///
+/// NON-REGRESSION GUARD, not a red-proof of `run_login`'s port of `meta.ts:189-192` (`catch (e) {
+/// if (interaction.signal.aborted) throw new Error("Login cancelled"); throw e; }`). With that
+/// mapping removed this test still passes, because the poller and `send`'s biased `select!` already
+/// answer `Cancelled` (mutation `080-cancel-map`, green). The mapping matters only for a cancel that
+/// lands after a reply was read and before its error returns, a race no test here can stage.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_cancelled_login_reports_login_cancelled() {
     let (origin, log) = spawn(Arc::new(|path: &str, _| match path {

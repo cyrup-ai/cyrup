@@ -526,6 +526,10 @@ static LABEL_TOKENS: LazyLock<DashMap<String, Arc<OnceCell<Option<TokenId>>>>> =
 /// waiters went away; before PROV-110 a waiter dropped mid-lookup (a cancelled `classify`) removed
 /// the entry while another caller was still resolving it, so the token that lookup then resolved
 /// went into an orphaned cell and the next caller sent the `/tokenize` requests again.
+///
+/// Every holder's handle is cloned out of the map and released back under the same shard write
+/// lock (see `drop`), so the count each check reads is exact: two holders dropped at the same
+/// moment on two threads cannot both read the other's handle and both keep an empty cell.
 struct EvictUnresolved {
     key: String,
     cell: Arc<OnceCell<Option<TokenId>>>,
@@ -534,11 +538,17 @@ struct EvictUnresolved {
 impl Drop for EvictUnresolved {
     fn drop(&mut self) {
         // Under the map shard's write lock, so a caller cloning the cell out of the map is ordered
-        // before or after this check, never across it.
-        LABEL_TOKENS.remove_if(&self.key, |_, current| {
-            Arc::ptr_eq(current, &self.cell)
-                && !self.cell.initialized()
-                && Arc::strong_count(&self.cell) == 2
+        // before or after this check, never across it. This guard's own handle is released INSIDE
+        // the closure, under that lock too: released after `remove_if` returned, two guards dropped
+        // at once could each check while the other still held its handle (a count of 3 for both),
+        // and the empty cell would stay in the map. The placeholder `take` leaves in the field is
+        // never shared.
+        let cell = std::mem::take(&mut self.cell);
+        LABEL_TOKENS.remove_if(&self.key, move |_, current| {
+            let evict =
+                Arc::ptr_eq(current, &cell) && !cell.initialized() && Arc::strong_count(&cell) == 2;
+            drop(cell);
+            evict
         });
     }
 }

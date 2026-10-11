@@ -28,8 +28,8 @@
 
 use std::sync::Arc;
 
-use serde_json::{Map, Value, json};
 use cyrup_core::Content;
+use serde_json::{Map, Value, json};
 
 use super::classifier_shared::{
     ClassifyError, format_error, json_stringify, parse_classifier_usage, post_classifier_request,
@@ -166,12 +166,16 @@ fn wire_input(context: &ClassifierContext) -> Result<Value, ClassifyError> {
 /// object in entry order (`Object.fromEntries`: a repeated value keeps its first position and takes
 /// the last probability, which [`OrderedMap::insert`] also does).
 fn choice_probabilities(value: Option<&Value>, id: &str) -> Result<OrderedMap<f64>, ClassifyError> {
-    let invalid = || ClassifyError::plain(format!("{LABEL} returned invalid probabilities for {id}"));
+    let invalid =
+        || ClassifyError::plain(format!("{LABEL} returned invalid probabilities for {id}"));
     let entries = value.and_then(Value::as_array).ok_or_else(invalid)?;
     let mut probabilities = OrderedMap::new();
     for entry in entries {
         let entry = entry.as_object().ok_or_else(invalid)?;
-        let choice = entry.get("value").and_then(Value::as_str).ok_or_else(invalid)?;
+        let choice = entry
+            .get("value")
+            .and_then(Value::as_str)
+            .ok_or_else(invalid)?;
         let probability = required_number(
             LABEL,
             entry.get("probability"),
@@ -192,7 +196,9 @@ fn parse_answer(
 ) -> Result<ClassifierAnswer, ClassifyError> {
     let kind = answer.get("type").and_then(Value::as_str);
     if kind == Some("refusal") {
-        return Err(ClassifyError::plain(format!("{LABEL} refused to answer {id}")));
+        return Err(ClassifyError::plain(format!(
+            "{LABEL} refused to answer {id}"
+        )));
     }
     match question {
         ClassifierQuestion::Choice { .. } => {
@@ -321,7 +327,8 @@ async fn run(
         "input": wire_input(context)?,
         "questions": questions,
     });
-    let body = post_classifier_request(LABEL, &url, model, body, options, NO_RETRY_STATUSES).await?;
+    let body =
+        post_classifier_request(LABEL, &url, model, body, options, NO_RETRY_STATUSES).await?;
     let Value::Object(body) = body else {
         return Err(ClassifyError::plain(format!(
             "{LABEL} returned an unexpected response"

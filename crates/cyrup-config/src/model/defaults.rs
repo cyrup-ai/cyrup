@@ -6,9 +6,9 @@ use cyrup_provider::Model;
 /// Curated default model id per known provider (Pi `defaultModelPerProvider`,
 /// `model-resolver.ts:21-62` @f1b2e77f5, v1.1.0-11). Returns `None` for an unknown provider.
 ///
-/// CFG-102 — every row is pi's f1b2e77f5 value except two, each pinned by name in the test below:
-/// `meta` (`muse-spark-1.3`), a provider cyrup does not ship (PROV-080); and pi's `azure` key,
-/// which cyrup still spells `azure-openai-responses` (the rename is PROV-145).
+/// CFG-102 — every row is pi's f1b2e77f5 value under pi's key, except pi's `azure` key, which
+/// cyrup still spells `azure-openai-responses` (the rename is PROV-145), pinned by name in the test
+/// below. `meta` (`muse-spark-1.3`) was the other exception until PROV-080 shipped the provider.
 pub fn default_model_per_provider(provider: &str) -> Option<&'static str> {
     let id = match provider {
         "amazon-bedrock" => "us.anthropic.claude-opus-4-6-v1",

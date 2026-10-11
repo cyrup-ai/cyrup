@@ -1745,8 +1745,9 @@ mod tests {
             LIVE_CATALOGS.len(),
             41,
             "every `packages/ai/src/providers/<p>.models.ts` pi ships except `together` (hand-\
-             ported), `radius` (catalog from its gateway) and `azure` (PROV-145), plus two \
-             classifier catalogs"
+             ported), `radius` (catalog from its gateway) and `typesafe` (no chat rows), with \
+             `azure` still fetched under its pre-rename id `azure-openai-responses` (PROV-145), \
+             plus two classifier catalogs (`openai-classifiers`, `typesafe-classifiers`)"
         );
         assert_eq!(
             CATALOGS.len() + LIVE_CATALOGS.len(),
@@ -2177,7 +2178,10 @@ mod tests {
             roster.unported_present.iter().map(|u| &u.reason).collect();
         assert_eq!(
             reasons,
-            [&UnportedReason::CatalogElsewhere, &UnportedReason::HandPorted]
+            [
+                &UnportedReason::CatalogElsewhere,
+                &UnportedReason::HandPorted
+            ]
         );
     }
 

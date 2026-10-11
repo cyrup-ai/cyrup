@@ -23,13 +23,13 @@ use serde_json::{Value, json};
 use super::llama_cpp_classify_fake_server::{
     Behavior, FakeServer, Recorded, Reply, boolean, choice, options, score,
 };
+use crate::Modality;
 use crate::api::openai_decisions::{MAX_IMAGES, openai_decisions_api};
 use crate::classifier::{
     ClassifierAnswer, ClassifierContext, ClassifierModel, ClassifierOptions, ClassifierResult,
     ClassifierStopReason, OrderedMap,
 };
 use crate::model::{ModelCost, ModelCostTier};
-use crate::Modality;
 use cyrup_core::Content;
 
 /// pi's test model (test:5-21): `gpt-6-luna` with the long-context tier, on the fake.
@@ -237,7 +237,11 @@ async fn maps_questions_to_decisions_types_and_answers_back_by_name() {
     let usage = result.usage.expect("usage");
     assert_eq!((usage.input, usage.output, usage.cache_read), (164, 0, 0));
     assert_eq!(usage.total_tokens, 164);
-    assert!((usage.cost.total - 0.000_016_4).abs() < 1e-12, "{}", usage.cost.total);
+    assert!(
+        (usage.cost.total - 0.000_016_4).abs() < 1e-12,
+        "{}",
+        usage.cost.total
+    );
 }
 
 /// pi test:132-139, "prices long-context requests at the long-context input rate".
@@ -398,6 +402,11 @@ async fn returns_missing_and_mistyped_answers_as_classifier_errors() {
 
 /// pi test:218-233, "preserves prototype-sensitive question IDs in answers". `__proto__` is an
 /// ordinary key in Rust, so this pins the id round trip the JS test exists for.
+///
+/// NON-REGRESSION GUARD: the hazard pi's test guards against (a `__proto__` key on a plain JS
+/// object sets its prototype, which is why `parseAnswers` uses a `Map` and `Object.fromEntries`,
+/// `openai-decisions.ts:131-144`) has no Rust counterpart, so no plausible defect in this port makes
+/// it fail. It is pi's test, ported, not proof of anything here.
 #[tokio::test]
 async fn preserves_prototype_sensitive_question_ids_in_answers() {
     let server = decisions(|_, _| {
@@ -490,7 +499,10 @@ async fn includes_the_api_error_body_for_other_http_failures() {
     let result = classify(&server, &context(), &opts).await;
     assert_eq!(result.stop_reason, ClassifierStopReason::Error);
     let message = result.error_message.unwrap();
-    assert!(message.contains("OpenAI Decisions error (400)"), "{message}");
+    assert!(
+        message.contains("OpenAI Decisions error (400)"),
+        "{message}"
+    );
     assert!(
         message.contains("Decision input exceeds the token limit."),
         "{message}"
@@ -718,7 +730,12 @@ async fn the_builtin_openai_provider_routes_gpt_6_luna_through_the_decisions_api
             .as_deref(),
         Some("openai-responses")
     );
-    assert!(models.get_provider("openai").unwrap().supports_classification());
+    assert!(
+        models
+            .get_provider("openai")
+            .unwrap()
+            .supports_classification()
+    );
 
     let server = decisions(|_, _| {
         Reply::Json(json!({
@@ -757,7 +774,11 @@ async fn the_builtin_openai_provider_routes_gpt_6_luna_through_the_decisions_api
 #[tokio::test]
 async fn openai_decisions_models_are_listed_only_for_api_key_credentials() {
     for overlay in [None, Some(openai_overlay())] {
-        let label = if overlay.is_some() { "overlaid" } else { "embedded" };
+        let label = if overlay.is_some() {
+            "overlaid"
+        } else {
+            "embedded"
+        };
         let with_api_key = builtin_models(
             Some(store(crate::Credential::api_key("secret"))),
             overlay.clone(),

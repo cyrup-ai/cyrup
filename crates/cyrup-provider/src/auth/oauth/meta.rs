@@ -48,13 +48,13 @@
 //! * **No `signal` on [`OAuthAuth::refresh`].** pi's `refresh(credential, signal)` re-mints under
 //!   the caller's signal; the trait has no parameter for one, so the trait method calls
 //!   [`MetaOAuth::mint_api_key`] with `None` (the same note [`super::kimi_coding`] carries).
-//! * **`JSON.stringify(json)`** in the invalid-device-response message is `serde_json::to_string`:
-//!   the same key order (the workspace enables `preserve_order`), and the same text for every
-//!   string, integer, boolean and null; a float with no fraction would print `1.0` where JS prints
-//!   `1`.
+//! * **`JSON.stringify(json)`** in the invalid-device-response message is the classifier apis'
+//!   emulation of it (`json_stringify`, PROV-110): `serde_json` alone would keep integer-like keys
+//!   in insertion order, keep an integer past 2^53 exact and print a float with no fraction as
+//!   `1.0`, where JS hoists the keys, rounds the integer and prints `1`.
 //! * **`new URL(value).href`** is [`super::kimi_coding::trusted_http_url`] — pi's `meta.ts:57-67`
-//!   is a copy of `kimi-coding.ts:57-67`, and cyrup keeps one Rust copy of the pair rather than
-//!   three; see that function for the normalization it does and does not model.
+//!   is a copy of `kimi-coding.ts:58-68` @f1b2e77f5, and cyrup keeps one Rust copy of the pair
+//!   rather than three; see that function for the normalization it does and does not model.
 
 use super::OAuthError;
 use super::device_code::{
@@ -97,7 +97,7 @@ const DEVICE_CODE_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:device_co
 /// The provider these failures are attributed to.
 pub const META_PROVIDER_ID: &str = "meta";
 
-/// `meta.ts:186`.
+/// `meta.ts:187`.
 pub const PROGRESS_MESSAGE: &str = "Enabling Meta Model API access...";
 
 // ---------------------------------------------------------------------------
@@ -105,7 +105,8 @@ pub const PROGRESS_MESSAGE: &str = "Enabling Meta Model API access...";
 // ---------------------------------------------------------------------------
 
 /// `readJson` (`meta.ts:40-47`): the body when it parses to a truthy `typeof === "object"` value
-/// (an object or an array), otherwise `null`. The same function as `kimi-coding.ts:48-55`.
+/// (an object or an array), otherwise `null`. The same function as `kimi-coding.ts:49-56`
+/// @f1b2e77f5.
 pub fn read_json(body: &str) -> Option<Value> {
     super::kimi_coding::read_json(body)
 }
@@ -144,10 +145,13 @@ pub fn positive_number(value: Option<&Value>) -> Option<f64> {
         .filter(|number| number.is_finite() && *number > 0.0)
 }
 
-/// `JSON.stringify(json)` for the invalid-response message; a rejected body is `null`, as pi's
-/// `readJson` returns.
+/// `JSON.stringify(json)` for the invalid-response message (`meta.ts:91`); a rejected body is
+/// `null`, as pi's `readJson` returns. The classifier apis' emulation of `JSON.stringify`
+/// ([`crate::api::classifier_shared::json_stringify`]): JS own-key order and JS number text, so the
+/// message is the text pi prints for the same reply.
 fn stringify(json: Option<&Value>) -> String {
-    serde_json::to_string(json.unwrap_or(&Value::Null)).unwrap_or_else(|_| "null".to_string())
+    crate::api::classifier_shared::json_stringify(json.unwrap_or(&Value::Null))
+        .unwrap_or_else(|_| "null".to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -205,7 +209,11 @@ pub fn parse_device_authorization(json: Option<&Value>) -> Result<DeviceAuthoriz
 /// `meta.ts:120-140`), split out so every branch is assertable without a socket. The identity
 /// token is the completed value. A success with no `access_token` and no `error` falls to the
 /// default branch, as pi's `switch` does.
-pub fn classify_token_reply(ok: bool, status: u16, json: Option<&Value>) -> DeviceCodePollResult<String> {
+pub fn classify_token_reply(
+    ok: bool,
+    status: u16,
+    json: Option<&Value>,
+) -> DeviceCodePollResult<String> {
     let get = |key: &str| json.and_then(Value::as_object).and_then(|o| o.get(key));
     if ok
         && let Some(token) = get("access_token")
