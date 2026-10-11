@@ -868,6 +868,7 @@ pub(super) async fn run_import_async_root(
             imported.structured_output.as_ref(),
             None,
         ),
+        output_partial: false,
         structured_output_path: None,
         // An imported async root's recovery evidence lives on ITS own terminal `ResultFile`
         // (pi's import copy, `subagent-runner.ts:760-790`, carries no `timeoutRecovery`).

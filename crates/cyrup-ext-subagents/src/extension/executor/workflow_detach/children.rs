@@ -347,6 +347,7 @@ fn step_child(step: &StepStatus, output: &str) -> SingleResult {
         session_file: step.session_file.clone(),
         child_run_id: step.run_id.clone(),
         output_state: output_state_for(output),
+        output_partial: false,
         structured_output_path: None,
         artifact_paths: None,
         // The step's own live-transcript stamps, exactly as `session_file` above is the step's.

@@ -1361,6 +1361,11 @@ pub struct StepResult {
     /// Whether the child produced substantive output
     /// ([`crate::exec::SingleResult::output_state`]).
     pub output_state: crate::exec::output_state::SubagentOutputState,
+    /// SUBA-195 — pi's runner `StepResult.outputPartial` (`src/runs/background/subagent-runner.ts`
+    /// @ad11b7ab, `outputPartial: finalResult?.outputPartial`), carried from
+    /// [`crate::exec::SingleResult::output_partial`] so an async run's terminal `ResultFile` still
+    /// says its output is recovered streaming text.
+    pub output_partial: bool,
     /// Where the child's structured output was written, when it survives
     /// ([`crate::exec::SingleResult::structured_output_path`]).
     pub structured_output_path: Option<std::path::PathBuf>,
@@ -1443,6 +1448,7 @@ impl StepResult {
             attempted_models: Vec::new(),
             session_file: None,
             output_state: crate::exec::output_state::SubagentOutputState::Unknown,
+            output_partial: false,
             structured_output_path: None,
             timeout_recovery: None,
             transcript_path: None,
@@ -1480,6 +1486,7 @@ impl StepResult {
             attempted_models: Vec::new(),
             session_file: None,
             output_state: crate::exec::output_state::SubagentOutputState::Unknown,
+            output_partial: false,
             structured_output_path: None,
             timeout_recovery: None,
             transcript_path: None,
@@ -2934,6 +2941,7 @@ fn collapse_fan_out(fan_out: FanOutResult<StepResult, SubagentError>) -> GroupSt
             attempted_models: Vec::new(),
             session_file: None,
             output_state: aggregate_output_state,
+            output_partial: false,
             structured_output_path: None,
             timeout_recovery: None,
             transcript_path: None,

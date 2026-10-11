@@ -1896,6 +1896,7 @@ pub(crate) fn detach_receipt(
             // `derive_output_state`'s own first branch — asserted rather than re-derived, because
             // the only input that could change the answer is a constant.
             output_state: crate::exec::output_state::SubagentOutputState::Present,
+            output_partial: false,
             // A detach is a hand-off, not a failure: `error` must stay `None` or
             // `foreground_history_child_status` would mint `"failed"` instead of `"detached"`
             // (`foreground_history/record.rs`), and `routing.rs`'s detached arm would never be

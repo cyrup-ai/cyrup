@@ -204,6 +204,7 @@ fn child_result(child_run_id: &str) -> SingleResult {
         session_file: None,
         child_run_id: Some(RunId::from_token(child_run_id.to_string())),
         output_state: SubagentOutputState::Present,
+        output_partial: false,
         structured_output_path: None,
         artifact_paths: None,
         transcript_path: None,

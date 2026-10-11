@@ -56,7 +56,7 @@ fn child(dir: &Path) -> std::path::PathBuf {
     script
 }
 
-fn single_step() -> SingleStepSpec {
+pub(super) fn single_step() -> SingleStepSpec {
     SingleStepSpec {
         worktree: crate::spawn::worktree::WorktreeRequest::Shared,
         machine: None,
@@ -84,7 +84,7 @@ fn single_step() -> SingleStepSpec {
     }
 }
 
-fn config(dir: &Path, run_id: &RunId, deadline_at_ms: u64) -> RunnerConfig {
+pub(super) fn config(dir: &Path, run_id: &RunId, deadline_at_ms: u64) -> RunnerConfig {
     let mut helper = crate::discovery::management::test_support::sample_agent(
         crate::discovery::types::AgentSource::Project,
         dir.join("helper.md"),

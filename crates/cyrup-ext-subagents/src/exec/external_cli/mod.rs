@@ -556,6 +556,7 @@ pub async fn run_external_cli(
             None,
             None,
         ),
+        output_partial: false,
         session_file: None,
         structured_output_path: None,
         artifact_paths: None,

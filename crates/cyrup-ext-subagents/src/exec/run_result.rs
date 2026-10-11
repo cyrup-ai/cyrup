@@ -345,6 +345,14 @@ pub struct SingleResult {
     /// stopped/timeout sentinel would get a different answer than the producer did.
     #[serde(default)]
     pub output_state: crate::exec::output_state::SubagentOutputState,
+    /// SUBA-195 — pi `SingleResult.outputPartial` (`src/shared/types.ts` @ad11b7ab, added by
+    /// `9bc8f2d1` / #2653): "True when the output is unfinished streamed text recovered after a
+    /// timeout or child error." Such a result has already failed; its [`Self::final_output`] carries
+    /// the text under `Partial output before timeout:` or `Partial output before child error:`, and
+    /// [`Self::output_state`] stays `present`, as upstream's does. Written only when `true`, as
+    /// upstream writes the key (`...(result.outputPartial ? { outputPartial: true } : {})`).
+    #[serde(default, skip_serializing_if = "crate::exec::is_false")]
+    pub output_partial: bool,
     /// Where this child's structured output was written, when it survives the run — pi
     /// `SingleResult.structuredOutputPath` (`subagent-runner.ts:1588`).
     ///

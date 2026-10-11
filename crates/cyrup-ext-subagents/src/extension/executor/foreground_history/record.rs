@@ -396,6 +396,7 @@ pub(crate) fn test_single_result(agent: &str, exit_code: i32) -> SingleResult {
         structured_output: None,
         session_file: None,
         output_state: Default::default(),
+        output_partial: false,
         structured_output_path: None,
         artifact_paths: None,
         transcript_path: None,

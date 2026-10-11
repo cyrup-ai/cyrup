@@ -383,6 +383,7 @@ pub(super) fn child_stopped_step_result() -> StepResult {
         attempted_models: Vec::new(),
         session_file: None,
         output_state: crate::exec::output_state::SubagentOutputState::Absent,
+        output_partial: false,
         structured_output_path: None,
         // No child ever ran — there is no worktree evidence to summarize (upstream's
         // `childStopResult` carries no `timeoutRecovery` either, `subagent-runner.ts:3011-3014`).
@@ -427,6 +428,7 @@ pub(super) fn stopped_single_result(step: &RunnerStep) -> SingleResult {
             attempted_models: Vec::new(),
             session_file: None,
             output_state: crate::exec::output_state::SubagentOutputState::Absent,
+            output_partial: false,
             structured_output_path: None,
             // pi `stoppedStepResult` (`subagent-runner.ts:3182-3190`) carries no
             // `timeoutRecovery`: the stop was applied outside the child (or before it spawned),
@@ -681,6 +683,7 @@ pub(super) fn step_result_to_single_result_with(
         child_run_id: None,
         session_file: result.session_file.clone(),
         output_state: result.output_state,
+        output_partial: result.output_partial,
         structured_output_path: result.structured_output_path.clone(),
         artifact_paths: result.artifact_paths.clone(),
         // pi `transcriptPath` / `transcriptError` on the runner's results copy
@@ -789,6 +792,7 @@ pub(super) fn imported_root_to_single_result(
             imported.structured_output.as_ref(),
             None,
         ),
+        output_partial: false,
         structured_output_path: None,
         artifact_paths: None,
         transcript_path: None,

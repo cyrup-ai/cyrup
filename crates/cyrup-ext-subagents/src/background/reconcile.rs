@@ -999,6 +999,7 @@ fn synthesize_step_results(status: &RunStatus, diagnostic: &str) -> Vec<crate::e
             // A reconciled placeholder describes a run cyrup could not read back — whether the
             // child produced output is genuinely unknowable here.
             output_state: crate::exec::output_state::SubagentOutputState::Unknown,
+            output_partial: false,
             structured_output_path: None,
             artifact_paths: None,
             // The step's declaration-time transcript stamp survives a crashed runner exactly as
@@ -1076,6 +1077,7 @@ pub(crate) fn placeholder_result(
         session_file: None,
         // As on `synthesize_step_results`: a run cyrup could not read back — unknowable.
         output_state: crate::exec::output_state::SubagentOutputState::Unknown,
+        output_partial: false,
         structured_output_path: None,
         artifact_paths: None,
         transcript_path: None,

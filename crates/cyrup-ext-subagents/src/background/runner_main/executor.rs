@@ -1375,6 +1375,7 @@ fn build_step_result(
         structured_output,
         session_file,
         output_state,
+        output_partial,
         structured_output_path,
         error,
         interrupted,
@@ -1397,9 +1398,20 @@ fn build_step_result(
     let mut step_result = if exit_code == 0 {
         StepResult::success(final_output, structured_output)
     } else {
-        StepResult::failure(error.unwrap_or_else(|| {
+        let mut failed = StepResult::failure(error.unwrap_or_else(|| {
             format!("subagent step '{agent_name}' exited with code {exit_code}")
-        }))
+        }));
+        // SUBA-195 — a partial result is by construction a FAILED one, and its text is the whole
+        // point: pi's runner keeps it as the step's `output` (`finalOutput =
+        // formatPartialOutput(streamedPartial, partialCause)`, `src/runs/background/
+        // run-child-session.ts` @ad11b7ab, carried as `output: outputForSummary` with
+        // `outputPartial: finalResult?.outputPartial`, `subagent-runner.ts`). `failure` drops
+        // `final_output` for every other failed step — that general drop is SUBA-222, not widened
+        // here.
+        if output_partial {
+            failed.final_output = final_output;
+        }
+        failed
     };
     step_result.interrupted = interrupted;
     // SUBA-149 — pi reads `singleResult.detached` to decide whether a step's managed worktree may
@@ -1477,6 +1489,9 @@ fn build_step_result(
     step_result.attempted_models = attempted_models;
     step_result.session_file = session_file;
     step_result.output_state = output_state;
+    // SUBA-195 — pi `outputPartial: finalResult?.outputPartial` on the runner's step result
+    // (`src/runs/background/subagent-runner.ts` @ad11b7ab). Same trailing-`..` caveat as above.
+    step_result.output_partial = output_partial;
     step_result.structured_output_path = structured_output_path;
     step_result
 }

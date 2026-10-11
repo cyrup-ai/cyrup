@@ -441,6 +441,7 @@ pub(super) async fn finish_run(
             // per-child placeholder — it is the parent run's session, not a child's.
             session_file: None,
             output_state: crate::exec::output_state::SubagentOutputState::Absent,
+            output_partial: false,
             structured_output_path: None,
             artifact_paths: None,
             transcript_path: None,
@@ -1003,6 +1004,7 @@ mod tests {
                 structured_output: None,
                 session_file: None,
                 output_state: Default::default(),
+                output_partial: false,
                 structured_output_path: None,
                 artifact_paths: None,
                 transcript_path: None,

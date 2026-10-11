@@ -89,6 +89,17 @@ pub(crate) struct SpawnedChildAttemptRunner<'a> {
 pub(crate) struct AttemptRecord {
     pub(crate) progress: AgentProgress,
     pub(crate) final_output: Option<String>,
+    /// SUBA-195 — pi `result.outputPartial = true` (`src/runs/foreground/execution.ts` @ad11b7ab;
+    /// the runner's `outputPartial: partialCause && streamedPartial ? true : undefined`,
+    /// `src/runs/background/run-child-session.ts`): [`Self::final_output`] is unfinished streamed
+    /// text recovered after a timeout or a child error, not a completed reply.
+    pub(crate) output_partial: bool,
+    /// SUBA-196 — pi `timeoutCause` (`src/runs/foreground/execution.ts` @ad11b7ab, `ba008223` /
+    /// #2694): the message of WHICHEVER timer ended this attempt — the run deadline's
+    /// `Subagent timed out after {timeoutMs}ms.` or the per-tool deadline's `Tool '{name}' exceeded
+    /// its timeout of {ms}ms.` — which the terminal preamble leads with. `None` unless the attempt
+    /// timed out.
+    pub(crate) timeout_cause: Option<String>,
     /// A soft interrupt (`RunOptions.interrupt`) fired on this attempt — pi's paused-success
     /// semantics (`execution.ts:722-761`, T3 group A). Carried on the runner's own per-attempt
     /// payload (not on [`AttemptSignal`], which this crate does not own) so `run_sync` can flip the
@@ -295,6 +306,14 @@ impl AttemptRunner for SpawnedChildAttemptRunner<'_> {
                 spawn_error,
                 final_output,
             );
+            // SUBA-196 — pi `timeoutCause`: the run timer assigns `attemptTimeout.message`
+            // (`Subagent timed out after ${options.timeoutMs}ms.`), `terminateForToolTimeout`
+            // assigns its own `message`, and the `select!` in `drive_attempt` lets only one of the
+            // two fire, as upstream's `|| result.timedOut` guards and `clearTimeout(timeoutTimer)`
+            // do.
+            record.timeout_cause = Some(outcome.tool_timeout_error.clone().unwrap_or_else(|| {
+                crate::exec::format_timeout_message(self.opts.timeout_ms.unwrap_or(0))
+            }));
             record.runtime_acknowledged_extensions = runtime_acknowledged_extensions;
             record.native_machine = native_machine;
             record.placed_stderr_tail = placed_stderr_tail;
@@ -324,6 +343,39 @@ impl AttemptRunner for SpawnedChildAttemptRunner<'_> {
             )
             .await;
 
+        // Read against the COMPLETED output, before the substitution below: a recovered partial
+        // is not evidence the child got past startup.
+        let startup = build_startup_evidence(
+            &progress,
+            &outcome,
+            final_output.as_deref(),
+            process_signal,
+            error_is_placeholder,
+            self.agent.mutation_tools.as_deref(),
+        );
+
+        // SUBA-195 — pi's `"child error"` arm: the unfinished text, stripped of any acceptance
+        // report and labelled `Partial output before child error:`, replaces the completed output
+        // (`fullOutput = formatPartialOutput(text, partialCause)`, `src/runs/foreground/execution.ts`;
+        // the runner's `finalOutput = formatPartialOutput(streamedPartial, partialCause)`,
+        // `src/runs/background/run-child-session.ts` @ad11b7ab). Applied AFTER the startup evidence
+        // above read the completed output, and only to a FAILED attempt: upstream's child error is
+        // always `exitCode: 1`, so a recovered text can never ride on a success.
+        let (final_output, output_partial) = match outcome.streamed_partial.as_ref() {
+            Some((cause @ crate::exec::partial_output::PartialOutputCause::ChildError, text))
+                if !success =>
+            {
+                (
+                    Some(crate::exec::partial_output::format_partial_output(
+                        &crate::exec::acceptance::model::strip_acceptance_report(text),
+                        *cause,
+                    )),
+                    true,
+                )
+            }
+            _ => (final_output, false),
+        };
+
         (
             AttemptSignal {
                 success,
@@ -343,19 +395,14 @@ impl AttemptRunner for SpawnedChildAttemptRunner<'_> {
                 // ladder can tell a provider failure the child reported from raw stderr after
                 // real activity.
                 message_errors: message_error_messages(&progress.message_end_events),
-                startup: build_startup_evidence(
-                    &progress,
-                    &outcome,
-                    final_output.as_deref(),
-                    process_signal,
-                    error_is_placeholder,
-                    self.agent.mutation_tools.as_deref(),
-                ),
+                startup,
             },
             AttemptRecord {
                 turn_budget: outcome.turn_budget.clone(),
                 progress,
                 final_output,
+                output_partial,
+                timeout_cause: None,
                 interrupted: false,
                 control,
                 tool_surface,
@@ -460,6 +507,9 @@ impl AttemptRunner for SpawnedChildAttemptRunner<'_> {
     /// pi mutates `result.finalOutput`/`result.interrupted` in place at `execution.ts:1584-1618`;
     /// this crate's ladder cannot reach inside an opaque `Attempt`, so it calls back here instead.
     fn apply_startup_outcome(&mut self, attempt: &mut Self::Attempt, outcome: &StartupOutcome) {
+        // SUBA-195 — every arm below REPLACES the output, so whatever partial text it held is gone
+        // and the flag must not outlive it.
+        attempt.output_partial = false;
         match outcome {
             StartupOutcome::Interrupted => {
                 attempt.interrupted = true;
@@ -1079,6 +1129,8 @@ fn attempt_setup_failure(
             turn_budget: Default::default(),
             progress,
             final_output: None,
+            output_partial: false,
+            timeout_cause: None,
             interrupted: false,
             control,
             // Nothing was planned or spawned, so there is no surface to report.
@@ -1127,6 +1179,9 @@ fn interrupted_attempt(
             turn_budget: outcome.turn_budget.clone(),
             progress,
             final_output: Some(INTERRUPTED_FINAL_OUTPUT.to_string()),
+            // pi's partial cause excludes an interrupt (`!result.interrupted`).
+            output_partial: false,
+            timeout_cause: None,
             interrupted: true,
             control,
             // A child DID launch on this path, so the surface it launched with is real and is
@@ -1162,6 +1217,16 @@ fn timed_out_attempt(
     spawn_error: Option<String>,
     final_output: Option<String>,
 ) -> (AttemptSignal, AttemptRecord) {
+    // SUBA-195 — pi `if (partialCause && streamedPartial) { fullOutput = partialCause === "timeout"
+    // ? text : …; result.outputPartial = true; }` with `text = stripAcceptanceReport(streamedPartial)`
+    // (`src/runs/foreground/execution.ts` @ad11b7ab): the unfinished text REPLACES the completed
+    // output, unlabelled — the terminal preamble files it under `Partial output before timeout:`.
+    let streamed = outcome
+        .streamed_partial
+        .as_ref()
+        .filter(|(cause, _)| *cause == crate::exec::partial_output::PartialOutputCause::Timeout)
+        .map(|(_, text)| crate::exec::acceptance::model::strip_acceptance_report(text));
+    let output_partial = streamed.is_some();
     (
         AttemptSignal {
             success: false,
@@ -1187,10 +1252,15 @@ fn timed_out_attempt(
             // (`execution.ts:1241`), but the state is still published.
             turn_budget: outcome.turn_budget.clone(),
             progress,
-            // CFG-067 — `result.finalOutput = message` on the same line (`execution.ts:1252`): the
-            // operator reads WHY the run stopped where its answer would have been, rather than the
-            // half-sentence a child signalled mid-tool-call happens to have flushed.
-            final_output: outcome.tool_timeout_error.clone().or(final_output),
+            // SUBA-196 — NOT the tool-timeout message. Upstream does assign `result.finalOutput =
+            // message` in `terminateForToolTimeout`, but its terminal composition rebuilds
+            // `fullOutput` from the completed messages (`getFinalOutput(result.messages)`) and puts
+            // the message in FRONT as `timeoutCause` (`ba008223`). Carrying it here as the output
+            // is what made the preamble file the cause under "Partial output before timeout:".
+            final_output: streamed.or(final_output),
+            output_partial,
+            // SUBA-196 — stamped by the caller, which holds the run's nominal `timeout_ms`.
+            timeout_cause: None,
             interrupted: false,
             control,
             // As on the interrupt path: a child launched, so its surface is real.

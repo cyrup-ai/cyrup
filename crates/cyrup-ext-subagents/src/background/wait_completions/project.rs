@@ -92,6 +92,12 @@ pub struct WaitCompletionChild {
     pub session_file: Option<std::path::PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_state: Option<crate::exec::output_state::SubagentOutputState>,
+    /// SUBA-195 — pi `...(child.outputPartial === true ? { outputPartial: true } : {})`
+    /// (`src/runs/background/wait-completions.ts` @ad11b7ab): the child's output is unfinished
+    /// streamed text recovered after a timeout or child error. Only a literal `true` counts, and
+    /// the key is written only when set.
+    #[serde(default, skip_serializing_if = "crate::exec::is_false")]
+    pub output_partial: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub structured_output_path: Option<std::path::PathBuf>,
     /// pi writes the key only when `true` (`:92`); `false` is the common case and must be
@@ -227,6 +233,7 @@ fn project_child(child: &serde_json::Value) -> WaitCompletionChild {
             .get("outputState")
             .cloned()
             .and_then(|value| serde_json::from_value(value).ok()),
+        output_partial: child.get("outputPartial") == Some(&serde_json::Value::Bool(true)),
         structured_output_path: non_empty(child.get("structuredOutputPath"))
             .map(std::path::PathBuf::from),
         context_overflow: child
@@ -702,10 +709,35 @@ mod tests {
             run_id: None,
             session_file: None,
             output_state: None,
+            output_partial: false,
             structured_output_path: None,
             context_overflow: false,
             artifact_paths: None,
             timeout_recovery: None,
         }
+    }
+
+    /// SUBA-195 — pi's own two projection cases (`test/unit/partial-output.test.ts`,
+    /// `9bc8f2d1`): "carries the partial flag" and "omits the flag when the output is complete".
+    #[test]
+    fn the_partial_flag_is_carried_only_when_true() {
+        let partial = project_child(&serde_json::json!({
+            "agent": "worker", "outputState": "present", "outputPartial": true
+        }));
+        assert!(partial.output_partial);
+        assert_eq!(
+            serde_json::to_value(&partial).unwrap()["outputPartial"],
+            serde_json::Value::Bool(true)
+        );
+        let complete = project_child(&serde_json::json!({
+            "agent": "worker", "outputState": "present"
+        }));
+        assert!(!complete.output_partial);
+        assert!(
+            serde_json::to_value(&complete)
+                .unwrap()
+                .get("outputPartial")
+                .is_none()
+        );
     }
 }

@@ -90,6 +90,13 @@ pub(crate) struct DriveOutcome {
     /// than by anything resumable. Read by the abort-recovery plan's `tool_budget_exhausted` rung
     /// (`abort-recovery.ts:111`).
     pub(crate) tool_budget_blocked: bool,
+    /// SUBA-195 — the text still streaming when this attempt ended abnormally, and why it ended
+    /// (pi `partialCause` + `partialOutput.text()`, `src/runs/foreground/execution.ts` and
+    /// `src/runs/background/run-child-session.ts` @ad11b7ab). `None` when the attempt ended
+    /// normally, or abnormally with no unfinished text newer than its last completed reply.
+    /// Computed once, at settle, as upstream extracts it once ("text is extracted once, when a
+    /// child ends abnormally").
+    pub(crate) streamed_partial: Option<(crate::exec::partial_output::PartialOutputCause, String)>,
 }
 
 /// The final-stop grace window (pi `FINAL_STOP_GRACE_MS`, `execution.ts:333`): once a terminal
@@ -280,6 +287,10 @@ struct DriveState {
     /// (`execution.ts:1102`) never CLOBBERS an earlier error, and the `!result.error` half of that is
     /// why this latches the FIRST one and ignores every later one.
     model_verification_error: Option<String>,
+    /// SUBA-195 — pi `const partialOutput = createPartialOutputTracker()`, one per attempt
+    /// (`runSingleAttempt` in `src/runs/foreground/execution.ts`; `runChildSession` in
+    /// `src/runs/background/run-child-session.ts`), fed every parsed child event.
+    partial_output: crate::exec::partial_output::PartialOutputTracker,
 }
 
 /// Which of [`drive_attempt`]'s exit paths is settling the attempt — the ONLY thing that differs
@@ -334,6 +345,7 @@ impl DriveState {
             tool_budget: None,
             model_verification_error: None,
             tool_timeouts: crate::exec::tool_timeout::ToolTimeoutTracker::new(opts.tool_timeout_ms),
+            partial_output: crate::exec::partial_output::PartialOutputTracker::new(),
             turn_budget: crate::exec::turn_budget::TurnBudgetTracker::new(
                 opts.turn_budget,
                 opts.enforce_hard_turn_limit,
@@ -348,7 +360,13 @@ impl DriveState {
         reason: Settled,
         exit_status: std::io::Result<Option<std::process::ExitStatus>>,
     ) -> DriveOutcome {
+        // Extracted only on an abnormal end, as upstream defers `text()` until then.
+        let streamed_partial = match self.partial_cause(reason, &exit_status) {
+            Some(cause) => self.partial_output.text().map(|text| (cause, text)),
+            None => None,
+        };
         DriveOutcome {
+            streamed_partial,
             // CFG-067 — pi's tool-timeout path sets the same `result.timedOut` the run-level
             // timeout does (`execution.ts:1250` vs `:1199`), so the ladder stops on either.
             timed_out: matches!(reason, Settled::TimedOut | Settled::ToolTimeout),
@@ -369,6 +387,45 @@ impl DriveState {
             // the ordinary one.
             after_compaction_settlement: self.after_compaction_settlement,
             tool_budget_blocked: self.tool_budget_blocked,
+        }
+    }
+
+    /// SUBA-195 — pi `partialCause` (`src/runs/foreground/execution.ts` @ad11b7ab):
+    ///
+    /// ```ts
+    /// const partialCause: PartialOutputCause | undefined = result.timedOut
+    ///     ? "timeout"
+    ///     : childPromptFailed && !abortedBySignal && !result.interrupted && !result.stopped ? "child error" : undefined;
+    /// ```
+    ///
+    /// `result.timedOut` is both of cyrup's timeout settles (the run deadline and a per-tool
+    /// deadline set the same flag upstream). `[CYRUP-DELTA]` `childPromptFailed` is upstream's
+    /// in-process `session.prompt()` REJECTING; a cyrup child is a subprocess, whose equivalent is
+    /// the process ending in failure — a non-zero exit, a fatal signal, or a wait/read fault —
+    /// WITHOUT ever emitting `agent_settled`. That second half is what keeps upstream's "ordinary
+    /// non-zero exits are unchanged" (`9bc8f2d1`'s message): a child whose run settled and then
+    /// exited non-zero (a provider error the agent reported, say) did not throw, and an ordinary
+    /// `Exited` settle is the only path a failure like that takes. Cancel (`abortedBySignal`),
+    /// interrupt, a forced drain, a turn-budget abort and a protocol failure are their own settles
+    /// and so never qualify.
+    fn partial_cause(
+        &self,
+        reason: Settled,
+        exit_status: &std::io::Result<Option<std::process::ExitStatus>>,
+    ) -> Option<crate::exec::partial_output::PartialOutputCause> {
+        match reason {
+            Settled::TimedOut | Settled::ToolTimeout => {
+                Some(crate::exec::partial_output::PartialOutputCause::Timeout)
+            }
+            Settled::Exited if !self.agent_settled => {
+                let failed = match exit_status {
+                    Ok(Some(status)) => !status.success(),
+                    Ok(None) => false,
+                    Err(_) => true,
+                };
+                failed.then_some(crate::exec::partial_output::PartialOutputCause::ChildError)
+            }
+            _ => None,
         }
     }
 
@@ -535,6 +592,10 @@ async fn handle_child_line(
     let Some(event) = crate::exec::ndjson::parse_line(line) else {
         return LineAction::Continue;
     };
+    // SUBA-195 — pi `partialOutput.observe(evt)`, the first statement of `processEvent`
+    // (`src/runs/foreground/execution.ts`; `src/runs/background/run-child-session.ts`) @ad11b7ab:
+    // every parsed event, before any other fold can return early.
+    state.partial_output.observe(&event);
     // Final-stop grace-drain (pi `startFinalDrain`, execution.ts:584-605): open the grace window on
     // the FIRST terminal assistant stop and track whether ANY terminal stop was clean (no
     // errorMessage) for `forcedDrainAfterFinalSuccess`.

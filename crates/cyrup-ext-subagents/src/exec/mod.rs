@@ -54,6 +54,7 @@ pub mod mutation_evidence;
 pub mod ndjson;
 pub mod output;
 pub mod output_state;
+pub mod partial_output;
 pub mod permissions;
 pub mod refinement_evidence;
 pub mod result_summary;
@@ -613,6 +614,8 @@ async fn run_sync_unnamed(agent: &AgentConfig, task: &str, opts: &RunOptions) ->
         exit_code,
         mut error,
         final_output,
+        output_partial,
+        timeout_cause,
     } = SettledAttempt::from_ladder(last_signal.as_ref(), last_attempt.as_ref());
     // SUBA-100 [CYRUP-DELTA] — a placed native child that failed gets upstream's remote-failure
     // hint (`formatHerdrMachineHint`, `herdr-machine.ts`: missing remote binary, ssh auth,
@@ -781,6 +784,7 @@ async fn run_sync_unnamed(agent: &AgentConfig, task: &str, opts: &RunOptions) ->
         final_output,
         timed_out,
         opts.timeout_ms,
+        timeout_cause.as_deref(),
         &turn_budget_tracker,
         // §0.1's one-interpolation-wide hole, filled: `execution.ts:1500-1502` splices the
         // recovery message between the timeout message and the partial-output heading.
@@ -802,7 +806,15 @@ async fn run_sync_unnamed(agent: &AgentConfig, task: &str, opts: &RunOptions) ->
             &contract,
             &progress,
             opts,
-            if structured_substituted {
+            // SUBA-195 — "Unfinished streamed text never stands in for the child's completed
+            // reply" (pi's runner, `outputForAcceptance = finalResult?.outputPartial ? "" :
+            // rawOutput`, `src/runs/background/subagent-runner.ts` @ad11b7ab; the foreground keeps
+            // `acceptanceOutput = getFinalOutput(result.messages)` apart from the partial). A
+            // partial run has already failed, so the gate is not clean either way; this keeps the
+            // text out of the evaluation by construction rather than by that coincidence.
+            if output_partial {
+                None
+            } else if structured_substituted {
                 acceptance_prose.as_deref()
             } else {
                 final_output.as_deref()
@@ -917,6 +929,7 @@ async fn run_sync_unnamed(agent: &AgentConfig, task: &str, opts: &RunOptions) ->
         // async settle path's mirror of `StepStatus::run_id` (`runner_main/settle.rs`).
         child_run_id: None,
         output_state,
+        output_partial,
         // pi `subagent-runner.ts:1588`: published only where the capture directory outlives the
         // run (`RunOptions::structured_output_dir`, the async policy), and withheld from a
         // timed-out or stopped run whose capture the child may not have finished writing. The
@@ -1268,6 +1281,7 @@ pub(crate) fn pre_spawn_failure(agent: &AgentConfig, task: &str, error: String) 
         structured_output: None,
         // Nothing spawned, so nothing was produced — known-absent, not unknown.
         output_state: crate::exec::output_state::SubagentOutputState::Absent,
+        output_partial: false,
         session_file: None,
         structured_output_path: None,
         artifact_paths: None,
@@ -1525,6 +1539,10 @@ struct SettledAttempt {
     exit_code: i32,
     error: Option<String>,
     final_output: Option<String>,
+    /// SUBA-195 — [`AttemptRecord::output_partial`] of the winning attempt.
+    output_partial: bool,
+    /// SUBA-196 — [`AttemptRecord::timeout_cause`] of the winning attempt.
+    timeout_cause: Option<String>,
 }
 
 impl SettledAttempt {
@@ -1543,6 +1561,8 @@ impl SettledAttempt {
                     .unwrap_or(if signal.success { 0 } else { 1 }),
                 error: signal.error.clone(),
                 final_output: record.final_output.clone(),
+                output_partial: record.output_partial,
+                timeout_cause: record.timeout_cause.clone(),
             },
             _ => Self {
                 timed_out: false,
@@ -1552,6 +1572,8 @@ impl SettledAttempt {
                 exit_code: 1,
                 error: Some("subagent fallback ladder produced no attempt outcome".to_string()),
                 final_output: None,
+                output_partial: false,
+                timeout_cause: None,
             },
         }
     }
@@ -1576,15 +1598,26 @@ impl SettledAttempt {
 /// only, never in a preamble. Before this parameter existed, cyrup's port of `:824-829` was
 /// `execution.ts:1501` with the recovery interpolation deleted: a timed-out child's caller was
 /// told the run timed out and never told which tracked files it had already changed.
+///
+/// SUBA-196 — the preamble leads with `timeout_cause`, the message of whichever timer actually
+/// fired (pi `timeoutCause`, `ba008223` / #2694: `` `${timeoutCause}\n\n${recovery}\n\nPartial
+/// output before timeout:\n${fullOutput}` ``), so a child ended by a per-tool deadline reads
+/// `Tool 'bash' exceeded its timeout of …ms.` rather than a run-deadline sentence (`after 0ms` when
+/// no run timeout was set). `None` falls back to the run-deadline sentence: a timed-out ladder
+/// whose winning attempt carried no cause (none today) is a run-deadline kill.
 fn apply_terminal_preamble(
     mut final_output: Option<String>,
     timed_out: bool,
     timeout_ms: Option<u64>,
+    timeout_cause: Option<&str>,
     turn_budget_tracker: &crate::exec::turn_budget::TurnBudgetTracker,
     recovery_message: Option<&str>,
 ) -> Option<String> {
     if timed_out {
-        let timeout_message = format_timeout_message(timeout_ms.unwrap_or(0));
+        let timeout_message = timeout_cause.map_or_else(
+            || format_timeout_message(timeout_ms.unwrap_or(0)),
+            str::to_string,
+        );
         // pi `execution.ts:1500-1502`: the recovery summary sits BETWEEN the timeout message and
         // the partial-output heading.
         let head = match recovery_message {
@@ -3581,6 +3614,7 @@ mod tests {
             Some("partial answer".to_string()),
             true,
             Some(5_000),
+            None,
             &tracker,
             Some("Recovery summary:\n- termination: timed-out"),
         );
@@ -3598,7 +3632,8 @@ mod tests {
     #[test]
     fn terminal_preamble_splices_the_recovery_message_alone_when_no_partial_exists() {
         let tracker = crate::exec::turn_budget::TurnBudgetTracker::default();
-        let out = apply_terminal_preamble(None, true, Some(5_000), &tracker, Some("recovery"));
+        let out =
+            apply_terminal_preamble(None, true, Some(5_000), None, &tracker, Some("recovery"));
         assert_eq!(
             out.as_deref(),
             Some(format!("{}\n\nrecovery", format_timeout_message(5_000))).as_deref()
@@ -3617,6 +3652,7 @@ mod tests {
                 Some("partial".to_string()),
                 true,
                 Some(5_000),
+                None,
                 &tracker,
                 None
             )
@@ -3631,6 +3667,7 @@ mod tests {
             apply_terminal_preamble(
                 Some("answer".to_string()),
                 false,
+                None,
                 None,
                 &tracker,
                 Some("recovery must be ignored"),
