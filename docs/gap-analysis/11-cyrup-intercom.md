@@ -2,6 +2,15 @@
 
 This area covers `crates/cyrup-intercom` — the Unix-socket supervisor↔subagent broker, its client transport, inbound-message delivery, presence/lifecycle reporting, the `intercom` / `contact_supervisor` tool surface, and the broker binary.
 
+> ### CLOSURE 2026-10-11 — `ICOM-088` filed and closed: the reconnect integration test asserted a transient state
+>
+> `intercom reconnect::a_broker_drop_reconnects_and_the_session_can_send_again` failed once in a loaded
+> full `cargo run -p xtask -- it` at `reconnect.rs:134` ("the disconnect edge armed a backoff rung").
+> Root cause, reproduction and fix are in the `ICOM-088` row and section. Production's disconnect
+> ordering matches pi v0.16.1 and is unchanged; the supervisor gained a monotonic `rungs_armed()`
+> count and the test reads that. **Counted set after this pass: 0 open; 81 closed (`count_open_items.py`; 80 before). Next free id:
+> `ICOM-089`.**
+
 > ### E2E VERIFICATION 2026-10-09 — real binaries over two scratch HOMEs; one defect found and closed (`ICOM-086`)
 >
 > Driven with the real `cyrup`, `cyrup-intercom-cli` and the `__intercom-broker` it spawns, two
@@ -40,7 +49,7 @@ This area covers `crates/cyrup-intercom` — the Unix-socket supervisor↔subage
 > `it-bins` build filled the disk — and AWS keys unset for `no_ambient_provider_credentials`).
 >
 > **Counted set after this pass: 0 critical · 0 high · 0 medium · 0 low = 0 open; 79 closed.**
-> **Next free id: `ICOM-088`.**
+> **Next free id: `ICOM-088`** (superseded: `ICOM-089` after the 2026-10-11 closure of `ICOM-088`).
 
 > ### CLOSURES 2026-10-08 — the whole `v0.14.0..v0.16.1` backlog: eight rows closed (`ICOM-071`, `ICOM-073`, `ICOM-075`, `ICOM-076`, `ICOM-078`, `ICOM-079`, `ICOM-080`, `ICOM-081`); `ICOM-083`…`ICOM-085` filed and closed
 >
@@ -443,6 +452,8 @@ Closed this pass: **3** (ICOM-007, ICOM-019, ICOM-020). Newly filed: **24** (ICO
 
 ## Open items
 
+> **2026-10-11:** `ICOM-088` (test-defect, the reconnect test read a transient armed slot) filed and closed; no open row. **Next free id: `ICOM-089`.**
+>
 > **2026-10-10:** `ICOM-087` was stale (removed on `main` by `cc1fcd627` before this branch merged it) and is struck; area 11 has no open row again. **Next free id: `ICOM-088`** (2026-10-09, after the codemode end-to-end repair filed `ICOM-087` (that branch called it `ICOM-083`; renumbered when it was merged with `main`, where `ICOM-083`…`ICOM-086` are the v0.16.1 and E2E rows); before that `ICOM-083`…`ICOM-086`, 2026-10-09 on `main`, 2026-10-04, after `ICOM-082` was filed and closed in the same pass).
 
 > ### BATCH 2 — 2026-09-04 (ledger audit): **2 closed, 5 open** — counted set **0 critical, 0 high, 2 medium, 3 low = 5**, 49 closed (`scripts/count_open_items.py`); authoritative over every block below.
@@ -741,6 +752,7 @@ Closed this pass: **3** (ICOM-007, ICOM-019, ICOM-020). Newly filed: **24** (ICO
 | ~~ICOM-085~~ | ~~low~~ **CLOSED 2026-10-08** | not-ported | M | **`/intercom` and Alt+M print a picture of the session list instead of opening it (`PARITY-GAPS.md` `UW-10`)** — upstream's `openIntercomOverlay` (`index.ts:3149-3221@v0.16.1`) hands `SessionListOverlay` (`:3186`) and `ComposeOverlay` (`:3208`) to `ctx.ui.custom`, and `/intercom` and `alt+m` both open it (`:3223-3226`, `:3243-3246`). cyrup's `handle_input` state machines were ported and unit-tested but never reached: nothing in the crate called `open_overlay`, and three in-tree comments still claimed the overlay host and `register_shortcut` were absent. `UW-10` had no area-11 id (`PARITY-GAPS.md` said one must be filed); `ICOM-078`'s `h` key needs a live list, so it is **FILED and CLOSED 2026-10-08** with it. Bare `/intercom` in the TUI and the newly registered Alt+M shortcut (`extension.rs:1294-1296`) open the live list (`open_intercom_overlay`, `:570`, gated like upstream at `:1413-1420`); Enter opens a live compose box that sends from inside the overlay and still writes `intercom_sent`; `h` opens the handover picker. When no interactive surface takes the overlay the existing text rendering stands in. `ui/overlay.rs` (new) adapts the crate's text components to `open_overlay`: host keys become raw terminal input and theme colours ride as zero-width markers that become themed spans, every line at its declared width. The "Current session is missing…" text is upstream's, and the false comments are corrected. Pinned by `ui::session_list::tests::the_overlay_adapter_publishes_message_and_handover_selections`, the `ui::overlay` tests, and over a real broker `handover_command::alt_m_opens_the_live_list_and_enter_composes_and_sends`, `h_in_the_live_session_list_opens_the_picker_on_that_session` and `no_interactive_surface_falls_back_to_the_text_list`. |
 | ~~ICOM-086~~ | ~~medium~~ **CLOSED 2026-10-09** | parity-bug | S | **A session started with `--name` or renamed with `/name` registers on the broker under its unnamed `subagent-chat-<id>` alias, so peers cannot address it by name** — pi's `getSessionName()` reads the session manager live (`agent-session.ts:865`), and `--name` is applied before extensions start (`main.ts:709-716`), so pi-intercom's `buildPresenceIdentity` (`index.ts:387-389@v0.16.1`) registers the name. cyrup's `HostServices::session_name` read a `LiveHostServices` snapshot that only a GUEST's own `set_session_name` refreshed: `attach_session` never seeded it and `AgentSession::set_session_name` (`/name`, `--name` via `apply_post_build`, RPC) never touched it (`update_state` had no production caller). Found by the 2026-10-09 E2E run: `cyrup --name beta-worker` listed as `subagent-chat-01a11ea2-58df-7582`, so `beta-worker@beta` and the picker rows named nothing. **Fixed:** `attach_session` seeds the name from the manager; `AgentSession::set_session_name` refreshes it through the new `LiveHostServices::set_snapshot_session_name` before the `session_info_changed` fan-out, and intercom's 1 s name poll pushes it to the broker. Tests: `host_services::tests::attach_session_seeds_the_session_name_from_the_manager`, `tests::round8_postrun::a_host_side_rename_is_what_extensions_read_back`; E2E: `--name` registered as `alpha-lead`/`beta-worker`, and `/name alpha-peer-renamed` reached `cyrup intercom list` within the poll. |
 | ~~ICOM-087~~ | ~~low~~ **CLOSED 2026-10-10 — STALE: removed on `main` by `cc1fcd627`, which this branch had already merged when the row was written** | test-defect | S | **`cyrup-it`'s `intercom` target fails `clippy -D warnings`: a dead helper and a single-arm match.** — `crates/cyrup-it/tests/intercom/handover_action.rs`: `fn session(id: &str, cwd: &str) -> SessionInfo` (`:66`) has no caller in the file (the other `session*` names are trait methods or different functions), and `match self.peer_events.recv().await.expect("the channel delivers") { InboundEvent::Message { from, message } => return (from, *message), _ => {} }` (`:288-291`) is `clippy::single_match`. Found by the e2e lane's clippy run (`clippy3.txt`); the ledger pass confirmed both by reading the file. Pre-existing, not caused by the codemode repair. **Fix** -- delete the helper and rewrite the match as `if let`. **Verify** -- `cargo clippy -p cyrup-it --features it --test intercom -- -D warnings` is clean. **FILED 2026-10-09** (the codemode end-to-end repair; closure record in `18-pi-codemode.md`). **CLOSED 2026-10-10 as stale (the it-suite lane found it; the ledger pass re-read it).** Both anchors exist at `4f649ab66` and at `cc1fcd627^` (`fn session(id: &str, cwd: &str) -> SessionInfo` at `:66` and the `_ => {}` arm at `:290` of `crates/cyrup-it/tests/intercom/handover_action.rs`) and neither exists at HEAD: `cc1fcd627` (the area-11 backlog on `main`, an ancestor of HEAD) deleted the helper and rewrote the match as `if let InboundEvent::Message { from, message } = ...`. The lane ran the target: clippy `-D warnings` over all `cyrup-it` test targets is clean (rc 0, with real `Checking` lines) and the 174 intercom tests pass. The row named `4f649ab66` as its evidence and was never re-read after the merge. |
+| ~~ICOM-088~~ | ~~low~~ **CLOSED 2026-10-11** | test-defect | S | **The ICOM-003 reconnect integration test asserted `reconnect_armed()`, a state that is true only while a backoff rung sleeps, so a loaded run saw it false** — `crates/cyrup-it/tests/intercom/reconnect.rs:134` (`a_broker_drop_reconnects_and_the_session_can_send_again`) checked `state.connect.reconnect_armed()` after the in-flight ask had resolved. That accessor is `timer.is_some() && !is_finished()`, and the slot empties in two ways the test cannot exclude: (1) rung 0's own body calls `release_timer()` when it fires 1000 ms after the edge (`connect.rs` `schedule_reconnect`, pi `reconnectTimer = null`, `index.ts:1515@v0.16.1`), so a test task descheduled for >1 s between the edge and the assert reads `false` — then `connecting`, then a respawned client; (2) `handle_disconnect` resolves the waiter and sets `client = None` before it calls `schedule_reconnect`, on another worker thread, so a poll can land between them. pi's handler (`index.ts:1489-1503@v0.16.1`) has the same order — reject, `client = null`, `scheduleReconnect()` — but runs as one synchronous JS callback, so no observer sees the middle; production matches upstream and is not the defect. Observed once in a loaded full `xtask it` run (panic `reconnect.rs:134:5`, "the disconnect edge armed a backoff rung", right after the ask resolved with `Disconnected while waiting for reply:`); passed alone. **Reproduced deterministically** by inserting `tokio::time::sleep(1500 ms)` (the descheduling) before the assert: FAIL every run, same message (`reconnect.rs:136:5` with the two inserted lines). **Fix:** `ConnectSupervisor::rungs_armed()`, a monotonic count incremented by every arm in `schedule_reconnect`; the test asserts it is 0 after the startup connect and `> 0` after the edge (`within` 5 s, a monotone predicate). The same stalled build PASSES. A disconnect that arms nothing (the pre-ICOM-003 `break`) still fails it. Unit test `connect::tests::the_arm_count_outlives_the_transient_armed_slot` (paused clock) pins the count: one per real arm, none for an idempotent or refused schedule, still counted after the slot is empty. |
 
 ---
 
@@ -2357,6 +2369,69 @@ had no target, and the handover picker and `/intercom` list showed aliases.
 `mgr.session_name()`; new `set_snapshot_session_name`) and
 `crates/cyrup-session-svc/src/session/transcript.rs` (`set_session_name` refreshes the snapshot before
 fanning out). Unit tests named in the row; the E2E evidence is the 2026-10-09 block at the top.
+
+## ~~ICOM-088~~ — ~~low~~ **CLOSED 2026-10-11** — the reconnect test asserted the transient armed slot
+
+**Kind.** test-defect. Production is unchanged in behaviour; it gains one observability counter.
+
+**Failure.** One loaded full `cargo run -p xtask -- it` run:
+
+```text
+thread 'reconnect::a_broker_drop_reconnects_and_the_session_can_send_again' panicked at
+crates/cyrup-it/tests/intercom/reconnect.rs:134:5:
+the disconnect edge armed a backoff rung
+```
+
+This fired right after the in-flight ask resolved with `Disconnected while waiting for reply:`. It
+passed alone and in later full runs.
+
+**Root cause.** `ConnectSupervisor::reconnect_armed()` is `timer.is_some_and(|h| !h.is_finished())`, so
+it is true only while a rung is sleeping. Two interleavings make it false at the assert:
+
+1. **Rung 0 fired before the assert (reproduced).** The rung's body calls `release_timer()` as its first
+   statement, as pi does with `reconnectTimer = null` (`index.ts:1515@v0.16.1`). It then runs a
+   `Background` `ensure_connected`, which respawns the broker and installs a client. A test task
+   descheduled for more than 1000 ms between the edge and the assert therefore finds the slot empty.
+   Under a full `xtask it` run on a loaded box, that much delay is plausible.
+2. **The assert ran before the edge armed (analytic).** `handle_disconnect` runs `fail_pending`, then
+   `set_client(None)`, then `set_timer(None)` and `schedule_reconnect`, on a tokio worker other than
+   the test's. The test waits on the first two effects (the `client().is_none()` poll and the waiter),
+   so if the disconnect thread is preempted after `set_client(None)`, the test can read the slot before
+   the rung exists. pi's `disconnected` handler (`index.ts:1489-1503@v0.16.1`) has the same order, but
+   it is one synchronous callback on a single-threaded event loop, so no continuation can observe the
+   middle. The port keeps the order and loses the atomicity. That changes nothing for production:
+   no caller acts on "armed", and a tool connect racing the edge is handled by `connecting` and the
+   gate. It only matters to an observer that reads the slot.
+
+Neither interleaving is a production defect, so the fix is in what the test observes.
+
+**Reproduction at HEAD.** With `tokio::time::sleep(Duration::from_millis(1500)).await;` inserted just
+before the assert (standing in for the descheduling),
+`cargo run -p xtask -- it -E 'test(a_broker_drop_reconnects_and_the_session_can_send_again)'` gave
+`FAIL [2.104s]` with `panicked at crates/cyrup-it/tests/intercom/reconnect.rs:136:5: the disconnect
+edge armed a backoff rung`. That is the original message, two lines lower because of the inserted
+lines. Interleaving 2 needs a preemption inside `handle_disconnect`, which the test cannot force
+without a production hook. The fix covers it by construction: a monotone count read with a bounded
+wait cannot be missed by arriving early or late.
+
+**Fix.**
+- `crates/cyrup-intercom/src/connect.rs`: new `ConnectSupervisor::rungs_armed: AtomicU64`, incremented
+  after every successful arm in `schedule_reconnect`, and never on an early return. Its accessor is
+  `rungs_armed()`.
+- `crates/cyrup-it/tests/intercom/reconnect.rs`: asserts `rungs_armed() == 0` after the startup connect,
+  then `within(5 s, || rungs_armed() > before)` after the edge. This is not vacuous: before ICOM-003
+  the inbound loop `break`ed and nothing ever armed.
+- Unit test `connect::tests::the_arm_count_outlives_the_transient_armed_slot` runs on a paused clock.
+  It checks one count per real arm and none for an idempotent re-schedule. It checks that rung 0's
+  failure counts rung 1, that the count holds after the slot is emptied, and that nothing counts after
+  shutdown.
+
+**Evidence after the fix.** With the same 1500 ms stall still inserted, the test gives `PASS [1.645s]`.
+With the stall removed: `cargo run -p xtask -- it -E 'binary(intercom)'`
+**174/174** passed (`reconnect::a_broker_drop_…` `PASS [1.249s]`, both sibling reconnect tests
+pass); `cargo nextest run -p cyrup-intercom` **492/492** (the new unit test included);
+`cargo clippy -D warnings` clean on `cyrup-intercom --all-targets` and `cyrup-it --features it --tests`;
+`cargo fmt --all -- --check` clean.
 
 ## Coverage
 
