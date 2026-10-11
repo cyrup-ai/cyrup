@@ -4,5 +4,6 @@
 mod getters;
 mod merge_and_scope;
 mod quiet_startup;
+mod symlinked_store;
 mod wheel_lines;
 mod write_refusal;

@@ -95,20 +95,38 @@ impl SettingsStore for FileSettingsStore {
         scope: SettingsScope,
         f: &mut (dyn for<'s> FnMut(Option<&'s str>) -> Option<String> + Send),
     ) -> Result<(), ConfigError> {
-        let path = self.path(scope).to_path_buf();
-        let _guard = crate::lock::FileLock::acquire(&path, None).await?;
-        let current = match std::fs::read_to_string(&path) {
+        let path = self.path(scope);
+        // CFG-112: lock and write the PHYSICAL file, not the spelling this store was built with.
+        // `FileLock` keys on `<given path>.lock`, so locking a symlinked `settings.json` by its
+        // link name took a different sidecar from the `cyrup-ext-subagents` settings writers,
+        // which lock `<physical target>.lock` (SUBA-029/171/184, pi `withSettingsFileLease` →
+        // `resolveSettingsWriteTarget`), and the two did not exclude each other; and
+        // `write_atomic` renamed its temp over the link, replacing it with a plain file. The
+        // resolution needs an existing physical parent, so the parent is created first — the
+        // `ensure_dir` `FileLock::acquire` already performed on it before CFG-112.
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            crate::lock::ensure_dir(parent)?;
+        }
+        let target =
+            super::resolve_settings_write_target(path).map_err(|source| ConfigError::Io {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        let _guard = crate::lock::FileLock::acquire(&target, None).await?;
+        let current = match std::fs::read_to_string(&target) {
             Ok(s) => Some(s),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
             Err(e) => {
                 return Err(ConfigError::Io {
-                    path: path.clone(),
+                    path: target.clone(),
                     source: e,
                 });
             }
         };
         if let Some(new_text) = f(current.as_deref()) {
-            crate::lock::write_atomic(&path, new_text.as_bytes(), false)?;
+            // Atomic onto the target, keeping the link, the existing mode, and pi's refusal of a
+            // read-only file (`writeFileSync` → `EACCES`).
+            super::write_settings_target_atomic(&target, new_text.as_bytes())?;
         }
         Ok(())
     }

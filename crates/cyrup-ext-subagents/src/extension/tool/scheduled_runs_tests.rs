@@ -1604,3 +1604,165 @@ async fn an_active_run_known_only_by_its_receipt_is_protected_from_retention() {
          sweep must protect it: {referenced:?}"
     );
 }
+
+/// Leave schedule `id` holding a claim whose active run exists ONLY as its receipt: the real
+/// `write_run` writes `runs/<run>.json`, then times out on `history.json.lock`, held by a peer
+/// past the 200 ms bound (SUBA-183's write order). The receipt names async run `async_id`, whose
+/// `status.json` reports `state`. Returns the active run id.
+async fn claim_known_only_by_its_receipt(
+    store: &crate::background::scheduled_runs::ScheduleStore,
+    dir: &Path,
+    id: &crate::background::scheduled_runs::ScheduleId,
+    async_id: &str,
+    state: crate::background::RunState,
+) -> crate::background::scheduled_runs::ScheduleRunId {
+    use crate::background::scheduled_runs::{
+        HISTORY_FILE, ScheduleDueReason, ScheduleRunId, ScheduleRunRecord, ScheduleStoreError,
+        ScheduleVersion,
+    };
+
+    let run_id = ScheduleRunId::mint();
+    let async_dir = dir.join("async").join(async_id);
+    let mut schedule = store.get(id).await.expect("schedule");
+    schedule.active_run_id = Some(run_id.clone());
+    store.write(&schedule).await.expect("claim");
+    let run = ScheduleRunRecord {
+        schema_version: ScheduleVersion,
+        id: run_id.clone(),
+        schedule_id: id.clone(),
+        planned_at: schedule_timestamp(0),
+        due_reason: ScheduleDueReason::Manual,
+        state: ScheduleRunState::Running,
+        started_at: Some(schedule_timestamp(0)),
+        completed_at: None,
+        async_id: Some(async_id.to_string()),
+        async_dir: Some(async_dir.clone()),
+        error: None,
+    };
+
+    let history_lock = std::fs::canonicalize(store.directory(id, false).await.expect("dir"))
+        .expect("canonical dir")
+        .join(format!("{HISTORY_FILE}.lock"));
+    let peer = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&history_lock)
+        .expect("peer sidecar");
+    peer.lock().expect("peer flock");
+    let timed_out = store
+        .write_run(&schedule, &run, "schedule.run.started")
+        .await
+        .expect_err("the history update must time out behind the held lock");
+    assert!(
+        matches!(timed_out, ScheduleStoreError::LeaseTimeout { .. }),
+        "{timed_out}"
+    );
+    drop(peer);
+    assert!(
+        store
+            .history(id)
+            .await
+            .expect("history")
+            .iter()
+            .all(|item| item.id != run_id),
+        "precondition: history.json never got the run"
+    );
+
+    tokio::fs::create_dir_all(&async_dir)
+        .await
+        .expect("async dir");
+    let mut status = crate::background::RunStatus::queued(
+        crate::background::RunId::from_token(async_id.to_string()),
+        crate::background::RunMode::Single,
+        None,
+    );
+    status.state = state;
+    if state.is_terminal() {
+        status.ended_at = Some(1_700_000_000_000);
+    }
+    crate::background::atomic::write_atomic_json(&async_dir.join("status.json"), &status)
+        .await
+        .expect("write status.json");
+    run_id
+}
+
+/// SUBA-227 — `schedule.delete`'s active-run guard reads the active run RECEIPT-FIRST
+/// (`ScheduleStore::active_run`, pi `remove` `:809` @ad11b7ab: `const run = this.activeRun(store,
+/// schedule);`), so a claim whose `history.json` update timed out is judged by its receipt exactly
+/// as a claim found in history is:
+///
+/// * its async run still RUNNING → refused with pi's sentence, the schedule kept;
+/// * its async run TERMINAL (only the settle was missed) → deleted.
+///
+/// Red with `remove` reverted to the history-only lookup (`history(..).find(|r| r.id == active)`):
+/// the history has no entry, so the guard sees no run and refuses the terminal claim too — a
+/// schedule whose run is over can never be deleted. (The running half passes either way: the
+/// guard refuses whenever it cannot prove the run ended; it pins that the receipt path does not
+/// loosen that.)
+#[tokio::test]
+async fn deleting_a_schedule_judges_an_active_run_known_only_by_its_receipt() {
+    use crate::background::scheduled_runs::ScheduleId;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (executor, _host, manager) = armed(dir.path(), "session-a").await;
+    let tool = SubagentTool::new(Arc::clone(&executor), dir.path().to_path_buf());
+    for name in ["live", "over"] {
+        dispatch(
+            &tool,
+            serde_json::json!({
+                "action": "schedule.create", "id": name, "at": "+1h",
+                "workflow": workflow_script_path(TRIVIAL_SCRIPT),
+            }),
+        )
+        .await
+        .expect("create");
+    }
+    let store = manager.store();
+    let live = ScheduleId::parse("live").expect("id");
+    let over = ScheduleId::parse("over").expect("id");
+    let live_run = claim_known_only_by_its_receipt(
+        store,
+        dir.path(),
+        &live,
+        "227aaaa1",
+        crate::background::RunState::Running,
+    )
+    .await;
+    claim_known_only_by_its_receipt(
+        store,
+        dir.path(),
+        &over,
+        "227bbbb2",
+        crate::background::RunState::Complete,
+    )
+    .await;
+
+    let refused = dispatch(
+        &tool,
+        serde_json::json!({ "action": "schedule.delete", "id": "live" }),
+    )
+    .await
+    .expect_err("a receipt-only claim whose async run is still running blocks the delete");
+    assert_eq!(
+        refused.to_string(),
+        format!(
+            "Schedule live has active run {live_run}; stop that run before deleting the schedule."
+        )
+    );
+    assert!(
+        store.get(&live).await.is_ok(),
+        "the refused schedule is still there"
+    );
+
+    let deleted = dispatch(
+        &tool,
+        serde_json::json!({ "action": "schedule.delete", "id": "over" }),
+    )
+    .await
+    .expect("a receipt-only claim whose async run is over must not block the delete");
+    assert_eq!(tool_text(&deleted), "Deleted schedule over.");
+    let ids = store.ids().await.expect("ids");
+    assert_eq!(ids, vec![live], "only the live schedule remains");
+}

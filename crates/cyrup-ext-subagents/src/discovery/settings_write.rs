@@ -81,9 +81,11 @@ fn read_settings_file_strict(path: &Path) -> Result<Map<String, Value>, Subagent
 /// SUBA-171: every caller passes the PHYSICAL write target ([`settings_write_target`]), as pi's
 /// `withSettingsFileLease` resolves the target before it takes the lease
 /// (`src/shared/settings-file-lease.ts:33-36` @ad11b7ab), so a symlinked `settings.json` is locked
-/// on its target's sidecar. `FileSettingsStore::with_lock` locks the path it is given, so for a
-/// symlinked file the two take DIFFERENT sidecars and do not exclude each other; for a regular file
-/// they are the same lock.
+/// on its target's sidecar. Since CFG-112 `cyrup-config`'s `FileSettingsStore::with_lock` resolves
+/// the target through the SAME function (`cyrup_config::settings::resolve_settings_write_target`)
+/// and locks the same `<physical target>.lock`, so cyrup's main settings writer and these writers
+/// exclude each other for a symlinked `settings.json` as for a regular one
+/// (`tests::a_main_settings_write_and_an_override_save_on_one_symlinked_file_exclude_each_other`).
 pub(crate) async fn lock_settings_file(
     path: &Path,
 ) -> Result<cyrup_config::lock::FileLock, SubagentError> {
@@ -141,51 +143,6 @@ pub(crate) async fn lock_settings_file_within(
         })
 }
 
-/// SUBA-171 — pi `resolveSettingsWriteTarget` (`src/shared/settings-file-lease.ts:6-30`
-/// @ad11b7ab): the physical file a settings path writes to, following file and directory links,
-/// including a dangling file link (whose link text names the file to create). A missing target is
-/// allowed only when its physical parent exists; a path ending in a separator cannot name a new
-/// settings file. The atomic rename then lands on the link's TARGET and the link stays in place.
-fn resolve_settings_write_target(file_path: &Path) -> std::io::Result<PathBuf> {
-    let mut target = file_path.to_path_buf();
-    loop {
-        match std::fs::canonicalize(&target) {
-            Ok(resolved) => return Ok(resolved),
-            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
-            Err(e) => {
-                let text = target.as_os_str().to_string_lossy();
-                if text.ends_with('/') || text.ends_with(std::path::MAIN_SEPARATOR) {
-                    return Err(e);
-                }
-            }
-        }
-        let parent = match target.parent() {
-            Some(p) if !p.as_os_str().is_empty() => p,
-            _ => Path::new("."),
-        };
-        let parent_path = std::fs::canonicalize(parent)?;
-        let Some(base) = target.file_name() else {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("settings path '{}' names no file", target.display()),
-            ));
-        };
-        let unresolved = parent_path.join(base);
-        let link_text = match std::fs::read_link(&unresolved) {
-            Ok(text) => text,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(unresolved),
-            Err(e) => return Err(e),
-        };
-        // Keep the link text intact (no normalization) so the filesystem follows directory links
-        // before any `..`, as upstream's string join does.
-        target = if link_text.is_absolute() {
-            link_text
-        } else {
-            parent_path.join(link_text)
-        };
-    }
-}
-
 /// SUBA-171 — `mkdir -p` the parent of `path`, then resolve the physical write target. pi does
 /// both before it takes the settings lease (`withSettingsFileLease`,
 /// `src/shared/settings-file-lease.ts:33-36` @ad11b7ab), so the lease, the read-modify-write and
@@ -200,7 +157,9 @@ pub(crate) fn settings_write_target(path: &Path) -> Result<PathBuf, SubagentErro
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         std::fs::create_dir_all(parent).map_err(fail)?;
     }
-    resolve_settings_write_target(path).map_err(fail)
+    // CFG-112: the ONE port of pi `resolveSettingsWriteTarget` (`src/shared/settings-file-lease.ts:6-30`
+    // @ad11b7ab) lives in `cyrup-config`, so `FileSettingsStore` resolves — and locks — the same file.
+    cyrup_config::settings::resolve_settings_write_target(path).map_err(fail)
 }
 
 /// pi `writeSettingsFile` (`src/agents/agents.ts:950-978` @ad11b7ab): write
@@ -225,38 +184,13 @@ pub(crate) fn write_settings_file(
             path.display()
         ))
     };
-    let existing_mode = match std::fs::metadata(target) {
-        Ok(meta) => Some(file_mode(&meta)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-        Err(e) => return Err(fail(&e)),
-    };
-    if existing_mode.is_some() {
-        // pi `fs.accessSync(targetPath, W_OK)`. This crate forbids `unsafe`, so the probe is an
-        // open-for-write that neither truncates nor creates: it is refused exactly when `access(2)`
-        // with `W_OK` would be for a regular file the caller owns or is permitted to write.
-        std::fs::OpenOptions::new()
-            .write(true)
-            .open(target)
-            .map_err(|e| fail(&e))?;
-    }
     let mut body = serde_json::to_string_pretty(&Value::Object(settings.clone()))
         .map_err(|e| SubagentError::Spawn(std::io::Error::other(e)))?;
     body.push('\n');
-    cyrup_config::lock::write_atomic_with_mode(target, body.as_bytes(), existing_mode)
+    // CFG-112: the mode-keeping, write-access-probing atomic save is shared with
+    // `FileSettingsStore` (`cyrup_config::settings::write_settings_target_atomic`).
+    cyrup_config::settings::write_settings_target_atomic(target, body.as_bytes())
         .map_err(|e| fail(&e))
-}
-
-/// `stat().mode & 0o7777` on unix; `None`-equivalent elsewhere, where a file has no mode bits and
-/// `write_atomic_with_mode` ignores the value.
-#[cfg(unix)]
-fn file_mode(meta: &std::fs::Metadata) -> u32 {
-    use std::os::unix::fs::PermissionsExt;
-    meta.permissions().mode() & 0o7777
-}
-
-#[cfg(not(unix))]
-fn file_mode(_meta: &std::fs::Metadata) -> u32 {
-    0
 }
 
 /// Borrow `settings.subagents.agentOverrides` as an object, if all three levels are objects.
@@ -467,7 +401,7 @@ mod tests {
     /// `read_settings_file_strict` was a separate unlocked call — so both readers saw the same
     /// base document and the second writer silently discarded the first's change, and a crash
     /// mid-write left a truncated `settings.json` that disables every agent until hand-repaired.
-    /// cyrup's own bar (`FileSettingsStore::with_lock`) is `FileLock` + `write_atomic`.
+    /// cyrup's own bar (`FileSettingsStore::with_lock`) is `FileLock` + an atomic write.
     ///
     /// Red before the fix: with the bare `fs::write` both writers read `{}` and the last write
     /// wins, so exactly ONE override survives.
@@ -901,13 +835,104 @@ mod tests {
         );
     }
 
+    /// CFG-112 — cyrup's MAIN settings writer (`cyrup_config::FileSettingsStore`, behind every
+    /// `/config` toggle) and an agent-override save exclude each other on a symlinked
+    /// `settings.json`, and both changes survive with the link in place.
+    ///
+    /// Deterministic: the main writer's read-modify-write closure is parked (holding its lock)
+    /// until the test releases it; the override save started meanwhile must still be waiting
+    /// 300 ms later, and runs only after the release.
+    ///
+    /// Red before CFG-112: `FileSettingsStore::with_lock` locked `settings.json.lock` beside the
+    /// LINK while this crate locks `real.json.lock` beside the TARGET, so the override save did
+    /// not wait ("must wait" fails); and had it been allowed to finish, the main writer's write
+    /// from its stale read would have erased it.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_main_settings_write_and_an_override_save_on_one_symlinked_file_exclude_each_other() {
+        use cyrup_config::SettingsStore as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real.json");
+        std::fs::write(&real, r#"{"theme":"dark"}"#).unwrap();
+        let link = tmp.path().join("settings.json");
+        std::os::unix::fs::symlink("real.json", &link).unwrap();
+
+        let store = std::sync::Arc::new(cyrup_config::FileSettingsStore::new(
+            link.clone(),
+            tmp.path().join("project.json"),
+        ));
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let main_writer = {
+            let store = std::sync::Arc::clone(&store);
+            tokio::spawn(async move {
+                store
+                    .with_lock(cyrup_config::SettingsScope::Global, &mut move |current| {
+                        let mut doc: Value = serde_json::from_str(current.unwrap_or("{}")).unwrap();
+                        entered_tx.send(()).unwrap();
+                        // Hold the main writer's lock, mid read-modify-write, until released.
+                        release_rx.recv().unwrap();
+                        doc["quietStartup"] = Value::Bool(true);
+                        Some(doc.to_string())
+                    })
+                    .await
+            })
+        };
+        tokio::task::spawn_blocking(move || entered_rx.recv())
+            .await
+            .unwrap()
+            .expect("the main writer reached its read-modify-write");
+
+        let override_link = link.clone();
+        let mut override_save = tokio::spawn(async move {
+            merge_builtin_agent_override(
+                &override_link,
+                "scout",
+                &field("disabled", Value::Bool(true)),
+            )
+            .await
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(300), &mut override_save)
+                .await
+                .is_err(),
+            "the override save must wait for the main settings writer holding the same symlinked \
+             file"
+        );
+        release_tx.send(()).unwrap();
+        main_writer
+            .await
+            .unwrap()
+            .expect("the main settings write succeeds");
+        override_save
+            .await
+            .unwrap()
+            .expect("the override save succeeds after the main writer releases");
+
+        let after = read(&real);
+        assert_eq!(after["theme"], Value::String("dark".to_string()));
+        assert_eq!(after["quietStartup"], Value::Bool(true), "{after}");
+        assert_eq!(
+            after["subagents"]["agentOverrides"]["scout"]["disabled"],
+            Value::Bool(true),
+            "{after}"
+        );
+        let meta = std::fs::symlink_metadata(&link).unwrap();
+        assert!(
+            meta.file_type().is_symlink(),
+            "the link survives both writes"
+        );
+        assert_eq!(std::fs::read_link(&link).unwrap(), Path::new("real.json"));
+    }
+
     /// pi `resolveSettingsWriteTarget`: a path ending in a separator cannot name a new file.
     #[test]
     fn a_missing_path_with_a_trailing_separator_is_not_a_write_target() {
         let tmp = tempfile::tempdir().unwrap();
         let mut path = tmp.path().join("missing").into_os_string();
         path.push("/");
-        assert!(resolve_settings_write_target(Path::new(&path)).is_err());
+        assert!(settings_write_target(Path::new(&path)).is_err());
     }
 
     #[tokio::test]

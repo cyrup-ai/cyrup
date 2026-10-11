@@ -10,7 +10,9 @@
 //! `deep_merge_settings`, `default_tools` is the `defaultTools` language (CFG-097),
 //! `installation` is the per-install `deviceId` (PROV-118), `effective` is
 //! the merged read-only view and its typed getters, `store` is the read/lock seam plus its two
-//! implementations, and `manager` is the two-layer facade and its writers.
+//! implementations, `write_target` resolves the physical file a settings path writes to and saves
+//! onto it (CFG-112, shared with `cyrup-ext-subagents`), and `manager` is the two-layer facade and
+//! its writers.
 //!
 //! Submodules are private; every item is re-exported here, so `cyrup_config::settings::X` stays
 //! the one public path for all of them.
@@ -24,6 +26,7 @@ mod merge;
 mod migrate;
 mod store;
 mod types;
+mod write_target;
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
@@ -50,3 +53,4 @@ pub use types::{
     SettingsScope, TerminalCapabilityOverrides, TerminalImagesOverride, ThinkingBudgets, TuiMode,
     Warnings, WheelLineCount, WheelScrollLines,
 };
+pub use write_target::{resolve_settings_write_target, write_settings_target_atomic};
