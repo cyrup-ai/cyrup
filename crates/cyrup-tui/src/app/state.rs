@@ -216,6 +216,11 @@ pub struct AppState {
     /// Stale under the alternate-screen renderer for exactly as long as [`Self::term_rows`] is:
     /// `draw_fullscreen` forks before either is published (ADR-0005 §B-14).
     pub term_cols: u16,
+    /// TUI-123 — the cell the topmost extension overlay claimed for the terminal cursor on the
+    /// frame just painted, or `None` if none did. Written by `paint_overlays`, read immediately
+    /// after the draw so the cursor can be POSITIONED without being SHOWN; see
+    /// [`AppState::cursor_positioned_but_hidden`].
+    pub(crate) overlay_cursor_cell: Option<(u16, u16)>,
     /// Where each region sat in the last frame painted — the rectangles a pointer report is resolved
     /// against. Written by [`render`](crate::app::render) (inline) and by the alternate screen's
     /// layout step; all-zero until the first draw.
@@ -628,6 +633,7 @@ impl AppState {
             compaction_queue: Vec::new(),
             term_rows: 24,
             term_cols: 80,
+            overlay_cursor_cell: None,
             regions: super::Regions::default(),
             pointer: super::PointerState::default(),
             overlay_pointer: super::OverlayPointerState::default(),
@@ -892,4 +898,19 @@ pub(crate) fn countdown_title(
     let remaining = deadline.saturating_duration_since(now);
     let secs = remaining.as_millis().div_ceil(1000);
     format!("{base} ({secs}s)")
+}
+
+impl AppState {
+    /// TUI-123 — this frame positioned the terminal cursor for an extension overlay while the
+    /// hardware cursor is turned OFF, so the draw must hide it again without moving it back.
+    ///
+    /// Upstream always writes the cursor move and only then shows or hides it
+    /// (`positionHardwareCursor`, `tui-main-screen.ts:623-653`: the move, then `showCursor()` or
+    /// `hideCursor()`), which is what lets IME composition and assistive tech follow a focused
+    /// field even when no block is drawn. `Frame::set_cursor_position` conflates the two — it
+    /// places AND shows, and not calling it hides — so the hide is issued on the BACKEND after the
+    /// frame is flushed, where ratatui keeps position and visibility apart.
+    pub(crate) fn cursor_positioned_but_hidden(&self) -> bool {
+        self.overlay_cursor_cell.is_some() && !self.editor.show_hardware_cursor()
+    }
 }
