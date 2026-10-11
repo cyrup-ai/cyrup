@@ -9,7 +9,7 @@ cyrup follows the design of the [Pi](https://github.com/earendil-works/pi) agent
 core, everything-is-an-extension, an agent that can extend itself. It rebuilds that design on a Rust
 backbone.
 
-> **Status:** pre-release, and not yet versioned. The agent loop, provider layer, tool set, session
+> **Status:** pre-release, at `0.1.0` — see [`CHANGELOG.md`](CHANGELOG.md). The agent loop, provider layer, tool set, session
 > tree, terminal interface, extension host, all five run modes, the MCP client, the ACP adapter, the
 > `workflowScript` runtime, the Flux development pipeline, background and remote subagent delegation,
 > and the [herdr](#herdr) integration work end to end.

@@ -1427,7 +1427,7 @@ dependencies = [
 
 [[package]]
 name = "cyrup"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1468,7 +1468,7 @@ dependencies = [
 
 [[package]]
 name = "cyrup-acp"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "agent-client-protocol",
  "cyrup-config",
@@ -1489,7 +1489,7 @@ dependencies = [
 
 [[package]]
 name = "cyrup-agent"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "cyrup-core",
@@ -1503,7 +1503,7 @@ dependencies = [
 
 [[package]]
 name = "cyrup-codemode"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
  "cyrup-core",
@@ -1516,7 +1516,7 @@ dependencies = [
 
 [[package]]
 name = "cyrup-codemode-runtime"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -1540,7 +1540,7 @@ dependencies = [
 
 [[package]]
 name = "cyrup-config"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "cyrup-core",
@@ -1558,7 +1558,7 @@ dependencies = [
 
 [[package]]
 name = "cyrup-core"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "dashmap",
@@ -1573,7 +1573,7 @@ dependencies = [
 
 [[package]]
 name = "cyrup-ext"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "async-compression",
  "async-trait",
@@ -1603,7 +1603,7 @@ dependencies = [
 
 [[package]]
 name = "cyrup-ext-sdk"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -1612,7 +1612,7 @@ dependencies = [
 
 [[package]]
 name = "cyrup-ext-subagents"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -1656,7 +1656,7 @@ dependencies = [
 
 [[package]]
 name = "cyrup-flux"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "cyrup-core",
@@ -1672,7 +1672,7 @@ dependencies = [
 
 [[package]]
 name = "cyrup-herdr"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -1684,7 +1684,7 @@ dependencies = [
 
 [[package]]
 name = "cyrup-intercom"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1709,7 +1709,7 @@ dependencies = [
 
 [[package]]
 name = "cyrup-it"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1748,7 +1748,7 @@ dependencies = [
 
 [[package]]
 name = "cyrup-llama"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1776,14 +1776,14 @@ dependencies = [
 
 [[package]]
 name = "cyrup-llama-cpp-wire"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "serde_json",
 ]
 
 [[package]]
 name = "cyrup-mcp"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -1823,7 +1823,7 @@ dependencies = [
 
 [[package]]
 name = "cyrup-modes"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "cyrup-config",
@@ -1844,7 +1844,7 @@ dependencies = [
 
 [[package]]
 name = "cyrup-permission-system"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -1869,7 +1869,7 @@ dependencies = [
 
 [[package]]
 name = "cyrup-pico"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "cyrup-pico",
@@ -1886,7 +1886,7 @@ dependencies = [
 
 [[package]]
 name = "cyrup-pico-doc"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "indexmap 2.14.0",
  "serde",
@@ -1897,7 +1897,7 @@ dependencies = [
 
 [[package]]
 name = "cyrup-pico-store"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "cyrup-pico-doc",
@@ -1912,7 +1912,7 @@ dependencies = [
 
 [[package]]
 name = "cyrup-pico-store-jsonl"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "cyrup-pico-doc",
@@ -1928,7 +1928,7 @@ dependencies = [
 
 [[package]]
 name = "cyrup-provider"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -1949,7 +1949,7 @@ dependencies = [
 
 [[package]]
 name = "cyrup-resources"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "arc-swap",
  "cyrup-config",
@@ -1969,7 +1969,7 @@ dependencies = [
 
 [[package]]
 name = "cyrup-sdk"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "cyrup-agent",
@@ -1988,7 +1988,7 @@ dependencies = [
 
 [[package]]
 name = "cyrup-session"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "arc-swap",
  "cyrup-config",
@@ -2009,7 +2009,7 @@ dependencies = [
 
 [[package]]
 name = "cyrup-session-svc"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -2040,7 +2040,7 @@ dependencies = [
 
 [[package]]
 name = "cyrup-test-support"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "cyrup-agent",
@@ -2064,7 +2064,7 @@ dependencies = [
 
 [[package]]
 name = "cyrup-tool-search"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "cyrup-codemode",
@@ -2077,7 +2077,7 @@ dependencies = [
 
 [[package]]
 name = "cyrup-tools"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "cyrup-core",
@@ -2106,7 +2106,7 @@ dependencies = [
 
 [[package]]
 name = "cyrup-tui"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "arboard",
  "async-trait",
@@ -2144,7 +2144,7 @@ dependencies = [
 
 [[package]]
 name = "cyrup-workflow-runtime"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "deno_core",
@@ -10091,7 +10091,7 @@ checksum = "ea6fc2961e4ef194dcbfe56bb845534d0dc8098940c7e5c012a258bfec6701bd"
 
 [[package]]
 name = "xtask"
-version = "0.0.0"
+version = "0.1.0"
 
 [[package]]
 name = "yaml-rust"

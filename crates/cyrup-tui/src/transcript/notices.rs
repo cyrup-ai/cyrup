@@ -55,6 +55,18 @@ impl TranscriptView {
         });
     }
 
+    /// The "What's New" startup notice (`interactive-mode.ts:849-870`) — see
+    /// [`Entry::ChangelogNotice`] for why this is not [`Self::push_block`].
+    ///
+    /// `condensed` is the `collapseChangelog` setting, read by the caller at push time as upstream
+    /// reads it when the notice is built (`:857`).
+    pub fn push_changelog_notice(&mut self, markdown: impl Into<String>, condensed: bool) {
+        self.pending.push(Entry::ChangelogNotice {
+            markdown: markdown.into(),
+            condensed,
+        });
+    }
+
     /// The startup "packages are out of date" notice — Pi `showPackageUpdateNotification`
     /// (`interactive-mode.ts:3920-3936`), pushed when the detached package-update check settles with
     /// a non-empty list (`:850-856`).

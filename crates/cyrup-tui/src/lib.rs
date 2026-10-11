@@ -55,6 +55,7 @@ mod app;
 mod auth_select;
 mod autocomplete;
 mod bash;
+pub mod changelog;
 mod chrome;
 mod clipboard;
 mod color_scheme;

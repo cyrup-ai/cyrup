@@ -422,6 +422,11 @@ pub async fn run_interactive(
     app.set_verbose_startup(verbose);
     app.push_session_loaded_resources(&session);
 
+    // TUI-011 — the "What's New" startup notice, immediately after the loaded-resources panel
+    // because that is pi's order: `showLoadedResources(...)` then `showStartupNoticesIfNeeded()`
+    // (`interactive-mode.ts:2044-2045`).
+    push_startup_changelog_notice(&mut app, &session).await;
+
     // TUI-003 — the boot transcript in pi's order: `init()`'s `renderInitialMessages()`
     // (`interactive-mode.ts:1036` @v0.87.1) — the replay, the trust banner, the compaction count —
     // and only then `run()`'s startup warnings (`:1120-1161`) and the initial message (`:1164`).
@@ -551,6 +556,55 @@ pub(crate) fn settle_terminal_theme<B: cyrup_tui::RebuildBackend>(
 /// channel seeds with the theme's current [`cyrup_resources::ThemeData`], so the run loop's
 /// `theme_changed` arm fires
 /// on every subsequent edit of that file (`/theme` edits + a settings.theme pointed at a file theme).
+/// The "What's New" startup notice — pi `showStartupNoticesIfNeeded` (`interactive-mode.ts:843-870`)
+/// over `getChangelogForDisplay` (`:1332-1356`). TUI-011.
+///
+/// The decision is a value ([`cyrup_tui::changelog::StartupNotice`]) so the persist stays here,
+/// where the settings manager is, rather than inside the renderer. Persists on both of upstream's
+/// persisting arms: when the notice is shown, and on a FRESH install where upstream deliberately
+/// records the version and shows nothing, so a new user is not greeted by release notes.
+async fn push_startup_changelog_notice<B: cyrup_tui::RebuildBackend>(
+    app: &mut cyrup_tui::App<B>,
+    session: &Arc<AgentSession>,
+) {
+    use cyrup_tui::changelog::{EMBEDDED, StartupNotice, startup_notice};
+
+    // `this.session.state.messages.length > 0` (`:1334`) — a resumed or continued session shows
+    // nothing. `replay_items` is what the boot replay itself walks.
+    let has_messages = !session.replay_items().await.is_empty();
+    let settings = &session.services().settings;
+    let (last, condensed) = {
+        let eff = settings.effective();
+        (eff.last_changelog_version(), eff.collapse_changelog())
+    };
+    let decision = startup_notice(EMBEDDED, has_messages, last.as_deref());
+    let persist = match &decision {
+        StartupNotice::Show(markdown) => {
+            app.state_mut()
+                .transcript
+                .push_changelog_notice(markdown.clone(), condensed);
+            true
+        }
+        StartupNotice::RecordOnly => true,
+        StartupNotice::Resumed | StartupNotice::UpToDate => false,
+    };
+    if persist
+        && let Err(e) = settings
+            .persist_nested(
+                // GLOBAL, not project: "which release notes has this install seen" is a
+                // per-install fact, and pi persists it to its global settings.
+                cyrup_config::SettingsScope::Global,
+                &["lastChangelogVersion"],
+                serde_json::Value::String(env!("CARGO_PKG_VERSION").to_string()),
+            )
+            .await
+    {
+        // Never fatal: a read-only settings file must not stop a session starting. Upstream has no
+        // failure path here because its write is fire-and-forget.
+        tracing::warn!("could not persist lastChangelogVersion: {e}");
+    }
+}
+
 fn build_theme_watcher(
     session: &AgentSession,
     active_name: &str,

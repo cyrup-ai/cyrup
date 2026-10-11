@@ -550,6 +550,65 @@ fn render_entry(
             out.push(Line::styled(rule, theme.border_style()));
             out
         }
+        // The startup notice (`interactive-mode.ts:849-870`). Shares `Entry::Block`'s border
+        // sandwich; differs in the two ways its own doc records, and in the condensed form entirely.
+        Entry::ChangelogNotice {
+            markdown,
+            condensed,
+        } => {
+            let w = width.max(1);
+            let rule = "─".repeat(w);
+            let mut out: Vec<Line<'static>> = vec![
+                Line::default(),
+                Line::styled(rule.clone(), theme.border_style()),
+            ];
+            if *condensed {
+                // `Text(condensedText, 1, 0)` (`:861`) — one row, inset one column, with the
+                // `/changelog` span BOLD (`theme.bold`, `:860`). The version comes from the
+                // notice's own newest entry, falling back to the running version (`:858-859`).
+                let (before, cmd, after) =
+                    crate::changelog::condensed_notice(markdown, env!("CARGO_PKG_VERSION"));
+                let line = Line::from(vec![
+                    ratatui::text::Span::styled(before, theme.muted_style()),
+                    ratatui::text::Span::styled(
+                        cmd,
+                        theme
+                            .muted_style()
+                            .add_modifier(ratatui::style::Modifier::BOLD),
+                    ),
+                    ratatui::text::Span::styled(after, theme.muted_style()),
+                ]);
+                out.extend(text_lines_of(&line, w, 1));
+            } else {
+                let bold = theme
+                    .accent_style()
+                    .add_modifier(ratatui::style::Modifier::BOLD);
+                out.extend(text_lines_of(
+                    &Line::styled("What's New".to_string(), bold),
+                    w,
+                    1,
+                ));
+                out.push(Line::default());
+                if !markdown.trim().is_empty() {
+                    let mut md = crate::markdown::render_with_links(
+                        markdown,
+                        w.saturating_sub(2).max(1),
+                        theme,
+                        None,
+                        false,
+                        md_links,
+                    );
+                    pad_lines(&mut md, 1);
+                    // `Markdown(md, 1, 0)` — paddingY 0, so NO blank row inside the markdown
+                    // component, unlike `/changelog`'s `(1, 1)`.
+                    out.extend(md);
+                }
+                // `Spacer(1)` after the body (`:868`), which `/changelog` does not have.
+                out.push(Line::default());
+            }
+            out.push(Line::styled(rule, theme.border_style()));
+            out
+        }
         Entry::LoadedResources(lines) => {
             crate::startup::startup_lines(lines, theme, width.max(1), output_pad)
         }

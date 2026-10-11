@@ -47,6 +47,7 @@ mod builtin_collision;
 mod cache_warming_notice;
 mod cache_warming_ui;
 mod cell_size_query;
+mod changelog;
 mod chrome;
 mod clipboard;
 mod codemode_renderer;
