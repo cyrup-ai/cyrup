@@ -761,6 +761,7 @@ mod tests {
             SubagentTool::new_child_safe(Arc::clone(&executor), dir.path().to_path_buf());
         let refused = child_safe
             .route_watchdog_action("watchdog.configure", &empty_params(), dir.path())
+            .await
             .expect_err("a child-safe tool must refuse the mutating watchdog verb");
         assert_eq!(
             refused.to_string(),
@@ -773,7 +774,9 @@ mod tests {
             "watchdog.check",
             "watchdog.recommend-model",
         ] {
-            let outcome = child_safe.route_watchdog_action(action, &empty_params(), dir.path());
+            let outcome = child_safe
+                .route_watchdog_action(action, &empty_params(), dir.path())
+                .await;
             let text = match outcome {
                 Ok(result) => format!("{:?}", result.content),
                 Err(error) => error.to_string(),
@@ -785,8 +788,9 @@ mod tests {
         }
         // The full tool is not restricted at all.
         let full = SubagentTool::new(executor, dir.path().to_path_buf());
-        let full_outcome =
-            full.route_watchdog_action("watchdog.configure", &empty_params(), dir.path());
+        let full_outcome = full
+            .route_watchdog_action("watchdog.configure", &empty_params(), dir.path())
+            .await;
         let full_text = match full_outcome {
             Ok(result) => format!("{:?}", result.content),
             Err(error) => error.to_string(),

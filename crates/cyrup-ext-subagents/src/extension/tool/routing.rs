@@ -1712,7 +1712,7 @@ impl SubagentTool {
                 if crate::watchdog::tool_actions::WATCHDOG_TOOL_ACTIONS
                     .contains(&watchdog_action) =>
             {
-                self.route_watchdog_action(watchdog_action, p, cwd)
+                self.route_watchdog_action(watchdog_action, p, cwd).await
             }
             // The seven `mission.*` actions (pi `subagent-executor.ts:5723-5732` @v0.64.0;
             // `:4397-4407` @v0.43.0 before SUBA-085's `mission.resolve-decision`), in the dispatch
@@ -2433,7 +2433,7 @@ impl SubagentTool {
     /// Upstream returns an `AgentToolResult` whose `isError` flag distinguishes a failed action;
     /// cyrup surfaces a failed tool as `Err` (R-02-024), so that flag becomes a [`ToolError`] here,
     /// exactly as [`Self::route_management_action`] already maps pi's `isError: true`.
-    pub(crate) fn route_watchdog_action(
+    pub(crate) async fn route_watchdog_action(
         &self,
         action: &str,
         p: &SubagentToolParams,
@@ -2474,7 +2474,8 @@ impl SubagentTool {
             &params,
             &ctx,
             self.watchdog.as_deref(),
-        );
+        )
+        .await;
         if result.is_error {
             return Err(ToolError::new(result.text));
         }
