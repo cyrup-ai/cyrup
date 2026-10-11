@@ -19,11 +19,13 @@ use cyrup_core::{ExtensionId, StopReason};
 use cyrup_ext::{
     ExtError, HookOutcome, HostCtx, HostEvent, HostServices, InitApi, NativeExtension,
 };
-use cyrup_provider::faux::{FauxProvider, faux_assistant_message, faux_text};
+use cyrup_provider::faux::{FauxProvider, FauxResponseStep, faux_assistant_message, faux_text};
 use serde_json::Value;
 use tokio::io::AsyncWriteExt;
 
-use super::support::{build_runtime_with_ext, fixture, read_json_line, spawn_rpc_duplex, type_of};
+use super::support::{
+    build_runtime_with_ext, fixture, parse_lines, read_json_line, spawn_rpc_duplex, type_of,
+};
 
 /// A native extension whose `before_agent_start` handler asks the user to confirm the run, and
 /// records the answer.
@@ -150,4 +152,83 @@ async fn a_before_agent_start_dialog_reaches_the_client_before_the_prompt_respon
         .await
         .expect("run_rpc returns after stdin ends")
         .unwrap();
+}
+
+/// SEAM-161 (b) — the RPC `agent_start` re-abort at stdin EOF (`450b35f3c`, SEAM-154), driven in a
+/// fixed order instead of by a `prompt` and the close in one write (which proved it only 5 of 5 live
+/// runs, never deterministically).
+///
+/// The `before_agent_start` dialog pins the order: the prompt's preparation parks on it, the client
+/// closes stdin, and the EOF handling (`abort_at_eof`) aborts the session — no run yet, so nothing —
+/// and answers the dialog as cancelled. Only then does the handler return and the run start, AFTER
+/// the EOF was seen. The model never answers, so only the re-abort on that run's `agent_start` ends
+/// it: without it the loop waits out its 5 s bound and the run never settles as aborted.
+///
+/// Passes at HEAD+SEAM-158 (the re-abort exists; this is the pin SEAM-161 asked for) — a
+/// NON-REGRESSION GUARD. Removing the re-abort turns it red.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_run_that_starts_after_stdin_ended_is_aborted_on_its_agent_start() {
+    let fx = fixture();
+    let ext = Arc::new(ConfirmBeforeStart::default());
+    let answer = ext.answer.clone();
+    let faux = Arc::new(FauxProvider::new());
+    // A model that never answers (no test releases it).
+    let release = Arc::new(tokio::sync::Notify::new());
+    faux.set_response_steps(vec![FauxResponseStep::async_factory(
+        move |_ctx, _opts, _state, _model| {
+            let release = release.clone();
+            async move {
+                release.notified().await;
+                faux_assistant_message(vec![faux_text("never reached")], StopReason::Stop)
+            }
+        },
+    )]);
+    let runtime = build_runtime_with_ext(&fx, faux, ext).await;
+    let (mut client_tx, mut client_reader, rpc) = spawn_rpc_duplex(runtime);
+
+    client_tx
+        .write_all(b"{\"type\":\"prompt\",\"id\":\"p\",\"message\":\"go\"}\n")
+        .await
+        .unwrap();
+    let first = tokio::time::timeout(Duration::from_secs(5), read_json_line(&mut client_reader))
+        .await
+        .expect("the preparation is parked on the dialog");
+    assert_eq!(type_of(&first), "extension_ui_request", "{first}");
+
+    let closed = std::time::Instant::now();
+    drop(client_tx);
+    tokio::time::timeout(Duration::from_secs(20), rpc)
+        .await
+        .expect("run_rpc returns after stdin ends")
+        .unwrap();
+    let elapsed = closed.elapsed();
+
+    let mut rest = String::new();
+    {
+        use tokio::io::AsyncReadExt as _;
+        let _ = client_reader.read_to_string(&mut rest).await;
+    }
+    let lines = parse_lines(rest.as_bytes());
+    assert_eq!(
+        *answer.lock().unwrap(),
+        Some(false),
+        "the EOF answered the open dialog as cancelled, so the run started after it"
+    );
+    assert!(
+        lines.iter().any(|l| type_of(l) == "agent_start"),
+        "the run started after the EOF: {lines:?}"
+    );
+    let aborted = lines.iter().any(|l| {
+        type_of(l) == "message_end"
+            && l["message"]["role"] == "assistant"
+            && l["message"]["stopReason"] == "aborted"
+    });
+    assert!(
+        aborted,
+        "its agent_start re-abort ended it as an aborted turn: {lines:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(4),
+        "the re-abort ended the run; waiting out the 5 s bound would not: {elapsed:?}"
+    );
 }
