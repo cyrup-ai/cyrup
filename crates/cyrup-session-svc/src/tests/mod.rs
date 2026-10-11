@@ -72,6 +72,7 @@ mod read_model_resize;
 mod read_model_vision;
 mod reload_default_tools;
 mod remote_catalog_overlay;
+mod remote_catalog_revalidation;
 mod replay_custom_entries;
 mod round10_medium;
 mod round2;

@@ -29,7 +29,12 @@ use std::process::Command;
 /// same wrong spec and saw nothing. At five entries that was a test; at thirty-eight it would be a
 /// certainty. Deriving them makes the mismatch unspellable instead of merely detected.
 ///
-/// # Classifier catalogs (PROV-147, PROV-153)
+/// # Classifier catalogs (PROV-147, PROV-153, PROV-155)
+///
+/// Six providers have one — exactly the six whose pi `createProvider` carries a `classifiers` map
+/// (`cloudflare-workers-ai`, `openai`, `opencode`, `openrouter`, `typesafe`, `vercel-ai-gateway`
+/// @f1b2e77f5) — and a provider's chat and classifier files must sit on ONE pi.dev revision
+/// (`main.rs::check_one_revision_per_provider`).
 ///
 /// A provider's classifier rows are a SECOND catalog file, `<provider>-classifiers.json`, and the
 /// suffix is the whole declaration: [`LiveCatalogSpec::kind`], [`LiveCatalogSpec::provider`],

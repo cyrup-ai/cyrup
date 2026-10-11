@@ -15,8 +15,9 @@ use std::time::Duration;
 
 use cyrup_core::{CancelToken, Content, ToolCallId, ToolUpdate, Usage};
 use cyrup_provider::{
-    AnyModel, AssistantImages, ClassifierAnswer, ClassifierModel, ClassifierResult,
-    ClassifierStopReason, HeaderMap, ImageModel, ImagesStopReason, Modality, ModelCost, OrderedMap,
+    AnyModel, AssistantImages, BoolCriteria, ClassifierAnswer, ClassifierContext, ClassifierModel,
+    ClassifierQuestion, ClassifierResult, ClassifierStopReason, HeaderMap, ImageModel,
+    ImagesStopReason, Modality, ModelCost, OrderedMap,
 };
 use serde_json::{Value, json};
 
@@ -77,6 +78,8 @@ fn usage(input: u64, cost: f64) -> Usage {
 
 struct Observed {
     classify_inputs: Mutex<Vec<(String, Value)>>,
+    /// Every context the fake classifier was handed, as the provider sees it (PROV-156).
+    classify_contexts: Mutex<Vec<ClassifierContext>>,
     image_inputs: Mutex<Vec<(String, Vec<Content>)>>,
     active: AtomicUsize,
     max_active: AtomicUsize,
@@ -93,6 +96,7 @@ struct Rig {
 fn rig() -> Rig {
     let observed = Arc::new(Observed {
         classify_inputs: Mutex::new(Vec::new()),
+        classify_contexts: Mutex::new(Vec::new()),
         image_inputs: Mutex::new(Vec::new()),
         active: AtomicUsize::new(0),
         max_active: AtomicUsize::new(0),
@@ -112,6 +116,11 @@ fn rig() -> Rig {
                 tokio::time::sleep(Duration::from_millis(10)).await;
                 observed.active.fetch_sub(1, Ordering::SeqCst);
                 let text = context.state.get("text").cloned().unwrap_or(Value::Null);
+                observed
+                    .classify_contexts
+                    .lock()
+                    .unwrap()
+                    .push(context.clone());
                 observed
                     .classify_inputs
                     .lock()
@@ -209,6 +218,51 @@ impl Rig {
     async fn err(&self, name: &str, args: Vec<Value>) -> String {
         self.call(name, args).await.unwrap_err()
     }
+}
+
+/// PROV-156 — pi's `checkClassifierContext` checks `type`, `instructions` and `criteria` and
+/// refuses no other member (`execute.ts:121-170` @f1b2e77f5), so a script's extra question member
+/// or extra bool criterion is accepted, and so it is here. What reaches the provider is the typed
+/// question, its `true`/`false` read by name (the `[CYRUP-DELTA, intentional]` on
+/// `check_classifier_context`; that nothing else is carried is guaranteed by the type, not by this
+/// test). GUARD: green at the base; red if the boundary refused an unnamed member, or if a bool's
+/// `true`/`false` were read swapped.
+#[tokio::test]
+async fn a_question_member_the_shape_does_not_name_is_accepted() {
+    let rig = rig();
+    let model = rig
+        .ok(
+            "models.getModelOfType",
+            vec![json!("classifier"), json!("scorer"), json!("judge")],
+        )
+        .await;
+    let result = rig
+        .ok(
+            "models.classify",
+            vec![
+                model,
+                json!({ "state": { "text": "good" }, "questions": { "approved": {
+                    "criteria": { "false": "no", "true": "yes", "maybe": "unsure" },
+                    "threshold": 0.5,
+                    "instructions": "Approval?",
+                    "type": "bool"
+                } } }),
+            ],
+        )
+        .await;
+    assert_eq!(result["stopReason"], "stop");
+    assert_eq!(result["answers"]["approved"]["probability"], 0.9);
+    let seen = rig.observed.classify_contexts.lock().unwrap();
+    assert_eq!(
+        seen[0].questions.get("approved"),
+        Some(&ClassifierQuestion::Bool {
+            instructions: "Approval?".into(),
+            criteria: BoolCriteria {
+                when_true: "yes".into(),
+                when_false: "no".into(),
+            },
+        })
+    );
 }
 
 const QUESTIONS: &str = r#"{ "approved": { "type": "bool", "instructions": "Approval?", "criteria": { "true": "yes", "false": "no" } } }"#;

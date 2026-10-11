@@ -55,7 +55,7 @@ use crate::wire::WireProvider;
 use std::sync::Arc;
 
 /// Static metadata for one openai-completions fleet provider (Pi provider factory `id`/`name`/
-/// `auth`, plus the embedded `<id>.models.ts` catalog).
+/// `baseUrl`/`auth`, plus the embedded `<id>.models.ts` catalog).
 pub struct FleetSpec {
     pub id: &'static str,
     pub name: &'static str,
@@ -72,12 +72,11 @@ pub struct FleetSpec {
     pub wire: FleetWire,
     /// Where this member's rows come from — see [`FleetCatalog`].
     pub catalog: FleetCatalog,
-    /// Upstream's `createProvider({ baseUrl })` (`Provider.baseUrl`, PROV-017) for the members
-    /// whose provider file passes one and that cyrup carries (`baseten`, the three
-    /// `qwen-token-plan*`, `meta`); `None` otherwise — including members whose upstream file does
-    /// pass one (PROV-154). Each row carries its own `baseUrl`, which is what the request path
-    /// reads.
-    pub base_url: Option<&'static str>,
+    /// Upstream's `createProvider({ baseUrl })` — `Provider.baseUrl` (`models.ts:154`, set at
+    /// `:1088` @f1b2e77f5; PROV-017). Every fleet member's module passes one
+    /// (`providers/<id>.ts:10-14`), so it is not optional (PROV-154): a row without it does not
+    /// compile. Metadata only — a request goes to its row's own `baseUrl`.
+    pub base_url: &'static str,
 }
 
 /// The source of a fleet member's catalog rows. Two variants because "no embedded rows" is a
@@ -145,37 +144,24 @@ impl FleetWire {
     }
 }
 
-/// The catalog half of a `fleet!` row. Three forms, because "has rows" and "carries a
-/// provider-level `baseUrl`" are INDEPENDENT facts and conflating them cost DRIFT-009 a regression:
+/// The catalog half of a `fleet!` row: `<stem>` embeds `catalog/<stem>.json`; `dynamic` declares
+/// a member with no embedded rows (none today — DRIFT-009 embedded the last four).
 ///
-/// * `<stem>` embeds `catalog/<stem>.json` and carries no provider-level `baseUrl` — every row of
-///   such a catalog declares its own, which is what the request path reads.
-/// * `embedded(<stem>, <url>)` embeds the catalog AND keeps `<url>`, for the members whose upstream
-///   `createProvider({ baseUrl })` sets one explicitly (`Provider.baseUrl`, PROV-017). DRIFT-009's
-///   four are exactly these: their rows became embeddable, but `providers/baseten.ts:6-14` and
-///   `providers/qwen-token-plan*.ts:6-15` still pass a `baseUrl`, so dropping it while flipping
-///   `Dynamic` -> `Embedded` would silently lose `Provider.baseUrl` for four providers.
-/// * `dynamic(<url>)` declares a member with no embedded rows at all, keeping only that `baseUrl`.
+/// The provider-level `baseUrl` is NOT part of it: it is its own `fleet!` column, because "has
+/// rows" and "carries a provider-level `baseUrl`" are INDEPENDENT facts and conflating them cost
+/// DRIFT-009 a regression (flipping `Dynamic` -> `Embedded` silently dropped `Provider.baseUrl` for
+/// four providers). With its own column, gaining or losing a catalog cannot touch the URL.
 macro_rules! fleet_catalog {
-    (dynamic($base_url:literal)) => {
-        (FleetCatalog::Dynamic, Some($base_url))
-    };
-    (embedded($file:literal, $base_url:literal)) => {
-        (
-            FleetCatalog::Embedded(include_str!(concat!("catalog/", $file, ".json"))),
-            Some($base_url),
-        )
+    (dynamic) => {
+        FleetCatalog::Dynamic
     };
     ($file:literal) => {
-        (
-            FleetCatalog::Embedded(include_str!(concat!("catalog/", $file, ".json"))),
-            None::<&'static str>,
-        )
+        FleetCatalog::Embedded(include_str!(concat!("catalog/", $file, ".json")))
     };
 }
 
 macro_rules! fleet {
-    ($($id:literal => ($const:ident, $name:literal, $env:literal, $auth:literal, $wire:ident, $($catalog:tt)+)),* $(,)?) => {
+    ($($id:literal => ($const:ident, $name:literal, $env:literal, $auth:literal, $wire:ident, $base_url:literal, $($catalog:tt)+)),* $(,)?) => {
         $(
             pub const $const: FleetSpec = FleetSpec {
                 id: $id,
@@ -183,8 +169,8 @@ macro_rules! fleet {
                 env_var: $env,
                 auth_name: $auth,
                 wire: FleetWire::$wire,
-                catalog: fleet_catalog!($($catalog)+).0,
-                base_url: fleet_catalog!($($catalog)+).1,
+                catalog: fleet_catalog!($($catalog)+),
+                base_url: $base_url,
             };
         )*
 
@@ -194,7 +180,7 @@ macro_rules! fleet {
 }
 
 fleet! {
-    "ant-ling"              => (ANT_LING, "Ant Ling", "ANT_LING_API_KEY", "Ant Ling API key", Completions, "ant-ling"),
+    "ant-ling"              => (ANT_LING, "Ant Ling", "ANT_LING_API_KEY", "Ant Ling API key", Completions, "https://api.ant-ling.com/v1", "ant-ling"),
     // DRIFT-009 — `providers/baseten.ts:6-14` @v0.84.4, registered `all.ts:95`; a v0.84.x
     // addition (`c1019d920`, 2026-08-03 — absent at the ported baseline v0.83.0). models.dev
     // source `baseten`, generated by `generate-models.ts::processBasetenModels` (`:1256-1345`),
@@ -206,25 +192,25 @@ fleet! {
     // `zai-org/GLM-5.2` (`test/baseten-models.test.ts:19-54`), which is also cyrup's default
     // model for the provider (`cyrup-config/src/model/defaults.rs:37`). See the module doc for
     // why the rows themselves are not embedded.
-    "baseten"               => (BASETEN, "Baseten", "BASETEN_API_KEY", "Baseten API key", Completions, embedded("baseten", "https://inference.baseten.co/v1")),
-    "cerebras"              => (CEREBRAS, "Cerebras", "CEREBRAS_API_KEY", "Cerebras API key", Completions, "cerebras"),
-    "deepseek"              => (DEEPSEEK, "DeepSeek", "DEEPSEEK_API_KEY", "DeepSeek API key", Completions, "deepseek"),
-    "groq"                  => (GROQ, "Groq", "GROQ_API_KEY", "Groq API key", Completions, "groq"),
-    "huggingface"           => (HUGGINGFACE, "Hugging Face", "HF_TOKEN", "Hugging Face token", Completions, "huggingface"),
+    "baseten"               => (BASETEN, "Baseten", "BASETEN_API_KEY", "Baseten API key", Completions, "https://inference.baseten.co/v1", "baseten"),
+    "cerebras"              => (CEREBRAS, "Cerebras", "CEREBRAS_API_KEY", "Cerebras API key", Completions, "https://api.cerebras.ai/v1", "cerebras"),
+    "deepseek"              => (DEEPSEEK, "DeepSeek", "DEEPSEEK_API_KEY", "DeepSeek API key", Completions, "https://api.deepseek.com", "deepseek"),
+    "groq"                  => (GROQ, "Groq", "GROQ_API_KEY", "Groq API key", Completions, "https://api.groq.com/openai/v1", "groq"),
+    "huggingface"           => (HUGGINGFACE, "Hugging Face", "HF_TOKEN", "Hugging Face token", Completions, "https://router.huggingface.co/v1", "huggingface"),
     // PROV-080 — `providers/meta.ts` @f1b2e77f5 (added v0.86.1, registered `all.ts:154` between
     // `kimiCodingProvider()` and `minimaxProvider()`): `openai-responses` at
-    // `https://api.meta.ai/v1`, which `createProvider({ baseUrl })` passes explicitly (`:11`) and
-    // so is kept as the provider's `baseUrl`; `envApiKeyAuth("Meta Model API key",
+    // `https://api.meta.ai/v1`, which `createProvider({ baseUrl })` passes explicitly (`:11`);
+    // `envApiKeyAuth("Meta Model API key",
     // ["META_API_KEY"])` (`:13`) beside the Muse-subscription `lazyOAuth`
     // (`builtin_oauth::builtin_provider_oauth`). Rows from `generate-models.ts:2013-2033` via the
     // live catalog.
-    "meta"                  => (META, "Meta", "META_API_KEY", "Meta Model API key", Responses, embedded("meta", "https://api.meta.ai/v1")),
-    "moonshotai"            => (MOONSHOTAI, "Moonshot AI", "MOONSHOT_API_KEY", "Moonshot AI API key", Completions, "moonshotai"),
-    "moonshotai-cn"         => (MOONSHOTAI_CN, "Moonshot AI CN", "MOONSHOT_API_KEY", "Moonshot AI API key", Completions, "moonshotai-cn"),
-    "nvidia"                => (NVIDIA, "NVIDIA", "NVIDIA_API_KEY", "NVIDIA API key", Completions, "nvidia"),
+    "meta"                  => (META, "Meta", "META_API_KEY", "Meta Model API key", Responses, "https://api.meta.ai/v1", "meta"),
+    "moonshotai"            => (MOONSHOTAI, "Moonshot AI", "MOONSHOT_API_KEY", "Moonshot AI API key", Completions, "https://api.moonshot.ai/v1", "moonshotai"),
+    "moonshotai-cn"         => (MOONSHOTAI_CN, "Moonshot AI CN", "MOONSHOT_API_KEY", "Moonshot AI API key", Completions, "https://api.moonshot.cn/v1", "moonshotai-cn"),
+    "nvidia"                => (NVIDIA, "NVIDIA", "NVIDIA_API_KEY", "NVIDIA API key", Completions, "https://integrate.api.nvidia.com/v1", "nvidia"),
     // `providers/openrouter.ts:8,21-25` @v0.87.1 declares TWO apis; at `b0c2a90e` it declared one
     // (`Provider<"openai-completions">`). See `FleetWire::MessagesAndCompletions`.
-    "openrouter"            => (OPENROUTER, "OpenRouter", "OPENROUTER_API_KEY", "OpenRouter API key", MessagesAndCompletions, "openrouter"),
+    "openrouter"            => (OPENROUTER, "OpenRouter", "OPENROUTER_API_KEY", "OpenRouter API key", MessagesAndCompletions, "https://openrouter.ai/api/v1", "openrouter"),
     // PROV-014 — `providers/qwen-token-plan.ts:6-15` @v0.84.4 (identical at v0.83.0), registered at
     // `all.ts:118`. models.dev source `alibaba-token-plan`; the ids upstream's own test pins as
     // present (`qwen-token-plan-models.test.ts:42-58` @v0.84.4): MiniMax-M2.5, deepseek-v3.2,
@@ -233,26 +219,26 @@ fleet! {
     // row `compat: { thinkingFormat: "qwen", supportsDeveloperRole: false, supportsStore: false }`
     // (`generate-models.ts:2308-2313`), `reasoning_effort` only on the deepseek-v4-*/glm-5* rows
     // (`:306-316`). See the module doc for why the rows themselves are not embedded.
-    "qwen-token-plan"       => (QWEN_TOKEN_PLAN, "Qwen Token Plan", "QWEN_TOKEN_PLAN_API_KEY", "Qwen Token Plan API key", Completions, embedded("qwen-token-plan", "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1")),
+    "qwen-token-plan"       => (QWEN_TOKEN_PLAN, "Qwen Token Plan", "QWEN_TOKEN_PLAN_API_KEY", "Qwen Token Plan API key", Completions, "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1", "qwen-token-plan"),
     // PROV-014 — `providers/qwen-token-plan-cn.ts:6-15` @v0.84.4 (identical at v0.83.0),
     // `all.ts:119`. models.dev source `alibaba-token-plan-cn`; same id set as the international
     // plan, China endpoint, its own key.
-    "qwen-token-plan-cn"    => (QWEN_TOKEN_PLAN_CN, "Qwen Token Plan CN", "QWEN_TOKEN_PLAN_CN_API_KEY", "Qwen Token Plan CN API key", Completions, embedded("qwen-token-plan-cn", "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1")),
+    "qwen-token-plan-cn"    => (QWEN_TOKEN_PLAN_CN, "Qwen Token Plan CN", "QWEN_TOKEN_PLAN_CN_API_KEY", "Qwen Token Plan CN API key", Completions, "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1", "qwen-token-plan-cn"),
     // VERSION LAG (v0.83.0 → v0.84.4): `providers/qwen-token-plan-individual.ts:6-15`, added at
     // `c03d78bdc` (#7659), `all.ts:120`. The international endpoint and the SAME env var as
     // `qwen-token-plan` (`env-api-keys.ts:83`: `"qwen-token-plan-individual":
     // "QWEN_TOKEN_PLAN_API_KEY"`), narrowed to the eight-model personal allowlist
     // (`generate-models.ts:324-336`; `qwen-token-plan-models.test.ts:60-69`).
-    "qwen-token-plan-individual" => (QWEN_TOKEN_PLAN_INDIVIDUAL, "Qwen Token Plan Individual", "QWEN_TOKEN_PLAN_API_KEY", "Qwen Token Plan Individual API key", Completions, embedded("qwen-token-plan-individual", "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1")),
+    "qwen-token-plan-individual" => (QWEN_TOKEN_PLAN_INDIVIDUAL, "Qwen Token Plan Individual", "QWEN_TOKEN_PLAN_API_KEY", "Qwen Token Plan Individual API key", Completions, "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1", "qwen-token-plan-individual"),
     // XAI_2 — a Responses member (with `meta`, PROV-080). The declaration is what a freshly
     // downloaded file gets checked against.
-    "xai"                   => (XAI, "xAI", "XAI_API_KEY", "xAI API key", Responses, "xai"),
-    "xiaomi"                => (XIAOMI, "Xiaomi", "XIAOMI_API_KEY", "Xiaomi API key", Completions, "xiaomi"),
-    "xiaomi-token-plan-ams" => (XIAOMI_TP_AMS, "Xiaomi Token Plan AMS", "XIAOMI_TOKEN_PLAN_AMS_API_KEY", "Xiaomi Token Plan AMS API key", Completions, "xiaomi-token-plan-ams"),
-    "xiaomi-token-plan-cn"  => (XIAOMI_TP_CN, "Xiaomi Token Plan CN", "XIAOMI_TOKEN_PLAN_CN_API_KEY", "Xiaomi Token Plan CN API key", Completions, "xiaomi-token-plan-cn"),
-    "xiaomi-token-plan-sgp" => (XIAOMI_TP_SGP, "Xiaomi Token Plan SGP", "XIAOMI_TOKEN_PLAN_SGP_API_KEY", "Xiaomi Token Plan SGP API key", Completions, "xiaomi-token-plan-sgp"),
-    "zai"                   => (ZAI, "Z.AI", "ZAI_API_KEY", "Z.AI API key", Completions, "zai"),
-    "zai-coding-cn"         => (ZAI_CODING_CN, "Z.AI Coding CN", "ZAI_CODING_CN_API_KEY", "Z.AI Coding CN API key", Completions, "zai-coding-cn"),
+    "xai"                   => (XAI, "xAI", "XAI_API_KEY", "xAI API key", Responses, "https://api.x.ai/v1", "xai"),
+    "xiaomi"                => (XIAOMI, "Xiaomi", "XIAOMI_API_KEY", "Xiaomi API key", Completions, "https://api.xiaomimimo.com/v1", "xiaomi"),
+    "xiaomi-token-plan-ams" => (XIAOMI_TP_AMS, "Xiaomi Token Plan AMS", "XIAOMI_TOKEN_PLAN_AMS_API_KEY", "Xiaomi Token Plan AMS API key", Completions, "https://token-plan-ams.xiaomimimo.com/v1", "xiaomi-token-plan-ams"),
+    "xiaomi-token-plan-cn"  => (XIAOMI_TP_CN, "Xiaomi Token Plan CN", "XIAOMI_TOKEN_PLAN_CN_API_KEY", "Xiaomi Token Plan CN API key", Completions, "https://token-plan-cn.xiaomimimo.com/v1", "xiaomi-token-plan-cn"),
+    "xiaomi-token-plan-sgp" => (XIAOMI_TP_SGP, "Xiaomi Token Plan SGP", "XIAOMI_TOKEN_PLAN_SGP_API_KEY", "Xiaomi Token Plan SGP API key", Completions, "https://token-plan-sgp.xiaomimimo.com/v1", "xiaomi-token-plan-sgp"),
+    "zai"                   => (ZAI, "Z.AI", "ZAI_API_KEY", "Z.AI API key", Completions, "https://api.z.ai/api/coding/paas/v4", "zai"),
+    "zai-coding-cn"         => (ZAI_CODING_CN, "Z.AI Coding CN", "ZAI_CODING_CN_API_KEY", "Z.AI Coding CN API key", Completions, "https://open.bigmodel.cn/api/coding/paas/v4", "zai-coding-cn"),
 }
 
 impl FleetSpec {
@@ -297,15 +283,15 @@ impl FleetSpec {
             self.auth(),
             store,
             registry,
-        );
-        let provider = match self.base_url {
-            Some(base_url) => provider.with_base_url(base_url),
-            None => provider,
-        };
+        )
+        .with_base_url(self.base_url);
         // PROV-128 — the per-id image leg, shaped exactly like `auth()`'s `builtin_provider_oauth`
         // clause: `openrouter` is the only fleet member upstream gives an `images` map
         // (`providers/openrouter.ts:33`), and every other id comes back untouched.
-        super::openrouter::with_builtin_images(self.id, provider)
+        let provider = super::openrouter::with_builtin_images(self.id, provider);
+        // PROV-155 — the per-id classifier leg (pi `classifiers:`): `openrouter` is the only fleet
+        // member with one; every other id comes back untouched.
+        super::classifiers::with_builtin_classifiers(self.id, provider)
     }
 
     /// Build this provider with an in-memory store + the built-in api registry.
@@ -516,10 +502,9 @@ mod tests {
     ///
     /// DRIFT-009 moved all three from `Dynamic` to `Embedded`, so the assertions flipped with them:
     /// each now ships rows and each row must be tagged with its own provider id. The provider-level
-    /// `baseUrl` is asserted UNCHANGED, and that is the point of the `embedded(<stem>, <url>)` macro
-    /// arm: upstream's `createProvider({ baseUrl })` still passes one for these three (and for
-    /// `baseten`) whether or not a catalog exists, so gaining a catalog must not cost
-    /// `Provider.baseUrl`.
+    /// `baseUrl` is asserted UNCHANGED, and that is the point of the `fleet!` row's own URL column:
+    /// upstream's `createProvider({ baseUrl })` passes one whether or not a catalog exists, so
+    /// gaining a catalog must not cost `Provider.baseUrl`.
     #[test]
     fn qwen_token_plan_members_match_upstream() {
         let expected: &[(&str, &str, &str, &str, &str)] = &[
@@ -551,8 +536,7 @@ mod tests {
             assert_eq!(spec.env_var, *env);
             assert_eq!(spec.auth_name, *auth);
             assert_eq!(
-                spec.base_url,
-                Some(*base_url),
+                spec.base_url, *base_url,
                 "{id}: `createProvider({{ baseUrl }})` survives the flip to Embedded (DRIFT-009)"
             );
             assert!(
@@ -605,29 +589,8 @@ mod tests {
             dynamic.is_empty(),
             "DRIFT-009 embedded the last four; {dynamic:?} is still Dynamic"
         );
-        // The members carrying a provider-level `baseUrl`: the four DRIFT-009 members, and `meta`
-        // (PROV-080), whose `createProvider` passes `baseUrl: "https://api.meta.ai/v1"`
-        // (`providers/meta.ts:11` @f1b2e77f5). Every other member's rows carry their own.
-        //
-        // NOT the whole upstream set at the pin: `xai.ts`, `groq.ts`, `cerebras.ts`, `deepseek.ts`,
-        // `huggingface.ts`, `openrouter.ts` and `zai.ts` (sampled) also pass one at f1b2e77f5, and
-        // these members still carry `None` — PROV-154, filed by PROV-080, not widened here.
-        let with_base_url: Vec<&str> = FLEET
-            .iter()
-            .filter(|s| s.base_url.is_some())
-            .map(|s| s.id)
-            .collect();
-        assert_eq!(
-            with_base_url,
-            [
-                "baseten",
-                "meta",
-                "qwen-token-plan",
-                "qwen-token-plan-cn",
-                "qwen-token-plan-individual"
-            ],
-            "in `all.ts` order"
-        );
+        // Every member carries a provider-level `baseUrl` (a `&'static str`, PROV-154);
+        // `providers::all`'s table pins each value against its pi module.
     }
 
     /// DRIFT-009 — the fourth blocked provider, field for field against `providers/baseten.ts:6-14`
@@ -647,9 +610,8 @@ mod tests {
         assert_eq!(spec.env_var, "BASETEN_API_KEY");
         assert_eq!(spec.auth_name, "Baseten API key");
         assert_eq!(
-            spec.base_url,
-            Some("https://inference.baseten.co/v1"),
-            "generate-models.ts:1259 @v0.84.4"
+            spec.base_url, "https://inference.baseten.co/v1",
+            "providers/baseten.ts:10 @f1b2e77f5"
         );
         assert!(
             !spec.is_dynamic(),

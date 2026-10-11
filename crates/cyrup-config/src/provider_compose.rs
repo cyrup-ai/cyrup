@@ -14,7 +14,8 @@
 //!
 //! 1. `composeModelProvider` synthesizes a `Provider` even when `base` is `undefined`
 //!    (provider-composer.ts:411-437), so a provider that exists ONLY in `models.json` is a real,
-//!    streamable provider. Its `streamWith` falls through to `getApiProvider(model.api)` (:459-465).
+//!    streamable provider. Its `streamWith` falls through to `getApiProvider(model.api)`
+//!    (`:583-603` @f1b2e77f5).
 //! 2. Every consumer reads that one collection: `--list-models`
 //!    (`modelRegistry.getAvailable()`, list-models.ts:35), `find`, `setModel`, `stream`. A caller
 //!    that reaches for the raw built-in registry is reading a registry Pi does not have.
@@ -25,16 +26,22 @@
 //! cyrup's analog of `getApiProvider(model.api)` is [`WireProvider`], which holds a catalog + a
 //! [`ProviderAuth`] and dispatches each request through the shared [`ApiRegistry`] keyed on
 //! `model.api`. Every built-in text provider in `cyrup-provider`'s `providers/all.rs` **is** a
-//! `WireProvider` (they differ only in id/name/catalog/auth), so building the composed provider the
-//! same way reproduces the built-in's behavior exactly when there is nothing to compose, and adds
-//! the overlay when there is.
+//! `WireProvider` (they differ only in id/name/baseUrl/catalog/auth), so the composed provider is
+//! built the same way, carrying the base's name and baseUrl unless the block sets its own
+//! (provider-composer.ts:607-608, CFG-114). It declares [`ApiDispatch::Global`]: its registry is
+//! `streamWith`'s process-wide one, and a model on an api its base's chat catalog lists is the base's
+//! to answer (`supportsBaseApi`, `:582`, `:593-596`), which [`WireProvider`] resolves per request
+//! through [`WireProvider::with_operations_from`]. So a miss reports pi's text on both branches
+//! (PROV-157). Where the base is one of pi's single-api built-ins, pi's base streams any model
+//! through its one api (`apiFor = single ?? byApi[model.api]`, `models.ts:1070`) where cyrup
+//! dispatches on `model.api`: that is PROV-160, not a composition question.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use cyrup_core::ProviderId;
 use cyrup_provider::auth::oauth::{AuthInteraction, AuthPrompt, OAuthError};
-use cyrup_provider::wire::WireProvider;
+use cyrup_provider::wire::{ApiDispatch, WireProvider};
 use cyrup_provider::{
     AnyModel, ApiKeyAuth, ApiRegistry, AuthContext, AuthError, AuthResult, ClassifierModel,
     CreateModelsOptions, Credential, CredentialStore, ImageModel, InMemoryCredentialStore, Model,
@@ -44,7 +51,7 @@ use cyrup_provider::{
 use crate::config_value::{
     config_value_env_var_names, resolve_config_value_or_throw_async, resolve_headers_or_throw,
 };
-use crate::model::{ModelFile, ProviderConfig, apply_models_json, provider_base_url};
+use crate::model::{ModelFile, ProviderConfig, apply_models_json, model_base_url_override};
 
 /// Pi `configContextEnv` (provider-composer.ts:279-291): resolve, **through the injected auth
 /// context** rather than the ambient process env, every environment variable named by a
@@ -441,7 +448,7 @@ impl ModelFile {
                     continue;
                 }
             };
-            if let Some(base_url) = provider_base_url(config) {
+            if let Some(base_url) = model_base_url_override(config) {
                 for model in &mut base_images {
                     model.base_url = base_url.to_string();
                 }
@@ -456,7 +463,29 @@ impl ModelFile {
                     continue;
                 }
             };
-            let name = config.name.clone().unwrap_or_else(|| provider_id.clone());
+            // Pi `name: extension?.name ?? config?.name ?? base?.name ?? extension?.oauth?.name ??
+            // providerId` and `baseUrl: extension?.baseUrl ?? config?.baseUrl ?? base?.baseUrl`
+            // (provider-composer.ts:607-608 @f1b2e77f5). No extension layer composes here (a guest
+            // registration is its own provider). The URL is the block's `baseUrl` even under
+            // `oauth` — deliberately NOT `model_base_url_override`, which drops it for the ROWS
+            // (:326, the block's URL is then the auth gateway); the provider's own `baseUrl` takes
+            // it either way. CFG-114.
+            //
+            // An `oauth` block's base is pi's radius provider, named `config.name ?? providerId`
+            // (`model-runtime.ts:263-276`), not the built-in cyrup composes over (`[CYRUP-DELTA]`
+            // in `model/schema.rs`), so its name never falls back to the built-in's.
+            let name = config
+                .name
+                .clone()
+                .or_else(|| match config.oauth {
+                    Some(_) => None,
+                    None => base.as_ref().map(|b| b.name().to_string()),
+                })
+                .unwrap_or_else(|| provider_id.clone());
+            let base_url = config
+                .base_url
+                .clone()
+                .or_else(|| base.as_ref().and_then(|b| b.base_url().map(str::to_string)));
             let mut provider = WireProvider::new(
                 provider_id.as_str(),
                 name,
@@ -466,7 +495,14 @@ impl ModelFile {
                 registry.clone(),
             )
             .with_image_models(base_images)
-            .with_classifier_models(base_classifiers);
+            .with_classifier_models(base_classifiers)
+            // `streamWith` falls through to the process-wide registry (provider-composer.ts:
+            // 598-599); a model its base lists is the base's (`:593-596`), resolved per request
+            // from `with_operations_from` below. PROV-157.
+            .with_api_dispatch(ApiDispatch::Global);
+            if let Some(base_url) = base_url {
+                provider = provider.with_base_url(base_url);
+            }
             if let Some(ctx) = &auth_context {
                 provider = provider.with_auth_context(ctx.clone());
             }

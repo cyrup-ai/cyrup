@@ -63,9 +63,11 @@ use std::time::Duration;
 /// The provider id (Pi `github-copilot.ts:11`).
 pub const GITHUB_COPILOT_PROVIDER_ID: &str = "github-copilot";
 
-/// The default (individual-plan) API base URL. Used only when the access token carries no
-/// `proxy-ep=` claim and no enterprise domain is configured (Pi `github-copilot.ts:13`,
-/// `auth/oauth/github-copilot.ts:83`).
+/// The default (individual-plan) API base URL — two roles, as upstream gives it two. It is pi's
+/// provider-level `createProvider({ baseUrl })` (`providers/github-copilot.ts:13` @f1b2e77f5,
+/// PROV-154), and the request host when the access token carries no `proxy-ep=` claim and no
+/// enterprise domain is configured (`getGitHubCopilotBaseUrl`, `auth/oauth/github-copilot.ts:78-87`,
+/// the fallback at `:86`). A request still goes where the token's claim says.
 pub const GITHUB_COPILOT_BASE_URL: &str = "https://api.individual.githubcopilot.com";
 
 /// The env var carrying a Copilot token (Pi `envApiKeyAuth("GitHub Copilot token",
@@ -176,6 +178,7 @@ pub fn github_copilot_provider_with(
         store,
         registry,
     )
+    .with_base_url(GITHUB_COPILOT_BASE_URL)
     // Pi `createProvider({ …, filterModels })` (`providers/github-copilot.ts:19-27` @v0.83.0).
     .with_filter_models(filter_github_copilot_models)
 }

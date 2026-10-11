@@ -313,8 +313,10 @@ async fn force_bypasses_the_window_and_a_304_moves_only_checked_at() {
 
 #[tokio::test]
 async fn a_304_is_never_requested_without_a_cached_body() {
-    // An entry that carries an etag but NO models: sending `if-none-match` here could return 304 and
-    // leave the overlay permanently empty. Pi suppresses the validator; so must cyrup.
+    // An entry that carries an etag but NO rows of ANY type: sending `if-none-match` here could
+    // return 304 and leave the overlay permanently empty. Pi suppresses the validator; so must
+    // cyrup. GUARD (green before and after PROV-159): the fix counts every persisted half, and
+    // must not turn the predicate into "any etag".
     let origin = MockOrigin::spawn(vec![Canned::ok("[]")]).await;
     let store = Arc::new(InMemoryModelsStore::new());
     store
@@ -339,6 +341,178 @@ async fn a_304_is_never_requested_without_a_cached_body() {
             .to_lowercase()
             .contains("if-none-match"),
         "validator must be suppressed when no cached body backs it"
+    );
+}
+
+/// The embedded `typesafe` classifier row under a remote-only id: a classifier-only provider's
+/// pi.dev body (`typesafe` has no chat rows at all, PROV-153).
+fn typesafe_classifier_json(id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "type": "classifier",
+        "id": id,
+        "name": "Jev Next",
+        "api": "typesafe-system-one",
+        "provider": "typesafe",
+        "baseUrl": "https://api.typesafe.ai/v1/",
+        "input": ["text"],
+        "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
+        "contextWindow": 64000
+    })
+}
+
+/// PROV-159 — pi `refreshModels` (`coding-agent/src/core/remote-catalog-provider.ts:98-100`
+/// @f1b2e77f5): `const validator = stored && stored.models.length > 0 ? stored.etag : undefined`,
+/// where `stored.models` is the ONE persisted array of every type. A classifier-only provider
+/// (`typesafe`) therefore revalidates with its etag, and the 304 (`:117-122`) moves only
+/// `checkedAt`, keeping every row. Port of pi's "revalidates a stored catalog with its etag and
+/// keeps the overlay on 304" for that shape. Red at the base, whose validator asked only the chat
+/// half (empty here), so the second request carried no `if-none-match`.
+#[tokio::test]
+async fn a_classifier_only_catalog_revalidates_and_a_304_keeps_its_classifier_row() {
+    let origin = MockOrigin::spawn(vec![
+        Canned::ok(&serde_json::json!([typesafe_classifier_json("jev-next")]).to_string())
+            .header("etag", "\"ts-1\"")
+            .header("last-modified", "Sat, 11 Jul 2026 10:00:00 GMT"),
+        Canned::status("HTTP/1.1 304 Not Modified"),
+    ])
+    .await;
+    let store = Arc::new(InMemoryModelsStore::new());
+    let catalog = catalog(store.clone(), &origin.base_url);
+
+    catalog
+        .refresh_provider("typesafe", RefreshOptions::network())
+        .await
+        .expect("the 200 refresh succeeds");
+    let first = store
+        .read("typesafe", None)
+        .await
+        .unwrap()
+        .expect("persisted");
+    assert!(first.models.is_empty(), "the premise: no chat half");
+    assert_eq!(first.etag.as_deref(), Some("\"ts-1\""));
+    assert!(
+        !origin.request_heads()[0]
+            .to_lowercase()
+            .contains("if-none-match")
+    );
+
+    catalog
+        .refresh_provider("typesafe", RefreshOptions::forced())
+        .await
+        .expect("a 304 is not an error");
+    assert_eq!(origin.accept_count(), 2);
+    let head = origin.request_heads()[1].to_lowercase();
+    assert!(head.contains("if-none-match: \"ts-1\""), "{head}");
+
+    let after = store.read("typesafe", None).await.unwrap().expect("kept");
+    assert_eq!(after.etag, first.etag);
+    assert_eq!(after.last_modified, first.last_modified);
+    assert!(
+        after.checked_at >= first.checked_at,
+        "only the window moves"
+    );
+    let kept = store
+        .read_classifier_models("typesafe", None)
+        .await
+        .unwrap();
+    assert_eq!(
+        kept.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+        ["jev-next"]
+    );
+    let overlay = catalog.load_overlay(&["typesafe"]).await;
+    assert_eq!(
+        overlay
+            .classifier_models_for("typesafe")
+            .iter()
+            .map(|m| m.id.as_str())
+            .collect::<Vec<_>>(),
+        ["jev-next"],
+        "the 304 left the overlay listing the classifier row"
+    );
+}
+
+/// PROV-159 — the image half backs the validator too (pi's one array holds image rows as well).
+/// The classifier test above stays green if only the classifier half is counted; this one does
+/// not. Red at the base (chat half empty, so no `if-none-match`).
+#[tokio::test]
+async fn an_image_only_entry_also_backs_the_validator() {
+    let origin = MockOrigin::spawn(vec![Canned::status("HTTP/1.1 304 Not Modified")]).await;
+    let store = Arc::new(InMemoryModelsStore::new());
+    let image: crate::ImageModel = serde_json::from_value(serde_json::json!({
+        "type": "image", "id": "img", "name": "Img", "api": "openrouter-images",
+        "provider": "openrouter", "baseUrl": "https://openrouter.ai/api/v1",
+        "input": ["text"], "output": ["image"],
+        "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0}
+    }))
+    .unwrap();
+    store
+        .write_all_types(
+            "openrouter",
+            ModelsStoreEntry {
+                models: Vec::new(),
+                last_modified: Some(7),
+                checked_at: Some(1),
+                etag: Some("\"img-1\"".into()),
+            },
+            vec![image],
+            Vec::new(),
+            None,
+        )
+        .await
+        .unwrap();
+
+    catalog(store.clone(), &origin.base_url)
+        .refresh_provider("openrouter", RefreshOptions::forced())
+        .await
+        .expect("a 304 is not an error");
+    let head = origin.request_heads()[0].to_lowercase();
+    assert!(head.contains("if-none-match: \"img-1\""), "{head}");
+    let after = store.read("openrouter", None).await.unwrap().expect("kept");
+    assert_eq!(after.etag.as_deref(), Some("\"img-1\""));
+    assert_eq!(after.last_modified, Some(7));
+    assert!(after.checked_at.unwrap() > 1);
+    assert_eq!(
+        store
+            .read_image_models("openrouter", None)
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "the 304 kept the image row"
+    );
+}
+
+/// PROV-159 — pi sends the validator only when it is truthy:
+/// `...(validator ? { "if-none-match": validator } : {})` (`remote-catalog-provider.ts:109`), and
+/// it stores an empty `ETag` header verbatim as `""` (`:147`), so an empty validator is never
+/// sent. Red at the base, which sent `if-none-match:` with an empty value.
+#[tokio::test]
+async fn an_empty_etag_is_never_sent_as_a_validator() {
+    let origin = MockOrigin::spawn(vec![Canned::ok("[]")]).await;
+    let store = Arc::new(InMemoryModelsStore::new());
+    store
+        .write(
+            "groq",
+            ModelsStoreEntry {
+                models: vec![serde_json::from_value(model_json("cached", 9)).unwrap()],
+                last_modified: Some(1),
+                checked_at: Some(1),
+                etag: Some(String::new()),
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    catalog(store, &origin.base_url)
+        .refresh_provider("groq", RefreshOptions::forced())
+        .await
+        .unwrap();
+    assert!(
+        !origin.request_heads()[0]
+            .to_lowercase()
+            .contains("if-none-match"),
+        "{}",
+        origin.request_heads()[0]
     );
 }
 

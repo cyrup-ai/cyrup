@@ -6,6 +6,12 @@
 //! Auth: `OPENCODE_API_KEY` (Pi `envApiKeyAuth("OpenCode API key", ["OPENCODE_API_KEY"])`). The
 //! provider has no provider-level base URL; the per-model `baseUrl` drives each request. The shared
 //! [`builtin_registry`] already provides all four wire impls, so this provider is purely additive.
+//!
+//! It also classifies (PROV-155): pi's `opencode.ts:18` lists `OPENCODE_CLASSIFIER_MODELS` beside
+//! the chat rows and `:25-26` installs `classifiers: { "typesafe-system-one": … }` ("OpenCode Zen
+//! serves TypeSafe's System One protocol at /zen/v1/systemone"); both come from
+//! [`super::classifiers::OPENCODE_CLASSIFIERS`]. The System One api is not wrapped in pi's
+//! `withOpenCodeSessionHeader`, which wraps only the chat apis.
 
 use crate::api::{ApiRegistry, builtin_registry};
 use crate::auth::{CredentialStore, InMemoryCredentialStore, ProviderAuth, env_key};
@@ -36,14 +42,16 @@ pub fn opencode_provider_with(
     store: Arc<dyn CredentialStore>,
     registry: Arc<ApiRegistry>,
 ) -> WireProvider {
-    WireProvider::new(
+    // PROV-155 — `jev-1.13`, `jev-1.13-free` and the `typesafe-system-one` map (pi
+    // `opencode.ts:18`, `:25-26`), from the classifier table.
+    super::classifiers::OPENCODE_CLASSIFIERS.attach(WireProvider::new(
         OPENCODE_PROVIDER_ID,
         "OpenCode Zen",
         opencode_models(),
         opencode_auth(),
         store,
         registry,
-    )
+    ))
 }
 
 /// Convenience constructor: an in-memory credential store + the built-in api registry.

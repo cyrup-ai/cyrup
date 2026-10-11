@@ -6,6 +6,7 @@ pub mod amazon_bedrock;
 pub mod anthropic;
 pub mod azure_openai_responses;
 pub mod builtin_oauth;
+pub mod classifiers;
 pub mod cloudflare;
 pub mod fireworks;
 pub mod fleet;
@@ -40,6 +41,10 @@ pub use azure_openai_responses::{
     azure_openai_responses_provider_with,
 };
 pub use builtin_oauth::builtin_provider_oauth;
+pub use classifiers::{
+    BUILTIN_CLASSIFIER_LEGS, BuiltinClassifierLeg, builtin_classifier_leg,
+    builtin_classifier_model, builtin_classifier_models, with_builtin_classifiers,
+};
 pub use cloudflare::{
     CLOUDFLARE_AI_GATEWAY_PROVIDER_ID, CLOUDFLARE_WORKERS_AI_PROVIDER_ID,
     cloudflare_ai_gateway_auth, cloudflare_ai_gateway_models, cloudflare_ai_gateway_provider,
@@ -64,9 +69,8 @@ pub use mistral::{
     mistral_provider_with,
 };
 pub use openai::{
-    OPENAI_BASE_URL, OPENAI_PROVIDER_ID, filter_openai_all_models, openai_auth,
-    openai_classifier_models, openai_classifiers_registry, openai_models, openai_provider,
-    openai_provider_with,
+    OPENAI_BASE_URL, OPENAI_PROVIDER_ID, filter_openai_all_models, openai_auth, openai_models,
+    openai_provider, openai_provider_with,
 };
 pub use openai_codex::*;
 pub use opencode::{
@@ -87,6 +91,6 @@ pub use together::{
     TOGETHER_BASE_URL, together_auth, together_models, together_provider, together_provider_with,
 };
 pub use typesafe::{
-    TYPESAFE_API_KEY_ENV, TYPESAFE_PROVIDER_ID, typesafe_auth, typesafe_classifier_models,
-    typesafe_classifiers_registry, typesafe_provider, typesafe_provider_with,
+    TYPESAFE_API_KEY_ENV, TYPESAFE_PROVIDER_ID, typesafe_auth, typesafe_provider,
+    typesafe_provider_with,
 };

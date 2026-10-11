@@ -128,7 +128,10 @@ pub fn models_json_provider_is_configured(
 /// models alike. `None` leaves each model's own endpoint. Under an oauth mode the block's `baseUrl`
 /// is the auth gateway, so the models keep their own request endpoints; `oauth` is single-valued,
 /// so `is_none()` is the exact negation of Pi's `=== "radius"`.
-pub(crate) fn provider_base_url(config: &ProviderConfig) -> Option<&str> {
+///
+/// This is the ROWS' override, not the composed provider's own `baseUrl` (pi :608, which takes the
+/// block's value even under `oauth`; see `ModelFile::compose_providers`, CFG-114).
+pub(crate) fn model_base_url_override(config: &ProviderConfig) -> Option<&str> {
     config
         .base_url
         .as_deref()
@@ -177,7 +180,7 @@ pub(crate) fn apply_models_json(
             // (:188): under an oauth mode the block's `baseUrl` is the auth gateway, so the models
             // keep their own request endpoints. `oauth` is single-valued, so `is_none()` is the
             // exact negation of Pi's `=== "radius"`.
-            if let Some(base_url) = provider_base_url(config) {
+            if let Some(base_url) = model_base_url_override(config) {
                 m.base_url = base_url.to_string();
             }
             m.compat = merge_compat(m.compat.as_ref(), config.compat.as_ref());

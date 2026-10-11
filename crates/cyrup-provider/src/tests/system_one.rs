@@ -738,10 +738,11 @@ async fn the_builtin_typesafe_provider_classifies_against_its_own_system_one_end
 }
 
 /// pi's `typesafeProvider()` passes no `api`, so `createProvider` answers any chat stream with
-/// `Provider typesafe has no API implementation for "<api>"` (`models.ts:1076-1080`). The built-in
-/// carries an EMPTY api registry, so a chat model handed to it fails rather than being streamed
-/// through the shared registry under TypeSafe's key. The assertion is cyrup's wording
-/// (`ProviderError::NoApiImpl`), which differs from pi's and carries no provider id: PROV-157.
+/// `Provider typesafe has no API implementation for "<api>"` (`models.ts:1072-1083` @f1b2e77f5).
+/// The built-in carries an EMPTY api registry, so a chat model handed to it fails rather than
+/// being streamed through the shared registry under TypeSafe's key. PROV-157's Verify: the
+/// message is pi's, whole; red at the base, where it read `no API implementation for
+/// openai-responses`.
 #[tokio::test]
 async fn the_typesafe_provider_streams_nothing() {
     use crate::context::Context;
@@ -764,13 +765,12 @@ async fn the_typesafe_provider_streams_nothing() {
     ))
     .await;
     assert_eq!(message.stop_reason, cyrup_core::StopReason::Error);
-    assert!(
-        message
-            .error_message
-            .as_deref()
-            .is_some_and(|m| m.contains("no API implementation for openai-responses")),
+    assert_eq!(
+        message.error_message.as_deref(),
+        Some(r#"Provider typesafe has no API implementation for "openai-responses""#),
         "{message:?}"
     );
+    assert_eq!(message.api.as_str(), "openai-responses");
 }
 
 /// PROV-110 corner (1) on the System One wire. pi posts `JSON.stringify({model, state, questions})`
@@ -841,6 +841,76 @@ async fn the_system_one_body_spells_numbers_as_json_stringify_does() {
     );
 }
 
+/// PROV-156 — every System One question goes out as `{type, instructions, criteria}`, `bool`
+/// spelled `noul`, a bool's criteria as `{true, false}`: pi's declared member order for each
+/// variant (`types.ts:662-678` @f1b2e77f5) and the three members both published System One input
+/// schemas name. Asserted on the raw bytes, so member order is pinned. GUARD, not a red proof: the
+/// wire is unchanged by design (the `[CYRUP-DELTA, intentional]` on `wire_question`); it is red
+/// under a bool arm that spells `bool`, any arm that puts `criteria` first, and a bool criteria
+/// spelled `{false, true}`.
+#[tokio::test]
+async fn every_system_one_question_goes_out_as_type_instructions_criteria() {
+    let server = FakeServer::start().await;
+    typesafe_system_one_api()
+        .classify(&model(TYPESAFE, &server.base_url), &context(), &keyed())
+        .await;
+    let raw = &server.requests_to("/v1/systemone")[0].raw_body;
+    assert!(
+        raw.contains(concat!(
+            r#""questions":{"category":{"type":"choice","instructions":"Classify the message","#,
+            r#""criteria":{"success":"Successful","failure":"Failed"}},"#,
+            r#""satisfaction":{"type":"score","instructions":"Score satisfaction","#,
+            r#""criteria":["low","neutral","high"]},"#,
+            r#""approved":{"type":"noul","instructions":"Does the user approve?","#,
+            r#""criteria":{"true":"Approval","false":"No approval"}}}"#
+        )),
+        "{raw}"
+    );
+}
+
+/// PROV-156 — a JSON caller's question with its members out of order and members the type does
+/// not name reaches the wire as its typed members only, in the typed order. pi forwards such a
+/// question object as given (`wireRequest`, `system-one-shared.ts:85-96` @f1b2e77f5); the Workers
+/// AI `typesafe/jev` input schema closes every question object and a noul's criteria
+/// (`additionalProperties: false`), so a service validating against it would refuse pi's request,
+/// while llama.cpp and Clef's open schema ignore the extras. GUARD of the recorded delta: green at
+/// the base; red if the question parse refused an unnamed member, or if a bool's `true`/`false`
+/// were read swapped.
+#[tokio::test]
+async fn a_json_callers_question_reaches_the_wire_as_its_typed_members() {
+    let server = FakeServer::start().await;
+    let ctx: ClassifierContext = serde_json::from_value(json!({
+        "state": {"text": "The deployment succeeded, thank you."},
+        "questions": {"approved": {
+            "criteria": {"false": "No approval", "maybe": "Unsure", "true": "Approval"},
+            "threshold": 0.5,
+            "instructions": "Does the user approve?",
+            "type": "bool"
+        }}
+    }))
+    .unwrap();
+    let result = typesafe_system_one_api()
+        .classify(&model(TYPESAFE, &server.base_url), &ctx, &keyed())
+        .await;
+    assert_eq!(result.stop_reason, ClassifierStopReason::Stop, "{result:?}");
+    assert!(matches!(
+        result.answers.get("approved"),
+        Some(ClassifierAnswer::Bool { probability }) if (*probability - 0.95).abs() < 1e-12
+    ));
+    let raw = &server.requests_to("/v1/systemone")[0].raw_body;
+    assert!(
+        raw.contains(concat!(
+            r#""questions":{"approved":{"type":"noul","instructions":"Does the user approve?","#,
+            r#""criteria":{"true":"Approval","false":"No approval"}}}"#
+        )),
+        "{raw}"
+    );
+    assert!(
+        !raw.contains("threshold") && !raw.contains("maybe"),
+        "{raw}"
+    );
+}
+
 /// Every known classifier api names its own implementation, and each is the api it says it is.
 #[tokio::test]
 async fn every_known_classifier_api_has_its_implementation() {
@@ -864,4 +934,191 @@ async fn every_known_classifier_api_has_its_implementation() {
         );
     }
     assert!(server.requests().is_empty());
+}
+
+/// An auth context that answers one api-key variable (and pins proxy resolution off for the
+/// loopback request).
+struct OneKeyEnv(&'static str, &'static str);
+
+#[async_trait::async_trait]
+impl crate::auth::AuthContext for OneKeyEnv {
+    async fn env(&self, name: &str) -> Option<String> {
+        if name == self.0 {
+            return Some(self.1.to_string());
+        }
+        match name {
+            "no_proxy" | "NO_PROXY" => Some("*".to_string()),
+            _ => None,
+        }
+    }
+    async fn file_exists(&self, _path: &str) -> bool {
+        false
+    }
+}
+
+/// `row` re-hosted on the fake: its origin replaced by the fake's, its path kept, so the request
+/// path still proves which endpoint the catalog row names.
+fn rehost(row: &ClassifierModel, server: &FakeServer) -> ClassifierModel {
+    let origin = server.base_url.trim_end_matches("/v1");
+    let path = row
+        .base_url
+        .splitn(4, '/')
+        .nth(3)
+        .map_or_else(String::new, |p| format!("/{p}"));
+    let mut row = row.clone();
+    row.base_url = format!("{origin}{path}");
+    row
+}
+
+/// A fake that answers `POST <path>` as a System One endpoint.
+async fn system_one_at(path: &'static str) -> FakeServer {
+    FakeServer::with(Behavior::default().intercept(move |request, _| {
+        (request.path == path).then(|| {
+            match system_one_output(&Behavior::default(), &request.body) {
+                Ok(answer) => Reply::Json(answer),
+                Err((status, body)) => Reply::status(status, &body.to_string()),
+            }
+        })
+    }))
+    .await
+}
+
+/// PROV-155 — pi `classifier-models.test.ts:131-164` @f1b2e77f5, "routes %s Jev (%s) to its
+/// TypeSafe-compatible endpoint": the built-in `vercel-ai-gateway` and `opencode` providers list
+/// their Jev rows as classifier models (never chat models), each row names pi's System One URL, and
+/// `Models::classify` through the built-in provider posts there with the provider's key. Red before
+/// PROV-155: neither provider had the rows (`missing … Jev model`), nor a `classifiers` map.
+#[tokio::test]
+async fn the_builtin_vercel_and_opencode_jev_rows_classify_at_their_system_one_endpoints() {
+    use crate::collection::CreateModelsOptions;
+
+    for (provider, env, id, url, path) in [
+        (
+            "vercel-ai-gateway",
+            "AI_GATEWAY_API_KEY",
+            "typesafe-ai/jev",
+            "https://ai-gateway.vercel.sh/typesafe/v1/systemone",
+            "/typesafe/v1/systemone",
+        ),
+        (
+            "opencode",
+            "OPENCODE_API_KEY",
+            "jev-1.13",
+            "https://opencode.ai/zen/v1/systemone",
+            "/zen/v1/systemone",
+        ),
+        (
+            "opencode",
+            "OPENCODE_API_KEY",
+            "jev-1.13-free",
+            "https://opencode.ai/zen/v1/systemone",
+            "/zen/v1/systemone",
+        ),
+    ] {
+        let models = crate::providers::all::default_models(CreateModelsOptions {
+            credentials: None,
+            auth_context: Some(Arc::new(OneKeyEnv(env, "secret"))),
+            catalog_overlay: None,
+        });
+        let jev = models
+            .get_classifier_model(provider, id)
+            .unwrap_or_else(|| panic!("missing {provider} Jev model {id}"));
+        assert_eq!(jev.api.as_str(), TYPESAFE, "{provider}/{id}");
+        assert_eq!(jev.context_window, 32000, "{provider}/{id}");
+        assert!(models.get_model(provider, id).is_none(), "not a chat model");
+        assert_eq!(
+            crate::api::system_one_shared::endpoint_url(&jev.base_url, "systemone").unwrap(),
+            url
+        );
+
+        let server = system_one_at(path).await;
+        let result = models
+            .classify(&rehost(&jev, &server), &context(), &options())
+            .await;
+        assert_eq!(result.error_message, None, "{provider}/{id}");
+        assert_eq!(result.stop_reason, ClassifierStopReason::Stop);
+        assert_eq!(result.answers, expected_answers());
+        let request = &server.requests()[0];
+        assert_eq!(request.path, path);
+        assert_eq!(request.header("authorization"), Some("Bearer secret"));
+        assert_eq!(request.body["model"], json!(id));
+    }
+}
+
+/// PROV-155 — pi `classifier-models.test.ts:248-255` @f1b2e77f5, "routes OpenRouter classifier
+/// models through the System One API", made non-vacuous: pi's loop passes on an empty list, this
+/// one first requires the built-in rows to exist. Each is a `typesafe-system-one` row at
+/// `https://openrouter.ai/api/v1`, not a chat model, and resolves through the built-in registry.
+/// Red before PROV-155: `openrouter` embedded no classifier rows.
+#[test]
+fn the_builtin_openrouter_classifier_rows_route_through_system_one() {
+    let models = crate::providers::all::default_models(Default::default());
+    let rows = crate::providers::classifiers::builtin_classifier_models("openrouter");
+    assert!(!rows.is_empty());
+    for row in rows {
+        assert_eq!(row.api.as_str(), TYPESAFE, "{}", row.id);
+        assert_eq!(row.base_url, "https://openrouter.ai/api/v1", "{}", row.id);
+        assert!(models.get_model("openrouter", row.id.as_str()).is_none());
+        assert_eq!(
+            models.get_classifier_model("openrouter", row.id.as_str()),
+            Some(row)
+        );
+    }
+}
+
+/// PROV-155 — the BUILT-IN Workers AI Clef row (`CLOUDFLARE_WORKERS_AI_CLASSIFIER_MODELS`,
+/// `generate-models.ts:2649-2687` @f1b2e77f5) classifies end to end: its catalog base URL keeps the
+/// `{CLOUDFLARE_ACCOUNT_ID}` placeholder, and `Models::classify` posts to `/accounts/<id>/ai/run`
+/// with the provider's key — pi's `cloudflareClassifier`, done by the provider's auth `resolve`.
+/// Red before PROV-155: the built-in listed no Clef row.
+#[tokio::test]
+async fn the_builtin_workers_ai_clef_row_classifies_with_the_account_id_resolved() {
+    use crate::auth::AuthContext;
+    use crate::collection::CreateModelsOptions;
+
+    struct CloudflareEnv;
+    #[async_trait::async_trait]
+    impl AuthContext for CloudflareEnv {
+        async fn env(&self, name: &str) -> Option<String> {
+            match name {
+                "CLOUDFLARE_API_KEY" => Some("cf-key".to_string()),
+                "CLOUDFLARE_ACCOUNT_ID" => Some("acct".to_string()),
+                "no_proxy" | "NO_PROXY" => Some("*".to_string()),
+                _ => None,
+            }
+        }
+        async fn file_exists(&self, _path: &str) -> bool {
+            false
+        }
+    }
+
+    let models = crate::providers::all::default_models(CreateModelsOptions {
+        credentials: None,
+        auth_context: Some(Arc::new(CloudflareEnv)),
+        catalog_overlay: None,
+    });
+    let clef = models
+        .get_classifier_model("cloudflare-workers-ai", "@cf/cloudflare/clef")
+        .expect("the built-in Clef row");
+    assert_eq!(clef.api.as_str(), CLOUDFLARE);
+    assert_eq!(
+        clef.base_url,
+        "https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/ai"
+    );
+
+    let server = FakeServer::with(Behavior::default().intercept(|request, _| {
+        (request.path == "/client/v4/accounts/acct/ai/run").then(|| {
+            let output = system_one_output(&Behavior::default(), &request.body["input"]).unwrap();
+            Reply::Json(json!({ "success": true, "result": output }))
+        })
+    }))
+    .await;
+    let result = models
+        .classify(&rehost(&clef, &server), &context(), &options())
+        .await;
+    assert_eq!(result.error_message, None);
+    assert_eq!(result.answers, expected_answers());
+    let request = &server.requests()[0];
+    assert_eq!(request.path, "/client/v4/accounts/acct/ai/run");
+    assert_eq!(request.header("authorization"), Some("Bearer cf-key"));
 }

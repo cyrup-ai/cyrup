@@ -199,7 +199,18 @@ fn to_model_info(model: &AnyModel) -> Result<Value, String> {
 const CLASSIFIER_CONTEXT_SHAPE: &str = r#"{ state: { ... }, questions: { <id>: { type: "choice", instructions, criteria: { <label>: <meaning> } } | { type: "score", instructions, criteria: [<lowest level>, ..., <highest level>] } | { type: "bool", instructions, criteria: { true: <meaning>, false: <meaning> } } } }"#;
 
 /// Check a script's classifier context, so mistakes fail with the expected shape instead of a
-/// provider error (`checkClassifierContext`, `execute.ts:102-142`).
+/// provider error (`checkClassifierContext`, `execute.ts:123-157` @v1.0.1).
+///
+/// `[CYRUP-DELTA, intentional]` PROV-156: pi validates the same members and then returns the
+/// script's own value (`return context as unknown as ClassifierContext;`, `execute.ts:169`
+/// @f1b2e77f5) — the `JSON.parse` of what the script passed (`codemode/src/runtime/host.ts:278`),
+/// so a question member the type does not name, and the script's member order, travel with it.
+/// cyrup returns the typed parse: such a member is accepted (pi refuses none) and dropped. Its three
+/// consumers see the typed question: the System One wire (`system_one_shared`'s `wire_question`
+/// gives the observable half: the Workers AI `typesafe/jev` input schema forbids extra members),
+/// an `on_payload` hook, and a classifier a provider registers (pi hands an extension classifier
+/// the raw object, `provider-composer.ts:666-672`). Carrying the raw object beside the typed one
+/// would give the request two sources of truth; a new question option belongs on the type.
 fn check_classifier_context(
     context: Option<&Value>,
     docs_path: &str,

@@ -122,14 +122,12 @@ fn catalogs() -> Vec<(String, String)> {
 /// `openrouter-images` resolves through the separate images registry (`images/mod.rs:38`).
 const IMAGES_CATALOGS: &[&str] = &["openrouter-images"];
 
-/// The stem suffix of a provider's CLASSIFIER catalog (PROV-147, PROV-153): `<provider>-classifiers`
-/// holds `type: "classifier"` rows, read with [`crate::catalog::load_classifier_catalog`] and owned
-/// by `<provider>` (xtask's `LiveCatalogKind::Classifier`).
-const CLASSIFIER_SUFFIX: &str = "-classifiers";
-
-/// The provider a classifier catalog's stem belongs to, or `None` for any other catalog.
+/// The provider a classifier catalog's stem belongs to, or `None` for any other catalog: a
+/// `<provider>-classifiers` file holds `type: "classifier"` rows, read with
+/// [`crate::catalog::load_classifier_catalog`] and owned by `<provider>` (PROV-147, PROV-153,
+/// PROV-155; xtask's `LiveCatalogKind::Classifier`).
 fn classifier_catalog_owner(stem: &str) -> Option<&str> {
-    stem.strip_suffix(CLASSIFIER_SUFFIX)
+    stem.strip_suffix(crate::providers::classifiers::CLASSIFIER_CATALOG_SUFFIX)
 }
 
 /// The guard. Production loaders swallow a parse error into `Vec::default()`, so without this a
@@ -353,7 +351,8 @@ fn the_catalog_file_set_matches_the_registered_providers() {
 
 /// PROV-030's regression guard (PROV-038 asked for it here): every row's `api` must be an api the
 /// registry can actually construct, otherwise the model resolves, lists in `/model`, and then dies
-/// at `wire.rs` with `no API implementation for <api>`.
+/// at `wire.rs` with `Provider <id> has no API implementation for "<api>"` (pi's `createProvider`
+/// text, `models.ts:1072-1083` @f1b2e77f5; PROV-157).
 ///
 /// **There is no carve-out, and there must never be one again.** `google-vertex` was the single
 /// dangling api this guard was written around; `api/google_vertex.rs` closed it (PROV-030) and the
@@ -394,9 +393,11 @@ fn every_catalog_row_names_a_registered_api() {
             assert!(
                 registry.contains(&m.api),
                 "{name}: {} names api `{}`, which register_builtins() does not provide — \
-                 every request on this row would die with `no API implementation for {}`",
+                 every request on this row would die with `Provider {} has no API \
+                 implementation for \"{}\"`",
                 m.id,
                 m.api,
+                m.provider,
                 m.api
             );
         }
@@ -1382,9 +1383,10 @@ fn the_catalog_manifest_names_one_revision_per_provider() {
         per_provider.len() - PINNED.len(),
         "every catalog but the pinned one must be live-fetched (PROV-071)"
     );
-    // 38 provider catalogs, plus `meta` (PROV-080) and the two classifier catalogs
-    // `openai-classifiers` (PROV-147) and `typesafe-classifiers` (PROV-153).
-    assert_eq!(seen_live.len(), 41);
+    // 38 provider catalogs, plus `meta` (PROV-080) and six classifier catalogs: `openai`
+    // (PROV-147), `typesafe` (PROV-153), and `cloudflare-workers-ai`, `opencode`, `openrouter` and
+    // `vercel-ai-gateway` (PROV-155).
+    assert_eq!(seen_live.len(), 45);
     for name in PINNED {
         assert!(
             per_provider.contains_key(*name),
@@ -1447,5 +1449,150 @@ fn gen_catalogs_check_reports_no_drift_against_the_pinned_revision() {
         "the embedded catalogs no longer reproduce from the pinned pi revision:\n{}\n{}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr),
+    );
+}
+
+/// PROV-155 — a built-in classifies exactly when pi gives it a `classifiers` map, and then it lists
+/// that leg's generated rows, in order. At f1b2e77f5 that is six providers; before PROV-155,
+/// `opencode` and `vercel-ai-gateway` had no map and `openrouter` and `cloudflare-workers-ai` had no
+/// rows (their classifier models arrived only with the live overlay).
+#[test]
+fn every_builtin_classifies_exactly_when_pi_gives_it_a_classifier_map() {
+    use crate::classifier::AnyModel;
+    use crate::providers::classifiers::{BUILTIN_CLASSIFIER_LEGS, builtin_classifier_leg};
+
+    let providers = crate::providers::all::all_providers();
+    let mut with_leg = 0;
+    for provider in &providers {
+        let id = provider.id().as_str();
+        let listed: Vec<_> = provider
+            .get_all_models()
+            .into_iter()
+            .filter_map(|m| match m {
+                AnyModel::Classifier(c) => Some(c),
+                _ => None,
+            })
+            .collect();
+        match builtin_classifier_leg(id) {
+            Some(leg) => {
+                with_leg += 1;
+                assert!(provider.supports_classification(), "{id}");
+                assert_eq!(listed, leg.models(), "{id}: the leg's rows, in order");
+                assert!(!listed.is_empty(), "{id}");
+            }
+            None => {
+                assert!(!provider.supports_classification(), "{id}");
+                assert!(listed.is_empty(), "{id}");
+            }
+        }
+    }
+    assert_eq!(
+        with_leg,
+        BUILTIN_CLASSIFIER_LEGS.len(),
+        "every leg is a registered built-in"
+    );
+}
+
+/// PROV-155 — GUARD (no unloaded classifier file existed at the base, which this fails only by not
+/// compiling): every `<provider>-classifiers.json` under `providers/catalog/` is some leg's file. A
+/// leg without its file cannot build (`include_str!`), so this catches the converse: a generated
+/// `<id>-classifiers.json` that no leg loads. PROV-155's own defect (missing maps and rows) is
+/// pinned by `every_builtin_classifies_exactly_when_pi_gives_it_a_classifier_map`.
+#[test]
+fn every_classifier_catalog_on_disk_is_a_builtin_leg() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/providers/catalog");
+    let mut on_disk: Vec<String> = std::fs::read_dir(&dir)
+        .expect("catalog dir")
+        .filter_map(|e| e.ok())
+        .filter_map(|e| {
+            e.file_name()
+                .to_str()
+                .and_then(|n| n.strip_suffix(".json"))
+                .and_then(classifier_catalog_owner)
+                .map(str::to_string)
+        })
+        .collect();
+    on_disk.sort();
+    let legs: Vec<String> = crate::providers::classifiers::BUILTIN_CLASSIFIER_LEGS
+        .iter()
+        .map(|leg| leg.provider.to_string())
+        .collect();
+    assert_eq!(on_disk, legs);
+}
+
+/// PROV-155 — in the committed manifest, a provider's catalogs carry ONE pi.dev revision. Its
+/// overlay floor is the chat catalog's stamp (`providers::all`), which speaks for its classifier
+/// rows only if both files hold the same revision; `xtask`'s `check_one_revision_per_provider`
+/// refuses to write anything else, and this pins the data that was written.
+#[test]
+fn a_providers_catalogs_share_one_pi_dev_revision() {
+    let manifest: serde_json::Value =
+        serde_json::from_str(include_str!("../providers/catalog_manifest.json"))
+            .expect("manifest parses");
+    let catalogs = manifest["catalogs"].as_object().expect("catalogs map");
+    let mut revisions: std::collections::BTreeMap<&str, std::collections::BTreeSet<&str>> =
+        std::collections::BTreeMap::new();
+    for (name, entry) in catalogs {
+        if let Some(revision) = entry["revision"].as_str() {
+            let owner = classifier_catalog_owner(name).unwrap_or(name);
+            revisions.entry(owner).or_default().insert(revision);
+        }
+    }
+    let split: Vec<_> = revisions.iter().filter(|(_, r)| r.len() > 1).collect();
+    assert!(split.is_empty(), "{split:?}");
+    for provider in [
+        "cloudflare-workers-ai",
+        "openai",
+        "opencode",
+        "openrouter",
+        "vercel-ai-gateway",
+    ] {
+        assert!(
+            catalogs.contains_key(&format!("{provider}-classifiers"))
+                && catalogs.contains_key(provider),
+            "non-vacuity: {provider} has both catalogs"
+        );
+    }
+}
+
+/// PROV-158 — every embedded `<provider>-classifiers.json` is a pi.dev shard, so the live overlay
+/// must read it exactly as the floor does: `remote_catalog::parse_catalog` (pi's runtime
+/// `parseCatalog`, verbatim, `remote-catalog-provider.ts:37-50` @f1b2e77f5) and
+/// `catalog::load_classifier_catalog` must produce identical rows. A per-type pass added to one
+/// reader and not the other shows up here as an overlay row that contradicts its own floor. Red at
+/// the base, whose overlay stamped image input limits onto `gpt-6-luna` and OpenRouter's
+/// image-capable classifiers.
+#[test]
+fn every_classifier_catalog_reads_identically_through_the_overlay_parser() {
+    use crate::classifier::AnyModel;
+    use crate::model::Modality;
+
+    let mut image_capable = 0;
+    let mut files = 0;
+    for (name, blob) in catalogs() {
+        let Some(owner) = classifier_catalog_owner(&name) else {
+            continue;
+        };
+        files += 1;
+        let floor = crate::catalog::load_classifier_catalog(&blob).expect("floor parses");
+        let body: serde_json::Value = serde_json::from_str(&blob).expect("json");
+        let overlay: Vec<_> = crate::remote_catalog::parse_catalog(owner, &body)
+            .expect("overlay parses")
+            .into_iter()
+            .filter_map(AnyModel::into_classifier)
+            .collect();
+        assert_eq!(overlay, floor, "{name}");
+        image_capable += floor
+            .iter()
+            .filter(|m| m.input.contains(&Modality::Image))
+            .count();
+    }
+    assert_eq!(
+        files,
+        crate::providers::classifiers::BUILTIN_CLASSIFIER_LEGS.len()
+    );
+    assert!(
+        image_capable > 0,
+        "non-vacuity: some floor row is image-capable"
     );
 }

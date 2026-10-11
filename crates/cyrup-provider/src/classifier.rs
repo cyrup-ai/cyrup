@@ -172,8 +172,9 @@ pub struct ClassifierModel {
     pub input: Vec<Modality>,
     /// Provider input limits and cache-safe image preprocessing metadata (pi
     /// `BaseModel.inputLimits`, `types.ts:1105` @v1.0.4, declared between `input` and `cost`).
-    /// Declared on `BaseModel`, which this type extends, so an classifier row carries it exactly as a
-    /// chat [`Model`] does.
+    /// Declared on `BaseModel`, which this type extends, so a classifier row carries it exactly as a
+    /// chat [`Model`] does. It holds what the catalog row declared and nothing more: no catalog pass
+    /// stamps a classifier row, embedded or overlaid, because pi's generator never does (PROV-158).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_limits: Option<ModelInputLimits>,
     pub cost: ModelCost,
@@ -675,6 +676,9 @@ pub struct BoolCriteria {
 }
 
 /// One question about the state (pi `ClassifierQuestion`, types.ts:633-651).
+///
+/// Read leniently, as pi's own codemode check is: the members named here are required, and a member
+/// a JSON caller adds is accepted and not carried (PROV-156, recorded where the question is parsed).
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum ClassifierQuestion {

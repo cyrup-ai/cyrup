@@ -1925,6 +1925,48 @@ async fn a_stored_credential_routes_the_stream_to_its_server() {
     assert_eq!(requests[0].header("authorization"), Some("Bearer secret"));
 }
 
+/// PROV-157 — pi's llama provider streams through `compat` `stream`/`streamSimple`
+/// (`extensions/llama/provider.ts:288-289` @f1b2e77f5), whose `resolveApiProvider` answers a miss
+/// with ``throw new Error(`No API provider registered for api: ${api}`)`` (`compat.ts:244-247`),
+/// not `createProvider`'s text. The registry here is empty, so the stream ends at that miss
+/// without any server.
+#[tokio::test]
+async fn a_model_on_an_api_the_registry_lacks_reports_the_registry_miss() {
+    let register: RegisterProviderFn = Arc::new(|_| Ok(()));
+    let controller = LlamaController::new(
+        LlamaControllerOptions::new(Arc::new(InMemoryCredentialStore::new()), register)
+            .with_auth_context(Arc::new(MapContext::default()))
+            .with_registry(Arc::new(cyrup_provider::ApiRegistry::new())),
+    );
+    controller
+        .set_catalog(
+            &[info(
+                json!({ "id": "qwen", "status": { "value": "loaded" } }),
+            )],
+            "http://127.0.0.1:1",
+            SetCatalogOptions::default(),
+        )
+        .unwrap();
+    let provider = controller.provider();
+    let model = provider.models()[0].clone();
+    let options = StreamOptions {
+        api_key: Some("local".to_string()),
+        env: Some(ProviderEnv::from([(
+            "LLAMA_BASE_URL".to_string(),
+            "http://127.0.0.1:1".to_string(),
+        )])),
+        ..StreamOptions::default()
+    };
+
+    let message = collect_message(provider.stream(&model, &user_context("hi"), &options)).await;
+
+    assert_eq!(
+        message.error_message.as_deref(),
+        Some("No API provider registered for api: openai-completions"),
+        "{message:?}"
+    );
+}
+
 /// Before any server is configured the provider is dormant: `Models` finds no auth and the stream
 /// fails as "not configured" instead of calling the default address.
 #[tokio::test]

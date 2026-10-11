@@ -17,7 +17,8 @@ use crate::model::Model;
 use crate::wire::WireProvider;
 use std::sync::Arc;
 
-/// Anthropic's API base URL (the `/v1/messages` path is appended by the wire impl).
+/// Anthropic's API base URL (the `/v1/messages` path is appended by the wire impl), and pi's
+/// provider-level `createProvider({ baseUrl })` (`providers/anthropic.ts:78` @f1b2e77f5, PROV-154).
 pub const ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com";
 
 /// The provider id.
@@ -231,6 +232,7 @@ pub fn anthropic_provider_with(
         store,
         registry,
     )
+    .with_base_url(ANTHROPIC_BASE_URL)
 }
 
 /// Convenience constructor: an in-memory credential store + the built-in api registry. Resolves
@@ -246,11 +248,13 @@ pub fn anthropic_provider() -> WireProvider {
 // ---------------------------------------------------------------------------
 // The Anthropic-compatible provider fleet (Pi providers/{kimi-coding,minimax,minimax-cn,
 // vercel-ai-gateway}.ts). Every one speaks the `anthropic-messages` wire protocol with a single
-// env-key auth and a verbatim generated catalog; they differ only in id/name/base URL/env-key.
+// env-key auth and a verbatim generated catalog; they differ only in id/name/base URL/env-key,
+// except that `vercel-ai-gateway` also classifies (`classifiers: { typesafe-system-one }`,
+// `vercel-ai-gateway.ts:15-16`, PROV-155).
 // ---------------------------------------------------------------------------
 
 /// Static metadata for one `anthropic-messages` fleet provider (Pi provider factory `id`/`name`/
-/// env-key, plus the embedded `<id>.models.ts` catalog).
+/// `baseUrl`/env-key, plus the embedded `<id>.models.ts` catalog).
 pub struct AnthropicFleetSpec {
     pub id: &'static str,
     pub name: &'static str,
@@ -260,18 +264,23 @@ pub struct AnthropicFleetSpec {
     /// (`ai/src/auth/helpers.ts:9`). Not derivable from `name`: `kimi-coding` is
     /// `"Kimi API key"`, not `"Kimi For Coding API key"` (`providers/kimi-coding.ts:13`).
     pub auth_name: &'static str,
+    /// Upstream's `createProvider({ baseUrl })` — `Provider.baseUrl` (`models.ts:154`, set at
+    /// `:1088` @f1b2e77f5). Every member's module passes one (`providers/<id>.ts:10-11`), so it is
+    /// not optional (PROV-154). Metadata only — a request goes to its row's own `baseUrl`.
+    pub base_url: &'static str,
     /// The verbatim JSON catalog (extracted from Pi's `<id>.models.ts`).
     pub catalog_json: &'static str,
 }
 
 macro_rules! anthropic_fleet {
-    ($($id:literal => ($const:ident, $name:literal, $env:literal, $auth:literal, $file:literal)),* $(,)?) => {
+    ($($id:literal => ($const:ident, $name:literal, $env:literal, $auth:literal, $base_url:literal, $file:literal)),* $(,)?) => {
         $(
             pub const $const: AnthropicFleetSpec = AnthropicFleetSpec {
                 id: $id,
                 name: $name,
                 env_var: $env,
                 auth_name: $auth,
+                base_url: $base_url,
                 catalog_json: include_str!(concat!("catalog/", $file, ".json")),
             };
         )*
@@ -281,10 +290,10 @@ macro_rules! anthropic_fleet {
 }
 
 anthropic_fleet! {
-    "kimi-coding"       => (KIMI_CODING, "Kimi For Coding", "KIMI_API_KEY", "Kimi API key", "kimi-coding"),
-    "minimax"           => (MINIMAX, "MiniMax", "MINIMAX_API_KEY", "MiniMax API key", "minimax"),
-    "minimax-cn"        => (MINIMAX_CN, "MiniMax CN", "MINIMAX_CN_API_KEY", "MiniMax CN API key", "minimax-cn"),
-    "vercel-ai-gateway" => (VERCEL_AI_GATEWAY, "Vercel AI Gateway", "AI_GATEWAY_API_KEY", "Vercel AI Gateway API key", "vercel-ai-gateway"),
+    "kimi-coding"       => (KIMI_CODING, "Kimi For Coding", "KIMI_API_KEY", "Kimi API key", "https://api.kimi.com/coding", "kimi-coding"),
+    "minimax"           => (MINIMAX, "MiniMax", "MINIMAX_API_KEY", "MiniMax API key", "https://api.minimax.io/anthropic", "minimax"),
+    "minimax-cn"        => (MINIMAX_CN, "MiniMax CN", "MINIMAX_CN_API_KEY", "MiniMax CN API key", "https://api.minimaxi.com/anthropic", "minimax-cn"),
+    "vercel-ai-gateway" => (VERCEL_AI_GATEWAY, "Vercel AI Gateway", "AI_GATEWAY_API_KEY", "Vercel AI Gateway API key", "https://ai-gateway.vercel.sh", "vercel-ai-gateway"),
 }
 
 impl AnthropicFleetSpec {
@@ -310,13 +319,19 @@ impl AnthropicFleetSpec {
         store: Arc<dyn CredentialStore>,
         registry: Arc<ApiRegistry>,
     ) -> WireProvider {
-        WireProvider::new(
+        // PROV-155 — the per-id classifier leg (pi `classifiers:`): `vercel-ai-gateway` is the only
+        // member with one (`vercel-ai-gateway.ts:13`, `:15-16`); every other id comes back untouched.
+        super::classifiers::with_builtin_classifiers(
             self.id,
-            self.name,
-            self.models(),
-            self.auth(),
-            store,
-            registry,
+            WireProvider::new(
+                self.id,
+                self.name,
+                self.models(),
+                self.auth(),
+                store,
+                registry,
+            )
+            .with_base_url(self.base_url),
         )
     }
 

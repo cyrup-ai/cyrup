@@ -10,7 +10,7 @@
 //!          ...Object.values(OPENROUTER_CLASSIFIER_MODELS)],
 //! api:         { "anthropic-messages": …, "openai-completions": … },
 //! images:      { "openrouter-images": openrouterImagesApi() },   // :33
-//! classifiers: { "typesafe-system-one": typesafeSystemOneApi() }, // :35
+//! classifiers: { "typesafe-system-one": typesafeSystemOneApi() }, // :34
 //! ```
 //!
 //! cyrup compresses the twenty single-file `createProvider` factories that are purely
@@ -21,14 +21,13 @@
 //! [`super::fleet::FleetSpec::provider_with`] calls, so the fleet-built `openrouter` provider comes
 //! out of `builtin_providers_with` already carrying its image rows and its `images` map.
 //!
-//! The classifier leg is the same kind of exception: `classifiers: { "typesafe-system-one": … }`
-//! (`:34`, "OpenRouter serves TypeSafe's System One protocol at /api/v1/systemone"). PROV-104
-//! ported the api ([`crate::api::typesafe_system_one`]) and [`with_builtin_images`] installs it as
-//! [`openrouter_classifiers_registry`], so the live catalog's `openrouter` classifier rows, which
-//! the remote catalog overlays onto this provider, classify through
-//! `https://openrouter.ai/api/v1/systemone`. The embedded catalog holds no classifier rows (pi's
-//! `OPENROUTER_CLASSIFIER_MODELS` is generated data, gitignored at the pin); the overlay is where
-//! they come from.
+//! The classifier leg — `classifiers: { "typesafe-system-one": … }` (`:33-34`, "OpenRouter serves
+//! TypeSafe's System One protocol at /api/v1/systemone") and `OPENROUTER_CLASSIFIER_MODELS` — is
+//! [`super::classifiers::OPENROUTER_CLASSIFIERS`] (PROV-104 ported the api, PROV-155 the rows),
+//! attached by [`super::fleet::FleetSpec::provider_with`] through
+//! [`super::classifiers::with_builtin_classifiers`]. Its rows are embedded from
+//! `catalog/openrouter-classifiers.json`, generated from pi.dev, and the live overlay merges over
+//! them, so an offline run lists OpenRouter's decision models too.
 
 use crate::classifier::ImageModel;
 use crate::images::ImageApiRegistry;
@@ -70,7 +69,7 @@ pub fn openrouter_image_models() -> Vec<ImageModel> {
             // 54 image-capable ones carry no resize profile (measured at HEAD), while the live
             // pi.dev body carries one on 57 of its 59 image rows. Upstream's generator stamps the
             // image catalog with the identical pass it stamps the chat catalog with
-            // (`applyImageInputMetadata`, `generate-models.ts:3505`), so without this an image
+            // (`applyImageInputMetadata`, `generate-models.ts:3377` @f1b2e77f5), so without this an image
             // model would resolve no profile at all. Same `[CYRUP-DELTA]` mechanism note as
             // `catalog::load_catalog` carries: parse time instead of generation time, because the
             // generator analogue is unreachable at this pin (PROV-071).
@@ -99,16 +98,7 @@ pub fn openrouter_images_registry() -> ImageApiRegistry {
     registry
 }
 
-/// The provider's `classifiers` dispatch map (pi `classifiers: { "typesafe-system-one":
-/// typesafeSystemOneApi() }`, `providers/openrouter.ts:34`). PROV-104.
-pub fn openrouter_classifiers_registry() -> crate::classifier::ClassifierApiRegistry {
-    let kind = crate::classifier::KnownClassifierApi::TypesafeSystemOne;
-    let mut registry = crate::classifier::ClassifierApiRegistry::new();
-    registry.register(kind, kind.implementation());
-    registry
-}
-
-/// Attach the built-in image and classifier legs to the provider `id`, if it has them — the per-id hook
+/// Attach the built-in image leg to the provider `id`, if it has one — the per-id hook
 /// [`super::fleet::FleetSpec::provider_with`] applies, shaped exactly like
 /// [`super::builtin_oauth::builtin_provider_oauth`].
 ///
@@ -122,7 +112,6 @@ pub fn with_builtin_images(id: &str, provider: WireProvider) -> WireProvider {
     provider
         .with_image_models(openrouter_image_models())
         .with_images(Arc::new(openrouter_images_registry()))
-        .with_classifiers(Arc::new(openrouter_classifiers_registry()))
 }
 
 #[cfg(test)]

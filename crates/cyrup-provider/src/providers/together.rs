@@ -11,6 +11,8 @@ use crate::wire::WireProvider;
 use std::sync::Arc;
 
 /// Together's OpenAI-compatible base URL (the `/chat/completions` path is appended by the wire impl).
+/// Also pi's provider-level `createProvider({ baseUrl })` (`providers/together.ts:10` @f1b2e77f5,
+/// PROV-154).
 pub const TOGETHER_BASE_URL: &str = "https://api.together.ai/v1";
 
 /// The provider id.
@@ -96,7 +98,7 @@ fn model(
     // than embedded JSON, so its rows never pass through `catalog::load_catalog` and would be the
     // only image-capable rows in the whole built-in registry with no resize profile (measured: 6
     // of them). Upstream's `together.models.ts` is generated data and is stamped with everything
-    // else at `generate-models.ts:3487`, so stamping here is the parity-preserving placement, not
+    // else at `generate-models.ts:3359` @f1b2e77f5, so stamping here is the parity-preserving placement, not
     // a cyrup invention. Same fill-only discipline as every other pass.
     crate::catalog::apply_image_input_metadata(&mut model);
     model
@@ -390,6 +392,7 @@ pub fn together_provider_with(
         store,
         registry,
     )
+    .with_base_url(TOGETHER_BASE_URL)
 }
 
 /// Convenience constructor: an in-memory credential store + the built-in api registry. Resolves

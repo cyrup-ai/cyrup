@@ -52,9 +52,9 @@ use cyrup_provider::known_api::OPENAI_COMPLETIONS;
 use cyrup_provider::stream::{StreamEvent, StreamOptions};
 use cyrup_provider::utils::simple_options::SimpleStreamOptions;
 use cyrup_provider::{
-    AnyModel, AuthError, ClassifierContext, ClassifierModel, ClassifierOptions, ClassifierResult,
-    Context, KnownClassifierApi, Model, ProviderClassifier, ProviderError, RefreshModelsContext,
-    WireProvider,
+    AnyModel, ApiDispatch, AuthError, ClassifierContext, ClassifierModel, ClassifierOptions,
+    ClassifierResult, Context, KnownClassifierApi, Model, ProviderClassifier, ProviderError,
+    RefreshModelsContext, WireProvider,
 };
 use futures::future::try_join_all;
 use serde::{Deserialize, Serialize};
@@ -420,7 +420,8 @@ struct Parts {
 
 /// The llama.cpp provider (`createLlamaProvider().provider`, `provider.ts:152-263`).
 ///
-/// Streaming and auth resolution are a [`WireProvider`] over the `openai-completions` api;
+/// Streaming and auth resolution are a [`WireProvider`] over the `openai-completions` api, declared
+/// [`ApiDispatch::Global`] because pi streams through `compat` (PROV-157);
 /// `classify` dispatches on the model's api, `typesafe-system-one` for a decision model and
 /// `llama-cpp-classify` for everything else (`provider.ts:290-296` @f1b2e77f5, EXT-110). Every
 /// [`Provider`] surface method is delegated by name rather than left to a trait default.
@@ -454,7 +455,11 @@ impl LlamaProvider {
             parts.credentials.clone(),
             parts.registry.clone(),
         )
-        .with_auth_context(parts.auth_context.clone());
+        .with_auth_context(parts.auth_context.clone())
+        // pi's llama provider streams through `compat` `stream`/`streamSimple` (`provider.ts:
+        // 288-289` @f1b2e77f5), the process-wide registry: a miss is `No API provider registered for
+        // api: <api>` (`compat.ts:244-250`), not `createProvider`'s text. PROV-157.
+        .with_api_dispatch(ApiDispatch::Global);
         Self {
             id,
             base_url: DEFAULT_LLAMA_BASE_URL.to_string(),
@@ -744,7 +749,7 @@ impl Provider for LlamaProvider {
         classifier.classify(model, context, options).await
     }
 
-    /// `stream` (`provider.ts:260`).
+    /// `stream` (`provider.ts:288` @f1b2e77f5).
     fn stream(
         &self,
         model: &Model,
@@ -754,7 +759,7 @@ impl Provider for LlamaProvider {
         self.inner.stream(model, context, options)
     }
 
-    /// `streamSimple` (`provider.ts:261`).
+    /// `streamSimple` (`provider.ts:289` @f1b2e77f5).
     fn stream_simple(
         &self,
         model: &Model,

@@ -153,7 +153,7 @@ async fn models_classify_routes_to_the_provider_that_owns_the_model() {
     );
 }
 
-/// pi `requireProvider` (`models.ts:824-829`): `Unknown provider: ${model.provider}`, delivered as
+/// pi `requireProvider` (`models.ts:830-836` @f1b2e77f5): `Unknown provider: ${model.provider}`, delivered as
 /// an error result (`:979-981`).
 #[tokio::test]
 async fn models_classify_unknown_provider_is_an_error_result() {

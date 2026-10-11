@@ -1,0 +1,38 @@
+[
+	{
+		"type": "classifier",
+		"id": "jev-1.13",
+		"name": "Jev 1.13",
+		"api": "typesafe-system-one",
+		"provider": "opencode",
+		"baseUrl": "https://opencode.ai/zen/v1",
+		"input": [
+			"text"
+		],
+		"cost": {
+			"input": 0.042,
+			"output": 0,
+			"cacheRead": 0,
+			"cacheWrite": 0
+		},
+		"contextWindow": 32000
+	},
+	{
+		"type": "classifier",
+		"id": "jev-1.13-free",
+		"name": "Jev 1.13 Free",
+		"api": "typesafe-system-one",
+		"provider": "opencode",
+		"baseUrl": "https://opencode.ai/zen/v1",
+		"input": [
+			"text"
+		],
+		"cost": {
+			"input": 0,
+			"output": 0,
+			"cacheRead": 0,
+			"cacheWrite": 0
+		},
+		"contextWindow": 32000
+	}
+]

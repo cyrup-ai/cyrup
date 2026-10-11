@@ -13,6 +13,8 @@ use std::sync::Arc;
 
 /// Fireworks inference base URL (per-model `baseUrl` overrides distinguish the
 /// `anthropic-messages` root from the `openai-completions` `/v1` root).
+/// Also pi's provider-level `createProvider({ baseUrl })` (`providers/fireworks.ts:11` @f1b2e77f5,
+/// PROV-154).
 pub const FIREWORKS_BASE_URL: &str = "https://api.fireworks.ai/inference";
 
 /// The provider id.
@@ -51,6 +53,7 @@ pub fn fireworks_provider_with(
         store,
         registry,
     )
+    .with_base_url(FIREWORKS_BASE_URL)
 }
 
 /// Convenience constructor: an in-memory credential store + the built-in api registry.

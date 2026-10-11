@@ -11,7 +11,7 @@
 //! here remain the source of truth and the floor, and the overlay can only add or replace models by
 //! id, never remove one.
 
-use crate::classifier::{ClassifierModel, ImageModel, ModelType};
+use crate::classifier::{AnyModel, ClassifierModel, ImageModel};
 use crate::model::{
     Modality, Model, ModelImageInputLimits, ModelImageResizeOptions, ModelInputLimits,
 };
@@ -57,6 +57,8 @@ pub fn load_catalog(json: &str) -> Result<Vec<Model>, serde_json::Error> {
 /// (`generate-models.ts:3347-3359`, `:3376-3377` @f1b2e77f5); its classifier rows
 /// (`OPENAI_CLASSIFIER_MODELS`, `loadModelsDevClassifierModels`, `:3381-3392`) are merged after
 /// that loop and carry no `inputLimits`, which is also what pi.dev serves for them.
+///
+/// The live overlay reads classifier rows the same way ([`apply_overlay_metadata`], PROV-158).
 ///
 /// The `type` member is required on every row ([`ClassifierModel`]'s deserializer), so a chat row
 /// cannot be read as a classifier one.
@@ -126,21 +128,23 @@ pub(crate) fn apply_prompt_cache_metadata(model: &mut Model) {
 }
 
 /// The resize profile every image-capable model resolves to when its row declares none — Pi
-/// `DEFAULT_IMAGE_RESIZE` (`packages/ai/scripts/generate-models.ts:424-430` @v1.0.4).
+/// `DEFAULT_IMAGE_RESIZE` (`packages/ai/scripts/generate-models.ts:420-425` @f1b2e77f5).
 ///
 /// Re-exported from its home in `cyrup-core` beside [`ModelImageResizeOptions`], so the generator
 /// stamp here and the resizer in `cyrup-tools` read the SAME four numbers rather than two copies
 /// that can drift. See [`cyrup_core::image`] for why the type is homed there.
 pub use cyrup_core::DEFAULT_IMAGE_RESIZE;
 
-/// Pi `applyImageInputMetadata` (`packages/ai/scripts/generate-models.ts:994-1020` @v1.0.4), the
-/// third of this module's generated-catalog passes.
+/// Pi `applyImageInputMetadata` (`packages/ai/scripts/generate-models.ts:994-1020` @f1b2e77f5),
+/// the third of this module's generated-catalog passes.
 ///
 /// **A stamp here is warranted by direct evidence, not by analogy with
 /// [`apply_prompt_cache_metadata`].** Upstream really does inject `inputLimits` at generation
-/// time: `applyImageInputMetadata` is called once over the chat + classifier list (`:3487`) and
-/// again over the openrouter IMAGE list (`:3505`). Its numbers are pinned by upstream's own
-/// assertions (`packages/ai/test/providers.test.ts:111-136`).
+/// time, at exactly two call sites: once over the chat rows (`:3359`, inside the loop over
+/// `allModels`, which holds chat rows only, `:2723`) and again over the OpenRouter IMAGE rows
+/// (`:3377`). Classifier rows are assembled after both loops (`:3381-3392`) and are never stamped,
+/// so no wrapper here takes a [`ClassifierModel`] (PROV-158). Its numbers are pinned by upstream's
+/// own assertions (`packages/ai/test/providers.test.ts:104-137`).
 ///
 /// It differs from its prompt-cache sibling in REACH, which is why copying that one's shape
 /// without re-reading would under-port it: that pass is narrow (direct Anthropic only), this one
@@ -182,46 +186,82 @@ pub(crate) fn apply_image_input_metadata(model: &mut Model) {
     stamp_image_input_limits(
         model.provider.as_str(),
         &model.input,
-        ModelType::Chat,
-        Some(model.context_window),
+        StampedKind::Chat {
+            context_window: model.context_window,
+        },
         &mut model.input_limits,
     );
 }
 
-/// [`apply_image_input_metadata`] for an image row — upstream's second call site (`:3505`), where
-/// `model.type === "image"` short-circuits Anthropic's `contextWindow` branch to 600.
+/// [`apply_image_input_metadata`] for an image row — upstream's second call site (`:3377`
+/// @f1b2e77f5), where `model.type === "image"` short-circuits Anthropic's `contextWindow` branch
+/// to 600.
 pub(crate) fn apply_image_input_metadata_to_image(model: &mut ImageModel) {
     stamp_image_input_limits(
         model.provider.as_str(),
         &model.input,
-        ModelType::Image,
-        // pi's `ImageModel` extends `BaseModel`, which declares no `contextWindow`
-        // (`types.ts:1097-1108`), so the `=== 200000` test is `undefined === 200000` → false.
-        None,
+        StampedKind::Image,
         &mut model.input_limits,
     );
 }
 
-/// [`apply_image_input_metadata`] for a classifier row. Classifiers go through upstream's FIRST
-/// call site with the chat models (`:3487`), so the `type !== "image"` half of Anthropic's branch
-/// is true for them and their own `contextWindow` decides 100 vs 600.
-pub(crate) fn apply_image_input_metadata_to_classifier(model: &mut ClassifierModel) {
-    stamp_image_input_limits(
-        model.provider.as_str(),
-        &model.input,
-        ModelType::Classifier,
-        Some(model.context_window),
-        &mut model.input_limits,
-    );
+/// The generated-catalog passes the live overlay replays on a row pi.dev served (SEAM-131,
+/// PROV-134, PROV-158): one exhaustive match, so what the overlay does per row kind is decided in
+/// one place, beside the floor loaders it has to agree with.
+///
+/// pi's runtime `parseCatalog` (`coding-agent/src/core/remote-catalog-provider.ts:37-50`
+/// @f1b2e77f5) stamps nothing; it trusts the body, because pi's generator ran these passes before
+/// publishing it: over the chat rows (`generate-models.ts:3358-3359`) and over the OpenRouter
+/// image rows (`:3377`).
+///
+/// `[CYRUP-DELTA, intentional]` The chat and image passes are replayed on the overlay anyway, so an
+/// overlay row has the shape its embedded floor has ([`load_catalog`],
+/// [`crate::providers::openrouter::openrouter_image_models`]): `merge_models` replaces a floor row
+/// wholesale by id, and a refreshed row served without the field would otherwise drop what the
+/// floor row had (SEAM-131 for the prompt cache, PROV-134 for image limits). Against pi.dev the
+/// image pass is a no-op — measured on `tests/fixtures/pi-dev-openrouter-all-types.json`, all 327
+/// image-capable chat and image rows (270 + 57) already carry `inputLimits`, and every pass only
+/// fills what a row left unset. It acts only on a row served WITHOUT the field, where pi keeps the
+/// row bare: there cyrup lists and persists the generator's values, and a stamped `resize` wins
+/// over an embedder's static read fallback (`cyrup-tools` `ReadOpts::resize_profile_now`; pi
+/// `read.ts:91`, `?? fallbackResizeOptions`) that pi's bare row would leave in charge.
+///
+/// A classifier row is left VERBATIM (PROV-158). The generator never stamps one — it assembles them
+/// after both loops (`:3381-3392`) — so a replay there is not a no-op: it rewrote pi.dev's own
+/// image-capable `gpt-6-luna`. Verbatim is also how [`load_classifier_catalog`] reads the floor;
+/// `tests::catalog_data`'s `every_classifier_catalog_reads_identically_through_the_overlay_parser`
+/// holds the two readers together.
+pub(crate) fn apply_overlay_metadata(row: &mut AnyModel) {
+    match row {
+        AnyModel::Chat(model) => {
+            apply_prompt_cache_metadata(model);
+            apply_image_input_metadata(model);
+        }
+        AnyModel::Image(model) => apply_image_input_metadata_to_image(model),
+        AnyModel::Classifier(_) => {}
+    }
 }
 
-/// The one body the three wrappers share, held apart from them because pi's `AnyModel` parameter
-/// has no Rust counterpart that is `&mut` across all three concrete types.
+/// Which of the generator's two stamp call sites a row comes through — the one thing
+/// `applyImageInputMetadata` reads besides the provider and `input`: Anthropic's
+/// `model.type !== "image" && model.contextWindow === 200000` (`generate-models.ts:1001`
+/// @f1b2e77f5). pi's `ImageModel` extends `BaseModel`, which declares no `contextWindow`
+/// (`types.ts:820-830`, `:870`), so for an image row the test is `undefined === 200000`: the pair
+/// `(type, contextWindow)` has exactly these two live cases.
+#[derive(Clone, Copy)]
+enum StampedKind {
+    /// The chat call site (`:3359`), with the row's `contextWindow`.
+    Chat { context_window: u64 },
+    /// The OpenRouter image call site (`:3377`).
+    Image,
+}
+
+/// The one body the two wrappers share, held apart from them because pi's `AnyModel` parameter has
+/// no Rust counterpart that is `&mut` across the concrete types.
 fn stamp_image_input_limits(
     provider: &str,
     input: &[Modality],
-    model_type: ModelType,
-    context_window: Option<u64>,
+    kind: StampedKind,
     limits: &mut Option<ModelInputLimits>,
 ) {
     if !input.contains(&Modality::Image) {
@@ -232,7 +272,13 @@ fn stamp_image_input_limits(
     // (maxRequestBytes, images.maxPerMessage, images.maxPerRequest).
     let (provider_request_bytes, provider_per_message, provider_per_request) = match provider {
         "anthropic" => {
-            let per_request = if model_type != ModelType::Image && context_window == Some(200_000) {
+            // `model.type !== "image" && model.contextWindow === 200000 ? 100 : 600`.
+            let per_request = if matches!(
+                kind,
+                StampedKind::Chat {
+                    context_window: 200_000
+                }
+            ) {
                 100
             } else {
                 600
