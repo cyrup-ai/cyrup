@@ -841,6 +841,76 @@ async fn the_system_one_body_spells_numbers_as_json_stringify_does() {
     );
 }
 
+/// PROV-156 — every System One question goes out as `{type, instructions, criteria}`, `bool`
+/// spelled `noul`, a bool's criteria as `{true, false}`: pi's declared member order for each
+/// variant (`types.ts:662-678` @f1b2e77f5) and the three members both published System One input
+/// schemas name. Asserted on the raw bytes, so member order is pinned. GUARD, not a red proof: the
+/// wire is unchanged by design (the `[CYRUP-DELTA, intentional]` on `wire_question`); it is red
+/// under a bool arm that spells `bool`, any arm that puts `criteria` first, and a bool criteria
+/// spelled `{false, true}`.
+#[tokio::test]
+async fn every_system_one_question_goes_out_as_type_instructions_criteria() {
+    let server = FakeServer::start().await;
+    typesafe_system_one_api()
+        .classify(&model(TYPESAFE, &server.base_url), &context(), &keyed())
+        .await;
+    let raw = &server.requests_to("/v1/systemone")[0].raw_body;
+    assert!(
+        raw.contains(concat!(
+            r#""questions":{"category":{"type":"choice","instructions":"Classify the message","#,
+            r#""criteria":{"success":"Successful","failure":"Failed"}},"#,
+            r#""satisfaction":{"type":"score","instructions":"Score satisfaction","#,
+            r#""criteria":["low","neutral","high"]},"#,
+            r#""approved":{"type":"noul","instructions":"Does the user approve?","#,
+            r#""criteria":{"true":"Approval","false":"No approval"}}}"#
+        )),
+        "{raw}"
+    );
+}
+
+/// PROV-156 — a JSON caller's question with its members out of order and members the type does
+/// not name reaches the wire as its typed members only, in the typed order. pi forwards such a
+/// question object as given (`wireRequest`, `system-one-shared.ts:85-96` @f1b2e77f5); the Workers
+/// AI `typesafe/jev` input schema closes every question object and a noul's criteria
+/// (`additionalProperties: false`), so a service validating against it would refuse pi's request,
+/// while llama.cpp and Clef's open schema ignore the extras. GUARD of the recorded delta: green at
+/// the base; red if the question parse refused an unnamed member, or if a bool's `true`/`false`
+/// were read swapped.
+#[tokio::test]
+async fn a_json_callers_question_reaches_the_wire_as_its_typed_members() {
+    let server = FakeServer::start().await;
+    let ctx: ClassifierContext = serde_json::from_value(json!({
+        "state": {"text": "The deployment succeeded, thank you."},
+        "questions": {"approved": {
+            "criteria": {"false": "No approval", "maybe": "Unsure", "true": "Approval"},
+            "threshold": 0.5,
+            "instructions": "Does the user approve?",
+            "type": "bool"
+        }}
+    }))
+    .unwrap();
+    let result = typesafe_system_one_api()
+        .classify(&model(TYPESAFE, &server.base_url), &ctx, &keyed())
+        .await;
+    assert_eq!(result.stop_reason, ClassifierStopReason::Stop, "{result:?}");
+    assert!(matches!(
+        result.answers.get("approved"),
+        Some(ClassifierAnswer::Bool { probability }) if (*probability - 0.95).abs() < 1e-12
+    ));
+    let raw = &server.requests_to("/v1/systemone")[0].raw_body;
+    assert!(
+        raw.contains(concat!(
+            r#""questions":{"approved":{"type":"noul","instructions":"Does the user approve?","#,
+            r#""criteria":{"true":"Approval","false":"No approval"}}}"#
+        )),
+        "{raw}"
+    );
+    assert!(
+        !raw.contains("threshold") && !raw.contains("maybe"),
+        "{raw}"
+    );
+}
+
 /// Every known classifier api names its own implementation, and each is the api it says it is.
 #[tokio::test]
 async fn every_known_classifier_api_has_its_implementation() {

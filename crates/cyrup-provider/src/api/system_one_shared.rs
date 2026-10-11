@@ -10,10 +10,11 @@
 //! the difference between them.
 //!
 //! **`bool` is `noul` on the wire.** pi's public question and answer type is `bool`; System One
-//! calls it `noul`. [`wire_request`] renames a bool question's `type` to `noul` and keeps every
-//! other member; [`parse_answers`] reads a `noul` answer's `noul` member as the bool's
+//! calls it `noul`. [`wire_request`] sends each question as `{type, instructions, criteria}` with a
+//! bool's `type` spelled `noul` (`wire_question`, where the PROV-156 delta on extra members is
+//! recorded); [`parse_answers`] reads a `noul` answer's `noul` member as the bool's
 //! `probability` (pi `wireRequest`, `parseAnswers`). llama.cpp's server accepts exactly
-//! `choice`, `score` and `noul` (`parse_questions`, `tools/server/server-decision.cpp:164-198`
+//! `choice`, `score` and `noul` (`parse_questions`, `tools/server/server-decision.cpp:137-207`
 //! @b11436) and answers a noul with `{"type": "noul", "noul": <p(true)>}` (`format_answer`,
 //! `:764-779`).
 //!
@@ -28,8 +29,8 @@ use super::classifier_shared::{
     required_number,
 };
 use crate::classifier::{
-    ClassifierAnswer, ClassifierContext, ClassifierModel, ClassifierOptions, ClassifierQuestion,
-    ClassifierResult, ClassifierStopReason, KnownClassifierApi, OrderedMap,
+    BoolCriteria, ClassifierAnswer, ClassifierContext, ClassifierModel, ClassifierOptions,
+    ClassifierQuestion, ClassifierResult, ClassifierStopReason, KnownClassifierApi, OrderedMap,
 };
 
 /// Differences between services that serve System One models (pi `SystemOneTransport`).
@@ -58,21 +59,13 @@ pub(crate) fn endpoint_url(base_url: &str, path: &str) -> Result<String, Classif
         .map_err(|_| ClassifyError::plain("Invalid URL"))
 }
 
-/// pi `wireRequest`: `{state, questions}`, with every public `bool` question's `type` renamed to
-/// the wire-level `noul` and every other member kept. Questions keep their order.
+/// pi `wireRequest` (`system-one-shared.ts:85-96` @f1b2e77f5): `{state, questions}`, every
+/// question in [`wire_question`]'s shape. Questions keep their order.
 pub(crate) fn wire_request(context: &ClassifierContext) -> Map<String, Value> {
     let questions: Map<String, Value> = context
         .questions
         .iter()
-        .map(|(id, question)| {
-            let mut wire = serde_json::to_value(question).unwrap_or(Value::Null);
-            if matches!(question, ClassifierQuestion::Bool { .. })
-                && let Some(object) = wire.as_object_mut()
-            {
-                object.insert("type".to_string(), Value::from("noul"));
-            }
-            (id.to_string(), wire)
-        })
+        .map(|(id, question)| (id.to_string(), wire_question(question)))
         .collect();
     let mut request = Map::new();
     // `state: context.state` is a JS object, so it is already in own-key order when the payload is
@@ -83,6 +76,65 @@ pub(crate) fn wire_request(context: &ClassifierContext) -> Map<String, Value> {
     );
     request.insert("questions".to_string(), Value::Object(questions));
     request
+}
+
+/// One question as System One reads it: `{type, instructions, criteria}` — pi's declared member
+/// order for every variant (`types.ts:662-678` @f1b2e77f5) — with `bool` spelled `noul` and a
+/// bool's criteria as `{true, false}`. Every field is named (no `..`), so a field added to a
+/// variant does not compile here until its wire spelling is decided.
+///
+/// `[CYRUP-DELTA, intentional]` PROV-156: pi sends the question OBJECT it was handed (`question`,
+/// or for a bool `{ ...question, type: "noul" }`), so a JSON caller's member order and any member
+/// the type does not name reach the server. cyrup's question is typed at the parse boundary, which
+/// is where the delta is recorded (`cyrup-codemode-runtime`'s `check_classifier_context`). On this
+/// wire it is the observable half: the Workers AI `typesafe/jev` input schema closes every question
+/// object and a noul's criteria (`additionalProperties: false`), so a service validating against it
+/// would refuse pi's request with an extra member and answers cyrup's; llama.cpp reads the three
+/// members by name (`parse_questions`, `server-decision.cpp:137-207` @b11436) and Clef's schema
+/// leaves them open, so there an extra changes nothing.
+fn wire_question(question: &ClassifierQuestion) -> Value {
+    let (kind, instructions, criteria) = match question {
+        ClassifierQuestion::Choice {
+            instructions,
+            criteria,
+        } => (
+            "choice",
+            instructions,
+            Value::Object(
+                criteria
+                    .iter()
+                    .map(|(label, meaning)| (label.to_owned(), Value::from(meaning.as_str())))
+                    .collect(),
+            ),
+        ),
+        ClassifierQuestion::Score {
+            instructions,
+            criteria,
+        } => ("score", instructions, Value::from(criteria.clone())),
+        ClassifierQuestion::Bool {
+            instructions,
+            criteria:
+                BoolCriteria {
+                    when_true,
+                    when_false,
+                },
+        } => (
+            "noul",
+            instructions,
+            Value::Object(Map::from_iter([
+                ("true".to_owned(), Value::from(when_true.as_str())),
+                ("false".to_owned(), Value::from(when_false.as_str())),
+            ])),
+        ),
+    };
+    Value::Object(Map::from_iter([
+        ("type".to_owned(), Value::from(kind)),
+        (
+            "instructions".to_owned(),
+            Value::from(instructions.as_str()),
+        ),
+        ("criteria".to_owned(), criteria),
+    ]))
 }
 
 /// pi `probabilities`: an object of finite numbers, in the object's own key order.

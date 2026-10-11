@@ -524,7 +524,7 @@ pub(super) fn default_system_one_answer(question: &Value) -> Option<Value> {
 }
 
 /// `POST /v1/systemone` over `body` (`{model, state, questions}`): the request checks llama.cpp
-/// makes before any model work (`parse_questions`, `tools/server/server-decision.cpp:137-198`
+/// makes before any model work (`parse_questions`, `tools/server/server-decision.cpp:137-207`
 /// @b11436, as `400 invalid_request_error`), then one answer per question in the request's order,
 /// then the whole answer (`post_systemone`, `server-context.cpp:5583-5667`).
 pub(super) fn system_one_output(behavior: &Behavior, body: &Value) -> Result<Value, (u16, Value)> {

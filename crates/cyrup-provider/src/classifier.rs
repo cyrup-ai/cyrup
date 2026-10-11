@@ -676,6 +676,9 @@ pub struct BoolCriteria {
 }
 
 /// One question about the state (pi `ClassifierQuestion`, types.ts:633-651).
+///
+/// Read leniently, as pi's own codemode check is: the members named here are required, and a member
+/// a JSON caller adds is accepted and not carried (PROV-156, recorded where the question is parsed).
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum ClassifierQuestion {
