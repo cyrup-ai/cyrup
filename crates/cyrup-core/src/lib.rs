@@ -107,6 +107,33 @@ macro_rules! str_id {
 str_id!(SessionId);
 str_id!(EntryId);
 str_id!(ToolCallId);
+
+impl ToolCallId {
+    /// The id of the `number`th call a running tool makes on behalf of `caller` — pi's
+    /// `` `${callerId}/${scope.nextId++}` `` (`core/nested-tool-calls.ts:189` @f1b2e77f5). The one
+    /// place the nested form is spelled, so [`ToolCallId::is_anonymous`] reads the form it writes.
+    #[must_use]
+    pub fn nested(caller: &ToolCallId, number: u32) -> Self {
+        Self::from(format!("{caller}/{number}"))
+    }
+
+    /// Whether this call traces back to no id at all: the empty id a provider records for a tool
+    /// call its stream named no id for (`openai_completions` `id.unwrap_or("")`, and the Anthropic
+    /// and pi-messages streams likewise), or a [`nested`](ToolCallId::nested) id under one — exactly
+    /// `/<n>`, `/<n>/<m>`, …, the only form `nested` writes under an empty caller. Any other id, a
+    /// provider's `/calls/42` included, is not anonymous; a provider id that is literally `/1` cannot
+    /// be told from a nested one without provenance and reads as anonymous.
+    #[must_use]
+    pub fn is_anonymous(&self) -> bool {
+        match self.0.strip_prefix('/') {
+            None => self.0.is_empty(),
+            Some(numbers) => numbers.split('/').all(|number| {
+                !number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit())
+            }),
+        }
+    }
+}
+
 str_id!(ProviderId);
 str_id!(ModelId);
 str_id!(ExtensionId);

@@ -51,7 +51,8 @@ use crate::owner::McpRuntimeOwner;
 use crate::proxy::error_vocab::McpErrorCode;
 use crate::proxy::results::text_result;
 use crate::proxy::{
-    ApprovalOrigin, INIT_WAIT_TIMEOUT_MS, InitPhase, McpTool, ProxyCtx, ProxyInitGate, execute_call,
+    ApprovalOrigin, INIT_WAIT_TIMEOUT_MS, InitPhase, McpTool, OriginatingCall, ProxyCtx,
+    ProxyInitGate, execute_call,
 };
 use crate::registration::{DirectToolSpec, McpToolDispatch};
 
@@ -304,13 +305,15 @@ impl McpToolDispatch for McpDispatch {
     /// `toolErrorOverride` branches on `details.error` alone, and the two codes it re-flags
     /// (`tool_error`, `call_failed`) are produced byte-identically.
     ///
-    /// `call_id` and `on_update` are unused because no phase of this path streams or reads a call
-    /// id; the trait fixes the signature, so they keep their names with an underscore rather than
-    /// being dropped.
+    /// `call_id` is pi's `toolCallId`, which `direct-tools.ts:139` @v5.0.0 passes to the executor
+    /// and `:321` sends to the server as `_meta["pi-mcp-adapter/toolCallId"]`
+    /// ([`crate::proxy::OriginatingCall`], MCP-609). `on_update` is unused because no phase of this
+    /// path streams; the trait fixes the signature, so it keeps its name with an underscore rather
+    /// than being dropped.
     async fn call_direct(
         &self,
         spec: &DirectToolSpec,
-        _call_id: ToolCallId,
+        call_id: ToolCallId,
         params: Value,
         cancel: CancelToken,
         _on_update: ToolUpdateSink,
@@ -373,6 +376,7 @@ impl McpToolDispatch for McpDispatch {
             &cancel,
             // `direct-tools.ts:440` `spec.resourceUri ? "resource" : "direct"`.
             Some(ApprovalOrigin::for_direct_tool(spec.resource_uri.as_ref())),
+            OriginatingCall::of(&call_id).as_ref(),
         )
         .await
         .map_err(|error| ToolError::new(error.to_string()))

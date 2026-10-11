@@ -19,7 +19,7 @@
 > dependency on pi's in-monorepo `packages/mcp`, and every citation in `13-cyrup-mcp.md` and
 > `13a`–`13i` resolves at that tag. `MCP-587` records the rule.
 >
-> Numbering resumes from **`MCP-633`** (it read `MCP-616` when written; `MCP-616` was filed 2026-10-07, `MCP-618`…`MCP-621` on 2026-10-09 and `MCP-622`…`MCP-633` on 2026-10-10; table F, *Fourth pass*, took `MCP-587`–`MCP-608`; table G,
+> Numbering resumes from **`MCP-634`** (it read `MCP-633` until 2026-10-11, one short: `MCP-633` is taken, filed with `MCP-622`…`MCP-632` on 2026-10-10; it read `MCP-616` when written; `MCP-616` was filed 2026-10-07, `MCP-618`…`MCP-621` on 2026-10-09 and `MCP-622`…`MCP-633` on 2026-10-10; table F, *Fourth pass*, took `MCP-587`–`MCP-608`; table G,
 > *Post-pin triage 2026-10-03*, took `MCP-609`–`MCP-611`; `MCP-586` was never allocated and is still free).
 > **2026-10-09:** numbering now resumes from **`MCP-618`** (`MCP-612`–`MCP-616` were filed 2026-10-06 and 2026-10-07;
 > `MCP-617` by the pi v1.1.0 drift triage, §*Additions — 2026-10-09*). The `pi-mcp-adapter` pin is now **`2ccf648`**
@@ -553,7 +553,7 @@ Rows moved to `implemented` in the tables above (the table rows are left as file
 | `MCP-211` | 13e | `formatSchema` and its helpers are ported from `pi-mcp-adapter` `tool-metadata.ts` (`crates/cyrup-mcp/src/proxy/tool_metadata.rs::format_schema`, wired into `RuntimeEnv::format_schema` in `live.rs`; `6c869417b`), keeping the JavaScript behaviour a reader takes for granted: `Object.entries` order for property names, `JSON.stringify`'s number and member order (through `cyrup-codemode`'s one reproduction of both) and the truthiness test on `type`. The test table is upstream's own `formatSchema` output for 35 schemas, run under bun from the function's text at v5.0.0 and compared byte for byte (`format_schema_matches_upstreams_output_byte_for_byte`). `mcp({ describe })`, `mcp({ search })` and the 'Expected parameters:' end of a failed call now carry parameters; they had answered the literal `(schema rendering is not wired - MCP-211)`, so a model never saw what a tool takes, and a script reaches default-mode MCP servers only through that gateway. The placeholder is gone from the tree outside this directory (the lane's grep). |
 | `MCP-616` | 13e | `*` patterns in `--tools` and `--exclude-tools`, MCP tools kept registered under an allowlist without an `mcp__` entry, and `--no-mcp` (`843a4c123`); evidence, the `[CYRUP-DELTA]` `Tool::is_mcp_tool` and the known limit are in the row. |
 
-Four rows filed in `13e` and closed on filing (`implemented`): `MCP-618` (a script that names a server, and `tool_search`, wait for the build), `MCP-619` (every MCP tool resolves to the server's `CallToolResult`), `MCP-620` (the first prompt waits for starting servers, 10 s, declared) and `MCP-621` (the MCP approval dialog is awaited on the blocking pool). `MCP-612` and `MCP-614` carry dated NARROWED notes and stay `missing`.
+Four rows filed in `13e` and closed on filing (`implemented`): `MCP-618` (a script that names a server, and `tool_search`, wait for the build), `MCP-619` (every MCP tool resolves to the server's `CallToolResult`), `MCP-620` (the first prompt waits for starting servers, 10 s, declared) and `MCP-621` (the MCP approval dialog is awaited on the blocking pool). `MCP-612` and `MCP-614` carry dated NARROWED notes and stay `missing`. *(CORRECTED 2026-10-11: `MCP-612` had already closed on 2026-10-08, `13e`; `MCP-614` closed 2026-10-11. See *Closures — 2026-10-11* for the census.)*
 
 Arithmetic on the census above (554: `implemented` 349, `partial` 70, `missing` 101, `not-applicable` 34, after `main`'s pi v1.1.0 drift triage added `MCP-617`; the branch's own base was 553 with `missing` 100): +4 rows = **558**; `implemented` 349 + 2 (`MCP-211`, `MCP-616`) + 4 (`MCP-618`…`MCP-621`) = **355**; `missing` 101 − 2 = **99**; `partial` 70; `not-applicable` 34. 355 + 70 + 99 + 34 = 558. Severity of the four new rows: 4 medium. Next free id: `MCP-622`. (The branch had numbered these four `MCP-617`…`MCP-620`; the rebase onto `main`, which had filed `MCP-617`, moved them up one.)
 
@@ -581,6 +581,47 @@ Twelve rows filed in `13e`, six closed on filing (`implemented`) and six open. C
 Arithmetic on the census above (558: `implemented` 355, `partial` 70, `missing` 99, `not-applicable` 34): +12 rows = **570**; `implemented` 355 + 6 (`MCP-622`…`MCP-627`) = **361**; `partial` 70 + 5 (`MCP-628`…`MCP-632`) = **75**; `missing` 99 + 1 (`MCP-633`) = **100**; `not-applicable` 34. 361 + 75 + 100 + 34 = 570. Severity of the new rows: 6 medium, 6 low. Next free id: `MCP-634`.
 
 Upstream for these rows: `pi-mcp-adapter` **`v5.2.0`** for `MCP-625`, `MCP-626` and `MCP-631` (the area's pin is `v5.0.0`; **the window `v5.0.0..v5.2.0` was not triaged by this pass**) and pi's built-in MCP extension at `v1.0.4` for `MCP-622` and `MCP-629`.
+
+### Closures — 2026-10-11 (`MCP-609`, `MCP-614`)
+
+Two `missing` rows in `13e` closed, on `claude/eloquent-lovelace-vivq3h` off `main` @ `4fa902b0d`;
+the closure records are on the rows and in `MCP-609`'s body (*Closure — 2026-10-11*). The table rows
+above are left as filed.
+
+- **`MCP-609`** (13e, low, S) → **implemented**. pi's tool-call id now reaches the server as
+  `_meta["pi-mcp-adapter/toolCallId"]`, on both routes, through one carrier (`OriginatingCall`,
+  `proxy/tool_call_meta.rs`) stamped at the one production `tools/call` build; no key for a call
+  with no id, and none for a call nested under one (`[CYRUP-DELTA, upward]`). This also retires the
+  "already ported" ruling for `4b7e310` in *Already covered / not owed* below, which is now struck
+  and annotated.
+- **`MCP-614`** (13e, low, S) → **implemented**. `cyrup-it`
+  `a_live_search_loads_the_tool_for_the_next_request` drives `mcp({ search })` against the live
+  fixture server on a bound session and sees the loaded tool in the next request.
+
+Arithmetic on the 2026-10-10 census (570: `implemented` 361, `partial` 75, `missing` 100,
+`not-applicable` 34): no row added; `implemented` 361 + 2 = 363; `missing` 100 − 2 = 98.
+
+**Correction: the 2026-10-08 drift-sweep closures never reached a census.** Seven rows were closed on
+`claude/mcp-drift-sweep` by editing their table cells in place, and no arithmetic block since has
+counted them:
+- partial → implemented: `MCP-588`, `MCP-597`, `MCP-605` (table F) and `MCP-610` (table G). Each
+  was filed `partial` (`ed8952c4d`, `c0d4d1fc9`).
+- missing → implemented: `MCP-590`, `MCP-592` (table F), and `MCP-612` (closed 2026-10-08 in
+  `13e`). The 2026-10-09 block above still said `MCP-612` "stays `missing`"; that sentence is now
+  annotated.
+
+Folded in, the census at 2026-10-11 is:
+
+| status | count |
+|---|---|
+| `implemented` | 363 + 7 = **370** |
+| `partial` | 75 − 4 = **71** |
+| `missing` | 98 − 3 = **95** |
+| `not-applicable` | **34** |
+| **total** | 370 + 71 + 95 + 34 = **570** |
+
+Next free id unchanged: `MCP-634`. Area 13 is counted in this file by the standing rule, so
+`scripts/count_open_items.py` does not see this change.
 
 ### Additions — 2026-10-07 (area 18's pi `v1.0.1..v1.0.4` triage)
 
@@ -698,9 +739,16 @@ host and MCP implementation, so there is no second owner to detect, replace, dis
   vendor-neutral and applies to cyrup's five presets; filed as **`MCP-611`** (`13h`).
 
 **Already ported; verified on both sides, nothing owed.**
-- `4b7e310` (#674) forward pi tool call IDs to MCP requests — cyrup threads a tool call id through
+- ~~`4b7e310` (#674) forward pi tool call IDs to MCP requests — cyrup threads a tool call id through
   the call path: `grep -rln 'tool_call_id' crates/cyrup-mcp/src` matches `registration.rs`,
-  `dispatch.rs`, `proxy/tool.rs` and `owner.rs`. **CORRECTED 2026-10-03:** this ruling is wrong.
+  `dispatch.rs`, `proxy/tool.rs` and `owner.rs`.~~ **This entry does not belong under "already
+  ported": `4b7e310` was NOT ported when this list was written, and the evidence above could not
+  have shown that it was** — a grep for `tool_call_id` finds the `ToolCallId` type in signatures,
+  never a value sent to a server; only a server that records the request it read can. **PORTED
+  2026-10-11 (`MCP-609` closed, `13e`):** a `tools/call` made for a pi tool call now carries
+  `_meta["pi-mcp-adapter/toolCallId"]` on the direct route and through `mcp({ tool })`, and no key
+  for a call with no id; the `cyrup-it` fixture server in `tests/mcp/live_tool_call.rs` records the
+  line it read. **CORRECTED 2026-10-03:** this ruling is wrong.
   Those matches are the `ToolCallId` type in trait signatures; `dispatch.rs:312` and
   `proxy/tool.rs:351` name the parameter `_call_id` and drop it, `live.rs:1478` builds the
   `tools/call` params with no `_meta`, and nothing sends `_meta["pi-mcp-adapter/toolCallId"]`

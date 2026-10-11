@@ -80,6 +80,7 @@ pub mod error_vocab;
 pub mod ranking;
 pub mod results;
 pub mod tool;
+pub mod tool_call_meta;
 pub mod tool_metadata;
 
 /// Fixtures shared by more than one submodule's tests (the crate's
@@ -103,6 +104,7 @@ pub use error_vocab::*;
 pub use ranking::*;
 pub use results::*;
 pub use tool::*;
+pub use tool_call_meta::*;
 pub use tool_metadata::*;
 
 #[cfg(test)]
