@@ -284,6 +284,13 @@ More in [Sessions](../guides/sessions.md).
 Precedence when several are given: `acp`, then `rpc`, then `json`, then `print`. A non-TTY stdin or stdout
 selects print mode on its own, which is what makes `cyrup -p` redundant inside a pipe.
 
+`--mode rpc` ends when its input does, as pi's does: closing stdin asks for the shutdown. The run in
+flight, a running `bash` command, a compaction and every open dialog are aborted at once, not waited
+for, and the process exits as soon as what was aborted has reported (at most five seconds). A client
+that wants a run's output keeps stdin open until it has read `agent_settled`, then closes it.
+`printf '{"type":"prompt","message":"hi"}\n' | cyrup --mode rpc` therefore stops the run it starts;
+use `cyrup -p` for a one-shot prompt.
+
 A token beginning with `---` immediately after `-p`/`--print` is taken as the prompt, not as a flag:
 `cyrup -p ---weird` sends the literal text `---weird`. It keeps its place among the positionals. A
 genuine unknown long flag (`--weird`) is still captured as an extension flag.
@@ -301,22 +308,45 @@ are no `--json`, `--rpc` or `--output-format` shorthands: use `--mode json`, `--
 | Flag | Argument | Meaning |
 |---|---|---|
 | `-nt`, `--no-tools` | — | Disable every tool, built-in and extension |
-| `-nbt`, `--no-builtin-tools` | — | Drop the four default built-ins; see below |
-| `-t`, `--tools` | `<tools>` | Comma-separated allowlist of tool names |
-| `-xt`, `--exclude-tools` | `<tools>` | Comma-separated denylist of tool names |
+| `-nbt`, `--no-builtin-tools` | — | Start with every built-in tool off; extension and custom tools stay |
+| `-t`, `--tools` | `<tools>` | Comma-separated allowlist of tool names or patterns (`*`) |
+| `-xt`, `--exclude-tools` | `<tools>` | Comma-separated denylist of tool names or patterns (`*`) |
 
-Seven built-in tools are registered — `read`, `bash`, `edit`, `write`, `grep`, `find` and `ls` — but
+Eight built-in tools are registered — `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls` and `powershell` — but
 **only four of them are active in a default session**: `read`, `bash`, `edit` and `write`. `grep`,
-`find` and `ls` are registered and reachable; they simply are not in the default active set, so name
+`find`, `ls` and `powershell` are registered and reachable; they simply are not in the default active set, so name
 them to switch them on: `--tools read,grep,find`.
 
-`--no-builtin-tools` is narrower than its name suggests. It drops exactly those four defaults, and
-the active set becomes everything that is *not* one of them — `grep`, `find` and `ls` included,
-alongside extension and custom tools. Use `--no-tools` for a run with no tools at all; it wins over
-`--no-builtin-tools` when both are given. `--exclude-tools` is applied last, on top of whichever set
-the other three produced.
+`--no-builtin-tools` turns off every built-in tool, not only the four defaults: `read`, `bash`,
+`edit`, `write`, and also `grep`, `find`, `ls` and `powershell`. What stays active is what is not a
+built-in and starts active — the `mcp` gateway tool, for one. The built-ins remain registered, so
+something that activates tools by name, an extension for one, can still turn one on: an armed
+[permission system](../guides/tools-and-permissions.md#the-permission-system) does, and with a policy
+present `-nbt` leaves every tool its policy does not deny active.
+`codemode` and `tool_search` start inactive, so this flag does not switch them on either; to run
+with `codemode` and no other built-in, name it: `--tools codemode`. Use `--no-tools` for a run with no
+tools at all; it wins over `--no-builtin-tools` when both are given. `--exclude-tools` is applied
+last, on top of whichever set the other three produced.
 
 Values are comma-split and trimmed, so `--tools "read, grep"` works.
+
+An entry with a `*` is a pattern that matches any run of characters. MCP tools are named by the
+`toolPrefix` setting of the MCP configuration, `<server>_<tool>` unless it says otherwise, so
+`--exclude-tools "github_*"` drops every tool of a server named `github` and `--tools "read,docs_*"`
+activates the tools of one named `docs`. With `"toolPrefix": "mcp"` the same tools are
+`mcp__github_<tool>` and `mcp__docs_<tool>`.
+
+MCP tools are treated apart. A `--tools` list with no entry that starts with `mcp__` leaves MCP
+tools registered, and what that reaches depends on how the server registers them (see
+[MCP tools](../guides/codemode.md#mcp-tools)): the tools of a `directTools: "search"` server stay
+callable from `codemode` scripts and loadable by `tool_search`, while eager tools and the `mcp`
+gateway are callable from a script only while active, so `--tools read,codemode` leaves a script
+without them. An entry that starts with `mcp__`, or an empty list (as `--no-tools` makes), makes the
+list decide for MCP tools too. The default `toolPrefix` gives no tool a name that starts with `mcp__`,
+so by default such an entry matches nothing and cuts off every MCP tool; to filter by server, set
+`"toolPrefix": "mcp"` and write `mcp__<server>_*`. `--exclude-tools` applies to every tool, MCP tools
+included. A registered MCP tool is declared to the model only when the list names it or matches it,
+or when it is a `deferred` (`directTools: "search"`) tool and `tool_search` is active.
 
 **A repeated `--tools`, `-t`, `--exclude-tools` or `--models` replaces the earlier one — it does not
 append.** `--tools read --tools bash` enables `bash` alone. The comma form is the way to name
@@ -329,12 +359,59 @@ cyrup --tools read,grep,find,ls -p "review the code in src/"
 
 See [Tools and permissions](../guides/tools-and-permissions.md).
 
+Built-in extensions add two more tools. Both start inactive. An MCP server that connects does not
+turn them on; name them in `--tools` or in `defaultTools`. The one exception is an armed permission
+system: with a policy present, every tool the policy does not deny is active, these two included (see
+[The permission system](../guides/tools-and-permissions.md#the-permission-system)).
+
+| Built-in extension | Purpose |
+|---|---|
+| `codemode` | Run JavaScript that calls the other tools, for example in parallel with `Promise.allSettled`; only the script's output reaches the model |
+| `tool_search` | Search the tools that are not declared to the model (`codemode` and `deferred` exposure, such as the tools of an MCP server in search mode) and declare the matches for the next call |
+
+#### Enable codemode
+
+To turn `codemode` on for every session, add it to the default tools in `~/.cyrup/agent/settings.json`:
+
+```json
+{
+  "defaultTools": ["+codemode"]
+}
+```
+
+This keeps `read`, `bash`, `edit`, and `write` and adds `codemode`. For one invocation, list every
+tool, since `--tools` replaces the selection:
+
+```sh
+cyrup --tools read,bash,edit,write,codemode
+```
+
+The same line in a project's `.cyrup/settings.json` takes effect only in a trusted project, which in
+`-p`, `--mode json` and `--mode rpc` means passing `--approve`. `--no-extensions` removes the tool.
+With a permission policy present `codemode` is already active and needs no line; to keep it off
+there, deny it in the policy or pass `--exclude-tools codemode`.
+
+Codemode is useful without MCP: a script can run several tool calls in parallel, filter large output
+before it reaches the model, call classifier models through `models.classify()` and generate images
+through `models.generateImages()`. Scripts run in a V8 sandbox, each in a process of its own, and
+reach the other tools through `tools.<name>(args)` under the same permission gate as any call.
+[Codemode](../guides/codemode.md) describes the script API, which tools a script can call, the
+security model, the limits and what you see while a script runs.
+
+#### Tool search
+
+`tool_search` is off by default (a permission policy turns it on, like `codemode`); enable it with
+`"defaultTools": ["+tool_search"]` or `--tools`. It ranks the tools that are not declared yet, the
+same set `searchTools()` finds in a script, and declares the matches from the model's next call on.
+A script cannot call `tool_search`.
+
 ### Resources
 
 | Flag | Argument | Meaning |
 |---|---|---|
 | `-e`, `--extension` | `<path>` | Load an extension file or directory, or a built-in extension such as `builtin:llama.cpp`; repeatable |
 | `-ne`, `--no-extensions` | — | Disable extension discovery and the built-in extensions; explicit `-e` paths still load, so `cyrup -ne -e builtin:llama.cpp` keeps only llama.cpp |
+| `--no-mcp` | — | Disable built-in MCP support for this run: no servers connect and no MCP tools |
 | `--skill` | `<path>` | Load a skill file or directory; repeatable |
 | `-ns`, `--no-skills` | — | Disable skill discovery and loading |
 | `--prompt-template` | `<path>` | Load a prompt template file or directory; repeatable |
@@ -350,8 +427,9 @@ See [Tools and permissions](../guides/tools-and-permissions.md).
 checking whether the value names an existing file. Multiple `--append-system-prompt` values are
 joined with a blank line.
 
-`--no-extensions` also turns off installed-package extensions and the three native extensions
-(subagents, the permission system, intercom), and removes the built-in [llama.cpp](../llama-cpp.md)
+`--no-extensions` also turns off installed-package extensions and the native extensions
+(subagents, the permission system, intercom, and the built-in MCP and `codemode` ones, so the `mcp`
+gateway tool and `codemode` do not exist in that run), and removes the built-in [llama.cpp](../llama-cpp.md)
 provider and its `/llama` command. `-e` paths survive it. Relative resource paths resolve
 against the current directory.
 

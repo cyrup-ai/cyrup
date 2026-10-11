@@ -258,3 +258,127 @@ fn reasoning_summary_option_overrides_auto() {
     let body = build_request_body(&model, &Context::default(), &so, &codex, None).unwrap();
     assert_eq!(body["reasoning"]["summary"], json!("detailed"));
 }
+
+/// PROMPT-001 — the prompt a transcript replays to reaches the Codex `instructions`.
+#[test]
+fn the_transcripts_prompt_reaches_the_request_body() {
+    use crate::api::prompt_fixture::{agent_context, assert_wire_carries_prompt};
+    let model = codex_model("gpt-5.5-codex");
+    let body = build_request_body(
+        &model,
+        &agent_context(Vec::new()),
+        &StreamOptions::default(),
+        &opts(),
+        None,
+    )
+    .unwrap();
+    assert_wire_carries_prompt(&body["instructions"].to_string());
+}
+
+/// PROV-101: Codex sends a grammar tool as a `custom` tool with `strict` left out, only when the
+/// model opts in (`compat.supportsOpenAIGrammarTools`), and replays the call and its result as
+/// `custom_tool_call` / `custom_tool_call_output`.
+#[test]
+fn grammar_tools_are_custom_tools_on_an_opted_in_model_only() {
+    use crate::api::compat::ModelCompat;
+    use crate::context::{ConstrainedSampling, ConstrainedSamplingConfig, GrammarVariants};
+    use cyrup_core::{Content, Message, ToolCall, ToolCallId, Usage};
+
+    let tool = crate::context::ToolDef {
+        name: "sample_tool".into(),
+        description: "d".into(),
+        parameters: json!({
+            "type": "object",
+            "properties": { "payload": { "type": "string" } },
+            "required": ["payload"],
+        }),
+        constrained_sampling: Some(ConstrainedSampling::Config(
+            ConstrainedSamplingConfig::Grammar {
+                variants: GrammarVariants {
+                    openai_lark: Some("start: /[a-z]+/".to_string()),
+                    openai_regex: None,
+                },
+            },
+        )),
+    };
+    let mut args = serde_json::Map::new();
+    args.insert("payload".to_string(), json!("abc"));
+    let mut model = codex_model("gpt-5.1-codex");
+    let ctx = Context {
+        system_prompt: None,
+        messages: vec![
+            Message::Assistant(AssistantMessage {
+                content: vec![Content::ToolCall(ToolCall {
+                    id: ToolCallId::from("call_1|ctc_1"),
+                    name: "sample_tool".to_string(),
+                    arguments: args.into(),
+                    thought_signature: None,
+                    namespace: None,
+                })],
+                provider: "openai-codex".into(),
+                model: "gpt-5.1-codex".to_string(),
+                api: API_ID.into(),
+                response_model: None,
+                response_id: None,
+                provider_thinking_level: None,
+                thinking_level: None,
+                diagnostics: None,
+                usage: Usage::default(),
+                stop_reason: StopReason::ToolUse,
+                deferred: None,
+                error_message: None,
+                raw_stop_reason: None,
+                end_turn: None,
+                timestamp: 1,
+                duration_ms: None,
+            }),
+            Message::ToolResult {
+                duration_ms: None,
+                tool_call_id: ToolCallId::from("call_1|ctc_1"),
+                tool_name: "sample_tool".to_string(),
+                content: vec![Content::text("done")],
+                is_error: false,
+                details: None,
+                usage: None,
+                added_tool_names: Vec::new(),
+                timestamp: 2,
+                nested_calls: None,
+            },
+        ],
+        tools: vec![tool],
+    };
+
+    let body = build_request_body(&model, &ctx, &StreamOptions::default(), &opts(), None).unwrap();
+    assert_eq!(body["tools"][0]["type"], "function");
+    let input = body["input"].as_array().unwrap();
+    assert!(input.iter().any(|i| i["type"] == "function_call"));
+    assert!(input.iter().all(|i| i["type"] != "custom_tool_call"));
+
+    model.compat = Some(ModelCompat {
+        supports_openai_grammar_tools: Some(true),
+        ..Default::default()
+    });
+    let body = build_request_body(&model, &ctx, &StreamOptions::default(), &opts(), None).unwrap();
+    assert_eq!(
+        body["tools"][0],
+        json!({
+            "type": "custom",
+            "name": "sample_tool",
+            "description": "d",
+            "format": { "type": "grammar", "syntax": "lark", "definition": "start: /[a-z]+/" },
+        })
+    );
+    let input = body["input"].as_array().unwrap();
+    assert!(input.contains(&json!({
+        "type": "custom_tool_call",
+        "id": "ctc_1",
+        "call_id": "call_1",
+        "name": "sample_tool",
+        "input": "abc",
+    })));
+    assert!(input.contains(&json!({
+        "type": "custom_tool_call_output",
+        "call_id": "call_1",
+        "output": "done",
+    })));
+}

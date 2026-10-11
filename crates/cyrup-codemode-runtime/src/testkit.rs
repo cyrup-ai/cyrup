@@ -14,7 +14,9 @@ pub mod models;
 pub use models::FakeModels;
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
 
 use cyrup_config::CodemodeMode;
 use cyrup_core::{CancelToken, Tool, ToolCallId};
@@ -27,8 +29,8 @@ use crate::tool::store::{BranchCustomEntry, CodemodeStoreEntryData};
 use crate::tool::{SandboxFactory, SandboxUnavailable};
 use crate::types::{
     CodemodeCall, CodemodeError, CodemodeResult, CodemodeStoreWrites, CodemodeToolContext,
-    Deadline, ErrorKind, ExecuteOptions, SandboxClosed, SandboxOptions, ScriptSandbox,
-    ToolCallback, ToolResult,
+    Deadline, ErrorKind, ExecuteOptions, ReturnValue, SandboxClosed, SandboxOptions, ScriptSandbox,
+    ToolCallback, ToolResult, UnobservedErrors,
 };
 use cyrup_codemode::types::OutputItem;
 
@@ -103,10 +105,11 @@ impl ScriptEnv {
 #[must_use]
 pub fn completed(output: Vec<OutputItem>, value: Option<Value>) -> CodemodeResult {
     CodemodeResult::Completed {
-        value,
+        value: value.map(ReturnValue::from),
         output,
         calls: Vec::<CodemodeCall>::new(),
         store_writes: CodemodeStoreWrites::default(),
+        unobserved: UnobservedErrors::default(),
     }
 }
 
@@ -140,6 +143,7 @@ pub struct SeenRun {
     pub tool_names: Vec<String>,
     pub global_names: Vec<String>,
     pub deadline: Deadline,
+    pub active_limit: Option<Duration>,
     pub memory_limit_bytes: Option<u64>,
     pub code: String,
     pub store: Map<String, Value>,
@@ -221,6 +225,7 @@ impl ScriptSandbox for ScriptedSandbox {
                     .map(|tool| tool.declaration.name.clone())
                     .collect(),
                 deadline: options.deadline.unwrap_or(self.options.deadline),
+                active_limit: self.options.active_limit,
                 memory_limit_bytes: self.options.memory_limit_bytes,
                 code: code.to_owned(),
                 store: options.store.clone(),
@@ -399,6 +404,13 @@ pub struct RecordingHost {
     pub appended: Mutex<Vec<CodemodeStoreEntryData>>,
     pub fail_append: Mutex<Option<String>>,
     pub models: Mutex<Option<Arc<dyn CodemodeModels>>>,
+    /// When set, a nested call takes one of its permits before it answers and keeps it, so a test
+    /// decides how many calls get through: calls wait while it has none.
+    pub gate: Mutex<Option<Arc<tokio::sync::Semaphore>>>,
+    /// Nested calls inside `execute_nested` now.
+    pub running: AtomicUsize,
+    /// The most nested calls that were ever inside `execute_nested` at once.
+    pub peak_running: AtomicUsize,
 }
 
 impl Default for RecordingHost {
@@ -413,6 +425,9 @@ impl Default for RecordingHost {
             appended: Mutex::new(Vec::new()),
             fail_append: Mutex::new(None),
             models: Mutex::new(None),
+            gate: Mutex::new(None),
+            running: AtomicUsize::new(0),
+            peak_running: AtomicUsize::new(0),
         }
     }
 }
@@ -466,6 +481,13 @@ impl CodemodeHost for RecordingHost {
             nested.push((caller.clone(), name.to_owned(), args.clone()));
             nested.len()
         };
+        let running = self.running.fetch_add(1, Ordering::SeqCst) + 1;
+        self.peak_running.fetch_max(running, Ordering::SeqCst);
+        let gate = self.gate.lock().unwrap().clone();
+        if let Some(gate) = gate {
+            gate.acquire().await.unwrap().forget();
+        }
+        self.running.fetch_sub(1, Ordering::SeqCst);
         let on_nested = self.on_nested.lock().unwrap().clone();
         match on_nested {
             Some(answer) => answer(name, &args),

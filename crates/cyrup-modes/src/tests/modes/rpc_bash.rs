@@ -4,11 +4,12 @@
 //! `user_bash` extension event with its `{result}` override, its `{operations}` backend and the
 //! #9068 fail-closed verdict for every other DEFINED shape.
 
-use std::io::Cursor;
 use std::sync::Arc;
 
-use super::support::{build_runtime, build_runtime_with_ext, fixture, parse_lines, type_of};
-use crate::run_rpc;
+use super::support::{
+    build_runtime, build_runtime_with_ext, fixture, has_response, parse_lines, run_rpc_until_bytes,
+    type_of,
+};
 use cyrup_provider::faux::FauxProvider;
 use serde_json::Value;
 
@@ -34,11 +35,8 @@ async fn rpc_bash_backend_failure_is_not_fabricated_into_a_success() {
     std::fs::remove_dir_all(&fx.cwd).expect("remove the session cwd out from under the session");
 
     let input = concat!(r#"{"type":"bash","id":"b1","command":"echo hi"}"#, "\n");
-    let reader = Cursor::new(input.as_bytes().to_vec());
-    let mut out: Vec<u8> = Vec::new();
-    run_rpc(&runtime, reader, &mut out)
-        .await
-        .expect("rpc mode runs");
+    // SEAM-154: closing the input aborts a running command, so the client waits for its answer.
+    let out = run_rpc_until_bytes(&runtime, input, |lines| has_response(lines, "b1")).await;
 
     let lines = parse_lines(&out);
     let bash_resp = lines
@@ -99,12 +97,8 @@ async fn rpc_abort_bash_interrupts_a_running_bash_command() {
         r#"{"type":"abort_bash","id":"ab"}"#,
         "\n",
     );
-    let reader = Cursor::new(input.as_bytes().to_vec());
-    let mut out: Vec<u8> = Vec::new();
-
-    run_rpc(&runtime, reader, &mut out)
-        .await
-        .expect("rpc mode runs");
+    // SEAM-154: closing the input aborts a running command, so the client waits for its answer.
+    let out = run_rpc_until_bytes(&runtime, input, |lines| has_response(lines, "b1")).await;
 
     let lines = parse_lines(&out);
     let bash = lines
@@ -213,11 +207,8 @@ async fn rpc_bash_delivers_user_bash_to_an_extension() {
         r#"{"type":"bash","id":"b1","command":"echo rpc-hello","excludeFromContext":true}"#,
         "\n",
     );
-    let reader = Cursor::new(input.as_bytes().to_vec());
-    let mut out: Vec<u8> = Vec::new();
-    run_rpc(&runtime, reader, &mut out)
-        .await
-        .expect("rpc mode runs");
+    // SEAM-154: closing the input aborts a running command, so the client waits for its answer.
+    let out = run_rpc_until_bytes(&runtime, input, |lines| has_response(lines, "b1")).await;
 
     let delivered = seen.lock().unwrap().clone();
     assert_eq!(
@@ -286,11 +277,8 @@ async fn rpc_bash_honors_a_user_bash_result_override() {
         r#"{"type":"bash","id":"b1","command":"echo locally-executed"}"#,
         "\n"
     );
-    let reader = Cursor::new(input.as_bytes().to_vec());
-    let mut out: Vec<u8> = Vec::new();
-    run_rpc(&runtime, reader, &mut out)
-        .await
-        .expect("rpc mode runs");
+    // SEAM-154: closing the input aborts a running command, so the client waits for its answer.
+    let out = run_rpc_until_bytes(&runtime, input, |lines| has_response(lines, "b1")).await;
 
     assert_eq!(seen.lock().unwrap().len(), 1, "the handler was consulted");
 
@@ -372,11 +360,8 @@ async fn rpc_bash_fails_closed_on_a_partial_user_bash_result_override() {
         r#"{"type":"bash","id":"b1","command":"echo locally-executed"}"#,
         "\n"
     );
-    let reader = Cursor::new(input.as_bytes().to_vec());
-    let mut out: Vec<u8> = Vec::new();
-    run_rpc(&runtime, reader, &mut out)
-        .await
-        .expect("rpc mode runs");
+    // SEAM-154: closing the input aborts a running command, so the client waits for its answer.
+    let out = run_rpc_until_bytes(&runtime, input, |lines| has_response(lines, "b1")).await;
 
     assert_eq!(seen.lock().unwrap().len(), 1, "the handler was consulted");
 
@@ -536,11 +521,8 @@ async fn rpc_bash_runs_on_an_extension_supplied_operations_backend() {
         r#"{"type":"bash","id":"b1","command":"echo locally-executed"}"#,
         "\n"
     );
-    let reader = Cursor::new(input.as_bytes().to_vec());
-    let mut out: Vec<u8> = Vec::new();
-    run_rpc(&runtime, reader, &mut out)
-        .await
-        .expect("rpc mode runs");
+    // SEAM-154: closing the input aborts a running command, so the client waits for its answer.
+    let out = run_rpc_until_bytes(&runtime, input, |lines| has_response(lines, "b1")).await;
 
     let executed = ops.seen.lock().unwrap().clone();
     assert_eq!(
@@ -681,11 +663,8 @@ async fn drive_raw_user_bash(
         r#"{"type":"bash","id":"b1","command":"echo locally-executed"}"#,
         "\n"
     );
-    let reader = Cursor::new(input.as_bytes().to_vec());
-    let mut out: Vec<u8> = Vec::new();
-    run_rpc(&runtime, reader, &mut out)
-        .await
-        .expect("rpc mode runs");
+    // SEAM-154: closing the input aborts a running command, so the client waits for its answer.
+    let out = run_rpc_until_bytes(&runtime, input, |lines| has_response(lines, "b1")).await;
 
     let msgs = session.agent_messages().await;
     let transcript = serde_json::to_value(&msgs)

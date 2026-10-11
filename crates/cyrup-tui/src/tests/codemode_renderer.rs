@@ -19,7 +19,8 @@
 
 use std::sync::Arc;
 
-use crate::{App, UiTheme};
+use super::harness::esc;
+use crate::{App, AppAction, UiTheme};
 use cyrup_codemode_runtime::CodemodeExtension;
 use cyrup_codemode_runtime::tool::{CodemodeHostSlot, UnavailableSandboxFactory};
 use cyrup_core::{
@@ -571,4 +572,66 @@ async fn only_the_last_eight_calls_show_until_the_row_is_expanded() {
     let rows = cell_text(&app).join("\n");
     assert!(rows.contains("tool01") && rows.contains("tool10"), "{rows}");
     assert!(!rows.contains("earlier calls"), "{rows}");
+}
+
+/// Escape on a script that is running a call. The key handler used to commit the live tool rows
+/// where they stood, so the block stayed in the scrollback with its call as `… bash`, running for
+/// good, and the end of the tool, which the session emits after an abort as after any other end,
+/// found no row to finish and drew a second block: a bare title over `⊘ bash`, with no script. The
+/// end of the tool and the end of the run are what finish the row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn escape_during_a_script_leaves_one_block_that_the_end_of_the_tool_finishes() {
+    let host = host().await;
+    let mut app = app(100, 40);
+    app.ingest_event_with_extensions(&AgentSessionEvent::AgentStart, &host)
+        .await;
+    app.ingest_event_with_extensions(&start("await tools.bash({ command: 'sleep 31' });"), &host)
+        .await;
+    let running = json!({
+        "id": "call-1/1", "name": "bash", "args": "{\"command\":\"sleep 31\"}", "status": "running",
+    });
+    app.ingest_event_with_extensions(&update(json!([running])), &host)
+        .await;
+
+    assert_eq!(app.handle_input(&esc()), AppAction::InterruptRestoreQueued);
+
+    // What the aborted session emits next: the tool ends as a failure with its call cancelled, then
+    // the run ends.
+    let cancelled = json!({
+        "id": "call-1/1", "name": "bash", "args": "{\"command\":\"sleep 31\"}",
+        "status": "cancelled", "durationMs": 1800,
+    });
+    app.ingest_event_with_extensions(
+        &end(
+            true,
+            json!({
+                "content": [{ "type": "text", "text": "Script error:\nScript aborted" }],
+                "details": { "calls": [cancelled] },
+            }),
+        ),
+        &host,
+    )
+    .await;
+    app.ingest_event_with_extensions(
+        &AgentSessionEvent::AgentEnd {
+            messages: Vec::new(),
+            will_retry: false,
+        },
+        &host,
+    )
+    .await;
+    app.draw().unwrap();
+
+    let text = app.scrollback_text();
+    assert_eq!(
+        text.matches("codemode").count(),
+        1,
+        "one block for one tool call:\n{text}"
+    );
+    assert!(!text.contains("… bash"), "no call is left running:\n{text}");
+    let (script, cancelled_row) = (text.find("await tools.bash"), text.find("⊘ bash"));
+    assert!(
+        script.is_some() && cancelled_row.is_some() && script < cancelled_row,
+        "the block that has the script is the one that has the cancelled call:\n{text}"
+    );
 }

@@ -6,6 +6,8 @@
 
 use serde_json::Value;
 
+use crate::identifier::{CodemodeIdentifier, to_codemode_identifier};
+
 /// A tool or global as the declaration renderer sees it: pi `CodemodeTool` (`types.ts:14-41`)
 /// without `execute`, which is the engine's business and never reaches a declaration.
 ///
@@ -17,6 +19,11 @@ pub struct ToolDeclaration {
     /// [`to_codemode_identifier`](crate::identifier::to_codemode_identifier) of this name. Globals
     /// are called as `<name>(args)`, or `<namespace>.<member>` to group them into one object.
     pub name: String,
+    /// [CYRUP-DELTA] The identifier scripts call a tool by when it is not
+    /// [`to_codemode_identifier`] of [`Self::name`], because another tool has that identifier too
+    /// (see [`IdentifierTable`](crate::identifier::IdentifierTable)). `None` for globals and for
+    /// every tool whose identifier is the derived one.
+    pub identifier: Option<CodemodeIdentifier>,
     /// Shown as a doc comment in [`render_declarations`](crate::declarations::render_declarations).
     pub description: Option<String>,
     /// Schema of the single argument. Rendered as the parameter type; `unknown` when omitted.
@@ -38,6 +45,21 @@ impl ToolDeclaration {
             name: name.into(),
             ..Self::default()
         }
+    }
+
+    /// The identifier scripts call this tool by: [`Self::identifier`], else the one derived from the
+    /// name.
+    #[must_use]
+    pub fn script_identifier(&self) -> CodemodeIdentifier {
+        self.identifier
+            .clone()
+            .unwrap_or_else(|| to_codemode_identifier(&self.name))
+    }
+
+    #[must_use]
+    pub fn with_identifier(mut self, identifier: CodemodeIdentifier) -> Self {
+        self.identifier = Some(identifier);
+        self
     }
 
     #[must_use]

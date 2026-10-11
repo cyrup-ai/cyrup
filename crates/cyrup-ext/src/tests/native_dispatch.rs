@@ -1973,6 +1973,144 @@ async fn a_builtin_override_survives_the_filter() {
 }
 
 // ---------------------------------------------------------------------------
+// `--tools` / `--exclude-tools` with patterns and MCP tools (`_isAllowedTool` / `createToolNameMatcher`,
+// pi @v1.0.4): an allowlist that does not name MCP tools leaves them registered, inactive.
+// ---------------------------------------------------------------------------
+
+/// An MCP tool named by its own extension's `toolPrefix`, which pi's name rule cannot see.
+struct PrefixedMcpTool {
+    name: &'static str,
+    schema: Value,
+}
+#[async_trait::async_trait]
+impl Tool for PrefixedMcpTool {
+    fn name(&self) -> &str {
+        self.name
+    }
+    fn parameters(&self) -> &Value {
+        &self.schema
+    }
+    fn is_mcp_tool(&self) -> bool {
+        true
+    }
+    async fn execute(
+        &self,
+        _call_id: ToolCallId,
+        _params: Value,
+        _cancel: CancelToken,
+        _on_update: cyrup_core::ToolUpdateSink,
+    ) -> Result<ToolResult, ToolError> {
+        Ok(ToolResult::default())
+    }
+}
+struct McpMixExt;
+#[async_trait::async_trait]
+impl NativeExtension for McpMixExt {
+    fn id(&self) -> ExtensionId {
+        "mcp-mix".into()
+    }
+    async fn init(&self, api: &mut InitApi) -> Result<(), crate::ExtError> {
+        let schema = json!({"type": "object"});
+        api.register_tool(Arc::new(NamedTool {
+            name: "plain_tool",
+            schema: schema.clone(),
+        }));
+        api.register_tool(Arc::new(NamedTool {
+            name: "mcp__docs__find",
+            schema: schema.clone(),
+        }));
+        api.register_tool(Arc::new(PrefixedMcpTool {
+            name: "docs_search",
+            schema,
+        }));
+        Ok(())
+    }
+    async fn on_event(&self, _ev: &HostEvent, _ctx: &HostCtx) -> HookOutcome {
+        HookOutcome::Noop
+    }
+}
+
+async fn mcp_mix_host() -> ExtensionHost {
+    let host = ExtensionHost::new(cfg());
+    host.load_native(Arc::new(McpMixExt)).await.unwrap();
+    host
+}
+
+fn set_of(entries: &[&str]) -> std::collections::HashSet<String> {
+    entries.iter().map(|entry| (*entry).to_string()).collect()
+}
+
+fn sorted(tools: &[Arc<dyn Tool>]) -> Vec<String> {
+    let mut names = names(tools);
+    names.sort();
+    names
+}
+
+/// An allowlist with no MCP entry keeps the MCP tools REGISTERED (a `codemode` script and
+/// `tool_search` reach them) and leaves them INACTIVE: only what the list names is declared.
+/// Killing mutation: the carve-out is gone (`is_allowed_tool` ignores `is_mcp`) — both MCP tools
+/// leave the registry.
+#[tokio::test]
+async fn an_allowlist_without_an_mcp_entry_keeps_mcp_tools_registered_but_inactive() {
+    let host = mcp_mix_host().await;
+    let allow = set_of(&["plain_tool"]);
+    let none = set_of(&[]);
+
+    let registered = host
+        .registered_tools_filtered(&[], Some(&allow), &none)
+        .unwrap();
+    assert_eq!(
+        sorted(&registered),
+        ["docs_search", "mcp__docs__find", "plain_tool"],
+        "an MCP tool by pi's name rule and one that says so itself both stay"
+    );
+    let active = host
+        .active_tools_filtered(&[], Some(&allow), &none)
+        .unwrap();
+    assert_eq!(
+        sorted(&active),
+        ["plain_tool"],
+        "kept without being named, so not declared"
+    );
+}
+
+/// An allowlist entry that starts with `mcp__` makes the list decide for MCP tools too, and its
+/// `*` patterns match. Killing mutation: `allowlist_filters_mcp` is always false — the unnamed MCP
+/// tool `docs_search` stays registered.
+#[tokio::test]
+async fn an_mcp_entry_makes_the_allowlist_decide_for_mcp_tools() {
+    let host = mcp_mix_host().await;
+    let allow = set_of(&["mcp__docs__*"]);
+    let none = set_of(&[]);
+
+    let registered = host
+        .registered_tools_filtered(&[], Some(&allow), &none)
+        .unwrap();
+    assert_eq!(sorted(&registered), ["mcp__docs__find"]);
+    let active = host
+        .active_tools_filtered(&[], Some(&allow), &none)
+        .unwrap();
+    assert_eq!(
+        sorted(&active),
+        ["mcp__docs__find"],
+        "matching a pattern activates"
+    );
+}
+
+/// `--exclude-tools` applies to every tool, MCP tools included, and takes patterns. Killing
+/// mutation: the denylist is compared by exact name — the pattern removes nothing.
+#[tokio::test]
+async fn a_denylist_pattern_removes_mcp_tools_too() {
+    let host = mcp_mix_host().await;
+    let exclude = set_of(&["mcp__*", "docs_*"]);
+
+    let active = host.active_tools_filtered(&[], None, &exclude).unwrap();
+    assert_eq!(sorted(&active), ["plain_tool"]);
+    let registered = host.registered_tools_filtered(&[], None, &exclude).unwrap();
+    assert_eq!(sorted(&registered), ["plain_tool"]);
+}
+
+// ---------------------------------------------------------------------------
 // UW-3: the sanctioned-wait guard generalised past humans. A handler that DECLARES a bounded long
 // wait (the watchdog's agent-end model review) is not dropped at the budget; one that overruns its
 // declared ceiling is; and dropping the guard hands the rest of the handler back to the budget.

@@ -26,7 +26,7 @@
 //!
 //! [`set_process_name`] cannot move into the library: it needs `unsafe` (`prctl(PR_SET_NAME)` /
 //! `pthread_setname_np`) and `cyrup`'s lib root is `#![forbid(unsafe_code)]`. That is also why
-//! [`cyrup::predispatch`] *classifies* the four internal subcommands and this file dispatches them
+//! [`cyrup::predispatch`] *classifies* the five internal subcommands and this file dispatches them
 //! — each one re-labels the process first (SEAM-070).
 
 use std::io::{self, IsTerminal};
@@ -252,10 +252,11 @@ async fn run() -> anyhow::Result<i32> {
     // (`normalize_process_argv`).
     let mut raw: Vec<String> = normalize_process_argv(std::env::args());
 
-    // The four internal, never-advertised subcommands — `__subagent-runner --config <path>`
+    // The five internal, never-advertised subcommands — `__subagent-runner --config <path>`
     // (arch-SA §2.2/§6.5), `__subagent-inspector --async-dir <dir> --run-id <id>` (VL-S6),
-    // `__intercom-broker` (cyrup-intercom-port.md §7.3) and
-    // `__mcp-keyring-helper` (13f-mcp-credentials MCP-260). All four MUST be recognized before ANY
+    // `__intercom-broker` (cyrup-intercom-port.md §7.3),
+    // `__mcp-keyring-helper` (13f-mcp-credentials MCP-260) and `__codemode-sandbox` (one codemode
+    // script's isolate). All five MUST be recognized before ANY
     // user-facing arg leniency/clap parsing and before the package/config pre-dispatch below, which
     // has no knowledge of them. `cyrup::predispatch` classifies; the naming + dispatch is here
     // because `set_process_name` is `unsafe` and cannot live in the library (SEAM-070: a distinct
@@ -292,7 +293,14 @@ async fn run() -> anyhow::Result<i32> {
             set_process_name("cyrup-mcp-keyring");
             return Ok(cyrup::mcp_keyring_helper_cmd::dispatch());
         }
-        // ACP-001 — the `--terminal-login` gate. Unlike the four above it does NOT end the
+        // One codemode script's sandbox process. Stdout is the parent's frame pipe: nothing above
+        // this arm may have printed, and nothing below it runs. `PR_SET_NAME` keeps `cyrup-sandbox`
+        // whole (13 bytes), so `ps -o comm=` shows which cyrup process is a script's.
+        Some(Internal::CodemodeSandbox) => {
+            set_process_name("cyrup-sandbox");
+            return Ok(cyrup::codemode_sandbox_cmd::dispatch().await);
+        }
+        // ACP-001 — the `--terminal-login` gate. Unlike the five above it does NOT end the
         // process: an ACP client's Authenticate button appends `AuthMethod.args` to the agent
         // command it already holds, so this argv is `cyrup --acp … --terminal-login`, and the job
         // is to become an ordinary interactive `cyrup` the user can type `/login` into.
@@ -428,6 +436,15 @@ async fn run() -> anyhow::Result<i32> {
     // `--offline`, `--api-key`, `--model(s)` thread through `CliConfigOverrides`.
     let env = EnvVars::from_process();
     let (overrides, dirs) = bootstrap::resolve_dirs(&cli, &env)?;
+
+    // [CYRUP-DELTA] The terminal UI owns the terminal, and stderr is the same terminal unless the
+    // user redirected it. pi's logging is `console.*`, which its TUI replaces at start-up; cyrup's
+    // is `tracing`, whose `WARN`/`ERROR` lines (a directory watch that lost its path, an MCP server
+    // that would not start) were written into the middle of the screen. They go to a log file from
+    // here on; the dirs are needed to name it, so this is the first point it can run.
+    if bootstrap::should_redirect_tracing(mode, io::stderr().is_terminal()) {
+        bootstrap::redirect_tracing_to_log(&dirs);
+    }
 
     // One-time startup migrations (Pi `runMigrations(cwd)`, main.ts:549): legacy auth/session/tools
     // moves + extension-system deprecation warnings.

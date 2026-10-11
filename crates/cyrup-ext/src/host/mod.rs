@@ -20,7 +20,7 @@ pub mod services;
 pub mod store_state;
 pub mod testkit;
 
-pub use engine::{build_engine, build_engine_on_demand, map_wasm_error};
+pub use engine::{build_engine, build_engine_on_demand, build_engine_or_on_demand, map_wasm_error};
 pub use epoch::EpochDriver;
 pub use limits::StoreLimits;
 pub use live::{
@@ -35,9 +35,9 @@ pub use overlay::{
 pub use overlay_keys::{KeySpec, key_ids, parse_user_bindings, read_user_bindings};
 pub use services::{
     CannedResponses, ControlOp, DENIED_EXEC, DENIED_MODEL_CALLS, DENIED_NET, DENIED_UI,
-    DenyServices, DialogOptions, ExecOutput, FsCaps, GuestState, HostServices, HttpRequest,
-    HttpResponse, HttpStreamResponse, HumanInteractionGuard, HumanInteractionLock, InjectOutcome,
-    NestedImportRefusal, NotifyKind, OAuthEvent, ProcSpawnSpec, ProviderReduction,
+    DenyServices, DialogOptions, ExecOutput, FsCaps, GuestState, HostServices, HostServicesSlot,
+    HttpRequest, HttpResponse, HttpStreamResponse, HumanInteractionGuard, HumanInteractionLock,
+    InjectOutcome, NestedImportRefusal, NotifyKind, OAuthEvent, ProcSpawnSpec, ProviderReduction,
     RecordingServices, SharedBus, StandaloneCompletion, StandaloneCompletionRefusal, UiChrome,
     WidgetEffect, WidgetPlacement,
 };

@@ -18,6 +18,7 @@ pub mod acp_terminal_login_cmd;
 pub mod actions;
 pub mod bootstrap;
 pub mod cli;
+pub mod codemode_sandbox_cmd;
 pub mod credential_print;
 pub mod diagnostics;
 pub mod input;

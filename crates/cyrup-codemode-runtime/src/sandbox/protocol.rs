@@ -3,18 +3,17 @@
 //!
 //! Upstream passes everything as JSON strings so the worker never builds structured values; so
 //! does this. The functions here are the pure half of that boundary: they turn the strings the
-//! isolate reports into [`CodemodeResult`] parts, and the host's values into the strings it
+//! isolate reports into [`crate::types::CodemodeResult`] parts, and the host's values into the strings it
 //! reads, with no engine and no I/O.
 
-use cyrup_codemode::identifier::to_codemode_identifier;
 use cyrup_codemode::types::OutputItem;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-use crate::types::{CodemodeError, CodemodeStoreWrites, CodemodeTool, ErrorKind};
+use crate::types::{CodemodeError, CodemodeStoreWrites, CodemodeTool, ErrorKind, ReturnValue};
 
 /// Which table a call from the script is looked up in (`protocol.ts:31` `target`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) enum CallTarget {
     /// `tools.<name>(args)`; recorded in the result's `calls`.
     Tool,
@@ -37,29 +36,70 @@ pub(super) enum WorkerMessage {
     Done(ScriptSettled),
     /// The engine failed outside the script's control (`protocol.ts` `crash`).
     Crash(String),
+    /// The engine reported a fatal out-of-memory and the process is about to abort. Only a sandbox
+    /// process can say this: in the host's own process the engine's abort takes the host with it.
+    OutOfMemory,
+    /// The script used up its [`IsolateInit::active_limit_ms`] of running time; its isolate has been
+    /// told to stop.
+    ActiveLimit,
 }
 
 /// How the script ended, as the isolate reports it.
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub(super) enum ScriptSettled {
     Returned {
         /// JSON text of the return value; `None` is `undefined`.
         value: Option<String>,
         /// JSON array of `[key, json]` for `store()` and `[key]` for deletions.
         writes: String,
+        /// [CYRUP-DELTA] The errors the script left unhandled.
+        #[serde(default)]
+        report: UnobservedReport,
     },
     /// JSON `{ name?, message, stack? }`.
     Threw(String),
 }
 
+/// [CYRUP-DELTA] What the isolate knows of the errors a script that succeeded never looked at
+/// (`prelude.js` `unobservedReport`). Advisory: it is read leniently, and a report that does not
+/// decode is an empty one, never a failed execution.
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub(super) struct UnobservedReport {
+    /// Rejections no handler had when the script ended: the first few, each already bounded.
+    #[serde(default)]
+    pub unhandled: Vec<UnhandledRejection>,
+    /// How many rejections there were in all.
+    #[serde(default)]
+    pub total: usize,
+    /// The calls the script started, never saw settle, and left with nothing waiting on them (no
+    /// `await`, `.then`, `.catch` or `Promise.all` reacts to the call's promise). The host knows
+    /// which of them had failed: the script ended before it was told.
+    #[serde(default)]
+    pub unsettled: Vec<u32>,
+    /// The calls the script started and never saw settle, with something waiting on them (an `await`
+    /// in an `async` function nobody awaited, a `.then`, a `.catch`, a `Promise.all` that had already
+    /// rejected). Disjoint from [`Self::unsettled`]. The host knows which of them had failed.
+    #[serde(default)]
+    pub waited: Vec<u32>,
+}
+
+/// One entry of [`UnobservedReport::unhandled`].
+#[derive(Debug, Serialize, Deserialize)]
+pub(super) struct UnhandledRejection {
+    /// The tool or global whose failed call this is, when it is one.
+    #[serde(default)]
+    pub call: Option<String>,
+    pub message: String,
+}
+
 /// Supervisor to isolate thread (`protocol.ts` `HostToWorkerMessage`): a tool call's outcome.
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub(super) struct HostReply {
     pub id: u32,
     pub payload: ReplyPayload,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub(super) enum ReplyPayload {
     /// JSON text of the result; `None` is `undefined`.
     Value(Option<String>),
@@ -68,13 +108,16 @@ pub(super) enum ReplyPayload {
 }
 
 /// Everything one isolate needs to run one script (`protocol.ts` `WorkerData`).
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub(super) struct IsolateInit {
     pub code: String,
     pub tools_json: String,
     pub globals_json: String,
     pub store_json: String,
     pub memory_limit: Option<usize>,
+    /// [CYRUP-DELTA] Milliseconds of running time the script may use, not counting the time it
+    /// waits for the host (see [`crate::types::SandboxOptions::active_limit`]).
+    pub active_limit_ms: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -110,7 +153,7 @@ pub(super) fn tools_json(tools: &[CodemodeTool]) -> String {
         .iter()
         .map(|tool| ToolEntry {
             name: &tool.declaration.name,
-            js_name: to_codemode_identifier(&tool.declaration.name).into_string(),
+            js_name: tool.declaration.script_identifier().into_string(),
             description: tool.declaration.description.as_deref().unwrap_or(""),
         })
         .collect();
@@ -163,6 +206,12 @@ impl BridgeError {
 /// `parseBridgeJson` (`host.ts:55-61` @v1.0.4).
 fn parse_bridge_json(json: &str, what: &str) -> Result<Value, BridgeError> {
     serde_json::from_str(json).map_err(|_| BridgeError::new(format!("{what} is not valid JSON")))
+}
+
+/// The return value of a script that ran to its end (`host.ts:261` `parseBridgeJson(message.value,
+/// "return value")`), kept as the text it arrived as: see [`ReturnValue`].
+pub(super) fn return_value(json: String) -> Result<ReturnValue, BridgeError> {
+    ReturnValue::from_json(json).map_err(|_| BridgeError::new("return value is not valid JSON"))
 }
 
 /// The error of a script that threw (`parseScriptError`, `host.ts:81-95` @v1.0.4). `message` must be
@@ -293,6 +342,14 @@ mod tests {
         assert_eq!(
             reason(store_writes(r#"[["k","{"]]"#).map(drop)),
             broken("store value for \"k\" is not valid JSON")
+        );
+        assert_eq!(
+            reason(return_value("{".to_owned()).map(drop)),
+            broken("return value is not valid JSON")
+        );
+        assert_eq!(
+            reason(return_value("1 2".to_owned()).map(drop)),
+            broken("return value is not valid JSON")
         );
         assert_eq!(
             reason(script_error("5").map(drop)),

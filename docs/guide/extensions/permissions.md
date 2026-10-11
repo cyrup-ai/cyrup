@@ -8,7 +8,10 @@ see when a call is held for approval.
 on if it finds a `cyrup-permissions.jsonc` anywhere it looks — no environment variable needed. That
 means dropping a policy file into a repository turns the gate on for anyone who runs cyrup there.
 That is the feature working as designed; it is also the behaviour that surprises people, so know it
-before you commit a policy file.
+before you commit a policy file. It changes the tool set too: with the system armed, every tool the
+policy does not `deny` is active, `grep`, `find`, `ls`, `powershell`, `codemode` and `tool_search`
+included, whatever `defaultTools` says. See
+[Tools and permissions](../guides/tools-and-permissions.md#the-permission-system).
 
 ## How it arms
 
@@ -45,6 +48,17 @@ relax a trusted `deny`.** A repository you have not vetted can add its own denie
 can turn your `allow` into an `ask`. It cannot turn your `deny` into an `allow`. Everything under
 `~/.cyrup/agent` is trusted because you wrote it; everything under a project's `.cyrup/` is not,
 because someone else may have.
+
+**A project you have not trusted can only tighten, whatever the file says.** The two project layers are
+read in an untrusted project too, and cyrup drops every `allow` from them there, a rule or a
+`defaultPolicy` of `allow`, so the layers below decide that call and an `ask` of yours stays an `ask`.
+Their `deny` and `ask` rules stand. A project is untrusted when you chose "Do not trust", or when
+the run could not ask and you passed no `--approve` (`-p`, `--mode json`; see
+[Project trust](../guides/tools-and-permissions.md#project-trust)). A project policy file is one of
+the things that start the trust question, so a repository that ships only that file is asked about too.
+In a trusted project the layers apply in full, under the `deny` floor above. Upstream
+`pi-permission-system` has no such rule: its project layer can turn an `ask` into an `allow` in any
+project.
 
 The two "agent" layers apply only when a call runs under a named agent persona — see
 [Subagents](subagents.md).
@@ -111,8 +125,9 @@ your workflow actually calls before you decide what to permit.
 
 ### tools
 
-Keyed by tool name: `read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`, and any tool an extension
-registers. `*` wildcards are allowed, so `"*": "ask"` covers everything you did not name.
+Keyed by tool name: `read`, `write`, `edit`, `bash`, `powershell`, `grep`, `find`, `ls`, and any tool
+an extension registers (`codemode` and `tool_search` included). `*` wildcards are allowed, so
+`"*": "ask"` covers everything you did not name.
 
 Tools that take a path also accept **resource-qualified** keys, which apply only to matching paths:
 
@@ -163,6 +178,19 @@ A closed set — the only keys accepted are:
 `"external_directory:/home/alice/shared/*": "allow"` permits one directory outside the project while
 the bare key stays at `ask`. Any other key in this block is rejected.
 
+One path outside the project needs no such rule: the `codemode` script reference that cyrup writes to
+`<agent dir>/docs/codemode.md` and that the `codemode` tool description sends the model to. A `read`
+of exactly that file skips `external_directory`; the `read` rule still applies, and so does
+`external_directory` for every other path, for a `write` of that file and for a path spelled with `..`
+into the rest of the agent directory.
+
+The same exemption covers the files cyrup itself wrote during the session for the model to read back:
+the temp file that a truncated `bash` result names (`Full output: /tmp/cyrup-bash-<id>.log`), and the
+`pi-codemode-<id>.txt` or image file a `codemode` result names (`Full output: ...`, `Image saved to
+...`). Only those exact paths qualify, they are remembered for the life of the process, and only for
+a `read`: another file in the same directory, a `write` of the file, or a path that has since become
+a symbolic link meets `external_directory` as usual.
+
 ## The dialog
 
 When a rule resolves to `ask`, the call stops and you get four options:
@@ -174,13 +202,39 @@ When a rule resolves to `ask`, the call stops and you get four options:
 | Reject | Refuse it |
 | Reject with Reason | Refuse it and type an explanation the model receives |
 
+The dialog of a call a [`codemode`](../guides/codemode.md) script made has a fifth option,
+**Reject All From This Script**: it refuses that call and every other call the same script makes, the
+ones waiting behind the dialog included, without another dialog. Each fails with `the user rejected
+this script's tool calls`; the script is not aborted, and other scripts are asked as before.
+
 Pressing `Esc` counts as a reject, and so does a timeout. **The gate fails closed on anything but an
-explicit allow.** A headless run — a script, a piped invocation, anything with no interactive UI —
-has nobody to ask, so an `ask` becomes a block. Policies you intend to use in
-[scripts](../guides/scripting.md) should resolve to `allow` or `deny`, never `ask`.
+explicit allow.** A headless run — a script, a piped invocation (`-p`, `--mode json`), anything with no
+interactive UI — has nobody to ask, so an `ask` becomes a block. Policies you intend to use in
+[scripts](../guides/scripting.md) should resolve to `allow` or `deny`, never `ask`. `--mode rpc` is the
+exception: the dialog goes to the client as an `extension_ui_request` and the client's
+`extension_ui_response` decides.
 
 When the call comes from a subagent child, which has no human of its own, the child's `ask` is
-forwarded up to your session through a filesystem spool and you answer it in the parent.
+forwarded up to the session that started it through a filesystem spool, and you answer it there. That
+needs a session with a UI. A session without one (`-p`, `--mode json`) leaves a `no-ui` marker in its
+spool, and a child whose `ask` fires reads it and refuses the call at once, with the same text a
+headless session gives (`... requires approval, but no interactive UI is available`), instead of
+waiting. The marker names the process that wrote it, so it holds only while that process is running:
+one left by a run that was killed, crashed or finished is ignored, and the next headless run removes
+it. A session id outlives its process, so `cyrup -p ...` followed by `cyrup -c` with a UI is one
+session in two processes: the process with the UI removes the marker on its first turn and its
+children's questions are put to you. A child whose parent does have a UI, and is not answered, gives
+up after 10 minutes and the call is denied.
+
+### Calls made by a `codemode` script
+
+A call a [`codemode`](../guides/codemode.md) script makes with `tools.*` is gated like a call the model
+makes: same rules, same dialog, same fail-closed rule. Two things differ. The `codemode` call has its
+own rule, so with `ask` you answer once for the script and again for each nested call that resolves to
+`ask`. And the dialog text, the headless block text and the audit entry say the call came from a
+script: the prompt ends with `(from codemode script)`, and the entry has a `parentToolCallId`. In a
+headless run (`-p`, `--mode json`) the script receives the block as an error that says so and names
+the fix; in `--mode rpc` the client is asked.
 
 ## The /permission-system command
 
@@ -245,7 +299,7 @@ That is the file cyrup writes for you the first time it needs one, with every va
 | `enabled` | bool | `true` | `false` disables the extension entirely; nothing else disables it |
 | `debug` | bool | `false` | The JSONL audit trail |
 | `yoloMode` | bool | `false` | Auto-approve everything |
-| `forwardedPromptTimeoutSeconds` | number | `30` | How long a child waits for you to answer a forwarded ask |
+| `forwardedPromptTimeoutSeconds` | number | `30` | How long the dialog of a forwarded ask stays open in your session before it is rejected for you. The child itself waits at most 10 minutes for any answer |
 
 Point `CYRUP_PERMISSION_SYSTEM_CONFIG_PATH` at a different file to relocate it.
 

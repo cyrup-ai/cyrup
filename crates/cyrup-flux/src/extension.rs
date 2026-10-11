@@ -6,7 +6,7 @@
 //! namespaced under `flux/…` (see [`crate::resources`]) — after first materialising the embedded
 //! bundle there (FLUX-001, [`crate::install`]).
 
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use cyrup_core::ExtensionId;
 use cyrup_ext::registry::CommandDescriptor;
@@ -55,8 +55,9 @@ pub struct FluxExtension {
     pub(crate) id: ExtensionId,
     /// Late-bound by the host before `init` (`native.rs:683`); the overlay (port doc §3.4.3) and
     /// the `ask_user_question` tool (§3.4.4) both reach the live backend through this slot. The
-    /// `cyrup-ext-subagents` `OnceLock` pattern (`extension.rs:139`, `:751-759`).
-    pub(crate) host_services: Arc<OnceLock<Arc<dyn cyrup_ext::host::HostServices>>>,
+    /// A rebindable slot ([`cyrup_ext::host::HostServicesSlot`]): a session replacement binds the
+    /// replacement's backend to this same extension, and the last bind wins.
+    pub(crate) host_services: Arc<cyrup_ext::host::HostServicesSlot>,
     /// Where the bundled tree lives at run time — decided once, at construction
     /// (`crate::flux_extension`), from the agent dir the binary resolved for every extension and
     /// the `CYRUP_FLUX_RESOURCES_DIR` override. FLUX-001: never the build machine's source tree.
@@ -103,7 +104,9 @@ impl NativeExtension for FluxExtension {
     }
 
     fn set_host_services(&self, services: Arc<dyn cyrup_ext::host::HostServices>) {
-        let _ = self.host_services.set(services);
+        // The last bind wins: a session replacement binds the replacement's backend to this same
+        // extension, and the overlay and `ask_user_question` must reach the live session's UI.
+        self.host_services.bind(services);
     }
 
     /// Route the one command this task registers, `flux/status` (port doc §3.4.2). Session

@@ -57,7 +57,8 @@
 use std::path::PathBuf;
 
 use agent_client_protocol::schema::v1::{
-    ContentBlock, ContentChunk, SessionUpdate, ToolCallContent, ToolCallId, ToolCallLocation,
+    ContentBlock, ContentChunk, ImageContent, SessionUpdate, ToolCallContent, ToolCallId,
+    ToolCallLocation,
 };
 use cyrup_core::{Content, StopReason};
 use cyrup_session_svc::{AgentMessage, AgentSessionEvent, StreamEvent};
@@ -717,7 +718,6 @@ fn tool_execution_end(
         return Translated::maybe(ledger.terminal_finish(id, &text, is_error, code));
     }
 
-    let text = tool_result_to_text(result);
     let mut content = None;
 
     // `ACP-135` — `is_error` is authoritative: cyrup's `edit` returns `Err` for a partial batch, so
@@ -741,8 +741,8 @@ fn tool_execution_end(
     }
 
     let has_diff = content.is_some();
-    if content.is_none() && !text.is_empty() {
-        content = Some(vec![text_content(&text)]);
+    if content.is_none() {
+        content = tool_result_content(result);
     }
 
     Translated::maybe(ledger.finish(
@@ -914,8 +914,22 @@ fn edit_old_texts(args: &Value) -> Vec<String> {
 /// 1. `details.diff`, when a non-blank string. cyrup's `edit` returns a terse success line in
 ///    `content` and the full unified diff in `EditDetails.diff`
 ///    (`crates/cyrup-tools/src/details.rs`), exactly as pi's does, so the diff wins.
-/// 2. The `text` of every `{"type":"text"}` content block, joined with **no separator**.
+/// 2. The `text` of every non-empty `{"type":"text"}` content block, joined with `\n`.
 /// 4. `serde_json::to_string_pretty`, which is `JSON.stringify(result, null, 2)`.
+///
+/// # [CYRUP-DELTA] — the blocks are joined with a newline, not with nothing
+///
+/// **What differs.** Upstream's step 2 is `texts.join('')` (`translate/pi-tools.ts` @v0.0.33). pi's
+/// own tools return one text block, so the joiner never showed. A cyrup tool that returns several
+/// does: the `codemode` tool emits one block per `text()` or `console.*` call, so a script that
+/// printed `first line`, `second line` and `{"a":1}` reached the editor as
+/// `first linesecond line{"a":1}`; an MCP result with several text items is the same. The model and
+/// the terminal UI see those blocks on separate lines, and so does this now.
+///
+/// **What it costs.** A tool that splits one piece of prose across blocks it expects to be glued
+/// shows a line break at each seam. None of cyrup's does; the terminal class
+/// ([`bash_result_text`]) keeps the plain concatenation, because the chunks of one process's output
+/// are one stream.
 ///
 /// # [CYRUP-DELTA] — steps 3 and 4's fallback are cut
 ///
@@ -941,38 +955,93 @@ pub fn tool_result_to_text(result: &Value) -> String {
     if result.is_null() {
         return String::new();
     }
+    readable_tool_result_text(result)
+        .unwrap_or_else(|| serde_json::to_string_pretty(result).unwrap_or_default())
+}
 
+/// Rungs 1 and 2 of [`tool_result_to_text`]: the diff, else the text blocks. `None` when the result
+/// has neither, which is where the ladder falls back to pretty JSON.
+fn readable_tool_result_text(result: &Value) -> Option<String> {
     if let Some(diff) = result
         .get("details")
         .and_then(|d| d.get("diff"))
         .and_then(Value::as_str)
         .filter(|d| !d.trim().is_empty())
     {
-        return diff.to_string();
+        return Some(diff.to_string());
     }
 
-    let joined = joined_text_blocks(result);
-    if !joined.is_empty() {
-        return joined;
-    }
-
-    serde_json::to_string_pretty(result).unwrap_or_default()
+    Some(tool_result_text_blocks(result)).filter(|joined| !joined.is_empty())
 }
 
-/// The `text` of every `{"type":"text"}` content block, joined with **no separator**.
+/// The non-empty `text` of every `{"type":"text"}` content block, in order.
 ///
 /// Upstream writes this twice — step 2 of `translate/pi-tools.ts`'s `toolResultToText` and the
-/// first half of `translate/bash.ts`'s `bashResultText` — with the same `.filter(Boolean)` and the
-/// same empty-join guard. One function, because two copies of a joiner is how they drift.
-fn joined_text_blocks(result: &Value) -> String {
-    let Some(blocks) = result.get("content").and_then(Value::as_array) else {
-        return String::new();
-    };
-    blocks
-        .iter()
+/// first half of `translate/bash.ts`'s `bashResultText` — with the same `.filter(Boolean)`. One
+/// function, because two copies of a filter is how they drift; what they do with the pieces is
+/// [`joined_text_blocks`] and [`tool_result_text_blocks`].
+fn text_blocks(result: &Value) -> impl Iterator<Item = &str> {
+    result
+        .get("content")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
         .filter(|b| b.get("type").and_then(Value::as_str) == Some("text"))
         .filter_map(|b| b.get("text").and_then(Value::as_str))
+        .filter(|text| !text.is_empty())
+}
+
+/// [`text_blocks`] joined with **no separator**: the chunks of one process's output.
+fn joined_text_blocks(result: &Value) -> String {
+    text_blocks(result).collect()
+}
+
+/// [`text_blocks`] joined with a newline: the separate things a tool said, one per line (see
+/// [`tool_result_to_text`]'s `[CYRUP-DELTA]`).
+fn tool_result_text_blocks(result: &Value) -> String {
+    text_blocks(result).collect::<Vec<_>>().join("\n")
+}
+
+/// [CYRUP-DELTA] The `{"type":"image"}` blocks of a tool result as ACP image content, in order.
+///
+/// pi-acp renders only text and a diff; the images of a result (a `codemode` script's `image()`, the
+/// `read` of a picture) reached the editor only inside `rawOutput`, which no client draws. ACP's
+/// `tool_call_update.content` takes any content block, and an image is one. A block without data
+/// or without a MIME type is skipped: there is nothing for a client to draw.
+fn image_contents(result: &Value) -> Vec<ToolCallContent> {
+    result
+        .get("content")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|b| b.get("type").and_then(Value::as_str) == Some("image"))
+        .filter_map(|b| {
+            let data = b.get("data").and_then(Value::as_str)?;
+            let mime_type = b.get("mimeType").and_then(Value::as_str)?;
+            (!data.is_empty() && !mime_type.is_empty()).then(|| {
+                ToolCallContent::from(ContentBlock::Image(ImageContent::new(data, mime_type)))
+            })
+        })
         .collect()
+}
+
+/// What the generic (non-terminal, non-diff) arm shows of a finished result: its text and then its
+/// images. A result whose only content is images shows the images and not the pretty-JSON fallback of
+/// [`tool_result_to_text`], which would print their base64 as text. `None` when there is nothing to
+/// show.
+pub(crate) fn tool_result_content(result: &Value) -> Option<Vec<ToolCallContent>> {
+    let images = image_contents(result);
+    let text = match readable_tool_result_text(result) {
+        Some(text) => text,
+        None if images.is_empty() => tool_result_to_text(result),
+        None => String::new(),
+    };
+    let mut content = Vec::new();
+    if !text.is_empty() {
+        content.push(text_content(&text));
+    }
+    content.extend(images);
+    (!content.is_empty()).then_some(content)
 }
 
 /// Port of pi-acp v0.0.33 `translate/bash.ts`'s `bashResultText` (`ACP-140`).
@@ -1164,6 +1233,80 @@ mod tests {
     /// (`crates/cyrup-agent/src/agent/message.rs`).
     fn tool_result(text: &str) -> Value {
         json!({ "content": [{ "type": "text", "text": text }] })
+    }
+
+    /// [CYRUP-DELTA] A result with several text blocks reads one block per line in the editor, as it
+    /// does to the model and in the terminal UI, and a result's images are shown as image content.
+    /// The `codemode` tool emits one block per `text()` or `console.*` call and one per `image()`;
+    /// joined with nothing (pi-acp's `join('')`) `console.log('first line'); console.log('second
+    /// line')` read `first linesecond line`, and an image existed only in `rawOutput`, which no client
+    /// draws. Killing mutations: `tool_result_text_blocks` joining with `""`; `tool_result_content`
+    /// dropping the images.
+    #[test]
+    fn a_codemode_results_blocks_are_lines_and_its_images_are_shown() {
+        let mut ledger = fresh();
+        let _ = translate(
+            &mut ledger,
+            &AgentSessionEvent::ToolExecutionStart {
+                tool_call_id: "cm1".into(),
+                tool_name: "codemode".into(),
+                args: json!({ "code": "console.log('first line')" }),
+            },
+            None,
+        );
+        let out = translate(
+            &mut ledger,
+            &AgentSessionEvent::ToolExecutionEnd {
+                duration_ms: None,
+                tool_call_id: "cm1".into(),
+                tool_name: "codemode".into(),
+                result: json!({ "content": [
+                    { "type": "text", "text": "Script completed\nWall time 0.1 seconds\nOutput:\n" },
+                    { "type": "text", "text": "first line" },
+                    { "type": "text", "text": "second line" },
+                    { "type": "image", "data": "iVBORw0KGgo=", "mimeType": "image/png" },
+                    { "type": "text", "text": "[Image saved to /tmp/pi-codemode-1.png (image/png, 8B)]" },
+                    { "type": "text", "text": "[1,2]" }
+                ] }),
+                is_error: false,
+            },
+            None,
+        );
+        let out = json_all(&out);
+        assert_eq!(out[0]["status"], "completed");
+        assert_eq!(
+            out[0]["content"][0]["content"]["text"],
+            "Script completed\nWall time 0.1 seconds\nOutput:\n\nfirst line\nsecond line\n[Image saved to /tmp/pi-codemode-1.png (image/png, 8B)]\n[1,2]"
+        );
+        assert_eq!(out[0]["content"][1]["type"], "content");
+        assert_eq!(out[0]["content"][1]["content"]["type"], "image");
+        assert_eq!(out[0]["content"][1]["content"]["data"], "iVBORw0KGgo=");
+        assert_eq!(out[0]["content"][1]["content"]["mimeType"], "image/png");
+        assert_eq!(out[0]["content"].as_array().map(Vec::len), Some(2));
+    }
+
+    /// A result that is only an image shows the image, not the pretty-JSON fallback that would print
+    /// its base64 as text; an image block with no data or MIME type is skipped.
+    #[test]
+    fn an_image_only_result_shows_the_image_and_not_its_base64_as_text() {
+        let content = tool_result_content(&json!({ "content": [
+            { "type": "image", "data": "AAAA", "mimeType": "image/png" },
+            { "type": "image", "data": "", "mimeType": "image/png" },
+            { "type": "image", "data": "BBBB" }
+        ] }))
+        .expect("the one drawable image");
+        let shown: Vec<Value> = content
+            .iter()
+            .map(|c| serde_json::to_value(c).expect("serializes"))
+            .collect();
+        assert_eq!(shown.len(), 1, "{shown:?}");
+        assert_eq!(shown[0]["content"]["type"], "image");
+        assert_eq!(shown[0]["content"]["data"], "AAAA");
+        // Nothing to show stays nothing to show.
+        assert!(tool_result_content(&Value::Null).is_none());
+        // A result with neither text nor images is still the pretty JSON, as before.
+        let fallback = tool_result_content(&json!({ "details": { "rows": 3 } })).expect("fallback");
+        assert_eq!(fallback.len(), 1);
     }
 
     /// ACP-121 / ACP-154 — the two signals the whole shell is written against. Settling on
@@ -2251,16 +2394,18 @@ mod tests {
             })),
             "Edited"
         );
-        // 2. Text blocks join with NO separator, and non-text blocks are skipped.
+        // 2. Text blocks join with a newline ([CYRUP-DELTA]: upstream joins with nothing), empty
+        //    blocks add no blank line, and non-text blocks are skipped.
         assert_eq!(
             tool_result_to_text(&json!({
                 "content": [
                     { "type": "text", "text": "a" },
                     { "type": "image", "data": "…", "mimeType": "image/png" },
+                    { "type": "text", "text": "" },
                     { "type": "text", "text": "b" }
                 ]
             })),
-            "ab"
+            "a\nb"
         );
         // 4. A result with no text content — an MCP tool returning only `details` — is pretty JSON.
         let fallback = tool_result_to_text(&json!({ "details": { "rows": 3 } }));

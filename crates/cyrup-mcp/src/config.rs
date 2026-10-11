@@ -2421,6 +2421,44 @@ impl fmt::Display for ConfigDiagnostic {
     }
 }
 
+/// [CYRUP-DELTA] How many distinct diagnostic messages [`log_diagnostic`] remembers.
+const MAX_LOGGED_DIAGNOSTICS: usize = 256;
+
+/// [CYRUP-DELTA] Logs a load diagnostic through `tracing::warn!`, once per distinct message.
+///
+/// Upstream's `console.warn` fires on every read of a bad file, and the ladder is read many times:
+/// `getMergedSettings` and the load each walk it, and the extension loads it again for registration,
+/// for the surface sync and at `session_start`. A file that was not valid JSON printed the same
+/// line ten times in one `-p` run. The message names the file and the parse error, so a message seen
+/// is a message that would only repeat itself; the set is bounded and starts over when it fills. The
+/// values ([`ConfigDiagnostic`]) are unaffected: every load still returns its own, for the panels and
+/// for the startup notice.
+fn log_diagnostic(message: &str) {
+    static LOGGED: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::LazyLock::new(Default::default);
+    let first_time = {
+        // A set of strings: a poisoned lock holds no broken invariant.
+        let mut logged = LOGGED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if logged.len() >= MAX_LOGGED_DIAGNOSTICS {
+            logged.clear();
+        }
+        logged.insert(message.to_owned())
+    };
+    if first_time {
+        tracing::warn!("{message}");
+    }
+}
+
+/// Drops the repeats of a diagnostic (same file, server and message), keeping the first of each and
+/// the order.
+fn dedup_diagnostics(diagnostics: &mut Vec<ConfigDiagnostic>) {
+    let mut seen: std::collections::HashSet<(PathBuf, Option<String>, String)> =
+        std::collections::HashSet::new();
+    diagnostics.retain(|d| seen.insert((d.path.clone(), d.server.clone(), d.message.clone())));
+}
+
 /// What one source contributed, plus everything the load had to complain about on the way.
 #[derive(Debug, Clone, Default)]
 pub struct LoadedConfig {
@@ -2496,7 +2534,7 @@ fn strip_project_provider_auth(
         "Ignoring MCP servers {names}: auth.provider is only allowed in user-global config, and \
          project config defines or overrides them"
     );
-    tracing::warn!("{message}");
+    log_diagnostic(&message);
     diagnostics.push(ConfigDiagnostic {
         // Upstream's warning names no path — the offending source is whichever project file
         // defined or overrode the server, and there may be several. The diagnostic needs one, so it
@@ -2666,7 +2704,7 @@ pub fn to_server_entries(
                  which this build does not implement (Cut 3); the entry is ignored.",
                 path.display()
             );
-            tracing::warn!("{message}");
+            log_diagnostic(&message);
             diagnostics.push(ConfigDiagnostic {
                 path: path.to_path_buf(),
                 server: Some(name.clone()),
@@ -2680,7 +2718,7 @@ pub fn to_server_entries(
                  client transport (Cut 1), so the entry is ignored.",
                 path.display()
             );
-            tracing::warn!("{message}");
+            log_diagnostic(&message);
             diagnostics.push(ConfigDiagnostic {
                 path: path.to_path_buf(),
                 server: Some(name.clone()),
@@ -2703,7 +2741,7 @@ pub fn to_server_entries(
                 "MCP server \"{name}\" in {}: {error}; the entry is ignored.",
                 path.display()
             );
-            tracing::warn!("{message}");
+            log_diagnostic(&message);
             diagnostics.push(ConfigDiagnostic {
                 path: path.to_path_buf(),
                 server: Some(name.clone()),
@@ -2727,7 +2765,7 @@ pub fn to_server_entries(
                     "Ignoring MCP server \"{name}\" in {}: {error}",
                     path.display()
                 );
-                tracing::warn!("{message}");
+                log_diagnostic(&message);
                 diagnostics.push(ConfigDiagnostic {
                     path: path.to_path_buf(),
                     server: Some(name.clone()),
@@ -2746,7 +2784,7 @@ pub fn to_server_entries(
                 let message = format!(
                     "Ignoring invalid description for MCP server \"{name}\": expected a string"
                 );
-                tracing::warn!("{message}");
+                log_diagnostic(&message);
                 diagnostics.push(ConfigDiagnostic {
                     path: path.to_path_buf(),
                     server: Some(name.clone()),
@@ -2872,7 +2910,7 @@ fn warn_unrecognized_approve_tools(
          approval until it is corrected.",
         path.display()
     );
-    tracing::warn!("{message}");
+    log_diagnostic(&message);
     diagnostics.push(ConfigDiagnostic {
         path: path.to_path_buf(),
         server: server.map(str::to_string),
@@ -2911,7 +2949,7 @@ pub fn read_validated_config(
 /// one warning every ladder source shares.
 fn push_load_warning(path: &Path, error: &str, diagnostics: &mut Vec<ConfigDiagnostic>) {
     let message = format!("Failed to load MCP config from {}: {error}", path.display());
-    tracing::warn!("{message}");
+    log_diagnostic(&message);
     diagnostics.push(ConfigDiagnostic {
         path: path.to_path_buf(),
         server: None,
@@ -3393,7 +3431,7 @@ fn push_import_warning(
     diagnostics: &mut Vec<ConfigDiagnostic>,
 ) {
     let message = format!("{prefix} {error}");
-    tracing::warn!("{message}");
+    log_diagnostic(&message);
     diagnostics.push(ConfigDiagnostic {
         path: path.to_path_buf(),
         server: None,
@@ -4287,7 +4325,7 @@ impl ConfigContext {
                          user-global MCP config instead",
                         source.read_path.display()
                     );
-                    tracing::warn!("{message}");
+                    log_diagnostic(&message);
                     diagnostics.push(ConfigDiagnostic {
                         path: source.read_path.clone(),
                         server: None,
@@ -4343,6 +4381,10 @@ impl ConfigContext {
             &mut diagnostics,
             self.dirs.cwd(),
         );
+
+        // [CYRUP-DELTA] The ladder is walked twice (`merged_settings`, then the load itself), so a
+        // file that does not parse is reported twice. The second report adds nothing.
+        dedup_diagnostics(&mut diagnostics);
 
         LoadedConfig {
             config,
@@ -5529,6 +5571,11 @@ pub struct ConfigDiscoverySource {
     /// `exists` and `server_count` without distinguishing a rung that is present from one that
     /// contributes, so this field is carried and not shown.
     pub contributes: bool,
+    /// [CYRUP-DELTA] Not an upstream field: the file exists and could not be used (it is not valid
+    /// JSON, or it could not be read). [`Self::server_count`] is `0` for it exactly as for an empty
+    /// file, and the setup panel would otherwise read `Detected 0 configured servers` for a config
+    /// that was rejected.
+    pub unreadable: bool,
 }
 
 /// `ImportConfigSummary` — a detected host config plus how many servers it declares.
@@ -5788,10 +5835,12 @@ impl ConfigContext {
             .into_iter()
             .map(|source| {
                 let loaded = read_validated_config(&source.read_path, diagnostics);
+                let exists = source.read_path.exists();
                 ConfigDiscoverySource {
                     id: source.id,
                     label: source.label,
-                    exists: source.read_path.exists(),
+                    exists,
+                    unreadable: exists && loaded.is_none(),
                     scope: source.scope,
                     kind: if source.shared {
                         DiscoveryKind::Shared
@@ -8071,6 +8120,89 @@ mod tests {
                 path.display()
             );
         }
+    }
+
+    /// A `tracing` subscriber that counts the warnings it is shown.
+    struct CountWarnings(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+    impl tracing::Subscriber for CountWarnings {
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            *metadata.level() == tracing::Level::WARN
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, _: &tracing::Event<'_>) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    /// [CYRUP-DELTA] A `mcp.json` that is not valid JSON is named once by a load and once in the log,
+    /// however many times the extension loads the ladder. The load walks the ladder twice (the merged
+    /// settings, then the servers) and the extension loads it again for registration, for the surface
+    /// sync and at `session_start`; a `-p` run printed the same warning ten times, and a load returned
+    /// the same diagnostic twice. Killing mutations: `log_diagnostic` logging every time;
+    /// `dedup_diagnostics` left out of `load`.
+    #[test]
+    fn a_file_that_does_not_parse_is_reported_once_per_load_and_logged_once() {
+        let fixture = Fixture::new();
+        let path = fixture.user_path();
+        fixture.write(&path, "{ not json");
+
+        let warnings = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let loads: Vec<LoadedConfig> = tracing::subscriber::with_default(
+            CountWarnings(std::sync::Arc::clone(&warnings)),
+            || (0..3).map(|_| fixture.context().load()).collect(),
+        );
+
+        for loaded in &loads {
+            let reported: Vec<&ConfigDiagnostic> = loaded
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.path == path)
+                .collect();
+            assert_eq!(reported.len(), 1, "{:?}", loaded.diagnostics);
+            let message = &reported.first().unwrap().message;
+            assert!(
+                message.starts_with(&format!(
+                    "Failed to load MCP config from {}",
+                    path.display()
+                )),
+                "{message}"
+            );
+        }
+        assert_eq!(
+            warnings.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "three loads of the same bad file log it once"
+        );
+    }
+
+    /// [CYRUP-DELTA] The setup panel's source summary says a file that exists and could not be used
+    /// is unreadable, and does not say it for a file that parsed or for a file that is not there.
+    #[test]
+    fn the_source_summary_marks_a_file_that_exists_and_cannot_be_used() {
+        let fixture = Fixture::new();
+        fixture.write(&fixture.user_path(), "{ not json");
+        fixture.write(
+            &fixture.shared_global(),
+            "{\"mcpServers\":{\"a\":{\"command\":\"x\"}}}",
+        );
+
+        let mut diagnostics = Vec::new();
+        let summaries = fixture.context().config_source_summaries(&mut diagnostics);
+        let by_path = |path: &Path| summaries.iter().find(|source| source.path == path).unwrap();
+
+        let broken = by_path(&fixture.user_path());
+        assert!(broken.exists && broken.unreadable && broken.server_count == 0);
+        let fine = by_path(&fixture.shared_global());
+        assert!(fine.exists && !fine.unreadable && fine.server_count == 1);
+        let absent = by_path(&fixture.cwd.join(PROJECT_CONFIG_NAME));
+        assert!(!absent.exists && !absent.unreadable);
     }
 
     #[test]

@@ -35,6 +35,10 @@ pub struct ToolInfo {
     /// The tool's namespace, when it has one (pi `ToolInfo.namespace`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub namespace: Option<ToolNamespace>,
+    /// The tool's annotations, when it has them (pi `ToolInfo.annotations`, `types.ts:2086`
+    /// @v1.0.4).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub annotations: Option<cyrup_core::ToolAnnotations>,
     /// The definition's `renderShell` (pi `ToolDefinition.renderShell?: "default" | "self"`,
     /// `extensions/types.ts:467` @v0.84.4), read off [`Tool::render_kind`] — what
     /// `ToolExecutionComponent.getRenderShell()` resolves from `session.getToolDefinition(name)`
@@ -245,10 +249,72 @@ impl PromptRebuilder {
     }
 }
 
+/// The session's `--tools` / `--exclude-tools` bounds (pi `_allowedTools` / `_excludedTools`,
+/// `agent-session.ts:490-495` @v1.0.4), resolved once at build time and carried by the registry
+/// that enforces them.
+///
+/// The bounds apply to the REGISTRY, not only to the initial selection: pi's
+/// `_refreshToolRegistry` drops a disallowed tool, built-in or not, before the registry exists
+/// (`agent-session.ts:3497-3536` @v1.0.4), so `setActiveToolsByName` can only enable a registered
+/// tool, and a tool the flags do not allow is neither declarable nor callable from another tool.
+/// [`DynamicToolState`] keeps that property by admitting a tool through [`Self::permits`] at every
+/// point a tool enters the registry: construction, [`DynamicToolState::register_custom`] and
+/// [`DynamicToolState::merge_registered`].
+///
+/// Entries are exact names or `*` patterns, and an allowlist that does not name MCP tools leaves
+/// them registered: see [`cyrup_core::is_allowed_tool`].
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ToolAccess {
+    allowed: Option<std::collections::HashSet<String>>,
+    excluded: std::collections::HashSet<String>,
+}
+
+impl ToolAccess {
+    pub(crate) fn new(
+        allowed: Option<std::collections::HashSet<String>>,
+        excluded: std::collections::HashSet<String>,
+    ) -> Self {
+        Self { allowed, excluded }
+    }
+
+    /// Whether the session's flags keep `tool` registered (pi `_isAllowedTool`).
+    pub(crate) fn permits(&self, tool: &dyn Tool) -> bool {
+        cyrup_core::is_allowed_tool(
+            self.allowed.as_ref(),
+            &self.excluded,
+            tool.name(),
+            tool.is_mcp_tool(),
+        )
+    }
+
+    /// Whether the allowlist, when there is one, names or matches `name`: what registering a tool
+    /// activates it by (`allowedTools(toolName)` in `_refreshToolRegistry`, `agent-session.ts`
+    /// @v1.0.4). An MCP tool that is only left registered is not named, and stays inactive.
+    fn names(&self, name: &str) -> bool {
+        self.allowed
+            .as_ref()
+            .is_none_or(|allowed| cyrup_core::tool_name_matches(allowed, name))
+    }
+
+    /// Whether `tool` may be active, which declares it to the model (pi `_isActivatable`,
+    /// `agent-session.ts` @v1.0.4). An MCP tool the allowlist keeps without naming is only for
+    /// `codemode` and `tool_search`: it may be declared only when `tool_search` can load it, which
+    /// needs an exposure other than `direct` and `tool_search` in the registry.
+    fn activatable(&self, tool: &dyn Tool, tool_search_registered: bool) -> bool {
+        if self.names(tool.name()) || !tool.is_mcp_tool() {
+            return true;
+        }
+        tool.exposure() != cyrup_core::ToolExposure::Direct && tool_search_registered
+    }
+}
+
 /// The mutable dynamic-tool surface (Pi `_toolRegistry`/`_toolDefinitions`/`_activeToolNames`).
 pub(crate) struct DynamicToolState {
-    /// All enable-able tools by name (built-ins after selection + extension/custom tools).
+    /// All enable-able tools by name (built-ins after selection + extension/custom tools). Holds
+    /// only tools [`Self::access`] permits.
     registry: BTreeMap<String, Arc<dyn Tool>>,
+    /// The `--tools` / `--exclude-tools` bounds every insertion into [`Self::registry`] honours.
+    access: ToolAccess,
     /// The resolved loadout of the currently-active names (Pi `agent.state.tools` plus
     /// `_hiddenDeclarations`): what the loop runs, and what a request may declare.
     loadout: ToolLoadout,
@@ -265,19 +331,47 @@ impl DynamicToolState {
         registry_tools: Vec<Arc<dyn Tool>>,
         active: Vec<Arc<dyn Tool>>,
         rebuilder: PromptRebuilder,
+        access: ToolAccess,
     ) -> Self {
         let registry: BTreeMap<String, Arc<dyn Tool>> = registry_tools
             .into_iter()
+            .filter(|t| access.permits(t.as_ref()))
             .map(|t| (t.name().to_string(), t))
             .collect();
-        let names: Vec<String> = active.iter().map(|t| t.name().to_string()).collect();
-        let loadout = ToolLoadout::resolve(&names, &registry.values().cloned().collect::<Vec<_>>());
+        let names: Vec<String> = active
+            .iter()
+            .filter(|t| access.permits(t.as_ref()))
+            .map(|t| t.name().to_string())
+            .collect();
+        let loadout = Self::resolve_loadout(&registry, &access, &names);
         Self {
             registry,
+            access,
             loadout,
             rebuilder,
             pending: BTreeSet::new(),
         }
+    }
+
+    /// [`ToolLoadout::resolve`] over `registry`, for the names that may be active (pi
+    /// `_applyToolLoadout`, which drops what `_isActivatable` refuses).
+    fn resolve_loadout(
+        registry: &BTreeMap<String, Arc<dyn Tool>>,
+        access: &ToolAccess,
+        names: &[String],
+    ) -> ToolLoadout {
+        let tool_search_registered = registry.contains_key("tool_search");
+        let names: Vec<String> = names
+            .iter()
+            .filter(|name| {
+                registry
+                    .get(name.as_str())
+                    .is_none_or(|tool| access.activatable(tool.as_ref(), tool_search_registered))
+            })
+            .cloned()
+            .collect();
+        let tools: Vec<Arc<dyn Tool>> = registry.values().cloned().collect();
+        ToolLoadout::resolve(&names, &tools)
     }
 
     /// Restore the loadout the transcript declares (pi `_restoreToolsFromTranscript`,
@@ -288,8 +382,21 @@ impl DynamicToolState {
     /// see [`is_allowed_tool`]). This is `_setActiveTools`, not `setActiveToolsByName`: replacing
     /// the loadout with the restored one must not drop the pending names it just recorded.
     pub(crate) fn restore_declared(&mut self, declared: &[String]) -> (ToolLoadout, BuiltPrompt) {
-        self.pending = declared.iter().cloned().collect();
-        self.activate(declared)
+        self.seed(declared, declared)
+    }
+
+    /// Start from `names` and keep `pending` waiting for a tool to register (pi `_setActiveTools`
+    /// over `initialActiveToolNames`, `agent-session.ts:3489-3578` @v1.0.4). The build-time form of
+    /// [`Self::restore_declared`], which is this with `pending == names`: the builder adds the
+    /// configured `defaultTools` names to a restored loadout, and the ones nothing has registered
+    /// yet wait, where the restored names all do.
+    pub(crate) fn seed(
+        &mut self,
+        names: &[String],
+        pending: &[String],
+    ) -> (ToolLoadout, BuiltPrompt) {
+        self.pending = pending.iter().cloned().collect();
+        self.activate(names)
     }
 
     /// Drop the restored names that have not registered (pi `_pendingToolNames.clear()`): at the
@@ -308,8 +415,7 @@ impl DynamicToolState {
     /// Pi `_setActiveTools` (`agent-session.ts:1495-1499` @v1.0.1): resolve `names`, retire the
     /// pending names that are now active, and rebuild the prompt.
     fn activate(&mut self, names: &[String]) -> (ToolLoadout, BuiltPrompt) {
-        let registry: Vec<Arc<dyn Tool>> = self.registry.values().cloned().collect();
-        self.loadout = ToolLoadout::resolve(names, &registry);
+        self.loadout = Self::resolve_loadout(&self.registry, &self.access, names);
         for tool in self.loadout.executable() {
             self.pending.remove(tool.name());
         }
@@ -399,6 +505,7 @@ impl DynamicToolState {
                 .any(|a| a.name() == t.name()),
             exposure: t.exposure(),
             namespace: t.namespace().cloned(),
+            annotations: t.annotations().copied(),
             render_kind: t.render_kind(),
         }
     }
@@ -430,7 +537,10 @@ impl DynamicToolState {
     /// registered here and then activated reached the model's tool array with no prompt guidance at
     /// all — the exact failure [`PromptRebuilder::upsert_contribution`]'s own doc describes.
     pub(crate) fn register_custom(&mut self, tools: Vec<Arc<dyn Tool>>) {
-        for t in tools {
+        for t in tools
+            .into_iter()
+            .filter(|t| self.access.permits(t.as_ref()))
+        {
             self.rebuilder.upsert_contribution(&t);
             self.registry.insert(t.name().to_string(), t);
         }
@@ -482,7 +592,10 @@ impl DynamicToolState {
             .map(|t| t.name().to_string())
             .collect();
         let mut registry_moved = false;
-        for t in tools {
+        for t in tools
+            .into_iter()
+            .filter(|t| self.access.permits(t.as_ref()))
+        {
             let name = t.name().to_string();
             self.rebuilder.upsert_contribution(&t);
             match self.registry.insert(name.clone(), t) {
@@ -519,14 +632,17 @@ impl DynamicToolState {
     }
 }
 
-/// pi `_isAllowedTool` (`agent-session.ts:1501-1503` @v1.0.1): inside the session's allowlist, when
-/// it has one, and outside its denylist.
+/// pi `_isAllowedTool` (`agent-session.ts` @v1.0.4) for a tool name alone, such as a name the
+/// transcript declared: inside the session's allowlist, when it has one, and outside its denylist,
+/// where an MCP tool the allowlist does not name stays (see [`cyrup_core::is_allowed_tool`]). A
+/// name says whether it is an MCP tool's only by pi's rule ([`cyrup_core::is_mcp_tool_name`]);
+/// [`ToolAccess::permits`] asks the tool.
 pub(crate) fn is_allowed_tool(
     allowed: Option<&std::collections::HashSet<String>>,
     excluded: &std::collections::HashSet<String>,
     name: &str,
 ) -> bool {
-    allowed.is_none_or(|allowed| allowed.contains(name)) && !excluded.contains(name)
+    cyrup_core::is_allowed_tool(allowed, excluded, name, cyrup_core::is_mcp_tool_name(name))
 }
 
 /// The active tool names a transcript declares (pi `_restoreToolsFromTranscript`'s read,
@@ -591,6 +707,7 @@ mod tests {
         params: Value,
         snippet: Option<String>,
         exposure: ToolExposure,
+        mcp: bool,
     }
 
     impl Fake {
@@ -601,7 +718,14 @@ mod tests {
                 params: json!({"type": "object", "properties": {}}),
                 snippet: None,
                 exposure: ToolExposure::Direct,
+                mcp: false,
             }
+        }
+
+        /// An MCP tool whatever its name says (an MCP extension's own `toolPrefix`).
+        fn mcp(mut self) -> Self {
+            self.mcp = true;
+            self
         }
 
         /// Registered but not activated by registration (`deferred`).
@@ -637,6 +761,9 @@ mod tests {
         fn exposure(&self) -> ToolExposure {
             self.exposure
         }
+        fn is_mcp_tool(&self) -> bool {
+            self.mcp || cyrup_core::is_mcp_tool_name(self.name)
+        }
         async fn execute(
             &self,
             _call_id: ToolCallId,
@@ -659,7 +786,7 @@ mod tests {
             cyrup_session::prompt::PromptInputs::default(),
             contributions,
         );
-        DynamicToolState::new(tools.clone(), tools, rebuilder)
+        DynamicToolState::new(tools.clone(), tools, rebuilder, ToolAccess::default())
     }
 
     /// A REPLACED tool definition must reach the agent.
@@ -904,6 +1031,219 @@ mod tests {
             "denied wins"
         );
         assert!(!is_allowed_tool(None, &denied, "b"));
+    }
+
+    /// A state over `tools` bounded by `allowed` / `excluded`, every tool offered as active — the
+    /// shape `builder.rs` hands over when the unfiltered built-ins are all that it has.
+    fn state_bounded(
+        tools: Vec<Arc<dyn Tool>>,
+        allowed: Option<&[&str]>,
+        excluded: &[&str],
+    ) -> DynamicToolState {
+        let contributions = tools
+            .iter()
+            .map(|t| (t.name().to_string(), crate::builder::tool_contribution(t)))
+            .collect();
+        let rebuilder = PromptRebuilder::new(
+            cyrup_session::prompt::PromptInputs::default(),
+            contributions,
+        );
+        let access = ToolAccess::new(
+            allowed.map(|names| names.iter().map(|n| (*n).to_string()).collect()),
+            excluded.iter().map(|n| (*n).to_string()).collect(),
+        );
+        DynamicToolState::new(tools.clone(), tools, rebuilder, access)
+    }
+
+    fn registered_names(st: &DynamicToolState) -> Vec<String> {
+        st.all().into_iter().map(|t| t.name).collect()
+    }
+
+    /// pi's `_refreshToolRegistry` drops a disallowed built-in before the registry exists
+    /// (`agent-session.ts:3497-3536` @v1.0.4): it is neither registered nor active, so
+    /// `setActiveToolsByName` over every name enables only the allowed ones.
+    #[test]
+    fn a_disallowed_tool_is_neither_registered_nor_activatable() {
+        let all = || {
+            vec![
+                Fake::new("read", "builtin").arc(),
+                Fake::new("bash", "builtin").arc(),
+                Fake::new("grep", "builtin").arc(),
+            ]
+        };
+        let mut st = state_bounded(all(), Some(&["read", "grep"]), &[]);
+        assert_eq!(registered_names(&st), ["grep", "read"]);
+        assert_eq!(st.active_names(), ["read", "grep"]);
+
+        let (loadout, _) = st.set_active(&strings(&["read", "bash", "grep"]));
+        let active: Vec<&str> = loadout.executable().iter().map(|t| t.name()).collect();
+        assert_eq!(active, ["read", "grep"], "naming `bash` activates nothing");
+
+        // The denylist bounds the registry the same way, and outranks the allowlist.
+        let st = state_bounded(all(), Some(&["read", "bash"]), &["bash"]);
+        assert_eq!(registered_names(&st), ["read"]);
+        let st = state_bounded(all(), None, &["bash"]);
+        assert_eq!(registered_names(&st), ["grep", "read"]);
+    }
+
+    /// An allowlist that names no MCP tool leaves them REGISTERED — a `codemode` script and
+    /// `tool_search` reach them — and does not activate them, whatever the caller offers as active
+    /// (`_isAllowedTool` and `_isActivatable`, `agent-session.ts` @v1.0.4). A tool is an MCP tool by
+    /// pi's name rule or because it says so.
+    #[test]
+    fn an_allowlist_leaves_mcp_tools_registered_and_inactive() {
+        let st = state_bounded(
+            vec![
+                Fake::new("read", "builtin").arc(),
+                Fake::new("bash", "builtin").arc(),
+                Fake::new("docs_find", "mcp").mcp().arc(),
+                Fake::new("mcp__docs__search", "mcp").deferred().arc(),
+            ],
+            Some(&["read"]),
+            &[],
+        );
+        assert_eq!(
+            registered_names(&st),
+            ["docs_find", "mcp__docs__search", "read"],
+            "`bash` is dropped, the MCP tools stay"
+        );
+        assert_eq!(
+            st.active_names(),
+            ["read"],
+            "kept without being named, so not declared; `mcp__docs__search` cannot be loaded without \
+             `tool_search`"
+        );
+    }
+
+    /// A `deferred` MCP tool the allowlist only keeps is declared once `tool_search` is registered
+    /// and can load it; a `direct` one never is (`_isActivatable`). Killing mutation:
+    /// `activatable` is always true.
+    #[test]
+    fn a_kept_mcp_tool_is_declarable_only_when_tool_search_can_load_it() {
+        let mut st = state_bounded(
+            vec![
+                Fake::new("read", "builtin").arc(),
+                Fake::new("tool_search", "search").arc(),
+                Fake::new("docs_find", "mcp").mcp().arc(),
+                Fake::new("mcp__docs__search", "mcp").deferred().arc(),
+            ],
+            Some(&["read", "tool_search"]),
+            &[],
+        );
+        let (loadout, _) = st.set_active(&strings(&[
+            "read",
+            "tool_search",
+            "docs_find",
+            "mcp__docs__search",
+        ]));
+        let active: Vec<&str> = loadout.executable().iter().map(|t| t.name()).collect();
+        assert_eq!(active, ["read", "tool_search", "mcp__docs__search"]);
+    }
+
+    /// An allowlist entry that matches an MCP tool names it: patterns work, and naming one makes
+    /// the list decide for the others.
+    #[test]
+    fn an_allowlist_pattern_names_mcp_tools() {
+        let tools = || {
+            vec![
+                Fake::new("read", "builtin").arc(),
+                Fake::new("mcp__docs__find", "mcp").arc(),
+                Fake::new("mcp__docs__search", "mcp").arc(),
+                Fake::new("mcp__web__fetch", "mcp").arc(),
+            ]
+        };
+        let st = state_bounded(tools(), Some(&["read", "mcp__docs__*"]), &[]);
+        assert_eq!(
+            registered_names(&st),
+            ["mcp__docs__find", "mcp__docs__search", "read"],
+            "an MCP entry makes the list decide for MCP tools"
+        );
+        assert_eq!(
+            st.active_names(),
+            ["read", "mcp__docs__find", "mcp__docs__search"]
+        );
+        // The denylist takes patterns and outranks the allowlist.
+        let st = state_bounded(tools(), Some(&["read", "mcp__docs__*"]), &["*__search"]);
+        assert_eq!(registered_names(&st), ["mcp__docs__find", "read"]);
+        // No allowlist at all: only the denylist applies.
+        let st = state_bounded(tools(), None, &["mcp__web__*"]);
+        assert_eq!(
+            registered_names(&st),
+            ["mcp__docs__find", "mcp__docs__search", "read"]
+        );
+    }
+
+    /// An MCP tool that registers once the session runs (its server just connected) is kept by an
+    /// allowlist that does not name it, and activates only when the allowlist does.
+    /// Killing mutation: `merge_registered` activates on registration whatever the allowlist says.
+    #[test]
+    fn a_late_mcp_tool_activates_only_when_the_allowlist_names_it() {
+        let late = || vec![Fake::new("mcp__docs__find", "late").arc()];
+
+        let mut st = state_bounded(
+            vec![Fake::new("read", "builtin").arc()],
+            Some(&["read"]),
+            &[],
+        );
+        let (loadout, _) = st.merge_registered(late()).expect("the registry moved");
+        let active: Vec<&str> = loadout.executable().iter().map(|t| t.name()).collect();
+        assert_eq!(active, ["read"], "registered, not declared");
+        assert!(registered_names(&st).contains(&"mcp__docs__find".to_string()));
+
+        let mut st = state_bounded(
+            vec![Fake::new("read", "builtin").arc()],
+            Some(&["read", "mcp__docs__*"]),
+            &[],
+        );
+        let (loadout, _) = st.merge_registered(late()).expect("the registry moved");
+        let active: Vec<&str> = loadout.executable().iter().map(|t| t.name()).collect();
+        assert_eq!(active, ["read", "mcp__docs__find"]);
+    }
+
+    /// A tool registered after the build (`register_custom_tools`) is held to the same bounds.
+    #[test]
+    fn register_custom_skips_a_disallowed_tool() {
+        let mut st = state_bounded(
+            vec![Fake::new("read", "builtin").arc()],
+            Some(&["read", "deploy"]),
+            &["audit"],
+        );
+        st.register_custom(vec![
+            Fake::new("deploy", "custom").arc(),
+            Fake::new("audit", "custom").arc(),
+            Fake::new("unlisted", "custom").arc(),
+        ]);
+        assert_eq!(registered_names(&st), ["deploy", "read"]);
+    }
+
+    /// A tool an extension registers mid-session (`merge_registered`) is held to the same bounds,
+    /// and does not activate when the bounds refuse it.
+    #[test]
+    fn merge_registered_skips_a_disallowed_tool() {
+        let mut st = state_bounded(
+            vec![Fake::new("read", "builtin").arc()],
+            Some(&["read", "dynamic"]),
+            &[],
+        );
+        let moved = st.merge_registered(vec![
+            Fake::new("dynamic", "late").arc(),
+            Fake::new("bash", "late override").arc(),
+        ]);
+        let (loadout, _) = moved.expect("the allowed tool moved the registry");
+        let active: Vec<&str> = loadout.executable().iter().map(|t| t.name()).collect();
+        assert_eq!(active, ["read", "dynamic"]);
+        assert_eq!(registered_names(&st), ["dynamic", "read"]);
+
+        let mut st = state_bounded(
+            vec![Fake::new("read", "builtin").arc()],
+            Some(&["read"]),
+            &[],
+        );
+        assert!(
+            st.merge_registered(vec![Fake::new("bash", "late").arc()])
+                .is_none(),
+            "a refused tool does not move the registry"
+        );
     }
 
     /// pi `_restoreToolsFromTranscript`'s read (`:1763-1766`): the replayed tool names, or nothing

@@ -3,7 +3,7 @@
 use super::events::decode_codex_stream;
 use super::headers::{build_sse_headers, extract_account_id};
 use super::options::OpenAiCodexResponsesOptions;
-use super::request::build_request_body;
+use super::request::{build_request_body, supports_openai_grammar_tools};
 use super::retry::{
     backoff_delay_ms, get_retry_after_delay_ms, is_retryable_error, parse_error_response,
     validate_retry_delay_ms,
@@ -18,6 +18,7 @@ use crate::error::ProviderError;
 use crate::model::Model;
 use crate::stream::StreamOptions;
 use crate::stream::sse::{SseRequest, build_client_for_target, open_sse};
+use crate::utils::constrained_sampling::grammar_tool_input_properties;
 use crate::utils::provider_plumbing::now_millis;
 use crate::utils::provider_retry::ProviderRetry;
 use cyrup_core::{ApiId, CancelToken};
@@ -65,14 +66,20 @@ impl ApiImpl for CodexResponsesApi {
 
         let codex_opts = OpenAiCodexResponsesOptions::from_stream_options(opts);
         // PROV-011: an unsatisfiable `constrainedSampling` fails the turn before any HTTP.
-        let params =
-            match build_request_body(model, ctx, opts, &codex_opts, codex_session_id.as_deref()) {
-                Ok(p) => p,
-                Err(e) => {
-                    sink.send(error_event(model, &self.api, e.0, false)).await;
-                    return;
-                }
-            };
+        // PROV-101: the same resolution yields the grammar tools whose `custom_tool_call`s the
+        // decoder below must read.
+        let built = grammar_tool_input_properties(ctx, supports_openai_grammar_tools(model))
+            .and_then(|inputs| {
+                build_request_body(model, ctx, opts, &codex_opts, codex_session_id.as_deref())
+                    .map(|params| (params, inputs))
+            });
+        let (params, grammar_inputs) = match built {
+            Ok(p) => p,
+            Err(e) => {
+                sink.send(error_event(model, &self.api, e.0, false)).await;
+                return;
+            }
+        };
         // gap-08 #2: `before_provider_request` may inspect/replace the outbound body (pi
         // `options?.onPayload?.(body, model)`, :284-287).
         let body = crate::stream::apply_on_payload(opts, model, params).await;
@@ -286,6 +293,7 @@ impl ApiImpl for CodexResponsesApi {
         decode_codex_stream(
             frames,
             codex_opts.service_tier.clone(),
+            grammar_inputs,
             model,
             &self.api,
             &sink,

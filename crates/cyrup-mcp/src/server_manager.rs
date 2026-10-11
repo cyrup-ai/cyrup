@@ -88,7 +88,8 @@ use crate::config::ServerEntry;
 use crate::errors::{McpError, McpResult};
 use crate::lifecycle::{ConnectionHandle, ConnectionStatus, ServerConnectionRef};
 use crate::runtime::{
-    append_stderr_tail, build_request_options, normalize_request_timeout_ms, stderr_tail_detail,
+    DEFAULT_REQUEST_TIMEOUT, append_stderr_tail, build_request_options,
+    normalize_request_timeout_ms, stderr_tail_detail,
 };
 
 // =================================================================================================
@@ -1275,8 +1276,20 @@ pub struct CreateConnection {
     pub credentials_invalidated: bool,
     /// `buildRequestOptions(definition, requestSignal)`'s timeout half. Computed **once**, before
     /// any transport is built, and reused for the connect and all three discovery list calls
-    /// (§3.2).
-    pub request_options: Option<PeerRequestOptions>,
+    /// (§3.2). Its timeout is always set — see [`Self::request_timeout`].
+    pub request_options: PeerRequestOptions,
+}
+
+impl CreateConnection {
+    /// The budget the connect and each discovery list run under: the resolved `requestTimeoutMs`,
+    /// or the SDK's [`DEFAULT_REQUEST_TIMEOUT`] when options carry none. There is no unbounded arm:
+    /// upstream's `undefined` is the SDK default, never "wait for ever".
+    #[must_use]
+    pub fn request_timeout(&self) -> Duration {
+        self.request_options
+            .timeout
+            .unwrap_or(DEFAULT_REQUEST_TIMEOUT)
+    }
 }
 
 /// What `Promise.all([fetchAllTools, fetchAllResources, fetchAllPrompts])` produced, plus the
@@ -1431,6 +1444,14 @@ impl ConnectionFactory for UnbuiltConnectionFactory {
 /// `connectPromises` / `reconnectPromises` — a connect attempt, shared by every racing caller.
 type ConnectFuture = Shared<BoxFuture<'static, ManagerResult<Arc<ServerConnection>>>>;
 
+/// One attempt's "its detached tail has finished" signal; see [`Tables::connect_tails`].
+struct ConnectTail {
+    /// The attempt this belongs to, for the identity-matched removal in [`AttemptSlot`]'s `Drop`.
+    attempt: Arc<AbortHandle>,
+    /// Resolves, as an error, when the tail's sender is dropped.
+    finished: tokio::sync::watch::Receiver<()>,
+}
+
 /// `closePromises` — one teardown, shared by every racing caller.
 type CloseFuture = Shared<BoxFuture<'static, ManagerResult<()>>>;
 
@@ -1471,6 +1492,19 @@ struct Tables {
     close_generations: HashMap<String, u64>,
     /// `connectAttempts` — guard 2.
     connect_attempts: HashMap<String, Arc<AbortHandle>>,
+    /// The attempt's "winner's tail has finished" signal, beside [`Self::connect_promises`].
+    ///
+    /// Upstream has no counterpart and needs none: its deduped callers and its winner wait on the
+    /// same promise, and a promise runs its earlier-registered continuation — the winner's, which
+    /// ends in `this.connections.set` — before a later-registered one. Here the winner's body is a
+    /// detached task (see [`McpServerManager::connect`]), so a deduped caller can be woken, return,
+    /// and read [`McpServerManager::get_connection`] before that task has run. MEASURED: five calls
+    /// batched at a cold `lazy` server, and three of them answered `Server "x" is not connected`.
+    ///
+    /// The value is the attempt it belongs to (the same identity-match as `connect_attempts`) and a
+    /// receiver that resolves — as an error, because nothing is ever sent — when the tail's sender
+    /// drops, which is after the registration and after the slot has cleared.
+    connect_tails: HashMap<String, ConnectTail>,
     /// `acceptedUrlElicitations`.
     ///
     /// Written by [`McpServerManager::remember_url_elicitation`] from
@@ -1825,14 +1859,15 @@ impl McpServerManager {
     /// `getRequestOptions(name, signal)` (`server-manager.ts:228-231`).
     ///
     /// Delegates to [`crate::runtime::build_request_options`], which owns the per-server-wins rule
-    /// and its trap (an invalid per-server `requestTimeoutMs` yields *no* timeout rather than
+    /// and its trap (an invalid per-server `requestTimeoutMs` yields the SDK default rather than
     /// falling back to the global). MEASURED end to end against upstream: unknown server + global
-    /// `1234` → `{timeout: 1234}`; per-server `0` + global `1234` → `undefined`.
+    /// `1234` → `{timeout: 1234}`; per-server `0` + global `1234` → `undefined`, which the SDK runs
+    /// under its 60 s default — so here the answer is that default, not an absent timeout.
     ///
     /// The `signal` half of upstream's `RequestOptions` has no representation — rmcp cancels a
     /// request by dropping its future — so it stays in the `abortable(..)` wrapper around each call.
     #[must_use]
-    pub fn get_request_options(&self, name: &str) -> Option<PeerRequestOptions> {
+    pub fn get_request_options(&self, name: &str) -> PeerRequestOptions {
         let definition = self
             .tables()
             .connections
@@ -1963,6 +1998,13 @@ impl Drop for AttemptSlot {
                 .is_some_and(|current| Arc::ptr_eq(current, &self.attempt))
             {
                 tables.connect_attempts.remove(&self.name);
+            }
+            if tables
+                .connect_tails
+                .get(&self.name)
+                .is_some_and(|current| Arc::ptr_eq(&current.attempt, &self.attempt))
+            {
+                tables.connect_tails.remove(&self.name);
             }
         }
         // Outside the guard, and last: `abort.rs:21-26`'s discipline is that a combination costs
@@ -2173,14 +2215,17 @@ impl McpServerManager {
 
         /// What the one critical section below decided.
         enum Step {
-            /// `connectPromises.has(name)` — dedupe onto the in-flight attempt.
-            Dedupe(ConnectFuture),
+            /// `connectPromises.has(name)` — dedupe onto the in-flight attempt, and the signal
+            /// that the winner's tail has registered what the attempt produced.
+            Dedupe(ConnectFuture, Option<tokio::sync::watch::Receiver<()>>),
             /// A `connected` record is already in the map.
             Reuse(Arc<ServerConnection>),
             /// This caller won: it owns the attempt that was just registered.
             Start {
                 promise: ConnectFuture,
                 generation: u64,
+                /// Dropped when the tail ends; see [`Tables::connect_tails`].
+                finished: tokio::sync::watch::Sender<()>,
             },
         }
 
@@ -2196,7 +2241,11 @@ impl McpServerManager {
         let step = {
             let mut tables = self.tables();
             if let Some(pending) = tables.connect_promises.get(name).cloned() {
-                Step::Dedupe(pending)
+                let finished = tables
+                    .connect_tails
+                    .get(name)
+                    .map(|tail| tail.finished.clone());
+                Step::Dedupe(pending, finished)
             } else if let Some(existing) = tables
                 .connections
                 .get(name)
@@ -2246,25 +2295,53 @@ impl McpServerManager {
                 tables
                     .connect_attempts
                     .insert(name.to_string(), Arc::clone(&attempt));
+                let (finished, receiver) = tokio::sync::watch::channel(());
+                tables.connect_tails.insert(
+                    name.to_string(),
+                    ConnectTail {
+                        attempt: Arc::clone(&attempt),
+                        finished: receiver,
+                    },
+                );
                 Step::Start {
                     promise,
                     generation,
+                    finished,
                 }
             }
         };
 
-        let (promise, generation) = match step {
+        let (promise, generation, finished) = match step {
             // `if (this.connectPromises.has(name)) return abortable(this.connectPromises.get(name)!, …)`.
             //
             // Note what a deduped caller receives: the **raw attempt**, not the winner's body's
             // result. It therefore skips the generation fence and the `connections.set` below —
             // upstream's shape, reproduced deliberately. What makes that safe is that the winner's
             // body always runs; see the detached tail below.
-            Step::Dedupe(pending) => {
+            //
+            // It does wait for that body to have run. Upstream's winner and its deduped callers are
+            // continuations of one promise, and the winner's — registered first — runs first, so a
+            // caller that returns finds the connection in the map. The tail here is a task of its
+            // own, so without the wait a caller could return, ask [`Self::get_connection`] and be
+            // told the server it was just handed a connection to is not connected.
+            Step::Dedupe(pending, finished) => {
                 // This caller's attempt was never registered, so nothing will ever fire its
                 // handle — reap `attempt_signal`'s joiner here or it parks until session end.
                 attempt.reap();
-                return Self::race(pending, &owned).await;
+                let connection = Self::race(pending, &owned).await?;
+                if let Some(mut finished) = finished {
+                    // `changed()` resolves, as an error, when the tail's sender drops; nothing is
+                    // ever sent through it.
+                    Self::race(
+                        async move {
+                            let _ = finished.changed().await;
+                            Ok(())
+                        },
+                        &owned,
+                    )
+                    .await?;
+                }
+                return Ok(connection);
             }
             Step::Reuse(existing) => {
                 attempt.reap();
@@ -2274,7 +2351,8 @@ impl McpServerManager {
             Step::Start {
                 promise,
                 generation,
-            } => (promise, generation),
+                finished,
+            } => (promise, generation, finished),
         };
 
         // ── the winner's body, detached ───────────────────────────────────────────────────────
@@ -2299,6 +2377,9 @@ impl McpServerManager {
             let promise = promise.clone();
             let owned_scope = Arc::clone(&owned_scope);
             async move {
+                // Declared first, so it drops last: after the registration below and after the
+                // slot has cleared. A deduped caller is waiting on it; see [`Tables::connect_tails`].
+                let _finished = finished;
                 let _owned_scope = owned_scope;
                 // The `finally`. Held for the rest of the tail; see `AttemptSlot`.
                 let _slot = AttemptSlot {
@@ -3819,6 +3900,59 @@ mod tests {
         assert!(!manager.is_connecting("s"), "the `finally` clears the slot");
     }
 
+    /// **A deduped caller finds the connection registered when its `connect` returns.**
+    ///
+    /// Upstream's winner and its deduped callers are continuations of one promise, and the winner's
+    /// (registered first) ends in `this.connections.set`, so by the time a deduped caller runs the
+    /// connection is in the map. Here the winner's body is a task of its own, and a caller woken
+    /// ahead of it returned a connection that [`McpServerManager::get_connection`] then denied
+    /// existed. MEASURED through the real binary: five `tools/call`s batched at a cold `lazy`
+    /// server, and three of them answered `Server "fx" is not connected` — the batch is the case
+    /// where every call after the first is a deduped caller.
+    ///
+    /// A single-threaded runtime makes the order deterministic, and the callers are spawned in the
+    /// same breath as the winner so that they poll the shared attempt **before** the winner's tail
+    /// task has had its first poll: a `Shared` future wakes its pollers in the order they first
+    /// polled it, so the callers are woken ahead of the tail when the attempt resolves.
+    #[tokio::test]
+    async fn a_deduped_connect_returns_only_after_the_connection_is_registered() {
+        let gate = Gate::shut();
+        let factory = ScriptedFactory::new(Script::Connect, Some(gate.clone()));
+        let manager = manager(Arc::clone(&factory) as Arc<dyn ConnectionFactory>);
+
+        let winner = tokio::spawn({
+            let manager = Arc::clone(&manager);
+            async move { manager.connect("s", &entry(), None).await }
+        });
+        let followers: Vec<_> = (0..5)
+            .map(|_| {
+                let manager = Arc::clone(&manager);
+                tokio::spawn(async move {
+                    let connection = manager.connect("s", &entry(), None).await.unwrap();
+                    // Read in the same poll that `connect` returned in, the way
+                    // `with_session_recovery` does.
+                    (connection, manager.get_connection("s"))
+                })
+            })
+            .collect();
+        settle().await;
+        assert_eq!(
+            factory.call_count(),
+            1,
+            "the callers deduped onto the first attempt"
+        );
+        gate.open();
+
+        let winner = winner.await.unwrap().unwrap();
+        for follower in followers {
+            let (connection, registered) = follower.await.unwrap();
+            let registered =
+                registered.expect("the connection is in the map when a deduped `connect` returns");
+            assert!(Arc::ptr_eq(&registered, &connection));
+            assert!(Arc::ptr_eq(&connection, &winner));
+        }
+    }
+
     /// **BLOCKER regression: `connect`'s single-flight must be one critical section.**
     ///
     /// The dedupe read and the matching insert used to live in two different `MutexGuard`s sixty
@@ -5003,22 +5137,27 @@ mod tests {
 
     // ── request options (§3.13) ─────────────────────────────────────────────────────────────
 
-    /// MEASURED upstream: `0` and `-5` normalise away; `1234` survives; a per-server `0` beats a
-    /// valid global and yields **no** timeout.
+    /// MEASURED upstream: `0` and `-5` normalise away to `undefined`, which the SDK runs under its
+    /// 60 s default; `1234` survives; a per-server `0` beats a valid global and yields that default
+    /// too, not the global.
     #[tokio::test]
     async fn the_default_request_timeout_normalises_on_the_way_in() {
         let factory = ScriptedFactory::new(Script::Connect, None);
         let manager = manager(factory as Arc<dyn ConnectionFactory>);
 
         manager.set_default_request_timeout_ms(Some(0.0));
-        assert!(manager.get_request_options("nope").is_none());
+        assert_eq!(
+            manager.get_request_options("nope").timeout,
+            Some(DEFAULT_REQUEST_TIMEOUT)
+        );
         manager.set_default_request_timeout_ms(Some(-5.0));
-        assert!(manager.get_request_options("nope").is_none());
+        assert_eq!(
+            manager.get_request_options("nope").timeout,
+            Some(DEFAULT_REQUEST_TIMEOUT)
+        );
         manager.set_default_request_timeout_ms(Some(1234.0));
         assert_eq!(
-            manager
-                .get_request_options("nope")
-                .and_then(|options| options.timeout),
+            manager.get_request_options("nope").timeout,
             Some(Duration::from_millis(1234))
         );
 
@@ -5033,9 +5172,33 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(
-            manager.get_request_options("s").is_none(),
-            "an invalid per-server value yields no timeout; it does NOT fall back to the global"
+        assert_eq!(
+            manager.get_request_options("s").timeout,
+            Some(DEFAULT_REQUEST_TIMEOUT),
+            "an invalid per-server value yields the SDK default; it does NOT fall back to the global"
+        );
+    }
+
+    /// The budget the connect and the three discovery lists run under is the options' timeout, or
+    /// the SDK's 60 s when the options carry none — there is no unbounded arm.
+    #[test]
+    fn a_connect_with_no_timeout_in_its_options_runs_under_the_sdk_default() {
+        let request = |request_options| CreateConnection {
+            name: "s".to_string(),
+            definition: Arc::new(entry()),
+            trace: None,
+            attempt: CancelToken::new(),
+            request: CancelToken::new(),
+            credentials_invalidated: false,
+            request_options,
+        };
+        assert_eq!(
+            request(PeerRequestOptions::no_options()).request_timeout(),
+            DEFAULT_REQUEST_TIMEOUT
+        );
+        assert_eq!(
+            request(PeerRequestOptions::with_timeout(Duration::from_millis(250))).request_timeout(),
+            Duration::from_millis(250)
         );
     }
 

@@ -493,10 +493,11 @@ async fn agent015_022_blocked_terminate_survives_an_abort_that_leaves_a_slot_unp
 fn empty_state() -> StateInner {
     StateInner {
         system_prompt: String::new(),
+        shared_system_prompt: None,
         model: Some(model_ref()),
         thinking_level: ModelThinkingLevel::Off,
         tools: cyrup_core::ToolLoadout::empty(),
-        messages: Vec::new(),
+        messages: Vec::new().into(),
         streaming_message: None,
         pending_tool_calls: std::collections::HashSet::new(),
         error_message: None,

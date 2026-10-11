@@ -257,7 +257,11 @@ async fn nothing_queued_during_the_stall_is_lost_at_shutdown() {
         r#"{"type":"get_state","id":"2"}"#,
         "\n",
     );
-    let reader = std::io::Cursor::new(input.as_bytes().to_vec());
+    // The client keeps its input open until the run is over: closing it aborts a run in flight
+    // (SEAM-154), and what is queued here is meant to be a whole run's output.
+    let (mut client, server) = tokio::io::duplex(64 * 1024);
+    client.write_all(input.as_bytes()).await.unwrap();
+    let reader = BufReader::new(server);
 
     let host = {
         let rt = Arc::clone(&rt);
@@ -277,8 +281,14 @@ async fn nothing_queued_during_the_stall_is_lost_at_shutdown() {
         gate.bytes().is_empty(),
         "a stalled peer has received nothing yet"
     );
+    let session = rt.session().await;
+    assert!(
+        within(Duration::from_secs(20), || !session.is_run_active()).await,
+        "the run finishes while the peer is stalled"
+    );
 
     gate.open();
+    drop(client);
     tokio::time::timeout(Duration::from_secs(30), host)
         .await
         .expect("run_rpc returns after the peer drains")

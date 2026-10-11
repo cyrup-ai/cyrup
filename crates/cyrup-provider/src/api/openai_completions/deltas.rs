@@ -5,7 +5,8 @@ use super::decode::REASONING_FIELDS;
 use crate::api::EventSink;
 use crate::model::Model;
 use crate::stream::StreamEvent;
-use cyrup_core::{ApiId, SharedStr};
+use crate::utils::constrained_sampling::CustomToolInput;
+use cyrup_core::{ApiId, SharedStr, StopReason};
 use serde_json::Value;
 
 /// Ensure a text block exists, emitting `TextStart` on first appearance. Returns its index, or
@@ -67,6 +68,12 @@ pub(super) async fn ensure_thinking_block(
 }
 
 /// Apply one `tool_calls[]` delta fragment, assembling id/name/arguments across chunks.
+///
+/// A fragment with a `custom` member and no `function` member is a grammar-constrained call
+/// (PROV-101, pi `ensureToolCallBlock` / the `tool_calls` loop, `openai-completions.ts:493-540`,
+/// `:644-668` @v1.0.4): its `custom.input` is raw text, stored under the tool's grammar property
+/// (pi's `"input"` fallback for a tool the request never declared) and streamed as append-only
+/// JSON deltas.
 pub(super) async fn process_tool_call_delta(
     tc: &Value,
     dec: &mut Decoder,
@@ -79,16 +86,22 @@ pub(super) async fn process_tool_call_delta(
         .get("id")
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty());
-    let name = tc
-        .get("function")
+    let function = tc.get("function").filter(|f| !f.is_null());
+    let custom = tc.get("custom").filter(|c| !c.is_null());
+    let name = function
         .and_then(|f| f.get("name"))
         .and_then(Value::as_str)
+        .or_else(|| custom.and_then(|c| c.get("name")).and_then(Value::as_str))
         .filter(|s| !s.is_empty());
-    let args_fragment = tc
-        .get("function")
+    let args_fragment = function
         .and_then(|f| f.get("arguments"))
         .and_then(Value::as_str)
         .unwrap_or("");
+    let custom_fragment = custom
+        .and_then(|c| c.get("input"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let is_custom = custom.is_some() && function.is_none();
 
     // Locate the block: by stream index first, then by id.
     let existing = stream_index
@@ -99,11 +112,20 @@ pub(super) async fn process_tool_call_delta(
         Some(idx) => idx,
         None => {
             let idx = dec.blocks.len();
+            let custom_input = is_custom.then(|| {
+                let property = name
+                    .and_then(|n| dec.grammar_inputs.get(n))
+                    .map_or("input", String::as_str);
+                CustomToolInput::new(property, "")
+            });
             dec.push_block(Block::Tool {
                 id: id.unwrap_or("").to_string(),
                 name: name.unwrap_or("").to_string(),
-                args: SharedStr::new(),
+                args: custom_input
+                    .as_ref()
+                    .map_or_else(SharedStr::new, |c| c.open_json().as_str().into()),
                 thought_signature: None,
+                custom: custom_input,
             });
             if let Some(si) = stream_index {
                 dec.tool_by_stream.insert(si, idx);
@@ -125,10 +147,32 @@ pub(super) async fn process_tool_call_delta(
         }
     };
 
+    // A block that opened as a plain function call and now receives a `custom` fragment becomes a
+    // custom call (pi `:539-548`): its name is known by now, which is what picks the property.
+    let upgraded = match dec.blocks.get(idx) {
+        Some(Block::Tool {
+            name: bname,
+            custom: None,
+            ..
+        }) if is_custom => {
+            let known = if bname.is_empty() {
+                name.unwrap_or("")
+            } else {
+                bname.as_str()
+            };
+            let property = dec
+                .grammar_inputs
+                .get(known)
+                .map_or("input", String::as_str);
+            Some(CustomToolInput::new(property, ""))
+        }
+        _ => None,
+    };
     if let Some(Block::Tool {
         id: bid,
         name: bname,
         args,
+        custom: block_custom,
         ..
     }) = dec.block_mut(idx)
     {
@@ -142,7 +186,11 @@ pub(super) async fn process_tool_call_delta(
         {
             *bname = n.to_string();
         }
-        if !args_fragment.is_empty() {
+        if let Some(upgraded) = upgraded {
+            *args = upgraded.open_json().as_str().into();
+            *block_custom = Some(upgraded);
+        }
+        if block_custom.is_none() && !args_fragment.is_empty() {
             // O(delta): the append is amortised and no parse happens here at all — see
             // [`SharedStr`] and [`LazyArgs`](cyrup_core::LazyArgs) (PERF-001).
             args.push_str(args_fragment);
@@ -153,10 +201,33 @@ pub(super) async fn process_tool_call_delta(
         dec.tool_by_id.entry(i.to_string()).or_insert(idx);
     }
 
+    let delta = if dec.custom_input(idx).is_some() {
+        // `else if (toolCall.custom?.input)`: nothing to append for an empty fragment, but the
+        // event is still pushed (pi `:661-667`), with an empty delta.
+        if custom_fragment.is_empty() {
+            String::new()
+        } else {
+            let next = format!(
+                "{}{custom_fragment}",
+                dec.custom_input(idx).unwrap_or_default()
+            );
+            match dec.append_custom_input(idx, &next, false) {
+                Ok(delta) => delta.unwrap_or_default(),
+                Err(e) => {
+                    dec.stop_reason = Some(StopReason::Error);
+                    dec.error_message = Some(e.0);
+                    String::new()
+                }
+            }
+        }
+    } else {
+        args_fragment.to_string()
+    };
+
     let partial = dec.snapshot(model, api);
     sink.send(StreamEvent::ToolCallDelta {
         content_index: idx,
-        delta: args_fragment.to_string(),
+        delta,
         partial,
     })
     .await

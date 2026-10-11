@@ -6,7 +6,7 @@ front of a tool call: project trust and the permission system.
 
 ## The built-in tools
 
-Seven tools ship in the binary.
+Eight tools ship in the binary.
 
 | Tool | What it does |
 |---|---|
@@ -14,6 +14,7 @@ Seven tools ship in the binary.
 | `write` | Write a file, creating parent directories and overwriting what is there. |
 | `edit` | Replace exact text in one file. One call carries a list of edits, each matching a unique, non-overlapping region of the original. |
 | `bash` | Run a shell command in the working directory and return stdout and stderr. |
+| `powershell` | Run a PowerShell command. Registered on every platform, off by default. |
 | `grep` | Search file contents for a regex or literal. Respects `.gitignore`. |
 | `find` | Find files by glob pattern. Respects `.gitignore`. |
 | `ls` | List a directory, dotfiles included, directories suffixed with `/`. |
@@ -22,8 +23,23 @@ Every tool truncates its output — `read` and `bash` at 2000 lines or 50KB, `gr
 `find` at 1000 results, `ls` at 500 entries, all capped at 50KB. When `bash` output is truncated the
 full text is written to a temp file and the path is reported.
 
-**Only four are active by default:** `read`, `bash`, `edit`, and `write`. `grep`, `find` and `ls` are
-registered but off, so the model reaches for `bash` to search unless you turn them on with `--tools`.
+`read` takes a whole file into memory before it cuts a window out of it, so it refuses what it cannot
+hold: a file over 512 MiB (`File size (<bytes>) is greater than the 512.0MB limit for read`; over
+2 GiB the message is Node's `File size (<bytes>) is greater than 2 GiB`), and anything that is not a
+regular file, such as a device (`/dev/zero`), a pipe or a socket. Use `bash` (`head`, `tail`,
+`sed -n`, `grep`) to look at part of a file that large.
+
+**Only four are active by default:** `read`, `bash`, `edit`, and `write`. `grep`, `find`, `ls` and
+`powershell` are registered but off, so the model reaches for `bash` to search unless you turn them on with `--tools`.
+
+Two more tools come from built-in extensions and start off as well. `codemode` lets the model write
+one JavaScript script that calls the other tools, in parallel if it likes, and only the script's
+output comes back to it. `tool_search` finds tools that are not declared to the model yet and
+declares the matches. Turn `codemode` on with `"defaultTools": ["+codemode"]` in `settings.json`, or
+for one run with `--tools read,bash,edit,write,codemode`; see [Codemode](codemode.md). None of this
+holds once [the permission system](#the-permission-system) is armed: then the policy decides which
+tools are active, and every tool it does not deny is, `grep`, `find`, `ls`, `powershell`, `codemode`
+and `tool_search` included.
 
 Two details that matter if you read session files or debug a provider rejection:
 
@@ -45,21 +61,29 @@ alike.
 | `--tools <names>` | `-t` | Allowlist. Only the named tools are active. |
 | `--exclude-tools <names>` | `-xt` | Denylist. The named tools are removed. |
 | `--no-tools` | `-nt` | Start with nothing active. |
-| `--no-builtin-tools` | `-nbt` | Drop the four default built-ins. |
+| `--no-builtin-tools` | `-nbt` | Turn off every built-in tool; extension and custom tools stay. |
 
 Names are comma-separated and trimmed, so `--tools "read, grep"` works. An explicit `--tools`
 allowlist wins over `--no-tools` and `--no-builtin-tools`, and `--exclude-tools` is applied on top
 of whatever survives, so a name in both lists is removed.
 
+`--tools`, `--exclude-tools` and `--no-tools` bound what is registered, not only what starts active.
+A built-in the flags do not allow cannot be switched back on later by an extension, by the
+permission system or by `setActiveTools`, and a `codemode` script cannot call it: `tools.bash` does
+not exist in a session started with `--tools read,grep,codemode`. (`--no-builtin-tools` only changes
+the starting set, so the built-ins stay switchable, and an armed permission system switches them back
+on.)
+
 **Repeating a flag replaces it — it does not add to it.** `--tools read --tools bash` gives you
 `bash` alone; write `--tools read,bash` for both. The same last-one-wins rule applies to
 `--exclude-tools` and to `--models`.
 
-`--no-builtin-tools` drops exactly the four tools that are on by default — `read`, `bash`, `edit`,
-`write` — and leaves extension and custom tools alone. Note what that does *not* cover: `grep`,
-`find` and `ls` are not in the default set, so the flag does not remove them and they come out
-active. A run with `-nbt` is a read-only search session, not an empty one. For empty, use
-`--no-tools`.
+`--no-builtin-tools` turns off every built-in tool: the four that are on by default and `grep`, `find`,
+`ls` and `powershell`, which are registered but off. It leaves extension and custom tools alone, such
+as the `mcp` gateway tool, and it does not switch on `codemode`, which starts off. A run with `-nbt`
+therefore has no file or shell tool of its own; for no tools at all, use `--no-tools`. The built-ins
+stay registered, so something that activates tools by name, an extension for one, can still turn one on;
+the permission system does when a policy is armed.
 
 The read-only review session:
 
@@ -74,7 +98,9 @@ not on by default.
 ## Project trust
 
 Trust is the first gate, and it runs before the model is even asked anything. A project you have not
-trusted contributes no configuration to the session.
+trusted contributes no configuration to the session, with one exception that only restricts: its
+permission policy is still read, and can add denies and asks but no `allow` (see
+[the four layers](../extensions/permissions.md#the-four-layers)).
 
 ### What triggers the prompt
 
@@ -83,6 +109,9 @@ cyrup asks about a folder when it finds anything a project could use to change c
 - `.cyrup/settings.json`
 - `.cyrup/extensions`, `.cyrup/skills`, `.cyrup/prompts`, `.cyrup/themes`
 - `.cyrup/SYSTEM.md` or `.cyrup/APPEND_SYSTEM.md`
+- `.cyrup/agent/cyrup-permissions.jsonc` or a `.cyrup/agent/agents` directory, the project's
+  [permission policy](../extensions/permissions.md#the-four-layers) (not counted in your home
+  directory, where that path is your own global policy)
 - an `.agents/skills` directory in the repository or any ancestor of it
 
 A repository with none of those is trusted implicitly — there is nothing to decide.
@@ -92,7 +121,10 @@ A repository with none of those is trusted implicitly — there is nothing to de
 Untrusted, cyrup still loads your global configuration, your global extensions, and anything you
 passed on the command line with `-e`. What it will not load is project settings, project context
 files, project extensions, and project packages. An untrusted `.cyrup/settings.json` is not read at
-all, and writes to it are refused.
+all, and writes to it are refused. The project's permission policy is the exception: it is read
+untrusted too, because ignoring a repository's `deny` would help no one, but only its `deny` and `ask`
+rules count. Its `allow` rules, and a `defaultPolicy` of `allow`, are dropped until you trust the
+project, so a repository cannot approve its own tool calls for you.
 
 You are told. In the terminal interface an untrusted project prints a warning-coloured banner after
 the initial replay:
@@ -166,8 +198,22 @@ so does any of these, in the agent directory or in `.cyrup/agent/` in the reposi
 - a `cyrup-permission-system/config.json` whose contents differ from the template cyrup writes for
   itself (an untouched template does not count, so the system cannot latch itself on).
 
+A project's policy file arms the system whether or not the project is trusted: an untrusted
+project's policy is read and applied, but it can only tighten (see [Project trust](#project-trust)).
+
 Removing the environment variable does not disarm it; to switch it off with a policy file present,
 set `"enabled": false` in `~/.cyrup/agent/cyrup-permission-system/config.json`.
+
+**An armed permission system also decides which tools are active.** At the start of each prompt it
+sets the active tools to every registered tool its policy does not `deny`, whatever `defaultTools` or
+`--no-builtin-tools` say. Measured with only a `cyrup-permissions.jsonc` present (`"tools"` set to `allow`
+or to `ask` in its `defaultPolicy`) and no `defaultTools`: the first request declared `read`, `bash`, `edit`, `write`,
+`grep`, `find`, `ls`, `powershell`, `mcp`, `ask_user_question`, `codemode` and `tool_search`, and the
+system prompt of that request lists the same tools and carries the rules for them. That
+includes a policy file in `.cyrup/agent/` of an untrusted project. `--tools`, `--no-tools` and
+`--exclude-tools` still bound the set, and so does a `deny` rule: `"tools": { "codemode": "deny" }`
+keeps `codemode` out. `--no-extensions` skips the permission system along with the other built-in
+extensions. Check what a policy leaves active before relying on a smaller default tool set.
 
 When a rule says `ask`, you get a dialog naming the tool and what it wants to do, with four choices:
 
@@ -176,8 +222,18 @@ When a rule says `ask`, you get a dialog naming the tool and what it wants to do
 - **Reject** — refuse.
 - **Reject with Reason** — refuse and type a sentence the model sees, which is how you redirect it
   rather than just blocking it.
+- **Reject All From This Script** — offered only for a call a codemode script made: refuse it and
+  every other call that script makes, without a dialog for each.
 
 `Esc`, dismissing the dialog, or letting it time out all count as a plain reject.
+
+Where nobody can answer, an `ask` is a block: `-p` and `--mode json` have no UI, so the call fails
+with `requires approval, but no interactive UI is available`. `--mode rpc` does have one, the client:
+the dialog reaches it as an `extension_ui_request` and its `extension_ui_response` decides.
+
+A [codemode](codemode.md#permissions) script's calls are gated one by one, like any other: you are
+asked for the script and again for each call that resolves to `ask`, and the prompt of such a call
+ends with `(from codemode script)`.
 
 The policy syntax, the four layers, and how a project policy can only tighten a global one are
 covered in [The permission system](../extensions/permissions.md).

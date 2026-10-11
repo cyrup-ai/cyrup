@@ -21,6 +21,10 @@ const OUTPUT_FILE_MODE: u32 = 0o600;
 /// exclusively, so a path someone else placed there (a link, say) is an error and is never followed
 /// (pi's `flags: "wx"`), and readable only by the user.
 ///
+/// The path is also recorded with [`cyrup_core::spilled_files`]: it is about to be named in a
+/// result the model reads (`Full output: <path>`), and a permission policy that guards reads outside
+/// the project has to be able to tell this file from any other one in the temp directory.
+///
 /// # Errors
 ///
 /// The file could not be created, including when something already exists at `path`.
@@ -32,7 +36,9 @@ pub fn create_output_file(path: &Path) -> std::io::Result<std::fs::File> {
         use std::os::unix::fs::OpenOptionsExt as _;
         options.mode(OUTPUT_FILE_MODE);
     }
-    options.open(path)
+    let file = options.open(path)?;
+    cyrup_core::spilled_files::record(path);
+    Ok(file)
 }
 
 /// `U+FEFF` encoded as UTF-8 — the byte-order mark `TextDecoder` removes at the head of a stream
@@ -557,6 +563,25 @@ mod tests {
         assert!(through_link.is_err(), "a link at the path must be refused");
         assert!(over_file.is_err(), "an existing file must be refused");
         assert_eq!(kept, b"keep", "the file behind the link must be untouched");
+    }
+
+    /// The spill file is named in the result the model reads (`Full output: <path>`), and a
+    /// permission policy that guards reads outside the project has to be able to tell it from any
+    /// other file in the temp directory.
+    #[test]
+    fn a_created_output_file_is_recorded_as_a_file_the_model_may_read() {
+        let dir = std::env::temp_dir().join(format!("cyrup-output-rec-{}", unique_suffix()));
+        std::fs::create_dir(&dir).unwrap();
+        let made = dir.join("cyrup-bash-made.log");
+        // In a directory that does not exist, so the file cannot be created: nobody wrote it.
+        let never = dir.join("missing").join("cyrup-bash-never.log");
+        let created = create_output_file(&made);
+        let refused = create_output_file(&never);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(created.is_ok() && refused.is_err());
+        let recorded = |path: &Path| cyrup_core::spilled_files::any_recorded(|known| known == path);
+        assert!(recorded(&made));
+        assert!(!recorded(&never));
     }
 
     #[test]

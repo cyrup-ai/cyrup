@@ -126,6 +126,18 @@ const CONFIRM_NO_NAME: &str = "No";
 const PERMISSION_DIALOG_OPTIONS: [&str; 4] =
     ["Allow Once", "Allow Always", "Reject", "Reject with Reason"];
 
+/// [`PERMISSION_DIALOG_OPTIONS`] and the fifth option of the dialog for a call another tool made (a
+/// `codemode` script's `tools.bash(...)`), in the order `LocalAskChannel::confirm` builds them
+/// (`PERMISSION_DIALOG_SCRIPT_OPTIONS` in `crates/cyrup-permission-system/src/ask.rs`), duplicated
+/// for the reason the four are.
+const PERMISSION_DIALOG_SCRIPT_OPTIONS: [&str; 5] = [
+    "Allow Once",
+    "Allow Always",
+    "Reject",
+    "Reject with Reason",
+    "Reject All From This Script",
+];
+
 /// The `_meta` namespace this crate writes under, replacing upstream's `piAcp` (`ACP-148`).
 ///
 /// # [CYRUP-DELTA] — the namespace carries cyrup's name, not another product's
@@ -260,11 +272,11 @@ impl DialogOptionTable {
     /// [`PERMISSION_DIALOG_OPTIONS`] for why that makes the duplicated strings safe.
     #[must_use]
     pub fn mint(options: &[String]) -> Self {
-        let permission_dialog = options.len() == PERMISSION_DIALOG_OPTIONS.len()
-            && options
-                .iter()
-                .zip(PERMISSION_DIALOG_OPTIONS)
-                .all(|(got, want)| got == want);
+        let is_list = |want: &[&str]| {
+            options.len() == want.len() && options.iter().zip(want).all(|(got, want)| got == want)
+        };
+        let permission_dialog =
+            is_list(&PERMISSION_DIALOG_OPTIONS) || is_list(&PERMISSION_DIALOG_SCRIPT_OPTIONS);
 
         let mut table = Vec::with_capacity(options.len());
         let mut advertised = Vec::with_capacity(options.len());
@@ -361,7 +373,11 @@ fn permission_option_kind(name: &str) -> PermissionOptionKind {
     match name {
         "Allow Once" => PermissionOptionKind::AllowOnce,
         "Allow Always" => PermissionOptionKind::AllowAlways,
-        "Reject" | "Reject with Reason" => PermissionOptionKind::RejectOnce,
+        // `"Reject All From This Script"` is `Reject` too, for every call of the script it refuses:
+        // the gate remembers it for that script and not beyond it.
+        "Reject" | "Reject with Reason" | "Reject All From This Script" => {
+            PermissionOptionKind::RejectOnce
+        }
         _ => PermissionOptionKind::AllowOnce,
     }
 }
@@ -1360,6 +1376,38 @@ mod tests {
             cyrup_permission_system::PERMISSION_DIALOG_OPTIONS,
             "ACP-145: `permission.rs`'s matcher and `ask.rs`'s dialog must be the same four \
              strings in the same order"
+        );
+        assert_eq!(
+            PERMISSION_DIALOG_SCRIPT_OPTIONS,
+            cyrup_permission_system::PERMISSION_DIALOG_SCRIPT_OPTIONS,
+            "and the dialog of a call another tool made, which adds a fifth"
+        );
+    }
+
+    /// [CYRUP-DELTA] The dialog of a call a script made has a fifth option, and it is still the
+    /// permission dialog: the three reject options are advertised as rejections, not as the
+    /// blanket `allow_once` an unrecognised menu gets (which would label a refusal as an approval to
+    /// a client that treats the kinds as meaning something).
+    #[test]
+    fn the_script_dialog_is_advertised_as_the_permission_dialog_with_its_fifth_a_rejection() {
+        let options: Vec<String> = PERMISSION_DIALOG_SCRIPT_OPTIONS
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        let kinds: Vec<_> = DialogOptionTable::mint(&options)
+            .advertised()
+            .iter()
+            .map(|o| o.kind)
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                PermissionOptionKind::AllowOnce,
+                PermissionOptionKind::AllowAlways,
+                PermissionOptionKind::RejectOnce,
+                PermissionOptionKind::RejectOnce,
+                PermissionOptionKind::RejectOnce,
+            ]
         );
     }
 

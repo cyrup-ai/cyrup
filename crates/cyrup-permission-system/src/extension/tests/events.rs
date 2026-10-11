@@ -135,6 +135,7 @@ async fn a_gated_request_is_published_on_the_permission_request_channel_body() {
         command: Some("git status".to_string()),
         target: None,
         tool_input: json!({ "command": "git status" }),
+        parent_tool_call_id: None,
     };
     let ctx = headless_ctx(dir.path());
     let outcome = ext.prompt_decision(&details, &ctx).await;

@@ -73,7 +73,7 @@ cyrup_ext_sdk::export_extension!(build);
 
 `export_extension!` emits every guest export the world requires — initialisation, all 34 `on-*`
 hooks, tool execution, command execution, argument completions, call and result renderers, argument
-preparation, markdown transformation, autocomplete suggestions, bus delivery, shortcut execution and
+preparation, loadout preparation, markdown transformation, autocomplete suggestions, bus delivery, shortcut execution and
 the six provider exports — each routed to whatever you registered on the `ExtensionApi`. You register
 what you care about and ignore the rest.
 
@@ -104,14 +104,19 @@ and is recorded, with its usage, as `nestedCalls` on your tool's result. A tool 
 back as an outcome with `is_error` set; `Err` means the call could not be made at all (the host's
 text says why).
 
-Three things differ from pi's `ctx.executeTool`. The call is always cancelled with your own call
-(there is no `signal` option, because a guest suspended inside the call has no handle to fire).
-`ExecuteToolOptions::on_update` is invoked with the nested tool's partial results after the call
-settles, not as they stream; the same results reach `tool_execution_update` events live. And an
-instance runs one call at a time, so a call to a tool of your own extension is refused instead of
-waiting for itself; the same holds for the nested call's events: your own handlers are not given
-the `tool_call`, `tool_result` and `tool_execution_*` events of a call your tool is making, while
-every other extension is.
+Four things differ from pi's `ctx.executeTool`. Pi's `signal` option is the named signal
+`ExecuteToolOptions::signal_id` (the id `ctx.ui().abort_signal(..)` aborts, read once when the call
+starts, so a signal you aborted beforehand cancels the call before it begins) together with
+`ExecuteToolOptions::timeout_ms`, a deadline the host enforces, because a guest suspended inside the
+call has no timer and nothing else can fire an abort while it waits; the call is always also
+cancelled with your own call. `ExecuteToolOptions::on_update` is invoked with the nested tool's
+partial results after the call settles, not as they stream; the same results reach
+`tool_execution_update` events live. An instance runs one call at a time, so a call to a tool of
+your own extension comes back as an error outcome naming the cause instead of waiting for itself.
+And the nested call's events are not given to your own handlers (`tool_call`, `tool_result` and
+`tool_execution_*`) while your tool is making the call, though every other extension receives them.
+The last three are the single-instance store, not omissions: lifting them would make a guest
+reentrant.
 
 A native extension reads the same context inside its tool's `execute`:
 `cyrup_ext::ExtensionToolContext::current()` gives `execute_tool(name, args, options)` bound to the
@@ -261,6 +266,27 @@ handler; a continuation is honoured only when that context can be continued from
 ends on the assistant's reply needs something after it. `turn_end` also names the entries the turn was
 persisted as (`message_entry_id`, `tool_result_entry_ids`), which a `context_edit` can target.
 
+## Structured results, annotations and loadout hooks
+
+A tool can declare the shape of a machine-readable result with
+`ToolDescriptor::output_schema(schema)` and return it with
+`ToolOutput::with_structured_content(value)`. The model still reads `content`; a codemode script
+that calls the tool receives the structured value instead of the text. A result for which
+`ToolOutput::error(..)` was used is reported as a failed call (`is_error`), and its structured
+content is kept for programmatic callers.
+
+`ToolDescriptor::annotations(ToolAnnotations::new().read_only(true)..)` attaches MCP-style hints
+(`readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint`) that `getAllTools` reports so
+a permission extension can decide which calls to confirm. They are the author's claim and are not
+verified.
+
+A tool that orchestrates other tools can adjust how the loadout is presented to the model by
+implementing `ToolExec::prepare_loadout` and setting `ToolDescriptor::prepare_loadout(true)`. The hook
+gets the declared, callable and registered tools and returns `ToolLoadoutChanges`: new descriptions
+for declared tools, and declared tools whose declarations requests should leave out. The host calls
+it whenever it applies the active tools. It cannot call tools, and while the extension is busy with
+another call the host reuses the hook's previous answer.
+
 ## Building
 
 ```sh
@@ -278,7 +304,7 @@ post-processes it.
 {
   "id": "my-ext",
   "version": "1.0.0",
-  "world": "cyrup:ext@0.19",
+  "world": "cyrup:ext@0.20",
   "entry": "crates/my-ext",
   "capabilities": {
     "fs": ["read:.", "write:.cyrup/todo"],
@@ -300,9 +326,9 @@ post-processes it.
 
 ### World compatibility
 
-The host world is `cyrup:ext@0.19` (`HOST_WORLD` in `crates/cyrup-ext/src/manifest.rs`, which also
+The host world is `cyrup:ext@0.20` (`HOST_WORLD` in `crates/cyrup-ext/src/manifest.rs`, which also
 carries the bump history). A manifest's `world` must declare the **same major version** as the host
-and a **minor version at least** the host's. Against today's host, `cyrup:ext@0.19` is the value to
+and a **minor version at least** the host's. Against today's host, `cyrup:ext@0.20` is the value to
 write; an older minor is a mismatch, and so is a different major.
 
 The minor moves whenever an export is added, removed or re-signed, and whenever an import is removed

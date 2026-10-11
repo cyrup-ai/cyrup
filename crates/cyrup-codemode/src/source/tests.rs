@@ -61,19 +61,108 @@ fn parses_the_options_line_and_keeps_line_numbers() {
 }
 
 #[test]
-fn only_treats_the_first_line_as_an_options_line() {
-    let input = "text(1)\n// @options: {\"timeout_ms\": 1}";
-    assert_eq!(
-        parse(input),
-        ParsedCodemodeSource {
-            code: input.into(),
-            options: options(None, None)
-        }
-    );
+fn a_comment_that_merely_starts_like_the_prefix_is_not_an_options_line() {
     assert_eq!(
         parse("// @optionsx {}\ntext(1)").options,
         options(None, None)
     );
+    assert_eq!(
+        parse("text(1)\n// @options without a colon").options,
+        options(None, None)
+    );
+}
+
+/// [CYRUP-DELTA] Upstream reads the first line only, so a blank line before the options line (an
+/// empty first line is common when a model starts its string with a newline) dropped `timeout_ms`
+/// without a word: measured, `"\n// @options: {\"timeout_ms\": 3000}\nwhile(true){}"` ran unbounded.
+#[test]
+fn the_options_line_is_the_first_non_blank_line_and_keeps_line_numbers() {
+    assert_eq!(
+        parse("\n  \n// @options: {\"timeout_ms\": 10}\nconst a = 1;"),
+        ParsedCodemodeSource {
+            code: "\n  \n\nconst a = 1;".into(),
+            options: options(None, Some(10))
+        }
+    );
+    // CRLF line ends.
+    assert_eq!(
+        parse("\r\n// @options: {\"timeout_ms\": 10}\r\ntext(1)").options,
+        options(None, Some(10))
+    );
+}
+
+/// [CYRUP-DELTA] An options line below the first non-blank line used to be an ordinary comment.
+#[test]
+fn a_late_options_line_is_an_error_naming_its_line() {
+    for (input, line) in [
+        ("text(1)\n// @options: {\"timeout_ms\": 1}", 2),
+        ("text(1)\n\n  // @options: {}\n", 3),
+        (
+            "// @options: {}\ntext(1)\n// @options: {\"timeout_ms\": 1}",
+            3,
+        ),
+    ] {
+        let error = parse_codemode_source(input).unwrap_err();
+        assert_eq!(
+            error,
+            CodemodeSourceError::LateOptions { line },
+            "{input:?}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("one is on line {line}")),
+            "{error}"
+        );
+    }
+}
+
+/// [CYRUP-DELTA] A script wrapped in a markdown fence reached the engine as "```js" (a tagged
+/// template) and failed with `TypeError: "" is not a function at codemode.js:1:31`.
+#[test]
+fn one_surrounding_markdown_fence_is_stripped_and_line_numbers_stay() {
+    for input in [
+        "```js\ntext(1)\n```",
+        "```javascript\ntext(1)\n```\n",
+        "```\ntext(1)\n```  \n\n",
+        "\n```ts\ntext(1)\n```",
+    ] {
+        let parsed = parse(input);
+        assert!(parsed.code.contains("\ntext(1)\n"), "{input:?}: {parsed:?}");
+        assert!(!parsed.code.contains("```"), "{input:?}: {parsed:?}");
+        let fence_line = input
+            .lines()
+            .position(|line| line.starts_with("```"))
+            .unwrap();
+        let script_line = parsed
+            .code
+            .lines()
+            .position(|line| line == "text(1)")
+            .unwrap();
+        assert_eq!(
+            script_line,
+            fence_line + 1,
+            "{input:?}: the script keeps its line"
+        );
+    }
+    // The options line may follow the fence.
+    let parsed = parse("```js\n// @options: {\"timeout_ms\": 5}\ntext(1)\n```");
+    assert_eq!(parsed.options, options(None, Some(5)));
+    assert!(!parsed.code.contains("@options"), "{parsed:?}");
+    // Only the outer pair goes: a template literal inside the script keeps its fences.
+    let parsed = parse("```js\ntext(`\\`\\`\\``)\n```");
+    assert_eq!(parsed.code, "\n".to_owned() + "text(`\\`\\`\\``)\n");
+}
+
+#[test]
+fn a_fence_that_never_closes_is_refused_with_a_clear_message() {
+    for input in ["```js\ntext(1)", "```js\ntext(1)\ntext(2) ```"] {
+        let error = parse_codemode_source(input).unwrap_err();
+        assert_eq!(error, CodemodeSourceError::UnclosedFence, "{input:?}");
+        assert!(error.to_string().contains("raw JavaScript"), "{error}");
+    }
+    // Backticks later in a fenceless script are JavaScript.
+    assert_eq!(parse("text(`a`)\n```").code, "text(`a`)\n```");
 }
 
 #[test]
@@ -277,6 +366,17 @@ fn agrees_with_upstream_on_the_corpus() {
         let input = case["input"].as_str().unwrap();
         let result = &case["result"];
         let actual = parse_codemode_source(input);
+        // The one corpus input that is a [CYRUP-DELTA]: upstream reads a late options line as a
+        // comment and runs the script, here it is an error (see the source module).
+        if input == "text(1)\n// @options: {\"timeout_ms\": 1}" {
+            assert_eq!(
+                result["ok"]["options"],
+                serde_json::json!({}),
+                "upstream ran it with no options"
+            );
+            assert_eq!(actual, Err(CodemodeSourceError::LateOptions { line: 2 }));
+            continue;
+        }
         if let Some(ok) = result.get("ok") {
             let parsed = actual.unwrap_or_else(|error| panic!("{input:?}: {error}"));
             assert_eq!(parsed.code, ok["code"].as_str().unwrap(), "{input:?}");

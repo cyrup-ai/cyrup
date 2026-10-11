@@ -11,7 +11,7 @@
 
 use crate::error::ExtError;
 use crate::host::epoch::DEFAULT_TICK;
-use crate::host::{EpochDriver, build_engine};
+use crate::host::{EpochDriver, build_engine_or_on_demand};
 use cyrup_core::RunCancel;
 use wasmtime::Engine;
 
@@ -26,7 +26,7 @@ impl WasmRuntime {
     /// Build the engine and spawn the epoch driver. Must be called from within a tokio runtime
     /// (the epoch driver is a background task).
     pub fn new() -> Result<Self, ExtError> {
-        let engine = build_engine()?;
+        let engine = build_engine_or_on_demand()?;
         let cancel = RunCancel::new();
         let epoch = EpochDriver::spawn(engine.clone(), DEFAULT_TICK, cancel.clone());
         Ok(Self {

@@ -243,8 +243,28 @@ pub enum UiEffect {
 /// setWidget/setTitle/setEditorText — rpc-mode.ts:149-241) onward to the client. Set by the mode entry
 /// point via [`LiveHostServices::set_ui_effect_sink`]; absent (`None`) in headless (print/json), where
 /// the effect methods below silently drop (== Pi `noOpUIContext`'s `notify`/`setStatus`/… no-ops,
-/// runner.ts:234-244).
+/// runner.ts:234-244). [CYRUP-DELTA] A notice said before the drain is attached is held and
+/// delivered when it is ([`EffectDrain`]).
 pub type UiEffectSink = UnboundedSender<UiEffect>;
+
+/// How many notices are kept for a mode that has not attached its effect drain yet.
+const MAX_EARLY_NOTICES: usize = 32;
+
+/// The mode's effect drain, and the notices said before it was attached.
+///
+/// [CYRUP-DELTA] Pi hands an extension its `ui` context before `session_start` fires, so a notice
+/// from the first moments of a session reaches the screen. Here the session, and with it the
+/// extensions that start in the background (the MCP adapter connecting its servers), exists before
+/// the mode has built its terminal and attached the drain; the notice was dropped, and a server that
+/// failed at once (a command that does not exist) was announced nowhere, with its tools silently
+/// missing from every script. A notice said while no drain is attached is kept, a few of them, and
+/// delivered when one is. Every other effect (status, widgets, the title) is state the extension sets
+/// again, and is still dropped as in headless modes, where no drain is ever attached.
+#[derive(Default)]
+struct EffectDrain {
+    sink: Option<UiEffectSink>,
+    early_notices: Vec<UiEffect>,
+}
 
 /// The sync snapshot the session keeps current for the (sync) host-services reads.
 #[derive(Clone, Debug, Default)]
@@ -903,7 +923,7 @@ pub struct LiveHostServices {
     /// the SYNC [`HostServices`] method, which forwards a [`UiEffect`] here and returns immediately —
     /// no reply is awaited, unlike [`Self::ui_sink`]. `None` in headless (print/json): the overrides
     /// then silently drop (== Pi `noOpUIContext`, runner.ts:230-261).
-    ui_effect_sink: Mutex<Option<UiEffectSink>>,
+    ui_effect_sink: Mutex<EffectDrain>,
     /// The active mode's INTERACTIVE-OVERLAY renderer, attached post-build via
     /// [`Self::set_overlay_sink`]. An extension's `open_overlay` reaches the SYNC [`HostServices`]
     /// method, which forwards an [`OverlayRequest`] here and BLOCKS on the one-shot reply until the
@@ -1148,7 +1168,7 @@ impl LiveHostServices {
             shutdown_requested: std::sync::atomic::AtomicBool::new(false),
             control: Mutex::new(None),
             ui_sink: Mutex::new(None),
-            ui_effect_sink: Mutex::new(None),
+            ui_effect_sink: Mutex::new(EffectDrain::default()),
             overlay_sink: Mutex::new(None),
             control_rx: Mutex::new(None),
             manager: Mutex::new(None),
@@ -1387,8 +1407,15 @@ impl LiveHostServices {
 
     /// Attach the mode's fire-and-forget effect drain (see [`UiEffectSink`]/[`Self::ui_effect_sink`]).
     /// Only interactive/rpc call this; headless (print/json) leaves it `None`.
+    ///
+    /// The notices said before this call (see [`EffectDrain`]) are delivered first, in the order they
+    /// were said.
     pub fn set_ui_effect_sink(&self, sink: UiEffectSink) {
-        *Self::lock(&self.ui_effect_sink) = Some(sink);
+        let mut drain = Self::lock(&self.ui_effect_sink);
+        for notice in drain.early_notices.drain(..) {
+            let _ = sink.send(notice);
+        }
+        drain.sink = Some(sink);
     }
 
     /// Attach the mode's interactive-overlay renderer (see [`OverlaySink`]/[`Self::overlay_sink`]).
@@ -1402,8 +1429,13 @@ impl LiveHostServices {
     /// Send one fire-and-forget effect to the attached drain, if any (no-op — matching Pi's
     /// `noOpUIContext` — when unattached). Never blocks: an `UnboundedSender::send` never awaits.
     fn emit_ui_effect(&self, effect: UiEffect) {
-        if let Some(sink) = Self::lock(&self.ui_effect_sink).clone() {
+        let mut drain = Self::lock(&self.ui_effect_sink);
+        if let Some(sink) = drain.sink.as_ref() {
             let _ = sink.send(effect);
+        } else if matches!(effect, UiEffect::Notify { .. })
+            && drain.early_notices.len() < MAX_EARLY_NOTICES
+        {
+            drain.early_notices.push(effect);
         }
     }
 
@@ -2966,7 +2998,13 @@ impl HostServices for LiveHostServices {
         let Some(dt) = Self::lock(&self.dynamic_tools).clone() else {
             return;
         };
-        let _rebuilt = { Self::lock(&dt).set_active(names) };
+        let (_loadout, rebuilt) = { Self::lock(&dt).set_active(names) };
+        // The mirrored prompt follows the tool set at once, as pi's `setActiveTools` rebuilds
+        // `_baseSystemPrompt` before it returns: a `before_agent_start` handler that changes the
+        // tools and then reads `getSystemPrompt()` gets the prompt for the tools it just set, not
+        // the one it was handed. The session's own base follows when the drain applies the names
+        // (`AgentSession::push_active_tools`), to the same text.
+        Self::lock(&self.snapshot).system_prompt = Some(rebuilt.text().to_owned());
         *Self::lock(&self.pending_active_tools) = Some(names.to_vec());
     }
 
@@ -3019,6 +3057,11 @@ impl HostServices for LiveHostServices {
                     });
                     if let (Some(ns), Some(obj)) = (t.namespace(), row.as_object_mut()) {
                         obj.insert("namespace".to_string(), json!(ns));
+                    }
+                    // pi v1.0.4 `getAllTools` adds `annotations` when the definition has them
+                    // (`agent-session.ts:1489`).
+                    if let (Some(annotations), Some(obj)) = (t.annotations(), row.as_object_mut()) {
+                        obj.insert("annotations".to_string(), json!(annotations));
                     }
                     row
                 })
@@ -4011,6 +4054,7 @@ mod tests {
         name: &'static str,
         params: Value,
         guidelines: Vec<&'static str>,
+        annotations: Option<cyrup_core::ToolAnnotations>,
     }
 
     impl CatalogTool {
@@ -4019,6 +4063,7 @@ mod tests {
                 name,
                 params: json!({"type": "object", "properties": {}}),
                 guidelines,
+                annotations: None,
             }
         }
     }
@@ -4036,6 +4081,9 @@ mod tests {
         }
         fn prompt_guidelines(&self) -> Vec<&str> {
             self.guidelines.clone()
+        }
+        fn annotations(&self) -> Option<&cyrup_core::ToolAnnotations> {
+            self.annotations.as_ref()
         }
         async fn execute(
             &self,
@@ -4084,6 +4132,7 @@ mod tests {
             tools.clone(),
             tools,
             rebuilder,
+            crate::tools::ToolAccess::default(),
         )))
     }
 
@@ -4232,7 +4281,12 @@ mod tests {
         );
 
         let builtin: Arc<dyn Tool> = Arc::new(CatalogTool::new("read", vec!["read: prefer read"]));
-        let ext: Arc<dyn Tool> = Arc::new(CatalogTool::new("ext_tool", vec![]));
+        let mut annotated = CatalogTool::new("ext_tool", vec![]);
+        annotated.annotations = Some(cyrup_core::ToolAnnotations {
+            read_only_hint: Some(true),
+            ..cyrup_core::ToolAnnotations::default()
+        });
+        let ext: Arc<dyn Tool> = Arc::new(annotated);
         svc.attach_dynamic_tools(dynamic_tools_with(vec![builtin, ext]));
         svc.attach_session_catalog(Arc::new(FakeCatalog));
 
@@ -4300,6 +4354,13 @@ mod tests {
             ext_row["sourceInfo"]["source"],
             json!("demo-ext"),
             "an extension-contributed tool keeps the REGISTRY's sourceInfo, not the builtin synthetic"
+        );
+        // pi v1.0.4 `getAllTools` adds `annotations` only for a definition that has them
+        // (`agent-session.ts:1489`).
+        assert_eq!(ext_row["annotations"], json!({"readOnlyHint": true}));
+        assert!(
+            read.get("annotations").is_none(),
+            "a tool with none has no key: {read}"
         );
     }
 
@@ -4711,6 +4772,77 @@ mod tests {
             rx.try_recv().ok(),
             Some(UiEffect::SetWorkingIndicator { options: None })
         );
+    }
+
+    /// [CYRUP-DELTA] A notice said before the mode attached its effect drain is not lost: the MCP
+    /// adapter connects its servers when the session starts, and a server whose command does not
+    /// exist fails before the terminal UI is up, so its "Failed to connect" line had nowhere to go
+    /// and the server's tools were missing from every script with no word on screen. Measured in the
+    /// real binary before the fix: the line was on screen for a server that died 2.5 s in, and never
+    /// for one that failed at once.
+    #[test]
+    fn a_notice_said_before_the_effect_sink_is_attached_is_delivered_when_it_is() {
+        let provider: Arc<dyn Provider> = Arc::new(FauxProvider::new());
+        let svc = svc_with(provider);
+        svc.notify("MCP: Failed to connect to ghost", NotifyKind::Error);
+        svc.set_status("mcp", Some("connecting"));
+        svc.notify("second", NotifyKind::Info);
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<UiEffect>();
+        svc.set_ui_effect_sink(tx);
+        assert_eq!(
+            rx.try_recv().ok(),
+            Some(UiEffect::Notify {
+                message: "MCP: Failed to connect to ghost".to_string(),
+                kind: NotifyKind::Error
+            }),
+            "the first notice is delivered on attach"
+        );
+        assert_eq!(
+            rx.try_recv().ok(),
+            Some(UiEffect::Notify {
+                message: "second".to_string(),
+                kind: NotifyKind::Info
+            }),
+            "in the order they were said, and the status between them is state the extension sets \
+             again, not a notice"
+        );
+        assert!(rx.try_recv().is_err(), "nothing else was held");
+
+        // Once attached, effects go straight through and nothing is held a second time.
+        svc.notify("live", NotifyKind::Info);
+        assert_eq!(
+            rx.try_recv().ok(),
+            Some(UiEffect::Notify {
+                message: "live".to_string(),
+                kind: NotifyKind::Info
+            })
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<UiEffect>();
+        svc.set_ui_effect_sink(tx);
+        assert!(
+            rx.try_recv().is_err(),
+            "a delivered notice is not delivered again"
+        );
+    }
+
+    /// The notices held for a mode that never attaches (print, json) are bounded: the oldest are
+    /// kept, and a session that says more drops the rest instead of growing for as long as it runs.
+    #[test]
+    fn the_notices_held_for_an_unattached_mode_are_bounded() {
+        let provider: Arc<dyn Provider> = Arc::new(FauxProvider::new());
+        let svc = svc_with(provider);
+        for n in 0..(MAX_EARLY_NOTICES + 10) {
+            svc.notify(&format!("notice {n}"), NotifyKind::Info);
+        }
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<UiEffect>();
+        svc.set_ui_effect_sink(tx);
+        let mut held = Vec::new();
+        while let Ok(UiEffect::Notify { message, .. }) = rx.try_recv() {
+            held.push(message);
+        }
+        assert_eq!(held.len(), MAX_EARLY_NOTICES);
+        assert_eq!(held.first().map(String::as_str), Some("notice 0"));
     }
 
     /// MIRROR: with NO effect sink (headless print/json) the four silently drop and — critically —

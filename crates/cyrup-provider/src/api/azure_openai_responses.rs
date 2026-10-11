@@ -24,8 +24,8 @@ use crate::api::compat::{
     thinking_level_key,
 };
 use crate::api::openai_responses::{
-    ConvertResponsesToolsOptions, ReasoningSummary, convert_responses_messages,
-    convert_responses_tools, decode_stream,
+    ConvertResponsesToolsOptions, DecodeOptions, ReasoningSummary, convert_responses_messages,
+    convert_responses_tools, decode_stream_with_options,
 };
 use crate::api::{ApiImpl, EventSink};
 use crate::auth::AuthResult;
@@ -36,7 +36,7 @@ use crate::error::ProviderError;
 use crate::model::Model;
 use crate::stream::StreamOptions;
 use crate::stream::sse::SseRequest;
-use crate::utils::constrained_sampling::ConstrainedSamplingError;
+use crate::utils::constrained_sampling::{ConstrainedSamplingError, grammar_tool_input_properties};
 use crate::utils::provider_plumbing::{EnvSource, connect_sse, provider_env_value};
 use cyrup_core::{ApiId, CancelToken, ModelThinkingLevel};
 use serde_json::{Map, Value, json};
@@ -151,7 +151,13 @@ impl ApiImpl for AzureOpenAiResponsesApi {
 
         let deployment = resolve_deployment_name(model, env, azure);
         // PROV-011: an unsatisfiable `constrainedSampling` fails the turn before any HTTP.
-        let params = match build_params(model, ctx, opts, &deployment) {
+        // PROV-101: the same resolution yields the grammar tools whose `custom_tool_call`s the
+        // decoder below must read.
+        let built = grammar_tool_input_properties(ctx, supports_openai_grammar_tools(model))
+            .and_then(|inputs| {
+                build_params(model, ctx, opts, &deployment).map(|params| (params, inputs))
+            });
+        let (params, grammar_inputs) = match built {
             Ok(p) => p,
             Err(e) => {
                 let e = ProviderError::from(e);
@@ -181,7 +187,17 @@ impl ApiImpl for AzureOpenAiResponsesApi {
         };
 
         // Azure speaks the identical Responses SSE wire format → reuse the shared decoder.
-        decode_stream(frames, model, &self.api, &sink).await;
+        decode_stream_with_options(
+            frames,
+            model,
+            &self.api,
+            &sink,
+            DecodeOptions {
+                end_turn: None,
+                grammar_inputs,
+            },
+        )
+        .await;
     }
 }
 
@@ -336,6 +352,16 @@ fn resolve_request_url(
 // Request encoding
 // ---------------------------------------------------------------------------
 
+/// Pi `model.compat?.supportsOpenAIGrammarTools ?? false` (`azure-openai-responses.ts:74`,
+/// `:194` @v1.0.4): grammar tools are opt-in on this route.
+fn supports_openai_grammar_tools(model: &Model) -> bool {
+    model
+        .compat
+        .as_ref()
+        .and_then(|c| c.supports_openai_grammar_tools)
+        .unwrap_or(false)
+}
+
 /// 1:1 port of Pi `buildParams` (azure-openai-responses.ts:251-307). Differs from
 /// `openai-responses` `buildParams`: the `model` field carries the resolved *deployment* name, the
 /// `prompt_cache_key` is set whenever a session id is present (no cache-retention gate), and there
@@ -363,6 +389,7 @@ pub(crate) fn build_params(
             .and_then(|c| c.supports_strict_mode)
             .unwrap_or(true),
         default_strict: Some(false),
+        supports_openai_grammar_tools: supports_openai_grammar_tools(model),
     };
     let messages =
         convert_responses_messages(model, ctx, AZURE_TOOL_CALL_PROVIDERS, &[], tool_options)?;
@@ -722,6 +749,15 @@ mod tests {
         );
     }
 
+    /// PROMPT-001 — the prompt a transcript replays to reaches the Azure request body.
+    #[test]
+    fn the_transcripts_prompt_reaches_the_azure_body() {
+        let m = azure_model("gpt-4", false);
+        let ctx = crate::api::prompt_fixture::agent_context(Vec::new());
+        let body = build_params(&m, &ctx, &StreamOptions::default(), "my-deployment").unwrap();
+        crate::api::prompt_fixture::assert_wire_carries_prompt(&body.to_string());
+    }
+
     /// PERM-012 — `azure-openai-responses` is the second member of upstream's
     /// `OPENAI_RESPONSES_APIS` (`pi-permission-system/src/model-option-compatibility.ts:16-19`
     /// @v0.8.0), so the reasoning-model rule at `:78-80` applies here too. Red at HEAD~: the
@@ -883,5 +919,172 @@ mod tests {
             !raw.contains("defer_loading"),
             "azure emitted defer_loading: {raw}"
         );
+    }
+
+    /// PROV-101: Azure sends a grammar tool as a `custom` tool only when the model opts in
+    /// (`compat.supportsOpenAIGrammarTools`, default off) and replays its call and result as
+    /// `custom_tool_call` / `custom_tool_call_output`.
+    #[test]
+    fn grammar_tools_are_custom_tools_on_an_opted_in_model_only() {
+        use crate::api::compat::ModelCompat;
+        use crate::context::{ConstrainedSampling, ConstrainedSamplingConfig, GrammarVariants};
+
+        let tool = crate::context::ToolDef {
+            name: "sample_tool".into(),
+            description: "d".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": { "payload": { "type": "string" } },
+                "required": ["payload"],
+            }),
+            constrained_sampling: Some(ConstrainedSampling::Config(
+                ConstrainedSamplingConfig::Grammar {
+                    variants: GrammarVariants {
+                        openai_lark: Some("start: /[a-z]+/".to_string()),
+                        openai_regex: None,
+                    },
+                },
+            )),
+        };
+        let mut args = serde_json::Map::new();
+        args.insert("payload".to_string(), json!("abc"));
+        let ctx = Context {
+            system_prompt: None,
+            messages: vec![
+                cyrup_core::Message::Assistant(cyrup_core::AssistantMessage {
+                    content: vec![cyrup_core::Content::ToolCall(cyrup_core::ToolCall {
+                        id: cyrup_core::ToolCallId::from("call_1|ctc_1"),
+                        name: "sample_tool".to_string(),
+                        arguments: args.into(),
+                        thought_signature: None,
+                        namespace: None,
+                    })],
+                    provider: "azure-openai-responses".into(),
+                    model: "gpt-5".to_string(),
+                    api: API_ID.into(),
+                    response_model: None,
+                    response_id: None,
+                    provider_thinking_level: None,
+                    thinking_level: None,
+                    diagnostics: None,
+                    usage: cyrup_core::Usage::default(),
+                    stop_reason: cyrup_core::StopReason::ToolUse,
+                    deferred: None,
+                    error_message: None,
+                    raw_stop_reason: None,
+                    end_turn: None,
+                    timestamp: 1,
+                    duration_ms: None,
+                }),
+                cyrup_core::Message::ToolResult {
+                    duration_ms: None,
+                    tool_call_id: cyrup_core::ToolCallId::from("call_1|ctc_1"),
+                    tool_name: "sample_tool".to_string(),
+                    content: vec![cyrup_core::Content::text("done")],
+                    is_error: false,
+                    details: None,
+                    usage: None,
+                    added_tool_names: Vec::new(),
+                    timestamp: 2,
+                    nested_calls: None,
+                },
+            ],
+            tools: vec![tool],
+        };
+
+        let mut m = azure_model("gpt-5", false);
+        // Default: not opted in, so the JSON function tool and function_call items.
+        let body = build_params(&m, &ctx, &StreamOptions::default(), "dep").unwrap();
+        assert_eq!(body["tools"][0]["type"], "function");
+        let input = body["input"].as_array().expect("input");
+        assert!(input.iter().any(|i| i["type"] == "function_call"));
+        assert!(input.iter().all(|i| i["type"] != "custom_tool_call"));
+
+        m.compat = Some(ModelCompat {
+            supports_openai_grammar_tools: Some(true),
+            ..Default::default()
+        });
+        let body = build_params(&m, &ctx, &StreamOptions::default(), "dep").unwrap();
+        assert_eq!(
+            body["tools"][0],
+            json!({
+                "type": "custom",
+                "name": "sample_tool",
+                "description": "d",
+                "format": { "type": "grammar", "syntax": "lark", "definition": "start: /[a-z]+/" },
+            })
+        );
+        let input = body["input"].as_array().expect("input");
+        assert!(input.contains(&json!({
+            "type": "custom_tool_call",
+            "id": "ctc_1",
+            "call_id": "call_1",
+            "name": "sample_tool",
+            "input": "abc",
+        })));
+        assert!(input.contains(&json!({
+            "type": "custom_tool_call_output",
+            "call_id": "call_1",
+            "output": "done",
+        })));
+    }
+
+    /// PROV-101, driver level: the request `run` posts declares the grammar tool as `custom`, and
+    /// the `custom_tool_call` the server streams back decodes to a tool call holding the raw text.
+    /// This is what proves the Azure driver hands the grammar map to its decoder.
+    #[tokio::test]
+    async fn run_posts_a_custom_tool_and_decodes_the_custom_call() {
+        use crate::api::test_server::{custom_tool_call_sse, grammar_tool_def, serve_sse};
+        use crate::api::{ApiImpl, channel};
+        use crate::stream::StreamEvent;
+
+        let (origin, seen) = serve_sse(custom_tool_call_sse("response.completed")).await;
+        let mut m = azure_model("gpt-5", false);
+        m.base_url = format!("{origin}/openai/v1");
+        m.compat = Some(crate::api::compat::ModelCompat {
+            supports_openai_grammar_tools: Some(true),
+            ..Default::default()
+        });
+        let ctx = Context {
+            system_prompt: None,
+            messages: vec![cyrup_core::Message::User {
+                content: vec![cyrup_core::Content::text("go")],
+                timestamp: 0,
+            }],
+            tools: vec![grammar_tool_def()],
+        };
+        let (sink, mut rx) = channel(64);
+        AzureOpenAiResponsesApi::new()
+            .run(
+                &m,
+                &ctx,
+                &crate::auth::AuthResult::from_key("azure-key", "test"),
+                &StreamOptions::default(),
+                cyrup_core::CancelToken::new(),
+                sink,
+            )
+            .await;
+        let mut last = None;
+        while let Some(ev) = rx.recv().await {
+            last = Some(ev);
+        }
+        let Some(StreamEvent::Done { message, .. }) = last else {
+            panic!("no done terminal: {last:?}")
+        };
+        assert_eq!(
+            serde_json::to_value(&message.content).expect("serialize"),
+            json!([{
+                "type": "toolCall",
+                "id": "call_1|ctc_1",
+                "name": "sample_tool",
+                "arguments": { "payload": "abc" },
+            }])
+        );
+        let body: Value = {
+            let seen = seen.lock().expect("lock");
+            serde_json::from_str(&seen.first().expect("a request").1).expect("json body")
+        };
+        assert_eq!(body["tools"][0]["type"], "custom");
+        assert_eq!(body["tools"][0]["format"]["syntax"], "lark");
     }
 }

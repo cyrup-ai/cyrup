@@ -55,9 +55,25 @@ pub struct DedupDetails {
     pub command: Option<String>,
     pub target: Option<String>,
     pub tool_input: serde_json::Value,
+    /// `Some` when the call being gated was made by another tool while it ran (a `codemode`
+    /// script's `tools.bash(...)`, `ctx.executeTool`): the id of the calling tool call.
+    ///
+    /// **[CYRUP-DELTA]** pi-permission-system v0.8.0 has no notion of a nested call (it predates
+    /// `parentToolCallId`); cyrup records it on the audit entry so "who asked for this" reads off
+    /// the log. Not part of the dedup fingerprint: [`Self::message`] already carries the origin
+    /// label and `request_id` is the nested call's own id.
+    pub parent_tool_call_id: Option<String>,
 }
 
 impl DedupDetails {
+    /// Mark these details as those of a call another tool made: record the parent and append the
+    /// origin `label` (`gate::format_nested_origin_label`) to the prompt text, so the dialog, the
+    /// forwarded prompt and the audit entry all say the call did not come from the model directly.
+    pub fn mark_nested(&mut self, parent_tool_call_id: &str, label: &str) {
+        self.message = format!("{} {label}", self.message);
+        self.parent_tool_call_id = Some(parent_tool_call_id.to_string());
+    }
+
     /// pi `createPermissionPromptCacheKey` (`index.ts:728-737`): `requestId \0 sha256(fingerprint)`,
     /// or `None` when `requestId` is empty (uncacheable). The fingerprint need only be internally
     /// consistent (dedup is per-process); the exact bytes need not match pi's.
@@ -152,6 +168,7 @@ impl Pending {
                     approved: false,
                     state: PermissionDecisionState::Reject,
                     denial_reason: None,
+                    reject_script: false,
                 };
             }
         }
@@ -338,6 +355,7 @@ pub fn create_duplicate_decision(decision: &PermissionPromptDecision) -> Permiss
             approved: true,
             state: PermissionDecisionState::Approved,
             denial_reason: None,
+            reject_script: false,
         }
     } else {
         decision.clone()
@@ -361,6 +379,7 @@ mod tests {
             approved: true,
             state: PermissionDecisionState::Always,
             denial_reason: None,
+            reject_script: false,
         }
     }
 

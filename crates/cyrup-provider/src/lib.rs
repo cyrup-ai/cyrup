@@ -222,8 +222,8 @@ pub use utils::transcript::{
     create_initial_system_message, declarations_equal, get_current_system_message,
     get_current_system_prompt, get_current_tools, get_declared_tools, get_initial_system_message,
     get_tool_state_changes, has_non_additive_tool_changes, has_tool_redefinitions,
-    normalize_context, resolve_transcript, resolve_transcript_tools, to_tool_declaration,
-    without_initial_system_message,
+    normalize_context, request_context, resolve_transcript, resolve_transcript_tools,
+    to_tool_declaration, without_initial_system_message,
 };
 pub use validate::{ToolValidationError, validate_named_tool_call, validate_tool_call};
 pub use virtual_models::{

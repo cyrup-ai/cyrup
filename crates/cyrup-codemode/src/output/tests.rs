@@ -53,7 +53,7 @@ fn output_one_character_over_the_budget_becomes_one_head_and_tail_item() {
     let combined = "12345678901234567890X";
     let out = truncate_output(vec![text(combined)], 5, fake_spill);
     // budget 20: head 10, tail 10, removed 1 character -> ceil(1/4) = 1 token; original 21 -> 6.
-    let expected = "Warning: truncated output (original token count: 6)\nTotal output lines: 1\n\n1234567890…1 tokens truncated…234567890X\n\n[Full output: /spill/pi-codemode-0011223344556677.txt (read with offset/limit)]";
+    let expected = "Warning: truncated output (original token count: 6)\nTotal output lines: 1\n\n1234567890…1 tokens truncated…234567890X\n\n[Full output: /spill/pi-codemode-0011223344556677.txt (read or tools.read with offset/limit)]";
     assert_eq!(
         out,
         TruncatedOutput {
@@ -77,7 +77,7 @@ fn text_items_are_joined_with_a_newline_and_images_follow_the_single_text_item()
         out.items,
         vec![
             text(
-                "Warning: truncated output (original token count: 4)\nTotal output lines: 3\n\naa…3 tokens truncated…cc\n\n[Full output: /p (read with offset/limit)]"
+                "Warning: truncated output (original token count: 4)\nTotal output lines: 3\n\naa…3 tokens truncated…cc\n\n[Full output: /p (read or tools.read with offset/limit)]"
             ),
             image(),
             image(),
@@ -281,7 +281,7 @@ fn a_truncated_output_end_to_end_leaves_the_full_text_on_disk() {
         panic!("text expected")
     };
     assert!(body.ends_with(&format!(
-        "\n\n[Full output: {} (read with offset/limit)]",
+        "\n\n[Full output: {} (read or tools.read with offset/limit)]",
         path.display()
     )));
 }
@@ -311,7 +311,17 @@ fn truncation_agrees_with_upstream_on_the_corpus() {
     for case in &cases {
         let items = items_from(&case["items"]);
         let max_tokens = case["maxTokens"].as_u64().unwrap();
-        let want = items_from(&case["out"]);
+        // [CYRUP-DELTA] The recorded footer is upstream's "(read with offset/limit)".
+        let want: Vec<OutputItem> = items_from(&case["out"])
+            .into_iter()
+            .map(|item| match item {
+                OutputItem::Text(text) => OutputItem::Text(text.replace(
+                    "(read with offset/limit)",
+                    "(read or tools.read with offset/limit)",
+                )),
+                other => other,
+            })
+            .collect();
         let mut spilled = None;
         let out = truncate_output(items.clone(), max_tokens, |full| {
             spilled = Some(full.to_owned());
@@ -538,4 +548,31 @@ fn assert_owner_only(path: &Path) {
     }
     #[cfg(not(unix))]
     let _ = path;
+}
+
+fn is_recorded(path: &Path) -> bool {
+    cyrup_core::spilled_files::any_recorded(|known| known == path)
+}
+
+/// The result names these files and tells the model to read them; a permission policy that guards
+/// reads outside the project needs the record to tell them from any other file in the temp
+/// directory.
+#[test]
+fn a_spill_and_a_saved_image_are_recorded_as_files_the_model_may_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let spill = spill_output(dir.path(), "full text").unwrap();
+    let image = save_image_output(dir.path(), "image/png", &[1, 2, 3]).unwrap();
+    assert!(is_recorded(&spill), "{spill:?}");
+    assert!(is_recorded(&image), "{image:?}");
+    // A neighbour nobody wrote through here is not.
+    assert!(!is_recorded(&dir.path().join(spill_file_name([9; 8]))));
+}
+
+#[test]
+fn a_spill_that_could_not_be_written_is_not_recorded() {
+    let dir = tempfile::tempdir().unwrap();
+    let token = [4, 4, 4, 4, 4, 4, 4, 4];
+    let missing = dir.path().join("does-not-exist");
+    assert!(write_spill(&missing, token, "x").is_err());
+    assert!(!is_recorded(&missing.join(spill_file_name(token))));
 }

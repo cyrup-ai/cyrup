@@ -101,6 +101,23 @@ understand two-level nesting.
 intact. That is how a `permission:` block rides along in an agent file and gets enforced by
 [the permission system](permissions.md) as its own policy layer.
 
+### Tools a subagent gets
+
+A child's tools are its own `tools:` list, not the parent's. `codemode` is not among the default
+built-ins, so a child with a `tools:` list can run [codemode](../guides/codemode.md) scripts only when
+the list names it (`tools: read, grep, codemode`), and `excludeTools` can still remove it. This holds for an agent
+that pins `extensions:` too, although such a child starts with `--no-extensions`: naming `codemode`
+keeps that one built-in loaded. A capability ceiling that denies extensions does not: the plan leaves
+`codemode` out of the child's tool list, and the child fails at start with its missing-tool message
+naming `codemode` rather than running without it. A child without a `tools:` list is started with no
+`--tools` flag, so an armed [permission system](permissions.md) activates `codemode` in it as in any
+session; a `tools:` list pins the set.
+
+Inside a child, a script's calls go through the child's permission gate. Calls a script makes are
+not counted as tool calls of the child in its progress, tool count, current tool or recent tools; the
+`codemode` call is. They still count for the check that the child changed files, so a child that
+only wrote through a script has changed files.
+
 ### Turn budgets
 
 `turnBudget` caps how many assistant turns a child may take. It is two numbers, written as **inline

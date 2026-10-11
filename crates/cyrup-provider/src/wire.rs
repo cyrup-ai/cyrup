@@ -72,6 +72,13 @@ pub struct WireProvider {
     /// classifier map, dispatched on `model.api` (`models.ts:1161-1171`). `None` is pi's absent
     /// option, which is what makes `provider.classify` absent. PROV-104.
     classifiers: Option<Arc<ClassifierApiRegistry>>,
+    /// The provider this one was composed over — pi `composeModelProvider`'s `base`
+    /// (`provider-composer.ts:657`, `:669` @v1.0.4), whose `generateImages` and `classify` the
+    /// composed provider calls through (`provider.generateImages = … base.generateImages`,
+    /// `provider.classify = … base.classify`). `None` for every provider that owns its own
+    /// operations. When set, it answers the image and classifier operations INSTEAD of
+    /// `images` and `classifiers`.
+    operations_base: Option<Arc<dyn Provider>>,
 }
 
 /// A provider's credential-scoped availability policy (Pi `Provider.filterModels?`,
@@ -105,6 +112,7 @@ impl WireProvider {
             images: None,
             classifier_models: Vec::new(),
             classifiers: None,
+            operations_base: None,
         }
     }
 
@@ -171,6 +179,19 @@ impl WireProvider {
         self
     }
 
+    /// Make `base` the owner of this provider's image generation and classification — pi
+    /// `composeModelProvider` (`provider-composer.ts` @v1.0.4), whose composed provider is built
+    /// `generateImages: base.generateImages` and `classify: base.classify` over `base`'s
+    /// `getAllModels()`: the composition changes the catalog and the auth, never what the provider
+    /// can do. Whether the operations exist at all is `base`'s answer too
+    /// ([`Provider::supports_image_generation`], [`Provider::supports_classification`]), as pi
+    /// attaches the members only `if (base?.generateImages)` / `if (base?.classify)`.
+    #[must_use]
+    pub fn with_operations_from(mut self, base: Arc<dyn Provider>) -> Self {
+        self.operations_base = Some(base);
+        self
+    }
+
     /// Override the ambient auth context (for tests / custom env sources).
     #[must_use]
     pub fn with_auth_context(mut self, ctx: Arc<dyn AuthContext>) -> Self {
@@ -206,8 +227,8 @@ impl Provider for WireProvider {
     }
 
     /// Pi `getAllModels: currentModels` (`models.ts:1085`): the ONE catalog, every type. Chat rows
-    /// first, then image rows, in the order `createProvider({ models })` was given them
-    /// (`providers/openrouter.ts:23-27`). PROV-128.
+    /// first, then image rows, then classifier rows, in the order `createProvider({ models })` was
+    /// given them (`providers/openrouter.ts:23-27`). PROV-128, PROV-104.
     fn get_all_models(&self) -> Vec<AnyModel> {
         let mut all: Vec<AnyModel> = Vec::with_capacity(
             self.models.len() + self.image_models.len() + self.classifier_models.len(),
@@ -232,6 +253,9 @@ impl Provider for WireProvider {
         context: &ImagesContext,
         options: &ImagesOptions,
     ) -> AssistantImages {
+        if let Some(base) = &self.operations_base {
+            return base.generate_images(model, context, options).await;
+        }
         match &self.images {
             Some(images) => images.generate_images(model, context, options).await,
             None => AssistantImages::errored(
@@ -251,18 +275,26 @@ impl Provider for WireProvider {
     /// "does not support image generation" before any credential is read, rather than resolving
     /// auth and then failing on dispatch. PROV-128.
     fn supports_image_generation(&self) -> bool {
-        self.images.is_some()
+        match &self.operations_base {
+            Some(base) => base.supports_image_generation(),
+            None => self.images.is_some(),
+        }
     }
 
     /// Pi dispatches `classifiers[model.api]` and answers `classifierErrorResult` when there is no
     /// entry (`models.ts:1161-1171`); [`ClassifierApiRegistry`] is that map and that message. With
-    /// no `classifiers` option at all, the absent member's message. PROV-104.
+    /// no `classifiers` option at all, the absent member's message. A provider composed over a
+    /// base ([`WireProvider::with_operations_from`]) calls through to it instead, as pi's
+    /// `composeModelProvider` assigns `provider.classify = … base.classify`. PROV-104, CFG-111.
     async fn classify(
         &self,
         model: &ClassifierModel,
         context: &ClassifierContext,
         options: &ClassifierOptions,
     ) -> ClassifierResult {
+        if let Some(base) = &self.operations_base {
+            return base.classify(model, context, options).await;
+        }
         match &self.classifiers {
             Some(classifiers) => classifiers.classify(model, context, options).await,
             None => ClassifierResult::errored(
@@ -278,9 +310,13 @@ impl Provider for WireProvider {
 
     /// Pi attaches `classify` exactly when `createProvider` was given a non-empty `classifiers`
     /// map, not when the catalog holds a classifier row — the twin of
-    /// [`WireProvider::supports_image_generation`]. PROV-104.
+    /// [`WireProvider::supports_image_generation`]. A composed provider answers with its base's
+    /// answer (pi attaches the member only `if (base?.classify)`). PROV-104, CFG-111.
     fn supports_classification(&self) -> bool {
-        self.classifiers.is_some()
+        match &self.operations_base {
+            Some(base) => base.supports_classification(),
+            None => self.classifiers.is_some(),
+        }
     }
 
     fn filter_models(

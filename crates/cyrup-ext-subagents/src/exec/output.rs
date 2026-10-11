@@ -585,12 +585,15 @@ pub fn detect_subagent_error(events: &[SubagentEvent]) -> Option<DetectedSubagen
                     tool_result: None,
                 })
             }
-            SubagentEvent::ToolExecutionEnd {
+            // A nested call is not a transcript tool result (pi: nested ids "do not appear as tool
+            // calls or tool results in the transcript"): a script that catches its own failed
+            // `tools.bash(...)` and carries on must not read as a trailing failed tool.
+            event @ SubagentEvent::ToolExecutionEnd {
                 tool_name,
                 result,
                 is_error,
                 ..
-            } => Some(DiagMessage {
+            } if !event.is_nested() => Some(DiagMessage {
                 is_assistant_with_text: false,
                 tool_result: Some(DiagToolResult {
                     tool_name: tool_name.clone(),
@@ -1341,6 +1344,7 @@ pub fn extract_child_written_output(
             tool_call_id,
             tool_name,
             args,
+            ..
         } = event
         else {
             continue;
@@ -1948,6 +1952,7 @@ mod tests {
                 tool_call_id: "c1".into(),
                 tool_name: "bash".to_string(),
                 args: serde_json::Value::Null,
+                parent_tool_call_id: None,
             },
         ];
         let out = extract_final_output(&events);
@@ -1979,6 +1984,7 @@ mod tests {
                 "terminate": false
             }),
             is_error,
+            parent_tool_call_id: None,
         }
     }
 
@@ -2199,6 +2205,7 @@ mod tests {
                 tool_name: "bash".to_string(),
                 result: serde_json::json!({"errorMessage": "not a message"}),
                 is_error: true,
+                parent_tool_call_id: None,
             },
         ];
         assert_eq!(
@@ -2822,6 +2829,7 @@ mod tests {
             tool_call_id: id.into(),
             tool_name: "write".to_string(),
             args: serde_json::json!({"path": path, "content": content}),
+            parent_tool_call_id: None,
         }
     }
 
@@ -2831,6 +2839,7 @@ mod tests {
             tool_name: "write".to_string(),
             result: serde_json::Value::Null,
             is_error,
+            parent_tool_call_id: None,
         }
     }
 
@@ -2942,12 +2951,14 @@ mod tests {
                 tool_call_id: "e1".into(),
                 tool_name: "edit".to_string(),
                 args: serde_json::json!({"path": "/tmp/out.md", "oldText": "a", "newText": "b"}),
+                parent_tool_call_id: None,
             },
             tool_result("e1", false),
             SubagentEvent::ToolExecutionStart {
                 tool_call_id: "w1".into(),
                 tool_name: "write".to_string(),
                 args: serde_json::json!({"path": "/tmp/out.md"}),
+                parent_tool_call_id: None,
             },
             tool_result("w1", false),
         ];
@@ -2988,6 +2999,7 @@ mod tests {
                     tool_call_id: "t1".into(),
                     tool_name: tool.to_string(),
                     args: serde_json::json!({"path": "/tmp/out.md", "content": "impostor"}),
+                    parent_tool_call_id: None,
                 },
                 tool_result("t1", false),
             ];
@@ -3131,5 +3143,30 @@ mod tests {
             resolve_single_output_claim_path(&dir.path().join("alias/x/y.log")),
             resolve_single_output_claim_path(&dir.path().join("real/x/y.log")),
         );
+    }
+
+    /// pi: nested ids "do not appear as tool calls or tool results in the transcript". A script
+    /// that catches its own failed `tools.bash(...)` and finishes cleanly must not make the run
+    /// read as a trailing failed tool.
+    #[test]
+    fn a_nested_failed_call_is_not_a_trailing_tool_failure() {
+        let events = vec![
+            assistant_stop("running the script"),
+            SubagentEvent::ToolExecutionEnd {
+                tool_call_id: "c1/1".into(),
+                tool_name: "bash".to_string(),
+                result: serde_json::json!({"content": [{"type": "text", "text": "boom"}]}),
+                is_error: true,
+                parent_tool_call_id: Some("c1".into()),
+            },
+            tool_result_end("codemode", "recovered and finished", false),
+        ];
+        assert_eq!(detect_subagent_error(&events), None);
+        // The same failure WITHOUT a parent is a real trailing tool failure.
+        let top_level = vec![
+            assistant_stop("running the script"),
+            tool_result_end("bash", "boom", true),
+        ];
+        assert!(detect_subagent_error(&top_level).is_some());
     }
 }

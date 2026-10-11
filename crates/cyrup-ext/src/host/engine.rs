@@ -5,6 +5,7 @@
 
 use crate::error::ExtError;
 use crate::host::limits::OOM_SENTINEL;
+use std::sync::atomic::{AtomicBool, Ordering};
 use wasmtime::{Config, Engine, InstanceAllocationStrategy, PoolingAllocationConfig};
 
 /// Build the shared engine (arch-08 §5). The host binary does not need the wasm toolchain to build
@@ -34,6 +35,50 @@ pub fn build_engine_on_demand() -> Result<Engine, ExtError> {
     config.epoch_interruption(true);
     config.wasm_component_model(true);
     Engine::new(&config).map_err(|e| ExtError::Engine(e.to_string()))
+}
+
+/// The engine the host runs on: the pooling engine, or the on-demand one when the pool cannot be
+/// built.
+///
+/// [CYRUP-DELTA] The pooling allocator reserves its slabs of address space up front (`total_memories
+/// (100)` and its siblings above), and a process whose address space is limited (`ulimit -v`, a
+/// container's `--ulimit as`, a CI job wrapper) cannot map them: `failed to create memory pool
+/// mapping`, at every limit measured below 512 GiB (2, 4, 8, 16, 32, 64, 128, 256 and 384 GiB
+/// failed; 512 GiB, 768 GiB and 1 TiB did not). With no fallback that error ended session start
+/// for every extension, the native ones (`codemode`, `mcp`, `flux`) that never touch wasm among
+/// them, and `--no-extensions` did not help. The on-demand allocator maps memory as a guest asks
+/// for it, so the host starts and a wasm guest that needs more than the limit allows fails to load
+/// by itself, as a contained error. pi has no wasm runtime to size; its extensions are TypeScript.
+///
+/// The fallback is logged once per process (the host builds an engine for the pre-trust pass and
+/// again for the session).
+pub fn build_engine_or_on_demand() -> Result<Engine, ExtError> {
+    build_engine_with_fallback(build_engine, build_engine_on_demand)
+}
+
+/// [`build_engine_or_on_demand`] with the two builders given, so a test can make the first fail.
+pub(crate) fn build_engine_with_fallback(
+    pooling: impl FnOnce() -> Result<Engine, ExtError>,
+    on_demand: impl FnOnce() -> Result<Engine, ExtError>,
+) -> Result<Engine, ExtError> {
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    match pooling() {
+        Ok(engine) => Ok(engine),
+        Err(pooling_error) => {
+            if !WARNED.swap(true, Ordering::Relaxed) {
+                tracing::warn!(
+                    error = %pooling_error,
+                    "wasm pooling allocator unavailable (is the address space limited, e.g. by \
+                     `ulimit -v`?); using the on-demand allocator"
+                );
+            }
+            on_demand().map_err(|on_demand_error| {
+                ExtError::Engine(format!(
+                    "{pooling_error}; the on-demand engine failed too: {on_demand_error}"
+                ))
+            })
+        }
+    }
 }
 
 /// Map any Wasmtime fault into a typed, surfaced `ExtError` (R-08-036). Epoch preemption becomes

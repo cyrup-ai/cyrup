@@ -33,7 +33,9 @@ mod tests;
 pub use options::{OpenAiResponsesOptions, ReasoningSummary};
 
 pub(crate) use convert::convert_responses_messages;
-pub(crate) use decoder::{EndTurnCell, decode_stream, decode_stream_with_end_turn};
+#[cfg(test)]
+pub(crate) use decoder::decode_stream;
+pub(crate) use decoder::{DecodeOptions, EndTurnCell, decode_stream_with_options};
 #[cfg(test)]
 pub(crate) use params::build_params;
 pub(crate) use params::responses_tool_choice;
@@ -46,6 +48,7 @@ use crate::error::ProviderError;
 use crate::model::Model;
 use crate::stream::StreamOptions;
 use crate::stream::sse::SseRequest;
+use crate::utils::constrained_sampling::grammar_tool_input_properties;
 use crate::utils::provider_plumbing::connect_sse;
 use auth::ResponsesCredential;
 use cyrup_core::{ApiId, CancelToken};
@@ -126,9 +129,17 @@ impl ApiImpl for OpenAiResponsesApi {
         };
 
         // PROV-011: an unsatisfiable `constrainedSampling` fails the turn before any HTTP, with
-        // pi's own message.
-        let params = match try_build_params(model, ctx, opts, auth.env.as_ref(), credential.kind())
-        {
+        // pi's own message. PROV-101: the same resolution yields the grammar tools whose
+        // `custom_tool_call`s the decoder below must read.
+        let built = grammar_tool_input_properties(
+            ctx,
+            crate::api::compat::get_responses_compat(model).supports_openai_grammar_tools,
+        )
+        .and_then(|inputs| {
+            try_build_params(model, ctx, opts, auth.env.as_ref(), credential.kind())
+                .map(|params| (params, inputs))
+        });
+        let (params, grammar_inputs) = match built {
             Ok(p) => p,
             Err(e) => {
                 let e = ProviderError::from(e);
@@ -170,6 +181,16 @@ impl ApiImpl for OpenAiResponsesApi {
             return;
         };
 
-        decode_stream(frames, model, &self.api, &sink).await;
+        decode_stream_with_options(
+            frames,
+            model,
+            &self.api,
+            &sink,
+            DecodeOptions {
+                end_turn: None,
+                grammar_inputs,
+            },
+        )
+        .await;
     }
 }

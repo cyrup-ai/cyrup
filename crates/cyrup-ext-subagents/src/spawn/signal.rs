@@ -32,6 +32,12 @@
 //! descendants a subagent is itself blocked on, which both defeats stage 1 and orphans the whole
 //! subtree at stage 3.
 //!
+//! A process group is not the whole subtree, though: the child's `bash` tool starts each command in
+//! a session of its own. [`terminate_with_graces`] therefore lists the processes below the child by
+//! parent links before it signals anything, and kills those still left once the child is gone
+//! (`descendants_of`, `kill_strays`) — what a run aborted through a cancelled token needs, since its
+//! ladder gives the child no time to kill its tool's commands itself.
+//!
 //! On non-Unix targets there is no direct `SIGINT`/`SIGTERM` process-group equivalent; per
 //! R-SA-059's own fallback clause and the workspace convention already established by
 //! `cyrup_tools::ops::local::terminate_pid`, the "graceful" stages become best-effort no-ops that
@@ -212,9 +218,38 @@ pub async fn terminate(child: Child, cancel: &CancelToken) -> std::io::Result<Te
 ///
 /// Identical to [`terminate`]'s: `Err` only from a genuine `child.wait()` I/O failure.
 pub async fn terminate_with_graces(
+    child: Child,
+    cancel: &CancelToken,
+    graces: EscalationGraces,
+) -> std::io::Result<TerminationOutcome> {
+    // [CYRUP-DELTA] The group signals of the ladder reach the child's descendants only while they
+    // share its group, and the child's `bash` tool does not leave them there: it starts every
+    // command in a session of its own, so that it can kill the command's whole tree when the tool
+    // is cancelled (`LocalProc::exec`'s `setsid`). Killing those groups is the child's job, done by
+    // its signal handler (`kill_tracked_detached_children`) when it is given the time, and when the
+    // run was CANCELLED it is not: the token is already fired, so the ladder sends SIGINT, SIGTERM
+    // and SIGKILL back to back, and the `sleep 61` of an aborted `bash` call outlived the abort,
+    // re-parented to init, in a group nothing held a handle to. So the processes below the child
+    // are listed BEFORE it is signalled (once it is dead they are children of init and nothing
+    // says whose they were) and whatever of them is left when the child is gone is killed.
+    #[cfg(unix)]
+    let mut strays = child.id().map(descendants_of).unwrap_or_default();
+    #[cfg(unix)]
+    let outcome = walk_ladder(child, cancel, graces, &mut strays).await;
+    #[cfg(not(unix))]
+    let outcome = walk_ladder(child, cancel, graces).await;
+    #[cfg(unix)]
+    kill_strays(&strays);
+    outcome
+}
+
+/// The three rungs of [`terminate_with_graces`]. `strays` is refreshed before the last one, to
+/// take in what the child started while it was being given time to stop.
+async fn walk_ladder(
     mut child: Child,
     cancel: &CancelToken,
     graces: EscalationGraces,
+    #[cfg(unix)] strays: &mut Vec<Stray>,
 ) -> std::io::Result<TerminationOutcome> {
     // Stage 1: SIGINT, raced against the SIGINT grace and `cancel`. The grace is skipped outright
     // when nothing was actually sent (non-Unix, or the child was already reaped out-of-band so it
@@ -243,6 +278,8 @@ pub async fn terminate_with_graces(
     // Stage 3: SIGKILL (or the non-Unix force-terminate equivalent) — unconditional, never
     // raced against a timer or `cancel`; `wait()` here is bounded only by the OS's own guarantee
     // that a KILL signal cannot be caught/ignored/blocked.
+    #[cfg(unix)]
+    note_descendants(&child, strays);
     send_sigkill(&mut child);
     let status = child.wait().await?;
     Ok(TerminationOutcome {
@@ -302,6 +339,31 @@ pub async fn terminate_on_timeout_with_grace(
     child: &mut Child,
     grace: Duration,
 ) -> std::io::Result<std::process::ExitStatus> {
+    // [CYRUP-DELTA] Same as [`terminate_with_graces`], for the same reason: the group signals reach
+    // only what stayed in the child's group, and a command the child started in a session of its own
+    // (a subagent's `bash` tool starts every command in one) survives them, re-parented to init. So
+    // the processes below the child are listed BEFORE it is signalled and whatever of them is left
+    // once the child is gone is killed. pi's `abortVerification` signals the child's pid alone
+    // (`child.kill`, `acceptance.ts:742-758` @v0.34.0), so a descendant outlives it there too; this
+    // is cleanup upstream does not do, in the one place it is known to leak.
+    #[cfg(unix)]
+    let mut strays = child.id().map(descendants_of).unwrap_or_default();
+    #[cfg(unix)]
+    let result = walk_timeout_ladder(child, grace, &mut strays).await;
+    #[cfg(not(unix))]
+    let result = walk_timeout_ladder(child, grace).await;
+    #[cfg(unix)]
+    kill_strays(&strays);
+    result
+}
+
+/// The two rungs of [`terminate_on_timeout_with_grace`]. `strays` is refreshed before the last one,
+/// to take in what the child started while it was being given time to stop.
+async fn walk_timeout_ladder(
+    child: &mut Child,
+    grace: Duration,
+    #[cfg(unix)] strays: &mut Vec<Stray>,
+) -> std::io::Result<std::process::ExitStatus> {
     // Rung 1: SIGTERM, raced against the hard-kill timer only — a timeout path has no grace period
     // left to honor beyond the one upstream itself arms, and none at all when the SIGTERM was never
     // actually sent (non-Unix; see [`send_sigterm`]).
@@ -314,6 +376,8 @@ pub async fn terminate_on_timeout_with_grace(
 
     // Rung 2: SIGKILL — unconditional, and its `wait()` is never raced, so this function's
     // "confirmed gone" contract is bounded by the OS's own guarantee rather than another timer.
+    #[cfg(unix)]
+    note_descendants(child, strays);
     send_sigkill(child);
     child.wait().await
 }
@@ -451,6 +515,19 @@ pub(crate) fn send_sigkill(child: &mut Child) {
     let _ = child.start_kill();
 }
 
+/// [`send_sigkill`] for a child that is being abandoned rather than waited for: the processes below
+/// it are listed first and killed with it, so that what it started in sessions of its own does not
+/// outlive it (see [`terminate_with_graces`]). It cannot wait for the child to die, so the strays
+/// are killed at once; the child's `SIGKILL` is not catchable, and it has no handler to give them
+/// time for.
+pub(crate) fn send_sigkill_to_tree(child: &mut Child) {
+    #[cfg(unix)]
+    let strays = child.id().map(descendants_of).unwrap_or_default();
+    send_sigkill(child);
+    #[cfg(unix)]
+    kill_strays(&strays);
+}
+
 /// The exact argv pi's `killProcessTree` passes to `taskkill` on win32
 /// (`packages/coding-agent/src/utils/shell.ts:204` @v0.83.0:
 /// `["/F", "/T", "/PID", String(pid)]`), and the in-workspace twin of
@@ -517,6 +594,152 @@ fn send_signal(pid: u32, signal: nix::sys::signal::Signal) {
         _ => nix_pid,
     };
     let _ = nix::sys::signal::kill(target, signal);
+}
+
+/// A process below the child, remembered with enough to tell it from a later process that is
+/// given its pid.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Stray {
+    pid: u32,
+    /// When the process started, in the table's own unit (`starttime` of `/proc/<pid>/stat`); `None`
+    /// where the table has none, and the pid alone is then all there is to go by.
+    started: Option<u64>,
+}
+
+/// One row of the process table.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Row {
+    pid: u32,
+    ppid: u32,
+    started: Option<u64>,
+}
+
+/// Every live process below `root` by parent links, however many process groups and sessions lie
+/// between them: the child, what it started, what that started. Empty when the process table cannot
+/// be read, which leaves [`terminate_with_graces`] with the group signals it always had.
+#[cfg(unix)]
+fn descendants_of(root: u32) -> Vec<Stray> {
+    process_table().map_or_else(Vec::new, |table| descendants_in(&table, root))
+}
+
+/// Adds to `strays` the processes below `child` that are not on it yet: what the child started
+/// since the list was taken.
+#[cfg(unix)]
+fn note_descendants(child: &Child, strays: &mut Vec<Stray>) {
+    if let Some(pid) = child.id() {
+        for stray in descendants_of(pid) {
+            if !strays.iter().any(|known| known.pid == stray.pid) {
+                strays.push(stray);
+            }
+        }
+    }
+}
+
+/// [`descendants_of`] over an explicit table.
+#[cfg(unix)]
+fn descendants_in(table: &[Row], root: u32) -> Vec<Stray> {
+    let mut found: Vec<Stray> = Vec::new();
+    let mut frontier = vec![root];
+    while let Some(parent) = frontier.pop() {
+        for row in table {
+            if row.ppid == parent && row.pid != root && !found.iter().any(|s| s.pid == row.pid) {
+                found.push(Stray {
+                    pid: row.pid,
+                    started: row.started,
+                });
+                frontier.push(row.pid);
+            }
+        }
+    }
+    found
+}
+
+/// The live (not zombie) processes: from `/proc` where there is one, from `ps` where there is not
+/// (macOS). `None` when neither can be read.
+#[cfg(unix)]
+fn process_table() -> Option<Vec<Row>> {
+    if let Ok(entries) = std::fs::read_dir("/proc") {
+        let table: Vec<Row> = entries
+            .filter_map(Result::ok)
+            .filter_map(|entry| {
+                let pid: u32 = entry.file_name().to_str()?.parse().ok()?;
+                let stat = std::fs::read_to_string(entry.path().join("stat")).ok()?;
+                let (ppid, started) = parse_proc_stat(&stat)?;
+                Some(Row {
+                    pid,
+                    ppid,
+                    started: Some(started),
+                })
+            })
+            .collect();
+        if !table.is_empty() {
+            return Some(table);
+        }
+    }
+    let listing = std::process::Command::new("ps")
+        .args(["-axo", "pid=,ppid=,stat="])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()
+        .filter(|output| output.status.success())?;
+    let table: Vec<Row> = String::from_utf8_lossy(&listing.stdout)
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let pid = fields.next()?.parse().ok()?;
+            let ppid = fields.next()?.parse().ok()?;
+            let live = !fields.next()?.starts_with('Z');
+            live.then_some(Row {
+                pid,
+                ppid,
+                started: None,
+            })
+        })
+        .collect();
+    (!table.is_empty()).then_some(table)
+}
+
+/// `(ppid, starttime)` from a `/proc/<pid>/stat` line, or `None` for a zombie or a line that does not
+/// parse. The command name is in parentheses and may hold spaces and parentheses itself, so the
+/// fields are read after the LAST closing one: `state ppid pgrp session tty_nr tpgid flags minflt
+/// cminflt majflt cmajflt utime stime cutime cstime priority nice num_threads itrealvalue
+/// starttime ...`.
+#[cfg(unix)]
+fn parse_proc_stat(stat: &str) -> Option<(u32, u64)> {
+    let after_name = stat.get(stat.rfind(')')? + 1..)?;
+    let mut fields = after_name.split_whitespace();
+    let state = fields.next()?;
+    let ppid = fields.next()?.parse().ok()?;
+    // Skips `pgrp` through `itrealvalue`, seventeen fields, to reach `starttime`.
+    let started = fields.nth(17)?.parse().ok()?;
+    (!state.starts_with('Z')).then_some((ppid, started))
+}
+
+/// Whether `stray` is still the process it was when it was listed: running, and not a later process
+/// that was handed its pid.
+#[cfg(unix)]
+fn is_still_running(stray: Stray) -> bool {
+    match stray.started {
+        None => true,
+        Some(started) => std::fs::read_to_string(format!("/proc/{}/stat", stray.pid))
+            .ok()
+            .and_then(|stat| parse_proc_stat(&stat))
+            .is_some_and(|(_, now)| now == started),
+    }
+}
+
+/// `SIGKILL`s each of `strays` that is still the process it was listed as, with its whole group when
+/// it leads one (the `bash` tool's command and everything it started).
+#[cfg(unix)]
+fn kill_strays(strays: &[Stray]) {
+    for &stray in strays {
+        if is_still_running(stray) {
+            send_signal(stray.pid, nix::sys::signal::Signal::SIGKILL);
+        }
+    }
 }
 
 /// Make sure a child spawned from THIS process can actually be killed by `SIGINT` — repairing the
@@ -646,6 +869,74 @@ mod tests {
     )]
 
     use super::*;
+
+    /// `/proc/<pid>/stat` puts the command name first, in parentheses, and a name can hold spaces
+    /// and parentheses: the fields that follow are read after the LAST `)`. A zombie has no parent
+    /// worth following (it is dead).
+    #[cfg(unix)]
+    #[test]
+    fn proc_stat_yields_the_parent_pid_and_start_after_the_last_closing_parenthesis() {
+        let stat = |name: &str, state: &str| {
+            format!(
+                "42 ({name}) {state} 7 42 42 0 -1 4194560 100 0 0 0 1 2 3 4 20 0 1 0 987654 1000"
+            )
+        };
+        assert_eq!(parse_proc_stat(&stat("sleep", "S")), Some((7, 987_654)));
+        assert_eq!(parse_proc_stat(&stat("a b) c", "R")), Some((7, 987_654)));
+        assert_eq!(parse_proc_stat(&stat("defunct", "Z")), None);
+        assert_eq!(parse_proc_stat("garbage"), None);
+        assert_eq!(parse_proc_stat("42 (x) S 7"), None);
+    }
+
+    /// Descendants are found by parent links alone, through any depth and any process group, and
+    /// the root itself and unrelated processes are not among them.
+    #[cfg(unix)]
+    #[test]
+    fn descendants_follow_parent_links_to_any_depth() {
+        let row = |pid, ppid| Row {
+            pid,
+            ppid,
+            started: Some(u64::from(pid)),
+        };
+        let table = [
+            row(10, 1),
+            row(11, 10),
+            row(12, 11),
+            row(13, 10),
+            row(20, 1),
+            row(21, 20),
+            row(1, 0),
+        ];
+        let mut found: Vec<u32> = descendants_in(&table, 10).iter().map(|s| s.pid).collect();
+        found.sort_unstable();
+        assert_eq!(found, [11, 12, 13]);
+        assert!(descendants_in(&table, 99).is_empty());
+        // A cycle (a stale table) ends instead of looping.
+        let cycle = [row(2, 1), row(1, 2)];
+        assert_eq!(descendants_in(&cycle, 1).len(), 1);
+    }
+
+    /// A pid handed to another process since the listing is not killed: the start time is part of
+    /// what the process was.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_stray_whose_pid_was_reused_is_not_the_process_that_was_listed() {
+        let me = std::process::id();
+        let stat = std::fs::read_to_string(format!("/proc/{me}/stat")).unwrap();
+        let (_, started) = parse_proc_stat(&stat).unwrap();
+        assert!(is_still_running(Stray {
+            pid: me,
+            started: Some(started)
+        }));
+        assert!(!is_still_running(Stray {
+            pid: me,
+            started: Some(started + 1)
+        }));
+        assert!(!is_still_running(Stray {
+            pid: u32::MAX - 1,
+            started: Some(started)
+        }));
+    }
 
     /// SUBA-023 — signal-name attribution on [`TerminationOutcome`].
     ///

@@ -47,6 +47,10 @@
 use crate::error::SubagentError;
 use crate::exec::agent_config::AgentConfig;
 
+/// The `codemode` tool's name (`cyrup_codemode_runtime::EXTENSION_ID`, which is also the tool's
+/// name). This crate does not depend on the runtime crate, so the literal is restated.
+const CODEMODE_TOOL_NAME: &str = "codemode";
+
 // ================================================================================================
 // ResolvedToolSurface
 // ================================================================================================
@@ -662,8 +666,25 @@ pub fn resolve_tool_surface_in(
         Vec::new()
     };
 
+    // [CYRUP-DELTA] `codemode` is an ambient built-in, and a child under `--no-extensions` (an agent
+    // that pins `extensions:`, or this very ceiling) loads it only when its `--tools` names it
+    // (`cyrup-session-svc`'s `child_keeps_codemode`). A ceiling that denies extensions must keep it
+    // out, so the name is left off the list the child is launched with. pi-subagents' child
+    // session registers the host's codemode factory only when `!capabilityCeiling?.denyExtensions`
+    // (`child-session.ts` @HEAD `0c33ec7c`). `required_child_tools` above is deliberately computed
+    // BEFORE this subtraction: the agent still declared the tool, so the child's `agent_start`
+    // check reports it missing by name instead of the run silently proceeding without it.
+    let builtins: Vec<String> = if deny_extensions {
+        effective_builtin_tools
+            .into_iter()
+            .filter(|tool| tool != CODEMODE_TOOL_NAME)
+            .collect()
+    } else {
+        effective_builtin_tools
+    };
+
     Ok(ResolvedToolSurface {
-        builtins: effective_builtin_tools,
+        builtins,
         // G103 / pi `runs/shared/pi-args.ts:389-393` @v0.43.0: `explicitToolAllowlist` is "did
         // anything pin this child's tool surface at all". cyrup folds pi's `tools` and
         // `mcpDirectTools` into the one `agent.tools`, so `is_some()` covers pi's first two terms
@@ -1273,6 +1294,39 @@ mod tests {
         assert!(
             denied.tool_extension_paths.is_empty(),
             "pi empties the PLAN field under `denyExtensions`, not just the argv it feeds"
+        );
+    }
+
+    /// A subagent's `tools:` may name `codemode`; the child keeps it across `--no-extensions` when
+    /// the list reaches it. A ceiling that denies extensions must keep it out of that list, and the
+    /// agent's own declaration still makes the child require it, so the child names the tool as
+    /// missing at `agent_start` instead of dropping it without a word.
+    #[test]
+    fn deny_extensions_keeps_codemode_out_of_the_launch_list_but_in_the_required_list() {
+        let mut agent = agent_with(Some("read"));
+        agent.tools = Some(vec![
+            ToolRef::Builtin("read".to_string()),
+            ToolRef::Builtin("codemode".to_string()),
+        ]);
+
+        let open = resolve_tool_surface_in(&agent, false, None, no_cwd(), &unreachable_dirs())
+            .expect("resolves");
+        assert_eq!(
+            open.builtins,
+            vec!["read".to_string(), "codemode".to_string()]
+        );
+
+        let c = crate::exec::capability_ceiling::ResolvedCapabilityCeiling {
+            deny_extensions: true,
+            ..ceiling(None, &["test"])
+        };
+        let denied =
+            resolve_tool_surface_in(&agent, false, Some(&c), no_cwd(), &unreachable_dirs())
+                .expect("resolves");
+        assert_eq!(denied.builtins, vec!["read".to_string()]);
+        assert_eq!(
+            denied.required_child_tools,
+            vec!["read".to_string(), "codemode".to_string()]
         );
     }
 

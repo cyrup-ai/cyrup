@@ -127,10 +127,11 @@ fn build_run_ctx(
     let working_messages = messages.clone();
     let state = Arc::new(Mutex::new(StateInner {
         system_prompt: system_prompt.clone(),
+        shared_system_prompt: None,
         model: Some(config.model.clone()),
         thinking_level: config.thinking_level,
         tools: tools.clone(),
-        messages,
+        messages: messages.into(),
         streaming_message: None,
         pending_tool_calls: HashSet::new(),
         error_message: None,

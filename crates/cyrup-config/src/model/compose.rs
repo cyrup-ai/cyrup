@@ -122,6 +122,19 @@ pub fn models_json_provider_is_configured(
         || crate::config_value::is_config_value_configured(raw, env)
 }
 
+/// The `baseUrl` a `models.json` block puts on every model its provider lists, of every type: pi's
+/// `config.oauth === "radius" ? model.baseUrl : (config.baseUrl ?? model.baseUrl)`
+/// (provider-composer.ts:326 @v1.0.4), which `applyModelsJson` evaluates for chat and non-chat
+/// models alike. `None` leaves each model's own endpoint. Under an oauth mode the block's `baseUrl`
+/// is the auth gateway, so the models keep their own request endpoints; `oauth` is single-valued,
+/// so `is_none()` is the exact negation of Pi's `=== "radius"`.
+pub(crate) fn provider_base_url(config: &ProviderConfig) -> Option<&str> {
+    config
+        .base_url
+        .as_deref()
+        .filter(|_| config.oauth.is_none())
+}
+
 /// Pi `applyModelsJson` + `modelFromJson` + the `modelOverrides` map
 /// (provider-composer.ts:161-199, 124-159, 433-436), as one fallible composition over ONE provider's
 /// models. Returns the provider's effective model list, or Pi's own error string.
@@ -164,10 +177,8 @@ pub(crate) fn apply_models_json(
             // (:188): under an oauth mode the block's `baseUrl` is the auth gateway, so the models
             // keep their own request endpoints. `oauth` is single-valued, so `is_none()` is the
             // exact negation of Pi's `=== "radius"`.
-            if let Some(base_url) = &config.base_url
-                && config.oauth.is_none()
-            {
-                m.base_url = base_url.clone();
+            if let Some(base_url) = provider_base_url(config) {
+                m.base_url = base_url.to_string();
             }
             m.compat = merge_compat(m.compat.as_ref(), config.compat.as_ref());
             m

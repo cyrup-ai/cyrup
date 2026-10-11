@@ -15,8 +15,8 @@ use super::ToolCall;
 pub enum NestedCallError {
     /// The arguments could not be encoded as JSON.
     Arguments(String),
-    /// The host refused the call itself — `call-id` is not the call in flight, no session is
-    /// attached, or the call re-enters this same extension instance. The text is the host's.
+    /// The host refused the call itself — `call-id` is not the call in flight or no session is
+    /// attached. The text is the host's.
     Host(String),
     /// The host's answer is not the JSON shape `world.wit` promises.
     Answer(String),
@@ -35,17 +35,41 @@ impl std::fmt::Display for NestedCallError {
 impl std::error::Error for NestedCallError {}
 
 /// The options of [`ToolCall::execute_tool`] — pi `ExecuteToolOptions`
-/// (`extensions/types.ts:368-373` @v1.0.1).
+/// (`extensions/types.ts:368-373` @v1.0.4).
 ///
-/// Pi's `signal` is not here: the nested call is always cancelled with the calling tool, because a
-/// guest suspended inside the call has no abort handle of its own to fire. Pi's `onUpdate` is here,
-/// but a guest cannot run a closure while the host runs the call, so it is invoked once per partial
-/// result AFTER the call settles, in order (the same results reach `tool_execution_update` events
-/// live).
+/// A guest suspended inside the call can neither run a closure nor fire an abort, so both of pi's
+/// options cross in a different shape. `on_update` is invoked once per partial result AFTER the
+/// call settles, in order (the same results reach `tool_execution_update` events live). Pi's
+/// `signal` is the named signal [`Self::signal_id`] — the id namespace
+/// [`crate::ctx::Ui::abort_signal`] writes, read once when the call starts, so only pi's "already
+/// aborted" branch is reachable — and [`Self::timeout_ms`], the one mid-call abort a guest can ask
+/// the host for. The nested call is always also cancelled with the calling tool.
 #[derive(Default)]
 pub struct ExecuteToolOptions {
     /// Receives each partial result of the nested tool, as pi's `AgentToolResult` JSON.
     pub on_update: Option<Box<dyn FnMut(Value)>>,
+    /// A named signal that cancels the call when it was aborted before the call started. Set with
+    /// [`Self::signal_id`].
+    pub signal_id: Option<String>,
+    /// Cancel the call this many milliseconds after it starts (pi: `AbortSignal.timeout(ms)` as
+    /// `signal`). Set with [`Self::timeout_ms`].
+    pub timeout_ms: Option<u32>,
+}
+
+impl ExecuteToolOptions {
+    /// Cancel the call when the named signal was already aborted (builder-style).
+    #[must_use]
+    pub fn signal_id(mut self, id: impl Into<String>) -> Self {
+        self.signal_id = Some(id.into());
+        self
+    }
+
+    /// Cancel the call after `ms` milliseconds (builder-style).
+    #[must_use]
+    pub fn timeout_ms(mut self, ms: u32) -> Self {
+        self.timeout_ms = Some(ms);
+        self
+    }
 }
 
 /// The settled result of a nested call — pi `AgentToolResult` as carried by
@@ -158,8 +182,9 @@ impl ToolCall {
     /// and a bounded record of it is kept as `nestedCalls` on this call's result message.
     ///
     /// `Err` only when the call itself could not be made (see [`NestedCallError`]); a tool that
-    /// failed is `Ok` with [`ToolOutcome::is_error`] set. A call to a tool of this same extension
-    /// is refused: an instance runs one call at a time, and this one is suspended in the call.
+    /// failed is `Ok` with [`ToolOutcome::is_error`] set, and so is a call to a tool of this same
+    /// extension: an instance runs one call at a time and this one is suspended in the call, so the
+    /// host answers that call with an error outcome that names the cause instead of running it.
     pub fn execute_tool(
         &self,
         name: &str,
@@ -168,7 +193,11 @@ impl ToolCall {
     ) -> Result<ToolOutcome, NestedCallError> {
         let args_json =
             serde_json::to_string(&args).map_err(|e| NestedCallError::Arguments(e.to_string()))?;
-        let ExecuteToolOptions { on_update } = options;
+        let ExecuteToolOptions {
+            on_update,
+            signal_id,
+            timeout_ms,
+        } = options;
         #[cfg(target_arch = "wasm32")]
         {
             let mut on_update = on_update;
@@ -177,7 +206,11 @@ impl ToolCall {
                     &self.call_id,
                     name,
                     &args_json,
-                    on_update.is_some(),
+                    &crate::guest::bindings::cyrup::ext::host_tool::ExecuteOptions {
+                        collect_updates: on_update.is_some(),
+                        signal_id,
+                        timeout_ms,
+                    },
                 )
                 .map_err(NestedCallError::Host)?;
             if let Some(on_update) = on_update.as_mut() {
@@ -190,7 +223,7 @@ impl ToolCall {
         }
         #[cfg(not(target_arch = "wasm32"))]
         {
-            let _ = (name, args_json, on_update);
+            let _ = (name, args_json, on_update, signal_id, timeout_ms);
             Err(NestedCallError::Host(
                 "execute_tool unavailable on host target".into(),
             ))

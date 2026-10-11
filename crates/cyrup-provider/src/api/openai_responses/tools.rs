@@ -2,7 +2,8 @@
 
 use crate::context::ToolDef;
 use crate::utils::constrained_sampling::{
-    ConstrainedSamplingError, json_schema_tool_parameters, resolve_json_schema_strict_sampling,
+    ConstrainedSamplingError, json_schema_tool_parameters, resolve_grammar_constrained_sampling,
+    resolve_json_schema_strict_sampling,
 };
 use serde_json::{Map, Value, json};
 
@@ -22,6 +23,11 @@ pub(crate) struct ConvertResponsesToolsOptions {
     /// (`:345`). `Some(b)` is a JSON boolean; **`None` is JSON `null`**, which is what
     /// `openai-codex-responses.ts:576` passes (`strict: null`) — not an absent key.
     pub default_strict: Option<bool>,
+    /// Pi `const supportsOpenAIGrammarTools = options?.supportsOpenAIGrammarTools ?? false`
+    /// (`openai-responses-shared.ts:363` @v1.0.4): the route's `compat.supportsOpenAIGrammarTools`.
+    /// When set, a tool that declares grammar constrained sampling is sent as a `custom` tool
+    /// instead of a JSON-schema `function` tool (PROV-101).
+    pub supports_openai_grammar_tools: bool,
 }
 
 /// 1:1 port of Pi `convertResponsesTools` (`openai-responses-shared.ts:359-395` @v0.84.2).
@@ -41,6 +47,30 @@ pub(crate) fn convert_responses_tools(
     tools
         .iter()
         .map(|t| {
+            // Pi `resolveGrammarConstrainedSampling` first (`:366-379` @v1.0.4): a grammar tool is
+            // `{type:"custom", name, description, format:{type:"grammar", syntax, definition}}`
+            // with no `parameters` and no `strict`. A route without grammar support resolves to
+            // `None` and the tool falls through to the JSON function tool below.
+            if let Some(grammar) =
+                resolve_grammar_constrained_sampling(t, options.supports_openai_grammar_tools)?
+            {
+                let mut o = Map::new();
+                o.insert("type".to_string(), json!("custom"));
+                o.insert("name".to_string(), json!(t.name));
+                o.insert("description".to_string(), json!(t.description));
+                o.insert(
+                    "format".to_string(),
+                    json!({
+                        "type": "grammar",
+                        "syntax": grammar.format.as_str(),
+                        "definition": grammar.definition,
+                    }),
+                );
+                if options.defer_loading {
+                    o.insert("defer_loading".to_string(), json!(true));
+                }
+                return Ok(Value::Object(o));
+            }
             let constrained_strict =
                 resolve_json_schema_strict_sampling(t, options.supports_strict_mode, None)?;
             // `const strict = constrainedStrict ?? defaultStrict` (`:381` @v0.84.2) — resolved

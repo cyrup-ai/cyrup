@@ -21,7 +21,7 @@ use crate::host::services::{
 use crate::host::store_state::HostState;
 use crate::native::{CtxTier, ExtMode};
 use crate::nested::{
-    ExecuteToolOptions, ExtensionToolContext, callable_tools_json, tool_update_json,
+    ExecuteToolOptions, ExtensionToolContext, callable_tools_json, loadout_json, tool_update_json,
 };
 use crate::registry::{CommandDescriptor, ExecModeWire, ToolDescriptor};
 use crate::ui_prompt::UiPromptKind;
@@ -174,6 +174,22 @@ impl bindings::cyrup::ext::registration::Host for HostState {
         let exposure =
             crate::registry::parse_exposure(&guest.owner, &t.name, t.exposure.as_deref())
                 .map_err(|e| e.to_string())?;
+        // pi `ToolDefinition.outputSchema` (`extensions/types.ts:592` @v1.0.4) is a schema object.
+        // An unparseable declaration is refused like an unknown `exposure`: a tool that promises a
+        // structured result and cannot say what shape it has would hand a script a value no
+        // declaration describes.
+        let output_schema = match t.output_schema_json.as_deref() {
+            None => None,
+            Some(raw) => match serde_json::from_str::<Value>(raw) {
+                Ok(schema) if schema.is_object() || schema.is_boolean() => Some(schema),
+                _ => {
+                    return Err(format!(
+                        "tool `{}`: `output-schema-json` is not a JSON Schema",
+                        t.name
+                    ));
+                }
+            },
+        };
         let desc = ToolDescriptor {
             name: t.name,
             label: t.label,
@@ -219,6 +235,14 @@ impl bindings::cyrup::ext::registration::Host for HostState {
                 instructions: n.instructions,
             }),
             default_active: t.default_active.unwrap_or(true),
+            output_schema,
+            annotations: t.annotations.map(|a| cyrup_core::ToolAnnotations {
+                read_only_hint: a.read_only_hint,
+                destructive_hint: a.destructive_hint,
+                idempotent_hint: a.idempotent_hint,
+                open_world_hint: a.open_world_hint,
+            }),
+            prepare_loadout: t.prepare_loadout,
         };
         // A guest tool is dispatched back across the boundary; register it via the registry's
         // descriptor table so the active-tool set can surface it (R-08-012/014). A refusal (pi's
@@ -1289,14 +1313,15 @@ impl bindings::cyrup::ext::host_tool::Host for HostState {
     }
 
     /// pi `ctx.executeTool(name, args, options?)` for the guest tool call `call_id`
-    /// (`extensions/types.ts:394` @v1.0.1): the call goes through the session
-    /// ([`crate::NestedToolRunner`]) bound to that call, with the calling tool's own cancellation.
+    /// (`extensions/types.ts:394` @v1.0.4): the call goes through the session
+    /// ([`crate::NestedToolRunner`]) bound to that call, cancelled with the calling tool, with the
+    /// guest's own signal and deadline when `options` names them.
     async fn execute_tool(
         &mut self,
         call_id: String,
         name: String,
         args_json: String,
-        collect_updates: bool,
+        options: bindings::cyrup::ext::host_tool::ExecuteOptions,
     ) -> Result<(String, Vec<String>), String> {
         let guest = Arc::clone(guest_of(self)?);
         let context = guest
@@ -1305,16 +1330,36 @@ impl bindings::cyrup::ext::host_tool::Host for HostState {
         let args: Value = serde_json::from_str(&args_json)
             .map_err(|e| NestedImportRefusal::BadArguments(e.to_string()).to_string())?;
         // pi's `onUpdate` closure inverts into the partial results returned once the call settles
-        // (`world.wit`, `host-tool.execute-tool`); the same results already reached the
+        // (`world.wit`, `host-tool.execute-options`); the same results already reached the
         // `tool_execution_update` events as they happened.
         let partials: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
-        let on_update: Option<ToolUpdateSink> = collect_updates.then(|| {
+        let on_update: Option<ToolUpdateSink> = options.collect_updates.then(|| {
             let partials = Arc::clone(&partials);
             Box::new(move |u: ToolUpdate| {
                 if let Ok(mut g) = partials.lock() {
                     g.push(tool_update_json(&u).to_string());
                 }
             }) as ToolUpdateSink
+        });
+        // pi's `signal` option. The call is cancelled with the calling tool whatever it says (a
+        // child token), and also by the guest's named signal and deadline. A suspended guest can
+        // abort nothing while the call runs, so the signal is read once, here, and the deadline is
+        // the only mid-call abort it can ask for ([CYRUP-DELTA], `world.wit`).
+        let cancel = context.cancel().child_token();
+        if options
+            .signal_id
+            .as_deref()
+            .is_some_and(|id| guest.is_signal_aborted(id))
+        {
+            cancel.cancel();
+        }
+        let deadline = options.timeout_ms.map(|ms| {
+            let token = cancel.clone();
+            let ms = u64::from(ms);
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+                token.cancel();
+            })
         });
         // The nested call can run for as long as the tools it calls: the wait is host time, not
         // guest CPU, so it is forgiven against the epoch budget exactly like a dialog.
@@ -1324,11 +1369,14 @@ impl bindings::cyrup::ext::host_tool::Host for HostState {
                 &name,
                 args,
                 ExecuteToolOptions {
-                    cancel: None,
+                    cancel: Some(cancel),
                     on_update,
                 },
             )
             .await;
+        if let Some(deadline) = deadline {
+            deadline.abort();
+        }
         guest.note_dialog_wait(started);
         let partial_results = partials.lock().map(|g| g.clone()).unwrap_or_default();
         Ok((outcome.to_wire().to_string(), partial_results))
@@ -2214,12 +2262,23 @@ impl LiveExtension {
                 let details = out
                     .details_json
                     .and_then(|d| serde_json::from_str::<Value>(&d).ok());
+                // pi `AgentToolResult.structuredContent` (`agent/src/types.ts:433` @v1.0.4): what a
+                // codemode script receives for a tool that declares an `outputSchema`. An
+                // unparseable value is the omitted field, not a failure of a call that ran.
+                let structured_content = out
+                    .structured_content_json
+                    .and_then(|s| serde_json::from_str::<Value>(&s).ok());
                 // WIT `tool-output.terminate` is a plain `bool` (world.wit:162) — THE boundary where
                 // the guest's bool becomes a hint. A guest `false` is "nothing said", so the wire
                 // it produces (key absent) is byte-identical to before `TerminateHint` existed.
                 Ok(ToolResult {
                     content,
                     details,
+                    structured_content,
+                    // pi `AgentToolResult.isError` (`agent/src/types.ts:440`): the guest reported a
+                    // failure without throwing. The field crossed the ABI and stopped here, so a
+                    // guest's `ToolOutput::error` ran as a success.
+                    is_error: out.is_error,
                     terminate: TerminateHint::from_guest_bool(out.terminate),
                     ..Default::default()
                 })
@@ -2861,6 +2920,59 @@ impl LiveExtension {
         }
     }
 
+    /// The instance lock, held by the caller: what a running tool call holds.
+    #[cfg(test)]
+    pub(crate) async fn hold_instance_for_test(&self) -> impl Drop + '_ {
+        self.inner.lock().await
+    }
+
+    /// Invoke the guest's `prepare-loadout` export (CODE-015) for the tool `name`, from the
+    /// SYNCHRONOUS context [`cyrup_core::Tool::prepare_loadout`] runs in.
+    ///
+    /// `None` when the instance is busy: a single-instance store runs one call at a time, and the
+    /// session applies the loadout from inside the very call that holds it when a tool's own
+    /// `set-active-tools` triggers it, so waiting would deadlock. The caller falls back to the
+    /// tool's last answer (see `world.wit`, `events.prepare-loadout`).
+    ///
+    /// The export is driven to completion on a scoped thread under the caller's tokio context, so
+    /// it is safe from any runtime flavour and never parks a worker the guest's own imports might
+    /// need; the caller blocks for the call, which the epoch deadline bounds.
+    pub fn try_prepare_loadout(
+        &self,
+        name: &str,
+        loadout_json: &str,
+    ) -> Option<Result<Option<String>, ExtError>> {
+        let mut guard = self.inner.try_lock().ok()?;
+        let inner = &mut *guard;
+        inner.store.set_epoch_deadline(self.epoch_ticks);
+        self.guest.arm_epoch_deadline_estimate(self.epoch_ticks);
+        // EVENT tier: like argument preparation, this runs inside the session's tool bookkeeping,
+        // not from a command handler.
+        self.guest.set_tier(CtxTier::Event);
+        let runtime = tokio::runtime::Handle::try_current().ok();
+        let api = inner.instance.cyrup_ext_events();
+        let answer = std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let _enter = runtime.as_ref().map(tokio::runtime::Handle::enter);
+                    futures::executor::block_on(api.call_prepare_loadout(
+                        &mut inner.store,
+                        name,
+                        loadout_json,
+                    ))
+                })
+                .join()
+        });
+        Some(match answer {
+            Ok(Ok(Ok(changes))) => Ok(changes),
+            Ok(Ok(Err(message))) => Err(ExtError::CommandFailed(message)),
+            Ok(Err(e)) => Err(map_wasm_error(&e)),
+            Err(_) => Err(ExtError::Panicked(
+                "the `prepare-loadout` call panicked".into(),
+            )),
+        })
+    }
+
     async fn render(
         &self,
         custom_type: &str,
@@ -2896,12 +3008,39 @@ impl LiveExtension {
 pub struct WasmTool {
     ext: Arc<LiveExtension>,
     descriptor: ToolDescriptor,
+    /// The last changes the guest's `prepare-loadout` answered, kept for the call that finds the
+    /// instance busy ([`LiveExtension::try_prepare_loadout`]).
+    last_loadout: std::sync::Mutex<cyrup_core::ToolLoadoutChanges>,
 }
 
 impl WasmTool {
     pub fn new(ext: Arc<LiveExtension>, descriptor: ToolDescriptor) -> Self {
-        Self { ext, descriptor }
+        Self {
+            ext,
+            descriptor,
+            last_loadout: std::sync::Mutex::default(),
+        }
     }
+}
+
+/// The `ToolLoadoutChanges` a guest's `prepare-loadout` answered, as pi's
+/// `{descriptions?, hiddenDeclarations?}` JSON (`extensions/types.ts:553-563` @v1.0.4).
+fn parse_loadout_changes(raw: &str) -> Result<cyrup_core::ToolLoadoutChanges, ToolError> {
+    #[derive(serde::Deserialize, Default)]
+    #[serde(rename_all = "camelCase", default)]
+    struct Wire {
+        descriptions: std::collections::BTreeMap<String, String>,
+        hidden_declarations: Vec<String>,
+    }
+    let wire: Wire = serde_json::from_str(raw).map_err(|e| {
+        ToolError::new(format!(
+            "`prepare-loadout` returned something that is not `{{descriptions?, hiddenDeclarations?}}`: {e}"
+        ))
+    })?;
+    Ok(cyrup_core::ToolLoadoutChanges {
+        descriptions: wire.descriptions,
+        hidden_declarations: wire.hidden_declarations,
+    })
 }
 
 /// The `Tool::label` view of a guest descriptor (EXT-M03). Split out of the trait method purely so
@@ -3015,10 +3154,62 @@ impl Tool for WasmTool {
     fn namespace(&self) -> Option<&cyrup_core::ToolNamespace> {
         self.descriptor.namespace.as_ref()
     }
+    /// The guest's declared `annotations` (pi `ToolDefinition.annotations`,
+    /// `extensions/types.ts:603` @v1.0.4).
+    fn annotations(&self) -> Option<&cyrup_core::ToolAnnotations> {
+        self.descriptor.annotations.as_ref()
+    }
+    /// The guest's declared `outputSchema` (pi `ToolDefinition.outputSchema`,
+    /// `extensions/types.ts:592` @v1.0.4). Without this override the trait default, `None`, would
+    /// answer for every guest tool, and a codemode script would be handed the text of a result
+    /// that carries a structured one (`toScriptValue` reads `structuredContent` only for a tool
+    /// that declares a schema, `execute.ts:303-312`).
+    fn output_schema(&self) -> Option<&Value> {
+        self.descriptor.output_schema.as_ref()
+    }
     /// The guest's declared `defaultActive` (pi `ToolDefinition.defaultActive`,
     /// `extensions/types.ts:608` @v1.0.1); `true` when omitted.
     fn default_active(&self) -> bool {
         self.descriptor.default_active
+    }
+    /// pi `ToolDefinition.prepareLoadout` (`extensions/types.ts:617` @v1.0.4), run by the guest's
+    /// `prepare-loadout` export. CODE-015 — a guest tool kept the trait default, so it could never
+    /// describe the callable tools in its own description or hide a declaration.
+    ///
+    /// Only called across the boundary when the descriptor DECLARED the hook. The trait method is
+    /// synchronous (it runs inside the session's tool-state lock, and a guest's `set-active-tools`
+    /// is synchronous by design), so this drives the export to completion on a scoped thread; when
+    /// the instance is busy it answers with the last changes it got ([CYRUP-DELTA], `world.wit`,
+    /// `events.prepare-loadout`).
+    fn prepare_loadout(
+        &self,
+        view: &cyrup_core::LoadoutView<'_>,
+    ) -> Result<cyrup_core::ToolLoadoutChanges, ToolError> {
+        if !self.descriptor.prepare_loadout {
+            return Ok(cyrup_core::ToolLoadoutChanges::default());
+        }
+        let loadout = loadout_json(view).to_string();
+        let remembered = |tool: &Self| {
+            tool.last_loadout
+                .lock()
+                .map(|g| g.clone())
+                .unwrap_or_default()
+        };
+        let Some(answer) = self
+            .ext
+            .try_prepare_loadout(&self.descriptor.name, &loadout)
+        else {
+            return Ok(remembered(self));
+        };
+        let changes = match answer {
+            Ok(Some(raw)) => parse_loadout_changes(&raw)?,
+            Ok(None) => cyrup_core::ToolLoadoutChanges::default(),
+            Err(e) => return Err(ToolError::new(e.to_string())),
+        };
+        if let Ok(mut last) = self.last_loadout.lock() {
+            *last = changes.clone();
+        }
+        Ok(changes)
     }
     /// pi `ToolDefinition.prepareArguments?: (args: unknown) => Static<TParams>`
     /// (`extensions/types.ts:468` @v0.83.0), run BEFORE `validateToolArguments` in
@@ -4041,6 +4232,9 @@ mod tests {
             exposure: cyrup_core::ToolExposure::Direct,
             namespace: None,
             default_active: true,
+            output_schema: None,
+            annotations: None,
+            prepare_loadout: false,
         };
         assert_eq!(
             descriptor_label(&described),

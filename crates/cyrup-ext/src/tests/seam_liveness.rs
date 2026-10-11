@@ -273,6 +273,9 @@ fn descriptor(name: &str, description: &str) -> ToolDescriptor {
         exposure: cyrup_core::ToolExposure::Direct,
         namespace: None,
         default_active: true,
+        output_schema: None,
+        annotations: None,
+        prepare_loadout: false,
     }
 }
 

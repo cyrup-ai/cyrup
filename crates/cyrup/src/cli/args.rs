@@ -123,6 +123,10 @@ pub struct Cli {
     /// Disable extension discovery (explicit `-e` paths still work).
     #[arg(long = "no-extensions")]
     pub no_extensions: bool,
+    /// Disable built-in MCP support for this run: no servers connect and no MCP tools (pi
+    /// `--no-mcp`, `cli/args.ts` @v1.0.4, which sets `disabledBuiltinExtensions: ["mcp"]`).
+    #[arg(long = "no-mcp")]
+    pub no_mcp: bool,
     /// Load a skill file or directory (repeatable).
     #[arg(long = "skill", allow_hyphen_values = true)]
     pub skill: Vec<PathBuf>,

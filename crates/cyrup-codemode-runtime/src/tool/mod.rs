@@ -30,11 +30,13 @@
 //! | `execute` | `execute.ts:300-433` | CODE-009, CODE-012 |
 //! | `discovery` | `execute.ts:437-517` | CODE-010 |
 //! | `models` | `execute.ts:524-630` | CODE-008 |
+//! | `docs` | `tool.ts:133` | — |
 //! | `store` | `tool.ts:53`, `execute.ts:205-228` | CODE-009 |
 //! | `host`, `factory` | `ExtensionToolContext`, `new CodemodeSandbox` | — |
 
 pub mod description;
 pub mod discovery;
+pub mod docs;
 pub mod execute;
 pub mod factory;
 mod globals;
@@ -59,7 +61,8 @@ pub use description::{
     to_codemode_declaration,
 };
 pub use factory::{
-    EngineSandboxFactory, SandboxFactory, SandboxUnavailable, UnavailableSandboxFactory,
+    EngineSandboxFactory, IsolatedSandboxFactory, SandboxFactory, SandboxUnavailable,
+    UnavailableSandboxFactory,
 };
 pub use host::{CodemodeHost, CodemodeHostSlot, NestedOutcome, StoreAppendFailed};
 pub use models::CodemodeModels;
@@ -80,6 +83,12 @@ pub const CODEMODE_DOCS_FILE: &str = "codemode.md";
 /// `getDocsPath()`), so the model can `read` it from any working directory. An install whose asset
 /// directory cannot be located has no shipped docs to point at, and the path is then the page's
 /// location inside the docs directory, `docs/codemode.md`.
+///
+/// [CYRUP-DELTA] That is only the default of a tool that was not told where the agent directory is.
+/// The binary attaches the extension with
+/// [`CodemodeExtension::with_agent_dir`](crate::CodemodeExtension::with_agent_dir), which writes the
+/// page embedded in the binary ([`docs::materialise_codemode_docs`]) and points at that copy, so the
+/// path resolves for an installed binary too.
 #[must_use]
 pub fn codemode_docs_path() -> String {
     docs_path_in(cyrup_config::docs_dir().as_deref())
@@ -103,6 +112,10 @@ pub const PROMPT_GUIDELINES: [&str; 1] = [
 
 /// The tool's parameter schema (`codemodeSchema`, `tool.ts:90-94`): `{ code: string }`.
 ///
+/// [CYRUP-DELTA, PROV-101] the property is described as "JavaScript source (no code fence)" where
+/// upstream says "Raw JavaScript source.": this schema is what a provider without grammar tools
+/// sends, and there the script is the string value of `code`, JSON-escaped like any other string.
+///
 /// One `static`: every wrapper of the tool hands back the same schema object.
 ///
 /// Upstream's `isCodemodeTool` (`tool.ts:98-100`) compares that object by identity, and its one caller
@@ -114,7 +127,7 @@ pub fn codemode_schema() -> &'static Value {
         json!({
             "type": "object",
             "properties": {
-                "code": { "type": "string", "description": "Raw JavaScript source." }
+                "code": { "type": "string", "description": "JavaScript source (no code fence)." }
             },
             "required": ["code"]
         })
@@ -250,6 +263,7 @@ impl CodemodeTool {
                 guidelines: &std::collections::BTreeMap::new(),
                 inline_budget: None,
                 docs_path: &options.docs_path,
+                identifiers: &cyrup_codemode::identifier::IdentifierTable::default(),
             },
         );
         Self {
@@ -328,5 +342,7 @@ impl Tool for CodemodeTool {
 
 #[cfg(test)]
 mod engine_tests;
+#[cfg(test)]
+mod grammar_tests;
 #[cfg(test)]
 mod tests;

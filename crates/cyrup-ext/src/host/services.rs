@@ -1425,6 +1425,55 @@ pub struct UiChrome {
 pub struct DenyServices;
 impl HostServices for DenyServices {}
 
+/// [CYRUP-DELTA] The holder of the session's [`HostServices`] that a native extension keeps for the
+/// code that runs outside a [`HostCtx`](crate::HostCtx): a background task, a prompt hook, a
+/// completion watcher. pi's factory runs once per process and rebinds its context on every
+/// `session_start`; cyrup builds the replacement session first, with a `LiveHostServices` of its own,
+/// and runs `NativeExtension::set_host_services` again on the SAME extension object
+/// (`ExtensionHost::load_native_with_services`). A holder that kept the first backend (a `OnceLock`)
+/// sent everything after `/new`, an RPC `new_session` or a second ACP `session/new` to the session that
+/// had been replaced: the tool set was shaped on its registry, and a background task's completion was
+/// injected into its transcript. The last bind wins, as it does for the holders that were rebindable
+/// from the start.
+#[derive(Default)]
+pub struct HostServicesSlot {
+    services: std::sync::RwLock<Option<Arc<dyn HostServices>>>,
+}
+
+impl HostServicesSlot {
+    /// An empty slot: [`Self::get`] is `None` until the host binds a backend.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Bind the session's backend, replacing the previous one.
+    pub fn bind(&self, services: Arc<dyn HostServices>) {
+        // An `Option<Arc>`: a poisoned lock holds no broken invariant.
+        *self
+            .services
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(services);
+    }
+
+    /// The bound backend, if any.
+    #[must_use]
+    pub fn get(&self) -> Option<Arc<dyn HostServices>> {
+        self.services
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
+
+impl std::fmt::Debug for HostServicesSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HostServicesSlot")
+            .field("bound", &self.get().is_some())
+            .finish()
+    }
+}
+
 /// Canned responses a [`RecordingServices`] returns for the interactive (host→user) capabilities.
 #[derive(Clone, Debug)]
 pub struct CannedResponses {
@@ -3480,6 +3529,30 @@ impl GuestState {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
     use super::*;
+
+    /// A backend that only says which session it belongs to.
+    struct SessionOf(&'static str);
+    impl HostServices for SessionOf {
+        fn session_id(&self) -> Option<String> {
+            Some(self.0.to_string())
+        }
+    }
+
+    /// A session replacement binds the replacement's backend to the same extension object, and what
+    /// the extension reaches outside a `HostCtx` has to be the live session's. The slot is empty until
+    /// the host binds, and the last bind wins; a holder that kept the first one (a `OnceLock`) sent
+    /// everything after `/new` to the session that had been replaced.
+    #[test]
+    fn a_host_services_slot_is_empty_until_bound_and_the_last_bind_wins() {
+        let slot = HostServicesSlot::new();
+        assert!(slot.get().is_none());
+
+        slot.bind(Arc::new(SessionOf("first")));
+        assert_eq!(slot.get().unwrap().session_id().as_deref(), Some("first"));
+
+        slot.bind(Arc::new(SessionOf("second")));
+        assert_eq!(slot.get().unwrap().session_id().as_deref(), Some("second"));
+    }
 
     /// A formatted result never prints the key, nor any value of the env overlay: the overlay of
     /// another provider can hold its own secrets. The variable names are still there to debug by.

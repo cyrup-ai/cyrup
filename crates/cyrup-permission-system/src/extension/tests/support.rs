@@ -185,3 +185,38 @@ impl HostServices for ExposureRegistry {
         guard(&self.applied).push(tools.to_vec());
     }
 }
+
+/// A registry whose prompt mirror follows `set_active_tools`, as the live session's does: applying
+/// the tool set rebuilds the base prompt, and `system_prompt()` reads the rebuilt one back.
+pub(super) struct RebuildingHost {
+    pub(super) names: Vec<String>,
+    /// What `system_prompt()` returns now.
+    pub(super) prompt: Mutex<String>,
+    /// What it returns once `set_active_tools` has been called.
+    pub(super) rebuilt: String,
+    pub(super) applied: Mutex<Vec<Vec<String>>>,
+}
+
+impl HostServices for RebuildingHost {
+    fn all_tool_names(&self) -> Option<Vec<String>> {
+        Some(self.names.clone())
+    }
+    fn system_prompt(&self) -> Option<String> {
+        Some(guard(&self.prompt).clone())
+    }
+    fn set_active_tools(&self, tools: &[String]) {
+        guard(&self.applied).push(tools.to_vec());
+        *guard(&self.prompt) = self.rebuilt.clone();
+    }
+}
+
+/// The system prompt a `before_agent_start` outcome replaces the prompt with, if it does.
+pub(super) fn replaced_prompt(outcome: cyrup_ext::HookOutcome) -> Option<String> {
+    match outcome {
+        cyrup_ext::HookOutcome::Mutate(cyrup_ext::EventPatch::SystemPromptAndInject {
+            system,
+            ..
+        }) => system,
+        _ => None,
+    }
+}

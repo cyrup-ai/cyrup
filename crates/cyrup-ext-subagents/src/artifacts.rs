@@ -713,6 +713,29 @@ mod tests {
         );
     }
 
+    /// SUBA-175 — pi's `_meta.json` `usage` is its own six-field `Usage`, `turns` included
+    /// (`shared/types.ts:261-268` @ad11b7ab; written at `runs/foreground/execution.ts:154` and
+    /// `runs/background/subagent-runner.ts:1512`), and `/subagent-cost` reads the count back off it.
+    /// `cyrup_core::Usage` has no turn count, so the builder adds the result's own beside the
+    /// token columns. Mutation killed: leaving the count out of the usage object.
+    #[test]
+    fn metadata_usage_carries_the_turn_count_beside_the_token_columns() {
+        let mut result = crate::exec::pre_spawn_failure(
+            &crate::exec::testsupport::sample_agent_config("m1", &[]),
+            "task",
+            String::new(),
+        );
+        result.usage.input = 30;
+        result.usage.cost.total = 0.5;
+        result.turns = 3;
+
+        let usage = run_artifact_metadata("r1", &result)["usage"].clone();
+
+        assert_eq!(usage["turns"], serde_json::json!(3), "{usage}");
+        assert_eq!(usage["input"], serde_json::json!(30), "{usage}");
+        assert_eq!(usage["cost"]["total"], serde_json::json!(0.5), "{usage}");
+    }
+
     /// SUBA-048 — pi `getArtifactsDir(sessionFile, projectCwd?, dirPreference = "project")`
     /// (`shared/artifacts.ts:160-183` @v0.43.0), all three arms plus their fall-throughs.
     ///

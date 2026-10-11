@@ -864,3 +864,17 @@ fn qwen_omits_reasoning_effort_with_thinking_off_and_without_effort_support() {
     );
     assert!(body.get("reasoning_effort").is_none(), "{body}");
 }
+
+/// PROMPT-001 — the prompt a transcript replays to reaches the chat-completions body: the agent
+/// builds its request from system rows alone, so the adapter must render what the context carries.
+#[test]
+fn the_transcripts_prompt_reaches_the_request_body() {
+    use crate::api::prompt_fixture::{agent_context, assert_wire_carries_prompt};
+    let body = build_body(
+        &model(),
+        &agent_context(Vec::new()),
+        &StreamOptions::default(),
+    );
+    assert_wire_carries_prompt(&body.to_string());
+    assert_eq!(body["messages"][0]["role"], "system", "{body}");
+}

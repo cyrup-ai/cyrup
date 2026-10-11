@@ -72,6 +72,7 @@ impl AskChannel for CountingOnceChannel {
             approved: true,
             state: PermissionDecisionState::Once,
             denial_reason: None,
+            reject_script: false,
         })
     }
 }
@@ -313,6 +314,7 @@ impl AskChannel for GatedChannel {
             approved: true,
             state: PermissionDecisionState::Once,
             denial_reason: None,
+            reject_script: false,
         })
     }
 }

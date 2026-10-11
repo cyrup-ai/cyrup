@@ -112,6 +112,12 @@ pub enum SanctionedWaitKind {
     /// Cutting it at the dispatch budget loses exactly the completions the drain exists to deliver.
     /// Always declared with a ceiling derived from that `timeoutMs`.
     AutoDrain,
+    /// A `tool_call` handler holding the call until the servers it needs have connected — the MCP
+    /// extension's wait before a `codemode` script or a `tool_search` runs, so the tools of a server
+    /// that is still starting are registered when it looks (`pi.on("tool_call")` in
+    /// `extensions/mcp/index.ts` @v1.0.4, which awaits the servers' `ready` promises). Always
+    /// declared with a ceiling; the handler gives up and lets the call run before it passes.
+    ServerConnect,
 }
 
 /// One live sanctioned wait.
@@ -1229,7 +1235,10 @@ pub trait NativeExtension: Send + Sync {
     /// The default is a no-op — a built-in that needs none simply ignores it. A built-in that DOES
     /// need late, out-of-`HostCtx` reach (a background tokio task that must resolve the live session
     /// id/file, open a dialog, or inject a turn-triggering message) overrides this to STASH the `Arc`
-    /// in its own interior-mutable slot (`OnceLock`/`Mutex`). The captured `Arc` is a shared handle to
+    /// in a [`crate::host::HostServicesSlot`] (or a `Mutex` of its own) and NOT in a `OnceLock`: a
+    /// session replacement (`/new`, RPC `new_session`, a second ACP `session/new`) builds the
+    /// replacement's `LiveHostServices` and calls this again on the SAME extension object, and a
+    /// set-once slot keeps serving the session that was replaced. The captured `Arc` is a shared handle to
     /// the one `LiveHostServices` the session late-attaches its manager / ui sink / inject sink to, so
     /// capturing it early (before those attachments) is correct: the built-in observes them through
     /// the `Arc`'s interior mutability when the background task actually runs. Gated on `wasm-host`

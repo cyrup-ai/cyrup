@@ -62,6 +62,7 @@ impl PermissionSystemExtension {
         // \[CYRUP-DELTA] pi v0.8.0 predates the exposure model (`ToolExposure`,
         // `core/extensions/types.ts:509` @pi v1.0.1) and round-trips every `getAllTools()` name.
         let allowed: Option<Vec<String>> = services
+            .as_ref()
             .and_then(|s| {
                 s.all_tool_names()
                     .map(|names| shapeable_tools(names, s.all_tools(), s.active_tools()))
@@ -78,6 +79,16 @@ impl PermissionSystemExtension {
         };
 
         // pi `:1894-1898`: `setActiveTools` runs ONLY when the tool-list key changed.
+        //
+        // \[CYRUP-DELTA] `system_prompt` was built for the tools that were active before this
+        // call, and the sanitizers below only ever REMOVE from it: handed back as it was, it
+        // described the old tool set (the first prompt of a session listed six tools and the
+        // rules for them while the request declared twelve, and under `codemode.mode: only` it
+        // described tools the request hides), because the replacement a handler returns wins over
+        // the base the session rebuilds afterwards. pi's `setActiveTools` rebuilds the base before
+        // it returns, so the prompt for the new tools is read back here and sanitized instead.
+        // Only when nothing earlier in the chain changed the prompt: its edit would be lost.
+        let mut rebuilt: Option<String> = None;
         let active_tools_key = agent_start_cache::create_active_tools_cache_key(&allowed);
         {
             let mut cache = guard(&self.agent_start_cache);
@@ -85,12 +96,17 @@ impl PermissionSystemExtension {
                 cache.last_active_tools_key.as_deref(),
                 &active_tools_key,
             ) {
-                if let Some(s) = services {
+                if let Some(s) = &services {
+                    let before = s.system_prompt();
                     s.set_active_tools(&allowed);
+                    if before.as_deref() == Some(system_prompt) {
+                        rebuilt = s.system_prompt();
+                    }
                 }
                 cache.last_active_tools_key = Some(active_tools_key);
             }
         }
+        let system_prompt = rebuilt.as_deref().unwrap_or(system_prompt);
 
         // pi `:1900-1907`: the prompt-state key. `permissionStamp` is what makes a mid-session
         // policy edit invalidate this — see [`PermissionManager::policy_cache_stamp`].

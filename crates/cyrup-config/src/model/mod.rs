@@ -24,7 +24,7 @@ mod validate;
 #[cfg(test)]
 mod fixtures;
 
-pub(crate) use compose::apply_models_json;
+pub(crate) use compose::{apply_models_json, provider_base_url};
 pub use compose::{models_json_provider_is_configured, provider_is_configured};
 pub use cycler::ModelCycler;
 pub use defaults::{build_fallback_model, default_model_per_provider};

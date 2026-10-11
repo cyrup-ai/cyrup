@@ -152,6 +152,11 @@ pub struct SessionConfig {
     /// [`native_survives_no_extensions`] for the discriminator and for the one carve-out pi makes in
     /// a subagent child.
     pub no_extensions: bool,
+    /// Ids of native built-in extensions this session does not load (pi
+    /// `resourceLoaderOptions.disabledBuiltinExtensions`, `main.ts` @v1.0.4, which `--no-mcp` sets
+    /// to `["mcp"]`: "Disable built-in MCP support: no servers connect and no MCP tools"). Unlike
+    /// `--no-extensions` this removes the named built-in whatever tier it is in.
+    pub disabled_builtin_extensions: Vec<String>,
     /// Explicit `--extension <path>` resources to load as pre-trust *configured* extensions (Pi
     /// `resourceLoaderOptions.additionalExtensionPaths`, main.ts:660). Each may be a single extension
     /// dir or a directory of extensions. Threaded into [`extension_discovery_roots`] regardless of
@@ -249,6 +254,7 @@ impl SessionConfig {
             no_prompt_templates: false,
             no_themes: false,
             no_extensions: false,
+            disabled_builtin_extensions: Vec::new(),
             extra_extension_paths: Vec::new(),
             extra_skill_paths: Vec::new(),
             extra_prompt_paths: Vec::new(),
@@ -400,13 +406,15 @@ const ALL_BUILTIN_TOOLS: [&str; 8] = [
 /// `defaultTools` first shipped as an `allowedToolNames` allowlist (`4d9aa837c`) that dropped
 /// extension and SDK custom tools, and `541045ae0` ("preserve extension tools with defaults")
 /// narrowed it to the built-in selection before v0.84.4 shipped.
+///
+/// The other half of the setting — a configured name an EXTENSION registered, `codemode` for one —
+/// is applied further down `build`, against the registry the extensions filled
+/// ([`crate::default_tools`]); this function never sees those tools' names.
 fn select_active_tools(
     visible: &[Arc<dyn cyrup_core::Tool>],
     cfg: &SessionConfig,
     default_tools: Option<&[String]>,
 ) -> Vec<Arc<dyn cyrup_core::Tool>> {
-    let exclude: std::collections::HashSet<&str> =
-        cfg.exclude_tools.iter().map(String::as_str).collect();
     // Pi `_isActivatedOnRegistration` for the non-built-in tools (`agent-session.ts:3554` @v1.0.1):
     // a `codemode`, `deferred` or `hidden` tool, or one registered `defaultActive: false`, is
     // registered but not active at start.
@@ -417,7 +425,10 @@ fn select_active_tools(
         match (&cfg.tools, cfg.no_tools) {
             // Explicit allowlist wins (Pi `options.tools`): naming a tool activates it iff it is
             // declarable, even when it is not active by default (`agent-session.ts:3510-3516`).
-            (Some(allow), _) => allow.iter().any(|a| a == name) && t.exposure().declarable(),
+            // `--tools` entries are exact names or `*` patterns (`createToolNameMatcher`).
+            (Some(allow), _) => {
+                cyrup_core::tool_name_matches(allow, name) && t.exposure().declarable()
+            }
             (None, Some(NoTools::All)) => false,
             // SEAM-118: `!ALL_BUILTIN_TOOLS`, not `!DEFAULT_BUILTIN_TOOLS`. Upstream's expression
             // branches on the PRESENCE of `noTools`, not on its value —
@@ -469,44 +480,9 @@ fn select_active_tools(
     };
     visible
         .iter()
-        .filter(|t| keep(t) && !exclude.contains(t.name()))
+        .filter(|t| keep(t) && !cyrup_core::tool_name_matches(&cfg.exclude_tools, t.name()))
         .cloned()
         .collect()
-}
-
-/// The extension tools the `defaultTools` setting names, appended to the active set registration
-/// produced. pi seeds `_refreshToolRegistry` with `initialActiveToolNames` — the resolved
-/// `defaultTools` when neither `tools` nor `noTools` is given (`sdk.ts:282-294` @v1.1.0) — and
-/// keeps every allowed name of it whatever the tool's `defaultActive` (`agent-session.ts:3566-3568`),
-/// so a named `codemode` starts active. [`select_active_tools`] applies the setting to built-ins
-/// only, which left `"defaultTools": ["+codemode"]` without a `codemode` tool. A named tool must be
-/// declarable, the rule an explicit `tools` list follows here too: a `codemode`, `deferred` or
-/// `hidden` tool is reached through `codemode` or `tool_search`, never declared.
-///
-/// `registered` is already narrowed by `excludeTools`; with `noTools` pi's default list is empty,
-/// and an explicit `tools` list is resolved by [`select_active_tools`] and the registry filter.
-fn activate_default_extension_tools(
-    mut active: Vec<Arc<dyn cyrup_core::Tool>>,
-    registered: &[Arc<dyn cyrup_core::Tool>],
-    cfg: &SessionConfig,
-    default_tools: Option<&[String]>,
-) -> Vec<Arc<dyn cyrup_core::Tool>> {
-    let Some(names) = default_tools else {
-        return active;
-    };
-    if cfg.tools.is_some() || cfg.no_tools.is_some() {
-        return active;
-    }
-    for tool in registered {
-        let name = tool.name();
-        if names.iter().any(|n| n == name)
-            && tool.exposure().declarable()
-            && !active.iter().any(|t| t.name() == name)
-        {
-            active.push(tool.clone());
-        }
-    }
-    active
 }
 
 /// A `tools` list resolved against pi v1.1.0's `+name`/`-name` modifier form (SEAM-148).
@@ -704,6 +680,11 @@ pub struct SessionBuilder {
     /// allocator reserving its slabs), which cannot be staged from inside the test process.
     #[cfg(test)]
     force_pre_trust_wasm_failure: bool,
+    /// Tests only: make the session's own extension host behave as if the Wasmtime runtime could
+    /// not be constructed at all (neither the pooling nor the on-demand engine), so the
+    /// native-only host is exercisable. Same reasoning as the field above.
+    #[cfg(test)]
+    force_runtime_wasm_failure: bool,
 }
 
 /// The interactive project-trust prompt seam (pi `selectProjectTrustOption`,
@@ -773,6 +754,8 @@ impl SessionBuilder {
             reload_rebuild: false,
             #[cfg(test)]
             force_pre_trust_wasm_failure: false,
+            #[cfg(test)]
+            force_runtime_wasm_failure: false,
         }
     }
 
@@ -811,6 +794,16 @@ impl SessionBuilder {
     #[must_use]
     pub(crate) fn force_pre_trust_wasm_failure(mut self) -> Self {
         self.force_pre_trust_wasm_failure = true;
+        self
+    }
+
+    /// Force the native-only fallback of the session's own extension host: it behaves as if the
+    /// Wasmtime runtime could not be constructed. Tests only, like
+    /// [`Self::force_pre_trust_wasm_failure`].
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn force_runtime_wasm_failure(mut self) -> Self {
+        self.force_runtime_wasm_failure = true;
         self
     }
 
@@ -979,6 +972,10 @@ impl SessionBuilder {
         // SEAM-148: pi rejects a mixed or patterned modifier list before building anything
         // (`core/sdk.ts:280-281` @f1b2e77f5).
         check_tool_list(&cfg)?;
+        // The native built-ins the launch flags turned off (pi `disabledBuiltinExtensions`) are
+        // never loaded, not even to vote on project trust.
+        let native_extensions =
+            without_disabled_builtins(self.native_extensions, &cfg.disabled_builtin_extensions);
         // Embedder-supplied seams pulled out before the rest of `self` is consumed piecewise below.
         let custom_stream_fn = self.stream_fn;
         let custom_key_resolver = self.key_resolver;
@@ -1010,7 +1007,7 @@ impl SessionBuilder {
             pre_trust_extension_verdict(
                 &cfg,
                 &cwd,
-                &self.native_extensions,
+                &native_extensions,
                 &settings.global().extension_paths(),
                 force_wasm_failure,
             )
@@ -1478,8 +1475,21 @@ impl SessionBuilder {
         };
         // With `wasm-host`, spin up the Wasmtime engine so live wasm extensions can be loaded with
         // `LiveHostServices` injected (the seam below); otherwise a native-only host (the default).
+        //
+        // [CYRUP-DELTA] A runtime that cannot be constructed leaves the NATIVE extensions running
+        // instead of ending session start (`ExtensionHost::with_wasm(..)?` used to). `codemode`,
+        // `mcp`, `flux` and the other built-ins never need wasm, and the pre-trust pass above
+        // already degrades this way (EXT-003). A wasm extension that is installed then fails to
+        // load and is reported through `startup_diagnostics` like any other load failure
+        // (`WasmHostDisabled`). pi has no wasm runtime to lose.
         #[cfg(feature = "wasm-host")]
-        let host = ExtensionHost::with_wasm(host_config)?;
+        let host = {
+            #[cfg(test)]
+            let force_failure = self.force_runtime_wasm_failure;
+            #[cfg(not(test))]
+            let force_failure = false;
+            wasm_host_or_native_only(host_config, force_failure)
+        };
         #[cfg(not(feature = "wasm-host"))]
         let host = ExtensionHost::new(host_config);
         // Attach the live `getActiveTools` source BEFORE any tool set is materialized, so every tool
@@ -1545,8 +1555,19 @@ impl SessionBuilder {
         // (`resource-loader.ts:451-452`, `:555-557` @v0.83.0). It does not touch pi's inline
         // `extensionFactories` tier, and neither does this — see `native_survives_no_extensions`.
         let is_subagent_child = std::env::var_os(SUBAGENT_CHILD_ENV).is_some();
-        for ext in natives_to_load(self.native_extensions, cfg.no_extensions, is_subagent_child) {
+        let keeps_codemode = child_keeps_codemode(&cfg);
+        let codemode_available = native_extensions
+            .iter()
+            .any(|e| e.id().as_str() == cyrup_codemode_runtime::EXTENSION_ID);
+        let mut codemode_loaded = false;
+        for ext in natives_to_load(
+            native_extensions,
+            cfg.no_extensions,
+            is_subagent_child,
+            keeps_codemode,
+        ) {
             let id = ext.id();
+            codemode_loaded |= id.as_str() == cyrup_codemode_runtime::EXTENSION_ID;
             if let Err(e) = host
                 .load_native_with_services(ext, native_services.clone())
                 .await
@@ -1561,6 +1582,10 @@ impl SessionBuilder {
                 });
             }
         }
+        native_load_errors.extend(codemode_skipped_diagnostic(
+            &cfg,
+            codemode_available && !codemode_loaded,
+        ));
         let ext_host = Arc::new(host);
 
         // ---- 5. resources discovery (cyrup-resources) — RUN FIRST (before disk-extension load) so
@@ -2171,14 +2196,6 @@ impl SessionBuilder {
             allowed_tool_names.as_ref(),
             &excluded_tool_names,
         )?;
-        // `defaultTools` names extension tools too: `"defaultTools": ["+codemode"]` is how pi's
-        // docs turn `codemode` on (`docs/mcp.md:230`, `docs/cli.md:164` @v1.1.0).
-        let active_tools = activate_default_extension_tools(
-            active_tools,
-            &registered_tools,
-            &tool_selection.cfg,
-            configured_default_tools.as_deref(),
-        );
         // The dynamic-tool registry (Pi `_toolRegistry`): every Availability-visible tool, the caller's
         // custom tools, AND the extension-contributed/override tools are enable-able; the active set
         // starts at the build-time selection. Including the extension tools is load-bearing: (a) the
@@ -2257,12 +2274,61 @@ impl SessionBuilder {
         } else {
             None
         };
-        let initial_loadout = {
-            let names: Vec<String> = restored_loadout
+        //
+        // `defaultTools` names that are not built-ins: `select_active_tools` above only
+        // walks the built-in registry, so `codemode`, `tool_search` and every other tool an
+        // extension registered never saw the configured names. Pi hands ONE list of initial names
+        // to the session and activates each registered tool the list names
+        // (`sdk.ts:282-294` → `agent-session.ts:3566-3592` @v1.1.0); this is that second half,
+        // against the registry the extensions just filled. Only the default arm applies it: an
+        // explicit `--tools` list, `--no-tools` or `--no-builtin-tools` replaces the configured
+        // list, and a `+name`/`-name` `tools` list has been applied to it already (SEAM-148).
+        let default_plan = {
+            // The selection pi seeds the session with: once the `+name`/`-name` modifiers were
+            // applied to the defaults it carries neither `tools` nor `noTools`, which also holds
+            // for `noTools: "builtin"` with modifiers (their base is empty, they fill it), so this
+            // is not `uses_default_tools` (pi's `usesDefaultTools` is false there).
+            let names_apply =
+                tool_selection.cfg.tools.is_none() && tool_selection.cfg.no_tools.is_none();
+            let configured = configured_default_tools.clone().unwrap_or_default();
+            // What counts as "already offered". The `/reload` rebuild offered every configured
+            // name: the names the setting newly adds are activated after it, against the replaced
+            // session's own `defaultTools` (`AgentSession::activate_added_default_tools`, pi's
+            // `previousDefaultTools`), and a name turned off since stays off. A session restored
+            // from its transcript elsewhere has no earlier load to ask, so it is what the
+            // transcript's first system message declared (see [`crate::default_tools`]).
+            let started_with = if self.reload_rebuild {
+                Some(configured.clone())
+            } else {
+                restored_loadout
+                    .as_ref()
+                    .and_then(|_| crate::default_tools::declared_at_start(&existing_raw))
+            };
+            crate::default_tools::plan(
+                &crate::default_tools::DefaultToolInputs {
+                    names_apply,
+                    configured: &configured,
+                    excluded: &excluded_tool_names,
+                    started_with: started_with.as_deref(),
+                },
+                &registry_tools,
+            )
+        };
+        if let Some(warning) = default_plan.warning() {
+            startup_diagnostics.settings.push(warning);
+        }
+        let initial_names: Vec<String> = {
+            let mut names: Vec<String> = restored_loadout
                 .clone()
                 .unwrap_or_else(|| active_tools.iter().map(|t| t.name().to_string()).collect());
-            cyrup_core::ToolLoadout::resolve(&names, &registry_tools)
+            for name in &default_plan.activate {
+                if !names.contains(name) {
+                    names.push(name.clone());
+                }
+            }
+            names
         };
+        let initial_loadout = cyrup_core::ToolLoadout::resolve(&initial_names, &registry_tools);
         let selected_tools: Vec<Arc<str>> = initial_loadout
             .executable()
             .iter()
@@ -2380,12 +2446,29 @@ impl SessionBuilder {
             registry_tools,
             active_tools.clone(),
             crate::tools::PromptRebuilder::new(rebuild_base, contributions),
+            // pi filters the base definitions and `allCustomTools` by `_isAllowedTool` before the
+            // registry is built (`_refreshToolRegistry`, `agent-session.ts:3497-3536` @v1.0.4).
+            // The registry here is built from every Availability-visible built-in, so it is the
+            // registry's own constructor that applies the bounds: a built-in the flags do not
+            // allow is never registered, which is what keeps the permission system's per-turn
+            // `set_active_tools` over `all_tool_names`, `set_active_tools_by_name` and a
+            // `codemode` script's `tools.*` from reaching it.
+            crate::tools::ToolAccess::new(allowed_tool_names.clone(), excluded_tool_names.clone()),
         );
         // The same names `initial_loadout` was resolved from, now with their pending half: a
         // restored tool that registers after the build (an MCP server still connecting) becomes
         // active when it does.
-        if let Some(names) = &restored_loadout {
-            dynamic_tool_state.restore_declared(names);
+        //
+        // The configured names nothing has registered yet wait too ([CYRUP-DELTA] — see
+        // `default_tools`): pi drops an unregistered default name, cyrup keeps it until a tool of
+        // that name registers or the first run starts.
+        if restored_loadout.is_some()
+            || !default_plan.activate.is_empty()
+            || !default_plan.pending.is_empty()
+        {
+            let mut pending = restored_loadout.clone().unwrap_or_default();
+            pending.extend(default_plan.pending.iter().cloned());
+            dynamic_tool_state.seed(&initial_names, &pending);
         }
         let dynamic_tools = Arc::new(std::sync::Mutex::new(dynamic_tool_state));
         host_services.attach_dynamic_tools(dynamic_tools.clone());
@@ -3316,7 +3399,7 @@ async fn pre_trust_extension_verdict(
     // (`core/extensions/runner.ts:204-233` @v0.84.4). A failure in part of the extension subsystem
     // never silences the part that still works; here the natives are exactly that part.
     #[cfg(feature = "wasm-host")]
-    let (host, wasm_ready) = match pre_trust_wasm_host(host_config.clone(), force_wasm_failure) {
+    let (host, wasm_ready) = match try_wasm_host(host_config.clone(), force_wasm_failure) {
         Ok(host) => (host, true),
         Err(e) => {
             tracing::warn!(
@@ -3336,9 +3419,10 @@ async fn pre_trust_extension_verdict(
     // either — pi's pre-trust pass (`loadProjectTrustExtensions()`) runs over the SAME reduced set
     // its main pass does, because both read `extensionPaths` (resource-loader.ts:451-455 @v0.83.0).
     let is_subagent_child = std::env::var_os(SUBAGENT_CHILD_ENV).is_some();
-    let voters = natives
-        .iter()
-        .filter(|e| !cfg.no_extensions || native_survives_no_extensions(e, is_subagent_child));
+    let voters = natives.iter().filter(|e| {
+        !cfg.no_extensions
+            || native_survives_no_extensions(e, is_subagent_child, child_keeps_codemode(cfg))
+    });
     for ext in voters.filter(|e| e.decides_project_trust()) {
         // A load failure in the throwaway pass must not fail the build — the real load at step 4b
         // surfaces it. Skip and keep polling the rest.
@@ -3374,25 +3458,43 @@ async fn pre_trust_extension_verdict(
     decision
 }
 
-/// [`ExtensionHost::with_wasm`] for the throwaway pre-trust pass, with the test-only fault
-/// injection `SessionBuilder::force_pre_trust_wasm_failure` folded in so the native-only fallback
-/// above is reachable from a test. Every non-`cfg(test)` build compiles to the bare `with_wasm`
-/// call: `force_failure` is dead in production and the `Err` arm is only ever produced by a real
-/// engine-construction failure.
+/// [`ExtensionHost::with_wasm`] with the test-only fault injection
+/// `SessionBuilder::force_pre_trust_wasm_failure` / `force_runtime_wasm_failure` folded in so the
+/// native-only fallbacks are reachable from a test. Every non-`cfg(test)` build compiles to the
+/// bare `with_wasm` call: `force_failure` is dead in production and the `Err` arm is only ever
+/// produced by a real engine-construction failure.
 #[cfg(feature = "wasm-host")]
-fn pre_trust_wasm_host(
+fn try_wasm_host(
     config: HostConfig,
     force_failure: bool,
 ) -> Result<ExtensionHost, cyrup_ext::ExtError> {
     #[cfg(test)]
     if force_failure {
         return Err(cyrup_ext::ExtError::Engine(
-            "forced pre-trust wasm-runtime failure".to_string(),
+            "forced wasm-runtime failure".to_string(),
         ));
     }
     #[cfg(not(test))]
     let _ = force_failure;
     ExtensionHost::with_wasm(config)
+}
+
+/// The session's extension host: with the Wasmtime runtime when it can be built, and without it
+/// (natives only) when it cannot. `ExtensionHost::with_wasm` already retries with the on-demand
+/// engine when the pooling allocator cannot reserve its slabs, so this is the second line: an
+/// engine that cannot be built at all.
+#[cfg(feature = "wasm-host")]
+fn wasm_host_or_native_only(config: HostConfig, force_failure: bool) -> ExtensionHost {
+    match try_wasm_host(config.clone(), force_failure) {
+        Ok(host) => host,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "wasm runtime unavailable; running the native extensions only"
+            );
+            ExtensionHost::new(config)
+        }
+    }
 }
 
 /// The subagent-child marker (`cyrup_ext_subagents::spawn::nested_events::CHILD_ENV`). Read as a
@@ -3436,7 +3538,11 @@ const SUBAGENT_CHILD_RUNTIME_NATIVES: [&str; 3] = [
 /// `loadFinalExtensionSet` calls `loadExtensionFactories` unconditionally (`resource-loader.ts:579-581`
 /// @v0.83.0) over `extensionFactories = [...builtInExtensions, ...(options?.extensionFactories ?? [])]`
 /// (`main.ts:523`), while only `extensionPaths` — the PATH tier — is collapsed by the flag (`:451-453`).
-fn native_survives_no_extensions(ext: &Arc<dyn NativeExtension>, is_subagent_child: bool) -> bool {
+fn native_survives_no_extensions(
+    ext: &Arc<dyn NativeExtension>,
+    is_subagent_child: bool,
+    keeps_codemode: bool,
+) -> bool {
     let id = ext.id();
     let id = id.as_str();
     // pi's inline-factory tier: never gated by a flag about discovery.
@@ -3444,8 +3550,76 @@ fn native_survives_no_extensions(ext: &Arc<dyn NativeExtension>, is_subagent_chi
         return true;
     }
     // The ambient tier, plus pi's one carve-out: a subagent child keeps the extensions its launcher
-    // re-injects by path (see [`SUBAGENT_CHILD_RUNTIME_NATIVES`]).
-    is_subagent_child && SUBAGENT_CHILD_RUNTIME_NATIVES.contains(&id)
+    // re-injects by path (see [`SUBAGENT_CHILD_RUNTIME_NATIVES`]), and `codemode` when the child's
+    // own `--tools` names it (see [`child_keeps_codemode`]).
+    is_subagent_child
+        && (SUBAGENT_CHILD_RUNTIME_NATIVES.contains(&id)
+            || (keeps_codemode && id == cyrup_codemode_runtime::EXTENSION_ID))
+}
+
+/// The startup diagnostic for a `codemode` the allowlist names but `--no-extensions` left unloaded.
+/// `--tools codemode` then names a tool that does not exist, and nothing said so: the model's first
+/// call came back "Tool codemode not found". Not fatal (the session is usable), so it travels on the
+/// `[Extension issues]` panel and not on the exit channel.
+///
+/// **[CYRUP-DELTA]** pi has no such diagnostic; its `builtin:codemode` is dropped just as silently
+/// (`package-manager.ts:972-974` @v1.0.1).
+fn codemode_skipped_diagnostic(
+    cfg: &SessionConfig,
+    skipped: bool,
+) -> Option<crate::services::ExtensionLoadDiagnostic> {
+    let id = cyrup_codemode_runtime::EXTENSION_ID;
+    (skipped && cyrup_core::tool_name_matches(cfg.tools.iter().flatten(), id)).then(|| {
+        crate::services::ExtensionLoadDiagnostic {
+            path: PathBuf::from(id),
+            error: format!(
+                "--tools names `{id}`, but --no-extensions skipped the built-in extension that provides it, so the tool does not exist in this session. Drop --no-extensions to use it."
+            ),
+            fatal: false,
+        }
+    })
+}
+
+/// Whether a subagent child under `--no-extensions` keeps the `codemode` built-in: its `--tools`
+/// allowlist names it (an exact name or a `*` pattern) and `--exclude-tools` does not.
+///
+/// **[CYRUP-DELTA]** `codemode` is an ambient built-in, so `--no-extensions` (which a subagent whose
+/// agent pins `extensions:` always gets) used to drop it silently even when the agent's `tools:`
+/// list named it. pi-subagents decides the same question from the child's tool list alone: its child
+/// session registers the host's codemode factory when `launch.tools` is unset or includes
+/// `"codemode"`, `codemode` is not in `excludeTools`, and the capability ceiling does not deny
+/// extensions (`src/runs/shared/child-session.ts` @HEAD `0c33ec7c`, from `8f90bf1b` "register Pi
+/// codemode in native child sessions", first in v0.74.0; the ledger pin v0.71.0 predates it).
+/// cyrup keeps only the explicit-name half: an unpinned child (`--tools` absent) gets its own
+/// default tool set, which does not include `codemode`, so nothing is gained by keeping it loaded.
+/// The `denyExtensions` half is the parent's: the spawn plan leaves `codemode` out of the `--tools`
+/// it hands a child under a ceiling that denies extensions (`exec/tool_surface.rs`), and this check
+/// reads that list.
+fn child_keeps_codemode(cfg: &SessionConfig) -> bool {
+    let id = cyrup_codemode_runtime::EXTENSION_ID;
+    cfg.tools
+        .as_ref()
+        .is_some_and(|tools| cyrup_core::tool_name_matches(tools, id))
+        && !cyrup_core::tool_name_matches(&cfg.exclude_tools, id)
+}
+
+/// `natives` without the built-ins `disabled` names by id (pi `resourceLoaderOptions.
+/// disabledBuiltinExtensions`, `core/resource-loader.ts` @v1.0.4: a `builtin:<id>` path whose id is
+/// in the set is not loaded). Pure, so the flag's meaning is testable without standing up a session.
+fn without_disabled_builtins(
+    natives: Vec<Arc<dyn NativeExtension>>,
+    disabled: &[String],
+) -> Vec<Arc<dyn NativeExtension>> {
+    natives
+        .into_iter()
+        .filter(|ext| {
+            let off = disabled.iter().any(|id| id == ext.id().as_str());
+            if off {
+                tracing::debug!(extension = %ext.id(), "native built-in not loaded: disabled");
+            }
+            !off
+        })
+        .collect()
 }
 
 /// The native built-ins this session actually loads (SEAM-071). Pure, so the flag's meaning is
@@ -3455,6 +3629,7 @@ fn natives_to_load(
     natives: Vec<Arc<dyn NativeExtension>>,
     no_extensions: bool,
     is_subagent_child: bool,
+    keeps_codemode: bool,
 ) -> Vec<Arc<dyn NativeExtension>> {
     if !no_extensions {
         return natives;
@@ -3462,7 +3637,7 @@ fn natives_to_load(
     natives
         .into_iter()
         .filter(|e| {
-            let keep = native_survives_no_extensions(e, is_subagent_child);
+            let keep = native_survives_no_extensions(e, is_subagent_child, keeps_codemode);
             if !keep {
                 tracing::debug!(extension = %e.id(), "native built-in skipped: --no-extensions");
             }
@@ -3809,6 +3984,28 @@ mod tests {
         list.iter().map(|s| (*s).to_string()).collect()
     }
 
+    /// `--tools` and `--exclude-tools` entries with a `*` are patterns (`createToolNameMatcher`,
+    /// `core/mcp-servers.ts` @v1.0.4): the allowlist activates what matches, the denylist removes
+    /// what matches from the default selection.
+    #[test]
+    fn tools_and_exclude_tools_entries_may_be_patterns() {
+        let mut cfg = super::SessionConfig::new("/tmp", "/tmp/agent");
+        cfg.tools = Some(names(&["re*", "gr*"]));
+        let mut picked = selected(&cfg, None);
+        picked.sort();
+        assert_eq!(picked, names(&["grep", "read"]));
+
+        let mut cfg = super::SessionConfig::new("/tmp", "/tmp/agent");
+        cfg.exclude_tools = names(&["ba*", "*it"]);
+        let mut picked = selected(&cfg, None);
+        picked.sort();
+        assert_eq!(
+            picked,
+            names(&["read", "static_tool", "write"]),
+            "`bash` and `edit` are excluded by their patterns"
+        );
+    }
+
     /// A non-built-in tool with a settable exposure and `defaultActive`.
     struct ExposedTool {
         name: &'static str,
@@ -3888,69 +4085,6 @@ mod tests {
             "x_model_only",
         ]));
         assert_eq!(pick(&allow), names(&["x_model_only", "x_inactive"]));
-    }
-
-    /// `defaultTools` activates the extension tools it names, the way pi's `initialActiveToolNames`
-    /// does (`sdk.ts:282-294`, `agent-session.ts:3566-3568` @v1.1.0): `["+codemode"]` must start
-    /// `codemode` (`defaultActive: false`) active. A non-declarable tool stays inactive, and
-    /// `tools` / `noTools` leave the setting out of it.
-    #[test]
-    fn the_default_tools_setting_activates_the_extension_tools_it_names() {
-        use cyrup_core::ToolExposure as E;
-        let tool = |name, exposure, default_active| {
-            std::sync::Arc::new(ExposedTool {
-                name,
-                exposure,
-                default_active,
-                params: serde_json::json!({}),
-            }) as std::sync::Arc<dyn cyrup_core::Tool>
-        };
-        let registered = vec![
-            tool("read", E::Direct, true),
-            tool("x_direct", E::Direct, true),
-            tool("codemode", E::ModelOnly, false),
-            tool("x_deferred", E::Deferred, true),
-            tool("x_unnamed", E::Direct, false),
-        ];
-        let active = || vec![registered[0].clone(), registered[1].clone()];
-        let pick = |cfg: &super::SessionConfig, default_tools: Option<&[String]>| -> Vec<String> {
-            super::activate_default_extension_tools(active(), &registered, cfg, default_tools)
-                .iter()
-                .map(|t| t.name().to_string())
-                .collect()
-        };
-        let cfg = super::SessionConfig::new("/tmp", "/tmp/agent");
-        let eff = |json: &str| {
-            cyrup_config::EffectiveSettings::from_settings(
-                cyrup_config::Settings::parse(json).unwrap(),
-            )
-            .default_tools()
-        };
-
-        let plus_codemode = eff(r#"{"defaultTools":["+codemode"]}"#);
-        assert_eq!(
-            pick(&cfg, plus_codemode.as_deref()),
-            names(&["read", "x_direct", "codemode"])
-        );
-        // Unset, nothing extra; a non-declarable name and an already-active name add nothing.
-        assert_eq!(pick(&cfg, None), names(&["read", "x_direct"]));
-        assert_eq!(
-            pick(&cfg, Some(&names(&["read", "x_direct", "x_deferred"]))),
-            names(&["read", "x_direct"])
-        );
-
-        let mut allow = super::SessionConfig::new("/tmp", "/tmp/agent");
-        allow.tools = Some(names(&["read"]));
-        assert_eq!(
-            pick(&allow, plus_codemode.as_deref()),
-            names(&["read", "x_direct"])
-        );
-        let mut no_builtin = super::SessionConfig::new("/tmp", "/tmp/agent");
-        no_builtin.no_tools = Some(super::NoTools::Builtin);
-        assert_eq!(
-            pick(&no_builtin, plus_codemode.as_deref()),
-            names(&["read", "x_direct"])
-        );
     }
 
     #[test]
@@ -4165,8 +4299,34 @@ mod tests {
     /// Without the flag nothing changes — the whole point is that this is a FLAG, not a policy.
     #[test]
     fn every_native_loads_without_no_extensions() {
-        assert_eq!(ids(&super::natives_to_load(stubs(), false, false)).len(), 5);
-        assert_eq!(ids(&super::natives_to_load(stubs(), false, true)).len(), 5);
+        assert_eq!(
+            ids(&super::natives_to_load(stubs(), false, false, false)).len(),
+            5
+        );
+        assert_eq!(
+            ids(&super::natives_to_load(stubs(), false, true, false)).len(),
+            5
+        );
+    }
+
+    /// `--no-mcp` is `disabledBuiltinExtensions: ["mcp"]` (`main.ts` @v1.0.4): the named built-in
+    /// is not loaded, in any tier, and the rest are. Without the flag nothing is dropped.
+    #[test]
+    fn a_disabled_builtin_is_not_loaded_and_the_rest_are() {
+        let disabled = vec!["subagents".to_string(), "no-such-extension".to_string()];
+        assert_eq!(
+            ids(&super::without_disabled_builtins(stubs(), &disabled)),
+            [
+                "cyrup-permission-system",
+                "subagent-prompt-runtime",
+                "cyrup-intercom",
+                "an-embedders-own-extension"
+            ]
+        );
+        assert_eq!(
+            ids(&super::without_disabled_builtins(stubs(), &[])).len(),
+            5
+        );
     }
 
     /// A ROOT session under `--no-extensions` loads none of the four shipped built-ins. pi's
@@ -4176,7 +4336,7 @@ mod tests {
     /// installed packages living in exactly that tier upstream.
     #[test]
     fn no_extensions_drops_every_ambient_native_in_a_root_session() {
-        let kept = ids(&super::natives_to_load(stubs(), true, false));
+        let kept = ids(&super::natives_to_load(stubs(), true, false, false));
         assert_eq!(
             kept,
             vec!["an-embedders-own-extension".to_string()],
@@ -4194,7 +4354,7 @@ mod tests {
     fn an_extension_the_embedder_passed_by_hand_survives_no_extensions() {
         for child in [false, true] {
             assert!(
-                ids(&super::natives_to_load(stubs(), true, child))
+                ids(&super::natives_to_load(stubs(), true, child, false))
                     .contains(&"an-embedders-own-extension".to_string()),
                 "inline tier survives (is_subagent_child={child})"
             );
@@ -4223,7 +4383,7 @@ mod tests {
         ] {
             for child in [false, true] {
                 assert!(
-                    super::native_survives_no_extensions(&inline_double(id), child),
+                    super::native_survives_no_extensions(&inline_double(id), child, false),
                     "a by-value extension named {id} is pi's inline tier and must load \
                      (is_subagent_child={child})"
                 );
@@ -4238,7 +4398,7 @@ mod tests {
     /// the permission system here would be a permission gate failing OPEN.
     #[test]
     fn a_subagent_child_keeps_exactly_the_natives_pi_re_injects() {
-        let kept = ids(&super::natives_to_load(stubs(), true, true));
+        let kept = ids(&super::natives_to_load(stubs(), true, true, false));
         assert_eq!(
             kept,
             vec![
@@ -4265,18 +4425,88 @@ mod tests {
         };
         for id in super::SUBAGENT_CHILD_RUNTIME_NATIVES {
             assert!(
-                super::native_survives_no_extensions(&one(id), true),
+                super::native_survives_no_extensions(&one(id), true, false),
                 "{id} survives in a child"
             );
             assert!(
-                !super::native_survives_no_extensions(&one(id), false),
+                !super::native_survives_no_extensions(&one(id), false, false),
                 "{id} drops at the root"
             );
         }
         assert!(!super::native_survives_no_extensions(
             &one("cyrup-intercom"),
-            true
+            true,
+            false
         ));
+    }
+
+    /// A subagent child whose `--tools` names `codemode` keeps the `codemode` built-in across
+    /// `--no-extensions` (an agent that pins `extensions:` always gets that flag); without the
+    /// name it is dropped as before, and a ROOT session never keeps it this way.
+    #[test]
+    fn a_subagent_child_keeps_codemode_across_no_extensions_only_when_its_tools_name_it() {
+        let stubs_with_codemode = || {
+            let mut all = stubs();
+            all.push(std::sync::Arc::new(StubNative(
+                cyrup_core::ExtensionId::from("codemode"),
+                true,
+            )));
+            all
+        };
+        let kept = ids(&super::natives_to_load(
+            stubs_with_codemode(),
+            true,
+            true,
+            true,
+        ));
+        assert!(kept.contains(&"codemode".to_string()), "kept: {kept:?}");
+        let dropped = ids(&super::natives_to_load(
+            stubs_with_codemode(),
+            true,
+            true,
+            false,
+        ));
+        assert!(
+            !dropped.contains(&"codemode".to_string()),
+            "kept: {dropped:?}"
+        );
+        let root = ids(&super::natives_to_load(
+            stubs_with_codemode(),
+            true,
+            false,
+            true,
+        ));
+        assert!(
+            !root.contains(&"codemode".to_string()),
+            "the carve-out is a subagent child's only: {root:?}"
+        );
+    }
+
+    /// What "its `--tools` names `codemode`" means: an exact name or a `*` pattern in `--tools`,
+    /// and not removed by `--exclude-tools`. No `--tools` at all is an unpinned child, which keeps
+    /// nothing extra.
+    #[test]
+    fn a_child_keeps_codemode_when_tools_name_it_and_exclude_tools_does_not() {
+        let cfg = |tools: Option<&[&str]>, exclude: &[&str]| {
+            let mut cfg = super::SessionConfig::new("/tmp", "/tmp/agent");
+            cfg.tools = tools.map(|t| t.iter().map(|s| (*s).to_string()).collect());
+            cfg.exclude_tools = exclude.iter().map(|s| (*s).to_string()).collect();
+            cfg
+        };
+        assert!(super::child_keeps_codemode(&cfg(
+            Some(&["read", "codemode"]),
+            &[]
+        )));
+        assert!(super::child_keeps_codemode(&cfg(Some(&["code*"]), &[])));
+        assert!(!super::child_keeps_codemode(&cfg(
+            Some(&["read", "bash"]),
+            &[]
+        )));
+        assert!(!super::child_keeps_codemode(&cfg(None, &[])));
+        assert!(!super::child_keeps_codemode(&cfg(
+            Some(&["read", "codemode"]),
+            &["codemode"]
+        )));
     }
 
     /// CFG-010 (dedupe half) — Pi's `dedupePackages` keeps BOTH entries, delta first, when a
@@ -4716,6 +4946,24 @@ mod tests {
         );
         let (active, _) = session_surface(&cfg).await;
         assert!(active.is_empty(), "got {active:?}");
+    }
+
+    /// Patterns reach the extension tools too: the allowlist's `dyn*` names `dynamic_tool`, and the
+    /// denylist's removes it.
+    #[tokio::test]
+    async fn patterns_bound_extension_tools() {
+        let mut cfg = super::SessionConfig::new("/tmp", "/tmp/agent");
+        cfg.tools = Some(names(&["read", "dyn*"]));
+        let (active, _) = session_surface(&cfg).await;
+        assert_eq!(active, names(&["dynamic_tool", "read"]));
+
+        let mut cfg = super::SessionConfig::new("/tmp", "/tmp/agent");
+        cfg.exclude_tools = names(&["dyn*"]);
+        let (active, _) = session_surface(&cfg).await;
+        assert!(
+            !active.contains(&"dynamic_tool".to_string()),
+            "got {active:?}"
+        );
     }
 
     /// pi `excludedToolNames = options.excludeTools` (`sdk.ts:259`) applies to extension tools with

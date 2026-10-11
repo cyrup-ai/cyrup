@@ -547,6 +547,7 @@ pub fn format_structured_output_rejection_error(
                 tool_name,
                 result,
                 is_error: true,
+                ..
             } if tool_name == STRUCTURED_OUTPUT_TOOL_NAME || call_ids.contains(tool_call_id) => {
                 Some(utf8_prefix(
                     &sanitize_structured_output_rejection(&tool_result_text(result)),

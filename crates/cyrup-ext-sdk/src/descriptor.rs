@@ -176,6 +176,65 @@ impl ToolNamespace {
     }
 }
 
+/// Hints about what a tool does, with the meaning of MCP tool annotations (pi `ToolAnnotations`,
+/// `extensions/types.ts:512-523` @v1.0.4). They come from the tool's author and are not verified;
+/// permission extensions can use them to decide which calls to confirm. Every hint is optional
+/// because pi reports only the hints a tool set. Set with [`ToolDescriptor::annotations`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolAnnotations {
+    /// The tool does not modify its environment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_only_hint: Option<bool>,
+    /// The tool may delete or overwrite data, rather than only add to it. Meaningful when not
+    /// read-only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub destructive_hint: Option<bool>,
+    /// Repeating a call with the same arguments has no further effect. Meaningful when not
+    /// read-only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotent_hint: Option<bool>,
+    /// The tool reaches an open world of external entities, such as the web, rather than a closed
+    /// domain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub open_world_hint: Option<bool>,
+}
+
+impl ToolAnnotations {
+    /// No hint set; add them with the builder methods below.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set `readOnlyHint` (builder-style).
+    #[must_use]
+    pub fn read_only(mut self, yes: bool) -> Self {
+        self.read_only_hint = Some(yes);
+        self
+    }
+
+    /// Set `destructiveHint` (builder-style).
+    #[must_use]
+    pub fn destructive(mut self, yes: bool) -> Self {
+        self.destructive_hint = Some(yes);
+        self
+    }
+
+    /// Set `idempotentHint` (builder-style).
+    #[must_use]
+    pub fn idempotent(mut self, yes: bool) -> Self {
+        self.idempotent_hint = Some(yes);
+        self
+    }
+
+    /// Set `openWorldHint` (builder-style).
+    #[must_use]
+    pub fn open_world(mut self, yes: bool) -> Self {
+        self.open_world_hint = Some(yes);
+        self
+    }
+}
+
 /// What a guest sends to register a tool (R-08-012/013; Pi `ToolDefinition`, types.ts:435-482).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -238,6 +297,23 @@ pub struct ToolDescriptor {
     /// to `true`. Set with [`Self::default_active`].
     #[serde(default = "default_active_true")]
     pub default_active: bool,
+    /// JSON Schema of the `structured_content` the tool's successful results carry (pi
+    /// `ToolDefinition.outputSchema`, `extensions/types.ts:592` @v1.0.4). A tool that declares one
+    /// should always set [`crate::ToolOutput::structured_content`]; codemode scripts then receive
+    /// that instead of the text content. `None` = no declaration. Set with [`Self::output_schema`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_schema: Option<Value>,
+    /// Hints about what the tool does (pi `ToolDefinition.annotations`, `extensions/types.ts:603`
+    /// @v1.0.4). `None` = the omitted field. Set with [`Self::annotations`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub annotations: Option<ToolAnnotations>,
+    /// Whether the tool supplies a `prepareLoadout` hook (pi `ToolDefinition.prepareLoadout`,
+    /// `extensions/types.ts:617` @v1.0.4); the host calls the [`crate::ToolExec::prepare_loadout`]
+    /// export when it is set, whenever the active tools change. A tool that overrides that method
+    /// must ALSO set this, as for [`Self::prepare_arguments`]. Set with
+    /// [`Self::prepare_loadout`].
+    #[serde(default)]
+    pub prepare_loadout: bool,
 }
 
 fn default_active_true() -> bool {
@@ -263,6 +339,9 @@ impl ToolDescriptor {
             exposure: ToolExposure::Direct,
             namespace: None,
             default_active: true,
+            output_schema: None,
+            annotations: None,
+            prepare_loadout: false,
         }
     }
 
@@ -344,6 +423,29 @@ impl ToolDescriptor {
     #[must_use]
     pub fn default_active(mut self, active: bool) -> Self {
         self.default_active = active;
+        self
+    }
+
+    /// Declare the JSON Schema of the structured content this tool's results carry (builder-style);
+    /// see [`Self::output_schema`].
+    #[must_use]
+    pub fn output_schema(mut self, schema: Value) -> Self {
+        self.output_schema = Some(schema);
+        self
+    }
+
+    /// Attach [`ToolAnnotations`] to this tool (builder-style).
+    #[must_use]
+    pub fn annotations(mut self, annotations: ToolAnnotations) -> Self {
+        self.annotations = Some(annotations);
+        self
+    }
+
+    /// Declare that this tool supplies a `prepareLoadout` hook (builder-style); see
+    /// [`Self::prepare_loadout`].
+    #[must_use]
+    pub fn prepare_loadout(mut self, yes: bool) -> Self {
+        self.prepare_loadout = yes;
         self
     }
 
@@ -668,9 +770,7 @@ impl ModelRouteRequest {
     pub fn is_cancelled(&self) -> bool {
         #[cfg(target_arch = "wasm32")]
         {
-            return crate::guest::bindings::cyrup::ext::host_router::is_route_cancelled(
-                &self.route_id,
-            );
+            crate::guest::bindings::cyrup::ext::host_router::is_route_cancelled(&self.route_id)
         }
         #[cfg(not(target_arch = "wasm32"))]
         false

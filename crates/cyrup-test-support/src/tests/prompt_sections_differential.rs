@@ -100,7 +100,8 @@ fn the_default_sections_are_pis_apart_from_the_two_named_deltas() {
         );
     }
 
-    // docs: pi's text with the product name and the one line cyrup omits.
+    // docs: pi's text with the product name, and with pi's one `When asked about:` line replaced by
+    // the one entry cyrup ships (`docs/codemode.md`), which `builder.rs` marks `[CYRUP-DELTA]`.
     let pi_docs = pi["sections"]["docs"].as_str().unwrap();
     let pi_docs: Vec<&str> = pi_docs
         .lines()
@@ -109,7 +110,18 @@ fn the_default_sections_are_pis_apart_from_the_two_named_deltas() {
     let ours_docs = text_of(&ours, "docs")
         .replace("cyrup documentation", "Pi documentation")
         .replace("cyrup", "pi");
-    assert_eq!(ours_docs.lines().collect::<Vec<_>>(), pi_docs);
+    let (ours_asked, ours_docs): (Vec<&str>, Vec<&str>) = ours_docs
+        .lines()
+        .partition(|l| l.starts_with("- When asked about:"));
+    assert_eq!(ours_docs, pi_docs);
+    assert_eq!(
+        ours_asked,
+        vec![
+            "- When asked about: codemode scripts and non-LLM models such as classifiers and image \
+             models (docs/codemode.md)"
+        ],
+        "the one documentation entry cyrup ships"
+    );
 }
 
 /// A custom prompt replaces the preamble and the default `tools`/`rules`/`docs`, and nothing else.

@@ -79,6 +79,18 @@ macro_rules! export_extension {
                 ) -> ::core::option::Option<::std::string::String> {
                     $crate::guest::prepare_arguments(name, args_json)
                 }
+                // CODE-015 — `prepareLoadout` (pi `ToolDefinition.prepareLoadout`,
+                // extensions/types.ts:617 @v1.0.4). Called ONLY for a descriptor that set the
+                // `prepare-loadout` flag.
+                fn prepare_loadout(
+                    name: ::std::string::String,
+                    loadout_json: ::std::string::String,
+                ) -> ::core::result::Result<
+                    ::core::option::Option<::std::string::String>,
+                    ::std::string::String,
+                > {
+                    $crate::guest::prepare_loadout(name, loadout_json)
+                }
                 fn execute_shortcut(
                     key: ::std::string::String,
                 ) -> ::core::result::Result<(), ::std::string::String> {

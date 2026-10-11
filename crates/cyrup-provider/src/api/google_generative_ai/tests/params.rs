@@ -19,3 +19,12 @@ fn build_params_basic_shape() {
     // Non-reasoning model: no thinkingConfig.
     assert!(body["generationConfig"].get("thinkingConfig").is_none());
 }
+
+/// PROMPT-001 — the prompt a transcript replays to reaches the `systemInstruction` of the body.
+#[test]
+fn the_transcripts_prompt_reaches_the_request_body() {
+    use crate::api::prompt_fixture::{agent_context, assert_wire_carries_prompt};
+    let m = model_with("gemini-2.0-flash", false);
+    let body = build_body(&m, &agent_context(Vec::new()), &StreamOptions::default());
+    assert_wire_carries_prompt(&body["systemInstruction"].to_string());
+}

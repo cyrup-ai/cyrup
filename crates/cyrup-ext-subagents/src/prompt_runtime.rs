@@ -2739,6 +2739,16 @@ impl NativeExtension for SubagentPromptRuntime {
                 let Some(placed) = &self.placed_resources else {
                     return HookOutcome::Noop;
                 };
+                // SUBA-219 — `system_prompt` was built for the tools that were active before this
+                // handler set them, and the replacement it returns wins over the base the session
+                // rebuilds afterwards (the shape `PERM-036` fixed for the permission system). pi's
+                // bridge calls `setActiveTools(resolved.tools)` in its `configure` frame handler,
+                // before any prompt exists, and its `before_agent_start` handler only rewrites the
+                // prompt it is handed (`herdr-pi-bridge.ts` @v0.74.0), so the prompt it rewrites is
+                // already the one for those tools; here the prompt for the tools just set is read
+                // back, as long as no handler ahead of this one has edited the text, whose edit it
+                // would drop.
+                let mut rebuilt: Option<String> = None;
                 if let Some(tools) = &placed.tools
                     && let Some(services) = self
                         .services
@@ -2746,8 +2756,13 @@ impl NativeExtension for SubagentPromptRuntime {
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .clone()
                 {
+                    let before = services.system_prompt();
                     services.set_active_tools(tools);
+                    if before.as_deref() == Some(system_prompt.as_str()) {
+                        rebuilt = services.system_prompt();
+                    }
                 }
+                let system_prompt = rebuilt.as_deref().unwrap_or(system_prompt);
                 let rewrite = self.rewrite.as_ref();
                 HookOutcome::Mutate(EventPatch::SystemPromptAndInject {
                     system: Some(placed.system_prompt(
@@ -3814,6 +3829,131 @@ mod tests {
                 "the request must be consumed by the flush that follows a dropped one"
             );
         });
+    }
+
+    fn ctx() -> HostCtx {
+        HostCtx::event(
+            cyrup_ext::native::ExtMode::Json,
+            false,
+            PathBuf::from("/tmp"),
+        )
+    }
+
+    /// SUBA-219 — a [`cyrup_ext::host::HostServices`] double whose mirrored prompt follows
+    /// `set_active_tools` the way the live session's does: applying the tool set rebuilds the base
+    /// prompt, and `system_prompt()` reads the rebuilt one back.
+    struct RebuildingHost {
+        /// What `system_prompt()` returns now.
+        prompt: std::sync::Mutex<String>,
+        /// What it returns once `set_active_tools` has been called.
+        rebuilt: String,
+        applied: std::sync::Mutex<Vec<Vec<String>>>,
+    }
+    impl cyrup_ext::host::HostServices for RebuildingHost {
+        fn system_prompt(&self) -> Option<String> {
+            Some(self.prompt.lock().unwrap().clone())
+        }
+        fn set_active_tools(&self, tools: &[String]) {
+            self.applied.lock().unwrap().push(tools.to_vec());
+            *self.prompt.lock().unwrap() = self.rebuilt.clone();
+        }
+    }
+
+    /// A placed child (SUBA-100) whose remote agent declares `read` and `bash`.
+    fn placed_runtime(host: Arc<RebuildingHost>) -> SubagentPromptRuntime {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let runtime = SubagentPromptRuntime::new(
+            serde_json::json!({ "type": "object" }),
+            dir.path().join("out.json"),
+        )
+        .with_placed_resources(Some(
+            crate::placement::remote_resources::ResolvedRemoteResources {
+                agent: "remote-worker".to_string(),
+                skills: Vec::new(),
+                tools: Some(vec!["read".to_string(), "bash".to_string()]),
+                system_prompt: "REMOTE AGENT PROMPT".to_string(),
+                inherit_project_context: true,
+                inherit_global_context: true,
+                inherit_skills: true,
+            },
+        ));
+        cyrup_ext::NativeExtension::set_host_services(&runtime, host);
+        runtime
+    }
+
+    async fn placed_prompt(runtime: &SubagentPromptRuntime, handed: &str) -> String {
+        match runtime
+            .on_event(
+                &HostEvent::BeforeAgentStart {
+                    prompt: "task".to_string(),
+                    images: serde_json::Value::Null,
+                    system_prompt: handed.to_string(),
+                    options: serde_json::Value::Null,
+                    injected: Vec::new(),
+                },
+                &ctx(),
+            )
+            .await
+        {
+            HookOutcome::Mutate(EventPatch::SystemPromptAndInject {
+                system: Some(system),
+                ..
+            }) => system,
+            other => panic!("a placed child replaces its prompt: {other:?}"),
+        }
+    }
+
+    /// SUBA-219 — the prompt a placed child returns describes the tools it has just set. The
+    /// handler is handed the base built for the tools active before, applying the remote agent's
+    /// tools rebuilds the base, and the replacement the handler returns wins over that rebuild, so a
+    /// replacement derived from the handed text told the model about tools it no longer had.
+    #[tokio::test]
+    async fn a_placed_childs_prompt_is_derived_from_the_prompt_of_the_tools_it_set() {
+        let stale = "STALE BASE: tools read, grep";
+        let host = Arc::new(RebuildingHost {
+            prompt: std::sync::Mutex::new(stale.to_string()),
+            rebuilt: "REBUILT BASE: tools read, bash".to_string(),
+            applied: std::sync::Mutex::new(Vec::new()),
+        });
+        let runtime = placed_runtime(host.clone());
+
+        let prompt = placed_prompt(&runtime, stale).await;
+
+        assert_eq!(
+            *host.applied.lock().unwrap(),
+            [vec!["read".to_string(), "bash".to_string()]],
+            "the remote agent's tools were applied"
+        );
+        assert!(
+            prompt.contains("REBUILT BASE: tools read, bash"),
+            "{prompt}"
+        );
+        assert!(!prompt.contains("STALE BASE"), "{prompt}");
+        assert!(
+            prompt.contains("<active_agent name=\"remote-worker\"/>")
+                && prompt.ends_with("REMOTE AGENT PROMPT"),
+            "the remote agent's own prompt still follows: {prompt}"
+        );
+    }
+
+    /// SUBA-219 — another handler ahead of this one may have edited the prompt; reading the rebuilt
+    /// base back would drop that edit, so then the prompt it was handed is the one derived from.
+    #[tokio::test]
+    async fn a_prompt_an_earlier_handler_changed_is_kept_by_a_placed_child() {
+        let host = Arc::new(RebuildingHost {
+            prompt: std::sync::Mutex::new("BASE".to_string()),
+            rebuilt: "REBUILT BASE".to_string(),
+            applied: std::sync::Mutex::new(Vec::new()),
+        });
+        let runtime = placed_runtime(host.clone());
+
+        let prompt = placed_prompt(&runtime, "BASE EDITED BY ANOTHER HANDLER").await;
+
+        assert!(
+            prompt.contains("BASE EDITED BY ANOTHER HANDLER"),
+            "{prompt}"
+        );
+        assert!(!prompt.contains("REBUILT BASE"), "{prompt}");
     }
 
     /// SUBA-045 — a [`cyrup_ext::host::HostServices`] double that answers only `all_tool_names`,

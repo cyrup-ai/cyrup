@@ -122,6 +122,50 @@ impl NativeExtension for StreamerExt {
     }
 }
 
+/// A native tool that waits until it is cancelled — what a deadline or an aborted signal on a
+/// guest's `ExecuteToolOptions` has to end.
+struct Sleeper {
+    params: Value,
+}
+
+#[async_trait::async_trait]
+impl Tool for Sleeper {
+    fn name(&self) -> &str {
+        "sleeper"
+    }
+    fn parameters(&self) -> &Value {
+        &self.params
+    }
+    async fn execute(
+        &self,
+        _call_id: ToolCallId,
+        _params: Value,
+        cancel: CancelToken,
+        _on_update: ToolUpdateSink,
+    ) -> Result<ToolResult, ToolError> {
+        cancel.cancelled().await;
+        Err(ToolError::new("sleeper was cancelled"))
+    }
+}
+
+struct SleeperExt;
+
+#[async_trait::async_trait]
+impl NativeExtension for SleeperExt {
+    fn id(&self) -> ExtensionId {
+        ExtensionId::from("sleeper-ext")
+    }
+    async fn init(&self, api: &mut InitApi) -> Result<(), ExtError> {
+        api.register_tool(Arc::new(Sleeper {
+            params: json!({ "type": "object", "properties": {}, "additionalProperties": true }),
+        }));
+        Ok(())
+    }
+    async fn on_event(&self, _ev: &HostEvent, _ctx: &HostCtx) -> HookOutcome {
+        HookOutcome::Noop
+    }
+}
+
 struct Loaded {
     session: Arc<cyrup_session_svc::AgentSession>,
     demo: Arc<cyrup_ext::host::LiveExtension>,
@@ -134,6 +178,7 @@ async fn session_with_two_guests(fx: &Fixture, provider: Arc<FauxProvider>) -> L
     cfg.no_extensions = true;
     let session = SessionBuilder::new(provider as Arc<dyn Provider>, cfg)
         .with_native_extension(Arc::new(StreamerExt))
+        .with_native_extension(Arc::new(SleeperExt))
         .build()
         .await
         .unwrap()
@@ -337,4 +382,64 @@ async fn a_guest_tools_on_update_receives_the_nested_tools_partial_results() {
         text.contains("error=false partials=1 :: streamed"),
         "{text}"
     );
+}
+
+/// CODE-016, the `signal` gap: a guest that names a signal it already aborted cancels the nested
+/// call before it starts. Without the option the sleeper would wait for the calling tool's own
+/// cancellation, which never comes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_nested_call_is_cancelled_by_a_signal_the_guest_already_aborted() {
+    let fx = fixture();
+    let loaded = session_with_two_guests(
+        &fx,
+        faux_calling_probe(json!({
+            "tool": "sleeper", "args": {}, "abort_first": "stop", "signal_id": "stop"
+        })),
+    )
+    .await;
+
+    let _ = loaded.session.prompt("go").await.unwrap();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        loaded.session.wait_for_idle(),
+    )
+    .await
+    .expect("the aborted signal ended the nested call instead of waiting for it");
+
+    // The session refuses to start a call whose signal is already aborted, so the sleeper never ran.
+    let text = text_of(&probe_result(&loaded.session).await);
+    assert!(text.contains("error=true"), "{text}");
+    assert!(text.contains("Operation aborted"), "{text}");
+}
+
+/// CODE-016, the `signal` gap, the half a suspended guest can still use: a deadline. A signal the
+/// guest names but never aborted does not cancel the call; the deadline does, no sooner than asked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_nested_call_is_cancelled_when_its_deadline_passes() {
+    let fx = fixture();
+    let loaded = session_with_two_guests(
+        &fx,
+        faux_calling_probe(json!({
+            "tool": "sleeper", "args": {}, "signal_id": "never-aborted", "timeout_ms": 400
+        })),
+    )
+    .await;
+
+    let started = std::time::Instant::now();
+    let _ = loaded.session.prompt("go").await.unwrap();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        loaded.session.wait_for_idle(),
+    )
+    .await
+    .expect("the deadline ended the nested call instead of waiting for it");
+
+    assert!(
+        started.elapsed() >= std::time::Duration::from_millis(350),
+        "a signal nobody aborted must not cancel the call early: {:?}",
+        started.elapsed()
+    );
+    let text = text_of(&probe_result(&loaded.session).await);
+    assert!(text.contains("error=true"), "{text}");
+    assert!(text.contains("sleeper was cancelled"), "{text}");
 }

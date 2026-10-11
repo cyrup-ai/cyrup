@@ -34,3 +34,13 @@ fn prompt_cache_key_set_with_session() {
     let body = build_body(&m, &user_ctx("x"), &opts);
     assert_eq!(body["prompt_cache_key"], "s9");
 }
+
+/// PROMPT-001 — the prompt a transcript replays to reaches the chat body.
+#[test]
+fn the_transcripts_prompt_reaches_the_request_body() {
+    use crate::api::prompt_fixture::{agent_context, assert_wire_carries_prompt};
+    let m = model_with("codestral-latest", false);
+    let body = build_body(&m, &agent_context(Vec::new()), &StreamOptions::default());
+    assert_wire_carries_prompt(&body.to_string());
+    assert_eq!(body["messages"][0]["role"], "system", "{body}");
+}

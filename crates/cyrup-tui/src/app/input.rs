@@ -379,7 +379,12 @@ impl<B: Backend> App<B> {
                 //    abort, so nothing typed during the run is lost.
                 if self.state.status.streaming {
                     self.state.transcript.discard_streaming();
-                    self.state.transcript.commit_tools();
+                    // The turn's tool rows are NOT committed here. Pi's handler only aborts; the
+                    // tools end as they end (`tool_execution_end`, then `agent_end`), and each end
+                    // finds its row still live and finishes it. Committing the rows at the keypress
+                    // left them in the scrollback as they were drawn, running for good, and the end
+                    // that followed drew a second block, without the command or the script, for
+                    // the result.
                     self.state.status.set_streaming(false);
                     self.state.indicator.idle();
                     return AppAction::InterruptRestoreQueued;

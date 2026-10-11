@@ -198,3 +198,72 @@ pub(super) fn spawn_rpc_duplex(
     });
     (client_tx, tokio::io::BufReader::new(client_rx), handle)
 }
+
+/// Run [`run_rpc`] as a client that keeps its input OPEN until `done` says it has seen what it was
+/// waiting for, then closes it — the only way to get a run or a command to completion since
+/// closing the input aborts them (SEAM-154, pi's `process.stdin.on("end")` → `shutdown()`,
+/// rpc-mode.ts:802-805). `input` is written up front; the result is every line the host wrote, in
+/// order, up to its return, as the bytes the wire carried.
+pub(super) async fn run_rpc_until_bytes(
+    runtime: &AgentSessionRuntime,
+    input: &str,
+    done: impl Fn(&[Value]) -> bool + Send + 'static,
+) -> Vec<u8> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+    let (mut client_tx, server_rx) = tokio::io::duplex(1 << 20);
+    let (mut server_tx, client_rx) = tokio::io::duplex(1 << 20);
+    client_tx.write_all(input.as_bytes()).await.unwrap();
+    let collector = tokio::spawn(async move {
+        let mut lines = tokio::io::BufReader::new(client_rx).lines();
+        let mut seen: Vec<Value> = Vec::new();
+        let mut bytes: Vec<u8> = Vec::new();
+        let mut input_open = Some(client_tx);
+        while let Some(line) = lines.next_line().await.unwrap() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            seen.push(serde_json::from_str(&line).expect("each line is valid json"));
+            bytes.extend_from_slice(line.as_bytes());
+            bytes.push(b'\n');
+            if input_open.is_some() && done(&seen) {
+                input_open = None;
+            }
+        }
+        bytes
+    });
+    tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        run_rpc(
+            runtime,
+            tokio::io::BufReader::new(server_rx),
+            &mut server_tx,
+        ),
+    )
+    .await
+    .expect("run_rpc returns once the client has what it waited for and closes the input")
+    .expect("rpc mode runs");
+    drop(server_tx);
+    collector.await.unwrap()
+}
+
+/// [`run_rpc_until_bytes`], parsed one value per line.
+pub(super) async fn run_rpc_until(
+    runtime: &AgentSessionRuntime,
+    input: &str,
+    done: impl Fn(&[Value]) -> bool + Send + 'static,
+) -> Vec<Value> {
+    parse_lines(&run_rpc_until_bytes(runtime, input, done).await)
+}
+
+/// Whether the host has written `agent_settled`: the whole run is done (SEAM-005).
+pub(super) fn has_settled(lines: &[Value]) -> bool {
+    lines.iter().any(|l| type_of(l) == "agent_settled")
+}
+
+/// Whether the host has written the `response` to the command with `id`.
+pub(super) fn has_response(lines: &[Value], id: &str) -> bool {
+    lines
+        .iter()
+        .any(|l| type_of(l) == "response" && l["id"] == id)
+}

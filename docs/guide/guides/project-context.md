@@ -4,8 +4,9 @@ Everything cyrup knows about your project beyond what it reads at runtime comes 
 context files, the system prompt, skills, and prompt templates. This page covers where each lives,
 how to add your own, and how to turn any of them off.
 
-All project-scoped resources are gated on trust. In a folder you have not trusted, cyrup loads only
-your global configuration and says so with a banner in the transcript
+All project-scoped resources are gated on trust, with one exception that only restricts: a project's
+permission policy is read untrusted too, and can add denies and asks but no `allow`. In a folder you
+have not trusted, cyrup loads only your global configuration and says so with a banner in the transcript
 (`This project is not trusted. Project .cyrup resources and packages are ignored…`) — see
 [Tools and permissions](tools-and-permissions.md#project-trust). That banner is the first thing to
 check when project settings, skills or extensions appear not to load.

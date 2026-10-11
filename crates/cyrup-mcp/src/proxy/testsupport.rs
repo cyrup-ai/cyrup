@@ -78,9 +78,15 @@ pub(crate) struct FakeEnv {
     pub(crate) activations_asked: Mutex<Vec<Vec<(String, String)>>>,
     /// The tools `activate_search_matches` has loaded, so a second match is not reported again.
     pub(crate) activated: Mutex<BTreeSet<String>>,
+    /// What `call_tool` answers; the empty outcome when unset.
+    pub(crate) call_outcome: Mutex<Option<CallToolOutcome>>,
 }
 
 impl FakeEnv {
+    pub(crate) fn with_call_outcome(self, outcome: CallToolOutcome) -> Self {
+        *self.call_outcome.lock().unwrap() = Some(outcome);
+        self
+    }
     pub(crate) fn with_search_mode_tool(self, server: &str, tool: &str) -> Self {
         self.search_mode_tools
             .lock()
@@ -201,7 +207,12 @@ impl ProxyEnv for FakeEnv {
         _recovery: &AuthRecovery<'_>,
         _cancel: &CancelToken,
     ) -> Result<CallToolOutcome, ProxyCallError> {
-        Ok(CallToolOutcome::default())
+        Ok(self
+            .call_outcome
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_default())
     }
     async fn read_resource(
         &self,

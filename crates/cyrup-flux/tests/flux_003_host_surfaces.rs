@@ -30,12 +30,12 @@
 use std::collections::VecDeque;
 use std::fs;
 use std::path::Path;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 
 use cyrup_core::{CancelToken, Content, Tool, ToolCallId};
 use cyrup_ext::host::{
-    DialogOptions, HostServices, HumanInteractionLock, InteractiveOverlay, NotifyKind,
-    OverlayColor, OverlayKey, OverlayKeyCode, OverlayOutcome,
+    DialogOptions, HostServices, HostServicesSlot, HumanInteractionLock, InteractiveOverlay,
+    NotifyKind, OverlayColor, OverlayKey, OverlayKeyCode, OverlayOutcome,
 };
 use cyrup_ext::{ExtMode, HostCtx, NativeExtension};
 use cyrup_flux::ask_tool::AskUserQuestionTool;
@@ -122,11 +122,11 @@ impl HostServices for ScriptedHost {
     }
 }
 
-fn slot(host: ScriptedHost) -> (Arc<OnceLock<Arc<dyn HostServices>>>, Arc<ScriptedHost>) {
+fn slot(host: ScriptedHost) -> (Arc<HostServicesSlot>, Arc<ScriptedHost>) {
     let host = Arc::new(host);
     let services: Arc<dyn HostServices> = host.clone();
-    let slot = Arc::new(OnceLock::new());
-    slot.set(services).ok().unwrap();
+    let slot = Arc::new(HostServicesSlot::new());
+    slot.bind(services);
     (slot, host)
 }
 
@@ -291,7 +291,7 @@ fn the_overlay_ticks_only_on_change_and_closes_on_escape() {
 /// arrives as ONE Info notification.
 #[test]
 fn open_status_overlay_hands_over_or_falls_back_to_the_plain_panel() {
-    let unbound: Arc<OnceLock<Arc<dyn HostServices>>> = Arc::new(OnceLock::new());
+    let unbound = Arc::new(HostServicesSlot::new());
     open_status_overlay(&unbound);
 
     let (slot_accepting, accepting) = slot(ScriptedHost {
@@ -371,7 +371,7 @@ fn ask_tool_metadata_and_schema() {
 /// count outside 2-4, and a host without the interaction lock.
 #[test]
 fn ask_tool_refuses_without_a_host_with_bad_params_or_without_the_lock() {
-    let unbound: Arc<OnceLock<Arc<dyn HostServices>>> = Arc::new(OnceLock::new());
+    let unbound = Arc::new(HostServicesSlot::new());
     let err = ask(
         &AskUserQuestionTool::new(unbound),
         json!({"question": "q", "options": two_options()}),

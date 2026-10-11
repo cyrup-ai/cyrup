@@ -118,6 +118,31 @@ pub struct InitializeOptions {
     pub auth_store: Option<crate::credentials::McpAuthStore>,
 }
 
+/// How many of a load's diagnostics the startup notice spells out.
+const CONFIG_PROBLEMS_SHOWN: usize = 3;
+
+/// The startup notice for what the config load skipped or dropped (a file that is not valid JSON, an
+/// entry it could not use): the first few, one per line, and the count of the rest. `None` for a
+/// clean load.
+fn config_problems_notice(diagnostics: &[crate::config::ConfigDiagnostic]) -> Option<String> {
+    if diagnostics.is_empty() {
+        return None;
+    }
+    let mut lines: Vec<String> = diagnostics
+        .iter()
+        .take(CONFIG_PROBLEMS_SHOWN)
+        .map(|diagnostic| format!("MCP: {}", diagnostic.message))
+        .collect();
+    let rest = diagnostics.len().saturating_sub(CONFIG_PROBLEMS_SHOWN);
+    if rest > 0 {
+        lines.push(format!(
+            "MCP: and {rest} more config problem{}",
+            if rest == 1 { "" } else { "s" }
+        ));
+    }
+    Some(lines.join("\n"))
+}
+
 /// `initializeMcp(pi, ctx, owner, options)` — build the live runtime for one generation.
 ///
 /// **Minimal body (MCP-016…MCP-026 fill it).** What is landed now is the shape every later unit
@@ -185,6 +210,17 @@ pub async fn initialize_mcp(
     // `a6cfeea` (#701) is the reason the placement is not negotiable: the approval has to happen
     // *inside* `session_start`. Earlier there is no session to ask in; later the server has already
     // started.
+    // [CYRUP-DELTA] A config file the load skipped is said so on the screen. Upstream's `console.warn`
+    // is on the terminal; here the terminal UI owns it and tracing goes to a log file, so a
+    // `mcp.json` that was not valid JSON left the startup panel listing the extension as loaded and
+    // `/mcp` counting zero servers, with the reason nowhere a person looks. Without a UI the loader
+    // has already logged each message, once.
+    if let (Some(ui), Some(notice)) = (
+        ui.as_ref().filter(|_| snapshot.has_ui),
+        config_problems_notice(&loaded.diagnostics),
+    ) {
+        ui.notify(&notice, cyrup_ext::NotifyKind::Warning);
+    }
     let dialog = ui.as_ref().map(crate::owner::McpDialog::fenced);
     let trust = crate::project_server_trust::apply_project_server_trust(
         &loaded.config,
@@ -1529,6 +1565,81 @@ mod tests {
             ..snap
         };
         assert!(tui.is_tui_mode());
+    }
+
+    /// [CYRUP-DELTA] A `mcp.json` that is not valid JSON is said so on the screen at `session_start`:
+    /// the load skips it, the startup panel lists the extension as loaded, and `/mcp` counts zero
+    /// servers, so the notice is the only place the reason can be read. Without a UI nothing more is
+    /// said, the loader having logged it already. Killing mutation: the `ui.notify` removed.
+    #[tokio::test]
+    async fn a_config_file_that_does_not_parse_is_announced_to_the_ui_at_session_start() {
+        use cyrup_ext::{NotifyKind, RecordingServices};
+
+        let dir = tempfile::tempdir().unwrap();
+        let agent_dir = dir.path().join("agent");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        let broken = agent_dir.join("mcp.json");
+        std::fs::write(&broken, "{ not json").unwrap();
+
+        let run = |has_ui: bool| {
+            let services = Arc::new(RecordingServices::default());
+            let snapshot = ContextSnapshot {
+                config_path: None,
+                cwd: dir.path().to_path_buf(),
+                has_ui,
+                mode: "tui".to_string(),
+                initial_signal: None,
+                services: Some(Arc::clone(&services) as Arc<dyn HostServices>),
+            };
+            let dirs = McpDirs::new(agent_dir.clone(), dir.path().to_path_buf());
+            async move {
+                initialize_mcp(
+                    Arc::new(McpRuntimeOwner::new()),
+                    dirs,
+                    snapshot,
+                    InitializeOptions::default(),
+                )
+                .await
+                .unwrap();
+                services.notify_calls()
+            }
+        };
+
+        let shown = run(true).await;
+        assert_eq!(shown.len(), 1, "{shown:?}");
+        let (message, kind) = shown.first().unwrap();
+        assert_eq!(*kind, NotifyKind::Warning);
+        assert!(
+            message.starts_with("MCP: Failed to load MCP config from")
+                && message.contains(&broken.display().to_string()),
+            "{message}"
+        );
+
+        assert!(run(false).await.is_empty(), "no UI, nothing to notify");
+    }
+
+    #[test]
+    fn the_config_problems_notice_spells_out_the_first_few_and_counts_the_rest() {
+        use crate::config::ConfigDiagnostic;
+        let diagnostic = |n: usize| ConfigDiagnostic {
+            path: PathBuf::from(format!("/c/{n}.json")),
+            server: None,
+            message: format!("problem {n}"),
+        };
+        assert_eq!(config_problems_notice(&[]), None);
+        assert_eq!(
+            config_problems_notice(&[diagnostic(1), diagnostic(2)]).as_deref(),
+            Some("MCP: problem 1\nMCP: problem 2")
+        );
+        let many: Vec<ConfigDiagnostic> = (1..=6).map(diagnostic).collect();
+        assert_eq!(
+            config_problems_notice(&many).as_deref(),
+            Some("MCP: problem 1\nMCP: problem 2\nMCP: problem 3\nMCP: and 3 more config problems")
+        );
+        assert_eq!(
+            config_problems_notice(many.get(..4).unwrap()).as_deref(),
+            Some("MCP: problem 1\nMCP: problem 2\nMCP: problem 3\nMCP: and 1 more config problem")
+        );
     }
 
     #[tokio::test]
@@ -3658,9 +3769,9 @@ where
 ///    only by `RequestHandle::await_response`, which consumes the handle [`crate::live`] keeps in
 ///    order to cancel.
 ///
-/// `None` means no timeout, which is `normalizeRequestTimeoutMs`'s answer for an absent, zero,
-/// negative, `NaN` or infinite value — see [`resolve_request_timeout`] for why that does **not**
-/// fall back to the global.
+/// `budget` is [`resolve_request_timeout`]'s answer, which is never "no timeout": an absent, zero,
+/// negative, `NaN` or infinite `requestTimeoutMs` is [`DEFAULT_REQUEST_TIMEOUT`], as it is for the
+/// SDK. See that function for why an invalid per-server value does **not** fall back to the global.
 ///
 /// # Errors
 ///
@@ -3673,7 +3784,7 @@ pub async fn connect_client_bounded<T, E, A>(
     transport: T,
     lifecycle: ClientLifecycleMode,
     ct: CancelToken,
-    timeout: Option<Duration>,
+    budget: Duration,
 ) -> Result<
     Result<RunningService<RoleClient, McpClientHandler>, Box<ClientInitializeError>>,
     Duration,
@@ -3687,23 +3798,17 @@ where
     // [`detachable_from`] for why holding it past that point closed every connection this crate
     // made.
     let (service, detach) = detachable_from(&ct);
-    let outcome = match timeout {
-        None => Ok(connect_client(handler, transport, lifecycle, service).await),
-        // Dropping the `connect_client` future is what tears the half-built connection down, and it
-        // is the same drop the abort path relies on: `serve_client_with_ct_inner` holds the
-        // transport in a local, so the transport (and, for stdio, `ChildWithCleanup::drop`'s
-        // `kill()`) goes with it.
-        Some(budget) => {
-            match tokio::time::timeout(
-                budget,
-                connect_client(handler, transport, lifecycle, service),
-            )
-            .await
-            {
-                Ok(outcome) => Ok(outcome),
-                Err(_elapsed) => Err(budget),
-            }
-        }
+    // Dropping the `connect_client` future is what tears the half-built connection down, and it is
+    // the same drop the abort path relies on: `serve_client_with_ct_inner` holds the transport in a
+    // local, so the transport (and, for stdio, `ChildWithCleanup::drop`'s `kill()`) goes with it.
+    let outcome = match tokio::time::timeout(
+        budget,
+        connect_client(handler, transport, lifecycle, service),
+    )
+    .await
+    {
+        Ok(outcome) => Ok(outcome),
+        Err(_elapsed) => Err(budget),
     };
     // The `finally`. Fired on BOTH arms, success and failure: on failure the transport is already
     // gone and this only reaps the joiner task.
@@ -3800,8 +3905,32 @@ fn handshake_timeout_error(server: &str, stderr: Option<&StderrPump>) -> McpErro
 // MCP-128 — request options (§3.13)
 // -------------------------------------------------------------------------------------------------
 
+/// The MCP TypeScript SDK's `DEFAULT_REQUEST_TIMEOUT_MSEC` — what `Protocol.request` runs a request
+/// under when `options.timeout` is undefined (`options?.timeout ?? DEFAULT_REQUEST_TIMEOUT_MSEC`;
+/// `callToolPausingForElicitation` spells the same fallback, `elicitation-handler.ts:84`).
+///
+/// pi-mcp-adapter documents it as the effective default: `requestTimeoutMs` "if omitted or `<= 0`,
+/// the MCP SDK default timeout is used" (`docs/configuration.md`, `docs/servers.md`), "the SDK's
+/// 60-second default" (`docs/prompts-and-ui.md`). Upstream therefore has **no** way to wait for a
+/// reply forever, and neither does this port: a server that never answers `initialize`,
+/// `tools/list` or `tools/call` — or whose reply rmcp cannot parse and so drops
+/// (`transport/async_rw.rs`, "Ignoring unparsable incoming message", which the other official SDKs
+/// do too) — ends the request at this budget.
+///
+/// [CYRUP-DELTA] One reply that a JavaScript client reads is dropped here and so times out at this
+/// budget: a JSON-RPC message nested more than 128 levels deep, which serde_json refuses
+/// (`recursion limit exceeded`, reported as `Category::Syntax`, which rmcp's `async_rw.rs` treats
+/// as unparsable input). A `tools/list` whose schema nests that deeply fails the connect after a
+/// minute and a `tools/call` whose `structuredContent` does rejects after a minute. Reading such a
+/// message needs serde_json's `disable_recursion_limit`, which only the transport that reads the
+/// line could call, and that transport is rmcp's.
+pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// `normalizeRequestTimeoutMs` (`server-manager.ts:1249-1253`): finite **and** strictly positive,
-/// else no timeout.
+/// else no *configured* timeout.
+///
+/// "No configured timeout" is `undefined`, which the SDK resolves to [`DEFAULT_REQUEST_TIMEOUT`]; it
+/// is not "no timeout". [`resolve_request_timeout`] is where that resolution happens.
 ///
 /// The subtle half is in [`resolve_request_timeout`], not here.
 #[must_use]
@@ -3813,32 +3942,40 @@ pub fn normalize_request_timeout_ms(timeout_ms: Option<f64>) -> Option<Duration>
     Some(Duration::from_secs_f64(ms / 1000.0))
 }
 
-/// `getResolvedRequestTimeoutMs(definition)` (`server-manager.ts:234-239`).
+/// `getResolvedRequestTimeoutMs(definition)` (`server-manager.ts:234-239`), resolved the way the
+/// SDK resolves what that returns: an `undefined` timeout becomes [`DEFAULT_REQUEST_TIMEOUT`].
 ///
 /// **The trap**: an invalid *per-server* `requestTimeoutMs` — `0`, negative, `NaN`, `Infinity` —
-/// resolves to **no timeout at all**. It does *not* fall back to the global. Upstream's shape is
+/// resolves to the SDK default. It does *not* fall back to the global. Upstream's shape is
 /// `if (definition?.requestTimeoutMs !== undefined) return normalize(...)`, so the global is only
 /// consulted when the per-server key is **absent**; once present, whatever it normalises to wins.
 /// A porter who writes `definition.or(global)` after normalising gets a plausible-looking
-/// implementation that silently reinstates a 30-second cap the user disabled on purpose.
+/// implementation that silently reinstates a 30-second cap the user did not ask for on this server.
+///
+/// It is also not "wait forever": the first version of this port read `undefined` as "no timeout",
+/// which left every request without a configured budget — connect, `tools/list`, `tools/call` —
+/// parked for as long as the server lived.
 #[must_use]
-pub fn resolve_request_timeout(
-    entry: Option<&ServerEntry>,
-    global_ms: Option<f64>,
-) -> Option<Duration> {
+pub fn resolve_request_timeout(entry: Option<&ServerEntry>, global_ms: Option<f64>) -> Duration {
     match entry.and_then(|entry| entry.request_timeout_ms) {
         Some(per_server) => normalize_request_timeout_ms(Some(per_server)),
         None => normalize_request_timeout_ms(global_ms),
     }
+    .unwrap_or(DEFAULT_REQUEST_TIMEOUT)
 }
 
-/// `buildRequestOptions(definition, signal)` (`server-manager.ts:241-256`).
+/// `buildRequestOptions(definition, signal)` (`server-manager.ts:241-256`), with the SDK's default
+/// applied.
 ///
 /// Upstream returns `undefined` when *neither* a signal nor a timeout exists, and the object is
 /// shared by the connect and all three discovery list calls. Here only the timeout half is
 /// representable: [`PeerRequestOptions`] has no signal field, because rmcp cancels a request by
 /// dropping its future — the `ownedSignal` half therefore lives in the `abortable(..)` wrapper
 /// around each call rather than inside the options object.
+///
+/// The timeout is always set. Upstream leaves it off and lets the SDK apply
+/// [`DEFAULT_REQUEST_TIMEOUT`]; rmcp has no such default, so the equivalent is made explicit here
+/// and every consumer reads a budget that is always there.
 ///
 /// `max_total_timeout` has no upstream analogue and stays at its default.
 /// `reset_timeout_on_progress` also stays at its default **here**, and that is parity, not a gap:
@@ -3849,8 +3986,8 @@ pub fn resolve_request_timeout(
 pub fn build_request_options(
     entry: Option<&ServerEntry>,
     global_ms: Option<f64>,
-) -> Option<PeerRequestOptions> {
-    resolve_request_timeout(entry, global_ms).map(PeerRequestOptions::with_timeout)
+) -> PeerRequestOptions {
+    PeerRequestOptions::with_timeout(resolve_request_timeout(entry, global_ms))
 }
 
 // =================================================================================================
@@ -4845,10 +4982,7 @@ impl ConnectionBuilder {
             process,
             lifecycle,
             request.attempt.clone(),
-            request
-                .request_options
-                .as_ref()
-                .and_then(|options| options.timeout),
+            request.request_timeout(),
         )
         .await;
         let handshake = match handshake {
@@ -5202,10 +5336,7 @@ impl ConnectionBuilder {
         // `requestOptions.timeout`, per attempt — upstream's object is built once and passed to
         // every `client.connect`, so each turn of the ladder gets the full budget rather than a
         // share of one. See [`connect_client_bounded`].
-        let budget = request
-            .request_options
-            .as_ref()
-            .and_then(|options| options.timeout);
+        let budget = request.request_timeout();
         // [`SessionIdProbe`] wraps whichever client this attempt uses, so `has_session_id` below is
         // a read of what the server actually sent rather than a constant. The flag is cloned out
         // BEFORE the probe is handed to the transport, which takes its client by value.
@@ -5456,7 +5587,7 @@ async fn drive_http_attempt<C>(
     handler: McpClientHandler,
     request: &CreateConnection,
     lifecycle: ClientLifecycleMode,
-    budget: Option<Duration>,
+    budget: Duration,
 ) -> (
     Result<
         Result<RunningService<RoleClient, McpClientHandler>, Box<ClientInitializeError>>,
@@ -5628,13 +5759,10 @@ fn unauthorized_list_failure(failure: &ListFailure) -> bool {
 /// `RequestHandle::await_response`'s own timeout arm, which the typed `list_all_*` helpers do not
 /// route through. A server that keeps building a tool list nobody will read is the cost, bounded by
 /// the connection being torn down immediately afterwards.
-async fn bounded_list<T, F>(budget: Option<Duration>, list: F) -> Result<T, ListFailure>
+async fn bounded_list<T, F>(budget: Duration, list: F) -> Result<T, ListFailure>
 where
     F: std::future::Future<Output = Result<T, ServiceError>>,
 {
-    let Some(budget) = budget else {
-        return list.await.map_err(ListFailure::Service);
-    };
     match tokio::time::timeout(budget, list).await {
         Ok(outcome) => outcome.map_err(ListFailure::Service),
         Err(_elapsed) => Err(ListFailure::Timeout),
@@ -5706,10 +5834,7 @@ async fn discover(
         None => (false, false, None),
     };
 
-    let budget = request
-        .request_options
-        .as_ref()
-        .and_then(|options| options.timeout);
+    let budget = request.request_timeout();
     let (tools, resources_result, prompts_result) = tokio::join!(
         bounded_list(budget, list_all_tools_with_hints(peer)),
         async {
@@ -6624,7 +6749,7 @@ mod wire_tests {
     // --- MCP-128 --------------------------------------------------------------------------------
 
     #[test]
-    fn an_invalid_per_server_timeout_means_no_timeout_even_when_a_global_is_set() {
+    fn an_invalid_per_server_timeout_means_the_sdk_default_even_when_a_global_is_set() {
         let with = |ms: Option<f64>| {
             let mut e = entry();
             e.request_timeout_ms = ms;
@@ -6633,10 +6758,13 @@ mod wire_tests {
 
         for bad in [0.0_f64, -1.0, f64::NAN, f64::INFINITY] {
             let e = with(Some(bad));
-            assert_eq!(resolve_request_timeout(Some(&e), None), None);
+            assert_eq!(
+                resolve_request_timeout(Some(&e), None),
+                DEFAULT_REQUEST_TIMEOUT
+            );
             assert_eq!(
                 resolve_request_timeout(Some(&e), Some(30_000.0)),
-                None,
+                DEFAULT_REQUEST_TIMEOUT,
                 "an invalid per-server value must NOT reinstate the global ({bad})"
             );
         }
@@ -6644,20 +6772,39 @@ mod wire_tests {
         let pinned = with(Some(5_000.0));
         assert_eq!(
             resolve_request_timeout(Some(&pinned), Some(30_000.0)),
-            Some(Duration::from_millis(5_000))
+            Duration::from_millis(5_000)
         );
 
         let absent = with(None);
         assert_eq!(
             resolve_request_timeout(Some(&absent), Some(30_000.0)),
-            Some(Duration::from_millis(30_000)),
+            Duration::from_millis(30_000),
             "the global is consulted only when the per-server key is absent"
         );
-        assert_eq!(resolve_request_timeout(Some(&absent), None), None);
-        assert!(build_request_options(Some(&absent), None).is_none());
         assert_eq!(
-            build_request_options(Some(&pinned), None).and_then(|o| o.timeout),
+            resolve_request_timeout(Some(&absent), None),
+            DEFAULT_REQUEST_TIMEOUT
+        );
+        assert_eq!(
+            build_request_options(Some(&pinned), None).timeout,
             Some(Duration::from_millis(5_000))
+        );
+    }
+
+    /// pi-mcp-adapter has no way to wait for a reply for ever: an unset `requestTimeoutMs` is the MCP
+    /// SDK's 60 s (`docs/configuration.md`: "if omitted or `<= 0`, the MCP SDK default timeout is
+    /// used"). An entry and a global that say nothing must therefore produce options that carry a
+    /// 60 s budget, for the connect, the three lists and `tools/call` alike. The first port read
+    /// `undefined` as "no timeout".
+    #[test]
+    fn a_request_with_no_configured_timeout_runs_under_the_sdk_default() {
+        assert_eq!(DEFAULT_REQUEST_TIMEOUT, Duration::from_secs(60));
+        let options = build_request_options(Some(&entry()), None);
+        assert_eq!(options.timeout, Some(Duration::from_secs(60)));
+        assert_eq!(
+            build_request_options(None, None).timeout,
+            Some(Duration::from_secs(60)),
+            "a call for a server the manager does not know carries it too"
         );
     }
 }
@@ -6735,7 +6882,7 @@ done
             attempt: CancelToken::new(),
             request: CancelToken::new(),
             credentials_invalidated: false,
-            request_options: None,
+            request_options: build_request_options(None, None),
         }
     }
 
@@ -6954,6 +7101,22 @@ while IFS= read -r line; do
     *)
       if [ -n "$id" ]; then printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id"; fi
       ;;
+  esac
+done
+"#;
+
+    /// Answers `initialize` advertising `tools`, records that `tools/list` arrived by creating the
+    /// file named by `$1`, and then never answers anything again.
+    const STALLED_LIST_MCP: &str = r#"
+marker="$1"
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"%s","capabilities":{"tools":{}},"serverInfo":{"name":"fixture","version":"1"}}}\n' "$id" "$PV"
+      ;;
+    *'"method":"tools/list"'*) : > "$marker" ;;
+    *) : ;;
   esac
 done
 "#;
@@ -7899,6 +8062,80 @@ done
             "expected `{HANDSHAKE_TIMED_OUT}`, got {error}"
         );
         assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    /// The SDK's 60 s default bounds the handshake when **no** `requestTimeoutMs` is configured, on
+    /// the stdio arm. The first port read the unset value as "no timeout" and parked the connect — and
+    /// the manager's per-name single-flight slot, and the first prompt held for the build — for as long
+    /// as the child lived: MEASURED, a `tools/list` reply rmcp could not parse and so dropped left the
+    /// build waiting for 120 s.
+    ///
+    /// The clock is the runtime's virtual one, so the minute elapses the moment the runtime is idle,
+    /// which with a child asleep in `sleep 60` is at once. `elapsed` is virtual time: at least the
+    /// default, so a budget shorter than it cannot satisfy this.
+    #[tokio::test(start_paused = true)]
+    async fn a_wedged_stdio_server_with_no_timeout_configured_fails_its_handshake_at_the_sdk_default()
+     {
+        let started = tokio::time::Instant::now();
+        let error = builder()
+            .connect_stdio(&request("wedged", stdio_entry("exec sleep 60", &[])))
+            .await
+            .expect_err("a server that never answers `initialize` must not hang the connect");
+        assert!(
+            error.to_string().contains(HANDSHAKE_TIMED_OUT),
+            "expected `{HANDSHAKE_TIMED_OUT}`, got {error}"
+        );
+        assert!(
+            started.elapsed() >= DEFAULT_REQUEST_TIMEOUT,
+            "the connect gave up after {:?}, before the SDK default",
+            started.elapsed()
+        );
+    }
+
+    /// A server that completes `initialize` and then never answers `tools/list` fails its connect at
+    /// the SDK default too — the discovery half of the same bound.
+    ///
+    /// The runtime must not idle while the handshake is in flight or the virtual minute would pass
+    /// before the child could answer, so a spinner keeps it busy until the fixture records that it
+    /// received `tools/list`. From then on the child is silent, the runtime idles, and the clock
+    /// jumps to the budget.
+    #[tokio::test(start_paused = true)]
+    async fn a_tools_list_the_server_never_answers_fails_the_connect_at_the_sdk_default() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let marker = temp.path().join("tools-list-received");
+        let mut entry = stdio_entry(STALLED_LIST_MCP, &[&marker.to_string_lossy()]);
+        entry.env = Some(record(&[(
+            "PV",
+            rmcp::model::ProtocolVersion::LATEST.as_str(),
+        )]));
+
+        let spinner = {
+            let marker = marker.clone();
+            tokio::spawn(async move {
+                while !marker.exists() {
+                    tokio::task::yield_now().await;
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            })
+        };
+        let started = tokio::time::Instant::now();
+        let error = builder()
+            .create_connection(request("stalled", entry))
+            .await
+            .err()
+            .expect("a `tools/list` nobody answers must not park the connect");
+        spinner.abort();
+
+        assert!(marker.exists(), "the fixture was asked for its tools");
+        assert!(
+            error.to_string().contains(HANDSHAKE_TIMED_OUT),
+            "expected `{HANDSHAKE_TIMED_OUT}`, got {error}"
+        );
+        assert!(
+            started.elapsed() >= DEFAULT_REQUEST_TIMEOUT,
+            "the list gave up after {:?}, before the SDK default",
+            started.elapsed()
+        );
     }
 
     // ── MCP-114 · §3.4 steps 1–6 ──────────────────────────────────────────────────────────────

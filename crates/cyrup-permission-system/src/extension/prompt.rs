@@ -10,18 +10,69 @@ use cyrup_ext::{HookOutcome, HostCtx};
 
 use crate::ask::{
     AskChannel, AskOutcome, LocalAskChannel, PermissionDecisionState, PermissionPromptDecision,
-    PromptOpts,
+    PromptOpts, SCRIPT_REJECTED_REASON,
 };
 use crate::dedup::DedupDetails;
 use crate::gate;
 use crate::types::PermissionCheckResult;
 
 use super::audit::decision_state_str;
-use super::decide::dedup_details;
+use super::decide::{NestedOrigin, dedup_details};
 use super::env::is_subagent_child;
 use super::{PermissionSystemExtension, guard};
 
+/// How many refused scripts [`PermissionSystemExtension`] remembers. A script is refused by a person,
+/// one at a time, so this is far more than a session sees; it only bounds the memory.
+const REJECTED_SCRIPTS_CAP: usize = 64;
+
 impl PermissionSystemExtension {
+    /// [CYRUP-DELTA] The decision for a call whose script the user refused as a whole, when it is one
+    /// ([`crate::ask::REJECT_SCRIPT_OPTION`]): the call is refused without a dialog, with the reason
+    /// the user's refusal carried. `None` for every other call.
+    fn script_rejection(&self, details: &DedupDetails) -> Option<PermissionPromptDecision> {
+        let parent = details.parent_tool_call_id.as_deref()?;
+        guard(&self.rejected_scripts)
+            .iter()
+            .any(|rejected| rejected == parent)
+            .then(|| PermissionPromptDecision {
+                approved: false,
+                state: PermissionDecisionState::Reject,
+                denial_reason: Some(SCRIPT_REJECTED_REASON.to_string()),
+                reject_script: true,
+            })
+    }
+
+    /// Remember that the user refused the script that made `parent` (see [`Self::script_rejection`]).
+    fn remember_rejected_script(&self, parent: &str) {
+        let mut rejected = guard(&self.rejected_scripts);
+        if rejected.iter().any(|known| known == parent) {
+            return;
+        }
+        if rejected.len() >= REJECTED_SCRIPTS_CAP {
+            rejected.pop_front();
+        }
+        rejected.push_back(parent.to_string());
+    }
+
+    /// Audit and announce a call refused because its script was ([`Self::script_rejection`]).
+    fn record_script_rejection(&self, details: &DedupDetails, decision: &PermissionPromptDecision) {
+        self.review_permission_decision(
+            "permission_request.denied",
+            details,
+            json!({
+                "resolution": "script_rejected",
+                "denialReason": decision.denial_reason,
+                "denialReasonMetadata":
+                    crate::logging::sensitive_log_metadata(decision.denial_reason.as_deref()),
+                "decisionPersistence": "none",
+                "approvalPersistence": "none",
+                "decisionScope": Self::permission_decision_scope(details),
+            }),
+        );
+        self.emit_permission_state_event(details, "denied");
+        self.logger.flush();
+    }
+
     /// Settle an in-flight dedup registration with the decision that resolved it (pi's
     /// `decisionPromise` fulfilling, observed by `rememberPermissionPromptDecision`'s stored promise
     /// at v0.8.0 `index.ts:1633`). A `None` owner is pi's uncacheable case (empty `requestId`,
@@ -45,6 +96,15 @@ impl PermissionSystemExtension {
         if let Some(owner) = owner {
             owner.forget(&mut guard(&self.dedup));
         }
+    }
+
+    /// Whether the session this child forwards its asks to (the parent-session anchor) has said it
+    /// has no UI ([`crate::forwarding::mark_session_unattended`]). No anchor is not an answer: the
+    /// forward then fails closed on its own.
+    fn forwarding_target_is_unattended(&self) -> bool {
+        crate::envx::var(cyrup_ext_subagents::PARENT_SESSION_ENV_VAR).is_some_and(|anchor| {
+            crate::forwarding::session_is_unattended(&self.agent_dir, &anchor)
+        })
     }
 
     /// pi `promptPermission` (`index.ts:1794-1902`), the shared prompting core EVERY ask surface goes
@@ -75,12 +135,24 @@ impl PermissionSystemExtension {
     ) -> AskOutcome {
         let message = details.message.as_str();
         let yolo_mode = guard(&self.config).yolo_mode;
-        if !(ctx.has_ui || is_subagent_child() || yolo_mode) {
+        // \[CYRUP-DELTA] A subagent child may forward its ask to its root session, but not to one
+        // that said it has no UI: nobody would answer, and the child would wait the forwarding
+        // bound (10 minutes) before reporting a denial by a user it never asked. It is refused here
+        // instead, with the reason a session without a UI gives itself.
+        let can_forward = is_subagent_child() && !self.forwarding_target_is_unattended();
+        if !(ctx.has_ui || can_forward || yolo_mode) {
             // The caller's `confirmation_unavailable` entry covers this branch (pi audits it at
             // each of its three `canRequestPermissionConfirmation` sites, not inside
             // `promptPermission`). Ordered BEFORE the cache lookup to match pi, whose callers run
             // `canRequestPermissionConfirmation` before ever entering `promptPermission`.
             return AskOutcome::NoLiveChannel;
+        }
+
+        // [CYRUP-DELTA] A call of a script the user has refused is refused before anything else
+        // about it is asked or reused.
+        if let Some(decision) = self.script_rejection(details) {
+            self.record_script_rejection(details, &decision);
+            return AskOutcome::Decided(decision);
         }
 
         // Dedup hit: reuse the prior decision (collapsed to Allow-Once by `create_duplicate_decision`,
@@ -153,6 +225,7 @@ impl PermissionSystemExtension {
                 approved: true,
                 state: PermissionDecisionState::Approved,
                 denial_reason: None,
+                reject_script: false,
             };
             // pi caches the yolo auto-approval too: `rememberPermissionPromptDecision`
             // (`index.ts:1633`) is handed the SAME `decisionPromise` whose body took the
@@ -176,16 +249,31 @@ impl PermissionSystemExtension {
             Some(lock) => Some(lock.acquire().await),
             None => None,
         };
+        // [CYRUP-DELTA] The calls that waited for the lock while the person answered another one of the
+        // same script's: the answer may have been to refuse the rest.
+        if let Some(decision) = self.script_rejection(details) {
+            self.record_script_rejection(details, &decision);
+            self.resolve_prompt_decision(owner, &decision);
+            return AskOutcome::Decided(decision);
+        }
         let channel: Arc<dyn AskChannel> = match (ctx.has_ui, self.host_services.get()) {
             (true, Some(services)) => Arc::new(LocalAskChannel::new(services.clone())),
             _ => self.ask_channel.clone(),
         };
         let outcome = {
             let _human_wait = ctx.begin_human_wait();
-            channel
-                .confirm("Permission Required", message, PromptOpts::default())
-                .await
+            let opts = PromptOpts {
+                offer_script_reject: details.parent_tool_call_id.is_some(),
+                ..PromptOpts::default()
+            };
+            channel.confirm("Permission Required", message, opts).await
         };
+        if let (AskOutcome::Decided(decision), Some(parent)) =
+            (&outcome, details.parent_tool_call_id.as_deref())
+            && decision.reject_script
+        {
+            self.remember_rejected_script(parent);
+        }
 
         // pi `index.ts:1855-1868`: the resolved decision, with the "Allow Always" session-persist
         // intent recorded alongside it.
@@ -244,11 +332,15 @@ impl PermissionSystemExtension {
         call_id: &str,
         input: &Value,
         check: &PermissionCheckResult,
+        origin: Option<&NestedOrigin>,
         ctx: &HostCtx,
     ) -> HookOutcome {
         let agent_name = self.agent_name.as_deref();
 
-        let details = dedup_details(call_id, input, check, agent_name);
+        let mut details = dedup_details(call_id, input, check, agent_name);
+        if let Some(origin) = origin {
+            origin.mark(&mut details);
+        }
 
         // pi `formatAskPrompt` (`index.ts:570-590`) — the human-facing prompt (NOT the headless reason).
         // The shared prompting core applies the dedup cache, yolo auto-approve (pi
@@ -266,8 +358,12 @@ impl PermissionSystemExtension {
                     &details,
                     json!({ "source": "tool_call", "resolution": "confirmation_unavailable" }),
                 );
+                let reason = gate::format_ask_unavailable_reason(check);
                 return HookOutcome::Block {
-                    reason: Some(gate::format_ask_unavailable_reason(check)),
+                    reason: Some(match origin {
+                        Some(origin) => origin.unavailable_reason(&reason),
+                        None => reason,
+                    }),
                     terminate: TerminateHint::Unspecified,
                 };
             }

@@ -163,6 +163,12 @@ impl ShellTool {
         });
         // `bashOutputSchema` as TypeBox emits it (bash.ts:52-62 @v1.1.0): `full_output_path` is
         // the one `Type.Optional`, so it is the one property missing from `required`.
+        //
+        // [CYRUP-DELTA] `exit_code` carries a description. Upstream states it only in the JSDoc of
+        // `bashOutputSchema` ("A non-zero exit code is an error result for the model, but scripts
+        // still resolve to this value"), which no model ever reads; a codemode declaration renders
+        // a property's description as a comment, so this is where a script author learns that
+        // `exit 3` resolves instead of rejecting.
         let output_schema = serde_json::json!({
             "type": "object",
             "required": ["output", "truncated", "exit_code", "wall_time_seconds"],
@@ -170,7 +176,7 @@ impl ShellTool {
                 "output": { "type": "string", "description": "Combined stdout and stderr, possibly truncated" },
                 "truncated": { "type": "boolean" },
                 "full_output_path": { "type": "string", "description": "Full output, when truncated" },
-                "exit_code": { "type": "number" },
+                "exit_code": { "type": "number", "description": "Exit code. A non-zero code is an error for the model, but the call still resolves to this result; a timeout rejects" },
                 "wall_time_seconds": { "type": "number" }
             }
         });

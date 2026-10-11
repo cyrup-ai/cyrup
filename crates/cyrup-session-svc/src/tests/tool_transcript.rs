@@ -203,9 +203,10 @@ impl NativeExtension for ToolsExt {
 pub(super) struct Seen {
     pub(super) tools: Vec<String>,
     pub(super) messages: String,
-    /// The system prompt the PROVIDER renders for this request: the transcript's system messages
-    /// replayed into one (`getCurrentSystemPrompt` over `normalizeContext`), which is the text of
-    /// the leading system message a provider that carries the prompt outside the message list sends.
+    /// The system prompt the PROVIDER renders for this request: `Context::system_prompt`, the one
+    /// field every adapter reads (they ignore system messages in the message list). It was once
+    /// derived here by replaying the transcript itself, which proved only that the transcript
+    /// replays, not that the request carried it (PROMPT-001).
     pub(super) system_prompt: String,
 }
 
@@ -228,9 +229,7 @@ pub(super) fn script(requests: &Requests, replies: Vec<Reply>) -> Arc<FauxProvid
                 seen.lock().unwrap().push(Seen {
                     tools: ctx.tools.iter().map(|t| t.name.clone()).collect(),
                     messages: serde_json::to_string(&ctx.messages).unwrap(),
-                    system_prompt: cyrup_provider::get_current_system_prompt(
-                        cyrup_provider::normalize_context(ctx).messages(),
-                    ),
+                    system_prompt: ctx.system_prompt.clone().unwrap_or_default(),
                 });
                 match reply {
                     Reply::Call(name) => faux_assistant_message(

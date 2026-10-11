@@ -4505,9 +4505,23 @@ impl McpSetupPanelModel {
     }
 
     /// `discoverySummaryLine()` — first match wins (MCP-378).
+    ///
+    /// [CYRUP-DELTA] A config file that exists and could not be used is said so, before anything is
+    /// counted: upstream reads `Detected 0 configured servers across 0 shared and 0 Pi-owned
+    /// sources.` for a `mcp.json` that is not valid JSON, which is indistinguishable from an empty
+    /// one. When other files did load, the count stays and the sentence follows it.
     #[must_use]
     pub fn discovery_summary_line(&self) -> (Style, String) {
         let t = self.theme;
+        let unreadable: Vec<&crate::config::ConfigDiscoverySource> = self
+            .discovery
+            .sources
+            .iter()
+            .filter(|source| source.unreadable)
+            .collect();
+        if !unreadable.is_empty() && self.discovery.total_server_count == 0 {
+            return (t.warning, Self::unreadable_files_sentence(&unreadable));
+        }
         if !self.discovery.has_any_config {
             return (
                 t.warning,
@@ -4539,15 +4553,41 @@ impl McpSetupPanelModel {
             .iter()
             .filter(|s| s.kind == crate::config::DiscoveryKind::Pi && s.server_count > 0)
             .count();
-        (
-            t.hint,
-            format!(
-                "Detected {} configured servers across {shared} shared and {pi_owned} Pi-owned source{}.",
-                self.discovery.total_server_count,
-                // The plural is suppressed only when the two counts sum to one; `configured
-                // servers` is never singularised.
-                if shared + pi_owned == 1 { "" } else { "s" }
-            ),
+        let detected = format!(
+            "Detected {} configured servers across {shared} shared and {pi_owned} Pi-owned source{}.",
+            self.discovery.total_server_count,
+            // The plural is suppressed only when the two counts sum to one; `configured
+            // servers` is never singularised.
+            if shared + pi_owned == 1 { "" } else { "s" }
+        );
+        if unreadable.is_empty() {
+            (t.hint, detected)
+        } else {
+            (
+                t.warning,
+                format!(
+                    "{detected} {}",
+                    Self::unreadable_files_sentence(&unreadable)
+                ),
+            )
+        }
+    }
+
+    /// `N MCP config file(s) found but not readable: <first path>.`
+    fn unreadable_files_sentence(unreadable: &[&crate::config::ConfigDiscoverySource]) -> String {
+        let first = unreadable
+            .first()
+            .map(|source| source.path.display().to_string())
+            .unwrap_or_default();
+        format!(
+            "{} MCP config file{} found but not readable: {first}{}. The startup warning has the error.",
+            unreadable.len(),
+            if unreadable.len() == 1 { "" } else { "s" },
+            if unreadable.len() > 1 {
+                " and others"
+            } else {
+                ""
+            }
         )
     }
 
@@ -6514,6 +6554,7 @@ mod tests {
                 kind: DiscoveryKind::Shared,
                 server_count: 1,
                 contributes: true,
+                unreadable: false,
             })
             .collect();
         discovery.imports = ImportKind::ALL
@@ -6888,6 +6929,52 @@ mod tests {
         );
     }
 
+    /// [CYRUP-DELTA] A config file that exists and could not be used is not counted as an empty one:
+    /// `Detected 0 configured servers across 0 shared and 0 Pi-owned sources.` read the same for a
+    /// `mcp.json` that was not valid JSON and for one that declared nothing. With servers from other
+    /// files, the count stays and the sentence follows it.
+    #[test]
+    fn the_summary_line_says_so_when_a_config_file_exists_and_cannot_be_read() {
+        let source = |id: SourceId, name: &str, unreadable: bool, server_count: usize| {
+            crate::config::ConfigDiscoverySource {
+                id,
+                label: "rung",
+                path: PathBuf::from(format!("/home/u/{name}/mcp.json")),
+                exists: true,
+                scope: crate::config::SourceScope::Global,
+                kind: crate::config::DiscoveryKind::Pi,
+                server_count,
+                contributes: true,
+                unreadable,
+            }
+        };
+
+        let mut model = setup_model(SetupScreen::Setup);
+        model.discovery.has_any_config = true;
+        model.discovery.sources = vec![source(SourceId::PiGlobal, "agent", true, 0)];
+        assert_eq!(
+            model.discovery_summary_line().1,
+            "1 MCP config file found but not readable: /home/u/agent/mcp.json. The startup warning has the error."
+        );
+
+        model.discovery.sources = vec![
+            source(SourceId::PiGlobal, "agent", true, 0),
+            source(SourceId::SharedGlobal, "shared", false, 2),
+        ];
+        model.discovery.total_server_count = 2;
+        assert_eq!(
+            model.discovery_summary_line().1,
+            "Detected 2 configured servers across 0 shared and 1 Pi-owned source. 1 MCP config file found but not readable: /home/u/agent/mcp.json. The startup warning has the error."
+        );
+
+        // A clean ladder reads exactly as before.
+        model.discovery.sources = vec![source(SourceId::PiGlobal, "agent", false, 2)];
+        assert_eq!(
+            model.discovery_summary_line().1,
+            "Detected 2 configured servers across 0 shared and 1 Pi-owned source."
+        );
+    }
+
     #[test]
     fn the_precedence_preview_names_cyrups_project_override_dir() {
         let model = setup_model(SetupScreen::Setup);
@@ -7019,6 +7106,7 @@ mod tests {
                 kind: crate::config::DiscoveryKind::Shared,
                 server_count: 2,
                 contributes: true,
+                unreadable: false,
             }],
             has_shared_servers: true,
             fingerprint: "fp-1".into(),

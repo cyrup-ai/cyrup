@@ -20,9 +20,11 @@ pub mod keyed_lock;
 pub mod lazy_args;
 pub mod message;
 pub mod shared_str;
+pub mod spilled_files;
 pub mod timings;
 pub mod tool;
 pub mod tool_def;
+pub mod tool_names;
 
 pub use cancel::{CancelToken, RunCancel};
 pub use constrained_sampling::{
@@ -39,7 +41,7 @@ pub use event_stream::{
     Finalizing, FinalizingSink, FinalizingStream, finalizing_channel, finalizing_channel_stamped,
 };
 pub use exposure::{
-    AdvertisedTools, LoadoutHookFailure, LoadoutView, ToolExposure, ToolLoadout,
+    AdvertisedTools, LoadoutHookFailure, LoadoutView, ToolAnnotations, ToolExposure, ToolLoadout,
     ToolLoadoutChanges, ToolNamespace, UnknownExposure, callable_tools,
     normalized_prompt_guidelines,
 };
@@ -59,6 +61,7 @@ pub use tool::{
     ToolUpdateSink,
 };
 pub use tool_def::{ToolDef, ToolReference};
+pub use tool_names::{allowlist_filters_mcp, is_allowed_tool, is_mcp_tool_name, tool_name_matches};
 
 /// The single streaming primitive used across provider, agent, and tools (arch-00 §3.1).
 ///
