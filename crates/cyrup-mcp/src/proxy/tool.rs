@@ -1161,13 +1161,12 @@ mod tests {
             "{:?}",
             result.details
         );
-        assert_eq!(
-            env.calls_made.lock().unwrap().clone(),
-            vec![(
-                "report_0".to_string(),
-                OriginatingCall::of(&ToolCallId::from("call-1"))
-            )]
-        );
+        let calls = env.calls_made.lock().unwrap().clone();
+        let sent: Vec<(&str, Option<&str>)> = calls
+            .iter()
+            .map(|(tool, call)| (tool.as_str(), call.as_ref().map(|call| call.id().as_str())))
+            .collect();
+        assert_eq!(sent, vec![("report_0", Some("call-1"))]);
     }
 
     /// A failed call carries `details.error` beside its identity (`catch_arm` spreads

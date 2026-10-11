@@ -117,13 +117,20 @@ impl ToolCallId {
         Self::from(format!("{caller}/{number}"))
     }
 
-    /// Whether this call has no id to be told apart by: the empty id a provider records for a tool
+    /// Whether this call traces back to no id at all: the empty id a provider records for a tool
     /// call its stream named no id for (`openai_completions` `id.unwrap_or("")`, and the Anthropic
-    /// and pi-messages streams likewise), or a [`nested`](ToolCallId::nested) id under one — `/1`,
-    /// `/1/2`, the same few strings in every turn that has such a call.
+    /// and pi-messages streams likewise), or a [`nested`](ToolCallId::nested) id under one — exactly
+    /// `/<n>`, `/<n>/<m>`, …, the only form `nested` writes under an empty caller. Any other id, a
+    /// provider's `/calls/42` included, is not anonymous; a provider id that is literally `/1` cannot
+    /// be told from a nested one without provenance and reads as anonymous.
     #[must_use]
     pub fn is_anonymous(&self) -> bool {
-        self.0.is_empty() || self.0.starts_with('/')
+        match self.0.strip_prefix('/') {
+            None => self.0.is_empty(),
+            Some(numbers) => numbers.split('/').all(|number| {
+                !number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit())
+            }),
+        }
     }
 }
 

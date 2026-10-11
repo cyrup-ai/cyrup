@@ -336,9 +336,18 @@ inactive and is activated by it, and that its `execute` is unchanged.
 #### MCP-609 — forward pi's tool-call id as the request `_meta` correlation key
 
 **Closure — 2026-10-11** (`claude/eloquent-lovelace-vivq3h` off `main` @ `4fa902b0d`). Every
-`file:line` below was read at that branch's HEAD; the ones this row cited at filing had drifted
-(`dispatch.rs:312` → `:313`, `proxy/call.rs:205` → `:219`, `live.rs:1478` → `:1589-1590`) and are given
-as they now stand.
+`file:line` in this closure was read at that branch's HEAD. The filing text below it (from *Filed
+2026-10-03*) is left as filed. Its cyrup cites have drifted:
+- `dispatch.rs:312` → `:313`
+- `proxy/tool.rs:351` → `:354`
+- `proxy/call.rs:205` → `:219`
+- `proxy/env.rs:269` → `:277`
+- `live.rs:1467` → `:1497` (`impl ProxyEnv for RuntimeEnv`)
+- `live.rs:1478` → `:1590-1591`
+- `proxy/testsupport.rs:133` → `:165`
+- `runtime.rs:2587` → `:3198`
+
+Its *cyrup at HEAD* paragraph describes the base, where no `tools/call` carried the key.
 
 *Sites, enumerated before the change.*
 - **Where the id was dropped: 2 sites, and only 2.** It entered `cyrup-mcp` at 2 `Tool` impls,
@@ -347,10 +356,11 @@ as they now stand.
   There is no third route. `McpTool` is built only by `dispatch.rs`'s `gateway_router`.
   `ProxyEnv::call_tool` has one caller, `invoke` (`proxy/call.rs:954`). `cyrup-ext-subagents`
   builds no MCP request.
-- **Every `CallToolRequestParams` in the workspace: 7, all in `live.rs`.**
-  - 1 is production: `RuntimeEnv::call_tool` (`live.rs:1578`).
+- **Every `CallToolRequestParams` in the workspace before the change: 7, all in `live.rs`.**
+  - 1 is production: `RuntimeEnv::call_tool` (`live.rs:1579`).
   - 6 are tests that call `request_on_peer` directly, with no id in scope; they are unchanged.
   - Nothing builds a raw `tools/call` JSON-RPC request.
+  - The change adds 2 more, both test-only, in `proxy/tool_call_meta.rs`.
 - **One convergence point, already there.** Both routes call `execute_call` (`proxy/call.rs:219`).
   So the id needed carrying, not a second helper:
   - `OriginatingCall` (`proxy/tool_call_meta.rs`) is made at the two entry points by
@@ -358,11 +368,14 @@ as they now stand.
   - It rides `execute_call` as upstream's ninth `executeCall` parameter (`proxy-modes.ts:1209`
     @v5.0.0), then `invoke`, into `ProxyEnv::call_tool`. That trait has 2 implementors,
     `RuntimeEnv` and the test `FakeEnv`, which now records what it was handed.
-  - `OriginatingCall::stamp` writes it in the one production build (`live.rs:1594`), inside the
+  - `OriginatingCall::stamp` writes it in the one production build (`live.rs:1595`), inside the
     session-recovery closure, so a retry resends the same key. Upstream builds `requestMeta` once,
     before `withSessionRecovery` (`proxy-modes.ts:1658`).
-  - `execute_call` has 27 call sites. The 2 production ones pass their origin; the 25 tests pass
-    `None`.
+  - `execute_call` had 27 call sites before the change and has 28 at HEAD.
+    - The 2 production ones (`dispatch.rs:379`, `proxy/tool.rs:496`) pass their origin.
+    - The 25 that existed in tests pass `None`.
+    - The new wire test's helper (`live.rs:3027`) passes the origin it is given: `Some` at `:3063`
+      and `None` at `:3075`.
 - **Merge.** `{ ...meta, [KEY]: id }` (`utils.ts:357`): the key is inserted into the params'
   `_meta`, and only a same-named key is replaced. rmcp adds `progressToken` beside it at send time
   (rmcp 3.1.4 `service.rs:877-888`), which is why a call with no id still goes out with
@@ -379,25 +392,31 @@ as they now stand.
 - **The model's own id.** The agent loop, both batch kinds (`cyrup-agent` `preflight.rs` →
   `run/tools/exec.rs`).
 - **`<caller>/<n>`.** A codemode script's or a WASM guest's nested call (`cyrup-agent`
-  `agent/nested.rs:217`). This is forwarded, as upstream forwards it, because it names the call
-  that made it. `ToolCallId::nested` (`cyrup-core` `lib.rs:116`) is now the one place that form is
-  spelled.
+  `agent/nested.rs:217`). Under a caller with a real id this is forwarded, as upstream forwards it.
+  `ToolCallId::nested` (`cyrup-core` `lib.rs:116`) is now the one place that form is spelled.
 - **No id.**
   - A tool call a provider streamed with no id is recorded as `""`. The sources are
     `openai_completions/deltas.rs:122` `id.unwrap_or("")`, `anthropic_messages/events.rs:108-112`
     and `pi_messages.rs:963`. That call sends **no key** (`if (!toolCallId) return meta;`,
     `utils.ts:356`).
-  - So does a call nested under one, at any depth (`/1`, `/1/2`, …; `ToolCallId::is_anonymous`,
-    `lib.rs:125`). **`[CYRUP-DELTA, upward]`** on `OriginatingCall::of`: upstream forwards `"/1"`
-    because it is truthy. It names no call, and the same strings recur in every turn that has an
-    id-less caller.
+  - So does a call nested under one, at any depth. `ToolCallId::is_anonymous` (`lib.rs:127`)
+    matches exactly `/<n>`, `/<n>/<m>`, …, the only form `nested` writes under an empty caller.
+    Any other id, including a provider's `/calls/42`, is forwarded.
+  - **`[CYRUP-DELTA, upward]`** on `OriginatingCall::of`. Upstream forwards `"/1"` because it is
+    truthy. Its id is derived from a caller that upstream itself treats as having no id
+    (`if (!toolCallId)`), and an id derived from no id is still no id. A provider id that is
+    literally `/1` cannot be told apart from a nested one without provenance, so it is withheld
+    too.
   - No production path reaches `execute_call` without a tool call.
-- **Ids a provider adapter mints when the stream names none.** Google: `{name}_{millis}_{n}`.
-  Mistral: `toolcall<index>`, from `derive_mistral_tool_call_id("toolcall:<index>", 0)` in
-  `mistral_conversations/blocks.rs`, which repeats from turn to turn. Both are the transcript's own
-  ids for the call, as at pi `google-generative-ai.ts:200` and `mistral-conversations.ts:719`, so
-  they are forwarded as pi forwards them. Mistral's repetition is a provider-side property, not
-  this row's.
+- **Ids a provider adapter mints when the stream names none.** These have a real root, so they are
+  forwarded as pi forwards them.
+  - Google: `{name}_{millis}_{n}`.
+  - Mistral: `derive_mistral_tool_call_id("toolcall:<index>", 0)` (`mistral_conversations/blocks.rs:34`).
+    That is the literal `toolcall<index>` for index 0–9 and otherwise a 9-character hash of it
+    (`tool_call_id.rs:44-61`). It is deterministic, so it repeats from turn to turn; that is a
+    provider-side property, not this row's.
+  - Both are the transcript's own ids for the call, as at pi `google-generative-ai.ts:200` and
+    `mistral-conversations.ts:719`.
 
 *Tests.*
 - **`cyrup-it` `tests/mcp/live_tool_call.rs`.** `LIVE_MCP` now appends every `tools/call` line it
@@ -414,9 +433,14 @@ as they now stand.
   - `live.rs` `the_originating_call_rides_the_request_meta_and_no_origin_sends_no_key`:
     `LIVE_ECHO`'s new `request` tool answers with the JSON-RPC line it read, so this checks the key
     beside `progressToken` on the wire, and no key without an origin.
-  - `proxy/tool.rs` `the_tool_arm_sends_the_gateway_calls_own_id`.
-  - `proxy/tool_call_meta.rs` ports `__tests__/tool-call-id-meta.test.ts:32`, `:37-41` and `:47`,
-    plus the nested-under-anonymous delta.
+  - `extension.rs` `a_direct_tool_call_sends_its_own_id_in_the_request_meta`. This is the direct
+    route, ungated: a `DirectTool` call through the real dispatch slot against the extension's live
+    fixture, whose new `request` tool answers with the line it read.
+  - `proxy/tool.rs` `the_tool_arm_sends_the_gateway_calls_own_id`: the gateway route, compared
+    against the literal id.
+  - `proxy/tool_call_meta.rs` ports `__tests__/tool-call-id-meta.test.ts:32`, `:37-41` and `:47`.
+    It also covers the nested-under-anonymous delta, and checks that `/`-prefixed provider ids are
+    still forwarded.
   - These call the new API and so do not compile at the base. Each is proved by the mutations
     below.
 - **Mutation-proved.** Each mutation restores byte-identical, sha256-checked, and each turns a

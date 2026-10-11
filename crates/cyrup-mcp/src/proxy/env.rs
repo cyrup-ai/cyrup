@@ -259,8 +259,9 @@ pub trait ProxyEnv: Send + Sync {
     /// `state.manager.decrementInFlight(server)`.
     fn decrement_in_flight(&self, server: &str);
     /// `withSessionRecovery(..., conn => abortable(conn.client.callTool({name, arguments, _meta}),
-    /// signal))`, with `_meta` being `withToolCallIdMeta(undefined, toolCallId)` built once before the
-    /// recovery wrapper (`proxy-modes.ts:1658`, `:1679-1683` @v5.0.0).
+    /// signal))`, with `_meta` being `withToolCallIdMeta(uiSession?.requestMeta, toolCallId)` built
+    /// once before the recovery wrapper (`proxy-modes.ts:1658`, `:1679-1683` @v5.0.0). Its base is
+    /// always `undefined` here: `uiSession` is MCP Apps, Cut 2.
     ///
     /// `call` is the tool call the request serves. An implementor that sends a request stamps it
     /// with [`OriginatingCall::stamp`] on **every** attempt, the retries [`AuthRecovery`] drives

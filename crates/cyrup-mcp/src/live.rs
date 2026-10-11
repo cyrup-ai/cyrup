@@ -1566,8 +1566,9 @@ impl ProxyEnv for RuntimeEnv {
         self.state.manager.decrement_in_flight(server);
     }
 
-    /// `withSessionRecovery(…, conn => abortable(conn.client.callTool({name, arguments}), signal))`
-    /// (`proxy-modes.ts:1228-1240`) — **MCP-164**.
+    /// `withSessionRecovery(…, conn => abortable(conn.client.callTool({name, arguments, _meta}),
+    /// signal))` (`proxy-modes.ts:1228-1240`) — **MCP-164**; `_meta` carries `call`
+    /// ([`OriginatingCall::stamp`], `proxy-modes.ts:1658` @v5.0.0) — **MCP-609**.
     ///
     /// `arguments` is always sent, an empty map included: upstream's `arguments: args ?? {}` puts the
     /// key on the wire unconditionally, and a server whose schema has no required properties still

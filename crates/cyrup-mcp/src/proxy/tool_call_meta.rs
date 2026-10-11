@@ -33,12 +33,15 @@ impl OriginatingCall {
     /// `if (!toolCallId) return meta;` (`utils.ts:356`) — the empty id a provider records for a
     /// tool call its stream named no id for is no id, and the request carries no key.
     ///
-    /// [CYRUP-DELTA, upward] A nested call under such a caller (`/1`, `/1/2`, …; see
-    /// [`ToolCallId::is_anonymous`]) is no id either. Upstream forwards it, because `"/1"` is
-    /// truthy (`utils.ts:356`) and the nested form is `` `${callerId}/${n}` `` whatever `callerId`
-    /// is (pi `core/nested-tool-calls.ts:189` @f1b2e77f5); but it names no call — the same few
-    /// strings recur in every turn that has an id-less caller — so sending it would hand the server
-    /// a key that correlates unrelated calls.
+    /// [CYRUP-DELTA, upward] A call nested under such a caller (`/1`, `/1/2`, …; see
+    /// [`ToolCallId::is_anonymous`]) is treated as having no id either. Its id is derived from a
+    /// caller upstream itself treats as having none (`if (!toolCallId)`, `utils.ts:356`), and an id
+    /// derived from no id is still no id. Upstream forwards it, because `"/1"` is truthy and the
+    /// nested form is `` `${callerId}/${n}` `` whatever `callerId` is (pi
+    /// `core/nested-tool-calls.ts:189` @f1b2e77f5). Every id with a real root is forwarded as
+    /// upstream forwards it — a nested call under a real caller, and an id a provider adapter mints
+    /// for a call its stream named none for (Mistral's `toolcall<index>`, which also repeats from
+    /// turn to turn).
     #[must_use]
     pub fn of(call_id: &ToolCallId) -> Option<Self> {
         (!call_id.is_anonymous()).then(|| Self(call_id.clone()))
@@ -123,22 +126,17 @@ mod tests {
         );
     }
 
-    /// `withToolCallIdMeta(meta, "")` returns `meta` unchanged (`tool-call-id-meta.test.ts:47`): no
-    /// origin, so nothing to stamp and no `_meta` on the wire.
+    /// `withToolCallIdMeta(undefined, "")` is `undefined` (`tool-call-id-meta.test.ts:47`): an empty
+    /// id is no origin, so there is nothing to stamp. The request still carries the `_meta` rmcp adds
+    /// (`progressToken`) but never this key, which `live.rs`'s
+    /// `the_originating_call_rides_the_request_meta_and_no_origin_sends_no_key` checks on the wire.
     #[test]
     fn an_empty_id_is_no_origin() {
         assert_eq!(OriginatingCall::of(&ToolCallId::from("")), None);
-        let params = CallToolRequestParams::new("echo");
-        assert!(
-            serde_json::to_value(&params)
-                .unwrap()
-                .get("_meta")
-                .is_none()
-        );
     }
 
-    /// [CYRUP-DELTA, upward] — a nested call under an id-less caller names no call, at any depth.
-    /// A nested call under a REAL caller is that caller's call and is forwarded, as upstream does.
+    /// [CYRUP-DELTA, upward] — a nested call under an id-less caller has no origin, at any depth. A
+    /// nested call under a REAL caller, and any other id, is forwarded as upstream forwards it.
     #[test]
     fn a_nested_id_has_an_origin_exactly_when_its_caller_does() {
         let anonymous = ToolCallId::from("");
@@ -153,5 +151,16 @@ mod tests {
             OriginatingCall::of(&nested).unwrap().id().as_str(),
             "call_7/3"
         );
+
+        // Only the form `nested` writes under an empty caller is anonymous: a provider id that merely
+        // begins with `/` is a real id, and upstream forwards it.
+        for provided in ["/calls/42", "/abc", "/", "/1/", "/1a"] {
+            assert_eq!(
+                OriginatingCall::of(&ToolCallId::from(provided))
+                    .map(|call| call.id().as_str().to_string()),
+                Some(provided.to_string()),
+                "{provided:?} is forwarded"
+            );
+        }
     }
 }

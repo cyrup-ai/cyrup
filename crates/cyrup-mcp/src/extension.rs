@@ -3503,6 +3503,10 @@ mod tests {
     /// because a stdio server's `env` REPLACES the child's environment and `sh` needs `PATH`), and
     /// `$2` is a marker file it touches on start, so "a child process really ran" is checkable from
     /// the outside.
+    ///
+    /// It lists two tools. `echo`'s `tools/call` is answered with an empty object (not a
+    /// `CallToolResult`, which is how a test proves the call reached the server); `request` answers
+    /// with the JSON-RPC line it READ, so a test can assert on the bytes the child received (MCP-609).
     const LIVE_MCP: &str = r#"
 : > "$2"
 while IFS= read -r line; do
@@ -3512,9 +3516,13 @@ while IFS= read -r line; do
       printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"%s","capabilities":{"tools":{}},"serverInfo":{"name":"fixture","version":"1"}}}\n' "$id" "$1"
       ;;
     *'"method":"tools/list"'*)
-      printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"echo","description":"echo back","inputSchema":{"type":"object","properties":{"text":{"type":"string"}}}}]}}\n' "$id"
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"echo","description":"echo back","inputSchema":{"type":"object","properties":{"text":{"type":"string"}}}},{"name":"request","description":"answers with the request it read","inputSchema":{"type":"object"}}]}}\n' "$id"
       ;;
     *'"method":"notifications/'*) : ;;
+    *'"method":"tools/call"'*'"name":"request"'*)
+      req=$(printf '%s' "$line" | sed 's/\\/\\\\/g; s/"/\\"/g')
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"%s"}],"isError":false}}\n' "$id" "$req"
+      ;;
     *)
       if [ -n "$id" ]; then printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id"; fi
       ;;
@@ -3978,6 +3986,62 @@ done
             "the call returned before the 2 s server could have come up"
         );
         assert!(ext.proxy_ctx().is_some(), "the answer came from the commit");
+    }
+
+    /// **MCP-609 on the direct route, ungated.** A `DirectTool` call hands its own tool-call id to
+    /// `McpDispatch::call_direct`, which sends it to the server as
+    /// `_meta["pi-mcp-adapter/toolCallId"]` (`direct-tools.ts:321` @v5.0.0). The fixture's
+    /// `request` tool answers with the line it read, so the assertion is on the child's bytes;
+    /// `cyrup-it`'s `live_tool_call.rs` holds the same through a whole session.
+    #[tokio::test]
+    async fn a_direct_tool_call_sends_its_own_id_in_the_request_meta() {
+        use cyrup_core::Tool;
+
+        let dir = tempfile::tempdir().unwrap();
+        let ext = start_unsettled_where(
+            dir.path(),
+            1,
+            serde_json::json!({ "directTools": true }),
+            |ext| ext,
+        )
+        .await;
+        let slot = ext
+            .dispatch()
+            .expect("`init` stashed the generation's executor slot");
+        let direct = crate::registration::DirectTool::new(
+            crate::registration::DirectToolSpec {
+                server_name: "slow".to_string(),
+                original_name: "request".to_string(),
+                prefixed_name: "slow_request".to_string(),
+                description: "answers with the request it read".to_string(),
+                input_schema: None,
+                resource_uri: None,
+                lazy: false,
+            },
+            cyrup_core::ToolRenderKind::SelfRendered,
+            slot,
+            None,
+        );
+
+        let result = direct
+            .execute(
+                cyrup_core::ToolCallId::from("call_direct_unit"),
+                serde_json::json!({}),
+                cyrup_core::CancelToken::new(),
+                Box::new(|_| {}),
+            )
+            .await
+            .expect("a direct call reports through its result");
+
+        let received: serde_json::Value = serde_json::from_str(&result_text(&result))
+            .unwrap_or_else(|_| panic!("the server answered: {}", result_text(&result)));
+        assert_eq!(received["method"], serde_json::json!("tools/call"));
+        assert_eq!(received["params"]["name"], serde_json::json!("request"));
+        assert_eq!(
+            received["params"]["_meta"]["pi-mcp-adapter/toolCallId"],
+            serde_json::json!("call_direct_unit"),
+            "the direct tool's own call id reached the server: {received}"
+        );
     }
 
     /// A script that searches, enumerates or describes tools may find the server in any form, and

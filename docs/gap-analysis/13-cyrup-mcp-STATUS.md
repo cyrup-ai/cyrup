@@ -553,7 +553,7 @@ Rows moved to `implemented` in the tables above (the table rows are left as file
 | `MCP-211` | 13e | `formatSchema` and its helpers are ported from `pi-mcp-adapter` `tool-metadata.ts` (`crates/cyrup-mcp/src/proxy/tool_metadata.rs::format_schema`, wired into `RuntimeEnv::format_schema` in `live.rs`; `6c869417b`), keeping the JavaScript behaviour a reader takes for granted: `Object.entries` order for property names, `JSON.stringify`'s number and member order (through `cyrup-codemode`'s one reproduction of both) and the truthiness test on `type`. The test table is upstream's own `formatSchema` output for 35 schemas, run under bun from the function's text at v5.0.0 and compared byte for byte (`format_schema_matches_upstreams_output_byte_for_byte`). `mcp({ describe })`, `mcp({ search })` and the 'Expected parameters:' end of a failed call now carry parameters; they had answered the literal `(schema rendering is not wired - MCP-211)`, so a model never saw what a tool takes, and a script reaches default-mode MCP servers only through that gateway. The placeholder is gone from the tree outside this directory (the lane's grep). |
 | `MCP-616` | 13e | `*` patterns in `--tools` and `--exclude-tools`, MCP tools kept registered under an allowlist without an `mcp__` entry, and `--no-mcp` (`843a4c123`); evidence, the `[CYRUP-DELTA]` `Tool::is_mcp_tool` and the known limit are in the row. |
 
-Four rows filed in `13e` and closed on filing (`implemented`): `MCP-618` (a script that names a server, and `tool_search`, wait for the build), `MCP-619` (every MCP tool resolves to the server's `CallToolResult`), `MCP-620` (the first prompt waits for starting servers, 10 s, declared) and `MCP-621` (the MCP approval dialog is awaited on the blocking pool). `MCP-612` and `MCP-614` carry dated NARROWED notes and stay `missing`.
+Four rows filed in `13e` and closed on filing (`implemented`): `MCP-618` (a script that names a server, and `tool_search`, wait for the build), `MCP-619` (every MCP tool resolves to the server's `CallToolResult`), `MCP-620` (the first prompt waits for starting servers, 10 s, declared) and `MCP-621` (the MCP approval dialog is awaited on the blocking pool). `MCP-612` and `MCP-614` carry dated NARROWED notes and stay `missing`. *(CORRECTED 2026-10-11: `MCP-612` had already closed on 2026-10-08, `13e`; `MCP-614` closed 2026-10-11. See *Closures — 2026-10-11* for the census.)*
 
 Arithmetic on the census above (554: `implemented` 349, `partial` 70, `missing` 101, `not-applicable` 34, after `main`'s pi v1.1.0 drift triage added `MCP-617`; the branch's own base was 553 with `missing` 100): +4 rows = **558**; `implemented` 349 + 2 (`MCP-211`, `MCP-616`) + 4 (`MCP-618`…`MCP-621`) = **355**; `missing` 101 − 2 = **99**; `partial` 70; `not-applicable` 34. 355 + 70 + 99 + 34 = 558. Severity of the four new rows: 4 medium. Next free id: `MCP-622`. (The branch had numbered these four `MCP-617`…`MCP-620`; the rebase onto `main`, which had filed `MCP-617`, moved them up one.)
 
@@ -599,9 +599,29 @@ above are left as filed.
   fixture server on a bound session and sees the loaded tool in the next request.
 
 Arithmetic on the 2026-10-10 census (570: `implemented` 361, `partial` 75, `missing` 100,
-`not-applicable` 34): no row added; `implemented` 361 + 2 = **363**; `missing` 100 − 2 = **98**;
-363 + 75 + 98 + 34 = **570**. Next free id unchanged: `MCP-634`. Area 13 is counted in this file
-by the standing rule, so `scripts/count_open_items.py` does not see this change.
+`not-applicable` 34): no row added; `implemented` 361 + 2 = 363; `missing` 100 − 2 = 98.
+
+**Correction: the 2026-10-08 drift-sweep closures never reached a census.** Seven rows were closed on
+`claude/mcp-drift-sweep` by editing their table cells in place, and no arithmetic block since has
+counted them:
+- partial → implemented: `MCP-588`, `MCP-597`, `MCP-605` (table F) and `MCP-610` (table G). Each
+  was filed `partial` (`ed8952c4d`, `c0d4d1fc9`).
+- missing → implemented: `MCP-590`, `MCP-592` (table F), and `MCP-612` (closed 2026-10-08 in
+  `13e`). The 2026-10-09 block above still said `MCP-612` "stays `missing`"; that sentence is now
+  annotated.
+
+Folded in, the census at 2026-10-11 is:
+
+| status | count |
+|---|---|
+| `implemented` | 363 + 7 = **370** |
+| `partial` | 75 − 4 = **71** |
+| `missing` | 98 − 3 = **95** |
+| `not-applicable` | **34** |
+| **total** | 370 + 71 + 95 + 34 = **570** |
+
+Next free id unchanged: `MCP-634`. Area 13 is counted in this file by the standing rule, so
+`scripts/count_open_items.py` does not see this change.
 
 ### Additions — 2026-10-07 (area 18's pi `v1.0.1..v1.0.4` triage)
 
