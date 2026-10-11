@@ -541,6 +541,25 @@ pub trait HostServices: Send + Sync {
         Err("theme capability not granted".into())
     }
     /// Whether tool rows are expanded (Pi `getToolsExpanded()`, `types.ts:278` @v0.83.0).
+    /// The host's EFFECTIVE keybinding table for `namespace` (`"app"`, `"tui.editor"`,
+    /// `"tui.select"`, `"app.tree"`), as `{ "<id>": ["<key>", …], … }` — pi's
+    /// `keybindingsManager.getBindings()` read an extension does through `ctx`, rather than
+    /// re-reading `keybindings.json` for itself. TUI-126.
+    ///
+    /// The point is LIVENESS and PRECEDENCE, not convenience: the host's table is the user's
+    /// `keybindings.json` already merged over the platform-conditional defaults of
+    /// `core/keybindings.ts` and already re-merged on a live rebind, so an extension that reads
+    /// this cannot drift from the keys the rest of the UI answers to. An extension that reads the
+    /// file itself gets neither — it misses the defaults it did not reimplement, and it freezes
+    /// whatever was on disk when it opened.
+    ///
+    /// The default is an empty object: a host with no keymap (RPC, print/json, a test) answers
+    /// nothing and the caller keeps its own defaults, which is the shape every other
+    /// live-UI-state read here takes.
+    fn effective_keybindings(&self, _namespace: &str) -> Value {
+        serde_json::json!({})
+    }
+
     fn tools_expanded(&self) -> bool {
         false
     }

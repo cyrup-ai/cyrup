@@ -1046,6 +1046,20 @@ impl Keymap {
     }
 
     /// All keys currently bound to `action` (the reverse of [`action_for`](Self::action_for)).
+    /// Every binding in this namespace as `{ "<id>": ["<key>", …], … }` — what
+    /// `HostServices::effective_keybindings("app")` answers, so an extension reads the table the
+    /// rest of the UI answers to instead of re-reading `keybindings.json` for itself. TUI-126.
+    ///
+    /// Ids in first-bound order, keys in bound order, both as the user would read them
+    /// ([`Key::label`]). An action bound to nothing is absent rather than present-and-empty, which
+    /// is how upstream's table reads: `app.suspend` is UNBOUND on `win32` (`keybindings.ts:96-99`)
+    /// and the platform-conditional defaults are already merged in here, so a caller sees the keys
+    /// for ITS platform without reimplementing that table.
+    #[must_use]
+    pub fn bindings_json(&self) -> serde_json::Value {
+        bindings_table(&self.bindings)
+    }
+
     pub fn keys_for(&self, action: Action) -> Vec<Key> {
         self.bindings
             .iter()
@@ -1193,6 +1207,13 @@ impl Default for SelectKeymap {
 }
 
 impl SelectKeymap {
+    /// This namespace's bindings as `{ "<id>": ["<key>", …] }` — see
+    /// [`Keymap::bindings_json`], which this mirrors for `tui.select`. TUI-126.
+    #[must_use]
+    pub fn bindings_json(&self) -> serde_json::Value {
+        bindings_table(&self.bindings)
+    }
+
     /// An empty selector keymap.
     pub fn empty() -> Self {
         SelectKeymap {
@@ -1880,6 +1901,13 @@ impl TreeKeymap {
 }
 
 impl TreeKeymap {
+    /// This namespace's bindings as `{ "<id>": ["<key>", …] }` — see
+    /// [`Keymap::bindings_json`], which this mirrors for `app.tree`. TUI-126.
+    #[must_use]
+    pub fn bindings_json(&self) -> serde_json::Value {
+        bindings_table(&self.bindings)
+    }
+
     /// Resolve the tree action for an event, if any (R-10-018).
     pub fn action_for(&self, ev: &KeyEvent) -> Option<TreeAction> {
         self.bindings
@@ -1956,6 +1984,13 @@ impl Default for EditorKeymap {
 }
 
 impl EditorKeymap {
+    /// This namespace's bindings as `{ "<id>": ["<key>", …] }` — see
+    /// [`Keymap::bindings_json`], which this mirrors for `tui.editor`. TUI-126.
+    #[must_use]
+    pub fn bindings_json(&self) -> serde_json::Value {
+        bindings_table(&self.bindings)
+    }
+
     /// Upstream's `tui.*` editor defaults for `platform`. One of them has platform arms:
     /// `tui.editor.undo` is `process.platform === "win32" ? "ctrl+z" : windowsKeybindings ? "alt+z"
     /// : "ctrl+-"` (`core/keybindings.ts:77-80` @v0.87.1) — `alt+z` under WSL (CFG-091), `ctrl+z`
@@ -2439,5 +2474,91 @@ impl AltScreenKeymap {
     /// extension-shortcut gate; see [`effective_config`].
     pub fn effective_config(&self) -> Vec<(String, Vec<String>)> {
         effective_config(&self.bindings, AltScreenAction::id)
+    }
+}
+
+/// The one reader behind every `bindings_json` (TUI-126): a keymap's bindings as
+/// `{ "<action id>": ["<key label>", …] }`.
+///
+/// Ids in first-bound order, keys in bound order, both as the user would read them
+/// ([`Key::label`]). An action bound to NOTHING is absent rather than present-and-empty, which is
+/// how upstream's table reads — `app.suspend` is unbound on `win32` (`keybindings.ts:96-99`) — and
+/// the platform-conditional defaults are already merged in by each `for_platform`, so a caller
+/// sees the keys for ITS platform without reimplementing that table.
+fn bindings_table<A: Copy>(bindings: &[(Key, A)]) -> serde_json::Value
+where
+    A: KeyActionId,
+{
+    let mut out = serde_json::Map::new();
+    for (key, action) in bindings {
+        let entry = out
+            .entry(action.action_id().to_string())
+            .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+        if let Some(list) = entry.as_array_mut() {
+            list.push(serde_json::Value::String(key.label()));
+        }
+    }
+    serde_json::Value::Object(out)
+}
+
+/// The `id(self) -> &'static str` every keymap action already has, as a bound [`bindings_table`]
+/// can take. Deliberately NOT implemented for `AutocompleteAction`: the popup has no upstream ids
+/// at all, so it has no namespace to publish (`app/shell.rs:265-267`).
+trait KeyActionId {
+    fn action_id(self) -> &'static str;
+}
+
+macro_rules! key_action_id {
+    ($($ty:ty),+ $(,)?) => {
+        $(impl KeyActionId for $ty {
+            fn action_id(self) -> &'static str {
+                self.id()
+            }
+        })+
+    };
+}
+
+key_action_id!(
+    Action,
+    EditorAction,
+    SelectAction,
+    TreeAction,
+    ModelsAction,
+    SessionAction,
+    ThinkingAction,
+    AltScreenAction,
+);
+
+/// The four remaining keymaps' readers, so `effective_keybindings` can answer EVERY namespace the
+/// app owns rather than only the ones `/llama` happens to read today (TUI-126).
+impl ModelsKeymap {
+    /// `app.models.*`, for `HostServices::effective_keybindings`. See [`bindings_table`].
+    #[must_use]
+    pub fn bindings_json(&self) -> serde_json::Value {
+        bindings_table(&self.bindings)
+    }
+}
+
+impl SessionKeymap {
+    /// `app.session.*`, for `HostServices::effective_keybindings`. See [`bindings_table`].
+    #[must_use]
+    pub fn bindings_json(&self) -> serde_json::Value {
+        bindings_table(&self.bindings)
+    }
+}
+
+impl ThinkingKeymap {
+    /// `app.thinking.*`, for `HostServices::effective_keybindings`. See [`bindings_table`].
+    #[must_use]
+    pub fn bindings_json(&self) -> serde_json::Value {
+        bindings_table(&self.bindings)
+    }
+}
+
+impl AltScreenKeymap {
+    /// `tui.altScreen.*`, for `HostServices::effective_keybindings`. See [`bindings_table`].
+    #[must_use]
+    pub fn bindings_json(&self) -> serde_json::Value {
+        bindings_table(&self.bindings)
     }
 }

@@ -509,6 +509,61 @@ impl EditorTextMirror {
     }
 }
 
+/// The host's live keybinding tables, keyed by namespace — `{ "app": { "<id>": ["<key>", …] }, … }`
+/// — republished by the interactive app and read by
+/// [`LiveHostServices::effective_keybindings`]. TUI-126.
+///
+/// A published snapshot rather than a trait object calling back into the TUI, because `AppState`
+/// owns its keymaps BY VALUE (`pub keymap: Keymap`, `pub select_keymap: SelectKeymap`, …) and
+/// mutates them in place on a rebind, so there is nothing stable for a callback to hold. This is
+/// the same seam [`EditorTextMirror`] uses for the buffer.
+#[derive(Clone, Debug, Default)]
+pub struct KeybindingMirror(Arc<Mutex<Value>>);
+
+impl KeybindingMirror {
+    /// A fresh mirror, carrying no table — every read answers `{}` until the app publishes.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Publish the WHOLE effective table at once — one flat `{ "<action id>": ["<key>", …] }`
+    /// map over every namespace the app owns. The app calls this from its per-frame readback, so a
+    /// live rebind is visible to the next extension that asks.
+    pub fn publish(&self, table: Value) {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = table;
+    }
+
+    /// The ids under `namespace`, keyed by their FULL id, or `{}` when this host carries no table.
+    ///
+    /// A namespace is an id PREFIX, not a table name, because the app's keymaps and upstream's
+    /// namespaces do not partition the same way: `tui.input.*` ids ride the EDITOR's map
+    /// (`keymap.rs`, `EditorAction`), so a caller asking for `tui.input` would get nothing from a
+    /// namespace-keyed store even though those ids exist. Filtering by prefix also makes the
+    /// coarser reads work — `effective_keybindings("tui")`, or `""` for everything — which is what
+    /// an extension enumerating the table wants.
+    #[must_use]
+    pub fn bindings(&self, namespace: &str) -> Value {
+        let guard = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(table) = guard.as_object() else {
+            return json!({});
+        };
+        if namespace.is_empty() {
+            return Value::Object(table.clone());
+        }
+        let mut prefix = String::with_capacity(namespace.len() + 1);
+        prefix.push_str(namespace);
+        prefix.push('.');
+        let mut out = serde_json::Map::new();
+        for (id, keys) in table {
+            if id.starts_with(&prefix) {
+                out.insert(id.clone(), keys.clone());
+            }
+        }
+        Value::Object(out)
+    }
+}
+
 /// EXT-064 — the interactive footer's extension-visible data (SEAM-T03): pi's `FooterDataProvider`
 /// in the shape a cyrup guest can pull, backing [`HostServices::footer_data`].
 ///
@@ -1072,6 +1127,11 @@ pub struct LiveHostServices {
     /// default host — where all four theme methods answer pi's `noOpUIContext` values. See
     /// [`ThemeAccess`].
     theme_access: Mutex<Option<Arc<dyn ThemeAccess>>>,
+    /// The live keybinding tables, republished by the TUI each frame through
+    /// [`Self::attach_keybinding_mirror`] — the keymap member of the same readback seam as
+    /// [`Self::editor_mirror`]. Empty in RPC and in headless, and then every read answers `{}` so a
+    /// caller keeps its own defaults. TUI-126.
+    keybinding_mirror: Mutex<Option<KeybindingMirror>>,
     /// EXT-064 — the interactive footer's extension-visible data (SEAM-T03), attached post-build
     /// via [`Self::attach_footer_data_mirror`]. `None` in RPC and in headless (print/json) — and
     /// on the default host — where [`HostServices::footer_data`] keeps its trait default `None`,
@@ -1243,6 +1303,7 @@ impl LiveHostServices {
             catalog: Mutex::new(None),
             model_calls: Mutex::new(None),
             theme_access: Mutex::new(None),
+            keybinding_mirror: Mutex::new(None),
             footer_data_mirror: Mutex::new(None),
             editor_mirror: Mutex::new(None),
             editor_focus_mirror: Mutex::new(None),
@@ -1415,6 +1476,12 @@ impl LiveHostServices {
     /// `interactive-mode.ts:2401-2417` @v0.84.2); leaving it unattached in RPC/print/json IS the
     /// upstream policy, not an omission. Must be re-run against every swapped-in session, exactly
     /// like the ui sinks: a replacement session brings a fresh `LiveHostServices`.
+    /// Install the live keybinding mirror — the keymap twin of [`Self::attach_editor_mirror`], and
+    /// re-installed on every session swap for the same reason. TUI-126.
+    pub fn attach_keybinding_mirror(&self, keys: KeybindingMirror) {
+        *Self::lock(&self.keybinding_mirror) = Some(keys);
+    }
+
     pub fn attach_theme_access(&self, theme: Arc<dyn ThemeAccess>) {
         *Self::lock(&self.theme_access) = Some(theme);
     }
@@ -2052,6 +2119,13 @@ impl HostServices for LiveHostServices {
         match Self::lock(&self.theme_access).clone() {
             Some(access) => access.list(),
             None => json!([]),
+        }
+    }
+
+    fn effective_keybindings(&self, namespace: &str) -> Value {
+        match Self::lock(&self.keybinding_mirror).clone() {
+            Some(mirror) => mirror.bindings(namespace),
+            None => json!({}),
         }
     }
 

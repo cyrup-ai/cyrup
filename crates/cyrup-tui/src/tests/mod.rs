@@ -122,6 +122,7 @@ mod model_selector_assembled;
 mod native_shift_enter;
 mod nested_tool_events;
 mod overlay_cursor;
+mod overlay_keybindings;
 mod overlay_paste;
 mod overlay_pointer;
 mod package_update_notice;

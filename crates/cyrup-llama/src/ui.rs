@@ -588,6 +588,37 @@ impl LlamaKeys {
         Self { table }
     }
 
+    /// Resolve against the HOST's effective keybinding tables — TUI-126, and the form to prefer
+    /// over [`Self::from_agent_dir`] wherever a `HostServices` is in hand.
+    ///
+    /// Reads `tui.editor` and `tui.select`, the two namespaces these bindings live in (the
+    /// `tui.input.*` ids are carried by the editor's map, `keymap.rs`'s `EditorAction`). The host's
+    /// table is the user's `keybindings.json` ALREADY merged over the platform-conditional defaults
+    /// of `core/keybindings.ts` and already re-merged on a live rebind, so this is both the right
+    /// precedence and the live value — where reading the file directly carried neither: it missed
+    /// defaults this crate does not reimplement, and it froze whatever was on disk when the overlay
+    /// opened.
+    ///
+    /// Falls back to [`Self::from_agent_dir`] when the host answers nothing, which is every
+    /// non-interactive mode (RPC, print/json, a test): there is no live keymap there, so the file is
+    /// still the best available answer and behaviour outside the TUI is unchanged.
+    #[must_use]
+    pub fn from_host(host: &dyn cyrup_ext::HostServices, agent_dir: &Path) -> Self {
+        // ONE read of the `tui` prefix, not one per leaf namespace: this overlay's ids span three
+        // of them — `tui.editor.*`, `tui.select.*` and `tui.input.*` (`Binding::InputSubmit` is
+        // `tui.input.submit`) — and `tui.input.*` is bound in the host's EDITOR keymap, so naming
+        // `tui.editor` and `tui.select` would silently miss a `tui.input` rebind. Ids this overlay
+        // does not know (`tui.altScreen.*`) are dropped by `from_user_bindings`.
+        let mut pairs: Vec<(String, serde_json::Value)> = Vec::new();
+        if let serde_json::Value::Object(map) = host.effective_keybindings("tui") {
+            pairs.extend(map.into_iter());
+        }
+        if pairs.is_empty() {
+            return Self::from_agent_dir(agent_dir);
+        }
+        Self::from_user_bindings(&pairs)
+    }
+
     /// Read `<agent_dir>/keybindings.json`, migrating legacy ids exactly as the TUI does. Any
     /// failure (absent, unreadable, malformed, not an object) yields the defaults.
     #[must_use]
