@@ -86,7 +86,6 @@ fn key_spec_aliases_and_case() {
     assert!(KeySpec::parse("f1x").is_none());
     // A spec with modifiers only, or a second multi-character token, names no key.
     assert!(KeySpec::parse("ctrl").is_none());
-    assert!(KeySpec::parse("ctrl++").is_none());
     assert!(KeySpec::parse("up+down+nope").is_none());
     assert!(KeySpec::parse("cmd+k").is_none());
 }
@@ -288,4 +287,48 @@ fn user_bindings_migrate_legacy_ids_and_reject_non_objects() {
     assert_eq!(parse_user_bindings("[1, 2]"), None);
     assert_eq!(parse_user_bindings("\"up\""), None);
     assert_eq!(parse_user_bindings(""), None);
+}
+
+/// CFG-103 — the overlay reader is `keybindings.getUserBindings()`, which pi `7f9e1198f` filters
+/// through `toKeybindingsConfig` (`core/keybindings.ts:267-276` @f1b2e77f5): `$schema` is skipped
+/// and an entry whose value fails `KeybindingValueSchema` is dropped WHOLE, so an overlay falls back
+/// to its default exactly as the TUI's keymaps do. RED at HEAD `4fa902b0`: every entry was kept,
+/// and `["up", "ctrl+nope"]` resolved to `up` alone in the MCP panel and the llama overlay while
+/// the TUI kept the default.
+#[test]
+fn cfg103_user_bindings_drop_an_entry_with_an_invalid_key() {
+    let kept = parse_user_bindings(
+        r#"{
+            "$schema": "https://example.invalid/keybindings.schema.json",
+            "tui.select.up": ["up", "ctrl+nope"],
+            "tui.select.down": "Ctrl+N",
+            "tui.select.cancel": ["escape", 7],
+            "tui.select.pageUp": [],
+            "tui.select.confirm": "ctrl+j"
+        }"#,
+    )
+    .unwrap();
+    let mut ids: Vec<&str> = kept.iter().map(|(id, _)| id.as_str()).collect();
+    ids.sort_unstable();
+    assert_eq!(ids, vec!["tui.select.confirm", "tui.select.pageUp"]);
+}
+
+/// CFG-103 / TUI-177 in step — `ctrl++` and `+` are `KeyId`s pi's schema accepts and the TUI's
+/// `Key::parse` binds to the `+` key (TUI-177), so after the CFG-103 gate they are the one place a
+/// user's file could still mean something different in an overlay. RED at HEAD `4fa902b0`: both
+/// parsed to no key. pi `parseKeyId` (`packages/tui/src/keys.ts:820-840` @f1b2e77f5):
+/// `if (!key || (key.includes("+") && key !== "+")) return null;` — so `a++` and `++` stay
+/// invalid.
+#[test]
+fn cfg103_key_spec_names_the_plus_key() {
+    assert_eq!(spec("+").code, OverlayKeyCode::Char('+'));
+    let ctrl_plus = spec("ctrl++");
+    assert_eq!(ctrl_plus.code, OverlayKeyCode::Char('+'));
+    assert!(ctrl_plus.ctrl && !ctrl_plus.alt && !ctrl_plus.shift);
+    assert!(ctrl_plus.matches(&ctrl('+')));
+    let alt_shift_plus = spec("alt+shift++");
+    assert!(alt_shift_plus.alt && alt_shift_plus.shift && !alt_shift_plus.ctrl);
+    assert!(KeySpec::parse("a++").is_none());
+    assert!(KeySpec::parse("++").is_none());
+    assert!(KeySpec::parse("ctrl+++").is_none());
 }

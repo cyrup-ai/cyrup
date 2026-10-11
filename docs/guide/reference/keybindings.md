@@ -329,30 +329,36 @@ A recognised id **replaces that action's entire key set** — it does not add to
 ignored silently.
 
 **A bad entry costs you that entry, not the file.** A value that is neither a string nor an array of
-strings skips the entry and the action keeps its default. A key spec that will not parse drops that
-one key and the rest of the entry still applies; when it was the only key, the action ends up
-unbound. Each rejection is reported by binding id and reason — `warning: <path>: ignoring <id>:
+strings skips the entry and the action keeps its default. So does an entry with any key spec that is
+not valid: `["ctrl+l", "ctrl+nope"]` leaves the action exactly as it was, not bound to `ctrl+l`
+alone (pi does the same). Each rejection is reported by binding id and reason — `warning: <path>: ignoring <id>:
 <reason>` at startup, `keybindings: ignoring <id>: <reason>` on `/reload`. Only unparseable JSON, or
 a top level that is not an object, discards the whole document.
 
 ### Key-spec grammar
 
-A key spec is modifiers and a key joined with `+`, and is case-insensitive.
+A key spec is up to four modifiers and one key joined with `+`, spelled exactly as below — the
+same grammar as pi's published `keybindings.json` schema. Case matters: `Ctrl+L`, `Escape` and
+`pageup` are invalid (write `ctrl+l`, `escape`, `pageUp`).
 
-- **Modifiers:** `ctrl`, `shift`, `alt`, `super`.
+- **Modifiers:** `ctrl`, `shift`, `alt`, `super`, in any order, each at most once.
 - **Named keys:** `enter` (`return`), `tab`, `esc` (`escape`), `space`, `up`, `down`, `left`,
   `right`, `home`, `end`, `backspace`, `delete`, `insert`, `pageUp`, `pageDown`, and `f1` through
   `f12`. `shift+tab` matches Shift+Tab however the terminal reports it.
-- **Anything else must be a single character.** `ctrl+shift+p` is valid; `ctrl+q1` is not.
+- **Single characters:** a lowercase letter, a digit, or one of `` ` - = [ ] \ ; ' , . / ! @ # $ %
+  ^ & * ( ) _ + | ~ { } : < > ? ``. `ctrl+shift+p` and `ctrl++` are valid; `ctrl+q1`, `ctrl+é` and
+  `ctrl+ctrl+x` are not.
 
-`clear` is deliberately unsupported — the terminal backend has no counterpart for it, so there is
-nothing to bind.
+`clear` is a valid spec but deliberately unsupported — the terminal backend has no counterpart for
+it, so there is nothing to bind. It is reported and dropped on its own; the entry's other keys still
+apply.
 
 `shift+a` matches a terminal that reports `A` with Shift held. Caps Lock and Num Lock state is
 stripped before matching, so neither can defeat a binding.
 
-`/hotkeys` and the on-screen key hints render these back through the same grammar, so what you read
-is what you can write: `PageUp`, `PageDown`, `Escape`, `F5`. `Shift+Tab` prints once, not as
+`/hotkeys` and the on-screen key hints render these back from the same key names; where a part is
+shown capitalised, as pi does (`PageUp`, `Escape`, `F5`), write it in the file as above (`pageUp`,
+`escape`, `f5`). `Shift+Tab` prints once, not as
 `Shift+Shift+Tab`, and a chord your terminal reports under several spellings collapses to one
 label.
 

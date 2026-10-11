@@ -186,28 +186,48 @@ fn key_specs(value: &serde_json::Value) -> Option<Vec<&str>> {
 }
 
 /// Walk a keybindings document once, applying every entry this map recognizes and **collecting**
-/// the rejects instead of aborting on the first one — CFG-038.
+/// the rejects instead of aborting on the first one — CFG-038 — and keeping an action's DEFAULT
+/// when any key in its entry is invalid — CFG-103.
 ///
-/// **Mechanism note (JS → Rust).** Pi cannot fail an individual entry: `toKeybindingsConfig` drops
-/// an off-shape value silently (see [`key_specs`]) and a `KeyId` is just a string, so an
-/// unparseable spell like `"ctrl+nope+bad+"` survives into `keysById` and simply never matches
-/// anything in `matchesKey` (`packages/tui/src/keybindings.ts:198-204` @v0.83.0) — the action ends
-/// up **unbound**, not defaulted, and nothing else in the document is affected. cyrup's `Key` is a
-/// parsed type, so the two shapes have to be reproduced explicitly:
+/// **CFG-103 supersedes CFG-038's per-key rule.** pi `7f9e1198f` (#9880, post-v1.1.0; read at the
+/// area-05 pin f1b2e77f5) made `toKeybindingsConfig` validate each value against
+/// `KeybindingValueSchema` before keeping it (`core/keybindings.ts:267-276`):
+///
+/// ```ts
+/// const validateKeybindingValue = Compile(KeybindingValueSchema);
+/// …
+/// if (key === "$schema") continue;
+/// if (validateKeybindingValue.Check(binding)) config[key] = binding;
+/// ```
+///
+/// so an entry with ONE invalid key (`["ctrl+l", "ctrl+nope"]`) is dropped whole and the action
+/// keeps its default (`packages/tui/src/keybindings.ts` falls back to `defaultKeys` for an id the
+/// user config lacks). Before that commit a `KeyId` was any string, a bad one never matched, and
+/// the action ended up unbound or partly bound — the outcome CFG-038 reproduced here by dropping
+/// only the bad key and applying the rest. Both rejected shapes now have pi's one outcome:
 ///
 /// * value not a string / not an array-of-strings ⇒ **skip the entry**, action keeps its default;
-/// * a spec string that does not parse ⇒ **drop that key** from the entry's list and apply the
-///   rest. A dropped key is behaviourally identical to Pi's never-matching `KeyId`; when it was the
-///   only key, `set_action(action, vec![])` leaves the action unbound, which is Pi's outcome too.
+/// * any spec that is not a `KeyId` ([`cyrup_config::is_key_id`], pi's `KeyIdSchema`, stricter than
+///   [`Key::parse`] the way pi's schema is stricter than its runtime `parseKeyId`: lowercase only,
+///   a closed base-key set) or that [`Key::parse`] rejects ⇒ **skip the entry**, every bad spec in
+///   it reported, action keeps its default.
 ///
-/// Before this, every `merge_json` did `set_action(action, parse_key_values(&value)?)` **inside**
+/// **[CYRUP-DELTA] the warning.** pi drops the entry silently; cyrup still returns a
+/// [`KeybindingIssue`] per bad spec and the binary prints it (CFG-038's diagnostics), because a
+/// typo that silently does nothing is worse than one that names itself. Upward: the outcome is
+/// pi's, only the report is added.
+///
+/// **[CYRUP-DELTA] `clear`.** `clear` is a `KeyId` pi binds, but crossterm has no key for it, so
+/// [`Key::parse`] returns `UnsupportedKey` (TUI-073). That is not a typo — pi would keep the entry —
+/// so it is reported and dropped ALONE and the entry's other keys still apply, the nearest cyrup
+/// can come to pi's outcome. Only `clear` takes this path: every other `KeyId` parses.
+///
+/// Before CFG-038, every `merge_json` did `set_action(action, parse_key_values(&value)?)` **inside**
 /// the loop, so one bad spec aborted the merge — after the entries ahead of it in iteration order
-/// had already been applied — and the binary then printed `warning: ignoring <path>`, which was
-/// false: the file had been half-applied, in an order the user cannot see.
-///
-/// The whole-document error survives for `keybindings_object` only, which is Pi's `loadRawConfig`
-/// returning `undefined` for unparseable JSON or a non-object top level
-/// (`core/keybindings.ts:328-336`).
+/// had already been applied. The whole-document error survives for `keybindings_object` only,
+/// which is pi's `loadRawConfig` returning `undefined` for unparseable JSON or a non-object top
+/// level (`core/keybindings.ts:328-336` @v0.83.0). `$schema` is not an action id, so `from_id`
+/// skips it like pi's explicit `continue`.
 fn merge_entries<A>(
     json: &str,
     from_id: impl Fn(&str) -> Option<A>,
@@ -227,16 +247,34 @@ fn merge_entries<A>(
             continue;
         };
         let mut keys = Vec::with_capacity(specs.len());
+        let mut rejected = false;
         for spec in specs {
-            match Key::parse(spec) {
+            let parsed = if cyrup_config::is_key_id(spec) {
+                Key::parse(spec)
+            } else {
+                Err(TuiError::KeySpec(spec.to_string()))
+            };
+            match parsed {
                 Ok(k) => keys.push(k),
-                Err(e) => issues.push(KeybindingIssue {
+                // [CYRUP-DELTA] `clear`, above: a valid `KeyId` cyrup cannot represent.
+                Err(e @ TuiError::UnsupportedKey(_)) => issues.push(KeybindingIssue {
                     id: id.clone(),
                     reason: e.to_string(),
                 }),
+                Err(e) => {
+                    rejected = true;
+                    issues.push(KeybindingIssue {
+                        id: id.clone(),
+                        reason: e.to_string(),
+                    });
+                }
             }
         }
-        apply(action, keys);
+        // CFG-103 — pi `7f9e1198f`: an entry with any invalid key is not kept, so the action
+        // stays exactly as it was before this document was read.
+        if !rejected {
+            apply(action, keys);
+        }
     }
     Ok(issues)
 }
