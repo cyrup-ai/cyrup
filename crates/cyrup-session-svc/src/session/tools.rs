@@ -242,6 +242,29 @@ impl AgentSession {
         }
     }
 
+    /// SEAM-159 — pi `reload`'s `activeToolNames: [...this.getActiveToolNames(), …]` with
+    /// `for (const name of this.getActiveToolNames()) this._pendingToolNames.add(name)`
+    /// (`agent-session.ts:3678-3684` @v1.1.0): the rebuilt session starts from the names that were
+    /// active in the session it replaced, not from what the transcript last recorded, and a name
+    /// whose tool has not registered on the rebuild yet (an MCP tool, an extension tool) stays
+    /// pending until it does. The names the rebuilt session may not expose are dropped, as at every
+    /// other restore (`_isAllowedTool`).
+    pub(crate) async fn restore_live_tools(&self, live: &[String]) {
+        let names: Vec<String> = live
+            .iter()
+            .filter(|name| {
+                crate::tools::is_allowed_tool(
+                    self.services.allowed_tool_names.as_ref(),
+                    &self.services.excluded_tool_names,
+                    name,
+                )
+            })
+            .cloned()
+            .collect();
+        let (loadout, prompt) = { Self::lock(&self.dynamic_tools).restore_declared(&names) };
+        self.push_active_tools(loadout, prompt).await;
+    }
+
     /// Restore the loadout the session's transcript now declares (pi `_restoreToolsFromTranscript`,
     /// `agent-session.ts:1762-1769` @v1.0.1), after `/tree` navigation has changed which branch the
     /// transcript is. `context` is the navigated branch's raw projection.
