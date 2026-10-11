@@ -103,13 +103,20 @@ impl KeySpec {
 
     /// Does `key` satisfy this spec?
     ///
-    /// `ctrl` and `alt` must agree exactly. `shift` is compared only when the spec asks for it,
-    /// because the host delivers a printable character already shift-resolved (`Shift+k` arrives as
-    /// `Char('K')`; pi distinguishes `K` from `k` off the raw byte for the same reason).
+    /// Every modifier is compared EXACTLY, as pi's `matchesKey` does
+    /// (`pi/packages/tui/src/keys.ts` @f1b2e77f5): each named-key arm accepts only
+    /// `modifier === 0`, `MODIFIERS.shift`, `MODIFIERS.alt`, `MODIFIERS.ctrl` or the exact sum the
+    /// spec spells, so a bare `up` is not Shift+Up (EXT-106). pi's per-key special cases:
     ///
-    /// A `BackTab` keystroke is `Tab` + shift (pi: `matchesKey(data, "shift+tab")` is `"\x1b[Z"`),
-    /// and `Tab` is the one non-character key compared exactly on shift, so `"tab"` does not match
-    /// `BackTab` (pi: `modifier === 0` accepts `"\t"` only) while `"shift+tab"` and `"backtab"` do.
+    /// * `escape` and `f1`..`f12` match only with no modifier at all (`case "escape"`:
+    ///   `if (modifier !== 0) return false`; the `f1`..`f12` arm likewise), so `shift+escape` and
+    ///   `ctrl+f5` never match.
+    /// * A `BackTab` keystroke is `Tab` + shift (`case "tab"`: shift matches `"\x1b[Z"`, no
+    ///   modifier matches `"\t"` only), so `"tab"` does not match `BackTab` while `"shift+tab"` and
+    ///   `"backtab"` do (EXT-103).
+    /// * Characters are matched by [`char_matches`]: the host delivers a printable character
+    ///   already shift-resolved (`Shift+k` arrives as `Char('K')`), which pi reads off the raw byte
+    ///   the same way.
     #[must_use]
     pub fn matches(&self, key: &OverlayKey) -> bool {
         if self.ctrl != key.ctrl || self.alt != key.alt {
@@ -118,17 +125,54 @@ impl KeySpec {
         let (want, want_shift) = fold_backtab(self.code, self.shift);
         let (got, got_shift) = fold_backtab(key.code, key.shift);
         match (want, got) {
-            (OverlayKeyCode::Char(want), OverlayKeyCode::Char(got)) => {
-                if self.shift {
-                    got.eq_ignore_ascii_case(&want) && (key.shift || got.is_uppercase())
-                } else {
-                    want == got || (!key.shift && want.eq_ignore_ascii_case(&got))
-                }
+            (OverlayKeyCode::Escape | OverlayKeyCode::F(_), _)
+                if self.ctrl || self.alt || want_shift =>
+            {
+                false
             }
-            (OverlayKeyCode::Tab, OverlayKeyCode::Tab) => want_shift == got_shift,
-            (a, b) => a == b && (!want_shift || got_shift),
+            (OverlayKeyCode::Char(want), OverlayKeyCode::Char(got)) => {
+                char_matches(want, want_shift, got, got_shift)
+            }
+            (a, b) => a == b && want_shift == got_shift,
         }
     }
+}
+
+/// pi's `SYMBOL_KEYS` (`packages/tui/src/keys.ts:258-290` @f1b2e77f5): the punctuation a
+/// single-character `KeyId` may name.
+const SYMBOL_KEYS: &str = r"`-=[]\;',./!@#$%^&*()_+|~{}:<>?";
+
+/// The character half of [`KeySpec::matches`], pi's single-key tail of `matchesKey`
+/// (`keys.ts:1187-1244` @f1b2e77f5). `want` is the spec's (lowercased) character; ctrl and alt
+/// were already compared exactly.
+///
+/// * Space is a named key (`case "space"`): exact.
+/// * A letter: an uppercase character IS shift+letter — pi's legacy arm
+///   `if (isLetter && data === key.toUpperCase()) return true` under `MODIFIERS.shift`, and
+///   `normalizeShiftedLetterIdentityCodepoint` on the Kitty side — so the effective shift is the
+///   reported bit OR the case, compared exactly. `"k"` does not match `K`; `"shift+k"` does.
+/// * A digit: exact.
+/// * A symbol: the produced symbol consumes the shift that made it, ctrl and alt preserved (the
+///   "logical match" of `matchesKittySequence` and `matchesPrintableModifyOtherKeys`, which strip
+///   `MODIFIERS.shift` from a reported shifted symbol), so `"?"` matches `?` with or without a
+///   reported shift; the physical spelling `"shift+?"` still needs the shift.
+/// * Anything else never matches: pi's grammar names only a-z, 0-9 and `SYMBOL_KEYS`, and its
+///   fall-through is `return false`.
+fn char_matches(want: char, want_shift: bool, got: char, got_shift: bool) -> bool {
+    if want == ' ' {
+        return got == ' ' && want_shift == got_shift;
+    }
+    if want.is_ascii_lowercase() {
+        let shift = got_shift || got.is_ascii_uppercase();
+        return got.to_ascii_lowercase() == want && shift == want_shift;
+    }
+    if want.is_ascii_digit() {
+        return got == want && want_shift == got_shift;
+    }
+    if SYMBOL_KEYS.contains(want) {
+        return got == want && (got_shift || !want_shift);
+    }
+    false
 }
 
 /// `BackTab` is `Tab` with shift held.

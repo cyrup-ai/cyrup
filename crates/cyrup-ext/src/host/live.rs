@@ -328,9 +328,19 @@ impl bindings::cyrup::ext::registration::Host for HostState {
             .register_provider(guest.owner.clone(), id, config);
     }
 
+    /// The GUEST tier of pi `pi.unregisterProvider(name)` (`core/extensions/types.ts:1846`, impl
+    /// `core/extensions/loader.ts:466-469` @f1b2e77f5). Void like upstream's, so the `bool` the
+    /// registry answers is discarded.
+    ///
+    /// [CYRUP-DELTA] EXT-090: owner-narrowed
+    /// ([`crate::ExtensionRegistry::unregister_provider_owned`]) where pi removes by name for
+    /// anyone (`loader.ts:468` passes `extension.path`, but `runner.ts:532-538` and
+    /// `model-runtime.ts:944-950` drop it). The native `LateRegistrar` door and the guest
+    /// `unregister-virtual-model` door already apply this narrowing; without it here the same call
+    /// meant two things by extension flavour, and one guest could retract another's provider.
     async fn unregister_provider(&mut self, id: String) {
         let Ok(guest) = guest_of(self) else { return };
-        let _ = guest.registry.unregister_provider(&id);
+        let _ = guest.registry.unregister_provider_owned(&guest.owner, &id);
     }
 
     /// EXT-019 — pi `registerMarkdownTransformer(transformer)` (`extensions/types.ts:1292`
